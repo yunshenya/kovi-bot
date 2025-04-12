@@ -1,0 +1,8 @@
+[model]
+enable_on_startup = true
+access_control = false
+list_mode = "WhiteList"
+
+[model.access_list]
+friends = []
+groups = []
