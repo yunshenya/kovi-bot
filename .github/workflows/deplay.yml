@@ -16,7 +16,29 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+
+    - name: setup ssh
+      uses: webfactory/ssh-agent@v0.5.3
+      with:
+        ssh-private-key: ${{secrets.DEPLOY_KEY}}
+    - name: add server to know hosts
+      run: ssh-keyscan -H 1.95.216.102 > ~/.ssh/known_hosts
+
     - name: Build
-      run: cargo build --verbose
+      run: cargo build --release
+
     - name: Run tests
       run: cargo test --verbose
+
+    - name: deploy release to server
+      run: |
+        APP_NAME="kovi-bot"
+        LOCAL_APP_PATH="/target/release/$APP_NAME"
+        REMOTE_SERVER="admin@1.95.216.102"
+        REMOTE_APP_DIR="/home/admin/kovi-bot"
+        
+        rsync -avz -e "ssh" $LOCAL_APP_PATH $REMOTE_SERVER:$REMOTE_APP_DIR/$APP_NAME
+        
+        ssh $REMOTE_SERVER << EOF
+          sudo systemctl restart bot.service
+        EOF
