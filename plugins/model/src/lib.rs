@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use kovi::{MsgEvent, PluginBuilder, RuntimeBot};
+use std::sync::Arc;
 
 #[kovi::plugin]
 async fn main() {

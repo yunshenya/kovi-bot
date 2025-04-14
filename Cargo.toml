@@ -12,3 +12,4 @@ members = ["plugins/model"]
 
 [workspace.dependencies]
 kovi = "0.11.10"
+reqwest = { version = "0.12.15", features = ["json", "blocking", "rustls-tls"], default-features = false }
