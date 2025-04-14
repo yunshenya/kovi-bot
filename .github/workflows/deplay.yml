@@ -40,5 +40,5 @@ jobs:
         rsync -avz -e "ssh" $LOCAL_APP_PATH $REMOTE_SERVER:$REMOTE_APP_DIR/$APP_NAME
         
         ssh $REMOTE_SERVER << EOF
-          sudo systemctl restart bot.service
+          sudo systemctl restart kovi.service
         EOF
