@@ -1,4 +1,4 @@
-name: Rust
+name: Rust Deployment
 
 on:
   push:
@@ -10,35 +10,70 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
-
+  build-and-deploy:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-    - name: setup ssh
-      uses: webfactory/ssh-agent@v0.5.3
-      with:
-        ssh-private-key: ${{secrets.DEPLOY_KEY}}
-    - name: add server to know hosts
-      run: ssh-keyscan -H 1.95.216.102 > ~/.ssh/known_hosts
+      # 安装 Rust 工具链
+      - name: Setup Rust
+        uses: actions-rust-lang/setup-rust@v1
+        with:
+          rust-version: stable
 
-    - name: Build
-      run: cargo build --release
+      # 缓存依赖加速构建
+      - name: Cache dependencies
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-    - name: Run tests
-      run: cargo test --verbose
+      - name: Build
+        run: cargo build --release
 
-    - name: deploy release to server
-      run: |
-        APP_NAME="kovi-bot"
-        LOCAL_APP_PATH="target/release/$APP_NAME"
-        REMOTE_SERVER="admin@1.95.216.102"
-        REMOTE_APP_DIR="/home/admin/kovi-bot"
-        
-        rsync -avz -e "ssh" $LOCAL_APP_PATH $REMOTE_SERVER:$REMOTE_APP_DIR/$APP_NAME
-        
-        ssh $REMOTE_SERVER << EOF
-          sudo systemctl restart kovi.service
-        EOF
+      - name: Run tests
+        run: cargo test --verbose
+
+      # 部署部分
+      - name: Setup SSH
+        if: github.ref == 'refs/heads/main'
+        uses: webfactory/ssh-agent@v0.5.3
+        with:
+          ssh-private-key: ${{ secrets.DEPLOY_KEY }}
+
+      - name: Add server to known hosts
+        if: github.ref == 'refs/heads/main'
+        run: ssh-keyscan -H 1.95.216.102 >> ~/.ssh/known_hosts
+
+      - name: Deploy to production
+        if: github.ref == 'refs/heads/main'
+        run: |
+          APP_NAME="kovi-bot"
+          LOCAL_APP_PATH="target/release/$APP_NAME"
+          REMOTE_SERVER="admin@1.95.216.102"
+          REMOTE_APP_DIR="/home/admin/kovi-bot"
+          
+          # 检查二进制文件是否存在
+          if [ ! -f "$LOCAL_APP_PATH" ]; then
+            echo "❌ 构建产物不存在: $LOCAL_APP_PATH"
+            exit 1
+          fi
+          
+          # 确保远程目录存在
+          ssh $REMOTE_SERVER "mkdir -p $REMOTE_APP_DIR"
+          
+          # 带进度显示的同步
+          echo "🚀 开始同步文件..."
+          rsync -avz -e ssh --progress --delete \
+            $LOCAL_APP_PATH \
+            $REMOTE_SERVER:$REMOTE_APP_DIR/$APP_NAME
+          
+          # 安全重启服务
+          echo "🔄 重启服务..."
+          ssh -t $REMOTE_SERVER "sudo systemctl restart kovi.service || echo '❌ 服务重启失败'"
+          
+          echo "✅ 部署成功！"
