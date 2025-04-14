@@ -19,6 +19,8 @@ async fn main() {
 async fn group_message_event(event: Arc<MsgEvent>, bot: Arc<RuntimeBot>){
     let group_id = event.group_id.unwrap();
     if let Some(message) = event.borrow_text() {
-        bot.send_group_msg(group_id,message);
+        if message.eq("我的宝贝在哪里") {
+            bot.send_group_msg(group_id,"这里吖");
+        }
     }
 }
