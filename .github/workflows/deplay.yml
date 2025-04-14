@@ -31,14 +31,13 @@ jobs:
       run: cargo test --verbose
 
     - name: deploy release to server
+      env:
+        APP_NAME: "kovi-bot"
+        REMOTE_SERVER: "admin@1.95.216.102"
+        REMOTE_APP_DIR: "/home/admin/kovi-bot"
+        LOCAL_APP_PATH: "target/release/$APP_NAME"
       run: |
-        APP_NAME="kovi-bot"
-        LOCAL_APP_PATH="target/release/$APP_NAME"
-        REMOTE_SERVER="admin@1.95.216.102"
-        REMOTE_APP_DIR="/home/admin/kovi-bot"
-        
         rsync -avz -e "ssh" $LOCAL_APP_PATH $REMOTE_SERVER:$REMOTE_APP_DIR/$APP_NAME
-        
         ssh $REMOTE_SERVER << EOF
           sudo systemctl restart kovi.service
         EOF
