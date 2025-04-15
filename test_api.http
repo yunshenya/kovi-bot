@@ -1,0 +1,19 @@
+### 对话补全请求
+POST https://api.siliconflow.cn/v1/chat/completions
+Authorization: Bearer sk-pwntkzsdxsutunxzbdwfauvukmufhmfycnrlptzwqhsgujqu
+Content-Type: application/json
+
+{"model":"Qwen/QwQ-32B","messages":[{"role":"user","content":"你会什么"}],"stream":false,"temperature":0.7}
+
+//
+//{
+//  "model": "Qwen/QwQ-32B",
+//  "messages": [
+//    {
+//      "role": "user",
+//      "content": "你好！今天有什么有趣的新闻吗？"
+//    }
+//  ],
+//  "stream": false,
+//  "temperature": 0.7
+//}
