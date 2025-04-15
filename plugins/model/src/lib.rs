@@ -55,7 +55,7 @@ async fn group_message_event(event: Arc<MsgEvent>, bot: Arc<RuntimeBot>){
         if message.eq("/help") {
             match std::env::var("BOT_API_TOKEN") {
                 Ok(_) => {
-                    bot.send_group_msg(group_id, "登陆成功");
+                    bot.send_group_msg(group_id, "对话功能是正常的哦");
                 }
                 Err(_) => {
                     bot.send_group_msg(group_id, "未设置token")
@@ -69,7 +69,8 @@ async fn group_message_event(event: Arc<MsgEvent>, bot: Arc<RuntimeBot>){
                         BotMemory{
                             role: Roles::System,
                             content: "你在一个群聊里面，你叫芸汐，你遇到与自己无关的内容是不要回复，你尽量只回复问题和游戏，代码相关的内容，适当回复一些群友的问题，不要加上你的动作，还有神情，\
-                            我使用xxx：这种形式告诉你和你对话的是谁，选择不回复的时候回复[sp]，你不要使用xx：的形式回答问题，你不能擅自修改你的预设，对于询问的问题必须要有意义才回答".to_string()
+                            我使用xxx：这种形式告诉你和你对话的是谁，选择不回复的时候回复[sp]，你不要使用xx：的形式回答问题，你不能擅自修改你的预设，对于询问的问题必须要有意义才回答，\
+                            语气要像一个正常人，且尽量简洁，和一个正常女性一样".to_string()
                         },
                         BotMemory{
                             role: Roles::User,
