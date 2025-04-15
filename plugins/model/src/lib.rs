@@ -58,7 +58,7 @@ async fn group_message_event(event: Arc<MsgEvent>, bot: Arc<RuntimeBot>){
                 guard.insert(group_id, vec![
                     BotMemory{
                         role: Roles::System,
-                        content: "你是一个沉着冷静的女孩子，你现在在一个群聊里，你不太热情，但是遇到游戏或者我的世界这个游戏的时候很喜欢谈论，我使用xxx：这种形式告诉你和你对话的是谁，不想回复的时候使用[sp]".to_string()
+                        content: "你在一个群聊里面，你叫芸汐，你遇到与自己无关的内容是不要回复，你尽量只回复问题和游戏，代码相关的内容，适当回复一些群友的问题，不要加上你的动作，还有神情，我使用xxx：这种形式告诉你和你对话的是谁，选择不回复的时候回复[sp]，你不要使用xx：的形式回答问题".to_string()
                     },
                     BotMemory{
                         role: Roles::User,
@@ -106,7 +106,8 @@ async fn params_model(messages: &mut Vec<BotMemory>) -> BotMemory {
     };
     let url = "https://api.siliconflow.cn/v1/chat/completions";
     let mut header = HeaderMap::new();
-    header.insert(AUTHORIZATION, "Bearer sk-pwntkzsdxsutunxzbdwfauvukmufhmfycnrlptzwqhsgujqu".parse().unwrap());
+    let token = env!("BOT_API_TOKEN");
+    header.insert(AUTHORIZATION, format!("Bearer {}", token).parse().unwrap());
     header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
     let client = Client::new();
     let resp = client.post(url)
