@@ -109,7 +109,7 @@ async fn group_message_event(event: Arc<MsgEvent>, bot: Arc<RuntimeBot>){
 
 async fn params_model(messages: &mut Vec<BotMemory>) -> BotMemory {
     if messages.len() > 11 {
-        messages.drain(1..10);
+        messages.drain(1..11);
     };
     let bot_conf = ModelConf{
         model: "Qwen/QwQ-32B",
@@ -146,8 +146,10 @@ mod tests {
 
     #[tokio::test]
     async fn test(){
-        let mut vec = vec![1,2,3,4,5];
-        vec.drain(1..4);
-        println!("{:?}", vec);
+        let mut vec = vec![1,2,3,4,5,6];
+        if vec.len() > 5 {
+            vec.drain(1..5);
+            println!("{:?}", vec);
+        }
     }
 }
