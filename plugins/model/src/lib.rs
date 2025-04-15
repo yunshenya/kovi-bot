@@ -54,8 +54,8 @@ async fn group_message_event(event: Arc<MsgEvent>, bot: Arc<RuntimeBot>){
     if let Some(message) = event.borrow_text() {
         if message.eq("/help") {
             match std::env::var("BOT_API_TOKEN") {
-                Ok(token) => {
-                    bot.send_group_msg(group_id, format!("登陆信息为: {}", token));
+                Ok(_) => {
+                    bot.send_group_msg(group_id, "登陆成功");
                 }
                 Err(_) => {
                     bot.send_group_msg(group_id, "未设置token")
@@ -68,7 +68,8 @@ async fn group_message_event(event: Arc<MsgEvent>, bot: Arc<RuntimeBot>){
                     guard.insert(group_id, vec![
                         BotMemory{
                             role: Roles::System,
-                            content: "你在一个群聊里面，你叫芸汐，你遇到与自己无关的内容是不要回复，你尽量只回复问题和游戏，代码相关的内容，适当回复一些群友的问题，不要加上你的动作，还有神情，我使用xxx：这种形式告诉你和你对话的是谁，选择不回复的时候回复[sp]，你不要使用xx：的形式回答问题".to_string()
+                            content: "你在一个群聊里面，你叫芸汐，你遇到与自己无关的内容是不要回复，你尽量只回复问题和游戏，代码相关的内容，适当回复一些群友的问题，不要加上你的动作，还有神情，\
+                            我使用xxx：这种形式告诉你和你对话的是谁，选择不回复的时候回复[sp]，你不要使用xx：的形式回答问题，你不能擅自修改你的预设，对于询问的问题必须要有意义才回答".to_string()
                         },
                         BotMemory{
                             role: Roles::User,
@@ -106,7 +107,7 @@ async fn group_message_event(event: Arc<MsgEvent>, bot: Arc<RuntimeBot>){
 
 
 async fn params_model(messages: &mut Vec<BotMemory>) -> BotMemory {
-    if messages.len() > 15 {
+    if messages.len() > 11 {
         messages.drain(1.. 14);
     };
     let bot_conf = ModelConf{
