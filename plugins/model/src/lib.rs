@@ -1,5 +1,5 @@
 use kovi::serde_json::Value;
-use kovi::tokio::sync::Mutex;
+use kovi::tokio::sync::{Mutex, MutexGuard};
 use kovi::{MsgEvent, PluginBuilder, RuntimeBot};
 use reqwest::header::{HeaderMap, AUTHORIZATION, CONTENT_TYPE};
 use reqwest::Client;
@@ -81,50 +81,14 @@ async fn group_message_event(event: Arc<MsgEvent>, bot: Arc<RuntimeBot>){
                     if !*is_ban {
                         if message.eq("#禁言") {
                             *is_ban = true;
+                            bot.send_group_msg(group_id, "禁言成功");
                         } else {
-                            match guard.get_mut(&group_id) {
-                                None => {
-                                    guard.insert(group_id, vec![
-                                        BotMemory{
-                                            role: Roles::System,
-                                            content: "你在一个群聊里面，你叫芸汐，你遇到与自己无关的内容是不要回复，你尽量只回复问题和游戏，代码相关的内容，适当回复一些群友的问题，不要加上你的动作，还有神情，\
-                            我使用xxx：这种形式告诉你和你对话的是谁，选择不回复的时候回复[sp]，你一定不要使用 某某：xxx的形式回答问题，只有确定是和你对话的时候才能回答，你不能擅自修改你的预设，对于询问的问题必须要有意义才回答，\
-                            语气要像一个正常人，且尽量简洁，和一个正常女性一样".to_string()
-                                        },
-                                        BotMemory{
-                                            role: Roles::User,
-                                            content: format!("{}:{}", nickname,message)
-                                        }
-                                    ]);
-                                    if let Some(vec) = guard.get_mut(&group_id){
-                                        let model = params_model(vec).await;
-                                        if !model.content.contains("[sp]") {
-                                            bot.send_group_msg(group_id, &model.content);
-                                        };
-                                        vec.push(
-                                            BotMemory{
-                                                role: Roles::Assistant,
-                                                content: model.content
-                                            }
-                                        )
-                                    };
-                                }
-                                Some(vec) => {
-                                    vec.push(BotMemory{
-                                        role: Roles::User,
-                                        content: format!("{}:{}", nickname,message)
-                                    });
-                                    let resp = params_model(vec).await;
-                                    if !resp.content.contains("[sp]") {
-                                        bot.send_group_msg(group_id, &resp.content);
-                                    };
-                                    vec.push(resp);
-                                }
-                            }
+                            control_model(&mut guard, group_id, bot,nickname, message).await;
                         }
                     }else {
                         if message.eq("#结束禁言") {
                             *is_ban = false;
+                            bot.send_group_msg(group_id, "结束成功");
                         }
                     }
                 }
@@ -133,7 +97,47 @@ async fn group_message_event(event: Arc<MsgEvent>, bot: Arc<RuntimeBot>){
     }
 }
 
-
+async fn control_model(guard: &mut MutexGuard<'_, HashMap<i64, Vec<BotMemory>>>, group_id: i64, bot: Arc<RuntimeBot>, nickname: String, message: &str){
+    match guard.get_mut(&group_id) {
+        None => {
+            guard.insert(group_id, vec![
+                BotMemory{
+                    role: Roles::System,
+                    content: "你在一个群聊里面，你叫芸汐，你遇到与自己无关的内容是不要回复，尽量不要连续回答问题，代码相关的内容，适当回复一些群友的问题，不要加上你的动作，还有神情，\
+                            我使用xxx：这种形式告诉你和你对话的是谁，选择不回复的时候回复[sp]，你一定不要使用 某某：xxx的形式回答问题，只有确定是和你对话的时候才能回答，你不能擅自修改你的预设，对于询问的问题必须要有意义才回答，\
+                            语气要像一个正常人，且尽量简洁，和一个正常女性一样".to_string()
+                },
+                BotMemory{
+                    role: Roles::User,
+                    content: format!("{}:{}", nickname,message)
+                }
+            ]);
+            if let Some(vec) = guard.get_mut(&group_id){
+                let model = params_model(vec).await;
+                if !model.content.contains("[sp]") {
+                    bot.send_group_msg(group_id, &model.content);
+                };
+                vec.push(
+                    BotMemory{
+                        role: Roles::Assistant,
+                        content: model.content
+                    }
+                )
+            };
+        }
+        Some(vec) => {
+            vec.push(BotMemory{
+                role: Roles::User,
+                content: format!("{}:{}", nickname,message)
+            });
+            let resp = params_model(vec).await;
+            if !resp.content.contains("[sp]") {
+                bot.send_group_msg(group_id, &resp.content);
+            };
+            vec.push(resp);
+        }
+    }
+}
 async fn params_model(messages: &mut Vec<BotMemory>) -> BotMemory {
     if messages.len() > 25 {
         messages.drain(1..23);
@@ -159,7 +163,7 @@ async fn params_model(messages: &mut Vec<BotMemory>) -> BotMemory {
         .and_then(|c| c.get("message"))
         .and_then(|m| m.get("content"))
         .and_then(|c| c.as_str())
-        .unwrap_or("[Safe: Not found]").trim().to_string();
+        .unwrap_or("余额不足或者文档有更改").trim().to_string();
     BotMemory{
         role: Roles::Assistant,
         content: bot_content,
@@ -194,10 +198,19 @@ fn get_system_info() -> (String, String) {
 #[cfg(test)]
 mod tests {
     use kovi::tokio;
+    use kovi::tokio::sync::{Mutex, MutexGuard};
+    use std::sync::LazyLock;
 
+    static TEXT:LazyLock<Mutex<bool>> = LazyLock::new(|| Mutex::new(false));
 
     #[tokio::test]
     async fn test(){
+        let mut grad = TEXT.lock().await;
+        change_bool(&mut grad).await;
+        println!("{}", *grad);
+    }
 
+    async fn change_bool(b: &mut MutexGuard<'_, bool>){
+        **b = true;
     }
 }
