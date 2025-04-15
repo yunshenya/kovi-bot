@@ -1,11 +1,11 @@
-use std::collections::HashMap;
-use kovi::{MsgEvent, PluginBuilder, RuntimeBot};
-use std::sync::{Arc, LazyLock};
 use kovi::serde_json::Value;
 use kovi::tokio::sync::Mutex;
-use reqwest::Client;
+use kovi::{MsgEvent, PluginBuilder, RuntimeBot};
 use reqwest::header::{HeaderMap, AUTHORIZATION, CONTENT_TYPE};
+use reqwest::Client;
 use serde::Serialize;
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock};
 
 static MEMORY:LazyLock<Mutex<HashMap<i64, Vec<BotMemory>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -52,42 +52,53 @@ async fn group_message_event(event: Arc<MsgEvent>, bot: Arc<RuntimeBot>){
     let group_id = event.group_id.unwrap();
     let nickname = event.get_sender_nickname();
     if let Some(message) = event.borrow_text() {
-        let mut guard = MEMORY.lock().await;
-        match guard.get_mut(&group_id) {
-            None => {
-                guard.insert(group_id, vec![
-                    BotMemory{
-                        role: Roles::System,
-                        content: "你在一个群聊里面，你叫芸汐，你遇到与自己无关的内容是不要回复，你尽量只回复问题和游戏，代码相关的内容，适当回复一些群友的问题，不要加上你的动作，还有神情，我使用xxx：这种形式告诉你和你对话的是谁，选择不回复的时候回复[sp]，你不要使用xx：的形式回答问题".to_string()
-                    },
-                    BotMemory{
+        if message.eq("/help") {
+            match std::env::var("BOT_API_TOKEN") {
+                Ok(token) => {
+                    bot.send_group_msg(group_id, format!("登陆信息为: {}", token));
+                }
+                Err(_) => {
+                    bot.send_group_msg(group_id, "未设置token")
+                }
+            }
+        } else {
+            let mut guard = MEMORY.lock().await;
+            match guard.get_mut(&group_id) {
+                None => {
+                    guard.insert(group_id, vec![
+                        BotMemory{
+                            role: Roles::System,
+                            content: "你在一个群聊里面，你叫芸汐，你遇到与自己无关的内容是不要回复，你尽量只回复问题和游戏，代码相关的内容，适当回复一些群友的问题，不要加上你的动作，还有神情，我使用xxx：这种形式告诉你和你对话的是谁，选择不回复的时候回复[sp]，你不要使用xx：的形式回答问题".to_string()
+                        },
+                        BotMemory{
+                            role: Roles::User,
+                            content: format!("{}:{}", nickname,message)
+                        }
+                    ]);
+                    if let Some(vec) = guard.get_mut(&group_id){
+                        let model = params_model(vec).await;
+                        if !model.content.contains("[sp]") {
+                            bot.send_group_msg(group_id, &model.content);
+                        };
+                        vec.push(
+                            BotMemory{
+                                role: Roles::Assistant,
+                                content: model.content
+                            }
+                        )
+                    };
+                }
+                Some(vec) => {
+                    vec.push(BotMemory{
                         role: Roles::User,
                         content: format!("{}:{}", nickname,message)
-                    }
-                ]);
-                if let Some(vec) = guard.get_mut(&group_id){
-                    let model = params_model(vec).await;
-                    if !model.content.contains("[sp]") {
-                        bot.send_group_msg(group_id, &model.content);
+                    });
+                    let resp = params_model(vec).await;
+                    if !resp.content.contains("[sp]") {
+                        bot.send_group_msg(group_id, &resp.content);
                     };
-                    vec.push(
-                        BotMemory{
-                            role: Roles::Assistant,
-                            content: model.content
-                        }
-                    )
-                };
-            }
-            Some(vec) => {
-                vec.push(BotMemory{
-                    role: Roles::User,
-                    content: format!("{}:{}", nickname,message)
-                });
-                let resp = params_model(vec).await;
-                if !resp.content.contains("[sp]") {
-                    bot.send_group_msg(group_id, &resp.content);
-                };
-                vec.push(resp);
+                    vec.push(resp);
+                }
             }
         }
     }
