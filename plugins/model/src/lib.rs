@@ -106,7 +106,7 @@ async fn params_model(messages: &mut Vec<BotMemory>) -> BotMemory {
     };
     let url = "https://api.siliconflow.cn/v1/chat/completions";
     let mut header = HeaderMap::new();
-    let token = env!("BOT_API_TOKEN");
+    let token = std::env::var("BOT_API_TOKEN").expect("BOT_API_TOKEN must be set");
     header.insert(AUTHORIZATION, format!("Bearer {}", token).parse().unwrap());
     header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
     let client = Client::new();
