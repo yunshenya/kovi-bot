@@ -108,7 +108,7 @@ async fn group_message_event(event: Arc<MsgEvent>, bot: Arc<RuntimeBot>){
 
 async fn params_model(messages: &mut Vec<BotMemory>) -> BotMemory {
     if messages.len() > 11 {
-        messages.drain(1.. 14);
+        messages.drain(1.. 10);
     };
     let bot_conf = ModelConf{
         model: "Qwen/QwQ-32B",
