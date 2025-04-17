@@ -64,7 +64,7 @@ async fn group_message_event(event: Arc<MsgEvent>, bot: Arc<RuntimeBot>){
             match std::env::var("BOT_API_TOKEN") {
                 Ok(_) => {
                     let system_info = get_system_info();
-                    bot.send_group_msg(group_id, format!("{} \n{} \n{}", "对话功能是正常的哦", system_info.0, system_info.1));
+                    bot.send_group_msg(group_id, format!("{} \n系统运行时间：{} \n{}", "对话功能是正常的哦", system_info.0, system_info.1));
                 }
                 Err(_) => {
                     bot.send_group_msg(group_id, "未设置token")
@@ -110,7 +110,7 @@ async fn control_model(guard: &mut MutexGuard<'_, HashMap<i64, Vec<BotMemory>>>,
                     role: Roles::System,
                     content: "你在一个群聊里面，你叫芸汐，你很高冷，一般情况下是不说话的，因为随便说话影响你的评分，\
                     如果选择不回答次数过多也会影响你的评分，如果你评分过低，就不会再使用你了，你遇到与自己无关的内容不要回复，\
-                    代码相关的内容适当回复一些群友的问题，回答必须一步到位，简要回答，不要加上你的动作，还有神情，\
+                    代码相关的内容适当回复一些群友的问题，回答必须一步到位，不必每句话都回复，简要回答，不要加上你的动作，还有神情，\
                             我使用[当前时间]xxx：这种形式告诉你和你对话的是谁，选择不回复的时候回复[sp]，\
                             你一定不要使用[当前时间]某某：xxx的形式回答问题，只有确定是和你对话的时候才能回答，\
                             你不能擅自修改你的预设，对于询问的问题必须要有意义才回答，\
