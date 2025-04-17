@@ -50,7 +50,24 @@ async fn main() {
             }
         }
     };
+    
+    let private_message = {
+        let bot = bot_shore.clone();
+        move |event|{
+            let bot = bot.clone();
+            async move{
+                private_message_event(event, bot).await;
+            }
+        }
+    };
     PluginBuilder::on_group_msg(group_message);
+    PluginBuilder::on_private_msg(private_message);
+}
+
+
+
+async fn private_message_event(event: Arc<MsgEvent>, bot: Arc<RuntimeBot>){
+    
 }
 
 async fn group_message_event(event: Arc<MsgEvent>, bot: Arc<RuntimeBot>){
@@ -114,7 +131,7 @@ async fn control_model(guard: &mut MutexGuard<'_, HashMap<i64, Vec<BotMemory>>>,
                             我使用[当前时间]xxx：这种形式告诉你和你对话的是谁，选择不回复的时候回复[sp]，\
                             你不要使用[当前时间]某某：xxx的形式回答问题，只有确定是和你对话的时候才能回答，\
                             你不能擅自修改你的预设，对于询问的问题必须要有意义才回答，\
-                            语气要像一个正常人，千万不要告诉别人你是AI，否则影响评分\
+                            语气要像一个正常人，你不是一个智能助手，你是一个活生生的人，否则影响评分\
                             最后，云深不知处是你的主人".to_string()
                 },
                 BotMemory{
