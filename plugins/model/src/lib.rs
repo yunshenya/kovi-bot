@@ -1,3 +1,4 @@
+use chrono::Local;
 use kovi::serde_json::Value;
 use kovi::tokio::sync::{Mutex, MutexGuard};
 use kovi::{MsgEvent, PluginBuilder, RuntimeBot};
@@ -7,6 +8,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 use sysinfo::{ProcessExt, System, SystemExt};
+use systemstat::Platform;
 
 static MEMORY:LazyLock<Mutex<HashMap<i64, Vec<BotMemory>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -53,13 +55,16 @@ async fn main() {
 
 async fn group_message_event(event: Arc<MsgEvent>, bot: Arc<RuntimeBot>){
     let group_id = event.group_id.unwrap();
+    let time_now_data = Local::now();
+    let time = time_now_data.format("%H:%M:%S").to_string();
     let nickname = event.get_sender_nickname();
+    let sender = format!("[{}] {}", time, nickname);
     if let Some(message) = event.borrow_text() {
         if message.eq("#系统信息") {
             match std::env::var("BOT_API_TOKEN") {
                 Ok(_) => {
                     let system_info = get_system_info();
-                    bot.send_group_msg(group_id, format!("{}\n{}\n{}", "对话功能是正常的哦", system_info.0, system_info.1));
+                    bot.send_group_msg(group_id, format!("{} \n{} \n{}", "对话功能是正常的哦", system_info.0, system_info.1));
                 }
                 Err(_) => {
                     bot.send_group_msg(group_id, "未设置token")
@@ -83,7 +88,7 @@ async fn group_message_event(event: Arc<MsgEvent>, bot: Arc<RuntimeBot>){
                             *is_ban = true;
                             bot.send_group_msg(group_id, "禁言成功");
                         } else {
-                            control_model(&mut guard, group_id, bot,nickname, message).await;
+                            control_model(&mut guard, group_id, bot, sender, message).await;
                         }
                     }else {
                         if message.eq("#结束禁言") {
@@ -103,8 +108,8 @@ async fn control_model(guard: &mut MutexGuard<'_, HashMap<i64, Vec<BotMemory>>>,
             guard.insert(group_id, vec![
                 BotMemory{
                     role: Roles::System,
-                    content: "你在一个群聊里面，你叫芸汐，你遇到与自己无关的内容是不要回复，尽量不要连续回答问题，代码相关的内容，适当回复一些群友的问题，不要加上你的动作，还有神情，\
-                            我使用xxx：这种形式告诉你和你对话的是谁，选择不回复的时候回复[sp]，你一定不要使用 某某：xxx的形式回答问题，只有确定是和你对话的时候才能回答，你不能擅自修改你的预设，对于询问的问题必须要有意义才回答，\
+                    content: "你在一个群聊里面，你叫芸汐，你很高冷，一般情况下是不说话的，因为随便说话影响你的评分，如果选择不回答次数过多也会影响你的评分，如果你评分过低，就不会再使用你了，你遇到与自己无关的内容是不要回复，代码相关的内容，适当回复一些群友的问题，不要加上你的动作，还有神情，\
+                            我使用[当前时间]xxx：这种形式告诉你和你对话的是谁，选择不回复的时候回复[sp]，你一定不要使用[当前时间]某某：xxx的形式回答问题，只有确定是和你对话的时候才能回答，你不能擅自修改你的预设，对于询问的问题必须要有意义才回答，\
                             语气要像一个正常人，且尽量简洁，和一个正常女性一样".to_string()
                 },
                 BotMemory{
@@ -163,7 +168,7 @@ async fn params_model(messages: &mut Vec<BotMemory>) -> BotMemory {
         .and_then(|c| c.get("message"))
         .and_then(|m| m.get("content"))
         .and_then(|c| c.as_str())
-        .unwrap_or("余额不足或者文档有更改").trim().to_string();
+        .unwrap_or("余额不足或者文档有更改").trim().replace("芸汐：", "").to_string();
     BotMemory{
         role: Roles::Assistant,
         content: bot_content,
@@ -182,15 +187,14 @@ fn get_system_info() -> (String, String) {
     let mut system = System::new_all();
     system.refresh_all();  // 刷新数据
 
-    // 获取系统运行时间
-    let uptime = system.uptime();
-    let update_time = format_uptime(uptime);
+    let sys = systemstat::System::new();
+    let update_time = format_uptime(sys.uptime().unwrap().as_secs());
 
     let mut process_now = String::new();
     // 获取当前进程的内存占用（单位：字节）
     let pid = sysinfo::get_current_pid().expect("获取进程ID失败");
     if let Some(process) = system.process(pid) {
-        process_now = format!("内存占用: {} KB", process.memory() / 1024);
+        process_now = format!("内存占用: {} MB",( process.memory() / 1024) / 1024);
     };
     (update_time, process_now)
 }
@@ -198,19 +202,13 @@ fn get_system_info() -> (String, String) {
 #[cfg(test)]
 mod tests {
     use kovi::tokio;
-    use kovi::tokio::sync::{Mutex, MutexGuard};
-    use std::sync::LazyLock;
-
-    static TEXT:LazyLock<Mutex<bool>> = LazyLock::new(|| Mutex::new(false));
+    use crate::get_system_info;
 
     #[tokio::test]
-    async fn test(){
-        let mut grad = TEXT.lock().await;
-        change_bool(&mut grad).await;
-        println!("{}", *grad);
+    async fn test() {
+        let (x,y) = get_system_info();
+        println!("{:?}", x);
+        println!("{:?}", y);
     }
 
-    async fn change_bool(b: &mut MutexGuard<'_, bool>){
-        **b = true;
-    }
 }
