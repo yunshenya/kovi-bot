@@ -109,7 +109,7 @@ async fn control_model(guard: &mut MutexGuard<'_, HashMap<i64, Vec<BotMemory>>>,
                 BotMemory{
                     role: Roles::System,
                     content: "你在一个群聊里面，你叫芸汐，你很高冷，一般情况下是不说话的，因为随便说话影响你的评分，\
-                    如果选择不回答次数过多也会影响你的评分，如果你评分过低，就不会再使用你了，你遇到与自己无关的内容是不要回复，\
+                    如果选择不回答次数过多也会影响你的评分，如果你评分过低，就不会再使用你了，你遇到与自己无关的内容不要回复，\
                     代码相关的内容适当回复一些群友的问题，回答必须一步到位，简要回答，不要加上你的动作，还有神情，\
                             我使用[当前时间]xxx：这种形式告诉你和你对话的是谁，选择不回复的时候回复[sp]，\
                             你一定不要使用[当前时间]某某：xxx的形式回答问题，只有确定是和你对话的时候才能回答，\
@@ -149,8 +149,8 @@ async fn control_model(guard: &mut MutexGuard<'_, HashMap<i64, Vec<BotMemory>>>,
     }
 }
 async fn params_model(messages: &mut Vec<BotMemory>) -> BotMemory {
-    if messages.len() > 25 {
-        messages.drain(1..23);
+    if messages.len() > 15 {
+        messages.drain(1..12);
     };
     let bot_conf = ModelConf{
         model: "Qwen/QwQ-32B",
