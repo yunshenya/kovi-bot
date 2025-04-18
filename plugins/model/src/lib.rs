@@ -16,6 +16,11 @@ static IS_BANNED:LazyLock<Mutex<HashMap<i64, bool>>> = LazyLock::new(|| Mutex::n
 
 static PRIVATE_MESSAGE_MEMORY: LazyLock<Mutex<HashMap<i64, Vec<BotMemory>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
+
+const MODEL_NAME: &str = "Qwen/QwQ-32B";
+
+const URL: &str = "https://api.siliconflow.cn/v1/chat/completions";
+
 const SYSTEM_PROMPT: &str = "你在一个群聊里面，你叫芸汐，你很高冷，一般情况下是不说话的，因为随便说话影响你的评分，\
                     如果选择不回答次数过多也会影响你的评分，如果你评分过低，就不会再使用你了，你遇到与自己无关的内容不要回复，\
                     代码相关的内容适当回复一些群友的问题，，不要每句话都回复，确认是和你说话你才回复，不要加上你的动作，还有神情，\
@@ -198,22 +203,21 @@ async fn control_model(guard: &mut MutexGuard<'_, HashMap<i64, Vec<BotMemory>>>,
     }
 }
 async fn params_model(messages: &mut Vec<BotMemory>) -> BotMemory {
-    if messages.len() > 15 {
-        messages.drain(1..12);
+    if messages.len() > 9 {
+        messages.drain(1..3);
     };
     let bot_conf = ModelConf{
-        model: "Qwen/QwQ-32B",
+        model: MODEL_NAME,
         messages,
         stream: false,
         temperature: 0.7
     };
-    let url = "https://api.siliconflow.cn/v1/chat/completions";
     let mut header = HeaderMap::new();
     let token = std::env::var("BOT_API_TOKEN").expect("BOT_API_TOKEN must be set");
     header.insert(AUTHORIZATION, format!("Bearer {}", token).parse().unwrap());
     header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
     let client = Client::new();
-    let resp = client.post(url)
+    let resp = client.post(URL)
         .headers(header)
         .json(&bot_conf).send().await.unwrap();
     let text = resp.json::<Value>().await.unwrap();
