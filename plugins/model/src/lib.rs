@@ -125,7 +125,15 @@ async fn group_message_event(event: Arc<MsgEvent>, bot: Arc<RuntimeBot>){
             match std::env::var("BOT_API_TOKEN") {
                 Ok(_) => {
                     let system_info = get_system_info();
-                    bot.send_group_msg(group_id, format!("{} \n系统运行时间：{} \n{}", "对话功能是正常的哦", system_info.0, system_info.1));
+                    let option_status = bot.get_status().await;
+                    if let Ok(status) =  option_status{
+                        let now_status = status.data.get("memory").and_then(|t| {
+                            t.as_i64()
+                        }).unwrap_or(0);
+                        bot.send_group_msg(group_id, format!("{} \n系统运行时间：{} \n{} \nLagrange占用: {}MB", "对话功能是正常的哦", 
+                                                                system_info.0, system_info.1, (now_status / 1024) / 1024));
+                    }
+                    
                 }
                 Err(_) => {
                     bot.send_group_msg(group_id, "未设置token")
