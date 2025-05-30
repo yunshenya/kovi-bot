@@ -141,7 +141,6 @@ async fn group_message_event(event: Arc<MsgEvent>, bot: Arc<RuntimeBot>){
                 }
             }
         } else {
-            let mut guard = MEMORY.lock().await;
             let mut banned_list = IS_BANNED.lock().await;
             match banned_list.get_mut(&group_id) {
                 None => {
@@ -158,6 +157,7 @@ async fn group_message_event(event: Arc<MsgEvent>, bot: Arc<RuntimeBot>){
                             *is_ban = true;
                             bot.send_group_msg(group_id, "禁言成功");
                         } else {
+                            let mut guard = MEMORY.lock().await;
                             control_model(&mut guard, group_id, bot, sender, message).await;
                         }
                     }else {
