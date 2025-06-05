@@ -2,7 +2,9 @@ use serde::Deserialize;
 
 #[derive(Debug, Deserialize, Default)]
 pub struct Prompt {
+    #[serde(default)]
     system_prompt: Option<String>,
+    #[serde(default)]
     private_prompt: Option<String>,
 }
 

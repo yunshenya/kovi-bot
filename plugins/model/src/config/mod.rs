@@ -13,7 +13,9 @@ static MODEL_CONFIG: LazyLock<ModelConfig> =
 
 #[derive(Debug, Deserialize, Default)]
 pub struct ModelConfig {
+    #[serde(default)]
     prompt: Prompt,
+    #[serde(default)]
     server_config: ServerConfig,
 }
 
@@ -23,7 +25,7 @@ impl ModelConfig {
             .add_source(
                 config::File::with_name("application")
                     .format(FileFormat::Yaml)
-                    .required(true),
+                    .required(false),
             )
             .add_source(
                 config::Environment::with_prefix("APP")
