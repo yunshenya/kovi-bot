@@ -1,3 +1,3 @@
-pub mod system_info;
+mod system_info;
 
-pub use crate::system_info::system_info_get;
+pub use crate::utils::system_info::system_info_get;
