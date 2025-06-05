@@ -11,7 +11,7 @@ pub mod server;
 static MODEL_CONFIG: LazyLock<ModelConfig> =
     LazyLock::new(|| ModelConfig::load().expect("Failed to load config file"));
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
 pub struct ModelConfig {
     prompt: Prompt,
     server_config: ServerConfig,
@@ -21,7 +21,7 @@ impl ModelConfig {
     pub fn load() -> anyhow::Result<Self> {
         Config::builder()
             .add_source(
-                config::File::with_name("../../application")
+                config::File::with_name("application")
                     .format(FileFormat::Yaml)
                     .required(true),
             )
