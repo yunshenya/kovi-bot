@@ -10,7 +10,9 @@ pub struct ServerConfig {
 
 impl ServerConfig {
     pub fn url(&self) -> &str {
-        self.url.as_deref().unwrap_or("https://api.siliconflow.cn/v1/chat/completions")
+        self.url
+            .as_deref()
+            .unwrap_or("https://api.siliconflow.cn/v1/chat/completions")
     }
 
     pub fn model_name(&self) -> &str {

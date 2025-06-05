@@ -1,12 +1,11 @@
+use kovi::RuntimeBot;
 use kovi::serde_json::Value;
 use kovi::tokio::sync::{Mutex, MutexGuard};
-use kovi::RuntimeBot;
-use reqwest::header::{HeaderMap, AUTHORIZATION, CONTENT_TYPE};
 use reqwest::Client;
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
-
 
 static MEMORY: LazyLock<Mutex<HashMap<i64, Vec<BotMemory>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -38,8 +37,6 @@ struct ModelConf<'a> {
     stream: bool,
     temperature: f32,
 }
-
-
 
 pub async fn control_model(
     guard: &mut MutexGuard<'_, HashMap<i64, Vec<BotMemory>>>,

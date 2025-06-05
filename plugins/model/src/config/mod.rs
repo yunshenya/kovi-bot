@@ -5,8 +5,8 @@ use config::{Config, FileFormat};
 use serde::Deserialize;
 use std::sync::LazyLock;
 
-pub mod prompt;
-pub mod server;
+mod prompt;
+mod server;
 
 static MODEL_CONFIG: LazyLock<ModelConfig> =
     LazyLock::new(|| ModelConfig::load().expect("Failed to load config file"));

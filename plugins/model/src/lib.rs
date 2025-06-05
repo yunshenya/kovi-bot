@@ -1,10 +1,9 @@
-use kovi::PluginBuilder;
 use crate::model::{group_message_event, private_message_event};
+use kovi::PluginBuilder;
 
 mod config;
-mod utils;
 mod model;
-
+mod utils;
 
 #[kovi::plugin]
 async fn main() {
@@ -32,14 +31,10 @@ async fn main() {
     PluginBuilder::on_private_msg(private_message);
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use kovi::tokio;
 
     #[tokio::test]
-    async fn test() {
-        
-    }
+    async fn test() {}
 }

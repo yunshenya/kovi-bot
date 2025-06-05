@@ -1,8 +1,8 @@
-use std::sync::Arc;
-use chrono::Local;
-use kovi::{MsgEvent, RuntimeBot};
 use crate::model::utils::{control_model, get_memory, instance_is_ban};
 use crate::utils;
+use chrono::Local;
+use kovi::{MsgEvent, RuntimeBot};
+use std::sync::Arc;
 
 pub async fn group_message_event(event: Arc<MsgEvent>, bot: Arc<RuntimeBot>) {
     let group_id = event.group_id.unwrap();
