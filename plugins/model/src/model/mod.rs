@@ -1,6 +1,6 @@
 mod group;
 mod private;
-mod utils;
+pub(crate) mod utils;
 
 pub use crate::model::group::group_message_event;
 

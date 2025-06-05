@@ -1,4 +1,4 @@
-use sysinfo::{ProcessExt, System, SystemExt};
+use sysinfo::System;
 use systemstat::Platform;
 
 fn format_uptime(seconds: u64) -> String {
