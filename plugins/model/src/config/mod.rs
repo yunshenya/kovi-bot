@@ -23,8 +23,8 @@ impl ModelConfig {
     pub fn load() -> anyhow::Result<Self> {
         Config::builder()
             .add_source(
-                config::File::with_name("application")
-                    .format(FileFormat::Yaml)
+                config::File::with_name("kovi.plugin")
+                    .format(FileFormat::Toml)
                     .required(false),
             )
             .add_source(
