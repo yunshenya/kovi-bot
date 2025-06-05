@@ -125,15 +125,15 @@ pub async fn params_model(messages: &mut Vec<BotMemory>) -> BotMemory {
     }
 }
 
-pub fn instance_is_ban() -> &'static Mutex<HashMap<i64, bool>> {
+fn instance_is_ban() -> &'static Mutex<HashMap<i64, bool>> {
     &IS_BANNED
 }
 
-pub fn get_memory() -> &'static Mutex<HashMap<i64, Vec<BotMemory>>> {
+fn get_memory() -> &'static Mutex<HashMap<i64, Vec<BotMemory>>> {
     &MEMORY
 }
 
-pub fn get_private_message_memory() -> &'static Mutex<HashMap<i64, Vec<BotMemory>>> {
+fn get_private_message_memory() -> &'static Mutex<HashMap<i64, Vec<BotMemory>>> {
     &PRIVATE_MESSAGE_MEMORY
 }
 
