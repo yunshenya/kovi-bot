@@ -1,5 +1,5 @@
-use kovi::PluginBuilder;
 use crate::model::{group_message_event, private_message_event};
+use kovi::PluginBuilder;
 
 mod config;
 mod model;
@@ -7,7 +7,7 @@ mod utils;
 
 #[kovi::plugin]
 async fn main() {
-    register_chat_function!{
+    register_chat_function! {
         (group_message,group_message_event),
         (private_message, private_message_event)
     }
