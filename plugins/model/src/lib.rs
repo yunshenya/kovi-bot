@@ -104,7 +104,7 @@ async fn private_message_event(event: Arc<MsgEvent>, bot: Arc<RuntimeBot>){
     let time = time_now_data.format("%H:%M:%S").to_string();
     let format_nickname = format!("[{}] {}", time, nick_name);
     if let Some(message) = event.borrow_text(){
-        let mut private = PRIVATE_MESSAGE_MEMORY.lock().await;
+        let mut private = get_private_message_memory().lock().await;
         let history = private.entry(user_id).or_insert(vec![
             BotMemory { role: Roles::System, content: PRIVATE.to_string() },
             BotMemory { role: Roles::User, content: message.to_string() }
@@ -141,7 +141,7 @@ async fn group_message_event(event: Arc<MsgEvent>, bot: Arc<RuntimeBot>){
                 }
             }
         } else {
-            let mut banned_list = IS_BANNED.lock().await;
+            let mut banned_list = instance_is_ban().lock().await;
             match banned_list.get_mut(&group_id) {
                 None => {
                     if message.eq("#禁言") {
@@ -157,11 +157,10 @@ async fn group_message_event(event: Arc<MsgEvent>, bot: Arc<RuntimeBot>){
                             *is_ban = true;
                             bot.send_group_msg(group_id, "禁言成功");
                         } else {
-                            let mut guard = MEMORY.lock().await;
+                            let mut guard = get_memory().lock().await;
                             control_model(&mut guard, group_id, bot, sender, message).await;
                         }
-                    }else {
-                        if message.eq("#结束禁言") {
+                    }else if message.eq("#结束禁言") {
                             *is_ban = false;
                             bot.send_group_msg(group_id, "结束成功");
                         }
@@ -169,7 +168,6 @@ async fn group_message_event(event: Arc<MsgEvent>, bot: Arc<RuntimeBot>){
                 }
             };
         }
-    }
 }
 
 async fn control_model(guard: &mut MutexGuard<'_, HashMap<i64, Vec<BotMemory>>>, group_id: i64, bot: Arc<RuntimeBot>, nickname: String, message: &str){
@@ -264,6 +262,19 @@ fn get_system_info() -> (String, String) {
         process_now = format!("内存占用: {} MB",( process.memory() / 1024) / 1024);
     };
     (update_time, process_now)
+}
+
+
+fn instance_is_ban() -> &'static Mutex<HashMap<i64, bool>>{
+    &IS_BANNED
+}
+
+fn get_memory() -> &'static Mutex<HashMap<i64, Vec<BotMemory>>>{
+    &MEMORY
+}
+
+fn get_private_message_memory() -> &'static Mutex<HashMap<i64, Vec<BotMemory>>>{
+    &PRIVATE_MESSAGE_MEMORY
 }
 
 #[cfg(test)]
