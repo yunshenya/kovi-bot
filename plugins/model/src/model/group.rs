@@ -11,17 +11,7 @@ pub async fn group_message_event(event: Arc<MsgEvent>, bot: Arc<RuntimeBot>) {
     let sender = format!("[{}] {}", time, nickname);
     if let Some(message) = event.borrow_text() {
         if message.eq("#系统信息") {
-            send_sys_info(Arc::clone(&bot), group_id).await;
-            let imgs = event.message.get("image");
-            if imgs.is_empty() {
-                return;
-            }
-            let urls: Vec<_> = imgs
-                .iter()
-                .map(|x| x.data.get("url").unwrap().as_str().unwrap())
-                .collect();
-            
-            bot.send_group_msg(group_id, urls.join("\n"));
+            send_sys_info(bot, group_id).await;
         } else {
             silence(group_id, message, bot, sender).await;
         };
