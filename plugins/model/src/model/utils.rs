@@ -7,6 +7,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 use crate::utils;
+use crate::config;
 
 static MEMORY: LazyLock<Mutex<HashMap<i64, Vec<BotMemory>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -53,7 +54,7 @@ pub async fn control_model(
                 vec![
                     BotMemory {
                         role: Roles::System,
-                        content: crate::config::get().prompt().system_prompt().to_string(),
+                        content: config::get().prompt().system_prompt().to_string(),
                     },
                     BotMemory {
                         role: Roles::User,
@@ -86,9 +87,9 @@ pub async fn control_model(
     }
 }
 pub async fn params_model(messages: &mut Vec<BotMemory>) -> BotMemory {
-    let server_config = crate::config::get().server_config();
+    let server_config = config::get().server_config();
     if messages.len() > 9 {
-        messages.drain(1..3);
+        messages.drain(1..7);
     };
     let bot_conf = ModelConf {
         model: server_config.model_name(),
@@ -199,7 +200,7 @@ pub async fn private_chat(user_id: i64, message: &str, format_nickname:String, b
     let history = private.entry(user_id).or_insert(vec![
         BotMemory {
             role: Roles::System,
-            content: crate::config::get().prompt().private_prompt().to_string(),
+            content: config::get().prompt().private_prompt().to_string(),
         },
         BotMemory {
             role: Roles::User,
