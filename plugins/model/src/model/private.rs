@@ -1,9 +1,10 @@
-use chrono::Local;
-use kovi::{MsgEvent, RuntimeBot};
-use std::sync::Arc;
 use crate::model::utils::private_chat;
+use chrono::Local;
+use kovi::event::PrivateMsgEvent;
+use kovi::RuntimeBot;
+use std::sync::Arc;
 
-pub async fn private_message_event(event: Arc<MsgEvent>, bot: Arc<RuntimeBot>) {
+pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<RuntimeBot>) {
     let user_id = event.user_id;
     let nick_name = event.get_sender_nickname();
     let time_now_data = Local::now();

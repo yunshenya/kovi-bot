@@ -1,10 +1,11 @@
 use crate::model::utils::{send_sys_info, silence};
 use chrono::Local;
-use kovi::{MsgEvent, RuntimeBot};
+use kovi::event::GroupMsgEvent;
+use kovi::RuntimeBot;
 use std::sync::Arc;
 
-pub async fn group_message_event(event: Arc<MsgEvent>, bot: Arc<RuntimeBot>) {
-    let group_id = event.group_id.unwrap();
+pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>) {
+    let group_id = event.group_id;
     let time_now_data = Local::now();
     let time = time_now_data.format("%H:%M:%S").to_string();
     let nickname = event.get_sender_nickname();

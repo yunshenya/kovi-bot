@@ -4,13 +4,13 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-kovi = "0.11.12"
+kovi.workspace = true
 model = { version = "0.1.0", path = "plugins/model" }
 
 [workspace]
 members = ["plugins/model"]
 
 [workspace.dependencies]
-kovi = "0.11.10"
+kovi = "0.12"
 reqwest = { version = "0.12.15", features = ["json", "blocking", "rustls-tls"], default-features = false }
 chrono = "0.4"
