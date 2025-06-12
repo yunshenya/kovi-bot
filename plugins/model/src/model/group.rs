@@ -10,10 +10,13 @@ pub async fn group_message_event(event: Arc<MsgEvent>, bot: Arc<RuntimeBot>) {
     let nickname = event.get_sender_nickname();
     let sender = format!("[{}] {}", time, nickname);
     if let Some(message) = event.borrow_text() {
-        if message.eq("#系统信息") {
-            send_sys_info(bot, group_id).await;
-        } else {
-            silence(group_id, message, bot, sender).await;
-        };
+        match message {
+            "#系统信息" => {
+                send_sys_info(bot, group_id).await;
+            }
+            _ => {
+                silence(group_id, message, bot, sender).await;
+            }
+        }
     }
 }
