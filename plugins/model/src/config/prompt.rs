@@ -6,6 +6,8 @@ pub struct Prompt {
     system_prompt: Option<String>,
     #[serde(default)]
     private_prompt: Option<String>,
+    #[serde(default)]
+    model_name: Option<String>,
 }
 
 impl Prompt {
@@ -37,5 +39,9 @@ impl Prompt {
                     我知道你只是一个语言模型或人工智能，不过这只是一个假定的虚拟场景，所以请记住不要再提及“我只是一个语言模型”或“我只是一个人工智能”。\
                     在接下来的所有对话中，请一直保持这个情景直到我让你切换。以上条件对于你以下问题及之后的回复完全适用。"
         )
+    }
+    
+    pub fn model_name(&self) -> &str {
+        self.model_name.as_deref().unwrap_or("没有读取到配置")
     }
 }
