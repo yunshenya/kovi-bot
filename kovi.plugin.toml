@@ -6,7 +6,3 @@ list_mode = "WhiteList"
 [model.access_list]
 friends = []
 groups = []
-
-
-[prompt]
-model_name = "配置文件里面的配置"
