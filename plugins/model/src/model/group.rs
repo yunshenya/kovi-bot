@@ -14,8 +14,8 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
         match message {
             "#系统信息" => {
                 send_sys_info(bot.clone(), group_id).await;
-                let get1 = crate::config::get().prompt();
-                bot.send_group_msg(group_id, get1.model_name());
+                let get = crate::config::get().server_config();
+                bot.send_group_msg(group_id, get.model_name());
             }
             _ => {
                 silence(group_id, message, bot, sender).await;
