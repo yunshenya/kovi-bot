@@ -7,8 +7,8 @@ edition = "2024"
 kovi.workspace = true
 reqwest.workspace = true
 serde = { version = "1.0.219", features = ["derive"] }
-sysinfo = "0.35.2"
+sysinfo = "0.37.0"
 chrono.workspace = true
 systemstat= "0.2.1"
-config = {version = "0.15.11", features = ["yaml"]}
 anyhow = {version = "1.0.98"}
+config = "0.15.15"

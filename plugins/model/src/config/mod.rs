@@ -64,7 +64,6 @@ impl ModelConfig {
         let default_config = ModelConfig::default();
         let toml_content = toml::to_string_pretty(&default_config)
             .with_context(|| anyhow::anyhow!("Failed to serialize default config"))?;
-
         fs::write(config_path, toml_content)
             .with_context(|| anyhow::anyhow!("Failed to write config file: {}", config_path))?;
         Ok(())
