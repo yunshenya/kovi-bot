@@ -1,10 +1,9 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize, Debug, Serialize)]
+#[serde(default)]
 pub struct ServerConfig {
-    #[serde(default="default_url")]
     url: String,
-    #[serde(default="default_model_name")]
     model_name: String,
 }
 
@@ -22,12 +21,9 @@ impl ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self{
-            url: default_url(),
-            model_name: default_model_name(),
+            url: "https://api.siliconflow.cn/v1/chat/completions".to_string() ,
+            model_name: "Qwen/QwQ-32B".to_string(),
         }
     }
 }
 
-fn default_url() -> String { "https://api.siliconflow.cn/v1/chat/completions".to_string() }
-
-fn default_model_name() -> String { "Qwen/QwQ-32B".to_string() }

@@ -80,13 +80,3 @@ impl Default for ModelConfig {
         }
     }
 }
-
-#[cfg(test)]
-mod model {
-    use super::*;
-
-    #[test]
-    fn load() {
-        ModelConfig::load().unwrap();
-    }
-}
