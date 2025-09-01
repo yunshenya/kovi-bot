@@ -14,16 +14,13 @@ mod server;
 static MODEL_CONFIG: LazyLock<ModelConfig> =
     LazyLock::new(|| ModelConfig::load().expect("Failed to load config file"));
 
-static SERVER_CONFIG: LazyLock<ServerConfig> = LazyLock::new(ServerConfig::default);
 
-static PROMPT: LazyLock<Prompt> = LazyLock::new(Prompt::default);
 
 #[derive(Debug, Deserialize, Serialize)]
+#[serde(default)]
 pub struct ModelConfig {
-    #[serde(default)]
-    prompt: Option<Prompt>,
-    #[serde(default)]
-    server_config: Option<ServerConfig>,
+    prompt: Prompt,
+    server_config: ServerConfig,
 }
 
 impl ModelConfig {
@@ -53,11 +50,11 @@ impl ModelConfig {
     }
 
     pub fn prompt(&self) -> &Prompt {
-        self.prompt.as_ref().unwrap_or(&PROMPT)
+        &self.prompt
     }
 
     pub fn server_config(&self) -> &ServerConfig {
-        &self.server_config.as_ref().unwrap_or(&SERVER_CONFIG)
+        &self.server_config
     }
 
     fn create_default_config_file(config_path: &str) -> anyhow::Result<()> {
@@ -78,8 +75,8 @@ pub fn get() -> &'static ModelConfig {
 impl Default for ModelConfig {
     fn default() -> Self {
         Self{
-            prompt: Option::from(Prompt::default()),
-            server_config: Option::from(ServerConfig::default()),
+            prompt: Prompt::default(),
+            server_config: ServerConfig::default(),
         }
     }
 }
@@ -87,7 +84,6 @@ impl Default for ModelConfig {
 #[cfg(test)]
 mod model {
     use super::*;
-
 
     #[test]
     fn load() {
