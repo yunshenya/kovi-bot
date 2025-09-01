@@ -17,7 +17,6 @@ impl Prompt {
     }
 }
 
-
 impl Default for Prompt {
     fn default() -> Self {
         Self{

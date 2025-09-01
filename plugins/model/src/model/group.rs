@@ -1,7 +1,7 @@
 use crate::model::utils::{send_sys_info, silence};
 use chrono::Local;
-use kovi::event::GroupMsgEvent;
 use kovi::RuntimeBot;
+use kovi::event::GroupMsgEvent;
 use std::sync::Arc;
 
 pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>) {

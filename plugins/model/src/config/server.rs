@@ -17,13 +17,11 @@ impl ServerConfig {
     }
 }
 
-
 impl Default for ServerConfig {
     fn default() -> Self {
-        Self{
-            url: "https://api.siliconflow.cn/v1/chat/completions".to_string() ,
+        Self {
+            url: "https://api.siliconflow.cn/v1/chat/completions".to_string(),
             model_name: "Qwen/QwQ-32B".to_string(),
         }
     }
 }
-

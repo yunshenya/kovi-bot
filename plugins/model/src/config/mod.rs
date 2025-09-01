@@ -1,12 +1,12 @@
-use std::fs;
-use std::path::Path;
 use crate::config::prompt::Prompt;
 use crate::config::server::ServerConfig;
 use anyhow::Context;
 use config::{Config, FileFormat};
-use serde::{Deserialize, Serialize};
-use std::sync::LazyLock;
 use kovi::toml;
+use serde::{Deserialize, Serialize};
+use std::fs;
+use std::path::Path;
+use std::sync::LazyLock;
 
 mod prompt;
 mod server;
@@ -14,9 +14,7 @@ mod server;
 static MODEL_CONFIG: LazyLock<ModelConfig> =
     LazyLock::new(|| ModelConfig::load().expect("Failed to load config file"));
 
-
-
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Default)]
 #[serde(default)]
 pub struct ModelConfig {
     prompt: Prompt,
@@ -71,12 +69,3 @@ pub fn get() -> &'static ModelConfig {
     &MODEL_CONFIG
 }
 
-
-impl Default for ModelConfig {
-    fn default() -> Self {
-        Self{
-            prompt: Prompt::default(),
-            server_config: ServerConfig::default(),
-        }
-    }
-}

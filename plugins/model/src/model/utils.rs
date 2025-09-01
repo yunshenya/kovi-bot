@@ -1,3 +1,5 @@
+use crate::config;
+use crate::utils;
 use kovi::RuntimeBot;
 use kovi::serde_json::Value;
 use kovi::tokio::sync::{Mutex, MutexGuard};
@@ -6,8 +8,6 @@ use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
-use crate::utils;
-use crate::config;
 
 static MEMORY: LazyLock<Mutex<HashMap<i64, Vec<BotMemory>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -138,8 +138,7 @@ fn get_private_message_memory() -> &'static Mutex<HashMap<i64, Vec<BotMemory>>> 
     &PRIVATE_MESSAGE_MEMORY
 }
 
-
-pub async fn silence(group_id: i64, message: &str, bot: Arc<RuntimeBot>, sender:String) {
+pub async fn silence(group_id: i64, message: &str, bot: Arc<RuntimeBot>, sender: String) {
     let mut banned_list = instance_is_ban().lock().await;
     match banned_list.get_mut(&group_id) {
         None => {
@@ -166,7 +165,6 @@ pub async fn silence(group_id: i64, message: &str, bot: Arc<RuntimeBot>, sender:
         }
     }
 }
-
 
 pub async fn send_sys_info(bot: Arc<RuntimeBot>, group_id: i64) {
     match std::env::var("BOT_API_TOKEN") {
@@ -195,7 +193,12 @@ pub async fn send_sys_info(bot: Arc<RuntimeBot>, group_id: i64) {
     }
 }
 
-pub async fn private_chat(user_id: i64, message: &str, format_nickname:String, bot: Arc<RuntimeBot>) {
+pub async fn private_chat(
+    user_id: i64,
+    message: &str,
+    format_nickname: String,
+    bot: Arc<RuntimeBot>,
+) {
     let mut private = get_private_message_memory().lock().await;
     let history = private.entry(user_id).or_insert(vec![
         BotMemory {

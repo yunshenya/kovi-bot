@@ -1,7 +1,7 @@
 use crate::model::utils::private_chat;
 use chrono::Local;
-use kovi::event::PrivateMsgEvent;
 use kovi::RuntimeBot;
+use kovi::event::PrivateMsgEvent;
 use std::sync::Arc;
 
 pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<RuntimeBot>) {
