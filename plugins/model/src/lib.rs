@@ -1,7 +1,7 @@
 use crate::model::{group_message_event, private_message_event};
 use kovi::PluginBuilder;
 
-mod config;
+pub mod config;
 mod model;
 mod utils;
 

@@ -4,6 +4,7 @@ use chrono::Local;
 use kovi::RuntimeBot;
 use kovi::event::GroupMsgEvent;
 use std::sync::Arc;
+use std::time::Duration;
 
 pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>) {
     let group_id = event.group_id;
@@ -30,7 +31,41 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
                     Err(e) => bot.send_group_msg(group_id, format!("重载失败： {}", e))
                 }
             },
-            
+
+            "#启用自动重载" => {
+                if config::is_auto_reload_enabled() {
+                    bot.send_group_msg(group_id, "自动重载已经启用");
+                } else {
+                    config::enable_auto_reload(Duration::from_secs(5));
+                    bot.send_group_msg(group_id, "自动重载已启用，每5秒检查一次");
+                }
+            },
+
+            "#禁用自动重载" => {
+                if config::is_auto_reload_enabled() {
+                    config::disable_auto_reload();
+                    bot.send_group_msg(group_id, "自动重载已禁用");
+                } else {
+                    bot.send_group_msg(group_id, "自动重载未启用");
+                }
+            },
+
+            "#检查配置变化" => {
+                match config::check_and_reload() {
+                    Ok(true) => bot.send_group_msg(group_id, "检测到配置变化，已自动重载"),
+                    Ok(false) => bot.send_group_msg(group_id, "配置文件无变化"),
+                    Err(e) => bot.send_group_msg(group_id, format!("检查配置失败: {}", e)),
+                }
+            },
+
+            "#自动重载状态" => {
+                let status = if config::is_auto_reload_enabled() {
+                    "已启用"
+                } else {
+                    "已禁用"
+                };
+                bot.send_group_msg(group_id, format!("配置自动重载状态: {}", status));
+            },
             _ => {
                 silence(group_id, message, bot, sender).await;
             }
