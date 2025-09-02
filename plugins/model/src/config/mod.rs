@@ -6,7 +6,7 @@ use kovi::toml;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
-use std::sync::{Arc, RwLock, LazyLock, atomic::{AtomicBool, Ordering}};
+use std::sync::{atomic::{AtomicBool, Ordering}, Arc, LazyLock, RwLock};
 use std::time::Duration;
 
 mod prompt;
@@ -213,3 +213,4 @@ pub fn check_and_reload() -> anyhow::Result<bool> {
 pub fn is_auto_reload_enabled() -> bool {
     ModelConfig::is_auto_reload_enabled()
 }
+

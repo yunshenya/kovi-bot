@@ -7,7 +7,12 @@ use reqwest::Client;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap};
 use serde::Serialize;
 use std::collections::HashMap;
+use std::fs;
+use std::path::Path;
 use std::sync::{Arc, LazyLock};
+use std::time::UNIX_EPOCH;
+use anyhow::Context;
+use chrono::{Local, TimeZone};
 
 static MEMORY: LazyLock<Mutex<HashMap<i64, Vec<BotMemory>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -181,12 +186,13 @@ pub async fn send_sys_info(bot: Arc<RuntimeBot>, group_id: i64) {
                 bot.send_group_msg(
                     group_id,
                     format!(
-                        "{} \n系统运行时间：{} \n{} \nLagrange占用: {}MB,\n当前使用的模型为:{}",
+                        "{} \n系统运行时间：{} \n{} \nLagrange占用: {}MB,\n当前使用的模型为:{}\n配置文件最后修改时间为:{}",
                         "对话功能是正常的哦",
                         system_info.0,
                         system_info.1,
                         (now_status / 1024) / 1024,
-                        config::get().server_config().model_name()
+                        config::get().server_config().model_name(),
+                        get_file_modified_time_formatted().unwrap_or(String::from("获取失败")),
                     ),
                 );
             }
@@ -218,4 +224,28 @@ pub async fn private_chat(
     });
     let bot_content = params_model(history).await;
     bot.send_private_msg(user_id, bot_content.content);
+}
+
+
+pub fn get_file_modified_time_formatted() -> anyhow::Result<String> {
+    let config_path = "bot.conf.toml";
+    if !Path::new(config_path).exists() {
+        return Ok("文件不存在".to_string());
+    }
+
+    let metadata = fs::metadata(config_path)
+        .with_context(|| anyhow::anyhow!("Failed to get file metadata"))?;
+
+    let modified = metadata.modified()
+        .with_context(|| anyhow::anyhow!("Failed to get modification time"))?;
+
+    let since_epoch = modified.duration_since(UNIX_EPOCH)
+        .with_context(|| anyhow::anyhow!("Failed to calculate time since epoch"))?;
+
+    // 转换为本地时间并格式化
+    let datetime = Local.timestamp_opt(since_epoch.as_secs() as i64, 0)
+        .single()
+        .ok_or_else(|| anyhow::anyhow!("Invalid timestamp"))?;
+
+    Ok(datetime.format("%Y-%m-%d %H:%M:%S").to_string())
 }
