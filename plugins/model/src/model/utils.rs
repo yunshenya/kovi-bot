@@ -87,7 +87,8 @@ pub async fn control_model(
     }
 }
 pub async fn params_model(messages: &mut Vec<BotMemory>) -> BotMemory {
-    let server_config = config::get().server_config();
+    let config = config::get();
+    let server_config = config.server_config();
     if messages.len() > 9 {
         messages.drain(1..7);
     };
