@@ -180,11 +180,12 @@ pub async fn send_sys_info(bot: Arc<RuntimeBot>, group_id: i64) {
                 bot.send_group_msg(
                     group_id,
                     format!(
-                        "{} \n系统运行时间：{} \n{} \nLagrange占用: {}MB",
+                        "{} \n系统运行时间：{} \n{} \nLagrange占用: {}MB,\n当前使用的模型为:{}",
                         "对话功能是正常的哦",
                         system_info.0,
                         system_info.1,
-                        (now_status / 1024) / 1024
+                        (now_status / 1024) / 1024,
+                        config::get().server_config().model_name()
                     ),
                 );
             }
