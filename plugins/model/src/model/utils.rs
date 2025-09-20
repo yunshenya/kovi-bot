@@ -1,5 +1,7 @@
 use crate::config;
 use crate::utils;
+use crate::memory::{MemoryManager, UserProfile};
+use crate::mood_system::MoodSystem;
 use kovi::RuntimeBot;
 use kovi::serde_json::Value;
 use kovi::tokio::sync::{Mutex, MutexGuard};
@@ -22,6 +24,14 @@ static IS_BANNED: LazyLock<Mutex<HashMap<i64, bool>>> =
 
 static PRIVATE_MESSAGE_MEMORY: LazyLock<Mutex<HashMap<i64, Vec<BotMemory>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+// 全局记忆管理器
+static MEMORY_MANAGER: LazyLock<Arc<MemoryManager>> = 
+    LazyLock::new(|| Arc::new(MemoryManager::new("bot_memory.json")));
+
+// 全局情绪系统
+static MOOD_SYSTEM: LazyLock<MoodSystem> = 
+    LazyLock::new(|| MoodSystem::new(Arc::clone(&MEMORY_MANAGER)));
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -52,6 +62,20 @@ pub async fn control_model(
     nickname: String,
     message: &str,
 ) {
+    // 分析情绪并更新
+    if let Err(e) = MOOD_SYSTEM.analyze_and_update_mood(message, "group_chat").await {
+        eprintln!("Failed to analyze mood: {}", e);
+    }
+
+    // 记录对话记忆
+    if let Err(e) = MEMORY_MANAGER.add_conversation_memory(
+        group_id,
+        &format!("{}: {}", nickname, message),
+        "group_chat"
+    ).await {
+        eprintln!("Failed to add conversation memory: {}", e);
+    }
+
     match guard.get_mut(&group_id) {
         None => {
             guard.insert(
@@ -207,6 +231,23 @@ pub async fn private_chat(
     format_nickname: String,
     bot: Arc<RuntimeBot>,
 ) {
+    // 分析情绪并更新
+    if let Err(e) = MOOD_SYSTEM.analyze_and_update_mood(message, "private_chat").await {
+        eprintln!("Failed to analyze mood: {}", e);
+    }
+
+    // 记录对话记忆
+    if let Err(e) = MEMORY_MANAGER.add_conversation_memory(
+        user_id,
+        &format!("{}: {}", format_nickname, message),
+        "private_chat"
+    ).await {
+        eprintln!("Failed to add conversation memory: {}", e);
+    }
+
+    // 更新用户档案
+    update_user_profile_from_message(user_id, message, &format_nickname).await;
+
     let mut private = get_private_message_memory().lock().await;
     let history = private.entry(user_id).or_insert(vec![
         BotMemory {
@@ -224,6 +265,69 @@ pub async fn private_chat(
     });
     let bot_content = params_model(history).await;
     bot.send_private_msg(user_id, bot_content.content);
+}
+
+async fn update_user_profile_from_message(user_id: i64, message: &str, nickname: &str) {
+    let mut profile = MEMORY_MANAGER.get_user_profile(user_id).await
+        .unwrap_or_else(|| UserProfile {
+            user_id,
+            nickname: nickname.to_string(),
+            personality_traits: Vec::new(),
+            interests: Vec::new(),
+            relationship_level: 1,
+            last_interaction: Local::now(),
+            interaction_count: 0,
+            mood_history: Vec::new(),
+        });
+
+    // 更新互动信息
+    profile.last_interaction = Local::now();
+    profile.interaction_count += 1;
+    
+    // 根据对话内容更新关系等级
+    if message.contains("谢谢") || message.contains("感谢") {
+        profile.relationship_level = (profile.relationship_level + 1).min(10);
+    }
+
+    // 提取兴趣关键词
+    let interests = extract_interests_from_message(message);
+    for interest in interests {
+        if !profile.interests.contains(&interest) {
+            profile.interests.push(interest);
+        }
+    }
+
+    // 更新用户档案
+    if let Err(e) = MEMORY_MANAGER.update_user_profile(user_id, profile).await {
+        eprintln!("Failed to update user profile: {}", e);
+    }
+}
+
+fn extract_interests_from_message(message: &str) -> Vec<String> {
+    let mut interests = Vec::new();
+    let message_lower = message.to_lowercase();
+    
+    let interest_keywords = [
+        ("游戏", vec!["游戏", "打游戏", "玩", "lol", "王者", "吃鸡"]),
+        ("音乐", vec!["音乐", "歌", "听歌", "唱歌", "演唱会"]),
+        ("电影", vec!["电影", "看片", "影院", "大片"]),
+        ("读书", vec!["书", "读书", "小说", "文学"]),
+        ("运动", vec!["运动", "跑步", "健身", "锻炼"]),
+        ("美食", vec!["吃", "美食", "餐厅", "料理", "做饭"]),
+        ("旅行", vec!["旅行", "旅游", "出去玩", "度假"]),
+        ("学习", vec!["学习", "考试", "课程", "知识"]),
+    ];
+
+    for (category, keywords) in &interest_keywords {
+        for keyword in keywords {
+            if message_lower.contains(keyword) {
+                interests.push(category.to_string());
+                break;
+            }
+        }
+    }
+
+    interests
 }
 
 
