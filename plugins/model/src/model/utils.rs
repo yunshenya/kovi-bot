@@ -291,11 +291,14 @@ async fn update_user_profile_from_message(user_id: i64, message: &str, nickname:
 
     // 提取兴趣关键词
     let interests = extract_interests_from_message(message);
+    if interests.is_empty() {
+        return;
+    }
     for interest in interests {
         if !profile.interests.contains(&interest) {
             profile.interests.push(interest);
         }
-    }
+    };
 
     // 更新用户档案
     if let Err(e) = MEMORY_MANAGER.update_user_profile(user_id, profile).await {

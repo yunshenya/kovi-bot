@@ -1,11 +1,11 @@
+use anyhow::Result;
+use chrono::{DateTime, Local};
+use kovi::tokio::sync::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
-use kovi::tokio::sync::Mutex;
-use chrono::{DateTime, Local};
-use anyhow::Result;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct MemoryEntry {
@@ -114,8 +114,10 @@ impl MemoryManager {
     }
 
     pub async fn add_memory(&self, memory: MemoryEntry) -> Result<()> {
-        let mut memories = self.memories.lock().await;
-        memories.insert(memory.id.clone(), memory);
+        {
+            let mut memories = self.memories.lock().await;
+            memories.insert(memory.id.clone(), memory);
+        }
         self.save_memories().await
     }
 
@@ -149,7 +151,7 @@ impl MemoryManager {
         memories
             .values()
             .filter(|m| m.content.to_lowercase().contains(&query.to_lowercase()) ||
-                       m.tags.iter().any(|tag| tag.to_lowercase().contains(&query.to_lowercase())))
+                        m.tags.iter().any(|tag| tag.to_lowercase().contains(&query.to_lowercase())))
             .cloned()
             .collect()
     }
@@ -177,8 +179,10 @@ impl MemoryManager {
     }
 
     pub async fn update_bot_personality(&self, personality: BotPersonality) -> Result<()> {
-        let mut bot_personality = self.bot_personality.lock().await;
-        *bot_personality = personality;
+        {
+            let mut bot_personality = self.bot_personality.lock().await;
+            *bot_personality = personality;
+        }
         self.save_memories().await
     }
 

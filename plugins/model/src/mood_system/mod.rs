@@ -70,7 +70,7 @@ impl MoodSystem {
         let new_mood = self.analyze_mood_from_message(message, context, &current_personality).await;
         
         // 更新机器人人格
-        let mut updated_personality = current_personality.clone();
+        let mut updated_personality = current_personality;
         updated_personality.current_mood = new_mood.to_string();
         updated_personality.last_mood_change = Local::now();
         
@@ -98,7 +98,7 @@ impl MoodSystem {
         
         // 结合当前情绪状态
         let final_mood = self.combine_mood_analysis(mood_scores, context_mood, current_personality);
-        
+
         final_mood
     }
 
@@ -238,10 +238,10 @@ impl MoodSystem {
         // 如果所有情绪得分都很低，保持当前情绪或转为中性
         if best_score == 0 {
             let current_mood = Mood::from_string(&current_personality.current_mood);
-            if current_personality.energy_level > 5 {
-                return current_mood;
+            return if current_personality.energy_level > 5 {
+                current_mood
             } else {
-                return Mood::Neutral;
+                Mood::Neutral
             }
         }
 
