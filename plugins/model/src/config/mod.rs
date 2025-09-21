@@ -1,3 +1,12 @@
+//! # 配置管理模块
+//! 
+//! 提供完整的配置管理功能，包括：
+//! - 配置文件加载和验证
+//! - 自动重载监控
+//! - 默认配置生成
+//! - 线程安全的配置访问
+//! - 配置验证和错误处理
+
 use crate::config::prompt::Prompt;
 use crate::config::server::ServerConfig;
 use anyhow::Context;
@@ -12,28 +21,59 @@ use std::time::Duration;
 mod prompt;
 mod server;
 
+/// 全局配置实例
+/// 
+/// 使用LazyLock确保线程安全的单例模式，在首次访问时加载配置
+/// 配置存储在RwLock中，支持多读单写访问
 static MODEL_CONFIG: LazyLock<Arc<RwLock<ModelConfig>>> =
     LazyLock::new(|| Arc::new(RwLock::new(ModelConfig::load().expect("Failed to load config file"))));
 
-// 自动重载控制和状态
+/// 自动重载功能控制标志
 static AUTO_RELOAD_ENABLED: AtomicBool = AtomicBool::new(false);
+/// 配置监控线程运行状态
 static WATCHER_RUNNING: AtomicBool = AtomicBool::new(false);
 
+/// 模型配置结构体
+/// 
+/// 包含机器人的所有配置信息，包括提示词和服务器配置
 #[derive(Debug, Deserialize, Serialize, Default, Clone, PartialEq)]
 #[serde(default)]
 pub struct ModelConfig {
+    /// 提示词配置
     prompt: Prompt,
+    /// 服务器配置
     server_config: ServerConfig,
 }
 
 impl ModelConfig {
+    /// 加载配置文件
+    /// 
+    /// 从 `bot.conf.toml` 文件加载配置，如果文件不存在则创建默认配置
+    /// 
+    /// # 返回值
+    /// 成功时返回配置实例，失败时返回错误
     pub fn load() -> anyhow::Result<Self> {
         let config_path = "bot.conf.toml";
         if !Path::new(config_path).exists() {
+            println!("[INFO] 配置文件不存在，创建默认配置文件: {}", config_path);
             Self::create_default_config_file(config_path)
                 .with_context(|| anyhow::anyhow!("Failed to create default config file"))?;
         };
-        Self::try_deserialize_config()
+        let config = Self::try_deserialize_config()?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// 验证配置的有效性
+    pub fn validate(&self) -> anyhow::Result<()> {
+        // 验证服务器配置
+        self.server_config.validate()?;
+        
+        // 验证提示配置
+        self.prompt.validate()?;
+        
+        println!("[INFO] 配置验证通过");
+        Ok(())
     }
 
     pub fn prompt(&self) -> &Prompt {

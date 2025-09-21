@@ -1,23 +1,50 @@
+//! # 情绪系统模块
+//! 
+//! 提供智能的情绪分析和人格调整功能，包括：
+//! - 多维度情绪识别和分析
+//! - 基于关键词的情绪评分算法
+//! - 上下文感知的情绪调整
+//! - 自然情绪变化和漂移
+//! - 情绪缓存和性能优化
+//! - 人格特征动态调整
+
 use crate::memory::{MemoryManager, BotPersonality};
 use chrono::{Duration, Local, Timelike};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::Mutex;
 use anyhow::Result;
 
+/// 情绪状态枚举
+/// 
+/// 定义机器人可能的各种情绪状态，用于人格化和个性化交互
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Hash)]
 pub enum Mood {
-    Happy,      // 开心
-    Sad,        // 难过
-    Angry,      // 生气
-    Excited,    // 兴奋
-    Calm,       // 平静
-    Curious,    // 好奇
-    Playful,    // 顽皮
-    Thoughtful, // 深思
-    Lonely,     // 孤独
-    Confident,  // 自信
-    Shy,        // 害羞
-    Neutral,    // 中性
+    /// 开心：积极正面的情绪状态
+    Happy,
+    /// 难过：消极悲伤的情绪状态
+    Sad,
+    /// 生气：愤怒不满的情绪状态
+    Angry,
+    /// 兴奋：高度活跃的情绪状态
+    Excited,
+    /// 平静：稳定平和的情绪状态
+    Calm,
+    /// 好奇：探索求知的情绪状态
+    Curious,
+    /// 顽皮：活泼调皮的情绪状态
+    Playful,
+    /// 深思：理性思考的情绪状态
+    Thoughtful,
+    /// 孤独：缺乏陪伴的情绪状态
+    Lonely,
+    /// 自信：确信肯定的情绪状态
+    Confident,
+    /// 害羞：内向拘谨的情绪状态
+    Shy,
+    /// 中性：平衡稳定的情绪状态
+    Neutral,
 }
 
 impl Mood {
@@ -56,23 +83,80 @@ impl Mood {
     }
 }
 
+/// 情绪系统结构体
+/// 
+/// 负责分析用户消息的情绪并调整机器人的人格状态
+/// 包含情绪缓存机制以提高性能
 pub struct MoodSystem {
+    /// 记忆管理器引用，用于获取和更新机器人人格
     memory_manager: Arc<MemoryManager>,
+    /// 情绪分析缓存，避免重复计算相同消息的情绪
+    mood_cache: Arc<Mutex<HashMap<String, (Mood, chrono::DateTime<Local>)>>>,
 }
 
 impl MoodSystem {
+    /// 创建新的情绪系统实例
+    /// 
+    /// # 参数
+    /// * `memory_manager` - 记忆管理器实例
+    /// 
+    /// # 返回值
+    /// 初始化的MoodSystem实例
     pub fn new(memory_manager: Arc<MemoryManager>) -> Self {
-        Self { memory_manager }
+        Self { 
+            memory_manager,
+            mood_cache: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 
+    /// 分析消息情绪并更新机器人人格
+    /// 
+    /// 这是情绪系统的核心函数，执行以下步骤：
+    /// 1. 检查情绪分析缓存（5分钟内有效）
+    /// 2. 分析消息内容确定情绪
+    /// 3. 更新缓存并清理过期数据
+    /// 4. 调整机器人人格属性
+    /// 5. 保存更新后的人格状态
+    /// 
+    /// # 参数
+    /// * `message` - 要分析的消息内容
+    /// * `context` - 消息上下文（如"group_chat"、"private_chat"）
+    /// 
+    /// # 返回值
+    /// 成功时返回分析出的情绪状态，失败时返回错误
     pub async fn analyze_and_update_mood(&self, message: &str, context: &str) -> Result<Mood> {
+        // 检查缓存
+        let cache_key = format!("{}:{}", message, context);
+        let now = Local::now();
+        
+        {
+            let cache = self.mood_cache.lock().unwrap();
+            if let Some((cached_mood, cache_time)) = cache.get(&cache_key) {
+                // 如果缓存时间在5分钟内，直接返回缓存结果
+                if now.signed_duration_since(*cache_time) < Duration::minutes(5) {
+                    return Ok(cached_mood.clone());
+                }
+            }
+        }
+
         let current_personality = self.memory_manager.get_bot_personality().await;
         let new_mood = self.analyze_mood_from_message(message, context, &current_personality).await;
+        
+        // 更新缓存
+        {
+            let mut cache = self.mood_cache.lock().unwrap();
+            cache.insert(cache_key, (new_mood.clone(), now));
+            
+            // 清理过期缓存
+            cache.retain(|_, (_, cache_time)| {
+                now.signed_duration_since(*cache_time) < Duration::hours(1)
+            });
+        }
         
         // 更新机器人人格
         let mut updated_personality = current_personality;
         updated_personality.current_mood = new_mood.to_string();
-        updated_personality.last_mood_change = Local::now();
+        updated_personality.last_mood_change = now;
         
         // 根据情绪调整其他属性
         self.adjust_personality_traits(&mut updated_personality, &new_mood);
@@ -102,6 +186,31 @@ impl MoodSystem {
         final_mood
     }
 
+    /// 计算消息的情绪得分
+    /// 
+    /// 使用关键词匹配算法分析消息内容，为每种情绪计算得分
+    /// 
+    /// ## 评分规则
+    /// - **高权重关键词** (+2分)：开心、难过、生气、兴奋、孤独等强烈情绪
+    /// - **中权重关键词** (+1分)：好奇、顽皮、深思、自信、害羞等温和情绪
+    /// 
+    /// ## 关键词分类
+    /// - **开心**：开心、高兴、快乐、哈哈、😊、😄、好棒、太好了、喜欢
+    /// - **难过**：难过、伤心、哭、😢、😭、糟糕、不好、讨厌
+    /// - **生气**：生气、愤怒、讨厌、烦、😠、😡、气死
+    /// - **兴奋**：兴奋、激动、太棒了、哇、！、!!!、😆、😃
+    /// - **好奇**：什么、为什么、怎么、？、???、好奇、想知道
+    /// - **顽皮**：调皮、顽皮、哈哈、嘿嘿、😏、😜、开玩笑
+    /// - **深思**：思考、想想、觉得、认为、可能、也许
+    /// - **孤独**：一个人、孤单、寂寞、没人、只有我
+    /// - **自信**：肯定、一定、当然、没问题、我可以、我能
+    /// - **害羞**：害羞、不好意思、脸红、😳、尴尬
+    /// 
+    /// # 参数
+    /// * `message` - 要分析的消息内容
+    /// 
+    /// # 返回值
+    /// 各种情绪及其得分的映射表
     fn calculate_mood_scores(&self, message: &str) -> std::collections::HashMap<Mood, i32> {
         let mut scores = std::collections::HashMap::new();
         

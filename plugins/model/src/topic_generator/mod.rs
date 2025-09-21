@@ -1,28 +1,55 @@
+//! # 话题生成器模块
+//! 
+//! 提供智能话题生成功能，包括：
+//! - 基于情绪和能量水平的话题选择
+//! - 个性化话题生成
+//! - 话题模板库管理
+//! - 话题分类和标签系统
+
 use crate::memory::MemoryManager;
 use chrono::Local;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use anyhow::Result;
 
+/// 话题结构体
+/// 
+/// 表示一个完整的话题，包含内容、分类、要求等信息
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Topic {
+    /// 话题内容
     pub content: String,
+    /// 话题分类
     pub category: TopicCategory,
+    /// 情绪要求（可选）
     pub mood_requirement: Option<String>,
+    /// 所需能量水平 (0-10)
     pub energy_level_required: u8,
+    /// 话题标签
     pub tags: Vec<String>,
 }
 
+/// 话题分类枚举
+/// 
+/// 定义不同类型的话题，用于分类和筛选
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum TopicCategory {
-    Casual,      // 日常闲聊
-    Deep,        // 深度话题
-    Fun,         // 有趣话题
-    Personal,    // 个人话题
-    Current,     // 时事话题
-    Creative,    // 创意话题
-    Nostalgic,   // 怀旧话题
-    Future,      // 未来话题
+    /// 日常闲聊：轻松随意的话题
+    Casual,
+    /// 深度话题：需要深入思考的话题
+    Deep,
+    /// 有趣话题：娱乐性较强的话题
+    Fun,
+    /// 个人话题：涉及个人经历和感受的话题
+    Personal,
+    /// 时事话题：当前热点和新闻相关话题
+    Current,
+    /// 创意话题：需要创造力和想象力的话题
+    Creative,
+    /// 怀旧话题：回忆过去的话题
+    Nostalgic,
+    /// 未来话题：展望未来的话题
+    Future,
 }
 
 pub struct TopicGenerator {
@@ -163,10 +190,37 @@ impl TopicGenerator {
     async fn select_best_template(
         &self,
         templates: Vec<&TopicTemplate>,
-        _group_id: Option<i64>,
-        _user_id: Option<i64>,
+        group_id: Option<i64>,
+        user_id: Option<i64>,
     ) -> Result<TopicTemplate> {
-        // 简单的随机选择，后续可以加入更复杂的逻辑
+        // 如果有群组或用户信息，尝试选择更相关的话题
+        if let Some(gid) = group_id {
+            if let Some(group_profile) = self.memory_manager.get_group_profile(gid).await {
+                // 根据群组话题偏好选择
+                for template in &templates {
+                    if group_profile.conversation_topics.iter().any(|topic| 
+                        template.tags.iter().any(|tag| tag.contains(topic))
+                    ) {
+                        return Ok((*template).clone());
+                    }
+                }
+            }
+        }
+
+        if let Some(uid) = user_id {
+            if let Some(user_profile) = self.memory_manager.get_user_profile(uid).await {
+                // 根据用户兴趣选择
+                for template in &templates {
+                    if user_profile.interests.iter().any(|interest| 
+                        template.tags.iter().any(|tag| tag.contains(interest))
+                    ) {
+                        return Ok((*template).clone());
+                    }
+                }
+            }
+        }
+
+        // 如果没有匹配的，使用随机选择
         let now = Local::now();
         let seed = now.timestamp() as usize;
         let index = seed % templates.len();
@@ -216,7 +270,7 @@ impl TopicGenerator {
         Ok(None)
     }
 
-    pub async fn should_initiate_conversation(&self, _group_id: Option<i64>, _user_id: Option<i64>) -> bool {
+    pub async fn should_initiate_conversation(&self, group_id: Option<i64>, user_id: Option<i64>) -> bool {
         let bot_personality = self.memory_manager.get_bot_personality().await;
         
         // 检查能量水平和社交信心
@@ -238,10 +292,33 @@ impl TopicGenerator {
             return bot_personality.curiosity_level > 7;
         }
 
+        // 检查特定群组或用户的活跃度
+        if let Some(gid) = group_id {
+            if let Some(group_profile) = self.memory_manager.get_group_profile(gid).await {
+                // 如果群组不活跃，增加主动聊天的概率
+                if group_profile.activity_level < 3 {
+                    return bot_personality.curiosity_level > 5;
+                }
+            }
+        }
+
+        if let Some(uid) = user_id {
+            if let Some(user_profile) = self.memory_manager.get_user_profile(uid).await {
+                // 根据关系等级调整主动聊天的概率
+                match user_profile.relationship_level {
+                    8..=10 => return bot_personality.curiosity_level > 4, // 高关系等级更容易主动聊天
+                    5..=7 => return bot_personality.curiosity_level > 6,
+                    1..=4 => return bot_personality.curiosity_level > 8, // 低关系等级需要更高好奇心
+                    _ => return false,
+                }
+            }
+        }
+
         // 根据情绪决定是否主动发起对话
         match bot_personality.current_mood.as_str() {
             "happy" | "curious" | "playful" => true,
             "neutral" => bot_personality.curiosity_level > 6,
+            "lonely" => bot_personality.social_confidence > 5, // 孤独时更容易主动聊天
             _ => false,
         }
     }

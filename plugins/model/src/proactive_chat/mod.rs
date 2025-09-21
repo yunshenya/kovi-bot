@@ -1,3 +1,11 @@
+//! # 主动聊天模块
+//! 
+//! 提供智能主动聊天功能，包括：
+//! - 基于情绪和社交信心的主动聊天判断
+//! - 智能目标选择（群聊或私聊）
+//! - 活跃度检测和时机判断
+//! - 话题生成和个性化聊天
+
 use crate::memory::MemoryManager;
 use crate::topic_generator::TopicGenerator;
 use crate::mood_system::MoodSystem;
@@ -8,10 +16,19 @@ use kovi::tokio::time::sleep;
 use anyhow::Result;
 use chrono::Local;
 
+pub mod startup;
+
+/// 主动聊天管理器
+/// 
+/// 负责管理机器人的主动聊天行为，包括判断时机、选择目标、生成话题等
 pub struct ProactiveChatManager {
+    /// 记忆管理器，用于获取用户和群组信息
     memory_manager: Arc<MemoryManager>,
+    /// 话题生成器，用于生成个性化话题
     topic_generator: TopicGenerator,
+    /// 情绪系统，用于分析当前情绪状态
     mood_system: MoodSystem,
+    /// 机器人实例，用于发送消息
     bot: Arc<RuntimeBot>,
 }
 
@@ -93,16 +110,29 @@ impl ProactiveChatManager {
     }
 
     async fn get_active_groups(&self) -> Vec<i64> {
-        // 这里应该从实际的群组列表中获取
-        // 暂时返回空列表，实际实现时需要从bot获取群组列表
-        vec![]
+        // 从群组档案中获取活跃群组
+        let group_profiles = self.memory_manager.get_all_group_profiles().await;
+        let now = Local::now();
+        let one_day_ago = now - chrono::Duration::days(1);
+        
+        group_profiles
+            .into_iter()
+            .filter(|profile| profile.last_activity > one_day_ago && profile.activity_level > 3)
+            .map(|profile| profile.group_id)
+            .collect()
     }
 
     async fn get_active_users(&self) -> Vec<i64> {
         // 从用户档案中获取最近活跃的用户
-        // 这里需要访问私有字段，暂时返回空列表
-        // 实际实现时需要添加公共方法
-        vec![]
+        let user_profiles = self.memory_manager.get_all_user_profiles().await;
+        let now = Local::now();
+        let three_days_ago = now - chrono::Duration::days(3);
+        
+        user_profiles
+            .into_iter()
+            .filter(|profile| profile.last_interaction > three_days_ago && profile.relationship_level > 2)
+            .map(|profile| profile.user_id)
+            .collect()
     }
 
     async fn select_chat_target(&self, groups: Vec<i64>, users: Vec<i64>) -> ChatTarget {

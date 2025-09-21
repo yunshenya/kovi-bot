@@ -1,9 +1,18 @@
+//! # 提示词配置模块
+//! 
+//! 管理机器人的提示词配置，包括群聊和私聊的系统提示
+
 use serde::{Deserialize, Serialize};
 
+/// 提示词配置结构体
+/// 
+/// 包含机器人在不同场景下使用的系统提示词
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 #[serde(default)]
 pub struct Prompt {
+    /// 群聊系统提示词
     system_prompt: String,
+    /// 私聊系统提示词
     private_prompt: String,
 }
 
@@ -14,6 +23,28 @@ impl Prompt {
 
     pub fn private_prompt(&self) -> &str {
         self.private_prompt.as_str()
+    }
+
+    /// 验证提示配置
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.system_prompt.is_empty() {
+            return Err(anyhow::anyhow!("系统提示不能为空"));
+        }
+        
+        if self.private_prompt.is_empty() {
+            return Err(anyhow::anyhow!("私聊提示不能为空"));
+        }
+        
+        if self.system_prompt.len() < 10 {
+            return Err(anyhow::anyhow!("系统提示太短，至少需要10个字符"));
+        }
+        
+        if self.private_prompt.len() < 10 {
+            return Err(anyhow::anyhow!("私聊提示太短，至少需要10个字符"));
+        }
+        
+        println!("[INFO] 提示配置验证通过");
+        Ok(())
     }
 }
 

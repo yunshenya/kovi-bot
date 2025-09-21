@@ -1,10 +1,16 @@
 use crate::model::utils::private_chat;
+use crate::proactive_chat::startup;
 use chrono::Local;
 use kovi::RuntimeBot;
 use kovi::event::PrivateMsgEvent;
 use std::sync::Arc;
 
 pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<RuntimeBot>) {
+    // 启动主动聊天管理器（只在第一次启动）
+    if let Some(_proactive_manager) = startup::get_or_create_proactive_manager(Arc::clone(&bot)).await {
+        println!("主动聊天管理器已启动");
+    }
+    
     let user_id = event.user_id;
     let nick_name = event.get_sender_nickname();
     let time_now_data = Local::now();
