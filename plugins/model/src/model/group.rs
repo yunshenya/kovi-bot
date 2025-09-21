@@ -126,6 +126,9 @@ async fn update_group_profile(group_id: i64, message: &str, _nickname: &str) {
 
     // 提取话题关键词
     let topics = extract_topics_from_message(message);
+    if topics.is_empty() {
+        return;
+    }
     for topic in topics {
         if !profile.conversation_topics.contains(&topic) {
             profile.conversation_topics.push(topic);
