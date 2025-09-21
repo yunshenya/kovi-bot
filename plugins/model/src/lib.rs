@@ -38,7 +38,9 @@ static BACKGROUND_TASK_STARTED: AtomicBool = AtomicBool::new(false);
 /// - 注册群聊和私聊消息处理函数
 /// - 启动记忆管理器
 /// - 初始化情绪系统
-/// - 准备主动聊天功能（待bot实例可用时启用）
+/// - 启动后台定期任务（自然情绪变化）
+/// 
+/// 注意：主动聊天功能在消息处理函数中动态启动
 #[kovi::plugin]
 async fn main() {
     // 注册聊天功能宏，定义消息处理函数映射
@@ -57,16 +59,9 @@ async fn main() {
         // 获取全局记忆管理器实例
         let memory_manager = Arc::clone(&crate::memory::MEMORY_MANAGER);
         
-        // 在后台异步任务中准备主动聊天功能
-        // TODO: 当bot实例可用时，启用主动聊天循环
-        // 当前由于kovi框架限制，无法直接获取bot实例
-        // 需要在消息处理函数中动态启动主动聊天管理器
+        // 在后台异步任务中执行定期任务
+        // 注意：主动聊天功能已在消息处理函数中实现，通过startup模块管理
         kovi::tokio::spawn(async move {
-            // 主动聊天功能需要bot实例才能正常工作
-            // 目前暂时注释，等待框架提供获取bot实例的方法
-            // let proactive_manager = crate::proactive_chat::ProactiveChatManager::new(memory_manager, bot);
-            // proactive_manager.start_proactive_chat_loop().await;
-            
             // 创建单一的情绪系统实例，避免重复创建
             let mood_system = crate::mood_system::MoodSystem::new(memory_manager);
             
