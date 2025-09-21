@@ -57,13 +57,13 @@ async fn main() {
     // 确保后台任务只启动一次
     if BACKGROUND_TASK_STARTED.compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
         // 获取全局记忆管理器实例
-        let memory_manager = Arc::clone(&crate::memory::MEMORY_MANAGER);
+        let memory_manager = Arc::clone(&memory::MEMORY_MANAGER);
         
         // 在后台异步任务中执行定期任务
         // 注意：主动聊天功能已在消息处理函数中实现，通过startup模块管理
         kovi::tokio::spawn(async move {
             // 创建单一的情绪系统实例，避免重复创建
-            let mood_system = crate::mood_system::MoodSystem::new(memory_manager);
+            let mood_system = mood_system::MoodSystem::new(memory_manager);
             
             // 定期执行自然情绪变化
             loop {
