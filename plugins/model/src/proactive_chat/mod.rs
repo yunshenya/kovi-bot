@@ -60,7 +60,7 @@ impl ProactiveChatManager {
             }
 
             // 等待一段时间再检查
-            sleep(Duration::from_secs(10)).await; // 5分钟检查一次
+            sleep(Duration::from_secs(300)).await; // 5分钟检查一次
         }
     }
 
