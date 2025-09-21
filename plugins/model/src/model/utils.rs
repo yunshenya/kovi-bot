@@ -26,14 +26,17 @@ static PRIVATE_MESSAGE_MEMORY: LazyLock<Mutex<HashMap<i64, Vec<BotMemory>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 // 全局记忆管理器
-static MEMORY_MANAGER: LazyLock<Arc<MemoryManager>> = 
+static MEMORY_MANAGER: LazyLock<Arc<MemoryManager>> =
     LazyLock::new(|| Arc::new(MemoryManager::new("bot_memory.json")));
 
 // 全局情绪系统
-static MOOD_SYSTEM: LazyLock<MoodSystem> = 
+static MOOD_SYSTEM: LazyLock<MoodSystem> =
     LazyLock::new(|| MoodSystem::new(Arc::clone(&MEMORY_MANAGER)));
 
-#[derive(Debug, Serialize)]
+// 最大记忆条数常量
+const MAX_MEMORY_SIZE: usize = 25;
+
+#[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "lowercase")]
 pub enum Roles {
     System,
@@ -41,7 +44,7 @@ pub enum Roles {
     Assistant,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 pub struct BotMemory {
     pub(crate) role: Roles,
     pub(crate) content: String,
@@ -78,6 +81,7 @@ pub async fn control_model(
 
     match guard.get_mut(&group_id) {
         None => {
+            // 创建新的对话记录
             guard.insert(
                 group_id,
                 vec![
@@ -99,28 +103,60 @@ pub async fn control_model(
                 vec.push(BotMemory {
                     role: Roles::Assistant,
                     content: model.content,
-                })
+                });
+
+                // 检查并限制记忆大小
+                limit_memory_size(vec);
             };
         }
         Some(vec) => {
+            // 添加新的用户消息
             vec.push(BotMemory {
                 role: Roles::User,
                 content: format!("{}:{}", nickname, message),
             });
+
             let resp = params_model(vec).await;
             if !resp.content.contains("[sp]") {
                 bot.send_group_msg(group_id, &resp.content);
             };
             vec.push(resp);
+
+            // 检查并限制记忆大小
+            limit_memory_size(vec);
         }
     }
 }
+
+/// 限制记忆大小，保持最多10条记录（包括system prompt）
+fn limit_memory_size(messages: &mut Vec<BotMemory>) {
+    if messages.len() <= MAX_MEMORY_SIZE {
+        return;
+    }
+
+    // 保留system prompt (第一条消息)
+    let system_message = messages[0].clone();
+
+    // 计算需要保留的消息数量（除了system prompt）
+    let keep_count = MAX_MEMORY_SIZE - 1;
+
+    // 保留最近的对话
+    let recent_messages = messages.drain(messages.len() - keep_count..).collect::<Vec<_>>();
+
+    // 重新构建消息列表
+    messages.clear();
+    messages.push(system_message);
+    messages.extend(recent_messages);
+
+    println!("记忆已清理，当前保留 {} 条记录", messages.len());
+}
+
 pub async fn params_model(messages: &mut Vec<BotMemory>) -> BotMemory {
     let config = config::get();
     let server_config = config.server_config();
-    if messages.len() > 9 {
-        messages.drain(1..7);
-    };
+
+    // 移除了原来的记忆管理逻辑，因为我们现在使用新的limit_memory_size函数
+
     let bot_conf = ModelConf {
         model: server_config.model_name(),
         messages,
@@ -254,17 +290,22 @@ pub async fn private_chat(
             role: Roles::System,
             content: config::get().prompt().private_prompt().to_string(),
         },
-        BotMemory {
-            role: Roles::User,
-            content: message.to_string(),
-        },
     ]);
+
+    // 添加用户消息
     history.push(BotMemory {
         role: Roles::User,
         content: format!("{}:{}", format_nickname, message),
     });
+
     let bot_content = params_model(history).await;
-    bot.send_private_msg(user_id, bot_content.content);
+    bot.send_private_msg(user_id, &bot_content.content);
+
+    // 添加机器人回复
+    history.push(bot_content);
+
+    // 限制私聊记忆大小
+    limit_memory_size(history);
 }
 
 async fn update_user_profile_from_message(user_id: i64, message: &str, nickname: &str) {
@@ -283,7 +324,7 @@ async fn update_user_profile_from_message(user_id: i64, message: &str, nickname:
     // 更新互动信息
     profile.last_interaction = Local::now();
     profile.interaction_count += 1;
-    
+
     // 根据对话内容更新关系等级
     if message.contains("谢谢") || message.contains("感谢") {
         profile.relationship_level = (profile.relationship_level + 1).min(10);
@@ -309,7 +350,7 @@ async fn update_user_profile_from_message(user_id: i64, message: &str, nickname:
 fn extract_interests_from_message(message: &str) -> Vec<String> {
     let mut interests = Vec::new();
     let message_lower = message.to_lowercase();
-    
+
     let interest_keywords = [
         ("游戏", vec!["游戏", "打游戏", "玩", "lol", "王者", "吃鸡"]),
         ("音乐", vec!["音乐", "歌", "听歌", "唱歌", "演唱会"]),
@@ -332,7 +373,6 @@ fn extract_interests_from_message(message: &str) -> Vec<String> {
 
     interests
 }
-
 
 pub fn get_file_modified_time_formatted() -> anyhow::Result<String> {
     let config_path = "bot.conf.toml";
