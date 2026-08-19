@@ -736,7 +736,7 @@ fn split_reply(content: &str) -> Vec<String> {
         .collect::<Vec<_>>();
 
     if marked_sections.len() > 1 {
-        return marked_sections;
+        return sanitize_reply_sections(marked_sections);
     }
 
     let Some(reply) = marked_sections.into_iter().next() else {
@@ -750,10 +750,51 @@ fn split_reply(content: &str) -> Vec<String> {
         .map(ToString::to_string)
         .collect::<Vec<_>>();
     if line_sections.len() > 1 {
-        line_sections
+        sanitize_reply_sections(line_sections)
     } else {
-        vec![reply]
+        sanitize_reply_sections(vec![reply])
     }
+}
+
+fn sanitize_reply_sections(sections: Vec<String>) -> Vec<String> {
+    sections
+        .into_iter()
+        .map(|section| strip_leading_stage_directions(&section))
+        .collect()
+}
+
+/// 模型偶尔会把小说式的舞台说明放在消息开头。QQ 聊天中只保留真正要说的话。
+fn strip_leading_stage_directions(content: &str) -> String {
+    let mut text = content.trim();
+
+    while let Some(rest) = strip_one_leading_bracketed_note(text) {
+        text = rest.trim_start_matches(|character: char| {
+            character.is_whitespace() || matches!(character, '，' | ',' | '。' | '：' | ':')
+        });
+    }
+
+    if text.is_empty() {
+        "……".to_string()
+    } else {
+        text.to_string()
+    }
+}
+
+fn strip_one_leading_bracketed_note(text: &str) -> Option<&str> {
+    let (open, close) = if text.starts_with('[') {
+        ('[', ']')
+    } else if text.starts_with('【') {
+        ('【', '】')
+    } else {
+        return None;
+    };
+
+    let after_open = &text[open.len_utf8()..];
+    let close_index = after_open.find(close)?;
+    if after_open[..close_index].trim().is_empty() {
+        return None;
+    }
+    Some(&after_open[close_index + close.len_utf8()..])
 }
 
 /// 根据当前情绪、能量、社交信心和少量随机浮动，决定下一条消息前的停顿。
@@ -1097,6 +1138,15 @@ mod tests {
             split_reply("第一句\n第二句\n\n第三句"),
             vec!["第一句", "第二句", "第三句"]
         );
+    }
+
+    #[test]
+    fn reply_drops_leading_bracketed_stage_directions() {
+        assert_eq!(
+            split_reply("[听到呼唤，轻轻应了一声] 嗯？这么晚啦……你找我，是有什么心事吗？"),
+            vec!["嗯？这么晚啦……你找我，是有什么心事吗？"]
+        );
+        assert_eq!(split_reply("【有点不好意思】[轻轻点头] 好呀"), vec!["好呀"]);
     }
 
     #[test]
