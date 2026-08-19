@@ -172,13 +172,16 @@ async fn should_continue_conversation(group_id: i64, message: &str) -> bool {
     let Some(state) = states.get_mut(&group_id) else {
         return false;
     };
-    match state.conversation_until {
-        Some(until) if until > Instant::now() => true,
-        _ => {
-            state.conversation_until = None;
-            false
-        }
+    if has_active_conversation_window(state.conversation_until, Instant::now()) {
+        true
+    } else {
+        state.conversation_until = None;
+        false
     }
+}
+
+fn has_active_conversation_window(until: Option<Instant>, now: Instant) -> bool {
+    until.is_some_and(|deadline| deadline > now)
 }
 
 fn is_conversation_follow_up(message: &str) -> bool {
@@ -392,9 +395,10 @@ fn extract_topics_from_message(message: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_topics_from_message, infer_group_personality, is_conversation_follow_up,
-        is_interjection_candidate,
+        extract_topics_from_message, has_active_conversation_window, infer_group_personality,
+        is_conversation_follow_up, is_interjection_candidate,
     };
+    use std::time::{Duration, Instant};
 
     #[test]
     fn group_topics_and_personality_are_learned() {
@@ -422,5 +426,19 @@ mod tests {
         assert!(is_conversation_follow_up("嗯，对呀"));
         assert!(!is_conversation_follow_up("[图片]"));
         assert!(!is_conversation_follow_up("#系统信息"));
+    }
+
+    #[test]
+    fn conversation_window_remains_open_for_three_minutes_then_expires() {
+        let opened_at = Instant::now();
+        let deadline = opened_at + Duration::from_secs(180);
+
+        assert!(has_active_conversation_window(Some(deadline), opened_at));
+        assert!(has_active_conversation_window(
+            Some(deadline),
+            opened_at + Duration::from_secs(179)
+        ));
+        assert!(!has_active_conversation_window(Some(deadline), deadline));
+        assert!(!has_active_conversation_window(None, opened_at));
     }
 }
