@@ -723,20 +723,37 @@ pub async fn private_chat(user_id: i64, message: &str, nickname: String, bot: Ar
     limit_memory_size(&mut history);
 }
 
-/// 将模型给出的回复拆成任意数量的消息。模型不用分隔标记时，仍保持单条发送。
+/// 将模型给出的回复拆成任意数量的消息。
+///
+/// `[[NEXT_MESSAGE]]` 是明确的分段指令；某些模型会自然地以换行分段而省略标记，
+/// 此时也把每个非空行当作一个气泡，避免一段本应连续说出的内容挤成单条消息。
 fn split_reply(content: &str) -> Vec<String> {
-    let mut sections = content
+    let marked_sections = content
         .split(FOLLOW_UP_MARKER)
         .map(str::trim)
-        .filter(|section| !section.is_empty());
+        .filter(|section| !section.is_empty())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
 
-    let Some(first) = sections.next() else {
+    if marked_sections.len() > 1 {
+        return marked_sections;
+    }
+
+    let Some(reply) = marked_sections.into_iter().next() else {
         return vec!["……".to_string()];
     };
 
-    let mut replies = vec![first.to_string()];
-    replies.extend(sections.map(ToString::to_string));
-    replies
+    let line_sections = reply
+        .lines()
+        .map(str::trim)
+        .filter(|section| !section.is_empty())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    if line_sections.len() > 1 {
+        line_sections
+    } else {
+        vec![reply]
+    }
 }
 
 /// 根据当前情绪、能量、社交信心和少量随机浮动，决定下一条消息前的停顿。
@@ -1070,6 +1087,14 @@ mod tests {
     fn reply_can_send_every_model_selected_message() {
         assert_eq!(
             split_reply("第一句 [[NEXT_MESSAGE]] 第二句 [[NEXT_MESSAGE]] 第三句"),
+            vec!["第一句", "第二句", "第三句"]
+        );
+    }
+
+    #[test]
+    fn reply_uses_natural_line_breaks_as_follow_up_fallback() {
+        assert_eq!(
+            split_reply("第一句\n第二句\n\n第三句"),
             vec!["第一句", "第二句", "第三句"]
         );
     }
