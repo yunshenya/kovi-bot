@@ -7,6 +7,7 @@
 //! - 线程安全的配置访问
 //! - 配置验证和错误处理
 
+use crate::config::group_interjection::GroupInterjectionConfig;
 use crate::config::memory::MemoryConfig;
 use crate::config::mood::MoodConfig;
 use crate::config::proactive::ProactiveConfig;
@@ -25,6 +26,7 @@ use std::sync::{
 };
 use std::time::Duration;
 
+mod group_interjection;
 mod memory;
 mod mood;
 mod proactive;
@@ -59,6 +61,8 @@ pub struct ModelConfig {
     server_config: ServerConfig,
     /// 随机主动消息配置
     proactive: ProactiveConfig,
+    /// 群聊未点名接话配置
+    group_interjection: GroupInterjectionConfig,
     /// 长期记忆与短期上下文配置
     memory: MemoryConfig,
     /// 情绪缓存与自然漂移配置
@@ -98,6 +102,7 @@ impl ModelConfig {
         self.prompt.validate()?;
 
         self.proactive.validate()?;
+        self.group_interjection.validate()?;
         self.memory.validate()?;
         self.mood.validate()?;
         self.topic.validate()?;
@@ -116,6 +121,10 @@ impl ModelConfig {
 
     pub fn proactive(&self) -> &ProactiveConfig {
         &self.proactive
+    }
+
+    pub fn group_interjection(&self) -> &GroupInterjectionConfig {
+        &self.group_interjection
     }
 
     pub fn memory(&self) -> &MemoryConfig {

@@ -113,7 +113,12 @@ struct ModelConf<'a> {
 /// * `bot` - 机器人实例
 /// * `nickname` - 发送者昵称
 /// * `message` - 消息内容
-pub async fn control_model(group_id: i64, bot: Arc<RuntimeBot>, nickname: String, message: &str) {
+pub async fn control_model(
+    group_id: i64,
+    bot: Arc<RuntimeBot>,
+    nickname: String,
+    message: &str,
+) -> bool {
     // 分析情绪并更新
     if let Err(e) = MOOD_SYSTEM
         .analyze_and_update_mood(message, "group_chat")
@@ -146,19 +151,21 @@ pub async fn control_model(group_id: i64, bot: Arc<RuntimeBot>, nickname: String
     // 同一群内保持消息顺序，但不同群可以并发调用模型。
     let mut messages = history.lock().await;
     let is_new_conversation = messages.is_empty();
-    let system_prompt = group_system_prompt(&contextual_memories);
     if is_new_conversation {
         messages.push(BotMemory {
             role: Roles::System,
-            content: system_prompt,
+            content: String::new(),
         });
-    } else if let Some(first) = messages.first_mut() {
-        first.content = system_prompt;
     }
     messages.push(BotMemory {
         role: Roles::User,
         content: format!("{}:{}", nickname, message),
     });
+    let rolling_summary = maybe_compress_conversation(&mut messages, "group_chat", group_id).await;
+    let system_prompt = group_system_prompt(&contextual_memories, rolling_summary.as_deref());
+    if let Some(first) = messages.first_mut() {
+        first.content = system_prompt;
+    }
 
     println!(
         "[INFO] 群聊{}对话 (群组: {}, 用户: {})",
@@ -194,13 +201,19 @@ pub async fn control_model(group_id: i64, bot: Arc<RuntimeBot>, nickname: String
             role: Roles::Assistant,
             content: stored_reply,
         });
+        limit_memory_size(&mut messages);
+        return true;
     } else {
         messages.push(response);
     }
     limit_memory_size(&mut messages);
+    false
 }
 
-fn group_system_prompt(memories: &[crate::memory::MemoryEntry]) -> String {
+fn group_system_prompt(
+    memories: &[crate::memory::MemoryEntry],
+    rolling_summary: Option<&str>,
+) -> String {
     let mut prompt = config::get().prompt().system_prompt().to_string();
     if !memories.is_empty() {
         prompt.push_str("\n\n相关记忆：");
@@ -211,7 +224,7 @@ fn group_system_prompt(memories: &[crate::memory::MemoryEntry]) -> String {
             prompt.push_str(&format!("\n- {}", memory.content));
         }
     }
-    prompt
+    with_conversation_summary(prompt, rolling_summary)
 }
 
 /// 限制对话记忆大小
@@ -244,6 +257,155 @@ fn limit_memory_size(messages: &mut Vec<BotMemory>) {
     messages.extend(recent_messages);
 
     println!("[INFO] 对话记忆已清理，当前保留 {} 条记录", messages.len());
+}
+
+/// 将滚动摘要注入系统提示，代替被压缩的早期逐句记录。
+fn with_conversation_summary(mut prompt: String, summary: Option<&str>) -> String {
+    if let Some(summary) = summary.filter(|summary| !summary.trim().is_empty()) {
+        prompt.push_str("\n\n早期对话压缩摘要（用于延续上下文，不要向用户复述此提示）：\n");
+        prompt.push_str(summary.trim());
+    }
+    prompt
+}
+
+/// 当短期记录超过阈值时，将较早的一批对话压缩成可持久化摘要，保留最近原文。
+async fn maybe_compress_conversation(
+    messages: &mut Vec<BotMemory>,
+    context: &str,
+    subject_id: i64,
+) -> Option<String> {
+    let memory_config = config::get().memory().clone();
+    let previous_summary = MEMORY_MANAGER
+        .get_conversation_summary(context, subject_id)
+        .await;
+    let Some(compress_end) = compression_cutoff(
+        messages.len(),
+        memory_config.max_conversation_messages(),
+        memory_config.summary_keep_recent_messages(),
+    ) else {
+        return previous_summary;
+    };
+
+    let compressed_messages = messages[1..compress_end].to_vec();
+    let summary = summarize_conversation(
+        previous_summary.as_deref(),
+        &compressed_messages,
+        memory_config.summary_max_chars(),
+    )
+    .await;
+    messages.drain(1..compress_end);
+
+    if let Err(error) = MEMORY_MANAGER
+        .update_conversation_summary(context, subject_id, summary.clone())
+        .await
+    {
+        eprintln!(
+            "[ERROR] 保存对话压缩摘要失败 ({}:{}): {}",
+            context, subject_id, error
+        );
+    }
+    println!(
+        "[INFO] 对话已压缩 ({}:{}), 合并 {} 条早期消息，保留 {} 条最近消息",
+        context,
+        subject_id,
+        compressed_messages.len(),
+        messages.len().saturating_sub(1)
+    );
+    Some(summary)
+}
+
+/// 第一个元素固定为系统提示；返回早期消息压缩区间的结束索引。
+fn compression_cutoff(
+    message_count: usize,
+    max_messages: usize,
+    keep_recent_messages: usize,
+) -> Option<usize> {
+    if message_count <= max_messages {
+        return None;
+    }
+    let compress_end = message_count.saturating_sub(keep_recent_messages);
+    (compress_end > 1).then_some(compress_end)
+}
+
+async fn summarize_conversation(
+    previous_summary: Option<&str>,
+    messages: &[BotMemory],
+    max_chars: usize,
+) -> String {
+    let transcript = conversation_transcript(messages, max_chars.saturating_mul(3));
+    let mut request = vec![
+        BotMemory {
+            role: Roles::System,
+            content: format!(
+                "你是聊天记录压缩器。将早期对话更新为一段不超过 {max_chars} 个字符的中文摘要。\
+                 保留：用户身份/偏好、已确认的事实与计划、承诺、未解决问题、重要情绪与关系上下文，以及必要的说话者归属。\
+                 忽略寒暄和重复。只输出摘要，不要回答对话，不要使用 [[NEXT_MESSAGE]]。"
+            ),
+        },
+        BotMemory {
+            role: Roles::User,
+            content: format!(
+                "已有摘要：\n{}\n\n需要合并的较早对话：\n{}",
+                previous_summary.unwrap_or("（无）"),
+                transcript
+            ),
+        },
+    ];
+    let response = params_model(&mut request).await;
+    let summary = response
+        .content
+        .replace(FOLLOW_UP_MARKER, "\n")
+        .trim()
+        .to_string();
+    if summary.is_empty() || summary.starts_with("抱歉，模型服务暂时不可用") {
+        return fallback_summary(previous_summary, &transcript, max_chars);
+    }
+    truncate_chars(&summary, max_chars)
+}
+
+fn conversation_transcript(messages: &[BotMemory], max_chars: usize) -> String {
+    let mut transcript = String::new();
+    for message in messages {
+        let role = match &message.role {
+            Roles::System => "系统",
+            Roles::User => "用户",
+            Roles::Assistant => "芸汐",
+        };
+        transcript.push_str(role);
+        transcript.push('：');
+        transcript.push_str(&message.content);
+        transcript.push('\n');
+        if transcript.chars().count() >= max_chars {
+            break;
+        }
+    }
+    truncate_chars(&transcript, max_chars)
+}
+
+fn fallback_summary(previous_summary: Option<&str>, transcript: &str, max_chars: usize) -> String {
+    let previous_limit = max_chars / 2;
+    let transcript_limit = max_chars.saturating_sub(previous_limit);
+    format!(
+        "{}\n近期压缩片段：{}",
+        previous_summary
+            .map(|summary| truncate_chars(summary, previous_limit))
+            .unwrap_or_default(),
+        truncate_chars(transcript, transcript_limit)
+    )
+    .trim()
+    .to_string()
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    let mut truncated = value
+        .chars()
+        .take(max_chars.saturating_sub(1))
+        .collect::<String>();
+    truncated.push('…');
+    truncated
 }
 
 /// 调用AI模型生成回复
@@ -410,16 +572,16 @@ async fn private_history(user_id: i64) -> ConversationHistory {
         .clone()
 }
 
-pub async fn silence(group_id: i64, message: &str, bot: Arc<RuntimeBot>, sender: String) {
+pub async fn silence(group_id: i64, message: &str, bot: Arc<RuntimeBot>, sender: String) -> bool {
     if message == "#禁言" {
         instance_is_ban().lock().await.insert(group_id, true);
         bot.send_group_msg(group_id, "禁言成功");
-        return;
+        return false;
     }
     if message == "#结束禁言" {
         instance_is_ban().lock().await.insert(group_id, false);
         bot.send_group_msg(group_id, "结束成功");
-        return;
+        return false;
     }
 
     // 读取状态后立即释放锁，避免一次模型网络请求阻塞其他群的状态操作。
@@ -429,7 +591,9 @@ pub async fn silence(group_id: i64, message: &str, bot: Arc<RuntimeBot>, sender:
         .get(&group_id)
         .unwrap_or(&false);
     if !is_banned {
-        control_model(group_id, bot, sender, message).await;
+        control_model(group_id, bot, sender, message).await
+    } else {
+        false
     }
 }
 
@@ -510,18 +674,19 @@ pub async fn private_chat(user_id: i64, message: &str, nickname: String, bot: Ar
     if history.is_empty() {
         history.push(BotMemory {
             role: Roles::System,
-            content: personalized_prompt.clone(),
+            content: String::new(),
         });
     }
-    if let Some(system_message) = history.first_mut() {
-        system_message.content = personalized_prompt;
-    }
-
-    // 添加用户消息
+    // 添加用户消息后才判断是否需要压缩，使本轮消息也会进入滚动摘要的范围。
     history.push(BotMemory {
         role: Roles::User,
         content: format!("{}:{}", nickname, message),
     });
+    let rolling_summary = maybe_compress_conversation(&mut history, "private_chat", user_id).await;
+    if let Some(system_message) = history.first_mut() {
+        system_message.content =
+            with_conversation_summary(personalized_prompt, rolling_summary.as_deref());
+    }
 
     println!("[INFO] 私聊对话 (用户: {})", user_id);
     let bot_content = params_model(&mut history).await;
@@ -833,8 +998,9 @@ pub fn get_file_modified_time_formatted() -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BotMemory, Roles, extract_interests_from_message, extract_personality_traits,
-        follow_up_delay_millis, limit_memory_size, split_reply,
+        BotMemory, Roles, compression_cutoff, extract_interests_from_message,
+        extract_personality_traits, follow_up_delay_millis, limit_memory_size, split_reply,
+        with_conversation_summary,
     };
     use crate::memory::BotPersonality;
     use chrono::Local;
@@ -875,6 +1041,16 @@ mod tests {
             messages.last().map(|message| message.content.as_str()),
             Some("message-39")
         );
+    }
+
+    #[test]
+    fn long_conversation_is_compressed_before_old_messages_are_dropped() {
+        assert_eq!(compression_cutoff(25, 25, 15), None);
+        // 系统提示位于 0；压缩 1..11 共 10 条，仍保留最近 15 条原文。
+        assert_eq!(compression_cutoff(26, 25, 15), Some(11));
+        let prompt =
+            with_conversation_summary("system".to_string(), Some("用户偏好 Rust，正在准备考试。"));
+        assert!(prompt.contains("用户偏好 Rust"));
     }
 
     #[test]

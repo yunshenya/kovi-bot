@@ -169,6 +169,8 @@ pub struct MemoryManager {
     user_profiles: Arc<Mutex<HashMap<i64, UserProfile>>>,
     /// 群组档案存储 (GroupID -> GroupProfile)
     group_profiles: Arc<Mutex<HashMap<i64, GroupProfile>>>,
+    /// 滚动压缩后的对话摘要（`group:<id>` 或 `private:<id>` -> 摘要）。
+    conversation_summaries: Arc<Mutex<HashMap<String, String>>>,
     /// 机器人人格状态
     bot_personality: Arc<Mutex<BotPersonality>>,
     /// 记忆文件路径
@@ -225,6 +227,7 @@ impl MemoryManager {
             memories: Arc::new(Mutex::new(data.memories)),
             user_profiles: Arc::new(Mutex::new(data.user_profiles)),
             group_profiles: Arc::new(Mutex::new(data.group_profiles)),
+            conversation_summaries: Arc::new(Mutex::new(data.conversation_summaries)),
             bot_personality: Arc::new(Mutex::new(data.bot_personality)),
             memory_file: memory_file.to_string(),
             save_lock: Arc::new(Mutex::new(())),
@@ -461,6 +464,29 @@ impl MemoryManager {
         profiles.get(&group_id).cloned()
     }
 
+    /// 获取某段私聊或群聊的滚动摘要。
+    pub async fn get_conversation_summary(&self, context: &str, subject_id: i64) -> Option<String> {
+        self.conversation_summaries
+            .lock()
+            .await
+            .get(&conversation_summary_key(context, subject_id))
+            .cloned()
+    }
+
+    /// 保存某段私聊或群聊的滚动摘要。每段会覆盖旧摘要，因此不会随轮次无限增长。
+    pub async fn update_conversation_summary(
+        &self,
+        context: &str,
+        subject_id: i64,
+        summary: String,
+    ) -> Result<()> {
+        {
+            let mut summaries = self.conversation_summaries.lock().await;
+            summaries.insert(conversation_summary_key(context, subject_id), summary);
+        }
+        self.save_memories().await
+    }
+
     pub async fn get_all_user_profiles(&self) -> Vec<UserProfile> {
         let profiles = self.user_profiles.lock().await;
         profiles.values().cloned().collect()
@@ -638,6 +664,7 @@ impl MemoryManager {
             memories: self.memories.lock().await.clone(),
             user_profiles: self.user_profiles.lock().await.clone(),
             group_profiles: self.group_profiles.lock().await.clone(),
+            conversation_summaries: self.conversation_summaries.lock().await.clone(),
             bot_personality: self.bot_personality.lock().await.clone(),
         };
 
@@ -739,12 +766,21 @@ fn context_scope(context: &str) -> Option<&'static str> {
     }
 }
 
+fn conversation_summary_key(context: &str, subject_id: i64) -> String {
+    format!(
+        "{}:{}",
+        context_scope(context).unwrap_or(context),
+        subject_id
+    )
+}
+
 #[derive(Debug, Serialize, Deserialize, Default)]
 #[serde(default)]
 struct MemoryData {
     memories: HashMap<String, MemoryEntry>,
     user_profiles: HashMap<i64, UserProfile>,
     group_profiles: HashMap<i64, GroupProfile>,
+    conversation_summaries: HashMap<String, String>,
     bot_personality: BotPersonality,
 }
 
@@ -843,6 +879,36 @@ mod tests {
                 let private_context = manager.get_contextual_memories(1, "private_chat", 10).await;
                 assert_eq!(private_context.len(), 1);
                 assert!(!private_context[0].content.contains("群聊"));
+
+                std::fs::remove_file(path).expect("应清理测试记忆文件");
+            });
+    }
+
+    #[test]
+    fn conversation_summaries_persist_and_keep_scopes_separate() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let path = temporary_memory_path("summary");
+                let manager = MemoryManager::new(path.to_str().expect("临时路径应为 UTF-8"));
+                manager
+                    .update_conversation_summary(
+                        "private_chat",
+                        42,
+                        "用户偏好 Rust，正在准备考试。".to_string(),
+                    )
+                    .await
+                    .expect("摘要应成功持久化");
+
+                let reloaded = MemoryManager::new(path.to_str().expect("临时路径应为 UTF-8"));
+                assert_eq!(
+                    reloaded.get_conversation_summary("private_chat", 42).await,
+                    Some("用户偏好 Rust，正在准备考试。".to_string())
+                );
+                assert_eq!(
+                    reloaded.get_conversation_summary("group_chat", 42).await,
+                    None
+                );
 
                 std::fs::remove_file(path).expect("应清理测试记忆文件");
             });

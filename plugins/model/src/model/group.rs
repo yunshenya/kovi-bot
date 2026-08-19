@@ -5,8 +5,22 @@ use crate::model::utils::{learn_user_profile_from_message, send_sys_info, silenc
 use chrono::Local;
 use kovi::RuntimeBot;
 use kovi::event::GroupMsgEvent;
-use std::sync::Arc;
-use std::time::Duration;
+use kovi::tokio::sync::Mutex;
+use rand::Rng;
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock};
+use std::time::{Duration, Instant};
+
+#[derive(Default)]
+struct GroupInterjectionState {
+    eligible_messages_since_sample: u32,
+    last_interjection: Option<Instant>,
+    conversation_until: Option<Instant>,
+}
+
+/// 未点名接话只维护本地计数和冷却状态；不会为每一条群消息调用模型。
+static GROUP_INTERJECTION_STATE: LazyLock<Mutex<HashMap<i64, GroupInterjectionState>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>) {
     let group_id = event.group_id;
@@ -95,10 +109,24 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
                 bot.send_group_msg(group_id, &status_msg);
             }
             _ => {
-                // 群聊中只在被 @ 或明确叫名字时回复，普通消息仍用于群组档案与话题学习。
+                // 被点名时始终处理；未点名消息仅由本地节流器偶尔抽样，不逐条调用模型。
                 if is_addressed_to_bot(&event, message) || matches!(message, "#禁言" | "#结束禁言")
                 {
-                    silence(group_id, message, bot, sender).await;
+                    if silence(group_id, message, bot, sender).await {
+                        activate_conversation_window(group_id).await;
+                    }
+                } else if should_continue_conversation(group_id, message).await {
+                    println!("[INFO] 群聊接续对话 (群组: {})", group_id);
+                    if silence(group_id, message, bot, sender).await {
+                        activate_conversation_window(group_id).await;
+                    } else {
+                        close_conversation_window(group_id).await;
+                    }
+                } else if should_interject(group_id, message).await {
+                    println!("[INFO] 群聊未点名接话 (群组: {})", group_id);
+                    if silence(group_id, message, bot, sender).await {
+                        activate_conversation_window(group_id).await;
+                    }
                 } else if let Err(error) = MEMORY_MANAGER
                     .add_conversation_memory(
                         group_id,
@@ -115,6 +143,133 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
             }
         }
     }
+}
+
+/// 机器人成功回复后开启或续期窗口，使用户可以不重复叫名字而继续对话。
+async fn activate_conversation_window(group_id: i64) {
+    let duration = Duration::from_secs(
+        config::get()
+            .group_interjection()
+            .conversation_window_secs(),
+    );
+    let mut states = GROUP_INTERJECTION_STATE.lock().await;
+    states.entry(group_id).or_default().conversation_until = Some(Instant::now() + duration);
+}
+
+async fn close_conversation_window(group_id: i64) {
+    if let Some(state) = GROUP_INTERJECTION_STATE.lock().await.get_mut(&group_id) {
+        state.conversation_until = None;
+    }
+}
+
+/// 在窗口内，仅对本地判断像在继续聊天的消息调用模型；无关消息仍不消耗 token。
+async fn should_continue_conversation(group_id: i64, message: &str) -> bool {
+    if !is_conversation_follow_up(message) {
+        return false;
+    }
+
+    let mut states = GROUP_INTERJECTION_STATE.lock().await;
+    let Some(state) = states.get_mut(&group_id) else {
+        return false;
+    };
+    match state.conversation_until {
+        Some(until) if until > Instant::now() => true,
+        _ => {
+            state.conversation_until = None;
+            false
+        }
+    }
+}
+
+fn is_conversation_follow_up(message: &str) -> bool {
+    let text = message.trim();
+    if text.is_empty() || text.starts_with('#') {
+        return false;
+    }
+
+    let follow_up_cues = [
+        "？",
+        "?",
+        "你",
+        "吗",
+        "谢谢",
+        "好呀",
+        "好的",
+        "对啊",
+        "是吗",
+        "真的",
+        "然后",
+        "继续",
+        "为什么",
+        "怎么",
+        "能不能",
+        "我也",
+        "哈哈",
+        "嗯",
+        "对",
+        "好",
+        "行",
+        "可以",
+    ];
+    follow_up_cues.iter().any(|cue| text.contains(cue))
+}
+
+/// 仅用本地关键词、计数、冷却和概率筛选未点名接话机会；这里不会请求模型。
+async fn should_interject(group_id: i64, message: &str) -> bool {
+    let config = config::get().group_interjection().clone();
+    if !config.enabled() || !is_interjection_candidate(message, config.min_message_chars()) {
+        return false;
+    }
+
+    let mut states = GROUP_INTERJECTION_STATE.lock().await;
+    let state = states.entry(group_id).or_default();
+    if state
+        .last_interjection
+        .is_some_and(|last| last.elapsed() < Duration::from_secs(config.cooldown_secs()))
+    {
+        return false;
+    }
+
+    state.eligible_messages_since_sample = state.eligible_messages_since_sample.saturating_add(1);
+    if state.eligible_messages_since_sample < config.min_eligible_messages() {
+        return false;
+    }
+    // 每积累一批候选消息才抽样一次；未抽中也重新累计，避免逐条消耗 token。
+    state.eligible_messages_since_sample = 0;
+    if !rand::rng().random_ratio(config.response_probability_percent().into(), 100) {
+        return false;
+    }
+
+    state.last_interjection = Some(Instant::now());
+    true
+}
+
+fn is_interjection_candidate(message: &str, min_message_chars: usize) -> bool {
+    let text = message.trim();
+    if text.chars().count() < min_message_chars || text.starts_with('#') {
+        return false;
+    }
+
+    let conversational_cues = [
+        "？",
+        "?",
+        "怎么",
+        "为什么",
+        "有没有",
+        "推荐",
+        "你们觉得",
+        "如何",
+        "要不要",
+        "求助",
+        "哈哈",
+        "笑死",
+        "开心",
+        "难过",
+        "担心",
+        "加油",
+    ];
+    conversational_cues.iter().any(|cue| text.contains(cue))
+        || !extract_topics_from_message(text).is_empty()
 }
 
 fn is_addressed_to_bot(event: &GroupMsgEvent, message: &str) -> bool {
@@ -236,7 +391,10 @@ fn extract_topics_from_message(message: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_topics_from_message, infer_group_personality};
+    use super::{
+        extract_topics_from_message, infer_group_personality, is_conversation_follow_up,
+        is_interjection_candidate,
+    };
 
     #[test]
     fn group_topics_and_personality_are_learned() {
@@ -247,5 +405,22 @@ mod tests {
             infer_group_personality("一起讨论代码和技术吧", "friendly"),
             "knowledgeable"
         );
+    }
+
+    #[test]
+    fn only_meaningful_unaddressed_messages_become_interjection_candidates() {
+        assert!(is_interjection_candidate("你们觉得 Rust 好学吗？", 5));
+        assert!(is_interjection_candidate("我今天有点难过", 5));
+        assert!(!is_interjection_candidate("嗯", 5));
+        assert!(!is_interjection_candidate("#某个命令", 5));
+    }
+
+    #[test]
+    fn conversation_window_only_accepts_likely_follow_ups() {
+        assert!(is_conversation_follow_up("那你觉得呢？"));
+        assert!(is_conversation_follow_up("好呀，谢谢你"));
+        assert!(is_conversation_follow_up("嗯，对呀"));
+        assert!(!is_conversation_follow_up("[图片]"));
+        assert!(!is_conversation_follow_up("#系统信息"));
     }
 }

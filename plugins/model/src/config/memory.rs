@@ -8,6 +8,8 @@ pub struct MemoryConfig {
     max_conversation_messages: usize,
     contextual_memory_limit: usize,
     maintenance_interval_secs: u64,
+    summary_keep_recent_messages: usize,
+    summary_max_chars: usize,
 }
 
 impl MemoryConfig {
@@ -31,6 +33,14 @@ impl MemoryConfig {
         self.maintenance_interval_secs
     }
 
+    pub fn summary_keep_recent_messages(&self) -> usize {
+        self.summary_keep_recent_messages
+    }
+
+    pub fn summary_max_chars(&self) -> usize {
+        self.summary_max_chars
+    }
+
     pub fn validate(&self) -> anyhow::Result<()> {
         if self.max_entries == 0 {
             return Err(anyhow::anyhow!("memory.max_entries 必须大于 0"));
@@ -51,6 +61,16 @@ impl MemoryConfig {
                 "memory.maintenance_interval_secs 必须大于 0"
             ));
         }
+        if self.summary_keep_recent_messages == 0
+            || self.summary_keep_recent_messages.saturating_add(2) > self.max_conversation_messages
+        {
+            return Err(anyhow::anyhow!(
+                "memory.summary_keep_recent_messages 必须大于0，且至少为下一轮用户和机器人回复预留两个位置"
+            ));
+        }
+        if self.summary_max_chars < 100 {
+            return Err(anyhow::anyhow!("memory.summary_max_chars 不能小于 100"));
+        }
         Ok(())
     }
 }
@@ -63,6 +83,8 @@ impl Default for MemoryConfig {
             max_conversation_messages: 25,
             contextual_memory_limit: 5,
             maintenance_interval_secs: 86_400,
+            summary_keep_recent_messages: 15,
+            summary_max_chars: 1_500,
         }
     }
 }
