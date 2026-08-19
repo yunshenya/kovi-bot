@@ -886,6 +886,11 @@ async fn update_user_profile_from_message(
         .relationship_level
         .max(1 + (profile.interaction_count / 20).min(9) as u8);
 
+    // 配置中的最信任用户始终保持最高关系等级，供主动关心和语气个性化使用。
+    if config::get().proactive().main_admin() == Some(user_id) {
+        profile.relationship_level = 10;
+    }
+
     // 根据对话内容更新关系等级
     if message.contains("谢谢") || message.contains("感谢") {
         profile.relationship_level = (profile.relationship_level + 1).min(10);

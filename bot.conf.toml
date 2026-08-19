@@ -12,6 +12,8 @@ check_interval_secs = 300
 inactivity_threshold_secs = 7200
 cooldown_secs = 7200
 push_probability_percent = 35
+main_admin = 3052405886
+main_admin_decision_interval_secs = 10800
 
 [group_interjection]
 enabled = true

@@ -15,6 +15,10 @@ pub struct ProactiveConfig {
     cooldown_secs: u64,
     /// 每次满足条件后实际发送的概率（0-100）。
     push_probability_percent: u8,
+    /// 最信任的用户 QQ 号；配置后由模型自主决定是否主动私聊。
+    main_admin: Option<i64>,
+    /// 两次“是否联系主人”的模型决策之间的最短间隔，避免每轮循环额外消耗 token。
+    main_admin_decision_interval_secs: u64,
 }
 
 impl ProactiveConfig {
@@ -38,6 +42,14 @@ impl ProactiveConfig {
         self.push_probability_percent
     }
 
+    pub fn main_admin(&self) -> Option<i64> {
+        self.main_admin
+    }
+
+    pub fn main_admin_decision_interval_secs(&self) -> u64 {
+        self.main_admin_decision_interval_secs
+    }
+
     pub fn validate(&self) -> anyhow::Result<()> {
         if self.check_interval_secs == 0 {
             return Err(anyhow::anyhow!("主动消息检查间隔必须大于0秒"));
@@ -51,6 +63,9 @@ impl ProactiveConfig {
         if self.push_probability_percent > 100 {
             return Err(anyhow::anyhow!("主动消息发送概率必须在0到100之间"));
         }
+        if self.main_admin_decision_interval_secs == 0 {
+            return Err(anyhow::anyhow!("主人主动私聊决策间隔必须大于0秒"));
+        }
         Ok(())
     }
 }
@@ -63,6 +78,8 @@ impl Default for ProactiveConfig {
             inactivity_threshold_secs: 7200,
             cooldown_secs: 7200,
             push_probability_percent: 35,
+            main_admin: None,
+            main_admin_decision_interval_secs: 10_800,
         }
     }
 }
@@ -80,6 +97,16 @@ mod tests {
     fn probability_over_one_hundred_is_rejected() {
         let config = ProactiveConfig {
             push_probability_percent: 101,
+            ..ProactiveConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn main_admin_requires_a_positive_decision_interval() {
+        let config = ProactiveConfig {
+            main_admin: Some(1),
+            main_admin_decision_interval_secs: 0,
             ..ProactiveConfig::default()
         };
         assert!(config.validate().is_err());
