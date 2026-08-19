@@ -52,8 +52,8 @@ secure = false
 
 ```toml
 [server_config]
-url = "https://api.siliconflow.cn/v1/chat/completions"
-model_name = "Qwen/QwQ-32B"
+url = "https://api.deepseek.com/chat/completions"
+model_name = "deepseek-v4-flash"
 
 [proactive]
 enabled = true
@@ -61,11 +61,27 @@ check_interval_secs = 300
 inactivity_threshold_secs = 7200
 cooldown_secs = 7200
 push_probability_percent = 35
+
+[memory]
+max_entries = 1000
+retention_days = 30
+max_conversation_messages = 25
+contextual_memory_limit = 5
+maintenance_interval_secs = 86400
+
+[mood]
+cache_ttl_secs = 300
+cache_retention_secs = 3600
+natural_drift_after_secs = 7200
+natural_drift_check_secs = 1800
+
+[topic]
+recent_topic_cooldown_secs = 604800
 ```
 
-机器人会从最近活跃的群组/用户中随机选择接收方，再结合情绪、能量、群组话题和用户兴趣随机选择内容。冷却时间、空闲阈值和发送概率共同避免刷屏。长期记忆写入项目运行目录下的 `bot_memory.json`，最多保留 1000 条，并清理 30 天前的低重要性记录。
+机器人会从最近活跃的群组和真正私聊过的用户中随机选择接收方，再结合情绪、能量、时间、群组话题和用户兴趣选择内容。冷却时间、空闲阈值、发送概率和话题去重共同避免刷屏。长期记忆写入项目运行目录下的 `bot_memory.json`，默认最多保留 1000 条；后台任务会定期去重并清理 30 天前的低重要性记录。
 
-群聊中，普通消息只用于学习群组活跃度和话题；机器人仅在被 `@` 或消息以“芸汐/云汐”开头时调用模型回复。私聊消息会直接回复。
+群聊中，普通消息用于学习群组活跃度、成员、话题、氛围和长期上下文；机器人仅在被 `@` 或消息以“芸汐/云汐”开头时调用模型回复。私聊消息会直接回复，并持续更新用户的兴趣、性格、关系等级和情绪历史。
 
 可用群聊命令：
 

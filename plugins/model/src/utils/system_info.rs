@@ -14,13 +14,19 @@ pub fn system_info_get() -> (String, String) {
     system.refresh_all(); // 刷新数据
 
     let sys = systemstat::System::new();
-    let update_time = format_uptime(sys.uptime().unwrap().as_secs());
+    let update_time = sys
+        .uptime()
+        .map(|uptime| format_uptime(uptime.as_secs()))
+        .unwrap_or_else(|error| format!("获取失败: {}", error));
 
     let mut process_now = String::new();
     // 获取当前进程的内存占用（单位：字节）
-    let pid = sysinfo::get_current_pid().expect("获取进程ID失败");
-    if let Some(process) = system.process(pid) {
+    if let Ok(pid) = sysinfo::get_current_pid()
+        && let Some(process) = system.process(pid)
+    {
         process_now = format!("内存占用: {} MB", (process.memory() / 1024) / 1024);
-    };
+    } else {
+        process_now.push_str("内存占用: 获取失败");
+    }
     (update_time, process_now)
 }

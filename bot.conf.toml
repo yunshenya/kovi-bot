@@ -12,3 +12,19 @@ check_interval_secs = 300
 inactivity_threshold_secs = 7200
 cooldown_secs = 7200
 push_probability_percent = 35
+
+[memory]
+max_entries = 1000
+retention_days = 30
+max_conversation_messages = 25
+contextual_memory_limit = 5
+maintenance_interval_secs = 86400
+
+[mood]
+cache_ttl_secs = 300
+cache_retention_secs = 3600
+natural_drift_after_secs = 7200
+natural_drift_check_secs = 1800
+
+[topic]
+recent_topic_cooldown_secs = 604800

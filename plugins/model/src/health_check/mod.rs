@@ -61,11 +61,22 @@ impl HealthChecker {
     pub async fn check_health(&mut self) -> HealthStatus {
         let mut errors = Vec::new();
         let mut warnings = Vec::new();
+        let memory_file = self.memory_manager.memory_file();
 
-        if let Err(error) = std::fs::metadata("bot_memory.json")
-            && error.kind() != std::io::ErrorKind::NotFound
+        match std::fs::metadata(memory_file) {
+            Ok(metadata) if metadata.permissions().readonly() => {
+                errors.push("记忆文件为只读，无法持久化新记忆".to_string());
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => errors.push(format!("无法读取记忆文件元数据: {}", error)),
+        }
+
+        if std::env::var("BOT_API_TOKEN")
+            .map(|token| token.trim().is_empty())
+            .unwrap_or(true)
         {
-            errors.push(format!("无法读取记忆文件元数据: {}", error));
+            errors.push("未设置 BOT_API_TOKEN".to_string());
         }
 
         // 检查记忆管理器
@@ -78,8 +89,14 @@ impl HealthChecker {
         }
 
         // 检查记忆数量
-        if memory_usage.total_memories > 5000 {
-            warnings.push("记忆数量过多，可能影响性能".to_string());
+        let max_entries = crate::config::get().memory().max_entries();
+        if memory_usage.total_memories > max_entries {
+            errors.push(format!(
+                "记忆数量 {} 超过配置上限 {}",
+                memory_usage.total_memories, max_entries
+            ));
+        } else if memory_usage.total_memories >= max_entries.saturating_mul(9) / 10 {
+            warnings.push("记忆数量接近配置上限，将优先保留重要记忆".to_string());
         }
 
         // 检查用户档案数量
@@ -106,7 +123,7 @@ impl HealthChecker {
         let user_profiles = self.memory_manager.get_all_user_profiles().await;
         let group_profiles = self.memory_manager.get_all_group_profiles().await;
 
-        let memory_file_size = std::fs::metadata("bot_memory.json")
+        let memory_file_size = std::fs::metadata(self.memory_manager.memory_file())
             .map(|m| m.len())
             .unwrap_or(0);
 

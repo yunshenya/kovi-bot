@@ -133,8 +133,8 @@ export BOT_API_TOKEN="your_api_token_here"
    - 查看错误日志
 
 3. **主动聊天过于频繁**
-   - 调整主动聊天的检查间隔
-   - 降低机器人的好奇心和能量水平
+   - 调大 `[proactive].check_interval_secs` 或 `cooldown_secs`
+   - 降低 `[proactive].push_probability_percent`
 
 ### 调试模式
 
@@ -144,15 +144,17 @@ export BOT_API_TOKEN="your_api_token_here"
 
 ### 修改机器人性格
 
-编辑 `plugins/model/src/config/prompt.rs` 中的系统提示词：
+编辑 `bot.conf.toml` 中的提示词，无需重新编译：
 
-```rust
-system_prompt: "你是芸汐，一个有着独特个性的AI助手...".to_string(),
+```toml
+[prompt]
+system_prompt = "你是芸汐，一个有着独特个性的AI助手..."
+private_prompt = "你是芸汐，一个温暖贴心的AI助手..."
 ```
 
 ### 调整情绪敏感度
 
-修改 `plugins/model/src/mood_system/mod.rs` 中的关键词权重。
+缓存时间与自然情绪变化间隔可在 `bot.conf.toml` 的 `[mood]` 中调整；如需修改关键词权重，再编辑 `plugins/model/src/mood_system/mod.rs`。
 
 ### 自定义话题模板
 

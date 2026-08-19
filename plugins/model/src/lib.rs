@@ -86,8 +86,9 @@ async fn main() {
                     eprintln!("[ERROR] 自然情绪变化失败: {}", e);
                 }
 
-                // 每30分钟检查一次自然情绪变化
-                kovi::tokio::time::sleep(kovi::tokio::time::Duration::from_secs(1800)).await;
+                let check_interval = config::get().mood().natural_drift_check_secs();
+                kovi::tokio::time::sleep(kovi::tokio::time::Duration::from_secs(check_interval))
+                    .await;
             }
         });
 
@@ -95,6 +96,17 @@ async fn main() {
         kovi::tokio::spawn(async move {
             let mut health_checker = health_check::HealthChecker::new(health_memory_manager);
             health_checker.start_health_monitoring().await;
+        });
+
+        let maintenance_memory_manager = Arc::clone(&memory::MEMORY_MANAGER);
+        kovi::tokio::spawn(async move {
+            loop {
+                if let Err(error) = maintenance_memory_manager.compact_memories().await {
+                    eprintln!("[ERROR] 定期记忆清理失败: {}", error);
+                }
+                let interval = config::get().memory().maintenance_interval_secs();
+                kovi::tokio::time::sleep(kovi::tokio::time::Duration::from_secs(interval)).await;
+            }
         });
 
         println!("[INFO] 后台任务已启动");

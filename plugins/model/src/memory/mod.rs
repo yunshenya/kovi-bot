@@ -13,7 +13,7 @@ use chrono::{DateTime, Local};
 use kovi::tokio::sync::Mutex;
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
@@ -89,6 +89,9 @@ pub struct UserProfile {
     pub last_interaction: DateTime<Local>,
     /// 总互动次数
     pub interaction_count: u32,
+    /// 最近一次私聊时间。只有真正私聊过的用户才会成为主动私聊候选。
+    #[serde(default)]
+    pub last_private_interaction: Option<DateTime<Local>>,
     /// 情绪历史记录
     pub mood_history: Vec<MoodEntry>,
 }
@@ -196,7 +199,18 @@ impl MemoryManager {
             Ok(json) => match serde_json::from_str::<MemoryData>(&json) {
                 Ok(data) => data,
                 Err(error) => {
-                    eprintln!("[ERROR] 记忆文件解析失败，将使用空记忆: {}", error);
+                    let backup_path =
+                        format!("{}.corrupt.{}", memory_file, Local::now().timestamp());
+                    match fs::copy(memory_file, &backup_path) {
+                        Ok(_) => eprintln!(
+                            "[ERROR] 记忆文件解析失败，已备份到 {}: {}",
+                            backup_path, error
+                        ),
+                        Err(backup_error) => eprintln!(
+                            "[ERROR] 记忆文件解析失败且备份失败 ({}): {}",
+                            backup_error, error
+                        ),
+                    }
                     MemoryData::default()
                 }
             },
@@ -301,25 +315,44 @@ impl MemoryManager {
     /// 按相关性得分排序的记忆条目列表
     pub async fn search_memories(&self, query: &str) -> Vec<MemoryEntry> {
         let memories = self.memories.lock().await;
-        let query_lower = query.to_lowercase();
+        let query_lower = query.trim().to_lowercase();
+        if query_lower.is_empty() {
+            return Vec::new();
+        }
+        let query_terms: Vec<&str> = query_lower
+            .split_whitespace()
+            .filter(|term| !term.is_empty())
+            .collect();
 
         let mut results: Vec<(MemoryEntry, u8)> = memories
             .values()
-            .map(|m| {
+            .filter_map(|m| {
                 let mut score = 0u8;
                 let content_lower = m.content.to_lowercase();
+                let content_match = content_lower.contains(&query_lower)
+                    || query_terms.iter().any(|term| content_lower.contains(term));
+                let tag_matches = m
+                    .tags
+                    .iter()
+                    .filter(|tag| {
+                        let tag = tag.to_lowercase();
+                        tag.contains(&query_lower)
+                            || query_terms.iter().any(|term| tag.contains(term))
+                    })
+                    .count();
+
+                // 无内容或标签匹配的记忆不应仅凭重要性进入搜索结果。
+                if !content_match && tag_matches == 0 {
+                    return None;
+                }
 
                 // 完全匹配得分最高
-                if content_lower.contains(&query_lower) {
+                if content_match {
                     score += 10;
                 }
 
                 // 标签匹配
-                for tag in &m.tags {
-                    if tag.to_lowercase().contains(&query_lower) {
-                        score += 5;
-                    }
-                }
+                score = score.saturating_add((tag_matches.min(3) as u8) * 5);
 
                 // 重要性权重
                 score += m.importance;
@@ -335,9 +368,8 @@ impl MemoryManager {
                     score += 1;
                 }
 
-                (m.clone(), score)
+                Some((m.clone(), score))
             })
-            .filter(|(_, score)| *score > 0)
             .collect();
 
         // 按得分排序
@@ -354,6 +386,7 @@ impl MemoryManager {
     ) -> Vec<MemoryEntry> {
         let memories = self.memories.lock().await;
         let mut contextual_memories: Vec<(MemoryEntry, u8)> = Vec::new();
+        let requested_scope = context_scope(context);
 
         for memory in memories.values() {
             let mut relevance_score = 0u8;
@@ -364,6 +397,11 @@ impl MemoryManager {
                 Some(_) => continue,
                 // 旧版数据没有所属对象，不能安全注入其他人的上下文。
                 None => continue,
+            }
+
+            // 用户号和群号都使用 i64，数值偶然相同时也不能跨私聊/群聊注入记忆。
+            if requested_scope.is_some() && context_scope(&memory.context) != requested_scope {
+                continue;
             }
 
             // 检查上下文匹配
@@ -446,6 +484,15 @@ impl MemoryManager {
         bot_personality.clone()
     }
 
+    pub fn memory_file(&self) -> &str {
+        &self.memory_file
+    }
+
+    /// 主动执行去重、过期清理和持久化，供后台维护任务调用。
+    pub async fn compact_memories(&self) -> Result<()> {
+        self.save_memories().await
+    }
+
     pub async fn add_conversation_memory(
         &self,
         user_id: i64,
@@ -469,6 +516,21 @@ impl MemoryManager {
             subject_id: Some(user_id),
         };
         self.add_memory(memory).await
+    }
+
+    pub async fn add_emotion_memory(&self, mood: &str, intensity: u8, context: &str) -> Result<()> {
+        let sequence = MEMORY_ID_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        self.add_memory(MemoryEntry {
+            id: format!("emotion_{}_{}", Local::now().timestamp_micros(), sequence),
+            content: format!("情绪变为 {}，强度 {}/10", mood, intensity.min(10)),
+            timestamp: Local::now(),
+            memory_type: MemoryType::Emotion,
+            importance: intensity.clamp(1, 10),
+            tags: vec!["情绪".to_string(), mood.to_string()],
+            context: context.to_string(),
+            subject_id: None,
+        })
+        .await
     }
 
     /// 计算记忆内容的重要性评分
@@ -522,9 +584,10 @@ impl MemoryManager {
         }
 
         // 根据长度调整
-        if content.len() > 150 {
+        let character_count = content.chars().count();
+        if character_count > 150 {
             importance += 2;
-        } else if content.len() > 100 {
+        } else if character_count > 100 {
             importance += 1;
         }
 
@@ -554,7 +617,8 @@ impl MemoryManager {
 
         // 简单的关键词提取
         let common_tags = [
-            "游戏", "学习", "工作", "生活", "情感", "技术", "娱乐", "美食", "旅行",
+            "游戏", "学习", "工作", "生活", "情感", "技术", "科技", "娱乐", "美食", "旅行", "运动",
+            "健康", "音乐", "电影", "读书", "家人", "朋友",
         ];
         for tag in &common_tags {
             if content.contains(tag) {
@@ -578,41 +642,100 @@ impl MemoryManager {
         };
 
         let json = serde_json::to_string_pretty(&data)?;
-        fs::write(&self.memory_file, json)?;
+        let memory_file = self.memory_file.clone();
+        kovi::tokio::task::spawn_blocking(move || -> Result<()> {
+            let temporary_file = format!("{}.tmp", memory_file);
+            fs::write(&temporary_file, json)?;
+            #[cfg(windows)]
+            if std::path::Path::new(&memory_file).exists() {
+                fs::remove_file(&memory_file)?;
+            }
+            fs::rename(&temporary_file, &memory_file)?;
+            Ok(())
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("记忆持久化任务失败: {}", error))??;
         Ok(())
     }
 
     /// 清理旧记忆，避免内存过度使用
     ///
     /// 执行以下清理策略：
-    /// 1. 移除30天前的低重要性记忆（重要性 < 7）
-    /// 2. 如果记忆数量超过1000条，只保留最重要的记忆
+    /// 1. 移除配置保留期之外的低重要性记忆（重要性 < 7）
+    /// 2. 压缩同一对象、上下文和内容的重复记忆
+    /// 3. 如果超过配置容量，只保留最重要且较新的记忆
     ///
     /// # 清理规则
     /// - 保留所有高重要性记忆（重要性 >= 7）
-    /// - 移除30天前的低重要性记忆
-    /// - 限制总记忆数量不超过1000条
+    /// - 保留期和最大数量均由 `bot.conf.toml` 的 `[memory]` 控制
     ///
     /// # 返回值
     /// 成功时返回 `Ok(())`，失败时返回错误信息
     async fn cleanup_old_memories(&self) -> Result<()> {
         let mut memories = self.memories.lock().await;
+        let original_count = memories.len();
         let now = Local::now();
-        let thirty_days_ago = now - chrono::Duration::days(30);
+        let memory_config = crate::config::get().memory().clone();
+        let retention_boundary = now - chrono::Duration::days(memory_config.retention_days());
 
-        // 移除30天前的低重要性记忆
-        memories.retain(|_, memory| memory.timestamp > thirty_days_ago || memory.importance >= 7);
+        // 移除保留期之外的低重要性记忆。
+        memories
+            .retain(|_, memory| memory.timestamp > retention_boundary || memory.importance >= 7);
 
-        // 如果记忆数量仍然过多，只保留最重要的
-        if memories.len() > 1000 {
-            let mut memory_vec: Vec<_> = memories.drain().collect();
-            memory_vec.sort_by_key(|memory| Reverse(memory.1.importance));
-            memory_vec.truncate(1000);
-            *memories = memory_vec.into_iter().collect();
+        // 对相同对象、上下文和内容的重复记忆去重，保留更新且更重要的一条。
+        let mut entries: Vec<_> = memories.drain().collect();
+        entries.sort_by(|left, right| {
+            right
+                .1
+                .timestamp
+                .cmp(&left.1.timestamp)
+                .then_with(|| right.1.importance.cmp(&left.1.importance))
+        });
+        let mut seen = HashSet::new();
+        entries.retain(|(_, memory)| {
+            let normalized_content = memory
+                .content
+                .split_whitespace()
+                .collect::<String>()
+                .to_lowercase();
+            seen.insert((
+                memory.subject_id,
+                memory.context.clone(),
+                normalized_content,
+            ))
+        });
+
+        // 超出容量时综合重要性与时间保留价值最高的记忆。
+        if entries.len() > memory_config.max_entries() {
+            entries.sort_by(|left, right| {
+                right
+                    .1
+                    .importance
+                    .cmp(&left.1.importance)
+                    .then_with(|| right.1.timestamp.cmp(&left.1.timestamp))
+            });
+            entries.truncate(memory_config.max_entries());
         }
+        *memories = entries.into_iter().collect();
 
-        println!("[INFO] 记忆清理完成，当前记忆数量: {}", memories.len());
+        if memories.len() < original_count {
+            println!(
+                "[INFO] 记忆清理完成，移除 {} 条，当前保留 {} 条",
+                original_count - memories.len(),
+                memories.len()
+            );
+        }
         Ok(())
+    }
+}
+
+fn context_scope(context: &str) -> Option<&'static str> {
+    if context.contains("private") {
+        Some("private")
+    } else if context.contains("group") {
+        Some("group")
+    } else {
+        None
     }
 }
 
@@ -673,6 +796,7 @@ mod tests {
                     relationship_level: 3,
                     last_interaction: Local::now(),
                     interaction_count: 2,
+                    last_private_interaction: Some(Local::now()),
                     mood_history: Vec::new(),
                 };
 
@@ -712,7 +836,56 @@ mod tests {
                 assert_eq!(user_one[0].subject_id, Some(1));
                 assert_eq!(manager.get_recent_memories(0).await.len(), 2);
 
+                manager
+                    .add_conversation_memory(1, "同号群聊内容", "group_chat")
+                    .await
+                    .expect("应写入同号群聊记忆");
+                let private_context = manager.get_contextual_memories(1, "private_chat", 10).await;
+                assert_eq!(private_context.len(), 1);
+                assert!(!private_context[0].content.contains("群聊"));
+
                 std::fs::remove_file(path).expect("应清理测试记忆文件");
             });
+    }
+
+    #[test]
+    fn duplicate_memories_are_compressed_and_search_requires_a_match() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let path = temporary_memory_path("compression");
+                let manager = MemoryManager::new(path.to_str().expect("临时路径应为 UTF-8"));
+
+                manager
+                    .add_conversation_memory(7, "我喜欢音乐", "private_chat")
+                    .await
+                    .expect("应写入记忆");
+                manager
+                    .add_conversation_memory(7, "我 喜欢 音乐", "private_chat")
+                    .await
+                    .expect("应压缩空白不同的重复记忆");
+
+                assert_eq!(manager.get_recent_memories(0).await.len(), 1);
+                assert_eq!(manager.search_memories("音乐").await.len(), 1);
+                assert!(manager.search_memories("量子计算").await.is_empty());
+
+                std::fs::remove_file(path).expect("应清理测试记忆文件");
+            });
+    }
+
+    #[test]
+    fn legacy_profile_defaults_private_interaction() {
+        let json = r#"{
+            "user_id": 9,
+            "nickname": "legacy",
+            "personality_traits": [],
+            "interests": [],
+            "relationship_level": 1,
+            "last_interaction": "2026-08-19T22:00:00+08:00",
+            "interaction_count": 1,
+            "mood_history": []
+        }"#;
+        let profile: UserProfile = serde_json::from_str(json).expect("旧档案应能迁移");
+        assert!(profile.last_private_interaction.is_none());
     }
 }

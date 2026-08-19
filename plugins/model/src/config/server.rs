@@ -50,8 +50,8 @@ impl ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            url: "https://api.siliconflow.cn/v1/chat/completions".to_string(),
-            model_name: "Qwen/QwQ-32B".to_string(),
+            url: "https://api.deepseek.com/chat/completions".to_string(),
+            model_name: "deepseek-v4-flash".to_string(),
         }
     }
 }

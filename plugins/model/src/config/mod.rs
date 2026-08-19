@@ -7,24 +7,30 @@
 //! - 线程安全的配置访问
 //! - 配置验证和错误处理
 
+use crate::config::memory::MemoryConfig;
+use crate::config::mood::MoodConfig;
 use crate::config::proactive::ProactiveConfig;
 use crate::config::prompt::Prompt;
 use crate::config::server::ServerConfig;
+use crate::config::topic::TopicConfig;
 use anyhow::Context;
 use config::{Config, FileFormat};
 use kovi::toml;
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, LazyLock, RwLock,
     atomic::{AtomicBool, Ordering},
 };
 use std::time::Duration;
 
+mod memory;
+mod mood;
 mod proactive;
 mod prompt;
 mod server;
+mod topic;
 
 /// 全局配置实例
 ///
@@ -53,6 +59,12 @@ pub struct ModelConfig {
     server_config: ServerConfig,
     /// 随机主动消息配置
     proactive: ProactiveConfig,
+    /// 长期记忆与短期上下文配置
+    memory: MemoryConfig,
+    /// 情绪缓存与自然漂移配置
+    mood: MoodConfig,
+    /// 话题去重配置
+    topic: TopicConfig,
 }
 
 impl ModelConfig {
@@ -63,10 +75,13 @@ impl ModelConfig {
     /// # 返回值
     /// 成功时返回配置实例，失败时返回错误
     pub fn load() -> anyhow::Result<Self> {
-        let config_path = "bot.conf.toml";
-        if !Path::new(config_path).exists() {
-            println!("[INFO] 配置文件不存在，创建默认配置文件: {}", config_path);
-            Self::create_default_config_file(config_path)
+        let config_path = Self::config_path();
+        if !config_path.exists() {
+            println!(
+                "[INFO] 配置文件不存在，创建默认配置文件: {}",
+                config_path.display()
+            );
+            Self::create_default_config_file(&config_path)
                 .with_context(|| anyhow::anyhow!("Failed to create default config file"))?;
         };
         let config = Self::try_deserialize_config()?;
@@ -83,6 +98,9 @@ impl ModelConfig {
         self.prompt.validate()?;
 
         self.proactive.validate()?;
+        self.memory.validate()?;
+        self.mood.validate()?;
+        self.topic.validate()?;
 
         println!("[INFO] 配置验证通过");
         Ok(())
@@ -100,12 +118,25 @@ impl ModelConfig {
         &self.proactive
     }
 
-    fn create_default_config_file(config_path: &str) -> anyhow::Result<()> {
+    pub fn memory(&self) -> &MemoryConfig {
+        &self.memory
+    }
+
+    pub fn mood(&self) -> &MoodConfig {
+        &self.mood
+    }
+
+    pub fn topic(&self) -> &TopicConfig {
+        &self.topic
+    }
+
+    fn create_default_config_file(config_path: &Path) -> anyhow::Result<()> {
         let default_config = ModelConfig::default();
         let toml_content = toml::to_string_pretty(&default_config)
             .with_context(|| anyhow::anyhow!("Failed to serialize default config"))?;
-        fs::write(config_path, toml_content)
-            .with_context(|| anyhow::anyhow!("Failed to write config file: {}", config_path))?;
+        fs::write(config_path, toml_content).with_context(|| {
+            anyhow::anyhow!("Failed to write config file: {}", config_path.display())
+        })?;
         Ok(())
     }
 
@@ -124,11 +155,11 @@ impl ModelConfig {
 
     /// 强制重载配置文件（忽略环境变量）
     pub fn reload_from_file() -> anyhow::Result<()> {
-        let config_path = "bot.conf.toml";
-        if !Path::new(config_path).exists() {
+        let config_path = Self::config_path();
+        if !config_path.exists() {
             return Err(anyhow::anyhow!(
                 "Config file {} does not exist",
-                config_path
+                config_path.display()
             ));
         }
         let new_config = Self::try_deserialize_config()?;
@@ -141,9 +172,10 @@ impl ModelConfig {
     }
 
     fn try_deserialize_config() -> anyhow::Result<ModelConfig> {
+        let config_path = Self::config_path();
         Config::builder()
             .add_source(
-                config::File::with_name("bot.conf")
+                config::File::from(config_path)
                     .format(FileFormat::Toml)
                     .required(true),
             )
@@ -187,8 +219,8 @@ impl ModelConfig {
 
     /// 检查配置文件是否有变化并自动重载
     pub fn check_and_reload() -> anyhow::Result<bool> {
-        let config_path = "bot.conf.toml";
-        if !Path::new(config_path).exists() {
+        let config_path = Self::config_path();
+        if !config_path.exists() {
             return Ok(false);
         }
 
@@ -213,6 +245,14 @@ impl ModelConfig {
         Ok(false)
     }
 
+    fn config_path() -> PathBuf {
+        #[cfg(test)]
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bot.conf.toml");
+        #[cfg(not(test))]
+        let path = PathBuf::from("bot.conf.toml");
+        path
+    }
+
     fn config_watcher_loop(check_interval: Duration) {
         let mut last_check_failed = false;
 
@@ -223,12 +263,16 @@ impl ModelConfig {
 
             match Self::check_and_reload() {
                 Ok(reloaded) => {
+                    if reloaded {
+                        println!("[INFO] 检测到 bot.conf.toml 变化，配置已自动重载");
+                    }
                     if reloaded && last_check_failed {
                         last_check_failed = false;
                     }
                 }
-                Err(_) => {
+                Err(error) => {
                     if !last_check_failed {
+                        eprintln!("[ERROR] 自动重载配置失败: {}", error);
                         last_check_failed = true;
                     }
                 }
@@ -279,4 +323,22 @@ pub fn check_and_reload() -> anyhow::Result<bool> {
 /// 获取自动重载状态
 pub fn is_auto_reload_enabled() -> bool {
     ModelConfig::is_auto_reload_enabled()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ModelConfig;
+
+    #[test]
+    fn complete_default_configuration_is_valid() {
+        assert!(ModelConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn repository_configuration_loads_with_all_sections() {
+        let config = ModelConfig::load().expect("仓库配置应可加载");
+        assert_eq!(config.memory().max_entries(), 1000);
+        assert_eq!(config.mood().cache_ttl_secs(), 300);
+        assert_eq!(config.topic().recent_topic_cooldown_secs(), 604_800);
+    }
 }

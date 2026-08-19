@@ -1,7 +1,7 @@
 use crate::config;
 use crate::health_check::HealthChecker;
 use crate::memory::{GroupProfile, MEMORY_MANAGER};
-use crate::model::utils::{send_sys_info, silence};
+use crate::model::utils::{learn_user_profile_from_message, send_sys_info, silence};
 use chrono::Local;
 use kovi::RuntimeBot;
 use kovi::event::GroupMsgEvent;
@@ -16,6 +16,7 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
     let sender = format!("[{}] {}", time, nickname);
     if let Some(message) = event.borrow_text() {
         update_group_profile(group_id, event.user_id, message, &nickname).await;
+        learn_user_profile_from_message(event.user_id, message, &nickname, false).await;
         match message {
             "#系统信息" => {
                 send_sys_info(Arc::clone(&bot), group_id).await;
@@ -98,6 +99,18 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
                 if is_addressed_to_bot(&event, message) || matches!(message, "#禁言" | "#结束禁言")
                 {
                     silence(group_id, message, bot, sender).await;
+                } else if let Err(error) = MEMORY_MANAGER
+                    .add_conversation_memory(
+                        group_id,
+                        &format!("{}: {}", nickname, message),
+                        "group_observation",
+                    )
+                    .await
+                {
+                    eprintln!(
+                        "[ERROR] 群聊观察记忆记录失败 (群组: {}): {}",
+                        group_id, error
+                    );
                 }
             }
         }
@@ -157,9 +170,32 @@ async fn update_group_profile(group_id: i64, user_id: i64, message: &str, _nickn
             .drain(0..profile.conversation_topics.len() - 20);
     }
 
+    profile.group_personality = infer_group_personality(message, &profile.group_personality);
+
     // 更新群组档案
     if let Err(e) = MEMORY_MANAGER.update_group_profile(group_id, profile).await {
         eprintln!("[ERROR] 更新群组档案失败 (群组: {}): {}", group_id, e);
+    }
+}
+
+fn infer_group_personality(message: &str, current: &str) -> String {
+    if ["哈哈", "笑死", "好玩", "开心"]
+        .iter()
+        .any(|keyword| message.contains(keyword))
+    {
+        "lively".to_string()
+    } else if ["技术", "代码", "编程", "论文", "学习"]
+        .iter()
+        .any(|keyword| message.contains(keyword))
+    {
+        "knowledgeable".to_string()
+    } else if ["难过", "担心", "安慰", "加油"]
+        .iter()
+        .any(|keyword| message.contains(keyword))
+    {
+        "supportive".to_string()
+    } else {
+        current.to_string()
     }
 }
 
@@ -196,4 +232,20 @@ fn extract_topics_from_message(message: &str) -> Vec<String> {
     }
 
     topics
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{extract_topics_from_message, infer_group_personality};
+
+    #[test]
+    fn group_topics_and_personality_are_learned() {
+        let topics = extract_topics_from_message("最近在学习 Rust 编程和 AI 技术");
+        assert!(topics.contains(&"学习".to_string()));
+        assert!(topics.contains(&"科技".to_string()));
+        assert_eq!(
+            infer_group_personality("一起讨论代码和技术吧", "friendly"),
+            "knowledgeable"
+        );
+    }
 }

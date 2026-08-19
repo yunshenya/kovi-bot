@@ -3,3 +3,5 @@ target
 server-login
 .env
 bot_memory.json
+bot_memory.json.tmp
+bot_memory.json.corrupt.*

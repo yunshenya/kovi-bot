@@ -8,7 +8,7 @@
 
 use crate::memory::MemoryManager;
 use anyhow::Result;
-use chrono::Local;
+use chrono::{Local, Timelike};
 use rand::prelude::IndexedRandom;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -33,7 +33,7 @@ pub struct Topic {
 /// 话题分类枚举
 ///
 /// 定义不同类型的话题，用于分类和筛选
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub enum TopicCategory {
     /// 日常闲聊：轻松随意的话题
     Casual,
@@ -51,6 +51,10 @@ pub enum TopicCategory {
     Nostalgic,
     /// 未来话题：展望未来的话题
     Future,
+    /// 知识话题：分享知识与学习经验
+    Knowledge,
+    /// 社交话题：围绕朋友、团队与沟通
+    Social,
 }
 
 pub struct TopicGenerator {
@@ -148,6 +152,27 @@ impl TopicGenerator {
                 energy_level_required: 7,
                 tags: vec!["设计".to_string(), "城市".to_string()],
             },
+            TopicTemplate {
+                template: "最近学到的哪件新知识最让你惊讶？".to_string(),
+                category: TopicCategory::Knowledge,
+                mood_requirement: Some("curious".to_string()),
+                energy_level_required: 5,
+                tags: vec!["学习".to_string(), "知识".to_string()],
+            },
+            TopicTemplate {
+                template: "你最欣赏朋友身上的什么品质？".to_string(),
+                category: TopicCategory::Social,
+                mood_requirement: None,
+                energy_level_required: 4,
+                tags: vec!["朋友".to_string(), "社交".to_string()],
+            },
+            TopicTemplate {
+                template: "最近有什么新闻或新鲜事让你印象深刻？".to_string(),
+                category: TopicCategory::Current,
+                mood_requirement: None,
+                energy_level_required: 4,
+                tags: vec!["时事".to_string(), "新闻".to_string()],
+            },
         ]
     }
 
@@ -179,13 +204,26 @@ impl TopicGenerator {
             return Ok(None);
         }
 
+        let recent_memories = self.memory_manager.get_recent_memories(0).await;
+        let mut unused_templates = Vec::new();
+        for template in &suitable_templates {
+            if !Self::topic_used_recently(&recent_memories, &template.template, group_id, user_id) {
+                unused_templates.push(*template);
+            }
+        }
+        let candidate_templates = if unused_templates.is_empty() {
+            suitable_templates
+        } else {
+            unused_templates
+        };
+
         // 根据群组或用户的历史记录调整话题选择
         let selected_template = self
-            .select_best_template(suitable_templates, group_id, user_id)
+            .select_best_template(candidate_templates, group_id, user_id)
             .await?;
 
         let topic = Topic {
-            content: selected_template.template.clone(),
+            content: Self::adapt_topic_to_time(&selected_template.template),
             category: selected_template.category.clone(),
             mood_requirement: selected_template.mood_requirement.clone(),
             energy_level_required: selected_template.energy_level_required,
@@ -193,6 +231,15 @@ impl TopicGenerator {
         };
 
         Ok(Some(topic))
+    }
+
+    fn adapt_topic_to_time(topic: &str) -> String {
+        match Local::now().hour() {
+            5..=10 => format!("早上好，{}", topic),
+            11..=13 => format!("到午饭时间啦，{}", topic),
+            22..=23 | 0..=4 => format!("这么晚还没睡呀，{}", topic),
+            _ => topic.to_string(),
+        }
     }
 
     async fn select_best_template(
@@ -246,11 +293,36 @@ impl TopicGenerator {
             let personalized_topic = self
                 .generate_topic_based_on_interests(&user_profile)
                 .await?;
-            return Ok(personalized_topic);
+            let recent_memories = self.memory_manager.get_recent_memories(0).await;
+            if let Some(mut topic) = personalized_topic
+                && !Self::topic_used_recently(&recent_memories, &topic.content, None, Some(user_id))
+            {
+                topic.content = Self::adapt_topic_to_time(&topic.content);
+                return Ok(Some(topic));
+            }
         }
 
         // 如果没有用户档案，使用通用话题
         self.generate_topic(None, Some(user_id)).await
+    }
+
+    fn topic_used_recently(
+        memories: &[crate::memory::MemoryEntry],
+        topic: &str,
+        group_id: Option<i64>,
+        user_id: Option<i64>,
+    ) -> bool {
+        let subject_id = group_id.or(user_id);
+        let cutoff = Local::now()
+            - chrono::Duration::seconds(
+                crate::config::get().topic().recent_topic_cooldown_secs() as i64
+            );
+        memories.iter().any(|memory| {
+            memory.subject_id == subject_id
+                && memory.context.starts_with("proactive_")
+                && memory.timestamp > cutoff
+                && memory.content.contains(topic)
+        })
     }
 
     async fn generate_topic_based_on_interests(
@@ -303,9 +375,17 @@ impl TopicGenerator {
         let now = Local::now();
         let one_hour_ago = now - chrono::Duration::hours(1);
 
-        let recent_activity = recent_memories
-            .iter()
-            .any(|memory| memory.timestamp > one_hour_ago);
+        let target_subject = group_id.or(user_id);
+        let target_context = if group_id.is_some() {
+            "group"
+        } else {
+            "private"
+        };
+        let recent_activity = recent_memories.iter().any(|memory| {
+            memory.subject_id == target_subject
+                && memory.context.contains(target_context)
+                && memory.timestamp > one_hour_ago
+        });
 
         // 如果最近有活动，降低主动发起对话的概率
         if recent_activity {
@@ -341,5 +421,72 @@ impl TopicGenerator {
             "lonely" => bot_personality.social_confidence > 5, // 孤独时更容易主动聊天
             _ => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TopicCategory, TopicGenerator};
+    use crate::memory::MemoryManager;
+    use std::collections::HashSet;
+    use std::sync::Arc;
+
+    fn temporary_memory_path(test_name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "kovi-topic-{}-{}-{}.json",
+            test_name,
+            std::process::id(),
+            chrono::Local::now().timestamp_micros()
+        ))
+    }
+
+    #[test]
+    fn template_library_covers_ten_categories() {
+        let path = temporary_memory_path("categories");
+        let manager = Arc::new(MemoryManager::new(
+            path.to_str().expect("临时路径应为 UTF-8"),
+        ));
+        let generator = TopicGenerator::new(manager);
+        let categories: HashSet<String> = generator
+            .topic_templates
+            .iter()
+            .map(|template| format!("{:?}", template.category))
+            .collect();
+        assert_eq!(categories.len(), 10);
+        assert!(
+            generator
+                .topic_templates
+                .iter()
+                .any(|template| template.category == TopicCategory::Knowledge)
+        );
+    }
+
+    #[test]
+    fn recently_used_topic_is_not_selected_again() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let path = temporary_memory_path("dedup");
+                let manager = Arc::new(MemoryManager::new(
+                    path.to_str().expect("临时路径应为 UTF-8"),
+                ));
+                manager
+                    .add_conversation_memory(
+                        123,
+                        "主动发起话题: 今天天气怎么样？感觉适合做什么呢？",
+                        "proactive_group_chat",
+                    )
+                    .await
+                    .expect("应记录主动话题");
+                let generator = TopicGenerator::new(manager);
+                let topic = generator
+                    .generate_topic(Some(123), None)
+                    .await
+                    .expect("应成功生成话题")
+                    .expect("应存在可用话题");
+                assert!(!topic.content.contains("今天天气怎么样"));
+
+                std::fs::remove_file(path).expect("应清理测试记忆文件");
+            });
     }
 }

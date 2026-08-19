@@ -9,14 +9,14 @@
 //! - 系统状态监控
 
 use crate::config;
-use crate::memory::{MEMORY_MANAGER, UserProfile};
-use crate::mood_system::MoodSystem;
+use crate::memory::{MEMORY_MANAGER, MoodEntry, UserProfile};
+use crate::mood_system::{Mood, MoodSystem};
 use crate::utils;
 use anyhow::Context;
 use chrono::{Local, TimeZone};
 use kovi::RuntimeBot;
 use kovi::serde_json::Value;
-use kovi::tokio::sync::{Mutex, MutexGuard};
+use kovi::tokio::sync::Mutex;
 use reqwest::Client;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -29,7 +29,9 @@ use std::time::UNIX_EPOCH;
 ///
 /// 存储每个群组的对话历史，用于维护上下文连续性
 /// Key: 群组ID, Value: 对话消息列表
-static MEMORY: LazyLock<Mutex<HashMap<i64, Vec<BotMemory>>>> =
+type ConversationHistory = Arc<Mutex<Vec<BotMemory>>>;
+
+static MEMORY: LazyLock<Mutex<HashMap<i64, ConversationHistory>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// 群组禁言状态存储
@@ -43,7 +45,7 @@ static IS_BANNED: LazyLock<Mutex<HashMap<i64, bool>>> =
 ///
 /// 存储每个用户的私聊历史，用于个性化交互
 /// Key: 用户ID, Value: 对话消息列表
-static PRIVATE_MESSAGE_MEMORY: LazyLock<Mutex<HashMap<i64, Vec<BotMemory>>>> =
+static PRIVATE_MESSAGE_MEMORY: LazyLock<Mutex<HashMap<i64, ConversationHistory>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// 全局情绪系统实例
@@ -51,11 +53,6 @@ static PRIVATE_MESSAGE_MEMORY: LazyLock<Mutex<HashMap<i64, Vec<BotMemory>>>> =
 /// 负责分析用户消息的情绪并调整机器人的人格状态
 static MOOD_SYSTEM: LazyLock<MoodSystem> =
     LazyLock::new(|| MoodSystem::new(Arc::clone(&MEMORY_MANAGER)));
-
-/// 最大记忆条数限制
-///
-/// 限制单次对话中保留的最大消息数量，防止内存过度使用
-const MAX_MEMORY_SIZE: usize = 25;
 
 /// 消息角色枚举
 ///
@@ -112,13 +109,7 @@ struct ModelConf<'a> {
 /// * `bot` - 机器人实例
 /// * `nickname` - 发送者昵称
 /// * `message` - 消息内容
-pub async fn control_model(
-    guard: &mut MutexGuard<'_, HashMap<i64, Vec<BotMemory>>>,
-    group_id: i64,
-    bot: Arc<RuntimeBot>,
-    nickname: String,
-    message: &str,
-) {
+pub async fn control_model(group_id: i64, bot: Arc<RuntimeBot>, nickname: String, message: &str) {
     // 分析情绪并更新
     if let Err(e) = MOOD_SYSTEM
         .analyze_and_update_mood(message, "group_chat")
@@ -141,178 +132,85 @@ pub async fn control_model(
 
     // 获取相关记忆来增强上下文
     let contextual_memories = MEMORY_MANAGER
-        .get_contextual_memories(group_id, "group_chat", 5)
+        .get_contextual_memories(
+            group_id,
+            "group_chat",
+            config::get().memory().contextual_memory_limit(),
+        )
         .await;
-    let recent_memories = MEMORY_MANAGER.get_recent_memories(10).await;
-
-    match guard.get_mut(&group_id) {
-        None => {
-            // 创建新的对话记录，包含相关记忆
-            let mut system_prompt = config::get().prompt().system_prompt().to_string();
-
-            // 添加相关记忆到系统提示中
-            if !contextual_memories.is_empty() {
-                system_prompt.push_str("\n\n相关记忆：");
-                for memory in contextual_memories.iter().take(3) {
-                    system_prompt.push_str(&format!("\n- {}", memory.content));
-                }
-            }
-
-            guard.insert(
-                group_id,
-                vec![
-                    BotMemory {
-                        role: Roles::System,
-                        content: system_prompt,
-                    },
-                    BotMemory {
-                        role: Roles::User,
-                        content: format!("{}:{}", nickname, message),
-                    },
-                ],
-            );
-            if let Some(vec) = guard.get_mut(&group_id) {
-                println!(
-                    "[INFO] 群聊新对话开始 (群组: {}, 用户: {})",
-                    group_id, nickname
-                );
-                let model = params_model(vec).await;
-                if !model.content.contains("[sp]") {
-                    bot.send_group_msg(group_id, &model.content);
-                    println!(
-                        "[INFO] 群聊消息已发送 (群组: {}): {}",
-                        group_id, model.content
-                    );
-                    if let Err(error) = MEMORY_MANAGER
-                        .add_conversation_memory(
-                            group_id,
-                            &format!("芸汐: {}", model.content),
-                            "group_chat",
-                        )
-                        .await
-                    {
-                        eprintln!(
-                            "[ERROR] 群聊回复记忆记录失败 (群组: {}): {}",
-                            group_id, error
-                        );
-                    }
-                };
-                vec.push(BotMemory {
-                    role: Roles::Assistant,
-                    content: model.content,
-                });
-
-                // 检查并限制记忆大小
-                limit_memory_size(vec);
-            };
-        }
-        Some(vec) => {
-            // 添加新的用户消息
-            vec.push(BotMemory {
-                role: Roles::User,
-                content: format!("{}:{}", nickname, message),
-            });
-
-            // 在生成回复前，检查是否需要添加相关记忆
-            if should_add_memory_context(vec.len(), &recent_memories) {
-                add_memory_context_to_messages(vec, &contextual_memories);
-            }
-
-            println!(
-                "[INFO] 群聊继续对话 (群组: {}, 用户: {})",
-                group_id, nickname
-            );
-            let resp = params_model(vec).await;
-            if !resp.content.contains("[sp]") {
-                bot.send_group_msg(group_id, &resp.content);
-                println!(
-                    "[INFO] 群聊消息已发送 (群组: {}): {}",
-                    group_id, resp.content
-                );
-                if let Err(error) = MEMORY_MANAGER
-                    .add_conversation_memory(
-                        group_id,
-                        &format!("芸汐: {}", resp.content),
-                        "group_chat",
-                    )
-                    .await
-                {
-                    eprintln!(
-                        "[ERROR] 群聊回复记忆记录失败 (群组: {}): {}",
-                        group_id, error
-                    );
-                }
-            };
-            vec.push(resp);
-
-            // 检查并限制记忆大小
-            limit_memory_size(vec);
-        }
+    let history = group_history(group_id).await;
+    // 同一群内保持消息顺序，但不同群可以并发调用模型。
+    let mut messages = history.lock().await;
+    let is_new_conversation = messages.is_empty();
+    let system_prompt = group_system_prompt(&contextual_memories);
+    if is_new_conversation {
+        messages.push(BotMemory {
+            role: Roles::System,
+            content: system_prompt,
+        });
+    } else if let Some(first) = messages.first_mut() {
+        first.content = system_prompt;
     }
-}
+    messages.push(BotMemory {
+        role: Roles::User,
+        content: format!("{}:{}", nickname, message),
+    });
 
-/// 判断是否需要添加记忆上下文
-///
-/// 当对话较短且存在相关记忆时，将记忆注入到对话上下文中
-///
-/// # 参数
-/// * `current_length` - 当前对话长度
-/// * `recent_memories` - 最近的相关记忆
-///
-/// # 返回值
-/// 是否需要添加记忆上下文
-fn should_add_memory_context(
-    current_length: usize,
-    recent_memories: &[crate::memory::MemoryEntry],
-) -> bool {
-    // 如果对话较短且没有太多上下文，添加记忆
-    current_length < 10 && !recent_memories.is_empty()
-}
-
-/// 将相关记忆添加到消息列表中
-///
-/// 在系统消息后添加相关记忆，增强AI的上下文理解能力
-///
-/// # 参数
-/// * `messages` - 消息列表（可变引用）
-/// * `memories` - 要添加的相关记忆
-fn add_memory_context_to_messages(
-    messages: &mut [BotMemory],
-    memories: &[crate::memory::MemoryEntry],
-) {
-    if memories.is_empty() {
-        return;
-    }
-
-    // 在系统消息后添加相关记忆
-    if messages.len() > 1 {
-        let memory_context = format!(
-            "\n\n相关记忆：\n{}",
-            memories
-                .iter()
-                .take(2)
-                .map(|m| format!("- {}", m.content))
-                .collect::<Vec<_>>()
-                .join("\n")
+    println!(
+        "[INFO] 群聊{}对话 (群组: {}, 用户: {})",
+        if is_new_conversation { "新" } else { "继续" },
+        group_id,
+        nickname
+    );
+    let response = params_model(&mut messages).await;
+    if !response.content.contains("[sp]") {
+        bot.send_group_msg(group_id, &response.content);
+        println!(
+            "[INFO] 群聊消息已发送 (群组: {}): {}",
+            group_id, response.content
         );
-
-        if let Some(system_msg) = messages.first_mut()
-            && system_msg.role == Roles::System
+        if let Err(error) = MEMORY_MANAGER
+            .add_conversation_memory(
+                group_id,
+                &format!("芸汐: {}", response.content),
+                "group_chat",
+            )
+            .await
         {
-            system_msg.content.push_str(&memory_context);
+            eprintln!(
+                "[ERROR] 群聊回复记忆记录失败 (群组: {}): {}",
+                group_id, error
+            );
         }
     }
+    messages.push(response);
+    limit_memory_size(&mut messages);
+}
+
+fn group_system_prompt(memories: &[crate::memory::MemoryEntry]) -> String {
+    let mut prompt = config::get().prompt().system_prompt().to_string();
+    if !memories.is_empty() {
+        prompt.push_str("\n\n相关记忆：");
+        for memory in memories
+            .iter()
+            .take(config::get().memory().contextual_memory_limit())
+        {
+            prompt.push_str(&format!("\n- {}", memory.content));
+        }
+    }
+    prompt
 }
 
 /// 限制对话记忆大小
 ///
-/// 保持最多25条记录（包括system prompt），防止内存过度使用
+/// 按配置保留有限记录（包括system prompt），防止内存过度使用
 /// 优先保留最近的对话内容
 ///
 /// # 参数
 /// * `messages` - 消息列表（可变引用）
 fn limit_memory_size(messages: &mut Vec<BotMemory>) {
-    if messages.len() <= MAX_MEMORY_SIZE {
+    let max_memory_size = config::get().memory().max_conversation_messages();
+    if messages.len() <= max_memory_size {
         return;
     }
 
@@ -320,7 +218,7 @@ fn limit_memory_size(messages: &mut Vec<BotMemory>) {
     let system_message = messages[0].clone();
 
     // 计算需要保留的消息数量（除了system prompt）
-    let keep_count = MAX_MEMORY_SIZE - 1;
+    let keep_count = max_memory_size - 1;
 
     // 保留最近的对话
     let recent_messages = messages
@@ -431,13 +329,12 @@ fn model_error(error: &str) -> BotMemory {
 /// - 根据能量水平调整思考深度
 ///
 /// # 参数
-/// * `_messages` - 对话消息列表（当前未使用）
+/// * `messages` - 对话消息列表，用于判断是否注入了相关记忆
 ///
 /// # 返回值
 /// 生成的思考过程文本
-async fn generate_thinking_prompt(_messages: &[BotMemory]) -> String {
+async fn generate_thinking_prompt(messages: &[BotMemory]) -> String {
     let personality = MEMORY_MANAGER.get_bot_personality().await;
-    let recent_memories = MEMORY_MANAGER.get_recent_memories(5).await;
 
     let mut thinking = String::new();
 
@@ -461,7 +358,10 @@ async fn generate_thinking_prompt(_messages: &[BotMemory]) -> String {
     }
 
     // 添加相关记忆到思考中
-    if !recent_memories.is_empty() {
+    let has_contextual_memories = messages
+        .first()
+        .is_some_and(|message| message.content.contains("相关记忆："));
+    if has_contextual_memories {
         thinking.push_str(" 我记得之前讨论过类似的话题...");
     }
 
@@ -479,12 +379,22 @@ fn instance_is_ban() -> &'static Mutex<HashMap<i64, bool>> {
     &IS_BANNED
 }
 
-fn get_memory() -> &'static Mutex<HashMap<i64, Vec<BotMemory>>> {
-    &MEMORY
+async fn group_history(group_id: i64) -> ConversationHistory {
+    MEMORY
+        .lock()
+        .await
+        .entry(group_id)
+        .or_insert_with(|| Arc::new(Mutex::new(Vec::new())))
+        .clone()
 }
 
-fn get_private_message_memory() -> &'static Mutex<HashMap<i64, Vec<BotMemory>>> {
-    &PRIVATE_MESSAGE_MEMORY
+async fn private_history(user_id: i64) -> ConversationHistory {
+    PRIVATE_MESSAGE_MEMORY
+        .lock()
+        .await
+        .entry(user_id)
+        .or_insert_with(|| Arc::new(Mutex::new(Vec::new())))
+        .clone()
 }
 
 pub async fn silence(group_id: i64, message: &str, bot: Arc<RuntimeBot>, sender: String) {
@@ -506,8 +416,7 @@ pub async fn silence(group_id: i64, message: &str, bot: Arc<RuntimeBot>, sender:
         .get(&group_id)
         .unwrap_or(&false);
     if !is_banned {
-        let mut guard = get_memory().lock().await;
-        control_model(&mut guard, group_id, bot, sender, message).await;
+        control_model(group_id, bot, sender, message).await;
     }
 }
 
@@ -542,12 +451,16 @@ pub async fn send_sys_info(bot: Arc<RuntimeBot>, group_id: i64) {
 
 pub async fn private_chat(user_id: i64, message: &str, nickname: String, bot: Arc<RuntimeBot>) {
     // 分析情绪并更新
-    if let Err(e) = MOOD_SYSTEM
+    let detected_mood = match MOOD_SYSTEM
         .analyze_and_update_mood(message, "private_chat")
         .await
     {
-        eprintln!("[ERROR] 私聊情绪分析失败 (用户: {}): {}", user_id, e);
-    }
+        Ok(mood) => Some(mood),
+        Err(e) => {
+            eprintln!("[ERROR] 私聊情绪分析失败 (用户: {}): {}", user_id, e);
+            None
+        }
+    };
 
     // 记录对话记忆
     if let Err(e) = MEMORY_MANAGER
@@ -562,23 +475,31 @@ pub async fn private_chat(user_id: i64, message: &str, nickname: String, bot: Ar
     }
 
     // 更新用户档案
-    update_user_profile_from_message(user_id, message, &nickname).await;
+    update_user_profile_from_message(user_id, message, &nickname, true, detected_mood).await;
 
     // 获取用户档案和个性化信息
     let user_profile = MEMORY_MANAGER.get_user_profile(user_id).await;
     let contextual_memories = MEMORY_MANAGER
-        .get_contextual_memories(user_id, "private_chat", 3)
+        .get_contextual_memories(
+            user_id,
+            "private_chat",
+            config::get().memory().contextual_memory_limit(),
+        )
         .await;
     let personality = MEMORY_MANAGER.get_bot_personality().await;
 
     let personalized_prompt =
         generate_personalized_system_prompt(&user_profile, &personality, &contextual_memories)
             .await;
-    let mut private = get_private_message_memory().lock().await;
-    let history = private.entry(user_id).or_insert(vec![BotMemory {
-        role: Roles::System,
-        content: personalized_prompt.clone(),
-    }]);
+    let private = private_history(user_id).await;
+    // 同一用户的私聊按顺序处理，不阻塞其他用户。
+    let mut history = private.lock().await;
+    if history.is_empty() {
+        history.push(BotMemory {
+            role: Roles::System,
+            content: personalized_prompt.clone(),
+        });
+    }
     if let Some(system_message) = history.first_mut() {
         system_message.content = personalized_prompt;
     }
@@ -590,7 +511,7 @@ pub async fn private_chat(user_id: i64, message: &str, nickname: String, bot: Ar
     });
 
     println!("[INFO] 私聊对话 (用户: {})", user_id);
-    let bot_content = params_model(history).await;
+    let bot_content = params_model(&mut history).await;
     bot.send_private_msg(user_id, &bot_content.content);
     println!(
         "[INFO] 私聊消息已发送 (用户: {}): {}",
@@ -614,7 +535,7 @@ pub async fn private_chat(user_id: i64, message: &str, nickname: String, bot: Ar
     history.push(bot_content);
 
     // 限制私聊记忆大小
-    limit_memory_size(history);
+    limit_memory_size(&mut history);
 }
 
 async fn generate_personalized_system_prompt(
@@ -660,7 +581,33 @@ async fn generate_personalized_system_prompt(
     prompt
 }
 
-async fn update_user_profile_from_message(user_id: i64, message: &str, nickname: &str) {
+pub(crate) async fn learn_user_profile_from_message(
+    user_id: i64,
+    message: &str,
+    nickname: &str,
+    is_private: bool,
+) {
+    let detected_mood = MOOD_SYSTEM
+        .analyze_mood(
+            message,
+            if is_private {
+                "private_chat"
+            } else {
+                "group_chat"
+            },
+        )
+        .await;
+    update_user_profile_from_message(user_id, message, nickname, is_private, Some(detected_mood))
+        .await;
+}
+
+async fn update_user_profile_from_message(
+    user_id: i64,
+    message: &str,
+    nickname: &str,
+    is_private: bool,
+    detected_mood: Option<Mood>,
+) {
     let mut profile = MEMORY_MANAGER
         .get_user_profile(user_id)
         .await
@@ -672,12 +619,19 @@ async fn update_user_profile_from_message(user_id: i64, message: &str, nickname:
             relationship_level: 1,
             last_interaction: Local::now(),
             interaction_count: 0,
+            last_private_interaction: None,
             mood_history: Vec::new(),
         });
 
     // 更新互动信息
+    if !nickname.trim().is_empty() {
+        profile.nickname = nickname.to_string();
+    }
     profile.last_interaction = Local::now();
-    profile.interaction_count += 1;
+    profile.interaction_count = profile.interaction_count.saturating_add(1);
+    if is_private {
+        profile.last_private_interaction = Some(Local::now());
+    }
 
     // 随互动次数自然提升关系等级，感谢类表达再额外提升一级。
     profile.relationship_level = profile
@@ -694,6 +648,28 @@ async fn update_user_profile_from_message(user_id: i64, message: &str, nickname:
     for interest in interests {
         if !profile.interests.contains(&interest) {
             profile.interests.push(interest);
+        }
+    }
+    profile.interests.truncate(20);
+
+    for personality_trait in extract_personality_traits(message) {
+        if !profile.personality_traits.contains(&personality_trait) {
+            profile.personality_traits.push(personality_trait);
+        }
+    }
+    profile.personality_traits.truncate(20);
+
+    if let Some(mood) = detected_mood {
+        profile.mood_history.push(MoodEntry {
+            mood: mood.to_string(),
+            intensity: 5,
+            timestamp: Local::now(),
+            trigger: message.chars().take(80).collect(),
+        });
+        if profile.mood_history.len() > 50 {
+            profile
+                .mood_history
+                .drain(0..profile.mood_history.len() - 50);
         }
     }
 
@@ -730,6 +706,21 @@ fn extract_interests_from_message(message: &str) -> Vec<String> {
     interests
 }
 
+fn extract_personality_traits(message: &str) -> Vec<String> {
+    let trait_keywords = [
+        ("友善", ["谢谢", "感谢", "辛苦", "关心"]),
+        ("好奇", ["为什么", "怎么", "想知道", "好奇"]),
+        ("幽默", ["哈哈", "笑死", "开玩笑", "有趣"]),
+        ("勤奋", ["学习", "工作", "努力", "练习"]),
+        ("体贴", ["没事吧", "注意休息", "保重", "别难过"]),
+    ];
+    trait_keywords
+        .iter()
+        .filter(|(_, keywords)| keywords.iter().any(|keyword| message.contains(keyword)))
+        .map(|(name, _)| (*name).to_string())
+        .collect()
+}
+
 pub fn get_file_modified_time_formatted() -> anyhow::Result<String> {
     let config_path = "bot.conf.toml";
     if !Path::new(config_path).exists() {
@@ -754,4 +745,50 @@ pub fn get_file_modified_time_formatted() -> anyhow::Result<String> {
         .ok_or_else(|| anyhow::anyhow!("Invalid timestamp"))?;
 
     Ok(datetime.format("%Y-%m-%d %H:%M:%S").to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        BotMemory, Roles, extract_interests_from_message, extract_personality_traits,
+        limit_memory_size,
+    };
+
+    #[test]
+    fn profile_signals_are_extracted_from_messages() {
+        let interests = extract_interests_from_message("谢谢，我最近在学习 Rust，也常听音乐");
+        assert!(interests.contains(&"学习".to_string()));
+        assert!(interests.contains(&"音乐".to_string()));
+
+        let traits = extract_personality_traits("谢谢你的关心，我会继续努力学习");
+        assert!(traits.contains(&"友善".to_string()));
+        assert!(traits.contains(&"勤奋".to_string()));
+    }
+
+    #[test]
+    fn short_term_history_keeps_system_prompt_and_recent_messages() {
+        let mut messages = vec![BotMemory {
+            role: Roles::System,
+            content: "system".to_string(),
+        }];
+        for index in 0..40 {
+            messages.push(BotMemory {
+                role: Roles::User,
+                content: format!("message-{index}"),
+            });
+        }
+
+        limit_memory_size(&mut messages);
+
+        assert_eq!(
+            messages.len(),
+            crate::config::get().memory().max_conversation_messages()
+        );
+        assert_eq!(messages[0].role, Roles::System);
+        assert_eq!(messages[0].content, "system");
+        assert_eq!(
+            messages.last().map(|message| message.content.as_str()),
+            Some("message-39")
+        );
+    }
 }

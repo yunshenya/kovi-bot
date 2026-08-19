@@ -150,7 +150,10 @@ impl ProactiveChatManager {
         user_profiles
             .into_iter()
             .filter(|profile| {
-                profile.last_interaction > three_days_ago && profile.relationship_level > 2
+                profile
+                    .last_private_interaction
+                    .is_some_and(|last_private| last_private > three_days_ago)
+                    && profile.relationship_level > 2
             })
             .map(|profile| profile.user_id)
             .collect()
@@ -299,12 +302,16 @@ impl ProactiveChatManager {
                 relationship_level: 1,
                 last_interaction: Local::now(),
                 interaction_count: 0,
+                last_private_interaction: if _is_group { None } else { Some(Local::now()) },
                 mood_history: Vec::new(),
             });
 
         // 更新互动信息
         profile.last_interaction = Local::now();
-        profile.interaction_count += 1;
+        profile.interaction_count = profile.interaction_count.saturating_add(1);
+        if !_is_group {
+            profile.last_private_interaction = Some(Local::now());
+        }
 
         // 根据对话内容更新关系等级
         if message.contains("谢谢") || message.contains("感谢") {
