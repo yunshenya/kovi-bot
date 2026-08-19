@@ -1,5 +1,5 @@
 //! # 记忆管理系统
-//! 
+//!
 //! 提供智能的长期记忆存储和检索功能，支持：
 //! - 多类型记忆分类存储
 //! - 智能重要性评分
@@ -12,20 +12,23 @@ use anyhow::Result;
 use chrono::{DateTime, Local};
 use kovi::tokio::sync::Mutex;
 use serde::{Deserialize, Serialize};
+use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 
+static MEMORY_ID_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
 /// 全局记忆管理器实例
-/// 
+///
 /// 使用LazyLock确保线程安全的单例模式，在首次访问时初始化
 /// 记忆文件默认保存为 "bot_memory.json"
 pub static MEMORY_MANAGER: LazyLock<Arc<MemoryManager>> =
     LazyLock::new(|| Arc::new(MemoryManager::new("bot_memory.json")));
 
 /// 记忆条目结构体
-/// 
+///
 /// 存储单条记忆的完整信息，包括内容、时间戳、类型、重要性等
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct MemoryEntry {
@@ -43,10 +46,13 @@ pub struct MemoryEntry {
     pub tags: Vec<String>,
     /// 上下文信息，描述记忆产生的环境
     pub context: String,
+    /// 该记忆所属的用户或群组。旧版记忆反序列化时为 `None`。
+    #[serde(default)]
+    pub subject_id: Option<i64>,
 }
 
 /// 记忆类型枚举
-/// 
+///
 /// 定义不同类型的记忆，用于分类存储和检索
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum MemoryType {
@@ -65,7 +71,7 @@ pub enum MemoryType {
 }
 
 /// 用户档案结构体
-/// 
+///
 /// 存储用户的详细信息，用于个性化交互和关系管理
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct UserProfile {
@@ -88,7 +94,7 @@ pub struct UserProfile {
 }
 
 /// 情绪记录条目
-/// 
+///
 /// 记录单次情绪变化的信息
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct MoodEntry {
@@ -103,7 +109,7 @@ pub struct MoodEntry {
 }
 
 /// 群组档案结构体
-/// 
+///
 /// 存储群组的基本信息和活跃状态
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct GroupProfile {
@@ -124,7 +130,7 @@ pub struct GroupProfile {
 }
 
 /// 机器人人格结构体
-/// 
+///
 /// 存储机器人的当前状态和人格特征
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct BotPersonality {
@@ -145,7 +151,7 @@ pub struct BotPersonality {
 }
 
 /// 记忆管理器结构体
-/// 
+///
 /// 负责管理所有类型的记忆数据，包括：
 /// - 对话记忆的存储和检索
 /// - 用户和群组档案的管理
@@ -164,17 +170,19 @@ pub struct MemoryManager {
     bot_personality: Arc<Mutex<BotPersonality>>,
     /// 记忆文件路径
     memory_file: String,
+    /// 串行化持久化操作，避免多个任务同时覆盖记忆文件。
+    save_lock: Arc<Mutex<()>>,
 }
 
 impl MemoryManager {
     /// 创建新的记忆管理器实例
-    /// 
+    ///
     /// # 参数
     /// * `memory_file` - 记忆数据持久化文件路径
-    /// 
+    ///
     /// # 返回值
     /// 返回初始化的MemoryManager实例，包含默认的机器人人格设置
-    /// 
+    ///
     /// # 默认人格特征
     /// - 当前情绪：中性
     /// - 情绪强度：5/10
@@ -183,46 +191,40 @@ impl MemoryManager {
     /// - 好奇心：8/10
     /// - 性格特征：好奇、顽皮、有同理心、轻微傲娇
     pub fn new(memory_file: &str) -> Self {
-        let manager = Self {
-            memories: Arc::new(Mutex::new(HashMap::new())),
-            user_profiles: Arc::new(Mutex::new(HashMap::new())),
-            group_profiles: Arc::new(Mutex::new(HashMap::new())),
-            bot_personality: Arc::new(Mutex::new(BotPersonality {
-                current_mood: "neutral".to_string(),
-                mood_intensity: 5,
-                energy_level: 7,
-                social_confidence: 6,
-                curiosity_level: 8,
-                last_mood_change: Local::now(),
-                personality_traits: vec![
-                    "curious".to_string(),
-                    "playful".to_string(),
-                    "empathetic".to_string(),
-                    "slightly_tsundere".to_string(),
-                ],
-            })),
-            memory_file: memory_file.to_string(),
-        };
-        
-        // 尝试加载现有记忆
-        let manager_clone = manager.clone();
-        kovi::tokio::spawn(async move {
-            if let Err(e) = manager_clone.load_memories().await {
-                eprintln!("Failed to load memories: {}", e);
+        // 构造阶段同步读取，保证第一条消息不会和后台加载任务竞态并覆盖旧数据。
+        let data = match fs::read_to_string(memory_file) {
+            Ok(json) => match serde_json::from_str::<MemoryData>(&json) {
+                Ok(data) => data,
+                Err(error) => {
+                    eprintln!("[ERROR] 记忆文件解析失败，将使用空记忆: {}", error);
+                    MemoryData::default()
+                }
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => MemoryData::default(),
+            Err(error) => {
+                eprintln!("[ERROR] 记忆文件读取失败，将使用空记忆: {}", error);
+                MemoryData::default()
             }
-        });
-        
-        manager
+        };
+
+        Self {
+            memories: Arc::new(Mutex::new(data.memories)),
+            user_profiles: Arc::new(Mutex::new(data.user_profiles)),
+            group_profiles: Arc::new(Mutex::new(data.group_profiles)),
+            bot_personality: Arc::new(Mutex::new(data.bot_personality)),
+            memory_file: memory_file.to_string(),
+            save_lock: Arc::new(Mutex::new(())),
+        }
     }
 
     /// 添加新的记忆条目
-    /// 
+    ///
     /// # 参数
     /// * `memory` - 要添加的记忆条目
-    /// 
+    ///
     /// # 返回值
     /// 成功时返回 `Ok(())`，失败时返回错误信息
-    /// 
+    ///
     /// # 注意
     /// 添加记忆后会自动保存到文件
     pub async fn add_memory(&self, memory: MemoryEntry) -> Result<()> {
@@ -234,40 +236,45 @@ impl MemoryManager {
     }
 
     /// 根据类型获取记忆条目
-    /// 
+    ///
     /// # 参数
     /// * `memory_type` - 要查询的记忆类型
-    /// 
+    ///
     /// # 返回值
     /// 返回指定类型的所有记忆条目
     pub async fn get_memories_by_type(&self, memory_type: &MemoryType) -> Vec<MemoryEntry> {
         let memories = self.memories.lock().await;
         memories
             .values()
-            .filter(|m| std::mem::discriminant(&m.memory_type) == std::mem::discriminant(memory_type))
+            .filter(|m| {
+                std::mem::discriminant(&m.memory_type) == std::mem::discriminant(memory_type)
+            })
             .cloned()
             .collect()
     }
 
     /// 获取最近的记忆条目
-    /// 
+    ///
     /// # 参数
     /// * `limit` - 返回的最大记忆条目数量
-    /// 
+    ///
     /// # 返回值
     /// 按时间倒序排列的最近记忆条目列表
     pub async fn get_recent_memories(&self, limit: usize) -> Vec<MemoryEntry> {
         let mut memories: Vec<MemoryEntry> = self.memories.lock().await.values().cloned().collect();
-        memories.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
-        memories.truncate(limit);
+        memories.sort_by_key(|memory| Reverse(memory.timestamp));
+        // limit=0 用于健康检查，表示返回全部记忆。
+        if limit > 0 {
+            memories.truncate(limit);
+        }
         memories
     }
 
     /// 获取重要性达到指定阈值的记忆条目
-    /// 
+    ///
     /// # 参数
     /// * `min_importance` - 最小重要性阈值 (0-10)
-    /// 
+    ///
     /// # 返回值
     /// 重要性大于等于阈值的记忆条目列表
     pub async fn get_important_memories(&self, min_importance: u8) -> Vec<MemoryEntry> {
@@ -280,43 +287,43 @@ impl MemoryManager {
     }
 
     /// 智能搜索记忆条目
-    /// 
+    ///
     /// 使用多因素评分算法搜索相关记忆，考虑以下因素：
     /// - 内容完全匹配 (10分)
     /// - 标签匹配 (5分)
     /// - 记忆重要性 (0-10分)
     /// - 时间权重：7天内(3分)，30天内(2分)，90天内(1分)
-    /// 
+    ///
     /// # 参数
     /// * `query` - 搜索查询字符串
-    /// 
+    ///
     /// # 返回值
     /// 按相关性得分排序的记忆条目列表
     pub async fn search_memories(&self, query: &str) -> Vec<MemoryEntry> {
         let memories = self.memories.lock().await;
         let query_lower = query.to_lowercase();
-        
+
         let mut results: Vec<(MemoryEntry, u8)> = memories
             .values()
             .map(|m| {
                 let mut score = 0u8;
                 let content_lower = m.content.to_lowercase();
-                
+
                 // 完全匹配得分最高
                 if content_lower.contains(&query_lower) {
                     score += 10;
                 }
-                
+
                 // 标签匹配
                 for tag in &m.tags {
                     if tag.to_lowercase().contains(&query_lower) {
                         score += 5;
                     }
                 }
-                
+
                 // 重要性权重
                 score += m.importance;
-                
+
                 // 时间权重（越近越重要）
                 let now = Local::now();
                 let days_ago = now.signed_duration_since(m.timestamp).num_days();
@@ -327,35 +334,43 @@ impl MemoryManager {
                 } else if days_ago < 90 {
                     score += 1;
                 }
-                
+
                 (m.clone(), score)
             })
             .filter(|(_, score)| *score > 0)
             .collect();
-        
+
         // 按得分排序
-        results.sort_by(|a, b| b.1.cmp(&a.1));
-        
+        results.sort_by_key(|result| Reverse(result.1));
+
         results.into_iter().map(|(memory, _)| memory).collect()
     }
 
-    pub async fn get_contextual_memories(&self, user_id: i64, context: &str, limit: usize) -> Vec<MemoryEntry> {
+    pub async fn get_contextual_memories(
+        &self,
+        user_id: i64,
+        context: &str,
+        limit: usize,
+    ) -> Vec<MemoryEntry> {
         let memories = self.memories.lock().await;
         let mut contextual_memories: Vec<(MemoryEntry, u8)> = Vec::new();
-        
+
         for memory in memories.values() {
             let mut relevance_score = 0u8;
-            
-            // 检查是否与用户相关
-            if memory.content.contains(&format!("{}", user_id)) {
-                relevance_score += 5;
+
+            // 新版数据精确匹配所属对象；旧版数据仍可通过上下文参与检索。
+            match memory.subject_id {
+                Some(subject_id) if subject_id == user_id => relevance_score += 5,
+                Some(_) => continue,
+                // 旧版数据没有所属对象，不能安全注入其他人的上下文。
+                None => continue,
             }
-            
+
             // 检查上下文匹配
             if memory.context == context {
                 relevance_score += 3;
             }
-            
+
             // 检查标签匹配
             let context_lower = context.to_lowercase();
             for tag in &memory.tags {
@@ -363,25 +378,30 @@ impl MemoryManager {
                     relevance_score += 2;
                 }
             }
-            
+
             // 重要性权重
             relevance_score += memory.importance;
-            
+
             if relevance_score > 0 {
                 contextual_memories.push((memory.clone(), relevance_score));
             }
         }
-        
+
         // 按相关性排序并限制数量
-        contextual_memories.sort_by(|a, b| b.1.cmp(&a.1));
+        contextual_memories.sort_by_key(|result| Reverse(result.1));
         contextual_memories.truncate(limit);
-        
-        contextual_memories.into_iter().map(|(memory, _)| memory).collect()
+
+        contextual_memories
+            .into_iter()
+            .map(|(memory, _)| memory)
+            .collect()
     }
 
     pub async fn update_user_profile(&self, user_id: i64, profile: UserProfile) -> Result<()> {
-        let mut profiles = self.user_profiles.lock().await;
-        profiles.insert(user_id, profile);
+        {
+            let mut profiles = self.user_profiles.lock().await;
+            profiles.insert(user_id, profile);
+        }
         self.save_memories().await
     }
 
@@ -391,8 +411,10 @@ impl MemoryManager {
     }
 
     pub async fn update_group_profile(&self, group_id: i64, profile: GroupProfile) -> Result<()> {
-        let mut profiles = self.group_profiles.lock().await;
-        profiles.insert(group_id, profile);
+        {
+            let mut profiles = self.group_profiles.lock().await;
+            profiles.insert(group_id, profile);
+        }
         self.save_memories().await
     }
 
@@ -424,79 +446,98 @@ impl MemoryManager {
         bot_personality.clone()
     }
 
-    pub async fn add_conversation_memory(&self, user_id: i64, content: &str, context: &str) -> Result<()> {
+    pub async fn add_conversation_memory(
+        &self,
+        user_id: i64,
+        content: &str,
+        context: &str,
+    ) -> Result<()> {
+        let sequence = MEMORY_ID_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let memory = MemoryEntry {
-            id: format!("conv_{}_{}", user_id, Local::now().timestamp_millis()),
+            id: format!(
+                "conv_{}_{}_{}",
+                user_id,
+                Local::now().timestamp_micros(),
+                sequence
+            ),
             content: content.to_string(),
             timestamp: Local::now(),
             memory_type: MemoryType::Conversation,
             importance: self.calculate_importance(content),
             tags: self.extract_tags(content),
             context: context.to_string(),
+            subject_id: Some(user_id),
         };
         self.add_memory(memory).await
     }
 
     /// 计算记忆内容的重要性评分
-    /// 
+    ///
     /// 使用多维度分析算法评估记忆的重要性，考虑以下因素：
-    /// 
+    ///
     /// ## 关键词权重
     /// - **高重要性关键词** (+4分)：喜欢、讨厌、重要、秘密、梦想、目标、家人、朋友、爱、恨、害怕、担心
     /// - **中等重要性关键词** (+2分)：工作、学习、游戏、电影、音乐、食物、旅行、运动、健康
     /// - **低重要性关键词** (-1分)：天气、今天、昨天、明天、现在、刚才
-    /// 
+    ///
     /// ## 内容特征
     /// - **长度权重**：>150字符(+2分)，>100字符(+1分)
     /// - **情感表达** (+2分)：开心、难过、生气、兴奋、害怕、担心、惊讶、失望
     /// - **个人信息** (+1分)：我、我的、自己、个人、私人的
-    /// 
+    ///
     /// # 参数
     /// * `content` - 要分析的内容文本
-    /// 
+    ///
     /// # 返回值
     /// 重要性评分 (0-10)，10表示最重要
     fn calculate_importance(&self, content: &str) -> u8 {
         let mut importance: u8 = 3; // 基础重要性
-        
+
         // 检查关键词
-        let high_importance_keywords = ["喜欢", "讨厌", "重要", "秘密", "梦想", "目标", "家人", "朋友", "爱", "恨", "害怕", "担心"];
-        let medium_importance_keywords = ["工作", "学习", "游戏", "电影", "音乐", "食物", "旅行", "运动", "健康"];
+        let high_importance_keywords = [
+            "喜欢", "讨厌", "重要", "秘密", "梦想", "目标", "家人", "朋友", "爱", "恨", "害怕",
+            "担心",
+        ];
+        let medium_importance_keywords = [
+            "工作", "学习", "游戏", "电影", "音乐", "食物", "旅行", "运动", "健康",
+        ];
         let low_importance_keywords = ["天气", "今天", "昨天", "明天", "现在", "刚才"];
-        
+
         for keyword in &high_importance_keywords {
             if content.contains(keyword) {
                 importance += 4;
             }
         }
-        
+
         for keyword in &medium_importance_keywords {
             if content.contains(keyword) {
                 importance += 2;
             }
         }
-        
+
         for keyword in &low_importance_keywords {
             if content.contains(keyword) {
                 importance = importance.saturating_sub(1);
             }
         }
-        
+
         // 根据长度调整
         if content.len() > 150 {
             importance += 2;
         } else if content.len() > 100 {
             importance += 1;
         }
-        
+
         // 检查是否包含情感表达
-        let emotional_keywords = ["开心", "难过", "生气", "兴奋", "害怕", "担心", "惊讶", "失望"];
+        let emotional_keywords = [
+            "开心", "难过", "生气", "兴奋", "害怕", "担心", "惊讶", "失望",
+        ];
         for keyword in &emotional_keywords {
             if content.contains(keyword) {
                 importance += 2;
             }
         }
-        
+
         // 检查是否包含个人信息
         let personal_keywords = ["我", "我的", "自己", "个人", "私人的"];
         for keyword in &personal_keywords {
@@ -504,59 +545,31 @@ impl MemoryManager {
                 importance += 1;
             }
         }
-        
+
         importance.min(10)
     }
 
     fn extract_tags(&self, content: &str) -> Vec<String> {
         let mut tags = Vec::new();
-        
+
         // 简单的关键词提取
-        let common_tags = ["游戏", "学习", "工作", "生活", "情感", "技术", "娱乐", "美食", "旅行"];
+        let common_tags = [
+            "游戏", "学习", "工作", "生活", "情感", "技术", "娱乐", "美食", "旅行",
+        ];
         for tag in &common_tags {
             if content.contains(tag) {
                 tags.push(tag.to_string());
             }
         }
-        
+
         tags
     }
 
-    async fn load_memories(&self) -> Result<()> {
-        if !Path::new(&self.memory_file).exists() {
-            return Ok(());
-        }
-
-        let data = fs::read_to_string(&self.memory_file)?;
-        let data: MemoryData = serde_json::from_str(&data)?;
-        
-        {
-            let mut memories = self.memories.lock().await;
-            *memories = data.memories;
-        }
-        
-        {
-            let mut user_profiles = self.user_profiles.lock().await;
-            *user_profiles = data.user_profiles;
-        }
-        
-        {
-            let mut group_profiles = self.group_profiles.lock().await;
-            *group_profiles = data.group_profiles;
-        }
-        
-        {
-            let mut bot_personality = self.bot_personality.lock().await;
-            *bot_personality = data.bot_personality;
-        }
-
-        Ok(())
-    }
-
     async fn save_memories(&self) -> Result<()> {
+        let _save_guard = self.save_lock.lock().await;
         // 限制记忆数量，避免内存过度使用
         self.cleanup_old_memories().await?;
-        
+
         let data = MemoryData {
             memories: self.memories.lock().await.clone(),
             user_profiles: self.user_profiles.lock().await.clone(),
@@ -570,45 +583,136 @@ impl MemoryManager {
     }
 
     /// 清理旧记忆，避免内存过度使用
-    /// 
+    ///
     /// 执行以下清理策略：
     /// 1. 移除30天前的低重要性记忆（重要性 < 7）
     /// 2. 如果记忆数量超过1000条，只保留最重要的记忆
-    /// 
+    ///
     /// # 清理规则
     /// - 保留所有高重要性记忆（重要性 >= 7）
     /// - 移除30天前的低重要性记忆
     /// - 限制总记忆数量不超过1000条
-    /// 
+    ///
     /// # 返回值
     /// 成功时返回 `Ok(())`，失败时返回错误信息
     async fn cleanup_old_memories(&self) -> Result<()> {
         let mut memories = self.memories.lock().await;
         let now = Local::now();
         let thirty_days_ago = now - chrono::Duration::days(30);
-        
+
         // 移除30天前的低重要性记忆
-        memories.retain(|_, memory| {
-            memory.timestamp > thirty_days_ago || memory.importance >= 7
-        });
-        
+        memories.retain(|_, memory| memory.timestamp > thirty_days_ago || memory.importance >= 7);
+
         // 如果记忆数量仍然过多，只保留最重要的
         if memories.len() > 1000 {
             let mut memory_vec: Vec<_> = memories.drain().collect();
-            memory_vec.sort_by(|a, b| b.1.importance.cmp(&a.1.importance));
+            memory_vec.sort_by_key(|memory| Reverse(memory.1.importance));
             memory_vec.truncate(1000);
             *memories = memory_vec.into_iter().collect();
         }
-        
+
         println!("[INFO] 记忆清理完成，当前记忆数量: {}", memories.len());
         Ok(())
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Default)]
+#[serde(default)]
 struct MemoryData {
     memories: HashMap<String, MemoryEntry>,
     user_profiles: HashMap<i64, UserProfile>,
     group_profiles: HashMap<i64, GroupProfile>,
     bot_personality: BotPersonality,
+}
+
+impl Default for BotPersonality {
+    fn default() -> Self {
+        Self {
+            current_mood: "neutral".to_string(),
+            mood_intensity: 5,
+            energy_level: 7,
+            social_confidence: 6,
+            curiosity_level: 8,
+            last_mood_change: Local::now(),
+            personality_traits: vec![
+                "curious".to_string(),
+                "playful".to_string(),
+                "empathetic".to_string(),
+                "slightly_tsundere".to_string(),
+            ],
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MemoryManager, UserProfile};
+    use chrono::Local;
+
+    fn temporary_memory_path(test_name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "kovi-bot-{}-{}-{}.json",
+            test_name,
+            std::process::id(),
+            Local::now().timestamp_micros(),
+        ))
+    }
+
+    #[test]
+    fn profile_updates_persist_without_deadlock() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let path = temporary_memory_path("profile");
+                let manager = MemoryManager::new(path.to_str().expect("临时路径应为 UTF-8"));
+                let profile = UserProfile {
+                    user_id: 42,
+                    nickname: "tester".to_string(),
+                    personality_traits: Vec::new(),
+                    interests: vec!["Rust".to_string()],
+                    relationship_level: 3,
+                    last_interaction: Local::now(),
+                    interaction_count: 2,
+                    mood_history: Vec::new(),
+                };
+
+                manager
+                    .update_user_profile(42, profile)
+                    .await
+                    .expect("档案应成功持久化");
+
+                let reloaded = MemoryManager::new(path.to_str().expect("临时路径应为 UTF-8"));
+                let saved = reloaded.get_user_profile(42).await.expect("应读回用户档案");
+                assert_eq!(saved.nickname, "tester");
+                assert_eq!(saved.interests, vec!["Rust"]);
+
+                std::fs::remove_file(path).expect("应清理测试记忆文件");
+            });
+    }
+
+    #[test]
+    fn contextual_memories_are_isolated_by_subject() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let path = temporary_memory_path("isolation");
+                let manager = MemoryManager::new(path.to_str().expect("临时路径应为 UTF-8"));
+
+                manager
+                    .add_conversation_memory(1, "用户一的秘密", "private_chat")
+                    .await
+                    .expect("应写入用户一记忆");
+                manager
+                    .add_conversation_memory(2, "用户二的秘密", "private_chat")
+                    .await
+                    .expect("应写入用户二记忆");
+
+                let user_one = manager.get_contextual_memories(1, "private_chat", 10).await;
+                assert_eq!(user_one.len(), 1);
+                assert_eq!(user_one[0].subject_id, Some(1));
+                assert_eq!(manager.get_recent_memories(0).await.len(), 2);
+
+                std::fs::remove_file(path).expect("应清理测试记忆文件");
+            });
+    }
 }

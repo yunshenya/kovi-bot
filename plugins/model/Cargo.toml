@@ -13,3 +13,4 @@ chrono.workspace = true
 systemstat= "0.2.1"
 anyhow = {version = "1.0.98"}
 config = "0.15.15"
+rand = "0.9"

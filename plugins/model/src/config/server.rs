@@ -1,11 +1,11 @@
 //! # 服务器配置模块
-//! 
+//!
 //! 管理AI模型服务器的连接配置
 
 use serde::{Deserialize, Serialize};
 
 /// 服务器配置结构体
-/// 
+///
 /// 包含连接AI模型服务器所需的配置信息
 #[derive(Deserialize, Debug, Serialize, Clone, PartialEq)]
 #[serde(default)]
@@ -30,16 +30,19 @@ impl ServerConfig {
         if self.url.is_empty() {
             return Err(anyhow::anyhow!("服务器URL不能为空"));
         }
-        
+
         if !self.url.starts_with("http://") && !self.url.starts_with("https://") {
             return Err(anyhow::anyhow!("服务器URL必须以http://或https://开头"));
         }
-        
+
         if self.model_name.is_empty() {
             return Err(anyhow::anyhow!("模型名称不能为空"));
         }
-        
-        println!("[INFO] 服务器配置验证通过: URL={}, Model={}", self.url, self.model_name);
+
+        println!(
+            "[INFO] 服务器配置验证通过: URL={}, Model={}",
+            self.url, self.model_name
+        );
         Ok(())
     }
 }

@@ -1,5 +1,5 @@
 //! # 健康检查模块
-//! 
+//!
 //! 提供系统健康监控功能，包括：
 //! - 记忆使用情况监控
 //! - 文件大小检查
@@ -8,13 +8,13 @@
 
 use crate::memory::MemoryManager;
 use chrono::Local;
+use kovi::tokio::time::sleep;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
-use kovi::tokio::time::sleep;
 
 /// 健康状态结构体
-/// 
+///
 /// 包含系统的整体健康状态信息
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct HealthStatus {
@@ -31,7 +31,7 @@ pub struct HealthStatus {
 }
 
 /// 内存使用情况结构体
-/// 
+///
 /// 记录各种类型记忆的使用情况
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct MemoryUsage {
@@ -59,14 +59,21 @@ impl HealthChecker {
     }
 
     pub async fn check_health(&mut self) -> HealthStatus {
-        let errors = Vec::new();
+        let mut errors = Vec::new();
         let mut warnings = Vec::new();
+
+        if let Err(error) = std::fs::metadata("bot_memory.json")
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            errors.push(format!("无法读取记忆文件元数据: {}", error));
+        }
 
         // 检查记忆管理器
         let memory_usage = self.check_memory_usage().await;
-        
+
         // 检查记忆文件大小
-        if memory_usage.memory_file_size > 10 * 1024 * 1024 { // 10MB
+        if memory_usage.memory_file_size > 10 * 1024 * 1024 {
+            // 10MB
             warnings.push("记忆文件过大，建议清理".to_string());
         }
 
@@ -98,7 +105,7 @@ impl HealthChecker {
         let memories = self.memory_manager.get_recent_memories(0).await;
         let user_profiles = self.memory_manager.get_all_user_profiles().await;
         let group_profiles = self.memory_manager.get_all_group_profiles().await;
-        
+
         let memory_file_size = std::fs::metadata("bot_memory.json")
             .map(|m| m.len())
             .unwrap_or(0);
@@ -114,7 +121,7 @@ impl HealthChecker {
     pub async fn start_health_monitoring(&mut self) {
         loop {
             let health_status = self.check_health().await;
-            
+
             if !health_status.is_healthy {
                 eprintln!("[HEALTH] 系统健康检查发现问题:");
                 for error in &health_status.errors {

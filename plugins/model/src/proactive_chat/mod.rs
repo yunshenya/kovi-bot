@@ -1,5 +1,5 @@
 //! # 主动聊天模块
-//! 
+//!
 //! 提供智能主动聊天功能，包括：
 //! - 基于情绪和社交信心的主动聊天判断
 //! - 智能目标选择（群聊或私聊）
@@ -7,19 +7,21 @@
 //! - 话题生成和个性化聊天
 
 use crate::memory::MemoryManager;
-use crate::topic_generator::TopicGenerator;
 use crate::mood_system::MoodSystem;
-use kovi::RuntimeBot;
-use std::sync::Arc;
-use std::time::Duration;
-use kovi::tokio::time::sleep;
+use crate::topic_generator::TopicGenerator;
 use anyhow::Result;
 use chrono::Local;
+use kovi::RuntimeBot;
+use kovi::tokio::time::sleep;
+use rand::Rng;
+use rand::prelude::IndexedRandom;
+use std::sync::Arc;
+use std::time::Duration;
 
 pub mod startup;
 
 /// 主动聊天管理器
-/// 
+///
 /// 负责管理机器人的主动聊天行为，包括判断时机、选择目标、生成话题等
 pub struct ProactiveChatManager {
     /// 记忆管理器，用于获取用户和群组信息
@@ -36,7 +38,7 @@ impl ProactiveChatManager {
     pub fn new(memory_manager: Arc<MemoryManager>, bot: Arc<RuntimeBot>) -> Self {
         let topic_generator = TopicGenerator::new(Arc::clone(&memory_manager));
         let mood_system = MoodSystem::new(Arc::clone(&memory_manager));
-        
+
         Self {
             memory_manager,
             topic_generator,
@@ -47,43 +49,60 @@ impl ProactiveChatManager {
 
     pub async fn start_proactive_chat_loop(&self) {
         loop {
-            // 自然情绪变化
-            if let Err(e) = self.mood_system.natural_mood_drift().await {
-                eprintln!("Failed to update mood naturally: {}", e);
+            let proactive_config = crate::config::get().proactive().clone();
+            if !proactive_config.enabled() {
+                sleep(Duration::from_secs(proactive_config.check_interval_secs())).await;
+                continue;
             }
 
             // 检查是否应该主动发起对话
-            if self.should_initiate_chat().await {
-                if let Err(e) = self.try_initiate_chat().await {
-                    eprintln!("Failed to initiate chat: {}", e);
-                }
+            if self.should_initiate_chat().await
+                && let Err(e) = self.try_initiate_chat().await
+            {
+                eprintln!("Failed to initiate chat: {}", e);
             }
 
             // 等待一段时间再检查
-            sleep(Duration::from_secs(300)).await; // 5分钟检查一次
+            sleep(Duration::from_secs(proactive_config.check_interval_secs())).await;
         }
     }
 
     async fn should_initiate_chat(&self) -> bool {
         let personality = self.memory_manager.get_bot_personality().await;
-        
+
         // 检查基本条件
         if personality.energy_level < 5 || personality.social_confidence < 4 {
             return false;
         }
 
-        // 检查最近是否有足够的活动
-        let recent_memories = self.memory_manager.get_recent_memories(20).await;
+        let proactive_config = crate::config::get().proactive().clone();
+        let recent_memories = self.memory_manager.get_recent_memories(100).await;
         let now = Local::now();
-        let two_hours_ago = now - chrono::Duration::hours(2);
-        
+        let inactivity_boundary =
+            now - chrono::Duration::seconds(proactive_config.inactivity_threshold_secs() as i64);
+        let cooldown_boundary =
+            now - chrono::Duration::seconds(proactive_config.cooldown_secs() as i64);
+
+        // 全局冷却，防止循环每次命中时连续推送。
+        if recent_memories.iter().any(|memory| {
+            memory.context.starts_with("proactive_") && memory.timestamp > cooldown_boundary
+        }) {
+            return false;
+        }
+
         let recent_activity_count = recent_memories
             .iter()
-            .filter(|memory| memory.timestamp > two_hours_ago)
+            .filter(|memory| {
+                !memory.context.starts_with("proactive_") && memory.timestamp > inactivity_boundary
+            })
             .count();
 
-        // 如果最近活动太少，增加主动聊天的概率
-        recent_activity_count < 3
+        if recent_activity_count >= 3 {
+            return false;
+        }
+
+        let probability = proactive_config.push_probability_percent() as u32;
+        probability > 0 && rand::rng().random_ratio(probability, 100)
     }
 
     async fn try_initiate_chat(&self) -> Result<()> {
@@ -93,14 +112,14 @@ impl ProactiveChatManager {
 
         // 随机选择一个目标
         let target = self.select_chat_target(groups, users).await;
-        
+
         match target {
             ChatTarget::Group(group_id) => {
                 self.initiate_group_chat(group_id).await?;
-            },
+            }
             ChatTarget::User(user_id) => {
                 self.initiate_private_chat(user_id).await?;
-            },
+            }
             ChatTarget::None => {
                 // 没有合适的目标，跳过这次主动聊天
             }
@@ -114,7 +133,7 @@ impl ProactiveChatManager {
         let group_profiles = self.memory_manager.get_all_group_profiles().await;
         let now = Local::now();
         let one_day_ago = now - chrono::Duration::days(1);
-        
+
         group_profiles
             .into_iter()
             .filter(|profile| profile.last_activity > one_day_ago && profile.activity_level > 3)
@@ -127,39 +146,47 @@ impl ProactiveChatManager {
         let user_profiles = self.memory_manager.get_all_user_profiles().await;
         let now = Local::now();
         let three_days_ago = now - chrono::Duration::days(3);
-        
+
         user_profiles
             .into_iter()
-            .filter(|profile| profile.last_interaction > three_days_ago && profile.relationship_level > 2)
+            .filter(|profile| {
+                profile.last_interaction > three_days_ago && profile.relationship_level > 2
+            })
             .map(|profile| profile.user_id)
             .collect()
     }
 
     async fn select_chat_target(&self, groups: Vec<i64>, users: Vec<i64>) -> ChatTarget {
         let personality = self.memory_manager.get_bot_personality().await;
-        
-        // 根据社交信心决定是群聊还是私聊
-        if personality.social_confidence >= 7 && !groups.is_empty() {
-            // 高社交信心，选择群聊
-            let group_id = groups[0]; // 简化选择逻辑
-            return ChatTarget::Group(group_id);
-        } else if !users.is_empty() {
-            // 选择私聊
-            let user_id = users[0]; // 简化选择逻辑
-            return ChatTarget::User(user_id);
+
+        let mut targets = Vec::new();
+        if personality.social_confidence >= 5 {
+            targets.extend(groups.into_iter().map(ChatTarget::Group));
         }
-        
-        ChatTarget::None
+        targets.extend(users.into_iter().map(ChatTarget::User));
+
+        targets
+            .choose(&mut rand::rng())
+            .cloned()
+            .unwrap_or(ChatTarget::None)
     }
 
     async fn initiate_group_chat(&self, group_id: i64) -> Result<()> {
         // 检查是否应该在这个群组发起对话
-        if !self.topic_generator.should_initiate_conversation(Some(group_id), None).await {
+        if !self
+            .topic_generator
+            .should_initiate_conversation(Some(group_id), None)
+            .await
+        {
             return Ok(());
         }
 
         // 生成话题
-        if let Some(topic) = self.topic_generator.generate_topic(Some(group_id), None).await? {
+        if let Some(topic) = self
+            .topic_generator
+            .generate_topic(Some(group_id), None)
+            .await?
+        {
             // 添加情绪前缀
             let mood_prefix = self.mood_system.get_mood_based_response_style().await;
             let content = topic.content.clone();
@@ -171,13 +198,15 @@ impl ProactiveChatManager {
 
             // 发送消息
             self.bot.send_group_msg(group_id, &message);
-            
+
             // 记录这次主动对话
-            self.memory_manager.add_conversation_memory(
-                group_id,
-                &format!("主动发起话题: {}", content),
-                "proactive_group_chat"
-            ).await?;
+            self.memory_manager
+                .add_conversation_memory(
+                    group_id,
+                    &format!("主动发起话题: {}", content),
+                    "proactive_group_chat",
+                )
+                .await?;
         }
 
         Ok(())
@@ -185,12 +214,20 @@ impl ProactiveChatManager {
 
     async fn initiate_private_chat(&self, user_id: i64) -> Result<()> {
         // 检查是否应该向这个用户发起对话
-        if !self.topic_generator.should_initiate_conversation(None, Some(user_id)).await {
+        if !self
+            .topic_generator
+            .should_initiate_conversation(None, Some(user_id))
+            .await
+        {
             return Ok(());
         }
 
         // 生成个性化话题
-        if let Some(topic) = self.topic_generator.generate_personalized_topic(user_id).await? {
+        if let Some(topic) = self
+            .topic_generator
+            .generate_personalized_topic(user_id)
+            .await?
+        {
             // 添加情绪前缀
             let mood_prefix = self.mood_system.get_mood_based_response_style().await;
             let content = topic.content.clone();
@@ -202,38 +239,58 @@ impl ProactiveChatManager {
 
             // 发送消息
             self.bot.send_private_msg(user_id, &message);
-            
+
             // 记录这次主动对话
-            self.memory_manager.add_conversation_memory(
-                user_id,
-                &format!("主动发起话题: {}", content),
-                "proactive_private_chat"
-            ).await?;
+            self.memory_manager
+                .add_conversation_memory(
+                    user_id,
+                    &format!("主动发起话题: {}", content),
+                    "proactive_private_chat",
+                )
+                .await?;
         }
 
         Ok(())
     }
 
-    pub async fn handle_user_response(&self, user_id: i64, message: &str, _is_group: bool) -> Result<()> {
+    pub async fn handle_user_response(
+        &self,
+        user_id: i64,
+        message: &str,
+        _is_group: bool,
+    ) -> Result<()> {
         // 更新用户档案
-        self.update_user_profile(user_id, message, _is_group).await?;
-        
+        self.update_user_profile(user_id, message, _is_group)
+            .await?;
+
         // 分析情绪变化
-        let context = if _is_group { "group_chat" } else { "private_chat" };
-        self.mood_system.analyze_and_update_mood(message, context).await?;
-        
+        let context = if _is_group {
+            "group_chat"
+        } else {
+            "private_chat"
+        };
+        self.mood_system
+            .analyze_and_update_mood(message, context)
+            .await?;
+
         // 记录对话记忆
-        self.memory_manager.add_conversation_memory(
-            user_id,
-            message,
-            context
-        ).await?;
+        self.memory_manager
+            .add_conversation_memory(user_id, message, context)
+            .await?;
 
         Ok(())
     }
 
-    async fn update_user_profile(&self, user_id: i64, message: &str, _is_group: bool) -> Result<()> {
-        let mut profile = self.memory_manager.get_user_profile(user_id).await
+    async fn update_user_profile(
+        &self,
+        user_id: i64,
+        message: &str,
+        _is_group: bool,
+    ) -> Result<()> {
+        let mut profile = self
+            .memory_manager
+            .get_user_profile(user_id)
+            .await
             .unwrap_or_else(|| crate::memory::UserProfile {
                 user_id,
                 nickname: format!("User_{}", user_id),
@@ -248,7 +305,7 @@ impl ProactiveChatManager {
         // 更新互动信息
         profile.last_interaction = Local::now();
         profile.interaction_count += 1;
-        
+
         // 根据对话内容更新关系等级
         if message.contains("谢谢") || message.contains("感谢") {
             profile.relationship_level = (profile.relationship_level + 1).min(10);
@@ -263,7 +320,9 @@ impl ProactiveChatManager {
         }
 
         // 更新用户档案
-        self.memory_manager.update_user_profile(user_id, profile).await?;
+        self.memory_manager
+            .update_user_profile(user_id, profile)
+            .await?;
 
         Ok(())
     }
@@ -271,7 +330,7 @@ impl ProactiveChatManager {
     fn extract_interests_from_message(&self, message: &str) -> Vec<String> {
         let mut interests = Vec::new();
         let message_lower = message.to_lowercase();
-        
+
         let interest_keywords = [
             ("游戏", vec!["游戏", "打游戏", "玩", "lol", "王者", "吃鸡"]),
             ("音乐", vec!["音乐", "歌", "听歌", "唱歌", "演唱会"]),
@@ -296,7 +355,7 @@ impl ProactiveChatManager {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum ChatTarget {
     Group(i64),
     User(i64),

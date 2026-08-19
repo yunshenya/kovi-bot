@@ -1,43 +1,145 @@
-name: Rust
+name: Deploy kovi-bot
 
 on:
   push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kovi-bot-production
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
+  DEPLOY_HOST: 139.155.156.152
+  DEPLOY_USER: ubuntu
+  REMOTE_APP_DIR: /home/ubuntu/kovi-bot
 
 jobs:
-  build:
-
+  test-and-deploy:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     steps:
-    - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-    - name: setup ssh
-      uses: webfactory/ssh-agent@v0.5.3
-      with:
-        ssh-private-key: ${{secrets.DEPLOY_KEY}}
-    - name: add server to know hosts
-      run: ssh-keyscan -H 1.95.216.102 > ~/.ssh/known_hosts
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
 
-    - name: Build
-      run: cargo build --release
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
 
-    - name: Run tests
-      run: cargo test --verbose
+      - name: Run tests
+        run: cargo test --workspace --all-targets --locked
 
-    - name: deploy release to server
-      env:
-        APP_NAME: "kovi-bot"
-        REMOTE_SERVER: "admin@1.95.216.102"
-        REMOTE_APP_DIR: "/home/admin/kovi-bot"
-        LOCAL_APP_PATH: "target/release/kovi-bot"
-      run: |
-        rsync -avz -e "ssh" $LOCAL_APP_PATH $REMOTE_SERVER:$REMOTE_APP_DIR/$APP_NAME
-        ssh $REMOTE_SERVER << EOF
-          sudo systemctl restart kovi.service
-        EOF
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Install deployment tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes sshpass rsync
+
+      - name: Configure SSH host verification
+        run: |
+          install -d -m 700 ~/.ssh
+          server_key="$(ssh-keyscan -t ed25519 "$DEPLOY_HOST" 2>/dev/null)"
+          fingerprint="$(printf '%s\n' "$server_key" | ssh-keygen -lf - | awk '{print $2}')"
+          test "$fingerprint" = "SHA256:B93UXbgWbAT+PDCy7/0WjBK1Gw4SQYh5lDITj9E64wQ"
+          printf '%s\n' "$server_key" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Validate deployment secrets
+        env:
+          DEPLOY_PASSWORD: ${{ secrets.DEPLOY_PASSWORD }}
+          BOT_API_TOKEN: ${{ secrets.BOT_API_TOKEN }}
+          NAPCAT_ACCESS_TOKEN: ${{ secrets.NAPCAT_ACCESS_TOKEN }}
+        run: |
+          test -n "$DEPLOY_PASSWORD" || { echo "Missing DEPLOY_PASSWORD"; exit 1; }
+          test -n "$BOT_API_TOKEN" || { echo "Missing BOT_API_TOKEN"; exit 1; }
+          test -n "$NAPCAT_ACCESS_TOKEN" || { echo "Missing NAPCAT_ACCESS_TOKEN"; exit 1; }
+
+      - name: Upload application
+        env:
+          SSHPASS: ${{ secrets.DEPLOY_PASSWORD }}
+        run: |
+          sshpass -e ssh "$DEPLOY_USER@$DEPLOY_HOST" "mkdir -p '$REMOTE_APP_DIR'"
+          sshpass -e rsync -az --chmod=F755 \
+            target/release/kovi-bot \
+            "$DEPLOY_USER@$DEPLOY_HOST:$REMOTE_APP_DIR/kovi-bot.new"
+          sshpass -e rsync -az \
+            bot.conf.toml kovi.plugin.toml \
+            "$DEPLOY_USER@$DEPLOY_HOST:$REMOTE_APP_DIR/"
+
+      - name: Write protected runtime configuration
+        env:
+          SSHPASS: ${{ secrets.DEPLOY_PASSWORD }}
+          BOT_API_TOKEN: ${{ secrets.BOT_API_TOKEN }}
+          NAPCAT_ACCESS_TOKEN: ${{ secrets.NAPCAT_ACCESS_TOKEN }}
+        run: |
+          printf 'BOT_API_TOKEN=%s\n' "$BOT_API_TOKEN" | \
+            sshpass -e ssh "$DEPLOY_USER@$DEPLOY_HOST" \
+            "umask 077; cat > '$REMOTE_APP_DIR/.env'"
+
+          {
+            printf '%s\n' '[config]'
+            printf '%s\n' 'main_admin = 3052405886'
+            printf '%s\n' 'admins = []'
+            printf '%s\n\n' 'debug = false'
+            printf '%s\n' '[server]'
+            printf '%s\n' 'host = "127.0.0.1"'
+            printf '%s\n' 'port = 3001'
+            printf 'access_token = "%s"\n' "$NAPCAT_ACCESS_TOKEN"
+            printf '%s\n' 'secure = false'
+          } | sshpass -e ssh "$DEPLOY_USER@$DEPLOY_HOST" \
+            "umask 077; cat > '$REMOTE_APP_DIR/kovi.conf.toml'"
+
+      - name: Install and restart systemd service
+        env:
+          SSHPASS: ${{ secrets.DEPLOY_PASSWORD }}
+          DEPLOY_PASSWORD: ${{ secrets.DEPLOY_PASSWORD }}
+        run: |
+          sshpass -e ssh "$DEPLOY_USER@$DEPLOY_HOST" "cat > '$REMOTE_APP_DIR/kovi.service'" <<'EOF'
+          [Unit]
+          Description=Kovi QQ Bot
+          Wants=network-online.target
+          After=network-online.target
+
+          [Service]
+          Type=simple
+          User=ubuntu
+          WorkingDirectory=/home/ubuntu/kovi-bot
+          EnvironmentFile=/home/ubuntu/kovi-bot/.env
+          ExecStart=/home/ubuntu/kovi-bot/kovi-bot
+          Restart=always
+          RestartSec=5
+          UMask=0077
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+
+          {
+            printf '%s\n' "$DEPLOY_PASSWORD"
+            cat <<'EOF'
+          set -e
+          install -m 0644 /home/ubuntu/kovi-bot/kovi.service /etc/systemd/system/kovi.service
+          install -m 0755 /home/ubuntu/kovi-bot/kovi-bot.new /home/ubuntu/kovi-bot/kovi-bot
+          systemctl daemon-reload
+          systemctl enable kovi.service
+          systemctl restart kovi.service
+          systemctl is-active --quiet kovi.service
+          EOF
+          } | sshpass -e ssh "$DEPLOY_USER@$DEPLOY_HOST" "sudo -S bash -s"
+
+      - name: Show service status
+        if: always()
+        env:
+          SSHPASS: ${{ secrets.DEPLOY_PASSWORD }}
+        run: |
+          sshpass -e ssh "$DEPLOY_USER@$DEPLOY_HOST" \
+            "systemctl --no-pager --full status kovi.service" || true
