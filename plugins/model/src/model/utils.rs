@@ -9,7 +9,7 @@
 //! - 系统状态监控
 
 use crate::config;
-use crate::memory::{MEMORY_MANAGER, MoodEntry, UserProfile};
+use crate::memory::{BotPersonality, MEMORY_MANAGER, MoodEntry, UserProfile};
 use crate::mood_system::{Mood, MoodSystem};
 use crate::utils;
 use anyhow::Context;
@@ -17,6 +17,7 @@ use chrono::{Local, TimeZone};
 use kovi::RuntimeBot;
 use kovi::serde_json::Value;
 use kovi::tokio::sync::Mutex;
+use rand::Rng;
 use reqwest::Client;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -53,6 +54,9 @@ static PRIVATE_MESSAGE_MEMORY: LazyLock<Mutex<HashMap<i64, ConversationHistory>>
 /// 负责分析用户消息的情绪并调整机器人的人格状态
 static MOOD_SYSTEM: LazyLock<MoodSystem> =
     LazyLock::new(|| MoodSystem::new(Arc::clone(&MEMORY_MANAGER)));
+
+/// 聊天中由模型决定是否继续发送下一条消息的分隔标记。
+const FOLLOW_UP_MARKER: &str = "[[NEXT_MESSAGE]]";
 
 /// 消息角色枚举
 ///
@@ -164,17 +168,21 @@ pub async fn control_model(group_id: i64, bot: Arc<RuntimeBot>, nickname: String
     );
     let response = params_model(&mut messages).await;
     if !response.content.contains("[sp]") {
-        bot.send_group_msg(group_id, &response.content);
+        let outbound_messages = split_reply(&response.content);
+        let stored_reply = outbound_messages.join("\n");
+        let personality = MEMORY_MANAGER.get_bot_personality().await;
+        for (index, outbound_message) in outbound_messages.iter().enumerate() {
+            if index > 0 {
+                kovi::tokio::time::sleep(follow_up_delay(&personality, index)).await;
+            }
+            bot.send_group_msg(group_id, outbound_message);
+        }
         println!(
             "[INFO] 群聊消息已发送 (群组: {}): {}",
-            group_id, response.content
+            group_id, stored_reply
         );
         if let Err(error) = MEMORY_MANAGER
-            .add_conversation_memory(
-                group_id,
-                &format!("芸汐: {}", response.content),
-                "group_chat",
-            )
+            .add_conversation_memory(group_id, &format!("芸汐: {}", stored_reply), "group_chat")
             .await
         {
             eprintln!(
@@ -182,8 +190,13 @@ pub async fn control_model(group_id: i64, bot: Arc<RuntimeBot>, nickname: String
                 group_id, error
             );
         }
+        messages.push(BotMemory {
+            role: Roles::Assistant,
+            content: stored_reply,
+        });
+    } else {
+        messages.push(response);
     }
-    messages.push(response);
     limit_memory_size(&mut messages);
 }
 
@@ -512,17 +525,21 @@ pub async fn private_chat(user_id: i64, message: &str, nickname: String, bot: Ar
 
     println!("[INFO] 私聊对话 (用户: {})", user_id);
     let bot_content = params_model(&mut history).await;
-    bot.send_private_msg(user_id, &bot_content.content);
+    let outbound_messages = split_reply(&bot_content.content);
+    let stored_reply = outbound_messages.join("\n");
+    let personality = MEMORY_MANAGER.get_bot_personality().await;
+    for (index, outbound_message) in outbound_messages.iter().enumerate() {
+        if index > 0 {
+            kovi::tokio::time::sleep(follow_up_delay(&personality, index)).await;
+        }
+        bot.send_private_msg(user_id, outbound_message);
+    }
     println!(
         "[INFO] 私聊消息已发送 (用户: {}): {}",
-        user_id, bot_content.content
+        user_id, stored_reply
     );
     if let Err(error) = MEMORY_MANAGER
-        .add_conversation_memory(
-            user_id,
-            &format!("芸汐: {}", bot_content.content),
-            "private_chat",
-        )
+        .add_conversation_memory(user_id, &format!("芸汐: {}", stored_reply), "private_chat")
         .await
     {
         eprintln!(
@@ -532,10 +549,76 @@ pub async fn private_chat(user_id: i64, message: &str, nickname: String, bot: Ar
     }
 
     // 添加机器人回复
-    history.push(bot_content);
+    history.push(BotMemory {
+        role: Roles::Assistant,
+        content: stored_reply,
+    });
 
     // 限制私聊记忆大小
     limit_memory_size(&mut history);
+}
+
+/// 将模型给出的回复拆成任意数量的消息。模型不用分隔标记时，仍保持单条发送。
+fn split_reply(content: &str) -> Vec<String> {
+    let mut sections = content
+        .split(FOLLOW_UP_MARKER)
+        .map(str::trim)
+        .filter(|section| !section.is_empty());
+
+    let Some(first) = sections.next() else {
+        return vec!["……".to_string()];
+    };
+
+    let mut replies = vec![first.to_string()];
+    replies.extend(sections.map(ToString::to_string));
+    replies
+}
+
+/// 根据当前情绪、能量、社交信心和少量随机浮动，决定下一条消息前的停顿。
+/// 活跃情绪更快，内敛或低落情绪会留出更长的思考空隙。
+fn follow_up_delay(personality: &BotPersonality, message_index: usize) -> std::time::Duration {
+    let variation_ms = rand::rng().random_range(-200_i64..=450_i64);
+    std::time::Duration::from_millis(follow_up_delay_millis(
+        personality,
+        message_index,
+        variation_ms,
+    ))
+}
+
+fn follow_up_delay_millis(
+    personality: &BotPersonality,
+    message_index: usize,
+    variation_ms: i64,
+) -> u64 {
+    let mood_base_ms = match personality.current_mood.as_str() {
+        "excited" => 280,
+        "playful" => 380,
+        "happy" => 480,
+        "curious" | "confident" => 560,
+        "neutral" => 800,
+        "calm" => 1_100,
+        "thoughtful" => 1_450,
+        "shy" | "lonely" => 1_600,
+        "angry" => 1_500,
+        "sad" => 1_800,
+        _ => 800,
+    };
+    let energy_adjustment_ms = (5_i64 - i64::from(personality.energy_level)) * 45;
+    let confidence_adjustment_ms = (5_i64 - i64::from(personality.social_confidence)) * 25;
+    let intensity_adjustment_ms = match personality.current_mood.as_str() {
+        "excited" | "playful" | "happy" if personality.mood_intensity >= 7 => -120,
+        "sad" | "shy" | "thoughtful" if personality.mood_intensity >= 7 => 160,
+        _ => 0,
+    };
+    // 连续表达越往后稍留空隙，但不会形成固定节拍。
+    let sequence_adjustment_ms = (message_index.saturating_sub(1).min(6) as i64) * 70;
+    (mood_base_ms
+        + energy_adjustment_ms
+        + confidence_adjustment_ms
+        + intensity_adjustment_ms
+        + sequence_adjustment_ms
+        + variation_ms)
+        .clamp(180, 4_500) as u64
 }
 
 async fn generate_personalized_system_prompt(
@@ -751,8 +834,10 @@ pub fn get_file_modified_time_formatted() -> anyhow::Result<String> {
 mod tests {
     use super::{
         BotMemory, Roles, extract_interests_from_message, extract_personality_traits,
-        limit_memory_size,
+        follow_up_delay_millis, limit_memory_size, split_reply,
     };
+    use crate::memory::BotPersonality;
+    use chrono::Local;
 
     #[test]
     fn profile_signals_are_extracted_from_messages() {
@@ -790,5 +875,46 @@ mod tests {
             messages.last().map(|message| message.content.as_str()),
             Some("message-39")
         );
+    }
+
+    #[test]
+    fn reply_is_single_message_without_follow_up_marker() {
+        assert_eq!(
+            split_reply("今天也要好好休息呀"),
+            vec!["今天也要好好休息呀"]
+        );
+    }
+
+    #[test]
+    fn reply_can_send_every_model_selected_message() {
+        assert_eq!(
+            split_reply("第一句 [[NEXT_MESSAGE]] 第二句 [[NEXT_MESSAGE]] 第三句"),
+            vec!["第一句", "第二句", "第三句"]
+        );
+    }
+
+    #[test]
+    fn follow_up_pacing_reflects_mood_and_energy() {
+        let lively = personality("excited", 9, 9, 8);
+        let reserved = personality("sad", 2, 2, 8);
+
+        assert!(follow_up_delay_millis(&lively, 1, 0) < follow_up_delay_millis(&reserved, 1, 0));
+    }
+
+    fn personality(
+        mood: &str,
+        energy_level: u8,
+        social_confidence: u8,
+        mood_intensity: u8,
+    ) -> BotPersonality {
+        BotPersonality {
+            current_mood: mood.to_string(),
+            mood_intensity,
+            energy_level,
+            social_confidence,
+            curiosity_level: 5,
+            last_mood_change: Local::now(),
+            personality_traits: Vec::new(),
+        }
     }
 }
