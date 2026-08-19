@@ -1,7 +1,9 @@
 use crate::config;
 use crate::health_check::HealthChecker;
 use crate::memory::{GroupProfile, MEMORY_MANAGER};
-use crate::model::utils::{learn_user_profile_from_message, send_sys_info, silence};
+use crate::model::utils::{
+    learn_user_profile_from_message, requests_no_reply, send_sys_info, silence,
+};
 use chrono::Local;
 use kovi::RuntimeBot;
 use kovi::event::GroupMsgEvent;
@@ -29,6 +31,10 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
     let nickname = event.get_sender_nickname();
     let sender = format!("[{}] {}", time, nickname);
     if let Some(message) = event.borrow_text() {
+        if requests_no_reply(message) {
+            println!("[INFO] 群聊明确要求不回复 (群组: {})", group_id);
+            return;
+        }
         update_group_profile(group_id, event.user_id, message, &nickname).await;
         learn_user_profile_from_message(event.user_id, message, &nickname, false).await;
         match message {

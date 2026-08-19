@@ -690,6 +690,11 @@ pub async fn private_chat(user_id: i64, message: &str, nickname: String, bot: Ar
 
     println!("[INFO] 私聊对话 (用户: {})", user_id);
     let bot_content = params_model(&mut history).await;
+    if is_silent_model_response(&bot_content.content) {
+        println!("[INFO] 私聊模型选择静默 (用户: {})", user_id);
+        limit_memory_size(&mut history);
+        return;
+    }
     let outbound_messages = split_reply(&bot_content.content);
     let stored_reply = outbound_messages.join("\n");
     let personality = MEMORY_MANAGER.get_bot_personality().await;
@@ -721,6 +726,31 @@ pub async fn private_chat(user_id: i64, message: &str, nickname: String, bot: Ar
 
     // 限制私聊记忆大小
     limit_memory_size(&mut history);
+}
+
+/// 明确表示“这一条不用回复”的消息不交给模型，避免模型用客套话反而回复。
+pub(crate) fn requests_no_reply(message: &str) -> bool {
+    let text = message.trim().trim_matches(|character: char| {
+        character.is_whitespace() || matches!(character, '。' | '！' | '!' | '，' | ',')
+    });
+    matches!(
+        text,
+        "别回复我这条消息"
+            | "不要回复我这条消息"
+            | "这条消息别回"
+            | "这条不用回"
+            | "这条别回"
+            | "不用回复这条"
+            | "不用回这条"
+            | "不用回复这条消息"
+            | "不用回这条消息"
+            | "不需要回复"
+            | "无需回复"
+    )
+}
+
+fn is_silent_model_response(content: &str) -> bool {
+    content.trim() == "[sp]"
 }
 
 /// 将模型给出的回复拆成任意数量的消息。
@@ -1062,8 +1092,8 @@ pub fn get_file_modified_time_formatted() -> anyhow::Result<String> {
 mod tests {
     use super::{
         BotMemory, Roles, compression_cutoff, extract_interests_from_message,
-        extract_personality_traits, follow_up_delay_millis, limit_memory_size, split_reply,
-        with_conversation_summary,
+        extract_personality_traits, follow_up_delay_millis, is_silent_model_response,
+        limit_memory_size, requests_no_reply, split_reply, with_conversation_summary,
     };
     use crate::memory::BotPersonality;
     use chrono::Local;
@@ -1147,6 +1177,20 @@ mod tests {
             vec!["嗯？这么晚啦……你找我，是有什么心事吗？"]
         );
         assert_eq!(split_reply("【有点不好意思】[轻轻点头] 好呀"), vec!["好呀"]);
+    }
+
+    #[test]
+    fn explicit_no_reply_requests_never_reach_the_model() {
+        assert!(requests_no_reply("别回复我这条消息"));
+        assert!(requests_no_reply("这条不用回。"));
+        assert!(requests_no_reply("不用回复这条消息！"));
+        assert!(!requests_no_reply("你为什么不回复我这条消息？"));
+    }
+
+    #[test]
+    fn only_the_exact_silence_marker_suppresses_a_model_reply() {
+        assert!(is_silent_model_response(" [sp] \n"));
+        assert!(!is_silent_model_response("不要回复[sp]"));
     }
 
     #[test]
