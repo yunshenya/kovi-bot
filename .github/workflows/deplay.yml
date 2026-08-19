@@ -41,8 +41,13 @@ jobs:
 
       - name: Install deployment tools
         run: |
-          sudo apt-get update
-          sudo apt-get install --yes sshpass rsync
+          # 网络异常时快速失败，避免后续发布任务无限排队。
+          sudo timeout 180s apt-get \
+            -o Acquire::Retries=2 \
+            -o Acquire::http::Timeout=30 \
+            -o Acquire::https::Timeout=30 \
+            update
+          sudo timeout 180s apt-get install --yes --no-install-recommends sshpass rsync
 
       - name: Configure SSH host verification
         run: |
