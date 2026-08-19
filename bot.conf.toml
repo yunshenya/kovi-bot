@@ -21,7 +21,7 @@ min_eligible_messages = 8
 cooldown_secs = 180
 response_probability_percent = 35
 min_message_chars = 5
-conversation_window_secs = 120
+conversation_window_secs = 180
 
 [memory]
 max_entries = 1000

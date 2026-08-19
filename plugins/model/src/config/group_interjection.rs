@@ -73,7 +73,7 @@ impl Default for GroupInterjectionConfig {
             cooldown_secs: 180,
             response_probability_percent: 35,
             min_message_chars: 5,
-            conversation_window_secs: 120,
+            conversation_window_secs: 180,
         }
     }
 }
