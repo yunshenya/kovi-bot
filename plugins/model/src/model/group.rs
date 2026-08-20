@@ -1,7 +1,7 @@
 use crate::config;
 use crate::health_check::HealthChecker;
 use crate::memory::{GroupProfile, MEMORY_MANAGER};
-use crate::model::coalesce::MessageCoalescer;
+use crate::model::coalesce::{MessageCoalescer, MessagePart};
 use crate::model::interrupt::{ReplyScope, interrupt, is_active, is_explicit_stop_message};
 use crate::model::utils::{
     learn_user_profile_from_message, requests_no_reply, send_sys_info, silence,
@@ -9,6 +9,10 @@ use crate::model::utils::{
 use crate::sticker_memory::{
     StickerScope, extract_stickers, has_reply, known_labels, quoted_message_context,
     stickers_for_teaching, teach, teaching_label, with_quoted_context, with_sticker_context,
+};
+use crate::vision::{
+    extract_image_attachments, is_vision_command, merge_image_attachments, resolve_image_urls,
+    strip_vision_command,
 };
 use chrono::Local;
 use kovi::RuntimeBot;
@@ -66,13 +70,20 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
     let sender = format!("[{}] {}", time, nickname);
     let message = event.borrow_text().unwrap_or_default();
     let stickers = extract_stickers(&event.message);
+    let current_images = extract_image_attachments(&event.message);
+    let vision_command = is_vision_command(message);
     let sticker_scope = StickerScope::Group(group_id);
     let reply_scope = ReplyScope::Group(group_id);
     let directly_addressed = is_addressed_to_bot(&event, message);
     let explicit_stop = is_explicit_stop_message(message);
     let asks_for_silence = explicit_stop || requests_no_reply(message);
-    let participant_follow_up =
-        is_conversation_participant_message(group_id, event.user_id, message).await;
+    let participant_follow_up = is_conversation_participant_message(
+        group_id,
+        event.user_id,
+        message,
+        !current_images.is_empty(),
+    )
+    .await;
     let can_interrupt = directly_addressed
         || asks_for_silence
         || (participant_follow_up && is_active(reply_scope).await);
@@ -143,19 +154,52 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
             None
         }
     };
+    let quoted_images = quoted
+        .as_ref()
+        .map(|quoted| quoted.images.as_slice())
+        .unwrap_or_default();
+    let images = merge_image_attachments(&current_images, quoted_images);
+    let replies_to_bot = quoted.as_ref().and_then(|quoted| quoted.sender_id) == Some(event.self_id);
+    let replies_to_image = !quoted_images.is_empty() && !message.trim().is_empty();
+    let vision_requested = !images.is_empty()
+        && (directly_addressed
+            || replies_to_bot
+            || replies_to_image
+            || vision_command
+            || participant_follow_up);
+    if vision_command && images.is_empty() {
+        bot.send_group_msg(
+            group_id,
+            "请把截图和 #看截图 放在一起，或回复那张截图再发送命令哦。",
+        );
+        return;
+    }
     // 没有文字的陌生表情不触发模型，也不消耗 token。
-    if message.trim().is_empty() && !stickers.is_empty() && labels.is_empty() && quoted.is_none() {
+    if message.trim().is_empty()
+        && !stickers.is_empty()
+        && labels.is_empty()
+        && quoted.is_none()
+        && !vision_requested
+    {
         println!("[INFO] 收到未学习群表情，保持静默 (群组: {})", group_id);
         return;
     }
-    if message.trim().is_empty() && stickers.is_empty() && !has_reply(&event.message) {
+    if message.trim().is_empty()
+        && stickers.is_empty()
+        && !has_reply(&event.message)
+        && !vision_requested
+    {
         return;
     }
-    let current_message = with_sticker_context(message, &labels);
+    let text_message = if vision_requested {
+        strip_vision_command(message)
+    } else {
+        message.to_string()
+    };
+    let current_message = with_sticker_context(&text_message, &labels);
     let model_message = quoted.as_ref().map_or(current_message.clone(), |quoted| {
         with_quoted_context(&current_message, quoted)
     });
-    let replies_to_bot = quoted.as_ref().and_then(|quoted| quoted.sender_id) == Some(event.self_id);
     if replies_to_bot && reply_ticket.is_none() {
         reply_ticket = Some(interrupt(reply_scope).await);
     }
@@ -167,21 +211,57 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
         return;
     }
     let addressed_to_bot = directly_addressed || replies_to_bot;
-    let (model_message, addressed_to_bot, plain_text) = if !message.trim_start().starts_with('#') {
-        let Some(combined) = GROUP_MESSAGE_BATCHES
-            .push(
-                (group_id, event.user_id),
+    let (model_message, addressed_to_bot, plain_text, vision_requested, images) =
+        if !message.trim_start().starts_with('#') {
+            let Some(combined) = GROUP_MESSAGE_BATCHES
+                .push(
+                    (group_id, event.user_id),
+                    MessagePart {
+                        text: model_message,
+                        addressed: addressed_to_bot,
+                        plain_text: stickers.is_empty() && quoted.is_none(),
+                        vision_requested,
+                        images,
+                    },
+                )
+                .await
+            else {
+                return;
+            };
+            (
+                combined.text,
+                combined.addressed,
+                combined.plain_text,
+                combined.vision_requested,
+                combined.images,
+            )
+        } else {
+            (
                 model_message,
                 addressed_to_bot,
-                stickers.is_empty() && quoted.is_none(),
+                false,
+                vision_requested,
+                images,
             )
-            .await
-        else {
-            return;
         };
-        (combined.text, combined.addressed, combined.plain_text)
+    let vision_images = if vision_requested {
+        match resolve_image_urls(&images, &bot).await {
+            Ok(images) if !images.is_empty() => images,
+            Ok(_) => {
+                bot.send_group_msg(
+                    group_id,
+                    "我暂时拿不到这张截图的内容，再发一次或换张图试试吧。",
+                );
+                return;
+            }
+            Err(error) => {
+                eprintln!("[ERROR] 群聊读取截图失败 (群组: {}): {}", group_id, error);
+                bot.send_group_msg(group_id, "我暂时读不到这张截图，再发一次或换张图试试吧。");
+                return;
+            }
+        }
     } else {
-        (model_message, addressed_to_bot, false)
+        Vec::new()
     };
     if plain_text && requests_no_reply(&model_message) {
         println!("[INFO] 合并后的群聊消息明确要求不回复 (群组: {})", group_id);
@@ -281,22 +361,50 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
         }
         _ => {
             // 被点名时始终处理；未点名消息仅由本地节流器偶尔抽样，不逐条调用模型。
-            if addressed_to_bot || matches!(message.trim(), "#禁言" | "#结束禁言") {
+            if addressed_to_bot
+                || vision_requested
+                || matches!(message.trim(), "#禁言" | "#结束禁言")
+            {
                 let ticket = match reply_ticket {
                     Some(ticket) => ticket,
                     None => interrupt(reply_scope).await,
                 };
                 let turn_marker = begin_conversation_turn(group_id, event.user_id).await;
-                let replied = silence(group_id, &model_message, bot, sender, ticket, None).await;
+                let replied = silence(
+                    group_id,
+                    &model_message,
+                    bot,
+                    sender,
+                    ticket,
+                    None,
+                    vision_images.clone(),
+                )
+                .await;
                 finish_conversation_turn(group_id, event.user_id, turn_marker, replied).await;
-            } else if should_continue_conversation(group_id, event.user_id, &model_message).await {
+            } else if should_continue_conversation(
+                group_id,
+                event.user_id,
+                &model_message,
+                !images.is_empty(),
+            )
+            .await
+            {
                 println!("[INFO] 群聊接续对话 (群组: {})", group_id);
                 let ticket = match reply_ticket {
                     Some(ticket) => ticket,
                     None => interrupt(reply_scope).await,
                 };
                 let turn_marker = begin_conversation_turn(group_id, event.user_id).await;
-                let replied = silence(group_id, &model_message, bot, sender, ticket, None).await;
+                let replied = silence(
+                    group_id,
+                    &model_message,
+                    bot,
+                    sender,
+                    ticket,
+                    None,
+                    vision_images.clone(),
+                )
+                .await;
                 finish_conversation_turn(group_id, event.user_id, turn_marker, replied).await;
             } else if should_interject(group_id, &model_message).await {
                 println!("[INFO] 群聊未点名接话 (群组: {})", group_id);
@@ -312,6 +420,7 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
                     sender,
                     ticket,
                     Some(max_output_tokens),
+                    vision_images.clone(),
                 )
                 .await;
                 finish_interjection_attempt(group_id, replied).await;
@@ -492,7 +601,12 @@ async fn finish_conversation_turn(
 }
 
 /// 参与者、待回复成员，或机器人刚发言后的新成员可以自然接续，无需匹配固定词。
-async fn is_conversation_participant_message(group_id: i64, user_id: i64, message: &str) -> bool {
+async fn is_conversation_participant_message(
+    group_id: i64,
+    user_id: i64,
+    message: &str,
+    has_image: bool,
+) -> bool {
     let now = Instant::now();
     let open_floor = Duration::from_secs(
         config::get()
@@ -507,21 +621,27 @@ async fn is_conversation_participant_message(group_id: i64, user_id: i64, messag
     if !has_active_conversation_window(state.conversation_until, now) {
         state.conversation_until = None;
     }
-    conversation_message_is_relevant(state, user_id, message, now, open_floor)
+    conversation_message_is_relevant(state, user_id, message, has_image, now, open_floor)
 }
 
-async fn should_continue_conversation(group_id: i64, user_id: i64, message: &str) -> bool {
-    is_conversation_participant_message(group_id, user_id, message).await
+async fn should_continue_conversation(
+    group_id: i64,
+    user_id: i64,
+    message: &str,
+    has_image: bool,
+) -> bool {
+    is_conversation_participant_message(group_id, user_id, message, has_image).await
 }
 
 fn conversation_message_is_relevant(
     state: &GroupInterjectionState,
     user_id: i64,
     message: &str,
+    has_image: bool,
     now: Instant,
     open_floor: Duration,
 ) -> bool {
-    if !is_meaningful_conversation_message(message) {
+    if !is_meaningful_conversation_message(message, has_image) {
         return false;
     }
     if state
@@ -543,12 +663,12 @@ fn conversation_message_is_relevant(
             .is_some_and(|last_reply| now.duration_since(last_reply) < open_floor)
 }
 
-fn is_meaningful_conversation_message(message: &str) -> bool {
+fn is_meaningful_conversation_message(message: &str, has_image: bool) -> bool {
     let text = message.trim();
-    if text.is_empty() || text.starts_with('#') {
+    if text.starts_with('#') {
         return false;
     }
-    text.chars().any(|character| character.is_alphanumeric())
+    has_image || text.chars().any(|character| character.is_alphanumeric())
 }
 
 fn prune_conversation_participants(state: &mut GroupInterjectionState, now: Instant) {
@@ -875,6 +995,7 @@ mod tests {
             &state,
             42,
             "今天买了新的杯子",
+            false,
             now,
             Duration::from_secs(45),
         ));
@@ -882,6 +1003,15 @@ mod tests {
             &state,
             42,
             "嗯",
+            false,
+            now,
+            Duration::from_secs(45),
+        ));
+        assert!(conversation_message_is_relevant(
+            &state,
+            42,
+            "",
+            true,
             now,
             Duration::from_secs(45),
         ));
@@ -889,6 +1019,7 @@ mod tests {
             &state,
             99,
             "这是群里另一段聊天",
+            false,
             now,
             Duration::from_secs(45),
         ));
@@ -898,6 +1029,7 @@ mod tests {
             &state,
             99,
             "我也想说一句",
+            false,
             now,
             Duration::from_secs(45),
         ));
@@ -905,6 +1037,7 @@ mod tests {
             &state,
             42,
             "#系统信息",
+            false,
             now,
             Duration::from_secs(45),
         ));

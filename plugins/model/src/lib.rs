@@ -19,6 +19,7 @@ use std::sync::{
 pub mod config;
 // 核心模型处理模块
 mod model;
+mod vision;
 // 工具函数模块
 mod utils;
 // 记忆管理系统

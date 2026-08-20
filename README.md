@@ -1,14 +1,14 @@
 # kovi-bot
 
-一个使用 Rust 和 Kovi 编写的 QQ 聊天机器人。它支持群聊/私聊、兼容 OpenAI Chat
-Completions 的模型服务、长期记忆、情绪与用户档案，以及可配置的随机主动消息推送。
+一个使用 Rust 和 Kovi 编写的 QQ 聊天机器人。它支持群聊/私聊、兼容 OpenAI
+Responses 或 Chat Completions 的模型服务、长期记忆、情绪与用户档案，以及可配置的随机主动消息推送。
 
 ## 运行
 
-要求：Rust stable、可用的 OneBot 11 服务，以及一个兼容 OpenAI Chat Completions 的模型 API。
+要求：Rust stable、可用的 OneBot 11 服务，以及一个兼容 OpenAI Responses 或 Chat Completions 的模型 API。
 
 ```bash
-export BOT_API_TOKEN="你的模型 API Token"
+export OPENAI_API_KEY="你的 GPT API Token"
 export DATABASE_URL="postgresql://postgres:数据库密码@127.0.0.1:5432/postgres"
 cargo run
 ```
@@ -44,7 +44,8 @@ secure = false
 `.github/workflows/deplay.yml` 会在 `main` 分支推送或手动触发时检查格式、运行 Clippy、使用临时 PostgreSQL 做集成测试、构建 Linux release、上传到 `/home/ubuntu/kovi-bot`，并创建或重启 `kovi.service`。发布采用可回滚的二进制替换，服务启动失败时会自动恢复上一版。部署前需要配置以下 GitHub Actions Secrets：
 
 - `DEPLOY_PASSWORD`：Ubuntu 用户的 SSH 和 sudo 密码
-- `BOT_API_TOKEN`：模型服务 Token
+- `OPENAI_API_KEY`：GPT 主模型 Token
+- `BOT_API_TOKEN`：切换到 DeepSeek 主模型时使用的 Token
 - `NAPCAT_ACCESS_TOKEN`：NapCat WebSocket 服务端 Token
 - `POSTGRES_PASSWORD`：服务器本机 `postgres` 用户的数据库密码
 
@@ -54,8 +55,13 @@ secure = false
 
 ```toml
 [server_config]
-url = "https://api.deepseek.com/chat/completions"
-model_name = "deepseek-v4-flash"
+url = "https://codex666ai.com"
+model_name = "gpt-5.5"
+wire_api = "responses"
+supports_vision = true
+api_key_env = "OPENAI_API_KEY"
+requires_auth = false
+actor_authorization = "local-image-extension"
 max_output_tokens = 1200
 request_timeout_secs = 60
 max_retries = 2
@@ -144,6 +150,73 @@ recent_topic_cooldown_secs = 604800
 
 她会确认已记住。之后相同表情会把“无语又想笑”作为上下文交给聊天模型；纯图片且没有学习过时默认静默，不调用模型、不消耗 token。图片同时带有普通文字时，仍会正常理解和回复文字内容。
 
+## 截图识别
+
+她支持把截图作为当前对话的视觉输入，但一轮请求只使用一个主聊天模型：
+
+- 主模型支持图片时，图片和文字一起直接发送给主模型，不调用另一个聊天模型。
+- 主模型不支持图片时，图片才会先交给独立视觉模型，视觉模型只返回图片文字分析；最终回复仍由主模型独立生成。
+
+因此，选择 GPT-5.5 作为主模型时不会再调用 DeepSeek；选择 DeepSeek 作为主模型时，只有图片输入才会额外调用视觉模型。图片本身不会写入长期记忆或日志。
+
+切换到 DeepSeek 主模型时，将 `[server_config]` 改为：
+
+```toml
+[server_config]
+url = "https://api.deepseek.com/chat/completions"
+model_name = "deepseek-v4-flash"
+wire_api = "chat_completions"
+supports_vision = false
+api_key_env = "BOT_API_TOKEN"
+requires_auth = true
+actor_authorization = ""
+```
+
+当前仓库默认的 GPT-5.5 主聊天配置为：
+
+```toml
+[server_config]
+url = "https://codex666ai.com"
+model_name = "gpt-5.5"
+wire_api = "responses"
+supports_vision = true
+api_key_env = "OPENAI_API_KEY"
+requires_auth = false
+actor_authorization = "local-image-extension"
+max_output_tokens = 1200
+request_timeout_secs = 60
+max_retries = 2
+```
+
+如果该服务实际要求 `/v1/responses`，将 `url` 直接写成完整接口地址。若使用需要 Bearer Token 的 GPT 服务，将 `requires_auth` 改为 `true`。
+
+只有主模型的 `supports_vision = false` 时，才需要配置独立视觉接口：
+
+```bash
+export VISION_API_URL="https://codex666ai.com"
+export VISION_WIRE_API="responses"
+export VISION_MODEL_NAME="gpt-5.5"
+export VISION_API_TOKEN="你的视觉模型 Token"
+export VISION_ACTOR_AUTHORIZATION="local-image-extension"
+# 若视觉服务明确不要求 Bearer Token，改为 false；此时不会发送 VISION_API_TOKEN
+export VISION_REQUIRES_AUTH="false"
+```
+
+`VISION_WIRE_API=responses` 时，`VISION_API_URL` 可以填写服务根地址，程序会补上 `/responses`；如果服务实际要求 `/v1/responses`，直接填写完整地址即可。若使用旧式 Chat Completions 接口，将其设为 `chat_completions`，程序会发送 `messages[].content` 中的 `image_url` 图片输入。
+
+视觉接口只在非视觉主模型收到图片时启用；GPT-5.5 主模型会完全跳过这些 `VISION_*` 配置。
+
+群聊中可以使用以下方式触发：
+
+- `@芸汐` 后附截图，并提出问题
+- 回复她或其他人的截图，再发送“帮我看看这里”
+- 将 `#看截图` 与截图放在同一条消息中
+- 回复截图后发送 `#看截图`
+
+私聊中，发送截图并附文字即可；只发送截图时，她也会请求模型描述图片。没有截图时使用 `#看截图`，她会提示补发截图。群聊中没有被点名、没有回复机器人、也没有显式看图命令的图片不会触发视觉模型；但已经进入芸汐回复后的窗口期时，参与者发送的纯截图也会作为接话处理。
+
+单次最多处理 4 张图片，每张限制 5 MB，支持 PNG、JPEG 和 WebP。图片地址会先由机器人下载并转换成本地请求内容，因此视觉模型不需要直接访问 QQ 或 NapCat 的内网地址。
+
 可用群聊命令（除表情教学外，管理类命令仅 Kovi 管理员可执行）：
 
 - `#系统信息`
@@ -153,6 +226,7 @@ recent_topic_cooldown_secs = 604800
 - `#启用自动重载` / `#禁用自动重载`
 - `#检查配置变化` / `#自动重载状态`
 - `#教芸汐 <表情含义>`（回复或引用要教学的表情包后发送）
+- `#看截图`（与截图同发，或回复截图后发送）
 
 ## 测试
 

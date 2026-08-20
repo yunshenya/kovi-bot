@@ -4,6 +4,7 @@ use super::interrupt::{ReplyTicket, is_current};
 use super::utils::{BotMemory, Roles, params_model_with_token_limit};
 use crate::config;
 use crate::memory::{MEMORY_MANAGER, MemoryEntry, MemoryLookup};
+use crate::vision::VisionImage;
 use std::time::Duration;
 
 const QUERY_START: &str = "[[MEMORY_QUERY]]";
@@ -23,10 +24,11 @@ pub(crate) async fn params_model_with_memory_access(
     context: &str,
     reply_ticket: ReplyTicket,
     max_output_tokens: Option<u32>,
+    vision_images: &[VisionImage],
 ) -> BotMemory {
     let memory_config = config::get().memory().clone();
     if !memory_config.autonomous_query_enabled() {
-        return interruptible_model_call(messages, reply_ticket, max_output_tokens)
+        return interruptible_model_call(messages, reply_ticket, max_output_tokens, vision_images)
             .await
             .unwrap_or_else(interrupted_response);
     }
@@ -39,7 +41,8 @@ pub(crate) async fn params_model_with_memory_access(
 
     for round in 0..memory_config.autonomous_query_max_rounds() {
         let Some(response) =
-            interruptible_model_call(&mut request, reply_ticket, max_output_tokens).await
+            interruptible_model_call(&mut request, reply_ticket, max_output_tokens, vision_images)
+                .await
         else {
             return interrupted_response();
         };
@@ -100,7 +103,8 @@ pub(crate) async fn params_model_with_memory_access(
             .to_string(),
     });
     let Some(response) =
-        interruptible_model_call(&mut request, reply_ticket, max_output_tokens).await
+        interruptible_model_call(&mut request, reply_ticket, max_output_tokens, vision_images)
+            .await
     else {
         return interrupted_response();
     };
@@ -122,12 +126,13 @@ pub(crate) async fn interruptible_model_call(
     messages: &mut [BotMemory],
     reply_ticket: ReplyTicket,
     max_output_tokens: Option<u32>,
+    vision_images: &[VisionImage],
 ) -> Option<BotMemory> {
     if !is_current(reply_ticket).await {
         return None;
     }
     kovi::tokio::select! {
-        response = params_model_with_token_limit(messages, max_output_tokens) => {
+        response = params_model_with_token_limit(messages, max_output_tokens, vision_images) => {
             is_current(reply_ticket).await.then_some(response)
         }
         () = wait_until_interrupted(reply_ticket) => None,

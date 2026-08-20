@@ -65,11 +65,13 @@ impl HealthChecker {
             errors.push(error.to_string());
         }
 
-        if std::env::var("BOT_API_TOKEN")
-            .map(|token| token.trim().is_empty())
-            .unwrap_or(true)
+        let server_config = crate::config::get().server_config().clone();
+        if server_config.requires_auth()
+            && std::env::var(server_config.api_key_env())
+                .map(|token| token.trim().is_empty())
+                .unwrap_or(true)
         {
-            errors.push("未设置 BOT_API_TOKEN".to_string());
+            errors.push(format!("未设置 {}", server_config.api_key_env()));
         }
 
         // 检查记忆管理器

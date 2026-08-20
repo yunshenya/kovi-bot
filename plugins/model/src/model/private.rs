@@ -1,9 +1,13 @@
-use crate::model::coalesce::MessageCoalescer;
+use crate::model::coalesce::{MessageCoalescer, MessagePart};
 use crate::model::interrupt::{ReplyScope, interrupt, is_explicit_stop_message};
 use crate::model::utils::{private_chat, requests_no_reply};
 use crate::sticker_memory::{
     StickerScope, extract_stickers, has_reply, known_labels, quoted_message_context,
     stickers_for_teaching, teach, teaching_label, with_quoted_context, with_sticker_context,
+};
+use crate::vision::{
+    default_vision_prompt, extract_image_attachments, is_vision_command, merge_image_attachments,
+    resolve_image_urls, strip_vision_command,
 };
 use kovi::RuntimeBot;
 use kovi::event::PrivateMsgEvent;
@@ -16,6 +20,8 @@ pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<Runtime
     let nick_name = event.get_sender_nickname();
     let message = event.borrow_text().unwrap_or_default();
     let stickers = extract_stickers(&event.message);
+    let current_images = extract_image_attachments(&event.message);
+    let vision_command = is_vision_command(message);
     // 私聊中的任何新消息都应立即使旧模型结果和未发送气泡失效。
     let reply_ticket = interrupt(ReplyScope::Private(user_id)).await;
 
@@ -79,8 +85,26 @@ pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<Runtime
             None
         }
     };
+    let quoted_images = quoted
+        .as_ref()
+        .map(|quoted| quoted.images.as_slice())
+        .unwrap_or_default();
+    let images = merge_image_attachments(&current_images, quoted_images);
+    let vision_requested = !images.is_empty();
+    if vision_command && images.is_empty() {
+        bot.send_private_msg(
+            user_id,
+            "请把截图和 #看截图 放在一起，或回复那张截图再发送命令哦。",
+        );
+        return;
+    }
     // 陌生且没有文字的表情默认保持静默，不请求模型。
-    if message.trim().is_empty() && !stickers.is_empty() && labels.is_empty() && quoted.is_none() {
+    if message.trim().is_empty()
+        && !stickers.is_empty()
+        && labels.is_empty()
+        && quoted.is_none()
+        && !vision_requested
+    {
         println!("[INFO] 收到未学习私聊表情，保持静默 (用户: {})", user_id);
         return;
     }
@@ -88,29 +112,75 @@ pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<Runtime
         return;
     }
 
-    let current_message = with_sticker_context(message, &labels);
+    let text_message = if vision_command {
+        strip_vision_command(message)
+    } else {
+        message.to_string()
+    };
+    let current_message = if vision_requested && text_message.trim().is_empty() {
+        default_vision_prompt().to_string()
+    } else {
+        with_sticker_context(&text_message, &labels)
+    };
     let model_message = quoted.as_ref().map_or(current_message.clone(), |quoted| {
         with_quoted_context(&current_message, quoted)
     });
-    let (model_message, plain_text) = if !message.trim_start().starts_with('#') {
-        let Some(combined) = PRIVATE_MESSAGE_BATCHES
-            .push(
-                user_id,
-                model_message,
-                false,
-                stickers.is_empty() && quoted.is_none(),
+    let (model_message, plain_text, vision_requested, images) =
+        if !message.trim_start().starts_with('#') {
+            let Some(combined) = PRIVATE_MESSAGE_BATCHES
+                .push(
+                    user_id,
+                    MessagePart {
+                        text: model_message,
+                        addressed: false,
+                        plain_text: stickers.is_empty() && quoted.is_none(),
+                        vision_requested,
+                        images,
+                    },
+                )
+                .await
+            else {
+                return;
+            };
+            (
+                combined.text,
+                combined.plain_text,
+                combined.vision_requested,
+                combined.images,
             )
-            .await
-        else {
-            return;
+        } else {
+            (model_message, false, vision_requested, images)
         };
-        (combined.text, combined.plain_text)
+    let vision_images = if vision_requested {
+        match resolve_image_urls(&images, &bot).await {
+            Ok(images) if !images.is_empty() => images,
+            Ok(_) => {
+                bot.send_private_msg(
+                    user_id,
+                    "我暂时拿不到这张截图的内容，再发一次或换张图试试吧。",
+                );
+                return;
+            }
+            Err(error) => {
+                eprintln!("[ERROR] 私聊读取截图失败 (用户: {}): {}", user_id, error);
+                bot.send_private_msg(user_id, "我暂时读不到这张截图，再发一次或换张图试试吧。");
+                return;
+            }
+        }
     } else {
-        (model_message, false)
+        Vec::new()
     };
     if plain_text && requests_no_reply(&model_message) {
         println!("[INFO] 合并后的私聊消息明确要求不回复 (用户: {})", user_id);
         return;
     }
-    private_chat(user_id, &model_message, nick_name, bot, reply_ticket).await;
+    private_chat(
+        user_id,
+        &model_message,
+        nick_name,
+        bot,
+        reply_ticket,
+        vision_images,
+    )
+    .await;
 }

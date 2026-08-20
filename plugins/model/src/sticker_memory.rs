@@ -3,6 +3,7 @@
 //! 仅保存 OneBot 表情/图片的稳定标识与人工教会的含义；不下载或保存图片文件。
 
 use crate::memory::MEMORY_MANAGER;
+use crate::vision::{ImageAttachment, extract_image_attachments};
 use anyhow::{Result, anyhow};
 use kovi::bot::message::Segment;
 use kovi::{Message, RuntimeBot};
@@ -37,6 +38,7 @@ impl StickerScope {
 pub(crate) struct QuotedMessageContext {
     pub(crate) content: String,
     pub(crate) sender_id: Option<i64>,
+    pub(crate) images: Vec<ImageAttachment>,
 }
 
 #[derive(Debug)]
@@ -294,6 +296,7 @@ pub(crate) async fn quoted_message_context(
     };
     let text = extract_text(&quoted.message);
     let stickers = extract_stickers(&quoted.message);
+    let images = extract_image_attachments(&quoted.message);
     let labels = known_labels(&stickers, scope).await?;
     let content = if !labels.is_empty() {
         with_sticker_context(&text, &labels)
@@ -308,6 +311,7 @@ pub(crate) async fn quoted_message_context(
     Ok(Some(QuotedMessageContext {
         content,
         sender_id: quoted.sender_id,
+        images,
     }))
 }
 
@@ -553,6 +557,7 @@ mod tests {
         let quoted = QuotedMessageContext {
             content: "上一句话".to_string(),
             sender_id: Some(42),
+            images: Vec::new(),
         };
         assert_eq!(
             with_quoted_context("你说得对", &quoted),

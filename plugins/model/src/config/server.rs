@@ -14,6 +14,16 @@ pub struct ServerConfig {
     url: String,
     /// 使用的模型名称
     model_name: String,
+    /// API 协议：chat_completions 或 responses
+    wire_api: String,
+    /// 当前主模型是否可以直接接收图片
+    supports_vision: bool,
+    /// 读取主模型 Token 的环境变量名
+    api_key_env: String,
+    /// 是否要求主模型携带 Bearer Token
+    requires_auth: bool,
+    /// 可选的自定义请求头 x-openai-actor-authorization
+    actor_authorization: String,
     /// 单次回复允许模型生成的最大 token 数
     max_output_tokens: u32,
     /// 单次 HTTP 请求超时秒数
@@ -29,6 +39,40 @@ impl ServerConfig {
 
     pub fn model_name(&self) -> &str {
         self.model_name.as_str()
+    }
+
+    pub fn wire_api(&self) -> &str {
+        self.wire_api.as_str()
+    }
+
+    pub fn supports_vision(&self) -> bool {
+        self.supports_vision
+    }
+
+    pub fn api_key_env(&self) -> &str {
+        self.api_key_env.as_str()
+    }
+
+    pub fn requires_auth(&self) -> bool {
+        self.requires_auth
+    }
+
+    pub fn actor_authorization(&self) -> &str {
+        self.actor_authorization.as_str()
+    }
+
+    pub fn endpoint(&self) -> String {
+        let base_url = self.url.trim_end_matches('/');
+        let suffix = if self.wire_api == "responses" {
+            "/responses"
+        } else {
+            "/chat/completions"
+        };
+        if base_url.ends_with(suffix) {
+            base_url.to_string()
+        } else {
+            format!("{base_url}{suffix}")
+        }
     }
 
     pub fn max_output_tokens(&self) -> u32 {
@@ -56,6 +100,14 @@ impl ServerConfig {
         if self.model_name.is_empty() {
             return Err(anyhow::anyhow!("模型名称不能为空"));
         }
+        if !matches!(self.wire_api.as_str(), "responses" | "chat_completions") {
+            return Err(anyhow::anyhow!(
+                "server.wire_api 只支持 responses 或 chat_completions"
+            ));
+        }
+        if self.api_key_env.trim().is_empty() {
+            return Err(anyhow::anyhow!("server.api_key_env 不能为空"));
+        }
         if self.max_output_tokens < 128 {
             return Err(anyhow::anyhow!("server.max_output_tokens 不能小于 128"));
         }
@@ -76,9 +128,38 @@ impl Default for ServerConfig {
         Self {
             url: "https://api.deepseek.com/chat/completions".to_string(),
             model_name: "deepseek-v4-flash".to_string(),
+            wire_api: "chat_completions".to_string(),
+            supports_vision: false,
+            api_key_env: "BOT_API_TOKEN".to_string(),
+            requires_auth: true,
+            actor_authorization: String::new(),
             max_output_tokens: 1_200,
             request_timeout_secs: 60,
             max_retries: 2,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ServerConfig;
+
+    #[test]
+    fn deepseek_default_is_text_only() {
+        let config = ServerConfig::default();
+        assert_eq!(config.wire_api(), "chat_completions");
+        assert!(!config.supports_vision());
+        assert_eq!(config.api_key_env(), "BOT_API_TOKEN");
+        assert!(config.requires_auth());
+    }
+
+    #[test]
+    fn responses_endpoint_is_appended_to_a_provider_base_url() {
+        let config = ServerConfig {
+            url: "https://example.com/v1".to_string(),
+            wire_api: "responses".to_string(),
+            ..ServerConfig::default()
+        };
+        assert_eq!(config.endpoint(), "https://example.com/v1/responses");
     }
 }

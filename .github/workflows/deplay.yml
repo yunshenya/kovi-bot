@@ -87,12 +87,12 @@ jobs:
       - name: Validate deployment secrets
         env:
           DEPLOY_PASSWORD: ${{ secrets.DEPLOY_PASSWORD }}
-          BOT_API_TOKEN: ${{ secrets.BOT_API_TOKEN }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           NAPCAT_ACCESS_TOKEN: ${{ secrets.NAPCAT_ACCESS_TOKEN }}
           POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
         run: |
           test -n "$DEPLOY_PASSWORD" || { echo "Missing DEPLOY_PASSWORD"; exit 1; }
-          test -n "$BOT_API_TOKEN" || { echo "Missing BOT_API_TOKEN"; exit 1; }
+          test -n "$OPENAI_API_KEY" || { echo "Missing OPENAI_API_KEY"; exit 1; }
           test -n "$NAPCAT_ACCESS_TOKEN" || { echo "Missing NAPCAT_ACCESS_TOKEN"; exit 1; }
           test -n "$POSTGRES_PASSWORD" || { echo "Missing POSTGRES_PASSWORD"; exit 1; }
 
@@ -111,12 +111,12 @@ jobs:
       - name: Write protected runtime configuration
         env:
           SSHPASS: ${{ secrets.DEPLOY_PASSWORD }}
-          BOT_API_TOKEN: ${{ secrets.BOT_API_TOKEN }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           NAPCAT_ACCESS_TOKEN: ${{ secrets.NAPCAT_ACCESS_TOKEN }}
           POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
         run: |
           {
-            printf 'BOT_API_TOKEN=%s\n' "$BOT_API_TOKEN"
+            printf 'OPENAI_API_KEY=%s\n' "$OPENAI_API_KEY"
             printf 'DATABASE_URL=postgresql://postgres:%s@127.0.0.1:5432/postgres\n' "$POSTGRES_PASSWORD"
           } | \
             sshpass -e ssh "$DEPLOY_USER@$DEPLOY_HOST" \

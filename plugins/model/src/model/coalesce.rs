@@ -1,4 +1,5 @@
 use crate::config;
+use crate::vision::{ImageAttachment, merge_image_attachments};
 use kovi::tokio::sync::Mutex;
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -9,6 +10,16 @@ pub(crate) struct TextBatch {
     pub(crate) text: String,
     pub(crate) addressed: bool,
     pub(crate) plain_text: bool,
+    pub(crate) vision_requested: bool,
+    pub(crate) images: Vec<ImageAttachment>,
+}
+
+pub(crate) struct MessagePart {
+    pub(crate) text: String,
+    pub(crate) addressed: bool,
+    pub(crate) plain_text: bool,
+    pub(crate) vision_requested: bool,
+    pub(crate) images: Vec<ImageAttachment>,
 }
 
 struct PendingBatch {
@@ -17,6 +28,8 @@ struct PendingBatch {
     char_count: usize,
     addressed: bool,
     all_plain_text: bool,
+    vision_requested: bool,
+    images: Vec<ImageAttachment>,
     started_at: Instant,
     updated_at: Instant,
 }
@@ -29,6 +42,8 @@ impl Default for PendingBatch {
             char_count: 0,
             addressed: false,
             all_plain_text: true,
+            vision_requested: false,
+            images: Vec::new(),
             started_at: Instant::now(),
             updated_at: Instant::now(),
         }
@@ -91,21 +106,9 @@ impl<K> MessageCoalescer<K>
 where
     K: Copy + Eq + Hash,
 {
-    pub(crate) async fn push(
-        &self,
-        key: K,
-        message: String,
-        addressed: bool,
-        plain_text: bool,
-    ) -> Option<TextBatch> {
-        self.push_with_policy(
-            key,
-            message,
-            addressed,
-            plain_text,
-            BatchPolicy::from_config(),
-        )
-        .await
+    pub(crate) async fn push(&self, key: K, part: MessagePart) -> Option<TextBatch> {
+        self.push_with_policy(key, part, BatchPolicy::from_config())
+            .await
     }
 
     pub(crate) async fn cancel(&self, key: K) {
@@ -115,17 +118,17 @@ where
     async fn push_with_policy(
         &self,
         key: K,
-        message: String,
-        addressed: bool,
-        plain_text: bool,
+        part: MessagePart,
         policy: BatchPolicy,
     ) -> Option<TextBatch> {
         if !policy.enabled {
             self.cancel(key).await;
             return Some(TextBatch {
-                text: message,
-                addressed,
-                plain_text,
+                text: part.text,
+                addressed: part.addressed,
+                plain_text: part.plain_text,
+                vision_requested: part.vision_requested,
+                images: part.images,
             });
         }
 
@@ -141,10 +144,12 @@ where
                 batch.started_at = now;
             }
             batch.generation = batch.generation.wrapping_add(1);
-            batch.char_count = batch.char_count.saturating_add(message.chars().count());
-            batch.parts.push(message);
-            batch.addressed |= addressed;
-            batch.all_plain_text &= plain_text;
+            batch.char_count = batch.char_count.saturating_add(part.text.chars().count());
+            batch.parts.push(part.text);
+            batch.addressed |= part.addressed;
+            batch.all_plain_text &= part.plain_text;
+            batch.vision_requested |= part.vision_requested;
+            batch.images = merge_image_attachments(&batch.images, &part.images);
             batch.updated_at = now;
 
             let reached_capacity =
@@ -173,6 +178,8 @@ where
             text: batch.parts.join("\n"),
             addressed: batch.addressed,
             plain_text: batch.all_plain_text,
+            vision_requested: batch.vision_requested,
+            images: batch.images,
         })
     }
 }
@@ -231,7 +238,7 @@ fn ends_complete_sentence(text: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{BatchPolicy, MessageCoalescer, TextBatch, adaptive_delay};
+    use super::{BatchPolicy, MessageCoalescer, MessagePart, TextBatch, adaptive_delay};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -247,9 +254,13 @@ mod tests {
                         coalescer
                             .push_with_policy(
                                 7_i64,
-                                "第一句".to_string(),
-                                true,
-                                true,
+                                MessagePart {
+                                    text: "第一句".to_string(),
+                                    addressed: true,
+                                    plain_text: true,
+                                    vision_requested: true,
+                                    images: Vec::new(),
+                                },
                                 BatchPolicy::testing(),
                             )
                             .await
@@ -259,9 +270,13 @@ mod tests {
                 let second = coalescer
                     .push_with_policy(
                         7_i64,
-                        "第二句。".to_string(),
-                        false,
-                        true,
+                        MessagePart {
+                            text: "第二句。".to_string(),
+                            addressed: false,
+                            plain_text: true,
+                            vision_requested: false,
+                            images: Vec::new(),
+                        },
                         BatchPolicy::testing(),
                     )
                     .await;
@@ -273,6 +288,8 @@ mod tests {
                         text: "第一句\n第二句。".to_string(),
                         addressed: true,
                         plain_text: true,
+                        vision_requested: true,
+                        images: Vec::new(),
                     })
                 );
             });
@@ -299,13 +316,33 @@ mod tests {
                     let coalescer = Arc::clone(&coalescer);
                     kovi::tokio::spawn(async move {
                         coalescer
-                            .push_with_policy(9_i64, "第一段".to_string(), false, true, policy)
+                            .push_with_policy(
+                                9_i64,
+                                MessagePart {
+                                    text: "第一段".to_string(),
+                                    addressed: false,
+                                    plain_text: true,
+                                    vision_requested: false,
+                                    images: Vec::new(),
+                                },
+                                policy,
+                            )
                             .await
                     })
                 };
                 kovi::tokio::time::sleep(Duration::from_millis(5)).await;
                 let second = coalescer
-                    .push_with_policy(9_i64, "第二段".to_string(), false, true, policy)
+                    .push_with_policy(
+                        9_i64,
+                        MessagePart {
+                            text: "第二段".to_string(),
+                            addressed: false,
+                            plain_text: true,
+                            vision_requested: false,
+                            images: Vec::new(),
+                        },
+                        policy,
+                    )
                     .await;
                 assert!(first.await.expect("任务应正常结束").is_none());
                 assert_eq!(second.expect("第二段应立即取出").text, "第一段\n第二段");
@@ -324,9 +361,13 @@ mod tests {
                         coalescer
                             .push_with_policy(
                                 12_i64,
-                                "先别急".to_string(),
-                                false,
-                                true,
+                                MessagePart {
+                                    text: "先别急".to_string(),
+                                    addressed: false,
+                                    plain_text: true,
+                                    vision_requested: false,
+                                    images: Vec::new(),
+                                },
                                 BatchPolicy::testing(),
                             )
                             .await
