@@ -39,6 +39,10 @@ contextual_memory_limit = 5
 maintenance_interval_secs = 86400
 summary_keep_recent_messages = 15
 summary_max_chars = 1500
+autonomous_query_enabled = true
+autonomous_query_max_rounds = 2
+autonomous_query_max_results = 8
+autonomous_query_max_days = 3650
 
 [mood]
 cache_ttl_secs = 300

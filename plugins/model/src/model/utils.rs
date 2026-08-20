@@ -8,6 +8,7 @@
 //! - 用户档案管理
 //! - 系统状态监控
 
+use super::memory_query::params_model_with_memory_access;
 use crate::config;
 use crate::memory::{BotPersonality, MEMORY_MANAGER, MoodEntry, UserProfile};
 use crate::mood_system::{MOOD_SYSTEM, Mood};
@@ -186,7 +187,8 @@ pub async fn control_model(
         &contextual_memories,
         rolling_summary.as_deref(),
     );
-    let response = params_model(&mut request_messages).await;
+    let response =
+        params_model_with_memory_access(&mut request_messages, group_id, "group_chat").await;
     if is_model_error_response(&response.content) {
         bot.send_group_msg(group_id, "我这里暂时有点连不上，等一会儿再和我说一次吧。");
         limit_memory_size(&mut messages);
@@ -839,7 +841,8 @@ pub async fn private_chat(user_id: i64, message: &str, nickname: String, bot: Ar
         &contextual_memories,
         rolling_summary.as_deref(),
     );
-    let bot_content = params_model(&mut request_messages).await;
+    let bot_content =
+        params_model_with_memory_access(&mut request_messages, user_id, "private_chat").await;
     if is_model_error_response(&bot_content.content) {
         bot.send_private_msg(user_id, "我这里暂时有点连不上，等一会儿再和我说一次吧。");
         limit_memory_size(&mut history);

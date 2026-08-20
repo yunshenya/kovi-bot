@@ -9,7 +9,7 @@
 //! - 自动记忆清理和优化
 
 use anyhow::Result;
-use chrono::{DateTime, Local};
+use chrono::{DateTime, Duration as ChronoDuration, Local, Utc};
 use kovi::tokio::sync::Mutex;
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
@@ -19,6 +19,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, OnceLock};
+use std::time::Duration;
 
 static MEMORY_ID_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -70,6 +71,87 @@ pub enum MemoryType {
     Preference,
     /// 情绪状态：存储机器人的情绪变化记录
     Emotion,
+}
+
+/// 模型可选择的记忆类型。查询范围和所属对象不在协议中，由程序强制指定。
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum MemoryLookupType {
+    Conversation,
+    UserProfile,
+    GroupInfo,
+    Event,
+    Preference,
+    Emotion,
+}
+
+impl MemoryLookupType {
+    fn database_value(&self) -> &'static str {
+        match self {
+            Self::Conversation => "Conversation",
+            Self::UserProfile => "UserProfile",
+            Self::GroupInfo => "GroupInfo",
+            Self::Event => "Event",
+            Self::Preference => "Preference",
+            Self::Emotion => "Emotion",
+        }
+    }
+}
+
+fn default_memory_lookup_limit() -> usize {
+    5
+}
+
+/// 模型能提交的受限查询参数。故意不包含 SQL、表名、会话对象或聊天范围。
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct MemoryLookup {
+    pub(crate) keywords: Vec<String>,
+    pub(crate) since_days: Option<u32>,
+    pub(crate) memory_types: Vec<MemoryLookupType>,
+    pub(crate) min_importance: Option<u8>,
+    #[serde(default = "default_memory_lookup_limit")]
+    pub(crate) limit: usize,
+}
+
+impl Default for MemoryLookup {
+    fn default() -> Self {
+        Self {
+            keywords: Vec::new(),
+            since_days: None,
+            memory_types: Vec::new(),
+            min_importance: None,
+            limit: default_memory_lookup_limit(),
+        }
+    }
+}
+
+impl MemoryLookup {
+    fn normalized(mut self, max_results: usize, max_days: u32) -> Self {
+        let mut seen_keywords = HashSet::new();
+        self.keywords = self
+            .keywords
+            .into_iter()
+            .map(|keyword| keyword.trim().chars().take(48).collect::<String>())
+            .filter(|keyword| !keyword.is_empty())
+            .filter(|keyword| seen_keywords.insert(keyword.to_lowercase()))
+            .take(5)
+            .collect();
+        self.memory_types.truncate(6);
+        self.since_days = self.since_days.map(|days| days.clamp(1, max_days));
+        self.min_importance = self.min_importance.map(|importance| importance.min(10));
+        self.limit = self.limit.clamp(1, max_results);
+
+        // 完全空的查询默认只取最近一周，避免模型无条件遍历全部历史。
+        if self.keywords.is_empty()
+            && self.since_days.is_none()
+            && self.memory_types.is_empty()
+            && self.min_importance.is_none()
+        {
+            self.since_days = Some(7);
+        }
+        self
+    }
 }
 
 /// 用户档案结构体
@@ -862,6 +944,125 @@ impl MemoryManager {
             .collect()
     }
 
+    /// 执行模型提出的受限长期记忆查询。
+    ///
+    /// `subject_id` 和 `context` 由当前事件决定，不接受模型输入；数据库查询始终参数化，
+    /// 并设置短超时与结果上限。未初始化数据库的单元测试实例使用相同规则查询内存副本。
+    pub(crate) async fn query_memories_for_model(
+        &self,
+        subject_id: i64,
+        context: &str,
+        lookup: MemoryLookup,
+        max_results: usize,
+        max_days: u32,
+    ) -> Result<Vec<MemoryEntry>> {
+        let lookup = lookup.normalized(max_results, max_days);
+        let requested_scope = context_scope(context).unwrap_or(context).to_string();
+        let since = lookup
+            .since_days
+            .map(|days| Utc::now() - ChronoDuration::days(i64::from(days)));
+        let memory_types = lookup
+            .memory_types
+            .iter()
+            .map(MemoryLookupType::database_value)
+            .collect::<Vec<_>>();
+        let min_importance = i16::from(lookup.min_importance.unwrap_or(0));
+
+        if let Some(pool) = self.database_pool.get() {
+            let fetch = sqlx::query(
+                r#"
+                SELECT payload
+                FROM kovi_bot_memories
+                WHERE subject_id = $1
+                  AND CASE
+                        WHEN $2 = 'private' THEN POSITION('private' IN context) > 0
+                        WHEN $2 = 'group' THEN POSITION('group' IN context) > 0
+                        ELSE context = $2
+                      END
+                  AND ($3::TIMESTAMPTZ IS NULL OR occurred_at >= $3)
+                  AND (CARDINALITY($4::TEXT[]) = 0 OR payload->>'memory_type' = ANY($4::TEXT[]))
+                  AND importance >= $5
+                  AND (
+                        CARDINALITY($6::TEXT[]) = 0
+                        OR EXISTS (
+                            SELECT 1
+                            FROM UNNEST($6::TEXT[]) AS terms(keyword)
+                            WHERE STRPOS(LOWER(COALESCE(payload->>'content', '')), LOWER(keyword)) > 0
+                               OR STRPOS(LOWER(COALESCE((payload->'tags')::TEXT, '')), LOWER(keyword)) > 0
+                        )
+                      )
+                ORDER BY (
+                    SELECT COUNT(*)
+                    FROM UNNEST($6::TEXT[]) AS ranked_terms(keyword)
+                    WHERE STRPOS(LOWER(COALESCE(payload->>'content', '')), LOWER(keyword)) > 0
+                       OR STRPOS(LOWER(COALESCE((payload->'tags')::TEXT, '')), LOWER(keyword)) > 0
+                ) DESC, importance DESC, occurred_at DESC
+                LIMIT $7
+                "#,
+            )
+            .bind(subject_id)
+            .bind(&requested_scope)
+            .bind(since)
+            .bind(&memory_types)
+            .bind(min_importance)
+            .bind(&lookup.keywords)
+            .bind(lookup.limit as i64)
+            .fetch_all(pool);
+            let rows = kovi::tokio::time::timeout(Duration::from_secs(2), fetch)
+                .await
+                .map_err(|_| anyhow::anyhow!("自主记忆查询超时"))??;
+            return rows
+                .into_iter()
+                .map(|row| serde_json::from_value(row.get("payload")).map_err(Into::into))
+                .collect();
+        }
+
+        let since_local = lookup
+            .since_days
+            .map(|days| Local::now() - ChronoDuration::days(i64::from(days)));
+        let mut results = self
+            .memories
+            .lock()
+            .await
+            .values()
+            .filter(|memory| memory.subject_id == Some(subject_id))
+            .filter(|memory| {
+                context_scope(&memory.context).unwrap_or(&memory.context) == requested_scope
+            })
+            .filter(|memory| since_local.is_none_or(|since| memory.timestamp >= since))
+            .filter(|memory| memory.importance >= lookup.min_importance.unwrap_or(0))
+            .filter(|memory| {
+                lookup.memory_types.is_empty()
+                    || lookup.memory_types.iter().any(|kind| {
+                        kind.database_value() == memory_type_database_value(&memory.memory_type)
+                    })
+            })
+            .filter_map(|memory| {
+                let searchable =
+                    format!("{} {}", memory.content, memory.tags.join(" ")).to_lowercase();
+                let matches = lookup
+                    .keywords
+                    .iter()
+                    .filter(|keyword| searchable.contains(&keyword.to_lowercase()))
+                    .count();
+                if !lookup.keywords.is_empty() && matches == 0 {
+                    None
+                } else {
+                    Some((memory.clone(), matches))
+                }
+            })
+            .collect::<Vec<_>>();
+        results.sort_by(|left, right| {
+            right
+                .1
+                .cmp(&left.1)
+                .then_with(|| right.0.importance.cmp(&left.0.importance))
+                .then_with(|| right.0.timestamp.cmp(&left.0.timestamp))
+        });
+        results.truncate(lookup.limit);
+        Ok(results.into_iter().map(|(memory, _)| memory).collect())
+    }
+
     pub async fn update_user_profile(&self, user_id: i64, profile: UserProfile) -> Result<()> {
         let persisted_profile = profile.clone();
         {
@@ -1213,6 +1414,17 @@ fn context_scope(context: &str) -> Option<&'static str> {
     }
 }
 
+fn memory_type_database_value(memory_type: &MemoryType) -> &'static str {
+    match memory_type {
+        MemoryType::Conversation => "Conversation",
+        MemoryType::UserProfile => "UserProfile",
+        MemoryType::GroupInfo => "GroupInfo",
+        MemoryType::Event => "Event",
+        MemoryType::Preference => "Preference",
+        MemoryType::Emotion => "Emotion",
+    }
+}
+
 fn memory_query_relevance(memory: &MemoryEntry, query: &str) -> u8 {
     let query = query.trim().to_lowercase();
     if query.is_empty() {
@@ -1287,7 +1499,7 @@ impl Default for BotPersonality {
 
 #[cfg(test)]
 mod tests {
-    use super::{MemoryManager, UserProfile};
+    use super::{MemoryLookup, MemoryLookupType, MemoryManager, UserProfile};
     use chrono::Local;
 
     fn temporary_memory_path(test_name: &str) -> std::path::PathBuf {
@@ -1365,6 +1577,50 @@ mod tests {
                     .await;
                 assert_eq!(private_context.len(), 1);
                 assert!(!private_context[0].content.contains("群聊"));
+
+                std::fs::remove_file(path).expect("应清理测试记忆文件");
+            });
+    }
+
+    #[test]
+    fn autonomous_lookup_is_scoped_and_parameter_limited() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let path = temporary_memory_path("autonomous-lookup");
+                let manager = MemoryManager::new(path.to_str().expect("临时路径应为 UTF-8"));
+                manager
+                    .add_conversation_memory(11, "小林喜欢爵士音乐", "private_chat")
+                    .await
+                    .expect("应写入当前用户记忆");
+                manager
+                    .add_conversation_memory(12, "另一个人的音乐秘密", "private_chat")
+                    .await
+                    .expect("应写入其他用户记忆");
+                manager
+                    .add_conversation_memory(11, "同号群聊里的音乐话题", "group_chat")
+                    .await
+                    .expect("应写入同号群聊记忆");
+
+                let memories = manager
+                    .query_memories_for_model(
+                        11,
+                        "private_chat",
+                        MemoryLookup {
+                            keywords: vec!["音乐".to_string()],
+                            since_days: None,
+                            memory_types: vec![MemoryLookupType::Conversation],
+                            min_importance: None,
+                            limit: 999,
+                        },
+                        8,
+                        3_650,
+                    )
+                    .await
+                    .expect("自主查询应成功");
+                assert_eq!(memories.len(), 1);
+                assert_eq!(memories[0].subject_id, Some(11));
+                assert_eq!(memories[0].context, "private_chat");
 
                 std::fs::remove_file(path).expect("应清理测试记忆文件");
             });
@@ -1470,6 +1726,28 @@ mod tests {
                     .get_contextual_memories(subject_id, "private_chat", &content, 3)
                     .await;
                 assert!(memories.iter().any(|memory| memory.content == content));
+
+                let autonomous_results = reloaded
+                    .query_memories_for_model(
+                        subject_id,
+                        "private_chat",
+                        MemoryLookup {
+                            keywords: vec!["PostgreSQL".to_string()],
+                            since_days: Some(1),
+                            memory_types: vec![MemoryLookupType::Conversation],
+                            min_importance: Some(1),
+                            limit: 3,
+                        },
+                        8,
+                        3_650,
+                    )
+                    .await
+                    .expect("参数化 PostgreSQL 自主查询应成功");
+                assert!(
+                    autonomous_results
+                        .iter()
+                        .any(|memory| memory.content == content)
+                );
             });
     }
 }
