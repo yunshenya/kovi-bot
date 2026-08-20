@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct TextBatch {
     pub(crate) text: String,
+    pub(crate) intent_text: String,
     pub(crate) addressed: bool,
     pub(crate) plain_text: bool,
     pub(crate) vision_requested: bool,
@@ -16,6 +17,7 @@ pub(crate) struct TextBatch {
 
 pub(crate) struct MessagePart {
     pub(crate) text: String,
+    pub(crate) intent_text: String,
     pub(crate) addressed: bool,
     pub(crate) plain_text: bool,
     pub(crate) vision_requested: bool,
@@ -25,6 +27,7 @@ pub(crate) struct MessagePart {
 struct PendingBatch {
     generation: u64,
     parts: Vec<String>,
+    intent_parts: Vec<String>,
     char_count: usize,
     addressed: bool,
     all_plain_text: bool,
@@ -39,6 +42,7 @@ impl Default for PendingBatch {
         Self {
             generation: 0,
             parts: Vec::new(),
+            intent_parts: Vec::new(),
             char_count: 0,
             addressed: false,
             all_plain_text: true,
@@ -125,6 +129,7 @@ where
             self.cancel(key).await;
             return Some(TextBatch {
                 text: part.text,
+                intent_text: part.intent_text,
                 addressed: part.addressed,
                 plain_text: part.plain_text,
                 vision_requested: part.vision_requested,
@@ -146,6 +151,7 @@ where
             batch.generation = batch.generation.wrapping_add(1);
             batch.char_count = batch.char_count.saturating_add(part.text.chars().count());
             batch.parts.push(part.text);
+            batch.intent_parts.push(part.intent_text);
             batch.addressed |= part.addressed;
             batch.all_plain_text &= part.plain_text;
             batch.vision_requested |= part.vision_requested;
@@ -176,6 +182,7 @@ where
         }
         pending.remove(&key).map(|batch| TextBatch {
             text: batch.parts.join("\n"),
+            intent_text: batch.intent_parts.join("\n"),
             addressed: batch.addressed,
             plain_text: batch.all_plain_text,
             vision_requested: batch.vision_requested,
@@ -256,6 +263,7 @@ mod tests {
                                 7_i64,
                                 MessagePart {
                                     text: "第一句".to_string(),
+                                    intent_text: "第一句".to_string(),
                                     addressed: true,
                                     plain_text: true,
                                     vision_requested: true,
@@ -272,6 +280,7 @@ mod tests {
                         7_i64,
                         MessagePart {
                             text: "第二句。".to_string(),
+                            intent_text: "第二句。".to_string(),
                             addressed: false,
                             plain_text: true,
                             vision_requested: false,
@@ -286,6 +295,7 @@ mod tests {
                     second,
                     Some(TextBatch {
                         text: "第一句\n第二句。".to_string(),
+                        intent_text: "第一句\n第二句。".to_string(),
                         addressed: true,
                         plain_text: true,
                         vision_requested: true,
@@ -320,6 +330,7 @@ mod tests {
                                 9_i64,
                                 MessagePart {
                                     text: "第一段".to_string(),
+                                    intent_text: "第一段".to_string(),
                                     addressed: false,
                                     plain_text: true,
                                     vision_requested: false,
@@ -336,6 +347,7 @@ mod tests {
                         9_i64,
                         MessagePart {
                             text: "第二段".to_string(),
+                            intent_text: "第二段".to_string(),
                             addressed: false,
                             plain_text: true,
                             vision_requested: false,
@@ -363,6 +375,7 @@ mod tests {
                                 12_i64,
                                 MessagePart {
                                     text: "先别急".to_string(),
+                                    intent_text: "先别急".to_string(),
                                     addressed: false,
                                     plain_text: true,
                                     vision_requested: false,

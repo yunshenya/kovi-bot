@@ -7,8 +7,10 @@ use crate::sticker_memory::{
     stickers_for_teaching, teach, teaching_label, with_quoted_context, with_sticker_context,
 };
 use crate::vision::{
-    VisionImage, default_vision_prompt, extract_image_attachments, is_vision_command,
-    merge_image_attachments, resolve_image_urls, strip_vision_command,
+    ImageIntent, ImageRequestScope, VisionImage, classify_image_intent,
+    consume_pending_image_request, default_vision_prompt, extract_image_attachments,
+    is_vision_command, merge_image_attachments, message_requests_image, resolve_image_urls,
+    strip_vision_command, with_social_image_context,
 };
 use kovi::RuntimeBot;
 use kovi::event::PrivateMsgEvent;
@@ -130,22 +132,26 @@ pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<Runtime
         .map(|quoted| quoted.images.as_slice())
         .unwrap_or_default();
     let images = merge_image_attachments(&current_images, quoted_images);
-    let vision_requested = !images.is_empty();
+    let quoted_message_requests_image = quoted
+        .as_ref()
+        .is_some_and(|quoted| message_requests_image(&quoted.content));
+    let pending_image_request =
+        consume_pending_image_request(ImageRequestScope::Private(user_id), !images.is_empty())
+            .await;
+    let image_intent = classify_image_intent(
+        message,
+        !images.is_empty(),
+        vision_command,
+        !quoted_images.is_empty() && !message.trim().is_empty(),
+        quoted_message_requests_image,
+        pending_image_request,
+    );
+    let vision_requested = image_intent == ImageIntent::VisualUnderstand;
     if vision_command && images.is_empty() {
         bot.send_private_msg(
             user_id,
             "请把截图和 #看截图 放在一起，或回复那张截图再发送命令哦。",
         );
-        return;
-    }
-    // 陌生且没有文字的表情默认保持静默，不请求模型。
-    if message.trim().is_empty()
-        && !stickers.is_empty()
-        && labels.is_empty()
-        && quoted.is_none()
-        && !vision_requested
-    {
-        println!("[INFO] 收到未学习私聊表情，保持静默 (用户: {})", user_id);
         return;
     }
     if message.trim().is_empty() && stickers.is_empty() && !has_reply(&event.message) {
@@ -165,13 +171,14 @@ pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<Runtime
     let model_message = quoted.as_ref().map_or(current_message.clone(), |quoted| {
         with_quoted_context(&current_message, quoted)
     });
-    let (model_message, plain_text, vision_requested, images) =
+    let (model_message, plain_text, intent_text, batch_vision_requested, images) =
         if !message.trim_start().starts_with('#') {
             let Some(combined) = PRIVATE_MESSAGE_BATCHES
                 .push(
                     user_id,
                     MessagePart {
                         text: model_message,
+                        intent_text: text_message.clone(),
                         addressed: false,
                         plain_text: stickers.is_empty() && quoted.is_none(),
                         vision_requested,
@@ -185,12 +192,42 @@ pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<Runtime
             (
                 combined.text,
                 combined.plain_text,
+                combined.intent_text,
                 combined.vision_requested,
                 combined.images,
             )
         } else {
-            (model_message, false, vision_requested, images)
+            (
+                model_message,
+                false,
+                text_message.clone(),
+                vision_requested,
+                images,
+            )
         };
+    let batch_image_intent = classify_image_intent(
+        &intent_text,
+        !images.is_empty(),
+        false,
+        !quoted_images.is_empty() && !intent_text.trim().is_empty(),
+        false,
+        batch_vision_requested,
+    );
+    let vision_requested =
+        batch_vision_requested || batch_image_intent == ImageIntent::VisualUnderstand;
+    if intent_text.trim().is_empty()
+        && !vision_requested
+        && (!images.is_empty() || !stickers.is_empty())
+    {
+        println!("[INFO] 收到私聊纯图片状态，保持静默 (用户: {})", user_id);
+        return;
+    }
+    let model_message = if !images.is_empty() && !vision_requested && !intent_text.trim().is_empty()
+    {
+        with_social_image_context(&model_message)
+    } else {
+        model_message
+    };
     let vision_images = if vision_requested {
         match resolve_image_urls(&images, &bot).await {
             Ok(images) if !images.is_empty() => images,

@@ -18,7 +18,10 @@ use crate::config;
 use crate::memory::{BotPersonality, MEMORY_MANAGER, MoodEntry, UserProfile};
 use crate::mood_system::{MOOD_SYSTEM, Mood};
 use crate::utils;
-use crate::vision::{VisionImage, analyze_images, default_vision_prompt, extract_response_content};
+use crate::vision::{
+    ImageRequestScope, VisionImage, analyze_images, default_vision_prompt,
+    extract_response_content, update_pending_image_request,
+};
 use anyhow::Context;
 use chrono::{Local, TimeZone};
 use kovi::RuntimeBot;
@@ -127,8 +130,10 @@ struct ModelConf<'a> {
 /// * `bot` - 机器人实例
 /// * `nickname` - 发送者昵称
 /// * `message` - 消息内容
+#[allow(clippy::too_many_arguments)]
 pub async fn control_model(
     group_id: i64,
+    user_id: i64,
     bot: Arc<RuntimeBot>,
     nickname: String,
     message: &str,
@@ -239,6 +244,11 @@ pub async fn control_model(
     let reply_action = sanitize_reply_action(
         super::interrupt::ReplyScope::Group(group_id),
         parsed_reply.action,
+    )
+    .await;
+    update_pending_image_request(
+        ImageRequestScope::Group { group_id, user_id },
+        &parsed_reply.content,
     )
     .await;
     if is_model_error_response(&parsed_reply.content) {
@@ -1022,8 +1032,10 @@ async fn touch_runtime_history(
     evicted
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn silence(
     group_id: i64,
+    user_id: i64,
     message: &str,
     bot: Arc<RuntimeBot>,
     sender: String,
@@ -1054,6 +1066,7 @@ pub async fn silence(
         }
         let replied = control_model(
             group_id,
+            user_id,
             bot,
             sender,
             message,
@@ -1244,6 +1257,7 @@ async fn private_chat_inner(
         parsed_reply.action,
     )
     .await;
+    update_pending_image_request(ImageRequestScope::Private(user_id), &parsed_reply.content).await;
     if is_model_error_response(&parsed_reply.content) {
         bot.send_private_msg(user_id, "我这里暂时有点连不上，等一会儿再和我说一次吧。");
         limit_memory_size(&mut history);

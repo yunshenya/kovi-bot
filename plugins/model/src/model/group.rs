@@ -12,8 +12,10 @@ use crate::sticker_memory::{
     stickers_for_teaching, teach, teaching_label, with_quoted_context, with_sticker_context,
 };
 use crate::vision::{
-    VisionImage, extract_image_attachments, is_vision_command, merge_image_attachments,
-    resolve_image_urls, strip_vision_command,
+    ImageIntent, ImageRequestScope, VisionImage, classify_image_intent,
+    consume_pending_image_request, extract_image_attachments, is_vision_command,
+    merge_image_attachments, message_requests_image, resolve_image_urls, strip_vision_command,
+    with_social_image_context,
 };
 use chrono::Local;
 use kovi::RuntimeBot;
@@ -192,27 +194,31 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
     let images = merge_image_attachments(&current_images, quoted_images);
     let replies_to_bot = quoted.as_ref().and_then(|quoted| quoted.sender_id) == Some(event.self_id);
     let replies_to_image = !quoted_images.is_empty() && !message.trim().is_empty();
-    let vision_requested = !images.is_empty()
-        && (directly_addressed
-            || replies_to_bot
-            || replies_to_image
-            || vision_command
-            || participant_follow_up);
+    let quoted_message_requests_image = quoted.as_ref().is_some_and(|quoted| {
+        quoted.sender_id == Some(event.self_id) && message_requests_image(&quoted.content)
+    });
+    let pending_image_request = consume_pending_image_request(
+        ImageRequestScope::Group {
+            group_id,
+            user_id: event.user_id,
+        },
+        !images.is_empty(),
+    )
+    .await;
+    let image_intent = classify_image_intent(
+        message,
+        !images.is_empty(),
+        vision_command,
+        replies_to_image,
+        quoted_message_requests_image,
+        pending_image_request,
+    );
+    let vision_requested = image_intent == ImageIntent::VisualUnderstand;
     if vision_command && images.is_empty() {
         bot.send_group_msg(
             group_id,
             "请把截图和 #看截图 放在一起，或回复那张截图再发送命令哦。",
         );
-        return;
-    }
-    // 没有文字的陌生表情不触发模型，也不消耗 token。
-    if message.trim().is_empty()
-        && !stickers.is_empty()
-        && labels.is_empty()
-        && quoted.is_none()
-        && !vision_requested
-    {
-        println!("[INFO] 收到未学习群表情，保持静默 (群组: {})", group_id);
         return;
     }
     if message.trim().is_empty()
@@ -242,13 +248,14 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
         return;
     }
     let addressed_to_bot = directly_addressed || replies_to_bot;
-    let (model_message, addressed_to_bot, plain_text, vision_requested, images) =
+    let (model_message, addressed_to_bot, plain_text, intent_text, batch_vision_requested, images) =
         if !message.trim_start().starts_with('#') {
             let Some(combined) = GROUP_MESSAGE_BATCHES
                 .push(
                     (group_id, event.user_id),
                     MessagePart {
                         text: model_message,
+                        intent_text: message.to_string(),
                         addressed: addressed_to_bot,
                         plain_text: stickers.is_empty() && quoted.is_none(),
                         vision_requested,
@@ -263,6 +270,7 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
                 combined.text,
                 combined.addressed,
                 combined.plain_text,
+                combined.intent_text,
                 combined.vision_requested,
                 combined.images,
             )
@@ -271,10 +279,34 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
                 model_message,
                 addressed_to_bot,
                 false,
+                message.to_string(),
                 vision_requested,
                 images,
             )
         };
+    let batch_image_intent = classify_image_intent(
+        &intent_text,
+        !images.is_empty(),
+        false,
+        !quoted_images.is_empty() && !intent_text.trim().is_empty(),
+        false,
+        batch_vision_requested,
+    );
+    let vision_requested =
+        batch_vision_requested || batch_image_intent == ImageIntent::VisualUnderstand;
+    if intent_text.trim().is_empty()
+        && !vision_requested
+        && (!images.is_empty() || !stickers.is_empty())
+    {
+        println!("[INFO] 收到群聊纯图片状态，保持静默 (群组: {})", group_id);
+        return;
+    }
+    let model_message = if !images.is_empty() && !vision_requested && !intent_text.trim().is_empty()
+    {
+        with_social_image_context(&model_message)
+    } else {
+        model_message
+    };
     let vision_images = if vision_requested {
         match resolve_image_urls(&images, &bot).await {
             Ok(images) if !images.is_empty() => images,
@@ -423,6 +455,7 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
                 let turn_marker = begin_conversation_turn(group_id, event.user_id).await;
                 let replied = silence(
                     group_id,
+                    event.user_id,
                     &model_message,
                     Arc::clone(&bot),
                     sender,
@@ -449,6 +482,7 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
                 let turn_marker = begin_conversation_turn(group_id, event.user_id).await;
                 let replied = silence(
                     group_id,
+                    event.user_id,
                     &model_message,
                     Arc::clone(&bot),
                     sender,
@@ -468,6 +502,7 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
                     .interjection_max_output_tokens();
                 let replied = silence(
                     group_id,
+                    event.user_id,
                     &model_message,
                     Arc::clone(&bot),
                     sender,
@@ -717,12 +752,12 @@ fn conversation_message_is_relevant(
             .is_some_and(|last_reply| now.duration_since(last_reply) < open_floor)
 }
 
-fn is_meaningful_conversation_message(message: &str, has_image: bool) -> bool {
+fn is_meaningful_conversation_message(message: &str, _has_image: bool) -> bool {
     let text = message.trim();
     if text.starts_with('#') {
         return false;
     }
-    has_image || text.chars().any(|character| character.is_alphanumeric())
+    text.chars().any(|character| character.is_alphanumeric())
 }
 
 fn should_defer_active_window_message(
@@ -793,6 +828,7 @@ async fn drain_pending_window_messages(group_id: i64, bot: Arc<RuntimeBot>) {
         let turn_marker = begin_conversation_turn(group_id, pending.user_id).await;
         let replied = crate::model::utils::silence(
             group_id,
+            pending.user_id,
             &pending.message,
             bot.clone(),
             pending.sender,
@@ -1144,7 +1180,7 @@ mod tests {
             now,
             Duration::from_secs(45),
         ));
-        assert!(conversation_message_is_relevant(
+        assert!(!conversation_message_is_relevant(
             &state,
             42,
             "",

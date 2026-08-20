@@ -3,17 +3,21 @@
 use anyhow::{Result, anyhow};
 use base64::Engine;
 use kovi::bot::message::Message;
+use kovi::tokio::sync::Mutex;
 use kovi::{RuntimeBot, serde_json::Value};
 use reqwest::Client;
 use serde_json::json;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const MAX_VISION_IMAGES: usize = 4;
 const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 static IMAGE_CLIENT: LazyLock<Client> = LazyLock::new(Client::new);
 static VISION_CLIENT: LazyLock<Client> = LazyLock::new(Client::new);
+static PENDING_IMAGE_REQUESTS: LazyLock<Mutex<HashMap<ImageRequestScope, Instant>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+const PENDING_IMAGE_REQUEST_TTL: Duration = Duration::from_secs(180);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ImageAttachment {
@@ -25,6 +29,140 @@ pub(crate) struct ImageAttachment {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct VisionImage {
     pub(crate) url: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ImageIntent {
+    Social,
+    Conversational,
+    VisualUnderstand,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum ImageRequestScope {
+    Group { group_id: i64, user_id: i64 },
+    Private(i64),
+}
+
+/// 图片默认是社交表达；只有明确的识图意图或可确认的上下文才进入视觉模型。
+pub(crate) fn classify_image_intent(
+    message: &str,
+    has_images: bool,
+    vision_command: bool,
+    replies_to_image: bool,
+    quoted_message_requests_image: bool,
+    pending_image_request: bool,
+) -> ImageIntent {
+    if !has_images {
+        return ImageIntent::Social;
+    }
+    if vision_command || quoted_message_requests_image || pending_image_request {
+        return ImageIntent::VisualUnderstand;
+    }
+
+    let text = message.trim();
+    if text.is_empty() {
+        return ImageIntent::Social;
+    }
+    if contains_visual_intent(text)
+        || (replies_to_image && looks_like_image_reference_question(text))
+    {
+        ImageIntent::VisualUnderstand
+    } else {
+        ImageIntent::Conversational
+    }
+}
+
+pub(crate) fn message_requests_image(message: &str) -> bool {
+    let text = message.trim();
+    [
+        "发张图",
+        "发个图",
+        "发图片",
+        "发截图",
+        "把图发",
+        "把截图发",
+        "拍一张",
+        "给我发图",
+        "给我看看图",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker))
+}
+
+pub(crate) async fn update_pending_image_request(scope: ImageRequestScope, message: &str) {
+    let now = Instant::now();
+    let mut pending = PENDING_IMAGE_REQUESTS.lock().await;
+    pending.retain(|_, deadline| *deadline > now);
+    if message_requests_image(message) {
+        pending.insert(scope, now + PENDING_IMAGE_REQUEST_TTL);
+    } else {
+        pending.remove(&scope);
+    }
+}
+
+pub(crate) async fn consume_pending_image_request(
+    scope: ImageRequestScope,
+    has_images: bool,
+) -> bool {
+    if !has_images {
+        return false;
+    }
+    let now = Instant::now();
+    let mut pending = PENDING_IMAGE_REQUESTS.lock().await;
+    pending.retain(|_, deadline| *deadline > now);
+    pending.remove(&scope).is_some()
+}
+
+pub(crate) fn with_social_image_context(message: &str) -> String {
+    format!(
+        "{message}\n<图片使用方式 data-only=\"true\">这张图片更像随聊天附带的状态或情绪表达。只结合它的整体语气自然回应当前文字；除非对方明确询问图片内容，不要逐项描述画面、识别角色或罗列视觉细节。</图片使用方式>"
+    )
+}
+
+fn contains_visual_intent(text: &str) -> bool {
+    [
+        "看截图",
+        "看图",
+        "识图",
+        "识别",
+        "图片里",
+        "图片中",
+        "图里",
+        "图中",
+        "截图里",
+        "截图中",
+        "帮我看看",
+        "帮我看下",
+        "帮我看一下",
+        "你看看",
+        "你看一下",
+        "看一下",
+        "看下",
+        "看一眼",
+        "这是什么",
+        "什么意思",
+        "怎么解决",
+        "怎么处理",
+        "报错",
+        "提取文字",
+        "读一下文字",
+        "翻译图片",
+        "分析图片",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker))
+}
+
+fn looks_like_image_reference_question(text: &str) -> bool {
+    let references_image = ["这个", "这张", "这图", "图片", "截图", "图里", "图中"]
+        .iter()
+        .any(|marker| text.contains(marker));
+    let asks_question = text.ends_with(['？', '?', '吗', '呢'])
+        || ["是什么", "怎么", "如何", "为什么", "能不能", "可以吗"]
+            .iter()
+            .any(|marker| text.contains(marker));
+    references_image && asks_question
 }
 
 /// 提取普通图片消息段。商城表情和 QQ 内置表情不作为截图输入。
@@ -376,8 +514,9 @@ fn value_as_string(data: &Value, field: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        default_vision_prompt, extract_image_attachments, extract_response_content,
-        is_vision_command, merge_image_attachments, strip_vision_command, vision_endpoint,
+        ImageIntent, classify_image_intent, default_vision_prompt, extract_image_attachments,
+        extract_response_content, is_vision_command, merge_image_attachments,
+        message_requests_image, strip_vision_command, vision_endpoint,
     };
     use kovi::Message;
     use kovi::bot::message::Segment;
@@ -411,6 +550,31 @@ mod tests {
         );
         assert_eq!(strip_vision_command("请看看截图"), "请看看截图");
         assert!(!default_vision_prompt().is_empty());
+    }
+
+    #[test]
+    fn pure_images_are_social_unless_a_visual_request_is_pending() {
+        assert_eq!(
+            classify_image_intent("", true, false, false, false, false),
+            ImageIntent::Social
+        );
+        assert_eq!(
+            classify_image_intent("", true, false, false, false, true),
+            ImageIntent::VisualUnderstand
+        );
+    }
+
+    #[test]
+    fn conversational_image_text_does_not_trigger_vision() {
+        assert_eq!(
+            classify_image_intent("我现在就是这样", true, false, false, false, false),
+            ImageIntent::Conversational
+        );
+        assert_eq!(
+            classify_image_intent("帮我看看图里的报错", true, false, false, false, false),
+            ImageIntent::VisualUnderstand
+        );
+        assert!(message_requests_image("方便的话把截图发给我看看"));
     }
 
     #[test]
