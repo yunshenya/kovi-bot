@@ -1,10 +1,12 @@
 //! 由模型自主发起、由程序严格约束的长期记忆查询循环。
 
 use super::interrupt::{ReplyTicket, is_current};
-use super::utils::{BotMemory, Roles, params_model_with_token_limit};
+use super::thinking::ThinkingReporter;
+use super::utils::{BotMemory, Roles, params_model_with_token_limit_and_progress};
 use crate::config;
 use crate::memory::{MEMORY_MANAGER, MemoryEntry, MemoryLookup};
 use crate::vision::VisionImage;
+use std::sync::Arc;
 use std::time::Duration;
 
 const QUERY_START: &str = "[[MEMORY_QUERY]]";
@@ -25,12 +27,19 @@ pub(crate) async fn params_model_with_memory_access(
     reply_ticket: ReplyTicket,
     max_output_tokens: Option<u32>,
     vision_images: &[VisionImage],
+    progress: Option<Arc<ThinkingReporter>>,
 ) -> BotMemory {
     let memory_config = config::get().memory().clone();
     if !memory_config.autonomous_query_enabled() {
-        return interruptible_model_call(messages, reply_ticket, max_output_tokens, vision_images)
-            .await
-            .unwrap_or_else(interrupted_response);
+        return interruptible_model_call(
+            messages,
+            reply_ticket,
+            max_output_tokens,
+            vision_images,
+            progress,
+        )
+        .await
+        .unwrap_or_else(interrupted_response);
     }
 
     let mut request = messages.to_vec();
@@ -40,9 +49,14 @@ pub(crate) async fn params_model_with_memory_access(
     });
 
     for round in 0..memory_config.autonomous_query_max_rounds() {
-        let Some(response) =
-            interruptible_model_call(&mut request, reply_ticket, max_output_tokens, vision_images)
-                .await
+        let Some(response) = interruptible_model_call(
+            &mut request,
+            reply_ticket,
+            max_output_tokens,
+            vision_images,
+            progress.clone(),
+        )
+        .await
         else {
             return interrupted_response();
         };
@@ -102,9 +116,14 @@ pub(crate) async fn params_model_with_memory_access(
         content: "本轮记忆查询次数已用完。请使用已有结果直接回答，不要再输出记忆查询标记。"
             .to_string(),
     });
-    let Some(response) =
-        interruptible_model_call(&mut request, reply_ticket, max_output_tokens, vision_images)
-            .await
+    let Some(response) = interruptible_model_call(
+        &mut request,
+        reply_ticket,
+        max_output_tokens,
+        vision_images,
+        progress,
+    )
+    .await
     else {
         return interrupted_response();
     };
@@ -127,12 +146,18 @@ pub(crate) async fn interruptible_model_call(
     reply_ticket: ReplyTicket,
     max_output_tokens: Option<u32>,
     vision_images: &[VisionImage],
+    progress: Option<Arc<ThinkingReporter>>,
 ) -> Option<BotMemory> {
     if !is_current(reply_ticket).await {
         return None;
     }
     kovi::tokio::select! {
-        response = params_model_with_token_limit(messages, max_output_tokens, vision_images) => {
+        response = params_model_with_token_limit_and_progress(
+            messages,
+            max_output_tokens,
+            vision_images,
+            progress,
+        ) => {
             is_current(reply_ticket).await.then_some(response)
         }
         () = wait_until_interrupted(reply_ticket) => None,

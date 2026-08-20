@@ -13,6 +13,7 @@ use super::memory_query::{interruptible_model_call, params_model_with_memory_acc
 use super::reply::{
     attach_reply_target_context, build_outbound_message, parse_reply_output, sanitize_reply_action,
 };
+use super::thinking::{ThinkingDestination, ThinkingReporter, strip_thinking_notices};
 use crate::config;
 use crate::memory::{BotPersonality, MEMORY_MANAGER, MoodEntry, UserProfile};
 use crate::mood_system::{MOOD_SYSTEM, Mood};
@@ -183,6 +184,17 @@ pub async fn control_model(
         role: Roles::User,
         content: format!("{}:{}", nickname, message),
     });
+    let server_config = config::get().server_config().clone();
+    let thinking_reporter = ThinkingReporter::new(
+        Arc::clone(&bot),
+        ThinkingDestination::Group(group_id),
+        reply_ticket,
+        message,
+        vision_images.len(),
+        server_config.supports_vision(),
+        messages.len(),
+    );
+    thinking_reporter.start().await;
     let rolling_summary =
         maybe_compress_conversation(&mut messages, "group_chat", group_id, reply_ticket).await;
     let system_prompt = group_system_prompt();
@@ -214,8 +226,10 @@ pub async fn control_model(
         reply_ticket,
         max_output_tokens,
         &vision_images,
+        Some(Arc::clone(&thinking_reporter)),
     )
     .await;
+    thinking_reporter.finish().await;
     if !is_current(reply_ticket).await {
         println!("[INFO] 群聊旧回复已被新消息打断 (群组: {})", group_id);
         limit_memory_size(&mut messages);
@@ -483,7 +497,7 @@ async fn summarize_conversation(
             ),
         },
     ];
-    let response = interruptible_model_call(&mut request, reply_ticket, None, &[]).await?;
+    let response = interruptible_model_call(&mut request, reply_ticket, None, &[], None).await?;
     let summary = response
         .content
         .replace(FOLLOW_UP_MARKER, "\n")
@@ -564,6 +578,15 @@ pub(crate) async fn params_model_with_token_limit(
     max_tokens: Option<u32>,
     vision_images: &[VisionImage],
 ) -> BotMemory {
+    params_model_with_token_limit_and_progress(messages, max_tokens, vision_images, None).await
+}
+
+pub(crate) async fn params_model_with_token_limit_and_progress(
+    messages: &mut [BotMemory],
+    max_tokens: Option<u32>,
+    vision_images: &[VisionImage],
+    progress: Option<Arc<ThinkingReporter>>,
+) -> BotMemory {
     let config = config::get();
     let server_config = config.server_config();
 
@@ -574,6 +597,12 @@ pub(crate) async fn params_model_with_token_limit(
         request_messages.push(BotMemory {
             role: Roles::System,
             content: format!("思考过程：{}\n请基于以上思考给出回复。", thinking_prompt),
+        });
+    }
+    if progress.is_some() {
+        request_messages.push(BotMemory {
+            role: Roles::System,
+            content: ThinkingReporter::protocol().to_string(),
         });
     }
 
@@ -603,6 +632,7 @@ pub(crate) async fn params_model_with_token_limit(
         json!({
             "model": server_config.model_name(),
             "input": build_responses_input(&request_messages, model_vision_images),
+            "stream": true,
             "max_output_tokens": max_output_tokens,
         })
     } else {
@@ -610,7 +640,7 @@ pub(crate) async fn params_model_with_token_limit(
         let bot_conf = ModelConf {
             model: server_config.model_name(),
             messages: &request_messages,
-            stream: false,
+            stream: true,
             temperature: 0.7,
             max_tokens: max_output_tokens,
         };
@@ -634,7 +664,7 @@ pub(crate) async fn params_model_with_token_limit(
         Err(error) => return model_error(&format!("模型请求队列已关闭: {error}")),
     };
     let mut last_error = String::new();
-    let mut response_json = None;
+    let mut response_content = None;
     for attempt in 0..=server_config.max_retries() {
         let mut request = MODEL_CLIENT
             .post(server_config.endpoint())
@@ -653,9 +683,9 @@ pub(crate) async fn params_model_with_token_limit(
 
         match result {
             Ok(response) if response.status().is_success() => {
-                match response.json::<Value>().await {
-                    Ok(value) => {
-                        response_json = Some(value);
+                match read_model_content(response, progress.as_deref()).await {
+                    Ok(content) => {
+                        response_content = Some(content);
                         break;
                     }
                     Err(error) => {
@@ -688,19 +718,94 @@ pub(crate) async fn params_model_with_token_limit(
             kovi::tokio::time::sleep(Duration::from_millis(delay_ms)).await;
         }
     }
-    let Some(text) = response_json else {
+    let Some(text) = response_content else {
         return model_error(&last_error);
     };
-    let bot_content = match extract_response_content(&text) {
-        Some(content) => content,
-        None => return model_error("模型响应中缺少可读内容"),
+    let bot_content = strip_thinking_notices(&text).replace("芸汐：", "");
+    if bot_content.trim().is_empty() {
+        return model_error("模型响应中缺少可读内容");
     }
-    .replace("芸汐：", "")
-    .to_string();
     BotMemory {
         role: Roles::Assistant,
         content: bot_content,
     }
+}
+
+async fn read_model_content(
+    mut response: reqwest::Response,
+    reporter: Option<&ThinkingReporter>,
+) -> Result<String, String> {
+    let mut raw_body = Vec::new();
+    let mut pending = Vec::new();
+    let mut streamed_content = String::new();
+
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| format!("模型响应读取失败: {error}"))?
+    {
+        raw_body.extend_from_slice(&chunk);
+        pending.extend_from_slice(&chunk);
+        while let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
+            let line = pending.drain(..=newline).collect::<Vec<_>>();
+            observe_stream_line(&line, &mut streamed_content, reporter).await;
+        }
+    }
+    if !pending.is_empty() {
+        observe_stream_line(&pending, &mut streamed_content, reporter).await;
+    }
+
+    if !streamed_content.trim().is_empty() {
+        return Ok(strip_thinking_notices(&streamed_content));
+    }
+
+    let body =
+        String::from_utf8(raw_body).map_err(|error| format!("模型响应不是有效 UTF-8: {error}"))?;
+    let value: Value =
+        serde_json::from_str(&body).map_err(|error| format!("模型响应解析失败: {error}"))?;
+    let content =
+        extract_response_content(&value).ok_or_else(|| "模型响应中缺少可读内容".to_string())?;
+    if let Some(reporter) = reporter {
+        reporter.observe_model_output(&content).await;
+    }
+    Ok(strip_thinking_notices(&content))
+}
+
+async fn observe_stream_line(
+    line: &[u8],
+    streamed_content: &mut String,
+    reporter: Option<&ThinkingReporter>,
+) {
+    let line = String::from_utf8_lossy(line);
+    let line = line.trim().trim_end_matches('\r');
+    let Some(data) = line.strip_prefix("data:").map(str::trim) else {
+        return;
+    };
+    if data.is_empty() || data == "[DONE]" {
+        return;
+    }
+    let Ok(value) = serde_json::from_str::<Value>(data) else {
+        return;
+    };
+    let Some(delta) = extract_stream_delta(&value) else {
+        return;
+    };
+    streamed_content.push_str(delta);
+    if let Some(reporter) = reporter {
+        reporter.observe_model_output(streamed_content).await;
+    }
+}
+
+fn extract_stream_delta(value: &Value) -> Option<&str> {
+    if value.get("type").and_then(Value::as_str) == Some("response.output_text.delta") {
+        return value.get("delta").and_then(Value::as_str);
+    }
+    value
+        .get("choices")
+        .and_then(|choices| choices.get(0))
+        .and_then(|choice| choice.get("delta"))
+        .and_then(|delta| delta.get("content"))
+        .and_then(Value::as_str)
 }
 
 fn build_model_messages(messages: &[BotMemory], vision_images: &[VisionImage]) -> Vec<Value> {
@@ -1088,6 +1193,17 @@ async fn private_chat_inner(
         role: Roles::User,
         content: format!("{}:{}", nickname, message),
     });
+    let server_config = config::get().server_config().clone();
+    let thinking_reporter = ThinkingReporter::new(
+        Arc::clone(&bot),
+        ThinkingDestination::Private(user_id),
+        reply_ticket,
+        message,
+        vision_images.len(),
+        server_config.supports_vision(),
+        history.len(),
+    );
+    thinking_reporter.start().await;
     let rolling_summary =
         maybe_compress_conversation(&mut history, "private_chat", user_id, reply_ticket).await;
     if let Some(system_message) = history.first_mut() {
@@ -1113,8 +1229,10 @@ async fn private_chat_inner(
         reply_ticket,
         None,
         vision_images,
+        Some(Arc::clone(&thinking_reporter)),
     )
     .await;
+    thinking_reporter.finish().await;
     if !is_current(reply_ticket).await {
         println!("[INFO] 私聊旧回复已被新消息打断 (用户: {})", user_id);
         limit_memory_size(&mut history);
@@ -1558,8 +1676,8 @@ mod tests {
     use super::{
         BotMemory, Roles, VisionImage, build_model_messages, build_responses_input,
         compression_cutoff, extract_interests_from_message, extract_personality_traits,
-        follow_up_delay_millis, is_silent_model_response, limit_memory_size, requests_no_reply,
-        split_reply, with_reference_context,
+        extract_stream_delta, follow_up_delay_millis, is_silent_model_response, limit_memory_size,
+        requests_no_reply, split_reply, with_reference_context,
     };
     use crate::memory::BotPersonality;
     use chrono::Local;
@@ -1619,6 +1737,19 @@ mod tests {
         assert!(request[0]["content"].is_string());
         assert_eq!(request[1]["content"][0]["type"], "input_text");
         assert_eq!(request[1]["content"][1]["type"], "input_image");
+    }
+
+    #[test]
+    fn streaming_deltas_support_responses_and_chat_completions() {
+        let responses_event = serde_json::json!({
+            "type": "response.output_text.delta",
+            "delta": "先看一下"
+        });
+        let chat_event = serde_json::json!({
+            "choices": [{"delta": {"content": "再回答"}}]
+        });
+        assert_eq!(extract_stream_delta(&responses_event), Some("先看一下"));
+        assert_eq!(extract_stream_delta(&chat_event), Some("再回答"));
     }
 
     #[test]
