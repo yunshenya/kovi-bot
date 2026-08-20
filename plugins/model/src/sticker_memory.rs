@@ -4,7 +4,9 @@
 
 use crate::memory::MEMORY_MANAGER;
 use anyhow::{Result, anyhow};
+use kovi::bot::message::Segment;
 use kovi::{Message, RuntimeBot};
+use serde_json::{Map, Value};
 use sqlx::Row;
 use std::collections::HashSet;
 
@@ -14,6 +16,18 @@ const MAX_LABEL_CHARS: usize = 160;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StickerImage {
     key: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct QuotedMessageContext {
+    pub(crate) content: String,
+    pub(crate) sender_id: Option<i64>,
+}
+
+#[derive(Debug)]
+struct FetchedMessage {
+    message: Message,
+    sender_id: Option<i64>,
 }
 
 /// 创建独立表情包表。该表不属于 JSON 记忆快照，因此可单独查询和更新。
@@ -96,6 +110,156 @@ fn reply_message_id(message: &Message) -> Option<i32> {
     })
 }
 
+pub(crate) fn has_reply(message: &Message) -> bool {
+    reply_message_id(message).is_some()
+}
+
+async fn fetch_replied_message(
+    message: &Message,
+    bot: &RuntimeBot,
+) -> Result<Option<FetchedMessage>> {
+    let Some(message_id) = reply_message_id(message) else {
+        return Ok(None);
+    };
+    let response = bot
+        .get_msg(message_id)
+        .await
+        .map_err(|response| anyhow!("读取被引用消息失败: {}", response.retcode))?;
+    let original_message = response
+        .data
+        .get("message")
+        .cloned()
+        .ok_or_else(|| anyhow!("被引用消息缺少消息内容"))?;
+    let original_message = message_from_onebot_value(original_message)?;
+    let sender_id = response
+        .data
+        .pointer("/sender/user_id")
+        .and_then(value_as_i64)
+        .or_else(|| response.data.get("user_id").and_then(value_as_i64));
+
+    Ok(Some(FetchedMessage {
+        message: original_message,
+        sender_id,
+    }))
+}
+
+fn message_from_onebot_value(value: Value) -> Result<Message> {
+    match value {
+        Value::Array(_) => {
+            Message::from_value(value).map_err(|error| anyhow!("解析被引用消息失败: {error}"))
+        }
+        Value::String(cq_message) => Ok(parse_cq_message(&cq_message)),
+        _ => Err(anyhow!("被引用消息格式不受支持")),
+    }
+}
+
+/// 兼容 OneBot `get_msg` 可能返回的 CQ 字符串格式。
+fn parse_cq_message(input: &str) -> Message {
+    let mut segments = Vec::new();
+    let mut rest = input;
+
+    while let Some(start) = rest.find("[CQ:") {
+        if start > 0 {
+            segments.push(Segment::new(
+                "text",
+                serde_json::json!({"text": decode_cq(&rest[..start])}),
+            ));
+        }
+        let after_start = &rest[start + 4..];
+        let Some(end) = after_start.find(']') else {
+            segments.push(Segment::new(
+                "text",
+                serde_json::json!({"text": decode_cq(&rest[start..])}),
+            ));
+            rest = "";
+            break;
+        };
+
+        let mut fields = after_start[..end].split(',');
+        let kind = fields.next().unwrap_or("text");
+        let mut data = Map::new();
+        for field in fields {
+            if let Some((key, value)) = field.split_once('=') {
+                data.insert(key.to_string(), Value::String(decode_cq(value)));
+            }
+        }
+        segments.push(Segment::new(kind, Value::Object(data)));
+        rest = &after_start[end + 1..];
+    }
+
+    if !rest.is_empty() {
+        segments.push(Segment::new(
+            "text",
+            serde_json::json!({"text": decode_cq(rest)}),
+        ));
+    }
+    Message::from(segments)
+}
+
+fn decode_cq(value: &str) -> String {
+    value
+        .replace("&#44;", ",")
+        .replace("&#91;", "[")
+        .replace("&#93;", "]")
+        .replace("&amp;", "&")
+}
+
+fn value_as_i64(value: &Value) -> Option<i64> {
+    value
+        .as_i64()
+        .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+}
+
+fn extract_text(message: &Message) -> String {
+    message
+        .iter()
+        .filter(|segment| segment.type_ == "text")
+        .filter_map(|segment| segment.data.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("")
+        .trim()
+        .to_string()
+}
+
+/// 将被引用消息的文字和已学习表情含义整理成模型可理解的上下文。
+pub(crate) async fn quoted_message_context(
+    message: &Message,
+    bot: &RuntimeBot,
+) -> Result<Option<QuotedMessageContext>> {
+    let Some(quoted) = fetch_replied_message(message, bot).await? else {
+        return Ok(None);
+    };
+    let text = extract_text(&quoted.message);
+    let stickers = extract_stickers(&quoted.message);
+    let labels = known_labels(&stickers).await?;
+    let content = if !labels.is_empty() {
+        with_sticker_context(&text, &labels)
+    } else if !text.is_empty() {
+        text
+    } else if !stickers.is_empty() {
+        "对方发送了一张尚未学习含义的表情包。".to_string()
+    } else {
+        quoted.message.to_human_string()
+    };
+
+    Ok(Some(QuotedMessageContext {
+        content,
+        sender_id: quoted.sender_id,
+    }))
+}
+
+pub(crate) fn with_quoted_context(current: &str, quoted: &QuotedMessageContext) -> String {
+    let current = current.trim();
+    if current.is_empty() {
+        format!("当前消息正在回复以下内容：\n{}", quoted.content)
+    } else {
+        format!(
+            "当前消息正在回复以下内容：\n{}\n当前消息：{}",
+            quoted.content, current
+        )
+    }
+}
+
 /// 教学时优先使用当前消息携带的表情；如果没有，则读取被引用消息中的表情。
 pub(crate) async fn stickers_for_teaching(
     message: &Message,
@@ -106,21 +270,10 @@ pub(crate) async fn stickers_for_teaching(
         return Ok(stickers);
     }
 
-    let message_id =
-        reply_message_id(message).ok_or_else(|| anyhow!("教学消息没有携带或引用表情包"))?;
-    let response = bot
-        .get_msg(message_id)
-        .await
-        .map_err(|response| anyhow!("读取被引用消息失败: {}", response.retcode))?;
-    let original_message = response
-        .data
-        .get("message")
-        .cloned()
-        .ok_or_else(|| anyhow!("被引用消息缺少消息内容"))?;
-    let original_message = Message::from_value(original_message)
-        .map_err(|error| anyhow!("解析被引用消息失败: {error}"))?;
-
-    Ok(extract_stickers(&original_message))
+    let original_message = fetch_replied_message(message, bot)
+        .await?
+        .ok_or_else(|| anyhow!("教学消息没有携带或引用表情包"))?;
+    Ok(extract_stickers(&original_message.message))
 }
 
 fn value_as_identifier(data: &serde_json::Value, fields: &[&str]) -> Option<String> {
@@ -234,7 +387,9 @@ pub(crate) fn with_sticker_context(text: &str, labels: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        StickerImage, extract_stickers, reply_message_id, teaching_label, with_sticker_context,
+        QuotedMessageContext, StickerImage, extract_stickers, extract_text,
+        message_from_onebot_value, reply_message_id, teaching_label, with_quoted_context,
+        with_sticker_context,
     };
     use kovi::Message;
     use kovi::bot::message::Segment;
@@ -278,6 +433,33 @@ mod tests {
         let number_id = Message::from(vec![Segment::new("reply", json!({"id": 67890}))]);
         assert_eq!(reply_message_id(&string_id), Some(12345));
         assert_eq!(reply_message_id(&number_id), Some(67890));
+    }
+
+    #[test]
+    fn parses_cq_string_returned_by_get_msg() {
+        let message = message_from_onebot_value(json!(
+            "前文[CQ:image,file=sticker-123,url=https://example.com/a&#44;b]后文"
+        ))
+        .unwrap();
+        assert_eq!(extract_text(&message), "前文后文");
+        assert_eq!(
+            extract_stickers(&message),
+            vec![StickerImage {
+                key: "image:sticker-123".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn quoted_context_is_explicit_for_the_model() {
+        let quoted = QuotedMessageContext {
+            content: "上一句话".to_string(),
+            sender_id: Some(42),
+        };
+        assert_eq!(
+            with_quoted_context("你说得对", &quoted),
+            "当前消息正在回复以下内容：\n上一句话\n当前消息：你说得对"
+        );
     }
 
     #[test]

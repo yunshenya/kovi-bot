@@ -5,8 +5,8 @@ use crate::model::utils::{
     learn_user_profile_from_message, requests_no_reply, send_sys_info, silence,
 };
 use crate::sticker_memory::{
-    extract_stickers, known_labels, stickers_for_teaching, teach, teaching_label,
-    with_sticker_context,
+    extract_stickers, has_reply, known_labels, quoted_message_context, stickers_for_teaching,
+    teach, teaching_label, with_quoted_context, with_sticker_context,
 };
 use chrono::Local;
 use kovi::RuntimeBot;
@@ -51,10 +51,14 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
                     }
                 }
             }
-            Ok(_) | Err(_) => bot.send_group_msg(
+            Ok(_) => bot.send_group_msg(
                 group_id,
                 "请回复（引用）那张表情包，再发送 #教芸汐 这个表情是……哦。",
             ),
+            Err(error) => {
+                eprintln!("[ERROR] 群聊读取被引用表情失败: {}", error);
+                bot.send_group_msg(group_id, "我没能读到被引用的表情，请重新引用后再试一次哦。");
+            }
         }
         return;
     }
@@ -71,15 +75,26 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
             Vec::new()
         }
     };
+    let quoted = match quoted_message_context(&event.message, &bot).await {
+        Ok(quoted) => quoted,
+        Err(error) => {
+            eprintln!("[ERROR] 群聊读取引用消息失败: {}", error);
+            None
+        }
+    };
     // 没有文字的陌生表情不触发模型，也不消耗 token。
-    if message.trim().is_empty() && !stickers.is_empty() && labels.is_empty() {
+    if message.trim().is_empty() && !stickers.is_empty() && labels.is_empty() && quoted.is_none() {
         println!("[INFO] 收到未学习群表情，保持静默 (群组: {})", group_id);
         return;
     }
-    if message.trim().is_empty() && stickers.is_empty() {
+    if message.trim().is_empty() && stickers.is_empty() && !has_reply(&event.message) {
         return;
     }
-    let model_message = with_sticker_context(message, &labels);
+    let current_message = with_sticker_context(message, &labels);
+    let model_message = quoted.as_ref().map_or(current_message.clone(), |quoted| {
+        with_quoted_context(&current_message, quoted)
+    });
+    let replies_to_bot = quoted.as_ref().and_then(|quoted| quoted.sender_id) == Some(event.self_id);
 
     if !message.trim().is_empty() {
         update_group_profile(group_id, event.user_id, message, &nickname).await;
@@ -164,7 +179,9 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
         }
         _ => {
             // 被点名时始终处理；未点名消息仅由本地节流器偶尔抽样，不逐条调用模型。
-            if is_addressed_to_bot(&event, message) || matches!(message, "#禁言" | "#结束禁言")
+            if is_addressed_to_bot(&event, message)
+                || replies_to_bot
+                || matches!(message, "#禁言" | "#结束禁言")
             {
                 if silence(group_id, &model_message, bot, sender).await {
                     activate_conversation_window(group_id).await;
@@ -173,8 +190,6 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
                 println!("[INFO] 群聊接续对话 (群组: {})", group_id);
                 if silence(group_id, &model_message, bot, sender).await {
                     activate_conversation_window(group_id).await;
-                } else {
-                    close_conversation_window(group_id).await;
                 }
             } else if should_interject(group_id, message).await {
                 println!("[INFO] 群聊未点名接话 (群组: {})", group_id);
@@ -209,12 +224,6 @@ async fn activate_conversation_window(group_id: i64) {
     states.entry(group_id).or_default().conversation_until = Some(Instant::now() + duration);
 }
 
-async fn close_conversation_window(group_id: i64) {
-    if let Some(state) = GROUP_INTERJECTION_STATE.lock().await.get_mut(&group_id) {
-        state.conversation_until = None;
-    }
-}
-
 /// 在窗口内，仅对本地判断像在继续聊天的消息调用模型；无关消息仍不消耗 token。
 async fn should_continue_conversation(group_id: i64, message: &str) -> bool {
     if !is_conversation_follow_up(message) {
@@ -226,6 +235,15 @@ async fn should_continue_conversation(group_id: i64, message: &str) -> bool {
         return false;
     };
     if has_active_conversation_window(state.conversation_until, Instant::now()) {
+        // 每条自然接续消息都滚动续期，因此活跃对话可以跨越任意多个窗口。
+        state.conversation_until = Some(
+            Instant::now()
+                + Duration::from_secs(
+                    config::get()
+                        .group_interjection()
+                        .conversation_window_secs(),
+                ),
+        );
         true
     } else {
         state.conversation_until = None;

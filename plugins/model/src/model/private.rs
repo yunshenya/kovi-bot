@@ -1,7 +1,7 @@
 use crate::model::utils::{private_chat, requests_no_reply};
 use crate::sticker_memory::{
-    extract_stickers, known_labels, stickers_for_teaching, teach, teaching_label,
-    with_sticker_context,
+    extract_stickers, has_reply, known_labels, quoted_message_context, stickers_for_teaching,
+    teach, teaching_label, with_quoted_context, with_sticker_context,
 };
 use kovi::RuntimeBot;
 use kovi::event::PrivateMsgEvent;
@@ -27,10 +27,14 @@ pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<Runtime
                     }
                 }
             }
-            Ok(_) | Err(_) => bot.send_private_msg(
+            Ok(_) => bot.send_private_msg(
                 user_id,
                 "请回复（引用）那张表情包，再发送 #教芸汐 这个表情是……哦。",
             ),
+            Err(error) => {
+                eprintln!("[ERROR] 私聊读取被引用表情失败: {}", error);
+                bot.send_private_msg(user_id, "我没能读到被引用的表情，请重新引用后再试一次哦。");
+            }
         }
         return;
     }
@@ -47,15 +51,25 @@ pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<Runtime
             Vec::new()
         }
     };
+    let quoted = match quoted_message_context(&event.message, &bot).await {
+        Ok(quoted) => quoted,
+        Err(error) => {
+            eprintln!("[ERROR] 私聊读取引用消息失败: {}", error);
+            None
+        }
+    };
     // 陌生且没有文字的表情默认保持静默，不请求模型。
-    if message.trim().is_empty() && !stickers.is_empty() && labels.is_empty() {
+    if message.trim().is_empty() && !stickers.is_empty() && labels.is_empty() && quoted.is_none() {
         println!("[INFO] 收到未学习私聊表情，保持静默 (用户: {})", user_id);
         return;
     }
-    if message.trim().is_empty() && stickers.is_empty() {
+    if message.trim().is_empty() && stickers.is_empty() && !has_reply(&event.message) {
         return;
     }
 
-    let model_message = with_sticker_context(message, &labels);
+    let current_message = with_sticker_context(message, &labels);
+    let model_message = quoted.as_ref().map_or(current_message.clone(), |quoted| {
+        with_quoted_context(&current_message, quoted)
+    });
     private_chat(user_id, &model_message, nick_name, bot).await;
 }
