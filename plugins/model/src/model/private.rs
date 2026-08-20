@@ -50,6 +50,7 @@ pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<Runtime
     }
 
     if requests_no_reply(message) {
+        PRIVATE_MESSAGE_BATCHES.cancel(user_id).await;
         println!("[INFO] 私聊明确要求不回复 (用户: {})", user_id);
         return;
     }
@@ -82,20 +83,25 @@ pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<Runtime
     let model_message = quoted.as_ref().map_or(current_message.clone(), |quoted| {
         with_quoted_context(&current_message, quoted)
     });
-    let model_message = if !message.trim().is_empty()
-        && stickers.is_empty()
-        && quoted.is_none()
-        && !message.trim_start().starts_with('#')
-    {
+    let (model_message, plain_text) = if !message.trim_start().starts_with('#') {
         let Some(combined) = PRIVATE_MESSAGE_BATCHES
-            .push(user_id, model_message, false)
+            .push(
+                user_id,
+                model_message,
+                false,
+                stickers.is_empty() && quoted.is_none(),
+            )
             .await
         else {
             return;
         };
-        combined.text
+        (combined.text, combined.plain_text)
     } else {
-        model_message
+        (model_message, false)
     };
+    if plain_text && requests_no_reply(&model_message) {
+        println!("[INFO] 合并后的私聊消息明确要求不回复 (用户: {})", user_id);
+        return;
+    }
     private_chat(user_id, &model_message, nick_name, bot).await;
 }

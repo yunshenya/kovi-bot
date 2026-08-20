@@ -44,6 +44,15 @@ autonomous_query_max_rounds = 2
 autonomous_query_max_results = 8
 autonomous_query_max_days = 3650
 
+[message_batch]
+enabled = true
+complete_delay_ms = 900
+normal_delay_ms = 1600
+incomplete_delay_ms = 2300
+max_wait_ms = 5000
+max_parts = 6
+max_chars = 500
+
 [mood]
 cache_ttl_secs = 300
 cache_retention_secs = 3600

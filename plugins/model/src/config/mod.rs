@@ -9,6 +9,7 @@
 
 use crate::config::group_interjection::GroupInterjectionConfig;
 use crate::config::memory::MemoryConfig;
+use crate::config::message_batch::MessageBatchConfig;
 use crate::config::mood::MoodConfig;
 use crate::config::proactive::ProactiveConfig;
 use crate::config::prompt::Prompt;
@@ -28,6 +29,7 @@ use std::time::Duration;
 
 mod group_interjection;
 mod memory;
+mod message_batch;
 mod mood;
 mod proactive;
 mod prompt;
@@ -65,6 +67,8 @@ pub struct ModelConfig {
     group_interjection: GroupInterjectionConfig,
     /// 长期记忆与短期上下文配置
     memory: MemoryConfig,
+    /// 连续消息气泡的本地合并配置
+    message_batch: MessageBatchConfig,
     /// 情绪缓存与自然漂移配置
     mood: MoodConfig,
     /// 话题去重配置
@@ -104,6 +108,7 @@ impl ModelConfig {
         self.proactive.validate()?;
         self.group_interjection.validate()?;
         self.memory.validate()?;
+        self.message_batch.validate()?;
         self.mood.validate()?;
         self.topic.validate()?;
 
@@ -129,6 +134,10 @@ impl ModelConfig {
 
     pub fn memory(&self) -> &MemoryConfig {
         &self.memory
+    }
+
+    pub fn message_batch(&self) -> &MessageBatchConfig {
+        &self.message_batch
     }
 
     pub fn mood(&self) -> &MoodConfig {

@@ -88,6 +88,9 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
     }
 
     if requests_no_reply(message) {
+        GROUP_MESSAGE_BATCHES
+            .cancel((group_id, event.user_id))
+            .await;
         println!("[INFO] 群聊明确要求不回复 (群组: {})", group_id);
         return;
     }
@@ -120,9 +123,29 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
     });
     let replies_to_bot = quoted.as_ref().and_then(|quoted| quoted.sender_id) == Some(event.self_id);
     let addressed_to_bot = is_addressed_to_bot(&event, message) || replies_to_bot;
+    let (model_message, addressed_to_bot, plain_text) = if !message.trim_start().starts_with('#') {
+        let Some(combined) = GROUP_MESSAGE_BATCHES
+            .push(
+                (group_id, event.user_id),
+                model_message,
+                addressed_to_bot,
+                stickers.is_empty() && quoted.is_none(),
+            )
+            .await
+        else {
+            return;
+        };
+        (combined.text, combined.addressed, combined.plain_text)
+    } else {
+        (model_message, addressed_to_bot, false)
+    };
+    if plain_text && requests_no_reply(&model_message) {
+        println!("[INFO] 合并后的群聊消息明确要求不回复 (群组: {})", group_id);
+        return;
+    }
     if addressed_to_bot
         && !is_bot_admin(&bot, event.user_id)
-        && should_suppress_direct_trigger(group_id, event.user_id, message).await
+        && should_suppress_direct_trigger(group_id, event.user_id, &model_message).await
     {
         println!(
             "[INFO] 群聊重复或高频点名已静默 (群组: {}, 用户: {})",
@@ -130,21 +153,6 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
         );
         return;
     }
-    let (model_message, addressed_to_bot) = if !message.trim().is_empty()
-        && stickers.is_empty()
-        && quoted.is_none()
-        && !message.trim_start().starts_with('#')
-    {
-        let Some(combined) = GROUP_MESSAGE_BATCHES
-            .push((group_id, event.user_id), model_message, addressed_to_bot)
-            .await
-        else {
-            return;
-        };
-        (combined.text, combined.addressed)
-    } else {
-        (model_message, addressed_to_bot)
-    };
 
     if !message.trim().is_empty() {
         update_group_profile(group_id, event.user_id, message, &nickname).await;

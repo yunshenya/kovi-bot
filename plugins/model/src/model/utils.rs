@@ -1368,6 +1368,7 @@ mod tests {
     #[test]
     fn explicit_no_reply_requests_never_reach_the_model() {
         assert!(requests_no_reply("别回复我这条消息"));
+        assert!(requests_no_reply("别回复我\n这条消息"));
         assert!(requests_no_reply("这条不用回。"));
         assert!(requests_no_reply("不用回复这条消息！"));
         assert!(requests_no_reply("本条消息请不要回复，谢谢"));
