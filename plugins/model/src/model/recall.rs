@@ -18,8 +18,15 @@ struct ActiveReply {
     sent_message_ids: Vec<i32>,
 }
 
+struct RecentReply {
+    source_message_ids: Vec<i32>,
+    sent_message_ids: Vec<i32>,
+    finished_at: Instant,
+}
+
 struct ReplyLifecycle {
     active: Option<ActiveReply>,
+    recent_replies: Vec<RecentReply>,
     recalled_message_ids: HashMap<i32, Instant>,
     last_seen: Instant,
 }
@@ -28,6 +35,7 @@ impl Default for ReplyLifecycle {
     fn default() -> Self {
         Self {
             active: None,
+            recent_replies: Vec::new(),
             recalled_message_ids: HashMap::new(),
             last_seen: Instant::now(),
         }
@@ -64,12 +72,18 @@ pub(crate) async fn begin_reply(
 pub(crate) async fn finish_reply(scope: ReplyScope, ticket: ReplyTicket) {
     let mut lifecycles = REPLY_LIFECYCLES.lock().await;
     if let Some(lifecycle) = lifecycles.get_mut(&scope) {
-        if lifecycle
-            .active
-            .as_ref()
-            .is_some_and(|active| active.ticket == ticket)
-        {
-            lifecycle.active = None;
+        if let Some(active) = lifecycle.active.take() {
+            if active.ticket == ticket {
+                if !active.sent_message_ids.is_empty() {
+                    lifecycle.recent_replies.push(RecentReply {
+                        source_message_ids: active.source_message_ids,
+                        sent_message_ids: active.sent_message_ids,
+                        finished_at: Instant::now(),
+                    });
+                }
+            } else {
+                lifecycle.active = Some(active);
+            }
         }
         lifecycle.last_seen = Instant::now();
     }
@@ -131,16 +145,25 @@ pub(crate) async fn handle_recalled_message(
             .recalled_message_ids
             .insert(message_id, Instant::now());
 
-        match lifecycle.active.take() {
-            Some(active) if active.source_message_ids.contains(&message_id) => {
-                (Some(active.ticket), active.sent_message_ids)
-            }
-            Some(active) => {
+        let mut ticket = None;
+        let mut sent_message_ids = Vec::new();
+        if let Some(active) = lifecycle.active.take() {
+            if active.source_message_ids.contains(&message_id) {
+                ticket = Some(active.ticket);
+                sent_message_ids.extend(active.sent_message_ids);
+            } else {
                 lifecycle.active = Some(active);
-                (None, Vec::new())
             }
-            None => (None, Vec::new()),
         }
+        lifecycle.recent_replies.retain(|recent| {
+            if recent.source_message_ids.contains(&message_id) {
+                sent_message_ids.extend(recent.sent_message_ids.iter().copied());
+                false
+            } else {
+                true
+            }
+        });
+        (ticket, sent_message_ids)
     };
 
     if ticket.is_some() {
@@ -184,6 +207,9 @@ fn prune_lifecycles(lifecycles: &mut HashMap<ReplyScope, ReplyLifecycle>) {
         lifecycle
             .recalled_message_ids
             .retain(|_, seen_at| now.duration_since(*seen_at) < RECALLED_MESSAGE_RETENTION);
+        lifecycle
+            .recent_replies
+            .retain(|recent| now.duration_since(recent.finished_at) < RECALLED_MESSAGE_RETENTION);
     }
     if lifecycles.len() > 2_048 {
         lifecycles.retain(|_, lifecycle| {
