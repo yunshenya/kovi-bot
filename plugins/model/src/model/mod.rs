@@ -1,5 +1,6 @@
 mod coalesce;
 mod group;
+mod interrupt;
 mod memory_query;
 mod private;
 pub(crate) mod utils;

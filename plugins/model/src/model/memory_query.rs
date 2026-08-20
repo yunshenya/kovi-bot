@@ -1,8 +1,10 @@
 //! 由模型自主发起、由程序严格约束的长期记忆查询循环。
 
+use super::interrupt::{ReplyTicket, is_current};
 use super::utils::{BotMemory, Roles, params_model};
 use crate::config;
 use crate::memory::{MEMORY_MANAGER, MemoryEntry, MemoryLookup};
+use std::time::Duration;
 
 const QUERY_START: &str = "[[MEMORY_QUERY]]";
 const QUERY_END: &str = "[[/MEMORY_QUERY]]";
@@ -19,10 +21,13 @@ pub(crate) async fn params_model_with_memory_access(
     messages: &mut [BotMemory],
     subject_id: i64,
     context: &str,
+    reply_ticket: ReplyTicket,
 ) -> BotMemory {
     let memory_config = config::get().memory().clone();
     if !memory_config.autonomous_query_enabled() {
-        return params_model(messages).await;
+        return interruptible_model_call(messages, reply_ticket)
+            .await
+            .unwrap_or_else(interrupted_response);
     }
 
     let mut request = messages.to_vec();
@@ -32,7 +37,9 @@ pub(crate) async fn params_model_with_memory_access(
     });
 
     for round in 0..memory_config.autonomous_query_max_rounds() {
-        let response = params_model(&mut request).await;
+        let Some(response) = interruptible_model_call(&mut request, reply_ticket).await else {
+            return interrupted_response();
+        };
         match parse_memory_query(&response.content) {
             ParsedMemoryQuery::None => return response,
             ParsedMemoryQuery::Invalid(reason) => {
@@ -89,7 +96,9 @@ pub(crate) async fn params_model_with_memory_access(
         content: "本轮记忆查询次数已用完。请使用已有结果直接回答，不要再输出记忆查询标记。"
             .to_string(),
     });
-    let response = params_model(&mut request).await;
+    let Some(response) = interruptible_model_call(&mut request, reply_ticket).await else {
+        return interrupted_response();
+    };
     if matches!(
         parse_memory_query(&response.content),
         ParsedMemoryQuery::None
@@ -100,6 +109,35 @@ pub(crate) async fn params_model_with_memory_access(
             role: Roles::Assistant,
             content: "我一时没能从记忆里找到合适的内容……可以再给我一点提示吗？".to_string(),
         }
+    }
+}
+
+/// 模型请求期间轮询会话代数；一旦有新消息，立即丢弃网络 future 并让下一轮接管。
+pub(crate) async fn interruptible_model_call(
+    messages: &mut [BotMemory],
+    reply_ticket: ReplyTicket,
+) -> Option<BotMemory> {
+    if !is_current(reply_ticket).await {
+        return None;
+    }
+    kovi::tokio::select! {
+        response = params_model(messages) => {
+            is_current(reply_ticket).await.then_some(response)
+        }
+        () = wait_until_interrupted(reply_ticket) => None,
+    }
+}
+
+async fn wait_until_interrupted(reply_ticket: ReplyTicket) {
+    while is_current(reply_ticket).await {
+        kovi::tokio::time::sleep(Duration::from_millis(75)).await;
+    }
+}
+
+fn interrupted_response() -> BotMemory {
+    BotMemory {
+        role: Roles::Assistant,
+        content: "[sp]".to_string(),
     }
 }
 

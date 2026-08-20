@@ -2,6 +2,7 @@ use crate::config;
 use crate::health_check::HealthChecker;
 use crate::memory::{GroupProfile, MEMORY_MANAGER};
 use crate::model::coalesce::MessageCoalescer;
+use crate::model::interrupt::{ReplyScope, interrupt, is_active, is_explicit_stop_message};
 use crate::model::utils::{
     learn_user_profile_from_message, requests_no_reply, send_sys_info, silence,
 };
@@ -55,6 +56,28 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
     let message = event.borrow_text().unwrap_or_default();
     let stickers = extract_stickers(&event.message);
     let sticker_scope = StickerScope::Group(group_id);
+    let reply_scope = ReplyScope::Group(group_id);
+    let directly_addressed = is_addressed_to_bot(&event, message);
+    let explicit_stop = is_explicit_stop_message(message);
+    let asks_for_silence = explicit_stop || requests_no_reply(message);
+    let looks_like_follow_up = asks_for_silence || is_conversation_follow_up(message);
+    let can_interrupt = directly_addressed
+        || asks_for_silence
+        || (looks_like_follow_up
+            && (is_active(reply_scope).await || has_conversation_window(group_id).await));
+    let mut reply_ticket = if can_interrupt {
+        Some(interrupt(reply_scope).await)
+    } else {
+        None
+    };
+
+    if asks_for_silence && can_interrupt {
+        GROUP_MESSAGE_BATCHES
+            .cancel((group_id, event.user_id))
+            .await;
+        println!("[INFO] 群聊用户打断回复 (群组: {})", group_id);
+        return;
+    }
 
     if is_admin_command(message) && !is_bot_admin(&bot, event.user_id) {
         bot.send_group_msg(group_id, "这个命令只有管理员可以使用哦。");
@@ -122,7 +145,17 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
         with_quoted_context(&current_message, quoted)
     });
     let replies_to_bot = quoted.as_ref().and_then(|quoted| quoted.sender_id) == Some(event.self_id);
-    let addressed_to_bot = is_addressed_to_bot(&event, message) || replies_to_bot;
+    if replies_to_bot && reply_ticket.is_none() {
+        reply_ticket = Some(interrupt(reply_scope).await);
+    }
+    if explicit_stop && replies_to_bot {
+        GROUP_MESSAGE_BATCHES
+            .cancel((group_id, event.user_id))
+            .await;
+        println!("[INFO] 群聊引用消息打断回复 (群组: {})", group_id);
+        return;
+    }
+    let addressed_to_bot = directly_addressed || replies_to_bot;
     let (model_message, addressed_to_bot, plain_text) = if !message.trim_start().starts_with('#') {
         let Some(combined) = GROUP_MESSAGE_BATCHES
             .push(
@@ -238,17 +271,26 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
         _ => {
             // 被点名时始终处理；未点名消息仅由本地节流器偶尔抽样，不逐条调用模型。
             if addressed_to_bot || matches!(message.trim(), "#禁言" | "#结束禁言") {
-                if silence(group_id, &model_message, bot, sender).await {
+                let ticket = match reply_ticket {
+                    Some(ticket) => ticket,
+                    None => interrupt(reply_scope).await,
+                };
+                if silence(group_id, &model_message, bot, sender, ticket).await {
                     activate_conversation_window(group_id).await;
                 }
             } else if should_continue_conversation(group_id, &model_message).await {
                 println!("[INFO] 群聊接续对话 (群组: {})", group_id);
-                if silence(group_id, &model_message, bot, sender).await {
+                let ticket = match reply_ticket {
+                    Some(ticket) => ticket,
+                    None => interrupt(reply_scope).await,
+                };
+                if silence(group_id, &model_message, bot, sender, ticket).await {
                     activate_conversation_window(group_id).await;
                 }
             } else if should_interject(group_id, &model_message).await {
                 println!("[INFO] 群聊未点名接话 (群组: {})", group_id);
-                if silence(group_id, &model_message, bot, sender).await {
+                let ticket = interrupt(reply_scope).await;
+                if silence(group_id, &model_message, bot, sender, ticket).await {
                     activate_conversation_window(group_id).await;
                 }
             } else if let Err(error) = MEMORY_MANAGER
@@ -381,6 +423,17 @@ async fn activate_conversation_window(group_id: i64) {
     let mut states = GROUP_INTERJECTION_STATE.lock().await;
     prune_interjection_states(&mut states);
     states.entry(group_id).or_default().conversation_until = Some(Instant::now() + duration);
+}
+
+/// 只读取窗口状态，不续期；用于判断新消息是否有资格打断正在生成或发送的回复。
+async fn has_conversation_window(group_id: i64) -> bool {
+    GROUP_INTERJECTION_STATE
+        .lock()
+        .await
+        .get(&group_id)
+        .is_some_and(|state| {
+            has_active_conversation_window(state.conversation_until, Instant::now())
+        })
 }
 
 /// 在窗口内，仅对本地判断像在继续聊天的消息调用模型；无关消息仍不消耗 token。

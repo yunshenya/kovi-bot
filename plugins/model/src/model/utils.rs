@@ -8,7 +8,8 @@
 //! - 用户档案管理
 //! - 系统状态监控
 
-use super::memory_query::params_model_with_memory_access;
+use super::interrupt::{ReplyTicket, finish, is_current, mark_active};
+use super::memory_query::{interruptible_model_call, params_model_with_memory_access};
 use crate::config;
 use crate::memory::{BotPersonality, MEMORY_MANAGER, MoodEntry, UserProfile};
 use crate::mood_system::{MOOD_SYSTEM, Mood};
@@ -125,6 +126,7 @@ pub async fn control_model(
     bot: Arc<RuntimeBot>,
     nickname: String,
     message: &str,
+    reply_ticket: ReplyTicket,
 ) -> bool {
     // 分析情绪并更新
     if let Err(e) = MOOD_SYSTEM
@@ -169,7 +171,8 @@ pub async fn control_model(
         role: Roles::User,
         content: format!("{}:{}", nickname, message),
     });
-    let rolling_summary = maybe_compress_conversation(&mut messages, "group_chat", group_id).await;
+    let rolling_summary =
+        maybe_compress_conversation(&mut messages, "group_chat", group_id, reply_ticket).await;
     let system_prompt = group_system_prompt();
     if let Some(first) = messages.first_mut() {
         first.content = system_prompt;
@@ -187,8 +190,18 @@ pub async fn control_model(
         &contextual_memories,
         rolling_summary.as_deref(),
     );
-    let response =
-        params_model_with_memory_access(&mut request_messages, group_id, "group_chat").await;
+    let response = params_model_with_memory_access(
+        &mut request_messages,
+        group_id,
+        "group_chat",
+        reply_ticket,
+    )
+    .await;
+    if !is_current(reply_ticket).await {
+        println!("[INFO] 群聊旧回复已被新消息打断 (群组: {})", group_id);
+        limit_memory_size(&mut messages);
+        return false;
+    }
     if is_model_error_response(&response.content) {
         bot.send_group_msg(group_id, "我这里暂时有点连不上，等一会儿再和我说一次吧。");
         limit_memory_size(&mut messages);
@@ -196,18 +209,32 @@ pub async fn control_model(
     }
     if !response.content.contains("[sp]") {
         let outbound_messages = split_reply(&response.content);
-        let stored_reply = outbound_messages.join("\n");
         let personality = MEMORY_MANAGER.get_bot_personality().await;
+        let mut sent_messages = Vec::new();
         for (index, outbound_message) in outbound_messages.iter().enumerate() {
+            if !is_current(reply_ticket).await {
+                break;
+            }
             if index > 0 {
                 kovi::tokio::time::sleep(follow_up_delay(&personality, index)).await;
+                if !is_current(reply_ticket).await {
+                    break;
+                }
             }
             bot.send_group_msg(group_id, outbound_message);
+            sent_messages.push(outbound_message.clone());
         }
+        if sent_messages.is_empty() {
+            println!("[INFO] 群聊回复在发送前被打断 (群组: {})", group_id);
+            limit_memory_size(&mut messages);
+            return false;
+        }
+        let stored_reply = sent_messages.join("\n");
         println!(
-            "[INFO] 群聊消息已发送 (群组: {}, 分段: {})",
+            "[INFO] 群聊消息已发送 (群组: {}, 已发: {}, 取消: {})",
             group_id,
-            outbound_messages.len()
+            sent_messages.len(),
+            outbound_messages.len().saturating_sub(sent_messages.len())
         );
         if let Err(error) = MEMORY_MANAGER
             .add_conversation_memory(group_id, &format!("芸汐: {}", stored_reply), "group_chat")
@@ -312,6 +339,7 @@ async fn maybe_compress_conversation(
     messages: &mut Vec<BotMemory>,
     context: &str,
     subject_id: i64,
+    reply_ticket: ReplyTicket,
 ) -> Option<String> {
     let memory_config = config::get().memory().clone();
     let previous_summary = MEMORY_MANAGER
@@ -327,12 +355,16 @@ async fn maybe_compress_conversation(
     };
 
     let compressed_messages = messages[1..compress_end].to_vec();
-    let summary = summarize_conversation(
+    let Some(summary) = summarize_conversation(
         previous_summary.as_deref(),
         &compressed_messages,
         memory_config.summary_max_chars(),
+        reply_ticket,
     )
-    .await;
+    .await
+    else {
+        return previous_summary;
+    };
     messages.drain(1..compress_end);
 
     if let Err(error) = MEMORY_MANAGER
@@ -399,7 +431,8 @@ async fn summarize_conversation(
     previous_summary: Option<&str>,
     messages: &[BotMemory],
     max_chars: usize,
-) -> String {
+    reply_ticket: ReplyTicket,
+) -> Option<String> {
     let transcript = conversation_transcript(messages, max_chars.saturating_mul(3));
     let mut request = vec![
         BotMemory {
@@ -419,16 +452,16 @@ async fn summarize_conversation(
             ),
         },
     ];
-    let response = params_model(&mut request).await;
+    let response = interruptible_model_call(&mut request, reply_ticket).await?;
     let summary = response
         .content
         .replace(FOLLOW_UP_MARKER, "\n")
         .trim()
         .to_string();
     if summary.is_empty() || summary.starts_with("抱歉，模型服务暂时不可用") {
-        return fallback_summary(previous_summary, &transcript, max_chars);
+        return Some(fallback_summary(previous_summary, &transcript, max_chars));
     }
-    truncate_chars(&summary, max_chars)
+    Some(truncate_chars(&summary, max_chars))
 }
 
 fn conversation_transcript(messages: &[BotMemory], max_chars: usize) -> String {
@@ -719,7 +752,13 @@ async fn touch_runtime_history(
     evicted
 }
 
-pub async fn silence(group_id: i64, message: &str, bot: Arc<RuntimeBot>, sender: String) -> bool {
+pub async fn silence(
+    group_id: i64,
+    message: &str,
+    bot: Arc<RuntimeBot>,
+    sender: String,
+    reply_ticket: ReplyTicket,
+) -> bool {
     if message.trim() == "#禁言" {
         instance_is_ban().lock().await.insert(group_id, true);
         bot.send_group_msg(group_id, "禁言成功");
@@ -738,7 +777,12 @@ pub async fn silence(group_id: i64, message: &str, bot: Arc<RuntimeBot>, sender:
         .get(&group_id)
         .unwrap_or(&false);
     if !is_banned {
-        control_model(group_id, bot, sender, message).await
+        if !mark_active(reply_ticket).await {
+            return false;
+        }
+        let replied = control_model(group_id, bot, sender, message, reply_ticket).await;
+        finish(reply_ticket).await;
+        replied
     } else {
         false
     }
@@ -773,7 +817,27 @@ pub async fn send_sys_info(bot: Arc<RuntimeBot>, group_id: i64) {
     }
 }
 
-pub async fn private_chat(user_id: i64, message: &str, nickname: String, bot: Arc<RuntimeBot>) {
+pub async fn private_chat(
+    user_id: i64,
+    message: &str,
+    nickname: String,
+    bot: Arc<RuntimeBot>,
+    reply_ticket: ReplyTicket,
+) {
+    if !mark_active(reply_ticket).await {
+        return;
+    }
+    private_chat_inner(user_id, message, nickname, bot, reply_ticket).await;
+    finish(reply_ticket).await;
+}
+
+async fn private_chat_inner(
+    user_id: i64,
+    message: &str,
+    nickname: String,
+    bot: Arc<RuntimeBot>,
+    reply_ticket: ReplyTicket,
+) {
     // 分析情绪并更新
     let detected_mood = match MOOD_SYSTEM
         .analyze_and_update_mood(message, "private_chat")
@@ -829,7 +893,8 @@ pub async fn private_chat(user_id: i64, message: &str, nickname: String, bot: Ar
         role: Roles::User,
         content: format!("{}:{}", nickname, message),
     });
-    let rolling_summary = maybe_compress_conversation(&mut history, "private_chat", user_id).await;
+    let rolling_summary =
+        maybe_compress_conversation(&mut history, "private_chat", user_id, reply_ticket).await;
     if let Some(system_message) = history.first_mut() {
         system_message.content = personalized_prompt;
     }
@@ -841,8 +906,18 @@ pub async fn private_chat(user_id: i64, message: &str, nickname: String, bot: Ar
         &contextual_memories,
         rolling_summary.as_deref(),
     );
-    let bot_content =
-        params_model_with_memory_access(&mut request_messages, user_id, "private_chat").await;
+    let bot_content = params_model_with_memory_access(
+        &mut request_messages,
+        user_id,
+        "private_chat",
+        reply_ticket,
+    )
+    .await;
+    if !is_current(reply_ticket).await {
+        println!("[INFO] 私聊旧回复已被新消息打断 (用户: {})", user_id);
+        limit_memory_size(&mut history);
+        return;
+    }
     if is_model_error_response(&bot_content.content) {
         bot.send_private_msg(user_id, "我这里暂时有点连不上，等一会儿再和我说一次吧。");
         limit_memory_size(&mut history);
@@ -854,18 +929,32 @@ pub async fn private_chat(user_id: i64, message: &str, nickname: String, bot: Ar
         return;
     }
     let outbound_messages = split_reply(&bot_content.content);
-    let stored_reply = outbound_messages.join("\n");
     let personality = MEMORY_MANAGER.get_bot_personality().await;
+    let mut sent_messages = Vec::new();
     for (index, outbound_message) in outbound_messages.iter().enumerate() {
+        if !is_current(reply_ticket).await {
+            break;
+        }
         if index > 0 {
             kovi::tokio::time::sleep(follow_up_delay(&personality, index)).await;
+            if !is_current(reply_ticket).await {
+                break;
+            }
         }
         bot.send_private_msg(user_id, outbound_message);
+        sent_messages.push(outbound_message.clone());
     }
+    if sent_messages.is_empty() {
+        println!("[INFO] 私聊回复在发送前被打断 (用户: {})", user_id);
+        limit_memory_size(&mut history);
+        return;
+    }
+    let stored_reply = sent_messages.join("\n");
     println!(
-        "[INFO] 私聊消息已发送 (用户: {}, 分段: {})",
+        "[INFO] 私聊消息已发送 (用户: {}, 已发: {}, 取消: {})",
         user_id,
-        outbound_messages.len()
+        sent_messages.len(),
+        outbound_messages.len().saturating_sub(sent_messages.len())
     );
     if let Err(error) = MEMORY_MANAGER
         .add_conversation_memory(user_id, &format!("芸汐: {}", stored_reply), "private_chat")

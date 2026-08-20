@@ -1,4 +1,5 @@
 use crate::model::coalesce::MessageCoalescer;
+use crate::model::interrupt::{ReplyScope, interrupt, is_explicit_stop_message};
 use crate::model::utils::{private_chat, requests_no_reply};
 use crate::sticker_memory::{
     StickerScope, extract_stickers, has_reply, known_labels, quoted_message_context,
@@ -15,6 +16,14 @@ pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<Runtime
     let nick_name = event.get_sender_nickname();
     let message = event.borrow_text().unwrap_or_default();
     let stickers = extract_stickers(&event.message);
+    // 私聊中的任何新消息都应立即使旧模型结果和未发送气泡失效。
+    let reply_ticket = interrupt(ReplyScope::Private(user_id)).await;
+
+    if is_explicit_stop_message(message) {
+        PRIVATE_MESSAGE_BATCHES.cancel(user_id).await;
+        println!("[INFO] 私聊用户打断回复 (用户: {})", user_id);
+        return;
+    }
 
     if let Some(label) = teaching_label(message) {
         match stickers_for_teaching(&event.message, &bot).await {
@@ -103,5 +112,5 @@ pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<Runtime
         println!("[INFO] 合并后的私聊消息明确要求不回复 (用户: {})", user_id);
         return;
     }
-    private_chat(user_id, &model_message, nick_name, bot).await;
+    private_chat(user_id, &model_message, nick_name, bot, reply_ticket).await;
 }
