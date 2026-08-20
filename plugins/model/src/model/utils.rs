@@ -24,7 +24,7 @@ use crate::mood_system::{MOOD_SYSTEM, Mood};
 use crate::utils;
 use crate::vision::{
     ImageRequestScope, VisionImage, analyze_images, default_vision_prompt,
-    extract_response_content, update_pending_image_request,
+    extract_response_content, is_vision_command, update_pending_image_request,
 };
 use anyhow::Context;
 use chrono::{Local, TimeZone};
@@ -74,6 +74,29 @@ const MAX_RUNTIME_CONVERSATIONS: usize = 512;
 static MODEL_CLIENT: LazyLock<Client> = LazyLock::new(Client::new);
 static MODEL_REQUEST_LIMIT: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(4));
 const MIN_MODEL_ATTEMPTS: usize = 5;
+
+/// 当前所有正式命令都只允许 Kovi 管理员使用。
+pub(crate) fn is_restricted_command(message: &str) -> bool {
+    let text = message.trim();
+    is_group_admin_command(text)
+        || text.starts_with("#教芸汐")
+        || text.starts_with("#教云汐")
+        || is_vision_command(text)
+}
+
+/// 这些命令只在群聊中处理，私聊即使由管理员发送也不进入模型。
+pub(crate) fn is_group_admin_command(message: &str) -> bool {
+    matches!(
+        message.trim(),
+        "#系统信息" | "#健康检查" | "#禁言" | "#结束禁言"
+    )
+}
+
+pub(crate) fn is_bot_admin(bot: &RuntimeBot, user_id: i64) -> bool {
+    bot.get_all_admin()
+        .map(|admins| admins.contains(&user_id))
+        .unwrap_or(false)
+}
 
 /// 聊天中由模型决定是否继续发送下一条消息的分隔标记。
 const FOLLOW_UP_MARKER: &str = "[[NEXT_MESSAGE]]";
@@ -1850,8 +1873,9 @@ mod tests {
     use super::{
         BotMemory, Roles, VisionImage, build_model_messages, build_responses_input,
         compression_cutoff, extract_interests_from_message, extract_personality_traits,
-        extract_stream_delta, follow_up_delay_millis, is_silent_model_response, limit_memory_size,
-        model_attempt_count, requests_no_reply, split_reply, with_reference_context,
+        extract_stream_delta, follow_up_delay_millis, is_group_admin_command,
+        is_restricted_command, is_silent_model_response, limit_memory_size, model_attempt_count,
+        requests_no_reply, split_reply, with_reference_context,
     };
     use crate::memory::BotPersonality;
     use chrono::Local;
@@ -1871,6 +1895,17 @@ mod tests {
             super::format_adapter_status(&json!({"memory": 123})),
             "接口正常（未提供详细状态）"
         );
+    }
+
+    #[test]
+    fn formal_commands_are_restricted_to_administrators() {
+        assert!(is_restricted_command("#系统信息"));
+        assert!(is_restricted_command("#教芸汐 这个表情是开心"));
+        assert!(is_restricted_command("#教云汐"));
+        assert!(is_restricted_command("#看图：这个报错是什么意思"));
+        assert!(is_group_admin_command(" #健康检查 "));
+        assert!(!is_restricted_command("请看看截图"));
+        assert!(!is_restricted_command("芸汐，今天开心吗"));
     }
 
     #[test]

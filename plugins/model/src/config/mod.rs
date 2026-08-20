@@ -2,7 +2,6 @@
 //!
 //! 提供完整的配置管理功能，包括：
 //! - 配置文件加载和验证
-//! - 自动重载监控
 //! - 默认配置生成
 //! - 线程安全的配置访问
 //! - 配置验证和错误处理
@@ -21,11 +20,7 @@ use kovi::toml;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{
-    Arc, LazyLock, RwLock,
-    atomic::{AtomicBool, Ordering},
-};
-use std::time::Duration;
+use std::sync::{Arc, LazyLock, RwLock};
 
 mod group_interjection;
 mod memory;
@@ -46,15 +41,10 @@ static MODEL_CONFIG: LazyLock<Arc<RwLock<ModelConfig>>> = LazyLock::new(|| {
     ))
 });
 
-/// 自动重载功能控制标志
-static AUTO_RELOAD_ENABLED: AtomicBool = AtomicBool::new(false);
-/// 配置监控线程运行状态
-static WATCHER_RUNNING: AtomicBool = AtomicBool::new(false);
-
 /// 模型配置结构体
 ///
 /// 包含机器人的所有配置信息，包括提示词和服务器配置
-#[derive(Debug, Deserialize, Serialize, Default, Clone, PartialEq)]
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
 #[serde(default)]
 pub struct ModelConfig {
     /// 提示词配置
@@ -158,37 +148,6 @@ impl ModelConfig {
         Ok(())
     }
 
-    /// 重载配置文件
-    pub fn reload() -> anyhow::Result<()> {
-        let new_config =
-            Self::load().with_context(|| anyhow::anyhow!("Failed to reload config"))?;
-        let mut config_guard = MODEL_CONFIG
-            .write()
-            .map_err(|_| anyhow::anyhow!("Failed to acquire write lock for config"))?;
-
-        *config_guard = new_config;
-
-        Ok(())
-    }
-
-    /// 强制重载配置文件（忽略环境变量）
-    pub fn reload_from_file() -> anyhow::Result<()> {
-        let config_path = Self::config_path();
-        if !config_path.exists() {
-            return Err(anyhow::anyhow!(
-                "Config file {} does not exist",
-                config_path.display()
-            ));
-        }
-        let new_config = Self::try_deserialize_config()?;
-        new_config.validate()?;
-        let mut config_guard = MODEL_CONFIG
-            .write()
-            .map_err(|_| anyhow::anyhow!("Failed to acquire write lock for config"))?;
-        *config_guard = new_config;
-        Ok(())
-    }
-
     fn try_deserialize_config() -> anyhow::Result<ModelConfig> {
         let config_path = Self::config_path();
         Config::builder()
@@ -212,57 +171,6 @@ impl ModelConfig {
         Ok(config_guard.clone())
     }
 
-    /// 启用配置文件自动重载监控
-    pub fn enable_auto_reload(check_interval: Duration) {
-        if AUTO_RELOAD_ENABLED.load(Ordering::Relaxed) {
-            return;
-        }
-
-        AUTO_RELOAD_ENABLED.store(true, Ordering::Relaxed);
-
-        if WATCHER_RUNNING
-            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok()
-        {
-            std::thread::spawn(move || {
-                Self::config_watcher_loop(check_interval);
-            });
-        }
-    }
-
-    /// 禁用配置文件自动重载监控
-    pub fn disable_auto_reload() {
-        AUTO_RELOAD_ENABLED.store(false, Ordering::Relaxed);
-    }
-
-    /// 检查配置文件是否有变化并自动重载
-    pub fn check_and_reload() -> anyhow::Result<bool> {
-        let config_path = Self::config_path();
-        if !config_path.exists() {
-            return Ok(false);
-        }
-
-        let file_config = Self::try_deserialize_config()?;
-
-        // 获取当前内存中的配置
-        let current_config = {
-            let config_guard = MODEL_CONFIG
-                .read()
-                .map_err(|_| anyhow::anyhow!("Failed to acquire read lock for config"))?;
-            config_guard.clone()
-        };
-
-        // 比较配置是否有变化（只比较文件部分）
-        if file_config != current_config {
-            Self::reload().with_context(|| {
-                anyhow::anyhow!("Failed to reload config after detecting changes")
-            })?;
-            return Ok(true);
-        }
-
-        Ok(false)
-    }
-
     fn config_path() -> PathBuf {
         #[cfg(test)]
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bot.conf.toml");
@@ -270,77 +178,11 @@ impl ModelConfig {
         let path = PathBuf::from("bot.conf.toml");
         path
     }
-
-    fn config_watcher_loop(check_interval: Duration) {
-        let mut last_check_failed = false;
-
-        loop {
-            if !AUTO_RELOAD_ENABLED.load(Ordering::Relaxed) {
-                break;
-            }
-
-            match Self::check_and_reload() {
-                Ok(reloaded) => {
-                    if reloaded {
-                        println!("[INFO] 检测到 bot.conf.toml 变化，配置已自动重载");
-                    }
-                    if reloaded && last_check_failed {
-                        last_check_failed = false;
-                    }
-                }
-                Err(error) => {
-                    if !last_check_failed {
-                        eprintln!("[ERROR] 自动重载配置失败: {}", error);
-                        last_check_failed = true;
-                    }
-                }
-            }
-
-            std::thread::sleep(check_interval);
-        }
-
-        WATCHER_RUNNING.store(false, Ordering::Relaxed);
-    }
-
-    /// 获取自动重载状态
-    pub fn is_auto_reload_enabled() -> bool {
-        AUTO_RELOAD_ENABLED.load(Ordering::Relaxed)
-    }
 }
 
 /// 获取当前配置的克隆
 pub fn get() -> ModelConfig {
     ModelConfig::get_current().expect("Failed to get current config")
-}
-
-/// 重载配置的便捷函数
-pub fn reload_config() -> anyhow::Result<()> {
-    ModelConfig::reload()
-}
-
-/// 从文件重载配置的便捷函数
-pub fn reload_config_from_file() -> anyhow::Result<()> {
-    ModelConfig::reload_from_file()
-}
-
-/// 启用配置自动重载
-pub fn enable_auto_reload(check_interval: Duration) {
-    ModelConfig::enable_auto_reload(check_interval);
-}
-
-/// 禁用配置自动重载
-pub fn disable_auto_reload() {
-    ModelConfig::disable_auto_reload();
-}
-
-/// 手动检查并重载配置
-pub fn check_and_reload() -> anyhow::Result<bool> {
-    ModelConfig::check_and_reload()
-}
-
-/// 获取自动重载状态
-pub fn is_auto_reload_enabled() -> bool {
-    ModelConfig::is_auto_reload_enabled()
 }
 
 #[cfg(test)]

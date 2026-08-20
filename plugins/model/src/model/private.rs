@@ -2,7 +2,9 @@ use crate::model::coalesce::{MessageCoalescer, MessagePart};
 use crate::model::interrupt::{ReplyScope, interrupt, is_active, is_explicit_stop_message};
 use crate::model::recall::{has_recalled_messages, send_tracked_private_message};
 use crate::model::reply::record_reply_target;
-use crate::model::utils::{private_chat, requests_no_reply};
+use crate::model::utils::{
+    is_bot_admin, is_group_admin_command, is_restricted_command, private_chat, requests_no_reply,
+};
 use crate::sticker_memory::{
     StickerScope, extract_stickers, has_reply, known_labels, quoted_message_context,
     stickers_for_teaching, teach, teaching_label, with_quoted_context, with_sticker_context,
@@ -34,8 +36,16 @@ static PENDING_PRIVATE_MESSAGES: LazyLock<Mutex<HashMap<i64, PendingPrivateMessa
 
 pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<RuntimeBot>) {
     let user_id = event.user_id;
-    let nick_name = event.get_sender_nickname();
     let message = event.borrow_text().unwrap_or_default();
+    if is_restricted_command(message) && !is_bot_admin(&bot, user_id) {
+        println!("[INFO] 私聊未授权命令已静默 (用户: {})", user_id);
+        return;
+    }
+    if is_group_admin_command(message) {
+        println!("[INFO] 私聊群聊专用命令已忽略 (用户: {})", user_id);
+        return;
+    }
+    let nick_name = event.get_sender_nickname();
     let stickers = extract_stickers(&event.message);
     let current_images = extract_image_attachments(&event.message);
     let vision_command = is_vision_command(message);

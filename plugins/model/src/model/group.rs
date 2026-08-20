@@ -6,7 +6,8 @@ use crate::model::interrupt::{ReplyScope, interrupt, is_active, is_explicit_stop
 use crate::model::recall::{has_recalled_messages, send_tracked_group_message};
 use crate::model::reply::record_reply_target;
 use crate::model::utils::{
-    learn_user_profile_from_message, requests_no_reply, send_sys_info, silence,
+    is_bot_admin, is_restricted_command, learn_user_profile_from_message, requests_no_reply,
+    send_sys_info, silence,
 };
 use crate::redis_store;
 use crate::sticker_memory::{
@@ -148,6 +149,13 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
     let nickname = sender_identity.qq_nickname.clone();
     let sender = sender_identity.model_sender(&time);
     let message = event.borrow_text().unwrap_or_default();
+    if is_restricted_command(message) && !is_bot_admin(&bot, event.user_id) {
+        println!(
+            "[INFO] 群聊未授权命令已静默 (群组: {}, 用户: {})",
+            group_id, event.user_id
+        );
+        return;
+    }
     let stickers = extract_stickers(&event.message);
     let current_images = extract_image_attachments(&event.message);
     let vision_command = is_vision_command(message);
@@ -183,11 +191,6 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
             .cancel((group_id, event.user_id))
             .await;
         println!("[INFO] 群聊用户打断回复 (群组: {})", group_id);
-        return;
-    }
-
-    if is_admin_command(message) && !is_bot_admin(&bot, event.user_id) {
-        send_tracked_group_message(&bot, group_id, "这个命令只有管理员可以使用哦。").await;
         return;
     }
 
@@ -479,59 +482,6 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
             send_sys_info(Arc::clone(&bot), group_id).await;
         }
 
-        "#重载配置文件" => {
-            let result = match config::reload_config_from_file() {
-                Ok(_) => "配置重载成功".to_string(),
-                Err(e) => format!("配置重载失败: {}", e),
-            };
-            send_tracked_group_message(&bot, group_id, result).await;
-        }
-
-        "#重载全部配置" => {
-            let result = match config::reload_config() {
-                Ok(_) => "全部配置文件重载成功".to_string(),
-                Err(e) => format!("重载失败： {}", e),
-            };
-            send_tracked_group_message(&bot, group_id, result).await;
-        }
-
-        "#启用自动重载" => {
-            if config::is_auto_reload_enabled() {
-                send_tracked_group_message(&bot, group_id, "自动重载已经启用").await;
-            } else {
-                config::enable_auto_reload(Duration::from_secs(5));
-                send_tracked_group_message(&bot, group_id, "自动重载已启用，每5秒检查一次").await;
-            }
-        }
-
-        "#禁用自动重载" => {
-            if config::is_auto_reload_enabled() {
-                config::disable_auto_reload();
-                send_tracked_group_message(&bot, group_id, "自动重载已禁用").await;
-            } else {
-                send_tracked_group_message(&bot, group_id, "自动重载未启用").await;
-            }
-        }
-
-        "#检查配置变化" => {
-            let result = match config::check_and_reload() {
-                Ok(true) => "检测到配置变化，已自动重载".to_string(),
-                Ok(false) => "配置文件无变化".to_string(),
-                Err(e) => format!("检查配置失败: {}", e),
-            };
-            send_tracked_group_message(&bot, group_id, result).await;
-        }
-
-        "#自动重载状态" => {
-            let status = if config::is_auto_reload_enabled() {
-                "已启用"
-            } else {
-                "已禁用"
-            };
-            send_tracked_group_message(&bot, group_id, format!("配置自动重载状态: {}", status))
-                .await;
-        }
-
         "#健康检查" => {
             let mut health_checker = HealthChecker::new(Arc::clone(&MEMORY_MANAGER));
             let health_status = health_checker.check_health().await;
@@ -759,28 +709,6 @@ fn normalize_for_spam_detection(message: &str) -> String {
         .flat_map(char::to_lowercase)
         .take(200)
         .collect()
-}
-
-fn is_bot_admin(bot: &RuntimeBot, user_id: i64) -> bool {
-    bot.get_all_admin()
-        .map(|admins| admins.contains(&user_id))
-        .unwrap_or(false)
-}
-
-fn is_admin_command(message: &str) -> bool {
-    matches!(
-        message.trim(),
-        "#系统信息"
-            | "#重载配置文件"
-            | "#重载全部配置"
-            | "#启用自动重载"
-            | "#禁用自动重载"
-            | "#检查配置变化"
-            | "#自动重载状态"
-            | "#健康检查"
-            | "#禁言"
-            | "#结束禁言"
-    )
 }
 
 /// 标记正在回复的成员，使其在模型思考和连续气泡发送期间也能自然打断或补充。
@@ -1271,10 +1199,10 @@ mod tests {
         DirectTriggerState, GroupInterjectionState, GroupSenderIdentity,
         complete_interjection_attempt, conversation_message_is_relevant, decision_budget_available,
         extract_topics_from_message, has_active_conversation_window, infer_group_personality,
-        is_admin_command, is_interjection_candidate, normalize_for_spam_detection,
-        normalized_sender_name, prune_decision_attempts, should_defer_active_window_message,
-        suppress_direct_trigger,
+        is_interjection_candidate, normalize_for_spam_detection, normalized_sender_name,
+        prune_decision_attempts, should_defer_active_window_message, suppress_direct_trigger,
     };
+    use crate::model::utils::{is_group_admin_command, is_restricted_command};
     use std::time::{Duration, Instant};
 
     #[test]
@@ -1467,11 +1395,12 @@ mod tests {
     }
 
     #[test]
-    fn operational_commands_require_an_admin() {
-        assert!(is_admin_command("#健康检查"));
-        assert!(is_admin_command(" #禁言 "));
-        assert!(!is_admin_command("芸汐，今天开心吗"));
-        assert!(!is_admin_command("#教芸汐 这个表情是开心"));
+    fn formal_commands_are_classified_before_chat_processing() {
+        assert!(is_group_admin_command("#健康检查"));
+        assert!(is_restricted_command(" #禁言 "));
+        assert!(is_restricted_command("#教芸汐 这个表情是开心"));
+        assert!(is_restricted_command("#识图"));
+        assert!(!is_restricted_command("芸汐，今天开心吗"));
     }
 
     #[test]
