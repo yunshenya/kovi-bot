@@ -3,6 +3,7 @@ mod group;
 mod interrupt;
 mod memory_query;
 mod private;
+mod reply;
 pub(crate) mod utils;
 
 pub use crate::model::group::group_message_event;

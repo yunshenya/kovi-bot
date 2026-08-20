@@ -1,19 +1,32 @@
 use crate::model::coalesce::{MessageCoalescer, MessagePart};
-use crate::model::interrupt::{ReplyScope, interrupt, is_explicit_stop_message};
+use crate::model::interrupt::{ReplyScope, interrupt, is_active, is_explicit_stop_message};
+use crate::model::reply::record_reply_target;
 use crate::model::utils::{private_chat, requests_no_reply};
 use crate::sticker_memory::{
     StickerScope, extract_stickers, has_reply, known_labels, quoted_message_context,
     stickers_for_teaching, teach, teaching_label, with_quoted_context, with_sticker_context,
 };
 use crate::vision::{
-    default_vision_prompt, extract_image_attachments, is_vision_command, merge_image_attachments,
-    resolve_image_urls, strip_vision_command,
+    VisionImage, default_vision_prompt, extract_image_attachments, is_vision_command,
+    merge_image_attachments, resolve_image_urls, strip_vision_command,
 };
 use kovi::RuntimeBot;
 use kovi::event::PrivateMsgEvent;
+use kovi::tokio::sync::Mutex;
+use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
 static PRIVATE_MESSAGE_BATCHES: LazyLock<MessageCoalescer<i64>> = LazyLock::new(Default::default);
+
+struct PendingPrivateMessage {
+    nickname: String,
+    message: String,
+    vision_images: Vec<VisionImage>,
+}
+
+/// 当前私聊回复期间只保留一条待处理消息，避免连续发送让模型请求一直被取消。
+static PENDING_PRIVATE_MESSAGES: LazyLock<Mutex<HashMap<i64, PendingPrivateMessage>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<RuntimeBot>) {
     let user_id = event.user_id;
@@ -22,10 +35,25 @@ pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<Runtime
     let stickers = extract_stickers(&event.message);
     let current_images = extract_image_attachments(&event.message);
     let vision_command = is_vision_command(message);
-    // 私聊中的任何新消息都应立即使旧模型结果和未发送气泡失效。
-    let reply_ticket = interrupt(ReplyScope::Private(user_id)).await;
+    let reply_scope = ReplyScope::Private(user_id);
+    record_reply_target(
+        reply_scope,
+        event.message_id,
+        Some(user_id),
+        nick_name.clone(),
+        &event.human_text,
+    )
+    .await;
+    let explicit_stop = is_explicit_stop_message(message);
+    let asks_for_silence = explicit_stop || requests_no_reply(message);
+    let can_interrupt = asks_for_silence || vision_command;
+    let reply_ticket = if can_interrupt {
+        Some(interrupt(ReplyScope::Private(user_id)).await)
+    } else {
+        None
+    };
 
-    if is_explicit_stop_message(message) {
+    if asks_for_silence {
         PRIVATE_MESSAGE_BATCHES.cancel(user_id).await;
         println!("[INFO] 私聊用户打断回复 (用户: {})", user_id);
         return;
@@ -85,6 +113,18 @@ pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<Runtime
             None
         }
     };
+    if let Some(quoted) = quoted.as_ref()
+        && let Some(message_id) = quoted.message_id
+    {
+        record_reply_target(
+            reply_scope,
+            message_id,
+            quoted.sender_id,
+            "引用消息",
+            &quoted.content,
+        )
+        .await;
+    }
     let quoted_images = quoted
         .as_ref()
         .map(|quoted| quoted.images.as_slice())
@@ -174,13 +214,90 @@ pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<Runtime
         println!("[INFO] 合并后的私聊消息明确要求不回复 (用户: {})", user_id);
         return;
     }
+    if should_defer_active_private_message(is_active(reply_scope).await, reply_ticket.is_some()) {
+        println!("[INFO] 私聊已有回复进行中，排队新消息 (用户: {})", user_id);
+        queue_pending_private_message(user_id, nick_name, model_message, vision_images).await;
+        return;
+    }
+    let reply_ticket = match reply_ticket {
+        Some(ticket) => ticket,
+        None => interrupt(reply_scope).await,
+    };
     private_chat(
         user_id,
         &model_message,
         nick_name,
-        bot,
+        Arc::clone(&bot),
         reply_ticket,
         vision_images,
     )
     .await;
+    drain_pending_private_messages(user_id, Arc::clone(&bot)).await;
+}
+
+fn should_defer_active_private_message(active_reply: bool, has_explicit_interrupt: bool) -> bool {
+    active_reply && !has_explicit_interrupt
+}
+
+async fn queue_pending_private_message(
+    user_id: i64,
+    nickname: String,
+    message: String,
+    vision_images: Vec<VisionImage>,
+) {
+    let mut pending = PENDING_PRIVATE_MESSAGES.lock().await;
+    if let Some(existing) = pending.get_mut(&user_id) {
+        existing.nickname = nickname;
+        existing.message = message;
+        merge_vision_images(&mut existing.vision_images, vision_images);
+    } else {
+        pending.insert(
+            user_id,
+            PendingPrivateMessage {
+                nickname,
+                message,
+                vision_images,
+            },
+        );
+    }
+}
+
+fn merge_vision_images(target: &mut Vec<VisionImage>, incoming: Vec<VisionImage>) {
+    for image in incoming {
+        if target.iter().any(|existing| existing.url == image.url) {
+            continue;
+        }
+        target.push(image);
+        if target.len() >= 4 {
+            target.truncate(4);
+            break;
+        }
+    }
+}
+
+async fn drain_pending_private_messages(user_id: i64, bot: Arc<RuntimeBot>) {
+    for _ in 0..3 {
+        let Some(pending) = PENDING_PRIVATE_MESSAGES.lock().await.remove(&user_id) else {
+            return;
+        };
+        if is_active(ReplyScope::Private(user_id)).await {
+            PENDING_PRIVATE_MESSAGES
+                .lock()
+                .await
+                .insert(user_id, pending);
+            return;
+        }
+
+        println!("[INFO] 私聊开始处理排队消息 (用户: {})", user_id);
+        let ticket = interrupt(ReplyScope::Private(user_id)).await;
+        private_chat(
+            user_id,
+            &pending.message,
+            pending.nickname,
+            bot.clone(),
+            ticket,
+            pending.vision_images,
+        )
+        .await;
+    }
 }

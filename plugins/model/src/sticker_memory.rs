@@ -37,6 +37,7 @@ impl StickerScope {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct QuotedMessageContext {
     pub(crate) content: String,
+    pub(crate) message_id: Option<i32>,
     pub(crate) sender_id: Option<i64>,
     pub(crate) images: Vec<ImageAttachment>,
 }
@@ -44,6 +45,7 @@ pub(crate) struct QuotedMessageContext {
 #[derive(Debug)]
 struct FetchedMessage {
     message: Message,
+    message_id: i32,
     sender_id: Option<i64>,
 }
 
@@ -203,6 +205,7 @@ async fn fetch_replied_message(
 
     Ok(Some(FetchedMessage {
         message: original_message,
+        message_id,
         sender_id,
     }))
 }
@@ -310,6 +313,7 @@ pub(crate) async fn quoted_message_context(
 
     Ok(Some(QuotedMessageContext {
         content,
+        message_id: Some(quoted.message_id),
         sender_id: quoted.sender_id,
         images,
     }))
@@ -317,12 +321,19 @@ pub(crate) async fn quoted_message_context(
 
 pub(crate) fn with_quoted_context(current: &str, quoted: &QuotedMessageContext) -> String {
     let current = current.trim();
+    let quoted_label = quoted
+        .message_id
+        .map(|message_id| format!("消息ID：{}\n", message_id))
+        .unwrap_or_default();
     if current.is_empty() {
-        format!("当前消息正在回复以下内容：\n{}", quoted.content)
+        format!(
+            "当前消息正在回复以下内容：\n{}{}",
+            quoted_label, quoted.content
+        )
     } else {
         format!(
-            "当前消息正在回复以下内容：\n{}\n当前消息：{}",
-            quoted.content, current
+            "当前消息正在回复以下内容：\n{}{}\n当前消息：{}",
+            quoted_label, quoted.content, current
         )
     }
 }
@@ -556,12 +567,13 @@ mod tests {
     fn quoted_context_is_explicit_for_the_model() {
         let quoted = QuotedMessageContext {
             content: "上一句话".to_string(),
+            message_id: Some(41),
             sender_id: Some(42),
             images: Vec::new(),
         };
         assert_eq!(
             with_quoted_context("你说得对", &quoted),
-            "当前消息正在回复以下内容：\n上一句话\n当前消息：你说得对"
+            "当前消息正在回复以下内容：\n消息ID：41\n上一句话\n当前消息：你说得对"
         );
     }
 

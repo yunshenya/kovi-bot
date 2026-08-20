@@ -3,6 +3,7 @@ use crate::health_check::HealthChecker;
 use crate::memory::{GroupProfile, MEMORY_MANAGER};
 use crate::model::coalesce::{MessageCoalescer, MessagePart};
 use crate::model::interrupt::{ReplyScope, interrupt, is_active, is_explicit_stop_message};
+use crate::model::reply::record_reply_target;
 use crate::model::utils::{
     learn_user_profile_from_message, requests_no_reply, send_sys_info, silence,
 };
@@ -86,6 +87,14 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
     let vision_command = is_vision_command(message);
     let sticker_scope = StickerScope::Group(group_id);
     let reply_scope = ReplyScope::Group(group_id);
+    record_reply_target(
+        reply_scope,
+        event.message_id,
+        Some(event.user_id),
+        nickname.clone(),
+        &event.human_text,
+    )
+    .await;
     let directly_addressed = is_addressed_to_bot(&event, message);
     let explicit_stop = is_explicit_stop_message(message);
     let asks_for_silence = explicit_stop || requests_no_reply(message);
@@ -164,6 +173,18 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
             None
         }
     };
+    if let Some(quoted) = quoted.as_ref()
+        && let Some(message_id) = quoted.message_id
+    {
+        record_reply_target(
+            reply_scope,
+            message_id,
+            quoted.sender_id,
+            "引用消息",
+            &quoted.content,
+        )
+        .await;
+    }
     let quoted_images = quoted
         .as_ref()
         .map(|quoted| quoted.images.as_slice())

@@ -10,6 +10,9 @@
 
 use super::interrupt::{ReplyTicket, finish, is_current, mark_active};
 use super::memory_query::{interruptible_model_call, params_model_with_memory_access};
+use super::reply::{
+    attach_reply_target_context, build_outbound_message, parse_reply_output, sanitize_reply_action,
+};
 use crate::config;
 use crate::memory::{BotPersonality, MEMORY_MANAGER, MoodEntry, UserProfile};
 use crate::mood_system::{MOOD_SYSTEM, Mood};
@@ -199,6 +202,11 @@ pub async fn control_model(
         &contextual_memories,
         rolling_summary.as_deref(),
     );
+    attach_reply_target_context(
+        &mut request_messages,
+        super::interrupt::ReplyScope::Group(group_id),
+    )
+    .await;
     let response = params_model_with_memory_access(
         &mut request_messages,
         group_id,
@@ -213,13 +221,19 @@ pub async fn control_model(
         limit_memory_size(&mut messages);
         return false;
     }
-    if is_model_error_response(&response.content) {
+    let parsed_reply = parse_reply_output(&response.content);
+    let reply_action = sanitize_reply_action(
+        super::interrupt::ReplyScope::Group(group_id),
+        parsed_reply.action,
+    )
+    .await;
+    if is_model_error_response(&parsed_reply.content) {
         bot.send_group_msg(group_id, "我这里暂时有点连不上，等一会儿再和我说一次吧。");
         limit_memory_size(&mut messages);
         return false;
     }
-    if !response.content.contains("[sp]") {
-        let outbound_messages = split_reply(&response.content);
+    if !parsed_reply.content.contains("[sp]") {
+        let outbound_messages = split_reply(&parsed_reply.content);
         let personality = MEMORY_MANAGER.get_bot_personality().await;
         let mut sent_messages = Vec::new();
         for (index, outbound_message) in outbound_messages.iter().enumerate() {
@@ -232,7 +246,10 @@ pub async fn control_model(
                     break;
                 }
             }
-            bot.send_group_msg(group_id, outbound_message);
+            bot.send_group_msg(
+                group_id,
+                build_outbound_message(outbound_message, &reply_action, index == 0),
+            );
             sent_messages.push(outbound_message.clone());
         }
         if sent_messages.is_empty() {
@@ -263,7 +280,10 @@ pub async fn control_model(
         limit_memory_size(&mut messages);
         return true;
     } else {
-        messages.push(response);
+        messages.push(BotMemory {
+            role: Roles::Assistant,
+            content: parsed_reply.content,
+        });
     }
     limit_memory_size(&mut messages);
     false
@@ -1081,6 +1101,11 @@ async fn private_chat_inner(
         &contextual_memories,
         rolling_summary.as_deref(),
     );
+    attach_reply_target_context(
+        &mut request_messages,
+        super::interrupt::ReplyScope::Private(user_id),
+    )
+    .await;
     let bot_content = params_model_with_memory_access(
         &mut request_messages,
         user_id,
@@ -1095,17 +1120,23 @@ async fn private_chat_inner(
         limit_memory_size(&mut history);
         return;
     }
-    if is_model_error_response(&bot_content.content) {
+    let parsed_reply = parse_reply_output(&bot_content.content);
+    let reply_action = sanitize_reply_action(
+        super::interrupt::ReplyScope::Private(user_id),
+        parsed_reply.action,
+    )
+    .await;
+    if is_model_error_response(&parsed_reply.content) {
         bot.send_private_msg(user_id, "我这里暂时有点连不上，等一会儿再和我说一次吧。");
         limit_memory_size(&mut history);
         return;
     }
-    if is_silent_model_response(&bot_content.content) {
+    if is_silent_model_response(&parsed_reply.content) {
         println!("[INFO] 私聊模型选择静默 (用户: {})", user_id);
         limit_memory_size(&mut history);
         return;
     }
-    let outbound_messages = split_reply(&bot_content.content);
+    let outbound_messages = split_reply(&parsed_reply.content);
     let personality = MEMORY_MANAGER.get_bot_personality().await;
     let mut sent_messages = Vec::new();
     for (index, outbound_message) in outbound_messages.iter().enumerate() {
@@ -1118,7 +1149,10 @@ async fn private_chat_inner(
                 break;
             }
         }
-        bot.send_private_msg(user_id, outbound_message);
+        bot.send_private_msg(
+            user_id,
+            build_outbound_message(outbound_message, &reply_action, index == 0),
+        );
         sent_messages.push(outbound_message.clone());
     }
     if sent_messages.is_empty() {
