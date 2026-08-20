@@ -14,7 +14,7 @@ use kovi::RuntimeBot;
 use kovi::event::GroupMsgEvent;
 use kovi::tokio::sync::Mutex;
 use rand::Rng;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
@@ -31,6 +31,20 @@ static GROUP_INTERJECTION_STATE: LazyLock<Mutex<HashMap<i64, GroupInterjectionSt
 
 static GROUP_MESSAGE_BATCHES: LazyLock<MessageCoalescer<(i64, i64)>> =
     LazyLock::new(Default::default);
+
+#[derive(Default)]
+struct DirectTriggerState {
+    last_message: String,
+    repeated_count: u32,
+    last_message_at: Option<Instant>,
+    recent_triggers: VecDeque<Instant>,
+    blocked_until: Option<Instant>,
+    last_seen: Option<Instant>,
+}
+
+/// 防刷状态按“群 + 成员”隔离，不影响群内其他人正常聊天。
+static DIRECT_TRIGGER_STATES: LazyLock<Mutex<HashMap<(i64, i64), DirectTriggerState>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>) {
     let group_id = event.group_id;
@@ -106,6 +120,16 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
     });
     let replies_to_bot = quoted.as_ref().and_then(|quoted| quoted.sender_id) == Some(event.self_id);
     let addressed_to_bot = is_addressed_to_bot(&event, message) || replies_to_bot;
+    if addressed_to_bot
+        && !is_bot_admin(&bot, event.user_id)
+        && should_suppress_direct_trigger(group_id, event.user_id, message).await
+    {
+        println!(
+            "[INFO] 群聊重复或高频点名已静默 (群组: {}, 用户: {})",
+            group_id, event.user_id
+        );
+        return;
+    }
     let (model_message, addressed_to_bot) = if !message.trim().is_empty()
         && stickers.is_empty()
         && quoted.is_none()
@@ -234,6 +258,87 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
             }
         }
     }
+}
+
+async fn should_suppress_direct_trigger(group_id: i64, user_id: i64, message: &str) -> bool {
+    let limits = config::get().group_interjection().clone();
+    let now = Instant::now();
+    let mut states = DIRECT_TRIGGER_STATES.lock().await;
+    if states.len() > 2_048 {
+        let retention = Duration::from_secs(limits.direct_spam_cooldown_secs().saturating_mul(2));
+        states.retain(|_, state| {
+            state
+                .last_seen
+                .is_some_and(|last_seen| now.duration_since(last_seen) < retention)
+        });
+    }
+    let state = states.entry((group_id, user_id)).or_default();
+    suppress_direct_trigger(
+        state,
+        &normalize_for_spam_detection(message),
+        now,
+        Duration::from_secs(limits.direct_repeat_window_secs()),
+        Duration::from_secs(limits.direct_spam_cooldown_secs()),
+        Duration::from_secs(limits.direct_rate_window_secs()),
+        limits.direct_rate_limit(),
+    )
+}
+
+fn suppress_direct_trigger(
+    state: &mut DirectTriggerState,
+    normalized_message: &str,
+    now: Instant,
+    repeat_window: Duration,
+    cooldown: Duration,
+    rate_window: Duration,
+    rate_limit: usize,
+) -> bool {
+    state.last_seen = Some(now);
+    if state.blocked_until.is_some_and(|until| until > now) {
+        return true;
+    }
+    state.blocked_until = None;
+
+    while state
+        .recent_triggers
+        .front()
+        .is_some_and(|seen_at| now.duration_since(*seen_at) >= rate_window)
+    {
+        state.recent_triggers.pop_front();
+    }
+    state.recent_triggers.push_back(now);
+    if state.recent_triggers.len() > rate_limit {
+        state.blocked_until = Some(now + cooldown);
+        return true;
+    }
+
+    let repeated = !normalized_message.is_empty()
+        && normalized_message == state.last_message
+        && state
+            .last_message_at
+            .is_some_and(|last_at| now.duration_since(last_at) < repeat_window);
+    state.repeated_count = if repeated {
+        state.repeated_count.saturating_add(1)
+    } else {
+        1
+    };
+    state.last_message.clear();
+    state.last_message.push_str(normalized_message);
+    state.last_message_at = Some(now);
+
+    if state.repeated_count >= 3 {
+        state.blocked_until = Some(now + cooldown);
+    }
+    repeated
+}
+
+fn normalize_for_spam_detection(message: &str) -> String {
+    message
+        .chars()
+        .filter(|character| character.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .take(200)
+        .collect()
 }
 
 fn is_bot_admin(bot: &RuntimeBot, user_id: i64) -> bool {
@@ -527,8 +632,9 @@ fn extract_topics_from_message(message: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_topics_from_message, has_active_conversation_window, infer_group_personality,
-        is_admin_command, is_conversation_follow_up, is_interjection_candidate,
+        DirectTriggerState, extract_topics_from_message, has_active_conversation_window,
+        infer_group_personality, is_admin_command, is_conversation_follow_up,
+        is_interjection_candidate, normalize_for_spam_detection, suppress_direct_trigger,
     };
     use std::time::{Duration, Instant};
 
@@ -580,5 +686,90 @@ mod tests {
         assert!(is_admin_command(" #禁言 "));
         assert!(!is_admin_command("芸汐，今天开心吗"));
         assert!(!is_admin_command("#教芸汐 这个表情是开心"));
+    }
+
+    #[test]
+    fn repeated_direct_mentions_are_silenced_then_cooled_down() {
+        let mut state = DirectTriggerState::default();
+        let started = Instant::now();
+        let repeat_window = Duration::from_secs(120);
+        let cooldown = Duration::from_secs(600);
+        let rate_window = Duration::from_secs(60);
+
+        assert!(!suppress_direct_trigger(
+            &mut state,
+            "芸汐你好",
+            started,
+            repeat_window,
+            cooldown,
+            rate_window,
+            4,
+        ));
+        assert!(suppress_direct_trigger(
+            &mut state,
+            "芸汐你好",
+            started + Duration::from_secs(5),
+            repeat_window,
+            cooldown,
+            rate_window,
+            4,
+        ));
+        assert!(suppress_direct_trigger(
+            &mut state,
+            "芸汐你好",
+            started + Duration::from_secs(10),
+            repeat_window,
+            cooldown,
+            rate_window,
+            4,
+        ));
+        assert!(suppress_direct_trigger(
+            &mut state,
+            "换一句也还在冷却",
+            started + Duration::from_secs(20),
+            repeat_window,
+            cooldown,
+            rate_window,
+            4,
+        ));
+        assert!(!suppress_direct_trigger(
+            &mut state,
+            "冷却后正常聊天",
+            started + Duration::from_secs(620),
+            repeat_window,
+            cooldown,
+            rate_window,
+            4,
+        ));
+    }
+
+    #[test]
+    fn varied_high_frequency_mentions_are_rate_limited() {
+        let mut state = DirectTriggerState::default();
+        let started = Instant::now();
+        for offset in [0, 5, 10, 15] {
+            assert!(!suppress_direct_trigger(
+                &mut state,
+                &format!("不同消息{offset}"),
+                started + Duration::from_secs(offset),
+                Duration::from_secs(120),
+                Duration::from_secs(300),
+                Duration::from_secs(60),
+                4,
+            ));
+        }
+        assert!(suppress_direct_trigger(
+            &mut state,
+            "第五条",
+            started + Duration::from_secs(20),
+            Duration::from_secs(120),
+            Duration::from_secs(300),
+            Duration::from_secs(60),
+            4,
+        ));
+        assert_eq!(
+            normalize_for_spam_detection(" 芸汐，你好！！！ "),
+            "芸汐你好"
+        );
     }
 }

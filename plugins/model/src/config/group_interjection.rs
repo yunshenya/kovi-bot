@@ -18,6 +18,18 @@ pub struct GroupInterjectionConfig {
     min_message_chars: usize,
     /// 机器人成功接话后，允许无称呼继续对话的时间窗口（秒）。
     conversation_window_secs: u64,
+    /// 判断同一句点名为重复刷屏的时间窗口（秒）。
+    direct_repeat_window_secs: u64,
+    /// 连续刷屏后暂停处理该成员直接点名的时间（秒）。
+    direct_spam_cooldown_secs: u64,
+    /// 高频点名计数窗口（秒）。
+    direct_rate_window_secs: u64,
+    /// 计数窗口内允许同一成员直接触发的最大次数。
+    direct_rate_limit: usize,
+    /// 单次群聊回复允许发送的最大气泡数。
+    reply_max_messages: usize,
+    /// 单次群聊回复所有气泡合计的最大字符数。
+    reply_max_chars: usize,
 }
 
 impl GroupInterjectionConfig {
@@ -45,6 +57,30 @@ impl GroupInterjectionConfig {
         self.conversation_window_secs
     }
 
+    pub fn direct_repeat_window_secs(&self) -> u64 {
+        self.direct_repeat_window_secs
+    }
+
+    pub fn direct_spam_cooldown_secs(&self) -> u64 {
+        self.direct_spam_cooldown_secs
+    }
+
+    pub fn direct_rate_window_secs(&self) -> u64 {
+        self.direct_rate_window_secs
+    }
+
+    pub fn direct_rate_limit(&self) -> usize {
+        self.direct_rate_limit
+    }
+
+    pub fn reply_max_messages(&self) -> usize {
+        self.reply_max_messages
+    }
+
+    pub fn reply_max_chars(&self) -> usize {
+        self.reply_max_chars
+    }
+
     pub fn validate(&self) -> anyhow::Result<()> {
         if self.min_eligible_messages == 0 {
             return Err(anyhow::anyhow!("群聊接话消息间隔必须大于0"));
@@ -61,6 +97,18 @@ impl GroupInterjectionConfig {
         if self.conversation_window_secs == 0 {
             return Err(anyhow::anyhow!("群聊接话对话窗口必须大于0秒"));
         }
+        if self.direct_repeat_window_secs == 0
+            || self.direct_spam_cooldown_secs == 0
+            || self.direct_rate_window_secs == 0
+        {
+            return Err(anyhow::anyhow!("群聊防刷时间配置必须大于0秒"));
+        }
+        if self.direct_rate_limit < 2 {
+            return Err(anyhow::anyhow!("群聊点名频率上限不能小于2"));
+        }
+        if self.reply_max_messages == 0 || self.reply_max_chars < 20 {
+            return Err(anyhow::anyhow!("群聊回复至少允许1条消息和20个字符"));
+        }
         Ok(())
     }
 }
@@ -74,6 +122,12 @@ impl Default for GroupInterjectionConfig {
             response_probability_percent: 35,
             min_message_chars: 5,
             conversation_window_secs: 180,
+            direct_repeat_window_secs: 120,
+            direct_spam_cooldown_secs: 600,
+            direct_rate_window_secs: 60,
+            direct_rate_limit: 4,
+            reply_max_messages: 3,
+            reply_max_chars: 120,
         }
     }
 }
