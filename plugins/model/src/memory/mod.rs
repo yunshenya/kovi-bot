@@ -12,8 +12,11 @@ use anyhow::Result;
 use chrono::{DateTime, Duration as ChronoDuration, Local, Utc};
 use kovi::tokio::sync::Mutex;
 use serde::{Deserialize, Serialize};
-use sqlx::postgres::PgPoolOptions;
-use sqlx::{PgPool, Postgres, Row, Transaction};
+use sqlx_core::query::query;
+use sqlx_core::query_scalar::query_scalar;
+use sqlx_core::row::Row;
+use sqlx_core::transaction::Transaction;
+use sqlx_postgres::{PgPool, PgPoolOptions, Postgres};
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -344,7 +347,7 @@ impl MemoryManager {
             .map_err(|error| anyhow::anyhow!("连接 PostgreSQL 失败: {}", error))?;
 
         // 保留旧快照表作为一次性迁移源，新写入改用按实体拆分的表。
-        sqlx::query(
+        query(
             r#"
             CREATE TABLE IF NOT EXISTS kovi_bot_memory (
                 id SMALLINT PRIMARY KEY CHECK (id = 1),
@@ -362,7 +365,7 @@ impl MemoryManager {
             println!("[INFO] 已从 PostgreSQL 分表加载记忆");
             Self::load_normalized_data(&pool).await?
         } else {
-            let stored_payload = sqlx::query("SELECT payload FROM kovi_bot_memory WHERE id = 1")
+            let stored_payload = query("SELECT payload FROM kovi_bot_memory WHERE id = 1")
                 .fetch_optional(&pool)
                 .await
                 .map_err(|error| anyhow::anyhow!("读取旧 PostgreSQL 记忆失败: {}", error))?
@@ -416,7 +419,7 @@ impl MemoryManager {
     }
 
     async fn create_normalized_schema(pool: &PgPool) -> Result<()> {
-        sqlx::query(
+        query(
             r#"
             CREATE TABLE IF NOT EXISTS kovi_bot_memories (
                 id TEXT PRIMARY KEY,
@@ -431,12 +434,12 @@ impl MemoryManager {
         .execute(pool)
         .await
         .map_err(|error| anyhow::anyhow!("创建记忆明细表失败: {}", error))?;
-        sqlx::query(
+        query(
             "CREATE INDEX IF NOT EXISTS kovi_bot_memories_subject_context_time_idx ON kovi_bot_memories (subject_id, context, occurred_at DESC)",
         )
         .execute(pool)
         .await?;
-        sqlx::query(
+        query(
             r#"
             CREATE TABLE IF NOT EXISTS kovi_bot_user_profiles (
                 user_id BIGINT PRIMARY KEY,
@@ -447,7 +450,7 @@ impl MemoryManager {
         )
         .execute(pool)
         .await?;
-        sqlx::query(
+        query(
             r#"
             CREATE TABLE IF NOT EXISTS kovi_bot_group_profiles (
                 group_id BIGINT PRIMARY KEY,
@@ -458,7 +461,7 @@ impl MemoryManager {
         )
         .execute(pool)
         .await?;
-        sqlx::query(
+        query(
             r#"
             CREATE TABLE IF NOT EXISTS kovi_bot_conversation_summaries (
                 summary_key TEXT PRIMARY KEY,
@@ -469,7 +472,7 @@ impl MemoryManager {
         )
         .execute(pool)
         .await?;
-        sqlx::query(
+        query(
             r#"
             CREATE TABLE IF NOT EXISTS kovi_bot_personality (
                 id SMALLINT PRIMARY KEY CHECK (id = 1),
@@ -484,7 +487,7 @@ impl MemoryManager {
     }
 
     async fn normalized_storage_has_data(pool: &PgPool) -> Result<bool> {
-        sqlx::query_scalar::<_, bool>(
+        query_scalar::<Postgres, bool>(
             r#"
             SELECT EXISTS(SELECT 1 FROM kovi_bot_personality WHERE id = 1)
                 OR EXISTS(SELECT 1 FROM kovi_bot_memories LIMIT 1)
@@ -500,14 +503,14 @@ impl MemoryManager {
 
     async fn load_normalized_data(pool: &PgPool) -> Result<MemoryData> {
         let mut data = MemoryData::default();
-        for row in sqlx::query("SELECT payload FROM kovi_bot_memories")
+        for row in query("SELECT payload FROM kovi_bot_memories")
             .fetch_all(pool)
             .await?
         {
             let memory: MemoryEntry = serde_json::from_value(row.get("payload"))?;
             data.memories.insert(memory.id.clone(), memory);
         }
-        for row in sqlx::query("SELECT user_id, payload FROM kovi_bot_user_profiles")
+        for row in query("SELECT user_id, payload FROM kovi_bot_user_profiles")
             .fetch_all(pool)
             .await?
         {
@@ -516,7 +519,7 @@ impl MemoryManager {
                 serde_json::from_value(row.get("payload"))?,
             );
         }
-        for row in sqlx::query("SELECT group_id, payload FROM kovi_bot_group_profiles")
+        for row in query("SELECT group_id, payload FROM kovi_bot_group_profiles")
             .fetch_all(pool)
             .await?
         {
@@ -525,14 +528,14 @@ impl MemoryManager {
                 serde_json::from_value(row.get("payload"))?,
             );
         }
-        for row in sqlx::query("SELECT summary_key, summary FROM kovi_bot_conversation_summaries")
+        for row in query("SELECT summary_key, summary FROM kovi_bot_conversation_summaries")
             .fetch_all(pool)
             .await?
         {
             data.conversation_summaries
                 .insert(row.get("summary_key"), row.get("summary"));
         }
-        if let Some(row) = sqlx::query("SELECT payload FROM kovi_bot_personality WHERE id = 1")
+        if let Some(row) = query("SELECT payload FROM kovi_bot_personality WHERE id = 1")
             .fetch_optional(pool)
             .await?
         {
@@ -564,7 +567,7 @@ impl MemoryManager {
         transaction: &mut Transaction<'_, Postgres>,
         memory: &MemoryEntry,
     ) -> Result<()> {
-        sqlx::query(
+        query(
             r#"
             INSERT INTO kovi_bot_memories
                 (id, subject_id, context, occurred_at, importance, payload)
@@ -592,7 +595,7 @@ impl MemoryManager {
         transaction: &mut Transaction<'_, Postgres>,
         profile: &UserProfile,
     ) -> Result<()> {
-        sqlx::query(
+        query(
             r#"
             INSERT INTO kovi_bot_user_profiles (user_id, payload, updated_at)
             VALUES ($1, $2, NOW())
@@ -610,7 +613,7 @@ impl MemoryManager {
         transaction: &mut Transaction<'_, Postgres>,
         profile: &GroupProfile,
     ) -> Result<()> {
-        sqlx::query(
+        query(
             r#"
             INSERT INTO kovi_bot_group_profiles (group_id, payload, updated_at)
             VALUES ($1, $2, NOW())
@@ -629,7 +632,7 @@ impl MemoryManager {
         summary_key: &str,
         summary: &str,
     ) -> Result<()> {
-        sqlx::query(
+        query(
             r#"
             INSERT INTO kovi_bot_conversation_summaries (summary_key, summary, updated_at)
             VALUES ($1, $2, NOW())
@@ -647,7 +650,7 @@ impl MemoryManager {
         transaction: &mut Transaction<'_, Postgres>,
         personality: &BotPersonality,
     ) -> Result<()> {
-        sqlx::query(
+        query(
             r#"
             INSERT INTO kovi_bot_personality (id, payload, updated_at)
             VALUES (1, $1, NOW())
@@ -743,7 +746,7 @@ impl MemoryManager {
         if let Some(duplicate_id) = duplicate_id
             && let Some(pool) = self.database_pool.get()
         {
-            sqlx::query("DELETE FROM kovi_bot_memories WHERE id = $1")
+            query("DELETE FROM kovi_bot_memories WHERE id = $1")
                 .bind(duplicate_id)
                 .execute(pool)
                 .await?;
@@ -969,7 +972,7 @@ impl MemoryManager {
         let min_importance = i16::from(lookup.min_importance.unwrap_or(0));
 
         if let Some(pool) = self.database_pool.get() {
-            let fetch = sqlx::query(
+            let fetch = query(
                 r#"
                 SELECT payload
                 FROM kovi_bot_memories
@@ -1144,7 +1147,7 @@ impl MemoryManager {
             .database_pool
             .get()
             .ok_or_else(|| anyhow::anyhow!("PostgreSQL 记忆存储尚未初始化"))?;
-        sqlx::query("SELECT 1")
+        query("SELECT 1")
             .execute(pool)
             .await
             .map_err(|error| anyhow::anyhow!("PostgreSQL 记忆存储不可用: {}", error))?;
@@ -1163,7 +1166,7 @@ impl MemoryManager {
         let removed_ids = self.cleanup_old_memories().await?;
         if let Some(pool) = self.database_pool.get() {
             if !removed_ids.is_empty() {
-                sqlx::query("DELETE FROM kovi_bot_memories WHERE id = ANY($1::TEXT[])")
+                query("DELETE FROM kovi_bot_memories WHERE id = ANY($1::TEXT[])")
                     .bind(&removed_ids)
                     .execute(pool)
                     .await?;

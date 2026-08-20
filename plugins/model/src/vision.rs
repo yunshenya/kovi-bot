@@ -1,5 +1,6 @@
 //! 图片附件解析与视觉模型输入。
 
+use crate::redis_store;
 use anyhow::{Result, anyhow};
 use base64::Engine;
 use kovi::bot::message::Message;
@@ -92,12 +93,28 @@ pub(crate) fn message_requests_image(message: &str) -> bool {
 
 pub(crate) async fn update_pending_image_request(scope: ImageRequestScope, message: &str) {
     let now = Instant::now();
+    let requested = message_requests_image(message);
     let mut pending = PENDING_IMAGE_REQUESTS.lock().await;
     pending.retain(|_, deadline| *deadline > now);
-    if message_requests_image(message) {
+    if requested {
         pending.insert(scope, now + PENDING_IMAGE_REQUEST_TTL);
     } else {
         pending.remove(&scope);
+    }
+    drop(pending);
+
+    let suffix = pending_image_request_key(scope);
+    if let Some(store) = redis_store::get().await {
+        let result = if requested {
+            store
+                .set_expiring_text(&suffix, "1", PENDING_IMAGE_REQUEST_TTL)
+                .await
+        } else {
+            store.delete(&suffix).await
+        };
+        if let Err(error) = result {
+            eprintln!("[WARN] Redis 图片请求状态同步失败: {}", error);
+        }
     }
 }
 
@@ -111,7 +128,36 @@ pub(crate) async fn consume_pending_image_request(
     let now = Instant::now();
     let mut pending = PENDING_IMAGE_REQUESTS.lock().await;
     pending.retain(|_, deadline| *deadline > now);
-    pending.remove(&scope).is_some()
+    let local_pending = pending.remove(&scope).is_some();
+    drop(pending);
+    if local_pending {
+        if let Some(store) = redis_store::get().await
+            && let Err(error) = store.delete(&pending_image_request_key(scope)).await
+        {
+            eprintln!("[WARN] Redis 图片请求状态清理失败: {}", error);
+        }
+        return true;
+    }
+
+    let Some(store) = redis_store::get().await else {
+        return false;
+    };
+    match store.take_text(&pending_image_request_key(scope)).await {
+        Ok(value) => value.is_some(),
+        Err(error) => {
+            eprintln!("[WARN] Redis 图片请求状态读取失败: {}", error);
+            false
+        }
+    }
+}
+
+fn pending_image_request_key(scope: ImageRequestScope) -> String {
+    match scope {
+        ImageRequestScope::Group { group_id, user_id } => {
+            format!("vision:pending:group:{group_id}:user:{user_id}")
+        }
+        ImageRequestScope::Private(user_id) => format!("vision:pending:private:{user_id}"),
+    }
 }
 
 pub(crate) fn with_social_image_context(message: &str) -> String {

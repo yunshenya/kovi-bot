@@ -1,13 +1,14 @@
 //! 用户撤回消息与芸汐回复的生命周期联动。
 
 use super::interrupt::{ReplyScope, ReplyTicket, interrupt};
+use crate::redis_store;
 use kovi::PluginBuilder;
 use kovi::RuntimeBot;
 use kovi::bot::runtimebot::CanSendApi;
 use kovi::event::NoticeEvent;
 use kovi::tokio::sync::Mutex;
 use serde_json::{Value, json};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
@@ -113,7 +114,7 @@ pub(crate) async fn record_bot_message(
     content: &str,
     bot: &RuntimeBot,
 ) {
-    let should_delete = {
+    let recorded_content = {
         let mut lifecycles = REPLY_LIFECYCLES.lock().await;
         if let Some(lifecycle) = lifecycles.get_mut(&scope) {
             lifecycle.last_seen = Instant::now();
@@ -132,15 +133,17 @@ pub(crate) async fn record_bot_message(
                     .sent_message_ids
                     .push(message_id);
                 record_recent_bot_message(lifecycle, message_id, content);
-                false
+                Some(bot_message_content(content))
             } else {
-                true
+                None
             }
         } else {
-            true
+            None
         }
     };
-    if should_delete {
+    if let Some(recorded_content) = recorded_content {
+        persist_redis_bot_message(scope, message_id, &recorded_content).await;
+    } else {
         bot.delete_msg(message_id);
     }
 }
@@ -159,6 +162,8 @@ pub(crate) async fn record_standalone_bot_message(
     let lifecycle = lifecycles.entry(scope).or_default();
     lifecycle.last_seen = Instant::now();
     record_recent_bot_message(lifecycle, message_id, content);
+    drop(lifecycles);
+    persist_redis_bot_message(scope, message_id, &bot_message_content(content)).await;
 }
 
 pub(crate) async fn send_tracked_group_message(
@@ -198,19 +203,23 @@ pub(crate) async fn send_tracked_private_message(
 }
 
 pub(crate) async fn recent_bot_messages(scope: ReplyScope) -> Vec<RecentBotMessage> {
-    let mut lifecycles = REPLY_LIFECYCLES.lock().await;
-    prune_lifecycles(&mut lifecycles);
-    lifecycles
-        .get(&scope)
-        .map(|lifecycle| {
-            lifecycle
-                .recent_bot_messages
-                .iter()
-                .rev()
-                .cloned()
-                .collect()
-        })
-        .unwrap_or_default()
+    let local_messages = {
+        let mut lifecycles = REPLY_LIFECYCLES.lock().await;
+        prune_lifecycles(&mut lifecycles);
+        lifecycles
+            .get(&scope)
+            .map(|lifecycle| {
+                lifecycle
+                    .recent_bot_messages
+                    .iter()
+                    .rev()
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    };
+    let redis_messages = load_redis_bot_messages(scope).await;
+    merge_recent_bot_messages(local_messages, redis_messages)
 }
 
 /// 执行模型提出的主动撤回。消息 ID 必须存在于本会话的机器人发送白名单中。
@@ -224,23 +233,16 @@ pub(crate) async fn recall_bot_messages(
         return Vec::new();
     }
 
-    let candidates = {
-        let mut lifecycles = REPLY_LIFECYCLES.lock().await;
-        prune_lifecycles(&mut lifecycles);
-        let Some(lifecycle) = lifecycles.get(&scope) else {
-            return Vec::new();
-        };
-        requested_message_ids
-            .iter()
-            .filter_map(|message_id| {
-                lifecycle
-                    .recent_bot_messages
-                    .iter()
-                    .find(|message| message.message_id == *message_id)
-                    .cloned()
-            })
-            .collect::<Vec<_>>()
-    };
+    let available_messages = recent_bot_messages(scope).await;
+    let candidates = requested_message_ids
+        .iter()
+        .filter_map(|message_id| {
+            available_messages
+                .iter()
+                .find(|message| message.message_id == *message_id)
+                .cloned()
+        })
+        .collect::<Vec<_>>();
 
     let mut recalled = Vec::new();
     for candidate in candidates {
@@ -261,11 +263,14 @@ pub(crate) async fn recall_bot_messages(
             .iter()
             .map(|message| message.message_id)
             .collect::<Vec<_>>();
-        let mut lifecycles = REPLY_LIFECYCLES.lock().await;
-        if let Some(lifecycle) = lifecycles.get_mut(&scope) {
-            remove_bot_messages(lifecycle, &recalled_ids);
-            lifecycle.last_seen = Instant::now();
+        {
+            let mut lifecycles = REPLY_LIFECYCLES.lock().await;
+            if let Some(lifecycle) = lifecycles.get_mut(&scope) {
+                remove_bot_messages(lifecycle, &recalled_ids);
+                lifecycle.last_seen = Instant::now();
+            }
         }
+        remove_redis_bot_messages(scope, &recalled_ids).await;
     }
     recalled
 }
@@ -285,7 +290,7 @@ pub(crate) async fn handle_recalled_message(
     message_id: i32,
     bot: Arc<RuntimeBot>,
 ) {
-    let (ticket, sent_message_ids) = {
+    let (ticket, sent_message_ids, redis_message_ids) = {
         let mut lifecycles = REPLY_LIFECYCLES.lock().await;
         prune_lifecycles(&mut lifecycles);
         let lifecycle = lifecycles.entry(scope).or_default();
@@ -316,9 +321,13 @@ pub(crate) async fn handle_recalled_message(
             }
         });
         remove_bot_messages(lifecycle, &sent_message_ids);
-        (ticket, sent_message_ids)
+        let mut redis_message_ids = Vec::with_capacity(sent_message_ids.len() + 1);
+        redis_message_ids.push(message_id);
+        redis_message_ids.extend(sent_message_ids.iter().copied());
+        (ticket, sent_message_ids, redis_message_ids)
     };
 
+    remove_redis_bot_messages(scope, &redis_message_ids).await;
     if ticket.is_some() {
         interrupt(scope).await;
     }
@@ -381,11 +390,123 @@ fn record_recent_bot_message(lifecycle: &mut ReplyLifecycle, message_id: i32, co
         .retain(|message| message.message_id != message_id);
     lifecycle.recent_bot_messages.push_back(RecentBotMessage {
         message_id,
-        content: truncate_chars(content.trim(), MAX_BOT_MESSAGE_CONTENT_CHARS),
+        content: bot_message_content(content),
         sent_at: Instant::now(),
     });
     while lifecycle.recent_bot_messages.len() > MAX_RECENT_BOT_MESSAGES {
         lifecycle.recent_bot_messages.pop_front();
+    }
+}
+
+fn bot_message_content(content: &str) -> String {
+    truncate_chars(content.trim(), MAX_BOT_MESSAGE_CONTENT_CHARS)
+}
+
+fn redis_scope(scope: ReplyScope) -> (&'static str, i64) {
+    match scope {
+        ReplyScope::Group(group_id) => ("group", group_id),
+        ReplyScope::Private(user_id) => ("private", user_id),
+    }
+}
+
+async fn persist_redis_bot_message(scope: ReplyScope, message_id: i32, content: &str) {
+    if message_id <= 0 {
+        return;
+    }
+    let Some(store) = redis_store::get().await else {
+        return;
+    };
+    let (scope_type, subject_id) = redis_scope(scope);
+    if let Err(error) = store
+        .record_bot_message(
+            scope_type,
+            subject_id,
+            message_id,
+            content,
+            BOT_RECALL_WINDOW,
+        )
+        .await
+    {
+        eprintln!("[WARN] Redis 记录芸汐撤回候选失败: {}", error);
+    }
+}
+
+async fn load_redis_bot_messages(scope: ReplyScope) -> Vec<RecentBotMessage> {
+    let Some(store) = redis_store::get().await else {
+        return Vec::new();
+    };
+    let (scope_type, subject_id) = redis_scope(scope);
+    let messages = match store
+        .recent_bot_messages(
+            scope_type,
+            subject_id,
+            MAX_RECENT_BOT_MESSAGES,
+            BOT_RECALL_WINDOW,
+        )
+        .await
+    {
+        Ok(messages) => messages,
+        Err(error) => {
+            eprintln!("[WARN] Redis 读取芸汐撤回候选失败: {}", error);
+            return Vec::new();
+        }
+    };
+    let now = Instant::now();
+    let now_ms = redis_now_millis();
+    messages
+        .into_iter()
+        .map(|message| RecentBotMessage {
+            message_id: message.message_id,
+            content: message.content,
+            // 用 Redis 的墙上时间恢复近似年龄，再交给本地单调时钟做生命周期清理。
+            sent_at: now
+                .checked_sub(Duration::from_millis(
+                    now_ms
+                        .saturating_sub(message.sent_at_ms)
+                        .try_into()
+                        .unwrap_or(u64::MAX),
+                ))
+                .unwrap_or(now),
+        })
+        .collect()
+}
+
+fn merge_recent_bot_messages(
+    local_messages: Vec<RecentBotMessage>,
+    redis_messages: Vec<RecentBotMessage>,
+) -> Vec<RecentBotMessage> {
+    let mut seen = HashSet::new();
+    let mut merged = local_messages
+        .into_iter()
+        .chain(redis_messages)
+        .filter(|message| seen.insert(message.message_id))
+        .collect::<Vec<_>>();
+    merged.sort_by_key(|message| std::cmp::Reverse(message.sent_at));
+    merged.truncate(MAX_RECENT_BOT_MESSAGES);
+    merged
+}
+
+fn redis_now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+        .unwrap_or(0)
+}
+
+async fn remove_redis_bot_messages(scope: ReplyScope, message_ids: &[i32]) {
+    if message_ids.is_empty() {
+        return;
+    }
+    let Some(store) = redis_store::get().await else {
+        return;
+    };
+    let (scope_type, subject_id) = redis_scope(scope);
+    if let Err(error) = store
+        .remove_bot_messages(scope_type, subject_id, message_ids)
+        .await
+    {
+        eprintln!("[WARN] Redis 删除芸汐撤回候选失败: {}", error);
     }
 }
 

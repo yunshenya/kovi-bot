@@ -1190,12 +1190,25 @@ pub async fn send_sys_info(bot: Arc<RuntimeBot>, group_id: i64) {
             Ok(Err(error)) => format!("查询失败（retcode={}）", error.retcode),
             Err(_) => "查询超时".to_string(),
         };
+    let postgres_status = match kovi::tokio::time::timeout(
+        Duration::from_secs(3),
+        MEMORY_MANAGER.check_storage_health(),
+    )
+    .await
+    {
+        Ok(Ok(())) => "已连接且正常",
+        Ok(Err(_)) => "未初始化或不可用",
+        Err(_) => "查询超时",
+    };
+    let redis_status = crate::redis_store::health_status().await;
     let system_info = utils::system_info_get();
     let content = format!(
-        "系统信息\n系统运行时间：{}\n{}\nQQ适配器状态：{}\n当前使用的模型：{}\n模型鉴权：{}\n配置文件最后修改时间：{}",
+        "系统信息\n系统运行时间：{}\n{}\nQQ适配器状态：{}\nPostgreSQL：{}\nRedis：{}\n当前使用的模型：{}\n模型鉴权：{}\n配置文件最后修改时间：{}",
         system_info.0,
         system_info.1,
         adapter_status,
+        postgres_status,
+        redis_status,
         server_config.model_name(),
         model_auth,
         get_file_modified_time_formatted().unwrap_or_else(|_| "获取失败".to_string()),

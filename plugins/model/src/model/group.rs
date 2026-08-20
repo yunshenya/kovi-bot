@@ -8,6 +8,7 @@ use crate::model::reply::record_reply_target;
 use crate::model::utils::{
     learn_user_profile_from_message, requests_no_reply, send_sys_info, silence,
 };
+use crate::redis_store;
 use crate::sticker_memory::{
     StickerScope, extract_stickers, has_reply, known_labels, quoted_message_context,
     stickers_for_teaching, teach, teaching_label, with_quoted_context, with_sticker_context,
@@ -655,25 +656,52 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
 async fn should_suppress_direct_trigger(group_id: i64, user_id: i64, message: &str) -> bool {
     let limits = config::get().group_interjection().clone();
     let now = Instant::now();
-    let mut states = DIRECT_TRIGGER_STATES.lock().await;
-    if states.len() > 2_048 {
-        let retention = Duration::from_secs(limits.direct_spam_cooldown_secs().saturating_mul(2));
-        states.retain(|_, state| {
-            state
-                .last_seen
-                .is_some_and(|last_seen| now.duration_since(last_seen) < retention)
-        });
+    let local_suppressed = {
+        let mut states = DIRECT_TRIGGER_STATES.lock().await;
+        if states.len() > 2_048 {
+            let retention =
+                Duration::from_secs(limits.direct_spam_cooldown_secs().saturating_mul(2));
+            states.retain(|_, state| {
+                state
+                    .last_seen
+                    .is_some_and(|last_seen| now.duration_since(last_seen) < retention)
+            });
+        }
+        let state = states.entry((group_id, user_id)).or_default();
+        suppress_direct_trigger(
+            state,
+            &normalize_for_spam_detection(message),
+            now,
+            Duration::from_secs(limits.direct_repeat_window_secs()),
+            Duration::from_secs(limits.direct_spam_cooldown_secs()),
+            Duration::from_secs(limits.direct_rate_window_secs()),
+            limits.direct_rate_limit(),
+        )
+    };
+    if local_suppressed {
+        return true;
     }
-    let state = states.entry((group_id, user_id)).or_default();
-    suppress_direct_trigger(
-        state,
-        &normalize_for_spam_detection(message),
-        now,
-        Duration::from_secs(limits.direct_repeat_window_secs()),
-        Duration::from_secs(limits.direct_spam_cooldown_secs()),
-        Duration::from_secs(limits.direct_rate_window_secs()),
-        limits.direct_rate_limit(),
-    )
+
+    let Some(store) = redis_store::get().await else {
+        return false;
+    };
+    let rate_window = Duration::from_secs(limits.direct_rate_window_secs());
+    let rate_key = format!("rate:direct-trigger:group:{group_id}:user:{user_id}");
+    match store.increment_expiring(&rate_key, rate_window).await {
+        Ok(count) if count > limits.direct_rate_limit() as i64 => {
+            let mut states = DIRECT_TRIGGER_STATES.lock().await;
+            if let Some(state) = states.get_mut(&(group_id, user_id)) {
+                state.blocked_until =
+                    Some(Instant::now() + Duration::from_secs(limits.direct_spam_cooldown_secs()));
+            }
+            true
+        }
+        Ok(_) => false,
+        Err(error) => {
+            eprintln!("[WARN] Redis 直接点名限流失败，继续使用本地限流: {}", error);
+            false
+        }
+    }
 }
 
 fn suppress_direct_trigger(

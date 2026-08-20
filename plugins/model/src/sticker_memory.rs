@@ -8,7 +8,8 @@ use anyhow::{Result, anyhow};
 use kovi::bot::message::Segment;
 use kovi::{Message, RuntimeBot};
 use serde_json::{Map, Value};
-use sqlx::Row;
+use sqlx_core::query::query;
+use sqlx_core::row::Row;
 use std::collections::{HashMap, HashSet};
 
 const TEACH_COMMANDS: [&str; 2] = ["#教芸汐", "#教云汐"];
@@ -57,7 +58,7 @@ pub(crate) async fn initialize_database() -> Result<()> {
         .database_pool()
         .ok_or_else(|| anyhow!("PostgreSQL 记忆连接池尚未初始化"))?;
 
-    sqlx::query(
+    query(
         r#"
         CREATE TABLE IF NOT EXISTS kovi_bot_sticker_memory (
             sticker_key TEXT NOT NULL,
@@ -77,20 +78,20 @@ pub(crate) async fn initialize_database() -> Result<()> {
     .map_err(|error| anyhow!("创建表情包记忆表失败: {error}"))?;
 
     // 兼容第一版只有 sticker_key 主键的表：旧标签迁移为全局默认值。
-    sqlx::query(
+    query(
         "ALTER TABLE kovi_bot_sticker_memory ADD COLUMN IF NOT EXISTS scope_type TEXT NOT NULL DEFAULT 'global'",
     )
     .execute(pool)
     .await
     .map_err(|error| anyhow!("迁移表情包作用域失败: {error}"))?;
-    sqlx::query(
+    query(
         "ALTER TABLE kovi_bot_sticker_memory ADD COLUMN IF NOT EXISTS scope_id BIGINT NOT NULL DEFAULT 0",
     )
     .execute(pool)
     .await
     .map_err(|error| anyhow!("迁移表情包作用域失败: {error}"))?;
 
-    let primary_key_columns = sqlx::query(
+    let primary_key_columns = query(
         r#"
         SELECT a.attname AS column_name
         FROM pg_index i
@@ -107,12 +108,10 @@ pub(crate) async fn initialize_database() -> Result<()> {
     .collect::<Vec<_>>();
     if primary_key_columns == ["sticker_key"] {
         let mut transaction = pool.begin().await?;
-        sqlx::query(
-            "ALTER TABLE kovi_bot_sticker_memory DROP CONSTRAINT kovi_bot_sticker_memory_pkey",
-        )
-        .execute(&mut *transaction)
-        .await?;
-        sqlx::query(
+        query("ALTER TABLE kovi_bot_sticker_memory DROP CONSTRAINT kovi_bot_sticker_memory_pkey")
+            .execute(&mut *transaction)
+            .await?;
+        query(
             "ALTER TABLE kovi_bot_sticker_memory ADD CONSTRAINT kovi_bot_sticker_memory_pkey PRIMARY KEY (sticker_key, scope_type, scope_id)",
         )
         .execute(&mut *transaction)
@@ -120,7 +119,7 @@ pub(crate) async fn initialize_database() -> Result<()> {
         transaction.commit().await?;
     }
 
-    sqlx::query(
+    query(
         "CREATE INDEX IF NOT EXISTS kovi_bot_sticker_memory_updated_at_idx ON kovi_bot_sticker_memory (updated_at DESC)",
     )
     .execute(pool)
@@ -442,7 +441,7 @@ pub(crate) async fn teach(
     };
     let mut transaction = pool.begin().await?;
     for sticker in stickers {
-        sqlx::query(
+        query(
             r#"
             INSERT INTO kovi_bot_sticker_memory
                 (sticker_key, scope_type, scope_id, label, learned_by, learned_in_group, created_at, updated_at)
@@ -486,7 +485,7 @@ pub(crate) async fn known_labels(
         .map(|sticker| sticker.key.clone())
         .collect::<Vec<_>>();
     let (scope_type, scope_id) = scope.database_values();
-    let rows = sqlx::query(
+    let rows = query(
         r#"
         SELECT sticker_key, label,
                CASE WHEN scope_type = $2 AND scope_id = $3 THEN 0 ELSE 1 END AS priority

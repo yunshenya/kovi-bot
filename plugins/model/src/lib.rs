@@ -19,6 +19,7 @@ use std::sync::{
 pub mod config;
 // 核心模型处理模块
 mod model;
+mod redis_store;
 mod vision;
 // 工具函数模块
 mod utils;
@@ -69,6 +70,9 @@ async fn main() {
             error
         );
     }
+
+    // Redis 只承载可丢失的运行态；连接失败时各模块会继续使用本地兜底。
+    redis_store::initialize().await;
 
     // 注册聊天功能宏，定义消息处理函数映射
     register_chat_function! {

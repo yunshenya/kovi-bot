@@ -10,6 +10,8 @@ Responses 或 Chat Completions 的模型服务、长期记忆、情绪与用户�
 ```bash
 export OPENAI_API_KEY="你的 GPT API Token"
 export DATABASE_URL="postgresql://postgres:数据库密码@127.0.0.1:5432/postgres"
+# 可选：启用 Redis 运行态共享；未配置时自动回退到进程内内存
+export REDIS_URL="redis://127.0.0.1:6379/0"
 cargo run
 ```
 
@@ -49,6 +51,7 @@ secure = false
 - `VISION_API_TOKEN`：可选，切换到 DeepSeek 时使用的独立视觉模型 Token
 - `NAPCAT_ACCESS_TOKEN`：NapCat WebSocket 服务端 Token
 - `POSTGRES_PASSWORD`：服务器本机 `postgres` 用户的数据库密码
+- `REDIS_URL`：可选，Redis 连接地址；不配置时部署默认使用 `redis://127.0.0.1:6379/0`
 
 部署生成的 `.env` 和 `kovi.conf.toml` 权限受限，Token 和数据库密码不会写入仓库。服务器与 NapCat、PostgreSQL 位于同一台机器，因此部署配置分别使用 `127.0.0.1:3001` 和 `127.0.0.1:5432`。
 
@@ -126,6 +129,8 @@ recent_topic_cooldown_secs = 604800
 配置 `main_admin` 后，该用户的关系等级会自动保持为最高。她会使用独立的主动私聊策略：每隔 `main_admin_decision_interval_secs`（默认 3 小时）才让模型基于近期互动、对话摘要、当前情绪与时间，自主决定是否联系以及说什么；没有固定日上限或固定发送间隔。该间隔只限制决策请求频率，避免每轮检查都额外消耗 token；此策略不与普通群聊/私聊随机推送竞争。
 
 每段群聊和私聊还会维护一份可持久化的滚动摘要。短期记录超过 `max_conversation_messages`（默认 25 条）或估算超过 `max_conversation_tokens`（默认 6000 token）时，模型会将较早消息连同旧摘要压缩为不超过 `summary_max_chars`（默认 1500 字）的新摘要，并尽量保留最近 `summary_keep_recent_messages`（默认 15 条）原文继续聊天。模型暂时不可用时，会使用截断后的本地片段作为降级摘要，避免直接遗失上下文。
+
+应用运行时不再使用 SQLite，`sqlx` 只启用 PostgreSQL；长期记忆、用户档案、群组档案、滚动摘要、人格和表情包记忆全部由 PostgreSQL 持久化。Redis 只保存可重建的短期运行态：芸汐最近 110 秒内可主动撤回的消息候选、等待图片的临时标记，以及直接点名限流计数。Redis 不可用时这些功能会回退到进程内状态，不会阻断启动，也不会把群名片和 QQ 昵称拼接写入记忆档案。
 
 当自动附带的上下文仍不足时，芸汐可以自主提出一次受限的长期记忆查询，选择关键词、回看天数、记忆类型、最低重要性和结果数量；默认单次回复最多查询 2 轮、每轮返回 8 条。程序会把查询强制限定在当前私聊对象或当前群，并使用参数化 SQL 查询 PostgreSQL。模型不能指定用户号、群号、表名或 SQL，也不能借此写入、修改或删除数据；查询设有 2 秒超时、字段长度和返回数量限制。普通寒暄和已有足够上下文的对话不会额外查询模型。
 
