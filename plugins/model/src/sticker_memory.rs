@@ -39,6 +39,7 @@ pub(crate) struct QuotedMessageContext {
     pub(crate) content: String,
     pub(crate) message_id: Option<i32>,
     pub(crate) sender_id: Option<i64>,
+    pub(crate) sender_label: Option<String>,
     pub(crate) images: Vec<ImageAttachment>,
 }
 
@@ -47,6 +48,7 @@ struct FetchedMessage {
     message: Message,
     message_id: i32,
     sender_id: Option<i64>,
+    sender_label: Option<String>,
 }
 
 /// 创建独立表情包表。该表不属于 JSON 记忆快照，因此可单独查询和更新。
@@ -202,11 +204,13 @@ async fn fetch_replied_message(
         .pointer("/sender/user_id")
         .and_then(value_as_i64)
         .or_else(|| response.data.get("user_id").and_then(value_as_i64));
+    let sender_label = quoted_sender_label(&response.data);
 
     Ok(Some(FetchedMessage {
         message: original_message,
         message_id,
         sender_id,
+        sender_label,
     }))
 }
 
@@ -277,6 +281,32 @@ fn value_as_i64(value: &Value) -> Option<i64> {
         .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
 }
 
+fn quoted_sender_label(value: &Value) -> Option<String> {
+    let sender = value.get("sender").and_then(Value::as_object)?;
+    let user_id = sender.get("user_id").and_then(value_as_i64);
+    let nickname = sender
+        .get("nickname")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let card = sender
+        .get("card")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if user_id.is_none() && nickname.is_none() && card.is_none() {
+        return None;
+    }
+    Some(format!(
+        "群名片={}；QQ昵称={}；QQ号={}",
+        card.unwrap_or("未设置"),
+        nickname.unwrap_or("未设置"),
+        user_id
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "未知".to_string())
+    ))
+}
+
 fn extract_text(message: &Message) -> String {
     message
         .iter()
@@ -315,6 +345,7 @@ pub(crate) async fn quoted_message_context(
         content,
         message_id: Some(quoted.message_id),
         sender_id: quoted.sender_id,
+        sender_label: quoted.sender_label,
         images,
     }))
 }
@@ -325,15 +356,20 @@ pub(crate) fn with_quoted_context(current: &str, quoted: &QuotedMessageContext) 
         .message_id
         .map(|message_id| format!("消息ID：{}\n", message_id))
         .unwrap_or_default();
+    let sender_label = quoted
+        .sender_label
+        .as_deref()
+        .map(|label| format!("发送者身份：{}\n", label))
+        .unwrap_or_default();
     if current.is_empty() {
         format!(
-            "当前消息正在回复以下内容：\n{}{}",
-            quoted_label, quoted.content
+            "当前消息正在回复以下内容：\n{}{}{}",
+            sender_label, quoted_label, quoted.content
         )
     } else {
         format!(
-            "当前消息正在回复以下内容：\n{}{}\n当前消息：{}",
-            quoted_label, quoted.content, current
+            "当前消息正在回复以下内容：\n{}{}{}\n当前消息：{}",
+            sender_label, quoted_label, quoted.content, current
         )
     }
 }
@@ -569,11 +605,27 @@ mod tests {
             content: "上一句话".to_string(),
             message_id: Some(41),
             sender_id: Some(42),
+            sender_label: None,
             images: Vec::new(),
         };
         assert_eq!(
             with_quoted_context("你说得对", &quoted),
             "当前消息正在回复以下内容：\n消息ID：41\n上一句话\n当前消息：你说得对"
+        );
+    }
+
+    #[test]
+    fn quoted_group_sender_keeps_card_and_qq_nickname() {
+        assert_eq!(
+            super::quoted_sender_label(&json!({
+                "sender": {
+                    "user_id": 42,
+                    "nickname": "QQ用户名",
+                    "card": "群内昵称"
+                }
+            }))
+            .as_deref(),
+            Some("群名片=群内昵称；QQ昵称=QQ用户名；QQ号=42")
         );
     }
 

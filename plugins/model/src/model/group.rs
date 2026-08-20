@@ -3,7 +3,7 @@ use crate::health_check::HealthChecker;
 use crate::memory::{GroupProfile, MEMORY_MANAGER};
 use crate::model::coalesce::{MessageCoalescer, MessagePart};
 use crate::model::interrupt::{ReplyScope, interrupt, is_active, is_explicit_stop_message};
-use crate::model::recall::has_recalled_messages;
+use crate::model::recall::{has_recalled_messages, send_tracked_group_message};
 use crate::model::reply::record_reply_target;
 use crate::model::utils::{
     learn_user_profile_from_message, requests_no_reply, send_sys_info, silence,
@@ -21,6 +21,7 @@ use crate::vision::{
 use chrono::Local;
 use kovi::RuntimeBot;
 use kovi::event::GroupMsgEvent;
+use kovi::serde_json::json;
 use kovi::tokio::sync::Mutex;
 use rand::Rng;
 use std::collections::{HashMap, VecDeque};
@@ -61,6 +62,65 @@ struct PendingWindowMessage {
     message_ids: Vec<i32>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GroupSenderIdentity {
+    user_id: i64,
+    qq_nickname: String,
+    group_card: Option<String>,
+}
+
+impl GroupSenderIdentity {
+    fn from_event(event: &GroupMsgEvent) -> Self {
+        Self {
+            user_id: event.user_id,
+            qq_nickname: normalized_sender_name(event.sender.nickname.as_deref())
+                .unwrap_or_else(|| format!("QQ用户_{}", event.user_id)),
+            group_card: normalized_sender_name(event.sender.card.as_deref()),
+        }
+    }
+
+    fn display_name(&self) -> &str {
+        self.group_card.as_deref().unwrap_or(&self.qq_nickname)
+    }
+
+    fn model_sender(&self, time: &str) -> String {
+        format!(
+            "[{}] 群成员身份={}",
+            time,
+            json!({
+                "群名片": self.group_card.as_deref().unwrap_or("未设置"),
+                "群内称呼": self.display_name(),
+                "QQ昵称": self.qq_nickname,
+                "QQ号": self.user_id,
+            })
+        )
+    }
+
+    fn reply_target_label(&self) -> String {
+        format!(
+            "群名片={}；QQ昵称={}；QQ号={}",
+            self.group_card.as_deref().unwrap_or("未设置"),
+            self.qq_nickname,
+            self.user_id
+        )
+    }
+}
+
+fn normalized_sender_name(value: Option<&str>) -> Option<String> {
+    let value = value?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let normalized = value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(80)
+        .collect::<String>();
+    (!normalized.is_empty()).then_some(normalized)
+}
+
 /// 当前回复期间只保留每个群组的一条待处理窗口消息，避免高频消息把模型请求反复取消。
 static PENDING_WINDOW_MESSAGES: LazyLock<Mutex<HashMap<i64, PendingWindowMessage>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -83,8 +143,9 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
     let group_id = event.group_id;
     let time_now_data = Local::now();
     let time = time_now_data.format("%H:%M:%S").to_string();
-    let nickname = event.get_sender_nickname();
-    let sender = format!("[{}] {}", time, nickname);
+    let sender_identity = GroupSenderIdentity::from_event(&event);
+    let nickname = sender_identity.qq_nickname.clone();
+    let sender = sender_identity.model_sender(&time);
     let message = event.borrow_text().unwrap_or_default();
     let stickers = extract_stickers(&event.message);
     let current_images = extract_image_attachments(&event.message);
@@ -95,7 +156,7 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
         reply_scope,
         event.message_id,
         Some(event.user_id),
-        nickname.clone(),
+        sender_identity.reply_target_label(),
         &event.human_text,
     )
     .await;
@@ -125,7 +186,7 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
     }
 
     if is_admin_command(message) && !is_bot_admin(&bot, event.user_id) {
-        bot.send_group_msg(group_id, "这个命令只有管理员可以使用哦。");
+        send_tracked_group_message(&bot, group_id, "这个命令只有管理员可以使用哦。").await;
         return;
     }
 
@@ -133,23 +194,41 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
         match stickers_for_teaching(&event.message, &bot).await {
             Ok(teaching_stickers) if !teaching_stickers.is_empty() => {
                 match teach(&teaching_stickers, &label, event.user_id, sticker_scope).await {
-                    Ok(count) => bot.send_group_msg(
-                        group_id,
-                        format!("记住啦，这 {count} 个表情以后表示“{label}”。"),
-                    ),
+                    Ok(count) => {
+                        send_tracked_group_message(
+                            &bot,
+                            group_id,
+                            format!("记住啦，这 {count} 个表情以后表示“{label}”。"),
+                        )
+                        .await;
+                    }
                     Err(error) => {
                         eprintln!("[ERROR] 群聊保存表情包记忆失败: {}", error);
-                        bot.send_group_msg(group_id, "这次没能记住，稍后再教我一次吧。");
+                        send_tracked_group_message(
+                            &bot,
+                            group_id,
+                            "这次没能记住，稍后再教我一次吧。",
+                        )
+                        .await;
                     }
                 }
             }
-            Ok(_) => bot.send_group_msg(
-                group_id,
-                "请回复（引用）那张表情包，再发送 #教芸汐 这个表情是……哦。",
-            ),
+            Ok(_) => {
+                send_tracked_group_message(
+                    &bot,
+                    group_id,
+                    "请回复（引用）那张表情包，再发送 #教芸汐 这个表情是……哦。",
+                )
+                .await;
+            }
             Err(error) => {
                 eprintln!("[ERROR] 群聊读取被引用表情失败: {}", error);
-                bot.send_group_msg(group_id, "我没能读到被引用的表情，请重新引用后再试一次哦。");
+                send_tracked_group_message(
+                    &bot,
+                    group_id,
+                    "我没能读到被引用的表情，请重新引用后再试一次哦。",
+                )
+                .await;
             }
         }
         return;
@@ -217,10 +296,12 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
     );
     let vision_requested = image_intent == ImageIntent::VisualUnderstand;
     if vision_command && images.is_empty() {
-        bot.send_group_msg(
+        send_tracked_group_message(
+            &bot,
             group_id,
             "请把截图和 #看截图 放在一起，或回复那张截图再发送命令哦。",
-        );
+        )
+        .await;
         return;
     }
     if message.trim().is_empty()
@@ -330,15 +411,22 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
         match resolve_image_urls(&images, &bot).await {
             Ok(images) if !images.is_empty() => images,
             Ok(_) => {
-                bot.send_group_msg(
+                send_tracked_group_message(
+                    &bot,
                     group_id,
                     "我暂时拿不到这张截图的内容，再发一次或换张图试试吧。",
-                );
+                )
+                .await;
                 return;
             }
             Err(error) => {
                 eprintln!("[ERROR] 群聊读取截图失败 (群组: {}): {}", group_id, error);
-                bot.send_group_msg(group_id, "我暂时读不到这张截图，再发一次或换张图试试吧。");
+                send_tracked_group_message(
+                    &bot,
+                    group_id,
+                    "我暂时读不到这张截图，再发一次或换张图试试吧。",
+                )
+                .await;
                 return;
             }
         }
@@ -390,39 +478,48 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
             send_sys_info(Arc::clone(&bot), group_id).await;
         }
 
-        "#重载配置文件" => match config::reload_config_from_file() {
-            Ok(_) => bot.send_group_msg(group_id, "配置重载成功"),
-            Err(e) => bot.send_group_msg(group_id, format!("配置重载失败: {}", e)),
-        },
+        "#重载配置文件" => {
+            let result = match config::reload_config_from_file() {
+                Ok(_) => "配置重载成功".to_string(),
+                Err(e) => format!("配置重载失败: {}", e),
+            };
+            send_tracked_group_message(&bot, group_id, result).await;
+        }
 
-        "#重载全部配置" => match config::reload_config() {
-            Ok(_) => bot.send_group_msg(group_id, "全部配置文件重载成功"),
-            Err(e) => bot.send_group_msg(group_id, format!("重载失败： {}", e)),
-        },
+        "#重载全部配置" => {
+            let result = match config::reload_config() {
+                Ok(_) => "全部配置文件重载成功".to_string(),
+                Err(e) => format!("重载失败： {}", e),
+            };
+            send_tracked_group_message(&bot, group_id, result).await;
+        }
 
         "#启用自动重载" => {
             if config::is_auto_reload_enabled() {
-                bot.send_group_msg(group_id, "自动重载已经启用");
+                send_tracked_group_message(&bot, group_id, "自动重载已经启用").await;
             } else {
                 config::enable_auto_reload(Duration::from_secs(5));
-                bot.send_group_msg(group_id, "自动重载已启用，每5秒检查一次");
+                send_tracked_group_message(&bot, group_id, "自动重载已启用，每5秒检查一次").await;
             }
         }
 
         "#禁用自动重载" => {
             if config::is_auto_reload_enabled() {
                 config::disable_auto_reload();
-                bot.send_group_msg(group_id, "自动重载已禁用");
+                send_tracked_group_message(&bot, group_id, "自动重载已禁用").await;
             } else {
-                bot.send_group_msg(group_id, "自动重载未启用");
+                send_tracked_group_message(&bot, group_id, "自动重载未启用").await;
             }
         }
 
-        "#检查配置变化" => match config::check_and_reload() {
-            Ok(true) => bot.send_group_msg(group_id, "检测到配置变化，已自动重载"),
-            Ok(false) => bot.send_group_msg(group_id, "配置文件无变化"),
-            Err(e) => bot.send_group_msg(group_id, format!("检查配置失败: {}", e)),
-        },
+        "#检查配置变化" => {
+            let result = match config::check_and_reload() {
+                Ok(true) => "检测到配置变化，已自动重载".to_string(),
+                Ok(false) => "配置文件无变化".to_string(),
+                Err(e) => format!("检查配置失败: {}", e),
+            };
+            send_tracked_group_message(&bot, group_id, result).await;
+        }
 
         "#自动重载状态" => {
             let status = if config::is_auto_reload_enabled() {
@@ -430,7 +527,8 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
             } else {
                 "已禁用"
             };
-            bot.send_group_msg(group_id, format!("配置自动重载状态: {}", status));
+            send_tracked_group_message(&bot, group_id, format!("配置自动重载状态: {}", status))
+                .await;
         }
 
         "#健康检查" => {
@@ -460,7 +558,7 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
                 )
             };
 
-            bot.send_group_msg(group_id, &status_msg);
+            send_tracked_group_message(&bot, group_id, status_msg).await;
         }
         _ => {
             // 被点名时始终处理；未点名消息仅由本地节流器偶尔抽样，不逐条调用模型。
@@ -540,7 +638,7 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
             } else if let Err(error) = MEMORY_MANAGER
                 .add_conversation_memory(
                     group_id,
-                    &format!("{}: {}", nickname, model_message),
+                    &format!("{}: {}", sender, model_message),
                     "group_observation",
                 )
                 .await
@@ -1142,11 +1240,12 @@ fn extract_topics_from_message(message: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DirectTriggerState, GroupInterjectionState, complete_interjection_attempt,
-        conversation_message_is_relevant, decision_budget_available, extract_topics_from_message,
-        has_active_conversation_window, infer_group_personality, is_admin_command,
-        is_interjection_candidate, normalize_for_spam_detection, prune_decision_attempts,
-        should_defer_active_window_message, suppress_direct_trigger,
+        DirectTriggerState, GroupInterjectionState, GroupSenderIdentity,
+        complete_interjection_attempt, conversation_message_is_relevant, decision_budget_available,
+        extract_topics_from_message, has_active_conversation_window, infer_group_personality,
+        is_admin_command, is_interjection_candidate, normalize_for_spam_detection,
+        normalized_sender_name, prune_decision_attempts, should_defer_active_window_message,
+        suppress_direct_trigger,
     };
     use std::time::{Duration, Instant};
 
@@ -1159,6 +1258,33 @@ mod tests {
             infer_group_personality("一起讨论代码和技术吧", "friendly"),
             "knowledgeable"
         );
+    }
+
+    #[test]
+    fn group_identity_keeps_card_and_qq_nickname_separate() {
+        let identity = GroupSenderIdentity {
+            user_id: 123,
+            qq_nickname: "QQ用户名".to_string(),
+            group_card: Some("群内昵称".to_string()),
+        };
+        assert_eq!(identity.display_name(), "群内昵称");
+        let sender = identity.model_sender("12:34:56");
+        assert!(sender.contains("群内昵称"));
+        assert!(sender.contains("QQ用户名"));
+        assert!(sender.contains("123"));
+        assert_eq!(
+            identity.reply_target_label(),
+            "群名片=群内昵称；QQ昵称=QQ用户名；QQ号=123"
+        );
+    }
+
+    #[test]
+    fn sender_names_are_trimmed_without_merging_identity_fields() {
+        assert_eq!(
+            normalized_sender_name(Some("  群 名片\n测试  ")).as_deref(),
+            Some("群 名片 测试")
+        );
+        assert_eq!(normalized_sender_name(Some("   ")), None);
     }
 
     #[test]

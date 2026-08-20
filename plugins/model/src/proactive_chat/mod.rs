@@ -8,6 +8,7 @@
 
 use crate::memory::MemoryManager;
 use crate::model::utils::{BotMemory, Roles, params_model};
+use crate::model::{send_tracked_group_message, send_tracked_private_message};
 use crate::mood_system::MOOD_SYSTEM;
 use crate::topic_generator::TopicGenerator;
 use anyhow::Result;
@@ -157,7 +158,9 @@ impl ProactiveChatManager {
         let Some(message) = message else {
             return Ok(false);
         };
-        self.bot.send_private_msg(main_admin, &message);
+        if !send_tracked_private_message(&self.bot, main_admin, message.clone()).await {
+            return Ok(false);
+        }
         self.memory_manager
             .add_conversation_memory(
                 main_admin,
@@ -322,7 +325,9 @@ impl ProactiveChatManager {
             let content = topic.content.clone();
 
             // 发送消息
-            self.bot.send_group_msg(group_id, &content);
+            if !send_tracked_group_message(&self.bot, group_id, content.clone()).await {
+                return Ok(());
+            }
 
             // 记录这次主动对话
             self.memory_manager
@@ -356,7 +361,9 @@ impl ProactiveChatManager {
             let content = topic.content.clone();
 
             // 发送消息
-            self.bot.send_private_msg(user_id, &content);
+            if !send_tracked_private_message(&self.bot, user_id, content.clone()).await {
+                return Ok(false);
+            }
 
             // 记录这次主动对话
             self.memory_manager

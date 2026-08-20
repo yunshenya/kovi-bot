@@ -120,10 +120,14 @@ impl ThinkingReporter {
         }
         let message_id = match self.destination {
             ThinkingDestination::Group(group_id) => {
-                self.bot.send_group_msg_return(group_id, notice).await
+                self.bot
+                    .send_group_msg_return(group_id, notice.clone())
+                    .await
             }
             ThinkingDestination::Private(user_id) => {
-                self.bot.send_private_msg_return(user_id, notice).await
+                self.bot
+                    .send_private_msg_return(user_id, notice.clone())
+                    .await
             }
         };
         if let Ok(message_id) = message_id {
@@ -135,7 +139,7 @@ impl ThinkingReporter {
                     crate::model::interrupt::ReplyScope::Private(user_id)
                 }
             };
-            record_bot_message(scope, self.ticket, message_id, &self.bot).await;
+            record_bot_message(scope, self.ticket, message_id, &notice, &self.bot).await;
         }
     }
 

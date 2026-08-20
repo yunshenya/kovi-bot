@@ -1,6 +1,6 @@
 use crate::model::coalesce::{MessageCoalescer, MessagePart};
 use crate::model::interrupt::{ReplyScope, interrupt, is_active, is_explicit_stop_message};
-use crate::model::recall::has_recalled_messages;
+use crate::model::recall::{has_recalled_messages, send_tracked_private_message};
 use crate::model::reply::record_reply_target;
 use crate::model::utils::{private_chat, requests_no_reply};
 use crate::sticker_memory::{
@@ -74,23 +74,41 @@ pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<Runtime
                 )
                 .await
                 {
-                    Ok(count) => bot.send_private_msg(
-                        user_id,
-                        format!("记住啦，这 {count} 个表情以后表示“{label}”。"),
-                    ),
+                    Ok(count) => {
+                        send_tracked_private_message(
+                            &bot,
+                            user_id,
+                            format!("记住啦，这 {count} 个表情以后表示“{label}”。"),
+                        )
+                        .await;
+                    }
                     Err(error) => {
                         eprintln!("[ERROR] 私聊保存表情包记忆失败: {}", error);
-                        bot.send_private_msg(user_id, "这次没能记住，稍后再教我一次吧。");
+                        send_tracked_private_message(
+                            &bot,
+                            user_id,
+                            "这次没能记住，稍后再教我一次吧。",
+                        )
+                        .await;
                     }
                 }
             }
-            Ok(_) => bot.send_private_msg(
-                user_id,
-                "请回复（引用）那张表情包，再发送 #教芸汐 这个表情是……哦。",
-            ),
+            Ok(_) => {
+                send_tracked_private_message(
+                    &bot,
+                    user_id,
+                    "请回复（引用）那张表情包，再发送 #教芸汐 这个表情是……哦。",
+                )
+                .await;
+            }
             Err(error) => {
                 eprintln!("[ERROR] 私聊读取被引用表情失败: {}", error);
-                bot.send_private_msg(user_id, "我没能读到被引用的表情，请重新引用后再试一次哦。");
+                send_tracked_private_message(
+                    &bot,
+                    user_id,
+                    "我没能读到被引用的表情，请重新引用后再试一次哦。",
+                )
+                .await;
             }
         }
         return;
@@ -150,10 +168,12 @@ pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<Runtime
     );
     let vision_requested = image_intent == ImageIntent::VisualUnderstand;
     if vision_command && images.is_empty() {
-        bot.send_private_msg(
+        send_tracked_private_message(
+            &bot,
             user_id,
             "请把截图和 #看截图 放在一起，或回复那张截图再发送命令哦。",
-        );
+        )
+        .await;
         return;
     }
     if message.trim().is_empty() && stickers.is_empty() && !has_reply(&event.message) {
@@ -250,15 +270,22 @@ pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<Runtime
         match resolve_image_urls(&images, &bot).await {
             Ok(images) if !images.is_empty() => images,
             Ok(_) => {
-                bot.send_private_msg(
+                send_tracked_private_message(
+                    &bot,
                     user_id,
                     "我暂时拿不到这张截图的内容，再发一次或换张图试试吧。",
-                );
+                )
+                .await;
                 return;
             }
             Err(error) => {
                 eprintln!("[ERROR] 私聊读取截图失败 (用户: {}): {}", user_id, error);
-                bot.send_private_msg(user_id, "我暂时读不到这张截图，再发一次或换张图试试吧。");
+                send_tracked_private_message(
+                    &bot,
+                    user_id,
+                    "我暂时读不到这张截图，再发一次或换张图试试吧。",
+                )
+                .await;
                 return;
             }
         }
