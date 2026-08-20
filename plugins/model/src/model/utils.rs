@@ -1175,41 +1175,43 @@ pub async fn silence(
 
 pub async fn send_sys_info(bot: Arc<RuntimeBot>, group_id: i64) {
     let server_config = config::get().server_config().clone();
-    let credentials_ready = !server_config.requires_auth()
+    let model_auth_status = !server_config.requires_auth()
         || std::env::var(server_config.api_key_env())
             .map(|token| !token.trim().is_empty())
             .unwrap_or(false);
-    if credentials_ready {
-        let system_info = utils::system_info_get();
-        let option_status = bot.get_status().await;
-        if let Ok(status) = option_status {
-            let now_status = status
-                .data
-                .get("memory")
-                .and_then(|t| t.as_i64())
-                .unwrap_or(0);
-            send_tracked_group_message(
-                &bot,
-                group_id,
-                format!(
-                    "{} \n系统运行时间：{} \n{} \nLagrange占用: {}MB,\n当前使用的模型为:{}\n配置文件最后修改时间为:{}",
-                    "对话功能是正常的哦",
-                    system_info.0,
-                    system_info.1,
-                    (now_status / 1024) / 1024,
-                    server_config.model_name(),
-                    get_file_modified_time_formatted().unwrap_or(String::from("获取失败")),
-                ),
-            )
-            .await;
-        }
+    let model_auth = if model_auth_status {
+        "已配置".to_string()
     } else {
-        send_tracked_group_message(
-            &bot,
-            group_id,
-            format!("未设置{}", server_config.api_key_env()),
-        )
-        .await;
+        format!("未配置（{}）", server_config.api_key_env())
+    };
+    let adapter_status =
+        match kovi::tokio::time::timeout(Duration::from_secs(3), bot.get_status()).await {
+            Ok(Ok(status)) => format_adapter_status(&status.data),
+            Ok(Err(error)) => format!("查询失败（retcode={}）", error.retcode),
+            Err(_) => "查询超时".to_string(),
+        };
+    let system_info = utils::system_info_get();
+    let content = format!(
+        "系统信息\n系统运行时间：{}\n{}\nQQ适配器状态：{}\n当前使用的模型：{}\n模型鉴权：{}\n配置文件最后修改时间：{}",
+        system_info.0,
+        system_info.1,
+        adapter_status,
+        server_config.model_name(),
+        model_auth,
+        get_file_modified_time_formatted().unwrap_or_else(|_| "获取失败".to_string()),
+    );
+    send_tracked_group_message(&bot, group_id, content).await;
+}
+
+fn format_adapter_status(data: &Value) -> String {
+    let online = data.get("online").and_then(Value::as_bool);
+    let good = data.get("good").and_then(Value::as_bool);
+    match (online, good) {
+        (Some(true), Some(true)) => "在线且健康".to_string(),
+        (Some(true), Some(false)) => "在线但异常".to_string(),
+        (Some(false), _) => "离线".to_string(),
+        (Some(true), None) => "在线".to_string(),
+        _ => "接口正常（未提供详细状态）".to_string(),
     }
 }
 
@@ -1840,6 +1842,23 @@ mod tests {
     };
     use crate::memory::BotPersonality;
     use chrono::Local;
+    use kovi::serde_json::json;
+
+    #[test]
+    fn adapter_status_is_reported_without_assuming_a_memory_field() {
+        assert_eq!(
+            super::format_adapter_status(&json!({"online": true, "good": true})),
+            "在线且健康"
+        );
+        assert_eq!(
+            super::format_adapter_status(&json!({"online": false})),
+            "离线"
+        );
+        assert_eq!(
+            super::format_adapter_status(&json!({"memory": 123})),
+            "接口正常（未提供详细状态）"
+        );
+    }
 
     #[test]
     fn profile_signals_are_extracted_from_messages() {

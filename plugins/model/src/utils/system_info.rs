@@ -19,9 +19,9 @@ pub fn system_info_get() -> (String, String) {
     if let Ok(pid) = sysinfo::get_current_pid()
         && let Some(process) = system.process(pid)
     {
-        process_now = format!("内存占用: {} MB", (process.memory() / 1024) / 1024);
+        process_now = format!("芸汐进程内存: {} MB", (process.memory() / 1024) / 1024);
     } else {
-        process_now.push_str("内存占用: 获取失败");
+        process_now.push_str("芸汐进程内存: 获取失败");
     }
     (update_time, process_now)
 }
