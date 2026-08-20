@@ -31,6 +31,8 @@ pub mod mood_system;
 pub mod proactive_chat;
 // 健康检查系统
 pub mod health_check;
+// PostgreSQL 表情包记忆库
+pub(crate) mod sticker_memory;
 
 /// 后台任务启动标志，确保只启动一次
 static BACKGROUND_TASK_STARTED: AtomicBool = AtomicBool::new(false);
@@ -58,6 +60,13 @@ async fn main() {
                 kovi::tokio::time::sleep(kovi::tokio::time::Duration::from_secs(5)).await;
             }
         }
+    }
+
+    if let Err(error) = sticker_memory::initialize_database().await {
+        eprintln!(
+            "[ERROR] 表情包记忆库初始化失败，表情学习功能暂不可用: {}",
+            error
+        );
     }
 
     // 注册聊天功能宏，定义消息处理函数映射

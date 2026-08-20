@@ -304,6 +304,11 @@ impl MemoryManager {
         Ok(())
     }
 
+    /// 返回已初始化的 PostgreSQL 连接池，供独立的持久化功能复用同一数据库。
+    pub(crate) fn database_pool(&self) -> Option<&PgPool> {
+        self.database_pool.get()
+    }
+
     async fn replace_data(&self, data: MemoryData) {
         *self.memories.lock().await = data.memories;
         *self.user_profiles.lock().await = data.user_profiles;

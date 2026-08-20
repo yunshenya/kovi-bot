@@ -4,6 +4,9 @@ use crate::memory::{GroupProfile, MEMORY_MANAGER};
 use crate::model::utils::{
     learn_user_profile_from_message, requests_no_reply, send_sys_info, silence,
 };
+use crate::sticker_memory::{
+    extract_stickers, known_labels, teach, teaching_label, with_sticker_context,
+};
 use chrono::Local;
 use kovi::RuntimeBot;
 use kovi::event::GroupMsgEvent;
@@ -30,122 +33,161 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
     let time = time_now_data.format("%H:%M:%S").to_string();
     let nickname = event.get_sender_nickname();
     let sender = format!("[{}] {}", time, nickname);
-    if let Some(message) = event.borrow_text() {
-        if requests_no_reply(message) {
-            println!("[INFO] 群聊明确要求不回复 (群组: {})", group_id);
-            return;
+    let message = event.borrow_text().unwrap_or_default();
+    let stickers = extract_stickers(&event.message);
+
+    if let Some(label) = teaching_label(message) {
+        if stickers.is_empty() {
+            bot.send_group_msg(group_id, "请把表情包和 #教芸汐 命令放在同一条消息里哦。");
+        } else {
+            match teach(&stickers, &label, event.user_id, Some(group_id)).await {
+                Ok(count) => bot.send_group_msg(
+                    group_id,
+                    format!("记住啦，这 {count} 个表情以后表示“{label}”。"),
+                ),
+                Err(error) => {
+                    eprintln!("[ERROR] 群聊保存表情包记忆失败: {}", error);
+                    bot.send_group_msg(group_id, "这次没能记住，稍后再教我一次吧。");
+                }
+            }
         }
+        return;
+    }
+
+    if requests_no_reply(message) {
+        println!("[INFO] 群聊明确要求不回复 (群组: {})", group_id);
+        return;
+    }
+
+    let labels = match known_labels(&stickers).await {
+        Ok(labels) => labels,
+        Err(error) => {
+            eprintln!("[ERROR] 群聊读取表情包记忆失败: {}", error);
+            Vec::new()
+        }
+    };
+    // 没有文字的陌生表情不触发模型，也不消耗 token。
+    if message.trim().is_empty() && !stickers.is_empty() && labels.is_empty() {
+        println!("[INFO] 收到未学习群表情，保持静默 (群组: {})", group_id);
+        return;
+    }
+    if message.trim().is_empty() && stickers.is_empty() {
+        return;
+    }
+    let model_message = with_sticker_context(message, &labels);
+
+    if !message.trim().is_empty() {
         update_group_profile(group_id, event.user_id, message, &nickname).await;
         learn_user_profile_from_message(event.user_id, message, &nickname, false).await;
-        match message {
-            "#系统信息" => {
-                send_sys_info(Arc::clone(&bot), group_id).await;
+    }
+    match message {
+        "#系统信息" => {
+            send_sys_info(Arc::clone(&bot), group_id).await;
+        }
+
+        "#重载配置文件" => match config::reload_config_from_file() {
+            Ok(_) => bot.send_group_msg(group_id, "配置重载成功"),
+            Err(e) => bot.send_group_msg(group_id, format!("配置重载失败: {}", e)),
+        },
+
+        "#重载全部配置" => match config::reload_config() {
+            Ok(_) => bot.send_group_msg(group_id, "全部配置文件重载成功"),
+            Err(e) => bot.send_group_msg(group_id, format!("重载失败： {}", e)),
+        },
+
+        "#启用自动重载" => {
+            if config::is_auto_reload_enabled() {
+                bot.send_group_msg(group_id, "自动重载已经启用");
+            } else {
+                config::enable_auto_reload(Duration::from_secs(5));
+                bot.send_group_msg(group_id, "自动重载已启用，每5秒检查一次");
             }
+        }
 
-            "#重载配置文件" => match config::reload_config_from_file() {
-                Ok(_) => bot.send_group_msg(group_id, "配置重载成功"),
-                Err(e) => bot.send_group_msg(group_id, format!("配置重载失败: {}", e)),
-            },
+        "#禁用自动重载" => {
+            if config::is_auto_reload_enabled() {
+                config::disable_auto_reload();
+                bot.send_group_msg(group_id, "自动重载已禁用");
+            } else {
+                bot.send_group_msg(group_id, "自动重载未启用");
+            }
+        }
 
-            "#重载全部配置" => match config::reload_config() {
-                Ok(_) => bot.send_group_msg(group_id, "全部配置文件重载成功"),
-                Err(e) => bot.send_group_msg(group_id, format!("重载失败： {}", e)),
-            },
+        "#检查配置变化" => match config::check_and_reload() {
+            Ok(true) => bot.send_group_msg(group_id, "检测到配置变化，已自动重载"),
+            Ok(false) => bot.send_group_msg(group_id, "配置文件无变化"),
+            Err(e) => bot.send_group_msg(group_id, format!("检查配置失败: {}", e)),
+        },
 
-            "#启用自动重载" => {
-                if config::is_auto_reload_enabled() {
-                    bot.send_group_msg(group_id, "自动重载已经启用");
-                } else {
-                    config::enable_auto_reload(Duration::from_secs(5));
-                    bot.send_group_msg(group_id, "自动重载已启用，每5秒检查一次");
+        "#自动重载状态" => {
+            let status = if config::is_auto_reload_enabled() {
+                "已启用"
+            } else {
+                "已禁用"
+            };
+            bot.send_group_msg(group_id, format!("配置自动重载状态: {}", status));
+        }
+
+        "#健康检查" => {
+            let mut health_checker = HealthChecker::new(Arc::clone(&MEMORY_MANAGER));
+            let health_status = health_checker.check_health().await;
+
+            let status_msg = if health_status.is_healthy && health_status.warnings.is_empty() {
+                format!(
+                    "✅ 系统健康状态良好\n📊 记忆数量: {}\n👥 用户档案: {}\n🏢 群组档案: {}\n💾 记忆快照大小: {:.2}MB",
+                    health_status.memory_usage.total_memories,
+                    health_status.memory_usage.user_profiles,
+                    health_status.memory_usage.group_profiles,
+                    health_status.memory_usage.storage_size_bytes as f64 / 1024.0 / 1024.0
+                )
+            } else if health_status.is_healthy {
+                format!(
+                    "⚠️ 系统可以运行，但有警告\n{}\n📊 记忆数量: {}\n💾 记忆快照大小: {:.2}MB",
+                    health_status.warnings.join("\n"),
+                    health_status.memory_usage.total_memories,
+                    health_status.memory_usage.storage_size_bytes as f64 / 1024.0 / 1024.0,
+                )
+            } else {
+                format!(
+                    "❌ 系统健康状态异常\n错误: {}\n警告: {}",
+                    health_status.errors.join(", "),
+                    health_status.warnings.join(", ")
+                )
+            };
+
+            bot.send_group_msg(group_id, &status_msg);
+        }
+        _ => {
+            // 被点名时始终处理；未点名消息仅由本地节流器偶尔抽样，不逐条调用模型。
+            if is_addressed_to_bot(&event, message) || matches!(message, "#禁言" | "#结束禁言")
+            {
+                if silence(group_id, &model_message, bot, sender).await {
+                    activate_conversation_window(group_id).await;
                 }
-            }
-
-            "#禁用自动重载" => {
-                if config::is_auto_reload_enabled() {
-                    config::disable_auto_reload();
-                    bot.send_group_msg(group_id, "自动重载已禁用");
+            } else if should_continue_conversation(group_id, message).await {
+                println!("[INFO] 群聊接续对话 (群组: {})", group_id);
+                if silence(group_id, &model_message, bot, sender).await {
+                    activate_conversation_window(group_id).await;
                 } else {
-                    bot.send_group_msg(group_id, "自动重载未启用");
+                    close_conversation_window(group_id).await;
                 }
-            }
-
-            "#检查配置变化" => match config::check_and_reload() {
-                Ok(true) => bot.send_group_msg(group_id, "检测到配置变化，已自动重载"),
-                Ok(false) => bot.send_group_msg(group_id, "配置文件无变化"),
-                Err(e) => bot.send_group_msg(group_id, format!("检查配置失败: {}", e)),
-            },
-
-            "#自动重载状态" => {
-                let status = if config::is_auto_reload_enabled() {
-                    "已启用"
-                } else {
-                    "已禁用"
-                };
-                bot.send_group_msg(group_id, format!("配置自动重载状态: {}", status));
-            }
-
-            "#健康检查" => {
-                let mut health_checker = HealthChecker::new(Arc::clone(&MEMORY_MANAGER));
-                let health_status = health_checker.check_health().await;
-
-                let status_msg = if health_status.is_healthy && health_status.warnings.is_empty() {
-                    format!(
-                        "✅ 系统健康状态良好\n📊 记忆数量: {}\n👥 用户档案: {}\n🏢 群组档案: {}\n💾 记忆快照大小: {:.2}MB",
-                        health_status.memory_usage.total_memories,
-                        health_status.memory_usage.user_profiles,
-                        health_status.memory_usage.group_profiles,
-                        health_status.memory_usage.storage_size_bytes as f64 / 1024.0 / 1024.0
-                    )
-                } else if health_status.is_healthy {
-                    format!(
-                        "⚠️ 系统可以运行，但有警告\n{}\n📊 记忆数量: {}\n💾 记忆快照大小: {:.2}MB",
-                        health_status.warnings.join("\n"),
-                        health_status.memory_usage.total_memories,
-                        health_status.memory_usage.storage_size_bytes as f64 / 1024.0 / 1024.0,
-                    )
-                } else {
-                    format!(
-                        "❌ 系统健康状态异常\n错误: {}\n警告: {}",
-                        health_status.errors.join(", "),
-                        health_status.warnings.join(", ")
-                    )
-                };
-
-                bot.send_group_msg(group_id, &status_msg);
-            }
-            _ => {
-                // 被点名时始终处理；未点名消息仅由本地节流器偶尔抽样，不逐条调用模型。
-                if is_addressed_to_bot(&event, message) || matches!(message, "#禁言" | "#结束禁言")
-                {
-                    if silence(group_id, message, bot, sender).await {
-                        activate_conversation_window(group_id).await;
-                    }
-                } else if should_continue_conversation(group_id, message).await {
-                    println!("[INFO] 群聊接续对话 (群组: {})", group_id);
-                    if silence(group_id, message, bot, sender).await {
-                        activate_conversation_window(group_id).await;
-                    } else {
-                        close_conversation_window(group_id).await;
-                    }
-                } else if should_interject(group_id, message).await {
-                    println!("[INFO] 群聊未点名接话 (群组: {})", group_id);
-                    if silence(group_id, message, bot, sender).await {
-                        activate_conversation_window(group_id).await;
-                    }
-                } else if let Err(error) = MEMORY_MANAGER
-                    .add_conversation_memory(
-                        group_id,
-                        &format!("{}: {}", nickname, message),
-                        "group_observation",
-                    )
-                    .await
-                {
-                    eprintln!(
-                        "[ERROR] 群聊观察记忆记录失败 (群组: {}): {}",
-                        group_id, error
-                    );
+            } else if should_interject(group_id, message).await {
+                println!("[INFO] 群聊未点名接话 (群组: {})", group_id);
+                if silence(group_id, &model_message, bot, sender).await {
+                    activate_conversation_window(group_id).await;
                 }
+            } else if let Err(error) = MEMORY_MANAGER
+                .add_conversation_memory(
+                    group_id,
+                    &format!("{}: {}", nickname, model_message),
+                    "group_observation",
+                )
+                .await
+            {
+                eprintln!(
+                    "[ERROR] 群聊观察记忆记录失败 (群组: {}): {}",
+                    group_id, error
+                );
             }
         }
     }
