@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 struct GroupInterjectionState {
     eligible_messages_since_sample: u32,
     last_interjection: Option<Instant>,
+    interjection_in_flight: bool,
     conversation_until: Option<Instant>,
 }
 
@@ -290,7 +291,9 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
             } else if should_interject(group_id, &model_message).await {
                 println!("[INFO] 群聊未点名接话 (群组: {})", group_id);
                 let ticket = interrupt(reply_scope).await;
-                if silence(group_id, &model_message, bot, sender, ticket).await {
+                let replied = silence(group_id, &model_message, bot, sender, ticket).await;
+                finish_interjection_attempt(group_id, replied).await;
+                if replied {
                     activate_conversation_window(group_id).await;
                 }
             } else if let Err(error) = MEMORY_MANAGER
@@ -510,6 +513,9 @@ async fn should_interject(group_id: i64, message: &str) -> bool {
     let mut states = GROUP_INTERJECTION_STATE.lock().await;
     prune_interjection_states(&mut states);
     let state = states.entry(group_id).or_default();
+    if state.interjection_in_flight {
+        return false;
+    }
     if state
         .last_interjection
         .is_some_and(|last| last.elapsed() < Duration::from_secs(config.cooldown_secs()))
@@ -527,8 +533,27 @@ async fn should_interject(group_id: i64, message: &str) -> bool {
         return false;
     }
 
-    state.last_interjection = Some(Instant::now());
+    state.interjection_in_flight = true;
     true
+}
+
+/// 模型选择静默时只结束本轮尝试；真正发出消息后才开始冷却。
+async fn finish_interjection_attempt(group_id: i64, replied: bool) {
+    let mut states = GROUP_INTERJECTION_STATE.lock().await;
+    if let Some(state) = states.get_mut(&group_id) {
+        complete_interjection_attempt(state, replied, Instant::now());
+    }
+}
+
+fn complete_interjection_attempt(
+    state: &mut GroupInterjectionState,
+    replied: bool,
+    completed_at: Instant,
+) {
+    state.interjection_in_flight = false;
+    if replied {
+        state.last_interjection = Some(completed_at);
+    }
 }
 
 fn prune_interjection_states(states: &mut HashMap<i64, GroupInterjectionState>) {
@@ -538,7 +563,8 @@ fn prune_interjection_states(states: &mut HashMap<i64, GroupInterjectionState>) 
     let now = Instant::now();
     let cooldown = Duration::from_secs(config::get().group_interjection().cooldown_secs());
     states.retain(|_, state| {
-        has_active_conversation_window(state.conversation_until, now)
+        state.interjection_in_flight
+            || has_active_conversation_window(state.conversation_until, now)
             || state
                 .last_interjection
                 .is_some_and(|last| now.duration_since(last) < cooldown)
@@ -547,30 +573,14 @@ fn prune_interjection_states(states: &mut HashMap<i64, GroupInterjectionState>) 
 
 fn is_interjection_candidate(message: &str, min_message_chars: usize) -> bool {
     let text = message.trim();
-    if text.chars().count() < min_message_chars || text.starts_with('#') {
+    if text.starts_with('#') {
         return false;
     }
-
-    let conversational_cues = [
-        "？",
-        "?",
-        "怎么",
-        "为什么",
-        "有没有",
-        "推荐",
-        "你们觉得",
-        "如何",
-        "要不要",
-        "求助",
-        "哈哈",
-        "笑死",
-        "开心",
-        "难过",
-        "担心",
-        "加油",
-    ];
-    conversational_cues.iter().any(|cue| text.contains(cue))
-        || !extract_topics_from_message(text).is_empty()
+    // 只在本地统计有实际文字内容的消息；是否值得接话仍由抽样后的模型判断。
+    text.chars()
+        .filter(|character| character.is_alphanumeric())
+        .count()
+        >= min_message_chars
 }
 
 fn is_addressed_to_bot(event: &GroupMsgEvent, message: &str) -> bool {
@@ -693,9 +703,10 @@ fn extract_topics_from_message(message: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DirectTriggerState, extract_topics_from_message, has_active_conversation_window,
-        infer_group_personality, is_admin_command, is_conversation_follow_up,
-        is_interjection_candidate, normalize_for_spam_detection, suppress_direct_trigger,
+        DirectTriggerState, GroupInterjectionState, complete_interjection_attempt,
+        extract_topics_from_message, has_active_conversation_window, infer_group_personality,
+        is_admin_command, is_conversation_follow_up, is_interjection_candidate,
+        normalize_for_spam_detection, suppress_direct_trigger,
     };
     use std::time::{Duration, Instant};
 
@@ -711,11 +722,30 @@ mod tests {
     }
 
     #[test]
-    fn only_meaningful_unaddressed_messages_become_interjection_candidates() {
-        assert!(is_interjection_candidate("你们觉得 Rust 好学吗？", 5));
-        assert!(is_interjection_candidate("我今天有点难过", 5));
-        assert!(!is_interjection_candidate("嗯", 5));
-        assert!(!is_interjection_candidate("#某个命令", 5));
+    fn ordinary_meaningful_messages_become_interjection_candidates() {
+        assert!(is_interjection_candidate("你们觉得 Rust 好学吗？", 4));
+        assert!(is_interjection_candidate("今天晚上吃火锅", 4));
+        assert!(is_interjection_candidate("刚刚下班回家", 4));
+        assert!(!is_interjection_candidate("嗯嗯", 4));
+        assert!(!is_interjection_candidate("[图片]", 4));
+        assert!(!is_interjection_candidate("#某个命令", 4));
+    }
+
+    #[test]
+    fn interjection_cooldown_starts_only_after_a_visible_reply() {
+        let mut state = GroupInterjectionState {
+            interjection_in_flight: true,
+            ..GroupInterjectionState::default()
+        };
+        let now = Instant::now();
+        complete_interjection_attempt(&mut state, false, now);
+        assert!(!state.interjection_in_flight);
+        assert!(state.last_interjection.is_none());
+
+        state.interjection_in_flight = true;
+        complete_interjection_attempt(&mut state, true, now);
+        assert!(!state.interjection_in_flight);
+        assert_eq!(state.last_interjection, Some(now));
     }
 
     #[test]

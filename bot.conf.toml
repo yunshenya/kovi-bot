@@ -20,10 +20,10 @@ main_admin_decision_interval_secs = 10800
 
 [group_interjection]
 enabled = true
-min_eligible_messages = 8
+min_eligible_messages = 4
 cooldown_secs = 180
-response_probability_percent = 35
-min_message_chars = 5
+response_probability_percent = 60
+min_message_chars = 4
 conversation_window_secs = 180
 direct_repeat_window_secs = 120
 direct_spam_cooldown_secs = 600
