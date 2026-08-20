@@ -142,7 +142,7 @@ pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<Runtime
             reply_scope,
             message_id,
             quoted.sender_id,
-            "引用消息",
+            quoted.sender_label.as_deref().unwrap_or("引用消息"),
             &quoted.content,
         )
         .await;

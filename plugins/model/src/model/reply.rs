@@ -111,7 +111,7 @@ pub(crate) async fn reply_target_context(scope: ReplyScope) -> String {
     }
     if !bot_messages.is_empty() {
         context.push_str(&format!(
-            "自己发送的消息候选（仅保留最近约 {} 秒，最近的在前）：\n",
+            "QQ通常只能撤回两分钟内的消息；程序只提供最近约 {} 秒的自己发送消息候选（最近的在前）：\n",
             BOT_RECALL_WINDOW_SECS
         ));
         for message in bot_messages {
