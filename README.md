@@ -46,6 +46,7 @@ secure = false
 - `DEPLOY_PASSWORD`：Ubuntu 用户的 SSH 和 sudo 密码
 - `OPENAI_API_KEY`：GPT 主模型 Token
 - `BOT_API_TOKEN`：切换到 DeepSeek 主模型时使用的 Token
+- `VISION_API_TOKEN`：可选，切换到 DeepSeek 时使用的独立视觉模型 Token
 - `NAPCAT_ACCESS_TOKEN`：NapCat WebSocket 服务端 Token
 - `POSTGRES_PASSWORD`：服务器本机 `postgres` 用户的数据库密码
 
@@ -191,6 +192,18 @@ max_retries = 2
 如果该服务实际要求 `/v1/responses`，将 `url` 直接写成完整接口地址。若使用需要 Bearer Token 的 GPT 服务，将 `requires_auth` 改为 `true`。
 
 只有主模型的 `supports_vision = false` 时，才需要配置独立视觉接口：
+
+GitHub Actions 会在部署时自动写入以下视觉配置；当前 GPT-5.5 主模型会忽略它们，切换到 DeepSeek 后直接生效：
+
+```env
+VISION_API_URL=https://codex666ai.com
+VISION_WIRE_API=responses
+VISION_MODEL_NAME=gpt-5.5
+VISION_ACTOR_AUTHORIZATION=local-image-extension
+VISION_REQUIRES_AUTH=false
+```
+
+如果视觉接口需要 Bearer Token，在 GitHub Repository Secrets 中增加 `VISION_API_TOKEN`，并把 `VISION_REQUIRES_AUTH` 改为 `true`。
 
 ```bash
 export VISION_API_URL="https://codex666ai.com"
