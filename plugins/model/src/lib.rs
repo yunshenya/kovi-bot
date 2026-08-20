@@ -46,6 +46,20 @@ static BACKGROUND_TASK_STARTED: AtomicBool = AtomicBool::new(false);
 /// 主动聊天功能在插件初始化时启动。
 #[kovi::plugin]
 async fn main() {
+    // 数据库必须先加载完成，避免第一条消息在旧记忆恢复前被处理。
+    loop {
+        match memory::MEMORY_MANAGER.initialize_database().await {
+            Ok(()) => break,
+            Err(error) => {
+                eprintln!(
+                    "[ERROR] PostgreSQL 记忆存储初始化失败，5 秒后重试: {}",
+                    error
+                );
+                kovi::tokio::time::sleep(kovi::tokio::time::Duration::from_secs(5)).await;
+            }
+        }
+    }
+
     // 注册聊天功能宏，定义消息处理函数映射
     register_chat_function! {
         (group_message, group_message_event),

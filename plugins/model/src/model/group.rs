@@ -91,18 +91,18 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
 
                 let status_msg = if health_status.is_healthy && health_status.warnings.is_empty() {
                     format!(
-                        "✅ 系统健康状态良好\n📊 记忆数量: {}\n👥 用户档案: {}\n🏢 群组档案: {}\n💾 记忆文件大小: {:.2}MB",
+                        "✅ 系统健康状态良好\n📊 记忆数量: {}\n👥 用户档案: {}\n🏢 群组档案: {}\n💾 记忆快照大小: {:.2}MB",
                         health_status.memory_usage.total_memories,
                         health_status.memory_usage.user_profiles,
                         health_status.memory_usage.group_profiles,
-                        health_status.memory_usage.memory_file_size as f64 / 1024.0 / 1024.0
+                        health_status.memory_usage.storage_size_bytes as f64 / 1024.0 / 1024.0
                     )
                 } else if health_status.is_healthy {
                     format!(
-                        "⚠️ 系统可以运行，但有警告\n{}\n📊 记忆数量: {}\n💾 记忆文件大小: {:.2}MB",
+                        "⚠️ 系统可以运行，但有警告\n{}\n📊 记忆数量: {}\n💾 记忆快照大小: {:.2}MB",
                         health_status.warnings.join("\n"),
                         health_status.memory_usage.total_memories,
-                        health_status.memory_usage.memory_file_size as f64 / 1024.0 / 1024.0,
+                        health_status.memory_usage.storage_size_bytes as f64 / 1024.0 / 1024.0,
                     )
                 } else {
                     format!(

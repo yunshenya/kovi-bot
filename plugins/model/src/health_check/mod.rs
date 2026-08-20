@@ -2,7 +2,7 @@
 //!
 //! 提供系统健康监控功能，包括：
 //! - 记忆使用情况监控
-//! - 文件大小检查
+//! - PostgreSQL 存储检查
 //! - 系统状态报告
 //! - 警告和错误检测
 
@@ -41,8 +41,8 @@ pub struct MemoryUsage {
     pub user_profiles: usize,
     /// 群组档案数量
     pub group_profiles: usize,
-    /// 记忆文件大小（字节）
-    pub memory_file_size: u64,
+    /// 当前记忆快照大小（字节）
+    pub storage_size_bytes: u64,
 }
 
 pub struct HealthChecker {
@@ -61,15 +61,8 @@ impl HealthChecker {
     pub async fn check_health(&mut self) -> HealthStatus {
         let mut errors = Vec::new();
         let mut warnings = Vec::new();
-        let memory_file = self.memory_manager.memory_file();
-
-        match std::fs::metadata(memory_file) {
-            Ok(metadata) if metadata.permissions().readonly() => {
-                errors.push("记忆文件为只读，无法持久化新记忆".to_string());
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => errors.push(format!("无法读取记忆文件元数据: {}", error)),
+        if let Err(error) = self.memory_manager.check_storage_health().await {
+            errors.push(error.to_string());
         }
 
         if std::env::var("BOT_API_TOKEN")
@@ -82,10 +75,10 @@ impl HealthChecker {
         // 检查记忆管理器
         let memory_usage = self.check_memory_usage().await;
 
-        // 检查记忆文件大小
-        if memory_usage.memory_file_size > 10 * 1024 * 1024 {
+        // 检查序列化后的记忆快照大小
+        if memory_usage.storage_size_bytes > 10 * 1024 * 1024 {
             // 10MB
-            warnings.push("记忆文件过大，建议清理".to_string());
+            warnings.push("记忆快照过大，建议清理".to_string());
         }
 
         // 检查记忆数量
@@ -123,15 +116,13 @@ impl HealthChecker {
         let user_profiles = self.memory_manager.get_all_user_profiles().await;
         let group_profiles = self.memory_manager.get_all_group_profiles().await;
 
-        let memory_file_size = std::fs::metadata(self.memory_manager.memory_file())
-            .map(|m| m.len())
-            .unwrap_or(0);
+        let storage_size_bytes = self.memory_manager.storage_size_bytes().await;
 
         MemoryUsage {
             total_memories: memories.len(),
             user_profiles: user_profiles.len(),
             group_profiles: group_profiles.len(),
-            memory_file_size,
+            storage_size_bytes,
         }
     }
 

@@ -9,6 +9,7 @@ Completions 的模型服务、长期记忆、情绪与用户档案，以及可�
 
 ```bash
 export BOT_API_TOKEN="你的模型 API Token"
+export DATABASE_URL="postgresql://postgres:数据库密码@127.0.0.1:5432/postgres"
 cargo run
 ```
 
@@ -45,8 +46,9 @@ secure = false
 - `DEPLOY_PASSWORD`：Ubuntu 用户的 SSH 和 sudo 密码
 - `BOT_API_TOKEN`：模型服务 Token
 - `NAPCAT_ACCESS_TOKEN`：NapCat WebSocket 服务端 Token
+- `POSTGRES_PASSWORD`：服务器本机 `postgres` 用户的数据库密码
 
-部署生成的 `.env` 和 `kovi.conf.toml` 权限受限，Token 不会写入仓库。服务器与 NapCat 位于同一台机器，因此部署配置使用 `127.0.0.1:3001`。
+部署生成的 `.env` 和 `kovi.conf.toml` 权限受限，Token 和数据库密码不会写入仓库。服务器与 NapCat、PostgreSQL 位于同一台机器，因此部署配置分别使用 `127.0.0.1:3001` 和 `127.0.0.1:5432`。
 
 模型与随机推送的配置示例：
 
@@ -91,7 +93,7 @@ natural_drift_check_secs = 1800
 recent_topic_cooldown_secs = 604800
 ```
 
-机器人会从最近活跃的群组和真正私聊过的用户中随机选择接收方，再结合情绪、能量、时间、群组话题和用户兴趣选择内容。冷却时间、空闲阈值、发送概率和话题去重共同避免刷屏。长期记忆写入项目运行目录下的 `bot_memory.json`，默认最多保留 1000 条；后台任务会定期去重并清理 30 天前的低重要性记录。
+机器人会从最近活跃的群组和真正私聊过的用户中随机选择接收方，再结合情绪、能量、时间、群组话题和用户兴趣选择内容。冷却时间、空闲阈值、发送概率和话题去重共同避免刷屏。长期记忆以 JSONB 快照写入 PostgreSQL 的 `kovi_bot_memory` 表，默认最多保留 1000 条；后台任务会定期去重并清理 30 天前的低重要性记录。首次连接且数据库表为空时，程序会自动导入运行目录中已有的 `bot_memory.json`，并保留原文件作为备份。
 
 配置 `main_admin` 后，该用户的关系等级会自动保持为最高。她会使用独立的主动私聊策略：每隔 `main_admin_decision_interval_secs`（默认 3 小时）才让模型基于近期互动、对话摘要、当前情绪与时间，自主决定是否联系以及说什么；没有固定日上限或固定发送间隔。该间隔只限制决策请求频率，避免每轮检查都额外消耗 token；此策略不与普通群聊/私聊随机推送竞争。
 

@@ -12,18 +12,20 @@ use anyhow::Result;
 use chrono::{DateTime, Local};
 use kovi::tokio::sync::Mutex;
 use serde::{Deserialize, Serialize};
+use sqlx::postgres::PgPoolOptions;
+use sqlx::{PgPool, Row};
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 
 static MEMORY_ID_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// 全局记忆管理器实例
 ///
 /// 使用LazyLock确保线程安全的单例模式，在首次访问时初始化
-/// 记忆文件默认保存为 "bot_memory.json"
+/// PostgreSQL 为空时会从 "bot_memory.json" 自动迁移旧数据
 pub static MEMORY_MANAGER: LazyLock<Arc<MemoryManager>> =
     LazyLock::new(|| Arc::new(MemoryManager::new("bot_memory.json")));
 
@@ -173,17 +175,19 @@ pub struct MemoryManager {
     conversation_summaries: Arc<Mutex<HashMap<String, String>>>,
     /// 机器人人格状态
     bot_personality: Arc<Mutex<BotPersonality>>,
-    /// 记忆文件路径
+    /// 旧版记忆文件路径，仅用于迁移和无数据库的单元测试实例
     memory_file: String,
-    /// 串行化持久化操作，避免多个任务同时覆盖记忆文件。
+    /// 串行化持久化操作，避免多个任务同时覆盖记忆快照。
     save_lock: Arc<Mutex<()>>,
+    /// PostgreSQL 连接池。测试和未初始化的独立实例仍可使用 JSON 文件后端。
+    database_pool: Arc<OnceLock<PgPool>>,
 }
 
 impl MemoryManager {
     /// 创建新的记忆管理器实例
     ///
     /// # 参数
-    /// * `memory_file` - 记忆数据持久化文件路径
+    /// * `memory_file` - 旧版 JSON 记忆路径（数据库迁移源和测试后端）
     ///
     /// # 返回值
     /// 返回初始化的MemoryManager实例，包含默认的机器人人格设置
@@ -231,7 +235,108 @@ impl MemoryManager {
             bot_personality: Arc::new(Mutex::new(data.bot_personality)),
             memory_file: memory_file.to_string(),
             save_lock: Arc::new(Mutex::new(())),
+            database_pool: Arc::new(OnceLock::new()),
         }
+    }
+
+    /// 初始化 PostgreSQL 存储，并在数据库为空时自动导入旧 JSON 记忆。
+    ///
+    /// 连接串只从 `DATABASE_URL` 环境变量读取，避免凭据进入配置文件或源码。
+    pub async fn initialize_database(&self) -> Result<()> {
+        if self.database_pool.get().is_some() {
+            return Ok(());
+        }
+
+        let database_url = std::env::var("DATABASE_URL")
+            .map_err(|_| anyhow::anyhow!("未设置 DATABASE_URL，无法启用 PostgreSQL 记忆存储"))?;
+        if database_url.trim().is_empty() {
+            return Err(anyhow::anyhow!(
+                "DATABASE_URL 为空，无法启用 PostgreSQL 记忆存储"
+            ));
+        }
+
+        let pool = PgPoolOptions::new()
+            .max_connections(5)
+            .connect(&database_url)
+            .await
+            .map_err(|error| anyhow::anyhow!("连接 PostgreSQL 失败: {}", error))?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS kovi_bot_memory (
+                id SMALLINT PRIMARY KEY CHECK (id = 1),
+                payload JSONB NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .map_err(|error| anyhow::anyhow!("创建 PostgreSQL 记忆表失败: {}", error))?;
+
+        let stored_payload = sqlx::query("SELECT payload FROM kovi_bot_memory WHERE id = 1")
+            .fetch_optional(&pool)
+            .await
+            .map_err(|error| anyhow::anyhow!("读取 PostgreSQL 记忆失败: {}", error))?
+            .map(|row| row.get::<serde_json::Value, _>("payload"));
+
+        if let Some(payload) = stored_payload {
+            let data: MemoryData = serde_json::from_value(payload)
+                .map_err(|error| anyhow::anyhow!("解析 PostgreSQL 记忆失败: {}", error))?;
+            self.replace_data(data).await;
+            println!("[INFO] 已从 PostgreSQL 加载记忆");
+        } else {
+            let data = self.snapshot().await;
+            Self::write_database_snapshot(&pool, &data).await?;
+            if std::path::Path::new(&self.memory_file).exists() {
+                println!(
+                    "[INFO] 已将旧记忆文件 {} 导入 PostgreSQL（原文件保留为备份）",
+                    self.memory_file
+                );
+            } else {
+                println!("[INFO] PostgreSQL 记忆表已初始化");
+            }
+        }
+
+        self.database_pool
+            .set(pool)
+            .map_err(|_| anyhow::anyhow!("PostgreSQL 记忆存储已被并发初始化"))?;
+        Ok(())
+    }
+
+    async fn replace_data(&self, data: MemoryData) {
+        *self.memories.lock().await = data.memories;
+        *self.user_profiles.lock().await = data.user_profiles;
+        *self.group_profiles.lock().await = data.group_profiles;
+        *self.conversation_summaries.lock().await = data.conversation_summaries;
+        *self.bot_personality.lock().await = data.bot_personality;
+    }
+
+    async fn snapshot(&self) -> MemoryData {
+        MemoryData {
+            memories: self.memories.lock().await.clone(),
+            user_profiles: self.user_profiles.lock().await.clone(),
+            group_profiles: self.group_profiles.lock().await.clone(),
+            conversation_summaries: self.conversation_summaries.lock().await.clone(),
+            bot_personality: self.bot_personality.lock().await.clone(),
+        }
+    }
+
+    async fn write_database_snapshot(pool: &PgPool, data: &MemoryData) -> Result<()> {
+        let payload = serde_json::to_value(data)?;
+        sqlx::query(
+            r#"
+            INSERT INTO kovi_bot_memory (id, payload, updated_at)
+            VALUES (1, $1, NOW())
+            ON CONFLICT (id) DO UPDATE
+            SET payload = EXCLUDED.payload, updated_at = NOW()
+            "#,
+        )
+        .bind(payload)
+        .execute(pool)
+        .await
+        .map_err(|error| anyhow::anyhow!("写入 PostgreSQL 记忆失败: {}", error))?;
+        Ok(())
     }
 
     /// 添加新的记忆条目
@@ -243,7 +348,7 @@ impl MemoryManager {
     /// 成功时返回 `Ok(())`，失败时返回错误信息
     ///
     /// # 注意
-    /// 添加记忆后会自动保存到文件
+    /// 添加记忆后会自动保存到当前持久化后端
     pub async fn add_memory(&self, memory: MemoryEntry) -> Result<()> {
         {
             let mut memories = self.memories.lock().await;
@@ -510,8 +615,22 @@ impl MemoryManager {
         bot_personality.clone()
     }
 
-    pub fn memory_file(&self) -> &str {
-        &self.memory_file
+    pub async fn check_storage_health(&self) -> Result<()> {
+        let pool = self
+            .database_pool
+            .get()
+            .ok_or_else(|| anyhow::anyhow!("PostgreSQL 记忆存储尚未初始化"))?;
+        sqlx::query("SELECT 1")
+            .execute(pool)
+            .await
+            .map_err(|error| anyhow::anyhow!("PostgreSQL 记忆存储不可用: {}", error))?;
+        Ok(())
+    }
+
+    pub async fn storage_size_bytes(&self) -> u64 {
+        serde_json::to_vec(&self.snapshot().await)
+            .map(|data| data.len() as u64)
+            .unwrap_or(0)
     }
 
     /// 主动执行去重、过期清理和持久化，供后台维护任务调用。
@@ -660,13 +779,11 @@ impl MemoryManager {
         // 限制记忆数量，避免内存过度使用
         self.cleanup_old_memories().await?;
 
-        let data = MemoryData {
-            memories: self.memories.lock().await.clone(),
-            user_profiles: self.user_profiles.lock().await.clone(),
-            group_profiles: self.group_profiles.lock().await.clone(),
-            conversation_summaries: self.conversation_summaries.lock().await.clone(),
-            bot_personality: self.bot_personality.lock().await.clone(),
-        };
+        let data = self.snapshot().await;
+
+        if let Some(pool) = self.database_pool.get() {
+            return Self::write_database_snapshot(pool, &data).await;
+        }
 
         let json = serde_json::to_string_pretty(&data)?;
         let memory_file = self.memory_file.clone();
