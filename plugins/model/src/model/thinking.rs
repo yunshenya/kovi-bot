@@ -1,4 +1,5 @@
 use crate::model::interrupt::{ReplyTicket, is_current};
+use crate::model::recall::record_bot_message;
 use kovi::RuntimeBot;
 use kovi::tokio::sync::Mutex;
 use std::hash::{Hash, Hasher};
@@ -117,9 +118,24 @@ impl ThinkingReporter {
             self.notice_sent.store(false, Ordering::Release);
             return;
         }
-        match self.destination {
-            ThinkingDestination::Group(group_id) => self.bot.send_group_msg(group_id, notice),
-            ThinkingDestination::Private(user_id) => self.bot.send_private_msg(user_id, notice),
+        let message_id = match self.destination {
+            ThinkingDestination::Group(group_id) => {
+                self.bot.send_group_msg_return(group_id, notice).await
+            }
+            ThinkingDestination::Private(user_id) => {
+                self.bot.send_private_msg_return(user_id, notice).await
+            }
+        };
+        if let Ok(message_id) = message_id {
+            let scope = match self.destination {
+                ThinkingDestination::Group(group_id) => {
+                    crate::model::interrupt::ReplyScope::Group(group_id)
+                }
+                ThinkingDestination::Private(user_id) => {
+                    crate::model::interrupt::ReplyScope::Private(user_id)
+                }
+            };
+            record_bot_message(scope, self.ticket, message_id, &self.bot).await;
         }
     }
 

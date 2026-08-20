@@ -10,6 +10,7 @@
 
 use super::interrupt::{ReplyTicket, finish, is_current, mark_active};
 use super::memory_query::{interruptible_model_call, params_model_with_memory_access};
+use super::recall::{begin_reply, finish_reply, record_bot_message};
 use super::reply::{
     attach_reply_target_context, build_outbound_message, parse_reply_output, sanitize_reply_action,
 };
@@ -69,6 +70,7 @@ const MAX_RUNTIME_CONVERSATIONS: usize = 512;
 /// 复用连接池，并限制并发模型请求，避免高峰时把上游 API 和本机连接耗尽。
 static MODEL_CLIENT: LazyLock<Client> = LazyLock::new(Client::new);
 static MODEL_REQUEST_LIMIT: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(4));
+const MIN_MODEL_ATTEMPTS: usize = 5;
 
 /// 聊天中由模型决定是否继续发送下一条消息的分隔标记。
 const FOLLOW_UP_MARKER: &str = "[[NEXT_MESSAGE]]";
@@ -252,7 +254,18 @@ pub async fn control_model(
     )
     .await;
     if is_model_error_response(&parsed_reply.content) {
-        bot.send_group_msg(group_id, "我这里暂时有点连不上，等一会儿再和我说一次吧。");
+        if let Ok(message_id) = bot
+            .send_group_msg_return(group_id, "我这里暂时有点连不上，等一会儿再和我说一次吧。")
+            .await
+        {
+            record_bot_message(
+                super::interrupt::ReplyScope::Group(group_id),
+                reply_ticket,
+                message_id,
+                &bot,
+            )
+            .await;
+        }
         limit_memory_size(&mut messages);
         return false;
     }
@@ -270,11 +283,27 @@ pub async fn control_model(
                     break;
                 }
             }
-            bot.send_group_msg(
-                group_id,
-                build_outbound_message(outbound_message, &reply_action, index == 0),
-            );
-            sent_messages.push(outbound_message.clone());
+            match bot
+                .send_group_msg_return(
+                    group_id,
+                    build_outbound_message(outbound_message, &reply_action, index == 0),
+                )
+                .await
+            {
+                Ok(message_id) => {
+                    record_bot_message(
+                        super::interrupt::ReplyScope::Group(group_id),
+                        reply_ticket,
+                        message_id,
+                        &bot,
+                    )
+                    .await;
+                    sent_messages.push(outbound_message.clone());
+                }
+                Err(error) => {
+                    eprintln!("[ERROR] 群聊回复发送失败 (群组: {}): {:?}", group_id, error);
+                }
+            }
         }
         if sent_messages.is_empty() {
             println!("[INFO] 群聊回复在发送前被打断 (群组: {})", group_id);
@@ -675,7 +704,8 @@ pub(crate) async fn params_model_with_token_limit_and_progress(
     };
     let mut last_error = String::new();
     let mut response_content = None;
-    for attempt in 0..=server_config.max_retries() {
+    let max_attempts = model_attempt_count(server_config.max_retries());
+    for attempt in 0..max_attempts {
         let mut request = MODEL_CLIENT
             .post(server_config.endpoint())
             .timeout(Duration::from_secs(server_config.request_timeout_secs()))
@@ -700,7 +730,6 @@ pub(crate) async fn params_model_with_token_limit_and_progress(
                     }
                     Err(error) => {
                         last_error = format!("模型响应解析失败: {error}");
-                        break;
                     }
                 }
             }
@@ -723,7 +752,13 @@ pub(crate) async fn params_model_with_token_limit_and_progress(
             }
         }
 
-        if attempt < server_config.max_retries() {
+        if attempt + 1 < max_attempts {
+            println!(
+                "[WARN] 模型请求失败，第 {}/{} 次后重试: {}",
+                attempt + 1,
+                max_attempts,
+                last_error
+            );
             let delay_ms = 350_u64.saturating_mul(1_u64 << attempt.min(4));
             kovi::tokio::time::sleep(Duration::from_millis(delay_ms)).await;
         }
@@ -739,6 +774,12 @@ pub(crate) async fn params_model_with_token_limit_and_progress(
         role: Roles::Assistant,
         content: bot_content,
     }
+}
+
+fn model_attempt_count(configured_retries: u8) -> usize {
+    usize::from(configured_retries)
+        .saturating_add(1)
+        .max(MIN_MODEL_ATTEMPTS)
 }
 
 async fn read_model_content(
@@ -1042,6 +1083,7 @@ pub async fn silence(
     reply_ticket: ReplyTicket,
     max_output_tokens: Option<u32>,
     vision_images: Vec<VisionImage>,
+    source_message_ids: Vec<i32>,
 ) -> bool {
     if message.trim() == "#禁言" {
         instance_is_ban().lock().await.insert(group_id, true);
@@ -1064,6 +1106,11 @@ pub async fn silence(
         if !mark_active(reply_ticket).await {
             return false;
         }
+        let scope = super::interrupt::ReplyScope::Group(group_id);
+        if !begin_reply(scope, reply_ticket, source_message_ids).await {
+            finish(reply_ticket).await;
+            return false;
+        }
         let replied = control_model(
             group_id,
             user_id,
@@ -1075,6 +1122,7 @@ pub async fn silence(
             vision_images,
         )
         .await;
+        finish_reply(scope, reply_ticket).await;
         finish(reply_ticket).await;
         replied
     } else {
@@ -1122,8 +1170,14 @@ pub async fn private_chat(
     bot: Arc<RuntimeBot>,
     reply_ticket: ReplyTicket,
     vision_images: Vec<VisionImage>,
+    source_message_ids: Vec<i32>,
 ) {
     if !mark_active(reply_ticket).await {
+        return;
+    }
+    let scope = super::interrupt::ReplyScope::Private(user_id);
+    if !begin_reply(scope, reply_ticket, source_message_ids).await {
+        finish(reply_ticket).await;
         return;
     }
     private_chat_inner(
@@ -1135,6 +1189,7 @@ pub async fn private_chat(
         &vision_images,
     )
     .await;
+    finish_reply(scope, reply_ticket).await;
     finish(reply_ticket).await;
 }
 
@@ -1259,7 +1314,18 @@ async fn private_chat_inner(
     .await;
     update_pending_image_request(ImageRequestScope::Private(user_id), &parsed_reply.content).await;
     if is_model_error_response(&parsed_reply.content) {
-        bot.send_private_msg(user_id, "我这里暂时有点连不上，等一会儿再和我说一次吧。");
+        if let Ok(message_id) = bot
+            .send_private_msg_return(user_id, "我这里暂时有点连不上，等一会儿再和我说一次吧。")
+            .await
+        {
+            record_bot_message(
+                super::interrupt::ReplyScope::Private(user_id),
+                reply_ticket,
+                message_id,
+                &bot,
+            )
+            .await;
+        }
         limit_memory_size(&mut history);
         return;
     }
@@ -1281,11 +1347,27 @@ async fn private_chat_inner(
                 break;
             }
         }
-        bot.send_private_msg(
-            user_id,
-            build_outbound_message(outbound_message, &reply_action, index == 0),
-        );
-        sent_messages.push(outbound_message.clone());
+        match bot
+            .send_private_msg_return(
+                user_id,
+                build_outbound_message(outbound_message, &reply_action, index == 0),
+            )
+            .await
+        {
+            Ok(message_id) => {
+                record_bot_message(
+                    super::interrupt::ReplyScope::Private(user_id),
+                    reply_ticket,
+                    message_id,
+                    &bot,
+                )
+                .await;
+                sent_messages.push(outbound_message.clone());
+            }
+            Err(error) => {
+                eprintln!("[ERROR] 私聊回复发送失败 (用户: {}): {:?}", user_id, error);
+            }
+        }
     }
     if sent_messages.is_empty() {
         println!("[INFO] 私聊回复在发送前被打断 (用户: {})", user_id);
@@ -1691,7 +1773,7 @@ mod tests {
         BotMemory, Roles, VisionImage, build_model_messages, build_responses_input,
         compression_cutoff, extract_interests_from_message, extract_personality_traits,
         extract_stream_delta, follow_up_delay_millis, is_silent_model_response, limit_memory_size,
-        requests_no_reply, split_reply, with_reference_context,
+        model_attempt_count, requests_no_reply, split_reply, with_reference_context,
     };
     use crate::memory::BotPersonality;
     use chrono::Local;
@@ -1764,6 +1846,13 @@ mod tests {
         });
         assert_eq!(extract_stream_delta(&responses_event), Some("先看一下"));
         assert_eq!(extract_stream_delta(&chat_event), Some("再回答"));
+    }
+
+    #[test]
+    fn transient_model_failures_have_at_least_five_attempts() {
+        assert_eq!(model_attempt_count(0), 5);
+        assert_eq!(model_attempt_count(2), 5);
+        assert_eq!(model_attempt_count(6), 7);
     }
 
     #[test]

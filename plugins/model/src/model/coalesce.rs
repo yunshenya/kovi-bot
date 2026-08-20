@@ -13,6 +13,7 @@ pub(crate) struct TextBatch {
     pub(crate) plain_text: bool,
     pub(crate) vision_requested: bool,
     pub(crate) images: Vec<ImageAttachment>,
+    pub(crate) message_ids: Vec<i32>,
 }
 
 pub(crate) struct MessagePart {
@@ -22,6 +23,7 @@ pub(crate) struct MessagePart {
     pub(crate) plain_text: bool,
     pub(crate) vision_requested: bool,
     pub(crate) images: Vec<ImageAttachment>,
+    pub(crate) message_ids: Vec<i32>,
 }
 
 struct PendingBatch {
@@ -33,6 +35,7 @@ struct PendingBatch {
     all_plain_text: bool,
     vision_requested: bool,
     images: Vec<ImageAttachment>,
+    message_ids: Vec<i32>,
     started_at: Instant,
     updated_at: Instant,
 }
@@ -48,6 +51,7 @@ impl Default for PendingBatch {
             all_plain_text: true,
             vision_requested: false,
             images: Vec::new(),
+            message_ids: Vec::new(),
             started_at: Instant::now(),
             updated_at: Instant::now(),
         }
@@ -134,6 +138,7 @@ where
                 plain_text: part.plain_text,
                 vision_requested: part.vision_requested,
                 images: part.images,
+                message_ids: part.message_ids,
             });
         }
 
@@ -156,6 +161,11 @@ where
             batch.all_plain_text &= part.plain_text;
             batch.vision_requested |= part.vision_requested;
             batch.images = merge_image_attachments(&batch.images, &part.images);
+            for message_id in part.message_ids {
+                if !batch.message_ids.contains(&message_id) {
+                    batch.message_ids.push(message_id);
+                }
+            }
             batch.updated_at = now;
 
             let reached_capacity =
@@ -187,6 +197,7 @@ where
             plain_text: batch.all_plain_text,
             vision_requested: batch.vision_requested,
             images: batch.images,
+            message_ids: batch.message_ids,
         })
     }
 }
@@ -268,6 +279,7 @@ mod tests {
                                     plain_text: true,
                                     vision_requested: true,
                                     images: Vec::new(),
+                                    message_ids: vec![101],
                                 },
                                 BatchPolicy::testing(),
                             )
@@ -285,6 +297,7 @@ mod tests {
                             plain_text: true,
                             vision_requested: false,
                             images: Vec::new(),
+                            message_ids: vec![102],
                         },
                         BatchPolicy::testing(),
                     )
@@ -300,6 +313,7 @@ mod tests {
                         plain_text: true,
                         vision_requested: true,
                         images: Vec::new(),
+                        message_ids: vec![101, 102],
                     })
                 );
             });
@@ -335,6 +349,7 @@ mod tests {
                                     plain_text: true,
                                     vision_requested: false,
                                     images: Vec::new(),
+                                    message_ids: vec![201],
                                 },
                                 policy,
                             )
@@ -352,6 +367,7 @@ mod tests {
                             plain_text: true,
                             vision_requested: false,
                             images: Vec::new(),
+                            message_ids: vec![202],
                         },
                         policy,
                     )
@@ -380,6 +396,7 @@ mod tests {
                                     plain_text: true,
                                     vision_requested: false,
                                     images: Vec::new(),
+                                    message_ids: vec![301],
                                 },
                                 BatchPolicy::testing(),
                             )

@@ -3,6 +3,7 @@ use crate::health_check::HealthChecker;
 use crate::memory::{GroupProfile, MEMORY_MANAGER};
 use crate::model::coalesce::{MessageCoalescer, MessagePart};
 use crate::model::interrupt::{ReplyScope, interrupt, is_active, is_explicit_stop_message};
+use crate::model::recall::has_recalled_messages;
 use crate::model::reply::record_reply_target;
 use crate::model::utils::{
     learn_user_profile_from_message, requests_no_reply, send_sys_info, silence,
@@ -57,6 +58,7 @@ struct PendingWindowMessage {
     sender: String,
     message: String,
     vision_images: Vec<VisionImage>,
+    message_ids: Vec<i32>,
 }
 
 /// 当前回复期间只保留每个群组的一条待处理窗口消息，避免高频消息把模型请求反复取消。
@@ -248,42 +250,59 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
         return;
     }
     let addressed_to_bot = directly_addressed || replies_to_bot;
-    let (model_message, addressed_to_bot, plain_text, intent_text, batch_vision_requested, images) =
-        if !message.trim_start().starts_with('#') {
-            let Some(combined) = GROUP_MESSAGE_BATCHES
-                .push(
-                    (group_id, event.user_id),
-                    MessagePart {
-                        text: model_message,
-                        intent_text: message.to_string(),
-                        addressed: addressed_to_bot,
-                        plain_text: stickers.is_empty() && quoted.is_none(),
-                        vision_requested,
-                        images,
-                    },
-                )
-                .await
-            else {
-                return;
-            };
-            (
-                combined.text,
-                combined.addressed,
-                combined.plain_text,
-                combined.intent_text,
-                combined.vision_requested,
-                combined.images,
+    let (
+        model_message,
+        addressed_to_bot,
+        plain_text,
+        intent_text,
+        batch_vision_requested,
+        images,
+        source_message_ids,
+    ) = if !message.trim_start().starts_with('#') {
+        let Some(combined) = GROUP_MESSAGE_BATCHES
+            .push(
+                (group_id, event.user_id),
+                MessagePart {
+                    text: model_message,
+                    intent_text: message.to_string(),
+                    addressed: addressed_to_bot,
+                    plain_text: stickers.is_empty() && quoted.is_none(),
+                    vision_requested,
+                    images,
+                    message_ids: vec![event.message_id],
+                },
             )
-        } else {
-            (
-                model_message,
-                addressed_to_bot,
-                false,
-                message.to_string(),
-                vision_requested,
-                images,
-            )
+            .await
+        else {
+            return;
         };
+        (
+            combined.text,
+            combined.addressed,
+            combined.plain_text,
+            combined.intent_text,
+            combined.vision_requested,
+            combined.images,
+            combined.message_ids,
+        )
+    } else {
+        (
+            model_message,
+            addressed_to_bot,
+            false,
+            message.to_string(),
+            vision_requested,
+            images,
+            vec![event.message_id],
+        )
+    };
+    if has_recalled_messages(reply_scope, &source_message_ids).await {
+        println!(
+            "[INFO] 群聊输入已撤回，丢弃尚未开始的回复 (群组: {})",
+            group_id
+        );
+        return;
+    }
     let batch_image_intent = classify_image_intent(
         &intent_text,
         !images.is_empty(),
@@ -361,6 +380,7 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
             sender,
             model_message,
             vision_images,
+            source_message_ids,
         )
         .await;
         return;
@@ -462,6 +482,7 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
                     ticket,
                     None,
                     vision_images.clone(),
+                    source_message_ids.clone(),
                 )
                 .await;
                 finish_conversation_turn(group_id, event.user_id, turn_marker, replied).await;
@@ -489,6 +510,7 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
                     ticket,
                     None,
                     vision_images.clone(),
+                    source_message_ids.clone(),
                 )
                 .await;
                 finish_conversation_turn(group_id, event.user_id, turn_marker, replied).await;
@@ -509,6 +531,7 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
                     ticket,
                     Some(max_output_tokens),
                     vision_images.clone(),
+                    source_message_ids.clone(),
                 )
                 .await;
                 finish_interjection_attempt(group_id, replied).await;
@@ -775,6 +798,7 @@ async fn queue_pending_window_message(
     sender: String,
     message: String,
     vision_images: Vec<VisionImage>,
+    message_ids: Vec<i32>,
 ) {
     let mut pending = PENDING_WINDOW_MESSAGES.lock().await;
     if let Some(existing) = pending.get_mut(&group_id) {
@@ -783,6 +807,7 @@ async fn queue_pending_window_message(
         existing.sender = sender;
         existing.message = message;
         merge_vision_images(&mut existing.vision_images, vision_images);
+        merge_message_ids(&mut existing.message_ids, message_ids);
     } else {
         pending.insert(
             group_id,
@@ -792,6 +817,7 @@ async fn queue_pending_window_message(
                 sender,
                 message,
                 vision_images,
+                message_ids,
             },
         );
     }
@@ -806,6 +832,14 @@ fn merge_vision_images(target: &mut Vec<VisionImage>, incoming: Vec<VisionImage>
         if target.len() >= 4 {
             target.truncate(4);
             break;
+        }
+    }
+}
+
+fn merge_message_ids(target: &mut Vec<i32>, incoming: Vec<i32>) {
+    for message_id in incoming {
+        if !target.contains(&message_id) {
+            target.push(message_id);
         }
     }
 }
@@ -835,6 +869,7 @@ async fn drain_pending_window_messages(group_id: i64, bot: Arc<RuntimeBot>) {
             ticket,
             None,
             pending.vision_images,
+            pending.message_ids,
         )
         .await;
         finish_conversation_turn(group_id, pending.user_id, turn_marker, replied).await;

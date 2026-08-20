@@ -8,7 +8,7 @@
 //! - 话题生成：智能生成相关话题促进互动
 //! - 健康监控：实时监控系统状态和性能
 
-use crate::model::{group_message_event, private_message_event};
+use crate::model::{group_message_event, private_message_event, recall_notice_event};
 use kovi::PluginBuilder;
 use std::sync::{
     Arc,
@@ -80,6 +80,7 @@ async fn main() {
     PluginBuilder::on_group_msg(group_message);
     // 注册私聊消息处理器
     PluginBuilder::on_private_msg(private_message);
+    PluginBuilder::on_notice(recall_notice_event);
 
     // 插件启动即启动主动消息循环，不需要等待第一条群聊或私聊事件。
     let proactive_bot = PluginBuilder::get_runtime_bot();
