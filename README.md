@@ -61,7 +61,7 @@ model_name = "gpt-5.5"
 wire_api = "responses"
 supports_vision = true
 api_key_env = "OPENAI_API_KEY"
-requires_auth = false
+requires_auth = true
 actor_authorization = "local-image-extension"
 max_output_tokens = 1200
 request_timeout_secs = 60
@@ -189,7 +189,7 @@ request_timeout_secs = 60
 max_retries = 2
 ```
 
-如果该服务实际要求 `/v1/responses`，将 `url` 直接写成完整接口地址。若使用需要 Bearer Token 的 GPT 服务，将 `requires_auth` 改为 `true`。
+当前 `codex666ai.com` 接口要求通过 `OPENAI_API_KEY` 发送 Bearer Token，因此这里必须保持 `requires_auth = true`。如果服务实际要求 `/v1/responses`，将 `url` 直接写成完整接口地址。
 
 只有主模型的 `supports_vision = false` 时，才需要配置独立视觉接口：
 
