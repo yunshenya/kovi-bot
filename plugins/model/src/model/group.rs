@@ -787,7 +787,21 @@ async fn is_conversation_participant_message(
     if !has_active_conversation_window(state.conversation_until, now) {
         state.conversation_until = None;
     }
-    conversation_message_is_relevant(state, user_id, message, has_image, now, open_floor)
+    let relevant =
+        conversation_message_is_relevant(state, user_id, message, has_image, now, open_floor);
+    if relevant {
+        roll_conversation_window(
+            state,
+            user_id,
+            now,
+            Duration::from_secs(
+                config::get()
+                    .group_interjection()
+                    .conversation_window_secs(),
+            ),
+        );
+    }
+    relevant
 }
 
 async fn should_continue_conversation(
@@ -827,6 +841,30 @@ fn conversation_message_is_relevant(
         || state
             .last_bot_reply_at
             .is_some_and(|last_reply| now.duration_since(last_reply) < open_floor)
+}
+
+/// 有效的连续对话消息会把窗口向后滚动，避免窗口从第一次回复开始固定倒计时。
+fn roll_conversation_window(
+    state: &mut GroupInterjectionState,
+    user_id: i64,
+    now: Instant,
+    window: Duration,
+) {
+    let deadline = now + window;
+    if state
+        .conversation_until
+        .is_none_or(|current_deadline| current_deadline < deadline)
+    {
+        state.conversation_until = Some(deadline);
+    }
+
+    let participant_deadline = state
+        .conversation_participants
+        .entry(user_id)
+        .or_insert(deadline);
+    if *participant_deadline < deadline {
+        *participant_deadline = deadline;
+    }
 }
 
 fn is_meaningful_conversation_message(message: &str, _has_image: bool) -> bool {
@@ -1200,7 +1238,8 @@ mod tests {
         complete_interjection_attempt, conversation_message_is_relevant, decision_budget_available,
         extract_topics_from_message, has_active_conversation_window, infer_group_personality,
         is_interjection_candidate, normalize_for_spam_detection, normalized_sender_name,
-        prune_decision_attempts, should_defer_active_window_message, suppress_direct_trigger,
+        prune_decision_attempts, roll_conversation_window, should_defer_active_window_message,
+        suppress_direct_trigger,
     };
     use crate::model::utils::{is_group_admin_command, is_restricted_command};
     use std::time::{Duration, Instant};
@@ -1384,6 +1423,57 @@ mod tests {
         ));
         assert!(!has_active_conversation_window(Some(deadline), deadline));
         assert!(!has_active_conversation_window(None, opened_at));
+    }
+
+    #[test]
+    fn conversation_window_rolls_forward_with_relevant_messages() {
+        let opened_at = Instant::now();
+        let original_deadline = opened_at + Duration::from_secs(180);
+        let first_message_at = opened_at + Duration::from_secs(170);
+        let second_message_at = opened_at + Duration::from_secs(340);
+        let window = Duration::from_secs(180);
+        let mut state = GroupInterjectionState {
+            conversation_until: Some(original_deadline),
+            ..GroupInterjectionState::default()
+        };
+        state
+            .conversation_participants
+            .insert(42, original_deadline);
+
+        assert!(conversation_message_is_relevant(
+            &state,
+            42,
+            "继续聊这个",
+            false,
+            first_message_at,
+            Duration::from_secs(45),
+        ));
+        roll_conversation_window(&mut state, 42, first_message_at, window);
+
+        let first_rolled_deadline = first_message_at + window;
+        assert_eq!(state.conversation_until, Some(first_rolled_deadline));
+        assert_eq!(
+            state.conversation_participants.get(&42),
+            Some(&first_rolled_deadline)
+        );
+        assert!(has_active_conversation_window(
+            state.conversation_until,
+            second_message_at
+        ));
+
+        assert!(conversation_message_is_relevant(
+            &state,
+            42,
+            "我再补充一句",
+            false,
+            second_message_at,
+            Duration::from_secs(45),
+        ));
+        roll_conversation_window(&mut state, 42, second_message_at, window);
+        assert!(has_active_conversation_window(
+            state.conversation_until,
+            second_message_at + Duration::from_secs(179)
+        ));
     }
 
     #[test]

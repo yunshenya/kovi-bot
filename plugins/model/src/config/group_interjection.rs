@@ -24,7 +24,7 @@ pub struct GroupInterjectionConfig {
     decision_rate_limit: usize,
     /// 未点名接话单次允许生成的最大 token 数。
     interjection_max_output_tokens: u32,
-    /// 机器人成功接话后，允许无称呼继续对话的时间窗口（秒）。
+    /// 机器人成功接话后，允许无称呼继续对话的滚动窗口（秒）；每条有效接话都会续期。
     conversation_window_secs: u64,
     /// 机器人刚发言后，允许新成员自然接话并加入窗口的时间（秒）。
     conversation_open_floor_secs: u64,
