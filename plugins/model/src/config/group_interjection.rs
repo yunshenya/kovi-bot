@@ -26,10 +26,6 @@ pub struct GroupInterjectionConfig {
     direct_rate_window_secs: u64,
     /// 计数窗口内允许同一成员直接触发的最大次数。
     direct_rate_limit: usize,
-    /// 单次群聊回复允许发送的最大气泡数。
-    reply_max_messages: usize,
-    /// 单次群聊回复所有气泡合计的最大字符数。
-    reply_max_chars: usize,
 }
 
 impl GroupInterjectionConfig {
@@ -73,14 +69,6 @@ impl GroupInterjectionConfig {
         self.direct_rate_limit
     }
 
-    pub fn reply_max_messages(&self) -> usize {
-        self.reply_max_messages
-    }
-
-    pub fn reply_max_chars(&self) -> usize {
-        self.reply_max_chars
-    }
-
     pub fn validate(&self) -> anyhow::Result<()> {
         if self.min_eligible_messages == 0 {
             return Err(anyhow::anyhow!("群聊接话消息间隔必须大于0"));
@@ -106,9 +94,6 @@ impl GroupInterjectionConfig {
         if self.direct_rate_limit < 2 {
             return Err(anyhow::anyhow!("群聊点名频率上限不能小于2"));
         }
-        if self.reply_max_messages == 0 || self.reply_max_chars < 20 {
-            return Err(anyhow::anyhow!("群聊回复至少允许1条消息和20个字符"));
-        }
         Ok(())
     }
 }
@@ -126,8 +111,6 @@ impl Default for GroupInterjectionConfig {
             direct_spam_cooldown_secs: 600,
             direct_rate_window_secs: 60,
             direct_rate_limit: 4,
-            reply_max_messages: 3,
-            reply_max_chars: 120,
         }
     }
 }

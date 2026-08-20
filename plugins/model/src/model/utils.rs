@@ -186,23 +186,14 @@ pub async fn control_model(
         &contextual_memories,
         rolling_summary.as_deref(),
     );
-    let group_reply_max_tokens = (config::get().group_interjection().reply_max_chars() as u32)
-        .saturating_mul(2)
-        .clamp(128, 400);
-    let response =
-        params_model_with_max_tokens(&mut request_messages, Some(group_reply_max_tokens)).await;
+    let response = params_model(&mut request_messages).await;
     if is_model_error_response(&response.content) {
         bot.send_group_msg(group_id, "我这里暂时有点连不上，等一会儿再和我说一次吧。");
         limit_memory_size(&mut messages);
         return false;
     }
     if !response.content.contains("[sp]") {
-        let group_config = config::get().group_interjection().clone();
-        let outbound_messages = limit_group_reply(
-            split_reply(&response.content),
-            group_config.reply_max_messages(),
-            group_config.reply_max_chars(),
-        );
+        let outbound_messages = split_reply(&response.content);
         let stored_reply = outbound_messages.join("\n");
         let personality = MEMORY_MANAGER.get_bot_personality().await;
         for (index, outbound_message) in outbound_messages.iter().enumerate() {
@@ -963,53 +954,6 @@ fn split_reply(content: &str) -> Vec<String> {
     }
 }
 
-fn limit_group_reply(
-    messages: Vec<String>,
-    max_messages: usize,
-    max_total_chars: usize,
-) -> Vec<String> {
-    let mut remaining_chars = max_total_chars;
-    let mut concise = Vec::new();
-    for message in messages.into_iter().take(max_messages) {
-        if remaining_chars == 0 {
-            break;
-        }
-        let per_message_limit = remaining_chars.min(60);
-        let shortened = truncate_at_natural_boundary(&message, per_message_limit);
-        if shortened.trim().is_empty() {
-            continue;
-        }
-        remaining_chars = remaining_chars.saturating_sub(shortened.chars().count());
-        concise.push(shortened);
-    }
-    if concise.is_empty() {
-        vec!["……".to_string()]
-    } else {
-        concise
-    }
-}
-
-fn truncate_at_natural_boundary(value: &str, max_chars: usize) -> String {
-    if value.chars().count() <= max_chars {
-        return value.to_string();
-    }
-    let prefix = value.chars().take(max_chars).collect::<String>();
-    let boundary = prefix
-        .char_indices()
-        .filter(|(_, character)| matches!(character, '。' | '！' | '？' | '!' | '?' | '；' | ';'))
-        .map(|(index, character)| index + character.len_utf8())
-        .rfind(|index| prefix[..*index].chars().count() >= 12);
-    if let Some(boundary) = boundary {
-        return prefix[..boundary].to_string();
-    }
-    let mut truncated = value
-        .chars()
-        .take(max_chars.saturating_sub(1))
-        .collect::<String>();
-    truncated.push('…');
-    truncated
-}
-
 fn sanitize_reply_sections(sections: Vec<String>) -> Vec<String> {
     sections
         .into_iter()
@@ -1311,8 +1255,7 @@ mod tests {
     use super::{
         BotMemory, Roles, compression_cutoff, extract_interests_from_message,
         extract_personality_traits, follow_up_delay_millis, is_silent_model_response,
-        limit_group_reply, limit_memory_size, requests_no_reply, split_reply,
-        with_reference_context,
+        limit_memory_size, requests_no_reply, split_reply, with_reference_context,
     };
     use crate::memory::BotPersonality;
     use chrono::Local;
@@ -1405,37 +1348,18 @@ mod tests {
     }
 
     #[test]
+    fn detailed_group_reply_is_not_truncated() {
+        let detailed = "这是一个确实需要完整说明的复杂问题。".repeat(20);
+        assert_eq!(split_reply(&detailed), vec![detailed]);
+    }
+
+    #[test]
     fn reply_drops_leading_bracketed_stage_directions() {
         assert_eq!(
             split_reply("[听到呼唤，轻轻应了一声] 嗯？这么晚啦……你找我，是有什么心事吗？"),
             vec!["嗯？这么晚啦……你找我，是有什么心事吗？"]
         );
         assert_eq!(split_reply("【有点不好意思】[轻轻点头] 好呀"), vec!["好呀"]);
-    }
-
-    #[test]
-    fn group_reply_is_kept_short_even_when_the_model_is_verbose() {
-        let reply = limit_group_reply(
-            vec![
-                "这是第一条很长的回复，它会不断补充很多不适合QQ群聊天的内容，所以应该在自然的位置结束。后面这些内容不该继续发出去。"
-                    .to_string(),
-                "第二条也应该保留，但不会超过总长度。".to_string(),
-                "第三条".to_string(),
-                "第四条不应发送".to_string(),
-            ],
-            3,
-            80,
-        );
-        assert!(reply.len() <= 3);
-        assert!(reply.iter().all(|message| message.chars().count() <= 60));
-        assert!(
-            reply
-                .iter()
-                .map(|message| message.chars().count())
-                .sum::<usize>()
-                <= 80
-        );
-        assert!(!reply.iter().any(|message| message.contains("第四条")));
     }
 
     #[test]
