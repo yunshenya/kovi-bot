@@ -11,8 +11,8 @@ use crate::sticker_memory::{
     stickers_for_teaching, teach, teaching_label, with_quoted_context, with_sticker_context,
 };
 use crate::vision::{
-    extract_image_attachments, is_vision_command, merge_image_attachments, resolve_image_urls,
-    strip_vision_command,
+    VisionImage, extract_image_attachments, is_vision_command, merge_image_attachments,
+    resolve_image_urls, strip_vision_command,
 };
 use chrono::Local;
 use kovi::RuntimeBot;
@@ -47,6 +47,18 @@ static GROUP_INTERJECTION_STATE: LazyLock<Mutex<HashMap<i64, GroupInterjectionSt
 
 static GROUP_MESSAGE_BATCHES: LazyLock<MessageCoalescer<(i64, i64)>> =
     LazyLock::new(Default::default);
+
+struct PendingWindowMessage {
+    user_id: i64,
+    nickname: String,
+    sender: String,
+    message: String,
+    vision_images: Vec<VisionImage>,
+}
+
+/// 当前回复期间只保留每个群组的一条待处理窗口消息，避免高频消息把模型请求反复取消。
+static PENDING_WINDOW_MESSAGES: LazyLock<Mutex<HashMap<i64, PendingWindowMessage>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Default)]
 struct DirectTriggerState {
@@ -84,9 +96,7 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
         !current_images.is_empty(),
     )
     .await;
-    let can_interrupt = directly_addressed
-        || asks_for_silence
-        || (participant_follow_up && is_active(reply_scope).await);
+    let can_interrupt = directly_addressed || asks_for_silence || vision_command;
     let mut reply_ticket = if can_interrupt {
         Some(interrupt(reply_scope).await)
     } else {
@@ -282,6 +292,26 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
         update_group_profile(group_id, event.user_id, message, &nickname).await;
         learn_user_profile_from_message(event.user_id, message, &nickname, false).await;
     }
+    if should_defer_active_window_message(
+        is_active(reply_scope).await,
+        participant_follow_up,
+        reply_ticket.is_some(),
+    ) {
+        println!(
+            "[INFO] 群聊已有回复进行中，排队窗口消息 (群组: {}, 用户: {})",
+            group_id, event.user_id
+        );
+        queue_pending_window_message(
+            group_id,
+            event.user_id,
+            nickname,
+            sender,
+            model_message,
+            vision_images,
+        )
+        .await;
+        return;
+    }
     match message.trim() {
         "#系统信息" => {
             send_sys_info(Arc::clone(&bot), group_id).await;
@@ -373,7 +403,7 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
                 let replied = silence(
                     group_id,
                     &model_message,
-                    bot,
+                    Arc::clone(&bot),
                     sender,
                     ticket,
                     None,
@@ -381,6 +411,7 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
                 )
                 .await;
                 finish_conversation_turn(group_id, event.user_id, turn_marker, replied).await;
+                drain_pending_window_messages(group_id, Arc::clone(&bot)).await;
             } else if should_continue_conversation(
                 group_id,
                 event.user_id,
@@ -398,7 +429,7 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
                 let replied = silence(
                     group_id,
                     &model_message,
-                    bot,
+                    Arc::clone(&bot),
                     sender,
                     ticket,
                     None,
@@ -406,6 +437,7 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
                 )
                 .await;
                 finish_conversation_turn(group_id, event.user_id, turn_marker, replied).await;
+                drain_pending_window_messages(group_id, Arc::clone(&bot)).await;
             } else if should_interject(group_id, &model_message).await {
                 println!("[INFO] 群聊未点名接话 (群组: {})", group_id);
                 let ticket = interrupt(reply_scope).await;
@@ -416,7 +448,7 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
                 let replied = silence(
                     group_id,
                     &model_message,
-                    bot,
+                    Arc::clone(&bot),
                     sender,
                     ticket,
                     Some(max_output_tokens),
@@ -425,6 +457,7 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
                 .await;
                 finish_interjection_attempt(group_id, replied).await;
                 finish_conversation_turn(group_id, event.user_id, turn_marker, replied).await;
+                drain_pending_window_messages(group_id, Arc::clone(&bot)).await;
             } else if let Err(error) = MEMORY_MANAGER
                 .add_conversation_memory(
                     group_id,
@@ -669,6 +702,89 @@ fn is_meaningful_conversation_message(message: &str, has_image: bool) -> bool {
         return false;
     }
     has_image || text.chars().any(|character| character.is_alphanumeric())
+}
+
+fn should_defer_active_window_message(
+    active_reply: bool,
+    participant_follow_up: bool,
+    has_explicit_interrupt: bool,
+) -> bool {
+    active_reply && participant_follow_up && !has_explicit_interrupt
+}
+
+async fn queue_pending_window_message(
+    group_id: i64,
+    user_id: i64,
+    nickname: String,
+    sender: String,
+    message: String,
+    vision_images: Vec<VisionImage>,
+) {
+    let mut pending = PENDING_WINDOW_MESSAGES.lock().await;
+    if let Some(existing) = pending.get_mut(&group_id) {
+        existing.user_id = user_id;
+        existing.nickname = nickname;
+        existing.sender = sender;
+        existing.message = message;
+        merge_vision_images(&mut existing.vision_images, vision_images);
+    } else {
+        pending.insert(
+            group_id,
+            PendingWindowMessage {
+                user_id,
+                nickname,
+                sender,
+                message,
+                vision_images,
+            },
+        );
+    }
+}
+
+fn merge_vision_images(target: &mut Vec<VisionImage>, incoming: Vec<VisionImage>) {
+    for image in incoming {
+        if target.iter().any(|existing| existing.url == image.url) {
+            continue;
+        }
+        target.push(image);
+        if target.len() >= 4 {
+            target.truncate(4);
+            break;
+        }
+    }
+}
+
+async fn drain_pending_window_messages(group_id: i64, bot: Arc<RuntimeBot>) {
+    for _ in 0..3 {
+        let Some(pending) = PENDING_WINDOW_MESSAGES.lock().await.remove(&group_id) else {
+            return;
+        };
+        if is_active(ReplyScope::Group(group_id)).await {
+            PENDING_WINDOW_MESSAGES
+                .lock()
+                .await
+                .insert(group_id, pending);
+            return;
+        }
+
+        println!("[INFO] 群聊开始处理排队窗口消息 (群组: {})", group_id);
+        let ticket = interrupt(ReplyScope::Group(group_id)).await;
+        let turn_marker = begin_conversation_turn(group_id, pending.user_id).await;
+        let replied = crate::model::utils::silence(
+            group_id,
+            &pending.message,
+            bot.clone(),
+            pending.sender,
+            ticket,
+            None,
+            pending.vision_images,
+        )
+        .await;
+        finish_conversation_turn(group_id, pending.user_id, turn_marker, replied).await;
+        if !replied {
+            return;
+        }
+    }
 }
 
 fn prune_conversation_participants(state: &mut GroupInterjectionState, now: Instant) {
@@ -938,7 +1054,7 @@ mod tests {
         conversation_message_is_relevant, decision_budget_available, extract_topics_from_message,
         has_active_conversation_window, infer_group_personality, is_admin_command,
         is_interjection_candidate, normalize_for_spam_detection, prune_decision_attempts,
-        suppress_direct_trigger,
+        should_defer_active_window_message, suppress_direct_trigger,
     };
     use std::time::{Duration, Instant};
 
@@ -1094,6 +1210,14 @@ mod tests {
         ));
         assert!(!has_active_conversation_window(Some(deadline), deadline));
         assert!(!has_active_conversation_window(None, opened_at));
+    }
+
+    #[test]
+    fn ordinary_window_messages_do_not_cancel_an_active_reply() {
+        assert!(should_defer_active_window_message(true, true, false));
+        assert!(!should_defer_active_window_message(true, true, true));
+        assert!(!should_defer_active_window_message(true, false, false));
+        assert!(!should_defer_active_window_message(false, true, false));
     }
 
     #[test]

@@ -11,7 +11,7 @@ use std::sync::LazyLock;
 use std::time::Duration;
 
 const MAX_VISION_IMAGES: usize = 4;
-const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
+const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 static IMAGE_CLIENT: LazyLock<Client> = LazyLock::new(Client::new);
 static VISION_CLIENT: LazyLock<Client> = LazyLock::new(Client::new);
 
