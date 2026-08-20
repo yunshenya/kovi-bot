@@ -24,7 +24,17 @@ struct GroupInterjectionState {
     eligible_messages_since_sample: u32,
     last_interjection: Option<Instant>,
     interjection_in_flight: bool,
+    decision_attempts: VecDeque<Instant>,
     conversation_until: Option<Instant>,
+    last_bot_reply_at: Option<Instant>,
+    conversation_participants: HashMap<i64, Instant>,
+    next_turn_generation: u64,
+    pending_participants: HashMap<i64, PendingConversationTurn>,
+}
+
+struct PendingConversationTurn {
+    generation: u64,
+    expires_at: Instant,
 }
 
 /// 未点名接话只维护本地计数和冷却状态；不会为每一条群消息调用模型。
@@ -61,11 +71,11 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
     let directly_addressed = is_addressed_to_bot(&event, message);
     let explicit_stop = is_explicit_stop_message(message);
     let asks_for_silence = explicit_stop || requests_no_reply(message);
-    let looks_like_follow_up = asks_for_silence || is_conversation_follow_up(message);
+    let participant_follow_up =
+        is_conversation_participant_message(group_id, event.user_id, message).await;
     let can_interrupt = directly_addressed
         || asks_for_silence
-        || (looks_like_follow_up
-            && (is_active(reply_scope).await || has_conversation_window(group_id).await));
+        || (participant_follow_up && is_active(reply_scope).await);
     let mut reply_ticket = if can_interrupt {
         Some(interrupt(reply_scope).await)
     } else {
@@ -276,26 +286,36 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
                     Some(ticket) => ticket,
                     None => interrupt(reply_scope).await,
                 };
-                if silence(group_id, &model_message, bot, sender, ticket).await {
-                    activate_conversation_window(group_id).await;
-                }
-            } else if should_continue_conversation(group_id, &model_message).await {
+                let turn_marker = begin_conversation_turn(group_id, event.user_id).await;
+                let replied = silence(group_id, &model_message, bot, sender, ticket, None).await;
+                finish_conversation_turn(group_id, event.user_id, turn_marker, replied).await;
+            } else if should_continue_conversation(group_id, event.user_id, &model_message).await {
                 println!("[INFO] 群聊接续对话 (群组: {})", group_id);
                 let ticket = match reply_ticket {
                     Some(ticket) => ticket,
                     None => interrupt(reply_scope).await,
                 };
-                if silence(group_id, &model_message, bot, sender, ticket).await {
-                    activate_conversation_window(group_id).await;
-                }
+                let turn_marker = begin_conversation_turn(group_id, event.user_id).await;
+                let replied = silence(group_id, &model_message, bot, sender, ticket, None).await;
+                finish_conversation_turn(group_id, event.user_id, turn_marker, replied).await;
             } else if should_interject(group_id, &model_message).await {
                 println!("[INFO] 群聊未点名接话 (群组: {})", group_id);
                 let ticket = interrupt(reply_scope).await;
-                let replied = silence(group_id, &model_message, bot, sender, ticket).await;
+                let turn_marker = begin_conversation_turn(group_id, event.user_id).await;
+                let max_output_tokens = config::get()
+                    .group_interjection()
+                    .interjection_max_output_tokens();
+                let replied = silence(
+                    group_id,
+                    &model_message,
+                    bot,
+                    sender,
+                    ticket,
+                    Some(max_output_tokens),
+                )
+                .await;
                 finish_interjection_attempt(group_id, replied).await;
-                if replied {
-                    activate_conversation_window(group_id).await;
-                }
+                finish_conversation_turn(group_id, event.user_id, turn_marker, replied).await;
             } else if let Err(error) = MEMORY_MANAGER
                 .add_conversation_memory(
                     group_id,
@@ -416,94 +436,135 @@ fn is_admin_command(message: &str) -> bool {
     )
 }
 
-/// 机器人成功回复后开启或续期窗口，使用户可以不重复叫名字而继续对话。
-async fn activate_conversation_window(group_id: i64) {
+/// 标记正在回复的成员，使其在模型思考和连续气泡发送期间也能自然打断或补充。
+async fn begin_conversation_turn(group_id: i64, user_id: i64) -> u64 {
+    let deadline = Instant::now()
+        + Duration::from_secs(
+            config::get()
+                .group_interjection()
+                .conversation_window_secs(),
+        );
+    let mut states = GROUP_INTERJECTION_STATE.lock().await;
+    prune_interjection_states(&mut states);
+    let state = states.entry(group_id).or_default();
+    state.next_turn_generation = state.next_turn_generation.wrapping_add(1);
+    let generation = state.next_turn_generation;
+    state.pending_participants.insert(
+        user_id,
+        PendingConversationTurn {
+            generation,
+            expires_at: deadline,
+        },
+    );
+    generation
+}
+
+/// 只有实际回复成功才开启三分钟窗口；代数标记避免旧任务清掉同一成员的新一轮状态。
+async fn finish_conversation_turn(
+    group_id: i64,
+    user_id: i64,
+    turn_generation: u64,
+    replied: bool,
+) {
+    let now = Instant::now();
     let duration = Duration::from_secs(
         config::get()
             .group_interjection()
             .conversation_window_secs(),
     );
     let mut states = GROUP_INTERJECTION_STATE.lock().await;
-    prune_interjection_states(&mut states);
-    states.entry(group_id).or_default().conversation_until = Some(Instant::now() + duration);
-}
-
-/// 只读取窗口状态，不续期；用于判断新消息是否有资格打断正在生成或发送的回复。
-async fn has_conversation_window(group_id: i64) -> bool {
-    GROUP_INTERJECTION_STATE
-        .lock()
-        .await
-        .get(&group_id)
-        .is_some_and(|state| {
-            has_active_conversation_window(state.conversation_until, Instant::now())
-        })
-}
-
-/// 在窗口内，仅对本地判断像在继续聊天的消息调用模型；无关消息仍不消耗 token。
-async fn should_continue_conversation(group_id: i64, message: &str) -> bool {
-    if !is_conversation_follow_up(message) {
-        return false;
+    let Some(state) = states.get_mut(&group_id) else {
+        return;
+    };
+    if state
+        .pending_participants
+        .get(&user_id)
+        .is_some_and(|turn| turn.generation == turn_generation)
+    {
+        state.pending_participants.remove(&user_id);
     }
+    if replied {
+        let deadline = now + duration;
+        state.conversation_until = Some(deadline);
+        state.last_bot_reply_at = Some(now);
+        state.conversation_participants.insert(user_id, deadline);
+    }
+}
 
+/// 参与者、待回复成员，或机器人刚发言后的新成员可以自然接续，无需匹配固定词。
+async fn is_conversation_participant_message(group_id: i64, user_id: i64, message: &str) -> bool {
+    let now = Instant::now();
+    let open_floor = Duration::from_secs(
+        config::get()
+            .group_interjection()
+            .conversation_open_floor_secs(),
+    );
     let mut states = GROUP_INTERJECTION_STATE.lock().await;
     let Some(state) = states.get_mut(&group_id) else {
         return false;
     };
-    if has_active_conversation_window(state.conversation_until, Instant::now()) {
-        // 每条自然接续消息都滚动续期，因此活跃对话可以跨越任意多个窗口。
-        state.conversation_until = Some(
-            Instant::now()
-                + Duration::from_secs(
-                    config::get()
-                        .group_interjection()
-                        .conversation_window_secs(),
-                ),
-        );
-        true
-    } else {
+    prune_conversation_participants(state, now);
+    if !has_active_conversation_window(state.conversation_until, now) {
         state.conversation_until = None;
-        false
     }
+    conversation_message_is_relevant(state, user_id, message, now, open_floor)
+}
+
+async fn should_continue_conversation(group_id: i64, user_id: i64, message: &str) -> bool {
+    is_conversation_participant_message(group_id, user_id, message).await
+}
+
+fn conversation_message_is_relevant(
+    state: &GroupInterjectionState,
+    user_id: i64,
+    message: &str,
+    now: Instant,
+    open_floor: Duration,
+) -> bool {
+    if !is_meaningful_conversation_message(message) {
+        return false;
+    }
+    if state
+        .pending_participants
+        .get(&user_id)
+        .is_some_and(|turn| turn.expires_at > now)
+    {
+        return true;
+    }
+    if !has_active_conversation_window(state.conversation_until, now) {
+        return false;
+    }
+    state
+        .conversation_participants
+        .get(&user_id)
+        .is_some_and(|deadline| *deadline > now)
+        || state
+            .last_bot_reply_at
+            .is_some_and(|last_reply| now.duration_since(last_reply) < open_floor)
+}
+
+fn is_meaningful_conversation_message(message: &str) -> bool {
+    let text = message.trim();
+    if text.is_empty() || text.starts_with('#') {
+        return false;
+    }
+    text.chars().any(|character| character.is_alphanumeric())
+}
+
+fn prune_conversation_participants(state: &mut GroupInterjectionState, now: Instant) {
+    state
+        .conversation_participants
+        .retain(|_, deadline| *deadline > now);
+    state
+        .pending_participants
+        .retain(|_, turn| turn.expires_at > now);
 }
 
 fn has_active_conversation_window(until: Option<Instant>, now: Instant) -> bool {
     until.is_some_and(|deadline| deadline > now)
 }
 
-fn is_conversation_follow_up(message: &str) -> bool {
-    let text = message.trim();
-    if text.is_empty() || text.starts_with('#') {
-        return false;
-    }
-
-    let follow_up_cues = [
-        "？",
-        "?",
-        "你",
-        "吗",
-        "谢谢",
-        "好呀",
-        "好的",
-        "对啊",
-        "是吗",
-        "真的",
-        "然后",
-        "继续",
-        "为什么",
-        "怎么",
-        "能不能",
-        "我也",
-        "哈哈",
-        "嗯",
-        "对",
-        "好",
-        "行",
-        "可以",
-    ];
-    follow_up_cues.iter().any(|cue| text.contains(cue))
-}
-
-/// 仅用本地关键词、计数、冷却和概率筛选未点名接话机会；这里不会请求模型。
+/// 仅用本地有效内容、计数、额度和概率筛选未点名接话机会；这里不会请求模型。
 async fn should_interject(group_id: i64, message: &str) -> bool {
     let config = config::get().group_interjection().clone();
     if !config.enabled() || !is_interjection_candidate(message, config.min_message_chars()) {
@@ -513,18 +574,34 @@ async fn should_interject(group_id: i64, message: &str) -> bool {
     let mut states = GROUP_INTERJECTION_STATE.lock().await;
     prune_interjection_states(&mut states);
     let state = states.entry(group_id).or_default();
+    let now = Instant::now();
+    prune_decision_attempts(
+        state,
+        now,
+        Duration::from_secs(config.decision_rate_window_secs()),
+    );
     if state.interjection_in_flight {
         return false;
     }
     if state
         .last_interjection
-        .is_some_and(|last| last.elapsed() < Duration::from_secs(config.cooldown_secs()))
+        .is_some_and(|last| now.duration_since(last) < Duration::from_secs(config.cooldown_secs()))
     {
         return false;
     }
 
     state.eligible_messages_since_sample = state.eligible_messages_since_sample.saturating_add(1);
     if state.eligible_messages_since_sample < config.min_eligible_messages() {
+        return false;
+    }
+    if !decision_budget_available(
+        state,
+        now,
+        Duration::from_secs(config.decision_cooldown_secs()),
+        config.decision_rate_limit(),
+    ) {
+        // 保留已累计的候选；额度恢复后下一条有效消息即可再次抽样。
+        state.eligible_messages_since_sample = config.min_eligible_messages();
         return false;
     }
     // 每积累一批候选消息才抽样一次；未抽中也重新累计，避免逐条消耗 token。
@@ -534,7 +611,35 @@ async fn should_interject(group_id: i64, message: &str) -> bool {
     }
 
     state.interjection_in_flight = true;
+    state.decision_attempts.push_back(now);
     true
+}
+
+fn prune_decision_attempts(
+    state: &mut GroupInterjectionState,
+    now: Instant,
+    rate_window: Duration,
+) {
+    while state
+        .decision_attempts
+        .front()
+        .is_some_and(|attempt| now.duration_since(*attempt) >= rate_window)
+    {
+        state.decision_attempts.pop_front();
+    }
+}
+
+fn decision_budget_available(
+    state: &GroupInterjectionState,
+    now: Instant,
+    cooldown: Duration,
+    rate_limit: usize,
+) -> bool {
+    state
+        .decision_attempts
+        .back()
+        .is_none_or(|attempt| now.duration_since(*attempt) >= cooldown)
+        && state.decision_attempts.len() < rate_limit
 }
 
 /// 模型选择静默时只结束本轮尝试；真正发出消息后才开始冷却。
@@ -561,10 +666,16 @@ fn prune_interjection_states(states: &mut HashMap<i64, GroupInterjectionState>) 
         return;
     }
     let now = Instant::now();
-    let cooldown = Duration::from_secs(config::get().group_interjection().cooldown_secs());
+    let interjection_config = config::get().group_interjection().clone();
+    let cooldown = Duration::from_secs(interjection_config.cooldown_secs());
+    let decision_window = Duration::from_secs(interjection_config.decision_rate_window_secs());
     states.retain(|_, state| {
+        prune_conversation_participants(state, now);
+        prune_decision_attempts(state, now, decision_window);
         state.interjection_in_flight
             || has_active_conversation_window(state.conversation_until, now)
+            || !state.pending_participants.is_empty()
+            || !state.decision_attempts.is_empty()
             || state
                 .last_interjection
                 .is_some_and(|last| now.duration_since(last) < cooldown)
@@ -704,9 +815,10 @@ fn extract_topics_from_message(message: &str) -> Vec<String> {
 mod tests {
     use super::{
         DirectTriggerState, GroupInterjectionState, complete_interjection_attempt,
-        extract_topics_from_message, has_active_conversation_window, infer_group_personality,
-        is_admin_command, is_conversation_follow_up, is_interjection_candidate,
-        normalize_for_spam_detection, suppress_direct_trigger,
+        conversation_message_is_relevant, decision_budget_available, extract_topics_from_message,
+        has_active_conversation_window, infer_group_personality, is_admin_command,
+        is_interjection_candidate, normalize_for_spam_detection, prune_decision_attempts,
+        suppress_direct_trigger,
     };
     use std::time::{Duration, Instant};
 
@@ -749,12 +861,92 @@ mod tests {
     }
 
     #[test]
-    fn conversation_window_only_accepts_likely_follow_ups() {
-        assert!(is_conversation_follow_up("那你觉得呢？"));
-        assert!(is_conversation_follow_up("好呀，谢谢你"));
-        assert!(is_conversation_follow_up("嗯，对呀"));
-        assert!(!is_conversation_follow_up("[图片]"));
-        assert!(!is_conversation_follow_up("#系统信息"));
+    fn conversation_window_uses_participants_and_timing_instead_of_keywords() {
+        let now = Instant::now();
+        let deadline = now + Duration::from_secs(180);
+        let mut state = GroupInterjectionState {
+            conversation_until: Some(deadline),
+            last_bot_reply_at: Some(now - Duration::from_secs(46)),
+            ..GroupInterjectionState::default()
+        };
+        state.conversation_participants.insert(42, deadline);
+
+        assert!(conversation_message_is_relevant(
+            &state,
+            42,
+            "今天买了新的杯子",
+            now,
+            Duration::from_secs(45),
+        ));
+        assert!(conversation_message_is_relevant(
+            &state,
+            42,
+            "嗯",
+            now,
+            Duration::from_secs(45),
+        ));
+        assert!(!conversation_message_is_relevant(
+            &state,
+            99,
+            "这是群里另一段聊天",
+            now,
+            Duration::from_secs(45),
+        ));
+
+        state.last_bot_reply_at = Some(now - Duration::from_secs(10));
+        assert!(conversation_message_is_relevant(
+            &state,
+            99,
+            "我也想说一句",
+            now,
+            Duration::from_secs(45),
+        ));
+        assert!(!conversation_message_is_relevant(
+            &state,
+            42,
+            "#系统信息",
+            now,
+            Duration::from_secs(45),
+        ));
+    }
+
+    #[test]
+    fn unsolicited_model_decisions_obey_cooldown_and_rate_budget() {
+        let now = Instant::now();
+        let mut state = GroupInterjectionState::default();
+        assert!(decision_budget_available(
+            &state,
+            now,
+            Duration::from_secs(60),
+            3,
+        ));
+        state
+            .decision_attempts
+            .push_back(now - Duration::from_secs(30));
+        assert!(!decision_budget_available(
+            &state,
+            now,
+            Duration::from_secs(60),
+            3,
+        ));
+        state.decision_attempts.clear();
+        state
+            .decision_attempts
+            .push_back(now - Duration::from_secs(120));
+        state
+            .decision_attempts
+            .push_back(now - Duration::from_secs(90));
+        state
+            .decision_attempts
+            .push_back(now - Duration::from_secs(30));
+        assert!(!decision_budget_available(
+            &state,
+            now,
+            Duration::from_secs(60),
+            3,
+        ));
+        prune_decision_attempts(&mut state, now, Duration::from_secs(100));
+        assert_eq!(state.decision_attempts.len(), 2);
     }
 
     #[test]

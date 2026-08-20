@@ -16,8 +16,18 @@ pub struct GroupInterjectionConfig {
     response_probability_percent: u8,
     /// 只有达到该长度的消息才会作为候选，过滤“嗯”“哈哈”等短消息。
     min_message_chars: usize,
+    /// 两次未点名模型判断之间的最短间隔（秒）。
+    decision_cooldown_secs: u64,
+    /// 未点名模型判断额度的统计窗口（秒）。
+    decision_rate_window_secs: u64,
+    /// 统计窗口内最多允许多少次未点名模型判断。
+    decision_rate_limit: usize,
+    /// 未点名接话单次允许生成的最大 token 数。
+    interjection_max_output_tokens: u32,
     /// 机器人成功接话后，允许无称呼继续对话的时间窗口（秒）。
     conversation_window_secs: u64,
+    /// 机器人刚发言后，允许新成员自然接话并加入窗口的时间（秒）。
+    conversation_open_floor_secs: u64,
     /// 判断同一句点名为重复刷屏的时间窗口（秒）。
     direct_repeat_window_secs: u64,
     /// 连续刷屏后暂停处理该成员直接点名的时间（秒）。
@@ -49,8 +59,28 @@ impl GroupInterjectionConfig {
         self.min_message_chars
     }
 
+    pub fn decision_cooldown_secs(&self) -> u64 {
+        self.decision_cooldown_secs
+    }
+
+    pub fn decision_rate_window_secs(&self) -> u64 {
+        self.decision_rate_window_secs
+    }
+
+    pub fn decision_rate_limit(&self) -> usize {
+        self.decision_rate_limit
+    }
+
+    pub fn interjection_max_output_tokens(&self) -> u32 {
+        self.interjection_max_output_tokens
+    }
+
     pub fn conversation_window_secs(&self) -> u64 {
         self.conversation_window_secs
+    }
+
+    pub fn conversation_open_floor_secs(&self) -> u64 {
+        self.conversation_open_floor_secs
     }
 
     pub fn direct_repeat_window_secs(&self) -> u64 {
@@ -82,7 +112,14 @@ impl GroupInterjectionConfig {
         if self.min_message_chars == 0 {
             return Err(anyhow::anyhow!("群聊接话最小消息长度必须大于0"));
         }
-        if self.conversation_window_secs == 0 {
+        if self.decision_cooldown_secs == 0
+            || self.decision_rate_window_secs == 0
+            || self.decision_rate_limit == 0
+            || self.interjection_max_output_tokens == 0
+        {
+            return Err(anyhow::anyhow!("群聊未点名判断额度必须大于0"));
+        }
+        if self.conversation_window_secs == 0 || self.conversation_open_floor_secs == 0 {
             return Err(anyhow::anyhow!("群聊接话对话窗口必须大于0秒"));
         }
         if self.direct_repeat_window_secs == 0
@@ -106,7 +143,12 @@ impl Default for GroupInterjectionConfig {
             cooldown_secs: 180,
             response_probability_percent: 60,
             min_message_chars: 4,
+            decision_cooldown_secs: 60,
+            decision_rate_window_secs: 600,
+            decision_rate_limit: 3,
+            interjection_max_output_tokens: 240,
             conversation_window_secs: 180,
+            conversation_open_floor_secs: 45,
             direct_repeat_window_secs: 120,
             direct_spam_cooldown_secs: 600,
             direct_rate_window_secs: 60,

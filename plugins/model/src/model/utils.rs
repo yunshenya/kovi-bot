@@ -127,6 +127,7 @@ pub async fn control_model(
     nickname: String,
     message: &str,
     reply_ticket: ReplyTicket,
+    max_output_tokens: Option<u32>,
 ) -> bool {
     // 分析情绪并更新
     if let Err(e) = MOOD_SYSTEM
@@ -195,6 +196,7 @@ pub async fn control_model(
         group_id,
         "group_chat",
         reply_ticket,
+        max_output_tokens,
     )
     .await;
     if !is_current(reply_ticket).await {
@@ -452,7 +454,7 @@ async fn summarize_conversation(
             ),
         },
     ];
-    let response = interruptible_model_call(&mut request, reply_ticket).await?;
+    let response = interruptible_model_call(&mut request, reply_ticket, None).await?;
     let summary = response
         .content
         .replace(FOLLOW_UP_MARKER, "\n")
@@ -525,10 +527,10 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
 /// # 错误处理
 /// 如果API调用失败，返回默认错误消息
 pub async fn params_model(messages: &mut [BotMemory]) -> BotMemory {
-    params_model_with_max_tokens(messages, None).await
+    params_model_with_token_limit(messages, None).await
 }
 
-async fn params_model_with_max_tokens(
+pub(crate) async fn params_model_with_token_limit(
     messages: &mut [BotMemory],
     max_tokens: Option<u32>,
 ) -> BotMemory {
@@ -758,6 +760,7 @@ pub async fn silence(
     bot: Arc<RuntimeBot>,
     sender: String,
     reply_ticket: ReplyTicket,
+    max_output_tokens: Option<u32>,
 ) -> bool {
     if message.trim() == "#禁言" {
         instance_is_ban().lock().await.insert(group_id, true);
@@ -780,7 +783,15 @@ pub async fn silence(
         if !mark_active(reply_ticket).await {
             return false;
         }
-        let replied = control_model(group_id, bot, sender, message, reply_ticket).await;
+        let replied = control_model(
+            group_id,
+            bot,
+            sender,
+            message,
+            reply_ticket,
+            max_output_tokens,
+        )
+        .await;
         finish(reply_ticket).await;
         replied
     } else {
@@ -911,6 +922,7 @@ async fn private_chat_inner(
         user_id,
         "private_chat",
         reply_ticket,
+        None,
     )
     .await;
     if !is_current(reply_ticket).await {

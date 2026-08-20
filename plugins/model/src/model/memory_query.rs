@@ -1,7 +1,7 @@
 //! 由模型自主发起、由程序严格约束的长期记忆查询循环。
 
 use super::interrupt::{ReplyTicket, is_current};
-use super::utils::{BotMemory, Roles, params_model};
+use super::utils::{BotMemory, Roles, params_model_with_token_limit};
 use crate::config;
 use crate::memory::{MEMORY_MANAGER, MemoryEntry, MemoryLookup};
 use std::time::Duration;
@@ -22,10 +22,11 @@ pub(crate) async fn params_model_with_memory_access(
     subject_id: i64,
     context: &str,
     reply_ticket: ReplyTicket,
+    max_output_tokens: Option<u32>,
 ) -> BotMemory {
     let memory_config = config::get().memory().clone();
     if !memory_config.autonomous_query_enabled() {
-        return interruptible_model_call(messages, reply_ticket)
+        return interruptible_model_call(messages, reply_ticket, max_output_tokens)
             .await
             .unwrap_or_else(interrupted_response);
     }
@@ -37,7 +38,9 @@ pub(crate) async fn params_model_with_memory_access(
     });
 
     for round in 0..memory_config.autonomous_query_max_rounds() {
-        let Some(response) = interruptible_model_call(&mut request, reply_ticket).await else {
+        let Some(response) =
+            interruptible_model_call(&mut request, reply_ticket, max_output_tokens).await
+        else {
             return interrupted_response();
         };
         match parse_memory_query(&response.content) {
@@ -96,7 +99,9 @@ pub(crate) async fn params_model_with_memory_access(
         content: "本轮记忆查询次数已用完。请使用已有结果直接回答，不要再输出记忆查询标记。"
             .to_string(),
     });
-    let Some(response) = interruptible_model_call(&mut request, reply_ticket).await else {
+    let Some(response) =
+        interruptible_model_call(&mut request, reply_ticket, max_output_tokens).await
+    else {
         return interrupted_response();
     };
     if matches!(
@@ -116,12 +121,13 @@ pub(crate) async fn params_model_with_memory_access(
 pub(crate) async fn interruptible_model_call(
     messages: &mut [BotMemory],
     reply_ticket: ReplyTicket,
+    max_output_tokens: Option<u32>,
 ) -> Option<BotMemory> {
     if !is_current(reply_ticket).await {
         return None;
     }
     kovi::tokio::select! {
-        response = params_model(messages) => {
+        response = params_model_with_token_limit(messages, max_output_tokens) => {
             is_current(reply_ticket).await.then_some(response)
         }
         () = wait_until_interrupted(reply_ticket) => None,
