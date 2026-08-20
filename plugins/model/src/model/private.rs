@@ -1,6 +1,7 @@
 use crate::model::utils::{private_chat, requests_no_reply};
 use crate::sticker_memory::{
-    extract_stickers, known_labels, teach, teaching_label, with_sticker_context,
+    extract_stickers, known_labels, stickers_for_teaching, teach, teaching_label,
+    with_sticker_context,
 };
 use kovi::RuntimeBot;
 use kovi::event::PrivateMsgEvent;
@@ -13,19 +14,23 @@ pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<Runtime
     let stickers = extract_stickers(&event.message);
 
     if let Some(label) = teaching_label(message) {
-        if stickers.is_empty() {
-            bot.send_private_msg(user_id, "请把表情包和 #教芸汐 命令放在同一条消息里哦。");
-        } else {
-            match teach(&stickers, &label, user_id, None).await {
-                Ok(count) => bot.send_private_msg(
-                    user_id,
-                    format!("记住啦，这 {count} 个表情以后表示“{label}”。"),
-                ),
-                Err(error) => {
-                    eprintln!("[ERROR] 私聊保存表情包记忆失败: {}", error);
-                    bot.send_private_msg(user_id, "这次没能记住，稍后再教我一次吧。");
+        match stickers_for_teaching(&event.message, &bot).await {
+            Ok(teaching_stickers) if !teaching_stickers.is_empty() => {
+                match teach(&teaching_stickers, &label, user_id, None).await {
+                    Ok(count) => bot.send_private_msg(
+                        user_id,
+                        format!("记住啦，这 {count} 个表情以后表示“{label}”。"),
+                    ),
+                    Err(error) => {
+                        eprintln!("[ERROR] 私聊保存表情包记忆失败: {}", error);
+                        bot.send_private_msg(user_id, "这次没能记住，稍后再教我一次吧。");
+                    }
                 }
             }
+            Ok(_) | Err(_) => bot.send_private_msg(
+                user_id,
+                "请回复（引用）那张表情包，再发送 #教芸汐 这个表情是……哦。",
+            ),
         }
         return;
     }

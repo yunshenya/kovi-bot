@@ -4,7 +4,7 @@
 
 use crate::memory::MEMORY_MANAGER;
 use anyhow::{Result, anyhow};
-use kovi::Message;
+use kovi::{Message, RuntimeBot};
 use sqlx::Row;
 use std::collections::HashSet;
 
@@ -75,6 +75,52 @@ pub(crate) fn extract_stickers(message: &Message) -> Vec<StickerImage> {
             seen.insert(key.clone()).then_some(StickerImage { key })
         })
         .collect()
+}
+
+/// 从引用消息段中读取原消息 ID。
+fn reply_message_id(message: &Message) -> Option<i32> {
+    message.iter().find_map(|segment| {
+        if segment.type_ != "reply" {
+            return None;
+        }
+
+        segment
+            .data
+            .get("id")
+            .and_then(|value| {
+                value
+                    .as_i64()
+                    .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+            })
+            .and_then(|value| i32::try_from(value).ok())
+    })
+}
+
+/// 教学时优先使用当前消息携带的表情；如果没有，则读取被引用消息中的表情。
+pub(crate) async fn stickers_for_teaching(
+    message: &Message,
+    bot: &RuntimeBot,
+) -> Result<Vec<StickerImage>> {
+    let stickers = extract_stickers(message);
+    if !stickers.is_empty() {
+        return Ok(stickers);
+    }
+
+    let message_id =
+        reply_message_id(message).ok_or_else(|| anyhow!("教学消息没有携带或引用表情包"))?;
+    let response = bot
+        .get_msg(message_id)
+        .await
+        .map_err(|response| anyhow!("读取被引用消息失败: {}", response.retcode))?;
+    let original_message = response
+        .data
+        .get("message")
+        .cloned()
+        .ok_or_else(|| anyhow!("被引用消息缺少消息内容"))?;
+    let original_message = Message::from_value(original_message)
+        .map_err(|error| anyhow!("解析被引用消息失败: {error}"))?;
+
+    Ok(extract_stickers(&original_message))
 }
 
 fn value_as_identifier(data: &serde_json::Value, fields: &[&str]) -> Option<String> {
@@ -187,7 +233,9 @@ pub(crate) fn with_sticker_context(text: &str, labels: &[String]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{StickerImage, extract_stickers, teaching_label, with_sticker_context};
+    use super::{
+        StickerImage, extract_stickers, reply_message_id, teaching_label, with_sticker_context,
+    };
     use kovi::Message;
     use kovi::bot::message::Segment;
     use serde_json::json;
@@ -222,6 +270,14 @@ mod tests {
         );
         assert_eq!(teaching_label("#教云汐：委屈"), Some("委屈".to_string()));
         assert_eq!(teaching_label("这个表情是无语"), None);
+    }
+
+    #[test]
+    fn extracts_quoted_message_id_from_string_or_number() {
+        let string_id = Message::from(vec![Segment::new("reply", json!({"id": "12345"}))]);
+        let number_id = Message::from(vec![Segment::new("reply", json!({"id": 67890}))]);
+        assert_eq!(reply_message_id(&string_id), Some(12345));
+        assert_eq!(reply_message_id(&number_id), Some(67890));
     }
 
     #[test]
