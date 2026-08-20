@@ -8,7 +8,7 @@
 
 use crate::memory::MemoryManager;
 use crate::model::utils::{BotMemory, Roles, params_model};
-use crate::mood_system::MoodSystem;
+use crate::mood_system::MOOD_SYSTEM;
 use crate::topic_generator::TopicGenerator;
 use anyhow::Result;
 use chrono::Local;
@@ -29,8 +29,6 @@ pub struct ProactiveChatManager {
     memory_manager: Arc<MemoryManager>,
     /// 话题生成器，用于生成个性化话题
     topic_generator: TopicGenerator,
-    /// 情绪系统，用于分析当前情绪状态
-    mood_system: MoodSystem,
     /// 机器人实例，用于发送消息
     bot: Arc<RuntimeBot>,
 }
@@ -38,12 +36,9 @@ pub struct ProactiveChatManager {
 impl ProactiveChatManager {
     pub fn new(memory_manager: Arc<MemoryManager>, bot: Arc<RuntimeBot>) -> Self {
         let topic_generator = TopicGenerator::new(Arc::clone(&memory_manager));
-        let mood_system = MoodSystem::new(Arc::clone(&memory_manager));
-
         Self {
             memory_manager,
             topic_generator,
-            mood_system,
             bot,
         }
     }
@@ -195,7 +190,7 @@ impl ProactiveChatManager {
             .await;
         let contextual_memories = self
             .memory_manager
-            .get_contextual_memories(main_admin, "private_chat", 5)
+            .get_contextual_memories(main_admin, "private_chat", "主动关心近况", 5)
             .await;
         let recent_outreach = self
             .memory_manager
@@ -324,17 +319,10 @@ impl ProactiveChatManager {
             .generate_topic(Some(group_id), None)
             .await?
         {
-            // 添加情绪前缀
-            let mood_prefix = self.mood_system.get_mood_based_response_style().await;
             let content = topic.content.clone();
-            let message = if mood_prefix.is_empty() {
-                content.clone()
-            } else {
-                format!("{} {}", mood_prefix, content)
-            };
 
             // 发送消息
-            self.bot.send_group_msg(group_id, &message);
+            self.bot.send_group_msg(group_id, &content);
 
             // 记录这次主动对话
             self.memory_manager
@@ -365,17 +353,10 @@ impl ProactiveChatManager {
             .generate_personalized_topic(user_id)
             .await?
         {
-            // 添加情绪前缀
-            let mood_prefix = self.mood_system.get_mood_based_response_style().await;
             let content = topic.content.clone();
-            let message = if mood_prefix.is_empty() {
-                content.clone()
-            } else {
-                format!("{} {}", mood_prefix, content)
-            };
 
             // 发送消息
-            self.bot.send_private_msg(user_id, &message);
+            self.bot.send_private_msg(user_id, &content);
 
             // 记录这次主动对话
             self.memory_manager
@@ -407,7 +388,7 @@ impl ProactiveChatManager {
         } else {
             "private_chat"
         };
-        self.mood_system
+        MOOD_SYSTEM
             .analyze_and_update_mood(message, context)
             .await?;
 

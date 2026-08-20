@@ -1,11 +1,14 @@
+use crate::model::coalesce::MessageCoalescer;
 use crate::model::utils::{private_chat, requests_no_reply};
 use crate::sticker_memory::{
-    extract_stickers, has_reply, known_labels, quoted_message_context, stickers_for_teaching,
-    teach, teaching_label, with_quoted_context, with_sticker_context,
+    StickerScope, extract_stickers, has_reply, known_labels, quoted_message_context,
+    stickers_for_teaching, teach, teaching_label, with_quoted_context, with_sticker_context,
 };
 use kovi::RuntimeBot;
 use kovi::event::PrivateMsgEvent;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
+
+static PRIVATE_MESSAGE_BATCHES: LazyLock<MessageCoalescer<i64>> = LazyLock::new(Default::default);
 
 pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<RuntimeBot>) {
     let user_id = event.user_id;
@@ -16,7 +19,14 @@ pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<Runtime
     if let Some(label) = teaching_label(message) {
         match stickers_for_teaching(&event.message, &bot).await {
             Ok(teaching_stickers) if !teaching_stickers.is_empty() => {
-                match teach(&teaching_stickers, &label, user_id, None).await {
+                match teach(
+                    &teaching_stickers,
+                    &label,
+                    user_id,
+                    StickerScope::Private(user_id),
+                )
+                .await
+                {
                     Ok(count) => bot.send_private_msg(
                         user_id,
                         format!("记住啦，这 {count} 个表情以后表示“{label}”。"),
@@ -44,14 +54,15 @@ pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<Runtime
         return;
     }
 
-    let labels = match known_labels(&stickers).await {
+    let sticker_scope = StickerScope::Private(user_id);
+    let labels = match known_labels(&stickers, sticker_scope).await {
         Ok(labels) => labels,
         Err(error) => {
             eprintln!("[ERROR] 私聊读取表情包记忆失败: {}", error);
             Vec::new()
         }
     };
-    let quoted = match quoted_message_context(&event.message, &bot).await {
+    let quoted = match quoted_message_context(&event.message, &bot, sticker_scope).await {
         Ok(quoted) => quoted,
         Err(error) => {
             eprintln!("[ERROR] 私聊读取引用消息失败: {}", error);
@@ -71,5 +82,20 @@ pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<Runtime
     let model_message = quoted.as_ref().map_or(current_message.clone(), |quoted| {
         with_quoted_context(&current_message, quoted)
     });
+    let model_message = if !message.trim().is_empty()
+        && stickers.is_empty()
+        && quoted.is_none()
+        && !message.trim_start().starts_with('#')
+    {
+        let Some(combined) = PRIVATE_MESSAGE_BATCHES
+            .push(user_id, model_message, false)
+            .await
+        else {
+            return;
+        };
+        combined.text
+    } else {
+        model_message
+    };
     private_chat(user_id, &model_message, nick_name, bot).await;
 }

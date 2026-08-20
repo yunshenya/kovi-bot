@@ -1,5 +1,4 @@
 use sysinfo::System;
-use systemstat::Platform;
 
 fn format_uptime(seconds: u64) -> String {
     let days = seconds / 86400; // 天：86400秒 = 24*60*60
@@ -13,11 +12,7 @@ pub fn system_info_get() -> (String, String) {
     let mut system = System::new_all();
     system.refresh_all(); // 刷新数据
 
-    let sys = systemstat::System::new();
-    let update_time = sys
-        .uptime()
-        .map(|uptime| format_uptime(uptime.as_secs()))
-        .unwrap_or_else(|error| format!("获取失败: {}", error));
+    let update_time = format_uptime(System::uptime());
 
     let mut process_now = String::new();
     // 获取当前进程的内存占用（单位：字节）

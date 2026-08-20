@@ -41,7 +41,7 @@ secure = false
 
 ## GitHub Actions 部署
 
-`.github/workflows/deplay.yml` 会在 `main` 分支推送或手动触发时运行测试、构建 Linux release、上传到 `/home/ubuntu/kovi-bot`，并创建或重启 `kovi.service`。部署前需要配置以下 GitHub Actions Secrets：
+`.github/workflows/deplay.yml` 会在 `main` 分支推送或手动触发时检查格式、运行 Clippy、使用临时 PostgreSQL 做集成测试、构建 Linux release、上传到 `/home/ubuntu/kovi-bot`，并创建或重启 `kovi.service`。发布采用可回滚的二进制替换，服务启动失败时会自动恢复上一版。部署前需要配置以下 GitHub Actions Secrets：
 
 - `DEPLOY_PASSWORD`：Ubuntu 用户的 SSH 和 sudo 密码
 - `BOT_API_TOKEN`：模型服务 Token
@@ -56,6 +56,9 @@ secure = false
 [server_config]
 url = "https://api.deepseek.com/chat/completions"
 model_name = "deepseek-v4-flash"
+max_output_tokens = 1200
+request_timeout_secs = 60
+max_retries = 2
 
 [proactive]
 enabled = true
@@ -78,6 +81,7 @@ conversation_window_secs = 180
 max_entries = 1000
 retention_days = 30
 max_conversation_messages = 25
+max_conversation_tokens = 6000
 contextual_memory_limit = 5
 maintenance_interval_secs = 86400
 summary_keep_recent_messages = 15
@@ -93,17 +97,17 @@ natural_drift_check_secs = 1800
 recent_topic_cooldown_secs = 604800
 ```
 
-机器人会从最近活跃的群组和真正私聊过的用户中随机选择接收方，再结合情绪、能量、时间、群组话题和用户兴趣选择内容。冷却时间、空闲阈值、发送概率和话题去重共同避免刷屏。长期记忆以 JSONB 快照写入 PostgreSQL 的 `kovi_bot_memory` 表，默认最多保留 1000 条；后台任务会定期去重并清理 30 天前的低重要性记录。首次连接且数据库表为空时，程序会自动导入运行目录中已有的 `bot_memory.json`，并保留原文件作为备份。
+机器人会从最近活跃的群组和真正私聊过的用户中随机选择接收方，再结合情绪、能量、时间、群组话题和用户兴趣选择内容。冷却时间、空闲阈值、发送概率和话题去重共同避免刷屏。长期记忆、用户档案、群组档案、滚动摘要和人格分别写入 PostgreSQL 分表，不再为每次变化重写整份 JSONB；默认最多保留 1000 条明细，后台任务会定期去重并清理 30 天前的低重要性记录。首次升级时会自动从旧 `kovi_bot_memory` JSONB 快照（或运行目录的 `bot_memory.json`）迁移，原数据保留作为兼容备份。
 
 配置 `main_admin` 后，该用户的关系等级会自动保持为最高。她会使用独立的主动私聊策略：每隔 `main_admin_decision_interval_secs`（默认 3 小时）才让模型基于近期互动、对话摘要、当前情绪与时间，自主决定是否联系以及说什么；没有固定日上限或固定发送间隔。该间隔只限制决策请求频率，避免每轮检查都额外消耗 token；此策略不与普通群聊/私聊随机推送竞争。
 
-每段群聊和私聊还会维护一份可持久化的滚动摘要。短期记录超过 `max_conversation_messages`（默认 25 条）时，模型才会将较早消息连同旧摘要压缩为不超过 `summary_max_chars`（默认 1500 字）的新摘要，并保留最近 `summary_keep_recent_messages`（默认 15 条）原文继续聊天。模型暂时不可用时，会使用截断后的本地片段作为降级摘要，避免直接遗失上下文。
+每段群聊和私聊还会维护一份可持久化的滚动摘要。短期记录超过 `max_conversation_messages`（默认 25 条）或估算超过 `max_conversation_tokens`（默认 6000 token）时，模型会将较早消息连同旧摘要压缩为不超过 `summary_max_chars`（默认 1500 字）的新摘要，并尽量保留最近 `summary_keep_recent_messages`（默认 15 条）原文继续聊天。模型暂时不可用时，会使用截断后的本地片段作为降级摘要，避免直接遗失上下文。
 
-群聊中，普通消息用于学习群组活跃度、成员、话题、氛围和长期上下文；被 `@`、回复她，或消息以“芸汐/云汐”开头时会调用模型回复。未点名消息不会逐条调用模型：本地节流器只对话题、提问或情绪表达计数，默认每累计 8 条候选消息才按 35% 概率抽样一次，且同一群至少间隔 3 分钟，命中后才会请求模型自然接话。她成功接话（或正常回复）后，会开启 3 分钟滚动对话窗口；窗口内每条自然接续消息都会重新续 3 分钟，因此活跃对话能连续跨过任意多个窗口，连续 3 分钟没有相关对话才会结束。无关群消息仍只记忆。群聊与私聊都会展开被引用消息的文字和已学习表情含义交给模型。回复前模型会判断是否值得自然延续：通常只发一条，想继续表达时可自行连续发送任意条。每条之间的停顿会随当前情绪、能量、社交信心和随机浮动变化。私聊还会持续更新用户的兴趣、性格、关系等级和情绪历史。
+群聊中，普通消息用于学习群组活跃度、成员、话题、氛围和长期上下文；被 `@`、回复她，或消息以“芸汐/云汐”开头时会调用模型回复。未点名消息不会逐条调用模型：本地节流器只对话题、提问或情绪表达计数，默认每累计 8 条候选消息才按 35% 概率抽样一次，且同一群至少间隔 3 分钟，命中后才会请求模型自然接话。她成功接话（或正常回复）后，会开启 3 分钟滚动对话窗口；窗口内每条自然接续消息都会重新续 3 分钟，因此活跃对话能连续跨过任意多个窗口，连续 3 分钟没有相关对话才会结束。无关群消息仍只记忆。同一成员在约 0.85 秒内连发的纯文字会先合并，再只请求模型一次。群聊与私聊都会展开被引用消息的文字和已学习表情含义交给模型。回复前模型会判断是否值得自然延续：通常只发一条，想继续表达时可自行连续发送任意条。每条之间的停顿会随当前情绪、能量、社交信心和随机浮动变化。私聊还会持续更新用户的兴趣、性格、关系等级和情绪历史。
 
 ## 表情包记忆库
 
-表情包标签直接保存在 PostgreSQL 的 `kovi_bot_sticker_memory` 表中，只保存 OneBot 图片/表情的唯一标识和人工标签，不下载或保存图片文件。回复（引用）那张表情包并发送命令即可教会她；把命令和表情放在同一条消息中也仍然兼容：
+表情包标签直接保存在 PostgreSQL 的 `kovi_bot_sticker_memory` 表中，只保存 OneBot 图片/表情的唯一标识和人工标签，不下载或保存图片文件。标签按群聊或私聊用户隔离，某个群里的教学不会覆盖其他群的理解；旧版全局标签仍可作为只读兜底。回复（引用）那张表情包并发送命令即可教会她；把命令和表情放在同一条消息中也仍然兼容：
 
 ```text
 #教芸汐 这个表情是无语又想笑
@@ -111,7 +115,7 @@ recent_topic_cooldown_secs = 604800
 
 她会确认已记住。之后相同表情会把“无语又想笑”作为上下文交给聊天模型；纯图片且没有学习过时默认静默，不调用模型、不消耗 token。图片同时带有普通文字时，仍会正常理解和回复文字内容。
 
-可用群聊命令：
+可用群聊命令（除表情教学外，管理类命令仅 Kovi 管理员可执行）：
 
 - `#系统信息`
 - `#健康检查`
@@ -124,7 +128,9 @@ recent_topic_cooldown_secs = 604800
 ## 测试
 
 ```bash
-cargo test --workspace --all-targets
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --all-targets --locked
 ```
 
 ## 交叉编译

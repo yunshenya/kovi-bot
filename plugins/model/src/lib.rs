@@ -94,18 +94,12 @@ async fn main() {
         .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
         .is_ok()
     {
-        // 获取全局记忆管理器实例
-        let memory_manager = Arc::clone(&memory::MEMORY_MANAGER);
-
         // 在后台异步任务中执行定期任务
         // 主动聊天循环由 startup 模块单独管理。
         kovi::tokio::spawn(async move {
-            // 创建单一的情绪系统实例，避免重复创建
-            let mood_system = mood_system::MoodSystem::new(memory_manager);
-
             // 定期执行自然情绪变化
             loop {
-                if let Err(e) = mood_system.natural_mood_drift().await {
+                if let Err(e) = mood_system::MOOD_SYSTEM.natural_mood_drift().await {
                     eprintln!("[ERROR] 自然情绪变化失败: {}", e);
                 }
 

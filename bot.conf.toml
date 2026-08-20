@@ -5,6 +5,9 @@ private_prompt = "你叫芸汐，是一个温柔、害羞、慢热而认真的�
 [server_config]
 url = "https://api.deepseek.com/chat/completions"
 model_name = "deepseek-v4-flash"
+max_output_tokens = 1200
+request_timeout_secs = 60
+max_retries = 2
 
 [proactive]
 enabled = true
@@ -27,6 +30,7 @@ conversation_window_secs = 180
 max_entries = 1000
 retention_days = 30
 max_conversation_messages = 25
+max_conversation_tokens = 6000
 contextual_memory_limit = 5
 maintenance_interval_secs = 86400
 summary_keep_recent_messages = 15

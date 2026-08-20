@@ -13,7 +13,7 @@ use chrono::{DateTime, Local};
 use kovi::tokio::sync::Mutex;
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
-use sqlx::{PgPool, Row};
+use sqlx::{PgPool, Postgres, Row, Transaction};
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -261,6 +261,7 @@ impl MemoryManager {
             .await
             .map_err(|error| anyhow::anyhow!("连接 PostgreSQL 失败: {}", error))?;
 
+        // 保留旧快照表作为一次性迁移源，新写入改用按实体拆分的表。
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS kovi_bot_memory (
@@ -274,29 +275,34 @@ impl MemoryManager {
         .await
         .map_err(|error| anyhow::anyhow!("创建 PostgreSQL 记忆表失败: {}", error))?;
 
-        let stored_payload = sqlx::query("SELECT payload FROM kovi_bot_memory WHERE id = 1")
-            .fetch_optional(&pool)
-            .await
-            .map_err(|error| anyhow::anyhow!("读取 PostgreSQL 记忆失败: {}", error))?
-            .map(|row| row.get::<serde_json::Value, _>("payload"));
-
-        if let Some(payload) = stored_payload {
-            let data: MemoryData = serde_json::from_value(payload)
-                .map_err(|error| anyhow::anyhow!("解析 PostgreSQL 记忆失败: {}", error))?;
-            self.replace_data(data).await;
-            println!("[INFO] 已从 PostgreSQL 加载记忆");
+        Self::create_normalized_schema(&pool).await?;
+        let data = if Self::normalized_storage_has_data(&pool).await? {
+            println!("[INFO] 已从 PostgreSQL 分表加载记忆");
+            Self::load_normalized_data(&pool).await?
         } else {
-            let data = self.snapshot().await;
-            Self::write_database_snapshot(&pool, &data).await?;
-            if std::path::Path::new(&self.memory_file).exists() {
-                println!(
-                    "[INFO] 已将旧记忆文件 {} 导入 PostgreSQL（原文件保留为备份）",
-                    self.memory_file
-                );
+            let stored_payload = sqlx::query("SELECT payload FROM kovi_bot_memory WHERE id = 1")
+                .fetch_optional(&pool)
+                .await
+                .map_err(|error| anyhow::anyhow!("读取旧 PostgreSQL 记忆失败: {}", error))?
+                .map(|row| row.get::<serde_json::Value, _>("payload"));
+            let data = if let Some(payload) = stored_payload {
+                println!("[INFO] 正在将旧 PostgreSQL JSONB 快照迁移到分表存储");
+                serde_json::from_value(payload)
+                    .map_err(|error| anyhow::anyhow!("解析旧 PostgreSQL 记忆失败: {}", error))?
             } else {
-                println!("[INFO] PostgreSQL 记忆表已初始化");
-            }
-        }
+                let data = self.snapshot().await;
+                if std::path::Path::new(&self.memory_file).exists() {
+                    println!(
+                        "[INFO] 正在将旧记忆文件 {} 导入 PostgreSQL 分表（原文件保留）",
+                        self.memory_file
+                    );
+                }
+                data
+            };
+            Self::write_normalized_snapshot(&pool, &data).await?;
+            data
+        };
+        self.replace_data(data).await;
 
         self.database_pool
             .set(pool)
@@ -327,21 +333,299 @@ impl MemoryManager {
         }
     }
 
-    async fn write_database_snapshot(pool: &PgPool, data: &MemoryData) -> Result<()> {
-        let payload = serde_json::to_value(data)?;
+    async fn create_normalized_schema(pool: &PgPool) -> Result<()> {
         sqlx::query(
             r#"
-            INSERT INTO kovi_bot_memory (id, payload, updated_at)
-            VALUES (1, $1, NOW())
-            ON CONFLICT (id) DO UPDATE
-            SET payload = EXCLUDED.payload, updated_at = NOW()
+            CREATE TABLE IF NOT EXISTS kovi_bot_memories (
+                id TEXT PRIMARY KEY,
+                subject_id BIGINT,
+                context TEXT NOT NULL,
+                occurred_at TIMESTAMPTZ NOT NULL,
+                importance SMALLINT NOT NULL,
+                payload JSONB NOT NULL
+            )
             "#,
         )
-        .bind(payload)
         .execute(pool)
         .await
-        .map_err(|error| anyhow::anyhow!("写入 PostgreSQL 记忆失败: {}", error))?;
+        .map_err(|error| anyhow::anyhow!("创建记忆明细表失败: {}", error))?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS kovi_bot_memories_subject_context_time_idx ON kovi_bot_memories (subject_id, context, occurred_at DESC)",
+        )
+        .execute(pool)
+        .await?;
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS kovi_bot_user_profiles (
+                user_id BIGINT PRIMARY KEY,
+                payload JSONB NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            "#,
+        )
+        .execute(pool)
+        .await?;
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS kovi_bot_group_profiles (
+                group_id BIGINT PRIMARY KEY,
+                payload JSONB NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            "#,
+        )
+        .execute(pool)
+        .await?;
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS kovi_bot_conversation_summaries (
+                summary_key TEXT PRIMARY KEY,
+                summary TEXT NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            "#,
+        )
+        .execute(pool)
+        .await?;
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS kovi_bot_personality (
+                id SMALLINT PRIMARY KEY CHECK (id = 1),
+                payload JSONB NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            "#,
+        )
+        .execute(pool)
+        .await?;
         Ok(())
+    }
+
+    async fn normalized_storage_has_data(pool: &PgPool) -> Result<bool> {
+        sqlx::query_scalar::<_, bool>(
+            r#"
+            SELECT EXISTS(SELECT 1 FROM kovi_bot_personality WHERE id = 1)
+                OR EXISTS(SELECT 1 FROM kovi_bot_memories LIMIT 1)
+                OR EXISTS(SELECT 1 FROM kovi_bot_user_profiles LIMIT 1)
+                OR EXISTS(SELECT 1 FROM kovi_bot_group_profiles LIMIT 1)
+                OR EXISTS(SELECT 1 FROM kovi_bot_conversation_summaries LIMIT 1)
+            "#,
+        )
+        .fetch_one(pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    async fn load_normalized_data(pool: &PgPool) -> Result<MemoryData> {
+        let mut data = MemoryData::default();
+        for row in sqlx::query("SELECT payload FROM kovi_bot_memories")
+            .fetch_all(pool)
+            .await?
+        {
+            let memory: MemoryEntry = serde_json::from_value(row.get("payload"))?;
+            data.memories.insert(memory.id.clone(), memory);
+        }
+        for row in sqlx::query("SELECT user_id, payload FROM kovi_bot_user_profiles")
+            .fetch_all(pool)
+            .await?
+        {
+            data.user_profiles.insert(
+                row.get("user_id"),
+                serde_json::from_value(row.get("payload"))?,
+            );
+        }
+        for row in sqlx::query("SELECT group_id, payload FROM kovi_bot_group_profiles")
+            .fetch_all(pool)
+            .await?
+        {
+            data.group_profiles.insert(
+                row.get("group_id"),
+                serde_json::from_value(row.get("payload"))?,
+            );
+        }
+        for row in sqlx::query("SELECT summary_key, summary FROM kovi_bot_conversation_summaries")
+            .fetch_all(pool)
+            .await?
+        {
+            data.conversation_summaries
+                .insert(row.get("summary_key"), row.get("summary"));
+        }
+        if let Some(row) = sqlx::query("SELECT payload FROM kovi_bot_personality WHERE id = 1")
+            .fetch_optional(pool)
+            .await?
+        {
+            data.bot_personality = serde_json::from_value(row.get("payload"))?;
+        }
+        Ok(data)
+    }
+
+    async fn write_normalized_snapshot(pool: &PgPool, data: &MemoryData) -> Result<()> {
+        let mut transaction = pool.begin().await?;
+        for memory in data.memories.values() {
+            Self::upsert_memory(&mut transaction, memory).await?;
+        }
+        for profile in data.user_profiles.values() {
+            Self::upsert_user_profile(&mut transaction, profile).await?;
+        }
+        for profile in data.group_profiles.values() {
+            Self::upsert_group_profile(&mut transaction, profile).await?;
+        }
+        for (summary_key, summary) in &data.conversation_summaries {
+            Self::upsert_summary(&mut transaction, summary_key, summary).await?;
+        }
+        Self::upsert_personality(&mut transaction, &data.bot_personality).await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    async fn upsert_memory(
+        transaction: &mut Transaction<'_, Postgres>,
+        memory: &MemoryEntry,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO kovi_bot_memories
+                (id, subject_id, context, occurred_at, importance, payload)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            ON CONFLICT (id) DO UPDATE SET
+                subject_id = EXCLUDED.subject_id,
+                context = EXCLUDED.context,
+                occurred_at = EXCLUDED.occurred_at,
+                importance = EXCLUDED.importance,
+                payload = EXCLUDED.payload
+            "#,
+        )
+        .bind(&memory.id)
+        .bind(memory.subject_id)
+        .bind(&memory.context)
+        .bind(memory.timestamp)
+        .bind(i16::from(memory.importance))
+        .bind(serde_json::to_value(memory)?)
+        .execute(&mut **transaction)
+        .await?;
+        Ok(())
+    }
+
+    async fn upsert_user_profile(
+        transaction: &mut Transaction<'_, Postgres>,
+        profile: &UserProfile,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO kovi_bot_user_profiles (user_id, payload, updated_at)
+            VALUES ($1, $2, NOW())
+            ON CONFLICT (user_id) DO UPDATE SET payload = EXCLUDED.payload, updated_at = NOW()
+            "#,
+        )
+        .bind(profile.user_id)
+        .bind(serde_json::to_value(profile)?)
+        .execute(&mut **transaction)
+        .await?;
+        Ok(())
+    }
+
+    async fn upsert_group_profile(
+        transaction: &mut Transaction<'_, Postgres>,
+        profile: &GroupProfile,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO kovi_bot_group_profiles (group_id, payload, updated_at)
+            VALUES ($1, $2, NOW())
+            ON CONFLICT (group_id) DO UPDATE SET payload = EXCLUDED.payload, updated_at = NOW()
+            "#,
+        )
+        .bind(profile.group_id)
+        .bind(serde_json::to_value(profile)?)
+        .execute(&mut **transaction)
+        .await?;
+        Ok(())
+    }
+
+    async fn upsert_summary(
+        transaction: &mut Transaction<'_, Postgres>,
+        summary_key: &str,
+        summary: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO kovi_bot_conversation_summaries (summary_key, summary, updated_at)
+            VALUES ($1, $2, NOW())
+            ON CONFLICT (summary_key) DO UPDATE SET summary = EXCLUDED.summary, updated_at = NOW()
+            "#,
+        )
+        .bind(summary_key)
+        .bind(summary)
+        .execute(&mut **transaction)
+        .await?;
+        Ok(())
+    }
+
+    async fn upsert_personality(
+        transaction: &mut Transaction<'_, Postgres>,
+        personality: &BotPersonality,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO kovi_bot_personality (id, payload, updated_at)
+            VALUES (1, $1, NOW())
+            ON CONFLICT (id) DO UPDATE SET payload = EXCLUDED.payload, updated_at = NOW()
+            "#,
+        )
+        .bind(serde_json::to_value(personality)?)
+        .execute(&mut **transaction)
+        .await?;
+        Ok(())
+    }
+
+    async fn persist_memory(&self, memory: &MemoryEntry) -> Result<()> {
+        if let Some(pool) = self.database_pool.get() {
+            let mut transaction = pool.begin().await?;
+            Self::upsert_memory(&mut transaction, memory).await?;
+            transaction.commit().await?;
+            return Ok(());
+        }
+        self.save_file_snapshot().await
+    }
+
+    async fn persist_user_profile(&self, profile: &UserProfile) -> Result<()> {
+        if let Some(pool) = self.database_pool.get() {
+            let mut transaction = pool.begin().await?;
+            Self::upsert_user_profile(&mut transaction, profile).await?;
+            transaction.commit().await?;
+            return Ok(());
+        }
+        self.save_file_snapshot().await
+    }
+
+    async fn persist_group_profile(&self, profile: &GroupProfile) -> Result<()> {
+        if let Some(pool) = self.database_pool.get() {
+            let mut transaction = pool.begin().await?;
+            Self::upsert_group_profile(&mut transaction, profile).await?;
+            transaction.commit().await?;
+            return Ok(());
+        }
+        self.save_file_snapshot().await
+    }
+
+    async fn persist_summary(&self, summary_key: &str, summary: &str) -> Result<()> {
+        if let Some(pool) = self.database_pool.get() {
+            let mut transaction = pool.begin().await?;
+            Self::upsert_summary(&mut transaction, summary_key, summary).await?;
+            transaction.commit().await?;
+            return Ok(());
+        }
+        self.save_file_snapshot().await
+    }
+
+    async fn persist_personality(&self, personality: &BotPersonality) -> Result<()> {
+        if let Some(pool) = self.database_pool.get() {
+            let mut transaction = pool.begin().await?;
+            Self::upsert_personality(&mut transaction, personality).await?;
+            transaction.commit().await?;
+            return Ok(());
+        }
+        self.save_file_snapshot().await
     }
 
     /// 添加新的记忆条目
@@ -355,11 +639,37 @@ impl MemoryManager {
     /// # 注意
     /// 添加记忆后会自动保存到当前持久化后端
     pub async fn add_memory(&self, memory: MemoryEntry) -> Result<()> {
-        {
+        let persisted_memory = memory.clone();
+        let duplicate_id = {
             let mut memories = self.memories.lock().await;
+            let normalized_content = normalize_memory_content(&memory.content);
+            let duplicate_id = memories
+                .values()
+                .find(|existing| {
+                    existing.subject_id == memory.subject_id
+                        && existing.context == memory.context
+                        && normalize_memory_content(&existing.content) == normalized_content
+                })
+                .map(|existing| existing.id.clone());
+            if let Some(duplicate_id) = &duplicate_id {
+                memories.remove(duplicate_id);
+            }
             memories.insert(memory.id.clone(), memory);
+            duplicate_id
+        };
+        self.persist_memory(&persisted_memory).await?;
+        if let Some(duplicate_id) = duplicate_id
+            && let Some(pool) = self.database_pool.get()
+        {
+            sqlx::query("DELETE FROM kovi_bot_memories WHERE id = $1")
+                .bind(duplicate_id)
+                .execute(pool)
+                .await?;
         }
-        self.save_memories().await
+        if self.memories.lock().await.len() > crate::config::get().memory().max_entries() {
+            self.compact_memories().await?;
+        }
+        Ok(())
     }
 
     /// 根据类型获取记忆条目
@@ -495,10 +805,11 @@ impl MemoryManager {
         &self,
         user_id: i64,
         context: &str,
+        query: &str,
         limit: usize,
     ) -> Vec<MemoryEntry> {
         let memories = self.memories.lock().await;
-        let mut contextual_memories: Vec<(MemoryEntry, u8)> = Vec::new();
+        let mut contextual_memories: Vec<(MemoryEntry, u8, u8)> = Vec::new();
         let requested_scope = context_scope(context);
 
         for memory in memories.values() {
@@ -522,38 +833,42 @@ impl MemoryManager {
                 relevance_score += 3;
             }
 
-            // 检查标签匹配
-            let context_lower = context.to_lowercase();
-            for tag in &memory.tags {
-                if context_lower.contains(&tag.to_lowercase()) {
-                    relevance_score += 2;
-                }
-            }
+            // 当前消息与记忆正文/标签的词面相关度优先于单纯的重要性和新旧程度。
+            let query_relevance = memory_query_relevance(memory, query);
+            relevance_score = relevance_score.saturating_add(query_relevance);
 
             // 重要性权重
             relevance_score += memory.importance;
 
             if relevance_score > 0 {
-                contextual_memories.push((memory.clone(), relevance_score));
+                contextual_memories.push((memory.clone(), relevance_score, query_relevance));
             }
         }
 
-        // 按相关性排序并限制数量
+        let has_query_match = contextual_memories
+            .iter()
+            .any(|(_, _, query_relevance)| *query_relevance > 0);
+        if has_query_match {
+            contextual_memories.retain(|(_, _, query_relevance)| *query_relevance > 0);
+        }
         contextual_memories.sort_by_key(|result| Reverse(result.1));
+        // 没有词面命中时只回退少量高价值记忆，避免每轮塞入一批无关旧消息。
+        let limit = if has_query_match { limit } else { limit.min(2) };
         contextual_memories.truncate(limit);
 
         contextual_memories
             .into_iter()
-            .map(|(memory, _)| memory)
+            .map(|(memory, _, _)| memory)
             .collect()
     }
 
     pub async fn update_user_profile(&self, user_id: i64, profile: UserProfile) -> Result<()> {
+        let persisted_profile = profile.clone();
         {
             let mut profiles = self.user_profiles.lock().await;
             profiles.insert(user_id, profile);
         }
-        self.save_memories().await
+        self.persist_user_profile(&persisted_profile).await
     }
 
     pub async fn get_user_profile(&self, user_id: i64) -> Option<UserProfile> {
@@ -562,11 +877,12 @@ impl MemoryManager {
     }
 
     pub async fn update_group_profile(&self, group_id: i64, profile: GroupProfile) -> Result<()> {
+        let persisted_profile = profile.clone();
         {
             let mut profiles = self.group_profiles.lock().await;
             profiles.insert(group_id, profile);
         }
-        self.save_memories().await
+        self.persist_group_profile(&persisted_profile).await
     }
 
     pub async fn get_group_profile(&self, group_id: i64) -> Option<GroupProfile> {
@@ -590,11 +906,12 @@ impl MemoryManager {
         subject_id: i64,
         summary: String,
     ) -> Result<()> {
+        let summary_key = conversation_summary_key(context, subject_id);
         {
             let mut summaries = self.conversation_summaries.lock().await;
-            summaries.insert(conversation_summary_key(context, subject_id), summary);
+            summaries.insert(summary_key.clone(), summary.clone());
         }
-        self.save_memories().await
+        self.persist_summary(&summary_key, &summary).await
     }
 
     pub async fn get_all_user_profiles(&self) -> Vec<UserProfile> {
@@ -608,11 +925,12 @@ impl MemoryManager {
     }
 
     pub async fn update_bot_personality(&self, personality: BotPersonality) -> Result<()> {
+        let persisted_personality = personality.clone();
         {
             let mut bot_personality = self.bot_personality.lock().await;
             *bot_personality = personality;
         }
-        self.save_memories().await
+        self.persist_personality(&persisted_personality).await
     }
 
     pub async fn get_bot_personality(&self) -> BotPersonality {
@@ -640,7 +958,18 @@ impl MemoryManager {
 
     /// 主动执行去重、过期清理和持久化，供后台维护任务调用。
     pub async fn compact_memories(&self) -> Result<()> {
-        self.save_memories().await
+        let _save_guard = self.save_lock.lock().await;
+        let removed_ids = self.cleanup_old_memories().await?;
+        if let Some(pool) = self.database_pool.get() {
+            if !removed_ids.is_empty() {
+                sqlx::query("DELETE FROM kovi_bot_memories WHERE id = ANY($1::TEXT[])")
+                    .bind(&removed_ids)
+                    .execute(pool)
+                    .await?;
+            }
+            return Ok(());
+        }
+        self.save_file_snapshot_locked().await
     }
 
     pub async fn add_conversation_memory(
@@ -779,17 +1108,13 @@ impl MemoryManager {
         tags
     }
 
-    async fn save_memories(&self) -> Result<()> {
+    async fn save_file_snapshot(&self) -> Result<()> {
         let _save_guard = self.save_lock.lock().await;
-        // 限制记忆数量，避免内存过度使用
-        self.cleanup_old_memories().await?;
+        self.save_file_snapshot_locked().await
+    }
 
+    async fn save_file_snapshot_locked(&self) -> Result<()> {
         let data = self.snapshot().await;
-
-        if let Some(pool) = self.database_pool.get() {
-            return Self::write_database_snapshot(pool, &data).await;
-        }
-
         let json = serde_json::to_string_pretty(&data)?;
         let memory_file = self.memory_file.clone();
         kovi::tokio::task::spawn_blocking(move || -> Result<()> {
@@ -820,9 +1145,10 @@ impl MemoryManager {
     ///
     /// # 返回值
     /// 成功时返回 `Ok(())`，失败时返回错误信息
-    async fn cleanup_old_memories(&self) -> Result<()> {
+    async fn cleanup_old_memories(&self) -> Result<Vec<String>> {
         let mut memories = self.memories.lock().await;
         let original_count = memories.len();
+        let original_ids = memories.keys().cloned().collect::<HashSet<_>>();
         let now = Local::now();
         let memory_config = crate::config::get().memory().clone();
         let retention_boundary = now - chrono::Duration::days(memory_config.retention_days());
@@ -842,11 +1168,7 @@ impl MemoryManager {
         });
         let mut seen = HashSet::new();
         entries.retain(|(_, memory)| {
-            let normalized_content = memory
-                .content
-                .split_whitespace()
-                .collect::<String>()
-                .to_lowercase();
+            let normalized_content = normalize_memory_content(&memory.content);
             seen.insert((
                 memory.subject_id,
                 memory.context.clone(),
@@ -874,7 +1196,10 @@ impl MemoryManager {
                 memories.len()
             );
         }
-        Ok(())
+        Ok(original_ids
+            .into_iter()
+            .filter(|id| !memories.contains_key(id))
+            .collect())
     }
 }
 
@@ -886,6 +1211,41 @@ fn context_scope(context: &str) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+fn memory_query_relevance(memory: &MemoryEntry, query: &str) -> u8 {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return 0;
+    }
+    let searchable = format!("{} {}", memory.content, memory.tags.join(" ")).to_lowercase();
+    if searchable.contains(&query) {
+        return 12;
+    }
+
+    let query_chars = query
+        .chars()
+        .filter(|character| !character.is_whitespace() && !character.is_ascii_punctuation())
+        .collect::<Vec<_>>();
+    if query_chars.len() < 2 {
+        return u8::from(searchable.contains(*query_chars.first().unwrap_or(&'\0')));
+    }
+    let matching_bigrams = query_chars
+        .windows(2)
+        .filter(|pair| searchable.contains(&pair.iter().collect::<String>()))
+        .count();
+    if matching_bigrams == 0 {
+        0
+    } else {
+        (matching_bigrams.min(6) as u8).saturating_add(2)
+    }
+}
+
+fn normalize_memory_content(content: &str) -> String {
+    content
+        .split_whitespace()
+        .collect::<String>()
+        .to_lowercase()
 }
 
 fn conversation_summary_key(context: &str, subject_id: i64) -> String {
@@ -989,7 +1349,9 @@ mod tests {
                     .await
                     .expect("应写入用户二记忆");
 
-                let user_one = manager.get_contextual_memories(1, "private_chat", 10).await;
+                let user_one = manager
+                    .get_contextual_memories(1, "private_chat", "秘密", 10)
+                    .await;
                 assert_eq!(user_one.len(), 1);
                 assert_eq!(user_one[0].subject_id, Some(1));
                 assert_eq!(manager.get_recent_memories(0).await.len(), 2);
@@ -998,7 +1360,9 @@ mod tests {
                     .add_conversation_memory(1, "同号群聊内容", "group_chat")
                     .await
                     .expect("应写入同号群聊记忆");
-                let private_context = manager.get_contextual_memories(1, "private_chat", 10).await;
+                let private_context = manager
+                    .get_contextual_memories(1, "private_chat", "秘密", 10)
+                    .await;
                 assert_eq!(private_context.len(), 1);
                 assert!(!private_context[0].content.contains("群聊"));
 
@@ -1075,5 +1439,37 @@ mod tests {
         }"#;
         let profile: UserProfile = serde_json::from_str(json).expect("旧档案应能迁移");
         assert!(profile.last_private_interaction.is_none());
+    }
+
+    #[test]
+    fn normalized_postgres_storage_round_trips_when_enabled() {
+        if std::env::var("KOVI_RUN_POSTGRES_TEST").as_deref() != Ok("1") {
+            return;
+        }
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let subject_id = Local::now().timestamp_micros();
+                let content = format!("PostgreSQL roundtrip {subject_id}");
+                let first = MemoryManager::new("/tmp/kovi-postgres-integration-source.json");
+                first
+                    .initialize_database()
+                    .await
+                    .expect("应初始化 PostgreSQL 分表");
+                first
+                    .add_conversation_memory(subject_id, &content, "private_chat")
+                    .await
+                    .expect("应写入 PostgreSQL");
+
+                let reloaded = MemoryManager::new("/tmp/kovi-postgres-integration-reload.json");
+                reloaded
+                    .initialize_database()
+                    .await
+                    .expect("应从 PostgreSQL 重新加载");
+                let memories = reloaded
+                    .get_contextual_memories(subject_id, "private_chat", &content, 3)
+                    .await;
+                assert!(memories.iter().any(|memory| memory.content == content));
+            });
     }
 }

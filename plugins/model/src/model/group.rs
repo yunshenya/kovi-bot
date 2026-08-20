@@ -1,12 +1,13 @@
 use crate::config;
 use crate::health_check::HealthChecker;
 use crate::memory::{GroupProfile, MEMORY_MANAGER};
+use crate::model::coalesce::MessageCoalescer;
 use crate::model::utils::{
     learn_user_profile_from_message, requests_no_reply, send_sys_info, silence,
 };
 use crate::sticker_memory::{
-    extract_stickers, has_reply, known_labels, quoted_message_context, stickers_for_teaching,
-    teach, teaching_label, with_quoted_context, with_sticker_context,
+    StickerScope, extract_stickers, has_reply, known_labels, quoted_message_context,
+    stickers_for_teaching, teach, teaching_label, with_quoted_context, with_sticker_context,
 };
 use chrono::Local;
 use kovi::RuntimeBot;
@@ -28,6 +29,9 @@ struct GroupInterjectionState {
 static GROUP_INTERJECTION_STATE: LazyLock<Mutex<HashMap<i64, GroupInterjectionState>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+static GROUP_MESSAGE_BATCHES: LazyLock<MessageCoalescer<(i64, i64)>> =
+    LazyLock::new(Default::default);
+
 pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>) {
     let group_id = event.group_id;
     let time_now_data = Local::now();
@@ -36,11 +40,17 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
     let sender = format!("[{}] {}", time, nickname);
     let message = event.borrow_text().unwrap_or_default();
     let stickers = extract_stickers(&event.message);
+    let sticker_scope = StickerScope::Group(group_id);
+
+    if is_admin_command(message) && !is_bot_admin(&bot, event.user_id) {
+        bot.send_group_msg(group_id, "这个命令只有管理员可以使用哦。");
+        return;
+    }
 
     if let Some(label) = teaching_label(message) {
         match stickers_for_teaching(&event.message, &bot).await {
             Ok(teaching_stickers) if !teaching_stickers.is_empty() => {
-                match teach(&teaching_stickers, &label, event.user_id, Some(group_id)).await {
+                match teach(&teaching_stickers, &label, event.user_id, sticker_scope).await {
                     Ok(count) => bot.send_group_msg(
                         group_id,
                         format!("记住啦，这 {count} 个表情以后表示“{label}”。"),
@@ -68,14 +78,14 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
         return;
     }
 
-    let labels = match known_labels(&stickers).await {
+    let labels = match known_labels(&stickers, sticker_scope).await {
         Ok(labels) => labels,
         Err(error) => {
             eprintln!("[ERROR] 群聊读取表情包记忆失败: {}", error);
             Vec::new()
         }
     };
-    let quoted = match quoted_message_context(&event.message, &bot).await {
+    let quoted = match quoted_message_context(&event.message, &bot, sticker_scope).await {
         Ok(quoted) => quoted,
         Err(error) => {
             eprintln!("[ERROR] 群聊读取引用消息失败: {}", error);
@@ -95,12 +105,28 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
         with_quoted_context(&current_message, quoted)
     });
     let replies_to_bot = quoted.as_ref().and_then(|quoted| quoted.sender_id) == Some(event.self_id);
+    let addressed_to_bot = is_addressed_to_bot(&event, message) || replies_to_bot;
+    let (model_message, addressed_to_bot) = if !message.trim().is_empty()
+        && stickers.is_empty()
+        && quoted.is_none()
+        && !message.trim_start().starts_with('#')
+    {
+        let Some(combined) = GROUP_MESSAGE_BATCHES
+            .push((group_id, event.user_id), model_message, addressed_to_bot)
+            .await
+        else {
+            return;
+        };
+        (combined.text, combined.addressed)
+    } else {
+        (model_message, addressed_to_bot)
+    };
 
     if !message.trim().is_empty() {
         update_group_profile(group_id, event.user_id, message, &nickname).await;
         learn_user_profile_from_message(event.user_id, message, &nickname, false).await;
     }
-    match message {
+    match message.trim() {
         "#系统信息" => {
             send_sys_info(Arc::clone(&bot), group_id).await;
         }
@@ -179,19 +205,16 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
         }
         _ => {
             // 被点名时始终处理；未点名消息仅由本地节流器偶尔抽样，不逐条调用模型。
-            if is_addressed_to_bot(&event, message)
-                || replies_to_bot
-                || matches!(message, "#禁言" | "#结束禁言")
-            {
+            if addressed_to_bot || matches!(message.trim(), "#禁言" | "#结束禁言") {
                 if silence(group_id, &model_message, bot, sender).await {
                     activate_conversation_window(group_id).await;
                 }
-            } else if should_continue_conversation(group_id, message).await {
+            } else if should_continue_conversation(group_id, &model_message).await {
                 println!("[INFO] 群聊接续对话 (群组: {})", group_id);
                 if silence(group_id, &model_message, bot, sender).await {
                     activate_conversation_window(group_id).await;
                 }
-            } else if should_interject(group_id, message).await {
+            } else if should_interject(group_id, &model_message).await {
                 println!("[INFO] 群聊未点名接话 (群组: {})", group_id);
                 if silence(group_id, &model_message, bot, sender).await {
                     activate_conversation_window(group_id).await;
@@ -213,6 +236,28 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
     }
 }
 
+fn is_bot_admin(bot: &RuntimeBot, user_id: i64) -> bool {
+    bot.get_all_admin()
+        .map(|admins| admins.contains(&user_id))
+        .unwrap_or(false)
+}
+
+fn is_admin_command(message: &str) -> bool {
+    matches!(
+        message.trim(),
+        "#系统信息"
+            | "#重载配置文件"
+            | "#重载全部配置"
+            | "#启用自动重载"
+            | "#禁用自动重载"
+            | "#检查配置变化"
+            | "#自动重载状态"
+            | "#健康检查"
+            | "#禁言"
+            | "#结束禁言"
+    )
+}
+
 /// 机器人成功回复后开启或续期窗口，使用户可以不重复叫名字而继续对话。
 async fn activate_conversation_window(group_id: i64) {
     let duration = Duration::from_secs(
@@ -221,6 +266,7 @@ async fn activate_conversation_window(group_id: i64) {
             .conversation_window_secs(),
     );
     let mut states = GROUP_INTERJECTION_STATE.lock().await;
+    prune_interjection_states(&mut states);
     states.entry(group_id).or_default().conversation_until = Some(Instant::now() + duration);
 }
 
@@ -296,6 +342,7 @@ async fn should_interject(group_id: i64, message: &str) -> bool {
     }
 
     let mut states = GROUP_INTERJECTION_STATE.lock().await;
+    prune_interjection_states(&mut states);
     let state = states.entry(group_id).or_default();
     if state
         .last_interjection
@@ -316,6 +363,20 @@ async fn should_interject(group_id: i64, message: &str) -> bool {
 
     state.last_interjection = Some(Instant::now());
     true
+}
+
+fn prune_interjection_states(states: &mut HashMap<i64, GroupInterjectionState>) {
+    if states.len() <= 1_024 {
+        return;
+    }
+    let now = Instant::now();
+    let cooldown = Duration::from_secs(config::get().group_interjection().cooldown_secs());
+    states.retain(|_, state| {
+        has_active_conversation_window(state.conversation_until, now)
+            || state
+                .last_interjection
+                .is_some_and(|last| now.duration_since(last) < cooldown)
+    });
 }
 
 fn is_interjection_candidate(message: &str, min_message_chars: usize) -> bool {
@@ -467,7 +528,7 @@ fn extract_topics_from_message(message: &str) -> Vec<String> {
 mod tests {
     use super::{
         extract_topics_from_message, has_active_conversation_window, infer_group_personality,
-        is_conversation_follow_up, is_interjection_candidate,
+        is_admin_command, is_conversation_follow_up, is_interjection_candidate,
     };
     use std::time::{Duration, Instant};
 
@@ -511,5 +572,13 @@ mod tests {
         ));
         assert!(!has_active_conversation_window(Some(deadline), deadline));
         assert!(!has_active_conversation_window(None, opened_at));
+    }
+
+    #[test]
+    fn operational_commands_require_an_admin() {
+        assert!(is_admin_command("#健康检查"));
+        assert!(is_admin_command(" #禁言 "));
+        assert!(!is_admin_command("芸汐，今天开心吗"));
+        assert!(!is_admin_command("#教芸汐 这个表情是开心"));
     }
 }

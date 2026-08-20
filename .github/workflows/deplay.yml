@@ -22,16 +22,42 @@ jobs:
   test-and-deploy:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: integration-test
+          POSTGRES_DB: kovi_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d kovi_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      CARGO_TERM_COLOR: always
+      DATABASE_URL: postgresql://postgres:integration-test@127.0.0.1:5432/kovi_test
+      KOVI_RUN_POSTGRES_TEST: "1"
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          components: rustfmt, clippy
 
       - name: Cache Rust build
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Run tests
         run: cargo test --workspace --all-targets --locked
@@ -129,6 +155,25 @@ jobs:
           Restart=always
           RestartSec=5
           UMask=0077
+          NoNewPrivileges=true
+          PrivateTmp=true
+          PrivateDevices=true
+          ProtectSystem=strict
+          ProtectHome=read-only
+          ReadWritePaths=/home/ubuntu/kovi-bot
+          ProtectKernelTunables=true
+          ProtectKernelModules=true
+          ProtectKernelLogs=true
+          ProtectControlGroups=true
+          ProtectClock=true
+          RestrictSUIDSGID=true
+          RestrictRealtime=true
+          RestrictNamespaces=true
+          LockPersonality=true
+          CapabilityBoundingSet=
+          AmbientCapabilities=
+          RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+          SystemCallArchitectures=native
 
           [Install]
           WantedBy=multi-user.target
@@ -139,11 +184,34 @@ jobs:
             cat <<'EOF'
           set -e
           install -m 0644 /home/ubuntu/kovi-bot/kovi.service /etc/systemd/system/kovi.service
-          install -m 0755 /home/ubuntu/kovi-bot/kovi-bot.new /home/ubuntu/kovi-bot/kovi-bot
+          if test -x /home/ubuntu/kovi-bot/kovi-bot; then
+            cp -a /home/ubuntu/kovi-bot/kovi-bot /home/ubuntu/kovi-bot/kovi-bot.previous
+          fi
+          chown ubuntu:ubuntu /home/ubuntu/kovi-bot/kovi-bot.new
+          chmod 0755 /home/ubuntu/kovi-bot/kovi-bot.new
+          mv -f /home/ubuntu/kovi-bot/kovi-bot.new /home/ubuntu/kovi-bot/kovi-bot
           systemctl daemon-reload
           systemctl enable kovi.service
-          systemctl restart kovi.service
-          systemctl is-active --quiet kovi.service
+          deployment_started_at="$(date --iso-8601=seconds)"
+          ready=0
+          if systemctl restart kovi.service; then
+            for attempt in $(seq 1 20); do
+              if systemctl is-active --quiet kovi.service && \
+                 journalctl -u kovi.service --since "$deployment_started_at" --no-pager | \
+                   grep -q 'PostgreSQL 表情包记忆库已就绪'; then
+                ready=1
+                break
+              fi
+              sleep 1
+            done
+          fi
+          if test "$ready" -ne 1; then
+            if test -x /home/ubuntu/kovi-bot/kovi-bot.previous; then
+              mv -f /home/ubuntu/kovi-bot/kovi-bot.previous /home/ubuntu/kovi-bot/kovi-bot
+              systemctl restart kovi.service
+            fi
+            exit 1
+          fi
           EOF
           } | sshpass -e ssh "$DEPLOY_USER@$DEPLOY_HOST" "sudo -S bash -s"
 

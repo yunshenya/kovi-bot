@@ -1,3 +1,4 @@
+mod coalesce;
 mod group;
 mod private;
 pub(crate) mod utils;

@@ -6,6 +6,7 @@ pub struct MemoryConfig {
     max_entries: usize,
     retention_days: i64,
     max_conversation_messages: usize,
+    max_conversation_tokens: usize,
     contextual_memory_limit: usize,
     maintenance_interval_secs: u64,
     summary_keep_recent_messages: usize,
@@ -27,6 +28,10 @@ impl MemoryConfig {
 
     pub fn contextual_memory_limit(&self) -> usize {
         self.contextual_memory_limit
+    }
+
+    pub fn max_conversation_tokens(&self) -> usize {
+        self.max_conversation_tokens
     }
 
     pub fn maintenance_interval_secs(&self) -> u64 {
@@ -51,6 +56,11 @@ impl MemoryConfig {
         if self.max_conversation_messages < 3 {
             return Err(anyhow::anyhow!(
                 "memory.max_conversation_messages 不能小于 3"
+            ));
+        }
+        if self.max_conversation_tokens < 512 {
+            return Err(anyhow::anyhow!(
+                "memory.max_conversation_tokens 不能小于 512"
             ));
         }
         if self.contextual_memory_limit == 0 {
@@ -81,6 +91,7 @@ impl Default for MemoryConfig {
             max_entries: 1000,
             retention_days: 30,
             max_conversation_messages: 25,
+            max_conversation_tokens: 6_000,
             contextual_memory_limit: 5,
             maintenance_interval_secs: 86_400,
             summary_keep_recent_messages: 15,

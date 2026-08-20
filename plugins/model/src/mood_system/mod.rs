@@ -8,14 +8,19 @@
 //! - 情绪缓存和性能优化
 //! - 人格特征动态调整
 
-use crate::memory::{BotPersonality, MemoryManager};
+use crate::memory::{BotPersonality, MEMORY_MANAGER, MemoryManager};
 use anyhow::Result;
 use chrono::{Duration, Local, Timelike};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::sync::Mutex;
+
+/// 所有聊天与后台漂移共享同一份情绪缓存和人格更新入口。
+pub static MOOD_SYSTEM: LazyLock<MoodSystem> =
+    LazyLock::new(|| MoodSystem::new(Arc::clone(&MEMORY_MANAGER)));
 
 #[derive(Clone)]
 struct CachedMood {
@@ -166,6 +171,12 @@ impl MoodSystem {
                 .await
         };
 
+        let new_intensity = self.mood_intensity(message, &new_mood);
+        let recently_same_mood = current_personality.current_mood == new_mood.to_string()
+            && (i16::from(current_personality.mood_intensity) - i16::from(new_intensity)).abs() < 2
+            && now.signed_duration_since(current_personality.last_mood_change)
+                < Duration::minutes(30);
+
         // 更新缓存
         {
             let mut cache = self
@@ -188,10 +199,14 @@ impl MoodSystem {
             });
         }
 
+        if recently_same_mood {
+            return Ok(new_mood);
+        }
+
         // 更新机器人人格
         let mut updated_personality = current_personality;
         updated_personality.current_mood = new_mood.to_string();
-        updated_personality.mood_intensity = self.mood_intensity(message, &new_mood);
+        updated_personality.mood_intensity = new_intensity;
         updated_personality.last_mood_change = now;
 
         // 根据情绪调整其他属性
@@ -506,23 +521,32 @@ impl MoodSystem {
         context_mood: Option<Mood>,
         current_personality: &BotPersonality,
     ) -> Mood {
-        // 找到得分最高的情绪
+        // 固定优先级消除 HashMap 遍历造成的随机结果；上下文只加一分，不覆盖强烈情绪。
+        let ordered_moods = [
+            Mood::Angry,
+            Mood::Sad,
+            Mood::Lonely,
+            Mood::Excited,
+            Mood::Happy,
+            Mood::Shy,
+            Mood::Curious,
+            Mood::Thoughtful,
+            Mood::Playful,
+            Mood::Confident,
+            Mood::Calm,
+            Mood::Neutral,
+        ];
         let mut best_mood = Mood::Neutral;
         let mut best_score = 0;
-
-        for (mood, score) in &mood_scores {
-            if *score > best_score {
-                best_score = *score;
-                best_mood = mood.clone();
+        for mood in ordered_moods {
+            let score = mood_scores.get(&mood).copied().unwrap_or_default()
+                + i32::from(
+                    context_mood.as_ref() == Some(&mood) && score_is_positive(&mood_scores, &mood),
+                );
+            if score > best_score {
+                best_score = score;
+                best_mood = mood;
             }
-        }
-
-        // 如果上下文有特殊情绪，给予额外权重
-        if let Some(context_mood) = context_mood
-            && let Some(context_score) = mood_scores.get(&context_mood)
-            && *context_score > 0
-        {
-            best_mood = context_mood;
         }
 
         // 如果所有情绪得分都很低，保持当前情绪或转为中性
@@ -583,26 +607,6 @@ impl MoodSystem {
         }
     }
 
-    pub async fn get_mood_based_response_style(&self) -> String {
-        let personality = self.memory_manager.get_bot_personality().await;
-        let mood = Mood::from_string(&personality.current_mood);
-
-        match mood {
-            Mood::Happy => "开心地 😊".to_string(),
-            Mood::Sad => "有点难过地 😢".to_string(),
-            Mood::Angry => "有点生气地 😠".to_string(),
-            Mood::Excited => "兴奋地 ✨".to_string(),
-            Mood::Calm => "平静地 🌙".to_string(),
-            Mood::Curious => "好奇地 🤔".to_string(),
-            Mood::Playful => "顽皮地 😜".to_string(),
-            Mood::Thoughtful => "深思地 💭".to_string(),
-            Mood::Lonely => "有点孤单地 🥺".to_string(),
-            Mood::Confident => "自信地 😎".to_string(),
-            Mood::Shy => "害羞地 😳".to_string(),
-            Mood::Neutral => "".to_string(),
-        }
-    }
-
     pub async fn should_change_mood_naturally(&self) -> bool {
         let personality = self.memory_manager.get_bot_personality().await;
         let now = Local::now();
@@ -633,6 +637,9 @@ impl MoodSystem {
 
         personality.current_mood = new_mood.to_string();
         personality.mood_intensity = 4;
+        personality.energy_level = move_toward(personality.energy_level, 6);
+        personality.social_confidence = move_toward(personality.social_confidence, 6);
+        personality.curiosity_level = move_toward(personality.curiosity_level, 6);
         personality.last_mood_change = Local::now();
 
         self.memory_manager
@@ -640,6 +647,18 @@ impl MoodSystem {
             .await?;
 
         Ok(())
+    }
+}
+
+fn score_is_positive(scores: &HashMap<Mood, i32>, mood: &Mood) -> bool {
+    scores.get(mood).copied().unwrap_or_default() > 0
+}
+
+fn move_toward(value: u8, target: u8) -> u8 {
+    match value.cmp(&target) {
+        std::cmp::Ordering::Less => value.saturating_add(1),
+        std::cmp::Ordering::Greater => value.saturating_sub(1),
+        std::cmp::Ordering::Equal => value,
     }
 }
 
