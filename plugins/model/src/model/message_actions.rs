@@ -12,7 +12,8 @@ use crate::memory::BotPersonality;
 use kovi::RuntimeBot;
 use rand::Rng;
 
-pub(crate) const FOLLOW_UP_MARKER: &str = "[[NEXT_MESSAGE]]";
+/// 仅用于兼容旧模型输出；新回复必须通过回复协议的 `messages` 字段分段。
+pub(crate) const LEGACY_FOLLOW_UP_MARKER: &str = "[[NEXT_MESSAGE]]";
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum MessageDestination {
@@ -41,17 +42,29 @@ impl ReplyPlan {
     pub(crate) async fn from_model_output(scope: ReplyScope, content: &str) -> Self {
         let parsed = parse_reply_output(content);
         let mut action = sanitize_reply_action(scope, parsed.action).await;
-        if parsed.disposition.is_silent() || parsed.content.is_empty() {
-            action.quote_message_id = None;
-            action.at_user_ids.clear();
-        }
-        let bubbles = if parsed.disposition.is_silent() || parsed.content.is_empty() {
+        let has_structured_messages = parsed.messages.is_some();
+        let bubbles = if parsed.disposition.is_silent() {
+            Vec::new()
+        } else if let Some(messages) = parsed.messages {
+            sanitize_reply_sections(messages)
+        } else if parsed.content.is_empty() {
             Vec::new()
         } else {
             split_reply(&parsed.content)
         };
+        if parsed.disposition.is_silent() || bubbles.is_empty() {
+            action.quote_message_id = None;
+            action.at_user_ids.clear();
+        }
+        let visible_content = if parsed.disposition.is_silent() || bubbles.is_empty() {
+            String::new()
+        } else if has_structured_messages {
+            bubbles.join("\n")
+        } else {
+            parsed.content
+        };
         Self {
-            content: parsed.content,
+            content: visible_content,
             disposition: parsed.disposition,
             action,
             bubbles,
@@ -139,7 +152,7 @@ pub(crate) async fn execute_reply_plan(
 
 pub(crate) fn split_reply(content: &str) -> Vec<String> {
     let marked_sections = content
-        .split(FOLLOW_UP_MARKER)
+        .split(LEGACY_FOLLOW_UP_MARKER)
         .map(str::trim)
         .filter(|section| !section.is_empty())
         .map(ToString::to_string)
@@ -154,6 +167,10 @@ pub(crate) fn split_reply(content: &str) -> Vec<String> {
     };
 
     sanitize_reply_sections(vec![reply])
+}
+
+pub(crate) fn normalize_legacy_message_text(content: &str) -> String {
+    content.replace(LEGACY_FOLLOW_UP_MARKER, "\n")
 }
 
 fn sanitize_reply_sections(sections: Vec<String>) -> Vec<String> {
@@ -263,6 +280,22 @@ mod tests {
             action: Default::default(),
             bubbles: vec!["你好".to_string()],
         };
+    }
+
+    #[test]
+    fn reply_plan_uses_structured_messages_as_bubbles() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let plan = ReplyPlan::from_model_output(
+                    ReplyScope::Private(9_100_003),
+                    "[[REPLY_ACTION]]{\"messages\":[\"第一条\",\"第二条\"]}[[/REPLY_ACTION]]",
+                )
+                .await;
+                assert_eq!(plan.bubbles, vec!["第一条", "第二条"]);
+                assert_eq!(plan.content, "第一条\n第二条");
+                assert!(plan.has_visible_reply());
+            });
     }
 
     #[test]

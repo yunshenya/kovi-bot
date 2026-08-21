@@ -235,5 +235,7 @@ mod tests {
         assert_eq!(config.memory().max_entries(), 1000);
         assert_eq!(config.mood().cache_ttl_secs(), 300);
         assert_eq!(config.topic().recent_topic_cooldown_secs(), 604_800);
+        assert!(!config.prompt().system_prompt().contains("NEXT_MESSAGE"));
+        assert!(!config.prompt().private_prompt().contains("NEXT_MESSAGE"));
     }
 }

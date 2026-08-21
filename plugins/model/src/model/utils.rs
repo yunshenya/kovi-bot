@@ -10,7 +10,9 @@
 
 use super::interrupt::{ReplyTicket, finish, is_current, mark_active};
 use super::memory_query::{interruptible_model_call, params_model_with_tool_access};
-use super::message_actions::{FOLLOW_UP_MARKER, MessageDestination, ReplyPlan, execute_reply_plan};
+use super::message_actions::{
+    MessageDestination, ReplyPlan, execute_reply_plan, normalize_legacy_message_text,
+};
 use super::recall::{
     RecentBotMessage, begin_reply, finish_reply, record_bot_message, send_tracked_group_message,
 };
@@ -72,7 +74,6 @@ const MAX_RUNTIME_CONVERSATIONS: usize = 512;
 /// 复用连接池，并限制并发模型请求，避免高峰时把上游 API 和本机连接耗尽。
 static MODEL_CLIENT: LazyLock<Client> = LazyLock::new(Client::new);
 static MODEL_REQUEST_LIMIT: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(4));
-const MIN_MODEL_ATTEMPTS: usize = 5;
 const HUMAN_ROLEPLAY_GUARD: &str = r#"
 
 群聊角色守则：
@@ -589,7 +590,7 @@ async fn summarize_conversation(
             content: format!(
                 "你是聊天记录压缩器。将早期对话更新为一段不超过 {max_chars} 个字符的中文摘要。\
                  保留：用户身份/偏好、已确认的事实与计划、承诺、未解决问题、重要情绪与关系上下文，以及必要的说话者归属。\
-                 忽略寒暄和重复。只输出摘要，不要回答对话，不要使用 [[NEXT_MESSAGE]]。"
+                 忽略寒暄和重复。只输出摘要，不要回答对话。"
             ),
         },
         BotMemory {
@@ -602,9 +603,7 @@ async fn summarize_conversation(
         },
     ];
     let response = interruptible_model_call(&mut request, reply_ticket, None, &[], None).await?;
-    let summary = response
-        .content
-        .replace(FOLLOW_UP_MARKER, "\n")
+    let summary = normalize_legacy_message_text(&response.content)
         .trim()
         .to_string();
     if summary.is_empty() || summary.starts_with("抱歉，模型服务暂时不可用") {
@@ -859,9 +858,7 @@ pub(crate) async fn params_model_with_token_limit_and_progress_for_reply(
 }
 
 fn model_attempt_count(configured_retries: u8) -> usize {
-    usize::from(configured_retries)
-        .saturating_add(1)
-        .max(MIN_MODEL_ATTEMPTS)
+    usize::from(configured_retries.saturating_add(1))
 }
 
 async fn read_model_content(
@@ -1688,6 +1685,7 @@ mod tests {
         assert!(prompt.contains("日常寒暄、接话和简单问答默认只发一条"));
         assert!(!prompt.contains("确实想补充时再发几条短气泡"));
         assert!(!prompt.contains("回复[sp]"));
+        assert!(!prompt.contains("NEXT_MESSAGE"));
     }
 
     #[test]
@@ -1699,6 +1697,7 @@ mod tests {
         assert!(prompt.contains("默认一条消息"));
         assert!(!prompt.contains("优先拆成2到5条短气泡"));
         assert!(!prompt.contains("回复[sp]"));
+        assert!(!prompt.contains("NEXT_MESSAGE"));
     }
 
     #[test]
@@ -1763,9 +1762,9 @@ mod tests {
     }
 
     #[test]
-    fn transient_model_failures_have_at_least_five_attempts() {
-        assert_eq!(model_attempt_count(0), 5);
-        assert_eq!(model_attempt_count(2), 5);
+    fn transient_model_failures_respect_configured_retry_count() {
+        assert_eq!(model_attempt_count(0), 1);
+        assert_eq!(model_attempt_count(2), 3);
         assert_eq!(model_attempt_count(6), 7);
     }
 

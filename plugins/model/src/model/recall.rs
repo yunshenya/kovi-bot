@@ -2,7 +2,6 @@
 
 use super::interrupt::{ReplyScope, ReplyTicket, interrupt};
 use crate::redis_store;
-use kovi::PluginBuilder;
 use kovi::RuntimeBot;
 use kovi::bot::runtimebot::CanSendApi;
 use kovi::event::NoticeEvent;
@@ -337,11 +336,10 @@ pub(crate) async fn handle_recalled_message(
 }
 
 /// Kovi 0.12 的撤回通知是通用 NoticeEvent，需要从原始 OneBot JSON 中提取消息 ID。
-pub(crate) async fn recall_notice_event(event: Arc<NoticeEvent>) {
+pub(crate) async fn recall_notice_event(event: Arc<NoticeEvent>, bot: Arc<RuntimeBot>) {
     let Some((scope, message_id)) = parse_recall_notice(&event) else {
         return;
     };
-    let bot = PluginBuilder::get_runtime_bot();
     handle_recalled_message(scope, message_id, bot).await;
 }
 

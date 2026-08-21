@@ -13,6 +13,7 @@ pub(crate) mod tool_access;
 pub(crate) mod utils;
 
 pub(crate) use interrupt::ReplyTicket;
+pub(crate) use message_actions::normalize_legacy_message_text;
 
 pub use crate::model::group::group_message_event;
 

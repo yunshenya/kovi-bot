@@ -10,6 +10,7 @@ use std::sync::LazyLock;
 const ACTION_START: &str = "[[REPLY_ACTION]]";
 const ACTION_END: &str = "[[/REPLY_ACTION]]";
 const MAX_REPLY_PROTOCOL_CHARS: usize = 4_096;
+const MAX_REPLY_MESSAGES: usize = 8;
 const MAX_REPLY_TARGETS: usize = 24;
 const MAX_AT_USERS: usize = 8;
 const MAX_RECALL_MESSAGES: usize = 8;
@@ -17,12 +18,15 @@ const MAX_TARGET_CONTENT_CHARS: usize = 280;
 const REPLY_PROTOCOL_INSTRUCTIONS: &str = concat!(
     "<回复协议>\n",
     "你要先决定本轮是正常回复还是保持静默。正常回复直接输出正文；",
+    "只有确实需要连续发送多条时，才在动作标记中填写 messages 数组；此时不要同时输出正文。",
+    "数组中的每一项都是一条完整可见消息，通常不超过两项，只有内容确实需要时才增加。\n",
     "只有确实不应发出任何可见消息时，输出：",
     "[[REPLY_ACTION]]{\"disposition\":\"silent\"}[[/REPLY_ACTION]]。\n",
     "你也可以自己判断是否需要引用、@ 某人，或主动撤回自己先前发出的消息；",
     "没有真实需要时不要填写这些动作字段。\n",
     "完整动作格式示例为：[[REPLY_ACTION]]",
-    "{\"disposition\":\"reply\",\"quote_message_id\":123,",
+    "{\"disposition\":\"reply\",\"messages\":[\"第一条\",\"第二条\"],",
+    "\"quote_message_id\":123,",
     "\"at_user_ids\":[456],\"recall_message_ids\":[789]}",
     "[[/REPLY_ACTION]]。disposition 只允许 reply 或 silent；字段都可选，默认为 reply；",
     "动作标记放在正文之外且不会展示给用户，示例 ID 必须替换为下面真实存在的候选 ID。\n",
@@ -49,6 +53,7 @@ pub(crate) struct ReplyAction {
 #[derive(Debug, Clone)]
 pub(crate) struct ParsedReply {
     pub(crate) content: String,
+    pub(crate) messages: Option<Vec<String>>,
     pub(crate) disposition: ReplyDisposition,
     pub(crate) action: ReplyAction,
 }
@@ -56,6 +61,7 @@ pub(crate) struct ParsedReply {
 #[derive(Debug, Clone, Default)]
 struct ParsedReplyProtocol {
     disposition: ReplyDisposition,
+    messages: Option<Vec<String>>,
     action: ReplyAction,
 }
 
@@ -216,8 +222,14 @@ pub(crate) fn parse_reply_output(content: &str) -> ParsedReply {
     }
     let (disposition, content) =
         normalize_reply_disposition(protocol.disposition, clean.trim().to_string());
+    let messages = if disposition.is_silent() || !content.is_empty() {
+        None
+    } else {
+        protocol.messages
+    };
     ParsedReply {
         content,
+        messages,
         disposition,
         action: protocol.action,
     }
@@ -249,6 +261,7 @@ fn parse_protocol_json(raw: &str) -> Option<ParsedReplyProtocol> {
     let object = value.as_object()?;
     const ALLOWED_FIELDS: &[&str] = &[
         "disposition",
+        "messages",
         "quote_message_id",
         "reply_to_message_id",
         "at_user_ids",
@@ -267,18 +280,43 @@ fn parse_protocol_json(raw: &str) -> Option<ParsedReplyProtocol> {
         Some(_) => return None,
         None => ReplyDisposition::Reply,
     };
+    let messages = parse_optional_messages(object)?;
     let quote_message_id = parse_optional_i32(object, "quote_message_id", "reply_to_message_id")?;
     let at_user_ids = parse_optional_i64_list(object, "at_user_ids", "mention_user_ids")?;
     let recall_message_ids =
         parse_optional_i32_list(object, "recall_message_ids", "delete_message_ids")?;
     Some(ParsedReplyProtocol {
         disposition,
+        messages,
         action: ReplyAction {
             quote_message_id,
             at_user_ids,
             recall_message_ids,
         },
     })
+}
+
+fn parse_optional_messages(object: &serde_json::Map<String, Value>) -> Option<Option<Vec<String>>> {
+    let Some(value) = object.get("messages") else {
+        return Some(None);
+    };
+    if value.is_null() {
+        return Some(None);
+    }
+    let values = value.as_array()?;
+    if values.len() > MAX_REPLY_MESSAGES {
+        return None;
+    }
+
+    let mut messages = Vec::with_capacity(values.len());
+    for value in values {
+        let message = value.as_str()?.trim();
+        if message.is_empty() {
+            return None;
+        }
+        messages.push(message.to_string());
+    }
+    Some(Some(messages))
 }
 
 fn parse_optional_i32(
@@ -397,6 +435,36 @@ mod tests {
     }
 
     #[test]
+    fn parses_structured_message_bubbles_without_visible_protocol_text() {
+        let parsed = parse_reply_output(
+            "[[REPLY_ACTION]]{\"messages\":[\"第一条\",\"第二条\"]}[[/REPLY_ACTION]]",
+        );
+        assert!(parsed.content.is_empty());
+        assert_eq!(
+            parsed.messages,
+            Some(vec!["第一条".to_string(), "第二条".to_string()])
+        );
+    }
+
+    #[test]
+    fn malformed_structured_messages_do_not_hide_a_normal_reply() {
+        let parsed = parse_reply_output(
+            "普通正文[[REPLY_ACTION]]{\"messages\":\"不是数组\"}[[/REPLY_ACTION]]",
+        );
+        assert_eq!(parsed.content, "普通正文");
+        assert_eq!(parsed.messages, None);
+    }
+
+    #[test]
+    fn structured_messages_are_ignored_when_plain_body_is_also_present() {
+        let parsed = parse_reply_output(
+            "普通正文[[REPLY_ACTION]]{\"messages\":[\"隐藏正文\"]}[[/REPLY_ACTION]]",
+        );
+        assert_eq!(parsed.content, "普通正文");
+        assert_eq!(parsed.messages, None);
+    }
+
+    #[test]
     fn parses_structured_silence_and_discards_visible_content() {
         let parsed = parse_reply_output(
             "不该发送\n[[REPLY_ACTION]]{\"disposition\":\"silent\",\"recall_message_ids\":[12]}[[/REPLY_ACTION]]",
@@ -420,6 +488,8 @@ mod tests {
     #[test]
     fn runtime_protocol_does_not_prime_the_legacy_marker() {
         assert!(!REPLY_PROTOCOL_INSTRUCTIONS.contains("[sp]"));
+        assert!(!REPLY_PROTOCOL_INSTRUCTIONS.contains("NEXT_MESSAGE"));
+        assert!(REPLY_PROTOCOL_INSTRUCTIONS.contains("\"messages\""));
         assert!(REPLY_PROTOCOL_INSTRUCTIONS.contains("\"disposition\":\"silent\""));
     }
 

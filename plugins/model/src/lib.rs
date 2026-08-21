@@ -92,10 +92,18 @@ async fn main() {
     PluginBuilder::on_group_msg(group_message);
     // 注册私聊消息处理器
     PluginBuilder::on_private_msg(private_message);
-    PluginBuilder::on_notice(recall_notice_event);
 
     // 插件启动即启动主动消息循环，不需要等待第一条群聊或私聊事件。
     let proactive_bot = PluginBuilder::get_runtime_bot();
+    let recall_bot = Arc::clone(&proactive_bot);
+    PluginBuilder::on_notice({
+        move |event| {
+            let bot = Arc::clone(&recall_bot);
+            async move {
+                recall_notice_event(event, bot).await;
+            }
+        }
+    });
     if proactive_chat::startup::get_or_create_proactive_manager(proactive_bot)
         .await
         .is_some()

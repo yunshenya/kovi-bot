@@ -9,7 +9,9 @@
 use crate::memory::MemoryManager;
 use crate::model::semantic::{MessageUnderstanding, UnderstandingRequest, understand};
 use crate::model::utils::{BotMemory, Roles, params_model};
-use crate::model::{send_tracked_group_message, send_tracked_private_message};
+use crate::model::{
+    normalize_legacy_message_text, send_tracked_group_message, send_tracked_private_message,
+};
 use crate::mood_system::MOOD_SYSTEM;
 use crate::topic_generator::TopicGenerator;
 use anyhow::Result;
@@ -471,7 +473,7 @@ fn parse_main_admin_decision(content: &str) -> Option<String> {
     if message.is_empty() {
         return None;
     }
-    Some(message.replace("[[NEXT_MESSAGE]]", "\n"))
+    Some(normalize_legacy_message_text(message))
 }
 
 #[derive(Debug, Clone)]
