@@ -3,7 +3,7 @@
 use super::interrupt::{ReplyTicket, is_current};
 use super::thinking::ThinkingReporter;
 use super::tool_access::tool_registry;
-use super::utils::{BotMemory, Roles, params_model_with_token_limit_and_progress};
+use super::utils::{BotMemory, Roles, params_model_with_token_limit_and_progress_for_reply};
 use crate::config;
 use crate::vision::VisionImage;
 use serde::Deserialize;
@@ -157,11 +157,12 @@ pub(crate) async fn interruptible_model_call(
         return None;
     }
     kovi::tokio::select! {
-        response = params_model_with_token_limit_and_progress(
+        response = params_model_with_token_limit_and_progress_for_reply(
             messages,
             max_output_tokens,
             vision_images,
             progress,
+            Some(reply_ticket),
         ) => {
             is_current(reply_ticket).await.then_some(response)
         }

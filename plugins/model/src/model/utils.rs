@@ -10,28 +10,26 @@
 
 use super::interrupt::{ReplyTicket, finish, is_current, mark_active};
 use super::memory_query::{interruptible_model_call, params_model_with_tool_access};
+use super::message_actions::{FOLLOW_UP_MARKER, MessageDestination, ReplyPlan, execute_reply_plan};
 use super::recall::{
-    RecentBotMessage, begin_reply, finish_reply, recall_bot_messages, record_bot_message,
-    send_tracked_group_message,
+    RecentBotMessage, begin_reply, finish_reply, record_bot_message, send_tracked_group_message,
 };
-use super::reply::{
-    attach_reply_target_context, build_outbound_message, parse_reply_output, sanitize_reply_action,
-};
+use super::reply::attach_reply_target_context;
 use super::thinking::{ThinkingDestination, ThinkingReporter, strip_thinking_notices};
 use crate::config;
-use crate::memory::{BotPersonality, MEMORY_MANAGER, MoodEntry, UserProfile};
+use crate::memory::{MEMORY_MANAGER, MoodEntry, UserProfile};
 use crate::mood_system::{MOOD_SYSTEM, Mood};
 use crate::utils;
 use crate::vision::{
-    ImageRequestScope, VisionImage, analyze_images, default_vision_prompt,
-    extract_response_content, is_vision_command, update_pending_image_request,
+    ImageRequestScope, VisionImage, default_vision_prompt, extract_response_content,
+    is_vision_command, update_pending_image_request,
 };
+use crate::vision_router::analyze_images;
 use anyhow::Context;
 use chrono::{Local, TimeZone};
 use kovi::RuntimeBot;
 use kovi::serde_json::Value;
 use kovi::tokio::sync::{Mutex, Semaphore};
-use rand::Rng;
 use reqwest::Client;
 use serde::Serialize;
 use serde_json::json;
@@ -117,9 +115,6 @@ pub(crate) fn is_bot_admin(bot: &RuntimeBot, user_id: i64) -> bool {
         .map(|admins| admins.contains(&user_id))
         .unwrap_or(false)
 }
-
-/// 聊天中由模型决定是否继续发送下一条消息的分隔标记。
-const FOLLOW_UP_MARKER: &str = "[[NEXT_MESSAGE]]";
 
 /// 消息角色枚举
 ///
@@ -288,15 +283,14 @@ pub async fn control_model(
         limit_memory_size(&mut messages);
         return false;
     }
-    let parsed_reply = parse_reply_output(&response.content);
     let reply_scope = super::interrupt::ReplyScope::Group(group_id);
-    let reply_action = sanitize_reply_action(reply_scope, parsed_reply.action).await;
+    let plan = ReplyPlan::from_model_output(reply_scope, &response.content).await;
     update_pending_image_request(
         ImageRequestScope::Group { group_id, user_id },
-        &parsed_reply.content,
+        &plan.content,
     )
     .await;
-    if is_model_error_response(&parsed_reply.content) {
+    if is_model_error_response(&plan.content) {
         if let Ok(message_id) = bot
             .send_group_msg_return(group_id, "我这里暂时有点连不上，等一会儿再和我说一次吧。")
             .await
@@ -313,76 +307,48 @@ pub async fn control_model(
         limit_memory_size(&mut messages);
         return false;
     }
-    let recall_requested = !reply_action.recall_message_ids.is_empty();
-    let recalled_messages =
-        recall_bot_messages(reply_scope, &reply_action.recall_message_ids, &bot).await;
-    if !recalled_messages.is_empty() {
+    let personality = MEMORY_MANAGER.get_bot_personality().await;
+    let execution = execute_reply_plan(
+        &bot,
+        MessageDestination::Group(group_id),
+        &plan,
+        &personality,
+        reply_ticket,
+    )
+    .await;
+    if !execution.recalled_messages.is_empty() {
         println!(
             "[INFO] 芸汐主动撤回群聊消息 (群组: {}, 数量: {})",
             group_id,
-            recalled_messages.len()
+            execution.recalled_messages.len()
         );
-        append_recall_history_notice(&mut messages, &recalled_messages);
+        append_recall_history_notice(&mut messages, &execution.recalled_messages);
     }
-    if parsed_reply.content.contains("[sp]") || parsed_reply.content.trim().is_empty() {
-        if parsed_reply.content.contains("[sp]") {
+    if plan.is_silent() {
+        if plan.content.trim() == "[sp]" {
             messages.push(BotMemory {
                 role: Roles::Assistant,
-                content: parsed_reply.content,
+                content: plan.content,
             });
-        } else if recall_requested && recalled_messages.is_empty() {
+        } else if execution.recall_requested && execution.recalled_messages.is_empty() {
             println!("[WARN] 群聊主动撤回未命中可撤回消息 (群组: {})", group_id);
         }
         limit_memory_size(&mut messages);
-        return !recalled_messages.is_empty();
+        return !execution.recalled_messages.is_empty();
     }
-    let outbound_messages = split_reply(&parsed_reply.content);
-    let personality = MEMORY_MANAGER.get_bot_personality().await;
-    let mut sent_messages = Vec::new();
-    for (index, outbound_message) in outbound_messages.iter().enumerate() {
-        if !is_current(reply_ticket).await {
-            break;
-        }
-        if index > 0 {
-            kovi::tokio::time::sleep(follow_up_delay(&personality, index)).await;
-            if !is_current(reply_ticket).await {
-                break;
-            }
-        }
-        match bot
-            .send_group_msg_return(
-                group_id,
-                build_outbound_message(outbound_message, &reply_action, index == 0),
-            )
-            .await
-        {
-            Ok(message_id) => {
-                record_bot_message(
-                    reply_scope,
-                    reply_ticket,
-                    message_id,
-                    outbound_message,
-                    &bot,
-                )
-                .await;
-                sent_messages.push(outbound_message.clone());
-            }
-            Err(error) => {
-                eprintln!("[ERROR] 群聊回复发送失败 (群组: {}): {:?}", group_id, error);
-            }
-        }
-    }
-    if sent_messages.is_empty() {
+    if execution.sent_messages.is_empty() {
         println!("[INFO] 群聊回复在发送前被打断 (群组: {})", group_id);
         limit_memory_size(&mut messages);
-        return !recalled_messages.is_empty();
+        return !execution.recalled_messages.is_empty();
     }
-    let stored_reply = sent_messages.join("\n");
+    let stored_reply = execution.sent_messages.join("\n");
     println!(
         "[INFO] 群聊消息已发送 (群组: {}, 已发: {}, 取消: {})",
         group_id,
-        sent_messages.len(),
-        outbound_messages.len().saturating_sub(sent_messages.len())
+        execution.sent_messages.len(),
+        plan.bubbles
+            .len()
+            .saturating_sub(execution.sent_messages.len())
     );
     if let Err(error) = MEMORY_MANAGER
         .add_conversation_memory(group_id, &format!("芸汐: {}", stored_reply), "group_chat")
@@ -713,6 +679,23 @@ pub(crate) async fn params_model_with_token_limit_and_progress(
     vision_images: &[VisionImage],
     progress: Option<Arc<ThinkingReporter>>,
 ) -> BotMemory {
+    params_model_with_token_limit_and_progress_for_reply(
+        messages,
+        max_tokens,
+        vision_images,
+        progress,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn params_model_with_token_limit_and_progress_for_reply(
+    messages: &mut [BotMemory],
+    max_tokens: Option<u32>,
+    vision_images: &[VisionImage],
+    progress: Option<Arc<ThinkingReporter>>,
+    reply_ticket: Option<ReplyTicket>,
+) -> BotMemory {
     let config = config::get();
     let server_config = config.server_config();
 
@@ -732,19 +715,22 @@ pub(crate) async fn params_model_with_token_limit_and_progress(
         });
     }
 
-    let model_vision_images = if server_config.supports_vision() {
+    let force_external_vision = !vision_images.is_empty()
+        && !matches!(config.vision().provider(), "auto")
+        && server_config.supports_vision();
+    let model_vision_images = if server_config.supports_vision() && !force_external_vision {
         vision_images
     } else {
         &[]
     };
-    if !server_config.supports_vision() && !vision_images.is_empty() {
+    if (!server_config.supports_vision() || force_external_vision) && !vision_images.is_empty() {
         let question = request_messages
             .iter()
             .rev()
             .find(|message| message.role == Roles::User)
             .map(|message| message.content.as_str())
             .unwrap_or_default();
-        let analysis = match analyze_images(vision_images, question).await {
+        let analysis = match analyze_images(vision_images, question, reply_ticket).await {
             Ok(analysis) => analysis,
             Err(error) => return vision_model_error(&error.to_string()),
         };
@@ -1414,11 +1400,10 @@ async fn private_chat_inner(
         limit_memory_size(&mut history);
         return;
     }
-    let parsed_reply = parse_reply_output(&bot_content.content);
     let reply_scope = super::interrupt::ReplyScope::Private(user_id);
-    let reply_action = sanitize_reply_action(reply_scope, parsed_reply.action).await;
-    update_pending_image_request(ImageRequestScope::Private(user_id), &parsed_reply.content).await;
-    if is_model_error_response(&parsed_reply.content) {
+    let plan = ReplyPlan::from_model_output(reply_scope, &bot_content.content).await;
+    update_pending_image_request(ImageRequestScope::Private(user_id), &plan.content).await;
+    if is_model_error_response(&plan.content) {
         if let Ok(message_id) = bot
             .send_private_msg_return(user_id, "我这里暂时有点连不上，等一会儿再和我说一次吧。")
             .await
@@ -1435,72 +1420,44 @@ async fn private_chat_inner(
         limit_memory_size(&mut history);
         return;
     }
-    let recall_requested = !reply_action.recall_message_ids.is_empty();
-    let recalled_messages =
-        recall_bot_messages(reply_scope, &reply_action.recall_message_ids, &bot).await;
-    if !recalled_messages.is_empty() {
+    let personality = MEMORY_MANAGER.get_bot_personality().await;
+    let execution = execute_reply_plan(
+        &bot,
+        MessageDestination::Private(user_id),
+        &plan,
+        &personality,
+        reply_ticket,
+    )
+    .await;
+    if !execution.recalled_messages.is_empty() {
         println!(
             "[INFO] 芸汐主动撤回私聊消息 (用户: {}, 数量: {})",
             user_id,
-            recalled_messages.len()
+            execution.recalled_messages.len()
         );
-        append_recall_history_notice(&mut history, &recalled_messages);
+        append_recall_history_notice(&mut history, &execution.recalled_messages);
     }
-    if is_silent_model_response(&parsed_reply.content) || parsed_reply.content.trim().is_empty() {
+    if plan.is_silent() {
         println!("[INFO] 私聊模型选择静默 (用户: {})", user_id);
-        if recall_requested && recalled_messages.is_empty() {
+        if execution.recall_requested && execution.recalled_messages.is_empty() {
             println!("[WARN] 私聊主动撤回未命中可撤回消息 (用户: {})", user_id);
         }
         limit_memory_size(&mut history);
         return;
     }
-    let outbound_messages = split_reply(&parsed_reply.content);
-    let personality = MEMORY_MANAGER.get_bot_personality().await;
-    let mut sent_messages = Vec::new();
-    for (index, outbound_message) in outbound_messages.iter().enumerate() {
-        if !is_current(reply_ticket).await {
-            break;
-        }
-        if index > 0 {
-            kovi::tokio::time::sleep(follow_up_delay(&personality, index)).await;
-            if !is_current(reply_ticket).await {
-                break;
-            }
-        }
-        match bot
-            .send_private_msg_return(
-                user_id,
-                build_outbound_message(outbound_message, &reply_action, index == 0),
-            )
-            .await
-        {
-            Ok(message_id) => {
-                record_bot_message(
-                    reply_scope,
-                    reply_ticket,
-                    message_id,
-                    outbound_message,
-                    &bot,
-                )
-                .await;
-                sent_messages.push(outbound_message.clone());
-            }
-            Err(error) => {
-                eprintln!("[ERROR] 私聊回复发送失败 (用户: {}): {:?}", user_id, error);
-            }
-        }
-    }
-    if sent_messages.is_empty() {
+    if execution.sent_messages.is_empty() {
         println!("[INFO] 私聊回复在发送前被打断 (用户: {})", user_id);
         limit_memory_size(&mut history);
         return;
     }
-    let stored_reply = sent_messages.join("\n");
+    let stored_reply = execution.sent_messages.join("\n");
     println!(
         "[INFO] 私聊消息已发送 (用户: {}, 已发: {}, 取消: {})",
         user_id,
-        sent_messages.len(),
-        outbound_messages.len().saturating_sub(sent_messages.len())
+        execution.sent_messages.len(),
+        plan.bubbles
+            .len()
+            .saturating_sub(execution.sent_messages.len())
     );
     if let Err(error) = MEMORY_MANAGER
         .add_conversation_memory(user_id, &format!("芸汐: {}", stored_reply), "private_chat")
@@ -1553,131 +1510,6 @@ pub(crate) fn requests_no_reply(message: &str) -> bool {
         && ["别回", "不要回", "不用回", "无需回"]
             .iter()
             .any(|phrase| text.contains(phrase)))
-}
-
-fn is_silent_model_response(content: &str) -> bool {
-    content.trim() == "[sp]"
-}
-
-/// 将模型给出的回复拆成任意数量的消息。
-///
-/// `[[NEXT_MESSAGE]]` 是明确的分段指令；某些模型会自然地以换行分段而省略标记，
-/// 此时也把每个非空行当作一个气泡，避免一段本应连续说出的内容挤成单条消息。
-fn split_reply(content: &str) -> Vec<String> {
-    let marked_sections = content
-        .split(FOLLOW_UP_MARKER)
-        .map(str::trim)
-        .filter(|section| !section.is_empty())
-        .map(ToString::to_string)
-        .collect::<Vec<_>>();
-
-    if marked_sections.len() > 1 {
-        return sanitize_reply_sections(marked_sections);
-    }
-
-    let Some(reply) = marked_sections.into_iter().next() else {
-        return vec!["……".to_string()];
-    };
-
-    let line_sections = reply
-        .lines()
-        .map(str::trim)
-        .filter(|section| !section.is_empty())
-        .map(ToString::to_string)
-        .collect::<Vec<_>>();
-    if line_sections.len() > 1 {
-        sanitize_reply_sections(line_sections)
-    } else {
-        sanitize_reply_sections(vec![reply])
-    }
-}
-
-fn sanitize_reply_sections(sections: Vec<String>) -> Vec<String> {
-    sections
-        .into_iter()
-        .map(|section| strip_leading_stage_directions(&section))
-        .collect()
-}
-
-/// 模型偶尔会把小说式的舞台说明放在消息开头。QQ 聊天中只保留真正要说的话。
-fn strip_leading_stage_directions(content: &str) -> String {
-    let mut text = content.trim();
-
-    while let Some(rest) = strip_one_leading_bracketed_note(text) {
-        text = rest.trim_start_matches(|character: char| {
-            character.is_whitespace() || matches!(character, '，' | ',' | '。' | '：' | ':')
-        });
-    }
-
-    if text.is_empty() {
-        "……".to_string()
-    } else {
-        text.to_string()
-    }
-}
-
-fn strip_one_leading_bracketed_note(text: &str) -> Option<&str> {
-    let (open, close) = if text.starts_with('[') {
-        ('[', ']')
-    } else if text.starts_with('【') {
-        ('【', '】')
-    } else {
-        return None;
-    };
-
-    let after_open = &text[open.len_utf8()..];
-    let close_index = after_open.find(close)?;
-    if after_open[..close_index].trim().is_empty() {
-        return None;
-    }
-    Some(&after_open[close_index + close.len_utf8()..])
-}
-
-/// 根据当前情绪、能量、社交信心和少量随机浮动，决定下一条消息前的停顿。
-/// 活跃情绪更快，内敛或低落情绪会留出更长的思考空隙。
-fn follow_up_delay(personality: &BotPersonality, message_index: usize) -> std::time::Duration {
-    let variation_ms = rand::rng().random_range(-200_i64..=450_i64);
-    std::time::Duration::from_millis(follow_up_delay_millis(
-        personality,
-        message_index,
-        variation_ms,
-    ))
-}
-
-fn follow_up_delay_millis(
-    personality: &BotPersonality,
-    message_index: usize,
-    variation_ms: i64,
-) -> u64 {
-    let mood_base_ms = match personality.current_mood.as_str() {
-        "excited" => 280,
-        "playful" => 380,
-        "happy" => 480,
-        "curious" | "confident" => 560,
-        "neutral" => 800,
-        "calm" => 1_100,
-        "thoughtful" => 1_450,
-        "shy" | "lonely" => 1_600,
-        "angry" => 1_500,
-        "sad" => 1_800,
-        _ => 800,
-    };
-    let energy_adjustment_ms = (5_i64 - i64::from(personality.energy_level)) * 45;
-    let confidence_adjustment_ms = (5_i64 - i64::from(personality.social_confidence)) * 25;
-    let intensity_adjustment_ms = match personality.current_mood.as_str() {
-        "excited" | "playful" | "happy" if personality.mood_intensity >= 7 => -120,
-        "sad" | "shy" | "thoughtful" if personality.mood_intensity >= 7 => 160,
-        _ => 0,
-    };
-    // 连续表达越往后稍留空隙，但不会形成固定节拍。
-    let sequence_adjustment_ms = (message_index.saturating_sub(1).min(6) as i64) * 70;
-    (mood_base_ms
-        + energy_adjustment_ms
-        + confidence_adjustment_ms
-        + intensity_adjustment_ms
-        + sequence_adjustment_ms
-        + variation_ms)
-        .clamp(180, 4_500) as u64
 }
 
 fn generate_personalized_system_prompt(
@@ -1894,11 +1726,11 @@ mod tests {
     use super::{
         BotMemory, Roles, VisionImage, build_model_messages, build_responses_input,
         compression_cutoff, extract_interests_from_message, extract_personality_traits,
-        extract_stream_delta, follow_up_delay_millis, group_system_prompt, is_group_admin_command,
-        is_restricted_command, is_silent_model_response, limit_memory_size, model_attempt_count,
-        requests_no_reply, split_reply, with_reference_context,
+        extract_stream_delta, group_system_prompt, is_group_admin_command, is_restricted_command,
+        limit_memory_size, model_attempt_count, requests_no_reply, with_reference_context,
     };
     use crate::memory::BotPersonality;
+    use crate::model::message_actions::{ReplyPlan, follow_up_delay_millis, split_reply};
     use chrono::Local;
     use kovi::serde_json::json;
 
@@ -2127,8 +1959,18 @@ mod tests {
 
     #[test]
     fn only_the_exact_silence_marker_suppresses_a_model_reply() {
-        assert!(is_silent_model_response(" [sp] \n"));
-        assert!(!is_silent_model_response("不要回复[sp]"));
+        let silent = ReplyPlan {
+            content: " [sp] \n".to_string(),
+            action: Default::default(),
+            bubbles: Vec::new(),
+        };
+        let visible = ReplyPlan {
+            content: "不要回复[sp]".to_string(),
+            action: Default::default(),
+            bubbles: vec!["不要回复[sp]".to_string()],
+        };
+        assert!(silent.is_silent());
+        assert!(!visible.is_silent());
     }
 
     #[test]

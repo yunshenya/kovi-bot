@@ -81,3 +81,9 @@ web_search_enabled = true
 web_fetch_enabled = true
 web_search_max_results = 5
 web_fetch_max_chars = 12000
+
+[vision]
+provider = "auto"
+mcp_server = ""
+mcp_tool = "analyze_image"
+timeout_secs = 60

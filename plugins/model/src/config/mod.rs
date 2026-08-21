@@ -31,8 +31,10 @@ mod prompt;
 mod server;
 mod tools;
 mod topic;
+mod vision;
 
 pub use tools::{McpServerConfig, ToolsConfig};
+pub use vision::VisionConfig;
 
 /// 全局配置实例
 ///
@@ -68,6 +70,8 @@ pub struct ModelConfig {
     topic: TopicConfig,
     /// 模型可自主调用的受限工具。
     tools: ToolsConfig,
+    /// 图片理解 Provider 路由配置。
+    vision: VisionConfig,
 }
 
 impl ModelConfig {
@@ -107,6 +111,23 @@ impl ModelConfig {
         self.mood.validate()?;
         self.topic.validate()?;
         self.tools.validate()?;
+        self.vision.validate()?;
+        if !self.vision.mcp_server().is_empty() && !self.tools.enabled() {
+            return Err(anyhow::anyhow!(
+                "配置 vision.mcp_server 时必须启用 tools.enabled"
+            ));
+        }
+        if !self.vision.mcp_server().is_empty()
+            && !self
+                .tools
+                .mcp_servers()
+                .iter()
+                .any(|server| server.name() == self.vision.mcp_server())
+        {
+            return Err(anyhow::anyhow!(
+                "vision.mcp_server 必须对应 tools.mcp_servers 中已配置的服务"
+            ));
+        }
 
         println!("[INFO] 配置验证通过");
         Ok(())
@@ -146,6 +167,10 @@ impl ModelConfig {
 
     pub fn tools(&self) -> &ToolsConfig {
         &self.tools
+    }
+
+    pub fn vision(&self) -> &VisionConfig {
+        &self.vision
     }
 
     fn create_default_config_file(config_path: &Path) -> anyhow::Result<()> {

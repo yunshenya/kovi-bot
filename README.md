@@ -116,6 +116,12 @@ web_fetch_enabled = true
 web_search_max_results = 5
 web_fetch_max_chars = 12000
 
+[vision]
+provider = "auto"              # auto、builtin 或 mcp
+mcp_server = ""                # 对应 tools.mcp_servers.name
+mcp_tool = "analyze_image"     # MCP 工具名
+timeout_secs = 60
+
 # MCP 服务默认不配置。只有明确列入 allowed_tools 的工具才会暴露给芸汐。
 # [[tools.mcp_servers]]
 # name = "notes"
@@ -123,7 +129,7 @@ web_fetch_max_chars = 12000
 # args = ["--stdio"]
 # cwd = "/home/ubuntu/kovi-bot"
 # inherit_env = ["NOTES_API_TOKEN"]
-# allowed_tools = ["search_notes", "read_note"]
+# allowed_tools = ["search_notes", "read_note", "analyze_image"]
 # read_only = true
 
 [message_batch]
@@ -243,7 +249,24 @@ export VISION_REQUIRES_AUTH="false"
 
 `VISION_WIRE_API=responses` 时，`VISION_API_URL` 可以填写服务根地址，程序会补上 `/responses`；如果服务实际要求 `/v1/responses`，直接填写完整地址即可。若使用旧式 Chat Completions 接口，将其设为 `chat_completions`，程序会发送 `messages[].content` 中的 `image_url` 图片输入。
 
-视觉接口只在非视觉主模型收到图片时启用；GPT-5.5 主模型会完全跳过这些 `VISION_*` 配置。
+`provider = "auto"` 时，视觉主模型优先直接接收图片；只有主模型的 `supports_vision = false` 时才启用独立视觉接口。若将 Provider 明确设为 `builtin` 或 `mcp`，则会强制先做独立图片分析，再把文字结果交给主模型。
+
+也可以把视觉识别切换成 MCP Provider。将 `[vision]` 改为 `provider = "mcp"`，填写 `mcp_server` 和 `mcp_tool`，并在对应 MCP 服务的 `allowed_tools` 中加入这个工具。MCP 工具接收的参数固定为：
+
+```json
+{
+  "question": "用户关于图片的问题",
+  "images": [
+    {
+      "path": "/tmp/kovi-bot-vision-.../image-0.png",
+      "mime_type": "image/png",
+      "name": "image-0.png"
+    }
+  ]
+}
+```
+
+工具需要在调用期间读取这些临时文件，并返回文字分析结果；调用结束后文件会自动删除。`provider = "auto"` 会优先使用现有 `VISION_*` 内置 Provider，失败后再尝试已配置的 MCP Provider。
 
 ## 工具与 MCP
 

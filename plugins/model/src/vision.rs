@@ -351,7 +351,10 @@ pub(crate) fn default_vision_prompt() -> &'static str {
 }
 
 /// 使用单独的 OpenAI 兼容视觉接口分析图片，主聊天模型只接收分析后的文字。
-pub(crate) async fn analyze_images(images: &[VisionImage], question: &str) -> Result<String> {
+pub(crate) async fn analyze_images_with_builtin(
+    images: &[VisionImage],
+    question: &str,
+) -> Result<String> {
     let url = std::env::var("VISION_API_URL")
         .ok()
         .filter(|value| !value.trim().is_empty())

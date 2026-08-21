@@ -1,0 +1,287 @@
+//! 可替换的图片理解 Provider 路由。
+//!
+//! 图片先由机器人本地物化并校验，再交给内置视觉接口或受控 MCP 服务。
+
+use crate::config::{self, VisionConfig};
+use crate::model::ReplyTicket;
+use crate::model::tool_access::tool_registry;
+use crate::vision::{VisionImage, analyze_images_with_builtin, default_vision_prompt};
+use anyhow::{Result, anyhow};
+use base64::Engine;
+use kovi::serde_json::{Map, Value, json};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+
+const MAX_VISION_QUESTION_CHARS: usize = 4_000;
+const MAX_VISION_IMAGE_BYTES: usize = 10 * 1024 * 1024;
+static TEMP_IMAGE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone)]
+pub(crate) struct VisionRouter {
+    config: VisionConfig,
+}
+
+impl VisionRouter {
+    pub(crate) fn from_config(config: VisionConfig) -> Self {
+        Self { config }
+    }
+
+    pub(crate) async fn analyze(
+        &self,
+        images: &[VisionImage],
+        question: &str,
+        reply_ticket: Option<ReplyTicket>,
+    ) -> Result<String> {
+        if images.is_empty() {
+            return Err(anyhow!("没有可供视觉 Provider 分析的图片"));
+        }
+        let question = if question.trim().is_empty() {
+            default_vision_prompt().to_string()
+        } else {
+            question.chars().take(MAX_VISION_QUESTION_CHARS).collect()
+        };
+
+        kovi::tokio::time::timeout(
+            Duration::from_secs(self.config.timeout_secs()),
+            self.analyze_provider(images, &question, reply_ticket),
+        )
+        .await
+        .map_err(|_| anyhow!("视觉 Provider 调用超时"))?
+    }
+
+    async fn analyze_provider(
+        &self,
+        images: &[VisionImage],
+        question: &str,
+        reply_ticket: Option<ReplyTicket>,
+    ) -> Result<String> {
+        match self.config.provider() {
+            "builtin" => analyze_images_with_builtin(images, question).await,
+            "mcp" => self.analyze_with_mcp(images, question, reply_ticket).await,
+            _ => self.analyze_auto(images, question, reply_ticket).await,
+        }
+    }
+
+    async fn analyze_auto(
+        &self,
+        images: &[VisionImage],
+        question: &str,
+        reply_ticket: Option<ReplyTicket>,
+    ) -> Result<String> {
+        let mcp_configured = !self.config.mcp_server().trim().is_empty();
+        let builtin_configured = std::env::var("VISION_API_URL")
+            .ok()
+            .is_some_and(|value| !value.trim().is_empty())
+            && std::env::var("VISION_MODEL_NAME")
+                .ok()
+                .is_some_and(|value| !value.trim().is_empty());
+
+        let mut builtin_error = None;
+        if builtin_configured {
+            match analyze_images_with_builtin(images, question).await {
+                Ok(result) => return Ok(result),
+                Err(error) => {
+                    eprintln!("[WARN] 内置视觉 Provider 失败: {}", error);
+                    builtin_error = Some(error);
+                }
+            }
+        }
+        if mcp_configured {
+            return self.analyze_with_mcp(images, question, reply_ticket).await;
+        }
+        if let Some(error) = builtin_error {
+            return Err(error);
+        }
+        analyze_images_with_builtin(images, question).await
+    }
+
+    async fn analyze_with_mcp(
+        &self,
+        images: &[VisionImage],
+        question: &str,
+        reply_ticket: Option<ReplyTicket>,
+    ) -> Result<String> {
+        let reply_ticket =
+            reply_ticket.ok_or_else(|| anyhow!("MCP 视觉 Provider 需要回复会话上下文"))?;
+        let server = self.config.mcp_server().trim();
+        if server.is_empty() {
+            return Err(anyhow!("未配置 vision.mcp_server"));
+        }
+        let registry = tool_registry().ok_or_else(|| anyhow!("MCP 工具注册表尚未就绪"))?;
+        let files = TempVisionFiles::create(images)?;
+        let arguments: Map<String, Value> = serde_json::from_value(json!({
+            "question": question,
+            "images": files
+                .images
+                .iter()
+                .map(|image| json!({
+                    "path": image.path,
+                    "mime_type": image.mime_type,
+                    "name": image.name,
+                }))
+                .collect::<Vec<_>>(),
+        }))?;
+        let tool_name = format!("mcp.{}.{}", server, self.config.mcp_tool());
+        let result = registry
+            .execute_mcp_for_vision(
+                &tool_name,
+                arguments,
+                reply_ticket,
+                Duration::from_secs(self.config.timeout_secs()),
+            )
+            .await?;
+        let result = result.trim();
+        if result.is_empty() {
+            return Err(anyhow!("MCP 视觉 Provider 返回空结果"));
+        }
+        Ok(result.to_string())
+    }
+}
+
+pub(crate) async fn analyze_images(
+    images: &[VisionImage],
+    question: &str,
+    reply_ticket: Option<ReplyTicket>,
+) -> Result<String> {
+    VisionRouter::from_config(config::get().vision().clone())
+        .analyze(images, question, reply_ticket)
+        .await
+}
+
+struct TempVisionFiles {
+    directory: PathBuf,
+    images: Vec<TempVisionImage>,
+}
+
+struct TempVisionImage {
+    path: String,
+    mime_type: String,
+    name: String,
+}
+
+impl TempVisionFiles {
+    fn create(images: &[VisionImage]) -> Result<Self> {
+        let counter = TEMP_IMAGE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "kovi-bot-vision-{}-{}",
+            std::process::id(),
+            counter
+        ));
+        fs::create_dir(&directory).map_err(|error| anyhow!("创建视觉临时目录失败: {error}"))?;
+        if let Err(error) = set_private_permissions(&directory, 0o700) {
+            let _ = fs::remove_dir_all(&directory);
+            return Err(error);
+        }
+
+        let entries = match write_temp_images(&directory, images) {
+            Ok(entries) => entries,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&directory);
+                return Err(error);
+            }
+        };
+        Ok(Self {
+            directory,
+            images: entries,
+        })
+    }
+}
+
+fn write_temp_images(directory: &Path, images: &[VisionImage]) -> Result<Vec<TempVisionImage>> {
+    let mut entries = Vec::new();
+    for (index, image) in images.iter().enumerate() {
+        let (mime_type, bytes) = decode_image_data_url(&image.url)?;
+        let extension = image_extension(&mime_type);
+        let name = format!("image-{index}.{extension}");
+        let path = directory.join(&name);
+        fs::write(&path, bytes).map_err(|error| anyhow!("写入视觉临时图片失败: {error}"))?;
+        set_private_permissions(&path, 0o600)?;
+        entries.push(TempVisionImage {
+            path: path.to_string_lossy().into_owned(),
+            mime_type,
+            name,
+        });
+    }
+    Ok(entries)
+}
+
+impl Drop for TempVisionFiles {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.directory);
+    }
+}
+
+fn decode_image_data_url(url: &str) -> Result<(String, Vec<u8>)> {
+    let (header, encoded) = url
+        .split_once(',')
+        .ok_or_else(|| anyhow!("视觉图片不是有效的 data URL"))?;
+    let mime_type = header
+        .strip_prefix("data:")
+        .and_then(|value| value.strip_suffix(";base64"))
+        .filter(|value| matches!(*value, "image/png" | "image/jpeg" | "image/webp"))
+        .ok_or_else(|| anyhow!("MCP 视觉 Provider 只支持 PNG、JPEG 或 WebP"))?
+        .to_string();
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|error| anyhow!("视觉图片 Base64 解码失败: {error}"))?;
+    if bytes.len() > MAX_VISION_IMAGE_BYTES {
+        return Err(anyhow!(
+            "MCP 视觉 Provider 图片超过 {} MB 限制",
+            MAX_VISION_IMAGE_BYTES / 1024 / 1024
+        ));
+    }
+    Ok((mime_type, bytes))
+}
+
+fn image_extension(mime_type: &str) -> &'static str {
+    match mime_type {
+        "image/png" => "png",
+        "image/webp" => "webp",
+        _ => "jpg",
+    }
+}
+
+fn set_private_permissions(path: &Path, mode: u32) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{VisionRouter, decode_image_data_url, image_extension};
+    use crate::config::VisionConfig;
+    use crate::vision::VisionImage;
+
+    #[test]
+    fn decodes_supported_image_data_urls_for_mcp() {
+        let (mime, bytes) = decode_image_data_url("data:image/png;base64,aGVsbG8=")
+            .expect("图片 data URL 应能解码");
+        assert_eq!(mime, "image/png");
+        assert_eq!(bytes, b"hello");
+        assert_eq!(image_extension("image/jpeg"), "jpg");
+    }
+
+    #[test]
+    fn rejects_unsupported_mcp_image_data_urls() {
+        assert!(decode_image_data_url("data:image/gif;base64,aGVsbG8=").is_err());
+        assert!(decode_image_data_url("not-a-data-url").is_err());
+    }
+
+    #[test]
+    fn router_can_be_constructed_from_default_config() {
+        let config = VisionConfig::default();
+        let router = VisionRouter::from_config(config);
+        let _ = (
+            router,
+            VisionImage {
+                url: "data:image/png;base64,aGVsbG8=".to_string(),
+            },
+        );
+    }
+}

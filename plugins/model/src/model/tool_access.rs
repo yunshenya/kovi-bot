@@ -320,6 +320,37 @@ impl ToolRegistry {
             Err(error) => format!("工具执行失败：{}", truncate_chars(&error.to_string(), 800)),
         }
     }
+
+    pub(crate) async fn execute_mcp_for_vision(
+        &self,
+        name: &str,
+        arguments: Map<String, Value>,
+        reply_ticket: crate::model::interrupt::ReplyTicket,
+        timeout: Duration,
+    ) -> Result<String> {
+        let definition = self
+            .definitions
+            .iter()
+            .find(|definition| definition.name == name)
+            .ok_or_else(|| anyhow!("MCP 视觉工具未开放：{name}"))?;
+        let ToolSource::Mcp {
+            server,
+            remote_name,
+            client,
+        } = &definition.source
+        else {
+            return Err(anyhow!("视觉 Provider 不是 MCP 工具：{name}"));
+        };
+        let arguments_text = serde_json::to_string(&arguments)?;
+        if arguments_text.chars().count() > MAX_TOOL_ARGUMENT_CHARS {
+            return Err(anyhow!("MCP 视觉工具参数过长"));
+        }
+        let execution = execute_mcp(server, remote_name, client, arguments, reply_ticket);
+        let result = kovi::tokio::time::timeout(timeout, execution)
+            .await
+            .map_err(|_| anyhow!("MCP 视觉工具调用超时（工具：{name}）"))??;
+        Ok(truncate_chars(&result, self.max_result_chars))
+    }
 }
 
 async fn connect_mcp_server(server: &McpServerConfig) -> Option<McpClient> {

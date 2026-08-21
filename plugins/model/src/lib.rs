@@ -21,6 +21,7 @@ pub mod config;
 mod model;
 mod redis_store;
 mod vision;
+mod vision_router;
 // 工具函数模块
 mod utils;
 // 记忆管理系统
