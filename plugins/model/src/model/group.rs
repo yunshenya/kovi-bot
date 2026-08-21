@@ -21,10 +21,10 @@ use crate::vision::{
     with_social_image_context,
 };
 use chrono::Local;
-use kovi::RuntimeBot;
 use kovi::event::GroupMsgEvent;
 use kovi::serde_json::json;
 use kovi::tokio::sync::Mutex;
+use kovi::{Message, RuntimeBot};
 use rand::Rng;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, LazyLock};
@@ -63,6 +63,25 @@ struct PendingWindowMessage {
     vision_images: Vec<VisionImage>,
     message_ids: Vec<i32>,
     understanding: MessageUnderstanding,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Addressing {
+    at_self: bool,
+    reply_to_self: bool,
+}
+
+impl Addressing {
+    fn detect(message: &Message, self_id: i64, replied_sender_id: Option<i64>) -> Self {
+        Self {
+            at_self: message_at_self(message, self_id),
+            reply_to_self: replied_sender_id == Some(self_id),
+        }
+    }
+
+    fn directly_addressed(self) -> bool {
+        self.at_self || self.reply_to_self
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -167,8 +186,6 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
         &event.human_text,
     )
     .await;
-    let directly_addressed = is_addressed_to_bot(&event);
-
     if let Some(label) = teaching_label(message) {
         match stickers_for_teaching(&event.message, &bot).await {
             Ok(teaching_stickers) if !teaching_stickers.is_empty() => {
@@ -244,7 +261,12 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
         .map(|quoted| quoted.images.as_slice())
         .unwrap_or_default();
     let images = merge_image_attachments(&current_images, quoted_images);
-    let replies_to_bot = quoted.as_ref().and_then(|quoted| quoted.sender_id) == Some(event.self_id);
+    let addressing = Addressing::detect(
+        &event.message,
+        event.self_id,
+        quoted.as_ref().and_then(|quoted| quoted.sender_id),
+    );
+    let addressed_to_bot = addressing.directly_addressed();
     let pending_image_request = consume_pending_image_request(
         ImageRequestScope::Group {
             group_id,
@@ -260,8 +282,7 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
     }
     let active_reply = is_active(reply_scope).await;
     let conversation_open = has_open_conversation_window(group_id).await;
-    let semantic_required = directly_addressed
-        || replies_to_bot
+    let semantic_required = addressed_to_bot
         || vision_command
         || !images.is_empty()
         || active_reply
@@ -274,7 +295,7 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
         quoted_has_images: !quoted_images.is_empty(),
         explicit_vision_command: vision_command,
         pending_image_request,
-        addressed_to_bot: directly_addressed || replies_to_bot,
+        addressed_to_bot,
         conversation_open: active_reply || conversation_open,
     };
     let mut understanding = if semantic_required {
@@ -283,8 +304,8 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
         MessageUnderstanding::default()
     };
     let mut asks_for_silence = understanding.wants_no_reply || understanding.wants_stop;
-    let can_interrupt = directly_addressed || asks_for_silence || vision_command;
-    let mut reply_ticket = if can_interrupt {
+    let can_interrupt = addressed_to_bot || asks_for_silence || vision_command;
+    let reply_ticket = if can_interrupt {
         Some(interrupt(reply_scope).await)
     } else {
         None
@@ -322,10 +343,6 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
     let model_message = quoted.as_ref().map_or(current_message.clone(), |quoted| {
         with_quoted_context(&current_message, quoted)
     });
-    if replies_to_bot && reply_ticket.is_none() {
-        reply_ticket = Some(interrupt(reply_scope).await);
-    }
-    let addressed_to_bot = directly_addressed || replies_to_bot;
     let (
         model_message,
         addressed_to_bot,
@@ -1108,15 +1125,16 @@ fn prune_interjection_states(states: &mut HashMap<i64, GroupInterjectionState>) 
     })
 }
 
-fn is_addressed_to_bot(event: &GroupMsgEvent) -> bool {
-    let self_id = event.self_id.to_string();
-    event.message.iter().any(|segment| {
+fn message_at_self(message: &Message, self_id: i64) -> bool {
+    message.iter().any(|segment| {
         if segment.type_ != "at" {
             return false;
         }
-        let qq = segment.data.get("qq");
-        qq.and_then(|value| value.as_str()) == Some(self_id.as_str())
-            || qq.and_then(|value| value.as_i64()) == Some(event.self_id)
+
+        segment.data.get("qq").is_some_and(|qq| {
+            qq.as_i64() == Some(self_id)
+                || qq.as_str().and_then(|value| value.parse::<i64>().ok()) == Some(self_id)
+        })
     })
 }
 
@@ -1178,13 +1196,59 @@ async fn update_group_profile(group_id: i64, user_id: i64, understanding: &Messa
 #[cfg(test)]
 mod tests {
     use super::{
-        DirectTriggerState, GroupInterjectionState, GroupSenderIdentity,
+        Addressing, DirectTriggerState, GroupInterjectionState, GroupSenderIdentity,
         complete_interjection_attempt, conversation_message_is_relevant, decision_budget_available,
-        has_active_conversation_window, normalized_sender_name, prune_decision_attempts,
-        roll_conversation_window, should_defer_active_window_message, suppress_direct_trigger,
+        has_active_conversation_window, message_at_self, normalized_sender_name,
+        prune_decision_attempts, roll_conversation_window, should_defer_active_window_message,
+        suppress_direct_trigger,
     };
     use crate::model::utils::{is_group_admin_command, is_restricted_command};
+    use kovi::Message;
+    use kovi::bot::message::Segment;
+    use kovi::serde_json::json;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn structured_at_segments_identify_only_the_bot_account() {
+        let self_id = 123_456;
+
+        let string_id = Message::from(vec![Segment::new("at", json!({"qq": "123456"}))]);
+        let numeric_id = Message::from(vec![Segment::new("at", json!({"qq": 123456}))]);
+        let another_user = Message::from(vec![Segment::new("at", json!({"qq": "654321"}))]);
+        let everyone = Message::from(vec![Segment::new("at", json!({"qq": "all"}))]);
+        let no_at = Message::from("芸汐在吗");
+        let multiple_targets = Message::from(vec![
+            Segment::new("at", json!({"qq": "654321"})),
+            Segment::new("text", json!({"text": "还有"})),
+            Segment::new("at", json!({"qq": "123456"})),
+        ]);
+
+        assert!(message_at_self(&string_id, self_id));
+        assert!(message_at_self(&numeric_id, self_id));
+        assert!(!message_at_self(&another_user, self_id));
+        assert!(!message_at_self(&everyone, self_id));
+        assert!(!message_at_self(&no_at, self_id));
+        assert!(message_at_self(&multiple_targets, self_id));
+    }
+
+    #[test]
+    fn at_and_reply_are_unified_as_direct_addressing() {
+        let self_id = 123_456;
+        let at_self = Message::from(vec![Segment::new("at", json!({"qq": "123456"}))]);
+        let plain = Message::from("继续说");
+
+        let mention = Addressing::detect(&at_self, self_id, None);
+        assert!(mention.at_self);
+        assert!(!mention.reply_to_self);
+        assert!(mention.directly_addressed());
+
+        let reply = Addressing::detect(&plain, self_id, Some(self_id));
+        assert!(!reply.at_self);
+        assert!(reply.reply_to_self);
+        assert!(reply.directly_addressed());
+
+        assert!(!Addressing::detect(&plain, self_id, Some(654_321)).directly_addressed());
+    }
 
     #[test]
     fn group_identity_keeps_card_and_qq_nickname_separate() {
