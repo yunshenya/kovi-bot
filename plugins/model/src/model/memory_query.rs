@@ -1,6 +1,7 @@
 //! 由模型自主发起、由程序严格约束的工具调用循环。
 
 use super::interrupt::{ReplyTicket, is_current};
+use super::reply_disposition::SILENT_REPLY_OUTPUT;
 use super::thinking::ThinkingReporter;
 use super::tool_access::tool_registry;
 use super::utils::{BotMemory, Roles, params_model_with_token_limit_and_progress_for_reply};
@@ -179,7 +180,7 @@ async fn wait_until_interrupted(reply_ticket: ReplyTicket) {
 fn interrupted_response() -> BotMemory {
     BotMemory {
         role: Roles::Assistant,
-        content: "[sp]".to_string(),
+        content: SILENT_REPLY_OUTPUT.to_string(),
     }
 }
 
@@ -219,7 +220,8 @@ fn format_tool_result(name: &str, result: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ParsedToolCall, parse_tool_call};
+    use super::{ParsedToolCall, interrupted_response, parse_tool_call};
+    use crate::model::reply::parse_reply_output;
 
     #[test]
     fn parses_only_the_restricted_tool_protocol() {
@@ -252,5 +254,12 @@ mod tests {
             parse_tool_call(r#"[[TOOL_CALL]]{"name":"time.now","sql":"DROP TABLE"}[[/TOOL_CALL]]"#),
             ParsedToolCall::Invalid(_)
         ));
+    }
+
+    #[test]
+    fn interrupted_tool_loop_returns_structured_silence() {
+        let parsed = parse_reply_output(&interrupted_response().content);
+        assert!(parsed.disposition.is_silent());
+        assert!(parsed.content.is_empty());
     }
 }

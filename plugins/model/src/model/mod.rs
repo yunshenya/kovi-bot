@@ -6,6 +6,7 @@ mod message_actions;
 mod private;
 mod recall;
 mod reply;
+mod reply_disposition;
 pub(crate) mod semantic;
 mod thinking;
 pub(crate) mod tool_access;

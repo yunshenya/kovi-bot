@@ -7,7 +7,8 @@ use crate::model::recall::{has_recalled_messages, send_tracked_group_message};
 use crate::model::reply::record_reply_target;
 use crate::model::semantic::{MessageUnderstanding, UnderstandingRequest, understand};
 use crate::model::utils::{
-    is_bot_admin, is_restricted_command, learn_user_profile_from_message, send_sys_info, silence,
+    is_bot_admin, is_restricted_command, learn_user_profile_from_message, process_group_reply,
+    send_sys_info,
 };
 use crate::redis_store;
 use crate::sticker_memory::{
@@ -540,7 +541,7 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
                     None => interrupt(reply_scope).await,
                 };
                 let turn_marker = begin_conversation_turn(group_id, event.user_id).await;
-                let replied = silence(
+                let replied = process_group_reply(
                     group_id,
                     event.user_id,
                     &model_message,
@@ -568,7 +569,7 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
                     None => interrupt(reply_scope).await,
                 };
                 let turn_marker = begin_conversation_turn(group_id, event.user_id).await;
-                let replied = silence(
+                let replied = process_group_reply(
                     group_id,
                     event.user_id,
                     &model_message,
@@ -590,7 +591,7 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
                 let max_output_tokens = config::get()
                     .group_interjection()
                     .interjection_max_output_tokens();
-                let replied = silence(
+                let replied = process_group_reply(
                     group_id,
                     event.user_id,
                     &model_message,
@@ -936,7 +937,7 @@ async fn drain_pending_window_messages(group_id: i64, bot: Arc<RuntimeBot>) {
         println!("[INFO] 群聊开始处理排队窗口消息 (群组: {})", group_id);
         let ticket = interrupt(ReplyScope::Group(group_id)).await;
         let turn_marker = begin_conversation_turn(group_id, pending.user_id).await;
-        let replied = crate::model::utils::silence(
+        let replied = crate::model::utils::process_group_reply(
             group_id,
             pending.user_id,
             &pending.message,

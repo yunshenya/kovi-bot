@@ -7,6 +7,7 @@ use super::recall::{RecentBotMessage, recall_bot_messages, record_bot_message};
 use super::reply::{
     ReplyAction, build_outbound_message, parse_reply_output, sanitize_reply_action,
 };
+use super::reply_disposition::ReplyDisposition;
 use crate::memory::BotPersonality;
 use kovi::RuntimeBot;
 use rand::Rng;
@@ -31,6 +32,7 @@ impl MessageDestination {
 #[derive(Debug, Clone)]
 pub(crate) struct ReplyPlan {
     pub(crate) content: String,
+    pub(crate) disposition: ReplyDisposition,
     pub(crate) action: ReplyAction,
     pub(crate) bubbles: Vec<String>,
 }
@@ -38,17 +40,30 @@ pub(crate) struct ReplyPlan {
 impl ReplyPlan {
     pub(crate) async fn from_model_output(scope: ReplyScope, content: &str) -> Self {
         let parsed = parse_reply_output(content);
-        let action = sanitize_reply_action(scope, parsed.action).await;
-        let bubbles = split_reply(&parsed.content);
+        let mut action = sanitize_reply_action(scope, parsed.action).await;
+        if parsed.disposition.is_silent() || parsed.content.is_empty() {
+            action.quote_message_id = None;
+            action.at_user_ids.clear();
+        }
+        let bubbles = if parsed.disposition.is_silent() || parsed.content.is_empty() {
+            Vec::new()
+        } else {
+            split_reply(&parsed.content)
+        };
         Self {
             content: parsed.content,
+            disposition: parsed.disposition,
             action,
             bubbles,
         }
     }
 
     pub(crate) fn is_silent(&self) -> bool {
-        self.content.trim() == "[sp]" || self.content.trim().is_empty()
+        self.disposition.is_silent()
+    }
+
+    pub(crate) fn has_visible_reply(&self) -> bool {
+        !self.is_silent() && !self.bubbles.is_empty()
     }
 }
 
@@ -80,7 +95,7 @@ pub(crate) async fn execute_reply_plan(
         return execution;
     }
 
-    if plan.is_silent() {
+    if !plan.has_visible_reply() {
         return execution;
     }
 
@@ -230,6 +245,7 @@ mod tests {
     use super::{MessageDestination, ReplyPlan, follow_up_delay_millis, split_reply};
     use crate::memory::BotPersonality;
     use crate::model::interrupt::ReplyScope;
+    use crate::model::reply_disposition::ReplyDisposition;
 
     #[test]
     fn reply_plan_keeps_bubbles_and_destination_scope_is_stable() {
@@ -243,8 +259,38 @@ mod tests {
         assert!(follow_up_delay_millis(&personality, 1, 0) > 0);
         let _ = ReplyPlan {
             content: "你好".to_string(),
+            disposition: ReplyDisposition::Reply,
             action: Default::default(),
             bubbles: vec!["你好".to_string()],
         };
+    }
+
+    #[test]
+    fn structured_silence_keeps_recall_but_drops_visible_actions() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let scope = ReplyScope::Private(9_100_001);
+                crate::model::reply::record_reply_target(
+                    scope,
+                    77,
+                    Some(88),
+                    "测试用户",
+                    "测试消息",
+                )
+                .await;
+                let plan = ReplyPlan::from_model_output(
+                    scope,
+                    "[[REPLY_ACTION]]{\"disposition\":\"silent\",\"quote_message_id\":77,\"at_user_ids\":[88],\"recall_message_ids\":[99]}[[/REPLY_ACTION]]",
+                )
+                .await;
+                assert!(plan.is_silent());
+                assert!(!plan.has_visible_reply());
+                assert!(plan.content.is_empty());
+                assert!(plan.bubbles.is_empty());
+                assert_eq!(plan.action.quote_message_id, None);
+                assert!(plan.action.at_user_ids.is_empty());
+                assert_eq!(plan.action.recall_message_ids, vec![99]);
+            });
     }
 }
