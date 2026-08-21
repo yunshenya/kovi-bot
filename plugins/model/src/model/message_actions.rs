@@ -138,17 +138,7 @@ pub(crate) fn split_reply(content: &str) -> Vec<String> {
         return vec!["……".to_string()];
     };
 
-    let line_sections = reply
-        .lines()
-        .map(str::trim)
-        .filter(|section| !section.is_empty())
-        .map(ToString::to_string)
-        .collect::<Vec<_>>();
-    if line_sections.len() > 1 {
-        sanitize_reply_sections(line_sections)
-    } else {
-        sanitize_reply_sections(vec![reply])
-    }
+    sanitize_reply_sections(vec![reply])
 }
 
 fn sanitize_reply_sections(sections: Vec<String>) -> Vec<String> {
@@ -249,7 +239,7 @@ mod tests {
             MessageDestination::Private(34).scope(),
             ReplyScope::Private(34)
         );
-        assert_eq!(split_reply("第一句\n第二句"), vec!["第一句", "第二句"]);
+        assert_eq!(split_reply("第一句\n第二句"), vec!["第一句\n第二句"]);
         assert!(follow_up_delay_millis(&personality, 1, 0) > 0);
         let _ = ReplyPlan {
             content: "你好".to_string(),
