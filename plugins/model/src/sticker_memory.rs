@@ -532,12 +532,27 @@ pub(crate) fn with_sticker_context(text: &str, labels: &[String]) -> String {
     }
 }
 
+/// 告知模型当前带有尚未学习的表情，但不臆造它的具体含义。
+pub(crate) fn with_unknown_sticker_context(text: &str, count: usize) -> String {
+    let message = text.trim();
+    let description = if count == 1 {
+        "附带了一个芸汐还没学会理解的表情包；不要擅自猜它的具体含义，可以自然地承认还没看懂。"
+    } else {
+        "附带了几个芸汐还没学会理解的表情包；不要擅自猜它们的具体含义，可以自然地承认还没看懂。"
+    };
+    if message.is_empty() {
+        description.to_string()
+    } else {
+        format!("{message}\n{description}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         QuotedMessageContext, StickerImage, extract_stickers, extract_text,
         message_from_onebot_value, reply_message_id, teaching_label, with_quoted_context,
-        with_sticker_context,
+        with_sticker_context, with_unknown_sticker_context,
     };
     use kovi::Message;
     use kovi::bot::message::Segment;
@@ -635,5 +650,13 @@ mod tests {
             "对方发送了一个表情包。附带的已学习表情含义：无语又想笑。"
         );
         assert_eq!(with_sticker_context("你好", &[]), "你好");
+    }
+
+    #[test]
+    fn unknown_sticker_context_does_not_invent_a_meaning() {
+        let context = with_unknown_sticker_context("这个怎么样", 1);
+        assert!(context.contains("还没学会理解"));
+        assert!(context.contains("不要擅自猜"));
+        assert!(with_unknown_sticker_context("", 2).contains("几个"));
     }
 }

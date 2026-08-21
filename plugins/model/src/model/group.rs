@@ -14,6 +14,7 @@ use crate::redis_store;
 use crate::sticker_memory::{
     StickerScope, extract_stickers, has_reply, known_labels, quoted_message_context,
     stickers_for_teaching, teach, teaching_label, with_quoted_context, with_sticker_context,
+    with_unknown_sticker_context,
 };
 use crate::vision::{
     ImageRequestScope, VisionImage, consume_pending_image_request, extract_image_attachments,
@@ -278,7 +279,11 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
         !images.is_empty(),
     )
     .await;
-    if message.trim().is_empty() && !images.is_empty() && !vision_command && !pending_image_request
+    if message.trim().is_empty()
+        && (!images.is_empty() || !stickers.is_empty())
+        && !vision_command
+        && !pending_image_request
+        && !addressed_to_bot
     {
         println!("[INFO] 收到群聊纯图片状态，保持静默 (群组: {})", group_id);
         return;
@@ -296,6 +301,7 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
         quoted_message: quoted.as_ref().map(|value| value.content.clone()),
         has_images: !images.is_empty(),
         quoted_has_images: !quoted_images.is_empty(),
+        has_recent_images: false,
         explicit_vision_command: vision_command,
         pending_image_request,
         addressed_to_bot,
@@ -321,6 +327,14 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
         return;
     }
     let mut vision_requested = understanding.should_understand_image(&understanding_request);
+    if addressed_to_bot
+        && !images.is_empty()
+        && labels.is_empty()
+        && !vision_command
+        && !pending_image_request
+    {
+        vision_requested = true;
+    }
     if vision_command && images.is_empty() {
         send_tracked_group_message(
             &bot,
@@ -342,7 +356,11 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
     } else {
         message.to_string()
     };
-    let current_message = with_sticker_context(&text_message, &labels);
+    let current_message = if images.is_empty() && labels.is_empty() && !stickers.is_empty() {
+        with_unknown_sticker_context(&text_message, stickers.len())
+    } else {
+        with_sticker_context(&text_message, &labels)
+    };
     let model_message = quoted.as_ref().map_or(current_message.clone(), |quoted| {
         with_quoted_context(&current_message, quoted)
     });
@@ -405,6 +423,7 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
         quoted_message: quoted.as_ref().map(|value| value.content.clone()),
         has_images: !images.is_empty(),
         quoted_has_images: !quoted_images.is_empty(),
+        has_recent_images: false,
         explicit_vision_command: false,
         pending_image_request: batch_vision_requested,
         addressed_to_bot,
@@ -440,6 +459,7 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
     vision_requested = understanding.should_understand_image(&batch_request);
     if intent_text.trim().is_empty()
         && !vision_requested
+        && model_message.trim().is_empty()
         && (!images.is_empty() || !stickers.is_empty())
     {
         println!("[INFO] 收到群聊纯图片状态，保持静默 (群组: {})", group_id);

@@ -20,6 +20,14 @@ pub(crate) enum SemanticImageIntent {
     Understand,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum ImageReferenceIntent {
+    #[default]
+    None,
+    Recent,
+    Described,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct UnderstandingRequest {
     pub(crate) message: String,
@@ -27,6 +35,7 @@ pub(crate) struct UnderstandingRequest {
     pub(crate) quoted_message: Option<String>,
     pub(crate) has_images: bool,
     pub(crate) quoted_has_images: bool,
+    pub(crate) has_recent_images: bool,
     pub(crate) explicit_vision_command: bool,
     pub(crate) pending_image_request: bool,
     pub(crate) addressed_to_bot: bool,
@@ -41,6 +50,7 @@ impl UnderstandingRequest {
             quoted_message: None,
             has_images: false,
             quoted_has_images: false,
+            has_recent_images: false,
             explicit_vision_command: false,
             pending_image_request: false,
             addressed_to_bot: false,
@@ -58,6 +68,7 @@ pub(crate) struct MessageUnderstanding {
     pub(crate) wants_stop: bool,
     pub(crate) requests_image: bool,
     pub(crate) image_intent: SemanticImageIntent,
+    pub(crate) image_reference: ImageReferenceIntent,
     pub(crate) conversation_relevant: bool,
     pub(crate) interjection_worthy: bool,
     pub(crate) gratitude: bool,
@@ -77,6 +88,7 @@ impl Default for MessageUnderstanding {
             wants_stop: false,
             requests_image: false,
             image_intent: SemanticImageIntent::Social,
+            image_reference: ImageReferenceIntent::None,
             conversation_relevant: false,
             interjection_worthy: false,
             gratitude: false,
@@ -94,7 +106,13 @@ impl MessageUnderstanding {
             || request.pending_image_request
             || ((!request.message.trim().is_empty())
                 && (request.has_images || request.quoted_has_images)
-                && self.image_intent == SemanticImageIntent::Understand)
+                && matches!(
+                    self.image_intent,
+                    SemanticImageIntent::Conversational | SemanticImageIntent::Understand
+                ))
+            || ((!request.message.trim().is_empty())
+                && request.has_recent_images
+                && self.image_reference != ImageReferenceIntent::None)
     }
 
     pub(crate) fn memory_importance(&self) -> u8 {
@@ -145,6 +163,7 @@ struct RawUnderstanding {
     wants_stop: bool,
     requests_image: bool,
     image_intent: String,
+    image_reference: String,
     conversation_relevant: bool,
     interjection_worthy: bool,
     gratitude: bool,
@@ -172,6 +191,7 @@ pub(crate) async fn understand(request: UnderstandingRequest) -> MessageUndersta
   "wants_stop": false,
   "requests_image": false,
   "image_intent": "social|conversational|understand",
+  "image_reference": "none|recent|described",
   "conversation_relevant": false,
   "interjection_worthy": false,
   "gratitude": false,
@@ -186,6 +206,9 @@ pub(crate) async fn understand(request: UnderstandingRequest) -> MessageUndersta
 - wants_stop：用户希望停止当前正在生成或发送的回复。
 - requests_image：用户希望对方提供、发送或补发图片。
 - image_intent：图片只是社交表达、结合文字自然回应，还是需要真正查看图片内容。
+- image_reference：当前文字是否在回指之前发过的图片。recent 表示“那张图/刚才的截图”等泛指，described 表示“有猫的那张/带红色按钮的截图”等按内容寻找；没有回指时填 none。
+  当前消息已直接附图或明确引用图片时，优先理解当前图片；只有没有当前图片时，才按历史图片指代寻找。
+  在确有近期图片时，“我说的是穿红衣服那个”这类省略了“图片”二字的表达，也可以是 described。
 - conversation_relevant：在已有对话窗口中，这条消息是否自然地接着当前话题。
 - interjection_worthy：没有被点名时，是否有自然、具体、能增加交流价值的接话空间。
 - interests、personality_traits、topics：只有从整体语义中有足够把握时才填写，最多各 6 项。
@@ -218,6 +241,7 @@ fn build_prompt(request: &UnderstandingRequest) -> String {
         "quoted_message": quoted,
         "has_images": request.has_images,
         "quoted_has_images": request.quoted_has_images,
+        "has_recent_images": request.has_recent_images,
         "explicit_vision_command": request.explicit_vision_command,
         "pending_image_request": request.pending_image_request,
         "addressed_to_bot": request.addressed_to_bot,
@@ -245,6 +269,7 @@ fn parse_understanding(content: &str, request: &UnderstandingRequest) -> Message
         wants_stop: raw.wants_stop,
         requests_image: raw.requests_image,
         image_intent: normalize_image_intent(&raw.image_intent),
+        image_reference: normalize_image_reference(&raw.image_reference),
         conversation_relevant: raw.conversation_relevant,
         interjection_worthy: raw.interjection_worthy,
         gratitude: raw.gratitude,
@@ -259,7 +284,11 @@ fn parse_understanding(content: &str, request: &UnderstandingRequest) -> Message
     if request.explicit_vision_command || request.pending_image_request {
         understanding.image_intent = SemanticImageIntent::Understand;
     }
-    if !request.has_images && !request.quoted_has_images {
+    if !request.has_images
+        && !request.quoted_has_images
+        && !(request.has_recent_images
+            && understanding.image_reference != ImageReferenceIntent::None)
+    {
         understanding.image_intent = SemanticImageIntent::Social;
     }
     understanding
@@ -288,6 +317,14 @@ fn normalize_image_intent(value: &str) -> SemanticImageIntent {
     }
 }
 
+fn normalize_image_reference(value: &str) -> ImageReferenceIntent {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "recent" => ImageReferenceIntent::Recent,
+        "described" => ImageReferenceIntent::Described,
+        _ => ImageReferenceIntent::None,
+    }
+}
+
 fn normalize_list(values: Vec<String>) -> Vec<String> {
     let mut normalized = Vec::new();
     for value in values {
@@ -310,7 +347,8 @@ fn truncate(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        MessageUnderstanding, SemanticImageIntent, UnderstandingRequest, parse_understanding,
+        ImageReferenceIntent, MessageUnderstanding, SemanticImageIntent, UnderstandingRequest,
+        parse_understanding,
     };
 
     #[test]
@@ -351,6 +389,31 @@ mod tests {
         request.has_images = true;
         let result = parse_understanding(r#"{"image_intent":"understand"}"#, &request);
         assert!(result.should_understand_image(&request));
+    }
+
+    #[test]
+    fn recent_image_reference_can_trigger_vision_without_a_current_attachment() {
+        let mut request = UnderstandingRequest::text("刚才那张图怎么样？", "private_chat");
+        request.has_recent_images = true;
+        let result = parse_understanding(
+            r#"{"image_intent":"conversational","image_reference":"recent"}"#,
+            &request,
+        );
+        assert_eq!(result.image_reference, ImageReferenceIntent::Recent);
+        assert_eq!(result.image_intent, SemanticImageIntent::Conversational);
+        assert!(result.should_understand_image(&request));
+    }
+
+    #[test]
+    fn historical_reference_without_candidates_does_not_trigger_vision() {
+        let request = UnderstandingRequest::text("有猫的那张", "private_chat");
+        let result = parse_understanding(
+            r#"{"image_intent":"understand","image_reference":"described"}"#,
+            &request,
+        );
+        assert_eq!(result.image_reference, ImageReferenceIntent::Described);
+        assert_eq!(result.image_intent, SemanticImageIntent::Social);
+        assert!(!result.should_understand_image(&request));
     }
 
     #[test]

@@ -19,6 +19,7 @@ use std::sync::{
 pub mod config;
 // 核心模型处理模块
 mod model;
+mod private_image_memory;
 mod redis_store;
 mod vision;
 mod vision_router;

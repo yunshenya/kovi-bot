@@ -1,6 +1,7 @@
 //! 用户撤回消息与芸汐回复的生命周期联动。
 
 use super::interrupt::{ReplyScope, ReplyTicket, interrupt};
+use crate::private_image_memory::forget_private_message_images;
 use crate::redis_store;
 use kovi::RuntimeBot;
 use kovi::bot::runtimebot::CanSendApi;
@@ -289,6 +290,9 @@ pub(crate) async fn handle_recalled_message(
     message_id: i32,
     bot: Arc<RuntimeBot>,
 ) {
+    if let ReplyScope::Private(user_id) = scope {
+        forget_private_message_images(user_id, message_id).await;
+    }
     let (ticket, sent_message_ids, redis_message_ids) = {
         let mut lifecycles = REPLY_LIFECYCLES.lock().await;
         prune_lifecycles(&mut lifecycles);
