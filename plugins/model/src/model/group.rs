@@ -69,18 +69,20 @@ struct PendingWindowMessage {
 struct Addressing {
     at_self: bool,
     reply_to_self: bool,
+    named_in_text: bool,
 }
 
 impl Addressing {
-    fn detect(message: &Message, self_id: i64, replied_sender_id: Option<i64>) -> Self {
+    fn detect(message: &Message, text: &str, self_id: i64, replied_sender_id: Option<i64>) -> Self {
         Self {
             at_self: message_at_self(message, self_id),
             reply_to_self: replied_sender_id == Some(self_id),
+            named_in_text: text_mentions_bot(text),
         }
     }
 
     fn directly_addressed(self) -> bool {
-        self.at_self || self.reply_to_self
+        self.at_self || self.reply_to_self || self.named_in_text
     }
 }
 
@@ -263,6 +265,7 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
     let images = merge_image_attachments(&current_images, quoted_images);
     let addressing = Addressing::detect(
         &event.message,
+        message,
         event.self_id,
         quoted.as_ref().and_then(|quoted| quoted.sender_id),
     );
@@ -1138,6 +1141,10 @@ fn message_at_self(message: &Message, self_id: i64) -> bool {
     })
 }
 
+fn text_mentions_bot(message: &str) -> bool {
+    ["芸汐", "云汐"].iter().any(|name| message.contains(name))
+}
+
 async fn update_group_profile(group_id: i64, user_id: i64, understanding: &MessageUnderstanding) {
     let mut profile = MEMORY_MANAGER
         .get_group_profile(group_id)
@@ -1200,7 +1207,7 @@ mod tests {
         complete_interjection_attempt, conversation_message_is_relevant, decision_budget_available,
         has_active_conversation_window, message_at_self, normalized_sender_name,
         prune_decision_attempts, roll_conversation_window, should_defer_active_window_message,
-        suppress_direct_trigger,
+        suppress_direct_trigger, text_mentions_bot,
     };
     use crate::model::utils::{is_group_admin_command, is_restricted_command};
     use kovi::Message;
@@ -1237,17 +1244,33 @@ mod tests {
         let at_self = Message::from(vec![Segment::new("at", json!({"qq": "123456"}))]);
         let plain = Message::from("继续说");
 
-        let mention = Addressing::detect(&at_self, self_id, None);
+        let mention = Addressing::detect(&at_self, "在吗", self_id, None);
         assert!(mention.at_self);
         assert!(!mention.reply_to_self);
+        assert!(!mention.named_in_text);
         assert!(mention.directly_addressed());
 
-        let reply = Addressing::detect(&plain, self_id, Some(self_id));
+        let reply = Addressing::detect(&plain, "继续说", self_id, Some(self_id));
         assert!(!reply.at_self);
         assert!(reply.reply_to_self);
+        assert!(!reply.named_in_text);
         assert!(reply.directly_addressed());
 
-        assert!(!Addressing::detect(&plain, self_id, Some(654_321)).directly_addressed());
+        let named = Addressing::detect(&plain, "芸汐你在吗", self_id, None);
+        assert!(!named.at_self);
+        assert!(!named.reply_to_self);
+        assert!(named.named_in_text);
+        assert!(named.directly_addressed());
+
+        assert!(!Addressing::detect(&plain, "继续说", self_id, Some(654_321)).directly_addressed());
+    }
+
+    #[test]
+    fn bot_name_aliases_are_direct_text_mentions() {
+        assert!(text_mentions_bot("芸汐你在吗"));
+        assert!(text_mentions_bot("云汐，看看这个"));
+        assert!(text_mentions_bot("你家芸汐好像有点安静"));
+        assert!(!text_mentions_bot("今天群里有点安静"));
     }
 
     #[test]
