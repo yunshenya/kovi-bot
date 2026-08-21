@@ -6,6 +6,7 @@ mod private;
 mod recall;
 mod reply;
 mod thinking;
+pub(crate) mod tool_access;
 pub(crate) mod utils;
 
 pub use crate::model::group::group_message_event;

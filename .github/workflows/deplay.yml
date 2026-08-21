@@ -117,12 +117,14 @@ jobs:
           VISION_API_TOKEN: ${{ secrets.VISION_API_TOKEN }}
           NAPCAT_ACCESS_TOKEN: ${{ secrets.NAPCAT_ACCESS_TOKEN }}
           POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          BRAVE_SEARCH_API_KEY: ${{ secrets.BRAVE_SEARCH_API_KEY }}
           REDIS_URL: ${{ secrets.REDIS_URL }}
         run: |
           {
             printf 'BOT_API_TOKEN=%s\n' "$BOT_API_TOKEN"
             printf 'OPENAI_API_KEY=%s\n' "$OPENAI_API_KEY"
             printf 'VISION_API_TOKEN=%s\n' "$VISION_API_TOKEN"
+            printf 'BRAVE_SEARCH_API_KEY=%s\n' "$BRAVE_SEARCH_API_KEY"
             printf '%s\n' 'VISION_API_URL=https://codex666ai.com'
             printf '%s\n' 'VISION_WIRE_API=responses'
             printf '%s\n' 'VISION_MODEL_NAME=gpt-5.5'

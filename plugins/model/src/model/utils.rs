@@ -9,7 +9,7 @@
 //! - 系统状态监控
 
 use super::interrupt::{ReplyTicket, finish, is_current, mark_active};
-use super::memory_query::{interruptible_model_call, params_model_with_memory_access};
+use super::memory_query::{interruptible_model_call, params_model_with_tool_access};
 use super::recall::{
     RecentBotMessage, begin_reply, finish_reply, recall_bot_messages, record_bot_message,
     send_tracked_group_message,
@@ -272,7 +272,7 @@ pub async fn control_model(
         super::interrupt::ReplyScope::Group(group_id),
     )
     .await;
-    let response = params_model_with_memory_access(
+    let response = params_model_with_tool_access(
         &mut request_messages,
         group_id,
         "group_chat",
@@ -1398,7 +1398,7 @@ async fn private_chat_inner(
         super::interrupt::ReplyScope::Private(user_id),
     )
     .await;
-    let bot_content = params_model_with_memory_access(
+    let bot_content = params_model_with_tool_access(
         &mut request_messages,
         user_id,
         "private_chat",

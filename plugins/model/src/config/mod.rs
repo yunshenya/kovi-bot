@@ -29,7 +29,10 @@ mod mood;
 mod proactive;
 mod prompt;
 mod server;
+mod tools;
 mod topic;
+
+pub use tools::{McpServerConfig, ToolsConfig};
 
 /// 全局配置实例
 ///
@@ -63,6 +66,8 @@ pub struct ModelConfig {
     mood: MoodConfig,
     /// 话题去重配置
     topic: TopicConfig,
+    /// 模型可自主调用的受限工具。
+    tools: ToolsConfig,
 }
 
 impl ModelConfig {
@@ -101,6 +106,7 @@ impl ModelConfig {
         self.message_batch.validate()?;
         self.mood.validate()?;
         self.topic.validate()?;
+        self.tools.validate()?;
 
         println!("[INFO] 配置验证通过");
         Ok(())
@@ -136,6 +142,10 @@ impl ModelConfig {
 
     pub fn topic(&self) -> &TopicConfig {
         &self.topic
+    }
+
+    pub fn tools(&self) -> &ToolsConfig {
+        &self.tools
     }
 
     fn create_default_config_file(config_path: &Path) -> anyhow::Result<()> {

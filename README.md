@@ -49,6 +49,7 @@ secure = false
 - `OPENAI_API_KEY`：GPT 主模型 Token
 - `BOT_API_TOKEN`：切换到 DeepSeek 主模型时使用的 Token
 - `VISION_API_TOKEN`：可选，切换到 DeepSeek 时使用的独立视觉模型 Token
+- `BRAVE_SEARCH_API_KEY`：可选，网页搜索优先使用 Brave Search；未配置或 API 不可用时使用 Bing、DuckDuckGo HTML 兜底
 - `NAPCAT_ACCESS_TOKEN`：NapCat WebSocket 服务端 Token
 - `POSTGRES_PASSWORD`：服务器本机 `postgres` 用户的数据库密码
 - `REDIS_URL`：可选，Redis 连接地址；不配置时部署默认使用 `redis://127.0.0.1:6379/0`
@@ -104,6 +105,26 @@ autonomous_query_enabled = true
 autonomous_query_max_rounds = 2
 autonomous_query_max_results = 8
 autonomous_query_max_days = 3650
+
+[tools]
+enabled = true
+max_rounds = 2
+timeout_secs = 15
+max_result_chars = 12000
+web_search_enabled = true
+web_fetch_enabled = true
+web_search_max_results = 5
+web_fetch_max_chars = 12000
+
+# MCP 服务默认不配置。只有明确列入 allowed_tools 的工具才会暴露给芸汐。
+# [[tools.mcp_servers]]
+# name = "notes"
+# command = "/usr/local/bin/your-read-only-mcp-server"
+# args = ["--stdio"]
+# cwd = "/home/ubuntu/kovi-bot"
+# inherit_env = ["NOTES_API_TOKEN"]
+# allowed_tools = ["search_notes", "read_note"]
+# read_only = true
 
 [message_batch]
 enabled = true
@@ -223,6 +244,20 @@ export VISION_REQUIRES_AUTH="false"
 `VISION_WIRE_API=responses` 时，`VISION_API_URL` 可以填写服务根地址，程序会补上 `/responses`；如果服务实际要求 `/v1/responses`，直接填写完整地址即可。若使用旧式 Chat Completions 接口，将其设为 `chat_completions`，程序会发送 `messages[].content` 中的 `image_url` 图片输入。
 
 视觉接口只在非视觉主模型收到图片时启用；GPT-5.5 主模型会完全跳过这些 `VISION_*` 配置。
+
+## 工具与 MCP
+
+芸汐可以在确实需要时自主调用受限工具：
+
+- `time.now`：获取当前时间，支持 `Asia/Shanghai`、`Asia/Tokyo`、`UTC` 等 IANA 时区。
+- `memory.search`：查询当前私聊对象或当前群的长期记忆，范围由程序强制决定。
+- `web.search`：搜索公开网页；配置 `BRAVE_SEARCH_API_KEY` 时优先使用 Brave Search，失败后依次使用 Bing、DuckDuckGo HTML 兜底。
+- `web.fetch`：读取公开网页正文，只允许 HTTP/HTTPS，拒绝本机、内网 IP、内网 DNS 解析和自动重定向。
+- `mcp.<服务名>.<工具名>`：来自配置白名单的 MCP 工具。
+
+模型最多连续调用有限轮次，工具参数、超时、结果长度和工具名称都由程序校验。工具返回内容会被标记为资料，不会被当成新的系统指令。MCP 目前使用 stdio 子进程传输；服务必须在 `tools.mcp_servers` 中配置，工具必须列入 `allowed_tools`。`read_only = true` 时会拒绝 MCP 明确标记为破坏性或名称带常见写操作动词的工具。MCP 子进程只继承 `PATH` 和 `inherit_env` 明确列出的变量，不会拿到主进程的整套密钥。修改 `bot.conf.toml` 后需要重启机器人。
+
+部署时可在 GitHub Actions Secrets 中增加 `BRAVE_SEARCH_API_KEY`。不配置也能搜索，但公共搜索服务可能有频率限制。
 
 群聊中可以使用以下方式触发：
 

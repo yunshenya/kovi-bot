@@ -74,6 +74,13 @@ async fn main() {
     // Redis 只承载可丢失的运行态；连接失败时各模块会继续使用本地兜底。
     redis_store::initialize().await;
 
+    if let Err(error) = model::tool_access::initialize().await {
+        eprintln!(
+            "[ERROR] 模型工具初始化失败，工具调用功能暂不可用: {}",
+            error
+        );
+    }
+
     // 注册聊天功能宏，定义消息处理函数映射
     register_chat_function! {
         (group_message, group_message_event),

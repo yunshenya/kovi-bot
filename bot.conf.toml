@@ -71,3 +71,13 @@ natural_drift_check_secs = 1800
 
 [topic]
 recent_topic_cooldown_secs = 604800
+
+[tools]
+enabled = true
+max_rounds = 2
+timeout_secs = 15
+max_result_chars = 12000
+web_search_enabled = true
+web_fetch_enabled = true
+web_search_max_results = 5
+web_fetch_max_chars = 12000
