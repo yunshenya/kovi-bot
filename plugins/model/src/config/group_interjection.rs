@@ -14,7 +14,7 @@ pub struct GroupInterjectionConfig {
     cooldown_secs: u64,
     /// 到达抽样时机后，实际调用模型接话的概率（0-100）。
     response_probability_percent: u8,
-    /// 只有达到该长度的消息才会作为候选，过滤“嗯”“哈哈”等短消息。
+    /// 只有达到该长度的消息才会作为候选，减少过短消息触发语义判断。
     min_message_chars: usize,
     /// 两次未点名模型判断之间的最短间隔（秒）。
     decision_cooldown_secs: u64,
@@ -28,8 +28,6 @@ pub struct GroupInterjectionConfig {
     conversation_window_secs: u64,
     /// 机器人刚发言后，允许新成员自然接话并加入窗口的时间（秒）。
     conversation_open_floor_secs: u64,
-    /// 判断同一句点名为重复刷屏的时间窗口（秒）。
-    direct_repeat_window_secs: u64,
     /// 连续刷屏后暂停处理该成员直接点名的时间（秒）。
     direct_spam_cooldown_secs: u64,
     /// 高频点名计数窗口（秒）。
@@ -83,10 +81,6 @@ impl GroupInterjectionConfig {
         self.conversation_open_floor_secs
     }
 
-    pub fn direct_repeat_window_secs(&self) -> u64 {
-        self.direct_repeat_window_secs
-    }
-
     pub fn direct_spam_cooldown_secs(&self) -> u64 {
         self.direct_spam_cooldown_secs
     }
@@ -122,10 +116,7 @@ impl GroupInterjectionConfig {
         if self.conversation_window_secs == 0 || self.conversation_open_floor_secs == 0 {
             return Err(anyhow::anyhow!("群聊接话对话窗口必须大于0秒"));
         }
-        if self.direct_repeat_window_secs == 0
-            || self.direct_spam_cooldown_secs == 0
-            || self.direct_rate_window_secs == 0
-        {
+        if self.direct_spam_cooldown_secs == 0 || self.direct_rate_window_secs == 0 {
             return Err(anyhow::anyhow!("群聊防刷时间配置必须大于0秒"));
         }
         if self.direct_rate_limit < 2 {
@@ -149,7 +140,6 @@ impl Default for GroupInterjectionConfig {
             interjection_max_output_tokens: 240,
             conversation_window_secs: 180,
             conversation_open_floor_secs: 45,
-            direct_repeat_window_secs: 120,
             direct_spam_cooldown_secs: 600,
             direct_rate_window_secs: 60,
             direct_rate_limit: 4,

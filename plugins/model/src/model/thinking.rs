@@ -189,26 +189,6 @@ fn estimate_thinking(
     } else if history_len > 22 {
         score = score.saturating_add(1);
     }
-    if [
-        "为什么",
-        "怎么解决",
-        "分析",
-        "解释",
-        "区别",
-        "步骤",
-        "原因",
-        "代码",
-        "报错",
-        "论文",
-        "总结",
-        "详细",
-    ]
-    .iter()
-    .any(|keyword| text.contains(keyword))
-    {
-        score = score.saturating_add(2);
-    }
-
     let kind = if image_count > 0 {
         ThinkingKind::Image
     } else if history_len > 36 {

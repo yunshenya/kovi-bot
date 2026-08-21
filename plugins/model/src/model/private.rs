@@ -1,18 +1,18 @@
 use crate::model::coalesce::{MessageCoalescer, MessagePart};
-use crate::model::interrupt::{ReplyScope, interrupt, is_active, is_explicit_stop_message};
+use crate::model::interrupt::{ReplyScope, interrupt, is_active};
 use crate::model::recall::{has_recalled_messages, send_tracked_private_message};
 use crate::model::reply::record_reply_target;
+use crate::model::semantic::{MessageUnderstanding, UnderstandingRequest, understand};
 use crate::model::utils::{
-    is_bot_admin, is_group_admin_command, is_restricted_command, private_chat, requests_no_reply,
+    is_bot_admin, is_group_admin_command, is_restricted_command, private_chat,
 };
 use crate::sticker_memory::{
     StickerScope, extract_stickers, has_reply, known_labels, quoted_message_context,
     stickers_for_teaching, teach, teaching_label, with_quoted_context, with_sticker_context,
 };
 use crate::vision::{
-    ImageIntent, ImageRequestScope, VisionImage, classify_image_intent,
-    consume_pending_image_request, default_vision_prompt, extract_image_attachments,
-    is_vision_command, merge_image_attachments, message_requests_image, resolve_image_urls,
+    ImageRequestScope, VisionImage, consume_pending_image_request, default_vision_prompt,
+    extract_image_attachments, is_vision_command, merge_image_attachments, resolve_image_urls,
     strip_vision_command, with_social_image_context,
 };
 use kovi::RuntimeBot;
@@ -28,6 +28,7 @@ struct PendingPrivateMessage {
     message: String,
     vision_images: Vec<VisionImage>,
     message_ids: Vec<i32>,
+    understanding: MessageUnderstanding,
 }
 
 /// 当前私聊回复期间只保留一条待处理消息，避免连续发送让模型请求一直被取消。
@@ -58,21 +59,6 @@ pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<Runtime
         &event.human_text,
     )
     .await;
-    let explicit_stop = is_explicit_stop_message(message);
-    let asks_for_silence = explicit_stop || requests_no_reply(message);
-    let can_interrupt = asks_for_silence || vision_command;
-    let reply_ticket = if can_interrupt {
-        Some(interrupt(ReplyScope::Private(user_id)).await)
-    } else {
-        None
-    };
-
-    if asks_for_silence {
-        PRIVATE_MESSAGE_BATCHES.cancel(user_id).await;
-        println!("[INFO] 私聊用户打断回复 (用户: {})", user_id);
-        return;
-    }
-
     if let Some(label) = teaching_label(message) {
         match stickers_for_teaching(&event.message, &bot).await {
             Ok(teaching_stickers) if !teaching_stickers.is_empty() => {
@@ -124,12 +110,6 @@ pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<Runtime
         return;
     }
 
-    if requests_no_reply(message) {
-        PRIVATE_MESSAGE_BATCHES.cancel(user_id).await;
-        println!("[INFO] 私聊明确要求不回复 (用户: {})", user_id);
-        return;
-    }
-
     let sticker_scope = StickerScope::Private(user_id);
     let labels = match known_labels(&stickers, sticker_scope).await {
         Ok(labels) => labels,
@@ -162,22 +142,38 @@ pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<Runtime
         .map(|quoted| quoted.images.as_slice())
         .unwrap_or_default();
     let images = merge_image_attachments(&current_images, quoted_images);
-    let quoted_message_requests_image = quoted
-        .as_ref()
-        .is_some_and(|quoted| message_requests_image(&quoted.content));
     let pending_image_request =
         consume_pending_image_request(ImageRequestScope::Private(user_id), !images.is_empty())
             .await;
-    let image_intent = classify_image_intent(
-        message,
-        !images.is_empty(),
-        vision_command,
-        !quoted_images.is_empty() && !message.trim().is_empty(),
-        quoted_message_requests_image,
+    let understanding_request = UnderstandingRequest {
+        message: message.to_string(),
+        context: "private_chat".to_string(),
+        quoted_message: quoted.as_ref().map(|value| value.content.clone()),
+        has_images: !images.is_empty(),
+        quoted_has_images: !quoted_images.is_empty(),
+        explicit_vision_command: vision_command,
         pending_image_request,
-        true,
-    );
-    let vision_requested = image_intent == ImageIntent::VisualUnderstand;
+        addressed_to_bot: false,
+        conversation_open: is_active(reply_scope).await,
+    };
+    let mut understanding = if message.trim_start().starts_with('#') {
+        MessageUnderstanding::default()
+    } else {
+        understand(understanding_request.clone()).await
+    };
+    let mut asks_for_silence = understanding.wants_no_reply || understanding.wants_stop;
+    let can_interrupt = asks_for_silence || vision_command;
+    let reply_ticket = if can_interrupt {
+        Some(interrupt(reply_scope).await)
+    } else {
+        None
+    };
+    if asks_for_silence {
+        PRIVATE_MESSAGE_BATCHES.cancel(user_id).await;
+        println!("[INFO] 私聊用户打断回复 (用户: {})", user_id);
+        return;
+    }
+    let mut vision_requested = understanding.should_understand_image(&understanding_request);
     if vision_command && images.is_empty() {
         send_tracked_private_message(
             &bot,
@@ -254,17 +250,32 @@ pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<Runtime
         );
         return;
     }
-    let batch_image_intent = classify_image_intent(
-        &intent_text,
-        !images.is_empty(),
-        false,
-        !quoted_images.is_empty() && !intent_text.trim().is_empty(),
-        false,
-        batch_vision_requested,
-        true,
-    );
-    let vision_requested =
-        batch_vision_requested || batch_image_intent == ImageIntent::VisualUnderstand;
+    let batch_request = UnderstandingRequest {
+        message: intent_text.clone(),
+        context: "private_chat_batch".to_string(),
+        quoted_message: quoted.as_ref().map(|value| value.content.clone()),
+        has_images: !images.is_empty(),
+        quoted_has_images: !quoted_images.is_empty(),
+        explicit_vision_command: false,
+        pending_image_request: batch_vision_requested,
+        addressed_to_bot: false,
+        conversation_open: is_active(reply_scope).await,
+    };
+    understanding = if intent_text.trim_start().starts_with('#') {
+        MessageUnderstanding::default()
+    } else {
+        understand(batch_request.clone()).await
+    };
+    asks_for_silence = plain_text && (understanding.wants_no_reply || understanding.wants_stop);
+    if asks_for_silence {
+        PRIVATE_MESSAGE_BATCHES.cancel(user_id).await;
+        println!(
+            "[INFO] 合并后的私聊消息请求停止当前回复 (用户: {})",
+            user_id
+        );
+        return;
+    }
+    vision_requested = understanding.should_understand_image(&batch_request);
     if intent_text.trim().is_empty()
         && !vision_requested
         && (!images.is_empty() || !stickers.is_empty())
@@ -304,10 +315,6 @@ pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<Runtime
     } else {
         Vec::new()
     };
-    if plain_text && requests_no_reply(&model_message) {
-        println!("[INFO] 合并后的私聊消息明确要求不回复 (用户: {})", user_id);
-        return;
-    }
     if should_defer_active_private_message(is_active(reply_scope).await, reply_ticket.is_some()) {
         println!("[INFO] 私聊已有回复进行中，排队新消息 (用户: {})", user_id);
         queue_pending_private_message(
@@ -316,6 +323,7 @@ pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<Runtime
             model_message,
             vision_images,
             source_message_ids,
+            understanding.clone(),
         )
         .await;
         return;
@@ -332,6 +340,7 @@ pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<Runtime
         reply_ticket,
         vision_images,
         source_message_ids,
+        understanding,
     )
     .await;
     drain_pending_private_messages(user_id, Arc::clone(&bot)).await;
@@ -347,6 +356,7 @@ async fn queue_pending_private_message(
     message: String,
     vision_images: Vec<VisionImage>,
     message_ids: Vec<i32>,
+    understanding: MessageUnderstanding,
 ) {
     let mut pending = PENDING_PRIVATE_MESSAGES.lock().await;
     if let Some(existing) = pending.get_mut(&user_id) {
@@ -354,6 +364,7 @@ async fn queue_pending_private_message(
         existing.message = message;
         merge_vision_images(&mut existing.vision_images, vision_images);
         merge_message_ids(&mut existing.message_ids, message_ids);
+        existing.understanding = understanding;
     } else {
         pending.insert(
             user_id,
@@ -362,6 +373,7 @@ async fn queue_pending_private_message(
                 message,
                 vision_images,
                 message_ids,
+                understanding,
             },
         );
     }
@@ -411,6 +423,7 @@ async fn drain_pending_private_messages(user_id: i64, bot: Arc<RuntimeBot>) {
             ticket,
             pending.vision_images,
             pending.message_ids,
+            pending.understanding,
         )
         .await;
     }

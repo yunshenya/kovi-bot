@@ -35,7 +35,6 @@ decision_rate_limit = 3
 interjection_max_output_tokens = 240
 conversation_window_secs = 180
 conversation_open_floor_secs = 45
-direct_repeat_window_secs = 120
 direct_spam_cooldown_secs = 600
 direct_rate_window_secs = 60
 direct_rate_limit = 4

@@ -7,6 +7,7 @@
 //! - 话题分类和标签系统
 
 use crate::memory::MemoryManager;
+use crate::model::utils::{BotMemory, Roles, params_model};
 use anyhow::Result;
 use chrono::{Local, Timelike};
 use rand::prelude::IndexedRandom;
@@ -217,10 +218,7 @@ impl TopicGenerator {
             unused_templates
         };
 
-        // 根据群组或用户的历史记录调整话题选择
-        let selected_template = self
-            .select_best_template(candidate_templates, group_id, user_id)
-            .await?;
+        let selected_template = self.select_best_template(candidate_templates);
 
         let topic = Topic {
             content: Self::adapt_topic_to_time(&selected_template.template),
@@ -242,57 +240,17 @@ impl TopicGenerator {
         }
     }
 
-    async fn select_best_template(
-        &self,
-        templates: Vec<&TopicTemplate>,
-        group_id: Option<i64>,
-        user_id: Option<i64>,
-    ) -> Result<TopicTemplate> {
-        // 如果有群组或用户信息，尝试选择更相关的话题
-        if let Some(gid) = group_id
-            && let Some(group_profile) = self.memory_manager.get_group_profile(gid).await
-        {
-            // 根据群组话题偏好选择
-            for template in &templates {
-                if group_profile
-                    .conversation_topics
-                    .iter()
-                    .any(|topic| template.tags.iter().any(|tag| tag.contains(topic)))
-                {
-                    return Ok((*template).clone());
-                }
-            }
-        }
-
-        if let Some(uid) = user_id
-            && let Some(user_profile) = self.memory_manager.get_user_profile(uid).await
-        {
-            // 根据用户兴趣选择
-            for template in &templates {
-                if user_profile
-                    .interests
-                    .iter()
-                    .any(|interest| template.tags.iter().any(|tag| tag.contains(interest)))
-                {
-                    return Ok((*template).clone());
-                }
-            }
-        }
-
-        // 如果没有偏好匹配，真正随机选择，避免同一秒固定命中同一模板。
+    fn select_best_template(&self, templates: Vec<&TopicTemplate>) -> TopicTemplate {
         let selected = templates
             .choose(&mut rand::rng())
             .expect("templates 已在调用前检查为非空");
-        Ok((**selected).clone())
+        (**selected).clone()
     }
 
     pub async fn generate_personalized_topic(&self, user_id: i64) -> Result<Option<Topic>> {
         // 获取用户档案
         if let Some(user_profile) = self.memory_manager.get_user_profile(user_id).await {
-            // 根据用户兴趣生成个性化话题
-            let personalized_topic = self
-                .generate_topic_based_on_interests(&user_profile)
-                .await?;
+            let personalized_topic = self.generate_topic_from_profile(&user_profile).await?;
             let recent_memories = self.memory_manager.get_recent_memories(0).await;
             if let Some(mut topic) = personalized_topic
                 && !Self::topic_used_recently(&recent_memories, &topic.content, None, Some(user_id))
@@ -325,37 +283,41 @@ impl TopicGenerator {
         })
     }
 
-    async fn generate_topic_based_on_interests(
+    async fn generate_topic_from_profile(
         &self,
         user_profile: &crate::memory::UserProfile,
     ) -> Result<Option<Topic>> {
-        let interests = &user_profile.interests;
-
-        // 根据用户兴趣生成话题
-        let interest_topics = vec![
-            ("游戏", "最近在玩什么游戏？有什么好玩的推荐吗？"),
-            ("音乐", "最近有什么好听的歌吗？"),
-            ("电影", "有什么好看的电影推荐吗？"),
-            ("读书", "最近在读什么书？有什么好书推荐吗？"),
-            ("运动", "最近有做什么运动吗？"),
-            ("美食", "最近有吃到什么好吃的东西吗？"),
-            ("旅行", "最近有去哪里玩吗？"),
-            ("学习", "最近在学什么新东西吗？"),
+        let mut messages = vec![
+            BotMemory {
+                role: Roles::System,
+                content: "你在帮芸汐想一条自然的主动聊天开场。根据用户档案和近期兴趣，写一句简短、具体、像熟人之间随口问起的话。不要总结档案，不要解释，不要使用固定模板，不要输出引号或舞台动作。".to_string(),
+            },
+            BotMemory {
+                role: Roles::User,
+                content: format!(
+                    "昵称：{}\n关系：{}/10\n兴趣：{}\n性格：{}",
+                    user_profile.nickname,
+                    user_profile.relationship_level,
+                    user_profile.interests.join("、"),
+                    user_profile.personality_traits.join("、"),
+                ),
+            },
         ];
-
-        for (interest, topic) in interest_topics {
-            if interests.iter().any(|i| i.contains(interest)) {
-                return Ok(Some(Topic {
-                    content: topic.to_string(),
-                    category: TopicCategory::Personal,
-                    mood_requirement: None,
-                    energy_level_required: 4,
-                    tags: vec![interest.to_string()],
-                }));
-            }
+        let content = params_model(&mut messages).await.content;
+        let content = content
+            .trim()
+            .trim_matches(|character| matches!(character, '"' | '“' | '”'))
+            .to_string();
+        if content.is_empty() || content.len() > 240 || content.starts_with("[[") {
+            return Ok(None);
         }
-
-        Ok(None)
+        Ok(Some(Topic {
+            content,
+            category: TopicCategory::Personal,
+            mood_requirement: None,
+            energy_level_required: 4,
+            tags: user_profile.interests.iter().take(6).cloned().collect(),
+        }))
     }
 
     pub async fn should_initiate_conversation(

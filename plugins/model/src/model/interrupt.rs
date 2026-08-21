@@ -89,42 +89,6 @@ pub(crate) async fn is_active(scope: ReplyScope) -> bool {
         .is_some_and(|state| state.active_generation.is_some())
 }
 
-pub(crate) fn is_explicit_stop_message(message: &str) -> bool {
-    let normalized = message
-        .trim()
-        .trim_matches(|character: char| {
-            character.is_whitespace()
-                || matches!(character, '。' | '！' | '!' | '，' | ',' | '？' | '?')
-        })
-        .split_whitespace()
-        .collect::<String>();
-    let normalized = normalized
-        .strip_prefix("芸汐")
-        .or_else(|| normalized.strip_prefix("云汐"))
-        .unwrap_or(&normalized)
-        .trim_matches(|character| matches!(character, '，' | ',' | '：' | ':'));
-    matches!(
-        normalized,
-        "停" | "等等"
-            | "等一下"
-            | "停一下"
-            | "先停一下"
-            | "先停"
-            | "暂停"
-            | "打住"
-            | "别说了"
-            | "先别说了"
-            | "别讲了"
-            | "别回了"
-            | "不要回了"
-            | "不用再回了"
-            | "不用说了"
-            | "不要再说了"
-            | "算了"
-            | "先这样吧"
-    )
-}
-
 fn prune_states(states: &mut HashMap<ReplyScope, ReplyState>) {
     if states.len() <= 2_048 {
         return;
@@ -137,9 +101,7 @@ fn prune_states(states: &mut HashMap<ReplyScope, ReplyState>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        ReplyScope, finish, interrupt, is_active, is_current, is_explicit_stop_message, mark_active,
-    };
+    use super::{ReplyScope, finish, interrupt, is_active, is_current, mark_active};
 
     #[test]
     fn a_new_generation_invalidates_the_old_reply() {
@@ -170,14 +132,5 @@ mod tests {
                 finish(new).await;
                 assert!(!is_active(scope).await);
             });
-    }
-
-    #[test]
-    fn explicit_stop_phrases_are_local_and_exact() {
-        assert!(is_explicit_stop_message("等等！"));
-        assert!(is_explicit_stop_message("芸汐，先别说了"));
-        assert!(is_explicit_stop_message("不用说了"));
-        assert!(!is_explicit_stop_message("等等我还有一句"));
-        assert!(!is_explicit_stop_message("算了以后怎么办"));
     }
 }

@@ -7,6 +7,7 @@
 //! - 话题生成和个性化聊天
 
 use crate::memory::MemoryManager;
+use crate::model::semantic::{MessageUnderstanding, UnderstandingRequest, understand};
 use crate::model::utils::{BotMemory, Roles, params_model};
 use crate::model::{send_tracked_group_message, send_tracked_private_message};
 use crate::mood_system::MOOD_SYSTEM;
@@ -385,23 +386,32 @@ impl ProactiveChatManager {
         message: &str,
         _is_group: bool,
     ) -> Result<()> {
-        // 更新用户档案
-        self.update_user_profile(user_id, message, _is_group)
-            .await?;
-
-        // 分析情绪变化
         let context = if _is_group {
             "group_chat"
         } else {
             "private_chat"
         };
+        let understanding = understand(UnderstandingRequest::text(message, context)).await;
+
+        // 更新用户档案
+        self.update_user_profile(user_id, _is_group, &understanding)
+            .await?;
+
+        // 分析情绪变化
         MOOD_SYSTEM
-            .analyze_and_update_mood(message, context)
+            .analyze_and_update_mood_with_understanding(message, context, &understanding)
             .await?;
 
         // 记录对话记忆
+        let memory_tags = understanding.memory_tags();
         self.memory_manager
-            .add_conversation_memory(user_id, message, context)
+            .add_conversation_memory_with_hints(
+                user_id,
+                message,
+                context,
+                Some(understanding.memory_importance()),
+                &memory_tags,
+            )
             .await?;
 
         Ok(())
@@ -410,8 +420,8 @@ impl ProactiveChatManager {
     async fn update_user_profile(
         &self,
         user_id: i64,
-        message: &str,
         _is_group: bool,
+        understanding: &MessageUnderstanding,
     ) -> Result<()> {
         let mut profile = self
             .memory_manager
@@ -436,18 +446,16 @@ impl ProactiveChatManager {
             profile.last_private_interaction = Some(Local::now());
         }
 
-        // 根据对话内容更新关系等级
-        if message.contains("谢谢") || message.contains("感谢") {
+        if understanding.gratitude {
             profile.relationship_level = (profile.relationship_level + 1).min(10);
         }
 
-        // 提取兴趣关键词
-        let interests = self.extract_interests_from_message(message);
-        for interest in interests {
-            if !profile.interests.contains(&interest) {
-                profile.interests.push(interest);
+        for interest in &understanding.interests {
+            if !profile.interests.contains(interest) {
+                profile.interests.push(interest.clone());
             }
         }
+        profile.interests.truncate(20);
 
         // 更新用户档案
         self.memory_manager
@@ -455,33 +463,6 @@ impl ProactiveChatManager {
             .await?;
 
         Ok(())
-    }
-
-    fn extract_interests_from_message(&self, message: &str) -> Vec<String> {
-        let mut interests = Vec::new();
-        let message_lower = message.to_lowercase();
-
-        let interest_keywords = [
-            ("游戏", vec!["游戏", "打游戏", "玩", "lol", "王者", "吃鸡"]),
-            ("音乐", vec!["音乐", "歌", "听歌", "唱歌", "演唱会"]),
-            ("电影", vec!["电影", "看片", "影院", "大片"]),
-            ("读书", vec!["书", "读书", "小说", "文学"]),
-            ("运动", vec!["运动", "跑步", "健身", "锻炼"]),
-            ("美食", vec!["吃", "美食", "餐厅", "料理", "做饭"]),
-            ("旅行", vec!["旅行", "旅游", "出去玩", "度假"]),
-            ("学习", vec!["学习", "考试", "课程", "知识"]),
-        ];
-
-        for (category, keywords) in &interest_keywords {
-            for keyword in keywords {
-                if message_lower.contains(keyword) {
-                    interests.push(category.to_string());
-                    break;
-                }
-            }
-        }
-
-        interests
     }
 }
 

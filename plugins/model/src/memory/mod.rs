@@ -1182,6 +1182,18 @@ impl MemoryManager {
         content: &str,
         context: &str,
     ) -> Result<()> {
+        self.add_conversation_memory_with_hints(user_id, content, context, None, &[])
+            .await
+    }
+
+    pub async fn add_conversation_memory_with_hints(
+        &self,
+        user_id: i64,
+        content: &str,
+        context: &str,
+        importance: Option<u8>,
+        tags: &[String],
+    ) -> Result<()> {
         let sequence = MEMORY_ID_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let memory = MemoryEntry {
             id: format!(
@@ -1193,8 +1205,10 @@ impl MemoryManager {
             content: content.to_string(),
             timestamp: Local::now(),
             memory_type: MemoryType::Conversation,
-            importance: self.calculate_importance(content),
-            tags: self.extract_tags(content),
+            importance: importance
+                .unwrap_or_else(|| default_conversation_importance(content, context))
+                .clamp(0, 10),
+            tags: normalize_memory_tags(tags),
             context: context.to_string(),
             subject_id: Some(user_id),
         };
@@ -1214,102 +1228,6 @@ impl MemoryManager {
             subject_id: None,
         })
         .await
-    }
-
-    /// 计算记忆内容的重要性评分
-    ///
-    /// 使用多维度分析算法评估记忆的重要性，考虑以下因素：
-    ///
-    /// ## 关键词权重
-    /// - **高重要性关键词** (+4分)：喜欢、讨厌、重要、秘密、梦想、目标、家人、朋友、爱、恨、害怕、担心
-    /// - **中等重要性关键词** (+2分)：工作、学习、游戏、电影、音乐、食物、旅行、运动、健康
-    /// - **低重要性关键词** (-1分)：天气、今天、昨天、明天、现在、刚才
-    ///
-    /// ## 内容特征
-    /// - **长度权重**：>150字符(+2分)，>100字符(+1分)
-    /// - **情感表达** (+2分)：开心、难过、生气、兴奋、害怕、担心、惊讶、失望
-    /// - **个人信息** (+1分)：我、我的、自己、个人、私人的
-    ///
-    /// # 参数
-    /// * `content` - 要分析的内容文本
-    ///
-    /// # 返回值
-    /// 重要性评分 (0-10)，10表示最重要
-    fn calculate_importance(&self, content: &str) -> u8 {
-        let mut importance: u8 = 3; // 基础重要性
-
-        // 检查关键词
-        let high_importance_keywords = [
-            "喜欢", "讨厌", "重要", "秘密", "梦想", "目标", "家人", "朋友", "爱", "恨", "害怕",
-            "担心",
-        ];
-        let medium_importance_keywords = [
-            "工作", "学习", "游戏", "电影", "音乐", "食物", "旅行", "运动", "健康",
-        ];
-        let low_importance_keywords = ["天气", "今天", "昨天", "明天", "现在", "刚才"];
-
-        for keyword in &high_importance_keywords {
-            if content.contains(keyword) {
-                importance += 4;
-            }
-        }
-
-        for keyword in &medium_importance_keywords {
-            if content.contains(keyword) {
-                importance += 2;
-            }
-        }
-
-        for keyword in &low_importance_keywords {
-            if content.contains(keyword) {
-                importance = importance.saturating_sub(1);
-            }
-        }
-
-        // 根据长度调整
-        let character_count = content.chars().count();
-        if character_count > 150 {
-            importance += 2;
-        } else if character_count > 100 {
-            importance += 1;
-        }
-
-        // 检查是否包含情感表达
-        let emotional_keywords = [
-            "开心", "难过", "生气", "兴奋", "害怕", "担心", "惊讶", "失望",
-        ];
-        for keyword in &emotional_keywords {
-            if content.contains(keyword) {
-                importance += 2;
-            }
-        }
-
-        // 检查是否包含个人信息
-        let personal_keywords = ["我", "我的", "自己", "个人", "私人的"];
-        for keyword in &personal_keywords {
-            if content.contains(keyword) {
-                importance += 1;
-            }
-        }
-
-        importance.min(10)
-    }
-
-    fn extract_tags(&self, content: &str) -> Vec<String> {
-        let mut tags = Vec::new();
-
-        // 简单的关键词提取
-        let common_tags = [
-            "游戏", "学习", "工作", "生活", "情感", "技术", "科技", "娱乐", "美食", "旅行", "运动",
-            "健康", "音乐", "电影", "读书", "家人", "朋友",
-        ];
-        for tag in &common_tags {
-            if content.contains(tag) {
-                tags.push(tag.to_string());
-            }
-        }
-
-        tags
     }
 
     async fn save_file_snapshot(&self) -> Result<()> {
@@ -1405,6 +1323,35 @@ impl MemoryManager {
             .filter(|id| !memories.contains_key(id))
             .collect())
     }
+}
+
+fn default_conversation_importance(content: &str, context: &str) -> u8 {
+    let mut score = if context == "group_observation" { 1 } else { 2 };
+    let character_count = content.chars().count();
+    if character_count > 160 {
+        score += 2;
+    } else if character_count > 80 {
+        score += 1;
+    }
+    if context.starts_with("proactive_") {
+        score += 1;
+    }
+    score.min(10)
+}
+
+fn normalize_memory_tags(tags: &[String]) -> Vec<String> {
+    let mut normalized = Vec::new();
+    for tag in tags {
+        let tag = tag.trim();
+        if tag.is_empty() || normalized.iter().any(|existing| existing == tag) {
+            continue;
+        }
+        normalized.push(tag.chars().take(48).collect());
+        if normalized.len() >= 8 {
+            break;
+        }
+    }
+    normalized
 }
 
 fn context_scope(context: &str) -> Option<&'static str> {

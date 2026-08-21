@@ -18,7 +18,8 @@ use super::reply::attach_reply_target_context;
 use super::thinking::{ThinkingDestination, ThinkingReporter, strip_thinking_notices};
 use crate::config;
 use crate::memory::{MEMORY_MANAGER, MoodEntry, UserProfile};
-use crate::mood_system::{MOOD_SYSTEM, Mood};
+use crate::model::semantic::MessageUnderstanding;
+use crate::mood_system::MOOD_SYSTEM;
 use crate::utils;
 use crate::vision::{
     ImageRequestScope, VisionImage, default_vision_prompt, extract_response_content,
@@ -183,6 +184,7 @@ pub async fn control_model(
     reply_ticket: ReplyTicket,
     max_output_tokens: Option<u32>,
     vision_images: Vec<VisionImage>,
+    understanding: MessageUnderstanding,
 ) -> bool {
     let message = if message.trim().is_empty() && !vision_images.is_empty() {
         default_vision_prompt()
@@ -191,18 +193,21 @@ pub async fn control_model(
     };
     // 分析情绪并更新
     if let Err(e) = MOOD_SYSTEM
-        .analyze_and_update_mood(message, "group_chat")
+        .analyze_and_update_mood_with_understanding(message, "group_chat", &understanding)
         .await
     {
         eprintln!("[ERROR] 群聊情绪分析失败 (群组: {}): {}", group_id, e);
     }
 
     // 记录对话记忆
+    let memory_tags = understanding.memory_tags();
     if let Err(e) = MEMORY_MANAGER
-        .add_conversation_memory(
+        .add_conversation_memory_with_hints(
             group_id,
             &format!("{}: {}", sender_identity, message),
             "group_chat",
+            Some(understanding.memory_importance()),
+            &memory_tags,
         )
         .await
     {
@@ -1157,6 +1162,7 @@ pub async fn silence(
     max_output_tokens: Option<u32>,
     vision_images: Vec<VisionImage>,
     source_message_ids: Vec<i32>,
+    understanding: MessageUnderstanding,
 ) -> bool {
     if message.trim() == "#禁言" {
         instance_is_ban().lock().await.insert(group_id, true);
@@ -1193,6 +1199,7 @@ pub async fn silence(
             reply_ticket,
             max_output_tokens,
             vision_images,
+            understanding,
         )
         .await;
         finish_reply(scope, reply_ticket).await;
@@ -1258,6 +1265,7 @@ fn format_adapter_status(data: &Value) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn private_chat(
     user_id: i64,
     message: &str,
@@ -1266,6 +1274,7 @@ pub async fn private_chat(
     reply_ticket: ReplyTicket,
     vision_images: Vec<VisionImage>,
     source_message_ids: Vec<i32>,
+    understanding: MessageUnderstanding,
 ) {
     if !mark_active(reply_ticket).await {
         return;
@@ -1282,6 +1291,7 @@ pub async fn private_chat(
         bot,
         reply_ticket,
         &vision_images,
+        &understanding,
     )
     .await;
     finish_reply(scope, reply_ticket).await;
@@ -1295,6 +1305,7 @@ async fn private_chat_inner(
     bot: Arc<RuntimeBot>,
     reply_ticket: ReplyTicket,
     vision_images: &[VisionImage],
+    understanding: &MessageUnderstanding,
 ) {
     let message = if message.trim().is_empty() && !vision_images.is_empty() {
         default_vision_prompt()
@@ -1302,23 +1313,22 @@ async fn private_chat_inner(
         message
     };
     // 分析情绪并更新
-    let detected_mood = match MOOD_SYSTEM
-        .analyze_and_update_mood(message, "private_chat")
+    if let Err(e) = MOOD_SYSTEM
+        .analyze_and_update_mood_with_understanding(message, "private_chat", understanding)
         .await
     {
-        Ok(mood) => Some(mood),
-        Err(e) => {
-            eprintln!("[ERROR] 私聊情绪分析失败 (用户: {}): {}", user_id, e);
-            None
-        }
-    };
+        eprintln!("[ERROR] 私聊情绪分析失败 (用户: {}): {}", user_id, e);
+    }
 
     // 记录对话记忆
+    let memory_tags = understanding.memory_tags();
     if let Err(e) = MEMORY_MANAGER
-        .add_conversation_memory(
+        .add_conversation_memory_with_hints(
             user_id,
             &format!("{}: {}", nickname, message),
             "private_chat",
+            Some(understanding.memory_importance()),
+            &memory_tags,
         )
         .await
     {
@@ -1326,7 +1336,7 @@ async fn private_chat_inner(
     }
 
     // 更新用户档案
-    update_user_profile_from_message(user_id, message, &nickname, true, detected_mood).await;
+    update_user_profile_from_message(user_id, message, &nickname, true, Some(understanding)).await;
 
     // 获取用户档案和个性化信息
     let user_profile = MEMORY_MANAGER.get_user_profile(user_id).await;
@@ -1479,39 +1489,6 @@ async fn private_chat_inner(
     limit_memory_size(&mut history);
 }
 
-/// 明确表示“这一条不用回复”的消息不交给模型，避免模型用客套话反而回复。
-pub(crate) fn requests_no_reply(message: &str) -> bool {
-    let text = message
-        .trim()
-        .trim_matches(|character: char| {
-            character.is_whitespace()
-                || matches!(character, '。' | '！' | '!' | '，' | ',' | '？' | '?')
-        })
-        .split_whitespace()
-        .collect::<String>();
-    matches!(
-        text.as_str(),
-        "别回复我这条消息"
-            | "不要回复我这条消息"
-            | "这条消息别回"
-            | "这条不用回"
-            | "这条别回"
-            | "不用回复这条"
-            | "不用回这条"
-            | "不用回复这条消息"
-            | "不用回这条消息"
-            | "不需要回复"
-            | "无需回复"
-            | "别回复"
-            | "不要回复"
-            | "不用回复"
-            | "不用回"
-    ) || ((text.contains("这条") || text.contains("本条"))
-        && ["别回", "不要回", "不用回", "无需回"]
-            .iter()
-            .any(|phrase| text.contains(phrase)))
-}
-
 fn generate_personalized_system_prompt(
     user_profile: &Option<crate::memory::UserProfile>,
     personality: &crate::memory::BotPersonality,
@@ -1555,18 +1532,9 @@ pub(crate) async fn learn_user_profile_from_message(
     message: &str,
     nickname: &str,
     is_private: bool,
+    understanding: &MessageUnderstanding,
 ) {
-    let detected_mood = MOOD_SYSTEM
-        .analyze_mood(
-            message,
-            if is_private {
-                "private_chat"
-            } else {
-                "group_chat"
-            },
-        )
-        .await;
-    update_user_profile_from_message(user_id, message, nickname, is_private, Some(detected_mood))
+    update_user_profile_from_message(user_id, message, nickname, is_private, Some(understanding))
         .await;
 }
 
@@ -1575,7 +1543,7 @@ async fn update_user_profile_from_message(
     message: &str,
     nickname: &str,
     is_private: bool,
-    detected_mood: Option<Mood>,
+    understanding: Option<&MessageUnderstanding>,
 ) {
     let mut profile = MEMORY_MANAGER
         .get_user_profile(user_id)
@@ -1612,31 +1580,34 @@ async fn update_user_profile_from_message(
         profile.relationship_level = 10;
     }
 
-    // 根据对话内容更新关系等级
-    if message.contains("谢谢") || message.contains("感谢") {
+    if understanding.is_some_and(|value| value.gratitude) {
         profile.relationship_level = (profile.relationship_level + 1).min(10);
     }
 
-    // 提取兴趣关键词
-    let interests = extract_interests_from_message(message);
-    for interest in interests {
-        if !profile.interests.contains(&interest) {
-            profile.interests.push(interest);
+    for interest in understanding
+        .into_iter()
+        .flat_map(|value| value.interests.iter())
+    {
+        if !profile.interests.contains(interest) {
+            profile.interests.push(interest.clone());
         }
     }
     profile.interests.truncate(20);
 
-    for personality_trait in extract_personality_traits(message) {
-        if !profile.personality_traits.contains(&personality_trait) {
-            profile.personality_traits.push(personality_trait);
+    for personality_trait in understanding
+        .into_iter()
+        .flat_map(|value| value.personality_traits.iter())
+    {
+        if !profile.personality_traits.contains(personality_trait) {
+            profile.personality_traits.push(personality_trait.clone());
         }
     }
     profile.personality_traits.truncate(20);
 
-    if let Some(mood) = detected_mood {
+    if let Some(understanding) = understanding {
         profile.mood_history.push(MoodEntry {
-            mood: mood.to_string(),
-            intensity: 5,
+            mood: understanding.mood.clone(),
+            intensity: understanding.mood_intensity,
             timestamp: Local::now(),
             trigger: message.chars().take(80).collect(),
         });
@@ -1651,48 +1622,6 @@ async fn update_user_profile_from_message(
     if let Err(e) = MEMORY_MANAGER.update_user_profile(user_id, profile).await {
         eprintln!("[ERROR] 更新用户档案失败 (用户: {}): {}", user_id, e);
     }
-}
-
-fn extract_interests_from_message(message: &str) -> Vec<String> {
-    let mut interests = Vec::new();
-    let message_lower = message.to_lowercase();
-
-    let interest_keywords = [
-        ("游戏", vec!["游戏", "打游戏", "玩", "lol", "王者", "吃鸡"]),
-        ("音乐", vec!["音乐", "歌", "听歌", "唱歌", "演唱会"]),
-        ("电影", vec!["电影", "看片", "影院", "大片"]),
-        ("读书", vec!["书", "读书", "小说", "文学"]),
-        ("运动", vec!["运动", "跑步", "健身", "锻炼"]),
-        ("美食", vec!["吃", "美食", "餐厅", "料理", "做饭"]),
-        ("旅行", vec!["旅行", "旅游", "出去玩", "度假"]),
-        ("学习", vec!["学习", "考试", "课程", "知识"]),
-    ];
-
-    for (category, keywords) in &interest_keywords {
-        for keyword in keywords {
-            if message_lower.contains(keyword) {
-                interests.push(category.to_string());
-                break;
-            }
-        }
-    }
-
-    interests
-}
-
-fn extract_personality_traits(message: &str) -> Vec<String> {
-    let trait_keywords = [
-        ("友善", ["谢谢", "感谢", "辛苦", "关心"]),
-        ("好奇", ["为什么", "怎么", "想知道", "好奇"]),
-        ("幽默", ["哈哈", "笑死", "开玩笑", "有趣"]),
-        ("勤奋", ["学习", "工作", "努力", "练习"]),
-        ("体贴", ["没事吧", "注意休息", "保重", "别难过"]),
-    ];
-    trait_keywords
-        .iter()
-        .filter(|(_, keywords)| keywords.iter().any(|keyword| message.contains(keyword)))
-        .map(|(name, _)| (*name).to_string())
-        .collect()
 }
 
 pub fn get_file_modified_time_formatted() -> anyhow::Result<String> {
@@ -1725,9 +1654,8 @@ pub fn get_file_modified_time_formatted() -> anyhow::Result<String> {
 mod tests {
     use super::{
         BotMemory, Roles, VisionImage, build_model_messages, build_responses_input,
-        compression_cutoff, extract_interests_from_message, extract_personality_traits,
-        extract_stream_delta, group_system_prompt, is_group_admin_command, is_restricted_command,
-        limit_memory_size, model_attempt_count, requests_no_reply, with_reference_context,
+        compression_cutoff, extract_stream_delta, group_system_prompt, is_group_admin_command,
+        is_restricted_command, limit_memory_size, model_attempt_count, with_reference_context,
     };
     use crate::memory::BotPersonality;
     use crate::model::message_actions::{ReplyPlan, follow_up_delay_millis, split_reply};
@@ -1774,17 +1702,6 @@ mod tests {
         assert!(prompt.contains("私聊角色守则"));
         assert!(prompt.contains("不主动谈论或承认模型"));
         assert!(prompt.contains("不把每句话都夸张地写成告白"));
-    }
-
-    #[test]
-    fn profile_signals_are_extracted_from_messages() {
-        let interests = extract_interests_from_message("谢谢，我最近在学习 Rust，也常听音乐");
-        assert!(interests.contains(&"学习".to_string()));
-        assert!(interests.contains(&"音乐".to_string()));
-
-        let traits = extract_personality_traits("谢谢你的关心，我会继续努力学习");
-        assert!(traits.contains(&"友善".to_string()));
-        assert!(traits.contains(&"勤奋".to_string()));
     }
 
     #[test]
@@ -1944,17 +1861,6 @@ mod tests {
             vec!["嗯？这么晚啦……你找我，是有什么心事吗？"]
         );
         assert_eq!(split_reply("【有点不好意思】[轻轻点头] 好呀"), vec!["好呀"]);
-    }
-
-    #[test]
-    fn explicit_no_reply_requests_never_reach_the_model() {
-        assert!(requests_no_reply("别回复我这条消息"));
-        assert!(requests_no_reply("别回复我\n这条消息"));
-        assert!(requests_no_reply("这条不用回。"));
-        assert!(requests_no_reply("不用回复这条消息！"));
-        assert!(requests_no_reply("本条消息请不要回复，谢谢"));
-        assert!(requests_no_reply("不要回复"));
-        assert!(!requests_no_reply("你为什么不回复我这条消息？"));
     }
 
     #[test]

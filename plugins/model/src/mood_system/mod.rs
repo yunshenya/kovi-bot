@@ -2,13 +2,14 @@
 //!
 //! 提供智能的情绪分析和人格调整功能，包括：
 //! - 多维度情绪识别和分析
-//! - 基于关键词的情绪评分算法
+//! - 基于模型语义理解的情绪估计
 //! - 上下文感知的情绪调整
 //! - 自然情绪变化和漂移
 //! - 情绪缓存和性能优化
 //! - 人格特征动态调整
 
 use crate::memory::{BotPersonality, MEMORY_MANAGER, MemoryManager};
+use crate::model::semantic::{MessageUnderstanding, UnderstandingRequest, understand};
 use anyhow::Result;
 use chrono::{Duration, Local, Timelike};
 use serde::{Deserialize, Serialize};
@@ -143,6 +144,17 @@ impl MoodSystem {
     /// # 返回值
     /// 成功时返回分析出的情绪状态，失败时返回错误
     pub async fn analyze_and_update_mood(&self, message: &str, context: &str) -> Result<Mood> {
+        let understanding = understand(UnderstandingRequest::text(message, context)).await;
+        self.analyze_and_update_mood_with_understanding(message, context, &understanding)
+            .await
+    }
+
+    pub(crate) async fn analyze_and_update_mood_with_understanding(
+        &self,
+        message: &str,
+        context: &str,
+        understanding: &MessageUnderstanding,
+    ) -> Result<Mood> {
         // 检查缓存
         let cache_key = format!("{}:{}", message, context);
         let now = Local::now();
@@ -164,14 +176,11 @@ impl MoodSystem {
         }
 
         let current_personality = self.memory_manager.get_bot_personality().await;
-        let new_mood = if let Some((mood, false)) = cached_mood {
-            mood
+        let (new_mood, new_intensity) = if let Some((mood, false)) = cached_mood {
+            (mood, understanding.mood_intensity.clamp(1, 10))
         } else {
-            self.analyze_mood_from_message(message, context, &current_personality)
-                .await
+            self.resolve_understanding(understanding, &current_personality)
         };
-
-        let new_intensity = self.mood_intensity(message, &new_mood);
         let recently_same_mood = current_personality.current_mood == new_mood.to_string()
             && (i16::from(current_personality.mood_intensity) - i16::from(new_intensity)).abs() < 2
             && now.signed_duration_since(current_personality.last_mood_change)
@@ -225,6 +234,17 @@ impl MoodSystem {
 
     /// 只分析消息情绪，不改变机器人人格。用于记录用户自己的情绪历史。
     pub async fn analyze_mood(&self, message: &str, context: &str) -> Mood {
+        let understanding = understand(UnderstandingRequest::text(message, context)).await;
+        self.analyze_mood_with_understanding(message, context, &understanding)
+            .await
+    }
+
+    pub(crate) async fn analyze_mood_with_understanding(
+        &self,
+        message: &str,
+        context: &str,
+        understanding: &MessageUnderstanding,
+    ) -> Mood {
         let cache_key = format!("{}:{}", message, context);
         let now = Local::now();
         let mood_config = crate::config::get().mood().clone();
@@ -243,9 +263,7 @@ impl MoodSystem {
         }
 
         let personality = self.memory_manager.get_bot_personality().await;
-        let mood = self
-            .analyze_mood_from_message(message, context, &personality)
-            .await;
+        let mood = self.resolve_understanding(understanding, &personality).0;
         let mut cache = self
             .mood_cache
             .lock()
@@ -265,301 +283,19 @@ impl MoodSystem {
         mood
     }
 
-    async fn analyze_mood_from_message(
+    fn resolve_understanding(
         &self,
-        message: &str,
-        context: &str,
+        understanding: &MessageUnderstanding,
         current_personality: &BotPersonality,
-    ) -> Mood {
-        let message_lower = message.to_lowercase();
-
-        // 情绪关键词分析
-        let mood_scores = self.calculate_mood_scores(&message_lower);
-
-        // 上下文分析
-        let context_mood = self.analyze_context_mood(context);
-
-        // 结合当前情绪状态
-        self.combine_mood_analysis(mood_scores, context_mood, current_personality)
-    }
-
-    /// 计算消息的情绪得分
-    ///
-    /// 使用关键词匹配算法分析消息内容，为每种情绪计算得分
-    ///
-    /// ## 评分规则
-    /// - **高权重关键词** (+2分)：开心、难过、生气、兴奋、孤独等强烈情绪
-    /// - **中权重关键词** (+1分)：好奇、顽皮、深思、自信、害羞等温和情绪
-    ///
-    /// ## 关键词分类
-    /// - **开心**：开心、高兴、快乐、哈哈、😊、😄、好棒、太好了、喜欢
-    /// - **难过**：难过、伤心、哭、😢、😭、糟糕、不好、讨厌
-    /// - **生气**：生气、愤怒、讨厌、烦、😠、😡、气死
-    /// - **兴奋**：兴奋、激动、太棒了、哇、！、!!!、😆、😃
-    /// - **好奇**：什么、为什么、怎么、？、???、好奇、想知道
-    /// - **顽皮**：调皮、顽皮、哈哈、嘿嘿、😏、😜、开玩笑
-    /// - **深思**：思考、想想、觉得、认为、可能、也许
-    /// - **孤独**：一个人、孤单、寂寞、没人、只有我
-    /// - **自信**：肯定、一定、当然、没问题、我可以、我能
-    /// - **害羞**：害羞、不好意思、脸红、😳、尴尬
-    ///
-    /// # 参数
-    /// * `message` - 要分析的消息内容
-    ///
-    /// # 返回值
-    /// 各种情绪及其得分的映射表
-    fn calculate_mood_scores(&self, message: &str) -> std::collections::HashMap<Mood, i32> {
-        let mut scores = std::collections::HashMap::new();
-
-        // 初始化所有情绪分数
-        for mood in [
-            Mood::Happy,
-            Mood::Sad,
-            Mood::Angry,
-            Mood::Excited,
-            Mood::Calm,
-            Mood::Curious,
-            Mood::Playful,
-            Mood::Thoughtful,
-            Mood::Lonely,
-            Mood::Confident,
-            Mood::Shy,
-            Mood::Neutral,
-        ] {
-            scores.insert(mood, 0);
-        }
-
-        // 开心关键词
-        let happy_keywords = [
-            "开心",
-            "高兴",
-            "快乐",
-            "哈哈",
-            "😊",
-            "😄",
-            "好棒",
-            "太好了",
-            "喜欢",
-            "happy",
-            "glad",
-            "awesome",
-            "love",
-        ];
-        for keyword in &happy_keywords {
-            if message.contains(keyword) {
-                *scores.get_mut(&Mood::Happy).unwrap() += 2;
-            }
-        }
-
-        // 难过关键词
-        let sad_keywords = [
-            "难过", "伤心", "哭", "😢", "😭", "糟糕", "不好", "讨厌", "sad", "upset", "cry",
-        ];
-        for keyword in &sad_keywords {
-            if message.contains(keyword) {
-                *scores.get_mut(&Mood::Sad).unwrap() += 2;
-            }
-        }
-
-        // 生气关键词
-        let angry_keywords = [
-            "生气", "愤怒", "讨厌", "烦", "😠", "😡", "气死", "angry", "hate", "annoyed",
-        ];
-        for keyword in &angry_keywords {
-            if message.contains(keyword) {
-                *scores.get_mut(&Mood::Angry).unwrap() += 2;
-            }
-        }
-
-        // 兴奋关键词
-        let excited_keywords = [
-            "兴奋",
-            "激动",
-            "太棒了",
-            "哇",
-            "！",
-            "!!!",
-            "😆",
-            "😃",
-            "excited",
-            "amazing",
-            "wow",
-        ];
-        for keyword in &excited_keywords {
-            if message.contains(keyword) {
-                *scores.get_mut(&Mood::Excited).unwrap() += 2;
-            }
-        }
-
-        // 好奇关键词
-        let curious_keywords = [
-            "什么",
-            "为什么",
-            "怎么",
-            "？",
-            "???",
-            "好奇",
-            "想知道",
-            "what",
-            "why",
-            "how",
-            "curious",
-        ];
-        for keyword in &curious_keywords {
-            if message.contains(keyword) {
-                *scores.get_mut(&Mood::Curious).unwrap() += 1;
-            }
-        }
-
-        // 顽皮关键词
-        let playful_keywords = [
-            "调皮",
-            "顽皮",
-            "哈哈",
-            "嘿嘿",
-            "😏",
-            "😜",
-            "开玩笑",
-            "joke",
-            "funny",
-        ];
-        for keyword in &playful_keywords {
-            if message.contains(keyword) {
-                *scores.get_mut(&Mood::Playful).unwrap() += 1;
-            }
-        }
-
-        // 深思关键词
-        let thoughtful_keywords = [
-            "思考", "想想", "觉得", "认为", "可能", "也许", "think", "maybe", "perhaps",
-        ];
-        for keyword in &thoughtful_keywords {
-            if message.contains(keyword) {
-                *scores.get_mut(&Mood::Thoughtful).unwrap() += 1;
-            }
-        }
-
-        // 孤独关键词
-        let lonely_keywords = [
-            "一个人",
-            "孤单",
-            "寂寞",
-            "没人",
-            "只有我",
-            "lonely",
-            "alone",
-        ];
-        for keyword in &lonely_keywords {
-            if message.contains(keyword) {
-                *scores.get_mut(&Mood::Lonely).unwrap() += 2;
-            }
-        }
-
-        // 自信关键词
-        let confident_keywords = [
-            "肯定",
-            "一定",
-            "当然",
-            "没问题",
-            "我可以",
-            "我能",
-            "sure",
-            "definitely",
-            "i can",
-        ];
-        for keyword in &confident_keywords {
-            if message.contains(keyword) {
-                *scores.get_mut(&Mood::Confident).unwrap() += 1;
-            }
-        }
-
-        // 害羞关键词
-        let shy_keywords = [
-            "害羞",
-            "不好意思",
-            "脸红",
-            "😳",
-            "尴尬",
-            "shy",
-            "embarrassed",
-        ];
-        for keyword in &shy_keywords {
-            if message.contains(keyword) {
-                *scores.get_mut(&Mood::Shy).unwrap() += 1;
-            }
-        }
-
-        let calm_keywords = [
-            "平静", "冷静", "放松", "安心", "calm", "relaxed", "peaceful",
-        ];
-        for keyword in &calm_keywords {
-            if message.contains(keyword) {
-                *scores.get_mut(&Mood::Calm).unwrap() += 1;
-            }
-        }
-
-        scores
-    }
-
-    fn analyze_context_mood(&self, context: &str) -> Option<Mood> {
-        let context_lower = context.to_lowercase();
-
-        if context_lower.contains("群聊") || context_lower.contains("group") {
-            Some(Mood::Playful) // 群聊时更顽皮
-        } else if context_lower.contains("私聊") || context_lower.contains("private") {
-            Some(Mood::Thoughtful) // 私聊时更深思
-        } else if context_lower.contains("深夜") {
-            Some(Mood::Calm) // 深夜更平静
+    ) -> (Mood, u8) {
+        let candidate = Mood::from_string(&understanding.mood);
+        let mood = if understanding.mood_confidence < 35 {
+            Mood::from_string(&current_personality.current_mood)
         } else {
-            None
-        }
-    }
-
-    fn combine_mood_analysis(
-        &self,
-        mood_scores: std::collections::HashMap<Mood, i32>,
-        context_mood: Option<Mood>,
-        current_personality: &BotPersonality,
-    ) -> Mood {
-        // 固定优先级消除 HashMap 遍历造成的随机结果；上下文只加一分，不覆盖强烈情绪。
-        let ordered_moods = [
-            Mood::Angry,
-            Mood::Sad,
-            Mood::Lonely,
-            Mood::Excited,
-            Mood::Happy,
-            Mood::Shy,
-            Mood::Curious,
-            Mood::Thoughtful,
-            Mood::Playful,
-            Mood::Confident,
-            Mood::Calm,
-            Mood::Neutral,
-        ];
-        let mut best_mood = Mood::Neutral;
-        let mut best_score = 0;
-        for mood in ordered_moods {
-            let score = mood_scores.get(&mood).copied().unwrap_or_default()
-                + i32::from(
-                    context_mood.as_ref() == Some(&mood) && score_is_positive(&mood_scores, &mood),
-                );
-            if score > best_score {
-                best_score = score;
-                best_mood = mood;
-            }
-        }
-
-        // 如果所有情绪得分都很低，保持当前情绪或转为中性
-        if best_score == 0 {
-            let current_mood = Mood::from_string(&current_personality.current_mood);
-            return if current_personality.energy_level > 5 {
-                current_mood
-            } else {
-                Mood::Neutral
-            };
-        }
-
-        best_mood
+            candidate
+        };
+        let intensity = understanding.mood_intensity.clamp(1, 10);
+        (mood, intensity)
     }
 
     fn adjust_personality_traits(&self, personality: &mut BotPersonality, mood: &Mood) {
@@ -594,16 +330,6 @@ impl MoodSystem {
                 personality.social_confidence = personality.social_confidence.saturating_sub(2);
             }
             _ => {}
-        }
-    }
-
-    fn mood_intensity(&self, message: &str, mood: &Mood) -> u8 {
-        let scores = self.calculate_mood_scores(&message.to_lowercase());
-        let score = scores.get(mood).copied().unwrap_or_default().max(0) as u8;
-        if *mood == Mood::Neutral {
-            3
-        } else {
-            (4 + score).min(10)
         }
     }
 
@@ -650,10 +376,6 @@ impl MoodSystem {
     }
 }
 
-fn score_is_positive(scores: &HashMap<Mood, i32>, mood: &Mood) -> bool {
-    scores.get(mood).copied().unwrap_or_default() > 0
-}
-
 fn move_toward(value: u8, target: u8) -> u8 {
     match value.cmp(&target) {
         std::cmp::Ordering::Less => value.saturating_add(1),
@@ -666,6 +388,7 @@ fn move_toward(value: u8, target: u8) -> u8 {
 mod tests {
     use super::{Mood, MoodSystem};
     use crate::memory::{MemoryManager, MemoryType};
+    use crate::model::semantic::MessageUnderstanding;
     use chrono::Local;
     use std::sync::Arc;
 
@@ -687,15 +410,35 @@ mod tests {
                     path.to_str().expect("临时路径应为 UTF-8"),
                 ));
                 let mood_system = MoodSystem::new(Arc::clone(&manager));
+                let happy = MessageUnderstanding {
+                    mood: "happy".to_string(),
+                    mood_intensity: 8,
+                    mood_confidence: 95,
+                    ..MessageUnderstanding::default()
+                };
+                let calm = MessageUnderstanding {
+                    mood: "calm".to_string(),
+                    mood_intensity: 5,
+                    mood_confidence: 90,
+                    ..MessageUnderstanding::default()
+                };
 
                 assert_eq!(
                     mood_system
-                        .analyze_mood("哈哈，今天太开心了！", "private_chat")
+                        .analyze_mood_with_understanding(
+                            "用户分享了一件让人开心的事",
+                            "private_chat",
+                            &happy,
+                        )
                         .await,
                     Mood::Happy
                 );
                 let mood = mood_system
-                    .analyze_and_update_mood("哈哈，今天太开心了！", "private_chat")
+                    .analyze_and_update_mood_with_understanding(
+                        "用户分享了一件让人开心的事",
+                        "private_chat",
+                        &happy,
+                    )
                     .await
                     .expect("情绪应更新");
                 assert_eq!(mood, Mood::Happy);
@@ -710,7 +453,11 @@ mod tests {
                     1
                 );
                 mood_system
-                    .analyze_and_update_mood("哈哈，今天太开心了！", "private_chat")
+                    .analyze_and_update_mood_with_understanding(
+                        "用户分享了一件让人开心的事",
+                        "private_chat",
+                        &happy,
+                    )
                     .await
                     .expect("缓存命中仍应返回情绪");
                 assert_eq!(
@@ -723,7 +470,11 @@ mod tests {
                 );
                 assert_eq!(
                     mood_system
-                        .analyze_mood("I feel calm and relaxed", "private_chat")
+                        .analyze_mood_with_understanding(
+                            "用户说现在想安静一会儿",
+                            "private_chat",
+                            &calm,
+                        )
                         .await,
                     Mood::Calm
                 );
