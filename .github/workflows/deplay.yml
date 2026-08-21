@@ -73,7 +73,7 @@ jobs:
             -o Acquire::http::Timeout=30 \
             -o Acquire::https::Timeout=30 \
             update
-          sudo timeout 180s apt-get install --yes --no-install-recommends sshpass rsync
+          sudo timeout 180s apt-get install --yes --no-install-recommends sshpass
 
       - name: Configure SSH host verification
         run: |
@@ -101,11 +101,11 @@ jobs:
         env:
           SSHPASS: ${{ secrets.DEPLOY_PASSWORD }}
         run: |
-          sshpass -e ssh "$DEPLOY_USER@$DEPLOY_HOST" "mkdir -p '$REMOTE_APP_DIR'"
-          sshpass -e rsync -az --chmod=F755 \
+          timeout 60s sshpass -e ssh "$DEPLOY_USER@$DEPLOY_HOST" "mkdir -p '$REMOTE_APP_DIR'"
+          timeout 180s sshpass -e scp \
             target/release/kovi-bot \
             "$DEPLOY_USER@$DEPLOY_HOST:$REMOTE_APP_DIR/kovi-bot.new"
-          sshpass -e rsync -az \
+          timeout 60s sshpass -e scp \
             bot.conf.toml kovi.plugin.toml \
             "$DEPLOY_USER@$DEPLOY_HOST:$REMOTE_APP_DIR/"
 
