@@ -102,10 +102,21 @@ jobs:
           SSHPASS: ${{ secrets.DEPLOY_PASSWORD }}
         run: |
           gzip -9 -c target/release/kovi-bot > target/release/kovi-bot.gz
-          timeout 60s sshpass -e ssh "$DEPLOY_USER@$DEPLOY_HOST" "mkdir -p '$REMOTE_APP_DIR'"
-          timeout 180s sshpass -e scp \
+          split -b 512K -d -a 4 \
             target/release/kovi-bot.gz \
-            "$DEPLOY_USER@$DEPLOY_HOST:$REMOTE_APP_DIR/kovi-bot.new.gz"
+            target/release/kovi-bot.gz.part-
+          archive_sha256="$(sha256sum target/release/kovi-bot.gz | awk '{print $1}')"
+          upload_dir="$REMOTE_APP_DIR/upload-$GITHUB_SHA"
+          timeout 60s sshpass -e ssh "$DEPLOY_USER@$DEPLOY_HOST" \
+            "mkdir -p '$upload_dir'"
+          for part in target/release/kovi-bot.gz.part-*; do
+            timeout 60s sshpass -e scp \
+              "$part" \
+              "$DEPLOY_USER@$DEPLOY_HOST:$upload_dir/$(basename "$part")"
+          done
+          timeout 60s sshpass -e ssh "$DEPLOY_USER@$DEPLOY_HOST" \
+            "cat '$upload_dir'/kovi-bot.gz.part-* > '$REMOTE_APP_DIR/kovi-bot.new.gz'; \
+             test \"\$(sha256sum '$REMOTE_APP_DIR/kovi-bot.new.gz' | awk '{print \$1}')\" = '$archive_sha256'"
           timeout 60s sshpass -e scp \
             bot.conf.toml kovi.plugin.toml \
             "$DEPLOY_USER@$DEPLOY_HOST:$REMOTE_APP_DIR/"
