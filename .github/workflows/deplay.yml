@@ -101,10 +101,11 @@ jobs:
         env:
           SSHPASS: ${{ secrets.DEPLOY_PASSWORD }}
         run: |
+          gzip -9 -c target/release/kovi-bot > target/release/kovi-bot.gz
           timeout 60s sshpass -e ssh "$DEPLOY_USER@$DEPLOY_HOST" "mkdir -p '$REMOTE_APP_DIR'"
           timeout 180s sshpass -e scp \
-            target/release/kovi-bot \
-            "$DEPLOY_USER@$DEPLOY_HOST:$REMOTE_APP_DIR/kovi-bot.new"
+            target/release/kovi-bot.gz \
+            "$DEPLOY_USER@$DEPLOY_HOST:$REMOTE_APP_DIR/kovi-bot.new.gz"
           timeout 60s sshpass -e scp \
             bot.conf.toml kovi.plugin.toml \
             "$DEPLOY_USER@$DEPLOY_HOST:$REMOTE_APP_DIR/"
@@ -199,6 +200,8 @@ jobs:
             cat <<'EOF'
           set -e
           install -m 0644 /home/ubuntu/kovi-bot/kovi.service /etc/systemd/system/kovi.service
+          gzip -t /home/ubuntu/kovi-bot/kovi-bot.new.gz
+          gzip -dc /home/ubuntu/kovi-bot/kovi-bot.new.gz > /home/ubuntu/kovi-bot/kovi-bot.new
           if test -x /home/ubuntu/kovi-bot/kovi-bot; then
             cp -a /home/ubuntu/kovi-bot/kovi-bot /home/ubuntu/kovi-bot/kovi-bot.previous
           fi
