@@ -102,7 +102,7 @@ jobs:
           SSHPASS: ${{ secrets.DEPLOY_PASSWORD }}
         run: |
           gzip -9 -c target/release/kovi-bot > target/release/kovi-bot.gz
-          split -b 512K -d -a 4 \
+          split -b 256K -d -a 4 \
             target/release/kovi-bot.gz \
             target/release/kovi-bot.gz.part-
           archive_sha256="$(sha256sum target/release/kovi-bot.gz | awk '{print $1}')"
@@ -110,9 +110,9 @@ jobs:
           timeout 60s sshpass -e ssh "$DEPLOY_USER@$DEPLOY_HOST" \
             "mkdir -p '$upload_dir'"
           for part in target/release/kovi-bot.gz.part-*; do
-            timeout 60s sshpass -e scp \
-              "$part" \
-              "$DEPLOY_USER@$DEPLOY_HOST:$upload_dir/$(basename "$part")"
+            timeout 60s sshpass -e ssh \
+              "$DEPLOY_USER@$DEPLOY_HOST" \
+              "cat > '$upload_dir/$(basename "$part")'" < "$part"
           done
           timeout 60s sshpass -e ssh "$DEPLOY_USER@$DEPLOY_HOST" \
             "cat '$upload_dir'/kovi-bot.gz.part-* > '$REMOTE_APP_DIR/kovi-bot.new.gz'; \
