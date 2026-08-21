@@ -53,6 +53,7 @@ pub(crate) fn classify_image_intent(
     replies_to_image: bool,
     quoted_message_requests_image: bool,
     pending_image_request: bool,
+    addressed_to_bot: bool,
 ) -> ImageIntent {
     if !has_images {
         return ImageIntent::Social;
@@ -67,6 +68,7 @@ pub(crate) fn classify_image_intent(
     }
     if contains_visual_intent(text)
         || (replies_to_image && looks_like_image_reference_question(text))
+        || (addressed_to_bot && looks_like_visual_opinion_request(text))
     {
         ImageIntent::VisualUnderstand
     } else {
@@ -211,6 +213,35 @@ fn looks_like_image_reference_question(text: &str) -> bool {
     references_image && asks_question
 }
 
+fn looks_like_visual_opinion_request(text: &str) -> bool {
+    [
+        "怎么看",
+        "怎么评价",
+        "觉得怎么样",
+        "感觉怎么样",
+        "效果怎么样",
+        "这张怎么样",
+        "这个怎么样",
+        "这图怎么样",
+        "图怎么样",
+        "好看吗",
+        "好不好看",
+        "评价一下",
+        "点评一下",
+        "帮我评价",
+        "帮我点评",
+        "给点意见",
+        "哪里怪",
+        "哪里不对",
+        "哪里有问题",
+        "有什么问题",
+        "行不行",
+        "可以吗",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker))
+}
+
 /// 提取普通图片消息段。商城表情和 QQ 内置表情不作为截图输入。
 pub(crate) fn extract_image_attachments(message: &Message) -> Vec<ImageAttachment> {
     let mut seen = HashSet::new();
@@ -316,7 +347,7 @@ pub(crate) fn strip_vision_command(message: &str) -> String {
 }
 
 pub(crate) fn default_vision_prompt() -> &'static str {
-    "请看看这张图片，先描述其中真正能确认的内容；如果图片里有文字、报错、按钮或关键数据，请提取出来，并结合当前问题给出帮助。看不清或不确定的地方要明确说明。"
+    "请认真查看这张图片，先描述其中真正能确认的主要内容；如果图片里有清晰可读的文字、报错、按钮或关键数据，请提取出来，并结合当前问题给出帮助。只有具体区域、小字或被遮挡内容真的无法辨认时，才说明哪里看不清，不要泛泛说整张图看不清。"
 }
 
 /// 使用单独的 OpenAI 兼容视觉接口分析图片，主聊天模型只接收分析后的文字。
@@ -368,7 +399,7 @@ pub(crate) async fn analyze_images(images: &[VisionImage], question: &str) -> Re
     };
 
     let prompt = format!(
-        "请分析用户提供的截图，只陈述图片中能确认的事实。提取可读文字、页面或应用名称、错误信息、按钮和关键状态；结合用户问题指出相关内容，但不要臆测。看不清的地方明确说明。\n\n用户问题：{}",
+        "请分析用户提供的截图，只陈述图片中能确认的事实。提取清晰可读的文字、页面或应用名称、错误信息、按钮和关键状态；结合用户问题指出相关内容，但不要臆测。只有具体区域、小字或被遮挡内容真的无法辨认时，才说明哪里看不清，不要泛泛说整张图看不清。\n\n用户问题：{}",
         question
     );
     let endpoint = vision_endpoint(&url, &wire_api);
@@ -381,7 +412,7 @@ pub(crate) async fn analyze_images(images: &[VisionImage], question: &str) -> Re
             json!({
                 "type": "input_image",
                 "image_url": image.url,
-                "detail": "auto",
+                "detail": "high",
             })
         }));
         json!({
@@ -397,7 +428,7 @@ pub(crate) async fn analyze_images(images: &[VisionImage], question: &str) -> Re
         content.extend(images.iter().map(|image| {
             json!({
                 "type": "image_url",
-                "image_url": {"url": image.url},
+                "image_url": {"url": image.url, "detail": "high"},
             })
         }));
         json!({
@@ -601,11 +632,11 @@ mod tests {
     #[test]
     fn pure_images_are_social_unless_a_visual_request_is_pending() {
         assert_eq!(
-            classify_image_intent("", true, false, false, false, false),
+            classify_image_intent("", true, false, false, false, false, false),
             ImageIntent::Social
         );
         assert_eq!(
-            classify_image_intent("", true, false, false, false, true),
+            classify_image_intent("", true, false, false, false, true, false),
             ImageIntent::VisualUnderstand
         );
     }
@@ -613,14 +644,38 @@ mod tests {
     #[test]
     fn conversational_image_text_does_not_trigger_vision() {
         assert_eq!(
-            classify_image_intent("我现在就是这样", true, false, false, false, false),
+            classify_image_intent("我现在就是这样", true, false, false, false, false, false),
             ImageIntent::Conversational
         );
         assert_eq!(
-            classify_image_intent("帮我看看图里的报错", true, false, false, false, false),
+            classify_image_intent(
+                "帮我看看图里的报错",
+                true,
+                false,
+                false,
+                false,
+                false,
+                false
+            ),
             ImageIntent::VisualUnderstand
         );
         assert!(message_requests_image("方便的话把截图发给我看看"));
+    }
+
+    #[test]
+    fn addressed_image_opinion_questions_trigger_vision() {
+        assert_eq!(
+            classify_image_intent("芸汐你怎么看", true, false, false, false, false, true),
+            ImageIntent::VisualUnderstand
+        );
+        assert_eq!(
+            classify_image_intent("这个怎么样", true, false, false, false, false, true),
+            ImageIntent::VisualUnderstand
+        );
+        assert_eq!(
+            classify_image_intent("今天怎么样", true, false, false, false, false, false),
+            ImageIntent::Conversational
+        );
     }
 
     #[test]

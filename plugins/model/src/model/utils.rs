@@ -968,7 +968,7 @@ fn build_model_messages(messages: &[BotMemory], vision_images: &[VisionImage]) -
                 parts.extend(vision_images.iter().map(|image| {
                     json!({
                         "type": "image_url",
-                        "image_url": {"url": image.url},
+                        "image_url": {"url": image.url, "detail": "high"},
                     })
                 }));
                 Value::Array(parts)
@@ -1003,7 +1003,7 @@ fn build_responses_input(messages: &[BotMemory], vision_images: &[VisionImage]) 
                     json!({
                         "type": "input_image",
                         "image_url": image.url,
-                        "detail": "auto",
+                        "detail": "high",
                     })
                 }));
                 Value::Array(parts)
@@ -1976,6 +1976,7 @@ mod tests {
         assert!(request[0]["content"].is_string());
         assert_eq!(request[1]["content"][0]["type"], "text");
         assert_eq!(request[1]["content"][1]["type"], "image_url");
+        assert_eq!(request[1]["content"][1]["image_url"]["detail"], "high");
     }
 
     #[test]
@@ -1999,6 +2000,7 @@ mod tests {
         assert!(request[0]["content"].is_string());
         assert_eq!(request[1]["content"][0]["type"], "input_text");
         assert_eq!(request[1]["content"][1]["type"], "input_image");
+        assert_eq!(request[1]["content"][1]["detail"], "high");
     }
 
     #[test]

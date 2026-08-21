@@ -297,6 +297,7 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
         replies_to_image,
         quoted_message_requests_image,
         pending_image_request,
+        directly_addressed || replies_to_bot,
     );
     let vision_requested = image_intent == ImageIntent::VisualUnderstand;
     if vision_command && images.is_empty() {
@@ -395,6 +396,7 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
         !quoted_images.is_empty() && !intent_text.trim().is_empty(),
         false,
         batch_vision_requested,
+        addressed_to_bot,
     );
     let vision_requested =
         batch_vision_requested || batch_image_intent == ImageIntent::VisualUnderstand;

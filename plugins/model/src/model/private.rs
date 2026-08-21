@@ -175,6 +175,7 @@ pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<Runtime
         !quoted_images.is_empty() && !message.trim().is_empty(),
         quoted_message_requests_image,
         pending_image_request,
+        true,
     );
     let vision_requested = image_intent == ImageIntent::VisualUnderstand;
     if vision_command && images.is_empty() {
@@ -260,6 +261,7 @@ pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<Runtime
         !quoted_images.is_empty() && !intent_text.trim().is_empty(),
         false,
         batch_vision_requested,
+        true,
     );
     let vision_requested =
         batch_vision_requested || batch_image_intent == ImageIntent::VisualUnderstand;
