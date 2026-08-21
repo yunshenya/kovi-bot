@@ -145,6 +145,11 @@ pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<Runtime
     let pending_image_request =
         consume_pending_image_request(ImageRequestScope::Private(user_id), !images.is_empty())
             .await;
+    if message.trim().is_empty() && !images.is_empty() && !vision_command && !pending_image_request
+    {
+        println!("[INFO] 收到私聊纯图片状态，保持静默 (用户: {})", user_id);
+        return;
+    }
     let understanding_request = UnderstandingRequest {
         message: message.to_string(),
         context: "private_chat".to_string(),

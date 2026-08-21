@@ -253,6 +253,11 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
         !images.is_empty(),
     )
     .await;
+    if message.trim().is_empty() && !images.is_empty() && !vision_command && !pending_image_request
+    {
+        println!("[INFO] 收到群聊纯图片状态，保持静默 (群组: {})", group_id);
+        return;
+    }
     let active_reply = is_active(reply_scope).await;
     let conversation_open = has_open_conversation_window(group_id).await;
     let semantic_required = directly_addressed

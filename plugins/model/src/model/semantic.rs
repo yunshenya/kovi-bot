@@ -92,8 +92,9 @@ impl MessageUnderstanding {
     pub(crate) fn should_understand_image(&self, request: &UnderstandingRequest) -> bool {
         request.explicit_vision_command
             || request.pending_image_request
-            || (request.has_images && self.image_intent == SemanticImageIntent::Understand)
-            || (request.quoted_has_images && self.image_intent == SemanticImageIntent::Understand)
+            || ((!request.message.trim().is_empty())
+                && (request.has_images || request.quoted_has_images)
+                && self.image_intent == SemanticImageIntent::Understand)
     }
 
     pub(crate) fn memory_importance(&self) -> u8 {
@@ -332,6 +333,23 @@ mod tests {
         request.explicit_vision_command = true;
         let result = parse_understanding(r#"{"image_intent":"social"}"#, &request);
         assert_eq!(result.image_intent, SemanticImageIntent::Understand);
+        assert!(result.should_understand_image(&request));
+    }
+
+    #[test]
+    fn pure_image_does_not_trigger_vision_from_model_label_alone() {
+        let mut request = UnderstandingRequest::text("", "group_chat");
+        request.has_images = true;
+        let result = parse_understanding(r#"{"image_intent":"understand"}"#, &request);
+        assert_eq!(result.image_intent, SemanticImageIntent::Understand);
+        assert!(!result.should_understand_image(&request));
+    }
+
+    #[test]
+    fn text_with_image_can_still_trigger_vision_semantically() {
+        let mut request = UnderstandingRequest::text("这张图里是什么？", "group_chat");
+        request.has_images = true;
+        let result = parse_understanding(r#"{"image_intent":"understand"}"#, &request);
         assert!(result.should_understand_image(&request));
     }
 
