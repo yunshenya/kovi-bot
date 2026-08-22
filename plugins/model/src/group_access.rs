@@ -344,6 +344,7 @@ async fn update_admin(bot: &RuntimeBot, user_id: i64, add: bool) -> Result<Strin
     let new_admins = normalize_admins(new_admins.into_iter().collect(), state.main_admin)?;
     if let Err(error) = apply_admins(bot, &state.plugin_name, &state.friends, &new_admins) {
         transaction.rollback().await.ok();
+        let _ = apply_admins(bot, &state.plugin_name, &state.friends, &old_admins);
         return Err(error);
     }
     if let Err(error) = transaction.commit().await {
