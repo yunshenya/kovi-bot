@@ -1,7 +1,8 @@
 # Production deployment bootstrap
 
-发布工作流通过 GitHub Secret 中的部署密码登录服务器，也不会动态安装 systemd 服务。以下
-操作只需由服务器管理员在控制台执行一次；之后 GitHub 只负责上传和切换发布版本。
+发布工作流通过 GitHub Secret 中的部署密码登录服务器，并会在发布前同步 systemd 服务和
+sudo 规则。服务器只需准备好 `ubuntu` 账号的 sudo 权限，之后 GitHub 负责构建、上传、切换
+版本和重启服务。
 
 ## 1. 创建专用应用账号
 
@@ -18,20 +19,15 @@ sudo install -d -o ubuntu -g ubuntu -m 0700 \
 `DEPLOY_PASSWORD`。由于这是服务器登录密码，建议为自动部署单独创建低权限账号；如果继续
 使用 `ubuntu`，至少应限制 SSH 密码登录来源并启用防火墙。
 
-## 2. 安装受限服务权限
+## 2. 准备服务权限
 
 ```bash
-sudo install -o root -g root -m 0644 \
-  .github/deploy/kovi-bot.service /etc/systemd/system/kovi-bot.service
-sudo install -o root -g root -m 0440 \
-  .github/deploy/kovi-bot.sudoers /etc/sudoers.d/kovi-bot-deploy
-sudo visudo -cf /etc/sudoers.d/kovi-bot-deploy
-sudo systemctl daemon-reload
-sudo systemctl enable kovi-bot.service
+sudo -v
 ```
 
-`ubuntu` 账号只能无密码执行 `systemctl restart kovi-bot.service`。工作流不修改 systemd、
-sudoers 或系统软件包。
+首次发布时工作流会安装并校验 `.github/deploy/kovi-bot.service` 和
+`.github/deploy/kovi-bot.sudoers`，随后 `ubuntu` 可以无密码执行
+`systemctl restart kovi-bot.service`。工作流不会安装系统软件包。
 
 ## 3. 创建最小权限数据库
 
@@ -59,6 +55,8 @@ OneBot、数据库和 Redis 端口。
 reviewers。截图中的敏感配置放在仓库级 Actions Secrets：
 
 - `DEPLOY_HOST`、`DEPLOY_PASSWORD`。
+- `DEPLOY_USER`、`DEPLOY_SSH_PORT`、`REMOTE_APP_DIR`：虽然不是敏感信息，也可以按你当前
+  的配置方式放在仓库 Secrets；默认分别是 `ubuntu`、`22`、`/home/ubuntu/kovi-bot`。
 - `NAPCAT_ACCESS_TOKEN`、`OPENAI_API_KEY`、`BOT_API_TOKEN`。`NAPCAT_ACCESS_TOKEN` 只要求
   非空，并且必须与 NapCat 配置完全一致。
 - `POSTGRES_PASSWORD`：工作流会生成本机 PostgreSQL 的连接串。
@@ -68,11 +66,8 @@ reviewers。截图中的敏感配置放在仓库级 Actions Secrets：
 - `VISION_ACTOR_AUTHORIZATION`、`VISION_API_URL`、`VISION_MODEL_NAME`、
   `VISION_REQUIRES_AUTH`、`VISION_WIRE_API`。
 
-以下非敏感配置仍放在 `production` Environment Variables：
+以下配置也可以放在 `production` Environment Variables；如果同时存在，仓库 Secrets 优先：
 
-- `DEPLOY_USER`：默认 `ubuntu`，当前工作流要求填写 `ubuntu`。
-- `DEPLOY_SSH_PORT`：默认 `22`。
-- `REMOTE_APP_DIR`：默认 `/home/ubuntu/kovi-bot`，当前工作流要求使用此路径。
 - `KOVI_ALLOWED_FRIENDS`：可选，逗号分隔的好友 QQ 号；所有者会自动加入。
 - `KOVI_ALLOWED_GROUPS`：可选，逗号分隔的群号；留空即不处理群消息。
 - `MODEL_API_KEY_ENV`：`OPENAI_API_KEY`（默认）或 `BOT_API_TOKEN`。

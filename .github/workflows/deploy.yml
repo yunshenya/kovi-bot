@@ -16,9 +16,9 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
-  DEPLOY_USER: ${{ vars.DEPLOY_USER || 'ubuntu' }}
-  DEPLOY_SSH_PORT: ${{ vars.DEPLOY_SSH_PORT || '22' }}
-  REMOTE_APP_DIR: ${{ vars.REMOTE_APP_DIR || '/home/ubuntu/kovi-bot' }}
+  DEPLOY_USER: ${{ secrets.DEPLOY_USER || vars.DEPLOY_USER || 'ubuntu' }}
+  DEPLOY_SSH_PORT: ${{ secrets.DEPLOY_SSH_PORT || vars.DEPLOY_SSH_PORT || '22' }}
+  REMOTE_APP_DIR: ${{ secrets.REMOTE_APP_DIR || vars.REMOTE_APP_DIR || '/home/ubuntu/kovi-bot' }}
   KOVI_MAIN_ADMIN: ${{ vars.KOVI_MAIN_ADMIN }}
   KOVI_ALLOWED_FRIENDS: ${{ vars.KOVI_ALLOWED_FRIENDS }}
   KOVI_ALLOWED_GROUPS: ${{ vars.KOVI_ALLOWED_GROUPS }}
@@ -45,6 +45,9 @@ jobs:
       name: production
     env:
       DEPLOY_HOST: ${{ secrets.DEPLOY_HOST || vars.DEPLOY_HOST }}
+      DEPLOY_USER: ${{ secrets.DEPLOY_USER || vars.DEPLOY_USER || 'ubuntu' }}
+      DEPLOY_SSH_PORT: ${{ secrets.DEPLOY_SSH_PORT || vars.DEPLOY_SSH_PORT || '22' }}
+      REMOTE_APP_DIR: ${{ secrets.REMOTE_APP_DIR || vars.REMOTE_APP_DIR || '/home/ubuntu/kovi-bot' }}
       KOVI_MAIN_ADMIN: ${{ secrets.KOVI_MAIN_ADMIN || vars.KOVI_MAIN_ADMIN }}
       MODEL_API_URL: ${{ secrets.MODEL_API_URL || vars.MODEL_API_URL || 'https://codex666ai.com' }}
       MODEL_NAME: ${{ secrets.MODEL_NAME || vars.MODEL_NAME || 'gpt-5.5' }}
@@ -116,6 +119,35 @@ jobs:
 
       - name: Build release binary
         run: cargo build --release --locked
+
+      - name: Install service configuration
+        env:
+          SSHPASS: ${{ secrets.DEPLOY_PASSWORD }}
+          DEPLOY_PASSWORD: ${{ secrets.DEPLOY_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          remote_tmp="/tmp/kovi-bot-deploy-$DEPLOY_SHA"
+          sshpass -e ssh -p "$DEPLOY_SSH_PORT" -o StrictHostKeyChecking=accept-new \
+            "$DEPLOY_USER@$DEPLOY_HOST" "install -d -m 700 '$remote_tmp'"
+          sshpass -e scp -P "$DEPLOY_SSH_PORT" -o StrictHostKeyChecking=accept-new \
+            .github/deploy/kovi-bot.service \
+            .github/deploy/kovi-bot.sudoers \
+            "$DEPLOY_USER@$DEPLOY_HOST:$remote_tmp/"
+          {
+            printf '%s\n' "$DEPLOY_PASSWORD"
+            cat <<REMOTE
+          set -euo pipefail
+          visudo -cf "$remote_tmp/kovi-bot.sudoers"
+          install -o root -g root -m 0644 "$remote_tmp/kovi-bot.service" /etc/systemd/system/kovi-bot.service
+          install -o root -g root -m 0440 "$remote_tmp/kovi-bot.sudoers" /etc/sudoers.d/kovi-bot-deploy
+          visudo -cf /etc/sudoers.d/kovi-bot-deploy
+          systemctl daemon-reload
+          systemctl enable kovi-bot.service
+          rm -rf -- "$remote_tmp"
+          REMOTE
+          } | sshpass -e ssh -p "$DEPLOY_SSH_PORT" -o StrictHostKeyChecking=accept-new \
+            "$DEPLOY_USER@$DEPLOY_HOST" "sudo -S -p '' bash -s"
 
       - name: Assemble immutable release
         env:
@@ -258,9 +290,10 @@ jobs:
           deploy_user="$2"
           test "$app_dir" = "/home/ubuntu/kovi-bot"
           test "$(id -un)" = "$deploy_user"
-          test -d "$app_dir"
+          install -d -m 0750 "$app_dir"
+          install -d -m 0700 "$app_dir/incoming" "$app_dir/runtime"
+          install -d -m 0750 "$app_dir/releases"
           test "$(stat -c '%U' "$app_dir")" = "$deploy_user"
-          test -d "$app_dir/runtime"
           test "$(stat -c '%U' "$app_dir/runtime")" = "$deploy_user"
           test -r "$app_dir/runtime" && test -w "$app_dir/runtime" && test -x "$app_dir/runtime"
           umask 077
