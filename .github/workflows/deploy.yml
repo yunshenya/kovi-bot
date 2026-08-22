@@ -27,7 +27,7 @@ env:
   MODEL_WIRE_API: ${{ vars.MODEL_WIRE_API || 'responses' }}
   MODEL_SUPPORTS_VISION: ${{ vars.MODEL_SUPPORTS_VISION || 'true' }}
   MODEL_API_KEY_ENV: ${{ vars.MODEL_API_KEY_ENV || 'OPENAI_API_KEY' }}
-  MODEL_REQUIRES_AUTH: ${{ vars.MODEL_REQUIRES_AUTH || 'false' }}
+  MODEL_REQUIRES_AUTH: ${{ vars.MODEL_REQUIRES_AUTH || 'true' }}
   MODEL_ACTOR_AUTHORIZATION: ${{ vars.MODEL_ACTOR_AUTHORIZATION || 'local-image-extension' }}
   DEPLOY_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
 
@@ -54,7 +54,7 @@ jobs:
       MODEL_WIRE_API: ${{ secrets.MODEL_WIRE_API || vars.MODEL_WIRE_API || 'responses' }}
       MODEL_SUPPORTS_VISION: ${{ secrets.MODEL_SUPPORTS_VISION || vars.MODEL_SUPPORTS_VISION || 'true' }}
       MODEL_API_KEY_ENV: ${{ secrets.MODEL_API_KEY_ENV || vars.MODEL_API_KEY_ENV || 'OPENAI_API_KEY' }}
-      MODEL_REQUIRES_AUTH: ${{ secrets.MODEL_REQUIRES_AUTH || vars.MODEL_REQUIRES_AUTH || 'false' }}
+      MODEL_REQUIRES_AUTH: ${{ secrets.MODEL_REQUIRES_AUTH || vars.MODEL_REQUIRES_AUTH || 'true' }}
       MODEL_ACTOR_AUTHORIZATION: ${{ secrets.MODEL_ACTOR_AUTHORIZATION || vars.MODEL_ACTOR_AUTHORIZATION || 'local-image-extension' }}
 
     steps:
@@ -96,6 +96,7 @@ jobs:
           [[ "$MODEL_SUPPORTS_VISION" == "true" || "$MODEL_SUPPORTS_VISION" == "false" ]] || { echo "Invalid MODEL_SUPPORTS_VISION"; exit 1; }
           [[ "$MODEL_API_KEY_ENV" == "OPENAI_API_KEY" || "$MODEL_API_KEY_ENV" == "BOT_API_TOKEN" ]] || { echo "Invalid MODEL_API_KEY_ENV"; exit 1; }
           [[ "$MODEL_REQUIRES_AUTH" == "true" || "$MODEL_REQUIRES_AUTH" == "false" ]] || { echo "Invalid MODEL_REQUIRES_AUTH"; exit 1; }
+          [[ "$MODEL_REQUIRES_AUTH" == "true" ]] || { echo "Production model endpoints must require Bearer authentication"; exit 1; }
           test -n "$DEPLOY_PASSWORD" || { echo "Missing repository secret DEPLOY_PASSWORD"; exit 1; }
           if test "$MODEL_API_KEY_ENV" = "OPENAI_API_KEY"; then
             test -n "$OPENAI_API_KEY" || { echo "Missing OPENAI_API_KEY"; exit 1; }

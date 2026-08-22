@@ -69,7 +69,7 @@ reviewers。截图中的敏感配置放在仓库级 Actions Secrets：
 - `KOVI_ALLOWED_FRIENDS`：可选，逗号分隔的好友 QQ 号；所有者会自动加入。
 - `KOVI_ALLOWED_GROUPS`：可选，逗号分隔的群号；留空即不处理群消息。
 - `MODEL_API_KEY_ENV`：`OPENAI_API_KEY`（默认）或 `BOT_API_TOKEN`。
-- `MODEL_REQUIRES_AUTH`：默认 `false`。
+- `MODEL_REQUIRES_AUTH`：默认 `true`；外部 HTTPS 模型服务应保持启用，以发送 `OPENAI_API_KEY` 的 Bearer Token。
 - `DATABASE_URL` 如果不想使用 `POSTGRES_PASSWORD` 自动生成的默认连接串。
 - `BRAVE_SEARCH_API_KEY`、`REDIS_URL`：按需配置。
 
