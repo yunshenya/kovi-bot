@@ -322,6 +322,7 @@ async fn build_generic_task(reminder: &ClaimedReminder) -> Result<String> {
             context: "scheduled_task",
             destination: reminder.destination,
             scheduled: true,
+            requires_reminder_create: false,
         },
         ticket,
         Some(1_200),
@@ -373,6 +374,85 @@ pub(crate) async fn create_from_tool(
     let request = parse_create_request(arguments, Utc::now(), config::get().reminders())?;
     let id = create(destination, actor_user_id, request.clone()).await?;
     Ok(format_created_message(id, &request))
+}
+
+/// 只用于决定是否强制模型走 reminder.create；这里不解析时间，也不创建任务。
+///
+/// 这是一个协议闸门，不是提醒实现。真正的时间解析、权限校验和数据库写入仍然只
+/// 发生在 reminder.create 工具内部，避免模型用一段确认话术冒充已经创建成功。
+pub(crate) fn looks_like_reminder_request(text: &str) -> bool {
+    let text = text.trim();
+    if text.is_empty() {
+        return false;
+    }
+    let is_cancellation = [
+        "取消提醒",
+        "取消定时",
+        "不用提醒",
+        "不要提醒",
+        "别提醒",
+        "不用发",
+        "不要发",
+        "别发",
+        "不用了",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker));
+    if is_cancellation {
+        return false;
+    }
+    let has_time = [
+        "秒后",
+        "分后",
+        "分钟后",
+        "小时后",
+        "天后",
+        "周后",
+        "星期后",
+        "礼拜后",
+        "之后",
+        "以后",
+        "今天",
+        "明天",
+        "后天",
+        "每天",
+        "每周",
+        "下周",
+        "今早",
+        "明早",
+        "今晚",
+        "明晚",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker));
+    let has_action = [
+        "提醒",
+        "定时",
+        "发消息",
+        "发一条消息",
+        "发条消息",
+        "发个消息",
+        "发条",
+        "给我发",
+        "发给我",
+        "帮我",
+        "替我",
+        "为我",
+        "记得",
+        "通知",
+        "叫我",
+        "喊我",
+        "告诉我",
+        "搜索",
+        "查询",
+        "查一下",
+        "整理",
+        "总结",
+        "执行",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker));
+    has_time && has_action
 }
 
 /// 由内置工具调用：列出当前私聊或当前群的未完成提醒。
@@ -1150,6 +1230,21 @@ mod tests {
         assert_eq!(request.message, "记得 吃饭");
         assert_eq!(request.repeat, RepeatRule::None);
         assert_eq!(request.due_at - now, Duration::seconds(600));
+    }
+
+    #[test]
+    fn detects_reminder_intent_without_creating_a_task() {
+        assert!(super::looks_like_reminder_request(
+            "三分钟后随便给我发一条消息"
+        ));
+        assert!(super::looks_like_reminder_request("明天早上提醒我吃饭"));
+        assert!(super::looks_like_reminder_request(
+            "十分钟后搜索早上的新闻发给我"
+        ));
+        assert!(super::looks_like_reminder_request("明天早上帮我检查日程"));
+        assert!(!super::looks_like_reminder_request("我三分钟后下班"));
+        assert!(!super::looks_like_reminder_request("提醒我吃饭"));
+        assert!(!super::looks_like_reminder_request("明天早上不用提醒我了"));
     }
 
     #[test]

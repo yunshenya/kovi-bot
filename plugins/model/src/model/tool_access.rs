@@ -65,6 +65,13 @@ pub(crate) struct ToolExecutionContext {
     pub(crate) context: &'static str,
     pub(crate) destination: MessageDestination,
     pub(crate) scheduled: bool,
+    /// 用户明确提出创建定时任务时，普通确认文本不能绕过 reminder.create。
+    pub(crate) requires_reminder_create: bool,
+}
+
+pub(crate) struct ToolExecutionResult {
+    pub(crate) succeeded: bool,
+    pub(crate) content: String,
 }
 
 struct ToolDefinition {
@@ -358,22 +365,34 @@ impl ToolRegistry {
         arguments: Map<String, Value>,
         tool_context: ToolExecutionContext,
         reply_ticket: crate::model::interrupt::ReplyTicket,
-    ) -> String {
+    ) -> ToolExecutionResult {
         let Some(definition) = self
             .definitions
             .iter()
             .find(|definition| definition.name == name)
         else {
-            return "工具未开放或工具名称无效。".to_string();
+            return ToolExecutionResult {
+                succeeded: false,
+                content: "工具未开放或工具名称无效。".to_string(),
+            };
         };
         if tool_context.scheduled && !definition.source.available_for_scheduled() {
-            return "这个工具未授权给定时任务使用。".to_string();
+            return ToolExecutionResult {
+                succeeded: false,
+                content: "这个工具未授权给定时任务使用。".to_string(),
+            };
         }
         let Ok(arguments_text) = serde_json::to_string(&arguments) else {
-            return "工具参数无法编码。".to_string();
+            return ToolExecutionResult {
+                succeeded: false,
+                content: "工具参数无法编码。".to_string(),
+            };
         };
         if arguments_text.chars().count() > MAX_TOOL_ARGUMENT_CHARS {
-            return "工具参数过长，已拒绝执行。".to_string();
+            return ToolExecutionResult {
+                succeeded: false,
+                content: "工具参数过长，已拒绝执行。".to_string(),
+            };
         }
 
         let execution = async {
@@ -394,8 +413,14 @@ impl ToolRegistry {
             Err(_) => Err(anyhow!("工具调用超时（工具：{name}）")),
         };
         match result {
-            Ok(result) => truncate_chars(&result, self.max_result_chars),
-            Err(error) => format!("工具执行失败：{}", truncate_chars(&error.to_string(), 800)),
+            Ok(result) => ToolExecutionResult {
+                succeeded: true,
+                content: truncate_chars(&result, self.max_result_chars),
+            },
+            Err(error) => ToolExecutionResult {
+                succeeded: false,
+                content: format!("工具执行失败：{}", truncate_chars(&error.to_string(), 800)),
+            },
         }
     }
 
