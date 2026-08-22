@@ -1111,14 +1111,13 @@ fn append_stream_delta(streamed_content: &mut String, delta: &str) {
     if streamed_content.is_empty() {
         streamed_content.push_str(delta);
     } else if delta == streamed_content {
-        return;
+        // Duplicate cumulative snapshot; keep the assembled response.
     } else if delta.starts_with(streamed_content.as_str()) {
         streamed_content.clear();
         streamed_content.push_str(delta);
     } else if streamed_content.starts_with(delta) {
         // A shorter cumulative snapshot arrived out of order; retain the
         // longer prefix instead of regressing the assembled response.
-        return;
     } else {
         streamed_content.push_str(delta);
     }
