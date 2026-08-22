@@ -380,7 +380,10 @@ pub(crate) fn admin_command_help() -> &'static str {
 fn command_requires_main_admin(command: AuthorizationCommand) -> bool {
     matches!(
         command,
-        AuthorizationCommand::AddAdmin(_) | AuthorizationCommand::RemoveAdmin(_)
+        AuthorizationCommand::AddAdmin(_)
+            | AuthorizationCommand::RemoveAdmin(_)
+            | AuthorizationCommand::ListAdmins
+            | AuthorizationCommand::AdminHelp
     )
 }
 
@@ -680,9 +683,10 @@ mod tests {
         assert!(command_requires_main_admin(
             AuthorizationCommand::RemoveAdmin(1)
         ));
-        assert!(!command_requires_main_admin(
+        assert!(command_requires_main_admin(
             AuthorizationCommand::ListAdmins
         ));
+        assert!(command_requires_main_admin(AuthorizationCommand::AdminHelp));
         assert!(!command_requires_main_admin(AuthorizationCommand::List));
         assert_eq!(parse_command("#授权群 641996763 extra"), None);
         assert_eq!(parse_command("#授权管理员 900000001 extra"), None);
