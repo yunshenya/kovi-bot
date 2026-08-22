@@ -21,9 +21,8 @@ env:
   REMOTE_APP_DIR: ${{ secrets.REMOTE_APP_DIR || vars.REMOTE_APP_DIR || '/home/ubuntu/kovi-bot' }}
   KOVI_MAIN_ADMIN: ${{ vars.KOVI_MAIN_ADMIN }}
   KOVI_ALLOWED_FRIENDS: ${{ vars.KOVI_ALLOWED_FRIENDS }}
-  # Keep the production group allowlist non-empty when the GitHub variable is
-  # missing; an empty list makes Kovi silently drop every group event.
-  KOVI_ALLOWED_GROUPS: ${{ vars.KOVI_ALLOWED_GROUPS || '475328908,641996763,784469488' }}
+  # Keep the production group allowlist empty unless it is explicitly configured.
+  KOVI_ALLOWED_GROUPS: ${{ vars.KOVI_ALLOWED_GROUPS || '' }}
   MODEL_API_URL: ${{ vars.MODEL_API_URL || 'https://codex666ai.com' }}
   MODEL_NAME: ${{ vars.MODEL_NAME || 'gpt-5.5' }}
   MODEL_WIRE_API: ${{ vars.MODEL_WIRE_API || 'responses' }}
@@ -51,7 +50,7 @@ jobs:
       DEPLOY_SSH_PORT: ${{ secrets.DEPLOY_SSH_PORT || vars.DEPLOY_SSH_PORT || '22' }}
       REMOTE_APP_DIR: ${{ secrets.REMOTE_APP_DIR || vars.REMOTE_APP_DIR || '/home/ubuntu/kovi-bot' }}
       KOVI_MAIN_ADMIN: ${{ secrets.KOVI_MAIN_ADMIN || vars.KOVI_MAIN_ADMIN }}
-      KOVI_ALLOWED_GROUPS: ${{ secrets.KOVI_ALLOWED_GROUPS || vars.KOVI_ALLOWED_GROUPS || '475328908,641996763,784469488' }}
+      KOVI_ALLOWED_GROUPS: ${{ secrets.KOVI_ALLOWED_GROUPS || vars.KOVI_ALLOWED_GROUPS || '' }}
       MODEL_API_URL: ${{ secrets.MODEL_API_URL || vars.MODEL_API_URL || 'https://codex666ai.com' }}
       MODEL_NAME: ${{ secrets.MODEL_NAME || vars.MODEL_NAME || 'gpt-5.5' }}
       MODEL_WIRE_API: ${{ secrets.MODEL_WIRE_API || vars.MODEL_WIRE_API || 'responses' }}
