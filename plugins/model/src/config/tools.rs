@@ -43,6 +43,8 @@ pub struct McpServerConfig {
     allowed_tools: Vec<String>,
     /// 只允许标记为只读或未声明破坏性的工具。
     read_only: bool,
+    /// 是否允许定时任务调用这个 MCP 服务。默认关闭，避免定时任务隐式执行副作用。
+    allow_scheduled: bool,
 }
 
 impl ToolsConfig {
@@ -152,6 +154,10 @@ impl McpServerConfig {
         self.read_only
     }
 
+    pub fn allow_scheduled(&self) -> bool {
+        self.allow_scheduled
+    }
+
     fn validate(&self) -> anyhow::Result<()> {
         if self.name.trim().is_empty() || !is_safe_identifier(&self.name) {
             return Err(anyhow::anyhow!(
@@ -233,6 +239,7 @@ impl Default for McpServerConfig {
             inherit_env: Vec::new(),
             allowed_tools: Vec::new(),
             read_only: true,
+            allow_scheduled: false,
         }
     }
 }
@@ -261,6 +268,7 @@ mod tests {
             ..McpServerConfig::default()
         };
         assert!(server.validate().is_ok());
+        assert!(!server.allow_scheduled());
 
         let invalid = McpServerConfig {
             inherit_env: vec!["NOTES-API-TOKEN".to_string()],

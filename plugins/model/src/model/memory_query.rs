@@ -54,7 +54,7 @@ pub(crate) async fn params_model_with_tool_access(
     let mut request = messages.to_vec();
     request.push(BotMemory {
         role: Roles::System,
-        content: registry.instruction(),
+        content: registry.instruction_for(tool_context.scheduled),
     });
     let model_config = config::get();
     let max_tool_rounds = model_config.tools().max_rounds();

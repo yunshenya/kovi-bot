@@ -292,6 +292,8 @@ export VISION_REQUIRES_AUTH="true"
 
 模型最多连续调用有限轮次，工具参数、超时、结果长度和工具名称都由程序校验。工具返回内容会被标记为资料，不会被当成新的系统指令。MCP 目前使用 stdio 子进程传输；服务必须在 `tools.mcp_servers` 中配置，工具必须列入 `allowed_tools`。`read_only = true` 时会拒绝 MCP 明确标记为破坏性或名称带常见写操作动词的工具。MCP 子进程只继承 `PATH` 和 `inherit_env` 明确列出的变量，不会拿到主进程的整套密钥。修改 `bot.conf.toml` 后需要重启机器人。
 
+持久化定时任务支持固定消息和通用 `task` 动作。`task` 会在到期时重新执行保存的自然语言指令，新闻摘要只是其中一个普通例子；默认可使用时间、网页和当前会话记忆工具。若要让定时任务调用 MCP，必须在对应服务上额外设置 `allow_scheduled = true`，只授权可信且必要的工具。定时任务不能创建、查看或取消其他定时任务，也不是任意代码执行器，完整说明见 [`docs/reminders.md`](docs/reminders.md)。
+
 部署时可在 GitHub Actions Secrets 中增加 `BRAVE_SEARCH_API_KEY`。不配置也能搜索，但公共搜索服务可能有频率限制。
 
 群聊中可以使用以下方式触发：

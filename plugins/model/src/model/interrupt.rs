@@ -10,6 +10,8 @@ use std::time::{Duration, Instant};
 pub(crate) enum ReplyScope {
     Group(i64),
     Private(i64),
+    /// 独立于聊天会话的持久化任务执行代数。
+    Scheduled(i64),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -245,6 +247,24 @@ mod tests {
                 assert!(is_current(new).await);
                 assert!(interrupt_if_current(new).await);
                 assert!(!is_current(new).await);
+            });
+    }
+
+    #[test]
+    fn scheduled_task_generation_is_independent_from_chat_generation() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let scheduled = ReplyScope::Scheduled(9_000_007);
+                let chat = ReplyScope::Private(9_000_007);
+                let scheduled_ticket = interrupt(scheduled).await;
+                let chat_ticket = interrupt(chat).await;
+                assert!(is_current(scheduled_ticket).await);
+                assert!(is_current(chat_ticket).await);
+                let newer_chat_ticket = interrupt(chat).await;
+                assert!(is_current(scheduled_ticket).await);
+                assert!(!is_current(chat_ticket).await);
+                assert!(is_current(newer_chat_ticket).await);
             });
     }
 

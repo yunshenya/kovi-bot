@@ -97,6 +97,14 @@ web_search_enabled = true
 web_fetch_enabled = true
 web_search_max_results = 5
 web_fetch_max_chars = 12000
+# 如需 MCP，请把 mcp_servers=[] 替换为下面的 [[tools.mcp_servers]] 配置；定时任务默认不允许 MCP。
+mcp_servers = []
+# [[tools.mcp_servers]]
+# name = "calendar"
+# command = "/opt/kovi/bin/calendar-mcp"
+# allowed_tools = ["list_events"]
+# read_only = true
+# allow_scheduled = false
 
 [reminders]
 enabled = true
@@ -109,9 +117,8 @@ default_timezone = "Asia/Shanghai"
 max_message_chars = 500
 max_attempts = 3
 lease_secs = 60
-news_digest_enabled = true
-news_max_items = 5
-news_max_output_chars = 4000
+max_task_instruction_chars = 2000
+max_task_output_chars = 4000
 
 [vision]
 provider = "auto"
