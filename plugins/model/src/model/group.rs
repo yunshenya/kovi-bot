@@ -223,6 +223,14 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
             delete_group_data(group_id, &bot).await;
             return;
         }
+        "#系统信息" => {
+            send_sys_info(Arc::clone(&bot), group_id).await;
+            return;
+        }
+        "#健康检查" => {
+            send_health_status(&bot, group_id).await;
+            return;
+        }
         _ => {}
     }
     if is_recent_bot_message(reply_scope, event.message_id).await {
@@ -558,39 +566,6 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
     )
     .await;
     match message.trim() {
-        "#系统信息" => {
-            send_sys_info(Arc::clone(&bot), group_id).await;
-        }
-
-        "#健康检查" => {
-            let mut health_checker = HealthChecker::new(Arc::clone(&MEMORY_MANAGER));
-            let health_status = health_checker.check_health().await;
-
-            let status_msg = if health_status.is_healthy && health_status.warnings.is_empty() {
-                format!(
-                    "✅ 系统健康状态良好\n📊 记忆数量: {}\n👥 用户档案: {}\n🏢 群组档案: {}\n💾 记忆快照大小: {:.2}MB",
-                    health_status.memory_usage.total_memories,
-                    health_status.memory_usage.user_profiles,
-                    health_status.memory_usage.group_profiles,
-                    health_status.memory_usage.storage_size_bytes as f64 / 1024.0 / 1024.0
-                )
-            } else if health_status.is_healthy {
-                format!(
-                    "⚠️ 系统可以运行，但有警告\n{}\n📊 记忆数量: {}\n💾 记忆快照大小: {:.2}MB",
-                    health_status.warnings.join("\n"),
-                    health_status.memory_usage.total_memories,
-                    health_status.memory_usage.storage_size_bytes as f64 / 1024.0 / 1024.0,
-                )
-            } else {
-                format!(
-                    "❌ 系统健康状态异常\n错误: {}\n警告: {}",
-                    health_status.errors.join(", "),
-                    health_status.warnings.join(", ")
-                )
-            };
-
-            send_tracked_group_message(&bot, group_id, status_msg).await;
-        }
         _ => {
             // 被点名时始终处理；未点名消息仅由本地节流器偶尔抽样，不逐条调用模型。
             if addressed_to_bot
@@ -724,6 +699,36 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
             }
         }
     }
+}
+
+async fn send_health_status(bot: &Arc<RuntimeBot>, group_id: i64) {
+    let mut health_checker = HealthChecker::new(Arc::clone(&MEMORY_MANAGER));
+    let health_status = health_checker.check_health().await;
+
+    let status_msg = if health_status.is_healthy && health_status.warnings.is_empty() {
+        format!(
+            "✅ 系统健康状态良好\n📊 记忆数量: {}\n👥 用户档案: {}\n🏢 群组档案: {}\n💾 记忆快照大小: {:.2}MB",
+            health_status.memory_usage.total_memories,
+            health_status.memory_usage.user_profiles,
+            health_status.memory_usage.group_profiles,
+            health_status.memory_usage.storage_size_bytes as f64 / 1024.0 / 1024.0
+        )
+    } else if health_status.is_healthy {
+        format!(
+            "⚠️ 系统可以运行，但有警告\n{}\n📊 记忆数量: {}\n💾 记忆快照大小: {:.2}MB",
+            health_status.warnings.join("\n"),
+            health_status.memory_usage.total_memories,
+            health_status.memory_usage.storage_size_bytes as f64 / 1024.0 / 1024.0,
+        )
+    } else {
+        format!(
+            "❌ 系统健康状态异常\n错误: {}\n警告: {}",
+            health_status.errors.join(", "),
+            health_status.warnings.join(", ")
+        )
+    };
+
+    send_tracked_group_message(bot, group_id, status_msg).await;
 }
 
 async fn delete_group_data(group_id: i64, bot: &RuntimeBot) {
