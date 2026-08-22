@@ -29,21 +29,20 @@ sudo -v
 `.github/deploy/kovi-bot.sudoers`，随后 `ubuntu` 可以无密码执行
 `systemctl restart kovi-bot.service`。工作流不会安装系统软件包。
 
-## 3. 创建最小权限数据库
+## 3. PostgreSQL 连接配置
 
-不要让机器人使用 PostgreSQL 超级用户。以下示例创建独立数据库及其所有者；密码应使用
-强随机值，并在 URL 中进行百分号编码。
+当前服务器使用 PostgreSQL 默认的 `postgres` 用户，工作流在没有配置 `DATABASE_URL` 时会用
+`POSTGRES_PASSWORD` 生成连接串，并连接本机的 `kovi_bot` 数据库。`POSTGRES_PASSWORD` 必须
+是服务器上 `postgres` 用户的实际密码，密码中的特殊字符应在 URL 中进行百分号编码。
 
 ```sql
-CREATE ROLE kovi_bot LOGIN PASSWORD 'replace-with-a-strong-password'
-  NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
-CREATE DATABASE kovi_bot OWNER kovi_bot;
+CREATE DATABASE kovi_bot;
 ```
 
 对应的 Secret 为：
 
 ```text
-DATABASE_URL=postgresql://kovi_bot:encoded-password@127.0.0.1:5432/kovi_bot
+DATABASE_URL=postgresql://postgres:encoded-password@127.0.0.1:5432/kovi_bot
 ```
 
 PostgreSQL、Redis 和 NapCat 应仅监听回环地址或受控私网。生产环境还应使用防火墙限制
@@ -59,7 +58,7 @@ reviewers。截图中的敏感配置放在仓库级 Actions Secrets：
   的配置方式放在仓库 Secrets；默认分别是 `ubuntu`、`22`、`/home/ubuntu/kovi-bot`。
 - `NAPCAT_ACCESS_TOKEN`、`OPENAI_API_KEY`、`BOT_API_TOKEN`。`NAPCAT_ACCESS_TOKEN` 只要求
   非空，并且必须与 NapCat 配置完全一致。
-- `POSTGRES_PASSWORD`：工作流会生成本机 PostgreSQL 的连接串。
+- `POSTGRES_PASSWORD`：服务器 `postgres` 用户密码；工作流会据此生成本机 PostgreSQL 的连接串。
 - `KOVI_MAIN_ADMIN`：机器人所有者 QQ 号。
 - `MODEL_API_URL`、`MODEL_NAME`、`MODEL_SUPPORTS_VISION`、`MODEL_WIRE_API`。
 - `MODEL_ACTOR_AUTHORIZATION`、`VISION_API_TOKEN`。
