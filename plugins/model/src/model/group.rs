@@ -13,8 +13,8 @@ use crate::model::reply::{clear_reply_targets, record_reply_target};
 use crate::model::semantic::{MessageUnderstanding, UnderstandingRequest, understand};
 use crate::model::traffic::{InboundScope, bounded_input, should_suppress};
 use crate::model::utils::{
-    clear_group_runtime_data, is_bot_admin, is_restricted_command, learn_user_profile_from_message,
-    process_group_reply_claimed, send_sys_info,
+    clear_group_runtime_data, command_help, is_bot_admin, is_help_command, is_restricted_command,
+    learn_user_profile_from_message, process_group_reply_claimed, send_sys_info,
 };
 use crate::redis_store;
 use crate::reminders;
@@ -176,6 +176,10 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
     let bounded_message = bounded_input(event.borrow_text().unwrap_or_default());
     let message = bounded_message.as_str();
     let sender_is_admin = is_bot_admin(&bot, event.user_id);
+    if is_help_command(message) {
+        send_tracked_group_message(&bot, group_id, command_help()).await;
+        return;
+    }
     let restricted_command = is_restricted_command(message);
     if restricted_command {
         println!(

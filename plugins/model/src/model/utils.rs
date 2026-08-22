@@ -131,6 +131,14 @@ const PRIVATE_HUMAN_ROLEPLAY_GUARD: &str = r#"
 
 /// 运维、教学、主动识图和群数据删除命令只允许 Kovi 管理员使用。
 /// 私聊用户自己的 `#删除我的数据` 不属于受限命令。
+pub(crate) fn is_help_command(message: &str) -> bool {
+    message.trim() == "#帮助"
+}
+
+pub(crate) fn command_help() -> &'static str {
+    "可用指令：\n聊天：直接发送消息，或 @芸汐。\n图片：#看图、#看截图、#识图。\n提醒：直接说“提醒我……”即可创建提醒。\n管理员：#系统信息、#健康检查、#禁言、#结束禁言。\n群授权：#授权群 群号、#取消授权群 群号、#授权群列表。\n主管理员：#授权管理员 QQ号、#取消授权管理员 QQ号、#授权管理员列表。\n数据：私聊发送 #删除我的数据；群内发送 #删除本群数据。"
+}
+
 pub(crate) fn is_restricted_command(message: &str) -> bool {
     let text = message.trim();
     group_access::is_authorization_command(text)
@@ -1963,8 +1971,8 @@ mod tests {
     use super::{
         BotMemory, Roles, VisionImage, build_model_messages, build_responses_input,
         compression_cutoff, extract_stream_delta, group_system_prompt, is_group_admin_command,
-        is_restricted_command, limit_memory_size, model_attempt_count, sanitize_scheduled_output,
-        with_reference_context,
+        is_help_command, is_restricted_command, limit_memory_size, model_attempt_count,
+        sanitize_scheduled_output, with_reference_context,
     };
     use crate::memory::{BotPersonality, UserProfile};
     use crate::model::message_actions::{ReplyPlan, follow_up_delay_millis, split_reply};
@@ -1990,6 +1998,8 @@ mod tests {
 
     #[test]
     fn formal_commands_are_restricted_to_administrators() {
+        assert!(is_help_command(" #帮助 "));
+        assert!(!is_restricted_command("#帮助"));
         assert!(is_restricted_command("#系统信息"));
         assert!(is_restricted_command("#教芸汐 这个表情是开心"));
         assert!(is_restricted_command("#教云汐"));
