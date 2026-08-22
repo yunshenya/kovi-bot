@@ -193,6 +193,21 @@ pub(crate) async fn health_status() -> String {
     }
 }
 
+/// 启动 readiness 使用的强校验：未配置 Redis 时明确表示该依赖是可选的；一旦配置，
+/// 就不能用“本地兜底”冒充生产已就绪。
+pub(crate) async fn check_readiness() -> Result<()> {
+    let configured = std::env::var("REDIS_URL")
+        .ok()
+        .is_some_and(|url| !url.trim().is_empty());
+    if !configured {
+        return Ok(());
+    }
+    let store = get()
+        .await
+        .ok_or_else(|| anyhow!("REDIS_URL 已配置但 Redis 尚未连接"))?;
+    store.ping().await
+}
+
 impl RedisStore {
     fn key(&self, suffix: &str) -> String {
         format!("{}:v1:{}", self.key_prefix, suffix)

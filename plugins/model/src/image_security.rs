@@ -139,7 +139,7 @@ fn image_size_error(max_bytes: usize) -> anyhow::Error {
     }
 }
 
-fn validate_remote_image_url(raw_url: &str) -> Result<Url> {
+pub(crate) fn validate_remote_image_url(raw_url: &str) -> Result<Url> {
     if raw_url.len() > MAX_REMOTE_IMAGE_URL_BYTES {
         return Err(anyhow!("图片 URL 过长"));
     }

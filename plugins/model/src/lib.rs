@@ -40,6 +40,67 @@ pub mod health_check;
 // PostgreSQL 表情包记忆库
 pub(crate) mod sticker_memory;
 
+#[cfg(feature = "integration-tests")]
+#[doc(hidden)]
+pub mod test_support {
+    use crate::image_security::validate_remote_image_url;
+    use crate::model::{ReplyScope, finish, interrupt, is_active, mark_active};
+    use crate::redis_store;
+    use std::time::Duration;
+
+    pub fn accepts_public_image_url(raw_url: &str) -> bool {
+        validate_remote_image_url(raw_url).is_ok()
+    }
+
+    pub async fn reply_ticket_generation_is_atomic() -> bool {
+        let scope = ReplyScope::Private(9_900_001);
+        let old = interrupt(scope).await;
+        let _ = mark_active(old).await;
+        let new = interrupt(scope).await;
+        let _ = mark_active(new).await;
+        finish(old).await;
+        let new_reply_survived = is_active(scope).await;
+        finish(new).await;
+        new_reply_survived
+    }
+
+    pub async fn redis_runtime_round_trip() -> anyhow::Result<()> {
+        let store = redis_store::get()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("REDIS_URL 未指向可用 Redis"))?;
+        let suffix = format!(
+            "integration-black-box:{}:{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        );
+        store
+            .set_expiring_text(&suffix, "round-trip", Duration::from_secs(30))
+            .await?;
+        anyhow::ensure!(
+            store.take_text(&suffix).await? == Some("round-trip".to_string()),
+            "Redis 临时值往返失败"
+        );
+        anyhow::ensure!(
+            store
+                .increment_expiring(&suffix, Duration::from_secs(30))
+                .await?
+                == 1,
+            "Redis 计数器第一次递增失败"
+        );
+        anyhow::ensure!(
+            store
+                .increment_expiring(&suffix, Duration::from_secs(30))
+                .await?
+                == 2,
+            "Redis 计数器第二次递增失败"
+        );
+        store.delete(&suffix).await?;
+        Ok(())
+    }
+}
+
 /// 后台任务启动标志，确保只启动一次
 static BACKGROUND_TASK_STARTED: AtomicBool = AtomicBool::new(false);
 const DATABASE_INIT_MAX_ATTEMPTS: u32 = 8;
@@ -78,10 +139,7 @@ async fn main() {
     }
 
     if let Err(error) = sticker_memory::initialize_database().await {
-        eprintln!(
-            "[ERROR] 表情包记忆库初始化失败，表情学习功能暂不可用: {}",
-            error
-        );
+        panic!("表情包记忆库初始化失败，拒绝写入 readiness: {error}");
     }
 
     // Redis 只承载可丢失的运行态；连接失败时各模块会继续使用本地兜底。
@@ -92,6 +150,10 @@ async fn main() {
             "[ERROR] 模型工具初始化失败，工具调用功能暂不可用: {}",
             error
         );
+    }
+
+    if let Err(error) = redis_store::check_readiness().await {
+        panic!("Redis readiness 检查失败，拒绝写入 readiness: {error}");
     }
 
     // 注册聊天功能宏，定义消息处理函数映射
@@ -155,6 +217,13 @@ async fn main() {
                 if let Err(error) = maintenance_memory_manager.compact_memories().await {
                     eprintln!("[ERROR] 定期记忆清理失败: {}", error);
                 }
+                match sticker_memory::compact_expired().await {
+                    Ok(removed) if removed > 0 => {
+                        println!("[INFO] 过期表情标签清理完成，移除 {} 条", removed);
+                    }
+                    Ok(_) => {}
+                    Err(error) => eprintln!("[ERROR] 定期表情标签清理失败: {}", error),
+                }
                 let interval = config::get().memory().maintenance_interval_secs();
                 kovi::tokio::time::sleep(kovi::tokio::time::Duration::from_secs(interval)).await;
             }
@@ -204,4 +273,34 @@ fn write_ready_marker() -> std::io::Result<()> {
     let temp_path = path.with_extension(format!("tmp.{}", std::process::id()));
     std::fs::write(&temp_path, format!("{}\n", revision.trim()))?;
     std::fs::rename(temp_path, path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{clear_ready_marker, write_ready_marker};
+    use std::fs;
+
+    #[test]
+    fn readiness_marker_contains_the_deployed_revision() {
+        let path = std::env::temp_dir().join(format!(
+            "kovi-ready-{}-{}.txt",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        unsafe {
+            std::env::set_var("KOVI_READY_FILE", &path);
+            std::env::set_var("KOVI_DEPLOY_REVISION", "test-revision");
+        }
+        clear_ready_marker();
+        write_ready_marker().expect("应写入 readiness 标记");
+        assert_eq!(
+            fs::read_to_string(&path).expect("应读取 readiness 标记"),
+            "test-revision\n"
+        );
+        clear_ready_marker();
+        unsafe {
+            std::env::remove_var("KOVI_READY_FILE");
+            std::env::remove_var("KOVI_DEPLOY_REVISION");
+        }
+    }
 }

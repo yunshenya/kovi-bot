@@ -2,16 +2,18 @@ use crate::config;
 use crate::health_check::HealthChecker;
 use crate::memory::{GroupProfile, MEMORY_MANAGER};
 use crate::model::coalesce::{MessageCoalescer, MessagePart};
-use crate::model::interrupt::{ReplyScope, interrupt, is_active};
+use crate::model::conversation_coordinator::{ConversationCoordinator, PendingTurn};
+use crate::model::interrupt::{ReplyScope, is_active, scope_mutex};
 use crate::model::recall::{
-    clear_reply_scope, has_recalled_messages, is_recent_bot_message, send_tracked_group_message,
+    clear_reply_scope_locked, has_recalled_messages, is_recent_bot_message,
+    send_tracked_group_message,
 };
 use crate::model::reply::{clear_reply_targets, record_reply_target};
 use crate::model::semantic::{MessageUnderstanding, UnderstandingRequest, understand};
 use crate::model::traffic::{InboundScope, bounded_input, should_suppress};
 use crate::model::utils::{
     clear_group_runtime_data, is_bot_admin, is_restricted_command, learn_user_profile_from_message,
-    process_group_reply, send_sys_info,
+    process_group_reply_claimed, send_sys_info,
 };
 use crate::redis_store;
 use crate::sticker_memory;
@@ -60,14 +62,7 @@ static GROUP_INTERJECTION_STATE: LazyLock<Mutex<HashMap<i64, GroupInterjectionSt
 static GROUP_MESSAGE_BATCHES: LazyLock<MessageCoalescer<(i64, i64)>> =
     LazyLock::new(Default::default);
 
-struct PendingWindowMessage {
-    user_id: i64,
-    sender: String,
-    message: String,
-    vision_images: Vec<VisionImage>,
-    message_ids: Vec<i32>,
-    understanding: MessageUnderstanding,
-}
+type PendingWindowMessage = PendingTurn;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct Addressing {
@@ -369,16 +364,14 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
     let active_reply = is_active(reply_scope).await;
     let conversation_open = has_open_conversation_window(group_id).await;
     let immediate_stop = active_reply && looks_like_immediate_stop_request(message);
-    let can_interrupt = addressed_to_bot || immediate_stop || vision_command;
+    let can_interrupt = addressed_to_bot || vision_command;
     let reply_ticket = if can_interrupt {
-        Some(interrupt(reply_scope).await)
+        Some(ConversationCoordinator::interrupt(reply_scope).await)
     } else {
         None
     };
     if immediate_stop {
-        GROUP_MESSAGE_BATCHES
-            .cancel((group_id, event.user_id))
-            .await;
+        stop_group_reply(group_id, event.user_id).await;
         println!("[INFO] 群聊用户打断回复 (群组: {})", group_id);
         return;
     }
@@ -500,10 +493,7 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
         if sampled_for_interjection {
             finish_interjection_attempt(group_id, false).await;
         }
-        GROUP_MESSAGE_BATCHES
-            .cancel((group_id, event.user_id))
-            .await;
-        interrupt(reply_scope).await;
+        stop_group_reply(group_id, event.user_id).await;
         println!(
             "[INFO] 合并后的群聊消息请求停止当前回复 (群组: {})",
             group_id
@@ -566,27 +556,6 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
         understanding.conversation_relevant,
     )
     .await;
-    if should_defer_active_window_message(
-        is_active(reply_scope).await,
-        participant_follow_up,
-        reply_ticket.is_some(),
-    ) {
-        println!(
-            "[INFO] 群聊已有回复进行中，排队窗口消息 (群组: {}, 用户: {})",
-            group_id, event.user_id
-        );
-        queue_pending_window_message(
-            group_id,
-            event.user_id,
-            sender,
-            model_message,
-            vision_images,
-            source_message_ids,
-            understanding.clone(),
-        )
-        .await;
-        return;
-    }
     match message.trim() {
         "#系统信息" => {
             send_sys_info(Arc::clone(&bot), group_id).await;
@@ -627,12 +596,24 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
                 || vision_requested
                 || matches!(message.trim(), "#禁言" | "#结束禁言")
             {
-                let ticket = match reply_ticket {
-                    Some(ticket) => ticket,
-                    None => interrupt(reply_scope).await,
+                let Some(ticket) = claim_or_queue_group_reply(
+                    reply_scope,
+                    reply_ticket,
+                    participant_follow_up,
+                    group_id,
+                    event.user_id,
+                    sender.clone(),
+                    model_message.clone(),
+                    vision_images.clone(),
+                    source_message_ids.clone(),
+                    understanding.clone(),
+                )
+                .await
+                else {
+                    return;
                 };
                 let turn_marker = begin_conversation_turn(group_id, event.user_id).await;
-                let replied = process_group_reply(
+                let replied = process_group_reply_claimed(
                     group_id,
                     event.user_id,
                     &model_message,
@@ -646,7 +627,7 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
                 )
                 .await;
                 finish_conversation_turn(group_id, event.user_id, turn_marker, replied).await;
-                drain_pending_window_messages(group_id, Arc::clone(&bot)).await;
+                drain_pending_window_messages(group_id, Arc::clone(&bot), ticket).await;
             } else if should_continue_conversation(
                 group_id,
                 event.user_id,
@@ -655,12 +636,24 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
             .await
             {
                 println!("[INFO] 群聊接续对话 (群组: {})", group_id);
-                let ticket = match reply_ticket {
-                    Some(ticket) => ticket,
-                    None => interrupt(reply_scope).await,
+                let Some(ticket) = claim_or_queue_group_reply(
+                    reply_scope,
+                    reply_ticket,
+                    participant_follow_up,
+                    group_id,
+                    event.user_id,
+                    sender.clone(),
+                    model_message.clone(),
+                    vision_images.clone(),
+                    source_message_ids.clone(),
+                    understanding.clone(),
+                )
+                .await
+                else {
+                    return;
                 };
                 let turn_marker = begin_conversation_turn(group_id, event.user_id).await;
-                let replied = process_group_reply(
+                let replied = process_group_reply_claimed(
                     group_id,
                     event.user_id,
                     &model_message,
@@ -674,15 +667,30 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
                 )
                 .await;
                 finish_conversation_turn(group_id, event.user_id, turn_marker, replied).await;
-                drain_pending_window_messages(group_id, Arc::clone(&bot)).await;
+                drain_pending_window_messages(group_id, Arc::clone(&bot), ticket).await;
             } else if sampled_for_interjection && understanding.interjection_worthy {
                 println!("[INFO] 群聊未点名接话 (群组: {})", group_id);
-                let ticket = interrupt(reply_scope).await;
+                let Some(ticket) = claim_or_queue_group_reply(
+                    reply_scope,
+                    None,
+                    participant_follow_up,
+                    group_id,
+                    event.user_id,
+                    sender.clone(),
+                    model_message.clone(),
+                    vision_images.clone(),
+                    source_message_ids.clone(),
+                    understanding.clone(),
+                )
+                .await
+                else {
+                    return;
+                };
                 let turn_marker = begin_conversation_turn(group_id, event.user_id).await;
                 let max_output_tokens = config::get()
                     .group_interjection()
                     .interjection_max_output_tokens();
-                let replied = process_group_reply(
+                let replied = process_group_reply_claimed(
                     group_id,
                     event.user_id,
                     &model_message,
@@ -697,7 +705,7 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
                 .await;
                 finish_interjection_attempt(group_id, replied).await;
                 finish_conversation_turn(group_id, event.user_id, turn_marker, replied).await;
-                drain_pending_window_messages(group_id, Arc::clone(&bot)).await;
+                drain_pending_window_messages(group_id, Arc::clone(&bot), ticket).await;
             } else if let Err(error) = MEMORY_MANAGER
                 .add_conversation_memory_with_hints(
                     group_id,
@@ -719,11 +727,16 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
 
 async fn delete_group_data(group_id: i64, bot: &RuntimeBot) {
     let scope = ReplyScope::Group(group_id);
-    interrupt(scope).await;
-    GROUP_MESSAGE_BATCHES
-        .cancel_where(|(candidate_group_id, _)| *candidate_group_id == group_id)
-        .await;
-    PENDING_WINDOW_MESSAGES.lock().await.remove(&group_id);
+    {
+        let scope_lock = scope_mutex(scope);
+        let _scope_guard = scope_lock.lock().await;
+        ConversationCoordinator::interrupt_locked(scope).await;
+        GROUP_MESSAGE_BATCHES
+            .cancel_where(|(candidate_group_id, _)| *candidate_group_id == group_id)
+            .await;
+        PENDING_WINDOW_MESSAGES.lock().await.remove(&group_id);
+        clear_reply_scope_locked(scope).await;
+    }
     GROUP_INTERJECTION_STATE.lock().await.remove(&group_id);
     DIRECT_TRIGGER_STATES
         .lock()
@@ -731,7 +744,6 @@ async fn delete_group_data(group_id: i64, bot: &RuntimeBot) {
         .retain(|(candidate_group_id, _), _| *candidate_group_id != group_id);
     clear_group_runtime_data(group_id).await;
     clear_reply_targets(scope).await;
-    clear_reply_scope(scope).await;
     clear_group_pending_image_requests(group_id).await;
 
     let memory_result = MEMORY_MANAGER.delete_group_data(group_id).await;
@@ -1012,57 +1024,94 @@ async fn queue_pending_window_message(
 ) {
     let mut pending = PENDING_WINDOW_MESSAGES.lock().await;
     let queue = pending.entry(group_id).or_default();
-    let max_pending = config::get().traffic().max_pending_turns();
-    if queue.len() >= max_pending {
-        queue.pop_front();
-        eprintln!(
-            "[WARN] 群聊待处理队列已满，丢弃最旧 turn (群组: {}, 上限: {})",
-            group_id, max_pending
-        );
-    }
-    queue.push_back(PendingWindowMessage {
-        user_id,
-        sender,
-        message,
-        vision_images,
-        message_ids,
-        understanding,
-    });
+    ConversationCoordinator::enqueue(
+        queue,
+        PendingWindowMessage {
+            user_id,
+            sender,
+            message,
+            vision_images,
+            message_ids,
+            understanding,
+        },
+        "群聊",
+        group_id,
+    );
 }
 
-async fn drain_pending_window_messages(group_id: i64, bot: Arc<RuntimeBot>) {
+#[allow(clippy::too_many_arguments)]
+async fn claim_or_queue_group_reply(
+    scope: ReplyScope,
+    ticket: Option<crate::model::ReplyTicket>,
+    participant_follow_up: bool,
+    group_id: i64,
+    user_id: i64,
+    sender: String,
+    message: String,
+    vision_images: Vec<VisionImage>,
+    message_ids: Vec<i32>,
+    understanding: MessageUnderstanding,
+) -> Option<crate::model::ReplyTicket> {
+    let scope_lock = scope_mutex(scope);
+    let _scope_guard = scope_lock.lock().await;
+    let active = ConversationCoordinator::is_active_locked(scope).await;
+    let has_queued = PENDING_WINDOW_MESSAGES
+        .lock()
+        .await
+        .get(&group_id)
+        .is_some_and(|queue| !queue.is_empty());
+    if should_defer_active_window_message(
+        active || has_queued,
+        participant_follow_up,
+        ticket.is_some(),
+    ) {
+        println!(
+            "[INFO] 群聊已有回复或排队消息进行中，排队窗口消息 (群组: {}, 用户: {})",
+            group_id, user_id
+        );
+        queue_pending_window_message(
+            group_id,
+            user_id,
+            sender,
+            message,
+            vision_images,
+            message_ids,
+            understanding,
+        )
+        .await;
+        return None;
+    }
+    let ticket = match ticket {
+        Some(ticket) => ticket,
+        None => ConversationCoordinator::interrupt_locked(scope).await,
+    };
+    ConversationCoordinator::begin_reply_locked(scope, ticket, message_ids)
+        .await
+        .then_some(ticket)
+}
+
+async fn stop_group_reply(group_id: i64, user_id: i64) {
+    let scope = ReplyScope::Group(group_id);
+    let scope_lock = scope_mutex(scope);
+    let _scope_guard = scope_lock.lock().await;
+    ConversationCoordinator::interrupt_locked(scope).await;
+    GROUP_MESSAGE_BATCHES.cancel((group_id, user_id)).await;
+    PENDING_WINDOW_MESSAGES.lock().await.remove(&group_id);
+}
+
+async fn drain_pending_window_messages(
+    group_id: i64,
+    bot: Arc<RuntimeBot>,
+    mut completed: crate::model::ReplyTicket,
+) {
     loop {
-        let pending = {
-            let mut pending_by_group = PENDING_WINDOW_MESSAGES.lock().await;
-            let (next, became_empty) = match pending_by_group.get_mut(&group_id) {
-                Some(queue) => {
-                    let next = queue.pop_front();
-                    (next, queue.is_empty())
-                }
-                None => (None, false),
-            };
-            if became_empty {
-                pending_by_group.remove(&group_id);
-            }
-            next
-        };
-        let Some(pending) = pending else {
+        let Some((pending, ticket)) = take_pending_window_turn(group_id, completed).await else {
             return;
         };
-        if is_active(ReplyScope::Group(group_id)).await {
-            PENDING_WINDOW_MESSAGES
-                .lock()
-                .await
-                .entry(group_id)
-                .or_default()
-                .push_front(pending);
-            return;
-        }
 
         println!("[INFO] 群聊开始处理排队窗口消息 (群组: {})", group_id);
-        let ticket = interrupt(ReplyScope::Group(group_id)).await;
         let turn_marker = begin_conversation_turn(group_id, pending.user_id).await;
-        let replied = crate::model::utils::process_group_reply(
+        let replied = crate::model::utils::process_group_reply_claimed(
             group_id,
             pending.user_id,
             &pending.message,
@@ -1076,7 +1125,24 @@ async fn drain_pending_window_messages(group_id: i64, bot: Arc<RuntimeBot>) {
         )
         .await;
         finish_conversation_turn(group_id, pending.user_id, turn_marker, replied).await;
+        completed = ticket;
     }
+}
+
+async fn take_pending_window_turn(
+    group_id: i64,
+    mut completed: crate::model::ReplyTicket,
+) -> Option<(PendingWindowMessage, crate::model::ReplyTicket)> {
+    let scope = ReplyScope::Group(group_id);
+    let scope_lock = scope_mutex(scope);
+    let _scope_guard = scope_lock.lock().await;
+    let mut pending_by_group = PENDING_WINDOW_MESSAGES.lock().await;
+    let queue = pending_by_group.entry(group_id).or_default();
+    let result = ConversationCoordinator::claim_next_locked(scope, &mut completed, queue).await;
+    if queue.is_empty() {
+        pending_by_group.remove(&group_id);
+    }
+    result
 }
 
 fn prune_conversation_participants(state: &mut GroupInterjectionState, now: Instant) {
@@ -1302,7 +1368,11 @@ mod tests {
         decision_budget_available, has_active_conversation_window,
         looks_like_immediate_stop_request, message_at_self, normalized_sender_name,
         prune_decision_attempts, queue_pending_window_message, roll_conversation_window,
-        should_defer_active_window_message, suppress_direct_trigger, text_mentions_bot,
+        should_defer_active_window_message, suppress_direct_trigger, take_pending_window_turn,
+        text_mentions_bot,
+    };
+    use crate::model::interrupt::{
+        ReplyScope, interrupt, interrupt_locked, is_current, scope_mutex,
     };
     use crate::model::semantic::MessageUnderstanding;
     use crate::model::utils::{is_group_admin_command, is_restricted_command};
@@ -1448,6 +1518,55 @@ mod tests {
                     "data:image/jpeg;base64,/9j/2Q=="
                 );
                 pending.remove(&group_id);
+            });
+    }
+
+    #[test]
+    fn stale_group_drainer_leaves_a_turn_queued_after_a_new_message_wins() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let group_id = 9_200_003;
+                let scope = ReplyScope::Group(group_id);
+                PENDING_WINDOW_MESSAGES.lock().await.remove(&group_id);
+                let completed = interrupt(scope).await;
+                queue_pending_window_message(
+                    group_id,
+                    33,
+                    "成员".to_string(),
+                    "旧排队消息".to_string(),
+                    Vec::new(),
+                    vec![303],
+                    MessageUnderstanding::default(),
+                )
+                .await;
+
+                let new_message_won = std::sync::Arc::new(kovi::tokio::sync::Notify::new());
+                let new_task = {
+                    let scope_lock = scope_mutex(scope);
+                    let new_message_won = std::sync::Arc::clone(&new_message_won);
+                    kovi::tokio::spawn(async move {
+                        let _scope_guard = scope_lock.lock().await;
+                        let ticket = interrupt_locked(scope).await;
+                        new_message_won.notify_one();
+                        ticket
+                    })
+                };
+                new_message_won.notified().await;
+
+                let drainer = kovi::tokio::spawn(async move {
+                    take_pending_window_turn(group_id, completed).await
+                });
+                let new_ticket = new_task.await.expect("新消息任务应正常结束");
+                assert!(drainer.await.expect("旧 drainer 应正常结束").is_none());
+
+                let mut pending = PENDING_WINDOW_MESSAGES.lock().await;
+                let queue = pending.get(&group_id).expect("旧 turn 应被放回队列");
+                assert_eq!(queue.len(), 1);
+                assert_eq!(queue[0].message, "旧排队消息");
+                assert_eq!(queue[0].message_ids, vec![303]);
+                pending.remove(&group_id);
+                assert!(is_current(new_ticket).await);
             });
     }
 

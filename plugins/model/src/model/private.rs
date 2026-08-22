@@ -1,8 +1,10 @@
 use crate::memory::MEMORY_MANAGER;
 use crate::model::coalesce::{MessageCoalescer, MessagePart};
-use crate::model::interrupt::{ReplyScope, interrupt, is_active};
+use crate::model::conversation_coordinator::{ConversationCoordinator, PendingTurn};
+use crate::model::interrupt::{ReplyScope, is_active, scope_mutex};
 use crate::model::recall::{
-    clear_reply_scope, has_recalled_messages, is_recent_bot_message, send_tracked_private_message,
+    clear_reply_scope_locked, has_recalled_messages, is_recent_bot_message,
+    send_tracked_private_message,
 };
 use crate::model::reply::{clear_reply_targets, record_reply_target};
 use crate::model::semantic::{
@@ -12,7 +14,7 @@ use crate::model::semantic::{
 use crate::model::traffic::{InboundScope, bounded_input, should_suppress};
 use crate::model::utils::{
     clear_private_runtime_data, is_bot_admin, is_group_admin_command, is_restricted_command,
-    private_chat,
+    private_chat_claimed,
 };
 use crate::private_image_memory::{
     RecentPrivateImage, forget_private_user_images, recent_private_images, remember_private_images,
@@ -37,13 +39,7 @@ use std::sync::{Arc, LazyLock};
 
 static PRIVATE_MESSAGE_BATCHES: LazyLock<MessageCoalescer<i64>> = LazyLock::new(Default::default);
 
-struct PendingPrivateMessage {
-    nickname: String,
-    message: String,
-    vision_images: Vec<VisionImage>,
-    message_ids: Vec<i32>,
-    understanding: MessageUnderstanding,
-}
+type PendingPrivateMessage = PendingTurn;
 
 /// 当前私聊回复期间保存有界 FIFO，完整保留每个 turn 的正文、附件和消息 ID。
 static PENDING_PRIVATE_MESSAGES: LazyLock<Mutex<HashMap<i64, VecDeque<PendingPrivateMessage>>>> =
@@ -213,14 +209,14 @@ pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<Runtime
             .await;
     let active_reply = is_active(reply_scope).await;
     let immediate_stop = active_reply && looks_like_immediate_stop_request(message);
-    let can_interrupt = immediate_stop || vision_command;
+    let can_interrupt = vision_command;
     let reply_ticket = if can_interrupt {
-        Some(interrupt(reply_scope).await)
+        Some(ConversationCoordinator::interrupt(reply_scope).await)
     } else {
         None
     };
     if immediate_stop {
-        PRIVATE_MESSAGE_BATCHES.cancel(user_id).await;
+        stop_private_reply(user_id).await;
         println!("[INFO] 私聊用户打断回复 (用户: {})", user_id);
         return;
     }
@@ -356,8 +352,7 @@ pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<Runtime
     };
     let asks_for_silence = plain_text && (understanding.wants_no_reply || understanding.wants_stop);
     if asks_for_silence {
-        PRIVATE_MESSAGE_BATCHES.cancel(user_id).await;
-        interrupt(reply_scope).await;
+        stop_private_reply(user_id).await;
         println!(
             "[INFO] 合并后的私聊消息请求停止当前回复 (用户: {})",
             user_id
@@ -436,24 +431,21 @@ pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<Runtime
     } else {
         Vec::new()
     };
-    if should_defer_active_private_message(is_active(reply_scope).await, reply_ticket.is_some()) {
-        println!("[INFO] 私聊已有回复进行中，排队新消息 (用户: {})", user_id);
-        queue_pending_private_message(
-            user_id,
-            nick_name,
-            model_message,
-            vision_images,
-            source_message_ids,
-            understanding.clone(),
-        )
-        .await;
+    let Some(reply_ticket) = claim_or_queue_private_reply(
+        reply_scope,
+        reply_ticket,
+        user_id,
+        nick_name.clone(),
+        model_message.clone(),
+        vision_images.clone(),
+        source_message_ids.clone(),
+        understanding.clone(),
+    )
+    .await
+    else {
         return;
-    }
-    let reply_ticket = match reply_ticket {
-        Some(ticket) => ticket,
-        None => interrupt(reply_scope).await,
     };
-    private_chat(
+    private_chat_claimed(
         user_id,
         &model_message,
         nick_name,
@@ -464,18 +456,75 @@ pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<Runtime
         understanding,
     )
     .await;
-    drain_pending_private_messages(user_id, Arc::clone(&bot)).await;
+    drain_pending_private_messages(user_id, Arc::clone(&bot), reply_ticket).await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn claim_or_queue_private_reply(
+    scope: ReplyScope,
+    ticket: Option<crate::model::ReplyTicket>,
+    user_id: i64,
+    nickname: String,
+    message: String,
+    vision_images: Vec<VisionImage>,
+    message_ids: Vec<i32>,
+    understanding: MessageUnderstanding,
+) -> Option<crate::model::ReplyTicket> {
+    let scope_lock = scope_mutex(scope);
+    let _scope_guard = scope_lock.lock().await;
+    let active = ConversationCoordinator::is_active_locked(scope).await;
+    let has_queued = PENDING_PRIVATE_MESSAGES
+        .lock()
+        .await
+        .get(&user_id)
+        .is_some_and(|queue| !queue.is_empty());
+    if should_defer_active_private_message(active || has_queued, ticket.is_some()) {
+        println!(
+            "[INFO] 私聊已有回复或排队消息进行中，排队新消息 (用户: {})",
+            user_id
+        );
+        queue_pending_private_message(
+            user_id,
+            nickname,
+            message,
+            vision_images,
+            message_ids,
+            understanding,
+        )
+        .await;
+        return None;
+    }
+    let ticket = match ticket {
+        Some(ticket) => ticket,
+        None => ConversationCoordinator::interrupt_locked(scope).await,
+    };
+    ConversationCoordinator::begin_reply_locked(scope, ticket, message_ids)
+        .await
+        .then_some(ticket)
+}
+
+async fn stop_private_reply(user_id: i64) {
+    let scope = ReplyScope::Private(user_id);
+    let scope_lock = scope_mutex(scope);
+    let _scope_guard = scope_lock.lock().await;
+    ConversationCoordinator::interrupt_locked(scope).await;
+    PRIVATE_MESSAGE_BATCHES.cancel(user_id).await;
+    PENDING_PRIVATE_MESSAGES.lock().await.remove(&user_id);
 }
 
 async fn delete_private_user_data(user_id: i64, bot: &RuntimeBot) {
     let scope = ReplyScope::Private(user_id);
-    interrupt(scope).await;
-    PRIVATE_MESSAGE_BATCHES.cancel(user_id).await;
-    PENDING_PRIVATE_MESSAGES.lock().await.remove(&user_id);
+    {
+        let scope_lock = scope_mutex(scope);
+        let _scope_guard = scope_lock.lock().await;
+        ConversationCoordinator::interrupt_locked(scope).await;
+        PRIVATE_MESSAGE_BATCHES.cancel(user_id).await;
+        PENDING_PRIVATE_MESSAGES.lock().await.remove(&user_id);
+        clear_reply_scope_locked(scope).await;
+    }
     clear_private_runtime_data(user_id).await;
     forget_private_user_images(user_id).await;
     clear_reply_targets(scope).await;
-    clear_reply_scope(scope).await;
     clear_user_pending_image_requests(user_id).await;
 
     let memory_result = MEMORY_MANAGER.delete_user_data(user_id).await;
@@ -620,58 +669,36 @@ async fn queue_pending_private_message(
 ) {
     let mut pending = PENDING_PRIVATE_MESSAGES.lock().await;
     let queue = pending.entry(user_id).or_default();
-    let max_pending = crate::config::get().traffic().max_pending_turns();
-    if queue.len() >= max_pending {
-        queue.pop_front();
-        eprintln!(
-            "[WARN] 私聊待处理队列已满，丢弃最旧 turn (用户: {}, 上限: {})",
-            user_id, max_pending
-        );
-    }
-    queue.push_back(PendingPrivateMessage {
-        nickname,
-        message,
-        vision_images,
-        message_ids,
-        understanding,
-    });
+    ConversationCoordinator::enqueue(
+        queue,
+        PendingPrivateMessage {
+            user_id,
+            sender: nickname,
+            message,
+            vision_images,
+            message_ids,
+            understanding,
+        },
+        "私聊",
+        user_id,
+    );
 }
 
-async fn drain_pending_private_messages(user_id: i64, bot: Arc<RuntimeBot>) {
+async fn drain_pending_private_messages(
+    user_id: i64,
+    bot: Arc<RuntimeBot>,
+    mut completed: crate::model::ReplyTicket,
+) {
     loop {
-        let pending = {
-            let mut pending_by_user = PENDING_PRIVATE_MESSAGES.lock().await;
-            let (next, became_empty) = match pending_by_user.get_mut(&user_id) {
-                Some(queue) => {
-                    let next = queue.pop_front();
-                    (next, queue.is_empty())
-                }
-                None => (None, false),
-            };
-            if became_empty {
-                pending_by_user.remove(&user_id);
-            }
-            next
-        };
-        let Some(pending) = pending else {
+        let Some((pending, ticket)) = take_pending_private_turn(user_id, completed).await else {
             return;
         };
-        if is_active(ReplyScope::Private(user_id)).await {
-            PENDING_PRIVATE_MESSAGES
-                .lock()
-                .await
-                .entry(user_id)
-                .or_default()
-                .push_front(pending);
-            return;
-        }
 
         println!("[INFO] 私聊开始处理排队消息 (用户: {})", user_id);
-        let ticket = interrupt(ReplyScope::Private(user_id)).await;
-        private_chat(
+        private_chat_claimed(
             user_id,
             &pending.message,
-            pending.nickname,
+            pending.sender,
             bot.clone(),
             ticket,
             pending.vision_images,
@@ -679,7 +706,24 @@ async fn drain_pending_private_messages(user_id: i64, bot: Arc<RuntimeBot>) {
             pending.understanding,
         )
         .await;
+        completed = ticket;
     }
+}
+
+async fn take_pending_private_turn(
+    user_id: i64,
+    mut completed: crate::model::ReplyTicket,
+) -> Option<(PendingPrivateMessage, crate::model::ReplyTicket)> {
+    let scope = ReplyScope::Private(user_id);
+    let scope_lock = scope_mutex(scope);
+    let _scope_guard = scope_lock.lock().await;
+    let mut pending_by_user = PENDING_PRIVATE_MESSAGES.lock().await;
+    let queue = pending_by_user.entry(user_id).or_default();
+    let result = ConversationCoordinator::claim_next_locked(scope, &mut completed, queue).await;
+    if queue.is_empty() {
+        pending_by_user.remove(&user_id);
+    }
+    result
 }
 
 #[cfg(test)]
@@ -687,7 +731,10 @@ mod tests {
     use super::{
         PENDING_PRIVATE_MESSAGES, looks_like_immediate_stop_request,
         normalized_private_sender_name, queue_pending_private_message, select_recent_images,
-        with_recent_image_context,
+        take_pending_private_turn, with_recent_image_context,
+    };
+    use crate::model::interrupt::{
+        ReplyScope, interrupt, interrupt_locked, is_current, scope_mutex,
     };
     use crate::model::semantic::{ImageReferenceIntent, MessageUnderstanding};
     use crate::private_image_memory::{recent_private_images, remember_private_images};
@@ -752,6 +799,54 @@ mod tests {
                 assert_eq!(queue[1].message_ids, vec![302]);
                 assert!(queue[1].vision_images.is_empty());
                 pending.remove(&user_id);
+            });
+    }
+
+    #[test]
+    fn stale_private_drainer_leaves_a_turn_queued_after_a_new_message_wins() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let user_id = 9_200_003;
+                let scope = ReplyScope::Private(user_id);
+                PENDING_PRIVATE_MESSAGES.lock().await.remove(&user_id);
+                let completed = interrupt(scope).await;
+                queue_pending_private_message(
+                    user_id,
+                    "昵称".to_string(),
+                    "旧排队消息".to_string(),
+                    Vec::new(),
+                    vec![303],
+                    MessageUnderstanding::default(),
+                )
+                .await;
+
+                let new_message_won = std::sync::Arc::new(kovi::tokio::sync::Notify::new());
+                let new_task = {
+                    let scope_lock = scope_mutex(scope);
+                    let new_message_won = std::sync::Arc::clone(&new_message_won);
+                    kovi::tokio::spawn(async move {
+                        let _scope_guard = scope_lock.lock().await;
+                        let ticket = interrupt_locked(scope).await;
+                        new_message_won.notify_one();
+                        ticket
+                    })
+                };
+                new_message_won.notified().await;
+
+                let drainer = kovi::tokio::spawn(async move {
+                    take_pending_private_turn(user_id, completed).await
+                });
+                let new_ticket = new_task.await.expect("新消息任务应正常结束");
+                assert!(drainer.await.expect("旧 drainer 应正常结束").is_none());
+
+                let mut pending = PENDING_PRIVATE_MESSAGES.lock().await;
+                let queue = pending.get(&user_id).expect("旧 turn 应被放回队列");
+                assert_eq!(queue.len(), 1);
+                assert_eq!(queue[0].message, "旧排队消息");
+                assert_eq!(queue[0].message_ids, vec![303]);
+                pending.remove(&user_id);
+                assert!(is_current(new_ticket).await);
             });
     }
     fn image(key: &str) -> ImageAttachment {

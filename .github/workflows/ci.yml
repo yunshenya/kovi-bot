@@ -15,6 +15,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
 
 jobs:
   rust:
@@ -70,6 +71,19 @@ jobs:
       - name: Run tests
         run: cargo test --workspace --all-targets --locked
 
+      - name: Run SSRF boundary tests
+        run: >-
+          cargo test -p model --lib --locked
+          image_security::tests::rejects_non_public_or_ambiguous_image_urls -- --exact
+
+      - name: Run deterministic concurrency tests
+        run: cargo test -p model --features integration-tests --test boundary_integration --locked
+
+      - name: Run black-box Redis integration test
+        run: >-
+          cargo test -p model --features integration-tests --test boundary_integration --locked
+          redis_runtime_store_round_trips_through_the_black_box_api -- --ignored --exact
+
       - name: Run PostgreSQL integration tests
         run: >-
           cargo test -p model --lib --locked
@@ -79,6 +93,10 @@ jobs:
         run: >-
           cargo test -p model --lib --locked
           redis_store::tests::redis_runtime_store_round_trips -- --ignored --exact
+
+      - name: Verify generated build output is bounded
+        run: |
+          test "$(du -sm target | awk '{print $1}')" -lt 16384
 
       - name: Build release binary
         run: cargo build --release --locked

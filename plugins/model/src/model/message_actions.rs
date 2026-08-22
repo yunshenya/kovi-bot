@@ -3,6 +3,7 @@
 //! 模型只负责提出动作意图，真正的消息发送、撤回、分段和打断检查都在这里完成。
 
 use super::interrupt::{ReplyScope, ReplyTicket, is_current};
+use super::message_transport::MessageTransport;
 use super::recall::{RecentBotMessage, recall_bot_messages, record_bot_message};
 use super::reply::{
     ReplyAction, build_outbound_message, parse_reply_output, sanitize_reply_action,
@@ -134,14 +135,7 @@ pub(crate) async fn execute_reply_plan(
         }
 
         let message = build_outbound_message(bubble, &plan.action, index == 0);
-        let sent = match destination {
-            MessageDestination::Group(group_id) => {
-                bot.send_group_msg_return(group_id, message).await
-            }
-            MessageDestination::Private(user_id) => {
-                bot.send_private_msg_return(user_id, message).await
-            }
-        };
+        let sent = MessageTransport::new(bot).send(destination, message).await;
         match sent {
             Ok(message_id) => {
                 if record_bot_message(scope, reply_ticket, message_id, bubble, bot).await {

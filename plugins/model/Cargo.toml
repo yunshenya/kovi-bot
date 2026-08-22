@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 
+[features]
+integration-tests = []
+
 [dependencies]
 kovi.workspace = true
 reqwest.workspace = true

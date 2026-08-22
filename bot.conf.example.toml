@@ -54,6 +54,11 @@ direct_rate_limit = 4
 [memory]
 max_entries = 1000
 retention_days = 30
+profile_ttl_days = 90
+summary_ttl_days = 30
+sticker_ttl_days = 90
+data_minimization = true
+runtime_history_ttl_secs = 3600
 max_conversation_messages = 25
 max_conversation_tokens = 6000
 contextual_memory_limit = 5

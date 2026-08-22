@@ -1,6 +1,9 @@
 //! 用户撤回消息与芸汐回复的生命周期联动。
 
-use super::interrupt::{ReplyScope, ReplyTicket, interrupt_if_current, is_current};
+use super::interrupt::{
+    ReplyScope, ReplyTicket, claim_active_locked, finish_locked, interrupt_if_current_locked,
+    is_current, scope_mutex,
+};
 use crate::private_image_memory::forget_private_message_images;
 use crate::redis_store;
 use kovi::RuntimeBot;
@@ -68,16 +71,35 @@ pub(crate) async fn begin_reply(
     ticket: ReplyTicket,
     source_message_ids: Vec<i32>,
 ) -> bool {
-    let mut lifecycles = REPLY_LIFECYCLES.lock().await;
-    prune_lifecycles(&mut lifecycles);
-    let lifecycle = lifecycles.entry(scope).or_default();
-    lifecycle.last_seen = Instant::now();
-    if source_message_ids
-        .iter()
-        .any(|message_id| lifecycle.recalled_message_ids.contains_key(message_id))
-    {
+    let lock = scope_mutex(scope);
+    let _scope_guard = lock.lock().await;
+    begin_reply_locked(scope, ticket, source_message_ids).await
+}
+
+pub(crate) async fn begin_reply_locked(
+    scope: ReplyScope,
+    ticket: ReplyTicket,
+    source_message_ids: Vec<i32>,
+) -> bool {
+    if !claim_active_locked(ticket).await {
         return false;
     }
+    let recalled = {
+        let mut lifecycles = REPLY_LIFECYCLES.lock().await;
+        prune_lifecycles(&mut lifecycles);
+        let lifecycle = lifecycles.entry(scope).or_default();
+        lifecycle.last_seen = Instant::now();
+        source_message_ids
+            .iter()
+            .any(|message_id| lifecycle.recalled_message_ids.contains_key(message_id))
+    };
+    if recalled {
+        finish_locked(ticket).await;
+        return false;
+    }
+    let mut lifecycles = REPLY_LIFECYCLES.lock().await;
+    let lifecycle = lifecycles.entry(scope).or_default();
+    lifecycle.last_seen = Instant::now();
     lifecycle.active = Some(ActiveReply {
         ticket,
         source_message_ids,
@@ -87,10 +109,18 @@ pub(crate) async fn begin_reply(
 }
 
 pub(crate) async fn finish_reply(scope: ReplyScope, ticket: ReplyTicket) {
+    let lock = scope_mutex(scope);
+    let _scope_guard = lock.lock().await;
+    finish_reply_locked(scope, ticket).await;
+}
+
+pub(crate) async fn finish_reply_locked(scope: ReplyScope, ticket: ReplyTicket) {
     let mut lifecycles = REPLY_LIFECYCLES.lock().await;
+    let mut matched = false;
     if let Some(lifecycle) = lifecycles.get_mut(&scope) {
         if let Some(active) = lifecycle.active.take() {
             if active.ticket == ticket {
+                matched = true;
                 if !active.sent_message_ids.is_empty() {
                     lifecycle.recent_replies.push(RecentReply {
                         source_message_ids: active.source_message_ids,
@@ -103,6 +133,10 @@ pub(crate) async fn finish_reply(scope: ReplyScope, ticket: ReplyTicket) {
             }
         }
         lifecycle.last_seen = Instant::now();
+    }
+    drop(lifecycles);
+    if matched {
+        finish_locked(ticket).await;
     }
 }
 
@@ -266,7 +300,7 @@ pub(crate) async fn is_recent_bot_message(scope: ReplyScope, message_id: i32) ->
         .any(|message| message.message_id == message_id)
 }
 
-pub(crate) async fn clear_reply_scope(scope: ReplyScope) {
+pub(crate) async fn clear_reply_scope_locked(scope: ReplyScope) {
     let redis_ids = load_redis_bot_messages(scope)
         .await
         .into_iter()
@@ -353,47 +387,52 @@ pub(crate) async fn handle_recalled_message(
     if let ReplyScope::Private(user_id) = scope {
         forget_private_message_images(user_id, message_id).await;
     }
-    let (ticket, sent_message_ids, redis_message_ids) = {
-        let mut lifecycles = REPLY_LIFECYCLES.lock().await;
-        prune_lifecycles(&mut lifecycles);
-        let lifecycle = lifecycles.entry(scope).or_default();
-        lifecycle.last_seen = Instant::now();
-        lifecycle
-            .recalled_message_ids
-            .insert(message_id, Instant::now());
-        // 撤回通知也可能来自芸汐自己的消息，先从可撤回候选中移除；
-        // 对普通用户消息则不会产生影响。
-        remove_bot_messages(lifecycle, &[message_id]);
+    let (sent_message_ids, redis_message_ids) = {
+        let scope_lock = scope_mutex(scope);
+        let _scope_guard = scope_lock.lock().await;
+        let (ticket, sent_message_ids, redis_message_ids) = {
+            let mut lifecycles = REPLY_LIFECYCLES.lock().await;
+            prune_lifecycles(&mut lifecycles);
+            let lifecycle = lifecycles.entry(scope).or_default();
+            lifecycle.last_seen = Instant::now();
+            lifecycle
+                .recalled_message_ids
+                .insert(message_id, Instant::now());
+            // 撤回通知也可能来自芸汐自己的消息，先从可撤回候选中移除；
+            // 对普通用户消息则不会产生影响。
+            remove_bot_messages(lifecycle, &[message_id]);
 
-        let mut ticket = None;
-        let mut sent_message_ids = Vec::new();
-        if let Some(active) = lifecycle.active.take() {
-            if active.source_message_ids.contains(&message_id) {
-                ticket = Some(active.ticket);
-                sent_message_ids.extend(active.sent_message_ids);
-            } else {
-                lifecycle.active = Some(active);
+            let mut ticket = None;
+            let mut sent_message_ids = Vec::new();
+            if let Some(active) = lifecycle.active.take() {
+                if active.source_message_ids.contains(&message_id) {
+                    ticket = Some(active.ticket);
+                    sent_message_ids.extend(active.sent_message_ids);
+                } else {
+                    lifecycle.active = Some(active);
+                }
             }
+            lifecycle.recent_replies.retain(|recent| {
+                if recent.source_message_ids.contains(&message_id) {
+                    sent_message_ids.extend(recent.sent_message_ids.iter().copied());
+                    false
+                } else {
+                    true
+                }
+            });
+            remove_bot_messages(lifecycle, &sent_message_ids);
+            let mut redis_message_ids = Vec::with_capacity(sent_message_ids.len() + 1);
+            redis_message_ids.push(message_id);
+            redis_message_ids.extend(sent_message_ids.iter().copied());
+            (ticket, sent_message_ids, redis_message_ids)
+        };
+        if let Some(ticket) = ticket {
+            interrupt_if_current_locked(ticket).await;
         }
-        lifecycle.recent_replies.retain(|recent| {
-            if recent.source_message_ids.contains(&message_id) {
-                sent_message_ids.extend(recent.sent_message_ids.iter().copied());
-                false
-            } else {
-                true
-            }
-        });
-        remove_bot_messages(lifecycle, &sent_message_ids);
-        let mut redis_message_ids = Vec::with_capacity(sent_message_ids.len() + 1);
-        redis_message_ids.push(message_id);
-        redis_message_ids.extend(sent_message_ids.iter().copied());
-        (ticket, sent_message_ids, redis_message_ids)
+        (sent_message_ids, redis_message_ids)
     };
 
     remove_redis_bot_messages(scope, &redis_message_ids).await;
-    if let Some(ticket) = ticket {
-        interrupt_if_current(ticket).await;
-    }
     for sent_message_id in sent_message_ids {
         bot.delete_msg(sent_message_id);
     }
@@ -626,9 +665,10 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ReplyLifecycle, normalize_recall_message_ids, parse_recall_notice,
-        record_recent_bot_message, remove_bot_messages,
+        ReplyLifecycle, begin_reply, finish_reply, normalize_recall_message_ids,
+        parse_recall_notice, record_recent_bot_message, remove_bot_messages,
     };
+    use crate::model::interrupt::{ReplyScope, interrupt, is_active};
     use kovi::event::NoticeEvent;
     use kovi::serde_json::{Value, json};
 
@@ -685,5 +725,24 @@ mod tests {
         remove_bot_messages(&mut lifecycle, &[10, 999]);
         assert_eq!(lifecycle.recent_bot_messages.len(), 1);
         assert_eq!(lifecycle.recent_bot_messages[0].message_id, 11);
+    }
+
+    #[test]
+    fn stale_finish_cannot_release_a_new_lifecycle_reply() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let scope = ReplyScope::Private(9_000_006);
+                let old = interrupt(scope).await;
+                assert!(begin_reply(scope, old, vec![601]).await);
+
+                let new = interrupt(scope).await;
+                assert!(begin_reply(scope, new, vec![602]).await);
+                finish_reply(scope, old).await;
+
+                assert!(is_active(scope).await);
+                finish_reply(scope, new).await;
+                assert!(!is_active(scope).await);
+            });
     }
 }

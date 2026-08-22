@@ -295,6 +295,8 @@ pub struct MemoryManager {
     group_profiles: Arc<Mutex<HashMap<i64, GroupProfile>>>,
     /// 滚动压缩后的对话摘要（`group:<id>` 或 `private:<id>` -> 摘要）。
     conversation_summaries: Arc<Mutex<HashMap<String, String>>>,
+    /// 摘要最后更新时间；与摘要分开保存以兼容旧 JSON 快照。
+    conversation_summary_updated_at: Arc<Mutex<HashMap<String, DateTime<Local>>>>,
     /// 机器人人格状态
     bot_personality: Arc<Mutex<BotPersonality>>,
     /// 旧版记忆文件路径，仅用于迁移和无数据库的单元测试实例
@@ -350,11 +352,21 @@ impl MemoryManager {
             }
         };
 
+        let mut data = data;
+        let now = Local::now();
+        for summary_key in data.conversation_summaries.keys() {
+            data.conversation_summary_updated_at
+                .entry(summary_key.clone())
+                .or_insert(now);
+        }
         Self {
             memories: Arc::new(Mutex::new(data.memories)),
             user_profiles: Arc::new(Mutex::new(data.user_profiles)),
             group_profiles: Arc::new(Mutex::new(data.group_profiles)),
             conversation_summaries: Arc::new(Mutex::new(data.conversation_summaries)),
+            conversation_summary_updated_at: Arc::new(Mutex::new(
+                data.conversation_summary_updated_at,
+            )),
             bot_personality: Arc::new(Mutex::new(data.bot_personality)),
             memory_file: memory_file.to_string(),
             save_lock: Arc::new(Mutex::new(())),
@@ -439,10 +451,18 @@ impl MemoryManager {
     }
 
     async fn replace_data(&self, data: MemoryData) {
+        let mut data = data;
+        let now = Local::now();
+        for summary_key in data.conversation_summaries.keys() {
+            data.conversation_summary_updated_at
+                .entry(summary_key.clone())
+                .or_insert(now);
+        }
         *self.memories.lock().await = data.memories;
         *self.user_profiles.lock().await = data.user_profiles;
         *self.group_profiles.lock().await = data.group_profiles;
         *self.conversation_summaries.lock().await = data.conversation_summaries;
+        *self.conversation_summary_updated_at.lock().await = data.conversation_summary_updated_at;
         *self.bot_personality.lock().await = data.bot_personality;
     }
 
@@ -452,6 +472,11 @@ impl MemoryManager {
             user_profiles: self.user_profiles.lock().await.clone(),
             group_profiles: self.group_profiles.lock().await.clone(),
             conversation_summaries: self.conversation_summaries.lock().await.clone(),
+            conversation_summary_updated_at: self
+                .conversation_summary_updated_at
+                .lock()
+                .await
+                .clone(),
             bot_personality: self.bot_personality.lock().await.clone(),
         }
     }
@@ -595,12 +620,19 @@ impl MemoryManager {
                 serde_json::from_value(row.get("payload"))?,
             );
         }
-        for row in query("SELECT summary_key, summary FROM kovi_bot_conversation_summaries")
-            .fetch_all(pool)
-            .await?
+        for row in
+            query("SELECT summary_key, summary, updated_at FROM kovi_bot_conversation_summaries")
+                .fetch_all(pool)
+                .await?
         {
+            let summary_key = row.get::<String, _>("summary_key");
             data.conversation_summaries
-                .insert(row.get("summary_key"), row.get("summary"));
+                .insert(summary_key.clone(), row.get("summary"));
+            data.conversation_summary_updated_at.insert(
+                summary_key,
+                row.get::<DateTime<Utc>, _>("updated_at")
+                    .with_timezone(&Local),
+            );
         }
         if let Some(row) = query("SELECT payload FROM kovi_bot_personality WHERE id = 1")
             .fetch_optional(pool)
@@ -1244,6 +1276,7 @@ impl MemoryManager {
                     .transpose()?;
             let mut next = mutate(current);
             next.user_id = user_id;
+            minimize_user_profile(&mut next);
             Self::upsert_user_profile(&mut transaction, &next).await?;
             transaction.commit().await?;
             self.user_profiles
@@ -1255,6 +1288,7 @@ impl MemoryManager {
             let current = self.user_profiles.lock().await.get(&user_id).cloned();
             let mut next = mutate(current);
             next.user_id = user_id;
+            minimize_user_profile(&mut next);
             let mut data = self.snapshot().await;
             data.user_profiles.insert(user_id, next.clone());
             self.persist_file_snapshot_locked(&data).await?;
@@ -1268,8 +1302,13 @@ impl MemoryManager {
     }
 
     pub async fn get_user_profile(&self, user_id: i64) -> Option<UserProfile> {
+        let boundary =
+            Local::now() - ChronoDuration::days(crate::config::get().memory().profile_ttl_days());
         let profiles = self.user_profiles.lock().await;
-        profiles.get(&user_id).cloned()
+        profiles
+            .get(&user_id)
+            .filter(|profile| profile.last_interaction > boundary)
+            .cloned()
     }
 
     pub async fn update_group_profile(&self, group_id: i64, profile: GroupProfile) -> Result<()> {
@@ -1300,6 +1339,7 @@ impl MemoryManager {
                     .transpose()?;
             let mut next = mutate(current);
             next.group_id = group_id;
+            minimize_group_profile(&mut next);
             Self::upsert_group_profile(&mut transaction, &next).await?;
             transaction.commit().await?;
             self.group_profiles
@@ -1311,6 +1351,7 @@ impl MemoryManager {
             let current = self.group_profiles.lock().await.get(&group_id).cloned();
             let mut next = mutate(current);
             next.group_id = group_id;
+            minimize_group_profile(&mut next);
             let mut data = self.snapshot().await;
             data.group_profiles.insert(group_id, next.clone());
             self.persist_file_snapshot_locked(&data).await?;
@@ -1324,17 +1365,31 @@ impl MemoryManager {
     }
 
     pub async fn get_group_profile(&self, group_id: i64) -> Option<GroupProfile> {
+        let boundary =
+            Local::now() - ChronoDuration::days(crate::config::get().memory().profile_ttl_days());
         let profiles = self.group_profiles.lock().await;
-        profiles.get(&group_id).cloned()
+        profiles
+            .get(&group_id)
+            .filter(|profile| profile.last_activity > boundary)
+            .cloned()
     }
 
     /// 获取某段私聊或群聊的滚动摘要。
     pub async fn get_conversation_summary(&self, context: &str, subject_id: i64) -> Option<String> {
-        self.conversation_summaries
+        let summary_key = conversation_summary_key(context, subject_id);
+        let boundary =
+            Local::now() - ChronoDuration::days(crate::config::get().memory().summary_ttl_days());
+        let summaries = self.conversation_summaries.lock().await;
+        let updated_at = self
+            .conversation_summary_updated_at
             .lock()
             .await
-            .get(&conversation_summary_key(context, subject_id))
-            .cloned()
+            .get(&summary_key)
+            .copied();
+        if updated_at.is_some_and(|updated_at| updated_at <= boundary) {
+            return None;
+        }
+        summaries.get(&summary_key).cloned()
     }
 
     /// 保存某段私聊或群聊的滚动摘要。每段会覆盖旧摘要，因此不会随轮次无限增长。
@@ -1345,6 +1400,7 @@ impl MemoryManager {
         summary: String,
     ) -> Result<()> {
         let summary_key = conversation_summary_key(context, subject_id);
+        let summary = truncate_chars(&summary, crate::config::get().memory().summary_max_chars());
         let _save_guard = self.save_lock.lock().await;
         if let Some(pool) = self.database_pool.get() {
             let mut transaction = pool.begin().await?;
@@ -1353,7 +1409,11 @@ impl MemoryManager {
             self.conversation_summaries
                 .lock()
                 .await
-                .insert(summary_key, summary);
+                .insert(summary_key.clone(), summary);
+            self.conversation_summary_updated_at
+                .lock()
+                .await
+                .insert(summary_key, Local::now());
             return Ok(());
         }
 
@@ -1364,7 +1424,11 @@ impl MemoryManager {
         self.conversation_summaries
             .lock()
             .await
-            .insert(summary_key, summary);
+            .insert(summary_key.clone(), summary);
+        self.conversation_summary_updated_at
+            .lock()
+            .await
+            .insert(summary_key, Local::now());
         Ok(())
     }
 
@@ -1443,6 +1507,7 @@ impl MemoryManager {
             ConversationScope::Group => data.group_profiles.remove(&subject_id).is_some(),
         };
         let summary_removed = data.conversation_summaries.remove(&summary_key).is_some();
+        data.conversation_summary_updated_at.remove(&summary_key);
         let removed = (before_memories - data.memories.len()) as u64
             + u64::from(profile_removed)
             + u64::from(summary_removed);
@@ -1473,6 +1538,10 @@ impl MemoryManager {
             }
         }
         self.conversation_summaries.lock().await.remove(summary_key);
+        self.conversation_summary_updated_at
+            .lock()
+            .await
+            .remove(summary_key);
     }
 
     pub async fn update_bot_personality(&self, personality: BotPersonality) -> Result<()> {
@@ -1669,6 +1738,8 @@ impl MemoryManager {
             *self.user_profiles.lock().await = data.user_profiles;
             *self.group_profiles.lock().await = data.group_profiles;
             *self.conversation_summaries.lock().await = data.conversation_summaries;
+            *self.conversation_summary_updated_at.lock().await =
+                data.conversation_summary_updated_at;
             return Ok(());
         }
 
@@ -1677,6 +1748,7 @@ impl MemoryManager {
         *self.user_profiles.lock().await = data.user_profiles;
         *self.group_profiles.lock().await = data.group_profiles;
         *self.conversation_summaries.lock().await = data.conversation_summaries;
+        *self.conversation_summary_updated_at.lock().await = data.conversation_summary_updated_at;
         Ok(())
     }
 
@@ -1698,6 +1770,7 @@ impl MemoryManager {
         importance: Option<u8>,
         tags: &[String],
     ) -> Result<()> {
+        let stored_content = minimize_memory_content(content);
         let sequence = MEMORY_ID_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let memory = MemoryEntry {
             id: format!(
@@ -1706,11 +1779,11 @@ impl MemoryManager {
                 Local::now().timestamp_micros(),
                 sequence
             ),
-            content: content.to_string(),
+            content: stored_content.clone(),
             timestamp: Local::now(),
             memory_type: MemoryType::Conversation,
             importance: importance
-                .unwrap_or_else(|| default_conversation_importance(content, context))
+                .unwrap_or_else(|| default_conversation_importance(&stored_content, context))
                 .clamp(0, 10),
             tags: normalize_memory_tags(tags),
             context: context.to_string(),
@@ -1819,12 +1892,13 @@ fn cleanup_old_memories(memories: &mut HashMap<String, MemoryEntry>) -> Vec<Stri
 }
 
 fn cleanup_old_profiles(data: &mut MemoryData) -> (Vec<i64>, Vec<i64>, Vec<String>) {
-    let retention_boundary =
-        Local::now() - chrono::Duration::days(crate::config::get().memory().retention_days());
+    let memory_config = crate::config::get().memory().clone();
+    let profile_boundary = Local::now() - chrono::Duration::days(memory_config.profile_ttl_days());
+    let summary_boundary = Local::now() - chrono::Duration::days(memory_config.summary_ttl_days());
     let mut removed_users = data
         .user_profiles
         .values()
-        .filter(|profile| profile.last_interaction <= retention_boundary)
+        .filter(|profile| profile.last_interaction <= profile_boundary)
         .map(|profile| profile.user_id)
         .collect::<HashSet<_>>();
     let mut remaining_users = data
@@ -1846,7 +1920,7 @@ fn cleanup_old_profiles(data: &mut MemoryData) -> (Vec<i64>, Vec<i64>, Vec<Strin
     let mut removed_groups = data
         .group_profiles
         .values()
-        .filter(|profile| profile.last_activity <= retention_boundary)
+        .filter(|profile| profile.last_activity <= profile_boundary)
         .map(|profile| profile.group_id)
         .collect::<HashSet<_>>();
     let mut remaining_groups = data
@@ -1879,6 +1953,29 @@ fn cleanup_old_profiles(data: &mut MemoryData) -> (Vec<i64>, Vec<i64>, Vec<Strin
         )
         .filter(|summary_key| data.conversation_summaries.remove(summary_key).is_some())
         .collect::<Vec<_>>();
+
+    let mut removed_summary_keys = removed_summary_keys;
+    for summary_key in data
+        .conversation_summaries
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>()
+    {
+        let updated_at = data
+            .conversation_summary_updated_at
+            .get(&summary_key)
+            .copied()
+            .unwrap_or_else(Local::now);
+        if updated_at <= summary_boundary {
+            data.conversation_summaries.remove(&summary_key);
+            removed_summary_keys.push(summary_key);
+        }
+    }
+    for summary_key in &removed_summary_keys {
+        data.conversation_summary_updated_at.remove(summary_key);
+    }
+    data.conversation_summary_updated_at
+        .retain(|summary_key, _| data.conversation_summaries.contains_key(summary_key));
 
     if !removed_users.is_empty() || !removed_groups.is_empty() {
         println!(
@@ -1950,6 +2047,82 @@ fn normalize_memory_tags(tags: &[String]) -> Vec<String> {
     normalized
 }
 
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    value.chars().take(max_chars).collect()
+}
+
+fn minimize_memory_content(content: &str) -> String {
+    let normalized = content.split_whitespace().collect::<Vec<_>>().join(" ");
+    let max_chars = if crate::config::get().memory().data_minimization() {
+        600
+    } else {
+        1_600
+    };
+    truncate_chars(&normalized, max_chars)
+}
+
+fn minimize_user_profile(profile: &mut UserProfile) {
+    let minimal = crate::config::get().memory().data_minimization();
+    profile.nickname = truncate_chars(profile.nickname.trim(), if minimal { 80 } else { 160 });
+    profile.personality_traits = normalize_profile_values(
+        &profile.personality_traits,
+        if minimal { 4 } else { 12 },
+        if minimal { 48 } else { 80 },
+    );
+    profile.interests = normalize_profile_values(
+        &profile.interests,
+        if minimal { 6 } else { 16 },
+        if minimal { 48 } else { 80 },
+    );
+    let mood_limit = if minimal { 8 } else { 16 };
+    if profile.mood_history.len() > mood_limit {
+        let remove_count = profile.mood_history.len() - mood_limit;
+        profile.mood_history.drain(..remove_count);
+    }
+    for entry in &mut profile.mood_history {
+        entry.mood = truncate_chars(entry.mood.trim(), 32);
+        entry.trigger = truncate_chars(entry.trigger.trim(), if minimal { 80 } else { 160 });
+        entry.intensity = entry.intensity.min(10);
+    }
+    profile.relationship_level = profile.relationship_level.min(10);
+}
+
+fn minimize_group_profile(profile: &mut GroupProfile) {
+    let minimal = crate::config::get().memory().data_minimization();
+    profile.group_name = truncate_chars(profile.group_name.trim(), if minimal { 80 } else { 160 });
+    profile.group_personality = truncate_chars(
+        profile.group_personality.trim(),
+        if minimal { 120 } else { 240 },
+    );
+    profile.conversation_topics = normalize_profile_values(
+        &profile.conversation_topics,
+        if minimal { 8 } else { 20 },
+        if minimal { 48 } else { 80 },
+    );
+    let member_limit = if minimal { 32 } else { 64 };
+    let mut seen = HashSet::new();
+    profile
+        .active_members
+        .retain(|member_id| *member_id > 0 && seen.insert(*member_id));
+    profile.active_members.truncate(member_limit);
+    profile.activity_level = profile.activity_level.min(10);
+}
+
+fn normalize_profile_values(values: &[String], max_items: usize, max_chars: usize) -> Vec<String> {
+    let mut normalized = Vec::new();
+    for value in values {
+        let value = truncate_chars(value.trim(), max_chars);
+        if value.is_empty() || normalized.iter().any(|existing| existing == &value) {
+            continue;
+        }
+        normalized.push(value);
+        if normalized.len() >= max_items {
+            break;
+        }
+    }
+    normalized
+}
+
 fn memory_type_database_value(memory_type: &MemoryType) -> &'static str {
     match memory_type {
         MemoryType::Conversation => "Conversation",
@@ -2013,6 +2186,8 @@ struct MemoryData {
     user_profiles: HashMap<i64, UserProfile>,
     group_profiles: HashMap<i64, GroupProfile>,
     conversation_summaries: HashMap<String, String>,
+    #[serde(default)]
+    conversation_summary_updated_at: HashMap<String, DateTime<Local>>,
     bot_personality: BotPersonality,
 }
 
@@ -2038,7 +2213,8 @@ impl Default for BotPersonality {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConversationScope, GroupProfile, MemoryLookup, MemoryLookupType, MemoryManager, UserProfile,
+        ConversationScope, GroupProfile, MemoryLookup, MemoryLookupType, MemoryManager, MoodEntry,
+        UserProfile, conversation_summary_key,
     };
     use chrono::Local;
     use std::sync::Arc;
@@ -2398,11 +2574,93 @@ mod tests {
                     .update_conversation_summary("private_chat", 77, "过期摘要".to_string())
                     .await
                     .expect("应写入摘要");
+                assert!(manager.get_user_profile(77).await.is_none());
                 manager.compact_memories().await.expect("应执行保留期清理");
                 assert!(manager.get_user_profile(77).await.is_none());
                 assert!(
                     manager
                         .get_conversation_summary("private_chat", 77)
+                        .await
+                        .is_none()
+                );
+                std::fs::remove_file(path).expect("应清理测试记忆文件");
+            });
+    }
+
+    #[test]
+    fn data_minimization_bounds_profiles_and_summary_ttl_is_enforced() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let path = temporary_memory_path("data-minimization");
+                let manager = MemoryManager::new(path.to_str().expect("临时路径应为 UTF-8"));
+                let now = Local::now();
+                manager
+                    .update_user_profile(
+                        88,
+                        UserProfile {
+                            user_id: 88,
+                            nickname: "昵称".repeat(100),
+                            personality_traits: (0..12)
+                                .map(|index| format!("trait-{index}"))
+                                .collect(),
+                            interests: (0..16).map(|index| format!("interest-{index}")).collect(),
+                            relationship_level: 99,
+                            last_interaction: now,
+                            interaction_count: 1,
+                            last_private_interaction: None,
+                            mood_history: (0..16)
+                                .map(|index| MoodEntry {
+                                    mood: format!("mood-{index}"),
+                                    intensity: 99,
+                                    timestamp: now,
+                                    trigger: "trigger".repeat(100),
+                                })
+                                .collect(),
+                        },
+                    )
+                    .await
+                    .expect("应写入档案");
+                let profile = manager.get_user_profile(88).await.expect("档案应存在");
+                assert_eq!(profile.nickname.chars().count(), 80);
+                assert_eq!(profile.personality_traits.len(), 4);
+                assert_eq!(profile.interests.len(), 6);
+                assert_eq!(profile.mood_history.len(), 8);
+                assert!(
+                    profile
+                        .mood_history
+                        .iter()
+                        .all(|entry| entry.intensity <= 10)
+                );
+                assert!(
+                    profile
+                        .mood_history
+                        .iter()
+                        .all(|entry| entry.trigger.chars().count() <= 80)
+                );
+
+                let summary_key = conversation_summary_key("private_chat", 88);
+                manager
+                    .update_conversation_summary("private_chat", 88, "摘要".repeat(1_000))
+                    .await
+                    .expect("应写入摘要");
+                assert_eq!(
+                    manager
+                        .get_conversation_summary("private_chat", 88)
+                        .await
+                        .expect("摘要应存在")
+                        .chars()
+                        .count(),
+                    1_500
+                );
+                manager
+                    .conversation_summary_updated_at
+                    .lock()
+                    .await
+                    .insert(summary_key, now - chrono::Duration::days(31));
+                assert!(
+                    manager
+                        .get_conversation_summary("private_chat", 88)
                         .await
                         .is_none()
                 );

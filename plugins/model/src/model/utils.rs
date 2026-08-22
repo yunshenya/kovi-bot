@@ -8,11 +8,13 @@
 //! - 用户档案管理
 //! - 系统状态监控
 
-use super::interrupt::{ReplyTicket, finish, is_current, mark_active};
-use super::memory_query::{interruptible_model_call, params_model_with_tool_access};
+use super::interrupt::{ReplyTicket, is_current};
+use super::memory_query::interruptible_model_call;
+use super::memory_repository::MEMORY_REPOSITORY;
 use super::message_actions::{
     MessageDestination, ReplyPlan, execute_reply_plan, normalize_legacy_message_text,
 };
+use super::model_gateway::ModelGateway;
 use super::recall::{
     RecentBotMessage, begin_reply, finish_reply, record_bot_message, send_tracked_group_message,
 };
@@ -240,8 +242,8 @@ pub async fn control_model(
 
     // 记录对话记忆
     let memory_tags = understanding.memory_tags();
-    if let Err(e) = MEMORY_MANAGER
-        .add_conversation_memory_with_hints(
+    if let Err(e) = MEMORY_REPOSITORY
+        .add_conversation(
             group_id,
             &format!("{}: {}", sender_identity, message),
             "group_chat",
@@ -254,8 +256,8 @@ pub async fn control_model(
     }
 
     // 获取相关记忆来增强上下文
-    let contextual_memories = MEMORY_MANAGER
-        .get_contextual_memories(
+    let contextual_memories = MEMORY_REPOSITORY
+        .contextual_memories(
             group_id,
             "group_chat",
             message,
@@ -310,7 +312,7 @@ pub async fn control_model(
         super::interrupt::ReplyScope::Group(group_id),
     )
     .await;
-    let response = params_model_with_tool_access(
+    let response = ModelGateway::complete(
         &mut request_messages,
         group_id,
         "group_chat",
@@ -358,7 +360,7 @@ pub async fn control_model(
         limit_memory_size(&mut messages);
         return false;
     }
-    let personality = MEMORY_MANAGER.get_bot_personality().await;
+    let personality = MEMORY_REPOSITORY.personality().await;
     let execution = execute_reply_plan(
         &bot,
         MessageDestination::Group(group_id),
@@ -414,8 +416,14 @@ pub async fn control_model(
             .len()
             .saturating_sub(execution.sent_messages.len())
     );
-    if let Err(error) = MEMORY_MANAGER
-        .add_conversation_memory(group_id, &format!("芸汐: {}", stored_reply), "group_chat")
+    if let Err(error) = MEMORY_REPOSITORY
+        .add_conversation(
+            group_id,
+            &format!("芸汐: {}", stored_reply),
+            "group_chat",
+            None,
+            &[],
+        )
         .await
     {
         eprintln!(
@@ -543,9 +551,7 @@ async fn maybe_compress_conversation(
     reply_ticket: ReplyTicket,
 ) -> Option<String> {
     let memory_config = config::get().memory().clone();
-    let previous_summary = MEMORY_MANAGER
-        .get_conversation_summary(context, subject_id)
-        .await;
+    let previous_summary = MEMORY_REPOSITORY.summary(context, subject_id).await;
     let Some(compress_end) = compression_cutoff(
         messages,
         memory_config.max_conversation_messages(),
@@ -568,8 +574,8 @@ async fn maybe_compress_conversation(
     };
     messages.drain(1..compress_end);
 
-    if let Err(error) = MEMORY_MANAGER
-        .update_conversation_summary(context, subject_id, summary.clone())
+    if let Err(error) = MEMORY_REPOSITORY
+        .update_summary(context, subject_id, summary.clone())
         .await
     {
         eprintln!(
@@ -1136,7 +1142,7 @@ fn is_model_error_response(content: &str) -> bool {
 /// # 返回值
 /// 本轮回复风格参考
 async fn generate_reply_guidance(messages: &[BotMemory]) -> String {
-    let personality = MEMORY_MANAGER.get_bot_personality().await;
+    let personality = MEMORY_REPOSITORY.personality().await;
     let has_contextual_memories = messages
         .iter()
         .any(|message| message.content.contains("<参考上下文"));
@@ -1187,9 +1193,19 @@ async fn touch_runtime_history(
     subject_id: i64,
 ) -> Vec<i64> {
     let mut access = access_map.lock().await;
-    access.insert(subject_id, Instant::now());
+    let now = Instant::now();
+    let ttl = Duration::from_secs(config::get().memory().runtime_history_ttl_secs());
+    let mut evicted = access
+        .iter()
+        .filter(|(_, last_access)| now.duration_since(**last_access) >= ttl)
+        .map(|(id, _)| *id)
+        .collect::<Vec<_>>();
+    for id in &evicted {
+        access.remove(id);
+    }
+    access.insert(subject_id, now);
     if access.len() <= MAX_RUNTIME_CONVERSATIONS {
-        return Vec::new();
+        return evicted;
     }
     let mut by_age = access
         .iter()
@@ -1197,11 +1213,15 @@ async fn touch_runtime_history(
         .collect::<Vec<_>>();
     by_age.sort_by_key(|(_, last_access)| *last_access);
     let remove_count = access.len() - MAX_RUNTIME_CONVERSATIONS;
-    let evicted = by_age
-        .into_iter()
-        .take(remove_count)
-        .map(|(id, _)| id)
-        .collect::<Vec<_>>();
+    evicted.extend(
+        by_age
+            .into_iter()
+            .take(remove_count)
+            .map(|(id, _)| id)
+            .filter(|id| *id != subject_id),
+    );
+    evicted.sort_unstable();
+    evicted.dedup();
     for id in &evicted {
         access.remove(id);
     }
@@ -1209,6 +1229,7 @@ async fn touch_runtime_history(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 pub async fn process_group_reply(
     group_id: i64,
     user_id: i64,
@@ -1221,14 +1242,80 @@ pub async fn process_group_reply(
     source_message_ids: Vec<i32>,
     understanding: MessageUnderstanding,
 ) -> bool {
+    process_group_reply_inner(
+        group_id,
+        user_id,
+        message,
+        bot,
+        sender,
+        reply_ticket,
+        max_output_tokens,
+        vision_images,
+        source_message_ids,
+        understanding,
+        false,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn process_group_reply_claimed(
+    group_id: i64,
+    user_id: i64,
+    message: &str,
+    bot: Arc<RuntimeBot>,
+    sender: String,
+    reply_ticket: ReplyTicket,
+    max_output_tokens: Option<u32>,
+    vision_images: Vec<VisionImage>,
+    source_message_ids: Vec<i32>,
+    understanding: MessageUnderstanding,
+) -> bool {
+    process_group_reply_inner(
+        group_id,
+        user_id,
+        message,
+        bot,
+        sender,
+        reply_ticket,
+        max_output_tokens,
+        vision_images,
+        source_message_ids,
+        understanding,
+        true,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn process_group_reply_inner(
+    group_id: i64,
+    user_id: i64,
+    message: &str,
+    bot: Arc<RuntimeBot>,
+    sender: String,
+    reply_ticket: ReplyTicket,
+    max_output_tokens: Option<u32>,
+    vision_images: Vec<VisionImage>,
+    source_message_ids: Vec<i32>,
+    understanding: MessageUnderstanding,
+    already_claimed: bool,
+) -> bool {
+    let scope = super::interrupt::ReplyScope::Group(group_id);
     if message.trim() == "#禁言" {
         instance_is_ban().lock().await.insert(group_id, true);
         send_tracked_group_message(&bot, group_id, "禁言成功").await;
+        if already_claimed {
+            finish_reply(scope, reply_ticket).await;
+        }
         return false;
     }
     if message.trim() == "#结束禁言" {
         instance_is_ban().lock().await.insert(group_id, false);
         send_tracked_group_message(&bot, group_id, "结束成功").await;
+        if already_claimed {
+            finish_reply(scope, reply_ticket).await;
+        }
         return false;
     }
 
@@ -1239,12 +1326,7 @@ pub async fn process_group_reply(
         .get(&group_id)
         .unwrap_or(&false);
     if !is_banned {
-        if !mark_active(reply_ticket).await {
-            return false;
-        }
-        let scope = super::interrupt::ReplyScope::Group(group_id);
-        if !begin_reply(scope, reply_ticket, source_message_ids).await {
-            finish(reply_ticket).await;
+        if !already_claimed && !begin_reply(scope, reply_ticket, source_message_ids).await {
             return false;
         }
         let replied = control_model(
@@ -1260,9 +1342,11 @@ pub async fn process_group_reply(
         )
         .await;
         finish_reply(scope, reply_ticket).await;
-        finish(reply_ticket).await;
         replied
     } else {
+        if already_claimed {
+            finish_reply(scope, reply_ticket).await;
+        }
         false
     }
 }
@@ -1323,6 +1407,7 @@ fn format_adapter_status(data: &Value) -> String {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 pub async fn private_chat(
     user_id: i64,
     message: &str,
@@ -1333,12 +1418,59 @@ pub async fn private_chat(
     source_message_ids: Vec<i32>,
     understanding: MessageUnderstanding,
 ) {
-    if !mark_active(reply_ticket).await {
-        return;
-    }
+    private_chat_inner_with_claim(
+        user_id,
+        message,
+        nickname,
+        bot,
+        reply_ticket,
+        vision_images,
+        source_message_ids,
+        understanding,
+        false,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn private_chat_claimed(
+    user_id: i64,
+    message: &str,
+    nickname: String,
+    bot: Arc<RuntimeBot>,
+    reply_ticket: ReplyTicket,
+    vision_images: Vec<VisionImage>,
+    source_message_ids: Vec<i32>,
+    understanding: MessageUnderstanding,
+) {
+    private_chat_inner_with_claim(
+        user_id,
+        message,
+        nickname,
+        bot,
+        reply_ticket,
+        vision_images,
+        source_message_ids,
+        understanding,
+        true,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn private_chat_inner_with_claim(
+    user_id: i64,
+    message: &str,
+    nickname: String,
+    bot: Arc<RuntimeBot>,
+    reply_ticket: ReplyTicket,
+    vision_images: Vec<VisionImage>,
+    source_message_ids: Vec<i32>,
+    understanding: MessageUnderstanding,
+    already_claimed: bool,
+) {
     let scope = super::interrupt::ReplyScope::Private(user_id);
-    if !begin_reply(scope, reply_ticket, source_message_ids).await {
-        finish(reply_ticket).await;
+    if !already_claimed && !begin_reply(scope, reply_ticket, source_message_ids).await {
         return;
     }
     private_chat_inner(
@@ -1352,7 +1484,6 @@ pub async fn private_chat(
     )
     .await;
     finish_reply(scope, reply_ticket).await;
-    finish(reply_ticket).await;
 }
 
 async fn private_chat_inner(
@@ -1385,8 +1516,8 @@ async fn private_chat_inner(
 
     // 记录对话记忆
     let memory_tags = understanding.memory_tags();
-    if let Err(e) = MEMORY_MANAGER
-        .add_conversation_memory_with_hints(
+    if let Err(e) = MEMORY_REPOSITORY
+        .add_conversation(
             user_id,
             &model_user_message,
             "private_chat",
@@ -1403,8 +1534,8 @@ async fn private_chat_inner(
 
     // 获取用户档案和个性化信息
     let user_profile = MEMORY_MANAGER.get_user_profile(user_id).await;
-    let contextual_memories = MEMORY_MANAGER
-        .get_contextual_memories(
+    let contextual_memories = MEMORY_REPOSITORY
+        .contextual_memories(
             user_id,
             "private_chat",
             message,
@@ -1455,7 +1586,7 @@ async fn private_chat_inner(
         super::interrupt::ReplyScope::Private(user_id),
     )
     .await;
-    let bot_content = params_model_with_tool_access(
+    let bot_content = ModelGateway::complete(
         &mut request_messages,
         user_id,
         "private_chat",
@@ -1503,7 +1634,7 @@ async fn private_chat_inner(
         limit_memory_size(&mut history);
         return;
     }
-    let personality = MEMORY_MANAGER.get_bot_personality().await;
+    let personality = MEMORY_REPOSITORY.personality().await;
     let execution = execute_reply_plan(
         &bot,
         MessageDestination::Private(user_id),
@@ -1559,8 +1690,14 @@ async fn private_chat_inner(
             .len()
             .saturating_sub(execution.sent_messages.len())
     );
-    if let Err(error) = MEMORY_MANAGER
-        .add_conversation_memory(user_id, &format!("芸汐: {}", stored_reply), "private_chat")
+    if let Err(error) = MEMORY_REPOSITORY
+        .add_conversation(
+            user_id,
+            &format!("芸汐: {}", stored_reply),
+            "private_chat",
+            None,
+            &[],
+        )
         .await
     {
         eprintln!(

@@ -2,7 +2,8 @@
 
 use kovi::tokio::sync::Mutex;
 use std::collections::HashMap;
-use std::sync::LazyLock;
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -36,13 +37,34 @@ impl Default for ReplyState {
 
 static REPLY_STATES: LazyLock<Mutex<HashMap<ReplyScope, ReplyState>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+const SCOPE_LOCK_SHARDS: usize = 64;
+static SCOPE_LOCKS: LazyLock<Vec<Arc<Mutex<()>>>> = LazyLock::new(|| {
+    (0..SCOPE_LOCK_SHARDS)
+        .map(|_| Arc::new(Mutex::new(())))
+        .collect()
+});
+
+/// 同一会话的队列、回复代数和消息生命周期必须共用线性化点；分片只减少
+/// 不同会话之间的锁竞争，不改变同一会话内的顺序。
+pub(crate) fn scope_mutex(scope: ReplyScope) -> Arc<Mutex<()>> {
+    let mut hasher = DefaultHasher::new();
+    scope.hash(&mut hasher);
+    Arc::clone(&SCOPE_LOCKS[(hasher.finish() as usize) % SCOPE_LOCK_SHARDS])
+}
 
 /// 新的相关消息到达时推进代数，使此前的模型结果和未发气泡全部失效。
 pub(crate) async fn interrupt(scope: ReplyScope) -> ReplyTicket {
+    let lock = scope_mutex(scope);
+    let _scope_guard = lock.lock().await;
+    interrupt_locked(scope).await
+}
+
+pub(crate) async fn interrupt_locked(scope: ReplyScope) -> ReplyTicket {
     let mut states = REPLY_STATES.lock().await;
     prune_states(&mut states);
     let state = states.entry(scope).or_default();
     state.generation = state.generation.wrapping_add(1);
+    state.active_generation = None;
     state.last_seen = Instant::now();
     ReplyTicket {
         scope,
@@ -52,7 +74,14 @@ pub(crate) async fn interrupt(scope: ReplyScope) -> ReplyTicket {
 
 /// 仅当指定 ticket 仍是当前代数时推进代数。
 /// 用于撤回等延迟事件，避免它们误中断随后已经开始的新回复。
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn interrupt_if_current(ticket: ReplyTicket) -> bool {
+    let lock = scope_mutex(ticket.scope);
+    let _scope_guard = lock.lock().await;
+    interrupt_if_current_locked(ticket).await
+}
+
+pub(crate) async fn interrupt_if_current_locked(ticket: ReplyTicket) -> bool {
     let mut states = REPLY_STATES.lock().await;
     let Some(state) = states.get_mut(&ticket.scope) else {
         return false;
@@ -61,6 +90,7 @@ pub(crate) async fn interrupt_if_current(ticket: ReplyTicket) -> bool {
         return false;
     }
     state.generation = state.generation.wrapping_add(1);
+    state.active_generation = None;
     state.last_seen = Instant::now();
     true
 }
@@ -70,6 +100,12 @@ pub(crate) async fn interrupt_if_current(ticket: ReplyTicket) -> bool {
 /// 不能覆盖已经在预处理的新消息，多个 drainer 也不能互相抢占。
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn claim_follow_up(completed: ReplyTicket) -> Option<ReplyTicket> {
+    let lock = scope_mutex(completed.scope);
+    let _scope_guard = lock.lock().await;
+    claim_follow_up_locked(completed).await
+}
+
+pub(crate) async fn claim_follow_up_locked(completed: ReplyTicket) -> Option<ReplyTicket> {
     let mut states = REPLY_STATES.lock().await;
     let state = states.get_mut(&completed.scope)?;
     if state.generation != completed.generation || state.active_generation.is_some() {
@@ -85,6 +121,12 @@ pub(crate) async fn claim_follow_up(completed: ReplyTicket) -> Option<ReplyTicke
 }
 
 pub(crate) async fn is_current(ticket: ReplyTicket) -> bool {
+    let lock = scope_mutex(ticket.scope);
+    let _scope_guard = lock.lock().await;
+    is_current_locked(ticket).await
+}
+
+pub(crate) async fn is_current_locked(ticket: ReplyTicket) -> bool {
     REPLY_STATES
         .lock()
         .await
@@ -92,7 +134,14 @@ pub(crate) async fn is_current(ticket: ReplyTicket) -> bool {
         .is_some_and(|state| state.generation == ticket.generation)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn mark_active(ticket: ReplyTicket) -> bool {
+    let lock = scope_mutex(ticket.scope);
+    let _scope_guard = lock.lock().await;
+    claim_active_locked(ticket).await
+}
+
+pub(crate) async fn claim_active_locked(ticket: ReplyTicket) -> bool {
     let mut states = REPLY_STATES.lock().await;
     let Some(state) = states.get_mut(&ticket.scope) else {
         return false;
@@ -105,7 +154,14 @@ pub(crate) async fn mark_active(ticket: ReplyTicket) -> bool {
     true
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn finish(ticket: ReplyTicket) {
+    let lock = scope_mutex(ticket.scope);
+    let _scope_guard = lock.lock().await;
+    finish_locked(ticket).await;
+}
+
+pub(crate) async fn finish_locked(ticket: ReplyTicket) {
     let mut states = REPLY_STATES.lock().await;
     if let Some(state) = states.get_mut(&ticket.scope) {
         if state.active_generation == Some(ticket.generation) {
@@ -116,6 +172,12 @@ pub(crate) async fn finish(ticket: ReplyTicket) {
 }
 
 pub(crate) async fn is_active(scope: ReplyScope) -> bool {
+    let lock = scope_mutex(scope);
+    let _scope_guard = lock.lock().await;
+    is_active_locked(scope).await
+}
+
+pub(crate) async fn is_active_locked(scope: ReplyScope) -> bool {
     REPLY_STATES
         .lock()
         .await
@@ -183,6 +245,25 @@ mod tests {
                 assert!(is_current(new).await);
                 assert!(interrupt_if_current(new).await);
                 assert!(!is_current(new).await);
+            });
+    }
+
+    #[test]
+    fn stale_recall_cannot_interrupt_a_new_active_reply() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let scope = ReplyScope::Group(9_000_005);
+                let old = interrupt(scope).await;
+                assert!(mark_active(old).await);
+                let new = interrupt(scope).await;
+                assert!(mark_active(new).await);
+
+                assert!(!interrupt_if_current(old).await);
+                assert!(is_current(new).await);
+                assert!(is_active(scope).await);
+
+                finish(new).await;
             });
     }
 

@@ -26,6 +26,8 @@ url = "2.5.8"
 # Line tables preserve useful backtraces while avoiding multi-gigabyte full debug info.
 [profile.dev]
 debug = 1
+incremental = false
 
 [profile.test]
 debug = 1
+incremental = false

@@ -1,10 +1,10 @@
 use crate::config;
 use crate::model::traffic::truncate_chars;
 use crate::vision::{ImageAttachment, merge_image_attachments};
-use kovi::tokio::sync::Mutex;
+use kovi::tokio::sync::{Mutex, Notify};
 use std::collections::HashMap;
 use std::hash::Hash;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[derive(Debug, PartialEq, Eq)]
@@ -29,7 +29,7 @@ pub(crate) struct MessagePart {
 }
 
 struct PendingBatch {
-    generation: u64,
+    identity: Arc<BatchIdentity>,
     parts: Vec<String>,
     intent_parts: Vec<String>,
     char_count: usize,
@@ -42,10 +42,13 @@ struct PendingBatch {
     updated_at: Instant,
 }
 
+#[derive(Debug)]
+struct BatchIdentity;
+
 impl Default for PendingBatch {
     fn default() -> Self {
         Self {
-            generation: 0,
+            identity: Arc::new(BatchIdentity),
             parts: Vec::new(),
             intent_parts: Vec::new(),
             char_count: 0,
@@ -105,14 +108,12 @@ impl BatchPolicy {
 /// 为每个聊天键提供轻量防抖队列；只有最后到达的任务会取走完整批次。
 pub(crate) struct MessageCoalescer<K> {
     pending: Mutex<HashMap<K, PendingBatch>>,
-    next_generation: AtomicU64,
 }
 
 impl<K> Default for MessageCoalescer<K> {
     fn default() -> Self {
         Self {
             pending: Mutex::new(HashMap::new()),
-            next_generation: AtomicU64::new(0),
         }
     }
 }
@@ -123,6 +124,18 @@ where
 {
     pub(crate) async fn push(&self, key: K, part: MessagePart) -> Option<TextBatch> {
         self.push_with_policy(key, part, BatchPolicy::from_config())
+            .await
+    }
+
+    #[cfg(test)]
+    async fn push_with_policy_paused(
+        &self,
+        key: K,
+        part: MessagePart,
+        policy: BatchPolicy,
+        hook: Arc<BatchPushHook>,
+    ) -> Option<TextBatch> {
+        self.push_with_policy_internal(key, part, policy, Some(hook))
             .await
     }
 
@@ -137,8 +150,19 @@ where
     async fn push_with_policy(
         &self,
         key: K,
+        part: MessagePart,
+        policy: BatchPolicy,
+    ) -> Option<TextBatch> {
+        self.push_with_policy_internal(key, part, policy, None)
+            .await
+    }
+
+    async fn push_with_policy_internal(
+        &self,
+        key: K,
         mut part: MessagePart,
         policy: BatchPolicy,
+        hook: Option<Arc<BatchPushHook>>,
     ) -> Option<TextBatch> {
         part.text = truncate_chars(&part.text, policy.max_input_chars);
         part.intent_text = truncate_chars(&part.intent_text, policy.max_input_chars);
@@ -155,9 +179,7 @@ where
             });
         }
 
-        // 代数必须跨批次删除与取消持续单调；否则旧 sleeper 可能把后来重建、
-        // 恰好使用相同局部代数的批次误认为自己的批次并取走（ABA）。
-        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+        let identity = Arc::new(BatchIdentity);
         let delay = {
             let now = Instant::now();
             let mut pending = self.pending.lock().await;
@@ -169,7 +191,7 @@ where
             if batch.parts.is_empty() {
                 batch.started_at = now;
             }
-            batch.generation = generation;
+            batch.identity = Arc::clone(&identity);
             let remaining = policy.max_input_chars.saturating_sub(batch.char_count);
             let bounded_text = truncate_chars(&part.text, remaining.max(1));
             let bounded_intent = truncate_chars(&part.intent_text, policy.max_input_chars);
@@ -206,9 +228,16 @@ where
         if !delay.is_zero() {
             kovi::tokio::time::sleep(delay).await;
         }
+        if let Some(hook) = hook {
+            hook.inserted.notify_one();
+            hook.release.notified().await;
+        }
 
         let mut pending = self.pending.lock().await;
-        if pending.get(&key)?.generation != generation {
+        if !pending
+            .get(&key)
+            .is_some_and(|batch| Arc::ptr_eq(&batch.identity, &identity))
+        {
             return None;
         }
         pending.remove(&key).map(|batch| TextBatch {
@@ -221,6 +250,11 @@ where
             message_ids: batch.message_ids,
         })
     }
+}
+
+struct BatchPushHook {
+    inserted: Notify,
+    release: Notify,
 }
 
 fn adaptive_delay(message: &str, policy: BatchPolicy) -> Duration {
@@ -277,7 +311,10 @@ fn ends_complete_sentence(text: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{BatchPolicy, MessageCoalescer, MessagePart, TextBatch, adaptive_delay};
+    use super::{
+        BatchPolicy, BatchPushHook, MessageCoalescer, MessagePart, TextBatch, adaptive_delay,
+    };
+    use kovi::tokio::sync::Notify;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -427,6 +464,84 @@ mod tests {
                 kovi::tokio::time::sleep(Duration::from_millis(5)).await;
                 coalescer.cancel(12_i64).await;
                 assert!(pending.await.expect("任务应正常结束").is_none());
+            });
+    }
+
+    #[test]
+    fn stale_sleeper_cannot_take_a_recreated_batch_after_cancel() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let coalescer = Arc::new(MessageCoalescer::default());
+                let old_hook = Arc::new(BatchPushHook {
+                    inserted: Notify::new(),
+                    release: Notify::new(),
+                });
+                let old_task = {
+                    let coalescer = Arc::clone(&coalescer);
+                    let hook = Arc::clone(&old_hook);
+                    kovi::tokio::spawn(async move {
+                        coalescer
+                            .push_with_policy_paused(
+                                14_i64,
+                                MessagePart {
+                                    text: "旧批次".to_string(),
+                                    intent_text: "旧批次".to_string(),
+                                    addressed: false,
+                                    plain_text: true,
+                                    vision_requested: false,
+                                    images: Vec::new(),
+                                    message_ids: vec![501],
+                                },
+                                BatchPolicy::testing(),
+                                hook,
+                            )
+                            .await
+                    })
+                };
+                old_hook.inserted.notified().await;
+                coalescer.cancel(14_i64).await;
+
+                let new_hook = Arc::new(BatchPushHook {
+                    inserted: Notify::new(),
+                    release: Notify::new(),
+                });
+                let new_task = {
+                    let coalescer = Arc::clone(&coalescer);
+                    let hook = Arc::clone(&new_hook);
+                    kovi::tokio::spawn(async move {
+                        coalescer
+                            .push_with_policy_paused(
+                                14_i64,
+                                MessagePart {
+                                    text: "新批次。".to_string(),
+                                    intent_text: "新批次。".to_string(),
+                                    addressed: true,
+                                    plain_text: true,
+                                    vision_requested: false,
+                                    images: Vec::new(),
+                                    message_ids: vec![502],
+                                },
+                                BatchPolicy::testing(),
+                                hook,
+                            )
+                            .await
+                    })
+                };
+                new_hook.inserted.notified().await;
+
+                old_hook.release.notify_one();
+                assert!(old_task.await.expect("旧任务应正常结束").is_none());
+
+                new_hook.release.notify_one();
+                assert_eq!(
+                    new_task
+                        .await
+                        .expect("新任务应正常结束")
+                        .expect("新批次应被取出")
+                        .text,
+                    "新批次。"
+                );
             });
     }
 

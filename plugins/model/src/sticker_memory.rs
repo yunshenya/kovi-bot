@@ -5,6 +5,7 @@
 use crate::memory::MEMORY_MANAGER;
 use crate::vision::{ImageAttachment, extract_image_attachments};
 use anyhow::{Result, anyhow};
+use chrono::{Duration as ChronoDuration, Utc};
 use kovi::bot::message::Segment;
 use kovi::{Message, RuntimeBot};
 use serde_json::{Map, Value};
@@ -127,7 +128,23 @@ pub(crate) async fn initialize_database() -> Result<()> {
     .map_err(|error| anyhow!("创建表情包记忆索引失败: {error}"))?;
 
     println!("[INFO] PostgreSQL 表情包记忆库已就绪");
+    compact_expired().await?;
     Ok(())
+}
+
+/// 清理超过配置 TTL 的表情标签；标签只保存稳定标识和文字，不保留图片内容。
+pub(crate) async fn compact_expired() -> Result<u64> {
+    let Some(pool) = MEMORY_MANAGER.database_pool() else {
+        return Ok(0);
+    };
+    let cutoff =
+        Utc::now() - ChronoDuration::days(crate::config::get().memory().sticker_ttl_days());
+    let result = query("DELETE FROM kovi_bot_sticker_memory WHERE updated_at <= $1")
+        .bind(cutoff)
+        .execute(pool)
+        .await
+        .map_err(|error| anyhow!("清理过期表情包记忆失败: {error}"))?;
+    Ok(result.rows_affected())
 }
 
 /// 从 OneBot 消息段中提取可长期识别的图片、商城表情和普通表情标识。
@@ -499,6 +516,15 @@ pub(crate) async fn teach(
         .ok_or_else(|| anyhow!("PostgreSQL 表情包记忆库尚未初始化"))?;
 
     let (scope_type, scope_id) = scope.database_values();
+    let stored_label = label
+        .trim()
+        .chars()
+        .take(if crate::config::get().memory().data_minimization() {
+            MAX_LABEL_CHARS.min(96)
+        } else {
+            MAX_LABEL_CHARS
+        })
+        .collect::<String>();
     let learned_in_group = match scope {
         StickerScope::Group(group_id) => Some(group_id),
         StickerScope::Private(_) => None,
@@ -520,7 +546,7 @@ pub(crate) async fn teach(
         .bind(&sticker.key)
         .bind(scope_type)
         .bind(scope_id)
-        .bind(label)
+        .bind(&stored_label)
         .bind(learned_by)
         .bind(learned_in_group)
         .execute(&mut *transaction)
@@ -594,12 +620,14 @@ pub(crate) async fn known_labels(
         FROM kovi_bot_sticker_memory
         WHERE sticker_key = ANY($1::TEXT[])
           AND ((scope_type = $2 AND scope_id = $3) OR (scope_type = 'global' AND scope_id = 0))
+          AND updated_at > $4
         ORDER BY priority ASC, updated_at DESC
         "#,
     )
     .bind(&keys)
     .bind(scope_type)
     .bind(scope_id)
+    .bind(Utc::now() - ChronoDuration::days(crate::config::get().memory().sticker_ttl_days()))
     .fetch_all(pool)
     .await
     .map_err(|error| anyhow!("读取表情包记忆失败: {error}"))?;

@@ -5,6 +5,11 @@ use serde::{Deserialize, Serialize};
 pub struct MemoryConfig {
     max_entries: usize,
     retention_days: i64,
+    profile_ttl_days: i64,
+    summary_ttl_days: i64,
+    sticker_ttl_days: i64,
+    data_minimization: bool,
+    runtime_history_ttl_secs: u64,
     max_conversation_messages: usize,
     max_conversation_tokens: usize,
     contextual_memory_limit: usize,
@@ -28,6 +33,26 @@ impl MemoryConfig {
 
     pub fn retention_days(&self) -> i64 {
         self.retention_days
+    }
+
+    pub fn profile_ttl_days(&self) -> i64 {
+        self.profile_ttl_days
+    }
+
+    pub fn summary_ttl_days(&self) -> i64 {
+        self.summary_ttl_days
+    }
+
+    pub fn sticker_ttl_days(&self) -> i64 {
+        self.sticker_ttl_days
+    }
+
+    pub fn data_minimization(&self) -> bool {
+        self.data_minimization
+    }
+
+    pub fn runtime_history_ttl_secs(&self) -> u64 {
+        self.runtime_history_ttl_secs
     }
 
     pub fn max_conversation_messages(&self) -> usize {
@@ -76,6 +101,20 @@ impl MemoryConfig {
         }
         if self.retention_days <= 0 {
             return Err(anyhow::anyhow!("memory.retention_days 必须大于 0"));
+        }
+        if self.profile_ttl_days <= 0 {
+            return Err(anyhow::anyhow!("memory.profile_ttl_days 必须大于 0"));
+        }
+        if self.summary_ttl_days <= 0 {
+            return Err(anyhow::anyhow!("memory.summary_ttl_days 必须大于 0"));
+        }
+        if self.sticker_ttl_days <= 0 {
+            return Err(anyhow::anyhow!("memory.sticker_ttl_days 必须大于 0"));
+        }
+        if self.runtime_history_ttl_secs == 0 {
+            return Err(anyhow::anyhow!(
+                "memory.runtime_history_ttl_secs 必须大于 0"
+            ));
         }
         if self.max_conversation_messages < 3 {
             return Err(anyhow::anyhow!(
@@ -129,6 +168,11 @@ impl Default for MemoryConfig {
         Self {
             max_entries: 1000,
             retention_days: 30,
+            profile_ttl_days: 90,
+            summary_ttl_days: 30,
+            sticker_ttl_days: 90,
+            data_minimization: true,
+            runtime_history_ttl_secs: 3_600,
             max_conversation_messages: 25,
             max_conversation_tokens: 6_000,
             contextual_memory_limit: 5,
