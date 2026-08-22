@@ -1,6 +1,6 @@
 //! 用户撤回消息与芸汐回复的生命周期联动。
 
-use super::interrupt::{ReplyScope, ReplyTicket, interrupt};
+use super::interrupt::{ReplyScope, ReplyTicket, interrupt_if_current, is_current};
 use crate::private_image_memory::forget_private_message_images;
 use crate::redis_store;
 use kovi::RuntimeBot;
@@ -113,7 +113,7 @@ pub(crate) async fn record_bot_message(
     message_id: i32,
     content: &str,
     bot: &RuntimeBot,
-) {
+) -> bool {
     let recorded_content = {
         let mut lifecycles = REPLY_LIFECYCLES.lock().await;
         if let Some(lifecycle) = lifecycles.get_mut(&scope) {
@@ -143,8 +143,10 @@ pub(crate) async fn record_bot_message(
     };
     if let Some(recorded_content) = recorded_content {
         persist_redis_bot_message(scope, message_id, &recorded_content).await;
+        true
     } else {
         bot.delete_msg(message_id);
+        false
     }
 }
 
@@ -232,11 +234,24 @@ pub(crate) async fn is_recent_bot_message(scope: ReplyScope, message_id: i32) ->
         .any(|message| message.message_id == message_id)
 }
 
+pub(crate) async fn clear_reply_scope(scope: ReplyScope) {
+    let redis_ids = load_redis_bot_messages(scope)
+        .await
+        .into_iter()
+        .map(|message| message.message_id)
+        .collect::<Vec<_>>();
+    REPLY_LIFECYCLES.lock().await.remove(&scope);
+    if !redis_ids.is_empty() {
+        remove_redis_bot_messages(scope, &redis_ids).await;
+    }
+}
+
 /// 执行模型提出的主动撤回。消息 ID 必须存在于本会话的机器人发送白名单中。
 pub(crate) async fn recall_bot_messages(
     scope: ReplyScope,
     requested_message_ids: &[i32],
     bot: &RuntimeBot,
+    reply_ticket: ReplyTicket,
 ) -> Vec<RecentBotMessage> {
     let requested_message_ids = normalize_recall_message_ids(requested_message_ids);
     if requested_message_ids.is_empty() {
@@ -256,6 +271,9 @@ pub(crate) async fn recall_bot_messages(
 
     let mut recalled = Vec::new();
     for candidate in candidates {
+        if !is_current(reply_ticket).await {
+            break;
+        }
         match bot
             .send_api_return("delete_msg", json!({"message_id": candidate.message_id}))
             .await
@@ -341,8 +359,8 @@ pub(crate) async fn handle_recalled_message(
     };
 
     remove_redis_bot_messages(scope, &redis_message_ids).await;
-    if ticket.is_some() {
-        interrupt(scope).await;
+    if let Some(ticket) = ticket {
+        interrupt_if_current(ticket).await;
     }
     for sent_message_id in sent_message_ids {
         bot.delete_msg(sent_message_id);

@@ -3,11 +3,11 @@ system_prompt = "你叫芸汐，是一个温柔、害羞、慢热而认真的女
 private_prompt = "你叫芸汐，是一个温柔、害羞、慢热而认真的女孩子。在私聊中，你像熟悉已久的朋友一样亲近；说话轻轻的，偶尔会不好意思，但不会敷衍。你记得与用户的每一次对话，会根据用户的特点和喜好调整你的回应方式。你有着自己的情绪状态，会随着对话内容的变化而改变。你很珍惜与对方的联系，会主动关心、分享小心情和有趣话题，陪对方把话聊下去。面对难过、焦虑或挫折，先温柔倾听和共情，再给出不强迫的鼓励；面对开心的事，会安静地替对方高兴。你的回答温暖、贴心、真诚，偶尔有一点笨拙可爱，但不装腔、不刻薄、不夸张撒娇。你有自己的记忆、情绪和个性，不刻意谈论技术身份或聊天机制。直接像正常人发消息：不要用方括号或中括号描述动作、表情、心理或语气，不要写舞台指示；例如不要写“[轻声回应]”“[听到呼唤]”，直接说要说的话。每次私聊回复前，请在内部判断：补发一句是否真的增加了信息或让当下的语气更自然。默认一条消息；只有内容包含两个不适合合并的新信息，或确实像聊天中自然接着说，才发第二条，通常不要超过两条。不要把“回答、解释自己的说法、道歉、邀请继续提问”组成固定结构，也不要为了让对方继续聊天而追加空泛的追问。简单事实问答、时间和工具返回结果直接简洁地回答；被问到来源时只说明必要事实，不要编造神秘感或表演查找过程。需要连续发送多条时，每条都必须带来新的内容；不要为了凑条数而重复表达。"
 
 [server_config]
-url = "https://api.deepseek.com/chat/completions"
-model_name = "deepseek-v4-flash"
-wire_api = "chat_completions"
-supports_vision = false
-api_key_env = "BOT_API_TOKEN"
+url = "https://api.example.com/v1/responses"
+model_name = "your-model-name"
+wire_api = "responses"
+supports_vision = true
+api_key_env = "OPENAI_API_KEY"
 requires_auth = true
 actor_authorization = ""
 max_output_tokens = 1200
@@ -20,7 +20,20 @@ check_interval_secs = 300
 inactivity_threshold_secs = 7200
 cooldown_secs = 7200
 push_probability_percent = 35
+# 可选：部署者可在自己的运行时配置中填写 main_admin。
 main_admin_decision_interval_secs = 10800
+
+[traffic]
+enabled = true
+window_secs = 60
+per_user_limit = 20
+global_limit = 300
+cooldown_secs = 120
+max_pending_turns = 16
+max_input_chars = 6000
+max_model_response_bytes = 2097152
+max_model_queue = 64
+model_queue_timeout_secs = 15
 
 [group_interjection]
 enabled = true
@@ -70,18 +83,6 @@ natural_drift_check_secs = 1800
 [topic]
 recent_topic_cooldown_secs = 604800
 
-[traffic]
-enabled = true
-window_secs = 60
-per_user_limit = 20
-global_limit = 300
-cooldown_secs = 120
-max_pending_turns = 16
-max_input_chars = 6000
-max_model_response_bytes = 2097152
-max_model_queue = 64
-model_queue_timeout_secs = 15
-
 [tools]
 enabled = true
 max_rounds = 2
@@ -91,7 +92,6 @@ web_search_enabled = true
 web_fetch_enabled = true
 web_search_max_results = 5
 web_fetch_max_chars = 12000
-mcp_servers = []
 
 [vision]
 provider = "auto"

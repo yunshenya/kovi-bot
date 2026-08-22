@@ -99,6 +99,10 @@ pub(crate) async fn forget_private_message_images(user_id: i64, message_id: i32)
     }
 }
 
+pub(crate) async fn forget_private_user_images(user_id: i64) {
+    RECENT_PRIVATE_IMAGES.lock().await.remove(&user_id);
+}
+
 fn prune_sessions(sessions: &mut HashMap<i64, RecentImageSession>, now: Instant) {
     sessions.retain(|_, session| {
         session

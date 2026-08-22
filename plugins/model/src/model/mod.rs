@@ -10,9 +10,10 @@ mod reply_disposition;
 pub(crate) mod semantic;
 mod thinking;
 pub(crate) mod tool_access;
+mod traffic;
 pub(crate) mod utils;
 
-pub(crate) use interrupt::ReplyTicket;
+pub(crate) use interrupt::{ReplyTicket, is_current};
 pub(crate) use message_actions::normalize_legacy_message_text;
 
 pub use crate::model::group::group_message_event;

@@ -2,6 +2,10 @@ target
 .idea
 server-login
 .env
+# 运行时配置可能含 QQ 号、白名单、主机和 Token；仓库只跟踪 *.example.toml。
+bot.conf.toml
+kovi.conf.toml
+kovi.plugin.toml
 bot_memory.json
 bot_memory.json.tmp
 bot_memory.json.corrupt.*

@@ -1,0 +1,43 @@
+[Unit]
+Description=Kovi QQ Bot
+Wants=network-online.target postgresql.service redis-server.service
+After=network-online.target postgresql.service redis-server.service
+
+[Service]
+Type=simple
+User=kovi-bot
+Group=kovi-bot
+WorkingDirectory=/opt/kovi-bot/current
+EnvironmentFile=/opt/kovi-bot/current/.env
+ExecStartPre=/usr/bin/rm -f /opt/kovi-bot/runtime/ready
+ExecStart=/opt/kovi-bot/current/kovi-bot
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=120
+# Readiness must be group-readable by kovi-deploy; the shared group contains only
+# kovi-bot and kovi-deploy.
+UMask=0027
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/opt/kovi-bot/current /opt/kovi-bot/releases
+ReadWritePaths=/opt/kovi-bot/runtime
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

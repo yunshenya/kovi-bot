@@ -2,6 +2,7 @@
 name = "kovi-bot"
 version = "0.1.0"
 edition = "2024"
+publish = false
 
 [dependencies]
 kovi.workspace = true
@@ -21,3 +22,10 @@ sqlx-postgres = { version = "=0.8.6", default-features = false, features = ["jso
 rmcp = { version = "3.1.4", default-features = false, features = ["client", "transport-child-process"] }
 scraper = "0.27.0"
 url = "2.5.8"
+
+# Line tables preserve useful backtraces while avoiding multi-gigabyte full debug info.
+[profile.dev]
+debug = 1
+
+[profile.test]
+debug = 1

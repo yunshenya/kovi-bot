@@ -1,0 +1,9 @@
+[model]
+enable_on_startup = true
+# 默认拒绝所有未列入白名单的好友和群。上线前显式填写访问范围。
+access_control = true
+list_mode = "WhiteList"
+
+[model.access_list]
+friends = []
+groups = []

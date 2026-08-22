@@ -36,6 +36,7 @@ pub(crate) struct ReplyPlan {
     pub(crate) disposition: ReplyDisposition,
     pub(crate) action: ReplyAction,
     pub(crate) bubbles: Vec<String>,
+    pub(crate) requests_image: bool,
 }
 
 impl ReplyPlan {
@@ -63,11 +64,13 @@ impl ReplyPlan {
         } else {
             parsed.content
         };
+        let requests_image = parsed.requests_image && !visible_content.is_empty();
         Self {
             content: visible_content,
             disposition: parsed.disposition,
             action,
             bubbles,
+            requests_image,
         }
     }
 
@@ -97,7 +100,14 @@ pub(crate) async fn execute_reply_plan(
 ) -> ReplyExecution {
     let scope = destination.scope();
     let recall_requested = !plan.action.recall_message_ids.is_empty();
-    let recalled_messages = recall_bot_messages(scope, &plan.action.recall_message_ids, bot).await;
+    if !is_current(reply_ticket).await {
+        return ReplyExecution {
+            recall_requested,
+            ..ReplyExecution::default()
+        };
+    }
+    let recalled_messages =
+        recall_bot_messages(scope, &plan.action.recall_message_ids, bot, reply_ticket).await;
     let mut execution = ReplyExecution {
         recalled_messages,
         recall_requested,
@@ -134,8 +144,9 @@ pub(crate) async fn execute_reply_plan(
         };
         match sent {
             Ok(message_id) => {
-                record_bot_message(scope, reply_ticket, message_id, bubble, bot).await;
-                execution.sent_messages.push(bubble.clone());
+                if record_bot_message(scope, reply_ticket, message_id, bubble, bot).await {
+                    execution.sent_messages.push(bubble.clone());
+                }
             }
             Err(error) => match destination {
                 MessageDestination::Group(group_id) => {
@@ -279,6 +290,7 @@ mod tests {
             disposition: ReplyDisposition::Reply,
             action: Default::default(),
             bubbles: vec!["你好".to_string()],
+            requests_image: false,
         };
     }
 

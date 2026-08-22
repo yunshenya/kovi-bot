@@ -60,10 +60,6 @@ impl ThinkingReporter {
         THINKING_PROTOCOL.as_str()
     }
 
-    pub(crate) async fn start(self: &Arc<Self>) {}
-
-    pub(crate) async fn finish(&self) {}
-
     pub(crate) async fn observe_model_output(&self, output: &str) {
         if let Some(notice) = extract_first_thinking_notice(output) {
             self.send_notice(notice).await;
@@ -104,7 +100,7 @@ impl ThinkingReporter {
                     crate::model::interrupt::ReplyScope::Private(user_id)
                 }
             };
-            record_bot_message(scope, self.ticket, message_id, &notice, &self.bot).await;
+            let _ = record_bot_message(scope, self.ticket, message_id, &notice, &self.bot).await;
         }
     }
 }

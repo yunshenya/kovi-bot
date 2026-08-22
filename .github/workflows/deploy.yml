@@ -1,0 +1,402 @@
+name: Deploy production
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kovi-bot-production
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
+  DEPLOY_USER: ${{ vars.DEPLOY_USER || 'kovi-deploy' }}
+  DEPLOY_SSH_PORT: ${{ vars.DEPLOY_SSH_PORT || '22' }}
+  REMOTE_APP_DIR: ${{ vars.REMOTE_APP_DIR || '/opt/kovi-bot' }}
+  KOVI_MAIN_ADMIN: ${{ vars.KOVI_MAIN_ADMIN }}
+  KOVI_ALLOWED_FRIENDS: ${{ vars.KOVI_ALLOWED_FRIENDS }}
+  KOVI_ALLOWED_GROUPS: ${{ vars.KOVI_ALLOWED_GROUPS }}
+  MODEL_API_URL: ${{ vars.MODEL_API_URL }}
+  MODEL_NAME: ${{ vars.MODEL_NAME }}
+  MODEL_WIRE_API: ${{ vars.MODEL_WIRE_API || 'responses' }}
+  MODEL_SUPPORTS_VISION: ${{ vars.MODEL_SUPPORTS_VISION || 'true' }}
+  MODEL_API_KEY_ENV: ${{ vars.MODEL_API_KEY_ENV || 'OPENAI_API_KEY' }}
+  MODEL_REQUIRES_AUTH: ${{ vars.MODEL_REQUIRES_AUTH || 'true' }}
+  DEPLOY_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+jobs:
+  deploy:
+    if: >-
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_repository.full_name == github.repository &&
+       github.event.workflow_run.head_branch == 'main')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment:
+      name: production
+
+    steps:
+      - name: Checkout verified revision
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ env.DEPLOY_SHA }}
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: 1.97.1
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - name: Validate deployment settings
+        env:
+          DEPLOY_SSH_PRIVATE_KEY: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          BOT_API_TOKEN: ${{ secrets.BOT_API_TOKEN }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          NAPCAT_ACCESS_TOKEN: ${{ secrets.NAPCAT_ACCESS_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$DEPLOY_HOST" || { echo "Missing production variable DEPLOY_HOST"; exit 1; }
+          [[ "$DEPLOY_HOST" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "DEPLOY_HOST must be a DNS name or IPv4 address"; exit 1; }
+          [[ "$DEPLOY_USER" == "kovi-deploy" ]] || { echo "DEPLOY_USER must be the dedicated kovi-deploy account"; exit 1; }
+          [[ "$DEPLOY_SSH_PORT" =~ ^[0-9]+$ ]] && (( 10#$DEPLOY_SSH_PORT >= 1 && 10#$DEPLOY_SSH_PORT <= 65535 )) || { echo "Invalid DEPLOY_SSH_PORT"; exit 1; }
+          [[ "$REMOTE_APP_DIR" =~ ^/(opt|srv)/[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$ ]] || { echo "REMOTE_APP_DIR must be a concrete path below /opt or /srv"; exit 1; }
+          [[ "$KOVI_MAIN_ADMIN" =~ ^[1-9][0-9]+$ ]] || { echo "Invalid or missing KOVI_MAIN_ADMIN"; exit 1; }
+          [[ -z "$KOVI_ALLOWED_FRIENDS" || "$KOVI_ALLOWED_FRIENDS" =~ ^[1-9][0-9]*(,[1-9][0-9]*)*$ ]] || { echo "Invalid KOVI_ALLOWED_FRIENDS"; exit 1; }
+          [[ -z "$KOVI_ALLOWED_GROUPS" || "$KOVI_ALLOWED_GROUPS" =~ ^[1-9][0-9]*(,[1-9][0-9]*)*$ ]] || { echo "Invalid KOVI_ALLOWED_GROUPS"; exit 1; }
+          [[ "$MODEL_API_URL" =~ ^https://[A-Za-z0-9._~:/?%+=,-]+$ ]] || { echo "Invalid or missing HTTPS MODEL_API_URL"; exit 1; }
+          [[ "$MODEL_NAME" =~ ^[A-Za-z0-9._:/-]+$ ]] || { echo "Invalid or missing MODEL_NAME"; exit 1; }
+          [[ "$MODEL_WIRE_API" == "responses" || "$MODEL_WIRE_API" == "chat_completions" ]] || { echo "Invalid MODEL_WIRE_API"; exit 1; }
+          [[ "$MODEL_SUPPORTS_VISION" == "true" || "$MODEL_SUPPORTS_VISION" == "false" ]] || { echo "Invalid MODEL_SUPPORTS_VISION"; exit 1; }
+          [[ "$MODEL_API_KEY_ENV" == "OPENAI_API_KEY" || "$MODEL_API_KEY_ENV" == "BOT_API_TOKEN" ]] || { echo "Invalid MODEL_API_KEY_ENV"; exit 1; }
+          [[ "$MODEL_REQUIRES_AUTH" == "true" || "$MODEL_REQUIRES_AUTH" == "false" ]] || { echo "Invalid MODEL_REQUIRES_AUTH"; exit 1; }
+          test -n "$DEPLOY_SSH_PRIVATE_KEY" || { echo "Missing DEPLOY_SSH_PRIVATE_KEY"; exit 1; }
+          test -n "$DEPLOY_KNOWN_HOSTS" || { echo "Missing DEPLOY_KNOWN_HOSTS"; exit 1; }
+          if test "$MODEL_API_KEY_ENV" = "OPENAI_API_KEY"; then
+            test -n "$OPENAI_API_KEY" || { echo "Missing OPENAI_API_KEY"; exit 1; }
+          else
+            test -n "$BOT_API_TOKEN" || { echo "Missing BOT_API_TOKEN"; exit 1; }
+          fi
+          test -n "$DATABASE_URL" || { echo "Missing DATABASE_URL"; exit 1; }
+          test -n "$NAPCAT_ACCESS_TOKEN" || { echo "Missing NAPCAT_ACCESS_TOKEN"; exit 1; }
+          [[ "$NAPCAT_ACCESS_TOKEN" =~ ^[A-Za-z0-9._~+/=-]{24,}$ ]] || { echo "NAPCAT_ACCESS_TOKEN must be at least 24 safe characters"; exit 1; }
+          for value in "$OPENAI_API_KEY" "$BOT_API_TOKEN" "$DATABASE_URL"; do
+            [[ "$value" != *[[:space:]]* ]] || { echo "A required secret contains whitespace"; exit 1; }
+          done
+
+      - name: Configure SSH
+        env:
+          DEPLOY_SSH_PRIVATE_KEY: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_PRIVATE_KEY" > ~/.ssh/kovi_deploy
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/kovi_deploy ~/.ssh/known_hosts
+          known_host="$DEPLOY_HOST"
+          if test "$DEPLOY_SSH_PORT" != "22"; then
+            known_host="[$DEPLOY_HOST]:$DEPLOY_SSH_PORT"
+          fi
+          ssh-keygen -F "$known_host" -f ~/.ssh/known_hosts >/dev/null || {
+            echo "DEPLOY_KNOWN_HOSTS does not contain the configured host and port"
+            exit 1
+          }
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Assemble immutable release
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          BOT_API_TOKEN: ${{ secrets.BOT_API_TOKEN }}
+          MODEL_ACTOR_AUTHORIZATION: ${{ secrets.MODEL_ACTOR_AUTHORIZATION }}
+          VISION_API_TOKEN: ${{ secrets.VISION_API_TOKEN }}
+          VISION_ACTOR_AUTHORIZATION: ${{ secrets.VISION_ACTOR_AUTHORIZATION }}
+          NAPCAT_ACCESS_TOKEN: ${{ secrets.NAPCAT_ACCESS_TOKEN }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          BRAVE_SEARCH_API_KEY: ${{ secrets.BRAVE_SEARCH_API_KEY }}
+          REDIS_URL: ${{ secrets.REDIS_URL }}
+          VISION_API_URL: ${{ vars.VISION_API_URL }}
+          VISION_WIRE_API: ${{ vars.VISION_WIRE_API || 'responses' }}
+          VISION_MODEL_NAME: ${{ vars.VISION_MODEL_NAME }}
+          VISION_REQUIRES_AUTH: ${{ vars.VISION_REQUIRES_AUTH || 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for value in "$OPENAI_API_KEY" "$BOT_API_TOKEN" "$MODEL_ACTOR_AUTHORIZATION" \
+            "$VISION_API_TOKEN" "$VISION_ACTOR_AUTHORIZATION" \
+            "$BRAVE_SEARCH_API_KEY" "$DATABASE_URL" "$REDIS_URL" "$VISION_API_URL" \
+            "$VISION_WIRE_API" "$VISION_MODEL_NAME" "$VISION_REQUIRES_AUTH"; do
+            [[ "$value" != *[[:space:]]* ]] || { echo "A runtime setting contains whitespace"; exit 1; }
+          done
+          if test -n "$VISION_API_URL"; then
+            [[ "$VISION_API_URL" =~ ^https://[A-Za-z0-9._~:/?%+=,-]+$ ]] || { echo "Invalid VISION_API_URL"; exit 1; }
+            [[ "$VISION_WIRE_API" == "responses" || "$VISION_WIRE_API" == "chat_completions" ]] || { echo "Invalid VISION_WIRE_API"; exit 1; }
+            [[ "$VISION_MODEL_NAME" =~ ^[A-Za-z0-9._:/-]+$ ]] || { echo "Missing or invalid VISION_MODEL_NAME"; exit 1; }
+            [[ "$VISION_REQUIRES_AUTH" == "true" || "$VISION_REQUIRES_AUTH" == "false" ]] || { echo "Invalid VISION_REQUIRES_AUTH"; exit 1; }
+          fi
+          release_dir="$RUNNER_TEMP/kovi-release"
+          install -d -m 700 "$release_dir"
+          install -m 0755 target/release/kovi-bot "$release_dir/kovi-bot"
+          install -m 0600 bot.conf.example.toml "$release_dir/bot.conf.toml"
+          awk -v url="$MODEL_API_URL" -v model="$MODEL_NAME" \
+            -v wire="$MODEL_WIRE_API" -v vision="$MODEL_SUPPORTS_VISION" \
+            -v keyenv="$MODEL_API_KEY_ENV" -v auth="$MODEL_REQUIRES_AUTH" \
+            -v actor="$MODEL_ACTOR_AUTHORIZATION" -v admin="$KOVI_MAIN_ADMIN" '
+            $0 == "url = \"https://api.example.com/v1/responses\"" {
+              print "url = \"" url "\""
+              next
+            }
+            $0 == "model_name = \"your-model-name\"" {
+              print "model_name = \"" model "\""
+              next
+            }
+            $0 == "wire_api = \"responses\"" {
+              print "wire_api = \"" wire "\""
+              next
+            }
+            $0 == "supports_vision = true" {
+              print "supports_vision = " vision
+              next
+            }
+            $0 == "api_key_env = \"OPENAI_API_KEY\"" {
+              print "api_key_env = \"" keyenv "\""
+              next
+            }
+            $0 == "requires_auth = true" {
+              print "requires_auth = " auth
+              next
+            }
+            $0 == "actor_authorization = \"\"" {
+              print "actor_authorization = \"" actor "\""
+              next
+            }
+            $0 == "push_probability_percent = 35" {
+              print
+              print "main_admin = " admin
+              next
+            }
+            { print }
+          ' "$release_dir/bot.conf.toml" > "$release_dir/bot.conf.toml.new"
+          mv "$release_dir/bot.conf.toml.new" "$release_dir/bot.conf.toml"
+          printf '%s\n' "$DEPLOY_SHA" > "$release_dir/REVISION"
+
+          friends="$KOVI_MAIN_ADMIN"
+          if test -n "$KOVI_ALLOWED_FRIENDS"; then
+            friends="$friends,$KOVI_ALLOWED_FRIENDS"
+          fi
+          {
+            printf '%s\n' '[model]'
+            printf '%s\n' 'enable_on_startup = true'
+            printf '%s\n' 'access_control = true'
+            printf '%s\n\n' 'list_mode = "WhiteList"'
+            printf '%s\n' '[model.access_list]'
+            printf 'friends = [%s]\n' "$friends"
+            printf 'groups = [%s]\n' "$KOVI_ALLOWED_GROUPS"
+          } > "$release_dir/kovi.plugin.toml"
+
+          {
+            printf '%s\n' '[config]'
+            printf 'main_admin = %s\n' "$KOVI_MAIN_ADMIN"
+            printf '%s\n' 'admins = []'
+            printf '%s\n\n' 'debug = false'
+            printf '%s\n' '[server]'
+            printf '%s\n' 'host = "127.0.0.1"'
+            printf '%s\n' 'port = 3001'
+            printf 'access_token = "%s"\n' "$NAPCAT_ACCESS_TOKEN"
+            printf '%s\n' 'secure = false'
+          } > "$release_dir/kovi.conf.toml"
+
+          {
+            test -z "$OPENAI_API_KEY" || printf 'OPENAI_API_KEY=%s\n' "$OPENAI_API_KEY"
+            test -z "$BOT_API_TOKEN" || printf 'BOT_API_TOKEN=%s\n' "$BOT_API_TOKEN"
+            test -z "$VISION_API_TOKEN" || printf 'VISION_API_TOKEN=%s\n' "$VISION_API_TOKEN"
+            test -z "$VISION_ACTOR_AUTHORIZATION" || printf 'VISION_ACTOR_AUTHORIZATION=%s\n' "$VISION_ACTOR_AUTHORIZATION"
+            test -z "$BRAVE_SEARCH_API_KEY" || printf 'BRAVE_SEARCH_API_KEY=%s\n' "$BRAVE_SEARCH_API_KEY"
+            printf 'DATABASE_URL=%s\n' "$DATABASE_URL"
+            printf 'REDIS_URL=%s\n' "${REDIS_URL:-redis://127.0.0.1:6379/0}"
+            printf '%s\n' 'REDIS_KEY_PREFIX=kovi'
+            printf 'KOVI_READY_FILE=%s/runtime/ready\n' "$REMOTE_APP_DIR"
+            printf 'KOVI_DEPLOY_REVISION=%s\n' "$DEPLOY_SHA"
+            if test -n "$VISION_API_URL"; then
+              printf 'VISION_API_URL=%s\n' "$VISION_API_URL"
+              printf 'VISION_WIRE_API=%s\n' "$VISION_WIRE_API"
+              printf 'VISION_MODEL_NAME=%s\n' "$VISION_MODEL_NAME"
+              printf 'VISION_REQUIRES_AUTH=%s\n' "$VISION_REQUIRES_AUTH"
+            fi
+          } > "$release_dir/.env"
+          chmod 0600 "$release_dir/.env" "$release_dir"/*.toml
+          tar -C "$release_dir" -czf "$RUNNER_TEMP/kovi-release-$DEPLOY_SHA.tar.gz" .
+
+      - name: Prepare remote upload directory
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/kovi_deploy -p "$DEPLOY_SSH_PORT" -o BatchMode=yes \
+            "$DEPLOY_USER@$DEPLOY_HOST" bash -s -- "$REMOTE_APP_DIR" <<'REMOTE'
+          set -euo pipefail
+          app_dir="$1"
+          [[ "$app_dir" =~ ^/(opt|srv)/[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$ ]]
+          test "$(id -un)" = "kovi-deploy"
+          id -nG | tr ' ' '\n' | grep -Fqx 'kovi-bot' || {
+            echo "kovi-deploy must be a member of the kovi-bot shared group" >&2
+            exit 1
+          }
+          test -d "$app_dir"
+          test "$(stat -c '%U:%G' "$app_dir")" = "kovi-deploy:kovi-bot"
+          test -d "$app_dir/runtime"
+          test "$(stat -c '%U:%G' "$app_dir/runtime")" = "kovi-bot:kovi-bot"
+          test "$(stat -c '%a' "$app_dir/runtime")" = "770"
+          test -r "$app_dir/runtime" && test -w "$app_dir/runtime" && test -x "$app_dir/runtime"
+          umask 077
+          install -d -m 700 "$app_dir/incoming"
+          install -d -m 750 "$app_dir/releases"
+          chgrp kovi-bot "$app_dir/releases"
+          chmod 750 "$app_dir" "$app_dir/releases"
+          find "$app_dir/incoming" -mindepth 1 -maxdepth 1 -type f \
+            -name '*.tar.gz' -mtime +1 -delete
+          REMOTE
+
+      - name: Upload release
+        shell: bash
+        run: |
+          set -euo pipefail
+          scp -i ~/.ssh/kovi_deploy -P "$DEPLOY_SSH_PORT" -o BatchMode=yes \
+            "$RUNNER_TEMP/kovi-release-$DEPLOY_SHA.tar.gz" \
+            "$DEPLOY_USER@$DEPLOY_HOST:$REMOTE_APP_DIR/incoming/$DEPLOY_SHA.tar.gz"
+
+      - name: Activate release and verify readiness
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/kovi_deploy -p "$DEPLOY_SSH_PORT" -o BatchMode=yes \
+            "$DEPLOY_USER@$DEPLOY_HOST" bash -s -- "$REMOTE_APP_DIR" "$DEPLOY_SHA" <<'REMOTE'
+          set -euo pipefail
+          app_dir="$1"
+          revision="$2"
+          [[ "$app_dir" =~ ^/(opt|srv)/[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$ ]]
+          [[ "$revision" =~ ^[0-9a-f]{40}$ ]]
+          test "$(id -un)" = "kovi-deploy"
+
+          archive="$app_dir/incoming/$revision.tar.gz"
+          releases_dir="$app_dir/releases"
+          release="$releases_dir/$revision"
+          staging="$releases_dir/$revision.tmp"
+          ready_file="$app_dir/runtime/ready"
+          previous=""
+          if test -L "$app_dir/current"; then
+            previous="$(readlink -f "$app_dir/current")"
+            case "$previous" in
+              "$releases_dir"/*) ;;
+              *) previous="" ;;
+            esac
+          fi
+
+          cleanup_upload() {
+            rm -f -- "$archive"
+            if test -d "$staging"; then
+              find "$staging" -depth -delete
+            fi
+          }
+          trap cleanup_upload EXIT
+
+          make_service_read_only() {
+            target="$1"
+            case "$target" in
+              "$releases_dir"/*) ;;
+              *) echo "Refusing to change permissions outside releases" >&2; exit 1 ;;
+            esac
+            chgrp -R kovi-bot "$target"
+            find "$target" -type d -exec chmod 0750 {} +
+            find "$target" -type f -exec chmod 0640 {} +
+            chmod 0550 "$target/kovi-bot"
+            test -z "$(find "$target" \( -perm -0020 -o -perm -0002 \) -print -quit)"
+          }
+
+          if ! test -d "$release"; then
+            if test -d "$staging"; then
+              find "$staging" -depth -delete
+            fi
+            install -d -m 750 "$staging"
+            tar --no-same-owner -xzf "$archive" -C "$staging"
+            test -x "$staging/kovi-bot"
+            test "$(cat "$staging/REVISION")" = "$revision"
+            test -s "$staging/.env"
+            test -s "$staging/kovi.conf.toml"
+            test -s "$staging/kovi.plugin.toml"
+            make_service_read_only "$staging"
+            mv "$staging" "$release"
+          fi
+          make_service_read_only "$release"
+          test -x "$release/kovi-bot"
+          test "$(cat "$release/REVISION")" = "$revision"
+          test -s "$release/.env"
+          test -s "$release/kovi.conf.toml"
+          test -s "$release/kovi.plugin.toml"
+
+          rm -f -- "$app_dir/current.next"
+          ln -s "$release" "$app_dir/current.next"
+          mv -Tf "$app_dir/current.next" "$app_dir/current"
+          rm -f -- "$ready_file"
+
+          ready=0
+          if sudo -n /usr/bin/systemctl restart kovi-bot.service; then
+            for _ in $(seq 1 90); do
+              if systemctl is-active --quiet kovi-bot.service && \
+                 test -f "$ready_file" && \
+                 grep -Fqx "$revision" "$ready_file"; then
+                ready=1
+                break
+              fi
+              sleep 1
+            done
+          fi
+
+          if test "$ready" -ne 1; then
+            if test -n "$previous" && test -d "$previous"; then
+              rm -f -- "$app_dir/current.rollback"
+              ln -s "$previous" "$app_dir/current.rollback"
+              mv -Tf "$app_dir/current.rollback" "$app_dir/current"
+              rm -f -- "$ready_file"
+              sudo -n /usr/bin/systemctl restart kovi-bot.service || true
+            fi
+            echo "Release did not become ready; restored the complete previous release" >&2
+            exit 1
+          fi
+
+          mapfile -t old_releases < <(
+            find "$releases_dir" -mindepth 1 -maxdepth 1 -type d \
+              ! -name '*.tmp' -printf '%T@ %p\n' | sort -nr | tail -n +6 | cut -d' ' -f2-
+          )
+          for candidate in "${old_releases[@]}"; do
+            case "$candidate" in
+              "$releases_dir"/*)
+                if test "$candidate" != "$release" && test "$candidate" != "$previous"; then
+                  find "$candidate" -depth -delete
+                fi
+                ;;
+            esac
+          done
+          REMOTE
+
+      - name: Show service status
+        if: always()
+        shell: bash
+        run: |
+          ssh -i ~/.ssh/kovi_deploy -p "$DEPLOY_SSH_PORT" -o BatchMode=yes \
+            "$DEPLOY_USER@$DEPLOY_HOST" \
+            "systemctl --no-pager --full status kovi-bot.service" || true

@@ -205,7 +205,18 @@ impl TopicGenerator {
             return Ok(None);
         }
 
-        let recent_memories = self.memory_manager.get_recent_memories(0).await;
+        let recent_memories = if let Some(subject_id) = group_id.or(user_id) {
+            let proactive_context = if group_id.is_some() {
+                "proactive_group_chat"
+            } else {
+                "proactive_private_chat"
+            };
+            self.memory_manager
+                .get_recent_memories_for_subject(subject_id, Some(proactive_context), 100)
+                .await
+        } else {
+            Vec::new()
+        };
         let mut unused_templates = Vec::new();
         for template in &suitable_templates {
             if !Self::topic_used_recently(&recent_memories, &template.template, group_id, user_id) {
@@ -251,7 +262,10 @@ impl TopicGenerator {
         // 获取用户档案
         if let Some(user_profile) = self.memory_manager.get_user_profile(user_id).await {
             let personalized_topic = self.generate_topic_from_profile(&user_profile).await?;
-            let recent_memories = self.memory_manager.get_recent_memories(0).await;
+            let recent_memories = self
+                .memory_manager
+                .get_recent_memories_for_subject(user_id, Some("proactive_private_chat"), 100)
+                .await;
             if let Some(mut topic) = personalized_topic
                 && !Self::topic_used_recently(&recent_memories, &topic.content, None, Some(user_id))
             {
@@ -333,7 +347,6 @@ impl TopicGenerator {
         }
 
         // 检查最近是否有互动
-        let recent_memories = self.memory_manager.get_recent_memories(10).await;
         let now = Local::now();
         let one_hour_ago = now - chrono::Duration::hours(1);
 
@@ -342,6 +355,13 @@ impl TopicGenerator {
             "group"
         } else {
             "private"
+        };
+        let recent_memories = if let Some(subject_id) = target_subject {
+            self.memory_manager
+                .get_recent_memories_for_subject(subject_id, Some(target_context), 10)
+                .await
+        } else {
+            Vec::new()
         };
         let recent_activity = recent_memories.iter().any(|memory| {
             memory.subject_id == target_subject
@@ -389,7 +409,7 @@ impl TopicGenerator {
 #[cfg(test)]
 mod tests {
     use super::{TopicCategory, TopicGenerator};
-    use crate::memory::MemoryManager;
+    use crate::memory::{MemoryEntry, MemoryManager, MemoryType};
     use std::collections::HashSet;
     use std::sync::Arc;
 
@@ -448,6 +468,34 @@ mod tests {
                     .expect("应存在可用话题");
                 assert!(!topic.content.contains("今天天气怎么样"));
 
+                std::fs::remove_file(path).expect("应清理测试记忆文件");
+            });
+    }
+
+    #[test]
+    fn same_numeric_user_and_group_ids_keep_topic_history_separate() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let path = temporary_memory_path("scope-isolation");
+                let manager = MemoryManager::new(path.to_str().expect("临时路径应为 UTF-8"));
+                manager
+                    .add_memory(MemoryEntry {
+                        id: "private-topic".to_string(),
+                        content: "主动发起话题: 最近有什么好看的电影推荐吗？".to_string(),
+                        timestamp: chrono::Local::now(),
+                        memory_type: MemoryType::Conversation,
+                        importance: 2,
+                        tags: Vec::new(),
+                        context: "proactive_private_chat".to_string(),
+                        subject_id: Some(42),
+                    })
+                    .await
+                    .expect("应写入私聊主动话题");
+                let group_history = manager
+                    .get_recent_memories_for_subject(42, Some("proactive_group_chat"), 100)
+                    .await;
+                assert!(group_history.is_empty());
                 std::fs::remove_file(path).expect("应清理测试记忆文件");
             });
     }

@@ -66,7 +66,6 @@ pub(crate) struct MessageUnderstanding {
     pub(crate) mood_confidence: u8,
     pub(crate) wants_no_reply: bool,
     pub(crate) wants_stop: bool,
-    pub(crate) requests_image: bool,
     pub(crate) image_intent: SemanticImageIntent,
     pub(crate) image_reference: ImageReferenceIntent,
     pub(crate) conversation_relevant: bool,
@@ -86,7 +85,6 @@ impl Default for MessageUnderstanding {
             mood_confidence: 0,
             wants_no_reply: false,
             wants_stop: false,
-            requests_image: false,
             image_intent: SemanticImageIntent::Social,
             image_reference: ImageReferenceIntent::None,
             conversation_relevant: false,
@@ -161,7 +159,6 @@ struct RawUnderstanding {
     mood_confidence: i16,
     wants_no_reply: bool,
     wants_stop: bool,
-    requests_image: bool,
     image_intent: String,
     image_reference: String,
     conversation_relevant: bool,
@@ -189,7 +186,6 @@ pub(crate) async fn understand(request: UnderstandingRequest) -> MessageUndersta
   "mood_confidence": 0,
   "wants_no_reply": false,
   "wants_stop": false,
-  "requests_image": false,
   "image_intent": "social|conversational|understand",
   "image_reference": "none|recent|described",
   "conversation_relevant": false,
@@ -204,7 +200,6 @@ pub(crate) async fn understand(request: UnderstandingRequest) -> MessageUndersta
 字段含义：
 - wants_no_reply：用户明确希望这条不产生可见回复；普通陈述、犹豫或礼貌结束不算。
 - wants_stop：用户希望停止当前正在生成或发送的回复。
-- requests_image：用户希望对方提供、发送或补发图片。
 - image_intent：图片只是社交表达、结合文字自然回应，还是需要真正查看图片内容。
 - image_reference：当前文字是否在回指之前发过的图片。recent 表示“那张图/刚才的截图”等泛指，described 表示“有猫的那张/带红色按钮的截图”等按内容寻找；没有回指时填 none。
   当前消息已直接附图或明确引用图片时，优先理解当前图片；只有没有当前图片时，才按历史图片指代寻找。
@@ -223,10 +218,6 @@ pub(crate) async fn understand(request: UnderstandingRequest) -> MessageUndersta
     let response =
         params_model_with_token_limit(&mut messages, Some(MAX_SEMANTIC_OUTPUT_TOKENS), &[]).await;
     parse_understanding(&response.content, &request)
-}
-
-pub(crate) async fn understand_text(message: &str, context: &str) -> MessageUnderstanding {
-    understand(UnderstandingRequest::text(message, context)).await
 }
 
 fn build_prompt(request: &UnderstandingRequest) -> String {
@@ -267,7 +258,6 @@ fn parse_understanding(content: &str, request: &UnderstandingRequest) -> Message
         mood_confidence: raw.mood_confidence.clamp(0, 100) as u8,
         wants_no_reply: raw.wants_no_reply,
         wants_stop: raw.wants_stop,
-        requests_image: raw.requests_image,
         image_intent: normalize_image_intent(&raw.image_intent),
         image_reference: normalize_image_reference(&raw.image_reference),
         conversation_relevant: raw.conversation_relevant,

@@ -14,6 +14,7 @@ use crate::config::proactive::ProactiveConfig;
 use crate::config::prompt::Prompt;
 use crate::config::server::ServerConfig;
 use crate::config::topic::TopicConfig;
+use crate::config::traffic::TrafficConfig;
 use anyhow::Context;
 use config::{Config, FileFormat};
 use kovi::toml;
@@ -31,6 +32,7 @@ mod prompt;
 mod server;
 mod tools;
 mod topic;
+mod traffic;
 mod vision;
 
 pub use tools::{McpServerConfig, ToolsConfig};
@@ -68,6 +70,8 @@ pub struct ModelConfig {
     mood: MoodConfig,
     /// 话题去重配置
     topic: TopicConfig,
+    /// 入站流量、排队和模型响应资源上限。
+    traffic: TrafficConfig,
     /// 模型可自主调用的受限工具。
     tools: ToolsConfig,
     /// 图片理解 Provider 路由配置。
@@ -110,6 +114,7 @@ impl ModelConfig {
         self.message_batch.validate()?;
         self.mood.validate()?;
         self.topic.validate()?;
+        self.traffic.validate()?;
         self.tools.validate()?;
         self.vision.validate()?;
         if !self.vision.mcp_server().is_empty() && !self.tools.enabled() {
@@ -163,6 +168,10 @@ impl ModelConfig {
 
     pub fn topic(&self) -> &TopicConfig {
         &self.topic
+    }
+
+    pub fn traffic(&self) -> &TrafficConfig {
+        &self.traffic
     }
 
     pub fn tools(&self) -> &ToolsConfig {

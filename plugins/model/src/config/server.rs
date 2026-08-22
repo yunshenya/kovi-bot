@@ -3,6 +3,8 @@
 //! 管理AI模型服务器的连接配置
 
 use serde::{Deserialize, Serialize};
+use std::net::IpAddr;
+use url::Url;
 
 /// 服务器配置结构体
 ///
@@ -93,9 +95,7 @@ impl ServerConfig {
             return Err(anyhow::anyhow!("服务器URL不能为空"));
         }
 
-        if !self.url.starts_with("http://") && !self.url.starts_with("https://") {
-            return Err(anyhow::anyhow!("服务器URL必须以http://或https://开头"));
-        }
+        validate_model_url(&self.url)?;
 
         if self.model_name.is_empty() {
             return Err(anyhow::anyhow!("模型名称不能为空"));
@@ -121,6 +121,30 @@ impl ServerConfig {
         );
         Ok(())
     }
+}
+
+fn validate_model_url(raw_url: &str) -> anyhow::Result<()> {
+    let url = Url::parse(raw_url).map_err(|_| anyhow::anyhow!("服务器URL格式无效"))?;
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(anyhow::anyhow!("服务器URL不能携带用户名或密码"));
+    }
+    match url.scheme() {
+        "https" => Ok(()),
+        "http" if is_loopback_host(url.host_str().unwrap_or_default()) => Ok(()),
+        "http" => Err(anyhow::anyhow!(
+            "非本机模型端点必须使用 HTTPS，避免 API Token 明文传输"
+        )),
+        _ => Err(anyhow::anyhow!(
+            "服务器URL只支持 HTTPS；本机回环地址可使用 HTTP"
+        )),
+    }
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
 }
 
 impl Default for ServerConfig {
@@ -161,5 +185,20 @@ mod tests {
             ..ServerConfig::default()
         };
         assert_eq!(config.endpoint(), "https://example.com/v1/responses");
+    }
+
+    #[test]
+    fn plaintext_remote_model_endpoint_is_rejected() {
+        let remote = ServerConfig {
+            url: "http://example.com/v1".to_string(),
+            ..ServerConfig::default()
+        };
+        assert!(remote.validate().is_err());
+
+        let loopback = ServerConfig {
+            url: "http://127.0.0.1:11434/v1".to_string(),
+            ..ServerConfig::default()
+        };
+        assert!(loopback.validate().is_ok());
     }
 }

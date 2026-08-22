@@ -3,18 +3,49 @@
 //! Redis 只保存可重建、带 TTL 的热数据；长期记忆和用户资料仍由 PostgreSQL 负责。
 
 use anyhow::{Context, Result, anyhow};
-use kovi::tokio::sync::OnceCell;
+use kovi::tokio::sync::Mutex;
 use redis::aio::ConnectionManager;
 use redis::{AsyncCommands, Script};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, LazyLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_KEY_PREFIX: &str = "kovi";
 const REDIS_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const REDIS_COMMAND_TIMEOUT: Duration = Duration::from_millis(800);
+const REDIS_INITIAL_RETRY_DELAY: Duration = Duration::from_secs(1);
+const REDIS_MAX_RETRY_DELAY: Duration = Duration::from_secs(60);
 
-static REDIS_STORE: OnceCell<Option<Arc<RedisStore>>> = OnceCell::const_new();
+static REDIS_STATE: LazyLock<Mutex<RedisConnectionState>> =
+    LazyLock::new(|| Mutex::new(RedisConnectionState::default()));
+
+struct RedisConnectionState {
+    store: Option<Arc<RedisStore>>,
+    configured_url: Option<String>,
+    configured_prefix: String,
+    retry_after: Option<Instant>,
+    retry_delay: Duration,
+}
+
+impl Default for RedisConnectionState {
+    fn default() -> Self {
+        Self {
+            store: None,
+            configured_url: None,
+            configured_prefix: DEFAULT_KEY_PREFIX.to_string(),
+            retry_after: None,
+            retry_delay: REDIS_INITIAL_RETRY_DELAY,
+        }
+    }
+}
+
+impl RedisConnectionState {
+    fn schedule_retry(&mut self, now: Instant) {
+        let retry_delay = self.retry_delay;
+        self.retry_after = Some(now + retry_delay);
+        self.retry_delay = retry_delay.saturating_mul(2).min(REDIS_MAX_RETRY_DELAY);
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct RedisStore {
@@ -54,39 +85,91 @@ pub(crate) async fn initialize() {
 }
 
 pub(crate) async fn get() -> Option<Arc<RedisStore>> {
-    REDIS_STORE
-        .get_or_init(|| async {
-            let url = std::env::var("REDIS_URL")
-                .ok()
-                .filter(|url| !url.trim().is_empty())?;
-            let key_prefix = std::env::var("REDIS_KEY_PREFIX")
-                .ok()
-                .filter(|prefix| !prefix.trim().is_empty())
-                .unwrap_or_else(|| DEFAULT_KEY_PREFIX.to_string());
-            let client = redis::Client::open(url.trim()).ok()?;
-            let connection = match kovi::tokio::time::timeout(
-                REDIS_CONNECT_TIMEOUT,
-                client.get_connection_manager(),
-            )
+    let url = std::env::var("REDIS_URL")
+        .ok()
+        .filter(|url| !url.trim().is_empty())?;
+    let url = url.trim().to_string();
+    let key_prefix = std::env::var("REDIS_KEY_PREFIX")
+        .ok()
+        .filter(|prefix| !prefix.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_KEY_PREFIX.to_string());
+    let now = Instant::now();
+    let mut state = REDIS_STATE.lock().await;
+
+    // 配置改变时立即丢弃旧连接并重新建立，避免进程必须重启才能生效。
+    if state.configured_url.as_deref() != Some(url.as_str())
+        || state.configured_prefix != key_prefix
+    {
+        state.store = None;
+        state.configured_url = Some(url.clone());
+        state.configured_prefix = key_prefix.clone();
+        state.retry_after = None;
+        state.retry_delay = REDIS_INITIAL_RETRY_DELAY;
+    }
+    if let Some(store) = &state.store {
+        return Some(Arc::clone(store));
+    }
+    if state
+        .retry_after
+        .is_some_and(|retry_after| retry_after > now)
+    {
+        return None;
+    }
+
+    match connect(&url, key_prefix).await {
+        Some(store) => {
+            let store = Arc::new(store);
+            state.store = Some(Arc::clone(&store));
+            state.retry_after = None;
+            state.retry_delay = REDIS_INITIAL_RETRY_DELAY;
+            Some(store)
+        }
+        None => {
+            state.schedule_retry(now);
+            None
+        }
+    }
+}
+
+async fn connect(url: &str, key_prefix: String) -> Option<RedisStore> {
+    let client = match redis::Client::open(url) {
+        Ok(client) => client,
+        Err(error) => {
+            eprintln!("[WARN] Redis URL 无效: {}", error);
+            return None;
+        }
+    };
+    let connection =
+        match kovi::tokio::time::timeout(REDIS_CONNECT_TIMEOUT, client.get_connection_manager())
             .await
-            {
-                Ok(Ok(connection)) => connection,
-                Ok(Err(error)) => {
-                    eprintln!("[WARN] Redis 连接失败: {}", error);
-                    return None;
-                }
-                Err(_) => {
-                    eprintln!("[WARN] Redis 连接超时");
-                    return None;
-                }
-            };
-            Some(Arc::new(RedisStore {
-                connection,
-                key_prefix,
-            }))
-        })
-        .await
-        .clone()
+        {
+            Ok(Ok(connection)) => connection,
+            Ok(Err(error)) => {
+                eprintln!("[WARN] Redis 连接失败: {}", error);
+                return None;
+            }
+            Err(_) => {
+                eprintln!("[WARN] Redis 连接超时");
+                return None;
+            }
+        };
+    Some(RedisStore {
+        connection,
+        key_prefix,
+    })
+}
+
+async fn mark_connection_unavailable(store: &Arc<RedisStore>) {
+    let mut state = REDIS_STATE.lock().await;
+    if state
+        .store
+        .as_ref()
+        .is_some_and(|current| Arc::ptr_eq(current, store))
+    {
+        state.store = None;
+        state.retry_delay = REDIS_INITIAL_RETRY_DELAY;
+        state.schedule_retry(Instant::now());
+    }
 }
 
 /// 返回 Redis 当前配置与连通状态，供系统信息命令展示。
@@ -103,7 +186,10 @@ pub(crate) async fn health_status() -> String {
     };
     match store.ping().await {
         Ok(()) => "已启用且连通".to_string(),
-        Err(_) => "已配置但不可用（本地内存兜底）".to_string(),
+        Err(_) => {
+            mark_connection_unavailable(&store).await;
+            "已配置但不可用（本地内存兜底）".to_string()
+        }
     }
 }
 
@@ -342,4 +428,63 @@ fn now_millis() -> Result<i64> {
         .duration_since(UNIX_EPOCH)
         .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
         .map_err(|error| anyhow!("系统时间异常: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{REDIS_INITIAL_RETRY_DELAY, REDIS_MAX_RETRY_DELAY, RedisConnectionState, get};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn connection_failures_schedule_bounded_retries_instead_of_caching_none_forever() {
+        let mut state = RedisConnectionState::default();
+        let now = Instant::now();
+        state.schedule_retry(now);
+        assert_eq!(state.retry_after, Some(now + REDIS_INITIAL_RETRY_DELAY));
+        assert!(state.retry_delay > REDIS_INITIAL_RETRY_DELAY);
+
+        for _ in 0..16 {
+            state.schedule_retry(now);
+        }
+        assert_eq!(state.retry_delay, REDIS_MAX_RETRY_DELAY);
+        assert!(state.retry_after.is_some());
+    }
+
+    #[test]
+    #[ignore = "requires Redis via REDIS_URL"]
+    fn redis_runtime_store_round_trips() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let store = get().await.expect("REDIS_URL 应指向可用 Redis");
+                let suffix = format!(
+                    "integration:{}:{}",
+                    std::process::id(),
+                    super::now_millis().expect("系统时间应可用")
+                );
+                store
+                    .set_expiring_text(&suffix, "round-trip", Duration::from_secs(30))
+                    .await
+                    .expect("应写入临时文本");
+                assert_eq!(
+                    store.take_text(&suffix).await.expect("应取出临时文本"),
+                    Some("round-trip".to_string())
+                );
+                assert_eq!(
+                    store
+                        .increment_expiring(&suffix, Duration::from_secs(30))
+                        .await
+                        .expect("首次计数应成功"),
+                    1
+                );
+                assert_eq!(
+                    store
+                        .increment_expiring(&suffix, Duration::from_secs(30))
+                        .await
+                        .expect("第二次计数应成功"),
+                    2
+                );
+                store.delete(&suffix).await.expect("应清理集成测试键");
+            });
+    }
 }

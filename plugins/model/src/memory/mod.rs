@@ -19,12 +19,17 @@ use sqlx_core::transaction::Transaction;
 use sqlx_postgres::{PgPool, PgPoolOptions, Postgres};
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::Duration;
 
 static MEMORY_ID_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+const MAX_USER_PROFILES: usize = 10_000;
+const MAX_GROUP_PROFILES: usize = 2_000;
 
 /// 全局记忆管理器实例
 ///
@@ -86,6 +91,38 @@ pub(crate) enum MemoryLookupType {
     Event,
     Preference,
     Emotion,
+}
+
+/// 持久化会话范围。自由文本 `context` 只负责描述事件类型，用户/群隔离由该类型决定。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConversationScope {
+    Private,
+    Group,
+}
+
+impl ConversationScope {
+    fn parse(context: &str) -> Option<Self> {
+        if context == "private"
+            || context.starts_with("private_")
+            || context.starts_with("proactive_private_")
+        {
+            Some(Self::Private)
+        } else if context == "group"
+            || context.starts_with("group_")
+            || context.starts_with("proactive_group_")
+        {
+            Some(Self::Group)
+        } else {
+            None
+        }
+    }
+
+    const fn database_value(self) -> &'static str {
+        match self {
+            Self::Private => "private",
+            Self::Group => "group",
+        }
+    }
 }
 
 impl MemoryLookupType {
@@ -285,6 +322,7 @@ impl MemoryManager {
     /// - 好奇心：8/10
     /// - 性格特征：好奇、顽皮、有同理心、轻微傲娇
     pub fn new(memory_file: &str) -> Self {
+        harden_memory_file_permissions(memory_file);
         // 构造阶段同步读取，保证第一条消息不会和后台加载任务竞态并覆盖旧数据。
         let data = match fs::read_to_string(memory_file) {
             Ok(json) => match serde_json::from_str::<MemoryData>(&json) {
@@ -424,6 +462,7 @@ impl MemoryManager {
             CREATE TABLE IF NOT EXISTS kovi_bot_memories (
                 id TEXT PRIMARY KEY,
                 subject_id BIGINT,
+                scope_type TEXT CHECK (scope_type IN ('private', 'group') OR scope_type IS NULL),
                 context TEXT NOT NULL,
                 occurred_at TIMESTAMPTZ NOT NULL,
                 importance SMALLINT NOT NULL,
@@ -434,8 +473,36 @@ impl MemoryManager {
         .execute(pool)
         .await
         .map_err(|error| anyhow::anyhow!("创建记忆明细表失败: {}", error))?;
+        // 非破坏式迁移：旧部署没有 scope_type 时补列，并按受控 context 映射回填。
+        query(
+            "ALTER TABLE kovi_bot_memories ADD COLUMN IF NOT EXISTS scope_type TEXT CHECK (scope_type IN ('private', 'group') OR scope_type IS NULL)",
+        )
+        .execute(pool)
+        .await?;
+        query(
+            r#"
+            UPDATE kovi_bot_memories
+            SET scope_type = CASE
+                WHEN context = 'private'
+                  OR context LIKE 'private\_%' ESCAPE '\'
+                  OR context LIKE 'proactive\_private\_%' ESCAPE '\' THEN 'private'
+                WHEN context = 'group'
+                  OR context LIKE 'group\_%' ESCAPE '\'
+                  OR context LIKE 'proactive\_group\_%' ESCAPE '\' THEN 'group'
+                ELSE NULL
+            END
+            WHERE scope_type IS NULL
+            "#,
+        )
+        .execute(pool)
+        .await?;
         query(
             "CREATE INDEX IF NOT EXISTS kovi_bot_memories_subject_context_time_idx ON kovi_bot_memories (subject_id, context, occurred_at DESC)",
+        )
+        .execute(pool)
+        .await?;
+        query(
+            "CREATE INDEX IF NOT EXISTS kovi_bot_memories_subject_scope_time_idx ON kovi_bot_memories (subject_id, scope_type, occurred_at DESC)",
         )
         .execute(pool)
         .await?;
@@ -570,10 +637,11 @@ impl MemoryManager {
         query(
             r#"
             INSERT INTO kovi_bot_memories
-                (id, subject_id, context, occurred_at, importance, payload)
-            VALUES ($1, $2, $3, $4, $5, $6)
+                (id, subject_id, scope_type, context, occurred_at, importance, payload)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
             ON CONFLICT (id) DO UPDATE SET
                 subject_id = EXCLUDED.subject_id,
+                scope_type = EXCLUDED.scope_type,
                 context = EXCLUDED.context,
                 occurred_at = EXCLUDED.occurred_at,
                 importance = EXCLUDED.importance,
@@ -582,6 +650,7 @@ impl MemoryManager {
         )
         .bind(&memory.id)
         .bind(memory.subject_id)
+        .bind(ConversationScope::parse(&memory.context).map(ConversationScope::database_value))
         .bind(&memory.context)
         .bind(memory.timestamp)
         .bind(i16::from(memory.importance))
@@ -663,56 +732,6 @@ impl MemoryManager {
         Ok(())
     }
 
-    async fn persist_memory(&self, memory: &MemoryEntry) -> Result<()> {
-        if let Some(pool) = self.database_pool.get() {
-            let mut transaction = pool.begin().await?;
-            Self::upsert_memory(&mut transaction, memory).await?;
-            transaction.commit().await?;
-            return Ok(());
-        }
-        self.save_file_snapshot().await
-    }
-
-    async fn persist_user_profile(&self, profile: &UserProfile) -> Result<()> {
-        if let Some(pool) = self.database_pool.get() {
-            let mut transaction = pool.begin().await?;
-            Self::upsert_user_profile(&mut transaction, profile).await?;
-            transaction.commit().await?;
-            return Ok(());
-        }
-        self.save_file_snapshot().await
-    }
-
-    async fn persist_group_profile(&self, profile: &GroupProfile) -> Result<()> {
-        if let Some(pool) = self.database_pool.get() {
-            let mut transaction = pool.begin().await?;
-            Self::upsert_group_profile(&mut transaction, profile).await?;
-            transaction.commit().await?;
-            return Ok(());
-        }
-        self.save_file_snapshot().await
-    }
-
-    async fn persist_summary(&self, summary_key: &str, summary: &str) -> Result<()> {
-        if let Some(pool) = self.database_pool.get() {
-            let mut transaction = pool.begin().await?;
-            Self::upsert_summary(&mut transaction, summary_key, summary).await?;
-            transaction.commit().await?;
-            return Ok(());
-        }
-        self.save_file_snapshot().await
-    }
-
-    async fn persist_personality(&self, personality: &BotPersonality) -> Result<()> {
-        if let Some(pool) = self.database_pool.get() {
-            let mut transaction = pool.begin().await?;
-            Self::upsert_personality(&mut transaction, personality).await?;
-            transaction.commit().await?;
-            return Ok(());
-        }
-        self.save_file_snapshot().await
-    }
-
     /// 添加新的记忆条目
     ///
     /// # 参数
@@ -724,35 +743,55 @@ impl MemoryManager {
     /// # 注意
     /// 添加记忆后会自动保存到当前持久化后端
     pub async fn add_memory(&self, memory: MemoryEntry) -> Result<()> {
-        let persisted_memory = memory.clone();
+        let _save_guard = self.save_lock.lock().await;
         let duplicate_id = {
-            let mut memories = self.memories.lock().await;
+            let memories = self.memories.lock().await;
             let normalized_content = normalize_memory_content(&memory.content);
-            let duplicate_id = memories
+            memories
                 .values()
                 .find(|existing| {
                     existing.subject_id == memory.subject_id
                         && existing.context == memory.context
                         && normalize_memory_content(&existing.content) == normalized_content
                 })
-                .map(|existing| existing.id.clone());
+                .map(|existing| existing.id.clone())
+        };
+
+        if let Some(pool) = self.database_pool.get() {
+            // 新记忆写入与旧重复项删除属于同一个事务。提交成功后才发布到内存，
+            // 避免数据库失败时进程内看见一个重启后会消失的状态。
+            let mut transaction = pool.begin().await?;
+            Self::upsert_memory(&mut transaction, &memory).await?;
+            if let Some(duplicate_id) = &duplicate_id
+                && *duplicate_id != memory.id
+            {
+                query("DELETE FROM kovi_bot_memories WHERE id = $1")
+                    .bind(duplicate_id)
+                    .execute(&mut *transaction)
+                    .await?;
+            }
+            transaction.commit().await?;
+            let mut memories = self.memories.lock().await;
             if let Some(duplicate_id) = &duplicate_id {
                 memories.remove(duplicate_id);
             }
             memories.insert(memory.id.clone(), memory);
-            duplicate_id
-        };
-        self.persist_memory(&persisted_memory).await?;
-        if let Some(duplicate_id) = duplicate_id
-            && let Some(pool) = self.database_pool.get()
-        {
-            query("DELETE FROM kovi_bot_memories WHERE id = $1")
-                .bind(duplicate_id)
-                .execute(pool)
-                .await?;
+        } else {
+            let mut data = self.snapshot().await;
+            if let Some(duplicate_id) = &duplicate_id {
+                data.memories.remove(duplicate_id);
+            }
+            data.memories.insert(memory.id.clone(), memory);
+            self.persist_file_snapshot_locked(&data).await?;
+            *self.memories.lock().await = data.memories;
         }
-        if self.memories.lock().await.len() > crate::config::get().memory().max_entries() {
-            self.compact_memories().await?;
+
+        let needs_compaction =
+            self.memories.lock().await.len() > crate::config::get().memory().max_entries();
+        drop(_save_guard);
+        if needs_compaction && let Err(error) = self.compact_memories().await {
+            // 记忆本身已经原子提交，压缩失败不应向调用方谎报“写入失败”并诱发重试。
+            eprintln!("[WARN] 记忆已保存，但后续压缩失败: {}", error);
         }
         Ok(())
     }
@@ -790,6 +829,94 @@ impl MemoryManager {
             memories.truncate(limit);
         }
         memories
+    }
+
+    /// 获取单个会话对象的近期记忆，避免为了一个用户或群组克隆并排序全局记忆。
+    /// `context_prefix` 为空时匹配该对象的全部上下文，否则只匹配指定前缀。
+    pub async fn get_recent_memories_for_subject(
+        &self,
+        subject_id: i64,
+        context_prefix: Option<&str>,
+        limit: usize,
+    ) -> Vec<MemoryEntry> {
+        if let Some(pool) = self.database_pool.get() {
+            let database_limit = if limit == 0 {
+                i64::MAX
+            } else {
+                i64::try_from(limit).unwrap_or(i64::MAX)
+            };
+            let fetch = query(
+                r#"
+                SELECT payload
+                FROM kovi_bot_memories
+                WHERE subject_id = $1
+                  AND ($2::TEXT IS NULL OR STRPOS(context, $2) = 1)
+                ORDER BY occurred_at DESC
+                LIMIT $3
+                "#,
+            )
+            .bind(subject_id)
+            .bind(context_prefix)
+            .bind(database_limit)
+            .fetch_all(pool)
+            .await;
+            match fetch {
+                Ok(rows) => {
+                    let parsed = rows
+                        .into_iter()
+                        .map(|row| serde_json::from_value(row.get("payload")))
+                        .collect::<std::result::Result<Vec<MemoryEntry>, _>>();
+                    match parsed {
+                        Ok(memories) => return memories,
+                        Err(error) => {
+                            eprintln!("[WARN] 解析范围记忆失败，回退内存缓存: {}", error);
+                        }
+                    }
+                }
+                Err(error) => {
+                    eprintln!("[WARN] 查询范围记忆失败，回退内存缓存: {}", error);
+                }
+            }
+        }
+
+        let memories = self.memories.lock().await;
+        let mut scoped = memories
+            .values()
+            .filter(|memory| memory.subject_id == Some(subject_id))
+            .filter(|memory| context_prefix.is_none_or(|prefix| memory.context.starts_with(prefix)))
+            .cloned()
+            .collect::<Vec<_>>();
+        scoped.sort_by_key(|memory| Reverse(memory.timestamp));
+        if limit > 0 {
+            scoped.truncate(limit);
+        }
+        scoped
+    }
+
+    /// 判断给定上下文中是否存在指定时间之后的记忆，不克隆或排序全局集合。
+    pub(crate) async fn has_memory_since_in_contexts(
+        &self,
+        contexts: &[&str],
+        since: DateTime<Local>,
+    ) -> bool {
+        self.memories.lock().await.values().any(|memory| {
+            memory.timestamp > since && contexts.iter().any(|context| memory.context == *context)
+        })
+    }
+
+    /// 统计指定时间后的普通互动；达到 `limit` 后提前停止。
+    pub(crate) async fn count_non_proactive_memories_since(
+        &self,
+        since: DateTime<Local>,
+        limit: usize,
+    ) -> usize {
+        self.memories
+            .lock()
+            .await
+            .values()
+            .filter(|memory| memory.timestamp > since && !memory.context.starts_with("proactive_"))
+            .take(limit)
+            .count()
     }
 
     /// 获取重要性达到指定阈值的记忆条目
@@ -895,7 +1022,7 @@ impl MemoryManager {
     ) -> Vec<MemoryEntry> {
         let memories = self.memories.lock().await;
         let mut contextual_memories: Vec<(MemoryEntry, u8, u8)> = Vec::new();
-        let requested_scope = context_scope(context);
+        let requested_scope = ConversationScope::parse(context);
 
         for memory in memories.values() {
             let mut relevance_score = 0u8;
@@ -909,7 +1036,9 @@ impl MemoryManager {
             }
 
             // 用户号和群号都使用 i64，数值偶然相同时也不能跨私聊/群聊注入记忆。
-            if requested_scope.is_some() && context_scope(&memory.context) != requested_scope {
+            if requested_scope.is_some()
+                && ConversationScope::parse(&memory.context) != requested_scope
+            {
                 continue;
             }
 
@@ -960,7 +1089,11 @@ impl MemoryManager {
         max_days: u32,
     ) -> Result<Vec<MemoryEntry>> {
         let lookup = lookup.normalized(max_results, max_days);
-        let requested_scope = context_scope(context).unwrap_or(context).to_string();
+        let requested_scope = ConversationScope::parse(context);
+        let requested_context = requested_scope
+            .map(ConversationScope::database_value)
+            .unwrap_or(context)
+            .to_string();
         let since = lookup
             .since_days
             .map(|days| Utc::now() - ChronoDuration::days(i64::from(days)));
@@ -978,8 +1111,7 @@ impl MemoryManager {
                 FROM kovi_bot_memories
                 WHERE subject_id = $1
                   AND CASE
-                        WHEN $2 = 'private' THEN POSITION('private' IN context) > 0
-                        WHEN $2 = 'group' THEN POSITION('group' IN context) > 0
+                        WHEN $2 IN ('private', 'group') THEN scope_type = $2
                         ELSE context = $2
                       END
                   AND ($3::TIMESTAMPTZ IS NULL OR occurred_at >= $3)
@@ -1004,7 +1136,7 @@ impl MemoryManager {
                 "#,
             )
             .bind(subject_id)
-            .bind(&requested_scope)
+            .bind(&requested_context)
             .bind(since)
             .bind(&memory_types)
             .bind(min_importance)
@@ -1030,7 +1162,11 @@ impl MemoryManager {
             .values()
             .filter(|memory| memory.subject_id == Some(subject_id))
             .filter(|memory| {
-                context_scope(&memory.context).unwrap_or(&memory.context) == requested_scope
+                if let Some(requested_scope) = requested_scope {
+                    ConversationScope::parse(&memory.context) == Some(requested_scope)
+                } else {
+                    memory.context == requested_context
+                }
             })
             .filter(|memory| since_local.is_none_or(|since| memory.timestamp >= since))
             .filter(|memory| memory.importance >= lookup.min_importance.unwrap_or(0))
@@ -1067,12 +1203,43 @@ impl MemoryManager {
     }
 
     pub async fn update_user_profile(&self, user_id: i64, profile: UserProfile) -> Result<()> {
-        let persisted_profile = profile.clone();
-        {
-            let mut profiles = self.user_profiles.lock().await;
-            profiles.insert(user_id, profile);
+        self.mutate_user_profile(user_id, |_| profile).await?;
+        Ok(())
+    }
+
+    /// 在持久化串行区内基于最新档案执行一次原子读改写。
+    /// 调用方应优先使用该接口，避免“先 get、后 update”覆盖并发消息的更新。
+    pub(crate) async fn mutate_user_profile<F>(
+        &self,
+        user_id: i64,
+        mutate: F,
+    ) -> Result<UserProfile>
+    where
+        F: FnOnce(Option<UserProfile>) -> UserProfile,
+    {
+        let _save_guard = self.save_lock.lock().await;
+        let current = self.user_profiles.lock().await.get(&user_id).cloned();
+        let mut next = mutate(current);
+        next.user_id = user_id;
+
+        if let Some(pool) = self.database_pool.get() {
+            let mut transaction = pool.begin().await?;
+            Self::upsert_user_profile(&mut transaction, &next).await?;
+            transaction.commit().await?;
+            self.user_profiles
+                .lock()
+                .await
+                .insert(user_id, next.clone());
+        } else {
+            let mut data = self.snapshot().await;
+            data.user_profiles.insert(user_id, next.clone());
+            self.persist_file_snapshot_locked(&data).await?;
+            self.user_profiles
+                .lock()
+                .await
+                .insert(user_id, next.clone());
         }
-        self.persist_user_profile(&persisted_profile).await
+        Ok(next)
     }
 
     pub async fn get_user_profile(&self, user_id: i64) -> Option<UserProfile> {
@@ -1081,12 +1248,42 @@ impl MemoryManager {
     }
 
     pub async fn update_group_profile(&self, group_id: i64, profile: GroupProfile) -> Result<()> {
-        let persisted_profile = profile.clone();
-        {
-            let mut profiles = self.group_profiles.lock().await;
-            profiles.insert(group_id, profile);
+        self.mutate_group_profile(group_id, |_| profile).await?;
+        Ok(())
+    }
+
+    /// 在持久化串行区内基于最新档案执行一次原子读改写。
+    pub(crate) async fn mutate_group_profile<F>(
+        &self,
+        group_id: i64,
+        mutate: F,
+    ) -> Result<GroupProfile>
+    where
+        F: FnOnce(Option<GroupProfile>) -> GroupProfile,
+    {
+        let _save_guard = self.save_lock.lock().await;
+        let current = self.group_profiles.lock().await.get(&group_id).cloned();
+        let mut next = mutate(current);
+        next.group_id = group_id;
+
+        if let Some(pool) = self.database_pool.get() {
+            let mut transaction = pool.begin().await?;
+            Self::upsert_group_profile(&mut transaction, &next).await?;
+            transaction.commit().await?;
+            self.group_profiles
+                .lock()
+                .await
+                .insert(group_id, next.clone());
+        } else {
+            let mut data = self.snapshot().await;
+            data.group_profiles.insert(group_id, next.clone());
+            self.persist_file_snapshot_locked(&data).await?;
+            self.group_profiles
+                .lock()
+                .await
+                .insert(group_id, next.clone());
         }
-        self.persist_group_profile(&persisted_profile).await
+        Ok(next)
     }
 
     pub async fn get_group_profile(&self, group_id: i64) -> Option<GroupProfile> {
@@ -1111,11 +1308,27 @@ impl MemoryManager {
         summary: String,
     ) -> Result<()> {
         let summary_key = conversation_summary_key(context, subject_id);
-        {
-            let mut summaries = self.conversation_summaries.lock().await;
-            summaries.insert(summary_key.clone(), summary.clone());
+        let _save_guard = self.save_lock.lock().await;
+        if let Some(pool) = self.database_pool.get() {
+            let mut transaction = pool.begin().await?;
+            Self::upsert_summary(&mut transaction, &summary_key, &summary).await?;
+            transaction.commit().await?;
+            self.conversation_summaries
+                .lock()
+                .await
+                .insert(summary_key, summary);
+            return Ok(());
         }
-        self.persist_summary(&summary_key, &summary).await
+
+        let mut data = self.snapshot().await;
+        data.conversation_summaries
+            .insert(summary_key.clone(), summary.clone());
+        self.persist_file_snapshot_locked(&data).await?;
+        self.conversation_summaries
+            .lock()
+            .await
+            .insert(summary_key, summary);
+        Ok(())
     }
 
     pub async fn get_all_user_profiles(&self) -> Vec<UserProfile> {
@@ -1128,13 +1341,196 @@ impl MemoryManager {
         profiles.values().cloned().collect()
     }
 
-    pub async fn update_bot_personality(&self, personality: BotPersonality) -> Result<()> {
-        let persisted_personality = personality.clone();
-        {
-            let mut bot_personality = self.bot_personality.lock().await;
-            *bot_personality = personality;
+    /// 删除一个私聊用户在记忆仓储中的全部可归属数据。
+    /// 群消息目前只以群为 subject，无法可靠拆分其中某位成员的历史文本。
+    pub(crate) async fn delete_user_data(&self, user_id: i64) -> Result<u64> {
+        self.delete_subject_data(user_id, ConversationScope::Private)
+            .await
+    }
+
+    /// 删除一个群组在记忆仓储中的全部可归属数据。
+    pub(crate) async fn delete_group_data(&self, group_id: i64) -> Result<u64> {
+        self.delete_subject_data(group_id, ConversationScope::Group)
+            .await
+    }
+
+    async fn delete_subject_data(&self, subject_id: i64, scope: ConversationScope) -> Result<u64> {
+        let _save_guard = self.save_lock.lock().await;
+        let summary_key = format!("{}:{}", scope.database_value(), subject_id);
+
+        if let Some(pool) = self.database_pool.get() {
+            let mut transaction = pool.begin().await?;
+            let memories = match scope {
+                ConversationScope::Private => query(
+                    "DELETE FROM kovi_bot_memories WHERE subject_id = $1 AND (scope_type = 'private' OR context = 'proactive_main_admin_decision')",
+                ),
+                ConversationScope::Group => query(
+                    "DELETE FROM kovi_bot_memories WHERE subject_id = $1 AND scope_type = 'group'",
+                ),
+            }
+            .bind(subject_id)
+            .execute(&mut *transaction)
+            .await?
+            .rows_affected();
+            let profile = match scope {
+                ConversationScope::Private => {
+                    query("DELETE FROM kovi_bot_user_profiles WHERE user_id = $1")
+                }
+                ConversationScope::Group => {
+                    query("DELETE FROM kovi_bot_group_profiles WHERE group_id = $1")
+                }
+            }
+            .bind(subject_id)
+            .execute(&mut *transaction)
+            .await?
+            .rows_affected();
+            let summary =
+                query("DELETE FROM kovi_bot_conversation_summaries WHERE summary_key = $1")
+                    .bind(&summary_key)
+                    .execute(&mut *transaction)
+                    .await?
+                    .rows_affected();
+            transaction.commit().await?;
+
+            self.publish_subject_deletion(subject_id, scope, &summary_key)
+                .await;
+            return Ok(memories + profile + summary);
         }
-        self.persist_personality(&persisted_personality).await
+
+        let mut data = self.snapshot().await;
+        let before_memories = data.memories.len();
+        data.memories
+            .retain(|_, memory| !memory_belongs_to_subject(memory, subject_id, scope));
+        let profile_removed = match scope {
+            ConversationScope::Private => data.user_profiles.remove(&subject_id).is_some(),
+            ConversationScope::Group => data.group_profiles.remove(&subject_id).is_some(),
+        };
+        let summary_removed = data.conversation_summaries.remove(&summary_key).is_some();
+        let removed = (before_memories - data.memories.len()) as u64
+            + u64::from(profile_removed)
+            + u64::from(summary_removed);
+        self.persist_file_snapshot_locked(&data).await?;
+        *self.memories.lock().await = data.memories;
+        *self.user_profiles.lock().await = data.user_profiles;
+        *self.group_profiles.lock().await = data.group_profiles;
+        *self.conversation_summaries.lock().await = data.conversation_summaries;
+        Ok(removed)
+    }
+
+    async fn publish_subject_deletion(
+        &self,
+        subject_id: i64,
+        scope: ConversationScope,
+        summary_key: &str,
+    ) {
+        self.memories
+            .lock()
+            .await
+            .retain(|_, memory| !memory_belongs_to_subject(memory, subject_id, scope));
+        match scope {
+            ConversationScope::Private => {
+                self.user_profiles.lock().await.remove(&subject_id);
+            }
+            ConversationScope::Group => {
+                self.group_profiles.lock().await.remove(&subject_id);
+            }
+        }
+        self.conversation_summaries.lock().await.remove(summary_key);
+    }
+
+    pub async fn update_bot_personality(&self, personality: BotPersonality) -> Result<()> {
+        self.mutate_bot_personality(|_| personality).await?;
+        Ok(())
+    }
+
+    /// 基于最新人格状态串行执行读改写，并在数据库提交后才发布到内存。
+    pub(crate) async fn mutate_bot_personality<F>(&self, mutate: F) -> Result<BotPersonality>
+    where
+        F: FnOnce(BotPersonality) -> BotPersonality,
+    {
+        let _save_guard = self.save_lock.lock().await;
+        let current = self.bot_personality.lock().await.clone();
+        let next = mutate(current);
+
+        if let Some(pool) = self.database_pool.get() {
+            let mut transaction = pool.begin().await?;
+            Self::upsert_personality(&mut transaction, &next).await?;
+            transaction.commit().await?;
+            *self.bot_personality.lock().await = next.clone();
+        } else {
+            let mut data = self.snapshot().await;
+            data.bot_personality = next.clone();
+            self.persist_file_snapshot_locked(&data).await?;
+            *self.bot_personality.lock().await = next.clone();
+        }
+        Ok(next)
+    }
+
+    /// 原子更新人格并记录对应情绪历史，避免其中一步成功、另一步失败。
+    pub(crate) async fn mutate_bot_personality_and_record_emotion<F>(
+        &self,
+        mood: &str,
+        context: &str,
+        mutate: F,
+    ) -> Result<BotPersonality>
+    where
+        F: FnOnce(BotPersonality) -> BotPersonality,
+    {
+        let save_guard = self.save_lock.lock().await;
+        let current = self.bot_personality.lock().await.clone();
+        let next = mutate(current);
+        let memory = new_emotion_memory(mood, next.mood_intensity, context);
+        let duplicate_id = self
+            .memories
+            .lock()
+            .await
+            .values()
+            .find(|existing| {
+                existing.subject_id == memory.subject_id
+                    && existing.context == memory.context
+                    && normalize_memory_content(&existing.content)
+                        == normalize_memory_content(&memory.content)
+            })
+            .map(|existing| existing.id.clone());
+
+        if let Some(pool) = self.database_pool.get() {
+            let mut transaction = pool.begin().await?;
+            Self::upsert_personality(&mut transaction, &next).await?;
+            Self::upsert_memory(&mut transaction, &memory).await?;
+            if let Some(duplicate_id) = &duplicate_id
+                && *duplicate_id != memory.id
+            {
+                query("DELETE FROM kovi_bot_memories WHERE id = $1")
+                    .bind(duplicate_id)
+                    .execute(&mut *transaction)
+                    .await?;
+            }
+            transaction.commit().await?;
+        } else {
+            let mut data = self.snapshot().await;
+            data.bot_personality = next.clone();
+            if let Some(duplicate_id) = &duplicate_id {
+                data.memories.remove(duplicate_id);
+            }
+            data.memories.insert(memory.id.clone(), memory.clone());
+            self.persist_file_snapshot_locked(&data).await?;
+        }
+
+        *self.bot_personality.lock().await = next.clone();
+        {
+            let mut memories = self.memories.lock().await;
+            if let Some(duplicate_id) = &duplicate_id {
+                memories.remove(duplicate_id);
+            }
+            memories.insert(memory.id.clone(), memory);
+        }
+        let needs_compaction =
+            self.memories.lock().await.len() > crate::config::get().memory().max_entries();
+        drop(save_guard);
+        if needs_compaction && let Err(error) = self.compact_memories().await {
+            eprintln!("[WARN] 情绪记录已保存，但后续记忆压缩失败: {}", error);
+        }
+        Ok(next)
     }
 
     pub async fn get_bot_personality(&self) -> BotPersonality {
@@ -1155,25 +1551,96 @@ impl MemoryManager {
     }
 
     pub async fn storage_size_bytes(&self) -> u64 {
-        serde_json::to_vec(&self.snapshot().await)
-            .map(|data| data.len() as u64)
-            .unwrap_or(0)
+        if let Some(pool) = self.database_pool.get()
+            && let Ok(size) = query_scalar::<Postgres, i64>(
+                r#"
+                SELECT pg_total_relation_size('kovi_bot_memories')
+                     + pg_total_relation_size('kovi_bot_user_profiles')
+                     + pg_total_relation_size('kovi_bot_group_profiles')
+                     + pg_total_relation_size('kovi_bot_conversation_summaries')
+                     + pg_total_relation_size('kovi_bot_personality')
+                "#,
+            )
+            .fetch_one(pool)
+            .await
+        {
+            return u64::try_from(size).unwrap_or(0);
+        }
+
+        let memory_file = self.memory_file.clone();
+        kovi::tokio::task::spawn_blocking(move || {
+            fs::metadata(memory_file)
+                .map(|metadata| metadata.len())
+                .unwrap_or(0)
+        })
+        .await
+        .unwrap_or(0)
+    }
+
+    /// 返回运行态对象数量，不克隆档案或对全量记忆排序。
+    pub(crate) async fn runtime_counts(&self) -> (usize, usize, usize) {
+        let memories = self.memories.lock().await.len();
+        let user_profiles = self.user_profiles.lock().await.len();
+        let group_profiles = self.group_profiles.lock().await.len();
+        (memories, user_profiles, group_profiles)
     }
 
     /// 主动执行去重、过期清理和持久化，供后台维护任务调用。
     pub async fn compact_memories(&self) -> Result<()> {
         let _save_guard = self.save_lock.lock().await;
-        let removed_ids = self.cleanup_old_memories().await?;
+        let mut data = self.snapshot().await;
+        let removed_ids = cleanup_old_memories(&mut data.memories);
+        let (removed_user_ids, removed_group_ids, removed_summary_keys) =
+            cleanup_old_profiles(&mut data);
+        if removed_ids.is_empty()
+            && removed_user_ids.is_empty()
+            && removed_group_ids.is_empty()
+            && removed_summary_keys.is_empty()
+        {
+            return Ok(());
+        }
         if let Some(pool) = self.database_pool.get() {
+            let mut transaction = pool.begin().await?;
             if !removed_ids.is_empty() {
                 query("DELETE FROM kovi_bot_memories WHERE id = ANY($1::TEXT[])")
                     .bind(&removed_ids)
-                    .execute(pool)
+                    .execute(&mut *transaction)
                     .await?;
             }
+            if !removed_user_ids.is_empty() {
+                query("DELETE FROM kovi_bot_user_profiles WHERE user_id = ANY($1::BIGINT[])")
+                    .bind(&removed_user_ids)
+                    .execute(&mut *transaction)
+                    .await?;
+            }
+            if !removed_group_ids.is_empty() {
+                query("DELETE FROM kovi_bot_group_profiles WHERE group_id = ANY($1::BIGINT[])")
+                    .bind(&removed_group_ids)
+                    .execute(&mut *transaction)
+                    .await?;
+            }
+            if !removed_summary_keys.is_empty() {
+                query(
+                    "DELETE FROM kovi_bot_conversation_summaries WHERE summary_key = ANY($1::TEXT[])",
+                )
+                .bind(&removed_summary_keys)
+                .execute(&mut *transaction)
+                .await?;
+            }
+            transaction.commit().await?;
+            *self.memories.lock().await = data.memories;
+            *self.user_profiles.lock().await = data.user_profiles;
+            *self.group_profiles.lock().await = data.group_profiles;
+            *self.conversation_summaries.lock().await = data.conversation_summaries;
             return Ok(());
         }
-        self.save_file_snapshot_locked().await
+
+        self.persist_file_snapshot_locked(&data).await?;
+        *self.memories.lock().await = data.memories;
+        *self.user_profiles.lock().await = data.user_profiles;
+        *self.group_profiles.lock().await = data.group_profiles;
+        *self.conversation_summaries.lock().await = data.conversation_summaries;
+        Ok(())
     }
 
     pub async fn add_conversation_memory(
@@ -1216,32 +1683,24 @@ impl MemoryManager {
     }
 
     pub async fn add_emotion_memory(&self, mood: &str, intensity: u8, context: &str) -> Result<()> {
-        let sequence = MEMORY_ID_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        self.add_memory(MemoryEntry {
-            id: format!("emotion_{}_{}", Local::now().timestamp_micros(), sequence),
-            content: format!("情绪变为 {}，强度 {}/10", mood, intensity.min(10)),
-            timestamp: Local::now(),
-            memory_type: MemoryType::Emotion,
-            importance: intensity.clamp(1, 10),
-            tags: vec!["情绪".to_string(), mood.to_string()],
-            context: context.to_string(),
-            subject_id: None,
-        })
-        .await
+        self.add_memory(new_emotion_memory(mood, intensity, context))
+            .await
     }
 
-    async fn save_file_snapshot(&self) -> Result<()> {
-        let _save_guard = self.save_lock.lock().await;
-        self.save_file_snapshot_locked().await
-    }
-
-    async fn save_file_snapshot_locked(&self) -> Result<()> {
-        let data = self.snapshot().await;
+    async fn persist_file_snapshot_locked(&self, data: &MemoryData) -> Result<()> {
         let json = serde_json::to_string_pretty(&data)?;
         let memory_file = self.memory_file.clone();
         kovi::tokio::task::spawn_blocking(move || -> Result<()> {
             let temporary_file = format!("{}.tmp", memory_file);
-            fs::write(&temporary_file, json)?;
+            let mut options = OpenOptions::new();
+            options.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            options.mode(0o600);
+            let mut file = options.open(&temporary_file)?;
+            file.write_all(json.as_bytes())?;
+            file.sync_all()?;
+            #[cfg(unix)]
+            fs::set_permissions(&temporary_file, fs::Permissions::from_mode(0o600))?;
             #[cfg(windows)]
             if std::path::Path::new(&memory_file).exists() {
                 fs::remove_file(&memory_file)?;
@@ -1253,75 +1712,175 @@ impl MemoryManager {
         .map_err(|error| anyhow::anyhow!("记忆持久化任务失败: {}", error))??;
         Ok(())
     }
+}
 
-    /// 清理旧记忆，避免内存过度使用
-    ///
-    /// 执行以下清理策略：
-    /// 1. 移除配置保留期之外的低重要性记忆（重要性 < 7）
-    /// 2. 压缩同一对象、上下文和内容的重复记忆
-    /// 3. 如果超过配置容量，只保留最重要且较新的记忆
-    ///
-    /// # 清理规则
-    /// - 保留所有高重要性记忆（重要性 >= 7）
-    /// - 保留期和最大数量均由 `bot.conf.toml` 的 `[memory]` 控制
-    ///
-    /// # 返回值
-    /// 成功时返回 `Ok(())`，失败时返回错误信息
-    async fn cleanup_old_memories(&self) -> Result<Vec<String>> {
-        let mut memories = self.memories.lock().await;
-        let original_count = memories.len();
-        let original_ids = memories.keys().cloned().collect::<HashSet<_>>();
-        let now = Local::now();
-        let memory_config = crate::config::get().memory().clone();
-        let retention_boundary = now - chrono::Duration::days(memory_config.retention_days());
+fn harden_memory_file_permissions(memory_file: &str) {
+    #[cfg(unix)]
+    if let Ok(metadata) = fs::metadata(memory_file)
+        && metadata.permissions().mode() & 0o077 != 0
+        && let Err(error) = fs::set_permissions(memory_file, fs::Permissions::from_mode(0o600))
+    {
+        eprintln!("[WARN] 收紧记忆文件权限失败 ({}): {}", memory_file, error);
+    }
+    #[cfg(not(unix))]
+    let _ = memory_file;
+}
 
-        // 移除保留期之外的低重要性记忆。
-        memories
-            .retain(|_, memory| memory.timestamp > retention_boundary || memory.importance >= 7);
+fn cleanup_old_memories(memories: &mut HashMap<String, MemoryEntry>) -> Vec<String> {
+    let original_count = memories.len();
+    let original_ids = memories.keys().cloned().collect::<HashSet<_>>();
+    let now = Local::now();
+    let memory_config = crate::config::get().memory().clone();
+    let retention_boundary = now - chrono::Duration::days(memory_config.retention_days());
 
-        // 对相同对象、上下文和内容的重复记忆去重，保留更新且更重要的一条。
-        let mut entries: Vec<_> = memories.drain().collect();
+    // 移除保留期之外的低重要性记忆。
+    memories.retain(|_, memory| memory.timestamp > retention_boundary || memory.importance >= 7);
+
+    // 对相同对象、上下文和内容的重复记忆去重，保留更新且更重要的一条。
+    let mut entries: Vec<_> = memories.drain().collect();
+    entries.sort_by(|left, right| {
+        right
+            .1
+            .timestamp
+            .cmp(&left.1.timestamp)
+            .then_with(|| right.1.importance.cmp(&left.1.importance))
+    });
+    let mut seen = HashSet::new();
+    entries.retain(|(_, memory)| {
+        let normalized_content = normalize_memory_content(&memory.content);
+        seen.insert((
+            memory.subject_id,
+            memory.context.clone(),
+            normalized_content,
+        ))
+    });
+
+    // 超出容量时综合重要性与时间保留价值最高的记忆。
+    if entries.len() > memory_config.max_entries() {
         entries.sort_by(|left, right| {
             right
                 .1
-                .timestamp
-                .cmp(&left.1.timestamp)
-                .then_with(|| right.1.importance.cmp(&left.1.importance))
+                .importance
+                .cmp(&left.1.importance)
+                .then_with(|| right.1.timestamp.cmp(&left.1.timestamp))
         });
-        let mut seen = HashSet::new();
-        entries.retain(|(_, memory)| {
-            let normalized_content = normalize_memory_content(&memory.content);
-            seen.insert((
-                memory.subject_id,
-                memory.context.clone(),
-                normalized_content,
-            ))
-        });
+        entries.truncate(memory_config.max_entries());
+    }
+    *memories = entries.into_iter().collect();
 
-        // 超出容量时综合重要性与时间保留价值最高的记忆。
-        if entries.len() > memory_config.max_entries() {
-            entries.sort_by(|left, right| {
-                right
-                    .1
-                    .importance
-                    .cmp(&left.1.importance)
-                    .then_with(|| right.1.timestamp.cmp(&left.1.timestamp))
-            });
-            entries.truncate(memory_config.max_entries());
-        }
-        *memories = entries.into_iter().collect();
+    if memories.len() < original_count {
+        println!(
+            "[INFO] 记忆清理完成，移除 {} 条，当前保留 {} 条",
+            original_count - memories.len(),
+            memories.len()
+        );
+    }
+    original_ids
+        .into_iter()
+        .filter(|id| !memories.contains_key(id))
+        .collect()
+}
 
-        if memories.len() < original_count {
-            println!(
-                "[INFO] 记忆清理完成，移除 {} 条，当前保留 {} 条",
-                original_count - memories.len(),
-                memories.len()
-            );
-        }
-        Ok(original_ids
-            .into_iter()
-            .filter(|id| !memories.contains_key(id))
-            .collect())
+fn cleanup_old_profiles(data: &mut MemoryData) -> (Vec<i64>, Vec<i64>, Vec<String>) {
+    let retention_boundary =
+        Local::now() - chrono::Duration::days(crate::config::get().memory().retention_days());
+    let mut removed_users = data
+        .user_profiles
+        .values()
+        .filter(|profile| profile.last_interaction <= retention_boundary)
+        .map(|profile| profile.user_id)
+        .collect::<HashSet<_>>();
+    let mut remaining_users = data
+        .user_profiles
+        .values()
+        .filter(|profile| !removed_users.contains(&profile.user_id))
+        .map(|profile| (profile.user_id, profile.last_interaction))
+        .collect::<Vec<_>>();
+    if remaining_users.len() > MAX_USER_PROFILES {
+        remaining_users.sort_by_key(|(_, last_interaction)| *last_interaction);
+        removed_users.extend(
+            remaining_users
+                .into_iter()
+                .take(data.user_profiles.len() - removed_users.len() - MAX_USER_PROFILES)
+                .map(|(user_id, _)| user_id),
+        );
+    }
+
+    let mut removed_groups = data
+        .group_profiles
+        .values()
+        .filter(|profile| profile.last_activity <= retention_boundary)
+        .map(|profile| profile.group_id)
+        .collect::<HashSet<_>>();
+    let mut remaining_groups = data
+        .group_profiles
+        .values()
+        .filter(|profile| !removed_groups.contains(&profile.group_id))
+        .map(|profile| (profile.group_id, profile.last_activity))
+        .collect::<Vec<_>>();
+    if remaining_groups.len() > MAX_GROUP_PROFILES {
+        remaining_groups.sort_by_key(|(_, last_activity)| *last_activity);
+        removed_groups.extend(
+            remaining_groups
+                .into_iter()
+                .take(data.group_profiles.len() - removed_groups.len() - MAX_GROUP_PROFILES)
+                .map(|(group_id, _)| group_id),
+        );
+    }
+
+    data.user_profiles
+        .retain(|user_id, _| !removed_users.contains(user_id));
+    data.group_profiles
+        .retain(|group_id, _| !removed_groups.contains(group_id));
+    let removed_summary_keys = removed_users
+        .iter()
+        .map(|user_id| format!("private:{user_id}"))
+        .chain(
+            removed_groups
+                .iter()
+                .map(|group_id| format!("group:{group_id}")),
+        )
+        .filter(|summary_key| data.conversation_summaries.remove(summary_key).is_some())
+        .collect::<Vec<_>>();
+
+    if !removed_users.is_empty() || !removed_groups.is_empty() {
+        println!(
+            "[INFO] 档案清理完成，移除 {} 个用户档案与 {} 个群档案",
+            removed_users.len(),
+            removed_groups.len()
+        );
+    }
+    (
+        removed_users.into_iter().collect(),
+        removed_groups.into_iter().collect(),
+        removed_summary_keys,
+    )
+}
+
+fn memory_belongs_to_subject(
+    memory: &MemoryEntry,
+    subject_id: i64,
+    scope: ConversationScope,
+) -> bool {
+    if memory.subject_id != Some(subject_id) {
+        return false;
+    }
+    ConversationScope::parse(&memory.context) == Some(scope)
+        || (scope == ConversationScope::Private
+            && memory.context == "proactive_main_admin_decision")
+}
+
+fn new_emotion_memory(mood: &str, intensity: u8, context: &str) -> MemoryEntry {
+    let sequence = MEMORY_ID_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    MemoryEntry {
+        id: format!("emotion_{}_{}", Local::now().timestamp_micros(), sequence),
+        content: format!("情绪变为 {}，强度 {}/10", mood, intensity.min(10)),
+        timestamp: Local::now(),
+        memory_type: MemoryType::Emotion,
+        importance: intensity.clamp(1, 10),
+        tags: vec!["情绪".to_string(), mood.to_string()],
+        context: context.to_string(),
+        subject_id: None,
     }
 }
 
@@ -1352,16 +1911,6 @@ fn normalize_memory_tags(tags: &[String]) -> Vec<String> {
         }
     }
     normalized
-}
-
-fn context_scope(context: &str) -> Option<&'static str> {
-    if context.contains("private") {
-        Some("private")
-    } else if context.contains("group") {
-        Some("group")
-    } else {
-        None
-    }
 }
 
 fn memory_type_database_value(memory_type: &MemoryType) -> &'static str {
@@ -1413,7 +1962,9 @@ fn normalize_memory_content(content: &str) -> String {
 fn conversation_summary_key(context: &str, subject_id: i64) -> String {
     format!(
         "{}:{}",
-        context_scope(context).unwrap_or(context),
+        ConversationScope::parse(context)
+            .map(ConversationScope::database_value)
+            .unwrap_or(context),
         subject_id
     )
 }
@@ -1449,8 +2000,11 @@ impl Default for BotPersonality {
 
 #[cfg(test)]
 mod tests {
-    use super::{MemoryLookup, MemoryLookupType, MemoryManager, UserProfile};
+    use super::{
+        ConversationScope, GroupProfile, MemoryLookup, MemoryLookupType, MemoryManager, UserProfile,
+    };
     use chrono::Local;
+    use std::sync::Arc;
 
     fn temporary_memory_path(test_name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
@@ -1489,8 +2043,96 @@ mod tests {
                 let saved = reloaded.get_user_profile(42).await.expect("应读回用户档案");
                 assert_eq!(saved.nickname, "tester");
                 assert_eq!(saved.interests, vec!["Rust"]);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let mode = std::fs::metadata(&path)
+                        .expect("应读取记忆文件权限")
+                        .permissions()
+                        .mode()
+                        & 0o777;
+                    assert_eq!(mode, 0o600);
+                }
 
                 std::fs::remove_file(path).expect("应清理测试记忆文件");
+            });
+    }
+
+    #[test]
+    fn atomic_profile_mutations_do_not_lose_concurrent_increments() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let path = temporary_memory_path("profile-concurrency");
+                let manager = Arc::new(MemoryManager::new(
+                    path.to_str().expect("临时路径应为 UTF-8"),
+                ));
+                let mut tasks = Vec::new();
+                for _ in 0..8 {
+                    let manager = Arc::clone(&manager);
+                    tasks.push(kovi::tokio::spawn(async move {
+                        manager
+                            .mutate_user_profile(42, |current| {
+                                let mut profile = current.unwrap_or_else(|| UserProfile {
+                                    user_id: 42,
+                                    nickname: "tester".to_string(),
+                                    personality_traits: Vec::new(),
+                                    interests: Vec::new(),
+                                    relationship_level: 1,
+                                    last_interaction: Local::now(),
+                                    interaction_count: 0,
+                                    last_private_interaction: None,
+                                    mood_history: Vec::new(),
+                                });
+                                profile.interaction_count =
+                                    profile.interaction_count.saturating_add(1);
+                                profile
+                            })
+                            .await
+                    }));
+                }
+                for task in tasks {
+                    task.await
+                        .expect("并发更新任务不应崩溃")
+                        .expect("并发更新应持久化");
+                }
+                assert_eq!(
+                    manager
+                        .get_user_profile(42)
+                        .await
+                        .expect("档案应存在")
+                        .interaction_count,
+                    8
+                );
+                std::fs::remove_file(path).expect("应清理测试记忆文件");
+            });
+    }
+
+    #[test]
+    fn failed_file_persistence_rolls_back_published_profile() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let parent = std::env::temp_dir().join(format!(
+                    "kovi-missing-dir-{}-{}",
+                    std::process::id(),
+                    Local::now().timestamp_micros()
+                ));
+                let path = parent.join("memory.json");
+                let manager = MemoryManager::new(path.to_str().expect("临时路径应为 UTF-8"));
+                let profile = UserProfile {
+                    user_id: 7,
+                    nickname: "rollback".to_string(),
+                    personality_traits: Vec::new(),
+                    interests: Vec::new(),
+                    relationship_level: 1,
+                    last_interaction: Local::now(),
+                    interaction_count: 1,
+                    last_private_interaction: None,
+                    mood_history: Vec::new(),
+                };
+                assert!(manager.update_user_profile(7, profile).await.is_err());
+                assert!(manager.get_user_profile(7).await.is_none());
             });
     }
 
@@ -1607,6 +2249,131 @@ mod tests {
     }
 
     #[test]
+    fn subject_deletion_is_transactional_and_scope_isolated() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let path = temporary_memory_path("subject-deletion");
+                let manager = MemoryManager::new(path.to_str().expect("临时路径应为 UTF-8"));
+                manager
+                    .add_conversation_memory(42, "私聊数据", "private_chat")
+                    .await
+                    .expect("应写入私聊记忆");
+                manager
+                    .add_conversation_memory(42, "同号群数据", "group_chat")
+                    .await
+                    .expect("应写入群记忆");
+                manager
+                    .update_user_profile(
+                        42,
+                        UserProfile {
+                            user_id: 42,
+                            nickname: "user".to_string(),
+                            personality_traits: Vec::new(),
+                            interests: Vec::new(),
+                            relationship_level: 1,
+                            last_interaction: Local::now(),
+                            interaction_count: 1,
+                            last_private_interaction: Some(Local::now()),
+                            mood_history: Vec::new(),
+                        },
+                    )
+                    .await
+                    .expect("应写入用户档案");
+                manager
+                    .update_group_profile(
+                        42,
+                        GroupProfile {
+                            group_id: 42,
+                            group_name: "group".to_string(),
+                            active_members: vec![42],
+                            group_personality: "friendly".to_string(),
+                            conversation_topics: Vec::new(),
+                            last_activity: Local::now(),
+                            activity_level: 1,
+                        },
+                    )
+                    .await
+                    .expect("应写入群档案");
+                manager
+                    .update_conversation_summary("private_chat", 42, "私聊摘要".to_string())
+                    .await
+                    .expect("应写入私聊摘要");
+                manager
+                    .update_conversation_summary("group_chat", 42, "群摘要".to_string())
+                    .await
+                    .expect("应写入群摘要");
+
+                assert!(manager.delete_user_data(42).await.expect("应删除用户数据") >= 3);
+                assert!(manager.get_user_profile(42).await.is_none());
+                assert!(
+                    manager
+                        .get_conversation_summary("private_chat", 42)
+                        .await
+                        .is_none()
+                );
+                assert!(manager.get_group_profile(42).await.is_some());
+                assert_eq!(
+                    manager.get_conversation_summary("group_chat", 42).await,
+                    Some("群摘要".to_string())
+                );
+                let remaining = manager.get_recent_memories_for_subject(42, None, 0).await;
+                assert_eq!(remaining.len(), 1);
+                assert_eq!(remaining[0].context, "group_chat");
+
+                assert!(manager.delete_group_data(42).await.expect("应删除群数据") >= 3);
+                assert!(manager.get_group_profile(42).await.is_none());
+                assert!(
+                    manager
+                        .get_recent_memories_for_subject(42, None, 0)
+                        .await
+                        .is_empty()
+                );
+                std::fs::remove_file(path).expect("应清理测试记忆文件");
+            });
+    }
+
+    #[test]
+    fn maintenance_expires_stale_profiles_and_their_summaries() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let path = temporary_memory_path("profile-retention");
+                let manager = MemoryManager::new(path.to_str().expect("临时路径应为 UTF-8"));
+                manager
+                    .update_user_profile(
+                        77,
+                        UserProfile {
+                            user_id: 77,
+                            nickname: "stale".to_string(),
+                            personality_traits: Vec::new(),
+                            interests: Vec::new(),
+                            relationship_level: 1,
+                            last_interaction: Local::now() - chrono::Duration::days(365),
+                            interaction_count: 1,
+                            last_private_interaction: None,
+                            mood_history: Vec::new(),
+                        },
+                    )
+                    .await
+                    .expect("应写入过期档案");
+                manager
+                    .update_conversation_summary("private_chat", 77, "过期摘要".to_string())
+                    .await
+                    .expect("应写入摘要");
+                manager.compact_memories().await.expect("应执行保留期清理");
+                assert!(manager.get_user_profile(77).await.is_none());
+                assert!(
+                    manager
+                        .get_conversation_summary("private_chat", 77)
+                        .await
+                        .is_none()
+                );
+                std::fs::remove_file(path).expect("应清理测试记忆文件");
+            });
+    }
+
+    #[test]
     fn duplicate_memories_are_compressed_and_search_requires_a_match() {
         kovi::tokio::runtime::Runtime::new()
             .expect("应创建测试运行时")
@@ -1648,10 +2415,25 @@ mod tests {
     }
 
     #[test]
-    fn normalized_postgres_storage_round_trips_when_enabled() {
-        if std::env::var("KOVI_RUN_POSTGRES_TEST").as_deref() != Ok("1") {
-            return;
-        }
+    fn context_scope_uses_explicit_prefixes_instead_of_substring_matches() {
+        assert_eq!(
+            ConversationScope::parse("private_chat"),
+            Some(ConversationScope::Private)
+        );
+        assert_eq!(
+            ConversationScope::parse("proactive_group_chat"),
+            Some(ConversationScope::Group)
+        );
+        assert_eq!(
+            ConversationScope::parse("not_private_but_contains_word"),
+            None
+        );
+        assert_eq!(ConversationScope::parse("ungrouped_note"), None);
+    }
+
+    #[test]
+    #[ignore = "requires PostgreSQL via DATABASE_URL"]
+    fn normalized_postgres_storage_round_trips() {
         kovi::tokio::runtime::Runtime::new()
             .expect("应创建测试运行时")
             .block_on(async {

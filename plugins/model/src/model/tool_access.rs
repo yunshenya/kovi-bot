@@ -13,7 +13,7 @@ use rmcp::{
 };
 use scraper::{Html, Selector};
 use serde_json::{Map, Value, json};
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use url::{Host, Url};
@@ -29,6 +29,7 @@ static TOOL_REGISTRY: OnceCell<Arc<ToolRegistry>> = OnceCell::const_new();
 static WEB_CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
         .build()
         .expect("网页工具 HTTP 客户端应可创建")
 });
@@ -211,9 +212,9 @@ pub(crate) async fn initialize() -> Result<()> {
             if !allowed.iter().any(|name| name == tool.name.as_ref()) {
                 continue;
             }
-            if server.read_only() && tool_is_destructive(&tool) {
+            if server.read_only() && !tool_is_explicitly_read_only(&tool) {
                 println!(
-                    "[WARN] 跳过 MCP 非只读工具 (服务: {}, 工具: {})",
+                    "[WARN] 跳过未明确声明只读的 MCP 工具 (服务: {}, 工具: {})",
                     server.name(),
                     tool.name
                 );
@@ -420,32 +421,42 @@ fn tool_is_destructive(tool: &Tool) -> bool {
     }) || tool_name_looks_destructive(tool.name.as_ref())
 }
 
+fn tool_is_explicitly_read_only(tool: &Tool) -> bool {
+    tool.annotations
+        .as_ref()
+        .is_some_and(|annotations| annotations.read_only_hint == Some(true))
+        && !tool_is_destructive(tool)
+}
+
 fn tool_name_looks_destructive(name: &str) -> bool {
-    let action = name
-        .split(['.', '_', '-', '/'])
-        .next()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    matches!(
-        action.as_str(),
-        "apply"
-            | "commit"
-            | "create"
-            | "delete"
-            | "execute"
-            | "move"
-            | "patch"
-            | "post"
-            | "put"
-            | "remove"
-            | "rename"
-            | "run"
-            | "send"
-            | "set"
-            | "update"
-            | "upload"
-            | "write"
-    )
+    name.split(['.', '_', '-', '/']).any(|token| {
+        matches!(
+            token.to_ascii_lowercase().as_str(),
+            "apply"
+                | "archive"
+                | "approve"
+                | "commit"
+                | "create"
+                | "delete"
+                | "execute"
+                | "grant"
+                | "invite"
+                | "move"
+                | "patch"
+                | "post"
+                | "put"
+                | "publish"
+                | "remove"
+                | "rename"
+                | "run"
+                | "schedule"
+                | "send"
+                | "set"
+                | "update"
+                | "upload"
+                | "write"
+        )
+    })
 }
 
 async fn execute_builtin(
@@ -571,7 +582,8 @@ async fn search_brave(
     if !response.status().is_success() {
         return Err(anyhow!("Brave Search 返回 HTTP {}", response.status()));
     }
-    let body: Value = response.json().await?;
+    let body_bytes = read_bounded_response(response, MAX_WEB_DOWNLOAD_BYTES, "搜索响应").await?;
+    let body: Value = serde_json::from_slice(&body_bytes)?;
     format_brave_results(&body, limit, max_result_chars)
 }
 
@@ -586,7 +598,8 @@ async fn search_bing(query: &str, limit: usize, max_result_chars: usize) -> Resu
     if !response.status().is_success() {
         return Err(anyhow!("Bing 搜索返回 HTTP {}", response.status()));
     }
-    let html = response.text().await?;
+    let html_bytes = read_bounded_response(response, MAX_WEB_DOWNLOAD_BYTES, "搜索响应").await?;
+    let html = String::from_utf8_lossy(&html_bytes);
     format_bing_results(&html, limit, max_result_chars)
 }
 
@@ -601,7 +614,8 @@ async fn search_duckduckgo(query: &str, limit: usize, max_result_chars: usize) -
     if !response.status().is_success() {
         return Err(anyhow!("DuckDuckGo 搜索返回 HTTP {}", response.status()));
     }
-    let html = response.text().await?;
+    let html_bytes = read_bounded_response(response, MAX_WEB_DOWNLOAD_BYTES, "搜索响应").await?;
+    let html = String::from_utf8_lossy(&html_bytes);
     format_duckduckgo_results(&html, limit, max_result_chars)
 }
 
@@ -710,8 +724,8 @@ async fn fetch_web(arguments: &Map<String, Value>, max_result_chars: usize) -> R
     reject_unknown_arguments(arguments, &["url"])?;
     let raw_url = required_string(arguments, "url", 2_000)?;
     let url = validate_public_url(&raw_url)?;
-    validate_resolved_public_host(&url).await?;
-    let response = WEB_CLIENT
+    let client = public_client_pinned_to_validated_address(&url).await?;
+    let response = client
         .get(url.as_str())
         .header("User-Agent", "kovi-bot/1.0")
         .timeout(Duration::from_secs(15))
@@ -719,12 +733,6 @@ async fn fetch_web(arguments: &Map<String, Value>, max_result_chars: usize) -> R
         .await?;
     if !response.status().is_success() {
         return Err(anyhow!("网页读取返回 HTTP {}", response.status()));
-    }
-    if response
-        .content_length()
-        .is_some_and(|length| length > MAX_WEB_DOWNLOAD_BYTES as u64)
-    {
-        return Err(anyhow!("网页内容过大"));
     }
     let content_type = response
         .headers()
@@ -738,14 +746,7 @@ async fn fetch_web(arguments: &Map<String, Value>, max_result_chars: usize) -> R
     {
         return Err(anyhow!("只支持读取 HTML 或纯文本网页"));
     }
-    let mut bytes = Vec::new();
-    let mut response = response;
-    while let Some(chunk) = response.chunk().await? {
-        if bytes.len().saturating_add(chunk.len()) > MAX_WEB_DOWNLOAD_BYTES {
-            return Err(anyhow!("网页内容过大"));
-        }
-        bytes.extend_from_slice(&chunk);
-    }
+    let bytes = read_bounded_response(response, MAX_WEB_DOWNLOAD_BYTES, "网页内容").await?;
     let body = String::from_utf8_lossy(&bytes);
     let text = if content_type.contains("html") || body.contains("<html") {
         let document = Html::parse_document(&body);
@@ -759,6 +760,28 @@ async fn fetch_web(arguments: &Map<String, Value>, max_result_chars: usize) -> R
         body.to_string()
     };
     Ok(truncate_chars(&clean_text(&text), max_result_chars))
+}
+
+async fn read_bounded_response(
+    mut response: reqwest::Response,
+    max_bytes: usize,
+    description: &str,
+) -> Result<Vec<u8>> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > max_bytes as u64)
+    {
+        return Err(anyhow!("{description}超过大小上限"));
+    }
+
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if bytes.len().saturating_add(chunk.len()) > max_bytes {
+            return Err(anyhow!("{description}超过大小上限"));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
 }
 
 async fn execute_mcp(
@@ -842,6 +865,14 @@ fn validate_public_url(raw_url: &str) -> Result<Url> {
     if !url.username().is_empty() || url.password().is_some() {
         return Err(anyhow!("URL 不允许携带用户名或密码"));
     }
+    let expected_port = match url.scheme() {
+        "http" => 80,
+        "https" => 443,
+        _ => unreachable!("URL scheme 已完成校验"),
+    };
+    if url.port().is_some_and(|port| port != expected_port) {
+        return Err(anyhow!("网页工具只允许标准 HTTP/HTTPS 端口"));
+    }
     match url.host().ok_or_else(|| anyhow!("URL 缺少主机名"))? {
         Host::Domain(host) => {
             let host = host.trim_end_matches('.').to_ascii_lowercase();
@@ -867,46 +898,81 @@ fn validate_public_url(raw_url: &str) -> Result<Url> {
     Ok(url)
 }
 
-async fn validate_resolved_public_host(url: &Url) -> Result<()> {
+async fn public_client_pinned_to_validated_address(url: &Url) -> Result<reqwest::Client> {
     let host = match url.host().ok_or_else(|| anyhow!("URL 缺少主机名"))? {
         Host::Domain(host) => host,
-        Host::Ipv4(_) | Host::Ipv6(_) => return Ok(()),
+        Host::Ipv4(_) | Host::Ipv6(_) => return Ok(WEB_CLIENT.clone()),
     };
     let port = url
         .port_or_known_default()
         .ok_or_else(|| anyhow!("URL 缺少端口"))?;
-    let addresses = kovi::tokio::net::lookup_host((host, port))
-        .await
-        .map_err(|_| anyhow!("无法解析网页主机"))?;
+    let addresses = kovi::tokio::time::timeout(
+        Duration::from_secs(5),
+        kovi::tokio::net::lookup_host((host, port)),
+    )
+    .await
+    .map_err(|_| anyhow!("解析网页主机超时"))?
+    .map_err(|_| anyhow!("无法解析网页主机"))?;
+    let mut validated = Vec::<SocketAddr>::new();
     for address in addresses {
         if is_private_ip(address.ip()) {
             return Err(anyhow!("网页主机解析到了内网 IP"));
         }
+        if !validated.contains(&address) {
+            validated.push(address);
+        }
     }
-    Ok(())
+    let Some(address) = validated.into_iter().next() else {
+        return Err(anyhow!("网页主机没有可用的公网地址"));
+    };
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .connect_timeout(Duration::from_secs(5))
+        // URL 保留原域名用于 Host/SNI，只固定底层连接地址，关闭 DNS rebinding 窗口。
+        .resolve_to_addrs(host, &[address])
+        .build()
+        .map_err(|error| anyhow!("无法创建固定解析的网页客户端: {error}"))
 }
 
 fn is_private_ip(address: IpAddr) -> bool {
     match address {
-        IpAddr::V4(address) => {
-            address.is_private()
-                || address.is_loopback()
-                || address.is_link_local()
-                || address.is_unspecified()
-                || address.is_broadcast()
-                || address.is_multicast()
-        }
+        IpAddr::V4(address) => !is_public_ipv4(address),
         IpAddr::V6(address) => {
             address
                 .to_ipv4_mapped()
                 .is_some_and(|address| is_private_ip(IpAddr::V4(address)))
-                || address.is_loopback()
-                || address.is_unspecified()
-                || address.is_multicast()
-                || address.segments()[0] & 0xfe00 == 0xfc00
-                || address.segments()[0] & 0xffc0 == 0xfe80
+                || !is_public_ipv6(address)
         }
     }
+}
+
+fn is_public_ipv4(address: std::net::Ipv4Addr) -> bool {
+    let octets = address.octets();
+    !(octets[0] == 0
+        || octets[0] == 10
+        || octets[0] == 127
+        || octets[0] >= 224
+        || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+        || (octets[0] == 169 && octets[1] == 254)
+        || (octets[0] == 172 && (16..=31).contains(&octets[1]))
+        || (octets[0] == 192 && octets[1] == 168)
+        || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
+        || (octets[0] == 192 && octets[1] == 0 && octets[2] == 2)
+        || (octets[0] == 192 && octets[1] == 88 && octets[2] == 99)
+        || (octets[0] == 198 && (octets[1] == 18 || octets[1] == 19))
+        || (octets[0] == 198 && octets[1] == 51 && octets[2] == 100)
+        || (octets[0] == 203 && octets[1] == 0 && octets[2] == 113))
+}
+
+fn is_public_ipv6(address: std::net::Ipv6Addr) -> bool {
+    let segments = address.segments();
+    // 仅接受当前分配的全球单播空间，并拒绝具有过渡、协议或文档语义的网段。
+    segments[0] & 0xe000 == 0x2000
+        && !(segments[0] == 0x2001 && segments[1] < 0x0200)
+        && !(segments[0] == 0x2001 && segments[1] == 0x0db8)
+        && segments[0] != 0x2002
+        && !(segments[0] == 0x3fff && segments[1] & 0xf000 == 0)
 }
 
 fn normalize_duckduckgo_url(raw_url: &str) -> Option<String> {
@@ -985,9 +1051,15 @@ mod tests {
     fn public_url_validation_rejects_private_hosts_and_credentials() {
         assert!(validate_public_url("https://example.com/article").is_ok());
         assert!(validate_public_url("http://127.0.0.1:8080/").is_err());
+        assert!(validate_public_url("http://0.0.0.1/").is_err());
+        assert!(validate_public_url("http://100.64.0.1/").is_err());
+        assert!(validate_public_url("http://198.18.0.1/").is_err());
         assert!(validate_public_url("http://[::1]/").is_err());
         assert!(validate_public_url("http://[::ffff:127.0.0.1]/").is_err());
+        assert!(validate_public_url("http://[fc00::1]/").is_err());
+        assert!(validate_public_url("http://[2001:db8::1]/").is_err());
         assert!(validate_public_url("https://user:password@example.com/").is_err());
+        assert!(validate_public_url("https://example.com:8443/admin").is_err());
         assert!(validate_public_url("file:///tmp/secret").is_err());
     }
 
@@ -1031,6 +1103,10 @@ mod tests {
         assert!(tool_name_looks_destructive("delete_note"));
         assert!(tool_name_looks_destructive("send.message"));
         assert!(tool_name_looks_destructive("update-profile"));
+        assert!(tool_name_looks_destructive("publish.article"));
+        assert!(tool_name_looks_destructive("archive_note"));
+        assert!(tool_name_looks_destructive("notes.delete"));
+        assert!(tool_name_looks_destructive("calendar/schedule_event"));
         assert!(!tool_name_looks_destructive("read_note"));
         assert!(!tool_name_looks_destructive("search.notes"));
     }

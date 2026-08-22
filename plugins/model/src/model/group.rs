@@ -4,24 +4,26 @@ use crate::memory::{GroupProfile, MEMORY_MANAGER};
 use crate::model::coalesce::{MessageCoalescer, MessagePart};
 use crate::model::interrupt::{ReplyScope, interrupt, is_active};
 use crate::model::recall::{
-    has_recalled_messages, is_recent_bot_message, send_tracked_group_message,
+    clear_reply_scope, has_recalled_messages, is_recent_bot_message, send_tracked_group_message,
 };
-use crate::model::reply::record_reply_target;
+use crate::model::reply::{clear_reply_targets, record_reply_target};
 use crate::model::semantic::{MessageUnderstanding, UnderstandingRequest, understand};
+use crate::model::traffic::{InboundScope, bounded_input, should_suppress};
 use crate::model::utils::{
-    is_bot_admin, is_restricted_command, learn_user_profile_from_message, process_group_reply,
-    send_sys_info,
+    clear_group_runtime_data, is_bot_admin, is_restricted_command, learn_user_profile_from_message,
+    process_group_reply, send_sys_info,
 };
 use crate::redis_store;
+use crate::sticker_memory;
 use crate::sticker_memory::{
     StickerScope, extract_stickers, has_reply, known_labels, quoted_message_context,
     stickers_for_teaching, teach, teaching_label, with_quoted_context, with_sticker_context,
     with_unknown_sticker_context,
 };
 use crate::vision::{
-    ImageRequestScope, VisionImage, consume_pending_image_request, extract_image_attachments,
-    is_vision_command, merge_image_attachments, resolve_image_urls, strip_vision_command,
-    with_social_image_context,
+    ImageRequestScope, VisionImage, clear_group_pending_image_requests,
+    consume_pending_image_request, extract_image_attachments, is_vision_command,
+    merge_image_attachments, resolve_image_urls, strip_vision_command, with_social_image_context,
 };
 use chrono::Local;
 use kovi::event::GroupMsgEvent;
@@ -60,7 +62,6 @@ static GROUP_MESSAGE_BATCHES: LazyLock<MessageCoalescer<(i64, i64)>> =
 
 struct PendingWindowMessage {
     user_id: i64,
-    nickname: String,
     sender: String,
     message: String,
     vision_images: Vec<VisionImage>,
@@ -91,7 +92,6 @@ impl Addressing {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct GroupSenderIdentity {
-    user_id: i64,
     qq_nickname: String,
     group_card: Option<String>,
 }
@@ -99,9 +99,8 @@ struct GroupSenderIdentity {
 impl GroupSenderIdentity {
     fn from_event(event: &GroupMsgEvent) -> Self {
         Self {
-            user_id: event.user_id,
             qq_nickname: normalized_sender_name(event.sender.nickname.as_deref())
-                .unwrap_or_else(|| format!("QQ用户_{}", event.user_id)),
+                .unwrap_or_else(|| "未设置昵称".to_string()),
             group_card: normalized_sender_name(event.sender.card.as_deref()),
         }
     }
@@ -111,25 +110,11 @@ impl GroupSenderIdentity {
     }
 
     fn model_sender(&self, time: &str) -> String {
-        format!(
-            "[{}] 群成员身份={}",
-            time,
-            json!({
-                "群名片": self.group_card.as_deref().unwrap_or("未设置"),
-                "群内称呼": self.display_name(),
-                "QQ昵称": self.qq_nickname,
-                "QQ号": self.user_id,
-            })
-        )
+        format!("[{}] 群成员称呼={}", time, json!(self.display_name()))
     }
 
     fn reply_target_label(&self) -> String {
-        format!(
-            "群名片={}；QQ昵称={}；QQ号={}",
-            self.group_card.as_deref().unwrap_or("未设置"),
-            self.qq_nickname,
-            self.user_id
-        )
+        self.display_name().to_string()
     }
 }
 
@@ -148,8 +133,29 @@ fn normalized_sender_name(value: Option<&str>) -> Option<String> {
     (!normalized.is_empty()).then_some(normalized)
 }
 
-/// 当前回复期间只保留每个群组的一条待处理窗口消息，避免高频消息把模型请求反复取消。
-static PENDING_WINDOW_MESSAGES: LazyLock<Mutex<HashMap<i64, PendingWindowMessage>>> =
+fn looks_like_immediate_stop_request(message: &str) -> bool {
+    let normalized = message
+        .trim()
+        .trim_matches(|character: char| {
+            character.is_ascii_punctuation() || "，。！？…".contains(character)
+        })
+        .to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "别说了"
+            | "不要说了"
+            | "别回复了"
+            | "不要回复了"
+            | "停下"
+            | "停止回复"
+            | "闭嘴"
+            | "stop"
+            | "stop replying"
+    )
+}
+
+/// 当前回复期间使用有界 FIFO 保存完整 turn，避免跨成员混合正文和附件。
+static PENDING_WINDOW_MESSAGES: LazyLock<Mutex<HashMap<i64, VecDeque<PendingWindowMessage>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Default)]
@@ -170,8 +176,10 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
     let sender_identity = GroupSenderIdentity::from_event(&event);
     let nickname = sender_identity.qq_nickname.clone();
     let sender = sender_identity.model_sender(&time);
-    let message = event.borrow_text().unwrap_or_default();
-    if is_restricted_command(message) && !is_bot_admin(&bot, event.user_id) {
+    let bounded_message = bounded_input(event.borrow_text().unwrap_or_default());
+    let message = bounded_message.as_str();
+    let sender_is_admin = is_bot_admin(&bot, event.user_id);
+    if is_restricted_command(message) && !sender_is_admin {
         println!(
             "[INFO] 群聊未授权命令已静默 (群组: {}, 用户: {})",
             group_id, event.user_id
@@ -183,11 +191,60 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
     let vision_command = is_vision_command(message);
     let sticker_scope = StickerScope::Group(group_id);
     let reply_scope = ReplyScope::Group(group_id);
-    if event.user_id == event.self_id || is_recent_bot_message(reply_scope, event.message_id).await
-    {
+    if event.user_id == event.self_id {
         println!(
             "[INFO] 忽略群聊自发消息回流 (群组: {}, 消息: {})",
             group_id, event.message_id
+        );
+        return;
+    }
+    if should_suppress(
+        InboundScope::Group {
+            group_id,
+            user_id: event.user_id,
+        },
+        sender_is_admin,
+    )
+    .await
+    {
+        println!(
+            "[INFO] 群聊入站流量已抑制 (群组: {}, 用户: {})",
+            group_id, event.user_id
+        );
+        return;
+    }
+    match message.trim() {
+        "#删除本群数据" => {
+            send_tracked_group_message(
+                &bot,
+                group_id,
+                "这会删除本群的长期记忆、群档案、摘要和本群表情教学数据。若确认，请发送：#删除本群数据 确认",
+            )
+            .await;
+            return;
+        }
+        "#删除本群数据 确认" => {
+            delete_group_data(group_id, &bot).await;
+            return;
+        }
+        _ => {}
+    }
+    if is_recent_bot_message(reply_scope, event.message_id).await {
+        println!(
+            "[INFO] 忽略群聊已记录消息回流 (群组: {}, 消息: {})",
+            group_id, event.message_id
+        );
+        return;
+    }
+    let locally_addressed =
+        message_at_self(&event.message, event.self_id) || text_mentions_bot(message);
+    if locally_addressed
+        && !sender_is_admin
+        && should_suppress_direct_trigger(group_id, event.user_id).await
+    {
+        println!(
+            "[INFO] 群聊重复或高频点名已静默 (群组: {}, 用户: {})",
+            group_id, event.user_id
         );
         return;
     }
@@ -200,7 +257,7 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
     )
     .await;
     if let Some(label) = teaching_label(message) {
-        match stickers_for_teaching(&event.message, &bot).await {
+        match stickers_for_teaching(&event.message, &bot, sticker_scope).await {
             Ok(teaching_stickers) if !teaching_stickers.is_empty() => {
                 match teach(&teaching_stickers, &label, event.user_id, sticker_scope).await {
                     Ok(count) => {
@@ -281,6 +338,17 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
         quoted.as_ref().and_then(|quoted| quoted.sender_id),
     );
     let addressed_to_bot = addressing.directly_addressed();
+    if addressed_to_bot
+        && !locally_addressed
+        && !sender_is_admin
+        && should_suppress_direct_trigger(group_id, event.user_id).await
+    {
+        println!(
+            "[INFO] 群聊重复或高频点名已静默 (群组: {}, 用户: {})",
+            group_id, event.user_id
+        );
+        return;
+    }
     let pending_image_request = consume_pending_image_request(
         ImageRequestScope::Group {
             group_id,
@@ -300,51 +368,24 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
     }
     let active_reply = is_active(reply_scope).await;
     let conversation_open = has_open_conversation_window(group_id).await;
-    let semantic_required = addressed_to_bot
-        || vision_command
-        || !images.is_empty()
-        || active_reply
-        || conversation_open;
-    let understanding_request = UnderstandingRequest {
-        message: message.to_string(),
-        context: "group_chat".to_string(),
-        quoted_message: quoted.as_ref().map(|value| value.content.clone()),
-        has_images: !images.is_empty(),
-        quoted_has_images: !quoted_images.is_empty(),
-        has_recent_images: false,
-        explicit_vision_command: vision_command,
-        pending_image_request,
-        addressed_to_bot,
-        conversation_open: active_reply || conversation_open,
-    };
-    let mut understanding = if semantic_required {
-        understand(understanding_request.clone()).await
-    } else {
-        MessageUnderstanding::default()
-    };
-    let mut asks_for_silence = understanding.wants_no_reply || understanding.wants_stop;
-    let can_interrupt = addressed_to_bot || asks_for_silence || vision_command;
+    let immediate_stop = active_reply && looks_like_immediate_stop_request(message);
+    let can_interrupt = addressed_to_bot || immediate_stop || vision_command;
     let reply_ticket = if can_interrupt {
         Some(interrupt(reply_scope).await)
     } else {
         None
     };
-    if asks_for_silence {
+    if immediate_stop {
         GROUP_MESSAGE_BATCHES
             .cancel((group_id, event.user_id))
             .await;
         println!("[INFO] 群聊用户打断回复 (群组: {})", group_id);
         return;
     }
-    let mut vision_requested = understanding.should_understand_image(&understanding_request);
-    if addressed_to_bot
-        && !images.is_empty()
-        && labels.is_empty()
-        && !vision_command
-        && !pending_image_request
-    {
-        vision_requested = true;
-    }
+    // 合并前只做确定性的本地判断，完整语义理解在批次形成后只调用一次。
+    let mut vision_requested = vision_command
+        || pending_image_request
+        || (addressed_to_bot && !images.is_empty() && labels.is_empty());
     if vision_command && images.is_empty() {
         send_tracked_group_message(
             &bot,
@@ -361,7 +402,7 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
     {
         return;
     }
-    let text_message = if vision_requested {
+    let text_message = if vision_command {
         strip_vision_command(message)
     } else {
         message.to_string()
@@ -434,22 +475,27 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
         has_images: !images.is_empty(),
         quoted_has_images: !quoted_images.is_empty(),
         has_recent_images: false,
-        explicit_vision_command: false,
-        pending_image_request: batch_vision_requested,
+        explicit_vision_command: batch_vision_requested,
+        pending_image_request: false,
         addressed_to_bot,
         conversation_open: active_reply || conversation_open,
     };
+    let semantic_required = addressed_to_bot
+        || batch_vision_requested
+        || !images.is_empty()
+        || active_reply
+        || conversation_open;
     let sampled_for_interjection = if semantic_required {
         false
     } else {
         reserve_interjection_decision(group_id, &intent_text).await
     };
-    understanding = if semantic_required || sampled_for_interjection {
+    let understanding = if semantic_required || sampled_for_interjection {
         understand(batch_request.clone()).await
     } else {
         MessageUnderstanding::default()
     };
-    asks_for_silence = plain_text && (understanding.wants_no_reply || understanding.wants_stop);
+    let asks_for_silence = plain_text && (understanding.wants_no_reply || understanding.wants_stop);
     if asks_for_silence {
         if sampled_for_interjection {
             finish_interjection_attempt(group_id, false).await;
@@ -457,6 +503,7 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
         GROUP_MESSAGE_BATCHES
             .cancel((group_id, event.user_id))
             .await;
+        interrupt(reply_scope).await;
         println!(
             "[INFO] 合并后的群聊消息请求停止当前回复 (群组: {})",
             group_id
@@ -466,7 +513,8 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
     if sampled_for_interjection && !understanding.interjection_worthy {
         finish_interjection_attempt(group_id, false).await;
     }
-    vision_requested = understanding.should_understand_image(&batch_request);
+    vision_requested =
+        batch_vision_requested || understanding.should_understand_image(&batch_request);
     if intent_text.trim().is_empty()
         && !vision_requested
         && model_message.trim().is_empty()
@@ -507,17 +555,6 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
     } else {
         Vec::new()
     };
-    if addressed_to_bot
-        && !is_bot_admin(&bot, event.user_id)
-        && should_suppress_direct_trigger(group_id, event.user_id).await
-    {
-        println!(
-            "[INFO] 群聊重复或高频点名已静默 (群组: {}, 用户: {})",
-            group_id, event.user_id
-        );
-        return;
-    }
-
     if !message.trim().is_empty() {
         update_group_profile(group_id, event.user_id, &understanding).await;
         learn_user_profile_from_message(event.user_id, message, &nickname, false, &understanding)
@@ -541,7 +578,6 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
         queue_pending_window_message(
             group_id,
             event.user_id,
-            nickname,
             sender,
             model_message,
             vision_images,
@@ -677,6 +713,51 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
                     group_id, error
                 );
             }
+        }
+    }
+}
+
+async fn delete_group_data(group_id: i64, bot: &RuntimeBot) {
+    let scope = ReplyScope::Group(group_id);
+    interrupt(scope).await;
+    GROUP_MESSAGE_BATCHES
+        .cancel_where(|(candidate_group_id, _)| *candidate_group_id == group_id)
+        .await;
+    PENDING_WINDOW_MESSAGES.lock().await.remove(&group_id);
+    GROUP_INTERJECTION_STATE.lock().await.remove(&group_id);
+    DIRECT_TRIGGER_STATES
+        .lock()
+        .await
+        .retain(|(candidate_group_id, _), _| *candidate_group_id != group_id);
+    clear_group_runtime_data(group_id).await;
+    clear_reply_targets(scope).await;
+    clear_reply_scope(scope).await;
+    clear_group_pending_image_requests(group_id).await;
+
+    let memory_result = MEMORY_MANAGER.delete_group_data(group_id).await;
+    let sticker_result = sticker_memory::delete_group_data(group_id).await;
+    match (memory_result, sticker_result) {
+        (Ok(memory_rows), Ok(sticker_rows)) => {
+            send_tracked_group_message(
+                bot,
+                group_id,
+                format!(
+                    "本群可归属数据已删除（记忆/档案/摘要 {memory_rows} 项，表情教学 {sticker_rows} 项）。"
+                ),
+            )
+            .await;
+        }
+        (memory, stickers) => {
+            eprintln!(
+                "[ERROR] 群数据删除未完全成功 (群组: {}, 记忆: {:?}, 表情: {:?})",
+                group_id, memory, stickers
+            );
+            send_tracked_group_message(
+                bot,
+                group_id,
+                "群数据删除没有全部完成，请稍后重试或让管理员检查日志。",
+            )
+            .await;
         }
     }
 }
@@ -923,7 +1004,6 @@ fn should_defer_active_window_message(
 async fn queue_pending_window_message(
     group_id: i64,
     user_id: i64,
-    nickname: String,
     sender: String,
     message: String,
     vision_images: Vec<VisionImage>,
@@ -931,61 +1011,51 @@ async fn queue_pending_window_message(
     understanding: MessageUnderstanding,
 ) {
     let mut pending = PENDING_WINDOW_MESSAGES.lock().await;
-    if let Some(existing) = pending.get_mut(&group_id) {
-        existing.user_id = user_id;
-        existing.nickname = nickname;
-        existing.sender = sender;
-        existing.message = message;
-        merge_vision_images(&mut existing.vision_images, vision_images);
-        merge_message_ids(&mut existing.message_ids, message_ids);
-        existing.understanding = understanding;
-    } else {
-        pending.insert(
-            group_id,
-            PendingWindowMessage {
-                user_id,
-                nickname,
-                sender,
-                message,
-                vision_images,
-                message_ids,
-                understanding,
-            },
+    let queue = pending.entry(group_id).or_default();
+    let max_pending = config::get().traffic().max_pending_turns();
+    if queue.len() >= max_pending {
+        queue.pop_front();
+        eprintln!(
+            "[WARN] 群聊待处理队列已满，丢弃最旧 turn (群组: {}, 上限: {})",
+            group_id, max_pending
         );
     }
-}
-
-fn merge_vision_images(target: &mut Vec<VisionImage>, incoming: Vec<VisionImage>) {
-    for image in incoming {
-        if target.iter().any(|existing| existing.url == image.url) {
-            continue;
-        }
-        target.push(image);
-        if target.len() >= 4 {
-            target.truncate(4);
-            break;
-        }
-    }
-}
-
-fn merge_message_ids(target: &mut Vec<i32>, incoming: Vec<i32>) {
-    for message_id in incoming {
-        if !target.contains(&message_id) {
-            target.push(message_id);
-        }
-    }
+    queue.push_back(PendingWindowMessage {
+        user_id,
+        sender,
+        message,
+        vision_images,
+        message_ids,
+        understanding,
+    });
 }
 
 async fn drain_pending_window_messages(group_id: i64, bot: Arc<RuntimeBot>) {
-    for _ in 0..3 {
-        let Some(pending) = PENDING_WINDOW_MESSAGES.lock().await.remove(&group_id) else {
+    loop {
+        let pending = {
+            let mut pending_by_group = PENDING_WINDOW_MESSAGES.lock().await;
+            let (next, became_empty) = match pending_by_group.get_mut(&group_id) {
+                Some(queue) => {
+                    let next = queue.pop_front();
+                    (next, queue.is_empty())
+                }
+                None => (None, false),
+            };
+            if became_empty {
+                pending_by_group.remove(&group_id);
+            }
+            next
+        };
+        let Some(pending) = pending else {
             return;
         };
         if is_active(ReplyScope::Group(group_id)).await {
             PENDING_WINDOW_MESSAGES
                 .lock()
                 .await
-                .insert(group_id, pending);
+                .entry(group_id)
+                .or_default()
+                .push_front(pending);
             return;
         }
 
@@ -1006,9 +1076,6 @@ async fn drain_pending_window_messages(group_id: i64, bot: Arc<RuntimeBot>) {
         )
         .await;
         finish_conversation_turn(group_id, pending.user_id, turn_marker, replied).await;
-        if !replied {
-            return;
-        }
     }
 }
 
@@ -1176,56 +1243,53 @@ fn text_mentions_bot(message: &str) -> bool {
 }
 
 async fn update_group_profile(group_id: i64, user_id: i64, understanding: &MessageUnderstanding) {
-    let mut profile = MEMORY_MANAGER
-        .get_group_profile(group_id)
+    let topics = understanding.topics.clone();
+    let group_atmosphere = understanding.group_atmosphere.trim().to_string();
+    let now = Local::now();
+    if let Err(e) = MEMORY_MANAGER
+        .mutate_group_profile(group_id, move |current| {
+            let mut profile = current.unwrap_or_else(|| GroupProfile {
+                group_id,
+                group_name: format!("群组_{}", group_id),
+                active_members: Vec::new(),
+                group_personality: "friendly".to_string(),
+                conversation_topics: Vec::new(),
+                last_activity: now,
+                activity_level: 1,
+            });
+            profile.last_activity = now;
+            profile.activity_level = profile.activity_level.saturating_add(1).min(10);
+            if !profile.active_members.contains(&user_id) {
+                profile.active_members.push(user_id);
+                if profile.active_members.len() > 100 {
+                    profile.active_members.remove(0);
+                }
+            }
+            for topic in topics
+                .iter()
+                .map(|topic| topic.trim())
+                .filter(|topic| !topic.is_empty())
+            {
+                if !profile
+                    .conversation_topics
+                    .iter()
+                    .any(|existing| existing == topic)
+                {
+                    profile.conversation_topics.push(topic.to_string());
+                }
+            }
+            if profile.conversation_topics.len() > 20 {
+                profile
+                    .conversation_topics
+                    .drain(0..profile.conversation_topics.len() - 20);
+            }
+            if !group_atmosphere.is_empty() {
+                profile.group_personality = group_atmosphere;
+            }
+            profile
+        })
         .await
-        .unwrap_or_else(|| GroupProfile {
-            group_id,
-            group_name: format!("群组_{}", group_id),
-            active_members: Vec::new(),
-            group_personality: "friendly".to_string(),
-            conversation_topics: Vec::new(),
-            last_activity: Local::now(),
-            activity_level: 1,
-        });
-
-    // 更新活动信息
-    profile.last_activity = Local::now();
-    profile.activity_level = (profile.activity_level + 1).min(10);
-    if !profile.active_members.contains(&user_id) {
-        profile.active_members.push(user_id);
-        if profile.active_members.len() > 100 {
-            profile.active_members.remove(0);
-        }
-    }
-
-    for topic in &understanding.topics {
-        let topic = topic.trim();
-        if topic.is_empty() {
-            continue;
-        }
-        if !profile
-            .conversation_topics
-            .iter()
-            .any(|existing| existing == topic)
-        {
-            profile.conversation_topics.push(topic.to_string());
-        }
-    }
-
-    // 限制话题数量
-    if profile.conversation_topics.len() > 20 {
-        profile
-            .conversation_topics
-            .drain(0..profile.conversation_topics.len() - 20);
-    }
-
-    if !understanding.group_atmosphere.trim().is_empty() {
-        profile.group_personality = understanding.group_atmosphere.trim().to_string();
-    }
-
-    // 更新群组档案
-    if let Err(e) = MEMORY_MANAGER.update_group_profile(group_id, profile).await {
+    {
         eprintln!("[ERROR] 更新群组档案失败 (群组: {}): {}", group_id, e);
     }
 }
@@ -1234,12 +1298,15 @@ async fn update_group_profile(group_id: i64, user_id: i64, understanding: &Messa
 mod tests {
     use super::{
         Addressing, DirectTriggerState, GroupInterjectionState, GroupSenderIdentity,
-        complete_interjection_attempt, conversation_message_is_relevant, decision_budget_available,
-        has_active_conversation_window, message_at_self, normalized_sender_name,
-        prune_decision_attempts, roll_conversation_window, should_defer_active_window_message,
-        suppress_direct_trigger, text_mentions_bot,
+        PENDING_WINDOW_MESSAGES, complete_interjection_attempt, conversation_message_is_relevant,
+        decision_budget_available, has_active_conversation_window,
+        looks_like_immediate_stop_request, message_at_self, normalized_sender_name,
+        prune_decision_attempts, queue_pending_window_message, roll_conversation_window,
+        should_defer_active_window_message, suppress_direct_trigger, text_mentions_bot,
     };
+    use crate::model::semantic::MessageUnderstanding;
     use crate::model::utils::{is_group_admin_command, is_restricted_command};
+    use crate::vision::VisionImage;
     use kovi::Message;
     use kovi::bot::message::Segment;
     use kovi::serde_json::json;
@@ -1306,19 +1373,15 @@ mod tests {
     #[test]
     fn group_identity_keeps_card_and_qq_nickname_separate() {
         let identity = GroupSenderIdentity {
-            user_id: 123,
             qq_nickname: "QQ用户名".to_string(),
             group_card: Some("群内昵称".to_string()),
         };
         assert_eq!(identity.display_name(), "群内昵称");
         let sender = identity.model_sender("12:34:56");
         assert!(sender.contains("群内昵称"));
-        assert!(sender.contains("QQ用户名"));
-        assert!(sender.contains("123"));
-        assert_eq!(
-            identity.reply_target_label(),
-            "群名片=群内昵称；QQ昵称=QQ用户名；QQ号=123"
-        );
+        assert!(!sender.contains("QQ用户名"));
+        assert!(!sender.contains("123"));
+        assert_eq!(identity.reply_target_label(), "群内昵称");
     }
 
     #[test]
@@ -1328,6 +1391,64 @@ mod tests {
             Some("群 名片 测试")
         );
         assert_eq!(normalized_sender_name(Some("   ")), None);
+    }
+
+    #[test]
+    fn exact_stop_phrases_can_interrupt_without_a_semantic_round_trip() {
+        assert!(looks_like_immediate_stop_request("别说了！"));
+        assert!(looks_like_immediate_stop_request("STOP"));
+        assert!(!looks_like_immediate_stop_request(
+            "他说‘别说了’，然后就走了"
+        ));
+    }
+
+    #[test]
+    fn pending_group_turns_keep_each_senders_payload_atomic() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let group_id = 9_200_001;
+                PENDING_WINDOW_MESSAGES.lock().await.remove(&group_id);
+                queue_pending_window_message(
+                    group_id,
+                    11,
+                    "成员甲".to_string(),
+                    "第一条".to_string(),
+                    vec![VisionImage {
+                        url: "data:image/png;base64,AA==".to_string(),
+                    }],
+                    vec![101],
+                    MessageUnderstanding::default(),
+                )
+                .await;
+                queue_pending_window_message(
+                    group_id,
+                    22,
+                    "成员乙".to_string(),
+                    "第二条".to_string(),
+                    vec![VisionImage {
+                        url: "data:image/jpeg;base64,/9j/2Q==".to_string(),
+                    }],
+                    vec![202],
+                    MessageUnderstanding::default(),
+                )
+                .await;
+                let mut pending = PENDING_WINDOW_MESSAGES.lock().await;
+                let queue = pending.get(&group_id).expect("应保留群队列");
+                assert_eq!(queue.len(), 2);
+                assert_eq!(queue[0].user_id, 11);
+                assert_eq!(queue[0].message, "第一条");
+                assert_eq!(queue[0].message_ids, vec![101]);
+                assert_eq!(queue[0].vision_images[0].url, "data:image/png;base64,AA==");
+                assert_eq!(queue[1].user_id, 22);
+                assert_eq!(queue[1].message, "第二条");
+                assert_eq!(queue[1].message_ids, vec![202]);
+                assert_eq!(
+                    queue[1].vision_images[0].url,
+                    "data:image/jpeg;base64,/9j/2Q=="
+                );
+                pending.remove(&group_id);
+            });
     }
 
     #[test]

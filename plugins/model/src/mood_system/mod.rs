@@ -13,11 +13,15 @@ use crate::model::semantic::{MessageUnderstanding, UnderstandingRequest, underst
 use anyhow::Result;
 use chrono::{Duration, Local, Timelike};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::Mutex;
+
+const MAX_MOOD_CACHE_ENTRIES: usize = 2_048;
+const MAX_APPLIED_SUBJECTS_PER_ENTRY: usize = 64;
 
 /// 所有聊天与后台漂移共享同一份情绪缓存和人格更新入口。
 pub static MOOD_SYSTEM: LazyLock<MoodSystem> =
@@ -27,7 +31,9 @@ pub static MOOD_SYSTEM: LazyLock<MoodSystem> =
 struct CachedMood {
     mood: Mood,
     analyzed_at: chrono::DateTime<Local>,
-    applied_to_personality: bool,
+    /// 已将该分析作用到人格的会话对象。不能只存一个 bool，否则另一个用户发送
+    /// 相同文本时会被误认为已经处理。
+    applied_subjects: HashSet<String>,
 }
 
 type MoodCache = Arc<Mutex<HashMap<String, CachedMood>>>;
@@ -111,6 +117,8 @@ pub struct MoodSystem {
     memory_manager: Arc<MemoryManager>,
     /// 情绪分析缓存，避免重复计算相同消息的情绪
     mood_cache: MoodCache,
+    /// 人格是全局状态，所有情绪读改写必须串行，防止并发消息互相覆盖。
+    update_lock: Arc<kovi::tokio::sync::Mutex<()>>,
 }
 
 impl MoodSystem {
@@ -125,6 +133,7 @@ impl MoodSystem {
         Self {
             memory_manager,
             mood_cache: Arc::new(Mutex::new(HashMap::new())),
+            update_lock: Arc::new(kovi::tokio::sync::Mutex::new(())),
         }
     }
 
@@ -155,8 +164,27 @@ impl MoodSystem {
         context: &str,
         understanding: &MessageUnderstanding,
     ) -> Result<Mood> {
-        // 检查缓存
-        let cache_key = format!("{}:{}", message, context);
+        self.analyze_and_update_mood_for_subject_with_understanding(
+            message,
+            context,
+            None,
+            understanding,
+        )
+        .await
+    }
+
+    /// 分析情绪并按实际发送者去重人格更新。同一条消息在同一会话对象内的重复处理
+    /// 只应用一次，但不同用户发送相同文本不会共享“已应用”状态。
+    pub(crate) async fn analyze_and_update_mood_for_subject_with_understanding(
+        &self,
+        message: &str,
+        context: &str,
+        subject_id: Option<i64>,
+        understanding: &MessageUnderstanding,
+    ) -> Result<Mood> {
+        let _update_guard = self.update_lock.lock().await;
+        let cache_key = mood_cache_key(message, context);
+        let subject_key = subject_id.map(|subject_id| format!("{}:{}", context, subject_id));
         let now = Local::now();
         let mood_config = crate::config::get().mood().clone();
 
@@ -168,7 +196,12 @@ impl MoodSystem {
             cache.get(&cache_key).and_then(|cached| {
                 (now.signed_duration_since(cached.analyzed_at)
                     < Duration::seconds(mood_config.cache_ttl_secs() as i64))
-                .then(|| (cached.mood.clone(), cached.applied_to_personality))
+                .then(|| {
+                    let applied = subject_key
+                        .as_ref()
+                        .is_some_and(|subject| cached.applied_subjects.contains(subject));
+                    (cached.mood.clone(), applied)
+                })
             })
         };
         if let Some((mood, true)) = cached_mood.as_ref() {
@@ -186,48 +219,36 @@ impl MoodSystem {
             && now.signed_duration_since(current_personality.last_mood_change)
                 < Duration::minutes(30);
 
-        // 更新缓存
-        {
-            let mut cache = self
-                .mood_cache
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            cache.insert(
-                cache_key,
-                CachedMood {
-                    mood: new_mood.clone(),
-                    analyzed_at: now,
-                    applied_to_personality: true,
-                },
-            );
-
-            // 清理过期缓存
-            cache.retain(|_, cached| {
-                now.signed_duration_since(cached.analyzed_at)
-                    < Duration::seconds(mood_config.cache_retention_secs() as i64)
-            });
-        }
-
         if recently_same_mood {
+            self.remember_cached_mood(
+                cache_key,
+                new_mood.clone(),
+                now,
+                subject_key.as_deref(),
+                mood_config.cache_retention_secs(),
+            );
             return Ok(new_mood);
         }
 
-        // 更新机器人人格
-        let mut updated_personality = current_personality;
-        updated_personality.current_mood = new_mood.to_string();
-        updated_personality.mood_intensity = new_intensity;
-        updated_personality.last_mood_change = now;
-
-        // 根据情绪调整其他属性
-        self.adjust_personality_traits(&mut updated_personality, &new_mood);
-
-        let intensity = updated_personality.mood_intensity;
+        let mood_name = new_mood.to_string();
         self.memory_manager
-            .update_bot_personality(updated_personality)
+            .mutate_bot_personality_and_record_emotion(&mood_name, context, |mut personality| {
+                personality.current_mood = mood_name.clone();
+                personality.mood_intensity = new_intensity;
+                personality.last_mood_change = now;
+                self.adjust_personality_traits(&mut personality, &new_mood);
+                personality
+            })
             .await?;
-        self.memory_manager
-            .add_emotion_memory(&new_mood.to_string(), intensity, context)
-            .await?;
+
+        // 只有持久化成功后才标记已应用；失败时下一次调用仍可重试。
+        self.remember_cached_mood(
+            cache_key,
+            new_mood.clone(),
+            now,
+            subject_key.as_deref(),
+            mood_config.cache_retention_secs(),
+        );
 
         Ok(new_mood)
     }
@@ -245,7 +266,7 @@ impl MoodSystem {
         context: &str,
         understanding: &MessageUnderstanding,
     ) -> Mood {
-        let cache_key = format!("{}:{}", message, context);
+        let cache_key = mood_cache_key(message, context);
         let now = Local::now();
         let mood_config = crate::config::get().mood().clone();
         if let Some(mood) = self
@@ -273,14 +294,47 @@ impl MoodSystem {
             CachedMood {
                 mood: mood.clone(),
                 analyzed_at: now,
-                applied_to_personality: false,
+                applied_subjects: HashSet::new(),
             },
         );
-        cache.retain(|_, cached| {
-            now.signed_duration_since(cached.analyzed_at)
-                < Duration::seconds(mood_config.cache_retention_secs() as i64)
-        });
+        prune_mood_cache(
+            &mut cache,
+            now,
+            Duration::seconds(mood_config.cache_retention_secs() as i64),
+        );
         mood
+    }
+
+    fn remember_cached_mood(
+        &self,
+        cache_key: String,
+        mood: Mood,
+        analyzed_at: chrono::DateTime<Local>,
+        subject_key: Option<&str>,
+        retention_secs: u64,
+    ) {
+        let mut cache = self
+            .mood_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let cached = cache.entry(cache_key).or_insert_with(|| CachedMood {
+            mood: mood.clone(),
+            analyzed_at,
+            applied_subjects: HashSet::new(),
+        });
+        cached.mood = mood;
+        cached.analyzed_at = analyzed_at;
+        if let Some(subject_key) = subject_key {
+            if cached.applied_subjects.len() >= MAX_APPLIED_SUBJECTS_PER_ENTRY {
+                cached.applied_subjects.clear();
+            }
+            cached.applied_subjects.insert(subject_key.to_string());
+        }
+        prune_mood_cache(
+            &mut cache,
+            analyzed_at,
+            Duration::seconds(retention_secs as i64),
+        );
     }
 
     fn resolve_understanding(
@@ -343,14 +397,18 @@ impl MoodSystem {
     }
 
     pub async fn natural_mood_drift(&self) -> Result<()> {
-        if !self.should_change_mood_naturally().await {
+        let _update_guard = self.update_lock.lock().await;
+        let personality = self.memory_manager.get_bot_personality().await;
+        let now = Local::now();
+        let drift_after_secs = crate::config::get().mood().natural_drift_after_secs();
+        if now.signed_duration_since(personality.last_mood_change)
+            <= Duration::seconds(drift_after_secs as i64)
+        {
             return Ok(());
         }
 
-        let mut personality = self.memory_manager.get_bot_personality().await;
-
         // 根据当前时间和能量水平自然调整情绪
-        let hour = Local::now().hour();
+        let hour = now.hour();
         let new_mood = match hour {
             6..=11 => Mood::Happy,     // 早晨开心
             12..=14 => Mood::Excited,  // 中午兴奋
@@ -361,18 +419,48 @@ impl MoodSystem {
             _ => Mood::Neutral,
         };
 
-        personality.current_mood = new_mood.to_string();
-        personality.mood_intensity = 4;
-        personality.energy_level = move_toward(personality.energy_level, 6);
-        personality.social_confidence = move_toward(personality.social_confidence, 6);
-        personality.curiosity_level = move_toward(personality.curiosity_level, 6);
-        personality.last_mood_change = Local::now();
-
         self.memory_manager
-            .update_bot_personality(personality)
+            .mutate_bot_personality(|mut personality| {
+                personality.current_mood = new_mood.to_string();
+                personality.mood_intensity = 4;
+                personality.energy_level = move_toward(personality.energy_level, 6);
+                personality.social_confidence = move_toward(personality.social_confidence, 6);
+                personality.curiosity_level = move_toward(personality.curiosity_level, 6);
+                personality.last_mood_change = now;
+                personality
+            })
             .await?;
 
         Ok(())
+    }
+}
+
+fn mood_cache_key(message: &str, context: &str) -> String {
+    let mut hasher = DefaultHasher::new();
+    context.hash(&mut hasher);
+    message.hash(&mut hasher);
+    format!("{context}:{:016x}", hasher.finish())
+}
+
+fn prune_mood_cache(
+    cache: &mut HashMap<String, CachedMood>,
+    now: chrono::DateTime<Local>,
+    retention: Duration,
+) {
+    cache.retain(|_, cached| now.signed_duration_since(cached.analyzed_at) < retention);
+    if cache.len() <= MAX_MOOD_CACHE_ENTRIES {
+        return;
+    }
+    let mut oldest = cache
+        .iter()
+        .map(|(key, cached)| (key.clone(), cached.analyzed_at))
+        .collect::<Vec<_>>();
+    oldest.sort_by_key(|(_, analyzed_at)| *analyzed_at);
+    for (key, _) in oldest
+        .into_iter()
+        .take(cache.len() - MAX_MOOD_CACHE_ENTRIES)
+    {
+        cache.remove(&key);
     }
 }
 
@@ -386,7 +474,7 @@ fn move_toward(value: u8, target: u8) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use super::{Mood, MoodSystem};
+    use super::{MAX_MOOD_CACHE_ENTRIES, Mood, MoodSystem};
     use crate::memory::{MemoryManager, MemoryType};
     use crate::model::semantic::MessageUnderstanding;
     use chrono::Local;
@@ -480,6 +568,90 @@ mod tests {
                 );
 
                 std::fs::remove_file(path).expect("应清理测试记忆文件");
+            });
+    }
+
+    #[test]
+    fn applied_cache_state_is_isolated_by_subject() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let path = temporary_memory_path();
+                let manager = Arc::new(MemoryManager::new(
+                    path.to_str().expect("临时路径应为 UTF-8"),
+                ));
+                let mood_system = MoodSystem::new(Arc::clone(&manager));
+                let strong = MessageUnderstanding {
+                    mood: "happy".to_string(),
+                    mood_intensity: 8,
+                    mood_confidence: 95,
+                    ..MessageUnderstanding::default()
+                };
+                let mild = MessageUnderstanding {
+                    mood: "happy".to_string(),
+                    mood_intensity: 4,
+                    mood_confidence: 95,
+                    ..MessageUnderstanding::default()
+                };
+
+                mood_system
+                    .analyze_and_update_mood_for_subject_with_understanding(
+                        "今天不错",
+                        "private_chat",
+                        Some(1),
+                        &strong,
+                    )
+                    .await
+                    .expect("首个用户应更新情绪");
+                mood_system
+                    .analyze_and_update_mood_for_subject_with_understanding(
+                        "今天不错",
+                        "private_chat",
+                        Some(1),
+                        &mild,
+                    )
+                    .await
+                    .expect("同一用户重复处理应命中缓存");
+                assert_eq!(manager.get_bot_personality().await.mood_intensity, 8);
+
+                mood_system
+                    .analyze_and_update_mood_for_subject_with_understanding(
+                        "今天不错",
+                        "private_chat",
+                        Some(2),
+                        &mild,
+                    )
+                    .await
+                    .expect("另一个用户不应共享已应用状态");
+                assert_eq!(manager.get_bot_personality().await.mood_intensity, 4);
+                std::fs::remove_file(path).expect("应清理测试记忆文件");
+            });
+    }
+
+    #[test]
+    fn mood_cache_has_a_hard_capacity_limit() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let path = temporary_memory_path();
+                let manager = Arc::new(MemoryManager::new(
+                    path.to_str().expect("临时路径应为 UTF-8"),
+                ));
+                let mood_system = MoodSystem::new(manager);
+                let understanding = MessageUnderstanding::default();
+                for index in 0..(MAX_MOOD_CACHE_ENTRIES + 8) {
+                    mood_system
+                        .analyze_mood_with_understanding(
+                            &format!("cache-entry-{index}"),
+                            "private_chat",
+                            &understanding,
+                        )
+                        .await;
+                }
+                assert!(
+                    mood_system.mood_cache.lock().expect("缓存锁不应中毒").len()
+                        <= MAX_MOOD_CACHE_ENTRIES
+                );
             });
     }
 }

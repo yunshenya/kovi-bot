@@ -3,11 +3,11 @@
 //! 图片先由机器人本地物化并校验，再交给内置视觉接口或受控 MCP 服务。
 
 use crate::config::{self, VisionConfig};
+use crate::image_security::decode_validated_image_data_url;
 use crate::model::ReplyTicket;
 use crate::model::tool_access::tool_registry;
 use crate::vision::{VisionImage, analyze_images_with_builtin, default_vision_prompt};
 use anyhow::{Result, anyhow};
-use base64::Engine;
 use kovi::serde_json::{Map, Value, json};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -15,7 +15,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 const MAX_VISION_QUESTION_CHARS: usize = 4_000;
+const MAX_ROUTED_VISION_IMAGES: usize = 4;
 const MAX_VISION_IMAGE_BYTES: usize = 10 * 1024 * 1024;
+const MAX_TOTAL_VISION_IMAGE_BYTES: usize = 20 * 1024 * 1024;
 static TEMP_IMAGE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
@@ -36,6 +38,9 @@ impl VisionRouter {
     ) -> Result<String> {
         if images.is_empty() {
             return Err(anyhow!("没有可供视觉 Provider 分析的图片"));
+        }
+        if images.len() > MAX_ROUTED_VISION_IMAGES {
+            return Err(anyhow!("一次最多分析 {MAX_ROUTED_VISION_IMAGES} 张图片"));
         }
         let question = if question.trim().is_empty() {
             default_vision_prompt().to_string()
@@ -110,7 +115,10 @@ impl VisionRouter {
             return Err(anyhow!("未配置 vision.mcp_server"));
         }
         let registry = tool_registry().ok_or_else(|| anyhow!("MCP 工具注册表尚未就绪"))?;
-        let files = TempVisionFiles::create(images)?;
+        let images = images.to_vec();
+        let files = kovi::tokio::task::spawn_blocking(move || TempVisionFiles::create(&images))
+            .await
+            .map_err(|error| anyhow!("创建视觉临时文件任务失败: {error}"))??;
         let arguments: Map<String, Value> = serde_json::from_value(json!({
             "question": question,
             "images": files
@@ -191,8 +199,24 @@ impl TempVisionFiles {
 
 fn write_temp_images(directory: &Path, images: &[VisionImage]) -> Result<Vec<TempVisionImage>> {
     let mut entries = Vec::new();
+    let mut total_bytes = 0usize;
     for (index, image) in images.iter().enumerate() {
-        let (mime_type, bytes) = decode_image_data_url(&image.url)?;
+        let remaining = MAX_TOTAL_VISION_IMAGE_BYTES.saturating_sub(total_bytes);
+        if remaining == 0 {
+            return Err(anyhow!(
+                "MCP 视觉 Provider 图片总大小超过 {} MB 限制",
+                MAX_TOTAL_VISION_IMAGE_BYTES / 1024 / 1024
+            ));
+        }
+        let (mime_type, bytes) =
+            decode_validated_image_data_url(&image.url, MAX_VISION_IMAGE_BYTES.min(remaining))?;
+        total_bytes = total_bytes.saturating_add(bytes.len());
+        if total_bytes > MAX_TOTAL_VISION_IMAGE_BYTES {
+            return Err(anyhow!(
+                "MCP 视觉 Provider 图片总大小超过 {} MB 限制",
+                MAX_TOTAL_VISION_IMAGE_BYTES / 1024 / 1024
+            ));
+        }
         let extension = image_extension(&mime_type);
         let name = format!("image-{index}.{extension}");
         let path = directory.join(&name);
@@ -213,26 +237,9 @@ impl Drop for TempVisionFiles {
     }
 }
 
+#[cfg(test)]
 fn decode_image_data_url(url: &str) -> Result<(String, Vec<u8>)> {
-    let (header, encoded) = url
-        .split_once(',')
-        .ok_or_else(|| anyhow!("视觉图片不是有效的 data URL"))?;
-    let mime_type = header
-        .strip_prefix("data:")
-        .and_then(|value| value.strip_suffix(";base64"))
-        .filter(|value| matches!(*value, "image/png" | "image/jpeg" | "image/webp"))
-        .ok_or_else(|| anyhow!("MCP 视觉 Provider 只支持 PNG、JPEG 或 WebP"))?
-        .to_string();
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(encoded)
-        .map_err(|error| anyhow!("视觉图片 Base64 解码失败: {error}"))?;
-    if bytes.len() > MAX_VISION_IMAGE_BYTES {
-        return Err(anyhow!(
-            "MCP 视觉 Provider 图片超过 {} MB 限制",
-            MAX_VISION_IMAGE_BYTES / 1024 / 1024
-        ));
-    }
-    Ok((mime_type, bytes))
+    decode_validated_image_data_url(url, MAX_VISION_IMAGE_BYTES)
 }
 
 fn image_extension(mime_type: &str) -> &'static str {
@@ -257,19 +264,25 @@ mod tests {
     use super::{VisionRouter, decode_image_data_url, image_extension};
     use crate::config::VisionConfig;
     use crate::vision::VisionImage;
+    use base64::Engine;
 
     #[test]
     fn decodes_supported_image_data_urls_for_mcp() {
-        let (mime, bytes) = decode_image_data_url("data:image/png;base64,aGVsbG8=")
-            .expect("图片 data URL 应能解码");
+        let png = b"\x89PNG\r\n\x1a\n";
+        let url = format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(png)
+        );
+        let (mime, bytes) = decode_image_data_url(&url).expect("图片 data URL 应能解码");
         assert_eq!(mime, "image/png");
-        assert_eq!(bytes, b"hello");
+        assert_eq!(bytes, png);
         assert_eq!(image_extension("image/jpeg"), "jpg");
     }
 
     #[test]
     fn rejects_unsupported_mcp_image_data_urls() {
         assert!(decode_image_data_url("data:image/gif;base64,aGVsbG8=").is_err());
+        assert!(decode_image_data_url("data:image/png;base64,aGVsbG8=").is_err());
         assert!(decode_image_data_url("not-a-data-url").is_err());
     }
 
@@ -280,8 +293,23 @@ mod tests {
         let _ = (
             router,
             VisionImage {
-                url: "data:image/png;base64,aGVsbG8=".to_string(),
+                url: "data:image/png;base64,iVBORw0KGgo=".to_string(),
             },
         );
+    }
+
+    #[test]
+    fn router_rejects_more_than_four_images_before_calling_a_provider() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let router = VisionRouter::from_config(VisionConfig::default());
+                let images = (0..5)
+                    .map(|_| VisionImage {
+                        url: "data:image/png;base64,iVBORw0KGgo=".to_string(),
+                    })
+                    .collect::<Vec<_>>();
+                assert!(router.analyze(&images, "看看", None).await.is_err());
+            });
     }
 }

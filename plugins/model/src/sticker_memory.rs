@@ -184,6 +184,7 @@ pub(crate) fn has_reply(message: &Message) -> bool {
 async fn fetch_replied_message(
     message: &Message,
     bot: &RuntimeBot,
+    scope: StickerScope,
 ) -> Result<Option<FetchedMessage>> {
     let Some(message_id) = reply_message_id(message) else {
         return Ok(None);
@@ -192,6 +193,7 @@ async fn fetch_replied_message(
         .get_msg(message_id)
         .await
         .map_err(|response| anyhow!("读取被引用消息失败: {}", response.retcode))?;
+    validate_fetched_message_scope(&response.data, message_id, scope)?;
     let original_message = response
         .data
         .get("message")
@@ -211,6 +213,67 @@ async fn fetch_replied_message(
         sender_id,
         sender_label,
     }))
+}
+
+fn validate_fetched_message_scope(
+    data: &Value,
+    requested_message_id: i32,
+    scope: StickerScope,
+) -> Result<()> {
+    let returned_message_id = data
+        .get("message_id")
+        .and_then(value_as_i64)
+        .ok_or_else(|| anyhow!("被引用消息缺少可验证的消息 ID"))?;
+    if returned_message_id != i64::from(requested_message_id) {
+        return Err(anyhow!("被引用消息 ID 与请求不一致"));
+    }
+
+    let message_type = data
+        .get("message_type")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .ok_or_else(|| anyhow!("被引用消息缺少可验证的会话类型"))?;
+    match scope {
+        StickerScope::Group(expected_group_id) => {
+            if message_type != "group" {
+                return Err(anyhow!("被引用消息不属于当前群聊"));
+            }
+            let group_id = data
+                .get("group_id")
+                .and_then(value_as_i64)
+                .or_else(|| data.get("target_id").and_then(value_as_i64))
+                .or_else(|| data.get("peer_id").and_then(value_as_i64))
+                .ok_or_else(|| anyhow!("被引用群消息缺少可验证的群号"))?;
+            if group_id != expected_group_id {
+                return Err(anyhow!("被引用消息来自其他群聊"));
+            }
+        }
+        StickerScope::Private(expected_user_id) => {
+            if message_type != "private" {
+                return Err(anyhow!("被引用消息不属于当前私聊"));
+            }
+            if data
+                .get("group_id")
+                .and_then(value_as_i64)
+                .is_some_and(|group_id| group_id != 0)
+            {
+                return Err(anyhow!("被引用消息带有其他群聊作用域"));
+            }
+            let belongs_to_peer = [
+                data.get("user_id").and_then(value_as_i64),
+                data.get("target_id").and_then(value_as_i64),
+                data.get("peer_id").and_then(value_as_i64),
+                data.pointer("/sender/user_id").and_then(value_as_i64),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|user_id| user_id == expected_user_id);
+            if !belongs_to_peer {
+                return Err(anyhow!("被引用消息来自其他私聊"));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn message_from_onebot_value(value: Value) -> Result<Message> {
@@ -323,7 +386,7 @@ pub(crate) async fn quoted_message_context(
     bot: &RuntimeBot,
     scope: StickerScope,
 ) -> Result<Option<QuotedMessageContext>> {
-    let Some(quoted) = fetch_replied_message(message, bot).await? else {
+    let Some(quoted) = fetch_replied_message(message, bot, scope).await? else {
         return Ok(None);
     };
     let text = extract_text(&quoted.message);
@@ -377,13 +440,14 @@ pub(crate) fn with_quoted_context(current: &str, quoted: &QuotedMessageContext) 
 pub(crate) async fn stickers_for_teaching(
     message: &Message,
     bot: &RuntimeBot,
+    scope: StickerScope,
 ) -> Result<Vec<StickerImage>> {
     let stickers = extract_stickers(message);
     if !stickers.is_empty() {
         return Ok(stickers);
     }
 
-    let original_message = fetch_replied_message(message, bot)
+    let original_message = fetch_replied_message(message, bot, scope)
         .await?
         .ok_or_else(|| anyhow!("教学消息没有携带或引用表情包"))?;
     Ok(extract_stickers(&original_message.message))
@@ -465,6 +529,44 @@ pub(crate) async fn teach(
     }
     transaction.commit().await?;
     Ok(stickers.len())
+}
+
+/// 删除与指定用户直接关联的表情教学数据，包括教学者身份和私聊作用域标签。
+pub(crate) async fn delete_user_data(user_id: i64) -> Result<u64> {
+    let pool = MEMORY_MANAGER
+        .database_pool()
+        .ok_or_else(|| anyhow!("PostgreSQL 表情包记忆库尚未初始化"))?;
+    let result = query(
+        r#"
+        DELETE FROM kovi_bot_sticker_memory
+        WHERE learned_by = $1
+           OR (scope_type = 'private' AND scope_id = $1)
+        "#,
+    )
+    .bind(user_id)
+    .execute(pool)
+    .await
+    .map_err(|error| anyhow!("删除用户表情包记忆失败: {error}"))?;
+    Ok(result.rows_affected())
+}
+
+/// 删除指定群聊作用域及来源于该群的表情教学数据。
+pub(crate) async fn delete_group_data(group_id: i64) -> Result<u64> {
+    let pool = MEMORY_MANAGER
+        .database_pool()
+        .ok_or_else(|| anyhow!("PostgreSQL 表情包记忆库尚未初始化"))?;
+    let result = query(
+        r#"
+        DELETE FROM kovi_bot_sticker_memory
+        WHERE (scope_type = 'group' AND scope_id = $1)
+           OR learned_in_group = $1
+        "#,
+    )
+    .bind(group_id)
+    .execute(pool)
+    .await
+    .map_err(|error| anyhow!("删除群聊表情包记忆失败: {error}"))?;
+    Ok(result.rows_affected())
 }
 
 /// 返回消息中已学习表情的含义；没有标签的图片不会进入模型上下文。
@@ -550,9 +652,10 @@ pub(crate) fn with_unknown_sticker_context(text: &str, count: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        QuotedMessageContext, StickerImage, extract_stickers, extract_text,
-        message_from_onebot_value, reply_message_id, teaching_label, with_quoted_context,
-        with_sticker_context, with_unknown_sticker_context,
+        QuotedMessageContext, StickerImage, StickerScope, extract_stickers, extract_text,
+        message_from_onebot_value, reply_message_id, teaching_label,
+        validate_fetched_message_scope, with_quoted_context, with_sticker_context,
+        with_unknown_sticker_context,
     };
     use kovi::Message;
     use kovi::bot::message::Segment;
@@ -610,6 +713,74 @@ mod tests {
             vec![StickerImage {
                 key: "image:sticker-123".to_string()
             }]
+        );
+    }
+
+    #[test]
+    fn accepts_only_quoted_messages_from_the_current_group() {
+        let valid = json!({
+            "message_id": 42,
+            "message_type": "group",
+            "group_id": 1001,
+        });
+        assert!(validate_fetched_message_scope(&valid, 42, StickerScope::Group(1001)).is_ok());
+
+        let wrong_group = json!({
+            "message_id": 42,
+            "message_type": "group",
+            "group_id": 2002,
+        });
+        assert!(
+            validate_fetched_message_scope(&wrong_group, 42, StickerScope::Group(1001)).is_err()
+        );
+        assert!(validate_fetched_message_scope(&valid, 41, StickerScope::Group(1001)).is_err());
+    }
+
+    #[test]
+    fn accepts_incoming_or_outgoing_messages_only_for_the_current_private_peer() {
+        let incoming = json!({
+            "message_id": "42",
+            "message_type": "private",
+            "user_id": "1001",
+            "sender": {"user_id": "1001"},
+        });
+        let outgoing = json!({
+            "message_id": 42,
+            "message_type": "private",
+            "user_id": 9999,
+            "target_id": 1001,
+            "sender": {"user_id": 9999},
+        });
+        assert!(validate_fetched_message_scope(&incoming, 42, StickerScope::Private(1001)).is_ok());
+        assert!(validate_fetched_message_scope(&outgoing, 42, StickerScope::Private(1001)).is_ok());
+        assert!(
+            validate_fetched_message_scope(&incoming, 42, StickerScope::Private(2002)).is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_quoted_messages_without_verifiable_scope() {
+        let missing_scope = json!({
+            "message_id": 42,
+            "message_type": "group",
+        });
+        assert!(
+            validate_fetched_message_scope(&missing_scope, 42, StickerScope::Group(1001)).is_err()
+        );
+
+        let group_message_disguised_as_private = json!({
+            "message_id": 42,
+            "message_type": "private",
+            "user_id": 1001,
+            "group_id": 2002,
+        });
+        assert!(
+            validate_fetched_message_scope(
+                &group_message_disguised_as_private,
+                42,
+                StickerScope::Private(1001),
+            )
+            .is_err()
         );
     }
 

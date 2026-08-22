@@ -3,70 +3,66 @@
 一个使用 Rust 和 Kovi 编写的 QQ 聊天机器人。它支持群聊/私聊、兼容 OpenAI
 Responses 或 Chat Completions 的模型服务、长期记忆、情绪与用户档案，以及可配置的随机主动消息推送。
 
-## 运行
+## 配置与运行
 
-要求：Rust stable、可用的 OneBot 11 服务，以及一个兼容 OpenAI Responses 或 Chat Completions 的模型 API。
+要求：`rust-toolchain.toml` 指定的 Rust、OneBot 11 服务、PostgreSQL，以及兼容 OpenAI
+Responses 或 Chat Completions 的模型 API。Redis 可选。
+
+仓库只跟踪不含真实账号、主机和 Token 的模板。首次运行前复制模板，并替换所有占位值：
 
 ```bash
-export OPENAI_API_KEY="你的 GPT API Token"
-export DATABASE_URL="postgresql://postgres:数据库密码@127.0.0.1:5432/postgres"
-# 可选：启用 Redis 运行态共享；未配置时自动回退到进程内内存
-export REDIS_URL="redis://127.0.0.1:6379/0"
-cargo run
+cp bot.conf.example.toml bot.conf.toml
+cp kovi.conf.example.toml kovi.conf.toml
+cp kovi.plugin.example.toml kovi.plugin.toml
+cp .env.example .env
 ```
 
-首次运行会创建 `bot.conf.toml`。Kovi/OneBot 连接配置位于 `kovi.conf.toml`，插件启用和群组、好友白名单位于 `kovi.plugin.toml`。
+- 在 `kovi.conf.toml` 填写所有者 QQ 号和强随机 OneBot Token。
+- 在 `kovi.plugin.toml` 明确填写允许的好友和群；默认空白名单会拒绝所有消息。
+- 在 `bot.conf.toml` 填写 HTTPS 模型地址和模型名。
+
+运行时文件已加入 `.gitignore`，不要强制提交它们。使用专用的非超级用户数据库账号：
+
+```bash
+# 编辑 .env 后显式加载；程序不会自行解析 dotenv 文件。
+set -a
+. ./.env
+set +a
+cargo run --locked
+```
 
 ## 连接 NapCat
 
-`6099` 是 NapCat WebUI 管理端口，不是机器人连接端口。本项目通过 NapCat 的 OneBot 11 WebSocket 服务端连接。当前 `kovi.conf.toml` 已配置为：
+`6099` 是 NapCat WebUI 管理端口，不是机器人连接端口。本项目连接 NapCat 的 OneBot 11
+WebSocket 服务端。NapCat 和机器人同机时，两端都应只监听 `127.0.0.1:3001`，并配置同一个
+至少 24 个随机安全字符的 Token；仓库模板故意使用无法工作的占位 Token。
 
-```toml
-[server]
-host = "139.155.156.152"
-port = 3001
-access_token = ""
-secure = false
-```
+跨主机部署时优先使用受控私网、VPN 或 WSS，并通过防火墙限制来源。不要把无 Token 的
+OneBot 端口暴露到公网。
 
-在 NapCat WebUI 的“网络配置”中新增或启用“WebSocket 服务端”，使用以下参数：
+## GitHub Actions
 
-- Host：`0.0.0.0`
-- Port：`3001`
-- 消息格式：`array`
-- 上报自身消息：关闭
-- 强制推送事件：开启
-- 心跳间隔：`30000` 毫秒
-- Token：建议设置一个强随机值，并将相同值填入 `kovi.conf.toml` 的 `access_token`
+[`CI`](.github/workflows/ci.yml) 会在 PR 与 `main` 推送时执行格式、Clippy、PostgreSQL
+集成测试、release 构建、RustSec 审计、许可证/来源策略和密钥扫描。只有仓库自身 `main`
+分支的 push 通过 CI 后，受保护的 [`Deploy production`](.github/workflows/deploy.yml) 才会
+使用 SSH Key 发布；PR 代码不能读取生产 Secrets。
 
-保存并重启 NapCat 后再运行 `cargo run`。如果 NapCat 与机器人部署在同一台服务器，应将 NapCat Host 和 Kovi Host 都改为 `127.0.0.1`，并通过防火墙禁止公网访问 `3001`；只有跨服务器部署才需要监听公网网卡。
-
-## GitHub Actions 部署
-
-`.github/workflows/deplay.yml` 会在 `main` 分支推送或手动触发时检查格式、运行 Clippy、使用临时 PostgreSQL 做集成测试、构建 Linux release、上传到 `/home/ubuntu/kovi-bot`，并创建或重启 `kovi.service`。发布采用可回滚的二进制替换，服务启动失败时会自动恢复上一版。部署前需要配置以下 GitHub Actions Secrets：
-
-- `DEPLOY_PASSWORD`：Ubuntu 用户的 SSH 和 sudo 密码
-- `OPENAI_API_KEY`：GPT 主模型 Token
-- `BOT_API_TOKEN`：切换到 DeepSeek 主模型时使用的 Token
-- `VISION_API_TOKEN`：可选，切换到 DeepSeek 时使用的独立视觉模型 Token
-- `BRAVE_SEARCH_API_KEY`：可选，网页搜索优先使用 Brave Search；未配置或 API 不可用时使用 Bing、DuckDuckGo HTML 兜底
-- `NAPCAT_ACCESS_TOKEN`：NapCat WebSocket 服务端 Token
-- `POSTGRES_PASSWORD`：服务器本机 `postgres` 用户的数据库密码
-- `REDIS_URL`：可选，Redis 连接地址；不配置时部署默认使用 `redis://127.0.0.1:6379/0`
-
-部署生成的 `.env` 和 `kovi.conf.toml` 权限受限，Token 和数据库密码不会写入仓库。服务器与 NapCat、PostgreSQL 位于同一台机器，因此部署配置分别使用 `127.0.0.1:3001` 和 `127.0.0.1:5432`。
+生产发布使用专用应用账号、最小权限数据库角色、固定 SSH 主机公钥、版本化 release 和
+readiness 文件。二进制、配置与环境变量会作为一个整体原子切换，失败时整体回滚。服务器
+初始化及 GitHub Environment 变量/Secrets 清单见
+[部署手册](.github/deploy/README.md)。
 
 模型与随机推送的配置示例：
 
 ```toml
 [server_config]
-url = "https://codex666ai.com"
-model_name = "gpt-5.5"
+url = "https://api.example.com/v1/responses"
+model_name = "your-model-name"
 wire_api = "responses"
 supports_vision = true
 api_key_env = "OPENAI_API_KEY"
 requires_auth = true
-actor_authorization = "local-image-extension"
+actor_authorization = ""
 max_output_tokens = 1200
 request_timeout_secs = 60
 max_retries = 2
@@ -77,8 +73,20 @@ check_interval_secs = 300
 inactivity_threshold_secs = 7200
 cooldown_secs = 7200
 push_probability_percent = 35
-main_admin = 123456789 # 可选：最信任用户的 QQ 号
+# main_admin 可选，只应写在未跟踪的运行时配置中
 main_admin_decision_interval_secs = 10800
+
+[traffic]
+enabled = true
+window_secs = 60
+per_user_limit = 20
+global_limit = 300
+cooldown_secs = 120
+max_pending_turns = 16
+max_input_chars = 6000
+max_model_response_bytes = 2097152
+max_model_queue = 64
+model_queue_timeout_secs = 15
 
 [group_interjection]
 enabled = true
@@ -150,11 +158,13 @@ natural_drift_check_secs = 1800
 recent_topic_cooldown_secs = 604800
 ```
 
-机器人会从最近活跃的群组和真正私聊过的用户中随机选择接收方，再结合情绪、能量、时间、群组话题和用户兴趣选择内容。冷却时间、空闲阈值、发送概率和话题去重共同避免刷屏。长期记忆、用户档案、群组档案、滚动摘要和人格分别写入 PostgreSQL 分表，不再为每次变化重写整份 JSONB；默认最多保留 1000 条明细，后台任务会定期去重并清理 30 天前的低重要性记录。首次升级时会自动从旧 `kovi_bot_memory` JSONB 快照（或运行目录的 `bot_memory.json`）迁移，原数据保留作为兼容备份。
+机器人会从最近活跃的群组和真正私聊过的用户中随机选择接收方，再结合情绪、能量、时间、群组话题和用户兴趣选择内容。冷却时间、空闲阈值、发送概率和话题去重共同避免刷屏。长期记忆、用户档案、群组档案、滚动摘要和人格分别写入 PostgreSQL 分表，不再为每次变化重写整份 JSONB；默认最多保留 1000 条长期记忆明细，后台任务会定期去重并清理 30 天前的低重要性记录。超过保留期未活跃的用户/群档案及其摘要也会清理；高重要性记忆不按年龄清理，但仍受总量上限约束，人格和表情标签则需显式删除。完整的数据范围、外部传输和删除边界见[数据与隐私说明](docs/privacy.md)。首次升级时会自动从旧 `kovi_bot_memory` JSONB 快照（或运行目录的 `bot_memory.json`）迁移，原数据保留作为兼容备份。
 
 配置 `main_admin` 后，该用户的关系等级会自动保持为最高。她会使用独立的主动私聊策略：每隔 `main_admin_decision_interval_secs`（默认 3 小时）才让模型基于近期互动、对话摘要、当前情绪与时间，自主决定是否联系以及说什么；没有固定日上限或固定发送间隔。该间隔只限制决策请求频率，避免每轮检查都额外消耗 token；此策略不与普通群聊/私聊随机推送竞争。
 
 每段群聊和私聊还会维护一份可持久化的滚动摘要。短期记录超过 `max_conversation_messages`（默认 25 条）或估算超过 `max_conversation_tokens`（默认 6000 token）时，模型会将较早消息连同旧摘要压缩为不超过 `summary_max_chars`（默认 1500 字）的新摘要，并尽量保留最近 `summary_keep_recent_messages`（默认 15 条）原文继续聊天。模型暂时不可用时，会使用截断后的本地片段作为降级摘要，避免直接遗失上下文。
+
+`traffic` 在模型调用和图片下载前实施硬边界：默认每用户每分钟 20 个、全局每分钟 300 个合格事件，超限冷却 120 秒；并发模型请求之外最多排队 64 个，单个请求最多等待 15 秒。输入、模型响应字节数和每会话待处理 turn 也分别有上限。管理员仍受全局资源上限约束，防止错误循环拖垮进程。
 
 应用运行时不再使用 SQLite，`sqlx` 只启用 PostgreSQL；长期记忆、用户档案、群组档案、滚动摘要、人格和表情包记忆全部由 PostgreSQL 持久化。Redis 只保存可重建的短期运行态：芸汐最近 110 秒内可主动撤回的消息候选、等待图片的临时标记，以及直接点名限流计数。Redis 不可用时这些功能会回退到进程内状态，不会阻断启动，也不会把群名片和 QQ 昵称拼接写入记忆档案。
 
@@ -166,9 +176,9 @@ recent_topic_cooldown_secs = 604800
 
 她成功回复后会为当时的聊天成员开启 3 分钟滚动窗口，不再依赖接续词表：窗口参与者发出的消息由语义理解判断是否自然接着当前话题，符合时才把窗口截止时间向后延长 3 分钟；她刚发言后的 45 秒内，其他成员也可以直接接上并加入窗口。其他人的群内闲聊仍走低频抽样，不会让整个群在窗口期内每句话请求模型。
 
-群聊和私聊都会在本地合并同一发送者连续发出的消息气泡，不额外消耗模型 token。完整句默认等待约 0.9 秒，普通句约 1.6 秒，短残句或未说完内容约 2.3 秒；新气泡会续期，但从第一条起最多等待 5 秒。达到 6 个气泡或约 500 字时立即提交。第一条中的 `@` 状态会保留，引用消息、已学习表情和后续文字也能一起交给模型；不同用户之间绝不会合并。用户是否希望取消回复由语义理解判断，尚未提交的气泡会被取消。
+群聊和私聊都会在本地合并同一发送者连续发出的消息气泡，合并阶段只做本地判断；批次完成后才进行一次语义理解。完整句默认等待约 0.9 秒，普通句约 1.6 秒，短残句或未说完内容约 2.3 秒；新气泡会续期，但从第一条起最多等待 5 秒。达到 6 个气泡或约 500 字时立即提交。第一条中的 `@` 状态会保留，引用消息、已学习表情和后续文字也能一起交给模型；不同用户之间不会合并。超过 `traffic.max_input_chars` 的输入会被限制，每个会话最多排队 `traffic.max_pending_turns` 个完整 turn。
 
-回复生成和连续气泡发送都支持打断。私聊收到任何新消息时，会废弃上一轮尚未返回的模型结果，并停止尚未发出的后续气泡；群聊只在再次 `@`/回复她、活跃窗口内自然接话，或语义理解判断用户明确要求停止时打断，其他成员的无关消息不会影响她。已经发出的气泡不会撤回，短期上下文和 PostgreSQL 长期记忆也只记录实际发出的部分。
+回复生成和连续气泡发送支持有条件打断。私聊中的普通新消息会作为完整 turn 排队，不会仅因为到达较晚就丢弃正在生成的回复；明确停止请求或新的识图命令会中断当前轮。群聊中的再次 `@`/回复、明确停止请求或识图命令可以中断当前轮，其他成员的无关消息不会影响她。ticket 在撤回、发送和状态更新等副作用前会重新校验；已经成功发出的气泡不会自动撤回，历史只记录实际发送的部分。
 
 直接 `@`、回复或文字点名还带有按“群 + 成员”隔离的防刷限制：不比较消息文本，只按 60 秒内的触发次数计数，超过 4 次进入 10 分钟冷却。管理员不受此限制。群聊和私聊回复默认采用一条消息；只有确实存在无法自然合并的新信息时才使用第二条连续气泡，详细解释、步骤、复杂分析或不能过度缩短的安慰仍可按内容需要完整回答，不会被固定字数截断。
 
@@ -195,14 +205,14 @@ recent_topic_cooldown_secs = 604800
 - 主模型支持图片时，图片和文字一起直接发送给主模型，不调用另一个聊天模型。
 - 主模型不支持图片时，图片才会先交给独立视觉模型，视觉模型只返回图片文字分析；最终回复仍由主模型独立生成。
 
-因此，选择 GPT-5.5 作为主模型时不会再调用 DeepSeek；选择 DeepSeek 作为主模型时，只有图片输入才会额外调用视觉模型。图片本身不会写入长期记忆或日志。
+因此，`supports_vision = true` 时不会再调用独立视觉聊天模型；设为 `false` 时，只有图片输入才会额外调用视觉模型。图片文件本身不会写入长期记忆，但当前图片会发送给配置的模型服务，OneBot 图片标识还可能进入短期索引。
 
-切换到 DeepSeek 主模型时，将 `[server_config]` 改为：
+使用不支持视觉的主模型时，可按服务商文档填写 Chat Completions 配置：
 
 ```toml
 [server_config]
-url = "https://api.deepseek.com/chat/completions"
-model_name = "deepseek-v4-flash"
+url = "https://api.example.com/v1/chat/completions"
+model_name = "your-text-model"
 wire_api = "chat_completions"
 supports_vision = false
 api_key_env = "BOT_API_TOKEN"
@@ -210,46 +220,43 @@ requires_auth = true
 actor_authorization = ""
 ```
 
-当前仓库默认的 GPT-5.5 主聊天配置为：
+仓库模板故意使用不可用的示例接口，部署前必须替换：
 
 ```toml
 [server_config]
-url = "https://codex666ai.com"
-model_name = "gpt-5.5"
+url = "https://api.example.com/v1/responses"
+model_name = "your-model-name"
 wire_api = "responses"
 supports_vision = true
 api_key_env = "OPENAI_API_KEY"
-requires_auth = false
-actor_authorization = "local-image-extension"
+requires_auth = true
+actor_authorization = ""
 max_output_tokens = 1200
 request_timeout_secs = 60
 max_retries = 2
 ```
 
-当前 `codex666ai.com` 接口要求通过 `OPENAI_API_KEY` 发送 Bearer Token，因此这里必须保持 `requires_auth = true`。如果服务实际要求 `/v1/responses`，将 `url` 直接写成完整接口地址。
+非回环模型地址必须使用 HTTPS。需要 Bearer Token 的服务应保持 `requires_auth = true`；接口路径不标准时，将 `url` 写成服务商给出的完整 HTTPS 地址。
 
 只有主模型的 `supports_vision = false` 时，才需要配置独立视觉接口：
 
-GitHub Actions 会在部署时自动写入以下视觉配置；当前 GPT-5.5 主模型会忽略它们，切换到 DeepSeek 后直接生效：
+GitHub Actions 只会在配置了 `VISION_API_URL` Environment Variable 时写入独立视觉配置：
 
 ```env
-VISION_API_URL=https://codex666ai.com
+VISION_API_URL=https://vision.example.com/v1/responses
 VISION_WIRE_API=responses
-VISION_MODEL_NAME=gpt-5.5
-VISION_ACTOR_AUTHORIZATION=local-image-extension
-VISION_REQUIRES_AUTH=false
+VISION_MODEL_NAME=your-vision-model
+VISION_REQUIRES_AUTH=true
 ```
 
-如果视觉接口需要 Bearer Token，在 GitHub Repository Secrets 中增加 `VISION_API_TOKEN`，并把 `VISION_REQUIRES_AUTH` 改为 `true`。
+如果视觉接口需要 Bearer Token，在 GitHub `production` Environment Secrets 中增加 `VISION_API_TOKEN`，并保持 `VISION_REQUIRES_AUTH=true`。
 
 ```bash
-export VISION_API_URL="https://codex666ai.com"
+export VISION_API_URL="https://vision.example.com/v1/responses"
 export VISION_WIRE_API="responses"
-export VISION_MODEL_NAME="gpt-5.5"
+export VISION_MODEL_NAME="your-vision-model"
 export VISION_API_TOKEN="你的视觉模型 Token"
-export VISION_ACTOR_AUTHORIZATION="local-image-extension"
-# 若视觉服务明确不要求 Bearer Token，改为 false；此时不会发送 VISION_API_TOKEN
-export VISION_REQUIRES_AUTH="false"
+export VISION_REQUIRES_AUTH="true"
 ```
 
 `VISION_WIRE_API=responses` 时，`VISION_API_URL` 可以填写服务根地址，程序会补上 `/responses`；如果服务实际要求 `/v1/responses`，直接填写完整地址即可。若使用旧式 Chat Completions 接口，将其设为 `chat_completions`，程序会发送 `messages[].content` 中的 `image_url` 图片输入。
@@ -303,15 +310,18 @@ export VISION_REQUIRES_AUTH="false"
 
 单次最多处理 4 张图片，每张限制 10 MB，支持 PNG、JPEG 和 WebP。图片地址会先由机器人下载并转换成本地请求内容，因此视觉模型不需要直接访问 QQ 或 NapCat 的内网地址。
 
-配置通过 GitHub 部署。修改 `bot.conf.toml` 后，需要由部署流程拉取最新文件并重启服务；运行中的机器人不再提供配置热重载指令。
+本地修改 `bot.conf.toml` 后需要重启。生产配置由模板和 GitHub `production` Environment
+生成；修改模板或 Environment 设置后重新发布，运行中的机器人不提供配置热重载。
 
-可用命令（所有正式 `#` 指令仅 Kovi 管理员可执行；非管理员使用时保持静默）：
+可用命令：
 
-- `#系统信息`
-- `#健康检查`
-- `#禁言` / `#结束禁言`
-- `#教芸汐 <表情含义>`（回复或引用要教学的表情包后发送）
-- `#看截图`（与截图同发，或回复截图后发送）
+- 私聊用户：`#删除我的数据`，再次发送 `#删除我的数据 确认` 后删除可直接归属到自己的数据
+- Kovi 管理员（群聊）：`#系统信息`、`#健康检查`、`#禁言` / `#结束禁言`
+- Kovi 管理员（群聊）：`#删除本群数据`，再次发送 `#删除本群数据 确认` 后删除本群数据
+- Kovi 管理员：`#教芸汐 <表情含义>`（回复或引用要教学的表情包后发送）
+- Kovi 管理员：`#看截图` / `#看图` / `#识图`（与截图同发，或回复截图后发送）
+
+除私聊用户删除本人数据外，非管理员发送上述受限命令时保持静默。
 
 ## 测试
 
@@ -319,7 +329,19 @@ export VISION_REQUIRES_AUTH="false"
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --all-targets --locked
+cargo audit --deny warnings
+cargo deny --all-features check
+ripsecrets --strict-ignore .
+
+DATABASE_URL="postgresql://…" cargo test -p model --lib \
+  memory::tests::normalized_postgres_storage_round_trips -- --ignored --exact
+REDIS_URL="redis://127.0.0.1:6379/15" cargo test -p model --lib \
+  redis_store::tests::redis_runtime_store_round_trips -- --ignored --exact
 ```
+
+后三项工具版本固定在 CI 工作流中；本地可使用同版本的 `cargo install --locked --version …`
+安装。PostgreSQL 和 Redis 集成测试标记为 ignored；CI 使用独立服务与上述精确测试名
+单独执行，本地运行时也必须显式使用 `--ignored --exact` 并提供测试连接地址。
 
 ## 交叉编译
 

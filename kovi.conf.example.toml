@@ -1,0 +1,14 @@
+[config]
+# 必须替换成机器人所有者的 QQ 号；0 是不可用的安全占位值。
+main_admin = 0
+admins = []
+debug = false
+
+[server]
+# NapCat WebUI 使用 6099；Kovi 连接的是 OneBot 11 WebSocket 服务端。
+# 默认只允许同机连接；跨主机部署时应使用私网或受防火墙保护的地址。
+host = "127.0.0.1"
+port = 3001
+# 必须与 NapCat WebSocket 服务端的强随机 Token 完全一致。
+access_token = "CHANGE_ME_TO_A_STRONG_RANDOM_TOKEN"
+secure = false

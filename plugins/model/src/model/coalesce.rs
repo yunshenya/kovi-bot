@@ -1,8 +1,10 @@
 use crate::config;
+use crate::model::traffic::truncate_chars;
 use crate::vision::{ImageAttachment, merge_image_attachments};
 use kovi::tokio::sync::Mutex;
 use std::collections::HashMap;
 use std::hash::Hash;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, PartialEq, Eq)]
@@ -67,6 +69,7 @@ struct BatchPolicy {
     max_wait: Duration,
     max_parts: usize,
     max_chars: usize,
+    max_input_chars: usize,
 }
 
 impl BatchPolicy {
@@ -80,6 +83,7 @@ impl BatchPolicy {
             max_wait: Duration::from_millis(batching.max_wait_ms()),
             max_parts: batching.max_parts(),
             max_chars: batching.max_chars(),
+            max_input_chars: config::get().traffic().max_input_chars(),
         }
     }
 
@@ -93,6 +97,7 @@ impl BatchPolicy {
             max_wait: Duration::from_millis(100),
             max_parts: 6,
             max_chars: 500,
+            max_input_chars: 6_000,
         }
     }
 }
@@ -100,12 +105,14 @@ impl BatchPolicy {
 /// 为每个聊天键提供轻量防抖队列；只有最后到达的任务会取走完整批次。
 pub(crate) struct MessageCoalescer<K> {
     pending: Mutex<HashMap<K, PendingBatch>>,
+    next_generation: AtomicU64,
 }
 
 impl<K> Default for MessageCoalescer<K> {
     fn default() -> Self {
         Self {
             pending: Mutex::new(HashMap::new()),
+            next_generation: AtomicU64::new(0),
         }
     }
 }
@@ -123,12 +130,18 @@ where
         self.pending.lock().await.remove(&key);
     }
 
+    pub(crate) async fn cancel_where(&self, mut predicate: impl FnMut(&K) -> bool) {
+        self.pending.lock().await.retain(|key, _| !predicate(key));
+    }
+
     async fn push_with_policy(
         &self,
         key: K,
-        part: MessagePart,
+        mut part: MessagePart,
         policy: BatchPolicy,
     ) -> Option<TextBatch> {
+        part.text = truncate_chars(&part.text, policy.max_input_chars);
+        part.intent_text = truncate_chars(&part.intent_text, policy.max_input_chars);
         if !policy.enabled {
             self.cancel(key).await;
             return Some(TextBatch {
@@ -142,7 +155,10 @@ where
             });
         }
 
-        let (generation, delay) = {
+        // 代数必须跨批次删除与取消持续单调；否则旧 sleeper 可能把后来重建、
+        // 恰好使用相同局部代数的批次误认为自己的批次并取走（ABA）。
+        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+        let delay = {
             let now = Instant::now();
             let mut pending = self.pending.lock().await;
             if pending.len() > 2_048 {
@@ -153,10 +169,16 @@ where
             if batch.parts.is_empty() {
                 batch.started_at = now;
             }
-            batch.generation = batch.generation.wrapping_add(1);
-            batch.char_count = batch.char_count.saturating_add(part.text.chars().count());
-            batch.parts.push(part.text);
-            batch.intent_parts.push(part.intent_text);
+            batch.generation = generation;
+            let remaining = policy.max_input_chars.saturating_sub(batch.char_count);
+            let bounded_text = truncate_chars(&part.text, remaining.max(1));
+            let bounded_intent = truncate_chars(&part.intent_text, policy.max_input_chars);
+            batch.char_count = batch
+                .char_count
+                .saturating_add(bounded_text.chars().count())
+                .min(policy.max_input_chars);
+            batch.parts.push(bounded_text);
+            batch.intent_parts.push(bounded_intent);
             batch.addressed |= part.addressed;
             batch.all_plain_text &= part.plain_text;
             batch.vision_requested |= part.vision_requested;
@@ -180,7 +202,7 @@ where
             } else {
                 semantic_delay.min(remaining)
             };
-            (batch.generation, delay)
+            delay
         };
         if !delay.is_zero() {
             kovi::tokio::time::sleep(delay).await;
@@ -191,8 +213,8 @@ where
             return None;
         }
         pending.remove(&key).map(|batch| TextBatch {
-            text: batch.parts.join("\n"),
-            intent_text: batch.intent_parts.join("\n"),
+            text: truncate_chars(&batch.parts.join("\n"), policy.max_input_chars),
+            intent_text: truncate_chars(&batch.intent_parts.join("\n"), policy.max_input_chars),
             addressed: batch.addressed,
             plain_text: batch.all_plain_text,
             vision_requested: batch.vision_requested,
@@ -406,6 +428,37 @@ mod tests {
                 kovi::tokio::time::sleep(Duration::from_millis(5)).await;
                 coalescer.cancel(12_i64).await;
                 assert!(pending.await.expect("任务应正常结束").is_none());
+            });
+    }
+
+    #[test]
+    fn one_oversized_part_is_hard_capped_before_batching() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let mut policy = BatchPolicy::testing();
+                policy.max_chars = 1;
+                policy.max_input_chars = 5;
+                let coalescer = MessageCoalescer::default();
+                let batch = coalescer
+                    .push_with_policy(
+                        13_i64,
+                        MessagePart {
+                            text: "这是一个明显过长的输入".to_string(),
+                            intent_text: "这是一个明显过长的输入".to_string(),
+                            addressed: true,
+                            plain_text: true,
+                            vision_requested: false,
+                            images: Vec::new(),
+                            message_ids: vec![401],
+                        },
+                        policy,
+                    )
+                    .await
+                    .expect("达到容量后应立即返回");
+                assert!(batch.text.chars().count() <= 5);
+                assert!(batch.intent_text.chars().count() <= 5);
+                assert!(batch.text.ends_with('…'));
             });
     }
 }

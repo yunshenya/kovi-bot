@@ -50,6 +50,39 @@ pub(crate) async fn interrupt(scope: ReplyScope) -> ReplyTicket {
     }
 }
 
+/// 仅当指定 ticket 仍是当前代数时推进代数。
+/// 用于撤回等延迟事件，避免它们误中断随后已经开始的新回复。
+pub(crate) async fn interrupt_if_current(ticket: ReplyTicket) -> bool {
+    let mut states = REPLY_STATES.lock().await;
+    let Some(state) = states.get_mut(&ticket.scope) else {
+        return false;
+    };
+    if state.generation != ticket.generation {
+        return false;
+    }
+    state.generation = state.generation.wrapping_add(1);
+    state.last_seen = Instant::now();
+    true
+}
+
+/// 在一轮回复正常完成后，原子领取同一会话的下一轮处理权。
+/// 只有完成的 ticket 仍是当前代数且没有活跃回复时才能领取，因此旧 drainer
+/// 不能覆盖已经在预处理的新消息，多个 drainer 也不能互相抢占。
+pub(crate) async fn claim_follow_up(completed: ReplyTicket) -> Option<ReplyTicket> {
+    let mut states = REPLY_STATES.lock().await;
+    let state = states.get_mut(&completed.scope)?;
+    if state.generation != completed.generation || state.active_generation.is_some() {
+        return None;
+    }
+    state.generation = state.generation.wrapping_add(1);
+    state.active_generation = Some(state.generation);
+    state.last_seen = Instant::now();
+    Some(ReplyTicket {
+        scope: completed.scope,
+        generation: state.generation,
+    })
+}
+
 pub(crate) async fn is_current(ticket: ReplyTicket) -> bool {
     REPLY_STATES
         .lock()
@@ -101,7 +134,10 @@ fn prune_states(states: &mut HashMap<ReplyScope, ReplyState>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{ReplyScope, finish, interrupt, is_active, is_current, mark_active};
+    use super::{
+        ReplyScope, claim_follow_up, finish, interrupt, interrupt_if_current, is_active,
+        is_current, mark_active,
+    };
 
     #[test]
     fn a_new_generation_invalidates_the_old_reply() {
@@ -131,6 +167,44 @@ mod tests {
                 assert!(is_active(scope).await);
                 finish(new).await;
                 assert!(!is_active(scope).await);
+            });
+    }
+
+    #[test]
+    fn delayed_interrupt_cannot_cancel_a_newer_generation() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let scope = ReplyScope::Private(9_000_003);
+                let old = interrupt(scope).await;
+                let new = interrupt(scope).await;
+                assert!(!interrupt_if_current(old).await);
+                assert!(is_current(new).await);
+                assert!(interrupt_if_current(new).await);
+                assert!(!is_current(new).await);
+            });
+    }
+
+    #[test]
+    fn only_current_completed_reply_can_claim_one_follow_up() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let scope = ReplyScope::Group(9_000_004);
+                let completed = interrupt(scope).await;
+                assert!(mark_active(completed).await);
+                finish(completed).await;
+
+                let claimed = claim_follow_up(completed)
+                    .await
+                    .expect("当前完成轮应能领取下一轮");
+                assert!(is_active(scope).await);
+                assert!(claim_follow_up(completed).await.is_none());
+                finish(claimed).await;
+
+                let newer = interrupt(scope).await;
+                assert!(claim_follow_up(claimed).await.is_none());
+                assert!(is_current(newer).await);
             });
     }
 }

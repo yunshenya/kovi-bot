@@ -10,6 +10,7 @@
 
 use crate::model::{group_message_event, private_message_event, recall_notice_event};
 use kovi::PluginBuilder;
+use std::path::PathBuf;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -18,6 +19,7 @@ use std::sync::{
 // 配置管理模块
 pub mod config;
 // 核心模型处理模块
+mod image_security;
 mod model;
 mod private_image_memory;
 mod redis_store;
@@ -40,6 +42,7 @@ pub(crate) mod sticker_memory;
 
 /// 后台任务启动标志，确保只启动一次
 static BACKGROUND_TASK_STARTED: AtomicBool = AtomicBool::new(false);
+const DATABASE_INIT_MAX_ATTEMPTS: u32 = 8;
 
 /// 插件主入口函数
 ///
@@ -52,16 +55,24 @@ static BACKGROUND_TASK_STARTED: AtomicBool = AtomicBool::new(false);
 /// 主动聊天功能在插件初始化时启动。
 #[kovi::plugin]
 async fn main() {
+    clear_ready_marker();
     // 数据库必须先加载完成，避免第一条消息在旧记忆恢复前被处理。
-    loop {
+    for attempt in 1..=DATABASE_INIT_MAX_ATTEMPTS {
         match memory::MEMORY_MANAGER.initialize_database().await {
             Ok(()) => break,
-            Err(error) => {
-                eprintln!(
-                    "[ERROR] PostgreSQL 记忆存储初始化失败，5 秒后重试: {}",
-                    error
+            Err(error) if attempt == DATABASE_INIT_MAX_ATTEMPTS => {
+                panic!(
+                    "PostgreSQL 记忆存储连续 {} 次初始化失败，终止进程交由服务管理器重启: {}",
+                    DATABASE_INIT_MAX_ATTEMPTS, error
                 );
-                kovi::tokio::time::sleep(kovi::tokio::time::Duration::from_secs(5)).await;
+            }
+            Err(error) => {
+                let delay_secs = (1_u64 << (attempt - 1).min(5)).min(30);
+                eprintln!(
+                    "[ERROR] PostgreSQL 记忆存储初始化失败，第 {}/{} 次，{} 秒后重试: {}",
+                    attempt, DATABASE_INIT_MAX_ATTEMPTS, delay_secs, error
+                );
+                kovi::tokio::time::sleep(kovi::tokio::time::Duration::from_secs(delay_secs)).await;
             }
         }
     }
@@ -151,4 +162,46 @@ async fn main() {
 
         println!("[INFO] 后台任务已启动");
     }
+
+    if let Err(error) = write_ready_marker() {
+        panic!("插件初始化完成但无法写入 readiness 标记: {error}");
+    }
+    println!("[INFO] Kovi Bot 插件已就绪");
+}
+
+fn ready_file_path() -> Option<PathBuf> {
+    std::env::var_os("KOVI_READY_FILE")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn clear_ready_marker() {
+    let Some(path) = ready_file_path() else {
+        return;
+    };
+    if let Err(error) = std::fs::remove_file(&path)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!(
+            "[WARN] 清理旧 readiness 标记失败 ({}): {}",
+            path.display(),
+            error
+        );
+    }
+}
+
+fn write_ready_marker() -> std::io::Result<()> {
+    let Some(path) = ready_file_path() else {
+        return Ok(());
+    };
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    let revision = std::env::var("KOVI_DEPLOY_REVISION").unwrap_or_else(|_| "ready".to_string());
+    let temp_path = path.with_extension(format!("tmp.{}", std::process::id()));
+    std::fs::write(&temp_path, format!("{}\n", revision.trim()))?;
+    std::fs::rename(temp_path, path)
 }

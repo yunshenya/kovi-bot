@@ -86,7 +86,6 @@ impl ProactiveChatManager {
         }
 
         let proactive_config = crate::config::get().proactive().clone();
-        let recent_memories = self.memory_manager.get_recent_memories(100).await;
         let now = Local::now();
         let inactivity_boundary =
             now - chrono::Duration::seconds(proactive_config.inactivity_threshold_secs() as i64);
@@ -94,18 +93,21 @@ impl ProactiveChatManager {
             now - chrono::Duration::seconds(proactive_config.cooldown_secs() as i64);
 
         // 全局冷却，防止循环每次命中时连续推送。
-        if recent_memories.iter().any(|memory| {
-            memory.context.starts_with("proactive_") && memory.timestamp > cooldown_boundary
-        }) {
+        if self
+            .memory_manager
+            .has_memory_since_in_contexts(
+                &["proactive_group_chat", "proactive_private_chat"],
+                cooldown_boundary,
+            )
+            .await
+        {
             return false;
         }
 
-        let recent_activity_count = recent_memories
-            .iter()
-            .filter(|memory| {
-                !memory.context.starts_with("proactive_") && memory.timestamp > inactivity_boundary
-            })
-            .count();
+        let recent_activity_count = self
+            .memory_manager
+            .count_non_proactive_memories_since(inactivity_boundary, 3)
+            .await;
 
         if recent_activity_count >= 3 {
             return false;
@@ -177,7 +179,10 @@ impl ProactiveChatManager {
     /// 本地仅控制模型决策频率；是否真正发送完全交由模型决定。
     async fn should_decide_main_admin_chat(&self, main_admin: i64) -> bool {
         let proactive_config = crate::config::get().proactive().clone();
-        let recent_memories = self.memory_manager.get_recent_memories(0).await;
+        let recent_memories = self
+            .memory_manager
+            .get_recent_memories_for_subject(main_admin, Some("proactive_main_admin_decision"), 1)
+            .await;
         let decision_boundary = Local::now()
             - chrono::Duration::seconds(proactive_config.main_admin_decision_interval_secs() as i64);
         !recent_memories.iter().any(|memory| {
@@ -200,13 +205,9 @@ impl ProactiveChatManager {
             .await;
         let recent_outreach = self
             .memory_manager
-            .get_recent_memories(0)
+            .get_recent_memories_for_subject(main_admin, Some("proactive_private_chat"), 3)
             .await
             .into_iter()
-            .filter(|memory| {
-                memory.subject_id == Some(main_admin) && memory.context == "proactive_private_chat"
-            })
-            .take(3)
             .map(|memory| {
                 format!(
                     "{}：{}",
@@ -401,7 +402,12 @@ impl ProactiveChatManager {
 
         // 分析情绪变化
         MOOD_SYSTEM
-            .analyze_and_update_mood_with_understanding(message, context, &understanding)
+            .analyze_and_update_mood_for_subject_with_understanding(
+                message,
+                context,
+                Some(user_id),
+                &understanding,
+            )
             .await?;
 
         // 记录对话记忆
@@ -425,47 +431,47 @@ impl ProactiveChatManager {
         _is_group: bool,
         understanding: &MessageUnderstanding,
     ) -> Result<()> {
-        let mut profile = self
-            .memory_manager
-            .get_user_profile(user_id)
-            .await
-            .unwrap_or_else(|| crate::memory::UserProfile {
-                user_id,
-                nickname: format!("User_{}", user_id),
-                personality_traits: Vec::new(),
-                interests: Vec::new(),
-                relationship_level: 1,
-                last_interaction: Local::now(),
-                interaction_count: 0,
-                last_private_interaction: if _is_group { None } else { Some(Local::now()) },
-                mood_history: Vec::new(),
-            });
-
-        // 更新互动信息
-        profile.last_interaction = Local::now();
-        profile.interaction_count = profile.interaction_count.saturating_add(1);
-        if !_is_group {
-            profile.last_private_interaction = Some(Local::now());
-        }
-
-        if understanding.gratitude {
-            profile.relationship_level = (profile.relationship_level + 1).min(10);
-        }
-
-        for interest in &understanding.interests {
-            if !profile.interests.contains(interest) {
-                profile.interests.push(interest.clone());
-            }
-        }
-        profile.interests.truncate(20);
-
-        // 更新用户档案
+        let now = Local::now();
+        let gratitude = understanding.gratitude;
+        let interests = understanding.interests.clone();
         self.memory_manager
-            .update_user_profile(user_id, profile)
+            .mutate_user_profile(user_id, move |current| {
+                let mut profile = current.unwrap_or_else(|| crate::memory::UserProfile {
+                    user_id,
+                    nickname: "未设置昵称".to_string(),
+                    personality_traits: Vec::new(),
+                    interests: Vec::new(),
+                    relationship_level: 1,
+                    last_interaction: now,
+                    interaction_count: 0,
+                    last_private_interaction: if _is_group { None } else { Some(now) },
+                    mood_history: Vec::new(),
+                });
+                profile.last_interaction = now;
+                profile.interaction_count = profile.interaction_count.saturating_add(1);
+                if !_is_group {
+                    profile.last_private_interaction = Some(now);
+                }
+                if gratitude {
+                    profile.relationship_level = (profile.relationship_level + 1).min(10);
+                }
+                for interest in interests {
+                    if !profile.interests.contains(&interest) {
+                        profile.interests.push(interest);
+                    }
+                }
+                profile.interests.truncate(20);
+                profile
+            })
             .await?;
 
         Ok(())
     }
+}
+
+#[cfg(test)]
+fn is_sent_proactive_context(context: &str) -> bool {
+    matches!(context, "proactive_group_chat" | "proactive_private_chat")
 }
 
 fn parse_main_admin_decision(content: &str) -> Option<String> {
@@ -485,7 +491,7 @@ enum ChatTarget {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_main_admin_decision;
+    use super::{is_sent_proactive_context, parse_main_admin_decision};
 
     #[test]
     fn main_admin_model_decision_requires_send_marker() {
@@ -495,5 +501,11 @@ mod tests {
         );
         assert_eq!(parse_main_admin_decision("[[SKIP]]"), None);
         assert_eq!(parse_main_admin_decision("随便问候一下"), None);
+    }
+
+    #[test]
+    fn skipped_main_admin_decision_does_not_start_global_cooldown() {
+        assert!(!is_sent_proactive_context("proactive_main_admin_decision"));
+        assert!(is_sent_proactive_context("proactive_private_chat"));
     }
 }

@@ -114,16 +114,15 @@ impl HealthChecker {
     }
 
     async fn check_memory_usage(&self) -> MemoryUsage {
-        let memories = self.memory_manager.get_recent_memories(0).await;
-        let user_profiles = self.memory_manager.get_all_user_profiles().await;
-        let group_profiles = self.memory_manager.get_all_group_profiles().await;
+        let (total_memories, user_profiles, group_profiles) =
+            self.memory_manager.runtime_counts().await;
 
         let storage_size_bytes = self.memory_manager.storage_size_bytes().await;
 
         MemoryUsage {
-            total_memories: memories.len(),
-            user_profiles: user_profiles.len(),
-            group_profiles: group_profiles.len(),
+            total_memories,
+            user_profiles,
+            group_profiles,
             storage_size_bytes,
         }
     }

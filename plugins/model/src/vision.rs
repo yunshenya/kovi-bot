@@ -1,25 +1,43 @@
 //! 图片附件解析与视觉模型输入。
 
-use crate::model::semantic::understand_text;
+use crate::image_security::{
+    MAX_DATA_IMAGE_URL_BYTES, MAX_REMOTE_IMAGE_URL_BYTES, MAX_TOTAL_IMAGE_BYTES,
+    is_safe_onebot_image_file, is_supported_url, materialize_image_url,
+};
+use crate::model::{ReplyTicket, is_current};
 use crate::redis_store;
 use anyhow::{Result, anyhow};
-use base64::Engine;
 use kovi::bot::message::Message;
 use kovi::tokio::sync::Mutex;
 use kovi::{RuntimeBot, serde_json::Value};
 use reqwest::Client;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::net::IpAddr;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
+use url::Url;
 
 const MAX_VISION_IMAGES: usize = 4;
-const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
-static IMAGE_CLIENT: LazyLock<Client> = LazyLock::new(Client::new);
-static VISION_CLIENT: LazyLock<Client> = LazyLock::new(Client::new);
-static PENDING_IMAGE_REQUESTS: LazyLock<Mutex<HashMap<ImageRequestScope, Instant>>> =
+const MAX_VISION_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+static VISION_CLIENT: LazyLock<Client> = LazyLock::new(|| {
+    Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .build()
+        .expect("视觉模型 HTTP 客户端应可创建")
+});
+static PENDING_IMAGE_REQUESTS: LazyLock<Mutex<HashMap<ImageRequestScope, PendingImageRequest>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+static PENDING_IMAGE_UPDATE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 const PENDING_IMAGE_REQUEST_TTL: Duration = Duration::from_secs(180);
+
+#[derive(Debug, Clone, Copy)]
+struct PendingImageRequest {
+    deadline: Instant,
+    reply_ticket: ReplyTicket,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ImageAttachment {
@@ -39,22 +57,46 @@ pub(crate) enum ImageRequestScope {
     Private(i64),
 }
 
-pub(crate) async fn update_pending_image_request(scope: ImageRequestScope, message: &str) {
-    let now = Instant::now();
-    let requested = understand_text(message, "assistant_message")
-        .await
-        .requests_image;
-    let mut pending = PENDING_IMAGE_REQUESTS.lock().await;
-    pending.retain(|_, deadline| *deadline > now);
-    if requested {
-        pending.insert(scope, now + PENDING_IMAGE_REQUEST_TTL);
-    } else {
-        pending.remove(&scope);
+pub(crate) async fn set_pending_image_request_for_reply(
+    scope: ImageRequestScope,
+    requested: bool,
+    reply_ticket: ReplyTicket,
+) -> bool {
+    let _update_guard = PENDING_IMAGE_UPDATE_LOCK.lock().await;
+    if !is_current(reply_ticket).await {
+        return false;
     }
-    drop(pending);
+
+    let now = Instant::now();
+    let previous = {
+        let mut pending = PENDING_IMAGE_REQUESTS.lock().await;
+        pending.retain(|_, state| state.deadline > now);
+        if !is_current(reply_ticket).await {
+            return false;
+        }
+        if requested {
+            pending.insert(
+                scope,
+                PendingImageRequest {
+                    deadline: now + PENDING_IMAGE_REQUEST_TTL,
+                    reply_ticket,
+                },
+            )
+        } else {
+            pending.remove(&scope)
+        }
+    };
+    if !is_current(reply_ticket).await {
+        restore_pending_image_request(scope, previous).await;
+        return false;
+    }
 
     let suffix = pending_image_request_key(scope);
     if let Some(store) = redis_store::get().await {
+        if !is_current(reply_ticket).await {
+            restore_pending_image_request(scope, previous).await;
+            return false;
+        }
         let result = if requested {
             store
                 .set_expiring_text(&suffix, "1", PENDING_IMAGE_REQUEST_TTL)
@@ -65,6 +107,38 @@ pub(crate) async fn update_pending_image_request(scope: ImageRequestScope, messa
         if let Err(error) = result {
             eprintln!("[WARN] Redis 图片请求状态同步失败: {}", error);
         }
+        if !is_current(reply_ticket).await {
+            restore_pending_image_request(scope, previous).await;
+            let compensation = if requested {
+                store.delete(&suffix).await
+            } else if previous.is_some() {
+                store
+                    .set_expiring_text(&suffix, "1", PENDING_IMAGE_REQUEST_TTL)
+                    .await
+            } else {
+                Ok(())
+            };
+            if let Err(error) = compensation {
+                eprintln!("[WARN] Redis 过期图片请求状态补偿失败: {}", error);
+            }
+            return false;
+        }
+    } else if !is_current(reply_ticket).await {
+        restore_pending_image_request(scope, previous).await;
+        return false;
+    }
+    true
+}
+
+async fn restore_pending_image_request(
+    scope: ImageRequestScope,
+    previous: Option<PendingImageRequest>,
+) {
+    let mut pending = PENDING_IMAGE_REQUESTS.lock().await;
+    if let Some(previous) = previous {
+        pending.insert(scope, previous);
+    } else {
+        pending.remove(&scope);
     }
 }
 
@@ -75,18 +149,20 @@ pub(crate) async fn consume_pending_image_request(
     if !has_images {
         return false;
     }
+    let _update_guard = PENDING_IMAGE_UPDATE_LOCK.lock().await;
     let now = Instant::now();
     let mut pending = PENDING_IMAGE_REQUESTS.lock().await;
-    pending.retain(|_, deadline| *deadline > now);
-    let local_pending = pending.remove(&scope).is_some();
+    pending.retain(|_, state| state.deadline > now);
+    let local_pending = pending.remove(&scope);
     drop(pending);
-    if local_pending {
+    if let Some(local_pending) = local_pending {
+        let is_current_request = is_current(local_pending.reply_ticket).await;
         if let Some(store) = redis_store::get().await
             && let Err(error) = store.delete(&pending_image_request_key(scope)).await
         {
             eprintln!("[WARN] Redis 图片请求状态清理失败: {}", error);
         }
-        return true;
+        return is_current_request;
     }
 
     let Some(store) = redis_store::get().await else {
@@ -99,6 +175,71 @@ pub(crate) async fn consume_pending_image_request(
             false
         }
     }
+}
+
+/// 清理指定群聊的本地图片请求状态，并删除本进程已知的对应 Redis 键。
+pub(crate) async fn clear_group_pending_image_requests(group_id: i64) -> usize {
+    let _update_guard = PENDING_IMAGE_UPDATE_LOCK.lock().await;
+    let scopes = {
+        let mut pending = PENDING_IMAGE_REQUESTS.lock().await;
+        let scopes = pending
+            .keys()
+            .filter(|scope| {
+                matches!(scope, ImageRequestScope::Group { group_id: id, .. } if *id == group_id)
+            })
+            .copied()
+            .collect::<Vec<_>>();
+        for scope in &scopes {
+            pending.remove(scope);
+        }
+        scopes
+    };
+    if let Some(store) = redis_store::get().await {
+        for scope in &scopes {
+            if let Err(error) = store.delete(&pending_image_request_key(*scope)).await {
+                eprintln!("[WARN] Redis 群聊图片请求状态清理失败: {}", error);
+            }
+        }
+    }
+    scopes.len()
+}
+
+/// 清理指定用户在私聊及各群聊中的本地图片请求状态与本进程已知的 Redis 键。
+pub(crate) async fn clear_user_pending_image_requests(user_id: i64) -> usize {
+    let _update_guard = PENDING_IMAGE_UPDATE_LOCK.lock().await;
+    let scopes = {
+        let mut pending = PENDING_IMAGE_REQUESTS.lock().await;
+        let scopes = pending
+            .keys()
+            .filter(|scope| match scope {
+                ImageRequestScope::Private(id) => *id == user_id,
+                ImageRequestScope::Group { user_id: id, .. } => *id == user_id,
+            })
+            .copied()
+            .collect::<Vec<_>>();
+        for scope in &scopes {
+            pending.remove(scope);
+        }
+        scopes
+    };
+    if let Some(store) = redis_store::get().await {
+        let private_scope = ImageRequestScope::Private(user_id);
+        if let Err(error) = store
+            .delete(&pending_image_request_key(private_scope))
+            .await
+        {
+            eprintln!("[WARN] Redis 私聊图片请求状态清理失败: {}", error);
+        }
+        for scope in scopes
+            .iter()
+            .filter(|scope| matches!(scope, ImageRequestScope::Group { .. }))
+        {
+            if let Err(error) = store.delete(&pending_image_request_key(*scope)).await {
+                eprintln!("[WARN] Redis 群内用户图片请求状态清理失败: {}", error);
+            }
+        }
+    }
+    scopes.len()
 }
 
 fn pending_image_request_key(scope: ImageRequestScope) -> String {
@@ -123,17 +264,12 @@ pub(crate) fn extract_image_attachments(message: &Message) -> Vec<ImageAttachmen
         .iter()
         .filter(|segment| segment.type_ == "image")
         .filter_map(|segment| {
-            let file = value_as_string(&segment.data, "file");
-            let url = value_as_string(&segment.data, "url");
-            let identifier = [
-                value_as_string(&segment.data, "file_unique"),
-                value_as_string(&segment.data, "md5"),
-                file.clone(),
-                url.clone(),
-            ]
-            .into_iter()
-            .flatten()
-            .find(|value| !value.is_empty())?;
+            let file = value_as_bounded_string(&segment.data, "file", 512);
+            let url = value_as_image_url(&segment.data, "url");
+            let identifier = value_as_bounded_string(&segment.data, "file_unique", 512)
+                .or_else(|| value_as_bounded_string(&segment.data, "md5", 512))
+                .or_else(|| file.clone())
+                .or_else(|| url.as_deref().map(hashed_image_url_key))?;
             let key = format!("image:{identifier}");
             seen.insert(key.clone())
                 .then_some(ImageAttachment { key, file, url })
@@ -165,6 +301,7 @@ pub(crate) async fn resolve_image_urls(
     bot: &RuntimeBot,
 ) -> Result<Vec<VisionImage>> {
     let mut images = Vec::new();
+    let mut total_bytes = 0usize;
     for attachment in attachments.iter().take(MAX_VISION_IMAGES) {
         let source_url = if let Some(url) = attachment
             .url
@@ -173,7 +310,11 @@ pub(crate) async fn resolve_image_urls(
         {
             url.to_string()
         } else {
-            let Some(file) = attachment.file.as_deref() else {
+            let Some(file) = attachment
+                .file
+                .as_deref()
+                .filter(|file| is_safe_onebot_image_file(file))
+            else {
                 continue;
             };
             let response = bot
@@ -188,8 +329,17 @@ pub(crate) async fn resolve_image_urls(
                 .ok_or_else(|| anyhow!("OneBot get_image 未返回可用 URL"))?
                 .to_string()
         };
+        let remaining = MAX_TOTAL_IMAGE_BYTES.saturating_sub(total_bytes);
+        if remaining == 0 {
+            return Err(anyhow!(
+                "图片总大小超过 {} MB 限制",
+                MAX_TOTAL_IMAGE_BYTES / 1024 / 1024
+            ));
+        }
+        let materialized = materialize_image_url(&source_url, remaining).await?;
+        total_bytes = total_bytes.saturating_add(materialized.byte_len);
         images.push(VisionImage {
-            url: materialize_image_url(&source_url).await?,
+            url: materialized.data_url,
         });
     }
     Ok(images)
@@ -280,6 +430,7 @@ pub(crate) async fn analyze_images_with_builtin(
         question
     );
     let endpoint = vision_endpoint(&url, &wire_api);
+    validate_vision_endpoint(&endpoint)?;
     let request_body = if wire_api == "responses" {
         let mut content = vec![json!({
             "type": "input_text",
@@ -337,11 +488,32 @@ pub(crate) async fn analyze_images_with_builtin(
         return Err(anyhow!("视觉模型返回 HTTP {}", response.status()));
     }
 
-    let body: Value = response
-        .json()
-        .await
+    let body_bytes = read_bounded_vision_response(response).await?;
+    let body: Value = serde_json::from_slice(&body_bytes)
         .map_err(|error| anyhow!("视觉模型响应解析失败: {error}"))?;
     extract_response_content(&body).ok_or_else(|| anyhow!("视觉模型响应中缺少可读内容"))
+}
+
+async fn read_bounded_vision_response(mut response: reqwest::Response) -> Result<Vec<u8>> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_VISION_RESPONSE_BYTES as u64)
+    {
+        return Err(anyhow!("视觉模型响应超过大小上限"));
+    }
+
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| anyhow!("读取视觉模型响应失败: {error}"))?
+    {
+        if bytes.len().saturating_add(chunk.len()) > MAX_VISION_RESPONSE_BYTES {
+            return Err(anyhow!("视觉模型响应超过大小上限"));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
 }
 
 pub(crate) fn extract_response_content(body: &Value) -> Option<String> {
@@ -401,75 +573,66 @@ fn vision_endpoint(base_url: &str, wire_api: &str) -> String {
     }
 }
 
-fn is_supported_url(url: &str) -> bool {
-    url.starts_with("http://") || url.starts_with("https://") || url.starts_with("data:image/")
+fn validate_vision_endpoint(raw_url: &str) -> Result<()> {
+    let url = Url::parse(raw_url).map_err(|_| anyhow!("VISION_API_URL 格式无效"))?;
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(anyhow!("VISION_API_URL 不能携带用户名或密码"));
+    }
+    match url.scheme() {
+        "https" => Ok(()),
+        "http" if is_loopback_host(url.host_str().unwrap_or_default()) => Ok(()),
+        "http" => Err(anyhow!(
+            "非本机视觉模型端点必须使用 HTTPS，避免 API Token 明文传输"
+        )),
+        _ => Err(anyhow!(
+            "VISION_API_URL 只支持 HTTPS；本机回环地址可使用 HTTP"
+        )),
+    }
 }
 
-async fn materialize_image_url(url: &str) -> Result<String> {
-    if url.starts_with("data:image/") {
-        return Ok(url.to_string());
-    }
-
-    let response = IMAGE_CLIENT
-        .get(url)
-        .timeout(Duration::from_secs(10))
-        .send()
-        .await
-        .map_err(|error| anyhow!("下载图片失败: {error}"))?;
-    if !response.status().is_success() {
-        return Err(anyhow!("下载图片返回 HTTP {}", response.status()));
-    }
-    if response
-        .content_length()
-        .is_some_and(|length| length > MAX_IMAGE_BYTES as u64)
-    {
-        return Err(anyhow!(
-            "图片超过 {} MB 限制",
-            MAX_IMAGE_BYTES / 1024 / 1024
-        ));
-    }
-
-    let content_type = response
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.split(';').next())
-        .filter(|value| matches!(*value, "image/png" | "image/jpeg" | "image/webp"))
-        .unwrap_or("image/jpeg")
-        .to_string();
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|error| anyhow!("读取图片内容失败: {error}"))?;
-    if bytes.len() > MAX_IMAGE_BYTES {
-        return Err(anyhow!(
-            "图片超过 {} MB 限制",
-            MAX_IMAGE_BYTES / 1024 / 1024
-        ));
-    }
-
-    Ok(format!(
-        "data:{content_type};base64,{}",
-        base64::engine::general_purpose::STANDARD.encode(bytes)
-    ))
+fn is_loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
 }
 
-fn value_as_string(data: &Value, field: &str) -> Option<String> {
+fn value_as_bounded_string(data: &Value, field: &str, max_bytes: usize) -> Option<String> {
     data.get(field).and_then(|value| {
         value
             .as_str()
             .map(str::trim)
-            .filter(|value| !value.is_empty())
+            .filter(|value| !value.is_empty() && value.len() <= max_bytes)
             .map(ToString::to_string)
             .or_else(|| value.as_i64().map(|value| value.to_string()))
     })
+}
+
+fn value_as_image_url(data: &Value, field: &str) -> Option<String> {
+    let value = data.get(field)?.as_str()?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let max_bytes = if value.starts_with("data:image/") {
+        MAX_DATA_IMAGE_URL_BYTES
+    } else {
+        MAX_REMOTE_IMAGE_URL_BYTES
+    };
+    (value.len() <= max_bytes).then(|| value.to_string())
+}
+
+fn hashed_image_url_key(url: &str) -> String {
+    let mut hasher = DefaultHasher::new();
+    url.hash(&mut hasher);
+    format!("url:{:016x}", hasher.finish())
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         default_vision_prompt, extract_image_attachments, extract_response_content,
-        is_vision_command, merge_image_attachments, strip_vision_command, vision_endpoint,
+        is_vision_command, merge_image_attachments, strip_vision_command, validate_vision_endpoint,
+        vision_endpoint,
     };
     use kovi::Message;
     use kovi::bot::message::Segment;
@@ -550,5 +713,15 @@ mod tests {
             vision_endpoint("https://example.com/v1", "chat_completions"),
             "https://example.com/v1/chat/completions"
         );
+    }
+
+    #[test]
+    fn rejects_unsafe_vision_endpoints() {
+        assert!(validate_vision_endpoint("https://example.com/v1/responses").is_ok());
+        assert!(validate_vision_endpoint("http://localhost:8080/v1/responses").is_ok());
+        assert!(validate_vision_endpoint("http://127.0.0.1:8080/v1/responses").is_ok());
+        assert!(validate_vision_endpoint("http://example.com/v1/responses").is_err());
+        assert!(validate_vision_endpoint("https://user:password@example.com/").is_err());
+        assert!(validate_vision_endpoint("file:///tmp/vision.sock").is_err());
     }
 }
