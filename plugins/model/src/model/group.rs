@@ -565,139 +565,133 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
         understanding.conversation_relevant,
     )
     .await;
-    match message.trim() {
-        _ => {
-            // 被点名时始终处理；未点名消息仅由本地节流器偶尔抽样，不逐条调用模型。
-            if addressed_to_bot
-                || vision_requested
-                || matches!(message.trim(), "#禁言" | "#结束禁言")
-            {
-                let Some(ticket) = claim_or_queue_group_reply(
-                    reply_scope,
-                    reply_ticket,
-                    participant_follow_up,
-                    group_id,
-                    event.user_id,
-                    sender.clone(),
-                    model_message.clone(),
-                    vision_images.clone(),
-                    source_message_ids.clone(),
-                    understanding.clone(),
-                )
-                .await
-                else {
-                    return;
-                };
-                let turn_marker = begin_conversation_turn(group_id, event.user_id).await;
-                let replied = process_group_reply_claimed(
-                    group_id,
-                    event.user_id,
-                    &model_message,
-                    Arc::clone(&bot),
-                    sender,
-                    ticket,
-                    None,
-                    vision_images.clone(),
-                    source_message_ids.clone(),
-                    understanding.clone(),
-                )
-                .await;
-                finish_conversation_turn(group_id, event.user_id, turn_marker, replied).await;
-                drain_pending_window_messages(group_id, Arc::clone(&bot), ticket).await;
-            } else if should_continue_conversation(
-                group_id,
-                event.user_id,
-                understanding.conversation_relevant,
-            )
-            .await
-            {
-                println!("[INFO] 群聊接续对话 (群组: {})", group_id);
-                let Some(ticket) = claim_or_queue_group_reply(
-                    reply_scope,
-                    reply_ticket,
-                    participant_follow_up,
-                    group_id,
-                    event.user_id,
-                    sender.clone(),
-                    model_message.clone(),
-                    vision_images.clone(),
-                    source_message_ids.clone(),
-                    understanding.clone(),
-                )
-                .await
-                else {
-                    return;
-                };
-                let turn_marker = begin_conversation_turn(group_id, event.user_id).await;
-                let replied = process_group_reply_claimed(
-                    group_id,
-                    event.user_id,
-                    &model_message,
-                    Arc::clone(&bot),
-                    sender,
-                    ticket,
-                    None,
-                    vision_images.clone(),
-                    source_message_ids.clone(),
-                    understanding.clone(),
-                )
-                .await;
-                finish_conversation_turn(group_id, event.user_id, turn_marker, replied).await;
-                drain_pending_window_messages(group_id, Arc::clone(&bot), ticket).await;
-            } else if sampled_for_interjection && understanding.interjection_worthy {
-                println!("[INFO] 群聊未点名接话 (群组: {})", group_id);
-                let Some(ticket) = claim_or_queue_group_reply(
-                    reply_scope,
-                    None,
-                    participant_follow_up,
-                    group_id,
-                    event.user_id,
-                    sender.clone(),
-                    model_message.clone(),
-                    vision_images.clone(),
-                    source_message_ids.clone(),
-                    understanding.clone(),
-                )
-                .await
-                else {
-                    return;
-                };
-                let turn_marker = begin_conversation_turn(group_id, event.user_id).await;
-                let max_output_tokens = config::get()
-                    .group_interjection()
-                    .interjection_max_output_tokens();
-                let replied = process_group_reply_claimed(
-                    group_id,
-                    event.user_id,
-                    &model_message,
-                    Arc::clone(&bot),
-                    sender,
-                    ticket,
-                    Some(max_output_tokens),
-                    vision_images.clone(),
-                    source_message_ids.clone(),
-                    understanding.clone(),
-                )
-                .await;
-                finish_interjection_attempt(group_id, replied).await;
-                finish_conversation_turn(group_id, event.user_id, turn_marker, replied).await;
-                drain_pending_window_messages(group_id, Arc::clone(&bot), ticket).await;
-            } else if let Err(error) = MEMORY_MANAGER
-                .add_conversation_memory_with_hints(
-                    group_id,
-                    &format!("{}: {}", sender, model_message),
-                    "group_observation",
-                    Some(understanding.memory_importance()),
-                    &understanding.memory_tags(),
-                )
-                .await
-            {
-                eprintln!(
-                    "[ERROR] 群聊观察记忆记录失败 (群组: {}): {}",
-                    group_id, error
-                );
-            }
-        }
+    // 被点名时始终处理；未点名消息仅由本地节流器偶尔抽样，不逐条调用模型。
+    if addressed_to_bot || vision_requested || matches!(message.trim(), "#禁言" | "#结束禁言")
+    {
+        let Some(ticket) = claim_or_queue_group_reply(
+            reply_scope,
+            reply_ticket,
+            participant_follow_up,
+            group_id,
+            event.user_id,
+            sender.clone(),
+            model_message.clone(),
+            vision_images.clone(),
+            source_message_ids.clone(),
+            understanding.clone(),
+        )
+        .await
+        else {
+            return;
+        };
+        let turn_marker = begin_conversation_turn(group_id, event.user_id).await;
+        let replied = process_group_reply_claimed(
+            group_id,
+            event.user_id,
+            &model_message,
+            Arc::clone(&bot),
+            sender,
+            ticket,
+            None,
+            vision_images.clone(),
+            source_message_ids.clone(),
+            understanding.clone(),
+        )
+        .await;
+        finish_conversation_turn(group_id, event.user_id, turn_marker, replied).await;
+        drain_pending_window_messages(group_id, Arc::clone(&bot), ticket).await;
+    } else if should_continue_conversation(
+        group_id,
+        event.user_id,
+        understanding.conversation_relevant,
+    )
+    .await
+    {
+        println!("[INFO] 群聊接续对话 (群组: {})", group_id);
+        let Some(ticket) = claim_or_queue_group_reply(
+            reply_scope,
+            reply_ticket,
+            participant_follow_up,
+            group_id,
+            event.user_id,
+            sender.clone(),
+            model_message.clone(),
+            vision_images.clone(),
+            source_message_ids.clone(),
+            understanding.clone(),
+        )
+        .await
+        else {
+            return;
+        };
+        let turn_marker = begin_conversation_turn(group_id, event.user_id).await;
+        let replied = process_group_reply_claimed(
+            group_id,
+            event.user_id,
+            &model_message,
+            Arc::clone(&bot),
+            sender,
+            ticket,
+            None,
+            vision_images.clone(),
+            source_message_ids.clone(),
+            understanding.clone(),
+        )
+        .await;
+        finish_conversation_turn(group_id, event.user_id, turn_marker, replied).await;
+        drain_pending_window_messages(group_id, Arc::clone(&bot), ticket).await;
+    } else if sampled_for_interjection && understanding.interjection_worthy {
+        println!("[INFO] 群聊未点名接话 (群组: {})", group_id);
+        let Some(ticket) = claim_or_queue_group_reply(
+            reply_scope,
+            None,
+            participant_follow_up,
+            group_id,
+            event.user_id,
+            sender.clone(),
+            model_message.clone(),
+            vision_images.clone(),
+            source_message_ids.clone(),
+            understanding.clone(),
+        )
+        .await
+        else {
+            return;
+        };
+        let turn_marker = begin_conversation_turn(group_id, event.user_id).await;
+        let max_output_tokens = config::get()
+            .group_interjection()
+            .interjection_max_output_tokens();
+        let replied = process_group_reply_claimed(
+            group_id,
+            event.user_id,
+            &model_message,
+            Arc::clone(&bot),
+            sender,
+            ticket,
+            Some(max_output_tokens),
+            vision_images.clone(),
+            source_message_ids.clone(),
+            understanding.clone(),
+        )
+        .await;
+        finish_interjection_attempt(group_id, replied).await;
+        finish_conversation_turn(group_id, event.user_id, turn_marker, replied).await;
+        drain_pending_window_messages(group_id, Arc::clone(&bot), ticket).await;
+    } else if let Err(error) = MEMORY_MANAGER
+        .add_conversation_memory_with_hints(
+            group_id,
+            &format!("{}: {}", sender, model_message),
+            "group_observation",
+            Some(understanding.memory_importance()),
+            &understanding.memory_tags(),
+        )
+        .await
+    {
+        eprintln!(
+            "[ERROR] 群聊观察记忆记录失败 (群组: {}): {}",
+            group_id, error
+        );
     }
 }
 
