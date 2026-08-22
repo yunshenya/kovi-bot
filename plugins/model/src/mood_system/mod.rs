@@ -479,12 +479,17 @@ mod tests {
     use crate::model::semantic::MessageUnderstanding;
     use chrono::Local;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEMPORARY_MEMORY_PATH_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn temporary_memory_path() -> std::path::PathBuf {
+        let sequence = TEMPORARY_MEMORY_PATH_COUNTER.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!(
-            "kovi-mood-{}-{}.json",
+            "kovi-mood-{}-{}-{}.json",
             std::process::id(),
-            Local::now().timestamp_micros()
+            Local::now().timestamp_micros(),
+            sequence,
         ))
     }
 
@@ -652,6 +657,7 @@ mod tests {
                     mood_system.mood_cache.lock().expect("缓存锁不应中毒").len()
                         <= MAX_MOOD_CACHE_ENTRIES
                 );
+                let _ = std::fs::remove_file(path);
             });
     }
 }
