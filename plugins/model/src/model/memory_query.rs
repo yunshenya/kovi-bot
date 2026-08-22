@@ -126,7 +126,7 @@ pub(crate) async fn params_model_with_tool_access(
         else {
             return interrupted_response();
         };
-        match parse_tool_call(&response.content) {
+        match parse_tool_call_with_wrapping(&response.content, round == 0) {
             ParsedToolCall::None => {
                 if should_retry_reminder_create(
                     tool_context.requires_reminder_create,
@@ -268,7 +268,10 @@ pub(crate) async fn params_model_with_tool_access(
     else {
         return interrupted_response();
     };
-    if matches!(parse_tool_call(&response.content), ParsedToolCall::None) {
+    if matches!(
+        parse_tool_call_with_wrapping(&response.content, false),
+        ParsedToolCall::None
+    ) {
         response
     } else {
         BotMemory {
@@ -408,20 +411,48 @@ fn interrupted_response() -> BotMemory {
     }
 }
 
-fn parse_tool_call(content: &str) -> ParsedToolCall {
+fn parse_tool_call_with_wrapping(content: &str, allow_wrapping: bool) -> ParsedToolCall {
     let content = content.trim();
     let has_start = content.contains(TOOL_CALL_START);
     let has_end = content.contains(TOOL_CALL_END);
     if !has_start && !has_end {
         return ParsedToolCall::None;
     }
-    let Some(json) = content
-        .strip_prefix(TOOL_CALL_START)
-        .and_then(|content| content.strip_suffix(TOOL_CALL_END))
-        .map(str::trim)
-    else {
-        return ParsedToolCall::Invalid("标记必须完整且不能混入其他文字".to_string());
+    if !allow_wrapping {
+        let Some(json) = content
+            .strip_prefix(TOOL_CALL_START)
+            .and_then(|content| content.strip_suffix(TOOL_CALL_END))
+            .map(str::trim)
+        else {
+            return ParsedToolCall::Invalid("标记必须完整且不能混入其他文字".to_string());
+        };
+        return parse_tool_call_json(json);
+    }
+    let Some(start) = content.find(TOOL_CALL_START) else {
+        return ParsedToolCall::Invalid("工具调用缺少开始标记".to_string());
     };
+    let json_start = start + TOOL_CALL_START.len();
+    let Some(end_offset) = content[json_start..].find(TOOL_CALL_END) else {
+        return ParsedToolCall::Invalid("工具调用缺少结束标记".to_string());
+    };
+    let end = json_start + end_offset;
+    let trailing_start = end + TOOL_CALL_END.len();
+    let before = &content[..start];
+    let after = &content[trailing_start..];
+    if before.contains(TOOL_CALL_START)
+        || before.contains(TOOL_CALL_END)
+        || after.contains(TOOL_CALL_START)
+        || after.contains(TOOL_CALL_END)
+    {
+        return ParsedToolCall::Invalid("工具调用标记必须唯一且成对".to_string());
+    }
+    // Some providers wrap a valid call in a short preamble or Markdown fence. The
+    // surrounding text is never executed; only the single JSON payload is trusted.
+    let json = content[json_start..end].trim();
+    parse_tool_call_json(json)
+}
+
+fn parse_tool_call_json(json: &str) -> ParsedToolCall {
     if json.chars().count() > MAX_TOOL_CALL_JSON_CHARS {
         return ParsedToolCall::Invalid("工具参数过长".to_string());
     }
@@ -445,40 +476,62 @@ fn format_tool_result(name: &str, result: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ParsedToolCall, ReminderCreateFailure, interrupted_response, parse_tool_call,
+        ParsedToolCall, ReminderCreateFailure, interrupted_response, parse_tool_call_with_wrapping,
         reminder_failure_response,
     };
     use crate::model::reply::parse_reply_output;
 
     #[test]
     fn parses_only_the_restricted_tool_protocol() {
-        let ParsedToolCall::Call(call) = parse_tool_call(
+        let ParsedToolCall::Call(call) = parse_tool_call_with_wrapping(
             r#"[[TOOL_CALL]]{"name":"time.now","arguments":{"timezone":"UTC"}}[[/TOOL_CALL]]"#,
+            true,
         ) else {
             panic!("应解析合法工具调用");
         };
         assert_eq!(call.name, "time.now");
         assert_eq!(call.arguments["timezone"], "UTC");
         assert!(matches!(
-            parse_tool_call("正常聊天回复"),
+            parse_tool_call_with_wrapping("正常聊天回复", true),
             ParsedToolCall::None
         ));
     }
 
     #[test]
-    fn rejects_mixed_text_and_unknown_arguments() {
+    fn accepts_one_wrapped_call_but_rejects_multiple_markers() {
+        let ParsedToolCall::Call(call) = parse_tool_call_with_wrapping(
+            r#"请查一下 [[TOOL_CALL]]{"name":"time.now","arguments":{}}[[/TOOL_CALL]]"#,
+            true,
+        ) else {
+            panic!("应提取被说明文字包裹的合法工具调用");
+        };
+        assert_eq!(call.name, "time.now");
         assert!(matches!(
-            parse_tool_call("请查一下 [[TOOL_CALL]]{}[[/TOOL_CALL]]"),
-            ParsedToolCall::Invalid(_)
+            parse_tool_call_with_wrapping(
+                r#"普通文字 [[TOOL_CALL]]{"name":"time.now","arguments":{}}[[/TOOL_CALL]] 还有尾巴"#,
+                true,
+            ),
+            ParsedToolCall::Call(_)
         ));
         assert!(matches!(
-            parse_tool_call(
-                r#"普通文字 [[TOOL_CALL]]{"name":"time.now","arguments":{}}[[/TOOL_CALL]] 还有尾巴"#
+            parse_tool_call_with_wrapping(
+                r#"[[TOOL_CALL]]{"name":"time.now","arguments":{}}[[/TOOL_CALL]] [[TOOL_CALL]]{"name":"time.now","arguments":{}}[[/TOOL_CALL]]"#,
+                true,
             ),
             ParsedToolCall::Invalid(_)
         ));
         assert!(matches!(
-            parse_tool_call(r#"[[TOOL_CALL]]{"name":"time.now","sql":"DROP TABLE"}[[/TOOL_CALL]]"#),
+            super::parse_tool_call_with_wrapping(
+                r#"前置说明 [[TOOL_CALL]]{"name":"time.now","arguments":{}}[[/TOOL_CALL]]"#,
+                false
+            ),
+            ParsedToolCall::Invalid(_)
+        ));
+        assert!(matches!(
+            parse_tool_call_with_wrapping(
+                r#"[[TOOL_CALL]]{"name":"time.now","sql":"DROP TABLE"}[[/TOOL_CALL]]"#,
+                true,
+            ),
             ParsedToolCall::Invalid(_)
         ));
     }
