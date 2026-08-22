@@ -775,7 +775,9 @@ pub(crate) fn sanitize_scheduled_output(
     content: &str,
     max_output_chars: usize,
 ) -> anyhow::Result<String> {
-    let summary = normalize_legacy_message_text(&strip_thinking_notices(content));
+    let summary = humanize_scheduled_prefix(&normalize_legacy_message_text(
+        &strip_thinking_notices(content),
+    ));
     if summary.is_empty() {
         return Err(anyhow::anyhow!("定时任务模型返回了空内容"));
     }
@@ -787,6 +789,44 @@ pub(crate) fn sanitize_scheduled_output(
         return Err(anyhow::anyhow!("定时任务模型返回了未处理的动作协议"));
     }
     Ok(truncate_chars(&summary, max_output_chars))
+}
+
+/// 只修整定时任务最终回复开头少量容易暴露实现的固定套话。
+///
+/// 这里刻意只匹配整段文本的开头，避免改写新闻标题、天气描述或用户要求中的
+/// 原文；真正的内容和来源仍由模型根据查询资料决定。
+fn humanize_scheduled_prefix(content: &str) -> String {
+    const PREFIXES: &[(&str, &str)] = &[
+        ("根据搜索结果，", "我刚看了一下，"),
+        ("根据搜索结果：", "我刚看了一下："),
+        ("根据搜索结果,", "我刚看了一下，"),
+        ("根据搜索结果:", "我刚看了一下："),
+        ("根据查询结果，", "我刚看了一下，"),
+        ("根据查询结果：", "我刚看了一下："),
+        ("根据查询结果,", "我刚看了一下，"),
+        ("根据查询结果:", "我刚看了一下："),
+        ("根据工具返回的结果，", "我刚看了一下，"),
+        ("根据工具返回的结果：", "我刚看了一下："),
+        ("根据工具返回的结果,", "我刚看了一下，"),
+        ("根据工具返回的结果:", "我刚看了一下："),
+        ("根据工具结果，", "我刚查到，"),
+        ("根据工具结果：", "我刚查到："),
+        ("根据工具结果,", "我刚查到，"),
+        ("根据工具结果:", "我刚查到："),
+        ("搜索结果如下：", "我刚看了一下："),
+        ("搜索结果如下:", "我刚看了一下："),
+        ("以下是搜索结果：", "我刚看了一下："),
+        ("以下是搜索结果:", "我刚看了一下："),
+        ("公开网页搜索结果：", "我刚看了一下："),
+        ("公开网页搜索结果:", "我刚看了一下："),
+    ];
+    let trimmed = content.trim();
+    for (prefix, replacement) in PREFIXES {
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            return format!("{replacement}{}", rest.trim_start());
+        }
+    }
+    trimmed.to_string()
 }
 
 pub(crate) async fn params_model_with_token_limit_and_progress(
@@ -1054,9 +1094,33 @@ async fn observe_stream_line(
     let Some(delta) = extract_stream_delta(&value) else {
         return;
     };
-    streamed_content.push_str(delta);
+    append_stream_delta(streamed_content, delta);
     if let Some(reporter) = reporter {
         reporter.observe_model_output(streamed_content).await;
+    }
+}
+
+/// Accept both standard incremental SSE deltas and gateways that incorrectly
+/// send the full text accumulated so far in each event. The latter would
+/// otherwise duplicate tool markers and make an otherwise valid call fail
+/// protocol parsing.
+fn append_stream_delta(streamed_content: &mut String, delta: &str) {
+    if delta.is_empty() {
+        return;
+    }
+    if streamed_content.is_empty() {
+        streamed_content.push_str(delta);
+    } else if delta == streamed_content {
+        return;
+    } else if delta.starts_with(streamed_content.as_str()) {
+        streamed_content.clear();
+        streamed_content.push_str(delta);
+    } else if streamed_content.starts_with(delta) {
+        // A shorter cumulative snapshot arrived out of order; retain the
+        // longer prefix instead of regressing the assembled response.
+        return;
+    } else {
+        streamed_content.push_str(delta);
     }
 }
 
@@ -1972,10 +2036,10 @@ pub fn get_file_modified_time_formatted() -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BotMemory, Roles, VisionImage, build_model_messages, build_responses_input,
-        compression_cutoff, extract_stream_delta, group_system_prompt, is_group_admin_command,
-        is_help_command, is_restricted_command, limit_memory_size, model_attempt_count,
-        sanitize_scheduled_output, with_reference_context,
+        BotMemory, Roles, VisionImage, append_stream_delta, build_model_messages,
+        build_responses_input, compression_cutoff, extract_stream_delta, group_system_prompt,
+        is_group_admin_command, is_help_command, is_restricted_command, limit_memory_size,
+        model_attempt_count, sanitize_scheduled_output, with_reference_context,
     };
     use crate::memory::{BotPersonality, UserProfile};
     use crate::model::message_actions::{ReplyPlan, follow_up_delay_millis, split_reply};
@@ -2143,6 +2207,28 @@ mod tests {
     }
 
     #[test]
+    fn streaming_text_accepts_incremental_and_cumulative_gateway_deltas() {
+        let mut incremental = String::new();
+        append_stream_delta(&mut incremental, "[[TOOL_CALL]]");
+        append_stream_delta(&mut incremental, "{\"name\":");
+        append_stream_delta(&mut incremental, "\"web.search\"}");
+        assert_eq!(incremental, "[[TOOL_CALL]]{\"name\":\"web.search\"}");
+
+        let mut cumulative = String::new();
+        append_stream_delta(&mut cumulative, "[[TOOL_CALL]]");
+        append_stream_delta(&mut cumulative, "[[TOOL_CALL]]{\"name\":");
+        append_stream_delta(&mut cumulative, "[[TOOL_CALL]]{\"name\":\"web.search\"}");
+        append_stream_delta(
+            &mut cumulative,
+            "[[TOOL_CALL]]{\"name\":\"web.search\"}[[/TOOL_CALL]]",
+        );
+        assert_eq!(
+            cumulative,
+            "[[TOOL_CALL]]{\"name\":\"web.search\"}[[/TOOL_CALL]]"
+        );
+    }
+
+    #[test]
     fn transient_model_failures_respect_configured_retry_count() {
         assert_eq!(model_attempt_count(0), 1);
         assert_eq!(model_attempt_count(2), 3);
@@ -2165,6 +2251,24 @@ mod tests {
                 .chars()
                 .count()
                 <= 100
+        );
+    }
+
+    #[test]
+    fn scheduled_task_output_humanizes_only_robotic_prefixes() {
+        assert_eq!(
+            sanitize_scheduled_output("根据搜索结果：今天有两条值得看。", 100)
+                .expect("应清理固定搜索前缀"),
+            "我刚看了一下：今天有两条值得看。"
+        );
+        assert_eq!(
+            sanitize_scheduled_output("今天上海有小雨。", 100).expect("普通自然回复不应被改写"),
+            "今天上海有小雨。"
+        );
+        assert_eq!(
+            sanitize_scheduled_output("以下是搜索结果:\n1. 标题", 100)
+                .expect("英文冒号前缀也应清理"),
+            "我刚看了一下：1. 标题"
         );
     }
 

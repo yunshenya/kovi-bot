@@ -261,17 +261,17 @@ async fn dispatch_due(bot: &RuntimeBot) -> Result<()> {
         let content = match content_result {
             Ok(content) => content,
             Err(error) => {
-                let outcome = fail_claim(
-                    &reminder,
-                    &format!("提醒任务执行失败: {error:?}"),
-                    reminder_config.max_attempts(),
-                )
-                .await?;
+                let error_text = format!("提醒任务执行失败: {error:?}");
+                let outcome =
+                    fail_claim(&reminder, &error_text, reminder_config.max_attempts()).await?;
                 if outcome == DeliveryFailure::Failed {
                     eprintln!(
                         "[ERROR] 提醒任务执行失败并停止重试 (任务: {}): {error:?}",
                         reminder.id
                     );
+                    if let Some(notice) = failure_notice_for_execution(reminder.kind, &error_text) {
+                        send_failure_notice(bot, &reminder, notice).await;
+                    }
                 }
                 continue;
             }
@@ -354,6 +354,47 @@ async fn build_delivery_content_with_lease(
     }
 }
 
+fn failure_notice_for_execution(kind: ReminderKind, error: &str) -> Option<&'static str> {
+    if kind != ReminderKind::Task {
+        return None;
+    }
+    if error.contains("未成功获取所需的外部资料") {
+        Some("我这次没能可靠获取到最新资料，所以先不发送未经核实的内容。你可以稍后再让我查一次。")
+    } else {
+        Some("这次定时任务执行失败了，所以我没有把不确定的结果发给你。")
+    }
+}
+
+async fn send_failure_notice(bot: &RuntimeBot, reminder: &ClaimedReminder, content: &str) {
+    let result = match kovi::tokio::time::timeout(
+        Duration::from_secs(5),
+        MessageTransport::new(bot).send(reminder.destination, Message::from(content.to_string())),
+    )
+    .await
+    {
+        Ok(Ok(message_id)) => Ok(message_id),
+        Ok(Err(error)) => Err(format!("{error:?}")),
+        Err(_) => Err("消息发送超时".to_string()),
+    };
+    match result {
+        Ok(message_id) => {
+            record_standalone_bot_message(
+                destination_scope(reminder.destination),
+                message_id,
+                content,
+            )
+            .await;
+            println!("[INFO] 定时任务失败说明已发送 (任务: {})", reminder.id);
+        }
+        Err(error) => {
+            eprintln!(
+                "[WARN] 定时任务失败说明发送失败 (任务: {}): {}",
+                reminder.id, error
+            );
+        }
+    }
+}
+
 async fn maintain_claim_lease(reminder: ClaimedReminder, lease_secs: u64) {
     let interval = Duration::from_secs(lease_heartbeat_interval_secs(lease_secs));
     loop {
@@ -401,9 +442,9 @@ async fn build_generic_task(reminder: &ClaimedReminder) -> Result<String> {
     let ticket = crate::model::interrupt(reminder_scope(reminder.id)).await;
     let external_task = task_requires_external_tool(&instruction);
     let delivery_style = if external_task {
-        "拿到资料后，请像你刚刚替对方打开网页看过一遍、回来顺手告诉对方那样说话。开头可以自然地说‘我刚看了一下’、‘我搜到几条’或直接进入重点，但不要每次套同一个开场。新闻、天气和其他即时信息要先说结论，再用简短条目整理；新闻条目尽量带媒体名和日期，只有确实有帮助时才附链接。不要逐字复制网页摘要，也不要说‘调用工具’、‘搜索源’、‘接口返回’、‘模型’、‘协议’、‘未能可靠获取’或‘根据工具结果’。不要把回复写成冷冰冰的接口列表，也不要虚构没有查到的内容。"
+        "请保持芸汐平时聊天的语气，像刚替对方打开浏览器看过一遍、回来顺手分享：不要先汇报‘任务已执行’，也不要写成客服或新闻播报。查到新闻时先自然说最值得看的结论，再列 2 到 5 条；查天气时先说地点、时间和体感，再补一句实用建议。可以自然使用‘我刚看了一下’、‘我搜到几条’或直接说重点，但每次不要固定套同一句。不要使用‘搜索结果如下’、‘根据工具/接口返回’、‘本次未能可靠获取’等系统式措辞，不复述网页摘要，不编造资料，也不要输出工具、模型、协议或实现细节。"
     } else {
-        "拿到资料后，请像正常聊天一样直接告诉对方结果，语气自然、简洁，不要解释内部执行过程，不要提到工具、模型、协议或实现细节。"
+        "请保持芸汐平时聊天的语气，像刚替对方查过资料后回来聊天一样直接说结果；语气自然、亲近、简洁，不要先汇报任务状态，也不要提到工具、模型、协议或实现细节。"
     };
     let mut messages = vec![
         crate::model::BotMemory {
@@ -1390,8 +1431,9 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ReminderToolFailureKind, RepeatRule, classify_tool_error, lease_heartbeat_interval_secs,
-        next_occurrence, next_occurrence_after, parse_create_request, reminder_tool_error,
+        ReminderKind, ReminderToolFailureKind, RepeatRule, classify_tool_error,
+        failure_notice_for_execution, lease_heartbeat_interval_secs, next_occurrence,
+        next_occurrence_after, parse_create_request, reminder_tool_error,
         task_requires_external_tool,
     };
     use crate::config::ReminderConfig;
@@ -1496,6 +1538,16 @@ mod tests {
         }))
         .expect("参数应能构造");
         assert!(parse_create_request(&too_long, Utc::now(), &ReminderConfig::default()).is_err());
+    }
+
+    #[test]
+    fn failed_external_tasks_get_a_safe_user_notice() {
+        assert!(
+            failure_notice_for_execution(ReminderKind::Task, "定时任务未成功获取所需的外部资料")
+                .is_some_and(|notice| notice.contains("未经核实"))
+        );
+        assert!(failure_notice_for_execution(ReminderKind::Task, "模型服务超时").is_some());
+        assert!(failure_notice_for_execution(ReminderKind::Message, "发送失败").is_none());
     }
 
     #[test]

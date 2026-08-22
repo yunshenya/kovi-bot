@@ -18,7 +18,7 @@ const TOOL_CALL_START: &str = "[[TOOL_CALL]]";
 const TOOL_CALL_END: &str = "[[/TOOL_CALL]]";
 const MAX_TOOL_CALL_JSON_CHARS: usize = 4_096;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct ToolCall {
     name: String,
@@ -113,11 +113,12 @@ pub(crate) async fn params_model_with_tool_access(
         });
     }
     let model_config = config::get();
-    let max_tool_rounds = if tool_context.requires_reminder_create {
-        model_config.tools().max_rounds().max(3)
-    } else {
-        model_config.tools().max_rounds()
-    };
+    let max_tool_rounds =
+        if tool_context.requires_reminder_create || tool_context.requires_external_tool {
+            model_config.tools().max_rounds().max(3)
+        } else {
+            model_config.tools().max_rounds()
+        };
     let max_memory_rounds = model_config.memory().autonomous_query_max_rounds();
     let mut memory_rounds = 0;
     let mut external_tool_succeeded = !tool_context.requires_external_tool;
@@ -144,16 +145,33 @@ pub(crate) async fn params_model_with_tool_access(
         match parse_tool_call_with_wrapping(&response.content, true) {
             ParsedToolCall::None => {
                 if tool_context.requires_external_tool && !external_tool_succeeded {
+                    if is_model_error_response(&response.content) || round + 1 >= max_tool_rounds {
+                        eprintln!(
+                            "[WARN] 定时任务未成功执行外部查询工具，拒绝发送未经核实的结果 (范围: {}:{}, 轮次: {})",
+                            tool_context.context,
+                            tool_context.subject_id,
+                            round + 1
+                        );
+                        return BotMemory {
+                            role: Roles::Assistant,
+                            content: crate::reminders::SCHEDULED_EXTERNAL_TOOL_FAILURE.to_string(),
+                        };
+                    }
                     eprintln!(
-                        "[WARN] 定时任务未成功执行外部查询工具，拒绝发送未经核实的结果 (范围: {}:{}, 轮次: {})",
+                        "[WARN] 定时任务模型未发起外部查询，要求协议重试 (范围: {}:{}, 轮次: {})",
                         tool_context.context,
                         tool_context.subject_id,
                         round + 1
                     );
-                    return BotMemory {
+                    request.push(BotMemory {
                         role: Roles::Assistant,
-                        content: crate::reminders::SCHEDULED_EXTERNAL_TOOL_FAILURE.to_string(),
-                    };
+                        content: "外部查询尚未执行。".to_string(),
+                    });
+                    request.push(BotMemory {
+                        role: Roles::System,
+                        content: "这个定时任务依赖最新外部资料。请不要直接回答；下一条只输出一个完整且唯一的 web.search 工具调用，不要代码块、解释文字或重复标记。".to_string(),
+                    });
+                    continue;
                 }
                 if should_retry_reminder_create(
                     tool_context.requires_reminder_create,
@@ -197,12 +215,15 @@ pub(crate) async fn params_model_with_tool_access(
                     response.content.matches(TOOL_CALL_START).count(),
                     response.content.matches(TOOL_CALL_END).count()
                 );
-                request.push(response);
+                request.push(BotMemory {
+                    role: Roles::Assistant,
+                    content: "工具调用未执行。".to_string(),
+                });
                 request.push(BotMemory {
                     role: Roles::System,
                     content: format!(
-                        "刚才的工具调用格式无效（{}）。如仍需工具，请只输出合法的工具调用；否则直接回答。",
-                        reason
+                        "上一轮工具调用格式无效（{}）。请重新输出一条完整且唯一的工具调用；不要输出代码块、前后解释或重复标记。",
+                        reason,
                     ),
                 });
             }
@@ -476,6 +497,11 @@ fn parse_tool_call_with_wrapping(content: &str, allow_wrapping: bool) -> ParsedT
         };
         return parse_tool_call_json(json);
     }
+    let start_count = content.matches(TOOL_CALL_START).count();
+    let end_count = content.matches(TOOL_CALL_END).count();
+    if start_count > 1 || end_count > 1 {
+        return parse_repeated_tool_calls(content, start_count, end_count);
+    }
     let Some(start) = content.find(TOOL_CALL_START) else {
         return ParsedToolCall::Invalid("工具调用缺少开始标记".to_string());
     };
@@ -514,6 +540,45 @@ fn parse_tool_call_with_wrapping(content: &str, allow_wrapping: bool) -> ParsedT
     // surrounding text is never executed; only the single JSON payload is trusted.
     let json = content[json_start..end].trim();
     parse_tool_call_json(json)
+}
+
+/// Some gateways repeat an identical streamed tool-call block. Collapse only
+/// that exact, fully parseable duplicate; multiple different calls remain
+/// invalid so the caller never executes ambiguous model output.
+fn parse_repeated_tool_calls(
+    content: &str,
+    start_count: usize,
+    end_count: usize,
+) -> ParsedToolCall {
+    if start_count != end_count || start_count == 0 {
+        return ParsedToolCall::Invalid("工具调用标记必须唯一且成对".to_string());
+    }
+
+    let mut cursor = 0;
+    let mut calls = Vec::with_capacity(start_count);
+    while let Some(relative_start) = content[cursor..].find(TOOL_CALL_START) {
+        let start = cursor + relative_start;
+        let json_start = start + TOOL_CALL_START.len();
+        let Some(relative_end) = content[json_start..].find(TOOL_CALL_END) else {
+            return ParsedToolCall::Invalid("工具调用缺少结束标记或 JSON 不完整".to_string());
+        };
+        let end = json_start + relative_end;
+        let json = content[json_start..end].trim();
+        let ParsedToolCall::Call(call) = parse_tool_call_json(json) else {
+            return ParsedToolCall::Invalid("重复工具调用中存在无效 JSON".to_string());
+        };
+        calls.push(call);
+        cursor = end + TOOL_CALL_END.len();
+    }
+
+    let Some(first) = calls.first() else {
+        return ParsedToolCall::Invalid("工具调用标记必须唯一且成对".to_string());
+    };
+    if calls.iter().all(|call| call == first) {
+        ParsedToolCall::Call(first.clone())
+    } else {
+        ParsedToolCall::Invalid("检测到多个不同的工具调用".to_string())
+    }
 }
 
 fn parse_tool_call_json(json: &str) -> ParsedToolCall {
@@ -579,7 +644,7 @@ mod tests {
         ));
         assert!(matches!(
             parse_tool_call_with_wrapping(
-                r#"[[TOOL_CALL]]{"name":"time.now","arguments":{}}[[/TOOL_CALL]] [[TOOL_CALL]]{"name":"time.now","arguments":{}}[[/TOOL_CALL]]"#,
+                r#"[[TOOL_CALL]]{"name":"time.now","arguments":{"timezone":"UTC"}}[[/TOOL_CALL]] [[TOOL_CALL]]{"name":"time.now","arguments":{"timezone":"Asia/Shanghai"}}[[/TOOL_CALL]]"#,
                 true,
             ),
             ParsedToolCall::Invalid(_)
@@ -596,6 +661,28 @@ mod tests {
                 r#"[[TOOL_CALL]]{"name":"time.now","sql":"DROP TABLE"}[[/TOOL_CALL]]"#,
                 true,
             ),
+            ParsedToolCall::Invalid(_)
+        ));
+    }
+
+    #[test]
+    fn collapses_identical_repeated_tool_calls_but_rejects_different_calls() {
+        let repeated = concat!(
+            "说明 ",
+            "[[TOOL_CALL]]{\"name\":\"web.search\",\"arguments\":{\"query\":\"新闻\"}}[[/TOOL_CALL]]",
+            " [[TOOL_CALL]]{\"name\":\"web.search\",\"arguments\":{\"query\":\"新闻\"}}[[/TOOL_CALL]]",
+        );
+        let ParsedToolCall::Call(call) = parse_tool_call_with_wrapping(repeated, true) else {
+            panic!("相同的重复工具调用应可安全折叠");
+        };
+        assert_eq!(call.name, "web.search");
+
+        let different = concat!(
+            "[[TOOL_CALL]]{\"name\":\"web.search\",\"arguments\":{\"query\":\"新闻\"}}[[/TOOL_CALL]]",
+            "[[TOOL_CALL]]{\"name\":\"time.now\",\"arguments\":{}}[[/TOOL_CALL]]",
+        );
+        assert!(matches!(
+            parse_tool_call_with_wrapping(different, true),
             ParsedToolCall::Invalid(_)
         ));
     }
