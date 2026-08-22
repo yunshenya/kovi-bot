@@ -3,7 +3,7 @@
 use super::interrupt::{ReplyTicket, is_current};
 use super::reply_disposition::SILENT_REPLY_OUTPUT;
 use super::thinking::ThinkingReporter;
-use super::tool_access::tool_registry;
+use super::tool_access::{ToolExecutionContext, tool_registry};
 use super::utils::{BotMemory, Roles, params_model_with_token_limit_and_progress_for_reply};
 use crate::config;
 use crate::vision::VisionImage;
@@ -33,8 +33,7 @@ enum ParsedToolCall {
 /// 普通回复只调用一次模型；只有模型明确请求工具时才进入有限工具循环。
 pub(crate) async fn params_model_with_tool_access(
     messages: &mut [BotMemory],
-    subject_id: i64,
-    context: &str,
+    tool_context: ToolExecutionContext,
     reply_ticket: ReplyTicket,
     max_output_tokens: Option<u32>,
     vision_images: &[VisionImage],
@@ -96,20 +95,14 @@ pub(crate) async fn params_model_with_tool_access(
                         memory_rounds += 1;
                     }
                     registry
-                        .execute(
-                            &call.name,
-                            call.arguments,
-                            subject_id,
-                            context,
-                            reply_ticket,
-                        )
+                        .execute(&call.name, call.arguments, tool_context, reply_ticket)
                         .await
                 };
                 println!(
                     "[INFO] 模型工具调用完成 (工具: {}, 范围: {}:{}, 轮次: {})",
                     tool_name,
-                    context,
-                    subject_id,
+                    tool_context.context,
+                    tool_context.subject_id,
                     round + 1
                 );
                 request.push(BotMemory {

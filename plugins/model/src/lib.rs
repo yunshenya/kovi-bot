@@ -23,6 +23,7 @@ mod image_security;
 mod model;
 mod private_image_memory;
 mod redis_store;
+pub(crate) mod reminders;
 mod vision;
 mod vision_router;
 // 工具函数模块
@@ -138,6 +139,10 @@ async fn main() {
         }
     }
 
+    if let Err(error) = reminders::initialize_database().await {
+        panic!("提醒任务表初始化失败，拒绝写入 readiness: {error}");
+    }
+
     if let Err(error) = sticker_memory::initialize_database().await {
         panic!("表情包记忆库初始化失败，拒绝写入 readiness: {error}");
     }
@@ -178,7 +183,7 @@ async fn main() {
             }
         }
     });
-    if proactive_chat::startup::get_or_create_proactive_manager(proactive_bot)
+    if proactive_chat::startup::get_or_create_proactive_manager(Arc::clone(&proactive_bot))
         .await
         .is_some()
     {
@@ -190,6 +195,11 @@ async fn main() {
         .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
         .is_ok()
     {
+        let reminder_bot = Arc::clone(&proactive_bot);
+        kovi::tokio::spawn(async move {
+            reminders::start_scheduler(reminder_bot).await;
+        });
+
         // 在后台异步任务中执行定期任务
         // 主动聊天循环由 startup 模块单独管理。
         kovi::tokio::spawn(async move {

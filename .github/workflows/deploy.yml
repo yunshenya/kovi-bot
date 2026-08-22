@@ -22,12 +22,13 @@ env:
   KOVI_MAIN_ADMIN: ${{ vars.KOVI_MAIN_ADMIN }}
   KOVI_ALLOWED_FRIENDS: ${{ vars.KOVI_ALLOWED_FRIENDS }}
   KOVI_ALLOWED_GROUPS: ${{ vars.KOVI_ALLOWED_GROUPS }}
-  MODEL_API_URL: ${{ vars.MODEL_API_URL }}
-  MODEL_NAME: ${{ vars.MODEL_NAME }}
+  MODEL_API_URL: ${{ vars.MODEL_API_URL || 'https://codex666ai.com' }}
+  MODEL_NAME: ${{ vars.MODEL_NAME || 'gpt-5.5' }}
   MODEL_WIRE_API: ${{ vars.MODEL_WIRE_API || 'responses' }}
   MODEL_SUPPORTS_VISION: ${{ vars.MODEL_SUPPORTS_VISION || 'true' }}
   MODEL_API_KEY_ENV: ${{ vars.MODEL_API_KEY_ENV || 'OPENAI_API_KEY' }}
-  MODEL_REQUIRES_AUTH: ${{ vars.MODEL_REQUIRES_AUTH || 'true' }}
+  MODEL_REQUIRES_AUTH: ${{ vars.MODEL_REQUIRES_AUTH || 'false' }}
+  MODEL_ACTOR_AUTHORIZATION: ${{ vars.MODEL_ACTOR_AUTHORIZATION || 'local-image-extension' }}
   DEPLOY_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
 
 jobs:
@@ -42,6 +43,16 @@ jobs:
     timeout-minutes: 20
     environment:
       name: production
+    env:
+      DEPLOY_HOST: ${{ secrets.DEPLOY_HOST || vars.DEPLOY_HOST }}
+      KOVI_MAIN_ADMIN: ${{ secrets.KOVI_MAIN_ADMIN || vars.KOVI_MAIN_ADMIN }}
+      MODEL_API_URL: ${{ secrets.MODEL_API_URL || vars.MODEL_API_URL || 'https://codex666ai.com' }}
+      MODEL_NAME: ${{ secrets.MODEL_NAME || vars.MODEL_NAME || 'gpt-5.5' }}
+      MODEL_WIRE_API: ${{ secrets.MODEL_WIRE_API || vars.MODEL_WIRE_API || 'responses' }}
+      MODEL_SUPPORTS_VISION: ${{ secrets.MODEL_SUPPORTS_VISION || vars.MODEL_SUPPORTS_VISION || 'true' }}
+      MODEL_API_KEY_ENV: ${{ secrets.MODEL_API_KEY_ENV || vars.MODEL_API_KEY_ENV || 'OPENAI_API_KEY' }}
+      MODEL_REQUIRES_AUTH: ${{ secrets.MODEL_REQUIRES_AUTH || vars.MODEL_REQUIRES_AUTH || 'false' }}
+      MODEL_ACTOR_AUTHORIZATION: ${{ secrets.MODEL_ACTOR_AUTHORIZATION || vars.MODEL_ACTOR_AUTHORIZATION || 'local-image-extension' }}
 
     steps:
       - name: Checkout verified revision
@@ -59,16 +70,16 @@ jobs:
 
       - name: Validate deployment settings
         env:
-          DEPLOY_SSH_PRIVATE_KEY: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
-          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+          DEPLOY_PASSWORD: ${{ secrets.DEPLOY_PASSWORD }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           BOT_API_TOKEN: ${{ secrets.BOT_API_TOKEN }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
           NAPCAT_ACCESS_TOKEN: ${{ secrets.NAPCAT_ACCESS_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
-          test -n "$DEPLOY_HOST" || { echo "Missing production variable DEPLOY_HOST"; exit 1; }
+          test -n "$DEPLOY_HOST" || { echo "Missing repository secret DEPLOY_HOST"; exit 1; }
           [[ "$DEPLOY_HOST" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "DEPLOY_HOST must be a DNS name or IPv4 address"; exit 1; }
           [[ "$DEPLOY_USER" == "kovi-deploy" ]] || { echo "DEPLOY_USER must be the dedicated kovi-deploy account"; exit 1; }
           [[ "$DEPLOY_SSH_PORT" =~ ^[0-9]+$ ]] && (( 10#$DEPLOY_SSH_PORT >= 1 && 10#$DEPLOY_SSH_PORT <= 65535 )) || { echo "Invalid DEPLOY_SSH_PORT"; exit 1; }
@@ -82,14 +93,15 @@ jobs:
           [[ "$MODEL_SUPPORTS_VISION" == "true" || "$MODEL_SUPPORTS_VISION" == "false" ]] || { echo "Invalid MODEL_SUPPORTS_VISION"; exit 1; }
           [[ "$MODEL_API_KEY_ENV" == "OPENAI_API_KEY" || "$MODEL_API_KEY_ENV" == "BOT_API_TOKEN" ]] || { echo "Invalid MODEL_API_KEY_ENV"; exit 1; }
           [[ "$MODEL_REQUIRES_AUTH" == "true" || "$MODEL_REQUIRES_AUTH" == "false" ]] || { echo "Invalid MODEL_REQUIRES_AUTH"; exit 1; }
-          test -n "$DEPLOY_SSH_PRIVATE_KEY" || { echo "Missing DEPLOY_SSH_PRIVATE_KEY"; exit 1; }
-          test -n "$DEPLOY_KNOWN_HOSTS" || { echo "Missing DEPLOY_KNOWN_HOSTS"; exit 1; }
+          test -n "$DEPLOY_PASSWORD" || { echo "Missing repository secret DEPLOY_PASSWORD"; exit 1; }
           if test "$MODEL_API_KEY_ENV" = "OPENAI_API_KEY"; then
             test -n "$OPENAI_API_KEY" || { echo "Missing OPENAI_API_KEY"; exit 1; }
           else
             test -n "$BOT_API_TOKEN" || { echo "Missing BOT_API_TOKEN"; exit 1; }
           fi
-          test -n "$DATABASE_URL" || { echo "Missing DATABASE_URL"; exit 1; }
+          if test -z "$DATABASE_URL"; then
+            test -n "$POSTGRES_PASSWORD" || { echo "Missing DATABASE_URL or POSTGRES_PASSWORD"; exit 1; }
+          fi
           test -n "$NAPCAT_ACCESS_TOKEN" || { echo "Missing NAPCAT_ACCESS_TOKEN"; exit 1; }
           [[ "$NAPCAT_ACCESS_TOKEN" =~ ^[A-Za-z0-9._~+/=-]{24,}$ ]] || { echo "NAPCAT_ACCESS_TOKEN must be at least 24 safe characters"; exit 1; }
           for value in "$OPENAI_API_KEY" "$BOT_API_TOKEN" "$DATABASE_URL"; do
@@ -97,24 +109,11 @@ jobs:
           done
 
       - name: Configure SSH
-        env:
-          DEPLOY_SSH_PRIVATE_KEY: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
-          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
         shell: bash
         run: |
           set -euo pipefail
-          install -d -m 700 ~/.ssh
-          printf '%s\n' "$DEPLOY_SSH_PRIVATE_KEY" > ~/.ssh/kovi_deploy
-          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
-          chmod 600 ~/.ssh/kovi_deploy ~/.ssh/known_hosts
-          known_host="$DEPLOY_HOST"
-          if test "$DEPLOY_SSH_PORT" != "22"; then
-            known_host="[$DEPLOY_HOST]:$DEPLOY_SSH_PORT"
-          fi
-          ssh-keygen -F "$known_host" -f ~/.ssh/known_hosts >/dev/null || {
-            echo "DEPLOY_KNOWN_HOSTS does not contain the configured host and port"
-            exit 1
-          }
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends sshpass
 
       - name: Build release binary
         run: cargo build --release --locked
@@ -123,20 +122,24 @@ jobs:
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           BOT_API_TOKEN: ${{ secrets.BOT_API_TOKEN }}
-          MODEL_ACTOR_AUTHORIZATION: ${{ secrets.MODEL_ACTOR_AUTHORIZATION }}
+          MODEL_ACTOR_AUTHORIZATION: ${{ secrets.MODEL_ACTOR_AUTHORIZATION || vars.MODEL_ACTOR_AUTHORIZATION || 'local-image-extension' }}
           VISION_API_TOKEN: ${{ secrets.VISION_API_TOKEN }}
           VISION_ACTOR_AUTHORIZATION: ${{ secrets.VISION_ACTOR_AUTHORIZATION }}
           NAPCAT_ACCESS_TOKEN: ${{ secrets.NAPCAT_ACCESS_TOKEN }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
           BRAVE_SEARCH_API_KEY: ${{ secrets.BRAVE_SEARCH_API_KEY }}
           REDIS_URL: ${{ secrets.REDIS_URL }}
-          VISION_API_URL: ${{ vars.VISION_API_URL }}
-          VISION_WIRE_API: ${{ vars.VISION_WIRE_API || 'responses' }}
-          VISION_MODEL_NAME: ${{ vars.VISION_MODEL_NAME }}
-          VISION_REQUIRES_AUTH: ${{ vars.VISION_REQUIRES_AUTH || 'true' }}
+          VISION_API_URL: ${{ secrets.VISION_API_URL || vars.VISION_API_URL }}
+          VISION_WIRE_API: ${{ secrets.VISION_WIRE_API || vars.VISION_WIRE_API || 'responses' }}
+          VISION_MODEL_NAME: ${{ secrets.VISION_MODEL_NAME || vars.VISION_MODEL_NAME }}
+          VISION_REQUIRES_AUTH: ${{ secrets.VISION_REQUIRES_AUTH || vars.VISION_REQUIRES_AUTH || 'true' }}
         shell: bash
         run: |
           set -euo pipefail
+          if test -z "$DATABASE_URL"; then
+            DATABASE_URL="postgresql://kovi_bot:${POSTGRES_PASSWORD}@127.0.0.1:5432/kovi_bot"
+          fi
           for value in "$OPENAI_API_KEY" "$BOT_API_TOKEN" "$MODEL_ACTOR_AUTHORIZATION" \
             "$VISION_API_TOKEN" "$VISION_ACTOR_AUTHORIZATION" \
             "$BRAVE_SEARCH_API_KEY" "$DATABASE_URL" "$REDIS_URL" "$VISION_API_URL" \
@@ -243,10 +246,12 @@ jobs:
           tar -C "$release_dir" -czf "$RUNNER_TEMP/kovi-release-$DEPLOY_SHA.tar.gz" .
 
       - name: Prepare remote upload directory
+        env:
+          SSHPASS: ${{ secrets.DEPLOY_PASSWORD }}
         shell: bash
         run: |
           set -euo pipefail
-          ssh -i ~/.ssh/kovi_deploy -p "$DEPLOY_SSH_PORT" -o BatchMode=yes \
+          sshpass -e ssh -p "$DEPLOY_SSH_PORT" -o StrictHostKeyChecking=accept-new \
             "$DEPLOY_USER@$DEPLOY_HOST" bash -s -- "$REMOTE_APP_DIR" <<'REMOTE'
           set -euo pipefail
           app_dir="$1"
@@ -272,18 +277,22 @@ jobs:
           REMOTE
 
       - name: Upload release
+        env:
+          SSHPASS: ${{ secrets.DEPLOY_PASSWORD }}
         shell: bash
         run: |
           set -euo pipefail
-          scp -i ~/.ssh/kovi_deploy -P "$DEPLOY_SSH_PORT" -o BatchMode=yes \
+          sshpass -e scp -P "$DEPLOY_SSH_PORT" -o StrictHostKeyChecking=accept-new \
             "$RUNNER_TEMP/kovi-release-$DEPLOY_SHA.tar.gz" \
             "$DEPLOY_USER@$DEPLOY_HOST:$REMOTE_APP_DIR/incoming/$DEPLOY_SHA.tar.gz"
 
       - name: Activate release and verify readiness
+        env:
+          SSHPASS: ${{ secrets.DEPLOY_PASSWORD }}
         shell: bash
         run: |
           set -euo pipefail
-          ssh -i ~/.ssh/kovi_deploy -p "$DEPLOY_SSH_PORT" -o BatchMode=yes \
+          sshpass -e ssh -p "$DEPLOY_SSH_PORT" -o StrictHostKeyChecking=accept-new \
             "$DEPLOY_USER@$DEPLOY_HOST" bash -s -- "$REMOTE_APP_DIR" "$DEPLOY_SHA" <<'REMOTE'
           set -euo pipefail
           app_dir="$1"
@@ -395,8 +404,10 @@ jobs:
 
       - name: Show service status
         if: always()
+        env:
+          SSHPASS: ${{ secrets.DEPLOY_PASSWORD }}
         shell: bash
         run: |
-          ssh -i ~/.ssh/kovi_deploy -p "$DEPLOY_SSH_PORT" -o BatchMode=yes \
+          sshpass -e ssh -p "$DEPLOY_SSH_PORT" -o StrictHostKeyChecking=accept-new \
             "$DEPLOY_USER@$DEPLOY_HOST" \
             "systemctl --no-pager --full status kovi-bot.service" || true

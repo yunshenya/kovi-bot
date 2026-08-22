@@ -29,12 +29,14 @@ mod message_batch;
 mod mood;
 mod proactive;
 mod prompt;
+mod reminders;
 mod server;
 mod tools;
 mod topic;
 mod traffic;
 mod vision;
 
+pub use reminders::ReminderConfig;
 pub use tools::{McpServerConfig, ToolsConfig};
 pub use vision::VisionConfig;
 
@@ -74,6 +76,8 @@ pub struct ModelConfig {
     traffic: TrafficConfig,
     /// 模型可自主调用的受限工具。
     tools: ToolsConfig,
+    /// 持久化提醒任务配置。
+    reminders: ReminderConfig,
     /// 图片理解 Provider 路由配置。
     vision: VisionConfig,
 }
@@ -116,6 +120,7 @@ impl ModelConfig {
         self.topic.validate()?;
         self.traffic.validate()?;
         self.tools.validate()?;
+        self.reminders.validate()?;
         self.vision.validate()?;
         if !self.vision.mcp_server().is_empty() && !self.tools.enabled() {
             return Err(anyhow::anyhow!(
@@ -176,6 +181,10 @@ impl ModelConfig {
 
     pub fn tools(&self) -> &ToolsConfig {
         &self.tools
+    }
+
+    pub fn reminders(&self) -> &ReminderConfig {
+        &self.reminders
     }
 
     pub fn vision(&self) -> &VisionConfig {

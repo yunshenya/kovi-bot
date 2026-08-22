@@ -20,6 +20,7 @@ use super::recall::{
 };
 use super::reply::attach_reply_protocol_context;
 use super::thinking::{ThinkingDestination, ThinkingReporter, strip_thinking_notices};
+use super::tool_access::ToolExecutionContext;
 use crate::config;
 use crate::memory::{MEMORY_MANAGER, MoodEntry, UserProfile};
 use crate::model::semantic::MessageUnderstanding;
@@ -314,8 +315,12 @@ pub async fn control_model(
     .await;
     let response = ModelGateway::complete(
         &mut request_messages,
-        group_id,
-        "group_chat",
+        ToolExecutionContext {
+            subject_id: group_id,
+            actor_user_id: user_id,
+            context: "group_chat",
+            destination: MessageDestination::Group(group_id),
+        },
         reply_ticket,
         max_output_tokens,
         &vision_images,
@@ -1588,8 +1593,12 @@ async fn private_chat_inner(
     .await;
     let bot_content = ModelGateway::complete(
         &mut request_messages,
-        user_id,
-        "private_chat",
+        ToolExecutionContext {
+            subject_id: user_id,
+            actor_user_id: user_id,
+            context: "private_chat",
+            destination: MessageDestination::Private(user_id),
+        },
         reply_ticket,
         None,
         vision_images,

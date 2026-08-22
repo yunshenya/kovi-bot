@@ -3,6 +3,7 @@
 use super::interrupt::ReplyTicket;
 use super::memory_query::params_model_with_tool_access;
 use super::thinking::ThinkingReporter;
+use super::tool_access::ToolExecutionContext;
 use super::utils::BotMemory;
 use crate::vision::VisionImage;
 use std::sync::Arc;
@@ -13,8 +14,7 @@ pub(crate) struct ModelGateway;
 impl ModelGateway {
     pub(crate) async fn complete(
         messages: &mut [BotMemory],
-        subject_id: i64,
-        context: &str,
+        tool_context: ToolExecutionContext,
         reply_ticket: ReplyTicket,
         max_output_tokens: Option<u32>,
         vision_images: &[VisionImage],
@@ -22,8 +22,7 @@ impl ModelGateway {
     ) -> BotMemory {
         params_model_with_tool_access(
             messages,
-            subject_id,
-            context,
+            tool_context,
             reply_ticket,
             max_output_tokens,
             vision_images,

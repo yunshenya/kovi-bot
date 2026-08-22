@@ -89,6 +89,11 @@ jobs:
           cargo test -p model --lib --locked
           memory::tests::normalized_postgres_storage_round_trips -- --ignored --exact
 
+      - name: Run reminder claim integration test
+        run: >-
+          cargo test -p model --lib --locked
+          reminders::tests::postgres_claim_is_atomic_across_concurrent_workers -- --ignored --exact
+
       - name: Run Redis integration tests
         run: >-
           cargo test -p model --lib --locked

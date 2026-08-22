@@ -1,7 +1,7 @@
 # Production deployment bootstrap
 
-发布工作流不会持有服务器登录密码，也不会动态安装 systemd 服务。以下操作只需由服务器
-管理员在控制台执行一次；之后 GitHub 只使用专用 SSH Key 和一条受限 sudo 规则发布。
+发布工作流通过 GitHub Secret 中的部署密码登录服务器，也不会动态安装 systemd 服务。以下
+操作只需由服务器管理员在控制台执行一次；之后 GitHub 只负责上传和切换发布版本。
 
 ## 1. 创建专用应用账号
 
@@ -16,18 +16,8 @@ sudo -u kovi-bot install -d -m 700 \
   /opt/kovi-bot/incoming /opt/kovi-bot/releases /opt/kovi-bot/runtime
 ```
 
-在可信机器生成独立部署密钥，将私钥保存为 GitHub `production` Environment Secret
-`DEPLOY_SSH_PRIVATE_KEY`。公钥以 `restrict` 选项写入：
-
-```text
-restrict ssh-ed25519 AAAA... github-kovi-deploy
-```
-
-将该行保存到 `/opt/kovi-bot/.ssh/authorized_keys`，所有者设为 `kovi-bot:kovi-bot`，
-权限设为 `0600`。`restrict` 会关闭端口、Agent、X11 和 PTY 转发；不要复用个人 SSH Key。
-
-从服务器控制台核对 SSH 主机公钥指纹，再把对应的完整 `known_hosts` 行保存为 Environment
-Secret `DEPLOY_KNOWN_HOSTS`。不要在 CI 内无条件信任 `ssh-keyscan` 的结果。
+为 `kovi-deploy` 设置专用登录密码，并保存为仓库级 Actions Secret `DEPLOY_PASSWORD`。
+不要复用个人账号密码。工作流使用一次性 runner 的 SSH 连接上传版本。
 
 ## 2. 安装受限服务权限
 
@@ -64,37 +54,31 @@ DATABASE_URL=postgresql://kovi_bot:encoded-password@127.0.0.1:5432/kovi_bot
 PostgreSQL、Redis 和 NapCat 应仅监听回环地址或受控私网。生产环境还应使用防火墙限制
 OneBot、数据库和 Redis 端口。
 
-## 4. 配置 GitHub Environment
+## 4. 配置 GitHub Actions Secrets 和 Variables
 
-创建名为 `production` 的 Environment，限制只能从 `main` 发布，并建议启用 required
-reviewers。配置以下 Variables：
+建议仍创建名为 `production` 的 Environment，限制只能从 `main` 发布，并启用 required
+reviewers。截图中的敏感配置放在仓库级 Actions Secrets：
 
-- `DEPLOY_HOST`：服务器 DNS 名称或 IPv4 地址。
-- `DEPLOY_USER`：默认 `kovi-bot`。
+- `DEPLOY_HOST`、`DEPLOY_PASSWORD`。
+- `NAPCAT_ACCESS_TOKEN`、`OPENAI_API_KEY`、`BOT_API_TOKEN`。
+- `POSTGRES_PASSWORD`：工作流会生成本机 PostgreSQL 的连接串。
+- `KOVI_MAIN_ADMIN`：机器人所有者 QQ 号。
+- `MODEL_API_URL`、`MODEL_NAME`、`MODEL_SUPPORTS_VISION`、`MODEL_WIRE_API`。
+- `MODEL_ACTOR_AUTHORIZATION`、`VISION_API_TOKEN`。
+- `VISION_ACTOR_AUTHORIZATION`、`VISION_API_URL`、`VISION_MODEL_NAME`、
+  `VISION_REQUIRES_AUTH`、`VISION_WIRE_API`。
+
+以下非敏感配置仍放在 `production` Environment Variables：
+
+- `DEPLOY_USER`：默认 `kovi-deploy`。
 - `DEPLOY_SSH_PORT`：默认 `22`。
 - `REMOTE_APP_DIR`：默认 `/opt/kovi-bot`，必须是 `/opt` 或 `/srv` 下的具体目录。
-- `KOVI_MAIN_ADMIN`：机器人所有者 QQ 号。
 - `KOVI_ALLOWED_FRIENDS`：可选，逗号分隔的好友 QQ 号；所有者会自动加入。
 - `KOVI_ALLOWED_GROUPS`：可选，逗号分隔的群号；留空即不处理群消息。
-- `MODEL_API_URL`：HTTPS 模型接口完整地址。
-- `MODEL_NAME`：模型名称。
-- `MODEL_WIRE_API`：`responses`（默认）或 `chat_completions`。
-- `MODEL_SUPPORTS_VISION`：默认 `true`。
 - `MODEL_API_KEY_ENV`：`OPENAI_API_KEY`（默认）或 `BOT_API_TOKEN`。
-- `MODEL_REQUIRES_AUTH`：默认 `true`。
-- `VISION_API_URL`、`VISION_WIRE_API`、`VISION_MODEL_NAME`、
-  `VISION_REQUIRES_AUTH`：仅独立视觉接口需要。
-
-配置以下 Secrets：
-
-- `DEPLOY_SSH_PRIVATE_KEY`、`DEPLOY_KNOWN_HOSTS`。
-- `NAPCAT_ACCESS_TOKEN`：至少 24 个随机安全字符，并与 NapCat 完全一致。
-- `DATABASE_URL`、`OPENAI_API_KEY`。
-- `BOT_API_TOKEN`、`MODEL_ACTOR_AUTHORIZATION`、`VISION_API_TOKEN`、
-  `VISION_ACTOR_AUTHORIZATION`、`BRAVE_SEARCH_API_KEY`、`REDIS_URL`：按需配置。
-
-旧的 `DEPLOY_PASSWORD` 和 `POSTGRES_PASSWORD` 不再使用。迁移完成并验证新流程后，应从
-GitHub 删除这两个 Secret，并轮换曾用于自动发布的服务器密码。
+- `MODEL_REQUIRES_AUTH`：默认 `false`。
+- `DATABASE_URL` 如果不想使用 `POSTGRES_PASSWORD` 自动生成的默认连接串。
+- `BRAVE_SEARCH_API_KEY`、`REDIS_URL`：按需配置。
 
 ## 5. 发布与回滚
 

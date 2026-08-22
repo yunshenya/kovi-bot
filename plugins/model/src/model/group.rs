@@ -16,6 +16,7 @@ use crate::model::utils::{
     process_group_reply_claimed, send_sys_info,
 };
 use crate::redis_store;
+use crate::reminders;
 use crate::sticker_memory;
 use crate::sticker_memory::{
     StickerScope, extract_stickers, has_reply, known_labels, quoted_message_context,
@@ -748,21 +749,22 @@ async fn delete_group_data(group_id: i64, bot: &RuntimeBot) {
 
     let memory_result = MEMORY_MANAGER.delete_group_data(group_id).await;
     let sticker_result = sticker_memory::delete_group_data(group_id).await;
-    match (memory_result, sticker_result) {
-        (Ok(memory_rows), Ok(sticker_rows)) => {
+    let reminder_result = reminders::delete_group_data(group_id).await;
+    match (memory_result, sticker_result, reminder_result) {
+        (Ok(memory_rows), Ok(sticker_rows), Ok(reminder_rows)) => {
             send_tracked_group_message(
                 bot,
                 group_id,
                 format!(
-                    "本群可归属数据已删除（记忆/档案/摘要 {memory_rows} 项，表情教学 {sticker_rows} 项）。"
+                    "本群可归属数据已删除（记忆/档案/摘要 {memory_rows} 项，表情教学 {sticker_rows} 项，提醒 {reminder_rows} 项）。"
                 ),
             )
             .await;
         }
-        (memory, stickers) => {
+        (memory, stickers, reminders) => {
             eprintln!(
-                "[ERROR] 群数据删除未完全成功 (群组: {}, 记忆: {:?}, 表情: {:?})",
-                group_id, memory, stickers
+                "[ERROR] 群数据删除未完全成功 (群组: {}, 记忆: {:?}, 表情: {:?}, 提醒: {:?})",
+                group_id, memory, stickers, reminders
             );
             send_tracked_group_message(
                 bot,

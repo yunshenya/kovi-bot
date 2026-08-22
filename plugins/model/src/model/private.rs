@@ -19,6 +19,7 @@ use crate::model::utils::{
 use crate::private_image_memory::{
     RecentPrivateImage, forget_private_user_images, recent_private_images, remember_private_images,
 };
+use crate::reminders;
 use crate::sticker_memory;
 use crate::sticker_memory::{
     StickerScope, extract_stickers, has_reply, known_labels, quoted_message_context,
@@ -529,21 +530,22 @@ async fn delete_private_user_data(user_id: i64, bot: &RuntimeBot) {
 
     let memory_result = MEMORY_MANAGER.delete_user_data(user_id).await;
     let sticker_result = sticker_memory::delete_user_data(user_id).await;
-    match (memory_result, sticker_result) {
-        (Ok(memory_rows), Ok(sticker_rows)) => {
+    let reminder_result = reminders::delete_user_data(user_id).await;
+    match (memory_result, sticker_result, reminder_result) {
+        (Ok(memory_rows), Ok(sticker_rows), Ok(reminder_rows)) => {
             send_tracked_private_message(
                 bot,
                 user_id,
                 format!(
-                    "你的可归属数据已删除（记忆/档案/摘要 {memory_rows} 项，表情教学 {sticker_rows} 项）。"
+                    "你的可归属数据已删除（记忆/档案/摘要 {memory_rows} 项，表情教学 {sticker_rows} 项，提醒 {reminder_rows} 项）。"
                 ),
             )
             .await;
         }
-        (memory, stickers) => {
+        (memory, stickers, reminders) => {
             eprintln!(
-                "[ERROR] 用户数据删除未完全成功 (用户: {}, 记忆: {:?}, 表情: {:?})",
-                user_id, memory, stickers
+                "[ERROR] 用户数据删除未完全成功 (用户: {}, 记忆: {:?}, 表情: {:?}, 提醒: {:?})",
+                user_id, memory, stickers, reminders
             );
             send_tracked_private_message(
                 bot,
