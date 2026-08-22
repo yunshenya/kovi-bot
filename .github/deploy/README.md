@@ -31,18 +31,17 @@ sudo -v
 
 ## 3. PostgreSQL 连接配置
 
-当前服务器使用 PostgreSQL 默认的 `postgres` 用户，工作流在没有配置 `DATABASE_URL` 时会用
-`POSTGRES_PASSWORD` 生成连接串，并连接本机的 `kovi_bot` 数据库。`POSTGRES_PASSWORD` 必须
-是服务器上 `postgres` 用户的实际密码，密码中的特殊字符应在 URL 中进行百分号编码。
+当前服务器使用 PostgreSQL 默认的 `postgres` 用户和 `postgres` 数据库；`public` 是该数据库的
+默认 schema。工作流在没有配置 `DATABASE_URL` 时会用 `POSTGRES_PASSWORD` 生成连接串。
+`POSTGRES_PASSWORD` 必须是服务器上 `postgres` 用户的实际密码，密码中的特殊字符应在 URL
+中进行百分号编码。
 
-```sql
-CREATE DATABASE kovi_bot;
-```
+如果服务器确实使用了其他数据库名，请配置完整的 `DATABASE_URL`，不要把 schema 名当作数据库名。
 
 对应的 Secret 为：
 
 ```text
-DATABASE_URL=postgresql://postgres:encoded-password@127.0.0.1:5432/kovi_bot
+DATABASE_URL=postgresql://postgres:encoded-password@127.0.0.1:5432/postgres
 ```
 
 PostgreSQL、Redis 和 NapCat 应仅监听回环地址或受控私网。生产环境还应使用防火墙限制

@@ -169,7 +169,7 @@ jobs:
         run: |
           set -euo pipefail
           if test -z "$DATABASE_URL"; then
-            DATABASE_URL="postgresql://postgres:${POSTGRES_PASSWORD}@127.0.0.1:5432/kovi_bot"
+            DATABASE_URL="postgresql://postgres:${POSTGRES_PASSWORD}@127.0.0.1:5432/postgres"
           fi
           for value in "$OPENAI_API_KEY" "$BOT_API_TOKEN" "$MODEL_ACTOR_AUTHORIZATION" \
             "$VISION_API_TOKEN" "$VISION_ACTOR_AUTHORIZATION" \
