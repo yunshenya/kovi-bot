@@ -14,7 +14,7 @@ use crate::model::semantic::{
 use crate::model::traffic::{InboundScope, bounded_input, should_suppress};
 use crate::model::utils::{
     clear_private_runtime_data, is_bot_admin, is_group_admin_command, is_restricted_command,
-    private_chat_claimed,
+    private_chat_claimed, send_sys_info_private,
 };
 use crate::private_image_memory::{
     RecentPrivateImage, forget_private_user_images, recent_private_images, remember_private_images,
@@ -63,8 +63,16 @@ pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<Runtime
         println!("[INFO] 私聊未授权命令已静默 (用户: {})", user_id);
         return;
     }
+    if message.trim() == "#系统信息" && sender_is_admin {
+        send_sys_info_private(Arc::clone(&bot), user_id).await;
+        return;
+    }
     if is_group_admin_command(message) {
-        println!("[INFO] 私聊群聊专用命令已忽略 (用户: {})", user_id);
+        println!(
+            "[INFO] 私聊群聊专用命令已忽略 (用户: {}, 命令: {})",
+            user_id,
+            message.trim()
+        );
         return;
     }
     if should_suppress(InboundScope::Private(user_id), sender_is_admin).await {

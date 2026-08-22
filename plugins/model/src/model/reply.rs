@@ -275,8 +275,10 @@ pub(crate) fn parse_reply_output(content: &str) -> ParsedReply {
         clean.replace_range(start..end + ACTION_END.len(), "");
         cursor = start;
     }
-    let (disposition, content) =
-        normalize_reply_disposition(protocol.disposition, clean.trim().to_string());
+    let (disposition, content) = normalize_reply_disposition(
+        protocol.disposition,
+        unwrap_accidental_json_reply(clean.trim().to_string()),
+    );
     let messages = if disposition.is_silent() || !content.is_empty() {
         None
     } else {
@@ -289,6 +291,39 @@ pub(crate) fn parse_reply_output(content: &str) -> ParsedReply {
         action: protocol.action,
         requests_image: protocol.requests_image && !disposition.is_silent(),
     }
+}
+
+/// Models occasionally echo the private-message input envelope as their visible reply.
+/// Only unwrap the exact two-field envelope so legitimate JSON answers remain untouched.
+fn unwrap_accidental_json_reply(content: String) -> String {
+    let trimmed = content.trim();
+    if !trimmed.starts_with('{') || !trimmed.ends_with('}') {
+        return content;
+    }
+    let Ok(Value::Object(object)) = serde_json::from_str::<Value>(trimmed) else {
+        return content;
+    };
+    if object.len() != 2 {
+        return content;
+    }
+    let chinese_envelope = object.contains_key("发送者") && object.contains_key("正文");
+    let english_envelope = object.contains_key("sender") && object.contains_key("content");
+    if !chinese_envelope && !english_envelope {
+        return content;
+    }
+    let body_key = if chinese_envelope {
+        "正文"
+    } else {
+        "content"
+    };
+    let Some(body) = object.get(body_key).and_then(Value::as_str) else {
+        return content;
+    };
+    let body = body.trim();
+    if body.is_empty() {
+        return content;
+    }
+    body.to_string()
 }
 
 pub(crate) fn build_outbound_message(
@@ -509,6 +544,15 @@ mod tests {
             parsed.messages,
             Some(vec!["第一条".to_string(), "第二条".to_string()])
         );
+    }
+
+    #[test]
+    fn unwraps_accidental_json_reply_envelope_without_touching_other_json() {
+        let parsed = parse_reply_output(r#"{"发送者":"芸汐","正文":"你好呀。"}"#);
+        assert_eq!(parsed.content, "你好呀。");
+
+        let parsed = parse_reply_output(r#"{"answer":"这是给用户看的 JSON"}"#);
+        assert_eq!(parsed.content, r#"{"answer":"这是给用户看的 JSON"}"#);
     }
 
     #[test]

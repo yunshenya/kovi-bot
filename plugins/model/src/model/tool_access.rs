@@ -72,6 +72,7 @@ pub(crate) struct ToolExecutionContext {
 pub(crate) struct ToolExecutionResult {
     pub(crate) succeeded: bool,
     pub(crate) content: String,
+    pub(crate) reminder_failure_kind: Option<reminders::ReminderToolFailureKind>,
 }
 
 struct ToolDefinition {
@@ -374,24 +375,28 @@ impl ToolRegistry {
             return ToolExecutionResult {
                 succeeded: false,
                 content: "工具未开放或工具名称无效。".to_string(),
+                reminder_failure_kind: None,
             };
         };
         if tool_context.scheduled && !definition.source.available_for_scheduled() {
             return ToolExecutionResult {
                 succeeded: false,
                 content: "这个工具未授权给定时任务使用。".to_string(),
+                reminder_failure_kind: None,
             };
         }
         let Ok(arguments_text) = serde_json::to_string(&arguments) else {
             return ToolExecutionResult {
                 succeeded: false,
                 content: "工具参数无法编码。".to_string(),
+                reminder_failure_kind: None,
             };
         };
         if arguments_text.chars().count() > MAX_TOOL_ARGUMENT_CHARS {
             return ToolExecutionResult {
                 succeeded: false,
                 content: "工具参数过长，已拒绝执行。".to_string(),
+                reminder_failure_kind: None,
             };
         }
 
@@ -416,11 +421,20 @@ impl ToolRegistry {
             Ok(result) => ToolExecutionResult {
                 succeeded: true,
                 content: truncate_chars(&result, self.max_result_chars),
+                reminder_failure_kind: None,
             },
-            Err(error) => ToolExecutionResult {
-                succeeded: false,
-                content: format!("工具执行失败：{}", truncate_chars(&error.to_string(), 800)),
-            },
+            Err(error) => {
+                let reminder_failure_kind = if name.starts_with("reminder.") {
+                    reminders::classify_tool_error(&error)
+                } else {
+                    None
+                };
+                ToolExecutionResult {
+                    succeeded: false,
+                    content: format!("工具执行失败：{}", truncate_chars(&error.to_string(), 800)),
+                    reminder_failure_kind,
+                }
+            }
         }
     }
 

@@ -67,7 +67,10 @@ reviewers。截图中的敏感配置放在仓库级 Actions Secrets：
 以下配置也可以放在 `production` Environment Variables；如果同时存在，仓库 Secrets 优先：
 
 - `KOVI_ALLOWED_FRIENDS`：可选，逗号分隔的好友 QQ 号；所有者会自动加入。
-- `KOVI_ALLOWED_GROUPS`：可选，逗号分隔的群号；留空即不处理群消息。
+- `KOVI_ALLOWED_GROUPS`：逗号分隔的群号；生产工作流默认使用
+  `475328908,641996763,784469488`，避免
+  未配置变量时被生成为空白名单。需要调整范围时，请在 `production` Environment Variables
+  中显式设置该值。
 - `MODEL_API_KEY_ENV`：`OPENAI_API_KEY`（默认）或 `BOT_API_TOKEN`。
 - `MODEL_REQUIRES_AUTH`：默认 `true`；外部 HTTPS 模型服务应保持启用，以发送 `OPENAI_API_KEY` 的 Bearer Token。
 - `DATABASE_URL` 如果不想使用 `POSTGRES_PASSWORD` 自动生成的默认连接串。

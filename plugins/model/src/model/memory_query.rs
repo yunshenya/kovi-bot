@@ -3,7 +3,7 @@
 use super::interrupt::{ReplyTicket, is_current};
 use super::reply_disposition::SILENT_REPLY_OUTPUT;
 use super::thinking::ThinkingReporter;
-use super::tool_access::{ToolExecutionContext, tool_registry};
+use super::tool_access::{ToolExecutionContext, ToolExecutionResult, tool_registry};
 use super::utils::{
     BotMemory, Roles, is_model_error_response, params_model_with_token_limit_and_progress_for_reply,
 };
@@ -30,6 +30,34 @@ enum ParsedToolCall {
     None,
     Invalid(String),
     Call(ToolCall),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReminderCreateFailure {
+    NotCalled,
+    InvalidArguments,
+    Rejected,
+    Database,
+    Execution,
+}
+
+impl ReminderCreateFailure {
+    fn label(self) -> &'static str {
+        match self {
+            Self::NotCalled => "模型未发起 reminder.create",
+            Self::InvalidArguments => "reminder.create 参数校验失败",
+            Self::Rejected => "reminder.create 被业务限制拒绝",
+            Self::Database => "提醒数据库写入失败",
+            Self::Execution => "reminder.create 执行失败",
+        }
+    }
+
+    fn log_prefix(self) -> &'static str {
+        match self {
+            Self::Database => "[ERROR]",
+            _ => "[WARN]",
+        }
+    }
 }
 
 /// 普通回复只调用一次模型；只有模型明确请求工具时才进入有限工具循环。
@@ -83,6 +111,8 @@ pub(crate) async fn params_model_with_tool_access(
     let max_memory_rounds = model_config.memory().autonomous_query_max_rounds();
     let mut memory_rounds = 0;
     let mut reminder_tool_succeeded = false;
+    let mut reminder_failure = ReminderCreateFailure::NotCalled;
+    let mut reminder_failure_detail = None;
 
     for round in 0..max_tool_rounds {
         let Some(response) = interruptible_model_call(
@@ -114,9 +144,29 @@ pub(crate) async fn params_model_with_tool_access(
                     );
                     continue;
                 }
+                if tool_context.requires_reminder_create && !reminder_tool_succeeded {
+                    eprintln!(
+                        "[WARN] {}：模型返回了不可重试的普通回复 (范围: {}:{}, 轮次: {})",
+                        reminder_failure.label(),
+                        tool_context.context,
+                        tool_context.subject_id,
+                        round + 1
+                    );
+                }
                 return response;
             }
             ParsedToolCall::Invalid(reason) => {
+                if tool_context.requires_reminder_create && !reminder_tool_succeeded {
+                    reminder_failure = ReminderCreateFailure::InvalidArguments;
+                    reminder_failure_detail = Some(reason.clone());
+                }
+                eprintln!(
+                    "[WARN] 模型工具调用格式无效 (范围: {}:{}, 轮次: {}, 原因: {})",
+                    tool_context.context,
+                    tool_context.subject_id,
+                    round + 1,
+                    reason
+                );
                 request.push(response);
                 request.push(BotMemory {
                     role: Roles::System,
@@ -130,9 +180,10 @@ pub(crate) async fn params_model_with_tool_access(
                 let tool_name = call.name.clone();
                 request.push(response);
                 let result = if call.name == "memory.search" && memory_rounds >= max_memory_rounds {
-                    super::tool_access::ToolExecutionResult {
+                    ToolExecutionResult {
                         succeeded: false,
                         content: "本轮长期记忆查询次数已用完，请使用已有资料回答。".to_string(),
+                        reminder_failure_kind: None,
                     }
                 } else {
                     if call.name == "memory.search" {
@@ -144,10 +195,38 @@ pub(crate) async fn params_model_with_tool_access(
                 };
                 if tool_name == "reminder.create" {
                     reminder_tool_succeeded = result.succeeded;
-                    println!(
-                        "[INFO] reminder.create 执行结果 (范围: {}:{}, 成功: {})",
-                        tool_context.context, tool_context.subject_id, reminder_tool_succeeded
-                    );
+                    if reminder_tool_succeeded {
+                        reminder_failure_detail = None;
+                        println!(
+                            "[INFO] reminder.create 执行成功 (范围: {}:{}, 轮次: {})",
+                            tool_context.context,
+                            tool_context.subject_id,
+                            round + 1
+                        );
+                    } else {
+                        reminder_failure = match result.reminder_failure_kind {
+                            Some(crate::reminders::ReminderToolFailureKind::Validation) => {
+                                ReminderCreateFailure::InvalidArguments
+                            }
+                            Some(crate::reminders::ReminderToolFailureKind::Rejected) => {
+                                ReminderCreateFailure::Rejected
+                            }
+                            Some(crate::reminders::ReminderToolFailureKind::Database) => {
+                                ReminderCreateFailure::Database
+                            }
+                            None => ReminderCreateFailure::Execution,
+                        };
+                        reminder_failure_detail = Some(result.content.clone());
+                        eprintln!(
+                            "{} {} (范围: {}:{}, 轮次: {}, 详情: {})",
+                            reminder_failure.log_prefix(),
+                            reminder_failure.label(),
+                            tool_context.context,
+                            tool_context.subject_id,
+                            round + 1,
+                            compact_log_text(&result.content)
+                        );
+                    }
                 }
                 println!(
                     "[INFO] 模型工具调用完成 (工具: {}, 范围: {}:{}, 轮次: {})",
@@ -165,10 +244,12 @@ pub(crate) async fn params_model_with_tool_access(
     }
 
     if tool_context.requires_reminder_create && !reminder_tool_succeeded {
-        return BotMemory {
-            role: Roles::Assistant,
-            content: "我还没有成功创建这个提醒，请稍后再试一次。".to_string(),
-        };
+        log_reminder_failure(
+            reminder_failure,
+            reminder_failure_detail.as_deref(),
+            tool_context,
+        );
+        return reminder_failure_response(reminder_failure, reminder_failure_detail.as_deref());
     }
 
     request.push(BotMemory {
@@ -203,6 +284,90 @@ fn should_retry_reminder_create(
     response: &str,
 ) -> bool {
     requires_reminder_create && !reminder_tool_succeeded && !is_model_error_response(response)
+}
+
+fn reminder_failure_response(failure: ReminderCreateFailure, detail: Option<&str>) -> BotMemory {
+    let content = match failure {
+        ReminderCreateFailure::NotCalled => {
+            "我理解了你的提醒请求，但模型没有成功调用提醒工具，任务未创建。请再试一次，并把时间和提醒内容说得更明确。"
+        }
+        ReminderCreateFailure::InvalidArguments => match detail
+            .and_then(compact_user_detail)
+            .as_deref()
+        {
+            Some(detail) => {
+                return BotMemory {
+                    role: Roles::Assistant,
+                    content: format!(
+                        "这个提醒的参数不完整或不合法（{}），任务未创建。请补充明确的时间和提醒内容后再试。",
+                        detail
+                    ),
+                };
+            }
+            None => "这个提醒的参数不完整或不合法，任务未创建。请提供明确的时间和提醒内容后再试。",
+        },
+        ReminderCreateFailure::Rejected => {
+            "这个提醒暂时无法创建（可能已达到未完成提醒数量上限），任务未创建。请先取消旧提醒或稍后再试。"
+        }
+        ReminderCreateFailure::Database => "提醒服务暂时不可用，任务未创建，请稍后再试。",
+        ReminderCreateFailure::Execution => "提醒工具执行失败，任务未创建，请稍后再试。",
+    };
+    BotMemory {
+        role: Roles::Assistant,
+        content: content.to_string(),
+    }
+}
+
+fn compact_user_detail(value: &str) -> Option<String> {
+    let value = value
+        .trim()
+        .strip_prefix("工具执行失败：")
+        .unwrap_or(value)
+        .trim();
+    if value.is_empty() {
+        return None;
+    }
+    let mut compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() > 120 {
+        compact = compact.chars().take(119).collect::<String>();
+        compact.push('…');
+    }
+    Some(compact)
+}
+
+fn log_reminder_failure(
+    failure: ReminderCreateFailure,
+    detail: Option<&str>,
+    tool_context: ToolExecutionContext,
+) {
+    let detail = detail.map(compact_log_text).unwrap_or_default();
+    if detail.is_empty() {
+        eprintln!(
+            "{} {} (范围: {}:{})",
+            failure.log_prefix(),
+            failure.label(),
+            tool_context.context,
+            tool_context.subject_id
+        );
+    } else {
+        eprintln!(
+            "{} {} (范围: {}:{}, 详情: {})",
+            failure.log_prefix(),
+            failure.label(),
+            tool_context.context,
+            tool_context.subject_id,
+            detail
+        );
+    }
+}
+
+fn compact_log_text(value: &str) -> String {
+    let mut compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() > 240 {
+        compact = compact.chars().take(239).collect::<String>();
+        compact.push('…');
+    }
+    compact
 }
 
 /// 模型请求期间轮询会话代数；一旦有新消息，立即丢弃网络 future 并让下一轮接管。
@@ -279,7 +444,10 @@ fn format_tool_result(name: &str, result: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ParsedToolCall, interrupted_response, parse_tool_call};
+    use super::{
+        ParsedToolCall, ReminderCreateFailure, interrupted_response, parse_tool_call,
+        reminder_failure_response,
+    };
     use crate::model::reply::parse_reply_output;
 
     #[test]
@@ -344,5 +512,24 @@ mod tests {
             false,
             "抱歉，模型服务暂时不可用（上游超时）。"
         ));
+    }
+
+    #[test]
+    fn reminder_failure_responses_explain_which_stage_failed() {
+        assert!(
+            reminder_failure_response(ReminderCreateFailure::NotCalled, None)
+                .content
+                .contains("没有成功调用提醒工具")
+        );
+        assert!(
+            reminder_failure_response(ReminderCreateFailure::InvalidArguments, None)
+                .content
+                .contains("参数不完整或不合法")
+        );
+        assert!(
+            reminder_failure_response(ReminderCreateFailure::Database, None)
+                .content
+                .contains("提醒服务暂时不可用")
+        );
     }
 }

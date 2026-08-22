@@ -21,7 +21,9 @@ env:
   REMOTE_APP_DIR: ${{ secrets.REMOTE_APP_DIR || vars.REMOTE_APP_DIR || '/home/ubuntu/kovi-bot' }}
   KOVI_MAIN_ADMIN: ${{ vars.KOVI_MAIN_ADMIN }}
   KOVI_ALLOWED_FRIENDS: ${{ vars.KOVI_ALLOWED_FRIENDS }}
-  KOVI_ALLOWED_GROUPS: ${{ vars.KOVI_ALLOWED_GROUPS }}
+  # Keep the production group allowlist non-empty when the GitHub variable is
+  # missing; an empty list makes Kovi silently drop every group event.
+  KOVI_ALLOWED_GROUPS: ${{ vars.KOVI_ALLOWED_GROUPS || '475328908,641996763,784469488' }}
   MODEL_API_URL: ${{ vars.MODEL_API_URL || 'https://codex666ai.com' }}
   MODEL_NAME: ${{ vars.MODEL_NAME || 'gpt-5.5' }}
   MODEL_WIRE_API: ${{ vars.MODEL_WIRE_API || 'responses' }}
@@ -49,6 +51,7 @@ jobs:
       DEPLOY_SSH_PORT: ${{ secrets.DEPLOY_SSH_PORT || vars.DEPLOY_SSH_PORT || '22' }}
       REMOTE_APP_DIR: ${{ secrets.REMOTE_APP_DIR || vars.REMOTE_APP_DIR || '/home/ubuntu/kovi-bot' }}
       KOVI_MAIN_ADMIN: ${{ secrets.KOVI_MAIN_ADMIN || vars.KOVI_MAIN_ADMIN }}
+      KOVI_ALLOWED_GROUPS: ${{ secrets.KOVI_ALLOWED_GROUPS || vars.KOVI_ALLOWED_GROUPS || '475328908,641996763,784469488' }}
       MODEL_API_URL: ${{ secrets.MODEL_API_URL || vars.MODEL_API_URL || 'https://codex666ai.com' }}
       MODEL_NAME: ${{ secrets.MODEL_NAME || vars.MODEL_NAME || 'gpt-5.5' }}
       MODEL_WIRE_API: ${{ secrets.MODEL_WIRE_API || vars.MODEL_WIRE_API || 'responses' }}
@@ -372,6 +375,26 @@ jobs:
             install -d -m 750 "$staging"
             tar --no-same-owner -xzf "$archive" -C "$staging"
             test -x "$staging/kovi-bot"
+            host_arch="$(uname -m)"
+            binary_format="$(file -b "$staging/kovi-bot")"
+            case "$host_arch" in
+              x86_64)
+                [[ "$binary_format" == *"ELF 64-bit LSB pie executable, x86-64"* ]] || {
+                  echo "Release binary architecture does not match host: host=$host_arch binary=$binary_format" >&2
+                  exit 1
+                }
+                ;;
+              aarch64|arm64)
+                [[ "$binary_format" == *"ELF 64-bit LSB pie executable, ARM aarch64"* ]] || {
+                  echo "Release binary architecture does not match host: host=$host_arch binary=$binary_format" >&2
+                  exit 1
+                }
+                ;;
+              *)
+                echo "Unsupported deployment host architecture: $host_arch" >&2
+                exit 1
+                ;;
+            esac
             test "$(cat "$staging/REVISION")" = "$revision"
             test -s "$staging/.env"
             test -s "$staging/kovi.conf.toml"

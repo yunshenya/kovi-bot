@@ -175,7 +175,17 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
     let bounded_message = bounded_input(event.borrow_text().unwrap_or_default());
     let message = bounded_message.as_str();
     let sender_is_admin = is_bot_admin(&bot, event.user_id);
-    if is_restricted_command(message) && !sender_is_admin {
+    let restricted_command = is_restricted_command(message);
+    if restricted_command {
+        println!(
+            "[INFO] 群聊管理命令收到 (群组: {}, 用户: {}, 管理员: {}, 命令: {})",
+            group_id,
+            event.user_id,
+            sender_is_admin,
+            message.trim()
+        );
+    }
+    if restricted_command && !sender_is_admin {
         println!(
             "[INFO] 群聊未授权命令已静默 (群组: {}, 用户: {})",
             group_id, event.user_id
@@ -224,6 +234,7 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
             return;
         }
         "#系统信息" => {
+            println!("[INFO] 群聊系统信息命令进入处理分支 (群组: {})", group_id);
             send_sys_info(Arc::clone(&bot), group_id).await;
             return;
         }

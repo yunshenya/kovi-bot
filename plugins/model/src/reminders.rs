@@ -32,6 +32,45 @@ static REMINDER_TOKEN_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static LAST_CLEANUP: LazyLock<kovi::tokio::sync::Mutex<Option<Instant>>> =
     LazyLock::new(|| kovi::tokio::sync::Mutex::new(None));
 
+/// 提醒内置工具失败的来源。回复层据此区分模型参数问题和持久化故障，
+/// 但不会把数据库细节直接暴露给用户。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReminderToolFailureKind {
+    Validation,
+    Rejected,
+    Database,
+}
+
+#[derive(Debug)]
+struct ReminderToolError {
+    kind: ReminderToolFailureKind,
+    message: String,
+}
+
+impl std::fmt::Display for ReminderToolError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ReminderToolError {}
+
+fn reminder_tool_error(
+    kind: ReminderToolFailureKind,
+    error: impl std::fmt::Display,
+) -> anyhow::Error {
+    anyhow::Error::new(ReminderToolError {
+        kind,
+        message: error.to_string(),
+    })
+}
+
+pub(crate) fn classify_tool_error(error: &anyhow::Error) -> Option<ReminderToolFailureKind> {
+    error
+        .downcast_ref::<ReminderToolError>()
+        .map(|error| error.kind)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RepeatRule {
     None,
@@ -371,8 +410,17 @@ pub(crate) async fn create_from_tool(
     destination: MessageDestination,
     actor_user_id: i64,
 ) -> Result<String> {
-    let request = parse_create_request(arguments, Utc::now(), config::get().reminders())?;
-    let id = create(destination, actor_user_id, request.clone()).await?;
+    let request = parse_create_request(arguments, Utc::now(), config::get().reminders())
+        .map_err(|error| reminder_tool_error(ReminderToolFailureKind::Validation, error))?;
+    let id = create(destination, actor_user_id, request.clone())
+        .await
+        .map_err(|error| {
+            if classify_tool_error(&error).is_some() {
+                error
+            } else {
+                reminder_tool_error(ReminderToolFailureKind::Database, error)
+            }
+        })?;
     Ok(format_created_message(id, &request))
 }
 
@@ -461,8 +509,11 @@ pub(crate) async fn list_from_tool(
     destination: MessageDestination,
     actor_user_id: i64,
 ) -> Result<String> {
-    reject_unknown_arguments(arguments, &[])?;
-    let items = list(destination).await?;
+    reject_unknown_arguments(arguments, &[])
+        .map_err(|error| reminder_tool_error(ReminderToolFailureKind::Validation, error))?;
+    let items = list(destination)
+        .await
+        .map_err(|error| reminder_tool_error(ReminderToolFailureKind::Database, error))?;
     if items.is_empty() {
         return Ok("当前会话没有未完成的提醒。".to_string());
     }
@@ -482,14 +533,13 @@ pub(crate) async fn list_from_tool(
         } else {
             "其他成员"
         };
+        let local_time = format_local_time(item.due_at, &item.timezone)
+            .map_err(|error| reminder_tool_error(ReminderToolFailureKind::Database, error))?;
+        let description = list_item_description(&item)
+            .map_err(|error| reminder_tool_error(ReminderToolFailureKind::Database, error))?;
         output.push_str(&format!(
             "\n- #{} [{}] {}，{}，{}，创建者 {}",
-            item.id,
-            destination_label,
-            format_local_time(item.due_at, &item.timezone)?,
-            repeat_label,
-            list_item_description(&item)?,
-            creator_label
+            item.id, destination_label, local_time, repeat_label, description, creator_label
         ));
         if item.status != "pending" {
             let status = match item.status.as_str() {
@@ -508,15 +558,23 @@ pub(crate) async fn cancel_from_tool(
     destination: MessageDestination,
     actor_user_id: i64,
 ) -> Result<String> {
-    reject_unknown_arguments(arguments, &["reminder_id"])?;
+    reject_unknown_arguments(arguments, &["reminder_id"])
+        .map_err(|error| reminder_tool_error(ReminderToolFailureKind::Validation, error))?;
     let id = arguments
         .get("reminder_id")
         .and_then(Value::as_i64)
-        .ok_or_else(|| anyhow!("参数 reminder_id 必须是正整数"))?;
+        .ok_or_else(|| anyhow!("参数 reminder_id 必须是正整数"))
+        .map_err(|error| reminder_tool_error(ReminderToolFailureKind::Validation, error))?;
     if id <= 0 {
-        return Err(anyhow!("参数 reminder_id 必须是正整数"));
+        return Err(reminder_tool_error(
+            ReminderToolFailureKind::Validation,
+            "参数 reminder_id 必须是正整数",
+        ));
     }
-    if cancel(destination, actor_user_id, id).await? {
+    if cancel(destination, actor_user_id, id)
+        .await
+        .map_err(|error| reminder_tool_error(ReminderToolFailureKind::Database, error))?
+    {
         Ok(format!("提醒 #{} 已取消。", id))
     } else {
         Ok(format!(
@@ -755,7 +813,10 @@ async fn create(
         MessageDestination::Group(_) => reminder_config.max_pending_per_group(),
     } as i64;
     if scope_count >= scope_limit {
-        return Err(anyhow!("当前会话的未完成提醒已达到上限 {}", scope_limit));
+        return Err(reminder_tool_error(
+            ReminderToolFailureKind::Rejected,
+            format!("当前会话的未完成提醒已达到上限 {}", scope_limit),
+        ));
     }
 
     let total_count = query_scalar::<Postgres, i64>(
@@ -764,7 +825,10 @@ async fn create(
     .fetch_one(&mut *transaction)
     .await?;
     if total_count >= reminder_config.max_pending_total() as i64 {
-        return Err(anyhow!("系统当前的未完成提醒已达到全局上限，请稍后再试"));
+        return Err(reminder_tool_error(
+            ReminderToolFailureKind::Rejected,
+            "系统当前的未完成提醒已达到全局上限，请稍后再试",
+        ));
     }
 
     let id = query_scalar::<Postgres, i64>(
@@ -1210,7 +1274,10 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{RepeatRule, next_occurrence, next_occurrence_after, parse_create_request};
+    use super::{
+        ReminderToolFailureKind, RepeatRule, classify_tool_error, next_occurrence,
+        next_occurrence_after, parse_create_request, reminder_tool_error,
+    };
     use crate::config::ReminderConfig;
     use chrono::{Duration, TimeZone, Utc};
     use serde_json::{Value, json};
@@ -1298,6 +1365,21 @@ mod tests {
         }))
         .expect("参数应能构造");
         assert!(parse_create_request(&too_long, Utc::now(), &ReminderConfig::default()).is_err());
+    }
+
+    #[test]
+    fn reminder_tool_errors_preserve_validation_and_database_categories() {
+        let validation = reminder_tool_error(ReminderToolFailureKind::Validation, "参数 mode 无效");
+        let database = reminder_tool_error(ReminderToolFailureKind::Database, "数据库连接失败");
+        assert_eq!(
+            classify_tool_error(&validation),
+            Some(ReminderToolFailureKind::Validation)
+        );
+        assert_eq!(
+            classify_tool_error(&database),
+            Some(ReminderToolFailureKind::Database)
+        );
+        assert_eq!(classify_tool_error(&anyhow::anyhow!("普通错误")), None);
     }
 
     #[test]
