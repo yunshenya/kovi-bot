@@ -3,7 +3,9 @@ use crate::health_check::HealthChecker;
 use crate::memory::{GroupProfile, MEMORY_MANAGER};
 use crate::model::coalesce::{MessageCoalescer, MessagePart};
 use crate::model::interrupt::{ReplyScope, interrupt, is_active};
-use crate::model::recall::{has_recalled_messages, send_tracked_group_message};
+use crate::model::recall::{
+    has_recalled_messages, is_recent_bot_message, send_tracked_group_message,
+};
 use crate::model::reply::record_reply_target;
 use crate::model::semantic::{MessageUnderstanding, UnderstandingRequest, understand};
 use crate::model::utils::{
@@ -181,6 +183,14 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
     let vision_command = is_vision_command(message);
     let sticker_scope = StickerScope::Group(group_id);
     let reply_scope = ReplyScope::Group(group_id);
+    if event.user_id == event.self_id || is_recent_bot_message(reply_scope, event.message_id).await
+    {
+        println!(
+            "[INFO] 忽略群聊自发消息回流 (群组: {}, 消息: {})",
+            group_id, event.message_id
+        );
+        return;
+    }
     record_reply_target(
         reply_scope,
         event.message_id,

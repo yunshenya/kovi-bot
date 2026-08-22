@@ -1,11 +1,8 @@
 use crate::model::interrupt::{ReplyTicket, is_current};
 use crate::model::recall::record_bot_message;
 use kovi::RuntimeBot;
-use kovi::tokio::sync::Mutex;
-use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
-use std::time::Duration;
 
 pub(crate) const THINKING_NOTICE_START: &str = "[[THINKING_NOTICE]]";
 pub(crate) const THINKING_NOTICE_END: &str = "[[/THINKING_NOTICE]]";
@@ -19,17 +16,8 @@ pub(crate) enum ThinkingDestination {
 }
 
 #[derive(Debug, Clone, Copy)]
-enum ThinkingKind {
-    Image,
-    Complex,
-    LongContext,
-}
-
-#[derive(Debug, Clone, Copy)]
 struct ThinkingEstimate {
     should_notify: bool,
-    fallback_delay: Duration,
-    kind: ThinkingKind,
 }
 
 pub(crate) struct ThinkingReporter {
@@ -37,14 +25,12 @@ pub(crate) struct ThinkingReporter {
     destination: ThinkingDestination,
     ticket: ReplyTicket,
     estimate: ThinkingEstimate,
-    fallback_seed: u64,
     notice_sent: AtomicBool,
-    timer: Mutex<Option<kovi::tokio::task::JoinHandle<()>>>,
 }
 
 static THINKING_PROTOCOL: LazyLock<String> = LazyLock::new(|| {
     format!(
-        "如果这次任务确实需要较长时间，先输出一句自然、简短、符合当前语气的状态提示，再输出最终回答。状态提示必须放在 {start} 和 {end} 之间；简单问题不要输出状态提示。不要承诺精确秒数，不要解释技术机制，不要把状态提示写进最终回答。",
+        "如果这次任务确实需要较长时间，先输出一句像聊天里随口说的短状态，再输出最终回答。状态提示必须放在 {start} 和 {end} 之间；简单问题不要输出状态提示。不要承诺精确秒数，不要解释技术机制，不要像客服或系统进度提示，也不要把状态提示写进最终回答。",
         start = THINKING_NOTICE_START,
         end = THINKING_NOTICE_END,
     )
@@ -61,18 +47,12 @@ impl ThinkingReporter {
         history_len: usize,
     ) -> Arc<Self> {
         let estimate = estimate_thinking(message, image_count, supports_vision, history_len);
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        message.hash(&mut hasher);
-        image_count.hash(&mut hasher);
-        let fallback_seed = hasher.finish();
         Arc::new(Self {
             bot,
             destination,
             ticket,
             estimate,
-            fallback_seed,
             notice_sent: AtomicBool::new(false),
-            timer: Mutex::new(None),
         })
     }
 
@@ -80,24 +60,9 @@ impl ThinkingReporter {
         THINKING_PROTOCOL.as_str()
     }
 
-    pub(crate) async fn start(self: &Arc<Self>) {
-        if !self.estimate.should_notify {
-            return;
-        }
-        let reporter = Arc::clone(self);
-        let delay = self.estimate.fallback_delay;
-        let handle = kovi::tokio::spawn(async move {
-            kovi::tokio::time::sleep(delay).await;
-            reporter.send_notice(reporter.fallback_notice()).await;
-        });
-        *self.timer.lock().await = Some(handle);
-    }
+    pub(crate) async fn start(self: &Arc<Self>) {}
 
-    pub(crate) async fn finish(&self) {
-        if let Some(handle) = self.timer.lock().await.take() {
-            handle.abort();
-        }
-    }
+    pub(crate) async fn finish(&self) {}
 
     pub(crate) async fn observe_model_output(&self, output: &str) {
         if let Some(notice) = extract_first_thinking_notice(output) {
@@ -142,27 +107,6 @@ impl ThinkingReporter {
             record_bot_message(scope, self.ticket, message_id, &notice, &self.bot).await;
         }
     }
-
-    fn fallback_notice(&self) -> String {
-        let choices = match self.estimate.kind {
-            ThinkingKind::Image => [
-                "我先把图里的细节看清楚一点。",
-                "这张图我看仔细一点，别急。",
-                "我先确认一下图片里的内容，马上回来。",
-            ],
-            ThinkingKind::LongContext => [
-                "我先把前后的内容理一遍，免得漏掉什么。",
-                "我捋一下上下文，再认真回你。",
-                "这段信息有点多，我先理清楚。",
-            ],
-            ThinkingKind::Complex => [
-                "这个我先认真想一下，直接说容易漏东西。",
-                "这题有点绕，我先把思路理顺。",
-                "我先想清楚一点，再好好回答你。",
-            ],
-        };
-        choices[(self.fallback_seed as usize) % choices.len()].to_string()
-    }
 }
 
 fn estimate_thinking(
@@ -189,23 +133,8 @@ fn estimate_thinking(
     } else if history_len > 22 {
         score = score.saturating_add(1);
     }
-    let kind = if image_count > 0 {
-        ThinkingKind::Image
-    } else if history_len > 36 {
-        ThinkingKind::LongContext
-    } else {
-        ThinkingKind::Complex
-    };
     ThinkingEstimate {
         should_notify: score >= 3,
-        fallback_delay: if image_count > 0 && !supports_vision {
-            Duration::from_millis(1_200)
-        } else if score >= 6 {
-            Duration::from_millis(2_000)
-        } else {
-            Duration::from_millis(2_800)
-        },
-        kind,
     }
 }
 

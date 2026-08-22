@@ -113,7 +113,7 @@ pub(crate) async fn params_model_with_tool_access(
                     round + 1
                 );
                 request.push(BotMemory {
-                    role: Roles::System,
+                    role: Roles::Data,
                     content: format_tool_result(&tool_name, &result),
                 });
             }

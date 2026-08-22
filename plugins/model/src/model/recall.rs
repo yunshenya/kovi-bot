@@ -222,6 +222,16 @@ pub(crate) async fn recent_bot_messages(scope: ReplyScope) -> Vec<RecentBotMessa
     merge_recent_bot_messages(local_messages, redis_messages)
 }
 
+pub(crate) async fn is_recent_bot_message(scope: ReplyScope, message_id: i32) -> bool {
+    if message_id <= 0 {
+        return false;
+    }
+    recent_bot_messages(scope)
+        .await
+        .iter()
+        .any(|message| message.message_id == message_id)
+}
+
 /// 执行模型提出的主动撤回。消息 ID 必须存在于本会话的机器人发送白名单中。
 pub(crate) async fn recall_bot_messages(
     scope: ReplyScope,

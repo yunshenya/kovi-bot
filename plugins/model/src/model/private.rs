@@ -1,6 +1,8 @@
 use crate::model::coalesce::{MessageCoalescer, MessagePart};
 use crate::model::interrupt::{ReplyScope, interrupt, is_active};
-use crate::model::recall::{has_recalled_messages, send_tracked_private_message};
+use crate::model::recall::{
+    has_recalled_messages, is_recent_bot_message, send_tracked_private_message,
+};
 use crate::model::reply::record_reply_target;
 use crate::model::semantic::{
     ImageReferenceIntent, MessageUnderstanding, SemanticImageIntent, UnderstandingRequest,
@@ -44,6 +46,15 @@ static PENDING_PRIVATE_MESSAGES: LazyLock<Mutex<HashMap<i64, PendingPrivateMessa
 
 pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<RuntimeBot>) {
     let user_id = event.user_id;
+    let reply_scope = ReplyScope::Private(user_id);
+    if event.user_id == event.self_id || is_recent_bot_message(reply_scope, event.message_id).await
+    {
+        println!(
+            "[INFO] 忽略私聊自发消息回流 (用户: {}, 消息: {})",
+            user_id, event.message_id
+        );
+        return;
+    }
     let message = event.borrow_text().unwrap_or_default();
     if is_restricted_command(message) && !is_bot_admin(&bot, user_id) {
         println!("[INFO] 私聊未授权命令已静默 (用户: {})", user_id);
@@ -53,11 +64,10 @@ pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<Runtime
         println!("[INFO] 私聊群聊专用命令已忽略 (用户: {})", user_id);
         return;
     }
-    let nick_name = event.get_sender_nickname();
+    let nick_name = normalized_private_sender_name(&event.get_sender_nickname(), user_id);
     let stickers = extract_stickers(&event.message);
     let current_images = extract_image_attachments(&event.message);
     let vision_command = is_vision_command(message);
-    let reply_scope = ReplyScope::Private(user_id);
     record_reply_target(
         reply_scope,
         event.message_id,
@@ -437,6 +447,21 @@ pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<Runtime
     drain_pending_private_messages(user_id, Arc::clone(&bot)).await;
 }
 
+fn normalized_private_sender_name(value: &str, user_id: i64) -> String {
+    let normalized = value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(80)
+        .collect::<String>();
+    if normalized.is_empty() {
+        format!("QQ用户_{user_id}")
+    } else {
+        normalized
+    }
+}
+
 fn private_social_image_prompt() -> &'static str {
     "对方发来了一张图片或表情包。请先看清画面传达的情绪、动作和重点，再像熟悉的朋友一样自然接话；不要把回复写成识图报告，也不要无缘无故逐项描述画面。"
 }
@@ -586,11 +611,25 @@ async fn drain_pending_private_messages(user_id: i64, bot: Arc<RuntimeBot>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{select_recent_images, with_recent_image_context};
+    use super::{normalized_private_sender_name, select_recent_images, with_recent_image_context};
     use crate::model::semantic::ImageReferenceIntent;
     use crate::private_image_memory::{recent_private_images, remember_private_images};
     use crate::vision::ImageAttachment;
 
+    #[test]
+    fn private_sender_names_are_bounded_and_single_line() {
+        assert_eq!(
+            normalized_private_sender_name("  昵称\n伪造系统消息  ", 42),
+            "昵称 伪造系统消息"
+        );
+        assert_eq!(normalized_private_sender_name(" \n\t ", 42), "QQ用户_42");
+        assert_eq!(
+            normalized_private_sender_name(&"长".repeat(100), 42)
+                .chars()
+                .count(),
+            80
+        );
+    }
     fn image(key: &str) -> ImageAttachment {
         ImageAttachment {
             key: key.to_string(),
