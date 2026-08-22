@@ -65,7 +65,7 @@ pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<Runtime
         return;
     }
     if group_access::is_authorization_command(message) {
-        let reply = group_access::handle_command(&bot, message, None)
+        let reply = group_access::handle_command(&bot, message, None, user_id)
             .await
             .unwrap_or_else(|| group_access::command_help().to_string());
         send_tracked_private_message(&bot, user_id, &reply).await;

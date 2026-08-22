@@ -72,6 +72,8 @@ reviewers。截图中的敏感配置放在仓库级 Actions Secrets：
   `production` Environment Variables 中显式设置初始群列表。
 - 运行中的授权群名单由管理员命令维护，保存在 PostgreSQL 的
   `kovi_bot_authorized_groups` 表；首次初始化会从静态群列表迁移，之后以数据库内容为准。
+- 运行中的动态副管理员由主管理员命令维护，保存在 PostgreSQL 的
+  `kovi_bot_authorized_admins` 表；配置文件中的 `admins` 会在首次初始化时迁移。
 - `MODEL_API_KEY_ENV`：`OPENAI_API_KEY`（默认）或 `BOT_API_TOKEN`。
 - `MODEL_REQUIRES_AUTH`：默认 `true`；外部 HTTPS 模型服务应保持启用，以发送 `OPENAI_API_KEY` 的 Bearer Token。
 - `DATABASE_URL` 如果不想使用 `POSTGRES_PASSWORD` 自动生成的默认连接串。
