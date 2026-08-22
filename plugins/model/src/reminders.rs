@@ -327,7 +327,7 @@ async fn dispatch_due(bot: &RuntimeBot) -> Result<()> {
 
 async fn build_delivery_content(reminder: &ClaimedReminder) -> Result<String> {
     match reminder.kind {
-        ReminderKind::Message => Ok(reminder.message),
+        ReminderKind::Message => Ok(reminder.message.clone()),
         ReminderKind::Task => build_generic_task(reminder).await,
     }
 }
