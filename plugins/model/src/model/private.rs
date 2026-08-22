@@ -60,12 +60,12 @@ pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<Runtime
     let bounded_message = bounded_input(event.borrow_text().unwrap_or_default());
     let message = bounded_message.as_str();
     let sender_is_admin = is_bot_admin(&bot, user_id);
-    if is_help_command(message) {
-        send_tracked_private_message(&bot, user_id, command_help()).await;
-        return;
-    }
     if is_restricted_command(message) && !sender_is_admin {
         println!("[INFO] 私聊未授权命令已静默 (用户: {})", user_id);
+        return;
+    }
+    if is_help_command(message) {
+        send_tracked_private_message(&bot, user_id, command_help()).await;
         return;
     }
     if group_access::is_authorization_command(message) {

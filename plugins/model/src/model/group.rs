@@ -176,10 +176,6 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
     let bounded_message = bounded_input(event.borrow_text().unwrap_or_default());
     let message = bounded_message.as_str();
     let sender_is_admin = is_bot_admin(&bot, event.user_id);
-    if is_help_command(message) {
-        send_tracked_group_message(&bot, group_id, command_help()).await;
-        return;
-    }
     let restricted_command = is_restricted_command(message);
     if restricted_command {
         println!(
@@ -195,6 +191,10 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
             "[INFO] 群聊未授权命令已静默 (群组: {}, 用户: {})",
             group_id, event.user_id
         );
+        return;
+    }
+    if is_help_command(message) {
+        send_tracked_group_message(&bot, group_id, command_help()).await;
         return;
     }
     if group_access::is_authorization_command(message) {
