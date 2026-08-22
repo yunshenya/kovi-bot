@@ -327,7 +327,7 @@ async fn dispatch_due(bot: &RuntimeBot) -> Result<()> {
 
 async fn build_delivery_content(reminder: &ClaimedReminder) -> Result<String> {
     match reminder.kind {
-        ReminderKind::Message => Ok(format!("⏰ {}", reminder.message)),
+        ReminderKind::Message => Ok(reminder.message),
         ReminderKind::Task => build_generic_task(reminder).await,
     }
 }
