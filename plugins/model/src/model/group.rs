@@ -1,4 +1,5 @@
 use crate::config;
+use crate::group_access;
 use crate::health_check::HealthChecker;
 use crate::memory::{GroupProfile, MEMORY_MANAGER};
 use crate::model::coalesce::{MessageCoalescer, MessagePart};
@@ -190,6 +191,13 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
             "[INFO] 群聊未授权命令已静默 (群组: {}, 用户: {})",
             group_id, event.user_id
         );
+        return;
+    }
+    if group_access::is_authorization_command(message) {
+        let reply = group_access::handle_command(&bot, message, Some(group_id))
+            .await
+            .unwrap_or_else(|| group_access::command_help().to_string());
+        send_tracked_group_message(&bot, group_id, reply).await;
         return;
     }
     let stickers = extract_stickers(&event.message);

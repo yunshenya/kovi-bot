@@ -71,6 +71,8 @@ reviewers。截图中的敏感配置放在仓库级 Actions Secrets：
   `475328908,641996763,784469488`，避免
   未配置变量时被生成为空白名单。需要调整范围时，请在 `production` Environment Variables
   中显式设置该值。
+- 运行中的授权群名单由管理员命令维护，保存在 PostgreSQL 的
+  `kovi_bot_authorized_groups` 表；首次初始化会从静态群列表迁移，之后以数据库内容为准。
 - `MODEL_API_KEY_ENV`：`OPENAI_API_KEY`（默认）或 `BOT_API_TOKEN`。
 - `MODEL_REQUIRES_AUTH`：默认 `true`；外部 HTTPS 模型服务应保持启用，以发送 `OPENAI_API_KEY` 的 Bearer Token。
 - `DATABASE_URL` 如果不想使用 `POSTGRES_PASSWORD` 自动生成的默认连接串。

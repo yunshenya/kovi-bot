@@ -23,6 +23,7 @@ use super::reply::attach_reply_protocol_context;
 use super::thinking::{ThinkingDestination, ThinkingReporter, strip_thinking_notices};
 use super::tool_access::ToolExecutionContext;
 use crate::config;
+use crate::group_access;
 use crate::memory::{MEMORY_MANAGER, MoodEntry, UserProfile};
 use crate::model::semantic::MessageUnderstanding;
 use crate::mood_system::MOOD_SYSTEM;
@@ -132,7 +133,8 @@ const PRIVATE_HUMAN_ROLEPLAY_GUARD: &str = r#"
 /// 私聊用户自己的 `#删除我的数据` 不属于受限命令。
 pub(crate) fn is_restricted_command(message: &str) -> bool {
     let text = message.trim();
-    is_group_admin_command(text)
+    group_access::is_authorization_command(text)
+        || is_group_admin_command(text)
         || text.starts_with("#教芸汐")
         || text.starts_with("#教云汐")
         || is_vision_command(text)

@@ -19,6 +19,7 @@ use std::sync::{
 // 配置管理模块
 pub mod config;
 // 核心模型处理模块
+mod group_access;
 mod image_security;
 mod model;
 mod private_image_memory;
@@ -162,6 +163,11 @@ async fn main() {
     }
 
     // 注册聊天功能宏，定义消息处理函数映射
+    let proactive_bot = PluginBuilder::get_runtime_bot();
+    if let Err(error) = group_access::initialize(&proactive_bot).await {
+        panic!("群聊白名单 PostgreSQL 初始化失败，拒绝写入 readiness: {error}");
+    }
+
     register_chat_function! {
         (group_message, group_message_event),
         (private_message, private_message_event)
@@ -173,7 +179,6 @@ async fn main() {
     PluginBuilder::on_private_msg(private_message);
 
     // 插件启动即启动主动消息循环，不需要等待第一条群聊或私聊事件。
-    let proactive_bot = PluginBuilder::get_runtime_bot();
     let recall_bot = Arc::clone(&proactive_bot);
     PluginBuilder::on_notice({
         move |event| {

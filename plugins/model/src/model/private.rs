@@ -1,3 +1,4 @@
+use crate::group_access;
 use crate::memory::MEMORY_MANAGER;
 use crate::model::coalesce::{MessageCoalescer, MessagePart};
 use crate::model::conversation_coordinator::{ConversationCoordinator, PendingTurn};
@@ -61,6 +62,13 @@ pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<Runtime
     let sender_is_admin = is_bot_admin(&bot, user_id);
     if is_restricted_command(message) && !sender_is_admin {
         println!("[INFO] 私聊未授权命令已静默 (用户: {})", user_id);
+        return;
+    }
+    if group_access::is_authorization_command(message) {
+        let reply = group_access::handle_command(&bot, message, None)
+            .await
+            .unwrap_or_else(|| group_access::command_help().to_string());
+        send_tracked_private_message(&bot, user_id, &reply).await;
         return;
     }
     if message.trim() == "#系统信息" && sender_is_admin {
