@@ -1,2 +1,2 @@
 # Validate with visudo -cf before installing as /etc/sudoers.d/kovi-bot-deploy.
-kovi-deploy ALL=(root) NOPASSWD: /usr/bin/systemctl restart kovi-bot.service
+ubuntu ALL=(root) NOPASSWD: /usr/bin/systemctl restart kovi-bot.service

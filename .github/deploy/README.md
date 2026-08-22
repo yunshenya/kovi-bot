@@ -5,19 +5,18 @@
 
 ## 1. 创建专用应用账号
 
-以下示例与仓库中的 systemd 单元均使用 `/opt/kovi-bot` 和 `kovi-bot`。如果修改路径或
-账号，需同步修改 systemd 单元与 GitHub Environment 变量。
+以下示例与仓库中的 systemd 单元均使用现有的 `ubuntu` 账号和 `/home/ubuntu/kovi-bot`。
+部署工作流、systemd 单元和 sudo 规则必须保持这两个值一致。
 
 ```bash
-sudo useradd --system --create-home --home-dir /opt/kovi-bot --shell /bin/bash kovi-bot
-sudo passwd --lock kovi-bot
-sudo -u kovi-bot install -d -m 700 /opt/kovi-bot/.ssh
-sudo -u kovi-bot install -d -m 700 \
-  /opt/kovi-bot/incoming /opt/kovi-bot/releases /opt/kovi-bot/runtime
+sudo install -d -o ubuntu -g ubuntu -m 0750 /home/ubuntu/kovi-bot
+sudo install -d -o ubuntu -g ubuntu -m 0700 \
+  /home/ubuntu/kovi-bot/incoming /home/ubuntu/kovi-bot/releases /home/ubuntu/kovi-bot/runtime
 ```
 
-为 `kovi-deploy` 设置专用登录密码，并保存为仓库级 Actions Secret `DEPLOY_PASSWORD`。
-不要复用个人账号密码。工作流使用一次性 runner 的 SSH 连接上传版本。
+使用 `ubuntu` 账号的 SSH 密码登录服务器，并将密码保存为仓库级 Actions Secret
+`DEPLOY_PASSWORD`。由于这是服务器登录密码，建议为自动部署单独创建低权限账号；如果继续
+使用 `ubuntu`，至少应限制 SSH 密码登录来源并启用防火墙。
 
 ## 2. 安装受限服务权限
 
@@ -31,7 +30,7 @@ sudo systemctl daemon-reload
 sudo systemctl enable kovi-bot.service
 ```
 
-部署账号只能无密码执行 `systemctl restart kovi-bot.service`。工作流不修改 systemd、
+`ubuntu` 账号只能无密码执行 `systemctl restart kovi-bot.service`。工作流不修改 systemd、
 sudoers 或系统软件包。
 
 ## 3. 创建最小权限数据库
@@ -71,9 +70,9 @@ reviewers。截图中的敏感配置放在仓库级 Actions Secrets：
 
 以下非敏感配置仍放在 `production` Environment Variables：
 
-- `DEPLOY_USER`：默认 `kovi-deploy`。
+- `DEPLOY_USER`：默认 `ubuntu`，当前工作流要求填写 `ubuntu`。
 - `DEPLOY_SSH_PORT`：默认 `22`。
-- `REMOTE_APP_DIR`：默认 `/opt/kovi-bot`，必须是 `/opt` 或 `/srv` 下的具体目录。
+- `REMOTE_APP_DIR`：默认 `/home/ubuntu/kovi-bot`，当前工作流要求使用此路径。
 - `KOVI_ALLOWED_FRIENDS`：可选，逗号分隔的好友 QQ 号；所有者会自动加入。
 - `KOVI_ALLOWED_GROUPS`：可选，逗号分隔的群号；留空即不处理群消息。
 - `MODEL_API_KEY_ENV`：`OPENAI_API_KEY`（默认）或 `BOT_API_TOKEN`。

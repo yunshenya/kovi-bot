@@ -5,26 +5,24 @@ After=network-online.target postgresql.service redis-server.service
 
 [Service]
 Type=simple
-User=kovi-bot
-Group=kovi-bot
-WorkingDirectory=/opt/kovi-bot/current
-EnvironmentFile=/opt/kovi-bot/current/.env
-ExecStartPre=/usr/bin/rm -f /opt/kovi-bot/runtime/ready
-ExecStart=/opt/kovi-bot/current/kovi-bot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/kovi-bot/current
+EnvironmentFile=/home/ubuntu/kovi-bot/current/.env
+ExecStartPre=/usr/bin/rm -f /home/ubuntu/kovi-bot/runtime/ready
+ExecStart=/home/ubuntu/kovi-bot/current/kovi-bot
 Restart=on-failure
 RestartSec=5
 TimeoutStartSec=120
-# Readiness must be group-readable by kovi-deploy; the shared group contains only
-# kovi-bot and kovi-deploy.
 UMask=0027
 
 NoNewPrivileges=true
 PrivateTmp=true
 PrivateDevices=true
 ProtectSystem=strict
-ProtectHome=true
-ReadOnlyPaths=/opt/kovi-bot/current /opt/kovi-bot/releases
-ReadWritePaths=/opt/kovi-bot/runtime
+ProtectHome=read-only
+ReadOnlyPaths=/home/ubuntu/kovi-bot/current /home/ubuntu/kovi-bot/releases
+ReadWritePaths=/home/ubuntu/kovi-bot/runtime
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectKernelLogs=true

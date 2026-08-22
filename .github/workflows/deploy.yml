@@ -16,9 +16,9 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
-  DEPLOY_USER: ${{ vars.DEPLOY_USER || 'kovi-deploy' }}
+  DEPLOY_USER: ${{ vars.DEPLOY_USER || 'ubuntu' }}
   DEPLOY_SSH_PORT: ${{ vars.DEPLOY_SSH_PORT || '22' }}
-  REMOTE_APP_DIR: ${{ vars.REMOTE_APP_DIR || '/opt/kovi-bot' }}
+  REMOTE_APP_DIR: ${{ vars.REMOTE_APP_DIR || '/home/ubuntu/kovi-bot' }}
   KOVI_MAIN_ADMIN: ${{ vars.KOVI_MAIN_ADMIN }}
   KOVI_ALLOWED_FRIENDS: ${{ vars.KOVI_ALLOWED_FRIENDS }}
   KOVI_ALLOWED_GROUPS: ${{ vars.KOVI_ALLOWED_GROUPS }}
@@ -81,9 +81,9 @@ jobs:
           set -euo pipefail
           test -n "$DEPLOY_HOST" || { echo "Missing repository secret DEPLOY_HOST"; exit 1; }
           [[ "$DEPLOY_HOST" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "DEPLOY_HOST must be a DNS name or IPv4 address"; exit 1; }
-          [[ "$DEPLOY_USER" == "kovi-deploy" ]] || { echo "DEPLOY_USER must be the dedicated kovi-deploy account"; exit 1; }
+          [[ "$DEPLOY_USER" == "ubuntu" ]] || { echo "DEPLOY_USER must be ubuntu"; exit 1; }
           [[ "$DEPLOY_SSH_PORT" =~ ^[0-9]+$ ]] && (( 10#$DEPLOY_SSH_PORT >= 1 && 10#$DEPLOY_SSH_PORT <= 65535 )) || { echo "Invalid DEPLOY_SSH_PORT"; exit 1; }
-          [[ "$REMOTE_APP_DIR" =~ ^/(opt|srv)/[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$ ]] || { echo "REMOTE_APP_DIR must be a concrete path below /opt or /srv"; exit 1; }
+          [[ "$REMOTE_APP_DIR" == "/home/ubuntu/kovi-bot" ]] || { echo "REMOTE_APP_DIR must be /home/ubuntu/kovi-bot"; exit 1; }
           [[ "$KOVI_MAIN_ADMIN" =~ ^[1-9][0-9]+$ ]] || { echo "Invalid or missing KOVI_MAIN_ADMIN"; exit 1; }
           [[ -z "$KOVI_ALLOWED_FRIENDS" || "$KOVI_ALLOWED_FRIENDS" =~ ^[1-9][0-9]*(,[1-9][0-9]*)*$ ]] || { echo "Invalid KOVI_ALLOWED_FRIENDS"; exit 1; }
           [[ -z "$KOVI_ALLOWED_GROUPS" || "$KOVI_ALLOWED_GROUPS" =~ ^[1-9][0-9]*(,[1-9][0-9]*)*$ ]] || { echo "Invalid KOVI_ALLOWED_GROUPS"; exit 1; }
@@ -252,25 +252,20 @@ jobs:
         run: |
           set -euo pipefail
           sshpass -e ssh -p "$DEPLOY_SSH_PORT" -o StrictHostKeyChecking=accept-new \
-            "$DEPLOY_USER@$DEPLOY_HOST" bash -s -- "$REMOTE_APP_DIR" <<'REMOTE'
+            "$DEPLOY_USER@$DEPLOY_HOST" bash -s -- "$REMOTE_APP_DIR" "$DEPLOY_USER" <<'REMOTE'
           set -euo pipefail
           app_dir="$1"
-          [[ "$app_dir" =~ ^/(opt|srv)/[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$ ]]
-          test "$(id -un)" = "kovi-deploy"
-          id -nG | tr ' ' '\n' | grep -Fqx 'kovi-bot' || {
-            echo "kovi-deploy must be a member of the kovi-bot shared group" >&2
-            exit 1
-          }
+          deploy_user="$2"
+          test "$app_dir" = "/home/ubuntu/kovi-bot"
+          test "$(id -un)" = "$deploy_user"
           test -d "$app_dir"
-          test "$(stat -c '%U:%G' "$app_dir")" = "kovi-deploy:kovi-bot"
+          test "$(stat -c '%U' "$app_dir")" = "$deploy_user"
           test -d "$app_dir/runtime"
-          test "$(stat -c '%U:%G' "$app_dir/runtime")" = "kovi-bot:kovi-bot"
-          test "$(stat -c '%a' "$app_dir/runtime")" = "770"
+          test "$(stat -c '%U' "$app_dir/runtime")" = "$deploy_user"
           test -r "$app_dir/runtime" && test -w "$app_dir/runtime" && test -x "$app_dir/runtime"
           umask 077
           install -d -m 700 "$app_dir/incoming"
           install -d -m 750 "$app_dir/releases"
-          chgrp kovi-bot "$app_dir/releases"
           chmod 750 "$app_dir" "$app_dir/releases"
           find "$app_dir/incoming" -mindepth 1 -maxdepth 1 -type f \
             -name '*.tar.gz' -mtime +1 -delete
@@ -293,13 +288,14 @@ jobs:
         run: |
           set -euo pipefail
           sshpass -e ssh -p "$DEPLOY_SSH_PORT" -o StrictHostKeyChecking=accept-new \
-            "$DEPLOY_USER@$DEPLOY_HOST" bash -s -- "$REMOTE_APP_DIR" "$DEPLOY_SHA" <<'REMOTE'
+            "$DEPLOY_USER@$DEPLOY_HOST" bash -s -- "$REMOTE_APP_DIR" "$DEPLOY_SHA" "$DEPLOY_USER" <<'REMOTE'
           set -euo pipefail
           app_dir="$1"
           revision="$2"
-          [[ "$app_dir" =~ ^/(opt|srv)/[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$ ]]
+          deploy_user="$3"
+          test "$app_dir" = "/home/ubuntu/kovi-bot"
           [[ "$revision" =~ ^[0-9a-f]{40}$ ]]
-          test "$(id -un)" = "kovi-deploy"
+          test "$(id -un)" = "$deploy_user"
 
           archive="$app_dir/incoming/$revision.tar.gz"
           releases_dir="$app_dir/releases"
@@ -329,7 +325,6 @@ jobs:
               "$releases_dir"/*) ;;
               *) echo "Refusing to change permissions outside releases" >&2; exit 1 ;;
             esac
-            chgrp -R kovi-bot "$target"
             find "$target" -type d -exec chmod 0750 {} +
             find "$target" -type f -exec chmod 0640 {} +
             chmod 0550 "$target/kovi-bot"
