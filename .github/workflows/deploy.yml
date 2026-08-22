@@ -103,7 +103,6 @@ jobs:
             test -n "$POSTGRES_PASSWORD" || { echo "Missing DATABASE_URL or POSTGRES_PASSWORD"; exit 1; }
           fi
           test -n "$NAPCAT_ACCESS_TOKEN" || { echo "Missing NAPCAT_ACCESS_TOKEN"; exit 1; }
-          [[ "$NAPCAT_ACCESS_TOKEN" =~ ^[A-Za-z0-9._~+/=-]{24,}$ ]] || { echo "NAPCAT_ACCESS_TOKEN must be at least 24 safe characters"; exit 1; }
           for value in "$OPENAI_API_KEY" "$BOT_API_TOKEN" "$DATABASE_URL"; do
             [[ "$value" != *[[:space:]]* ]] || { echo "A required secret contains whitespace"; exit 1; }
           done
@@ -220,7 +219,35 @@ jobs:
             printf '%s\n' '[server]'
             printf '%s\n' 'host = "127.0.0.1"'
             printf '%s\n' 'port = 3001'
-            printf 'access_token = "%s"\n' "$NAPCAT_ACCESS_TOKEN"
+            napcat_access_token_toml="$(python3 - <<'PY'
+            import os
+
+            value = os.environ["NAPCAT_ACCESS_TOKEN"]
+            escaped = []
+            for char in value:
+                code = ord(char)
+                if char == "\\":
+                    escaped.append("\\\\")
+                elif char == '"':
+                    escaped.append('\\"')
+                elif char == "\b":
+                    escaped.append("\\b")
+                elif char == "\t":
+                    escaped.append("\\t")
+                elif char == "\n":
+                    escaped.append("\\n")
+                elif char == "\f":
+                    escaped.append("\\f")
+                elif char == "\r":
+                    escaped.append("\\r")
+                elif code < 0x20 or 0x7f <= code <= 0x9f:
+                    escaped.append(f"\\u{code:04x}" if code <= 0xffff else f"\\U{code:08x}")
+                else:
+                    escaped.append(char)
+            print("".join(escaped), end="")
+            PY
+            )"
+            printf 'access_token = "%s"\n' "$napcat_access_token_toml"
             printf '%s\n' 'secure = false'
           } > "$release_dir/kovi.conf.toml"
 

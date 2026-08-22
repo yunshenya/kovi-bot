@@ -60,7 +60,8 @@ OneBot、数据库和 Redis 端口。
 reviewers。截图中的敏感配置放在仓库级 Actions Secrets：
 
 - `DEPLOY_HOST`、`DEPLOY_PASSWORD`。
-- `NAPCAT_ACCESS_TOKEN`、`OPENAI_API_KEY`、`BOT_API_TOKEN`。
+- `NAPCAT_ACCESS_TOKEN`、`OPENAI_API_KEY`、`BOT_API_TOKEN`。`NAPCAT_ACCESS_TOKEN` 只要求
+  非空，并且必须与 NapCat 配置完全一致。
 - `POSTGRES_PASSWORD`：工作流会生成本机 PostgreSQL 的连接串。
 - `KOVI_MAIN_ADMIN`：机器人所有者 QQ 号。
 - `MODEL_API_URL`、`MODEL_NAME`、`MODEL_SUPPORTS_VISION`、`MODEL_WIRE_API`。

@@ -15,6 +15,7 @@ use chrono_tz::Tz;
 use kovi::RuntimeBot;
 use kovi::tokio::time::sleep;
 use kovi::{Message, serde_json::Value};
+use serde::Deserialize;
 use sqlx_core::query::query;
 use sqlx_core::query_scalar::query_scalar;
 use sqlx_core::row::Row;
@@ -36,6 +37,29 @@ pub(crate) enum RepeatRule {
     None,
     Daily,
     Weekly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReminderKind {
+    Message,
+    NewsDigest,
+}
+
+impl ReminderKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Message => "message",
+            Self::NewsDigest => "news_digest",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "message" => Ok(Self::Message),
+            "news_digest" => Ok(Self::NewsDigest),
+            _ => Err(anyhow!("提醒保存了未知任务类型")),
+        }
+    }
 }
 
 impl RepeatRule {
@@ -61,15 +85,19 @@ impl RepeatRule {
 struct CreateReminderRequest {
     due_at: DateTime<Utc>,
     timezone: String,
+    kind: ReminderKind,
     message: String,
     repeat: RepeatRule,
+    payload: Value,
 }
 
 #[derive(Debug, Clone)]
 struct ClaimedReminder {
     id: i64,
     destination: MessageDestination,
+    kind: ReminderKind,
     message: String,
+    payload: Value,
     due_at: DateTime<Utc>,
     timezone: String,
     repeat: RepeatRule,
@@ -82,11 +110,20 @@ struct ReminderListItem {
     id: i64,
     destination: MessageDestination,
     creator_user_id: i64,
+    kind: ReminderKind,
     message: String,
+    payload: Value,
     due_at: DateTime<Utc>,
     timezone: String,
     repeat: RepeatRule,
     status: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NewsDigestSpec {
+    query: String,
+    max_items: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,7 +143,10 @@ pub(crate) async fn initialize_database() -> Result<()> {
             scope_type TEXT NOT NULL CHECK (scope_type IN ('private', 'group')),
             scope_id BIGINT NOT NULL,
             creator_user_id BIGINT NOT NULL,
+            kind TEXT NOT NULL DEFAULT 'message'
+                CHECK (kind IN ('message', 'news_digest')),
             message TEXT NOT NULL,
+            payload JSONB NOT NULL DEFAULT '{}'::jsonb,
             due_at TIMESTAMPTZ NOT NULL,
             timezone TEXT NOT NULL,
             repeat_kind TEXT NOT NULL DEFAULT 'none'
@@ -126,6 +166,19 @@ pub(crate) async fn initialize_database() -> Result<()> {
     .execute(pool)
     .await
     .map_err(|error| anyhow!("创建提醒任务表失败: {error}"))?;
+    // 兼容第一版提醒器已经创建的表，旧任务保持为普通文本提醒。
+    query(
+        "ALTER TABLE kovi_bot_reminders ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'message'",
+    )
+    .execute(pool)
+    .await
+    .map_err(|error| anyhow!("迁移提醒任务类型字段失败: {error}"))?;
+    query(
+        "ALTER TABLE kovi_bot_reminders ADD COLUMN IF NOT EXISTS payload JSONB NOT NULL DEFAULT '{}'::jsonb",
+    )
+    .execute(pool)
+    .await
+    .map_err(|error| anyhow!("迁移提醒任务参数字段失败: {error}"))?;
     query(
         "CREATE INDEX IF NOT EXISTS kovi_bot_reminders_due_idx ON kovi_bot_reminders (status, due_at, id)",
     )
@@ -169,17 +222,42 @@ pub(crate) async fn start_scheduler(bot: Arc<RuntimeBot>) {
 }
 
 async fn dispatch_due(bot: &RuntimeBot) -> Result<()> {
-    let claimed = claim_due(
-        Utc::now(),
-        CLAIM_BATCH_SIZE,
-        config::get().reminders().lease_secs(),
-    )
-    .await?;
+    let reminder_config = config::get().reminders().clone();
+    let claimed = claim_due(Utc::now(), CLAIM_BATCH_SIZE, reminder_config.lease_secs()).await?;
     for reminder in claimed {
         if !is_claim_current(&reminder).await? {
             continue;
         }
-        let content = format!("⏰ {}", reminder.message);
+        let execution_timeout = Duration::from_secs(reminder_config.lease_secs().saturating_sub(5));
+        let content_result =
+            match kovi::tokio::time::timeout(execution_timeout, build_delivery_content(&reminder))
+                .await
+            {
+                Err(_) => Err(anyhow!("提醒任务执行超过租约时间")),
+                Ok(result) => result,
+            };
+        let content = match content_result {
+            Ok(content) => content,
+            Err(error) => {
+                let outcome = fail_claim(
+                    &reminder,
+                    &format!("提醒任务执行失败: {error:?}"),
+                    reminder_config.max_attempts(),
+                )
+                .await?;
+                if outcome == DeliveryFailure::Failed {
+                    eprintln!(
+                        "[ERROR] 提醒任务执行失败并停止重试 (任务: {}): {error:?}",
+                        reminder.id
+                    );
+                }
+                continue;
+            }
+        };
+        // 搜索和摘要期间可能已经被用户取消，发送前必须再次确认租约仍归当前 worker。
+        if !is_claim_current(&reminder).await? {
+            continue;
+        }
         let destination = reminder.destination;
         let result = MessageTransport::new(bot)
             .send(destination, Message::from(content.clone()))
@@ -212,6 +290,52 @@ async fn dispatch_due(bot: &RuntimeBot) -> Result<()> {
         }
     }
     Ok(())
+}
+
+async fn build_delivery_content(reminder: &ClaimedReminder) -> Result<String> {
+    match reminder.kind {
+        ReminderKind::Message => Ok(format!("⏰ {}", reminder.message)),
+        ReminderKind::NewsDigest => build_news_digest(reminder).await,
+    }
+}
+
+async fn build_news_digest(reminder: &ClaimedReminder) -> Result<String> {
+    let spec: NewsDigestSpec = serde_json::from_value(reminder.payload.clone())
+        .map_err(|error| anyhow!("新闻任务参数无效: {error}"))?;
+    let reminder_config = config::get().reminders().clone();
+    if !reminder_config.news_digest_enabled() {
+        return Err(anyhow!("新闻摘要任务已被配置关闭"));
+    }
+    if spec.query.trim().is_empty() || spec.query.chars().count() > 300 {
+        return Err(anyhow!("新闻任务的搜索条件无效"));
+    }
+    if !(1..=reminder_config.news_max_items()).contains(&spec.max_items) {
+        return Err(anyhow!("新闻任务的来源数量超出配置上限"));
+    }
+    let timezone = reminder
+        .timezone
+        .parse::<Tz>()
+        .map_err(|_| anyhow!("新闻任务保存了未知时区"))?;
+    let local_date = Utc::now().with_timezone(&timezone).format("%Y-%m-%d");
+    let search_query = format!("{} {} 最新新闻", spec.query.trim(), local_date);
+    let search_results = crate::model::tool_access::search_web_for_scheduler(
+        &search_query,
+        spec.max_items,
+        config::get().tools().max_result_chars(),
+    )
+    .await?;
+    let summary = crate::model::utils::summarize_news_digest(
+        &spec.query,
+        &search_results,
+        reminder_config.news_max_output_chars(),
+    )
+    .await?;
+    let heading = if reminder.message.trim().is_empty() {
+        "早间新闻摘要".to_string()
+    } else {
+        reminder.message.clone()
+    };
+    Ok(format!("📰 {heading}\n{summary}"))
 }
 
 async fn maybe_cleanup_terminal_rows() {
@@ -274,7 +398,7 @@ pub(crate) async fn list_from_tool(
             destination_label,
             format_local_time(item.due_at, &item.timezone)?,
             repeat_label,
-            item.message,
+            list_item_description(&item)?,
             creator_label
         ));
         if item.status != "pending" {
@@ -324,19 +448,45 @@ fn parse_create_request(
             "after_seconds",
             "local_datetime",
             "timezone",
+            "kind",
+            "query",
+            "max_items",
             "message",
             "repeat",
         ],
     )?;
     let mode = required_string(arguments, "mode", 10)?;
-    let message = match arguments.get("message") {
-        Some(value) => normalize_message(
+    let kind = match arguments.get("kind") {
+        Some(value) => ReminderKind::parse(
+            value
+                .as_str()
+                .ok_or_else(|| anyhow!("参数 kind 必须是字符串"))?,
+        )?,
+        None => ReminderKind::Message,
+    };
+    if kind == ReminderKind::NewsDigest {
+        if !reminder_config.news_digest_enabled() {
+            return Err(anyhow!("新闻摘要提醒功能已关闭"));
+        }
+        if !config::get().tools().enabled() || !config::get().tools().web_search_enabled() {
+            return Err(anyhow!("新闻摘要提醒需要启用 tools.web_search_enabled"));
+        }
+    }
+    let message = match (kind, arguments.get("message")) {
+        (ReminderKind::Message, Some(value)) => normalize_message(
             value
                 .as_str()
                 .ok_or_else(|| anyhow!("参数 message 必须是字符串"))?,
             reminder_config.max_message_chars(),
         )?,
-        None => "时间到了，我来提醒你啦。".to_string(),
+        (ReminderKind::Message, None) => "时间到了，我来提醒你啦。".to_string(),
+        (ReminderKind::NewsDigest, Some(value)) => normalize_optional_message(
+            value
+                .as_str()
+                .ok_or_else(|| anyhow!("参数 message 必须是字符串"))?,
+            reminder_config.max_message_chars(),
+        )?,
+        (ReminderKind::NewsDigest, None) => String::new(),
     };
     let timezone_name = match arguments.get("timezone") {
         Some(value) => value
@@ -355,6 +505,28 @@ fn parse_create_request(
                 .ok_or_else(|| anyhow!("参数 repeat 必须是字符串"))?,
         )?,
         None => RepeatRule::None,
+    };
+    let payload = if kind == ReminderKind::NewsDigest {
+        let query = normalize_message(required_string(arguments, "query", 300)?.as_str(), 300)?;
+        let max_items = match arguments.get("max_items") {
+            Some(value) => value
+                .as_u64()
+                .ok_or_else(|| anyhow!("参数 max_items 必须是正整数"))?
+                as usize,
+            None => reminder_config.news_max_items(),
+        };
+        if !(1..=reminder_config.news_max_items()).contains(&max_items) {
+            return Err(anyhow!(
+                "参数 max_items 必须在 1 到 {} 之间",
+                reminder_config.news_max_items()
+            ));
+        }
+        serde_json::json!({
+            "query": query,
+            "max_items": max_items,
+        })
+    } else {
+        Value::Object(serde_json::Map::new())
     };
     let max_delay = ChronoDuration::days(reminder_config.max_delay_days() as i64);
     let due_at = match mode.as_str() {
@@ -395,8 +567,10 @@ fn parse_create_request(
     Ok(CreateReminderRequest {
         due_at,
         timezone: timezone_name.to_string(),
+        kind,
         message,
         repeat,
+        payload,
     })
 }
 
@@ -417,19 +591,50 @@ fn normalize_message(value: &str, max_chars: usize) -> Result<String> {
     Ok(normalized)
 }
 
+fn normalize_optional_message(value: &str, max_chars: usize) -> Result<String> {
+    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.chars().count() > max_chars {
+        return Err(anyhow!("参数 message 不能超过 {} 个字符", max_chars));
+    }
+    Ok(normalized)
+}
+
+fn list_item_description(item: &ReminderListItem) -> Result<String> {
+    match item.kind {
+        ReminderKind::Message => Ok(item.message.clone()),
+        ReminderKind::NewsDigest => {
+            let spec: NewsDigestSpec = serde_json::from_value(item.payload.clone())
+                .map_err(|error| anyhow!("新闻任务参数无效: {error}"))?;
+            Ok(format!(
+                "新闻摘要：{}（{} 条来源）",
+                spec.query, spec.max_items
+            ))
+        }
+    }
+}
+
 fn format_created_message(id: i64, request: &CreateReminderRequest) -> String {
     let repeat = match request.repeat {
         RepeatRule::None => "一次性",
         RepeatRule::Daily => "每天",
         RepeatRule::Weekly => "每周",
     };
-    format!(
-        "提醒已创建：#{}，{}，{}，内容：{}。",
-        id,
-        format_local_time(request.due_at, &request.timezone).unwrap_or_else(|_| "时间无效".into()),
-        repeat,
-        request.message
-    )
+    let time =
+        format_local_time(request.due_at, &request.timezone).unwrap_or_else(|_| "时间无效".into());
+    match request.kind {
+        ReminderKind::Message => format!(
+            "提醒已创建：#{}，{}，{}，内容：{}。",
+            id, time, repeat, request.message
+        ),
+        ReminderKind::NewsDigest => {
+            let spec: NewsDigestSpec = serde_json::from_value(request.payload.clone())
+                .expect("刚创建的新闻任务参数应有效");
+            format!(
+                "新闻摘要任务已创建：#{}，{}，{}，搜索：{}，来源数：{}。",
+                id, time, repeat, spec.query, spec.max_items
+            )
+        }
+    }
 }
 
 fn format_local_time(due_at: DateTime<Utc>, timezone_name: &str) -> Result<String> {
@@ -482,15 +687,17 @@ async fn create(
     let id = query_scalar::<Postgres, i64>(
         r#"
         INSERT INTO kovi_bot_reminders
-            (scope_type, scope_id, creator_user_id, message, due_at, timezone, repeat_kind)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
+            (scope_type, scope_id, creator_user_id, kind, message, payload, due_at, timezone, repeat_kind)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
         RETURNING id
         "#,
     )
     .bind(scope_type)
     .bind(scope_id)
     .bind(actor_user_id)
+    .bind(request.kind.as_str())
     .bind(&request.message)
+    .bind(&request.payload)
     .bind(request.due_at)
     .bind(&request.timezone)
     .bind(request.repeat.as_str())
@@ -505,8 +712,8 @@ async fn list(destination: MessageDestination) -> Result<Vec<ReminderListItem>> 
     let (scope_type, scope_id) = destination_values(destination);
     let rows = query(
         r#"
-        SELECT id, scope_type, scope_id, creator_user_id, message, due_at, timezone,
-               repeat_kind, status
+        SELECT id, scope_type, scope_id, creator_user_id, kind, message, payload,
+               due_at, timezone, repeat_kind, status
         FROM kovi_bot_reminders
         WHERE scope_type = $1 AND scope_id = $2 AND status IN ('pending', 'delivering')
         ORDER BY due_at ASC, id ASC
@@ -529,7 +736,7 @@ async fn cancel(destination: MessageDestination, actor_user_id: i64, id: i64) ->
         UPDATE kovi_bot_reminders
         SET status = 'cancelled', lease_token = NULL, lease_until = NULL, updated_at = NOW()
         WHERE id = $1 AND scope_type = $2 AND scope_id = $3
-          AND creator_user_id = $4 AND status = 'pending'
+          AND creator_user_id = $4 AND status IN ('pending', 'delivering')
         "#,
     )
     .bind(id)
@@ -551,7 +758,8 @@ async fn claim_due(
     let mut transaction = pool.begin().await?;
     let rows = query(
         r#"
-        SELECT id, scope_type, scope_id, message, due_at, timezone, repeat_kind, attempt_count
+        SELECT id, scope_type, scope_id, kind, message, payload, due_at, timezone,
+               repeat_kind, attempt_count
         FROM kovi_bot_reminders
         WHERE due_at <= $1
           AND (
@@ -591,7 +799,9 @@ async fn claim_due(
                 row.get::<String, _>("scope_type").as_str(),
                 row.get("scope_id"),
             )?,
+            kind: ReminderKind::parse(row.get::<String, _>("kind").as_str())?,
             message: row.get("message"),
+            payload: row.get("payload"),
             due_at: row.get("due_at"),
             timezone: row.get("timezone"),
             repeat: RepeatRule::parse(row.get::<String, _>("repeat_kind").as_str())?,
@@ -773,7 +983,9 @@ fn parse_list_item(row: PgRow) -> Result<ReminderListItem> {
             row.get("scope_id"),
         )?,
         creator_user_id: row.get("creator_user_id"),
+        kind: ReminderKind::parse(row.get::<String, _>("kind").as_str())?,
         message: row.get("message"),
+        payload: row.get("payload"),
         due_at: row.get("due_at"),
         timezone: row.get("timezone"),
         repeat: RepeatRule::parse(row.get::<String, _>("repeat_kind").as_str())?,
@@ -891,7 +1103,7 @@ mod tests {
     use super::{RepeatRule, next_occurrence, parse_create_request};
     use crate::config::ReminderConfig;
     use chrono::{Duration, TimeZone, Utc};
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     #[test]
     fn parses_relative_reminders_with_bounded_text() {
@@ -957,8 +1169,10 @@ mod tests {
                 let request = super::CreateReminderRequest {
                     due_at: Utc::now() - chrono::Duration::seconds(1),
                     timezone: ReminderConfig::default().default_timezone().to_string(),
+                    kind: super::ReminderKind::Message,
                     message: "并发领取测试".to_string(),
                     repeat: RepeatRule::None,
+                    payload: Value::Object(serde_json::Map::new()),
                 };
                 let id = super::create(
                     super::MessageDestination::Private(subject_id),

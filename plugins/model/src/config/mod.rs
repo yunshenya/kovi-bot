@@ -121,6 +121,13 @@ impl ModelConfig {
         self.traffic.validate()?;
         self.tools.validate()?;
         self.reminders.validate()?;
+        if self.reminders.news_digest_enabled()
+            && (!self.tools.enabled() || !self.tools.web_search_enabled())
+        {
+            return Err(anyhow::anyhow!(
+                "reminders.news_digest_enabled 需要同时启用 tools.enabled 和 tools.web_search_enabled"
+            ));
+        }
         self.vision.validate()?;
         if !self.vision.mcp_server().is_empty() && !self.tools.enabled() {
             return Err(anyhow::anyhow!(

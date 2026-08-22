@@ -25,6 +25,12 @@ pub struct ReminderConfig {
     max_attempts: u8,
     /// 单次任务领取租约时间（秒）。
     lease_secs: u64,
+    /// 是否允许创建到点执行的新闻摘要任务。
+    news_digest_enabled: bool,
+    /// 单条新闻摘要最多包含多少条来源。
+    news_max_items: usize,
+    /// 新闻摘要发送正文最大字符数。
+    news_max_output_chars: usize,
 }
 
 impl ReminderConfig {
@@ -66,6 +72,18 @@ impl ReminderConfig {
 
     pub fn lease_secs(&self) -> u64 {
         self.lease_secs
+    }
+
+    pub fn news_digest_enabled(&self) -> bool {
+        self.news_digest_enabled
+    }
+
+    pub fn news_max_items(&self) -> usize {
+        self.news_max_items
+    }
+
+    pub fn news_max_output_chars(&self) -> usize {
+        self.news_max_output_chars
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
@@ -112,6 +130,16 @@ impl ReminderConfig {
                 "reminders.lease_secs 必须在 10 到 600 秒之间"
             ));
         }
+        if self.news_max_items == 0 || self.news_max_items > 10 {
+            return Err(anyhow::anyhow!(
+                "reminders.news_max_items 必须在 1 到 10 之间"
+            ));
+        }
+        if self.news_max_output_chars < 500 || self.news_max_output_chars > 8_000 {
+            return Err(anyhow::anyhow!(
+                "reminders.news_max_output_chars 必须在 500 到 8000 之间"
+            ));
+        }
         Ok(())
     }
 }
@@ -129,6 +157,9 @@ impl Default for ReminderConfig {
             max_message_chars: 500,
             max_attempts: 3,
             lease_secs: 60,
+            news_digest_enabled: true,
+            news_max_items: 5,
+            news_max_output_chars: 4_000,
         }
     }
 }

@@ -109,6 +109,9 @@ default_timezone = "Asia/Shanghai"
 max_message_chars = 500
 max_attempts = 3
 lease_secs = 60
+news_digest_enabled = true
+news_max_items = 5
+news_max_output_chars = 4000
 
 [vision]
 provider = "auto"

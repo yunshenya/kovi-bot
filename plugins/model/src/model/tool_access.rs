@@ -198,7 +198,7 @@ pub(crate) async fn initialize() -> Result<()> {
     if config::get().reminders().enabled() {
         definitions.push(ToolDefinition {
             name: "reminder.create".to_string(),
-            description: "创建一个发送到当前私聊或当前群的持久化提醒。必须把时间转换为结构化参数：相对时间使用 after_seconds，绝对时间使用 local_datetime 和 IANA timezone；用户说早上、中午、晚上而没有更精确时间时，可分别按 08:00、12:00、20:00 理解，并在最终回复中确认。不确定语境时先向用户确认。message 只写到时要发送的提醒正文，不要写解释。支持一次性、每天或每周提醒。".to_string(),
+            description: "创建一个发送到当前私聊或当前群的持久化任务。普通提醒 kind=message；如果用户要求到时搜索新闻并整理发送，使用 kind=news_digest，并提供 query。必须把时间转换为结构化参数：相对时间使用 after_seconds，绝对时间使用 local_datetime 和 IANA timezone；用户说早上、中午、晚上而没有更精确时间时，可分别按 08:00、12:00、20:00 理解，并在最终回复中确认。不确定语境时先向用户确认。message 只写到时发送的普通提醒正文，新闻任务可省略。支持一次性、每天或每周任务。".to_string(),
             input_schema: json!({
                 "type": "object",
                 "required": ["mode"],
@@ -213,7 +213,10 @@ pub(crate) async fn initialize() -> Result<()> {
                         "type": "string",
                         "description": "IANA 时区，例如 Asia/Shanghai；省略时使用 Asia/Shanghai。"
                     },
-                    "message": {"type": "string", "description": "到时发送的简短提醒正文；省略时使用默认提醒语。"},
+                    "kind": {"type": "string", "enum": ["message", "news_digest"], "description": "普通提醒或到时搜索并整理新闻。"},
+                    "query": {"type": "string", "description": "新闻任务的搜索条件，例如 早间新闻、科技新闻；kind=news_digest 时必填。"},
+                    "max_items": {"type": "integer", "minimum": 1, "maximum": 10, "description": "新闻摘要最多引用的来源数。"},
+                    "message": {"type": "string", "description": "普通提醒到时发送的正文；新闻任务可作为标题前缀，省略即可。"},
                     "repeat": {"type": "string", "enum": ["none", "daily", "weekly"]}
                 },
                 "additionalProperties": false
@@ -650,6 +653,24 @@ async fn search_web(arguments: &Map<String, Value>, max_result_chars: usize) -> 
                 })
         }
     }
+}
+
+/// 调度器使用的受限网页搜索入口。它复用聊天工具的 SSRF、重定向和响应大小边界，
+/// 但不依赖当前会话的模型工具调用上下文。
+pub(crate) async fn search_web_for_scheduler(
+    query: &str,
+    limit: usize,
+    max_result_chars: usize,
+) -> Result<String> {
+    if !config::get().tools().enabled() || !config::get().tools().web_search_enabled() {
+        return Err(anyhow!("网页搜索工具未启用"));
+    }
+    let arguments = serde_json::from_value(json!({
+        "query": query,
+        "limit": limit,
+    }))
+    .map_err(|error| anyhow!("新闻搜索参数无法构造: {error}"))?;
+    search_web(&arguments, max_result_chars).await
 }
 
 async fn search_brave(
