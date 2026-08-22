@@ -678,6 +678,19 @@ impl MemoryManager {
         Ok(())
     }
 
+    /// 跨进程串行化同一档案的读改写；仅依赖 PostgreSQL 内置 advisory lock。
+    async fn lock_profile_entity(
+        transaction: &mut Transaction<'_, Postgres>,
+        kind: &str,
+        entity_id: i64,
+    ) -> Result<()> {
+        query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(format!("{kind}:{entity_id}"))
+            .execute(&mut **transaction)
+            .await?;
+        Ok(())
+    }
+
     async fn upsert_group_profile(
         transaction: &mut Transaction<'_, Postgres>,
         profile: &GroupProfile,
@@ -1218,19 +1231,30 @@ impl MemoryManager {
         F: FnOnce(Option<UserProfile>) -> UserProfile,
     {
         let _save_guard = self.save_lock.lock().await;
-        let current = self.user_profiles.lock().await.get(&user_id).cloned();
-        let mut next = mutate(current);
-        next.user_id = user_id;
 
-        if let Some(pool) = self.database_pool.get() {
+        let next = if let Some(pool) = self.database_pool.get() {
             let mut transaction = pool.begin().await?;
+            Self::lock_profile_entity(&mut transaction, "user", user_id).await?;
+            let current =
+                query("SELECT payload FROM kovi_bot_user_profiles WHERE user_id = $1 FOR UPDATE")
+                    .bind(user_id)
+                    .fetch_optional(&mut *transaction)
+                    .await?
+                    .map(|row| serde_json::from_value(row.get::<serde_json::Value, _>("payload")))
+                    .transpose()?;
+            let mut next = mutate(current);
+            next.user_id = user_id;
             Self::upsert_user_profile(&mut transaction, &next).await?;
             transaction.commit().await?;
             self.user_profiles
                 .lock()
                 .await
                 .insert(user_id, next.clone());
+            next
         } else {
+            let current = self.user_profiles.lock().await.get(&user_id).cloned();
+            let mut next = mutate(current);
+            next.user_id = user_id;
             let mut data = self.snapshot().await;
             data.user_profiles.insert(user_id, next.clone());
             self.persist_file_snapshot_locked(&data).await?;
@@ -1238,7 +1262,8 @@ impl MemoryManager {
                 .lock()
                 .await
                 .insert(user_id, next.clone());
-        }
+            next
+        };
         Ok(next)
     }
 
@@ -1262,19 +1287,30 @@ impl MemoryManager {
         F: FnOnce(Option<GroupProfile>) -> GroupProfile,
     {
         let _save_guard = self.save_lock.lock().await;
-        let current = self.group_profiles.lock().await.get(&group_id).cloned();
-        let mut next = mutate(current);
-        next.group_id = group_id;
 
-        if let Some(pool) = self.database_pool.get() {
+        let next = if let Some(pool) = self.database_pool.get() {
             let mut transaction = pool.begin().await?;
+            Self::lock_profile_entity(&mut transaction, "group", group_id).await?;
+            let current =
+                query("SELECT payload FROM kovi_bot_group_profiles WHERE group_id = $1 FOR UPDATE")
+                    .bind(group_id)
+                    .fetch_optional(&mut *transaction)
+                    .await?
+                    .map(|row| serde_json::from_value(row.get::<serde_json::Value, _>("payload")))
+                    .transpose()?;
+            let mut next = mutate(current);
+            next.group_id = group_id;
             Self::upsert_group_profile(&mut transaction, &next).await?;
             transaction.commit().await?;
             self.group_profiles
                 .lock()
                 .await
                 .insert(group_id, next.clone());
+            next
         } else {
+            let current = self.group_profiles.lock().await.get(&group_id).cloned();
+            let mut next = mutate(current);
+            next.group_id = group_id;
             let mut data = self.snapshot().await;
             data.group_profiles.insert(group_id, next.clone());
             self.persist_file_snapshot_locked(&data).await?;
@@ -1282,7 +1318,8 @@ impl MemoryManager {
                 .lock()
                 .await
                 .insert(group_id, next.clone());
-        }
+            next
+        };
         Ok(next)
     }
 

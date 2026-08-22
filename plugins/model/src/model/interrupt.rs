@@ -68,6 +68,7 @@ pub(crate) async fn interrupt_if_current(ticket: ReplyTicket) -> bool {
 /// 在一轮回复正常完成后，原子领取同一会话的下一轮处理权。
 /// 只有完成的 ticket 仍是当前代数且没有活跃回复时才能领取，因此旧 drainer
 /// 不能覆盖已经在预处理的新消息，多个 drainer 也不能互相抢占。
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn claim_follow_up(completed: ReplyTicket) -> Option<ReplyTicket> {
     let mut states = REPLY_STATES.lock().await;
     let state = states.get_mut(&completed.scope)?;

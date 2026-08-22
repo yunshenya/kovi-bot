@@ -197,12 +197,11 @@ where
                 batch.parts.last().map(String::as_str).unwrap_or_default(),
                 policy,
             );
-            let delay = if reached_capacity {
+            if reached_capacity {
                 Duration::ZERO
             } else {
                 semantic_delay.min(remaining)
-            };
-            delay
+            }
         };
         if !delay.is_zero() {
             kovi::tokio::time::sleep(delay).await;

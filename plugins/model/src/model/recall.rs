@@ -142,12 +142,44 @@ pub(crate) async fn record_bot_message(
         }
     };
     if let Some(recorded_content) = recorded_content {
+        if !is_current(ticket).await {
+            discard_stale_bot_message(scope, ticket, message_id, bot).await;
+            return false;
+        }
         persist_redis_bot_message(scope, message_id, &recorded_content).await;
+        if !is_current(ticket).await {
+            discard_stale_bot_message(scope, ticket, message_id, bot).await;
+            return false;
+        }
         true
     } else {
         bot.delete_msg(message_id);
         false
     }
+}
+
+async fn discard_stale_bot_message(
+    scope: ReplyScope,
+    ticket: ReplyTicket,
+    message_id: i32,
+    bot: &RuntimeBot,
+) {
+    {
+        let mut lifecycles = REPLY_LIFECYCLES.lock().await;
+        if let Some(lifecycle) = lifecycles.get_mut(&scope) {
+            if let Some(active) = lifecycle.active.as_mut()
+                && active.ticket == ticket
+            {
+                active
+                    .sent_message_ids
+                    .retain(|candidate| *candidate != message_id);
+            }
+            remove_bot_messages(lifecycle, &[message_id]);
+            lifecycle.last_seen = Instant::now();
+        }
+    }
+    remove_redis_bot_messages(scope, &[message_id]).await;
+    bot.delete_msg(message_id);
 }
 
 /// 记录不属于某轮被动回复的消息，例如主动聊天和命令反馈。
