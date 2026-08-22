@@ -116,7 +116,7 @@ max_delay_days = 365
 default_timezone = "Asia/Shanghai"
 max_message_chars = 500
 max_attempts = 3
-lease_secs = 60
+lease_secs = 180
 max_task_instruction_chars = 2000
 max_task_output_chars = 4000
 

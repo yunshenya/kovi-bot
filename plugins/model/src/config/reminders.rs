@@ -150,7 +150,9 @@ impl Default for ReminderConfig {
             default_timezone: "Asia/Shanghai".to_string(),
             max_message_chars: 500,
             max_attempts: 3,
-            lease_secs: 60,
+            // Leave enough room for a model request plus provider retries;
+            // the scheduler also renews this lease while work is running.
+            lease_secs: 180,
             max_task_instruction_chars: 2_000,
             max_task_output_chars: 4_000,
         }

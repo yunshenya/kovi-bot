@@ -67,6 +67,9 @@ pub(crate) struct ToolExecutionContext {
     pub(crate) scheduled: bool,
     /// 用户明确提出创建定时任务时，普通确认文本不能绕过 reminder.create。
     pub(crate) requires_reminder_create: bool,
+    /// 定时任务指令依赖外部资料时，必须至少成功执行一个只读外部工具，
+    /// 否则调度器会把本次执行视为失败并安排重试，而不是发送未经核实的兜底文本。
+    pub(crate) requires_external_tool: bool,
 }
 
 pub(crate) struct ToolExecutionResult {
@@ -701,24 +704,53 @@ async fn search_web(arguments: &Map<String, Value>, max_result_chars: usize) -> 
         None => 5,
     };
     let limit = requested_limit.min(config::get().tools().web_search_max_results());
+    println!(
+        "[INFO] web.search 开始 (查询字符数: {}, limit: {})",
+        query.chars().count(),
+        limit
+    );
     if let Ok(token) = std::env::var("BRAVE_SEARCH_API_KEY")
         && !token.trim().is_empty()
     {
         match search_brave(&query, limit, max_result_chars, &token).await {
-            Ok(result) => return Ok(result),
+            Ok(result) => {
+                println!(
+                    "[INFO] web.search 成功 (来源: Brave, 结果字符数: {})",
+                    result.chars().count()
+                );
+                return Ok(result);
+            }
             Err(error) => eprintln!("[WARN] Brave Search 不可用，尝试网页搜索兜底: {error}"),
         }
     }
 
     match search_bing(&query, limit, max_result_chars).await {
-        Ok(result) => Ok(result),
+        Ok(result) => {
+            println!(
+                "[INFO] web.search 成功 (来源: Bing, 结果字符数: {})",
+                result.chars().count()
+            );
+            Ok(result)
+        }
         Err(bing_error) => {
             eprintln!("[WARN] Bing 搜索不可用，尝试 DuckDuckGo: {bing_error}");
-            search_duckduckgo(&query, limit, max_result_chars)
-                .await
-                .map_err(|duck_error| {
-                    anyhow!("网页搜索源均不可用；Bing: {bing_error}; DuckDuckGo: {duck_error}")
-                })
+            match search_duckduckgo(&query, limit, max_result_chars).await {
+                Ok(result) => {
+                    println!(
+                        "[INFO] web.search 成功 (来源: DuckDuckGo, 结果字符数: {})",
+                        result.chars().count()
+                    );
+                    Ok(result)
+                }
+                Err(duck_error) => {
+                    eprintln!(
+                        "[ERROR] web.search 全部来源失败 (Bing: {bing_error}; DuckDuckGo: {duck_error})"
+                    );
+                    Err(anyhow!(
+                        "网页搜索源均不可用；Bing: {bing_error}; DuckDuckGo: {duck_error}"
+                    ))
+                }
+            }
         }
     }
 }

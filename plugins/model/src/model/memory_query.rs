@@ -70,6 +70,16 @@ pub(crate) async fn params_model_with_tool_access(
     progress: Option<Arc<ThinkingReporter>>,
 ) -> BotMemory {
     let Some(registry) = tool_registry() else {
+        if tool_context.requires_external_tool {
+            eprintln!(
+                "[WARN] 定时任务请求未执行：外部查询工具注册表不可用 (范围: {}:{})",
+                tool_context.context, tool_context.subject_id
+            );
+            return BotMemory {
+                role: Roles::Assistant,
+                content: crate::reminders::SCHEDULED_EXTERNAL_TOOL_FAILURE.to_string(),
+            };
+        }
         if tool_context.requires_reminder_create {
             eprintln!(
                 "[WARN] 定时任务请求未执行：模型工具注册表不可用 (范围: {}:{})",
@@ -110,6 +120,7 @@ pub(crate) async fn params_model_with_tool_access(
     };
     let max_memory_rounds = model_config.memory().autonomous_query_max_rounds();
     let mut memory_rounds = 0;
+    let mut external_tool_succeeded = !tool_context.requires_external_tool;
     let mut reminder_tool_succeeded = false;
     let mut reminder_failure = ReminderCreateFailure::NotCalled;
     let mut reminder_failure_detail = None;
@@ -126,8 +137,24 @@ pub(crate) async fn params_model_with_tool_access(
         else {
             return interrupted_response();
         };
-        match parse_tool_call_with_wrapping(&response.content, round == 0) {
+        // Providers sometimes add a short preamble or Markdown around a tool
+        // call. Keep the same tolerant-but-structured parser for every retry
+        // round; switching back to strict mode on round two turns recoverable
+        // protocol noise into a false task failure.
+        match parse_tool_call_with_wrapping(&response.content, true) {
             ParsedToolCall::None => {
+                if tool_context.requires_external_tool && !external_tool_succeeded {
+                    eprintln!(
+                        "[WARN] 定时任务未成功执行外部查询工具，拒绝发送未经核实的结果 (范围: {}:{}, 轮次: {})",
+                        tool_context.context,
+                        tool_context.subject_id,
+                        round + 1
+                    );
+                    return BotMemory {
+                        role: Roles::Assistant,
+                        content: crate::reminders::SCHEDULED_EXTERNAL_TOOL_FAILURE.to_string(),
+                    };
+                }
                 if should_retry_reminder_create(
                     tool_context.requires_reminder_create,
                     reminder_tool_succeeded,
@@ -161,11 +188,14 @@ pub(crate) async fn params_model_with_tool_access(
                     reminder_failure_detail = Some(reason.clone());
                 }
                 eprintln!(
-                    "[WARN] 模型工具调用格式无效 (范围: {}:{}, 轮次: {}, 原因: {})",
+                    "[WARN] 模型工具调用格式无效 (范围: {}:{}, 轮次: {}, 原因: {}, 响应字符数: {}, 开始标记: {}, 结束标记: {})",
                     tool_context.context,
                     tool_context.subject_id,
                     round + 1,
-                    reason
+                    reason,
+                    response.content.chars().count(),
+                    response.content.matches(TOOL_CALL_START).count(),
+                    response.content.matches(TOOL_CALL_END).count()
                 );
                 request.push(response);
                 request.push(BotMemory {
@@ -193,6 +223,9 @@ pub(crate) async fn params_model_with_tool_access(
                         .execute(&call.name, call.arguments, tool_context, reply_ticket)
                         .await
                 };
+                if result.succeeded && is_external_tool_name(&tool_name) {
+                    external_tool_succeeded = true;
+                }
                 if tool_name == "reminder.create" {
                     reminder_tool_succeeded = result.succeeded;
                     if reminder_tool_succeeded {
@@ -252,6 +285,17 @@ pub(crate) async fn params_model_with_tool_access(
         return reminder_failure_response(reminder_failure, reminder_failure_detail.as_deref());
     }
 
+    if tool_context.requires_external_tool && !external_tool_succeeded {
+        eprintln!(
+            "[WARN] 定时任务工具调用轮次耗尽，未获得成功的外部资料 (范围: {}:{})",
+            tool_context.context, tool_context.subject_id
+        );
+        return BotMemory {
+            role: Roles::Assistant,
+            content: crate::reminders::SCHEDULED_EXTERNAL_TOOL_FAILURE.to_string(),
+        };
+    }
+
     request.push(BotMemory {
         role: Roles::System,
         content: "本轮工具调用次数已用完。请使用已有结果直接回答，不要再输出工具调用标记。"
@@ -279,6 +323,10 @@ pub(crate) async fn params_model_with_tool_access(
             content: "我暂时没能把外部资料查完整……你可以换个说法再问我一次。".to_string(),
         }
     }
+}
+
+fn is_external_tool_name(name: &str) -> bool {
+    matches!(name, "web.search" | "web.fetch") || name.starts_with("mcp.")
 }
 
 fn should_retry_reminder_create(
@@ -431,13 +479,29 @@ fn parse_tool_call_with_wrapping(content: &str, allow_wrapping: bool) -> ParsedT
     let Some(start) = content.find(TOOL_CALL_START) else {
         return ParsedToolCall::Invalid("工具调用缺少开始标记".to_string());
     };
+    let before = &content[..start];
+    if before.contains(TOOL_CALL_START) || before.contains(TOOL_CALL_END) {
+        return ParsedToolCall::Invalid("工具调用标记必须唯一且成对".to_string());
+    }
     let json_start = start + TOOL_CALL_START.len();
     let Some(end_offset) = content[json_start..].find(TOOL_CALL_END) else {
-        return ParsedToolCall::Invalid("工具调用缺少结束标记".to_string());
+        // A few providers omit the closing marker while still returning a
+        // complete JSON object. Recover only that bounded case; truncated JSON
+        // and any trailing prose remain invalid and will be retried safely.
+        if content[json_start..].contains(TOOL_CALL_START) {
+            return ParsedToolCall::Invalid("工具调用标记必须唯一且成对".to_string());
+        }
+        let json = content[json_start..].trim();
+        return match parse_tool_call_json(json) {
+            ParsedToolCall::Call(call) => ParsedToolCall::Call(call),
+            ParsedToolCall::None => ParsedToolCall::Invalid("工具调用缺少结束标记".to_string()),
+            ParsedToolCall::Invalid(_) => {
+                ParsedToolCall::Invalid("工具调用缺少结束标记或 JSON 不完整".to_string())
+            }
+        };
     };
     let end = json_start + end_offset;
     let trailing_start = end + TOOL_CALL_END.len();
-    let before = &content[..start];
     let after = &content[trailing_start..];
     if before.contains(TOOL_CALL_START)
         || before.contains(TOOL_CALL_END)
@@ -530,6 +594,24 @@ mod tests {
         assert!(matches!(
             parse_tool_call_with_wrapping(
                 r#"[[TOOL_CALL]]{"name":"time.now","sql":"DROP TABLE"}[[/TOOL_CALL]]"#,
+                true,
+            ),
+            ParsedToolCall::Invalid(_)
+        ));
+    }
+
+    #[test]
+    fn recovers_complete_json_without_closing_marker() {
+        let ParsedToolCall::Call(call) = parse_tool_call_with_wrapping(
+            r#"[[TOOL_CALL]]{"name":"time.now","arguments":{}}"#,
+            true,
+        ) else {
+            panic!("完整 JSON 即使缺少结束标记也应可恢复");
+        };
+        assert_eq!(call.name, "time.now");
+        assert!(matches!(
+            parse_tool_call_with_wrapping(
+                "[[TOOL_CALL]]{\"name\":\"time.now\",\"arguments\":{\"timezone\":\"",
                 true,
             ),
             ParsedToolCall::Invalid(_)

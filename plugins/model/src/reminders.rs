@@ -41,6 +41,8 @@ pub(crate) enum ReminderToolFailureKind {
     Database,
 }
 
+pub(crate) const SCHEDULED_EXTERNAL_TOOL_FAILURE: &str = "[scheduled_task_external_tool_failure]";
+
 #[derive(Debug)]
 struct ReminderToolError {
     kind: ReminderToolFailureKind,
@@ -254,14 +256,8 @@ async fn dispatch_due(bot: &RuntimeBot) -> Result<()> {
         if !is_claim_current(&reminder).await? {
             continue;
         }
-        let execution_timeout = Duration::from_secs(reminder_config.lease_secs().saturating_sub(5));
         let content_result =
-            match kovi::tokio::time::timeout(execution_timeout, build_delivery_content(&reminder))
-                .await
-            {
-                Err(_) => Err(anyhow!("提醒任务执行超过租约时间")),
-                Ok(result) => result,
-            };
+            build_delivery_content_with_lease(&reminder, reminder_config.lease_secs()).await;
         let content = match content_result {
             Ok(content) => content,
             Err(error) => {
@@ -325,6 +321,69 @@ async fn dispatch_due(bot: &RuntimeBot) -> Result<()> {
     Ok(())
 }
 
+/// 在模型或外部查询运行期间持续延长当前 worker 的租约。
+///
+/// 模型请求可能跨过默认的 60 秒租约；如果租约不续期，下一次调度扫描会把同一
+/// 任务重新领取，导致重复搜索、重复发送甚至让旧 worker 的结果被判定为过期。
+async fn build_delivery_content_with_lease(
+    reminder: &ClaimedReminder,
+    lease_secs: u64,
+) -> Result<String> {
+    let heartbeat = kovi::tokio::spawn(maintain_claim_lease(reminder.clone(), lease_secs));
+    // The heartbeat keeps the claim exclusive while the model performs several
+    // requests, so the hard timeout can safely cover more than one lease.
+    let execution_timeout =
+        Duration::from_secs(lease_secs.saturating_mul(3).saturating_sub(5).max(60));
+    let content_result =
+        kovi::tokio::time::timeout(execution_timeout, build_delivery_content(reminder)).await;
+
+    // 无论内容生成成功、失败还是超时，都先停止心跳，避免任务结束后继续更新数据库。
+    heartbeat.abort();
+    if let Err(error) = heartbeat.await
+        && !error.is_cancelled()
+    {
+        eprintln!(
+            "[WARN] 提醒任务租约心跳停止异常 (任务: {}): {error}",
+            reminder.id
+        );
+    }
+
+    match content_result {
+        Err(_) => Err(anyhow!("提醒任务执行超过租约时间")),
+        Ok(result) => result,
+    }
+}
+
+async fn maintain_claim_lease(reminder: ClaimedReminder, lease_secs: u64) {
+    let interval = Duration::from_secs(lease_heartbeat_interval_secs(lease_secs));
+    loop {
+        sleep(interval).await;
+        match renew_claim(&reminder, lease_secs).await {
+            Ok(true) => println!(
+                "[INFO] 提醒任务租约已续期 (任务: {}, 租约: {} 秒)",
+                reminder.id, lease_secs
+            ),
+            Ok(false) => {
+                eprintln!(
+                    "[WARN] 提醒任务租约已被其他 worker 接管 (任务: {})",
+                    reminder.id
+                );
+                break;
+            }
+            Err(error) => {
+                eprintln!(
+                    "[WARN] 提醒任务租约续期失败 (任务: {}): {error}",
+                    reminder.id
+                );
+            }
+        }
+    }
+}
+
+fn lease_heartbeat_interval_secs(lease_secs: u64) -> u64 {
+    (lease_secs / 3).clamp(1, 60)
+}
+
 async fn build_delivery_content(reminder: &ClaimedReminder) -> Result<String> {
     match reminder.kind {
         ReminderKind::Message => Ok(reminder.message.clone()),
@@ -362,6 +421,7 @@ async fn build_generic_task(reminder: &ClaimedReminder) -> Result<String> {
             destination: reminder.destination,
             scheduled: true,
             requires_reminder_create: false,
+            requires_external_tool: task_requires_external_tool(&instruction),
         },
         ticket,
         Some(1_200),
@@ -372,6 +432,9 @@ async fn build_generic_task(reminder: &ClaimedReminder) -> Result<String> {
     crate::model::finish(ticket).await;
     if crate::model::utils::is_model_error_response(&response.content) {
         return Err(anyhow!("定时任务模型调用失败: {}", response.content));
+    }
+    if response.content == SCHEDULED_EXTERNAL_TOOL_FAILURE {
+        return Err(anyhow!("定时任务未成功获取所需的外部资料"));
     }
     let output = crate::model::utils::sanitize_scheduled_output(
         &response.content,
@@ -386,6 +449,32 @@ async fn build_generic_task(reminder: &ClaimedReminder) -> Result<String> {
         &content,
         config::get().reminders().max_task_output_chars(),
     ))
+}
+
+fn task_requires_external_tool(instruction: &str) -> bool {
+    [
+        "新闻",
+        "资讯",
+        "天气",
+        "最新",
+        "今日",
+        "实时",
+        "搜索",
+        "查询",
+        "网页",
+        "互联网",
+        "在线",
+        "价格",
+        "汇率",
+        "股价",
+        "比赛",
+        "赛事",
+        "航班",
+        "路况",
+        "日程",
+    ]
+    .iter()
+    .any(|keyword| instruction.contains(keyword))
 }
 
 async fn maybe_cleanup_terminal_rows() {
@@ -973,6 +1062,24 @@ async fn is_claim_current(reminder: &ClaimedReminder) -> Result<bool> {
     Ok(current)
 }
 
+async fn renew_claim(reminder: &ClaimedReminder, lease_secs: u64) -> Result<bool> {
+    let pool = database_pool()?;
+    let lease_until = Utc::now() + ChronoDuration::seconds(lease_secs as i64);
+    let result = query(
+        r#"
+        UPDATE kovi_bot_reminders
+        SET lease_until = $3, updated_at = $3
+        WHERE id = $1 AND status = 'delivering' AND lease_token = $2
+        "#,
+    )
+    .bind(reminder.id)
+    .bind(&reminder.lease_token)
+    .bind(lease_until)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
 async fn complete_claim(reminder: &ClaimedReminder) -> Result<bool> {
     let pool = database_pool()?;
     let now = Utc::now();
@@ -1275,12 +1382,28 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ReminderToolFailureKind, RepeatRule, classify_tool_error, next_occurrence,
-        next_occurrence_after, parse_create_request, reminder_tool_error,
+        ReminderToolFailureKind, RepeatRule, classify_tool_error, lease_heartbeat_interval_secs,
+        next_occurrence, next_occurrence_after, parse_create_request, reminder_tool_error,
+        task_requires_external_tool,
     };
     use crate::config::ReminderConfig;
     use chrono::{Duration, TimeZone, Utc};
     use serde_json::{Value, json};
+
+    #[test]
+    fn lease_heartbeat_interval_stays_well_inside_the_lease() {
+        assert_eq!(lease_heartbeat_interval_secs(10), 3);
+        assert_eq!(lease_heartbeat_interval_secs(60), 20);
+        assert_eq!(lease_heartbeat_interval_secs(180), 60);
+        assert_eq!(lease_heartbeat_interval_secs(600), 60);
+    }
+
+    #[test]
+    fn external_data_tasks_are_detected_without_marking_memory_lookup() {
+        assert!(task_requires_external_tool("搜索今天的新闻"));
+        assert!(task_requires_external_tool("三分钟后查询最新天气"));
+        assert!(!task_requires_external_tool("整理我之前说过的记忆"));
+    }
 
     #[test]
     fn parses_relative_reminders_with_bounded_text() {
