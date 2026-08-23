@@ -21,9 +21,11 @@ use crate::redis_store;
 use crate::reminders;
 use crate::sticker_memory;
 use crate::sticker_memory::{
-    StickerScope, extract_stickers, has_reply, has_usage, known_labels, quoted_message_context,
-    stickers_for_teaching, teach, teaching_label, with_quoted_context, with_sticker_context,
-    with_sticker_reaction_context, with_unknown_sticker_context,
+    StickerCandidateCommand, StickerScope, confirm_candidate, dismiss_candidate, extract_stickers,
+    format_candidate_list, has_reply, has_usage, known_labels, parse_candidate_command,
+    pending_candidates, quoted_message_context, stickers_for_teaching, teach, teaching_label,
+    with_quoted_context, with_sticker_context, with_sticker_reaction_context,
+    with_unknown_sticker_context,
 };
 use crate::vision::{
     ImageRequestScope, VisionImage, clear_group_pending_image_requests,
@@ -258,6 +260,67 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
             return;
         }
         _ => {}
+    }
+    if let Some(command) = parse_candidate_command(message) {
+        let reply = match command {
+            StickerCandidateCommand::List => match pending_candidates(Some(sticker_scope), 8).await
+            {
+                Ok(candidates) => format_candidate_list(&candidates),
+                Err(error) => {
+                    eprintln!("[ERROR] 读取群聊表情包候选失败: {}", error);
+                    "暂时读取不到待确认表情候选，请稍后再试。".to_string()
+                }
+            },
+            StickerCandidateCommand::Confirm {
+                candidate_id,
+                label,
+            } => match confirm_candidate(candidate_id, &label, event.user_id, Some(sticker_scope))
+                .await
+            {
+                Ok(true) => format!("已确认候选 {}，以后这个表情表示“{}”。", candidate_id, label),
+                Ok(false) => "找不到这个待确认候选，可能已经处理过或不属于本群。".to_string(),
+                Err(error) => {
+                    eprintln!("[ERROR] 确认群聊表情包候选失败: {}", error);
+                    "这次没能确认这个表情候选，请稍后再试。".to_string()
+                }
+            },
+            StickerCandidateCommand::Reject { candidate_id } => {
+                match dismiss_candidate(candidate_id, event.user_id, Some(sticker_scope), false, 30)
+                    .await
+                {
+                    Ok(true) => format!("已驳回候选 {}，近期不会重复提醒。", candidate_id),
+                    Ok(false) => "找不到这个待确认候选，可能已经处理过或不属于本群。".to_string(),
+                    Err(error) => {
+                        eprintln!("[ERROR] 驳回群聊表情包候选失败: {}", error);
+                        "这次没能驳回这个表情候选，请稍后再试。".to_string()
+                    }
+                }
+            }
+            StickerCandidateCommand::Ignore { candidate_id, days } => {
+                match dismiss_candidate(
+                    candidate_id,
+                    event.user_id,
+                    Some(sticker_scope),
+                    true,
+                    days,
+                )
+                .await
+                {
+                    Ok(true) => format!("已忽略候选 {}，{} 天内不会重复提醒。", candidate_id, days),
+                    Ok(false) => "找不到这个待确认候选，可能已经处理过或不属于本群。".to_string(),
+                    Err(error) => {
+                        eprintln!("[ERROR] 忽略群聊表情包候选失败: {}", error);
+                        "这次没能忽略这个表情候选，请稍后再试。".to_string()
+                    }
+                }
+            }
+            StickerCandidateCommand::Invalid => {
+                "格式：#待确认表情、#确认表情 编号 含义、#驳回表情 编号、#忽略表情 编号 [天数]。"
+                    .to_string()
+            }
+        };
+        send_tracked_group_message(&bot, group_id, reply).await;
+        return;
     }
     if is_recent_bot_message(reply_scope, event.message_id).await {
         println!(
@@ -644,7 +707,18 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
         || (group_paused && sender_is_admin)
     {
         if !stickers.is_empty()
-            && let Err(error) = sticker_memory::record_usage(&stickers, sticker_scope).await
+            && let Err(error) = sticker_memory::record_usage(
+                &stickers,
+                sticker_scope,
+                event.message_id,
+                &text_message,
+                recent_sticker_reaction
+                    .as_ref()
+                    .map(|message| message.content.as_str())
+                    .unwrap_or_default(),
+                Arc::clone(&bot),
+            )
+            .await
         {
             eprintln!("[ERROR] 群聊保存表情包使用记录失败: {}", error);
         }
@@ -695,7 +769,18 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
     {
         println!("[INFO] 群聊接续对话 (群组: {})", group_id);
         if !stickers.is_empty()
-            && let Err(error) = sticker_memory::record_usage(&stickers, sticker_scope).await
+            && let Err(error) = sticker_memory::record_usage(
+                &stickers,
+                sticker_scope,
+                event.message_id,
+                &text_message,
+                recent_sticker_reaction
+                    .as_ref()
+                    .map(|message| message.content.as_str())
+                    .unwrap_or_default(),
+                Arc::clone(&bot),
+            )
+            .await
         {
             eprintln!("[ERROR] 群聊保存表情包使用记录失败: {}", error);
         }
@@ -734,7 +819,18 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
     } else if sampled_for_interjection && understanding.interjection_worthy {
         println!("[INFO] 群聊未点名接话 (群组: {})", group_id);
         if !stickers.is_empty()
-            && let Err(error) = sticker_memory::record_usage(&stickers, sticker_scope).await
+            && let Err(error) = sticker_memory::record_usage(
+                &stickers,
+                sticker_scope,
+                event.message_id,
+                &text_message,
+                recent_sticker_reaction
+                    .as_ref()
+                    .map(|message| message.content.as_str())
+                    .unwrap_or_default(),
+                Arc::clone(&bot),
+            )
+            .await
         {
             eprintln!("[ERROR] 群聊保存表情包使用记录失败: {}", error);
         }

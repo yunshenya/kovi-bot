@@ -137,7 +137,7 @@ pub(crate) fn is_help_command(message: &str) -> bool {
 }
 
 pub(crate) fn command_help() -> &'static str {
-    "管理员可用指令：\n聊天：直接发送消息，或 @芸汐。\n图片：#看图、#看截图、#识图。\n提醒：直接说“提醒我……”即可创建提醒。\n管理员：#系统信息、#健康检查、#禁言、#结束禁言。\n群授权：#授权群 群号、#取消授权群 群号、#授权群列表。\n主管理员：#授权管理员 QQ号、#取消授权管理员 QQ号、#授权管理员列表。\n数据：私聊发送 #删除我的数据；群内发送 #删除本群数据。\n也可以直接说“查看系统信息”“检查健康状态”“暂停本群回复”或“恢复本群回复”。"
+    "管理员可用指令：\n聊天：直接发送消息，或 @芸汐。\n图片：#看图、#看截图、#识图。\n提醒：直接说“提醒我……”即可创建提醒。\n管理员：#系统信息、#健康检查、#禁言、#结束禁言。\n表情：#教芸汐、#待确认表情、#确认表情 编号 含义、#驳回表情 编号、#忽略表情 编号。\n群授权：#授权群 群号、#取消授权群 群号、#授权群列表。\n主管理员：#授权管理员 QQ号、#取消授权管理员 QQ号、#授权管理员列表。\n数据：私聊发送 #删除我的数据；群内发送 #删除本群数据。\n也可以直接说“查看系统信息”“检查健康状态”“暂停本群回复”或“恢复本群回复”。"
 }
 
 pub(crate) fn is_restricted_command(message: &str) -> bool {
@@ -147,6 +147,10 @@ pub(crate) fn is_restricted_command(message: &str) -> bool {
         || is_group_admin_command(text)
         || text.starts_with("#教芸汐")
         || text.starts_with("#教云汐")
+        || text == "#待确认表情"
+        || text.starts_with("#确认表情")
+        || text.starts_with("#驳回表情")
+        || text.starts_with("#忽略表情")
         || is_vision_command(text)
 }
 

@@ -24,9 +24,11 @@ use crate::private_image_memory::{
 use crate::reminders;
 use crate::sticker_memory;
 use crate::sticker_memory::{
-    StickerScope, extract_stickers, has_reply, has_usage, known_labels, quoted_message_context,
-    stickers_for_teaching, teach, teaching_label, with_quoted_context, with_sticker_context,
-    with_sticker_reaction_context, with_unknown_sticker_context,
+    StickerCandidateCommand, StickerScope, confirm_candidate, dismiss_candidate, extract_stickers,
+    format_candidate_list, has_reply, has_usage, known_labels, parse_candidate_command,
+    pending_candidates, quoted_message_context, stickers_for_teaching, teach, teaching_label,
+    with_quoted_context, with_sticker_context, with_sticker_reaction_context,
+    with_unknown_sticker_context,
 };
 use crate::vision::{
     ImageRequestScope, VisionImage, clear_user_pending_image_requests,
@@ -87,6 +89,54 @@ pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<Runtime
             user_id,
             message.trim()
         );
+        return;
+    }
+    if let Some(command) = parse_candidate_command(message) {
+        let reply = match command {
+            StickerCandidateCommand::List => match pending_candidates(None, 20).await {
+                Ok(candidates) => format_candidate_list(&candidates),
+                Err(error) => {
+                    eprintln!("[ERROR] 读取私聊表情包候选失败: {}", error);
+                    "暂时读取不到待确认表情候选，请稍后再试。".to_string()
+                }
+            },
+            StickerCandidateCommand::Confirm {
+                candidate_id,
+                label,
+            } => match confirm_candidate(candidate_id, &label, user_id, None).await {
+                Ok(true) => format!("已确认候选 {}，以后这个表情表示“{}”。", candidate_id, label),
+                Ok(false) => "找不到这个待确认候选，可能已经处理过。".to_string(),
+                Err(error) => {
+                    eprintln!("[ERROR] 确认私聊表情包候选失败: {}", error);
+                    "这次没能确认这个表情候选，请稍后再试。".to_string()
+                }
+            },
+            StickerCandidateCommand::Reject { candidate_id } => {
+                match dismiss_candidate(candidate_id, user_id, None, false, 30).await {
+                    Ok(true) => format!("已驳回候选 {}，近期不会重复提醒。", candidate_id),
+                    Ok(false) => "找不到这个待确认候选，可能已经处理过。".to_string(),
+                    Err(error) => {
+                        eprintln!("[ERROR] 驳回私聊表情包候选失败: {}", error);
+                        "这次没能驳回这个表情候选，请稍后再试。".to_string()
+                    }
+                }
+            }
+            StickerCandidateCommand::Ignore { candidate_id, days } => {
+                match dismiss_candidate(candidate_id, user_id, None, true, days).await {
+                    Ok(true) => format!("已忽略候选 {}，{} 天内不会重复提醒。", candidate_id, days),
+                    Ok(false) => "找不到这个待确认候选，可能已经处理过。".to_string(),
+                    Err(error) => {
+                        eprintln!("[ERROR] 忽略私聊表情包候选失败: {}", error);
+                        "这次没能忽略这个表情候选，请稍后再试。".to_string()
+                    }
+                }
+            }
+            StickerCandidateCommand::Invalid => {
+                "格式：#待确认表情、#确认表情 编号 含义、#驳回表情 编号、#忽略表情 编号 [天数]。"
+                    .to_string()
+            }
+        };
+        send_tracked_private_message(&bot, user_id, reply).await;
         return;
     }
     if should_suppress(InboundScope::Private(user_id), sender_is_admin).await {
@@ -495,7 +545,18 @@ pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<Runtime
         Vec::new()
     };
     if !stickers.is_empty()
-        && let Err(error) = sticker_memory::record_usage(&stickers, sticker_scope).await
+        && let Err(error) = sticker_memory::record_usage(
+            &stickers,
+            sticker_scope,
+            event.message_id,
+            &text_message,
+            recent_sticker_reaction
+                .as_ref()
+                .map(|message| message.content.as_str())
+                .unwrap_or_default(),
+            Arc::clone(&bot),
+        )
+        .await
     {
         eprintln!("[ERROR] 私聊保存表情包使用记录失败: {}", error);
     }
@@ -604,7 +665,7 @@ async fn delete_private_user_data(user_id: i64, bot: &RuntimeBot) {
                 bot,
                 user_id,
                 format!(
-                    "你的可归属数据已删除（记忆/档案/摘要 {memory_rows} 项，表情教学 {sticker_rows} 项，提醒 {reminder_rows} 项）。"
+                    "你的可归属数据已删除（记忆/档案/摘要 {memory_rows} 项，表情记忆 {sticker_rows} 项，提醒 {reminder_rows} 项）。"
                 ),
             )
             .await;
