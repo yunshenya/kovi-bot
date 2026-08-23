@@ -24,7 +24,7 @@ use crate::private_image_memory::{
 use crate::reminders;
 use crate::sticker_memory;
 use crate::sticker_memory::{
-    StickerScope, extract_stickers, has_reply, known_labels, quoted_message_context,
+    StickerScope, extract_stickers, has_reply, has_usage, known_labels, quoted_message_context,
     stickers_for_teaching, teach, teaching_label, with_quoted_context, with_sticker_context,
     with_sticker_reaction_context, with_unknown_sticker_context,
 };
@@ -98,7 +98,7 @@ pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<Runtime
             send_tracked_private_message(
                 &bot,
                 user_id,
-                "这会删除你的私聊记忆、用户档案、摘要、近期图片和与你关联的表情教学数据。若确认，请发送：#删除我的数据 确认",
+                "这会删除你的私聊记忆、用户档案、摘要、近期图片和与你关联的表情记忆。若确认，请发送：#删除我的数据 确认",
             )
             .await;
             return;
@@ -299,6 +299,17 @@ pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<Runtime
         return;
     }
 
+    let sticker_used_before = if stickers.is_empty() {
+        false
+    } else {
+        match has_usage(&stickers, sticker_scope).await {
+            Ok(used) => used,
+            Err(error) => {
+                eprintln!("[ERROR] 私聊读取表情包使用记录失败: {}", error);
+                false
+            }
+        }
+    };
     let current_message = if vision_requested && text_message.trim().is_empty() {
         if conversational_image {
             private_social_image_prompt().to_string()
@@ -306,7 +317,7 @@ pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<Runtime
             default_vision_prompt().to_string()
         }
     } else if labels.is_empty() && !stickers.is_empty() {
-        with_unknown_sticker_context(&text_message, stickers.len())
+        with_unknown_sticker_context(&text_message, stickers.len(), sticker_used_before)
     } else {
         with_sticker_context(&text_message, &labels)
     };
@@ -483,6 +494,11 @@ pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<Runtime
     } else {
         Vec::new()
     };
+    if !stickers.is_empty()
+        && let Err(error) = sticker_memory::record_usage(&stickers, sticker_scope).await
+    {
+        eprintln!("[ERROR] 私聊保存表情包使用记录失败: {}", error);
+    }
     let Some(reply_ticket) = claim_or_queue_private_reply(
         reply_scope,
         reply_ticket,

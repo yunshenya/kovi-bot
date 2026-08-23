@@ -1,6 +1,6 @@
 //! # 表情包记忆库
 //!
-//! 仅保存 OneBot 表情/图片的稳定标识与人工教会的含义；不下载或保存图片文件。
+//! 保存 OneBot 表情/图片的稳定标识、人工教会的含义和轻量使用记录；不下载或保存图片文件。
 
 use crate::memory::MEMORY_MANAGER;
 use crate::vision::{ImageAttachment, extract_image_attachments};
@@ -127,24 +127,52 @@ pub(crate) async fn initialize_database() -> Result<()> {
     .await
     .map_err(|error| anyhow!("创建表情包记忆索引失败: {error}"))?;
 
+    query(
+        r#"
+        CREATE TABLE IF NOT EXISTS kovi_bot_sticker_usage (
+            sticker_key TEXT NOT NULL,
+            scope_type TEXT NOT NULL,
+            scope_id BIGINT NOT NULL,
+            use_count BIGINT NOT NULL DEFAULT 0,
+            first_used_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            last_used_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (sticker_key, scope_type, scope_id)
+        )
+        "#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|error| anyhow!("创建表情包使用记录表失败: {error}"))?;
+    query(
+        "CREATE INDEX IF NOT EXISTS kovi_bot_sticker_usage_last_used_at_idx ON kovi_bot_sticker_usage (last_used_at DESC)",
+    )
+    .execute(pool)
+    .await
+    .map_err(|error| anyhow!("创建表情包使用记录索引失败: {error}"))?;
+
     println!("[INFO] PostgreSQL 表情包记忆库已就绪");
     compact_expired().await?;
     Ok(())
 }
 
-/// 清理超过配置 TTL 的表情标签；标签只保存稳定标识和文字，不保留图片内容。
+/// 清理超过配置 TTL 的表情标签和使用记录；两者都只保存稳定标识，不保留图片内容。
 pub(crate) async fn compact_expired() -> Result<u64> {
     let Some(pool) = MEMORY_MANAGER.database_pool() else {
         return Ok(0);
     };
     let cutoff =
         Utc::now() - ChronoDuration::days(crate::config::get().memory().sticker_ttl_days());
-    let result = query("DELETE FROM kovi_bot_sticker_memory WHERE updated_at <= $1")
+    let learned_result = query("DELETE FROM kovi_bot_sticker_memory WHERE updated_at <= $1")
         .bind(cutoff)
         .execute(pool)
         .await
         .map_err(|error| anyhow!("清理过期表情包记忆失败: {error}"))?;
-    Ok(result.rows_affected())
+    let usage_result = query("DELETE FROM kovi_bot_sticker_usage WHERE last_used_at <= $1")
+        .bind(cutoff)
+        .execute(pool)
+        .await
+        .map_err(|error| anyhow!("清理过期表情包使用记录失败: {error}"))?;
+    Ok(learned_result.rows_affected() + usage_result.rows_affected())
 }
 
 /// 从 OneBot 消息段中提取可长期识别的图片、商城表情和普通表情标识。
@@ -557,6 +585,74 @@ pub(crate) async fn teach(
     Ok(stickers.len())
 }
 
+/// 记录表情实际参与过一次回复。这里不推断含义，只保存稳定标识和使用频次。
+pub(crate) async fn record_usage(stickers: &[StickerImage], scope: StickerScope) -> Result<usize> {
+    if stickers.is_empty() {
+        return Ok(0);
+    }
+    let pool = MEMORY_MANAGER
+        .database_pool()
+        .ok_or_else(|| anyhow!("PostgreSQL 表情包记忆库尚未初始化"))?;
+    let (scope_type, scope_id) = scope.database_values();
+    let mut transaction = pool.begin().await?;
+    for sticker in stickers {
+        query(
+            r#"
+            INSERT INTO kovi_bot_sticker_usage
+                (sticker_key, scope_type, scope_id, use_count, first_used_at, last_used_at)
+            VALUES ($1, $2, $3, 1, NOW(), NOW())
+            ON CONFLICT (sticker_key, scope_type, scope_id) DO UPDATE
+            SET use_count = kovi_bot_sticker_usage.use_count + 1,
+                last_used_at = NOW()
+            "#,
+        )
+        .bind(&sticker.key)
+        .bind(scope_type)
+        .bind(scope_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| anyhow!("保存表情包使用记录失败: {error}"))?;
+    }
+    transaction.commit().await?;
+    Ok(stickers.len())
+}
+
+/// 判断表情是否已经在当前群聊或私聊中参与过互动，但不把它当作已学习含义。
+pub(crate) async fn has_usage(stickers: &[StickerImage], scope: StickerScope) -> Result<bool> {
+    if stickers.is_empty() {
+        return Ok(false);
+    }
+    let pool = MEMORY_MANAGER
+        .database_pool()
+        .ok_or_else(|| anyhow!("PostgreSQL 表情包记忆库尚未初始化"))?;
+    let keys = stickers
+        .iter()
+        .map(|sticker| sticker.key.clone())
+        .collect::<Vec<_>>();
+    let (scope_type, scope_id) = scope.database_values();
+    let cutoff =
+        Utc::now() - ChronoDuration::days(crate::config::get().memory().sticker_ttl_days());
+    let row = query(
+        r#"
+        SELECT 1
+        FROM kovi_bot_sticker_usage
+        WHERE sticker_key = ANY($1::TEXT[])
+          AND scope_type = $2
+          AND scope_id = $3
+          AND last_used_at > $4
+        LIMIT 1
+        "#,
+    )
+    .bind(&keys)
+    .bind(scope_type)
+    .bind(scope_id)
+    .bind(cutoff)
+    .fetch_optional(pool)
+    .await
+    .map_err(|error| anyhow!("读取表情包使用记录失败: {error}"))?;
+    Ok(row.is_some())
+}
+
 /// 删除与指定用户直接关联的表情教学数据，包括教学者身份和私聊作用域标签。
 pub(crate) async fn delete_user_data(user_id: i64) -> Result<u64> {
     let pool = MEMORY_MANAGER
@@ -573,7 +669,17 @@ pub(crate) async fn delete_user_data(user_id: i64) -> Result<u64> {
     .execute(pool)
     .await
     .map_err(|error| anyhow!("删除用户表情包记忆失败: {error}"))?;
-    Ok(result.rows_affected())
+    let usage_result = query(
+        r#"
+        DELETE FROM kovi_bot_sticker_usage
+        WHERE scope_type = 'private' AND scope_id = $1
+        "#,
+    )
+    .bind(user_id)
+    .execute(pool)
+    .await
+    .map_err(|error| anyhow!("删除用户表情包使用记录失败: {error}"))?;
+    Ok(result.rows_affected() + usage_result.rows_affected())
 }
 
 /// 删除指定群聊作用域及来源于该群的表情教学数据。
@@ -592,7 +698,17 @@ pub(crate) async fn delete_group_data(group_id: i64) -> Result<u64> {
     .execute(pool)
     .await
     .map_err(|error| anyhow!("删除群聊表情包记忆失败: {error}"))?;
-    Ok(result.rows_affected())
+    let usage_result = query(
+        r#"
+        DELETE FROM kovi_bot_sticker_usage
+        WHERE scope_type = 'group' AND scope_id = $1
+        "#,
+    )
+    .bind(group_id)
+    .execute(pool)
+    .await
+    .map_err(|error| anyhow!("删除群聊表情包使用记录失败: {error}"))?;
+    Ok(result.rows_affected() + usage_result.rows_affected())
 }
 
 /// 返回消息中已学习表情的含义；没有标签的图片不会进入模型上下文。
@@ -663,9 +779,17 @@ pub(crate) fn with_sticker_context(text: &str, labels: &[String]) -> String {
 }
 
 /// 告知模型当前带有尚未学习的表情，但不臆造它的具体含义。
-pub(crate) fn with_unknown_sticker_context(text: &str, count: usize) -> String {
+pub(crate) fn with_unknown_sticker_context(
+    text: &str,
+    count: usize,
+    previously_used: bool,
+) -> String {
     let message = text.trim();
-    let description = if count == 1 {
+    let description = if count == 1 && previously_used {
+        "附带了一个芸汐以前用过、但还没学会具体含义的表情包；不要擅自猜它的具体含义，可以结合上下文自然回应。"
+    } else if count > 1 && previously_used {
+        "附带了几个芸汐以前用过、但还没学会具体含义的表情包；不要擅自猜它们的具体含义，可以结合上下文自然回应。"
+    } else if count == 1 {
         "附带了一个芸汐还没学会理解的表情包；不要擅自猜它的具体含义，可以自然地承认还没看懂。"
     } else {
         "附带了几个芸汐还没学会理解的表情包；不要擅自猜它们的具体含义，可以自然地承认还没看懂。"
@@ -871,10 +995,18 @@ mod tests {
 
     #[test]
     fn unknown_sticker_context_does_not_invent_a_meaning() {
-        let context = with_unknown_sticker_context("这个怎么样", 1);
+        let context = with_unknown_sticker_context("这个怎么样", 1, false);
         assert!(context.contains("还没学会理解"));
         assert!(context.contains("不要擅自猜"));
-        assert!(with_unknown_sticker_context("", 2).contains("几个"));
+        assert!(with_unknown_sticker_context("", 2, false).contains("几个"));
+    }
+
+    #[test]
+    fn previously_used_unknown_sticker_context_stays_uncertain() {
+        let context = with_unknown_sticker_context("", 1, true);
+        assert!(context.contains("以前用过"));
+        assert!(context.contains("还没学会具体含义"));
+        assert!(context.contains("不要擅自猜"));
     }
 
     #[test]

@@ -21,7 +21,7 @@ use crate::redis_store;
 use crate::reminders;
 use crate::sticker_memory;
 use crate::sticker_memory::{
-    StickerScope, extract_stickers, has_reply, known_labels, quoted_message_context,
+    StickerScope, extract_stickers, has_reply, has_usage, known_labels, quoted_message_context,
     stickers_for_teaching, teach, teaching_label, with_quoted_context, with_sticker_context,
     with_sticker_reaction_context, with_unknown_sticker_context,
 };
@@ -239,7 +239,7 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
             send_tracked_group_message(
                 &bot,
                 group_id,
-                "这会删除本群的长期记忆、群档案、摘要和本群表情教学数据。若确认，请发送：#删除本群数据 确认",
+                "这会删除本群的长期记忆、群档案、摘要和本群表情记忆。若确认，请发送：#删除本群数据 确认",
             )
             .await;
             return;
@@ -452,8 +452,19 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
     } else {
         message.to_string()
     };
+    let sticker_used_before = if stickers.is_empty() {
+        false
+    } else {
+        match has_usage(&stickers, sticker_scope).await {
+            Ok(used) => used,
+            Err(error) => {
+                eprintln!("[ERROR] 群聊读取表情包使用记录失败: {}", error);
+                false
+            }
+        }
+    };
     let current_message = if labels.is_empty() && !stickers.is_empty() {
-        with_unknown_sticker_context(&text_message, stickers.len())
+        with_unknown_sticker_context(&text_message, stickers.len(), sticker_used_before)
     } else {
         with_sticker_context(&text_message, &labels)
     };
@@ -632,6 +643,11 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
         || matches!(message.trim(), "#禁言" | "#结束禁言")
         || (group_paused && sender_is_admin)
     {
+        if !stickers.is_empty()
+            && let Err(error) = sticker_memory::record_usage(&stickers, sticker_scope).await
+        {
+            eprintln!("[ERROR] 群聊保存表情包使用记录失败: {}", error);
+        }
         let Some(ticket) = claim_or_queue_group_reply(
             reply_scope,
             reply_ticket,
@@ -678,6 +694,11 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
     .await
     {
         println!("[INFO] 群聊接续对话 (群组: {})", group_id);
+        if !stickers.is_empty()
+            && let Err(error) = sticker_memory::record_usage(&stickers, sticker_scope).await
+        {
+            eprintln!("[ERROR] 群聊保存表情包使用记录失败: {}", error);
+        }
         let Some(ticket) = claim_or_queue_group_reply(
             reply_scope,
             reply_ticket,
@@ -712,6 +733,11 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
         drain_pending_window_messages(group_id, Arc::clone(&bot), ticket).await;
     } else if sampled_for_interjection && understanding.interjection_worthy {
         println!("[INFO] 群聊未点名接话 (群组: {})", group_id);
+        if !stickers.is_empty()
+            && let Err(error) = sticker_memory::record_usage(&stickers, sticker_scope).await
+        {
+            eprintln!("[ERROR] 群聊保存表情包使用记录失败: {}", error);
+        }
         let Some(ticket) = claim_or_queue_group_reply(
             reply_scope,
             None,
@@ -825,7 +851,7 @@ async fn delete_group_data(group_id: i64, bot: &RuntimeBot) {
                 bot,
                 group_id,
                 format!(
-                    "本群可归属数据已删除（记忆/档案/摘要 {memory_rows} 项，表情教学 {sticker_rows} 项，提醒 {reminder_rows} 项）。"
+                    "本群可归属数据已删除（记忆/档案/摘要 {memory_rows} 项，表情记忆 {sticker_rows} 项，提醒 {reminder_rows} 项）。"
                 ),
             )
             .await;
