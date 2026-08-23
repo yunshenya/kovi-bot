@@ -71,6 +71,12 @@ pub(crate) async fn params_model_with_tool_access(
     progress: Option<Arc<ThinkingReporter>>,
 ) -> BotMemory {
     let Some(registry) = tool_registry() else {
+        if tool_context.group_paused {
+            return BotMemory {
+                role: Roles::Assistant,
+                content: SILENT_REPLY_OUTPUT.to_string(),
+            };
+        }
         if tool_context.requires_external_tool {
             eprintln!(
                 "[WARN] 定时任务请求未执行：外部查询工具注册表不可用 (范围: {}:{})",
@@ -102,10 +108,11 @@ pub(crate) async fn params_model_with_tool_access(
         .unwrap_or_else(interrupted_response);
     };
 
+    let mut tool_context = tool_context;
     let mut request = messages.to_vec();
     request.push(BotMemory {
         role: Roles::System,
-        content: registry.instruction_for(tool_context.scheduled, tool_context.is_admin),
+        content: registry.instruction_for(&tool_context),
     });
     if tool_context.requires_reminder_create {
         request.push(BotMemory {
@@ -145,6 +152,12 @@ pub(crate) async fn params_model_with_tool_access(
         // protocol noise into a false task failure.
         match parse_tool_call_with_wrapping(&response.content, true) {
             ParsedToolCall::None => {
+                if tool_context.group_paused {
+                    return BotMemory {
+                        role: Roles::Assistant,
+                        content: SILENT_REPLY_OUTPUT.to_string(),
+                    };
+                }
                 if tool_context.requires_external_tool && !external_tool_succeeded {
                     if is_model_error_response(&response.content) || round + 1 >= max_tool_rounds {
                         eprintln!(
@@ -243,11 +256,20 @@ pub(crate) async fn params_model_with_tool_access(
                         memory_rounds += 1;
                     }
                     registry
-                        .execute(&call.name, call.arguments, tool_context, reply_ticket)
+                        .execute(
+                            &call.name,
+                            call.arguments,
+                            tool_context.clone(),
+                            reply_ticket,
+                        )
                         .await
                 };
                 if result.succeeded && is_external_tool_name(&tool_name) {
                     external_tool_succeeded = true;
+                }
+                if result.succeeded && matches!(tool_name.as_str(), "group.pause" | "group.resume")
+                {
+                    tool_context.group_paused = false;
                 }
                 if tool_name == "reminder.create" {
                     reminder_tool_succeeded = result.succeeded;

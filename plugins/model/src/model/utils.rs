@@ -137,7 +137,7 @@ pub(crate) fn is_help_command(message: &str) -> bool {
 }
 
 pub(crate) fn command_help() -> &'static str {
-    "管理员可用指令：\n聊天：直接发送消息，或 @芸汐。\n图片：#看图、#看截图、#识图。\n提醒：直接说“提醒我……”即可创建提醒。\n管理员：#系统信息、#健康检查、#禁言、#结束禁言。\n群授权：#授权群 群号、#取消授权群 群号、#授权群列表。\n主管理员：#授权管理员 QQ号、#取消授权管理员 QQ号、#授权管理员列表。\n数据：私聊发送 #删除我的数据；群内发送 #删除本群数据。"
+    "管理员可用指令：\n聊天：直接发送消息，或 @芸汐。\n图片：#看图、#看截图、#识图。\n提醒：直接说“提醒我……”即可创建提醒。\n管理员：#系统信息、#健康检查、#禁言、#结束禁言。\n群授权：#授权群 群号、#取消授权群 群号、#授权群列表。\n主管理员：#授权管理员 QQ号、#取消授权管理员 QQ号、#授权管理员列表。\n数据：私聊发送 #删除我的数据；群内发送 #删除本群数据。\n也可以直接说“查看系统信息”“检查健康状态”“暂停本群回复”或“恢复本群回复”。"
 }
 
 pub(crate) fn is_restricted_command(message: &str) -> bool {
@@ -396,6 +396,8 @@ pub async fn control_model(
             context: "group_chat",
             destination: MessageDestination::Group(group_id),
             scheduled: false,
+            group_paused: is_group_paused(group_id).await,
+            runtime_bot: Some(Arc::clone(&bot)),
             requires_reminder_create: crate::reminders::looks_like_reminder_request(message),
             requires_external_tool: false,
         },
@@ -1348,6 +1350,18 @@ fn instance_is_ban() -> &'static Mutex<HashMap<i64, bool>> {
     &IS_BANNED
 }
 
+pub(crate) async fn is_group_paused(group_id: i64) -> bool {
+    *instance_is_ban()
+        .lock()
+        .await
+        .get(&group_id)
+        .unwrap_or(&false)
+}
+
+pub(crate) async fn set_group_paused(group_id: i64, paused: bool) {
+    instance_is_ban().lock().await.insert(group_id, paused);
+}
+
 async fn group_history(group_id: i64) -> ConversationHistory {
     let evicted = touch_runtime_history(&GROUP_HISTORY_ACCESS, group_id).await;
     let mut histories = MEMORY.lock().await;
@@ -1487,7 +1501,7 @@ async fn process_group_reply_inner(
 ) -> bool {
     let scope = super::interrupt::ReplyScope::Group(group_id);
     if message.trim() == "#禁言" {
-        instance_is_ban().lock().await.insert(group_id, true);
+        set_group_paused(group_id, true).await;
         send_tracked_group_message(&bot, group_id, "禁言成功").await;
         if already_claimed {
             finish_reply(scope, reply_ticket).await;
@@ -1495,7 +1509,7 @@ async fn process_group_reply_inner(
         return false;
     }
     if message.trim() == "#结束禁言" {
-        instance_is_ban().lock().await.insert(group_id, false);
+        set_group_paused(group_id, false).await;
         send_tracked_group_message(&bot, group_id, "结束成功").await;
         if already_claimed {
             finish_reply(scope, reply_ticket).await;
@@ -1504,12 +1518,8 @@ async fn process_group_reply_inner(
     }
 
     // 读取状态后立即释放锁，避免一次模型网络请求阻塞其他群的状态操作。
-    let is_banned = *instance_is_ban()
-        .lock()
-        .await
-        .get(&group_id)
-        .unwrap_or(&false);
-    if !is_banned {
+    let is_banned = is_group_paused(group_id).await;
+    if !is_banned || is_bot_admin(&bot, user_id) {
         if !already_claimed && !begin_reply(scope, reply_ticket, source_message_ids).await {
             return false;
         }
@@ -1557,7 +1567,7 @@ pub async fn send_sys_info_private(bot: Arc<RuntimeBot>, user_id: i64) {
     }
 }
 
-async fn system_info_content(bot: &RuntimeBot) -> String {
+pub(crate) async fn system_info_content(bot: &RuntimeBot) -> String {
     let result = kovi::tokio::time::timeout(Duration::from_secs(8), async {
     let server_config = config::get().server_config().clone();
     let model_auth_status = !server_config.requires_auth()
@@ -1810,6 +1820,8 @@ async fn private_chat_inner(
             context: "private_chat",
             destination: MessageDestination::Private(user_id),
             scheduled: false,
+            group_paused: false,
+            runtime_bot: Some(Arc::clone(&bot)),
             requires_reminder_create: crate::reminders::looks_like_reminder_request(message),
             requires_external_tool: false,
         },

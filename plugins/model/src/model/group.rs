@@ -13,8 +13,9 @@ use crate::model::reply::{clear_reply_targets, record_reply_target};
 use crate::model::semantic::{MessageUnderstanding, UnderstandingRequest, understand};
 use crate::model::traffic::{InboundScope, bounded_input, should_suppress};
 use crate::model::utils::{
-    clear_group_runtime_data, command_help, is_bot_admin, is_help_command, is_restricted_command,
-    learn_user_profile_from_message, process_group_reply_claimed, send_sys_info,
+    clear_group_runtime_data, command_help, is_bot_admin, is_group_paused, is_help_command,
+    is_restricted_command, learn_user_profile_from_message, process_group_reply_claimed,
+    send_sys_info,
 };
 use crate::redis_store;
 use crate::reminders;
@@ -590,7 +591,11 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
     )
     .await;
     // 被点名时始终处理；未点名消息仅由本地节流器偶尔抽样，不逐条调用模型。
-    if addressed_to_bot || vision_requested || matches!(message.trim(), "#禁言" | "#结束禁言")
+    let group_paused = is_group_paused(group_id).await;
+    if addressed_to_bot
+        || vision_requested
+        || matches!(message.trim(), "#禁言" | "#结束禁言")
+        || (group_paused && sender_is_admin)
     {
         let Some(ticket) = claim_or_queue_group_reply(
             reply_scope,

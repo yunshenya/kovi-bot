@@ -470,6 +470,8 @@ async fn build_generic_task(reminder: &ClaimedReminder) -> Result<String> {
             context: "scheduled_task",
             destination: reminder.destination,
             scheduled: true,
+            group_paused: false,
+            runtime_bot: None,
             requires_reminder_create: false,
             requires_external_tool: external_task,
         },
