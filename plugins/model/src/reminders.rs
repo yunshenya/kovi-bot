@@ -472,6 +472,7 @@ async fn build_generic_task(reminder: &ClaimedReminder) -> Result<String> {
             scheduled: true,
             group_paused: false,
             runtime_bot: None,
+            sticker_teaching: None,
             requires_reminder_create: false,
             requires_external_tool: external_task,
         },

@@ -213,6 +213,9 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
     let current_images = extract_image_attachments(&event.message);
     let vision_command = is_vision_command(message);
     let sticker_scope = StickerScope::Group(group_id);
+    let sticker_teaching_message = (sender_is_admin
+        && (!stickers.is_empty() || has_reply(&event.message)))
+    .then(|| event.message.clone());
     let reply_scope = ReplyScope::Group(group_id);
     if event.user_id == event.self_id {
         println!(
@@ -700,9 +703,12 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
     .await;
     // 被点名时始终处理；未点名消息仅由本地节流器偶尔抽样，不逐条调用模型。
     let group_paused = is_group_paused(group_id).await;
+    let explicit_sticker_teaching =
+        sender_is_admin && sticker_teaching_message.is_some() && !message.trim().is_empty();
     if addressed_to_bot
         || vision_requested
         || batch_sticker_reaction
+        || explicit_sticker_teaching
         || matches!(message.trim(), "#禁言" | "#结束禁言")
         || (group_paused && sender_is_admin)
     {
@@ -732,6 +738,7 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
             model_message.clone(),
             vision_images.clone(),
             source_message_ids.clone(),
+            sticker_teaching_message.clone(),
             understanding.clone(),
         )
         .await
@@ -754,6 +761,7 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
             max_output_tokens,
             vision_images.clone(),
             source_message_ids.clone(),
+            sticker_teaching_message.clone(),
             understanding.clone(),
         )
         .await;
@@ -794,6 +802,7 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
             model_message.clone(),
             vision_images.clone(),
             source_message_ids.clone(),
+            sticker_teaching_message.clone(),
             understanding.clone(),
         )
         .await
@@ -811,6 +820,7 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
             None,
             vision_images.clone(),
             source_message_ids.clone(),
+            sticker_teaching_message.clone(),
             understanding.clone(),
         )
         .await;
@@ -844,6 +854,7 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
             model_message.clone(),
             vision_images.clone(),
             source_message_ids.clone(),
+            sticker_teaching_message.clone(),
             understanding.clone(),
         )
         .await
@@ -864,6 +875,7 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
             Some(max_output_tokens),
             vision_images.clone(),
             source_message_ids.clone(),
+            sticker_teaching_message.clone(),
             understanding.clone(),
         )
         .await;
@@ -1253,6 +1265,7 @@ async fn queue_pending_window_message(
     message: String,
     vision_images: Vec<VisionImage>,
     message_ids: Vec<i32>,
+    sticker_teaching_message: Option<Message>,
     understanding: MessageUnderstanding,
 ) {
     let mut pending = PENDING_WINDOW_MESSAGES.lock().await;
@@ -1265,6 +1278,7 @@ async fn queue_pending_window_message(
             message,
             vision_images,
             message_ids,
+            sticker_teaching_message,
             understanding,
         },
         "群聊",
@@ -1283,6 +1297,7 @@ async fn claim_or_queue_group_reply(
     message: String,
     vision_images: Vec<VisionImage>,
     message_ids: Vec<i32>,
+    sticker_teaching_message: Option<Message>,
     understanding: MessageUnderstanding,
 ) -> Option<crate::model::ReplyTicket> {
     let scope_lock = scope_mutex(scope);
@@ -1309,6 +1324,7 @@ async fn claim_or_queue_group_reply(
             message,
             vision_images,
             message_ids,
+            sticker_teaching_message,
             understanding,
         )
         .await;
@@ -1354,6 +1370,7 @@ async fn drain_pending_window_messages(
             None,
             pending.vision_images,
             pending.message_ids,
+            pending.sticker_teaching_message,
             pending.understanding,
         )
         .await;
@@ -1790,6 +1807,7 @@ mod tests {
                         url: "data:image/png;base64,AA==".to_string(),
                     }],
                     vec![101],
+                    None,
                     MessageUnderstanding::default(),
                 )
                 .await;
@@ -1802,6 +1820,7 @@ mod tests {
                         url: "data:image/jpeg;base64,/9j/2Q==".to_string(),
                     }],
                     vec![202],
+                    None,
                     MessageUnderstanding::default(),
                 )
                 .await;
@@ -1839,6 +1858,7 @@ mod tests {
                     "旧排队消息".to_string(),
                     Vec::new(),
                     vec![303],
+                    None,
                     MessageUnderstanding::default(),
                 )
                 .await;

@@ -6,11 +6,12 @@ use crate::health_check::HealthChecker;
 use crate::memory::{MEMORY_MANAGER, MemoryEntry, MemoryLookup};
 use crate::redis_store;
 use crate::reminders;
+use crate::sticker_memory::{self, StickerScope};
 use anyhow::{Result, anyhow};
 use chrono::{Duration as ChronoDuration, Local, Utc};
 use chrono_tz::Tz;
-use kovi::RuntimeBot;
 use kovi::tokio::sync::{Mutex, OnceCell};
+use kovi::{Message, RuntimeBot};
 use rmcp::{
     ServiceExt,
     model::{CallToolRequestParams, ContentBlock, Tool},
@@ -58,6 +59,7 @@ enum ToolSource {
 enum BuiltinTool {
     TimeNow,
     MemorySearch,
+    StickerMemoryTeach,
     ReminderCreate,
     ReminderList,
     ReminderCancel,
@@ -75,6 +77,12 @@ enum BuiltinTool {
 }
 
 #[derive(Clone)]
+pub(crate) struct StickerTeachingContext {
+    pub(crate) message: Message,
+    pub(crate) scope: StickerScope,
+}
+
+#[derive(Clone)]
 pub(crate) struct ToolExecutionContext {
     pub(crate) subject_id: i64,
     pub(crate) actor_user_id: i64,
@@ -84,6 +92,7 @@ pub(crate) struct ToolExecutionContext {
     pub(crate) scheduled: bool,
     pub(crate) group_paused: bool,
     pub(crate) runtime_bot: Option<Arc<RuntimeBot>>,
+    pub(crate) sticker_teaching: Option<StickerTeachingContext>,
     /// 用户明确提出创建定时任务时，普通确认文本不能绕过 reminder.create。
     pub(crate) requires_reminder_create: bool,
     /// 定时任务指令依赖外部资料时，必须至少成功执行一个只读外部工具，
@@ -304,6 +313,25 @@ pub(crate) async fn initialize() -> Result<()> {
             "additionalProperties": false
         }),
         source: ToolSource::Builtin(BuiltinTool::SystemInfo),
+    });
+    definitions.push(ToolDefinition {
+        name: "sticker_memory.teach".to_string(),
+        description: "管理员专用：当管理员明确描述当前表情包的含义，并且当前消息带有表情/图片或引用了包含表情的消息时，保存正式表情记忆。label 只填写管理员给出的含义；普通评价、提问、猜测或讨论表情时不要调用，也不要自行推断含义。"
+            .to_string(),
+        input_schema: json!({
+            "type": "object",
+            "required": ["label"],
+            "properties": {
+                "label": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 160,
+                    "description": "管理员明确给出的表情含义，例如：无语又想笑。不要加入教学过程或解释。"
+                }
+            },
+            "additionalProperties": false
+        }),
+        source: ToolSource::Builtin(BuiltinTool::StickerMemoryTeach),
     });
     definitions.push(ToolDefinition {
         name: "group.pause".to_string(),
@@ -530,6 +558,11 @@ impl ToolRegistry {
             if tool_context.scheduled && !definition.source.available_for_scheduled() {
                 continue;
             }
+            if definition.source.needs_sticker_teaching_context()
+                && tool_context.sticker_teaching.is_none()
+            {
+                continue;
+            }
             if definition.source.admin_only() && !tool_context.is_admin {
                 continue;
             }
@@ -547,6 +580,14 @@ impl ToolRegistry {
             instruction.push_str(
                 &serde_json::to_string(&definition.input_schema)
                     .unwrap_or_else(|_| "{\"type\":\"object\"}".to_string()),
+            );
+        }
+        if tool_context.is_admin
+            && !tool_context.scheduled
+            && tool_context.sticker_teaching.is_some()
+        {
+            instruction.push_str(
+                "\n\n当前消息带有可用于表情教学的内容。只有当管理员明确是在定义含义（例如‘这个表情表示无语’、‘记住这个表情是开心’）时，才调用 sticker_memory.teach；label 只填写管理员明确说出的含义。若只是询问、评价、猜测或普通聊天，不要调用，也不要自行推断。工具成功后再自然地确认已经记住。",
             );
         }
         if tool_context.group_paused {
@@ -600,6 +641,15 @@ impl ToolRegistry {
             return ToolExecutionResult {
                 succeeded: false,
                 content: "这个工具未授权给定时任务使用。".to_string(),
+                reminder_failure_kind: None,
+            };
+        }
+        if definition.source.needs_sticker_teaching_context()
+            && tool_context.sticker_teaching.is_none()
+        {
+            return ToolExecutionResult {
+                succeeded: false,
+                content: "当前消息没有可教学的表情或引用消息。".to_string(),
                 reminder_failure_kind: None,
             };
         }
@@ -690,6 +740,10 @@ impl ToolRegistry {
 }
 
 impl ToolSource {
+    fn needs_sticker_teaching_context(&self) -> bool {
+        matches!(self, Self::Builtin(BuiltinTool::StickerMemoryTeach))
+    }
+
     fn available_for_scheduled(&self) -> bool {
         match self {
             Self::Builtin(tool) => !matches!(
@@ -702,6 +756,7 @@ impl ToolSource {
                     | BuiltinTool::GroupPause
                     | BuiltinTool::GroupResume
                     | BuiltinTool::HealthCheck
+                    | BuiltinTool::StickerMemoryTeach
             ),
             Self::Mcp {
                 scheduled_allowed, ..
@@ -718,6 +773,7 @@ impl ToolSource {
                     | BuiltinTool::GroupPause
                     | BuiltinTool::GroupResume
                     | BuiltinTool::HealthCheck
+                    | BuiltinTool::StickerMemoryTeach
             )
         )
     }
@@ -855,6 +911,7 @@ async fn execute_builtin(
         BuiltinTool::MemorySearch => {
             search_memory(&arguments, tool_context.subject_id, tool_context.context).await
         }
+        BuiltinTool::StickerMemoryTeach => teach_sticker_memory(&arguments, &tool_context).await,
         BuiltinTool::ReminderCreate => {
             reminders::create_from_tool(
                 &arguments,
@@ -917,6 +974,31 @@ async fn execute_builtin(
         }
         BuiltinTool::HealthCheck => health_check().await,
     }
+}
+
+async fn teach_sticker_memory(
+    arguments: &Map<String, Value>,
+    tool_context: &ToolExecutionContext,
+) -> Result<String> {
+    reject_unknown_arguments(arguments, &["label"])?;
+    let label = required_string(arguments, "label", 160)?;
+    let teaching_context = tool_context
+        .sticker_teaching
+        .as_ref()
+        .ok_or_else(|| anyhow!("当前消息没有可教学的表情或引用消息"))?;
+    let bot = tool_context
+        .runtime_bot
+        .as_deref()
+        .ok_or_else(|| anyhow!("表情教学工具没有可用的机器人运行时"))?;
+    let count = sticker_memory::teach_from_message(
+        &teaching_context.message,
+        bot,
+        &label,
+        tool_context.actor_user_id,
+        teaching_context.scope,
+    )
+    .await?;
+    Ok(format!("已记住啦，这 {count} 个表情以后表示“{label}”。"))
 }
 
 fn current_time(arguments: &Map<String, Value>) -> Result<String> {
@@ -2367,6 +2449,7 @@ mod tests {
         assert!(!ToolSource::Builtin(BuiltinTool::GroupPause).available_for_scheduled());
         assert!(!ToolSource::Builtin(BuiltinTool::GroupResume).available_for_scheduled());
         assert!(!ToolSource::Builtin(BuiltinTool::HealthCheck).available_for_scheduled());
+        assert!(!ToolSource::Builtin(BuiltinTool::StickerMemoryTeach).available_for_scheduled());
         assert!(ToolSource::Builtin(BuiltinTool::HealthCheck).admin_only());
     }
 
@@ -2376,6 +2459,9 @@ mod tests {
         assert!(ToolSource::Builtin(BuiltinTool::SystemInfo).admin_only());
         assert!(ToolSource::Builtin(BuiltinTool::GroupPause).admin_only());
         assert!(ToolSource::Builtin(BuiltinTool::GroupResume).admin_only());
+        let sticker_teach = ToolSource::Builtin(BuiltinTool::StickerMemoryTeach);
+        assert!(sticker_teach.admin_only());
+        assert!(sticker_teach.needs_sticker_teaching_context());
 
         let private = MessageDestination::Private(7);
         let group = MessageDestination::Group(8);

@@ -7,6 +7,7 @@ use super::recall::begin_reply_locked;
 use super::semantic::MessageUnderstanding;
 use crate::config;
 use crate::vision::VisionImage;
+use kovi::Message;
 use std::collections::VecDeque;
 
 /// 一个不可拆分的待处理 turn；正文、发送者、附件和消息 ID 总是一起入队。
@@ -18,6 +19,7 @@ pub(crate) struct PendingTurn {
     pub(crate) vision_images: Vec<VisionImage>,
     pub(crate) message_ids: Vec<i32>,
     pub(crate) understanding: MessageUnderstanding,
+    pub(crate) sticker_teaching_message: Option<Message>,
 }
 
 pub(crate) struct ConversationCoordinator;

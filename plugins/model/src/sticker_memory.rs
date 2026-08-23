@@ -623,6 +623,21 @@ pub(crate) async fn stickers_for_teaching(
     Ok(extract_stickers(&original_message.message))
 }
 
+/// 由模型内置工具调用：从当前消息或引用消息中取得表情并保存管理员给出的含义。
+pub(crate) async fn teach_from_message(
+    message: &Message,
+    bot: &RuntimeBot,
+    label: &str,
+    learned_by: i64,
+    scope: StickerScope,
+) -> Result<usize> {
+    let stickers = stickers_for_teaching(message, bot, scope).await?;
+    if stickers.is_empty() {
+        return Err(anyhow!("当前消息没有可教学的表情包"));
+    }
+    teach(&stickers, label, learned_by, scope).await
+}
+
 fn value_as_identifier(data: &serde_json::Value, fields: &[&str]) -> Option<String> {
     fields.iter().find_map(|field| {
         let value = data.get(*field)?;

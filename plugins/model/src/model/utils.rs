@@ -21,12 +21,13 @@ use super::recall::{
 };
 use super::reply::attach_reply_protocol_context;
 use super::thinking::{ThinkingDestination, ThinkingReporter, strip_thinking_notices};
-use super::tool_access::ToolExecutionContext;
+use super::tool_access::{StickerTeachingContext, ToolExecutionContext};
 use crate::config;
 use crate::group_access;
 use crate::memory::{MEMORY_MANAGER, MoodEntry, UserProfile};
 use crate::model::semantic::MessageUnderstanding;
 use crate::mood_system::MOOD_SYSTEM;
+use crate::sticker_memory::StickerScope;
 use crate::utils;
 use crate::vision::{
     ImageRequestScope, VisionImage, default_vision_prompt, extract_response_content,
@@ -35,9 +36,9 @@ use crate::vision::{
 use crate::vision_router::analyze_images;
 use anyhow::Context;
 use chrono::{Local, TimeZone};
-use kovi::RuntimeBot;
 use kovi::serde_json::Value;
 use kovi::tokio::sync::{Mutex, Semaphore};
+use kovi::{Message, RuntimeBot};
 use reqwest::Client;
 use serde::Serialize;
 use serde_json::json;
@@ -137,7 +138,7 @@ pub(crate) fn is_help_command(message: &str) -> bool {
 }
 
 pub(crate) fn command_help() -> &'static str {
-    "管理员可用指令：\n聊天：直接发送消息，或 @芸汐。\n图片：#看图、#看截图、#识图。\n提醒：直接说“提醒我……”即可创建提醒。\n管理员：#系统信息、#健康检查、#禁言、#结束禁言。\n表情：#教芸汐、#待确认表情、#确认表情 编号 含义、#驳回表情 编号、#忽略表情 编号。\n群授权：#授权群 群号、#取消授权群 群号、#授权群列表。\n主管理员：#授权管理员 QQ号、#取消授权管理员 QQ号、#授权管理员列表。\n数据：私聊发送 #删除我的数据；群内发送 #删除本群数据。\n也可以直接说“查看系统信息”“检查健康状态”“暂停本群回复”或“恢复本群回复”。"
+    "管理员可用指令：\n聊天：直接发送消息，或 @芸汐。\n图片：#看图、#看截图、#识图。\n提醒：直接说“提醒我……”即可创建提醒。\n管理员：#系统信息、#健康检查、#禁言、#结束禁言。\n表情：引用或附带表情后直接描述含义即可教学，也可使用 #教芸汐、#待确认表情、#确认表情 编号 含义、#驳回表情 编号、#忽略表情 编号。\n群授权：#授权群 群号、#取消授权群 群号、#授权群列表。\n主管理员：#授权管理员 QQ号、#取消授权管理员 QQ号、#授权管理员列表。\n数据：私聊发送 #删除我的数据；群内发送 #删除本群数据。\n也可以直接说“查看系统信息”“检查健康状态”“暂停本群回复”或“恢复本群回复”。"
 }
 
 pub(crate) fn is_restricted_command(message: &str) -> bool {
@@ -299,6 +300,7 @@ pub async fn control_model(
     reply_ticket: ReplyTicket,
     max_output_tokens: Option<u32>,
     vision_images: Vec<VisionImage>,
+    sticker_teaching_message: Option<Message>,
     understanding: MessageUnderstanding,
 ) -> bool {
     let message = if message.trim().is_empty() && !vision_images.is_empty() {
@@ -402,6 +404,10 @@ pub async fn control_model(
             scheduled: false,
             group_paused: is_group_paused(group_id).await,
             runtime_bot: Some(Arc::clone(&bot)),
+            sticker_teaching: sticker_teaching_message.map(|message| StickerTeachingContext {
+                message,
+                scope: StickerScope::Group(group_id),
+            }),
             requires_reminder_create: crate::reminders::looks_like_reminder_request(message),
             requires_external_tool: false,
         },
@@ -1471,6 +1477,7 @@ pub async fn process_group_reply(
         max_output_tokens,
         vision_images,
         source_message_ids,
+        None,
         understanding,
         false,
     )
@@ -1488,6 +1495,7 @@ pub(crate) async fn process_group_reply_claimed(
     max_output_tokens: Option<u32>,
     vision_images: Vec<VisionImage>,
     source_message_ids: Vec<i32>,
+    sticker_teaching_message: Option<Message>,
     understanding: MessageUnderstanding,
 ) -> bool {
     process_group_reply_inner(
@@ -1500,6 +1508,7 @@ pub(crate) async fn process_group_reply_claimed(
         max_output_tokens,
         vision_images,
         source_message_ids,
+        sticker_teaching_message,
         understanding,
         true,
     )
@@ -1517,6 +1526,7 @@ async fn process_group_reply_inner(
     max_output_tokens: Option<u32>,
     vision_images: Vec<VisionImage>,
     source_message_ids: Vec<i32>,
+    sticker_teaching_message: Option<Message>,
     understanding: MessageUnderstanding,
     already_claimed: bool,
 ) -> bool {
@@ -1553,6 +1563,7 @@ async fn process_group_reply_inner(
             reply_ticket,
             max_output_tokens,
             vision_images,
+            sticker_teaching_message,
             understanding,
         )
         .await;
@@ -1662,6 +1673,7 @@ pub async fn private_chat(
     reply_ticket: ReplyTicket,
     vision_images: Vec<VisionImage>,
     source_message_ids: Vec<i32>,
+    sticker_teaching_message: Option<Message>,
     understanding: MessageUnderstanding,
 ) {
     private_chat_inner_with_claim(
@@ -1672,6 +1684,7 @@ pub async fn private_chat(
         reply_ticket,
         vision_images,
         source_message_ids,
+        sticker_teaching_message,
         understanding,
         false,
     )
@@ -1687,6 +1700,7 @@ pub(crate) async fn private_chat_claimed(
     reply_ticket: ReplyTicket,
     vision_images: Vec<VisionImage>,
     source_message_ids: Vec<i32>,
+    sticker_teaching_message: Option<Message>,
     understanding: MessageUnderstanding,
 ) {
     private_chat_inner_with_claim(
@@ -1697,6 +1711,7 @@ pub(crate) async fn private_chat_claimed(
         reply_ticket,
         vision_images,
         source_message_ids,
+        sticker_teaching_message,
         understanding,
         true,
     )
@@ -1712,6 +1727,7 @@ async fn private_chat_inner_with_claim(
     reply_ticket: ReplyTicket,
     vision_images: Vec<VisionImage>,
     source_message_ids: Vec<i32>,
+    sticker_teaching_message: Option<Message>,
     understanding: MessageUnderstanding,
     already_claimed: bool,
 ) {
@@ -1726,12 +1742,14 @@ async fn private_chat_inner_with_claim(
         bot,
         reply_ticket,
         &vision_images,
+        sticker_teaching_message,
         &understanding,
     )
     .await;
     finish_reply(scope, reply_ticket).await;
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn private_chat_inner(
     user_id: i64,
     message: &str,
@@ -1739,6 +1757,7 @@ async fn private_chat_inner(
     bot: Arc<RuntimeBot>,
     reply_ticket: ReplyTicket,
     vision_images: &[VisionImage],
+    sticker_teaching_message: Option<Message>,
     understanding: &MessageUnderstanding,
 ) {
     let message = if message.trim().is_empty() && !vision_images.is_empty() {
@@ -1843,6 +1862,10 @@ async fn private_chat_inner(
             scheduled: false,
             group_paused: false,
             runtime_bot: Some(Arc::clone(&bot)),
+            sticker_teaching: sticker_teaching_message.map(|message| StickerTeachingContext {
+                message,
+                scope: StickerScope::Private(user_id),
+            }),
             requires_reminder_create: crate::reminders::looks_like_reminder_request(message),
             requires_external_tool: false,
         },

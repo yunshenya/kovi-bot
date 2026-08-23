@@ -36,9 +36,9 @@ use crate::vision::{
     is_vision_command, merge_image_attachments, resolve_image_urls, strip_vision_command,
     with_social_image_context,
 };
-use kovi::RuntimeBot;
 use kovi::event::PrivateMsgEvent;
 use kovi::tokio::sync::Mutex;
+use kovi::{Message, RuntimeBot};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
@@ -230,6 +230,9 @@ pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<Runtime
     }
 
     let sticker_scope = StickerScope::Private(user_id);
+    let sticker_teaching_message = (sender_is_admin
+        && (!stickers.is_empty() || has_reply(&event.message)))
+    .then(|| event.message.clone());
     let labels = match known_labels(&stickers, sticker_scope).await {
         Ok(labels) => labels,
         Err(error) => {
@@ -568,6 +571,7 @@ pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<Runtime
         model_message.clone(),
         vision_images.clone(),
         source_message_ids.clone(),
+        sticker_teaching_message.clone(),
         understanding.clone(),
     )
     .await
@@ -582,6 +586,7 @@ pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<Runtime
         reply_ticket,
         vision_images,
         source_message_ids,
+        sticker_teaching_message,
         understanding,
     )
     .await;
@@ -597,6 +602,7 @@ async fn claim_or_queue_private_reply(
     message: String,
     vision_images: Vec<VisionImage>,
     message_ids: Vec<i32>,
+    sticker_teaching_message: Option<Message>,
     understanding: MessageUnderstanding,
 ) -> Option<crate::model::ReplyTicket> {
     let scope_lock = scope_mutex(scope);
@@ -618,6 +624,7 @@ async fn claim_or_queue_private_reply(
             message,
             vision_images,
             message_ids,
+            sticker_teaching_message,
             understanding,
         )
         .await;
@@ -795,6 +802,7 @@ async fn queue_pending_private_message(
     message: String,
     vision_images: Vec<VisionImage>,
     message_ids: Vec<i32>,
+    sticker_teaching_message: Option<Message>,
     understanding: MessageUnderstanding,
 ) {
     let mut pending = PENDING_PRIVATE_MESSAGES.lock().await;
@@ -807,6 +815,7 @@ async fn queue_pending_private_message(
             message,
             vision_images,
             message_ids,
+            sticker_teaching_message,
             understanding,
         },
         "私聊",
@@ -833,6 +842,7 @@ async fn drain_pending_private_messages(
             ticket,
             pending.vision_images,
             pending.message_ids,
+            pending.sticker_teaching_message,
             pending.understanding,
         )
         .await;
@@ -907,6 +917,7 @@ mod tests {
                         url: "data:image/png;base64,AA==".to_string(),
                     }],
                     vec![301],
+                    None,
                     MessageUnderstanding::default(),
                 )
                 .await;
@@ -916,6 +927,7 @@ mod tests {
                     "第二条".to_string(),
                     Vec::new(),
                     vec![302],
+                    None,
                     MessageUnderstanding::default(),
                 )
                 .await;
@@ -947,6 +959,7 @@ mod tests {
                     "旧排队消息".to_string(),
                     Vec::new(),
                     vec![303],
+                    None,
                     MessageUnderstanding::default(),
                 )
                 .await;
