@@ -149,13 +149,10 @@ pub(crate) async fn handle_command(
         AuthorizationCommand::ListAdmins => list_admins().await,
         AuthorizationCommand::AdminHelp => Ok(admin_command_help().to_string()),
     };
-    Some(match response {
-        Ok(message) => message,
-        Err(error) => {
-            eprintln!("[ERROR] 授权命令执行失败: {}", error);
-            format!("授权操作失败：{}", error)
-        }
-    })
+    Some(response.unwrap_or_else(|error| {
+        eprintln!("[ERROR] 授权命令执行失败: {}", error);
+        format!("授权操作失败：{}", error)
+    }))
 }
 
 fn parse_command(message: &str) -> Option<AuthorizationCommand> {

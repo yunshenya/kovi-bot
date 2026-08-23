@@ -8,10 +8,7 @@
 
 use crate::memory::MemoryManager;
 use crate::model::semantic::{MessageUnderstanding, UnderstandingRequest, understand};
-use crate::model::utils::{BotMemory, Roles, params_model};
-use crate::model::{
-    normalize_legacy_message_text, send_tracked_group_message, send_tracked_private_message,
-};
+use crate::model::{send_tracked_group_message, send_tracked_private_message};
 use crate::mood_system::MOOD_SYSTEM;
 use crate::topic_generator::TopicGenerator;
 use anyhow::Result;
@@ -150,7 +147,11 @@ impl ProactiveChatManager {
             return Ok(false);
         }
 
-        let message = self.decide_main_admin_chat(main_admin).await;
+        let message = self
+            .topic_generator
+            .generate_memory_based_topic(None, Some(main_admin))
+            .await?
+            .map(|topic| topic.content);
         let decision_record = if message.is_some() {
             "主人主动关心决策：发送消息"
         } else {
@@ -190,91 +191,6 @@ impl ProactiveChatManager {
                 && memory.context == "proactive_main_admin_decision"
                 && memory.timestamp > decision_boundary
         })
-    }
-
-    async fn decide_main_admin_chat(&self, main_admin: i64) -> Option<String> {
-        let personality = self.memory_manager.get_bot_personality().await;
-        let profile = self.memory_manager.get_user_profile(main_admin).await;
-        let summary = self
-            .memory_manager
-            .get_conversation_summary("private_chat", main_admin)
-            .await;
-        let contextual_memories = self
-            .memory_manager
-            .get_recent_memories_for_subject(main_admin, Some("private"), 100)
-            .await
-            .into_iter()
-            .filter(|memory| !memory.context.starts_with("proactive_"))
-            .take(12)
-            .collect::<Vec<_>>();
-        let has_profile_context = profile.as_ref().is_some_and(|profile| {
-            !profile.interests.is_empty() || !profile.personality_traits.is_empty()
-        });
-        if contextual_memories.is_empty()
-            && summary
-                .as_deref()
-                .is_none_or(|summary| summary.trim().is_empty())
-            && !has_profile_context
-        {
-            return None;
-        }
-        let recent_outreach = self
-            .memory_manager
-            .get_recent_memories_for_subject(main_admin, Some("proactive_private_chat"), 3)
-            .await
-            .into_iter()
-            .map(|memory| {
-                format!(
-                    "{}：{}",
-                    memory.timestamp.format("%m-%d %H:%M"),
-                    memory.content
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        let profile_description = profile.map_or_else(
-            || "暂时没有详细档案".to_string(),
-            |profile| {
-                format!(
-                    "昵称：{}；互动次数：{}；关系：{}/10；兴趣：{}",
-                    profile.nickname,
-                    profile.interaction_count,
-                    profile.relationship_level,
-                    profile.interests.join("、")
-                )
-            },
-        );
-        let memories = contextual_memories
-            .iter()
-            .map(|memory| memory.content.as_str())
-            .collect::<Vec<_>>()
-            .join("\n");
-        let now = Local::now().format("%Y-%m-%d %H:%M");
-        let mut request = vec![
-            BotMemory {
-                role: Roles::System,
-                content: "你是芸汐，一位温柔、害羞、慢热而真诚的女孩子。现在请自主决定是否要主动联系你最信任的人。\
-                          这不是定时任务：请根据当前时间、自己的情绪、近期互动与已有关心记录判断。\
-                          不要为了刷存在感而发送；对方刚忙完、频繁被打扰、没有自然的话题时，选择不打扰。\
-                          真心想问候、关心、分享一个自然的小心情时才发送。\
-                          严格按以下格式回答：如果不发送，只输出 [[SKIP]]；如果发送，先输出 [[SEND]]，随后写一条自然、简短、不过分黏人的私聊消息。不要解释规则。"
-                    .to_string(),
-            },
-            BotMemory {
-                role: Roles::User,
-                content: format!(
-                    "当前时间：{now}\n当前情绪：{}，能量：{}/10，社交信心：{}/10\n主人档案：{}\n滚动摘要：{}\n近期真实互动记忆：{}\n最近主动关心记录：{}",
-                    personality.current_mood,
-                    personality.energy_level,
-                    personality.social_confidence,
-                    profile_description,
-                    summary.unwrap_or_else(|| "（无）".to_string()),
-                    if memories.is_empty() { "（无）" } else { &memories },
-                    if recent_outreach.is_empty() { "（无）" } else { &recent_outreach },
-                ),
-            },
-        ];
-        parse_main_admin_decision(&params_model(&mut request).await.content)
     }
 
     async fn get_active_groups(&self) -> Vec<i64> {
@@ -489,14 +405,6 @@ fn is_sent_proactive_context(context: &str) -> bool {
     matches!(context, "proactive_group_chat" | "proactive_private_chat")
 }
 
-fn parse_main_admin_decision(content: &str) -> Option<String> {
-    let message = content.trim().strip_prefix("[[SEND]]")?.trim();
-    if message.is_empty() {
-        return None;
-    }
-    Some(normalize_legacy_message_text(message))
-}
-
 #[derive(Debug, Clone)]
 enum ChatTarget {
     Group(i64),
@@ -506,17 +414,7 @@ enum ChatTarget {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_sent_proactive_context, parse_main_admin_decision};
-
-    #[test]
-    fn main_admin_model_decision_requires_send_marker() {
-        assert_eq!(
-            parse_main_admin_decision("[[SEND]] 刚刚想到你啦，今天还好吗？"),
-            Some("刚刚想到你啦，今天还好吗？".to_string())
-        );
-        assert_eq!(parse_main_admin_decision("[[SKIP]]"), None);
-        assert_eq!(parse_main_admin_decision("随便问候一下"), None);
-    }
+    use super::is_sent_proactive_context;
 
     #[test]
     fn skipped_main_admin_decision_does_not_start_global_cooldown() {

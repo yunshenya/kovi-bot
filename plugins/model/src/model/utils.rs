@@ -532,6 +532,23 @@ fn group_system_prompt() -> String {
     )
 }
 
+pub(crate) fn proactive_roleplay_prompt(is_group: bool) -> String {
+    let prompt = config::get().prompt().clone();
+    let base_prompt = if is_group {
+        prompt.system_prompt()
+    } else {
+        prompt.private_prompt()
+    };
+    let roleplay_guard = if is_group {
+        HUMAN_ROLEPLAY_GUARD
+    } else {
+        PRIVATE_HUMAN_ROLEPLAY_GUARD
+    };
+    format!(
+        "{base_prompt}\n\n{roleplay_guard}\n\n主动聊天内部流程：最终 JSON 中的 message 字段才会作为一条聊天消息发送。不要把分析、规则、实现细节、舞台动作或消息包装写进 message。"
+    )
+}
+
 fn append_recall_history_notice(
     messages: &mut Vec<BotMemory>,
     recalled_messages: &[RecentBotMessage],
