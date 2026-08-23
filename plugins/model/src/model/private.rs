@@ -813,7 +813,6 @@ async fn queue_pending_private_message(
             user_id,
             sender: nickname,
             message,
-            addressed_to_bot: false,
             vision_images,
             message_ids,
             sticker_teaching_message,
