@@ -192,7 +192,7 @@ async fn main() {
         .await
         .is_some()
     {
-        println!("[INFO] 随机主动消息管理器已启动");
+        println!("[INFO] 主动消息管理器已启动");
     }
 
     // 确保后台任务只启动一次

@@ -201,8 +201,23 @@ impl ProactiveChatManager {
             .await;
         let contextual_memories = self
             .memory_manager
-            .get_contextual_memories(main_admin, "private_chat", "主动关心近况", 5)
-            .await;
+            .get_recent_memories_for_subject(main_admin, Some("private"), 100)
+            .await
+            .into_iter()
+            .filter(|memory| !memory.context.starts_with("proactive_"))
+            .take(12)
+            .collect::<Vec<_>>();
+        let has_profile_context = profile.as_ref().is_some_and(|profile| {
+            !profile.interests.is_empty() || !profile.personality_traits.is_empty()
+        });
+        if contextual_memories.is_empty()
+            && summary
+                .as_deref()
+                .is_none_or(|summary| summary.trim().is_empty())
+            && !has_profile_context
+        {
+            return None;
+        }
         let recent_outreach = self
             .memory_manager
             .get_recent_memories_for_subject(main_admin, Some("proactive_private_chat"), 3)
@@ -248,7 +263,7 @@ impl ProactiveChatManager {
             BotMemory {
                 role: Roles::User,
                 content: format!(
-                    "当前时间：{now}\n当前情绪：{}，能量：{}/10，社交信心：{}/10\n主人档案：{}\n滚动摘要：{}\n相关记忆：{}\n最近主动关心记录：{}",
+                    "当前时间：{now}\n当前情绪：{}，能量：{}/10，社交信心：{}/10\n主人档案：{}\n滚动摘要：{}\n近期真实互动记忆：{}\n最近主动关心记录：{}",
                     personality.current_mood,
                     personality.energy_level,
                     personality.social_confidence,
@@ -323,7 +338,7 @@ impl ProactiveChatManager {
         // 生成话题
         if let Some(topic) = self
             .topic_generator
-            .generate_topic(Some(group_id), None)
+            .generate_memory_based_topic(Some(group_id), None)
             .await?
         {
             let content = topic.content.clone();
@@ -356,10 +371,10 @@ impl ProactiveChatManager {
             return Ok(false);
         }
 
-        // 生成个性化话题
+        // 只根据真实近期互动、滚动摘要和长期档案生成主动话题
         if let Some(topic) = self
             .topic_generator
-            .generate_personalized_topic(user_id)
+            .generate_memory_based_topic(None, Some(user_id))
             .await?
         {
             let content = topic.content.clone();

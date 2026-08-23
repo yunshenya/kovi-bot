@@ -24,6 +24,7 @@ pub(crate) use message_actions::{MessageDestination, normalize_legacy_message_te
 pub(crate) use message_transport::MessageTransport;
 pub(crate) use model_gateway::ModelGateway;
 pub(crate) use recall::record_standalone_bot_message;
+pub(crate) use thinking::strip_thinking_notices;
 pub(crate) use tool_access::ToolExecutionContext;
 pub(crate) use utils::{BotMemory, Roles};
 
