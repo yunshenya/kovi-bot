@@ -20,6 +20,14 @@ pub struct ToolsConfig {
     web_search_max_results: usize,
     /// 网页正文最多保留多少字符。
     web_fetch_max_chars: usize,
+    /// 是否允许模型使用新闻专用搜索。
+    news_search_enabled: bool,
+    /// 是否允许模型查询公开天气数据。
+    weather_enabled: bool,
+    /// 是否允许模型使用本地安全计算器。
+    calculator_enabled: bool,
+    /// 是否注册管理员专用健康检查工具。
+    health_check_enabled: bool,
     /// 受信任的 MCP stdio 服务。
     mcp_servers: Vec<McpServerConfig>,
 }
@@ -78,6 +86,22 @@ impl ToolsConfig {
 
     pub fn web_fetch_max_chars(&self) -> usize {
         self.web_fetch_max_chars
+    }
+
+    pub fn news_search_enabled(&self) -> bool {
+        self.news_search_enabled
+    }
+
+    pub fn weather_enabled(&self) -> bool {
+        self.weather_enabled
+    }
+
+    pub fn calculator_enabled(&self) -> bool {
+        self.calculator_enabled
+    }
+
+    pub fn health_check_enabled(&self) -> bool {
+        self.health_check_enabled
     }
 
     pub fn mcp_servers(&self) -> &[McpServerConfig] {
@@ -223,6 +247,10 @@ impl Default for ToolsConfig {
             web_fetch_enabled: true,
             web_search_max_results: 5,
             web_fetch_max_chars: 12_000,
+            news_search_enabled: true,
+            weather_enabled: true,
+            calculator_enabled: true,
+            health_check_enabled: true,
             mcp_servers: Vec::new(),
         }
     }
@@ -254,6 +282,10 @@ mod tests {
         assert!(config.enabled());
         assert!(config.web_search_enabled());
         assert!(config.web_fetch_enabled());
+        assert!(config.news_search_enabled());
+        assert!(config.weather_enabled());
+        assert!(config.calculator_enabled());
+        assert!(config.health_check_enabled());
         assert!(config.mcp_servers().is_empty());
         assert!(config.validate().is_ok());
     }

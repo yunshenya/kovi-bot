@@ -5,7 +5,8 @@ use super::reply_disposition::SILENT_REPLY_OUTPUT;
 use super::thinking::ThinkingReporter;
 use super::tool_access::{ToolExecutionContext, ToolExecutionResult, tool_registry};
 use super::utils::{
-    BotMemory, Roles, is_model_error_response, params_model_with_token_limit_and_progress_for_reply,
+    BotMemory, Roles, complete_truncated_json_object, is_model_error_response,
+    params_model_with_token_limit_and_progress_for_reply,
 };
 use crate::config;
 use crate::vision::VisionImage;
@@ -104,7 +105,7 @@ pub(crate) async fn params_model_with_tool_access(
     let mut request = messages.to_vec();
     request.push(BotMemory {
         role: Roles::System,
-        content: registry.instruction_for(tool_context.scheduled),
+        content: registry.instruction_for(tool_context.scheduled, tool_context.is_admin),
     });
     if tool_context.requires_reminder_create {
         request.push(BotMemory {
@@ -206,14 +207,15 @@ pub(crate) async fn params_model_with_tool_access(
                     reminder_failure_detail = Some(reason.clone());
                 }
                 eprintln!(
-                    "[WARN] 模型工具调用格式无效 (范围: {}:{}, 轮次: {}, 原因: {}, 响应字符数: {}, 开始标记: {}, 结束标记: {})",
+                    "[WARN] 模型工具调用格式无效 (范围: {}:{}, 轮次: {}, 原因: {}, 响应字符数: {}, 开始标记: {}, 结束标记: {}, 响应预览: {})",
                     tool_context.context,
                     tool_context.subject_id,
                     round + 1,
                     reason,
                     response.content.chars().count(),
                     response.content.matches(TOOL_CALL_START).count(),
-                    response.content.matches(TOOL_CALL_END).count()
+                    response.content.matches(TOOL_CALL_END).count(),
+                    compact_log_text(&response.content)
                 );
                 request.push(BotMemory {
                     role: Roles::Assistant,
@@ -347,7 +349,10 @@ pub(crate) async fn params_model_with_tool_access(
 }
 
 fn is_external_tool_name(name: &str) -> bool {
-    matches!(name, "web.search" | "web.fetch") || name.starts_with("mcp.")
+    matches!(
+        name,
+        "web.search" | "web.fetch" | "news.search" | "weather.current" | "weather.forecast"
+    ) || name.starts_with("mcp.")
 }
 
 fn should_retry_reminder_create(
@@ -517,8 +522,7 @@ fn parse_tool_call_with_wrapping(content: &str, allow_wrapping: bool) -> ParsedT
         if content[json_start..].contains(TOOL_CALL_START) {
             return ParsedToolCall::Invalid("工具调用标记必须唯一且成对".to_string());
         }
-        let json = content[json_start..].trim();
-        return match parse_tool_call_json(json) {
+        return match parse_tool_call_payload(&content[json_start..]) {
             ParsedToolCall::Call(call) => ParsedToolCall::Call(call),
             ParsedToolCall::None => ParsedToolCall::Invalid("工具调用缺少结束标记".to_string()),
             ParsedToolCall::Invalid(_) => {
@@ -538,8 +542,7 @@ fn parse_tool_call_with_wrapping(content: &str, allow_wrapping: bool) -> ParsedT
     }
     // Some providers wrap a valid call in a short preamble or Markdown fence. The
     // surrounding text is never executed; only the single JSON payload is trusted.
-    let json = content[json_start..end].trim();
-    parse_tool_call_json(json)
+    parse_tool_call_payload(&content[json_start..end])
 }
 
 /// Some gateways repeat an identical streamed tool-call block. Collapse only
@@ -585,13 +588,62 @@ fn parse_tool_call_json(json: &str) -> ParsedToolCall {
     if json.chars().count() > MAX_TOOL_CALL_JSON_CHARS {
         return ParsedToolCall::Invalid("工具参数过长".to_string());
     }
-    let Ok(call) = serde_json::from_str::<ToolCall>(json) else {
-        return ParsedToolCall::Invalid("JSON 无法解析或包含未知字段".to_string());
+    let call = match serde_json::from_str::<ToolCall>(json) {
+        Ok(call) => call,
+        Err(_) => {
+            let Some(completed) = complete_truncated_json_object(json, MAX_TOOL_CALL_JSON_CHARS)
+            else {
+                return ParsedToolCall::Invalid("JSON 无法解析或包含未知字段".to_string());
+            };
+            let Ok(call) = serde_json::from_str::<ToolCall>(&completed) else {
+                return ParsedToolCall::Invalid("JSON 无法解析或包含未知字段".to_string());
+            };
+            call
+        }
     };
     if call.name.trim().is_empty() {
         return ParsedToolCall::Invalid("工具名称不能为空".to_string());
     }
     ParsedToolCall::Call(call)
+}
+
+fn parse_tool_call_payload(payload: &str) -> ParsedToolCall {
+    let mut payload = payload.trim();
+    for malformed_end in ["[/TOOL_CALL]]", "/TOOL_CALL]]"] {
+        if let Some(stripped) = payload.strip_suffix(malformed_end) {
+            payload = stripped.trim_end();
+            break;
+        }
+    }
+    if let Some(stripped) = payload
+        .strip_prefix("\x60\x60\x60json")
+        .or_else(|| payload.strip_prefix("\x60\x60\x60JSON"))
+        .or_else(|| payload.strip_prefix("\x60\x60\x60"))
+    {
+        payload = stripped.trim();
+    }
+    let Some(object_start) = payload.find('{') else {
+        return ParsedToolCall::Invalid("工具调用缺少 JSON 对象".to_string());
+    };
+    if !payload[..object_start].trim().is_empty() {
+        return ParsedToolCall::Invalid("工具调用 JSON 前包含额外文字".to_string());
+    }
+    payload = &payload[object_start..];
+
+    for (offset, character) in payload.char_indices().rev() {
+        if character != '}' {
+            continue;
+        }
+        let candidate = &payload[..offset + character.len_utf8()];
+        let suffix = payload[offset + character.len_utf8()..].trim();
+        if !suffix.is_empty() && suffix != "\x60\x60\x60" {
+            continue;
+        }
+        if let ParsedToolCall::Call(call) = parse_tool_call_json(candidate) {
+            return ParsedToolCall::Call(call);
+        }
+    }
+    parse_tool_call_json(payload)
 }
 
 fn format_tool_result(name: &str, result: &str) -> String {
@@ -703,6 +755,55 @@ mod tests {
             ),
             ParsedToolCall::Invalid(_)
         ));
+    }
+
+    #[test]
+    fn recovers_tool_call_missing_outer_json_brace() {
+        let ParsedToolCall::Call(call) = parse_tool_call_with_wrapping(
+            r#"[[TOOL_CALL]]{"name":"web.search","arguments":{"query":"查一下星空这个关键词然后发我","limit":5}"#,
+            true,
+        ) else {
+            panic!("只缺少最外层 JSON 结束括号的工具调用应可恢复");
+        };
+        assert_eq!(call.name, "web.search");
+        assert_eq!(call.arguments["query"], "查一下星空这个关键词然后发我");
+        assert_eq!(call.arguments["limit"], 5);
+    }
+
+    #[test]
+    fn does_not_repair_an_unterminated_json_string() {
+        assert!(matches!(
+            parse_tool_call_with_wrapping(
+                r#"[[TOOL_CALL]]{"name":"web.search","arguments":{"query":"星空}"#,
+                true,
+            ),
+            ParsedToolCall::Invalid(_)
+        ));
+    }
+
+    #[test]
+    fn extracts_a_strict_tool_call_from_a_markdown_fence() {
+        let fenced = concat!(
+            "前置说明 [[TOOL_CALL]]",
+            "\x60\x60\x60json\n{\"name\": \"time.now\", \"arguments\": {}}\n",
+            "\x60\x60\x60"
+        );
+        let ParsedToolCall::Call(call) = parse_tool_call_with_wrapping(fenced, true) else {
+            panic!("合法 JSON 外层的代码围栏不应阻断工具调用");
+        };
+        assert_eq!(call.name, "time.now");
+    }
+
+    #[test]
+    fn recovers_streamed_closing_marker_missing_opening_brackets() {
+        let ParsedToolCall::Call(call) = parse_tool_call_with_wrapping(
+            r#"[[TOOL_CALL]]{"name":"weather.current","arguments":{"location":"上海"}}/TOOL_CALL]]"#,
+            true,
+        ) else {
+            panic!("只缺少结束标记开头方括号的工具调用应可恢复");
+        };
+        assert_eq!(call.name, "weather.current");
+        assert_eq!(call.arguments["location"], "上海");
     }
 
     #[test]

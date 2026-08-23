@@ -288,6 +288,10 @@ export VISION_REQUIRES_AUTH="true"
 - `memory.search`：查询当前私聊对象或当前群的长期记忆，范围由程序强制决定。
 - `web.search`：搜索公开网页；配置 `BRAVE_SEARCH_API_KEY` 时优先使用 Brave Search，失败后依次使用 Bing、DuckDuckGo HTML 兜底。
 - `web.fetch`：读取公开网页正文，只允许 HTTP/HTTPS，拒绝本机、内网 IP、内网 DNS 解析和自动重定向。
+- `news.search`：按主题和最近天数搜索新闻，可限制来源域名；定时新闻任务优先使用它。
+- `weather.current` / `weather.forecast`：通过公开天气服务查询地点的当前天气和未来预报。
+- `calculator`：在本地执行受限数学表达式，不执行命令、代码或文件操作。
+- `health.check`：管理员专用，检查模型鉴权、数据库、Redis、工具注册表和 readiness 状态。
 - `mcp.<服务名>.<工具名>`：来自配置白名单的 MCP 工具。
 
 模型最多连续调用有限轮次，工具参数、超时、结果长度和工具名称都由程序校验。工具返回内容会被标记为资料，不会被当成新的系统指令。MCP 目前使用 stdio 子进程传输；服务必须在 `tools.mcp_servers` 中配置，工具必须列入 `allowed_tools`。`read_only = true` 时会拒绝 MCP 明确标记为破坏性或名称带常见写操作动词的工具。MCP 子进程只继承 `PATH` 和 `inherit_env` 明确列出的变量，不会拿到主进程的整套密钥。修改 `bot.conf.toml` 后需要重启机器人。

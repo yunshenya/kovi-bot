@@ -1,3 +1,4 @@
+use super::utils::complete_truncated_json_object;
 use crate::model::interrupt::ReplyScope;
 use crate::model::recall::{BOT_RECALL_WINDOW_SECS, recent_bot_messages};
 use crate::model::reply_disposition::{ReplyDisposition, normalize_reply_disposition};
@@ -263,6 +264,11 @@ pub(crate) fn parse_reply_output(content: &str) -> ParsedReply {
         let start = cursor + relative_start;
         let body_start = start + ACTION_START.len();
         let Some(relative_end) = clean[body_start..].find(ACTION_END) else {
+            if !protocol_parsed
+                && let Some(parsed) = parse_protocol_json_with_recovery(clean[body_start..].trim())
+            {
+                protocol = parsed;
+            }
             clean.replace_range(start.., "");
             break;
         };
@@ -391,6 +397,13 @@ fn parse_protocol_json(raw: &str) -> Option<ParsedReplyProtocol> {
             at_user_ids,
             recall_message_ids,
         },
+    })
+}
+
+fn parse_protocol_json_with_recovery(raw: &str) -> Option<ParsedReplyProtocol> {
+    parse_protocol_json(raw).or_else(|| {
+        let completed = complete_truncated_json_object(raw, MAX_REPLY_PROTOCOL_CHARS)?;
+        parse_protocol_json(&completed)
     })
 }
 
@@ -575,6 +588,17 @@ mod tests {
         );
         assert_eq!(parsed.content, "普通正文");
         assert_eq!(parsed.messages, None);
+    }
+
+    #[test]
+    fn recovers_reply_action_without_closing_marker_or_outer_brace() {
+        let parsed =
+            parse_reply_output(r#"[[REPLY_ACTION]]{"messages":["我刚看了一下，等会儿发你"]"#);
+        assert_eq!(parsed.content, "");
+        assert_eq!(
+            parsed.messages,
+            Some(vec!["我刚看了一下，等会儿发你".to_string()])
+        );
     }
 
     #[test]

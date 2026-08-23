@@ -466,6 +466,7 @@ async fn build_generic_task(reminder: &ClaimedReminder) -> Result<String> {
         crate::model::ToolExecutionContext {
             subject_id: destination_subject_id(reminder.destination),
             actor_user_id: reminder.creator_user_id,
+            is_admin: false,
             context: "scheduled_task",
             destination: reminder.destination,
             scheduled: true,

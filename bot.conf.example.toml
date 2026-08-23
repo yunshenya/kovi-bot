@@ -97,6 +97,11 @@ web_search_enabled = true
 web_fetch_enabled = true
 web_search_max_results = 5
 web_fetch_max_chars = 12000
+# 内置工具开关；新闻和天气可用于普通对话及定时任务，健康检查仅管理员可用。
+news_search_enabled = true
+weather_enabled = true
+calculator_enabled = true
+health_check_enabled = true
 # 如需 MCP，请把 mcp_servers=[] 替换为下面的 [[tools.mcp_servers]] 配置；定时任务默认不允许 MCP。
 mcp_servers = []
 # [[tools.mcp_servers]]

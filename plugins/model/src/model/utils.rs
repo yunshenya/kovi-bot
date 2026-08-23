@@ -78,6 +78,7 @@ static PRIVATE_HISTORY_ACCESS: LazyLock<Mutex<HashMap<i64, Instant>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 const MAX_RUNTIME_CONVERSATIONS: usize = 512;
+const MAX_STREAM_ENVELOPE_BYTES: usize = 16 * 1024 * 1024;
 
 pub(crate) async fn clear_private_runtime_data(user_id: i64) {
     PRIVATE_MESSAGE_MEMORY.lock().await.remove(&user_id);
@@ -198,6 +199,58 @@ pub struct BotMemory {
     pub(crate) role: Roles,
     /// 消息内容
     pub(crate) content: String,
+}
+
+/// Complete a JSON object that was cut off only at one or more closing
+/// delimiters. The caller must still parse the returned text with its strict
+/// schema; this helper only handles the unambiguous end-of-stream case.
+pub(crate) fn complete_truncated_json_object(raw: &str, max_chars: usize) -> Option<String> {
+    let raw = raw.trim();
+    if raw.chars().count() > max_chars || !raw.starts_with('{') {
+        return None;
+    }
+
+    let mut stack = Vec::new();
+    let mut in_string = false;
+    let mut escaped = false;
+    for character in raw.chars() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match character {
+            '"' => in_string = true,
+            '{' | '[' => stack.push(character),
+            '}' => {
+                if stack.pop() != Some('{') {
+                    return None;
+                }
+            }
+            ']' if stack.pop() != Some('[') => return None,
+            _ => {}
+        }
+    }
+
+    if in_string || stack.is_empty() {
+        return None;
+    }
+
+    let mut completed = raw.to_string();
+    while let Some(opening) = stack.pop() {
+        completed.push(match opening {
+            '{' => '}',
+            '[' => ']',
+            _ => return None,
+        });
+    }
+    (completed.chars().count() <= max_chars).then_some(completed)
 }
 
 /// 模型配置结构体
@@ -339,6 +392,7 @@ pub async fn control_model(
         ToolExecutionContext {
             subject_id: group_id,
             actor_user_id: user_id,
+            is_admin: crate::model::utils::is_bot_admin(&bot, user_id),
             context: "group_chat",
             destination: MessageDestination::Group(group_id),
             scheduled: false,
@@ -1030,11 +1084,28 @@ async fn read_model_content(
     reporter: Option<&ThinkingReporter>,
     max_response_bytes: usize,
 ) -> Result<String, String> {
+    let is_event_stream = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value.split(';').next().is_some_and(|media_type| {
+                media_type.trim().eq_ignore_ascii_case("text/event-stream")
+            })
+        });
+    let body_limit = if is_event_stream {
+        max_response_bytes
+            .saturating_mul(8)
+            .min(MAX_STREAM_ENVELOPE_BYTES)
+            .max(max_response_bytes)
+    } else {
+        max_response_bytes
+    };
     if response
         .content_length()
-        .is_some_and(|length| length > max_response_bytes as u64)
+        .is_some_and(|length| length > body_limit as u64)
     {
-        return Err(format!("模型响应超过 {} 字节上限", max_response_bytes));
+        return Err(format!("模型响应超过 {} 字节上限", body_limit));
     }
     let mut raw_body = Vec::new();
     let mut pending = Vec::new();
@@ -1045,8 +1116,8 @@ async fn read_model_content(
         .await
         .map_err(|error| format!("模型响应读取失败: {error}"))?
     {
-        if raw_body.len().saturating_add(chunk.len()) > max_response_bytes {
-            return Err(format!("模型响应超过 {} 字节上限", max_response_bytes));
+        if raw_body.len().saturating_add(chunk.len()) > body_limit {
+            return Err(format!("模型响应超过 {} 字节上限", body_limit));
         }
         raw_body.extend_from_slice(&chunk);
         pending.extend_from_slice(&chunk);
@@ -1060,6 +1131,9 @@ async fn read_model_content(
     }
 
     if !streamed_content.trim().is_empty() {
+        if streamed_content.len() > max_response_bytes {
+            return Err(format!("模型正文超过 {} 字节上限", max_response_bytes));
+        }
         return Ok(strip_thinking_notices(&streamed_content));
     }
 
@@ -1732,6 +1806,7 @@ async fn private_chat_inner(
         ToolExecutionContext {
             subject_id: user_id,
             actor_user_id: user_id,
+            is_admin: crate::model::utils::is_bot_admin(&bot, user_id),
             context: "private_chat",
             destination: MessageDestination::Private(user_id),
             scheduled: false,
