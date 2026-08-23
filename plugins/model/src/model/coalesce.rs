@@ -170,6 +170,7 @@ where
     ) -> Option<TextBatch> {
         part.text = truncate_chars(&part.text, policy.max_input_chars);
         part.intent_text = truncate_chars(&part.intent_text, policy.max_input_chars);
+        let image_only_part = !part.images.is_empty() && part.intent_text.trim().is_empty();
         if !policy.enabled {
             self.cancel(key).await;
             return Some(TextBatch {
@@ -221,10 +222,15 @@ where
             let reached_capacity =
                 batch.parts.len() >= policy.max_parts || batch.char_count >= policy.max_chars;
             let remaining = policy.max_wait.saturating_sub(batch.started_at.elapsed());
-            let semantic_delay = adaptive_delay(
-                batch.parts.last().map(String::as_str).unwrap_or_default(),
-                policy,
-            );
+            // 图片常常先发、文字问题随后补发；给首个纯图片批次完整窗口，避免过早启动模型请求。
+            let semantic_delay = if batch.parts.len() == 1 && image_only_part {
+                policy.max_wait
+            } else {
+                adaptive_delay(
+                    batch.parts.last().map(String::as_str).unwrap_or_default(),
+                    policy,
+                )
+            };
             if reached_capacity {
                 Duration::ZERO
             } else {
@@ -321,6 +327,7 @@ mod tests {
     use super::{
         BatchPolicy, BatchPushHook, MessageCoalescer, MessagePart, TextBatch, adaptive_delay,
     };
+    use crate::vision::ImageAttachment;
     use kovi::tokio::sync::Notify;
     use std::sync::Arc;
     use std::time::Duration;
@@ -394,6 +401,72 @@ mod tests {
         assert_eq!(adaptive_delay("我今天", policy), policy.incomplete_delay);
         assert_eq!(adaptive_delay("我知道了。", policy), policy.complete_delay);
         assert_eq!(adaptive_delay("我们晚点再聊", policy), policy.normal_delay);
+    }
+
+    #[test]
+    fn image_only_messages_wait_for_a_follow_up_text() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let mut policy = BatchPolicy::testing();
+                policy.max_wait = Duration::from_millis(300);
+                let coalescer = Arc::new(MessageCoalescer::default());
+                let mut first = {
+                    let coalescer = Arc::clone(&coalescer);
+                    kovi::tokio::spawn(async move {
+                        coalescer
+                            .push_with_policy(
+                                8_i64,
+                                MessagePart {
+                                    text: "先看看这张图。".to_string(),
+                                    intent_text: String::new(),
+                                    addressed: false,
+                                    plain_text: false,
+                                    vision_requested: true,
+                                    sticker_reaction: false,
+                                    images: vec![ImageAttachment {
+                                        key: "avatar".to_string(),
+                                        file: Some("avatar.png".to_string()),
+                                        url: None,
+                                    }],
+                                    message_ids: vec![601],
+                                },
+                                policy,
+                            )
+                            .await
+                    })
+                };
+
+                assert!(
+                    kovi::tokio::time::timeout(Duration::from_millis(60), &mut first)
+                        .await
+                        .is_err(),
+                    "纯图片批次不应在普通文本窗口内提前结束"
+                );
+                let combined = coalescer
+                    .push_with_policy(
+                        8_i64,
+                        MessagePart {
+                            text: "这个角色是什么？".to_string(),
+                            intent_text: "这个角色是什么？".to_string(),
+                            addressed: false,
+                            plain_text: true,
+                            vision_requested: false,
+                            sticker_reaction: false,
+                            images: Vec::new(),
+                            message_ids: vec![602],
+                        },
+                        policy,
+                    )
+                    .await
+                    .expect("补充文字应与图片合并");
+
+                assert_eq!(combined.text, "先看看这张图。\n这个角色是什么？");
+                assert_eq!(combined.intent_text, "\n这个角色是什么？");
+                assert_eq!(combined.message_ids, vec![601, 602]);
+                assert_eq!(combined.images.len(), 1);
+                assert!(first.await.expect("首个任务应正常结束").is_none());
+            });
     }
 
     #[test]
