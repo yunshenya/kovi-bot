@@ -175,14 +175,18 @@ pub(crate) fn split_reply(content: &str) -> Vec<String> {
 }
 
 pub(crate) fn normalize_legacy_message_text(content: &str) -> String {
-    content.replace(LEGACY_FOLLOW_UP_MARKER, "\n")
+    strip_markdown_bold_markers(&content.replace(LEGACY_FOLLOW_UP_MARKER, "\n"))
 }
 
 fn sanitize_reply_sections(sections: Vec<String>) -> Vec<String> {
     sections
         .into_iter()
-        .map(|section| strip_leading_stage_directions(&section))
+        .map(|section| strip_markdown_bold_markers(&strip_leading_stage_directions(&section)))
         .collect()
+}
+
+fn strip_markdown_bold_markers(content: &str) -> String {
+    content.replace("**", "")
 }
 
 fn strip_leading_stage_directions(content: &str) -> String {
@@ -264,7 +268,10 @@ pub(crate) fn follow_up_delay_millis(
 
 #[cfg(test)]
 mod tests {
-    use super::{MessageDestination, ReplyPlan, follow_up_delay_millis, split_reply};
+    use super::{
+        MessageDestination, ReplyPlan, follow_up_delay_millis, normalize_legacy_message_text,
+        split_reply,
+    };
     use crate::memory::BotPersonality;
     use crate::model::interrupt::ReplyScope;
     use crate::model::reply_disposition::ReplyDisposition;
@@ -301,6 +308,26 @@ mod tests {
                 assert_eq!(plan.bubbles, vec!["第一条", "第二条"]);
                 assert_eq!(plan.content, "第一条\n第二条");
                 assert!(plan.has_visible_reply());
+            });
+    }
+
+    #[test]
+    fn visible_replies_do_not_expose_markdown_bold_markers() {
+        assert_eq!(
+            normalize_legacy_message_text("结果是 **192**。"),
+            "结果是 192。"
+        );
+        assert_eq!(split_reply("结果是 **192**。"), vec!["结果是 192。"]);
+
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let plan = ReplyPlan::from_model_output(
+                    ReplyScope::Private(9_100_004),
+                    "[[REPLY_ACTION]]{\"messages\":[\"结果是 **192**。\",\"已处理\"]}[[/REPLY_ACTION]]",
+                )
+                .await;
+                assert_eq!(plan.bubbles, vec!["结果是 192。", "已处理"]);
             });
     }
 

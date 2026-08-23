@@ -2312,11 +2312,11 @@ mod tests {
     #[test]
     fn scheduled_task_output_is_plain_text_and_bounded() {
         let output = sanitize_scheduled_output(
-            "[[THINKING_NOTICE]]查询中[[/THINKING_NOTICE]]\n结果已经准备好。",
+            "[[THINKING_NOTICE]]查询中[[/THINKING_NOTICE]]\n结果是 **192**。",
             100,
         )
         .expect("定时任务结果应能发送");
-        assert_eq!(output, "结果已经准备好。");
+        assert_eq!(output, "结果是 192。");
 
         assert!(sanitize_scheduled_output("[[TOOL_CALL]]{}[[/TOOL_CALL]]", 100).is_err());
         assert!(
