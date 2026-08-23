@@ -302,6 +302,7 @@ pub async fn control_model(
     vision_images: Vec<VisionImage>,
     sticker_teaching_message: Option<Message>,
     understanding: MessageUnderstanding,
+    addressed_to_bot: bool,
 ) -> bool {
     let message = if message.trim().is_empty() && !vision_images.is_empty() {
         default_vision_prompt()
@@ -470,6 +471,49 @@ pub async fn control_model(
         reply_ticket,
     )
     .await;
+    if execution.sent_messages.is_empty()
+        && !execution.recall_requested
+        && addressed_to_bot
+        && let Some(fallback) = direct_greeting_fallback(message)
+        && is_current(reply_ticket).await
+    {
+        match bot.send_group_msg_return(group_id, fallback).await {
+            Ok(message_id)
+                if record_bot_message(reply_scope, reply_ticket, message_id, fallback, &bot)
+                    .await =>
+            {
+                println!("[INFO] 群聊短招呼使用兜底回复 (群组: {})", group_id);
+                if let Err(error) = MEMORY_REPOSITORY
+                    .add_conversation(
+                        group_id,
+                        &format!("芸汐: {}", fallback),
+                        "group_chat",
+                        None,
+                        &[],
+                    )
+                    .await
+                {
+                    eprintln!(
+                        "[ERROR] 群聊兜底回复记忆记录失败 (群组: {}): {}",
+                        group_id, error
+                    );
+                }
+                messages.push(BotMemory {
+                    role: Roles::Assistant,
+                    content: fallback.to_string(),
+                });
+                limit_memory_size(&mut messages);
+                return true;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                eprintln!(
+                    "[ERROR] 群聊兜底回复发送失败 (群组: {}): {:?}",
+                    group_id, error
+                );
+            }
+        }
+    }
     if !execution.recalled_messages.is_empty() {
         println!(
             "[INFO] 芸汐主动撤回群聊消息 (群组: {}, 数量: {})",
@@ -540,6 +584,24 @@ fn group_system_prompt() -> String {
         config::get().prompt().system_prompt(),
         HUMAN_ROLEPLAY_GUARD,
     )
+}
+
+fn direct_greeting_fallback(message: &str) -> Option<&'static str> {
+    let normalized = message
+        .trim()
+        .trim_matches(|character: char| {
+            character.is_ascii_punctuation() || "，。！？…～~".contains(character)
+        })
+        .to_ascii_lowercase();
+    match normalized.as_str() {
+        "oi" => Some("oi，我在呢，怎么啦？"),
+        "hi" | "hey" | "hello" => Some("我在呢，怎么啦？"),
+        "嗨" | "哈喽" => Some("嗨，我在呢。"),
+        "你好" => Some("你好呀，我在呢。"),
+        "在吗" | "你在吗" => Some("在呢，怎么啦？"),
+        "喂" => Some("嗯，我在。"),
+        _ => None,
+    }
 }
 
 pub(crate) fn proactive_roleplay_prompt(is_group: bool) -> String {
@@ -1480,6 +1542,7 @@ pub async fn process_group_reply(
         None,
         understanding,
         false,
+        false,
     )
     .await
 }
@@ -1497,6 +1560,7 @@ pub(crate) async fn process_group_reply_claimed(
     source_message_ids: Vec<i32>,
     sticker_teaching_message: Option<Message>,
     understanding: MessageUnderstanding,
+    addressed_to_bot: bool,
 ) -> bool {
     process_group_reply_inner(
         group_id,
@@ -1510,6 +1574,7 @@ pub(crate) async fn process_group_reply_claimed(
         source_message_ids,
         sticker_teaching_message,
         understanding,
+        addressed_to_bot,
         true,
     )
     .await
@@ -1528,6 +1593,7 @@ async fn process_group_reply_inner(
     source_message_ids: Vec<i32>,
     sticker_teaching_message: Option<Message>,
     understanding: MessageUnderstanding,
+    addressed_to_bot: bool,
     already_claimed: bool,
 ) -> bool {
     let scope = super::interrupt::ReplyScope::Group(group_id);
@@ -1565,6 +1631,7 @@ async fn process_group_reply_inner(
             vision_images,
             sticker_teaching_message,
             understanding,
+            addressed_to_bot,
         )
         .await;
         finish_reply(scope, reply_ticket).await;
@@ -2170,9 +2237,9 @@ pub fn get_file_modified_time_formatted() -> anyhow::Result<String> {
 mod tests {
     use super::{
         BotMemory, Roles, VisionImage, append_stream_delta, build_model_messages,
-        build_responses_input, compression_cutoff, extract_stream_delta, group_system_prompt,
-        is_group_admin_command, is_help_command, is_restricted_command, limit_memory_size,
-        model_attempt_count, sanitize_scheduled_output, with_reference_context,
+        build_responses_input, compression_cutoff, direct_greeting_fallback, extract_stream_delta,
+        group_system_prompt, is_group_admin_command, is_help_command, is_restricted_command,
+        limit_memory_size, model_attempt_count, sanitize_scheduled_output, with_reference_context,
     };
     use crate::memory::{BotPersonality, UserProfile};
     use crate::model::message_actions::{ReplyPlan, follow_up_delay_millis, split_reply};
@@ -2207,6 +2274,17 @@ mod tests {
         assert!(is_group_admin_command(" #健康检查 "));
         assert!(!is_restricted_command("请看看截图"));
         assert!(!is_restricted_command("芸汐，今天开心吗"));
+    }
+
+    #[test]
+    fn direct_greeting_fallback_only_handles_short_greetings() {
+        assert_eq!(
+            direct_greeting_fallback(" oi! "),
+            Some("oi，我在呢，怎么啦？")
+        );
+        assert_eq!(direct_greeting_fallback("在吗？"), Some("在呢，怎么啦？"));
+        assert_eq!(direct_greeting_fallback("oi 你看看这个"), None);
+        assert_eq!(direct_greeting_fallback("不要回复了"), None);
     }
 
     #[test]

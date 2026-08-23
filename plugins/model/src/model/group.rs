@@ -732,6 +732,7 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
             reply_scope,
             reply_ticket,
             participant_follow_up,
+            addressed_to_bot,
             group_id,
             event.user_id,
             sender.clone(),
@@ -763,6 +764,7 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
             source_message_ids.clone(),
             sticker_teaching_message.clone(),
             understanding.clone(),
+            addressed_to_bot,
         )
         .await;
         finish_conversation_turn(group_id, event.user_id, turn_marker, replied).await;
@@ -796,6 +798,7 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
             reply_scope,
             reply_ticket,
             participant_follow_up,
+            addressed_to_bot,
             group_id,
             event.user_id,
             sender.clone(),
@@ -822,6 +825,7 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
             source_message_ids.clone(),
             sticker_teaching_message.clone(),
             understanding.clone(),
+            addressed_to_bot,
         )
         .await;
         finish_conversation_turn(group_id, event.user_id, turn_marker, replied).await;
@@ -848,6 +852,7 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
             reply_scope,
             None,
             participant_follow_up,
+            addressed_to_bot,
             group_id,
             event.user_id,
             sender.clone(),
@@ -877,6 +882,7 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
             source_message_ids.clone(),
             sticker_teaching_message.clone(),
             understanding.clone(),
+            addressed_to_bot,
         )
         .await;
         finish_interjection_attempt(group_id, replied).await;
@@ -1261,6 +1267,7 @@ fn should_defer_active_window_message(
 async fn queue_pending_window_message(
     group_id: i64,
     user_id: i64,
+    addressed_to_bot: bool,
     sender: String,
     message: String,
     vision_images: Vec<VisionImage>,
@@ -1276,6 +1283,7 @@ async fn queue_pending_window_message(
             user_id,
             sender,
             message,
+            addressed_to_bot,
             vision_images,
             message_ids,
             sticker_teaching_message,
@@ -1291,6 +1299,7 @@ async fn claim_or_queue_group_reply(
     scope: ReplyScope,
     ticket: Option<crate::model::ReplyTicket>,
     participant_follow_up: bool,
+    addressed_to_bot: bool,
     group_id: i64,
     user_id: i64,
     sender: String,
@@ -1320,6 +1329,7 @@ async fn claim_or_queue_group_reply(
         queue_pending_window_message(
             group_id,
             user_id,
+            addressed_to_bot,
             sender,
             message,
             vision_images,
@@ -1372,6 +1382,7 @@ async fn drain_pending_window_messages(
             pending.message_ids,
             pending.sticker_teaching_message,
             pending.understanding,
+            pending.addressed_to_bot,
         )
         .await;
         finish_conversation_turn(group_id, pending.user_id, turn_marker, replied).await;
@@ -1801,6 +1812,7 @@ mod tests {
                 queue_pending_window_message(
                     group_id,
                     11,
+                    true,
                     "成员甲".to_string(),
                     "第一条".to_string(),
                     vec![VisionImage {
@@ -1814,6 +1826,7 @@ mod tests {
                 queue_pending_window_message(
                     group_id,
                     22,
+                    false,
                     "成员乙".to_string(),
                     "第二条".to_string(),
                     vec![VisionImage {
@@ -1854,6 +1867,7 @@ mod tests {
                 queue_pending_window_message(
                     group_id,
                     33,
+                    false,
                     "成员".to_string(),
                     "旧排队消息".to_string(),
                     Vec::new(),
