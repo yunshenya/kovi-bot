@@ -1,3 +1,4 @@
+use crate::config;
 use crate::group_access;
 use crate::memory::MEMORY_MANAGER;
 use crate::model::coalesce::{MessageCoalescer, MessagePart};
@@ -5,7 +6,7 @@ use crate::model::conversation_coordinator::{ConversationCoordinator, PendingTur
 use crate::model::interrupt::{ReplyScope, is_active, scope_mutex};
 use crate::model::recall::{
     clear_reply_scope_locked, has_recalled_messages, is_recent_bot_message,
-    send_tracked_private_message,
+    recent_bot_message_for_reaction, send_tracked_private_message,
 };
 use crate::model::reply::{clear_reply_targets, record_reply_target};
 use crate::model::semantic::{
@@ -25,7 +26,7 @@ use crate::sticker_memory;
 use crate::sticker_memory::{
     StickerScope, extract_stickers, has_reply, known_labels, quoted_message_context,
     stickers_for_teaching, teach, teaching_label, with_quoted_context, with_sticker_context,
-    with_unknown_sticker_context,
+    with_sticker_reaction_context, with_unknown_sticker_context,
 };
 use crate::vision::{
     ImageRequestScope, VisionImage, clear_user_pending_image_requests,
@@ -38,6 +39,7 @@ use kovi::event::PrivateMsgEvent;
 use kovi::tokio::sync::Mutex;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, LazyLock};
+use std::time::Duration;
 
 static PRIVATE_MESSAGE_BATCHES: LazyLock<MessageCoalescer<i64>> = LazyLock::new(Default::default);
 
@@ -228,6 +230,21 @@ pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<Runtime
     let pending_image_request =
         consume_pending_image_request(ImageRequestScope::Private(user_id), !images.is_empty())
             .await;
+    let recent_sticker_reaction =
+        if !stickers.is_empty() && !vision_command && !pending_image_request {
+            recent_bot_message_for_reaction(
+                reply_scope,
+                Duration::from_secs(
+                    config::get()
+                        .group_interjection()
+                        .sticker_reaction_window_secs(),
+                ),
+            )
+            .await
+        } else {
+            None
+        };
+    let sticker_reaction = recent_sticker_reaction.is_some();
     let active_reply = is_active(reply_scope).await;
     let immediate_stop = active_reply && looks_like_immediate_stop_request(message);
     let can_interrupt = vision_command;
@@ -293,6 +310,15 @@ pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<Runtime
     } else {
         with_sticker_context(&text_message, &labels)
     };
+    let current_message = if sticker_reaction {
+        recent_sticker_reaction
+            .as_ref()
+            .map_or(current_message.clone(), |bot_message| {
+                with_sticker_reaction_context(&current_message, &bot_message.content)
+            })
+    } else {
+        current_message
+    };
     let mut model_message = quoted.as_ref().map_or(current_message.clone(), |quoted| {
         with_quoted_context(&current_message, quoted)
     });
@@ -308,6 +334,7 @@ pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<Runtime
         plain_text,
         intent_text,
         batch_vision_requested,
+        batch_sticker_reaction,
         mut images,
         source_message_ids,
     ) = if !message.trim_start().starts_with('#') {
@@ -320,6 +347,7 @@ pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<Runtime
                     addressed: false,
                     plain_text: stickers.is_empty() && quoted.is_none(),
                     vision_requested,
+                    sticker_reaction,
                     images,
                     message_ids: vec![event.message_id],
                 },
@@ -333,6 +361,7 @@ pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<Runtime
             combined.plain_text,
             combined.intent_text,
             combined.vision_requested,
+            combined.sticker_reaction,
             combined.images,
             combined.message_ids,
         )
@@ -342,6 +371,7 @@ pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<Runtime
             false,
             text_message.clone(),
             vision_requested,
+            sticker_reaction,
             images,
             vec![event.message_id],
         )
@@ -365,6 +395,7 @@ pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<Runtime
         pending_image_request: false,
         addressed_to_bot: false,
         conversation_open: is_active(reply_scope).await,
+        sticker_reaction: batch_sticker_reaction,
     };
     let understanding = if intent_text.trim_start().starts_with('#') {
         MessageUnderstanding::default()

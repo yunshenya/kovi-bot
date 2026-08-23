@@ -34,6 +34,14 @@ pub struct GroupInterjectionConfig {
     direct_rate_window_secs: u64,
     /// 计数窗口内允许同一成员直接触发的最大次数。
     direct_rate_limit: usize,
+    /// 芸汐发言后，单独表情包可以被视为情绪回应的时间窗口（秒）。
+    sticker_reaction_window_secs: u64,
+    /// 同一成员表情回应的最短间隔（秒）。
+    sticker_reaction_cooldown_secs: u64,
+    /// 表情回应限流统计窗口（秒）。
+    sticker_reaction_rate_window_secs: u64,
+    /// 限流窗口内同一群最多回应多少次表情包。
+    sticker_reaction_rate_limit: usize,
 }
 
 impl GroupInterjectionConfig {
@@ -93,6 +101,22 @@ impl GroupInterjectionConfig {
         self.direct_rate_limit
     }
 
+    pub fn sticker_reaction_window_secs(&self) -> u64 {
+        self.sticker_reaction_window_secs
+    }
+
+    pub fn sticker_reaction_cooldown_secs(&self) -> u64 {
+        self.sticker_reaction_cooldown_secs
+    }
+
+    pub fn sticker_reaction_rate_window_secs(&self) -> u64 {
+        self.sticker_reaction_rate_window_secs
+    }
+
+    pub fn sticker_reaction_rate_limit(&self) -> usize {
+        self.sticker_reaction_rate_limit
+    }
+
     pub fn validate(&self) -> anyhow::Result<()> {
         if self.min_eligible_messages == 0 {
             return Err(anyhow::anyhow!("群聊接话消息间隔必须大于0"));
@@ -122,6 +146,13 @@ impl GroupInterjectionConfig {
         if self.direct_rate_limit < 2 {
             return Err(anyhow::anyhow!("群聊点名频率上限不能小于2"));
         }
+        if self.sticker_reaction_window_secs == 0
+            || self.sticker_reaction_cooldown_secs == 0
+            || self.sticker_reaction_rate_window_secs == 0
+            || self.sticker_reaction_rate_limit == 0
+        {
+            return Err(anyhow::anyhow!("群聊表情回应限流配置必须大于0"));
+        }
         Ok(())
     }
 }
@@ -143,6 +174,10 @@ impl Default for GroupInterjectionConfig {
             direct_spam_cooldown_secs: 600,
             direct_rate_window_secs: 60,
             direct_rate_limit: 4,
+            sticker_reaction_window_secs: 90,
+            sticker_reaction_cooldown_secs: 30,
+            sticker_reaction_rate_window_secs: 300,
+            sticker_reaction_rate_limit: 3,
         }
     }
 }

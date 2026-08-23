@@ -7,7 +7,7 @@ use crate::model::conversation_coordinator::{ConversationCoordinator, PendingTur
 use crate::model::interrupt::{ReplyScope, is_active, scope_mutex};
 use crate::model::recall::{
     clear_reply_scope_locked, has_recalled_messages, is_recent_bot_message,
-    send_tracked_group_message,
+    recent_bot_message_for_reaction, send_tracked_group_message,
 };
 use crate::model::reply::{clear_reply_targets, record_reply_target};
 use crate::model::semantic::{MessageUnderstanding, UnderstandingRequest, understand};
@@ -23,7 +23,7 @@ use crate::sticker_memory;
 use crate::sticker_memory::{
     StickerScope, extract_stickers, has_reply, known_labels, quoted_message_context,
     stickers_for_teaching, teach, teaching_label, with_quoted_context, with_sticker_context,
-    with_unknown_sticker_context,
+    with_sticker_reaction_context, with_unknown_sticker_context,
 };
 use crate::vision::{
     ImageRequestScope, VisionImage, clear_group_pending_image_requests,
@@ -49,6 +49,8 @@ struct GroupInterjectionState {
     conversation_until: Option<Instant>,
     last_bot_reply_at: Option<Instant>,
     conversation_participants: HashMap<i64, Instant>,
+    sticker_reaction_attempts: VecDeque<Instant>,
+    sticker_reaction_last_by_user: HashMap<i64, Instant>,
     next_turn_generation: u64,
     pending_participants: HashMap<i64, PendingConversationTurn>,
 }
@@ -385,11 +387,28 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
         !images.is_empty(),
     )
     .await;
+    let recent_sticker_reaction =
+        if !stickers.is_empty() && !vision_command && !pending_image_request {
+            recent_bot_message_for_reaction(
+                reply_scope,
+                Duration::from_secs(
+                    config::get()
+                        .group_interjection()
+                        .sticker_reaction_window_secs(),
+                ),
+            )
+            .await
+        } else {
+            None
+        };
+    let sticker_reaction = recent_sticker_reaction.is_some()
+        && reserve_sticker_reaction(group_id, event.user_id).await;
     if message.trim().is_empty()
         && (!images.is_empty() || !stickers.is_empty())
         && !vision_command
         && !pending_image_request
         && !addressed_to_bot
+        && !sticker_reaction
     {
         println!("[INFO] 收到群聊纯图片状态，保持静默 (群组: {})", group_id);
         return;
@@ -433,10 +452,19 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
     } else {
         message.to_string()
     };
-    let current_message = if images.is_empty() && labels.is_empty() && !stickers.is_empty() {
+    let current_message = if labels.is_empty() && !stickers.is_empty() {
         with_unknown_sticker_context(&text_message, stickers.len())
     } else {
         with_sticker_context(&text_message, &labels)
+    };
+    let current_message = if sticker_reaction {
+        recent_sticker_reaction
+            .as_ref()
+            .map_or(current_message.clone(), |bot_message| {
+                with_sticker_reaction_context(&current_message, &bot_message.content)
+            })
+    } else {
+        current_message
     };
     let model_message = quoted.as_ref().map_or(current_message.clone(), |quoted| {
         with_quoted_context(&current_message, quoted)
@@ -447,6 +475,7 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
         plain_text,
         intent_text,
         batch_vision_requested,
+        batch_sticker_reaction,
         images,
         source_message_ids,
     ) = if !message.trim_start().starts_with('#') {
@@ -459,6 +488,7 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
                     addressed: addressed_to_bot,
                     plain_text: stickers.is_empty() && quoted.is_none(),
                     vision_requested,
+                    sticker_reaction,
                     images,
                     message_ids: vec![event.message_id],
                 },
@@ -473,6 +503,7 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
             combined.plain_text,
             combined.intent_text,
             combined.vision_requested,
+            combined.sticker_reaction,
             combined.images,
             combined.message_ids,
         )
@@ -483,6 +514,7 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
             false,
             message.to_string(),
             vision_requested,
+            sticker_reaction,
             images,
             vec![event.message_id],
         )
@@ -505,9 +537,11 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
         pending_image_request: false,
         addressed_to_bot,
         conversation_open: active_reply || conversation_open,
+        sticker_reaction: batch_sticker_reaction,
     };
     let semantic_required = addressed_to_bot
         || batch_vision_requested
+        || batch_sticker_reaction
         || !images.is_empty()
         || active_reply
         || conversation_open;
@@ -594,6 +628,7 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
     let group_paused = is_group_paused(group_id).await;
     if addressed_to_bot
         || vision_requested
+        || batch_sticker_reaction
         || matches!(message.trim(), "#禁言" | "#结束禁言")
         || (group_paused && sender_is_admin)
     {
@@ -614,6 +649,11 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
             return;
         };
         let turn_marker = begin_conversation_turn(group_id, event.user_id).await;
+        let max_output_tokens = batch_sticker_reaction.then(|| {
+            config::get()
+                .group_interjection()
+                .interjection_max_output_tokens()
+        });
         let replied = process_group_reply_claimed(
             group_id,
             event.user_id,
@@ -621,7 +661,7 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
             Arc::clone(&bot),
             sender,
             ticket,
-            None,
+            max_output_tokens,
             vision_images.clone(),
             source_message_ids.clone(),
             understanding.clone(),
@@ -1290,6 +1330,67 @@ async fn reserve_interjection_decision(group_id: i64, message: &str) -> bool {
     true
 }
 
+/// 表情回应只在芸汐刚发言后的短窗口内进入模型，并单独限制同一成员和同一群的频率。
+async fn reserve_sticker_reaction(group_id: i64, user_id: i64) -> bool {
+    let limits = config::get().group_interjection().clone();
+    if !limits.enabled() {
+        return false;
+    }
+
+    let now = Instant::now();
+    let mut states = GROUP_INTERJECTION_STATE.lock().await;
+    prune_interjection_states(&mut states);
+    let state = states.entry(group_id).or_default();
+    sticker_reaction_budget_available(
+        state,
+        user_id,
+        now,
+        Duration::from_secs(limits.sticker_reaction_cooldown_secs()),
+        Duration::from_secs(limits.sticker_reaction_rate_window_secs()),
+        limits.sticker_reaction_rate_limit(),
+    )
+}
+
+fn sticker_reaction_budget_available(
+    state: &mut GroupInterjectionState,
+    user_id: i64,
+    now: Instant,
+    cooldown: Duration,
+    rate_window: Duration,
+    rate_limit: usize,
+) -> bool {
+    prune_sticker_reaction_attempts(state, now, rate_window);
+    if state
+        .sticker_reaction_last_by_user
+        .get(&user_id)
+        .is_some_and(|last| now.duration_since(*last) < cooldown)
+        || state.sticker_reaction_attempts.len() >= rate_limit
+    {
+        return false;
+    }
+
+    state.sticker_reaction_attempts.push_back(now);
+    state.sticker_reaction_last_by_user.insert(user_id, now);
+    true
+}
+
+fn prune_sticker_reaction_attempts(
+    state: &mut GroupInterjectionState,
+    now: Instant,
+    rate_window: Duration,
+) {
+    while state
+        .sticker_reaction_attempts
+        .front()
+        .is_some_and(|attempt| now.duration_since(*attempt) >= rate_window)
+    {
+        state.sticker_reaction_attempts.pop_front();
+    }
+    state
+        .sticker_reaction_last_by_user
+        .retain(|_, last| now.duration_since(*last) < rate_window);
+}
+
 fn has_interjection_candidate(message: &str, min_message_chars: usize) -> bool {
     let text = message.trim();
     !text.starts_with('#') && text.chars().count() >= min_message_chars
@@ -1349,13 +1450,21 @@ fn prune_interjection_states(states: &mut HashMap<i64, GroupInterjectionState>) 
     let interjection_config = config::get().group_interjection().clone();
     let cooldown = Duration::from_secs(interjection_config.cooldown_secs());
     let decision_window = Duration::from_secs(interjection_config.decision_rate_window_secs());
+    let sticker_window = Duration::from_secs(
+        interjection_config
+            .sticker_reaction_rate_window_secs()
+            .max(interjection_config.sticker_reaction_cooldown_secs()),
+    );
     states.retain(|_, state| {
         prune_conversation_participants(state, now);
         prune_decision_attempts(state, now, decision_window);
+        prune_sticker_reaction_attempts(state, now, sticker_window);
         state.interjection_in_flight
             || has_active_conversation_window(state.conversation_until, now)
             || !state.pending_participants.is_empty()
             || !state.decision_attempts.is_empty()
+            || !state.sticker_reaction_attempts.is_empty()
+            || !state.sticker_reaction_last_by_user.is_empty()
             || state
                 .last_interjection
                 .is_some_and(|last| now.duration_since(last) < cooldown)
@@ -1439,8 +1548,8 @@ mod tests {
         decision_budget_available, has_active_conversation_window, is_natural_short_follow_up,
         looks_like_immediate_stop_request, message_at_self, normalized_sender_name,
         prune_decision_attempts, queue_pending_window_message, roll_conversation_window,
-        should_defer_active_window_message, suppress_direct_trigger, take_pending_window_turn,
-        text_mentions_bot,
+        should_defer_active_window_message, sticker_reaction_budget_available,
+        suppress_direct_trigger, take_pending_window_turn, text_mentions_bot,
     };
     use crate::model::interrupt::{
         ReplyScope, interrupt, interrupt_locked, is_current, scope_mutex,
@@ -1656,6 +1765,63 @@ mod tests {
         complete_interjection_attempt(&mut state, true, now);
         assert!(!state.interjection_in_flight);
         assert_eq!(state.last_interjection, Some(now));
+    }
+
+    #[test]
+    fn sticker_reaction_budget_separates_user_cooldown_and_group_rate_limit() {
+        let now = Instant::now();
+        let mut state = GroupInterjectionState::default();
+        let cooldown = Duration::from_secs(30);
+        let rate_window = Duration::from_secs(300);
+
+        assert!(sticker_reaction_budget_available(
+            &mut state,
+            42,
+            now,
+            cooldown,
+            rate_window,
+            3,
+        ));
+        assert!(!sticker_reaction_budget_available(
+            &mut state,
+            42,
+            now + Duration::from_secs(1),
+            cooldown,
+            rate_window,
+            3,
+        ));
+        assert!(sticker_reaction_budget_available(
+            &mut state,
+            43,
+            now + Duration::from_secs(31),
+            cooldown,
+            rate_window,
+            3,
+        ));
+        assert!(sticker_reaction_budget_available(
+            &mut state,
+            44,
+            now + Duration::from_secs(32),
+            cooldown,
+            rate_window,
+            3,
+        ));
+        assert!(!sticker_reaction_budget_available(
+            &mut state,
+            45,
+            now + Duration::from_secs(33),
+            cooldown,
+            rate_window,
+            3,
+        ));
+        assert!(sticker_reaction_budget_available(
+            &mut state,
+            45,
+            now + Duration::from_secs(301),
+            cooldown,
+            rate_window,
+            3,
+        ));
     }
 
     #[test]

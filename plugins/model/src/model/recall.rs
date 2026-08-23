@@ -290,6 +290,17 @@ pub(crate) async fn recent_bot_messages(scope: ReplyScope) -> Vec<RecentBotMessa
     merge_recent_bot_messages(local_messages, redis_messages)
 }
 
+/// 返回最近一条仍在反应窗口内的芸汐消息，供纯表情回应判断使用。
+pub(crate) async fn recent_bot_message_for_reaction(
+    scope: ReplyScope,
+    window: Duration,
+) -> Option<RecentBotMessage> {
+    recent_bot_messages(scope)
+        .await
+        .into_iter()
+        .find(|message| message.sent_at.elapsed() < window)
+}
+
 pub(crate) async fn is_recent_bot_message(scope: ReplyScope, message_id: i32) -> bool {
     if message_id <= 0 {
         return false;

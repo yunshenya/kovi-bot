@@ -14,6 +14,7 @@ pub(crate) struct TextBatch {
     pub(crate) addressed: bool,
     pub(crate) plain_text: bool,
     pub(crate) vision_requested: bool,
+    pub(crate) sticker_reaction: bool,
     pub(crate) images: Vec<ImageAttachment>,
     pub(crate) message_ids: Vec<i32>,
 }
@@ -24,6 +25,7 @@ pub(crate) struct MessagePart {
     pub(crate) addressed: bool,
     pub(crate) plain_text: bool,
     pub(crate) vision_requested: bool,
+    pub(crate) sticker_reaction: bool,
     pub(crate) images: Vec<ImageAttachment>,
     pub(crate) message_ids: Vec<i32>,
 }
@@ -36,6 +38,7 @@ struct PendingBatch {
     addressed: bool,
     all_plain_text: bool,
     vision_requested: bool,
+    sticker_reaction: bool,
     images: Vec<ImageAttachment>,
     message_ids: Vec<i32>,
     started_at: Instant,
@@ -55,6 +58,7 @@ impl Default for PendingBatch {
             addressed: false,
             all_plain_text: true,
             vision_requested: false,
+            sticker_reaction: false,
             images: Vec::new(),
             message_ids: Vec::new(),
             started_at: Instant::now(),
@@ -174,6 +178,7 @@ where
                 addressed: part.addressed,
                 plain_text: part.plain_text,
                 vision_requested: part.vision_requested,
+                sticker_reaction: part.sticker_reaction,
                 images: part.images,
                 message_ids: part.message_ids,
             });
@@ -204,6 +209,7 @@ where
             batch.addressed |= part.addressed;
             batch.all_plain_text &= part.plain_text;
             batch.vision_requested |= part.vision_requested;
+            batch.sticker_reaction |= part.sticker_reaction;
             batch.images = merge_image_attachments(&batch.images, &part.images);
             for message_id in part.message_ids {
                 if !batch.message_ids.contains(&message_id) {
@@ -246,6 +252,7 @@ where
             addressed: batch.addressed,
             plain_text: batch.all_plain_text,
             vision_requested: batch.vision_requested,
+            sticker_reaction: batch.sticker_reaction,
             images: batch.images,
             message_ids: batch.message_ids,
         })
@@ -336,6 +343,7 @@ mod tests {
                                     addressed: true,
                                     plain_text: true,
                                     vision_requested: true,
+                                    sticker_reaction: false,
                                     images: Vec::new(),
                                     message_ids: vec![101],
                                 },
@@ -354,6 +362,7 @@ mod tests {
                             addressed: false,
                             plain_text: true,
                             vision_requested: false,
+                            sticker_reaction: true,
                             images: Vec::new(),
                             message_ids: vec![102],
                         },
@@ -370,6 +379,7 @@ mod tests {
                         addressed: true,
                         plain_text: true,
                         vision_requested: true,
+                        sticker_reaction: true,
                         images: Vec::new(),
                         message_ids: vec![101, 102],
                     })
@@ -406,6 +416,7 @@ mod tests {
                                     addressed: false,
                                     plain_text: true,
                                     vision_requested: false,
+                                    sticker_reaction: false,
                                     images: Vec::new(),
                                     message_ids: vec![201],
                                 },
@@ -424,6 +435,7 @@ mod tests {
                             addressed: false,
                             plain_text: true,
                             vision_requested: false,
+                            sticker_reaction: false,
                             images: Vec::new(),
                             message_ids: vec![202],
                         },
@@ -453,6 +465,7 @@ mod tests {
                                     addressed: false,
                                     plain_text: true,
                                     vision_requested: false,
+                                    sticker_reaction: false,
                                     images: Vec::new(),
                                     message_ids: vec![301],
                                 },
@@ -490,6 +503,7 @@ mod tests {
                                     addressed: false,
                                     plain_text: true,
                                     vision_requested: false,
+                                    sticker_reaction: false,
                                     images: Vec::new(),
                                     message_ids: vec![501],
                                 },
@@ -519,6 +533,7 @@ mod tests {
                                     addressed: true,
                                     plain_text: true,
                                     vision_requested: false,
+                                    sticker_reaction: false,
                                     images: Vec::new(),
                                     message_ids: vec![502],
                                 },
@@ -563,6 +578,7 @@ mod tests {
                             addressed: true,
                             plain_text: true,
                             vision_requested: false,
+                            sticker_reaction: false,
                             images: Vec::new(),
                             message_ids: vec![401],
                         },

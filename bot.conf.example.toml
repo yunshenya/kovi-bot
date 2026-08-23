@@ -55,6 +55,10 @@ conversation_open_floor_secs = 45
 direct_spam_cooldown_secs = 600
 direct_rate_window_secs = 60
 direct_rate_limit = 4
+sticker_reaction_window_secs = 90
+sticker_reaction_cooldown_secs = 30
+sticker_reaction_rate_window_secs = 300
+sticker_reaction_rate_limit = 3
 
 [memory]
 max_entries = 1000

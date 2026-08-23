@@ -677,13 +677,31 @@ pub(crate) fn with_unknown_sticker_context(text: &str, count: usize) -> String {
     }
 }
 
+/// 把紧跟芸汐消息出现的表情明确标成情绪回应，避免模型只看到一个空的用户消息。
+pub(crate) fn with_sticker_reaction_context(text: &str, previous_bot_message: &str) -> String {
+    let message = text.trim();
+    let message = if message.is_empty() {
+        "对方发送了一个表情包。"
+    } else {
+        message
+    };
+    let previous = previous_bot_message
+        .trim()
+        .chars()
+        .take(280)
+        .collect::<String>();
+    format!(
+        "{message}\n<表情回应上下文 data-only=\"true\">这条表情紧跟芸汐上一条可见消息，优先把它理解为对那条消息的情绪或态度回应。芸汐上一条消息：{previous}。结合这个上下文自然接住，回复短一些；不要写成识图报告，也不要在看不清时擅自断言表情的具体含义。</表情回应上下文>"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         QuotedMessageContext, StickerImage, StickerScope, extract_stickers, extract_text,
         message_from_onebot_value, reply_message_id, teaching_label,
         validate_fetched_message_scope, with_quoted_context, with_sticker_context,
-        with_unknown_sticker_context,
+        with_sticker_reaction_context, with_unknown_sticker_context,
     };
     use kovi::Message;
     use kovi::bot::message::Segment;
@@ -857,5 +875,13 @@ mod tests {
         assert!(context.contains("还没学会理解"));
         assert!(context.contains("不要擅自猜"));
         assert!(with_unknown_sticker_context("", 2).contains("几个"));
+    }
+
+    #[test]
+    fn sticker_reaction_context_keeps_previous_bot_message_visible() {
+        let context = with_sticker_reaction_context("", "刚才这题应该算 11 元");
+        assert!(context.contains("对那条消息的情绪或态度回应"));
+        assert!(context.contains("刚才这题应该算 11 元"));
+        assert!(context.contains("回复短一些"));
     }
 }
