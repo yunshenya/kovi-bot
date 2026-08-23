@@ -62,6 +62,29 @@ pub struct MemoryEntry {
     pub subject_id: Option<i64>,
 }
 
+/// 主动消息的持久化限频状态。
+///
+/// 这类状态不能放在普通记忆里，否则记忆达到容量上限时会被清理，
+/// 服务重启后就可能重新触发主动消息。
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
+#[serde(default)]
+pub(crate) struct ProactiveState {
+    pub(crate) last_decision_at: Option<DateTime<Local>>,
+    pub(crate) last_sent_at: Option<DateTime<Local>>,
+    pub(crate) day_key: String,
+    pub(crate) daily_sent_count: u32,
+}
+
+impl ProactiveState {
+    pub(crate) fn daily_count_for(&self, day_key: &str) -> u32 {
+        if self.day_key == day_key {
+            self.daily_sent_count
+        } else {
+            0
+        }
+    }
+}
+
 /// 记忆类型枚举
 ///
 /// 定义不同类型的记忆，用于分类存储和检索
@@ -297,6 +320,8 @@ pub struct MemoryManager {
     conversation_summaries: Arc<Mutex<HashMap<String, String>>>,
     /// 摘要最后更新时间；与摘要分开保存以兼容旧 JSON 快照。
     conversation_summary_updated_at: Arc<Mutex<HashMap<String, DateTime<Local>>>>,
+    /// 主动消息限频状态，独立于可压缩的普通记忆。
+    proactive_states: Arc<Mutex<HashMap<String, ProactiveState>>>,
     /// 机器人人格状态
     bot_personality: Arc<Mutex<BotPersonality>>,
     /// 旧版记忆文件路径，仅用于迁移和无数据库的单元测试实例
@@ -367,6 +392,7 @@ impl MemoryManager {
             conversation_summary_updated_at: Arc::new(Mutex::new(
                 data.conversation_summary_updated_at,
             )),
+            proactive_states: Arc::new(Mutex::new(data.proactive_states)),
             bot_personality: Arc::new(Mutex::new(data.bot_personality)),
             memory_file: memory_file.to_string(),
             save_lock: Arc::new(Mutex::new(())),
@@ -450,6 +476,148 @@ impl MemoryManager {
         self.database_pool.get()
     }
 
+    /// 获取主动消息的独立限频状态。
+    pub(crate) async fn get_proactive_state(&self, state_key: &str) -> Option<ProactiveState> {
+        if let Some(pool) = self.database_pool.get() {
+            match query(
+                "SELECT last_decision_at, last_sent_at, day_key, daily_sent_count FROM kovi_bot_proactive_state WHERE state_key = $1",
+            )
+            .bind(state_key)
+            .fetch_optional(pool)
+            .await
+            {
+                Ok(Some(row)) => {
+                    return Some(ProactiveState {
+                        last_decision_at: row
+                            .get::<Option<DateTime<Utc>>, _>("last_decision_at")
+                            .map(|value| value.with_timezone(&Local)),
+                        last_sent_at: row
+                            .get::<Option<DateTime<Utc>>, _>("last_sent_at")
+                            .map(|value| value.with_timezone(&Local)),
+                        day_key: row.get("day_key"),
+                        daily_sent_count: u32::try_from(
+                            row.get::<i32, _>("daily_sent_count"),
+                        )
+                        .unwrap_or_default(),
+                    });
+                }
+                Ok(None) => return None,
+                Err(error) => {
+                    eprintln!("[WARN] 查询主动消息限频状态失败，回退内存缓存: {}", error);
+                }
+            }
+        }
+
+        self.proactive_states.lock().await.get(state_key).cloned()
+    }
+
+    /// 记录一次主动决策和/或成功发送。
+    ///
+    /// `decision_key` 用于限制模型决策频率；`sent_keys` 同时更新全局、目标和
+    /// 主人专属计数。所有状态都在同一事务中写入，避免重启或记忆压缩造成丢失。
+    pub(crate) async fn record_proactive_event(
+        &self,
+        decision_key: Option<&str>,
+        sent_keys: &[String],
+        occurred_at: DateTime<Local>,
+    ) -> Result<()> {
+        let day_key = occurred_at.format("%Y-%m-%d").to_string();
+        let mut unique_sent_keys = Vec::new();
+        for key in sent_keys {
+            if !unique_sent_keys.contains(&key) {
+                unique_sent_keys.push(key);
+            }
+        }
+        let _save_guard = self.save_lock.lock().await;
+
+        if let Some(pool) = self.database_pool.get() {
+            let mut transaction = pool.begin().await?;
+            if let Some(state_key) = decision_key {
+                query(
+                    r#"
+                    INSERT INTO kovi_bot_proactive_state
+                        (state_key, last_decision_at, last_sent_at, day_key, daily_sent_count)
+                    VALUES ($1, $2, NULL, '', 0)
+                    ON CONFLICT (state_key) DO UPDATE SET
+                        last_decision_at = EXCLUDED.last_decision_at,
+                        updated_at = NOW()
+                    "#,
+                )
+                .bind(state_key)
+                .bind(occurred_at)
+                .execute(&mut *transaction)
+                .await?;
+            }
+            for state_key in &unique_sent_keys {
+                query(
+                    r#"
+                    INSERT INTO kovi_bot_proactive_state
+                        (state_key, last_decision_at, last_sent_at, day_key, daily_sent_count)
+                    VALUES ($1, NULL, $2, $3, 1)
+                    ON CONFLICT (state_key) DO UPDATE SET
+                        last_sent_at = EXCLUDED.last_sent_at,
+                        day_key = EXCLUDED.day_key,
+                        daily_sent_count = CASE
+                            WHEN kovi_bot_proactive_state.day_key = EXCLUDED.day_key
+                                THEN kovi_bot_proactive_state.daily_sent_count + 1
+                            ELSE 1
+                        END,
+                        updated_at = NOW()
+                    "#,
+                )
+                .bind(state_key.as_str())
+                .bind(occurred_at)
+                .bind(&day_key)
+                .execute(&mut *transaction)
+                .await?;
+            }
+            transaction.commit().await?;
+
+            let mut states = self.proactive_states.lock().await;
+            if let Some(state_key) = decision_key {
+                states
+                    .entry(state_key.to_string())
+                    .or_default()
+                    .last_decision_at = Some(occurred_at);
+            }
+            for state_key in unique_sent_keys {
+                let state = states.entry(state_key.clone()).or_default();
+                if state.day_key == day_key {
+                    state.daily_sent_count = state.daily_sent_count.saturating_add(1);
+                } else {
+                    state.day_key = day_key.clone();
+                    state.daily_sent_count = 1;
+                }
+                state.last_sent_at = Some(occurred_at);
+            }
+            return Ok(());
+        }
+
+        let mut data = self.snapshot().await;
+        if let Some(state_key) = decision_key {
+            data.proactive_states
+                .entry(state_key.to_string())
+                .or_default()
+                .last_decision_at = Some(occurred_at);
+        }
+        for state_key in unique_sent_keys {
+            let state = data
+                .proactive_states
+                .entry(state_key.to_string())
+                .or_default();
+            if state.day_key == day_key {
+                state.daily_sent_count = state.daily_sent_count.saturating_add(1);
+            } else {
+                state.day_key = day_key.clone();
+                state.daily_sent_count = 1;
+            }
+            state.last_sent_at = Some(occurred_at);
+        }
+        self.persist_file_snapshot_locked(&data).await?;
+        *self.proactive_states.lock().await = data.proactive_states;
+        Ok(())
+    }
+
     async fn replace_data(&self, data: MemoryData) {
         let mut data = data;
         let now = Local::now();
@@ -463,6 +631,7 @@ impl MemoryManager {
         *self.group_profiles.lock().await = data.group_profiles;
         *self.conversation_summaries.lock().await = data.conversation_summaries;
         *self.conversation_summary_updated_at.lock().await = data.conversation_summary_updated_at;
+        *self.proactive_states.lock().await = data.proactive_states;
         *self.bot_personality.lock().await = data.bot_personality;
     }
 
@@ -477,6 +646,7 @@ impl MemoryManager {
                 .lock()
                 .await
                 .clone(),
+            proactive_states: self.proactive_states.lock().await.clone(),
             bot_personality: self.bot_personality.lock().await.clone(),
         }
     }
@@ -575,6 +745,20 @@ impl MemoryManager {
         )
         .execute(pool)
         .await?;
+        query(
+            r#"
+            CREATE TABLE IF NOT EXISTS kovi_bot_proactive_state (
+                state_key TEXT PRIMARY KEY,
+                last_decision_at TIMESTAMPTZ,
+                last_sent_at TIMESTAMPTZ,
+                day_key TEXT NOT NULL DEFAULT '',
+                daily_sent_count INTEGER NOT NULL DEFAULT 0,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            "#,
+        )
+        .execute(pool)
+        .await?;
         Ok(())
     }
 
@@ -586,6 +770,7 @@ impl MemoryManager {
                 OR EXISTS(SELECT 1 FROM kovi_bot_user_profiles LIMIT 1)
                 OR EXISTS(SELECT 1 FROM kovi_bot_group_profiles LIMIT 1)
                 OR EXISTS(SELECT 1 FROM kovi_bot_conversation_summaries LIMIT 1)
+                OR EXISTS(SELECT 1 FROM kovi_bot_proactive_state LIMIT 1)
             "#,
         )
         .fetch_one(pool)
@@ -640,6 +825,30 @@ impl MemoryManager {
         {
             data.bot_personality = serde_json::from_value(row.get("payload"))?;
         }
+        for row in query(
+            "SELECT state_key, last_decision_at, last_sent_at, day_key, daily_sent_count FROM kovi_bot_proactive_state",
+        )
+        .fetch_all(pool)
+        .await?
+        {
+            let last_decision_at = row
+                .get::<Option<DateTime<Utc>>, _>("last_decision_at")
+                .map(|value| value.with_timezone(&Local));
+            let last_sent_at = row
+                .get::<Option<DateTime<Utc>>, _>("last_sent_at")
+                .map(|value| value.with_timezone(&Local));
+            let daily_sent_count = u32::try_from(row.get::<i32, _>("daily_sent_count"))
+                .unwrap_or_default();
+            data.proactive_states.insert(
+                row.get("state_key"),
+                ProactiveState {
+                    last_decision_at,
+                    last_sent_at,
+                    day_key: row.get("day_key"),
+                    daily_sent_count,
+                },
+            );
+        }
         Ok(data)
     }
 
@@ -656,6 +865,9 @@ impl MemoryManager {
         }
         for (summary_key, summary) in &data.conversation_summaries {
             Self::upsert_summary(&mut transaction, summary_key, summary).await?;
+        }
+        for (state_key, state) in &data.proactive_states {
+            Self::upsert_proactive_state(&mut transaction, state_key, state).await?;
         }
         Self::upsert_personality(&mut transaction, &data.bot_personality).await?;
         transaction.commit().await?;
@@ -705,6 +917,34 @@ impl MemoryManager {
         )
         .bind(profile.user_id)
         .bind(serde_json::to_value(profile)?)
+        .execute(&mut **transaction)
+        .await?;
+        Ok(())
+    }
+
+    async fn upsert_proactive_state(
+        transaction: &mut Transaction<'_, Postgres>,
+        state_key: &str,
+        state: &ProactiveState,
+    ) -> Result<()> {
+        query(
+            r#"
+            INSERT INTO kovi_bot_proactive_state
+                (state_key, last_decision_at, last_sent_at, day_key, daily_sent_count)
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (state_key) DO UPDATE SET
+                last_decision_at = EXCLUDED.last_decision_at,
+                last_sent_at = EXCLUDED.last_sent_at,
+                day_key = EXCLUDED.day_key,
+                daily_sent_count = EXCLUDED.daily_sent_count,
+                updated_at = NOW()
+            "#,
+        )
+        .bind(state_key)
+        .bind(state.last_decision_at)
+        .bind(state.last_sent_at)
+        .bind(&state.day_key)
+        .bind(i32::try_from(state.daily_sent_count).unwrap_or(i32::MAX))
         .execute(&mut **transaction)
         .await?;
         Ok(())
@@ -2188,6 +2428,8 @@ struct MemoryData {
     conversation_summaries: HashMap<String, String>,
     #[serde(default)]
     conversation_summary_updated_at: HashMap<String, DateTime<Local>>,
+    #[serde(default)]
+    proactive_states: HashMap<String, ProactiveState>,
     bot_personality: BotPersonality,
 }
 
@@ -2214,9 +2456,9 @@ impl Default for BotPersonality {
 mod tests {
     use super::{
         ConversationScope, GroupProfile, MemoryLookup, MemoryLookupType, MemoryManager, MoodEntry,
-        UserProfile, conversation_summary_key,
+        ProactiveState, UserProfile, conversation_summary_key,
     };
-    use chrono::Local;
+    use chrono::{Duration as ChronoDuration, Local};
     use std::sync::Arc;
 
     fn temporary_memory_path(test_name: &str) -> std::path::PathBuf {
@@ -2267,6 +2509,60 @@ mod tests {
                     assert_eq!(mode, 0o600);
                 }
 
+                std::fs::remove_file(path).expect("应清理测试记忆文件");
+            });
+    }
+
+    #[test]
+    fn proactive_state_survives_restart_and_rolls_daily_count() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let path = temporary_memory_path("proactive-state");
+                let manager = MemoryManager::new(path.to_str().expect("临时路径应为 UTF-8"));
+                let occurred_at = Local::now();
+                manager
+                    .record_proactive_event(
+                        Some("proactive:main_admin:42"),
+                        &["proactive:global".to_string()],
+                        occurred_at,
+                    )
+                    .await
+                    .expect("主动决策状态应成功保存");
+                manager
+                    .record_proactive_event(
+                        None,
+                        &["proactive:global".to_string()],
+                        occurred_at + ChronoDuration::minutes(1),
+                    )
+                    .await
+                    .expect("主动发送状态应成功保存");
+
+                let reloaded = MemoryManager::new(path.to_str().expect("临时路径应为 UTF-8"));
+                let state = reloaded
+                    .get_proactive_state("proactive:global")
+                    .await
+                    .expect("重启后应读回主动状态");
+                assert_eq!(state.daily_sent_count, 2);
+                assert_eq!(
+                    reloaded
+                        .get_proactive_state("proactive:main_admin:42")
+                        .await
+                        .expect("应读回决策状态")
+                        .last_decision_at,
+                    Some(occurred_at)
+                );
+                assert_eq!(
+                    state.daily_count_for(
+                        &(occurred_at + ChronoDuration::days(1))
+                            .format("%Y-%m-%d")
+                            .to_string()
+                    ),
+                    0
+                );
+
+                let empty = ProactiveState::default();
+                assert_eq!(empty.daily_count_for("2026-08-23"), 0);
                 std::fs::remove_file(path).expect("应清理测试记忆文件");
             });
     }

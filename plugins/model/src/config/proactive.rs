@@ -19,6 +19,16 @@ pub struct ProactiveConfig {
     main_admin: Option<i64>,
     /// 两次“是否联系主人”的模型决策之间的最短间隔，避免每轮循环额外消耗 token。
     main_admin_decision_interval_secs: u64,
+    /// 两次实际主动联系主人之间的最短间隔。
+    main_admin_cooldown_secs: u64,
+    /// 全部主动消息每天最多发送的条数。
+    daily_limit: u8,
+    /// 主人每天最多收到的主动私聊条数。
+    main_admin_daily_limit: u8,
+    /// 同一个群组或用户再次收到主动消息前的最短间隔。
+    target_cooldown_secs: u64,
+    /// 用户或群组最近主动互动后，暂不追加主动消息的时间。
+    recent_interaction_cooldown_secs: u64,
 }
 
 impl ProactiveConfig {
@@ -50,6 +60,26 @@ impl ProactiveConfig {
         self.main_admin_decision_interval_secs
     }
 
+    pub fn main_admin_cooldown_secs(&self) -> u64 {
+        self.main_admin_cooldown_secs
+    }
+
+    pub fn daily_limit(&self) -> u8 {
+        self.daily_limit
+    }
+
+    pub fn main_admin_daily_limit(&self) -> u8 {
+        self.main_admin_daily_limit
+    }
+
+    pub fn target_cooldown_secs(&self) -> u64 {
+        self.target_cooldown_secs
+    }
+
+    pub fn recent_interaction_cooldown_secs(&self) -> u64 {
+        self.recent_interaction_cooldown_secs
+    }
+
     pub fn validate(&self) -> anyhow::Result<()> {
         if self.check_interval_secs == 0 {
             return Err(anyhow::anyhow!("主动消息检查间隔必须大于0秒"));
@@ -66,6 +96,21 @@ impl ProactiveConfig {
         if self.main_admin_decision_interval_secs == 0 {
             return Err(anyhow::anyhow!("主人主动私聊决策间隔必须大于0秒"));
         }
+        if self.main_admin_cooldown_secs == 0 {
+            return Err(anyhow::anyhow!("主人主动私聊冷却时间必须大于0秒"));
+        }
+        if self.daily_limit == 0 {
+            return Err(anyhow::anyhow!("主动消息每日上限必须大于0"));
+        }
+        if self.main_admin_daily_limit == 0 {
+            return Err(anyhow::anyhow!("主人主动私聊每日上限必须大于0"));
+        }
+        if self.target_cooldown_secs == 0 {
+            return Err(anyhow::anyhow!("主动消息目标冷却时间必须大于0秒"));
+        }
+        if self.recent_interaction_cooldown_secs == 0 {
+            return Err(anyhow::anyhow!("主动消息互动抑制时间必须大于0秒"));
+        }
         Ok(())
     }
 }
@@ -80,6 +125,11 @@ impl Default for ProactiveConfig {
             push_probability_percent: 35,
             main_admin: None,
             main_admin_decision_interval_secs: 10_800,
+            main_admin_cooldown_secs: 21_600,
+            daily_limit: 4,
+            main_admin_daily_limit: 2,
+            target_cooldown_secs: 21_600,
+            recent_interaction_cooldown_secs: 7_200,
         }
     }
 }
@@ -110,5 +160,14 @@ mod tests {
             ..ProactiveConfig::default()
         };
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn defaults_include_conservative_send_limits() {
+        let config = ProactiveConfig::default();
+        assert_eq!(config.main_admin_cooldown_secs(), 21_600);
+        assert_eq!(config.daily_limit(), 4);
+        assert_eq!(config.main_admin_daily_limit(), 2);
+        assert_eq!(config.target_cooldown_secs(), 21_600);
     }
 }

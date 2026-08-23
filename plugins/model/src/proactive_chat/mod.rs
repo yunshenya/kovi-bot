@@ -22,6 +22,16 @@ use std::time::Duration;
 
 pub mod startup;
 
+const GLOBAL_PROACTIVE_STATE_KEY: &str = "proactive:global";
+
+fn target_state_key(scope: &str, subject_id: i64) -> String {
+    format!("proactive:{scope}:{subject_id}")
+}
+
+fn main_admin_state_key(subject_id: i64) -> String {
+    target_state_key("main_admin", subject_id)
+}
+
 /// 主动聊天管理器
 ///
 /// 负责管理机器人的主动聊天行为，包括判断时机、选择目标、生成话题等
@@ -45,6 +55,9 @@ impl ProactiveChatManager {
     }
 
     pub async fn start_proactive_chat_loop(&self) {
+        // 服务重启后先等待一个检查周期，避免启动瞬间把重启误判成新的主动时机。
+        let initial_interval = crate::config::get().proactive().check_interval_secs();
+        sleep(Duration::from_secs(initial_interval)).await;
         loop {
             let proactive_config = crate::config::get().proactive().clone();
             if !proactive_config.enabled() {
@@ -88,16 +101,30 @@ impl ProactiveChatManager {
             now - chrono::Duration::seconds(proactive_config.inactivity_threshold_secs() as i64);
         let cooldown_boundary =
             now - chrono::Duration::seconds(proactive_config.cooldown_secs() as i64);
+        let today = now.format("%Y-%m-%d").to_string();
+        let global_state = self
+            .memory_manager
+            .get_proactive_state(GLOBAL_PROACTIVE_STATE_KEY)
+            .await;
 
-        // 全局冷却，防止循环每次命中时连续推送。
-        if self
+        // 全局冷却和每日上限使用独立持久化状态；旧记忆只作为升级期间的兼容兜底。
+        let durable_global_cooldown = global_state
+            .as_ref()
+            .and_then(|state| state.last_sent_at)
+            .is_some_and(|last_sent| last_sent > cooldown_boundary);
+        let legacy_global_cooldown = self
             .memory_manager
             .has_memory_since_in_contexts(
                 &["proactive_group_chat", "proactive_private_chat"],
                 cooldown_boundary,
             )
-            .await
-        {
+            .await;
+        if durable_global_cooldown || legacy_global_cooldown {
+            return false;
+        }
+        if global_state.as_ref().is_some_and(|state| {
+            state.daily_count_for(&today) >= proactive_config.daily_limit() as u32
+        }) {
             return false;
         }
 
@@ -143,30 +170,43 @@ impl ProactiveChatManager {
         let Some(main_admin) = proactive_config.main_admin() else {
             return Ok(false);
         };
+        if !self.can_send_main_admin(main_admin).await {
+            return Ok(false);
+        }
         if !self.should_decide_main_admin_chat(main_admin).await {
             return Ok(false);
         }
+
+        let decision_key = main_admin_state_key(main_admin);
+        self.memory_manager
+            .record_proactive_event(Some(&decision_key), &[], Local::now())
+            .await?;
 
         let message = self
             .topic_generator
             .generate_memory_based_topic(None, Some(main_admin))
             .await?
             .map(|topic| topic.content);
-        let decision_record = if message.is_some() {
-            "主人主动关心决策：发送消息"
-        } else {
-            "主人主动关心决策：暂不打扰"
-        };
-        self.memory_manager
-            .add_conversation_memory(main_admin, decision_record, "proactive_main_admin_decision")
-            .await?;
 
         let Some(message) = message else {
             return Ok(false);
         };
+
         if !send_tracked_private_message(&self.bot, main_admin, message.clone()).await {
             return Ok(false);
         }
+        let target_key = target_state_key("private", main_admin);
+        self.memory_manager
+            .record_proactive_event(
+                None,
+                &[
+                    GLOBAL_PROACTIVE_STATE_KEY.to_string(),
+                    target_key,
+                    decision_key,
+                ],
+                Local::now(),
+            )
+            .await?;
         self.memory_manager
             .add_conversation_memory(
                 main_admin,
@@ -177,15 +217,83 @@ impl ProactiveChatManager {
         Ok(true)
     }
 
-    /// 本地仅控制模型决策频率；是否真正发送完全交由模型决定。
+    async fn can_send_main_admin(&self, main_admin: i64) -> bool {
+        let proactive_config = crate::config::get().proactive().clone();
+        let now = Local::now();
+        let today = now.format("%Y-%m-%d").to_string();
+        let boundary =
+            now - chrono::Duration::seconds(proactive_config.main_admin_cooldown_secs() as i64);
+        let target_boundary =
+            now - chrono::Duration::seconds(proactive_config.target_cooldown_secs() as i64);
+        let global_boundary =
+            now - chrono::Duration::seconds(proactive_config.cooldown_secs() as i64);
+        let main_key = main_admin_state_key(main_admin);
+        let target_key = target_state_key("private", main_admin);
+        let main_state = self.memory_manager.get_proactive_state(&main_key).await;
+        let target_state = self.memory_manager.get_proactive_state(&target_key).await;
+        let global_state = self
+            .memory_manager
+            .get_proactive_state(GLOBAL_PROACTIVE_STATE_KEY)
+            .await;
+
+        if main_state
+            .as_ref()
+            .and_then(|state| state.last_sent_at)
+            .is_some_and(|last_sent| last_sent > boundary)
+            || target_state
+                .as_ref()
+                .and_then(|state| state.last_sent_at)
+                .is_some_and(|last_sent| last_sent > target_boundary)
+            || global_state
+                .as_ref()
+                .and_then(|state| state.last_sent_at)
+                .is_some_and(|last_sent| last_sent > global_boundary)
+        {
+            return false;
+        }
+        if main_state.as_ref().is_some_and(|state| {
+            state.daily_count_for(&today) >= proactive_config.main_admin_daily_limit() as u32
+        }) || global_state.as_ref().is_some_and(|state| {
+            state.daily_count_for(&today) >= proactive_config.daily_limit() as u32
+        }) {
+            return false;
+        }
+
+        if let Some(profile) = self.memory_manager.get_user_profile(main_admin).await {
+            let interaction_boundary = now
+                - chrono::Duration::seconds(
+                    proactive_config.recent_interaction_cooldown_secs() as i64
+                );
+            if profile
+                .last_private_interaction
+                .is_some_and(|last_private| last_private > interaction_boundary)
+            {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    /// 持久化状态优先，本地记忆只用于兼容刚升级的旧部署。
     async fn should_decide_main_admin_chat(&self, main_admin: i64) -> bool {
         let proactive_config = crate::config::get().proactive().clone();
+        let decision_key = main_admin_state_key(main_admin);
+        let decision_boundary = Local::now()
+            - chrono::Duration::seconds(proactive_config.main_admin_decision_interval_secs() as i64);
+        if self
+            .memory_manager
+            .get_proactive_state(&decision_key)
+            .await
+            .and_then(|state| state.last_decision_at)
+            .is_some_and(|last_decision| last_decision > decision_boundary)
+        {
+            return false;
+        }
         let recent_memories = self
             .memory_manager
             .get_recent_memories_for_subject(main_admin, Some("proactive_main_admin_decision"), 1)
             .await;
-        let decision_boundary = Local::now()
-            - chrono::Duration::seconds(proactive_config.main_admin_decision_interval_secs() as i64);
         !recent_memories.iter().any(|memory| {
             memory.subject_id == Some(main_admin)
                 && memory.context == "proactive_main_admin_decision"
@@ -242,6 +350,9 @@ impl ProactiveChatManager {
     }
 
     async fn initiate_group_chat(&self, group_id: i64) -> Result<()> {
+        if !self.can_send_to_target("group", group_id).await {
+            return Ok(());
+        }
         // 检查是否应该在这个群组发起对话
         if !self
             .topic_generator
@@ -264,6 +375,15 @@ impl ProactiveChatManager {
                 return Ok(());
             }
 
+            let target_key = target_state_key("group", group_id);
+            self.memory_manager
+                .record_proactive_event(
+                    None,
+                    &[GLOBAL_PROACTIVE_STATE_KEY.to_string(), target_key],
+                    Local::now(),
+                )
+                .await?;
+
             // 记录这次主动对话
             self.memory_manager
                 .add_conversation_memory(
@@ -278,6 +398,9 @@ impl ProactiveChatManager {
     }
 
     async fn initiate_private_chat(&self, user_id: i64) -> Result<bool> {
+        if !self.can_send_to_target("private", user_id).await {
+            return Ok(false);
+        }
         // 检查是否应该向这个用户发起对话
         if !self
             .topic_generator
@@ -300,6 +423,15 @@ impl ProactiveChatManager {
                 return Ok(false);
             }
 
+            let target_key = target_state_key("private", user_id);
+            self.memory_manager
+                .record_proactive_event(
+                    None,
+                    &[GLOBAL_PROACTIVE_STATE_KEY.to_string(), target_key],
+                    Local::now(),
+                )
+                .await?;
+
             // 记录这次主动对话
             self.memory_manager
                 .add_conversation_memory(
@@ -312,6 +444,46 @@ impl ProactiveChatManager {
         }
 
         Ok(false)
+    }
+
+    async fn can_send_to_target(&self, scope: &str, subject_id: i64) -> bool {
+        let proactive_config = crate::config::get().proactive().clone();
+        let now = Local::now();
+        let boundary =
+            now - chrono::Duration::seconds(proactive_config.target_cooldown_secs() as i64);
+        let state_key = target_state_key(scope, subject_id);
+        if self
+            .memory_manager
+            .get_proactive_state(&state_key)
+            .await
+            .and_then(|state| state.last_sent_at)
+            .is_some_and(|last_sent| last_sent > boundary)
+        {
+            return false;
+        }
+
+        let interaction_boundary = now
+            - chrono::Duration::seconds(proactive_config.recent_interaction_cooldown_secs() as i64);
+        if scope == "private"
+            && self
+                .memory_manager
+                .get_user_profile(subject_id)
+                .await
+                .and_then(|profile| profile.last_private_interaction)
+                .is_some_and(|last_private| last_private > interaction_boundary)
+        {
+            return false;
+        }
+        if scope == "group"
+            && self
+                .memory_manager
+                .get_group_profile(subject_id)
+                .await
+                .is_some_and(|profile| profile.last_activity > interaction_boundary)
+        {
+            return false;
+        }
+        true
     }
 
     pub async fn handle_user_response(

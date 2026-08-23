@@ -22,6 +22,11 @@ cooldown_secs = 7200
 push_probability_percent = 35
 # 可选：部署者可在自己的运行时配置中填写 main_admin。
 main_admin_decision_interval_secs = 10800
+main_admin_cooldown_secs = 21600
+daily_limit = 4
+main_admin_daily_limit = 2
+target_cooldown_secs = 21600
+recent_interaction_cooldown_secs = 7200
 
 [traffic]
 enabled = true
