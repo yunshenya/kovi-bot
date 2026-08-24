@@ -163,7 +163,7 @@ pub(crate) fn is_help_command(message: &str) -> bool {
 }
 
 pub(crate) fn command_help() -> &'static str {
-    "管理员可用指令：\n聊天：直接发送消息，或 @芸汐。\n图片：#看图、#看截图、#识图。\n提醒：直接说“提醒我……”即可创建提醒。\n管理员：#系统信息、#健康检查、#禁言、#结束禁言。\n表情：引用或附带表情后直接描述含义即可教学，也可使用 #教芸汐、#待确认表情、#确认表情 编号 含义、#驳回表情 编号、#忽略表情 编号。\n群授权：#授权群 群号、#取消授权群 群号、#授权群列表。\n主管理员：#授权管理员 QQ号、#取消授权管理员 QQ号、#授权管理员列表。\n数据：私聊发送 #删除我的数据；群内发送 #删除本群数据。\n也可以直接说“查看系统信息”“检查健康状态”“暂停本群回复”或“恢复本群回复”。"
+    "管理员可用指令：\n聊天：直接发送消息，或 @芸汐。\n图片：#看图、#看截图、#识图。\n提醒：直接说“提醒我……”即可创建提醒。\n管理员：#系统信息、#健康检查、#禁言、#结束禁言。\n表情：引用或附带表情后直接描述含义即可教学，也可使用 #教芸汐、#待确认表情、#确认表情 编号 含义、#驳回表情 编号、#忽略表情 编号。\n群授权：#授权群 群号、#取消授权群 群号、#授权群列表。\n主管理员：#授权管理员 QQ号、#取消授权管理员 QQ号、#授权管理员列表；私聊中可以直接让芸汐去已授权群发消息。\n数据：私聊发送 #删除我的数据；群内发送 #删除本群数据。\n也可以直接说“查看系统信息”“检查健康状态”“暂停本群回复”或“恢复本群回复”。"
 }
 
 pub(crate) fn is_restricted_command(message: &str) -> bool {
@@ -201,6 +201,12 @@ pub(crate) fn is_bot_admin(bot: &RuntimeBot, user_id: i64) -> bool {
                 .unwrap_or(false)
         }
     }
+}
+
+pub(crate) fn is_main_admin(bot: &RuntimeBot, user_id: i64) -> bool {
+    bot.get_main_admin()
+        .map(|main_admin| main_admin == user_id)
+        .unwrap_or(false)
 }
 
 /// 消息角色枚举
@@ -427,8 +433,10 @@ pub async fn control_model(
             subject_id: group_id,
             actor_user_id: user_id,
             is_admin: crate::model::utils::is_bot_admin(&bot, user_id),
+            is_main_admin: crate::model::utils::is_main_admin(&bot, user_id),
             context: "group_chat",
             destination: MessageDestination::Group(group_id),
+            source_message_id: current_message_id,
             scheduled: false,
             group_paused: is_group_paused(group_id).await,
             runtime_bot: Some(Arc::clone(&bot)),
@@ -437,6 +445,7 @@ pub async fn control_model(
                 scope: StickerScope::Group(group_id),
             }),
             requires_reminder_create: crate::reminders::looks_like_reminder_request(message),
+            requires_group_message_send: false,
             requires_external_tool: false,
         },
         reply_ticket,
@@ -1653,6 +1662,22 @@ async fn group_history(group_id: i64) -> ConversationHistory {
         .clone()
 }
 
+pub(crate) async fn record_external_group_message(group_id: i64, content: &str) {
+    let history = group_history(group_id).await;
+    let mut messages = history.lock().await;
+    if messages.is_empty() {
+        messages.push(BotMemory {
+            role: Roles::System,
+            content: String::new(),
+        });
+    }
+    messages.push(BotMemory {
+        role: Roles::Assistant,
+        content: content.to_string(),
+    });
+    limit_memory_size(&mut messages);
+}
+
 async fn private_history(user_id: i64) -> ConversationHistory {
     let evicted = touch_runtime_history(&PRIVATE_HISTORY_ACCESS, user_id).await;
     let mut histories = PRIVATE_MESSAGE_MEMORY.lock().await;
@@ -1993,6 +2018,7 @@ async fn private_chat_inner_with_claim(
     already_claimed: bool,
 ) {
     let scope = super::interrupt::ReplyScope::Private(user_id);
+    let source_message_id = source_message_ids.last().copied();
     if !already_claimed && !begin_reply(scope, reply_ticket, source_message_ids).await {
         return;
     }
@@ -2002,6 +2028,7 @@ async fn private_chat_inner_with_claim(
         nickname,
         bot,
         reply_ticket,
+        source_message_id,
         &vision_images,
         sticker_teaching_message,
         &understanding,
@@ -2017,6 +2044,7 @@ async fn private_chat_inner(
     nickname: String,
     bot: Arc<RuntimeBot>,
     reply_ticket: ReplyTicket,
+    source_message_id: Option<i32>,
     vision_images: &[VisionImage],
     sticker_teaching_message: Option<Message>,
     understanding: &MessageUnderstanding,
@@ -2113,14 +2141,17 @@ async fn private_chat_inner(
         None,
     )
     .await;
+    let is_main_admin = crate::model::utils::is_main_admin(&bot, user_id);
     let bot_content = ModelGateway::complete(
         &mut request_messages,
         ToolExecutionContext {
             subject_id: user_id,
             actor_user_id: user_id,
             is_admin: crate::model::utils::is_bot_admin(&bot, user_id),
+            is_main_admin,
             context: "private_chat",
             destination: MessageDestination::Private(user_id),
+            source_message_id,
             scheduled: false,
             group_paused: false,
             runtime_bot: Some(Arc::clone(&bot)),
@@ -2129,6 +2160,7 @@ async fn private_chat_inner(
                 scope: StickerScope::Private(user_id),
             }),
             requires_reminder_create: crate::reminders::looks_like_reminder_request(message),
+            requires_group_message_send: is_main_admin && understanding.cross_group_message_request,
             requires_external_tool: false,
         },
         reply_ticket,

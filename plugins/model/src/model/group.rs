@@ -244,7 +244,7 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
             send_tracked_group_message(
                 &bot,
                 group_id,
-                "这会删除本群的长期记忆、群档案、摘要和本群表情记忆。若确认，请发送：#删除本群数据 确认",
+                "这会删除本群的长期记忆、群档案、摘要、本群表情记忆和以本群为目标的角色动作记录。若确认，请发送：#删除本群数据 确认",
             )
             .await;
             return;
@@ -966,21 +966,27 @@ async fn delete_group_data(group_id: i64, bot: &RuntimeBot) {
     let memory_result = MEMORY_MANAGER.delete_group_data(group_id).await;
     let sticker_result = sticker_memory::delete_group_data(group_id).await;
     let reminder_result = reminders::delete_group_data(group_id).await;
-    match (memory_result, sticker_result, reminder_result) {
-        (Ok(memory_rows), Ok(sticker_rows), Ok(reminder_rows)) => {
+    let agent_goal_result = crate::agent_runtime::delete_group_data(group_id).await;
+    match (
+        memory_result,
+        sticker_result,
+        reminder_result,
+        agent_goal_result,
+    ) {
+        (Ok(memory_rows), Ok(sticker_rows), Ok(reminder_rows), Ok(agent_goal_rows)) => {
             send_tracked_group_message(
                 bot,
                 group_id,
                 format!(
-                    "本群可归属数据已删除（记忆/档案/摘要 {memory_rows} 项，表情记忆 {sticker_rows} 项，提醒 {reminder_rows} 项）。"
+                    "本群可归属数据已删除（记忆/档案/摘要 {memory_rows} 项，表情记忆 {sticker_rows} 项，提醒 {reminder_rows} 项，角色目标 {agent_goal_rows} 项）。"
                 ),
             )
             .await;
         }
-        (memory, stickers, reminders) => {
+        (memory, stickers, reminders, agent_goals) => {
             eprintln!(
-                "[ERROR] 群数据删除未完全成功 (群组: {}, 记忆: {:?}, 表情: {:?}, 提醒: {:?})",
-                group_id, memory, stickers, reminders
+                "[ERROR] 群数据删除未完全成功 (群组: {}, 记忆: {:?}, 表情: {:?}, 提醒: {:?}, 角色目标: {:?})",
+                group_id, memory, stickers, reminders, agent_goals
             );
             send_tracked_group_message(
                 bot,

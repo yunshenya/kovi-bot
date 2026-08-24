@@ -16,7 +16,7 @@ use rand::Rng;
 /// 仅用于兼容旧模型输出；新回复必须通过回复协议的 `messages` 字段分段。
 pub(crate) const LEGACY_FOLLOW_UP_MARKER: &str = "[[NEXT_MESSAGE]]";
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MessageDestination {
     Group(i64),
     Private(i64),

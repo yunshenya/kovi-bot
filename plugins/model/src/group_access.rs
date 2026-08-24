@@ -114,6 +114,22 @@ pub(crate) fn is_authorization_command(message: &str) -> bool {
         || has_argument_prefix(text, "#移除授权管理员")
 }
 
+pub(crate) async fn is_authorized_group(group_id: i64) -> Result<bool> {
+    let state = STATE.lock().await;
+    let state = state
+        .as_ref()
+        .ok_or_else(|| anyhow!("群聊白名单尚未初始化"))?;
+    Ok(state.groups.contains(&group_id))
+}
+
+pub(crate) async fn authorized_groups() -> Result<Vec<i64>> {
+    let state = STATE.lock().await;
+    let state = state
+        .as_ref()
+        .ok_or_else(|| anyhow!("群聊白名单尚未初始化"))?;
+    Ok(state.groups.iter().copied().collect())
+}
+
 fn has_argument_prefix(text: &str, prefix: &str) -> bool {
     text.strip_prefix(prefix)
         .and_then(|rest| rest.chars().next())

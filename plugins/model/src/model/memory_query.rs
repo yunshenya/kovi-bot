@@ -97,6 +97,13 @@ pub(crate) async fn params_model_with_tool_access(
                 content: "我暂时无法创建这个定时任务，请稍后再试一次。".to_string(),
             };
         }
+        if tool_context.requires_group_message_send {
+            eprintln!(
+                "[WARN] 跨群发送请求未执行：模型工具注册表不可用 (范围: {}:{})",
+                tool_context.context, tool_context.subject_id
+            );
+            return required_group_message_failure(false, false);
+        }
         return interruptible_model_call(
             messages,
             reply_ticket,
@@ -120,19 +127,23 @@ pub(crate) async fn params_model_with_tool_access(
             content: "用户明确提出了定时任务请求。本轮不能只回复‘好的’、‘记住了’或其他确认话术；必须先严格调用 reminder.create，并且只有工具返回成功创建结果后才能向用户确认。若无法确定时间或参数，调用工具会返回错误，此时必须如实说明失败，不得声称任务已创建。".to_string(),
         });
     }
+    if tool_context.requires_group_message_send {
+        request.push(BotMemory {
+            role: Roles::System,
+            content: "语义理解层确认用户明确要求立即跨群发送。本轮不能只口头答应；必须调用 group.message.send。群名目标先调用 group.message.targets。只有 group.message.send 成功后才能确认已发送；不能执行或目标不唯一时不得声称已发送，结果不确定时说明无法确认且不要重试。".to_string(),
+        });
+    }
     let model_config = config::get();
-    let max_tool_rounds =
-        if tool_context.requires_reminder_create || tool_context.requires_external_tool {
-            model_config.tools().max_rounds().max(3)
-        } else {
-            model_config.tools().max_rounds()
-        };
+    let max_tool_rounds = tool_round_limit(model_config.tools().max_rounds(), &tool_context);
     let max_memory_rounds = model_config.memory().autonomous_query_max_rounds();
     let mut memory_rounds = 0;
     let mut external_tool_succeeded = !tool_context.requires_external_tool;
     let mut reminder_tool_succeeded = false;
     let mut reminder_failure = ReminderCreateFailure::NotCalled;
     let mut reminder_failure_detail = None;
+    let mut group_target_lookup_succeeded = false;
+    let mut group_message_send_attempted = false;
+    let mut group_message_send_succeeded = false;
 
     for round in 0..max_tool_rounds {
         let Some(response) = interruptible_model_call(
@@ -147,6 +158,9 @@ pub(crate) async fn params_model_with_tool_access(
             return interrupted_response();
         };
         if vision_failure_detail(&response.content).is_some() {
+            if group_message_send_succeeded {
+                return completed_group_message_response();
+            }
             return response;
         }
         // Providers sometimes add a short preamble or Markdown around a tool
@@ -160,6 +174,9 @@ pub(crate) async fn params_model_with_tool_access(
                         role: Roles::Assistant,
                         content: SILENT_REPLY_OUTPUT.to_string(),
                     };
+                }
+                if group_message_send_succeeded && is_model_error_response(&response.content) {
+                    return completed_group_message_response();
                 }
                 if tool_context.requires_external_tool && !external_tool_succeeded {
                     if is_model_error_response(&response.content) || round + 1 >= max_tool_rounds {
@@ -205,6 +222,34 @@ pub(crate) async fn params_model_with_tool_access(
                         tool_context.context, tool_context.subject_id
                     );
                     continue;
+                }
+                if tool_context.requires_group_message_send && !group_message_send_succeeded {
+                    if !group_message_send_attempted
+                        && !group_target_lookup_succeeded
+                        && !is_model_error_response(&response.content)
+                        && round + 1 < max_tool_rounds
+                    {
+                        request.push(response);
+                        request.push(BotMemory {
+                            role: Roles::System,
+                            content: "你刚才只输出了文字，但跨群消息尚未发送。下一条只能调用 group.message.send；如果目标是群名，先调用 group.message.targets。不要用确认话术代替工具执行。".to_string(),
+                        });
+                        println!(
+                            "[WARN] 跨群发送模型返回普通文本，要求补充真实动作 (范围: {}:{})",
+                            tool_context.context, tool_context.subject_id
+                        );
+                        continue;
+                    }
+                    eprintln!(
+                        "[WARN] 跨群发送未完成，拒绝返回可能伪造成功的模型文本 (范围: {}:{}, 轮次: {})",
+                        tool_context.context,
+                        tool_context.subject_id,
+                        round + 1
+                    );
+                    return required_group_message_failure(
+                        group_target_lookup_succeeded,
+                        group_message_send_attempted,
+                    );
                 }
                 if tool_context.requires_reminder_create && !reminder_tool_succeeded {
                     eprintln!(
@@ -309,6 +354,13 @@ pub(crate) async fn params_model_with_tool_access(
                         );
                     }
                 }
+                if tool_name == "group.message.targets" && result.succeeded {
+                    group_target_lookup_succeeded = true;
+                }
+                if tool_name == "group.message.send" {
+                    group_message_send_attempted = true;
+                    group_message_send_succeeded = result.succeeded;
+                }
                 println!(
                     "[INFO] 模型工具调用完成 (工具: {}, 范围: {}:{}, 轮次: {})",
                     tool_name,
@@ -344,6 +396,17 @@ pub(crate) async fn params_model_with_tool_access(
         };
     }
 
+    if tool_context.requires_group_message_send && !group_message_send_succeeded {
+        eprintln!(
+            "[WARN] 跨群发送工具轮次耗尽且动作未完成 (范围: {}:{})",
+            tool_context.context, tool_context.subject_id
+        );
+        return required_group_message_failure(
+            group_target_lookup_succeeded,
+            group_message_send_attempted,
+        );
+    }
+
     request.push(BotMemory {
         role: Roles::System,
         content: "本轮工具调用次数已用完。请使用已有结果直接回答，不要再输出工具调用标记。"
@@ -364,12 +427,56 @@ pub(crate) async fn params_model_with_tool_access(
         parse_tool_call_with_wrapping(&response.content, false),
         ParsedToolCall::None
     ) {
-        response
+        if group_message_send_succeeded && is_model_error_response(&response.content) {
+            completed_group_message_response()
+        } else {
+            response
+        }
+    } else if group_message_send_succeeded {
+        completed_group_message_response()
     } else {
         BotMemory {
             role: Roles::Assistant,
             content: "我暂时没能把外部资料查完整……你可以换个说法再问我一次。".to_string(),
         }
+    }
+}
+
+fn tool_round_limit(configured: u8, tool_context: &ToolExecutionContext) -> u8 {
+    if tool_context.requires_reminder_create || tool_context.requires_external_tool {
+        configured.max(3)
+    } else if tool_context.is_main_admin
+        && matches!(
+            tool_context.destination,
+            super::MessageDestination::Private(_)
+        )
+        && !tool_context.scheduled
+    {
+        // Resolving a group name can require targets followed by send.
+        configured.max(2)
+    } else {
+        configured
+    }
+}
+
+fn required_group_message_failure(targets_queried: bool, send_attempted: bool) -> BotMemory {
+    let content = if send_attempted {
+        "我没能确认这次发送是否成功，为避免重复没有自动重试。请先到目标群确认；需要重发时请重新给我一条指令。"
+    } else if targets_queried {
+        "我查过可用群，但还不能唯一确认目标，消息没有发送。请给我更准确的群名或群号。"
+    } else {
+        "我没有成功执行这次跨群发送，消息还没发出去。请重新说一次，并明确目标群和正文。"
+    };
+    BotMemory {
+        role: Roles::Assistant,
+        content: content.to_string(),
+    }
+}
+
+fn completed_group_message_response() -> BotMemory {
+    BotMemory {
+        role: Roles::Assistant,
+        content: "已经发出去了。".to_string(),
     }
 }
 
@@ -682,10 +789,13 @@ fn format_tool_result(name: &str, result: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ParsedToolCall, ReminderCreateFailure, interrupted_response, parse_tool_call_with_wrapping,
-        reminder_failure_response,
+        ParsedToolCall, ReminderCreateFailure, completed_group_message_response,
+        interrupted_response, parse_tool_call_with_wrapping, reminder_failure_response,
+        required_group_message_failure, tool_round_limit,
     };
+    use crate::model::MessageDestination;
     use crate::model::reply::parse_reply_output;
+    use crate::model::tool_access::ToolExecutionContext;
 
     #[test]
     fn parses_only_the_restricted_tool_protocol() {
@@ -701,6 +811,53 @@ mod tests {
             parse_tool_call_with_wrapping("正常聊天回复", true),
             ParsedToolCall::None
         ));
+    }
+
+    #[test]
+    fn main_admin_private_actions_have_two_tool_rounds() {
+        let context = ToolExecutionContext {
+            subject_id: 42,
+            actor_user_id: 42,
+            is_admin: true,
+            is_main_admin: true,
+            context: "private_chat",
+            destination: MessageDestination::Private(42),
+            source_message_id: Some(7),
+            scheduled: false,
+            group_paused: false,
+            runtime_bot: None,
+            sticker_teaching: None,
+            requires_reminder_create: false,
+            requires_group_message_send: false,
+            requires_external_tool: false,
+        };
+        assert_eq!(tool_round_limit(1, &context), 2);
+        assert_eq!(tool_round_limit(3, &context), 3);
+
+        let ordinary_private = ToolExecutionContext {
+            is_main_admin: false,
+            ..context.clone()
+        };
+        assert_eq!(tool_round_limit(1, &ordinary_private), 1);
+
+        let scheduled = ToolExecutionContext {
+            scheduled: true,
+            ..context
+        };
+        assert_eq!(tool_round_limit(1, &scheduled), 1);
+    }
+
+    #[test]
+    fn required_group_action_failures_never_claim_a_send_succeeded() {
+        for response in [
+            required_group_message_failure(false, false),
+            required_group_message_failure(true, false),
+            required_group_message_failure(true, true),
+        ] {
+            assert!(!response.content.contains("已发送"));
+            assert!(!response.content.contains("发出去了"));
+        }
+        assert_eq!(completed_group_message_response().content, "已经发出去了。");
     }
 
     #[test]

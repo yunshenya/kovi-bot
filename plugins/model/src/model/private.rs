@@ -148,7 +148,7 @@ pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<Runtime
             send_tracked_private_message(
                 &bot,
                 user_id,
-                "这会删除你的私聊记忆、用户档案、摘要、近期图片和与你关联的表情记忆。若确认，请发送：#删除我的数据 确认",
+                "这会删除你的私聊记忆、用户档案、摘要、近期图片、与你关联的表情记忆和角色动作记录。若确认，请发送：#删除我的数据 确认",
             )
             .await;
             return;
@@ -666,21 +666,27 @@ async fn delete_private_user_data(user_id: i64, bot: &RuntimeBot) {
     let memory_result = MEMORY_MANAGER.delete_user_data(user_id).await;
     let sticker_result = sticker_memory::delete_user_data(user_id).await;
     let reminder_result = reminders::delete_user_data(user_id).await;
-    match (memory_result, sticker_result, reminder_result) {
-        (Ok(memory_rows), Ok(sticker_rows), Ok(reminder_rows)) => {
+    let agent_goal_result = crate::agent_runtime::delete_user_data(user_id).await;
+    match (
+        memory_result,
+        sticker_result,
+        reminder_result,
+        agent_goal_result,
+    ) {
+        (Ok(memory_rows), Ok(sticker_rows), Ok(reminder_rows), Ok(agent_goal_rows)) => {
             send_tracked_private_message(
                 bot,
                 user_id,
                 format!(
-                    "你的可归属数据已删除（记忆/档案/摘要 {memory_rows} 项，表情记忆 {sticker_rows} 项，提醒 {reminder_rows} 项）。"
+                    "你的可归属数据已删除（记忆/档案/摘要 {memory_rows} 项，表情记忆 {sticker_rows} 项，提醒 {reminder_rows} 项，角色目标 {agent_goal_rows} 项）。"
                 ),
             )
             .await;
         }
-        (memory, stickers, reminders) => {
+        (memory, stickers, reminders, agent_goals) => {
             eprintln!(
-                "[ERROR] 用户数据删除未完全成功 (用户: {}, 记忆: {:?}, 表情: {:?}, 提醒: {:?})",
-                user_id, memory, stickers, reminders
+                "[ERROR] 用户数据删除未完全成功 (用户: {}, 记忆: {:?}, 表情: {:?}, 提醒: {:?}, 角色目标: {:?})",
+                user_id, memory, stickers, reminders, agent_goals
             );
             send_tracked_private_message(
                 bot,

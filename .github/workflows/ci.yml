@@ -94,6 +94,11 @@ jobs:
           cargo test -p model --lib --locked
           reminders::tests::postgres_claim_is_atomic_across_concurrent_workers -- --ignored --exact
 
+      - name: Run agent goal idempotency integration test
+        run: >-
+          cargo test -p model --lib --locked
+          agent_runtime::tests::postgres_goal_reservation_is_atomic_and_idempotent -- --ignored --exact
+
       - name: Run Redis integration tests
         run: >-
           cargo test -p model --lib --locked

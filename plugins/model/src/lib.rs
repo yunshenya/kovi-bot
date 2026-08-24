@@ -18,6 +18,8 @@ use std::sync::{
 
 // 配置管理模块
 pub mod config;
+// 持久化角色目标与统一动作执行器
+mod agent_runtime;
 // 核心模型处理模块
 mod group_access;
 mod image_security;
@@ -144,6 +146,10 @@ async fn main() {
         panic!("提醒任务表初始化失败，拒绝写入 readiness: {error}");
     }
 
+    if let Err(error) = agent_runtime::initialize_database().await {
+        panic!("角色目标表初始化失败，拒绝写入 readiness: {error}");
+    }
+
     if let Err(error) = sticker_memory::initialize_database().await {
         panic!("表情包记忆库初始化失败，拒绝写入 readiness: {error}");
     }
@@ -238,6 +244,13 @@ async fn main() {
                     }
                     Ok(_) => {}
                     Err(error) => eprintln!("[ERROR] 定期表情标签清理失败: {}", error),
+                }
+                match agent_runtime::compact_expired().await {
+                    Ok(removed) if removed > 0 => {
+                        println!("[INFO] 过期角色目标清理完成，移除 {} 条", removed);
+                    }
+                    Ok(_) => {}
+                    Err(error) => eprintln!("[ERROR] 定期角色目标清理失败: {}", error),
                 }
                 let interval = config::get().memory().maintenance_interval_secs();
                 kovi::tokio::time::sleep(kovi::tokio::time::Duration::from_secs(interval)).await;
