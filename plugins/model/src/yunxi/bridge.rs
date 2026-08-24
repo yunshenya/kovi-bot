@@ -8,16 +8,19 @@
 use super::qq;
 use crate::model::{ReplyScope, is_recent_bot_message};
 use chrono::{DateTime, Duration, TimeZone, Utc};
+use kovi::RuntimeBot;
 use kovi::bot::message::Message;
 use kovi::event::{GroupMsgEvent, PrivateMsgEvent};
 use kovi::tokio::sync::mpsc;
 use std::collections::{HashMap, VecDeque};
+use std::fmt;
 use std::sync::Arc;
 use yunxi_core::{
-    Admission, CognitiveRuntime, ConversationId, ConversationKind, EventPriority, EventScope,
+    ActionArbiter, ActionArbiterConfig, ActionPort, ActionResult, Admission, CognitiveRuntime,
+    ConversationId, ConversationKind, EnvironmentCapabilities, EventPriority, EventScope,
     ExternalConversation, IdentityStore, MessageContent, MessageId, MessageReceivedEvent,
-    OpenLoopDraft, OpenLoopKind, OpenLoopOwner, OpenLoopStore, ProcessingOutcome, RuntimeConfig,
-    RuntimeHandle, WorldEvent, WorldEventKind,
+    OpenLoopDraft, OpenLoopKind, OpenLoopOwner, OpenLoopStore, ProcessingOutcome, ProposedAction,
+    RuntimeConfig, RuntimeHandle, WorldEvent, WorldEventKind,
 };
 
 pub(crate) const SHADOW_INGRESS_CAPACITY: usize = 256;
@@ -35,32 +38,71 @@ pub(crate) enum EnqueueOutcome {
 
 /// A handle held by the host's event closures. It owns no Kovi event and never
 /// performs an await on the hot path.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct ShadowBridge {
     ingress: mpsc::Sender<InboundMessage>,
     runtime: RuntimeHandle,
+    action_arbiter: Option<Arc<ActionArbiter>>,
+    action_port: Option<Arc<dyn ActionPort>>,
+}
+
+impl fmt::Debug for ShadowBridge {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ShadowBridge")
+            .field("action_arbiter", &self.action_arbiter.is_some())
+            .field("action_port", &self.action_port.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl ShadowBridge {
     #[allow(dead_code)]
     pub(crate) fn start(store: Arc<dyn IdentityStore>) -> Arc<Self> {
-        Self::start_inner(store, None)
+        Self::start_inner(store, None, None)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn start_with_open_loops(
         store: Arc<dyn IdentityStore>,
         open_loop_store: Arc<dyn OpenLoopStore>,
     ) -> Arc<Self> {
-        Self::start_inner(store, Some(open_loop_store))
+        Self::start_inner(store, Some(open_loop_store), None)
+    }
+
+    /// Start the bridge with a real Kovi action adapter. The old constructor
+    /// remains observe-only for tests and hosts that have not opted into action
+    /// execution yet.
+    pub(crate) fn start_with_open_loops_and_actions(
+        store: Arc<super::identity_store::PostgresIdentityStore>,
+        open_loop_store: Arc<dyn OpenLoopStore>,
+        bot: Arc<RuntimeBot>,
+    ) -> Arc<Self> {
+        let adapter = super::delivery::QqActionAdapter::new(bot, Arc::clone(&store));
+        Self::start_inner(store, Some(open_loop_store), Some(adapter))
     }
 
     fn start_inner(
         store: Arc<dyn IdentityStore>,
         open_loop_store: Option<Arc<dyn OpenLoopStore>>,
+        action_adapter: Option<Arc<super::delivery::QqActionAdapter>>,
     ) -> Arc<Self> {
         let (ingress, receiver) = mpsc::channel(SHADOW_INGRESS_CAPACITY);
         let (runtime_handle, runtime) = CognitiveRuntime::new(RuntimeConfig::default())
             .expect("default Yunxi runtime configuration must be valid");
+
+        let (action_arbiter, action_port): (
+            Option<Arc<ActionArbiter>>,
+            Option<Arc<dyn ActionPort>>,
+        ) = action_adapter.map_or((None, None), |adapter| {
+            let resolver: Arc<dyn yunxi_core::DeliveryResolver> = adapter.clone();
+            let arbiter = ActionArbiter::new(
+                ActionArbiterConfig::default().with_capabilities(EnvironmentCapabilities::all()),
+            )
+            .with_delivery_resolver(resolver);
+            let port: Arc<dyn ActionPort> = adapter;
+            (Some(Arc::new(arbiter)), Some(port))
+        });
 
         let scheduler_runtime = runtime_handle.clone();
         let bridge_runtime = runtime_handle.clone();
@@ -77,7 +119,27 @@ impl ShadowBridge {
         Arc::new(Self {
             ingress,
             runtime: bridge_runtime,
+            action_arbiter,
+            action_port,
         })
+    }
+
+    /// Dispatch an admitted Core action through the configured host adapter,
+    /// then feed the result back into the same runtime event stream. Hosts
+    /// using the compatibility constructor receive `None` and keep their
+    /// existing observe-only behavior.
+    #[allow(dead_code)]
+    pub(crate) async fn dispatch_action(&self, action: ProposedAction) -> Option<ActionResult> {
+        let (Some(arbiter), Some(port)) = (&self.action_arbiter, &self.action_port) else {
+            return None;
+        };
+        let result = arbiter.dispatch(action.clone(), port.as_ref()).await;
+        if let Some(event) = action_result_event(&action, &result, Utc::now()) {
+            if let Err(error) = self.runtime.submit(event).await {
+                kovi::log::warn!("Yunxi action result could not enter runtime: {error}");
+            }
+        }
+        Some(result)
     }
 
     pub(crate) fn enqueue_group(&self, event: &GroupMsgEvent) -> EnqueueOutcome {
@@ -112,6 +174,54 @@ impl ShadowBridge {
             let _ = runtime.submit(event).await;
         });
     }
+}
+
+#[allow(dead_code)]
+fn action_result_event(
+    action: &ProposedAction,
+    result: &ActionResult,
+    occurred_at: DateTime<Utc>,
+) -> Option<WorldEvent> {
+    let idempotency_key = action.idempotency_key()?.to_owned();
+    let scope = match action.scope() {
+        yunxi_core::ActionScope::Conversation(conversation_id) => {
+            EventScope::Conversation { conversation_id }
+        }
+        yunxi_core::ActionScope::Person(person_id) => EventScope::Person { person_id },
+        yunxi_core::ActionScope::Global => EventScope::Global,
+    };
+    let kind = match result {
+        ActionResult::Executed {
+            outcome: yunxi_core::ActionPortOutcome::Delivered { .. },
+            ..
+        } => WorldEventKind::ActionSucceeded(yunxi_core::ActionSucceededEvent { idempotency_key }),
+        ActionResult::Executed {
+            outcome: yunxi_core::ActionPortOutcome::Deferred { reason },
+            ..
+        } => WorldEventKind::ActionFailed(yunxi_core::ActionFailedEvent {
+            idempotency_key,
+            error_category: format!("deferred:{reason}"),
+        }),
+        ActionResult::Failed { error, .. } => {
+            WorldEventKind::ActionFailed(yunxi_core::ActionFailedEvent {
+                idempotency_key,
+                error_category: error.category.clone(),
+            })
+        }
+        ActionResult::Rejected(rejection) => {
+            WorldEventKind::ActionRejected(yunxi_core::ActionRejectedEvent {
+                idempotency_key,
+                reason: rejection.to_string(),
+            })
+        }
+        ActionResult::Noop => return None,
+    };
+    Some(WorldEvent::new(
+        occurred_at,
+        scope,
+        EventPriority::High,
+        kind,
+    ))
 }
 
 fn idle_tick_event(occurred_at: DateTime<Utc>) -> WorldEvent {
@@ -725,9 +835,9 @@ fn looks_like_stop_request(message: &str) -> bool {
 mod tests {
     use super::{
         ConversationAddress, EnqueueOutcome, InboundMessage, MessageReference,
-        MessageReferenceCache, MessageReferenceKey, ShadowBridge, bounded_text,
-        detect_open_loop_candidate, idle_tick_event, looks_like_stop_request, message_at_self,
-        reply_message_id, resolve_and_submit, text_mentions_agent,
+        MessageReferenceCache, MessageReferenceKey, ShadowBridge, action_result_event,
+        bounded_text, detect_open_loop_candidate, idle_tick_event, looks_like_stop_request,
+        message_at_self, reply_message_id, resolve_and_submit, text_mentions_agent,
     };
     use chrono::Utc;
     use kovi::bot::message::{Message, Segment};
@@ -735,9 +845,10 @@ mod tests {
     use serde_json::json;
     use std::sync::Arc;
     use yunxi_core::{
-        AttentionDisposition, ConversationId, ConversationKind, EventPriority, IdentityStore,
-        IdentityStoreError, IdentityStoreFuture, MessageId, OpenLoopKind, OpenLoopOwner, PersonId,
-        ProcessingOutcome, RuntimeConfig,
+        ActionPortOutcome, ActionRejection, ActionResult, AttentionDisposition, ConversationId,
+        ConversationKind, EventPriority, IdentityStore, IdentityStoreError, IdentityStoreFuture,
+        MessageContent, MessageId, OpenLoopKind, OpenLoopOwner, PersonId, ProcessingOutcome,
+        ProposedAction, RuntimeConfig,
     };
 
     struct FakeIdentityStore {
@@ -897,7 +1008,12 @@ mod tests {
         let (ingress, _receiver) = mpsc::channel(1);
         let (runtime, _consumer) =
             yunxi_core::CognitiveRuntime::new(RuntimeConfig::default()).expect("valid runtime");
-        let bridge = ShadowBridge { ingress, runtime };
+        let bridge = ShadowBridge {
+            ingress,
+            runtime,
+            action_arbiter: None,
+            action_port: None,
+        };
         let message = inbound(ConversationAddress::Group { group_id: 123 }, false);
 
         assert_eq!(
@@ -916,6 +1032,60 @@ mod tests {
         assert_eq!(event.scope(), yunxi_core::EventScope::Global);
         assert_eq!(event.priority(), EventPriority::Low);
         assert!(matches!(event.kind(), yunxi_core::WorldEventKind::IdleTick));
+        assert!(event.validate(8).is_ok());
+    }
+
+    #[test]
+    fn action_results_become_scoped_core_events() {
+        let conversation_id = ConversationId::new();
+        let action = ProposedAction::send_message(conversation_id, MessageContent::text("hello"))
+            .expect("action should validate");
+        let result = ActionResult::Executed {
+            receipt: yunxi_core::ActionReceipt {
+                action_id: action.action_id(),
+                idempotency_key: action.idempotency_key().map(ToOwned::to_owned),
+                admitted_at: Utc::now(),
+            },
+            outcome: ActionPortOutcome::Delivered {
+                external_reference: Some("qq-message:42".to_owned()),
+            },
+        };
+        let event = action_result_event(&action, &result, Utc::now()).expect("event");
+        assert_eq!(
+            event.scope(),
+            yunxi_core::EventScope::Conversation { conversation_id }
+        );
+        assert_eq!(event.priority(), EventPriority::High);
+        assert!(matches!(
+            event.kind(),
+            yunxi_core::WorldEventKind::ActionSucceeded(payload)
+                if action
+                    .idempotency_key()
+                    .is_some_and(|key| payload.idempotency_key == key)
+        ));
+        assert!(event.validate(8).is_ok());
+    }
+
+    #[test]
+    fn rejected_action_result_preserves_person_scope_and_reason() {
+        let person_id = PersonId::new();
+        let action = ProposedAction::reach_out(
+            person_id,
+            MessageContent::text("hello"),
+            yunxi_core::ProactiveMotive::CheckIn,
+        )
+        .expect("action should validate");
+        let result = ActionResult::Rejected(ActionRejection::TargetUnavailable {
+            action_id: action.action_id(),
+            person_id,
+        });
+        let event = action_result_event(&action, &result, Utc::now()).expect("event");
+        assert_eq!(event.scope(), yunxi_core::EventScope::Person { person_id });
+        assert!(matches!(
+            event.kind(),
+            yunxi_core::WorldEventKind::ActionRejected(payload)
+                if payload.reason.contains("no delivery route")
+        ));
         assert!(event.validate(8).is_ok());
     }
 
