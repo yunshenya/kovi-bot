@@ -191,10 +191,29 @@ async fn main() {
         panic!("群聊白名单 PostgreSQL 初始化失败，拒绝写入 readiness: {error}");
     }
 
-    register_chat_function! {
-        (group_message, group_message_event),
-        (private_message, private_message_event)
-    }
+    let yunxi_bridge = yunxi::bridge::ShadowBridge::start(
+        yunxi::identity_store().expect("Yunxi identity store must be initialized before handlers"),
+    );
+    let group_bridge = Arc::clone(&yunxi_bridge);
+    let private_bridge = Arc::clone(&yunxi_bridge);
+    let group_bot = Arc::clone(&proactive_bot);
+    let private_bot = Arc::clone(&proactive_bot);
+    let group_message = move |event: Arc<kovi::event::GroupMsgEvent>| {
+        let bridge = Arc::clone(&group_bridge);
+        let bot = Arc::clone(&group_bot);
+        bridge.enqueue_group(&event);
+        async move {
+            group_message_event(event, bot).await;
+        }
+    };
+    let private_message = move |event: Arc<kovi::event::PrivateMsgEvent>| {
+        let bridge = Arc::clone(&private_bridge);
+        let bot = Arc::clone(&private_bot);
+        bridge.enqueue_private(&event);
+        async move {
+            private_message_event(event, bot).await;
+        }
+    };
 
     // 注册群聊消息处理器
     PluginBuilder::on_group_msg(group_message);

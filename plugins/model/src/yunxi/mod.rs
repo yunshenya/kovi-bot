@@ -1,3 +1,4 @@
+pub(crate) mod bridge;
 mod identity_store;
 pub(crate) mod qq;
 
