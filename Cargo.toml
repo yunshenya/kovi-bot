@@ -27,7 +27,7 @@ thiserror = "2.0"
 tokio = { version = "1.53.1", default-features = false, features = ["sync"] }
 url = "2.5.8"
 uuid = { version = "1.18", features = ["serde", "v4", "v5"] }
-yunxi-core = { path = "crates/yunxi-core" }
+yunxi-core = { version = "0.1.0", path = "crates/yunxi-core" }
 
 # Line tables preserve useful backtraces while avoiding multi-gigabyte full debug info.
 [profile.dev]
