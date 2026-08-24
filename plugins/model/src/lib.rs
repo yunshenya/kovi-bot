@@ -33,6 +33,7 @@ mod redis_store;
 pub(crate) mod reminders;
 mod vision;
 mod vision_router;
+pub(crate) mod yunxi;
 // 工具函数模块
 mod utils;
 // 记忆管理系统
@@ -144,6 +145,10 @@ async fn main() {
                 kovi::tokio::time::sleep(kovi::tokio::time::Duration::from_secs(delay_secs)).await;
             }
         }
+    }
+
+    if let Err(error) = yunxi::initialize_database().await {
+        panic!("Yunxi identity mapping 表初始化失败，拒绝写入 readiness: {error}");
     }
 
     if let Err(error) = reminders::initialize_database().await {

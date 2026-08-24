@@ -18,7 +18,7 @@ chrono = { version = "0.4.41", features = ["serde"] }
 chrono-tz = "0.10.4"
 redis = { version = "1.6", default-features = false, features = ["tokio-comp", "connection-manager", "script"] }
 sqlx-core = { version = "=0.8.6", default-features = false, features = ["_rt-tokio", "_tls-rustls-ring-webpki", "json", "chrono"] }
-sqlx-postgres = { version = "=0.8.6", default-features = false, features = ["json", "chrono"] }
+sqlx-postgres = { version = "=0.8.6", default-features = false, features = ["json", "chrono", "uuid"] }
 rmcp = { version = "3.1.4", default-features = false, features = ["client", "transport-child-process"] }
 scraper = "0.27.0"
 serde = { version = "1.0.219", features = ["derive"] }
@@ -27,6 +27,7 @@ thiserror = "2.0"
 tokio = { version = "1.53.1", default-features = false, features = ["sync"] }
 url = "2.5.8"
 uuid = { version = "1.18", features = ["serde", "v4"] }
+yunxi-core = { path = "crates/yunxi-core" }
 
 # Line tables preserve useful backtraces while avoiding multi-gigabyte full debug info.
 [profile.dev]

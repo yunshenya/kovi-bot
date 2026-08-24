@@ -19,8 +19,11 @@ pub use event::{
     ToolCompletedEvent, ToolFailedEvent, TraceContext, TraceError, WorldEvent, WorldEventKind,
 };
 pub use identity::{
-    ConversationId, ConversationKind, EventId, GoalId, MessageId, OpenLoopId, PersonId,
+    ConversationId, ConversationKind, EventId, ExternalConversation, ExternalIdentity,
+    ExternalReferenceError, GoalId, MAX_EXTERNAL_ID_BYTES, MAX_PLATFORM_ID_BYTES, MessageId,
+    OpenLoopId, PersonId, PlatformId,
 };
+pub use ports::{Clock, IdentityStore, IdentityStoreError, IdentityStoreFuture, SystemClock};
 pub use runtime::{
     Admission, CognitiveRuntime, ProcessingOutcome, RuntimeConfig, RuntimeConfigError,
     RuntimeHandle, RuntimeObservation, SubmitError,
