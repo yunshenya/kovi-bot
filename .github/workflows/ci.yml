@@ -89,6 +89,13 @@ jobs:
           cargo test -p model --lib --locked
           memory::tests::normalized_postgres_storage_round_trips -- --ignored --exact
 
+      - name: Run Yunxi identity mapping integration test
+        env:
+          DATABASE_URL: postgresql://kovi_test:integration-test@127.0.0.1:5432/kovi_test
+        run: >-
+          cargo test -p model --lib --locked
+          yunxi::identity_store::tests::postgres_identity_mapping_is_stable_and_race_safe -- --ignored --exact
+
       - name: Run reminder claim integration test
         env:
           DATABASE_URL: postgresql://kovi_test:integration-test@127.0.0.1:5432/kovi_test

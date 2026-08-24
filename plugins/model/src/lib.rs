@@ -33,6 +33,7 @@ mod redis_store;
 pub(crate) mod reminders;
 mod vision;
 mod vision_router;
+pub(crate) mod yunxi;
 // 工具函数模块
 mod utils;
 // 记忆管理系统
@@ -146,6 +147,10 @@ async fn main() {
         }
     }
 
+    if let Err(error) = yunxi::initialize_database().await {
+        panic!("Yunxi identity mapping 表初始化失败，拒绝写入 readiness: {error}");
+    }
+
     if let Err(error) = reminders::initialize_database().await {
         panic!("提醒任务表初始化失败，拒绝写入 readiness: {error}");
     }
@@ -186,10 +191,31 @@ async fn main() {
         panic!("群聊白名单 PostgreSQL 初始化失败，拒绝写入 readiness: {error}");
     }
 
-    register_chat_function! {
-        (group_message, group_message_event),
-        (private_message, private_message_event)
-    }
+    let yunxi_bridge = yunxi::bridge::ShadowBridge::start_with_open_loops(
+        yunxi::identity_store().expect("Yunxi identity store must be initialized before handlers"),
+        yunxi::open_loop_store()
+            .expect("Yunxi open-loop store must be initialized before handlers"),
+    );
+    let group_bridge = Arc::clone(&yunxi_bridge);
+    let private_bridge = Arc::clone(&yunxi_bridge);
+    let group_bot = Arc::clone(&proactive_bot);
+    let private_bot = Arc::clone(&proactive_bot);
+    let group_message = move |event: Arc<kovi::event::GroupMsgEvent>| {
+        let bridge = Arc::clone(&group_bridge);
+        let bot = Arc::clone(&group_bot);
+        bridge.enqueue_group(&event);
+        async move {
+            group_message_event(event, bot).await;
+        }
+    };
+    let private_message = move |event: Arc<kovi::event::PrivateMsgEvent>| {
+        let bridge = Arc::clone(&private_bridge);
+        let bot = Arc::clone(&private_bot);
+        bridge.enqueue_private(&event);
+        async move {
+            private_message_event(event, bot).await;
+        }
+    };
 
     // 注册群聊消息处理器
     PluginBuilder::on_group_msg(group_message);
@@ -206,9 +232,12 @@ async fn main() {
             }
         }
     });
-    if proactive_chat::startup::get_or_create_proactive_manager(Arc::clone(&proactive_bot))
-        .await
-        .is_some()
+    if proactive_chat::startup::get_or_create_proactive_manager_with_bridge(
+        Arc::clone(&proactive_bot),
+        Some(Arc::clone(&yunxi_bridge)),
+    )
+    .await
+    .is_some()
     {
         println!("[INFO] 主动消息管理器已启动");
     }

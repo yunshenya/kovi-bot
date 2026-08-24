@@ -6,11 +6,14 @@
 //! - 活跃度检测和时机判断
 //! - 话题生成和个性化聊天
 
+use crate::group_access;
 use crate::memory::MemoryManager;
 use crate::model::semantic::{MessageUnderstanding, UnderstandingRequest, understand};
-use crate::model::{send_tracked_group_message, send_tracked_private_message};
+use crate::model::send_tracked_group_message;
 use crate::mood_system::MOOD_SYSTEM;
 use crate::topic_generator::TopicGenerator;
+use crate::yunxi;
+use crate::yunxi::bridge::ShadowBridge;
 use anyhow::Result;
 use chrono::Local;
 use kovi::RuntimeBot;
@@ -19,6 +22,7 @@ use rand::Rng;
 use rand::prelude::IndexedRandom;
 use std::sync::Arc;
 use std::time::Duration;
+use yunxi_core::{MessageContent, ProactiveOpportunity, ReachOutIntent};
 
 pub mod startup;
 
@@ -42,15 +46,26 @@ pub struct ProactiveChatManager {
     topic_generator: TopicGenerator,
     /// 机器人实例，用于发送消息
     bot: Arc<RuntimeBot>,
+    /// Shared Core bridge used only for best-effort idle observations.
+    yunxi_bridge: Option<Arc<ShadowBridge>>,
 }
 
 impl ProactiveChatManager {
     pub fn new(memory_manager: Arc<MemoryManager>, bot: Arc<RuntimeBot>) -> Self {
+        Self::new_with_bridge(memory_manager, bot, None)
+    }
+
+    pub(crate) fn new_with_bridge(
+        memory_manager: Arc<MemoryManager>,
+        bot: Arc<RuntimeBot>,
+        yunxi_bridge: Option<Arc<ShadowBridge>>,
+    ) -> Self {
         let topic_generator = TopicGenerator::new(Arc::clone(&memory_manager));
         Self {
             memory_manager,
             topic_generator,
             bot,
+            yunxi_bridge,
         }
     }
 
@@ -63,6 +78,9 @@ impl ProactiveChatManager {
             if !proactive_config.enabled() {
                 sleep(Duration::from_secs(proactive_config.check_interval_secs())).await;
                 continue;
+            }
+            if let Some(bridge) = &self.yunxi_bridge {
+                bridge.observe_idle_tick();
             }
 
             // 最信任用户有独立、严格限额的关心频率，不与群聊随机目标竞争。
@@ -88,6 +106,14 @@ impl ProactiveChatManager {
     }
 
     async fn should_initiate_chat(&self) -> bool {
+        if !self.can_send_regular_chat().await {
+            return false;
+        }
+        let probability = crate::config::get().proactive().push_probability_percent() as u32;
+        probability > 0 && rand::rng().random_ratio(probability, 100)
+    }
+
+    async fn can_send_regular_chat(&self) -> bool {
         let personality = self.memory_manager.get_bot_personality().await;
 
         // 检查基本条件
@@ -137,8 +163,7 @@ impl ProactiveChatManager {
             return false;
         }
 
-        let probability = proactive_config.push_probability_percent() as u32;
-        probability > 0 && rand::rng().random_ratio(probability, 100)
+        true
     }
 
     async fn try_initiate_chat(&self) -> Result<()> {
@@ -164,6 +189,71 @@ impl ProactiveChatManager {
         Ok(())
     }
 
+    async fn plan_private_reach_out(&self, user_id: i64) -> Result<Option<ProactiveOpportunity>> {
+        let Some(identity_store) = yunxi::identity_store() else {
+            kovi::log::warn!("Yunxi proactive identity store is unavailable");
+            return Ok(None);
+        };
+        let external = match yunxi::qq::person(user_id) {
+            Ok(external) => external,
+            Err(error) => {
+                kovi::log::warn!("Yunxi proactive identity reference is invalid: {error}");
+                return Ok(None);
+            }
+        };
+        let person_id = match identity_store.resolve_identity(&external).await {
+            Ok(person_id) => person_id,
+            Err(error) => {
+                kovi::log::warn!("Yunxi proactive identity resolution failed: {error}");
+                return Ok(None);
+            }
+        };
+        let Some(profile) = self.memory_manager.get_user_profile(user_id).await else {
+            return Ok(None);
+        };
+        let personality = self.memory_manager.get_bot_personality().await;
+        let memories = self
+            .memory_manager
+            .get_recent_memories_for_subject(user_id, Some("private"), 16)
+            .await;
+        yunxi::proactive::project_private_opportunity(
+            person_id,
+            &profile,
+            &personality,
+            &memories,
+            Local::now(),
+            crate::model::utils::model_load_percent(),
+        )
+        .map_err(Into::into)
+    }
+
+    async fn generate_private_reach_out(&self, user_id: i64) -> Result<Option<ReachOutIntent>> {
+        let Some(opportunity) = self.plan_private_reach_out(user_id).await? else {
+            return Ok(None);
+        };
+        let motive = opportunity.motive();
+        let Some(topic) = self
+            .topic_generator
+            .generate_memory_based_topic_with_motive(None, Some(user_id), Some(motive))
+            .await?
+        else {
+            return Ok(None);
+        };
+        if topic.proactive_motive != Some(motive) {
+            return Ok(None);
+        }
+        ReachOutIntent::from_opportunity(opportunity, MessageContent::text(topic.content))
+            .map(Some)
+            .map_err(Into::into)
+    }
+
+    async fn deliver_private_reach_out(&self, user_id: i64, intent: &ReachOutIntent) -> bool {
+        let Some(identity_store) = yunxi::identity_store() else {
+            return false;
+        };
+        yunxi::delivery::send_reach_out(&self.bot, &identity_store, intent, user_id).await
+    }
+
     /// 由模型结合关系、情绪与近期互动决定是否主动关心最信任用户。
     async fn try_initiate_main_admin_chat(&self) -> Result<bool> {
         let proactive_config = crate::config::get().proactive().clone();
@@ -182,17 +272,16 @@ impl ProactiveChatManager {
             .record_proactive_event(Some(&decision_key), &[], Local::now())
             .await?;
 
-        let message = self
-            .topic_generator
-            .generate_memory_based_topic(None, Some(main_admin))
-            .await?
-            .map(|topic| topic.content);
-
-        let Some(message) = message else {
+        let Some(intent) = self.generate_private_reach_out(main_admin).await? else {
             return Ok(false);
         };
+        let message = intent.message().as_text().to_string();
 
-        if !send_tracked_private_message(&self.bot, main_admin, message.clone()).await {
+        // Model generation can take long enough for another event to invalidate
+        // cooldown, daily-limit, or recent-interaction state.
+        if !self.can_send_main_admin(main_admin).await
+            || !self.deliver_private_reach_out(main_admin, &intent).await
+        {
             return Ok(false);
         }
         let target_key = target_state_key("private", main_admin);
@@ -302,34 +391,34 @@ impl ProactiveChatManager {
     }
 
     async fn get_active_groups(&self) -> Vec<i64> {
-        // 从群组档案中获取活跃群组
-        let group_profiles = self.memory_manager.get_all_group_profiles().await;
         let now = Local::now();
         let one_day_ago = now - chrono::Duration::days(1);
 
-        group_profiles
-            .into_iter()
-            .filter(|profile| profile.last_activity > one_day_ago && profile.activity_level > 3)
-            .map(|profile| profile.group_id)
-            .collect()
+        let candidates = self
+            .memory_manager
+            .get_proactive_group_candidates(one_day_ago, 32)
+            .await;
+        let mut authorized = Vec::with_capacity(candidates.len());
+        for profile in candidates {
+            if group_access::is_authorized_group(profile.group_id)
+                .await
+                .unwrap_or(false)
+            {
+                authorized.push(profile.group_id);
+            }
+        }
+        authorized
     }
 
     async fn get_active_users(&self) -> Vec<i64> {
-        // 从用户档案中获取最近活跃的用户
-        let user_profiles = self.memory_manager.get_all_user_profiles().await;
         let now = Local::now();
         let three_days_ago = now - chrono::Duration::days(3);
         let main_admin = crate::config::get().proactive().main_admin();
 
-        user_profiles
+        self.memory_manager
+            .get_proactive_user_candidates(three_days_ago, main_admin, 32)
+            .await
             .into_iter()
-            .filter(|profile| {
-                Some(profile.user_id) != main_admin
-                    && profile
-                        .last_private_interaction
-                        .is_some_and(|last_private| last_private > three_days_ago)
-                    && profile.relationship_level > 2
-            })
             .map(|profile| profile.user_id)
             .collect()
     }
@@ -350,6 +439,14 @@ impl ProactiveChatManager {
     }
 
     async fn initiate_group_chat(&self, group_id: i64) -> Result<()> {
+        // Profile persistence can outlive an authorization revocation. Check the
+        // current allowlist before doing any model work and again before send.
+        if !group_access::is_authorized_group(group_id)
+            .await
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
         if !self.can_send_to_target("group", group_id).await {
             return Ok(());
         }
@@ -371,6 +468,14 @@ impl ProactiveChatManager {
             let content = topic.content.clone();
 
             // 发送消息
+            if !group_access::is_authorized_group(group_id)
+                .await
+                .unwrap_or(false)
+                || !self.can_send_regular_chat().await
+                || !self.can_send_to_target("group", group_id).await
+            {
+                return Ok(());
+            }
             if !send_tracked_group_message(&self.bot, group_id, content.clone()).await {
                 return Ok(());
             }
@@ -410,40 +515,34 @@ impl ProactiveChatManager {
             return Ok(false);
         }
 
-        // 只根据真实近期互动、滚动摘要和长期档案生成主动话题
-        if let Some(topic) = self
-            .topic_generator
-            .generate_memory_based_topic(None, Some(user_id))
-            .await?
+        let Some(intent) = self.generate_private_reach_out(user_id).await? else {
+            return Ok(false);
+        };
+        let content = intent.message().as_text().to_string();
+
+        if !self.can_send_regular_chat().await
+            || !self.can_send_to_target("private", user_id).await
+            || !self.deliver_private_reach_out(user_id, &intent).await
         {
-            let content = topic.content.clone();
-
-            // 发送消息
-            if !send_tracked_private_message(&self.bot, user_id, content.clone()).await {
-                return Ok(false);
-            }
-
-            let target_key = target_state_key("private", user_id);
-            self.memory_manager
-                .record_proactive_event(
-                    None,
-                    &[GLOBAL_PROACTIVE_STATE_KEY.to_string(), target_key],
-                    Local::now(),
-                )
-                .await?;
-
-            // 记录这次主动对话
-            self.memory_manager
-                .add_conversation_memory(
-                    user_id,
-                    &format!("主动发起话题: {}", content),
-                    "proactive_private_chat",
-                )
-                .await?;
-            return Ok(true);
+            return Ok(false);
         }
 
-        Ok(false)
+        let target_key = target_state_key("private", user_id);
+        self.memory_manager
+            .record_proactive_event(
+                None,
+                &[GLOBAL_PROACTIVE_STATE_KEY.to_string(), target_key],
+                Local::now(),
+            )
+            .await?;
+        self.memory_manager
+            .add_conversation_memory(
+                user_id,
+                &format!("主动发起话题: {}", content),
+                "proactive_private_chat",
+            )
+            .await?;
+        Ok(true)
     }
 
     async fn can_send_to_target(&self, scope: &str, subject_id: i64) -> bool {

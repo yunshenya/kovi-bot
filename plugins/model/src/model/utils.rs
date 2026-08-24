@@ -124,8 +124,21 @@ static MODEL_CLIENT: LazyLock<Client> = LazyLock::new(|| {
         .build()
         .expect("模型 HTTP 客户端应可创建")
 });
-static MODEL_REQUEST_LIMIT: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(4));
+const MODEL_CONCURRENCY_LIMIT: usize = 4;
+static MODEL_REQUEST_LIMIT: LazyLock<Semaphore> =
+    LazyLock::new(|| Semaphore::new(MODEL_CONCURRENCY_LIMIT));
 static MODEL_QUEUE_DEPTH: AtomicUsize = AtomicUsize::new(0);
+
+pub(crate) fn model_load_percent() -> u8 {
+    let active = MODEL_CONCURRENCY_LIMIT.saturating_sub(MODEL_REQUEST_LIMIT.available_permits());
+    let active_load = active.saturating_mul(100) / MODEL_CONCURRENCY_LIMIT;
+    let queue_limit = crate::config::get().traffic().max_model_queue().max(1);
+    let queue_load = MODEL_QUEUE_DEPTH
+        .load(Ordering::Acquire)
+        .saturating_mul(100)
+        / queue_limit;
+    active_load.max(queue_load).min(100) as u8
+}
 
 struct ModelQueueGuard;
 
