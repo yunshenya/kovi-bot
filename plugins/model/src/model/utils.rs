@@ -499,6 +499,16 @@ pub async fn control_model(
             }
         }
     }
+    if explicit_self_mention_request(message) && plan.has_visible_reply() {
+        let already_at_sender = plan.action.at_user_ids.contains(&user_id);
+        plan.ensure_at_user(user_id);
+        if !already_at_sender {
+            println!(
+                "[INFO] 群聊明确@当前发言者，补充结构化 at 动作 (群组: {}, 用户: {})",
+                group_id, user_id
+            );
+        }
+    }
     let personality = MEMORY_REPOSITORY.personality().await;
     let execution = execute_reply_plan(
         &bot,
@@ -597,6 +607,51 @@ fn should_repair_empty_reply(
         && !plan.is_silent()
         && !plan.has_visible_reply()
         && plan.action.recall_message_ids.is_empty()
+}
+
+fn explicit_self_mention_request(message: &str) -> bool {
+    let user_text = message.split('<').next().unwrap_or(message);
+    let compact = user_text
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>();
+    if compact.is_empty()
+        || [
+            "不要@我",
+            "别@我",
+            "不用@我",
+            "不要艾特我",
+            "别艾特我",
+            "不用艾特我",
+        ]
+        .iter()
+        .any(|phrase| compact.contains(phrase))
+    {
+        return false;
+    }
+
+    let normalized = compact.to_ascii_lowercase();
+    let target_requested = ["@我", "我@", "艾特我", "提及我", "at我"]
+        .iter()
+        .any(|phrase| normalized.contains(phrase));
+    if !target_requested {
+        return false;
+    }
+
+    [
+        "一下",
+        "请",
+        "让",
+        "帮",
+        "给",
+        "能不能",
+        "可以",
+        "麻烦",
+        "叫",
+    ]
+    .iter()
+    .any(|phrase| compact.contains(phrase))
+        || matches!(compact.as_str(), "@我" | "艾特我" | "你@我")
 }
 
 async fn repair_empty_reply(
@@ -2336,9 +2391,10 @@ mod tests {
     use super::{
         BotMemory, EMPTY_REPLY_REPAIR_PROMPT, MessageUnderstanding, Roles, VisionImage,
         append_stream_delta, build_model_messages, build_responses_input, compression_cutoff,
-        extract_stream_delta, group_system_prompt, is_group_admin_command, is_help_command,
-        is_restricted_command, limit_memory_size, model_attempt_count, sanitize_scheduled_output,
-        should_repair_empty_reply, with_reference_context,
+        explicit_self_mention_request, extract_stream_delta, group_system_prompt,
+        is_group_admin_command, is_help_command, is_restricted_command, limit_memory_size,
+        model_attempt_count, sanitize_scheduled_output, should_repair_empty_reply,
+        with_reference_context,
     };
     use crate::memory::{BotPersonality, UserProfile};
     use crate::model::message_actions::{ReplyPlan, follow_up_delay_millis, split_reply};
@@ -2427,6 +2483,17 @@ mod tests {
             true,
             &MessageUnderstanding::default()
         ));
+    }
+
+    #[test]
+    fn explicit_self_mention_requests_are_detected_without_matching_negations() {
+        assert!(explicit_self_mention_request("@ 我一下"));
+        assert!(explicit_self_mention_request("让他@我"));
+        assert!(explicit_self_mention_request("请艾特我一下"));
+        assert!(explicit_self_mention_request("帮我@一下"));
+        assert!(!explicit_self_mention_request("为什么你刚才@我"));
+        assert!(!explicit_self_mention_request("不要@我"));
+        assert!(!explicit_self_mention_request("你@一个名字叫南竹的人"));
     }
 
     #[test]

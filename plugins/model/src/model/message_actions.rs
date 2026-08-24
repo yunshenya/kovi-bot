@@ -82,6 +82,12 @@ impl ReplyPlan {
     pub(crate) fn has_visible_reply(&self) -> bool {
         !self.is_silent() && !self.bubbles.is_empty()
     }
+
+    pub(crate) fn ensure_at_user(&mut self, user_id: i64) {
+        if self.has_visible_reply() && !self.action.at_user_ids.contains(&user_id) {
+            self.action.at_user_ids.insert(0, user_id);
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -309,6 +315,23 @@ mod tests {
                 assert_eq!(plan.content, "第一条\n第二条");
                 assert!(plan.has_visible_reply());
             });
+    }
+
+    #[test]
+    fn visible_reply_can_add_the_current_sender_as_a_structured_mention() {
+        let mut plan = ReplyPlan {
+            content: "好呀".to_string(),
+            disposition: ReplyDisposition::Reply,
+            action: Default::default(),
+            bubbles: vec!["好呀".to_string()],
+            requests_image: false,
+        };
+
+        plan.ensure_at_user(3_052_405_886);
+
+        assert_eq!(plan.action.at_user_ids, vec![3_052_405_886]);
+        plan.ensure_at_user(3_052_405_886);
+        assert_eq!(plan.action.at_user_ids, vec![3_052_405_886]);
     }
 
     #[test]
