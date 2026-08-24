@@ -1785,6 +1785,7 @@ mod tests {
                 let group_id = suffix + 10_000;
                 let first_key = format!("agent-task-test:{suffix}:first");
                 let second_key = format!("agent-task-test:{suffix}:second");
+                let question = "今晚有空吗";
                 let pool = super::database_pool().expect("连接池应存在");
                 let first_goal = sqlx_core::query_scalar::query_scalar::<Postgres, i64>(
                     r#"
@@ -1799,7 +1800,7 @@ mod tests {
                 .bind(actor_user_id)
                 .bind(1_i32)
                 .bind(group_id)
-                .bind(serde_json::json!({"group_id": group_id, "content": "问题一"}))
+                .bind(serde_json::json!({"group_id": group_id, "content": question}))
                 .fetch_one(pool)
                 .await
                 .expect("应创建第一个测试目标");
@@ -1816,7 +1817,7 @@ mod tests {
                 .bind(actor_user_id)
                 .bind(2_i32)
                 .bind(group_id)
-                .bind(serde_json::json!({"group_id": group_id, "content": "问题二"}))
+                .bind(serde_json::json!({"group_id": group_id, "content": question}))
                 .fetch_one(pool)
                 .await
                 .expect("应创建第二个测试目标");
@@ -1828,7 +1829,7 @@ mod tests {
                     source_id: actor_user_id,
                     source_message_id: 1,
                     target_group_id: group_id,
-                    question: "今晚有空吗",
+                    question,
                     collect_minutes: 1,
                 };
                 let second_request = super::TaskReservationRequest {
@@ -1838,21 +1839,17 @@ mod tests {
                     source_id: actor_user_id,
                     source_message_id: 2,
                     target_group_id: group_id,
-                    question: "今晚有空吗",
+                    question,
                     collect_minutes: 1,
                 };
                 let (first, second) = kovi::tokio::join!(
                     super::reserve_task(first_request),
                     super::reserve_task(second_request),
                 );
-                let (task_id, replay_goal, replay_key, replay_source_message_id, replay_question) =
+                let (task_id, replay_goal, replay_key, replay_source_message_id) =
                     match (first, second) {
-                        (Ok(task_id), Err(_)) => {
-                            (task_id, first_goal, first_key.as_str(), 1, "问题一")
-                        }
-                        (Err(_), Ok(task_id)) => {
-                            (task_id, second_goal, second_key.as_str(), 2, "问题二")
-                        }
+                        (Ok(task_id), Err(_)) => (task_id, first_goal, first_key.as_str(), 1),
+                        (Err(_), Ok(task_id)) => (task_id, second_goal, second_key.as_str(), 2),
                         (Ok(_), Ok(_)) => panic!("同一目标群不应同时保留两个任务"),
                         (Err(first_error), Err(second_error)) => panic!(
                             "两个并发任务都未创建：第一个={first_error:?}, 第二个={second_error:?}"
@@ -1865,7 +1862,7 @@ mod tests {
                     source_id: actor_user_id,
                     source_message_id: replay_source_message_id,
                     target_group_id: group_id,
-                    question: replay_question,
+                    question,
                     collect_minutes: 1,
                 })
                 .await
