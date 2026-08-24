@@ -2,13 +2,136 @@ use crate::identity::{
     ConversationId, ConversationKind, ExternalConversation, ExternalIdentity, OpenLoopId, PersonId,
 };
 use crate::open_loop::{OpenLoop, OpenLoopDraft, OpenLoopOwner};
+use crate::planner::{ModelBackend, RelationState};
 use crate::{Memory, MemoryDraft, MemoryId, MemoryQuery, MemoryScope};
 use chrono::{DateTime, Utc};
 use std::error::Error as StdError;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
+
+/// Optional Core persistence boundary for relation context.  A host can
+/// provide this store when relation persistence is available; the planner
+/// also accepts an inline snapshot for read-only or lightweight hosts.
+pub type RelationStoreFuture<'a, T> =
+    Pin<Box<dyn Future<Output = Result<T, RelationStoreError>> + Send + 'a>>;
+
+pub trait RelationStore: Send + Sync {
+    fn get<'a>(&'a self, person_id: PersonId) -> RelationStoreFuture<'a, Option<RelationState>>;
+}
+
+#[derive(Debug, Error)]
+pub enum RelationStoreError {
+    #[error("relation storage operation failed")]
+    Storage {
+        #[source]
+        source: Box<dyn StdError + Send + Sync>,
+    },
+}
+
+impl RelationStoreError {
+    pub fn storage(source: impl StdError + Send + Sync + 'static) -> Self {
+        Self::Storage {
+            source: Box::new(source),
+        }
+    }
+}
+
+/// Goal persistence is intentionally a narrow marker at this phase.  Goal
+/// entities and mutation commands will be introduced by the Goal phase; the
+/// service container can already carry a host implementation without making
+/// the current Core depend on a platform goal schema.
+pub trait GoalStore: Send + Sync {}
+
+/// Shared, platform-neutral dependencies used by a cognitive runtime.
+///
+/// Storage ports are optional so a standalone in-memory/fake runtime can be
+/// started with only a model backend.  Production hosts can install each
+/// adapter through the builder methods as the corresponding Core phase lands.
+pub struct CoreServices {
+    pub memory: Option<Arc<dyn MemoryStore>>,
+    pub identity: Option<Arc<dyn IdentityStore>>,
+    pub open_loops: Option<Arc<dyn OpenLoopStore>>,
+    pub relations: Option<Arc<dyn RelationStore>>,
+    pub goals: Option<Arc<dyn GoalStore>>,
+    pub model: Arc<dyn ModelBackend>,
+    pub clock: Arc<dyn Clock>,
+}
+
+impl std::fmt::Debug for CoreServices {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CoreServices")
+            .field("memory", &self.memory.is_some())
+            .field("identity", &self.identity.is_some())
+            .field("open_loops", &self.open_loops.is_some())
+            .field("relations", &self.relations.is_some())
+            .field("goals", &self.goals.is_some())
+            .field("clock", &true)
+            .finish_non_exhaustive()
+    }
+}
+
+impl CoreServices {
+    #[must_use]
+    pub fn new(model: Arc<dyn ModelBackend>) -> Self {
+        Self {
+            memory: None,
+            identity: None,
+            open_loops: None,
+            relations: None,
+            goals: None,
+            model,
+            clock: Arc::new(SystemClock),
+        }
+    }
+
+    #[must_use]
+    pub fn with_model<M>(model: M) -> Self
+    where
+        M: ModelBackend + 'static,
+    {
+        Self::new(Arc::new(model))
+    }
+
+    #[must_use]
+    pub fn with_memory(mut self, memory: Arc<dyn MemoryStore>) -> Self {
+        self.memory = Some(memory);
+        self
+    }
+
+    #[must_use]
+    pub fn with_identity(mut self, identity: Arc<dyn IdentityStore>) -> Self {
+        self.identity = Some(identity);
+        self
+    }
+
+    #[must_use]
+    pub fn with_open_loops(mut self, open_loops: Arc<dyn OpenLoopStore>) -> Self {
+        self.open_loops = Some(open_loops);
+        self
+    }
+
+    #[must_use]
+    pub fn with_relations(mut self, relations: Arc<dyn RelationStore>) -> Self {
+        self.relations = Some(relations);
+        self
+    }
+
+    #[must_use]
+    pub fn with_goals(mut self, goals: Arc<dyn GoalStore>) -> Self {
+        self.goals = Some(goals);
+        self
+    }
+
+    #[must_use]
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
+    }
+}
 
 pub type IdentityStoreFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, IdentityStoreError>> + Send + 'a>>;

@@ -13,6 +13,7 @@ pub mod identity;
 pub mod intent;
 pub mod memory;
 pub mod open_loop;
+pub mod planner;
 pub mod ports;
 pub mod proactive;
 pub mod runtime;
@@ -54,9 +55,17 @@ pub use open_loop::{
     MAX_OPEN_LOOP_SUMMARY_CHARS, OpenLoop, OpenLoopDraft, OpenLoopKind, OpenLoopOwner,
     OpenLoopStatus, OpenLoopValidationError,
 };
+pub use planner::{
+    AffectState, DecisionDisposition, DecisionPlan, MAX_PLANNER_INTENTS, MAX_PLANNER_MEMORIES,
+    MAX_PLANNER_OPEN_LOOPS, MAX_PLANNER_STATE_UPDATES, MAX_PLANNER_TOPIC_BYTES,
+    MAX_PLANNER_TOPIC_CHARS, ModelBackend, ModelBackendError, ModelBackendFuture, Planner,
+    PlannerError, PlannerInput, PlannerInputValidationError, PlannerOutput,
+    PlannerOutputValidationError, PlannerStateSnapshot, RelationState, StateUpdateProposal,
+};
 pub use ports::{
-    Clock, IdentityStore, IdentityStoreError, IdentityStoreFuture, MemoryStore, MemoryStoreError,
-    MemoryStoreFuture, OpenLoopStore, OpenLoopStoreError, OpenLoopStoreFuture, SystemClock,
+    Clock, CoreServices, GoalStore, IdentityStore, IdentityStoreError, IdentityStoreFuture,
+    MemoryStore, MemoryStoreError, MemoryStoreFuture, OpenLoopStore, OpenLoopStoreError,
+    OpenLoopStoreFuture, RelationStore, RelationStoreError, RelationStoreFuture, SystemClock,
 };
 pub use proactive::{
     MAX_PROACTIVE_CANDIDATES, MAX_REACH_OUT_MESSAGE_BYTES, MAX_REACH_OUT_MESSAGE_CHARS,
@@ -65,8 +74,8 @@ pub use proactive::{
     ReachOutIntent,
 };
 pub use runtime::{
-    Admission, CognitiveRuntime, ProcessingOutcome, RuntimeConfig, RuntimeConfigError,
-    RuntimeHandle, RuntimeObservation, SubmitError,
+    Admission, CognitiveRuntime, PlannedProcessingOutcome, ProcessingOutcome, RuntimeConfig,
+    RuntimeConfigError, RuntimeHandle, RuntimeObservation, SubmitError,
 };
 pub use working_state::{
     CompactEvent, ConversationSnapshot, StateUpdate, WorkingState, WorkingStateConfig,
