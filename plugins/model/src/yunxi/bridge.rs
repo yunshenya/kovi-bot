@@ -14,10 +14,10 @@ use kovi::tokio::sync::mpsc;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use yunxi_core::{
-    Admission, CognitiveRuntime, ConversationId, ConversationKind, EventPriority,
+    Admission, CognitiveRuntime, ConversationId, ConversationKind, EventPriority, EventScope,
     ExternalConversation, IdentityStore, MessageContent, MessageId, MessageReceivedEvent,
     OpenLoopDraft, OpenLoopKind, OpenLoopOwner, OpenLoopStore, ProcessingOutcome, RuntimeConfig,
-    RuntimeHandle, WorldEvent,
+    RuntimeHandle, WorldEvent, WorldEventKind,
 };
 
 pub(crate) const SHADOW_INGRESS_CAPACITY: usize = 256;
@@ -38,6 +38,7 @@ pub(crate) enum EnqueueOutcome {
 #[derive(Debug, Clone)]
 pub(crate) struct ShadowBridge {
     ingress: mpsc::Sender<InboundMessage>,
+    runtime: RuntimeHandle,
 }
 
 impl ShadowBridge {
@@ -62,6 +63,7 @@ impl ShadowBridge {
             .expect("default Yunxi runtime configuration must be valid");
 
         let scheduler_runtime = runtime_handle.clone();
+        let bridge_runtime = runtime_handle.clone();
         kovi::tokio::spawn(run_ingress(
             receiver,
             store,
@@ -72,7 +74,10 @@ impl ShadowBridge {
         if let Some(open_loop_store) = open_loop_store {
             super::open_loop_scheduler::start(open_loop_store, scheduler_runtime);
         }
-        Arc::new(Self { ingress })
+        Arc::new(Self {
+            ingress,
+            runtime: bridge_runtime,
+        })
     }
 
     pub(crate) fn enqueue_group(&self, event: &GroupMsgEvent) -> EnqueueOutcome {
@@ -96,6 +101,26 @@ impl ShadowBridge {
             Err(mpsc::error::TrySendError::Closed(_)) => EnqueueOutcome::SkippedInvalid,
         }
     }
+
+    /// Submit a best-effort global idle observation without waiting on the
+    /// ingress or runtime queue. Low-priority runtime admission is bounded and
+    /// may be dropped when the host is busy.
+    pub(crate) fn observe_idle_tick(&self) {
+        let runtime = self.runtime.clone();
+        kovi::tokio::spawn(async move {
+            let event = idle_tick_event(Utc::now());
+            let _ = runtime.submit(event).await;
+        });
+    }
+}
+
+fn idle_tick_event(occurred_at: DateTime<Utc>) -> WorldEvent {
+    WorldEvent::new(
+        occurred_at,
+        EventScope::Global,
+        EventPriority::Low,
+        WorldEventKind::IdleTick,
+    )
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -701,8 +726,8 @@ mod tests {
     use super::{
         ConversationAddress, EnqueueOutcome, InboundMessage, MessageReference,
         MessageReferenceCache, MessageReferenceKey, ShadowBridge, bounded_text,
-        detect_open_loop_candidate, looks_like_stop_request, message_at_self, reply_message_id,
-        resolve_and_submit, text_mentions_agent,
+        detect_open_loop_candidate, idle_tick_event, looks_like_stop_request, message_at_self,
+        reply_message_id, resolve_and_submit, text_mentions_agent,
     };
     use chrono::Utc;
     use kovi::bot::message::{Message, Segment};
@@ -870,7 +895,9 @@ mod tests {
     #[test]
     fn ingress_drops_at_capacity_without_waiting() {
         let (ingress, _receiver) = mpsc::channel(1);
-        let bridge = ShadowBridge { ingress };
+        let (runtime, _consumer) =
+            yunxi_core::CognitiveRuntime::new(RuntimeConfig::default()).expect("valid runtime");
+        let bridge = ShadowBridge { ingress, runtime };
         let message = inbound(ConversationAddress::Group { group_id: 123 }, false);
 
         assert_eq!(
@@ -881,6 +908,15 @@ mod tests {
             bridge.try_enqueue(message),
             EnqueueOutcome::DroppedAtCapacity
         );
+    }
+
+    #[test]
+    fn idle_tick_is_global_low_priority() {
+        let event = idle_tick_event(Utc::now());
+        assert_eq!(event.scope(), yunxi_core::EventScope::Global);
+        assert_eq!(event.priority(), EventPriority::Low);
+        assert!(matches!(event.kind(), yunxi_core::WorldEventKind::IdleTick));
+        assert!(event.validate(8).is_ok());
     }
 
     #[test]

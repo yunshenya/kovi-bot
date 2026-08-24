@@ -10,6 +10,7 @@ pub mod identity;
 pub mod memory;
 pub mod open_loop;
 pub mod ports;
+pub mod proactive;
 pub mod runtime;
 pub mod working_state;
 
@@ -38,6 +39,12 @@ pub use open_loop::{
 pub use ports::{
     Clock, IdentityStore, IdentityStoreError, IdentityStoreFuture, MemoryStore, MemoryStoreError,
     MemoryStoreFuture, OpenLoopStore, OpenLoopStoreError, OpenLoopStoreFuture, SystemClock,
+};
+pub use proactive::{
+    MAX_PROACTIVE_CANDIDATES, MAX_REACH_OUT_MESSAGE_BYTES, MAX_REACH_OUT_MESSAGE_CHARS,
+    ProactiveCandidate, ProactiveContext, ProactiveDecision, ProactiveMotive, ProactiveOpportunity,
+    ProactiveSilenceReason, ProactiveSystem, ProactiveValidationError, ProspectiveSignal,
+    ReachOutIntent,
 };
 pub use runtime::{
     Admission, CognitiveRuntime, ProcessingOutcome, RuntimeConfig, RuntimeConfigError,

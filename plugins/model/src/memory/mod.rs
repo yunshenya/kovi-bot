@@ -725,6 +725,16 @@ impl MemoryManager {
         .execute(pool)
         .await?;
         query(
+            "CREATE INDEX IF NOT EXISTS kovi_bot_user_profiles_updated_idx ON kovi_bot_user_profiles (updated_at DESC)",
+        )
+        .execute(pool)
+        .await?;
+        query(
+            "CREATE INDEX IF NOT EXISTS kovi_bot_group_profiles_updated_idx ON kovi_bot_group_profiles (updated_at DESC)",
+        )
+        .execute(pool)
+        .await?;
+        query(
             r#"
             CREATE TABLE IF NOT EXISTS kovi_bot_conversation_summaries (
                 summary_key TEXT PRIMARY KEY,
@@ -1786,6 +1796,126 @@ impl MemoryManager {
     pub async fn get_all_group_profiles(&self) -> Vec<GroupProfile> {
         let profiles = self.group_profiles.lock().await;
         profiles.values().cloned().collect()
+    }
+
+    /// Fetch a bounded, recently updated private-profile candidate set. The
+    /// database index prevents proactive ticks from cloning every profile.
+    pub(crate) async fn get_proactive_user_candidates(
+        &self,
+        active_after: DateTime<Local>,
+        excluded_user_id: Option<i64>,
+        limit: usize,
+    ) -> Vec<UserProfile> {
+        let limit = limit.min(32);
+        if limit == 0 {
+            return Vec::new();
+        }
+        if let Some(pool) = self.database_pool.get() {
+            let rows = query(
+                r#"
+                SELECT payload
+                FROM kovi_bot_user_profiles
+                WHERE updated_at > $1
+                  AND ($2::BIGINT IS NULL OR user_id <> $2)
+                  AND COALESCE((payload->>'relationship_level')::SMALLINT, 0) > 2
+                  AND NULLIF(payload->>'last_private_interaction', '')::TIMESTAMPTZ > $1
+                ORDER BY updated_at DESC, user_id
+                LIMIT $3
+                "#,
+            )
+            .bind(active_after)
+            .bind(excluded_user_id)
+            .bind(limit as i64)
+            .fetch_all(pool)
+            .await;
+            match rows {
+                Ok(rows) => {
+                    let parsed = rows
+                        .into_iter()
+                        .map(|row| serde_json::from_value(row.get("payload")))
+                        .collect::<std::result::Result<Vec<_>, _>>();
+                    if let Ok(profiles) = parsed {
+                        return profiles;
+                    }
+                }
+                Err(error) => {
+                    eprintln!("[WARN] 查询主动私聊候选失败，回退内存缓存: {error}");
+                }
+            }
+        }
+
+        let mut profiles = self
+            .user_profiles
+            .lock()
+            .await
+            .values()
+            .filter(|profile| Some(profile.user_id) != excluded_user_id)
+            .filter(|profile| profile.relationship_level > 2)
+            .filter(|profile| {
+                profile
+                    .last_private_interaction
+                    .is_some_and(|last| last > active_after)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        profiles.sort_by_key(|profile| Reverse(profile.last_private_interaction));
+        profiles.truncate(limit);
+        profiles
+    }
+
+    /// Fetch a bounded, recently updated group-profile candidate set.
+    pub(crate) async fn get_proactive_group_candidates(
+        &self,
+        active_after: DateTime<Local>,
+        limit: usize,
+    ) -> Vec<GroupProfile> {
+        let limit = limit.min(32);
+        if limit == 0 {
+            return Vec::new();
+        }
+        if let Some(pool) = self.database_pool.get() {
+            let rows = query(
+                r#"
+                SELECT payload
+                FROM kovi_bot_group_profiles
+                WHERE updated_at > $1
+                  AND COALESCE((payload->>'activity_level')::SMALLINT, 0) > 3
+                  AND NULLIF(payload->>'last_activity', '')::TIMESTAMPTZ > $1
+                ORDER BY updated_at DESC, group_id
+                LIMIT $2
+                "#,
+            )
+            .bind(active_after)
+            .bind(limit as i64)
+            .fetch_all(pool)
+            .await;
+            match rows {
+                Ok(rows) => {
+                    let parsed = rows
+                        .into_iter()
+                        .map(|row| serde_json::from_value(row.get("payload")))
+                        .collect::<std::result::Result<Vec<_>, _>>();
+                    if let Ok(profiles) = parsed {
+                        return profiles;
+                    }
+                }
+                Err(error) => {
+                    eprintln!("[WARN] 查询主动群聊候选失败，回退内存缓存: {error}");
+                }
+            }
+        }
+
+        let mut profiles = self
+            .group_profiles
+            .lock()
+            .await
+            .values()
+            .filter(|profile| profile.activity_level > 3 && profile.last_activity > active_after)
+            .cloned()
+            .collect::<Vec<_>>();
+        profiles.sort_by_key(|profile| Reverse(profile.last_activity));
+        profiles.truncate(limit);
+        profiles
     }
 
     /// 删除一个私聊用户在记忆仓储中的全部可归属数据。

@@ -32,6 +32,23 @@ impl PostgresIdentityStore {
         .map_err(IdentityStoreError::storage)
     }
 
+    /// Resolve a delivery target without guessing when a person has changed
+    /// accounts. `LIMIT 2` distinguishes zero, exactly one, and ambiguous
+    /// mappings while keeping the query bounded.
+    pub(crate) async fn qq_external_identity_for_delivery(
+        &self,
+        person_id: PersonId,
+    ) -> Result<Option<String>, IdentityStoreError> {
+        let ids = query_scalar::<Postgres, String>(
+            "SELECT external_id FROM yunxi_external_identities WHERE platform = 'qq' AND person_id = $1 ORDER BY external_id LIMIT 2",
+        )
+        .bind(person_id.into_uuid())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(IdentityStoreError::storage)?;
+        Ok((ids.len() == 1).then(|| ids.into_iter().next()).flatten())
+    }
+
     pub(crate) async fn qq_external_conversations_for_id(
         &self,
         conversation_id: ConversationId,

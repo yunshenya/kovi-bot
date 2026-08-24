@@ -232,9 +232,12 @@ async fn main() {
             }
         }
     });
-    if proactive_chat::startup::get_or_create_proactive_manager(Arc::clone(&proactive_bot))
-        .await
-        .is_some()
+    if proactive_chat::startup::get_or_create_proactive_manager_with_bridge(
+        Arc::clone(&proactive_bot),
+        Some(Arc::clone(&yunxi_bridge)),
+    )
+    .await
+    .is_some()
     {
         println!("[INFO] 主动消息管理器已启动");
     }

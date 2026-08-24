@@ -1,8 +1,10 @@
 pub(crate) mod bridge;
+pub(crate) mod delivery;
 mod identity_store;
 mod memory_store;
 mod open_loop_scheduler;
 mod open_loop_store;
+pub(crate) mod proactive;
 pub(crate) mod qq;
 
 use anyhow::{Context, Result};
