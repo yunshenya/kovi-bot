@@ -69,6 +69,7 @@ pub(crate) struct MessageUnderstanding {
     pub(crate) wants_no_reply: bool,
     pub(crate) wants_stop: bool,
     pub(crate) cross_group_message_request: bool,
+    pub(crate) cross_group_followup_request: bool,
     pub(crate) image_intent: SemanticImageIntent,
     pub(crate) image_reference: ImageReferenceIntent,
     pub(crate) conversation_relevant: bool,
@@ -89,6 +90,7 @@ impl Default for MessageUnderstanding {
             wants_no_reply: false,
             wants_stop: false,
             cross_group_message_request: false,
+            cross_group_followup_request: false,
             image_intent: SemanticImageIntent::Social,
             image_reference: ImageReferenceIntent::None,
             conversation_relevant: false,
@@ -165,6 +167,7 @@ struct RawUnderstanding {
     wants_no_reply: bool,
     wants_stop: bool,
     cross_group_message_request: bool,
+    cross_group_followup_request: bool,
     image_intent: String,
     image_reference: String,
     conversation_relevant: bool,
@@ -193,6 +196,7 @@ pub(crate) async fn understand(request: UnderstandingRequest) -> MessageUndersta
   "wants_no_reply": false,
   "wants_stop": false,
   "cross_group_message_request": false,
+  "cross_group_followup_request": false,
   "image_intent": "social|conversational|understand",
   "image_reference": "none|recent|described",
   "conversation_relevant": false,
@@ -208,6 +212,7 @@ pub(crate) async fn understand(request: UnderstandingRequest) -> MessageUndersta
 - wants_no_reply：用户明确希望这条不产生可见回复；普通陈述、犹豫或礼貌结束不算。
 - wants_stop：用户希望停止当前正在生成或发送的回复。
 - cross_group_message_request：用户是否明确要求芸汐现在去另一个群发言、通知或转述。只有立即执行的明确请求才为 true；询问能否做到、讨论实现方式、假设、引用他人的话、取消请求和未来定时发送都为 false。
+- cross_group_followup_request：用户是否明确要求芸汐去另一个群提问、调查或征集意见。‘去群里问一下谁今晚有空’这类提问本身就默认需要等一小段时间收集并回报，不必额外出现‘告诉我结果’；只要求发一条通知、转述或立即发言时为 false。若为 true，cross_group_message_request 也必须为 true。
 - image_intent：图片只是社交表达、结合文字自然回应，还是需要真正查看图片内容。
 - image_reference：当前文字是否在回指之前发过的图片。recent 表示“那张图/刚才的截图”等泛指，described 表示“有猫的那张/带红色按钮的截图”等按内容寻找；没有回指时填 none。
   当前消息已直接附图或明确引用图片时，优先理解当前图片；只有没有当前图片时，才按历史图片指代寻找。
@@ -268,7 +273,9 @@ fn parse_understanding(content: &str, request: &UnderstandingRequest) -> Message
         mood_confidence: raw.mood_confidence.clamp(0, 100) as u8,
         wants_no_reply: raw.wants_no_reply,
         wants_stop: raw.wants_stop,
-        cross_group_message_request: raw.cross_group_message_request,
+        cross_group_message_request: raw.cross_group_message_request
+            || raw.cross_group_followup_request,
+        cross_group_followup_request: raw.cross_group_followup_request,
         image_intent: normalize_image_intent(&raw.image_intent),
         image_reference: normalize_image_reference(&raw.image_reference),
         conversation_relevant: raw.conversation_relevant,
@@ -376,6 +383,17 @@ mod tests {
 
         let malformed = parse_understanding("不是 JSON", &request);
         assert!(!malformed.cross_group_message_request);
+    }
+
+    #[test]
+    fn followup_intent_also_requires_the_initial_cross_group_action() {
+        let request = UnderstandingRequest::text("去开发群问问今晚谁有空", "private_chat");
+        let result = parse_understanding(
+            r#"{"cross_group_followup_request":true,"cross_group_message_request":false}"#,
+            &request,
+        );
+        assert!(result.cross_group_followup_request);
+        assert!(result.cross_group_message_request);
     }
 
     #[test]

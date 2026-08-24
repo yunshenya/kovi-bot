@@ -102,6 +102,9 @@ pub(crate) async fn params_model_with_tool_access(
                 "[WARN] 跨群发送请求未执行：模型工具注册表不可用 (范围: {}:{})",
                 tool_context.context, tool_context.subject_id
             );
+            if tool_context.requires_group_followup {
+                return required_group_followup_failure(false, false);
+            }
             return required_group_message_failure(false, false);
         }
         return interruptible_model_call(
@@ -130,7 +133,11 @@ pub(crate) async fn params_model_with_tool_access(
     if tool_context.requires_group_message_send {
         request.push(BotMemory {
             role: Roles::System,
-            content: "语义理解层确认用户明确要求立即跨群发送。本轮不能只口头答应；必须调用 group.message.send。群名目标先调用 group.message.targets。只有 group.message.send 成功后才能确认已发送；不能执行或目标不唯一时不得声称已发送，结果不确定时说明无法确认且不要重试。".to_string(),
+            content: if tool_context.requires_group_followup {
+                "语义理解层确认用户明确要求跨群问答闭环。本轮不能只口头答应；必须调用 group.message.send，并填写 collect_replies_minutes（省略时由程序使用默认等待时长）。只有工具返回 task_status=collecting 或 already_completed 后才能说问题已发出并会汇总；不能执行或目标不唯一时不得声称已发送，结果不确定时说明无法确认且不要重试。".to_string()
+            } else {
+                "语义理解层确认用户明确要求立即跨群发送。本轮不能只口头答应；必须调用 group.message.send。群名目标先调用 group.message.targets。只有 group.message.send 成功后才能确认已发送；不能执行或目标不唯一时不得声称已发送，结果不确定时说明无法确认且不要重试。".to_string()
+            },
         });
     }
     let model_config = config::get();
@@ -144,6 +151,7 @@ pub(crate) async fn params_model_with_tool_access(
     let mut group_target_lookup_succeeded = false;
     let mut group_message_send_attempted = false;
     let mut group_message_send_succeeded = false;
+    let mut group_followup_succeeded = false;
 
     for round in 0..max_tool_rounds {
         let Some(response) = interruptible_model_call(
@@ -176,7 +184,11 @@ pub(crate) async fn params_model_with_tool_access(
                     };
                 }
                 if group_message_send_succeeded && is_model_error_response(&response.content) {
-                    return completed_group_message_response();
+                    return if group_followup_succeeded {
+                        completed_group_followup_response()
+                    } else {
+                        completed_group_message_response()
+                    };
                 }
                 if tool_context.requires_external_tool && !external_tool_succeeded {
                     if is_model_error_response(&response.content) || round + 1 >= max_tool_rounds {
@@ -247,6 +259,18 @@ pub(crate) async fn params_model_with_tool_access(
                         round + 1
                     );
                     return required_group_message_failure(
+                        group_target_lookup_succeeded,
+                        group_message_send_attempted,
+                    );
+                }
+                if tool_context.requires_group_followup && !group_followup_succeeded {
+                    eprintln!(
+                        "[WARN] 跨群问答任务未创建，拒绝把普通发送结果当成闭环完成 (范围: {}:{}, 轮次: {})",
+                        tool_context.context,
+                        tool_context.subject_id,
+                        round + 1
+                    );
+                    return required_group_followup_failure(
                         group_target_lookup_succeeded,
                         group_message_send_attempted,
                     );
@@ -359,7 +383,11 @@ pub(crate) async fn params_model_with_tool_access(
                 }
                 if tool_name == "group.message.send" {
                     group_message_send_attempted = true;
-                    group_message_send_succeeded = result.succeeded;
+                    merge_group_send_result(
+                        &result,
+                        &mut group_message_send_succeeded,
+                        &mut group_followup_succeeded,
+                    );
                 }
                 println!(
                     "[INFO] 模型工具调用完成 (工具: {}, 范围: {}:{}, 轮次: {})",
@@ -401,7 +429,21 @@ pub(crate) async fn params_model_with_tool_access(
             "[WARN] 跨群发送工具轮次耗尽且动作未完成 (范围: {}:{})",
             tool_context.context, tool_context.subject_id
         );
-        return required_group_message_failure(
+        return if tool_context.requires_group_followup {
+            required_group_followup_failure(
+                group_target_lookup_succeeded,
+                group_message_send_attempted,
+            )
+        } else {
+            required_group_message_failure(
+                group_target_lookup_succeeded,
+                group_message_send_attempted,
+            )
+        };
+    }
+
+    if tool_context.requires_group_followup && !group_followup_succeeded {
+        return required_group_followup_failure(
             group_target_lookup_succeeded,
             group_message_send_attempted,
         );
@@ -428,12 +470,20 @@ pub(crate) async fn params_model_with_tool_access(
         ParsedToolCall::None
     ) {
         if group_message_send_succeeded && is_model_error_response(&response.content) {
-            completed_group_message_response()
+            if group_followup_succeeded {
+                completed_group_followup_response()
+            } else {
+                completed_group_message_response()
+            }
         } else {
             response
         }
     } else if group_message_send_succeeded {
-        completed_group_message_response()
+        if group_followup_succeeded {
+            completed_group_followup_response()
+        } else {
+            completed_group_message_response()
+        }
     } else {
         BotMemory {
             role: Roles::Assistant,
@@ -473,10 +523,58 @@ fn required_group_message_failure(targets_queried: bool, send_attempted: bool) -
     }
 }
 
+fn required_group_followup_failure(targets_queried: bool, send_attempted: bool) -> BotMemory {
+    let content = if send_attempted {
+        "我没能确认这次群内收集任务是否建立，为避免重复提问没有自动重试。请先到目标群确认；需要重新询问时请重新给我一条指令。"
+    } else if targets_queried {
+        "我查过可用群，但还不能唯一确认目标，问题没有发送。请给我更准确的群名或群号。"
+    } else {
+        "我没有成功建立这次群内收集任务，问题还没发出去。请重新说一次，并明确目标群和等待时长。"
+    };
+    BotMemory {
+        role: Roles::Assistant,
+        content: content.to_string(),
+    }
+}
+
 fn completed_group_message_response() -> BotMemory {
     BotMemory {
         role: Roles::Assistant,
         content: "已经发出去了。".to_string(),
+    }
+}
+
+fn completed_group_followup_response() -> BotMemory {
+    BotMemory {
+        role: Roles::Assistant,
+        content: "已经去群里问了，我等一会儿把大家的回复整理好再告诉你。".to_string(),
+    }
+}
+
+fn tool_result_has_task_status(result: &str, expected: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(result)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("task_status")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .is_some_and(|status| status == expected)
+}
+
+fn merge_group_send_result(
+    result: &ToolExecutionResult,
+    group_message_send_succeeded: &mut bool,
+    group_followup_succeeded: &mut bool,
+) {
+    // 一旦外部动作成功，后续重复调用失败不能覆盖已发生的副作用。
+    // 这也避免模型在第二次调用出错时向用户错误地报告“没有发送”。
+    if result.succeeded {
+        *group_message_send_succeeded = true;
+        if tool_result_has_task_status(&result.content, "collecting") {
+            *group_followup_succeeded = true;
+        }
     }
 }
 
@@ -789,13 +887,14 @@ fn format_tool_result(name: &str, result: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ParsedToolCall, ReminderCreateFailure, completed_group_message_response,
-        interrupted_response, parse_tool_call_with_wrapping, reminder_failure_response,
-        required_group_message_failure, tool_round_limit,
+        ParsedToolCall, ReminderCreateFailure, completed_group_followup_response,
+        completed_group_message_response, interrupted_response, merge_group_send_result,
+        parse_tool_call_with_wrapping, reminder_failure_response, required_group_followup_failure,
+        required_group_message_failure, tool_result_has_task_status, tool_round_limit,
     };
     use crate::model::MessageDestination;
     use crate::model::reply::parse_reply_output;
-    use crate::model::tool_access::ToolExecutionContext;
+    use crate::model::tool_access::{ToolExecutionContext, ToolExecutionResult};
 
     #[test]
     fn parses_only_the_restricted_tool_protocol() {
@@ -829,6 +928,7 @@ mod tests {
             sticker_teaching: None,
             requires_reminder_create: false,
             requires_group_message_send: false,
+            requires_group_followup: false,
             requires_external_tool: false,
         };
         assert_eq!(tool_round_limit(1, &context), 2);
@@ -858,6 +958,57 @@ mod tests {
             assert!(!response.content.contains("发出去了"));
         }
         assert_eq!(completed_group_message_response().content, "已经发出去了。");
+    }
+
+    #[test]
+    fn followup_action_failures_never_claim_that_collection_started() {
+        for response in [
+            required_group_followup_failure(false, false),
+            required_group_followup_failure(true, false),
+            required_group_followup_failure(true, true),
+        ] {
+            assert!(!response.content.contains("等一会儿"));
+            assert!(!response.content.contains("整理好"));
+        }
+        assert!(
+            completed_group_followup_response()
+                .content
+                .contains("等一会儿")
+        );
+        assert!(tool_result_has_task_status(
+            r#"{"status":"completed","task_status":"collecting"}"#,
+            "collecting"
+        ));
+        assert!(!tool_result_has_task_status(
+            r#"{"status":"completed"}"#,
+            "collecting"
+        ));
+    }
+
+    #[test]
+    fn later_failed_send_cannot_erase_an_already_successful_send() {
+        let mut send_succeeded = false;
+        let mut followup_succeeded = false;
+        merge_group_send_result(
+            &ToolExecutionResult {
+                succeeded: true,
+                content: r#"{"status":"completed","task_status":"collecting"}"#.to_string(),
+                reminder_failure_kind: None,
+            },
+            &mut send_succeeded,
+            &mut followup_succeeded,
+        );
+        merge_group_send_result(
+            &ToolExecutionResult {
+                succeeded: false,
+                content: "发送状态不确定".to_string(),
+                reminder_failure_kind: None,
+            },
+            &mut send_succeeded,
+            &mut followup_succeeded,
+        );
+        assert!(send_succeeded);
+        assert!(followup_succeeded);
     }
 
     #[test]

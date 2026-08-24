@@ -22,7 +22,11 @@ const MAX_GROUP_ACTIONS_PER_MINUTE: i64 = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AgentAction {
-    SendGroupMessage { group_id: i64, content: String },
+    SendGroupMessage {
+        group_id: i64,
+        content: String,
+        collect_replies_minutes: Option<u64>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,6 +112,7 @@ pub(crate) async fn compact_expired() -> Result<u64> {
 }
 
 pub(crate) async fn delete_user_data(user_id: i64) -> Result<u64> {
+    let removed_tasks = crate::agent_tasks::delete_user_data(user_id).await?;
     let removed = query(
         "DELETE FROM kovi_bot_agent_goals WHERE actor_user_id = $1 OR (source_scope = 'private' AND source_id = $1)",
     )
@@ -116,10 +121,11 @@ pub(crate) async fn delete_user_data(user_id: i64) -> Result<u64> {
     .await
     .context("删除用户角色目标")?
     .rows_affected();
-    Ok(removed)
+    Ok(removed + removed_tasks)
 }
 
 pub(crate) async fn delete_group_data(group_id: i64) -> Result<u64> {
+    let removed_tasks = crate::agent_tasks::delete_group_data(group_id).await?;
     let removed =
         query("DELETE FROM kovi_bot_agent_goals WHERE target_scope = 'group' AND target_id = $1")
             .bind(group_id)
@@ -127,7 +133,7 @@ pub(crate) async fn delete_group_data(group_id: i64) -> Result<u64> {
             .await
             .context("删除群聊角色目标")?
             .rows_affected();
-    Ok(removed)
+    Ok(removed + removed_tasks)
 }
 
 pub(crate) async fn execute_action(
@@ -143,8 +149,20 @@ pub(crate) async fn execute_action(
     );
 
     match action {
-        AgentAction::SendGroupMessage { group_id, content } => {
-            execute_send_group_message(bot, context, group_id, &content, reply_ticket).await
+        AgentAction::SendGroupMessage {
+            group_id,
+            content,
+            collect_replies_minutes,
+        } => {
+            execute_send_group_message(
+                bot,
+                context,
+                group_id,
+                &content,
+                collect_replies_minutes,
+                reply_ticket,
+            )
+            .await
         }
     }
 }
@@ -203,6 +221,7 @@ async fn execute_send_group_message(
     context: AgentActionContext,
     group_id: i64,
     content: &str,
+    collect_replies_minutes: Option<u64>,
     reply_ticket: ReplyTicket,
 ) -> Result<String> {
     ensure!(group_id > 0, "目标群号必须是正整数");
@@ -211,7 +230,11 @@ async fn execute_send_group_message(
         "目标群不在机器人的授权群白名单中"
     );
     let content = normalize_group_message(content)?;
-    let payload = json!({"group_id": group_id, "content": content});
+    let payload = json!({
+        "group_id": group_id,
+        "content": content,
+        "collect_replies_minutes": collect_replies_minutes,
+    });
     let request_key = action_request_key(context, "send_group_message")?;
     let pool = database_pool()?;
     let reservation = reserve_goal(
@@ -228,21 +251,68 @@ async fn execute_send_group_message(
         GoalReservation::Existing(goal) => return existing_goal_result(goal, &payload),
     };
 
-    mark_goal_executing(pool, goal_id).await?;
+    let task_id = if let Some(collect_minutes) = collect_replies_minutes {
+        let MessageDestination::Private(source_id) = context.source else {
+            mark_goal_failed(pool, goal_id, "闭环任务来源不是私聊").await;
+            return Err(anyhow!("跨群问答任务只能从私聊发起"));
+        };
+        match crate::agent_tasks::reserve_task(crate::agent_tasks::TaskReservationRequest {
+            goal_id,
+            request_key: &request_key,
+            actor_user_id: context.actor_user_id,
+            source_id,
+            source_message_id: context.source_message_id,
+            target_group_id: group_id,
+            question: &content,
+            collect_minutes,
+        })
+        .await
+        {
+            Ok(task_id) => Some(task_id),
+            Err(error) => {
+                mark_goal_failed(pool, goal_id, &format!("创建跨群问答任务失败：{error}")).await;
+                return Err(error);
+            }
+        }
+    } else {
+        None
+    };
+
+    if let Err(error) = mark_goal_executing(pool, goal_id).await {
+        if let Some(task_id) = task_id {
+            crate::agent_tasks::fail_pending_task(task_id, &format!("领取角色目标失败：{error}"))
+                .await;
+        }
+        return Err(error);
+    }
     if !is_current(reply_ticket).await {
         mark_goal_failed(pool, goal_id, "发送前被更新的私聊消息打断").await;
+        if let Some(task_id) = task_id {
+            crate::agent_tasks::fail_pending_task(task_id, "发送前被更新的私聊消息打断").await;
+        }
         return Err(anyhow!("这条指令已经被更新的私聊消息打断"));
     }
     if let Err(error) = ensure_group_joined(bot, group_id).await {
         mark_goal_failed(pool, goal_id, &format!("发送前目标校验失败：{error}")).await;
+        if let Some(task_id) = task_id {
+            crate::agent_tasks::fail_pending_task(task_id, &format!("发送前目标校验失败：{error}"))
+                .await;
+        }
         return Err(error);
     }
     if !is_current(reply_ticket).await {
         mark_goal_failed(pool, goal_id, "群状态校验后被更新的私聊消息打断").await;
+        if let Some(task_id) = task_id {
+            crate::agent_tasks::fail_pending_task(task_id, "群状态校验后被更新的私聊消息打断")
+                .await;
+        }
         return Err(anyhow!("这条指令已经被更新的私聊消息打断"));
     }
     if !group_access::is_authorized_group(group_id).await? {
         mark_goal_failed(pool, goal_id, "发送前目标群授权已失效").await;
+        if let Some(task_id) = task_id {
+            crate::agent_tasks::fail_pending_task(task_id, "发送前目标群授权已失效").await;
+        }
         return Err(anyhow!("目标群的授权已失效，消息未发送"));
     }
 
@@ -261,10 +331,40 @@ async fn execute_send_group_message(
                 group_id, goal_id, error
             );
             mark_goal_failed(pool, goal_id, &detail).await;
+            if let Some(task_id) = task_id {
+                crate::agent_tasks::fail_pending_task(task_id, &detail).await;
+            }
             return Err(anyhow!(
                 "没有成功发到群 {group_id}，请确认机器人仍在群里并具有发言权限"
             ));
         }
+    };
+
+    let collect_until = if let (Some(task_id), Some(collect_minutes)) =
+        (task_id, collect_replies_minutes)
+    {
+        match crate::agent_tasks::activate_after_send(task_id, message_id, collect_minutes).await {
+            Ok(collect_until) => Some((task_id, collect_until)),
+            Err(error) => {
+                // 群问题已经送达；任务状态不确定时绝不能自动重发问题。
+                crate::agent_tasks::fail_pending_task(
+                    task_id,
+                    &format!("问题已发送，但收集任务状态保存失败：{error}"),
+                )
+                .await;
+                mark_goal_failed(
+                    pool,
+                    goal_id,
+                    &format!("问题已发送，但收集任务未建立：{error}"),
+                )
+                .await;
+                return Err(anyhow!(
+                    "问题已经发到群 {group_id}，但我没能确认后续收集任务已建立；为避免重复提问没有自动重试"
+                ));
+            }
+        }
+    } else {
+        None
     };
 
     record_standalone_bot_message(ReplyScope::Group(group_id), message_id, &content).await;
@@ -283,12 +383,23 @@ async fn execute_send_group_message(
         );
     }
 
-    let result = json!({
-        "status": "completed",
-        "goal_id": goal_id,
-        "group_id": group_id,
-        "message_id": message_id,
-    });
+    let result = match collect_until {
+        Some((task_id, collect_until)) => json!({
+            "status": "completed",
+            "task_status": "collecting",
+            "goal_id": goal_id,
+            "task_id": task_id,
+            "group_id": group_id,
+            "message_id": message_id,
+            "collect_until": collect_until.to_rfc3339(),
+        }),
+        None => json!({
+            "status": "completed",
+            "goal_id": goal_id,
+            "group_id": group_id,
+            "message_id": message_id,
+        }),
+    };
     if let Err(error) = mark_goal_completed(pool, goal_id, &result).await {
         // 外部发送已经成功，不能因为审计状态更新失败而向用户谎报失败并诱导重发。
         eprintln!(

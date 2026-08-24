@@ -123,6 +123,18 @@ web_fetch_enabled = true
 web_search_max_results = 5
 web_fetch_max_chars = 12000
 
+[agent_tasks]
+enabled = true
+poll_interval_secs = 5
+max_collect_minutes = 120
+default_collect_minutes = 10
+max_active_per_actor = 20
+max_active_total = 200
+max_events_per_task = 200
+max_event_chars = 500
+max_report_chars = 3000
+lease_secs = 180
+
 [vision]
 provider = "auto"              # auto、builtin 或 mcp
 mcp_server = ""                # 对应 tools.mcp_servers.name
@@ -305,7 +317,7 @@ export VISION_REQUIRES_AUTH="true"
 - `help.commands`：管理员明确询问可用指令时，返回当前帮助内容。
 - `system.info`：管理员查询运行时间、适配器、数据库、Redis、模型和配置状态。
 - `group.pause` / `group.resume`：管理员在群聊中让芸汐暂停或恢复当前群的自动回复。
-- `group.message.targets` / `group.message.send`：主管理员私聊专用，解析已授权群并执行持久化、可审计的跨群发言。
+- `group.message.targets` / `group.message.send`：主管理员私聊专用，解析已授权群并执行持久化、可审计的跨群发言；在“去群里问一下，等回复后告诉我”这类请求中，`group.message.send` 还会创建持久化收集任务。
 - `health.check`：管理员专用，检查模型鉴权、数据库、Redis、工具注册表和 readiness 状态。
 - `mcp.<服务名>.<工具名>`：来自配置白名单的 MCP 工具。
 
@@ -318,6 +330,10 @@ export VISION_REQUIRES_AUTH="true"
 主管理员可以在私聊中自然地让芸汐去已授权群发一条纯文本消息，例如“去 123456 群说今晚八点开会”。目标使用群名或简称时，她会先读取机器人当前仍然加入的授权群；只有唯一匹配才会继续，歧义时会询问。普通管理员、群聊上下文和定时任务均不能获得跨群发送工具。
 
 每条来源私聊消息最多绑定一个跨群动作，主管理员每分钟最多发起 5 次。动作会先写入 PostgreSQL 的 `kovi_bot_agent_goals`，发送前再次检查会话 ticket 和群白名单，成功后保存 OneBot 消息 ID 并写入目标群上下文。模型只有收到真实的 `completed` 结果后才能确认已发送；进程中断的未知动作不会自动重放，避免重复发言。
+
+### 跨群问答闭环
+
+主管理员可以直接说“去开发群问一下今晚谁有空，等十分钟后把结果告诉我”。芸汐会先在唯一匹配的授权群里发出问题，随后在限定时间内收集成员文字回复，到期后把汇总发回主管理员私聊。默认每个目标群同时只允许一个收集任务；等待分钟数、回复数量、单条回复长度和汇报长度都受 `[agent_tasks]` 上限约束。群问题已经发出但后续状态不确定时不会自动重发，私聊汇报开始发送后也不会自动重复发送。
 
 部署时可在 GitHub Actions Secrets 中增加 `BRAVE_SEARCH_API_KEY`。不配置也能搜索，但公共搜索服务可能有频率限制。
 
@@ -375,6 +391,8 @@ ripsecrets --strict-ignore .
 
 DATABASE_URL="postgresql://…" cargo test -p model --lib \
   memory::tests::normalized_postgres_storage_round_trips -- --ignored --exact
+DATABASE_URL="postgresql://…" cargo test -p model --lib \
+  agent_tasks::tests::postgres_task_reservation_is_atomic_and_event_recording_is_idempotent -- --ignored --exact
 REDIS_URL="redis://127.0.0.1:6379/15" cargo test -p model --lib \
   redis_store::tests::redis_runtime_store_round_trips -- --ignored --exact
 ```

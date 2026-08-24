@@ -106,6 +106,8 @@ pub(crate) struct ToolExecutionContext {
     pub(crate) requires_reminder_create: bool,
     /// 语义层确认了立即跨群发送请求时，普通确认文本不能冒充真实发送结果。
     pub(crate) requires_group_message_send: bool,
+    /// 语义层确认了跨群问答闭环请求时，必须创建收集任务，不能只发一条普通消息。
+    pub(crate) requires_group_followup: bool,
     /// 定时任务指令依赖外部资料时，必须至少成功执行一个只读外部工具，
     /// 否则调度器会把本次执行视为失败并安排重试，而不是发送未经核实的兜底文本。
     pub(crate) requires_external_tool: bool,
@@ -136,6 +138,7 @@ pub(crate) async fn initialize() -> Result<()> {
         println!("[INFO] 模型工具调用已关闭");
         return Ok(());
     }
+    let max_collect_minutes = config::get().agent_tasks().max_collect_minutes();
 
     let mut definitions = vec![ToolDefinition {
         name: "time.now".to_string(),
@@ -336,7 +339,7 @@ pub(crate) async fn initialize() -> Result<()> {
     });
     definitions.push(ToolDefinition {
         name: "group.message.send".to_string(),
-        description: "主管理员专用、仅限私聊：把一条纯文本消息发送到指定的已授权群聊。只有主管理员明确要求你现在去另一个群发言、通知、提醒或转述时才调用。group_id 必须是主管理员明确给出的群号，或 group.message.targets 返回的唯一匹配；content 是最终直接发到群里的自然正文，不要包含执行说明。没有唯一目标或没有明确要表达的内容时先询问，不能猜测。"
+        description: "主管理员专用、仅限私聊：把一条纯文本消息发送到指定的已授权群聊。只有主管理员明确要求你现在去另一个群发言、通知、提醒、提问或转述时才调用。group_id 必须是主管理员明确给出的群号，或 group.message.targets 返回的唯一匹配；content 是最终直接发到群里的自然正文，不要包含执行说明。若用户要求去群里提问、调查或征集意见，提问默认需要收集一小段时间的回复并汇总，必须填写 collect_replies_minutes；这会创建持久化收集任务，任务到期后自动把汇总私聊给主管理员。没有唯一目标或没有明确要表达的内容时先询问，不能猜测。"
             .to_string(),
         input_schema: json!({
             "type": "object",
@@ -352,6 +355,12 @@ pub(crate) async fn initialize() -> Result<()> {
                     "minLength": 1,
                     "maxLength": 1000,
                     "description": "将直接发送到目标群的最终纯文本正文。"
+                },
+                "collect_replies_minutes": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": max_collect_minutes,
+                    "description": "可选。只有用户明确要求收集群成员回复并汇总时填写等待分钟数；省略时使用系统默认等待时长。普通通知和转述不要填写。"
                 }
             },
             "additionalProperties": false
@@ -680,7 +689,7 @@ impl ToolRegistry {
             && !tool_context.scheduled
         {
             instruction.push_str(
-                "\n\n跨会话动作规则：主管理员明确要求你现在去另一个群发消息时，必须执行 group.message.send，不能只口头答应。目标是明确群号时可直接调用；目标是群名、简称或描述时先调用 group.message.targets，只能采用唯一匹配，无法唯一确定就自然询问。content 必须是准备给目标群看到的最终正文。只有工具返回 completed 或 already_completed 后才能说已经发出；工具失败时如实说明没有成功，不要自行重试或伪造结果。",
+                "\n\n跨会话动作规则：主管理员明确要求你现在去另一个群发消息时，必须执行 group.message.send，不能只口头答应。目标是明确群号时可直接调用；目标是群名、简称或描述时先调用 group.message.targets，只能采用唯一匹配，无法唯一确定就自然询问。content 必须是准备给目标群看到的最终正文。若用户要求‘去群里问/征集意见/等待回复/之后告诉我结果’，这是闭环任务，必须在 group.message.send 中填写 collect_replies_minutes（不确定时使用默认时长），不能只发送普通消息。只有工具返回 completed 或 already_completed 后才能说已经发出；工具失败时如实说明没有成功，不要自行重试或伪造结果。",
             );
         }
         instruction
@@ -1104,9 +1113,33 @@ async fn execute_builtin(
             .await
         }
         BuiltinTool::GroupMessageSend => {
-            reject_unknown_arguments(&arguments, &["group_id", "content"])?;
+            reject_unknown_arguments(
+                &arguments,
+                &["group_id", "content", "collect_replies_minutes"],
+            )?;
             let group_id = required_positive_i64(&arguments, "group_id")?;
             let content = required_string(&arguments, "content", 1_000)?;
+            let requested_collect_minutes = arguments
+                .get("collect_replies_minutes")
+                .map(|value| {
+                    value
+                        .as_u64()
+                        .ok_or_else(|| anyhow!("参数 collect_replies_minutes 必须是正整数"))
+                })
+                .transpose()?;
+            let collect_replies_minutes = requested_collect_minutes.or_else(|| {
+                tool_context
+                    .requires_group_followup
+                    .then(|| config::get().agent_tasks().default_collect_minutes())
+            });
+            if let Some(minutes) = collect_replies_minutes
+                && (minutes == 0 || minutes > config::get().agent_tasks().max_collect_minutes())
+            {
+                return Err(anyhow!(
+                    "collect_replies_minutes 必须在 1 到 {} 分钟之间",
+                    config::get().agent_tasks().max_collect_minutes()
+                ));
+            }
             let source_message_id = tool_context
                 .source_message_id
                 .ok_or_else(|| anyhow!("跨群动作缺少来源消息编号"))?;
@@ -1121,7 +1154,11 @@ async fn execute_builtin(
                     source: tool_context.destination,
                     source_message_id,
                 },
-                crate::agent_runtime::AgentAction::SendGroupMessage { group_id, content },
+                crate::agent_runtime::AgentAction::SendGroupMessage {
+                    group_id,
+                    content,
+                    collect_replies_minutes,
+                },
                 reply_ticket,
             )
             .await

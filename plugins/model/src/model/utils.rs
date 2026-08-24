@@ -446,6 +446,7 @@ pub async fn control_model(
             }),
             requires_reminder_create: crate::reminders::looks_like_reminder_request(message),
             requires_group_message_send: false,
+            requires_group_followup: false,
             requires_external_tool: false,
         },
         reply_ticket,
@@ -1690,6 +1691,26 @@ async fn private_history(user_id: i64) -> ConversationHistory {
         .clone()
 }
 
+/// 为脱离普通回复流程的私聊通知补一条短期上下文，保持后续追问连续。
+pub(crate) async fn record_standalone_private_message(user_id: i64, content: &str) {
+    if content.trim().is_empty() {
+        return;
+    }
+    let private = private_history(user_id).await;
+    let mut history = private.lock().await;
+    if history.is_empty() {
+        history.push(BotMemory {
+            role: Roles::System,
+            content: String::new(),
+        });
+    }
+    history.push(BotMemory {
+        role: Roles::Assistant,
+        content: content.to_string(),
+    });
+    limit_memory_size(&mut history);
+}
+
 async fn touch_runtime_history(
     access_map: &Mutex<HashMap<i64, Instant>>,
     subject_id: i64,
@@ -2161,6 +2182,7 @@ async fn private_chat_inner(
             }),
             requires_reminder_create: crate::reminders::looks_like_reminder_request(message),
             requires_group_message_send: is_main_admin && understanding.cross_group_message_request,
+            requires_group_followup: is_main_admin && understanding.cross_group_followup_request,
             requires_external_tool: false,
         },
         reply_ticket,

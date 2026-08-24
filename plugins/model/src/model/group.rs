@@ -224,6 +224,20 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
         );
         return;
     }
+    if let Err(error) = crate::agent_tasks::record_group_message(
+        group_id,
+        event.message_id,
+        event.user_id,
+        sender_identity.display_name(),
+        message,
+    )
+    .await
+    {
+        eprintln!(
+            "[WARN] 保存跨群问答群成员回复失败 (群组: {}, 消息: {}): {}",
+            group_id, event.message_id, error
+        );
+    }
     if should_suppress(
         InboundScope::Group {
             group_id,
