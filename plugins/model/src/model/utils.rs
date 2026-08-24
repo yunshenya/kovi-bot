@@ -81,6 +81,7 @@ static PRIVATE_HISTORY_ACCESS: LazyLock<Mutex<HashMap<i64, Instant>>> =
 const MAX_RUNTIME_CONVERSATIONS: usize = 512;
 const MAX_STREAM_ENVELOPE_BYTES: usize = 16 * 1024 * 1024;
 const EMPTY_REPLY_ALERT_WINDOW: Duration = Duration::from_secs(10 * 60);
+const VISION_FAILURE_RESPONSE_PREFIX: &str = "[[VISION_FAILURE]]";
 const EMPTY_REPLY_REPAIR_PROMPT: &str = "上一轮没有形成可发送的回复。现在只做一次回复协议修复：重新结合当前用户消息判断本轮意图，需要文字回应时输出自然聊天正文；如果用户只要求发送结构化 @，可以只输出完整动作，不要为了凑正文添加无关套话。自然语言中的“@我”“艾特我”“提及我”必须输出 [[REPLY_ACTION]]{\"disposition\":\"reply\",\"at_current_sender\":true}[[/REPLY_ACTION]]，程序会绑定本轮真实发送者，不要调用成员搜索，也不要填写真实 QQ 号。@其他人时才使用动作候选中的 at_user_ref 并放入 at_user_ids。如果需要引用或撤回消息，也必须使用动作候选中的临时引用，不要只把动作写成正文里的普通文字。不要输出工具调用、解释、分析、代码块或协议之外的 JSON；若确实不应回应，只输出完整的 [[REPLY_ACTION]]{\"disposition\":\"silent\"}[[/REPLY_ACTION]]。不要编造工具结果，也不要把本次修复当成新的用户消息。";
 
 struct EmptyReplyIncident {
@@ -100,6 +101,8 @@ impl Default for EmptyReplyIncident {
 }
 
 static EMPTY_REPLY_INCIDENTS: LazyLock<Mutex<HashMap<String, EmptyReplyIncident>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static VISION_FAILURE_INCIDENTS: LazyLock<Mutex<HashMap<String, EmptyReplyIncident>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 pub(crate) async fn clear_private_runtime_data(user_id: i64) {
@@ -447,6 +450,21 @@ pub async fn control_model(
         limit_memory_size(&mut messages);
         return false;
     }
+    if let Some(detail) = vision_failure_detail(&response.content) {
+        let _ = set_pending_image_request_for_reply(
+            ImageRequestScope::Group { group_id, user_id },
+            false,
+            reply_ticket,
+        )
+        .await;
+        if !is_current(reply_ticket).await {
+            limit_memory_size(&mut messages);
+            return false;
+        }
+        report_vision_failure(&bot, &format!("群聊 {}", group_id), message, detail).await;
+        limit_memory_size(&mut messages);
+        return false;
+    }
     let reply_scope = super::interrupt::ReplyScope::Group(group_id);
     let mut plan =
         ReplyPlan::from_model_output_for_sender(reply_scope, &response.content, Some(user_id))
@@ -630,6 +648,7 @@ async fn repair_empty_reply(
     )
     .await;
     if is_model_error_response(&response.content)
+        || vision_failure_detail(&response.content).is_some()
         || response.content.contains("[[TOOL_CALL]]")
         || response.content.contains("[[/TOOL_CALL]]")
     {
@@ -672,27 +691,7 @@ fn log_unusable_reply_protocol(scope: super::interrupt::ReplyScope, phase: &str,
 }
 
 async fn report_empty_reply_incident(bot: &RuntimeBot, context: &str, message: &str) {
-    let now = Instant::now();
-    let (should_notify, count) = {
-        let mut incidents = EMPTY_REPLY_INCIDENTS.lock().await;
-        incidents.retain(|_, incident| {
-            now.duration_since(incident.last_seen) < EMPTY_REPLY_ALERT_WINDOW
-        });
-        let incident = incidents.entry(context.to_string()).or_default();
-        if now.duration_since(incident.last_seen) >= EMPTY_REPLY_ALERT_WINDOW {
-            incident.count = 0;
-            incident.last_notified = None;
-        }
-        incident.last_seen = now;
-        incident.count = incident.count.saturating_add(1);
-        let should_notify = incident.last_notified.is_none_or(|last_notified| {
-            now.duration_since(last_notified) >= EMPTY_REPLY_ALERT_WINDOW
-        });
-        if should_notify {
-            incident.last_notified = Some(now);
-        }
-        (should_notify, incident.count)
-    };
+    let (should_notify, count) = register_incident(&EMPTY_REPLY_INCIDENTS, context).await;
 
     println!(
         "[WARN] 回复链路自动修复失败 (场景: {}, 合并窗口内次数: {})",
@@ -719,6 +718,71 @@ async fn report_empty_reply_incident(bot: &RuntimeBot, context: &str, message: &
     );
     if !send_tracked_private_message(bot, main_admin, notification).await {
         eprintln!("[WARN] 回复链路异常通知管理员失败 (场景: {})", context);
+    }
+}
+
+pub(crate) async fn report_vision_failure(
+    bot: &RuntimeBot,
+    context: &str,
+    message: &str,
+    detail: &str,
+) {
+    let (should_notify, count) = register_incident(&VISION_FAILURE_INCIDENTS, context).await;
+    let reason = compact_incident_text(detail, 240, "未知原因");
+    println!(
+        "[WARN] 图片理解失败 (场景: {}, 合并窗口内次数: {}, 原因: {})",
+        context, count, reason
+    );
+    if !should_notify {
+        return;
+    }
+
+    let Ok(main_admin) = bot.get_main_admin() else {
+        eprintln!(
+            "[WARN] 图片理解失败，但无法读取主管理员 QQ (场景: {})",
+            context
+        );
+        return;
+    };
+    let preview = compact_incident_text(message, 80, "（无文本，附带图片）");
+    let notification = format!(
+        "图片理解失败\n场景：{context}\n本次已静默，未向群内发送消息。\n最近10分钟同类失败：{count}次\n原因：{reason}\n消息：{preview}\n相同场景的后续异常将在10分钟内合并通知。"
+    );
+    if !send_tracked_private_message(bot, main_admin, notification).await {
+        eprintln!("[WARN] 图片理解失败通知管理员失败 (场景: {})", context);
+    }
+}
+
+async fn register_incident(
+    incidents: &Mutex<HashMap<String, EmptyReplyIncident>>,
+    context: &str,
+) -> (bool, u32) {
+    let now = Instant::now();
+    let mut incidents = incidents.lock().await;
+    incidents
+        .retain(|_, incident| now.duration_since(incident.last_seen) < EMPTY_REPLY_ALERT_WINDOW);
+    let incident = incidents.entry(context.to_string()).or_default();
+    if now.duration_since(incident.last_seen) >= EMPTY_REPLY_ALERT_WINDOW {
+        incident.count = 0;
+        incident.last_notified = None;
+    }
+    incident.last_seen = now;
+    incident.count = incident.count.saturating_add(1);
+    let should_notify = incident
+        .last_notified
+        .is_none_or(|last_notified| now.duration_since(last_notified) >= EMPTY_REPLY_ALERT_WINDOW);
+    if should_notify {
+        incident.last_notified = Some(now);
+    }
+    (should_notify, incident.count)
+}
+
+fn compact_incident_text(value: &str, max_chars: usize, empty: &str) -> String {
+    let compact = value.replace(['\r', '\n'], " ");
+    if compact.trim().is_empty() {
+        empty.to_string()
+    } else {
+        truncate_chars(compact.trim(), max_chars)
     }
 }
 
@@ -1499,8 +1563,10 @@ fn vision_model_error(error: &str) -> BotMemory {
     eprintln!("[ERROR] 截图分析失败: {}", error);
     BotMemory {
         role: Roles::Assistant,
-        content: "我现在还不能直接读这张截图。请管理员配置一个支持图片输入的视觉模型后再试一次。"
-            .to_string(),
+        content: format!(
+            "{VISION_FAILURE_RESPONSE_PREFIX}{}",
+            compact_incident_text(error, 240, "未知原因")
+        ),
     }
 }
 
@@ -1522,6 +1588,12 @@ fn append_vision_analysis(messages: &mut [BotMemory], analysis: &str) {
 
 pub(crate) fn is_model_error_response(content: &str) -> bool {
     content.starts_with("抱歉，模型服务暂时不可用（")
+}
+
+pub(crate) fn vision_failure_detail(content: &str) -> Option<&str> {
+    content
+        .strip_prefix(VISION_FAILURE_RESPONSE_PREFIX)
+        .map(str::trim)
 }
 
 /// 生成只影响措辞、不预设回复结构的轻量风格参考。
@@ -2070,6 +2142,31 @@ async fn private_chat_inner(
         limit_memory_size(&mut history);
         return;
     }
+    if vision_failure_detail(&bot_content.content).is_some() {
+        let _ = set_pending_image_request_for_reply(
+            ImageRequestScope::Private(user_id),
+            false,
+            reply_ticket,
+        )
+        .await;
+        if !is_current(reply_ticket).await {
+            limit_memory_size(&mut history);
+            return;
+        }
+        let fallback = "这张图我这次没读出来，重新发一次或换张图试试吧。";
+        if let Ok(message_id) = bot.send_private_msg_return(user_id, fallback).await {
+            let _ = record_bot_message(
+                super::interrupt::ReplyScope::Private(user_id),
+                reply_ticket,
+                message_id,
+                fallback,
+                &bot,
+            )
+            .await;
+        }
+        limit_memory_size(&mut history);
+        return;
+    }
     let reply_scope = super::interrupt::ReplyScope::Private(user_id);
     let mut plan = ReplyPlan::from_model_output(reply_scope, &bot_content.content).await;
     if !is_current(reply_ticket).await {
@@ -2395,6 +2492,16 @@ mod tests {
     use crate::model::reply_disposition::ReplyDisposition;
     use chrono::Local;
     use kovi::serde_json::json;
+
+    #[test]
+    fn vision_failure_is_internal_and_extractable() {
+        let response = super::vision_model_error("视觉 Provider 调用超时");
+        assert_eq!(
+            super::vision_failure_detail(&response.content),
+            Some("视觉 Provider 调用超时")
+        );
+        assert!(!response.content.contains("我现在还不能直接读这张截图"));
+    }
 
     #[test]
     fn adapter_status_is_reported_without_assuming_a_memory_field() {

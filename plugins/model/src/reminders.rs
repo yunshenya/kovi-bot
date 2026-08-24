@@ -486,6 +486,9 @@ async fn build_generic_task(reminder: &ClaimedReminder) -> Result<String> {
     if crate::model::utils::is_model_error_response(&response.content) {
         return Err(anyhow!("定时任务模型调用失败: {}", response.content));
     }
+    if let Some(detail) = crate::model::utils::vision_failure_detail(&response.content) {
+        return Err(anyhow!("定时任务图片理解失败: {detail}"));
+    }
     if response.content == SCHEDULED_EXTERNAL_TOOL_FAILURE {
         return Err(anyhow!("定时任务未成功获取所需的外部资料"));
     }

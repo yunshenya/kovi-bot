@@ -6,7 +6,7 @@ use super::thinking::ThinkingReporter;
 use super::tool_access::{ToolExecutionContext, ToolExecutionResult, tool_registry};
 use super::utils::{
     BotMemory, Roles, complete_truncated_json_object, is_model_error_response,
-    params_model_with_token_limit_and_progress_for_reply,
+    params_model_with_token_limit_and_progress_for_reply, vision_failure_detail,
 };
 use crate::config;
 use crate::vision::VisionImage;
@@ -146,6 +146,9 @@ pub(crate) async fn params_model_with_tool_access(
         else {
             return interrupted_response();
         };
+        if vision_failure_detail(&response.content).is_some() {
+            return response;
+        }
         // Providers sometimes add a short preamble or Markdown around a tool
         // call. Keep the same tolerant-but-structured parser for every retry
         // round; switching back to strict mode on round two turns recoverable

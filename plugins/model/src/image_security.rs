@@ -95,12 +95,11 @@ pub(crate) async fn materialize_image_url(
         return Err(image_size_error(max_bytes));
     }
 
-    let content_type = response
+    let declared_content_type = response
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
-        .and_then(parse_image_content_type)
-        .ok_or_else(|| anyhow!("图片响应必须声明 PNG、JPEG 或 WebP Content-Type"))?;
+        .and_then(parse_image_content_type);
     let mut bytes =
         Vec::with_capacity(response.content_length().unwrap_or(0).min(max_bytes as u64) as usize);
     while let Some(chunk) = response
@@ -116,6 +115,10 @@ pub(crate) async fn materialize_image_url(
     if bytes.is_empty() {
         return Err(anyhow!("图片响应为空"));
     }
+
+    // 部分 QQ 图片 CDN 会返回 application/octet-stream 或缺少 Content-Type。
+    // 文件内容仍需通过 PNG/JPEG/WebP 签名校验，不能只凭响应头放行。
+    let content_type = resolve_image_content_type(declared_content_type.as_deref(), &bytes)?;
 
     kovi::tokio::task::spawn_blocking(move || {
         validate_image_signature(&content_type, &bytes)?;
@@ -305,6 +308,24 @@ fn parse_image_content_type(content_type: &str) -> Option<String> {
     }
 }
 
+fn resolve_image_content_type(declared: Option<&str>, bytes: &[u8]) -> Result<String> {
+    if let Some(declared) = declared
+        && validate_image_signature(declared, bytes).is_ok()
+    {
+        return Ok(declared.to_string());
+    }
+
+    if let Some(detected) = image_content_type_from_signature(bytes) {
+        return Ok(detected.to_string());
+    }
+
+    if declared.is_some() {
+        Err(anyhow!("图片内容不是受支持的 PNG、JPEG 或 WebP"))
+    } else {
+        Err(anyhow!("图片响应未声明受支持格式，且无法从文件签名识别"))
+    }
+}
+
 pub(crate) fn decode_validated_image_data_url(
     raw_url: &str,
     max_bytes: usize,
@@ -335,16 +356,23 @@ pub(crate) fn decode_validated_image_data_url(
 }
 
 fn validate_image_signature(mime_type: &str, bytes: &[u8]) -> Result<()> {
-    let valid = match mime_type {
-        "image/png" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
-        "image/jpeg" => bytes.starts_with(&[0xff, 0xd8, 0xff]),
-        "image/webp" => bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP",
-        _ => false,
-    };
+    let valid = image_content_type_from_signature(bytes) == Some(mime_type);
     if valid {
         Ok(())
     } else {
         Err(anyhow!("图片内容与声明的格式不匹配"))
+    }
+}
+
+fn image_content_type_from_signature(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some("image/jpeg")
+    } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
     }
 }
 
@@ -359,7 +387,7 @@ fn encode_image_data_url(mime_type: &str, bytes: &[u8]) -> String {
 mod tests {
     use super::{
         decode_validated_image_data_url, is_public_image_ip, is_safe_onebot_image_file,
-        parse_image_content_type, validate_remote_image_url,
+        parse_image_content_type, resolve_image_content_type, validate_remote_image_url,
     };
     use base64::Engine;
     use std::net::IpAddr;
@@ -451,5 +479,20 @@ mod tests {
         );
         assert!(parse_image_content_type("application/octet-stream").is_none());
         assert!(parse_image_content_type("image/svg+xml").is_none());
+    }
+
+    #[test]
+    fn detects_supported_image_from_signature_when_header_is_missing_or_wrong() {
+        let png = b"\x89PNG\r\n\x1a\n";
+        assert_eq!(resolve_image_content_type(None, png).unwrap(), "image/png");
+        assert_eq!(
+            resolve_image_content_type(Some("application/octet-stream"), png).unwrap(),
+            "image/png"
+        );
+        assert_eq!(
+            resolve_image_content_type(Some("image/jpeg"), png).unwrap(),
+            "image/png"
+        );
+        assert!(resolve_image_content_type(None, b"not an image").is_err());
     }
 }

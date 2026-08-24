@@ -15,7 +15,7 @@ use crate::model::traffic::{InboundScope, bounded_input, should_suppress};
 use crate::model::utils::{
     clear_group_runtime_data, command_help, is_bot_admin, is_group_paused, is_help_command,
     is_restricted_command, learn_user_profile_from_message, process_group_reply_claimed,
-    send_sys_info,
+    report_vision_failure, send_sys_info,
 };
 use crate::redis_store;
 use crate::reminders;
@@ -673,20 +673,21 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
         match resolve_image_urls(&images, &bot).await {
             Ok(images) if !images.is_empty() => images,
             Ok(_) => {
-                send_tracked_group_message(
+                report_vision_failure(
                     &bot,
-                    group_id,
-                    "我暂时拿不到这张截图的内容，再发一次或换张图试试吧。",
+                    &format!("群聊 {}", group_id),
+                    message,
+                    "未解析到可用图片地址",
                 )
                 .await;
                 return;
             }
             Err(error) => {
-                eprintln!("[ERROR] 群聊读取截图失败 (群组: {}): {}", group_id, error);
-                send_tracked_group_message(
+                report_vision_failure(
                     &bot,
-                    group_id,
-                    "我暂时读不到这张截图，再发一次或换张图试试吧。",
+                    &format!("群聊 {}", group_id),
+                    message,
+                    &error.to_string(),
                 )
                 .await;
                 return;
