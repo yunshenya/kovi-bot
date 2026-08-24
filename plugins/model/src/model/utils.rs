@@ -80,6 +80,27 @@ static PRIVATE_HISTORY_ACCESS: LazyLock<Mutex<HashMap<i64, Instant>>> =
 
 const MAX_RUNTIME_CONVERSATIONS: usize = 512;
 const MAX_STREAM_ENVELOPE_BYTES: usize = 16 * 1024 * 1024;
+const EMPTY_REPLY_ALERT_WINDOW: Duration = Duration::from_secs(10 * 60);
+const EMPTY_REPLY_REPAIR_PROMPT: &str = "上一轮没有生成可见回复。现在只做一次回复协议修复：结合当前用户消息，若确实需要回应，就直接输出一条自然聊天正文；不要输出工具调用、解释、分析、JSON、代码块或回复协议标记。若确实不应回应，只输出完整的 [[REPLY_ACTION]]{\"disposition\":\"silent\"}[[/REPLY_ACTION]]。不要编造工具结果，也不要把本次修复当成新的用户消息。";
+
+struct EmptyReplyIncident {
+    last_seen: Instant,
+    last_notified: Option<Instant>,
+    count: u32,
+}
+
+impl Default for EmptyReplyIncident {
+    fn default() -> Self {
+        Self {
+            last_seen: Instant::now(),
+            last_notified: None,
+            count: 0,
+        }
+    }
+}
+
+static EMPTY_REPLY_INCIDENTS: LazyLock<Mutex<HashMap<String, EmptyReplyIncident>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 pub(crate) async fn clear_private_runtime_data(user_id: i64) {
     PRIVATE_MESSAGE_MEMORY.lock().await.remove(&user_id);
@@ -302,6 +323,7 @@ pub async fn control_model(
     vision_images: Vec<VisionImage>,
     sticker_teaching_message: Option<Message>,
     understanding: MessageUnderstanding,
+    reply_expected: bool,
 ) -> bool {
     let message = if message.trim().is_empty() && !vision_images.is_empty() {
         default_vision_prompt()
@@ -423,7 +445,7 @@ pub async fn control_model(
         return false;
     }
     let reply_scope = super::interrupt::ReplyScope::Group(group_id);
-    let plan = ReplyPlan::from_model_output(reply_scope, &response.content).await;
+    let mut plan = ReplyPlan::from_model_output(reply_scope, &response.content).await;
     if !is_current(reply_ticket).await {
         limit_memory_size(&mut messages);
         return false;
@@ -454,6 +476,27 @@ pub async fn control_model(
         }
         limit_memory_size(&mut messages);
         return false;
+    }
+    if should_repair_empty_reply(&plan, reply_expected, &understanding) {
+        match repair_empty_reply(
+            &request_messages,
+            reply_scope,
+            max_output_tokens,
+            &vision_images,
+            reply_ticket,
+            Some(Arc::clone(&thinking_reporter)),
+        )
+        .await
+        {
+            Some(repaired_plan) => {
+                println!("[INFO] 群聊空回复已完成协议修复 (群组: {})", group_id);
+                plan = repaired_plan;
+            }
+            None => {
+                println!("[WARN] 群聊空回复协议修复失败 (群组: {})", group_id);
+                report_empty_reply_incident(&bot, &format!("群聊 {}", group_id), message).await;
+            }
+        }
     }
     let personality = MEMORY_REPOSITORY.personality().await;
     let execution = execute_reply_plan(
@@ -493,7 +536,6 @@ pub async fn control_model(
             }
         } else {
             println!("[WARN] 群聊模型返回了空回复计划 (群组: {})", group_id);
-            notify_main_admin_model_empty(&bot, &format!("群聊 {}", group_id)).await;
         }
         limit_memory_size(&mut messages);
         return false;
@@ -543,18 +585,98 @@ fn group_system_prompt() -> String {
     )
 }
 
-async fn notify_main_admin_model_empty(bot: &RuntimeBot, context: &str) {
+fn should_repair_empty_reply(
+    plan: &ReplyPlan,
+    reply_expected: bool,
+    understanding: &MessageUnderstanding,
+) -> bool {
+    reply_expected
+        && !understanding.wants_no_reply
+        && !understanding.wants_stop
+        && !plan.is_silent()
+        && !plan.has_visible_reply()
+        && plan.action.recall_message_ids.is_empty()
+}
+
+async fn repair_empty_reply(
+    request_messages: &[BotMemory],
+    scope: super::interrupt::ReplyScope,
+    max_output_tokens: Option<u32>,
+    vision_images: &[VisionImage],
+    reply_ticket: ReplyTicket,
+    progress: Option<Arc<ThinkingReporter>>,
+) -> Option<ReplyPlan> {
+    let mut repair_messages = request_messages.to_vec();
+    repair_messages.push(BotMemory {
+        role: Roles::System,
+        content: EMPTY_REPLY_REPAIR_PROMPT.to_string(),
+    });
+    let response = params_model_with_token_limit_and_progress_for_reply(
+        &mut repair_messages,
+        max_output_tokens,
+        vision_images,
+        progress,
+        Some(reply_ticket),
+    )
+    .await;
+    if is_model_error_response(&response.content)
+        || response.content.contains("[[TOOL_CALL]]")
+        || response.content.contains("[[/TOOL_CALL]]")
+    {
+        return None;
+    }
+    let plan = ReplyPlan::from_model_output(scope, &response.content).await;
+    (plan.has_visible_reply() || plan.is_silent()).then_some(plan)
+}
+
+async fn report_empty_reply_incident(bot: &RuntimeBot, context: &str, message: &str) {
+    let now = Instant::now();
+    let (should_notify, count) = {
+        let mut incidents = EMPTY_REPLY_INCIDENTS.lock().await;
+        incidents.retain(|_, incident| {
+            now.duration_since(incident.last_seen) < EMPTY_REPLY_ALERT_WINDOW
+        });
+        let incident = incidents.entry(context.to_string()).or_default();
+        if now.duration_since(incident.last_seen) >= EMPTY_REPLY_ALERT_WINDOW {
+            incident.count = 0;
+            incident.last_notified = None;
+        }
+        incident.last_seen = now;
+        incident.count = incident.count.saturating_add(1);
+        let should_notify = incident.last_notified.is_none_or(|last_notified| {
+            now.duration_since(last_notified) >= EMPTY_REPLY_ALERT_WINDOW
+        });
+        if should_notify {
+            incident.last_notified = Some(now);
+        }
+        (should_notify, incident.count)
+    };
+
+    println!(
+        "[WARN] 回复链路自动修复失败 (场景: {}, 合并窗口内次数: {})",
+        context, count
+    );
+    if !should_notify {
+        return;
+    }
+
     let Ok(main_admin) = bot.get_main_admin() else {
         eprintln!(
-            "[WARN] 模型返回为空，但无法读取主管理员 QQ (场景: {})",
+            "[WARN] 回复链路自动修复失败，但无法读取主管理员 QQ (场景: {})",
             context
         );
         return;
     };
-    if send_tracked_private_message(bot, main_admin, "模型返回为空").await {
-        println!("[WARN] 已通知管理员模型返回为空 (场景: {})", context);
+    let preview = if message.trim().is_empty() {
+        "（无文本消息）".to_string()
     } else {
-        eprintln!("[WARN] 模型返回为空，通知管理员失败 (场景: {})", context);
+        truncate_chars(&message.replace(['\r', '\n'], " "), 80)
+    };
+    let notification = format!(
+        "回复链路异常\n场景：{context}\n自动修复失败，本次未发送消息。\n最近10分钟同类异常：{count}次\n消息：{preview}\n相同场景的后续异常将在10分钟内合并通知。"
+    );
+    if !send_tracked_private_message(bot, main_admin, notification).await {
+        eprintln!("[WARN] 回复链路异常通知管理员失败 (场景: {})", context);
     }
 }
 
@@ -1496,6 +1618,7 @@ pub async fn process_group_reply(
         None,
         understanding,
         false,
+        false,
     )
     .await
 }
@@ -1513,6 +1636,7 @@ pub(crate) async fn process_group_reply_claimed(
     source_message_ids: Vec<i32>,
     sticker_teaching_message: Option<Message>,
     understanding: MessageUnderstanding,
+    reply_expected: bool,
 ) -> bool {
     process_group_reply_inner(
         group_id,
@@ -1526,6 +1650,7 @@ pub(crate) async fn process_group_reply_claimed(
         source_message_ids,
         sticker_teaching_message,
         understanding,
+        reply_expected,
         true,
     )
     .await
@@ -1544,6 +1669,7 @@ async fn process_group_reply_inner(
     source_message_ids: Vec<i32>,
     sticker_teaching_message: Option<Message>,
     understanding: MessageUnderstanding,
+    reply_expected: bool,
     already_claimed: bool,
 ) -> bool {
     let scope = super::interrupt::ReplyScope::Group(group_id);
@@ -1581,6 +1707,7 @@ async fn process_group_reply_inner(
             vision_images,
             sticker_teaching_message,
             understanding,
+            reply_expected,
         )
         .await;
         finish_reply(scope, reply_ticket).await;
@@ -1897,7 +2024,7 @@ async fn private_chat_inner(
         return;
     }
     let reply_scope = super::interrupt::ReplyScope::Private(user_id);
-    let plan = ReplyPlan::from_model_output(reply_scope, &bot_content.content).await;
+    let mut plan = ReplyPlan::from_model_output(reply_scope, &bot_content.content).await;
     if !is_current(reply_ticket).await {
         limit_memory_size(&mut history);
         return;
@@ -1928,6 +2055,27 @@ async fn private_chat_inner(
         }
         limit_memory_size(&mut history);
         return;
+    }
+    if should_repair_empty_reply(&plan, true, understanding) {
+        match repair_empty_reply(
+            &request_messages,
+            reply_scope,
+            None,
+            vision_images,
+            reply_ticket,
+            Some(Arc::clone(&thinking_reporter)),
+        )
+        .await
+        {
+            Some(repaired_plan) => {
+                println!("[INFO] 私聊空回复已完成协议修复 (用户: {})", user_id);
+                plan = repaired_plan;
+            }
+            None => {
+                println!("[WARN] 私聊空回复协议修复失败 (用户: {})", user_id);
+                report_empty_reply_incident(&bot, &format!("私聊 {}", user_id), message).await;
+            }
+        }
     }
     let personality = MEMORY_REPOSITORY.personality().await;
     let execution = execute_reply_plan(
@@ -1967,7 +2115,6 @@ async fn private_chat_inner(
             }
         } else {
             println!("[WARN] 私聊模型返回了空回复计划 (用户: {})", user_id);
-            notify_main_admin_model_empty(&bot, &format!("私聊 {}", user_id)).await;
         }
         limit_memory_size(&mut history);
         return;
@@ -2186,10 +2333,11 @@ pub fn get_file_modified_time_formatted() -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BotMemory, Roles, VisionImage, append_stream_delta, build_model_messages,
-        build_responses_input, compression_cutoff, extract_stream_delta, group_system_prompt,
-        is_group_admin_command, is_help_command, is_restricted_command, limit_memory_size,
-        model_attempt_count, sanitize_scheduled_output, with_reference_context,
+        BotMemory, EMPTY_REPLY_REPAIR_PROMPT, MessageUnderstanding, Roles, VisionImage,
+        append_stream_delta, build_model_messages, build_responses_input, compression_cutoff,
+        extract_stream_delta, group_system_prompt, is_group_admin_command, is_help_command,
+        is_restricted_command, limit_memory_size, model_attempt_count, sanitize_scheduled_output,
+        should_repair_empty_reply, with_reference_context,
     };
     use crate::memory::{BotPersonality, UserProfile};
     use crate::model::message_actions::{ReplyPlan, follow_up_delay_millis, split_reply};
@@ -2224,6 +2372,67 @@ mod tests {
         assert!(is_group_admin_command(" #健康检查 "));
         assert!(!is_restricted_command("请看看截图"));
         assert!(!is_restricted_command("芸汐，今天开心吗"));
+    }
+
+    #[test]
+    fn empty_reply_repair_only_runs_when_a_visible_reply_is_expected() {
+        let empty = ReplyPlan {
+            content: String::new(),
+            disposition: ReplyDisposition::Reply,
+            action: Default::default(),
+            bubbles: Vec::new(),
+            requests_image: false,
+        };
+        let wants_no_reply = MessageUnderstanding {
+            wants_no_reply: true,
+            ..Default::default()
+        };
+        let wants_stop = MessageUnderstanding {
+            wants_stop: true,
+            ..Default::default()
+        };
+        assert!(should_repair_empty_reply(
+            &empty,
+            true,
+            &MessageUnderstanding::default()
+        ));
+        assert!(!should_repair_empty_reply(
+            &empty,
+            false,
+            &MessageUnderstanding::default()
+        ));
+        assert!(!should_repair_empty_reply(&empty, true, &wants_no_reply));
+        assert!(!should_repair_empty_reply(&empty, true, &wants_stop));
+
+        let silent = ReplyPlan {
+            disposition: ReplyDisposition::Silent,
+            ..empty.clone()
+        };
+        assert!(!should_repair_empty_reply(
+            &silent,
+            true,
+            &MessageUnderstanding::default()
+        ));
+
+        let recall_only = ReplyPlan {
+            action: crate::model::reply::ReplyAction {
+                recall_message_ids: vec![12],
+                ..Default::default()
+            },
+            ..empty
+        };
+        assert!(!should_repair_empty_reply(
+            &recall_only,
+            true,
+            &MessageUnderstanding::default()
+        ));
+    }
+
+    #[test]
+    fn empty_reply_repair_prompt_stays_internal_and_plain() {
+        assert!(EMPTY_REPLY_REPAIR_PROMPT.contains("自然聊天正文"));
+        assert!(EMPTY_REPLY_REPAIR_PROMPT.contains("不要输出工具调用"));
+        assert!(!EMPTY_REPLY_REPAIR_PROMPT.contains("**"));
     }
 
     #[test]

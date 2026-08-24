@@ -16,6 +16,7 @@ pub(crate) struct PendingTurn {
     pub(crate) user_id: i64,
     pub(crate) sender: String,
     pub(crate) message: String,
+    pub(crate) reply_expected: bool,
     pub(crate) vision_images: Vec<VisionImage>,
     pub(crate) message_ids: Vec<i32>,
     pub(crate) understanding: MessageUnderstanding,
