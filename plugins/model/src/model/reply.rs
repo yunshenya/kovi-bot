@@ -44,6 +44,8 @@ const REPLY_PROTOCOL_INSTRUCTIONS: &str = concat!(
     "自然语言中的“@我”“艾特我”“提及我”指向动作候选里 is_current_sender=true 的当前消息发送者；",
     "此时必须把该候选的 at_user_ref 放进 at_user_ids，不能只在正文中写@，也不能填写真实 QQ 号。",
     "例如当前候选 at_user_ref=1000001 时，应使用动作字段 \"at_user_ids\":[1000001]。\n",
+    "如果用户要求按名字、昵称、简称或群名片 @ 其他群成员，而动作候选中没有现成的唯一目标，先调用 group.members.search；query 只填写要找的名字。",
+    "工具返回 unique 时才使用其中的 at_user_ref；返回 ambiguous、not_found 或 lookup_failed 时不要猜测，也不要把普通文字当成 @。\n",
     "如果本轮明确要求按昵称 @，且解析结果为 unique，必须把对应 at_user_ref 放入 at_user_ids；",
     "如果解析结果为 ambiguous、not_found 或 lookup_failed，不要猜测或输出假的 @，自然说明需要更明确的群名片或引用消息。\n",
     "disposition=reply 时可以正常输出正文，也可以只执行撤回而不发正文；",
@@ -858,6 +860,8 @@ mod tests {
         assert!(!REPLY_PROTOCOL_INSTRUCTIONS.contains("NEXT_MESSAGE"));
         assert!(REPLY_PROTOCOL_INSTRUCTIONS.contains("\"messages\""));
         assert!(REPLY_PROTOCOL_INSTRUCTIONS.contains("\"disposition\":\"silent\""));
+        assert!(REPLY_PROTOCOL_INSTRUCTIONS.contains("group.members.search"));
+        assert!(REPLY_PROTOCOL_INSTRUCTIONS.contains("ambiguous"));
     }
 
     #[test]

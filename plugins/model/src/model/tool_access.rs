@@ -1,6 +1,8 @@
 //! 内置工具与受限 MCP 工具的统一注册、校验和执行层。
 
+use super::interrupt::ReplyScope;
 use super::message_actions::MessageDestination;
+use super::reply::{MentionResolution, record_mention_resolution, register_mention_target};
 use crate::config::{self, McpServerConfig};
 use crate::health_check::HealthChecker;
 use crate::memory::{MEMORY_MANAGER, MemoryEntry, MemoryLookup};
@@ -32,6 +34,8 @@ const WEATHER_REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 const MAX_LOCATION_CHARS: usize = 120;
 const MAX_CALCULATOR_EXPRESSION_CHARS: usize = 300;
 const MAX_CALCULATOR_TOKENS: usize = 128;
+const MAX_GROUP_MEMBER_QUERY_CHARS: usize = 80;
+const MAX_GROUP_MEMBER_RESULTS: usize = 8;
 
 type McpClient = rmcp::service::RunningService<rmcp::RoleClient, ()>;
 
@@ -73,6 +77,7 @@ enum BuiltinTool {
     SystemInfo,
     GroupPause,
     GroupResume,
+    GroupMemberSearch,
     HealthCheck,
 }
 
@@ -293,6 +298,25 @@ pub(crate) async fn initialize() -> Result<()> {
             source: ToolSource::Builtin(BuiltinTool::Calculator),
         });
     }
+
+    definitions.push(ToolDefinition {
+        name: "group.members.search".to_string(),
+        description: "仅限群聊：搜索当前群的成员昵称和群名片，为回复动作准备安全的临时 @ 引用。用户说要 @ 某个名字、昵称、简称或群名片时使用；query 只填写要找的名字，不要填写整句请求，也不要把当前消息发送者候选当成目标。精确匹配优先，其次才使用唯一的前缀或包含匹配；多个候选时必须让用户澄清，不能猜测。工具结果中的 at_user_ref 只能放进回复动作的 at_user_ids。".to_string(),
+        input_schema: json!({
+            "type": "object",
+            "required": ["query"],
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": MAX_GROUP_MEMBER_QUERY_CHARS,
+                    "description": "要查找的群成员名字、昵称、简称或群名片，例如 南竹。"
+                }
+            },
+            "additionalProperties": false
+        }),
+        source: ToolSource::Builtin(BuiltinTool::GroupMemberSearch),
+    });
 
     definitions.push(ToolDefinition {
         name: "help.commands".to_string(),
@@ -599,6 +623,14 @@ impl ToolRegistry {
                 "\n\n如果管理员明确要求查看帮助、系统信息、健康状态，或暂停/恢复当前群的回复，必须优先调用对应的内置工具，不要凭记忆编造运行状态或权限结果。",
             );
         }
+        if !tool_context.group_paused
+            && matches!(tool_context.destination, MessageDestination::Group(_))
+            && !tool_context.scheduled
+        {
+            instruction.push_str(
+                "\n\n群成员 @ 规则：用户要求 @ 某个群成员时，先判断动作候选里是否已经有明确的目标；没有时调用 group.members.search，query 只填名字或昵称。不要用当前消息发送者的 is_current_sender 候选代替其他人，也不要在正文里伪造 @。搜索结果只有 unique 才能把 at_user_ref 放进 at_user_ids；ambiguous 时列出候选并请用户澄清。",
+            );
+        }
         instruction
     }
 
@@ -755,6 +787,7 @@ impl ToolSource {
                     | BuiltinTool::SystemInfo
                     | BuiltinTool::GroupPause
                     | BuiltinTool::GroupResume
+                    | BuiltinTool::GroupMemberSearch
                     | BuiltinTool::HealthCheck
                     | BuiltinTool::StickerMemoryTeach
             ),
@@ -788,6 +821,9 @@ impl ToolSource {
                 matches!(destination, MessageDestination::Group(_)) && !group_paused
             }
             Self::Builtin(BuiltinTool::GroupResume) => {
+                matches!(destination, MessageDestination::Group(_))
+            }
+            Self::Builtin(BuiltinTool::GroupMemberSearch) => {
                 matches!(destination, MessageDestination::Group(_))
             }
             _ => true,
@@ -972,8 +1008,305 @@ async fn execute_builtin(
             crate::model::utils::set_group_paused(group_id, false).await;
             Ok("已恢复当前群的自动回复。".to_string())
         }
+        BuiltinTool::GroupMemberSearch => search_group_members(&arguments, &tool_context).await,
         BuiltinTool::HealthCheck => health_check().await,
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum GroupMemberMatchKind {
+    Exact,
+    Prefix,
+    Contains,
+}
+
+impl GroupMemberMatchKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Exact => "exact",
+            Self::Prefix => "prefix",
+            Self::Contains => "contains",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GroupMemberCandidate {
+    user_id: i64,
+    display_name: String,
+    nickname: Option<String>,
+    card: Option<String>,
+    matched_name: String,
+    match_kind: GroupMemberMatchKind,
+}
+
+async fn search_group_members(
+    arguments: &Map<String, Value>,
+    tool_context: &ToolExecutionContext,
+) -> Result<String> {
+    reject_unknown_arguments(arguments, &["query"])?;
+    let query = required_string(arguments, "query", MAX_GROUP_MEMBER_QUERY_CHARS)?;
+    let MessageDestination::Group(group_id) = tool_context.destination else {
+        return Err(anyhow!("群成员搜索工具只能在群聊中使用"));
+    };
+    let scope = ReplyScope::Group(group_id);
+    let bot = tool_context
+        .runtime_bot
+        .as_deref()
+        .ok_or_else(|| anyhow!("群成员搜索工具没有可用的机器人运行时"))?;
+
+    let member_data = match bot.get_group_member_list(group_id).await {
+        Ok(response) if response.status == "ok" && response.data.is_array() => response.data,
+        Ok(response) => {
+            eprintln!(
+                "[WARN] 群成员搜索返回无效数据 (群组: {}, 查询: {}, 状态: {})",
+                group_id, query, response.status
+            );
+            record_mention_resolution(scope, &query, MentionResolution::LookupFailed).await;
+            return Ok(group_member_search_result(
+                &query,
+                "lookup_failed",
+                &[],
+                0,
+                None,
+            ));
+        }
+        Err(error) => {
+            eprintln!(
+                "[WARN] 群成员搜索读取成员列表失败 (群组: {}, 查询: {}, 错误: {:?})",
+                group_id, query, error
+            );
+            record_mention_resolution(scope, &query, MentionResolution::LookupFailed).await;
+            return Ok(group_member_search_result(
+                &query,
+                "lookup_failed",
+                &[],
+                0,
+                None,
+            ));
+        }
+    };
+
+    let candidates = search_group_member_candidates(&member_data, &query);
+    match candidates.as_slice() {
+        [] => {
+            record_mention_resolution(scope, &query, MentionResolution::NotFound).await;
+            Ok(group_member_search_result(
+                &query,
+                "not_found",
+                &[],
+                0,
+                None,
+            ))
+        }
+        [candidate] => {
+            let at_user_ref =
+                register_mention_target(scope, candidate.user_id, candidate.display_name.clone())
+                    .await;
+            record_mention_resolution(
+                scope,
+                &query,
+                MentionResolution::Unique {
+                    at_user_ref,
+                    matched_name: candidate.matched_name.clone(),
+                },
+            )
+            .await;
+            println!(
+                "[INFO] 群成员搜索唯一匹配 (群组: {}, 查询: {}, 匹配: {}, at_ref: {})",
+                group_id, query, candidate.display_name, at_user_ref
+            );
+            Ok(group_member_search_result(
+                &query,
+                "unique",
+                std::slice::from_ref(candidate),
+                1,
+                Some(at_user_ref),
+            ))
+        }
+        candidates => {
+            record_mention_resolution(
+                scope,
+                &query,
+                MentionResolution::Ambiguous {
+                    match_count: candidates.len(),
+                },
+            )
+            .await;
+            println!(
+                "[INFO] 群成员搜索匹配不唯一 (群组: {}, 查询: {}, 数量: {})",
+                group_id,
+                query,
+                candidates.len()
+            );
+            Ok(group_member_search_result(
+                &query,
+                "ambiguous",
+                &candidates[..candidates.len().min(MAX_GROUP_MEMBER_RESULTS)],
+                candidates.len(),
+                None,
+            ))
+        }
+    }
+}
+
+fn group_member_search_result(
+    query: &str,
+    status: &str,
+    candidates: &[GroupMemberCandidate],
+    match_count: usize,
+    at_user_ref: Option<i64>,
+) -> String {
+    let members = candidates
+        .iter()
+        .take(MAX_GROUP_MEMBER_RESULTS)
+        .map(|candidate| {
+            let mut member = Map::from_iter([
+                ("display_name".to_string(), json!(candidate.display_name)),
+                ("nickname".to_string(), json!(candidate.nickname)),
+                ("card".to_string(), json!(candidate.card)),
+                ("matched_name".to_string(), json!(candidate.matched_name)),
+                (
+                    "match_type".to_string(),
+                    json!(candidate.match_kind.as_str()),
+                ),
+            ]);
+            if let Some(at_user_ref) = at_user_ref {
+                member.insert("at_user_ref".to_string(), json!(at_user_ref));
+            }
+            Value::Object(member)
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "query": query,
+        "status": status,
+        "match_count": match_count,
+        "members": members,
+    })
+    .to_string()
+}
+
+fn search_group_member_candidates(data: &Value, query: &str) -> Vec<GroupMemberCandidate> {
+    let Some(members) = data.as_array() else {
+        return Vec::new();
+    };
+    let query = normalize_group_member_name(query);
+    if query.is_empty() {
+        return Vec::new();
+    }
+
+    let mut candidates = Vec::new();
+    for member in members {
+        let Some(user_id) = value_i64(member.get("user_id")) else {
+            continue;
+        };
+        let card = member
+            .get("card")
+            .and_then(Value::as_str)
+            .map(clean_group_member_label)
+            .filter(|value| !value.is_empty());
+        let nickname = member
+            .get("nickname")
+            .and_then(Value::as_str)
+            .map(clean_group_member_label)
+            .filter(|value| !value.is_empty());
+        let display_name = card.clone().or_else(|| nickname.clone());
+        let Some(display_name) = display_name else {
+            continue;
+        };
+
+        let mut best_match: Option<(GroupMemberMatchKind, String)> = None;
+        for alias in [card.as_deref(), nickname.as_deref()].into_iter().flatten() {
+            let normalized_alias = normalize_group_member_name(alias);
+            let Some(match_kind) = group_member_match_kind(&normalized_alias, &query) else {
+                continue;
+            };
+            if best_match
+                .as_ref()
+                .is_none_or(|(current_kind, _)| match_kind < *current_kind)
+            {
+                best_match = Some((match_kind, alias.to_string()));
+            }
+        }
+        let Some((match_kind, matched_name)) = best_match else {
+            continue;
+        };
+        if candidates
+            .iter()
+            .any(|candidate: &GroupMemberCandidate| candidate.user_id == user_id)
+        {
+            continue;
+        }
+        candidates.push(GroupMemberCandidate {
+            user_id,
+            display_name,
+            nickname,
+            card,
+            matched_name,
+            match_kind,
+        });
+    }
+
+    let best_kind = candidates
+        .iter()
+        .map(|candidate| candidate.match_kind)
+        .min();
+    if let Some(best_kind) = best_kind {
+        candidates.retain(|candidate| candidate.match_kind == best_kind);
+    }
+    candidates.sort_by(|left, right| {
+        left.display_name
+            .cmp(&right.display_name)
+            .then(left.user_id.cmp(&right.user_id))
+    });
+    candidates
+}
+
+fn group_member_match_kind(alias: &str, query: &str) -> Option<GroupMemberMatchKind> {
+    if alias == query {
+        Some(GroupMemberMatchKind::Exact)
+    } else if query.chars().count() < 2 {
+        None
+    } else if alias.starts_with(query) {
+        Some(GroupMemberMatchKind::Prefix)
+    } else if alias.contains(query) {
+        Some(GroupMemberMatchKind::Contains)
+    } else {
+        None
+    }
+}
+
+fn normalize_group_member_name(value: &str) -> String {
+    value
+        .trim()
+        .trim_matches(|character: char| {
+            matches!(
+                character,
+                '@' | '＠' | '"' | '\'' | '“' | '”' | '「' | '」' | '『' | '』'
+            )
+        })
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn clean_group_member_label(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(MAX_GROUP_MEMBER_QUERY_CHARS)
+        .collect()
+}
+
+fn value_i64(value: Option<&Value>) -> Option<i64> {
+    value.and_then(|value| {
+        value
+            .as_i64()
+            .or_else(|| value.as_str().and_then(|text| text.parse::<i64>().ok()))
+    })
 }
 
 async fn teach_sticker_memory(
@@ -2345,9 +2678,9 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        BuiltinTool, MessageDestination, ToolSource, calculate, current_time, format_bing_results,
-        format_duckduckgo_results, normalize_duckduckgo_url, tool_name_looks_destructive,
-        validate_public_url,
+        BuiltinTool, GroupMemberMatchKind, MessageDestination, ToolSource, calculate, current_time,
+        format_bing_results, format_duckduckgo_results, normalize_duckduckgo_url,
+        search_group_member_candidates, tool_name_looks_destructive, validate_public_url,
     };
     use serde_json::{Map, Value, json};
 
@@ -2474,6 +2807,73 @@ mod tests {
         assert!(
             !ToolSource::Builtin(BuiltinTool::GroupResume).available_for_context(private, true)
         );
+        assert!(
+            ToolSource::Builtin(BuiltinTool::GroupMemberSearch).available_for_context(group, false)
+        );
+        assert!(
+            !ToolSource::Builtin(BuiltinTool::GroupMemberSearch)
+                .available_for_context(private, false)
+        );
+        assert!(!ToolSource::Builtin(BuiltinTool::GroupMemberSearch).available_for_scheduled());
+    }
+
+    #[test]
+    fn group_member_search_prefers_exact_names_and_deduplicates_aliases() {
+        let members = json!([
+            {"user_id": 11, "nickname": "南竹吖", "card": ""},
+            {"user_id": 22, "nickname": "南竹", "card": "南竹的群名片"},
+            {"user_id": 33, "nickname": "南竹子", "card": ""}
+        ]);
+
+        let exact = search_group_member_candidates(&members, "南竹");
+        assert_eq!(exact.len(), 1);
+        assert_eq!(exact[0].user_id, 22);
+        assert_eq!(exact[0].match_kind, GroupMemberMatchKind::Exact);
+        assert_eq!(exact[0].matched_name, "南竹");
+        assert_eq!(exact[0].card.as_deref(), Some("南竹的群名片"));
+
+        let prefix = search_group_member_candidates(&members, "南竹吖");
+        assert_eq!(prefix.len(), 1);
+        assert_eq!(prefix[0].user_id, 11);
+        assert_eq!(prefix[0].match_kind, GroupMemberMatchKind::Exact);
+    }
+
+    #[test]
+    fn group_member_search_returns_ambiguous_prefix_candidates_without_guessing() {
+        let members = json!([
+            {"user_id": 11, "nickname": "南竹吖", "card": ""},
+            {"user_id": 22, "nickname": "南竹子", "card": ""},
+            {"user_id": 33, "nickname": "北竹", "card": ""}
+        ]);
+
+        let candidates = search_group_member_candidates(&members, "南竹");
+        assert_eq!(candidates.len(), 2);
+        assert!(
+            candidates
+                .iter()
+                .all(|candidate| candidate.match_kind == GroupMemberMatchKind::Prefix)
+        );
+        assert!(candidates.iter().all(|candidate| candidate.user_id != 33));
+    }
+
+    #[test]
+    fn group_member_search_normalizes_at_signs_and_case() {
+        let members = json!([
+            {"user_id": 11, "nickname": "Alice", "card": ""}
+        ]);
+
+        let candidates = search_group_member_candidates(&members, "＠alice");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].user_id, 11);
+    }
+
+    #[test]
+    fn group_member_search_does_not_fuzzy_match_a_single_character() {
+        let members = json!([
+            {"user_id": 11, "nickname": "南竹吖", "card": ""}
+        ]);
+
+        assert!(search_group_member_candidates(&members, "南").is_empty());
     }
 
     #[test]

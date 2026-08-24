@@ -19,7 +19,7 @@ use super::recall::{
     RecentBotMessage, begin_reply, finish_reply, record_bot_message, send_tracked_group_message,
     send_tracked_private_message,
 };
-use super::reply::attach_reply_protocol_context;
+use super::reply::{attach_reply_protocol_context, clear_mention_context};
 use super::thinking::{ThinkingDestination, ThinkingReporter, strip_thinking_notices};
 use super::tool_access::{StickerTeachingContext, ToolExecutionContext};
 use crate::config;
@@ -1676,6 +1676,8 @@ async fn process_group_reply_inner(
     already_claimed: bool,
 ) -> bool {
     let scope = super::interrupt::ReplyScope::Group(group_id);
+    // 每个群聊模型回合从干净的昵称候选开始，避免上一轮的临时 @ 引用污染本轮判断。
+    clear_mention_context(scope).await;
     if message.trim() == "#禁言" {
         set_group_paused(group_id, true).await;
         send_tracked_group_message(&bot, group_id, "禁言成功").await;
