@@ -193,6 +193,17 @@ pub struct ActionFailedEvent {
     pub error_category: String,
 }
 
+/// A proposed action that was refused before a host attempted a side effect.
+///
+/// Rejections are events as well as return values so callers can feed the
+/// decision back into the same bounded runtime without pretending delivery
+/// failed at the platform layer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActionRejectedEvent {
+    pub idempotency_key: String,
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum WorldEventKind {
@@ -206,6 +217,7 @@ pub enum WorldEventKind {
     ProspectiveMemoryDue(ProspectiveMemoryEvent),
     ActionSucceeded(ActionSucceededEvent),
     ActionFailed(ActionFailedEvent),
+    ActionRejected(ActionRejectedEvent),
     IdleTick,
     MaintenanceTick,
     HostStarted,
@@ -226,6 +238,7 @@ impl WorldEventKind {
             Self::ProspectiveMemoryDue(_) => EventType::ProspectiveMemoryDue,
             Self::ActionSucceeded(_) => EventType::ActionSucceeded,
             Self::ActionFailed(_) => EventType::ActionFailed,
+            Self::ActionRejected(_) => EventType::ActionRejected,
             Self::IdleTick => EventType::IdleTick,
             Self::MaintenanceTick => EventType::MaintenanceTick,
             Self::HostStarted => EventType::HostStarted,
@@ -247,6 +260,7 @@ pub enum EventType {
     ProspectiveMemoryDue,
     ActionSucceeded,
     ActionFailed,
+    ActionRejected,
     IdleTick,
     MaintenanceTick,
     HostStarted,
@@ -473,6 +487,18 @@ impl WorldEvent {
                 check_payload_size(
                     "error_category",
                     action.error_category.len(),
+                    MAX_ERROR_CATEGORY_BYTES,
+                )
+            }
+            WorldEventKind::ActionRejected(action) => {
+                check_payload_size(
+                    "idempotency_key",
+                    action.idempotency_key.len(),
+                    MAX_IDEMPOTENCY_KEY_BYTES,
+                )?;
+                check_payload_size(
+                    "action_rejection_reason",
+                    action.reason.len(),
                     MAX_ERROR_CATEGORY_BYTES,
                 )
             }

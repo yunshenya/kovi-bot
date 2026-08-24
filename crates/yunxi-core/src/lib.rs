@@ -4,9 +4,13 @@
 //! translate environment-specific events into these types and own all concrete
 //! side effects and infrastructure.
 
+pub mod action;
+pub mod arbiter;
 pub mod attention;
+pub mod delivery;
 pub mod event;
 pub mod identity;
+pub mod intent;
 pub mod memory;
 pub mod open_loop;
 pub mod ports;
@@ -14,10 +18,23 @@ pub mod proactive;
 pub mod runtime;
 pub mod working_state;
 
+pub use action::{
+    ActionId, ActionMetadata, ActionScope, ActionValidationError, MAX_ACTION_IDEMPOTENCY_KEY_BYTES,
+    MAX_ACTION_IDEMPOTENCY_KEY_CHARS, ProposedAction, ReachOutAction, SendMessageAction,
+};
+pub use arbiter::{
+    ActionArbiter, ActionArbiterConfig, ActionCapability, ActionDescriptor, ActionPort,
+    ActionPortError, ActionPortFuture, ActionPortOutcome, ActionReceipt, ActionRejection,
+    ActionResult, AuthorizationPolicy, EnvironmentCapabilities, MAX_RATE_LIMIT_WINDOW_ENTRIES,
+    MAX_TRACKED_ACTION_KEYS, MAX_TRACKED_ACTION_SCOPES, RateLimit, StaleReason,
+};
 pub use attention::{AttentionDisposition, AttentionReason, AttentionResult, AttentionSystem};
+pub use delivery::{
+    DeliveryResolutionError, DeliveryResolver, DeliveryResolverFuture, DeliveryRoute,
+};
 pub use event::{
-    ActionFailedEvent, ActionSucceededEvent, EventPriority, EventScope, EventType,
-    EventValidationError, GoalCompletedEvent, GoalUpdatedEvent, MessageContent,
+    ActionFailedEvent, ActionRejectedEvent, ActionSucceededEvent, EventPriority, EventScope,
+    EventType, EventValidationError, GoalCompletedEvent, GoalUpdatedEvent, MessageContent,
     MessageReceivedEvent, MessageSentEvent, ProspectiveMemoryEvent, ReminderDueEvent,
     ToolCompletedEvent, ToolFailedEvent, TraceContext, TraceError, WorldEvent, WorldEventKind,
 };
@@ -26,6 +43,7 @@ pub use identity::{
     ExternalReferenceError, GoalId, MAX_EXTERNAL_ID_BYTES, MAX_PLATFORM_ID_BYTES, MemoryId,
     MessageId, OpenLoopId, PersonId, PlatformId,
 };
+pub use intent::{CognitiveIntent, IntentValidationError};
 pub use memory::{
     MAX_MEMORY_CONTENT_BYTES, MAX_MEMORY_CONTENT_CHARS, MAX_MEMORY_QUERY_BYTES,
     MAX_MEMORY_TAG_BYTES, MAX_MEMORY_TAGS, Memory, MemoryDraft, MemoryKind, MemoryQuery,
