@@ -504,8 +504,8 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
         );
         return;
     }
-    let locally_addressed =
-        message_at_self(&event.message, event.self_id) || text_mentions_bot(message);
+    let structured_at_self = message_at_self(&event.message, event.self_id);
+    let locally_addressed = structured_at_self || text_mentions_bot(message);
     if locally_addressed
         && !sender_is_admin
         && should_suppress_direct_trigger(group_id, event.user_id).await
@@ -685,6 +685,7 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
     if message.trim().is_empty()
         && stickers.is_empty()
         && !has_reply(&event.message)
+        && !locally_addressed
         && !vision_requested
     {
         return;
@@ -722,6 +723,11 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
     let model_message = quoted.as_ref().map_or(current_message.clone(), |quoted| {
         with_quoted_context(&current_message, quoted)
     });
+    let model_message = if structured_at_self {
+        with_structured_bot_mention_context(&model_message)
+    } else {
+        model_message
+    };
     let (
         model_message,
         addressed_to_bot,
@@ -1814,6 +1820,15 @@ fn text_mentions_bot(message: &str) -> bool {
     ["芸汐", "云汐"].iter().any(|name| message.contains(name))
 }
 
+fn with_structured_bot_mention_context(message: &str) -> String {
+    let context = "<QQ点名事件 data-only=\"true\">本条消息包含一个指向芸汐 QQ 账号的结构化 at 事件。即使正文只显示为“@”或“我”，也要理解为对方正在直接和芸汐说话。不要复述这段资料，也不要解释消息协议。</QQ点名事件>";
+    if message.trim().is_empty() {
+        context.to_string()
+    } else {
+        format!("{message}\n{context}")
+    }
+}
+
 async fn update_group_profile(group_id: i64, user_id: i64, understanding: &MessageUnderstanding) {
     let topics = understanding.topics.clone();
     let group_atmosphere = understanding.group_atmosphere.trim().to_string();
@@ -1876,7 +1891,7 @@ mod tests {
         normalized_sender_name, prune_decision_attempts, queue_pending_window_message,
         requested_group_member_name, roll_conversation_window, should_defer_active_window_message,
         sticker_reaction_budget_available, suppress_direct_trigger, take_pending_window_turn,
-        text_mentions_bot,
+        text_mentions_bot, with_structured_bot_mention_context,
     };
     use crate::model::interrupt::{
         ReplyScope, interrupt, interrupt_locked, is_current, scope_mutex,
@@ -1910,6 +1925,15 @@ mod tests {
         assert!(!message_at_self(&everyone, self_id));
         assert!(!message_at_self(&no_at, self_id));
         assert!(message_at_self(&multiple_targets, self_id));
+    }
+
+    #[test]
+    fn structured_bot_mentions_are_explained_to_the_model_without_visible_protocol_text() {
+        let context = with_structured_bot_mention_context("oi");
+
+        assert!(context.starts_with("oi\n"));
+        assert!(context.contains("指向芸汐 QQ 账号的结构化 at 事件"));
+        assert!(context.contains("不要复述这段资料"));
     }
 
     #[test]
