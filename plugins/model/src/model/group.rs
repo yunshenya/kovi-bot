@@ -9,7 +9,10 @@ use crate::model::recall::{
     clear_reply_scope_locked, has_recalled_messages, is_recent_bot_message,
     recent_bot_message_for_reaction, send_tracked_group_message,
 };
-use crate::model::reply::{clear_reply_targets, record_reply_target};
+use crate::model::reply::{
+    MentionResolution, clear_mention_context, clear_reply_targets, record_mention_resolution,
+    record_reply_target, register_mention_target,
+};
 use crate::model::semantic::{MessageUnderstanding, UnderstandingRequest, understand};
 use crate::model::traffic::{InboundScope, bounded_input, should_suppress};
 use crate::model::utils::{
@@ -38,6 +41,7 @@ use kovi::serde_json::json;
 use kovi::tokio::sync::Mutex;
 use kovi::{Message, RuntimeBot};
 use rand::Rng;
+use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
@@ -133,6 +137,174 @@ fn normalized_sender_name(value: Option<&str>) -> Option<String> {
         .take(80)
         .collect::<String>();
     (!normalized.is_empty()).then_some(normalized)
+}
+
+fn requested_group_member_name(message: &str) -> Option<String> {
+    const MARKERS: [&str; 3] = ["名字叫", "昵称是", "名叫"];
+    let (_, marker) = MARKERS
+        .iter()
+        .filter_map(|marker| message.find(marker).map(|index| (index, *marker)))
+        .min_by_key(|(index, _)| *index)?;
+    let start = message.find(marker)? + marker.len();
+    let candidate = message[start..].trim_start_matches(|character: char| {
+        matches!(
+            character,
+            ':' | '：' | ' ' | '\t' | '"' | '\'' | '“' | '”' | '「' | '」' | '『' | '』'
+        )
+    });
+    let end = candidate
+        .find(|character: char| {
+            matches!(
+                character,
+                '的' | '，'
+                    | ','
+                    | '。'
+                    | '.'
+                    | '！'
+                    | '!'
+                    | '？'
+                    | '?'
+                    | '\n'
+                    | '\r'
+                    | ' '
+                    | '\t'
+                    | '"'
+                    | '\''
+                    | '“'
+                    | '”'
+                    | '」'
+                    | '』'
+            )
+        })
+        .unwrap_or(candidate.len());
+    let name = normalize_mention_name(&candidate[..end]);
+    (1..=80).contains(&name.chars().count()).then_some(name)
+}
+
+fn normalize_mention_name(value: &str) -> String {
+    value
+        .trim()
+        .trim_matches(|character: char| {
+            matches!(
+                character,
+                '"' | '\'' | '“' | '”' | '「' | '」' | '『' | '』'
+            )
+        })
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn json_i64(value: Option<&Value>) -> Option<i64> {
+    value.and_then(|value| {
+        value
+            .as_i64()
+            .or_else(|| value.as_str().and_then(|text| text.parse::<i64>().ok()))
+    })
+}
+
+fn exact_group_member_matches(data: &Value, requested_name: &str) -> Vec<(i64, String)> {
+    let Some(members) = data.as_array() else {
+        return Vec::new();
+    };
+    let requested_name = normalize_mention_name(requested_name);
+    let mut matches = Vec::new();
+    for member in members {
+        let Some(user_id) = json_i64(member.get("user_id")) else {
+            continue;
+        };
+        let nickname = member.get("nickname").and_then(Value::as_str);
+        let card = member.get("card").and_then(Value::as_str);
+        let matched_name = [card, nickname]
+            .into_iter()
+            .flatten()
+            .map(normalize_mention_name)
+            .find(|name| !name.is_empty() && *name == requested_name);
+        if let Some(matched_name) = matched_name
+            && !matches
+                .iter()
+                .any(|(candidate_id, _)| *candidate_id == user_id)
+        {
+            matches.push((user_id, matched_name));
+        }
+    }
+    matches
+}
+
+async fn resolve_group_member_mention(
+    bot: &RuntimeBot,
+    group_id: i64,
+    scope: ReplyScope,
+    requested_name: &str,
+) {
+    let member_data = match bot.get_group_member_list(group_id).await {
+        Ok(response) if response.status == "ok" && response.data.is_array() => response.data,
+        Ok(response) => {
+            eprintln!(
+                "[WARN] 群成员昵称解析返回无效数据 (群组: {}, 名称: {}, 状态: {}, 数据类型: {})",
+                group_id,
+                requested_name,
+                response.status,
+                if response.data.is_array() {
+                    "array"
+                } else {
+                    "non-array"
+                }
+            );
+            record_mention_resolution(scope, requested_name, MentionResolution::LookupFailed).await;
+            return;
+        }
+        Err(error) => {
+            eprintln!(
+                "[WARN] 群成员昵称解析失败，无法读取成员列表 (群组: {}, 名称: {}, 错误: {:?})",
+                group_id, requested_name, error
+            );
+            record_mention_resolution(scope, requested_name, MentionResolution::LookupFailed).await;
+            return;
+        }
+    };
+    let matches = exact_group_member_matches(&member_data, requested_name);
+    match matches.as_slice() {
+        [(user_id, matched_name)] => {
+            let at_user_ref = register_mention_target(scope, *user_id, matched_name).await;
+            record_mention_resolution(
+                scope,
+                requested_name,
+                MentionResolution::Unique {
+                    at_user_ref,
+                    matched_name: matched_name.clone(),
+                },
+            )
+            .await;
+            println!(
+                "[INFO] 群成员昵称已唯一匹配 (群组: {}, 名称: {}, at_ref: {})",
+                group_id, matched_name, at_user_ref
+            );
+        }
+        [] => {
+            record_mention_resolution(scope, requested_name, MentionResolution::NotFound).await;
+            println!(
+                "[INFO] 群成员昵称没有精确匹配 (群组: {}, 名称: {})",
+                group_id, requested_name
+            );
+        }
+        matches => {
+            record_mention_resolution(
+                scope,
+                requested_name,
+                MentionResolution::Ambiguous {
+                    match_count: matches.len(),
+                },
+            )
+            .await;
+            println!(
+                "[WARN] 群成员昵称匹配到多个成员，禁止盲目 @ (群组: {}, 名称: {}, 数量: {})",
+                group_id,
+                requested_name,
+                matches.len()
+            );
+        }
+    }
 }
 
 fn looks_like_immediate_stop_request(message: &str) -> bool {
@@ -352,6 +524,10 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
         &event.human_text,
     )
     .await;
+    if locally_addressed && let Some(requested_name) = requested_group_member_name(message) {
+        clear_mention_context(reply_scope).await;
+        resolve_group_member_mention(&bot, group_id, reply_scope, &requested_name).await;
+    }
     if let Some(label) = teaching_label(message) {
         match stickers_for_teaching(&event.message, &bot, sticker_scope).await {
             Ok(teaching_stickers) if !teaching_stickers.is_empty() => {
@@ -1695,11 +1871,12 @@ mod tests {
     use super::{
         Addressing, DirectTriggerState, GroupInterjectionState, GroupSenderIdentity,
         PENDING_WINDOW_MESSAGES, complete_interjection_attempt, conversation_message_is_relevant,
-        decision_budget_available, has_active_conversation_window, is_natural_short_follow_up,
-        looks_like_immediate_stop_request, message_at_self, normalized_sender_name,
-        prune_decision_attempts, queue_pending_window_message, roll_conversation_window,
-        should_defer_active_window_message, sticker_reaction_budget_available,
-        suppress_direct_trigger, take_pending_window_turn, text_mentions_bot,
+        decision_budget_available, exact_group_member_matches, has_active_conversation_window,
+        is_natural_short_follow_up, looks_like_immediate_stop_request, message_at_self,
+        normalized_sender_name, prune_decision_attempts, queue_pending_window_message,
+        requested_group_member_name, roll_conversation_window, should_defer_active_window_message,
+        sticker_reaction_budget_available, suppress_direct_trigger, take_pending_window_turn,
+        text_mentions_bot,
     };
     use crate::model::interrupt::{
         ReplyScope, interrupt, interrupt_locked, is_current, scope_mutex,
@@ -1791,6 +1968,35 @@ mod tests {
             Some("群 名片 测试")
         );
         assert_eq!(normalized_sender_name(Some("   ")), None);
+    }
+
+    #[test]
+    fn nickname_mention_requests_extract_the_requested_name() {
+        assert_eq!(
+            requested_group_member_name("你@一个名字叫南竹的那个人").as_deref(),
+            Some("南竹")
+        );
+        assert_eq!(
+            requested_group_member_name("请@昵称是\"南竹\"的人").as_deref(),
+            Some("南竹")
+        );
+        assert_eq!(requested_group_member_name("你在说谁"), None);
+    }
+
+    #[test]
+    fn exact_member_matching_checks_card_and_nickname_without_guessing() {
+        let members = json!([
+            {"user_id": 11, "nickname": "普通昵称", "card": "南竹"},
+            {"user_id": 22, "nickname": "南竹", "card": ""},
+            {"user_id": 33, "nickname": "南竹", "card": "另一个群名片"},
+            {"user_id": 44, "nickname": "南竹子", "card": ""}
+        ]);
+        let matches = exact_group_member_matches(&members, "南竹");
+        assert_eq!(matches.len(), 3);
+        assert!(matches.iter().any(|(user_id, _)| *user_id == 11));
+        assert!(matches.iter().any(|(user_id, _)| *user_id == 22));
+        assert!(matches.iter().any(|(user_id, _)| *user_id == 33));
+        assert!(exact_group_member_matches(&members, "不存在").is_empty());
     }
 
     #[test]
