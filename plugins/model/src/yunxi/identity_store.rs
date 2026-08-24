@@ -151,6 +151,188 @@ impl PostgresIdentityStore {
                 );
             }
         }
+
+        for (table, column) in [
+            ("yunxi_external_identities", "platform"),
+            ("yunxi_external_identities", "external_id"),
+            ("yunxi_external_conversations", "platform"),
+            ("yunxi_external_conversations", "external_id"),
+        ] {
+            let collation = query_scalar::<Postgres, String>(
+                r#"
+                SELECT collation_name
+                FROM information_schema.columns
+                WHERE table_schema = current_schema()
+                  AND table_name = $1
+                  AND column_name = $2
+                "#,
+            )
+            .bind(table)
+            .bind(column)
+            .fetch_optional(&self.pool)
+            .await?;
+            if collation.as_deref() != Some("C") {
+                anyhow::bail!(
+                    "Yunxi identity schema column {table}.{column} uses collation {:?}, expected C",
+                    collation
+                );
+            }
+        }
+
+        for (table, parent_table, column) in [
+            ("yunxi_external_identities", "yunxi_persons", "person_id"),
+            (
+                "yunxi_external_conversations",
+                "yunxi_conversations",
+                "conversation_id",
+            ),
+        ] {
+            let foreign_key = query_scalar::<Postgres, bool>(
+                r#"
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM pg_constraint AS constraint_row
+                    JOIN pg_class AS child_table
+                      ON child_table.oid = constraint_row.conrelid
+                    JOIN pg_namespace AS child_namespace
+                      ON child_namespace.oid = child_table.relnamespace
+                    JOIN pg_class AS parent_table
+                      ON parent_table.oid = constraint_row.confrelid
+                    JOIN pg_namespace AS parent_namespace
+                      ON parent_namespace.oid = parent_table.relnamespace
+                    JOIN pg_attribute AS child_column
+                      ON child_column.attrelid = constraint_row.conrelid
+                     AND child_column.attname = $3
+                     AND child_column.attnum = constraint_row.conkey[1]
+                    JOIN pg_attribute AS parent_column
+                      ON parent_column.attrelid = constraint_row.confrelid
+                     AND parent_column.attname = 'id'
+                     AND parent_column.attnum = constraint_row.confkey[1]
+                    WHERE child_namespace.nspname = current_schema()
+                      AND parent_namespace.nspname = current_schema()
+                      AND child_table.relname = $1
+                      AND parent_table.relname = $2
+                      AND constraint_row.contype = 'f'
+                      AND constraint_row.confdeltype = 'c'
+                      AND constraint_row.convalidated
+                      AND array_length(constraint_row.conkey, 1) = 1
+                      AND array_length(constraint_row.confkey, 1) = 1
+                )
+                "#,
+            )
+            .bind(table)
+            .bind(parent_table)
+            .bind(column)
+            .fetch_optional(&self.pool)
+            .await?;
+            if foreign_key != Some(true) {
+                anyhow::bail!(
+                    "Yunxi identity schema is missing ON DELETE CASCADE foreign key {table}.{column} -> {parent_table}.id"
+                );
+            }
+        }
+
+        for (table, required_fragments) in [
+            (
+                "yunxi_external_identities",
+                vec!["platform", "[a-z][a-z0-9_-]", "{0,63}"],
+            ),
+            (
+                "yunxi_external_identities",
+                vec!["external_id", "octet_length", "1", "512"],
+            ),
+            (
+                "yunxi_conversations",
+                vec!["kind", "direct", "group", "system"],
+            ),
+            (
+                "yunxi_external_conversations",
+                vec!["platform", "[a-z][a-z0-9_-]", "{0,63}"],
+            ),
+            (
+                "yunxi_external_conversations",
+                vec!["external_id", "octet_length", "1", "512"],
+            ),
+        ] {
+            let definitions = query_scalar::<Postgres, String>(
+                r#"
+                SELECT pg_get_constraintdef(constraint_row.oid)
+                FROM pg_constraint AS constraint_row
+                JOIN pg_class AS table_row
+                  ON table_row.oid = constraint_row.conrelid
+                JOIN pg_namespace AS namespace_row
+                  ON namespace_row.oid = table_row.relnamespace
+                WHERE namespace_row.nspname = current_schema()
+                  AND table_row.relname = $1
+                  AND constraint_row.contype = 'c'
+                  AND constraint_row.convalidated
+                "#,
+            )
+            .bind(table)
+            .fetch_all(&self.pool)
+            .await?;
+            let valid = definitions.iter().any(|definition| {
+                let definition = definition.to_ascii_lowercase();
+                required_fragments
+                    .iter()
+                    .all(|fragment| definition.contains(fragment))
+            });
+            if !valid {
+                anyhow::bail!(
+                    "Yunxi identity schema table {table} is missing a validated CHECK constraint containing {required_fragments:?}"
+                );
+            }
+        }
+
+        for (table, index, column) in [
+            (
+                "yunxi_external_identities",
+                "yunxi_external_identities_person_idx",
+                "person_id",
+            ),
+            (
+                "yunxi_external_conversations",
+                "yunxi_external_conversations_conversation_idx",
+                "conversation_id",
+            ),
+        ] {
+            let exists = query_scalar::<Postgres, bool>(
+                r#"
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM pg_index AS index_row
+                    JOIN pg_class AS table_row
+                      ON table_row.oid = index_row.indrelid
+                    JOIN pg_namespace AS namespace_row
+                      ON namespace_row.oid = table_row.relnamespace
+                    JOIN pg_class AS index_table
+                      ON index_table.oid = index_row.indexrelid
+                    JOIN pg_attribute AS column_row
+                      ON column_row.attrelid = index_row.indrelid
+                     AND column_row.attname = $3
+                    WHERE namespace_row.nspname = current_schema()
+                      AND table_row.relname = $1
+                      AND index_table.relname = $2
+                      AND index_row.indnatts = 1
+                      AND index_row.indnkeyatts = 1
+                      AND column_row.attnum = ANY(index_row.indkey)
+                      AND index_row.indpred IS NULL
+                      AND index_row.indexprs IS NULL
+                      AND index_row.indisvalid
+                      AND index_row.indisready
+                      AND NOT index_row.indisunique
+                )
+                "#,
+            )
+            .bind(table)
+            .bind(index)
+            .bind(column)
+            .fetch_one(&self.pool)
+            .await?;
+            if !exists {
+                anyhow::bail!("Yunxi identity schema is missing index {index}");
+            }
+        }
         Ok(())
     }
 
