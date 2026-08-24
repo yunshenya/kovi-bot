@@ -81,7 +81,7 @@ static PRIVATE_HISTORY_ACCESS: LazyLock<Mutex<HashMap<i64, Instant>>> =
 const MAX_RUNTIME_CONVERSATIONS: usize = 512;
 const MAX_STREAM_ENVELOPE_BYTES: usize = 16 * 1024 * 1024;
 const EMPTY_REPLY_ALERT_WINDOW: Duration = Duration::from_secs(10 * 60);
-const EMPTY_REPLY_REPAIR_PROMPT: &str = "上一轮没有形成可发送的回复。现在只做一次回复协议修复：重新结合当前用户消息判断本轮意图，需要文字回应时输出自然聊天正文；如果用户只要求发送结构化 @，可以只输出包含有效 at_user_ids 的完整 [[REPLY_ACTION]]，不要为了凑正文添加无关套话；如果需要引用、@某人或撤回消息，必须使用动作候选中的临时引用，不要只把动作写成正文里的普通文字。自然语言中的“@我”要使用动作候选中 is_current_sender=true 的 at_user_ref，并放入 at_user_ids。不要输出工具调用、解释、分析、代码块或协议之外的 JSON；若确实不应回应，只输出完整的 [[REPLY_ACTION]]{\"disposition\":\"silent\"}[[/REPLY_ACTION]]。不要编造工具结果，也不要把本次修复当成新的用户消息。";
+const EMPTY_REPLY_REPAIR_PROMPT: &str = "上一轮没有形成可发送的回复。现在只做一次回复协议修复：重新结合当前用户消息判断本轮意图，需要文字回应时输出自然聊天正文；如果用户只要求发送结构化 @，可以只输出完整动作，不要为了凑正文添加无关套话。自然语言中的“@我”“艾特我”“提及我”必须输出 [[REPLY_ACTION]]{\"disposition\":\"reply\",\"at_current_sender\":true}[[/REPLY_ACTION]]，程序会绑定本轮真实发送者，不要调用成员搜索，也不要填写真实 QQ 号。@其他人时才使用动作候选中的 at_user_ref 并放入 at_user_ids。如果需要引用或撤回消息，也必须使用动作候选中的临时引用，不要只把动作写成正文里的普通文字。不要输出工具调用、解释、分析、代码块或协议之外的 JSON；若确实不应回应，只输出完整的 [[REPLY_ACTION]]{\"disposition\":\"silent\"}[[/REPLY_ACTION]]。不要编造工具结果，也不要把本次修复当成新的用户消息。";
 
 struct EmptyReplyIncident {
     last_seen: Instant,
@@ -448,7 +448,9 @@ pub async fn control_model(
         return false;
     }
     let reply_scope = super::interrupt::ReplyScope::Group(group_id);
-    let mut plan = ReplyPlan::from_model_output(reply_scope, &response.content).await;
+    let mut plan =
+        ReplyPlan::from_model_output_for_sender(reply_scope, &response.content, Some(user_id))
+            .await;
     if !is_current(reply_ticket).await {
         limit_memory_size(&mut messages);
         return false;
@@ -481,9 +483,11 @@ pub async fn control_model(
         return false;
     }
     if should_repair_empty_reply(&plan, reply_expected, &understanding) {
+        log_unusable_reply_protocol(reply_scope, "首次回复", &response.content);
         match repair_empty_reply(
             &request_messages,
             reply_scope,
+            Some(user_id),
             max_output_tokens,
             &vision_images,
             reply_ticket,
@@ -606,6 +610,7 @@ fn should_repair_empty_reply(
 async fn repair_empty_reply(
     request_messages: &[BotMemory],
     scope: super::interrupt::ReplyScope,
+    current_sender_user_id: Option<i64>,
     max_output_tokens: Option<u32>,
     vision_images: &[VisionImage],
     reply_ticket: ReplyTicket,
@@ -628,10 +633,42 @@ async fn repair_empty_reply(
         || response.content.contains("[[TOOL_CALL]]")
         || response.content.contains("[[/TOOL_CALL]]")
     {
+        log_unusable_reply_protocol(scope, "协议修复", &response.content);
         return None;
     }
-    let plan = ReplyPlan::from_model_output(scope, &response.content).await;
-    (plan.has_visible_reply() || plan.is_silent()).then_some(plan)
+    let plan =
+        ReplyPlan::from_model_output_for_sender(scope, &response.content, current_sender_user_id)
+            .await;
+    if plan.has_visible_reply() || plan.is_silent() {
+        Some(plan)
+    } else {
+        log_unusable_reply_protocol(scope, "协议修复", &response.content);
+        None
+    }
+}
+
+fn log_unusable_reply_protocol(scope: super::interrupt::ReplyScope, phase: &str, content: &str) {
+    let scope_label = match scope {
+        super::interrupt::ReplyScope::Group(group_id) => format!("群聊 {group_id}"),
+        super::interrupt::ReplyScope::Private(user_id) => format!("私聊 {user_id}"),
+        super::interrupt::ReplyScope::Scheduled(task_id) => format!("定时任务 {task_id}"),
+    };
+    let compact = content.replace(['\r', '\n'], " ");
+    let preview = if compact.trim().is_empty() {
+        "（空）".to_string()
+    } else {
+        truncate_chars(compact.trim(), 320)
+    };
+    println!(
+        "[WARN] 回复协议未形成可执行计划 (场景: {}, 阶段: {}, 字符数: {}, 动作开始标记: {}, 动作结束标记: {}, 当前发送者字段: {}, 预览: {:?})",
+        scope_label,
+        phase,
+        content.chars().count(),
+        content.matches("[[REPLY_ACTION]]").count(),
+        content.matches("[[/REPLY_ACTION]]").count(),
+        content.contains("at_current_sender"),
+        preview
+    );
 }
 
 async fn report_empty_reply_incident(bot: &RuntimeBot, context: &str, message: &str) {
@@ -2067,9 +2104,11 @@ async fn private_chat_inner(
         return;
     }
     if should_repair_empty_reply(&plan, true, understanding) {
+        log_unusable_reply_protocol(reply_scope, "首次回复", &bot_content.content);
         match repair_empty_reply(
             &request_messages,
             reply_scope,
+            None,
             None,
             vision_images,
             reply_ticket,
@@ -2459,7 +2498,7 @@ mod tests {
     fn empty_reply_repair_prompt_stays_internal_and_plain() {
         assert!(EMPTY_REPLY_REPAIR_PROMPT.contains("自然聊天正文"));
         assert!(EMPTY_REPLY_REPAIR_PROMPT.contains("不要输出工具调用"));
-        assert!(EMPTY_REPLY_REPAIR_PROMPT.contains("is_current_sender=true"));
+        assert!(EMPTY_REPLY_REPAIR_PROMPT.contains("at_current_sender"));
         assert!(EMPTY_REPLY_REPAIR_PROMPT.contains("at_user_ids"));
         assert!(EMPTY_REPLY_REPAIR_PROMPT.contains("只要求发送结构化 @"));
         assert!(!EMPTY_REPLY_REPAIR_PROMPT.contains("**"));

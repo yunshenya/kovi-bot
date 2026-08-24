@@ -37,19 +37,19 @@ const REPLY_PROTOCOL_INSTRUCTIONS: &str = concat!(
     "{\"disposition\":\"reply\",\"messages\":[\"第一条\",\"第二条\"],",
     "\"requests_image\":false,",
     "\"quote_message_id\":123,",
-    "\"at_user_ids\":[456],\"recall_message_ids\":[789]}",
+    "\"at_current_sender\":true,\"at_user_ids\":[456],\"recall_message_ids\":[789]}",
     "[[/REPLY_ACTION]]。disposition 只允许 reply 或 silent；字段都可选，默认为 reply；",
     "动作标记放在正文之外且不会展示给用户，示例 ID 必须替换为本轮动作候选中真实存在的候选 ID；",
     "at_user_ids 使用候选中的 at_user_ref，它是本轮临时引用，不是用户真实账号。\n",
-    "自然语言中的“@我”“艾特我”“提及我”指向动作候选里 is_current_sender=true 的当前消息发送者；",
-    "此时必须把该候选的 at_user_ref 放进 at_user_ids，不能只在正文中写@，也不能填写真实 QQ 号。",
-    "例如当前候选 at_user_ref=1000001 时，应使用动作字段 \"at_user_ids\":[1000001]。\n",
+    "自然语言中的“@我”“艾特我”“提及我”指向本轮当前消息发送者；",
+    "此时使用动作字段 \"at_current_sender\":true，程序会绑定本轮真实发送者；",
+    "不要调用成员搜索，不要只在正文中写@，也不要填写真实 QQ 号。\n",
     "如果用户要求按名字、昵称、简称或群名片 @ 其他群成员，而动作候选中没有现成的唯一目标，先调用 group.members.search；query 只填写要找的名字。",
     "工具返回 unique 时才使用其中的 at_user_ref；返回 ambiguous、not_found 或 lookup_failed 时不要猜测，也不要把普通文字当成 @。\n",
     "如果本轮明确要求按昵称 @，且解析结果为 unique，必须把对应 at_user_ref 放入 at_user_ids；",
     "如果解析结果为 ambiguous、not_found 或 lookup_failed，不要猜测或输出假的 @，自然说明需要更明确的群名片或引用消息。\n",
     "disposition=reply 时可以正常输出正文，也可以只发送结构化 @ 或只执行撤回而不发正文；",
-    "只发送结构化 @ 时不要为了凑正文添加无关套话，至少填写一个有效的 at_user_ids；",
+    "只发送结构化 @ 时不要为了凑正文添加无关套话，至少填写 at_current_sender=true 或一个有效的 at_user_ids；",
     "disposition=silent 时任何正文都会被丢弃，但仍可同时执行撤回。",
     "引用只能使用收到的消息候选；@ 只能使用收到的消息候选或可按昵称 @ 的成员候选；撤回只能使用自己发送的消息候选。\n",
     "如果可见回复明确请对方发送、补发或上传图片，必须填写 requests_image=true；",
@@ -100,6 +100,7 @@ struct MentionRequest {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ReplyAction {
     pub(crate) quote_message_id: Option<i32>,
+    pub(crate) at_current_sender: bool,
     pub(crate) at_user_ids: Vec<i64>,
     pub(crate) recall_message_ids: Vec<i32>,
 }
@@ -379,7 +380,11 @@ pub(crate) async fn attach_reply_protocol_context(
     });
 }
 
-pub(crate) async fn sanitize_reply_action(scope: ReplyScope, action: ReplyAction) -> ReplyAction {
+pub(crate) async fn sanitize_reply_action_for_sender(
+    scope: ReplyScope,
+    action: ReplyAction,
+    current_sender_user_id: Option<i64>,
+) -> ReplyAction {
     let recall_message_ids = normalize_recall_message_ids(action.recall_message_ids);
     let targets = REPLY_TARGETS.lock().await;
     let mention_targets = REPLY_MENTION_TARGETS.lock().await;
@@ -394,6 +399,12 @@ pub(crate) async fn sanitize_reply_action(scope: ReplyScope, action: ReplyAction
         })
     });
     let mut at_user_ids = Vec::new();
+    if action.at_current_sender
+        && matches!(scope, ReplyScope::Group(_))
+        && let Some(user_id) = current_sender_user_id.filter(|user_id| *user_id > 0)
+    {
+        at_user_ids.push(user_id);
+    }
     for at_user_ref in action.at_user_ids {
         let user_id = entries
             .and_then(|entries| {
@@ -422,6 +433,7 @@ pub(crate) async fn sanitize_reply_action(scope: ReplyScope, action: ReplyAction
     }
     ReplyAction {
         quote_message_id,
+        at_current_sender: false,
         at_user_ids,
         recall_message_ids,
     }
@@ -587,6 +599,7 @@ fn parse_protocol_json(raw: &str) -> Option<ParsedReplyProtocol> {
         "requests_image",
         "quote_message_id",
         "reply_to_message_id",
+        "at_current_sender",
         "at_user_ids",
         "mention_user_ids",
         "recall_message_ids",
@@ -610,6 +623,11 @@ fn parse_protocol_json(raw: &str) -> Option<ParsedReplyProtocol> {
         None => false,
     };
     let quote_message_id = parse_optional_i32(object, "quote_message_id", "reply_to_message_id")?;
+    let at_current_sender = match object.get("at_current_sender") {
+        Some(Value::Bool(value)) => *value,
+        Some(_) => return None,
+        None => false,
+    };
     let at_user_ids = parse_optional_i64_list(object, "at_user_ids", "mention_user_ids")?;
     let recall_message_ids =
         parse_optional_i32_list(object, "recall_message_ids", "delete_message_ids")?;
@@ -619,6 +637,7 @@ fn parse_protocol_json(raw: &str) -> Option<ParsedReplyProtocol> {
         requests_image,
         action: ReplyAction {
             quote_message_id,
+            at_current_sender,
             at_user_ids,
             recall_message_ids,
         },
@@ -740,7 +759,7 @@ mod tests {
         MentionResolution, REPLY_PROTOCOL_INSTRUCTIONS, ReplyAction, attach_reply_protocol_context,
         build_outbound_message, clear_reply_targets, parse_reply_output, record_mention_resolution,
         record_reply_target, register_mention_target, reply_action_candidates_context,
-        sanitize_reply_action,
+        sanitize_reply_action_for_sender,
     };
     use crate::model::interrupt::ReplyScope;
     use crate::model::reply_disposition::ReplyDisposition;
@@ -758,10 +777,21 @@ mod tests {
             parsed.action,
             ReplyAction {
                 quote_message_id: Some(12),
+                at_current_sender: false,
                 at_user_ids: vec![34, 56],
                 recall_message_ids: vec![78, 79],
             }
         );
+    }
+
+    #[test]
+    fn parses_current_sender_mention_intent() {
+        let parsed = parse_reply_output(
+            "[[REPLY_ACTION]]{\"disposition\":\"reply\",\"at_current_sender\":true}[[/REPLY_ACTION]]",
+        );
+        assert!(parsed.content.is_empty());
+        assert!(parsed.action.at_current_sender);
+        assert!(parsed.action.at_user_ids.is_empty());
     }
 
     #[test]
@@ -863,6 +893,7 @@ mod tests {
         assert!(!REPLY_PROTOCOL_INSTRUCTIONS.contains("NEXT_MESSAGE"));
         assert!(REPLY_PROTOCOL_INSTRUCTIONS.contains("\"messages\""));
         assert!(REPLY_PROTOCOL_INSTRUCTIONS.contains("\"disposition\":\"silent\""));
+        assert!(REPLY_PROTOCOL_INSTRUCTIONS.contains("\"at_current_sender\":true"));
         assert!(REPLY_PROTOCOL_INSTRUCTIONS.contains("group.members.search"));
         assert!(REPLY_PROTOCOL_INSTRUCTIONS.contains("ambiguous"));
     }
@@ -980,16 +1011,50 @@ mod tests {
                 let at_user_ref = candidate["at_user_ref"]
                     .as_i64()
                     .expect("应包含临时用户引用");
-                let sanitized = sanitize_reply_action(
+                let sanitized = sanitize_reply_action_for_sender(
                     scope,
                     ReplyAction {
                         at_user_ids: vec![at_user_ref],
                         ..ReplyAction::default()
                     },
+                    None,
                 )
                 .await;
                 assert_eq!(sanitized.at_user_ids, vec![actual_user_id]);
                 clear_reply_targets(scope).await;
+            });
+    }
+
+    #[test]
+    fn current_sender_mention_uses_trusted_turn_identity() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let scope = ReplyScope::Group(9_100_009);
+                let actual_user_id = 8_765_432_114_i64;
+                let sanitized = sanitize_reply_action_for_sender(
+                    scope,
+                    ReplyAction {
+                        at_current_sender: true,
+                        ..ReplyAction::default()
+                    },
+                    Some(actual_user_id),
+                )
+                .await;
+
+                assert_eq!(sanitized.at_user_ids, vec![actual_user_id]);
+                assert!(!sanitized.at_current_sender);
+
+                let private = sanitize_reply_action_for_sender(
+                    ReplyScope::Private(9_100_009),
+                    ReplyAction {
+                        at_current_sender: true,
+                        ..ReplyAction::default()
+                    },
+                    Some(actual_user_id),
+                )
+                .await;
+                assert!(private.at_user_ids.is_empty());
             });
     }
 
@@ -1018,12 +1083,13 @@ mod tests {
                 assert!(context.contains("\"status\":\"unique\""));
                 assert!(!context.contains(&actual_user_id.to_string()));
 
-                let sanitized = sanitize_reply_action(
+                let sanitized = sanitize_reply_action_for_sender(
                     scope,
                     ReplyAction {
                         at_user_ids: vec![at_user_ref],
                         ..ReplyAction::default()
                     },
+                    None,
                 )
                 .await;
                 assert_eq!(sanitized.at_user_ids, vec![actual_user_id]);
@@ -1035,6 +1101,7 @@ mod tests {
     fn builds_reply_and_at_segments_only_for_the_first_bubble() {
         let action = ReplyAction {
             quote_message_id: Some(12),
+            at_current_sender: false,
             at_user_ids: vec![34],
             recall_message_ids: vec![56],
         };

@@ -6,7 +6,7 @@ use super::interrupt::{ReplyScope, ReplyTicket, is_current};
 use super::message_transport::MessageTransport;
 use super::recall::{RecentBotMessage, recall_bot_messages, record_bot_message};
 use super::reply::{
-    ReplyAction, build_outbound_message, parse_reply_output, sanitize_reply_action,
+    ReplyAction, build_outbound_message, parse_reply_output, sanitize_reply_action_for_sender,
 };
 use super::reply_disposition::ReplyDisposition;
 use crate::memory::BotPersonality;
@@ -42,8 +42,17 @@ pub(crate) struct ReplyPlan {
 
 impl ReplyPlan {
     pub(crate) async fn from_model_output(scope: ReplyScope, content: &str) -> Self {
+        Self::from_model_output_for_sender(scope, content, None).await
+    }
+
+    pub(crate) async fn from_model_output_for_sender(
+        scope: ReplyScope,
+        content: &str,
+        current_sender_user_id: Option<i64>,
+    ) -> Self {
         let parsed = parse_reply_output(content);
-        let mut action = sanitize_reply_action(scope, parsed.action).await;
+        let mut action =
+            sanitize_reply_action_for_sender(scope, parsed.action, current_sender_user_id).await;
         let has_structured_messages = parsed.messages.is_some();
         let mut bubbles = if parsed.disposition.is_silent() {
             Vec::new()
@@ -400,6 +409,26 @@ mod tests {
                 assert!(plan.content.is_empty());
                 assert_eq!(plan.action.at_user_ids, vec![8_765_432_113]);
                 crate::model::reply::clear_reply_targets(scope).await;
+            });
+    }
+
+    #[test]
+    fn action_only_current_sender_mention_is_a_sendable_reply() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let scope = ReplyScope::Group(9_100_009);
+                let plan = ReplyPlan::from_model_output_for_sender(
+                    scope,
+                    "[[REPLY_ACTION]]{\"at_current_sender\":true}[[/REPLY_ACTION]]",
+                    Some(8_765_432_114),
+                )
+                .await;
+
+                assert!(plan.has_visible_reply());
+                assert_eq!(plan.bubbles, vec![String::new()]);
+                assert!(plan.content.is_empty());
+                assert_eq!(plan.action.at_user_ids, vec![8_765_432_114]);
             });
     }
 }
