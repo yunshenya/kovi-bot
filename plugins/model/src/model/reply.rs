@@ -649,10 +649,30 @@ fn parse_protocol_json(raw: &str) -> Option<ParsedReplyProtocol> {
 }
 
 fn parse_protocol_json_with_recovery(raw: &str) -> Option<ParsedReplyProtocol> {
-    parse_protocol_json(raw).or_else(|| {
-        let completed = complete_truncated_json_object(raw, MAX_REPLY_PROTOCOL_CHARS)?;
-        parse_protocol_json(&completed)
-    })
+    parse_protocol_json(raw)
+        .or_else(|| {
+            let stripped = strip_malformed_action_end(raw)?;
+            parse_protocol_json(&stripped)
+        })
+        .or_else(|| {
+            let completed = complete_truncated_json_object(raw, MAX_REPLY_PROTOCOL_CHARS)?;
+            parse_protocol_json(&completed)
+        })
+        .or_else(|| {
+            let stripped = strip_malformed_action_end(raw)?;
+            let completed = complete_truncated_json_object(&stripped, MAX_REPLY_PROTOCOL_CHARS)?;
+            parse_protocol_json(&completed)
+        })
+}
+
+fn strip_malformed_action_end(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    ["/REPLY_ACTION]]", "/REPLY_ACTION]", "/REPLY_ACTION"]
+        .iter()
+        .find_map(|suffix| trimmed.strip_suffix(suffix))
+        .map(str::trim)
+        .filter(|body| !body.is_empty())
+        .map(ToString::to_string)
 }
 
 /// Some models omit the protocol wrapper and return only the action object.
@@ -888,6 +908,17 @@ mod tests {
             parsed.messages,
             Some(vec!["我刚看了一下，等会儿发你".to_string()])
         );
+    }
+
+    #[test]
+    fn recovers_reply_action_with_a_damaged_closing_marker() {
+        let parsed =
+            parse_reply_output(r#"[[REPLY_ACTION]]{"at_current_sender":true}/REPLY_ACTION]]"#);
+        assert!(parsed.content.is_empty());
+        assert!(parsed.action.at_current_sender);
+
+        let parsed = parse_reply_output(r#"[[REPLY_ACTION]]{"messages":["收到啦"]}/REPLY_ACTION]"#);
+        assert_eq!(parsed.messages, Some(vec!["收到啦".to_string()]));
     }
 
     #[test]
