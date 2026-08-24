@@ -20,6 +20,7 @@ pub enum AttentionReason {
     StopRequested,
     ExplicitRequest,
     ReliableTask,
+    ProspectiveMemory,
     CriticalEvent,
     RelevantEvent,
     BackgroundObservation,
@@ -72,6 +73,11 @@ impl AttentionSystem {
             WorldEventKind::ReminderDue(_) | WorldEventKind::GoalCompleted(_) => {
                 must_handle(AttentionReason::ReliableTask)
             }
+            WorldEventKind::ProspectiveMemoryDue(_) => AttentionResult {
+                disposition: AttentionDisposition::Attend,
+                reason: AttentionReason::ProspectiveMemory,
+                salience: 80,
+            },
             WorldEventKind::MaintenanceTick => AttentionResult {
                 disposition: AttentionDisposition::Ignore,
                 reason: AttentionReason::Maintenance,
@@ -108,8 +114,8 @@ const fn must_handle(reason: AttentionReason) -> AttentionResult {
 mod tests {
     use super::{AttentionDisposition, AttentionReason, AttentionSystem};
     use crate::event::{
-        EventPriority, EventScope, MessageContent, MessageReceivedEvent, ReminderDueEvent,
-        WorldEvent, WorldEventKind,
+        EventPriority, EventScope, MessageContent, MessageReceivedEvent, ProspectiveMemoryEvent,
+        ReminderDueEvent, WorldEvent, WorldEventKind,
     };
     use crate::identity::{ConversationId, ConversationKind, MessageId, PersonId};
     use chrono::Utc;
@@ -199,5 +205,20 @@ mod tests {
             AttentionSystem.evaluate(&reminder).disposition,
             AttentionDisposition::MustHandle
         );
+    }
+
+    #[test]
+    fn prospective_memory_is_attended_without_implying_delivery() {
+        let event = WorldEvent::new(
+            Utc::now(),
+            EventScope::Global,
+            EventPriority::High,
+            WorldEventKind::ProspectiveMemoryDue(ProspectiveMemoryEvent {
+                open_loop_id: crate::OpenLoopId::new(),
+            }),
+        );
+        let result = AttentionSystem.evaluate(&event);
+        assert_eq!(result.disposition, AttentionDisposition::Attend);
+        assert_eq!(result.reason, AttentionReason::ProspectiveMemory);
     }
 }

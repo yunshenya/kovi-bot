@@ -1,10 +1,12 @@
 use crate::identity::{
-    ConversationId, ConversationKind, ExternalConversation, ExternalIdentity, PersonId,
+    ConversationId, ConversationKind, ExternalConversation, ExternalIdentity, OpenLoopId, PersonId,
 };
+use crate::open_loop::{OpenLoop, OpenLoopDraft, OpenLoopOwner};
 use chrono::{DateTime, Utc};
 use std::error::Error as StdError;
 use std::future::Future;
 use std::pin::Pin;
+use std::time::Duration;
 use thiserror::Error;
 
 pub type IdentityStoreFuture<'a, T> =
@@ -40,6 +42,83 @@ pub enum IdentityStoreError {
 }
 
 impl IdentityStoreError {
+    pub fn storage(source: impl StdError + Send + Sync + 'static) -> Self {
+        Self::Storage {
+            source: Box::new(source),
+        }
+    }
+}
+
+pub type OpenLoopStoreFuture<'a, T> =
+    Pin<Box<dyn Future<Output = Result<T, OpenLoopStoreError>> + Send + 'a>>;
+
+/// Persistence boundary for prospective memory. Implementations must make
+/// `claim_due` an atomic claim, so two scheduler instances cannot emit the
+/// same due item concurrently.
+pub trait OpenLoopStore: Send + Sync {
+    fn create<'a>(&'a self, draft: &'a OpenLoopDraft) -> OpenLoopStoreFuture<'a, OpenLoop>;
+
+    fn get<'a>(&'a self, id: OpenLoopId) -> OpenLoopStoreFuture<'a, Option<OpenLoop>>;
+
+    fn list<'a>(
+        &'a self,
+        owner: &'a OpenLoopOwner,
+        limit: usize,
+    ) -> OpenLoopStoreFuture<'a, Vec<OpenLoop>>;
+
+    fn claim_due(&self, now: DateTime<Utc>, limit: usize)
+    -> OpenLoopStoreFuture<'_, Vec<OpenLoop>>;
+
+    fn defer(
+        &self,
+        id: OpenLoopId,
+        due_at: Option<DateTime<Utc>>,
+        now: DateTime<Utc>,
+    ) -> OpenLoopStoreFuture<'_, OpenLoop>;
+
+    fn resolve(&self, id: OpenLoopId, now: DateTime<Utc>) -> OpenLoopStoreFuture<'_, OpenLoop>;
+
+    fn cancel(&self, id: OpenLoopId, now: DateTime<Utc>) -> OpenLoopStoreFuture<'_, OpenLoop>;
+
+    /// Re-open leases left in `Triggered` after a host crash. The operation
+    /// is bounded and must use the indexed triggered/lease columns.
+    fn recover_stale_triggered(
+        &self,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> OpenLoopStoreFuture<'_, usize>;
+
+    /// Store-specific lease duration used by `claim_due`. This is exposed so
+    /// a host scheduler can choose a polling interval without duplicating the
+    /// persistence policy. Core does not interpret the duration.
+    fn claim_lease(&self) -> Duration {
+        Duration::from_secs(15 * 60)
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum OpenLoopStoreError {
+    #[error("open-loop storage operation failed")]
+    Storage {
+        #[source]
+        source: Box<dyn StdError + Send + Sync>,
+    },
+    #[error("open loop {id} was not found")]
+    NotFound { id: OpenLoopId },
+    #[error("open-loop owner capacity exceeded (limit {limit})")]
+    CapacityExceeded { owner: OpenLoopOwner, limit: usize },
+    #[error("open-loop operation conflicts with another update")]
+    Conflict,
+    #[error("invalid open-loop operation: {reason}")]
+    InvalidRequest { reason: String },
+    #[error("invalid open-loop status transition from {from} to {to}")]
+    InvalidTransition {
+        from: crate::OpenLoopStatus,
+        to: crate::OpenLoopStatus,
+    },
+}
+
+impl OpenLoopStoreError {
     pub fn storage(source: impl StdError + Send + Sync + 'static) -> Self {
         Self::Storage {
             source: Box::new(source),

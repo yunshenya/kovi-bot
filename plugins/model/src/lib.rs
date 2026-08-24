@@ -191,8 +191,10 @@ async fn main() {
         panic!("群聊白名单 PostgreSQL 初始化失败，拒绝写入 readiness: {error}");
     }
 
-    let yunxi_bridge = yunxi::bridge::ShadowBridge::start(
+    let yunxi_bridge = yunxi::bridge::ShadowBridge::start_with_open_loops(
         yunxi::identity_store().expect("Yunxi identity store must be initialized before handlers"),
+        yunxi::open_loop_store()
+            .expect("Yunxi open-loop store must be initialized before handlers"),
     );
     let group_bridge = Arc::clone(&yunxi_bridge);
     let private_bridge = Arc::clone(&yunxi_bridge);

@@ -7,6 +7,7 @@
 pub mod attention;
 pub mod event;
 pub mod identity;
+pub mod open_loop;
 pub mod ports;
 pub mod runtime;
 pub mod working_state;
@@ -23,7 +24,15 @@ pub use identity::{
     ExternalReferenceError, GoalId, MAX_EXTERNAL_ID_BYTES, MAX_PLATFORM_ID_BYTES, MessageId,
     OpenLoopId, PersonId, PlatformId,
 };
-pub use ports::{Clock, IdentityStore, IdentityStoreError, IdentityStoreFuture, SystemClock};
+pub use open_loop::{
+    MAX_OPEN_LOOP_DEDUPE_KEY_BYTES, MAX_OPEN_LOOP_SALIENCE, MAX_OPEN_LOOP_SUMMARY_BYTES,
+    MAX_OPEN_LOOP_SUMMARY_CHARS, OpenLoop, OpenLoopDraft, OpenLoopKind, OpenLoopOwner,
+    OpenLoopStatus, OpenLoopValidationError,
+};
+pub use ports::{
+    Clock, IdentityStore, IdentityStoreError, IdentityStoreFuture, OpenLoopStore,
+    OpenLoopStoreError, OpenLoopStoreFuture, SystemClock,
+};
 pub use runtime::{
     Admission, CognitiveRuntime, ProcessingOutcome, RuntimeConfig, RuntimeConfigError,
     RuntimeHandle, RuntimeObservation, SubmitError,
