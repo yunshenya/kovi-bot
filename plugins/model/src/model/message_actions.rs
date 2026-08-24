@@ -420,7 +420,7 @@ mod tests {
                 let scope = ReplyScope::Group(9_100_009);
                 let plan = ReplyPlan::from_model_output_for_sender(
                     scope,
-                    "[[REPLY_ACTION]]{\"at_current_sender\":true}[[/REPLY_ACTION]]",
+                    "{\"at_current_sender\":true}",
                     Some(8_765_432_114),
                 )
                 .await;

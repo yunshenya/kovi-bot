@@ -516,6 +516,10 @@ pub(crate) fn parse_reply_output(content: &str) -> ParsedReply {
         clean.replace_range(start..end + ACTION_END.len(), "");
         cursor = start;
     }
+    if !protocol_parsed && let Some(parsed) = parse_bare_protocol_json(clean.trim()) {
+        protocol = parsed;
+        clean.clear();
+    }
     let (disposition, content) = normalize_reply_disposition(
         protocol.disposition,
         unwrap_accidental_json_reply(clean.trim().to_string()),
@@ -649,6 +653,22 @@ fn parse_protocol_json_with_recovery(raw: &str) -> Option<ParsedReplyProtocol> {
         let completed = complete_truncated_json_object(raw, MAX_REPLY_PROTOCOL_CHARS)?;
         parse_protocol_json(&completed)
     })
+}
+
+/// Some models omit the protocol wrapper and return only the action object.
+/// Recover only strict, actionable protocol JSON so ordinary JSON answers stay visible.
+fn parse_bare_protocol_json(raw: &str) -> Option<ParsedReplyProtocol> {
+    let parsed = parse_protocol_json(raw)?;
+    let has_actionable_signal = parsed.disposition.is_silent()
+        || parsed
+            .messages
+            .as_ref()
+            .is_some_and(|messages| !messages.is_empty())
+        || parsed.action.quote_message_id.is_some()
+        || parsed.action.at_current_sender
+        || !parsed.action.at_user_ids.is_empty()
+        || !parsed.action.recall_message_ids.is_empty();
+    has_actionable_signal.then_some(parsed)
 }
 
 fn parse_optional_messages(object: &serde_json::Map<String, Value>) -> Option<Option<Vec<String>>> {
@@ -792,6 +812,19 @@ mod tests {
         assert!(parsed.content.is_empty());
         assert!(parsed.action.at_current_sender);
         assert!(parsed.action.at_user_ids.is_empty());
+    }
+
+    #[test]
+    fn recovers_bare_current_sender_action_without_hiding_normal_json() {
+        let parsed = parse_reply_output(r#"{"at_current_sender":true}"#);
+        assert!(parsed.content.is_empty());
+        assert!(parsed.action.at_current_sender);
+
+        let ordinary_json = parse_reply_output(r#"{"answer":"这是普通 JSON 正文"}"#);
+        assert_eq!(ordinary_json.content, r#"{"answer":"这是普通 JSON 正文"}"#);
+
+        let empty_reply_action = parse_reply_output(r#"{"disposition":"reply"}"#);
+        assert_eq!(empty_reply_action.content, r#"{"disposition":"reply"}"#);
     }
 
     #[test]
