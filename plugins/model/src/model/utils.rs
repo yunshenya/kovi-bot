@@ -81,7 +81,7 @@ static PRIVATE_HISTORY_ACCESS: LazyLock<Mutex<HashMap<i64, Instant>>> =
 const MAX_RUNTIME_CONVERSATIONS: usize = 512;
 const MAX_STREAM_ENVELOPE_BYTES: usize = 16 * 1024 * 1024;
 const EMPTY_REPLY_ALERT_WINDOW: Duration = Duration::from_secs(10 * 60);
-const EMPTY_REPLY_REPAIR_PROMPT: &str = "上一轮没有生成可见回复。现在只做一次回复协议修复：结合当前用户消息，若确实需要回应，就直接输出一条自然聊天正文；不要输出工具调用、解释、分析、JSON、代码块或回复协议标记。若确实不应回应，只输出完整的 [[REPLY_ACTION]]{\"disposition\":\"silent\"}[[/REPLY_ACTION]]。不要编造工具结果，也不要把本次修复当成新的用户消息。";
+const EMPTY_REPLY_REPAIR_PROMPT: &str = "上一轮没有生成可见回复。现在只做一次回复协议修复：重新结合当前用户消息判断本轮意图，需要回应时输出自然聊天正文；如果需要引用、@某人或撤回消息，必须同时使用 [[REPLY_ACTION]] JSON 填写动作候选中的临时引用，不要只把动作写成正文里的普通文字。自然语言中的“@我”要使用动作候选中 is_current_sender=true 的 at_user_ref，并放入 at_user_ids。不要输出工具调用、解释、分析、代码块或协议之外的 JSON；若确实不应回应，只输出完整的 [[REPLY_ACTION]]{\"disposition\":\"silent\"}[[/REPLY_ACTION]]。不要编造工具结果，也不要把本次修复当成新的用户消息。";
 
 struct EmptyReplyIncident {
     last_seen: Instant,
@@ -325,6 +325,7 @@ pub async fn control_model(
     sticker_teaching_message: Option<Message>,
     understanding: MessageUnderstanding,
     reply_expected: bool,
+    current_message_id: Option<i32>,
 ) -> bool {
     let message = if message.trim().is_empty() && !vision_images.is_empty() {
         default_vision_prompt()
@@ -414,6 +415,7 @@ pub async fn control_model(
     attach_reply_protocol_context(
         &mut request_messages,
         super::interrupt::ReplyScope::Group(group_id),
+        current_message_id,
     )
     .await;
     let response = ModelGateway::complete(
@@ -497,16 +499,6 @@ pub async fn control_model(
                 println!("[WARN] 群聊空回复协议修复失败 (群组: {})", group_id);
                 report_empty_reply_incident(&bot, &format!("群聊 {}", group_id), message).await;
             }
-        }
-    }
-    if explicit_self_mention_request(message) && plan.has_visible_reply() {
-        let already_at_sender = plan.action.at_user_ids.contains(&user_id);
-        plan.ensure_at_user(user_id);
-        if !already_at_sender {
-            println!(
-                "[INFO] 群聊明确@当前发言者，补充结构化 at 动作 (群组: {}, 用户: {})",
-                group_id, user_id
-            );
         }
     }
     let personality = MEMORY_REPOSITORY.personality().await;
@@ -607,51 +599,6 @@ fn should_repair_empty_reply(
         && !plan.is_silent()
         && !plan.has_visible_reply()
         && plan.action.recall_message_ids.is_empty()
-}
-
-fn explicit_self_mention_request(message: &str) -> bool {
-    let user_text = message.split('<').next().unwrap_or(message);
-    let compact = user_text
-        .chars()
-        .filter(|character| !character.is_whitespace())
-        .collect::<String>();
-    if compact.is_empty()
-        || [
-            "不要@我",
-            "别@我",
-            "不用@我",
-            "不要艾特我",
-            "别艾特我",
-            "不用艾特我",
-        ]
-        .iter()
-        .any(|phrase| compact.contains(phrase))
-    {
-        return false;
-    }
-
-    let normalized = compact.to_ascii_lowercase();
-    let target_requested = ["@我", "我@", "艾特我", "提及我", "at我"]
-        .iter()
-        .any(|phrase| normalized.contains(phrase));
-    if !target_requested {
-        return false;
-    }
-
-    [
-        "一下",
-        "请",
-        "让",
-        "帮",
-        "给",
-        "能不能",
-        "可以",
-        "麻烦",
-        "叫",
-    ]
-    .iter()
-    .any(|phrase| compact.contains(phrase))
-        || matches!(compact.as_str(), "@我" | "艾特我" | "你@我")
 }
 
 async fn repair_empty_reply(
@@ -1749,6 +1696,7 @@ async fn process_group_reply_inner(
     // 读取状态后立即释放锁，避免一次模型网络请求阻塞其他群的状态操作。
     let is_banned = is_group_paused(group_id).await;
     if !is_banned || is_bot_admin(&bot, user_id) {
+        let current_message_id = source_message_ids.last().copied();
         if !already_claimed && !begin_reply(scope, reply_ticket, source_message_ids).await {
             return false;
         }
@@ -1764,6 +1712,7 @@ async fn process_group_reply_inner(
             sticker_teaching_message,
             understanding,
             reply_expected,
+            current_message_id,
         )
         .await;
         finish_reply(scope, reply_ticket).await;
@@ -2048,6 +1997,7 @@ async fn private_chat_inner(
     attach_reply_protocol_context(
         &mut request_messages,
         super::interrupt::ReplyScope::Private(user_id),
+        None,
     )
     .await;
     let bot_content = ModelGateway::complete(
@@ -2391,10 +2341,9 @@ mod tests {
     use super::{
         BotMemory, EMPTY_REPLY_REPAIR_PROMPT, MessageUnderstanding, Roles, VisionImage,
         append_stream_delta, build_model_messages, build_responses_input, compression_cutoff,
-        explicit_self_mention_request, extract_stream_delta, group_system_prompt,
-        is_group_admin_command, is_help_command, is_restricted_command, limit_memory_size,
-        model_attempt_count, sanitize_scheduled_output, should_repair_empty_reply,
-        with_reference_context,
+        extract_stream_delta, group_system_prompt, is_group_admin_command, is_help_command,
+        is_restricted_command, limit_memory_size, model_attempt_count, sanitize_scheduled_output,
+        should_repair_empty_reply, with_reference_context,
     };
     use crate::memory::{BotPersonality, UserProfile};
     use crate::model::message_actions::{ReplyPlan, follow_up_delay_millis, split_reply};
@@ -2486,20 +2435,11 @@ mod tests {
     }
 
     #[test]
-    fn explicit_self_mention_requests_are_detected_without_matching_negations() {
-        assert!(explicit_self_mention_request("@ 我一下"));
-        assert!(explicit_self_mention_request("让他@我"));
-        assert!(explicit_self_mention_request("请艾特我一下"));
-        assert!(explicit_self_mention_request("帮我@一下"));
-        assert!(!explicit_self_mention_request("为什么你刚才@我"));
-        assert!(!explicit_self_mention_request("不要@我"));
-        assert!(!explicit_self_mention_request("你@一个名字叫南竹的人"));
-    }
-
-    #[test]
     fn empty_reply_repair_prompt_stays_internal_and_plain() {
         assert!(EMPTY_REPLY_REPAIR_PROMPT.contains("自然聊天正文"));
         assert!(EMPTY_REPLY_REPAIR_PROMPT.contains("不要输出工具调用"));
+        assert!(EMPTY_REPLY_REPAIR_PROMPT.contains("is_current_sender=true"));
+        assert!(EMPTY_REPLY_REPAIR_PROMPT.contains("at_user_ids"));
         assert!(!EMPTY_REPLY_REPAIR_PROMPT.contains("**"));
     }
 
