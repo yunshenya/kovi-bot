@@ -26,6 +26,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::Duration;
+use uuid::Uuid;
 
 static MEMORY_ID_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const MAX_USER_PROFILES: usize = 10_000;
@@ -1176,6 +1177,111 @@ impl MemoryManager {
             scoped.truncate(limit);
         }
         scoped
+    }
+
+    /// Bounded domain-scope lookup used by the Yunxi MemoryStore adapter.
+    /// `subject_id` stays an infrastructure detail; Core callers provide only
+    /// a validated Person/Conversation/Global scope.
+    pub(crate) async fn get_recent_memories_for_domain_scope(
+        &self,
+        subject_id: Option<i64>,
+        context_prefix: &str,
+        limit: usize,
+    ) -> Vec<MemoryEntry> {
+        let limit = limit.clamp(1, 128);
+        if let Some(pool) = self.database_pool.get() {
+            let fetch = query(
+                r#"
+                SELECT payload
+                FROM kovi_bot_memories
+                WHERE subject_id IS NOT DISTINCT FROM $1
+                  AND STRPOS(context, $2) = 1
+                ORDER BY occurred_at DESC, id DESC
+                LIMIT $3
+                "#,
+            )
+            .bind(subject_id)
+            .bind(context_prefix)
+            .bind(i64::try_from(limit).unwrap_or(128))
+            .fetch_all(pool)
+            .await;
+            if let Ok(rows) = fetch
+                && let Ok(memories) = rows
+                    .into_iter()
+                    .map(|row| serde_json::from_value(row.get("payload")))
+                    .collect::<std::result::Result<Vec<MemoryEntry>, _>>()
+            {
+                return memories;
+            }
+        }
+
+        let mut memories = self
+            .memories
+            .lock()
+            .await
+            .values()
+            .filter(|memory| memory.subject_id == subject_id)
+            .filter(|memory| memory.context.starts_with(context_prefix))
+            .cloned()
+            .collect::<Vec<_>>();
+        memories.sort_by_key(|memory| Reverse(memory.timestamp));
+        memories.truncate(limit);
+        memories
+    }
+
+    pub(crate) async fn delete_memory_for_domain_scope(
+        &self,
+        id: &str,
+        subject_id: Option<i64>,
+        context_prefix: &str,
+    ) -> Result<bool> {
+        let _save_guard = self.save_lock.lock().await;
+        let actual_id = self
+            .memories
+            .lock()
+            .await
+            .iter()
+            .find_map(|(actual_id, memory)| {
+                let in_scope =
+                    memory.subject_id == subject_id && memory.context.starts_with(context_prefix);
+                (in_scope
+                    && (actual_id == id
+                        || Uuid::parse_str(id)
+                            .ok()
+                            .is_some_and(|requested| stable_memory_uuid(actual_id) == requested)))
+                .then_some(actual_id.clone())
+            });
+        let Some(actual_id) = actual_id else {
+            return Ok(false);
+        };
+
+        if let Some(pool) = self.database_pool.get() {
+            let deleted = query(
+                r#"
+                DELETE FROM kovi_bot_memories
+                WHERE id = $1
+                  AND subject_id IS NOT DISTINCT FROM $2
+                  AND STRPOS(context, $3) = 1
+                "#,
+            )
+            .bind(&actual_id)
+            .bind(subject_id)
+            .bind(context_prefix)
+            .execute(pool)
+            .await?
+            .rows_affected();
+            if deleted > 0 {
+                self.memories.lock().await.remove(&actual_id);
+                return Ok(true);
+            }
+            return Ok(false);
+        }
+
+        let mut data = self.snapshot().await;
+        data.memories.remove(&actual_id);
+        self.persist_file_snapshot_locked(&data).await?;
+        *self.memories.lock().await = data.memories;
+        Ok(true)
     }
 
     /// 判断给定上下文中是否存在指定时间之后的记忆，不克隆或排序全局集合。
@@ -2409,6 +2515,11 @@ fn normalize_memory_content(content: &str) -> String {
         .to_lowercase()
 }
 
+fn stable_memory_uuid(legacy_id: &str) -> Uuid {
+    Uuid::parse_str(legacy_id)
+        .unwrap_or_else(|_| Uuid::new_v5(&Uuid::NAMESPACE_URL, legacy_id.as_bytes()))
+}
+
 fn conversation_summary_key(context: &str, subject_id: i64) -> String {
     format!(
         "{}:{}",
@@ -2455,11 +2566,13 @@ impl Default for BotPersonality {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConversationScope, GroupProfile, MemoryLookup, MemoryLookupType, MemoryManager, MoodEntry,
-        ProactiveState, UserProfile, conversation_summary_key,
+        ConversationScope, GroupProfile, MemoryEntry, MemoryLookup, MemoryLookupType,
+        MemoryManager, MemoryType, MoodEntry, ProactiveState, UserProfile,
+        conversation_summary_key,
     };
     use chrono::{Duration as ChronoDuration, Local};
     use std::sync::Arc;
+    use uuid::Uuid;
 
     fn temporary_memory_path(test_name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
@@ -2679,6 +2792,39 @@ mod tests {
                 assert_eq!(private_context.len(), 1);
                 assert!(!private_context[0].content.contains("群聊"));
 
+                std::fs::remove_file(path).expect("应清理测试记忆文件");
+            });
+    }
+
+    #[test]
+    fn scoped_delete_accepts_the_stable_id_of_a_legacy_memory() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let path = temporary_memory_path("legacy-delete");
+                let manager = MemoryManager::new(path.to_str().expect("临时路径应为 UTF-8"));
+                manager
+                    .add_memory(MemoryEntry {
+                        id: "legacy-conversation-1".to_string(),
+                        content: "可删除的旧记忆".to_string(),
+                        timestamp: Local::now(),
+                        memory_type: MemoryType::Event,
+                        importance: 5,
+                        tags: Vec::new(),
+                        context: "private_chat".to_string(),
+                        subject_id: Some(7),
+                    })
+                    .await
+                    .expect("旧记忆应写入");
+                let stable_id =
+                    Uuid::new_v5(&Uuid::NAMESPACE_URL, b"legacy-conversation-1").to_string();
+                assert!(
+                    manager
+                        .delete_memory_for_domain_scope(&stable_id, Some(7), "private_chat")
+                        .await
+                        .expect("旧记忆应可按稳定 ID 删除")
+                );
+                assert!(manager.get_recent_memories(0).await.is_empty());
                 std::fs::remove_file(path).expect("应清理测试记忆文件");
             });
     }

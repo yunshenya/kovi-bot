@@ -77,6 +77,7 @@ domain_id!(MessageId);
 domain_id!(EventId);
 domain_id!(GoalId);
 domain_id!(OpenLoopId);
+domain_id!(MemoryId);
 
 /// Stable identifier for a platform or identity provider.
 ///

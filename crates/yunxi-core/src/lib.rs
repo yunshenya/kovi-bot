@@ -7,6 +7,7 @@
 pub mod attention;
 pub mod event;
 pub mod identity;
+pub mod memory;
 pub mod open_loop;
 pub mod ports;
 pub mod runtime;
@@ -21,8 +22,13 @@ pub use event::{
 };
 pub use identity::{
     ConversationId, ConversationKind, EventId, ExternalConversation, ExternalIdentity,
-    ExternalReferenceError, GoalId, MAX_EXTERNAL_ID_BYTES, MAX_PLATFORM_ID_BYTES, MessageId,
-    OpenLoopId, PersonId, PlatformId,
+    ExternalReferenceError, GoalId, MAX_EXTERNAL_ID_BYTES, MAX_PLATFORM_ID_BYTES, MemoryId,
+    MessageId, OpenLoopId, PersonId, PlatformId,
+};
+pub use memory::{
+    MAX_MEMORY_CONTENT_BYTES, MAX_MEMORY_CONTENT_CHARS, MAX_MEMORY_QUERY_BYTES,
+    MAX_MEMORY_TAG_BYTES, MAX_MEMORY_TAGS, Memory, MemoryDraft, MemoryKind, MemoryQuery,
+    MemoryScope, MemoryValidationError,
 };
 pub use open_loop::{
     MAX_OPEN_LOOP_DEDUPE_KEY_BYTES, MAX_OPEN_LOOP_SALIENCE, MAX_OPEN_LOOP_SUMMARY_BYTES,
@@ -30,8 +36,8 @@ pub use open_loop::{
     OpenLoopStatus, OpenLoopValidationError,
 };
 pub use ports::{
-    Clock, IdentityStore, IdentityStoreError, IdentityStoreFuture, OpenLoopStore,
-    OpenLoopStoreError, OpenLoopStoreFuture, SystemClock,
+    Clock, IdentityStore, IdentityStoreError, IdentityStoreFuture, MemoryStore, MemoryStoreError,
+    MemoryStoreFuture, OpenLoopStore, OpenLoopStoreError, OpenLoopStoreFuture, SystemClock,
 };
 pub use runtime::{
     Admission, CognitiveRuntime, ProcessingOutcome, RuntimeConfig, RuntimeConfigError,

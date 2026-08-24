@@ -2,6 +2,7 @@ use crate::identity::{
     ConversationId, ConversationKind, ExternalConversation, ExternalIdentity, OpenLoopId, PersonId,
 };
 use crate::open_loop::{OpenLoop, OpenLoopDraft, OpenLoopOwner};
+use crate::{Memory, MemoryDraft, MemoryId, MemoryQuery, MemoryScope};
 use chrono::{DateTime, Utc};
 use std::error::Error as StdError;
 use std::future::Future;
@@ -126,6 +127,40 @@ impl OpenLoopStoreError {
     }
 }
 
+pub type MemoryStoreFuture<'a, T> =
+    Pin<Box<dyn Future<Output = Result<T, MemoryStoreError>> + Send + 'a>>;
+
+/// Platform-neutral memory boundary. Implementations must enforce the scope
+/// in every read and delete; a query may never widen to another scope.
+pub trait MemoryStore: Send + Sync {
+    fn remember<'a>(&'a self, draft: &'a MemoryDraft) -> MemoryStoreFuture<'a, Memory>;
+
+    fn recall<'a>(&'a self, query: &'a MemoryQuery) -> MemoryStoreFuture<'a, Vec<Memory>>;
+
+    fn forget(&self, scope: MemoryScope, id: MemoryId) -> MemoryStoreFuture<'_, bool>;
+}
+
+#[derive(Debug, Error)]
+pub enum MemoryStoreError {
+    #[error("memory storage operation failed")]
+    Storage {
+        #[source]
+        source: Box<dyn StdError + Send + Sync>,
+    },
+    #[error("memory scope is not available in this adapter: {scope:?}")]
+    UnsupportedScope { scope: MemoryScope },
+    #[error("memory operation is invalid: {reason}")]
+    InvalidRequest { reason: String },
+}
+
+impl MemoryStoreError {
+    pub fn storage(source: impl StdError + Send + Sync + 'static) -> Self {
+        Self::Storage {
+            source: Box::new(source),
+        }
+    }
+}
+
 /// Time source used by domain services that need deterministic tests.
 pub trait Clock: Send + Sync {
     fn now(&self) -> DateTime<Utc>;
@@ -142,11 +177,15 @@ impl Clock for SystemClock {
 
 #[cfg(test)]
 mod tests {
-    use super::{IdentityStore, IdentityStoreError, IdentityStoreFuture};
-    use crate::{
-        ConversationId, ConversationKind, ExternalConversation, ExternalIdentity, PersonId,
-        PlatformId,
+    use super::{
+        IdentityStore, IdentityStoreError, IdentityStoreFuture, MemoryStore, MemoryStoreError,
+        MemoryStoreFuture,
     };
+    use crate::{
+        ConversationId, ConversationKind, ExternalConversation, ExternalIdentity, Memory,
+        MemoryDraft, MemoryId, MemoryQuery, MemoryScope, PersonId, PlatformId,
+    };
+    use chrono::Utc;
     use std::sync::Arc;
 
     struct FakeIdentityStore {
@@ -204,6 +243,70 @@ mod tests {
                 .await
                 .expect("conversation should resolve"),
             expected_conversation
+        );
+    }
+
+    struct FakeMemoryStore;
+
+    impl MemoryStore for FakeMemoryStore {
+        fn remember<'a>(&'a self, draft: &'a MemoryDraft) -> MemoryStoreFuture<'a, Memory> {
+            Box::pin(async move {
+                Memory::from_draft(MemoryId::new(), draft, Utc::now()).map_err(|error| {
+                    MemoryStoreError::InvalidRequest {
+                        reason: error.to_string(),
+                    }
+                })
+            })
+        }
+
+        fn recall<'a>(&'a self, query: &'a MemoryQuery) -> MemoryStoreFuture<'a, Vec<Memory>> {
+            Box::pin(async move {
+                let draft = MemoryDraft::new(
+                    query.scope(),
+                    crate::MemoryKind::Fact,
+                    "remembered",
+                    Utc::now(),
+                )
+                .map_err(|error| MemoryStoreError::InvalidRequest {
+                    reason: error.to_string(),
+                })?;
+                Ok(vec![
+                    Memory::from_draft(MemoryId::new(), &draft, Utc::now()).map_err(|error| {
+                        MemoryStoreError::InvalidRequest {
+                            reason: error.to_string(),
+                        }
+                    })?,
+                ])
+            })
+        }
+
+        fn forget(&self, _scope: MemoryScope, _id: MemoryId) -> MemoryStoreFuture<'_, bool> {
+            Box::pin(async { Ok(true) })
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_store_is_usable_as_a_trait_object() {
+        let scope = MemoryScope::Person(PersonId::new());
+        let store: Arc<dyn MemoryStore> = Arc::new(FakeMemoryStore);
+        let draft = MemoryDraft::new(scope, crate::MemoryKind::Fact, "likes tea", Utc::now())
+            .expect("valid draft");
+        let memory = store.remember(&draft).await.expect("memory should persist");
+        assert_eq!(memory.scope(), scope);
+        let query = MemoryQuery::new(scope, "tea", 4).expect("valid query");
+        assert_eq!(
+            store
+                .recall(&query)
+                .await
+                .expect("memory should recall")
+                .len(),
+            1
+        );
+        assert!(
+            store
+                .forget(scope, memory.id())
+                .await
+                .expect("memory should be forgotten")
         );
     }
 }

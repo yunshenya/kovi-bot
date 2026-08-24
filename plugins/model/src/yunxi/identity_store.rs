@@ -19,6 +19,45 @@ impl PostgresIdentityStore {
         Self { pool }
     }
 
+    pub(crate) async fn qq_external_identities_for_person(
+        &self,
+        person_id: PersonId,
+    ) -> Result<Vec<String>, IdentityStoreError> {
+        query_scalar::<Postgres, String>(
+            "SELECT external_id FROM yunxi_external_identities WHERE platform = 'qq' AND person_id = $1 ORDER BY external_id",
+        )
+        .bind(person_id.into_uuid())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(IdentityStoreError::storage)
+    }
+
+    pub(crate) async fn qq_external_conversations_for_id(
+        &self,
+        conversation_id: ConversationId,
+    ) -> Result<Vec<(String, ConversationKind)>, IdentityStoreError> {
+        let rows = query(
+            "SELECT external.external_id, conversation.kind FROM yunxi_external_conversations AS external JOIN yunxi_conversations AS conversation ON conversation.id = external.conversation_id WHERE external.platform = 'qq' AND external.conversation_id = $1 ORDER BY external.external_id",
+        )
+        .bind(conversation_id.into_uuid())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(IdentityStoreError::storage)?;
+        rows.into_iter()
+            .map(|row| {
+                let external_id = row
+                    .try_get::<String, _>("external_id")
+                    .map_err(IdentityStoreError::storage)?;
+                let kind = row
+                    .try_get::<String, _>("kind")
+                    .map_err(IdentityStoreError::storage)?;
+                let kind =
+                    ConversationKind::from_str(&kind).map_err(IdentityStoreError::storage)?;
+                Ok((external_id, kind))
+            })
+            .collect()
+    }
+
     pub(crate) async fn initialize_schema(&self) -> anyhow::Result<()> {
         let mut transaction = self.pool.begin().await?;
         for statement in [
