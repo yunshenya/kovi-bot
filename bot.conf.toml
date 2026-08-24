@@ -125,6 +125,26 @@ lease_secs = 180
 max_task_instruction_chars = 2000
 max_task_output_chars = 4000
 
+[agent_runs]
+enabled = true
+recovery_scan_secs = 30
+lease_secs = 60
+request_timeout_secs = 15
+min_interval_secs = 5
+max_interval_secs = 86400
+default_interval_secs = 30
+default_stop_after_minutes = 1440
+max_stop_after_minutes = 10080
+default_max_executions = 20000
+max_executions_per_run = 100000
+max_active_per_user = 10
+max_active_total = 100
+max_consecutive_failures = 5
+max_response_bytes = 524288
+max_body_preview_chars = 2000
+max_notification_chars = 500
+claim_batch_size = 16
+
 [agent_tasks]
 enabled = true
 poll_interval_secs = 5

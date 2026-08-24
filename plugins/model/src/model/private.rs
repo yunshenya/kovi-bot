@@ -692,26 +692,34 @@ async fn delete_private_user_data(user_id: i64, bot: &RuntimeBot) {
     let sticker_result = sticker_memory::delete_user_data(user_id).await;
     let reminder_result = reminders::delete_user_data(user_id).await;
     let agent_goal_result = crate::agent_runtime::delete_user_data(user_id).await;
+    let agent_run_result = crate::agent_runs::delete_user_data(user_id).await;
     match (
         memory_result,
         sticker_result,
         reminder_result,
         agent_goal_result,
+        agent_run_result,
     ) {
-        (Ok(memory_rows), Ok(sticker_rows), Ok(reminder_rows), Ok(agent_goal_rows)) => {
+        (
+            Ok(memory_rows),
+            Ok(sticker_rows),
+            Ok(reminder_rows),
+            Ok(agent_goal_rows),
+            Ok(agent_run_rows),
+        ) => {
             send_tracked_private_message(
                 bot,
                 user_id,
                 format!(
-                    "你的可归属数据已删除（记忆/档案/摘要 {memory_rows} 项，表情记忆 {sticker_rows} 项，提醒 {reminder_rows} 项，角色目标 {agent_goal_rows} 项）。"
+                    "你的可归属数据已删除（记忆/档案/摘要 {memory_rows} 项，表情记忆 {sticker_rows} 项，提醒 {reminder_rows} 项，角色目标 {agent_goal_rows} 项，Agent Run {agent_run_rows} 项）。"
                 ),
             )
             .await;
         }
-        (memory, stickers, reminders, agent_goals) => {
+        (memory, stickers, reminders, agent_goals, agent_runs) => {
             eprintln!(
-                "[ERROR] 用户数据删除未完全成功 (用户: {}, 记忆: {:?}, 表情: {:?}, 提醒: {:?}, 角色目标: {:?})",
-                user_id, memory, stickers, reminders, agent_goals
+                "[ERROR] 用户数据删除未完全成功 (用户: {}, 记忆: {:?}, 表情: {:?}, 提醒: {:?}, 角色目标: {:?}, Agent Run: {:?})",
+                user_id, memory, stickers, reminders, agent_goals, agent_runs
             );
             send_tracked_private_message(
                 bot,

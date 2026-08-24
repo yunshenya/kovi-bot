@@ -97,6 +97,13 @@ pub(crate) async fn params_model_with_tool_access(
                 content: "我暂时无法创建这个定时任务，请稍后再试一次。".to_string(),
             };
         }
+        if tool_context.requires_agent_run_create {
+            eprintln!(
+                "[WARN] 持续任务请求未执行：模型工具注册表不可用 (范围: {}:{})",
+                tool_context.context, tool_context.subject_id
+            );
+            return required_agent_run_failure(false);
+        }
         if tool_context.requires_group_message_send {
             eprintln!(
                 "[WARN] 跨群发送请求未执行：模型工具注册表不可用 (范围: {}:{})",
@@ -130,6 +137,12 @@ pub(crate) async fn params_model_with_tool_access(
             content: "用户明确提出了定时任务请求。本轮不能只回复‘好的’、‘记住了’或其他确认话术；必须先严格调用 reminder.create，并且只有工具返回成功创建结果后才能向用户确认。若无法确定时间或参数，调用工具会返回错误，此时必须如实说明失败，不得声称任务已创建。".to_string(),
         });
     }
+    if tool_context.requires_agent_run_create {
+        request.push(BotMemory {
+            role: Roles::System,
+            content: "语义层确认用户明确要求持续监测公开 URL。本轮不能只口头答应，也不能创建普通提醒；必须调用 agent.run.create。把间隔、停止条件、截止时间、最大次数和命中后的私聊正文转换为结构化参数。只有工具成功返回 Run 编号后才能确认已经开始；参数不清楚或工具失败时必须如实说明没有创建。".to_string(),
+        });
+    }
     if tool_context.requires_group_message_send {
         request.push(BotMemory {
             role: Roles::System,
@@ -148,6 +161,8 @@ pub(crate) async fn params_model_with_tool_access(
     let mut reminder_tool_succeeded = false;
     let mut reminder_failure = ReminderCreateFailure::NotCalled;
     let mut reminder_failure_detail = None;
+    let mut agent_run_create_attempted = false;
+    let mut agent_run_create_succeeded = false;
     let mut group_target_lookup_succeeded = false;
     let mut group_message_send_attempted = false;
     let mut group_message_send_succeeded = false;
@@ -169,6 +184,9 @@ pub(crate) async fn params_model_with_tool_access(
             if group_message_send_succeeded {
                 return completed_group_message_response();
             }
+            if agent_run_create_succeeded {
+                return completed_agent_run_response();
+            }
             return response;
         }
         // Providers sometimes add a short preamble or Markdown around a tool
@@ -189,6 +207,9 @@ pub(crate) async fn params_model_with_tool_access(
                     } else {
                         completed_group_message_response()
                     };
+                }
+                if agent_run_create_succeeded && is_model_error_response(&response.content) {
+                    return completed_agent_run_response();
                 }
                 if tool_context.requires_external_tool && !external_tool_succeeded {
                     if is_model_error_response(&response.content) || round + 1 >= max_tool_rounds {
@@ -234,6 +255,24 @@ pub(crate) async fn params_model_with_tool_access(
                         tool_context.context, tool_context.subject_id
                     );
                     continue;
+                }
+                if tool_context.requires_agent_run_create && !agent_run_create_succeeded {
+                    if !agent_run_create_attempted
+                        && !is_model_error_response(&response.content)
+                        && round + 1 < max_tool_rounds
+                    {
+                        request.push(response);
+                        request.push(BotMemory {
+                            role: Roles::System,
+                            content: "你刚才只输出了文字，但持续任务尚未创建。下一条只能调用 agent.run.create；不要用确认话术或 reminder.create 代替。".to_string(),
+                        });
+                        println!(
+                            "[WARN] 持续任务模型返回普通文本，要求补充 agent.run.create (范围: {}:{})",
+                            tool_context.context, tool_context.subject_id
+                        );
+                        continue;
+                    }
+                    return required_agent_run_failure(agent_run_create_attempted);
                 }
                 if tool_context.requires_group_message_send && !group_message_send_succeeded {
                     if !group_message_send_attempted
@@ -378,6 +417,18 @@ pub(crate) async fn params_model_with_tool_access(
                         );
                     }
                 }
+                if tool_name == "agent.run.create" {
+                    agent_run_create_attempted = true;
+                    if result.succeeded {
+                        agent_run_create_succeeded = true;
+                        println!(
+                            "[INFO] agent.run.create 执行成功 (范围: {}:{}, 轮次: {})",
+                            tool_context.context,
+                            tool_context.subject_id,
+                            round + 1
+                        );
+                    }
+                }
                 if tool_name == "group.message.targets" && result.succeeded {
                     group_target_lookup_succeeded = true;
                 }
@@ -411,6 +462,10 @@ pub(crate) async fn params_model_with_tool_access(
             tool_context,
         );
         return reminder_failure_response(reminder_failure, reminder_failure_detail.as_deref());
+    }
+
+    if tool_context.requires_agent_run_create && !agent_run_create_succeeded {
+        return required_agent_run_failure(agent_run_create_attempted);
     }
 
     if tool_context.requires_external_tool && !external_tool_succeeded {
@@ -475,6 +530,8 @@ pub(crate) async fn params_model_with_tool_access(
             } else {
                 completed_group_message_response()
             }
+        } else if agent_run_create_succeeded && is_model_error_response(&response.content) {
+            completed_agent_run_response()
         } else {
             response
         }
@@ -484,6 +541,8 @@ pub(crate) async fn params_model_with_tool_access(
         } else {
             completed_group_message_response()
         }
+    } else if agent_run_create_succeeded {
+        completed_agent_run_response()
     } else {
         BotMemory {
             role: Roles::Assistant,
@@ -493,7 +552,10 @@ pub(crate) async fn params_model_with_tool_access(
 }
 
 fn tool_round_limit(configured: u8, tool_context: &ToolExecutionContext) -> u8 {
-    if tool_context.requires_reminder_create || tool_context.requires_external_tool {
+    if tool_context.requires_reminder_create
+        || tool_context.requires_agent_run_create
+        || tool_context.requires_external_tool
+    {
         configured.max(3)
     } else if tool_context.is_main_admin
         && matches!(
@@ -506,6 +568,26 @@ fn tool_round_limit(configured: u8, tool_context: &ToolExecutionContext) -> u8 {
         configured.max(2)
     } else {
         configured
+    }
+}
+
+fn required_agent_run_failure(attempted: bool) -> BotMemory {
+    BotMemory {
+        role: Roles::Assistant,
+        content: if attempted {
+            "这个持续任务没有创建成功，我不会假装已经在后台执行。请检查 URL、间隔和停止条件后再试一次。"
+        } else {
+            "我没有成功创建这个持续任务，所以现在并没有在后台监测。请重新说一次，并明确 URL、检查间隔和停止条件。"
+        }
+        .to_string(),
+    }
+}
+
+fn completed_agent_run_response() -> BotMemory {
+    BotMemory {
+        role: Roles::Assistant,
+        content: "持续监测已经开始了，满足条件、到达截止时间或提前停止时我会在私聊里告诉你。"
+            .to_string(),
     }
 }
 
@@ -927,6 +1009,7 @@ mod tests {
             runtime_bot: None,
             sticker_teaching: None,
             requires_reminder_create: false,
+            requires_agent_run_create: false,
             requires_group_message_send: false,
             requires_group_followup: false,
             requires_external_tool: false,

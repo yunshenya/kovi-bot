@@ -123,6 +123,26 @@ web_fetch_enabled = true
 web_search_max_results = 5
 web_fetch_max_chars = 12000
 
+[agent_runs]
+enabled = true
+recovery_scan_secs = 30       # 跨进程恢复兜底；进程内创建会立即唤醒
+lease_secs = 60
+request_timeout_secs = 15
+min_interval_secs = 5
+max_interval_secs = 86400
+default_interval_secs = 30
+default_stop_after_minutes = 1440
+max_stop_after_minutes = 10080
+default_max_executions = 20000
+max_executions_per_run = 100000
+max_active_per_user = 10
+max_active_total = 100
+max_consecutive_failures = 5
+max_response_bytes = 524288
+max_body_preview_chars = 2000
+max_notification_chars = 500
+claim_batch_size = 16
+
 [agent_tasks]
 enabled = true
 poll_interval_secs = 5
@@ -321,12 +341,21 @@ export VISION_REQUIRES_AUTH="true"
 - `group.pause` / `group.resume`：管理员在群聊中让芸汐暂停或恢复当前群的自动回复。
 - `group.message.targets` / `group.message.send`：主管理员私聊专用，解析已授权群并执行持久化、可审计的跨群发言；在“去群里问一下，等回复后告诉我”这类请求中，`group.message.send` 还会创建持久化收集任务。
 - `group.question.status` / `group.question.cancel`：主管理员私聊专用，查询跨群问答的收集进度或在私聊汇报开始前取消任务。
+- `agent.run.create` / `agent.run.status` / `agent.run.cancel`：主管理员私聊专用，创建、查看和取消可跨重启持续运行的受限任务；当前首个执行器是 URL 条件监测。
 - `health.check`：管理员专用，检查模型鉴权、数据库、Redis、工具注册表和 readiness 状态。
 - `mcp.<服务名>.<工具名>`：来自配置白名单的 MCP 工具。
 
 模型最多连续调用有限轮次，工具参数、超时、结果长度和工具名称都由程序校验。工具返回内容会被标记为资料，不会被当成新的系统指令。MCP 目前使用 stdio 子进程传输；服务必须在 `tools.mcp_servers` 中配置，工具必须列入 `allowed_tools`。`read_only = true` 时会拒绝 MCP 明确标记为破坏性或名称带常见写操作动词的工具。MCP 子进程只继承 `PATH` 和 `inherit_env` 明确列出的变量，不会拿到主进程的整套密钥。修改 `bot.conf.toml` 后需要重启机器人。
 
 持久化定时任务支持固定消息和通用 `task` 动作。`task` 会在到期时重新执行保存的自然语言指令，新闻摘要只是其中一个普通例子；默认可使用时间、网页和当前会话记忆工具。若要让定时任务调用 MCP，必须在对应服务上额外设置 `allow_scheduled = true`，只授权可信且必要的工具。定时任务不能创建、查看或取消其他定时任务，也不是任意代码执行器，完整说明见 [`docs/reminders.md`](docs/reminders.md)。
+
+### 持续 Agent Run
+
+主管理员可以在私聊中说“每隔 30 秒请求 `https://example.com/health`，直到 JSON `/status` 等于 `ready` 后告诉我”。芸汐会创建持久化 Run，立即执行第一次检查，未命中时按间隔继续，命中、到期、达到最大次数或连续失败时私聊通知。支持 `text_contains`、`text_not_contains`、`text_equals`、`status_equals` 和 `json_pointer_equals`；URL 只允许公网标准端口 HTTP/HTTPS GET，并沿用网页工具的 DNS 固定、内网拦截、禁重定向、超时和响应大小限制。
+
+调度器不是固定高频扫描：当前进程内创建和重排通过事件立即唤醒，数据库只按最近 `next_wake_at` 自适应等待，并以 `recovery_scan_secs` 做跨实例与崩溃恢复兜底。每次 `http.get` 都写入动作日志，状态转换写入事件日志；最终 QQ 通知属于不可逆动作，发送前先落库为 `sending`，超时或进程中断后只标记投递结果不确定，不会自动重发。完整状态机、限制和扩展边界见 [`docs/agent-runs.md`](docs/agent-runs.md)。
+
+“在群里只回复你喜欢回复的”属于长期行为策略，不是不断执行的定时 Run。策略层应在每条入站群消息事件上做偏好和权限决策；Run Runtime 则负责有开始、资源预算、截止条件和取消入口的持续工作。两者后续可以共享 Action 能力目录，但不会混成同一种任务。
 
 ### 跨会话角色动作
 

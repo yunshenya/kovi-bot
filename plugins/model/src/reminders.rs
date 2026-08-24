@@ -476,6 +476,7 @@ async fn build_generic_task(reminder: &ClaimedReminder) -> Result<String> {
             runtime_bot: None,
             sticker_teaching: None,
             requires_reminder_create: false,
+            requires_agent_run_create: false,
             requires_group_message_send: false,
             requires_group_followup: false,
             requires_external_tool: external_task,

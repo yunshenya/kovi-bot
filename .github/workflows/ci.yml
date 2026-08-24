@@ -104,6 +104,11 @@ jobs:
           cargo test -p model --lib --locked
           agent_tasks::tests::postgres_task_reservation_is_atomic_and_event_recording_is_idempotent -- --ignored --exact
 
+      - name: Run agent run concurrency integration test
+        run: >-
+          cargo test -p model --lib --locked
+          agent_runs::tests::postgres_run_creation_and_claim_are_atomic -- --ignored --exact
+
       - name: Run Redis integration tests
         run: >-
           cargo test -p model --lib --locked

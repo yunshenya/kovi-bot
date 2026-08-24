@@ -20,6 +20,8 @@ use std::sync::{
 pub mod config;
 // 持久化角色目标与统一动作执行器
 mod agent_runtime;
+// 通用持久化 Agent Run Runtime
+mod agent_runs;
 // 持久化跨群问答闭环任务
 mod agent_tasks;
 // 核心模型处理模块
@@ -152,6 +154,10 @@ async fn main() {
         panic!("角色目标表初始化失败，拒绝写入 readiness: {error}");
     }
 
+    if let Err(error) = agent_runs::initialize_database().await {
+        panic!("Agent Run 表初始化失败，拒绝写入 readiness: {error}");
+    }
+
     if let Err(error) = agent_tasks::initialize_database().await {
         panic!("跨群问答任务表初始化失败，拒绝写入 readiness: {error}");
     }
@@ -222,6 +228,11 @@ async fn main() {
             agent_tasks::start_scheduler(agent_task_bot).await;
         });
 
+        let agent_run_bot = Arc::clone(&proactive_bot);
+        kovi::tokio::spawn(async move {
+            agent_runs::start_scheduler(agent_run_bot).await;
+        });
+
         // 在后台异步任务中执行定期任务
         // 主动聊天循环由 startup 模块单独管理。
         kovi::tokio::spawn(async move {
@@ -269,6 +280,13 @@ async fn main() {
                     }
                     Ok(_) => {}
                     Err(error) => eprintln!("[ERROR] 定期跨群问答任务清理失败: {}", error),
+                }
+                match agent_runs::compact_expired().await {
+                    Ok(removed) if removed > 0 => {
+                        println!("[INFO] 过期 Agent Run 清理完成，移除 {} 条", removed);
+                    }
+                    Ok(_) => {}
+                    Err(error) => eprintln!("[ERROR] 定期 Agent Run 清理失败: {}", error),
                 }
                 let interval = config::get().memory().maintenance_interval_secs();
                 kovi::tokio::time::sleep(kovi::tokio::time::Duration::from_secs(interval)).await;

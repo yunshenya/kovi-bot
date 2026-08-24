@@ -23,6 +23,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, RwLock};
 
+mod agent_runs;
 mod agent_tasks;
 mod group_interjection;
 mod memory;
@@ -37,6 +38,7 @@ mod topic;
 mod traffic;
 mod vision;
 
+pub use agent_runs::AgentRunConfig;
 pub use agent_tasks::AgentTaskConfig;
 pub use reminders::ReminderConfig;
 pub use tools::{McpServerConfig, ToolsConfig};
@@ -82,6 +84,8 @@ pub struct ModelConfig {
     reminders: ReminderConfig,
     /// 跨群问答任务配置。
     agent_tasks: AgentTaskConfig,
+    /// 通用持久化 Agent Run 配置。
+    agent_runs: AgentRunConfig,
     /// 图片理解 Provider 路由配置。
     vision: VisionConfig,
 }
@@ -126,6 +130,7 @@ impl ModelConfig {
         self.tools.validate()?;
         self.reminders.validate()?;
         self.agent_tasks.validate()?;
+        self.agent_runs.validate()?;
         self.vision.validate()?;
         if !self.vision.mcp_server().is_empty() && !self.tools.enabled() {
             return Err(anyhow::anyhow!(
@@ -194,6 +199,10 @@ impl ModelConfig {
 
     pub fn agent_tasks(&self) -> &AgentTaskConfig {
         &self.agent_tasks
+    }
+
+    pub fn agent_runs(&self) -> &AgentRunConfig {
+        &self.agent_runs
     }
 
     pub fn vision(&self) -> &VisionConfig {
