@@ -3,6 +3,7 @@
 //! Redis 只保存可重建、带 TTL 的热数据；长期记忆和用户资料仍由 PostgreSQL 负责。
 
 use anyhow::{Context, Result, anyhow};
+use kovi::tokio::runtime::{Handle, Id as RuntimeId};
 use kovi::tokio::sync::Mutex;
 use redis::aio::ConnectionManager;
 use redis::{AsyncCommands, Script};
@@ -51,6 +52,7 @@ impl RedisConnectionState {
 pub(crate) struct RedisStore {
     connection: ConnectionManager,
     key_prefix: String,
+    runtime_id: RuntimeId,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -93,6 +95,7 @@ pub(crate) async fn get() -> Option<Arc<RedisStore>> {
         .ok()
         .filter(|prefix| !prefix.trim().is_empty())
         .unwrap_or_else(|| DEFAULT_KEY_PREFIX.to_string());
+    let runtime_id = Handle::current().id();
     let now = Instant::now();
     let mut state = REDIS_STATE.lock().await;
 
@@ -106,6 +109,18 @@ pub(crate) async fn get() -> Option<Arc<RedisStore>> {
         state.retry_after = None;
         state.retry_delay = REDIS_INITIAL_RETRY_DELAY;
     }
+    // redis::ConnectionManager caches reconnect futures and timer handles from the Tokio
+    // runtime that created it. Reusing it from another runtime can poll a timer after its
+    // original runtime has shut down (notably in parallel tests).
+    if state
+        .store
+        .as_ref()
+        .is_some_and(|store| store.runtime_id != runtime_id)
+    {
+        state.store = None;
+        state.retry_after = None;
+        state.retry_delay = REDIS_INITIAL_RETRY_DELAY;
+    }
     if let Some(store) = &state.store {
         return Some(Arc::clone(store));
     }
@@ -116,7 +131,7 @@ pub(crate) async fn get() -> Option<Arc<RedisStore>> {
         return None;
     }
 
-    match connect(&url, key_prefix).await {
+    match connect(&url, key_prefix, runtime_id).await {
         Some(store) => {
             let store = Arc::new(store);
             state.store = Some(Arc::clone(&store));
@@ -131,7 +146,7 @@ pub(crate) async fn get() -> Option<Arc<RedisStore>> {
     }
 }
 
-async fn connect(url: &str, key_prefix: String) -> Option<RedisStore> {
+async fn connect(url: &str, key_prefix: String, runtime_id: RuntimeId) -> Option<RedisStore> {
     let client = match redis::Client::open(url) {
         Ok(client) => client,
         Err(error) => {
@@ -156,6 +171,7 @@ async fn connect(url: &str, key_prefix: String) -> Option<RedisStore> {
     Some(RedisStore {
         connection,
         key_prefix,
+        runtime_id,
     })
 }
 
@@ -468,19 +484,25 @@ mod tests {
     #[test]
     #[ignore = "requires Redis via REDIS_URL"]
     fn redis_runtime_store_round_trips() {
+        let suffix = format!(
+            "integration:{}:{}",
+            std::process::id(),
+            super::now_millis().expect("系统时间应可用")
+        );
+        let first_runtime = kovi::tokio::runtime::Runtime::new().expect("应创建首个测试运行时");
+        first_runtime.block_on(async {
+            let store = get().await.expect("REDIS_URL 应指向可用 Redis");
+            store
+                .set_expiring_text(&suffix, "round-trip", Duration::from_secs(30))
+                .await
+                .expect("应写入临时文本");
+        });
+        drop(first_runtime);
+
         kovi::tokio::runtime::Runtime::new()
-            .expect("应创建测试运行时")
+            .expect("应创建第二个测试运行时")
             .block_on(async {
                 let store = get().await.expect("REDIS_URL 应指向可用 Redis");
-                let suffix = format!(
-                    "integration:{}:{}",
-                    std::process::id(),
-                    super::now_millis().expect("系统时间应可用")
-                );
-                store
-                    .set_expiring_text(&suffix, "round-trip", Duration::from_secs(30))
-                    .await
-                    .expect("应写入临时文本");
                 assert_eq!(
                     store.take_text(&suffix).await.expect("应取出临时文本"),
                     Some("round-trip".to_string())

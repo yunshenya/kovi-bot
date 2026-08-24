@@ -45,10 +45,6 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
-    env:
-      DATABASE_URL: postgresql://kovi_test:integration-test@127.0.0.1:5432/kovi_test
-      REDIS_URL: redis://127.0.0.1:6379/15
-
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -80,36 +76,50 @@ jobs:
         run: cargo test -p model --features integration-tests --test boundary_integration --locked
 
       - name: Run black-box Redis integration test
+        env:
+          REDIS_URL: redis://127.0.0.1:6379/15
         run: >-
           cargo test -p model --features integration-tests --test boundary_integration --locked
           redis_runtime_store_round_trips_through_the_black_box_api -- --ignored --exact
 
       - name: Run PostgreSQL integration tests
+        env:
+          DATABASE_URL: postgresql://kovi_test:integration-test@127.0.0.1:5432/kovi_test
         run: >-
           cargo test -p model --lib --locked
           memory::tests::normalized_postgres_storage_round_trips -- --ignored --exact
 
       - name: Run reminder claim integration test
+        env:
+          DATABASE_URL: postgresql://kovi_test:integration-test@127.0.0.1:5432/kovi_test
         run: >-
           cargo test -p model --lib --locked
           reminders::tests::postgres_claim_is_atomic_across_concurrent_workers -- --ignored --exact
 
       - name: Run agent goal idempotency integration test
+        env:
+          DATABASE_URL: postgresql://kovi_test:integration-test@127.0.0.1:5432/kovi_test
         run: >-
           cargo test -p model --lib --locked
           agent_runtime::tests::postgres_goal_reservation_is_atomic_and_idempotent -- --ignored --exact
 
       - name: Run agent task concurrency integration test
+        env:
+          DATABASE_URL: postgresql://kovi_test:integration-test@127.0.0.1:5432/kovi_test
         run: >-
           cargo test -p model --lib --locked
           agent_tasks::tests::postgres_task_reservation_is_atomic_and_event_recording_is_idempotent -- --ignored --exact
 
       - name: Run agent run concurrency integration test
+        env:
+          DATABASE_URL: postgresql://kovi_test:integration-test@127.0.0.1:5432/kovi_test
         run: >-
           cargo test -p model --lib --locked
           agent_runs::tests::postgres_run_creation_and_claim_are_atomic -- --ignored --exact
 
       - name: Run Redis integration tests
+        env:
+          REDIS_URL: redis://127.0.0.1:6379/15
         run: >-
           cargo test -p model --lib --locked
           redis_store::tests::redis_runtime_store_round_trips -- --ignored --exact
