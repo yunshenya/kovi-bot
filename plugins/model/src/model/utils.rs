@@ -81,7 +81,7 @@ static PRIVATE_HISTORY_ACCESS: LazyLock<Mutex<HashMap<i64, Instant>>> =
 const MAX_RUNTIME_CONVERSATIONS: usize = 512;
 const MAX_STREAM_ENVELOPE_BYTES: usize = 16 * 1024 * 1024;
 const EMPTY_REPLY_ALERT_WINDOW: Duration = Duration::from_secs(10 * 60);
-const EMPTY_REPLY_REPAIR_PROMPT: &str = "上一轮没有生成可见回复。现在只做一次回复协议修复：重新结合当前用户消息判断本轮意图，需要回应时输出自然聊天正文；如果需要引用、@某人或撤回消息，必须同时使用 [[REPLY_ACTION]] JSON 填写动作候选中的临时引用，不要只把动作写成正文里的普通文字。自然语言中的“@我”要使用动作候选中 is_current_sender=true 的 at_user_ref，并放入 at_user_ids。不要输出工具调用、解释、分析、代码块或协议之外的 JSON；若确实不应回应，只输出完整的 [[REPLY_ACTION]]{\"disposition\":\"silent\"}[[/REPLY_ACTION]]。不要编造工具结果，也不要把本次修复当成新的用户消息。";
+const EMPTY_REPLY_REPAIR_PROMPT: &str = "上一轮没有形成可发送的回复。现在只做一次回复协议修复：重新结合当前用户消息判断本轮意图，需要文字回应时输出自然聊天正文；如果用户只要求发送结构化 @，可以只输出包含有效 at_user_ids 的完整 [[REPLY_ACTION]]，不要为了凑正文添加无关套话；如果需要引用、@某人或撤回消息，必须使用动作候选中的临时引用，不要只把动作写成正文里的普通文字。自然语言中的“@我”要使用动作候选中 is_current_sender=true 的 at_user_ref，并放入 at_user_ids。不要输出工具调用、解释、分析、代码块或协议之外的 JSON；若确实不应回应，只输出完整的 [[REPLY_ACTION]]{\"disposition\":\"silent\"}[[/REPLY_ACTION]]。不要编造工具结果，也不要把本次修复当成新的用户消息。";
 
 struct EmptyReplyIncident {
     last_seen: Instant,
@@ -557,25 +557,27 @@ pub async fn control_model(
             .len()
             .saturating_sub(execution.sent_messages.len())
     );
-    if let Err(error) = MEMORY_REPOSITORY
-        .add_conversation(
-            group_id,
-            &format!("芸汐: {}", stored_reply),
-            "group_chat",
-            None,
-            &[],
-        )
-        .await
-    {
-        eprintln!(
-            "[ERROR] 群聊回复记忆记录失败 (群组: {}): {}",
-            group_id, error
-        );
+    if !stored_reply.is_empty() {
+        if let Err(error) = MEMORY_REPOSITORY
+            .add_conversation(
+                group_id,
+                &format!("芸汐: {}", stored_reply),
+                "group_chat",
+                None,
+                &[],
+            )
+            .await
+        {
+            eprintln!(
+                "[ERROR] 群聊回复记忆记录失败 (群组: {}): {}",
+                group_id, error
+            );
+        }
+        messages.push(BotMemory {
+            role: Roles::Assistant,
+            content: stored_reply,
+        });
     }
-    messages.push(BotMemory {
-        role: Roles::Assistant,
-        content: stored_reply,
-    });
     limit_memory_size(&mut messages);
     true
 }
@@ -2141,27 +2143,29 @@ async fn private_chat_inner(
             .len()
             .saturating_sub(execution.sent_messages.len())
     );
-    if let Err(error) = MEMORY_REPOSITORY
-        .add_conversation(
-            user_id,
-            &format!("芸汐: {}", stored_reply),
-            "private_chat",
-            None,
-            &[],
-        )
-        .await
-    {
-        eprintln!(
-            "[ERROR] 私聊回复记忆记录失败 (用户: {}): {}",
-            user_id, error
-        );
-    }
+    if !stored_reply.is_empty() {
+        if let Err(error) = MEMORY_REPOSITORY
+            .add_conversation(
+                user_id,
+                &format!("芸汐: {}", stored_reply),
+                "private_chat",
+                None,
+                &[],
+            )
+            .await
+        {
+            eprintln!(
+                "[ERROR] 私聊回复记忆记录失败 (用户: {}): {}",
+                user_id, error
+            );
+        }
 
-    // 添加机器人回复
-    history.push(BotMemory {
-        role: Roles::Assistant,
-        content: stored_reply,
-    });
+        // 添加机器人回复
+        history.push(BotMemory {
+            role: Roles::Assistant,
+            content: stored_reply,
+        });
+    }
 
     // 限制私聊记忆大小
     limit_memory_size(&mut history);
@@ -2427,10 +2431,25 @@ mod tests {
                 recall_message_ids: vec![12],
                 ..Default::default()
             },
-            ..empty
+            ..empty.clone()
         };
         assert!(!should_repair_empty_reply(
             &recall_only,
+            true,
+            &MessageUnderstanding::default()
+        ));
+
+        let mention_only = ReplyPlan {
+            action: crate::model::reply::ReplyAction {
+                at_user_ids: vec![88],
+                ..Default::default()
+            },
+            bubbles: vec![String::new()],
+            ..empty
+        };
+        assert!(mention_only.has_visible_reply());
+        assert!(!should_repair_empty_reply(
+            &mention_only,
             true,
             &MessageUnderstanding::default()
         ));
@@ -2442,6 +2461,7 @@ mod tests {
         assert!(EMPTY_REPLY_REPAIR_PROMPT.contains("不要输出工具调用"));
         assert!(EMPTY_REPLY_REPAIR_PROMPT.contains("is_current_sender=true"));
         assert!(EMPTY_REPLY_REPAIR_PROMPT.contains("at_user_ids"));
+        assert!(EMPTY_REPLY_REPAIR_PROMPT.contains("只要求发送结构化 @"));
         assert!(!EMPTY_REPLY_REPAIR_PROMPT.contains("**"));
     }
 

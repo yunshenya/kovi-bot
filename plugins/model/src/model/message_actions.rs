@@ -45,7 +45,7 @@ impl ReplyPlan {
         let parsed = parse_reply_output(content);
         let mut action = sanitize_reply_action(scope, parsed.action).await;
         let has_structured_messages = parsed.messages.is_some();
-        let bubbles = if parsed.disposition.is_silent() {
+        let mut bubbles = if parsed.disposition.is_silent() {
             Vec::new()
         } else if let Some(messages) = parsed.messages {
             sanitize_reply_sections(messages)
@@ -54,6 +54,14 @@ impl ReplyPlan {
         } else {
             split_reply(&parsed.content)
         };
+
+        // A structured @ is itself a visible QQ message. Keep a single empty
+        // bubble so the executor can send the at segment without inventing text.
+        let action_only_mention =
+            !parsed.disposition.is_silent() && bubbles.is_empty() && !action.at_user_ids.is_empty();
+        if action_only_mention {
+            bubbles.push(String::new());
+        }
         if parsed.disposition.is_silent() || bubbles.is_empty() {
             action.quote_message_id = None;
             action.at_user_ids.clear();
@@ -80,7 +88,17 @@ impl ReplyPlan {
     }
 
     pub(crate) fn has_visible_reply(&self) -> bool {
-        !self.is_silent() && !self.bubbles.is_empty()
+        !self.is_silent()
+            && (self.bubbles.iter().any(|bubble| !bubble.is_empty())
+                || self.has_action_only_mention())
+    }
+
+    fn has_action_only_mention(&self) -> bool {
+        !self.is_silent()
+            && self.content.is_empty()
+            && self.bubbles.len() == 1
+            && self.bubbles[0].is_empty()
+            && !self.action.at_user_ids.is_empty()
     }
 }
 
@@ -357,6 +375,31 @@ mod tests {
                 assert_eq!(plan.action.quote_message_id, None);
                 assert!(plan.action.at_user_ids.is_empty());
                 assert_eq!(plan.action.recall_message_ids, vec![99]);
+            });
+    }
+
+    #[test]
+    fn action_only_mention_is_a_sendable_reply() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let scope = ReplyScope::Group(9_100_008);
+                let at_user_ref =
+                    crate::model::reply::register_mention_target(scope, 8_765_432_113, "当前成员")
+                        .await;
+                let plan = ReplyPlan::from_model_output(
+                    scope,
+                    &format!(
+                        "[[REPLY_ACTION]]{{\"at_user_ids\":[{at_user_ref}]}}[[/REPLY_ACTION]]"
+                    ),
+                )
+                .await;
+
+                assert!(plan.has_visible_reply());
+                assert_eq!(plan.bubbles, vec![String::new()]);
+                assert!(plan.content.is_empty());
+                assert_eq!(plan.action.at_user_ids, vec![8_765_432_113]);
+                crate::model::reply::clear_reply_targets(scope).await;
             });
     }
 }

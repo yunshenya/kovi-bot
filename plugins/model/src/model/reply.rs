@@ -48,7 +48,8 @@ const REPLY_PROTOCOL_INSTRUCTIONS: &str = concat!(
     "工具返回 unique 时才使用其中的 at_user_ref；返回 ambiguous、not_found 或 lookup_failed 时不要猜测，也不要把普通文字当成 @。\n",
     "如果本轮明确要求按昵称 @，且解析结果为 unique，必须把对应 at_user_ref 放入 at_user_ids；",
     "如果解析结果为 ambiguous、not_found 或 lookup_failed，不要猜测或输出假的 @，自然说明需要更明确的群名片或引用消息。\n",
-    "disposition=reply 时可以正常输出正文，也可以只执行撤回而不发正文；",
+    "disposition=reply 时可以正常输出正文，也可以只发送结构化 @ 或只执行撤回而不发正文；",
+    "只发送结构化 @ 时不要为了凑正文添加无关套话，至少填写一个有效的 at_user_ids；",
     "disposition=silent 时任何正文都会被丢弃，但仍可同时执行撤回。",
     "引用只能使用收到的消息候选；@ 只能使用收到的消息候选或可按昵称 @ 的成员候选；撤回只能使用自己发送的消息候选。\n",
     "如果可见回复明确请对方发送、补发或上传图片，必须填写 requests_image=true；",
@@ -568,7 +569,9 @@ pub(crate) fn build_outbound_message(
             message.push_at(&user_id.to_string());
         }
     }
-    message.push_text(content);
+    if !content.is_empty() {
+        message.push_text(content);
+    }
     message
 }
 
@@ -1052,6 +1055,22 @@ mod tests {
                 .map(|segment| segment.type_.as_str())
                 .collect::<Vec<_>>(),
             vec!["text"]
+        );
+    }
+
+    #[test]
+    fn action_only_mention_does_not_add_an_empty_text_segment() {
+        let action = ReplyAction {
+            at_user_ids: vec![34],
+            ..ReplyAction::default()
+        };
+        let message: Message = build_outbound_message("", &action, true);
+        assert_eq!(
+            message
+                .iter()
+                .map(|segment| segment.type_.as_str())
+                .collect::<Vec<_>>(),
+            vec!["at"]
         );
     }
 }
