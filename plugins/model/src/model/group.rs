@@ -13,9 +13,9 @@ use crate::model::reply::{clear_reply_targets, record_reply_target};
 use crate::model::semantic::{MessageUnderstanding, UnderstandingRequest, understand};
 use crate::model::traffic::{InboundScope, bounded_input, should_suppress};
 use crate::model::utils::{
-    clear_group_runtime_data, command_help, is_bot_admin, is_group_paused, is_help_command,
-    is_restricted_command, learn_user_profile_from_message, process_group_reply_claimed,
-    report_vision_failure, send_sys_info,
+    clear_group_runtime_data, command_help, is_agent_task_command, is_bot_admin, is_group_paused,
+    is_help_command, is_restricted_command, learn_user_profile_from_message,
+    process_group_reply_claimed, report_vision_failure, send_sys_info,
 };
 use crate::redis_store;
 use crate::reminders;
@@ -209,6 +209,13 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
         send_tracked_group_message(&bot, group_id, reply).await;
         return;
     }
+    if is_agent_task_command(message) {
+        println!(
+            "[INFO] 群聊跨群任务命令已忽略（该控制面仅限主管理员私聊） (群组: {}, 用户: {})",
+            group_id, event.user_id
+        );
+        return;
+    }
     let stickers = extract_stickers(&event.message);
     let current_images = extract_image_attachments(&event.message);
     let vision_command = is_vision_command(message);
@@ -230,6 +237,8 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
         event.user_id,
         sender_identity.display_name(),
         message,
+        &event.message,
+        event.self_id,
     )
     .await
     {

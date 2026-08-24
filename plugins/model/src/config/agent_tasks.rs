@@ -22,6 +22,10 @@ pub struct AgentTaskConfig {
     max_active_total: usize,
     /// 单个任务最多保存多少条群成员回复。
     max_events_per_task: usize,
+    /// 达到多少条有效回复后开始等待安静窗口；0 表示只按最长等待时间收尾。
+    min_valid_replies: usize,
+    /// 达到最少有效回复后，连续没有新有效回复多久就提前收尾（秒）。
+    quiet_period_secs: u64,
     /// 单条群成员回复最多保存多少字符。
     max_event_chars: usize,
     /// 私聊汇报最多发送多少字符。
@@ -57,6 +61,14 @@ impl AgentTaskConfig {
 
     pub fn max_events_per_task(&self) -> usize {
         self.max_events_per_task
+    }
+
+    pub fn min_valid_replies(&self) -> usize {
+        self.min_valid_replies
+    }
+
+    pub fn quiet_period_secs(&self) -> u64 {
+        self.quiet_period_secs
     }
 
     pub fn max_event_chars(&self) -> usize {
@@ -104,6 +116,16 @@ impl AgentTaskConfig {
                 "agent_tasks.max_events_per_task 必须在 1 到 1000 之间"
             ));
         }
+        if self.min_valid_replies > self.max_events_per_task {
+            return Err(anyhow::anyhow!(
+                "agent_tasks.min_valid_replies 不能超过 max_events_per_task"
+            ));
+        }
+        if self.quiet_period_secs < 5 || self.quiet_period_secs > 900 {
+            return Err(anyhow::anyhow!(
+                "agent_tasks.quiet_period_secs 必须在 5 到 900 秒之间"
+            ));
+        }
         if self.max_event_chars < 20 || self.max_event_chars > 2_000 {
             return Err(anyhow::anyhow!(
                 "agent_tasks.max_event_chars 必须在 20 到 2000 之间"
@@ -133,6 +155,8 @@ impl Default for AgentTaskConfig {
             max_active_per_actor: 20,
             max_active_total: 200,
             max_events_per_task: 200,
+            min_valid_replies: 2,
+            quiet_period_secs: 45,
             max_event_chars: 500,
             max_report_chars: 3_000,
             lease_secs: 180,
@@ -153,6 +177,18 @@ mod tests {
     fn invalid_limits_are_rejected() {
         let config = AgentTaskConfig {
             max_collect_minutes: 0,
+            ..AgentTaskConfig::default()
+        };
+        assert!(config.validate().is_err());
+
+        let config = AgentTaskConfig {
+            min_valid_replies: 201,
+            ..AgentTaskConfig::default()
+        };
+        assert!(config.validate().is_err());
+
+        let config = AgentTaskConfig {
+            quiet_period_secs: 4,
             ..AgentTaskConfig::default()
         };
         assert!(config.validate().is_err());

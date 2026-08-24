@@ -1,3 +1,4 @@
+use crate::agent_tasks;
 use crate::config;
 use crate::group_access;
 use crate::memory::MEMORY_MANAGER;
@@ -77,6 +78,30 @@ pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<Runtime
             .await
             .unwrap_or_else(|| group_access::command_help().to_string());
         send_tracked_private_message(&bot, user_id, &reply).await;
+        return;
+    }
+    if let Some(command) = parse_agent_task_command(message) {
+        if bot.get_main_admin().ok() != Some(user_id) {
+            println!("[INFO] 私聊跨群任务命令未授权 (用户: {})", user_id);
+            return;
+        }
+        if matches!(command, AgentTaskCommand::Cancel(_)) {
+            stop_private_reply(user_id).await;
+        }
+        let reply = match command {
+            AgentTaskCommand::List => agent_tasks::task_status_report(user_id, None).await,
+            AgentTaskCommand::Status(task_id) => {
+                agent_tasks::task_status_report(user_id, task_id).await
+            }
+            AgentTaskCommand::Cancel(task_id) => agent_tasks::cancel_task(user_id, task_id).await,
+            AgentTaskCommand::Help => Ok(agent_tasks::task_command_help().to_string()),
+            AgentTaskCommand::Invalid => Ok(agent_tasks::task_command_help().to_string()),
+        }
+        .unwrap_or_else(|error| {
+            eprintln!("[ERROR] 处理私聊跨群任务命令失败: {}", error);
+            "这次没能读取跨群问答任务，请稍后再试。".to_string()
+        });
+        send_tracked_private_message(&bot, user_id, reply).await;
         return;
     }
     if message.trim() == "#系统信息" && sender_is_admin {
@@ -798,6 +823,96 @@ fn with_missing_recent_image_context(message: &str) -> String {
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentTaskCommand {
+    List,
+    Status(Option<i64>),
+    Cancel(Option<i64>),
+    Help,
+    Invalid,
+}
+
+fn parse_agent_task_command(message: &str) -> Option<AgentTaskCommand> {
+    let text = message.trim();
+    if text == "#群问答帮助" || text == "#跨群任务帮助" {
+        return Some(AgentTaskCommand::Help);
+    }
+    if text == "#群问答" || text == "#群任务" || text == "#跨群任务" {
+        return Some(AgentTaskCommand::List);
+    }
+    if let Some(rest) = text.strip_prefix("#群问答状态") {
+        return Some(parse_status_command_suffix(rest));
+    }
+    if let Some(rest) = text.strip_prefix("#群任务状态") {
+        return Some(parse_status_command_suffix(rest));
+    }
+    if let Some(rest) = text.strip_prefix("#取消群问答") {
+        return Some(parse_cancel_command_suffix(rest));
+    }
+    if let Some(rest) = text.strip_prefix("#群问答")
+        && (rest.is_empty() || rest.chars().next().is_some_and(char::is_whitespace))
+    {
+        let rest = rest.trim();
+        if rest.is_empty() {
+            return Some(AgentTaskCommand::List);
+        }
+        if rest == "帮助" {
+            return Some(AgentTaskCommand::Help);
+        }
+        if rest == "状态" {
+            return Some(AgentTaskCommand::Status(None));
+        }
+        if let Some(task_id) = parse_task_id(rest) {
+            return Some(AgentTaskCommand::Status(Some(task_id)));
+        }
+        if rest == "取消" {
+            return Some(AgentTaskCommand::Cancel(None));
+        }
+        if let Some(task_id) = rest.strip_prefix("取消").and_then(parse_task_id) {
+            return Some(AgentTaskCommand::Cancel(Some(task_id)));
+        }
+        return Some(AgentTaskCommand::Invalid);
+    }
+    None
+}
+
+fn parse_status_command_suffix(rest: &str) -> AgentTaskCommand {
+    if rest.is_empty() {
+        AgentTaskCommand::Status(None)
+    } else if rest.chars().next().is_some_and(char::is_whitespace) {
+        rest.trim()
+            .is_empty()
+            .then_some(AgentTaskCommand::Status(None))
+            .or_else(|| parse_task_id(rest.trim()).map(|id| AgentTaskCommand::Status(Some(id))))
+            .unwrap_or(AgentTaskCommand::Invalid)
+    } else {
+        AgentTaskCommand::Invalid
+    }
+}
+
+fn parse_cancel_command_suffix(rest: &str) -> AgentTaskCommand {
+    if rest.is_empty() {
+        AgentTaskCommand::Cancel(None)
+    } else if rest.chars().next().is_some_and(char::is_whitespace) {
+        let rest = rest.trim();
+        if rest.is_empty() {
+            AgentTaskCommand::Cancel(None)
+        } else {
+            parse_task_id(rest)
+                .map(|id| AgentTaskCommand::Cancel(Some(id)))
+                .unwrap_or(AgentTaskCommand::Invalid)
+        }
+    } else {
+        AgentTaskCommand::Invalid
+    }
+}
+
+fn parse_task_id(value: &str) -> Option<i64> {
+    let value = value.trim().strip_prefix('#').unwrap_or(value.trim());
+    let task_id = value.parse::<i64>().ok()?;
+    (task_id > 0).then_some(task_id)
+}
+
 fn should_defer_active_private_message(active_reply: bool, has_explicit_interrupt: bool) -> bool {
     active_reply && !has_explicit_interrupt
 }
@@ -876,9 +991,9 @@ async fn take_pending_private_turn(
 #[cfg(test)]
 mod tests {
     use super::{
-        PENDING_PRIVATE_MESSAGES, looks_like_immediate_stop_request,
-        normalized_private_sender_name, queue_pending_private_message, select_recent_images,
-        take_pending_private_turn, with_recent_image_context,
+        AgentTaskCommand, PENDING_PRIVATE_MESSAGES, looks_like_immediate_stop_request,
+        normalized_private_sender_name, parse_agent_task_command, queue_pending_private_message,
+        select_recent_images, take_pending_private_turn, with_recent_image_context,
     };
     use crate::model::interrupt::{
         ReplyScope, interrupt, interrupt_locked, is_current, scope_mutex,
@@ -907,6 +1022,31 @@ mod tests {
         assert!(looks_like_immediate_stop_request("不要回复了。"));
         assert!(looks_like_immediate_stop_request("stop replying"));
         assert!(!looks_like_immediate_stop_request("为什么他说不要回复了？"));
+    }
+
+    #[test]
+    fn agent_task_commands_have_explicit_ids_and_boundaries() {
+        assert_eq!(
+            parse_agent_task_command("#群问答"),
+            Some(AgentTaskCommand::List)
+        );
+        assert_eq!(
+            parse_agent_task_command("#群问答状态 #42"),
+            Some(AgentTaskCommand::Status(Some(42)))
+        );
+        assert_eq!(
+            parse_agent_task_command("#取消群问答 42"),
+            Some(AgentTaskCommand::Cancel(Some(42)))
+        );
+        assert_eq!(
+            parse_agent_task_command("#取消群问答"),
+            Some(AgentTaskCommand::Cancel(None))
+        );
+        assert_eq!(
+            parse_agent_task_command("#群问答状态abc"),
+            Some(AgentTaskCommand::Invalid)
+        );
+        assert_eq!(parse_agent_task_command("#群问答abc"), None);
     }
 
     #[test]

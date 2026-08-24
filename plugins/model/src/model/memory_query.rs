@@ -134,7 +134,7 @@ pub(crate) async fn params_model_with_tool_access(
         request.push(BotMemory {
             role: Roles::System,
             content: if tool_context.requires_group_followup {
-                "语义理解层确认用户明确要求跨群问答闭环。本轮不能只口头答应；必须调用 group.message.send，并填写 collect_replies_minutes（省略时由程序使用默认等待时长）。只有工具返回 task_status=collecting 或 already_completed 后才能说问题已发出并会汇总；不能执行或目标不唯一时不得声称已发送，结果不确定时说明无法确认且不要重试。".to_string()
+                "语义理解层确认用户明确要求跨群问答闭环。本轮不能只口头答应；必须调用 group.message.send，并填写 collect_replies_minutes（省略时由程序使用默认等待时长）。只有工具返回 task_status=collecting 或 already_completed 后才能说问题已发出并会汇总；工具返回 task_id 后可以自然告诉主管理员可用 #群问答状态 任务编号查询，必要时用 #取消群问答 任务编号取消。不能执行或目标不唯一时不得声称已发送，结果不确定时说明无法确认且不要重试。".to_string()
             } else {
                 "语义理解层确认用户明确要求立即跨群发送。本轮不能只口头答应；必须调用 group.message.send。群名目标先调用 group.message.targets。只有 group.message.send 成功后才能确认已发送；不能执行或目标不唯一时不得声称已发送，结果不确定时说明无法确认且不要重试。".to_string()
             },

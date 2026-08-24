@@ -315,6 +315,13 @@ async fn execute_send_group_message(
         }
         return Err(anyhow!("目标群的授权已失效，消息未发送"));
     }
+    if let Some(task_id) = task_id
+        && let Err(error) = crate::agent_tasks::begin_question_send(task_id).await
+    {
+        mark_goal_failed(pool, goal_id, &format!("群问题发送已停止：{error}")).await;
+        crate::agent_tasks::fail_pending_task(task_id, &format!("群问题发送已停止：{error}")).await;
+        return Err(error);
+    }
 
     let send_result = MessageTransport::new(bot)
         .send(
@@ -392,6 +399,10 @@ async fn execute_send_group_message(
             "group_id": group_id,
             "message_id": message_id,
             "collect_until": collect_until.to_rfc3339(),
+            "min_valid_replies": crate::config::get().agent_tasks().min_valid_replies(),
+            "quiet_period_secs": crate::config::get().agent_tasks().quiet_period_secs(),
+            "status_command": format!("#群问答状态 {}", task_id),
+            "cancel_command": format!("#取消群问答 {}", task_id),
         }),
         None => json!({
             "status": "completed",

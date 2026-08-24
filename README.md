@@ -131,6 +131,8 @@ default_collect_minutes = 10
 max_active_per_actor = 20
 max_active_total = 200
 max_events_per_task = 200
+min_valid_replies = 2
+quiet_period_secs = 45
 max_event_chars = 500
 max_report_chars = 3000
 lease_secs = 180
@@ -318,6 +320,7 @@ export VISION_REQUIRES_AUTH="true"
 - `system.info`：管理员查询运行时间、适配器、数据库、Redis、模型和配置状态。
 - `group.pause` / `group.resume`：管理员在群聊中让芸汐暂停或恢复当前群的自动回复。
 - `group.message.targets` / `group.message.send`：主管理员私聊专用，解析已授权群并执行持久化、可审计的跨群发言；在“去群里问一下，等回复后告诉我”这类请求中，`group.message.send` 还会创建持久化收集任务。
+- `group.question.status` / `group.question.cancel`：主管理员私聊专用，查询跨群问答的收集进度或在私聊汇报开始前取消任务。
 - `health.check`：管理员专用，检查模型鉴权、数据库、Redis、工具注册表和 readiness 状态。
 - `mcp.<服务名>.<工具名>`：来自配置白名单的 MCP 工具。
 
@@ -333,7 +336,7 @@ export VISION_REQUIRES_AUTH="true"
 
 ### 跨群问答闭环
 
-主管理员可以直接说“去开发群问一下今晚谁有空，等十分钟后把结果告诉我”。芸汐会先在唯一匹配的授权群里发出问题，随后在限定时间内收集成员文字回复，到期后把汇总发回主管理员私聊。默认每个目标群同时只允许一个收集任务；等待分钟数、回复数量、单条回复长度和汇报长度都受 `[agent_tasks]` 上限约束。群问题已经发出但后续状态不确定时不会自动重发，私聊汇报开始发送后也不会自动重复发送。
+主管理员可以直接说“去开发群问一下今晚谁有空，等十分钟后把结果告诉我”。芸汐会先在唯一匹配的授权群里发出问题，随后在限定时间内收集成员文字回复；达到 `min_valid_replies` 条有效回复并安静 `quiet_period_secs` 秒后会提前汇总，否则到最长等待时间再汇总，结果发回主管理员私聊。引用群问题、@芸汐或与问题有明确文字关联的消息会优先收集，普通命令、纯闲聊和无关消息会被过滤。默认每个目标群同时只允许一个收集任务；等待分钟数、回复数量、单条回复长度和汇报长度都受 `[agent_tasks]` 上限约束。任务创建后可发送 `#群问答` 查看最近任务、`#群问答状态 任务编号` 查看详情、`#取消群问答 任务编号` 取消任务；群问题或私聊汇报正在发送的短暂阶段不可取消。群问题已经发出但后续状态不确定时不会自动重发，私聊汇报开始发送后也不会自动重复发送。
 
 部署时可在 GitHub Actions Secrets 中增加 `BRAVE_SEARCH_API_KEY`。不配置也能搜索，但公共搜索服务可能有频率限制。
 

@@ -80,6 +80,8 @@ enum BuiltinTool {
     GroupMemberSearch,
     GroupMessageTargets,
     GroupMessageSend,
+    GroupQuestionStatus,
+    GroupQuestionCancel,
     HealthCheck,
 }
 
@@ -339,7 +341,7 @@ pub(crate) async fn initialize() -> Result<()> {
     });
     definitions.push(ToolDefinition {
         name: "group.message.send".to_string(),
-        description: "主管理员专用、仅限私聊：把一条纯文本消息发送到指定的已授权群聊。只有主管理员明确要求你现在去另一个群发言、通知、提醒、提问或转述时才调用。group_id 必须是主管理员明确给出的群号，或 group.message.targets 返回的唯一匹配；content 是最终直接发到群里的自然正文，不要包含执行说明。若用户要求去群里提问、调查或征集意见，提问默认需要收集一小段时间的回复并汇总，必须填写 collect_replies_minutes；这会创建持久化收集任务，任务到期后自动把汇总私聊给主管理员。没有唯一目标或没有明确要表达的内容时先询问，不能猜测。"
+        description: "主管理员专用、仅限私聊：把一条纯文本消息发送到指定的已授权群聊。只有主管理员明确要求你现在去另一个群发言、通知、提醒、提问或转述时才调用。group_id 必须是主管理员明确给出的群号，或 group.message.targets 返回的唯一匹配；content 是最终直接发到群里的自然正文，不要包含执行说明。若用户要求去群里提问、调查或征集意见，提问默认需要收集一小段时间的回复并汇总，必须填写 collect_replies_minutes；这会创建持久化收集任务，达到最低有效回复数且安静一段时间后可提前汇总，否则到等待上限后汇总。没有唯一目标或没有明确要表达的内容时先询问，不能猜测。"
             .to_string(),
         input_schema: json!({
             "type": "object",
@@ -366,6 +368,38 @@ pub(crate) async fn initialize() -> Result<()> {
             "additionalProperties": false
         }),
         source: ToolSource::Builtin(BuiltinTool::GroupMessageSend),
+    });
+    definitions.push(ToolDefinition {
+        name: "group.question.status".to_string(),
+        description: "主管理员专用、仅限私聊：查看跨群问答任务的状态、目标群、有效回复数和剩余等待时间。省略 task_id 时列出最近任务；用户询问‘刚才群里问得怎么样了’、‘有几个人回复’或‘还要等多久’时使用。不要把数据库字段或内部实现解释给用户。".to_string(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "task_id": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "可选的 group.message.send 返回的任务编号。"
+                }
+            },
+            "additionalProperties": false
+        }),
+        source: ToolSource::Builtin(BuiltinTool::GroupQuestionStatus),
+    });
+    definitions.push(ToolDefinition {
+        name: "group.question.cancel".to_string(),
+        description: "主管理员专用、仅限私聊：取消一个跨群问答收集任务。只能取消 group.message.send 返回的任务编号；省略 task_id 仅在当前只有一个未完成任务时允许。用户明确要求取消、停止等待或不要再汇报时使用；群问题或私聊汇报已经开始发送时不能取消，必须如实说明。".to_string(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "task_id": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "可选的跨群问答任务编号。"
+                }
+            },
+            "additionalProperties": false
+        }),
+        source: ToolSource::Builtin(BuiltinTool::GroupQuestionCancel),
     });
 
     definitions.push(ToolDefinition {
@@ -689,7 +723,7 @@ impl ToolRegistry {
             && !tool_context.scheduled
         {
             instruction.push_str(
-                "\n\n跨会话动作规则：主管理员明确要求你现在去另一个群发消息时，必须执行 group.message.send，不能只口头答应。目标是明确群号时可直接调用；目标是群名、简称或描述时先调用 group.message.targets，只能采用唯一匹配，无法唯一确定就自然询问。content 必须是准备给目标群看到的最终正文。若用户要求‘去群里问/征集意见/等待回复/之后告诉我结果’，这是闭环任务，必须在 group.message.send 中填写 collect_replies_minutes（不确定时使用默认时长），不能只发送普通消息。只有工具返回 completed 或 already_completed 后才能说已经发出；工具失败时如实说明没有成功，不要自行重试或伪造结果。",
+                "\n\n跨会话动作规则：主管理员明确要求你现在去另一个群发消息时，必须执行 group.message.send，不能只口头答应。目标是明确群号时可直接调用；目标是群名、简称或描述时先调用 group.message.targets，只能采用唯一匹配，无法唯一确定就自然询问。content 必须是准备给目标群看到的最终正文。若用户要求‘去群里问/征集意见/等待回复/之后告诉我结果’，这是闭环任务，必须在 group.message.send 中填写 collect_replies_minutes（不确定时使用默认时长），不能只发送普通消息；系统会在最低有效回复后安静一段时间提前汇总，或到等待上限汇总。工具返回中会给出 task_id，后续询问进度时调用 group.question.status，明确要求停止时调用 group.question.cancel；也可以告诉主管理员可用 #群问答状态 任务编号或 #取消群问答 任务编号。群问题或私聊汇报正在发送的短暂阶段不能取消，其余未完成阶段可以取消。只有工具返回 completed 或 already_completed 后才能说已经发出；工具失败时如实说明没有成功，不要自行重试或伪造结果。",
             );
         }
         instruction
@@ -865,6 +899,8 @@ impl ToolSource {
                     | BuiltinTool::GroupMemberSearch
                     | BuiltinTool::GroupMessageTargets
                     | BuiltinTool::GroupMessageSend
+                    | BuiltinTool::GroupQuestionStatus
+                    | BuiltinTool::GroupQuestionCancel
                     | BuiltinTool::HealthCheck
                     | BuiltinTool::StickerMemoryTeach
             ),
@@ -886,6 +922,8 @@ impl ToolSource {
                     | BuiltinTool::StickerMemoryTeach
                     | BuiltinTool::GroupMessageTargets
                     | BuiltinTool::GroupMessageSend
+                    | BuiltinTool::GroupQuestionStatus
+                    | BuiltinTool::GroupQuestionCancel
             )
         )
     }
@@ -893,7 +931,12 @@ impl ToolSource {
     fn main_admin_only(&self) -> bool {
         matches!(
             self,
-            Self::Builtin(BuiltinTool::GroupMessageTargets | BuiltinTool::GroupMessageSend)
+            Self::Builtin(
+                BuiltinTool::GroupMessageTargets
+                    | BuiltinTool::GroupMessageSend
+                    | BuiltinTool::GroupQuestionStatus
+                    | BuiltinTool::GroupQuestionCancel,
+            )
         )
     }
 
@@ -913,6 +956,9 @@ impl ToolSource {
                 matches!(destination, MessageDestination::Group(_))
             }
             Self::Builtin(BuiltinTool::GroupMessageTargets | BuiltinTool::GroupMessageSend) => {
+                matches!(destination, MessageDestination::Private(_))
+            }
+            Self::Builtin(BuiltinTool::GroupQuestionStatus | BuiltinTool::GroupQuestionCancel) => {
                 matches!(destination, MessageDestination::Private(_))
             }
             _ => true,
@@ -1162,6 +1208,17 @@ async fn execute_builtin(
                 reply_ticket,
             )
             .await
+        }
+        BuiltinTool::GroupQuestionStatus => {
+            reject_unknown_arguments(&arguments, &["task_id"])?;
+            let task_id = optional_positive_i64(&arguments, "task_id")?;
+            crate::agent_tasks::task_status_report(tool_context.actor_user_id, task_id).await
+        }
+        BuiltinTool::GroupQuestionCancel => {
+            reject_unknown_arguments(&arguments, &["task_id"])?;
+            ensure_current_tool_turn(reply_ticket).await?;
+            let task_id = optional_positive_i64(&arguments, "task_id")?;
+            crate::agent_tasks::cancel_task(tool_context.actor_user_id, task_id).await
         }
         BuiltinTool::HealthCheck => health_check().await,
     }
@@ -2663,6 +2720,27 @@ fn required_positive_i64(arguments: &Map<String, Value>, name: &str) -> Result<i
         .ok_or_else(|| anyhow!("参数 {name} 必须是正整数"))
 }
 
+fn optional_positive_i64(arguments: &Map<String, Value>, name: &str) -> Result<Option<i64>> {
+    let Some(value) = arguments.get(name) else {
+        return Ok(None);
+    };
+    value
+        .as_i64()
+        .filter(|value| *value > 0)
+        .map(Some)
+        .ok_or_else(|| anyhow!("参数 {name} 必须是正整数"))
+}
+
+async fn ensure_current_tool_turn(
+    reply_ticket: crate::model::interrupt::ReplyTicket,
+) -> Result<()> {
+    anyhow::ensure!(
+        crate::model::interrupt::is_current(reply_ticket).await,
+        "这条指令已经被更新的私聊消息打断"
+    );
+    Ok(())
+}
+
 fn reject_unknown_arguments(arguments: &Map<String, Value>, allowed: &[&str]) -> Result<()> {
     if let Some(unknown) = arguments
         .keys()
@@ -2945,6 +3023,8 @@ mod tests {
         assert!(!ToolSource::Builtin(BuiltinTool::GroupResume).available_for_scheduled());
         assert!(!ToolSource::Builtin(BuiltinTool::GroupMessageTargets).available_for_scheduled());
         assert!(!ToolSource::Builtin(BuiltinTool::GroupMessageSend).available_for_scheduled());
+        assert!(!ToolSource::Builtin(BuiltinTool::GroupQuestionStatus).available_for_scheduled());
+        assert!(!ToolSource::Builtin(BuiltinTool::GroupQuestionCancel).available_for_scheduled());
         assert!(!ToolSource::Builtin(BuiltinTool::HealthCheck).available_for_scheduled());
         assert!(!ToolSource::Builtin(BuiltinTool::StickerMemoryTeach).available_for_scheduled());
         assert!(ToolSource::Builtin(BuiltinTool::HealthCheck).admin_only());
@@ -2961,10 +3041,16 @@ mod tests {
         assert!(sticker_teach.needs_sticker_teaching_context());
         let group_targets = ToolSource::Builtin(BuiltinTool::GroupMessageTargets);
         let group_send = ToolSource::Builtin(BuiltinTool::GroupMessageSend);
+        let question_status = ToolSource::Builtin(BuiltinTool::GroupQuestionStatus);
+        let question_cancel = ToolSource::Builtin(BuiltinTool::GroupQuestionCancel);
         assert!(group_targets.admin_only());
         assert!(group_targets.main_admin_only());
         assert!(group_send.admin_only());
         assert!(group_send.main_admin_only());
+        assert!(question_status.admin_only());
+        assert!(question_status.main_admin_only());
+        assert!(question_cancel.admin_only());
+        assert!(question_cancel.main_admin_only());
 
         let private = MessageDestination::Private(7);
         let group = MessageDestination::Group(8);
@@ -2987,8 +3073,12 @@ mod tests {
         assert!(!ToolSource::Builtin(BuiltinTool::GroupMemberSearch).available_for_scheduled());
         assert!(group_targets.available_for_context(private, false));
         assert!(group_send.available_for_context(private, false));
+        assert!(question_status.available_for_context(private, false));
+        assert!(question_cancel.available_for_context(private, false));
         assert!(!group_targets.available_for_context(group, false));
         assert!(!group_send.available_for_context(group, false));
+        assert!(!question_status.available_for_context(group, false));
+        assert!(!question_cancel.available_for_context(group, false));
     }
 
     #[test]
