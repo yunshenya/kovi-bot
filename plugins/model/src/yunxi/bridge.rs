@@ -134,10 +134,10 @@ impl ShadowBridge {
             return None;
         };
         let result = arbiter.dispatch(action.clone(), port.as_ref()).await;
-        if let Some(event) = action_result_event(&action, &result, Utc::now()) {
-            if let Err(error) = self.runtime.submit(event).await {
-                kovi::log::warn!("Yunxi action result could not enter runtime: {error}");
-            }
+        if let Some(event) = action_result_event(&action, &result, Utc::now())
+            && let Err(error) = self.runtime.submit(event).await
+        {
+            kovi::log::warn!("Yunxi action result could not enter runtime: {error}");
         }
         Some(result)
     }

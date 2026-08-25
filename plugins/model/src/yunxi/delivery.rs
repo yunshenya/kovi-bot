@@ -140,8 +140,7 @@ impl QqActionAdapter {
             })?;
         let Some(user_id) = external_id
             .as_deref()
-            .map(|value| single_positive_qq_id(&[value.to_owned()]))
-            .flatten()
+            .and_then(|value| single_positive_qq_id(&[value.to_owned()]))
         else {
             return Err(DeliveryResolutionError::Unavailable { person_id });
         };
@@ -149,7 +148,7 @@ impl QqActionAdapter {
         let self_id = self
             .current_self_id()
             .await
-            .map_err(|error| DeliveryResolutionError::failed(error))?;
+            .map_err(DeliveryResolutionError::failed)?;
         let external = qq::direct(self_id, user_id).map_err(|error| {
             DeliveryResolutionError::failed(QqAdapterFailure::new(
                 "direct conversation reference",
