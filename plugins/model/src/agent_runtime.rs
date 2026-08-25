@@ -6,7 +6,7 @@ use crate::group_access;
 use crate::memory::MEMORY_MANAGER;
 use crate::model::{
     MessageDestination, OutgoingSource, ReplyTicket, is_current,
-    send_tracked_message_with_revalidation,
+    send_tracked_message_with_revalidation_guard,
 };
 use anyhow::{Context, Result, anyhow, ensure};
 use chrono::{Duration as ChronoDuration, Utc};
@@ -309,22 +309,27 @@ async fn execute_send_group_message(
         return Err(anyhow!("这条指令已经被更新的私聊消息打断"));
     }
     let delivery_key = format!("agent-goal:{goal_id}:group-send");
-    let send_result = send_tracked_message_with_revalidation(
+    let send_result = send_tracked_message_with_revalidation_guard(
         bot,
         MessageDestination::Group(group_id),
         Message::from(content.clone()),
-        OutgoingSource::Reply,
+        OutgoingSource::Proactive,
         Some(&delivery_key),
         || async {
-            if !is_current(reply_ticket).await || ensure_group_joined(bot, group_id).await.is_err() {
-                return false;
+            if !is_current(reply_ticket).await || ensure_group_joined(bot, group_id).await.is_err()
+            {
+                return None;
             }
-            match task_id {
+            let gate_open = match task_id {
                 Some(task_id) => crate::agent_tasks::begin_question_send(task_id)
                     .await
                     .is_ok(),
                 None => true,
+            };
+            if !gate_open {
+                return None;
             }
+            crate::model::utils::authorize_main_admin_commit(bot, context.actor_user_id).await
         },
     )
     .await;

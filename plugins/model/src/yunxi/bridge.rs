@@ -6,7 +6,11 @@
 //! owner of all model calls and QQ side effects.
 
 use super::qq;
-use crate::model::{ReplyScope, is_recent_bot_message, take_message_collisions};
+use crate::model::{
+    IncomingAdmission, ReplyScope, is_recent_bot_message, restore_message_collisions,
+    take_message_collisions,
+};
+use anyhow::Context;
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use kovi::RuntimeBot;
 use kovi::bot::message::Message;
@@ -14,6 +18,8 @@ use kovi::event::{GroupMsgEvent, PrivateMsgEvent};
 use kovi::tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock, mpsc, oneshot};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use yunxi_core::{
@@ -31,6 +37,7 @@ pub(crate) const MESSAGE_REFERENCE_CAPACITY: usize = 4_096;
 const MAX_TRACKED_USERS: usize = 256;
 const MAX_TRACKED_DIRECT_CONVERSATIONS_PER_USER: usize = 256;
 const MAX_BLOCKED_USERS: usize = 256;
+const MAX_BLOCKED_GROUPS: usize = 256;
 const MAX_PRIVATE_HANDLER_GATES: usize = 1_024;
 const MAX_MESSAGE_CHARS: usize = 8_192;
 const MAX_MESSAGE_BYTES: usize = 32 * 1_024;
@@ -46,6 +53,12 @@ pub(crate) enum EnqueueOutcome {
 
 enum IngressCommand {
     Message(InboundMessage),
+    ProjectDestination {
+        destination: crate::model::MessageDestination,
+        priority: EventPriority,
+        kind: WorldEventKind,
+        acknowledge: oneshot::Sender<Result<Admission, String>>,
+    },
     FlushMessageCollisions {
         sender_user_id: i64,
         address: ConversationAddress,
@@ -66,6 +79,15 @@ enum IngressCommand {
         runtime_barrier_person_id: yunxi_core::PersonId,
         acknowledge: oneshot::Sender<anyhow::Result<()>>,
     },
+    BeginGroupDataErasure {
+        group_id: i64,
+        acknowledge: oneshot::Sender<anyhow::Result<GroupDataErasureAck>>,
+    },
+    EndGroupDataErasure {
+        group_id: i64,
+        conversation_ids: Vec<ConversationId>,
+        acknowledge: oneshot::Sender<anyhow::Result<()>>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -78,6 +100,50 @@ struct DataErasureAck {
     cleared_person_routes: usize,
     cleared_conversation_routes: usize,
     cleared_tracked_routes: usize,
+}
+
+#[derive(Debug, Clone)]
+struct GroupDataErasureAck {
+    conversation_ids: Vec<ConversationId>,
+    purged_runtime_states: usize,
+    cleared_references: usize,
+    cleared_person_routes: usize,
+    cleared_conversation_routes: usize,
+}
+
+pub(crate) struct GroupDataErasure {
+    bridge: Arc<ShadowBridge>,
+    group_id: i64,
+    conversation_ids: Vec<ConversationId>,
+    #[cfg_attr(not(test), allow(dead_code))]
+    ack: GroupDataErasureAck,
+    finished: bool,
+}
+
+impl GroupDataErasure {
+    pub(crate) async fn finish(mut self) -> anyhow::Result<()> {
+        self.bridge
+            .end_group_data_erasure(self.group_id, self.conversation_ids.clone())
+            .await?;
+        self.finished = true;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn ack(&self) -> GroupDataErasureAck {
+        self.ack.clone()
+    }
+}
+
+impl Drop for GroupDataErasure {
+    fn drop(&mut self) {
+        if !self.finished {
+            kovi::log::warn!(
+                "Yunxi group data-erasure barrier dropped without resume (QQ group: {})",
+                self.group_id
+            );
+        }
+    }
 }
 
 pub(crate) struct UserDataErasure {
@@ -285,7 +351,9 @@ pub(crate) struct ShadowBridge {
     action_arbiter: Option<Arc<ActionArbiter>>,
     action_port: Option<Arc<dyn ActionPort>>,
     blocked_users: Arc<StdMutex<HashSet<i64>>>,
+    blocked_groups: Arc<StdMutex<HashSet<i64>>>,
     private_handler_gates: Arc<PrivateHandlerGateRegistry>,
+    group_handler_gates: Arc<PrivateHandlerGateRegistry>,
 }
 
 impl fmt::Debug for ShadowBridge {
@@ -301,7 +369,15 @@ impl fmt::Debug for ShadowBridge {
                     .lock()
                     .map_or(MAX_BLOCKED_USERS, |users| users.len()),
             )
+            .field(
+                "blocked_groups",
+                &self
+                    .blocked_groups
+                    .lock()
+                    .map_or(MAX_BLOCKED_GROUPS, |groups| groups.len()),
+            )
             .field("private_handler_gates", &"bounded per-user epochs")
+            .field("group_handler_gates", &"bounded per-group epochs")
             .finish_non_exhaustive()
     }
 }
@@ -337,6 +413,7 @@ impl ShadowBridge {
             Arc::clone(&store),
             open_loop_store_for_adapter,
             goal_store_for_adapter,
+            model.tool_turn_registry(),
         );
         let mut services = CoreServices::new(Arc::clone(&model) as Arc<dyn ModelBackend>)
             .with_identity(Arc::clone(&store) as Arc<dyn IdentityStore>)
@@ -378,7 +455,12 @@ impl ShadowBridge {
         let blocked_users = Arc::new(StdMutex::new(HashSet::with_capacity(
             MAX_BLOCKED_USERS.min(32),
         )));
+        let blocked_groups = Arc::new(StdMutex::new(HashSet::with_capacity(
+            MAX_BLOCKED_GROUPS.min(32),
+        )));
         let private_handler_gates =
+            Arc::new(PrivateHandlerGateRegistry::new(MAX_PRIVATE_HANDLER_GATES));
+        let group_handler_gates =
             Arc::new(PrivateHandlerGateRegistry::new(MAX_PRIVATE_HANDLER_GATES));
         let (runtime_handle, runtime) = services.map_or_else(
             || {
@@ -416,6 +498,9 @@ impl ShadowBridge {
 
         let scheduler_runtime = runtime_handle.clone();
         let bridge_runtime = runtime_handle.clone();
+        let incoming_releaser = model_backend
+            .as_ref()
+            .map(|backend| Arc::clone(backend) as Arc<dyn IncomingAdmissionReleaser>);
         kovi::tokio::spawn(run_ingress(
             receiver,
             store,
@@ -424,6 +509,7 @@ impl ShadowBridge {
             model_backend,
             message_store,
             Arc::clone(&blocked_users),
+            Arc::clone(&blocked_groups),
             action_arbiter.clone(),
             action_port.clone(),
             Arc::clone(&private_handler_gates),
@@ -432,6 +518,7 @@ impl ShadowBridge {
             runtime,
             action_arbiter.clone(),
             action_port.clone(),
+            incoming_releaser,
         ));
         if let Some(open_loop_store) = open_loop_store {
             super::open_loop_scheduler::start(open_loop_store, scheduler_runtime);
@@ -442,7 +529,9 @@ impl ShadowBridge {
             action_arbiter,
             action_port,
             blocked_users,
+            blocked_groups,
             private_handler_gates,
+            group_handler_gates,
         })
     }
 
@@ -485,10 +574,39 @@ impl ShadowBridge {
         self.runtime.submit(event).await
     }
 
-    pub(crate) fn enqueue_group(&self, event: &GroupMsgEvent) -> EnqueueOutcome {
-        let Some(message) = InboundMessage::from_group(event) else {
+    pub(crate) async fn project_destination(
+        &self,
+        destination: crate::model::MessageDestination,
+        priority: EventPriority,
+        kind: WorldEventKind,
+    ) -> Result<Admission, String> {
+        if self.destination_is_blocked(destination) {
+            return Err("Yunxi destination is blocked by a data-erasure barrier".to_string());
+        }
+        let (acknowledge, acknowledged) = oneshot::channel();
+        self.ingress
+            .send(IngressCommand::ProjectDestination {
+                destination,
+                priority,
+                kind,
+                acknowledge,
+            })
+            .await
+            .map_err(|_| "Yunxi ingress is closed".to_string())?;
+        acknowledged
+            .await
+            .map_err(|_| "Yunxi projection acknowledgement was dropped".to_string())?
+    }
+
+    pub(crate) fn enqueue_group(
+        &self,
+        event: &GroupMsgEvent,
+        incoming_admission: IncomingAdmission,
+    ) -> EnqueueOutcome {
+        let Some(mut message) = InboundMessage::from_group(event) else {
             return EnqueueOutcome::SkippedInvalid;
         };
+        message.incoming_admission = Some(incoming_admission);
         self.try_enqueue(message)
     }
 
@@ -500,10 +618,15 @@ impl ShadowBridge {
         self.try_enqueue(message)
     }
 
-    pub(crate) fn enqueue_private(&self, event: &PrivateMsgEvent) -> EnqueueOutcome {
-        let Some(message) = InboundMessage::from_private(event) else {
+    pub(crate) fn enqueue_private(
+        &self,
+        event: &PrivateMsgEvent,
+        incoming_admission: IncomingAdmission,
+    ) -> EnqueueOutcome {
+        let Some(mut message) = InboundMessage::from_private(event) else {
             return EnqueueOutcome::SkippedInvalid;
         };
+        message.incoming_admission = Some(incoming_admission);
         self.try_enqueue(message)
     }
 
@@ -546,7 +669,7 @@ impl ShadowBridge {
         sender_user_id: i64,
         address: ConversationAddress,
     ) -> anyhow::Result<usize> {
-        if self.is_user_blocked(sender_user_id) {
+        if self.is_user_blocked(sender_user_id) || self.address_is_blocked(address) {
             return Ok(0);
         }
         let (acknowledge, acknowledged) = oneshot::channel();
@@ -601,7 +724,8 @@ impl ShadowBridge {
     }
 
     fn try_enqueue(&self, message: InboundMessage) -> EnqueueOutcome {
-        if self.is_user_blocked(message.sender_user_id) {
+        if self.is_user_blocked(message.sender_user_id) || self.address_is_blocked(message.address)
+        {
             return EnqueueOutcome::Blocked;
         }
         match self.ingress.try_send(IngressCommand::Message(message)) {
@@ -614,6 +738,21 @@ impl ShadowBridge {
     pub(crate) fn is_user_blocked(&self, user_id: i64) -> bool {
         is_blocked(self.blocked_users.as_ref(), user_id)
             || self.private_handler_gates.deletion_pending(user_id)
+    }
+
+    pub(crate) fn is_group_blocked(&self, group_id: i64) -> bool {
+        is_blocked(self.blocked_groups.as_ref(), group_id)
+    }
+
+    fn address_is_blocked(&self, address: ConversationAddress) -> bool {
+        matches!(address, ConversationAddress::Group { group_id } if self.is_group_blocked(group_id))
+    }
+
+    fn destination_is_blocked(&self, destination: crate::model::MessageDestination) -> bool {
+        match destination {
+            crate::model::MessageDestination::Group(group_id) => self.is_group_blocked(group_id),
+            crate::model::MessageDestination::Private(user_id) => self.is_user_blocked(user_id),
+        }
     }
 
     pub(crate) fn capture_private_handler(&self, user_id: i64) -> Option<PrivateHandlerToken> {
@@ -638,6 +777,30 @@ impl ShadowBridge {
             return None;
         }
         self.private_handler_gates.capture_data_erasure(user_id)
+    }
+
+    pub(crate) fn capture_group_handler(&self, group_id: i64) -> Option<PrivateHandlerToken> {
+        if !valid_qq_id(group_id) || self.is_group_blocked(group_id) {
+            return None;
+        }
+        let gate = self.group_handler_gates.gate(group_id)?;
+        if gate.deletion_pending.load(Ordering::Acquire) {
+            return None;
+        }
+        Some(PrivateHandlerToken {
+            epoch: gate.epoch.load(Ordering::Acquire),
+            gate,
+        })
+    }
+
+    pub(crate) fn capture_group_data_erasure(
+        &self,
+        group_id: i64,
+    ) -> Option<PrivateDataErasureToken> {
+        if !valid_qq_id(group_id) || self.is_group_blocked(group_id) {
+            return None;
+        }
+        self.group_handler_gates.capture_data_erasure(group_id)
     }
 
     pub(crate) async fn begin_user_data_erasure(
@@ -726,10 +889,93 @@ impl ShadowBridge {
         Ok(())
     }
 
+    pub(crate) async fn begin_group_data_erasure(
+        self: &Arc<Self>,
+        group_id: i64,
+    ) -> anyhow::Result<GroupDataErasure> {
+        anyhow::ensure!(
+            valid_qq_id(group_id),
+            "invalid QQ group id for data erasure"
+        );
+        {
+            let mut blocked = self
+                .blocked_groups
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Yunxi blocked-group state is poisoned"))?;
+            anyhow::ensure!(
+                !blocked.contains(&group_id),
+                "a data erasure is already active for this QQ group"
+            );
+            anyhow::ensure!(
+                blocked.len() < MAX_BLOCKED_GROUPS,
+                "too many concurrent Yunxi group data erasures"
+            );
+            blocked.insert(group_id);
+        }
+
+        let (acknowledge, acknowledged) = oneshot::channel();
+        if self
+            .ingress
+            .send(IngressCommand::BeginGroupDataErasure {
+                group_id,
+                acknowledge,
+            })
+            .await
+            .is_err()
+        {
+            self.unblock_group(group_id);
+            return Err(anyhow::anyhow!("Yunxi ingress is closed"));
+        }
+        let ack = match acknowledged.await {
+            Ok(Ok(ack)) => ack,
+            Ok(Err(error)) => {
+                self.unblock_group(group_id);
+                return Err(error);
+            }
+            Err(_) => {
+                return Err(anyhow::anyhow!(
+                    "Yunxi group erasure acknowledgement was dropped; ingress remains blocked"
+                ));
+            }
+        };
+        Ok(GroupDataErasure {
+            bridge: Arc::clone(self),
+            group_id,
+            conversation_ids: ack.conversation_ids.clone(),
+            ack,
+            finished: false,
+        })
+    }
+
+    async fn end_group_data_erasure(
+        &self,
+        group_id: i64,
+        conversation_ids: Vec<ConversationId>,
+    ) -> anyhow::Result<()> {
+        let (acknowledge, acknowledged) = oneshot::channel();
+        self.ingress
+            .send(IngressCommand::EndGroupDataErasure {
+                group_id,
+                conversation_ids,
+                acknowledge,
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("Yunxi ingress is closed"))?;
+        acknowledged
+            .await
+            .map_err(|_| anyhow::anyhow!("Yunxi group resume acknowledgement was dropped"))??;
+        self.unblock_group(group_id);
+        Ok(())
+    }
+
     fn unblock_user(&self, user_id: i64) {
         if let Ok(mut blocked) = self.blocked_users.lock() {
             blocked.remove(&user_id);
         }
+    }
+
+    fn unblock_group(&self, group_id: i64) {
+        unblock(self.blocked_groups.as_ref(), group_id);
     }
 
     /// Submit a best-effort global idle observation without waiting on the
@@ -785,6 +1031,13 @@ fn action_result_event(
             outcome: yunxi_core::ActionPortOutcome::Delivered { .. },
             ..
         } => WorldEventKind::ActionSucceeded(yunxi_core::ActionSucceededEvent { idempotency_key }),
+        ActionResult::Executed {
+            outcome: yunxi_core::ActionPortOutcome::DeliveryIndeterminate { reason, .. },
+            ..
+        } => WorldEventKind::ActionFailed(yunxi_core::ActionFailedEvent {
+            idempotency_key,
+            error_category: format!("delivery_indeterminate:{reason}"),
+        }),
         ActionResult::Executed {
             outcome: yunxi_core::ActionPortOutcome::Deferred { reason },
             ..
@@ -871,6 +1124,10 @@ struct InboundMessage {
     visible_reply_allowed: bool,
     explicit_request: bool,
     stop_requested: bool,
+    /// Host conversation admission captured before this event entered the
+    /// asynchronous Core queues. It is consumed exactly once by the model
+    /// backend and never crosses into the platform-neutral Core event schema.
+    incoming_admission: Option<IncomingAdmission>,
 }
 
 impl InboundMessage {
@@ -896,6 +1153,7 @@ impl InboundMessage {
             visible_reply_allowed: true,
             explicit_request: false,
             stop_requested: looks_like_stop_request(&text),
+            incoming_admission: None,
             text,
             attachments,
             timestamp: event_timestamp(event.time),
@@ -922,6 +1180,7 @@ impl InboundMessage {
             visible_reply_allowed: true,
             explicit_request: true,
             stop_requested: looks_like_stop_request(&text),
+            incoming_admission: None,
             text,
             attachments,
             timestamp: event_timestamp(event.time),
@@ -1093,6 +1352,7 @@ async fn run_ingress(
     model_backend: Option<Arc<super::core_model::KoviModelBackend>>,
     message_store: Option<Arc<super::identity_store::PostgresIdentityStore>>,
     blocked_users: Arc<StdMutex<HashSet<i64>>>,
+    blocked_groups: Arc<StdMutex<HashSet<i64>>>,
     action_arbiter: Option<Arc<ActionArbiter>>,
     action_port: Option<Arc<dyn ActionPort>>,
     private_handler_gates: Arc<PrivateHandlerGateRegistry>,
@@ -1101,11 +1361,22 @@ async fn run_ingress(
     let mut routes =
         IngressRouteTracker::new(MAX_TRACKED_USERS, MAX_TRACKED_DIRECT_CONVERSATIONS_PER_USER);
     let mut blocked_at_ingress = HashSet::with_capacity(MAX_BLOCKED_USERS.min(32));
+    let mut blocked_groups_at_ingress = HashSet::with_capacity(MAX_BLOCKED_GROUPS.min(32));
+    let mut group_erasure_conversations: HashMap<i64, Vec<ConversationId>> = HashMap::new();
     let mut alias_handler_barriers: HashMap<i64, Vec<PrivateDataErasurePermit>> = HashMap::new();
     while let Some(command) = receiver.recv().await {
         match command {
             IngressCommand::Message(message) => {
-                if blocked_at_ingress.contains(&message.sender_user_id) {
+                if blocked_at_ingress.contains(&message.sender_user_id)
+                    || matches!(
+                        message.address,
+                        ConversationAddress::Group { group_id }
+                            if blocked_groups_at_ingress.contains(&group_id)
+                    )
+                {
+                    if let Some(admission) = message.incoming_admission {
+                        crate::model::ConversationCoordinator::abandon_incoming(admission).await;
+                    }
                     continue;
                 }
                 if let Err(error) = resolve_and_submit_inner(
@@ -1120,22 +1391,65 @@ async fn run_ingress(
                 )
                 .await
                 {
+                    if let Some(admission) = message.incoming_admission {
+                        crate::model::ConversationCoordinator::abandon_incoming(admission).await;
+                    }
                     eprintln!(
                         "[WARN] Yunxi shadow message dropped during identity resolution: {error}"
                     );
                 }
+            }
+            IngressCommand::ProjectDestination {
+                destination,
+                priority,
+                kind,
+                acknowledge,
+            } => {
+                let blocked = match destination {
+                    crate::model::MessageDestination::Private(user_id) => {
+                        blocked_at_ingress.contains(&user_id)
+                    }
+                    crate::model::MessageDestination::Group(group_id) => {
+                        blocked_groups_at_ingress.contains(&group_id)
+                    }
+                };
+                let result = if blocked {
+                    Err("Yunxi destination is blocked by a data-erasure barrier".to_string())
+                } else {
+                    resolve_projected_destination(
+                        destination,
+                        priority,
+                        kind,
+                        store.as_ref(),
+                        &runtime,
+                    )
+                    .await
+                };
+                let _ = acknowledge.send(result);
             }
             IngressCommand::FlushMessageCollisions {
                 sender_user_id,
                 address,
                 acknowledge,
             } => {
-                let result = if blocked_at_ingress.contains(&sender_user_id) {
+                let result = if blocked_at_ingress.contains(&sender_user_id)
+                    || matches!(
+                        address,
+                        ConversationAddress::Group { group_id }
+                            if blocked_groups_at_ingress.contains(&group_id)
+                    ) {
                     Err(anyhow::anyhow!(
                         "Yunxi collision flush blocked by data-erasure barrier"
                     ))
                 } else {
-                    resolve_and_submit_collisions(address, store.as_ref(), &runtime).await
+                    resolve_and_submit_collisions(
+                        address,
+                        sender_user_id,
+                        store.as_ref(),
+                        message_store.as_deref(),
+                        &runtime,
+                    )
+                    .await
                 };
                 if let Err(error) = &result {
                     kovi::log::warn!(
@@ -1149,7 +1463,15 @@ async fn run_ingress(
                 action,
                 acknowledge,
             } => {
-                if blocked_at_ingress.contains(&user_id) {
+                let blocked_conversation = match action.scope() {
+                    yunxi_core::ActionScope::Conversation(conversation_id) => {
+                        group_erasure_conversations
+                            .values()
+                            .any(|blocked| blocked.contains(&conversation_id))
+                    }
+                    yunxi_core::ActionScope::Person(_) | yunxi_core::ActionScope::Global => false,
+                };
+                if blocked_at_ingress.contains(&user_id) || blocked_conversation {
                     let _ = acknowledge.send(None);
                     continue;
                 }
@@ -1247,6 +1569,74 @@ async fn run_ingress(
                         routes.remove(*blocked_user_id);
                     }
                     unblock_users(&mut blocked_at_ingress, &blocked_users, &blocked_user_ids);
+                }
+                let _ = acknowledge.send(result);
+            }
+            IngressCommand::BeginGroupDataErasure {
+                group_id,
+                acknowledge,
+            } => {
+                blocked_groups_at_ingress.insert(group_id);
+                let result = begin_group_data_erasure_at_ingress_barrier(
+                    group_id,
+                    &runtime,
+                    &mut references,
+                    model_backend.as_deref(),
+                    message_store.as_deref(),
+                    &mut group_erasure_conversations,
+                )
+                .await;
+                if let Ok(ack) = &result {
+                    kovi::log::debug!(
+                        "Yunxi group data-erasure barrier ready: group={} conversations={:?} runtime_states={} references={} person_routes={} conversation_routes={}",
+                        group_id,
+                        ack.conversation_ids,
+                        ack.purged_runtime_states,
+                        ack.cleared_references,
+                        ack.cleared_person_routes,
+                        ack.cleared_conversation_routes,
+                    );
+                }
+                if result.is_err() {
+                    blocked_groups_at_ingress.remove(&group_id);
+                    unblock(&blocked_groups, group_id);
+                }
+                if let Err(result) = acknowledge.send(result)
+                    && let Ok(ack) = result
+                {
+                    match end_group_data_erasure_at_ingress_barrier(
+                        group_id,
+                        ack.conversation_ids,
+                        &runtime,
+                        &mut group_erasure_conversations,
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            blocked_groups_at_ingress.remove(&group_id);
+                            unblock(&blocked_groups, group_id);
+                        }
+                        Err(error) => kovi::log::warn!(
+                            "Yunxi group erasure caller disappeared and resume failed; retaining ingress block for QQ group {group_id}: {error}"
+                        ),
+                    }
+                }
+            }
+            IngressCommand::EndGroupDataErasure {
+                group_id,
+                conversation_ids,
+                acknowledge,
+            } => {
+                let result = end_group_data_erasure_at_ingress_barrier(
+                    group_id,
+                    conversation_ids,
+                    &runtime,
+                    &mut group_erasure_conversations,
+                )
+                .await;
+                if result.is_ok() {
+                    blocked_groups_at_ingress.remove(&group_id);
+                    unblock(&blocked_groups, group_id);
                 }
                 let _ = acknowledge.send(result);
             }
@@ -1462,6 +1852,79 @@ async fn end_data_erasure_at_ingress_barrier(
     Ok(())
 }
 
+async fn begin_group_data_erasure_at_ingress_barrier(
+    group_id: i64,
+    runtime: &RuntimeHandle,
+    references: &mut MessageReferenceCache,
+    model_backend: Option<&super::core_model::KoviModelBackend>,
+    message_store: Option<&super::identity_store::PostgresIdentityStore>,
+    active: &mut HashMap<i64, Vec<ConversationId>>,
+) -> anyhow::Result<GroupDataErasureAck> {
+    anyhow::ensure!(
+        !active.contains_key(&group_id),
+        "duplicate Yunxi group data-erasure barrier"
+    );
+    let message_store = message_store
+        .context("Yunxi PostgreSQL identity store is unavailable for group data erasure")?;
+    let persistent_conversation_id = message_store
+        .qq_group_conversation_id(group_id)
+        .await
+        .map_err(anyhow::Error::from)?;
+    let (mut conversation_ids, cleared_person_routes, cleared_conversation_routes) =
+        if let Some(model_backend) = model_backend {
+            model_backend.purge_group_routes(group_id).await
+        } else {
+            (Vec::new(), 0, 0)
+        };
+    if let Some(conversation_id) = persistent_conversation_id
+        && !conversation_ids.contains(&conversation_id)
+    {
+        conversation_ids.push(conversation_id);
+    }
+    let purged_runtime_states = if conversation_ids.is_empty() {
+        0
+    } else {
+        runtime
+            .begin_conversation_data_erasures(conversation_ids.iter().copied())
+            .await
+            .map_err(anyhow::Error::from)?
+    };
+    let cleared_references = references.remove_conversations(&conversation_ids);
+    active.insert(group_id, conversation_ids.clone());
+    Ok(GroupDataErasureAck {
+        conversation_ids,
+        purged_runtime_states,
+        cleared_references,
+        cleared_person_routes,
+        cleared_conversation_routes,
+    })
+}
+
+async fn end_group_data_erasure_at_ingress_barrier(
+    group_id: i64,
+    conversation_ids: Vec<ConversationId>,
+    runtime: &RuntimeHandle,
+    active: &mut HashMap<i64, Vec<ConversationId>>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        active.get(&group_id) == Some(&conversation_ids),
+        "Yunxi ingress had no matching group data-erasure barrier"
+    );
+    if !conversation_ids.is_empty() {
+        let resumed = runtime
+            .end_conversation_data_erasures(conversation_ids.iter().copied())
+            .await
+            .map_err(anyhow::Error::from)?;
+        anyhow::ensure!(
+            resumed == conversation_ids.len(),
+            "Yunxi runtime resumed {resumed} of {} conversation data-erasure barriers",
+            conversation_ids.len()
+        );
+    }
+    active.remove(&group_id);
+    Ok(())
+}
+
 fn block_user_aliases(
     initiating_user_id: i64,
     user_ids: &[i64],
@@ -1523,10 +1986,36 @@ fn unblock(blocked_users: &StdMutex<HashSet<i64>>, user_id: i64) {
     }
 }
 
+type IncomingAdmissionReleaseFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+
+trait IncomingAdmissionReleaser: Send + Sync {
+    fn discard<'a>(&'a self, message_id: MessageId) -> IncomingAdmissionReleaseFuture<'a>;
+}
+
+impl IncomingAdmissionReleaser for super::core_model::KoviModelBackend {
+    fn discard<'a>(&'a self, message_id: MessageId) -> IncomingAdmissionReleaseFuture<'a> {
+        Box::pin(async move {
+            self.discard_incoming(message_id).await;
+        })
+    }
+}
+
+async fn release_rejected_incoming(
+    event: &WorldEvent,
+    releaser: Option<&dyn IncomingAdmissionReleaser>,
+) {
+    let (Some(releaser), WorldEventKind::MessageReceived(message)) = (releaser, event.kind())
+    else {
+        return;
+    };
+    releaser.discard(message.message_id).await;
+}
+
 async fn run_runtime(
     mut runtime: CognitiveRuntime,
     action_arbiter: Option<Arc<ActionArbiter>>,
     action_port: Option<Arc<dyn ActionPort>>,
+    incoming_releaser: Option<Arc<dyn IncomingAdmissionReleaser>>,
 ) {
     let planned = runtime.planner().is_some();
     if planned
@@ -1549,8 +2038,9 @@ async fn run_runtime(
                         actions.len(),
                     );
                 }
-                Ok(PlannedProcessingOutcome::RejectedEvent { .. })
-                | Ok(PlannedProcessingOutcome::RejectedState { .. }) => {
+                Ok(PlannedProcessingOutcome::RejectedEvent { event, .. })
+                | Ok(PlannedProcessingOutcome::RejectedState { event, .. }) => {
+                    release_rejected_incoming(&event, incoming_releaser.as_deref()).await;
                     kovi::log::warn!("Yunxi Core planner rejected an event");
                 }
                 Err(error) => kovi::log::warn!("Yunxi Core planner failed: {error}"),
@@ -1571,7 +2061,9 @@ async fn run_runtime(
                     observation.state,
                 );
             }
-            ProcessingOutcome::RejectedEvent { .. } | ProcessingOutcome::RejectedState { .. } => {
+            ProcessingOutcome::RejectedEvent { event, .. }
+            | ProcessingOutcome::RejectedState { event, .. } => {
+                release_rejected_incoming(&event, incoming_releaser.as_deref()).await;
                 kovi::log::warn!("Yunxi shadow runtime rejected an event");
             }
         }
@@ -1586,6 +2078,37 @@ async fn resolve_and_submit(
     references: &mut MessageReferenceCache,
 ) -> anyhow::Result<()> {
     resolve_and_submit_inner(message, store, runtime, references, None, None, None, None).await
+}
+
+async fn resolve_projected_destination(
+    destination: crate::model::MessageDestination,
+    priority: EventPriority,
+    kind: WorldEventKind,
+    store: &dyn IdentityStore,
+    runtime: &RuntimeHandle,
+) -> Result<Admission, String> {
+    let scope = match destination {
+        crate::model::MessageDestination::Private(user_id) => {
+            let external = qq::person(user_id).map_err(|error| error.to_string())?;
+            let person_id = store
+                .resolve_external_identity(&external)
+                .await
+                .map_err(|error| error.to_string())?;
+            EventScope::Person { person_id }
+        }
+        crate::model::MessageDestination::Group(group_id) => {
+            let external = qq::group(group_id).map_err(|error| error.to_string())?;
+            let conversation_id = store
+                .resolve_external_conversation(&external)
+                .await
+                .map_err(|error| error.to_string())?;
+            EventScope::Conversation { conversation_id }
+        }
+    };
+    runtime
+        .submit(WorldEvent::new(Utc::now(), scope, priority, kind))
+        .await
+        .map_err(|error| error.to_string())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1605,10 +2128,20 @@ async fn resolve_and_submit_inner(
         .resolve_external_identity(&external_identity)
         .await
         .map_err(|error| anyhow::anyhow!(error))?;
-    let conversation_id = store
-        .resolve_external_conversation(&external_conversation)
-        .await
-        .map_err(|error| anyhow::anyhow!(error))?;
+    let direct_resolution =
+        matches!(message.address, ConversationAddress::Direct { .. }) && message_store.is_some();
+    let conversation_id = if direct_resolution {
+        message_store
+            .expect("direct resolution requires the configured PostgreSQL message store")
+            .resolve_direct_for_person(person_id, &external_conversation)
+            .await
+            .map_err(|error| anyhow::anyhow!(error))?
+    } else {
+        store
+            .resolve_external_conversation(&external_conversation)
+            .await
+            .map_err(|error| anyhow::anyhow!(error))?
+    };
     let reply_scope = message.address.reply_scope();
 
     if let Some(route_tracker) = route_tracker {
@@ -1620,7 +2153,7 @@ async fn resolve_and_submit_inner(
         );
     }
 
-    if let Some(member_store) = message_store.as_ref() {
+    if !direct_resolution && let Some(member_store) = message_store.as_ref() {
         let member = yunxi_core::ConversationMember::new(conversation_id, person_id);
         if let Err(error) = member_store.upsert(&member).await {
             kovi::log::warn!("Yunxi conversation-member upsert failed: {error}");
@@ -1658,6 +2191,9 @@ async fn resolve_and_submit_inner(
     if let Some(key) = reference_key
         && references.get(key).is_some()
     {
+        if let Some(admission) = message.incoming_admission {
+            crate::model::ConversationCoordinator::abandon_incoming(admission).await;
+        }
         if let Err(error) = submit_message_collisions(reply_scope, conversation_id, runtime).await {
             kovi::log::warn!("Yunxi message collision event was not admitted: {error}");
         }
@@ -1718,10 +2254,44 @@ async fn resolve_and_submit_inner(
     {
         kovi::log::warn!("Yunxi inbound message mapping could not be persisted: {error}");
     }
-    let admission = runtime
-        .submit(event)
-        .await
-        .map_err(|error| anyhow::anyhow!(error))?;
+    let registered_incoming = if let (Some(model_backend), Some(incoming_admission)) =
+        (model_backend, message.incoming_admission)
+    {
+        if incoming_admission.ticket.scope() == reply_scope {
+            model_backend
+                .register_incoming(message_id, incoming_admission)
+                .await;
+            true
+        } else {
+            kovi::log::warn!(
+                "Yunxi incoming admission scope does not match the resolved message route"
+            );
+            crate::model::ConversationCoordinator::abandon_incoming(incoming_admission).await;
+            false
+        }
+    } else {
+        if model_backend.is_none()
+            && let Some(incoming_admission) = message.incoming_admission
+        {
+            crate::model::ConversationCoordinator::abandon_incoming(incoming_admission).await;
+        }
+        false
+    };
+    let admission = match runtime.submit(event).await {
+        Ok(admission) => admission,
+        Err(error) => {
+            if registered_incoming && let Some(model_backend) = model_backend {
+                model_backend.discard_incoming(message_id).await;
+            }
+            return Err(anyhow::anyhow!(error));
+        }
+    };
+    if registered_incoming
+        && !matches!(admission, Admission::Accepted)
+        && let Some(model_backend) = model_backend
+    {
+        model_backend.discard_incoming(message_id).await;
+    }
     if let Err(error) = submit_message_collisions(reply_scope, conversation_id, runtime).await {
         kovi::log::warn!("Yunxi message collision event was not admitted: {error}");
     }
@@ -1753,14 +2323,30 @@ async fn resolve_and_submit_inner(
 
 async fn resolve_and_submit_collisions(
     address: ConversationAddress,
+    sender_user_id: i64,
     store: &dyn IdentityStore,
+    message_store: Option<&super::identity_store::PostgresIdentityStore>,
     runtime: &RuntimeHandle,
 ) -> anyhow::Result<usize> {
     let external_conversation = address.external()?;
-    let conversation_id = store
-        .resolve_external_conversation(&external_conversation)
-        .await
-        .map_err(|error| anyhow::anyhow!(error))?;
+    let conversation_id = if matches!(address, ConversationAddress::Direct { .. })
+        && let Some(message_store) = message_store
+    {
+        let external_identity = qq::person(sender_user_id)?;
+        let person_id = store
+            .resolve_external_identity(&external_identity)
+            .await
+            .map_err(|error| anyhow::anyhow!(error))?;
+        message_store
+            .resolve_direct_for_person(person_id, &external_conversation)
+            .await
+            .map_err(|error| anyhow::anyhow!(error))?
+    } else {
+        store
+            .resolve_external_conversation(&external_conversation)
+            .await
+            .map_err(|error| anyhow::anyhow!(error))?
+    };
     submit_message_collisions(address.reply_scope(), conversation_id, runtime).await
 }
 
@@ -1771,7 +2357,8 @@ async fn submit_message_collisions(
 ) -> anyhow::Result<usize> {
     let collisions = take_message_collisions(reply_scope).await;
     let collision_count = collisions.len();
-    for collision in collisions {
+    let mut pending = collisions.into_iter();
+    while let Some(collision) = pending.next() {
         kovi::log::debug!(
             "Yunxi message collision detected: scope={:?} source={:?}",
             collision.scope,
@@ -1788,11 +2375,26 @@ async fn submit_message_collisions(
                 fingerprint: collision.fingerprint,
             }),
         );
-        let admission = runtime
-            .submit(collision_event)
-            .await
-            .map_err(|error| anyhow::anyhow!(error))?;
-        debug_assert_eq!(admission, Admission::Accepted);
+        let admission = runtime.submit(collision_event).await;
+        if !matches!(admission, Ok(Admission::Accepted)) {
+            let remaining = std::iter::once(collision)
+                .chain(pending)
+                .collect::<Vec<_>>();
+            let remaining_count = remaining.len();
+            let restored = restore_message_collisions(reply_scope, remaining).await;
+            if restored != remaining_count {
+                kovi::log::warn!(
+                    "Yunxi collision retry state disappeared during data erasure: restored={restored} expected={remaining_count}"
+                );
+            }
+            return match admission {
+                Err(error) => Err(anyhow::anyhow!(error)),
+                Ok(Admission::DroppedAtCapacity) => Err(anyhow::anyhow!(
+                    "Yunxi runtime dropped a collision at capacity"
+                )),
+                Ok(Admission::Accepted) => unreachable!("accepted admission matched above"),
+            };
+        }
     }
     Ok(collision_count)
 }
@@ -2107,31 +2709,34 @@ fn looks_like_stop_request(message: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConversationAddress, EnqueueOutcome, InboundMessage, IngressRouteTracker, MessageReference,
-        MessageReferenceCache, MessageReferenceKey, ShadowBridge, acquire_alias_handler_barriers,
-        action_result_event, block_user_aliases, bounded_text, detect_open_loop_candidate,
-        idle_tick_event, looks_like_stop_request, merge_data_erasure_targets, message_at_self,
+        ConversationAddress, EnqueueOutcome, InboundMessage, IncomingAdmissionReleaseFuture,
+        IncomingAdmissionReleaser, IngressRouteTracker, MessageReference, MessageReferenceCache,
+        MessageReferenceKey, ShadowBridge, acquire_alias_handler_barriers, action_result_event,
+        block_user_aliases, bounded_text, detect_open_loop_candidate, idle_tick_event,
+        looks_like_stop_request, merge_data_erasure_targets, message_at_self,
         normalize_attachments, reply_message_id, resolve_and_submit, run_ingress, run_runtime,
-        text_mentions_agent, unblock_users,
+        submit_message_collisions, text_mentions_agent, unblock_users,
     };
     use crate::model::{
         OutgoingSource, ReplyScope, commit_outgoing, interrupt, mark_active, mark_outgoing_sent,
-        outgoing_fingerprint, prepare_outgoing,
+        outgoing_fingerprint, prepare_outgoing, take_message_collisions,
     };
     use chrono::Utc;
     use kovi::bot::message::{Message, Segment};
     use kovi::tokio::sync::{Notify, mpsc};
     use serde_json::json;
-    use std::collections::HashSet;
+    use sqlx_postgres::PgPoolOptions;
+    use std::collections::{HashMap, HashSet};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex as StdMutex};
     use std::time::Duration as StdDuration;
     use yunxi_core::{
         ActionArbiter, ActionArbiterConfig, ActionPort, ActionPortFuture, ActionPortOutcome,
-        ActionRejection, ActionResult, AttachmentKind, AttentionDisposition, ConversationId,
-        ConversationKind, EnvironmentCapabilities, EventPriority, EventType, IdentityStore,
-        IdentityStoreError, IdentityStoreFuture, MessageContent, MessageId, OpenLoopKind,
-        OpenLoopOwner, PersonId, ProcessingOutcome, ProposedAction, RuntimeConfig,
+        ActionRejection, ActionResult, Admission, AttachmentKind, AttentionDisposition,
+        ConversationId, ConversationKind, EnvironmentCapabilities, EventPriority, EventType,
+        IdentityStore, IdentityStoreError, IdentityStoreFuture, MessageContent, MessageId,
+        MessageReceivedEvent, OpenLoopKind, OpenLoopOwner, PersonId, ProcessingOutcome,
+        ProposedAction, RuntimeConfig, WorldEvent,
     };
 
     struct FakeIdentityStore {
@@ -2141,6 +2746,26 @@ mod tests {
     }
 
     struct FailingIdentityStore;
+
+    #[derive(Default)]
+    struct TestIncomingAdmissionReleaser {
+        admissions: kovi::tokio::sync::Mutex<HashMap<MessageId, crate::model::IncomingAdmission>>,
+        discarded: StdMutex<Vec<MessageId>>,
+    }
+
+    impl IncomingAdmissionReleaser for TestIncomingAdmissionReleaser {
+        fn discard<'a>(&'a self, message_id: MessageId) -> IncomingAdmissionReleaseFuture<'a> {
+            Box::pin(async move {
+                if let Some(admission) = self.admissions.lock().await.remove(&message_id) {
+                    crate::model::ConversationCoordinator::abandon_incoming(admission).await;
+                }
+                self.discarded
+                    .lock()
+                    .expect("discard recorder lock")
+                    .push(message_id);
+            })
+        }
+    }
 
     struct BlockingActionPort {
         conversation_id: ConversationId,
@@ -2225,6 +2850,7 @@ mod tests {
             visible_reply_allowed: true,
             explicit_request: false,
             stop_requested: false,
+            incoming_admission: None,
         }
     }
 
@@ -2321,7 +2947,9 @@ mod tests {
             action_arbiter: None,
             action_port: None,
             blocked_users: Arc::new(StdMutex::new(HashSet::new())),
+            blocked_groups: Arc::new(StdMutex::new(HashSet::new())),
             private_handler_gates: Arc::new(super::PrivateHandlerGateRegistry::new(4)),
+            group_handler_gates: Arc::new(super::PrivateHandlerGateRegistry::new(4)),
         };
         let message = inbound(ConversationAddress::Group { group_id: 123 }, false);
 
@@ -2332,6 +2960,35 @@ mod tests {
         assert_eq!(
             bridge.try_enqueue(message),
             EnqueueOutcome::DroppedAtCapacity
+        );
+    }
+
+    #[test]
+    fn group_data_erasure_gate_synchronously_blocks_core_ingress_and_resumes() {
+        let (ingress, _receiver) = mpsc::channel(1);
+        let (runtime, _consumer) =
+            yunxi_core::CognitiveRuntime::new(RuntimeConfig::default()).expect("valid runtime");
+        let bridge = ShadowBridge {
+            ingress,
+            runtime,
+            action_arbiter: None,
+            action_port: None,
+            blocked_users: Arc::new(StdMutex::new(HashSet::new())),
+            blocked_groups: Arc::new(StdMutex::new(HashSet::from([123]))),
+            private_handler_gates: Arc::new(super::PrivateHandlerGateRegistry::new(4)),
+            group_handler_gates: Arc::new(super::PrivateHandlerGateRegistry::new(4)),
+        };
+
+        assert!(bridge.is_group_blocked(123));
+        assert_eq!(
+            bridge.try_enqueue(inbound(ConversationAddress::Group { group_id: 123 }, true)),
+            EnqueueOutcome::Blocked
+        );
+        bridge.unblock_group(123);
+        assert!(!bridge.is_group_blocked(123));
+        assert_eq!(
+            bridge.try_enqueue(inbound(ConversationAddress::Group { group_id: 123 }, true)),
+            EnqueueOutcome::Accepted
         );
     }
 
@@ -2366,13 +3023,16 @@ mod tests {
             let (runtime_handle, mut core_runtime) =
                 yunxi_core::CognitiveRuntime::new(RuntimeConfig::default()).expect("valid runtime");
             let blocked_users = Arc::new(StdMutex::new(HashSet::new()));
+            let blocked_groups = Arc::new(StdMutex::new(HashSet::new()));
             let bridge = Arc::new(ShadowBridge {
                 ingress,
                 runtime: runtime_handle.clone(),
                 action_arbiter: None,
                 action_port: None,
                 blocked_users: Arc::clone(&blocked_users),
+                blocked_groups: Arc::clone(&blocked_groups),
                 private_handler_gates: Arc::new(super::PrivateHandlerGateRegistry::new(4)),
+                group_handler_gates: Arc::new(super::PrivateHandlerGateRegistry::new(4)),
             });
             let mut queued = inbound(
                 ConversationAddress::Direct {
@@ -2422,6 +3082,7 @@ mod tests {
                 None,
                 None,
                 blocked_users,
+                blocked_groups,
                 None,
                 None,
                 Arc::new(super::PrivateHandlerGateRegistry::new(4)),
@@ -2459,6 +3120,38 @@ mod tests {
     }
 
     #[test]
+    fn collision_flush_restores_unsubmitted_records_when_runtime_is_closed() {
+        let runtime = kovi::tokio::runtime::Runtime::new().expect("test runtime");
+        runtime.block_on(async {
+            let scope = ReplyScope::Private(9_200_458);
+            let ticket = interrupt(scope).await;
+            assert!(mark_active(ticket).await);
+            let outgoing = prepare_outgoing(
+                ticket,
+                outgoing_fingerprint("committed before runtime close"),
+                OutgoingSource::Reply,
+            )
+            .await
+            .expect("outgoing should prepare");
+            assert!(commit_outgoing(outgoing).await);
+            let _ = interrupt(scope).await;
+            mark_outgoing_sent(outgoing).await;
+
+            let (runtime_handle, core_runtime) =
+                yunxi_core::CognitiveRuntime::new(RuntimeConfig::default()).expect("valid runtime");
+            drop(core_runtime);
+            let error = submit_message_collisions(scope, ConversationId::new(), &runtime_handle)
+                .await
+                .expect_err("closed runtime must reject the collision");
+            assert!(error.to_string().contains("closed"));
+
+            let restored = take_message_collisions(scope).await;
+            assert_eq!(restored.len(), 1);
+            assert_eq!(restored[0].scope, scope);
+        });
+    }
+
+    #[test]
     fn lost_begin_acknowledgement_keeps_host_ingress_fail_closed() {
         let runtime = kovi::tokio::runtime::Runtime::new().expect("test runtime");
         runtime.block_on(async {
@@ -2471,7 +3164,9 @@ mod tests {
                 action_arbiter: None,
                 action_port: None,
                 blocked_users: Arc::new(StdMutex::new(HashSet::new())),
+                blocked_groups: Arc::new(StdMutex::new(HashSet::new())),
                 private_handler_gates: Arc::new(super::PrivateHandlerGateRegistry::new(4)),
+                group_handler_gates: Arc::new(super::PrivateHandlerGateRegistry::new(4)),
             });
             kovi::tokio::spawn(async move {
                 let Some(super::IngressCommand::BeginDataErasure { acknowledge, .. }) =
@@ -2487,6 +3182,201 @@ mod tests {
             };
             assert!(error.to_string().contains("remains blocked"));
             assert!(bridge.is_user_blocked(456));
+        });
+    }
+
+    #[test]
+    fn lost_group_begin_acknowledgement_keeps_host_ingress_fail_closed() {
+        let runtime = kovi::tokio::runtime::Runtime::new().expect("test runtime");
+        runtime.block_on(async {
+            let (ingress, mut receiver) = mpsc::channel(1);
+            let (runtime_handle, _consumer) =
+                yunxi_core::CognitiveRuntime::new(RuntimeConfig::default()).expect("valid runtime");
+            let bridge = Arc::new(ShadowBridge {
+                ingress,
+                runtime: runtime_handle,
+                action_arbiter: None,
+                action_port: None,
+                blocked_users: Arc::new(StdMutex::new(HashSet::new())),
+                blocked_groups: Arc::new(StdMutex::new(HashSet::new())),
+                private_handler_gates: Arc::new(super::PrivateHandlerGateRegistry::new(4)),
+                group_handler_gates: Arc::new(super::PrivateHandlerGateRegistry::new(4)),
+            });
+            kovi::tokio::spawn(async move {
+                let Some(super::IngressCommand::BeginGroupDataErasure { acknowledge, .. }) =
+                    receiver.recv().await
+                else {
+                    panic!("expected group begin command");
+                };
+                drop(acknowledge);
+            });
+
+            let Err(error) = bridge.begin_group_data_erasure(456).await else {
+                panic!("lost acknowledgement must fail");
+            };
+            assert!(error.to_string().contains("remains blocked"));
+            assert!(bridge.is_group_blocked(456));
+        });
+    }
+
+    #[test]
+    #[ignore = "requires PostgreSQL via DATABASE_URL"]
+    fn postgres_group_erasure_barrier_purges_runtime_references_and_mapping() {
+        let runtime = kovi::tokio::runtime::Runtime::new().expect("test runtime");
+        runtime.block_on(async {
+            let database_url = std::env::var("DATABASE_URL").expect("requires DATABASE_URL");
+            let pool = PgPoolOptions::new()
+                .max_connections(2)
+                .connect(&database_url)
+                .await
+                .expect("connect PostgreSQL");
+            let store = Arc::new(crate::yunxi::identity_store::PostgresIdentityStore::new(
+                pool,
+            ));
+            store
+                .initialize_schema()
+                .await
+                .expect("initialize identity schema");
+            let group_id = i64::try_from(
+                (uuid::Uuid::new_v4().as_u128() % 8_000_000_000_u128) + 1_000_000_000_u128,
+            )
+            .expect("bounded test group id");
+            let user_id = i64::try_from(
+                (uuid::Uuid::new_v4().as_u128() % 8_000_000_000_u128) + 1_000_000_000_u128,
+            )
+            .expect("bounded test user id");
+            let (runtime_handle, mut core_runtime) =
+                yunxi_core::CognitiveRuntime::new(RuntimeConfig::default()).expect("valid runtime");
+            let (ingress, receiver) = mpsc::channel(8);
+            let blocked_users = Arc::new(StdMutex::new(HashSet::new()));
+            let blocked_groups = Arc::new(StdMutex::new(HashSet::new()));
+            let identity_store: Arc<dyn IdentityStore> = store.clone();
+            let ingress_task = kovi::tokio::spawn(run_ingress(
+                receiver,
+                identity_store,
+                runtime_handle.clone(),
+                None,
+                None,
+                Some(Arc::clone(&store)),
+                Arc::clone(&blocked_users),
+                Arc::clone(&blocked_groups),
+                None,
+                None,
+                Arc::new(super::PrivateHandlerGateRegistry::new(4)),
+            ));
+            let driver = kovi::tokio::spawn(async move {
+                while core_runtime.process_next().await.is_some() {}
+                core_runtime
+            });
+            let bridge = Arc::new(ShadowBridge {
+                ingress,
+                runtime: runtime_handle.clone(),
+                action_arbiter: None,
+                action_port: None,
+                blocked_users,
+                blocked_groups,
+                private_handler_gates: Arc::new(super::PrivateHandlerGateRegistry::new(4)),
+                group_handler_gates: Arc::new(super::PrivateHandlerGateRegistry::new(4)),
+            });
+            let mut message = inbound(ConversationAddress::Group { group_id }, true);
+            message.sender_user_id = user_id;
+            message.external_message_id = Some(42);
+            assert_eq!(bridge.try_enqueue(message), EnqueueOutcome::Accepted);
+
+            let erasure = bridge
+                .begin_group_data_erasure(group_id)
+                .await
+                .expect("begin group barrier");
+            let ack = erasure.ack();
+            assert_eq!(ack.conversation_ids.len(), 1);
+            let conversation_id = ack.conversation_ids[0];
+            assert_eq!(ack.purged_runtime_states, 1);
+            assert_eq!(ack.cleared_references, 1);
+
+            assert!(
+                store
+                    .delete_qq_group_domain_data(group_id)
+                    .await
+                    .expect("delete canonical group")
+                    > 0
+            );
+            assert!(
+                bridge
+                    .project_destination(
+                        crate::model::MessageDestination::Group(group_id),
+                        EventPriority::High,
+                        yunxi_core::WorldEventKind::ActionSucceeded(
+                            yunxi_core::ActionSucceededEvent {
+                                idempotency_key: "blocked-projection".to_string(),
+                            },
+                        ),
+                    )
+                    .await
+                    .is_err(),
+                "projection must be rejected before it can recreate the deleted mapping"
+            );
+            let (projection_acknowledge, projected) = kovi::tokio::sync::oneshot::channel();
+            bridge
+                .ingress
+                .send(super::IngressCommand::ProjectDestination {
+                    destination: crate::model::MessageDestination::Group(group_id),
+                    priority: EventPriority::High,
+                    kind: yunxi_core::WorldEventKind::ActionSucceeded(
+                        yunxi_core::ActionSucceededEvent {
+                            idempotency_key: "fifo-blocked-projection".to_string(),
+                        },
+                    ),
+                    acknowledge: projection_acknowledge,
+                })
+                .await
+                .expect("enqueue projection behind begin barrier");
+            assert!(
+                projected
+                    .await
+                    .expect("projection acknowledgement")
+                    .is_err(),
+                "ingress FIFO must reject a raced projection before identity resolution"
+            );
+            assert_eq!(
+                store
+                    .qq_group_conversation_id(group_id)
+                    .await
+                    .expect("lookup group during barrier"),
+                None
+            );
+            runtime_handle
+                .submit(WorldEvent::new(
+                    Utc::now(),
+                    yunxi_core::EventScope::Conversation { conversation_id },
+                    EventPriority::High,
+                    yunxi_core::WorldEventKind::ActionSucceeded(yunxi_core::ActionSucceededEvent {
+                        idempotency_key: "late-group-receipt".to_string(),
+                    }),
+                ))
+                .await
+                .expect("enqueue blocked late receipt");
+            erasure.finish().await.expect("end group barrier");
+            assert_eq!(
+                store
+                    .qq_group_conversation_id(group_id)
+                    .await
+                    .expect("lookup deleted group"),
+                None
+            );
+            store
+                .delete_person_domain_data(
+                    &crate::yunxi::qq::person(user_id).expect("valid QQ user"),
+                    &crate::yunxi::qq::direct(9_999_999_999, user_id)
+                        .expect("valid cleanup direct route"),
+                )
+                .await
+                .expect("clean up test person");
+
+            drop(bridge);
+            drop(runtime_handle);
+            ingress_task.await.expect("ingress worker");
+            let core_runtime = driver.await.expect("runtime driver");
+            assert!(core_runtime.state().conversation(conversation_id).is_none());
         });
     }
 
@@ -2538,6 +3428,125 @@ mod tests {
                     .enter()
                     .await
                     .is_some()
+            );
+        });
+    }
+
+    #[test]
+    fn group_handler_epoch_drains_old_work_and_rejects_waiters_across_erasure() {
+        let runtime = kovi::tokio::runtime::Runtime::new().expect("test runtime");
+        runtime.block_on(async {
+            let store: Arc<dyn IdentityStore> = Arc::new(FakeIdentityStore {
+                person_id: PersonId::new(),
+                conversation_id: ConversationId::new(),
+                stored_kind: ConversationKind::Group,
+            });
+            let bridge = ShadowBridge::start(store);
+            let active = bridge
+                .capture_group_handler(456)
+                .expect("group handler token")
+                .enter()
+                .await
+                .expect("group handler permit");
+            let stale = bridge
+                .capture_group_handler(456)
+                .expect("waiting group handler token");
+            let erasure = bridge
+                .capture_group_data_erasure(456)
+                .expect("group erasure token");
+            assert!(bridge.capture_group_handler(456).is_none());
+
+            let mut entering = kovi::tokio::spawn(async move { erasure.enter().await });
+            assert!(
+                kovi::tokio::time::timeout(StdDuration::from_millis(20), &mut entering)
+                    .await
+                    .is_err(),
+                "group write permit must drain the active legacy handler"
+            );
+            drop(active);
+            let erasure_permit = entering
+                .await
+                .expect("group erasure permit task")
+                .expect("group erasure permit");
+            drop(erasure_permit);
+
+            assert!(stale.enter().await.is_none());
+            assert!(
+                bridge
+                    .capture_group_handler(456)
+                    .expect("fresh group handler token")
+                    .enter()
+                    .await
+                    .is_some()
+            );
+        });
+    }
+
+    #[test]
+    fn rejected_state_releases_the_exact_registered_incoming_admission() {
+        let runtime = kovi::tokio::runtime::Runtime::new().expect("test runtime");
+        runtime.block_on(async {
+            let conversation_id = ConversationId::new();
+            let sender = PersonId::new();
+            let scope = ReplyScope::Private(9_200_459);
+            let admission = crate::model::ConversationCoordinator::begin_incoming(scope).await;
+            let rejected_message_id = MessageId::new();
+            let releaser = Arc::new(TestIncomingAdmissionReleaser::default());
+            releaser
+                .admissions
+                .lock()
+                .await
+                .insert(rejected_message_id, admission);
+            let message = |message_id, conversation_kind| {
+                WorldEvent::message_received(
+                    EventPriority::Critical,
+                    MessageReceivedEvent {
+                        message_id,
+                        conversation_id,
+                        sender,
+                        content: MessageContent::text("hello"),
+                        reply_to: None,
+                        timestamp: Utc::now(),
+                        conversation_kind,
+                        addressed_to_agent: true,
+                        replies_to_agent: false,
+                        stop_requested: false,
+                        explicit_request: true,
+                        visible_reply_allowed: true,
+                    },
+                )
+            };
+            let (runtime_handle, core_runtime) =
+                yunxi_core::CognitiveRuntime::new(RuntimeConfig::default()).expect("valid runtime");
+            assert_eq!(
+                runtime_handle
+                    .submit(message(MessageId::new(), ConversationKind::Group))
+                    .await,
+                Ok(Admission::Accepted)
+            );
+            assert_eq!(
+                runtime_handle
+                    .submit(message(rejected_message_id, ConversationKind::Direct))
+                    .await,
+                Ok(Admission::Accepted)
+            );
+            drop(runtime_handle);
+            let runtime_releaser: Arc<dyn IncomingAdmissionReleaser> = releaser.clone();
+
+            run_runtime(core_runtime, None, None, Some(runtime_releaser)).await;
+
+            assert!(releaser.admissions.lock().await.is_empty());
+            assert_eq!(
+                releaser
+                    .discarded
+                    .lock()
+                    .expect("discard recorder lock")
+                    .as_slice(),
+                &[rejected_message_id]
+            );
+            assert!(
+                !crate::model::ConversationCoordinator::abandon_incoming(admission).await,
+                "runtime rejection must have already released the exact reservation"
             );
         });
     }
@@ -2601,6 +3610,7 @@ mod tests {
             let (runtime_handle, core_runtime) =
                 yunxi_core::CognitiveRuntime::new(RuntimeConfig::default()).expect("valid runtime");
             let blocked_users = Arc::new(StdMutex::new(HashSet::new()));
+            let blocked_groups = Arc::new(StdMutex::new(HashSet::new()));
             let arbiter = Arc::new(ActionArbiter::new(
                 ActionArbiterConfig::default().with_capabilities(EnvironmentCapabilities::all()),
             ));
@@ -2619,18 +3629,21 @@ mod tests {
                 None,
                 None,
                 Arc::clone(&blocked_users),
+                Arc::clone(&blocked_groups),
                 Some(Arc::clone(&arbiter)),
                 Some(Arc::clone(&action_port)),
                 Arc::new(super::PrivateHandlerGateRegistry::new(4)),
             ));
-            kovi::tokio::spawn(run_runtime(core_runtime, None, None));
+            kovi::tokio::spawn(run_runtime(core_runtime, None, None, None));
             let bridge = Arc::new(ShadowBridge {
                 ingress,
                 runtime: runtime_handle,
                 action_arbiter: Some(arbiter),
                 action_port: Some(action_port),
                 blocked_users,
+                blocked_groups,
                 private_handler_gates: Arc::new(super::PrivateHandlerGateRegistry::new(4)),
+                group_handler_gates: Arc::new(super::PrivateHandlerGateRegistry::new(4)),
             });
             let action = ProposedAction::send_message(
                 conversation_id,

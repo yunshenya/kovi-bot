@@ -9,6 +9,11 @@
 **当前存储：** PostgreSQL，可选 Redis  
 **长期目标：** Yunxi Desktop / Mobile / Web / Server / Kovi 等多个宿主共享同一个芸汐核心
 
+**当前交付范围（2026-08-25）：** `yunxi-core` 与现有 Kovi/QQ Host 的渐进迁移。
+Desktop、Mobile、Web、Server 产品 Host、协议层和 UI 均是未来方向，不属于当前阶段的
+交付物或完成条件。Live2D、语音、游戏、桌面控制等高级能力也只保留架构扩展点，不代表
+已经实现或已进入本阶段排期。`yunxi-cli` 是 Fake Host 边界测试，不等同于真实第二宿主迁移。
+
 ---
 
 # 1. 文档定位
@@ -343,9 +348,10 @@ replace with a new toy state machine
 
 > 系统可以在没有即时用户消息的情况下主动行动。
 
-但现有 proactive 还不是最终的 Yunxi Mind / Executive 驱动模式。
+当前交付范围已经在 Core 建立 motive/candidate/`ReachOut` 边界；成熟的调度、画像/冷却策略
+和真实投递继续由 Kovi Host/Adapter 承担，符合当前 DoD。
 
-长期迁移目标：
+以下是长期可选的跨宿主策略迁移目标，不是当前未完成项：
 
 ```text
 IdleTick / WorldEvent
@@ -359,7 +365,8 @@ IdleTick / WorldEvent
 → ReachOut(PersonId)
 ```
 
-现有 proactive 应作为第一版 Host 行为继续保留，随后逐步迁移到 Core。
+现有 proactive 作为 Host 行为继续保留。只有当其中的平台无关决策需要被多个真实 Host
+共享时，才逐步迁移相应策略；调度器生命周期和平台投递仍属于 Host/Adapter。
 
 ---
 
@@ -432,7 +439,7 @@ reuse existing semantic result
 
 > 当前部分 user semantic mood 可能影响 global bot mood。
 
-后续 v2 Affect 必须明确拆分：
+Core v2 Affect 的平台无关状态必须明确拆分：
 
 ```text
 PerceivedUserAffect
@@ -442,7 +449,9 @@ PerceivedUserAffect
 
 避免不同 Person 的情绪信息通过 global state 无意串扰。
 
-迁移阶段必须保持现有行为兼容，并通过 Shadow / metrics 验证后再改变更新规则。
+迁移阶段必须保持现有行为兼容，并通过 Shadow / metrics 验证后再改变更新规则。成熟的
+global `BotPersonality`/mood 兼容策略当前可以留在 Host；将其中可跨宿主复用的领域规则迁入
+Core 是长期可选工作，不是当前 DoD 缺口。
 
 ---
 
@@ -734,27 +743,82 @@ Yunxi Core 成为真正核心
 
 以下状态以仓库代码和测试为准；“部分完成”表示 Core 边界已经存在，但生产行为仍由
 legacy host 或人工验收承载，不能误读为迁移已经结束。
+本次审计的相关自动测试与本地 PostgreSQL fixture 已通过；这只能证明当前代码路径，不能
+替代下文列出的生产数据、真实宿主和长期运行人工验收。
 
 | Phase | 状态 | 已落地与剩余 |
 | --- | --- | --- |
 | 0 Core crate | 已完成 | `yunxi-core` 无 Kovi/OneBot/PostgreSQL 依赖，可离线测试。 |
-| 1 Identity | 已完成 | Core ID、QQ mapping、ConversationMember、附件归一化和 identity unlink 已有；versioned Person snapshot 会一致性携带 Memory/Relation/Affect/OpenLoop/Goal，超限、外部身份归属冲突及异内容 ID 冲突均 fail-closed。真实跨平台 host 携带性仍需验收。 |
+| 1 Identity | 已完成 | Core ID、QQ mapping、ConversationMember、附件归一化和 identity unlink 已有；Person import、direct route 与删除固定使用 `Person -> route -> Conversation` 锁序，删除按 canonical membership 枚举跨平台 direct conversation、保留 Group，并拒绝误删其他 Person 的 direct route；versioned Person snapshot 会一致性携带 Memory/Relation/Affect/OpenLoop/Goal，超限、外部身份归属冲突及异内容 ID 冲突均 fail-closed。真实跨平台 host 携带性仍需验收。 |
 | 2 Shadow Runtime | 已完成 | QQ ingress 进入 bounded `WorldEvent` runtime、Attention 和 WorkingState。 |
-| 3 OpenLoop | 基础完成 | PostgreSQL store、去重、容量、atomic claim、lease recovery、Person/Conversation/Global owner 合同已实现；更丰富的模型提取仍待演进。 |
+| 3 OpenLoop | 基础完成 | PostgreSQL store、去重、容量、atomic claim、lease recovery 已实现。到期 owner 合同已接线：Person 走 `ReachOut`，Conversation 走同会话非引用 `SendMessage`，Global 无安全路由时恢复为无 `due_at` 的 `Open`；真实 QQ 投递、跨重启和长时间运行仍需人工验收。 |
 | 4 Memory Bridge | 已完成 | Core `MemoryStore` 已接入规范化 PostgreSQL memory，并保留 legacy 双读/双写。 |
-| 5 Proactive | 部分完成 | Core motive/candidate/`ReachOut` 和 canonical owner 路由已接通；legacy 调度、画像和冷却仍保留。 |
-| 6 Intent / Action | 当前范围完成 | `SendMessage`、`ReachOut`、`UseTool`、Goal/OpenLoop 管理 Action、arbiter、QQ adapter 已接通，权限和路由缺失时 fail-closed。 |
-| 7 Direct Conversation | 部分完成 | 私聊安全纯文本、群聊 `@` 纯文本默认由 Core 接管；命令、提醒、Agent Run、附件和群聊 ambient 仍由 legacy handler 处理。 |
-| 8 Affect / 9 Relation | 部分完成 | Core store 与平台无关的有界演化已接通：使用已归一化事件信号、不会新增模型调用、严格绑定当前 `PersonId`；legacy profile/mood 只原子填充缺失行，不再覆盖 Core 增量。标准化 sentiment/gratitude cue、基于时间的自然漂移和跨平台人工验收仍待完成。 |
-| 10 Memory v2 | 基础完成 | 双读/双写、backfill、数量/哈希校验、审计、rollback、migration CLI 已完成；生产抽样和跨平台导入验收仍待完成。 |
+| 5 Proactive | 当前范围完成 | Core motive/candidate/`ReachOut` 和 canonical owner 路由已接通；真实调度、画像/冷却策略和投递属于 Host/Adapter，保留现有实现符合当前边界。将可跨宿主复用的选择策略进一步迁入 Core 是长期可选工作。 |
+| 6 Intent / Action | 当前范围完成 | `SendMessage`、`ReachOut`、`UseTool`、Goal/OpenLoop 管理 Action、arbiter、QQ adapter 已接通，权限和路由缺失时 fail-closed。普通 action 使用 event-local deterministic idempotency key；`UseTool` 由有界 one-shot Host capability 将 exact key + tool envelope 指纹绑定原 `ReplyTicket`，副作用 builtin/MCP 在 dispatch 前重验 ticket、actor route、membership/route、管理员、群授权与 context，不会让旧计划借新 ticket。`SendMessage`/`ReachOut` 使用 PostgreSQL delivery ledger，以业务 key 和完整 envelope 指纹持久化 `Committed`/`Sent`/`Unknown`/`Failed`，跨重启阻止重放；不可确认的投递返回非成功终态 `DeliveryIndeterminate`，不会伪造成功事件。Person 数据删除在同一事务内清理可归属账本，snapshot 不携带 Host 投递证据；详细合同见并发规范。 |
+| 7 Direct Conversation | 当前范围完成 | 私聊安全纯文本、群聊 `@` 纯文本默认由 Core 接管；ingress admission 绑定 exact `MessageId`，同一次模型回复会读取与 exact frozen ticket/reservation 绑定、最多 4096 字符的非可信 Prepared preview，并以受限 `incoming_impact` sidecar 将新消息精化为 `Keep / Rewrite / Merge / Defer`。需要直接回复时，`Unrelated` 对 proactive 使用 `Defer`、对 reactive 使用 `Rewrite`，不会吞掉新问题；缺失或非法分类按 `Unknown` fail-closed，全程不增加第二次模型调用。runtime 拒绝 collision 时会原序恢复未提交尾部，`RejectedState` 会释放 exact admission。命令、提醒、Agent Run、附件、Vision/sticker、coalescing/queue 和群聊 ambient 保留在 Kovi Host/Adapter，符合当前范围。 |
+| 8 Affect / 9 Relation | 部分完成 | Core store 与平台无关的有界演化已接通，严格绑定当前 `PersonId`。legacy `MessageUnderstanding` 的 mood/confidence/gratitude 已归一化为有界 `InteractionCues` 并 best-effort 投射；Core 直聊也可从同一次模型回复读取受限 cue sidecar，不增加一次模型调用，sidecar 缺失、重复、越界或非法时按 `Unknown` fail-closed。Core 已提供确定性时间衰减，PostgreSQL store 在读取时按 `updated_at` 应用，并忽略负时间差和 60 秒内抖动。legacy profile/mood 只填充缺失行；global `BotPersonality`/mood 兼容策略留在 Host 不阻塞当前 DoD，剩余项是跨天、跨重启和跨平台人工验收。 |
+| 10 Memory v2 | 基础完成 | 双读/双写、backfill、数量/哈希校验、审计、rollback、migration CLI 已完成；生产数据抽样、生产回滚演练和真实第二宿主导入仍需人工验收。 |
 | 11 Goal Event Integration | 已完成 | Reminder、`agent_tasks`、tools 已投射通用事件，runtime 加载有界 Goal context；legacy 状态保持权威。 |
-| 12 CLI Host | 当前范围完成 | Fake host 已跑通完整 Core 回路；`YUNXI_CLI_STATE` 以单个有界 JSON snapshot 接入 Memory/Affect/Relation/OpenLoop ports 并恢复稳定 Core ID/context，FakeModel 会读取 context 并提交有界 Affect/Relation 更新；`YUNXI_CLI_JOURNAL` 可独立提供同步 turn 审计。 |
-| 13 App 预留 | API 部分满足 | 通用 Event/Action 边界可供新 host 接入；Desktop/Mobile/Web/App 产品和协议未实现。 |
+| 12 CLI Host | 当前范围完成 | Fake host 已跑通 Core 回路；`YUNXI_CLI_STATE` 以单个有界 JSON snapshot 接入 Memory/Affect/Relation/OpenLoop ports 并恢复稳定 Core ID/context，FakeModel 会读取 context 并提交有界 Affect/Relation 更新；`YUNXI_CLI_JOURNAL` 可独立提供同步 turn 审计。它只证明离线边界，不算真实第二宿主或生产携带性验收。 |
+| 13 App 预留 | 未来 / 非目标 | 通用 Event/Action 边界可供新 host 接入；Desktop/Mobile/Web/App 产品、协议层和 App 专属能力均未实现，也不属于当前阶段完成条件。 |
 
-因此当前真正未完成的是：历史 Memory migration 的生产抽样与跨平台携带性验收；Affect/
-Relation 的标准化语义 cue、自然漂移与跨平台验收；剩余 Kovi 命令、管理员、附件和主动调度 handler 的 Adapter
-收敛；以及未来 Desktop/Mobile/Web/App 产品 host 与协议层。这些不包括 Live2D、TTS、
-STT、桌面控制等文档明确列为当前阶段非目标的能力。
+因此当前迁移真正未完成的是：历史 Memory migration 的生产抽样与回滚演练；使用真实
+第二宿主完成 snapshot 导入和身份携带性验收；以及 Affect/Relation、主动行为及 OpenLoop
+调度的跨天、跨重启长期行为验收。QQ 到未来 App 的同一 Person/Memory/Relation/OpenLoop 连续性只能在真实 App Host
+存在后人工验收，当前没有完成。Desktop/Mobile/Web/App 产品及 Live2D、TTS、STT、桌面
+控制等高级能力属于未来 / 非目标，不计作当前迁移的缺陷。
+
+现有 Kovi 命令、管理员控制面、附件/Vision/sticker、coalescing/queue、群聊 ambient 和主动
+投递可以继续作为 Host/Adapter 能力；把这些兼容层进一步变薄是可选后续，不是当前 DoD
+未完成项。
+
+## 2.22 当前 Core / Adapter 边界
+
+前文大量章节描述的是目标边界；仓库当前处于过渡期，实际所有权如下：
+
+| 层 | 当前职责 | 边界说明 |
+| --- | --- | --- |
+| `crates/yunxi-core` | 平台无关 ID、Event、Runtime、Planner、Affect/Relation/OpenLoop/Goal、Intent/Action、Ports 和确定性领域规则；不依赖 Kovi、OneBot、QQ 或 SQL 实现。 | 不负责 provider 配置、SQL、QQ 路由、权限和真实发送。 |
+| `plugins/model/src/yunxi` | 当前 Kovi Host 的 bridge/adapter：QQ identity 与 conversation mapping、PostgreSQL stores、到期 scheduler、旧 ModelGateway 适配、Action 仲裁与 QQ delivery。 | 它是宿主集成代码，不是第二套 Core；其中出现 QQ/SQL 是预期边界。 |
+| legacy `plugins/model` | 仍承载命令、管理员控制面、附件/视觉、群聊 ambient、提醒、Agent Task、主动调度、部分画像/冷却和 global `BotPersonality`/mood 兼容策略；部分结果以通用 Event/cue 投射给 Core。 | 这些成熟 Host/Adapter 能力可按当前范围保留；其中可跨宿主复用的领域规则可在长期迁移，进一步变薄不是当前 DoD 缺口。 |
+| Desktop/Mobile/Web/App | 尚无真实 Host。 | 产品、协议、同步、认证、通知和 UI 全部是未来工作。 |
+
+`KoviModelBackend` 复用现有 ModelGateway 的 provider 与工具策略，并把结果翻译成声明式 Core
+plan；这仍是 Host adapter，而不是 Core 直接依赖旧模型模块。当前 Core 直聊只接管私聊安全
+纯文本和群聊 `@` 安全纯文本，其他入口继续走 legacy handler。
+
+## 2.23 OpenLoop 到期 owner 路由合同
+
+当前生产接线必须保持：
+
+- `Person` owner 提交 person-scoped `ProspectiveMemoryDue`，成功生成 `ReachOut(PersonId)`；
+- `Conversation` owner 提交 conversation-scoped 事件，成功生成同一 `ConversationId` 的
+  非引用 `SendMessage`，即 `reply_to = None`；
+- Conversation 路由优先使用持久化唯一映射；只有持久层临时不可用时才可回退有界内存
+  缓存，权威查询无映射或有歧义时必须 fail-closed；
+- `Global` owner 在当前 Host 没有安全投递路由，不提交到 runtime；scheduler 调用
+  `defer(id, None, now)`，把记录恢复为 `Open` 并清除 `due_at`/`triggered_at`，避免反复 claim；
+- 已越过不可逆边界但平台是否接收无法确认时，adapter 返回 `DeliveryIndeterminate`；runtime
+  只生成 `ActionFailed(delivery_indeterminate:*)`，不生成 `ActionSucceeded`/`MessageSent`；
+- `DeliveryIndeterminate`、`ToolFailed`、non-retryable `ActionPortError`、
+  `TargetUnavailable` 和 `DeliveryResolutionFailed` 都是 terminal
+  non-success；本次到期 OpenLoop 必须调用 `defer(id, None, now)`，既不宣称 resolve，也不再
+  进入 lease recovery 循环；retryable `ActionPortError` 仍走有界重试；
+- runtime 关闭或容量丢弃是临时失败，使用有界延迟重试，不能按不支持 owner 处理。
+
+以上是当前代码合同和自动测试覆盖的行为，不代表真实 QQ 投递、进程重启、lease recovery
+和多日运行已经完成人工验收。
+
+## 2.24 必须保留的人工验收
+
+以下项目不能由单元测试、Fake Host 或本地空数据表替代，目前不得标为“已验收”：
+
+| 项目 | 人工验收门槛 |
+| --- | --- |
+| 生产 Memory migration | 先备份，在生产数据上 dry-run/抽样核对数量、内容与 hash；选择受控批次执行 rollback，确认只删除该批次新写记录且 legacy 数据不变。 |
+| 真实第二宿主 | 用非 Kovi、非 QQ 的真实 Host 导出/导入同一 versioned Person snapshot，核对稳定 `PersonId`、Memory、Affect、Relation、OpenLoop 和 Goal；`yunxi-cli` Fake Host 不计。 |
+| 长期行为 | 跨天和跨进程重启观察时间衰减、主动冷却、到期投递、失败重试、Global 停止重占 lease，以及无重复/错投。 |
+| QQ 到未来 App 连续性 | App Host 存在后，以同一用户完成 identity link，核对 QQ 历史数据在 App 中归属同一 Person，并验证后续双向更新；当前只能保留场景，不能宣称通过。 |
 
 # 3. 最终产品定义
 
@@ -2609,7 +2673,7 @@ GoalUpdated WorldEvent
 
 # 74. Proactive 行为
 
-主动行为必须变成：
+当前 DoD 要求主动意图进入平台无关边界：
 
 ```text
 Core motive
@@ -2620,6 +2684,9 @@ Core motive
 ```text
 QQ push
 ```
+
+成熟的主动调度、画像/冷却和真实投递可以继续由 Kovi Host/Adapter 承担。把其中需要由多个
+真实 Host 共享的平台无关选择策略迁入 Core，是长期可选演进，不是当前完成条件。
 
 ---
 
@@ -2874,7 +2941,8 @@ Yunxi: ...
 - OpenLoop；
 - Planner；
 
-说明分层成功。
+说明 Core 可以在 Fake Host 中脱离 QQ 运行，是依赖边界的自动验收。它不能证明生产数据
+可迁移、真实第二宿主可用，或 QQ 到未来 App 的用户连续性；这些仍按 2.24 人工验收。
 
 CLI 可通过环境变量启用 host-owned Core state 和独立的 durable turn journal：
 
@@ -3058,7 +3126,7 @@ MemoryStore port
 
 # 94. Phase 5：Proactive
 
-迁移主动聊天：
+当前 DoD 在 Core 建立主动意图边界：
 
 ```text
 QQ-oriented proactive
@@ -3071,6 +3139,9 @@ Core proactive motive
 ```
 
 实际发送仍由 Kovi Adapter。
+
+现有 Kovi 主动调度、画像和冷却策略可作为 Host 策略保留。把其中与平台无关、需要被多个
+真实 Host 共享的选择规则迁入 Core，是长期可选演进，不阻塞本 Phase 的当前范围完成。
 
 ---
 
@@ -3140,7 +3211,14 @@ MessageReceived
 
 # 98. Phase 8：Affect
 
-将 mood 从 QQ 插件搬入 Core。
+长期目标是把可跨宿主复用的 affect 领域规则从 QQ 插件搬入 Core；这不要求当前把所有
+global mood 兼容策略都搬走。
+
+当前已完成 Core state/port、PostgreSQL store、`InteractionCues` 和读取时的确定性时间衰减。
+legacy `MessageUnderstanding` 的 mood/confidence/gratitude 会归一化后 best-effort 投射；Core
+直聊可复用同一次模型回复的受限 cue sidecar。旧 global `BotPersonality`/mood 策略可继续
+作为 Host 兼容策略；进一步迁移是长期可选项，不是当前 DoD 缺口。本 Phase 的“部分完成”
+指跨天、跨重启和真实第二宿主的长期行为尚待人工验收。
 
 ---
 
@@ -3153,6 +3231,9 @@ PersonId
 ```
 
 绑定。
+
+当前 Relation 已绑定 canonical `PersonId`，接受有界 gratitude/sentiment cue，并在 PostgreSQL
+读取时按 `updated_at` 做确定性衰减。仍需验证跨天、重启和真实第二宿主中的长期行为。
 
 ---
 
@@ -3188,14 +3269,18 @@ generic WorldEvent
 apps/yunxi-cli
 ```
 
-作为最终平台无关验收；当前 host 提供可选 `YUNXI_CLI_STATE` Core store snapshot 和
+作为离线平台边界验收；当前 host 提供可选 `YUNXI_CLI_STATE` Core store snapshot 和
 `YUNXI_CLI_JOURNAL` durable turn journal，二者均保持在 Core crate 边界之外。
+它不是最终的真实第二宿主迁移验收。
 
 ---
 
 # 103. Phase 13：App 预留
 
 这一阶段不要求开发完整 App。
+
+Desktop/Mobile/Web/App Host、协议、认证、同步、通知和 UI 均为未来 / 当前非目标；本阶段只
+检查通用 API 没有把这些可能性封死。
 
 但 Core API 必须已经可以：
 
@@ -3215,6 +3300,8 @@ App output
 
 # 104. App 所需未来事件
 
+本节仅是未来扩展词汇表，不是当前已实现 API 或交付清单。
+
 架构要允许：
 
 ```text
@@ -3231,6 +3318,8 @@ NotificationOpened
 ---
 
 # 105. App 所需未来 Action
+
+本节仅是未来扩展词汇表，不是当前已实现 API 或交付清单。
 
 架构要允许：
 
@@ -3261,7 +3350,8 @@ external identities
 snapshot。导入对全部 Core state、scope 与 owner 做验证，在同一事务内检测 external identity
 归属和 Memory/OpenLoop/Goal ID 冲突，任何异内容或跨 Person 冲突都会回滚。新增字段采用
 `serde(default)`，兼容缺少这些字段的旧 version 1 JSON。真实跨平台 host 携带性仍需单独
-验收。
+验收；生产数据抽样、生产 rollback 演练也仍是人工门槛，不能因 adapter API 和本地测试存在
+而标为已通过。
 
 QQ-specific metadata 可作为：
 
@@ -3283,6 +3373,21 @@ optional external identity metadata
 - open loops；
 - goals；
 - linked external identities（视策略）；
+
+当前 Kovi Host 的彻底删除按以下安全合同执行：
+
+- Person import、direct route 创建和 Person 删除统一使用
+  `Person -> external route -> Conversation` advisory-lock 顺序；
+- Person 删除以 `ConversationMember` 为 canonical 枚举源，覆盖跨平台 direct
+  conversation，保留共享 Group；即使 external identity mapping 已不存在，也不得删除已属于
+  其他 Person 的 direct route；
+- Group/Conversation 删除先通过 Core FIFO erasure command 阻断并清空
+  `WorkingState`，再清 reference/route cache，并以 group handler epoch/write gate 排空 legacy
+  handler；PostgreSQL 事务持 Conversation owner lock，原子删除 group domain、canonical
+  Conversation 和 attributable delivery ledger；
+- 数据库成功或失败都必须结束 erasure window；若 barrier cleanup 本身失败则保持 blocked，
+  不能重新放行旧 scope。成功/失败 receipt 均走 tracked-but-unrecorded 发送，晚到结果不得重建
+  recall 或 ledger。
 
 不能只删除：
 
@@ -3857,11 +3962,11 @@ Memory v2。
 yunxi-cli
 ```
 
-作为真正脱离 QQ 的证明。
+作为 Core 可脱离 QQ 运行的依赖边界证明；真实第二宿主仍需人工验收。
 
 ---
 
-# 134. 最终 Definition of Done
+# 134. 目标 Definition of Done（不是当前完成状态）
 
 平台无关架构完成必须满足：
 
@@ -3917,7 +4022,9 @@ QQ
 Yunxi domain
 ```
 
-只负责 Adapter 工作。
+当前 DoD 中，Kovi 负责 QQ 与 Yunxi domain 的 Adapter 集成，也可保留成熟的主动调度、
+画像/冷却和 global mood 兼容策略；平台无关的身份、状态、意图和 Action 合同必须留在 Core。
+把可跨宿主复用的 Host 策略进一步迁入 Core 是长期可选目标，不是当前完成条件。
 
 ## Portability
 
@@ -3936,11 +4043,15 @@ NapCat
 QQ
 ```
 
-的情况下运行 Yunxi Core。
+的情况下运行 Yunxi Core。这只构成 Core 依赖边界门槛；产品级 portability 还必须通过
+2.24 的真实第二宿主和数据连续性人工验收。
 
 ---
 
-# 135. 最终产品验收场景
+# 135. 未来产品人工验收场景（当前未完成）
+
+以下是 QQ 到未来 App 连续性的最终人工场景，不是当前实现事实。只有真实 App Host、identity
+link 和数据迁移均存在后才能执行并判定通过。
 
 今天：
 
@@ -4235,6 +4346,8 @@ cargo test --workspace
 
 当前架构重构阶段不要优先实现：
 
+- Desktop / Mobile / Web / Server 产品 Host、协议层和 UI；
+- App 登录、跨设备同步、推送通知产品链路；
 - Live2D；
 - TTS；
 - STT；
@@ -4250,6 +4363,10 @@ cargo test --workspace
 - pgvector 强制迁移；
 - Tauri 产品开发；
 - Mobile App 产品开发。
+
+上述项目均是未来方向，不是当前 Phase 0～12 的缺陷或完成阻塞项。App 事件/Action 名称和
+架构图只表达可扩展性，不构成实现承诺。当前阶段也不以高级能力演示替代生产 Memory、真实
+第二宿主、长期行为和跨平台连续性的人工验收。
 
 这些未来都应该成为：
 
@@ -4336,20 +4453,61 @@ WORLD
 V1 Core 必须为普通自然语言输出维护：
 
 ```text
-Thinking → Prepared → Committed → Sent
-             ├→ Cancelled
-             └→ Superseded
+Thinking
+  ├→ Cancelled
+  └→ Prepared
+        ├→ Cancelled
+        ├→ Superseded
+        └→ Committed
+              ├→ Sent
+              ├→ Cancelled（明确拒绝）
+              └→ Unknown（仅在 Committed 后，平台接收不确定）
 ```
 
-**生成完成不等于允许发送。** `Prepared` 消息在进入 `Committed` 前必须基于最新 `ReplyTicket`、`conversation_version`、Stop 状态、目标有效性和权限执行 pre-commit revalidation。
+**生成完成不等于允许发送。** `Prepared` 消息在进入 `Committed` 前必须基于最新
+`ReplyTicket`、`scope_epoch`、`conversation_version`、Stop 状态、目标有效性和权限执行
+pre-commit revalidation。数据删除会更换 scope epoch，旧 epoch 的晚到发送完成不得重建
+recall 或其他已删除数据。
 
-新用户事件在 `Committed` 前可以使待发送消息：`Keep / Cancel / Rewrite / Merge / Defer`。`Committed` 是副作用 Point of No Return；之后默认不强制撤回。若双方已经分别进入不可撤销边界并近乎同时发言，应允许自然消息碰撞，并产生 `WorldEvent::MessageCollisionDetected`。
+入站发现现有 `Prepared` 时先建立单槽、带 lease 的 pending-inbound reservation，冻结 commit
+但不持会话锁等待模型；`Keep` 释放原 token，`Rewrite / Merge / Defer` 以及缺失或非法语义结果
+才 fail-closed 终结它。没有现有 `Prepared` 时，新入站 generation 在 handler active 前也必须
+保留 reservation，防止主动 fallback 抢占已经进入异步队列的用户消息。发送方只可在等待
+reservation 完成后、尚未取得 route/authorization guard 时领取 bounded precommit permit；permit
+之后到达的新入站直接使 token stale，因此最终 commit 不会持安全 guard 等待语义模型。
+
+同一次语义模型调用会收到与 exact frozen ticket/reservation 绑定、最多 4096 字符的 Prepared
+正文预览；它只作为非可信 JSON Data，reservation 或 token 不匹配时不得读取其他 envelope。
+需要直接回复的新事件若被分类为 `Unrelated`，proactive Prepared 使用 `Defer`，reactive
+Prepared 使用 `Rewrite`；只有无需回复的观察才允许 `Keep`。runtime 关闭或容量拒绝 collision
+提交时，当前项与未提交尾部按原序恢复；scope 已被删除时不得重建。Core 返回
+`RejectedState` 时必须释放 exact `MessageId` admission reservation。
+
+新用户事件在 `Committed` 前可以使待发送消息：`Keep / Cancel / Rewrite / Merge / Defer`。
+`Committed` 是副作用 Point of No Return；之后默认不强制撤回。明确拒绝可进入 `Cancelled`，
+平台是否接收无法确认或发送 future 丢失必须进入 `Unknown`，并继续阻止重复 key 和异 envelope
+碰撞。若双方已经分别进入不可撤销边界并近乎同时发言，应允许自然消息碰撞，并产生
+`WorldEvent::MessageCollisionDetected`。
 
 `ConversationCoordinator` 负责 generation、ReplyTicket、conversation version、PendingOutgoing、commit serialization、stale detection、cancellation propagation 与 collision detection。语义上是否 `Keep / Rewrite / Merge / Defer` 交由 Executive。
 
 主动消息可有 300–1000ms、可配置且可关闭的短 `Prepared` grace window，仅用于捕获“刚准备主动发言时用户恰好发来消息”，禁止用固定长延迟伪装真人打字。
 
-同一 Conversation 的真实 send commit 必须串行化，但禁止持锁等待 LLM。
+同一 Conversation 的真实 send commit 必须串行化，但禁止持锁等待 LLM 或平台网络。
+Core `SendMessage`/`ReachOut` 还必须在网络调用前写入 PostgreSQL delivery ledger；仅明确
+`Failed` 且 envelope 完全相同的记录允许重试。
+
+delivery ledger 的 `Unknown` 只能由 `Committed` 转入，不能从 `Prepared` 产生。对于到期
+OpenLoop，`DeliveryIndeterminate`、`ToolFailed`、non-retryable `ActionPortError`、
+`TargetUnavailable` 和 `DeliveryResolutionFailed` 都属于 terminal non-success，必须
+`defer(id, None, now)`；retryable `ActionPortError` 才继续有界重试。
+
+`UseTool` 不使用消息 delivery ledger，但不能脱离原 turn：runtime 为普通事件 action 写入
+`event:{EventId}:intent:{index}`，到期 action 继续使用 open-loop key；Host 以该 key 和
+scope/name/input 指纹一次性领取原 `ReplyTicket`，重复、伪造、丢失或淘汰的 capability 均
+fail-closed。每个副作用 builtin 与 MCP 在实际 dispatch 前重新验证 ticket、canonical actor
+route、conversation membership/route、管理员、群授权、暂停状态与当前工具可用性；guard 在
+外部 I/O 前释放。
 
 验收标准：
 

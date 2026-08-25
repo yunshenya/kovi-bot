@@ -468,9 +468,14 @@ fn response_from_actions(
                 deferred_reason.get_or_insert(reason);
             }
             ActionResult::Executed {
+                outcome: ActionPortOutcome::DeliveryIndeterminate { reason, .. },
+                ..
+            } => {
+                deferred_reason.get_or_insert_with(|| format!("delivery_indeterminate:{reason}"));
+            }
+            ActionResult::Executed {
                 outcome:
-                    ActionPortOutcome::ToolCompleted { .. }
-                    | ActionPortOutcome::ToolFailed { .. },
+                    ActionPortOutcome::ToolCompleted { .. } | ActionPortOutcome::ToolFailed { .. },
                 ..
             } => {
                 // Tool results are observations for a later planner turn, not

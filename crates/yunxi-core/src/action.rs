@@ -8,7 +8,7 @@ use crate::goal::{GoalDraft, GoalOwner, GoalValidationError};
 use crate::identity::{ConversationId, GoalId, MessageId, OpenLoopId, PersonId};
 use crate::open_loop::{OpenLoopDraft, OpenLoopOwner, OpenLoopValidationError};
 use crate::proactive::ProactiveMotive;
-use crate::{MessageContent, MessageValidationError};
+use crate::{EventId, MessageContent, MessageValidationError};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::fmt;
@@ -21,6 +21,17 @@ pub const MAX_TOOL_NAME_BYTES: usize = 256;
 pub const MAX_TOOL_NAME_CHARS: usize = 128;
 pub const MAX_TOOL_INPUT_BYTES: usize = 32 * 1_024;
 pub const MAX_TOOL_INPUT_CHARS: usize = 16 * 1_024;
+
+/// Stable, event-local idempotency key for one planned action.
+///
+/// Hosts that retain ingress capabilities can derive this before a
+/// [`CognitiveIntent`] is materialized, while the runtime applies the same key
+/// to the resulting action. `EventId` makes equal intents from different turns
+/// unambiguously distinct.
+#[must_use]
+pub fn event_action_idempotency_key(event_id: EventId, intent_index: usize) -> String {
+    format!("event:{event_id}:intent:{intent_index}")
+}
 
 /// The Core scope used for authorization and per-target cooldowns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

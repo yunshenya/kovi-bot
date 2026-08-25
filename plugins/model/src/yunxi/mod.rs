@@ -2,6 +2,7 @@ mod affect_store;
 pub(crate) mod bridge;
 pub(crate) mod core_model;
 pub(crate) mod delivery;
+mod delivery_ledger;
 pub(crate) mod events;
 mod goal_store;
 mod identity_store;
@@ -17,6 +18,7 @@ mod schema;
 
 use affect_store::PostgresAffectStore;
 use anyhow::{Context, Result};
+use delivery_ledger::PostgresDeliveryLedger;
 use goal_store::PostgresGoalStore;
 use identity_store::PostgresIdentityStore;
 use kovi::tokio::sync::{RwLock as AsyncRwLock, RwLockReadGuard};
@@ -32,6 +34,7 @@ static MEMORY_STORE: OnceLock<Arc<PostgresMemoryStore>> = OnceLock::new();
 static AFFECT_STORE: OnceLock<Arc<PostgresAffectStore>> = OnceLock::new();
 static RELATION_STORE: OnceLock<Arc<PostgresRelationStore>> = OnceLock::new();
 static GOAL_STORE: OnceLock<Arc<PostgresGoalStore>> = OnceLock::new();
+static DELIVERY_LEDGER: OnceLock<Arc<PostgresDeliveryLedger>> = OnceLock::new();
 static SHADOW_BRIDGE: OnceLock<Arc<bridge::ShadowBridge>> = OnceLock::new();
 static DELIVERY_ROUTE_LOCK: AsyncRwLock<()> = AsyncRwLock::const_new(());
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +45,17 @@ enum OwnerQqRoute {
 }
 
 static OWNER_QQ_ROUTE: OnceLock<RwLock<OwnerQqRoute>> = OnceLock::new();
+
+#[must_use]
+pub(crate) struct CanonicalOwnerRouteGuard {
+    _route_guard: RwLockReadGuard<'static, ()>,
+}
+
+pub(crate) enum CanonicalOwnerAuthorization {
+    Unconfigured,
+    Denied,
+    Authorized(CanonicalOwnerRouteGuard),
+}
 
 pub(crate) async fn pin_delivery_routes() -> RwLockReadGuard<'static, ()> {
     DELIVERY_ROUTE_LOCK.read().await
@@ -54,6 +68,7 @@ pub(crate) async fn initialize_database() -> Result<()> {
         && AFFECT_STORE.get().is_some()
         && RELATION_STORE.get().is_some()
         && GOAL_STORE.get().is_some()
+        && DELIVERY_LEDGER.get().is_some()
     {
         return Ok(());
     }
@@ -66,6 +81,11 @@ pub(crate) async fn initialize_database() -> Result<()> {
         let store = Arc::new(PostgresIdentityStore::new(pool.clone()));
         store.initialize_schema().await?;
         let _ = IDENTITY_STORE.set(store);
+    }
+    if DELIVERY_LEDGER.get().is_none() {
+        let ledger = Arc::new(PostgresDeliveryLedger::new(pool.clone()));
+        ledger.initialize_schema().await?;
+        let _ = DELIVERY_LEDGER.set(ledger);
     }
     initialize_owner_route().await;
     if OPEN_LOOP_STORE.get().is_none() {
@@ -105,7 +125,7 @@ pub(crate) async fn initialize_database() -> Result<()> {
 }
 
 async fn initialize_owner_route() {
-    cache_owner_route(resolve_owner_route_authoritatively().await);
+    let _ = refresh_owner_route().await;
 }
 
 async fn resolve_owner_route_authoritatively() -> OwnerQqRoute {
@@ -146,9 +166,11 @@ fn cache_owner_route(route: OwnerQqRoute) {
 }
 
 fn cached_owner_route() -> Option<OwnerQqRoute> {
-    OWNER_QQ_ROUTE
-        .get()
-        .map(|cache| cache.read().map_or(OwnerQqRoute::Unavailable, |route| *route))
+    OWNER_QQ_ROUTE.get().map(|cache| {
+        cache
+            .read()
+            .map_or(OwnerQqRoute::Unavailable, |route| *route)
+    })
 }
 
 /// Whether a QQ user is the configured canonical owner. `Some(false)` means
@@ -195,7 +217,29 @@ pub(crate) async fn canonical_owner_qq_id_authoritative() -> Option<Option<i64>>
     }
 }
 
+/// Revalidate the canonical owner and pin its identity route through a caller's
+/// outgoing commit. The caller must drop the returned guard before transport.
+pub(crate) async fn authorize_canonical_owner(user_id: i64) -> CanonicalOwnerAuthorization {
+    let route_guard = DELIVERY_ROUTE_LOCK.read().await;
+    match refresh_owner_route_while_locked().await {
+        OwnerQqRoute::Resolved(owner) if owner == user_id => {
+            CanonicalOwnerAuthorization::Authorized(CanonicalOwnerRouteGuard {
+                _route_guard: route_guard,
+            })
+        }
+        OwnerQqRoute::Unconfigured => CanonicalOwnerAuthorization::Unconfigured,
+        OwnerQqRoute::Resolved(_) | OwnerQqRoute::Unavailable => {
+            CanonicalOwnerAuthorization::Denied
+        }
+    }
+}
+
 async fn refresh_owner_route() -> OwnerQqRoute {
+    let _route_guard = DELIVERY_ROUTE_LOCK.read().await;
+    refresh_owner_route_while_locked().await
+}
+
+async fn refresh_owner_route_while_locked() -> OwnerQqRoute {
     let route = resolve_owner_route_authoritatively().await;
     cache_owner_route(route);
     route
@@ -229,6 +273,10 @@ pub(crate) fn relation_store() -> Option<Arc<PostgresRelationStore>> {
 #[allow(dead_code)]
 pub(crate) fn goal_store() -> Option<Arc<PostgresGoalStore>> {
     GOAL_STORE.get().cloned()
+}
+
+pub(crate) fn delivery_ledger() -> Option<Arc<PostgresDeliveryLedger>> {
+    DELIVERY_LEDGER.get().cloned()
 }
 
 /// Bootstrap canonical state from the legacy per-user profile. Existing rows
@@ -309,6 +357,11 @@ pub(crate) async fn begin_qq_user_data_erasure(user_id: i64) -> Result<bridge::U
     bridge.begin_user_data_erasure(user_id).await
 }
 
+pub(crate) async fn begin_qq_group_data_erasure(group_id: i64) -> Result<bridge::GroupDataErasure> {
+    let bridge = SHADOW_BRIDGE.get().context("Yunxi ShadowBridge 尚未安装")?;
+    bridge.begin_group_data_erasure(group_id).await
+}
+
 /// Remove the canonical Core person and all QQ direct conversations belonging
 /// to this user across bot accounts. This complements the legacy subsystem
 /// deletions used by `#删除我的数据 确认`.
@@ -328,9 +381,22 @@ pub(crate) async fn delete_qq_person_domain_data(self_id: i64, user_id: i64) -> 
         .delete_person_domain_data(&external_identity, &direct_conversation)
         .await
         .map_err(anyhow::Error::from);
-    let _ = refresh_owner_route().await;
+    let _ = refresh_owner_route_while_locked().await;
     let deleted = deleted?;
     Ok(deleted.total())
+}
+
+/// Remove canonical Core group data while pinning in-process delivery routes;
+/// the storage transaction also serializes cross-process commits by owner.
+pub(crate) async fn delete_qq_group_domain_data(group_id: i64) -> Result<u64> {
+    let _route_guard = DELIVERY_ROUTE_LOCK.write().await;
+    let store = IDENTITY_STORE
+        .get()
+        .context("Yunxi identity store 尚未初始化")?;
+    store
+        .delete_qq_group_domain_data(group_id)
+        .await
+        .map_err(anyhow::Error::from)
 }
 
 pub(crate) async fn export_person_json(person_id: uuid::Uuid) -> Result<String> {
@@ -355,7 +421,7 @@ pub(crate) async fn import_person_json(payload: &str) -> Result<uuid::Uuid> {
         .import_person(&export)
         .await
         .map_err(anyhow::Error::from)?;
-    let _ = refresh_owner_route().await;
+    let _ = refresh_owner_route_while_locked().await;
     Ok(person_id.into_uuid())
 }
 
@@ -375,7 +441,7 @@ pub(crate) async fn unlink_external_identity(platform: &str, external_id: &str) 
         .unlink_external_identity(&external)
         .await
         .map_err(anyhow::Error::from);
-    let _ = refresh_owner_route().await;
+    let _ = refresh_owner_route_while_locked().await;
     let unlinked = unlinked?;
     Ok(unlinked)
 }

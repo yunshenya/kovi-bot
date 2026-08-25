@@ -25,7 +25,7 @@ pub use action::{
     CreateOpenLoopAction, MAX_ACTION_IDEMPOTENCY_KEY_BYTES, MAX_ACTION_IDEMPOTENCY_KEY_CHARS,
     MAX_TOOL_INPUT_BYTES, MAX_TOOL_INPUT_CHARS, MAX_TOOL_NAME_BYTES, MAX_TOOL_NAME_CHARS,
     ProposedAction, ReachOutAction, ResolveOpenLoopAction, SendMessageAction, StartGoalAction,
-    ToolAction,
+    ToolAction, event_action_idempotency_key,
 };
 pub use arbiter::{
     ActionArbiter, ActionArbiterConfig, ActionCapability, ActionDescriptor, ActionPort,
@@ -40,12 +40,11 @@ pub use delivery::{
 pub use event::{
     ActionFailedEvent, ActionRejectedEvent, ActionSucceededEvent, Attachment, AttachmentKind,
     EventPriority, EventScope, EventType, EventValidationError, GoalCompletedEvent,
-    GoalUpdatedEvent, InteractionCuesObservedEvent, Message, MessageCollisionDetectedEvent,
-    MessageContent, MessageReceivedEvent, MessageSentEvent, MessageValidationError,
-    ProspectiveMemoryEvent, ReminderDueEvent,
-    ToolCompletedEvent, ToolFailedEvent, TraceContext, TraceError, WorldEvent, WorldEventKind,
-    MAX_TOOL_ERROR_DETAIL_BYTES, MAX_TOOL_ERROR_DETAIL_CHARS, MAX_TOOL_RESULT_BYTES,
-    MAX_TOOL_RESULT_CHARS,
+    GoalUpdatedEvent, InteractionCuesObservedEvent, MAX_TOOL_ERROR_DETAIL_BYTES,
+    MAX_TOOL_ERROR_DETAIL_CHARS, MAX_TOOL_RESULT_BYTES, MAX_TOOL_RESULT_CHARS, Message,
+    MessageCollisionDetectedEvent, MessageContent, MessageReceivedEvent, MessageSentEvent,
+    MessageValidationError, ProspectiveMemoryEvent, ReminderDueEvent, ToolCompletedEvent,
+    ToolFailedEvent, TraceContext, TraceError, WorldEvent, WorldEventKind,
 };
 pub use goal::{
     Goal, GoalDraft, GoalKind, GoalOwner, GoalState, GoalValidationError, MAX_GOAL_DETAILS_BYTES,
@@ -95,7 +94,7 @@ pub use runtime::{
     Admission, CognitiveRuntime, DataErasureError, MAX_BLOCKED_DATA_ERASURE_CONVERSATIONS,
     MAX_BLOCKED_DATA_ERASURE_PEOPLE, MAX_DATA_ERASURE_CONVERSATIONS, PlannedProcessingOutcome,
     ProcessingOutcome, RuntimeConfig, RuntimeConfigError, RuntimeHandle, RuntimeObservation,
-    SubmitError,
+    SubmitError, planned_action_idempotency_key,
 };
 pub use working_state::{
     CompactEvent, ConversationSnapshot, StateUpdate, WorkingState, WorkingStateConfig,

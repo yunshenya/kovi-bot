@@ -1,9 +1,11 @@
+use super::delivery_ledger::{delete_group_domain_rows, delete_person_domain_rows};
 use super::owner_lock::{self, DurableOwner};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx_core::query::query;
 use sqlx_core::query_scalar::query_scalar;
 use sqlx_core::row::Row;
+use sqlx_core::transaction::Transaction;
 use sqlx_postgres::{PgPool, Postgres};
 use std::collections::HashSet;
 use std::str::FromStr;
@@ -31,6 +33,7 @@ pub(crate) struct PersonDomainDeletion {
     pub(crate) external_identities: u64,
     pub(crate) external_conversations: u64,
     pub(crate) message_mappings: u64,
+    pub(crate) delivery_ledger: u64,
     pub(crate) memories: u64,
     pub(crate) open_loops: u64,
     pub(crate) affect_states: u64,
@@ -47,6 +50,8 @@ pub(crate) struct QqPersonDomainTargets {
 
 const MAX_QQ_PERSON_ALIASES: usize = 256;
 const MAX_QQ_PERSON_DIRECT_CONVERSATIONS: usize = 256;
+const MAX_PERSON_DIRECT_CONVERSATIONS: usize = 256;
+const MAX_PERSON_DIRECT_CONVERSATION_ROUTES: usize = 4_096;
 const PORTABLE_PERSON_EXPORT_VERSION: u16 = 1;
 const MAX_PORTABLE_EXTERNAL_IDENTITIES: usize = 256;
 const MAX_PORTABLE_MEMORIES: usize = 512;
@@ -77,6 +82,39 @@ pub(crate) struct PortablePersonExport {
     pub(crate) goals: Vec<Goal>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ExternalConversationRoute {
+    platform: String,
+    external_id: String,
+}
+
+impl ExternalConversationRoute {
+    fn from_external(external: &ExternalConversation) -> Self {
+        Self {
+            platform: external.platform().as_str().to_owned(),
+            external_id: external.external_id().to_owned(),
+        }
+    }
+
+    fn advisory_lock_key(&self) -> String {
+        format!(
+            "yunxi-route:conversation:{}:{}",
+            self.platform, self.external_id
+        )
+    }
+}
+
+async fn lock_conversation_route(
+    transaction: &mut Transaction<'_, Postgres>,
+    route: &ExternalConversationRoute,
+) -> Result<(), sqlx_core::error::Error> {
+    query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(route.advisory_lock_key())
+        .execute(&mut **transaction)
+        .await?;
+    Ok(())
+}
+
 impl PersonDomainDeletion {
     #[must_use]
     pub(crate) const fn total(self) -> u64 {
@@ -85,6 +123,7 @@ impl PersonDomainDeletion {
             + self.external_identities
             + self.external_conversations
             + self.message_mappings
+            + self.delivery_ledger
             + self.memories
             + self.open_loops
             + self.affect_states
@@ -281,6 +320,12 @@ impl PostgresIdentityStore {
             .begin()
             .await
             .map_err(IdentityStoreError::storage)?;
+        owner_lock::lock_owner(
+            &mut transaction,
+            DurableOwner::Person(export.person_id.into_uuid()),
+        )
+        .await
+        .map_err(IdentityStoreError::storage)?;
         query("INSERT INTO yunxi_persons (id) VALUES ($1) ON CONFLICT (id) DO NOTHING")
             .bind(export.person_id.into_uuid())
             .execute(&mut *transaction)
@@ -585,14 +630,33 @@ impl PostgresIdentityStore {
             .map_err(IdentityStoreError::storage)?;
         let person_id = query_scalar::<Postgres, Uuid>(
             "SELECT person_id FROM yunxi_external_identities
-             WHERE platform = $1 AND external_id = $2
-             FOR UPDATE",
+             WHERE platform = $1 AND external_id = $2",
         )
         .bind(external_identity.platform().as_str())
         .bind(external_identity.external_id())
         .fetch_optional(&mut *transaction)
         .await
         .map_err(IdentityStoreError::storage)?;
+        if let Some(person_id) = person_id {
+            owner_lock::lock_owner(&mut transaction, DurableOwner::Person(person_id))
+                .await
+                .map_err(IdentityStoreError::storage)?;
+            let locked_person_id = query_scalar::<Postgres, Uuid>(
+                "SELECT person_id FROM yunxi_external_identities
+                 WHERE platform = $1 AND external_id = $2
+                 FOR UPDATE",
+            )
+            .bind(external_identity.platform().as_str())
+            .bind(external_identity.external_id())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(IdentityStoreError::storage)?;
+            if locked_person_id != Some(person_id) {
+                return Err(IdentityStoreError::storage(std::io::Error::other(
+                    "external identity changed while person deletion was acquiring its owner lock",
+                )));
+            }
+        }
         let qq_alias_external_ids =
             if is_qq_direct_for_identity(external_identity, direct_conversation) {
                 if let Some(person_id) = person_id {
@@ -601,8 +665,7 @@ impl PostgresIdentityStore {
                      WHERE platform = 'qq' AND person_id = $1
                        AND external_id ~ '^[1-9][0-9]*$'
                      ORDER BY external_id
-                     LIMIT $2
-                     FOR UPDATE",
+                     LIMIT $2",
                     )
                     .bind(person_id)
                     .bind(i64::try_from(MAX_QQ_PERSON_ALIASES + 1).unwrap_or(i64::MAX))
@@ -616,10 +679,29 @@ impl PostgresIdentityStore {
             } else {
                 None
             };
-        let mut conversation_ids = if let Some(qq_alias_external_ids) = qq_alias_external_ids {
+        let mut conversation_ids = if let Some(person_id) = person_id {
             query_scalar::<Postgres, Uuid>(
-                r#"
-                SELECT external.conversation_id
+                "SELECT DISTINCT member.conversation_id
+                 FROM yunxi_conversation_members AS member
+                 JOIN yunxi_conversations AS conversation
+                   ON conversation.id = member.conversation_id
+                 WHERE member.person_id = $1 AND conversation.kind = 'direct'
+                 ORDER BY member.conversation_id
+                 LIMIT $2",
+            )
+            .bind(person_id)
+            .bind(i64::try_from(MAX_PERSON_DIRECT_CONVERSATIONS + 1).unwrap_or(i64::MAX))
+            .fetch_all(&mut *transaction)
+            .await
+            .map_err(IdentityStoreError::storage)?
+        } else {
+            Vec::new()
+        };
+        if let Some(qq_alias_external_ids) = &qq_alias_external_ids {
+            conversation_ids.extend(
+                query_scalar::<Postgres, Uuid>(
+                    r#"
+                SELECT DISTINCT external.conversation_id
                 FROM yunxi_external_conversations AS external
                 JOIN yunxi_conversations AS conversation
                   ON conversation.id = external.conversation_id
@@ -627,37 +709,93 @@ impl PostgresIdentityStore {
                   AND conversation.kind = 'direct'
                   AND external.external_id ~ '^direct:[1-9][0-9]*:[1-9][0-9]*$'
                   AND split_part(external.external_id, ':', 3) = ANY($1)
-                ORDER BY external.conversation_id, external.external_id
-                FOR UPDATE OF external, conversation
+                ORDER BY external.conversation_id
+                LIMIT $2
                 "#,
-            )
-            .bind(&qq_alias_external_ids)
-            .fetch_all(&mut *transaction)
-            .await
-            .map_err(IdentityStoreError::storage)?
-        } else {
+                )
+                .bind(qq_alias_external_ids)
+                .bind(i64::try_from(MAX_PERSON_DIRECT_CONVERSATIONS + 1).unwrap_or(i64::MAX))
+                .fetch_all(&mut *transaction)
+                .await
+                .map_err(IdentityStoreError::storage)?,
+            );
+        }
+        conversation_ids.extend(
             query_scalar::<Postgres, Uuid>(
                 "SELECT external.conversation_id
                  FROM yunxi_external_conversations AS external
                  JOIN yunxi_conversations AS conversation
                    ON conversation.id = external.conversation_id
                  WHERE external.platform = $1 AND external.external_id = $2
-                   AND conversation.kind = 'direct'
-                 FOR UPDATE OF external, conversation",
+                   AND conversation.kind = 'direct'",
             )
             .bind(direct_conversation.platform().as_str())
             .bind(direct_conversation.external_id())
             .fetch_optional(&mut *transaction)
             .await
-            .map_err(IdentityStoreError::storage)?
-            .into_iter()
-            .collect()
-        };
+            .map_err(IdentityStoreError::storage)?,
+        );
         conversation_ids.sort_unstable();
         conversation_ids.dedup();
+        if conversation_ids.len() > MAX_PERSON_DIRECT_CONVERSATIONS {
+            return Err(IdentityStoreError::storage(std::io::Error::other(
+                "person has too many direct conversations to erase safely",
+            )));
+        }
+        let qq_user_ids = qq_alias_external_ids
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|external_id| {
+                external_id.parse::<i64>().map_err(|error| {
+                    IdentityStoreError::storage(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        error,
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
 
-        if let Some(person_id) = person_id {
-            owner_lock::lock_owner(&mut transaction, DurableOwner::Person(person_id))
+        let mut conversation_routes = if conversation_ids.is_empty() {
+            Vec::new()
+        } else {
+            query(
+                "SELECT platform, external_id
+                 FROM yunxi_external_conversations
+                 WHERE conversation_id = ANY($1)
+                 ORDER BY platform, external_id
+                 LIMIT $2",
+            )
+            .bind(&conversation_ids)
+            .bind(i64::try_from(MAX_PERSON_DIRECT_CONVERSATION_ROUTES + 1).unwrap_or(i64::MAX))
+            .fetch_all(&mut *transaction)
+            .await
+            .map_err(IdentityStoreError::storage)?
+            .into_iter()
+            .map(|row| {
+                Ok(ExternalConversationRoute {
+                    platform: row
+                        .try_get::<String, _>("platform")
+                        .map_err(IdentityStoreError::storage)?,
+                    external_id: row
+                        .try_get::<String, _>("external_id")
+                        .map_err(IdentityStoreError::storage)?,
+                })
+            })
+            .collect::<Result<Vec<_>, IdentityStoreError>>()?
+        };
+        conversation_routes.push(ExternalConversationRoute::from_external(
+            direct_conversation,
+        ));
+        conversation_routes.sort_unstable();
+        conversation_routes.dedup();
+        if conversation_routes.len() > MAX_PERSON_DIRECT_CONVERSATION_ROUTES {
+            return Err(IdentityStoreError::storage(std::io::Error::other(
+                "person has too many external conversation routes to erase safely",
+            )));
+        }
+        for route in &conversation_routes {
+            lock_conversation_route(&mut transaction, route)
                 .await
                 .map_err(IdentityStoreError::storage)?;
         }
@@ -669,8 +807,62 @@ impl PostgresIdentityStore {
             .await
             .map_err(IdentityStoreError::storage)?;
         }
+        if !conversation_ids.is_empty() {
+            let locked_direct_ids = query_scalar::<Postgres, Uuid>(
+                "SELECT id FROM yunxi_conversations
+                 WHERE id = ANY($1) AND kind = 'direct'
+                 ORDER BY id
+                 FOR UPDATE",
+            )
+            .bind(&conversation_ids)
+            .fetch_all(&mut *transaction)
+            .await
+            .map_err(IdentityStoreError::storage)?;
+            if locked_direct_ids != conversation_ids {
+                return Err(IdentityStoreError::storage(std::io::Error::other(
+                    "direct conversation ownership changed during person deletion",
+                )));
+            }
+            let has_conflicting_members = query_scalar::<Postgres, bool>(
+                "SELECT EXISTS (
+                     SELECT 1 FROM yunxi_conversation_members
+                     WHERE conversation_id = ANY($1)
+                       AND ($2::uuid IS NULL OR person_id <> $2)
+                 )",
+            )
+            .bind(&conversation_ids)
+            .bind(person_id)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(IdentityStoreError::storage)?;
+            if has_conflicting_members {
+                return Err(IdentityStoreError::storage(std::io::Error::other(
+                    "direct conversation belongs to another canonical person",
+                )));
+            }
+        }
+        if person_id.is_none() {
+            let appeared_person = query_scalar::<Postgres, Uuid>(
+                "SELECT person_id FROM yunxi_external_identities
+                 WHERE platform = $1 AND external_id = $2",
+            )
+            .bind(external_identity.platform().as_str())
+            .bind(external_identity.external_id())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(IdentityStoreError::storage)?;
+            if appeared_person.is_some() {
+                return Err(IdentityStoreError::storage(std::io::Error::other(
+                    "external identity appeared while legacy person deletion was running",
+                )));
+            }
+        }
 
         let mut deleted = PersonDomainDeletion::default();
+        deleted.delivery_ledger +=
+            delete_person_domain_rows(&mut transaction, person_id, &conversation_ids, &qq_user_ids)
+                .await
+                .map_err(IdentityStoreError::storage)?;
         if let Some(person_id) = person_id {
             deleted.memories +=
                 query("DELETE FROM yunxi_memories WHERE scope_kind = 'person' AND scope_id = $1")
@@ -774,6 +966,269 @@ impl PostgresIdentityStore {
             .await
             .map_err(IdentityStoreError::storage)?;
         Ok(deleted)
+    }
+
+    /// Looks up an existing canonical QQ group without creating a replacement
+    /// mapping while a deletion barrier is being established.
+    pub(crate) async fn qq_group_conversation_id(
+        &self,
+        group_id: i64,
+    ) -> Result<Option<ConversationId>, IdentityStoreError> {
+        if group_id <= 0 {
+            return Err(IdentityStoreError::storage(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "QQ group id must be positive",
+            )));
+        }
+        query_scalar::<Postgres, Uuid>(
+            "SELECT external.conversation_id
+             FROM yunxi_external_conversations AS external
+             JOIN yunxi_conversations AS conversation
+               ON conversation.id = external.conversation_id
+             WHERE external.platform = 'qq' AND external.external_id = $1
+               AND conversation.kind = 'group'",
+        )
+        .bind(format!("group:{group_id}"))
+        .fetch_optional(&self.pool)
+        .await
+        .map(|conversation_id| conversation_id.map(ConversationId::from_uuid))
+        .map_err(IdentityStoreError::storage)
+    }
+
+    /// Delete the canonical Core conversation domains attributable to one QQ
+    /// group. Removing the canonical conversation makes a cross-process send
+    /// waiting on its owner lock fail existence revalidation after the purge.
+    pub(crate) async fn delete_qq_group_domain_data(
+        &self,
+        group_id: i64,
+    ) -> Result<u64, IdentityStoreError> {
+        if group_id <= 0 {
+            return Err(IdentityStoreError::storage(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "QQ group id must be positive",
+            )));
+        }
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(IdentityStoreError::storage)?;
+        let conversation_id = query_scalar::<Postgres, Uuid>(
+            "SELECT external.conversation_id
+             FROM yunxi_external_conversations AS external
+             JOIN yunxi_conversations AS conversation
+               ON conversation.id = external.conversation_id
+             WHERE external.platform = 'qq' AND external.external_id = $1
+               AND conversation.kind = 'group'
+             FOR UPDATE OF external, conversation",
+        )
+        .bind(format!("group:{group_id}"))
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(IdentityStoreError::storage)?;
+        if let Some(conversation_id) = conversation_id {
+            owner_lock::lock_owner(
+                &mut transaction,
+                DurableOwner::Conversation(conversation_id),
+            )
+            .await
+            .map_err(IdentityStoreError::storage)?;
+        }
+        let mut deleted = delete_group_domain_rows(&mut transaction, conversation_id, group_id)
+            .await
+            .map_err(IdentityStoreError::storage)?;
+        if let Some(conversation_id) = conversation_id {
+            deleted += query(
+                "DELETE FROM yunxi_memories
+                 WHERE scope_kind = 'conversation' AND scope_id = $1",
+            )
+            .bind(conversation_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(IdentityStoreError::storage)?
+            .rows_affected();
+            deleted += query(
+                "DELETE FROM yunxi_open_loops
+                 WHERE owner_kind = 'conversation' AND owner_id = $1",
+            )
+            .bind(conversation_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(IdentityStoreError::storage)?
+            .rows_affected();
+            deleted += query(
+                "DELETE FROM yunxi_goals
+                 WHERE owner_kind = 'conversation' AND owner_id = $1",
+            )
+            .bind(conversation_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(IdentityStoreError::storage)?
+            .rows_affected();
+            deleted += query("DELETE FROM yunxi_message_mappings WHERE conversation_id = $1")
+                .bind(conversation_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(IdentityStoreError::storage)?
+                .rows_affected();
+            deleted += query("DELETE FROM yunxi_external_conversations WHERE conversation_id = $1")
+                .bind(conversation_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(IdentityStoreError::storage)?
+                .rows_affected();
+            deleted += query("DELETE FROM yunxi_conversations WHERE id = $1")
+                .bind(conversation_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(IdentityStoreError::storage)?
+                .rows_affected();
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(IdentityStoreError::storage)?;
+        Ok(deleted)
+    }
+
+    /// Resolve the only safe QQ ReachOut route while serializing against
+    /// person-domain deletion. Unlike the general ingress resolver, this
+    /// rechecks canonical identity ownership before it may create a direct
+    /// conversation.
+    pub(crate) async fn resolve_qq_direct_for_person_delivery(
+        &self,
+        person_id: PersonId,
+        self_id: i64,
+    ) -> Result<Option<(ConversationId, i64)>, IdentityStoreError> {
+        if self_id <= 0 {
+            return Ok(None);
+        }
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(IdentityStoreError::storage)?;
+        if !owner_lock::lock_and_owner_exists(
+            &mut transaction,
+            DurableOwner::Person(person_id.into_uuid()),
+        )
+        .await
+        .map_err(IdentityStoreError::storage)?
+        {
+            transaction
+                .rollback()
+                .await
+                .map_err(IdentityStoreError::storage)?;
+            return Ok(None);
+        }
+        let external_ids = query_scalar::<Postgres, String>(
+            "SELECT external_id FROM yunxi_external_identities
+             WHERE platform = 'qq' AND person_id = $1
+             ORDER BY external_id LIMIT 2",
+        )
+        .bind(person_id.into_uuid())
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(IdentityStoreError::storage)?;
+        let [external_id] = external_ids.as_slice() else {
+            transaction
+                .rollback()
+                .await
+                .map_err(IdentityStoreError::storage)?;
+            return Ok(None);
+        };
+        let Ok(user_id) = external_id.parse::<i64>() else {
+            transaction
+                .rollback()
+                .await
+                .map_err(IdentityStoreError::storage)?;
+            return Ok(None);
+        };
+        if user_id <= 0 {
+            transaction
+                .rollback()
+                .await
+                .map_err(IdentityStoreError::storage)?;
+            return Ok(None);
+        }
+
+        let direct_external_id = format!("direct:{self_id}:{user_id}");
+        lock_conversation_route(
+            &mut transaction,
+            &ExternalConversationRoute {
+                platform: "qq".to_owned(),
+                external_id: direct_external_id.clone(),
+            },
+        )
+        .await
+        .map_err(IdentityStoreError::storage)?;
+        if let Some(row) = query(
+            "SELECT conversation.id, conversation.kind
+             FROM yunxi_external_conversations AS external
+             JOIN yunxi_conversations AS conversation
+               ON conversation.id = external.conversation_id
+             WHERE external.platform = 'qq' AND external.external_id = $1",
+        )
+        .bind(&direct_external_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(IdentityStoreError::storage)?
+        {
+            let conversation_id = row
+                .try_get::<Uuid, _>("id")
+                .map_err(IdentityStoreError::storage)?;
+            let kind = parse_stored_kind(
+                &row.try_get::<String, _>("kind")
+                    .map_err(IdentityStoreError::storage)?,
+            )?;
+            ensure_kind(ConversationKind::Direct, kind)?;
+            owner_lock::lock_owner(
+                &mut transaction,
+                DurableOwner::Conversation(conversation_id),
+            )
+            .await
+            .map_err(IdentityStoreError::storage)?;
+            transaction
+                .commit()
+                .await
+                .map_err(IdentityStoreError::storage)?;
+            return Ok(Some((ConversationId::from_uuid(conversation_id), user_id)));
+        }
+
+        let candidate = ConversationId::new();
+        query("INSERT INTO yunxi_conversations (id, kind) VALUES ($1, 'direct')")
+            .bind(candidate.into_uuid())
+            .execute(&mut *transaction)
+            .await
+            .map_err(IdentityStoreError::storage)?;
+        let winner = query_scalar::<Postgres, Uuid>(
+            "INSERT INTO yunxi_external_conversations AS current_mapping
+                (platform, external_id, conversation_id)
+             VALUES ('qq', $1, $2)
+             ON CONFLICT (platform, external_id) DO UPDATE
+             SET conversation_id = current_mapping.conversation_id
+             RETURNING current_mapping.conversation_id",
+        )
+        .bind(&direct_external_id)
+        .bind(candidate.into_uuid())
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(IdentityStoreError::storage)?;
+        if winner != candidate.into_uuid() {
+            query("DELETE FROM yunxi_conversations WHERE id = $1")
+                .bind(candidate.into_uuid())
+                .execute(&mut *transaction)
+                .await
+                .map_err(IdentityStoreError::storage)?;
+        }
+        owner_lock::lock_owner(&mut transaction, DurableOwner::Conversation(winner))
+            .await
+            .map_err(IdentityStoreError::storage)?;
+        transaction
+            .commit()
+            .await
+            .map_err(IdentityStoreError::storage)?;
+        Ok(Some((ConversationId::from_uuid(winner), user_id)))
     }
 
     pub(crate) async fn qq_external_identities_for_person(
@@ -1291,46 +1746,51 @@ impl PostgresIdentityStore {
         Ok(PersonId::from_uuid(winner))
     }
 
-    pub(crate) async fn resolve_conversation(
-        &self,
+    async fn resolve_conversation_in_transaction(
+        transaction: &mut Transaction<'_, Postgres>,
         external: &ExternalConversation,
     ) -> Result<ConversationId, IdentityStoreError> {
-        if let Some(row) = query(
-            r#"
-            SELECT conversation.id, conversation.kind
-            FROM yunxi_external_conversations AS external
-            JOIN yunxi_conversations AS conversation
-              ON conversation.id = external.conversation_id
-            WHERE external.platform = $1 AND external.external_id = $2
-            "#,
+        let route = ExternalConversationRoute::from_external(external);
+        lock_conversation_route(transaction, &route)
+            .await
+            .map_err(IdentityStoreError::storage)?;
+        if let Some(conversation_id) = query_scalar::<Postgres, Uuid>(
+            "SELECT conversation_id FROM yunxi_external_conversations
+             WHERE platform = $1 AND external_id = $2",
         )
         .bind(external.platform().as_str())
         .bind(external.external_id())
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut **transaction)
         .await
         .map_err(IdentityStoreError::storage)?
         {
-            let id = row
-                .try_get::<Uuid, _>("id")
-                .map_err(IdentityStoreError::storage)?;
-            let kind = parse_stored_kind(
-                &row.try_get::<String, _>("kind")
-                    .map_err(IdentityStoreError::storage)?,
-            )?;
-            ensure_kind(external.kind(), kind)?;
-            return Ok(ConversationId::from_uuid(id));
+            if !owner_lock::lock_and_owner_exists(
+                transaction,
+                DurableOwner::Conversation(conversation_id),
+            )
+            .await
+            .map_err(IdentityStoreError::storage)?
+            {
+                return Err(IdentityStoreError::storage(std::io::Error::other(
+                    "canonical conversation disappeared during route resolution",
+                )));
+            }
+            let stored_kind = query_scalar::<Postgres, String>(
+                "SELECT kind FROM yunxi_conversations WHERE id = $1",
+            )
+            .bind(conversation_id)
+            .fetch_one(&mut **transaction)
+            .await
+            .map_err(IdentityStoreError::storage)?;
+            ensure_kind(external.kind(), parse_stored_kind(&stored_kind)?)?;
+            return Ok(ConversationId::from_uuid(conversation_id));
         }
 
         let candidate = ConversationId::new();
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(IdentityStoreError::storage)?;
         query("INSERT INTO yunxi_conversations (id, kind) VALUES ($1, $2)")
             .bind(candidate.into_uuid())
             .bind(external.kind().as_str())
-            .execute(&mut *transaction)
+            .execute(&mut **transaction)
             .await
             .map_err(IdentityStoreError::storage)?;
         let winner = query_scalar::<Postgres, Uuid>(
@@ -1346,28 +1806,122 @@ impl PostgresIdentityStore {
         .bind(external.platform().as_str())
         .bind(external.external_id())
         .bind(candidate.into_uuid())
-        .fetch_one(&mut *transaction)
+        .fetch_one(&mut **transaction)
         .await
         .map_err(IdentityStoreError::storage)?;
-        let stored_kind =
-            query_scalar::<Postgres, String>("SELECT kind FROM yunxi_conversations WHERE id = $1")
-                .bind(winner)
-                .fetch_one(&mut *transaction)
-                .await
-                .map_err(IdentityStoreError::storage)?;
-        ensure_kind(external.kind(), parse_stored_kind(&stored_kind)?)?;
         if winner != candidate.into_uuid() {
             query("DELETE FROM yunxi_conversations WHERE id = $1")
                 .bind(candidate.into_uuid())
-                .execute(&mut *transaction)
+                .execute(&mut **transaction)
                 .await
                 .map_err(IdentityStoreError::storage)?;
         }
+        if !owner_lock::lock_and_owner_exists(transaction, DurableOwner::Conversation(winner))
+            .await
+            .map_err(IdentityStoreError::storage)?
+        {
+            return Err(IdentityStoreError::storage(std::io::Error::other(
+                "canonical conversation disappeared while its route was being created",
+            )));
+        }
+        let stored_kind =
+            query_scalar::<Postgres, String>("SELECT kind FROM yunxi_conversations WHERE id = $1")
+                .bind(winner)
+                .fetch_one(&mut **transaction)
+                .await
+                .map_err(IdentityStoreError::storage)?;
+        ensure_kind(external.kind(), parse_stored_kind(&stored_kind)?)?;
+        Ok(ConversationId::from_uuid(winner))
+    }
+
+    /// Resolve a direct conversation only while its canonical Person still
+    /// exists, and persist membership in the same lock-ordered transaction.
+    pub(crate) async fn resolve_direct_for_person(
+        &self,
+        person_id: PersonId,
+        external: &ExternalConversation,
+    ) -> Result<ConversationId, IdentityStoreError> {
+        if external.kind() != ConversationKind::Direct {
+            return Err(IdentityStoreError::ConversationKindMismatch {
+                requested: ConversationKind::Direct,
+                stored: external.kind(),
+            });
+        }
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(IdentityStoreError::storage)?;
+        if !owner_lock::lock_and_owner_exists(
+            &mut transaction,
+            DurableOwner::Person(person_id.into_uuid()),
+        )
+        .await
+        .map_err(IdentityStoreError::storage)?
+        {
+            return Err(IdentityStoreError::storage(std::io::Error::other(
+                "canonical person disappeared before direct conversation resolution",
+            )));
+        }
+        let conversation_id =
+            Self::resolve_conversation_in_transaction(&mut transaction, external).await?;
+        let has_other_member = query_scalar::<Postgres, bool>(
+            "SELECT EXISTS (
+                 SELECT 1 FROM yunxi_conversation_members
+                 WHERE conversation_id = $1 AND person_id <> $2
+             )",
+        )
+        .bind(conversation_id.into_uuid())
+        .bind(person_id.into_uuid())
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(IdentityStoreError::storage)?;
+        if has_other_member {
+            return Err(IdentityStoreError::storage(std::io::Error::other(
+                "direct conversation already belongs to another canonical person",
+            )));
+        }
+        query(
+            "INSERT INTO yunxi_conversation_members (conversation_id, person_id)
+             VALUES ($1, $2)
+             ON CONFLICT (conversation_id, person_id) DO UPDATE SET updated_at = NOW()",
+        )
+        .bind(conversation_id.into_uuid())
+        .bind(person_id.into_uuid())
+        .execute(&mut *transaction)
+        .await
+        .map_err(IdentityStoreError::storage)?;
         transaction
             .commit()
             .await
             .map_err(IdentityStoreError::storage)?;
-        Ok(ConversationId::from_uuid(winner))
+        Ok(conversation_id)
+    }
+
+    /// Resolve a shared conversation route. Direct routes require
+    /// [`Self::resolve_direct_for_person`] so they cannot bypass Person-domain
+    /// deletion and membership persistence.
+    pub(crate) async fn resolve_conversation(
+        &self,
+        external: &ExternalConversation,
+    ) -> Result<ConversationId, IdentityStoreError> {
+        if external.kind() == ConversationKind::Direct {
+            return Err(IdentityStoreError::storage(std::io::Error::other(
+                "direct conversation resolution requires a canonical Person owner",
+            )));
+        }
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(IdentityStoreError::storage)?;
+        let conversation_id =
+            Self::resolve_conversation_in_transaction(&mut transaction, external).await?;
+        transaction
+            .commit()
+            .await
+            .map_err(IdentityStoreError::storage)?;
+        Ok(conversation_id)
     }
 }
 
@@ -1398,6 +1952,33 @@ impl ConversationMemberStore for PostgresIdentityStore {
                 .map_err(|error| ConversationMemberStoreError::InvalidRequest {
                     reason: error.to_string(),
                 })?;
+            let mut transaction = self
+                .pool
+                .begin()
+                .await
+                .map_err(ConversationMemberStoreError::storage)?;
+            if !owner_lock::lock_and_owner_exists(
+                &mut transaction,
+                DurableOwner::Person(member.person_id().into_uuid()),
+            )
+            .await
+            .map_err(ConversationMemberStoreError::storage)?
+            {
+                return Err(ConversationMemberStoreError::InvalidRequest {
+                    reason: "canonical person does not exist".to_owned(),
+                });
+            }
+            if !owner_lock::lock_and_owner_exists(
+                &mut transaction,
+                DurableOwner::Conversation(member.conversation_id().into_uuid()),
+            )
+            .await
+            .map_err(ConversationMemberStoreError::storage)?
+            {
+                return Err(ConversationMemberStoreError::InvalidRequest {
+                    reason: "canonical conversation does not exist".to_owned(),
+                });
+            }
             query(
                 "INSERT INTO yunxi_conversation_members
                     (conversation_id, person_id, role)
@@ -1408,9 +1989,13 @@ impl ConversationMemberStore for PostgresIdentityStore {
             .bind(member.conversation_id().into_uuid())
             .bind(member.person_id().into_uuid())
             .bind(member.role())
-            .execute(&self.pool)
+            .execute(&mut *transaction)
             .await
             .map_err(ConversationMemberStoreError::storage)?;
+            transaction
+                .commit()
+                .await
+                .map_err(ConversationMemberStoreError::storage)?;
             Ok(member.clone())
         })
     }
@@ -1979,9 +2564,13 @@ fn is_qq_direct_for_identity(
 
 #[cfg(test)]
 mod tests {
-    use super::{PortableExternalIdentity, PortablePersonExport, PostgresIdentityStore};
+    use super::{
+        ExternalConversationRoute, PortableExternalIdentity, PortablePersonExport,
+        PostgresIdentityStore,
+    };
     use crate::memory::MemoryManager;
     use crate::yunxi::affect_store::PostgresAffectStore;
+    use crate::yunxi::delivery_ledger::PostgresDeliveryLedger;
     use crate::yunxi::goal_store::PostgresGoalStore;
     use crate::yunxi::memory_store::PostgresMemoryStore;
     use crate::yunxi::open_loop_store::PostgresOpenLoopStore;
@@ -1994,6 +2583,7 @@ mod tests {
     use sqlx_core::row::Row;
     use sqlx_postgres::{PgPool, PgPoolOptions, Postgres};
     use std::sync::Arc;
+    use std::time::Duration;
     use uuid::Uuid;
     use yunxi_core::{
         ConversationKind, ExternalConversation, ExternalIdentity, GoalDraft, GoalKind, GoalOwner,
@@ -2033,6 +2623,43 @@ mod tests {
             .await
             .expect("应初始化 goal schema");
         identities
+    }
+
+    async fn initialize_delivery_ledger(pool: &PgPool) {
+        PostgresDeliveryLedger::new(pool.clone())
+            .initialize_schema()
+            .await
+            .expect("应初始化 delivery ledger schema");
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn insert_delivery_fixture(
+        pool: &PgPool,
+        delivery_key: &str,
+        action_kind: &str,
+        target_kind: &str,
+        target_id: Uuid,
+        conversation_id: Uuid,
+        destination_kind: &str,
+        destination_id: i64,
+    ) {
+        query(
+            "INSERT INTO yunxi_action_delivery_ledger
+                (delivery_key, envelope_fingerprint, action_kind, target_kind, target_id,
+                 conversation_id, destination_kind, destination_id, status)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'sent')",
+        )
+        .bind(delivery_key)
+        .bind(vec![7_u8; 32])
+        .bind(action_kind)
+        .bind(target_kind)
+        .bind(target_id)
+        .bind(conversation_id)
+        .bind(destination_kind)
+        .bind(destination_id)
+        .execute(pool)
+        .await
+        .expect("应创建 delivery ledger fixture");
     }
 
     #[test]
@@ -2194,7 +2821,7 @@ mod tests {
                     group_id
                 );
                 let direct_id = store
-                    .resolve_conversation(&direct)
+                    .resolve_direct_for_person(winners[0], &direct)
                     .await
                     .expect("direct should resolve");
                 assert_ne!(group_id, direct_id);
@@ -2206,10 +2833,7 @@ mod tests {
                 .expect("valid conflicting reference");
                 assert!(matches!(
                     store.resolve_conversation(&wrong_kind).await,
-                    Err(IdentityStoreError::ConversationKindMismatch {
-                        requested: ConversationKind::Direct,
-                        stored: ConversationKind::Group,
-                    })
+                    Err(IdentityStoreError::Storage { .. })
                 ));
                 assert_eq!(
                     query_scalar::<Postgres, i64>(
@@ -2319,6 +2943,7 @@ mod tests {
                     .initialize_schema()
                     .await
                     .expect("应初始化身份 schema");
+                initialize_delivery_ledger(&pool).await;
                 PostgresOpenLoopStore::new(pool.clone())
                     .initialize_schema()
                     .await
@@ -2363,6 +2988,12 @@ mod tests {
                 let alias_direct = qq::direct(first_bot_id, alias_user_id)
                     .expect("valid alias direct conversation");
                 let group = qq::group(group_external_id).expect("valid group conversation");
+                let matrix_direct = ExternalConversation::new(
+                    PlatformId::new("matrix-test").expect("valid matrix platform"),
+                    format!("direct:portable:{suffix}"),
+                    ConversationKind::Direct,
+                )
+                .expect("valid cross-platform direct conversation");
                 let person_id = store
                     .resolve_identity(&identity)
                     .await
@@ -2377,17 +3008,21 @@ mod tests {
                 .await
                 .expect("alias should link to the canonical person");
                 let first_conversation_id = store
-                    .resolve_conversation(&first_direct)
+                    .resolve_direct_for_person(person_id, &first_direct)
                     .await
                     .expect("first conversation should resolve");
                 let second_conversation_id = store
-                    .resolve_conversation(&second_direct)
+                    .resolve_direct_for_person(person_id, &second_direct)
                     .await
                     .expect("second conversation should resolve");
                 let alias_conversation_id = store
-                    .resolve_conversation(&alias_direct)
+                    .resolve_direct_for_person(person_id, &alias_direct)
                     .await
                     .expect("alias conversation should resolve");
+                let matrix_conversation_id = store
+                    .resolve_direct_for_person(person_id, &matrix_direct)
+                    .await
+                    .expect("cross-platform direct conversation should resolve");
                 let group_conversation_id = store
                     .resolve_conversation(&group)
                     .await
@@ -2396,6 +3031,7 @@ mod tests {
                 let first_conversation_uuid = first_conversation_id.into_uuid();
                 let second_conversation_uuid = second_conversation_id.into_uuid();
                 let alias_conversation_uuid = alias_conversation_id.into_uuid();
+                let matrix_conversation_uuid = matrix_conversation_id.into_uuid();
                 let group_conversation_uuid = group_conversation_id.into_uuid();
 
                 for (scope_kind, scope_id) in [
@@ -2403,6 +3039,7 @@ mod tests {
                     ("conversation", first_conversation_uuid),
                     ("conversation", second_conversation_uuid),
                     ("conversation", alias_conversation_uuid),
+                    ("conversation", matrix_conversation_uuid),
                     ("conversation", group_conversation_uuid),
                 ] {
                     query(
@@ -2422,6 +3059,7 @@ mod tests {
                     ("conversation", first_conversation_uuid),
                     ("conversation", second_conversation_uuid),
                     ("conversation", alias_conversation_uuid),
+                    ("conversation", matrix_conversation_uuid),
                     ("conversation", group_conversation_uuid),
                 ] {
                     query(
@@ -2461,7 +3099,8 @@ mod tests {
                     (first_conversation_uuid, 1_i64),
                     (second_conversation_uuid, 2_i64),
                     (alias_conversation_uuid, 3_i64),
-                    (group_conversation_uuid, 4_i64),
+                    (matrix_conversation_uuid, 4_i64),
+                    (group_conversation_uuid, 5_i64),
                 ] {
                     query(
                         "INSERT INTO yunxi_message_mappings
@@ -2475,6 +3114,18 @@ mod tests {
                     .await
                     .expect("应创建测试 message mapping");
                 }
+                let matrix_delivery_key = format!("cross-platform-delete:{suffix}");
+                insert_delivery_fixture(
+                    &pool,
+                    &matrix_delivery_key,
+                    "send_message",
+                    "conversation",
+                    matrix_conversation_uuid,
+                    matrix_conversation_uuid,
+                    "private",
+                    user_id,
+                )
+                .await;
 
                 let targets = store
                     .qq_person_domain_targets(user_id)
@@ -2495,22 +3146,24 @@ mod tests {
                     .await
                     .expect("domain deletion should succeed");
                 assert_eq!(deleted.persons, 1);
-                assert_eq!(deleted.conversations, 3);
+                assert_eq!(deleted.conversations, 4);
                 assert_eq!(deleted.external_identities, 2);
-                assert_eq!(deleted.external_conversations, 3);
-                assert_eq!(deleted.message_mappings, 3);
-                assert_eq!(deleted.memories, 4);
-                assert_eq!(deleted.open_loops, 4);
+                assert_eq!(deleted.external_conversations, 4);
+                assert_eq!(deleted.message_mappings, 4);
+                assert_eq!(deleted.delivery_ledger, 1);
+                assert_eq!(deleted.memories, 5);
+                assert_eq!(deleted.open_loops, 5);
                 assert_eq!(deleted.affect_states, 1);
                 assert_eq!(deleted.relations, 1);
-                assert_eq!(deleted.goals, 4);
-                assert_eq!(deleted.total(), 26);
+                assert_eq!(deleted.goals, 5);
+                assert_eq!(deleted.total(), 33);
 
                 for (table, column, id) in [
                     ("yunxi_persons", "id", person_uuid),
                     ("yunxi_conversations", "id", first_conversation_uuid),
                     ("yunxi_conversations", "id", second_conversation_uuid),
                     ("yunxi_conversations", "id", alias_conversation_uuid),
+                    ("yunxi_conversations", "id", matrix_conversation_uuid),
                 ] {
                     let remaining = query_scalar::<Postgres, i64>(&format!(
                         "SELECT COUNT(*) FROM {table} WHERE {column} = $1"
@@ -2572,6 +3225,519 @@ mod tests {
 
     #[test]
     #[ignore = "requires PostgreSQL via DATABASE_URL"]
+    fn postgres_person_domain_deletion_purges_only_attributable_delivery_rows() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let database_url = std::env::var("DATABASE_URL").expect("需要 DATABASE_URL");
+                let pool = PgPoolOptions::new()
+                    .max_connections(8)
+                    .connect(&database_url)
+                    .await
+                    .expect("应连接 PostgreSQL");
+                let store = initialize_portable_schema(&pool).await;
+                initialize_delivery_ledger(&pool).await;
+
+                let suffix = (Uuid::new_v4().as_u128() % 900_000_000) as i64;
+                let user_id = 1_100_000_000_000_i64 + suffix;
+                let alias_user_id = 1_200_000_000_000_i64 + suffix;
+                let other_user_id = 1_300_000_000_000_i64 + suffix;
+                let bot_id = 2_100_000_000_000_i64 + suffix;
+                let group_id = 3_100_000_000_000_i64 + suffix;
+                let identity = qq::person(user_id).expect("valid person identity");
+                let alias = qq::person(alias_user_id).expect("valid alias identity");
+                let other_identity = qq::person(other_user_id).expect("valid other identity");
+                let direct = qq::direct(bot_id, user_id).expect("valid direct conversation");
+                let other_direct =
+                    qq::direct(bot_id, other_user_id).expect("valid other direct conversation");
+                let group = qq::group(group_id).expect("valid group conversation");
+                let person_id = store
+                    .resolve_identity(&identity)
+                    .await
+                    .expect("person identity should resolve");
+                query(
+                    "INSERT INTO yunxi_external_identities (platform, external_id, person_id)
+                     VALUES ('qq', $1, $2)",
+                )
+                .bind(alias.external_id())
+                .bind(person_id.into_uuid())
+                .execute(&pool)
+                .await
+                .expect("alias should link to person");
+                let other_person_id = store
+                    .resolve_identity(&other_identity)
+                    .await
+                    .expect("other identity should resolve");
+                let direct_id = store
+                    .resolve_direct_for_person(person_id, &direct)
+                    .await
+                    .expect("direct conversation should resolve");
+                let other_direct_id = store
+                    .resolve_direct_for_person(other_person_id, &other_direct)
+                    .await
+                    .expect("other direct conversation should resolve");
+                let group_conversation_id = store
+                    .resolve_conversation(&group)
+                    .await
+                    .expect("group conversation should resolve");
+                let prefix = format!("person-ledger:{}", Uuid::new_v4());
+                let person_key = format!("{prefix}:person");
+                let direct_key = format!("{prefix}:direct");
+                let qq_destination_key = format!("{prefix}:qq-destination");
+                let shared_group_key = format!("{prefix}:shared-group");
+                let other_person_key = format!("{prefix}:other-person");
+
+                insert_delivery_fixture(
+                    &pool,
+                    &person_key,
+                    "reach_out",
+                    "person",
+                    person_id.into_uuid(),
+                    direct_id.into_uuid(),
+                    "private",
+                    user_id,
+                )
+                .await;
+                insert_delivery_fixture(
+                    &pool,
+                    &direct_key,
+                    "send_message",
+                    "conversation",
+                    direct_id.into_uuid(),
+                    direct_id.into_uuid(),
+                    "private",
+                    user_id,
+                )
+                .await;
+                insert_delivery_fixture(
+                    &pool,
+                    &qq_destination_key,
+                    "send_message",
+                    "conversation",
+                    other_direct_id.into_uuid(),
+                    other_direct_id.into_uuid(),
+                    "private",
+                    alias_user_id,
+                )
+                .await;
+                insert_delivery_fixture(
+                    &pool,
+                    &shared_group_key,
+                    "send_message",
+                    "conversation",
+                    group_conversation_id.into_uuid(),
+                    group_conversation_id.into_uuid(),
+                    "group",
+                    user_id,
+                )
+                .await;
+                insert_delivery_fixture(
+                    &pool,
+                    &other_person_key,
+                    "reach_out",
+                    "person",
+                    other_person_id.into_uuid(),
+                    other_direct_id.into_uuid(),
+                    "private",
+                    other_user_id,
+                )
+                .await;
+
+                let deleted = store
+                    .delete_person_domain_data(&identity, &direct)
+                    .await
+                    .expect("person domain deletion should succeed");
+                assert_eq!(deleted.delivery_ledger, 3);
+                let remaining = query_scalar::<Postgres, String>(
+                    "SELECT delivery_key FROM yunxi_action_delivery_ledger
+                     WHERE delivery_key LIKE $1 ORDER BY delivery_key",
+                )
+                .bind(format!("{prefix}%"))
+                .fetch_all(&pool)
+                .await
+                .expect("should read remaining delivery fixtures");
+                let mut expected = vec![shared_group_key.clone(), other_person_key.clone()];
+                expected.sort_unstable();
+                assert_eq!(remaining, expected);
+                assert!(
+                    store
+                        .resolve_qq_direct_for_person_delivery(person_id, bot_id)
+                        .await
+                        .expect("deleted person route lookup should not fail")
+                        .is_none(),
+                    "ReachOut must not recreate a direct conversation after person deletion"
+                );
+
+                store
+                    .delete_person_domain_data(&other_identity, &other_direct)
+                    .await
+                    .expect("other person cleanup should succeed");
+                store
+                    .delete_qq_group_domain_data(group_id)
+                    .await
+                    .expect("group cleanup should succeed");
+            });
+    }
+
+    #[test]
+    #[ignore = "requires PostgreSQL via DATABASE_URL"]
+    fn postgres_group_domain_deletion_removes_canonical_and_delivery_rows() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let database_url = std::env::var("DATABASE_URL").expect("需要 DATABASE_URL");
+                let pool = PgPoolOptions::new()
+                    .max_connections(8)
+                    .connect(&database_url)
+                    .await
+                    .expect("应连接 PostgreSQL");
+                let store = initialize_portable_schema(&pool).await;
+                initialize_delivery_ledger(&pool).await;
+                let suffix = (Uuid::new_v4().as_u128() % 900_000_000) as i64;
+                let group_id = 3_200_000_000_000_i64 + suffix;
+                let other_group_id = 3_300_000_000_000_i64 + suffix;
+                let group = qq::group(group_id).expect("valid group");
+                let other_group = qq::group(other_group_id).expect("valid other group");
+                let conversation_id = store
+                    .resolve_conversation(&group)
+                    .await
+                    .expect("group should resolve");
+                let other_conversation_id = store
+                    .resolve_conversation(&other_group)
+                    .await
+                    .expect("other group should resolve");
+                let prefix = format!("group-ledger:{}", Uuid::new_v4());
+                let conversation_key = format!("{prefix}:conversation");
+                let destination_key = format!("{prefix}:destination");
+                let other_key = format!("{prefix}:other");
+                insert_delivery_fixture(
+                    &pool,
+                    &conversation_key,
+                    "send_message",
+                    "conversation",
+                    conversation_id.into_uuid(),
+                    conversation_id.into_uuid(),
+                    "group",
+                    group_id,
+                )
+                .await;
+                insert_delivery_fixture(
+                    &pool,
+                    &destination_key,
+                    "send_message",
+                    "conversation",
+                    other_conversation_id.into_uuid(),
+                    other_conversation_id.into_uuid(),
+                    "group",
+                    group_id,
+                )
+                .await;
+                insert_delivery_fixture(
+                    &pool,
+                    &other_key,
+                    "send_message",
+                    "conversation",
+                    other_conversation_id.into_uuid(),
+                    other_conversation_id.into_uuid(),
+                    "group",
+                    other_group_id,
+                )
+                .await;
+
+                let deleted = store
+                    .delete_qq_group_domain_data(group_id)
+                    .await
+                    .expect("group Core deletion should succeed");
+                assert!(
+                    deleted >= 4,
+                    "ledger, mapping, and conversation must be deleted"
+                );
+                assert_eq!(
+                    query_scalar::<Postgres, i64>(
+                        "SELECT COUNT(*) FROM yunxi_conversations WHERE id = $1",
+                    )
+                    .bind(conversation_id.into_uuid())
+                    .fetch_one(&pool)
+                    .await
+                    .expect("should count deleted conversation"),
+                    0
+                );
+                assert_eq!(
+                    query_scalar::<Postgres, String>(
+                        "SELECT delivery_key FROM yunxi_action_delivery_ledger
+                         WHERE delivery_key LIKE $1",
+                    )
+                    .bind(format!("{prefix}%"))
+                    .fetch_all(&pool)
+                    .await
+                    .expect("should read remaining group ledger rows"),
+                    vec![other_key]
+                );
+                store
+                    .delete_qq_group_domain_data(other_group_id)
+                    .await
+                    .expect("other group cleanup should succeed");
+            });
+    }
+
+    #[test]
+    #[ignore = "requires PostgreSQL via DATABASE_URL"]
+    fn postgres_missing_person_deletion_rejects_another_person_direct_member() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let database_url = std::env::var("DATABASE_URL").expect("需要 DATABASE_URL");
+                let pool = PgPoolOptions::new()
+                    .max_connections(4)
+                    .connect(&database_url)
+                    .await
+                    .expect("应连接 PostgreSQL");
+                let store = initialize_portable_schema(&pool).await;
+                initialize_delivery_ledger(&pool).await;
+                let suffix = (Uuid::new_v4().as_u128() % 1_000_000_000) as i64;
+                let missing_user_id = 6_100_000_000_000_i64 + suffix;
+                let other_user_id = 6_200_000_000_000_i64 + suffix;
+                let bot_id = 6_300_000_000_000_i64 + suffix;
+                let missing_identity = qq::person(missing_user_id).expect("valid missing identity");
+                let other_identity = qq::person(other_user_id).expect("valid other identity");
+                let direct =
+                    qq::direct(bot_id, missing_user_id).expect("valid conflicting direct route");
+                let other_person_id = store
+                    .resolve_identity(&other_identity)
+                    .await
+                    .expect("other identity should resolve");
+                let conversation_id = store
+                    .resolve_direct_for_person(other_person_id, &direct)
+                    .await
+                    .expect("other Person direct route should resolve");
+
+                assert!(matches!(
+                    store
+                        .delete_person_domain_data(&missing_identity, &direct)
+                        .await,
+                    Err(IdentityStoreError::Storage { .. })
+                ));
+                assert_eq!(
+                    query_scalar::<Postgres, i64>(
+                        "SELECT COUNT(*) FROM yunxi_persons WHERE id = $1",
+                    )
+                    .bind(other_person_id.into_uuid())
+                    .fetch_one(&pool)
+                    .await
+                    .expect("应核对其他 Person 保留"),
+                    1
+                );
+                assert_eq!(
+                    query_scalar::<Postgres, i64>(
+                        "SELECT COUNT(*) FROM yunxi_conversations WHERE id = $1",
+                    )
+                    .bind(conversation_id.into_uuid())
+                    .fetch_one(&pool)
+                    .await
+                    .expect("应核对其他 Person 的 direct conversation 保留"),
+                    1
+                );
+
+                store
+                    .delete_person_domain_data(&other_identity, &direct)
+                    .await
+                    .expect("应清理其他 Person fixture");
+            });
+    }
+
+    #[test]
+    #[ignore = "requires PostgreSQL via DATABASE_URL"]
+    fn postgres_person_import_waits_for_owner_lock() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let database_url = std::env::var("DATABASE_URL").expect("需要 DATABASE_URL");
+                let pool = PgPoolOptions::new()
+                    .max_connections(4)
+                    .connect(&database_url)
+                    .await
+                    .expect("应连接 PostgreSQL");
+                let store = initialize_portable_schema(&pool).await;
+                let person_id = PersonId::new();
+                let export = PortablePersonExport {
+                    version: 1,
+                    person_id,
+                    external_identities: Vec::new(),
+                    memories: Vec::new(),
+                    relation: None,
+                    affect: None,
+                    open_loops: Vec::new(),
+                    goals: Vec::new(),
+                };
+
+                let mut blocker = pool.begin().await.expect("应开始 owner lock 事务");
+                crate::yunxi::owner_lock::lock_owner(
+                    &mut blocker,
+                    crate::yunxi::owner_lock::DurableOwner::Person(person_id.into_uuid()),
+                )
+                .await
+                .expect("应锁定 Person owner");
+                let import_store = store.clone();
+                let import_task =
+                    kovi::tokio::spawn(async move { import_store.import_person(&export).await });
+                kovi::tokio::time::sleep(Duration::from_millis(50)).await;
+                assert!(
+                    !import_task.is_finished(),
+                    "portable import must wait for the Person owner lock"
+                );
+                assert_eq!(
+                    query_scalar::<Postgres, i64>(
+                        "SELECT COUNT(*) FROM yunxi_persons WHERE id = $1",
+                    )
+                    .bind(person_id.into_uuid())
+                    .fetch_one(&pool)
+                    .await
+                    .expect("应检查锁等待期间的 Person 可见性"),
+                    0
+                );
+
+                blocker.commit().await.expect("应释放 Person owner lock");
+                assert_eq!(
+                    import_task
+                        .await
+                        .expect("import task should join")
+                        .expect("import should complete after owner unlock"),
+                    person_id
+                );
+                query("DELETE FROM yunxi_persons WHERE id = $1")
+                    .bind(person_id.into_uuid())
+                    .execute(&pool)
+                    .await
+                    .expect("应清理 import owner-lock fixture");
+            });
+    }
+
+    #[test]
+    #[ignore = "requires PostgreSQL via DATABASE_URL"]
+    fn postgres_person_deletion_blocks_then_rejects_missing_direct_route_creation() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let database_url = std::env::var("DATABASE_URL").expect("需要 DATABASE_URL");
+                let pool = PgPoolOptions::new()
+                    .max_connections(8)
+                    .connect(&database_url)
+                    .await
+                    .expect("应连接 PostgreSQL");
+                let store = Arc::new(initialize_portable_schema(&pool).await);
+                initialize_delivery_ledger(&pool).await;
+                let suffix = (Uuid::new_v4().as_u128() % 1_000_000_000) as i64;
+                let user_id = 7_100_000_000_000_i64 + suffix;
+                let first_bot_id = 7_200_000_000_000_i64 + suffix;
+                let second_bot_id = 7_300_000_000_000_i64 + suffix;
+                let identity = qq::person(user_id).expect("valid race identity");
+                let existing_direct =
+                    qq::direct(first_bot_id, user_id).expect("valid existing direct route");
+                let missing_direct =
+                    qq::direct(second_bot_id, user_id).expect("valid missing direct route");
+                let person_id = store
+                    .resolve_identity(&identity)
+                    .await
+                    .expect("identity should resolve");
+                let existing_conversation_id = store
+                    .resolve_direct_for_person(person_id, &existing_direct)
+                    .await
+                    .expect("existing direct route should resolve");
+
+                let mut blocker = pool.begin().await.expect("应开始 Conversation lock 事务");
+                crate::yunxi::owner_lock::lock_owner(
+                    &mut blocker,
+                    crate::yunxi::owner_lock::DurableOwner::Conversation(
+                        existing_conversation_id.into_uuid(),
+                    ),
+                )
+                .await
+                .expect("应锁定 existing Conversation owner");
+
+                let delete_store = Arc::clone(&store);
+                let delete_identity = identity.clone();
+                let delete_direct = existing_direct.clone();
+                let delete_task = kovi::tokio::spawn(async move {
+                    delete_store
+                        .delete_person_domain_data(&delete_identity, &delete_direct)
+                        .await
+                });
+
+                let route_key = ExternalConversationRoute::from_external(&existing_direct)
+                    .advisory_lock_key();
+                let mut deletion_holds_route = false;
+                for _ in 0..100 {
+                    let mut probe = pool.begin().await.expect("应开始 route lock probe");
+                    let acquired = query_scalar::<Postgres, bool>(
+                        "SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0))",
+                    )
+                    .bind(&route_key)
+                    .fetch_one(&mut *probe)
+                    .await
+                    .expect("应探测删除事务的 route lock");
+                    probe.rollback().await.expect("应释放 route lock probe");
+                    if !acquired {
+                        deletion_holds_route = true;
+                        break;
+                    }
+                    kovi::tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                assert!(
+                    deletion_holds_route,
+                    "production deletion should hold the existing route before waiting on Conversation"
+                );
+
+                let resolve_store = Arc::clone(&store);
+                let resolve_task = kovi::tokio::spawn(async move {
+                    resolve_store
+                        .resolve_direct_for_person(person_id, &missing_direct)
+                        .await
+                });
+                kovi::tokio::time::sleep(Duration::from_millis(50)).await;
+                assert!(
+                    !resolve_task.is_finished(),
+                    "new direct route resolution must wait behind Person deletion"
+                );
+
+                blocker
+                    .commit()
+                    .await
+                    .expect("应释放 existing Conversation owner");
+                delete_task
+                    .await
+                    .expect("delete task should join")
+                    .expect("production Person deletion should succeed");
+                resolve_task
+                    .await
+                    .expect("resolve task should join")
+                    .expect_err("stale Person route resolution must fail after deletion");
+                assert_eq!(
+                    query_scalar::<Postgres, i64>(
+                        "SELECT COUNT(*) FROM yunxi_external_conversations
+                         WHERE platform = $1 AND external_id = $2",
+                    )
+                    .bind(existing_direct.platform().as_str())
+                    .bind(format!("direct:{second_bot_id}:{user_id}"))
+                    .fetch_one(&pool)
+                    .await
+                    .expect("应核对 missing route 未被创建"),
+                    0
+                );
+                assert_eq!(
+                    query_scalar::<Postgres, i64>(
+                        "SELECT COUNT(*) FROM yunxi_conversations WHERE id = $1",
+                    )
+                    .bind(existing_conversation_id.into_uuid())
+                    .fetch_one(&pool)
+                    .await
+                    .expect("应核对已有 direct conversation 已删除"),
+                    0
+                );
+            });
+    }
+
+    #[test]
+    #[ignore = "requires PostgreSQL via DATABASE_URL"]
     fn postgres_person_domain_deletion_serializes_concurrent_owner_writes() {
         kovi::tokio::runtime::Runtime::new()
             .expect("应创建测试运行时")
@@ -2587,6 +3753,7 @@ mod tests {
                     .initialize_schema()
                     .await
                     .expect("应初始化身份 schema");
+                initialize_delivery_ledger(&pool).await;
                 let open_loops = Arc::new(PostgresOpenLoopStore::new(pool.clone()));
                 open_loops
                     .initialize_schema()
@@ -2631,7 +3798,7 @@ mod tests {
                     .await
                     .expect("identity should resolve");
                 let conversation_id = identities
-                    .resolve_conversation(&direct)
+                    .resolve_direct_for_person(person_id, &direct)
                     .await
                     .expect("conversation should resolve");
 

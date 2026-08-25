@@ -21,7 +21,9 @@ use rmcp::{
 };
 use scraper::{Html, Selector};
 use serde_json::{Map, Value, json};
+use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use url::{Host, Url};
@@ -132,6 +134,17 @@ pub(crate) struct ToolExecutionResult {
     pub(crate) content: String,
     pub(crate) reminder_failure_kind: Option<reminders::ReminderToolFailureKind>,
 }
+
+pub(crate) type ToolEffectRevalidationFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<ToolExecutionContext, String>> + Send + 'a>>;
+
+pub(crate) trait ToolEffectRevalidator: Send + Sync {
+    fn revalidate(&self) -> ToolEffectRevalidationFuture<'_>;
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("tool effect authorization rejected: {0}")]
+struct ToolEffectAuthorizationRejected(String);
 
 struct ToolDefinition {
     name: String,
@@ -742,6 +755,26 @@ pub(crate) fn tool_registry() -> Option<Arc<ToolRegistry>> {
 }
 
 impl ToolRegistry {
+    pub(crate) fn available_for_context(
+        &self,
+        name: &str,
+        tool_context: &ToolExecutionContext,
+    ) -> bool {
+        self.definitions
+            .iter()
+            .find(|definition| definition.name == name)
+            .is_some_and(|definition| {
+                (!definition.source.admin_only() || tool_context.is_admin)
+                    && (!definition.source.main_admin_only() || tool_context.is_main_admin)
+                    && definition
+                        .source
+                        .available_for_context(tool_context.destination, tool_context.group_paused)
+                    && (!tool_context.scheduled || definition.source.available_for_scheduled())
+                    && (!definition.source.needs_sticker_teaching_context()
+                        || tool_context.sticker_teaching.is_some())
+            })
+    }
+
     pub(crate) fn instruction_for(&self, tool_context: &ToolExecutionContext) -> String {
         let mut instruction = if tool_context.scheduled {
             String::from(
@@ -829,6 +862,36 @@ impl ToolRegistry {
         tool_context: ToolExecutionContext,
         reply_ticket: crate::model::interrupt::ReplyTicket,
     ) -> ToolExecutionResult {
+        self.execute_inner(name, arguments, tool_context, reply_ticket, None)
+            .await
+    }
+
+    pub(crate) async fn execute_with_revalidation(
+        &self,
+        name: &str,
+        arguments: Map<String, Value>,
+        tool_context: ToolExecutionContext,
+        reply_ticket: crate::model::interrupt::ReplyTicket,
+        revalidator: Arc<dyn ToolEffectRevalidator>,
+    ) -> ToolExecutionResult {
+        self.execute_inner(
+            name,
+            arguments,
+            tool_context,
+            reply_ticket,
+            Some(revalidator.as_ref()),
+        )
+        .await
+    }
+
+    async fn execute_inner(
+        &self,
+        name: &str,
+        arguments: Map<String, Value>,
+        tool_context: ToolExecutionContext,
+        reply_ticket: crate::model::interrupt::ReplyTicket,
+        revalidator: Option<&dyn ToolEffectRevalidator>,
+    ) -> ToolExecutionResult {
         let Some(definition) = self
             .definitions
             .iter()
@@ -909,6 +972,7 @@ impl ToolRegistry {
                         tool_context,
                         reply_ticket,
                         self.max_result_chars,
+                        revalidator,
                     )
                     .await
                 }
@@ -917,7 +981,18 @@ impl ToolRegistry {
                     remote_name,
                     client,
                     ..
-                } => execute_mcp(server, remote_name, client, arguments, reply_ticket).await,
+                } => {
+                    execute_mcp(
+                        server,
+                        remote_name,
+                        client,
+                        arguments,
+                        reply_ticket,
+                        Some(&tool_context),
+                        revalidator,
+                    )
+                    .await
+                }
             }
         };
         let (result, projection) = match kovi::tokio::time::timeout(self.timeout, execution).await {
@@ -1001,7 +1076,15 @@ impl ToolRegistry {
         if arguments_text.chars().count() > MAX_TOOL_ARGUMENT_CHARS {
             return Err(anyhow!("MCP 视觉工具参数过长"));
         }
-        let execution = execute_mcp(server, remote_name, client, arguments, reply_ticket);
+        let execution = execute_mcp(
+            server,
+            remote_name,
+            client,
+            arguments,
+            reply_ticket,
+            None,
+            None,
+        );
         let result = kovi::tokio::time::timeout(timeout, execution)
             .await
             .map_err(|_| anyhow!("MCP 视觉工具调用超时（工具：{name}）"))??;
@@ -1220,14 +1303,21 @@ async fn execute_builtin(
     tool_context: ToolExecutionContext,
     reply_ticket: crate::model::interrupt::ReplyTicket,
     max_result_chars: usize,
+    revalidator: Option<&dyn ToolEffectRevalidator>,
 ) -> Result<String> {
     match tool {
         BuiltinTool::TimeNow => current_time(&arguments),
         BuiltinTool::MemorySearch => {
             search_memory(&arguments, tool_context.subject_id, tool_context.context).await
         }
-        BuiltinTool::StickerMemoryTeach => teach_sticker_memory(&arguments, &tool_context).await,
+        BuiltinTool::StickerMemoryTeach => {
+            let tool_context =
+                revalidate_tool_effect(&tool_context, reply_ticket, revalidator).await?;
+            teach_sticker_memory(&arguments, &tool_context).await
+        }
         BuiltinTool::ReminderCreate => {
+            let tool_context =
+                revalidate_tool_effect(&tool_context, reply_ticket, revalidator).await?;
             reminders::create_from_tool(
                 &arguments,
                 tool_context.destination,
@@ -1244,6 +1334,8 @@ async fn execute_builtin(
             .await
         }
         BuiltinTool::ReminderCancel => {
+            let tool_context =
+                revalidate_tool_effect(&tool_context, reply_ticket, revalidator).await?;
             reminders::cancel_from_tool(
                 &arguments,
                 tool_context.destination,
@@ -1255,6 +1347,8 @@ async fn execute_builtin(
             let source_message_id = tool_context
                 .source_message_id
                 .ok_or_else(|| anyhow!("Agent Run 创建缺少来源消息编号"))?;
+            let tool_context =
+                revalidate_tool_effect(&tool_context, reply_ticket, revalidator).await?;
             crate::agent_runs::create_from_tool(
                 &arguments,
                 tool_context.actor_user_id,
@@ -1266,7 +1360,8 @@ async fn execute_builtin(
             crate::agent_runs::status_from_tool(&arguments, tool_context.actor_user_id).await
         }
         BuiltinTool::AgentRunCancel => {
-            ensure_current_tool_turn(reply_ticket).await?;
+            let tool_context =
+                revalidate_tool_effect(&tool_context, reply_ticket, revalidator).await?;
             crate::agent_runs::cancel_from_tool(&arguments, tool_context.actor_user_id).await
         }
         BuiltinTool::WebSearch => search_web(&arguments, max_result_chars).await,
@@ -1294,6 +1389,8 @@ async fn execute_builtin(
             let MessageDestination::Group(group_id) = tool_context.destination else {
                 return Err(anyhow!("群聊暂停工具只能在群聊中使用"));
             };
+            let _tool_context =
+                revalidate_tool_effect(&tool_context, reply_ticket, revalidator).await?;
             crate::model::utils::set_group_paused(group_id, true).await;
             Ok("已暂停当前群的自动回复。".to_string())
         }
@@ -1302,6 +1399,8 @@ async fn execute_builtin(
             let MessageDestination::Group(group_id) = tool_context.destination else {
                 return Err(anyhow!("群聊恢复工具只能在群聊中使用"));
             };
+            let _tool_context =
+                revalidate_tool_effect(&tool_context, reply_ticket, revalidator).await?;
             crate::model::utils::set_group_paused(group_id, false).await;
             Ok("已恢复当前群的自动回复。".to_string())
         }
@@ -1354,6 +1453,8 @@ async fn execute_builtin(
                 .runtime_bot
                 .as_deref()
                 .ok_or_else(|| anyhow!("跨群动作没有可用的机器人运行时"))?;
+            let tool_context =
+                revalidate_tool_effect(&tool_context, reply_ticket, revalidator).await?;
             crate::agent_runtime::execute_action(
                 bot,
                 crate::agent_runtime::AgentActionContext {
@@ -1377,8 +1478,9 @@ async fn execute_builtin(
         }
         BuiltinTool::GroupQuestionCancel => {
             reject_unknown_arguments(&arguments, &["task_id"])?;
-            ensure_current_tool_turn(reply_ticket).await?;
             let task_id = optional_positive_i64(&arguments, "task_id")?;
+            let tool_context =
+                revalidate_tool_effect(&tool_context, reply_ticket, revalidator).await?;
             crate::agent_tasks::cancel_task(tool_context.actor_user_id, task_id).await
         }
         BuiltinTool::HealthCheck => health_check().await,
@@ -2834,11 +2936,15 @@ async fn execute_mcp(
     client: &Arc<Mutex<McpClient>>,
     arguments: Map<String, Value>,
     reply_ticket: crate::model::interrupt::ReplyTicket,
+    tool_context: Option<&ToolExecutionContext>,
+    revalidator: Option<&dyn ToolEffectRevalidator>,
 ) -> Result<String> {
-    if !crate::model::interrupt::is_current(reply_ticket).await {
-        return Err(anyhow!("回复已被新消息打断"));
-    }
     let client = client.lock().await;
+    if let Some(tool_context) = tool_context {
+        let _tool_context = revalidate_tool_effect(tool_context, reply_ticket, revalidator).await?;
+    } else {
+        ensure_current_tool_turn(reply_ticket).await?;
+    }
     let result = client
         .call_tool(CallToolRequestParams::new(remote_name.to_string()).with_arguments(arguments))
         .await
@@ -2918,6 +3024,21 @@ async fn ensure_current_tool_turn(
         "这条指令已经被更新的私聊消息打断"
     );
     Ok(())
+}
+
+async fn revalidate_tool_effect(
+    tool_context: &ToolExecutionContext,
+    reply_ticket: crate::model::interrupt::ReplyTicket,
+    revalidator: Option<&dyn ToolEffectRevalidator>,
+) -> Result<ToolExecutionContext> {
+    let Some(revalidator) = revalidator else {
+        ensure_current_tool_turn(reply_ticket).await?;
+        return Ok(tool_context.clone());
+    };
+    revalidator
+        .revalidate()
+        .await
+        .map_err(|reason| anyhow!(ToolEffectAuthorizationRejected(reason)))
 }
 
 fn reject_unknown_arguments(arguments: &Map<String, Value>, allowed: &[&str]) -> Result<()> {

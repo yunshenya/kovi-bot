@@ -75,7 +75,9 @@ impl RuntimeHandle {
                 .map_err(|error| match error.0 {
                     RuntimeCommand::Event(event) => SubmitError::RuntimeClosed(event),
                     RuntimeCommand::BeginDataErasure { .. }
-                    | RuntimeCommand::EndDataErasure { .. } => {
+                    | RuntimeCommand::EndDataErasure { .. }
+                    | RuntimeCommand::BeginConversationDataErasure { .. }
+                    | RuntimeCommand::EndConversationDataErasure { .. } => {
                         unreachable!("submit only sends event commands")
                     }
                 })
@@ -87,7 +89,10 @@ impl RuntimeHandle {
                     Err(SubmitError::RuntimeClosed(event))
                 }
                 Err(mpsc::error::TrySendError::Closed(
-                    RuntimeCommand::BeginDataErasure { .. } | RuntimeCommand::EndDataErasure { .. },
+                    RuntimeCommand::BeginDataErasure { .. }
+                    | RuntimeCommand::EndDataErasure { .. }
+                    | RuntimeCommand::BeginConversationDataErasure { .. }
+                    | RuntimeCommand::EndConversationDataErasure { .. },
                 )) => unreachable!("submit only sends event commands"),
             }
         }
@@ -140,6 +145,86 @@ impl RuntimeHandle {
             .await
             .map_err(|_| DataErasureError::AcknowledgementDropped)
     }
+
+    /// Establishes a FIFO erasure barrier for one canonical conversation.
+    ///
+    /// The acknowledgement means all earlier turns have drained and the
+    /// retained conversation snapshot has been purged. Later events for the
+    /// same conversation are discarded until
+    /// [`Self::end_conversation_data_erasure`] is acknowledged.
+    pub async fn begin_conversation_data_erasure(
+        &self,
+        conversation_id: ConversationId,
+    ) -> Result<bool, DataErasureError> {
+        self.begin_conversation_data_erasures([conversation_id])
+            .await
+            .map(|removed| removed != 0)
+    }
+
+    /// Atomically establishes FIFO erasure barriers for a bounded set of
+    /// canonical conversations.
+    pub async fn begin_conversation_data_erasures<I>(
+        &self,
+        conversation_ids: I,
+    ) -> Result<usize, DataErasureError>
+    where
+        I: IntoIterator<Item = ConversationId>,
+    {
+        let conversation_ids = bounded_conversation_ids(conversation_ids)?;
+        if conversation_ids.is_empty() {
+            return Ok(0);
+        }
+        let (acknowledge, acknowledged) = oneshot::channel();
+        self.sender
+            .send(RuntimeCommand::BeginConversationDataErasure {
+                conversation_ids,
+                acknowledge,
+            })
+            .await
+            .map_err(|_| DataErasureError::RuntimeClosed)?;
+        acknowledged
+            .await
+            .map_err(|_| DataErasureError::AcknowledgementDropped)?
+    }
+
+    /// Releases a conversation barrier through the same FIFO. Its
+    /// acknowledgement confirms that events submitted during the blocked
+    /// window have already been discarded.
+    pub async fn end_conversation_data_erasure(
+        &self,
+        conversation_id: ConversationId,
+    ) -> Result<bool, DataErasureError> {
+        self.end_conversation_data_erasures([conversation_id])
+            .await
+            .map(|resumed| resumed == 1)
+    }
+
+    /// Releases a bounded set of conversation barriers through one FIFO
+    /// command. The returned count lets a host fail closed if any expected
+    /// barrier was missing.
+    pub async fn end_conversation_data_erasures<I>(
+        &self,
+        conversation_ids: I,
+    ) -> Result<usize, DataErasureError>
+    where
+        I: IntoIterator<Item = ConversationId>,
+    {
+        let conversation_ids = bounded_conversation_ids(conversation_ids)?;
+        if conversation_ids.is_empty() {
+            return Ok(0);
+        }
+        let (acknowledge, acknowledged) = oneshot::channel();
+        self.sender
+            .send(RuntimeCommand::EndConversationDataErasure {
+                conversation_ids,
+                acknowledge,
+            })
+            .await
+            .map_err(|_| DataErasureError::RuntimeClosed)?;
+        acknowledged
+            .await
+            .map_err(|_| DataErasureError::AcknowledgementDropped)
+    }
 }
 
 fn bounded_conversation_ids<I>(conversation_ids: I) -> Result<Vec<ConversationId>, DataErasureError>
@@ -173,6 +258,14 @@ enum RuntimeCommand {
         person_id: PersonId,
         acknowledge: oneshot::Sender<bool>,
     },
+    BeginConversationDataErasure {
+        conversation_ids: Vec<ConversationId>,
+        acknowledge: oneshot::Sender<Result<usize, DataErasureError>>,
+    },
+    EndConversationDataErasure {
+        conversation_ids: Vec<ConversationId>,
+        acknowledge: oneshot::Sender<usize>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -181,7 +274,7 @@ pub enum DataErasureError {
     TooManyConversations { maximum: usize },
     #[error("data erasure is already active for person {person_id}")]
     AlreadyActive { person_id: PersonId },
-    #[error("direct conversation {conversation_id} is already blocked by another erasure")]
+    #[error("conversation {conversation_id} is already blocked by another erasure")]
     ConversationAlreadyBlocked { conversation_id: ConversationId },
     #[error("data-erasure blocked-person capacity is full (maximum {maximum})")]
     BlockedPeopleCapacity { maximum: usize },
@@ -273,6 +366,7 @@ pub struct CognitiveRuntime {
 #[derive(Debug, Default)]
 struct DataErasureState {
     conversations_by_person: HashMap<PersonId, Vec<ConversationId>>,
+    standalone_conversations: HashSet<ConversationId>,
     blocked_conversations: HashSet<ConversationId>,
 }
 
@@ -323,6 +417,45 @@ impl DataErasureState {
             self.blocked_conversations.remove(&conversation_id);
         }
         true
+    }
+
+    fn begin_conversations(
+        &mut self,
+        state: &mut WorkingState,
+        conversation_ids: Vec<ConversationId>,
+    ) -> Result<usize, DataErasureError> {
+        if let Some(conversation_id) = conversation_ids
+            .iter()
+            .find(|conversation_id| self.blocked_conversations.contains(conversation_id))
+        {
+            return Err(DataErasureError::ConversationAlreadyBlocked {
+                conversation_id: *conversation_id,
+            });
+        }
+        if self.blocked_conversations.len() + conversation_ids.len()
+            > MAX_BLOCKED_DATA_ERASURE_CONVERSATIONS
+        {
+            return Err(DataErasureError::BlockedConversationsCapacity {
+                maximum: MAX_BLOCKED_DATA_ERASURE_CONVERSATIONS,
+            });
+        }
+
+        let removed = state.purge_conversation_domains(&conversation_ids)?;
+        self.blocked_conversations
+            .extend(conversation_ids.iter().copied());
+        self.standalone_conversations.extend(conversation_ids);
+        Ok(removed)
+    }
+
+    fn end_conversations(&mut self, conversation_ids: Vec<ConversationId>) -> usize {
+        let mut resumed = 0;
+        for conversation_id in conversation_ids {
+            if self.standalone_conversations.remove(&conversation_id) {
+                self.blocked_conversations.remove(&conversation_id);
+                resumed += 1;
+            }
+        }
+        resumed
     }
 
     fn blocks(&self, event: &WorldEvent) -> bool {
@@ -444,6 +577,21 @@ impl CognitiveRuntime {
                     acknowledge,
                 } => {
                     let _ = acknowledge.send(self.data_erasure.end(person_id));
+                }
+                RuntimeCommand::BeginConversationDataErasure {
+                    conversation_ids,
+                    acknowledge,
+                } => {
+                    let result = self
+                        .data_erasure
+                        .begin_conversations(&mut self.state, conversation_ids);
+                    let _ = acknowledge.send(result);
+                }
+                RuntimeCommand::EndConversationDataErasure {
+                    conversation_ids,
+                    acknowledge,
+                } => {
+                    let _ = acknowledge.send(self.data_erasure.end_conversations(conversation_ids));
                 }
             }
         }
@@ -568,6 +716,7 @@ impl CognitiveRuntime {
             .apply_state_updates(&input, &plan, deferred_due_resolution)
             .await?;
         let mut all_due_deliveries_succeeded = true;
+        let mut due_terminal_non_success = false;
         let mut actions = Vec::with_capacity(plan.intents.len());
         let mut feedback = Vec::new();
         for (intent_index, intent) in plan.intents.iter().enumerate() {
@@ -579,41 +728,66 @@ impl CognitiveRuntime {
             {
                 proposed = proposed.with_actor(actor);
             }
-            if let Some(open_loop_id) = due_open_loop {
-                apply_due_action_idempotency(&mut proposed, open_loop_id, intent_index).map_err(
-                    |error| {
-                        PlannerError::InvalidOutput(PlannerOutputValidationError::InvalidIntent(
-                            crate::IntentValidationError::Action(error),
-                        ))
-                    },
-                )?;
-            }
+            apply_planned_action_idempotency(&mut proposed, &planner_event, intent_index).map_err(
+                |error| {
+                    PlannerError::InvalidOutput(PlannerOutputValidationError::InvalidIntent(
+                        crate::IntentValidationError::Action(error),
+                    ))
+                },
+            )?;
             let result = arbiter.dispatch(proposed.clone(), port).await;
-            let replay_of_delivered_action = matches!(
-                &result,
+            let replay_terminal = match &result {
                 ActionResult::Rejected(crate::ActionRejection::Duplicate {
                     idempotency_key,
                     original_action_id,
                     ..
-                }) if arbiter.was_delivered(idempotency_key, *original_action_id)
-            );
-            if deferred_due_resolution.is_some()
-                && !matches!(&proposed, crate::ProposedAction::Noop)
-                && !(matches!(
+                }) => arbiter.terminal_outcome(idempotency_key, *original_action_id),
+                _ => None,
+            };
+            let delivery_succeeded = matches!(
+                &result,
+                ActionResult::Executed {
+                    outcome: crate::ActionPortOutcome::Delivered { .. },
+                    ..
+                } | ActionResult::Executed {
+                    outcome: crate::ActionPortOutcome::ToolCompleted { .. },
+                    ..
+                }
+            ) || replay_terminal
+                == Some(crate::arbiter::AdmittedTerminal::Succeeded);
+            let delivery_indeterminate = matches!(
+                &result,
+                ActionResult::Executed {
+                    outcome: crate::ActionPortOutcome::DeliveryIndeterminate { .. },
+                    ..
+                }
+            ) || replay_terminal
+                == Some(crate::arbiter::AdmittedTerminal::Indeterminate);
+            let terminal_non_success = delivery_indeterminate
+                || matches!(
                     &result,
                     ActionResult::Executed {
-                        outcome: crate::ActionPortOutcome::Delivered { .. },
+                        outcome: crate::ActionPortOutcome::ToolFailed { .. },
+                        ..
+                    } | ActionResult::Rejected(
+                        crate::ActionRejection::TargetUnavailable { .. }
+                            | crate::ActionRejection::DeliveryResolutionFailed { .. },
+                    ) | ActionResult::Failed {
+                        error: crate::ActionPortError {
+                            retryable: false,
+                            ..
+                        },
                         ..
                     }
-                ) || matches!(
-                    &result,
-                    ActionResult::Executed {
-                        outcome: crate::ActionPortOutcome::ToolCompleted { .. },
-                        ..
-                    }
-                ) || replay_of_delivered_action)
-            {
-                all_due_deliveries_succeeded = false;
+                )
+                || replay_terminal == Some(crate::arbiter::AdmittedTerminal::Failed);
+            if due_open_loop.is_some() && !matches!(&proposed, crate::ProposedAction::Noop) {
+                if terminal_non_success {
+                    due_terminal_non_success = true;
+                    all_due_deliveries_succeeded = false;
+                } else if !delivery_succeeded {
+                    all_due_deliveries_succeeded = false;
+                }
             }
             if let Some(feedback_event) =
                 action_result_event(&planner_event, &proposed, &result, self.max_trace_depth)
@@ -641,7 +815,10 @@ impl CognitiveRuntime {
             }
             actions.push(result);
         }
-        if deferred_due_resolution.is_some() && all_due_deliveries_succeeded {
+        if due_open_loop.is_some() && due_terminal_non_success {
+            self.defer_due_open_loop_without_schedule(&input, applied_state_updates)
+                .await?;
+        } else if deferred_due_resolution.is_some() && all_due_deliveries_succeeded {
             self.resolve_due_open_loop(&input, applied_state_updates)
                 .await?;
         }
@@ -1018,6 +1195,43 @@ impl CognitiveRuntime {
         Ok(())
     }
 
+    async fn defer_due_open_loop_without_schedule(
+        &mut self,
+        input: &PlannerInput,
+        applied_before_failure: usize,
+    ) -> Result<(), PlannerError> {
+        let event = &input.event;
+        let open_loop_id = due_open_loop_id(event).ok_or_else(|| {
+            state_update_error(
+                "defer_open_loop",
+                "the event is not an open-loop due event",
+                applied_before_failure,
+            )
+        })?;
+        if !planner_input_contains_open_loop(input, open_loop_id) {
+            return Err(state_update_error(
+                "defer_open_loop",
+                format!("open loop {open_loop_id} was not hydrated for the event owner"),
+                applied_before_failure,
+            ));
+        }
+        let services = self.services.as_ref().ok_or_else(|| {
+            state_update_error(
+                "defer_open_loop",
+                "Core services are unavailable",
+                applied_before_failure,
+            )
+        })?;
+        services
+            .open_loops
+            .defer(open_loop_id, None, Utc::now())
+            .await
+            .map_err(|error| {
+                state_update_error("defer_open_loop", error.to_string(), applied_before_failure)
+            })?;
+        Ok(())
+    }
+
     #[must_use]
     pub const fn state(&self) -> &WorkingState {
         &self.state
@@ -1048,10 +1262,19 @@ fn due_open_loop_id(event: &WorldEvent) -> Option<crate::OpenLoopId> {
     }
 }
 
-fn apply_due_action_idempotency(
+/// Derive the exact action key used by both capability-aware planners and the
+/// runtime's final `ProposedAction`.
+#[must_use]
+pub fn planned_action_idempotency_key(event: &WorldEvent, intent_index: usize) -> String {
+    due_open_loop_id(event).map_or_else(
+        || crate::event_action_idempotency_key(event.id(), intent_index),
+        |open_loop_id| format!("open-loop:{open_loop_id}:delivery:{intent_index}"),
+    )
+}
+
+fn apply_action_idempotency_key(
     action: &mut crate::ProposedAction,
-    open_loop_id: crate::OpenLoopId,
-    intent_index: usize,
+    idempotency_key: String,
 ) -> Result<(), crate::ActionValidationError> {
     let metadata = match action {
         crate::ProposedAction::SendMessage(action) => &mut action.metadata,
@@ -1063,8 +1286,40 @@ fn apply_due_action_idempotency(
         crate::ProposedAction::CancelGoal(action) => &mut action.metadata,
         crate::ProposedAction::Noop => return Ok(()),
     };
-    metadata.idempotency_key = format!("open-loop:{open_loop_id}:delivery:{intent_index}");
+    metadata.idempotency_key = idempotency_key;
     metadata.validate()
+}
+
+fn apply_planned_action_idempotency(
+    action: &mut crate::ProposedAction,
+    event: &WorldEvent,
+    intent_index: usize,
+) -> Result<(), crate::ActionValidationError> {
+    apply_action_idempotency_key(action, planned_action_idempotency_key(event, intent_index))
+}
+
+#[cfg(test)]
+fn apply_due_action_idempotency(
+    action: &mut crate::ProposedAction,
+    open_loop_id: crate::OpenLoopId,
+    intent_index: usize,
+) -> Result<(), crate::ActionValidationError> {
+    apply_action_idempotency_key(
+        action,
+        format!("open-loop:{open_loop_id}:delivery:{intent_index}"),
+    )
+}
+
+#[cfg(test)]
+fn apply_event_action_idempotency(
+    action: &mut crate::ProposedAction,
+    event_id: crate::EventId,
+    intent_index: usize,
+) -> Result<(), crate::ActionValidationError> {
+    apply_action_idempotency_key(
+        action,
+        crate::event_action_idempotency_key(event_id, intent_index),
+    )
 }
 
 fn validate_due_open_loop_context(input: &PlannerInput) -> Result<(), PlannerError> {
@@ -1324,6 +1579,13 @@ fn action_result_event(
             crate::WorldEventKind::ActionSucceeded(crate::ActionSucceededEvent { idempotency_key })
         }
         ActionResult::Executed {
+            outcome: crate::ActionPortOutcome::DeliveryIndeterminate { reason, .. },
+            ..
+        } => crate::WorldEventKind::ActionFailed(crate::ActionFailedEvent {
+            idempotency_key,
+            error_category: format!("delivery_indeterminate:{reason}"),
+        }),
+        ActionResult::Executed {
             outcome: crate::ActionPortOutcome::Deferred { reason },
             ..
         } => crate::WorldEventKind::ActionFailed(crate::ActionFailedEvent {
@@ -1418,8 +1680,9 @@ mod tests {
     use super::{
         Admission, CognitiveRuntime, DataErasureError, MAX_DATA_ERASURE_CONVERSATIONS,
         MAX_GOALS_PER_CONTEXT_OWNER, PlannedProcessingOutcome, ProcessingOutcome, RuntimeConfig,
-        RuntimeConfigError, SubmitError, apply_due_action_idempotency, bounded_conversation_ids,
-        message_sent_event, validate_intent_targets,
+        RuntimeConfigError, SubmitError, apply_due_action_idempotency,
+        apply_event_action_idempotency, bounded_conversation_ids, message_sent_event,
+        validate_intent_targets,
     };
     use crate::arbiter::{
         ActionArbiter, ActionArbiterConfig, ActionPort, ActionPortFuture, ActionPortOutcome,
@@ -1432,7 +1695,7 @@ mod tests {
     };
     use crate::goal::{Goal, GoalDraft, GoalKind, GoalOwner};
     use crate::identity::{
-        ConversationId, ConversationKind, GoalId, MessageId, OpenLoopId, PersonId,
+        ConversationId, ConversationKind, EventId, GoalId, MessageId, OpenLoopId, PersonId,
     };
     use crate::memory::{Memory, MemoryDraft, MemoryKind, MemoryQuery, MemoryScope};
     use crate::open_loop::{OpenLoop, OpenLoopDraft, OpenLoopKind, OpenLoopOwner, OpenLoopStatus};
@@ -1633,6 +1896,30 @@ mod tests {
         }
     }
 
+    struct DueReachOutModel {
+        person_id: PersonId,
+        open_loop_id: OpenLoopId,
+    }
+
+    impl ModelBackend for DueReachOutModel {
+        fn plan<'a>(&'a self, _input: &'a PlannerInput) -> ModelBackendFuture<'a> {
+            let person_id = self.person_id;
+            let open_loop_id = self.open_loop_id;
+            Box::pin(async move {
+                let reach_out = crate::ReachOutIntent::from_parts(
+                    person_id,
+                    MessageContent::text("checking in"),
+                    crate::ProactiveMotive::FollowUp,
+                )
+                .map(crate::CognitiveIntent::reach_out)
+                .expect("valid due reach-out");
+                Ok(DecisionPlan::new(DecisionDisposition::Reply)
+                    .with_intent(reach_out)
+                    .with_state_update(StateUpdateProposal::ResolveOpenLoop { open_loop_id }))
+            })
+        }
+    }
+
     struct DueMultiActionModel {
         conversation_id: ConversationId,
         open_loop_id: OpenLoopId,
@@ -1659,6 +1946,27 @@ mod tests {
 
     struct DueActionWithoutResolutionModel {
         conversation_id: ConversationId,
+    }
+
+    struct DueToolActionModel {
+        conversation_id: ConversationId,
+        open_loop_id: OpenLoopId,
+    }
+
+    impl ModelBackend for DueToolActionModel {
+        fn plan<'a>(&'a self, _input: &'a PlannerInput) -> ModelBackendFuture<'a> {
+            let conversation_id = self.conversation_id;
+            let open_loop_id = self.open_loop_id;
+            Box::pin(async move {
+                Ok(DecisionPlan::new(DecisionDisposition::SpecialAction)
+                    .with_intent(crate::CognitiveIntent::use_tool(
+                        "calculator",
+                        r#"{"expression":"1+1"}"#,
+                        crate::ActionScope::Conversation(conversation_id),
+                    ))
+                    .with_state_update(StateUpdateProposal::ResolveOpenLoop { open_loop_id }))
+            })
+        }
     }
 
     impl ModelBackend for DueActionWithoutResolutionModel {
@@ -1741,6 +2049,82 @@ mod tests {
         }
     }
 
+    struct TerminalFailingActionPort {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ActionPort for TerminalFailingActionPort {
+        fn execute<'a>(&'a self, _action: &'a crate::ProposedAction) -> ActionPortFuture<'a> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Err(crate::ActionPortError::new("delivery_rejected", false)) })
+        }
+    }
+
+    struct ToolFailedActionPort {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ActionPort for ToolFailedActionPort {
+        fn execute<'a>(&'a self, _action: &'a crate::ProposedAction) -> ActionPortFuture<'a> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {
+                Ok(ActionPortOutcome::ToolFailed {
+                    operation: "calculator".to_owned(),
+                    error_category: "invalid_expression".to_owned(),
+                    detail: "expression rejected".to_owned(),
+                })
+            })
+        }
+    }
+
+    struct IndeterminateActionPort {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ActionPort for IndeterminateActionPort {
+        fn execute<'a>(&'a self, action: &'a crate::ProposedAction) -> ActionPortFuture<'a> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let conversation_id = match action.scope() {
+                crate::ActionScope::Conversation(conversation_id) => Some(conversation_id),
+                crate::ActionScope::Person(_) | crate::ActionScope::Global => None,
+            };
+            Box::pin(async move {
+                Ok(ActionPortOutcome::DeliveryIndeterminate {
+                    reason: "durable replay barrier".to_owned(),
+                    conversation_id,
+                })
+            })
+        }
+    }
+
+    struct DeliverThenIndeterminatePort {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ActionPort for DeliverThenIndeterminatePort {
+        fn execute<'a>(&'a self, action: &'a crate::ProposedAction) -> ActionPortFuture<'a> {
+            let attempt = self.calls.fetch_add(1, Ordering::SeqCst);
+            let conversation_id = match action.scope() {
+                crate::ActionScope::Conversation(conversation_id) => Some(conversation_id),
+                crate::ActionScope::Person(_) | crate::ActionScope::Global => None,
+            };
+            Box::pin(async move {
+                if attempt == 0 {
+                    Ok(ActionPortOutcome::Delivered {
+                        external_reference: Some("fake".to_owned()),
+                        message_id: None,
+                        conversation_id,
+                    })
+                } else {
+                    Ok(ActionPortOutcome::DeliveryIndeterminate {
+                        reason: "second delivery outcome unknown".to_owned(),
+                        conversation_id,
+                    })
+                }
+            })
+        }
+    }
+
     struct CountingDeliveredActionPort {
         calls: Arc<AtomicUsize>,
     }
@@ -1754,6 +2138,25 @@ mod tests {
                     message_id: None,
                     conversation_id: None,
                 })
+            })
+        }
+    }
+
+    struct RejectingDeliveryResolver {
+        resolution_failed: bool,
+    }
+
+    impl crate::DeliveryResolver for RejectingDeliveryResolver {
+        fn resolve<'a>(&'a self, person_id: PersonId) -> crate::DeliveryResolverFuture<'a> {
+            let resolution_failed = self.resolution_failed;
+            Box::pin(async move {
+                if resolution_failed {
+                    Err(crate::DeliveryResolutionError::failed(
+                        std::io::Error::other("route store unavailable"),
+                    ))
+                } else {
+                    Err(crate::DeliveryResolutionError::Unavailable { person_id })
+                }
             })
         }
     }
@@ -2525,6 +2928,452 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn indeterminate_due_delivery_is_unscheduled_without_claiming_success() {
+        let conversation_id = ConversationId::new();
+        let open_loop_id = OpenLoopId::new();
+        let open_loops = Arc::new(TestOpenLoopStore::with_visible(
+            open_loop_id,
+            OpenLoopOwner::Conversation(conversation_id),
+        ));
+        let (_handle, mut runtime) = CognitiveRuntime::new_with_services(
+            RuntimeConfig::default(),
+            CoreServices::with_model(DueActionModel {
+                conversation_id,
+                open_loop_id,
+            })
+            .with_open_loops(open_loops.clone()),
+        )
+        .expect("valid runtime");
+        let arbiter = ActionArbiter::new(
+            ActionArbiterConfig::default().with_capabilities(EnvironmentCapabilities::all()),
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let port = IndeterminateActionPort {
+            calls: calls.clone(),
+        };
+
+        let first = runtime
+            .process_event_with_planner_and_actions(
+                due_event(conversation_id, open_loop_id),
+                &arbiter,
+                &port,
+            )
+            .await
+            .expect("indeterminate delivery should remain a structured terminal outcome");
+        assert!(matches!(
+            first,
+            PlannedProcessingOutcome::Planned {
+                ref actions,
+                ref feedback,
+                ..
+            } if matches!(
+                actions.as_slice(),
+                [ActionResult::Executed {
+                    outcome: ActionPortOutcome::DeliveryIndeterminate { .. },
+                    ..
+                }]
+            ) && feedback.iter().all(|item| {
+                item.event_type != crate::EventType::ActionSucceeded
+                    && item.event_type != crate::EventType::MessageSent
+            }) && feedback
+                .iter()
+                .any(|item| item.event_type == crate::EventType::ActionFailed)
+        ));
+        assert!(
+            open_loops
+                .resolved
+                .lock()
+                .expect("open-loop recorder lock")
+                .is_empty()
+        );
+        assert_eq!(
+            open_loops
+                .deferred
+                .lock()
+                .expect("open-loop defer recorder lock")
+                .as_slice(),
+            &[(open_loop_id, None)]
+        );
+
+        let replay = runtime
+            .process_event_with_planner_and_actions(
+                due_event(conversation_id, open_loop_id),
+                &arbiter,
+                &port,
+            )
+            .await
+            .expect("an indeterminate duplicate should retry only the unschedule transition");
+        assert!(matches!(
+            replay,
+            PlannedProcessingOutcome::Planned { actions, .. }
+                if matches!(
+                    actions.as_slice(),
+                    [ActionResult::Rejected(ActionRejection::Duplicate { .. })]
+                )
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            open_loops
+                .deferred
+                .lock()
+                .expect("open-loop defer recorder lock")
+                .as_slice(),
+            &[(open_loop_id, None), (open_loop_id, None)]
+        );
+    }
+
+    #[tokio::test]
+    async fn indeterminate_due_delivery_is_unscheduled_without_a_resolve_proposal() {
+        let conversation_id = ConversationId::new();
+        let open_loop_id = OpenLoopId::new();
+        let open_loops = Arc::new(TestOpenLoopStore::with_visible(
+            open_loop_id,
+            OpenLoopOwner::Conversation(conversation_id),
+        ));
+        let (_handle, mut runtime) = CognitiveRuntime::new_with_services(
+            RuntimeConfig::default(),
+            CoreServices::with_model(DueActionWithoutResolutionModel { conversation_id })
+                .with_open_loops(open_loops.clone()),
+        )
+        .expect("valid runtime");
+        let arbiter = ActionArbiter::new(
+            ActionArbiterConfig::default().with_capabilities(EnvironmentCapabilities::all()),
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let outcome = runtime
+            .process_event_with_planner_and_actions(
+                due_event(conversation_id, open_loop_id),
+                &arbiter,
+                &IndeterminateActionPort {
+                    calls: calls.clone(),
+                },
+            )
+            .await
+            .expect("terminal delivery must close the scheduler lease independently of the plan");
+        assert!(matches!(
+            outcome,
+            PlannedProcessingOutcome::Planned { actions, .. }
+                if matches!(
+                    actions.as_slice(),
+                    [ActionResult::Executed {
+                        outcome: ActionPortOutcome::DeliveryIndeterminate { .. },
+                        ..
+                    }]
+                )
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            open_loops
+                .deferred
+                .lock()
+                .expect("open-loop defer recorder lock")
+                .as_slice(),
+            &[(open_loop_id, None)]
+        );
+        assert!(
+            open_loops
+                .resolved
+                .lock()
+                .expect("open-loop recorder lock")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn non_retryable_due_port_failure_is_unscheduled_and_not_dispatched_again() {
+        let conversation_id = ConversationId::new();
+        let open_loop_id = OpenLoopId::new();
+        let open_loops = Arc::new(TestOpenLoopStore::with_visible(
+            open_loop_id,
+            OpenLoopOwner::Conversation(conversation_id),
+        ));
+        let (_handle, mut runtime) = CognitiveRuntime::new_with_services(
+            RuntimeConfig::default(),
+            CoreServices::with_model(DueActionModel {
+                conversation_id,
+                open_loop_id,
+            })
+            .with_open_loops(open_loops.clone()),
+        )
+        .expect("valid runtime");
+        let arbiter = ActionArbiter::new(
+            ActionArbiterConfig::default().with_capabilities(EnvironmentCapabilities::all()),
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let port = TerminalFailingActionPort {
+            calls: calls.clone(),
+        };
+
+        let first = runtime
+            .process_event_with_planner_and_actions(
+                due_event(conversation_id, open_loop_id),
+                &arbiter,
+                &port,
+            )
+            .await
+            .expect("non-retryable adapter failure should remain structured");
+        assert!(matches!(
+            first,
+            PlannedProcessingOutcome::Planned { actions, .. }
+                if matches!(
+                    actions.as_slice(),
+                    [ActionResult::Failed {
+                        error: crate::ActionPortError {
+                            retryable: false,
+                            ..
+                        },
+                        ..
+                    }]
+                )
+        ));
+
+        let replay = runtime
+            .process_event_with_planner_and_actions(
+                due_event(conversation_id, open_loop_id),
+                &arbiter,
+                &port,
+            )
+            .await
+            .expect("terminal duplicate should only repeat the unschedule transition");
+        assert!(matches!(
+            replay,
+            PlannedProcessingOutcome::Planned { actions, .. }
+                if matches!(
+                    actions.as_slice(),
+                    [ActionResult::Rejected(ActionRejection::Duplicate { .. })]
+                )
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            open_loops
+                .deferred
+                .lock()
+                .expect("open-loop defer recorder lock")
+                .as_slice(),
+            &[(open_loop_id, None), (open_loop_id, None)]
+        );
+    }
+
+    #[tokio::test]
+    async fn due_reach_out_route_rejections_are_terminal_and_unscheduled() {
+        for resolution_failed in [false, true] {
+            let person_id = PersonId::new();
+            let open_loop_id = OpenLoopId::new();
+            let open_loops = Arc::new(TestOpenLoopStore::with_visible(
+                open_loop_id,
+                OpenLoopOwner::Person(person_id),
+            ));
+            let (_handle, mut runtime) = CognitiveRuntime::new_with_services(
+                RuntimeConfig::default(),
+                CoreServices::with_model(DueReachOutModel {
+                    person_id,
+                    open_loop_id,
+                })
+                .with_open_loops(open_loops.clone()),
+            )
+            .expect("valid runtime");
+            let arbiter = ActionArbiter::new(
+                ActionArbiterConfig::default().with_capabilities(EnvironmentCapabilities::all()),
+            )
+            .with_delivery_resolver(Arc::new(RejectingDeliveryResolver { resolution_failed }));
+            let calls = Arc::new(AtomicUsize::new(0));
+            let event = WorldEvent::new(
+                Utc::now(),
+                EventScope::Person { person_id },
+                EventPriority::High,
+                WorldEventKind::ProspectiveMemoryDue(crate::ProspectiveMemoryEvent {
+                    open_loop_id,
+                }),
+            );
+
+            let outcome = runtime
+                .process_event_with_planner_and_actions(
+                    event,
+                    &arbiter,
+                    &CountingDeliveredActionPort {
+                        calls: calls.clone(),
+                    },
+                )
+                .await
+                .expect("route rejection should remain a structured terminal outcome");
+
+            assert!(matches!(
+                outcome,
+                PlannedProcessingOutcome::Planned { actions, .. }
+                    if if resolution_failed {
+                        matches!(
+                            actions.as_slice(),
+                            [ActionResult::Rejected(
+                                ActionRejection::DeliveryResolutionFailed { .. }
+                            )]
+                        )
+                    } else {
+                        matches!(
+                            actions.as_slice(),
+                            [ActionResult::Rejected(ActionRejection::TargetUnavailable { .. })]
+                        )
+                    }
+            ));
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                open_loops
+                    .deferred
+                    .lock()
+                    .expect("open-loop defer recorder lock")
+                    .as_slice(),
+                &[(open_loop_id, None)]
+            );
+            assert!(
+                open_loops
+                    .resolved
+                    .lock()
+                    .expect("open-loop recorder lock")
+                    .is_empty()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn due_tool_failure_is_unscheduled_and_not_dispatched_again() {
+        let conversation_id = ConversationId::new();
+        let open_loop_id = OpenLoopId::new();
+        let open_loops = Arc::new(TestOpenLoopStore::with_visible(
+            open_loop_id,
+            OpenLoopOwner::Conversation(conversation_id),
+        ));
+        let (_handle, mut runtime) = CognitiveRuntime::new_with_services(
+            RuntimeConfig::default(),
+            CoreServices::with_model(DueToolActionModel {
+                conversation_id,
+                open_loop_id,
+            })
+            .with_open_loops(open_loops.clone()),
+        )
+        .expect("valid runtime");
+        let arbiter = ActionArbiter::new(
+            ActionArbiterConfig::default().with_capabilities(EnvironmentCapabilities::all()),
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let port = ToolFailedActionPort {
+            calls: calls.clone(),
+        };
+
+        let first = runtime
+            .process_event_with_planner_and_actions(
+                due_event(conversation_id, open_loop_id),
+                &arbiter,
+                &port,
+            )
+            .await
+            .expect("tool failure should remain a structured terminal outcome");
+        assert!(matches!(
+            first,
+            PlannedProcessingOutcome::Planned { actions, .. }
+                if matches!(
+                    actions.as_slice(),
+                    [ActionResult::Executed {
+                        outcome: ActionPortOutcome::ToolFailed { .. },
+                        ..
+                    }]
+                )
+        ));
+
+        let replay = runtime
+            .process_event_with_planner_and_actions(
+                due_event(conversation_id, open_loop_id),
+                &arbiter,
+                &port,
+            )
+            .await
+            .expect("terminal tool duplicate should only repeat the unschedule transition");
+        assert!(matches!(
+            replay,
+            PlannedProcessingOutcome::Planned { actions, .. }
+                if matches!(
+                    actions.as_slice(),
+                    [ActionResult::Rejected(ActionRejection::Duplicate { .. })]
+                )
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            open_loops
+                .deferred
+                .lock()
+                .expect("open-loop defer recorder lock")
+                .as_slice(),
+            &[(open_loop_id, None), (open_loop_id, None)]
+        );
+    }
+
+    #[tokio::test]
+    async fn one_indeterminate_action_unschedules_a_multi_action_due_loop() {
+        let conversation_id = ConversationId::new();
+        let open_loop_id = OpenLoopId::new();
+        let open_loops = Arc::new(TestOpenLoopStore::with_visible(
+            open_loop_id,
+            OpenLoopOwner::Conversation(conversation_id),
+        ));
+        let (_handle, mut runtime) = CognitiveRuntime::new_with_services(
+            RuntimeConfig::default(),
+            CoreServices::with_model(DueMultiActionModel {
+                conversation_id,
+                open_loop_id,
+            })
+            .with_open_loops(open_loops.clone()),
+        )
+        .expect("valid runtime");
+        let arbiter = ActionArbiter::new(
+            ActionArbiterConfig::default().with_capabilities(EnvironmentCapabilities::all()),
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let outcome = runtime
+            .process_event_with_planner_and_actions(
+                due_event(conversation_id, open_loop_id),
+                &arbiter,
+                &DeliverThenIndeterminatePort {
+                    calls: calls.clone(),
+                },
+            )
+            .await
+            .expect("mixed terminal delivery outcomes should be represented");
+        assert!(matches!(
+            outcome,
+            PlannedProcessingOutcome::Planned { actions, .. }
+                if matches!(
+                    actions.as_slice(),
+                    [
+                        ActionResult::Executed {
+                            outcome: ActionPortOutcome::Delivered { .. },
+                            ..
+                        },
+                        ActionResult::Executed {
+                            outcome: ActionPortOutcome::DeliveryIndeterminate { .. },
+                            ..
+                        }
+                    ]
+                )
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(
+            open_loops
+                .resolved
+                .lock()
+                .expect("open-loop recorder lock")
+                .is_empty()
+        );
+        assert_eq!(
+            open_loops
+                .deferred
+                .lock()
+                .expect("open-loop defer recorder lock")
+                .as_slice(),
+            &[(open_loop_id, None)]
+        );
+    }
+
+    #[tokio::test]
     async fn delivered_due_replay_retries_resolution_without_redelivery() {
         let conversation_id = ConversationId::new();
         let open_loop_id = OpenLoopId::new();
@@ -2810,6 +3659,22 @@ mod tests {
             Some(format!("open-loop:{open_loop_id}:delivery:1").as_str())
         );
         assert_ne!(first.idempotency_key(), second.idempotency_key());
+    }
+
+    #[test]
+    fn ordinary_action_key_matches_the_public_planner_helper() {
+        let conversation_id = ConversationId::new();
+        let event_id = EventId::new();
+        let mut action =
+            crate::ProposedAction::send_message(conversation_id, MessageContent::text("reply"))
+                .expect("valid action");
+
+        apply_event_action_idempotency(&mut action, event_id, 0).expect("valid metadata");
+
+        assert_eq!(
+            action.idempotency_key(),
+            Some(crate::event_action_idempotency_key(event_id, 0).as_str())
+        );
     }
 
     #[tokio::test]
@@ -3615,6 +4480,138 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn conversation_data_erasure_purges_state_and_discards_late_feedback_in_fifo() {
+        let conversation_id = ConversationId::new();
+        let unrelated_conversation = ConversationId::new();
+        let person_id = PersonId::new();
+        let prior = group_message(conversation_id, person_id);
+        let prior_id = prior.id();
+        let (handle, mut runtime) =
+            CognitiveRuntime::new(RuntimeConfig::default()).expect("valid runtime");
+        let (observed_sender, mut observed_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let driver = tokio::spawn(async move {
+            while let Some(outcome) = runtime.process_next().await {
+                if let ProcessingOutcome::Observed(observation) = outcome {
+                    observed_sender
+                        .send(observation.event_id)
+                        .expect("observation receiver should remain open");
+                }
+            }
+            runtime
+        });
+
+        handle.submit(prior).await.expect("enqueue prior event");
+        assert!(
+            handle
+                .begin_conversation_data_erasure(conversation_id)
+                .await
+                .expect("begin conversation barrier")
+        );
+        assert_eq!(observed_receiver.recv().await, Some(prior_id));
+
+        let sent_at = Utc::now();
+        handle
+            .submit(WorldEvent::new(
+                sent_at,
+                EventScope::Conversation { conversation_id },
+                EventPriority::High,
+                WorldEventKind::ActionSucceeded(crate::ActionSucceededEvent {
+                    idempotency_key: "late-action".to_string(),
+                }),
+            ))
+            .await
+            .expect("enqueue late action receipt");
+        let message_sent_at = Utc::now();
+        handle
+            .submit(WorldEvent::new(
+                message_sent_at,
+                EventScope::Conversation { conversation_id },
+                EventPriority::High,
+                WorldEventKind::MessageSent(crate::MessageSentEvent {
+                    message_id: MessageId::new(),
+                    conversation_id,
+                    timestamp: message_sent_at,
+                }),
+            ))
+            .await
+            .expect("enqueue late message receipt");
+        let unrelated = group_message(unrelated_conversation, person_id);
+        let unrelated_id = unrelated.id();
+        handle
+            .submit(unrelated)
+            .await
+            .expect("enqueue unrelated event");
+        assert!(
+            handle
+                .end_conversation_data_erasure(conversation_id)
+                .await
+                .expect("end conversation barrier")
+        );
+        assert_eq!(observed_receiver.recv().await, Some(unrelated_id));
+        assert!(observed_receiver.try_recv().is_err());
+
+        drop(handle);
+        let runtime = driver.await.expect("runtime driver should join");
+        assert!(runtime.state().conversation(conversation_id).is_none());
+        assert!(
+            runtime
+                .state()
+                .conversation(unrelated_conversation)
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn conversation_data_erasure_batch_covers_every_stale_canonical_id_atomically() {
+        let first_conversation = ConversationId::new();
+        let stale_remap = ConversationId::new();
+        let person_id = PersonId::new();
+        let (handle, mut runtime) =
+            CognitiveRuntime::new(RuntimeConfig::default()).expect("valid runtime");
+        let driver = tokio::spawn(async move {
+            while runtime.process_next().await.is_some() {}
+            runtime
+        });
+
+        handle
+            .submit(group_message(first_conversation, person_id))
+            .await
+            .expect("enqueue first conversation");
+        handle
+            .submit(group_message(stale_remap, person_id))
+            .await
+            .expect("enqueue stale remap");
+        assert_eq!(
+            handle
+                .begin_conversation_data_erasures([first_conversation, stale_remap])
+                .await
+                .expect("begin conversation barriers"),
+            2
+        );
+
+        handle
+            .submit(group_message(first_conversation, person_id))
+            .await
+            .expect("enqueue blocked first conversation");
+        handle
+            .submit(group_message(stale_remap, person_id))
+            .await
+            .expect("enqueue blocked stale remap");
+        assert_eq!(
+            handle
+                .end_conversation_data_erasures([first_conversation, stale_remap])
+                .await
+                .expect("end conversation barriers"),
+            2
+        );
+
+        drop(handle);
+        let runtime = driver.await.expect("runtime driver should join");
+        assert!(runtime.state().conversation(first_conversation).is_none());
+        assert!(runtime.state().conversation(stale_remap).is_none());
+    }
+
+    #[tokio::test]
     async fn data_erasure_commands_fail_cleanly_after_runtime_closes() {
         let (handle, runtime) =
             CognitiveRuntime::new(RuntimeConfig::default()).expect("valid runtime");
@@ -3627,6 +4624,18 @@ mod tests {
         );
         assert_eq!(
             handle.end_data_erasure(PersonId::new()).await,
+            Err(DataErasureError::RuntimeClosed)
+        );
+        assert_eq!(
+            handle
+                .begin_conversation_data_erasure(ConversationId::new())
+                .await,
+            Err(DataErasureError::RuntimeClosed)
+        );
+        assert_eq!(
+            handle
+                .end_conversation_data_erasure(ConversationId::new())
+                .await,
             Err(DataErasureError::RuntimeClosed)
         );
     }

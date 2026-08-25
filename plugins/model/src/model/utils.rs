@@ -244,6 +244,33 @@ pub(crate) fn is_main_admin(bot: &RuntimeBot, user_id: i64) -> bool {
         .unwrap_or(false)
 }
 
+#[must_use]
+pub(crate) struct MainAdminCommitAuthorization {
+    _canonical: Option<crate::yunxi::CanonicalOwnerRouteGuard>,
+}
+
+/// Revalidate administrator authority at the side-effect boundary. A
+/// canonical owner route is pinned through commit; legacy Kovi configuration
+/// is immutable for the running host and needs no runtime guard.
+pub(crate) async fn authorize_main_admin_commit(
+    bot: &RuntimeBot,
+    user_id: i64,
+) -> Option<MainAdminCommitAuthorization> {
+    match crate::yunxi::authorize_canonical_owner(user_id).await {
+        crate::yunxi::CanonicalOwnerAuthorization::Authorized(guard) => {
+            Some(MainAdminCommitAuthorization {
+                _canonical: Some(guard),
+            })
+        }
+        crate::yunxi::CanonicalOwnerAuthorization::Denied => None,
+        crate::yunxi::CanonicalOwnerAuthorization::Unconfigured => bot
+            .get_main_admin()
+            .ok()
+            .filter(|main_admin| *main_admin == user_id)
+            .map(|_| MainAdminCommitAuthorization { _canonical: None }),
+    }
+}
+
 /// Resolve the notification destination from the canonical owner mapping.
 /// A configured owner with no unique QQ route fails closed; only deployments
 /// without `[identity].owner_person_id` use Kovi's legacy administrator value.
@@ -1733,25 +1760,6 @@ async fn private_history(user_id: i64) -> ConversationHistory {
 }
 
 /// 为脱离普通回复流程的私聊通知补一条短期上下文，保持后续追问连续。
-pub(crate) async fn record_standalone_private_message(user_id: i64, content: &str) {
-    if content.trim().is_empty() {
-        return;
-    }
-    let private = private_history(user_id).await;
-    let mut history = private.lock().await;
-    if history.is_empty() {
-        history.push(BotMemory {
-            role: Roles::System,
-            content: String::new(),
-        });
-    }
-    history.push(BotMemory {
-        role: Roles::Assistant,
-        content: content.to_string(),
-    });
-    limit_memory_size(&mut history);
-}
-
 async fn touch_runtime_history(
     access_map: &Mutex<HashMap<i64, Instant>>,
     subject_id: i64,

@@ -2,9 +2,10 @@
 
 use super::interrupt::{
     CommittedOutgoing, OutgoingCommitRejection, OutgoingSource, OutgoingToken, ReplyScope,
-    ReplyTicket, active_ticket_locked, claim_active_locked, commit_outgoing_guard_with_context,
+    ReplyTicket, active_ticket_locked, begin_outgoing_commit, claim_active_locked,
     contextual_outgoing_fingerprint, finish, interrupt_locked, mark_outgoing_failed,
-    prepare_outgoing, scope_mutex,
+    prepare_outgoing_with_semantic_preview,
+    prepare_proactive_outgoing_if_idle_with_semantic_preview, scope_mutex,
 };
 use super::message_actions::MessageDestination;
 use super::message_transport::MessageTransport;
@@ -22,6 +23,7 @@ pub(crate) enum TrackedSendError {
     Stale,
     DuplicateIdempotency,
     Transport(String),
+    TransportIndeterminate(String),
 }
 
 impl std::fmt::Display for TrackedSendError {
@@ -38,6 +40,9 @@ impl std::fmt::Display for TrackedSendError {
             Self::Stale => formatter.write_str("prepared send became stale before commit"),
             Self::DuplicateIdempotency => formatter.write_str("duplicate idempotency key"),
             Self::Transport(detail) => write!(formatter, "transport failed: {detail}"),
+            Self::TransportIndeterminate(detail) => {
+                write!(formatter, "transport outcome is indeterminate: {detail}")
+            }
         }
     }
 }
@@ -59,18 +64,22 @@ impl PreparedTrackedSend {
         self.cleanup().await;
     }
 
-    async fn commit(mut self) -> Result<CommittedTrackedSend, TrackedSendError> {
-        let outgoing = self.outgoing.ok_or(TrackedSendError::Stale)?;
-        let committed = commit_outgoing_guard_with_context(
-            outgoing,
-            self.fingerprint,
-            self.idempotency_key.as_deref(),
-        )
-        .await
-        .map_err(|rejection| match rejection {
-            OutgoingCommitRejection::Stale => TrackedSendError::Stale,
-            OutgoingCommitRejection::DuplicateIdempotency => TrackedSendError::DuplicateIdempotency,
-        })?;
+    async fn commit(
+        mut self,
+        precommit: super::interrupt::PreparedOutgoingCommit,
+    ) -> Result<CommittedTrackedSend, TrackedSendError> {
+        if self.outgoing.is_none() {
+            return Err(TrackedSendError::Stale);
+        }
+        let committed = precommit
+            .commit(self.fingerprint, self.idempotency_key.as_deref())
+            .await
+            .map_err(|rejection| match rejection {
+                OutgoingCommitRejection::Stale => TrackedSendError::Stale,
+                OutgoingCommitRejection::DuplicateIdempotency => {
+                    TrackedSendError::DuplicateIdempotency
+                }
+            })?;
         self.outgoing = None;
         Ok(CommittedTrackedSend {
             destination: self.destination,
@@ -126,7 +135,9 @@ impl CommittedTrackedSend {
         }
         if record_delivery {
             let scope = destination_scope(self.destination);
-            record_standalone_bot_message(scope, message_id, &self.audit_content).await;
+            if let Some(ticket) = self.ticket {
+                record_standalone_bot_message(scope, ticket, message_id, &self.audit_content).await;
+            }
         }
         self.finish().await;
         message_id
@@ -159,6 +170,12 @@ impl Drop for CommittedTrackedSend {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct TrackedSendOptions {
+    record_delivery: bool,
+    precommit_before_revalidation: bool,
+}
+
 /// Send a visible host-side message through the same coordinator used by Core
 /// and legacy model replies. The caller's revalidation runs after preparation
 /// and immediately before the adapter authorization check and commit.
@@ -180,24 +197,61 @@ where
         message,
         source,
         idempotency_key,
-        revalidate,
-        true,
+        move || async move { revalidate().await.then_some(()) },
+        TrackedSendOptions {
+            record_delivery: true,
+            precommit_before_revalidation: false,
+        },
     )
     .await
 }
 
-async fn send_tracked_message_inner<Validate, ValidateFuture>(
+/// Variant whose validator returns a guard that stays alive through commit.
+/// Route and actor checks use it to close their final lookup-to-commit race
+/// without holding security locks over the platform request.
+pub(crate) async fn send_tracked_message_with_revalidation_guard<
+    Validate,
+    ValidateFuture,
+    RevalidationGuard,
+>(
     bot: &RuntimeBot,
     destination: MessageDestination,
     message: Message,
     source: OutgoingSource,
     idempotency_key: Option<&str>,
     revalidate: Validate,
-    record_delivery: bool,
 ) -> Result<i32, TrackedSendError>
 where
     Validate: FnOnce() -> ValidateFuture,
-    ValidateFuture: Future<Output = bool>,
+    ValidateFuture: Future<Output = Option<RevalidationGuard>>,
+{
+    send_tracked_message_inner(
+        bot,
+        destination,
+        message,
+        source,
+        idempotency_key,
+        revalidate,
+        TrackedSendOptions {
+            record_delivery: true,
+            precommit_before_revalidation: true,
+        },
+    )
+    .await
+}
+
+async fn send_tracked_message_inner<Validate, ValidateFuture, RevalidationGuard>(
+    bot: &RuntimeBot,
+    destination: MessageDestination,
+    message: Message,
+    source: OutgoingSource,
+    idempotency_key: Option<&str>,
+    revalidate: Validate,
+    options: TrackedSendOptions,
+) -> Result<i32, TrackedSendError>
+where
+    Validate: FnOnce() -> ValidateFuture,
+    ValidateFuture: Future<Output = Option<RevalidationGuard>>,
 {
     let prepared = prepare_tracked_message(
         destination,
@@ -206,16 +260,34 @@ where
         idempotency_key.map(ToOwned::to_owned),
     )
     .await?;
+    let outgoing = prepared.outgoing.ok_or(TrackedSendError::Stale)?;
+    let mut precommit = if options.precommit_before_revalidation {
+        Some(
+            begin_outgoing_commit(outgoing)
+                .await
+                .map_err(map_commit_rejection)?,
+        )
+    } else {
+        None
+    };
 
-    if !revalidate().await {
+    let Some(revalidation_guard) = revalidate().await else {
         prepared.cancel().await;
         return Err(TrackedSendError::RevalidationRejected);
+    };
+    if precommit.is_none() {
+        precommit = Some(
+            begin_outgoing_commit(outgoing)
+                .await
+                .map_err(map_commit_rejection)?,
+        );
     }
     let authorization = match destination {
         MessageDestination::Group(group_id) => {
             match group_access::authorize_group_send(group_id).await {
                 Ok(authorization) => Some(authorization),
                 Err(_) => {
+                    drop(revalidation_guard);
                     prepared.cancel().await;
                     return Err(TrackedSendError::Unauthorized);
                 }
@@ -224,17 +296,34 @@ where
         MessageDestination::Private(_) => None,
     };
 
-    let committed = prepared.commit().await?;
+    let committed = prepared
+        .commit(precommit.expect("precommit must be acquired before authorization"))
+        .await?;
     drop(authorization);
-    match MessageTransport::new(bot)
-        .send(committed.destination, committed.message.clone())
-        .await
-    {
-        Ok(message_id) => Ok(committed.mark_sent(message_id, record_delivery).await),
+    drop(revalidation_guard);
+    let transport = MessageTransport::new(bot);
+    let send_result = if options.record_delivery {
+        transport
+            .send(committed.destination, committed.message.clone())
+            .await
+    } else {
+        transport
+            .send_redacted(committed.destination, committed.message.clone())
+            .await
+    };
+    match send_result {
+        Ok(message_id) => Ok(committed
+            .mark_sent(message_id, options.record_delivery)
+            .await),
         Err(error) => {
-            let detail = format!("{error:?}");
-            committed.mark_failed().await;
-            Err(TrackedSendError::Transport(detail))
+            let detail = error.to_string();
+            if error.is_indeterminate() {
+                drop(committed);
+                Err(TrackedSendError::TransportIndeterminate(detail))
+            } else {
+                committed.mark_failed().await;
+                Err(TrackedSendError::Transport(detail))
+            }
         }
     }
 }
@@ -253,10 +342,20 @@ pub(crate) async fn send_tracked_unrecorded_plain_text(
         Message::from(content),
         OutgoingSource::Reply,
         None,
-        || async { true },
-        false,
+        || async { Some(()) },
+        TrackedSendOptions {
+            record_delivery: false,
+            precommit_before_revalidation: true,
+        },
     )
     .await
+}
+
+fn map_commit_rejection(rejection: OutgoingCommitRejection) -> TrackedSendError {
+    match rejection {
+        OutgoingCommitRejection::Stale => TrackedSendError::Stale,
+        OutgoingCommitRejection::DuplicateIdempotency => TrackedSendError::DuplicateIdempotency,
+    }
 }
 
 pub(crate) async fn send_tracked_plain_text(
@@ -285,31 +384,43 @@ async fn prepare_tracked_message(
         return Err(TrackedSendError::InvalidTarget);
     }
     let scope = destination_scope(destination);
-    let (ticket, owns_ticket) = {
-        let lock = scope_mutex(scope);
-        let _scope_guard = lock.lock().await;
-        match (source, active_ticket_locked(scope).await) {
-            (OutgoingSource::Proactive, Some(_)) => {
-                return Err(TrackedSendError::ConversationBusy);
-            }
-            (OutgoingSource::Reply, Some(ticket)) => (ticket, false),
-            (_, None) => {
-                let ticket = interrupt_locked(scope).await;
-                if !claim_active_locked(ticket).await {
-                    return Err(TrackedSendError::Stale);
-                }
-                (ticket, true)
-            }
-        }
-    };
     let audit_content = message.to_human_string();
     let fingerprint =
         tracked_message_fingerprint(destination, &message, idempotency_key.as_deref());
-    let Some(outgoing) = prepare_outgoing(ticket, fingerprint, source).await else {
-        if owns_ticket {
+    let (ticket, outgoing) = if source == OutgoingSource::Proactive {
+        let outgoing = prepare_proactive_outgoing_if_idle_with_semantic_preview(
+            scope,
+            fingerprint,
+            Some(&audit_content),
+        )
+        .await
+        .ok_or(TrackedSendError::ConversationBusy)?;
+        (outgoing.ticket(), outgoing)
+    } else {
+        let ticket = {
+            let lock = scope_mutex(scope);
+            let _scope_guard = lock.lock().await;
+            if active_ticket_locked(scope).await.is_some() {
+                return Err(TrackedSendError::ConversationBusy);
+            }
+            let ticket = interrupt_locked(scope).await;
+            if !claim_active_locked(ticket).await {
+                return Err(TrackedSendError::Stale);
+            }
+            ticket
+        };
+        let Some(outgoing) = prepare_outgoing_with_semantic_preview(
+            ticket,
+            fingerprint,
+            source,
+            Some(&audit_content),
+        )
+        .await
+        else {
             finish(ticket).await;
-        }
-        return Err(TrackedSendError::Stale);
+            return Err(TrackedSendError::Stale);
+        };
+        (ticket, outgoing)
     };
     Ok(PreparedTrackedSend {
         destination,
@@ -317,7 +428,7 @@ async fn prepare_tracked_message(
         audit_content,
         fingerprint,
         idempotency_key,
-        ticket: owns_ticket.then_some(ticket),
+        ticket: Some(ticket),
         outgoing: Some(outgoing),
     })
 }
@@ -355,8 +466,10 @@ const fn destination_id(destination: MessageDestination) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{TrackedSendError, prepare_tracked_message, tracked_message_fingerprint};
+    use crate::model::ConversationCoordinator;
     use crate::model::interrupt::{
-        OutgoingSource, ReplyScope, finish, interrupt, is_active, is_current, mark_active,
+        OutgoingSource, ReplyScope, begin_outgoing_commit, finish, interrupt, is_active,
+        is_current, mark_active,
     };
     use crate::model::message_actions::MessageDestination;
     use kovi::Message;
@@ -394,7 +507,7 @@ mod tests {
     }
 
     #[test]
-    fn reactive_send_borrows_the_current_ticket_without_finishing_it() {
+    fn host_side_send_never_borrows_an_unrelated_active_ticket() {
         kovi::tokio::runtime::Runtime::new()
             .expect("应创建测试运行时")
             .block_on(async {
@@ -402,16 +515,14 @@ mod tests {
                 let ticket = interrupt(scope).await;
                 assert!(mark_active(ticket).await);
 
-                let prepared = prepare_tracked_message(
+                let result = prepare_tracked_message(
                     MessageDestination::Group(9_110_001),
                     Message::from("确认消息"),
                     OutgoingSource::Reply,
                     None,
                 )
-                .await
-                .expect("reactive send 应复用当前 ticket");
-                assert!(prepared.ticket.is_none());
-                prepared.cancel().await;
+                .await;
+                assert!(matches!(result, Err(TrackedSendError::ConversationBusy)));
 
                 assert!(is_current(ticket).await);
                 assert!(is_active(scope).await);
@@ -443,6 +554,38 @@ mod tests {
     }
 
     #[test]
+    fn proactive_send_yields_to_an_admitted_but_not_yet_active_inbound() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("should create test runtime")
+            .block_on(async {
+                let scope = ReplyScope::Private(9_110_005);
+                let admission = ConversationCoordinator::begin_incoming(scope).await;
+
+                let result = prepare_tracked_message(
+                    MessageDestination::Private(9_110_005),
+                    Message::from("proactive must wait"),
+                    OutgoingSource::Proactive,
+                    None,
+                )
+                .await;
+
+                assert!(matches!(result, Err(TrackedSendError::ConversationBusy)));
+                assert!(is_current(admission.ticket).await);
+                assert!(ConversationCoordinator::abandon_incoming(admission).await);
+
+                let prepared = prepare_tracked_message(
+                    MessageDestination::Private(9_110_005),
+                    Message::from("proactive after release"),
+                    OutgoingSource::Proactive,
+                    None,
+                )
+                .await
+                .expect("released reservation must not block the scope permanently");
+                prepared.cancel().await;
+            });
+    }
+
+    #[test]
     fn inbound_turn_supersedes_a_prepared_proactive_send() {
         kovi::tokio::runtime::Runtime::new()
             .expect("应创建测试运行时")
@@ -458,16 +601,19 @@ mod tests {
                 .expect("空闲会话应允许准备主动消息");
 
                 let inbound = interrupt(scope).await;
+                let outgoing = prepared
+                    .outgoing
+                    .expect("prepared send must retain its token");
                 assert!(matches!(
-                    prepared.commit().await,
-                    Err(TrackedSendError::Stale)
+                    begin_outgoing_commit(outgoing).await,
+                    Err(crate::model::OutgoingCommitRejection::Stale)
                 ));
                 assert!(is_current(inbound).await);
             });
     }
 
     #[test]
-    fn cancelling_an_owned_prepared_send_releases_the_scope() {
+    fn cancelling_an_owned_prepared_send_keeps_the_scope_idle() {
         kovi::tokio::runtime::Runtime::new()
             .expect("应创建测试运行时")
             .block_on(async {
@@ -480,7 +626,7 @@ mod tests {
                 )
                 .await
                 .expect("空闲会话应允许准备主动消息");
-                assert!(is_active(scope).await);
+                assert!(!is_active(scope).await);
 
                 prepared.cancel().await;
                 assert!(!is_active(scope).await);

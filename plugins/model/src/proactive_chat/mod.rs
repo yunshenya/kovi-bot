@@ -16,6 +16,7 @@ use crate::mood_system::MOOD_SYSTEM;
 use crate::topic_generator::TopicGenerator;
 use crate::yunxi;
 use crate::yunxi::bridge::ShadowBridge;
+use crate::yunxi::delivery::ReachOutDeliveryOutcome;
 use anyhow::Result;
 use chrono::Local;
 use kovi::tokio::time::sleep;
@@ -32,6 +33,14 @@ use yunxi_core::{
 pub mod startup;
 
 const GLOBAL_PROACTIVE_STATE_KEY: &str = "proactive:global";
+
+fn bridge_reach_out_outcome(outcome: &ActionPortOutcome) -> ReachOutDeliveryOutcome {
+    match outcome {
+        ActionPortOutcome::Delivered { .. } => ReachOutDeliveryOutcome::Delivered,
+        ActionPortOutcome::DeliveryIndeterminate { .. } => ReachOutDeliveryOutcome::Indeterminate,
+        _ => ReachOutDeliveryOutcome::Failed,
+    }
+}
 
 fn prepared_grace_duration(configured_ms: u64) -> Duration {
     if configured_ms == 0 {
@@ -267,23 +276,25 @@ impl ProactiveChatManager {
             .map_err(Into::into)
     }
 
-    async fn deliver_private_reach_out(&self, user_id: i64, intent: &ReachOutIntent) -> bool {
+    async fn deliver_private_reach_out(
+        &self,
+        user_id: i64,
+        intent: &ReachOutIntent,
+    ) -> ReachOutDeliveryOutcome {
         if let Some(bridge) = &self.yunxi_bridge {
             let Ok(action) = ReachOutAction::from_intent(intent.clone()) else {
-                return false;
+                return ReachOutDeliveryOutcome::Failed;
             };
-            return matches!(
-                bridge
-                    .dispatch_action(user_id, ProposedAction::ReachOut(action))
-                    .await,
-                Some(ActionResult::Executed {
-                    outcome: ActionPortOutcome::Delivered { .. },
-                    ..
-                })
-            );
+            return match bridge
+                .dispatch_action(user_id, ProposedAction::ReachOut(action))
+                .await
+            {
+                Some(ActionResult::Executed { outcome, .. }) => bridge_reach_out_outcome(&outcome),
+                _ => ReachOutDeliveryOutcome::Failed,
+            };
         }
         let Some(identity_store) = yunxi::identity_store() else {
-            return false;
+            return ReachOutDeliveryOutcome::Failed;
         };
         yunxi::delivery::send_reach_out(&self.bot, &identity_store, intent, user_id).await
     }
@@ -314,8 +325,11 @@ impl ProactiveChatManager {
         // cooldown, daily-limit, or recent-interaction state.
         if !self.can_send_main_admin(main_admin).await
             || yunxi::canonical_owner_matches_authoritative(main_admin).await != Some(true)
-            || !self.deliver_private_reach_out(main_admin, &intent).await
         {
+            return Ok(false);
+        }
+        let delivery = self.deliver_private_reach_out(main_admin, &intent).await;
+        if !delivery.is_terminal_attempt() {
             return Ok(false);
         }
         let target_key = target_state_key("private", main_admin);
@@ -330,13 +344,15 @@ impl ProactiveChatManager {
                 Local::now(),
             )
             .await?;
-        self.memory_manager
-            .add_conversation_memory(
-                main_admin,
-                &format!("主动关心: {}", message),
-                "proactive_private_chat",
-            )
-            .await?;
+        if delivery.confirms_delivery() {
+            self.memory_manager
+                .add_conversation_memory(
+                    main_admin,
+                    &format!("主动关心: {}", message),
+                    "proactive_private_chat",
+                )
+                .await?;
+        }
         Ok(true)
     }
 
@@ -527,16 +543,32 @@ impl ProactiveChatManager {
                 },
             )
             .await;
-            if let Err(error) = send_result {
-                if matches!(
-                    error,
-                    TrackedSendError::InvalidTarget | TrackedSendError::Transport(_)
-                ) {
+            let delivery = match send_result {
+                Ok(_) => ReachOutDeliveryOutcome::Delivered,
+                Err(TrackedSendError::TransportIndeterminate(detail)) => {
                     eprintln!(
-                        "[ERROR] 主动群聊消息发送失败 (群组: {}): {}",
-                        group_id, error
+                        "[WARN] 主动群聊消息投递结果不确定 (群组: {}): {}",
+                        group_id, detail
                     );
+                    ReachOutDeliveryOutcome::Indeterminate
                 }
+                Err(TrackedSendError::DuplicateIdempotency) => {
+                    ReachOutDeliveryOutcome::Indeterminate
+                }
+                Err(error) => {
+                    if matches!(
+                        error,
+                        TrackedSendError::InvalidTarget | TrackedSendError::Transport(_)
+                    ) {
+                        eprintln!(
+                            "[ERROR] 主动群聊消息发送失败 (群组: {}): {}",
+                            group_id, error
+                        );
+                    }
+                    return Ok(());
+                }
+            };
+            if !delivery.is_terminal_attempt() {
                 return Ok(());
             }
 
@@ -549,14 +581,17 @@ impl ProactiveChatManager {
                 )
                 .await?;
 
-            // 记录这次主动对话
-            self.memory_manager
-                .add_conversation_memory(
-                    group_id,
-                    &format!("主动发起话题: {}", content),
-                    "proactive_group_chat",
-                )
-                .await?;
+            // Only confirmed delivery may become conversation memory. An
+            // indeterminate attempt still consumes cooldown to prevent replay.
+            if delivery.confirms_delivery() {
+                self.memory_manager
+                    .add_conversation_memory(
+                        group_id,
+                        &format!("主动发起话题: {}", content),
+                        "proactive_group_chat",
+                    )
+                    .await?;
+            }
         }
 
         Ok(())
@@ -580,10 +615,12 @@ impl ProactiveChatManager {
         };
         let content = intent.message().as_text().to_string();
 
-        if !self.can_send_regular_chat().await
-            || !self.can_send_to_target("private", user_id).await
-            || !self.deliver_private_reach_out(user_id, &intent).await
+        if !self.can_send_regular_chat().await || !self.can_send_to_target("private", user_id).await
         {
+            return Ok(false);
+        }
+        let delivery = self.deliver_private_reach_out(user_id, &intent).await;
+        if !delivery.is_terminal_attempt() {
             return Ok(false);
         }
 
@@ -595,13 +632,15 @@ impl ProactiveChatManager {
                 Local::now(),
             )
             .await?;
-        self.memory_manager
-            .add_conversation_memory(
-                user_id,
-                &format!("主动发起话题: {}", content),
-                "proactive_private_chat",
-            )
-            .await?;
+        if delivery.confirms_delivery() {
+            self.memory_manager
+                .add_conversation_memory(
+                    user_id,
+                    &format!("主动发起话题: {}", content),
+                    "proactive_private_chat",
+                )
+                .await?;
+        }
         Ok(true)
     }
 
@@ -745,8 +784,12 @@ enum ChatTarget {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_sent_proactive_context, prepared_grace_duration};
+    use super::{
+        ReachOutDeliveryOutcome, bridge_reach_out_outcome, is_sent_proactive_context,
+        prepared_grace_duration,
+    };
     use std::time::Duration;
+    use yunxi_core::ActionPortOutcome;
 
     #[test]
     fn skipped_main_admin_decision_does_not_start_global_cooldown() {
@@ -760,5 +803,17 @@ mod tests {
         assert_eq!(prepared_grace_duration(1), Duration::from_millis(300));
         assert_eq!(prepared_grace_duration(500), Duration::from_millis(500));
         assert_eq!(prepared_grace_duration(5_000), Duration::from_millis(1_000));
+    }
+
+    #[test]
+    fn indeterminate_reach_out_suppresses_retry_without_confirming_memory() {
+        let outcome = bridge_reach_out_outcome(&ActionPortOutcome::DeliveryIndeterminate {
+            reason: "response channel cancelled".to_owned(),
+            conversation_id: None,
+        });
+
+        assert_eq!(outcome, ReachOutDeliveryOutcome::Indeterminate);
+        assert!(outcome.is_terminal_attempt());
+        assert!(!outcome.confirms_delivery());
     }
 }

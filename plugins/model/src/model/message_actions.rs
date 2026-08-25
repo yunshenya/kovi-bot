@@ -3,8 +3,9 @@
 //! 模型只负责提出动作意图，真正的消息发送、撤回、分段和打断检查都在这里完成。
 
 use super::interrupt::{
-    OutgoingSource, ReplyScope, ReplyTicket, commit_outgoing_guard,
-    contextual_outgoing_fingerprint, is_current, mark_outgoing_failed, prepare_outgoing,
+    OutgoingSource, ReplyScope, ReplyTicket, begin_outgoing_commit,
+    contextual_outgoing_fingerprint, is_current, mark_outgoing_failed,
+    prepare_outgoing_with_semantic_preview,
 };
 use super::message_transport::MessageTransport;
 use super::recall::{RecentBotMessage, recall_bot_messages, record_committed_bot_message};
@@ -176,16 +177,20 @@ pub(crate) async fn execute_reply_plan(
         } else {
             &[]
         };
-        let fingerprint = contextual_outgoing_fingerprint(
-            scope,
-            bubble,
-            reply_to,
-            mention_user_ids,
-            None,
-        );
-        let Some(outgoing) =
-            prepare_outgoing(reply_ticket, fingerprint, OutgoingSource::Reply).await
+        let fingerprint =
+            contextual_outgoing_fingerprint(scope, bubble, reply_to, mention_user_ids, None);
+        let Some(outgoing) = prepare_outgoing_with_semantic_preview(
+            reply_ticket,
+            fingerprint,
+            OutgoingSource::Reply,
+            Some(bubble),
+        )
+        .await
         else {
+            break;
+        };
+        let Ok(precommit) = begin_outgoing_commit(outgoing).await else {
+            mark_outgoing_failed(outgoing).await;
             break;
         };
         let authorization = match destination {
@@ -204,7 +209,7 @@ pub(crate) async fn execute_reply_plan(
             }
             MessageDestination::Private(_) => None,
         };
-        let Some(committed) = commit_outgoing_guard(outgoing).await else {
+        let Ok(committed) = precommit.commit(fingerprint, None).await else {
             mark_outgoing_failed(outgoing).await;
             break;
         };
@@ -218,7 +223,11 @@ pub(crate) async fn execute_reply_plan(
                 }
             }
             Err(error) => {
-                committed.mark_failed().await;
+                if error.is_indeterminate() {
+                    drop(committed);
+                } else {
+                    committed.mark_failed().await;
+                }
                 match destination {
                     MessageDestination::Group(group_id) => {
                         eprintln!("[ERROR] 群聊回复发送失败 (群组: {}): {:?}", group_id, error)
@@ -247,8 +256,18 @@ pub(crate) async fn send_tracked_reply_text(
     }
     let scope = destination.scope();
     let fingerprint = contextual_outgoing_fingerprint(scope, content, None, &[], None);
-    let Some(outgoing) = prepare_outgoing(reply_ticket, fingerprint, OutgoingSource::Reply).await
+    let Some(outgoing) = prepare_outgoing_with_semantic_preview(
+        reply_ticket,
+        fingerprint,
+        OutgoingSource::Reply,
+        Some(content),
+    )
+    .await
     else {
+        return false;
+    };
+    let Ok(precommit) = begin_outgoing_commit(outgoing).await else {
+        mark_outgoing_failed(outgoing).await;
         return false;
     };
     let authorization = match destination {
@@ -267,7 +286,7 @@ pub(crate) async fn send_tracked_reply_text(
         }
         MessageDestination::Private(_) => None,
     };
-    let Some(committed) = commit_outgoing_guard(outgoing).await else {
+    let Ok(committed) = precommit.commit(fingerprint, None).await else {
         mark_outgoing_failed(outgoing).await;
         return false;
     };
@@ -281,7 +300,11 @@ pub(crate) async fn send_tracked_reply_text(
             record_committed_bot_message(scope, reply_ticket, message_id, content).await
         }
         Err(error) => {
-            committed.mark_failed().await;
+            if error.is_indeterminate() {
+                drop(committed);
+            } else {
+                committed.mark_failed().await;
+            }
             match destination {
                 MessageDestination::Group(group_id) => {
                     eprintln!("[ERROR] 群聊回复发送失败 (群组: {}): {:?}", group_id, error)

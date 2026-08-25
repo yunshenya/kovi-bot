@@ -586,6 +586,13 @@ pub enum ActionPortOutcome {
         message_id: Option<MessageId>,
         conversation_id: Option<ConversationId>,
     },
+    /// The adapter crossed an irreversible delivery boundary but cannot prove
+    /// whether the platform accepted the side effect. This is terminal for
+    /// automatic replay, but it is not successful delivery.
+    DeliveryIndeterminate {
+        reason: String,
+        conversation_id: Option<ConversationId>,
+    },
     ToolCompleted {
         operation: String,
         output: String,
@@ -686,7 +693,14 @@ struct ArbiterState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct AdmittedAction {
     action_id: ActionId,
-    delivered: bool,
+    terminal: Option<AdmittedTerminal>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AdmittedTerminal {
+    Succeeded,
+    Indeterminate,
+    Failed,
 }
 
 /// Validates and dispatches proposed actions without knowing a platform API.
@@ -906,16 +920,16 @@ impl ActionArbiter {
         }
 
         if state.admitted_keys.len() >= MAX_TRACKED_ACTION_KEYS {
-            let Some(delivered_index) = state.admitted_key_order.iter().position(|candidate| {
+            let Some(terminal_index) = state.admitted_key_order.iter().position(|candidate| {
                 state
                     .admitted_keys
                     .get(candidate)
-                    .is_some_and(|admitted| admitted.delivered)
+                    .is_some_and(|admitted| admitted.terminal.is_some())
             }) else {
                 return Err(ActionRejection::IdempotencyStateFull { action_id });
             };
-            if let Some(oldest_delivered) = state.admitted_key_order.remove(delivered_index) {
-                state.admitted_keys.remove(&oldest_delivered);
+            if let Some(oldest_terminal) = state.admitted_key_order.remove(terminal_index) {
+                state.admitted_keys.remove(&oldest_terminal);
             }
         }
         let key = key.to_owned();
@@ -923,7 +937,7 @@ impl ActionArbiter {
             key.clone(),
             AdmittedAction {
                 action_id: action_id.unwrap_or_default(),
-                delivered: false,
+                terminal: None,
             },
         );
         state.admitted_key_order.push_back(key.clone());
@@ -941,7 +955,7 @@ impl ActionArbiter {
         })
     }
 
-    fn mark_delivered(&self, receipt: &ActionReceipt) {
+    fn mark_terminal(&self, receipt: &ActionReceipt, terminal: AdmittedTerminal) {
         let (Some(key), Some(action_id)) = (&receipt.idempotency_key, receipt.action_id) else {
             return;
         };
@@ -952,7 +966,7 @@ impl ActionArbiter {
         if let Some(admitted) = state.admitted_keys.get_mut(key)
             && admitted.action_id == action_id
         {
-            admitted.delivered = true;
+            admitted.terminal = Some(terminal);
         }
     }
 
@@ -976,17 +990,18 @@ impl ActionArbiter {
         }
     }
 
-    pub(crate) fn was_delivered(
+    pub(crate) fn terminal_outcome(
         &self,
         idempotency_key: &str,
         original_action_id: ActionId,
-    ) -> bool {
+    ) -> Option<AdmittedTerminal> {
         self.state
             .lock()
             .expect("action arbiter state lock poisoned")
             .admitted_keys
             .get(idempotency_key)
-            .is_some_and(|admitted| admitted.action_id == original_action_id && admitted.delivered)
+            .filter(|admitted| admitted.action_id == original_action_id)
+            .and_then(|admitted| admitted.terminal)
     }
 
     /// Dispatches using the current wall clock.
@@ -1038,10 +1053,17 @@ impl ActionArbiter {
         match port.execute(&action).await {
             Ok(
                 outcome @ (ActionPortOutcome::Delivered { .. }
-                | ActionPortOutcome::ToolCompleted { .. }
-                | ActionPortOutcome::ToolFailed { .. }),
+                | ActionPortOutcome::ToolCompleted { .. }),
             ) => {
-                self.mark_delivered(&receipt);
+                self.mark_terminal(&receipt, AdmittedTerminal::Succeeded);
+                ActionResult::Executed { receipt, outcome }
+            }
+            Ok(outcome @ ActionPortOutcome::DeliveryIndeterminate { .. }) => {
+                self.mark_terminal(&receipt, AdmittedTerminal::Indeterminate);
+                ActionResult::Executed { receipt, outcome }
+            }
+            Ok(outcome @ ActionPortOutcome::ToolFailed { .. }) => {
+                self.mark_terminal(&receipt, AdmittedTerminal::Failed);
                 ActionResult::Executed { receipt, outcome }
             }
             Ok(outcome @ ActionPortOutcome::Deferred { .. }) => {
@@ -1049,7 +1071,11 @@ impl ActionArbiter {
                 ActionResult::Executed { receipt, outcome }
             }
             Err(error) => {
-                self.release_reservation(&receipt);
+                if error.retryable {
+                    self.release_reservation(&receipt);
+                } else {
+                    self.mark_terminal(&receipt, AdmittedTerminal::Failed);
+                }
                 ActionResult::Failed { receipt, error }
             }
         }
@@ -1295,7 +1321,7 @@ mod tests {
             if index == 0 {
                 oldest_receipt = Some(receipt.clone());
             }
-            arbiter.mark_delivered(&receipt);
+            arbiter.mark_terminal(&receipt, AdmittedTerminal::Succeeded);
         }
 
         arbiter
@@ -1356,6 +1382,125 @@ mod tests {
                 })
             })
         }
+    }
+
+    struct IndeterminatePort {
+        calls: AtomicUsize,
+    }
+
+    impl ActionPort for IndeterminatePort {
+        fn execute<'a>(&'a self, _action: &'a ProposedAction) -> ActionPortFuture<'a> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {
+                Ok(ActionPortOutcome::DeliveryIndeterminate {
+                    reason: "transport outcome unknown".to_owned(),
+                    conversation_id: None,
+                })
+            })
+        }
+    }
+
+    struct FailingPort {
+        calls: AtomicUsize,
+        retryable: bool,
+    }
+
+    impl ActionPort for FailingPort {
+        fn execute<'a>(&'a self, _action: &'a ProposedAction) -> ActionPortFuture<'a> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let retryable = self.retryable;
+            Box::pin(async move { Err(ActionPortError::new("adapter_failure", retryable)) })
+        }
+    }
+
+    #[tokio::test]
+    async fn indeterminate_delivery_is_terminal_without_being_successful() {
+        let now = Utc::now();
+        let action = send_with_key(ConversationId::new(), "terminal-unknown", now);
+        let action_id = action.action_id().expect("message action has an id");
+        let arbiter = ActionArbiter::new(
+            ActionArbiterConfig::default().with_capabilities(EnvironmentCapabilities::all()),
+        );
+        let port = IndeterminatePort {
+            calls: AtomicUsize::new(0),
+        };
+
+        let first = arbiter.dispatch_at(action.clone(), &port, now).await;
+        assert!(matches!(
+            first,
+            ActionResult::Executed {
+                outcome: ActionPortOutcome::DeliveryIndeterminate { .. },
+                ..
+            }
+        ));
+        assert!(!first.is_success());
+        assert_eq!(
+            arbiter.terminal_outcome("terminal-unknown", action_id),
+            Some(AdmittedTerminal::Indeterminate)
+        );
+        assert!(matches!(
+            arbiter.dispatch_at(action, &port, now).await,
+            ActionResult::Rejected(ActionRejection::Duplicate { .. })
+        ));
+        assert_eq!(port.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn only_retryable_port_errors_release_the_idempotency_reservation() {
+        let now = Utc::now();
+        let action = send_with_key(ConversationId::new(), "port-error-policy", now);
+        let action_id = action.action_id().expect("message action has an id");
+        let arbiter = ActionArbiter::new(
+            ActionArbiterConfig::default().with_capabilities(EnvironmentCapabilities::all()),
+        );
+        let terminal = FailingPort {
+            calls: AtomicUsize::new(0),
+            retryable: false,
+        };
+
+        assert!(matches!(
+            arbiter.dispatch_at(action.clone(), &terminal, now).await,
+            ActionResult::Failed {
+                error: ActionPortError {
+                    retryable: false,
+                    ..
+                },
+                ..
+            }
+        ));
+        assert_eq!(
+            arbiter.terminal_outcome("port-error-policy", action_id),
+            Some(AdmittedTerminal::Failed)
+        );
+        assert!(matches!(
+            arbiter.dispatch_at(action.clone(), &terminal, now).await,
+            ActionResult::Rejected(ActionRejection::Duplicate { .. })
+        ));
+        assert_eq!(terminal.calls.load(Ordering::SeqCst), 1);
+
+        let retryable_action =
+            send_with_key(ConversationId::new(), "retryable-port-error-policy", now);
+        let retryable = FailingPort {
+            calls: AtomicUsize::new(0),
+            retryable: true,
+        };
+        assert!(matches!(
+            arbiter
+                .dispatch_at(retryable_action.clone(), &retryable, now)
+                .await,
+            ActionResult::Failed {
+                error: ActionPortError {
+                    retryable: true,
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(matches!(
+            arbiter.dispatch_at(retryable_action, &retryable, now).await,
+            ActionResult::Failed { .. }
+        ));
+        assert_eq!(retryable.calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

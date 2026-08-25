@@ -508,6 +508,35 @@ impl WorkingState {
         Ok(removed_conversations.len())
     }
 
+    /// Removes all retained runtime context for canonical conversations.
+    /// Advancing the global version invalidates snapshots captured before the
+    /// FIFO erasure barrier even when no other conversation is affected.
+    pub(crate) fn purge_conversation_domains(
+        &mut self,
+        conversation_ids: &[ConversationId],
+    ) -> Result<usize, WorkingStateError> {
+        let removed: Vec<_> = conversation_ids
+            .iter()
+            .copied()
+            .filter(|conversation_id| self.conversations.contains_key(conversation_id))
+            .collect();
+        if removed.is_empty() {
+            return Ok(0);
+        }
+        let next_global_version = self
+            .global
+            .version
+            .checked_add(1)
+            .ok_or(WorkingStateError::VersionExhausted)?;
+        for conversation_id in &removed {
+            self.conversations.remove(conversation_id);
+        }
+        self.conversation_order
+            .retain(|candidate| !removed.contains(candidate));
+        self.global.version = next_global_version;
+        Ok(removed.len())
+    }
+
     #[must_use]
     pub fn conversation(&self, id: ConversationId) -> Option<ConversationSnapshot> {
         self.conversations

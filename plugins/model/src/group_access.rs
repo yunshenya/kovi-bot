@@ -674,9 +674,13 @@ fn apply_admins(
 #[cfg(test)]
 mod tests {
     use super::{
-        AuthorizationCommand, command_requires_main_admin, is_authorization_command,
-        normalize_admins, normalize_groups, parse_command,
+        AuthorizationCommand, GroupAccessState, STATE, authorize_group_send,
+        command_requires_main_admin, is_authorization_command, normalize_admins, normalize_groups,
+        parse_command,
     };
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     #[test]
     fn parses_allowlist_commands_without_prefix_injection() {
@@ -760,5 +764,58 @@ mod tests {
         assert!(normalize_admins(vec![0], 99).is_err());
         assert!(normalize_admins(vec![-1], 99).is_err());
         assert!(normalize_admins(vec![99], 99).is_err());
+    }
+
+    #[test]
+    fn group_send_authorization_pins_the_snapshot_until_commit() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let group_id = 9_120_001;
+                let groups = BTreeSet::from([group_id]);
+                *STATE.lock().await = Some(GroupAccessState {
+                    plugin_name: "test".to_string(),
+                    friends: BTreeSet::new(),
+                    configured_admins: BTreeSet::new(),
+                    groups,
+                    admins: BTreeSet::new(),
+                    main_admin: 9_120_002,
+                });
+
+                let authorization = authorize_group_send(group_id)
+                    .await
+                    .expect("发送应取得授权快照");
+                let revoked = Arc::new(AtomicBool::new(false));
+                let revoked_in_task = Arc::clone(&revoked);
+                let revoke = kovi::tokio::spawn(async move {
+                    let mut state = STATE.lock().await;
+                    state
+                        .as_mut()
+                        .expect("测试授权状态应存在")
+                        .groups
+                        .remove(&group_id);
+                    revoked_in_task.store(true, Ordering::Release);
+                });
+                kovi::tokio::task::yield_now().await;
+                assert!(!revoked.load(Ordering::Acquire));
+
+                drop(authorization);
+                revoke.await.expect("撤销任务应完成");
+                assert!(revoked.load(Ordering::Acquire));
+                assert!(
+                    authorize_group_send(group_id).await.is_err(),
+                    "a fresh pre-effect authorization must observe revocation"
+                );
+                assert!(
+                    !STATE
+                        .lock()
+                        .await
+                        .as_ref()
+                        .expect("测试授权状态应存在")
+                        .groups
+                        .contains(&group_id)
+                );
+                *STATE.lock().await = None;
+            });
     }
 }

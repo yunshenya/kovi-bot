@@ -6,7 +6,9 @@ use crate::model::coalesce::{MessageCoalescer, MessagePart};
 use crate::model::conversation_coordinator::{
     ConversationCoordinator, IncomingAdmission, OutgoingExecutiveDecision, PendingTurn,
 };
-use crate::model::interrupt::{ReplyScope, ReplyTicket, is_active, scope_mutex};
+use crate::model::interrupt::{
+    ReplyScope, ReplyTicket, clear_reply_state_locked, is_active, scope_mutex,
+};
 use crate::model::recall::{
     clear_reply_scope_locked, has_recalled_messages, is_recent_bot_message,
     recent_bot_message_for_reaction, send_tracked_group_message,
@@ -173,6 +175,7 @@ struct DirectTriggerState {
 static DIRECT_TRIGGER_STATES: LazyLock<Mutex<HashMap<(i64, i64), DirectTriggerState>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+#[allow(dead_code)]
 pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>) {
     if event.user_id == event.self_id {
         println!(
@@ -181,8 +184,10 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
         );
         return;
     }
-    let admission = ConversationCoordinator::begin_incoming(ReplyScope::Group(event.group_id)).await;
+    let admission =
+        ConversationCoordinator::begin_incoming(ReplyScope::Group(event.group_id)).await;
     group_message_event_after_ingress(event, bot, admission).await;
+    ConversationCoordinator::abandon_incoming(admission).await;
 }
 
 pub(crate) async fn group_message_event_after_ingress(
@@ -673,10 +678,7 @@ pub(crate) async fn group_message_event_after_ingress(
     } else {
         MessageUnderstanding::default()
     };
-    crate::yunxi::events::project_interaction_cues(
-        event.user_id,
-        understanding.interaction_cues(),
-    );
+    crate::yunxi::events::project_interaction_cues(event.user_id, understanding.interaction_cues());
     let asks_for_silence = plain_text && (understanding.wants_no_reply || understanding.wants_stop);
     if asks_for_silence {
         if sampled_for_interjection {
@@ -771,12 +773,8 @@ pub(crate) async fn group_message_event_after_ingress(
     let direct_reply_expected = primary_reply_expected
         || continue_conversation
         || (sampled_for_interjection && understanding.interjection_worthy);
-    let Some(admission) = admit_understood_group_turn(
-        initial_admission,
-        &understanding,
-        direct_reply_expected,
-    )
-    .await
+    let Some(admission) =
+        admit_understood_group_turn(initial_admission, &understanding, direct_reply_expected).await
     else {
         println!(
             "[INFO] 群聊语义决定已过期，丢弃旧批次 (群组: {}, 消息: {:?})",
@@ -1008,7 +1006,7 @@ async fn delete_group_data(group_id: i64, bot: &RuntimeBot) {
             .cancel_where(|(candidate_group_id, _)| *candidate_group_id == group_id)
             .await;
         PENDING_WINDOW_MESSAGES.lock().await.remove(&group_id);
-        clear_reply_scope_locked(scope).await;
+        clear_group_erasure_reply_state_locked(scope).await;
     }
     GROUP_INTERJECTION_STATE.lock().await.remove(&group_id);
     DIRECT_TRIGGER_STATES
@@ -1019,37 +1017,97 @@ async fn delete_group_data(group_id: i64, bot: &RuntimeBot) {
     clear_reply_targets(scope).await;
     clear_group_pending_image_requests(group_id).await;
 
+    let core_erasure = match crate::yunxi::begin_qq_group_data_erasure(group_id).await {
+        Ok(erasure) => erasure,
+        Err(error) => {
+            eprintln!(
+                "[ERROR] 无法建立群 Core 数据删除屏障 (群组: {}): {}",
+                group_id, error
+            );
+            send_group_erasure_receipt(
+                bot,
+                group_id,
+                "群数据删除未开始：Core 删除屏障不可用，请稍后重试或让管理员检查日志。",
+            )
+            .await;
+            return;
+        }
+    };
+
     let memory_result = MEMORY_MANAGER.delete_group_data(group_id).await;
     let sticker_result = sticker_memory::delete_group_data(group_id).await;
     let reminder_result = reminders::delete_group_data(group_id).await;
     let agent_goal_result = crate::agent_runtime::delete_group_data(group_id).await;
+    let core_result = crate::yunxi::delete_qq_group_domain_data(group_id).await;
+    let barrier_result = core_erasure.finish().await;
     match (
         memory_result,
         sticker_result,
         reminder_result,
         agent_goal_result,
+        core_result,
+        barrier_result,
     ) {
-        (Ok(memory_rows), Ok(sticker_rows), Ok(reminder_rows), Ok(agent_goal_rows)) => {
-            send_tracked_group_message(
+        (
+            Ok(memory_rows),
+            Ok(sticker_rows),
+            Ok(reminder_rows),
+            Ok(agent_goal_rows),
+            Ok(core_rows),
+            Ok(()),
+        ) => {
+            send_group_erasure_receipt(
                 bot,
                 group_id,
                 format!(
-                    "本群可归属数据已删除（记忆/档案/摘要 {memory_rows} 项，表情记忆 {sticker_rows} 项，提醒 {reminder_rows} 项，角色目标 {agent_goal_rows} 项）。"
+                    "本群可归属数据已删除（记忆/档案/摘要 {memory_rows} 项，表情记忆 {sticker_rows} 项，提醒 {reminder_rows} 项，角色目标 {agent_goal_rows} 项，Core 数据 {core_rows} 项）。"
                 ),
             )
             .await;
         }
-        (memory, stickers, reminders, agent_goals) => {
+        (memory, stickers, reminders, agent_goals, core, barrier) => {
             eprintln!(
-                "[ERROR] 群数据删除未完全成功 (群组: {}, 记忆: {:?}, 表情: {:?}, 提醒: {:?}, 角色目标: {:?})",
-                group_id, memory, stickers, reminders, agent_goals
+                "[ERROR] 群数据删除未完全成功 (群组: {}, 记忆: {:?}, 表情: {:?}, 提醒: {:?}, 角色目标: {:?}, Core: {:?}, 屏障恢复: {:?})",
+                group_id, memory, stickers, reminders, agent_goals, core, barrier
             );
-            send_tracked_group_message(
+            send_group_erasure_receipt(
                 bot,
                 group_id,
                 "群数据删除没有全部完成，请稍后重试或让管理员检查日志。",
             )
             .await;
+        }
+    }
+}
+
+async fn clear_group_erasure_reply_state_locked(scope: ReplyScope) {
+    clear_reply_state_locked(scope).await;
+    clear_reply_scope_locked(scope).await;
+}
+
+const fn group_erasure_receipt_destination(group_id: i64) -> crate::model::MessageDestination {
+    crate::model::MessageDestination::Group(group_id)
+}
+
+async fn send_group_erasure_receipt(
+    bot: &RuntimeBot,
+    group_id: i64,
+    content: impl Into<String>,
+) -> bool {
+    match crate::model::send_tracked_unrecorded_plain_text(
+        bot,
+        group_erasure_receipt_destination(group_id),
+        content.into(),
+    )
+    .await
+    {
+        Ok(_) => true,
+        Err(error) => {
+            eprintln!(
+                "[ERROR] 群数据删除回执发送失败 (群组: {}): {}",
+                group_id, error
+            );
+            false
         }
     }
 }
@@ -1327,8 +1385,9 @@ fn roll_conversation_window(
 fn should_queue_after_executive(
     active_or_queued: bool,
     decision: OutgoingExecutiveDecision,
+    preserved_prepared: bool,
 ) -> bool {
-    active_or_queued && decision == OutgoingExecutiveDecision::Keep
+    preserved_prepared || (active_or_queued && decision == OutgoingExecutiveDecision::Keep)
 }
 
 async fn admit_understood_group_turn(
@@ -1338,10 +1397,7 @@ async fn admit_understood_group_turn(
 ) -> Option<IncomingAdmission> {
     ConversationCoordinator::refine_current_incoming(
         initial,
-        ConversationCoordinator::context_for_understood_turn(
-            understanding,
-            direct_reply_expected,
-        ),
+        ConversationCoordinator::context_for_understood_turn(understanding, direct_reply_expected),
     )
     .await
 }
@@ -1399,7 +1455,11 @@ async fn claim_or_queue_group_reply(
         .await
         .get(&group_id)
         .is_some_and(|queue| !queue.is_empty());
-    if should_queue_after_executive(active || has_queued, admission.decision) {
+    if should_queue_after_executive(
+        active || has_queued,
+        admission.decision,
+        admission.preserved_prepared,
+    ) {
         println!(
             "[INFO] 群聊已有回复或排队消息进行中，排队窗口消息 (群组: {}, 用户: {})",
             group_id, user_id
@@ -1783,20 +1843,24 @@ async fn update_group_profile(group_id: i64, user_id: i64, understanding: &Messa
 mod tests {
     use super::{
         Addressing, DirectTriggerState, GroupInterjectionState, GroupSenderIdentity,
-        PENDING_WINDOW_MESSAGES, admit_understood_group_turn, complete_interjection_attempt,
+        PENDING_WINDOW_MESSAGES, admit_understood_group_turn,
+        clear_group_erasure_reply_state_locked, complete_interjection_attempt,
         conversation_message_is_relevant, decision_budget_available,
-        has_active_conversation_window, is_natural_short_follow_up,
-        looks_like_immediate_stop_request, message_at_self, normalized_sender_name,
-        prune_decision_attempts, queue_pending_window_message, roll_conversation_window,
-        should_queue_after_executive, sticker_reaction_budget_available, suppress_direct_trigger,
-        take_pending_window_turn, text_mentions_bot, with_structured_bot_mention_context,
+        group_erasure_receipt_destination, has_active_conversation_window,
+        is_natural_short_follow_up, looks_like_immediate_stop_request, message_at_self,
+        normalized_sender_name, prune_decision_attempts, queue_pending_window_message,
+        roll_conversation_window, should_queue_after_executive, sticker_reaction_budget_available,
+        suppress_direct_trigger, take_pending_window_turn, text_mentions_bot,
+        with_structured_bot_mention_context,
     };
+    use crate::model::MessageDestination;
     use crate::model::conversation_coordinator::{
         ConversationCoordinator, OutgoingExecutiveDecision,
     };
     use crate::model::interrupt::{
-        OutgoingSource, ReplyScope, commit_outgoing, interrupt, interrupt_locked, is_current,
-        mark_active, mark_outgoing_failed, outgoing_fingerprint, prepare_outgoing, scope_mutex,
+        OutgoingSource, OutgoingState, ReplyScope, commit_outgoing, interrupt, interrupt_locked,
+        is_current, is_scope_epoch_current, mark_active, mark_outgoing_failed,
+        outgoing_fingerprint, prepare_outgoing, scope_mutex, test_outgoing_state,
     };
     use crate::model::semantic::MessageUnderstanding;
     use crate::model::utils::{is_group_admin_command, is_restricted_command};
@@ -1805,6 +1869,29 @@ mod tests {
     use kovi::bot::message::Segment;
     use kovi::serde_json::json;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn group_erasure_rotates_scope_epoch_and_uses_an_unrecorded_group_receipt() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let group_id = 9_120_001;
+                let scope = ReplyScope::Group(group_id);
+                let erased = interrupt(scope).await;
+                let lock = scope_mutex(scope);
+                let guard = lock.lock().await;
+                clear_group_erasure_reply_state_locked(scope).await;
+                drop(guard);
+                let replacement = interrupt(scope).await;
+
+                assert!(!is_scope_epoch_current(erased).await);
+                assert!(is_scope_epoch_current(replacement).await);
+                assert_eq!(
+                    group_erasure_receipt_destination(group_id),
+                    MessageDestination::Group(group_id)
+                );
+            });
+    }
 
     #[test]
     fn structured_at_segments_identify_only_the_bot_account() {
@@ -2322,18 +2409,25 @@ mod tests {
     fn executive_keep_queues_behind_active_work_but_other_decisions_regenerate() {
         assert!(should_queue_after_executive(
             true,
-            OutgoingExecutiveDecision::Keep
+            OutgoingExecutiveDecision::Keep,
+            false,
         ));
         for decision in [
             OutgoingExecutiveDecision::Rewrite,
             OutgoingExecutiveDecision::Merge,
             OutgoingExecutiveDecision::Defer,
         ] {
-            assert!(!should_queue_after_executive(true, decision));
+            assert!(!should_queue_after_executive(true, decision, false));
         }
         assert!(!should_queue_after_executive(
             false,
-            OutgoingExecutiveDecision::Keep
+            OutgoingExecutiveDecision::Keep,
+            false,
+        ));
+        assert!(should_queue_after_executive(
+            false,
+            OutgoingExecutiveDecision::Keep,
+            true,
         ));
     }
 
@@ -2353,17 +2447,48 @@ mod tests {
                 .await
                 .expect("reply should prepare during semantic work");
 
-                let refined = admit_understood_group_turn(
-                    initial,
-                    &MessageUnderstanding::default(),
-                    false,
-                )
-                .await
-                .expect("ingress should remain current");
+                let refined =
+                    admit_understood_group_turn(initial, &MessageUnderstanding::default(), false)
+                        .await
+                        .expect("ingress should remain current");
 
                 assert_eq!(refined.decision, OutgoingExecutiveDecision::Keep);
                 assert!(commit_outgoing(outgoing).await);
                 mark_outgoing_failed(outgoing).await;
+            });
+    }
+
+    #[test]
+    fn production_group_semantic_helper_merges_by_regenerating() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let scope = ReplyScope::Group(9_340_002);
+                let initial = ConversationCoordinator::begin_incoming(scope).await;
+                assert!(mark_active(initial.ticket).await);
+                let outgoing = prepare_outgoing(
+                    initial.ticket,
+                    outgoing_fingerprint("reply before compatible follow-up"),
+                    OutgoingSource::Reply,
+                )
+                .await
+                .expect("reply should prepare during semantic work");
+                let understanding = MessageUnderstanding {
+                    conversation_relevant: true,
+                    ..MessageUnderstanding::default()
+                };
+
+                let refined = admit_understood_group_turn(initial, &understanding, true)
+                    .await
+                    .expect("ingress should remain current");
+
+                assert_eq!(refined.decision, OutgoingExecutiveDecision::Merge);
+                assert_ne!(refined.ticket, initial.ticket);
+                assert_eq!(
+                    test_outgoing_state(outgoing).await,
+                    Some(OutgoingState::Superseded)
+                );
+                assert!(!commit_outgoing(outgoing).await);
             });
     }
 

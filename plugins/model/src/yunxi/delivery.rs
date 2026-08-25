@@ -5,29 +5,36 @@
 //! Kovi API calls. Legacy proactive-chat delivery remains below as a small
 //! compatibility helper; new actions use [`QqActionAdapter`].
 
+use super::core_model::HostToolTurnRegistry;
+use super::delivery_ledger::{
+    DeliveryActionKind, DeliveryAttempt, DeliveryCommitError, DeliveryCommitOutcome,
+    DeliveryDestinationKind, DeliveryStatus, DeliveryTarget, PostgresDeliveryLedger,
+};
 use super::identity_store::PostgresIdentityStore;
-use super::qq;
+use crate::model::tool_access::{
+    ToolEffectRevalidationFuture, ToolEffectRevalidator, ToolRegistry,
+};
 use crate::model::{
     MessageDestination, MessageTransport, OutgoingCommitRejection, OutgoingSource, OutgoingToken,
-    ReplyScope, ToolExecutionContext, commit_outgoing_guard_with_context,
-    contextual_outgoing_fingerprint, find_prepared_outgoing, finish, interrupt, mark_active,
-    mark_outgoing_failed, outgoing_fingerprint, prepare_outgoing, record_standalone_bot_message,
-    send_tracked_private_message, tool_registry,
+    ReplyScope, ToolExecutionContext, begin_outgoing_commit, contextual_outgoing_fingerprint,
+    find_prepared_outgoing, finish, is_current, mark_active, mark_outgoing_failed,
+    outgoing_fingerprint, prepare_proactive_outgoing_if_idle_with_semantic_preview,
+    record_standalone_bot_message, send_tracked_message_with_revalidation_guard, tool_registry,
 };
 use kovi::bot::message::Segment;
 use kovi::serde_json::json;
 use kovi::tokio::sync::Mutex;
 use kovi::{Message, RuntimeBot};
+use sha2::{Digest, Sha256};
 use std::fmt;
 use std::sync::Arc;
 use thiserror::Error;
 use yunxi_core::{
     ActionPort, ActionPortError, ActionPortFuture, ActionPortOutcome, ActionScope, ConversationId,
     ConversationKind, ConversationMemberStore, DeliveryResolutionError, DeliveryResolver,
-    DeliveryResolverFuture, DeliveryRoute, GoalState, GoalStore, IdentityStore, MessageContent,
+    DeliveryResolverFuture, DeliveryRoute, GoalState, GoalStore, MAX_TOOL_ERROR_DETAIL_BYTES,
+    MAX_TOOL_ERROR_DETAIL_CHARS, MAX_TOOL_RESULT_BYTES, MAX_TOOL_RESULT_CHARS, MessageContent,
     MessageId, OpenLoopStore, ProposedAction, ReachOutIntent, ToolAction,
-    MAX_TOOL_ERROR_DETAIL_BYTES, MAX_TOOL_ERROR_DETAIL_CHARS, MAX_TOOL_RESULT_BYTES,
-    MAX_TOOL_RESULT_CHARS,
 };
 
 /// Concrete QQ destination after a canonical Core conversation has been
@@ -45,6 +52,22 @@ enum DeliveryRevalidationTarget {
     Person(yunxi_core::PersonId),
 }
 
+impl DeliveryRevalidationTarget {
+    const fn ledger_action_kind(self) -> DeliveryActionKind {
+        match self {
+            Self::Conversation(_) => DeliveryActionKind::SendMessage,
+            Self::Person(_) => DeliveryActionKind::ReachOut,
+        }
+    }
+
+    const fn ledger_target(self) -> DeliveryTarget {
+        match self {
+            Self::Conversation(conversation_id) => DeliveryTarget::Conversation(conversation_id),
+            Self::Person(person_id) => DeliveryTarget::Person(person_id),
+        }
+    }
+}
+
 impl QqDestination {
     fn message_destination(self) -> MessageDestination {
         match self {
@@ -58,6 +81,47 @@ impl QqDestination {
             Self::Group(group_id) => crate::model::ReplyScope::Group(group_id),
             Self::Private(user_id) => crate::model::ReplyScope::Private(user_id),
         }
+    }
+
+    const fn ledger_kind(self) -> DeliveryDestinationKind {
+        match self {
+            Self::Group(_) => DeliveryDestinationKind::Group,
+            Self::Private(_) => DeliveryDestinationKind::Private,
+        }
+    }
+
+    const fn external_id(self) -> i64 {
+        match self {
+            Self::Group(group_id) => group_id,
+            Self::Private(user_id) => user_id,
+        }
+    }
+}
+
+struct QqSendContext<'a> {
+    revalidation_target: DeliveryRevalidationTarget,
+    expected_destination: QqDestination,
+    content: &'a MessageContent,
+    reply_to: Option<MessageId>,
+    expected_conversation_id: ConversationId,
+    idempotency_key: &'a str,
+    outgoing: OutgoingToken,
+}
+
+#[derive(Clone)]
+struct CoreToolEffectRevalidator {
+    adapter: QqActionAdapter,
+    registry: Arc<ToolRegistry>,
+    action: ToolAction,
+    ticket: crate::model::ReplyTicket,
+    expected_actor_user_id: i64,
+    expected_conversation_id: ConversationId,
+    expected_destination: QqDestination,
+}
+
+impl ToolEffectRevalidator for CoreToolEffectRevalidator {
+    fn revalidate(&self) -> ToolEffectRevalidationFuture<'_> {
+        Box::pin(async move { self.adapter.revalidate_tool_effect(self).await })
     }
 }
 
@@ -84,8 +148,10 @@ impl QqAdapterFailure {
 pub(crate) struct QqActionAdapter {
     bot: Arc<RuntimeBot>,
     identity_store: Arc<PostgresIdentityStore>,
+    delivery_ledger: Arc<PostgresDeliveryLedger>,
     open_loop_store: Arc<dyn OpenLoopStore>,
     goal_store: Arc<dyn GoalStore>,
+    tool_turns: Arc<HostToolTurnRegistry>,
     /// Login info is stable for a running Kovi bot. Cache it after the first
     /// successful lookup, but leave it unset when the API is temporarily down
     /// so a later action can retry.
@@ -110,14 +176,138 @@ impl QqActionAdapter {
         identity_store: Arc<PostgresIdentityStore>,
         open_loop_store: Arc<dyn OpenLoopStore>,
         goal_store: Arc<dyn GoalStore>,
+        tool_turns: Arc<HostToolTurnRegistry>,
     ) -> Arc<Self> {
+        let delivery_ledger = super::delivery_ledger()
+            .expect("Yunxi delivery ledger must be initialized before the action adapter");
         Arc::new(Self {
             bot,
             identity_store,
+            delivery_ledger,
             open_loop_store,
             goal_store,
+            tool_turns,
             self_id: Arc::new(Mutex::new(None)),
         })
+    }
+
+    async fn resolve_tool_actor_user_id(
+        &self,
+        actor: yunxi_core::PersonId,
+    ) -> Result<i64, ActionPortError> {
+        self.identity_store
+            .qq_external_identity_for_delivery(actor)
+            .await
+            .map_err(|error| {
+                ActionPortError::new(format!("tool_actor_lookup_failed:{error}"), true)
+            })?
+            .and_then(|value| parse_positive_i64(&value))
+            .ok_or_else(|| ActionPortError::new("tool_actor_route_unavailable", false))
+    }
+
+    async fn revalidate_tool_effect(
+        &self,
+        binding: &CoreToolEffectRevalidator,
+    ) -> Result<ToolExecutionContext, String> {
+        let actor = binding
+            .action
+            .actor()
+            .ok_or_else(|| "tool_actor_required".to_string())?;
+        let route_guard = crate::yunxi::pin_delivery_routes().await;
+        let actor_user_id = self
+            .resolve_tool_actor_user_id(actor)
+            .await
+            .map_err(|error| error.to_string())?;
+        if actor_user_id != binding.expected_actor_user_id {
+            return Err("tool_actor_route_changed_at_effect_boundary".to_string());
+        }
+        if let ActionScope::Conversation(conversation_id) = binding.action.scope {
+            match self.identity_store.get(conversation_id, actor).await {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    return Err("tool_scope_membership_revoked_at_effect_boundary".to_string());
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "tool_scope_membership_effect_revalidation_failed:{error}"
+                    ));
+                }
+            }
+        }
+        let current_route = match binding.action.scope {
+            ActionScope::Conversation(conversation_id) => self
+                .resolve_conversation_destination_without_authorization(conversation_id)
+                .await
+                .map(|destination| (conversation_id, destination))
+                .map_err(|error| error.to_string())?,
+            ActionScope::Person(person_id) => self
+                .resolve_person_destination(person_id)
+                .await
+                .map(|(route, destination)| (route.conversation_id, destination))
+                .map_err(|error| error.to_string())?,
+            ActionScope::Global => return Err("global_tool_scope_rejected".to_string()),
+        };
+        if !delivery_route_is_unchanged(
+            binding.expected_conversation_id,
+            binding.expected_destination,
+            Some(current_route),
+        ) {
+            return Err("tool_route_changed_at_effect_boundary".to_string());
+        }
+        let destination = current_route.1;
+        if binding.ticket.scope() != destination.reply_scope() {
+            return Err("tool_ticket_route_mismatch_at_effect_boundary".to_string());
+        }
+        let group_authorization = match destination {
+            QqDestination::Group(group_id) => Some(
+                crate::group_access::authorize_group_send(group_id)
+                    .await
+                    .map_err(|error| format!("tool_group_authorization_revoked:{error}"))?,
+            ),
+            QqDestination::Private(_) => None,
+        };
+        let configured_owner = crate::config::get().identity().owner_person_id();
+        let is_main_admin = configured_owner.is_some_and(|owner| owner == actor.into_uuid())
+            || (configured_owner.is_none()
+                && self
+                    .bot
+                    .get_main_admin()
+                    .ok()
+                    .is_some_and(|main_admin| main_admin == actor_user_id));
+        let group_paused = match destination {
+            QqDestination::Group(group_id) => crate::model::utils::is_group_paused(group_id).await,
+            QqDestination::Private(_) => false,
+        };
+        if !is_current(binding.ticket).await {
+            return Err("tool_turn_stale_at_effect_boundary".to_string());
+        }
+        let context = ToolExecutionContext {
+            subject_id: actor_user_id,
+            actor_user_id,
+            is_admin: is_main_admin,
+            is_main_admin,
+            context: "yunxi_core_tool",
+            destination: destination.message_destination(),
+            source_message_id: None,
+            scheduled: false,
+            group_paused,
+            runtime_bot: Some(Arc::clone(&self.bot)),
+            sticker_teaching: None,
+            requires_reminder_create: false,
+            requires_agent_run_create: false,
+            requires_group_message_send: false,
+            requires_group_followup: false,
+            requires_external_tool: false,
+        };
+        if !binding
+            .registry
+            .available_for_context(&binding.action.tool_name, &context)
+        {
+            return Err("tool_unavailable_in_revalidated_context".to_string());
+        }
+        drop(group_authorization);
+        drop(route_guard);
+        Ok(context)
     }
 
     async fn current_self_id(&self) -> Result<i64, QqAdapterFailure> {
@@ -148,43 +338,23 @@ impl QqActionAdapter {
         &self,
         person_id: yunxi_core::PersonId,
     ) -> Result<(DeliveryRoute, QqDestination), DeliveryResolutionError> {
-        let external_id = self
-            .identity_store
-            .qq_external_identity_for_delivery(person_id)
-            .await
-            .map_err(|error| {
-                DeliveryResolutionError::failed(QqAdapterFailure::new(
-                    "person identity lookup",
-                    error.to_string(),
-                ))
-            })?;
-        let Some(user_id) = external_id
-            .as_deref()
-            .and_then(|value| single_positive_qq_id(&[value.to_owned()]))
-        else {
-            return Err(DeliveryResolutionError::Unavailable { person_id });
-        };
-
         let self_id = self
             .current_self_id()
             .await
             .map_err(DeliveryResolutionError::failed)?;
-        let external = qq::direct(self_id, user_id).map_err(|error| {
-            DeliveryResolutionError::failed(QqAdapterFailure::new(
-                "direct conversation reference",
-                error.to_string(),
-            ))
-        })?;
-        let conversation_id = self
+        let route = self
             .identity_store
-            .resolve_external_conversation(&external)
+            .resolve_qq_direct_for_person_delivery(person_id, self_id)
             .await
             .map_err(|error| {
                 DeliveryResolutionError::failed(QqAdapterFailure::new(
-                    "direct conversation lookup",
+                    "person delivery route lookup",
                     error.to_string(),
                 ))
             })?;
+        let Some((conversation_id, user_id)) = route else {
+            return Err(DeliveryResolutionError::Unavailable { person_id });
+        };
         Ok((
             DeliveryRoute::new(conversation_id, ConversationKind::Direct),
             QqDestination::Private(user_id),
@@ -247,19 +417,36 @@ impl QqActionAdapter {
 
     async fn send_to_destination(
         &self,
-        revalidation_target: DeliveryRevalidationTarget,
-        expected_destination: QqDestination,
-        content: &MessageContent,
-        reply_to: Option<MessageId>,
-        expected_conversation_id: ConversationId,
-        idempotency_key: &str,
-        outgoing: OutgoingToken,
+        context: QqSendContext<'_>,
     ) -> Result<ActionPortOutcome, ActionPortError> {
+        let QqSendContext {
+            revalidation_target,
+            expected_destination,
+            content,
+            reply_to: core_reply_to,
+            expected_conversation_id,
+            idempotency_key,
+            outgoing,
+        } = context;
+        let precommit = match begin_outgoing_commit(outgoing).await {
+            Ok(precommit) => precommit,
+            Err(OutgoingCommitRejection::Stale) => {
+                return Ok(ActionPortOutcome::Deferred {
+                    reason: "outgoing_superseded_before_revalidation".to_string(),
+                });
+            }
+            Err(OutgoingCommitRejection::DuplicateIdempotency) => {
+                return Ok(ActionPortOutcome::DeliveryIndeterminate {
+                    reason: "outgoing_duplicate_idempotency_key".to_string(),
+                    conversation_id: Some(expected_conversation_id),
+                });
+            }
+        };
         // Resolve the optional quote before the final destination check. Quote
         // degradation is stylistic; route and authorization are security
         // boundaries and therefore must be the last awaited lookups before
         // the serialized commit.
-        let reply_to = if let Some(reply_to) = reply_to {
+        let external_reply_to = if let Some(reply_to) = core_reply_to {
             match self
                 .identity_store
                 .qq_message_id_for_core(reply_to, expected_conversation_id)
@@ -291,21 +478,6 @@ impl QqActionAdapter {
             None
         };
         let route_guard = crate::yunxi::pin_delivery_routes().await;
-        let authorization = match expected_destination {
-            QqDestination::Group(group_id) => {
-                match crate::group_access::authorize_group_send(group_id).await {
-                    Ok(authorization) => Some(authorization),
-                    Err(error) => {
-                        mark_outgoing_failed(outgoing).await;
-                        return Err(ActionPortError::new(
-                            format!("group_not_authorized_before_commit:{error}"),
-                            false,
-                        ));
-                    }
-                }
-            }
-            QqDestination::Private(_) => None,
-        };
         let revalidated = match revalidation_target {
             DeliveryRevalidationTarget::Conversation(conversation_id) => self
                 .resolve_conversation_destination_without_authorization(conversation_id)
@@ -328,18 +500,36 @@ impl QqActionAdapter {
                 current
             }
             Ok(_) => {
+                drop(route_guard);
                 mark_outgoing_failed(outgoing).await;
                 return Ok(ActionPortOutcome::Deferred {
                     reason: "delivery_route_changed_before_commit".to_string(),
                 });
             }
             Err(error) => {
+                drop(route_guard);
                 mark_outgoing_failed(outgoing).await;
                 return Err(error);
             }
         };
+        let authorization = match destination {
+            QqDestination::Group(group_id) => {
+                match crate::group_access::authorize_group_send(group_id).await {
+                    Ok(authorization) => Some(authorization),
+                    Err(error) => {
+                        drop(route_guard);
+                        mark_outgoing_failed(outgoing).await;
+                        return Err(ActionPortError::new(
+                            format!("group_not_authorized_before_commit:{error}"),
+                            false,
+                        ));
+                    }
+                }
+            }
+            QqDestination::Private(_) => None,
+        };
         let text = content.as_text();
-        let message = if let Some(reply_to) = reply_to {
+        let message = if let Some(reply_to) = external_reply_to {
             Message::from(vec![
                 Segment::new("reply", json!({"id": reply_to})),
                 Segment::new("text", json!({"text": text})),
@@ -347,53 +537,136 @@ impl QqActionAdapter {
         } else {
             text.to_owned().into()
         };
-        let fingerprint_content = serde_json::to_string(content)
-            .unwrap_or_else(|_| content.as_text().to_owned());
+        let fingerprint_content =
+            serde_json::to_string(content).unwrap_or_else(|_| content.as_text().to_owned());
         let fingerprint = contextual_outgoing_fingerprint(
             destination.reply_scope(),
             &fingerprint_content,
-            reply_to,
+            external_reply_to,
             &[],
             Some(idempotency_key),
         );
-        let committed = match commit_outgoing_guard_with_context(
-            outgoing,
-            fingerprint,
-            Some(idempotency_key),
-        )
-        .await
-        {
+        let durable_attempt = match DeliveryAttempt::new(
+            revalidation_target.ledger_action_kind(),
+            revalidation_target.ledger_target(),
+            conversation_id,
+            destination.ledger_kind(),
+            destination.external_id(),
+            content,
+            core_reply_to,
+            external_reply_to,
+        ) {
+            Ok(attempt) => attempt,
+            Err(error) => {
+                drop(authorization);
+                drop(route_guard);
+                mark_outgoing_failed(outgoing).await;
+                return Err(ActionPortError::new(
+                    format!("durable_delivery_envelope_invalid:{error}"),
+                    false,
+                ));
+            }
+        };
+        let delivery_ticket = outgoing.ticket();
+        let commit_result = precommit.commit(fingerprint, Some(idempotency_key)).await;
+        let committed = match commit_result {
             Ok(committed) => committed,
             Err(OutgoingCommitRejection::Stale) => {
+                drop(authorization);
+                drop(route_guard);
                 return Ok(ActionPortOutcome::Deferred {
                     reason: "outgoing_superseded_before_commit".to_string(),
                 });
             }
             Err(OutgoingCommitRejection::DuplicateIdempotency) => {
-                return Ok(ActionPortOutcome::Deferred {
+                drop(authorization);
+                drop(route_guard);
+                return Ok(ActionPortOutcome::DeliveryIndeterminate {
                     reason: "outgoing_duplicate_idempotency_key".to_string(),
+                    conversation_id: Some(conversation_id),
                 });
             }
         };
+        let durable_commit = self
+            .delivery_ledger
+            .commit_attempt(idempotency_key, &durable_attempt)
+            .await;
         drop(authorization);
         drop(route_guard);
+        let durable_committed = match durable_commit {
+            Ok(DeliveryCommitOutcome::Acquired(committed_delivery)) => committed_delivery,
+            Ok(DeliveryCommitOutcome::AlreadyRecorded {
+                status,
+                external_message_id,
+            }) => {
+                let outcome =
+                    recorded_delivery_outcome(status, external_message_id, conversation_id)?;
+                if matches!(outcome, ActionPortOutcome::Delivered { .. }) {
+                    committed.mark_sent().await;
+                } else {
+                    drop(committed);
+                }
+                return Ok(outcome);
+            }
+            Ok(DeliveryCommitOutcome::EnvelopeConflict) => {
+                committed.mark_failed().await;
+                return Err(ActionPortError::new(
+                    "durable_delivery_key_envelope_conflict",
+                    false,
+                ));
+            }
+            Err(error) => {
+                committed.mark_failed().await;
+                return Err(durable_commit_error(error));
+            }
+        };
         let send_result = MessageTransport::new(&self.bot)
             .send(destination.message_destination(), message)
             .await;
         let message_id = match send_result {
             Ok(message_id) => {
+                if let Err(error) = durable_committed.mark_sent(i64::from(message_id)).await {
+                    // The network side effect is already irreversible. The
+                    // guard records Unknown when possible, while Committed is
+                    // itself a durable replay barrier if PostgreSQL is down.
+                    kovi::log::warn!(
+                        "QQ delivery succeeded but durable Sent persistence failed: {error}"
+                    );
+                }
                 committed.mark_sent().await;
                 message_id
             }
             Err(error) => {
-                committed.mark_failed().await;
+                let indeterminate = error.is_indeterminate();
+                if indeterminate {
+                    if let Err(ledger_error) = durable_committed.mark_unknown().await {
+                        kovi::log::warn!(
+                            "indeterminate QQ delivery could not be marked Unknown: {ledger_error}"
+                        );
+                    }
+                    drop(committed);
+                    return Ok(ActionPortOutcome::DeliveryIndeterminate {
+                        reason: "qq_send_indeterminate".to_owned(),
+                        conversation_id: Some(conversation_id),
+                    });
+                } else {
+                    if let Err(ledger_error) =
+                        durable_committed.mark_failed("qq_transport_rejected").await
+                    {
+                        kovi::log::warn!(
+                            "rejected QQ delivery could not be marked Failed: {ledger_error}"
+                        );
+                    }
+                    committed.mark_failed().await;
+                }
                 return Err(ActionPortError::new(
-                    format!("qq_send_failed:{}", format_api_return(&error)),
+                    format!("qq_send_failed:{error}"),
                     true,
                 ));
             }
         };
-        record_standalone_bot_message(destination.reply_scope(), message_id, text).await;
+        record_standalone_bot_message(destination.reply_scope(), delivery_ticket, message_id, text)
+            .await;
         let core_message_id = MessageId::new();
         if let Err(error) = self
             .identity_store
@@ -428,18 +701,21 @@ impl QqActionAdapter {
     ) -> Option<OutgoingToken> {
         let fingerprint = outgoing_fingerprint(content.as_text());
         let prepared = find_prepared_outgoing(scope, fingerprint).await;
-        let (outgoing, source) = if let Some(prepared) = prepared {
-            prepared
-        } else if allow_proactive_fallback {
-            let ticket = interrupt(scope).await;
-            if !mark_active(ticket).await {
-                return None;
-            }
-            let outgoing = prepare_outgoing(ticket, fingerprint, OutgoingSource::Proactive).await;
-            finish(ticket).await;
-            (outgoing?, OutgoingSource::Proactive)
-        } else {
-            return None;
+        let (outgoing, source) = match prepared {
+            // ReachOut is always proactive. Even an exact content collision
+            // must not let it consume a reactive user's prepared reply.
+            Some((_, OutgoingSource::Reply)) if allow_proactive_fallback => return None,
+            Some(prepared) => prepared,
+            None if allow_proactive_fallback => (
+                prepare_proactive_outgoing_if_idle_with_semantic_preview(
+                    scope,
+                    fingerprint,
+                    Some(content.as_text()),
+                )
+                .await?,
+                OutgoingSource::Proactive,
+            ),
+            None => return None,
         };
         if source == OutgoingSource::Proactive {
             let grace_ms = crate::config::get().proactive().prepared_grace_ms();
@@ -458,6 +734,20 @@ impl QqActionAdapter {
         &self,
         action: &ToolAction,
     ) -> Result<ActionPortOutcome, ActionPortError> {
+        let Some(ticket) = self
+            .tool_turns
+            .claim(
+                action.idempotency_key(),
+                action.scope,
+                &action.tool_name,
+                &action.input,
+            )
+            .await
+        else {
+            return Ok(ActionPortOutcome::Deferred {
+                reason: "tool_turn_capability_missing".to_string(),
+            });
+        };
         let Some(registry) = tool_registry() else {
             return Ok(ActionPortOutcome::Deferred {
                 reason: "tool_registry_unavailable".to_string(),
@@ -466,17 +756,9 @@ impl QqActionAdapter {
         let actor = action
             .actor()
             .ok_or_else(|| ActionPortError::new("tool_actor_required", false))?;
-        let actor_user_id = self
-            .identity_store
-            .qq_external_identity_for_delivery(actor)
-            .await
-            .map_err(|error| {
-                ActionPortError::new(format!("tool_actor_lookup_failed:{error}"), true)
-            })?
-            .and_then(|value| parse_positive_i64(&value))
-            .ok_or_else(|| ActionPortError::new("tool_actor_route_unavailable", false))?;
+        let actor_user_id = self.resolve_tool_actor_user_id(actor).await?;
 
-        let destination = match action.scope {
+        let (expected_conversation_id, expected_destination) = match action.scope {
             ActionScope::Conversation(conversation_id) => {
                 if self
                     .identity_store
@@ -492,7 +774,10 @@ impl QqActionAdapter {
                         false,
                     ));
                 }
-                self.resolve_conversation_destination(conversation_id).await?
+                let destination = self
+                    .resolve_conversation_destination_without_authorization(conversation_id)
+                    .await?;
+                (conversation_id, destination)
             }
             ActionScope::Person(person_id) => {
                 if person_id != actor {
@@ -501,11 +786,11 @@ impl QqActionAdapter {
                         false,
                     ));
                 }
-                let (_route, destination) = self
+                let (route, destination) = self
                     .resolve_person_destination(person_id)
                     .await
                     .map_err(|error| ActionPortError::new(error.to_string(), true))?;
-                destination
+                (route.conversation_id, destination)
             }
             ActionScope::Global => {
                 return Ok(ActionPortOutcome::Deferred {
@@ -513,6 +798,11 @@ impl QqActionAdapter {
                 });
             }
         };
+        if ticket.scope() != expected_destination.reply_scope() {
+            return Ok(ActionPortOutcome::Deferred {
+                reason: "tool_turn_capability_scope_mismatch".to_string(),
+            });
+        }
 
         let arguments = serde_json::from_str::<serde_json::Value>(&action.input)
             .map_err(|error| ActionPortError::new(format!("tool_input_invalid:{error}"), false))?;
@@ -522,6 +812,96 @@ impl QqActionAdapter {
                 false,
             ));
         };
+        // Route deletion and authorization revocation take the corresponding
+        // write locks. Pin both snapshots through the Host commit point, but
+        // never across ToolRegistry execution or external I/O.
+        let route_guard = crate::yunxi::pin_delivery_routes().await;
+        let current_actor_user_id = match self.resolve_tool_actor_user_id(actor).await {
+            Ok(user_id) if user_id == actor_user_id => user_id,
+            Ok(_) => {
+                drop(route_guard);
+                return Ok(ActionPortOutcome::Deferred {
+                    reason: "tool_actor_route_changed_before_commit".to_string(),
+                });
+            }
+            Err(error) => {
+                drop(route_guard);
+                return Err(error);
+            }
+        };
+        if let ActionScope::Conversation(conversation_id) = action.scope {
+            match self.identity_store.get(conversation_id, actor).await {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    drop(route_guard);
+                    return Err(ActionPortError::new(
+                        "tool_scope_membership_revoked_before_commit",
+                        false,
+                    ));
+                }
+                Err(error) => {
+                    drop(route_guard);
+                    return Err(ActionPortError::new(
+                        format!("tool_scope_membership_revalidation_failed:{error}"),
+                        true,
+                    ));
+                }
+            }
+        }
+        let current_route = match action.scope {
+            ActionScope::Conversation(conversation_id) => self
+                .resolve_conversation_destination_without_authorization(conversation_id)
+                .await
+                .map(|destination| (conversation_id, destination)),
+            ActionScope::Person(person_id) => self
+                .resolve_person_destination(person_id)
+                .await
+                .map_err(|error| ActionPortError::new(error.to_string(), true))
+                .map(|(route, destination)| (route.conversation_id, destination)),
+            ActionScope::Global => unreachable!("global tool scopes return before revalidation"),
+        };
+        let (_, destination) = match current_route {
+            Ok(current)
+                if delivery_route_is_unchanged(
+                    expected_conversation_id,
+                    expected_destination,
+                    Some(current),
+                ) =>
+            {
+                current
+            }
+            Ok(_) => {
+                drop(route_guard);
+                return Ok(ActionPortOutcome::Deferred {
+                    reason: "tool_route_changed_before_commit".to_string(),
+                });
+            }
+            Err(error) => {
+                drop(route_guard);
+                return Err(error);
+            }
+        };
+        if ticket.scope() != destination.reply_scope() {
+            drop(route_guard);
+            return Ok(ActionPortOutcome::Deferred {
+                reason: "tool_turn_capability_route_mismatch".to_string(),
+            });
+        }
+        let group_authorization = match destination {
+            QqDestination::Group(group_id) => {
+                match crate::group_access::authorize_group_send(group_id).await {
+                    Ok(authorization) => Some(authorization),
+                    Err(error) => {
+                        drop(route_guard);
+                        return Err(ActionPortError::new(
+                            format!("tool_group_authorization_revoked:{error}"),
+                            false,
+                        ));
+                    }
+                }
+            }
+            QqDestination::Private(_) => None,
+        };
         let configured_owner = crate::config::get().identity().owner_person_id();
         let is_main_admin = configured_owner.is_some_and(|owner| owner == actor.into_uuid())
             || (configured_owner.is_none()
@@ -529,25 +909,32 @@ impl QqActionAdapter {
                     .bot
                     .get_main_admin()
                     .ok()
-                    .is_some_and(|main_admin| main_admin == actor_user_id));
+                    .is_some_and(|main_admin| main_admin == current_actor_user_id));
         // The Core action has no raw group-admin proof. Restrict admin tools
-        // to the host's main administrator until a platform-neutral
-        // capability token is available.
+        // to the Host's main administrator, re-evaluated at commit time.
         let is_admin = is_main_admin;
         let group_paused = match destination {
             QqDestination::Group(group_id) => crate::model::utils::is_group_paused(group_id).await,
             QqDestination::Private(_) => false,
         };
-        let reply_scope = destination.reply_scope();
-        let ticket = interrupt(reply_scope).await;
         if !mark_active(ticket).await {
+            drop(group_authorization);
+            drop(route_guard);
             return Ok(ActionPortOutcome::Deferred {
-                reason: "tool_turn_superseded_before_start".to_string(),
+                reason: "tool_turn_capability_stale_before_commit".to_string(),
+            });
+        }
+        if !is_current(ticket).await {
+            drop(group_authorization);
+            drop(route_guard);
+            finish(ticket).await;
+            return Ok(ActionPortOutcome::Deferred {
+                reason: "tool_turn_capability_stale_at_effect_boundary".to_string(),
             });
         }
         let context = ToolExecutionContext {
-            subject_id: actor_user_id,
-            actor_user_id,
+            subject_id: current_actor_user_id,
+            actor_user_id: current_actor_user_id,
             is_admin,
             is_main_admin,
             context: "yunxi_core_tool",
@@ -563,8 +950,19 @@ impl QqActionAdapter {
             requires_group_followup: false,
             requires_external_tool: false,
         };
+        drop(group_authorization);
+        drop(route_guard);
+        let revalidator: Arc<dyn ToolEffectRevalidator> = Arc::new(CoreToolEffectRevalidator {
+            adapter: self.clone(),
+            registry: Arc::clone(&registry),
+            action: action.clone(),
+            ticket,
+            expected_actor_user_id: actor_user_id,
+            expected_conversation_id,
+            expected_destination,
+        });
         let result = registry
-            .execute(&action.tool_name, arguments, context, ticket)
+            .execute_with_revalidation(&action.tool_name, arguments, context, ticket, revalidator)
             .await;
         finish(ticket).await;
         if result.succeeded {
@@ -586,6 +984,17 @@ impl QqActionAdapter {
                 MAX_TOOL_ERROR_DETAIL_BYTES,
             ),
         })
+    }
+}
+
+fn durable_commit_error(error: DeliveryCommitError) -> ActionPortError {
+    match error {
+        DeliveryCommitError::OwnerMissing { .. } => {
+            ActionPortError::new(format!("durable_delivery_owner_missing:{error}"), false)
+        }
+        DeliveryCommitError::Ledger(_) => {
+            ActionPortError::new(format!("durable_delivery_ledger_unavailable:{error}"), true)
+        }
     }
 }
 
@@ -616,15 +1025,17 @@ impl ActionPort for QqActionAdapter {
                             reason: "outgoing_not_prepared".to_string(),
                         });
                     };
-                    self.send_to_destination(
-                        DeliveryRevalidationTarget::Conversation(send.conversation_id),
-                        destination,
-                        &send.content,
+                    self.send_to_destination(QqSendContext {
+                        revalidation_target: DeliveryRevalidationTarget::Conversation(
+                            send.conversation_id,
+                        ),
+                        expected_destination: destination,
+                        content: &send.content,
                         reply_to,
-                        send.conversation_id,
-                        send.idempotency_key(),
+                        expected_conversation_id: send.conversation_id,
+                        idempotency_key: send.idempotency_key(),
                         outgoing,
-                    )
+                    })
                     .await
                 }
                 ProposedAction::ReachOut(reach_out) => {
@@ -640,15 +1051,17 @@ impl ActionPort for QqActionAdapter {
                             reason: "outgoing_not_prepared".to_string(),
                         });
                     };
-                    self.send_to_destination(
-                        DeliveryRevalidationTarget::Person(reach_out.person_id),
-                        destination,
-                        &reach_out.message,
-                        None,
-                        route.conversation_id,
-                        reach_out.idempotency_key(),
+                    self.send_to_destination(QqSendContext {
+                        revalidation_target: DeliveryRevalidationTarget::Person(
+                            reach_out.person_id,
+                        ),
+                        expected_destination: destination,
+                        content: &reach_out.message,
+                        reply_to: None,
+                        expected_conversation_id: route.conversation_id,
+                        idempotency_key: reach_out.idempotency_key(),
                         outgoing,
-                    )
+                    })
                     .await
                 }
                 ProposedAction::UseTool(action) => self.execute_tool(action).await,
@@ -738,6 +1151,31 @@ impl ActionPort for QqActionAdapter {
 
 fn store_action_error(error: impl std::fmt::Display) -> ActionPortError {
     ActionPortError::new(format!("core_store_failed:{error}"), true)
+}
+
+fn recorded_delivery_outcome(
+    status: DeliveryStatus,
+    external_message_id: Option<i64>,
+    conversation_id: ConversationId,
+) -> Result<ActionPortOutcome, ActionPortError> {
+    match status {
+        DeliveryStatus::Sent => Ok(ActionPortOutcome::Delivered {
+            external_reference: external_message_id
+                .map(|message_id| format!("qq-message:{message_id}")),
+            message_id: None,
+            conversation_id: Some(conversation_id),
+        }),
+        DeliveryStatus::Prepared | DeliveryStatus::Committed | DeliveryStatus::Unknown => {
+            Ok(ActionPortOutcome::DeliveryIndeterminate {
+                reason: format!("durable_delivery_already_{status}"),
+                conversation_id: Some(conversation_id),
+            })
+        }
+        DeliveryStatus::Failed => Err(ActionPortError::new(
+            "durable_delivery_failed_row_was_not_reacquired",
+            false,
+        )),
+    }
 }
 
 fn bounded_core_tool_text(value: &str, max_chars: usize, max_bytes: usize) -> String {
@@ -830,35 +1268,92 @@ pub(crate) fn single_positive_qq_id(external_ids: &[String]) -> Option<i64> {
     (user_id > 0).then_some(user_id)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReachOutDeliveryOutcome {
+    Delivered,
+    Indeterminate,
+    Failed,
+}
+
+impl ReachOutDeliveryOutcome {
+    pub(crate) const fn is_terminal_attempt(self) -> bool {
+        matches!(self, Self::Delivered | Self::Indeterminate)
+    }
+
+    pub(crate) const fn confirms_delivery(self) -> bool {
+        matches!(self, Self::Delivered)
+    }
+}
+
+fn compatibility_reach_out_outcome(
+    result: Result<i32, crate::model::TrackedSendError>,
+) -> ReachOutDeliveryOutcome {
+    match result {
+        Ok(_) => ReachOutDeliveryOutcome::Delivered,
+        Err(
+            crate::model::TrackedSendError::TransportIndeterminate(_)
+            | crate::model::TrackedSendError::DuplicateIdempotency,
+        ) => ReachOutDeliveryOutcome::Indeterminate,
+        Err(_) => ReachOutDeliveryOutcome::Failed,
+    }
+}
+
 pub(crate) async fn send_reach_out(
     bot: &Arc<RuntimeBot>,
     identity_store: &PostgresIdentityStore,
     intent: &ReachOutIntent,
     expected_user_id: i64,
-) -> bool {
-    let Ok(Some(external_id)) = identity_store
-        .qq_external_identity_for_delivery(intent.person_id())
-        .await
-    else {
-        return false;
-    };
-    let Some(user_id) = single_positive_qq_id(&[external_id]) else {
-        return false;
-    };
-    if user_id != expected_user_id {
-        return false;
-    }
+) -> ReachOutDeliveryOutcome {
+    let person_id = intent.person_id();
     let content: &MessageContent = intent.message();
-    send_tracked_private_message(bot, user_id, content.as_text().to_string()).await
+    let delivery_key = compatibility_reach_out_key(intent);
+    compatibility_reach_out_outcome(
+        send_tracked_message_with_revalidation_guard(
+            bot,
+            MessageDestination::Private(expected_user_id),
+            Message::from(content.as_text().to_string()),
+            OutgoingSource::Proactive,
+            Some(&delivery_key),
+            || async {
+                let route_guard = crate::yunxi::pin_delivery_routes().await;
+                let Ok(Some(external_id)) = identity_store
+                    .qq_external_identity_for_delivery(person_id)
+                    .await
+                else {
+                    return None;
+                };
+                (single_positive_qq_id(&[external_id]) == Some(expected_user_id))
+                    .then_some(route_guard)
+            },
+        )
+        .await,
+    )
+}
+
+fn compatibility_reach_out_key(intent: &ReachOutIntent) -> String {
+    let mut hasher = Sha256::new();
+    match serde_json::to_vec(intent) {
+        Ok(encoded) => hasher.update(encoded),
+        Err(_) => hasher.update(intent.message().as_text().as_bytes()),
+    }
+    format!(
+        "legacy-reach-out:{}:{}:{:x}",
+        intent.person_id(),
+        chrono::Utc::now().format("%Y%m%d"),
+        hasher.finalize()
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        QqDestination, delivery_authorization_allows, delivery_route_is_unchanged,
-        parse_qq_destination, single_positive_qq_id,
+        QqDestination, ReachOutDeliveryOutcome, compatibility_reach_out_outcome,
+        delivery_authorization_allows, delivery_route_is_unchanged, durable_commit_error,
+        parse_qq_destination, recorded_delivery_outcome, single_positive_qq_id,
     };
-    use yunxi_core::{ConversationId, ConversationKind};
+    use crate::model::TrackedSendError;
+    use crate::yunxi::delivery_ledger::{DeliveryCommitError, DeliveryStatus};
+    use yunxi_core::{ActionPortOutcome, ConversationId, ConversationKind};
 
     fn ids(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
@@ -945,5 +1440,79 @@ mod tests {
             QqDestination::Private(456),
             None
         ));
+    }
+
+    #[test]
+    fn missing_durable_owner_is_terminal_but_ledger_outage_is_retryable() {
+        let missing = durable_commit_error(DeliveryCommitError::OwnerMissing {
+            owner_kind: "person",
+        });
+        assert!(!missing.retryable);
+        assert!(
+            missing
+                .category
+                .starts_with("durable_delivery_owner_missing:")
+        );
+
+        let unavailable = durable_commit_error(DeliveryCommitError::Ledger(anyhow::anyhow!(
+            "database unavailable"
+        )));
+        assert!(unavailable.retryable);
+        assert!(
+            unavailable
+                .category
+                .starts_with("durable_delivery_ledger_unavailable:")
+        );
+    }
+
+    #[test]
+    fn durable_replay_barriers_are_terminal_without_claiming_delivery() {
+        let conversation_id = ConversationId::new();
+        for status in [
+            DeliveryStatus::Prepared,
+            DeliveryStatus::Committed,
+            DeliveryStatus::Unknown,
+        ] {
+            assert!(matches!(
+                recorded_delivery_outcome(status, None, conversation_id),
+                Ok(ActionPortOutcome::DeliveryIndeterminate {
+                    conversation_id: Some(actual),
+                    ..
+                }) if actual == conversation_id
+            ));
+        }
+        assert!(matches!(
+            recorded_delivery_outcome(DeliveryStatus::Sent, Some(42), conversation_id),
+            Ok(ActionPortOutcome::Delivered {
+                external_reference: Some(reference),
+                conversation_id: Some(actual),
+                ..
+            }) if reference == "qq-message:42" && actual == conversation_id
+        ));
+        assert!(recorded_delivery_outcome(DeliveryStatus::Failed, None, conversation_id).is_err());
+    }
+
+    #[test]
+    fn compatibility_reach_out_preserves_indeterminate_delivery() {
+        assert_eq!(
+            compatibility_reach_out_outcome(Ok(42)),
+            ReachOutDeliveryOutcome::Delivered
+        );
+        assert_eq!(
+            compatibility_reach_out_outcome(Err(TrackedSendError::TransportIndeterminate(
+                "response cancelled".to_owned()
+            ))),
+            ReachOutDeliveryOutcome::Indeterminate
+        );
+        assert_eq!(
+            compatibility_reach_out_outcome(Err(TrackedSendError::DuplicateIdempotency)),
+            ReachOutDeliveryOutcome::Indeterminate
+        );
+        assert_eq!(
+            compatibility_reach_out_outcome(Err(TrackedSendError::Transport(
+                "request rejected".to_owned()
+            ))),
+            ReachOutDeliveryOutcome::Failed
+        );
     }
 }

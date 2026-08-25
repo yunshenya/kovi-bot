@@ -57,6 +57,7 @@ type PendingPrivateMessage = PendingTurn;
 static PENDING_PRIVATE_MESSAGES: LazyLock<Mutex<HashMap<i64, VecDeque<PendingPrivateMessage>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+#[allow(dead_code)]
 pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<RuntimeBot>) {
     if event.user_id == event.self_id {
         println!(
@@ -68,6 +69,7 @@ pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<Runtime
     let admission =
         ConversationCoordinator::begin_incoming(ReplyScope::Private(event.user_id)).await;
     private_message_event_after_ingress(event, bot, admission).await;
+    ConversationCoordinator::abandon_incoming(admission).await;
 }
 
 pub(crate) async fn private_message_event_after_ingress(
@@ -506,10 +508,7 @@ pub(crate) async fn private_message_event_after_ingress(
     } else {
         understand(batch_request.clone()).await
     };
-    crate::yunxi::events::project_interaction_cues(
-        user_id,
-        understanding.interaction_cues(),
-    );
+    crate::yunxi::events::project_interaction_cues(user_id, understanding.interaction_cues());
     let asks_for_silence = plain_text && (understanding.wants_no_reply || understanding.wants_stop);
     if asks_for_silence {
         stop_private_reply(user_id, ingress).await;
@@ -607,8 +606,7 @@ pub(crate) async fn private_message_event_after_ingress(
     {
         eprintln!("[ERROR] 私聊保存表情包使用记录失败: {}", error);
     }
-    let Some(admission) =
-        admit_understood_private_turn(initial_admission, &understanding).await
+    let Some(admission) = admit_understood_private_turn(initial_admission, &understanding).await
     else {
         println!(
             "[INFO] 私聊语义决定已过期，丢弃旧批次 (用户: {}, 消息: {:?})",
@@ -666,7 +664,11 @@ async fn claim_or_queue_private_reply(
         .await
         .get(&user_id)
         .is_some_and(|queue| !queue.is_empty());
-    if should_queue_after_executive(active || has_queued, admission.decision) {
+    if should_queue_after_executive(
+        active || has_queued,
+        admission.decision,
+        admission.preserved_prepared,
+    ) {
         println!(
             "[INFO] 私聊已有回复或排队消息进行中，排队新消息 (用户: {})",
             user_id
@@ -828,11 +830,7 @@ async fn clear_private_erasure_runtime_state(user_id: i64) {
     clear_private_traffic(user_id).await;
 }
 
-async fn send_erasure_receipt(
-    bot: &RuntimeBot,
-    user_id: i64,
-    content: impl Into<String>,
-) -> bool {
+async fn send_erasure_receipt(bot: &RuntimeBot, user_id: i64, content: impl Into<String>) -> bool {
     match crate::model::send_tracked_unrecorded_plain_text(
         bot,
         crate::model::MessageDestination::Private(user_id),
@@ -1044,8 +1042,9 @@ fn parse_task_id(value: &str) -> Option<i64> {
 fn should_queue_after_executive(
     active_or_queued: bool,
     decision: OutgoingExecutiveDecision,
+    preserved_prepared: bool,
 ) -> bool {
-    active_or_queued && decision == OutgoingExecutiveDecision::Keep
+    preserved_prepared || (active_or_queued && decision == OutgoingExecutiveDecision::Keep)
 }
 
 async fn admit_understood_private_turn(
@@ -1136,7 +1135,7 @@ mod tests {
         AgentTaskCommand, PENDING_PRIVATE_MESSAGES, admit_understood_private_turn,
         looks_like_immediate_stop_request, normalized_private_sender_name,
         parse_agent_task_command, queue_pending_private_message, select_recent_images,
-        take_pending_private_turn, with_recent_image_context,
+        should_queue_after_executive, take_pending_private_turn, with_recent_image_context,
     };
     use crate::model::conversation_coordinator::{
         ConversationCoordinator, OutgoingExecutiveDecision,
@@ -1146,6 +1145,15 @@ mod tests {
         mark_active, outgoing_fingerprint, prepare_outgoing, scope_mutex, test_outgoing_state,
     };
     use crate::model::semantic::{ImageReferenceIntent, MessageUnderstanding};
+
+    #[test]
+    fn preserved_prepared_reply_queues_the_new_private_turn() {
+        assert!(should_queue_after_executive(
+            false,
+            OutgoingExecutiveDecision::Keep,
+            true,
+        ));
+    }
     use crate::private_image_memory::{recent_private_images, remember_private_images};
     use crate::vision::{ImageAttachment, VisionImage};
 
@@ -1187,12 +1195,10 @@ mod tests {
                 .await
                 .expect("proactive output should prepare during semantic work");
 
-                let refined = admit_understood_private_turn(
-                    initial,
-                    &MessageUnderstanding::default(),
-                )
-                .await
-                .expect("ingress should remain current");
+                let refined =
+                    admit_understood_private_turn(initial, &MessageUnderstanding::default())
+                        .await
+                        .expect("ingress should remain current");
 
                 assert_eq!(refined.decision, OutgoingExecutiveDecision::Defer);
                 assert_eq!(

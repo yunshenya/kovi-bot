@@ -23,7 +23,16 @@ pub(crate) async fn project_destination(
     kind: WorldEventKind,
 ) {
     let wait = projection_timeout(priority);
-    match timeout(wait, resolve_and_submit(destination, priority, kind)).await {
+    let Some(bridge) = super::SHADOW_BRIDGE.get() else {
+        kovi::log::warn!("Yunxi event projection failed: shadow bridge is not installed");
+        return;
+    };
+    match timeout(
+        wait,
+        bridge.project_destination(destination, priority, kind),
+    )
+    .await
+    {
         Ok(Ok(Admission::Accepted)) => {}
         Ok(Ok(Admission::DroppedAtCapacity)) => {
             kovi::log::warn!("Yunxi event projection dropped at runtime capacity");
@@ -87,41 +96,6 @@ async fn project_interaction_cues_inner(
             EventPriority::Normal,
             WorldEventKind::InteractionCuesObserved(observed),
         ))
-        .await
-        .map_err(|error| error.to_string())
-}
-
-async fn resolve_and_submit(
-    destination: MessageDestination,
-    priority: EventPriority,
-    kind: WorldEventKind,
-) -> Result<Admission, String> {
-    let identities = super::IDENTITY_STORE
-        .get()
-        .ok_or_else(|| "identity store is not installed".to_string())?;
-    let bridge = super::SHADOW_BRIDGE
-        .get()
-        .ok_or_else(|| "shadow bridge is not installed".to_string())?;
-    let scope = match destination {
-        MessageDestination::Private(user_id) => {
-            let external = super::qq::person(user_id).map_err(|error| error.to_string())?;
-            let person_id = identities
-                .resolve_external_identity(&external)
-                .await
-                .map_err(|error| error.to_string())?;
-            EventScope::Person { person_id }
-        }
-        MessageDestination::Group(group_id) => {
-            let external = super::qq::group(group_id).map_err(|error| error.to_string())?;
-            let conversation_id = identities
-                .resolve_external_conversation(&external)
-                .await
-                .map_err(|error| error.to_string())?;
-            EventScope::Conversation { conversation_id }
-        }
-    };
-    bridge
-        .submit_event(WorldEvent::new(Utc::now(), scope, priority, kind))
         .await
         .map_err(|error| error.to_string())
 }

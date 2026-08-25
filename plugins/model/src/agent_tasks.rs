@@ -8,7 +8,8 @@ use crate::config;
 use crate::group_access;
 use crate::memory::MEMORY_MANAGER;
 use crate::model::{
-    BotMemory, MessageDestination, OutgoingSource, Roles, send_tracked_message_with_revalidation,
+    BotMemory, MessageDestination, OutgoingSource, Roles,
+    send_tracked_message_with_revalidation_guard,
 };
 use anyhow::{Context, Result, anyhow, ensure};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -713,25 +714,26 @@ async fn process_claimed_task(bot: &RuntimeBot, task: ClaimedTask, lease_secs: u
     let delivery_key = report_delivery_key(task.id);
     let send_result = kovi::tokio::time::timeout(
         Duration::from_secs(8),
-        send_tracked_message_with_revalidation(
+        send_tracked_message_with_revalidation_guard(
             bot,
             MessageDestination::Private(task.actor_user_id),
             Message::from(report.clone()),
             OutgoingSource::Proactive,
             Some(&delivery_key),
             || async {
-                crate::model::utils::is_main_admin(bot, task.actor_user_id)
-                    && mark_report_sending(&task, &report, &delivery_key)
-                        .await
-                        .is_ok()
+                if mark_report_sending(&task, &report, &delivery_key)
+                    .await
+                    .is_err()
+                {
+                    return None;
+                }
+                crate::model::utils::authorize_main_admin_commit(bot, task.actor_user_id).await
             },
         ),
     )
     .await;
     match send_result {
         Ok(Ok(message_id)) => {
-            crate::model::utils::record_standalone_private_message(task.actor_user_id, &report)
-                .await;
             if let Err(error) = complete_task(&task, message_id).await {
                 eprintln!(
                     "[ERROR] 跨群问答汇报已发送但完成状态未保存 (任务: {}): {}",
