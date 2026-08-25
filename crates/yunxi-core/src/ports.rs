@@ -12,9 +12,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 
-/// Optional Core persistence boundary for relation context.  A host can
-/// provide this store when relation persistence is available; the planner
-/// also accepts an inline snapshot for read-only or lightweight hosts.
+/// Core persistence boundary for relation context. A host can provide this
+/// store when relation persistence is available; the planner also accepts an
+/// inline snapshot for read-only or lightweight hosts.
 pub type RelationStoreFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, RelationStoreError>> + Send + 'a>>;
 
@@ -47,29 +47,28 @@ pub trait GoalStore: Send + Sync {}
 
 /// Shared, platform-neutral dependencies used by a cognitive runtime.
 ///
-/// Storage ports are optional so a standalone in-memory/fake runtime can be
-/// started with only a model backend.  Production hosts can install each
-/// adapter through the builder methods as the corresponding Core phase lands.
+/// The fields intentionally mirror the architecture document: every Core
+/// boundary is present in the service container and can be replaced by a
+/// host adapter. [`Self::with_model`] fills the not-yet-installed stores with
+/// unavailable adapters so a standalone fake runtime only needs a model.
 pub struct CoreServices {
-    pub memory: Option<Arc<dyn MemoryStore>>,
-    pub identity: Option<Arc<dyn IdentityStore>>,
-    pub open_loops: Option<Arc<dyn OpenLoopStore>>,
-    pub relations: Option<Arc<dyn RelationStore>>,
-    pub goals: Option<Arc<dyn GoalStore>>,
+    pub memory: Arc<dyn MemoryStore>,
+    pub identity: Arc<dyn IdentityStore>,
+    pub open_loops: Arc<dyn OpenLoopStore>,
+    pub relations: Arc<dyn RelationStore>,
+    pub goals: Arc<dyn GoalStore>,
     pub model: Arc<dyn ModelBackend>,
-    pub clock: Arc<dyn Clock>,
 }
 
 impl std::fmt::Debug for CoreServices {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("CoreServices")
-            .field("memory", &self.memory.is_some())
-            .field("identity", &self.identity.is_some())
-            .field("open_loops", &self.open_loops.is_some())
-            .field("relations", &self.relations.is_some())
-            .field("goals", &self.goals.is_some())
-            .field("clock", &true)
+            .field("memory", &true)
+            .field("identity", &true)
+            .field("open_loops", &true)
+            .field("relations", &true)
+            .field("goals", &true)
             .finish_non_exhaustive()
     }
 }
@@ -78,13 +77,12 @@ impl CoreServices {
     #[must_use]
     pub fn new(model: Arc<dyn ModelBackend>) -> Self {
         Self {
-            memory: None,
-            identity: None,
-            open_loops: None,
-            relations: None,
-            goals: None,
+            memory: Arc::new(UnavailableMemoryStore),
+            identity: Arc::new(UnavailableIdentityStore),
+            open_loops: Arc::new(UnavailableOpenLoopStore),
+            relations: Arc::new(UnavailableRelationStore),
+            goals: Arc::new(UnavailableGoalStore),
             model,
-            clock: Arc::new(SystemClock),
         }
     }
 
@@ -98,37 +96,31 @@ impl CoreServices {
 
     #[must_use]
     pub fn with_memory(mut self, memory: Arc<dyn MemoryStore>) -> Self {
-        self.memory = Some(memory);
+        self.memory = memory;
         self
     }
 
     #[must_use]
     pub fn with_identity(mut self, identity: Arc<dyn IdentityStore>) -> Self {
-        self.identity = Some(identity);
+        self.identity = identity;
         self
     }
 
     #[must_use]
     pub fn with_open_loops(mut self, open_loops: Arc<dyn OpenLoopStore>) -> Self {
-        self.open_loops = Some(open_loops);
+        self.open_loops = open_loops;
         self
     }
 
     #[must_use]
     pub fn with_relations(mut self, relations: Arc<dyn RelationStore>) -> Self {
-        self.relations = Some(relations);
+        self.relations = relations;
         self
     }
 
     #[must_use]
     pub fn with_goals(mut self, goals: Arc<dyn GoalStore>) -> Self {
-        self.goals = Some(goals);
-        self
-    }
-
-    #[must_use]
-    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
-        self.clock = clock;
+        self.goals = goals;
         self
     }
 }
@@ -283,6 +275,177 @@ impl MemoryStoreError {
         }
     }
 }
+
+#[derive(Debug)]
+struct UnavailablePortError(&'static str);
+
+impl std::fmt::Display for UnavailablePortError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.0)
+    }
+}
+
+impl StdError for UnavailablePortError {}
+
+#[derive(Debug)]
+struct UnavailableMemoryStore;
+
+impl MemoryStore for UnavailableMemoryStore {
+    fn remember<'a>(&'a self, _draft: &'a MemoryDraft) -> MemoryStoreFuture<'a, Memory> {
+        Box::pin(async {
+            Err(MemoryStoreError::storage(UnavailablePortError(
+                "memory store is unavailable",
+            )))
+        })
+    }
+
+    fn recall<'a>(&'a self, _query: &'a MemoryQuery) -> MemoryStoreFuture<'a, Vec<Memory>> {
+        Box::pin(async {
+            Err(MemoryStoreError::storage(UnavailablePortError(
+                "memory store is unavailable",
+            )))
+        })
+    }
+
+    fn forget(&self, _scope: MemoryScope, _id: MemoryId) -> MemoryStoreFuture<'_, bool> {
+        Box::pin(async {
+            Err(MemoryStoreError::storage(UnavailablePortError(
+                "memory store is unavailable",
+            )))
+        })
+    }
+}
+
+#[derive(Debug)]
+struct UnavailableIdentityStore;
+
+impl IdentityStore for UnavailableIdentityStore {
+    fn resolve_external_identity<'a>(
+        &'a self,
+        _external: &'a ExternalIdentity,
+    ) -> IdentityStoreFuture<'a, PersonId> {
+        Box::pin(async {
+            Err(IdentityStoreError::storage(UnavailablePortError(
+                "identity store is unavailable",
+            )))
+        })
+    }
+
+    fn resolve_external_conversation<'a>(
+        &'a self,
+        _external: &'a ExternalConversation,
+    ) -> IdentityStoreFuture<'a, ConversationId> {
+        Box::pin(async {
+            Err(IdentityStoreError::storage(UnavailablePortError(
+                "identity store is unavailable",
+            )))
+        })
+    }
+}
+
+#[derive(Debug)]
+struct UnavailableOpenLoopStore;
+
+impl OpenLoopStore for UnavailableOpenLoopStore {
+    fn create<'a>(&'a self, _draft: &'a OpenLoopDraft) -> OpenLoopStoreFuture<'a, OpenLoop> {
+        Box::pin(async {
+            Err(OpenLoopStoreError::storage(UnavailablePortError(
+                "open-loop store is unavailable",
+            )))
+        })
+    }
+
+    fn get<'a>(&'a self, _id: OpenLoopId) -> OpenLoopStoreFuture<'a, Option<OpenLoop>> {
+        Box::pin(async {
+            Err(OpenLoopStoreError::storage(UnavailablePortError(
+                "open-loop store is unavailable",
+            )))
+        })
+    }
+
+    fn list<'a>(
+        &'a self,
+        _owner: &'a OpenLoopOwner,
+        _limit: usize,
+    ) -> OpenLoopStoreFuture<'a, Vec<OpenLoop>> {
+        Box::pin(async {
+            Err(OpenLoopStoreError::storage(UnavailablePortError(
+                "open-loop store is unavailable",
+            )))
+        })
+    }
+
+    fn claim_due(
+        &self,
+        _now: DateTime<Utc>,
+        _limit: usize,
+    ) -> OpenLoopStoreFuture<'_, Vec<OpenLoop>> {
+        Box::pin(async {
+            Err(OpenLoopStoreError::storage(UnavailablePortError(
+                "open-loop store is unavailable",
+            )))
+        })
+    }
+
+    fn defer(
+        &self,
+        _id: OpenLoopId,
+        _due_at: Option<DateTime<Utc>>,
+        _now: DateTime<Utc>,
+    ) -> OpenLoopStoreFuture<'_, OpenLoop> {
+        Box::pin(async {
+            Err(OpenLoopStoreError::storage(UnavailablePortError(
+                "open-loop store is unavailable",
+            )))
+        })
+    }
+
+    fn resolve(&self, _id: OpenLoopId, _now: DateTime<Utc>) -> OpenLoopStoreFuture<'_, OpenLoop> {
+        Box::pin(async {
+            Err(OpenLoopStoreError::storage(UnavailablePortError(
+                "open-loop store is unavailable",
+            )))
+        })
+    }
+
+    fn cancel(&self, _id: OpenLoopId, _now: DateTime<Utc>) -> OpenLoopStoreFuture<'_, OpenLoop> {
+        Box::pin(async {
+            Err(OpenLoopStoreError::storage(UnavailablePortError(
+                "open-loop store is unavailable",
+            )))
+        })
+    }
+
+    fn recover_stale_triggered(
+        &self,
+        _now: DateTime<Utc>,
+        _limit: usize,
+    ) -> OpenLoopStoreFuture<'_, usize> {
+        Box::pin(async {
+            Err(OpenLoopStoreError::storage(UnavailablePortError(
+                "open-loop store is unavailable",
+            )))
+        })
+    }
+}
+
+#[derive(Debug)]
+struct UnavailableRelationStore;
+
+impl RelationStore for UnavailableRelationStore {
+    fn get<'a>(&'a self, _person_id: PersonId) -> RelationStoreFuture<'a, Option<RelationState>> {
+        Box::pin(async {
+            Err(RelationStoreError::storage(UnavailablePortError(
+                "relation store is unavailable",
+            )))
+        })
+    }
+}
+
+#[derive(Debug)]
+struct UnavailableGoalStore;
+
+impl GoalStore for UnavailableGoalStore {}
 
 /// Time source used by domain services that need deterministic tests.
 pub trait Clock: Send + Sync {
