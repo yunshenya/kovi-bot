@@ -242,10 +242,11 @@ impl PlannerInput {
 
 /// The planner's disposition is intentionally less specific than an action.
 /// A host only sees an action after an intent has passed the arbiter.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum DecisionDisposition {
     Reply,
+    #[default]
     Silent,
     Defer,
     ReactOnly,
@@ -253,12 +254,6 @@ pub enum DecisionDisposition {
     ChangeTopic,
     ResumeAgenda,
     SpecialAction,
-}
-
-impl Default for DecisionDisposition {
-    fn default() -> Self {
-        Self::Silent
-    }
 }
 
 impl DecisionDisposition {

@@ -314,12 +314,10 @@ impl CognitiveRuntime {
             let result = arbiter.dispatch(proposed.clone(), port).await;
             if let Some(feedback_event) =
                 action_result_event(&planner_event, &proposed, &result, self.max_trace_depth)
-            {
-                if let ProcessingOutcome::Observed(feedback_observation) =
+                && let ProcessingOutcome::Observed(feedback_observation) =
                     self.process_event(feedback_event)
-                {
-                    feedback.push(feedback_observation);
-                }
+            {
+                feedback.push(feedback_observation);
             }
             actions.push(result);
         }
