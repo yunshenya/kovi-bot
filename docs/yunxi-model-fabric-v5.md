@@ -1,4 +1,6 @@
-# Yunxi Model Fabric v5：本地模型、多模型路由与可替换推理基础设施需求文档
+# Yunxi Model Fabric v5：本地模型、多模型路由与可替换推理基础设施开发文档
+
+**文档状态：** 最终整合版  
 
 **文档版本：** 5.0  
 **适用项目：** Yunxi Core / Yunxi Mind / Yunxi Executive / Yunxi World Model  
@@ -2698,31 +2700,217 @@ V5 Model Fabric
 
 已经足够构成一个平台无关、模型可替换、可云端、可混合、也可完全本地运行的持续 Agent 架构。
 
+
+# Stale Generation Cancellation & Commit Boundary
+
+
+## 1. Generation 必须可追踪
+
+每个文本生成 Request 应尽量绑定：
+
+```text
+GenerationId
+OutgoingId
+ConversationId
+ReplyTicket / generation token
+CancellationToken
+```
+
 ---
 
-# 154. Stale Generation Cancellation 与 Pre-Commit 支持
+## 2. stale generation
 
-Model Fabric v5 必须把会话竞争视为一等取消场景。每个 text generation request 应尽量绑定：`GenerationId`、`OutgoingId`、ReplyTicket/generation token、`CancellationToken`。
+当 V1 ConversationCoordinator 判定：
 
-当 V1 ConversationCoordinator 判定 PendingOutgoing stale / superseded 时，应尽早 cancel backend generation。如果具体云/本地 Backend 无法真正取消，允许请求结束，但结果必须丢弃，不得重新进入 send path。
+```text
+PendingOutgoing stale
+or
+Superseded
+```
 
-Scheduler 优先级进一步明确：
+Model Fabric 应尽早：
+
+```text
+cancel generation
+```
+
+---
+
+## 3. Backend 不支持取消
+
+若具体 Backend 无法真正取消：
+
+允许请求继续结束。
+
+但结果必须：
+
+```text
+discard
+```
+
+禁止：
+
+```text
+stale model result
+→ 重新进入 send path
+```
+
+---
+
+## 4. Scheduler 优先级补充
+
+建议：
 
 ```text
 Direct Reply
-> Prepared Proactive rewrite
-> Background Reflection / Simulation
+>
+Prepared Proactive Rewrite
+>
+Planner
+>
+Semantic / World Extraction
+>
+Reflection / Simulation
 ```
 
-Streaming 第一阶段建议：
+具体可根据现有优先级体系合并。
+
+---
+
+## 5. 用户消息抢占主动生成
+
+如果：
+
+```text
+Proactive generation running
+```
+
+用户 direct message 到达：
+
+允许：
+
+- cancel proactive generation；
+- mark stale；
+- reprioritize direct reply。
+
+---
+
+## 6. Streaming Commit Boundary
+
+第一阶段建议：
 
 ```text
 Generate / Buffer
 → Prepared
 → Revalidate
 → Commit
+→ User-visible stream/send
 ```
 
-不要把尚未 revalidate 的 token 直接视作已提交的用户可见副作用。未来若实现真正 live token streaming，应单独定义 `PartialCommit`。
+不要把：
 
-新增测试：stale ReplyTicket cancels generation；cancelled backend result cannot commit；proactive generation 被 direct user message supersede；取消 race 不产生重复发送；cancellation 不跨 Conversation 误杀其他 generation。
+```text
+Generated Token
+```
+
+自动视作：
+
+```text
+Committed Token
+```
+
+---
+
+## 7. Future PartialCommit
+
+如果未来做真正 token-by-token live streaming：
+
+需要单独定义：
+
+```text
+PartialCommit
+```
+
+并设计：
+
+- already visible prefix
+- cancellation semantics
+- correction behavior
+- collision semantics
+
+V5 第一阶段不要求实现。
+
+---
+
+## 8. Local GPU Cancellation
+
+本地 Backend 如果支持：
+
+应尽可能利用：
+
+```text
+abort handle
+cancellation token
+scheduler preemption
+```
+
+降低 stale generation 对 GPU 的占用。
+
+---
+
+## 9. 云 Backend Cancellation
+
+如果云 API 不支持真正 cancel：
+
+至少：
+
+- stop consuming stream if possible；
+- discard response；
+- record cancelled/stale metrics。
+
+---
+
+## 10. Metrics
+
+增加：
+
+```text
+yunxi_generation_cancelled_stale_total
+yunxi_generation_result_discarded_total
+yunxi_proactive_generation_preempted_total
+yunxi_precommit_buffered_generation_total
+```
+
+---
+
+## 11. 测试补充
+
+至少：
+
+- stale ReplyTicket cancels generation
+- cancelled result cannot commit
+- direct message preempts proactive generation
+- cancellation race does not duplicate send
+- cancellation scoped to correct Conversation
+- backend without cancel still discards stale result
+- buffered streaming revalidates before visibility
+
+---
+
+## 12. 核心结论
+
+Model Fabric v5 必须保证：
+
+> **模型“算完了”不代表这份结果仍然有资格进入真实世界。**
+
+最终能否发送，仍由：
+
+```text
+ConversationCoordinator
++
+Executive
++
+Action / Adapter
+```
+
+决定。

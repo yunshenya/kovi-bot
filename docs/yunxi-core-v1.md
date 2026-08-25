@@ -1,4 +1,6 @@
-# Yunxi Core：平台无关的持续认知 Agent 架构需求文档
+# Yunxi Core v1：平台无关持续 Agent 核心架构与迁移开发文档
+
+**文档状态：** 最终整合版  
 
 **项目：** `yunshenya/kovi-bot`  
 **文档版本：** 2.0  
@@ -53,7 +55,682 @@
 
 ---
 
-# 2. 最终产品定义
+# 2. 当前实现状态
+
+本节用于记录 `kovi-bot` 在 Yunxi Core 拆分开始前已经存在的成熟能力。
+
+**本节属于迁移基线，不得在后续架构优化中删除。**
+
+后续 V1～V5 的目标不是“重新发明这些能力”，而是逐步把已经成熟的实现迁移到更清晰的平台无关边界中。
+
+当前项目已经具备：
+
+```text
+长期记忆
+滚动摘要
+用户 / 群档案
+Bot Personality / Mood
+主动聊天
+群聊插话
+视觉 / 图片语义入口
+工具调用
+提醒
+跨群任务
+可打断回复
+消息合并 / batching / coalescing
+ConversationCoordinator
+ReplyTicket
+PostgreSQL 持久化
+可选 Redis
+```
+
+因此，新架构必须优先：
+
+```text
+Reuse
+→ Wrap
+→ Bridge
+→ Migrate
+```
+
+而不是：
+
+```text
+Delete
+→ Rewrite Everything
+```
+
+---
+
+## 2.1 当前运行时入口
+
+`plugins/model/src/lib.rs` 已经承担大量运行时初始化工作，包括但不限于：
+
+- Memory；
+- Reminders；
+- Agent Runtime / Goals；
+- Agent Tasks；
+- Sticker Memory；
+- Redis；
+- Tool Registry；
+- Group Access；
+- Message Handlers；
+- Proactive Manager；
+- 多个 Tokio 后台循环。
+
+因此：
+
+> `plugins/model` 当前仍然是生产 Host，不应在建立 `yunxi-core` 时一次性拆空。
+
+第一阶段应保持：
+
+```text
+plugins/model
+    │
+    ├── existing production runtime
+    │
+    └── Yunxi Core bridge / shadow integration
+```
+
+然后再逐步迁移。
+
+---
+
+## 2.2 当前后台运行循环
+
+现有系统不是一个纯粹的：
+
+```text
+Message → LLM → Reply
+```
+
+程序。
+
+当前已经存在多个长期后台循环，例如：
+
+```text
+proactive_chat loop
+→ 主动聊天
+
+reminders loop
+→ 提醒
+
+agent_tasks loop
+→ 跨群任务
+
+mood drift loop
+→ 情绪漂移
+
+maintenance loop
+→ Memory / runtime maintenance
+
+health loop
+→ 健康监控
+```
+
+所以 Yunxi Core 的 Event Runtime 必须吸收这些“长期运行”能力，而不是把系统退化回 request-response chatbot。
+
+---
+
+## 2.3 ConversationCoordinator / ReplyTicket
+
+当前 `ConversationCoordinator` 已经提供非常重要的会话生命周期基础，包括：
+
+- bounded shared lifecycle；
+- FIFO / queue semantics；
+- ReplyTicket；
+- interruption；
+- generation validity；
+- 消息竞争协调。
+
+这套机制必须复用。
+
+V1 新增的：
+
+```text
+PendingOutgoing
+ConversationVersion
+Thinking
+Prepared
+Committed
+Sent
+Superseded
+```
+
+应建立在现有：
+
+```text
+ConversationCoordinator
++
+ReplyTicket
+```
+
+之上。
+
+不得平行重新实现第二套 conversation generation coordinator。
+
+---
+
+## 2.4 Message batching / coalescing
+
+当前系统已经存在消息合并、batching / coalescing 相关能力。
+
+因此：
+
+用户短时间连续发送：
+
+```text
+A
+B
+C
+```
+
+不应重新设计成：
+
+```text
+A → generation 1
+B → generation 2
+C → generation 3
+```
+
+三个彼此竞争的完整回复流程。
+
+V1 Conversation Concurrency 应优先复用现有 batching / coalescing 逻辑，并只补充：
+
+- conversation version；
+- pending outgoing；
+- pre-commit revalidation；
+- collision handling。
+
+---
+
+## 2.5 agent_runtime
+
+当前 `agent_runtime.rs` 已经不是简单聊天回复代码。
+
+它已经具有：
+
+- persistent goals；
+- action executor；
+- 模型提出 Action；
+- Rust 控制真实副作用；
+- 权限校验；
+- ID；
+- persistence；
+- idempotency；
+- side-effect execution。
+
+现有原则本身与 Yunxi Core 目标一致：
+
+```text
+LLM proposes
+↓
+Rust validates
+↓
+Rust executes
+```
+
+因此 V1/V3 不得把这一层改回：
+
+```text
+LLM 直接执行副作用
+```
+
+未来应逐步把其平台相关 Action 映射为：
+
+```text
+Core Intent / Action
+→ Action Arbiter
+→ Host / Adapter
+```
+
+---
+
+## 2.6 agent_tasks
+
+当前 `agent_tasks.rs` 已经实现较成熟的持久化跨群任务状态机。
+
+已有能力包括：
+
+```text
+ask
+→ collect events
+→ quiet period / deadline
+→ summarize
+→ reply
+```
+
+并且已有：
+
+- lease；
+- retry；
+- idempotency；
+- persistence；
+- restart recovery。
+
+这是非常重要的生产级能力。
+
+后续 Goal / Plan / Executive 设计必须：
+
+```text
+integrate
+```
+
+而不是：
+
+```text
+replace with a new toy state machine
+```
+
+尤其 V3 `PlanState` 不得在没有迁移方案的情况下与 `agent_tasks` 重复实现同一套可靠任务状态机。
+
+---
+
+## 2.7 proactive_chat
+
+当前 `proactive_chat` 已经能执行主动消息，但主要机制仍偏向：
+
+```text
+周期检查
+→ 条件判断
+→ eligible target
+→ random / heuristic target selection
+→ topic generation
+→ send
+```
+
+因此它已经证明：
+
+> 系统可以在没有即时用户消息的情况下主动行动。
+
+但现有 proactive 还不是最终的 Yunxi Mind / Executive 驱动模式。
+
+长期迁移目标：
+
+```text
+IdleTick / WorldEvent
+→ OpenLoop
+→ Memory
+→ Relation
+→ Affect
+→ Interests
+→ InnerAgenda
+→ Executive
+→ ReachOut(PersonId)
+```
+
+现有 proactive 应作为第一版 Host 行为继续保留，随后逐步迁移到 Core。
+
+---
+
+## 2.8 topic_generator
+
+当前主动话题生成已经有相对成熟的 Memory-aware prompt，并存在类似 motive：
+
+```text
+follow_up
+share
+check_in
+react
+```
+
+且支持：
+
+```text
+[[NONE]]
+```
+
+这意味着当前系统已经具备：
+
+> “即使有主动机会，也可以决定不说。”
+
+后续 `Silent / Defer / NoAction` 应复用这一产品语义，而不是把所有主动 trigger 变成必发消息。
+
+---
+
+## 2.9 semantic.rs
+
+当前已有统一 Semantic Understanding。
+
+其结构化理解已经覆盖多类信息，例如：
+
+- mood；
+- stop / no-reply intent；
+- image intent；
+- conversation relevance；
+- interjection worthiness；
+- interests；
+- topics；
+- group atmosphere。
+
+这部分是未来：
+
+```text
+WorldEvent Observation Extraction
+Attention
+World Model extraction
+```
+
+的重要输入。
+
+不得为了 v2/v4 再平行建立完全重复的 message-understanding 模型链路。
+
+优先：
+
+```text
+reuse existing semantic result
+→ map into new domain snapshot
+```
+
+---
+
+## 2.10 mood_system
+
+当前 Mood System 已存在 Bot Personality / Mood 漂移逻辑。
+
+同时需要特别注意：
+
+> 当前部分 user semantic mood 可能影响 global bot mood。
+
+后续 v2 Affect 必须明确拆分：
+
+```text
+PerceivedUserAffect
+→ BotAppraisal / Reaction
+→ Slow Global Affect
+```
+
+避免不同 Person 的情绪信息通过 global state 无意串扰。
+
+迁移阶段必须保持现有行为兼容，并通过 Shadow / metrics 验证后再改变更新规则。
+
+---
+
+## 2.11 Memory
+
+当前 Memory 已具备：
+
+- `MemoryEntry`；
+- `UserProfile`；
+- `GroupProfile`；
+- `BotPersonality`；
+- rolling summaries；
+- proactive state；
+- PostgreSQL persistence。
+
+当前 Memory 已经是生产系统的重要基础。
+
+现阶段主要缺少更明确的：
+
+```text
+Episodic Memory
+Prospective / OpenLoop Memory
+Platform-independent PersonId / ConversationId scope
+```
+
+因此后续 Memory v2 应：
+
+```text
+bridge / dual-read / dual-write / migrate
+```
+
+而不是 destructive rewrite。
+
+旧 Memory 数据不得自动删除。
+
+---
+
+## 2.12 当前 Memory Scope 的平台耦合
+
+现有 Memory 仍较多依赖类似：
+
+```text
+subject_id: i64
+```
+
+的 QQ-era scope。
+
+长期目标是：
+
+```rust
+pub enum MemoryScope {
+    Person(PersonId),
+    Conversation(ConversationId),
+    Global,
+}
+```
+
+迁移时：
+
+```text
+QQ private subject
+→ ExternalIdentity
+→ PersonId
+
+QQ group subject
+→ ExternalConversation
+→ ConversationId
+```
+
+---
+
+## 2.13 Reminder
+
+当前 Reminder 已经存在可靠提醒能力。
+
+因此必须明确：
+
+```text
+Reminder
+≠ OpenLoop
+```
+
+Reminder：
+
+```text
+用户明确要求在某时交付
+→ reliable MustExecute
+```
+
+OpenLoop：
+
+```text
+系统认为未来值得重新关注
+→ Planner 可 Reply / Silent / Defer
+```
+
+不得用 v2/v3 的自主行为机制削弱 Reminder reliability。
+
+---
+
+## 2.14 tool_access
+
+当前 `tool_access.rs` 已经提供较强 Capability / Security Boundary，包括：
+
+- ToolExecutionContext；
+- authorization；
+- admin control；
+- capability restrictions；
+- tool whitelist / scope。
+
+这部分必须作为 v1 ActionPort / v3 Executive 的下层硬边界继续保留。
+
+原则：
+
+```text
+Safety / Permission
+>
+MustExecute
+>
+Executive
+>
+Mind Preference
+```
+
+Mind / World Model / Planner 永远不能绕过现有工具权限。
+
+---
+
+## 2.15 ModelGateway / 当前模型调用
+
+当前模型调用已经具备：
+
+- OpenAI-compatible model 接入；
+- per-scope conversation history；
+- model concurrency；
+- generation pipeline。
+
+v5 应将它：
+
+```text
+wrap as Backend
+```
+
+而不是直接删除。
+
+第一步应完成：
+
+```text
+Existing ModelGateway
+→ ModelBackend Adapter
+```
+
+并保持生产行为不变。
+
+之后才增加：
+
+```text
+ModelRouter
+LocalBackend
+Role-specific routing
+```
+
+---
+
+## 2.16 当前角色提示约束
+
+现有模型提示中存在较强 human-roleplay / real-person style guard。
+
+长期更推荐：
+
+> 保持自然角色表现，但被直接询问身份时不需要虚构现实人类身份。
+
+该问题属于 Persona / Product Policy 调整，不应和 Core 拆分同时大范围修改。
+
+迁移阶段优先保持行为稳定。
+
+---
+
+## 2.17 当前 Embedding 状态
+
+在此前仓库检查中，没有发现一个已经成为核心依赖的完整 embedding retrieval layer。
+
+因此：
+
+v1～v4 不应假设：
+
+```text
+vector DB 已经存在
+```
+
+可以先使用：
+
+- existing memory search；
+- recency；
+- salience；
+- structured scope；
+- semantic model。
+
+v5 再抽象 `EmbeddingBackend`，需要时逐步引入 hybrid retrieval。
+
+---
+
+## 2.18 Group Authorization / Rate Limit / Transport
+
+当前仓库已经有：
+
+- group access；
+- message transport；
+- rate limiting；
+- authorization；
+- existing reply generation pipeline。
+
+这些都属于已经成熟的生产机制。
+
+新架构必须复用。
+
+---
+
+## 2.19 CI / Test / Security / Deployment
+
+当前项目已经具有较好的工程纪律，包括：
+
+- `cargo fmt`；
+- `cargo clippy`；
+- PostgreSQL integration tests；
+- release build；
+- RustSec；
+- secret scanning；
+- deploy / rollback 相关流程。
+
+因此所有 V1～V5 Phase 都必须延续：
+
+```text
+READ
+→ PLAN
+→ IMPLEMENT
+→ FORMAT
+→ TEST
+→ REVIEW
+→ FIX
+→ RETEST
+```
+
+不得以“架构大改”为理由绕过现有测试与安全流程。
+
+---
+
+## 2.20 当前实现状态的迁移结论
+
+当前 `kovi-bot` 已经拥有大量 Agent 所需的局部能力。
+
+真正缺少的不是：
+
+> “从零写一个 Agent。”
+
+而是：
+
+> “把这些已经存在的能力统一到平台无关、事件驱动、长期可演进的 Yunxi Core 边界中。”
+
+因此总体迁移策略必须是：
+
+```text
+现有生产机制
+      │
+      ▼
+Adapter / Port / Bridge
+      │
+      ▼
+Shadow Runtime
+      │
+      ▼
+逐模块迁移
+      │
+      ▼
+Yunxi Core 成为真正核心
+```
+
+而不是：
+
+```text
+停止现有系统
+→ 新建一套完全不同实现
+→ 一次性切换
+```
+
+这也是后续所有开发文档必须遵守的基线。
+
+# 3. 最终产品定义
 
 不要把芸汐理解成：
 
@@ -94,9 +771,9 @@ LLM
 
 ---
 
-# 3. 最高级架构原则
+# 4. 最高级架构原则
 
-## 3.1 Core 不认识 QQ
+## 4.1 Core 不认识 QQ
 
 `yunxi-core` 中禁止直接出现：
 
@@ -132,7 +809,7 @@ Goal
 
 ---
 
-# 4. 核心与平台关系
+# 5. 核心与平台关系
 
 输入：
 
@@ -196,7 +873,7 @@ Push Notification
 
 ---
 
-# 5. 关键产品要求
+# 6. 关键产品要求
 
 应该能够做到：
 
@@ -235,7 +912,7 @@ Yunxi Desktop
 
 ---
 
-# 6. Workspace 最终结构
+# 7. Workspace 最终结构
 
 长期建议：
 
@@ -283,7 +960,7 @@ kovi-bot/
 
 ---
 
-# 7. 第一阶段实际物理结构
+# 8. 第一阶段实际物理结构
 
 初期只强制增加：
 
@@ -322,7 +999,7 @@ plugins/model
 
 ---
 
-# 8. Yunxi Core 的依赖边界
+# 9. Yunxi Core 的依赖边界
 
 `yunxi-core`：
 
@@ -355,7 +1032,7 @@ plugins/model
 
 ---
 
-# 9. Ports and Adapters
+# 10. Ports and Adapters
 
 Core 通过 trait 使用外部世界。
 
@@ -410,7 +1087,7 @@ yunxi-adapter-desktop
 
 ---
 
-# 10. Core 必须可独立测试
+# 11. Core 必须可独立测试
 
 必须能够：
 
@@ -441,7 +1118,7 @@ FakeActionPort
 
 ---
 
-# 11. 内部身份系统
+# 12. 内部身份系统
 
 这是本次架构调整最重要的内容之一。
 
@@ -458,7 +1135,7 @@ group_id: i64
 
 ---
 
-# 12. PersonId
+# 13. PersonId
 
 芸汐认识的是：
 
@@ -485,7 +1162,7 @@ PersonId:
 
 ---
 
-# 13. ExternalIdentity
+# 14. ExternalIdentity
 
 平台身份：
 
@@ -533,7 +1210,7 @@ PersonId abc
 
 ---
 
-# 14. 禁止自动合并身份
+# 15. 禁止自动合并身份
 
 绝不允许根据：
 
@@ -558,7 +1235,7 @@ PersonId abc
 
 ---
 
-# 15. Person 数据库
+# 16. Person 数据库
 
 新增平台无关身份表。
 
@@ -588,7 +1265,7 @@ CREATE TABLE yunxi_external_identities (
 
 ---
 
-# 16. QQ Identity Resolver
+# 17. QQ Identity Resolver
 
 当前 Kovi Adapter：
 
@@ -615,9 +1292,8 @@ PersonId
 
 再送给 Core。
 
----
 
-# 17. ConversationId
+# 18. ConversationId
 
 同样：
 
@@ -633,9 +1309,8 @@ QQ群 98765
 pub struct ConversationId(Uuid);
 ```
 
----
 
-# 18. ConversationKind
+# 19. ConversationKind
 
 ```rust
 pub enum ConversationKind {
@@ -654,9 +1329,8 @@ GameSession
 
 不要现在过度扩展。
 
----
 
-# 19. Conversation 表
+# 20. Conversation 表
 
 建议：
 
@@ -692,9 +1366,8 @@ QQ group 98765
 ConversationId xyz
 ```
 
----
 
-# 20. ConversationMember
+# 21. ConversationMember
 
 建议：
 
@@ -720,7 +1393,7 @@ CREATE TABLE yunxi_conversation_members (
 
 ---
 
-# 21. Core 的 Message 模型
+# 22. Core 的 Message 模型
 
 定义内部：
 
@@ -742,7 +1415,7 @@ pub struct Message {
 
 ---
 
-# 22. MessageId
+# 23. MessageId
 
 使用：
 
@@ -758,7 +1431,7 @@ OneBot message_id: i32
 
 ---
 
-# 23. 外部消息 ID
+# 24. 外部消息 ID
 
 Adapter 保存：
 
@@ -784,7 +1457,7 @@ OneBot message_id
 
 ---
 
-# 24. WorldEvent
+# 25. WorldEvent
 
 系统统一事件：
 
@@ -806,7 +1479,7 @@ pub struct WorldEvent {
 
 ---
 
-# 25. EventScope
+# 26. EventScope
 
 禁止使用：
 
@@ -837,7 +1510,7 @@ pub enum EventScope {
 
 ---
 
-# 26. WorldEventKind
+# 27. WorldEventKind
 
 至少：
 
@@ -893,7 +1566,7 @@ NotificationOpened
 
 ---
 
-# 27. Adapter 的唯一输入职责
+# 28. Adapter 的唯一输入职责
 
 例如 `KoviAdapter`：
 
@@ -923,7 +1596,7 @@ OpenLoop
 
 ---
 
-# 28. Environment Capability
+# 29. Environment Capability
 
 不同平台能力不同。
 
@@ -956,7 +1629,7 @@ pub struct EnvironmentCapabilities {
 
 ---
 
-# 29. Action 也必须平台无关
+# 30. Action 也必须平台无关
 
 禁止 Core 输出：
 
@@ -989,7 +1662,7 @@ pub enum ProposedAction {
 
 ---
 
-# 30. SendMessage
+# 31. SendMessage
 
 ```rust
 pub struct SendMessageAction {
@@ -1003,7 +1676,7 @@ pub struct SendMessageAction {
 
 ---
 
-# 31. ReachOut
+# 32. ReachOut
 
 这个抽象尤其重要。
 
@@ -1027,7 +1700,7 @@ pub struct ReachOutAction {
 
 ---
 
-# 32. DeliveryResolver
+# 33. DeliveryResolver
 
 平台层负责：
 
@@ -1049,7 +1722,7 @@ Desktop
 
 ---
 
-# 33. 当前只有 QQ 时
+# 34. 当前只有 QQ 时
 
 ```text
 ReachOut(PersonId)
@@ -1063,7 +1736,7 @@ send
 
 ---
 
-# 34. 未来只有 App 时
+# 35. 未来只有 App 时
 
 ```text
 ReachOut(PersonId)
@@ -1077,7 +1750,7 @@ Core 完全不变。
 
 ---
 
-# 35. 多平台同时在线
+# 36. 多平台同时在线
 
 以后可能：
 
@@ -1118,7 +1791,7 @@ Host / Delivery Router
 
 ---
 
-# 36. Cognitive Runtime
+# 37. Cognitive Runtime
 
 Core 的核心：
 
@@ -1146,7 +1819,7 @@ WORLD
 
 ---
 
-# 37. CognitiveRuntime
+# 38. CognitiveRuntime
 
 建议：
 
@@ -1175,7 +1848,7 @@ PgPool
 
 ---
 
-# 38. CoreServices
+# 39. CoreServices
 
 例如：
 
@@ -1199,7 +1872,7 @@ pub struct CoreServices {
 
 ---
 
-# 39. Event Bus
+# 40. Event Bus
 
 继续使用：
 
@@ -1217,7 +1890,7 @@ bounded mpsc
 
 ---
 
-# 40. Backpressure
+# 41. Backpressure
 
 队列必须 bounded。
 
@@ -1237,7 +1910,7 @@ try_send
 
 ---
 
-# 41. Attention
+# 42. Attention
 
 继续采用：
 
@@ -1262,7 +1935,7 @@ LLM
 
 ---
 
-# 42. AttentionDisposition
+# 43. AttentionDisposition
 
 ```rust
 pub enum AttentionDisposition {
@@ -1275,7 +1948,7 @@ pub enum AttentionDisposition {
 
 ---
 
-# 43. MustHandle
+# 44. MustHandle
 
 以下始终 MustHandle：
 
@@ -1290,7 +1963,7 @@ pub enum AttentionDisposition {
 
 ---
 
-# 44. WorkingState
+# 45. WorkingState
 
 平台无关：
 
@@ -1306,9 +1979,8 @@ pub struct WorkingState {
 }
 ```
 
----
 
-# 45. ConversationWorkingState
+# 46. ConversationWorkingState
 
 ```rust
 pub struct ConversationWorkingState {
@@ -1332,7 +2004,7 @@ pub struct ConversationWorkingState {
 
 ---
 
-# 46. 所有 State 必须 bounded
+# 47. 所有 State 必须 bounded
 
 例如：
 
@@ -1347,7 +2019,7 @@ active participants: 32
 
 ---
 
-# 47. OpenLoop
+# 48. OpenLoop
 
 继续作为非常重要的能力。
 
@@ -1366,7 +2038,7 @@ OpenLoop:
 
 ---
 
-# 48. OpenLoop 不属于 QQ
+# 49. OpenLoop 不属于 QQ
 
 必须：
 
@@ -1388,7 +2060,7 @@ pub struct OpenLoop {
 
 ---
 
-# 49. OpenLoopOwner
+# 50. OpenLoopOwner
 
 ```rust
 pub enum OpenLoopOwner {
@@ -1408,7 +2080,7 @@ QQ user_id
 
 ---
 
-# 50. OpenLoop Store
+# 51. OpenLoop Store
 
 Core：
 
@@ -1432,7 +2104,7 @@ SQLite implementation
 
 ---
 
-# 51. OpenLoop PostgreSQL
+# 52. OpenLoop PostgreSQL
 
 建议：
 
@@ -1468,7 +2140,7 @@ CREATE TABLE yunxi_open_loops (
 
 ---
 
-# 52. Reminder 和 OpenLoop 必须继续分开
+# 53. Reminder 和 OpenLoop 必须继续分开
 
 Reminder：
 
@@ -1480,7 +2152,7 @@ OpenLoop：
 
 ---
 
-# 53. Affect
+# 54. Affect
 
 也必须属于：
 
@@ -1496,7 +2168,7 @@ QQ Bot mood
 
 ---
 
-# 54. AffectState
+# 55. AffectState
 
 ```rust
 pub struct AffectState {
@@ -1512,7 +2184,7 @@ pub struct AffectState {
 
 ---
 
-# 55. Relation
+# 56. Relation
 
 关系必须与：
 
@@ -1540,7 +2212,7 @@ pub struct RelationState {
 
 ---
 
-# 56. 关系不能属于某个平台
+# 57. 关系不能属于某个平台
 
 错误：
 
@@ -1562,7 +2234,7 @@ Person abc 的一个外部身份。
 
 ---
 
-# 57. Memory v2
+# 58. Memory v2
 
 这是长期必须解决的问题。
 
@@ -1588,7 +2260,7 @@ pub enum MemoryScope {
 
 ---
 
-# 58. 不要立刻破坏旧 Memory
+# 59. 不要立刻破坏旧 Memory
 
 必须：
 
@@ -1608,7 +2280,7 @@ ALTER 旧表然后一次把所有生产数据改掉
 
 ---
 
-# 59. 新 Memory 表建议
+# 60. 新 Memory 表建议
 
 长期：
 
@@ -1638,7 +2310,7 @@ CREATE TABLE yunxi_memories (
 
 ---
 
-# 60. Legacy Memory Migration
+# 61. Legacy Memory Migration
 
 需要单独 migration service。
 
@@ -1667,7 +2339,7 @@ ConversationId
 
 ---
 
-# 61. 双读策略
+# 62. 双读策略
 
 迁移期：
 
@@ -1681,7 +2353,7 @@ legacy memory fallback
 
 ---
 
-# 62. 双写策略
+# 63. 双写策略
 
 在稳定迁移阶段：
 
@@ -1701,7 +2373,7 @@ legacy memory fallback
 
 ---
 
-# 63. 不得自动删除旧 Memory
+# 64. 不得自动删除旧 Memory
 
 迁移成功也先保留。
 
@@ -1713,7 +2385,7 @@ legacy memory fallback
 
 ---
 
-# 64. Planner
+# 65. Planner
 
 Core Planner 输入必须平台无关。
 
@@ -1737,7 +2409,7 @@ available capabilities
 
 ---
 
-# 65. PlannerInput
+# 66. PlannerInput
 
 ```rust
 pub struct PlannerInput {
@@ -1760,7 +2432,7 @@ pub struct PlannerInput {
 
 ---
 
-# 66. PlannerOutput
+# 67. PlannerOutput
 
 只输出：
 
@@ -1783,7 +2455,7 @@ pub struct DecisionPlan {
 
 ---
 
-# 67. Intent 与 Action 分开
+# 68. Intent 与 Action 分开
 
 推荐：
 
@@ -1810,7 +2482,7 @@ Action：
 
 ---
 
-# 68. 示例
+# 69. 示例
 
 Core：
 
@@ -1834,7 +2506,7 @@ Push notification
 
 ---
 
-# 69. Action Arbiter
+# 70. Action Arbiter
 
 必须存在。
 
@@ -1851,7 +2523,7 @@ Push notification
 
 ---
 
-# 70. 平台权限仍由 Adapter 强制
+# 71. 平台权限仍由 Adapter 强制
 
 例如 QQ 跨群：
 
@@ -1873,7 +2545,7 @@ SendMessage(
 
 ---
 
-# 71. Goal
+# 72. Goal
 
 Goal 也必须平台无关。
 
@@ -1891,7 +2563,7 @@ pub struct Goal {
 
 ---
 
-# 72. 当前 agent_tasks
+# 73. 当前 agent_tasks
 
 当前跨群问答状态机不要重写。
 
@@ -1909,7 +2581,7 @@ GoalUpdated WorldEvent
 
 ---
 
-# 73. Proactive 行为
+# 74. Proactive 行为
 
 主动行为必须变成：
 
@@ -1925,7 +2597,7 @@ QQ push
 
 ---
 
-# 74. ProactiveMotive
+# 75. ProactiveMotive
 
 ```rust
 pub enum ProactiveMotive {
@@ -1943,7 +2615,7 @@ pub enum ProactiveMotive {
 
 ---
 
-# 75. Proactive Candidate
+# 76. Proactive Candidate
 
 目标是：
 
@@ -1959,7 +2631,7 @@ QQ user id
 
 ---
 
-# 76. Proactive Flow
+# 77. Proactive Flow
 
 ```text
 IdleTick
@@ -1987,7 +2659,7 @@ Adapter
 
 ---
 
-# 77. 主动行为失败
+# 78. 主动行为失败
 
 如果当前：
 
@@ -2011,7 +2683,7 @@ ActionFailed WorldEvent
 
 ---
 
-# 78. ModelBackend
+# 79. ModelBackend
 
 Core 不应该硬编码：
 
@@ -2031,7 +2703,7 @@ ModelGateway
 
 ---
 
-# 79. Tool
+# 80. Tool
 
 工具也不应该全部绑在 Kovi plugin。
 
@@ -2045,7 +2717,7 @@ Tool Runtime
 
 ---
 
-# 80. 环境专属 Tool
+# 81. 环境专属 Tool
 
 有些工具：
 
@@ -2067,7 +2739,7 @@ Planner 才能看到。
 
 ---
 
-# 81. Standalone App 架构
+# 82. Standalone App 架构
 
 未来至少支持两种方式。
 
@@ -2096,7 +2768,7 @@ Desktop/Mobile/Web
 
 ---
 
-# 82. 推荐未来 Desktop
+# 83. 推荐未来 Desktop
 
 例如：
 
@@ -2110,7 +2782,7 @@ Rust Yunxi Core
 
 ---
 
-# 83. yunxi-protocol
+# 84. yunxi-protocol
 
 长期如果使用 Server 模式，可以增加：
 
@@ -2130,7 +2802,7 @@ crates/yunxi-protocol
 
 ---
 
-# 84. CLI Host
+# 85. CLI Host
 
 强烈建议较早实现一个：
 
@@ -2146,7 +2818,7 @@ yunxi-cli
 
 ---
 
-# 85. CLI 验收
+# 86. CLI 验收
 
 执行：
 
@@ -2180,7 +2852,7 @@ Yunxi: ...
 
 ---
 
-# 86. Phase 0：建立 Core crate
+# 87. Phase 0：建立 Core crate
 
 新增：
 
@@ -2203,7 +2875,7 @@ ports
 
 ---
 
-# 87. Phase 0 关键验收
+# 88. Phase 0 关键验收
 
 运行：
 
@@ -2225,7 +2897,7 @@ sqlx
 
 ---
 
-# 88. Phase 1：Identity
+# 89. Phase 1：Identity
 
 实现：
 
@@ -2247,7 +2919,7 @@ yunxi_external_conversations
 
 ---
 
-# 89. Phase 1 Kovi Bridge
+# 90. Phase 1 Kovi Bridge
 
 Kovi message：
 
@@ -2282,7 +2954,7 @@ new ID
 
 ---
 
-# 90. Phase 2：WorldEvent Shadow Runtime
+# 91. Phase 2：WorldEvent Shadow Runtime
 
 Kovi 消息额外发送：
 
@@ -2308,7 +2980,7 @@ log
 
 ---
 
-# 91. Phase 3：OpenLoop
+# 92. Phase 3：OpenLoop
 
 OpenLoop 必须从第一天就使用：
 
@@ -2326,7 +2998,7 @@ QQ subject_id
 
 ---
 
-# 92. Phase 4：Memory Bridge
+# 93. Phase 4：Memory Bridge
 
 新增：
 
@@ -2344,7 +3016,7 @@ MemoryStore port
 
 ---
 
-# 93. Phase 5：Proactive
+# 94. Phase 5：Proactive
 
 迁移主动聊天：
 
@@ -2362,7 +3034,7 @@ Core proactive motive
 
 ---
 
-# 94. Phase 6：Intent / Action
+# 95. Phase 6：Intent / Action
 
 增加：
 
@@ -2375,9 +3047,8 @@ DeliveryResolver
 
 Core 不执行 Kovi API。
 
----
 
-# 95. Phase 7：Direct Conversation
+# 96. Phase 7：Direct Conversation
 
 逐步让：
 
@@ -2401,7 +3072,7 @@ MessageReceived
 
 ---
 
-# 96. 长期这些功能归属
+# 97. 长期这些功能归属
 
 推荐：
 
@@ -2427,13 +3098,13 @@ MessageReceived
 
 ---
 
-# 97. Phase 8：Affect
+# 98. Phase 8：Affect
 
 将 mood 从 QQ 插件搬入 Core。
 
 ---
 
-# 98. Phase 9：Relation
+# 99. Phase 9：Relation
 
 将关系状态与：
 
@@ -2445,7 +3116,7 @@ PersonId
 
 ---
 
-# 99. Phase 10：Memory v2
+# 100. Phase 10：Memory v2
 
 实现真正：
 
@@ -2457,7 +3128,7 @@ platform-independent memory
 
 ---
 
-# 100. Phase 11：Goal Event Integration
+# 101. Phase 11：Goal Event Integration
 
 Reminder / agent_tasks / tools：
 
@@ -2469,7 +3140,7 @@ generic WorldEvent
 
 ---
 
-# 101. Phase 12：CLI Host
+# 102. Phase 12：CLI Host
 
 实现一个最小：
 
@@ -2481,7 +3152,7 @@ apps/yunxi-cli
 
 ---
 
-# 102. Phase 13：App 预留
+# 103. Phase 13：App 预留
 
 这一阶段不要求开发完整 App。
 
@@ -2501,7 +3172,7 @@ App output
 
 ---
 
-# 103. App 所需未来事件
+# 104. App 所需未来事件
 
 架构要允许：
 
@@ -2518,7 +3189,7 @@ NotificationOpened
 
 ---
 
-# 104. App 所需未来 Action
+# 105. App 所需未来 Action
 
 架构要允许：
 
@@ -2534,7 +3205,7 @@ OpenPanel
 
 ---
 
-# 105. 数据可携带性
+# 106. 数据可携带性
 
 未来必须可以：
 
@@ -2552,7 +3223,7 @@ optional external identity metadata
 
 ---
 
-# 106. 数据删除
+# 107. 数据删除
 
 用户删除数据时必须删除：
 
@@ -2571,7 +3242,7 @@ QQ subject_id
 
 ---
 
-# 107. Identity unlink
+# 108. Identity unlink
 
 未来用户可能要求：
 
@@ -2599,7 +3270,7 @@ Relation
 
 ---
 
-# 108. Identity delete
+# 109. Identity delete
 
 而：
 
@@ -2615,7 +3286,7 @@ Person domain data
 
 ---
 
-# 109. 数据迁移必须可回滚
+# 110. 数据迁移必须可回滚
 
 所有新表：
 
@@ -2631,7 +3302,7 @@ additive
 
 ---
 
-# 110. 不要一次“大搬家”
+# 111. 不要一次“大搬家”
 
 尤其禁止 Codex 第一轮：
 
@@ -2653,7 +3324,7 @@ additive
 
 ---
 
-# 111. Commit 原则
+# 112. Commit 原则
 
 每个阶段独立 commit。
 
@@ -2673,7 +3344,7 @@ feat(core): add proactive reach-out intents
 
 ---
 
-# 112. Platform Boundary Test
+# 113. Platform Boundary Test
 
 建议专门写一个 lint/test。
 
@@ -2697,7 +3368,7 @@ kovi
 
 ---
 
-# 113. 代码级禁止项
+# 114. 代码级禁止项
 
 在：
 
@@ -2737,7 +3408,7 @@ PgPool
 
 ---
 
-# 114. 可接受的外部 ID
+# 115. 可接受的外部 ID
 
 Core 某些诊断 DTO 可以存在：
 
@@ -2756,7 +3427,7 @@ Core 不允许解释它。
 
 ---
 
-# 115. PersonId 不暴露平台
+# 116. PersonId 不暴露平台
 
 不要：
 
@@ -2766,9 +3437,8 @@ person_id = "qq:123456"
 
 应该使用真正平台无关 UUID。
 
----
 
-# 116. ConversationId 同理
+# 117. ConversationId 同理
 
 不要：
 
@@ -2778,7 +3448,7 @@ conversation_id = "qq-group-9988"
 
 ---
 
-# 117. Owner 身份
+# 118. Owner 身份
 
 当前主管理员最终应该映射到：
 
@@ -2807,7 +3477,7 @@ owner Person 的 QQ ExternalIdentity。
 
 ---
 
-# 118. 未来 App Owner
+# 119. 未来 App Owner
 
 Yunxi App 登录后：
 
@@ -2825,7 +3495,7 @@ owner PersonId
 
 ---
 
-# 119. Persona 本身
+# 120. Persona 本身
 
 Persona 属于：
 
@@ -2847,7 +3517,7 @@ Yunxi persona config
 
 ---
 
-# 120. 身份透明性
+# 121. 身份透明性
 
 芸汐是：
 
@@ -2859,7 +3529,7 @@ Yunxi persona config
 
 ---
 
-# 121. 最终认知模型
+# 122. 最终认知模型
 
 芸汐不是：
 
@@ -2904,7 +3574,7 @@ Yunxi persona config
 
 ---
 
-# 122. 最终宿主模型
+# 123. 最终宿主模型
 
 ```text
                      YUNXI CORE
@@ -2921,7 +3591,7 @@ Yunxi persona config
 
 ---
 
-# 123. 最终最重要的边界
+# 124. 最终最重要的边界
 
 下面这一句话作为整个项目的架构铁律：
 
@@ -2959,7 +3629,7 @@ Mobile：
 
 ---
 
-# 124. 第一轮 Codex 实施范围
+# 125. 第一轮 Codex 实施范围
 
 第一轮不要实现整个 PRD。
 
@@ -3006,7 +3676,7 @@ shadow Yunxi Core
 
 ---
 
-# 125. 第一轮严格禁止
+# 126. 第一轮严格禁止
 
 第一轮不得：
 
@@ -3022,7 +3692,7 @@ shadow Yunxi Core
 
 ---
 
-# 126. 第一轮完成标准
+# 127. 第一轮完成标准
 
 必须能够证明：
 
@@ -3051,7 +3721,7 @@ WorkingState
 
 ---
 
-# 127. 第二轮
+# 128. 第二轮
 
 实现：
 
@@ -3069,7 +3739,7 @@ PersonId / ConversationId
 
 ---
 
-# 128. 第三轮
+# 129. 第三轮
 
 主动行为：
 
@@ -3091,13 +3761,13 @@ QQ
 
 ---
 
-# 129. 第四轮
+# 130. 第四轮
 
 实现 Action / Delivery Router。
 
 ---
 
-# 130. 第五轮
+# 131. 第五轮
 
 实现：
 
@@ -3110,7 +3780,7 @@ Relation
 
 ---
 
-# 131. 第六轮
+# 132. 第六轮
 
 Memory v2。
 
@@ -3118,7 +3788,7 @@ Memory v2。
 
 ---
 
-# 132. 第七轮
+# 133. 第七轮
 
 增加：
 
@@ -3130,7 +3800,7 @@ yunxi-cli
 
 ---
 
-# 133. 最终 Definition of Done
+# 134. 最终 Definition of Done
 
 平台无关架构完成必须满足：
 
@@ -3209,7 +3879,7 @@ QQ
 
 ---
 
-# 134. 最终产品验收场景
+# 135. 最终产品验收场景
 
 今天：
 
@@ -3269,7 +3939,7 @@ App：
 
 ---
 
-# 135. 给 Codex 的最高优先级说明
+# 136. 给 Codex 的最高优先级说明
 
 将下面这段放在任务提示词最前面：
 
@@ -3291,9 +3961,9 @@ App：
 
 ---
 
-# 136. Codex 无人值守实施规则
+# 137. Codex 无人值守实施规则
 
-## 136.1 总原则
+## 137.1 总原则
 
 这是一次允许长时间无人值守执行的开发任务。在没有真正阻塞的情况下：
 
@@ -3316,7 +3986,7 @@ correctness
 
 ---
 
-## 136.2 开始编码之前
+## 137.2 开始编码之前
 
 先阅读至少：
 
@@ -3346,7 +4016,7 @@ PRD 中伪代码是设计目标，不要求机械照抄。
 
 ---
 
-## 136.3 Git 安全
+## 137.3 Git 安全
 
 开始前检查：
 
@@ -3374,7 +4044,7 @@ git status
 
 ---
 
-## 136.4 基线验证
+## 137.4 基线验证
 
 编码前至少尝试：
 
@@ -3395,7 +4065,7 @@ cargo test --workspace
 
 ---
 
-## 136.5 每个 Phase 的固定流程
+## 137.5 每个 Phase 的固定流程
 
 严格：
 
@@ -3426,7 +4096,7 @@ feat(core): add proactive reach-out intents
 
 ---
 
-## 136.6 每阶段测试
+## 137.6 每阶段测试
 
 至少运行适用的：
 
@@ -3447,7 +4117,7 @@ cargo test --workspace
 
 ---
 
-## 136.7 Review 要求
+## 137.7 Review 要求
 
 每个 Phase 完成后，在 commit 前必须检查：
 
@@ -3475,7 +4145,7 @@ cargo test --workspace
 
 ---
 
-## 136.8 自动停止条件
+## 137.8 自动停止条件
 
 无人值守不等于无条件继续。
 
@@ -3500,7 +4170,7 @@ cargo test --workspace
 
 ---
 
-# 137. 非目标 / 当前阶段禁止事项
+# 138. 非目标 / 当前阶段禁止事项
 
 当前架构重构阶段不要优先实现：
 
@@ -3532,7 +4202,7 @@ Effector / Adapter
 
 ---
 
-# 138. 最终实施哲学
+# 139. 最终实施哲学
 
 不要把芸汐实现成：
 
@@ -3591,17 +4261,16 @@ WORLD
 
 ---
 
-# 139. 一句话架构铁律
+# 140. 一句话架构铁律
 
 > **Yunxi Core 决定芸汐想做什么；Platform Adapter 决定这个环境里具体怎么做。**
 
 如果一个新的认知领域类型必须知道“QQ 号”“QQ群号”“Kovi RuntimeBot”才能工作，那么这个抽象大概率放错了层。
 
----
 
-# 140. Conversation Concurrency v1.1：双向同时发言与发送前重校验
+# 141. Conversation Concurrency v1：双向同时发言与发送前重校验
 
-本架构增加跨层规范：`yunxi-conversation-concurrency-v1.1-optimization-spec.md`。
+本架构增加跨层规范：`yunxi-conversation-concurrency-v1-optimization-spec.md`。
 
 V1 Core 必须为普通自然语言输出维护：
 

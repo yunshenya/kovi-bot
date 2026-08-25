@@ -1,4 +1,6 @@
-# Yunxi World Model v4：世界状态、因果建模、预测与反事实模拟需求文档
+# Yunxi World Model v4：世界状态、因果建模、预测与反事实模拟开发文档
+
+**文档状态：** 最终整合版  
 
 **文档版本：** 4.0  
 **适用项目：** Yunxi Core / Yunxi Mind / Yunxi Executive  
@@ -4733,3 +4735,198 @@ V7 HyperExecutive
 接下来最重要的是：
 
 > **让这四层真实工作得好。**
+
+
+# Message Collision as World State
+
+
+## 1. 新增 Conversation Concurrency Observation
+
+World Model v4 可接收：
+
+```text
+MessageCollisionDetected
+ConversationFloorChanged
+PendingQuestionAnswered
+OutgoingCommitted
+```
+
+---
+
+## 2. MessageCollisionDetected
+
+当：
+
+```text
+Outgoing 已 Committed
++
+Incoming message 几乎同时发生
+```
+
+产生：
+
+```text
+WorldEvent::MessageCollisionDetected
+```
+
+建议：
+
+```rust
+pub struct MessageCollision {
+    pub conversation_id: ConversationId,
+    pub incoming_message_id: MessageId,
+    pub outgoing_message_id: MessageId,
+    pub delta_ms: i64,
+    pub outgoing_was_committed: bool,
+}
+```
+
+---
+
+## 3. Collision 是正常 World Event
+
+禁止将 Message Collision：
+
+- 当成系统异常；
+- 每次自动撤回；
+- 每次自动道歉；
+- 每次固定输出“撞消息了”。
+
+它只是：
+
+```text
+Conversation State changed
+```
+
+的一种形式。
+
+---
+
+## 4. SocialScene 更新
+
+Collision 可以短期影响：
+
+```text
+current_floor
+recent_speaking_order
+conversation_version
+interruption_cost
+```
+
+但不自动产生心理判断。
+
+---
+
+## 5. 禁止心理过拟合
+
+碰撞不能自动推断：
+
+```text
+用户生气
+用户着急
+用户不耐烦
+用户故意打断
+```
+
+除非有独立明确证据。
+
+---
+
+## 6. PendingQuestionAnswered
+
+如果新用户消息已经回答 PendingOutgoing 的核心问题：
+
+World Model 可以产生：
+
+```text
+PendingQuestionAnswered
+```
+
+供 Executive 快速 revalidate。
+
+例如：
+
+```text
+Pending:
+“面试怎么样？”
+
+Incoming:
+“我面试过了！”
+```
+
+---
+
+## 7. WorldModel 不负责 Cancel / Send
+
+WorldModel 只负责：
+
+```text
+观察外部世界
+更新 SocialScene / Situation / Observation
+```
+
+不负责：
+
+```text
+Cancel PendingOutgoing
+Commit Outgoing
+Send Message
+```
+
+这些分别属于 Executive / Core。
+
+---
+
+## 8. Collision 与 Prediction
+
+高价值主动消息在 commit 前可将：
+
+```text
+conversation activity
+recent incoming rate
+social floor
+```
+
+纳入 interruption prediction。
+
+但普通 direct reply 不需要额外 Simulation。
+
+---
+
+## 9. 时间窗口
+
+near-simultaneous threshold 可配置，例如：
+
+```text
+<= 1500 ms
+```
+
+只作为 Conversation / SocialScene 信号。
+
+不能作为强语义事实。
+
+---
+
+## 10. 测试补充
+
+至少：
+
+- committed outgoing + incoming → collision event
+- prepared but not committed → no collision event, use revalidation
+- collision updates SocialScene
+- collision 不生成心理 Hypothesis
+- PendingQuestionAnswered detected
+- collision event does not trigger automatic reply
+- world snapshot exposes relevant concurrency state
+
+---
+
+## 11. 核心结论
+
+World Model v4 的新增职责是：
+
+> **让系统知道“刚刚双方几乎同时说了话”这个外部事实。**
+
+而不是：
+
+> **替 Executive 决定下一句说什么。**
