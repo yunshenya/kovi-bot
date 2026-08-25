@@ -6,7 +6,7 @@
 
 use crate::memory::{MemoryEntry, MemoryType};
 use anyhow::{Context, Result, bail, ensure};
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::{DateTime, SecondsFormat, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -730,17 +730,20 @@ fn legacy_draft(legacy: &LegacyMemory, scope: MemoryScope) -> Option<MemoryDraft
     let importance = u16::from(legacy.entry.importance)
         .saturating_mul(10)
         .min(100) as u8;
-    MemoryDraft::new(
-        scope,
-        kind,
-        legacy.entry.content.clone(),
-        legacy.entry.timestamp.with_timezone(&Utc),
-    )
-    .ok()?
-    .with_importance(importance)
-    .ok()?
-    .with_tags(legacy.entry.tags.clone())
-    .ok()
+    let occurred_at = postgres_timestamp_precision(legacy.entry.timestamp.with_timezone(&Utc));
+    MemoryDraft::new(scope, kind, legacy.entry.content.clone(), occurred_at)
+        .ok()?
+        .with_importance(importance)
+        .ok()?
+        .with_tags(legacy.entry.tags.clone())
+        .ok()
+}
+
+fn postgres_timestamp_precision(value: DateTime<Utc>) -> DateTime<Utc> {
+    let nanoseconds = value.nanosecond();
+    value
+        .with_nanosecond(nanoseconds - nanoseconds % 1_000)
+        .expect("microsecond-aligned nanoseconds are valid")
 }
 
 fn deterministic_target_id(legacy_id: &str) -> Uuid {
@@ -892,7 +895,7 @@ async fn fetch_target_from_pool(pool: &PgPool, id: Uuid) -> Result<Option<Target
 mod tests {
     use super::{
         BackfillOptions, LegacyScopeHint, MemoryMigrationCommand, aggregate_hash, classify_scope,
-        deterministic_target_id, parse_cli_args,
+        deterministic_target_id, parse_cli_args, postgres_timestamp_precision,
     };
     use crate::memory::{MemoryEntry, MemoryType};
     use chrono::Utc;
@@ -931,6 +934,17 @@ mod tests {
         assert_eq!(
             aggregate_hash(&["b:2".to_owned(), "a:1".to_owned()]),
             aggregate_hash(&["a:1".to_owned(), "b:2".to_owned()])
+        );
+    }
+
+    #[test]
+    fn postgres_timestamp_precision_discards_submicrosecond_nanoseconds() {
+        let timestamp = chrono::DateTime::<Utc>::from_timestamp(1_700_000_000, 123_456_789)
+            .expect("fixed timestamp");
+
+        assert_eq!(
+            postgres_timestamp_precision(timestamp).timestamp_subsec_nanos(),
+            123_456_000
         );
     }
 
@@ -1016,7 +1030,12 @@ mod tests {
                 let entry = MemoryEntry {
                     id: memory_id.clone(),
                     content: "migration fixture".to_owned(),
-                    timestamp: chrono::Local::now(),
+                    timestamp: chrono::DateTime::<Utc>::from_timestamp(
+                        1_700_000_000,
+                        123_456_789,
+                    )
+                    .expect("fixed submicrosecond timestamp")
+                    .with_timezone(&chrono::Local),
                     memory_type: MemoryType::Event,
                     importance: 7,
                     tags: vec!["fixture".to_owned()],
@@ -1061,10 +1080,13 @@ mod tests {
                     .await
                     .expect("repeat backfill fixture");
                 assert_eq!(repeat.already_present_rows, 1);
+                assert_eq!(repeat.mismatched_rows, 0);
                 let validation = service.validate(Some(report.batch_id)).await.expect("validate fixture");
                 assert_eq!(validation.matching_rows, 1);
+                assert_eq!(validation.changed_rows, 0);
                 let rollback = service.rollback(report.batch_id, false).await.expect("rollback fixture");
                 assert_eq!(rollback.deleted_rows, 1);
+                assert_eq!(rollback.skipped_changed_rows, 0);
                 let legacy_count = query_scalar::<Postgres, i64>(
                     "SELECT COUNT(*) FROM kovi_bot_memories WHERE id = $1",
                 )

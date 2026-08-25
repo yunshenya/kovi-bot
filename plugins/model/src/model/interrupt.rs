@@ -1321,13 +1321,18 @@ mod tests {
     }
 
     async fn wait_for_outgoing_state(token: OutgoingToken, expected: OutgoingState) {
-        for _ in 0..64 {
-            if outgoing_state(token).await == Some(expected) {
-                return;
+        let wait = kovi::tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if outgoing_state(token).await == Some(expected) {
+                    break;
+                }
+                kovi::tokio::time::sleep(std::time::Duration::from_millis(1)).await;
             }
-            kovi::tokio::task::yield_now().await;
+        })
+        .await;
+        if wait.is_err() {
+            assert_eq!(outgoing_state(token).await, Some(expected));
         }
-        assert_eq!(outgoing_state(token).await, Some(expected));
     }
 
     #[test]
