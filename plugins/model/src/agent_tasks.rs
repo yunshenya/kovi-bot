@@ -8,8 +8,7 @@ use crate::config;
 use crate::group_access;
 use crate::memory::MEMORY_MANAGER;
 use crate::model::{
-    BotMemory, MessageDestination, MessageTransport, ReplyScope, Roles,
-    record_standalone_bot_message,
+    BotMemory, MessageDestination, OutgoingSource, Roles, send_tracked_message_with_revalidation,
 };
 use anyhow::{Context, Result, anyhow, ensure};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -24,6 +23,7 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use yunxi_core::GoalState;
 
 const CLAIM_BATCH_SIZE: i64 = 16;
 const MAX_QUESTION_CHARS: usize = 1_000;
@@ -130,6 +130,8 @@ pub(crate) async fn initialize_database() -> Result<()> {
             last_relevant_event_at TIMESTAMPTZ,
             report_content TEXT,
             report_message_id INTEGER,
+            question_delivery_key TEXT,
+            report_delivery_key TEXT,
             attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
             lease_token TEXT,
             lease_until TIMESTAMPTZ,
@@ -170,6 +172,8 @@ pub(crate) async fn initialize_database() -> Result<()> {
     // 继续作为已收集的有效回复，同时新事件会写入更精确的关联和质量信息。
     for statement in [
         "ALTER TABLE kovi_bot_agent_tasks ADD COLUMN IF NOT EXISTS last_relevant_event_at TIMESTAMPTZ",
+        "ALTER TABLE kovi_bot_agent_tasks ADD COLUMN IF NOT EXISTS question_delivery_key TEXT",
+        "ALTER TABLE kovi_bot_agent_tasks ADD COLUMN IF NOT EXISTS report_delivery_key TEXT",
         "ALTER TABLE kovi_bot_agent_task_events ADD COLUMN IF NOT EXISTS reply_to_message_id INTEGER",
         "ALTER TABLE kovi_bot_agent_task_events ADD COLUMN IF NOT EXISTS mentions_bot BOOLEAN NOT NULL DEFAULT FALSE",
         "ALTER TABLE kovi_bot_agent_task_events ADD COLUMN IF NOT EXISTS relevance_score SMALLINT NOT NULL DEFAULT 1",
@@ -259,6 +263,18 @@ pub(crate) async fn initialize_database() -> Result<()> {
     .execute(pool)
     .await
     .context("创建跨群问答质量索引")?;
+    query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS kovi_bot_agent_tasks_question_delivery_key_idx ON kovi_bot_agent_tasks (question_delivery_key) WHERE question_delivery_key IS NOT NULL",
+    )
+    .execute(pool)
+    .await
+    .context("创建跨群问题投递幂等索引")?;
+    query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS kovi_bot_agent_tasks_report_delivery_key_idx ON kovi_bot_agent_tasks (report_delivery_key) WHERE report_delivery_key IS NOT NULL",
+    )
+    .execute(pool)
+    .await
+    .context("创建跨群汇报投递幂等索引")?;
 
     settle_uncertain_tasks(pool).await
 }
@@ -316,6 +332,12 @@ pub(crate) async fn reserve_task(request: TaskReservationRequest<'_>) -> Result<
         );
         let task_id = row.get("id");
         transaction.commit().await.context("结束已有跨群问答读取事务")?;
+        crate::yunxi::events::project_agent_task(
+            task_id,
+            actor_user_id,
+            &question,
+            GoalState::Active,
+        );
         return Ok(task_id);
     }
 
@@ -386,6 +408,7 @@ pub(crate) async fn reserve_task(request: TaskReservationRequest<'_>) -> Result<
             .context("读取已有跨群问答任务")?
     };
     transaction.commit().await.context("提交跨群问答预留事务")?;
+    crate::yunxi::events::project_agent_task(task_id, actor_user_id, &question, GoalState::Active);
     Ok(task_id)
 }
 
@@ -393,18 +416,27 @@ pub(crate) async fn fail_pending_task(task_id: i64, error: &str) {
     let Some(pool) = MEMORY_MANAGER.database_pool() else {
         return;
     };
-    if let Err(database_error) = query(
-        "UPDATE kovi_bot_agent_tasks SET status = 'failed', last_error = $2, updated_at = NOW(), completed_at = NOW(), lease_token = NULL, lease_until = NULL WHERE id = $1 AND status IN ('pending_send', 'question_sending')",
+    match query(
+        "UPDATE kovi_bot_agent_tasks SET status = 'failed', last_error = $2, updated_at = NOW(), completed_at = NOW(), lease_token = NULL, lease_until = NULL WHERE id = $1 AND status IN ('pending_send', 'question_sending') RETURNING actor_user_id, question",
     )
     .bind(task_id)
     .bind(truncate_chars(error, 800))
-    .execute(pool)
+    .fetch_optional(pool)
     .await
     {
-        eprintln!(
+        Ok(Some(row)) => {
+            crate::yunxi::events::project_agent_task(
+                task_id,
+                row.get("actor_user_id"),
+                &row.get::<String, _>("question"),
+                GoalState::Cancelled,
+            );
+        }
+        Ok(None) => {}
+        Err(database_error) => eprintln!(
             "[ERROR] 标记跨群问答预留失败时出错 (任务: {}): {}",
             task_id, database_error
-        );
+        ),
     }
 }
 
@@ -412,9 +444,10 @@ pub(crate) async fn fail_pending_task(task_id: i64, error: &str) {
 /// 避免已经确认取消的任务随后仍把问题发进群。
 pub(crate) async fn begin_question_send(task_id: i64) -> Result<()> {
     let updated = query(
-        "UPDATE kovi_bot_agent_tasks SET status = 'question_sending', updated_at = NOW(), last_error = NULL WHERE id = $1 AND status = 'pending_send'",
+        "UPDATE kovi_bot_agent_tasks SET status = 'question_sending', question_delivery_key = $2, updated_at = NOW(), last_error = NULL WHERE id = $1 AND status = 'pending_send'",
     )
     .bind(task_id)
+    .bind(question_delivery_key(task_id))
     .execute(database_pool()?)
     .await
     .context("锁定跨群问题发送")?;
@@ -621,7 +654,7 @@ async fn dispatch_due(bot: &RuntimeBot) -> Result<()> {
 }
 
 async fn process_claimed_task(bot: &RuntimeBot, task: ClaimedTask, lease_secs: u64) {
-    if bot.get_main_admin().ok() != Some(task.actor_user_id) {
+    if !crate::model::utils::is_main_admin(bot, task.actor_user_id) {
         fail_task(&task, "任务操作者已不再是主管理员，未发送群聊汇报").await;
         return;
     }
@@ -675,35 +708,28 @@ async fn process_claimed_task(bot: &RuntimeBot, task: ClaimedTask, lease_secs: u
             return;
         }
     };
-    if !is_claim_current(&task).await.unwrap_or(false) {
-        return;
-    }
-    if let Err(error) = mark_report_sending(&task, &report).await {
-        eprintln!(
-            "[WARN] 跨群问答汇报发送闸门失败 (任务: {}): {}",
-            task.id, error
-        );
-        return;
-    }
-
     // 从 report_sending 开始不再自动重放：网络超时和进程崩溃都可能已经送达，
     // 牺牲少量“漏报”来保证不会向管理员重复发送同一份汇总。
+    let delivery_key = report_delivery_key(task.id);
     let send_result = kovi::tokio::time::timeout(
         Duration::from_secs(8),
-        MessageTransport::new(bot).send(
+        send_tracked_message_with_revalidation(
+            bot,
             MessageDestination::Private(task.actor_user_id),
             Message::from(report.clone()),
+            OutgoingSource::Proactive,
+            Some(&delivery_key),
+            || async {
+                crate::model::utils::is_main_admin(bot, task.actor_user_id)
+                    && mark_report_sending(&task, &report, &delivery_key)
+                        .await
+                        .is_ok()
+            },
         ),
     )
     .await;
     match send_result {
         Ok(Ok(message_id)) => {
-            record_standalone_bot_message(
-                ReplyScope::Private(task.actor_user_id),
-                message_id,
-                &report,
-            )
-            .await;
             crate::model::utils::record_standalone_private_message(task.actor_user_id, &report)
                 .await;
             if let Err(error) = complete_task(&task, message_id).await {
@@ -722,11 +748,7 @@ async fn process_claimed_task(bot: &RuntimeBot, task: ClaimedTask, lease_secs: u
             }
         }
         Ok(Err(error)) => {
-            fail_task(
-                &task,
-                &format!("私聊汇报发送失败（retcode={}）", error.retcode),
-            )
-            .await;
+            fail_task(&task, &format!("私聊汇报发送失败：{error}")).await;
         }
         Err(_) => {
             fail_task(&task, "私聊汇报发送超时；为避免重复没有自动重试").await;
@@ -885,16 +907,6 @@ async fn load_events(task_id: i64) -> Result<Vec<TaskEvent>> {
         .collect())
 }
 
-async fn is_claim_current(task: &ClaimedTask) -> Result<bool> {
-    Ok(query_scalar::<Postgres, bool>(
-        "SELECT EXISTS(SELECT 1 FROM kovi_bot_agent_tasks WHERE id = $1 AND status = 'reporting' AND lease_token = $2 AND lease_until > NOW())",
-    )
-    .bind(task.id)
-    .bind(&task.lease_token)
-    .fetch_one(database_pool()?)
-    .await?)
-}
-
 async fn maintain_lease(task: ClaimedTask, lease_secs: u64) {
     let interval = Duration::from_secs((lease_secs / 3).clamp(1, 60));
     loop {
@@ -922,13 +934,14 @@ async fn maintain_lease(task: ClaimedTask, lease_secs: u64) {
     }
 }
 
-async fn mark_report_sending(task: &ClaimedTask, report: &str) -> Result<()> {
+async fn mark_report_sending(task: &ClaimedTask, report: &str, delivery_key: &str) -> Result<()> {
     let updated = query(
-        "UPDATE kovi_bot_agent_tasks SET status = 'report_sending', report_content = $3, lease_until = NOW() + INTERVAL '30 seconds', updated_at = NOW() WHERE id = $1 AND status = 'reporting' AND lease_token = $2",
+        "UPDATE kovi_bot_agent_tasks SET status = 'report_sending', report_content = $3, report_delivery_key = $4, lease_until = NOW() + INTERVAL '30 seconds', updated_at = NOW() WHERE id = $1 AND status = 'reporting' AND lease_token = $2 AND lease_until > NOW()",
     )
     .bind(task.id)
     .bind(&task.lease_token)
     .bind(report)
+    .bind(delivery_key)
     .execute(database_pool()?)
     .await
     .context("锁定跨群问答汇报发送")?;
@@ -950,6 +963,12 @@ async fn complete_task(task: &ClaimedTask, report_message_id: i32) -> Result<()>
     .await
     .context("完成跨群问答任务")?;
     ensure!(updated.rows_affected() == 1, "跨群问答任务状态已经发生变化");
+    crate::yunxi::events::project_agent_task(
+        task.id,
+        task.actor_user_id,
+        &task.question,
+        GoalState::Completed,
+    );
     Ok(())
 }
 
@@ -958,7 +977,7 @@ async fn fail_task(task: &ClaimedTask, error: &str) {
         return;
     };
     let error = truncate_chars(error, 800);
-    if let Err(database_error) = query(
+    match query(
         "UPDATE kovi_bot_agent_tasks SET status = 'failed', last_error = $2, lease_token = NULL, lease_until = NULL, updated_at = NOW(), completed_at = NOW() WHERE id = $1 AND status IN ('reporting', 'report_sending') AND lease_token = $3",
     )
     .bind(task.id)
@@ -967,7 +986,18 @@ async fn fail_task(task: &ClaimedTask, error: &str) {
     .execute(pool)
     .await
     {
-        eprintln!("[ERROR] 标记跨群问答失败时出错 (任务: {}): {}", task.id, database_error);
+        Ok(updated) if updated.rows_affected() == 1 => {
+            crate::yunxi::events::project_agent_task(
+                task.id,
+                task.actor_user_id,
+                &task.question,
+                GoalState::Cancelled,
+            );
+        }
+        Ok(_) => {}
+        Err(database_error) => {
+            eprintln!("[ERROR] 标记跨群问答失败时出错 (任务: {}): {}", task.id, database_error);
+        }
     }
 }
 
@@ -1111,6 +1141,12 @@ pub(crate) async fn cancel_task(
             .await
             .context("取消跨群问答任务")?;
             if updated.rows_affected() == 1 {
+                crate::yunxi::events::project_agent_task(
+                    target.id,
+                    actor_user_id,
+                    &target.question,
+                    GoalState::Cancelled,
+                );
                 Ok(format!(
                     "已取消跨群问答任务 #{}（目标群 {}）。如果群问题已经送达，我不会再次发送或继续汇报。",
                     target.id, target.target_group_id
@@ -1638,6 +1674,14 @@ fn database_pool() -> Result<&'static PgPool> {
         .ok_or_else(|| anyhow!("PostgreSQL 记忆连接池尚未初始化"))
 }
 
+fn question_delivery_key(task_id: i64) -> String {
+    format!("agent-task:{task_id}:question")
+}
+
+fn report_delivery_key(task_id: i64) -> String {
+    format!("agent-task:{task_id}:report")
+}
+
 fn new_lease_token(task_id: i64) -> String {
     let sequence = TASK_TOKEN_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let nanos = SystemTime::now()
@@ -1658,6 +1702,7 @@ mod tests {
     use kovi::Message;
     use kovi::bot::message::Segment;
     use kovi::serde_json::json;
+    use sqlx_core::row::Row;
     use sqlx_postgres::Postgres;
 
     #[test]
@@ -1671,6 +1716,26 @@ mod tests {
             normalize_event_content("  回复\r\n好的  ")
                 .unwrap()
                 .contains('\n')
+        );
+    }
+
+    #[test]
+    fn task_delivery_keys_are_stable_and_phase_specific() {
+        assert_eq!(
+            super::question_delivery_key(17),
+            super::question_delivery_key(17)
+        );
+        assert_eq!(
+            super::report_delivery_key(17),
+            super::report_delivery_key(17)
+        );
+        assert_ne!(
+            super::question_delivery_key(17),
+            super::report_delivery_key(17)
+        );
+        assert_ne!(
+            super::report_delivery_key(17),
+            super::report_delivery_key(18)
         );
     }
 
@@ -1766,172 +1831,297 @@ mod tests {
     #[test]
     #[ignore = "requires PostgreSQL via DATABASE_URL"]
     fn postgres_task_reservation_is_atomic_and_event_recording_is_idempotent() {
-        kovi::tokio::runtime::Runtime::new()
-            .expect("应创建测试运行时")
-            .block_on(async {
-                crate::memory::MEMORY_MANAGER
-                    .initialize_database()
-                    .await
-                    .expect("应初始化 PostgreSQL 记忆连接池");
-                crate::agent_runtime::initialize_database()
-                    .await
-                    .expect("应初始化角色目标表");
-                super::initialize_database()
-                    .await
-                    .expect("应初始化跨群问答任务表");
+        crate::database_test_support::block_on(async {
+            crate::memory::MEMORY_MANAGER
+                .initialize_database()
+                .await
+                .expect("应初始化 PostgreSQL 记忆连接池");
+            crate::agent_runtime::initialize_database()
+                .await
+                .expect("应初始化角色目标表");
+            super::initialize_database()
+                .await
+                .expect("应初始化跨群问答任务表");
 
-                let suffix = Utc::now().timestamp_micros();
-                let actor_user_id = suffix;
-                let group_id = suffix + 10_000;
-                let first_key = format!("agent-task-test:{suffix}:first");
-                let second_key = format!("agent-task-test:{suffix}:second");
-                let question = "今晚有空吗";
-                let pool = super::database_pool().expect("连接池应存在");
-                let first_goal = sqlx_core::query_scalar::query_scalar::<Postgres, i64>(
-                    r#"
+            let suffix = Utc::now().timestamp_micros();
+            let actor_user_id = suffix;
+            let group_id = suffix + 10_000;
+            let first_key = format!("agent-task-test:{suffix}:first");
+            let second_key = format!("agent-task-test:{suffix}:second");
+            let question = "今晚有空吗";
+            let pool = super::database_pool().expect("连接池应存在");
+            let first_goal = sqlx_core::query_scalar::query_scalar::<Postgres, i64>(
+                r#"
                     INSERT INTO kovi_bot_agent_goals
                         (request_key, actor_user_id, source_scope, source_id, source_message_id,
                          action_kind, target_scope, target_id, payload)
                     VALUES ($1, $2, 'private', $2, $3, 'send_group_message', 'group', $4, $5)
                     RETURNING id
                     "#,
-                )
-                .bind(&first_key)
-                .bind(actor_user_id)
-                .bind(1_i32)
-                .bind(group_id)
-                .bind(serde_json::json!({"group_id": group_id, "content": question}))
-                .fetch_one(pool)
-                .await
-                .expect("应创建第一个测试目标");
-                let second_goal = sqlx_core::query_scalar::query_scalar::<Postgres, i64>(
-                    r#"
+            )
+            .bind(&first_key)
+            .bind(actor_user_id)
+            .bind(1_i32)
+            .bind(group_id)
+            .bind(serde_json::json!({"group_id": group_id, "content": question}))
+            .fetch_one(pool)
+            .await
+            .expect("应创建第一个测试目标");
+            let second_goal = sqlx_core::query_scalar::query_scalar::<Postgres, i64>(
+                r#"
                     INSERT INTO kovi_bot_agent_goals
                         (request_key, actor_user_id, source_scope, source_id, source_message_id,
                          action_kind, target_scope, target_id, payload)
                     VALUES ($1, $2, 'private', $2, $3, 'send_group_message', 'group', $4, $5)
                     RETURNING id
                     "#,
-                )
-                .bind(&second_key)
-                .bind(actor_user_id)
-                .bind(2_i32)
-                .bind(group_id)
-                .bind(serde_json::json!({"group_id": group_id, "content": question}))
-                .fetch_one(pool)
-                .await
-                .expect("应创建第二个测试目标");
+            )
+            .bind(&second_key)
+            .bind(actor_user_id)
+            .bind(2_i32)
+            .bind(group_id)
+            .bind(serde_json::json!({"group_id": group_id, "content": question}))
+            .fetch_one(pool)
+            .await
+            .expect("应创建第二个测试目标");
 
-                let first_request = super::TaskReservationRequest {
-                    goal_id: first_goal,
-                    request_key: &first_key,
-                    actor_user_id,
-                    source_id: actor_user_id,
-                    source_message_id: 1,
-                    target_group_id: group_id,
-                    question,
-                    collect_minutes: 1,
-                };
-                let second_request = super::TaskReservationRequest {
-                    goal_id: second_goal,
-                    request_key: &second_key,
-                    actor_user_id,
-                    source_id: actor_user_id,
-                    source_message_id: 2,
-                    target_group_id: group_id,
-                    question,
-                    collect_minutes: 1,
-                };
-                let (first, second) = kovi::tokio::join!(
-                    super::reserve_task(first_request),
-                    super::reserve_task(second_request),
-                );
-                let (task_id, replay_goal, replay_key, replay_source_message_id) =
-                    match (first, second) {
-                        (Ok(task_id), Err(_)) => (task_id, first_goal, first_key.as_str(), 1),
-                        (Err(_), Ok(task_id)) => (task_id, second_goal, second_key.as_str(), 2),
-                        (Ok(_), Ok(_)) => panic!("同一目标群不应同时保留两个任务"),
-                        (Err(first_error), Err(second_error)) => panic!(
-                            "两个并发任务都未创建：第一个={first_error:?}, 第二个={second_error:?}"
-                        ),
-                    };
-                let replayed_task_id = super::reserve_task(super::TaskReservationRequest {
-                    goal_id: replay_goal,
-                    request_key: replay_key,
-                    actor_user_id,
-                    source_id: actor_user_id,
-                    source_message_id: replay_source_message_id,
-                    target_group_id: group_id,
-                    question,
-                    collect_minutes: 1,
-                })
+            let first_request = super::TaskReservationRequest {
+                goal_id: first_goal,
+                request_key: &first_key,
+                actor_user_id,
+                source_id: actor_user_id,
+                source_message_id: 1,
+                target_group_id: group_id,
+                question,
+                collect_minutes: 1,
+            };
+            let second_request = super::TaskReservationRequest {
+                goal_id: second_goal,
+                request_key: &second_key,
+                actor_user_id,
+                source_id: actor_user_id,
+                source_message_id: 2,
+                target_group_id: group_id,
+                question,
+                collect_minutes: 1,
+            };
+            let (first, second) = kovi::tokio::join!(
+                super::reserve_task(first_request),
+                super::reserve_task(second_request),
+            );
+            let (task_id, replay_goal, replay_key, replay_source_message_id) = match (first, second)
+            {
+                (Ok(task_id), Err(_)) => (task_id, first_goal, first_key.as_str(), 1),
+                (Err(_), Ok(task_id)) => (task_id, second_goal, second_key.as_str(), 2),
+                (Ok(_), Ok(_)) => panic!("同一目标群不应同时保留两个任务"),
+                (Err(first_error), Err(second_error)) => {
+                    panic!("两个并发任务都未创建：第一个={first_error:?}, 第二个={second_error:?}")
+                }
+            };
+            let replayed_task_id = super::reserve_task(super::TaskReservationRequest {
+                goal_id: replay_goal,
+                request_key: replay_key,
+                actor_user_id,
+                source_id: actor_user_id,
+                source_message_id: replay_source_message_id,
+                target_group_id: group_id,
+                question,
+                collect_minutes: 1,
+            })
+            .await
+            .expect("同一来源消息重放应返回原任务");
+            assert_eq!(replayed_task_id, task_id);
+            super::begin_question_send(task_id)
                 .await
-                .expect("同一来源消息重放应返回原任务");
-                assert_eq!(replayed_task_id, task_id);
-                super::begin_question_send(task_id)
-                    .await
-                    .expect("应锁定测试问题发送");
-                assert!(
-                    super::begin_question_send(task_id).await.is_err(),
-                    "同一个任务只能进入一次外部发送阶段"
-                );
-                super::activate_after_send(task_id, 70_000_001, 1)
-                    .await
-                    .expect("应启动测试任务收集");
-                let event_message = Message::from("有空");
-                let (first_event, second_event) = kovi::tokio::join!(
-                    super::record_group_message(
-                        group_id,
-                        70_000_002,
-                        99,
-                        "成员",
-                        "有空",
-                        &event_message,
-                        123,
-                    ),
-                    super::record_group_message(
-                        group_id,
-                        70_000_002,
-                        99,
-                        "成员",
-                        "有空",
-                        &event_message,
-                        123,
-                    ),
-                );
-                assert!(
-                    first_event.expect("第一次事件写入不应失败")
-                        || second_event.expect("第二次事件写入不应失败")
-                );
-                let event_count = sqlx_core::query_scalar::query_scalar::<Postgres, i64>(
-                    "SELECT COUNT(*) FROM kovi_bot_agent_task_events WHERE task_id = $1",
+                .expect("应锁定测试问题发送");
+            let question_key = sqlx_core::query_scalar::query_scalar::<Postgres, String>(
+                "SELECT question_delivery_key FROM kovi_bot_agent_tasks WHERE id = $1",
+            )
+            .bind(task_id)
+            .fetch_one(pool)
+            .await
+            .expect("应读取群问题投递键");
+            assert_eq!(question_key, super::question_delivery_key(task_id));
+            assert!(
+                super::begin_question_send(task_id).await.is_err(),
+                "同一个任务只能进入一次外部发送阶段"
+            );
+            super::activate_after_send(task_id, 70_000_001, 1)
+                .await
+                .expect("应启动测试任务收集");
+            let event_message = Message::from("有空");
+            let (first_event, second_event) = kovi::tokio::join!(
+                super::record_group_message(
+                    group_id,
+                    70_000_002,
+                    99,
+                    "成员",
+                    "有空",
+                    &event_message,
+                    123,
+                ),
+                super::record_group_message(
+                    group_id,
+                    70_000_002,
+                    99,
+                    "成员",
+                    "有空",
+                    &event_message,
+                    123,
+                ),
+            );
+            assert!(
+                first_event.expect("第一次事件写入不应失败")
+                    || second_event.expect("第二次事件写入不应失败")
+            );
+            let event_count = sqlx_core::query_scalar::query_scalar::<Postgres, i64>(
+                "SELECT COUNT(*) FROM kovi_bot_agent_task_events WHERE task_id = $1",
+            )
+            .bind(task_id)
+            .fetch_one(pool)
+            .await
+            .expect("应读取测试事件数量");
+            assert_eq!(event_count, 1, "同一群消息只能记录一次");
+            let status = super::task_status_report(actor_user_id, Some(task_id))
+                .await
+                .expect("应读取测试任务状态");
+            assert!(status.contains(&format!("任务 #{task_id}")));
+            assert!(status.contains("收集中"));
+            let cancelled = super::cancel_task(actor_user_id, Some(task_id))
+                .await
+                .expect("应取消测试任务");
+            assert!(cancelled.contains("已取消"));
+            let status = super::task_status_report(actor_user_id, Some(task_id))
+                .await
+                .expect("应读取已取消测试任务状态");
+            assert!(status.contains("已取消"));
+            sqlx_core::query::query(
+                "DELETE FROM kovi_bot_agent_goals WHERE request_key IN ($1, $2)",
+            )
+            .bind(&first_key)
+            .bind(&second_key)
+            .execute(pool)
+            .await
+            .expect("应清理测试目标");
+        });
+    }
+
+    #[test]
+    #[ignore = "requires PostgreSQL via DATABASE_URL"]
+    fn postgres_report_send_gate_is_fail_closed_on_failure_and_restart() {
+        crate::database_test_support::block_on(async {
+            crate::memory::MEMORY_MANAGER
+                .initialize_database()
+                .await
+                .expect("应初始化 PostgreSQL 记忆连接池");
+            crate::agent_runtime::initialize_database()
+                .await
+                .expect("应初始化角色目标表");
+            super::initialize_database()
+                .await
+                .expect("应初始化跨群问答任务表");
+            let pool = super::database_pool().unwrap();
+            let suffix = Utc::now().timestamp_micros();
+            let actor_user_id = suffix;
+            let mut tasks = Vec::new();
+            for phase in ["failure", "restart"] {
+                let request_key = format!("agent-task-delivery-test:{suffix}:{phase}");
+                let group_id = suffix + if phase == "failure" { 20_000 } else { 30_000 };
+                let goal_id = sqlx_core::query_scalar::query_scalar::<Postgres, i64>(
+                    r#"
+                    INSERT INTO kovi_bot_agent_goals
+                        (request_key, actor_user_id, source_scope, source_id, source_message_id,
+                         action_kind, target_scope, target_id, payload)
+                    VALUES ($1, $2, 'private', $2, 1, 'send_group_message', 'group', $3, $4)
+                    RETURNING id
+                    "#,
                 )
-                .bind(task_id)
+                .bind(&request_key)
+                .bind(actor_user_id)
+                .bind(group_id)
+                .bind(json!({"group_id": group_id, "content": "测试"}))
                 .fetch_one(pool)
                 .await
-                .expect("应读取测试事件数量");
-                assert_eq!(event_count, 1, "同一群消息只能记录一次");
-                let status = super::task_status_report(actor_user_id, Some(task_id))
-                    .await
-                    .expect("应读取测试任务状态");
-                assert!(status.contains(&format!("任务 #{task_id}")));
-                assert!(status.contains("收集中"));
-                let cancelled = super::cancel_task(actor_user_id, Some(task_id))
-                    .await
-                    .expect("应取消测试任务");
-                assert!(cancelled.contains("已取消"));
-                let status = super::task_status_report(actor_user_id, Some(task_id))
-                    .await
-                    .expect("应读取已取消测试任务状态");
-                assert!(status.contains("已取消"));
-                sqlx_core::query::query(
-                    "DELETE FROM kovi_bot_agent_goals WHERE request_key IN ($1, $2)",
+                .expect("应创建测试目标");
+                let lease_token = format!("test:{suffix}:{phase}");
+                let task_id = sqlx_core::query_scalar::query_scalar::<Postgres, i64>(
+                    r#"
+                    INSERT INTO kovi_bot_agent_tasks
+                        (goal_id, request_key, actor_user_id, source_id, source_message_id,
+                         target_group_id, question, collect_minutes, status, collect_until,
+                         lease_token, lease_until)
+                    VALUES ($1, $2, $3, $3, 1, $4, '测试问题', 1, 'reporting', NOW(),
+                            $5, NOW() + INTERVAL '60 seconds')
+                    RETURNING id
+                    "#,
                 )
-                .bind(&first_key)
-                .bind(&second_key)
+                .bind(goal_id)
+                .bind(&request_key)
+                .bind(actor_user_id)
+                .bind(group_id)
+                .bind(&lease_token)
+                .fetch_one(pool)
+                .await
+                .expect("应创建待汇报任务");
+                tasks.push(ClaimedTask {
+                    id: task_id,
+                    actor_user_id,
+                    target_group_id: group_id,
+                    question: "测试问题".to_string(),
+                    collect_until: Utc::now(),
+                    completion_reason: CompletionReason::Deadline,
+                    lease_token,
+                });
+            }
+
+            let failed = &tasks[0];
+            let failed_key = super::report_delivery_key(failed.id);
+            super::mark_report_sending(failed, "测试汇报", &failed_key)
+                .await
+                .expect("应进入汇报发送闸门");
+            super::fail_task(failed, "模拟 commit 后发送失败").await;
+            let failed_row = sqlx_core::query::query(
+                "SELECT status, report_delivery_key FROM kovi_bot_agent_tasks WHERE id = $1",
+            )
+            .bind(failed.id)
+            .fetch_one(pool)
+            .await
+            .expect("应读取发送失败任务");
+            assert_eq!(failed_row.get::<String, _>("status"), "failed");
+            assert_eq!(
+                failed_row.get::<String, _>("report_delivery_key"),
+                failed_key
+            );
+
+            let restarted = &tasks[1];
+            let restarted_key = super::report_delivery_key(restarted.id);
+            super::mark_report_sending(restarted, "测试汇报", &restarted_key)
+                .await
+                .expect("应进入汇报发送闸门");
+            sqlx_core::query::query(
+                "UPDATE kovi_bot_agent_tasks SET lease_until = NOW() - INTERVAL '1 second' WHERE id = $1",
+            )
+            .bind(restarted.id)
+            .execute(pool)
+            .await
+            .expect("应模拟发送中进程退出");
+            super::settle_uncertain_tasks(pool)
+                .await
+                .expect("重启扫描应收敛不确定汇报");
+            let restarted_status = sqlx_core::query_scalar::query_scalar::<Postgres, String>(
+                "SELECT status FROM kovi_bot_agent_tasks WHERE id = $1",
+            )
+            .bind(restarted.id)
+            .fetch_one(pool)
+            .await
+            .expect("应读取重启收敛状态");
+            assert_eq!(restarted_status, "failed");
+
+            sqlx_core::query::query("DELETE FROM kovi_bot_agent_goals WHERE request_key LIKE $1")
+                .bind(format!("agent-task-delivery-test:{suffix}:%"))
                 .execute(pool)
                 .await
                 .expect("应清理测试目标");
-            });
+        });
     }
 }

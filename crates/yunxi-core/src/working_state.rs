@@ -592,6 +592,7 @@ mod tests {
                 replies_to_agent: false,
                 stop_requested: false,
                 explicit_request: false,
+                visible_reply_allowed: true,
             },
         )
     }

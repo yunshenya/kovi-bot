@@ -329,6 +329,8 @@ pub struct MemoryManager {
     memory_file: String,
     /// 串行化持久化操作，避免多个任务同时覆盖记忆快照。
     save_lock: Arc<Mutex<()>>,
+    /// 串行化 PostgreSQL 初始化，避免并发调用重复建立连接池和迁移 schema。
+    database_init_lock: Arc<Mutex<()>>,
     /// PostgreSQL 连接池。测试和未初始化的独立实例仍可使用 JSON 文件后端。
     database_pool: Arc<OnceLock<PgPool>>,
 }
@@ -397,6 +399,7 @@ impl MemoryManager {
             bot_personality: Arc::new(Mutex::new(data.bot_personality)),
             memory_file: memory_file.to_string(),
             save_lock: Arc::new(Mutex::new(())),
+            database_init_lock: Arc::new(Mutex::new(())),
             database_pool: Arc::new(OnceLock::new()),
         }
     }
@@ -405,6 +408,13 @@ impl MemoryManager {
     ///
     /// 连接串只从 `DATABASE_URL` 环境变量读取，避免凭据进入配置文件或源码。
     pub async fn initialize_database(&self) -> Result<()> {
+        if self.database_pool.get().is_some() {
+            return Ok(());
+        }
+
+        // `OnceLock` only serializes the final write. Hold an async guard over
+        // the full initialization so concurrent callers reuse the same pool.
+        let _init_guard = self.database_init_lock.lock().await;
         if self.database_pool.get().is_some() {
             return Ok(());
         }

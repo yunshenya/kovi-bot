@@ -1371,6 +1371,7 @@ dependencies = [
  "scraper",
  "serde",
  "serde_json",
+ "sha2",
  "sqlx-core",
  "sqlx-postgres",
  "sysinfo",
@@ -3538,6 +3539,9 @@ name = "yunxi-cli"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
  "yunxi-core",
 ]
 

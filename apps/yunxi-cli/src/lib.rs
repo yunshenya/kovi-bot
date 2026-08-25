@@ -1,9 +1,12 @@
 //! A small platform-neutral host for exercising `yunxi-core`.
 //!
-//! The CLI intentionally owns no persistence or platform adapter code.  Its
-//! fake model turns text into a Core intent and its fake environment records
-//! the admitted Core action.  That keeps the executable useful as a smoke test
-//! for the Core boundary while remaining independent from Kovi and QQ.
+//! The fake model turns text into Core intents and its fake environment
+//! records admitted message actions. Optional host-owned JSON state supplies
+//! the durable Core ports without adding filesystem concerns to `yunxi-core`.
+//! The executable therefore remains independent from Kovi and QQ.
+
+mod journal;
+mod state;
 
 use std::fmt;
 use std::future::Future;
@@ -12,13 +15,20 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::thread;
 
+pub use journal::{CliJournal, JournalError, JournalRecord, MAX_JOURNAL_INPUT_BYTES};
+use serde::{Deserialize, Serialize};
+pub use state::{
+    CliCoreState, CliStateError, CliStateStats, MAX_CLI_MEMORIES, MAX_CLI_MEMORIES_PER_SCOPE,
+    MAX_CLI_OPEN_LOOPS, MAX_CLI_OPEN_LOOPS_PER_OWNER, MAX_CLI_PEOPLE, MAX_CLI_STATE_BYTES,
+};
 use yunxi_core::{
     ActionArbiter, ActionArbiterConfig, ActionCapability, ActionDescriptor, ActionPort,
     ActionPortError, ActionPortFuture, ActionPortOutcome, ActionRejection, ActionResult,
     CognitiveRuntime, ConversationId, CoreServices, DecisionDisposition, DecisionPlan,
-    EnvironmentCapabilities, MessageContent, ModelBackend as CoreModelBackend, PersonId,
-    PlannedProcessingOutcome, PlannerError, PlannerInput, ProposedAction, RuntimeConfig,
-    WorldEvent, WorldEventKind,
+    EnvironmentCapabilities, MemoryStore, MessageContent, ModelBackend as CoreModelBackend,
+    OpenLoopDraft, OpenLoopKind, OpenLoopOwner, OpenLoopStore, PersonId, PlannedProcessingOutcome,
+    PlannerError, PlannerInput, ProposedAction, RuntimeConfig, StateUpdateProposal, WorldEvent,
+    WorldEventKind,
 };
 
 /// Deterministic model used by the standalone demo and acceptance tests.
@@ -34,13 +44,94 @@ impl CoreModelBackend for FakeModel {
             if message.content.as_text().eq_ignore_ascii_case("/noop") {
                 return Ok(DecisionPlan::silent());
             }
+
+            let prior_memories = input
+                .memories
+                .iter()
+                .filter(|memory| memory.occurred_at() < message.timestamp)
+                .count();
+            let relation_before = input.relation;
+            let mut relation =
+                relation_before.unwrap_or_else(|| yunxi_core::RelationState::new(message.sender));
+            relation.familiarity = (relation.familiarity + 0.05).clamp(-1.0, 1.0);
+            relation.comfort = (relation.comfort + 0.02).clamp(-1.0, 1.0);
+            let mut affect = input.affect;
+            affect.arousal = (affect.arousal + 0.01).clamp(-1.0, 1.0);
+            affect.social_energy = (affect.social_energy - 0.01).clamp(0.0, 1.0);
+            affect.curiosity = (affect.curiosity + 0.01).clamp(0.0, 1.0);
+            let state_updates = vec![
+                StateUpdateProposal::Affect(affect),
+                StateUpdateProposal::Relation(relation),
+            ];
+
+            let context = if prior_memories == 0
+                && input.open_loops.is_empty()
+                && relation_before.is_none()
+            {
+                String::new()
+            } else {
+                format!(
+                    " [context: {prior_memories} memories, {} open loops, familiarity {:.2}, energy {:.2}]",
+                    input.open_loops.len(),
+                    relation_before.map_or(0.0, |state| state.familiarity),
+                    input.affect.social_energy,
+                )
+            };
+
+            let text = message.content.as_text();
+            if let Some(summary) = text.strip_prefix("/todo ").map(str::trim)
+                && !summary.is_empty()
+            {
+                let draft = OpenLoopDraft::new(
+                    OpenLoopOwner::Conversation(message.conversation_id),
+                    OpenLoopKind::FollowUp,
+                    summary,
+                )
+                .map_err(|error| yunxi_core::ModelBackendError::InvalidPlan {
+                    reason: error.to_string(),
+                })?;
+                return Ok(DecisionPlan {
+                    disposition: DecisionDisposition::SpecialAction,
+                    intents: vec![
+                        yunxi_core::CognitiveIntent::send_message(
+                            message.conversation_id,
+                            MessageContent::text(format!("Yunxi noted: {summary}{context}")),
+                        ),
+                        yunxi_core::CognitiveIntent::create_open_loop(draft),
+                    ],
+                    state_updates,
+                });
+            }
+
+            if text.eq_ignore_ascii_case("/done") {
+                let mut intents = vec![yunxi_core::CognitiveIntent::send_message(
+                    message.conversation_id,
+                    MessageContent::text(if input.open_loops.is_empty() {
+                        format!("Yunxi found no open item.{context}")
+                    } else {
+                        format!("Yunxi closed the next open item.{context}")
+                    }),
+                )];
+                if let Some(item) = input.open_loops.first() {
+                    intents.push(yunxi_core::CognitiveIntent::resolve_open_loop(
+                        item.id(),
+                        item.owner(),
+                    ));
+                }
+                return Ok(DecisionPlan {
+                    disposition: DecisionDisposition::SpecialAction,
+                    intents,
+                    state_updates,
+                });
+            }
+
             Ok(DecisionPlan {
                 disposition: DecisionDisposition::Reply,
                 intents: vec![yunxi_core::CognitiveIntent::send_message(
                     message.conversation_id,
-                    MessageContent::text(format!("Yunxi heard: {}", message.content.as_text())),
+                    MessageContent::text(format!("Yunxi heard: {text}{context}")),
                 )],
-                state_updates: Vec::new(),
+                state_updates,
             })
         })
     }
@@ -73,7 +164,13 @@ impl ActionPort for FakeEnvironment {
             let sequence = deliveries.len() + 1;
             let conversation_id = match &action {
                 ProposedAction::SendMessage(message) => Some(message.conversation_id),
-                ProposedAction::ReachOut(_) | ProposedAction::Noop => None,
+                ProposedAction::ReachOut(_)
+                | ProposedAction::UseTool(_)
+                | ProposedAction::CreateOpenLoop(_)
+                | ProposedAction::ResolveOpenLoop(_)
+                | ProposedAction::StartGoal(_)
+                | ProposedAction::CancelGoal(_)
+                | ProposedAction::Noop => None,
             };
             deliveries.push(action);
             Ok(ActionPortOutcome::Delivered {
@@ -86,7 +183,8 @@ impl ActionPort for FakeEnvironment {
 }
 
 /// The outcome shown by the CLI host after Core arbitration and delivery.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum HostResponse {
     Empty,
     Noop,
@@ -105,6 +203,8 @@ pub enum CliError {
     Planner(PlannerError),
     Rejected(ActionRejection),
     Port(ActionPortError),
+    Journal(JournalError),
+    State(CliStateError),
     Runtime(String),
 }
 
@@ -114,6 +214,8 @@ impl fmt::Display for CliError {
             Self::Planner(error) => write!(formatter, "planner error: {error}"),
             Self::Rejected(error) => write!(formatter, "action rejected: {error}"),
             Self::Port(error) => write!(formatter, "action port failed: {error}"),
+            Self::Journal(error) => write!(formatter, "journal error: {error}"),
+            Self::State(error) => write!(formatter, "state error: {error}"),
             Self::Runtime(error) => write!(formatter, "runtime error: {error}"),
         }
     }
@@ -126,8 +228,11 @@ pub struct CliHost<M, E> {
     model: Arc<M>,
     environment: E,
     arbiter: ActionArbiter,
+    person_id: PersonId,
     conversation_id: ConversationId,
     runtime: Mutex<CognitiveRuntime>,
+    journal: Option<Arc<CliJournal>>,
+    core_state: Arc<CliCoreState>,
 }
 
 impl<M, E> fmt::Debug for CliHost<M, E>
@@ -140,7 +245,10 @@ where
             .debug_struct("CliHost")
             .field("model", &self.model)
             .field("environment", &self.environment)
+            .field("person_id", &self.person_id)
             .field("conversation_id", &self.conversation_id)
+            .field("journal", &self.journal)
+            .field("core_state", &self.core_state.path())
             .finish_non_exhaustive()
     }
 }
@@ -152,12 +260,17 @@ where
 {
     #[must_use]
     pub fn new(model: M, environment: E, conversation_id: ConversationId) -> Self {
-        let capabilities =
-            EnvironmentCapabilities::new([ActionDescriptor::new(ActionCapability::SendMessage)]);
+        let capabilities = EnvironmentCapabilities::new([
+            ActionDescriptor::new(ActionCapability::SendMessage),
+            ActionDescriptor::new(ActionCapability::CreateOpenLoop),
+            ActionDescriptor::new(ActionCapability::ResolveOpenLoop),
+        ]);
         let model = Arc::new(model);
+        let person_id = PersonId::new();
+        let core_state = Arc::new(CliCoreState::in_memory_for(person_id, conversation_id));
         let (_, runtime) = CognitiveRuntime::new_with_services(
             RuntimeConfig::default(),
-            CoreServices::new(Arc::clone(&model) as Arc<dyn CoreModelBackend>),
+            core_services(&model, &core_state),
         )
         .expect("default CLI runtime configuration must be valid");
         let arbiter =
@@ -166,14 +279,55 @@ where
             model,
             environment,
             arbiter,
+            person_id,
             conversation_id,
             runtime: Mutex::new(runtime),
+            journal: None,
+            core_state,
         }
+    }
+
+    /// Replaces the ephemeral stores with a shared persistent CLI snapshot.
+    /// The snapshot's stable person and conversation IDs become this host's
+    /// local identity so all scopes continue to hydrate after a restart.
+    #[must_use]
+    pub fn with_core_state(mut self, core_state: Arc<CliCoreState>) -> Self {
+        self.person_id = core_state.person_id();
+        self.conversation_id = core_state.conversation_id();
+        self.runtime
+            .get_mut()
+            .expect("owned CLI runtime lock cannot be poisoned")
+            .install_services(core_services(&self.model, &core_state));
+        self.core_state = core_state;
+        self
+    }
+
+    /// Enables an optional durable write-ahead journal for this host.
+    #[must_use]
+    pub fn with_journal(mut self, journal: Arc<CliJournal>) -> Self {
+        self.journal = Some(journal);
+        self
+    }
+
+    /// Returns the configured journal, if this host was built with one.
+    #[must_use]
+    pub fn journal(&self) -> Option<&CliJournal> {
+        self.journal.as_deref()
     }
 
     #[must_use]
     pub const fn conversation_id(&self) -> ConversationId {
         self.conversation_id
+    }
+
+    #[must_use]
+    pub const fn person_id(&self) -> PersonId {
+        self.person_id
+    }
+
+    #[must_use]
+    pub fn core_state(&self) -> &CliCoreState {
+        &self.core_state
     }
 
     #[must_use]
@@ -194,55 +348,207 @@ where
             return Ok(HostResponse::Empty);
         }
 
+        let journal = self.journal.clone();
+        let journal_sequence = journal
+            .as_deref()
+            .map(|journal| {
+                journal
+                    .start(self.conversation_id, input)
+                    .map_err(CliError::Journal)
+            })
+            .transpose()?;
+
+        let timestamp = chrono::Utc::now();
         let event = WorldEvent::message_received(
             yunxi_core::EventPriority::High,
             yunxi_core::MessageReceivedEvent {
                 message_id: yunxi_core::MessageId::new(),
                 conversation_id: self.conversation_id,
-                sender: PersonId::new(),
+                sender: self.person_id,
                 content: MessageContent::text(input),
                 reply_to: None,
-                timestamp: chrono::Utc::now(),
+                timestamp,
                 conversation_kind: yunxi_core::ConversationKind::Direct,
                 addressed_to_agent: true,
                 replies_to_agent: false,
                 stop_requested: false,
                 explicit_request: true,
+                visible_reply_allowed: true,
             },
         );
-        let mut runtime = self
-            .runtime
-            .lock()
-            .map_err(|_| CliError::Runtime("runtime lock poisoned".to_owned()))?;
-        let outcome = block_on(runtime.process_event_with_planner_and_actions(
-            event,
-            &self.arbiter,
-            &self.environment,
-        ))
-        .map_err(CliError::Planner)?;
-        let PlannedProcessingOutcome::Planned { plan, actions, .. } = outcome else {
-            return Err(CliError::Runtime(
-                "runtime rejected the CLI event".to_owned(),
-            ));
-        };
-        let message = plan.intents.first().and_then(intent_message);
-        let result = actions.into_iter().next().unwrap_or(ActionResult::Noop);
-        match result {
-            ActionResult::Noop => Ok(HostResponse::Noop),
-            ActionResult::Executed { outcome, .. } => match outcome {
-                ActionPortOutcome::Delivered {
-                    external_reference, ..
-                } => Ok(HostResponse::Delivered {
-                    message: message.unwrap_or_default(),
-                    external_reference,
-                }),
-                ActionPortOutcome::Deferred { reason } => Ok(HostResponse::Deferred {
-                    message: message.unwrap_or_default(),
-                    reason,
-                }),
-            },
-            ActionResult::Rejected(error) => Err(CliError::Rejected(error)),
-            ActionResult::Failed { error, .. } => Err(CliError::Port(error)),
+        let result = self
+            .core_state
+            .remember_message(self.conversation_id, input, timestamp)
+            .map_err(CliError::State)
+            .and_then(|_| {
+                let mut runtime = self
+                    .runtime
+                    .lock()
+                    .map_err(|_| CliError::Runtime("runtime lock poisoned".to_owned()))?;
+                let action_port = CliActionPort {
+                    environment: &self.environment,
+                    core_state: &self.core_state,
+                };
+                block_on(runtime.process_event_with_planner_and_actions(
+                    event,
+                    &self.arbiter,
+                    &action_port,
+                ))
+                .map_err(CliError::Planner)
+            })
+            .and_then(|outcome| {
+                let PlannedProcessingOutcome::Planned { plan, actions, .. } = outcome else {
+                    return Err(CliError::Runtime(
+                        "runtime rejected the CLI event".to_owned(),
+                    ));
+                };
+                response_from_actions(&plan, actions)
+            });
+
+        if let (Some(journal), Some(sequence)) = (journal.as_deref(), journal_sequence) {
+            let journal_result = match &result {
+                Ok(response) => journal.complete(sequence, response),
+                Err(error) => journal.fail(sequence, error.to_string()),
+            };
+            // A completed action must not be reported as a planner failure if
+            // only the post-action audit record could not be written. For a
+            // successful turn, however, surface the journal failure so a host
+            // can repair its storage rather than silently lose durability.
+            if let Err(error) = journal_result
+                && result.is_ok()
+            {
+                return Err(CliError::Journal(error));
+            }
+        }
+        result
+    }
+}
+
+fn response_from_actions(
+    plan: &DecisionPlan,
+    actions: Vec<ActionResult>,
+) -> Result<HostResponse, CliError> {
+    if actions.len() != plan.intents.len() {
+        return Err(CliError::Runtime(format!(
+            "runtime returned {} action results for {} intents",
+            actions.len(),
+            plan.intents.len()
+        )));
+    }
+    let visible = plan
+        .intents
+        .iter()
+        .enumerate()
+        .find_map(|(index, intent)| intent_message(intent).map(|message| (index, message)));
+    let mut visible_reference = None;
+    let mut delivered = false;
+    let mut deferred_reason = None;
+    for (index, action) in actions.into_iter().enumerate() {
+        match action {
+            ActionResult::Noop => {}
+            ActionResult::Executed {
+                outcome:
+                    ActionPortOutcome::Delivered {
+                        external_reference, ..
+                    },
+                ..
+            } => {
+                delivered = true;
+                if visible
+                    .as_ref()
+                    .is_some_and(|(visible_index, _)| *visible_index == index)
+                {
+                    visible_reference = external_reference;
+                }
+            }
+            ActionResult::Executed {
+                outcome: ActionPortOutcome::Deferred { reason },
+                ..
+            } => {
+                deferred_reason.get_or_insert(reason);
+            }
+            ActionResult::Executed {
+                outcome:
+                    ActionPortOutcome::ToolCompleted { .. }
+                    | ActionPortOutcome::ToolFailed { .. },
+                ..
+            } => {
+                // Tool results are observations for a later planner turn, not
+                // proof that this host delivered a visible message.
+            }
+            ActionResult::Rejected(error) => return Err(CliError::Rejected(error)),
+            ActionResult::Failed { error, .. } => return Err(CliError::Port(error)),
+        }
+    }
+    let message = visible.map_or_else(String::new, |(_, message)| message);
+    if let Some(reason) = deferred_reason {
+        return Ok(HostResponse::Deferred { message, reason });
+    }
+    if delivered {
+        return Ok(HostResponse::Delivered {
+            message,
+            external_reference: visible_reference,
+        });
+    }
+    Ok(HostResponse::Noop)
+}
+
+fn core_services<M>(model: &Arc<M>, core_state: &Arc<CliCoreState>) -> CoreServices
+where
+    M: CoreModelBackend + 'static,
+{
+    CoreServices::new(Arc::clone(model) as Arc<dyn CoreModelBackend>)
+        .with_memory(Arc::clone(core_state) as Arc<dyn MemoryStore>)
+        .with_open_loops(Arc::clone(core_state) as Arc<dyn OpenLoopStore>)
+        .with_relations(Arc::clone(core_state) as Arc<dyn yunxi_core::RelationStore>)
+        .with_affect(Arc::clone(core_state) as Arc<dyn yunxi_core::AffectStore>)
+}
+
+struct CliActionPort<'a, E> {
+    environment: &'a E,
+    core_state: &'a CliCoreState,
+}
+
+impl<E> ActionPort for CliActionPort<'_, E>
+where
+    E: ActionPort,
+{
+    fn execute<'a>(&'a self, action: &'a ProposedAction) -> ActionPortFuture<'a> {
+        match action {
+            ProposedAction::CreateOpenLoop(action) => Box::pin(async move {
+                let item = self
+                    .core_state
+                    .create(&action.draft)
+                    .await
+                    .map_err(|error| ActionPortError::new(error.to_string(), true))?;
+                Ok(ActionPortOutcome::Delivered {
+                    external_reference: Some(format!("cli-open-loop:{}", item.id())),
+                    message_id: None,
+                    conversation_id: item.owner().conversation_id(),
+                })
+            }),
+            ProposedAction::ResolveOpenLoop(action) => Box::pin(async move {
+                let item = self
+                    .core_state
+                    .get(action.open_loop_id)
+                    .await
+                    .map_err(|error| ActionPortError::new(error.to_string(), true))?
+                    .ok_or_else(|| ActionPortError::new("open_loop_not_found", false))?;
+                if item.owner() != action.owner {
+                    return Err(ActionPortError::new("open_loop_owner_mismatch", false));
+                }
+                let resolved = self
+                    .core_state
+                    .resolve(action.open_loop_id, chrono::Utc::now())
+                    .await
+                    .map_err(|error| ActionPortError::new(error.to_string(), true))?;
+                Ok(ActionPortOutcome::Delivered {
+                    external_reference: Some(format!("cli-open-loop-resolved:{}", resolved.id())),
+                    message_id: None,
+                    conversation_id: resolved.owner().conversation_id(),
+                })
+            }),
+            _ => self.environment.execute(action),
         }
     }
 }
@@ -256,6 +562,11 @@ fn action_message(action: &ProposedAction) -> Option<String> {
     match action {
         ProposedAction::SendMessage(action) => Some(action.content.as_text().to_owned()),
         ProposedAction::ReachOut(action) => Some(action.message.as_text().to_owned()),
+        ProposedAction::UseTool(_)
+        | ProposedAction::CreateOpenLoop(_)
+        | ProposedAction::ResolveOpenLoop(_)
+        | ProposedAction::StartGoal(_)
+        | ProposedAction::CancelGoal(_) => None,
         ProposedAction::Noop => None,
     }
 }
@@ -274,6 +585,104 @@ where
         match Pin::new(&mut future).poll(&mut context) {
             Poll::Ready(value) => return value,
             Poll::Pending => thread::yield_now(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use yunxi_core::{ActionReceipt, CognitiveIntent};
+
+    #[test]
+    fn secondary_deferred_action_defers_the_host_response() {
+        let conversation_id = ConversationId::new();
+        let draft = OpenLoopDraft::new(
+            OpenLoopOwner::Conversation(conversation_id),
+            OpenLoopKind::FollowUp,
+            "later",
+        )
+        .expect("draft");
+        let plan = DecisionPlan {
+            disposition: DecisionDisposition::SpecialAction,
+            intents: vec![
+                CognitiveIntent::send_message(conversation_id, MessageContent::text("noted")),
+                CognitiveIntent::create_open_loop(draft),
+            ],
+            state_updates: Vec::new(),
+        };
+        let receipt = ActionReceipt {
+            action_id: None,
+            idempotency_key: None,
+            admitted_at: chrono::Utc::now(),
+        };
+        let response = response_from_actions(
+            &plan,
+            vec![
+                ActionResult::Executed {
+                    receipt: receipt.clone(),
+                    outcome: ActionPortOutcome::Delivered {
+                        external_reference: Some("message-1".to_owned()),
+                        message_id: None,
+                        conversation_id: Some(conversation_id),
+                    },
+                },
+                ActionResult::Executed {
+                    receipt,
+                    outcome: ActionPortOutcome::Deferred {
+                        reason: "state_busy".to_owned(),
+                    },
+                },
+            ],
+        )
+        .expect("deferred response");
+        assert_eq!(
+            response,
+            HostResponse::Deferred {
+                message: "noted".to_owned(),
+                reason: "state_busy".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn tool_results_are_not_reported_as_visible_delivery() {
+        let conversation_id = ConversationId::new();
+        let plan = DecisionPlan {
+            disposition: DecisionDisposition::SpecialAction,
+            intents: vec![CognitiveIntent::use_tool(
+                "time.now",
+                "{}",
+                yunxi_core::ActionScope::Conversation(conversation_id),
+            )],
+            state_updates: Vec::new(),
+        };
+        let receipt = ActionReceipt {
+            action_id: None,
+            idempotency_key: None,
+            admitted_at: chrono::Utc::now(),
+        };
+
+        for outcome in [
+            ActionPortOutcome::ToolCompleted {
+                operation: "time.now".to_owned(),
+                output: "12:00".to_owned(),
+            },
+            ActionPortOutcome::ToolFailed {
+                operation: "time.now".to_owned(),
+                error_category: "unavailable".to_owned(),
+                detail: "clock unavailable".to_owned(),
+            },
+        ] {
+            let response = response_from_actions(
+                &plan,
+                vec![ActionResult::Executed {
+                    receipt: receipt.clone(),
+                    outcome,
+                }],
+            )
+            .expect("tool outcome should remain a non-visible observation");
+            assert_eq!(response, HostResponse::Noop);
         }
     }
 }

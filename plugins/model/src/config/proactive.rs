@@ -15,7 +15,8 @@ pub struct ProactiveConfig {
     cooldown_secs: u64,
     /// 每次满足条件后实际发送的概率（0-100）。
     push_probability_percent: u8,
-    /// 最信任的用户 QQ 号；配置后由模型自主决定是否主动私聊。
+    /// 旧版最信任用户 QQ 号。配置 canonical `identity.owner_person_id`
+    /// 后不再承担 owner 语义，仅作为未迁移部署的兼容回退。
     main_admin: Option<i64>,
     /// 两次“是否联系主人”的模型决策之间的最短间隔，避免每轮循环额外消耗 token。
     main_admin_decision_interval_secs: u64,
@@ -29,6 +30,8 @@ pub struct ProactiveConfig {
     target_cooldown_secs: u64,
     /// 用户或群组最近主动互动后，暂不追加主动消息的时间。
     recent_interaction_cooldown_secs: u64,
+    /// 主动消息进入 Prepared 后的短竞争窗口；0 关闭，否则限 300-1000ms。
+    prepared_grace_ms: u64,
 }
 
 impl ProactiveConfig {
@@ -80,6 +83,10 @@ impl ProactiveConfig {
         self.recent_interaction_cooldown_secs
     }
 
+    pub fn prepared_grace_ms(&self) -> u64 {
+        self.prepared_grace_ms
+    }
+
     pub fn validate(&self) -> anyhow::Result<()> {
         if self.check_interval_secs == 0 {
             return Err(anyhow::anyhow!("主动消息检查间隔必须大于0秒"));
@@ -111,6 +118,11 @@ impl ProactiveConfig {
         if self.recent_interaction_cooldown_secs == 0 {
             return Err(anyhow::anyhow!("主动消息互动抑制时间必须大于0秒"));
         }
+        if self.prepared_grace_ms != 0 && !(300..=1_000).contains(&self.prepared_grace_ms) {
+            return Err(anyhow::anyhow!(
+                "主动消息 Prepared 竞争窗口必须为0或300到1000毫秒"
+            ));
+        }
         Ok(())
     }
 }
@@ -130,6 +142,7 @@ impl Default for ProactiveConfig {
             main_admin_daily_limit: 2,
             target_cooldown_secs: 21_600,
             recent_interaction_cooldown_secs: 7_200,
+            prepared_grace_ms: 500,
         }
     }
 }
@@ -169,5 +182,25 @@ mod tests {
         assert_eq!(config.daily_limit(), 4);
         assert_eq!(config.main_admin_daily_limit(), 2);
         assert_eq!(config.target_cooldown_secs(), 21_600);
+        assert_eq!(config.prepared_grace_ms(), 500);
+    }
+
+    #[test]
+    fn prepared_grace_can_be_disabled_but_rejects_long_typing_delays() {
+        let disabled = ProactiveConfig {
+            prepared_grace_ms: 0,
+            ..ProactiveConfig::default()
+        };
+        assert!(disabled.validate().is_ok());
+        let too_short = ProactiveConfig {
+            prepared_grace_ms: 299,
+            ..ProactiveConfig::default()
+        };
+        assert!(too_short.validate().is_err());
+        let too_long = ProactiveConfig {
+            prepared_grace_ms: 1_001,
+            ..ProactiveConfig::default()
+        };
+        assert!(too_long.validate().is_err());
     }
 }

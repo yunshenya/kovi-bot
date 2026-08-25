@@ -26,6 +26,7 @@ use std::sync::{Arc, LazyLock, RwLock};
 mod agent_runs;
 mod agent_tasks;
 mod group_interjection;
+mod identity;
 mod memory;
 mod message_batch;
 mod mood;
@@ -40,6 +41,7 @@ mod vision;
 
 pub use agent_runs::AgentRunConfig;
 pub use agent_tasks::AgentTaskConfig;
+pub use identity::IdentityConfig;
 pub use reminders::ReminderConfig;
 pub use tools::{McpServerConfig, ToolsConfig};
 pub use vision::VisionConfig;
@@ -60,6 +62,8 @@ static MODEL_CONFIG: LazyLock<Arc<RwLock<ModelConfig>>> = LazyLock::new(|| {
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
 #[serde(default)]
 pub struct ModelConfig {
+    /// Canonical Yunxi identity and owner mapping.
+    identity: IdentityConfig,
     /// 提示词配置
     prompt: Prompt,
     /// 服务器配置
@@ -155,6 +159,10 @@ impl ModelConfig {
 
     pub fn prompt(&self) -> &Prompt {
         &self.prompt
+    }
+
+    pub fn identity(&self) -> &IdentityConfig {
+        &self.identity
     }
 
     pub fn server_config(&self) -> &ServerConfig {

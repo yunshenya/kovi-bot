@@ -26,6 +26,11 @@ pub const MAX_RATE_LIMIT_WINDOW_ENTRIES: usize = 4_096;
 pub enum ActionCapability {
     SendMessage,
     ReachOut,
+    UseTool,
+    CreateOpenLoop,
+    ResolveOpenLoop,
+    StartGoal,
+    CancelGoal,
 }
 
 impl ActionCapability {
@@ -34,6 +39,11 @@ impl ActionCapability {
         match self {
             Self::SendMessage => "send_message",
             Self::ReachOut => "reach_out",
+            Self::UseTool => "use_tool",
+            Self::CreateOpenLoop => "create_open_loop",
+            Self::ResolveOpenLoop => "resolve_open_loop",
+            Self::StartGoal => "start_goal",
+            Self::CancelGoal => "cancel_goal",
         }
     }
 }
@@ -100,6 +110,11 @@ impl EnvironmentCapabilities {
         Self::empty()
             .with_action(ActionDescriptor::new(ActionCapability::SendMessage))
             .with_action(ActionDescriptor::new(ActionCapability::ReachOut))
+            .with_action(ActionDescriptor::new(ActionCapability::UseTool))
+            .with_action(ActionDescriptor::new(ActionCapability::CreateOpenLoop))
+            .with_action(ActionDescriptor::new(ActionCapability::ResolveOpenLoop))
+            .with_action(ActionDescriptor::new(ActionCapability::StartGoal))
+            .with_action(ActionDescriptor::new(ActionCapability::CancelGoal))
     }
 
     #[must_use]
@@ -139,6 +154,11 @@ impl EnvironmentCapabilities {
 pub struct AuthorizationPolicy {
     allow_send_message: bool,
     allow_reach_out: bool,
+    allow_use_tool: bool,
+    allow_create_open_loop: bool,
+    allow_resolve_open_loop: bool,
+    allow_start_goal: bool,
+    allow_cancel_goal: bool,
     allowed_actors: Option<HashSet<PersonId>>,
     allowed_people: Option<HashSet<PersonId>>,
     allowed_conversations: Option<HashSet<ConversationId>>,
@@ -152,6 +172,11 @@ impl AuthorizationPolicy {
         Self {
             allow_send_message: true,
             allow_reach_out: true,
+            allow_use_tool: true,
+            allow_create_open_loop: true,
+            allow_resolve_open_loop: true,
+            allow_start_goal: true,
+            allow_cancel_goal: true,
             allowed_actors: None,
             allowed_people: None,
             allowed_conversations: None,
@@ -165,6 +190,11 @@ impl AuthorizationPolicy {
         Self {
             allow_send_message: false,
             allow_reach_out: false,
+            allow_use_tool: false,
+            allow_create_open_loop: false,
+            allow_resolve_open_loop: false,
+            allow_start_goal: false,
+            allow_cancel_goal: false,
             ..Self::allow_all()
         }
     }
@@ -178,6 +208,36 @@ impl AuthorizationPolicy {
     #[must_use]
     pub fn allow_reach_out(mut self, allowed: bool) -> Self {
         self.allow_reach_out = allowed;
+        self
+    }
+
+    #[must_use]
+    pub const fn allow_use_tool(mut self, allowed: bool) -> Self {
+        self.allow_use_tool = allowed;
+        self
+    }
+
+    #[must_use]
+    pub const fn allow_create_open_loop(mut self, allowed: bool) -> Self {
+        self.allow_create_open_loop = allowed;
+        self
+    }
+
+    #[must_use]
+    pub const fn allow_resolve_open_loop(mut self, allowed: bool) -> Self {
+        self.allow_resolve_open_loop = allowed;
+        self
+    }
+
+    #[must_use]
+    pub const fn allow_start_goal(mut self, allowed: bool) -> Self {
+        self.allow_start_goal = allowed;
+        self
+    }
+
+    #[must_use]
+    pub const fn allow_cancel_goal(mut self, allowed: bool) -> Self {
+        self.allow_cancel_goal = allowed;
         self
     }
 
@@ -254,6 +314,44 @@ impl AuthorizationPolicy {
                     && !people.contains(&action.person_id)
                 {
                     return Err(AuthorizationFailure::ScopeNotAllowed);
+                }
+            }
+            ProposedAction::UseTool(_) => {
+                if !self.allow_use_tool {
+                    return Err(AuthorizationFailure::ActionNotAllowed);
+                }
+            }
+            ProposedAction::CreateOpenLoop(action) => {
+                if !self.allow_create_open_loop {
+                    return Err(AuthorizationFailure::ActionNotAllowed);
+                }
+                if let Some(people) = &self.allowed_people
+                    && let crate::open_loop::OpenLoopOwner::Person(person_id) = action.draft.owner()
+                    && !people.contains(&person_id)
+                {
+                    return Err(AuthorizationFailure::ScopeNotAllowed);
+                }
+                if let Some(conversations) = &self.allowed_conversations
+                    && let crate::open_loop::OpenLoopOwner::Conversation(conversation_id) =
+                        action.draft.owner()
+                    && !conversations.contains(&conversation_id)
+                {
+                    return Err(AuthorizationFailure::ScopeNotAllowed);
+                }
+            }
+            ProposedAction::ResolveOpenLoop(_action) => {
+                if !self.allow_resolve_open_loop {
+                    return Err(AuthorizationFailure::ActionNotAllowed);
+                }
+            }
+            ProposedAction::StartGoal(_action) => {
+                if !self.allow_start_goal {
+                    return Err(AuthorizationFailure::ActionNotAllowed);
+                }
+            }
+            ProposedAction::CancelGoal(_) => {
+                if !self.allow_cancel_goal {
+                    return Err(AuthorizationFailure::ActionNotAllowed);
                 }
             }
             ProposedAction::Noop => {}
@@ -488,6 +586,15 @@ pub enum ActionPortOutcome {
         message_id: Option<MessageId>,
         conversation_id: Option<ConversationId>,
     },
+    ToolCompleted {
+        operation: String,
+        output: String,
+    },
+    ToolFailed {
+        operation: String,
+        error_category: String,
+        detail: String,
+    },
     Deferred {
         reason: String,
     },
@@ -548,6 +655,10 @@ impl ActionResult {
             Self::Noop
                 | Self::Executed {
                     outcome: ActionPortOutcome::Delivered { .. },
+                    ..
+                }
+                | Self::Executed {
+                    outcome: ActionPortOutcome::ToolCompleted { .. },
                     ..
                 }
         )
@@ -925,7 +1036,11 @@ impl ActionArbiter {
             Err(rejection) => return ActionResult::Rejected(rejection),
         };
         match port.execute(&action).await {
-            Ok(outcome @ ActionPortOutcome::Delivered { .. }) => {
+            Ok(
+                outcome @ (ActionPortOutcome::Delivered { .. }
+                | ActionPortOutcome::ToolCompleted { .. }
+                | ActionPortOutcome::ToolFailed { .. }),
+            ) => {
                 self.mark_delivered(&receipt);
                 ActionResult::Executed { receipt, outcome }
             }
@@ -945,6 +1060,11 @@ fn capability_for(action: &ProposedAction) -> Option<ActionCapability> {
     match action {
         ProposedAction::SendMessage(_) => Some(ActionCapability::SendMessage),
         ProposedAction::ReachOut(_) => Some(ActionCapability::ReachOut),
+        ProposedAction::UseTool(_) => Some(ActionCapability::UseTool),
+        ProposedAction::CreateOpenLoop(_) => Some(ActionCapability::CreateOpenLoop),
+        ProposedAction::ResolveOpenLoop(_) => Some(ActionCapability::ResolveOpenLoop),
+        ProposedAction::StartGoal(_) => Some(ActionCapability::StartGoal),
+        ProposedAction::CancelGoal(_) => Some(ActionCapability::CancelGoal),
         ProposedAction::Noop => None,
     }
 }
@@ -1034,6 +1154,22 @@ mod tests {
     }
 
     #[test]
+    fn environment_all_exposes_every_platform_neutral_action_capability() {
+        let capabilities = EnvironmentCapabilities::all();
+        for capability in [
+            ActionCapability::SendMessage,
+            ActionCapability::ReachOut,
+            ActionCapability::UseTool,
+            ActionCapability::CreateOpenLoop,
+            ActionCapability::ResolveOpenLoop,
+            ActionCapability::StartGoal,
+            ActionCapability::CancelGoal,
+        ] {
+            assert!(capabilities.supports(capability, ActionScope::Global));
+        }
+    }
+
+    #[test]
     fn stale_generation_and_expiry_are_rejected() {
         let now = Utc::now();
         let metadata =
@@ -1062,7 +1198,13 @@ mod tests {
         let action = send_with_key(ConversationId::new(), "generation", now);
         let metadata = match action {
             ProposedAction::SendMessage(action) => action.metadata.with_generation(3),
-            ProposedAction::ReachOut(_) | ProposedAction::Noop => unreachable!(),
+            ProposedAction::ReachOut(_)
+            | ProposedAction::UseTool(_)
+            | ProposedAction::CreateOpenLoop(_)
+            | ProposedAction::ResolveOpenLoop(_)
+            | ProposedAction::StartGoal(_)
+            | ProposedAction::CancelGoal(_)
+            | ProposedAction::Noop => unreachable!(),
         };
         let action = ProposedAction::SendMessage(
             SendMessageAction::with_metadata(

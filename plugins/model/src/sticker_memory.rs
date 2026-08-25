@@ -1126,7 +1126,7 @@ async fn notify_candidate(
     confidence: i16,
     evidence: &str,
 ) {
-    let Ok(main_admin) = bot.get_main_admin() else {
+    let Some(main_admin) = crate::model::utils::owner_user_id(bot) else {
         return;
     };
     let scope = if scope_type == "group" {

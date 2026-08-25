@@ -3,8 +3,10 @@ use crate::group_access;
 use crate::health_check::HealthChecker;
 use crate::memory::{GroupProfile, MEMORY_MANAGER};
 use crate::model::coalesce::{MessageCoalescer, MessagePart};
-use crate::model::conversation_coordinator::{ConversationCoordinator, PendingTurn};
-use crate::model::interrupt::{ReplyScope, is_active, scope_mutex};
+use crate::model::conversation_coordinator::{
+    ConversationCoordinator, IncomingAdmission, OutgoingExecutiveDecision, PendingTurn,
+};
+use crate::model::interrupt::{ReplyScope, ReplyTicket, is_active, scope_mutex};
 use crate::model::recall::{
     clear_reply_scope_locked, has_recalled_messages, is_recent_bot_message,
     recent_bot_message_for_reaction, send_tracked_group_message,
@@ -172,6 +174,23 @@ static DIRECT_TRIGGER_STATES: LazyLock<Mutex<HashMap<(i64, i64), DirectTriggerSt
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>) {
+    if event.user_id == event.self_id {
+        println!(
+            "[INFO] 忽略群聊自发消息回流 (群组: {}, 消息: {})",
+            event.group_id, event.message_id
+        );
+        return;
+    }
+    let admission = ConversationCoordinator::begin_incoming(ReplyScope::Group(event.group_id)).await;
+    group_message_event_after_ingress(event, bot, admission).await;
+}
+
+pub(crate) async fn group_message_event_after_ingress(
+    event: Arc<GroupMsgEvent>,
+    bot: Arc<RuntimeBot>,
+    initial_admission: IncomingAdmission,
+) {
+    let ingress = initial_admission.ticket;
     let group_id = event.group_id;
     let time_now_data = Local::now();
     let time = time_now_data.format("%H:%M:%S").to_string();
@@ -504,15 +523,8 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
     }
     let active_reply = is_active(reply_scope).await;
     let conversation_open = has_open_conversation_window(group_id).await;
-    let immediate_stop = active_reply && looks_like_immediate_stop_request(message);
-    let can_interrupt = addressed_to_bot || vision_command;
-    let reply_ticket = if can_interrupt {
-        Some(ConversationCoordinator::interrupt(reply_scope).await)
-    } else {
-        None
-    };
-    if immediate_stop {
-        stop_group_reply(group_id, event.user_id).await;
+    if looks_like_immediate_stop_request(message) {
+        stop_group_reply(group_id, event.user_id, ingress).await;
         println!("[INFO] 群聊用户打断回复 (群组: {})", group_id);
         return;
     }
@@ -661,12 +673,16 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
     } else {
         MessageUnderstanding::default()
     };
+    crate::yunxi::events::project_interaction_cues(
+        event.user_id,
+        understanding.interaction_cues(),
+    );
     let asks_for_silence = plain_text && (understanding.wants_no_reply || understanding.wants_stop);
     if asks_for_silence {
         if sampled_for_interjection {
             finish_interjection_attempt(group_id, false).await;
         }
-        stop_group_reply(group_id, event.user_id).await;
+        stop_group_reply(group_id, event.user_id, ingress).await;
         println!(
             "[INFO] 合并后的群聊消息请求停止当前回复 (群组: {})",
             group_id
@@ -724,7 +740,7 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
         learn_user_profile_from_message(event.user_id, message, &nickname, false, &understanding)
             .await;
     }
-    let participant_follow_up = is_conversation_participant_message(
+    let _participant_follow_up = is_conversation_participant_message(
         group_id,
         event.user_id,
         understanding.conversation_relevant,
@@ -735,13 +751,40 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
     let group_paused = is_group_paused(group_id).await;
     let explicit_sticker_teaching =
         sender_is_admin && sticker_teaching_message.is_some() && !message.trim().is_empty();
-    if addressed_to_bot
+    let primary_reply_expected = addressed_to_bot
         || vision_requested
         || batch_sticker_reaction
         || explicit_sticker_teaching
         || matches!(message.trim(), "#禁言" | "#结束禁言")
-        || (group_paused && sender_is_admin)
-    {
+        || (group_paused && sender_is_admin);
+    let continue_conversation = if primary_reply_expected {
+        false
+    } else {
+        should_continue_conversation(
+            group_id,
+            event.user_id,
+            understanding.conversation_relevant,
+            is_natural_short_follow_up(&intent_text),
+        )
+        .await
+    };
+    let direct_reply_expected = primary_reply_expected
+        || continue_conversation
+        || (sampled_for_interjection && understanding.interjection_worthy);
+    let Some(admission) = admit_understood_group_turn(
+        initial_admission,
+        &understanding,
+        direct_reply_expected,
+    )
+    .await
+    else {
+        println!(
+            "[INFO] 群聊语义决定已过期，丢弃旧批次 (群组: {}, 消息: {:?})",
+            group_id, source_message_ids
+        );
+        return;
+    };
+    if primary_reply_expected {
         if !stickers.is_empty()
             && let Err(error) = sticker_memory::record_usage(
                 &stickers,
@@ -760,8 +803,7 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
         }
         let Some(ticket) = claim_or_queue_group_reply(
             reply_scope,
-            reply_ticket,
-            participant_follow_up,
+            admission,
             true,
             group_id,
             event.user_id,
@@ -799,14 +841,7 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
         .await;
         finish_conversation_turn(group_id, event.user_id, turn_marker, replied).await;
         drain_pending_window_messages(group_id, Arc::clone(&bot), ticket).await;
-    } else if should_continue_conversation(
-        group_id,
-        event.user_id,
-        understanding.conversation_relevant,
-        is_natural_short_follow_up(&intent_text),
-    )
-    .await
-    {
+    } else if continue_conversation {
         println!("[INFO] 群聊接续对话 (群组: {})", group_id);
         if !stickers.is_empty()
             && let Err(error) = sticker_memory::record_usage(
@@ -826,8 +861,7 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
         }
         let Some(ticket) = claim_or_queue_group_reply(
             reply_scope,
-            reply_ticket,
-            participant_follow_up,
+            admission,
             true,
             group_id,
             event.user_id,
@@ -880,8 +914,7 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
         }
         let Some(ticket) = claim_or_queue_group_reply(
             reply_scope,
-            None,
-            participant_follow_up,
+            admission,
             false,
             group_id,
             event.user_id,
@@ -1291,12 +1324,26 @@ fn roll_conversation_window(
     }
 }
 
-fn should_defer_active_window_message(
-    active_reply: bool,
-    participant_follow_up: bool,
-    has_explicit_interrupt: bool,
+fn should_queue_after_executive(
+    active_or_queued: bool,
+    decision: OutgoingExecutiveDecision,
 ) -> bool {
-    active_reply && participant_follow_up && !has_explicit_interrupt
+    active_or_queued && decision == OutgoingExecutiveDecision::Keep
+}
+
+async fn admit_understood_group_turn(
+    initial: IncomingAdmission,
+    understanding: &MessageUnderstanding,
+    direct_reply_expected: bool,
+) -> Option<IncomingAdmission> {
+    ConversationCoordinator::refine_current_incoming(
+        initial,
+        ConversationCoordinator::context_for_understood_turn(
+            understanding,
+            direct_reply_expected,
+        ),
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1333,8 +1380,7 @@ async fn queue_pending_window_message(
 #[allow(clippy::too_many_arguments)]
 async fn claim_or_queue_group_reply(
     scope: ReplyScope,
-    ticket: Option<crate::model::ReplyTicket>,
-    participant_follow_up: bool,
+    admission: IncomingAdmission,
     reply_expected: bool,
     group_id: i64,
     user_id: i64,
@@ -1353,11 +1399,7 @@ async fn claim_or_queue_group_reply(
         .await
         .get(&group_id)
         .is_some_and(|queue| !queue.is_empty());
-    if should_defer_active_window_message(
-        active || has_queued,
-        participant_follow_up,
-        ticket.is_some(),
-    ) {
+    if should_queue_after_executive(active || has_queued, admission.decision) {
         println!(
             "[INFO] 群聊已有回复或排队消息进行中，排队窗口消息 (群组: {}, 用户: {})",
             group_id, user_id
@@ -1376,20 +1418,22 @@ async fn claim_or_queue_group_reply(
         .await;
         return None;
     }
-    let ticket = match ticket {
-        Some(ticket) => ticket,
-        None => ConversationCoordinator::interrupt_locked(scope).await,
-    };
+    let ticket = admission.ticket;
     ConversationCoordinator::begin_reply_locked(scope, ticket, message_ids)
         .await
         .then_some(ticket)
 }
 
-async fn stop_group_reply(group_id: i64, user_id: i64) {
+async fn stop_group_reply(group_id: i64, user_id: i64, ingress: ReplyTicket) {
     let scope = ReplyScope::Group(group_id);
     let scope_lock = scope_mutex(scope);
     let _scope_guard = scope_lock.lock().await;
-    ConversationCoordinator::interrupt_locked(scope).await;
+    if ConversationCoordinator::cancel_current_incoming_locked(ingress)
+        .await
+        .is_none()
+    {
+        return;
+    }
     GROUP_MESSAGE_BATCHES.cancel((group_id, user_id)).await;
     PENDING_WINDOW_MESSAGES.lock().await.remove(&group_id);
 }
@@ -1739,16 +1783,20 @@ async fn update_group_profile(group_id: i64, user_id: i64, understanding: &Messa
 mod tests {
     use super::{
         Addressing, DirectTriggerState, GroupInterjectionState, GroupSenderIdentity,
-        PENDING_WINDOW_MESSAGES, complete_interjection_attempt, conversation_message_is_relevant,
-        decision_budget_available, has_active_conversation_window, is_natural_short_follow_up,
+        PENDING_WINDOW_MESSAGES, admit_understood_group_turn, complete_interjection_attempt,
+        conversation_message_is_relevant, decision_budget_available,
+        has_active_conversation_window, is_natural_short_follow_up,
         looks_like_immediate_stop_request, message_at_self, normalized_sender_name,
         prune_decision_attempts, queue_pending_window_message, roll_conversation_window,
-        should_defer_active_window_message, sticker_reaction_budget_available,
-        suppress_direct_trigger, take_pending_window_turn, text_mentions_bot,
-        with_structured_bot_mention_context,
+        should_queue_after_executive, sticker_reaction_budget_available, suppress_direct_trigger,
+        take_pending_window_turn, text_mentions_bot, with_structured_bot_mention_context,
+    };
+    use crate::model::conversation_coordinator::{
+        ConversationCoordinator, OutgoingExecutiveDecision,
     };
     use crate::model::interrupt::{
-        ReplyScope, interrupt, interrupt_locked, is_current, scope_mutex,
+        OutgoingSource, ReplyScope, commit_outgoing, interrupt, interrupt_locked, is_current,
+        mark_active, mark_outgoing_failed, outgoing_fingerprint, prepare_outgoing, scope_mutex,
     };
     use crate::model::semantic::MessageUnderstanding;
     use crate::model::utils::{is_group_admin_command, is_restricted_command};
@@ -2271,11 +2319,52 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_window_messages_do_not_cancel_an_active_reply() {
-        assert!(should_defer_active_window_message(true, true, false));
-        assert!(!should_defer_active_window_message(true, true, true));
-        assert!(!should_defer_active_window_message(true, false, false));
-        assert!(!should_defer_active_window_message(false, true, false));
+    fn executive_keep_queues_behind_active_work_but_other_decisions_regenerate() {
+        assert!(should_queue_after_executive(
+            true,
+            OutgoingExecutiveDecision::Keep
+        ));
+        for decision in [
+            OutgoingExecutiveDecision::Rewrite,
+            OutgoingExecutiveDecision::Merge,
+            OutgoingExecutiveDecision::Defer,
+        ] {
+            assert!(!should_queue_after_executive(true, decision));
+        }
+        assert!(!should_queue_after_executive(
+            false,
+            OutgoingExecutiveDecision::Keep
+        ));
+    }
+
+    #[test]
+    fn production_group_semantic_helper_keeps_no_effect_observation_prepared() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let scope = ReplyScope::Group(9_340_001);
+                let initial = ConversationCoordinator::begin_incoming(scope).await;
+                assert!(mark_active(initial.ticket).await);
+                let outgoing = prepare_outgoing(
+                    initial.ticket,
+                    outgoing_fingerprint("observation does not change this"),
+                    OutgoingSource::Reply,
+                )
+                .await
+                .expect("reply should prepare during semantic work");
+
+                let refined = admit_understood_group_turn(
+                    initial,
+                    &MessageUnderstanding::default(),
+                    false,
+                )
+                .await
+                .expect("ingress should remain current");
+
+                assert_eq!(refined.decision, OutgoingExecutiveDecision::Keep);
+                assert!(commit_outgoing(outgoing).await);
+                mark_outgoing_failed(outgoing).await;
+            });
     }
 
     #[test]

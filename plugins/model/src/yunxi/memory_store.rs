@@ -47,6 +47,8 @@ impl PostgresMemoryStore {
     /// Additive Core memory table. Legacy rows remain untouched during the
     /// migration; the table is ready for dual-read/dual-write rollout.
     pub(crate) async fn initialize_schema(&self) -> anyhow::Result<()> {
+        let mut transaction = self.pool.begin().await?;
+        super::schema::lock(&mut transaction).await?;
         query(
             r#"CREATE TABLE IF NOT EXISTS yunxi_memories (
                 id UUID PRIMARY KEY,
@@ -61,14 +63,15 @@ impl PostgresMemoryStore {
                 CHECK ((scope_kind = 'global' AND scope_id IS NULL) OR (scope_kind <> 'global' AND scope_id IS NOT NULL))
             )"#,
         )
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await?;
         query(
             "CREATE INDEX IF NOT EXISTS yunxi_memories_scope_idx
              ON yunxi_memories (scope_kind, scope_id, occurred_at DESC)",
         )
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await?;
+        transaction.commit().await?;
         Ok(())
     }
 

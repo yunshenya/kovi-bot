@@ -2,7 +2,7 @@ use super::owner_lock::{self, DurableOwner};
 use chrono::{DateTime, Utc};
 use sqlx_core::query::query;
 use sqlx_core::row::Row;
-use sqlx_postgres::PgPool;
+use sqlx_postgres::{PgPool, Postgres};
 use uuid::Uuid;
 use yunxi_core::{
     Goal, GoalDraft, GoalId, GoalKind, GoalOwner, GoalState, GoalStore, GoalStoreError,
@@ -23,6 +23,7 @@ impl PostgresGoalStore {
 
     pub(crate) async fn initialize_schema(&self) -> anyhow::Result<()> {
         let mut transaction = self.pool.begin().await?;
+        super::schema::lock(&mut transaction).await?;
         for statement in [
             r#"
             CREATE TABLE IF NOT EXISTS yunxi_goals (
@@ -57,6 +58,17 @@ impl PostgresGoalStore {
             )
             "#,
             r#"
+            CREATE TABLE IF NOT EXISTS yunxi_goal_external_links (
+                source_kind TEXT NOT NULL,
+                source_key TEXT NOT NULL,
+                goal_id UUID NOT NULL UNIQUE
+                    REFERENCES yunxi_goals(id) ON DELETE CASCADE,
+                PRIMARY KEY (source_kind, source_key),
+                CHECK (octet_length(source_kind) BETWEEN 1 AND 128),
+                CHECK (octet_length(source_key) BETWEEN 1 AND 512)
+            )
+            "#,
+            r#"
             CREATE INDEX IF NOT EXISTS yunxi_goals_owner_idx
                 ON yunxi_goals (owner_kind, owner_id, state, updated_at DESC, id)
             "#,
@@ -70,6 +82,154 @@ impl PostgresGoalStore {
         }
         transaction.commit().await?;
         Ok(())
+    }
+
+    pub(crate) async fn get_or_create_external_person_goal(
+        &self,
+        source_kind: &str,
+        source_key: &str,
+        person_id: yunxi_core::PersonId,
+        title: &str,
+    ) -> Result<Goal, GoalStoreError> {
+        validate_external_link(source_kind, source_key)?;
+        let draft = GoalDraft::new(GoalOwner::Person(person_id), GoalKind::FollowUp, title)
+            .map_err(validation_error)?;
+        let mut transaction = self.pool.begin().await.map_err(GoalStoreError::storage)?;
+        lock_external_link(&mut transaction, source_kind, source_key).await?;
+        if let Some(row) = query(
+            r#"
+            SELECT goals.*
+            FROM yunxi_goal_external_links AS links
+            JOIN yunxi_goals AS goals ON goals.id = links.goal_id
+            WHERE links.source_kind = $1 AND links.source_key = $2
+            FOR UPDATE OF goals
+            "#,
+        )
+        .bind(source_kind)
+        .bind(source_key)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(GoalStoreError::storage)?
+        {
+            let goal = row_to_goal(&row)?;
+            if goal.owner() != draft.owner() {
+                return Err(GoalStoreError::Conflict);
+            }
+            transaction
+                .commit()
+                .await
+                .map_err(GoalStoreError::storage)?;
+            return Ok(goal);
+        }
+
+        let owner = durable_owner(draft.owner());
+        if !owner_lock::lock_and_owner_exists(&mut transaction, owner)
+            .await
+            .map_err(GoalStoreError::storage)?
+        {
+            return Err(GoalStoreError::InvalidRequest {
+                reason: format!("goal owner {owner:?} does not exist"),
+            });
+        }
+        let goal = Goal::from_draft(GoalId::new(), &draft, Utc::now()).map_err(validation_error)?;
+        let (owner_kind, owner_id) = owner_parts(goal.owner());
+        let row = query(
+            r#"
+            INSERT INTO yunxi_goals
+                (id, owner_kind, owner_id, kind, title, details, state, due_at,
+                 created_at, updated_at, completed_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            RETURNING *
+            "#,
+        )
+        .bind(goal.id().into_uuid())
+        .bind(owner_kind)
+        .bind(owner_id)
+        .bind(kind_name(goal.kind()))
+        .bind(goal.title())
+        .bind(goal.details())
+        .bind(state_name(goal.state()))
+        .bind(goal.due_at())
+        .bind(goal.created_at())
+        .bind(goal.updated_at())
+        .bind(goal.completed_at())
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(GoalStoreError::storage)?;
+        query(
+            "INSERT INTO yunxi_goal_external_links (source_kind, source_key, goal_id) VALUES ($1, $2, $3)",
+        )
+        .bind(source_kind)
+        .bind(source_key)
+        .bind(goal.id().into_uuid())
+        .execute(&mut *transaction)
+        .await
+        .map_err(GoalStoreError::storage)?;
+        let goal = row_to_goal(&row)?;
+        transaction
+            .commit()
+            .await
+            .map_err(GoalStoreError::storage)?;
+        Ok(goal)
+    }
+
+    pub(crate) async fn transition_external_goal(
+        &self,
+        source_kind: &str,
+        source_key: &str,
+        target: GoalState,
+    ) -> Result<Option<Goal>, GoalStoreError> {
+        validate_external_link(source_kind, source_key)?;
+        let mut transaction = self.pool.begin().await.map_err(GoalStoreError::storage)?;
+        lock_external_link(&mut transaction, source_kind, source_key).await?;
+        let Some(row) = query(
+            r#"
+            SELECT goals.*
+            FROM yunxi_goal_external_links AS links
+            JOIN yunxi_goals AS goals ON goals.id = links.goal_id
+            WHERE links.source_kind = $1 AND links.source_key = $2
+            FOR UPDATE OF goals
+            "#,
+        )
+        .bind(source_kind)
+        .bind(source_key)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(GoalStoreError::storage)?
+        else {
+            transaction
+                .commit()
+                .await
+                .map_err(GoalStoreError::storage)?;
+            return Ok(None);
+        };
+        let mut goal = row_to_goal(&row)?;
+        if goal.state() == target || goal.state().is_terminal() {
+            transaction
+                .commit()
+                .await
+                .map_err(GoalStoreError::storage)?;
+            return Ok(Some(goal));
+        }
+        let transitioned_at = Utc::now().max(goal.updated_at() + chrono::Duration::microseconds(1));
+        goal.transition(target, transitioned_at)
+            .map_err(validation_error)?;
+        let row = query(
+            "UPDATE yunxi_goals SET state = $2, updated_at = $3, completed_at = $4 WHERE id = $1 RETURNING *",
+        )
+        .bind(goal.id().into_uuid())
+        .bind(state_name(goal.state()))
+        .bind(goal.updated_at())
+        .bind(goal.completed_at())
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(GoalStoreError::storage)?;
+        let goal = row_to_goal(&row)?;
+        transaction
+            .commit()
+            .await
+            .map_err(GoalStoreError::storage)?;
+        Ok(Some(goal))
     }
 
     async fn create_inner(&self, draft: &GoalDraft) -> Result<Goal, GoalStoreError> {
@@ -258,6 +418,34 @@ impl GoalStore for PostgresGoalStore {
     fn delete(&self, id: GoalId) -> GoalStoreFuture<'_, bool> {
         Box::pin(async move { self.delete_inner(id).await })
     }
+}
+
+async fn lock_external_link(
+    transaction: &mut sqlx_core::transaction::Transaction<'_, Postgres>,
+    source_kind: &str,
+    source_key: &str,
+) -> Result<(), GoalStoreError> {
+    query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!(
+            "yunxi_goal_external_link:{source_kind}:{source_key}"
+        ))
+        .execute(&mut **transaction)
+        .await
+        .map(|_| ())
+        .map_err(GoalStoreError::storage)
+}
+
+fn validate_external_link(source_kind: &str, source_key: &str) -> Result<(), GoalStoreError> {
+    if source_kind.is_empty()
+        || source_kind.len() > 128
+        || source_key.is_empty()
+        || source_key.len() > 512
+    {
+        return Err(GoalStoreError::InvalidRequest {
+            reason: "external goal link is invalid".to_string(),
+        });
+    }
+    Ok(())
 }
 
 fn owner_parts(owner: GoalOwner) -> (&'static str, Option<Uuid>) {
@@ -495,6 +683,65 @@ mod tests {
                         .await
                         .expect("second delete should be idempotent")
                 );
+
+                let source_key = suffix.to_string();
+                let linked = store
+                    .get_or_create_external_person_goal(
+                        "test_agent_task",
+                        &source_key,
+                        person_id,
+                        "linked task goal",
+                    )
+                    .await
+                    .expect("should create linked goal");
+                let replayed = store
+                    .get_or_create_external_person_goal(
+                        "test_agent_task",
+                        &source_key,
+                        person_id,
+                        "linked task goal",
+                    )
+                    .await
+                    .expect("should replay linked goal");
+                assert_eq!(replayed.id(), linked.id());
+
+                let completed = store
+                    .transition_external_goal(
+                        "test_agent_task",
+                        &source_key,
+                        GoalState::Completed,
+                    )
+                    .await
+                    .expect("should transition linked goal")
+                    .expect("linked goal should exist");
+                assert_eq!(completed.id(), linked.id());
+                assert_eq!(completed.state(), GoalState::Completed);
+                assert_eq!(
+                    store
+                        .transition_external_goal(
+                            "test_agent_task",
+                            &source_key,
+                            GoalState::Completed,
+                        )
+                        .await
+                        .expect("completion replay should succeed"),
+                    Some(completed.clone())
+                );
+                assert!(
+                    store
+                        .delete(completed.id())
+                        .await
+                        .expect("should delete linked goal")
+                );
+                let remaining_link = query(
+                    "SELECT goal_id FROM yunxi_goal_external_links WHERE source_kind = $1 AND source_key = $2",
+                )
+                .bind("test_agent_task")
+                .bind(&source_key)
+                .fetch_optional(&pool)
+                .await
+                .expect("should query linked goal cleanup");
+                assert!(remaining_link.is_none());
                 query("DELETE FROM yunxi_persons WHERE id = $1")
                     .bind(person_id.into_uuid())
                     .execute(&pool)

@@ -21,8 +21,11 @@ pub mod runtime;
 pub mod working_state;
 
 pub use action::{
-    ActionId, ActionMetadata, ActionScope, ActionValidationError, MAX_ACTION_IDEMPOTENCY_KEY_BYTES,
-    MAX_ACTION_IDEMPOTENCY_KEY_CHARS, ProposedAction, ReachOutAction, SendMessageAction,
+    ActionId, ActionMetadata, ActionScope, ActionValidationError, CancelGoalAction,
+    CreateOpenLoopAction, MAX_ACTION_IDEMPOTENCY_KEY_BYTES, MAX_ACTION_IDEMPOTENCY_KEY_CHARS,
+    MAX_TOOL_INPUT_BYTES, MAX_TOOL_INPUT_CHARS, MAX_TOOL_NAME_BYTES, MAX_TOOL_NAME_CHARS,
+    ProposedAction, ReachOutAction, ResolveOpenLoopAction, SendMessageAction, StartGoalAction,
+    ToolAction,
 };
 pub use arbiter::{
     ActionArbiter, ActionArbiterConfig, ActionCapability, ActionDescriptor, ActionPort,
@@ -35,19 +38,24 @@ pub use delivery::{
     DeliveryResolutionError, DeliveryResolver, DeliveryResolverFuture, DeliveryRoute,
 };
 pub use event::{
-    ActionFailedEvent, ActionRejectedEvent, ActionSucceededEvent, EventPriority, EventScope,
-    EventType, EventValidationError, GoalCompletedEvent, GoalUpdatedEvent, MessageContent,
-    MessageReceivedEvent, MessageSentEvent, ProspectiveMemoryEvent, ReminderDueEvent,
+    ActionFailedEvent, ActionRejectedEvent, ActionSucceededEvent, Attachment, AttachmentKind,
+    EventPriority, EventScope, EventType, EventValidationError, GoalCompletedEvent,
+    GoalUpdatedEvent, InteractionCuesObservedEvent, Message, MessageCollisionDetectedEvent,
+    MessageContent, MessageReceivedEvent, MessageSentEvent, MessageValidationError,
+    ProspectiveMemoryEvent, ReminderDueEvent,
     ToolCompletedEvent, ToolFailedEvent, TraceContext, TraceError, WorldEvent, WorldEventKind,
+    MAX_TOOL_ERROR_DETAIL_BYTES, MAX_TOOL_ERROR_DETAIL_CHARS, MAX_TOOL_RESULT_BYTES,
+    MAX_TOOL_RESULT_CHARS,
 };
 pub use goal::{
     Goal, GoalDraft, GoalKind, GoalOwner, GoalState, GoalValidationError, MAX_GOAL_DETAILS_BYTES,
     MAX_GOAL_DETAILS_CHARS, MAX_GOAL_TITLE_BYTES, MAX_GOAL_TITLE_CHARS,
 };
 pub use identity::{
-    ConversationId, ConversationKind, EventId, ExternalConversation, ExternalIdentity,
-    ExternalReferenceError, GoalId, MAX_EXTERNAL_ID_BYTES, MAX_PLATFORM_ID_BYTES, MemoryId,
-    MessageId, OpenLoopId, PersonId, PlatformId,
+    ConversationId, ConversationKind, ConversationMember, ConversationMemberValidationError,
+    EventId, ExternalConversation, ExternalIdentity, ExternalReferenceError, GoalId,
+    MAX_CONVERSATION_MEMBER_ROLE_BYTES, MAX_CONVERSATION_MEMBER_ROLE_CHARS, MAX_EXTERNAL_ID_BYTES,
+    MAX_PLATFORM_ID_BYTES, MemoryId, MessageId, OpenLoopId, PersonId, PlatformId,
 };
 pub use intent::{CognitiveIntent, IntentValidationError};
 pub use memory::{
@@ -61,14 +69,18 @@ pub use open_loop::{
     OpenLoopStatus, OpenLoopValidationError,
 };
 pub use planner::{
-    AffectState, DecisionDisposition, DecisionPlan, MAX_PLANNER_INTENTS, MAX_PLANNER_MEMORIES,
+    AffectState, DecisionDisposition, DecisionPlan, InteractionCueValidationError, InteractionCues,
+    InteractionStateEvolution, MAX_PLANNER_GOALS, MAX_PLANNER_INTENTS, MAX_PLANNER_MEMORIES,
     MAX_PLANNER_OPEN_LOOPS, MAX_PLANNER_STATE_UPDATES, MAX_PLANNER_TOPIC_BYTES,
     MAX_PLANNER_TOPIC_CHARS, ModelBackend, ModelBackendError, ModelBackendFuture, Planner,
     PlannerError, PlannerInput, PlannerInputValidationError, PlannerOutput,
     PlannerOutputValidationError, PlannerStateSnapshot, RelationState, StateUpdateProposal,
+    apply_interaction_cues, drift_affect_state, drift_relation_state, evolve_interaction_state,
+    evolve_interaction_state_with_cues,
 };
 pub use ports::{
-    AffectStore, AffectStoreError, AffectStoreFuture, Clock, CoreServices, GoalStore,
+    AffectStore, AffectStoreError, AffectStoreFuture, Clock, ConversationMemberStore,
+    ConversationMemberStoreError, ConversationMemberStoreFuture, CoreServices, GoalStore,
     GoalStoreError, GoalStoreFuture, IdentityStore, IdentityStoreError, IdentityStoreFuture,
     MemoryStore, MemoryStoreError, MemoryStoreFuture, OpenLoopStore, OpenLoopStoreError,
     OpenLoopStoreFuture, RelationStore, RelationStoreError, RelationStoreFuture, SystemClock,

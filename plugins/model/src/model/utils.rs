@@ -13,10 +13,11 @@ use super::memory_query::interruptible_model_call;
 use super::memory_repository::MEMORY_REPOSITORY;
 use super::message_actions::{
     MessageDestination, ReplyPlan, execute_reply_plan, normalize_legacy_message_text,
+    send_tracked_reply_text,
 };
 use super::model_gateway::ModelGateway;
 use super::recall::{
-    RecentBotMessage, begin_reply, finish_reply, record_bot_message, send_tracked_group_message,
+    RecentBotMessage, begin_reply, finish_reply, send_tracked_group_message,
     send_tracked_private_message,
 };
 use super::reply::{attach_reply_protocol_context, clear_mention_context};
@@ -217,6 +218,9 @@ pub(crate) fn is_group_admin_command(message: &str) -> bool {
 }
 
 pub(crate) fn is_bot_admin(bot: &RuntimeBot, user_id: i64) -> bool {
+    if crate::yunxi::canonical_owner_matches(user_id) == Some(true) {
+        return true;
+    }
     match bot.get_all_admin() {
         Ok(admins) => admins.contains(&user_id),
         Err(error) => {
@@ -232,9 +236,23 @@ pub(crate) fn is_bot_admin(bot: &RuntimeBot, user_id: i64) -> bool {
 }
 
 pub(crate) fn is_main_admin(bot: &RuntimeBot, user_id: i64) -> bool {
+    if let Some(is_owner) = crate::yunxi::canonical_owner_matches(user_id) {
+        return is_owner;
+    }
     bot.get_main_admin()
         .map(|main_admin| main_admin == user_id)
         .unwrap_or(false)
+}
+
+/// Resolve the notification destination from the canonical owner mapping.
+/// A configured owner with no unique QQ route fails closed; only deployments
+/// without `[identity].owner_person_id` use Kovi's legacy administrator value.
+pub(crate) fn owner_user_id(bot: &RuntimeBot) -> Option<i64> {
+    match crate::yunxi::canonical_owner_qq_id() {
+        Some(Some(user_id)) => Some(user_id),
+        Some(None) => None,
+        None => bot.get_main_admin().ok(),
+    }
 }
 
 /// 消息角色枚举
@@ -523,19 +541,13 @@ pub async fn control_model(
             limit_memory_size(&mut messages);
             return false;
         }
-        if let Ok(message_id) = bot
-            .send_group_msg_return(group_id, "我这里暂时有点连不上，等一会儿再和我说一次吧。")
-            .await
-        {
-            let _ = record_bot_message(
-                reply_scope,
-                reply_ticket,
-                message_id,
-                "我这里暂时有点连不上，等一会儿再和我说一次吧。",
-                &bot,
-            )
-            .await;
-        }
+        send_tracked_reply_text(
+            &bot,
+            MessageDestination::Group(group_id),
+            "我这里暂时有点连不上，等一会儿再和我说一次吧。",
+            reply_ticket,
+        )
+        .await;
         limit_memory_size(&mut messages);
         return false;
     }
@@ -740,7 +752,7 @@ async fn report_empty_reply_incident(bot: &RuntimeBot, context: &str, message: &
         return;
     }
 
-    let Ok(main_admin) = bot.get_main_admin() else {
+    let Some(main_admin) = owner_user_id(bot) else {
         eprintln!(
             "[WARN] 回复链路自动修复失败，但无法读取主管理员 QQ (场景: {})",
             context
@@ -776,7 +788,7 @@ pub(crate) async fn report_vision_failure(
         return;
     }
 
-    let Ok(main_admin) = bot.get_main_admin() else {
+    let Some(main_admin) = owner_user_id(bot) else {
         eprintln!(
             "[WARN] 图片理解失败，但无法读取主管理员 QQ (场景: {})",
             context
@@ -2241,16 +2253,13 @@ async fn private_chat_inner(
             return;
         }
         let fallback = "这张图我这次没读出来，重新发一次或换张图试试吧。";
-        if let Ok(message_id) = bot.send_private_msg_return(user_id, fallback).await {
-            let _ = record_bot_message(
-                super::interrupt::ReplyScope::Private(user_id),
-                reply_ticket,
-                message_id,
-                fallback,
-                &bot,
-            )
-            .await;
-        }
+        send_tracked_reply_text(
+            &bot,
+            MessageDestination::Private(user_id),
+            fallback,
+            reply_ticket,
+        )
+        .await;
         limit_memory_size(&mut history);
         return;
     }
@@ -2271,19 +2280,13 @@ async fn private_chat_inner(
             limit_memory_size(&mut history);
             return;
         }
-        if let Ok(message_id) = bot
-            .send_private_msg_return(user_id, "我这里暂时有点连不上，等一会儿再和我说一次吧。")
-            .await
-        {
-            let _ = record_bot_message(
-                reply_scope,
-                reply_ticket,
-                message_id,
-                "我这里暂时有点连不上，等一会儿再和我说一次吧。",
-                &bot,
-            )
-            .await;
-        }
+        send_tracked_reply_text(
+            &bot,
+            MessageDestination::Private(user_id),
+            "我这里暂时有点连不上，等一会儿再和我说一次吧。",
+            reply_ticket,
+        )
+        .await;
         limit_memory_size(&mut history);
         return;
     }
@@ -2474,9 +2477,17 @@ async fn update_user_profile_from_message(
     let nickname = nickname.trim().to_string();
     let trigger = message.chars().take(80).collect::<String>();
     let understanding = understanding.cloned();
-    let is_main_admin = config::get().proactive().main_admin() == Some(user_id);
+    let projection_understanding = understanding.clone();
+    let is_main_admin = crate::yunxi::canonical_owner_matches(user_id)
+        .or_else(|| {
+            config::get()
+                .proactive()
+                .main_admin()
+                .map(|owner| owner == user_id)
+        })
+        .unwrap_or(false);
     let now = Local::now();
-    if let Err(e) = MEMORY_MANAGER
+    let profile_result = MEMORY_MANAGER
         .mutate_user_profile(user_id, move |current| {
             let mut profile = current.unwrap_or_else(|| UserProfile {
                 user_id,
@@ -2533,9 +2544,23 @@ async fn update_user_profile_from_message(
             }
             profile
         })
-        .await
-    {
-        eprintln!("[ERROR] 更新用户档案失败 (用户: {}): {}", user_id, e);
+        .await;
+    match profile_result {
+        Ok(profile) => {
+            let mood = projection_understanding
+                .as_ref()
+                .map(|value| (value.mood.as_str(), value.mood_intensity));
+            crate::yunxi::project_legacy_user_state(
+                user_id,
+                mood,
+                profile.relationship_level,
+                profile.interaction_count,
+            )
+            .await;
+        }
+        Err(e) => {
+            eprintln!("[ERROR] 更新用户档案失败 (用户: {}): {}", user_id, e);
+        }
     }
 }
 

@@ -89,6 +89,7 @@ impl PostgresOpenLoopStore {
 
     pub(crate) async fn initialize_schema(&self) -> anyhow::Result<()> {
         let mut transaction = self.pool.begin().await?;
+        super::schema::lock(&mut transaction).await?;
         for statement in [
             r#"
             CREATE TABLE IF NOT EXISTS yunxi_open_loops (

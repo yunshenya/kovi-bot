@@ -5,8 +5,8 @@
 use crate::group_access;
 use crate::memory::MEMORY_MANAGER;
 use crate::model::{
-    MessageDestination, MessageTransport, ReplyScope, ReplyTicket, is_current,
-    record_standalone_bot_message,
+    MessageDestination, OutgoingSource, ReplyTicket, is_current,
+    send_tracked_message_with_revalidation,
 };
 use anyhow::{Context, Result, anyhow, ensure};
 use chrono::{Duration as ChronoDuration, Utc};
@@ -308,33 +308,32 @@ async fn execute_send_group_message(
         }
         return Err(anyhow!("这条指令已经被更新的私聊消息打断"));
     }
-    if !group_access::is_authorized_group(group_id).await? {
-        mark_goal_failed(pool, goal_id, "发送前目标群授权已失效").await;
-        if let Some(task_id) = task_id {
-            crate::agent_tasks::fail_pending_task(task_id, "发送前目标群授权已失效").await;
-        }
-        return Err(anyhow!("目标群的授权已失效，消息未发送"));
-    }
-    if let Some(task_id) = task_id
-        && let Err(error) = crate::agent_tasks::begin_question_send(task_id).await
-    {
-        mark_goal_failed(pool, goal_id, &format!("群问题发送已停止：{error}")).await;
-        crate::agent_tasks::fail_pending_task(task_id, &format!("群问题发送已停止：{error}")).await;
-        return Err(error);
-    }
-
-    let send_result = MessageTransport::new(bot)
-        .send(
-            MessageDestination::Group(group_id),
-            Message::from(content.clone()),
-        )
-        .await;
+    let delivery_key = format!("agent-goal:{goal_id}:group-send");
+    let send_result = send_tracked_message_with_revalidation(
+        bot,
+        MessageDestination::Group(group_id),
+        Message::from(content.clone()),
+        OutgoingSource::Reply,
+        Some(&delivery_key),
+        || async {
+            if !is_current(reply_ticket).await || ensure_group_joined(bot, group_id).await.is_err() {
+                return false;
+            }
+            match task_id {
+                Some(task_id) => crate::agent_tasks::begin_question_send(task_id)
+                    .await
+                    .is_ok(),
+                None => true,
+            }
+        },
+    )
+    .await;
     let message_id = match send_result {
         Ok(message_id) => message_id,
         Err(error) => {
-            let detail = format!("OneBot 发送失败（retcode={}）", error.retcode);
+            let detail = format!("跨群消息在发送前校验或投递时失败：{error}");
             eprintln!(
-                "[ERROR] 角色跨群动作发送失败 (目标: {}, 任务: {}): {:?}",
+                "[ERROR] 角色跨群动作发送失败 (目标: {}, 任务: {}): {}",
                 group_id, goal_id, error
             );
             mark_goal_failed(pool, goal_id, &detail).await;
@@ -374,7 +373,6 @@ async fn execute_send_group_message(
         None
     };
 
-    record_standalone_bot_message(ReplyScope::Group(group_id), message_id, &content).await;
     crate::model::utils::record_external_group_message(group_id, &content).await;
     if let Err(error) = MEMORY_MANAGER
         .add_conversation_memory(
@@ -445,6 +443,9 @@ fn ensure_private_main_admin(bot: &RuntimeBot, context: AgentActionContext) -> R
 }
 
 fn is_main_admin(bot: &RuntimeBot, actor_user_id: i64) -> Result<bool> {
+    if crate::yunxi::canonical_owner_matches(actor_user_id).is_some() {
+        return Ok(crate::model::utils::is_main_admin(bot, actor_user_id));
+    }
     Ok(bot.get_main_admin().context("读取 Kovi 主管理员")? == actor_user_id)
 }
 
@@ -804,64 +805,61 @@ mod tests {
     #[test]
     #[ignore = "requires PostgreSQL via DATABASE_URL"]
     fn postgres_goal_reservation_is_atomic_and_idempotent() {
-        kovi::tokio::runtime::Runtime::new()
-            .expect("应创建测试运行时")
-            .block_on(async {
-                crate::memory::MEMORY_MANAGER
-                    .initialize_database()
-                    .await
-                    .expect("应初始化 PostgreSQL 记忆连接池");
-                super::initialize_database()
-                    .await
-                    .expect("应初始化角色目标表");
-                let actor_user_id = chrono::Utc::now().timestamp_micros();
-                let source_message_id = ((actor_user_id % i64::from(i32::MAX - 1)) as i32).max(1);
-                let context = AgentActionContext {
-                    actor_user_id,
-                    source: MessageDestination::Private(actor_user_id),
-                    source_message_id,
-                };
-                let request_key = action_request_key(context, "send_group_message").unwrap();
-                let payload = json!({"group_id": 778899, "content": "并发幂等测试"});
-                let pool = super::database_pool().expect("连接池应存在");
-                let (first, second) = kovi::tokio::join!(
-                    super::reserve_goal(
-                        pool,
-                        &request_key,
-                        context,
-                        "send_group_message",
-                        778899,
-                        &payload,
-                    ),
-                    super::reserve_goal(
-                        pool,
-                        &request_key,
-                        context,
-                        "send_group_message",
-                        778899,
-                        &payload,
-                    ),
-                );
-                let first = first.expect("第一个目标预留不应失败");
-                let second = second.expect("第二个目标预留不应失败");
-                let new_count = usize::from(matches!(first, GoalReservation::New(_)))
-                    + usize::from(matches!(second, GoalReservation::New(_)));
-                assert_eq!(new_count, 1, "同一来源消息只能创建一个角色目标");
+        crate::database_test_support::block_on(async {
+            crate::memory::MEMORY_MANAGER
+                .initialize_database()
+                .await
+                .expect("应初始化 PostgreSQL 记忆连接池");
+            super::initialize_database()
+                .await
+                .expect("应初始化角色目标表");
+            let actor_user_id = chrono::Utc::now().timestamp_micros();
+            let source_message_id = ((actor_user_id % i64::from(i32::MAX - 1)) as i32).max(1);
+            let context = AgentActionContext {
+                actor_user_id,
+                source: MessageDestination::Private(actor_user_id),
+                source_message_id,
+            };
+            let request_key = action_request_key(context, "send_group_message").unwrap();
+            let payload = json!({"group_id": 778899, "content": "并发幂等测试"});
+            let pool = super::database_pool().expect("连接池应存在");
+            let (first, second) = kovi::tokio::join!(
+                super::reserve_goal(
+                    pool,
+                    &request_key,
+                    context,
+                    "send_group_message",
+                    778899,
+                    &payload,
+                ),
+                super::reserve_goal(
+                    pool,
+                    &request_key,
+                    context,
+                    "send_group_message",
+                    778899,
+                    &payload,
+                ),
+            );
+            let first = first.expect("第一个目标预留不应失败");
+            let second = second.expect("第二个目标预留不应失败");
+            let new_count = usize::from(matches!(first, GoalReservation::New(_)))
+                + usize::from(matches!(second, GoalReservation::New(_)));
+            assert_eq!(new_count, 1, "同一来源消息只能创建一个角色目标");
 
-                let row_count =
-                    sqlx_core::query_scalar::query_scalar::<sqlx_postgres::Postgres, i64>(
-                        "SELECT COUNT(*) FROM kovi_bot_agent_goals WHERE request_key = $1",
-                    )
-                    .bind(&request_key)
-                    .fetch_one(pool)
-                    .await
-                    .expect("应读取角色目标数量");
-                assert_eq!(row_count, 1);
-                sqlx_core::query::query("DELETE FROM kovi_bot_agent_goals WHERE request_key = $1")
-                    .bind(&request_key)
-                    .execute(pool)
-                    .await
-                    .expect("应清理测试角色目标");
-            });
+            let row_count = sqlx_core::query_scalar::query_scalar::<sqlx_postgres::Postgres, i64>(
+                "SELECT COUNT(*) FROM kovi_bot_agent_goals WHERE request_key = $1",
+            )
+            .bind(&request_key)
+            .fetch_one(pool)
+            .await
+            .expect("应读取角色目标数量");
+            assert_eq!(row_count, 1);
+            sqlx_core::query::query("DELETE FROM kovi_bot_agent_goals WHERE request_key = $1")
+                .bind(&request_key)
+                .execute(pool)
+                .await
+                .expect("应清理测试角色目标");
+        });
     }
 }

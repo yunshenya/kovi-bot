@@ -730,6 +730,32 @@ Yunxi Core 成为真正核心
 
 这也是后续所有开发文档必须遵守的基线。
 
+## 2.21 当前实现状态（2026-08-25）
+
+以下状态以仓库代码和测试为准；“部分完成”表示 Core 边界已经存在，但生产行为仍由
+legacy host 或人工验收承载，不能误读为迁移已经结束。
+
+| Phase | 状态 | 已落地与剩余 |
+| --- | --- | --- |
+| 0 Core crate | 已完成 | `yunxi-core` 无 Kovi/OneBot/PostgreSQL 依赖，可离线测试。 |
+| 1 Identity | 已完成 | Core ID、QQ mapping、ConversationMember、附件归一化和 identity unlink 已有；versioned Person snapshot 会一致性携带 Memory/Relation/Affect/OpenLoop/Goal，超限、外部身份归属冲突及异内容 ID 冲突均 fail-closed。真实跨平台 host 携带性仍需验收。 |
+| 2 Shadow Runtime | 已完成 | QQ ingress 进入 bounded `WorldEvent` runtime、Attention 和 WorkingState。 |
+| 3 OpenLoop | 基础完成 | PostgreSQL store、去重、容量、atomic claim、lease recovery、Person/Conversation/Global owner 合同已实现；更丰富的模型提取仍待演进。 |
+| 4 Memory Bridge | 已完成 | Core `MemoryStore` 已接入规范化 PostgreSQL memory，并保留 legacy 双读/双写。 |
+| 5 Proactive | 部分完成 | Core motive/candidate/`ReachOut` 和 canonical owner 路由已接通；legacy 调度、画像和冷却仍保留。 |
+| 6 Intent / Action | 当前范围完成 | `SendMessage`、`ReachOut`、`UseTool`、Goal/OpenLoop 管理 Action、arbiter、QQ adapter 已接通，权限和路由缺失时 fail-closed。 |
+| 7 Direct Conversation | 部分完成 | 私聊安全纯文本、群聊 `@` 纯文本默认由 Core 接管；命令、提醒、Agent Run、附件和群聊 ambient 仍由 legacy handler 处理。 |
+| 8 Affect / 9 Relation | 部分完成 | Core store 与平台无关的有界演化已接通：使用已归一化事件信号、不会新增模型调用、严格绑定当前 `PersonId`；legacy profile/mood 只原子填充缺失行，不再覆盖 Core 增量。标准化 sentiment/gratitude cue、基于时间的自然漂移和跨平台人工验收仍待完成。 |
+| 10 Memory v2 | 基础完成 | 双读/双写、backfill、数量/哈希校验、审计、rollback、migration CLI 已完成；生产抽样和跨平台导入验收仍待完成。 |
+| 11 Goal Event Integration | 已完成 | Reminder、`agent_tasks`、tools 已投射通用事件，runtime 加载有界 Goal context；legacy 状态保持权威。 |
+| 12 CLI Host | 当前范围完成 | Fake host 已跑通完整 Core 回路；`YUNXI_CLI_STATE` 以单个有界 JSON snapshot 接入 Memory/Affect/Relation/OpenLoop ports 并恢复稳定 Core ID/context，FakeModel 会读取 context 并提交有界 Affect/Relation 更新；`YUNXI_CLI_JOURNAL` 可独立提供同步 turn 审计。 |
+| 13 App 预留 | API 部分满足 | 通用 Event/Action 边界可供新 host 接入；Desktop/Mobile/Web/App 产品和协议未实现。 |
+
+因此当前真正未完成的是：历史 Memory migration 的生产抽样与跨平台携带性验收；Affect/
+Relation 的标准化语义 cue、自然漂移与跨平台验收；剩余 Kovi 命令、管理员、附件和主动调度 handler 的 Adapter
+收敛；以及未来 Desktop/Mobile/Web/App 产品 host 与协议层。这些不包括 Live2D、TTS、
+STT、桌面控制等文档明确列为当前阶段非目标的能力。
+
 # 3. 最终产品定义
 
 不要把芸汐理解成：
@@ -2850,6 +2876,20 @@ Yunxi: ...
 
 说明分层成功。
 
+CLI 可通过环境变量启用 host-owned Core state 和独立的 durable turn journal：
+
+```bash
+YUNXI_CLI_STATE=/path/to/yunxi-cli-state.json \
+YUNXI_CLI_JOURNAL=/path/to/yunxi-cli-turns.jsonl \
+cargo run -p yunxi-cli
+```
+
+`YUNXI_CLI_STATE` 使用单个有界 JSON snapshot，持久化稳定 Person/Conversation ID 以及
+Memory、Affect、Relation、OpenLoop；反序列化时会重新检查领域约束、总量和 scope/owner
+边界。FakeModel 会读取这些恢复后的 context，并通过 Core proposal 更新 Affect/Relation。
+JSONL journal 则在 Core 处理前同步记录输入，在处理后记录完成或失败，并能忽略崩溃留下的
+最后半行；两者可以单独启用，且都属于 host，不给 Core crate 增加文件系统依赖。
+
 ---
 
 # 87. Phase 0：建立 Core crate
@@ -3148,7 +3188,8 @@ generic WorldEvent
 apps/yunxi-cli
 ```
 
-作为最终平台无关验收。
+作为最终平台无关验收；当前 host 提供可选 `YUNXI_CLI_STATE` Core store snapshot 和
+`YUNXI_CLI_JOURNAL` durable turn journal，二者均保持在 Core crate 边界之外。
 
 ---
 
@@ -3207,11 +3248,20 @@ OpenPanel
 
 # 106. 数据可携带性
 
-未来必须可以：
+PostgreSQL adapter 当前已经可以导出、导入 versioned Person snapshot：
 
 ```text
-export Yunxi identity + memories + relations
+external identities
++ Person memories
++ relation / affect
++ Person-owned open loops / goals
 ```
+
+导出在一致性只读事务内完成，并以“上限 + 1”探测所有有界集合；超限时拒绝生成残缺
+snapshot。导入对全部 Core state、scope 与 owner 做验证，在同一事务内检测 external identity
+归属和 Memory/OpenLoop/Goal ID 冲突，任何异内容或跨 Person 冲突都会回滚。新增字段采用
+`serde(default)`，兼容缺少这些字段的旧 version 1 JSON。真实跨平台 host 携带性仍需单独
+验收。
 
 QQ-specific metadata 可作为：
 
@@ -3474,6 +3524,17 @@ main_admin QQ
 ```text
 owner Person 的 QQ ExternalIdentity。
 ```
+
+当前迁移实现已提供：
+
+```toml
+[identity]
+owner_person_id = "<canonical PersonId UUID>"
+```
+
+配置后 Core Tool、主动聊天、管理员入口和故障通知优先使用该 canonical `PersonId`
+对应的唯一 QQ 路由；配置了 owner 但没有唯一 QQ 路由时 fail-closed。未配置时才回退到
+`main_admin` 的 QQ 映射。`main_admin` 仅作为兼容字段保留。
 
 ---
 

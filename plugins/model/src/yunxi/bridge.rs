@@ -6,7 +6,7 @@
 //! owner of all model calls and QQ side effects.
 
 use super::qq;
-use crate::model::{ReplyScope, is_recent_bot_message};
+use crate::model::{ReplyScope, is_recent_bot_message, take_message_collisions};
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use kovi::RuntimeBot;
 use kovi::bot::message::Message;
@@ -17,10 +17,11 @@ use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use yunxi_core::{
-    ActionArbiter, ActionArbiterConfig, ActionPort, ActionResult, Admission, CognitiveRuntime,
-    ConversationId, ConversationKind, CoreServices, EnvironmentCapabilities, EventPriority,
-    EventScope, ExternalConversation, IdentityStore, MessageContent, MessageId,
-    MessageReceivedEvent, ModelBackend, OpenLoopDraft, OpenLoopKind, OpenLoopOwner, OpenLoopStore,
+    ActionArbiter, ActionArbiterConfig, ActionPort, ActionResult, Admission, Attachment,
+    AttachmentKind, CognitiveRuntime, ConversationId, ConversationKind, ConversationMemberStore,
+    CoreServices, EnvironmentCapabilities, EventPriority, EventScope, ExternalConversation,
+    IdentityStore, MessageCollisionDetectedEvent, MessageContent, MessageId, MessageReceivedEvent,
+    ModelBackend, OpenLoopDraft, OpenLoopKind, OpenLoopOwner, OpenLoopStore,
     PlannedProcessingOutcome, ProcessingOutcome, ProposedAction, RuntimeConfig, RuntimeHandle,
     WorldEvent, WorldEventKind,
 };
@@ -45,6 +46,11 @@ pub(crate) enum EnqueueOutcome {
 
 enum IngressCommand {
     Message(InboundMessage),
+    FlushMessageCollisions {
+        sender_user_id: i64,
+        address: ConversationAddress,
+        acknowledge: oneshot::Sender<anyhow::Result<usize>>,
+    },
     DispatchAction {
         user_id: i64,
         action: ProposedAction,
@@ -323,9 +329,20 @@ impl ShadowBridge {
         bot: Arc<RuntimeBot>,
     ) -> Arc<Self> {
         let model = super::core_model::KoviModelBackend::new(Arc::clone(&bot), Arc::clone(&store));
-        let adapter = super::delivery::QqActionAdapter::new(bot, Arc::clone(&store));
+        let open_loop_store_for_adapter = Arc::clone(&open_loop_store);
+        let goal_store_for_adapter: Arc<dyn yunxi_core::GoalStore> = super::goal_store()
+            .expect("Yunxi goal store must be initialized before the action adapter");
+        let adapter = super::delivery::QqActionAdapter::new(
+            bot,
+            Arc::clone(&store),
+            open_loop_store_for_adapter,
+            goal_store_for_adapter,
+        );
         let mut services = CoreServices::new(Arc::clone(&model) as Arc<dyn ModelBackend>)
             .with_identity(Arc::clone(&store) as Arc<dyn IdentityStore>)
+            .with_conversation_members(
+                Arc::clone(&store) as Arc<dyn yunxi_core::ConversationMemberStore>
+            )
             .with_open_loops(Arc::clone(&open_loop_store) as Arc<dyn OpenLoopStore>);
         if let Some(memory) = super::memory_store() {
             services = services.with_memory(memory);
@@ -379,9 +396,19 @@ impl ShadowBridge {
             Option<Arc<dyn ActionPort>>,
         ) = action_adapter.map_or((None, None), |adapter| {
             let resolver: Arc<dyn yunxi_core::DeliveryResolver> = adapter.clone();
-            let arbiter = ActionArbiter::new(
-                ActionArbiterConfig::default().with_capabilities(EnvironmentCapabilities::all()),
-            )
+            let arbiter = ActionArbiter::new(ActionArbiterConfig::default().with_capabilities(
+                EnvironmentCapabilities::new([
+                    yunxi_core::ActionDescriptor::new(yunxi_core::ActionCapability::SendMessage),
+                    yunxi_core::ActionDescriptor::new(yunxi_core::ActionCapability::ReachOut),
+                    yunxi_core::ActionDescriptor::new(yunxi_core::ActionCapability::UseTool),
+                    yunxi_core::ActionDescriptor::new(yunxi_core::ActionCapability::CreateOpenLoop),
+                    yunxi_core::ActionDescriptor::new(
+                        yunxi_core::ActionCapability::ResolveOpenLoop,
+                    ),
+                    yunxi_core::ActionDescriptor::new(yunxi_core::ActionCapability::StartGoal),
+                    yunxi_core::ActionDescriptor::new(yunxi_core::ActionCapability::CancelGoal),
+                ]),
+            ))
             .with_delivery_resolver(resolver);
             let port: Arc<dyn ActionPort> = adapter;
             (Some(Arc::new(arbiter)), Some(port))
@@ -448,10 +475,28 @@ impl ShadowBridge {
         acknowledged.await.ok().flatten()
     }
 
+    /// Submit an already-canonical host event directly to the Core runtime.
+    /// Callers remain responsible for choosing priority and bounding any wait
+    /// for reliable-event backpressure.
+    pub(crate) async fn submit_event(
+        &self,
+        event: WorldEvent,
+    ) -> Result<Admission, yunxi_core::SubmitError> {
+        self.runtime.submit(event).await
+    }
+
     pub(crate) fn enqueue_group(&self, event: &GroupMsgEvent) -> EnqueueOutcome {
         let Some(message) = InboundMessage::from_group(event) else {
             return EnqueueOutcome::SkippedInvalid;
         };
+        self.try_enqueue(message)
+    }
+
+    pub(crate) fn enqueue_group_observation(&self, event: &GroupMsgEvent) -> EnqueueOutcome {
+        let Some(mut message) = InboundMessage::from_group(event) else {
+            return EnqueueOutcome::SkippedInvalid;
+        };
+        message.visible_reply_allowed = false;
         self.try_enqueue(message)
     }
 
@@ -460,6 +505,66 @@ impl ShadowBridge {
             return EnqueueOutcome::SkippedInvalid;
         };
         self.try_enqueue(message)
+    }
+
+    pub(crate) fn enqueue_private_observation(&self, event: &PrivateMsgEvent) -> EnqueueOutcome {
+        let Some(mut message) = InboundMessage::from_private(event) else {
+            return EnqueueOutcome::SkippedInvalid;
+        };
+        message.visible_reply_allowed = false;
+        self.try_enqueue(message)
+    }
+
+    /// Reliably flush collision records for a legacy-owned group event. Unlike
+    /// normal message ingress, this waits for queue capacity and worker
+    /// acknowledgement so a full shadow queue cannot hide a committed send.
+    pub(crate) async fn flush_group_collisions(
+        &self,
+        event: &GroupMsgEvent,
+    ) -> anyhow::Result<usize> {
+        let Some(message) = InboundMessage::from_group(event) else {
+            return Ok(0);
+        };
+        self.flush_message_collisions(message.sender_user_id, message.address)
+            .await
+    }
+
+    /// Reliably flush collision records for a legacy-owned direct event.
+    pub(crate) async fn flush_private_collisions(
+        &self,
+        event: &PrivateMsgEvent,
+    ) -> anyhow::Result<usize> {
+        let Some(message) = InboundMessage::from_private(event) else {
+            return Ok(0);
+        };
+        self.flush_message_collisions(message.sender_user_id, message.address)
+            .await
+    }
+
+    async fn flush_message_collisions(
+        &self,
+        sender_user_id: i64,
+        address: ConversationAddress,
+    ) -> anyhow::Result<usize> {
+        if self.is_user_blocked(sender_user_id) {
+            return Ok(0);
+        }
+        let (acknowledge, acknowledged) = oneshot::channel();
+        self.ingress
+            .send(IngressCommand::FlushMessageCollisions {
+                sender_user_id,
+                address,
+                acknowledge,
+            })
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "Yunxi collision flush ingress closed; collision records remain queued"
+                )
+            })?;
+        acknowledged.await.map_err(|_| {
+            anyhow::anyhow!("Yunxi collision flush worker stopped before acknowledgement")
+        })?
     }
 
     /// Whether this private event is now owned by the Core direct-conversation
@@ -474,6 +579,25 @@ impl ShadowBridge {
                     && !message.stop_requested
                     && !message.text.trim_start().starts_with('#')
             })
+    }
+
+    /// Group Core canary admission is deliberately narrower than private
+    /// admission: only a plain-text message that explicitly addresses the bot
+    /// can be handed to the Core owner. Ambient group chatter remains on the
+    /// mature coalescing handler.
+    pub(crate) fn handles_group(&self, event: &GroupMsgEvent) -> bool {
+        self.action_arbiter.is_some()
+            && self.action_port.is_some()
+            && InboundMessage::from_group(event).is_some_and(|message| {
+                message.addressed_to_agent
+                    && !message.stop_requested
+                    && !message.text.trim().is_empty()
+                    && !message.text.trim_start().starts_with('#')
+            })
+            && event
+                .message
+                .iter()
+                .all(|segment| segment.type_ == "text" || segment.type_ == "at")
     }
 
     fn try_enqueue(&self, message: InboundMessage) -> EnqueueOutcome {
@@ -636,6 +760,28 @@ fn action_result_event(
     };
     let kind = match result {
         ActionResult::Executed {
+            outcome: yunxi_core::ActionPortOutcome::ToolCompleted { operation, output },
+            ..
+        } => WorldEventKind::ToolCompleted(yunxi_core::ToolCompletedEvent {
+            operation: operation.clone(),
+            output: output.clone(),
+            requires_follow_up: true,
+        }),
+        ActionResult::Executed {
+            outcome:
+                yunxi_core::ActionPortOutcome::ToolFailed {
+                    operation,
+                    error_category,
+                    detail,
+                },
+            ..
+        } => WorldEventKind::ToolFailed(yunxi_core::ToolFailedEvent {
+            operation: operation.clone(),
+            error_category: error_category.clone(),
+            detail: detail.clone(),
+            requires_follow_up: true,
+        }),
+        ActionResult::Executed {
             outcome: yunxi_core::ActionPortOutcome::Delivered { .. },
             ..
         } => WorldEventKind::ActionSucceeded(yunxi_core::ActionSucceededEvent { idempotency_key }),
@@ -719,8 +865,10 @@ struct InboundMessage {
     external_message_id: Option<i64>,
     reply_to_external_message_id: Option<i64>,
     text: String,
+    attachments: Vec<Attachment>,
     timestamp: DateTime<Utc>,
     addressed_to_agent: bool,
+    visible_reply_allowed: bool,
     explicit_request: bool,
     stop_requested: bool,
 }
@@ -735,6 +883,7 @@ impl InboundMessage {
             return None;
         }
         let text = bounded_text(event.borrow_text().unwrap_or_default());
+        let attachments = normalize_attachments(&event.message);
         Some(Self {
             address: ConversationAddress::Group {
                 group_id: event.group_id,
@@ -744,9 +893,11 @@ impl InboundMessage {
             reply_to_external_message_id: reply_message_id(&event.message),
             addressed_to_agent: message_at_self(&event.message, event.self_id)
                 || text_mentions_agent(&text),
+            visible_reply_allowed: true,
             explicit_request: false,
             stop_requested: looks_like_stop_request(&text),
             text,
+            attachments,
             timestamp: event_timestamp(event.time),
         })
     }
@@ -758,6 +909,7 @@ impl InboundMessage {
             return None;
         }
         let text = bounded_text(event.borrow_text().unwrap_or_default());
+        let attachments = normalize_attachments(&event.message);
         Some(Self {
             address: ConversationAddress::Direct {
                 self_id: event.self_id,
@@ -767,9 +919,11 @@ impl InboundMessage {
             external_message_id: positive_message_id(event.message_id),
             reply_to_external_message_id: reply_message_id(&event.message),
             addressed_to_agent: true,
+            visible_reply_allowed: true,
             explicit_request: true,
             stop_requested: looks_like_stop_request(&text),
             text,
+            attachments,
             timestamp: event_timestamp(event.time),
         })
     }
@@ -970,6 +1124,25 @@ async fn run_ingress(
                         "[WARN] Yunxi shadow message dropped during identity resolution: {error}"
                     );
                 }
+            }
+            IngressCommand::FlushMessageCollisions {
+                sender_user_id,
+                address,
+                acknowledge,
+            } => {
+                let result = if blocked_at_ingress.contains(&sender_user_id) {
+                    Err(anyhow::anyhow!(
+                        "Yunxi collision flush blocked by data-erasure barrier"
+                    ))
+                } else {
+                    resolve_and_submit_collisions(address, store.as_ref(), &runtime).await
+                };
+                if let Err(error) = &result {
+                    kovi::log::warn!(
+                        "Yunxi message collision flush failed for QQ user {sender_user_id}: {error}"
+                    );
+                }
+                let _ = acknowledge.send(result);
             }
             IngressCommand::DispatchAction {
                 user_id,
@@ -1436,6 +1609,7 @@ async fn resolve_and_submit_inner(
         .resolve_external_conversation(&external_conversation)
         .await
         .map_err(|error| anyhow::anyhow!(error))?;
+    let reply_scope = message.address.reply_scope();
 
     if let Some(route_tracker) = route_tracker {
         route_tracker.record(
@@ -1444,6 +1618,13 @@ async fn resolve_and_submit_inner(
             matches!(message.address, ConversationAddress::Direct { .. })
                 .then_some(conversation_id),
         );
+    }
+
+    if let Some(member_store) = message_store.as_ref() {
+        let member = yunxi_core::ConversationMember::new(conversation_id, person_id);
+        if let Err(error) = member_store.upsert(&member).await {
+            kovi::log::warn!("Yunxi conversation-member upsert failed: {error}");
+        }
     }
 
     if let Some(model_backend) = model_backend {
@@ -1477,6 +1658,9 @@ async fn resolve_and_submit_inner(
     if let Some(key) = reference_key
         && references.get(key).is_some()
     {
+        if let Err(error) = submit_message_collisions(reply_scope, conversation_id, runtime).await {
+            kovi::log::warn!("Yunxi message collision event was not admitted: {error}");
+        }
         return Ok(());
     }
     let reply_reference = message
@@ -1510,7 +1694,9 @@ async fn resolve_and_submit_inner(
             message_id,
             conversation_id,
             sender: person_id,
-            content: MessageContent::text(message.text.clone()),
+            content: MessageContent::text(message.text.clone())
+                .with_attachments(message.attachments.clone())
+                .map_err(|error| anyhow::anyhow!(error))?,
             reply_to: reply_reference.map(|reference| reference.message_id),
             timestamp: message.timestamp,
             conversation_kind: message.address.kind(),
@@ -1518,6 +1704,7 @@ async fn resolve_and_submit_inner(
             replies_to_agent: recent_agent_reply,
             stop_requested: message.stop_requested,
             explicit_request: message.explicit_request,
+            visible_reply_allowed: message.visible_reply_allowed,
         },
     );
     // Persist the external reference before admitting the event. The runtime
@@ -1535,6 +1722,9 @@ async fn resolve_and_submit_inner(
         .submit(event)
         .await
         .map_err(|error| anyhow::anyhow!(error))?;
+    if let Err(error) = submit_message_collisions(reply_scope, conversation_id, runtime).await {
+        kovi::log::warn!("Yunxi message collision event was not admitted: {error}");
+    }
     if matches!(admission, Admission::Accepted)
         && let Some(open_loop_store) = open_loop_store
     {
@@ -1559,6 +1749,52 @@ async fn resolve_and_submit_inner(
         );
     }
     Ok(())
+}
+
+async fn resolve_and_submit_collisions(
+    address: ConversationAddress,
+    store: &dyn IdentityStore,
+    runtime: &RuntimeHandle,
+) -> anyhow::Result<usize> {
+    let external_conversation = address.external()?;
+    let conversation_id = store
+        .resolve_external_conversation(&external_conversation)
+        .await
+        .map_err(|error| anyhow::anyhow!(error))?;
+    submit_message_collisions(address.reply_scope(), conversation_id, runtime).await
+}
+
+async fn submit_message_collisions(
+    reply_scope: ReplyScope,
+    conversation_id: ConversationId,
+    runtime: &RuntimeHandle,
+) -> anyhow::Result<usize> {
+    let collisions = take_message_collisions(reply_scope).await;
+    let collision_count = collisions.len();
+    for collision in collisions {
+        kovi::log::debug!(
+            "Yunxi message collision detected: scope={:?} source={:?}",
+            collision.scope,
+            collision.source,
+        );
+        let collision_event = WorldEvent::new(
+            Utc::now(),
+            EventScope::Conversation { conversation_id },
+            EventPriority::High,
+            WorldEventKind::MessageCollisionDetected(MessageCollisionDetectedEvent {
+                conversation_id,
+                outgoing_generation: collision.outgoing_generation,
+                conversation_version: collision.conversation_version,
+                fingerprint: collision.fingerprint,
+            }),
+        );
+        let admission = runtime
+            .submit(collision_event)
+            .await
+            .map_err(|error| anyhow::anyhow!(error))?;
+        debug_assert_eq!(admission, Admission::Accepted);
+    }
+    Ok(collision_count)
 }
 
 async fn recent_bot_message(
@@ -1792,6 +2028,30 @@ fn bounded_text(value: &str) -> String {
     bounded
 }
 
+/// Convert supported OneBot media segments into bounded opaque Core
+/// references. The adapter never stores the segment JSON itself in Core.
+fn normalize_attachments(message: &Message) -> Vec<Attachment> {
+    message
+        .iter()
+        .filter_map(|segment| {
+            let kind = match segment.type_.as_str() {
+                "image" => AttachmentKind::Image,
+                "record" | "audio" => AttachmentKind::Audio,
+                "video" => AttachmentKind::Video,
+                "file" => AttachmentKind::File,
+                _ => return None,
+            };
+            let reference = ["file_unique", "file_id", "file", "url"]
+                .iter()
+                .find_map(|field| segment.data.get(*field).and_then(|value| value.as_str()))
+                .map(bounded_text)
+                .filter(|value| !value.trim().is_empty())?;
+            Attachment::new(kind, reference).ok()
+        })
+        .take(16)
+        .collect()
+}
+
 fn message_at_self(message: &Message, self_id: i64) -> bool {
     message.iter().any(|segment| {
         segment.type_ == "at"
@@ -1851,8 +2111,12 @@ mod tests {
         MessageReferenceCache, MessageReferenceKey, ShadowBridge, acquire_alias_handler_barriers,
         action_result_event, block_user_aliases, bounded_text, detect_open_loop_candidate,
         idle_tick_event, looks_like_stop_request, merge_data_erasure_targets, message_at_self,
-        reply_message_id, resolve_and_submit, run_ingress, run_runtime, text_mentions_agent,
-        unblock_users,
+        normalize_attachments, reply_message_id, resolve_and_submit, run_ingress, run_runtime,
+        text_mentions_agent, unblock_users,
+    };
+    use crate::model::{
+        OutgoingSource, ReplyScope, commit_outgoing, interrupt, mark_active, mark_outgoing_sent,
+        outgoing_fingerprint, prepare_outgoing,
     };
     use chrono::Utc;
     use kovi::bot::message::{Message, Segment};
@@ -1864,10 +2128,10 @@ mod tests {
     use std::time::Duration as StdDuration;
     use yunxi_core::{
         ActionArbiter, ActionArbiterConfig, ActionPort, ActionPortFuture, ActionPortOutcome,
-        ActionRejection, ActionResult, AttentionDisposition, ConversationId, ConversationKind,
-        EnvironmentCapabilities, EventPriority, IdentityStore, IdentityStoreError,
-        IdentityStoreFuture, MessageContent, MessageId, OpenLoopKind, OpenLoopOwner, PersonId,
-        ProcessingOutcome, ProposedAction, RuntimeConfig,
+        ActionRejection, ActionResult, AttachmentKind, AttentionDisposition, ConversationId,
+        ConversationKind, EnvironmentCapabilities, EventPriority, EventType, IdentityStore,
+        IdentityStoreError, IdentityStoreFuture, MessageContent, MessageId, OpenLoopKind,
+        OpenLoopOwner, PersonId, ProcessingOutcome, ProposedAction, RuntimeConfig,
     };
 
     struct FakeIdentityStore {
@@ -1955,8 +2219,10 @@ mod tests {
             external_message_id: Some(789),
             reply_to_external_message_id: None,
             text: "hello".to_string(),
+            attachments: Vec::new(),
             timestamp: Utc::now(),
             addressed_to_agent,
+            visible_reply_allowed: true,
             explicit_request: false,
             stop_requested: false,
         }
@@ -2067,6 +2333,129 @@ mod tests {
             bridge.try_enqueue(message),
             EnqueueOutcome::DroppedAtCapacity
         );
+    }
+
+    #[test]
+    fn collision_flush_waits_for_full_ingress_and_reaches_core() {
+        let runtime = kovi::tokio::runtime::Runtime::new().expect("test runtime");
+        runtime.block_on(async {
+            let user_id = 9_200_456;
+            let queued_user_id = 9_200_457;
+            let self_id = 111;
+            let conversation_id = ConversationId::new();
+            let scope = ReplyScope::Private(user_id);
+            let ticket = interrupt(scope).await;
+            assert!(mark_active(ticket).await);
+            let outgoing = prepare_outgoing(
+                ticket,
+                outgoing_fingerprint("already committed"),
+                OutgoingSource::Reply,
+            )
+            .await
+            .expect("outgoing should prepare");
+            assert!(commit_outgoing(outgoing).await);
+            let _ = interrupt(scope).await;
+            mark_outgoing_sent(outgoing).await;
+
+            let store: Arc<dyn IdentityStore> = Arc::new(FakeIdentityStore {
+                person_id: PersonId::new(),
+                conversation_id,
+                stored_kind: ConversationKind::Direct,
+            });
+            let (ingress, receiver) = mpsc::channel(1);
+            let (runtime_handle, mut core_runtime) =
+                yunxi_core::CognitiveRuntime::new(RuntimeConfig::default()).expect("valid runtime");
+            let blocked_users = Arc::new(StdMutex::new(HashSet::new()));
+            let bridge = Arc::new(ShadowBridge {
+                ingress,
+                runtime: runtime_handle.clone(),
+                action_arbiter: None,
+                action_port: None,
+                blocked_users: Arc::clone(&blocked_users),
+                private_handler_gates: Arc::new(super::PrivateHandlerGateRegistry::new(4)),
+            });
+            let mut queued = inbound(
+                ConversationAddress::Direct {
+                    self_id,
+                    peer_user_id: queued_user_id,
+                },
+                true,
+            );
+            queued.sender_user_id = queued_user_id;
+            queued.external_message_id = Some(790);
+            assert_eq!(bridge.try_enqueue(queued), EnqueueOutcome::Accepted);
+            assert_eq!(
+                bridge.try_enqueue(inbound(
+                    ConversationAddress::Direct {
+                        self_id,
+                        peer_user_id: user_id,
+                    },
+                    true,
+                )),
+                EnqueueOutcome::DroppedAtCapacity
+            );
+
+            let flush_bridge = Arc::clone(&bridge);
+            let mut flush = kovi::tokio::spawn(async move {
+                flush_bridge
+                    .flush_message_collisions(
+                        user_id,
+                        ConversationAddress::Direct {
+                            self_id,
+                            peer_user_id: user_id,
+                        },
+                    )
+                    .await
+            });
+            assert!(
+                kovi::tokio::time::timeout(StdDuration::from_millis(20), &mut flush)
+                    .await
+                    .is_err(),
+                "reliable collision flush must wait while ingress is full"
+            );
+
+            kovi::tokio::spawn(run_ingress(
+                receiver,
+                store,
+                runtime_handle,
+                None,
+                None,
+                None,
+                blocked_users,
+                None,
+                None,
+                Arc::new(super::PrivateHandlerGateRegistry::new(4)),
+            ));
+            assert_eq!(
+                flush
+                    .await
+                    .expect("flush task should complete")
+                    .expect("collision should resolve"),
+                1
+            );
+
+            let ProcessingOutcome::Observed(message) = core_runtime
+                .process_next()
+                .await
+                .expect("queued message should reach Core")
+            else {
+                panic!("queued message should be observed");
+            };
+            assert_eq!(message.event_type, EventType::MessageReceived);
+            let ProcessingOutcome::Observed(collision) = core_runtime
+                .process_next()
+                .await
+                .expect("collision should reach Core")
+            else {
+                panic!("collision should be observed");
+            };
+            assert_eq!(collision.event_type, EventType::MessageCollisionDetected);
+            assert_eq!(
+                collision.scope,
+                yunxi_core::EventScope::Conversation { conversation_id }
+            );
+            assert_eq!(collision.priority, EventPriority::High);
+        });
     }
 
     #[test]
@@ -2707,6 +3096,64 @@ mod tests {
             )
             .expect("detector should not fail")
             .is_none()
+        );
+    }
+
+    #[test]
+    fn onebot_media_segments_normalize_to_opaque_core_attachments() {
+        let message = Message::from(vec![
+            Segment::new(
+                "image",
+                json!({"file_unique": "image-hash", "file_id": "image-id", "url": "https://image"}),
+            ),
+            Segment::new("record", json!({"file": "voice.amr"})),
+            Segment::new("audio", json!({"file_id": "voice-id"})),
+            Segment::new("video", json!({"url": "https://video"})),
+            Segment::new("file", json!({"file": "document.pdf"})),
+            Segment::new("image", json!({"url": "   "})),
+            Segment::new("text", json!({"text": "not an attachment"})),
+            Segment::new("image", json!({"file_id": 1234})),
+        ]);
+
+        let attachments = normalize_attachments(&message);
+        assert_eq!(attachments.len(), 5);
+        assert_eq!(attachments[0].kind(), AttachmentKind::Image);
+        assert_eq!(attachments[0].reference(), "image-hash");
+        assert_eq!(attachments[1].kind(), AttachmentKind::Audio);
+        assert_eq!(attachments[1].reference(), "voice.amr");
+        assert_eq!(attachments[2].kind(), AttachmentKind::Audio);
+        assert_eq!(attachments[2].reference(), "voice-id");
+        assert_eq!(attachments[3].kind(), AttachmentKind::Video);
+        assert_eq!(attachments[3].reference(), "https://video");
+        assert_eq!(attachments[4].kind(), AttachmentKind::File);
+        assert_eq!(attachments[4].reference(), "document.pdf");
+    }
+
+    #[test]
+    fn onebot_attachment_normalization_is_bounded_and_drops_oversized_references() {
+        let message = Message::from(
+            (0..20)
+                .map(|index| Segment::new("image", json!({"file_id": format!("asset-{index}")})))
+                .collect::<Vec<_>>(),
+        );
+        let attachments = normalize_attachments(&message);
+        assert_eq!(attachments.len(), 16);
+        assert_eq!(
+            attachments.first().map(|item| item.reference()),
+            Some("asset-0")
+        );
+        assert_eq!(
+            attachments.last().map(|item| item.reference()),
+            Some("asset-15")
+        );
+
+        let oversized = Message::from(vec![Segment::new(
+            "file",
+            json!({"file_id": "x".repeat(5_000)}),
+        )]);
+        assert!(
+            normalize_attachments(&oversized).is_empty(),
+            "references outside Core bounds must not enter the event"
         );
     }
 }

@@ -1,24 +1,27 @@
 use crate::arbiter::{ActionArbiter, ActionPort, ActionResult};
 use crate::attention::{AttentionResult, AttentionSystem};
 use crate::event::{EventPriority, EventScope, EventType, EventValidationError, WorldEvent};
+use crate::goal::GoalOwner;
 use crate::identity::{ConversationId, EventId, PersonId};
 use crate::memory::{MemoryQuery, MemoryScope};
 use crate::open_loop::OpenLoopOwner;
 use crate::planner::{
-    DecisionPlan, Planner, PlannerError, PlannerInput, PlannerOutputValidationError,
-    PlannerStateSnapshot, StateUpdateProposal,
+    DecisionPlan, MAX_PLANNER_GOALS, Planner, PlannerError, PlannerInput,
+    PlannerOutputValidationError, PlannerStateSnapshot, StateUpdateProposal,
 };
 use crate::ports::CoreServices;
 use crate::working_state::{
     StateUpdate, WorkingState, WorkingStateConfig, WorkingStateConfigError, WorkingStateError,
 };
 use chrono::Utc;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 
 const MAX_EVENT_QUEUE_CAPACITY: usize = 4_096;
+const MAX_GOALS_PER_CONTEXT_OWNER: usize = 32;
+const MAX_PENDING_TOOL_FOLLOW_UPS: usize = 128;
 pub const MAX_DATA_ERASURE_CONVERSATIONS: usize = 256;
 pub const MAX_BLOCKED_DATA_ERASURE_PEOPLE: usize = 256;
 pub const MAX_BLOCKED_DATA_ERASURE_CONVERSATIONS: usize = 4_096;
@@ -258,6 +261,7 @@ pub enum PlannedProcessingOutcome {
 #[derive(Debug)]
 pub struct CognitiveRuntime {
     receiver: mpsc::Receiver<RuntimeCommand>,
+    pending_tool_follow_ups: VecDeque<WorldEvent>,
     state: WorkingState,
     data_erasure: DataErasureState,
     attention: AttentionSystem,
@@ -358,6 +362,7 @@ impl CognitiveRuntime {
             },
             Self {
                 receiver,
+                pending_tool_follow_ups: VecDeque::new(),
                 state,
                 data_erasure: DataErasureState::default(),
                 attention: AttentionSystem,
@@ -412,6 +417,12 @@ impl CognitiveRuntime {
 
     async fn next_event(&mut self) -> Option<WorldEvent> {
         loop {
+            if let Some(event) = self.pending_tool_follow_ups.pop_front() {
+                if !self.data_erasure.blocks(&event) {
+                    return Some(event);
+                }
+                continue;
+            }
             match self.receiver.recv().await? {
                 RuntimeCommand::Event(event) => {
                     if !self.data_erasure.blocks(&event) {
@@ -533,7 +544,17 @@ impl CognitiveRuntime {
             .planner
             .as_ref()
             .ok_or(PlannerError::Model(crate::ModelBackendError::Unavailable))?;
-        let capabilities = arbiter.config().capabilities.actions().to_vec();
+        let capabilities = arbiter
+            .config()
+            .capabilities
+            .actions()
+            .iter()
+            .filter(|descriptor| {
+                !(tool_event_requires_follow_up(&planner_event)
+                    && descriptor.capability == crate::ActionCapability::UseTool)
+            })
+            .cloned()
+            .collect();
         let input = self
             .planner_input_with_context(planner_event.clone())
             .await
@@ -553,6 +574,11 @@ impl CognitiveRuntime {
             let mut proposed = intent.propose_action().map_err(|error| {
                 PlannerError::InvalidOutput(PlannerOutputValidationError::InvalidIntent(error))
             })?;
+            if proposed.actor().is_none()
+                && let Some(actor) = trusted_action_actor(&planner_event)
+            {
+                proposed = proposed.with_actor(actor);
+            }
             if let Some(open_loop_id) = due_open_loop {
                 apply_due_action_idempotency(&mut proposed, open_loop_id, intent_index).map_err(
                     |error| {
@@ -579,16 +605,32 @@ impl CognitiveRuntime {
                         outcome: crate::ActionPortOutcome::Delivered { .. },
                         ..
                     }
+                ) || matches!(
+                    &result,
+                    ActionResult::Executed {
+                        outcome: crate::ActionPortOutcome::ToolCompleted { .. },
+                        ..
+                    }
                 ) || replay_of_delivered_action)
             {
                 all_due_deliveries_succeeded = false;
             }
             if let Some(feedback_event) =
                 action_result_event(&planner_event, &proposed, &result, self.max_trace_depth)
-                && let ProcessingOutcome::Observed(feedback_observation) =
-                    self.process_event(feedback_event)
             {
-                feedback.push(feedback_observation);
+                if tool_event_requires_follow_up(&feedback_event)
+                    && self.pending_tool_follow_ups.len() < MAX_PENDING_TOOL_FOLLOW_UPS
+                {
+                    // Tool output gets a fresh, bounded planner turn after this
+                    // action turn completes. Keeping it on an internal FIFO
+                    // preserves causal ordering without recursively invoking
+                    // the planner from inside an ActionPort call.
+                    self.pending_tool_follow_ups.push_back(feedback_event);
+                } else if let ProcessingOutcome::Observed(feedback_observation) =
+                    self.process_event(feedback_event)
+                {
+                    feedback.push(feedback_observation);
+                }
             }
             if let Some(sent_event) =
                 message_sent_event(&planner_event, &proposed, &result, self.max_trace_depth)
@@ -633,8 +675,8 @@ impl CognitiveRuntime {
     }
 
     /// Builds a planner context from the current runtime state.  Hosts that
-    /// have retrieved durable memories/open loops can extend the returned
-    /// input before calling [`Planner::plan`].
+    /// have retrieved durable memories, open loops, or goals can extend the
+    /// returned input before calling [`Planner::plan`].
     pub fn planner_input(&self, event: WorldEvent) -> PlannerInput {
         let conversation = event
             .scope()
@@ -664,6 +706,7 @@ impl CognitiveRuntime {
 
         let mut memories = Vec::new();
         let mut open_loops = Vec::new();
+        let mut goals = Vec::new();
 
         if let Some(conversation_id) = conversation_id {
             let scope = MemoryScope::Conversation(conversation_id);
@@ -676,6 +719,12 @@ impl CognitiveRuntime {
             if let Ok(listed) = services.open_loops.list(&owner, 32).await {
                 extend_unique_open_loops(&mut open_loops, listed);
             }
+            hydrate_goal_owner(
+                services.goals.as_ref(),
+                GoalOwner::Conversation(conversation_id),
+                &mut goals,
+            )
+            .await;
         }
         if let Some(person_id) = person_id {
             let scope = MemoryScope::Person(person_id);
@@ -688,9 +737,34 @@ impl CognitiveRuntime {
             if let Ok(listed) = services.open_loops.list(&owner, 32).await {
                 extend_unique_open_loops(&mut open_loops, listed);
             }
+            hydrate_goal_owner(
+                services.goals.as_ref(),
+                GoalOwner::Person(person_id),
+                &mut goals,
+            )
+            .await;
         }
 
-        input = input.with_memories(memories).with_open_loops(open_loops);
+        match event.scope() {
+            EventScope::Global => {
+                hydrate_goal_owner(services.goals.as_ref(), GoalOwner::Global, &mut goals).await;
+            }
+            EventScope::Goal { goal_id } => {
+                if let Ok(Some(goal)) = services.goals.get(goal_id).await
+                    && goal.id() == goal_id
+                {
+                    let owner = goal.owner();
+                    extend_unique_goals(&mut goals, [goal]);
+                    hydrate_goal_owner(services.goals.as_ref(), owner, &mut goals).await;
+                }
+            }
+            EventScope::Conversation { .. } | EventScope::Person { .. } => {}
+        }
+
+        input = input
+            .with_memories(memories)
+            .with_open_loops(open_loops)
+            .with_goals(goals);
 
         if let Some(person_id) = person_id {
             if let Ok(relation) = services.relations.get(person_id).await {
@@ -751,6 +825,15 @@ impl CognitiveRuntime {
                 {
                     return Err(state_update_error(
                         "resolve_open_loop",
+                        "the update targets an open loop outside this turn",
+                        0,
+                    ));
+                }
+                StateUpdateProposal::DeferOpenLoop { open_loop_id, .. }
+                    if !planner_input_contains_open_loop(input, *open_loop_id) =>
+                {
+                    return Err(state_update_error(
+                        "defer_open_loop",
                         "the update targets an open loop outside this turn",
                         0,
                     ));
@@ -856,6 +939,29 @@ impl CognitiveRuntime {
                             )
                         })?;
                 }
+                StateUpdateProposal::DeferOpenLoop {
+                    open_loop_id,
+                    due_at,
+                } => {
+                    let services = self.services.clone().ok_or_else(|| {
+                        state_update_error(
+                            "defer_open_loop",
+                            "Core services are unavailable",
+                            applied_updates,
+                        )
+                    })?;
+                    services
+                        .open_loops
+                        .defer(*open_loop_id, *due_at, Utc::now())
+                        .await
+                        .map_err(|error| {
+                            state_update_error(
+                                "defer_open_loop",
+                                error.to_string(),
+                                applied_updates,
+                            )
+                        })?;
+                }
             }
             applied_updates += 1;
         }
@@ -930,6 +1036,7 @@ fn observed_without_planning(observation: RuntimeObservation) -> PlannedProcessi
 fn event_person_id(event: &WorldEvent) -> Option<PersonId> {
     match event.kind() {
         crate::WorldEventKind::MessageReceived(message) => Some(message.sender),
+        crate::WorldEventKind::InteractionCuesObserved(cues) => Some(cues.person_id),
         _ => None,
     }
 }
@@ -949,6 +1056,11 @@ fn apply_due_action_idempotency(
     let metadata = match action {
         crate::ProposedAction::SendMessage(action) => &mut action.metadata,
         crate::ProposedAction::ReachOut(action) => &mut action.metadata,
+        crate::ProposedAction::UseTool(action) => &mut action.metadata,
+        crate::ProposedAction::CreateOpenLoop(action) => &mut action.metadata,
+        crate::ProposedAction::ResolveOpenLoop(action) => &mut action.metadata,
+        crate::ProposedAction::StartGoal(action) => &mut action.metadata,
+        crate::ProposedAction::CancelGoal(action) => &mut action.metadata,
         crate::ProposedAction::Noop => return Ok(()),
     };
     metadata.idempotency_key = format!("open-loop:{open_loop_id}:delivery:{intent_index}");
@@ -972,6 +1084,15 @@ fn validate_due_open_loop_context(input: &PlannerInput) -> Result<(), PlannerErr
 
 fn validate_intent_targets(event: &WorldEvent, plan: &DecisionPlan) -> Result<(), PlannerError> {
     for intent in &plan.intents {
+        if tool_event_requires_follow_up(event)
+            && matches!(intent, crate::CognitiveIntent::UseTool { .. })
+        {
+            return Err(PlannerError::InvalidOutput(
+                PlannerOutputValidationError::IntentOutsideEventScope {
+                    reason: "tool-result follow-up turns cannot invoke another tool".to_string(),
+                },
+            ));
+        }
         let allowed = match (event.scope(), intent) {
             (_, crate::CognitiveIntent::Noop) => true,
             (
@@ -983,6 +1104,22 @@ fn validate_intent_targets(event: &WorldEvent, plan: &DecisionPlan) -> Result<()
             ) => conversation_id == *target,
             (EventScope::Person { person_id }, crate::CognitiveIntent::ReachOut(reach_out)) => {
                 person_id == reach_out.person_id()
+            }
+            (scope, crate::CognitiveIntent::UseTool { scope: target, .. }) => {
+                scope_matches_action_scope(scope, *target)
+            }
+            (scope, crate::CognitiveIntent::CreateOpenLoop(draft)) => scope_matches_action_scope(
+                scope,
+                crate::ActionScope::for_open_loop_owner(draft.owner()),
+            ),
+            (scope, crate::CognitiveIntent::ResolveOpenLoop { owner, .. }) => {
+                scope_matches_action_scope(scope, crate::ActionScope::for_open_loop_owner(*owner))
+            }
+            (scope, crate::CognitiveIntent::StartGoal(draft)) => {
+                scope_matches_action_scope(scope, crate::ActionScope::for_goal_owner(draft.owner()))
+            }
+            (scope, crate::CognitiveIntent::CancelGoal { owner, .. }) => {
+                scope_matches_action_scope(scope, crate::ActionScope::for_goal_owner(*owner))
             }
             _ => false,
         };
@@ -999,7 +1136,16 @@ fn validate_intent_targets(event: &WorldEvent, plan: &DecisionPlan) -> Result<()
                     reach_out.person_id(),
                     event.scope()
                 ),
-                crate::CognitiveIntent::Noop => unreachable!("noop intents are always allowed"),
+                crate::CognitiveIntent::UseTool { tool_name, .. } => format!(
+                    "use_tool `{tool_name}` targets {:?} from {:?}",
+                    intent.action_scope(),
+                    event.scope()
+                ),
+                _ => format!(
+                    "intent targets {:?} from {:?}",
+                    intent.action_scope(),
+                    event.scope()
+                ),
             };
             return Err(PlannerError::InvalidOutput(
                 PlannerOutputValidationError::IntentOutsideEventScope { reason },
@@ -1007,6 +1153,21 @@ fn validate_intent_targets(event: &WorldEvent, plan: &DecisionPlan) -> Result<()
         }
     }
     Ok(())
+}
+
+fn scope_matches_action_scope(event_scope: EventScope, action_scope: crate::ActionScope) -> bool {
+    match (event_scope, action_scope) {
+        (EventScope::Global, crate::ActionScope::Global) => true,
+        (
+            EventScope::Conversation { conversation_id },
+            crate::ActionScope::Conversation(target),
+        ) => conversation_id == target,
+        (EventScope::Person { person_id }, crate::ActionScope::Person(target)) => {
+            person_id == target
+        }
+        (EventScope::Goal { .. }, crate::ActionScope::Global) => false,
+        _ => false,
+    }
 }
 
 fn deferred_due_open_loop_resolution(
@@ -1077,6 +1238,48 @@ fn extend_unique_open_loops(target: &mut Vec<crate::OpenLoop>, values: Vec<crate
     }
 }
 
+async fn hydrate_goal_owner(
+    store: &dyn crate::GoalStore,
+    owner: GoalOwner,
+    target: &mut Vec<crate::Goal>,
+) {
+    let remaining = MAX_PLANNER_GOALS.saturating_sub(target.len());
+    let limit = remaining.min(MAX_GOALS_PER_CONTEXT_OWNER);
+    if limit == 0 {
+        return;
+    }
+    if let Ok(listed) = store.list(&owner, limit).await {
+        extend_unique_goals(
+            target,
+            listed
+                .into_iter()
+                .filter(|goal| goal.owner() == owner)
+                .take(limit),
+        );
+    }
+}
+
+fn extend_unique_goals(
+    target: &mut Vec<crate::Goal>,
+    values: impl IntoIterator<Item = crate::Goal>,
+) {
+    for goal in values {
+        if target.len() >= MAX_PLANNER_GOALS {
+            break;
+        }
+        if !target.iter().any(|existing| existing.id() == goal.id()) {
+            target.push(goal);
+        }
+    }
+}
+
+fn trusted_action_actor(event: &WorldEvent) -> Option<crate::PersonId> {
+    match event.kind() {
+        crate::WorldEventKind::MessageReceived(message) => Some(message.sender),
+        _ => None,
+    }
+}
+
 fn action_result_event(
     parent: &WorldEvent,
     action: &crate::ProposedAction,
@@ -1092,6 +1295,28 @@ fn action_result_event(
         crate::ActionScope::Global => EventScope::Global,
     };
     let kind = match result {
+        ActionResult::Executed {
+            outcome: crate::ActionPortOutcome::ToolCompleted { operation, output },
+            ..
+        } => crate::WorldEventKind::ToolCompleted(crate::ToolCompletedEvent {
+            operation: operation.clone(),
+            output: output.clone(),
+            requires_follow_up: true,
+        }),
+        ActionResult::Executed {
+            outcome:
+                crate::ActionPortOutcome::ToolFailed {
+                    operation,
+                    error_category,
+                    detail,
+                },
+            ..
+        } => crate::WorldEventKind::ToolFailed(crate::ToolFailedEvent {
+            operation: operation.clone(),
+            error_category: error_category.clone(),
+            detail: detail.clone(),
+            requires_follow_up: true,
+        }),
         ActionResult::Executed {
             outcome: crate::ActionPortOutcome::Delivered { .. },
             ..
@@ -1130,6 +1355,14 @@ fn action_result_event(
     .ok()
 }
 
+fn tool_event_requires_follow_up(event: &WorldEvent) -> bool {
+    match event.kind() {
+        crate::WorldEventKind::ToolCompleted(tool) => tool.requires_follow_up,
+        crate::WorldEventKind::ToolFailed(tool) => tool.requires_follow_up,
+        _ => false,
+    }
+}
+
 fn message_sent_event(
     parent: &WorldEvent,
     action: &crate::ProposedAction,
@@ -1157,6 +1390,11 @@ fn message_sent_event(
             send.conversation_id
         }
         crate::ProposedAction::ReachOut(_) => (*delivered_conversation_id)?,
+        crate::ProposedAction::UseTool(_)
+        | crate::ProposedAction::CreateOpenLoop(_)
+        | crate::ProposedAction::ResolveOpenLoop(_)
+        | crate::ProposedAction::StartGoal(_)
+        | crate::ProposedAction::CancelGoal(_) => return None,
         crate::ProposedAction::Noop => return None,
     };
     let delivered_at = Utc::now();
@@ -1179,28 +1417,33 @@ fn message_sent_event(
 mod tests {
     use super::{
         Admission, CognitiveRuntime, DataErasureError, MAX_DATA_ERASURE_CONVERSATIONS,
-        PlannedProcessingOutcome, ProcessingOutcome, RuntimeConfig, RuntimeConfigError,
-        SubmitError, apply_due_action_idempotency, bounded_conversation_ids, message_sent_event,
-        validate_intent_targets,
+        MAX_GOALS_PER_CONTEXT_OWNER, PlannedProcessingOutcome, ProcessingOutcome, RuntimeConfig,
+        RuntimeConfigError, SubmitError, apply_due_action_idempotency, bounded_conversation_ids,
+        message_sent_event, validate_intent_targets,
     };
     use crate::arbiter::{
         ActionArbiter, ActionArbiterConfig, ActionPort, ActionPortFuture, ActionPortOutcome,
         ActionReceipt, ActionRejection, ActionResult, EnvironmentCapabilities,
     };
     use crate::event::{
-        EventPriority, EventScope, EventValidationError, MessageContent, MessageReceivedEvent,
-        WorldEvent, WorldEventKind,
+        EventPriority, EventScope, EventValidationError, GoalUpdatedEvent,
+        InteractionCuesObservedEvent, MessageContent, MessageReceivedEvent, WorldEvent,
+        WorldEventKind,
     };
-    use crate::identity::{ConversationId, ConversationKind, MessageId, OpenLoopId, PersonId};
+    use crate::goal::{Goal, GoalDraft, GoalKind, GoalOwner};
+    use crate::identity::{
+        ConversationId, ConversationKind, GoalId, MessageId, OpenLoopId, PersonId,
+    };
     use crate::memory::{Memory, MemoryDraft, MemoryKind, MemoryQuery, MemoryScope};
     use crate::open_loop::{OpenLoop, OpenLoopDraft, OpenLoopKind, OpenLoopOwner, OpenLoopStatus};
     use crate::planner::{
-        AffectState, DecisionDisposition, DecisionPlan, ModelBackend, ModelBackendFuture,
-        PlannerError, PlannerInput, RelationState, StateUpdateProposal,
+        AffectState, DecisionDisposition, DecisionPlan, InteractionCues, ModelBackend,
+        ModelBackendError, ModelBackendFuture, PlannerError, PlannerInput, RelationState,
+        StateUpdateProposal,
     };
     use crate::ports::{
-        AffectStore, AffectStoreFuture, CoreServices, MemoryStore, MemoryStoreFuture,
-        OpenLoopStore, OpenLoopStoreFuture, RelationStore, RelationStoreFuture,
+        AffectStore, AffectStoreFuture, CoreServices, GoalStore, GoalStoreFuture, MemoryStore,
+        MemoryStoreFuture, OpenLoopStore, OpenLoopStoreFuture, RelationStore, RelationStoreFuture,
     };
     use chrono::Utc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1242,6 +1485,7 @@ mod tests {
                 replies_to_agent: false,
                 stop_requested: false,
                 explicit_request: true,
+                visible_reply_allowed: true,
             },
         )
     }
@@ -1299,6 +1543,73 @@ mod tests {
                     state_updates: Vec::new(),
                 })
             })
+        }
+    }
+
+    struct ToolModel {
+        conversation_id: ConversationId,
+    }
+
+    impl ModelBackend for ToolModel {
+        fn plan<'a>(&'a self, _input: &'a PlannerInput) -> ModelBackendFuture<'a> {
+            let conversation_id = self.conversation_id;
+            Box::pin(async move {
+                Ok(DecisionPlan::new(DecisionDisposition::Reply).with_intent(
+                    crate::CognitiveIntent::use_tool(
+                        "calculator",
+                        r#"{"expression":"1+1"}"#,
+                        crate::ActionScope::Conversation(conversation_id),
+                    ),
+                ))
+            })
+        }
+    }
+
+    struct ToolFollowUpModel {
+        conversation_id: ConversationId,
+        calls: Arc<AtomicUsize>,
+        recurse_on_result: bool,
+    }
+
+    impl ModelBackend for ToolFollowUpModel {
+        fn plan<'a>(&'a self, input: &'a PlannerInput) -> ModelBackendFuture<'a> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let conversation_id = self.conversation_id;
+            let plan = match input.event.kind() {
+                WorldEventKind::MessageReceived(_) => {
+                    assert!(input.supports(crate::ActionCapability::UseTool));
+                    DecisionPlan::new(DecisionDisposition::SpecialAction).with_intent(
+                        crate::CognitiveIntent::use_tool(
+                            "calculator",
+                            r#"{"expression":"1+1"}"#,
+                            crate::ActionScope::Conversation(conversation_id),
+                        ),
+                    )
+                }
+                WorldEventKind::ToolCompleted(tool) => {
+                    assert!(tool.requires_follow_up);
+                    assert_eq!(tool.output, "2");
+                    assert!(!input.supports(crate::ActionCapability::UseTool));
+                    if self.recurse_on_result {
+                        DecisionPlan::new(DecisionDisposition::SpecialAction).with_intent(
+                            crate::CognitiveIntent::use_tool(
+                                "calculator",
+                                r#"{"expression":"2+2"}"#,
+                                crate::ActionScope::Conversation(conversation_id),
+                            ),
+                        )
+                    } else {
+                        DecisionPlan::new(DecisionDisposition::Reply).with_intent(
+                            crate::CognitiveIntent::send_message(
+                                conversation_id,
+                                MessageContent::text("结果是 2"),
+                            ),
+                        )
+                    }
+                }
+                _ => DecisionPlan::silent(),
+            };
+            Box::pin(async move { Ok(plan) })
         }
     }
 
@@ -1371,6 +1682,50 @@ mod tests {
             Box::pin(async {
                 Ok(ActionPortOutcome::Delivered {
                     external_reference: Some("fake".to_owned()),
+                    message_id: None,
+                    conversation_id: None,
+                })
+            })
+        }
+    }
+
+    struct ToolThenDeliveryPort {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ActionPort for ToolThenDeliveryPort {
+        fn execute<'a>(&'a self, action: &'a crate::ProposedAction) -> ActionPortFuture<'a> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let outcome = match action {
+                crate::ProposedAction::UseTool(tool) => ActionPortOutcome::ToolCompleted {
+                    operation: tool.tool_name.clone(),
+                    output: "2".to_string(),
+                },
+                crate::ProposedAction::SendMessage(send) => ActionPortOutcome::Delivered {
+                    external_reference: Some("fake-message".to_string()),
+                    message_id: Some(MessageId::new()),
+                    conversation_id: Some(send.conversation_id),
+                },
+                _ => ActionPortOutcome::Deferred {
+                    reason: "unexpected_action".to_string(),
+                },
+            };
+            Box::pin(async move { Ok(outcome) })
+        }
+    }
+
+    struct ActorRecordingPort {
+        actor: Arc<Mutex<Option<PersonId>>>,
+    }
+
+    impl ActionPort for ActorRecordingPort {
+        fn execute<'a>(&'a self, action: &'a crate::ProposedAction) -> ActionPortFuture<'a> {
+            let actor = Arc::clone(&self.actor);
+            let action_actor = action.actor();
+            Box::pin(async move {
+                *actor.lock().expect("actor recording lock") = action_actor;
+                Ok(ActionPortOutcome::Delivered {
+                    external_reference: Some("tool".to_owned()),
                     message_id: None,
                     conversation_id: None,
                 })
@@ -1510,9 +1865,59 @@ mod tests {
     }
 
     #[derive(Default)]
+    struct TestGoalStore {
+        goals: Vec<Goal>,
+        fetched_ids: Mutex<Vec<GoalId>>,
+        listed_owners: Mutex<Vec<(GoalOwner, usize)>>,
+    }
+
+    impl TestGoalStore {
+        fn with_goals(goals: Vec<Goal>) -> Self {
+            Self {
+                goals,
+                ..Self::default()
+            }
+        }
+
+        fn goal(id: GoalId, owner: GoalOwner, title: impl Into<String>) -> Goal {
+            let draft =
+                GoalDraft::new(owner, GoalKind::Project, title).expect("valid test goal draft");
+            Goal::from_draft(id, &draft, Utc::now()).expect("valid test goal")
+        }
+    }
+
+    impl GoalStore for TestGoalStore {
+        fn get(&self, id: GoalId) -> GoalStoreFuture<'_, Option<Goal>> {
+            Box::pin(async move {
+                self.fetched_ids
+                    .lock()
+                    .expect("goal fetch recorder lock")
+                    .push(id);
+                Ok(self.goals.iter().find(|goal| goal.id() == id).cloned())
+            })
+        }
+
+        fn list<'a>(
+            &'a self,
+            owner: &'a GoalOwner,
+            limit: usize,
+        ) -> GoalStoreFuture<'a, Vec<Goal>> {
+            Box::pin(async move {
+                self.listed_owners
+                    .lock()
+                    .expect("goal list recorder lock")
+                    .push((*owner, limit));
+                // Deliberately ignore owner and limit; the runtime owns its context boundary.
+                Ok(self.goals.clone())
+            })
+        }
+    }
+
+    #[derive(Default)]
     struct TestOpenLoopStore {
         listed_owners: Mutex<Vec<OpenLoopOwner>>,
         resolved: Mutex<Vec<OpenLoopId>>,
+        deferred: Mutex<Vec<(OpenLoopId, Option<chrono::DateTime<Utc>>)>>,
         visible: Option<(OpenLoopId, OpenLoopOwner)>,
         resolve_failures_remaining: AtomicUsize,
     }
@@ -1583,10 +1988,16 @@ mod tests {
         fn defer(
             &self,
             id: OpenLoopId,
-            _due_at: Option<chrono::DateTime<Utc>>,
+            due_at: Option<chrono::DateTime<Utc>>,
             _now: chrono::DateTime<Utc>,
         ) -> OpenLoopStoreFuture<'_, OpenLoop> {
-            Box::pin(async move { Ok(Self::open_loop(id, OpenLoopOwner::Global)) })
+            Box::pin(async move {
+                self.deferred
+                    .lock()
+                    .expect("open-loop recorder lock")
+                    .push((id, due_at));
+                Ok(Self::open_loop(id, OpenLoopOwner::Global))
+            })
         }
 
         fn resolve(
@@ -1639,12 +2050,19 @@ mod tests {
 
     #[derive(Default)]
     struct TestAffectStore {
+        reads: Mutex<Vec<PersonId>>,
         updates: Mutex<Vec<(PersonId, AffectState)>>,
     }
 
     impl AffectStore for TestAffectStore {
-        fn get<'a>(&'a self, _person_id: PersonId) -> AffectStoreFuture<'a, AffectState> {
-            Box::pin(async { Ok(AffectState::default()) })
+        fn get<'a>(&'a self, person_id: PersonId) -> AffectStoreFuture<'a, AffectState> {
+            Box::pin(async move {
+                self.reads
+                    .lock()
+                    .expect("affect recorder lock")
+                    .push(person_id);
+                Ok(AffectState::default())
+            })
         }
 
         fn set<'a>(
@@ -1664,15 +2082,22 @@ mod tests {
 
     #[derive(Default)]
     struct TestRelationStore {
+        reads: Mutex<Vec<PersonId>>,
         updates: Mutex<Vec<RelationState>>,
     }
 
     impl RelationStore for TestRelationStore {
         fn get<'a>(
             &'a self,
-            _person_id: PersonId,
+            person_id: PersonId,
         ) -> RelationStoreFuture<'a, Option<RelationState>> {
-            Box::pin(async { Ok(None) })
+            Box::pin(async move {
+                self.reads
+                    .lock()
+                    .expect("relation recorder lock")
+                    .push(person_id);
+                Ok(None)
+            })
         }
 
         fn set<'a>(&'a self, state: RelationState) -> RelationStoreFuture<'a, RelationState> {
@@ -1708,6 +2133,32 @@ mod tests {
                         topic: "runtime closure".to_owned(),
                     })
                     .with_state_update(StateUpdateProposal::ResolveOpenLoop { open_loop_id }))
+            })
+        }
+    }
+
+    struct InteractionCueModel;
+
+    impl ModelBackend for InteractionCueModel {
+        fn plan<'a>(&'a self, input: &'a PlannerInput) -> ModelBackendFuture<'a> {
+            Box::pin(async move {
+                let WorldEventKind::InteractionCuesObserved(observed) = input.event.kind() else {
+                    return Err(ModelBackendError::InvalidPlan {
+                        reason: "expected interaction cue event".to_owned(),
+                    });
+                };
+                let evolved = crate::apply_interaction_cues(
+                    observed.person_id,
+                    input.relation,
+                    input.affect,
+                    observed.cues(),
+                )
+                .map_err(|error| ModelBackendError::InvalidPlan {
+                    reason: error.to_string(),
+                })?;
+                Ok(DecisionPlan::silent()
+                    .with_state_update(StateUpdateProposal::Affect(evolved.affect))
+                    .with_state_update(StateUpdateProposal::Relation(evolved.relation)))
             })
         }
     }
@@ -1787,6 +2238,146 @@ mod tests {
             } if actions.len() == 1 && feedback.len() == 1
         ));
         assert_eq!(runtime.state().global_version(), 2);
+    }
+
+    #[tokio::test]
+    async fn runtime_stamps_message_sender_on_model_tool_actions() {
+        let conversation_id = ConversationId::new();
+        let sender = PersonId::new();
+        let (_handle, mut runtime) = CognitiveRuntime::new_with_services(
+            RuntimeConfig::default(),
+            CoreServices::with_model(ToolModel { conversation_id }),
+        )
+        .expect("valid runtime");
+        let arbiter = ActionArbiter::new(
+            ActionArbiterConfig::default().with_capabilities(EnvironmentCapabilities::all()),
+        );
+        let actor = Arc::new(Mutex::new(None));
+        let port = ActorRecordingPort {
+            actor: Arc::clone(&actor),
+        };
+        let output = runtime
+            .process_event_with_planner_and_actions(
+                direct_message(conversation_id, sender),
+                &arbiter,
+                &port,
+            )
+            .await
+            .expect("tool action should be dispatched");
+        assert!(
+            matches!(output, PlannedProcessingOutcome::Planned { actions, .. } if actions.len() == 1)
+        );
+        assert_eq!(*actor.lock().expect("actor recording lock"), Some(sender));
+    }
+
+    #[tokio::test]
+    async fn tool_output_gets_one_causal_follow_up_turn_and_visible_delivery() {
+        let conversation_id = ConversationId::new();
+        let model_calls = Arc::new(AtomicUsize::new(0));
+        let (_handle, mut runtime) = CognitiveRuntime::new_with_services(
+            RuntimeConfig::default(),
+            CoreServices::with_model(ToolFollowUpModel {
+                conversation_id,
+                calls: Arc::clone(&model_calls),
+                recurse_on_result: false,
+            }),
+        )
+        .expect("valid runtime");
+        let arbiter = ActionArbiter::new(
+            ActionArbiterConfig::default().with_capabilities(EnvironmentCapabilities::all()),
+        );
+        let port_calls = Arc::new(AtomicUsize::new(0));
+        let port = ToolThenDeliveryPort {
+            calls: Arc::clone(&port_calls),
+        };
+
+        let first = runtime
+            .process_event_with_planner_and_actions(
+                direct_message(conversation_id, PersonId::new()),
+                &arbiter,
+                &port,
+            )
+            .await
+            .expect("tool request should execute");
+        assert!(matches!(
+            first,
+            PlannedProcessingOutcome::Planned { actions, .. }
+                if matches!(
+                    actions.as_slice(),
+                    [ActionResult::Executed {
+                        outcome: ActionPortOutcome::ToolCompleted { output, .. },
+                        ..
+                    }] if output == "2"
+                )
+        ));
+        assert_eq!(runtime.pending_tool_follow_ups.len(), 1);
+
+        let second = runtime
+            .process_next_with_planner_and_actions(&arbiter, &port)
+            .await
+            .expect("tool result should be queued")
+            .expect("tool follow-up planning should succeed");
+        assert!(matches!(
+            second,
+            PlannedProcessingOutcome::Planned {
+                observation,
+                actions,
+                ..
+            } if observation.event_type == crate::EventType::ToolCompleted
+                && matches!(
+                    actions.as_slice(),
+                    [ActionResult::Executed {
+                        outcome: ActionPortOutcome::Delivered { .. },
+                        ..
+                    }]
+                )
+        ));
+        assert!(runtime.pending_tool_follow_ups.is_empty());
+        assert_eq!(model_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(port_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn tool_follow_up_cannot_recursively_invoke_another_tool() {
+        let conversation_id = ConversationId::new();
+        let model_calls = Arc::new(AtomicUsize::new(0));
+        let (_handle, mut runtime) = CognitiveRuntime::new_with_services(
+            RuntimeConfig::default(),
+            CoreServices::with_model(ToolFollowUpModel {
+                conversation_id,
+                calls: Arc::clone(&model_calls),
+                recurse_on_result: true,
+            }),
+        )
+        .expect("valid runtime");
+        let arbiter = ActionArbiter::new(
+            ActionArbiterConfig::default().with_capabilities(EnvironmentCapabilities::all()),
+        );
+        let port_calls = Arc::new(AtomicUsize::new(0));
+        let port = ToolThenDeliveryPort {
+            calls: Arc::clone(&port_calls),
+        };
+
+        runtime
+            .process_event_with_planner_and_actions(
+                direct_message(conversation_id, PersonId::new()),
+                &arbiter,
+                &port,
+            )
+            .await
+            .expect("first tool request should execute");
+        let follow_up = runtime
+            .process_next_with_planner_and_actions(&arbiter, &port)
+            .await
+            .expect("tool result should be queued");
+        assert!(matches!(
+            follow_up,
+            Err(PlannerError::InvalidOutput(
+                crate::PlannerOutputValidationError::IntentOutsideEventScope { .. }
+            ))
+        ));
+        assert_eq!(model_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(port_calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -2227,11 +2818,23 @@ mod tests {
         let person_id = PersonId::new();
         let memory = Arc::new(TestMemoryStore::default());
         let open_loops = Arc::new(TestOpenLoopStore::default());
+        let conversation_goal = TestGoalStore::goal(
+            GoalId::new(),
+            GoalOwner::Conversation(conversation_id),
+            "conversation goal",
+        );
+        let person_goal =
+            TestGoalStore::goal(GoalId::new(), GoalOwner::Person(person_id), "person goal");
+        let goals = Arc::new(TestGoalStore::with_goals(vec![
+            conversation_goal.clone(),
+            person_goal.clone(),
+        ]));
         let (_handle, runtime) = CognitiveRuntime::new_with_services(
             RuntimeConfig::default(),
             CoreServices::with_model(FakeModel)
                 .with_memory(memory.clone())
-                .with_open_loops(open_loops.clone()),
+                .with_open_loops(open_loops.clone())
+                .with_goals(goals.clone()),
         )
         .expect("valid runtime");
 
@@ -2287,6 +2890,100 @@ mod tests {
                 .iter()
                 .any(|open_loop| open_loop.owner() == OpenLoopOwner::Person(person_id))
         );
+        assert_eq!(input.goals, vec![conversation_goal, person_goal]);
+        assert_eq!(
+            goals
+                .listed_owners
+                .lock()
+                .expect("goal list recorder lock")
+                .as_slice(),
+            &[
+                (
+                    GoalOwner::Conversation(conversation_id),
+                    MAX_GOALS_PER_CONTEXT_OWNER,
+                ),
+                (GoalOwner::Person(person_id), MAX_GOALS_PER_CONTEXT_OWNER),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_events_load_the_exact_goal_and_its_owner_context() {
+        let person_id = PersonId::new();
+        let owner = GoalOwner::Person(person_id);
+        let goal_id = GoalId::new();
+        let goal = TestGoalStore::goal(goal_id, owner, "changed goal");
+        let sibling = TestGoalStore::goal(GoalId::new(), owner, "related goal");
+        let goals = Arc::new(TestGoalStore::with_goals(vec![
+            goal.clone(),
+            sibling.clone(),
+        ]));
+        let (_handle, runtime) = CognitiveRuntime::new_with_services(
+            RuntimeConfig::default(),
+            CoreServices::with_model(FakeModel).with_goals(goals.clone()),
+        )
+        .expect("valid runtime");
+
+        let input = runtime
+            .planner_input_with_context(WorldEvent::new(
+                Utc::now(),
+                EventScope::Goal { goal_id },
+                EventPriority::High,
+                WorldEventKind::GoalUpdated(GoalUpdatedEvent { goal_id }),
+            ))
+            .await;
+
+        assert_eq!(
+            goals
+                .fetched_ids
+                .lock()
+                .expect("goal fetch recorder lock")
+                .as_slice(),
+            &[goal_id]
+        );
+        assert_eq!(
+            goals
+                .listed_owners
+                .lock()
+                .expect("goal list recorder lock")
+                .as_slice(),
+            &[(owner, MAX_GOALS_PER_CONTEXT_OWNER)]
+        );
+        assert_eq!(input.goals, vec![goal, sibling]);
+    }
+
+    #[tokio::test]
+    async fn goal_hydration_enforces_the_per_owner_bound_locally() {
+        let visible = (0..MAX_GOALS_PER_CONTEXT_OWNER + 5)
+            .map(|index| {
+                TestGoalStore::goal(
+                    GoalId::new(),
+                    GoalOwner::Global,
+                    format!("global goal {index}"),
+                )
+            })
+            .collect();
+        let goals = Arc::new(TestGoalStore::with_goals(visible));
+        let (_handle, runtime) = CognitiveRuntime::new_with_services(
+            RuntimeConfig::default(),
+            CoreServices::with_model(FakeModel).with_goals(goals.clone()),
+        )
+        .expect("valid runtime");
+
+        let input = runtime
+            .planner_input_with_context(event(EventPriority::High))
+            .await;
+
+        assert_eq!(input.goals.len(), MAX_GOALS_PER_CONTEXT_OWNER);
+        assert_eq!(
+            goals
+                .listed_owners
+                .lock()
+                .expect("goal list recorder lock")
+                .as_slice(),
+            &[(GoalOwner::Global, MAX_GOALS_PER_CONTEXT_OWNER)]
+        );
+        input.validate(8).expect("hydrated input remains bounded");
     }
 
     #[test]
@@ -2326,6 +3023,8 @@ mod tests {
             EventPriority::High,
             WorldEventKind::ToolCompleted(crate::ToolCompletedEvent {
                 operation: "background.task".to_owned(),
+                output: String::new(),
+                requires_follow_up: false,
             }),
         );
         let reach_out = |person_id, text| {
@@ -2447,6 +3146,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn interaction_cue_events_hydrate_and_persist_their_person_state() {
+        let person_id = PersonId::new();
+        let cues = InteractionCues {
+            sentiment_valence: 0.65,
+            sentiment_arousal: 0.35,
+            sentiment_confidence: 0.9,
+            gratitude_strength: 0.8,
+        };
+        let observed = InteractionCuesObservedEvent::new(person_id, cues).expect("bounded cues");
+        let expected =
+            crate::apply_interaction_cues(person_id, None, AffectState::default(), observed.cues())
+                .expect("fixed-point cues stay bounded");
+        let affects = Arc::new(TestAffectStore::default());
+        let relations = Arc::new(TestRelationStore::default());
+        let services = CoreServices::with_model(InteractionCueModel)
+            .with_affect(affects.clone())
+            .with_relations(relations.clone());
+        let (_handle, mut runtime) =
+            CognitiveRuntime::new_with_services(RuntimeConfig::default(), services)
+                .expect("valid runtime");
+        let event = WorldEvent::new(
+            Utc::now(),
+            EventScope::Person { person_id },
+            EventPriority::Normal,
+            WorldEventKind::InteractionCuesObserved(observed),
+        );
+
+        let outcome = runtime
+            .process_event_with_planner(event)
+            .await
+            .expect("cue state should persist");
+        assert!(matches!(
+            outcome,
+            PlannedProcessingOutcome::Planned { plan, .. }
+                if plan.intents.is_empty() && plan.state_updates.len() == 2
+        ));
+        assert_eq!(
+            affects
+                .reads
+                .lock()
+                .expect("affect recorder lock")
+                .as_slice(),
+            &[person_id]
+        );
+        assert_eq!(
+            relations
+                .reads
+                .lock()
+                .expect("relation recorder lock")
+                .as_slice(),
+            &[person_id]
+        );
+        assert_eq!(
+            affects
+                .updates
+                .lock()
+                .expect("affect recorder lock")
+                .as_slice(),
+            &[(person_id, expected.affect)]
+        );
+        assert_eq!(
+            relations
+                .updates
+                .lock()
+                .expect("relation recorder lock")
+                .as_slice(),
+            &[expected.relation]
+        );
+    }
+
+    #[tokio::test]
     async fn state_update_targets_are_preflighted_before_any_store_mutation() {
         let conversation_id = ConversationId::new();
         let person_id = PersonId::new();
@@ -2545,6 +3315,50 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[tokio::test]
+    async fn defer_open_loop_update_reopens_the_visible_item_without_resolving_it() {
+        let conversation_id = ConversationId::new();
+        let person_id = PersonId::new();
+        let open_loop_id = OpenLoopId::new();
+        let owner = OpenLoopOwner::Conversation(conversation_id);
+        let open_loops = Arc::new(TestOpenLoopStore::with_visible(open_loop_id, owner));
+        let (_handle, mut runtime) = CognitiveRuntime::new_with_services(
+            RuntimeConfig::default(),
+            CoreServices::with_model(FakeModel).with_open_loops(open_loops.clone()),
+        )
+        .expect("valid runtime");
+        let input = runtime
+            .planner_input(direct_message(conversation_id, person_id))
+            .with_open_loops(vec![TestOpenLoopStore::open_loop(open_loop_id, owner)]);
+        let plan = DecisionPlan::silent().with_state_update(StateUpdateProposal::DeferOpenLoop {
+            open_loop_id,
+            due_at: None,
+        });
+
+        assert_eq!(
+            runtime
+                .apply_state_updates(&input, &plan, None)
+                .await
+                .expect("visible open loop should be deferred"),
+            1
+        );
+        assert_eq!(
+            open_loops
+                .deferred
+                .lock()
+                .expect("open-loop recorder lock")
+                .as_slice(),
+            &[(open_loop_id, None)]
+        );
+        assert!(
+            open_loops
+                .resolved
+                .lock()
+                .expect("open-loop recorder lock")
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -2942,6 +3756,7 @@ mod tests {
                     replies_to_agent: false,
                     stop_requested: false,
                     explicit_request: false,
+                    visible_reply_allowed: true,
                 },
             )
         };

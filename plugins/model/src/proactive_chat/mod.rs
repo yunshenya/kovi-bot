@@ -9,15 +9,17 @@
 use crate::group_access;
 use crate::memory::MemoryManager;
 use crate::model::semantic::{MessageUnderstanding, UnderstandingRequest, understand};
-use crate::model::send_tracked_group_message;
+use crate::model::{
+    MessageDestination, OutgoingSource, TrackedSendError, send_tracked_message_with_revalidation,
+};
 use crate::mood_system::MOOD_SYSTEM;
 use crate::topic_generator::TopicGenerator;
 use crate::yunxi;
 use crate::yunxi::bridge::ShadowBridge;
 use anyhow::Result;
 use chrono::Local;
-use kovi::RuntimeBot;
 use kovi::tokio::time::sleep;
+use kovi::{Message, RuntimeBot};
 use rand::Rng;
 use rand::prelude::IndexedRandom;
 use std::sync::Arc;
@@ -31,12 +33,27 @@ pub mod startup;
 
 const GLOBAL_PROACTIVE_STATE_KEY: &str = "proactive:global";
 
+fn prepared_grace_duration(configured_ms: u64) -> Duration {
+    if configured_ms == 0 {
+        Duration::ZERO
+    } else {
+        Duration::from_millis(configured_ms.clamp(300, 1_000))
+    }
+}
+
 fn target_state_key(scope: &str, subject_id: i64) -> String {
     format!("proactive:{scope}:{subject_id}")
 }
 
 fn main_admin_state_key(subject_id: i64) -> String {
     target_state_key("main_admin", subject_id)
+}
+
+async fn configured_owner_target() -> Option<i64> {
+    match yunxi::canonical_owner_qq_id_authoritative().await {
+        Some(route) => route,
+        None => crate::config::get().proactive().main_admin(),
+    }
 }
 
 /// 主动聊天管理器
@@ -273,8 +290,7 @@ impl ProactiveChatManager {
 
     /// 由模型结合关系、情绪与近期互动决定是否主动关心最信任用户。
     async fn try_initiate_main_admin_chat(&self) -> Result<bool> {
-        let proactive_config = crate::config::get().proactive().clone();
-        let Some(main_admin) = proactive_config.main_admin() else {
+        let Some(main_admin) = configured_owner_target().await else {
             return Ok(false);
         };
         if !self.can_send_main_admin(main_admin).await {
@@ -297,6 +313,7 @@ impl ProactiveChatManager {
         // Model generation can take long enough for another event to invalidate
         // cooldown, daily-limit, or recent-interaction state.
         if !self.can_send_main_admin(main_admin).await
+            || yunxi::canonical_owner_matches_authoritative(main_admin).await != Some(true)
             || !self.deliver_private_reach_out(main_admin, &intent).await
         {
             return Ok(false);
@@ -430,7 +447,7 @@ impl ProactiveChatManager {
     async fn get_active_users(&self) -> Vec<i64> {
         let now = Local::now();
         let three_days_ago = now - chrono::Duration::days(3);
-        let main_admin = crate::config::get().proactive().main_admin();
+        let main_admin = configured_owner_target().await;
 
         self.memory_manager
             .get_proactive_user_candidates(three_days_ago, main_admin, 32)
@@ -493,7 +510,33 @@ impl ProactiveChatManager {
             {
                 return Ok(());
             }
-            if !send_tracked_group_message(&self.bot, group_id, content.clone()).await {
+            let grace =
+                prepared_grace_duration(crate::config::get().proactive().prepared_grace_ms());
+            let send_result = send_tracked_message_with_revalidation(
+                &self.bot,
+                MessageDestination::Group(group_id),
+                Message::from(content.clone()),
+                OutgoingSource::Proactive,
+                None,
+                || async {
+                    if !grace.is_zero() {
+                        sleep(grace).await;
+                    }
+                    self.can_send_regular_chat().await
+                        && self.can_send_to_target("group", group_id).await
+                },
+            )
+            .await;
+            if let Err(error) = send_result {
+                if matches!(
+                    error,
+                    TrackedSendError::InvalidTarget | TrackedSendError::Transport(_)
+                ) {
+                    eprintln!(
+                        "[ERROR] 主动群聊消息发送失败 (群组: {}): {}",
+                        group_id, error
+                    );
+                }
                 return Ok(());
             }
 
@@ -702,11 +745,20 @@ enum ChatTarget {
 
 #[cfg(test)]
 mod tests {
-    use super::is_sent_proactive_context;
+    use super::{is_sent_proactive_context, prepared_grace_duration};
+    use std::time::Duration;
 
     #[test]
     fn skipped_main_admin_decision_does_not_start_global_cooldown() {
         assert!(!is_sent_proactive_context("proactive_main_admin_decision"));
         assert!(is_sent_proactive_context("proactive_private_chat"));
+    }
+
+    #[test]
+    fn proactive_prepared_grace_is_disabled_or_tightly_bounded() {
+        assert_eq!(prepared_grace_duration(0), Duration::ZERO);
+        assert_eq!(prepared_grace_duration(1), Duration::from_millis(300));
+        assert_eq!(prepared_grace_duration(500), Duration::from_millis(500));
+        assert_eq!(prepared_grace_duration(5_000), Duration::from_millis(1_000));
     }
 }

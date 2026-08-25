@@ -1,7 +1,14 @@
+use chrono::{DateTime, Utc};
 use sqlx_core::query::query;
 use sqlx_core::row::Row;
 use sqlx_postgres::PgPool;
-use yunxi_core::{PersonId, RelationState, RelationStore, RelationStoreError, RelationStoreFuture};
+use std::time::Duration;
+use yunxi_core::{
+    PersonId, RelationState, RelationStore, RelationStoreError, RelationStoreFuture,
+    drift_relation_state,
+};
+
+const MINIMUM_DRIFT_ELAPSED: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone)]
 pub(crate) struct PostgresRelationStore {
@@ -14,6 +21,8 @@ impl PostgresRelationStore {
     }
 
     pub(crate) async fn initialize_schema(&self) -> anyhow::Result<()> {
+        let mut transaction = self.pool.begin().await?;
+        super::schema::lock(&mut transaction).await?;
         query(
             r#"CREATE TABLE IF NOT EXISTS yunxi_relations (
                 person_id UUID PRIMARY KEY REFERENCES yunxi_persons(id) ON DELETE CASCADE,
@@ -25,9 +34,37 @@ impl PostgresRelationStore {
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )"#,
         )
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await?;
+        transaction.commit().await?;
         Ok(())
+    }
+
+    /// Bootstrap a canonical row from legacy state without racing with or
+    /// replacing a Core-owned evolution that already exists.
+    pub(crate) async fn seed_if_absent(
+        &self,
+        state: RelationState,
+    ) -> Result<bool, RelationStoreError> {
+        state
+            .validate()
+            .map_err(|_| RelationStoreError::InvalidState)?;
+        let result = query(
+            "INSERT INTO yunxi_relations
+                (person_id, familiarity, affinity, trust, comfort, tension)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             ON CONFLICT (person_id) DO NOTHING",
+        )
+        .bind(state.person_id.into_uuid())
+        .bind(f64::from(state.familiarity))
+        .bind(f64::from(state.affinity))
+        .bind(f64::from(state.trust))
+        .bind(f64::from(state.comfort))
+        .bind(f64::from(state.tension))
+        .execute(&self.pool)
+        .await
+        .map_err(RelationStoreError::storage)?;
+        Ok(result.rows_affected() == 1)
     }
 }
 
@@ -35,7 +72,7 @@ impl RelationStore for PostgresRelationStore {
     fn get<'a>(&'a self, person_id: PersonId) -> RelationStoreFuture<'a, Option<RelationState>> {
         Box::pin(async move {
             let row = query(
-                "SELECT familiarity, affinity, trust, comfort, tension
+                "SELECT familiarity, affinity, trust, comfort, tension, updated_at
                  FROM yunxi_relations WHERE person_id = $1",
             )
             .bind(person_id.into_uuid())
@@ -45,7 +82,7 @@ impl RelationStore for PostgresRelationStore {
             let Some(row) = row else {
                 return Ok(None);
             };
-            let state = RelationState {
+            let stored_state = RelationState {
                 person_id,
                 familiarity: row
                     .try_get::<f64, _>("familiarity")
@@ -63,9 +100,14 @@ impl RelationStore for PostgresRelationStore {
                     .try_get::<f64, _>("tension")
                     .map_err(RelationStoreError::storage)? as f32,
             };
-            state.validate().map_err(|error| {
+            stored_state.validate().map_err(|error| {
                 RelationStoreError::storage(std::io::Error::other(error.to_string()))
             })?;
+            let updated_at = row
+                .try_get::<DateTime<Utc>, _>("updated_at")
+                .map_err(RelationStoreError::storage)?;
+            let state =
+                drift_relation_state(stored_state, elapsed_for_drift(updated_at, Utc::now()));
             Ok(Some(state))
         })
     }
@@ -101,13 +143,42 @@ impl RelationStore for PostgresRelationStore {
     }
 }
 
+fn elapsed_for_drift(updated_at: DateTime<Utc>, now: DateTime<Utc>) -> Duration {
+    let Ok(elapsed) = now.signed_duration_since(updated_at).to_std() else {
+        return Duration::ZERO;
+    };
+    if elapsed < MINIMUM_DRIFT_ELAPSED {
+        Duration::ZERO
+    } else {
+        elapsed
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::PostgresRelationStore;
+    use super::{PostgresRelationStore, elapsed_for_drift};
     use crate::yunxi::identity_store::PostgresIdentityStore;
+    use chrono::{Duration as ChronoDuration, Utc};
     use sqlx_core::query::query;
     use sqlx_postgres::PgPoolOptions;
     use yunxi_core::{PersonId, RelationState, RelationStore};
+
+    #[test]
+    fn relation_drift_elapsed_ignores_clock_skew_and_subminute_jitter() {
+        let now = Utc::now();
+        assert_eq!(
+            elapsed_for_drift(now + ChronoDuration::hours(1), now),
+            std::time::Duration::ZERO
+        );
+        assert_eq!(
+            elapsed_for_drift(now - ChronoDuration::seconds(59), now),
+            std::time::Duration::ZERO
+        );
+        assert_eq!(
+            elapsed_for_drift(now - ChronoDuration::seconds(61), now),
+            std::time::Duration::from_secs(61)
+        );
+    }
 
     #[test]
     #[ignore = "requires PostgreSQL via DATABASE_URL"]
@@ -146,6 +217,28 @@ mod tests {
                     None
                 );
 
+                let bootstrap = RelationState {
+                    person_id,
+                    familiarity: 0.1,
+                    affinity: 0.2,
+                    trust: 0.3,
+                    comfort: 0.4,
+                    tension: 0.0,
+                };
+                assert!(
+                    store
+                        .seed_if_absent(bootstrap)
+                        .await
+                        .expect("first legacy seed should insert")
+                );
+                assert_eq!(
+                    store
+                        .get(person_id)
+                        .await
+                        .expect("bootstrap should be readable"),
+                    Some(bootstrap)
+                );
+
                 let expected = RelationState {
                     person_id,
                     familiarity: 0.25,
@@ -163,6 +256,52 @@ mod tests {
                     store.get(person_id).await.expect("should reload relation"),
                     Some(expected)
                 );
+
+                let legacy_seed = RelationState {
+                    person_id,
+                    familiarity: 1.0,
+                    affinity: -1.0,
+                    trust: 1.0,
+                    comfort: -1.0,
+                    tension: 1.0,
+                };
+                assert!(
+                    !store
+                        .seed_if_absent(legacy_seed)
+                        .await
+                        .expect("legacy seed should be accepted")
+                );
+                assert_eq!(
+                    store
+                        .get(person_id)
+                        .await
+                        .expect("legacy seed must preserve Core relation"),
+                    Some(expected)
+                );
+
+                query(
+                    "UPDATE yunxi_relations
+                     SET updated_at = NOW() - INTERVAL '365 days'
+                     WHERE person_id = $1",
+                )
+                .bind(person_id.into_uuid())
+                .execute(&pool)
+                .await
+                .expect("should age stored relation state");
+                let drifted = store
+                    .get(person_id)
+                    .await
+                    .expect("should apply elapsed relation drift")
+                    .expect("relation should still exist");
+                assert_eq!(drifted.person_id, person_id);
+                assert!(drifted.familiarity.abs() < expected.familiarity.abs());
+                assert!(drifted.affinity.abs() < expected.affinity.abs());
+                assert!(drifted.trust.abs() < expected.trust.abs());
+                assert!(drifted.comfort.abs() < expected.comfort.abs());
+                assert!(drifted.tension.abs() < expected.tension.abs());
+                drifted
+                    .validate()
+                    .expect("drifted relation should be valid");
 
                 query("DELETE FROM yunxi_persons WHERE id = $1")
                     .bind(person_id.into_uuid())

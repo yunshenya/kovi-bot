@@ -1,5 +1,5 @@
 use crate::model::interrupt::{ReplyTicket, is_current};
-use crate::model::recall::record_bot_message;
+use crate::model::message_actions::{MessageDestination, send_tracked_reply_text};
 use kovi::RuntimeBot;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
@@ -79,28 +79,12 @@ impl ThinkingReporter {
             self.notice_sent.store(false, Ordering::Release);
             return;
         }
-        let message_id = match self.destination {
-            ThinkingDestination::Group(group_id) => {
-                self.bot
-                    .send_group_msg_return(group_id, notice.clone())
-                    .await
-            }
-            ThinkingDestination::Private(user_id) => {
-                self.bot
-                    .send_private_msg_return(user_id, notice.clone())
-                    .await
-            }
+        let destination = match self.destination {
+            ThinkingDestination::Group(group_id) => MessageDestination::Group(group_id),
+            ThinkingDestination::Private(user_id) => MessageDestination::Private(user_id),
         };
-        if let Ok(message_id) = message_id {
-            let scope = match self.destination {
-                ThinkingDestination::Group(group_id) => {
-                    crate::model::interrupt::ReplyScope::Group(group_id)
-                }
-                ThinkingDestination::Private(user_id) => {
-                    crate::model::interrupt::ReplyScope::Private(user_id)
-                }
-            };
-            let _ = record_bot_message(scope, self.ticket, message_id, &notice, &self.bot).await;
+        if !send_tracked_reply_text(&self.bot, destination, &notice, self.ticket).await {
+            self.notice_sent.store(false, Ordering::Release);
         }
     }
 }

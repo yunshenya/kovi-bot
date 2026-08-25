@@ -192,6 +192,35 @@ pub(crate) async fn record_bot_message(
     }
 }
 
+/// Record a message after the conversation coordinator has crossed its send
+/// commit point. A newer inbound turn may now coexist with this delivery, so
+/// generation changes must not trigger an automatic recall.
+pub(crate) async fn record_committed_bot_message(
+    scope: ReplyScope,
+    ticket: ReplyTicket,
+    message_id: i32,
+    content: &str,
+) -> bool {
+    if message_id <= 0 {
+        return false;
+    }
+    let recorded_content = bot_message_content(content);
+    {
+        let mut lifecycles = REPLY_LIFECYCLES.lock().await;
+        prune_lifecycles(&mut lifecycles);
+        let lifecycle = lifecycles.entry(scope).or_default();
+        lifecycle.last_seen = Instant::now();
+        if let Some(active) = lifecycle.active.as_mut()
+            && active.ticket == ticket
+        {
+            active.sent_message_ids.push(message_id);
+        }
+        record_recent_bot_message(lifecycle, message_id, content);
+    }
+    persist_redis_bot_message(scope, message_id, &recorded_content).await;
+    true
+}
+
 async fn discard_stale_bot_message(
     scope: ReplyScope,
     ticket: ReplyTicket,
@@ -240,13 +269,16 @@ pub(crate) async fn send_tracked_group_message(
     content: impl Into<String>,
 ) -> bool {
     let content = content.into();
-    match bot.send_group_msg_return(group_id, content.clone()).await {
-        Ok(message_id) => {
-            record_standalone_bot_message(ReplyScope::Group(group_id), message_id, &content).await;
-            true
-        }
+    match super::tracked_send::send_tracked_plain_text(
+        bot,
+        super::message_actions::MessageDestination::Group(group_id),
+        content,
+    )
+    .await
+    {
+        Ok(_) => true,
         Err(error) => {
-            eprintln!("[ERROR] 群聊消息发送失败 (群组: {}): {:?}", group_id, error);
+            eprintln!("[ERROR] 群聊消息发送失败 (群组: {}): {}", group_id, error);
             false
         }
     }
@@ -258,13 +290,16 @@ pub(crate) async fn send_tracked_private_message(
     content: impl Into<String>,
 ) -> bool {
     let content = content.into();
-    match bot.send_private_msg_return(user_id, content.clone()).await {
-        Ok(message_id) => {
-            record_standalone_bot_message(ReplyScope::Private(user_id), message_id, &content).await;
-            true
-        }
+    match super::tracked_send::send_tracked_plain_text(
+        bot,
+        super::message_actions::MessageDestination::Private(user_id),
+        content,
+    )
+    .await
+    {
+        Ok(_) => true,
         Err(error) => {
-            eprintln!("[ERROR] 私聊消息发送失败 (用户: {}): {:?}", user_id, error);
+            eprintln!("[ERROR] 私聊消息发送失败 (用户: {}): {}", user_id, error);
             false
         }
     }
@@ -757,4 +792,5 @@ mod tests {
                 assert!(!is_active(scope).await);
             });
     }
+
 }

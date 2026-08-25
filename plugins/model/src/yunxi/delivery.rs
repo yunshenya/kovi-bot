@@ -8,8 +8,11 @@
 use super::identity_store::PostgresIdentityStore;
 use super::qq;
 use crate::model::{
-    MessageDestination, MessageTransport, record_standalone_bot_message,
-    send_tracked_private_message,
+    MessageDestination, MessageTransport, OutgoingCommitRejection, OutgoingSource, OutgoingToken,
+    ReplyScope, ToolExecutionContext, commit_outgoing_guard_with_context,
+    contextual_outgoing_fingerprint, find_prepared_outgoing, finish, interrupt, mark_active,
+    mark_outgoing_failed, outgoing_fingerprint, prepare_outgoing, record_standalone_bot_message,
+    send_tracked_private_message, tool_registry,
 };
 use kovi::bot::message::Segment;
 use kovi::serde_json::json;
@@ -19,9 +22,12 @@ use std::fmt;
 use std::sync::Arc;
 use thiserror::Error;
 use yunxi_core::{
-    ActionPort, ActionPortError, ActionPortFuture, ActionPortOutcome, ConversationId,
-    ConversationKind, DeliveryResolutionError, DeliveryResolver, DeliveryResolverFuture,
-    DeliveryRoute, IdentityStore, MessageContent, MessageId, ProposedAction, ReachOutIntent,
+    ActionPort, ActionPortError, ActionPortFuture, ActionPortOutcome, ActionScope, ConversationId,
+    ConversationKind, ConversationMemberStore, DeliveryResolutionError, DeliveryResolver,
+    DeliveryResolverFuture, DeliveryRoute, GoalState, GoalStore, IdentityStore, MessageContent,
+    MessageId, OpenLoopStore, ProposedAction, ReachOutIntent, ToolAction,
+    MAX_TOOL_ERROR_DETAIL_BYTES, MAX_TOOL_ERROR_DETAIL_CHARS, MAX_TOOL_RESULT_BYTES,
+    MAX_TOOL_RESULT_CHARS,
 };
 
 /// Concrete QQ destination after a canonical Core conversation has been
@@ -31,6 +37,12 @@ use yunxi_core::{
 enum QqDestination {
     Group(i64),
     Private(i64),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeliveryRevalidationTarget {
+    Conversation(ConversationId),
+    Person(yunxi_core::PersonId),
 }
 
 impl QqDestination {
@@ -72,6 +84,8 @@ impl QqAdapterFailure {
 pub(crate) struct QqActionAdapter {
     bot: Arc<RuntimeBot>,
     identity_store: Arc<PostgresIdentityStore>,
+    open_loop_store: Arc<dyn OpenLoopStore>,
+    goal_store: Arc<dyn GoalStore>,
     /// Login info is stable for a running Kovi bot. Cache it after the first
     /// successful lookup, but leave it unset when the API is temporarily down
     /// so a later action can retry.
@@ -94,10 +108,14 @@ impl QqActionAdapter {
     pub(crate) fn new(
         bot: Arc<RuntimeBot>,
         identity_store: Arc<PostgresIdentityStore>,
+        open_loop_store: Arc<dyn OpenLoopStore>,
+        goal_store: Arc<dyn GoalStore>,
     ) -> Arc<Self> {
         Arc::new(Self {
             bot,
             identity_store,
+            open_loop_store,
+            goal_store,
             self_id: Arc::new(Mutex::new(None)),
         })
     }
@@ -177,6 +195,26 @@ impl QqActionAdapter {
         &self,
         conversation_id: ConversationId,
     ) -> Result<QqDestination, ActionPortError> {
+        let destination = self
+            .resolve_conversation_destination_without_authorization(conversation_id)
+            .await?;
+        if let QqDestination::Group(group_id) = destination {
+            let authorized = crate::group_access::is_authorized_group(group_id)
+                .await
+                .map_err(|error| {
+                    ActionPortError::new(format!("group_authorization_unavailable:{error}"), true)
+                })?;
+            if !delivery_authorization_allows(destination, Some(authorized)) {
+                return Err(ActionPortError::new("group_not_authorized", false));
+            }
+        }
+        Ok(destination)
+    }
+
+    async fn resolve_conversation_destination_without_authorization(
+        &self,
+        conversation_id: ConversationId,
+    ) -> Result<QqDestination, ActionPortError> {
         let mappings = self
             .identity_store
             .qq_external_conversations_for_id(conversation_id)
@@ -203,28 +241,103 @@ impl QqActionAdapter {
         } else {
             None
         };
-        let destination = parse_qq_destination(external_id, *kind, self_id)
-            .ok_or_else(|| ActionPortError::new("delivery_route_invalid", false))?;
-        if let QqDestination::Group(group_id) = destination {
-            let authorized = crate::group_access::is_authorized_group(group_id)
-                .await
-                .map_err(|error| {
-                    ActionPortError::new(format!("group_authorization_unavailable:{error}"), true)
-                })?;
-            if !authorized {
-                return Err(ActionPortError::new("group_not_authorized", false));
-            }
-        }
-        Ok(destination)
+        parse_qq_destination(external_id, *kind, self_id)
+            .ok_or_else(|| ActionPortError::new("delivery_route_invalid", false))
     }
 
     async fn send_to_destination(
         &self,
-        destination: QqDestination,
+        revalidation_target: DeliveryRevalidationTarget,
+        expected_destination: QqDestination,
         content: &MessageContent,
-        reply_to: Option<i64>,
-        conversation_id: ConversationId,
+        reply_to: Option<MessageId>,
+        expected_conversation_id: ConversationId,
+        idempotency_key: &str,
+        outgoing: OutgoingToken,
     ) -> Result<ActionPortOutcome, ActionPortError> {
+        // Resolve the optional quote before the final destination check. Quote
+        // degradation is stylistic; route and authorization are security
+        // boundaries and therefore must be the last awaited lookups before
+        // the serialized commit.
+        let reply_to = if let Some(reply_to) = reply_to {
+            match self
+                .identity_store
+                .qq_message_id_for_core(reply_to, expected_conversation_id)
+                .await
+            {
+                Ok(Some(external_id)) => match i32::try_from(external_id) {
+                    Ok(external_id) => Some(i64::from(external_id)),
+                    Err(_) => {
+                        kovi::log::warn!(
+                            "Yunxi reply target was outside the OneBot message-id range; sending without a reply segment"
+                        );
+                        None
+                    }
+                },
+                Ok(None) => {
+                    kovi::log::warn!(
+                        "Yunxi reply target had no QQ mapping in the expected conversation; sending without a reply segment"
+                    );
+                    None
+                }
+                Err(error) => {
+                    kovi::log::warn!(
+                        "Yunxi reply mapping lookup failed before route revalidation; sending without a reply segment: {error}"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let route_guard = crate::yunxi::pin_delivery_routes().await;
+        let authorization = match expected_destination {
+            QqDestination::Group(group_id) => {
+                match crate::group_access::authorize_group_send(group_id).await {
+                    Ok(authorization) => Some(authorization),
+                    Err(error) => {
+                        mark_outgoing_failed(outgoing).await;
+                        return Err(ActionPortError::new(
+                            format!("group_not_authorized_before_commit:{error}"),
+                            false,
+                        ));
+                    }
+                }
+            }
+            QqDestination::Private(_) => None,
+        };
+        let revalidated = match revalidation_target {
+            DeliveryRevalidationTarget::Conversation(conversation_id) => self
+                .resolve_conversation_destination_without_authorization(conversation_id)
+                .await
+                .map(|destination| (conversation_id, destination)),
+            DeliveryRevalidationTarget::Person(person_id) => self
+                .resolve_person_destination(person_id)
+                .await
+                .map_err(|error| ActionPortError::new(error.to_string(), true))
+                .map(|(route, destination)| (route.conversation_id, destination)),
+        };
+        let (conversation_id, destination) = match revalidated {
+            Ok(current)
+                if delivery_route_is_unchanged(
+                    expected_conversation_id,
+                    expected_destination,
+                    Some(current),
+                ) =>
+            {
+                current
+            }
+            Ok(_) => {
+                mark_outgoing_failed(outgoing).await;
+                return Ok(ActionPortOutcome::Deferred {
+                    reason: "delivery_route_changed_before_commit".to_string(),
+                });
+            }
+            Err(error) => {
+                mark_outgoing_failed(outgoing).await;
+                return Err(error);
+            }
+        };
         let text = content.as_text();
         let message = if let Some(reply_to) = reply_to {
             Message::from(vec![
@@ -234,15 +347,52 @@ impl QqActionAdapter {
         } else {
             text.to_owned().into()
         };
-        let message_id = MessageTransport::new(&self.bot)
+        let fingerprint_content = serde_json::to_string(content)
+            .unwrap_or_else(|_| content.as_text().to_owned());
+        let fingerprint = contextual_outgoing_fingerprint(
+            destination.reply_scope(),
+            &fingerprint_content,
+            reply_to,
+            &[],
+            Some(idempotency_key),
+        );
+        let committed = match commit_outgoing_guard_with_context(
+            outgoing,
+            fingerprint,
+            Some(idempotency_key),
+        )
+        .await
+        {
+            Ok(committed) => committed,
+            Err(OutgoingCommitRejection::Stale) => {
+                return Ok(ActionPortOutcome::Deferred {
+                    reason: "outgoing_superseded_before_commit".to_string(),
+                });
+            }
+            Err(OutgoingCommitRejection::DuplicateIdempotency) => {
+                return Ok(ActionPortOutcome::Deferred {
+                    reason: "outgoing_duplicate_idempotency_key".to_string(),
+                });
+            }
+        };
+        drop(authorization);
+        drop(route_guard);
+        let send_result = MessageTransport::new(&self.bot)
             .send(destination.message_destination(), message)
-            .await
-            .map_err(|error| {
-                ActionPortError::new(
+            .await;
+        let message_id = match send_result {
+            Ok(message_id) => {
+                committed.mark_sent().await;
+                message_id
+            }
+            Err(error) => {
+                committed.mark_failed().await;
+                return Err(ActionPortError::new(
                     format!("qq_send_failed:{}", format_api_return(&error)),
                     true,
-                )
-            })?;
+                ));
+            }
+        };
         record_standalone_bot_message(destination.reply_scope(), message_id, text).await;
         let core_message_id = MessageId::new();
         if let Err(error) = self
@@ -269,6 +419,174 @@ impl QqActionAdapter {
             conversation_id: Some(conversation_id),
         })
     }
+
+    async fn prepared_outgoing(
+        &self,
+        scope: ReplyScope,
+        content: &MessageContent,
+        allow_proactive_fallback: bool,
+    ) -> Option<OutgoingToken> {
+        let fingerprint = outgoing_fingerprint(content.as_text());
+        let prepared = find_prepared_outgoing(scope, fingerprint).await;
+        let (outgoing, source) = if let Some(prepared) = prepared {
+            prepared
+        } else if allow_proactive_fallback {
+            let ticket = interrupt(scope).await;
+            if !mark_active(ticket).await {
+                return None;
+            }
+            let outgoing = prepare_outgoing(ticket, fingerprint, OutgoingSource::Proactive).await;
+            finish(ticket).await;
+            (outgoing?, OutgoingSource::Proactive)
+        } else {
+            return None;
+        };
+        if source == OutgoingSource::Proactive {
+            let grace_ms = crate::config::get().proactive().prepared_grace_ms();
+            if grace_ms > 0 {
+                kovi::tokio::time::sleep(std::time::Duration::from_millis(grace_ms)).await;
+            }
+        }
+        Some(outgoing)
+    }
+
+    /// Execute a Core tool action only when the action carries enough
+    /// canonical context to reconstruct one concrete QQ turn. Core actions
+    /// intentionally do not carry raw QQ ids, so an anonymous/global tool
+    /// request is rejected instead of being guessed into a host operation.
+    async fn execute_tool(
+        &self,
+        action: &ToolAction,
+    ) -> Result<ActionPortOutcome, ActionPortError> {
+        let Some(registry) = tool_registry() else {
+            return Ok(ActionPortOutcome::Deferred {
+                reason: "tool_registry_unavailable".to_string(),
+            });
+        };
+        let actor = action
+            .actor()
+            .ok_or_else(|| ActionPortError::new("tool_actor_required", false))?;
+        let actor_user_id = self
+            .identity_store
+            .qq_external_identity_for_delivery(actor)
+            .await
+            .map_err(|error| {
+                ActionPortError::new(format!("tool_actor_lookup_failed:{error}"), true)
+            })?
+            .and_then(|value| parse_positive_i64(&value))
+            .ok_or_else(|| ActionPortError::new("tool_actor_route_unavailable", false))?;
+
+        let destination = match action.scope {
+            ActionScope::Conversation(conversation_id) => {
+                if self
+                    .identity_store
+                    .get(conversation_id, actor)
+                    .await
+                    .map_err(|error| {
+                        ActionPortError::new(format!("tool_scope_membership_failed:{error}"), true)
+                    })?
+                    .is_none()
+                {
+                    return Err(ActionPortError::new(
+                        "tool_scope_membership_required",
+                        false,
+                    ));
+                }
+                self.resolve_conversation_destination(conversation_id).await?
+            }
+            ActionScope::Person(person_id) => {
+                if person_id != actor {
+                    return Err(ActionPortError::new(
+                        "tool_person_scope_actor_mismatch",
+                        false,
+                    ));
+                }
+                let (_route, destination) = self
+                    .resolve_person_destination(person_id)
+                    .await
+                    .map_err(|error| ActionPortError::new(error.to_string(), true))?;
+                destination
+            }
+            ActionScope::Global => {
+                return Ok(ActionPortOutcome::Deferred {
+                    reason: "global_tool_scope_requires_host_context".to_string(),
+                });
+            }
+        };
+
+        let arguments = serde_json::from_str::<serde_json::Value>(&action.input)
+            .map_err(|error| ActionPortError::new(format!("tool_input_invalid:{error}"), false))?;
+        let Some(arguments) = arguments.as_object().cloned() else {
+            return Err(ActionPortError::new(
+                "tool_input_must_be_json_object",
+                false,
+            ));
+        };
+        let configured_owner = crate::config::get().identity().owner_person_id();
+        let is_main_admin = configured_owner.is_some_and(|owner| owner == actor.into_uuid())
+            || (configured_owner.is_none()
+                && self
+                    .bot
+                    .get_main_admin()
+                    .ok()
+                    .is_some_and(|main_admin| main_admin == actor_user_id));
+        // The Core action has no raw group-admin proof. Restrict admin tools
+        // to the host's main administrator until a platform-neutral
+        // capability token is available.
+        let is_admin = is_main_admin;
+        let group_paused = match destination {
+            QqDestination::Group(group_id) => crate::model::utils::is_group_paused(group_id).await,
+            QqDestination::Private(_) => false,
+        };
+        let reply_scope = destination.reply_scope();
+        let ticket = interrupt(reply_scope).await;
+        if !mark_active(ticket).await {
+            return Ok(ActionPortOutcome::Deferred {
+                reason: "tool_turn_superseded_before_start".to_string(),
+            });
+        }
+        let context = ToolExecutionContext {
+            subject_id: actor_user_id,
+            actor_user_id,
+            is_admin,
+            is_main_admin,
+            context: "yunxi_core_tool",
+            destination: destination.message_destination(),
+            source_message_id: None,
+            scheduled: false,
+            group_paused,
+            runtime_bot: Some(Arc::clone(&self.bot)),
+            sticker_teaching: None,
+            requires_reminder_create: false,
+            requires_agent_run_create: false,
+            requires_group_message_send: false,
+            requires_group_followup: false,
+            requires_external_tool: false,
+        };
+        let result = registry
+            .execute(&action.tool_name, arguments, context, ticket)
+            .await;
+        finish(ticket).await;
+        if result.succeeded {
+            return Ok(ActionPortOutcome::ToolCompleted {
+                operation: action.tool_name.clone(),
+                output: bounded_core_tool_text(
+                    &result.content,
+                    MAX_TOOL_RESULT_CHARS,
+                    MAX_TOOL_RESULT_BYTES,
+                ),
+            });
+        }
+        Ok(ActionPortOutcome::ToolFailed {
+            operation: action.tool_name.clone(),
+            error_category: "tool_execution_failed".to_string(),
+            detail: bounded_core_tool_text(
+                &result.content,
+                MAX_TOOL_ERROR_DETAIL_CHARS,
+                MAX_TOOL_ERROR_DETAIL_BYTES,
+            ),
+        })
+    }
 }
 
 impl DeliveryResolver for QqActionAdapter {
@@ -289,46 +607,23 @@ impl ActionPort for QqActionAdapter {
                     let destination = self
                         .resolve_conversation_destination(send.conversation_id)
                         .await?;
-                    let reply_to = if let Some(reply_to) = send.reply_to {
-                        match self
-                            .identity_store
-                            .qq_message_id_for_core(reply_to, send.conversation_id)
-                            .await
-                        {
-                            Ok(Some(external_id)) => match i32::try_from(external_id) {
-                                Ok(external_id) => Some(i64::from(external_id)),
-                                Err(_) => {
-                                    kovi::log::warn!(
-                                        "Yunxi reply target was outside the OneBot message-id range; sending without a reply segment"
-                                    );
-                                    None
-                                }
-                            },
-                            Ok(None) => {
-                                kovi::log::warn!(
-                                    "Yunxi reply target had no QQ mapping in the resolved conversation; sending without a reply segment"
-                                );
-                                None
-                            }
-                            Err(error) => {
-                                // The conversation destination was already
-                                // resolved and authorized. Losing the optional
-                                // quote style must not turn an otherwise safe
-                                // text reply into a swallowed canary message.
-                                kovi::log::warn!(
-                                    "Yunxi reply mapping lookup failed; sending without a reply segment: {error}"
-                                );
-                                None
-                            }
-                        }
-                    } else {
-                        None
+                    let reply_to = send.reply_to;
+                    let Some(outgoing) = self
+                        .prepared_outgoing(destination.reply_scope(), &send.content, false)
+                        .await
+                    else {
+                        return Ok(ActionPortOutcome::Deferred {
+                            reason: "outgoing_not_prepared".to_string(),
+                        });
                     };
                     self.send_to_destination(
+                        DeliveryRevalidationTarget::Conversation(send.conversation_id),
                         destination,
                         &send.content,
                         reply_to,
                         send.conversation_id,
+                        send.idempotency_key(),
+                        outgoing,
                     )
                     .await
                 }
@@ -337,13 +632,99 @@ impl ActionPort for QqActionAdapter {
                         .resolve_person_destination(reach_out.person_id)
                         .await
                         .map_err(|error| ActionPortError::new(error.to_string(), true))?;
+                    let Some(outgoing) = self
+                        .prepared_outgoing(destination.reply_scope(), &reach_out.message, true)
+                        .await
+                    else {
+                        return Ok(ActionPortOutcome::Deferred {
+                            reason: "outgoing_not_prepared".to_string(),
+                        });
+                    };
                     self.send_to_destination(
+                        DeliveryRevalidationTarget::Person(reach_out.person_id),
                         destination,
                         &reach_out.message,
                         None,
                         route.conversation_id,
+                        reach_out.idempotency_key(),
+                        outgoing,
                     )
                     .await
+                }
+                ProposedAction::UseTool(action) => self.execute_tool(action).await,
+                ProposedAction::CreateOpenLoop(action) => {
+                    let open_loop = self
+                        .open_loop_store
+                        .create(&action.draft)
+                        .await
+                        .map_err(store_action_error)?;
+                    Ok(ActionPortOutcome::Delivered {
+                        external_reference: Some(format!("yunxi-open-loop:{}", open_loop.id())),
+                        message_id: None,
+                        conversation_id: open_loop.owner().conversation_id(),
+                    })
+                }
+                ProposedAction::ResolveOpenLoop(action) => {
+                    let open_loop = self
+                        .open_loop_store
+                        .get(action.open_loop_id)
+                        .await
+                        .map_err(store_action_error)?
+                        .ok_or_else(|| ActionPortError::new("open_loop_not_found", false))?;
+                    if open_loop.owner() != action.owner {
+                        return Err(ActionPortError::new("open_loop_owner_mismatch", false));
+                    }
+                    let resolved = self
+                        .open_loop_store
+                        .resolve(action.open_loop_id, chrono::Utc::now())
+                        .await
+                        .map_err(store_action_error)?;
+                    Ok(ActionPortOutcome::Delivered {
+                        external_reference: Some(format!(
+                            "yunxi-open-loop-resolved:{}",
+                            resolved.id()
+                        )),
+                        message_id: None,
+                        conversation_id: resolved.owner().conversation_id(),
+                    })
+                }
+                ProposedAction::StartGoal(action) => {
+                    let goal = self
+                        .goal_store
+                        .create(&action.draft)
+                        .await
+                        .map_err(store_action_error)?;
+                    Ok(ActionPortOutcome::Delivered {
+                        external_reference: Some(format!("yunxi-goal:{}", goal.id())),
+                        message_id: None,
+                        conversation_id: goal.owner().conversation_id(),
+                    })
+                }
+                ProposedAction::CancelGoal(action) => {
+                    let mut goal = self
+                        .goal_store
+                        .get(action.goal_id)
+                        .await
+                        .map_err(store_action_error)?
+                        .ok_or_else(|| ActionPortError::new("goal_not_found", false))?;
+                    if goal.owner() != action.owner {
+                        return Err(ActionPortError::new("goal_owner_mismatch", false));
+                    }
+                    goal.transition(GoalState::Cancelled, chrono::Utc::now())
+                        .map_err(|error| ActionPortError::new(error.to_string(), false))?;
+                    let cancelled = self
+                        .goal_store
+                        .update(&goal)
+                        .await
+                        .map_err(store_action_error)?;
+                    Ok(ActionPortOutcome::Delivered {
+                        external_reference: Some(format!(
+                            "yunxi-goal-cancelled:{}",
+                            cancelled.id()
+                        )),
+                        message_id: None,
+                        conversation_id: cancelled.owner().conversation_id(),
+                    })
                 }
                 ProposedAction::Noop => Ok(ActionPortOutcome::Delivered {
                     external_reference: None,
@@ -352,6 +733,39 @@ impl ActionPort for QqActionAdapter {
                 }),
             }
         })
+    }
+}
+
+fn store_action_error(error: impl std::fmt::Display) -> ActionPortError {
+    ActionPortError::new(format!("core_store_failed:{error}"), true)
+}
+
+fn bounded_core_tool_text(value: &str, max_chars: usize, max_bytes: usize) -> String {
+    let mut bounded = String::with_capacity(value.len().min(max_bytes));
+    for character in value.chars().take(max_chars) {
+        if bounded.len().saturating_add(character.len_utf8()) > max_bytes {
+            break;
+        }
+        bounded.push(character);
+    }
+    bounded
+}
+
+fn delivery_route_is_unchanged(
+    expected_conversation_id: ConversationId,
+    expected_destination: QqDestination,
+    current: Option<(ConversationId, QqDestination)>,
+) -> bool {
+    current == Some((expected_conversation_id, expected_destination))
+}
+
+fn delivery_authorization_allows(
+    destination: QqDestination,
+    group_authorized: Option<bool>,
+) -> bool {
+    match destination {
+        QqDestination::Group(_) => group_authorized == Some(true),
+        QqDestination::Private(_) => true,
     }
 }
 
@@ -440,8 +854,11 @@ pub(crate) async fn send_reach_out(
 
 #[cfg(test)]
 mod tests {
-    use super::{QqDestination, parse_qq_destination, single_positive_qq_id};
-    use yunxi_core::ConversationKind;
+    use super::{
+        QqDestination, delivery_authorization_allows, delivery_route_is_unchanged,
+        parse_qq_destination, single_positive_qq_id,
+    };
+    use yunxi_core::{ConversationId, ConversationKind};
 
     fn ids(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
@@ -490,5 +907,43 @@ mod tests {
                 "route should be rejected: {external_id}"
             );
         }
+    }
+
+    #[test]
+    fn precommit_route_revalidation_rejects_deletion_or_retargeting() {
+        let conversation_id = ConversationId::new();
+        let expected = QqDestination::Group(123);
+        assert!(delivery_route_is_unchanged(
+            conversation_id,
+            expected,
+            Some((conversation_id, expected))
+        ));
+        assert!(!delivery_route_is_unchanged(
+            conversation_id,
+            expected,
+            None,
+        ));
+        assert!(!delivery_route_is_unchanged(
+            conversation_id,
+            expected,
+            Some((conversation_id, QqDestination::Group(456)))
+        ));
+        assert!(!delivery_route_is_unchanged(
+            conversation_id,
+            expected,
+            Some((ConversationId::new(), expected))
+        ));
+    }
+
+    #[test]
+    fn precommit_authorization_rejects_a_revoked_group() {
+        let group = QqDestination::Group(123);
+        assert!(delivery_authorization_allows(group, Some(true)));
+        assert!(!delivery_authorization_allows(group, Some(false)));
+        assert!(!delivery_authorization_allows(group, None));
+        assert!(delivery_authorization_allows(
+            QqDestination::Private(456),
+            None
+        ));
     }
 }

@@ -1,7 +1,8 @@
 use crate::goal::{Goal, GoalDraft, GoalOwner};
 use crate::identity::GoalId;
 use crate::identity::{
-    ConversationId, ConversationKind, ExternalConversation, ExternalIdentity, OpenLoopId, PersonId,
+    ConversationId, ConversationKind, ConversationMember, ExternalConversation, ExternalIdentity,
+    OpenLoopId, PersonId,
 };
 use crate::open_loop::{OpenLoop, OpenLoopDraft, OpenLoopOwner};
 use crate::planner::{AffectState, ModelBackend, RelationState};
@@ -150,6 +151,7 @@ fn unavailable_goal_store<'a, T>() -> GoalStoreFuture<'a, T> {
 pub struct CoreServices {
     pub memory: Arc<dyn MemoryStore>,
     pub identity: Arc<dyn IdentityStore>,
+    pub conversation_members: Arc<dyn ConversationMemberStore>,
     pub open_loops: Arc<dyn OpenLoopStore>,
     pub relations: Arc<dyn RelationStore>,
     pub affect: Arc<dyn AffectStore>,
@@ -163,6 +165,7 @@ impl std::fmt::Debug for CoreServices {
             .debug_struct("CoreServices")
             .field("memory", &true)
             .field("identity", &true)
+            .field("conversation_members", &true)
             .field("open_loops", &true)
             .field("relations", &true)
             .field("affect", &true)
@@ -177,6 +180,7 @@ impl CoreServices {
         Self {
             memory: Arc::new(UnavailableMemoryStore),
             identity: Arc::new(UnavailableIdentityStore),
+            conversation_members: Arc::new(UnavailableConversationMemberStore),
             open_loops: Arc::new(UnavailableOpenLoopStore),
             relations: Arc::new(UnavailableRelationStore),
             affect: Arc::new(UnavailableAffectStore),
@@ -202,6 +206,15 @@ impl CoreServices {
     #[must_use]
     pub fn with_identity(mut self, identity: Arc<dyn IdentityStore>) -> Self {
         self.identity = identity;
+        self
+    }
+
+    #[must_use]
+    pub fn with_conversation_members(
+        mut self,
+        conversation_members: Arc<dyn ConversationMemberStore>,
+    ) -> Self {
+        self.conversation_members = conversation_members;
         self
     }
 
@@ -263,6 +276,56 @@ pub enum IdentityStoreError {
 }
 
 impl IdentityStoreError {
+    pub fn storage(source: impl StdError + Send + Sync + 'static) -> Self {
+        Self::Storage {
+            source: Box::new(source),
+        }
+    }
+}
+
+pub type ConversationMemberStoreFuture<'a, T> =
+    Pin<Box<dyn Future<Output = Result<T, ConversationMemberStoreError>> + Send + 'a>>;
+
+/// Persistence boundary for lazily discovered conversation membership.
+pub trait ConversationMemberStore: Send + Sync {
+    fn upsert<'a>(
+        &'a self,
+        member: &'a ConversationMember,
+    ) -> ConversationMemberStoreFuture<'a, ConversationMember>;
+
+    fn get(
+        &self,
+        conversation_id: ConversationId,
+        person_id: PersonId,
+    ) -> ConversationMemberStoreFuture<'_, Option<ConversationMember>>;
+
+    fn list(
+        &self,
+        conversation_id: ConversationId,
+        limit: usize,
+    ) -> ConversationMemberStoreFuture<'_, Vec<ConversationMember>>;
+
+    fn remove(
+        &self,
+        conversation_id: ConversationId,
+        person_id: PersonId,
+    ) -> ConversationMemberStoreFuture<'_, bool>;
+}
+
+#[derive(Debug, Error)]
+pub enum ConversationMemberStoreError {
+    #[error("conversation-member storage operation failed")]
+    Storage {
+        #[source]
+        source: Box<dyn StdError + Send + Sync>,
+    },
+    #[error("conversation-member store is unavailable")]
+    Unavailable,
+    #[error("invalid conversation-member operation: {reason}")]
+    InvalidRequest { reason: String },
+}
+
+impl ConversationMemberStoreError {
     pub fn storage(source: impl StdError + Send + Sync + 'static) -> Self {
         Self::Storage {
             source: Box::new(source),
@@ -449,6 +512,42 @@ impl IdentityStore for UnavailableIdentityStore {
 }
 
 #[derive(Debug)]
+struct UnavailableConversationMemberStore;
+
+impl ConversationMemberStore for UnavailableConversationMemberStore {
+    fn upsert<'a>(
+        &'a self,
+        _member: &'a ConversationMember,
+    ) -> ConversationMemberStoreFuture<'a, ConversationMember> {
+        Box::pin(async { Err(ConversationMemberStoreError::Unavailable) })
+    }
+
+    fn get(
+        &self,
+        _conversation_id: ConversationId,
+        _person_id: PersonId,
+    ) -> ConversationMemberStoreFuture<'_, Option<ConversationMember>> {
+        Box::pin(async { Err(ConversationMemberStoreError::Unavailable) })
+    }
+
+    fn list(
+        &self,
+        _conversation_id: ConversationId,
+        _limit: usize,
+    ) -> ConversationMemberStoreFuture<'_, Vec<ConversationMember>> {
+        Box::pin(async { Err(ConversationMemberStoreError::Unavailable) })
+    }
+
+    fn remove(
+        &self,
+        _conversation_id: ConversationId,
+        _person_id: PersonId,
+    ) -> ConversationMemberStoreFuture<'_, bool> {
+        Box::pin(async { Err(ConversationMemberStoreError::Unavailable) })
+    }
+}
+
+#[derive(Debug)]
 struct UnavailableOpenLoopStore;
 
 impl OpenLoopStore for UnavailableOpenLoopStore {
@@ -602,13 +701,14 @@ impl Clock for SystemClock {
 #[cfg(test)]
 mod tests {
     use super::{
-        GoalStore, GoalStoreError, IdentityStore, IdentityStoreError, IdentityStoreFuture,
-        MemoryStore, MemoryStoreError, MemoryStoreFuture,
+        ConversationMemberStore, ConversationMemberStoreFuture, GoalStore, GoalStoreError,
+        IdentityStore, IdentityStoreError, IdentityStoreFuture, MemoryStore, MemoryStoreError,
+        MemoryStoreFuture,
     };
     use crate::{
-        ConversationId, ConversationKind, ExternalConversation, ExternalIdentity, GoalDraft,
-        GoalId, GoalKind, GoalOwner, Memory, MemoryDraft, MemoryId, MemoryQuery, MemoryScope,
-        PersonId, PlatformId,
+        ConversationId, ConversationKind, ConversationMember, ExternalConversation,
+        ExternalIdentity, GoalDraft, GoalId, GoalKind, GoalOwner, Memory, MemoryDraft, MemoryId,
+        MemoryQuery, MemoryScope, PersonId, PlatformId,
     };
     use chrono::Utc;
     use std::sync::Arc;
@@ -668,6 +768,71 @@ mod tests {
                 .await
                 .expect("conversation should resolve"),
             expected_conversation
+        );
+    }
+
+    struct FakeConversationMemberStore;
+
+    impl ConversationMemberStore for FakeConversationMemberStore {
+        fn upsert<'a>(
+            &'a self,
+            member: &'a ConversationMember,
+        ) -> ConversationMemberStoreFuture<'a, ConversationMember> {
+            Box::pin(async move { Ok(member.clone()) })
+        }
+
+        fn get(
+            &self,
+            conversation_id: ConversationId,
+            person_id: PersonId,
+        ) -> ConversationMemberStoreFuture<'_, Option<ConversationMember>> {
+            Box::pin(async move { Ok(Some(ConversationMember::new(conversation_id, person_id))) })
+        }
+
+        fn list(
+            &self,
+            _conversation_id: ConversationId,
+            _limit: usize,
+        ) -> ConversationMemberStoreFuture<'_, Vec<ConversationMember>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn remove(
+            &self,
+            _conversation_id: ConversationId,
+            _person_id: PersonId,
+        ) -> ConversationMemberStoreFuture<'_, bool> {
+            Box::pin(async { Ok(true) })
+        }
+    }
+
+    #[tokio::test]
+    async fn conversation_member_store_is_usable_as_a_trait_object() {
+        let conversation_id = ConversationId::new();
+        let person_id = PersonId::new();
+        let member = ConversationMember::new(conversation_id, person_id);
+        let store: Arc<dyn ConversationMemberStore> = Arc::new(FakeConversationMemberStore);
+
+        assert_eq!(store.upsert(&member).await.expect("upsert member"), member);
+        assert_eq!(
+            store
+                .get(conversation_id, person_id)
+                .await
+                .expect("get member"),
+            Some(member)
+        );
+        assert!(
+            store
+                .list(conversation_id, 16)
+                .await
+                .expect("list")
+                .is_empty()
+        );
+        assert!(
+            store
+                .remove(conversation_id, person_id)
+                .await
+                .expect("remove")
         );
     }
 

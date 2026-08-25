@@ -1,13 +1,19 @@
 use super::owner_lock::{self, DurableOwner};
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use sqlx_core::query::query;
 use sqlx_core::query_scalar::query_scalar;
 use sqlx_core::row::Row;
 use sqlx_postgres::{PgPool, Postgres};
+use std::collections::HashSet;
 use std::str::FromStr;
 use uuid::Uuid;
 use yunxi_core::{
-    ConversationId, ConversationKind, ExternalConversation, ExternalIdentity, IdentityStore,
-    IdentityStoreError, IdentityStoreFuture, MessageId, PersonId,
+    AffectState, ConversationId, ConversationKind, ConversationMember, ConversationMemberStore,
+    ConversationMemberStoreError, ConversationMemberStoreFuture, ExternalConversation,
+    ExternalIdentity, Goal, GoalKind, GoalOwner, GoalState, IdentityStore, IdentityStoreError,
+    IdentityStoreFuture, Memory, MemoryDraft, MemoryId, MemoryKind, MemoryScope, MessageId,
+    OpenLoop, OpenLoopKind, OpenLoopOwner, OpenLoopStatus, PersonId, PlatformId, RelationState,
 };
 
 #[derive(Debug, Clone)]
@@ -41,6 +47,35 @@ pub(crate) struct QqPersonDomainTargets {
 
 const MAX_QQ_PERSON_ALIASES: usize = 256;
 const MAX_QQ_PERSON_DIRECT_CONVERSATIONS: usize = 256;
+const PORTABLE_PERSON_EXPORT_VERSION: u16 = 1;
+const MAX_PORTABLE_EXTERNAL_IDENTITIES: usize = 256;
+const MAX_PORTABLE_MEMORIES: usize = 512;
+const MAX_PORTABLE_OPEN_LOOPS: usize = 512;
+const MAX_PORTABLE_GOALS: usize = 512;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) struct PortableExternalIdentity {
+    pub(crate) platform: String,
+    pub(crate) external_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) struct PortablePersonExport {
+    pub(crate) version: u16,
+    pub(crate) person_id: PersonId,
+    #[serde(default)]
+    pub(crate) external_identities: Vec<PortableExternalIdentity>,
+    #[serde(default)]
+    pub(crate) memories: Vec<Memory>,
+    #[serde(default)]
+    pub(crate) relation: Option<RelationState>,
+    #[serde(default)]
+    pub(crate) affect: Option<AffectState>,
+    #[serde(default)]
+    pub(crate) open_loops: Vec<OpenLoop>,
+    #[serde(default)]
+    pub(crate) goals: Vec<Goal>,
+}
 
 impl PersonDomainDeletion {
     #[must_use]
@@ -61,6 +96,380 @@ impl PersonDomainDeletion {
 impl PostgresIdentityStore {
     pub(crate) const fn new(pool: PgPool) -> Self {
         Self { pool }
+    }
+
+    /// Remove only one external identity mapping. Canonical Person data is
+    /// deliberately retained so unlinking a platform does not erase memory or
+    /// relations; full deletion uses `delete_person_domain_data` instead.
+    pub(crate) async fn unlink_external_identity(
+        &self,
+        external: &ExternalIdentity,
+    ) -> Result<bool, IdentityStoreError> {
+        query(
+            "DELETE FROM yunxi_external_identities
+             WHERE platform = $1 AND external_id = $2",
+        )
+        .bind(external.platform().as_str())
+        .bind(external.external_id())
+        .execute(&self.pool)
+        .await
+        .map(|result| result.rows_affected() != 0)
+        .map_err(IdentityStoreError::storage)
+    }
+
+    pub(crate) async fn export_person(
+        &self,
+        person_id: PersonId,
+    ) -> Result<PortablePersonExport, IdentityStoreError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(IdentityStoreError::storage)?;
+        query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            .execute(&mut *transaction)
+            .await
+            .map_err(IdentityStoreError::storage)?;
+        let person_exists = query_scalar::<Postgres, bool>(
+            "SELECT EXISTS (SELECT 1 FROM yunxi_persons WHERE id = $1)",
+        )
+        .bind(person_id.into_uuid())
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(IdentityStoreError::storage)?;
+        if !person_exists {
+            return Err(portable_error("cannot export a missing Yunxi person"));
+        }
+
+        let identities = query(
+            "SELECT platform, external_id FROM yunxi_external_identities
+             WHERE person_id = $1 ORDER BY platform, external_id LIMIT $2",
+        )
+        .bind(person_id.into_uuid())
+        .bind(portable_probe_limit(MAX_PORTABLE_EXTERNAL_IDENTITIES))
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(IdentityStoreError::storage)?
+        .into_iter()
+        .map(|row| {
+            Ok(PortableExternalIdentity {
+                platform: row
+                    .try_get("platform")
+                    .map_err(IdentityStoreError::storage)?,
+                external_id: row
+                    .try_get("external_id")
+                    .map_err(IdentityStoreError::storage)?,
+            })
+        })
+        .collect::<Result<Vec<_>, IdentityStoreError>>()?;
+        ensure_portable_bound(
+            "external identities",
+            identities.len(),
+            MAX_PORTABLE_EXTERNAL_IDENTITIES,
+        )?;
+        let rows = query(
+            "SELECT id, scope_kind, scope_id, kind, content, importance, tags,
+                    occurred_at, created_at
+             FROM yunxi_memories WHERE scope_kind = 'person' AND scope_id = $1
+             ORDER BY occurred_at, id LIMIT $2",
+        )
+        .bind(person_id.into_uuid())
+        .bind(portable_probe_limit(MAX_PORTABLE_MEMORIES))
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(IdentityStoreError::storage)?;
+        let memories = rows
+            .into_iter()
+            .map(|row| row_to_portable_memory(&row))
+            .collect::<Result<Vec<_>, IdentityStoreError>>()?;
+        ensure_portable_bound("memories", memories.len(), MAX_PORTABLE_MEMORIES)?;
+        if memories
+            .iter()
+            .any(|memory| memory.scope() != MemoryScope::Person(person_id))
+        {
+            return Err(portable_error(
+                "stored portable memory scope does not match exported person",
+            ));
+        }
+        let relation = query(
+            "SELECT familiarity, affinity, trust, comfort, tension
+             FROM yunxi_relations WHERE person_id = $1",
+        )
+        .bind(person_id.into_uuid())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(IdentityStoreError::storage)?
+        .map(|row| row_to_portable_relation(&row, person_id))
+        .transpose()?;
+        let affect = query(
+            "SELECT valence, arousal, social_energy, curiosity
+             FROM yunxi_affect_states WHERE person_id = $1",
+        )
+        .bind(person_id.into_uuid())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(IdentityStoreError::storage)?
+        .map(|row| row_to_portable_affect(&row))
+        .transpose()?;
+        let open_loops = query(
+            "SELECT * FROM yunxi_open_loops
+             WHERE owner_kind = 'person' AND owner_id = $1
+             ORDER BY created_at, id LIMIT $2",
+        )
+        .bind(person_id.into_uuid())
+        .bind(portable_probe_limit(MAX_PORTABLE_OPEN_LOOPS))
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(IdentityStoreError::storage)?
+        .into_iter()
+        .map(|row| row_to_portable_open_loop(&row))
+        .collect::<Result<Vec<_>, IdentityStoreError>>()?;
+        ensure_portable_bound("open loops", open_loops.len(), MAX_PORTABLE_OPEN_LOOPS)?;
+        if open_loops
+            .iter()
+            .any(|item| item.owner() != OpenLoopOwner::Person(person_id))
+        {
+            return Err(portable_error(
+                "stored open-loop owner does not match exported person",
+            ));
+        }
+        let goals = query(
+            "SELECT * FROM yunxi_goals
+             WHERE owner_kind = 'person' AND owner_id = $1
+             ORDER BY created_at, id LIMIT $2",
+        )
+        .bind(person_id.into_uuid())
+        .bind(portable_probe_limit(MAX_PORTABLE_GOALS))
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(IdentityStoreError::storage)?
+        .into_iter()
+        .map(|row| row_to_portable_goal(&row))
+        .collect::<Result<Vec<_>, IdentityStoreError>>()?;
+        ensure_portable_bound("goals", goals.len(), MAX_PORTABLE_GOALS)?;
+        if goals
+            .iter()
+            .any(|goal| goal.owner() != GoalOwner::Person(person_id))
+        {
+            return Err(portable_error(
+                "stored goal owner does not match exported person",
+            ));
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(IdentityStoreError::storage)?;
+        Ok(PortablePersonExport {
+            version: PORTABLE_PERSON_EXPORT_VERSION,
+            person_id,
+            external_identities: identities,
+            memories,
+            relation,
+            affect,
+            open_loops,
+            goals,
+        })
+    }
+
+    pub(crate) async fn import_person(
+        &self,
+        export: &PortablePersonExport,
+    ) -> Result<PersonId, IdentityStoreError> {
+        validate_portable_export(export)?;
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(IdentityStoreError::storage)?;
+        query("INSERT INTO yunxi_persons (id) VALUES ($1) ON CONFLICT (id) DO NOTHING")
+            .bind(export.person_id.into_uuid())
+            .execute(&mut *transaction)
+            .await
+            .map_err(IdentityStoreError::storage)?;
+        let locked_person =
+            query_scalar::<Postgres, Uuid>("SELECT id FROM yunxi_persons WHERE id = $1 FOR UPDATE")
+                .bind(export.person_id.into_uuid())
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(IdentityStoreError::storage)?;
+        if locked_person != Some(export.person_id.into_uuid()) {
+            return Err(portable_error(
+                "portable person disappeared while import was starting",
+            ));
+        }
+        for external in &export.external_identities {
+            let platform = PlatformId::new(external.platform.clone())
+                .map_err(|error| IdentityStoreError::storage(std::io::Error::other(error)))?;
+            let identity = ExternalIdentity::new(platform, external.external_id.clone())
+                .map_err(|error| IdentityStoreError::storage(std::io::Error::other(error)))?;
+            let mapped_person = query_scalar::<Postgres, Uuid>(
+                "INSERT INTO yunxi_external_identities AS stored
+                    (platform, external_id, person_id)
+                 VALUES ($1, $2, $3)
+                 ON CONFLICT (platform, external_id) DO UPDATE
+                    SET person_id = stored.person_id
+                 RETURNING person_id",
+            )
+            .bind(identity.platform().as_str())
+            .bind(identity.external_id())
+            .bind(export.person_id.into_uuid())
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(IdentityStoreError::storage)?;
+            if mapped_person != export.person_id.into_uuid() {
+                return Err(portable_error(format!(
+                    "external identity {}/{} already belongs to another person",
+                    identity.platform(),
+                    identity.external_id()
+                )));
+            }
+        }
+        for memory in &export.memories {
+            let stored = query(
+                "INSERT INTO yunxi_memories AS current_memory
+                    (id, scope_kind, scope_id, kind, content, importance, tags, occurred_at, created_at)
+                 VALUES ($1, 'person', $2, $3, $4, $5, $6, $7, $8)
+                 ON CONFLICT (id) DO UPDATE SET id = current_memory.id
+                 RETURNING *, (xmax = 0) AS portable_was_inserted",
+            )
+            .bind(memory.id().into_uuid())
+            .bind(export.person_id.into_uuid())
+            .bind(memory.kind().as_str())
+            .bind(memory.content())
+            .bind(i16::from(memory.importance()))
+            .bind(serde_json::to_value(memory.tags()).map_err(IdentityStoreError::storage)?)
+            .bind(memory.occurred_at())
+            .bind(memory.created_at())
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(IdentityStoreError::storage)?;
+            let was_inserted = stored
+                .try_get::<bool, _>("portable_was_inserted")
+                .map_err(IdentityStoreError::storage)?;
+            if !was_inserted && row_to_portable_memory(&stored)? != *memory {
+                return Err(portable_error(format!(
+                    "memory ID {} conflicts with an existing memory",
+                    memory.id()
+                )));
+            }
+        }
+        for item in &export.open_loops {
+            let stored = query(
+                "INSERT INTO yunxi_open_loops AS current_item
+                    (id, owner_kind, owner_id, kind, summary, source_message_id, due_at,
+                     expires_at, salience, status, dedupe_key, created_at, updated_at,
+                     resolved_at, triggered_at, version)
+                 VALUES ($1, 'person', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                         $13, $14, $15)
+                 ON CONFLICT (id) DO UPDATE SET id = current_item.id
+                 RETURNING *, (xmax = 0) AS portable_was_inserted",
+            )
+            .bind(item.id().into_uuid())
+            .bind(export.person_id.into_uuid())
+            .bind(item.kind().as_str())
+            .bind(item.summary())
+            .bind(item.source_message_id().map(MessageId::into_uuid))
+            .bind(item.due_at())
+            .bind(item.expires_at())
+            .bind(i16::from(item.salience()))
+            .bind(item.status().as_str())
+            .bind(item.dedupe_key())
+            .bind(item.created_at())
+            .bind(item.updated_at())
+            .bind(item.resolved_at())
+            .bind(item.triggered_at())
+            .bind(i64::try_from(item.version()).map_err(|_| {
+                portable_error("portable open-loop version exceeds PostgreSQL BIGINT")
+            })?)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(IdentityStoreError::storage)?;
+            let was_inserted = stored
+                .try_get::<bool, _>("portable_was_inserted")
+                .map_err(IdentityStoreError::storage)?;
+            if !was_inserted && row_to_portable_open_loop(&stored)? != *item {
+                return Err(portable_error(format!(
+                    "open-loop ID {} conflicts with an existing item",
+                    item.id()
+                )));
+            }
+        }
+        for goal in &export.goals {
+            let stored = query(
+                "INSERT INTO yunxi_goals AS current_goal
+                    (id, owner_kind, owner_id, kind, title, details, state, due_at,
+                     created_at, updated_at, completed_at)
+                 VALUES ($1, 'person', $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                 ON CONFLICT (id) DO UPDATE SET id = current_goal.id
+                 RETURNING *, (xmax = 0) AS portable_was_inserted",
+            )
+            .bind(goal.id().into_uuid())
+            .bind(export.person_id.into_uuid())
+            .bind(portable_goal_kind_name(goal.kind()))
+            .bind(goal.title())
+            .bind(goal.details())
+            .bind(portable_goal_state_name(goal.state()))
+            .bind(goal.due_at())
+            .bind(goal.created_at())
+            .bind(goal.updated_at())
+            .bind(goal.completed_at())
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(IdentityStoreError::storage)?;
+            let was_inserted = stored
+                .try_get::<bool, _>("portable_was_inserted")
+                .map_err(IdentityStoreError::storage)?;
+            if !was_inserted && row_to_portable_goal(&stored)? != *goal {
+                return Err(portable_error(format!(
+                    "goal ID {} conflicts with an existing goal",
+                    goal.id()
+                )));
+            }
+        }
+        if let Some(relation) = export.relation {
+            query(
+                "INSERT INTO yunxi_relations
+                    (person_id, familiarity, affinity, trust, comfort, tension)
+                 VALUES ($1, $2, $3, $4, $5, $6)
+                 ON CONFLICT (person_id) DO UPDATE SET
+                    familiarity = EXCLUDED.familiarity, affinity = EXCLUDED.affinity,
+                    trust = EXCLUDED.trust, comfort = EXCLUDED.comfort,
+                    tension = EXCLUDED.tension, updated_at = NOW()",
+            )
+            .bind(export.person_id.into_uuid())
+            .bind(f64::from(relation.familiarity))
+            .bind(f64::from(relation.affinity))
+            .bind(f64::from(relation.trust))
+            .bind(f64::from(relation.comfort))
+            .bind(f64::from(relation.tension))
+            .execute(&mut *transaction)
+            .await
+            .map_err(IdentityStoreError::storage)?;
+        }
+        if let Some(affect) = export.affect {
+            query(
+                "INSERT INTO yunxi_affect_states
+                    (person_id, valence, arousal, social_energy, curiosity)
+                 VALUES ($1, $2, $3, $4, $5)
+                 ON CONFLICT (person_id) DO UPDATE SET
+                    valence = EXCLUDED.valence, arousal = EXCLUDED.arousal,
+                    social_energy = EXCLUDED.social_energy, curiosity = EXCLUDED.curiosity,
+                    updated_at = NOW()",
+            )
+            .bind(export.person_id.into_uuid())
+            .bind(f64::from(affect.valence))
+            .bind(f64::from(affect.arousal))
+            .bind(f64::from(affect.social_energy))
+            .bind(f64::from(affect.curiosity))
+            .execute(&mut *transaction)
+            .await
+            .map_err(IdentityStoreError::storage)?;
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(IdentityStoreError::storage)?;
+        Ok(export.person_id)
     }
 
     /// Read the existing Core scopes for one QQ peer without resolving or
@@ -466,6 +875,7 @@ impl PostgresIdentityStore {
 
     pub(crate) async fn initialize_schema(&self) -> anyhow::Result<()> {
         let mut transaction = self.pool.begin().await?;
+        super::schema::lock(&mut transaction).await?;
         for statement in [
             r#"
             CREATE TABLE IF NOT EXISTS yunxi_persons (
@@ -525,8 +935,25 @@ impl PostgresIdentityStore {
             )
             "#,
             r#"
+            CREATE TABLE IF NOT EXISTS yunxi_conversation_members (
+                conversation_id UUID NOT NULL
+                    REFERENCES yunxi_conversations(id) ON DELETE CASCADE,
+                person_id UUID NOT NULL
+                    REFERENCES yunxi_persons(id) ON DELETE CASCADE,
+                role TEXT CHECK (role IS NULL OR (octet_length(role) BETWEEN 1 AND 256
+                    AND char_length(role) BETWEEN 1 AND 128 AND btrim(role) <> '')),
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (conversation_id, person_id)
+            )
+            "#,
+            r#"
             CREATE INDEX IF NOT EXISTS yunxi_message_mappings_conversation_idx
                 ON yunxi_message_mappings (conversation_id, platform, external_message_id)
+            "#,
+            r#"
+            CREATE INDEX IF NOT EXISTS yunxi_conversation_members_person_idx
+                ON yunxi_conversation_members (person_id, conversation_id)
             "#,
         ] {
             query(statement).execute(&mut *transaction).await?;
@@ -960,6 +1387,546 @@ impl IdentityStore for PostgresIdentityStore {
     }
 }
 
+impl ConversationMemberStore for PostgresIdentityStore {
+    fn upsert<'a>(
+        &'a self,
+        member: &'a ConversationMember,
+    ) -> ConversationMemberStoreFuture<'a, ConversationMember> {
+        Box::pin(async move {
+            member
+                .validate()
+                .map_err(|error| ConversationMemberStoreError::InvalidRequest {
+                    reason: error.to_string(),
+                })?;
+            query(
+                "INSERT INTO yunxi_conversation_members
+                    (conversation_id, person_id, role)
+                 VALUES ($1, $2, $3)
+                 ON CONFLICT (conversation_id, person_id) DO UPDATE SET
+                    role = EXCLUDED.role, updated_at = NOW()",
+            )
+            .bind(member.conversation_id().into_uuid())
+            .bind(member.person_id().into_uuid())
+            .bind(member.role())
+            .execute(&self.pool)
+            .await
+            .map_err(ConversationMemberStoreError::storage)?;
+            Ok(member.clone())
+        })
+    }
+
+    fn get(
+        &self,
+        conversation_id: ConversationId,
+        person_id: PersonId,
+    ) -> ConversationMemberStoreFuture<'_, Option<ConversationMember>> {
+        Box::pin(async move {
+            let row = query(
+                "SELECT role FROM yunxi_conversation_members
+                 WHERE conversation_id = $1 AND person_id = $2",
+            )
+            .bind(conversation_id.into_uuid())
+            .bind(person_id.into_uuid())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(ConversationMemberStoreError::storage)?;
+            let Some(row) = row else {
+                return Ok(None);
+            };
+            let role = row
+                .try_get::<Option<String>, _>("role")
+                .map_err(ConversationMemberStoreError::storage)?;
+            let member = ConversationMember::new(conversation_id, person_id)
+                .with_role(role)
+                .map_err(|error| ConversationMemberStoreError::InvalidRequest {
+                    reason: error.to_string(),
+                })?;
+            Ok(Some(member))
+        })
+    }
+
+    fn list(
+        &self,
+        conversation_id: ConversationId,
+        limit: usize,
+    ) -> ConversationMemberStoreFuture<'_, Vec<ConversationMember>> {
+        Box::pin(async move {
+            let limit = limit.min(256);
+            if limit == 0 {
+                return Ok(Vec::new());
+            }
+            let rows = query(
+                "SELECT person_id, role FROM yunxi_conversation_members
+                 WHERE conversation_id = $1 ORDER BY updated_at DESC, person_id LIMIT $2",
+            )
+            .bind(conversation_id.into_uuid())
+            .bind(i64::try_from(limit).unwrap_or(256))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(ConversationMemberStoreError::storage)?;
+            rows.into_iter()
+                .map(|row| {
+                    let person_id = row
+                        .try_get::<Uuid, _>("person_id")
+                        .map_err(ConversationMemberStoreError::storage)?;
+                    let role = row
+                        .try_get::<Option<String>, _>("role")
+                        .map_err(ConversationMemberStoreError::storage)?;
+                    ConversationMember::new(conversation_id, PersonId::from_uuid(person_id))
+                        .with_role(role)
+                        .map_err(|error| ConversationMemberStoreError::InvalidRequest {
+                            reason: error.to_string(),
+                        })
+                })
+                .collect()
+        })
+    }
+
+    fn remove(
+        &self,
+        conversation_id: ConversationId,
+        person_id: PersonId,
+    ) -> ConversationMemberStoreFuture<'_, bool> {
+        Box::pin(async move {
+            let result = query(
+                "DELETE FROM yunxi_conversation_members
+                 WHERE conversation_id = $1 AND person_id = $2",
+            )
+            .bind(conversation_id.into_uuid())
+            .bind(person_id.into_uuid())
+            .execute(&self.pool)
+            .await
+            .map_err(ConversationMemberStoreError::storage)?;
+            Ok(result.rows_affected() != 0)
+        })
+    }
+}
+
+fn portable_error(message: impl Into<String>) -> IdentityStoreError {
+    IdentityStoreError::storage(std::io::Error::other(message.into()))
+}
+
+fn portable_probe_limit(maximum: usize) -> i64 {
+    i64::try_from(maximum.saturating_add(1)).unwrap_or(i64::MAX)
+}
+
+fn ensure_portable_bound(
+    field: &str,
+    actual: usize,
+    maximum: usize,
+) -> Result<(), IdentityStoreError> {
+    if actual > maximum {
+        return Err(portable_error(format!(
+            "portable person has {actual} {field}, above maximum {maximum}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_portable_export(export: &PortablePersonExport) -> Result<(), IdentityStoreError> {
+    if export.version != PORTABLE_PERSON_EXPORT_VERSION {
+        return Err(portable_error(format!(
+            "unsupported Yunxi person export version {}",
+            export.version
+        )));
+    }
+    ensure_portable_bound(
+        "external identities",
+        export.external_identities.len(),
+        MAX_PORTABLE_EXTERNAL_IDENTITIES,
+    )?;
+    ensure_portable_bound("memories", export.memories.len(), MAX_PORTABLE_MEMORIES)?;
+    ensure_portable_bound(
+        "open loops",
+        export.open_loops.len(),
+        MAX_PORTABLE_OPEN_LOOPS,
+    )?;
+    ensure_portable_bound("goals", export.goals.len(), MAX_PORTABLE_GOALS)?;
+
+    let mut external_identities = HashSet::with_capacity(export.external_identities.len());
+    for external in &export.external_identities {
+        let platform = PlatformId::new(external.platform.clone())
+            .map_err(|error| portable_error(format!("invalid portable platform: {error}")))?;
+        ExternalIdentity::new(platform, external.external_id.clone())
+            .map_err(|error| portable_error(format!("invalid portable identity: {error}")))?;
+        if !external_identities.insert((&external.platform, &external.external_id)) {
+            return Err(portable_error(
+                "portable person contains a duplicate external identity",
+            ));
+        }
+    }
+
+    let mut memory_ids = HashSet::with_capacity(export.memories.len());
+    for memory in &export.memories {
+        if memory.scope() != MemoryScope::Person(export.person_id) {
+            return Err(portable_error(
+                "portable memory scope does not match exported person",
+            ));
+        }
+        let draft = MemoryDraft::new(
+            memory.scope(),
+            memory.kind(),
+            memory.content(),
+            memory.occurred_at(),
+        )
+        .and_then(|draft| draft.with_importance(memory.importance()))
+        .and_then(|draft| draft.with_tags(memory.tags().iter().cloned()))
+        .map_err(|error| portable_error(format!("portable memory is invalid: {error}")))?;
+        let validated = Memory::from_draft(memory.id(), &draft, memory.created_at())
+            .map_err(|error| portable_error(format!("portable memory is invalid: {error}")))?;
+        if validated != *memory {
+            return Err(portable_error("portable memory is not in canonical form"));
+        }
+        if !memory_ids.insert(memory.id()) {
+            return Err(portable_error(
+                "portable person contains a duplicate memory ID",
+            ));
+        }
+    }
+
+    if let Some(relation) = export.relation {
+        if relation.person_id != export.person_id {
+            return Err(portable_error(
+                "portable relation person does not match export",
+            ));
+        }
+        relation
+            .validate()
+            .map_err(|error| portable_error(format!("portable relation is invalid: {error}")))?;
+    }
+    if let Some(affect) = export.affect {
+        affect
+            .validate()
+            .map_err(|error| portable_error(format!("portable affect is invalid: {error}")))?;
+    }
+
+    let mut open_loop_ids = HashSet::with_capacity(export.open_loops.len());
+    for item in &export.open_loops {
+        if item.owner() != OpenLoopOwner::Person(export.person_id) {
+            return Err(portable_error(
+                "portable open-loop owner does not match exported person",
+            ));
+        }
+        validate_portable_open_loop(item)?;
+        if !open_loop_ids.insert(item.id()) {
+            return Err(portable_error(
+                "portable person contains a duplicate open-loop ID",
+            ));
+        }
+    }
+
+    let mut goal_ids = HashSet::with_capacity(export.goals.len());
+    for goal in &export.goals {
+        if goal.owner() != GoalOwner::Person(export.person_id) {
+            return Err(portable_error(
+                "portable goal owner does not match exported person",
+            ));
+        }
+        validate_portable_goal(goal)?;
+        if !goal_ids.insert(goal.id()) {
+            return Err(portable_error(
+                "portable person contains a duplicate goal ID",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn row_to_portable_memory(row: &sqlx_postgres::PgRow) -> Result<Memory, IdentityStoreError> {
+    let scope_kind = row
+        .try_get::<String, _>("scope_kind")
+        .map_err(IdentityStoreError::storage)?;
+    let scope_id = row
+        .try_get::<Option<Uuid>, _>("scope_id")
+        .map_err(IdentityStoreError::storage)?;
+    let scope = match (scope_kind.as_str(), scope_id) {
+        ("person", Some(id)) => MemoryScope::Person(PersonId::from_uuid(id)),
+        ("conversation", Some(id)) => MemoryScope::Conversation(ConversationId::from_uuid(id)),
+        ("global", None) => MemoryScope::Global,
+        _ => return Err(portable_error("stored memory scope is invalid")),
+    };
+    let kind = MemoryKind::from_str(
+        &row.try_get::<String, _>("kind")
+            .map_err(IdentityStoreError::storage)?,
+    )
+    .map_err(|error| portable_error(format!("stored memory kind is invalid: {error}")))?;
+    let tags = serde_json::from_value::<Vec<String>>(
+        row.try_get::<serde_json::Value, _>("tags")
+            .map_err(IdentityStoreError::storage)?,
+    )
+    .map_err(|error| portable_error(format!("stored memory tags are invalid: {error}")))?;
+    let importance = row
+        .try_get::<i16, _>("importance")
+        .map_err(IdentityStoreError::storage)?;
+    let importance = u8::try_from(importance)
+        .map_err(|_| portable_error("stored memory importance is invalid"))?;
+    let draft = MemoryDraft::new(
+        scope,
+        kind,
+        row.try_get::<String, _>("content")
+            .map_err(IdentityStoreError::storage)?,
+        row.try_get::<DateTime<Utc>, _>("occurred_at")
+            .map_err(IdentityStoreError::storage)?,
+    )
+    .and_then(|draft| draft.with_importance(importance))
+    .and_then(|draft| draft.with_tags(tags))
+    .map_err(|error| portable_error(format!("stored memory is invalid: {error}")))?;
+    Memory::from_draft(
+        MemoryId::from_uuid(
+            row.try_get::<Uuid, _>("id")
+                .map_err(IdentityStoreError::storage)?,
+        ),
+        &draft,
+        row.try_get::<DateTime<Utc>, _>("created_at")
+            .map_err(IdentityStoreError::storage)?,
+    )
+    .map_err(|error| portable_error(format!("stored memory is invalid: {error}")))
+}
+
+fn row_to_portable_relation(
+    row: &sqlx_postgres::PgRow,
+    person_id: PersonId,
+) -> Result<RelationState, IdentityStoreError> {
+    let state = RelationState {
+        person_id,
+        familiarity: row
+            .try_get::<f64, _>("familiarity")
+            .map_err(IdentityStoreError::storage)? as f32,
+        affinity: row
+            .try_get::<f64, _>("affinity")
+            .map_err(IdentityStoreError::storage)? as f32,
+        trust: row
+            .try_get::<f64, _>("trust")
+            .map_err(IdentityStoreError::storage)? as f32,
+        comfort: row
+            .try_get::<f64, _>("comfort")
+            .map_err(IdentityStoreError::storage)? as f32,
+        tension: row
+            .try_get::<f64, _>("tension")
+            .map_err(IdentityStoreError::storage)? as f32,
+    };
+    state
+        .validate()
+        .map_err(|error| portable_error(format!("stored relation is invalid: {error}")))?;
+    Ok(state)
+}
+
+fn row_to_portable_affect(row: &sqlx_postgres::PgRow) -> Result<AffectState, IdentityStoreError> {
+    let state = AffectState {
+        valence: row
+            .try_get::<f64, _>("valence")
+            .map_err(IdentityStoreError::storage)? as f32,
+        arousal: row
+            .try_get::<f64, _>("arousal")
+            .map_err(IdentityStoreError::storage)? as f32,
+        social_energy: row
+            .try_get::<f64, _>("social_energy")
+            .map_err(IdentityStoreError::storage)? as f32,
+        curiosity: row
+            .try_get::<f64, _>("curiosity")
+            .map_err(IdentityStoreError::storage)? as f32,
+    };
+    state
+        .validate()
+        .map_err(|error| portable_error(format!("stored affect is invalid: {error}")))?;
+    Ok(state)
+}
+
+fn row_to_portable_open_loop(row: &sqlx_postgres::PgRow) -> Result<OpenLoop, IdentityStoreError> {
+    let owner_kind = row
+        .try_get::<String, _>("owner_kind")
+        .map_err(IdentityStoreError::storage)?;
+    let owner_id = row
+        .try_get::<Option<Uuid>, _>("owner_id")
+        .map_err(IdentityStoreError::storage)?;
+    let owner = match (owner_kind.as_str(), owner_id) {
+        ("person", Some(id)) => OpenLoopOwner::Person(PersonId::from_uuid(id)),
+        ("conversation", Some(id)) => OpenLoopOwner::Conversation(ConversationId::from_uuid(id)),
+        ("global", None) => OpenLoopOwner::Global,
+        _ => return Err(portable_error("stored open-loop owner is invalid")),
+    };
+    let kind = OpenLoopKind::from_str(
+        &row.try_get::<String, _>("kind")
+            .map_err(IdentityStoreError::storage)?,
+    )
+    .map_err(|error| portable_error(format!("stored open-loop kind is invalid: {error}")))?;
+    let status = OpenLoopStatus::from_str(
+        &row.try_get::<String, _>("status")
+            .map_err(IdentityStoreError::storage)?,
+    )
+    .map_err(|error| portable_error(format!("stored open-loop status is invalid: {error}")))?;
+    let salience = row
+        .try_get::<i16, _>("salience")
+        .map_err(IdentityStoreError::storage)?;
+    let salience = u8::try_from(salience)
+        .map_err(|_| portable_error("stored open-loop salience is invalid"))?;
+    let version = row
+        .try_get::<i64, _>("version")
+        .map_err(IdentityStoreError::storage)?;
+    let version = u64::try_from(version)
+        .map_err(|_| portable_error("stored open-loop version is invalid"))?;
+    let item = OpenLoop::restore(
+        row.try_get::<Uuid, _>("id")
+            .map_err(IdentityStoreError::storage)?
+            .into(),
+        owner,
+        kind,
+        row.try_get::<String, _>("summary")
+            .map_err(IdentityStoreError::storage)?,
+        row.try_get::<Option<Uuid>, _>("source_message_id")
+            .map_err(IdentityStoreError::storage)?
+            .map(Into::into),
+        row.try_get::<Option<DateTime<Utc>>, _>("due_at")
+            .map_err(IdentityStoreError::storage)?,
+        row.try_get::<Option<DateTime<Utc>>, _>("expires_at")
+            .map_err(IdentityStoreError::storage)?,
+        salience,
+        status,
+        row.try_get::<DateTime<Utc>, _>("created_at")
+            .map_err(IdentityStoreError::storage)?,
+        row.try_get::<DateTime<Utc>, _>("updated_at")
+            .map_err(IdentityStoreError::storage)?,
+        row.try_get::<Option<DateTime<Utc>>, _>("resolved_at")
+            .map_err(IdentityStoreError::storage)?,
+        row.try_get::<Option<DateTime<Utc>>, _>("triggered_at")
+            .map_err(IdentityStoreError::storage)?,
+        version,
+        row.try_get::<Option<String>, _>("dedupe_key")
+            .map_err(IdentityStoreError::storage)?,
+    )
+    .map_err(|error| portable_error(format!("stored open loop is invalid: {error}")))?;
+    validate_portable_open_loop(&item)?;
+    Ok(item)
+}
+
+fn validate_portable_open_loop(item: &OpenLoop) -> Result<(), IdentityStoreError> {
+    let restored = OpenLoop::restore(
+        item.id(),
+        item.owner(),
+        item.kind(),
+        item.summary(),
+        item.source_message_id(),
+        item.due_at(),
+        item.expires_at(),
+        item.salience(),
+        item.status(),
+        item.created_at(),
+        item.updated_at(),
+        item.resolved_at(),
+        item.triggered_at(),
+        item.version(),
+        item.dedupe_key().map(str::to_owned),
+    )
+    .map_err(|error| portable_error(format!("portable open loop is invalid: {error}")))?;
+    if restored != *item
+        || item.updated_at() < item.created_at()
+        || item
+            .resolved_at()
+            .is_some_and(|at| at < item.created_at() || at > item.updated_at())
+        || item
+            .triggered_at()
+            .is_some_and(|at| at < item.created_at() || at > item.updated_at())
+        || item.version() > i64::MAX as u64
+    {
+        return Err(portable_error(
+            "portable open-loop lifecycle state is invalid",
+        ));
+    }
+    Ok(())
+}
+
+fn portable_goal_kind_name(kind: GoalKind) -> &'static str {
+    match kind {
+        GoalKind::Personal => "personal",
+        GoalKind::Conversation => "conversation",
+        GoalKind::FollowUp => "follow_up",
+        GoalKind::Project => "project",
+        GoalKind::System => "system",
+    }
+}
+
+fn parse_portable_goal_kind(value: &str) -> Result<GoalKind, IdentityStoreError> {
+    match value {
+        "personal" => Ok(GoalKind::Personal),
+        "conversation" => Ok(GoalKind::Conversation),
+        "follow_up" => Ok(GoalKind::FollowUp),
+        "project" => Ok(GoalKind::Project),
+        "system" => Ok(GoalKind::System),
+        _ => Err(portable_error("stored goal kind is invalid")),
+    }
+}
+
+fn portable_goal_state_name(state: GoalState) -> &'static str {
+    match state {
+        GoalState::Active => "active",
+        GoalState::Paused => "paused",
+        GoalState::Completed => "completed",
+        GoalState::Cancelled => "cancelled",
+    }
+}
+
+fn parse_portable_goal_state(value: &str) -> Result<GoalState, IdentityStoreError> {
+    match value {
+        "active" => Ok(GoalState::Active),
+        "paused" => Ok(GoalState::Paused),
+        "completed" => Ok(GoalState::Completed),
+        "cancelled" => Ok(GoalState::Cancelled),
+        _ => Err(portable_error("stored goal state is invalid")),
+    }
+}
+
+fn row_to_portable_goal(row: &sqlx_postgres::PgRow) -> Result<Goal, IdentityStoreError> {
+    let owner_kind = row
+        .try_get::<String, _>("owner_kind")
+        .map_err(IdentityStoreError::storage)?;
+    let owner_id = row
+        .try_get::<Option<Uuid>, _>("owner_id")
+        .map_err(IdentityStoreError::storage)?;
+    let owner = match (owner_kind.as_str(), owner_id) {
+        ("person", Some(id)) => GoalOwner::Person(PersonId::from_uuid(id)),
+        ("conversation", Some(id)) => GoalOwner::Conversation(ConversationId::from_uuid(id)),
+        ("global", None) => GoalOwner::Global,
+        _ => return Err(portable_error("stored goal owner is invalid")),
+    };
+    let kind = parse_portable_goal_kind(
+        &row.try_get::<String, _>("kind")
+            .map_err(IdentityStoreError::storage)?,
+    )?;
+    let state = parse_portable_goal_state(
+        &row.try_get::<String, _>("state")
+            .map_err(IdentityStoreError::storage)?,
+    )?;
+    let goal = serde_json::from_value::<Goal>(serde_json::json!({
+        "id": row.try_get::<Uuid, _>("id").map_err(IdentityStoreError::storage)?,
+        "owner": owner,
+        "kind": kind,
+        "title": row.try_get::<String, _>("title").map_err(IdentityStoreError::storage)?,
+        "details": row.try_get::<Option<String>, _>("details").map_err(IdentityStoreError::storage)?,
+        "state": state,
+        "due_at": row.try_get::<Option<DateTime<Utc>>, _>("due_at").map_err(IdentityStoreError::storage)?,
+        "created_at": row.try_get::<DateTime<Utc>, _>("created_at").map_err(IdentityStoreError::storage)?,
+        "updated_at": row.try_get::<DateTime<Utc>, _>("updated_at").map_err(IdentityStoreError::storage)?,
+        "completed_at": row.try_get::<Option<DateTime<Utc>>, _>("completed_at").map_err(IdentityStoreError::storage)?,
+    }))
+    .map_err(|error| portable_error(format!("stored goal is invalid: {error}")))?;
+    validate_portable_goal(&goal)?;
+    Ok(goal)
+}
+
+fn validate_portable_goal(goal: &Goal) -> Result<(), IdentityStoreError> {
+    goal.validate()
+        .map_err(|error| portable_error(format!("portable goal is invalid: {error}")))?;
+    if goal.updated_at() < goal.created_at()
+        || (goal.state() == GoalState::Completed) != goal.completed_at().is_some()
+        || goal
+            .completed_at()
+            .is_some_and(|at| at < goal.created_at() || at > goal.updated_at())
+    {
+        return Err(portable_error("portable goal lifecycle state is invalid"));
+    }
+    Ok(())
+}
+
 fn parse_stored_kind(value: &str) -> Result<ConversationKind, IdentityStoreError> {
     ConversationKind::from_str(value).map_err(IdentityStoreError::storage)
 }
@@ -1012,7 +1979,7 @@ fn is_qq_direct_for_identity(
 
 #[cfg(test)]
 mod tests {
-    use super::PostgresIdentityStore;
+    use super::{PortableExternalIdentity, PortablePersonExport, PostgresIdentityStore};
     use crate::memory::MemoryManager;
     use crate::yunxi::affect_store::PostgresAffectStore;
     use crate::yunxi::goal_store::PostgresGoalStore;
@@ -1020,18 +1987,70 @@ mod tests {
     use crate::yunxi::open_loop_store::PostgresOpenLoopStore;
     use crate::yunxi::qq;
     use crate::yunxi::relation_store::PostgresRelationStore;
+    use chrono::Utc;
     use sqlx_core::error::DatabaseError;
     use sqlx_core::query::query;
     use sqlx_core::query_scalar::query_scalar;
-    use sqlx_postgres::{PgPoolOptions, Postgres};
+    use sqlx_core::row::Row;
+    use sqlx_postgres::{PgPool, PgPoolOptions, Postgres};
     use std::sync::Arc;
     use uuid::Uuid;
     use yunxi_core::{
         ConversationKind, ExternalConversation, ExternalIdentity, GoalDraft, GoalKind, GoalOwner,
         GoalStore, GoalStoreError, IdentityStoreError, MemoryDraft, MemoryKind, MemoryScope,
         MemoryStore, MemoryStoreError, OpenLoopDraft, OpenLoopKind, OpenLoopOwner, OpenLoopStore,
-        OpenLoopStoreError, PlatformId,
+        OpenLoopStoreError, PersonId, PlatformId,
     };
+
+    async fn initialize_portable_schema(pool: &PgPool) -> PostgresIdentityStore {
+        let identities = PostgresIdentityStore::new(pool.clone());
+        identities
+            .initialize_schema()
+            .await
+            .expect("应初始化 identity schema");
+        PostgresMemoryStore::new(
+            Arc::clone(&crate::memory::MEMORY_MANAGER),
+            Arc::new(identities.clone()),
+            pool.clone(),
+        )
+        .initialize_schema()
+        .await
+        .expect("应初始化 memory schema");
+        PostgresRelationStore::new(pool.clone())
+            .initialize_schema()
+            .await
+            .expect("应初始化 relation schema");
+        PostgresAffectStore::new(pool.clone())
+            .initialize_schema()
+            .await
+            .expect("应初始化 affect schema");
+        PostgresOpenLoopStore::new(pool.clone())
+            .initialize_schema()
+            .await
+            .expect("应初始化 open-loop schema");
+        PostgresGoalStore::new(pool.clone())
+            .initialize_schema()
+            .await
+            .expect("应初始化 goal schema");
+        identities
+    }
+
+    #[test]
+    fn portable_person_old_json_defaults_new_state_domains() {
+        let person_id = PersonId::new();
+        let export: PortablePersonExport = serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "person_id": person_id,
+        }))
+        .expect("旧快照缺少新增字段时应使用空状态");
+
+        assert!(export.external_identities.is_empty());
+        assert!(export.memories.is_empty());
+        assert!(export.relation.is_none());
+        assert!(export.affect.is_none());
+        assert!(export.open_loops.is_empty());
+        assert!(export.goals.is_empty());
+    }
 
     #[test]
     #[ignore = "requires PostgreSQL via DATABASE_URL"]
@@ -1052,12 +2071,6 @@ mod tests {
                     .await
                     .expect("重复初始化应安全");
 
-                let person_count_before = query_scalar::<Postgres, i64>(
-                    "SELECT COUNT(*) FROM yunxi_persons",
-                )
-                .fetch_one(&pool)
-                .await
-                .expect("应读取 person 数量");
                 let platform = PlatformId::new("phase1test").expect("valid platform");
                 let suffix = Uuid::new_v4().to_string();
                 let identity = ExternalIdentity::new(
@@ -1082,13 +2095,20 @@ mod tests {
                     );
                 }
                 assert!(winners.iter().all(|winner| *winner == winners[0]));
+                // Only inspect this test's identity mapping. A global person count
+                // is inherently racy when PostgreSQL ignored tests run in parallel.
                 assert_eq!(
-                    query_scalar::<Postgres, i64>("SELECT COUNT(*) FROM yunxi_persons")
-                        .fetch_one(&pool)
-                        .await
-                        .expect("应读取 person 数量"),
-                    person_count_before + 1,
-                    "并发输掉的候选 person 必须删除"
+                    query_scalar::<Postgres, i64>(
+                        "SELECT COUNT(*) FROM yunxi_external_identities
+                         WHERE platform = $1 AND external_id = $2",
+                    )
+                    .bind(platform.as_str())
+                    .bind(identity.external_id())
+                    .fetch_one(&pool)
+                    .await
+                    .expect("应读取 identity mapping 数量"),
+                    1,
+                    "并发 resolver 只能保留一个 identity mapping"
                 );
 
                 let other_identity = ExternalIdentity::new(
@@ -1110,12 +2130,6 @@ mod tests {
                     winners[0]
                 );
 
-                let conversation_count_before = query_scalar::<Postgres, i64>(
-                    "SELECT COUNT(*) FROM yunxi_conversations",
-                )
-                .fetch_one(&pool)
-                .await
-                .expect("应读取 conversation 数量");
                 let group = ExternalConversation::new(
                     platform.clone(),
                     format!("group:{suffix}"),
@@ -1150,12 +2164,17 @@ mod tests {
                         .all(|winner| *winner == conversation_winners[0])
                 );
                 assert_eq!(
-                    query_scalar::<Postgres, i64>("SELECT COUNT(*) FROM yunxi_conversations")
-                        .fetch_one(&pool)
-                        .await
-                        .expect("应读取 conversation 数量"),
-                    conversation_count_before + 1,
-                    "并发输掉的候选 conversation 必须删除"
+                    query_scalar::<Postgres, i64>(
+                        "SELECT COUNT(*) FROM yunxi_external_conversations
+                         WHERE platform = $1 AND external_id = $2",
+                    )
+                    .bind(platform.as_str())
+                    .bind(race_conversation.external_id())
+                    .fetch_one(&pool)
+                    .await
+                    .expect("应读取 conversation mapping 数量"),
+                    1,
+                    "并发 resolver 只能保留一个 conversation mapping"
                 );
                 let direct = ExternalConversation::new(
                     platform.clone(),
@@ -1193,11 +2212,20 @@ mod tests {
                     })
                 ));
                 assert_eq!(
-                    query_scalar::<Postgres, i64>("SELECT COUNT(*) FROM yunxi_conversations")
-                        .fetch_one(&pool)
-                        .await
-                        .expect("应读取 conversation 数量"),
-                    conversation_count_before + 3
+                    query_scalar::<Postgres, i64>(
+                        "SELECT COUNT(*) FROM yunxi_external_conversations
+                         WHERE platform = $1 AND external_id = ANY($2)",
+                    )
+                    .bind(platform.as_str())
+                    .bind(vec![
+                        group.external_id(),
+                        direct.external_id(),
+                        race_conversation.external_id(),
+                    ])
+                    .fetch_one(&pool)
+                    .await
+                    .expect("应读取 conversation mapping 数量"),
+                    3
                 );
 
                 let mut transaction = pool.begin().await.expect("应开始唯一约束事务");
@@ -1311,6 +2339,10 @@ mod tests {
                     .initialize_schema()
                     .await
                     .expect("应初始化 relation schema");
+                crate::yunxi::affect_store::PostgresAffectStore::new(pool.clone())
+                    .initialize_schema()
+                    .await
+                    .expect("应初始化 affect schema");
                 PostgresGoalStore::new(pool.clone())
                     .initialize_schema()
                     .await
@@ -1735,6 +2767,449 @@ mod tests {
                     assert_eq!(remaining, 0, "{table} retained owner {owner_id}");
                 }
                 let _ = std::fs::remove_file(legacy_path);
+            });
+    }
+
+    #[test]
+    #[ignore = "requires PostgreSQL via DATABASE_URL"]
+    fn postgres_person_export_import_and_unlink_round_trip() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let database_url = std::env::var("DATABASE_URL").expect("需要 DATABASE_URL");
+                let pool = PgPoolOptions::new()
+                    .max_connections(8)
+                    .connect(&database_url)
+                    .await
+                    .expect("应连接 PostgreSQL");
+                let store = initialize_portable_schema(&pool).await;
+                let open_loops = PostgresOpenLoopStore::new(pool.clone());
+                let goals = PostgresGoalStore::new(pool.clone());
+
+                let suffix = Uuid::new_v4().to_string();
+                let person_id = PersonId::new();
+                let platform = PlatformId::new("portabletest").expect("valid platform");
+                let primary = ExternalIdentity::new(platform.clone(), format!("primary:{suffix}"))
+                    .expect("valid primary identity");
+                let secondary = ExternalIdentity::new(platform, format!("secondary:{suffix}"))
+                    .expect("valid secondary identity");
+                let memory_id = Uuid::new_v4();
+                let occurred_at = Utc::now();
+
+                query("INSERT INTO yunxi_persons (id) VALUES ($1)")
+                    .bind(person_id.into_uuid())
+                    .execute(&pool)
+                    .await
+                    .expect("应创建 portable person");
+                query(
+                    "INSERT INTO yunxi_external_identities (platform, external_id, person_id)
+                     VALUES ($1, $2, $3), ($1, $4, $3)",
+                )
+                .bind(primary.platform().as_str())
+                .bind(primary.external_id())
+                .bind(person_id.into_uuid())
+                .bind(secondary.external_id())
+                .execute(&pool)
+                .await
+                .expect("应创建 portable identities");
+                query(
+                    "INSERT INTO yunxi_memories
+                        (id, scope_kind, scope_id, kind, content, importance, tags, occurred_at)
+                     VALUES ($1, 'person', $2, 'fact', 'portable memory', 80, $3, $4)",
+                )
+                .bind(memory_id)
+                .bind(person_id.into_uuid())
+                .bind(serde_json::json!(["portable", "round-trip"]))
+                .bind(occurred_at)
+                .execute(&pool)
+                .await
+                .expect("应创建 portable memory");
+                query(
+                    "INSERT INTO yunxi_relations
+                        (person_id, familiarity, affinity, trust, comfort, tension)
+                     VALUES ($1, 0.25, -0.5, 0.75, 0.5, -0.25)",
+                )
+                .bind(person_id.into_uuid())
+                .execute(&pool)
+                .await
+                .expect("应创建 portable relation");
+                query(
+                    "INSERT INTO yunxi_affect_states
+                        (person_id, valence, arousal, social_energy, curiosity)
+                     VALUES ($1, -0.25, 0.5, 0.75, 0.9)",
+                )
+                .bind(person_id.into_uuid())
+                .execute(&pool)
+                .await
+                .expect("应创建 portable affect");
+                let open_loop = open_loops
+                    .create(
+                        &OpenLoopDraft::new(
+                            OpenLoopOwner::Person(person_id),
+                            OpenLoopKind::AwaitingOutcome,
+                            "portable open loop",
+                        )
+                        .expect("应创建合法 open-loop draft")
+                        .with_due_at(Some(occurred_at + chrono::Duration::hours(2)))
+                        .with_salience(73)
+                        .expect("应设置合法 salience")
+                        .with_dedupe_key(Some(format!("portable:{suffix}")))
+                        .expect("应设置合法 dedupe key"),
+                    )
+                    .await
+                    .expect("应创建 portable open loop");
+                let goal = goals
+                    .create(
+                        &GoalDraft::new(
+                            GoalOwner::Person(person_id),
+                            GoalKind::Project,
+                            "portable goal",
+                        )
+                        .expect("应创建合法 goal draft")
+                        .with_details("portable goal details")
+                        .expect("应设置合法 goal details")
+                        .with_due_at(Some(occurred_at + chrono::Duration::days(3))),
+                    )
+                    .await
+                    .expect("应创建 portable goal");
+
+                let exported = store
+                    .export_person(person_id)
+                    .await
+                    .expect("应导出 person snapshot");
+                assert_eq!(exported.version, 1);
+                assert_eq!(exported.person_id, person_id);
+                assert_eq!(exported.external_identities.len(), 2);
+                assert_eq!(exported.memories.len(), 1);
+                assert_eq!(exported.memories[0].content(), "portable memory");
+                assert_eq!(exported.memories[0].importance(), 80);
+                assert_eq!(exported.memories[0].tags(), ["portable", "round-trip"]);
+                let relation = exported.relation.expect("relation should be exported");
+                assert_eq!(relation.person_id, person_id);
+                assert_eq!(relation.affinity, -0.5);
+                let affect = exported.affect.expect("affect should be exported");
+                assert_eq!(affect.valence, -0.25);
+                assert_eq!(affect.curiosity, 0.9);
+                assert_eq!(exported.open_loops, [open_loop]);
+                assert_eq!(exported.goals, [goal]);
+
+                assert!(
+                    store
+                        .unlink_external_identity(&primary)
+                        .await
+                        .expect("unlink should succeed")
+                );
+                assert!(
+                    !store
+                        .unlink_external_identity(&primary)
+                        .await
+                        .expect("second unlink should be idempotent")
+                );
+                assert_eq!(
+                    query_scalar::<Postgres, i64>(
+                        "SELECT COUNT(*) FROM yunxi_external_identities
+                         WHERE person_id = $1",
+                    )
+                    .bind(person_id.into_uuid())
+                    .fetch_one(&pool)
+                    .await
+                    .expect("应读取剩余 identity"),
+                    1
+                );
+
+                assert_eq!(
+                    store
+                        .import_person(&exported)
+                        .await
+                        .expect("import should restore the unlinked identity"),
+                    person_id
+                );
+                assert_eq!(
+                    store
+                        .export_person(person_id)
+                        .await
+                        .expect("re-export should round-trip"),
+                    exported
+                );
+
+                for statement in [
+                    "DELETE FROM yunxi_memories WHERE scope_kind = 'person' AND scope_id = $1",
+                    "DELETE FROM yunxi_open_loops WHERE owner_kind = 'person' AND owner_id = $1",
+                    "DELETE FROM yunxi_goals WHERE owner_kind = 'person' AND owner_id = $1",
+                ] {
+                    query(statement)
+                        .bind(person_id.into_uuid())
+                        .execute(&pool)
+                        .await
+                        .expect("应清理 portable person owner state");
+                }
+                query("DELETE FROM yunxi_persons WHERE id = $1")
+                    .bind(person_id.into_uuid())
+                    .execute(&pool)
+                    .await
+                    .expect("应清理 portable person root");
+                assert_eq!(
+                    store
+                        .import_person(&exported)
+                        .await
+                        .expect("应向空目标恢复完整 person snapshot"),
+                    person_id
+                );
+                assert_eq!(
+                    store
+                        .export_person(person_id)
+                        .await
+                        .expect("完整恢复后应可等价导出"),
+                    exported
+                );
+
+                for statement in [
+                    "DELETE FROM yunxi_memories WHERE scope_kind = 'person' AND scope_id = $1",
+                    "DELETE FROM yunxi_open_loops WHERE owner_kind = 'person' AND owner_id = $1",
+                    "DELETE FROM yunxi_goals WHERE owner_kind = 'person' AND owner_id = $1",
+                ] {
+                    query(statement)
+                        .bind(person_id.into_uuid())
+                        .execute(&pool)
+                        .await
+                        .expect("应清理 round-trip owner state");
+                }
+                query("DELETE FROM yunxi_persons WHERE id = $1")
+                    .bind(person_id.into_uuid())
+                    .execute(&pool)
+                    .await
+                    .expect("应清理 round-trip person");
+            });
+    }
+
+    #[test]
+    #[ignore = "requires PostgreSQL via DATABASE_URL"]
+    fn postgres_person_import_rejects_identity_and_memory_conflicts_transactionally() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let database_url = std::env::var("DATABASE_URL").expect("需要 DATABASE_URL");
+                let pool = PgPoolOptions::new()
+                    .max_connections(8)
+                    .connect(&database_url)
+                    .await
+                    .expect("应连接 PostgreSQL");
+                let store = initialize_portable_schema(&pool).await;
+                let source_person = PersonId::new();
+                let other_person = PersonId::new();
+                let suffix = Uuid::new_v4().to_string();
+                let memory_id = Uuid::new_v4();
+                query("INSERT INTO yunxi_persons (id) VALUES ($1), ($2)")
+                    .bind(source_person.into_uuid())
+                    .bind(other_person.into_uuid())
+                    .execute(&pool)
+                    .await
+                    .expect("应创建冲突测试 persons");
+                query(
+                    "INSERT INTO yunxi_external_identities (platform, external_id, person_id)
+                     VALUES ('portabletest', $1, $2), ('portabletest', $3, $4)",
+                )
+                .bind(format!("source:{suffix}"))
+                .bind(source_person.into_uuid())
+                .bind(format!("occupied:{suffix}"))
+                .bind(other_person.into_uuid())
+                .execute(&pool)
+                .await
+                .expect("应创建冲突测试 identities");
+                query(
+                    "INSERT INTO yunxi_memories
+                        (id, scope_kind, scope_id, kind, content, importance, tags, occurred_at)
+                     VALUES ($1, 'person', $2, 'fact', 'source memory', 60, '[]', NOW())",
+                )
+                .bind(memory_id)
+                .bind(source_person.into_uuid())
+                .execute(&pool)
+                .await
+                .expect("应创建冲突测试 memory");
+
+                let mut exported = store
+                    .export_person(source_person)
+                    .await
+                    .expect("应导出冲突测试 snapshot");
+                let fresh_identity = format!("fresh-before-conflict:{suffix}");
+                exported.external_identities.push(PortableExternalIdentity {
+                    platform: "portabletest".to_owned(),
+                    external_id: fresh_identity.clone(),
+                });
+                exported.external_identities.push(PortableExternalIdentity {
+                    platform: "portabletest".to_owned(),
+                    external_id: format!("occupied:{suffix}"),
+                });
+                let error = store
+                    .import_person(&exported)
+                    .await
+                    .expect_err("被占用 identity 必须拒绝导入");
+                assert!(
+                    format!("{error:?}").contains("another person"),
+                    "unexpected identity conflict error: {error:?}"
+                );
+                assert_eq!(
+                    query_scalar::<Postgres, i64>(
+                        "SELECT COUNT(*) FROM yunxi_external_identities
+                         WHERE platform = 'portabletest' AND external_id = $1",
+                    )
+                    .bind(&fresh_identity)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("应核对 identity 冲突事务回滚"),
+                    0
+                );
+                assert_eq!(
+                    query_scalar::<Postgres, Uuid>(
+                        "SELECT person_id FROM yunxi_external_identities
+                         WHERE platform = 'portabletest' AND external_id = $1",
+                    )
+                    .bind(format!("occupied:{suffix}"))
+                    .fetch_one(&pool)
+                    .await
+                    .expect("应核对被占用 identity 未被劫持"),
+                    other_person.into_uuid()
+                );
+
+                exported.external_identities.truncate(1);
+                let fresh_before_memory_conflict = format!("fresh-before-memory:{suffix}");
+                exported.external_identities.push(PortableExternalIdentity {
+                    platform: "portabletest".to_owned(),
+                    external_id: fresh_before_memory_conflict.clone(),
+                });
+                query(
+                    "UPDATE yunxi_memories
+                     SET scope_id = $2, content = 'conflicting memory'
+                     WHERE id = $1",
+                )
+                .bind(memory_id)
+                .bind(other_person.into_uuid())
+                .execute(&pool)
+                .await
+                .expect("应制造 memory ID 冲突");
+                let error = store
+                    .import_person(&exported)
+                    .await
+                    .expect_err("异内容 memory ID 必须拒绝导入");
+                assert!(
+                    format!("{error:?}").contains("memory ID"),
+                    "unexpected memory conflict error: {error:?}"
+                );
+                assert_eq!(
+                    query_scalar::<Postgres, i64>(
+                        "SELECT COUNT(*) FROM yunxi_external_identities
+                         WHERE platform = 'portabletest' AND external_id = $1",
+                    )
+                    .bind(&fresh_before_memory_conflict)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("应核对 memory 冲突事务回滚"),
+                    0
+                );
+                let stored_memory =
+                    query("SELECT scope_id, content FROM yunxi_memories WHERE id = $1")
+                        .bind(memory_id)
+                        .fetch_one(&pool)
+                        .await
+                        .expect("应读取冲突 memory");
+                assert_eq!(
+                    stored_memory
+                        .try_get::<Uuid, _>("scope_id")
+                        .expect("应读取 memory scope"),
+                    other_person.into_uuid()
+                );
+                assert_eq!(
+                    stored_memory
+                        .try_get::<String, _>("content")
+                        .expect("应读取 memory content"),
+                    "conflicting memory"
+                );
+
+                query("DELETE FROM yunxi_memories WHERE id = $1")
+                    .bind(memory_id)
+                    .execute(&pool)
+                    .await
+                    .expect("应清理冲突 memory");
+                query("DELETE FROM yunxi_persons WHERE id = $1 OR id = $2")
+                    .bind(source_person.into_uuid())
+                    .bind(other_person.into_uuid())
+                    .execute(&pool)
+                    .await
+                    .expect("应清理冲突测试 persons");
+            });
+    }
+
+    #[test]
+    #[ignore = "requires PostgreSQL via DATABASE_URL"]
+    fn postgres_person_export_fails_closed_above_collection_limits() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let database_url = std::env::var("DATABASE_URL").expect("需要 DATABASE_URL");
+                let pool = PgPoolOptions::new()
+                    .max_connections(8)
+                    .connect(&database_url)
+                    .await
+                    .expect("应连接 PostgreSQL");
+                let store = initialize_portable_schema(&pool).await;
+                let person_id = PersonId::new();
+                let suffix = Uuid::new_v4().to_string();
+                query("INSERT INTO yunxi_persons (id) VALUES ($1)")
+                    .bind(person_id.into_uuid())
+                    .execute(&pool)
+                    .await
+                    .expect("应创建上限测试 person");
+                query(
+                    "INSERT INTO yunxi_external_identities (platform, external_id, person_id)
+                     SELECT 'portablelimit', $1 || ':' || sequence::text, $2
+                     FROM generate_series(1, 257) AS sequence",
+                )
+                .bind(&suffix)
+                .bind(person_id.into_uuid())
+                .execute(&pool)
+                .await
+                .expect("应创建超限 identities");
+                let error = store
+                    .export_person(person_id)
+                    .await
+                    .expect_err("257 个 identities 必须拒绝导出");
+                assert!(format!("{error:?}").contains("above maximum 256"));
+
+                query("DELETE FROM yunxi_external_identities WHERE person_id = $1")
+                    .bind(person_id.into_uuid())
+                    .execute(&pool)
+                    .await
+                    .expect("应清理超限 identities");
+                let memory_ids = (0..513).map(|_| Uuid::new_v4()).collect::<Vec<_>>();
+                query(
+                    "INSERT INTO yunxi_memories
+                        (id, scope_kind, scope_id, kind, content, importance, tags,
+                         occurred_at, created_at)
+                     SELECT imported.id, 'person', $1, 'fact', 'portable limit memory', 50,
+                            '[]'::jsonb, NOW(), NOW()
+                     FROM UNNEST($2::uuid[]) AS imported(id)",
+                )
+                .bind(person_id.into_uuid())
+                .bind(&memory_ids)
+                .execute(&pool)
+                .await
+                .expect("应创建超限 memories");
+                let error = store
+                    .export_person(person_id)
+                    .await
+                    .expect_err("513 条 memories 必须拒绝导出");
+                assert!(format!("{error:?}").contains("above maximum 512"));
+
+                query("DELETE FROM yunxi_memories WHERE scope_id = $1")
+                    .bind(person_id.into_uuid())
+                    .execute(&pool)
+                    .await
+                    .expect("应清理超限 memories");
+                query("DELETE FROM yunxi_persons WHERE id = $1")
+                    .bind(person_id.into_uuid())
+                    .execute(&pool)
+                    .await
+                    .expect("应清理上限测试 person");
             });
     }
 }

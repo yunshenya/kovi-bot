@@ -25,6 +25,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use url::{Host, Url};
+use yunxi_core::{EventPriority, ToolCompletedEvent, ToolFailedEvent, WorldEventKind};
 
 const MAX_WEB_DOWNLOAD_BYTES: usize = 2 * 1024 * 1024;
 const MAX_SEARCH_QUERY_CHARS: usize = 300;
@@ -894,6 +895,11 @@ impl ToolRegistry {
             };
         }
 
+        let destination = tool_context.destination;
+        // Core-owned actions emit their causally linked result from the Core
+        // ActionPort outcome. The legacy projection below remains observation
+        // only and must not create a second follow-up turn.
+        let project_legacy_result = tool_context.context != "yunxi_core_tool";
         let execution = async {
             match &definition.source {
                 ToolSource::Builtin(tool) => {
@@ -914,10 +920,41 @@ impl ToolRegistry {
                 } => execute_mcp(server, remote_name, client, arguments, reply_ticket).await,
             }
         };
-        let result = match kovi::tokio::time::timeout(self.timeout, execution).await {
-            Ok(result) => result,
-            Err(_) => Err(anyhow!("工具调用超时（工具：{name}）")),
+        let (result, projection) = match kovi::tokio::time::timeout(self.timeout, execution).await {
+            Ok(Ok(result)) => (
+                Ok(result),
+                WorldEventKind::ToolCompleted(ToolCompletedEvent {
+                    operation: name.to_string(),
+                    output: String::new(),
+                    requires_follow_up: false,
+                }),
+            ),
+            Ok(Err(error)) => (
+                Err(error),
+                WorldEventKind::ToolFailed(ToolFailedEvent {
+                    operation: name.to_string(),
+                    error_category: "execution_failed".to_string(),
+                    detail: String::new(),
+                    requires_follow_up: false,
+                }),
+            ),
+            Err(_) => (
+                Err(anyhow!("工具调用超时（工具：{name}）")),
+                WorldEventKind::ToolFailed(ToolFailedEvent {
+                    operation: name.to_string(),
+                    error_category: "timeout".to_string(),
+                    detail: String::new(),
+                    requires_follow_up: false,
+                }),
+            ),
         };
+        if project_legacy_result {
+            kovi::tokio::spawn(crate::yunxi::events::project_destination(
+                destination,
+                EventPriority::Normal,
+                projection,
+            ));
+        }
         match result {
             Ok(result) => ToolExecutionResult {
                 succeeded: true,

@@ -7,7 +7,7 @@
 use crate::config;
 use crate::memory::MEMORY_MANAGER;
 use crate::model::{
-    MessageDestination, MessageTransport, ReplyScope, record_standalone_bot_message,
+    MessageDestination, OutgoingSource, ReplyScope, send_tracked_message_with_revalidation,
 };
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDateTime, TimeZone, Utc};
@@ -23,10 +23,13 @@ use sqlx_postgres::{PgPool, PgRow, Postgres};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use yunxi_core::{EventPriority, ReminderDueEvent, WorldEventKind};
 
 const MAX_LIST_ITEMS: i64 = 20;
 const CLAIM_BATCH_SIZE: i64 = 32;
 const MAX_RETRY_DELAY_SECS: i64 = 300;
+const DELIVERY_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+const DELIVERY_GATE_LEASE_SECS: i64 = 30;
 static REMINDER_TOKEN_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 static LAST_CLEANUP: LazyLock<kovi::tokio::sync::Mutex<Option<Instant>>> =
@@ -144,6 +147,7 @@ struct ClaimedReminder {
     timezone: String,
     repeat: RepeatRule,
     lease_token: String,
+    delivery_key: String,
     attempt_count: i32,
 }
 
@@ -193,10 +197,13 @@ pub(crate) async fn initialize_database() -> Result<()> {
             repeat_kind TEXT NOT NULL DEFAULT 'none'
                 CHECK (repeat_kind IN ('none', 'daily', 'weekly')),
             status TEXT NOT NULL DEFAULT 'pending'
-                CHECK (status IN ('pending', 'delivering', 'sent', 'cancelled', 'failed')),
+                CHECK (status IN ('pending', 'delivering', 'sending', 'sent', 'cancelled', 'failed')),
             attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
             lease_token TEXT,
             lease_until TIMESTAMPTZ,
+            delivery_key TEXT,
+            delivery_started_at TIMESTAMPTZ,
+            delivery_message_id INTEGER,
             last_error TEXT,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -207,6 +214,43 @@ pub(crate) async fn initialize_database() -> Result<()> {
     .execute(pool)
     .await
     .map_err(|error| anyhow!("创建提醒任务表失败: {error}"))?;
+    query("ALTER TABLE kovi_bot_reminders ADD COLUMN IF NOT EXISTS delivery_key TEXT")
+        .execute(pool)
+        .await
+        .map_err(|error| anyhow!("迁移提醒投递幂等键失败: {error}"))?;
+    query(
+        "ALTER TABLE kovi_bot_reminders ADD COLUMN IF NOT EXISTS delivery_started_at TIMESTAMPTZ",
+    )
+    .execute(pool)
+    .await
+    .map_err(|error| anyhow!("迁移提醒发送闸门时间失败: {error}"))?;
+    query("ALTER TABLE kovi_bot_reminders ADD COLUMN IF NOT EXISTS delivery_message_id INTEGER")
+        .execute(pool)
+        .await
+        .map_err(|error| anyhow!("迁移提醒平台消息 ID 失败: {error}"))?;
+    query(
+        r#"
+        DO $$
+        BEGIN
+            IF EXISTS (
+                SELECT 1
+                FROM pg_constraint
+                WHERE conrelid = 'kovi_bot_reminders'::regclass
+                  AND conname = 'kovi_bot_reminders_status_check'
+                  AND pg_get_constraintdef(oid) NOT LIKE '%sending%'
+            ) THEN
+                ALTER TABLE kovi_bot_reminders
+                    DROP CONSTRAINT kovi_bot_reminders_status_check;
+                ALTER TABLE kovi_bot_reminders
+                    ADD CONSTRAINT kovi_bot_reminders_status_check
+                    CHECK (status IN ('pending', 'delivering', 'sending', 'sent', 'cancelled', 'failed'));
+            END IF;
+        END $$
+        "#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|error| anyhow!("迁移提醒发送状态约束失败: {error}"))?;
     query(
         "CREATE INDEX IF NOT EXISTS kovi_bot_reminders_due_idx ON kovi_bot_reminders (status, due_at, id)",
     )
@@ -225,6 +269,12 @@ pub(crate) async fn initialize_database() -> Result<()> {
     .execute(pool)
     .await
     .map_err(|error| anyhow!("创建提醒创建者索引失败: {error}"))?;
+    query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS kovi_bot_reminders_delivery_key_idx ON kovi_bot_reminders (delivery_key) WHERE delivery_key IS NOT NULL",
+    )
+    .execute(pool)
+    .await
+    .map_err(|error| anyhow!("创建提醒投递幂等索引失败: {error}"))?;
     Ok(())
 }
 
@@ -251,11 +301,20 @@ pub(crate) async fn start_scheduler(bot: Arc<RuntimeBot>) {
 
 async fn dispatch_due(bot: &RuntimeBot) -> Result<()> {
     let reminder_config = config::get().reminders().clone();
+    settle_uncertain_deliveries(Utc::now()).await?;
     let claimed = claim_due(Utc::now(), CLAIM_BATCH_SIZE, reminder_config.lease_secs()).await?;
     for reminder in claimed {
         if !is_claim_current(&reminder).await? {
             continue;
         }
+        crate::yunxi::events::project_destination(
+            reminder.destination,
+            EventPriority::High,
+            WorldEventKind::ReminderDue(ReminderDueEvent {
+                reference: format!("reminder:{}", reminder.id),
+            }),
+        )
+        .await;
         let content_result =
             build_delivery_content_with_lease(&reminder, reminder_config.lease_secs()).await;
         let content = match content_result {
@@ -276,37 +335,33 @@ async fn dispatch_due(bot: &RuntimeBot) -> Result<()> {
                 continue;
             }
         };
-        // 搜索和摘要期间可能已经被用户取消，发送前必须再次确认租约仍归当前 worker。
-        if !is_claim_current(&reminder).await? {
-            continue;
-        }
         let destination = reminder.destination;
-        let result = match kovi::tokio::time::timeout(
-            Duration::from_secs(5),
-            MessageTransport::new(bot).send(destination, Message::from(content.clone())),
+        let result = kovi::tokio::time::timeout(
+            DELIVERY_SEND_TIMEOUT,
+            send_tracked_message_with_revalidation(
+                bot,
+                destination,
+                Message::from(content.clone()),
+                OutgoingSource::Proactive,
+                Some(&reminder.delivery_key),
+                || async { begin_delivery(&reminder).await.unwrap_or(false) },
+            ),
         )
-        .await
-        {
-            Ok(Ok(message_id)) => Ok(message_id),
-            Ok(Err(error)) => Err(format!("{error:?}")),
-            Err(_) => Err("消息发送超时".to_string()),
-        };
+        .await;
         match result {
-            Ok(message_id) => {
-                let scope = destination_scope(destination);
-                record_standalone_bot_message(scope, message_id, &content).await;
-                if !complete_claim(&reminder).await? {
+            Ok(Ok(message_id)) => {
+                if !complete_delivery(&reminder, message_id).await? {
                     eprintln!(
                         "[WARN] 提醒已发送但完成状态未更新 (任务: {})，可能已被取消",
                         reminder.id
                     );
                 }
             }
-            Err(error) => {
-                let outcome = fail_claim(
+            Ok(Err(error)) => {
+                let outcome = fail_send_attempt(
                     &reminder,
                     &format!("消息发送失败: {error}"),
-                    config::get().reminders().max_attempts(),
+                    reminder_config.max_attempts(),
                 )
                 .await?;
                 if outcome == DeliveryFailure::Failed {
@@ -314,6 +369,17 @@ async fn dispatch_due(bot: &RuntimeBot) -> Result<()> {
                         "[ERROR] 提醒发送失败并停止重试 (任务: {}): {error:?}",
                         reminder.id
                     );
+                }
+            }
+            Err(_) => {
+                let outcome = fail_send_attempt(
+                    &reminder,
+                    "消息发送超时，投递结果不确定且不会自动重放",
+                    reminder_config.max_attempts(),
+                )
+                .await?;
+                if outcome == DeliveryFailure::Failed {
+                    eprintln!("[WARN] 提醒发送超时并停止重放 (任务: {})", reminder.id);
                 }
             }
         }
@@ -366,32 +432,30 @@ fn failure_notice_for_execution(kind: ReminderKind, error: &str) -> Option<&'sta
 }
 
 async fn send_failure_notice(bot: &RuntimeBot, reminder: &ClaimedReminder, content: &str) {
-    let result = match kovi::tokio::time::timeout(
-        Duration::from_secs(5),
-        MessageTransport::new(bot).send(reminder.destination, Message::from(content.to_string())),
+    let delivery_key = format!("reminder:{}:failure-notice", reminder.id);
+    let result = kovi::tokio::time::timeout(
+        DELIVERY_SEND_TIMEOUT,
+        send_tracked_message_with_revalidation(
+            bot,
+            reminder.destination,
+            Message::from(content.to_string()),
+            OutgoingSource::Proactive,
+            Some(&delivery_key),
+            || async { is_failed_reminder(reminder.id).await.unwrap_or(false) },
+        ),
     )
-    .await
-    {
-        Ok(Ok(message_id)) => Ok(message_id),
-        Ok(Err(error)) => Err(format!("{error:?}")),
-        Err(_) => Err("消息发送超时".to_string()),
-    };
+    .await;
     match result {
-        Ok(message_id) => {
-            record_standalone_bot_message(
-                destination_scope(reminder.destination),
-                message_id,
-                content,
-            )
-            .await;
+        Ok(Ok(_message_id)) => {
             println!("[INFO] 定时任务失败说明已发送 (任务: {})", reminder.id);
         }
-        Err(error) => {
+        Ok(Err(error)) => {
             eprintln!(
                 "[WARN] 定时任务失败说明发送失败 (任务: {}): {}",
                 reminder.id, error
             );
         }
+        Err(_) => eprintln!("[WARN] 定时任务失败说明发送超时 (任务: {})", reminder.id),
     }
 }
 
@@ -693,7 +757,8 @@ pub(crate) async fn list_from_tool(
         ));
         if item.status != "pending" {
             let status = match item.status.as_str() {
-                "delivering" => "发送中",
+                "delivering" => "生成中",
+                "sending" => "发送中",
                 other => other,
             };
             output.push_str(&format!("（{}）", status));
@@ -952,7 +1017,7 @@ async fn create(
     lock_scope(&mut transaction, scope_type, scope_id).await?;
 
     let scope_count = query_scalar::<Postgres, i64>(
-        "SELECT COUNT(*) FROM kovi_bot_reminders WHERE scope_type = $1 AND scope_id = $2 AND status IN ('pending', 'delivering')",
+        "SELECT COUNT(*) FROM kovi_bot_reminders WHERE scope_type = $1 AND scope_id = $2 AND status IN ('pending', 'delivering', 'sending')",
     )
     .bind(scope_type)
     .bind(scope_id)
@@ -970,7 +1035,7 @@ async fn create(
     }
 
     let total_count = query_scalar::<Postgres, i64>(
-        "SELECT COUNT(*) FROM kovi_bot_reminders WHERE status IN ('pending', 'delivering')",
+        "SELECT COUNT(*) FROM kovi_bot_reminders WHERE status IN ('pending', 'delivering', 'sending')",
     )
     .fetch_one(&mut *transaction)
     .await?;
@@ -1012,7 +1077,7 @@ async fn list(destination: MessageDestination) -> Result<Vec<ReminderListItem>> 
         SELECT id, scope_type, scope_id, creator_user_id, kind, message, payload,
                due_at, timezone, repeat_kind, status
         FROM kovi_bot_reminders
-        WHERE scope_type = $1 AND scope_id = $2 AND status IN ('pending', 'delivering')
+        WHERE scope_type = $1 AND scope_id = $2 AND status IN ('pending', 'delivering', 'sending')
         ORDER BY due_at ASC, id ASC
         LIMIT $3
         "#,
@@ -1056,7 +1121,7 @@ async fn claim_due(
     let rows = query(
         r#"
         SELECT id, scope_type, scope_id, creator_user_id, kind, message, payload, due_at, timezone,
-               repeat_kind, attempt_count
+               repeat_kind, attempt_count, delivery_key
         FROM kovi_bot_reminders
         WHERE due_at <= $1
           AND (
@@ -1076,17 +1141,22 @@ async fn claim_due(
     for row in rows {
         let id = row.get::<i64, _>("id");
         let lease_token = new_lease_token(id);
+        let due_at = row.get::<DateTime<Utc>, _>("due_at");
+        let delivery_key = row
+            .get::<Option<String>, _>("delivery_key")
+            .unwrap_or_else(|| reminder_delivery_key(id, due_at));
         query(
             r#"
             UPDATE kovi_bot_reminders
             SET status = 'delivering', lease_token = $2, lease_until = $3,
-                attempt_count = attempt_count + 1, updated_at = $3
+                attempt_count = attempt_count + 1, delivery_key = $4, updated_at = $3
             WHERE id = $1
             "#,
         )
         .bind(id)
         .bind(&lease_token)
         .bind(lease_until)
+        .bind(&delivery_key)
         .execute(&mut *transaction)
         .await?;
         let attempt_count = row.get::<i32, _>("attempt_count") + 1;
@@ -1100,10 +1170,11 @@ async fn claim_due(
             kind: ReminderKind::parse(row.get::<String, _>("kind").as_str())?,
             message: row.get("message"),
             payload: row.get("payload"),
-            due_at: row.get("due_at"),
+            due_at,
             timezone: row.get("timezone"),
             repeat: RepeatRule::parse(row.get::<String, _>("repeat_kind").as_str())?,
             lease_token,
+            delivery_key,
             attempt_count,
         });
     }
@@ -1141,7 +1212,26 @@ async fn renew_claim(reminder: &ClaimedReminder, lease_secs: u64) -> Result<bool
     Ok(result.rows_affected() == 1)
 }
 
-async fn complete_claim(reminder: &ClaimedReminder) -> Result<bool> {
+async fn begin_delivery(reminder: &ClaimedReminder) -> Result<bool> {
+    let lease_until = Utc::now() + ChronoDuration::seconds(DELIVERY_GATE_LEASE_SECS);
+    let result = query(
+        r#"
+        UPDATE kovi_bot_reminders
+        SET status = 'sending', delivery_started_at = NOW(), lease_until = $4, updated_at = NOW()
+        WHERE id = $1 AND status = 'delivering' AND lease_token = $2
+          AND delivery_key = $3 AND lease_until > NOW()
+        "#,
+    )
+    .bind(reminder.id)
+    .bind(&reminder.lease_token)
+    .bind(&reminder.delivery_key)
+    .bind(lease_until)
+    .execute(database_pool()?)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+async fn complete_delivery(reminder: &ClaimedReminder, message_id: i32) -> Result<bool> {
     let pool = database_pool()?;
     let now = Utc::now();
     let result = match reminder.repeat {
@@ -1150,13 +1240,16 @@ async fn complete_claim(reminder: &ClaimedReminder) -> Result<bool> {
                 r#"
                 UPDATE kovi_bot_reminders
                 SET status = 'sent', delivered_at = $3, lease_token = NULL, lease_until = NULL,
-                    updated_at = $3, last_error = NULL
-                WHERE id = $1 AND status = 'delivering' AND lease_token = $2
+                    delivery_message_id = $4, updated_at = $3, last_error = NULL
+                WHERE id = $1 AND status = 'sending' AND lease_token = $2
+                  AND delivery_key = $5
                 "#,
             )
             .bind(reminder.id)
             .bind(&reminder.lease_token)
             .bind(now)
+            .bind(message_id)
+            .bind(&reminder.delivery_key)
             .execute(pool)
             .await?
         }
@@ -1166,19 +1259,76 @@ async fn complete_claim(reminder: &ClaimedReminder) -> Result<bool> {
                 r#"
                 UPDATE kovi_bot_reminders
                 SET status = 'pending', due_at = $3, attempt_count = 0,
-                    lease_token = NULL, lease_until = NULL, updated_at = $4, last_error = NULL
-                WHERE id = $1 AND status = 'delivering' AND lease_token = $2
+                    lease_token = NULL, lease_until = NULL, updated_at = $4, last_error = NULL,
+                    delivered_at = $4, delivery_key = NULL, delivery_started_at = NULL,
+                    delivery_message_id = NULL
+                WHERE id = $1 AND status = 'sending' AND lease_token = $2
+                  AND delivery_key = $5
                 "#,
             )
             .bind(reminder.id)
             .bind(&reminder.lease_token)
             .bind(next_due)
             .bind(now)
+            .bind(&reminder.delivery_key)
             .execute(pool)
             .await?
         }
     };
     Ok(result.rows_affected() == 1)
+}
+
+async fn fail_send_attempt(
+    reminder: &ClaimedReminder,
+    error: &str,
+    max_attempts: u8,
+) -> Result<DeliveryFailure> {
+    let error = truncate_chars(error, 800);
+    let result = query(
+        r#"
+        UPDATE kovi_bot_reminders
+        SET status = 'failed', last_error = $4, lease_token = NULL, lease_until = NULL,
+            updated_at = NOW()
+        WHERE id = $1 AND status = 'sending' AND lease_token = $2
+          AND delivery_key = $3
+        "#,
+    )
+    .bind(reminder.id)
+    .bind(&reminder.lease_token)
+    .bind(&reminder.delivery_key)
+    .bind(&error)
+    .execute(database_pool()?)
+    .await?;
+    if result.rows_affected() == 1 {
+        return Ok(DeliveryFailure::Failed);
+    }
+    fail_claim(reminder, &error, max_attempts).await
+}
+
+async fn settle_uncertain_deliveries(now: DateTime<Utc>) -> Result<u64> {
+    let result = query(
+        r#"
+        UPDATE kovi_bot_reminders
+        SET status = 'failed',
+            last_error = '提醒发送期间租约过期，投递结果不确定且不会自动重放',
+            lease_token = NULL, lease_until = NULL, updated_at = $1
+        WHERE status = 'sending' AND (lease_until IS NULL OR lease_until <= $1)
+        "#,
+    )
+    .bind(now)
+    .execute(database_pool()?)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+async fn is_failed_reminder(id: i64) -> Result<bool> {
+    query_scalar::<Postgres, bool>(
+        "SELECT EXISTS(SELECT 1 FROM kovi_bot_reminders WHERE id = $1 AND status = 'failed')",
+    )
+    .bind(id)
+    .fetch_one(database_pool()?)
+    .await
+    .map_err(Into::into)
 }
 
 async fn fail_claim(
@@ -1324,13 +1474,6 @@ fn destination_from_values(scope_type: &str, scope_id: i64) -> Result<MessageDes
     }
 }
 
-fn destination_scope(destination: MessageDestination) -> ReplyScope {
-    match destination {
-        MessageDestination::Private(user_id) => ReplyScope::Private(user_id),
-        MessageDestination::Group(group_id) => ReplyScope::Group(group_id),
-    }
-}
-
 fn reminder_scope(task_id: i64) -> ReplyScope {
     ReplyScope::Scheduled(task_id)
 }
@@ -1345,6 +1488,14 @@ fn database_pool() -> Result<&'static PgPool> {
     MEMORY_MANAGER
         .database_pool()
         .ok_or_else(|| anyhow!("PostgreSQL 记忆连接池尚未初始化"))
+}
+
+fn reminder_delivery_key(reminder_id: i64, due_at: DateTime<Utc>) -> String {
+    format!(
+        "reminder:{reminder_id}:occurrence:{}:{}",
+        due_at.timestamp(),
+        due_at.timestamp_subsec_nanos()
+    )
 }
 
 fn new_lease_token(reminder_id: i64) -> String {
@@ -1451,6 +1602,7 @@ mod tests {
     use crate::config::ReminderConfig;
     use chrono::{Duration, TimeZone, Utc};
     use serde_json::{Value, json};
+    use sqlx_postgres::Postgres;
 
     #[test]
     fn lease_heartbeat_interval_stays_well_inside_the_lease() {
@@ -1607,48 +1759,155 @@ mod tests {
     }
 
     #[test]
+    fn delivery_keys_are_stable_per_occurrence() {
+        let first = Utc.with_ymd_and_hms(2026, 8, 25, 12, 0, 0).unwrap();
+        let next = first + chrono::Duration::days(1);
+        assert_eq!(
+            super::reminder_delivery_key(42, first),
+            super::reminder_delivery_key(42, first)
+        );
+        assert_ne!(
+            super::reminder_delivery_key(42, first),
+            super::reminder_delivery_key(42, next)
+        );
+        assert_ne!(
+            super::reminder_delivery_key(42, first),
+            super::reminder_delivery_key(43, first)
+        );
+    }
+
+    #[test]
     #[ignore = "requires PostgreSQL via DATABASE_URL"]
     fn postgres_claim_is_atomic_across_concurrent_workers() {
-        kovi::tokio::runtime::Runtime::new()
-            .expect("应创建测试运行时")
-            .block_on(async {
-                let subject_id = Utc::now().timestamp_micros();
-                crate::memory::MEMORY_MANAGER
-                    .initialize_database()
+        crate::database_test_support::block_on(async {
+            let subject_id = Utc::now().timestamp_micros();
+            crate::memory::MEMORY_MANAGER
+                .initialize_database()
+                .await
+                .expect("应初始化 PostgreSQL 记忆连接池");
+            super::initialize_database().await.expect("应初始化提醒表");
+            let request = super::CreateReminderRequest {
+                due_at: Utc::now() - chrono::Duration::seconds(1),
+                timezone: ReminderConfig::default().default_timezone().to_string(),
+                kind: super::ReminderKind::Message,
+                message: "并发领取测试".to_string(),
+                repeat: RepeatRule::None,
+                payload: Value::Object(serde_json::Map::new()),
+            };
+            let id = super::create(
+                super::MessageDestination::Private(subject_id),
+                subject_id,
+                request,
+            )
+            .await
+            .expect("应创建测试提醒");
+            let now = Utc::now();
+            let (first, second) =
+                kovi::tokio::join!(super::claim_due(now, 1, 60), super::claim_due(now, 1, 60),);
+            let first = first.expect("第一个领取者不应失败");
+            let second = second.expect("第二个领取者不应失败");
+            let claimed = first
+                .iter()
+                .chain(second.iter())
+                .filter(|reminder| reminder.id == id)
+                .count();
+            assert_eq!(claimed, 1, "同一提醒只能被一个并发领取者拿到");
+            let reminder = first
+                .into_iter()
+                .chain(second)
+                .find(|reminder| reminder.id == id)
+                .expect("测试提醒应被领取");
+            assert_eq!(
+                reminder.delivery_key,
+                super::reminder_delivery_key(id, reminder.due_at)
+            );
+            assert!(
+                super::begin_delivery(&reminder)
                     .await
-                    .expect("应初始化 PostgreSQL 记忆连接池");
-                super::initialize_database().await.expect("应初始化提醒表");
-                let request = super::CreateReminderRequest {
+                    .expect("应进入不可逆发送闸门")
+            );
+            assert_eq!(
+                super::fail_send_attempt(&reminder, "模拟 commit 后发送失败", 3)
+                    .await
+                    .expect("应收束发送失败"),
+                super::DeliveryFailure::Failed
+            );
+            let replayed = super::claim_due(Utc::now(), 32, 60)
+                .await
+                .expect("失败收束后仍应能扫描")
+                .into_iter()
+                .any(|candidate| candidate.id == id);
+            assert!(!replayed, "进入发送闸门的提醒失败后不得自动重放");
+            super::query("DELETE FROM kovi_bot_reminders WHERE id = $1")
+                .bind(id)
+                .execute(super::database_pool().expect("连接池应存在"))
+                .await
+                .expect("应清理测试提醒");
+        });
+    }
+
+    #[test]
+    #[ignore = "requires PostgreSQL via DATABASE_URL"]
+    fn postgres_restart_settles_expired_sending_without_replay() {
+        crate::database_test_support::block_on(async {
+            let subject_id = Utc::now().timestamp_micros();
+            crate::memory::MEMORY_MANAGER
+                .initialize_database()
+                .await
+                .expect("应初始化 PostgreSQL 记忆连接池");
+            super::initialize_database().await.expect("应初始化提醒表");
+            let id = super::create(
+                super::MessageDestination::Private(subject_id),
+                subject_id,
+                super::CreateReminderRequest {
                     due_at: Utc::now() - chrono::Duration::seconds(1),
                     timezone: ReminderConfig::default().default_timezone().to_string(),
                     kind: super::ReminderKind::Message,
-                    message: "并发领取测试".to_string(),
+                    message: "重启收敛测试".to_string(),
                     repeat: RepeatRule::None,
                     payload: Value::Object(serde_json::Map::new()),
-                };
-                let id = super::create(
-                    super::MessageDestination::Private(subject_id),
-                    subject_id,
-                    request,
-                )
+                },
+            )
+            .await
+            .expect("应创建测试提醒");
+            let reminder = super::claim_due(Utc::now(), 64, 60)
                 .await
-                .expect("应创建测试提醒");
-                let now = Utc::now();
-                let (first, second) =
-                    kovi::tokio::join!(super::claim_due(now, 1, 60), super::claim_due(now, 1, 60),);
-                let first = first.expect("第一个领取者不应失败");
-                let second = second.expect("第二个领取者不应失败");
-                let claimed = first
-                    .iter()
-                    .chain(second.iter())
-                    .filter(|reminder| reminder.id == id)
-                    .count();
-                assert_eq!(claimed, 1, "同一提醒只能被一个并发领取者拿到");
-                super::query("DELETE FROM kovi_bot_reminders WHERE id = $1")
-                    .bind(id)
-                    .execute(super::database_pool().expect("连接池应存在"))
+                .expect("应领取测试提醒")
+                .into_iter()
+                .find(|candidate| candidate.id == id)
+                .expect("测试提醒应在领取结果中");
+            assert!(super::begin_delivery(&reminder).await.unwrap());
+            super::query(
+                "UPDATE kovi_bot_reminders SET lease_until = NOW() - INTERVAL '1 second' WHERE id = $1",
+            )
+            .bind(id)
+            .execute(super::database_pool().unwrap())
+            .await
+            .expect("应模拟发送中进程退出");
+            super::settle_uncertain_deliveries(Utc::now())
+                .await
+                .expect("重启扫描应收敛不确定投递");
+            let status = sqlx_core::query_scalar::query_scalar::<Postgres, String>(
+                "SELECT status FROM kovi_bot_reminders WHERE id = $1",
+            )
+            .bind(id)
+            .fetch_one(super::database_pool().unwrap())
+            .await
+            .expect("应读取提醒终态");
+            assert_eq!(status, "failed");
+            assert!(
+                !super::claim_due(Utc::now(), 64, 60)
                     .await
-                    .expect("应清理测试提醒");
-            });
+                    .unwrap()
+                    .into_iter()
+                    .any(|candidate| candidate.id == id),
+                "重启后不得重放投递结果不确定的提醒"
+            );
+            super::query("DELETE FROM kovi_bot_reminders WHERE id = $1")
+                .bind(id)
+                .execute(super::database_pool().unwrap())
+                .await
+                .expect("应清理测试提醒");
+        });
     }
 }

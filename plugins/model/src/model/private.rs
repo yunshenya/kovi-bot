@@ -3,8 +3,12 @@ use crate::config;
 use crate::group_access;
 use crate::memory::MEMORY_MANAGER;
 use crate::model::coalesce::{MessageCoalescer, MessagePart};
-use crate::model::conversation_coordinator::{ConversationCoordinator, PendingTurn};
-use crate::model::interrupt::{ReplyScope, clear_reply_state_locked, is_active, scope_mutex};
+use crate::model::conversation_coordinator::{
+    ConversationCoordinator, IncomingAdmission, OutgoingExecutiveDecision, PendingTurn,
+};
+use crate::model::interrupt::{
+    ReplyScope, ReplyTicket, clear_reply_state_locked, is_active, scope_mutex,
+};
 use crate::model::recall::{
     clear_reply_scope_locked, has_recalled_messages, is_recent_bot_message,
     recent_bot_message_for_reaction, send_tracked_private_message,
@@ -17,7 +21,8 @@ use crate::model::semantic::{
 use crate::model::traffic::{InboundScope, bounded_input, clear_private_traffic, should_suppress};
 use crate::model::utils::{
     clear_private_runtime_data, command_help, is_bot_admin, is_group_admin_command,
-    is_help_command, is_restricted_command, private_chat_claimed, send_sys_info_private,
+    is_help_command, is_main_admin, is_restricted_command, private_chat_claimed,
+    send_sys_info_private,
 };
 use crate::private_image_memory::{
     RecentPrivateImage, forget_private_user_images, recent_private_images, remember_private_images,
@@ -53,6 +58,24 @@ static PENDING_PRIVATE_MESSAGES: LazyLock<Mutex<HashMap<i64, VecDeque<PendingPri
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<RuntimeBot>) {
+    if event.user_id == event.self_id {
+        println!(
+            "[INFO] 忽略私聊自发消息回流 (用户: {}, 消息: {})",
+            event.user_id, event.message_id
+        );
+        return;
+    }
+    let admission =
+        ConversationCoordinator::begin_incoming(ReplyScope::Private(event.user_id)).await;
+    private_message_event_after_ingress(event, bot, admission).await;
+}
+
+pub(crate) async fn private_message_event_after_ingress(
+    event: Arc<PrivateMsgEvent>,
+    bot: Arc<RuntimeBot>,
+    initial_admission: IncomingAdmission,
+) {
+    let ingress = initial_admission.ticket;
     let user_id = event.user_id;
     let reply_scope = ReplyScope::Private(user_id);
     if event.user_id == event.self_id {
@@ -81,12 +104,12 @@ pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<Runtime
         return;
     }
     if let Some(command) = parse_agent_task_command(message) {
-        if bot.get_main_admin().ok() != Some(user_id) {
+        if !is_main_admin(&bot, user_id) {
             println!("[INFO] 私聊跨群任务命令未授权 (用户: {})", user_id);
             return;
         }
         if matches!(command, AgentTaskCommand::Cancel(_)) {
-            stop_private_reply(user_id).await;
+            stop_private_reply(user_id, ingress).await;
         }
         let reply = match command {
             AgentTaskCommand::List => agent_tasks::task_status_report(user_id, None).await,
@@ -323,16 +346,8 @@ pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<Runtime
             None
         };
     let sticker_reaction = recent_sticker_reaction.is_some();
-    let active_reply = is_active(reply_scope).await;
-    let immediate_stop = active_reply && looks_like_immediate_stop_request(message);
-    let can_interrupt = vision_command;
-    let reply_ticket = if can_interrupt {
-        Some(ConversationCoordinator::interrupt(reply_scope).await)
-    } else {
-        None
-    };
-    if immediate_stop {
-        stop_private_reply(user_id).await;
+    if looks_like_immediate_stop_request(message) {
+        stop_private_reply(user_id, ingress).await;
         println!("[INFO] 私聊用户打断回复 (用户: {})", user_id);
         return;
     }
@@ -491,9 +506,13 @@ pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<Runtime
     } else {
         understand(batch_request.clone()).await
     };
+    crate::yunxi::events::project_interaction_cues(
+        user_id,
+        understanding.interaction_cues(),
+    );
     let asks_for_silence = plain_text && (understanding.wants_no_reply || understanding.wants_stop);
     if asks_for_silence {
-        stop_private_reply(user_id).await;
+        stop_private_reply(user_id, ingress).await;
         println!(
             "[INFO] 合并后的私聊消息请求停止当前回复 (用户: {})",
             user_id
@@ -588,9 +607,18 @@ pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<Runtime
     {
         eprintln!("[ERROR] 私聊保存表情包使用记录失败: {}", error);
     }
+    let Some(admission) =
+        admit_understood_private_turn(initial_admission, &understanding).await
+    else {
+        println!(
+            "[INFO] 私聊语义决定已过期，丢弃旧批次 (用户: {}, 消息: {:?})",
+            user_id, source_message_ids
+        );
+        return;
+    };
     let Some(reply_ticket) = claim_or_queue_private_reply(
         reply_scope,
-        reply_ticket,
+        admission,
         user_id,
         nick_name.clone(),
         model_message.clone(),
@@ -621,7 +649,7 @@ pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<Runtime
 #[allow(clippy::too_many_arguments)]
 async fn claim_or_queue_private_reply(
     scope: ReplyScope,
-    ticket: Option<crate::model::ReplyTicket>,
+    admission: IncomingAdmission,
     user_id: i64,
     nickname: String,
     message: String,
@@ -638,7 +666,7 @@ async fn claim_or_queue_private_reply(
         .await
         .get(&user_id)
         .is_some_and(|queue| !queue.is_empty());
-    if should_defer_active_private_message(active || has_queued, ticket.is_some()) {
+    if should_queue_after_executive(active || has_queued, admission.decision) {
         println!(
             "[INFO] 私聊已有回复或排队消息进行中，排队新消息 (用户: {})",
             user_id
@@ -655,20 +683,22 @@ async fn claim_or_queue_private_reply(
         .await;
         return None;
     }
-    let ticket = match ticket {
-        Some(ticket) => ticket,
-        None => ConversationCoordinator::interrupt_locked(scope).await,
-    };
+    let ticket = admission.ticket;
     ConversationCoordinator::begin_reply_locked(scope, ticket, message_ids)
         .await
         .then_some(ticket)
 }
 
-async fn stop_private_reply(user_id: i64) {
+async fn stop_private_reply(user_id: i64, ingress: ReplyTicket) {
     let scope = ReplyScope::Private(user_id);
     let scope_lock = scope_mutex(scope);
     let _scope_guard = scope_lock.lock().await;
-    ConversationCoordinator::interrupt_locked(scope).await;
+    if ConversationCoordinator::cancel_current_incoming_locked(ingress)
+        .await
+        .is_none()
+    {
+        return;
+    }
     PRIVATE_MESSAGE_BATCHES.cancel(user_id).await;
     PENDING_PRIVATE_MESSAGES.lock().await.remove(&user_id);
 }
@@ -756,7 +786,7 @@ async fn delete_private_user_data(user_id: i64, self_id: i64, bot: &RuntimeBot) 
     }
 
     if failures.is_empty() {
-        send_untracked_private_message(
+        send_erasure_receipt(
             bot,
             user_id,
             format!(
@@ -771,7 +801,7 @@ async fn delete_private_user_data(user_id: i64, self_id: i64, bot: &RuntimeBot) 
             user_id,
             failures.join("; ")
         );
-        send_untracked_private_message(
+        send_erasure_receipt(
             bot,
             user_id,
             "数据删除没有全部完成；已尝试其余可归属数据，请稍后重试或联系管理员检查日志。",
@@ -798,16 +828,22 @@ async fn clear_private_erasure_runtime_state(user_id: i64) {
     clear_private_traffic(user_id).await;
 }
 
-async fn send_untracked_private_message(
+async fn send_erasure_receipt(
     bot: &RuntimeBot,
     user_id: i64,
     content: impl Into<String>,
 ) -> bool {
-    match bot.send_private_msg_return(user_id, content.into()).await {
+    match crate::model::send_tracked_unrecorded_plain_text(
+        bot,
+        crate::model::MessageDestination::Private(user_id),
+        content.into(),
+    )
+    .await
+    {
         Ok(_) => true,
         Err(error) => {
             eprintln!(
-                "[ERROR] 私聊无追踪消息发送失败 (用户: {}): {:?}",
+                "[ERROR] 私聊数据删除回执发送失败 (用户: {}): {}",
                 user_id, error
             );
             false
@@ -1005,8 +1041,22 @@ fn parse_task_id(value: &str) -> Option<i64> {
     (task_id > 0).then_some(task_id)
 }
 
-fn should_defer_active_private_message(active_reply: bool, has_explicit_interrupt: bool) -> bool {
-    active_reply && !has_explicit_interrupt
+fn should_queue_after_executive(
+    active_or_queued: bool,
+    decision: OutgoingExecutiveDecision,
+) -> bool {
+    active_or_queued && decision == OutgoingExecutiveDecision::Keep
+}
+
+async fn admit_understood_private_turn(
+    initial: IncomingAdmission,
+    understanding: &MessageUnderstanding,
+) -> Option<IncomingAdmission> {
+    ConversationCoordinator::refine_current_incoming(
+        initial,
+        ConversationCoordinator::context_for_understood_turn(understanding, true),
+    )
+    .await
 }
 
 async fn queue_pending_private_message(
@@ -1083,12 +1133,17 @@ async fn take_pending_private_turn(
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentTaskCommand, PENDING_PRIVATE_MESSAGES, looks_like_immediate_stop_request,
-        normalized_private_sender_name, parse_agent_task_command, queue_pending_private_message,
-        select_recent_images, take_pending_private_turn, with_recent_image_context,
+        AgentTaskCommand, PENDING_PRIVATE_MESSAGES, admit_understood_private_turn,
+        looks_like_immediate_stop_request, normalized_private_sender_name,
+        parse_agent_task_command, queue_pending_private_message, select_recent_images,
+        take_pending_private_turn, with_recent_image_context,
+    };
+    use crate::model::conversation_coordinator::{
+        ConversationCoordinator, OutgoingExecutiveDecision,
     };
     use crate::model::interrupt::{
-        ReplyScope, interrupt, interrupt_locked, is_current, scope_mutex,
+        OutgoingSource, OutgoingState, ReplyScope, interrupt, interrupt_locked, is_current,
+        mark_active, outgoing_fingerprint, prepare_outgoing, scope_mutex, test_outgoing_state,
     };
     use crate::model::semantic::{ImageReferenceIntent, MessageUnderstanding};
     use crate::private_image_memory::{recent_private_images, remember_private_images};
@@ -1114,6 +1169,38 @@ mod tests {
         assert!(looks_like_immediate_stop_request("不要回复了。"));
         assert!(looks_like_immediate_stop_request("stop replying"));
         assert!(!looks_like_immediate_stop_request("为什么他说不要回复了？"));
+    }
+
+    #[test]
+    fn production_private_semantic_helper_defers_proactive_conflict() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let scope = ReplyScope::Private(9_350_001);
+                let initial = ConversationCoordinator::begin_incoming(scope).await;
+                assert!(mark_active(initial.ticket).await);
+                let outgoing = prepare_outgoing(
+                    initial.ticket,
+                    outgoing_fingerprint("proactive check-in"),
+                    OutgoingSource::Proactive,
+                )
+                .await
+                .expect("proactive output should prepare during semantic work");
+
+                let refined = admit_understood_private_turn(
+                    initial,
+                    &MessageUnderstanding::default(),
+                )
+                .await
+                .expect("ingress should remain current");
+
+                assert_eq!(refined.decision, OutgoingExecutiveDecision::Defer);
+                assert_eq!(
+                    test_outgoing_state(outgoing).await,
+                    Some(OutgoingState::Cancelled)
+                );
+                assert!(!is_current(initial.ticket).await);
+            });
     }
 
     #[test]
