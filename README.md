@@ -31,6 +31,12 @@ set +a
 cargo run --locked
 ```
 
+不依赖 Kovi、OneBot 或 QQ 的 Core 验收宿主：
+
+```bash
+cargo run -p yunxi-cli
+```
+
 ## 连接 NapCat
 
 `6099` 是 NapCat WebUI 管理端口，不是机器人连接端口。本项目连接 NapCat 的 OneBot 11
