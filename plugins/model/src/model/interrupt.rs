@@ -187,6 +187,13 @@ pub(crate) async fn is_active_locked(scope: ReplyScope) -> bool {
         .is_some_and(|state| state.active_generation.is_some())
 }
 
+/// Remove all reply-generation state for a scope while its `scope_mutex` is
+/// held by the caller. Data erasure uses this after the Core FIFO barrier,
+/// because a drained adapter may have recreated state after the first cancel.
+pub(crate) async fn clear_reply_state_locked(scope: ReplyScope) -> bool {
+    REPLY_STATES.lock().await.remove(&scope).is_some()
+}
+
 fn prune_states(states: &mut HashMap<ReplyScope, ReplyState>) {
     if states.len() <= 2_048 {
         return;
@@ -200,8 +207,8 @@ fn prune_states(states: &mut HashMap<ReplyScope, ReplyState>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        ReplyScope, claim_follow_up, finish, interrupt, interrupt_if_current, is_active,
-        is_current, mark_active,
+        ReplyScope, claim_follow_up, clear_reply_state_locked, finish, interrupt,
+        interrupt_if_current, is_active, is_current, mark_active, scope_mutex,
     };
 
     #[test]
@@ -247,6 +254,23 @@ mod tests {
                 assert!(is_current(new).await);
                 assert!(interrupt_if_current(new).await);
                 assert!(!is_current(new).await);
+            });
+    }
+
+    #[test]
+    fn data_erasure_clear_removes_private_reply_state() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let scope = ReplyScope::Private(9_000_008);
+                let ticket = interrupt(scope).await;
+                assert!(mark_active(ticket).await);
+                let lock = scope_mutex(scope);
+                let _guard = lock.lock().await;
+                assert!(clear_reply_state_locked(scope).await);
+                drop(_guard);
+                assert!(!is_current(ticket).await);
+                assert!(!is_active(scope).await);
             });
     }
 

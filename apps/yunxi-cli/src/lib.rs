@@ -71,9 +71,15 @@ impl ActionPort for FakeEnvironment {
                 .lock()
                 .expect("fake environment lock poisoned");
             let sequence = deliveries.len() + 1;
+            let conversation_id = match &action {
+                ProposedAction::SendMessage(message) => Some(message.conversation_id),
+                ProposedAction::ReachOut(_) | ProposedAction::Noop => None,
+            };
             deliveries.push(action);
             Ok(ActionPortOutcome::Delivered {
                 external_reference: Some(format!("fake-delivery-{sequence}")),
+                message_id: Some(yunxi_core::MessageId::new()),
+                conversation_id,
             })
         })
     }
@@ -224,12 +230,12 @@ where
         match result {
             ActionResult::Noop => Ok(HostResponse::Noop),
             ActionResult::Executed { outcome, .. } => match outcome {
-                ActionPortOutcome::Delivered { external_reference } => {
-                    Ok(HostResponse::Delivered {
-                        message: message.unwrap_or_default(),
-                        external_reference,
-                    })
-                }
+                ActionPortOutcome::Delivered {
+                    external_reference, ..
+                } => Ok(HostResponse::Delivered {
+                    message: message.unwrap_or_default(),
+                    external_reference,
+                }),
                 ActionPortOutcome::Deferred { reason } => Ok(HostResponse::Deferred {
                     message: message.unwrap_or_default(),
                     reason,

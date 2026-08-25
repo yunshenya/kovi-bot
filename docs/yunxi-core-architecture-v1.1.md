@@ -3532,54 +3532,6 @@ Effector / Adapter
 
 ---
 
-# 137.1 当前实现状态（2026-08-25）
-
-本节记录仓库当前实现，不改变前文的长期目标。状态中的“部分完成”表示领域类型或
-基础设施已经存在，但生产行为仍由旧 Kovi/QQ 路径承担，不能据此视为迁移完成。
-
-| Phase | 状态 | 当前实现与剩余工作 |
-| --- | --- | --- |
-| 0 Core crate | 已完成 | `yunxi-core` 已独立成 crate，可离线测试；CI 检查 Kovi、QQ、SQL 存储依赖边界。 |
-| 1 Identity | 基础完成 | 已有 Core ID、PostgreSQL identity/conversation mapping 和 Kovi bridge；`ConversationMember`、附件归一化和完整 identity unlink 仍未实现。 |
-| 2 Shadow Runtime | 已完成 | QQ ingress 会生成通用 `WorldEvent`，进入 bounded runtime、Attention 和 WorkingState。 |
-| 3 OpenLoop | 基础完成 | 已有平台无关领域模型、PostgreSQL store、去重、容量、atomic claim、lease recovery 和到期调度；更丰富的模型提取仍可继续演进。 |
-| 4 Memory Bridge | 已完成 | `MemoryStore` port 已接入现有记忆系统，并提供规范化 Core 存储。 |
-| 5 Proactive | 部分完成 | Core 已有 motive/candidate/opportunity/`ReachOut`，旧主动聊天也会投影到 Core；调度、画像和部分冷却状态仍归 legacy host。 |
-| 6 Intent / Action | 当前范围完成 | 已接通 Planner、`SendMessage`、`ReachOut`、ActionArbiter、DeliveryResolver 和 QQ ActionPort；`UseTool`、Goal/OpenLoop 管理类 Action 尚未实现。 |
-| 7 Direct Conversation | 部分完成 | 私聊纯文本只有在 `CORE_PRIVATE_CUTOVER=1` 时由 Core canary 接管；命令、管理员能力、附件及群聊回复仍由成熟 legacy handler 处理。 |
-| 8 Affect | 部分完成 | Core state/port 和 PostgreSQL store 已有，Planner 可读取和提交更新；生产 mood 的主要更新逻辑仍在 `mood_system`。 |
-| 9 Relation | 部分完成 | Core state/port 和 PostgreSQL store 已有，Planner 可读取和提交更新；尚未形成由生产交互持续驱动的关系演化闭环。 |
-| 10 Memory v2 | 部分完成 | 新表及双读/双写兼容路径已存在；历史数据 backfill、数量/哈希校验、人工抽样和可回滚 migration service 尚未完成。 |
-| 11 Goal Event Integration | 部分完成 | Goal 领域模型、store 与事件类型已存在；Reminder、`agent_tasks`、tools 尚未统一投射为 Goal 事件，runtime 也尚未 hydrate Goal context。 |
-| 12 CLI Host | 最小验收完成 | `yunxi-cli` 已能用 FakeModel/FakeEnvironment 跑通 Event -> Planner -> Intent -> Action；还不是带 Memory/Affect/Relation/OpenLoop 持久化的独立产品 host。 |
-| 13 App 预留 | API 部分满足 | 当前通用 Event/Action 边界可供新 host 接入；Desktop/Mobile/Web host、协议层以及 App 专属事件和 Action 均未实现。 |
-
-仍未完成的跨阶段产品能力：
-
-- 将 Kovi plugin 进一步收敛为纯 Adapter，完成私聊和群聊生产 cutover；
-- 建立平台无关的 canonical owner/persona，移除 `main_admin: i64` 对核心所有者语义的承担；
-- 实现历史 Memory migration、数据导出/导入、identity unlink 和跨平台携带性验收；
-- 支持结构化 Message/附件以及需要的 `ConversationMember` 模型；
-- 将 Affect、Relation、Goal 的生产事件更新闭环真正迁入 Core；
-- 扩展当前只有消息投递的 Action/Tool 能力，并补独立 App host。
-
-## OpenLoop 到期 owner 路由合同
-
-生产调度必须遵守以下规则：
-
-- `Person` owner 生成 person-scoped `ProspectiveMemoryDue`，模型生成 `ReachOut(PersonId)`；
-- `Conversation` owner 生成 conversation-scoped `ProspectiveMemoryDue`，模型生成同一
-  `ConversationId` 的非引用 `SendMessage`（`reply_to = None`）；
-- Conversation 的 QQ 路由优先使用持久化唯一映射。只有持久层暂时不可用时，才允许
-  回退到有界进程内缓存；权威查询无映射或映射歧义时不得使用旧缓存；
-- `Global` owner 在当前 host 没有安全投递路由，因此不向 runtime 提交到期事件。
-  scheduler 必须调用 `defer(id, None, now)`，将记录恢复为 `Open`、清除 `due_at` 和
-  `triggered_at`，避免重复 claim 和反复占用 lease；
-- runtime 关闭或事件未被接收属于临时失败，保留有界延迟重试，不得与“不支持 owner”
-  混为一类。
-
----
-
 # 138. 最终实施哲学
 
 不要把芸汐实现成：
@@ -3644,3 +3596,31 @@ WORLD
 > **Yunxi Core 决定芸汐想做什么；Platform Adapter 决定这个环境里具体怎么做。**
 
 如果一个新的认知领域类型必须知道“QQ 号”“QQ群号”“Kovi RuntimeBot”才能工作，那么这个抽象大概率放错了层。
+
+---
+
+# 140. Conversation Concurrency v1.1：双向同时发言与发送前重校验
+
+本架构增加跨层规范：`yunxi-conversation-concurrency-v1.1-optimization-spec.md`。
+
+V1 Core 必须为普通自然语言输出维护：
+
+```text
+Thinking → Prepared → Committed → Sent
+             ├→ Cancelled
+             └→ Superseded
+```
+
+**生成完成不等于允许发送。** `Prepared` 消息在进入 `Committed` 前必须基于最新 `ReplyTicket`、`conversation_version`、Stop 状态、目标有效性和权限执行 pre-commit revalidation。
+
+新用户事件在 `Committed` 前可以使待发送消息：`Keep / Cancel / Rewrite / Merge / Defer`。`Committed` 是副作用 Point of No Return；之后默认不强制撤回。若双方已经分别进入不可撤销边界并近乎同时发言，应允许自然消息碰撞，并产生 `WorldEvent::MessageCollisionDetected`。
+
+`ConversationCoordinator` 负责 generation、ReplyTicket、conversation version、PendingOutgoing、commit serialization、stale detection、cancellation propagation 与 collision detection。语义上是否 `Keep / Rewrite / Merge / Defer` 交由 Executive。
+
+主动消息可有 300–1000ms、可配置且可关闭的短 `Prepared` grace window，仅用于捕获“刚准备主动发言时用户恰好发来消息”，禁止用固定长延迟伪装真人打字。
+
+同一 Conversation 的真实 send commit 必须串行化，但禁止持锁等待 LLM。
+
+验收标准：
+
+> 在 `Committed` 之前，新事件可以阻止明显过时的待发送内容；进入 `Committed` 后允许自然碰撞，并把碰撞本身作为新的 WorldEvent。

@@ -9,6 +9,7 @@ pub mod arbiter;
 pub mod attention;
 pub mod delivery;
 pub mod event;
+pub mod goal;
 pub mod identity;
 pub mod intent;
 pub mod memory;
@@ -39,6 +40,10 @@ pub use event::{
     MessageReceivedEvent, MessageSentEvent, ProspectiveMemoryEvent, ReminderDueEvent,
     ToolCompletedEvent, ToolFailedEvent, TraceContext, TraceError, WorldEvent, WorldEventKind,
 };
+pub use goal::{
+    Goal, GoalDraft, GoalKind, GoalOwner, GoalState, GoalValidationError, MAX_GOAL_DETAILS_BYTES,
+    MAX_GOAL_DETAILS_CHARS, MAX_GOAL_TITLE_BYTES, MAX_GOAL_TITLE_CHARS,
+};
 pub use identity::{
     ConversationId, ConversationKind, EventId, ExternalConversation, ExternalIdentity,
     ExternalReferenceError, GoalId, MAX_EXTERNAL_ID_BYTES, MAX_PLATFORM_ID_BYTES, MemoryId,
@@ -63,7 +68,8 @@ pub use planner::{
     PlannerOutputValidationError, PlannerStateSnapshot, RelationState, StateUpdateProposal,
 };
 pub use ports::{
-    Clock, CoreServices, GoalStore, IdentityStore, IdentityStoreError, IdentityStoreFuture,
+    AffectStore, AffectStoreError, AffectStoreFuture, Clock, CoreServices, GoalStore,
+    GoalStoreError, GoalStoreFuture, IdentityStore, IdentityStoreError, IdentityStoreFuture,
     MemoryStore, MemoryStoreError, MemoryStoreFuture, OpenLoopStore, OpenLoopStoreError,
     OpenLoopStoreFuture, RelationStore, RelationStoreError, RelationStoreFuture, SystemClock,
 };
@@ -74,8 +80,10 @@ pub use proactive::{
     ReachOutIntent,
 };
 pub use runtime::{
-    Admission, CognitiveRuntime, PlannedProcessingOutcome, ProcessingOutcome, RuntimeConfig,
-    RuntimeConfigError, RuntimeHandle, RuntimeObservation, SubmitError,
+    Admission, CognitiveRuntime, DataErasureError, MAX_BLOCKED_DATA_ERASURE_CONVERSATIONS,
+    MAX_BLOCKED_DATA_ERASURE_PEOPLE, MAX_DATA_ERASURE_CONVERSATIONS, PlannedProcessingOutcome,
+    ProcessingOutcome, RuntimeConfig, RuntimeConfigError, RuntimeHandle, RuntimeObservation,
+    SubmitError,
 };
 pub use working_state::{
     CompactEvent, ConversationSnapshot, StateUpdate, WorkingState, WorkingStateConfig,

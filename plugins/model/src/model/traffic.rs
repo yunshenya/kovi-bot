@@ -83,6 +83,15 @@ pub(crate) async fn should_suppress(scope: InboundScope, trusted: bool) -> bool 
     false
 }
 
+pub(crate) async fn clear_private_traffic(user_id: i64) -> bool {
+    TRAFFIC_STATE
+        .lock()
+        .await
+        .scopes
+        .remove(&InboundScope::Private(user_id))
+        .is_some()
+}
+
 pub(crate) fn bounded_input(value: &str) -> String {
     truncate_chars(value, config::get().traffic().max_input_chars())
 }
@@ -101,12 +110,32 @@ pub(crate) fn truncate_chars(value: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::truncate_chars;
+    use super::{InboundScope, ScopeTraffic, TRAFFIC_STATE, clear_private_traffic, truncate_chars};
 
     #[test]
     fn input_truncation_is_unicode_safe_and_bounded() {
         assert_eq!(truncate_chars("abcdef", 4), "abc…");
         assert_eq!(truncate_chars("你好世界", 3), "你好…");
         assert_eq!(truncate_chars("ok", 4), "ok");
+    }
+
+    #[test]
+    fn data_erasure_clear_removes_only_the_private_traffic_scope() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let private = InboundScope::Private(9_100_001);
+                let other = InboundScope::Private(9_100_002);
+                {
+                    let mut state = TRAFFIC_STATE.lock().await;
+                    state.scopes.insert(private, ScopeTraffic::default());
+                    state.scopes.insert(other, ScopeTraffic::default());
+                }
+
+                assert!(clear_private_traffic(9_100_001).await);
+                let state = TRAFFIC_STATE.lock().await;
+                assert!(!state.scopes.contains_key(&private));
+                assert!(state.scopes.contains_key(&other));
+            });
     }
 }

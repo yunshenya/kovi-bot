@@ -350,6 +350,164 @@ impl WorkingState {
         })
     }
 
+    /// Applies a planner-validated topic update and advances snapshot
+    /// versions just like any other working-state mutation.
+    pub(crate) fn set_current_topic(
+        &mut self,
+        conversation_id: ConversationId,
+        topic: String,
+    ) -> Result<StateUpdate, WorkingStateError> {
+        let next_global_version = self
+            .global
+            .version
+            .checked_add(1)
+            .ok_or(WorkingStateError::VersionExhausted)?;
+        let next_conversation_version =
+            self.conversations
+                .get(&conversation_id)
+                .map_or(Ok(1), |state| {
+                    state
+                        .version
+                        .checked_add(1)
+                        .ok_or(WorkingStateError::VersionExhausted)
+                })?;
+
+        let mut evicted_conversation = None;
+        if !self.conversations.contains_key(&conversation_id)
+            && self.conversations.len() >= self.config.max_conversations
+            && let Some(evicted) = self.conversation_order.pop_front()
+        {
+            self.conversations.remove(&evicted);
+            evicted_conversation = Some(evicted);
+        }
+
+        touch_lru(&mut self.conversation_order, conversation_id);
+        let state = self.conversations.entry(conversation_id).or_default();
+        state.current_topic = Some(topic);
+        state.version = next_conversation_version;
+        self.global.version = next_global_version;
+
+        Ok(StateUpdate {
+            global_version: next_global_version,
+            conversation_id: Some(conversation_id),
+            conversation_version: Some(next_conversation_version),
+            evicted_conversation,
+        })
+    }
+
+    /// Removes a resolved durable open-loop reference from all bounded
+    /// conversation snapshots. The durable store remains the source of truth;
+    /// this only prevents stale references from lingering in working state.
+    pub(crate) fn resolve_open_loop_reference(
+        &mut self,
+        open_loop_id: OpenLoopId,
+    ) -> Result<bool, WorkingStateError> {
+        let affected: Vec<_> = self
+            .conversations
+            .iter()
+            .filter_map(|(conversation_id, state)| {
+                state
+                    .open_loops
+                    .contains(&open_loop_id)
+                    .then_some((*conversation_id, state.version))
+            })
+            .collect();
+        if affected.is_empty() {
+            return Ok(false);
+        }
+
+        let next_global_version = self
+            .global
+            .version
+            .checked_add(1)
+            .ok_or(WorkingStateError::VersionExhausted)?;
+        let next_versions: Vec<_> = affected
+            .iter()
+            .map(|(conversation_id, version)| {
+                version
+                    .checked_add(1)
+                    .map(|next| (*conversation_id, next))
+                    .ok_or(WorkingStateError::VersionExhausted)
+            })
+            .collect::<Result<_, _>>()?;
+
+        for (conversation_id, next_version) in next_versions {
+            if let Some(state) = self.conversations.get_mut(&conversation_id) {
+                state.open_loops.retain(|id| *id != open_loop_id);
+                state.version = next_version;
+            }
+            touch_lru(&mut self.conversation_order, conversation_id);
+        }
+        self.global.version = next_global_version;
+        Ok(true)
+    }
+
+    /// Removes direct-conversation snapshots and the person's identifier from
+    /// retained shared-conversation snapshots at a runtime control barrier.
+    /// Shared conversation text is retained because it is shared history and
+    /// compact events do not retain sender identifiers. The global event log
+    /// contains neither message text nor person identifiers. A successful
+    /// mutation advances all affected versions so callers cannot mistake a
+    /// pre-erasure snapshot for current runtime state.
+    pub(crate) fn purge_person_domain(
+        &mut self,
+        person_id: PersonId,
+        conversation_ids: &[ConversationId],
+    ) -> Result<usize, WorkingStateError> {
+        let mut removed_conversations = Vec::new();
+        for conversation_id in conversation_ids
+            .iter()
+            .copied()
+            .filter(|conversation_id| self.conversations.contains_key(conversation_id))
+        {
+            if !removed_conversations.contains(&conversation_id) {
+                removed_conversations.push(conversation_id);
+            }
+        }
+        let affected_retained: Vec<_> = self
+            .conversations
+            .iter()
+            .filter_map(|(conversation_id, state)| {
+                (!removed_conversations.contains(conversation_id)
+                    && state.active_people.contains(&person_id))
+                .then_some((*conversation_id, state.version))
+            })
+            .collect();
+        if removed_conversations.is_empty() && affected_retained.is_empty() {
+            return Ok(0);
+        }
+        let next_global_version = self
+            .global
+            .version
+            .checked_add(1)
+            .ok_or(WorkingStateError::VersionExhausted)?;
+        let next_retained_versions: Vec<_> = affected_retained
+            .iter()
+            .map(|(conversation_id, version)| {
+                version
+                    .checked_add(1)
+                    .map(|next| (*conversation_id, next))
+                    .ok_or(WorkingStateError::VersionExhausted)
+            })
+            .collect::<Result<_, _>>()?;
+
+        for conversation_id in &removed_conversations {
+            self.conversations.remove(conversation_id);
+        }
+        self.conversation_order
+            .retain(|conversation_id| !removed_conversations.contains(conversation_id));
+        for (conversation_id, next_version) in next_retained_versions {
+            if let Some(state) = self.conversations.get_mut(&conversation_id) {
+                state
+                    .active_people
+                    .retain(|candidate| *candidate != person_id);
+                state.version = next_version;
+            }
+        }
+        self.global.version = next_global_version;
+        Ok(removed_conversations.len())
+    }
+
     #[must_use]
     pub fn conversation(&self, id: ConversationId) -> Option<ConversationSnapshot> {
         self.conversations

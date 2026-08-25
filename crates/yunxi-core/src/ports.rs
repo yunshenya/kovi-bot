@@ -1,8 +1,10 @@
+use crate::goal::{Goal, GoalDraft, GoalOwner};
+use crate::identity::GoalId;
 use crate::identity::{
     ConversationId, ConversationKind, ExternalConversation, ExternalIdentity, OpenLoopId, PersonId,
 };
 use crate::open_loop::{OpenLoop, OpenLoopDraft, OpenLoopOwner};
-use crate::planner::{ModelBackend, RelationState};
+use crate::planner::{AffectState, ModelBackend, RelationState};
 use crate::{Memory, MemoryDraft, MemoryId, MemoryQuery, MemoryScope};
 use chrono::{DateTime, Utc};
 use std::error::Error as StdError;
@@ -20,6 +22,43 @@ pub type RelationStoreFuture<'a, T> =
 
 pub trait RelationStore: Send + Sync {
     fn get<'a>(&'a self, person_id: PersonId) -> RelationStoreFuture<'a, Option<RelationState>>;
+
+    fn set<'a>(&'a self, state: RelationState) -> RelationStoreFuture<'a, RelationState>;
+}
+
+/// Persistence boundary for slow affect state. Implementations may bridge an
+/// existing host mood system while keeping the Core-facing representation
+/// platform-neutral.
+pub type AffectStoreFuture<'a, T> =
+    Pin<Box<dyn Future<Output = Result<T, AffectStoreError>> + Send + 'a>>;
+
+pub trait AffectStore: Send + Sync {
+    fn get<'a>(&'a self, person_id: PersonId) -> AffectStoreFuture<'a, AffectState>;
+
+    fn set<'a>(
+        &'a self,
+        person_id: PersonId,
+        state: AffectState,
+    ) -> AffectStoreFuture<'a, AffectState>;
+}
+
+#[derive(Debug, Error)]
+pub enum AffectStoreError {
+    #[error("affect storage operation failed")]
+    Storage {
+        #[source]
+        source: Box<dyn StdError + Send + Sync>,
+    },
+    #[error("affect state is invalid")]
+    InvalidState,
+}
+
+impl AffectStoreError {
+    pub fn storage(source: impl StdError + Send + Sync + 'static) -> Self {
+        Self::Storage {
+            source: Box::new(source),
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -29,6 +68,8 @@ pub enum RelationStoreError {
         #[source]
         source: Box<dyn StdError + Send + Sync>,
     },
+    #[error("relation state is invalid")]
+    InvalidState,
 }
 
 impl RelationStoreError {
@@ -39,11 +80,66 @@ impl RelationStoreError {
     }
 }
 
-/// Goal persistence is intentionally a narrow marker at this phase.  Goal
-/// entities and mutation commands will be introduced by the Goal phase; the
-/// service container can already carry a host implementation without making
-/// the current Core depend on a platform goal schema.
-pub trait GoalStore: Send + Sync {}
+/// Persistence boundary for long-running Core goals.
+///
+/// Every method has an unavailable default so existing hosts that only need a
+/// marker service can continue to implement `GoalStore` with an empty `impl`.
+/// Hosts adopting the goal phase override the CRUD methods they support.
+pub type GoalStoreFuture<'a, T> =
+    Pin<Box<dyn Future<Output = Result<T, GoalStoreError>> + Send + 'a>>;
+
+pub trait GoalStore: Send + Sync {
+    fn create<'a>(&'a self, _draft: &'a GoalDraft) -> GoalStoreFuture<'a, Goal> {
+        unavailable_goal_store()
+    }
+
+    fn get(&self, _id: GoalId) -> GoalStoreFuture<'_, Option<Goal>> {
+        unavailable_goal_store()
+    }
+
+    fn list<'a>(&'a self, _owner: &'a GoalOwner, _limit: usize) -> GoalStoreFuture<'a, Vec<Goal>> {
+        unavailable_goal_store()
+    }
+
+    fn update<'a>(&'a self, _goal: &'a Goal) -> GoalStoreFuture<'a, Goal> {
+        unavailable_goal_store()
+    }
+
+    fn delete(&self, _id: GoalId) -> GoalStoreFuture<'_, bool> {
+        unavailable_goal_store()
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum GoalStoreError {
+    #[error("goal storage operation failed")]
+    Storage {
+        #[source]
+        source: Box<dyn StdError + Send + Sync>,
+    },
+    #[error("goal store is unavailable")]
+    Unavailable,
+    #[error("goal {id} was not found")]
+    NotFound { id: GoalId },
+    #[error("goal owner capacity exceeded (limit {limit})")]
+    CapacityExceeded { owner: GoalOwner, limit: usize },
+    #[error("goal operation conflicts with another update")]
+    Conflict,
+    #[error("invalid goal operation: {reason}")]
+    InvalidRequest { reason: String },
+}
+
+impl GoalStoreError {
+    pub fn storage(source: impl StdError + Send + Sync + 'static) -> Self {
+        Self::Storage {
+            source: Box::new(source),
+        }
+    }
+}
+
+fn unavailable_goal_store<'a, T>() -> GoalStoreFuture<'a, T> {
+    Box::pin(async { Err(GoalStoreError::Unavailable) })
+}
 
 /// Shared, platform-neutral dependencies used by a cognitive runtime.
 ///
@@ -56,6 +152,7 @@ pub struct CoreServices {
     pub identity: Arc<dyn IdentityStore>,
     pub open_loops: Arc<dyn OpenLoopStore>,
     pub relations: Arc<dyn RelationStore>,
+    pub affect: Arc<dyn AffectStore>,
     pub goals: Arc<dyn GoalStore>,
     pub model: Arc<dyn ModelBackend>,
 }
@@ -68,6 +165,7 @@ impl std::fmt::Debug for CoreServices {
             .field("identity", &true)
             .field("open_loops", &true)
             .field("relations", &true)
+            .field("affect", &true)
             .field("goals", &true)
             .finish_non_exhaustive()
     }
@@ -81,6 +179,7 @@ impl CoreServices {
             identity: Arc::new(UnavailableIdentityStore),
             open_loops: Arc::new(UnavailableOpenLoopStore),
             relations: Arc::new(UnavailableRelationStore),
+            affect: Arc::new(UnavailableAffectStore),
             goals: Arc::new(UnavailableGoalStore),
             model,
         }
@@ -115,6 +214,12 @@ impl CoreServices {
     #[must_use]
     pub fn with_relations(mut self, relations: Arc<dyn RelationStore>) -> Self {
         self.relations = relations;
+        self
+    }
+
+    #[must_use]
+    pub fn with_affect(mut self, affect: Arc<dyn AffectStore>) -> Self {
+        self.affect = affect;
         self
     }
 
@@ -440,6 +545,39 @@ impl RelationStore for UnavailableRelationStore {
             )))
         })
     }
+
+    fn set<'a>(&'a self, _state: RelationState) -> RelationStoreFuture<'a, RelationState> {
+        Box::pin(async {
+            Err(RelationStoreError::storage(UnavailablePortError(
+                "relation store is unavailable",
+            )))
+        })
+    }
+}
+
+#[derive(Debug)]
+struct UnavailableAffectStore;
+
+impl AffectStore for UnavailableAffectStore {
+    fn get<'a>(&'a self, _person_id: PersonId) -> AffectStoreFuture<'a, AffectState> {
+        Box::pin(async {
+            Err(AffectStoreError::storage(UnavailablePortError(
+                "affect store is unavailable",
+            )))
+        })
+    }
+
+    fn set<'a>(
+        &'a self,
+        _person_id: PersonId,
+        _state: AffectState,
+    ) -> AffectStoreFuture<'a, AffectState> {
+        Box::pin(async {
+            Err(AffectStoreError::storage(UnavailablePortError(
+                "affect store is unavailable",
+            )))
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -464,12 +602,13 @@ impl Clock for SystemClock {
 #[cfg(test)]
 mod tests {
     use super::{
-        IdentityStore, IdentityStoreError, IdentityStoreFuture, MemoryStore, MemoryStoreError,
-        MemoryStoreFuture,
+        GoalStore, GoalStoreError, IdentityStore, IdentityStoreError, IdentityStoreFuture,
+        MemoryStore, MemoryStoreError, MemoryStoreFuture,
     };
     use crate::{
-        ConversationId, ConversationKind, ExternalConversation, ExternalIdentity, Memory,
-        MemoryDraft, MemoryId, MemoryQuery, MemoryScope, PersonId, PlatformId,
+        ConversationId, ConversationKind, ExternalConversation, ExternalIdentity, GoalDraft,
+        GoalId, GoalKind, GoalOwner, Memory, MemoryDraft, MemoryId, MemoryQuery, MemoryScope,
+        PersonId, PlatformId,
     };
     use chrono::Utc;
     use std::sync::Arc;
@@ -594,5 +733,37 @@ mod tests {
                 .await
                 .expect("memory should be forgotten")
         );
+    }
+
+    struct MarkerGoalStore;
+
+    impl GoalStore for MarkerGoalStore {}
+
+    #[tokio::test]
+    async fn goal_store_defaults_remain_usable_as_a_trait_object() {
+        let store: Arc<dyn GoalStore> = Arc::new(MarkerGoalStore);
+        let draft = GoalDraft::new(GoalOwner::Global, GoalKind::Project, "ship core")
+            .expect("valid goal draft");
+        assert!(matches!(
+            store.create(&draft).await,
+            Err(GoalStoreError::Unavailable)
+        ));
+        assert!(matches!(
+            store.get(GoalId::new()).await,
+            Err(GoalStoreError::Unavailable)
+        ));
+        assert!(matches!(
+            store.list(&GoalOwner::Global, 4).await,
+            Err(GoalStoreError::Unavailable)
+        ));
+        let goal = crate::Goal::from_draft(GoalId::new(), &draft, Utc::now()).expect("valid goal");
+        assert!(matches!(
+            store.update(&goal).await,
+            Err(GoalStoreError::Unavailable)
+        ));
+        assert!(matches!(
+            store.delete(goal.id()).await,
+            Err(GoalStoreError::Unavailable)
+        ));
     }
 }

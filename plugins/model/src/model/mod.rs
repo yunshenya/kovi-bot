@@ -20,7 +20,7 @@ pub(crate) mod utils;
 pub(crate) use interrupt::{ReplyScope, ReplyTicket, finish, interrupt, is_current};
 #[cfg(feature = "integration-tests")]
 pub(crate) use interrupt::{is_active, mark_active};
-pub(crate) use message_actions::{MessageDestination, normalize_legacy_message_text};
+pub(crate) use message_actions::{MessageDestination, ReplyPlan, normalize_legacy_message_text};
 pub(crate) use message_transport::MessageTransport;
 pub(crate) use model_gateway::ModelGateway;
 pub(crate) use recall::record_standalone_bot_message;

@@ -257,7 +257,7 @@ impl ProactiveChatManager {
             };
             return matches!(
                 bridge
-                    .dispatch_action(ProposedAction::ReachOut(action))
+                    .dispatch_action(user_id, ProposedAction::ReachOut(action))
                     .await,
                 Some(ActionResult::Executed {
                     outcome: ActionPortOutcome::Delivered { .. },

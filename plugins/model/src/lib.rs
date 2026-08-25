@@ -113,6 +113,138 @@ pub mod test_support {
 /// 后台任务启动标志，确保只启动一次
 static BACKGROUND_TASK_STARTED: AtomicBool = AtomicBool::new(false);
 const DATABASE_INIT_MAX_ATTEMPTS: u32 = 8;
+const CORE_PRIVATE_CUTOVER_ENV: &str = "YUNXI_CORE_PRIVATE_CUTOVER";
+
+/// Exactly one runtime owns a private message. Core takeover stays opt-in
+/// until the new path has parity with the mature private-message pipeline.
+/// This makes rollback a process restart with the flag removed and, more
+/// importantly, prevents an accepted shadow event from creating a second
+/// reply beside the legacy handler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrivateMessageOwner {
+    Legacy,
+    Core,
+    Dropped,
+}
+
+fn core_private_cutover_enabled_from(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "on"
+        )
+    })
+}
+
+fn core_private_cutover_enabled() -> bool {
+    core_private_cutover_enabled_from(
+        std::env::var_os(CORE_PRIVATE_CUTOVER_ENV)
+            .as_deref()
+            .and_then(std::ffi::OsStr::to_str),
+    )
+}
+
+/// Keep host-specific private features on the mature path even if the bridge
+/// later broadens its own event admission. The Core canary currently accepts
+/// only non-command text and cannot preserve image/sticker semantics.
+fn core_private_canary_payload_is_safe(
+    message: &kovi::Message,
+    text: Option<&str>,
+    sender_is_admin: bool,
+) -> bool {
+    message.iter().all(|segment| segment.type_ == "text")
+        && text.is_some_and(|text| {
+            let text = text.trim();
+            !text.is_empty()
+                && !text.starts_with('#')
+                && !private_text_requires_legacy(text, sender_is_admin)
+        })
+}
+
+/// Requests backed by mature host tools stay on the legacy pipeline until
+/// Core has equivalent declarative intents. Administrator conversations are
+/// kept there wholesale because their natural-language control surface also
+/// includes cross-group sends, health checks, and persistent task management.
+fn private_text_requires_legacy(text: &str, sender_is_admin: bool) -> bool {
+    if sender_is_admin
+        || crate::reminders::looks_like_reminder_request(text)
+        || crate::agent_runs::looks_like_agent_run_request(text)
+    {
+        return true;
+    }
+
+    // The creation detectors intentionally reject cancellation/status phrases,
+    // because those must not force a create call. They still require the
+    // legacy tool-capable path, though, so keep a conservative routing guard.
+    if text.contains("提醒") || text.contains("定时") {
+        return true;
+    }
+
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("agent run") || lower.contains("agent-run") {
+        return true;
+    }
+    let agent_run_control = [
+        "查看",
+        "列出",
+        "列表",
+        "有哪些",
+        "状态",
+        "进度",
+        "取消",
+        "删除",
+        "停止",
+        "不用",
+        "不要",
+        "别",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker));
+    let agent_run_target = ["监控", "监测", "轮询", "盯着", "盯一下"]
+        .iter()
+        .any(|marker| text.contains(marker));
+    agent_run_control && agent_run_target
+}
+
+/// Select a single owner at the Kovi ingress boundary.
+///
+/// Unsupported events always stay with the legacy handler. Even during an
+/// explicit Core canary, an ingress rejection falls back immediately instead
+/// of silently losing the user's message. Once Core accepts the event, legacy
+/// must not run as well because both paths can send a visible reply.
+async fn select_private_message_owner<Interrupt, InterruptFuture>(
+    core_cutover_enabled: bool,
+    core_supports_event: bool,
+    interrupt_core: Interrupt,
+    enqueue_core: impl FnOnce() -> yunxi::bridge::EnqueueOutcome,
+) -> PrivateMessageOwner
+where
+    Interrupt: FnOnce() -> InterruptFuture,
+    InterruptFuture: std::future::Future<Output = ()>,
+{
+    if !core_cutover_enabled {
+        // The backend is observe-only for direct MessageReceived events while
+        // cutover is disabled, so shadowing cannot create a duplicate reply.
+        if core_supports_event && enqueue_core() == yunxi::bridge::EnqueueOutcome::Blocked {
+            return PrivateMessageOwner::Dropped;
+        }
+        return PrivateMessageOwner::Legacy;
+    }
+    if !core_supports_event {
+        return PrivateMessageOwner::Legacy;
+    }
+
+    // Invalidate an in-flight legacy or Core model call before this message is
+    // admitted. If ingress then rejects the message, the legacy fallback below
+    // claims a fresh ticket through its normal pipeline.
+    interrupt_core().await;
+    match enqueue_core() {
+        yunxi::bridge::EnqueueOutcome::Accepted => PrivateMessageOwner::Core,
+        yunxi::bridge::EnqueueOutcome::DroppedAtCapacity
+        | yunxi::bridge::EnqueueOutcome::SkippedInvalid => PrivateMessageOwner::Legacy,
+        yunxi::bridge::EnqueueOutcome::Blocked => PrivateMessageOwner::Dropped,
+    }
+}
 
 /// 插件主入口函数
 ///
@@ -197,10 +329,21 @@ async fn main() {
             .expect("Yunxi open-loop store must be initialized before handlers"),
         Arc::clone(&proactive_bot),
     );
+    yunxi::install_shadow_bridge(Arc::clone(&yunxi_bridge))
+        .expect("Yunxi ShadowBridge must be installed exactly once");
     let group_bridge = Arc::clone(&yunxi_bridge);
     let private_bridge = Arc::clone(&yunxi_bridge);
     let group_bot = Arc::clone(&proactive_bot);
     let private_bot = Arc::clone(&proactive_bot);
+    let core_private_cutover = core_private_cutover_enabled();
+    println!(
+        "[INFO] 私聊回复所有者: {} ({CORE_PRIVATE_CUTOVER_ENV}=1 可启用 Core canary)",
+        if core_private_cutover {
+            "Yunxi Core canary"
+        } else {
+            "legacy"
+        }
+    );
     let group_message = move |event: Arc<kovi::event::GroupMsgEvent>| {
         let bridge = Arc::clone(&group_bridge);
         let bot = Arc::clone(&group_bot);
@@ -212,9 +355,60 @@ async fn main() {
     let private_message = move |event: Arc<kovi::event::PrivateMsgEvent>| {
         let bridge = Arc::clone(&private_bridge);
         let bot = Arc::clone(&private_bot);
-        bridge.enqueue_private(&event);
+        let user_id = event.user_id;
+        let confirmed_data_erasure = event
+            .borrow_text()
+            .is_some_and(|text| text.trim() == "#删除我的数据 确认");
+        let data_erasure_token = confirmed_data_erasure
+            .then(|| bridge.capture_private_data_erasure(user_id))
+            .flatten();
+        let handler_token = (!confirmed_data_erasure)
+            .then(|| bridge.capture_private_handler(user_id))
+            .flatten();
+        let sender_is_admin = crate::model::utils::is_bot_admin(&bot, event.user_id);
+        let core_supports_event = core_private_canary_payload_is_safe(
+            &event.message,
+            event.borrow_text(),
+            sender_is_admin,
+        ) && bridge.handles_private(&event);
         async move {
-            private_message_event(event, bot).await;
+            if confirmed_data_erasure {
+                let Some(token) = data_erasure_token else {
+                    println!("[INFO] 私聊数据删除已在等待或执行，丢弃重复确认 (用户: {user_id})");
+                    return;
+                };
+                let Some(_permit) = token.enter().await else {
+                    println!("[INFO] 私聊数据删除确认已过期，停止执行 (用户: {user_id})");
+                    return;
+                };
+                private_message_event(event, bot).await;
+                return;
+            }
+            let Some(token) = handler_token else {
+                println!("[INFO] 私聊数据删除屏障期间丢弃入站 (用户: {user_id})");
+                return;
+            };
+            let Some(_permit) = token.enter().await else {
+                println!("[INFO] 私聊数据删除 epoch 已推进，丢弃旧入站 (用户: {user_id})");
+                return;
+            };
+            if bridge.is_user_blocked(user_id) {
+                println!("[INFO] 私聊数据删除屏障期间丢弃入站 (用户: {user_id})");
+                return;
+            }
+            let owner = select_private_message_owner(
+                core_private_cutover,
+                core_supports_event,
+                || async move {
+                    let _ =
+                        crate::model::interrupt(crate::model::ReplyScope::Private(user_id)).await;
+                },
+                || bridge.enqueue_private(&event),
+            )
+            .await;
+            if owner == PrivateMessageOwner::Legacy && !bridge.is_user_blocked(user_id) {
+                private_message_event(event, bot).await;
+            }
         }
     };
 
@@ -371,8 +565,237 @@ fn write_ready_marker() -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{clear_ready_marker, write_ready_marker};
+    use super::{
+        PrivateMessageOwner, clear_ready_marker, core_private_canary_payload_is_safe,
+        core_private_cutover_enabled_from, select_private_message_owner, write_ready_marker,
+    };
+    use crate::yunxi::bridge::EnqueueOutcome;
+    use kovi::bot::message::{Message, Segment};
+    use serde_json::json;
+    use std::cell::Cell;
     use std::fs;
+
+    #[test]
+    fn private_core_cutover_requires_an_explicit_truthy_value() {
+        assert!(!core_private_cutover_enabled_from(None));
+        assert!(!core_private_cutover_enabled_from(Some("")));
+        assert!(!core_private_cutover_enabled_from(Some("0")));
+        assert!(!core_private_cutover_enabled_from(Some("false")));
+        assert!(core_private_cutover_enabled_from(Some("1")));
+        assert!(core_private_cutover_enabled_from(Some(" TRUE ")));
+        assert!(core_private_cutover_enabled_from(Some("on")));
+    }
+
+    #[test]
+    fn private_messages_default_to_legacy_while_shadowing_core_once() {
+        let runtime = kovi::tokio::runtime::Runtime::new().expect("应创建测试运行时");
+        let interrupt_calls = Cell::new(0);
+        let enqueue_calls = Cell::new(0);
+        let owner = runtime.block_on(select_private_message_owner(
+            false,
+            true,
+            || async {
+                interrupt_calls.set(interrupt_calls.get() + 1);
+            },
+            || {
+                enqueue_calls.set(enqueue_calls.get() + 1);
+                EnqueueOutcome::Accepted
+            },
+        ));
+
+        assert_eq!(owner, PrivateMessageOwner::Legacy);
+        assert_eq!(interrupt_calls.get(), 0);
+        assert_eq!(enqueue_calls.get(), 1);
+
+        let unsupported_interrupt_calls = Cell::new(0);
+        let unsupported_enqueue_calls = Cell::new(0);
+        let owner = runtime.block_on(select_private_message_owner(
+            false,
+            false,
+            || async {
+                unsupported_interrupt_calls.set(unsupported_interrupt_calls.get() + 1);
+            },
+            || {
+                unsupported_enqueue_calls.set(unsupported_enqueue_calls.get() + 1);
+                EnqueueOutcome::Accepted
+            },
+        ));
+        assert_eq!(owner, PrivateMessageOwner::Legacy);
+        assert_eq!(unsupported_interrupt_calls.get(), 0);
+        assert_eq!(unsupported_enqueue_calls.get(), 0);
+    }
+
+    #[test]
+    fn commands_and_non_text_private_events_stay_on_legacy() {
+        let command = Message::from("#删除我的数据");
+        assert!(!core_private_canary_payload_is_safe(
+            &command,
+            Some("#删除我的数据"),
+            false,
+        ));
+
+        let non_text = Message::from(vec![
+            Segment::new("text", json!({"text": "看看这张图"})),
+            Segment::new("image", json!({"url": "https://example.test/image.png"})),
+        ]);
+        assert!(!core_private_canary_payload_is_safe(
+            &non_text,
+            Some("看看这张图"),
+            false,
+        ));
+
+        let runtime = kovi::tokio::runtime::Runtime::new().expect("应创建测试运行时");
+        for unsupported_event in ["command", "non-text", "bridge-rejected"] {
+            let interrupt_calls = Cell::new(0);
+            let enqueue_calls = Cell::new(0);
+            let owner = runtime.block_on(select_private_message_owner(
+                true,
+                false,
+                || async {
+                    interrupt_calls.set(interrupt_calls.get() + 1);
+                },
+                || {
+                    enqueue_calls.set(enqueue_calls.get() + 1);
+                    EnqueueOutcome::Accepted
+                },
+            ));
+
+            assert_eq!(owner, PrivateMessageOwner::Legacy, "{unsupported_event}");
+            assert_eq!(interrupt_calls.get(), 0, "{unsupported_event}");
+            assert_eq!(enqueue_calls.get(), 0, "{unsupported_event}");
+        }
+    }
+
+    #[test]
+    fn private_host_features_and_admins_stay_on_legacy() {
+        for text in [
+            "明天早上提醒我吃饭",
+            "取消定时任务 3",
+            "查看我的提醒列表",
+            "每隔30秒请求一下 https://example.com/health，直到返回 ready 之后告诉我",
+            "查看接口监控任务状态",
+            "停止监控这个链接",
+        ] {
+            let message = Message::from(text);
+            assert!(
+                !core_private_canary_payload_is_safe(&message, Some(text), false),
+                "{text}"
+            );
+        }
+
+        let ordinary_admin_message = Message::from("今天过得怎么样");
+        assert!(!core_private_canary_payload_is_safe(
+            &ordinary_admin_message,
+            Some("今天过得怎么样"),
+            true,
+        ));
+
+        let ordinary_non_admin_message = Message::from("今天过得怎么样");
+        assert!(core_private_canary_payload_is_safe(
+            &ordinary_non_admin_message,
+            Some("今天过得怎么样"),
+            false,
+        ));
+    }
+
+    #[test]
+    fn core_ingress_failure_falls_back_to_legacy() {
+        let runtime = kovi::tokio::runtime::Runtime::new().expect("应创建测试运行时");
+        for outcome in [
+            EnqueueOutcome::DroppedAtCapacity,
+            EnqueueOutcome::SkippedInvalid,
+        ] {
+            let order = Cell::new(0);
+            let owner = runtime.block_on(select_private_message_owner(
+                true,
+                true,
+                || async {
+                    assert_eq!(order.get(), 0);
+                    order.set(1);
+                },
+                || {
+                    assert_eq!(order.get(), 1);
+                    order.set(2);
+                    outcome
+                },
+            ));
+            assert_eq!(owner, PrivateMessageOwner::Legacy, "{outcome:?}");
+            assert_eq!(order.get(), 2, "{outcome:?}");
+        }
+    }
+
+    #[test]
+    fn data_erasure_block_never_falls_back_to_legacy_private_handling() {
+        let runtime = kovi::tokio::runtime::Runtime::new().expect("应创建测试运行时");
+        for core_cutover_enabled in [false, true] {
+            let interrupt_calls = Cell::new(0);
+            let enqueue_calls = Cell::new(0);
+            let owner = runtime.block_on(select_private_message_owner(
+                core_cutover_enabled,
+                true,
+                || async {
+                    interrupt_calls.set(interrupt_calls.get() + 1);
+                },
+                || {
+                    enqueue_calls.set(enqueue_calls.get() + 1);
+                    EnqueueOutcome::Blocked
+                },
+            ));
+
+            assert_eq!(owner, PrivateMessageOwner::Dropped);
+            assert_eq!(enqueue_calls.get(), 1);
+            assert_eq!(interrupt_calls.get(), usize::from(core_cutover_enabled));
+        }
+    }
+
+    #[test]
+    fn accepted_core_canary_has_exactly_one_reply_owner() {
+        let runtime = kovi::tokio::runtime::Runtime::new().expect("应创建测试运行时");
+        let order = Cell::new(0);
+        let enqueue_calls = Cell::new(0);
+        let owner = runtime.block_on(select_private_message_owner(
+            true,
+            true,
+            || async {
+                assert_eq!(order.get(), 0);
+                order.set(1);
+            },
+            || {
+                assert_eq!(order.get(), 1);
+                order.set(2);
+                enqueue_calls.set(enqueue_calls.get() + 1);
+                EnqueueOutcome::Accepted
+            },
+        ));
+
+        assert_eq!(owner, PrivateMessageOwner::Core);
+        assert_eq!(order.get(), 2);
+        assert_eq!(enqueue_calls.get(), 1);
+        assert_ne!(owner, PrivateMessageOwner::Legacy);
+    }
+
+    #[test]
+    fn core_takeover_invalidates_the_existing_private_reply_generation() {
+        let runtime = kovi::tokio::runtime::Runtime::new().expect("应创建测试运行时");
+        runtime.block_on(async {
+            let scope = crate::model::ReplyScope::Private(9_200_001);
+            let previous = crate::model::interrupt(scope).await;
+            assert!(crate::model::is_current(previous).await);
+
+            let owner = select_private_message_owner(
+                true,
+                true,
+                || async {
+                    let _ = crate::model::interrupt(scope).await;
+                },
+                || EnqueueOutcome::Accepted,
+            )
+            .await;
+
+            assert_eq!(owner, PrivateMessageOwner::Core);
+            assert!(!crate::model::is_current(previous).await);
+        });
+    }
 
     #[test]
     fn readiness_marker_contains_the_deployed_revision() {

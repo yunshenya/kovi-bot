@@ -564,10 +564,10 @@ pub enum EventValidationError {
 #[cfg(test)]
 mod tests {
     use super::{
-        EventPriority, EventScope, EventValidationError, MessageContent, MessageReceivedEvent,
-        TraceError, WorldEvent, WorldEventKind,
+        EventPriority, EventScope, EventValidationError, GoalCompletedEvent, GoalUpdatedEvent,
+        MessageContent, MessageReceivedEvent, TraceError, WorldEvent, WorldEventKind,
     };
-    use crate::{ConversationId, ConversationKind, EventId, MessageId, PersonId};
+    use crate::{ConversationId, ConversationKind, EventId, GoalId, MessageId, PersonId};
     use chrono::Utc;
 
     #[test]
@@ -649,6 +649,29 @@ mod tests {
         );
 
         assert_eq!(event.validate(8), Err(EventValidationError::ScopeMismatch));
+    }
+
+    #[test]
+    fn goal_events_require_their_goal_scope() {
+        let goal_id = GoalId::new();
+        let valid = WorldEvent::new(
+            Utc::now(),
+            EventScope::Goal { goal_id },
+            EventPriority::Normal,
+            WorldEventKind::GoalUpdated(GoalUpdatedEvent { goal_id }),
+        );
+        assert_eq!(valid.validate(8), Ok(()));
+
+        let mismatched = WorldEvent::new(
+            Utc::now(),
+            EventScope::Global,
+            EventPriority::Normal,
+            WorldEventKind::GoalCompleted(GoalCompletedEvent { goal_id }),
+        );
+        assert_eq!(
+            mismatched.validate(8),
+            Err(EventValidationError::ScopeMismatch)
+        );
     }
 
     #[test]

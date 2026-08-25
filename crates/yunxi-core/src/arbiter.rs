@@ -7,7 +7,7 @@
 
 use crate::action::{ActionId, ActionScope, ActionValidationError, ProposedAction};
 use crate::delivery::{DeliveryResolutionError, DeliveryResolver};
-use crate::identity::{ConversationId, PersonId};
+use crate::identity::{ConversationId, MessageId, PersonId};
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -483,8 +483,14 @@ impl ActionRejection {
 /// Result returned by a host adapter after it receives an admitted action.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActionPortOutcome {
-    Delivered { external_reference: Option<String> },
-    Deferred { reason: String },
+    Delivered {
+        external_reference: Option<String>,
+        message_id: Option<MessageId>,
+        conversation_id: Option<ConversationId>,
+    },
+    Deferred {
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -558,11 +564,18 @@ impl ActionResult {
 
 #[derive(Debug, Default)]
 struct ArbiterState {
-    admitted_keys: HashMap<String, ActionId>,
+    admitted_keys: HashMap<String, AdmittedAction>,
+    admitted_key_order: VecDeque<String>,
     last_by_scope: HashMap<ActionScope, DateTime<Utc>>,
     rate_events: VecDeque<DateTime<Utc>>,
     daily_date: Option<NaiveDate>,
     daily_count: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AdmittedAction {
+    action_id: ActionId,
+    delivered: bool,
 }
 
 /// Validates and dispatches proposed actions without knowing a platform API.
@@ -707,17 +720,13 @@ impl ActionArbiter {
             .lock()
             .expect("action arbiter state lock poisoned");
 
-        if let Some(original_action_id) = state.admitted_keys.get(key).copied() {
+        if let Some(original) = state.admitted_keys.get(key).copied() {
             return Err(ActionRejection::Duplicate {
                 action_id,
                 idempotency_key: key.to_owned(),
-                original_action_id,
+                original_action_id: original.action_id,
             });
         }
-        if state.admitted_keys.len() >= MAX_TRACKED_ACTION_KEYS {
-            return Err(ActionRejection::IdempotencyStateFull { action_id });
-        }
-
         if self.config.cooldown > Duration::ZERO {
             if let Some(last) = state.last_by_scope.get(&scope).copied() {
                 let cooldown = chrono::Duration::from_std(self.config.cooldown)
@@ -785,9 +794,28 @@ impl ActionArbiter {
             return Err(ActionRejection::DailyLimitExceeded { action_id, limit });
         }
 
-        state
-            .admitted_keys
-            .insert(key.to_owned(), action_id.unwrap_or_default());
+        if state.admitted_keys.len() >= MAX_TRACKED_ACTION_KEYS {
+            let Some(delivered_index) = state.admitted_key_order.iter().position(|candidate| {
+                state
+                    .admitted_keys
+                    .get(candidate)
+                    .is_some_and(|admitted| admitted.delivered)
+            }) else {
+                return Err(ActionRejection::IdempotencyStateFull { action_id });
+            };
+            if let Some(oldest_delivered) = state.admitted_key_order.remove(delivered_index) {
+                state.admitted_keys.remove(&oldest_delivered);
+            }
+        }
+        let key = key.to_owned();
+        state.admitted_keys.insert(
+            key.clone(),
+            AdmittedAction {
+                action_id: action_id.unwrap_or_default(),
+                delivered: false,
+            },
+        );
+        state.admitted_key_order.push_back(key.clone());
         if self.config.cooldown > Duration::ZERO {
             state.last_by_scope.insert(scope, now);
         }
@@ -797,9 +825,57 @@ impl ActionArbiter {
         state.daily_count = state.daily_count.saturating_add(1);
         Ok(ActionReceipt {
             action_id,
-            idempotency_key: Some(key.to_owned()),
+            idempotency_key: Some(key),
             admitted_at: now,
         })
+    }
+
+    fn mark_delivered(&self, receipt: &ActionReceipt) {
+        let (Some(key), Some(action_id)) = (&receipt.idempotency_key, receipt.action_id) else {
+            return;
+        };
+        let mut state = self
+            .state
+            .lock()
+            .expect("action arbiter state lock poisoned");
+        if let Some(admitted) = state.admitted_keys.get_mut(key)
+            && admitted.action_id == action_id
+        {
+            admitted.delivered = true;
+        }
+    }
+
+    fn release_reservation(&self, receipt: &ActionReceipt) {
+        let (Some(key), Some(action_id)) = (&receipt.idempotency_key, receipt.action_id) else {
+            return;
+        };
+        let mut state = self
+            .state
+            .lock()
+            .expect("action arbiter state lock poisoned");
+        if state
+            .admitted_keys
+            .get(key)
+            .is_some_and(|admitted| admitted.action_id == action_id)
+        {
+            state.admitted_keys.remove(key);
+            state
+                .admitted_key_order
+                .retain(|candidate| candidate != key);
+        }
+    }
+
+    pub(crate) fn was_delivered(
+        &self,
+        idempotency_key: &str,
+        original_action_id: ActionId,
+    ) -> bool {
+        self.state
+            .lock()
+            .expect("action arbiter state lock poisoned")
+            .admitted_keys
+            .get(idempotency_key)
+            .is_some_and(|admitted| admitted.action_id == original_action_id && admitted.delivered)
     }
 
     /// Dispatches using the current wall clock.
@@ -849,8 +925,18 @@ impl ActionArbiter {
             Err(rejection) => return ActionResult::Rejected(rejection),
         };
         match port.execute(&action).await {
-            Ok(outcome) => ActionResult::Executed { receipt, outcome },
-            Err(error) => ActionResult::Failed { receipt, error },
+            Ok(outcome @ ActionPortOutcome::Delivered { .. }) => {
+                self.mark_delivered(&receipt);
+                ActionResult::Executed { receipt, outcome }
+            }
+            Ok(outcome @ ActionPortOutcome::Deferred { .. }) => {
+                self.release_reservation(&receipt);
+                ActionResult::Executed { receipt, outcome }
+            }
+            Err(error) => {
+                self.release_reservation(&receipt);
+                ActionResult::Failed { receipt, error }
+            }
         }
     }
 }
@@ -896,6 +982,8 @@ mod tests {
             Box::pin(async {
                 Ok(ActionPortOutcome::Delivered {
                     external_reference: None,
+                    message_id: None,
+                    conversation_id: None,
                 })
             })
         }
@@ -1045,6 +1133,116 @@ mod tests {
             ),
             Err(ActionRejection::DailyLimitExceeded { limit: 1, .. })
         ));
+    }
+
+    #[test]
+    fn idempotency_history_evicts_the_oldest_key_at_capacity() {
+        let now = Utc::now();
+        let conversation = ConversationId::new();
+        let arbiter = ActionArbiter::new(
+            ActionArbiterConfig::default().with_capabilities(EnvironmentCapabilities::all()),
+        );
+        let mut oldest_receipt = None;
+        for index in 0..MAX_TRACKED_ACTION_KEYS {
+            let receipt = arbiter
+                .admit_at(
+                    &send_with_key(conversation, &format!("bounded-{index}"), now),
+                    now,
+                )
+                .expect("history entry should fit");
+            if index == 0 {
+                oldest_receipt = Some(receipt.clone());
+            }
+            arbiter.mark_delivered(&receipt);
+        }
+
+        arbiter
+            .admit_at(&send_with_key(conversation, "newest", now), now)
+            .expect("a full history should evict its oldest entry");
+        assert!(matches!(
+            arbiter.admit_at(&send_with_key(conversation, "newest", now), now),
+            Err(ActionRejection::Duplicate { .. })
+        ));
+        let replacement = arbiter
+            .admit_at(&send_with_key(conversation, "bounded-0", now), now)
+            .expect("the oldest idempotency key should have been evicted");
+        arbiter.release_reservation(
+            &oldest_receipt.expect("the oldest admission receipt should be recorded"),
+        );
+        assert!(matches!(
+            arbiter.admit_at(&send_with_key(conversation, "bounded-0", now), now),
+            Err(ActionRejection::Duplicate {
+                original_action_id,
+                ..
+            }) if Some(original_action_id) == replacement.action_id
+        ));
+    }
+
+    #[test]
+    fn idempotency_history_never_evicts_in_flight_reservations() {
+        let now = Utc::now();
+        let conversation = ConversationId::new();
+        let arbiter = ActionArbiter::new(
+            ActionArbiterConfig::default().with_capabilities(EnvironmentCapabilities::all()),
+        );
+        for index in 0..MAX_TRACKED_ACTION_KEYS {
+            arbiter
+                .admit_at(
+                    &send_with_key(conversation, &format!("in-flight-{index}"), now),
+                    now,
+                )
+                .expect("in-flight reservation should fit");
+        }
+
+        assert!(matches!(
+            arbiter.admit_at(&send_with_key(conversation, "overflow", now), now),
+            Err(ActionRejection::IdempotencyStateFull { .. })
+        ));
+        assert!(matches!(
+            arbiter.admit_at(&send_with_key(conversation, "in-flight-0", now), now),
+            Err(ActionRejection::Duplicate { .. })
+        ));
+    }
+
+    struct DeferredPort;
+
+    impl ActionPort for DeferredPort {
+        fn execute<'a>(&'a self, _action: &'a ProposedAction) -> ActionPortFuture<'a> {
+            Box::pin(async {
+                Ok(ActionPortOutcome::Deferred {
+                    reason: "temporarily offline".to_owned(),
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn deferred_delivery_releases_its_idempotency_reservation() {
+        let now = Utc::now();
+        let action = send_with_key(ConversationId::new(), "retry-deferred", now);
+        let arbiter = ActionArbiter::new(
+            ActionArbiterConfig::default().with_capabilities(EnvironmentCapabilities::all()),
+        );
+        assert!(matches!(
+            arbiter
+                .dispatch_at(action.clone(), &DeferredPort, now)
+                .await,
+            ActionResult::Executed {
+                outcome: ActionPortOutcome::Deferred { .. },
+                ..
+            }
+        ));
+        let delivered = FakePort {
+            calls: AtomicUsize::new(0),
+        };
+        assert!(matches!(
+            arbiter.dispatch_at(action, &delivered, now).await,
+            ActionResult::Executed {
+                outcome: ActionPortOutcome::Delivered { .. },
+                ..
+            }
+        ));
+        assert_eq!(delivered.calls.load(Ordering::SeqCst), 1);
     }
 
     struct UnavailableResolver;

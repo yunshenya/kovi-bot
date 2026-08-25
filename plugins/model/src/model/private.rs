@@ -4,7 +4,7 @@ use crate::group_access;
 use crate::memory::MEMORY_MANAGER;
 use crate::model::coalesce::{MessageCoalescer, MessagePart};
 use crate::model::conversation_coordinator::{ConversationCoordinator, PendingTurn};
-use crate::model::interrupt::{ReplyScope, is_active, scope_mutex};
+use crate::model::interrupt::{ReplyScope, clear_reply_state_locked, is_active, scope_mutex};
 use crate::model::recall::{
     clear_reply_scope_locked, has_recalled_messages, is_recent_bot_message,
     recent_bot_message_for_reaction, send_tracked_private_message,
@@ -14,7 +14,7 @@ use crate::model::semantic::{
     ImageReferenceIntent, MessageUnderstanding, SemanticImageIntent, UnderstandingRequest,
     understand,
 };
-use crate::model::traffic::{InboundScope, bounded_input, should_suppress};
+use crate::model::traffic::{InboundScope, bounded_input, clear_private_traffic, should_suppress};
 use crate::model::utils::{
     clear_private_runtime_data, command_help, is_bot_admin, is_group_admin_command,
     is_help_command, is_restricted_command, private_chat_claimed, send_sys_info_private,
@@ -164,25 +164,25 @@ pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<Runtime
         send_tracked_private_message(&bot, user_id, reply).await;
         return;
     }
-    if should_suppress(InboundScope::Private(user_id), sender_is_admin).await {
-        println!("[INFO] 私聊入站流量已抑制 (用户: {})", user_id);
-        return;
-    }
     match message.trim() {
         "#删除我的数据" => {
             send_tracked_private_message(
                 &bot,
                 user_id,
-                "这会删除你的私聊记忆、用户档案、摘要、近期图片、与你关联的表情记忆和角色动作记录。若确认，请发送：#删除我的数据 确认",
+                "这会删除你的私聊记忆、用户档案、摘要、近期图片、与你关联的表情记忆、角色动作记录，以及 Yunxi Core 中的身份映射、关系、情绪、待办和目标。若确认，请发送：#删除我的数据 确认",
             )
             .await;
             return;
         }
         "#删除我的数据 确认" => {
-            delete_private_user_data(user_id, &bot).await;
+            delete_private_user_data(user_id, event.self_id, &bot).await;
             return;
         }
         _ => {}
+    }
+    if should_suppress(InboundScope::Private(user_id), sender_is_admin).await {
+        println!("[INFO] 私聊入站流量已抑制 (用户: {})", user_id);
+        return;
     }
     if is_recent_bot_message(reply_scope, event.message_id).await {
         println!(
@@ -673,7 +673,7 @@ async fn stop_private_reply(user_id: i64) {
     PENDING_PRIVATE_MESSAGES.lock().await.remove(&user_id);
 }
 
-async fn delete_private_user_data(user_id: i64, bot: &RuntimeBot) {
+async fn delete_private_user_data(user_id: i64, self_id: i64, bot: &RuntimeBot) {
     let scope = ReplyScope::Private(user_id);
     {
         let scope_lock = scope_mutex(scope);
@@ -683,50 +683,134 @@ async fn delete_private_user_data(user_id: i64, bot: &RuntimeBot) {
         PENDING_PRIVATE_MESSAGES.lock().await.remove(&user_id);
         clear_reply_scope_locked(scope).await;
     }
-    clear_private_runtime_data(user_id).await;
-    forget_private_user_images(user_id).await;
-    clear_reply_targets(scope).await;
-    clear_user_pending_image_requests(user_id).await;
 
-    let memory_result = MEMORY_MANAGER.delete_user_data(user_id).await;
-    let sticker_result = sticker_memory::delete_user_data(user_id).await;
-    let reminder_result = reminders::delete_user_data(user_id).await;
-    let agent_goal_result = crate::agent_runtime::delete_user_data(user_id).await;
-    let agent_run_result = crate::agent_runs::delete_user_data(user_id).await;
-    match (
-        memory_result,
-        sticker_result,
-        reminder_result,
-        agent_goal_result,
-        agent_run_result,
-    ) {
-        (
-            Ok(memory_rows),
-            Ok(sticker_rows),
-            Ok(reminder_rows),
-            Ok(agent_goal_rows),
-            Ok(agent_run_rows),
-        ) => {
-            send_tracked_private_message(
-                bot,
-                user_id,
-                format!(
-                    "你的可归属数据已删除（记忆/档案/摘要 {memory_rows} 项，表情记忆 {sticker_rows} 项，提醒 {reminder_rows} 项，角色目标 {agent_goal_rows} 项，Agent Run {agent_run_rows} 项）。"
-                ),
-            )
-            .await;
-        }
-        (memory, stickers, reminders, agent_goals, agent_runs) => {
+    // `begin_qq_user_data_erasure` synchronously closes the ingress gate on
+    // its first poll. Keep it immediately after releasing the reply-scope lock
+    // so an old model turn is cancelled before the Core FIFO barrier waits for
+    // it, without holding that same lock across the barrier acknowledgement.
+    let erasure = match crate::yunxi::begin_qq_user_data_erasure(user_id).await {
+        Ok(erasure) => erasure,
+        Err(error) => {
             eprintln!(
-                "[ERROR] 用户数据删除未完全成功 (用户: {}, 记忆: {:?}, 表情: {:?}, 提醒: {:?}, 角色目标: {:?}, Agent Run: {:?})",
-                user_id, memory, stickers, reminders, agent_goals, agent_runs
+                "[ERROR] 启动 Yunxi 数据删除屏障失败 (用户: {}): {error}",
+                user_id
             );
             send_tracked_private_message(
                 bot,
                 user_id,
-                "数据删除没有全部完成，已停止继续处理；请稍后重试或联系管理员检查日志。",
+                "数据删除安全屏障启动失败，未开始删除；请稍后重试。",
             )
             .await;
+            return;
+        }
+    };
+    let qq_user_ids = erasure.qq_user_ids().to_vec();
+    for alias_user_id in &qq_user_ids {
+        clear_private_erasure_runtime_state(*alias_user_id).await;
+    }
+
+    let mut memory_rows = 0_u64;
+    let mut sticker_rows = 0_u64;
+    let mut reminder_rows = 0_u64;
+    let mut agent_goal_rows = 0_u64;
+    let mut agent_run_rows = 0_u64;
+    let mut failures = Vec::new();
+    for alias_user_id in &qq_user_ids {
+        let (memory, stickers, reminders, agent_goals, agent_runs) = kovi::tokio::join!(
+            MEMORY_MANAGER.delete_user_data(*alias_user_id),
+            sticker_memory::delete_user_data(*alias_user_id),
+            reminders::delete_user_data(*alias_user_id),
+            crate::agent_runtime::delete_user_data(*alias_user_id),
+            crate::agent_runs::delete_user_data(*alias_user_id),
+        );
+        match memory {
+            Ok(rows) => memory_rows = memory_rows.saturating_add(rows),
+            Err(error) => failures.push(format!("memory[{alias_user_id}]: {error}")),
+        }
+        match stickers {
+            Ok(rows) => sticker_rows = sticker_rows.saturating_add(rows),
+            Err(error) => failures.push(format!("stickers[{alias_user_id}]: {error}")),
+        }
+        match reminders {
+            Ok(rows) => reminder_rows = reminder_rows.saturating_add(rows),
+            Err(error) => failures.push(format!("reminders[{alias_user_id}]: {error}")),
+        }
+        match agent_goals {
+            Ok(rows) => agent_goal_rows = agent_goal_rows.saturating_add(rows),
+            Err(error) => failures.push(format!("agent-goals[{alias_user_id}]: {error}")),
+        }
+        match agent_runs {
+            Ok(rows) => agent_run_rows = agent_run_rows.saturating_add(rows),
+            Err(error) => failures.push(format!("agent-runs[{alias_user_id}]: {error}")),
+        }
+    }
+    let yunxi_rows = match crate::yunxi::delete_qq_person_domain_data(self_id, user_id).await {
+        Ok(rows) => rows,
+        Err(error) => {
+            failures.push(format!("yunxi-core: {error}"));
+            0
+        }
+    };
+    if let Err(error) = erasure.finish().await {
+        failures.push(format!("core-barrier-resume: {error}"));
+    }
+
+    if failures.is_empty() {
+        send_untracked_private_message(
+            bot,
+            user_id,
+            format!(
+                "你的可归属数据已删除（QQ 身份 {} 个，记忆/档案/摘要 {memory_rows} 项，表情记忆 {sticker_rows} 项，提醒 {reminder_rows} 项，角色目标 {agent_goal_rows} 项，Agent Run {agent_run_rows} 项，Yunxi Core {yunxi_rows} 项）。",
+                qq_user_ids.len()
+            ),
+        )
+        .await;
+    } else {
+        eprintln!(
+            "[ERROR] 用户数据删除未完全成功 (发起用户: {}, 失败: {})",
+            user_id,
+            failures.join("; ")
+        );
+        send_untracked_private_message(
+            bot,
+            user_id,
+            "数据删除没有全部完成；已尝试其余可归属数据，请稍后重试或联系管理员检查日志。",
+        )
+        .await;
+    }
+}
+
+async fn clear_private_erasure_runtime_state(user_id: i64) {
+    let scope = ReplyScope::Private(user_id);
+    {
+        let scope_lock = scope_mutex(scope);
+        let _scope_guard = scope_lock.lock().await;
+        ConversationCoordinator::interrupt_locked(scope).await;
+        PRIVATE_MESSAGE_BATCHES.cancel(user_id).await;
+        PENDING_PRIVATE_MESSAGES.lock().await.remove(&user_id);
+        clear_reply_scope_locked(scope).await;
+        clear_reply_state_locked(scope).await;
+    }
+    clear_private_runtime_data(user_id).await;
+    forget_private_user_images(user_id).await;
+    clear_reply_targets(scope).await;
+    clear_user_pending_image_requests(user_id).await;
+    clear_private_traffic(user_id).await;
+}
+
+async fn send_untracked_private_message(
+    bot: &RuntimeBot,
+    user_id: i64,
+    content: impl Into<String>,
+) -> bool {
+    match bot.send_private_msg_return(user_id, content.into()).await {
+        Ok(_) => true,
+        Err(error) => {
+            eprintln!(
+                "[ERROR] 私聊无追踪消息发送失败 (用户: {}): {:?}",
+                user_id, error
+            );
+            false
         }
     }
 }

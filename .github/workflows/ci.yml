@@ -62,7 +62,22 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Run Clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+      - name: Verify Yunxi platform dependency boundaries
+        shell: bash
+        run: |
+          for package in yunxi-core yunxi-cli; do
+            forbidden="$({
+              cargo tree -p "$package" --edges normal --prefix none --format '{p}' |
+                awk '{ name = tolower($1); if (name ~ /^(kovi|onebot|sqlx|postgres|tokio-postgres|sea-orm|diesel)(-|$)/) print }
+            })"
+            if [[ -n "$forbidden" ]]; then
+              echo "$package contains forbidden platform or storage dependencies:"
+              echo "$forbidden"
+              exit 1
+            fi
+          done
 
       - name: Run tests
         run: cargo test --workspace --all-targets --locked
@@ -95,6 +110,23 @@ jobs:
         run: >-
           cargo test -p model --lib --locked
           yunxi::identity_store::tests::postgres_identity_mapping_is_stable_and_race_safe -- --ignored --exact
+
+      - name: Run Yunxi Core store integration tests
+        env:
+          DATABASE_URL: postgresql://kovi_test:integration-test@127.0.0.1:5432/kovi_test
+        shell: bash
+        run: |
+          for test in \
+            yunxi::affect_store::tests::postgres_affect_store_round_trips_state \
+            yunxi::relation_store::tests::postgres_relation_store_reads_optional_state \
+            yunxi::goal_store::tests::postgres_goal_store_round_trips_crud \
+            yunxi::memory_store::tests::postgres_memory_v2_round_trips_person_and_conversation_scopes \
+            yunxi::open_loop_store::tests::postgres_global_due_defer_removes_the_schedule \
+            yunxi::identity_store::tests::postgres_person_domain_deletion_removes_core_data_transactionally \
+            yunxi::identity_store::tests::postgres_person_domain_deletion_serializes_concurrent_owner_writes
+          do
+            cargo test -p model --lib --locked "$test" -- --ignored --exact
+          done
 
       - name: Run reminder claim integration test
         env:

@@ -55,8 +55,7 @@ async fn run(store: Arc<dyn OpenLoopStore>, runtime: RuntimeHandle) {
                             kovi::log::warn!(
                                 "Yunxi open-loop due event could not be submitted: {error:?}"
                             );
-                            let retry_at =
-                                Some(now + Duration::seconds(OPEN_LOOP_RETRY_DELAY_SECS));
+                            let retry_at = retry_due_at(error, now);
                             if let Err(defer_error) =
                                 store.defer(item.id(), retry_at, Utc::now()).await
                             {
@@ -87,10 +86,22 @@ async fn run(store: Arc<dyn OpenLoopStore>, runtime: RuntimeHandle) {
     }
 }
 
+fn retry_due_at(error: DueSubmitError, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    match error {
+        // A global owner has no safe host delivery route. Clearing due_at
+        // returns it to an ordinary open loop instead of re-claiming it.
+        DueSubmitError::UnsupportedOwner => None,
+        DueSubmitError::RuntimeClosed | DueSubmitError::Dropped => {
+            Some(now + Duration::seconds(OPEN_LOOP_RETRY_DELAY_SECS))
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DueSubmitError {
     RuntimeClosed,
     Dropped,
+    UnsupportedOwner,
 }
 
 async fn submit_due(
@@ -98,9 +109,12 @@ async fn submit_due(
     item: &OpenLoop,
     now: DateTime<Utc>,
 ) -> Result<(), DueSubmitError> {
+    let Some(scope) = event_scope(item.owner()) else {
+        return Err(DueSubmitError::UnsupportedOwner);
+    };
     let event = WorldEvent::new(
         now,
-        event_scope(item.owner()),
+        scope,
         EventPriority::High,
         WorldEventKind::ProspectiveMemoryDue(yunxi_core::ProspectiveMemoryEvent {
             open_loop_id: item.id(),
@@ -115,20 +129,20 @@ async fn submit_due(
 }
 
 #[must_use]
-pub(crate) const fn event_scope(owner: OpenLoopOwner) -> EventScope {
+pub(crate) const fn event_scope(owner: OpenLoopOwner) -> Option<EventScope> {
     match owner {
-        OpenLoopOwner::Person(person_id) => EventScope::Person { person_id },
+        OpenLoopOwner::Person(person_id) => Some(EventScope::Person { person_id }),
         OpenLoopOwner::Conversation(conversation_id) => {
-            EventScope::Conversation { conversation_id }
+            Some(EventScope::Conversation { conversation_id })
         }
-        OpenLoopOwner::Global => EventScope::Global,
+        OpenLoopOwner::Global => None,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{event_scope, submit_due};
-    use chrono::Utc;
+    use super::{DueSubmitError, event_scope, retry_due_at, submit_due};
+    use chrono::{Duration, Utc};
     use yunxi_core::{
         ConversationId, EventPriority, EventScope, OpenLoop, OpenLoopKind, OpenLoopOwner, PersonId,
         ProcessingOutcome, RuntimeConfig,
@@ -140,13 +154,13 @@ mod tests {
         let conversation_id = ConversationId::new();
         assert_eq!(
             event_scope(OpenLoopOwner::Person(person_id)),
-            EventScope::Person { person_id }
+            Some(EventScope::Person { person_id })
         );
         assert_eq!(
             event_scope(OpenLoopOwner::Conversation(conversation_id)),
-            EventScope::Conversation { conversation_id }
+            Some(EventScope::Conversation { conversation_id })
         );
-        assert_eq!(event_scope(OpenLoopOwner::Global), EventScope::Global);
+        assert_eq!(event_scope(OpenLoopOwner::Global), None);
     }
 
     #[test]
@@ -176,5 +190,38 @@ mod tests {
                 yunxi_core::EventType::ProspectiveMemoryDue
             );
         });
+    }
+
+    #[test]
+    fn global_due_item_is_not_submitted_without_a_delivery_scope() {
+        let runtime = kovi::tokio::runtime::Runtime::new().expect("test runtime");
+        runtime.block_on(async {
+            let draft = yunxi_core::OpenLoopDraft::new(
+                OpenLoopOwner::Global,
+                OpenLoopKind::AwaitingOutcome,
+                "host-independent work",
+            )
+            .expect("valid draft")
+            .with_due_at(Some(Utc::now()));
+            let item = OpenLoop::from_draft(yunxi_core::OpenLoopId::new(), &draft, Utc::now())
+                .expect("valid open loop");
+            let (handle, _cognitive_runtime) =
+                yunxi_core::CognitiveRuntime::new(RuntimeConfig::default()).expect("runtime");
+
+            assert_eq!(
+                submit_due(&handle, &item, Utc::now()).await,
+                Err(DueSubmitError::UnsupportedOwner)
+            );
+        });
+    }
+
+    #[test]
+    fn unsupported_global_owner_is_reopened_without_a_due_time() {
+        let now = Utc::now();
+        assert_eq!(retry_due_at(DueSubmitError::UnsupportedOwner, now), None);
+        assert_eq!(
+            retry_due_at(DueSubmitError::Dropped, now),
+            Some(now + Duration::seconds(60))
+        );
     }
 }

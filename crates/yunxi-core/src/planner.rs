@@ -270,6 +270,7 @@ impl DecisionDisposition {
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum StateUpdateProposal {
     Affect(AffectState),
+    Relation(RelationState),
     SetTopic {
         conversation_id: ConversationId,
         topic: String,
@@ -285,6 +286,9 @@ impl StateUpdateProposal {
             Self::Affect(affect) => affect
                 .validate()
                 .map_err(PlannerOutputValidationError::InvalidAffect),
+            Self::Relation(relation) => relation
+                .validate()
+                .map_err(PlannerOutputValidationError::InvalidRelation),
             Self::SetTopic { topic, .. } => validate_topic(topic),
             Self::ResolveOpenLoop { .. } => Ok(()),
         }
@@ -466,6 +470,16 @@ pub enum PlannerError {
     Model(#[from] ModelBackendError),
     #[error("planner output is invalid: {0}")]
     InvalidOutput(PlannerOutputValidationError),
+    #[error(
+        "planner state update `{kind}` failed after {applied_before_failure} earlier update(s) were applied: {message}"
+    )]
+    StateUpdate {
+        kind: &'static str,
+        message: String,
+        /// State-update ports are independent and cannot share a transaction.
+        /// This count makes a fail-fast partial commit explicit to callers.
+        applied_before_failure: usize,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -494,8 +508,12 @@ pub enum PlannerOutputValidationError {
     TooManyStateUpdates { length: usize, maximum: usize },
     #[error("planner returned an invalid intent: {0}")]
     InvalidIntent(#[from] IntentValidationError),
+    #[error("planner returned an intent outside the current event scope: {reason}")]
+    IntentOutsideEventScope { reason: String },
     #[error("planner returned an invalid affect update: {0}")]
     InvalidAffect(PlannerInputValidationError),
+    #[error("planner returned an invalid relation update: {0}")]
+    InvalidRelation(PlannerInputValidationError),
     #[error("planner returned an invalid topic: {0}")]
     InvalidTopic(String),
 }

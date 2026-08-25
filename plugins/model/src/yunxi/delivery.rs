@@ -11,15 +11,17 @@ use crate::model::{
     MessageDestination, MessageTransport, record_standalone_bot_message,
     send_tracked_private_message,
 };
-use kovi::RuntimeBot;
+use kovi::bot::message::Segment;
+use kovi::serde_json::json;
 use kovi::tokio::sync::Mutex;
+use kovi::{Message, RuntimeBot};
 use std::fmt;
 use std::sync::Arc;
 use thiserror::Error;
 use yunxi_core::{
     ActionPort, ActionPortError, ActionPortFuture, ActionPortOutcome, ConversationId,
     ConversationKind, DeliveryResolutionError, DeliveryResolver, DeliveryResolverFuture,
-    DeliveryRoute, IdentityStore, MessageContent, ProposedAction, ReachOutIntent,
+    DeliveryRoute, IdentityStore, MessageContent, MessageId, ProposedAction, ReachOutIntent,
 };
 
 /// Concrete QQ destination after a canonical Core conversation has been
@@ -201,18 +203,39 @@ impl QqActionAdapter {
         } else {
             None
         };
-        parse_qq_destination(external_id, *kind, self_id)
-            .ok_or_else(|| ActionPortError::new("delivery_route_invalid", false))
+        let destination = parse_qq_destination(external_id, *kind, self_id)
+            .ok_or_else(|| ActionPortError::new("delivery_route_invalid", false))?;
+        if let QqDestination::Group(group_id) = destination {
+            let authorized = crate::group_access::is_authorized_group(group_id)
+                .await
+                .map_err(|error| {
+                    ActionPortError::new(format!("group_authorization_unavailable:{error}"), true)
+                })?;
+            if !authorized {
+                return Err(ActionPortError::new("group_not_authorized", false));
+            }
+        }
+        Ok(destination)
     }
 
     async fn send_to_destination(
         &self,
         destination: QqDestination,
         content: &MessageContent,
+        reply_to: Option<i64>,
+        conversation_id: ConversationId,
     ) -> Result<ActionPortOutcome, ActionPortError> {
         let text = content.as_text();
+        let message = if let Some(reply_to) = reply_to {
+            Message::from(vec![
+                Segment::new("reply", json!({"id": reply_to})),
+                Segment::new("text", json!({"text": text})),
+            ])
+        } else {
+            text.to_owned().into()
+        };
         let message_id = MessageTransport::new(&self.bot)
-            .send(destination.message_destination(), text.to_owned().into())
+            .send(destination.message_destination(), message)
             .await
             .map_err(|error| {
                 ActionPortError::new(
@@ -221,8 +244,29 @@ impl QqActionAdapter {
                 )
             })?;
         record_standalone_bot_message(destination.reply_scope(), message_id, text).await;
+        let core_message_id = MessageId::new();
+        if let Err(error) = self
+            .identity_store
+            .record_qq_message_mapping(
+                core_message_id,
+                conversation_id,
+                i64::from(message_id),
+                "outbound",
+            )
+            .await
+        {
+            // The platform send is already irreversible. Reporting the whole
+            // action as failed would make reliable schedulers retry and send a
+            // duplicate message, so retain successful delivery and surface the
+            // degraded reply-mapping state through diagnostics instead.
+            kovi::log::warn!(
+                "Yunxi outbound message mapping could not be persisted after QQ delivery: {error}"
+            );
+        }
         Ok(ActionPortOutcome::Delivered {
             external_reference: Some(format!("qq-message:{message_id}")),
+            message_id: Some(core_message_id),
+            conversation_id: Some(conversation_id),
         })
     }
 }
@@ -242,27 +286,69 @@ impl ActionPort for QqActionAdapter {
         Box::pin(async move {
             match action {
                 ProposedAction::SendMessage(send) => {
-                    // Core MessageId values are intentionally opaque. The
-                    // current adapter has no shared Core->QQ message index,
-                    // so silently dropping `reply_to` would alter intent.
-                    if send.reply_to.is_some() {
-                        return Err(ActionPortError::new("reply_target_unmapped", false));
-                    }
                     let destination = self
                         .resolve_conversation_destination(send.conversation_id)
                         .await?;
-                    self.send_to_destination(destination, &send.content).await
+                    let reply_to = if let Some(reply_to) = send.reply_to {
+                        match self
+                            .identity_store
+                            .qq_message_id_for_core(reply_to, send.conversation_id)
+                            .await
+                        {
+                            Ok(Some(external_id)) => match i32::try_from(external_id) {
+                                Ok(external_id) => Some(i64::from(external_id)),
+                                Err(_) => {
+                                    kovi::log::warn!(
+                                        "Yunxi reply target was outside the OneBot message-id range; sending without a reply segment"
+                                    );
+                                    None
+                                }
+                            },
+                            Ok(None) => {
+                                kovi::log::warn!(
+                                    "Yunxi reply target had no QQ mapping in the resolved conversation; sending without a reply segment"
+                                );
+                                None
+                            }
+                            Err(error) => {
+                                // The conversation destination was already
+                                // resolved and authorized. Losing the optional
+                                // quote style must not turn an otherwise safe
+                                // text reply into a swallowed canary message.
+                                kovi::log::warn!(
+                                    "Yunxi reply mapping lookup failed; sending without a reply segment: {error}"
+                                );
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    self.send_to_destination(
+                        destination,
+                        &send.content,
+                        reply_to,
+                        send.conversation_id,
+                    )
+                    .await
                 }
                 ProposedAction::ReachOut(reach_out) => {
-                    let (_, destination) = self
+                    let (route, destination) = self
                         .resolve_person_destination(reach_out.person_id)
                         .await
                         .map_err(|error| ActionPortError::new(error.to_string(), true))?;
-                    self.send_to_destination(destination, &reach_out.message)
-                        .await
+                    self.send_to_destination(
+                        destination,
+                        &reach_out.message,
+                        None,
+                        route.conversation_id,
+                    )
+                    .await
                 }
                 ProposedAction::Noop => Ok(ActionPortOutcome::Delivered {
                     external_reference: None,
+                    message_id: None,
+                    conversation_id: None,
                 }),
             }
         })
