@@ -39,6 +39,7 @@ const CORE_INTERACTION_CUES_START: &str = "[[INTERACTION_CUES]]";
 const CORE_INTERACTION_CUES_END: &str = "[[/INTERACTION_CUES]]";
 const MAX_CORE_INTERACTION_CUES_PAYLOAD_BYTES: usize = 256;
 const CORE_DIRECT_FALLBACK_REPLY: &str = "我刚才处理回复时出了点问题，请再发一次。";
+const CORE_DIRECT_REPAIR_PROMPT: &str = "Core 私聊回复修复：上一轮没有形成可见回复，但当前用户消息明确需要回应。现在必须只生成一条自然、简短的中文聊天回复，不能选择 silent，不能调用工具，不能输出 JSON、协议标记或解释这次修复，也不能返回空字符串。直接输出要发给用户看的正文。";
 
 fn prepared_outgoing_semantic_context(content: &str) -> String {
     let encoded = serde_json::to_string(content)
@@ -150,6 +151,33 @@ fn parse_core_response(content: &str) -> ParsedCoreResponse {
         interaction_cues: InteractionCues::default(),
         incoming_impact: None,
     }
+}
+
+async fn repair_direct_reply(
+    messages: &[BotMemory],
+    reply_ticket: ReplyTicket,
+    scope: ReplyScope,
+) -> Option<ReplyPlan> {
+    let mut repair_messages = messages.to_vec();
+    repair_messages.push(BotMemory {
+        role: Roles::System,
+        content: CORE_DIRECT_REPAIR_PROMPT.to_string(),
+    });
+    let response =
+        ModelGateway::complete_without_tools(&mut repair_messages, reply_ticket, None, &[], None)
+            .await?;
+    if crate::model::utils::is_model_error_response(&response.content) {
+        return None;
+    }
+    let parsed = parse_core_response(&response.content);
+    if parsed.content.trim().is_empty()
+        || parsed.content.contains(CORE_TOOL_CALL_START)
+        || parsed.content.contains(CORE_TOOL_CALL_END)
+    {
+        return None;
+    }
+    let plan = ReplyPlan::from_model_output(scope, &parsed.content).await;
+    plan.has_visible_reply().then_some(plan)
 }
 
 fn strip_core_interaction_cues(content: &str) -> String {
@@ -1283,15 +1311,35 @@ impl ModelBackend for KoviModelBackend {
                 && is_current(ticket).await
             {
                 kovi::log::warn!(
-                    "Yunxi Core direct reply fallback: event_id={} message_id={} conversation_id={} reason=empty_or_silent_plan disposition={:?}",
+                    "Yunxi Core direct reply repair: event_id={} message_id={} conversation_id={} reason=empty_or_silent_plan disposition={:?}",
                     input.event.id(),
                     message_id_for_log(input),
                     conversation_id_for_log(input),
                     plan.disposition,
                 );
-                plan =
-                    ReplyPlan::from_model_output(conversation.scope(), CORE_DIRECT_FALLBACK_REPLY)
-                        .await;
+                if let Some(repaired) =
+                    repair_direct_reply(&messages, ticket, conversation.scope()).await
+                {
+                    plan = repaired;
+                    kovi::log::info!(
+                        "Yunxi Core direct reply repair succeeded: event_id={} message_id={} conversation_id={}",
+                        input.event.id(),
+                        message_id_for_log(input),
+                        conversation_id_for_log(input),
+                    );
+                } else {
+                    kovi::log::warn!(
+                        "Yunxi Core direct reply fallback: event_id={} message_id={} conversation_id={} reason=repair_failed",
+                        input.event.id(),
+                        message_id_for_log(input),
+                        conversation_id_for_log(input),
+                    );
+                    plan = ReplyPlan::from_model_output(
+                        conversation.scope(),
+                        CORE_DIRECT_FALLBACK_REPLY,
+                    )
+                    .await;
+                }
             }
             if !plan.has_visible_reply() || plan.content.trim().is_empty() {
                 crate::model::finish(ticket).await;
