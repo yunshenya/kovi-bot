@@ -9,15 +9,18 @@
 use crate::group_access;
 use crate::memory::MemoryManager;
 use crate::model::semantic::{MessageUnderstanding, UnderstandingRequest, understand};
-use crate::model::send_tracked_group_message;
+use crate::model::{
+    MessageDestination, OutgoingSource, TrackedSendError, send_tracked_message_with_revalidation,
+};
 use crate::mood_system::MOOD_SYSTEM;
 use crate::topic_generator::TopicGenerator;
 use crate::yunxi;
 use crate::yunxi::bridge::ShadowBridge;
+use crate::yunxi::delivery::ReachOutDeliveryOutcome;
 use anyhow::Result;
 use chrono::Local;
-use kovi::RuntimeBot;
 use kovi::tokio::time::sleep;
+use kovi::{Message, RuntimeBot};
 use rand::Rng;
 use rand::prelude::IndexedRandom;
 use std::sync::Arc;
@@ -31,12 +34,35 @@ pub mod startup;
 
 const GLOBAL_PROACTIVE_STATE_KEY: &str = "proactive:global";
 
+fn bridge_reach_out_outcome(outcome: &ActionPortOutcome) -> ReachOutDeliveryOutcome {
+    match outcome {
+        ActionPortOutcome::Delivered { .. } => ReachOutDeliveryOutcome::Delivered,
+        ActionPortOutcome::DeliveryIndeterminate { .. } => ReachOutDeliveryOutcome::Indeterminate,
+        _ => ReachOutDeliveryOutcome::Failed,
+    }
+}
+
+fn prepared_grace_duration(configured_ms: u64) -> Duration {
+    if configured_ms == 0 {
+        Duration::ZERO
+    } else {
+        Duration::from_millis(configured_ms.clamp(300, 1_000))
+    }
+}
+
 fn target_state_key(scope: &str, subject_id: i64) -> String {
     format!("proactive:{scope}:{subject_id}")
 }
 
 fn main_admin_state_key(subject_id: i64) -> String {
     target_state_key("main_admin", subject_id)
+}
+
+async fn configured_owner_target() -> Option<i64> {
+    match yunxi::canonical_owner_qq_id_authoritative().await {
+        Some(route) => route,
+        None => crate::config::get().proactive().main_admin(),
+    }
 }
 
 /// 主动聊天管理器
@@ -250,31 +276,32 @@ impl ProactiveChatManager {
             .map_err(Into::into)
     }
 
-    async fn deliver_private_reach_out(&self, user_id: i64, intent: &ReachOutIntent) -> bool {
+    async fn deliver_private_reach_out(
+        &self,
+        user_id: i64,
+        intent: &ReachOutIntent,
+    ) -> ReachOutDeliveryOutcome {
         if let Some(bridge) = &self.yunxi_bridge {
             let Ok(action) = ReachOutAction::from_intent(intent.clone()) else {
-                return false;
+                return ReachOutDeliveryOutcome::Failed;
             };
-            return matches!(
-                bridge
-                    .dispatch_action(ProposedAction::ReachOut(action))
-                    .await,
-                Some(ActionResult::Executed {
-                    outcome: ActionPortOutcome::Delivered { .. },
-                    ..
-                })
-            );
+            return match bridge
+                .dispatch_action(user_id, ProposedAction::ReachOut(action))
+                .await
+            {
+                Some(ActionResult::Executed { outcome, .. }) => bridge_reach_out_outcome(&outcome),
+                _ => ReachOutDeliveryOutcome::Failed,
+            };
         }
         let Some(identity_store) = yunxi::identity_store() else {
-            return false;
+            return ReachOutDeliveryOutcome::Failed;
         };
         yunxi::delivery::send_reach_out(&self.bot, &identity_store, intent, user_id).await
     }
 
     /// 由模型结合关系、情绪与近期互动决定是否主动关心最信任用户。
     async fn try_initiate_main_admin_chat(&self) -> Result<bool> {
-        let proactive_config = crate::config::get().proactive().clone();
-        let Some(main_admin) = proactive_config.main_admin() else {
+        let Some(main_admin) = configured_owner_target().await else {
             return Ok(false);
         };
         if !self.can_send_main_admin(main_admin).await {
@@ -297,8 +324,12 @@ impl ProactiveChatManager {
         // Model generation can take long enough for another event to invalidate
         // cooldown, daily-limit, or recent-interaction state.
         if !self.can_send_main_admin(main_admin).await
-            || !self.deliver_private_reach_out(main_admin, &intent).await
+            || yunxi::canonical_owner_matches_authoritative(main_admin).await != Some(true)
         {
+            return Ok(false);
+        }
+        let delivery = self.deliver_private_reach_out(main_admin, &intent).await;
+        if !delivery.is_terminal_attempt() {
             return Ok(false);
         }
         let target_key = target_state_key("private", main_admin);
@@ -313,13 +344,15 @@ impl ProactiveChatManager {
                 Local::now(),
             )
             .await?;
-        self.memory_manager
-            .add_conversation_memory(
-                main_admin,
-                &format!("主动关心: {}", message),
-                "proactive_private_chat",
-            )
-            .await?;
+        if delivery.confirms_delivery() {
+            self.memory_manager
+                .add_conversation_memory(
+                    main_admin,
+                    &format!("主动关心: {}", message),
+                    "proactive_private_chat",
+                )
+                .await?;
+        }
         Ok(true)
     }
 
@@ -430,7 +463,7 @@ impl ProactiveChatManager {
     async fn get_active_users(&self) -> Vec<i64> {
         let now = Local::now();
         let three_days_ago = now - chrono::Duration::days(3);
-        let main_admin = crate::config::get().proactive().main_admin();
+        let main_admin = configured_owner_target().await;
 
         self.memory_manager
             .get_proactive_user_candidates(three_days_ago, main_admin, 32)
@@ -493,7 +526,49 @@ impl ProactiveChatManager {
             {
                 return Ok(());
             }
-            if !send_tracked_group_message(&self.bot, group_id, content.clone()).await {
+            let grace =
+                prepared_grace_duration(crate::config::get().proactive().prepared_grace_ms());
+            let send_result = send_tracked_message_with_revalidation(
+                &self.bot,
+                MessageDestination::Group(group_id),
+                Message::from(content.clone()),
+                OutgoingSource::Proactive,
+                None,
+                || async {
+                    if !grace.is_zero() {
+                        sleep(grace).await;
+                    }
+                    self.can_send_regular_chat().await
+                        && self.can_send_to_target("group", group_id).await
+                },
+            )
+            .await;
+            let delivery = match send_result {
+                Ok(_) => ReachOutDeliveryOutcome::Delivered,
+                Err(TrackedSendError::TransportIndeterminate(detail)) => {
+                    eprintln!(
+                        "[WARN] 主动群聊消息投递结果不确定 (群组: {}): {}",
+                        group_id, detail
+                    );
+                    ReachOutDeliveryOutcome::Indeterminate
+                }
+                Err(TrackedSendError::DuplicateIdempotency) => {
+                    ReachOutDeliveryOutcome::Indeterminate
+                }
+                Err(error) => {
+                    if matches!(
+                        error,
+                        TrackedSendError::InvalidTarget | TrackedSendError::Transport(_)
+                    ) {
+                        eprintln!(
+                            "[ERROR] 主动群聊消息发送失败 (群组: {}): {}",
+                            group_id, error
+                        );
+                    }
+                    return Ok(());
+                }
+            };
+            if !delivery.is_terminal_attempt() {
                 return Ok(());
             }
 
@@ -506,14 +581,17 @@ impl ProactiveChatManager {
                 )
                 .await?;
 
-            // 记录这次主动对话
-            self.memory_manager
-                .add_conversation_memory(
-                    group_id,
-                    &format!("主动发起话题: {}", content),
-                    "proactive_group_chat",
-                )
-                .await?;
+            // Only confirmed delivery may become conversation memory. An
+            // indeterminate attempt still consumes cooldown to prevent replay.
+            if delivery.confirms_delivery() {
+                self.memory_manager
+                    .add_conversation_memory(
+                        group_id,
+                        &format!("主动发起话题: {}", content),
+                        "proactive_group_chat",
+                    )
+                    .await?;
+            }
         }
 
         Ok(())
@@ -537,10 +615,12 @@ impl ProactiveChatManager {
         };
         let content = intent.message().as_text().to_string();
 
-        if !self.can_send_regular_chat().await
-            || !self.can_send_to_target("private", user_id).await
-            || !self.deliver_private_reach_out(user_id, &intent).await
+        if !self.can_send_regular_chat().await || !self.can_send_to_target("private", user_id).await
         {
+            return Ok(false);
+        }
+        let delivery = self.deliver_private_reach_out(user_id, &intent).await;
+        if !delivery.is_terminal_attempt() {
             return Ok(false);
         }
 
@@ -552,13 +632,15 @@ impl ProactiveChatManager {
                 Local::now(),
             )
             .await?;
-        self.memory_manager
-            .add_conversation_memory(
-                user_id,
-                &format!("主动发起话题: {}", content),
-                "proactive_private_chat",
-            )
-            .await?;
+        if delivery.confirms_delivery() {
+            self.memory_manager
+                .add_conversation_memory(
+                    user_id,
+                    &format!("主动发起话题: {}", content),
+                    "proactive_private_chat",
+                )
+                .await?;
+        }
         Ok(true)
     }
 
@@ -702,11 +784,36 @@ enum ChatTarget {
 
 #[cfg(test)]
 mod tests {
-    use super::is_sent_proactive_context;
+    use super::{
+        ReachOutDeliveryOutcome, bridge_reach_out_outcome, is_sent_proactive_context,
+        prepared_grace_duration,
+    };
+    use std::time::Duration;
+    use yunxi_core::ActionPortOutcome;
 
     #[test]
     fn skipped_main_admin_decision_does_not_start_global_cooldown() {
         assert!(!is_sent_proactive_context("proactive_main_admin_decision"));
         assert!(is_sent_proactive_context("proactive_private_chat"));
+    }
+
+    #[test]
+    fn proactive_prepared_grace_is_disabled_or_tightly_bounded() {
+        assert_eq!(prepared_grace_duration(0), Duration::ZERO);
+        assert_eq!(prepared_grace_duration(1), Duration::from_millis(300));
+        assert_eq!(prepared_grace_duration(500), Duration::from_millis(500));
+        assert_eq!(prepared_grace_duration(5_000), Duration::from_millis(1_000));
+    }
+
+    #[test]
+    fn indeterminate_reach_out_suppresses_retry_without_confirming_memory() {
+        let outcome = bridge_reach_out_outcome(&ActionPortOutcome::DeliveryIndeterminate {
+            reason: "response channel cancelled".to_owned(),
+            conversation_id: None,
+        });
+
+        assert_eq!(outcome, ReachOutDeliveryOutcome::Indeterminate);
+        assert!(outcome.is_terminal_attempt());
+        assert!(!outcome.confirms_delivery());
     }
 }

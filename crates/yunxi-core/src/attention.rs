@@ -34,6 +34,19 @@ pub struct AttentionResult {
     pub salience: u8,
 }
 
+impl AttentionResult {
+    /// Whether this observation is important enough to spend a planner turn.
+    /// Ignore and observe-only events still update bounded working state, but
+    /// are intentionally handled entirely by the Rust runtime.
+    #[must_use]
+    pub const fn should_invoke_planner(self) -> bool {
+        matches!(
+            self.disposition,
+            AttentionDisposition::Attend | AttentionDisposition::MustHandle
+        )
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct AttentionSystem;
 
@@ -70,9 +83,15 @@ impl AttentionSystem {
                     }
                 }
             }
-            WorldEventKind::ReminderDue(_) | WorldEventKind::GoalCompleted(_) => {
-                must_handle(AttentionReason::ReliableTask)
-            }
+            WorldEventKind::InteractionCuesObserved(_) => AttentionResult {
+                disposition: AttentionDisposition::Attend,
+                reason: AttentionReason::RelevantEvent,
+                salience: 60,
+            },
+            WorldEventKind::ToolCompleted(_)
+            | WorldEventKind::ToolFailed(_)
+            | WorldEventKind::ReminderDue(_)
+            | WorldEventKind::GoalCompleted(_) => must_handle(AttentionReason::ReliableTask),
             WorldEventKind::ProspectiveMemoryDue(_) => AttentionResult {
                 disposition: AttentionDisposition::Attend,
                 reason: AttentionReason::ProspectiveMemory,
@@ -114,10 +133,12 @@ const fn must_handle(reason: AttentionReason) -> AttentionResult {
 mod tests {
     use super::{AttentionDisposition, AttentionReason, AttentionSystem};
     use crate::event::{
-        EventPriority, EventScope, MessageContent, MessageReceivedEvent, ProspectiveMemoryEvent,
-        ReminderDueEvent, WorldEvent, WorldEventKind,
+        EventPriority, EventScope, InteractionCuesObservedEvent, MessageContent,
+        MessageReceivedEvent, ProspectiveMemoryEvent, ReminderDueEvent, ToolCompletedEvent,
+        ToolFailedEvent, WorldEvent, WorldEventKind,
     };
     use crate::identity::{ConversationId, ConversationKind, MessageId, PersonId};
+    use crate::planner::InteractionCues;
     use chrono::Utc;
 
     fn message(kind: ConversationKind, addressed: bool, replied: bool) -> WorldEvent {
@@ -135,6 +156,7 @@ mod tests {
                 replies_to_agent: replied,
                 stop_requested: false,
                 explicit_request: false,
+                visible_reply_allowed: true,
             },
         )
     }
@@ -158,6 +180,31 @@ mod tests {
 
         assert_eq!(result.disposition, AttentionDisposition::ObserveOnly);
         assert_eq!(result.reason, AttentionReason::BackgroundObservation);
+        assert!(!result.should_invoke_planner());
+    }
+
+    #[test]
+    fn semantic_cue_events_are_attended() {
+        let person_id = PersonId::new();
+        let observed = InteractionCuesObservedEvent::new(
+            person_id,
+            InteractionCues {
+                sentiment_confidence: 0.8,
+                ..InteractionCues::default()
+            },
+        )
+        .expect("bounded cues");
+        let event = WorldEvent::new(
+            Utc::now(),
+            EventScope::Person { person_id },
+            EventPriority::Normal,
+            WorldEventKind::InteractionCuesObserved(observed),
+        );
+
+        let result = AttentionSystem.evaluate(&event);
+        assert_eq!(result.disposition, AttentionDisposition::Attend);
+        assert_eq!(result.reason, AttentionReason::RelevantEvent);
+        assert!(result.should_invoke_planner());
     }
 
     #[test]
@@ -174,6 +221,7 @@ mod tests {
 
         assert_eq!(result.disposition, AttentionDisposition::Attend);
         assert_eq!(result.reason, AttentionReason::RelevantEvent);
+        assert!(result.should_invoke_planner());
     }
 
     #[test]
@@ -205,6 +253,38 @@ mod tests {
             AttentionSystem.evaluate(&reminder).disposition,
             AttentionDisposition::MustHandle
         );
+    }
+
+    #[test]
+    fn normal_priority_tool_results_are_must_handle() {
+        let completed = WorldEvent::new(
+            Utc::now(),
+            EventScope::Global,
+            EventPriority::Normal,
+            WorldEventKind::ToolCompleted(ToolCompletedEvent {
+                operation: "weather.lookup".to_owned(),
+                output: String::new(),
+                requires_follow_up: false,
+            }),
+        );
+        let failed = WorldEvent::new(
+            Utc::now(),
+            EventScope::Global,
+            EventPriority::Normal,
+            WorldEventKind::ToolFailed(ToolFailedEvent {
+                operation: "weather.lookup".to_owned(),
+                error_category: "upstream_timeout".to_owned(),
+                detail: String::new(),
+                requires_follow_up: false,
+            }),
+        );
+
+        for event in [&completed, &failed] {
+            let result = AttentionSystem.evaluate(event);
+            assert_eq!(result.disposition, AttentionDisposition::MustHandle);
+            assert_eq!(result.reason, AttentionReason::ReliableTask);
+            assert!(result.should_invoke_planner());
+        }
     }
 
     #[test]

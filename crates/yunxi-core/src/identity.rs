@@ -6,6 +6,8 @@ use uuid::Uuid;
 
 pub const MAX_PLATFORM_ID_BYTES: usize = 64;
 pub const MAX_EXTERNAL_ID_BYTES: usize = 512;
+pub const MAX_CONVERSATION_MEMBER_ROLE_BYTES: usize = 128;
+pub const MAX_CONVERSATION_MEMBER_ROLE_CHARS: usize = 64;
 
 macro_rules! domain_id {
     ($name:ident) => {
@@ -238,6 +240,115 @@ impl FromStr for ConversationKind {
     }
 }
 
+/// A lazily discovered relationship between a canonical person and a
+/// canonical conversation.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConversationMember {
+    conversation_id: ConversationId,
+    person_id: PersonId,
+    role: Option<String>,
+}
+
+impl ConversationMember {
+    #[must_use]
+    pub const fn new(conversation_id: ConversationId, person_id: PersonId) -> Self {
+        Self {
+            conversation_id,
+            person_id,
+            role: None,
+        }
+    }
+
+    pub fn with_role(
+        mut self,
+        role: Option<String>,
+    ) -> Result<Self, ConversationMemberValidationError> {
+        if let Some(role) = &role {
+            validate_conversation_member_role(role)?;
+        }
+        self.role = role;
+        Ok(self)
+    }
+
+    #[must_use]
+    pub const fn conversation_id(&self) -> ConversationId {
+        self.conversation_id
+    }
+
+    #[must_use]
+    pub const fn person_id(&self) -> PersonId {
+        self.person_id
+    }
+
+    #[must_use]
+    pub fn role(&self) -> Option<&str> {
+        self.role.as_deref()
+    }
+
+    pub fn validate(&self) -> Result<(), ConversationMemberValidationError> {
+        if let Some(role) = &self.role {
+            validate_conversation_member_role(role)?;
+        }
+        Ok(())
+    }
+}
+
+impl<'de> Deserialize<'de> for ConversationMember {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            conversation_id: ConversationId,
+            person_id: PersonId,
+            role: Option<String>,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        Self::new(wire.conversation_id, wire.person_id)
+            .with_role(wire.role)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum ConversationMemberValidationError {
+    #[error("conversation member role must not be empty")]
+    EmptyRole,
+    #[error("conversation member role must not contain NUL")]
+    RoleContainsNul,
+    #[error("conversation member role is {length} bytes, above maximum {maximum}")]
+    RoleTooLong { length: usize, maximum: usize },
+    #[error("conversation member role is {length} characters, above maximum {maximum}")]
+    RoleTooManyCharacters { length: usize, maximum: usize },
+}
+
+fn validate_conversation_member_role(role: &str) -> Result<(), ConversationMemberValidationError> {
+    if role.trim().is_empty() {
+        return Err(ConversationMemberValidationError::EmptyRole);
+    }
+    if role.contains('\0') {
+        return Err(ConversationMemberValidationError::RoleContainsNul);
+    }
+    if role.len() > MAX_CONVERSATION_MEMBER_ROLE_BYTES {
+        return Err(ConversationMemberValidationError::RoleTooLong {
+            length: role.len(),
+            maximum: MAX_CONVERSATION_MEMBER_ROLE_BYTES,
+        });
+    }
+    let chars = role.chars().count();
+    if chars > MAX_CONVERSATION_MEMBER_ROLE_CHARS {
+        return Err(ConversationMemberValidationError::RoleTooManyCharacters {
+            length: chars,
+            maximum: MAX_CONVERSATION_MEMBER_ROLE_CHARS,
+        });
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub struct ExternalConversation {
     platform: PlatformId,
@@ -358,9 +469,10 @@ pub enum ExternalReferenceError {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConversationId, ConversationKind, ExternalConversation, ExternalIdentity,
-        ExternalReferenceError, MAX_EXTERNAL_ID_BYTES, MAX_PLATFORM_ID_BYTES, MessageId, PersonId,
-        PlatformId,
+        ConversationId, ConversationKind, ConversationMember, ConversationMemberValidationError,
+        ExternalConversation, ExternalIdentity, ExternalReferenceError,
+        MAX_CONVERSATION_MEMBER_ROLE_BYTES, MAX_CONVERSATION_MEMBER_ROLE_CHARS,
+        MAX_EXTERNAL_ID_BYTES, MAX_PLATFORM_ID_BYTES, MessageId, PersonId, PlatformId,
     };
     use std::str::FromStr;
 
@@ -502,6 +614,72 @@ mod tests {
             Err(ExternalReferenceError::UnknownConversationKind {
                 value: "channel".to_owned(),
             })
+        );
+    }
+
+    #[test]
+    fn conversation_members_are_platform_neutral_and_validated() {
+        let conversation_id = ConversationId::new();
+        let person_id = PersonId::new();
+        let member = ConversationMember::new(conversation_id, person_id)
+            .with_role(Some("moderator".to_owned()))
+            .expect("valid role");
+
+        assert_eq!(member.conversation_id(), conversation_id);
+        assert_eq!(member.person_id(), person_id);
+        assert_eq!(member.role(), Some("moderator"));
+        let encoded = serde_json::to_string(&member).expect("serialize member");
+        assert_eq!(
+            serde_json::from_str::<ConversationMember>(&encoded).expect("deserialize member"),
+            member
+        );
+
+        assert_eq!(
+            ConversationMember::new(conversation_id, person_id)
+                .with_role(Some(" ".to_owned()))
+                .expect_err("blank role must fail"),
+            ConversationMemberValidationError::EmptyRole
+        );
+        assert_eq!(
+            ConversationMember::new(conversation_id, person_id)
+                .with_role(Some("x".repeat(MAX_CONVERSATION_MEMBER_ROLE_BYTES + 1)))
+                .expect_err("role is bounded"),
+            ConversationMemberValidationError::RoleTooLong {
+                length: MAX_CONVERSATION_MEMBER_ROLE_BYTES + 1,
+                maximum: MAX_CONVERSATION_MEMBER_ROLE_BYTES,
+            }
+        );
+    }
+
+    #[test]
+    fn conversation_member_roles_reject_control_characters_and_forged_wire_fields() {
+        let conversation_id = ConversationId::new();
+        let person_id = PersonId::new();
+
+        assert_eq!(
+            ConversationMember::new(conversation_id, person_id)
+                .with_role(Some("moderator\0admin".to_owned()))
+                .expect_err("NUL in a role must fail closed"),
+            ConversationMemberValidationError::RoleContainsNul
+        );
+        assert_eq!(
+            ConversationMember::new(conversation_id, person_id)
+                .with_role(Some("x".repeat(MAX_CONVERSATION_MEMBER_ROLE_CHARS + 1)))
+                .expect_err("role character count must be bounded"),
+            ConversationMemberValidationError::RoleTooManyCharacters {
+                length: MAX_CONVERSATION_MEMBER_ROLE_CHARS + 1,
+                maximum: MAX_CONVERSATION_MEMBER_ROLE_CHARS,
+            }
+        );
+
+        let member = ConversationMember::new(conversation_id, person_id);
+        assert_eq!(member.role(), None);
+        assert_eq!(member.validate(), Ok(()));
+        let mut wire = serde_json::to_value(&member).expect("member should serialize");
+        wire["unexpected"] = serde_json::json!(true);
+        assert!(
+            serde_json::from_value::<ConversationMember>(wire).is_err(),
+            "portable member JSON must reject unknown fields"
         );
     }
 }

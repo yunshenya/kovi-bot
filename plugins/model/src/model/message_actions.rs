@@ -2,15 +2,20 @@
 //!
 //! 模型只负责提出动作意图，真正的消息发送、撤回、分段和打断检查都在这里完成。
 
-use super::interrupt::{ReplyScope, ReplyTicket, is_current};
+use super::interrupt::{
+    OutgoingSource, ReplyScope, ReplyTicket, begin_outgoing_commit,
+    contextual_outgoing_fingerprint, is_current, mark_outgoing_failed,
+    prepare_outgoing_with_semantic_preview,
+};
 use super::message_transport::MessageTransport;
-use super::recall::{RecentBotMessage, recall_bot_messages, record_bot_message};
+use super::recall::{RecentBotMessage, recall_bot_messages, record_committed_bot_message};
 use super::reply::{
     ReplyAction, build_outbound_message, parse_reply_output, sanitize_reply_action_for_sender,
 };
 use super::reply_disposition::ReplyDisposition;
+use crate::group_access;
 use crate::memory::BotPersonality;
-use kovi::RuntimeBot;
+use kovi::{Message, RuntimeBot};
 use rand::Rng;
 
 /// 仅用于兼容旧模型输出；新回复必须通过回复协议的 `messages` 字段分段。
@@ -161,25 +166,156 @@ pub(crate) async fn execute_reply_plan(
             }
         }
 
-        let message = build_outbound_message(bubble, &plan.action, index == 0);
+        let first_message = index == 0;
+        let message = build_outbound_message(bubble, &plan.action, first_message);
+        let reply_to = first_message
+            .then_some(plan.action.quote_message_id)
+            .flatten()
+            .map(i64::from);
+        let mention_user_ids = if first_message {
+            plan.action.at_user_ids.as_slice()
+        } else {
+            &[]
+        };
+        let fingerprint =
+            contextual_outgoing_fingerprint(scope, bubble, reply_to, mention_user_ids, None);
+        let Some(outgoing) = prepare_outgoing_with_semantic_preview(
+            reply_ticket,
+            fingerprint,
+            OutgoingSource::Reply,
+            Some(bubble),
+        )
+        .await
+        else {
+            break;
+        };
+        let Ok(precommit) = begin_outgoing_commit(outgoing).await else {
+            mark_outgoing_failed(outgoing).await;
+            break;
+        };
+        let authorization = match destination {
+            MessageDestination::Group(group_id) => {
+                match group_access::authorize_group_send(group_id).await {
+                    Ok(authorization) => Some(authorization),
+                    Err(error) => {
+                        mark_outgoing_failed(outgoing).await;
+                        eprintln!(
+                            "[WARN] 群聊回复在提交前失去授权 (群组: {}): {}",
+                            group_id, error
+                        );
+                        break;
+                    }
+                }
+            }
+            MessageDestination::Private(_) => None,
+        };
+        let Ok(committed) = precommit.commit(fingerprint, None).await else {
+            mark_outgoing_failed(outgoing).await;
+            break;
+        };
+        drop(authorization);
         let sent = MessageTransport::new(bot).send(destination, message).await;
         match sent {
             Ok(message_id) => {
-                if record_bot_message(scope, reply_ticket, message_id, bubble, bot).await {
+                committed.mark_sent().await;
+                if record_committed_bot_message(scope, reply_ticket, message_id, bubble).await {
                     execution.sent_messages.push(bubble.clone());
                 }
             }
-            Err(error) => match destination {
+            Err(error) => {
+                if error.is_indeterminate() {
+                    drop(committed);
+                } else {
+                    committed.mark_failed().await;
+                }
+                match destination {
+                    MessageDestination::Group(group_id) => {
+                        eprintln!("[ERROR] 群聊回复发送失败 (群组: {}): {:?}", group_id, error)
+                    }
+                    MessageDestination::Private(user_id) => {
+                        eprintln!("[ERROR] 私聊回复发送失败 (用户: {}): {:?}", user_id, error)
+                    }
+                }
+            }
+        }
+    }
+    execution
+}
+
+/// Send one host-owned text message as part of an existing reactive reply.
+/// Fallbacks and progress notices use this path so they cross the same
+/// Prepared -> Committed boundary as model-generated reply bubbles.
+pub(crate) async fn send_tracked_reply_text(
+    bot: &RuntimeBot,
+    destination: MessageDestination,
+    content: &str,
+    reply_ticket: ReplyTicket,
+) -> bool {
+    if content.is_empty() || !is_current(reply_ticket).await {
+        return false;
+    }
+    let scope = destination.scope();
+    let fingerprint = contextual_outgoing_fingerprint(scope, content, None, &[], None);
+    let Some(outgoing) = prepare_outgoing_with_semantic_preview(
+        reply_ticket,
+        fingerprint,
+        OutgoingSource::Reply,
+        Some(content),
+    )
+    .await
+    else {
+        return false;
+    };
+    let Ok(precommit) = begin_outgoing_commit(outgoing).await else {
+        mark_outgoing_failed(outgoing).await;
+        return false;
+    };
+    let authorization = match destination {
+        MessageDestination::Group(group_id) => {
+            match group_access::authorize_group_send(group_id).await {
+                Ok(authorization) => Some(authorization),
+                Err(error) => {
+                    mark_outgoing_failed(outgoing).await;
+                    eprintln!(
+                        "[WARN] 群聊提示在提交前失去授权 (群组: {}): {}",
+                        group_id, error
+                    );
+                    return false;
+                }
+            }
+        }
+        MessageDestination::Private(_) => None,
+    };
+    let Ok(committed) = precommit.commit(fingerprint, None).await else {
+        mark_outgoing_failed(outgoing).await;
+        return false;
+    };
+    drop(authorization);
+    match MessageTransport::new(bot)
+        .send(destination, Message::from(content.to_owned()))
+        .await
+    {
+        Ok(message_id) => {
+            committed.mark_sent().await;
+            record_committed_bot_message(scope, reply_ticket, message_id, content).await
+        }
+        Err(error) => {
+            if error.is_indeterminate() {
+                drop(committed);
+            } else {
+                committed.mark_failed().await;
+            }
+            match destination {
                 MessageDestination::Group(group_id) => {
                     eprintln!("[ERROR] 群聊回复发送失败 (群组: {}): {:?}", group_id, error)
                 }
                 MessageDestination::Private(user_id) => {
                     eprintln!("[ERROR] 私聊回复发送失败 (用户: {}): {:?}", user_id, error)
                 }
-            },
+            }
+            false
         }
     }
-    execution
 }
 
 pub(crate) fn split_reply(content: &str) -> Vec<String> {

@@ -6,9 +6,7 @@
 use crate::config;
 use crate::memory::MEMORY_MANAGER;
 use crate::model::tool_access::{fetch_public_http_response, validate_public_url};
-use crate::model::{
-    MessageDestination, MessageTransport, ReplyScope, record_standalone_bot_message,
-};
+use crate::model::{MessageDestination, OutgoingSource, send_tracked_message_with_revalidation};
 use anyhow::{Context, Result, anyhow, ensure};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use chrono_tz::Tz;
@@ -494,6 +492,101 @@ async fn begin_notification(
     final_result: Value,
 ) -> Result<()> {
     let content = terminal_notification_content(run, outcome);
+    let delivery_key = notification_delivery_key(run.id);
+    let notification_action = Arc::new(kovi::tokio::sync::Mutex::new(None));
+    let action_slot = Arc::clone(&notification_action);
+    let send_result = kovi::tokio::time::timeout(
+        NOTIFICATION_SEND_TIMEOUT,
+        send_tracked_message_with_revalidation(
+            bot,
+            MessageDestination::Private(run.owner_user_id),
+            Message::from(content.clone()),
+            OutgoingSource::Proactive,
+            Some(&delivery_key),
+            || async {
+                match start_notification_send(
+                    run,
+                    outcome,
+                    completed_action_id,
+                    action_completion.as_ref(),
+                    &final_result,
+                    &content,
+                    &delivery_key,
+                )
+                .await
+                {
+                    Ok(Some(action_id)) => {
+                        *action_slot.lock().await = Some(action_id);
+                        true
+                    }
+                    Ok(None) => false,
+                    Err(error) => {
+                        eprintln!(
+                            "[WARN] Agent Run 通知发送闸门失败 (Run: {}): {}",
+                            run.id, error
+                        );
+                        false
+                    }
+                }
+            },
+        ),
+    )
+    .await;
+
+    let notification_action_id = *notification_action.lock().await;
+    let notification_action_id = match notification_action_id {
+        Some(action_id) => Some(action_id),
+        None => load_notification_action_id(run).await?,
+    };
+    match (send_result, notification_action_id) {
+        (Ok(Ok(message_id)), Some(action_id)) => {
+            finish_notification(run, action_id, outcome, Some(message_id), None).await?;
+        }
+        (Ok(Ok(_)), None) => {
+            return Err(anyhow!("Agent Run 通知已发送但投递动作未持久化"));
+        }
+        (result, Some(action_id)) => {
+            let error = match result {
+                Ok(Err(error)) => format!("消息发送失败: {error}"),
+                Err(_) => "消息发送超时，投递结果不确定".to_string(),
+                Ok(Ok(_)) => unreachable!(),
+            };
+            finish_notification(run, action_id, outcome, None, Some(error.clone())).await?;
+            eprintln!(
+                "[WARN] Agent Run 终态通知结果不确定，已禁止自动重放 (Run: {}, 错误: {})",
+                run.id, error
+            );
+        }
+        (result, None) => {
+            let error = match result {
+                Ok(Err(error)) => format!("通知在提交前被拒绝: {error}"),
+                Err(_) => "通知在提交前超时".to_string(),
+                Ok(Ok(_)) => unreachable!(),
+            };
+            abandon_notification_before_send(
+                run,
+                outcome,
+                completed_action_id,
+                action_completion.as_ref(),
+                &final_result,
+                &error,
+            )
+            .await?;
+        }
+    }
+    RUN_WAKEUP.notify_one();
+    Ok(())
+}
+
+async fn start_notification_send(
+    run: &ClaimedRun,
+    outcome: TerminalOutcome,
+    completed_action_id: Option<i64>,
+    action_completion: Option<&ActionCompletion>,
+    final_result: &Value,
+    content: &str,
+    delivery_key: &str,
+) -> Result<Option<i64>> {
     let pool = database_pool()?;
     let lease_until =
         Utc::now() + ChronoDuration::seconds(config::get().agent_runs().lease_secs() as i64);
@@ -505,21 +598,22 @@ async fn begin_notification(
             notification_started_at = NOW(), final_outcome = $3, result = $4,
             next_wake_at = NULL, lease_until = $5, updated_at = NOW()
         WHERE id = $1 AND status = 'running' AND lease_token = $2
+          AND lease_until > NOW()
         RETURNING id
         "#,
     )
     .bind(run.id)
     .bind(&run.lease_token)
     .bind(outcome.as_str())
-    .bind(&final_result)
+    .bind(final_result)
     .bind(lease_until)
     .fetch_optional(&mut *transaction)
     .await?;
     if updated.is_none() {
         transaction.rollback().await?;
-        return Ok(());
+        return Ok(None);
     }
-    if let (Some(action_id), Some(completion)) = (completed_action_id, action_completion.as_ref()) {
+    if let (Some(action_id), Some(completion)) = (completed_action_id, action_completion) {
         finish_action(&mut transaction, action_id, completion).await?;
     }
     let notification_action_id = query_scalar::<Postgres, i64>(
@@ -535,6 +629,7 @@ async fn begin_notification(
         "destination": "private",
         "user_id": run.owner_user_id,
         "content": content,
+        "delivery_key": delivery_key,
     }))
     .fetch_one(&mut *transaction)
     .await?;
@@ -547,46 +642,70 @@ async fn begin_notification(
     )
     .await?;
     transaction.commit().await?;
+    Ok(Some(notification_action_id))
+}
 
-    // `sending` 是不可逆闸门：从这里开始即使超时或重启也不会自动重放。
-    let destination = MessageDestination::Private(run.owner_user_id);
-    let send_result = match kovi::tokio::time::timeout(
-        NOTIFICATION_SEND_TIMEOUT,
-        MessageTransport::new(bot).send(destination, Message::from(content.clone())),
+async fn load_notification_action_id(run: &ClaimedRun) -> Result<Option<i64>> {
+    query_scalar::<Postgres, i64>(
+        r#"
+        SELECT action.id
+        FROM kovi_bot_agent_run_actions action
+        JOIN kovi_bot_agent_runs run ON run.id = action.run_id
+        WHERE run.id = $1 AND run.status = 'notifying'
+          AND run.notification_status = 'sending' AND run.lease_token = $2
+          AND action.idempotency_key = 'final:private.message.send'
+          AND action.status = 'started'
+        "#,
     )
+    .bind(run.id)
+    .bind(&run.lease_token)
+    .fetch_optional(database_pool()?)
     .await
-    {
-        Ok(Ok(message_id)) => Ok(message_id),
-        Ok(Err(error)) => Err(format!("消息发送失败: {error:?}")),
-        Err(_) => Err("消息发送超时，投递结果不确定".to_string()),
-    };
-    match send_result {
-        Ok(message_id) => {
-            record_standalone_bot_message(
-                ReplyScope::Private(run.owner_user_id),
-                message_id,
-                &content,
-            )
-            .await;
-            finish_notification(run, notification_action_id, outcome, Some(message_id), None)
-                .await?;
-        }
-        Err(error) => {
-            finish_notification(
-                run,
-                notification_action_id,
-                outcome,
-                None,
-                Some(error.clone()),
-            )
-            .await?;
-            eprintln!(
-                "[WARN] Agent Run 终态通知结果不确定，已禁止自动重放 (Run: {}, 错误: {})",
-                run.id, error
-            );
-        }
+    .map_err(Into::into)
+}
+
+async fn abandon_notification_before_send(
+    run: &ClaimedRun,
+    outcome: TerminalOutcome,
+    completed_action_id: Option<i64>,
+    action_completion: Option<&ActionCompletion>,
+    final_result: &Value,
+    error: &str,
+) -> Result<()> {
+    let mut transaction = database_pool()?.begin().await?;
+    let updated = query_scalar::<Postgres, i64>(
+        r#"
+        UPDATE kovi_bot_agent_runs
+        SET status = 'failed', notification_status = 'failed', final_outcome = $3,
+            result = $4, last_error = $5, next_wake_at = NULL,
+            lease_token = NULL, lease_until = NULL, completed_at = NOW(), updated_at = NOW()
+        WHERE id = $1 AND status = 'running' AND lease_token = $2
+        RETURNING id
+        "#,
+    )
+    .bind(run.id)
+    .bind(&run.lease_token)
+    .bind(outcome.as_str())
+    .bind(final_result)
+    .bind(truncate_chars(error, 800))
+    .fetch_optional(&mut *transaction)
+    .await?;
+    if updated.is_none() {
+        transaction.rollback().await?;
+        return Ok(());
     }
-    RUN_WAKEUP.notify_one();
+    if let (Some(action_id), Some(completion)) = (completed_action_id, action_completion) {
+        finish_action(&mut transaction, action_id, completion).await?;
+    }
+    insert_event(
+        &mut transaction,
+        run.id,
+        &format!("final:{}:notification_suppressed", outcome.as_str()),
+        "notification_failed",
+        json!({"outcome": outcome.as_str(), "error": error}),
+    )
+    .await?;
+    transaction.commit().await?;
     Ok(())
 }
 
@@ -1747,6 +1866,10 @@ fn database_pool() -> Result<&'static PgPool> {
         .ok_or_else(|| anyhow!("PostgreSQL 记忆连接池尚未初始化"))
 }
 
+fn notification_delivery_key(run_id: i64) -> String {
+    format!("agent-run:{run_id}:final-notification")
+}
+
 fn new_lease_token(run_id: i64) -> String {
     let sequence = LEASE_TOKEN_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let nanos = SystemTime::now()
@@ -1798,6 +1921,18 @@ mod tests {
         assert!(!looks_like_agent_run_request("查看接口监控任务状态"));
         assert!(!looks_like_agent_run_request("停止监控这个链接"));
         assert!(!looks_like_agent_run_request("帮我请求一下这个链接"));
+    }
+
+    #[test]
+    fn notification_delivery_keys_are_stable_per_run() {
+        assert_eq!(
+            super::notification_delivery_key(23),
+            super::notification_delivery_key(23)
+        );
+        assert_ne!(
+            super::notification_delivery_key(23),
+            super::notification_delivery_key(24)
+        );
     }
 
     #[test]
@@ -1863,67 +1998,59 @@ mod tests {
     #[test]
     #[ignore = "requires PostgreSQL via DATABASE_URL"]
     fn postgres_run_creation_and_claim_are_atomic() {
-        kovi::tokio::runtime::Runtime::new()
-            .expect("应创建测试运行时")
-            .block_on(async {
-                crate::memory::MEMORY_MANAGER
-                    .initialize_database()
-                    .await
-                    .expect("应初始化 PostgreSQL 记忆连接池");
-                super::initialize_database()
-                    .await
-                    .expect("应初始化 Agent Run 表");
-                let actor_user_id = Utc::now().timestamp_micros();
-                let source_message_id =
-                    ((actor_user_id % i64::from(i32::MAX - 1)) as i32).max(1);
-                let arguments: Map<String, Value> = serde_json::from_value(json!({
-                    "url": "https://example.com/health",
-                    "interval_seconds": 30,
-                    "condition": "status_equals",
-                    "expected": 204,
-                    "stop_after_minutes": 60,
-                    "max_executions": 20
-                }))
-                .expect("应构造工具参数");
-                let (first, second) = kovi::tokio::join!(
-                    super::create_from_tool(&arguments, actor_user_id, source_message_id),
-                    super::create_from_tool(&arguments, actor_user_id, source_message_id),
-                );
-                first.expect("第一次创建不应失败");
-                second.expect("同一来源消息重放应返回原 Run");
-
-                let request_key =
-                    format!("private:{actor_user_id}:{source_message_id}:agent.run.create");
-                let pool = super::database_pool().expect("连接池应存在");
-                let run_ids = sqlx_core::query_scalar::query_scalar::<Postgres, i64>(
-                    "SELECT id FROM kovi_bot_agent_runs WHERE request_key = $1",
-                )
-                .bind(&request_key)
-                .fetch_all(pool)
+        crate::database_test_support::block_on(async {
+            crate::memory::MEMORY_MANAGER
+                .initialize_database()
                 .await
-                .expect("应读取测试 Run");
-                assert_eq!(run_ids.len(), 1, "同一来源消息只能创建一个 Run");
-                let run_id = run_ids[0];
+                .expect("应初始化 PostgreSQL 记忆连接池");
+            super::initialize_database()
+                .await
+                .expect("应初始化 Agent Run 表");
+            let actor_user_id = Utc::now().timestamp_micros();
+            let source_message_id = ((actor_user_id % i64::from(i32::MAX - 1)) as i32).max(1);
+            let arguments: Map<String, Value> = serde_json::from_value(json!({
+                "url": "https://example.com/health",
+                "interval_seconds": 30,
+                "condition": "status_equals",
+                "expected": 204,
+                "stop_after_minutes": 60,
+                "max_executions": 20
+            }))
+            .expect("应构造工具参数");
+            let (first, second) = kovi::tokio::join!(
+                super::create_from_tool(&arguments, actor_user_id, source_message_id),
+                super::create_from_tool(&arguments, actor_user_id, source_message_id),
+            );
+            first.expect("第一次创建不应失败");
+            second.expect("同一来源消息重放应返回原 Run");
 
-                let now = Utc::now();
-                let (first_claim, second_claim) = kovi::tokio::join!(
-                    super::claim_due(now, 32, 60),
-                    super::claim_due(now, 32, 60),
-                );
-                let claimed = first_claim
-                    .expect("第一个 worker 领取不应失败")
-                    .into_iter()
-                    .chain(
-                        second_claim
-                            .expect("第二个 worker 领取不应失败"),
-                    )
-                    .filter(|run| run.id == run_id)
-                    .collect::<Vec<_>>();
-                assert_eq!(claimed.len(), 1, "同一个 tick 只能被一个 worker 领取");
-                let run = claimed.into_iter().next().expect("测试 Run 应被领取");
-                assert_eq!(run.execution_count, 1);
+            let request_key =
+                format!("private:{actor_user_id}:{source_message_id}:agent.run.create");
+            let pool = super::database_pool().expect("连接池应存在");
+            let run_ids = sqlx_core::query_scalar::query_scalar::<Postgres, i64>(
+                "SELECT id FROM kovi_bot_agent_runs WHERE request_key = $1",
+            )
+            .bind(&request_key)
+            .fetch_all(pool)
+            .await
+            .expect("应读取测试 Run");
+            assert_eq!(run_ids.len(), 1, "同一来源消息只能创建一个 Run");
+            let run_id = run_ids[0];
 
-                let action_count =
+            let now = Utc::now();
+            let (first_claim, second_claim) =
+                kovi::tokio::join!(super::claim_due(now, 32, 60), super::claim_due(now, 32, 60),);
+            let claimed = first_claim
+                .expect("第一个 worker 领取不应失败")
+                .into_iter()
+                .chain(second_claim.expect("第二个 worker 领取不应失败"))
+                .filter(|run| run.id == run_id)
+                .collect::<Vec<_>>();
+            assert_eq!(claimed.len(), 1, "同一个 tick 只能被一个 worker 领取");
+            let run = claimed.into_iter().next().expect("测试 Run 应被领取");
+            assert_eq!(run.execution_count, 1);
+
+            let action_count =
                     sqlx_core::query_scalar::query_scalar::<Postgres, i64>(
                         "SELECT COUNT(*) FROM kovi_bot_agent_run_actions WHERE run_id = $1 AND idempotency_key = 'execution:1:http.get'",
                     )
@@ -1931,82 +2058,138 @@ mod tests {
                     .fetch_one(pool)
                     .await
                     .expect("应读取动作数量");
-                let event_count = sqlx_core::query_scalar::query_scalar::<Postgres, i64>(
+            let event_count = sqlx_core::query_scalar::query_scalar::<Postgres, i64>(
                     "SELECT COUNT(*) FROM kovi_bot_agent_run_events WHERE run_id = $1 AND event_key = 'execution:1:started'",
                 )
                 .bind(run_id)
                 .fetch_one(pool)
                 .await
                 .expect("应读取事件数量");
-                assert_eq!(action_count, 1);
-                assert_eq!(event_count, 1);
+            assert_eq!(action_count, 1);
+            assert_eq!(event_count, 1);
 
-                super::reschedule_claim(
-                    &run,
-                    Utc::now() + chrono::Duration::seconds(30),
-                    0,
-                    None,
-                    super::ActionCompletion::Succeeded(json!({"status": 200})),
-                    "condition_false",
-                )
-                .await
-                .expect("应完成并重排测试 tick");
+            super::reschedule_claim(
+                &run,
+                Utc::now() + chrono::Duration::seconds(30),
+                0,
+                None,
+                super::ActionCompletion::Succeeded(json!({"status": 200})),
+                "condition_false",
+            )
+            .await
+            .expect("应完成并重排测试 tick");
 
-                sqlx_core::query::query(
-                    r#"
+            sqlx_core::query::query(
+                r#"
                     UPDATE kovi_bot_agent_runs
-                    SET status = 'notifying', notification_status = 'sending',
+                    SET status = 'running', notification_status = 'none',
                         lease_token = $2, lease_until = NOW() + INTERVAL '60 seconds',
                         final_outcome = 'matched'
                     WHERE id = $1
                     "#,
-                )
+            )
+            .bind(run_id)
+            .bind(&run.lease_token)
+            .execute(pool)
+            .await
+            .expect("应模拟待通知状态");
+            let content =
+                super::terminal_notification_content(&run, super::TerminalOutcome::Matched);
+            let delivery_key = super::notification_delivery_key(run_id);
+            let notification_action_id = super::start_notification_send(
+                &run,
+                super::TerminalOutcome::Matched,
+                None,
+                None,
+                &json!({"matched": true}),
+                &content,
+                &delivery_key,
+            )
+            .await
+            .expect("应建立通知发送闸门")
+            .expect("当前 Run 应仍持有租约");
+            super::finish_notification(
+                &run,
+                notification_action_id,
+                super::TerminalOutcome::Matched,
+                None,
+                Some("模拟 commit 后发送超时".to_string()),
+            )
+            .await
+            .expect("应完成通知状态回写");
+            let terminal = sqlx_core::query::query(
+                "SELECT status, notification_status FROM kovi_bot_agent_runs WHERE id = $1",
+            )
+            .bind(run_id)
+            .fetch_one(pool)
+            .await
+            .expect("应读取终态");
+            assert_eq!(terminal.get::<String, _>("status"), "failed");
+            assert_eq!(terminal.get::<String, _>("notification_status"), "unknown");
+
+            let restart_source_message_id = source_message_id.saturating_add(1);
+            super::create_from_tool(&arguments, actor_user_id, restart_source_message_id)
+                .await
+                .expect("应创建重启收敛测试 Run");
+            let restart_key =
+                format!("private:{actor_user_id}:{restart_source_message_id}:agent.run.create");
+            let restart_id = sqlx_core::query_scalar::query_scalar::<Postgres, i64>(
+                "SELECT id FROM kovi_bot_agent_runs WHERE request_key = $1",
+            )
+            .bind(&restart_key)
+            .fetch_one(pool)
+            .await
+            .expect("应读取重启测试 Run");
+            let restart_run = super::claim_due(Utc::now(), 32, 60)
+                .await
+                .expect("应领取重启测试 Run")
+                .into_iter()
+                .find(|candidate| candidate.id == restart_id)
+                .expect("重启测试 Run 应被领取");
+            let restart_content =
+                super::terminal_notification_content(&restart_run, super::TerminalOutcome::Matched);
+            let restart_delivery_key = super::notification_delivery_key(restart_id);
+            super::start_notification_send(
+                &restart_run,
+                super::TerminalOutcome::Matched,
+                restart_run.http_action_id,
+                Some(&super::ActionCompletion::Succeeded(json!({"status": 200}))),
+                &json!({"matched": true}),
+                &restart_content,
+                &restart_delivery_key,
+            )
+            .await
+            .expect("应建立重启测试通知闸门")
+            .expect("重启测试 Run 应仍持有租约");
+            sqlx_core::query::query(
+                "UPDATE kovi_bot_agent_runs SET lease_until = NOW() - INTERVAL '1 second' WHERE id = $1",
+            )
+            .bind(restart_id)
+            .execute(pool)
+            .await
+            .expect("应模拟通知发送中进程退出");
+            super::recover_stale_claims(Utc::now())
+                .await
+                .expect("重启扫描应收敛不确定通知");
+            let restart_terminal = sqlx_core::query::query(
+                "SELECT status, notification_status FROM kovi_bot_agent_runs WHERE id = $1",
+            )
+            .bind(restart_id)
+            .fetch_one(pool)
+            .await
+            .expect("应读取重启收敛终态");
+            assert_eq!(restart_terminal.get::<String, _>("status"), "failed");
+            assert_eq!(
+                restart_terminal.get::<String, _>("notification_status"),
+                "unknown"
+            );
+
+            sqlx_core::query::query("DELETE FROM kovi_bot_agent_runs WHERE id IN ($1, $2)")
                 .bind(run_id)
-                .bind(&run.lease_token)
+                .bind(restart_id)
                 .execute(pool)
                 .await
-                .expect("应模拟通知发送闸门");
-                let notification_action_id =
-                    sqlx_core::query_scalar::query_scalar::<Postgres, i64>(
-                        r#"
-                        INSERT INTO kovi_bot_agent_run_actions
-                            (run_id, idempotency_key, capability, effect_class, arguments)
-                        VALUES ($1, 'final:private.message.send', 'private.message.send',
-                                'irreversible', '{}'::jsonb)
-                        RETURNING id
-                        "#,
-                    )
-                    .bind(run_id)
-                    .fetch_one(pool)
-                    .await
-                    .expect("应写入通知动作");
-                super::finish_notification(
-                    &run,
-                    notification_action_id,
-                    super::TerminalOutcome::Matched,
-                    Some(70_000_001),
-                    None,
-                )
-                .await
-                .expect("应完成通知状态回写");
-                let terminal = sqlx_core::query::query(
-                    "SELECT status, notification_status FROM kovi_bot_agent_runs WHERE id = $1",
-                )
-                .bind(run_id)
-                .fetch_one(pool)
-                .await
-                .expect("应读取终态");
-                assert_eq!(terminal.get::<String, _>("status"), "completed");
-                assert_eq!(
-                    terminal.get::<String, _>("notification_status"),
-                    "sent"
-                );
-
-                sqlx_core::query::query("DELETE FROM kovi_bot_agent_runs WHERE id = $1")
-                    .bind(run_id)
-                    .execute(pool)
-                    .await
-                    .expect("应清理测试 Run");
-            });
+                .expect("应清理测试 Run");
+        });
     }
 }

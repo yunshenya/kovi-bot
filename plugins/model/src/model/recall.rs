@@ -2,7 +2,7 @@
 
 use super::interrupt::{
     ReplyScope, ReplyTicket, claim_active_locked, finish_locked, interrupt_if_current_locked,
-    is_current, scope_mutex,
+    is_current, is_scope_epoch_current, scope_mutex,
 };
 use crate::private_image_memory::forget_private_message_images;
 use crate::redis_store;
@@ -140,90 +140,48 @@ pub(crate) async fn finish_reply_locked(scope: ReplyScope, ticket: ReplyTicket) 
     }
 }
 
-/// 记录芸汐实际发出的消息。撤回事件与发送请求竞速时，已经发出的消息会立即补撤。
-pub(crate) async fn record_bot_message(
+/// Record a message after the conversation coordinator has crossed its send
+/// commit point. A newer inbound turn may now coexist with this delivery, so
+/// generation changes must not trigger an automatic recall.
+pub(crate) async fn record_committed_bot_message(
     scope: ReplyScope,
     ticket: ReplyTicket,
     message_id: i32,
     content: &str,
-    bot: &RuntimeBot,
 ) -> bool {
-    let recorded_content = {
-        let mut lifecycles = REPLY_LIFECYCLES.lock().await;
-        if let Some(lifecycle) = lifecycles.get_mut(&scope) {
-            lifecycle.last_seen = Instant::now();
-            let can_record = lifecycle.active.as_ref().is_some_and(|active| {
-                active.ticket == ticket
-                    && !active
-                        .source_message_ids
-                        .iter()
-                        .any(|source_id| lifecycle.recalled_message_ids.contains_key(source_id))
-            });
-            if can_record {
-                lifecycle
-                    .active
-                    .as_mut()
-                    .expect("已确认存在活跃回复")
-                    .sent_message_ids
-                    .push(message_id);
-                record_recent_bot_message(lifecycle, message_id, content);
-                Some(bot_message_content(content))
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-    };
-    if let Some(recorded_content) = recorded_content {
-        if !is_current(ticket).await {
-            discard_stale_bot_message(scope, ticket, message_id, bot).await;
-            return false;
-        }
-        persist_redis_bot_message(scope, message_id, &recorded_content).await;
-        if !is_current(ticket).await {
-            discard_stale_bot_message(scope, ticket, message_id, bot).await;
-            return false;
-        }
-        true
-    } else {
-        bot.delete_msg(message_id);
-        false
+    if message_id <= 0 || !is_scope_epoch_current(ticket).await {
+        return false;
     }
-}
-
-async fn discard_stale_bot_message(
-    scope: ReplyScope,
-    ticket: ReplyTicket,
-    message_id: i32,
-    bot: &RuntimeBot,
-) {
+    let recorded_content = bot_message_content(content);
     {
         let mut lifecycles = REPLY_LIFECYCLES.lock().await;
-        if let Some(lifecycle) = lifecycles.get_mut(&scope) {
-            if let Some(active) = lifecycle.active.as_mut()
-                && active.ticket == ticket
-            {
-                active
-                    .sent_message_ids
-                    .retain(|candidate| *candidate != message_id);
-            }
-            remove_bot_messages(lifecycle, &[message_id]);
-            lifecycle.last_seen = Instant::now();
+        prune_lifecycles(&mut lifecycles);
+        let lifecycle = lifecycles.entry(scope).or_default();
+        lifecycle.last_seen = Instant::now();
+        if let Some(active) = lifecycle.active.as_mut()
+            && active.ticket == ticket
+        {
+            active.sent_message_ids.push(message_id);
         }
+        record_recent_bot_message(lifecycle, message_id, content);
     }
-    remove_redis_bot_messages(scope, &[message_id]).await;
-    bot.delete_msg(message_id);
+    persist_redis_bot_message(scope, message_id, &recorded_content).await;
+    if !is_scope_epoch_current(ticket).await {
+        discard_erased_bot_record(scope, message_id).await;
+        return false;
+    }
+    true
 }
 
 /// 记录不属于某轮被动回复的消息，例如主动聊天和命令反馈。
 pub(crate) async fn record_standalone_bot_message(
     scope: ReplyScope,
+    ticket: ReplyTicket,
     message_id: i32,
     content: &str,
-) {
-    if message_id <= 0 {
-        return;
+) -> bool {
+    if message_id <= 0 || !is_scope_epoch_current(ticket).await {
+        return false;
     }
     let mut lifecycles = REPLY_LIFECYCLES.lock().await;
     prune_lifecycles(&mut lifecycles);
@@ -232,6 +190,22 @@ pub(crate) async fn record_standalone_bot_message(
     record_recent_bot_message(lifecycle, message_id, content);
     drop(lifecycles);
     persist_redis_bot_message(scope, message_id, &bot_message_content(content)).await;
+    if !is_scope_epoch_current(ticket).await {
+        discard_erased_bot_record(scope, message_id).await;
+        return false;
+    }
+    true
+}
+
+async fn discard_erased_bot_record(scope: ReplyScope, message_id: i32) {
+    {
+        let mut lifecycles = REPLY_LIFECYCLES.lock().await;
+        if let Some(lifecycle) = lifecycles.get_mut(&scope) {
+            remove_bot_messages(lifecycle, &[message_id]);
+            lifecycle.last_seen = Instant::now();
+        }
+    }
+    remove_redis_bot_messages(scope, &[message_id]).await;
 }
 
 pub(crate) async fn send_tracked_group_message(
@@ -240,13 +214,16 @@ pub(crate) async fn send_tracked_group_message(
     content: impl Into<String>,
 ) -> bool {
     let content = content.into();
-    match bot.send_group_msg_return(group_id, content.clone()).await {
-        Ok(message_id) => {
-            record_standalone_bot_message(ReplyScope::Group(group_id), message_id, &content).await;
-            true
-        }
+    match super::tracked_send::send_tracked_plain_text(
+        bot,
+        super::message_actions::MessageDestination::Group(group_id),
+        content,
+    )
+    .await
+    {
+        Ok(_) => true,
         Err(error) => {
-            eprintln!("[ERROR] 群聊消息发送失败 (群组: {}): {:?}", group_id, error);
+            eprintln!("[ERROR] 群聊消息发送失败 (群组: {}): {}", group_id, error);
             false
         }
     }
@@ -258,13 +235,16 @@ pub(crate) async fn send_tracked_private_message(
     content: impl Into<String>,
 ) -> bool {
     let content = content.into();
-    match bot.send_private_msg_return(user_id, content.clone()).await {
-        Ok(message_id) => {
-            record_standalone_bot_message(ReplyScope::Private(user_id), message_id, &content).await;
-            true
-        }
+    match super::tracked_send::send_tracked_plain_text(
+        bot,
+        super::message_actions::MessageDestination::Private(user_id),
+        content,
+    )
+    .await
+    {
+        Ok(_) => true,
         Err(error) => {
-            eprintln!("[ERROR] 私聊消息发送失败 (用户: {}): {:?}", user_id, error);
+            eprintln!("[ERROR] 私聊消息发送失败 (用户: {}): {}", user_id, error);
             false
         }
     }
@@ -677,10 +657,13 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ReplyLifecycle, begin_reply, finish_reply, normalize_recall_message_ids,
-        parse_recall_notice, record_recent_bot_message, remove_bot_messages,
+        REPLY_LIFECYCLES, ReplyLifecycle, begin_reply, finish_reply, normalize_recall_message_ids,
+        parse_recall_notice, record_recent_bot_message, record_standalone_bot_message,
+        remove_bot_messages,
     };
-    use crate::model::interrupt::{ReplyScope, interrupt, is_active};
+    use crate::model::interrupt::{
+        ReplyScope, clear_reply_state_locked, interrupt, is_active, scope_mutex,
+    };
     use kovi::event::NoticeEvent;
     use kovi::serde_json::{Value, json};
 
@@ -755,6 +738,30 @@ mod tests {
                 assert!(is_active(scope).await);
                 finish_reply(scope, new).await;
                 assert!(!is_active(scope).await);
+            });
+    }
+
+    #[test]
+    fn erased_scope_epoch_rejects_late_post_send_persistence() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let scope = ReplyScope::Private(9_000_007);
+                let erased_ticket = interrupt(scope).await;
+                let lock = scope_mutex(scope);
+                let guard = lock.lock().await;
+                assert!(clear_reply_state_locked(scope).await);
+                drop(guard);
+                let _replacement = interrupt(scope).await;
+
+                assert!(!record_standalone_bot_message(scope, erased_ticket, 707, "旧投递").await);
+                assert!(
+                    REPLY_LIFECYCLES
+                        .lock()
+                        .await
+                        .get(&scope)
+                        .is_none_or(|lifecycle| lifecycle.recent_bot_messages.is_empty())
+                );
             });
     }
 }

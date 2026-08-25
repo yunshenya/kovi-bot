@@ -23,6 +23,7 @@ config = "0.15.15"
 rand = "0.9"
 rmcp.workspace = true
 scraper.workspace = true
+sha2 = "0.10"
 sqlx-core.workspace = true
 sqlx-postgres.workspace = true
 url.workspace = true

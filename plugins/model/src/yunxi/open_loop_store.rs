@@ -1,3 +1,4 @@
+use super::owner_lock::{self, DurableOwner};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use sqlx_core::query::query;
 use sqlx_core::query_scalar::query_scalar;
@@ -88,6 +89,7 @@ impl PostgresOpenLoopStore {
 
     pub(crate) async fn initialize_schema(&self) -> anyhow::Result<()> {
         let mut transaction = self.pool.begin().await?;
+        super::schema::lock(&mut transaction).await?;
         for statement in [
             r#"
             CREATE TABLE IF NOT EXISTS yunxi_open_loops (
@@ -326,7 +328,7 @@ impl PostgresOpenLoopStore {
     async fn create_inner(&self, draft: &OpenLoopDraft) -> Result<OpenLoop, OpenLoopStoreError> {
         draft.validate().map_err(validation_error)?;
         let now = Utc::now();
-        let (owner_kind, owner_id, lock_key) = owner_parts(draft.owner());
+        let (owner_kind, owner_id) = owner_parts(draft.owner());
         let dedupe_key = draft.dedupe_key().map(ToOwned::to_owned).or_else(|| {
             draft
                 .source_message_id()
@@ -338,7 +340,15 @@ impl PostgresOpenLoopStore {
             .await
             .map_err(OpenLoopStoreError::storage)?;
 
-        advisory_lock(&mut transaction, &lock_key).await?;
+        let owner = durable_owner(draft.owner());
+        if !owner_lock::lock_and_owner_exists(&mut transaction, owner)
+            .await
+            .map_err(OpenLoopStoreError::storage)?
+        {
+            return Err(OpenLoopStoreError::InvalidRequest {
+                reason: format!("open-loop owner {owner:?} does not exist"),
+            });
+        }
         expire_owner_rows(&mut transaction, owner_kind, owner_id, now).await?;
 
         if let Some(dedupe_key) = dedupe_key.as_deref() {
@@ -524,7 +534,7 @@ impl PostgresOpenLoopStore {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let (owner_kind, owner_id, _) = owner_parts(*owner);
+        let (owner_kind, owner_id) = owner_parts(*owner);
         let now = Utc::now();
         let mut transaction = self
             .pool
@@ -867,28 +877,20 @@ fn validation_error(error: OpenLoopValidationError) -> OpenLoopStoreError {
     }
 }
 
-fn owner_parts(owner: OpenLoopOwner) -> (&'static str, Option<Uuid>, String) {
+fn owner_parts(owner: OpenLoopOwner) -> (&'static str, Option<Uuid>) {
     match owner {
-        OpenLoopOwner::Person(id) => ("person", Some(id.into_uuid()), format!("person:{id}")),
-        OpenLoopOwner::Conversation(id) => (
-            "conversation",
-            Some(id.into_uuid()),
-            format!("conversation:{id}"),
-        ),
-        OpenLoopOwner::Global => ("global", None, "global".to_string()),
+        OpenLoopOwner::Person(id) => ("person", Some(id.into_uuid())),
+        OpenLoopOwner::Conversation(id) => ("conversation", Some(id.into_uuid())),
+        OpenLoopOwner::Global => ("global", None),
     }
 }
 
-async fn advisory_lock(
-    transaction: &mut sqlx_core::transaction::Transaction<'_, Postgres>,
-    lock_key: &str,
-) -> Result<(), OpenLoopStoreError> {
-    query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
-        .bind(lock_key)
-        .execute(&mut **transaction)
-        .await
-        .map(|_| ())
-        .map_err(OpenLoopStoreError::storage)
+const fn durable_owner(owner: OpenLoopOwner) -> DurableOwner {
+    match owner {
+        OpenLoopOwner::Person(id) => DurableOwner::Person(id.into_uuid()),
+        OpenLoopOwner::Conversation(id) => DurableOwner::Conversation(id.into_uuid()),
+        OpenLoopOwner::Global => DurableOwner::Global,
+    }
 }
 
 async fn expire_owner_rows(
@@ -1105,8 +1107,13 @@ fn row_to_open_loop(row: &sqlx_postgres::PgRow) -> Result<OpenLoop, OpenLoopStor
 
 #[cfg(test)]
 mod tests {
-    use super::OpenLoopStoreConfig;
+    use super::{OpenLoopStoreConfig, PostgresOpenLoopStore};
+    use chrono::{Duration as ChronoDuration, Utc};
+    use sqlx_core::query::query;
+    use sqlx_postgres::PgPoolOptions;
     use std::time::Duration;
+    use uuid::Uuid;
+    use yunxi_core::{OpenLoopDraft, OpenLoopKind, OpenLoopOwner, OpenLoopStatus, OpenLoopStore};
 
     #[test]
     fn store_config_is_bounded() {
@@ -1127,5 +1134,70 @@ mod tests {
             .validate()
             .is_err()
         );
+    }
+
+    #[test]
+    #[ignore = "requires PostgreSQL via DATABASE_URL"]
+    fn postgres_global_due_defer_removes_the_schedule() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("should create test runtime")
+            .block_on(async {
+                let database_url = std::env::var("DATABASE_URL").expect("requires DATABASE_URL");
+                let pool = PgPoolOptions::new()
+                    .max_connections(4)
+                    .connect(&database_url)
+                    .await
+                    .expect("should connect to PostgreSQL");
+                let store = PostgresOpenLoopStore::new(pool.clone());
+                store
+                    .initialize_schema()
+                    .await
+                    .expect("should initialize open-loop schema");
+
+                let now = Utc::now();
+                let marker = Uuid::new_v4();
+                let draft = OpenLoopDraft::new(
+                    OpenLoopOwner::Global,
+                    OpenLoopKind::FutureEvent,
+                    format!("global unscheduled test {marker}"),
+                )
+                .expect("should create draft")
+                .with_due_at(Some(now - ChronoDuration::seconds(1)))
+                .with_dedupe_key(Some(format!("global-unscheduled:{marker}")))
+                .expect("should set dedupe key");
+                let created = store.create(&draft).await.expect("should create open loop");
+                query(
+                    "UPDATE yunxi_open_loops
+                     SET status = 'triggered', triggered_at = $2,
+                         updated_at = $2, version = version + 1
+                     WHERE id = $1",
+                )
+                .bind(created.id().into_uuid())
+                .bind(now)
+                .execute(&pool)
+                .await
+                .expect("should simulate the scheduler claim");
+                let claimed_item = store
+                    .get(created.id())
+                    .await
+                    .expect("should read claimed open loop")
+                    .expect("claimed open loop should exist");
+                let reopened = store
+                    .defer(created.id(), None, now + ChronoDuration::seconds(1))
+                    .await
+                    .expect("should remove the global schedule");
+
+                query("DELETE FROM yunxi_open_loops WHERE id = $1")
+                    .bind(created.id().into_uuid())
+                    .execute(&pool)
+                    .await
+                    .expect("should clean up isolated open loop");
+
+                assert_eq!(claimed_item.status(), OpenLoopStatus::Triggered);
+                assert!(claimed_item.triggered_at().is_some());
+                assert_eq!(reopened.status(), OpenLoopStatus::Open);
+                assert!(reopened.due_at().is_none());
+                assert!(reopened.triggered_at().is_none());
+            });
     }
 }

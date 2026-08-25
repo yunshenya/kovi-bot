@@ -37,6 +37,28 @@ cargo run --locked
 cargo run -p yunxi-cli
 ```
 
+CLI 默认使用进程内 Core stores；设置 `YUNXI_CLI_STATE` 后，会用单个有界 JSON snapshot
+持久化稳定的 Core 身份以及 Memory、Affect、Relation、OpenLoop。`YUNXI_CLI_JOURNAL`
+可另外开启 turn 审计日志：
+
+```bash
+YUNXI_CLI_STATE=./yunxi-cli-state.json \
+YUNXI_CLI_JOURNAL=./yunxi-cli-turns.jsonl \
+cargo run -p yunxi-cli
+```
+
+私聊安全纯文本和群聊中明确 `@` 芸汐的纯文本默认由 Yunxi Core 接管；命令、提醒、Agent
+Run、附件和群聊环境消息继续由成熟的 Kovi handler 处理。生产出现异常时可在重启前显式
+回退到 legacy：
+
+```bash
+YUNXI_CORE_PRIVATE_CUTOVER=0 YUNXI_CORE_GROUP_CUTOVER=0 cargo run --locked
+```
+
+建议在 `[identity]` 配置 canonical owner 的 Core `PersonId`。该 Person 必须在 PostgreSQL
+中恰好有一个 QQ ExternalIdentity；缺失或歧义时权限、主动投递和故障通知会 fail-closed，
+不会猜测旧账号。未配置时才兼容 `[proactive].main_admin`。
+
 ## 连接 NapCat
 
 `6099` 是 NapCat WebUI 管理端口，不是机器人连接端口。本项目连接 NapCat 的 OneBot 11
@@ -61,6 +83,10 @@ readiness 文件。二进制、配置与环境变量会作为一个整体原子�
 模型与随机推送的配置示例：
 
 ```toml
+[identity]
+# canonical Yunxi PersonId；配置后优先使用该 Person 的唯一 QQ 路由
+# owner_person_id = "00000000-0000-0000-0000-000000000000"
+
 [server_config]
 url = "https://api.example.com/v1/responses"
 model_name = "your-model-name"
@@ -200,7 +226,7 @@ recent_topic_cooldown_secs = 604800
 
 机器人会从最近活跃的群组和真正私聊过的用户中随机选择接收方，再结合情绪、能量、时间、群组话题和用户兴趣选择内容。冷却时间、空闲阈值、发送概率、目标冷却和每日上限共同避免刷屏。主动消息的决策时间、最后发送时间和每日计数单独写入 PostgreSQL 的 `kovi_bot_proactive_state`，不受普通记忆容量清理影响；服务重启后也不会重新触发一轮主动消息。长期记忆、用户档案、群组档案、滚动摘要和人格分别写入 PostgreSQL 分表，不再为每次变化重写整份 JSONB；默认最多保留 1000 条长期记忆明细，后台任务会定期去重并清理 30 天前的低重要性记录。超过保留期未活跃的用户/群档案及其摘要也会清理；高重要性记忆不按年龄清理，但仍受总量上限约束，人格和表情标签则需显式删除。完整的数据范围、外部传输和删除边界见[数据与隐私说明](docs/privacy.md)。首次升级时会自动从旧 `kovi_bot_memory` JSONB 快照（或运行目录的 `bot_memory.json`）迁移，原数据保留作为兼容备份。
 
-配置 `main_admin` 后，该用户的关系等级会自动保持为最高。她会使用独立的主动私聊策略：模型最多每隔 `main_admin_decision_interval_secs`（默认 3 小时）评估一次，但实际发送还必须满足 `main_admin_cooldown_secs`（默认 6 小时）、`main_admin_daily_limit`（默认每天 2 条）和全局 `daily_limit`（默认每天 4 条）；同一目标的主动消息默认至少间隔 `target_cooldown_secs`（默认 6 小时）。用户或群组刚刚主动互动后，`recent_interaction_cooldown_secs`（默认 2 小时）内不会追加主动开场。上述状态独立持久化，服务重启和普通记忆清理都不会绕过限频。
+配置 canonical owner 后，该用户的关系等级会自动保持为最高。她会使用独立的主动私聊策略：模型最多每隔 `main_admin_decision_interval_secs`（默认 3 小时）评估一次，但实际发送还必须满足 `main_admin_cooldown_secs`（默认 6 小时）、`main_admin_daily_limit`（默认每天 2 条）和全局 `daily_limit`（默认每天 4 条）；同一目标的主动消息默认至少间隔 `target_cooldown_secs`（默认 6 小时）。用户或群组刚刚主动互动后，`recent_interaction_cooldown_secs`（默认 2 小时）内不会追加主动开场。上述状态独立持久化，服务重启和普通记忆清理都不会绕过限频。未配置 canonical owner 时，这段兼容策略才使用 `main_admin` QQ 号。
 
 每段群聊和私聊还会维护一份可持久化的滚动摘要。短期记录超过 `max_conversation_messages`（默认 25 条）或估算超过 `max_conversation_tokens`（默认 6000 token）时，模型会将较早消息连同旧摘要压缩为不超过 `summary_max_chars`（默认 1500 字）的新摘要，并尽量保留最近 `summary_keep_recent_messages`（默认 15 条）原文继续聊天。模型暂时不可用时，会使用截断后的本地片段作为降级摘要，避免直接遗失上下文。
 

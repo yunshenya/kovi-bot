@@ -1,4 +1,6 @@
-# Yunxi Mind v2：持续心智状态与自主认知扩展需求文档
+# Yunxi Mind v2：持续心智状态与自主认知扩展开发文档
+
+**文档状态：** 最终整合版  
 
 **文档版本：** 2.0  
 **适用项目：** Yunxi Core / kovi-bot  
@@ -2081,7 +2083,6 @@ idle period
 day boundary
 ```
 
----
 
 # 91. Conversation End
 
@@ -3846,3 +3847,197 @@ Yunxi Mind v2 的目标不是：
 ```
 
 Yunxi Mind v2 才算真正完成。
+
+
+# Conversation Concurrency Integration
+
+
+## 1. Mind 与发送并发状态的职责边界
+
+Yunxi Mind v2 不维护：
+
+```text
+Thinking
+Prepared
+Committed
+Sent
+Cancelled
+Superseded
+```
+
+这些属于 V1 `ConversationCoordinator` / Outgoing Lifecycle。
+
+Mind 只负责：
+
+- Curiosity
+- OpenQuestion
+- OpenLoop-related cognitive state
+- InnerAgenda
+- Beliefs
+- Preferences
+- Interests
+- Reflection / Episode
+
+---
+
+## 2. 新消息到达时的 Mind 更新顺序
+
+如果当前存在尚未 `Committed` 的 PendingOutgoing，而用户新消息到达：
+
+应先允许 Mind 更新相关内部状态，再由 Executive 基于最新 MindSnapshot 进行 revalidation。
+
+例如：
+
+```text
+InnerAgenda:
+“想知道用户面试结果”
+
+Prepared proactive:
+“你今天面试怎么样？”
+
+New User Message:
+“我面试过了！”
+```
+
+正确流程：
+
+```text
+New Message
+→ Observation / Semantic Update
+→ OpenLoop resolved
+→ Curiosity resolved
+→ OpenQuestion resolved if applicable
+→ InnerAgenda updated
+→ latest MindSnapshot
+→ Executive revalidates PendingOutgoing
+→ Supersede / Rewrite / Cancel
+```
+
+禁止：
+
+```text
+Mind 已经知道答案
+→ 仍发送旧问题
+```
+
+---
+
+## 3. Mind 不直接执行 Outgoing 决策
+
+Mind 不应直接：
+
+```text
+send
+cancel
+commit
+withdraw
+```
+
+Mind 只改变：
+
+```text
+“现在我知道什么 / 在意什么”
+```
+
+Executive 决定：
+
+```text
+旧 PendingOutgoing 是否仍值得发
+```
+
+Core 决定：
+
+```text
+是否还能安全 commit
+```
+
+---
+
+## 4. Curiosity / OpenQuestion Collision
+
+如果一个 PendingOutgoing 本质上是为了满足 Curiosity：
+
+```text
+Pending:
+“你为什么换工作？”
+```
+
+而新消息已经自然回答：
+
+```text
+“主要是因为上一份工作太远了。”
+```
+
+则：
+
+```text
+Curiosity → Resolved
+Pending → Superseded / Rewrite
+```
+
+不要继续机械追问。
+
+---
+
+## 5. OpenLoop Collision
+
+如果：
+
+```text
+OpenLoop:
+FollowUp interview
+```
+
+而用户在主动 follow-up 发出前先报告结果：
+
+```text
+OpenLoop → Resolve
+Agenda item → Resolve / Drop
+Pending proactive → Supersede
+```
+
+---
+
+## 6. Reflection 与 Collision
+
+Message Collision 本身可以作为轻量 Episode candidate，但不应每次都进入长期记忆。
+
+只有：
+
+```text
+salience high
+or
+conversation meaning changed
+```
+
+才进入 Reflection。
+
+---
+
+## 7. 测试补充
+
+至少增加：
+
+- Curiosity resolved before pending question commit
+- OpenQuestion resolved before pending question commit
+- OpenLoop resolved before proactive commit
+- InnerAgenda changes affect revalidation
+- collision 不导致重复建立 Curiosity
+- stale PendingOutgoing 不写错误 Episode
+
+---
+
+## 8. 兼容性原则
+
+本补丁不得：
+
+- 删除 V2 原有 SelfModel
+- 删除 Belief / Preference / Interest
+- 删除 Curiosity / OpenQuestion
+- 删除 InnerAgenda
+- 删除 Reflection / Episode / Consolidation
+- 改变原有 Phase 顺序语义
+
+它只增加：
+
+> **Mind 状态在会话竞争发生时如何先更新，再提供最新 Snapshot 给 Executive。**

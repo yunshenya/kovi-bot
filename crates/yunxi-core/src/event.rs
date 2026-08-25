@@ -1,12 +1,22 @@
 use crate::identity::{
     ConversationId, ConversationKind, EventId, GoalId, MessageId, OpenLoopId, PersonId,
 };
+use crate::planner::{InteractionCueValidationError, InteractionCues};
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
 pub const MAX_MESSAGE_CONTENT_BYTES: usize = 32 * 1_024;
 pub const MAX_MESSAGE_CONTENT_CHARS: usize = 8_192;
+pub const MAX_MESSAGE_ATTACHMENTS: usize = 16;
+pub const MAX_ATTACHMENT_REFERENCE_BYTES: usize = 4 * 1_024;
+pub const MAX_ATTACHMENT_REFERENCE_CHARS: usize = 2 * 1_024;
+pub const MAX_ATTACHMENT_MEDIA_TYPE_BYTES: usize = 256;
+pub const MAX_ATTACHMENT_FILE_NAME_BYTES: usize = 1_024;
+pub const MAX_TOOL_RESULT_BYTES: usize = 16 * 1_024;
+pub const MAX_TOOL_RESULT_CHARS: usize = 4_096;
+pub const MAX_TOOL_ERROR_DETAIL_BYTES: usize = 4 * 1_024;
+pub const MAX_TOOL_ERROR_DETAIL_CHARS: usize = 1_024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -112,21 +122,376 @@ pub enum TraceError {
     InvalidContext,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachmentKind {
+    Image,
+    Audio,
+    Video,
+    File,
+}
+
+/// A platform-neutral reference to message media.
+///
+/// Core preserves the reference as an opaque value. A host may use a URL,
+/// content-addressed key, or another adapter-owned locator without exposing a
+/// platform message segment in the domain model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Attachment {
+    kind: AttachmentKind,
+    reference: String,
+    media_type: Option<String>,
+    file_name: Option<String>,
+}
+
+impl Attachment {
+    pub fn new(
+        kind: AttachmentKind,
+        reference: impl Into<String>,
+    ) -> Result<Self, MessageValidationError> {
+        let attachment = Self {
+            kind,
+            reference: reference.into(),
+            media_type: None,
+            file_name: None,
+        };
+        attachment.validate()?;
+        Ok(attachment)
+    }
+
+    pub fn with_media_type(
+        mut self,
+        media_type: Option<String>,
+    ) -> Result<Self, MessageValidationError> {
+        self.media_type = media_type;
+        self.validate()?;
+        Ok(self)
+    }
+
+    pub fn with_file_name(
+        mut self,
+        file_name: Option<String>,
+    ) -> Result<Self, MessageValidationError> {
+        self.file_name = file_name;
+        self.validate()?;
+        Ok(self)
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> AttachmentKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub fn reference(&self) -> &str {
+        &self.reference
+    }
+
+    #[must_use]
+    pub fn media_type(&self) -> Option<&str> {
+        self.media_type.as_deref()
+    }
+
+    #[must_use]
+    pub fn file_name(&self) -> Option<&str> {
+        self.file_name.as_deref()
+    }
+
+    pub fn validate(&self) -> Result<(), MessageValidationError> {
+        validate_required_attachment_field(
+            "reference",
+            &self.reference,
+            MAX_ATTACHMENT_REFERENCE_BYTES,
+            Some(MAX_ATTACHMENT_REFERENCE_CHARS),
+        )?;
+        if let Some(media_type) = &self.media_type {
+            validate_optional_attachment_field(
+                "media_type",
+                media_type,
+                MAX_ATTACHMENT_MEDIA_TYPE_BYTES,
+            )?;
+        }
+        if let Some(file_name) = &self.file_name {
+            validate_optional_attachment_field(
+                "file_name",
+                file_name,
+                MAX_ATTACHMENT_FILE_NAME_BYTES,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl<'de> Deserialize<'de> for Attachment {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            kind: AttachmentKind,
+            reference: String,
+            media_type: Option<String>,
+            file_name: Option<String>,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        Attachment::new(wire.kind, wire.reference)
+            .and_then(|attachment| attachment.with_media_type(wire.media_type))
+            .and_then(|attachment| attachment.with_file_name(wire.file_name))
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct MessageContent {
     text: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    attachments: Vec<Attachment>,
+}
+
+impl Default for MessageContent {
+    fn default() -> Self {
+        Self::text("")
+    }
 }
 
 impl MessageContent {
     #[must_use]
     pub fn text(value: impl Into<String>) -> Self {
-        Self { text: value.into() }
+        Self {
+            text: value.into(),
+            attachments: Vec::new(),
+        }
     }
 
     #[must_use]
     pub fn as_text(&self) -> &str {
         &self.text
     }
+
+    pub fn with_attachments(
+        mut self,
+        attachments: Vec<Attachment>,
+    ) -> Result<Self, MessageValidationError> {
+        self.attachments = attachments;
+        self.validate()?;
+        Ok(self)
+    }
+
+    #[must_use]
+    pub fn attachments(&self) -> &[Attachment] {
+        &self.attachments
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.text.trim().is_empty() && self.attachments.is_empty()
+    }
+
+    pub fn validate(&self) -> Result<(), MessageValidationError> {
+        if self.text.contains('\0') {
+            return Err(MessageValidationError::TextContainsNul);
+        }
+        if self.text.len() > MAX_MESSAGE_CONTENT_BYTES {
+            return Err(MessageValidationError::TextTooLong {
+                length: self.text.len(),
+                maximum: MAX_MESSAGE_CONTENT_BYTES,
+            });
+        }
+        let chars = self.text.chars().count();
+        if chars > MAX_MESSAGE_CONTENT_CHARS {
+            return Err(MessageValidationError::TextTooManyCharacters {
+                length: chars,
+                maximum: MAX_MESSAGE_CONTENT_CHARS,
+            });
+        }
+        if self.attachments.len() > MAX_MESSAGE_ATTACHMENTS {
+            return Err(MessageValidationError::TooManyAttachments {
+                length: self.attachments.len(),
+                maximum: MAX_MESSAGE_ATTACHMENTS,
+            });
+        }
+        for attachment in &self.attachments {
+            attachment.validate()?;
+        }
+        Ok(())
+    }
+}
+
+impl<'de> Deserialize<'de> for MessageContent {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            text: String,
+            #[serde(default)]
+            attachments: Vec<Attachment>,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        MessageContent::text(wire.text)
+            .with_attachments(wire.attachments)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+/// A complete message after a host has normalized platform input.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Message {
+    pub id: MessageId,
+    pub conversation_id: ConversationId,
+    pub sender: PersonId,
+    pub content: MessageContent,
+    pub timestamp: DateTime<Utc>,
+    pub reply_to: Option<MessageId>,
+}
+
+impl Message {
+    pub fn new(
+        id: MessageId,
+        conversation_id: ConversationId,
+        sender: PersonId,
+        content: MessageContent,
+        timestamp: DateTime<Utc>,
+    ) -> Result<Self, MessageValidationError> {
+        let message = Self {
+            id,
+            conversation_id,
+            sender,
+            content,
+            timestamp,
+            reply_to: None,
+        };
+        message.validate()?;
+        Ok(message)
+    }
+
+    #[must_use]
+    pub fn with_reply_to(mut self, reply_to: Option<MessageId>) -> Self {
+        self.reply_to = reply_to;
+        self
+    }
+
+    pub fn validate(&self) -> Result<(), MessageValidationError> {
+        self.content.validate()
+    }
+}
+
+impl<'de> Deserialize<'de> for Message {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            id: MessageId,
+            conversation_id: ConversationId,
+            sender: PersonId,
+            content: MessageContent,
+            timestamp: DateTime<Utc>,
+            reply_to: Option<MessageId>,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        Message::new(
+            wire.id,
+            wire.conversation_id,
+            wire.sender,
+            wire.content,
+            wire.timestamp,
+        )
+        .map(|message| message.with_reply_to(wire.reply_to))
+        .map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum MessageValidationError {
+    #[error("message text must not contain NUL")]
+    TextContainsNul,
+    #[error("message text is {length} bytes, above maximum {maximum}")]
+    TextTooLong { length: usize, maximum: usize },
+    #[error("message text is {length} characters, above maximum {maximum}")]
+    TextTooManyCharacters { length: usize, maximum: usize },
+    #[error("message has {length} attachments, above maximum {maximum}")]
+    TooManyAttachments { length: usize, maximum: usize },
+    #[error("attachment {field} must not be empty")]
+    EmptyAttachmentField { field: &'static str },
+    #[error("attachment {field} must not contain NUL")]
+    AttachmentFieldContainsNul { field: &'static str },
+    #[error("attachment {field} is {length} bytes, above maximum {maximum}")]
+    AttachmentFieldTooLong {
+        field: &'static str,
+        length: usize,
+        maximum: usize,
+    },
+    #[error("attachment {field} is {length} characters, above maximum {maximum}")]
+    AttachmentFieldTooManyCharacters {
+        field: &'static str,
+        length: usize,
+        maximum: usize,
+    },
+}
+
+fn validate_required_attachment_field(
+    field: &'static str,
+    value: &str,
+    maximum_bytes: usize,
+    maximum_chars: Option<usize>,
+) -> Result<(), MessageValidationError> {
+    if value.trim().is_empty() {
+        return Err(MessageValidationError::EmptyAttachmentField { field });
+    }
+    validate_attachment_field(field, value, maximum_bytes, maximum_chars)
+}
+
+fn validate_optional_attachment_field(
+    field: &'static str,
+    value: &str,
+    maximum_bytes: usize,
+) -> Result<(), MessageValidationError> {
+    if value.trim().is_empty() {
+        return Err(MessageValidationError::EmptyAttachmentField { field });
+    }
+    validate_attachment_field(field, value, maximum_bytes, None)
+}
+
+fn validate_attachment_field(
+    field: &'static str,
+    value: &str,
+    maximum_bytes: usize,
+    maximum_chars: Option<usize>,
+) -> Result<(), MessageValidationError> {
+    if value.contains('\0') {
+        return Err(MessageValidationError::AttachmentFieldContainsNul { field });
+    }
+    if value.len() > maximum_bytes {
+        return Err(MessageValidationError::AttachmentFieldTooLong {
+            field,
+            length: value.len(),
+            maximum: maximum_bytes,
+        });
+    }
+    if let Some(maximum) = maximum_chars {
+        let length = value.chars().count();
+        if length > maximum {
+            return Err(MessageValidationError::AttachmentFieldTooManyCharacters {
+                field,
+                length,
+                maximum,
+            });
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -142,6 +507,16 @@ pub struct MessageReceivedEvent {
     pub replies_to_agent: bool,
     pub stop_requested: bool,
     pub explicit_request: bool,
+    /// Whether this observation may produce a visible reply.
+    ///
+    /// Hosts set this to `false` when another execution path owns user-visible
+    /// effects but Core should still observe the message and update state.
+    #[serde(default = "default_visible_reply_allowed")]
+    pub visible_reply_allowed: bool,
+}
+
+const fn default_visible_reply_allowed() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -151,15 +526,92 @@ pub struct MessageSentEvent {
     pub timestamp: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageCollisionDetectedEvent {
+    pub conversation_id: ConversationId,
+    pub outgoing_generation: u64,
+    pub conversation_version: u64,
+    pub fingerprint: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolCompletedEvent {
     pub operation: String,
+    #[serde(default)]
+    pub output: String,
+    #[serde(default)]
+    pub requires_follow_up: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolFailedEvent {
     pub operation: String,
     pub error_category: String,
+    #[serde(default)]
+    pub detail: String,
+    #[serde(default)]
+    pub requires_follow_up: bool,
+}
+
+/// Fixed-point wire representation of semantic evidence already produced by
+/// a host understanding pass. Fixed-point fields keep WorldEvent equality and
+/// serialization deterministic while the planner consumes normalized floats.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InteractionCuesObservedEvent {
+    pub person_id: PersonId,
+    pub sentiment_valence_millis: i16,
+    pub sentiment_arousal_millis: i16,
+    pub sentiment_confidence_millis: u16,
+    pub gratitude_strength_millis: u16,
+}
+
+impl InteractionCuesObservedEvent {
+    pub fn new(
+        person_id: PersonId,
+        cues: InteractionCues,
+    ) -> Result<Self, InteractionCueValidationError> {
+        cues.validate()?;
+        Ok(Self {
+            person_id,
+            sentiment_valence_millis: (cues.sentiment_valence * 1_000.0).round() as i16,
+            sentiment_arousal_millis: (cues.sentiment_arousal * 1_000.0).round() as i16,
+            sentiment_confidence_millis: (cues.sentiment_confidence * 1_000.0).round() as u16,
+            gratitude_strength_millis: (cues.gratitude_strength * 1_000.0).round() as u16,
+        })
+    }
+
+    #[must_use]
+    pub fn cues(self) -> InteractionCues {
+        InteractionCues {
+            sentiment_valence: f32::from(self.sentiment_valence_millis) / 1_000.0,
+            sentiment_arousal: f32::from(self.sentiment_arousal_millis) / 1_000.0,
+            sentiment_confidence: f32::from(self.sentiment_confidence_millis) / 1_000.0,
+            gratitude_strength: f32::from(self.gratitude_strength_millis) / 1_000.0,
+        }
+    }
+
+    fn validate(self) -> Result<(), EventValidationError> {
+        for (field, value) in [
+            ("sentiment_valence_millis", self.sentiment_valence_millis),
+            ("sentiment_arousal_millis", self.sentiment_arousal_millis),
+        ] {
+            if !(-1_000..=1_000).contains(&value) {
+                return Err(EventValidationError::InteractionCueOutOfRange { field });
+            }
+        }
+        for (field, value) in [
+            (
+                "sentiment_confidence_millis",
+                self.sentiment_confidence_millis,
+            ),
+            ("gratitude_strength_millis", self.gratitude_strength_millis),
+        ] {
+            if value > 1_000 {
+                return Err(EventValidationError::InteractionCueOutOfRange { field });
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -209,6 +661,8 @@ pub struct ActionRejectedEvent {
 pub enum WorldEventKind {
     MessageReceived(MessageReceivedEvent),
     MessageSent(MessageSentEvent),
+    MessageCollisionDetected(MessageCollisionDetectedEvent),
+    InteractionCuesObserved(InteractionCuesObservedEvent),
     ToolCompleted(ToolCompletedEvent),
     ToolFailed(ToolFailedEvent),
     ReminderDue(ReminderDueEvent),
@@ -230,6 +684,8 @@ impl WorldEventKind {
         match self {
             Self::MessageReceived(_) => EventType::MessageReceived,
             Self::MessageSent(_) => EventType::MessageSent,
+            Self::MessageCollisionDetected(_) => EventType::MessageCollisionDetected,
+            Self::InteractionCuesObserved(_) => EventType::InteractionCuesObserved,
             Self::ToolCompleted(_) => EventType::ToolCompleted,
             Self::ToolFailed(_) => EventType::ToolFailed,
             Self::ReminderDue(_) => EventType::ReminderDue,
@@ -252,6 +708,8 @@ impl WorldEventKind {
 pub enum EventType {
     MessageReceived,
     MessageSent,
+    MessageCollisionDetected,
+    InteractionCuesObserved,
     ToolCompleted,
     ToolFailed,
     ReminderDue,
@@ -407,6 +865,7 @@ impl WorldEvent {
                 }
                 Some(message.conversation_id)
             }
+            WorldEventKind::MessageCollisionDetected(collision) => Some(collision.conversation_id),
             _ => None,
         };
         if let Some(expected) = expected_conversation
@@ -422,6 +881,14 @@ impl WorldEvent {
         };
         if let Some(expected) = expected_goal
             && self.scope != (EventScope::Goal { goal_id: expected })
+        {
+            return Err(EventValidationError::ScopeMismatch);
+        }
+        if let WorldEventKind::InteractionCuesObserved(cues) = &self.kind
+            && self.scope
+                != (EventScope::Person {
+                    person_id: cues.person_id,
+                })
         {
             return Err(EventValidationError::ScopeMismatch);
         }
@@ -445,20 +912,32 @@ impl WorldEvent {
         const MAX_ERROR_CATEGORY_BYTES: usize = 256;
 
         match &self.kind {
-            WorldEventKind::MessageReceived(message) => {
-                check_payload_size(
-                    "message_content",
-                    message.content.text.len(),
-                    MAX_MESSAGE_CONTENT_BYTES,
-                )?;
-                check_payload_char_count(
-                    "message_content",
-                    message.content.text.chars().count(),
-                    MAX_MESSAGE_CONTENT_CHARS,
-                )
-            }
+            WorldEventKind::MessageReceived(message) => match message.content.validate() {
+                Ok(()) => Ok(()),
+                Err(MessageValidationError::TextTooLong { length, maximum }) => {
+                    Err(EventValidationError::PayloadTooLarge {
+                        field: "message_content",
+                        length,
+                        maximum,
+                    })
+                }
+                Err(MessageValidationError::TextTooManyCharacters { length, maximum }) => {
+                    Err(EventValidationError::PayloadTooLong {
+                        field: "message_content",
+                        length,
+                        maximum,
+                    })
+                }
+                Err(error) => Err(EventValidationError::InvalidMessageContent(error)),
+            },
             WorldEventKind::ToolCompleted(tool) => {
-                check_payload_size("tool_operation", tool.operation.len(), MAX_OPERATION_BYTES)
+                check_payload_size("tool_operation", tool.operation.len(), MAX_OPERATION_BYTES)?;
+                check_payload_size("tool_output", tool.output.len(), MAX_TOOL_RESULT_BYTES)?;
+                check_payload_char_count(
+                    "tool_output",
+                    tool.output.chars().count(),
+                    MAX_TOOL_RESULT_CHARS,
+                )
             }
             WorldEventKind::ToolFailed(tool) => {
                 check_payload_size("tool_operation", tool.operation.len(), MAX_OPERATION_BYTES)?;
@@ -466,8 +945,19 @@ impl WorldEvent {
                     "error_category",
                     tool.error_category.len(),
                     MAX_ERROR_CATEGORY_BYTES,
+                )?;
+                check_payload_size(
+                    "tool_error_detail",
+                    tool.detail.len(),
+                    MAX_TOOL_ERROR_DETAIL_BYTES,
+                )?;
+                check_payload_char_count(
+                    "tool_error_detail",
+                    tool.detail.chars().count(),
+                    MAX_TOOL_ERROR_DETAIL_CHARS,
                 )
             }
+            WorldEventKind::InteractionCuesObserved(cues) => cues.validate(),
             WorldEventKind::ReminderDue(reminder) => check_payload_size(
                 "reminder_reference",
                 reminder.reference.len(),
@@ -547,6 +1037,8 @@ pub enum EventValidationError {
     ScopeMismatch,
     #[error("event timestamp does not match its message payload")]
     TimestampMismatch,
+    #[error("event contains invalid message content: {0}")]
+    InvalidMessageContent(MessageValidationError),
     #[error("event payload `{field}` is {length} bytes, above maximum {maximum}")]
     PayloadTooLarge {
         field: &'static str,
@@ -559,15 +1051,22 @@ pub enum EventValidationError {
         length: usize,
         maximum: usize,
     },
+    #[error("interaction cue `{field}` is outside its fixed-point range")]
+    InteractionCueOutOfRange { field: &'static str },
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        EventPriority, EventScope, EventValidationError, MessageContent, MessageReceivedEvent,
-        TraceError, WorldEvent, WorldEventKind,
+        Attachment, AttachmentKind, EventPriority, EventScope, EventValidationError,
+        GoalCompletedEvent, GoalUpdatedEvent, InteractionCuesObservedEvent,
+        MAX_MESSAGE_ATTACHMENTS, MAX_TOOL_ERROR_DETAIL_CHARS, MAX_TOOL_RESULT_BYTES, Message,
+        MessageContent, MessageReceivedEvent, MessageValidationError, ToolCompletedEvent,
+        ToolFailedEvent, TraceError, WorldEvent, WorldEventKind,
     };
-    use crate::{ConversationId, ConversationKind, EventId, MessageId, PersonId};
+    use crate::{
+        ConversationId, ConversationKind, EventId, GoalId, InteractionCues, MessageId, PersonId,
+    };
     use chrono::Utc;
 
     #[test]
@@ -606,6 +1105,64 @@ mod tests {
                 max_depth: 1,
             })
         );
+    }
+
+    #[test]
+    fn legacy_tool_events_default_to_observation_only() {
+        let completed: ToolCompletedEvent = serde_json::from_value(serde_json::json!({
+            "operation": "weather.current"
+        }))
+        .expect("legacy completed event");
+        let failed: ToolFailedEvent = serde_json::from_value(serde_json::json!({
+            "operation": "weather.current",
+            "error_category": "timeout"
+        }))
+        .expect("legacy failed event");
+
+        assert!(completed.output.is_empty());
+        assert!(!completed.requires_follow_up);
+        assert!(failed.detail.is_empty());
+        assert!(!failed.requires_follow_up);
+    }
+
+    #[test]
+    fn tool_feedback_payloads_are_bounded() {
+        let completed = WorldEvent::new(
+            Utc::now(),
+            EventScope::Global,
+            EventPriority::High,
+            WorldEventKind::ToolCompleted(ToolCompletedEvent {
+                operation: "weather.current".to_string(),
+                output: "x".repeat(MAX_TOOL_RESULT_BYTES + 1),
+                requires_follow_up: true,
+            }),
+        );
+        assert!(matches!(
+            completed.validate(8),
+            Err(EventValidationError::PayloadTooLarge {
+                field: "tool_output",
+                ..
+            })
+        ));
+
+        let failed = WorldEvent::new(
+            Utc::now(),
+            EventScope::Global,
+            EventPriority::High,
+            WorldEventKind::ToolFailed(ToolFailedEvent {
+                operation: "weather.current".to_string(),
+                error_category: "timeout".to_string(),
+                detail: "错".repeat(MAX_TOOL_ERROR_DETAIL_CHARS + 1),
+                requires_follow_up: true,
+            }),
+        );
+        assert!(matches!(
+            failed.validate(8),
+            Err(EventValidationError::PayloadTooLong {
+                field: "tool_error_detail",
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -652,6 +1209,146 @@ mod tests {
     }
 
     #[test]
+    fn goal_events_require_their_goal_scope() {
+        let goal_id = GoalId::new();
+        let valid = WorldEvent::new(
+            Utc::now(),
+            EventScope::Goal { goal_id },
+            EventPriority::Normal,
+            WorldEventKind::GoalUpdated(GoalUpdatedEvent { goal_id }),
+        );
+        assert_eq!(valid.validate(8), Ok(()));
+
+        let mismatched = WorldEvent::new(
+            Utc::now(),
+            EventScope::Global,
+            EventPriority::Normal,
+            WorldEventKind::GoalCompleted(GoalCompletedEvent { goal_id }),
+        );
+        assert_eq!(
+            mismatched.validate(8),
+            Err(EventValidationError::ScopeMismatch)
+        );
+    }
+
+    #[test]
+    fn interaction_cues_use_a_validated_fixed_point_wire_format() {
+        let person_id = PersonId::new();
+        let observed = InteractionCuesObservedEvent::new(
+            person_id,
+            InteractionCues {
+                sentiment_valence: -0.625,
+                sentiment_arousal: 0.375,
+                sentiment_confidence: 0.875,
+                gratitude_strength: 0.75,
+            },
+        )
+        .expect("bounded cues");
+        let event = WorldEvent::new(
+            Utc::now(),
+            EventScope::Person { person_id },
+            EventPriority::Normal,
+            WorldEventKind::InteractionCuesObserved(observed),
+        );
+
+        assert_eq!(observed.sentiment_valence_millis, -625);
+        assert_eq!(observed.sentiment_arousal_millis, 375);
+        assert_eq!(observed.sentiment_confidence_millis, 875);
+        assert_eq!(observed.gratitude_strength_millis, 750);
+        assert_eq!(event.validate(8), Ok(()));
+
+        let encoded = serde_json::to_string(&event).expect("cue event should serialize");
+        let decoded: WorldEvent =
+            serde_json::from_str(&encoded).expect("cue event should deserialize");
+        assert_eq!(decoded, event);
+        assert_eq!(decoded.validate(8), Ok(()));
+    }
+
+    #[test]
+    fn interaction_cues_reject_out_of_range_fixed_point_values() {
+        let person_id = PersonId::new();
+        for (observed, field) in [
+            (
+                InteractionCuesObservedEvent {
+                    person_id,
+                    sentiment_valence_millis: 1_001,
+                    sentiment_arousal_millis: 0,
+                    sentiment_confidence_millis: 0,
+                    gratitude_strength_millis: 0,
+                },
+                "sentiment_valence_millis",
+            ),
+            (
+                InteractionCuesObservedEvent {
+                    person_id,
+                    sentiment_valence_millis: 0,
+                    sentiment_arousal_millis: -1_001,
+                    sentiment_confidence_millis: 0,
+                    gratitude_strength_millis: 0,
+                },
+                "sentiment_arousal_millis",
+            ),
+            (
+                InteractionCuesObservedEvent {
+                    person_id,
+                    sentiment_valence_millis: 0,
+                    sentiment_arousal_millis: 0,
+                    sentiment_confidence_millis: 1_001,
+                    gratitude_strength_millis: 0,
+                },
+                "sentiment_confidence_millis",
+            ),
+            (
+                InteractionCuesObservedEvent {
+                    person_id,
+                    sentiment_valence_millis: 0,
+                    sentiment_arousal_millis: 0,
+                    sentiment_confidence_millis: 0,
+                    gratitude_strength_millis: 1_001,
+                },
+                "gratitude_strength_millis",
+            ),
+        ] {
+            let event = WorldEvent::new(
+                Utc::now(),
+                EventScope::Person { person_id },
+                EventPriority::Normal,
+                WorldEventKind::InteractionCuesObserved(observed),
+            );
+            assert_eq!(
+                event.validate(8),
+                Err(EventValidationError::InteractionCueOutOfRange { field })
+            );
+        }
+    }
+
+    #[test]
+    fn interaction_cues_require_their_person_scope() {
+        let person_id = PersonId::new();
+        let observed = InteractionCuesObservedEvent::new(
+            person_id,
+            InteractionCues {
+                sentiment_confidence: 0.8,
+                ..InteractionCues::default()
+            },
+        )
+        .expect("bounded cues");
+        let mismatched = WorldEvent::new(
+            Utc::now(),
+            EventScope::Person {
+                person_id: PersonId::new(),
+            },
+            EventPriority::Normal,
+            WorldEventKind::InteractionCuesObserved(observed),
+        );
+
+        assert_eq!(
+            mismatched.validate(8),
+            Err(EventValidationError::ScopeMismatch)
+        );
+    }
+
+    #[test]
     fn event_round_trips_and_oversized_content_is_rejected() {
         let event = WorldEvent::message_received(
             EventPriority::Normal,
@@ -667,12 +1364,25 @@ mod tests {
                 replies_to_agent: false,
                 stop_requested: false,
                 explicit_request: false,
+                visible_reply_allowed: true,
             },
         );
         let encoded = serde_json::to_string(&event).expect("event should serialize");
         let decoded: WorldEvent = serde_json::from_str(&encoded).expect("event should deserialize");
         assert_eq!(decoded, event);
         assert_eq!(decoded.validate(8), Ok(()));
+
+        let mut legacy = serde_json::to_value(&event).expect("event should serialize");
+        legacy["kind"]["payload"]
+            .as_object_mut()
+            .expect("message payload")
+            .remove("visible_reply_allowed");
+        let legacy: WorldEvent =
+            serde_json::from_value(legacy).expect("older message event should deserialize");
+        assert!(matches!(
+            legacy.kind(),
+            WorldEventKind::MessageReceived(message) if message.visible_reply_allowed
+        ));
 
         let oversized = match event.kind().clone() {
             WorldEventKind::MessageReceived(mut message) => {
@@ -688,6 +1398,68 @@ mod tests {
                 length: 32 * 1_024 + 1,
                 maximum: 32 * 1_024,
             })
+        );
+    }
+
+    #[test]
+    fn structured_message_content_preserves_text_compatibility() {
+        let image = Attachment::new(AttachmentKind::Image, "asset:sha256:abc")
+            .expect("opaque reference")
+            .with_media_type(Some("image/png".to_owned()))
+            .expect("media type")
+            .with_file_name(Some("photo.png".to_owned()))
+            .expect("file name");
+        let content = MessageContent::text("")
+            .with_attachments(vec![image.clone()])
+            .expect("attachment-only content is valid");
+
+        assert_eq!(content.as_text(), "");
+        assert_eq!(content.attachments(), &[image]);
+        assert!(!content.is_empty());
+
+        let legacy: MessageContent =
+            serde_json::from_str(r#"{"text":"legacy"}"#).expect("legacy text-only JSON");
+        assert_eq!(legacy.as_text(), "legacy");
+        assert!(legacy.attachments().is_empty());
+        assert_eq!(
+            serde_json::to_value(MessageContent::text("legacy")).expect("serialize content"),
+            serde_json::json!({"text": "legacy"})
+        );
+    }
+
+    #[test]
+    fn attachment_and_message_deserialization_enforce_bounds() {
+        let attachment =
+            Attachment::new(AttachmentKind::File, "asset:document").expect("attachment");
+        assert_eq!(
+            MessageContent::text("body")
+                .with_attachments(vec![attachment; MAX_MESSAGE_ATTACHMENTS + 1])
+                .expect_err("attachment count is bounded"),
+            MessageValidationError::TooManyAttachments {
+                length: MAX_MESSAGE_ATTACHMENTS + 1,
+                maximum: MAX_MESSAGE_ATTACHMENTS,
+            }
+        );
+        assert!(
+            serde_json::from_str::<Attachment>(
+                r#"{"kind":"image","reference":"","media_type":null,"file_name":null}"#,
+            )
+            .is_err()
+        );
+
+        let message = Message::new(
+            MessageId::new(),
+            ConversationId::new(),
+            PersonId::new(),
+            MessageContent::text("hello"),
+            Utc::now(),
+        )
+        .expect("valid message")
+        .with_reply_to(Some(MessageId::new()));
+        let encoded = serde_json::to_string(&message).expect("serialize message");
+        assert_eq!(
+            serde_json::from_str::<Message>(&encoded).expect("deserialize message"),
+            message
         );
     }
 }

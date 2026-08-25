@@ -1,4 +1,6 @@
-# Yunxi Executive v3：执行控制、元认知与计划修正需求文档
+# Yunxi Executive v3：执行控制、元认知与计划修正开发文档
+
+**文档状态：** 最终整合版  
 
 **文档版本：** 3.0  
 **适用项目：** Yunxi Core / Yunxi Mind  
@@ -3534,3 +3536,257 @@ v3 让系统：
 能够真实改变未来行为，
 
 Yunxi Executive v3 才算完成。
+
+
+# Outgoing Revalidation & Collision Arbitration
+
+
+## 1. 新职责：Outgoing Revalidation
+
+Executive v3 新增正式职责：
+
+> 当 PendingOutgoing 尚未 `Committed` 且 Conversation 在生成期间发生变化时，判断旧内容是否仍值得发送。
+
+---
+
+## 2. 输入
+
+建议：
+
+```text
+PendingOutgoing
+New WorldEvent(s)
+Latest MindSnapshot
+Latest WorldModelSnapshot
+Latest ConversationState
+ExecutiveSnapshot
+```
+
+---
+
+## 3. 输出
+
+建议：
+
+```rust
+pub enum OutgoingRevalidation {
+    CommitAsIs,
+    Cancel,
+    Supersede,
+    Rewrite(RewriteRequest),
+    Merge(MergeRequest),
+    Defer(DeferUntil),
+}
+```
+
+---
+
+## 4. Deterministic Fast Path 优先
+
+以下情况不需要额外模型：
+
+- ReplyTicket stale
+- generation stale
+- Stop intent
+- target invalid
+- permission invalid
+- capability invalid
+- exact duplicate
+- OpenLoop 已明确 resolved
+- user already answered exact pending question
+- direct reply preempts unrelated proactive
+
+只有：
+
+```text
+conversation changed
++
+semantic ambiguity high
+```
+
+才进入 Executive / lightweight model 仲裁。
+
+---
+
+## 5. 典型场景
+
+### Pending
+
+```text
+“你今天面试怎么样？”
+```
+
+### New Message A
+
+```text
+“我面试过了！”
+```
+
+结果：
+
+```text
+Supersede / Rewrite
+```
+
+### New Message B
+
+```text
+“我刚去吃火锅了。”
+```
+
+结果：
+
+```text
+CommitAsIs / Defer
+```
+
+不能 deterministic 全取消。
+
+---
+
+## 6. Direct Reply vs Proactive
+
+默认：
+
+```text
+Direct Reply
+>
+Prepared Proactive
+```
+
+如果 proactive 尚未 `Committed`：
+
+可以：
+
+```text
+Cancel
+Merge
+Defer
+Rewrite
+```
+
+---
+
+## 7. 多 Proactive Motive
+
+如果两个 motive 同时准备：
+
+```text
+FollowUp
++
+Share
+```
+
+Executive 应：
+
+- 选择主 motive；
+- 或自然 Merge；
+- 或 Defer 一个。
+
+禁止短时间机械连续发两条独立主动消息。
+
+---
+
+## 8. CandidateScore 新增维度
+
+建议加入：
+
+```text
+semantic_staleness
+duplicate_question_cost
+conversation_change_cost
+user_already_answered
+direct_preempts_proactive
+collision_risk
+rewrite_value
+```
+
+---
+
+## 9. MustExecute 边界
+
+Executive 不得取消：
+
+- Reminder
+- data deletion
+- Stop handling
+- committed task delivery
+- security / permission operation
+
+但可以调整：
+
+```text
+自然语言包装
+合法 delivery timing
+```
+
+因此：
+
+```text
+MustExecute
+!=
+MustSendExactOldSentence
+```
+
+---
+
+## 10. Rewrite / Merge 次数限制
+
+单个 PendingOutgoing：
+
+```text
+max rewrite / merge count
+```
+
+必须 bounded，例如：
+
+```text
+2
+```
+
+用户连续快速发送时，超过限制：
+
+```text
+Cancel / re-enter normal planning
+```
+
+避免永远生成、永远发不出去。
+
+---
+
+## 11. 测试补充
+
+至少：
+
+- user already answered → Supersede
+- unrelated message → Keep/Defer
+- direct preempts proactive
+- proactive + proactive merge
+- rewrite bounded
+- MustExecute not silently cancelled
+- no extra LLM on unchanged conversation
+- semantic gray-zone only calls optional evaluator
+
+---
+
+## 12. 性能原则
+
+普通 direct message：
+
+```text
+conversation_version unchanged
+```
+
+不得因为 V3 默认增加额外大模型调用。
+
+---
+
+## 13. 核心结论
+
+Executive v3 负责的不是：
+
+> “阻止双方同时说话。”
+
+而是：
+
+> **“在仍有机会修改输出时，判断旧输出是否已经失去语义价值。”**

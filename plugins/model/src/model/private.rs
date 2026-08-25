@@ -3,8 +3,12 @@ use crate::config;
 use crate::group_access;
 use crate::memory::MEMORY_MANAGER;
 use crate::model::coalesce::{MessageCoalescer, MessagePart};
-use crate::model::conversation_coordinator::{ConversationCoordinator, PendingTurn};
-use crate::model::interrupt::{ReplyScope, is_active, scope_mutex};
+use crate::model::conversation_coordinator::{
+    ConversationCoordinator, IncomingAdmission, OutgoingExecutiveDecision, PendingTurn,
+};
+use crate::model::interrupt::{
+    ReplyScope, ReplyTicket, clear_reply_state_locked, is_active, scope_mutex,
+};
 use crate::model::recall::{
     clear_reply_scope_locked, has_recalled_messages, is_recent_bot_message,
     recent_bot_message_for_reaction, send_tracked_private_message,
@@ -14,10 +18,11 @@ use crate::model::semantic::{
     ImageReferenceIntent, MessageUnderstanding, SemanticImageIntent, UnderstandingRequest,
     understand,
 };
-use crate::model::traffic::{InboundScope, bounded_input, should_suppress};
+use crate::model::traffic::{InboundScope, bounded_input, clear_private_traffic, should_suppress};
 use crate::model::utils::{
     clear_private_runtime_data, command_help, is_bot_admin, is_group_admin_command,
-    is_help_command, is_restricted_command, private_chat_claimed, send_sys_info_private,
+    is_help_command, is_main_admin, is_restricted_command, private_chat_claimed,
+    send_sys_info_private,
 };
 use crate::private_image_memory::{
     RecentPrivateImage, forget_private_user_images, recent_private_images, remember_private_images,
@@ -52,7 +57,27 @@ type PendingPrivateMessage = PendingTurn;
 static PENDING_PRIVATE_MESSAGES: LazyLock<Mutex<HashMap<i64, VecDeque<PendingPrivateMessage>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+#[allow(dead_code)]
 pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<RuntimeBot>) {
+    if event.user_id == event.self_id {
+        println!(
+            "[INFO] 忽略私聊自发消息回流 (用户: {}, 消息: {})",
+            event.user_id, event.message_id
+        );
+        return;
+    }
+    let admission =
+        ConversationCoordinator::begin_incoming(ReplyScope::Private(event.user_id)).await;
+    private_message_event_after_ingress(event, bot, admission).await;
+    ConversationCoordinator::abandon_incoming(admission).await;
+}
+
+pub(crate) async fn private_message_event_after_ingress(
+    event: Arc<PrivateMsgEvent>,
+    bot: Arc<RuntimeBot>,
+    initial_admission: IncomingAdmission,
+) {
+    let ingress = initial_admission.ticket;
     let user_id = event.user_id;
     let reply_scope = ReplyScope::Private(user_id);
     if event.user_id == event.self_id {
@@ -81,12 +106,12 @@ pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<Runtime
         return;
     }
     if let Some(command) = parse_agent_task_command(message) {
-        if bot.get_main_admin().ok() != Some(user_id) {
+        if !is_main_admin(&bot, user_id) {
             println!("[INFO] 私聊跨群任务命令未授权 (用户: {})", user_id);
             return;
         }
         if matches!(command, AgentTaskCommand::Cancel(_)) {
-            stop_private_reply(user_id).await;
+            stop_private_reply(user_id, ingress).await;
         }
         let reply = match command {
             AgentTaskCommand::List => agent_tasks::task_status_report(user_id, None).await,
@@ -164,25 +189,25 @@ pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<Runtime
         send_tracked_private_message(&bot, user_id, reply).await;
         return;
     }
-    if should_suppress(InboundScope::Private(user_id), sender_is_admin).await {
-        println!("[INFO] 私聊入站流量已抑制 (用户: {})", user_id);
-        return;
-    }
     match message.trim() {
         "#删除我的数据" => {
             send_tracked_private_message(
                 &bot,
                 user_id,
-                "这会删除你的私聊记忆、用户档案、摘要、近期图片、与你关联的表情记忆和角色动作记录。若确认，请发送：#删除我的数据 确认",
+                "这会删除你的私聊记忆、用户档案、摘要、近期图片、与你关联的表情记忆、角色动作记录，以及 Yunxi Core 中的身份映射、关系、情绪、待办和目标。若确认，请发送：#删除我的数据 确认",
             )
             .await;
             return;
         }
         "#删除我的数据 确认" => {
-            delete_private_user_data(user_id, &bot).await;
+            delete_private_user_data(user_id, event.self_id, &bot).await;
             return;
         }
         _ => {}
+    }
+    if should_suppress(InboundScope::Private(user_id), sender_is_admin).await {
+        println!("[INFO] 私聊入站流量已抑制 (用户: {})", user_id);
+        return;
     }
     if is_recent_bot_message(reply_scope, event.message_id).await {
         println!(
@@ -323,16 +348,8 @@ pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<Runtime
             None
         };
     let sticker_reaction = recent_sticker_reaction.is_some();
-    let active_reply = is_active(reply_scope).await;
-    let immediate_stop = active_reply && looks_like_immediate_stop_request(message);
-    let can_interrupt = vision_command;
-    let reply_ticket = if can_interrupt {
-        Some(ConversationCoordinator::interrupt(reply_scope).await)
-    } else {
-        None
-    };
-    if immediate_stop {
-        stop_private_reply(user_id).await;
+    if looks_like_immediate_stop_request(message) {
+        stop_private_reply(user_id, ingress).await;
         println!("[INFO] 私聊用户打断回复 (用户: {})", user_id);
         return;
     }
@@ -491,9 +508,10 @@ pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<Runtime
     } else {
         understand(batch_request.clone()).await
     };
+    crate::yunxi::events::project_interaction_cues(user_id, understanding.interaction_cues());
     let asks_for_silence = plain_text && (understanding.wants_no_reply || understanding.wants_stop);
     if asks_for_silence {
-        stop_private_reply(user_id).await;
+        stop_private_reply(user_id, ingress).await;
         println!(
             "[INFO] 合并后的私聊消息请求停止当前回复 (用户: {})",
             user_id
@@ -588,9 +606,17 @@ pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<Runtime
     {
         eprintln!("[ERROR] 私聊保存表情包使用记录失败: {}", error);
     }
+    let Some(admission) = admit_understood_private_turn(initial_admission, &understanding).await
+    else {
+        println!(
+            "[INFO] 私聊语义决定已过期，丢弃旧批次 (用户: {}, 消息: {:?})",
+            user_id, source_message_ids
+        );
+        return;
+    };
     let Some(reply_ticket) = claim_or_queue_private_reply(
         reply_scope,
-        reply_ticket,
+        admission,
         user_id,
         nick_name.clone(),
         model_message.clone(),
@@ -621,7 +647,7 @@ pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<Runtime
 #[allow(clippy::too_many_arguments)]
 async fn claim_or_queue_private_reply(
     scope: ReplyScope,
-    ticket: Option<crate::model::ReplyTicket>,
+    admission: IncomingAdmission,
     user_id: i64,
     nickname: String,
     message: String,
@@ -638,7 +664,11 @@ async fn claim_or_queue_private_reply(
         .await
         .get(&user_id)
         .is_some_and(|queue| !queue.is_empty());
-    if should_defer_active_private_message(active || has_queued, ticket.is_some()) {
+    if should_queue_after_executive(
+        active || has_queued,
+        admission.decision,
+        admission.preserved_prepared,
+    ) {
         println!(
             "[INFO] 私聊已有回复或排队消息进行中，排队新消息 (用户: {})",
             user_id
@@ -655,25 +685,27 @@ async fn claim_or_queue_private_reply(
         .await;
         return None;
     }
-    let ticket = match ticket {
-        Some(ticket) => ticket,
-        None => ConversationCoordinator::interrupt_locked(scope).await,
-    };
+    let ticket = admission.ticket;
     ConversationCoordinator::begin_reply_locked(scope, ticket, message_ids)
         .await
         .then_some(ticket)
 }
 
-async fn stop_private_reply(user_id: i64) {
+async fn stop_private_reply(user_id: i64, ingress: ReplyTicket) {
     let scope = ReplyScope::Private(user_id);
     let scope_lock = scope_mutex(scope);
     let _scope_guard = scope_lock.lock().await;
-    ConversationCoordinator::interrupt_locked(scope).await;
+    if ConversationCoordinator::cancel_current_incoming_locked(ingress)
+        .await
+        .is_none()
+    {
+        return;
+    }
     PRIVATE_MESSAGE_BATCHES.cancel(user_id).await;
     PENDING_PRIVATE_MESSAGES.lock().await.remove(&user_id);
 }
 
-async fn delete_private_user_data(user_id: i64, bot: &RuntimeBot) {
+async fn delete_private_user_data(user_id: i64, self_id: i64, bot: &RuntimeBot) {
     let scope = ReplyScope::Private(user_id);
     {
         let scope_lock = scope_mutex(scope);
@@ -683,50 +715,136 @@ async fn delete_private_user_data(user_id: i64, bot: &RuntimeBot) {
         PENDING_PRIVATE_MESSAGES.lock().await.remove(&user_id);
         clear_reply_scope_locked(scope).await;
     }
-    clear_private_runtime_data(user_id).await;
-    forget_private_user_images(user_id).await;
-    clear_reply_targets(scope).await;
-    clear_user_pending_image_requests(user_id).await;
 
-    let memory_result = MEMORY_MANAGER.delete_user_data(user_id).await;
-    let sticker_result = sticker_memory::delete_user_data(user_id).await;
-    let reminder_result = reminders::delete_user_data(user_id).await;
-    let agent_goal_result = crate::agent_runtime::delete_user_data(user_id).await;
-    let agent_run_result = crate::agent_runs::delete_user_data(user_id).await;
-    match (
-        memory_result,
-        sticker_result,
-        reminder_result,
-        agent_goal_result,
-        agent_run_result,
-    ) {
-        (
-            Ok(memory_rows),
-            Ok(sticker_rows),
-            Ok(reminder_rows),
-            Ok(agent_goal_rows),
-            Ok(agent_run_rows),
-        ) => {
-            send_tracked_private_message(
-                bot,
-                user_id,
-                format!(
-                    "你的可归属数据已删除（记忆/档案/摘要 {memory_rows} 项，表情记忆 {sticker_rows} 项，提醒 {reminder_rows} 项，角色目标 {agent_goal_rows} 项，Agent Run {agent_run_rows} 项）。"
-                ),
-            )
-            .await;
-        }
-        (memory, stickers, reminders, agent_goals, agent_runs) => {
+    // `begin_qq_user_data_erasure` synchronously closes the ingress gate on
+    // its first poll. Keep it immediately after releasing the reply-scope lock
+    // so an old model turn is cancelled before the Core FIFO barrier waits for
+    // it, without holding that same lock across the barrier acknowledgement.
+    let erasure = match crate::yunxi::begin_qq_user_data_erasure(user_id).await {
+        Ok(erasure) => erasure,
+        Err(error) => {
             eprintln!(
-                "[ERROR] 用户数据删除未完全成功 (用户: {}, 记忆: {:?}, 表情: {:?}, 提醒: {:?}, 角色目标: {:?}, Agent Run: {:?})",
-                user_id, memory, stickers, reminders, agent_goals, agent_runs
+                "[ERROR] 启动 Yunxi 数据删除屏障失败 (用户: {}): {error}",
+                user_id
             );
             send_tracked_private_message(
                 bot,
                 user_id,
-                "数据删除没有全部完成，已停止继续处理；请稍后重试或联系管理员检查日志。",
+                "数据删除安全屏障启动失败，未开始删除；请稍后重试。",
             )
             .await;
+            return;
+        }
+    };
+    let qq_user_ids = erasure.qq_user_ids().to_vec();
+    for alias_user_id in &qq_user_ids {
+        clear_private_erasure_runtime_state(*alias_user_id).await;
+    }
+
+    let mut memory_rows = 0_u64;
+    let mut sticker_rows = 0_u64;
+    let mut reminder_rows = 0_u64;
+    let mut agent_goal_rows = 0_u64;
+    let mut agent_run_rows = 0_u64;
+    let mut failures = Vec::new();
+    for alias_user_id in &qq_user_ids {
+        let (memory, stickers, reminders, agent_goals, agent_runs) = kovi::tokio::join!(
+            MEMORY_MANAGER.delete_user_data(*alias_user_id),
+            sticker_memory::delete_user_data(*alias_user_id),
+            reminders::delete_user_data(*alias_user_id),
+            crate::agent_runtime::delete_user_data(*alias_user_id),
+            crate::agent_runs::delete_user_data(*alias_user_id),
+        );
+        match memory {
+            Ok(rows) => memory_rows = memory_rows.saturating_add(rows),
+            Err(error) => failures.push(format!("memory[{alias_user_id}]: {error}")),
+        }
+        match stickers {
+            Ok(rows) => sticker_rows = sticker_rows.saturating_add(rows),
+            Err(error) => failures.push(format!("stickers[{alias_user_id}]: {error}")),
+        }
+        match reminders {
+            Ok(rows) => reminder_rows = reminder_rows.saturating_add(rows),
+            Err(error) => failures.push(format!("reminders[{alias_user_id}]: {error}")),
+        }
+        match agent_goals {
+            Ok(rows) => agent_goal_rows = agent_goal_rows.saturating_add(rows),
+            Err(error) => failures.push(format!("agent-goals[{alias_user_id}]: {error}")),
+        }
+        match agent_runs {
+            Ok(rows) => agent_run_rows = agent_run_rows.saturating_add(rows),
+            Err(error) => failures.push(format!("agent-runs[{alias_user_id}]: {error}")),
+        }
+    }
+    let yunxi_rows = match crate::yunxi::delete_qq_person_domain_data(self_id, user_id).await {
+        Ok(rows) => rows,
+        Err(error) => {
+            failures.push(format!("yunxi-core: {error}"));
+            0
+        }
+    };
+    if let Err(error) = erasure.finish().await {
+        failures.push(format!("core-barrier-resume: {error}"));
+    }
+
+    if failures.is_empty() {
+        send_erasure_receipt(
+            bot,
+            user_id,
+            format!(
+                "你的可归属数据已删除（QQ 身份 {} 个，记忆/档案/摘要 {memory_rows} 项，表情记忆 {sticker_rows} 项，提醒 {reminder_rows} 项，角色目标 {agent_goal_rows} 项，Agent Run {agent_run_rows} 项，Yunxi Core {yunxi_rows} 项）。",
+                qq_user_ids.len()
+            ),
+        )
+        .await;
+    } else {
+        eprintln!(
+            "[ERROR] 用户数据删除未完全成功 (发起用户: {}, 失败: {})",
+            user_id,
+            failures.join("; ")
+        );
+        send_erasure_receipt(
+            bot,
+            user_id,
+            "数据删除没有全部完成；已尝试其余可归属数据，请稍后重试或联系管理员检查日志。",
+        )
+        .await;
+    }
+}
+
+async fn clear_private_erasure_runtime_state(user_id: i64) {
+    let scope = ReplyScope::Private(user_id);
+    {
+        let scope_lock = scope_mutex(scope);
+        let _scope_guard = scope_lock.lock().await;
+        ConversationCoordinator::interrupt_locked(scope).await;
+        PRIVATE_MESSAGE_BATCHES.cancel(user_id).await;
+        PENDING_PRIVATE_MESSAGES.lock().await.remove(&user_id);
+        clear_reply_scope_locked(scope).await;
+        clear_reply_state_locked(scope).await;
+    }
+    clear_private_runtime_data(user_id).await;
+    forget_private_user_images(user_id).await;
+    clear_reply_targets(scope).await;
+    clear_user_pending_image_requests(user_id).await;
+    clear_private_traffic(user_id).await;
+}
+
+async fn send_erasure_receipt(bot: &RuntimeBot, user_id: i64, content: impl Into<String>) -> bool {
+    match crate::model::send_tracked_unrecorded_plain_text(
+        bot,
+        crate::model::MessageDestination::Private(user_id),
+        content.into(),
+    )
+    .await
+    {
+        Ok(_) => true,
+        Err(error) => {
+            eprintln!(
+                "[ERROR] 私聊数据删除回执发送失败 (用户: {}): {}",
+                user_id, error
+            );
+            false
         }
     }
 }
@@ -921,8 +1039,23 @@ fn parse_task_id(value: &str) -> Option<i64> {
     (task_id > 0).then_some(task_id)
 }
 
-fn should_defer_active_private_message(active_reply: bool, has_explicit_interrupt: bool) -> bool {
-    active_reply && !has_explicit_interrupt
+fn should_queue_after_executive(
+    active_or_queued: bool,
+    decision: OutgoingExecutiveDecision,
+    preserved_prepared: bool,
+) -> bool {
+    preserved_prepared || (active_or_queued && decision == OutgoingExecutiveDecision::Keep)
+}
+
+async fn admit_understood_private_turn(
+    initial: IncomingAdmission,
+    understanding: &MessageUnderstanding,
+) -> Option<IncomingAdmission> {
+    ConversationCoordinator::refine_current_incoming(
+        initial,
+        ConversationCoordinator::context_for_understood_turn(understanding, true),
+    )
+    .await
 }
 
 async fn queue_pending_private_message(
@@ -999,14 +1132,28 @@ async fn take_pending_private_turn(
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentTaskCommand, PENDING_PRIVATE_MESSAGES, looks_like_immediate_stop_request,
-        normalized_private_sender_name, parse_agent_task_command, queue_pending_private_message,
-        select_recent_images, take_pending_private_turn, with_recent_image_context,
+        AgentTaskCommand, PENDING_PRIVATE_MESSAGES, admit_understood_private_turn,
+        looks_like_immediate_stop_request, normalized_private_sender_name,
+        parse_agent_task_command, queue_pending_private_message, select_recent_images,
+        should_queue_after_executive, take_pending_private_turn, with_recent_image_context,
+    };
+    use crate::model::conversation_coordinator::{
+        ConversationCoordinator, OutgoingExecutiveDecision,
     };
     use crate::model::interrupt::{
-        ReplyScope, interrupt, interrupt_locked, is_current, scope_mutex,
+        OutgoingSource, OutgoingState, ReplyScope, interrupt, interrupt_locked, is_current,
+        mark_active, outgoing_fingerprint, prepare_outgoing, scope_mutex, test_outgoing_state,
     };
     use crate::model::semantic::{ImageReferenceIntent, MessageUnderstanding};
+
+    #[test]
+    fn preserved_prepared_reply_queues_the_new_private_turn() {
+        assert!(should_queue_after_executive(
+            false,
+            OutgoingExecutiveDecision::Keep,
+            true,
+        ));
+    }
     use crate::private_image_memory::{recent_private_images, remember_private_images};
     use crate::vision::{ImageAttachment, VisionImage};
 
@@ -1030,6 +1177,36 @@ mod tests {
         assert!(looks_like_immediate_stop_request("不要回复了。"));
         assert!(looks_like_immediate_stop_request("stop replying"));
         assert!(!looks_like_immediate_stop_request("为什么他说不要回复了？"));
+    }
+
+    #[test]
+    fn production_private_semantic_helper_defers_proactive_conflict() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let scope = ReplyScope::Private(9_350_001);
+                let initial = ConversationCoordinator::begin_incoming(scope).await;
+                assert!(mark_active(initial.ticket).await);
+                let outgoing = prepare_outgoing(
+                    initial.ticket,
+                    outgoing_fingerprint("proactive check-in"),
+                    OutgoingSource::Proactive,
+                )
+                .await
+                .expect("proactive output should prepare during semantic work");
+
+                let refined =
+                    admit_understood_private_turn(initial, &MessageUnderstanding::default())
+                        .await
+                        .expect("ingress should remain current");
+
+                assert_eq!(refined.decision, OutgoingExecutiveDecision::Defer);
+                assert_eq!(
+                    test_outgoing_state(outgoing).await,
+                    Some(OutgoingState::Cancelled)
+                );
+                assert!(!is_current(initial.ticket).await);
+            });
     }
 
     #[test]

@@ -1,8 +1,13 @@
 //! Platform-neutral cognitive intents.
 
-use crate::action::{ActionValidationError, ProposedAction, SendMessageAction};
+use crate::action::{
+    ActionScope, ActionValidationError, CancelGoalAction, CreateOpenLoopAction, ProposedAction,
+    ResolveOpenLoopAction, SendMessageAction, StartGoalAction, ToolAction,
+};
+use crate::goal::{GoalDraft, GoalOwner};
+use crate::open_loop::{OpenLoopDraft, OpenLoopOwner};
 use crate::proactive::{ProactiveValidationError, ReachOutIntent};
-use crate::{ConversationId, MessageContent, MessageId};
+use crate::{ConversationId, GoalId, MessageContent, MessageId, OpenLoopId};
 use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
@@ -18,6 +23,21 @@ pub enum CognitiveIntent {
         reply_to: Option<MessageId>,
     },
     ReachOut(ReachOutIntent),
+    UseTool {
+        tool_name: String,
+        input: String,
+        scope: ActionScope,
+    },
+    CreateOpenLoop(OpenLoopDraft),
+    ResolveOpenLoop {
+        open_loop_id: OpenLoopId,
+        owner: OpenLoopOwner,
+    },
+    StartGoal(GoalDraft),
+    CancelGoal {
+        goal_id: GoalId,
+        owner: GoalOwner,
+    },
     Noop,
 }
 
@@ -36,6 +56,21 @@ impl<'de> Deserialize<'de> for CognitiveIntent {
                 reply_to: Option<MessageId>,
             },
             ReachOut(ReachOutIntent),
+            UseTool {
+                tool_name: String,
+                input: String,
+                scope: ActionScope,
+            },
+            CreateOpenLoop(OpenLoopDraft),
+            ResolveOpenLoop {
+                open_loop_id: OpenLoopId,
+                owner: OpenLoopOwner,
+            },
+            StartGoal(GoalDraft),
+            CancelGoal {
+                goal_id: GoalId,
+                owner: GoalOwner,
+            },
             Noop,
         }
 
@@ -50,6 +85,25 @@ impl<'de> Deserialize<'de> for CognitiveIntent {
                 reply_to,
             },
             Wire::ReachOut(intent) => Self::ReachOut(intent),
+            Wire::UseTool {
+                tool_name,
+                input,
+                scope,
+            } => Self::UseTool {
+                tool_name,
+                input,
+                scope,
+            },
+            Wire::CreateOpenLoop(draft) => Self::CreateOpenLoop(draft),
+            Wire::ResolveOpenLoop {
+                open_loop_id,
+                owner,
+            } => Self::ResolveOpenLoop {
+                open_loop_id,
+                owner,
+            },
+            Wire::StartGoal(draft) => Self::StartGoal(draft),
+            Wire::CancelGoal { goal_id, owner } => Self::CancelGoal { goal_id, owner },
             Wire::Noop => Self::Noop,
         };
         intent.validate().map_err(serde::de::Error::custom)?;
@@ -85,6 +139,42 @@ impl CognitiveIntent {
     }
 
     #[must_use]
+    pub fn use_tool(
+        tool_name: impl Into<String>,
+        input: impl Into<String>,
+        scope: ActionScope,
+    ) -> Self {
+        Self::UseTool {
+            tool_name: tool_name.into(),
+            input: input.into(),
+            scope,
+        }
+    }
+
+    #[must_use]
+    pub fn create_open_loop(draft: OpenLoopDraft) -> Self {
+        Self::CreateOpenLoop(draft)
+    }
+
+    #[must_use]
+    pub const fn resolve_open_loop(open_loop_id: OpenLoopId, owner: OpenLoopOwner) -> Self {
+        Self::ResolveOpenLoop {
+            open_loop_id,
+            owner,
+        }
+    }
+
+    #[must_use]
+    pub fn start_goal(draft: GoalDraft) -> Self {
+        Self::StartGoal(draft)
+    }
+
+    #[must_use]
+    pub const fn cancel_goal(goal_id: GoalId, owner: GoalOwner) -> Self {
+        Self::CancelGoal { goal_id, owner }
+    }
+
+    #[must_use]
     pub const fn noop() -> Self {
         Self::Noop
     }
@@ -100,6 +190,28 @@ impl CognitiveIntent {
                 .map(|_| ())
                 .map_err(IntentValidationError::Action),
             Self::ReachOut(intent) => intent.validate().map_err(IntentValidationError::Proactive),
+            Self::UseTool {
+                tool_name,
+                input,
+                scope,
+            } => ToolAction::new(tool_name.clone(), input.clone(), *scope)
+                .map(|_| ())
+                .map_err(IntentValidationError::Action),
+            Self::CreateOpenLoop(draft) => CreateOpenLoopAction::new(draft.clone())
+                .map(|_| ())
+                .map_err(IntentValidationError::Action),
+            Self::ResolveOpenLoop {
+                open_loop_id,
+                owner,
+            } => ResolveOpenLoopAction::new(*open_loop_id, *owner)
+                .map(|_| ())
+                .map_err(IntentValidationError::Action),
+            Self::StartGoal(draft) => StartGoalAction::new(draft.clone())
+                .map(|_| ())
+                .map_err(IntentValidationError::Action),
+            Self::CancelGoal { goal_id, owner } => CancelGoalAction::new(*goal_id, *owner)
+                .map(|_| ())
+                .map_err(IntentValidationError::Action),
             Self::Noop => Ok(()),
         }
     }
@@ -117,7 +229,45 @@ impl CognitiveIntent {
             Self::ReachOut(intent) => crate::ReachOutAction::from_intent(intent.clone())
                 .map(ProposedAction::ReachOut)
                 .map_err(IntentValidationError::Action),
+            Self::UseTool {
+                tool_name,
+                input,
+                scope,
+            } => ToolAction::new(tool_name.clone(), input.clone(), *scope)
+                .map(ProposedAction::UseTool)
+                .map_err(IntentValidationError::Action),
+            Self::CreateOpenLoop(draft) => CreateOpenLoopAction::new(draft.clone())
+                .map(ProposedAction::CreateOpenLoop)
+                .map_err(IntentValidationError::Action),
+            Self::ResolveOpenLoop {
+                open_loop_id,
+                owner,
+            } => ResolveOpenLoopAction::new(*open_loop_id, *owner)
+                .map(ProposedAction::ResolveOpenLoop)
+                .map_err(IntentValidationError::Action),
+            Self::StartGoal(draft) => StartGoalAction::new(draft.clone())
+                .map(ProposedAction::StartGoal)
+                .map_err(IntentValidationError::Action),
+            Self::CancelGoal { goal_id, owner } => CancelGoalAction::new(*goal_id, *owner)
+                .map(ProposedAction::CancelGoal)
+                .map_err(IntentValidationError::Action),
             Self::Noop => Ok(ProposedAction::Noop),
+        }
+    }
+
+    #[must_use]
+    pub const fn action_scope(&self) -> ActionScope {
+        match self {
+            Self::SendMessage {
+                conversation_id, ..
+            } => ActionScope::Conversation(*conversation_id),
+            Self::ReachOut(intent) => ActionScope::Person(intent.person_id()),
+            Self::UseTool { scope, .. } => *scope,
+            Self::CreateOpenLoop(draft) => ActionScope::for_open_loop_owner(draft.owner()),
+            Self::ResolveOpenLoop { owner, .. } => ActionScope::for_open_loop_owner(*owner),
+            Self::StartGoal(draft) => ActionScope::for_goal_owner(draft.owner()),
+            Self::CancelGoal { owner, .. } => ActionScope::for_goal_owner(*owner),
+            Self::Noop => ActionScope::Global,
         }
     }
 }
@@ -141,7 +291,7 @@ pub enum IntentValidationError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{PersonId, ProactiveMotive, ProactiveOpportunity};
+    use crate::{GoalKind, OpenLoopKind, PersonId, ProactiveMotive, ProactiveOpportunity};
 
     #[test]
     fn intent_conversion_keeps_platform_neutral_targets() {
@@ -183,5 +333,40 @@ mod tests {
         let mut encoded = serde_json::to_value(intent).expect("serialize intent");
         encoded["payload"]["content"]["text"] = serde_json::json!(" ");
         assert!(serde_json::from_value::<CognitiveIntent>(encoded).is_err());
+    }
+
+    #[test]
+    fn new_intents_validate_and_convert_without_losing_scope() {
+        let person_id = PersonId::new();
+        let conversation_id = ConversationId::new();
+        let intents = vec![
+            CognitiveIntent::use_tool("calendar.read", "{}", ActionScope::Person(person_id)),
+            CognitiveIntent::create_open_loop(
+                OpenLoopDraft::new(
+                    OpenLoopOwner::Conversation(conversation_id),
+                    OpenLoopKind::FollowUp,
+                    "continue later",
+                )
+                .expect("open loop"),
+            ),
+            CognitiveIntent::resolve_open_loop(
+                OpenLoopId::new(),
+                OpenLoopOwner::Conversation(conversation_id),
+            ),
+            CognitiveIntent::start_goal(
+                GoalDraft::new(GoalOwner::Person(person_id), GoalKind::Personal, "practice")
+                    .expect("goal"),
+            ),
+            CognitiveIntent::cancel_goal(GoalId::new(), GoalOwner::Person(person_id)),
+        ];
+
+        for intent in intents {
+            let scope = intent.action_scope();
+            let encoded = serde_json::to_string(&intent).expect("serialize intent");
+            let decoded = serde_json::from_str::<CognitiveIntent>(&encoded)
+                .expect("deserialize validated intent");
+            assert_eq!(decoded.action_scope(), scope);
+            assert_eq!(decoded.propose_action().expect("propose").scope(), scope);
+        }
     }
 }

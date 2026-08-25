@@ -6,6 +6,7 @@
 use super::utils::{BotMemory, Roles, params_model_with_token_limit};
 use serde::Deserialize;
 use serde_json::json;
+use yunxi_core::InteractionCues;
 
 const MAX_SEMANTIC_OUTPUT_TOKENS: u32 = 420;
 const MAX_CONTEXT_CHARS: usize = 6_000;
@@ -105,6 +106,40 @@ impl Default for MessageUnderstanding {
 }
 
 impl MessageUnderstanding {
+    /// Normalize the existing semantic pass into the platform-neutral Core
+    /// cue vocabulary. This is a pure conversion and never triggers another
+    /// model call.
+    pub(crate) fn interaction_cues(&self) -> InteractionCues {
+        let (base_valence, base_arousal, recognized) = match self.mood.as_str() {
+            "happy" => (0.75, 0.45, true),
+            "excited" => (0.8, 0.9, true),
+            "playful" => (0.6, 0.55, true),
+            "confident" => (0.45, 0.35, true),
+            "calm" => (0.2, -0.45, true),
+            "thoughtful" => (0.05, -0.15, true),
+            "curious" => (0.25, 0.3, true),
+            "neutral" => (0.0, 0.0, true),
+            "sad" => (-0.7, -0.4, true),
+            "lonely" => (-0.65, -0.45, true),
+            "shy" => (-0.2, 0.1, true),
+            "angry" => (-0.85, 0.8, true),
+            _ => (0.0, 0.0, false),
+        };
+        let confidence = if recognized && self.mood_confidence >= 35 {
+            f32::from(self.mood_confidence.min(100)) / 100.0
+        } else {
+            0.0
+        };
+        let intensity = f32::from(self.mood_intensity.clamp(1, 10)) / 10.0;
+        let intensity_weight = 0.4 + 0.6 * intensity;
+        InteractionCues {
+            sentiment_valence: base_valence * intensity_weight,
+            sentiment_arousal: base_arousal * intensity_weight,
+            sentiment_confidence: confidence,
+            gratitude_strength: if self.gratitude { 0.75 } else { 0.0 },
+        }
+    }
+
     pub(crate) fn should_understand_image(&self, request: &UnderstandingRequest) -> bool {
         request.explicit_vision_command
             || request.pending_image_request
@@ -454,5 +489,31 @@ mod tests {
         let result = parse_understanding("不是 JSON", &request);
         assert_eq!(result.mood, MessageUnderstanding::default().mood);
         assert_eq!(result.image_intent, SemanticImageIntent::Social);
+    }
+
+    #[test]
+    fn existing_understanding_normalizes_to_bounded_core_cues() {
+        let understanding = MessageUnderstanding {
+            mood: "happy".to_string(),
+            mood_intensity: 8,
+            mood_confidence: 90,
+            gratitude: true,
+            ..MessageUnderstanding::default()
+        };
+        let cues = understanding.interaction_cues();
+
+        cues.validate().expect("normalized cues are bounded");
+        assert!(cues.sentiment_valence > 0.0);
+        assert!(cues.sentiment_arousal > 0.0);
+        assert_eq!(cues.sentiment_confidence, 0.9);
+        assert_eq!(cues.gratitude_strength, 0.75);
+
+        let uncertain = MessageUnderstanding {
+            mood: "angry".to_string(),
+            mood_confidence: 20,
+            ..MessageUnderstanding::default()
+        }
+        .interaction_cues();
+        assert_eq!(uncertain.sentiment_confidence, 0.0);
     }
 }

@@ -9,7 +9,7 @@ use anyhow::{Context, Result, anyhow};
 use kovi::PluginBuilder;
 use kovi::RuntimeBot;
 use kovi::bot::runtimebot::kovi_api::{SetAccessControlList, SetAdmin};
-use kovi::tokio::sync::Mutex;
+use kovi::tokio::sync::{Mutex, MutexGuard};
 use sqlx_core::query::query;
 use sqlx_core::row::Row;
 use sqlx_postgres::PgPool;
@@ -28,6 +28,15 @@ struct GroupAccessState {
     groups: BTreeSet<i64>,
     admins: BTreeSet<i64>,
     main_admin: i64,
+}
+
+/// Pins the runtime authorization snapshot through the outgoing commit point.
+/// Allowlist mutations use the same mutex, so revocation and commit have a
+/// deterministic order without holding the conversation lock across SQL or
+/// platform calls.
+#[must_use]
+pub(crate) struct GroupSendAuthorization {
+    _state: MutexGuard<'static, Option<GroupAccessState>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,7 +59,18 @@ pub async fn initialize(bot: &RuntimeBot) -> Result<()> {
     let plugin_name = PluginBuilder::get_plugin_name();
     let configured_groups = configured_groups(bot, &plugin_name);
     let mut friends = configured_friends(bot, &plugin_name);
-    let main_admin = bot.get_main_admin().context("读取 Kovi 主管理员")?;
+    // Use the canonical PersonId owner route whenever configured. The Kovi
+    // host administrator remains a compatibility source only for deployments
+    // that have not migrated `[identity].owner_person_id` yet.
+    let main_admin = match crate::yunxi::canonical_owner_qq_id() {
+        Some(Some(owner)) => owner,
+        Some(None) => {
+            return Err(anyhow!(
+                "[identity].owner_person_id 未绑定唯一 QQ，拒绝初始化管理员入口"
+            ));
+        }
+        None => bot.get_main_admin().context("读取 Kovi 主管理员")?,
+    };
     friends.insert(main_admin);
     let configured_admins = bot
         .get_deputy_admins()
@@ -120,6 +140,17 @@ pub(crate) async fn is_authorized_group(group_id: i64) -> Result<bool> {
         .as_ref()
         .ok_or_else(|| anyhow!("群聊白名单尚未初始化"))?;
     Ok(state.groups.contains(&group_id))
+}
+
+pub(crate) async fn authorize_group_send(group_id: i64) -> Result<GroupSendAuthorization> {
+    let state = STATE.lock().await;
+    let initialized = state
+        .as_ref()
+        .ok_or_else(|| anyhow!("群聊白名单尚未初始化"))?;
+    if !initialized.groups.contains(&group_id) {
+        return Err(anyhow!("群聊不在授权白名单中"));
+    }
+    Ok(GroupSendAuthorization { _state: state })
 }
 
 pub(crate) async fn authorized_groups() -> Result<Vec<i64>> {
@@ -401,6 +432,9 @@ fn command_requires_main_admin(command: AuthorizationCommand) -> bool {
 }
 
 async fn is_main_admin(user_id: i64) -> Result<bool> {
+    if let Some(is_owner) = crate::yunxi::canonical_owner_matches_authoritative(user_id).await {
+        return Ok(is_owner);
+    }
     let state = STATE.lock().await;
     let state = state
         .as_ref()
@@ -640,9 +674,13 @@ fn apply_admins(
 #[cfg(test)]
 mod tests {
     use super::{
-        AuthorizationCommand, command_requires_main_admin, is_authorization_command,
-        normalize_admins, normalize_groups, parse_command,
+        AuthorizationCommand, GroupAccessState, STATE, authorize_group_send,
+        command_requires_main_admin, is_authorization_command, normalize_admins, normalize_groups,
+        parse_command,
     };
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     #[test]
     fn parses_allowlist_commands_without_prefix_injection() {
@@ -726,5 +764,58 @@ mod tests {
         assert!(normalize_admins(vec![0], 99).is_err());
         assert!(normalize_admins(vec![-1], 99).is_err());
         assert!(normalize_admins(vec![99], 99).is_err());
+    }
+
+    #[test]
+    fn group_send_authorization_pins_the_snapshot_until_commit() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let group_id = 9_120_001;
+                let groups = BTreeSet::from([group_id]);
+                *STATE.lock().await = Some(GroupAccessState {
+                    plugin_name: "test".to_string(),
+                    friends: BTreeSet::new(),
+                    configured_admins: BTreeSet::new(),
+                    groups,
+                    admins: BTreeSet::new(),
+                    main_admin: 9_120_002,
+                });
+
+                let authorization = authorize_group_send(group_id)
+                    .await
+                    .expect("发送应取得授权快照");
+                let revoked = Arc::new(AtomicBool::new(false));
+                let revoked_in_task = Arc::clone(&revoked);
+                let revoke = kovi::tokio::spawn(async move {
+                    let mut state = STATE.lock().await;
+                    state
+                        .as_mut()
+                        .expect("测试授权状态应存在")
+                        .groups
+                        .remove(&group_id);
+                    revoked_in_task.store(true, Ordering::Release);
+                });
+                kovi::tokio::task::yield_now().await;
+                assert!(!revoked.load(Ordering::Acquire));
+
+                drop(authorization);
+                revoke.await.expect("撤销任务应完成");
+                assert!(revoked.load(Ordering::Acquire));
+                assert!(
+                    authorize_group_send(group_id).await.is_err(),
+                    "a fresh pre-effect authorization must observe revocation"
+                );
+                assert!(
+                    !STATE
+                        .lock()
+                        .await
+                        .as_ref()
+                        .expect("测试授权状态应存在")
+                        .groups
+                        .contains(&group_id)
+                );
+                *STATE.lock().await = None;
+            });
     }
 }
