@@ -70,7 +70,7 @@ jobs:
           for package in yunxi-core yunxi-cli; do
             forbidden="$({
               cargo tree -p "$package" --edges normal --prefix none --format '{p}' |
-                awk '{ name = tolower($1); if (name ~ /^(kovi|onebot|sqlx|postgres|tokio-postgres|sea-orm|diesel)(-|$)/) print }
+                awk '{ name = tolower($1); if (name ~ /^(kovi|onebot|sqlx|postgres|tokio-postgres|sea-orm|diesel)(-|$)/) print }'
             })"
             if [[ -n "$forbidden" ]]; then
               echo "$package contains forbidden platform or storage dependencies:"
