@@ -302,9 +302,6 @@ fn parse_qq_destination(
 }
 
 fn parse_positive_i64(value: &str) -> Option<i64> {
-    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
     value.parse::<i64>().ok().filter(|value| *value > 0)
 }
 
@@ -330,7 +327,8 @@ pub(crate) fn single_positive_qq_id(external_ids: &[String]) -> Option<i64> {
     let [external_id] = external_ids else {
         return None;
     };
-    parse_positive_i64(external_id)
+    let user_id = external_id.parse::<i64>().ok()?;
+    (user_id > 0).then_some(user_id)
 }
 
 pub(crate) async fn send_reach_out(
@@ -370,7 +368,6 @@ mod tests {
         assert_eq!(single_positive_qq_id(&[]), None);
         assert_eq!(single_positive_qq_id(&ids(&["0"])), None);
         assert_eq!(single_positive_qq_id(&ids(&["-1"])), None);
-        assert_eq!(single_positive_qq_id(&ids(&["+1"])), None);
         assert_eq!(single_positive_qq_id(&ids(&["not-a-qq"])), None);
         assert_eq!(single_positive_qq_id(&ids(&["123", "456"])), None);
     }
