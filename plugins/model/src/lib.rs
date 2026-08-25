@@ -200,9 +200,8 @@ fn core_group_cutover_enabled() -> bool {
     )
 }
 
-/// Keep host-specific private features on the mature path even though Core is
-/// now the default owner. Core accepts only non-command text and cannot yet
-/// preserve image/sticker semantics.
+/// When the private Core cutover is enabled, every supported text turn belongs
+/// to Core. Only commands, empty input, and non-text payloads stay on legacy.
 fn core_private_canary_payload_is_safe(
     message: &kovi::Message,
     text: Option<&str>,
@@ -211,52 +210,8 @@ fn core_private_canary_payload_is_safe(
     message.iter().all(|segment| segment.type_ == "text")
         && text.is_some_and(|text| {
             let text = text.trim();
-            !text.is_empty() && !text.starts_with('#') && !private_text_requires_legacy(text)
+            !text.is_empty() && !text.starts_with('#')
         })
-}
-
-/// Requests still implemented only by host-specific handlers stay on legacy.
-/// Administrator identity alone is not a routing condition: ordinary owner
-/// conversation is Core-owned, while structured commands and task requests
-/// remain available through their mature adapters.
-fn private_text_requires_legacy(text: &str) -> bool {
-    if crate::reminders::looks_like_reminder_request(text)
-        || crate::agent_runs::looks_like_agent_run_request(text)
-    {
-        return true;
-    }
-
-    // The creation detectors intentionally reject cancellation/status phrases,
-    // because those must not force a create call. They still require the
-    // legacy tool-capable path, though, so keep a conservative routing guard.
-    if text.contains("提醒") || text.contains("定时") {
-        return true;
-    }
-
-    let lower = text.to_ascii_lowercase();
-    if lower.contains("agent run") || lower.contains("agent-run") {
-        return true;
-    }
-    let agent_run_control = [
-        "查看",
-        "列出",
-        "列表",
-        "有哪些",
-        "状态",
-        "进度",
-        "取消",
-        "删除",
-        "停止",
-        "不用",
-        "不要",
-        "别",
-    ]
-    .iter()
-    .any(|marker| text.contains(marker));
-    let agent_run_target = ["监控", "监测", "轮询", "盯着", "盯一下"]
-        .iter()
-        .any(|marker| text.contains(marker));
-    agent_run_control && agent_run_target
 }
 
 /// Select a single owner at the Kovi ingress boundary.
@@ -869,7 +824,7 @@ mod tests {
     }
 
     #[test]
-    fn private_host_features_stay_on_legacy_but_owner_chat_cuts_over() {
+    fn supported_private_text_stays_on_core_when_cutover_is_enabled() {
         for text in [
             "明天早上提醒我吃饭",
             "取消定时任务 3",
@@ -880,7 +835,7 @@ mod tests {
         ] {
             let message = Message::from(text);
             assert!(
-                !core_private_canary_payload_is_safe(&message, Some(text), false),
+                core_private_canary_payload_is_safe(&message, Some(text), false),
                 "{text}"
             );
         }
