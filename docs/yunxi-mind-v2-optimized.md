@@ -1,12 +1,12 @@
 # Yunxi Mind v2：持续心智状态与自主认知扩展开发文档
 
-**文档状态：** 最终整合版  
+**文档状态：** 最终整合版（已对齐当前 V1 实现）  
 
 **文档版本：** 2.0  
 **适用项目：** Yunxi Core / kovi-bot  
 **主要语言：** Rust  
-**前置依赖：** Yunxi Core v1 已基本完成并稳定  
-**文档定位：** 在不推翻 Yunxi Core v1 的前提下，为芸汐增加更持续、更有自我一致性、更少“一问一答感”的心智状态层。
+**前置依赖：** Yunxi Core v1 已全部实现并作为稳定运行基线  
+**文档定位：** 以当前仓库已经实现完成的 Yunxi Core v1 为权威基线，在不重写、不迁移、不破坏既有 V1 公共契约的前提下，为芸汐增加持续心智状态、自我一致性、内部议程与低频反思能力。
 
 ---
 
@@ -62,55 +62,160 @@ v2 的目标不是让模型假装具有人类意识，也不是让系统持续�
 
 # 2. 最高级原则
 
-## 2.1 不推翻 Yunxi Core v1
 
-v2 必须建立在已经存在的：
+## 2.1 不推翻、也不“整理式重写” Yunxi Core v1
 
-- WorldEvent
-- Attention
-- WorkingState
-- Memory
-- OpenLoop
-- Affect
-- Relation
-- Goal
-- Planner
-- Intent
-- Action
-- ActionResult
-- PersonId
-- ConversationId
-- MessageId
-- Platform Adapter
+V2 必须建立在当前仓库已经实现的 V1 公共契约之上。
 
-之上。
-
-不得为了实现 v2：
-
-- 重写 Event Bus；
-- 重写 Identity；
-- 重写 Kovi Adapter；
-- 重写 ReplyTicket；
-- 重写 ConversationCoordinator；
-- 重写 MemoryManager；
-- 重写 agent_tasks；
-- 重写 Reminder；
-- 重写 Tool Runtime；
-- 删除 v1 数据结构。
-
-v2 是：
+当前 `crates/yunxi-core` 已经实际拥有并导出的关键 V1 类型包括：
 
 ```text
-新增心智层
+WorldEvent
+AttentionDisposition / AttentionResult
+WorkingState / ConversationSnapshot
+Memory / MemoryScope / MemoryKind
+OpenLoop
+Goal
+Planner / PlannerInput / PlannerStateSnapshot
+DecisionDisposition / DecisionPlan
+CognitiveIntent
+ProposedAction
+ActionArbiter / ActionDescriptor / ActionResult
+AffectState / RelationState
+PersonId / ConversationId / MessageId
+TraceContext
+CoreServices
+```
+
+这些已经不是“文档里的建议”，而是当前 V1 的真实实现基线。
+
+因此 V2 不得为了所谓“架构更干净”而：
+
+- 重写 Event Bus；
+- 改 V1 ID 类型；
+- 重命名 `ActionResult`；
+- 新造一套 `EventMeta` 取代现有 `TraceContext`；
+- 重写 `Planner` / `ModelBackend`；
+- 重写 `ActionArbiter`；
+- 重写 `WorkingState`；
+- 重写 `MemoryStore` / `OpenLoopStore` / `GoalStore`；
+- 重写 Kovi / Host Adapter；
+- 删除或迁移 V1 已稳定运行的数据结构。
+
+V2 的策略是：
+
+```text
+Freeze V1 semantics
++
+Add Mind domain
++
+Add bounded MindSnapshot
++
+Additive Planner integration
++
+Shadow first
++
+Gradual behavior activation
 ```
 
 而不是：
 
 ```text
-重新做一套 Core
+为了实现 V2
+→ 先把 V1 重构一遍
 ```
 
----
+## 2.2 当前代码优先于旧文档假设
+
+如果本 V2 文档中的旧示例与当前 `main` 分支实际实现发生冲突：
+
+```text
+当前稳定 V1 代码
+>
+V1 旧设计稿示例
+>
+V2 早期伪代码
+```
+
+也就是说，V2 设计必须向已经验证可运行的 V1 契约对齐。
+
+只有当 V2 本身确实需要一个新的能力时，才做：
+
+```text
+small additive change
+```
+
+并补兼容测试。
+
+## 2.3 V2 的 canonical ownership
+
+V2 **只拥有 Mind 新增概念**：
+
+```text
+SelfModel
+ValueProfile
+Belief
+Preference
+Interest
+CuriosityItem
+OpenQuestion
+InnerAgenda
+AgendaItem
+Episode
+MindSnapshot
+ReflectionProposal
+Consolidation
+```
+
+V2 **引用但不重新定义**：
+
+```text
+WorldEvent                 → V1
+PlannerInput               → V1
+PlannerStateSnapshot       → V1
+DecisionDisposition        → V1
+AffectState                → V1
+RelationState              → V1
+ActionDescriptor           → V1
+ActionResult               → V1
+TraceContext               → V1
+MemoryScope                → V1
+PersonId / ConversationId  → V1
+Goal / OpenLoop            → V1
+```
+
+原则：
+
+> **One existing V1 concept → one existing V1 owner. V2 不创建“差不多一样”的替代类型。**
+
+## 2.4 V2 与未来 V3～V10 的边界
+
+V2 只负责：
+
+```text
+她是谁
+她相信什么
+她喜欢什么
+她对什么感兴趣
+她想知道什么
+她当前在意什么
+她如何低频整理经历
+```
+
+V2 不提前实现：
+
+```text
+V3 Executive arbitration
+V4 World Model prediction
+V5 Model routing
+V6 Runtime task supervisor
+V7 perception loop
+V8 affordance protocol
+V9 autonomy governance
+V10 training pipeline
+```
+
+可以预留接口，但不能把后续版本职责提前塞进 Mind。
 
 # 3. 核心设计目标
 
@@ -162,45 +267,86 @@ InnerAgenda
 
 # 4. 新增模块建议
 
-建议在：
+
+当前仓库 V1 已经将 `Planner`、`ModelBackend`、`AffectState`、`RelationState`、`CoreServices` 等稳定边界放在：
+
+```text
+crates/yunxi-core
+```
+
+因此 **V2 第一阶段不要求先拆 `yunxi-mind` 独立 crate，也不要求先创建 `yunxi-protocol`**。
+
+推荐采用最低风险方案：
 
 ```text
 crates/yunxi-core/src/
+├── mind/
+│   ├── mod.rs
+│   ├── self_model.rs
+│   ├── belief.rs
+│   ├── preference.rs
+│   ├── interest.rs
+│   ├── curiosity.rs
+│   ├── open_question.rs
+│   ├── agenda.rs
+│   ├── reflection.rs
+│   ├── consolidation.rs
+│   ├── episode.rs
+│   ├── snapshot.rs
+│   └── ports.rs
 ```
 
-新增：
+并在：
 
 ```text
-mind/
-├── mod.rs
-├── self_model.rs
-├── belief.rs
-├── preference.rs
-├── interest.rs
-├── curiosity.rs
-├── open_question.rs
-├── agenda.rs
-├── reflection.rs
-├── consolidation.rs
-└── snapshot.rs
+crates/yunxi-core/src/lib.rs
 ```
 
-也可以按当前仓库风格拆分。
+只做：
 
-关键要求：
+```rust
+pub mod mind;
+```
 
-> 所有新模块仍然必须保持平台无关。
+以及必要的 `pub use`。
+
+这样做的理由：
+
+```text
+V1 已经稳定
+↓
+V2 只做 additive module
+↓
+不制造 crate dependency cycle
+↓
+不要求先迁移 V1 类型
+↓
+可以逐 Phase 开启
+```
+
+未来当 V2/V3 边界真正稳定后，如果项目需要再拆：
+
+```text
+yunxi-mind
+```
+
+可以单独做架构迁移；**它不是 V2 的前置工作**。
+
+所有 Mind 新模块必须继续保持平台无关。
 
 禁止引入：
 
 - QQ ID；
 - Kovi 类型；
 - OneBot 类型；
-- PgPool；
-- RuntimeBot；
-- 具体模型 HTTP client。
+- NapCat 类型；
+- `PgPool`；
+- `RuntimeBot`；
+- 具体模型 HTTP Client；
+- Redis Connection；
+- GUI / Tauri 类型。
 
----
+基础设施只能通过 Port / Store Trait 接入。
 
 # 5. SelfModel
 
@@ -220,13 +366,14 @@ SelfModel 应成为长期、结构化、可版本化状态。
 
 # 6. SelfModel 数据结构
 
+
 建议：
 
 ```rust
 pub struct SelfModel {
     pub identity: SelfIdentity,
     pub traits: Vec<SelfTrait>,
-    pub capabilities: CapabilitySummary,
+    pub values: ValueProfile,
     pub limitations: Vec<SelfLimitation>,
     pub long_term_goals: Vec<GoalId>,
     pub updated_at: DateTime<Utc>,
@@ -234,7 +381,31 @@ pub struct SelfModel {
 }
 ```
 
----
+与旧稿相比，**不再把实时 `CapabilitySummary` 持久化进 SelfModel**。
+
+原因：
+
+当前 V1 已经通过：
+
+```text
+PlannerInput.capabilities: Vec<ActionDescriptor>
+```
+
+传入当前环境实际允许的动作能力。
+
+因此：
+
+```text
+SelfModel
+= “我如何理解自己”
+
+ActionDescriptor / Environment capability
+= “这个 Host 此刻实际能让我做什么”
+```
+
+两者不能重复成为两个真相源。
+
+SelfModel 可以记录稳定的“能力认知/限制描述”，但运行时是否真的支持某 Action，始终以 V1 当前 capability / arbiter 边界为准。
 
 # 7. SelfIdentity
 
@@ -1088,30 +1259,84 @@ stability
 
 # 43. PlannerInput v2
 
-在 v1 PlannerInput 上扩展：
+
+当前 V1 的真实结构已经是：
 
 ```rust
 pub struct PlannerInput {
     pub event: WorldEvent,
-    pub working_state: WorkingStateSnapshot,
+    pub state: PlannerStateSnapshot,
     pub memories: Vec<Memory>,
     pub open_loops: Vec<OpenLoop>,
     pub goals: Vec<Goal>,
-    pub affect: AffectState,
     pub relation: Option<RelationState>,
-
-    pub self_model: SelfModelSnapshot,
-    pub beliefs: Vec<Belief>,
-    pub preferences: Vec<Preference>,
-    pub interests: Vec<Interest>,
-    pub open_questions: Vec<OpenQuestion>,
-    pub agenda: InnerAgendaSnapshot,
-
+    pub affect: AffectState,
     pub capabilities: Vec<ActionDescriptor>,
 }
 ```
 
----
+V2 不重写它。
+
+V2 只做一个**明确、最小的 additive 扩展**：
+
+```rust
+pub struct PlannerInput {
+    // ---- V1 fields: semantics unchanged ----
+    pub event: WorldEvent,
+    pub state: PlannerStateSnapshot,
+    pub memories: Vec<Memory>,
+    pub open_loops: Vec<OpenLoop>,
+    pub goals: Vec<Goal>,
+    pub relation: Option<RelationState>,
+    pub affect: AffectState,
+    pub capabilities: Vec<ActionDescriptor>,
+
+    // ---- V2 additive field ----
+    #[serde(default)]
+    pub mind: MindSnapshot,
+}
+```
+
+同时：
+
+```text
+PlannerInput::new(...)
+```
+
+默认填入：
+
+```rust
+MindSnapshot::empty()
+```
+
+这保证：
+
+```text
+没有安装 MindStore 的 Host
+→ 仍然可以得到与 V1 基本一致的行为
+```
+
+迁移要求：
+
+- 不改现有 V1 字段名称；
+- 不把 `state` 重命名成 `working_state`；
+- 不重新定义 `AffectState` / `RelationState`；
+- 不重新定义 `ActionDescriptor`；
+- `MindSnapshot` 必须 bounded；
+- `PlannerInput::validate()` 增加 MindSnapshot 自身边界检查；
+- 直接使用 struct literal 的旧调用点需要补 `mind`，优先逐步迁移到 builder / constructor。
+
+如果希望进一步降低 V1 代码改动，也可以先使用：
+
+```text
+Mind-aware ModelBackend adapter
+```
+
+做 Shadow 验证；但正式进入 V2 Planner 行为后，推荐让 MindSnapshot 成为显式 PlannerInput，而不是让 ModelBackend 暗中查询数据库。
+
+原因：
+
+> **Planner 输入应当是可重放、可测试、可审计的 bounded snapshot。**
 
 # 44. 不允许 Planner 只看 user_message
 
@@ -1129,20 +1354,54 @@ PlannerInput {
 
 # 45. DecisionDisposition v2
 
-建议支持：
+
+当前 V1 已经实际实现：
+
+```rust
+pub enum DecisionDisposition {
+    Reply,
+    Silent,
+    Defer,
+    ReactOnly,
+    AskQuestion,
+    ChangeTopic,
+    ResumeAgenda,
+    SpecialAction,
+}
+```
+
+因此 V2：
 
 ```text
-Reply
+不新增 enum
+不复制 enum
+不改 wire naming
+```
+
+而是让现有这些 disposition 真正受到：
+
+```text
+Belief
+Preference
+Interest
+Curiosity
+OpenQuestion
+InnerAgenda
+```
+
+影响。
+
+特别是：
+
+```text
 Silent
 Defer
-ReactOnly
 AskQuestion
 ChangeTopic
 ResumeAgenda
-SpecialAction
 ```
 
----
+从“V1 已有能力”升级为“V2 有长期内部状态依据的选择”。
 
 # 46. MustHandle != MustReply
 
@@ -1497,21 +1756,49 @@ Episode 更接近：
 
 # 62. Episode 与 Memory
 
-Episode 可以存入：
 
-Memory v2
-
-但需要：
+当前 V1 `MemoryKind` 已经稳定包含：
 
 ```text
-MemoryType::Episode
+Conversation
+Profile
+Event
+Preference
+Emotion
+Fact
 ```
 
-或单独 EpisodeStore。
+V2 第一阶段**不要求修改这个 enum 增加 `MemoryKind::Episode`**，避免为了 Mind 引入不必要的序列化 / 数据库兼容面。
 
-根据 v1 实际实现决定。
+优先推荐：
 
----
+```text
+EpisodeStore
+```
+
+单独持久化 Episode。
+
+如果希望复用现有 MemoryStore，也可以将 Episode 的 compact summary 作为：
+
+```text
+MemoryKind::Event
+```
+
+写入，同时使用 tag：
+
+```text
+yunxi:episode
+```
+
+但 canonical Episode 结构仍由 Mind 层持有。
+
+以后是否正式新增 `MemoryKind::Episode`：
+
+```text
+等 Episode 语义与存储模型稳定后再决定
+```
+
+不作为 V2 DoD。
 
 # 63. Consolidation
 
@@ -1676,29 +1963,66 @@ confidence
 
 # 71. Persistence Ports
 
-Core 新增：
+
+V1 已经存在稳定的：
 
 ```text
-SelfModelStore
-BeliefStore
-PreferenceStore
-InterestStore
-OpenQuestionStore
-AgendaStore
-EpisodeStore
+CoreServices
+MemoryStore
+IdentityStore
+ConversationMemberStore
+OpenLoopStore
+RelationStore
+AffectStore
+GoalStore
+ModelBackend
 ```
 
-也可合并成：
+V2 不建议第一天就把所有 Mind Store 字段塞进 `CoreServices`，否则会扩大 V1 构造器和测试替身的改动面。
+
+推荐新增：
+
+```rust
+pub struct MindServices {
+    pub self_model: Arc<dyn SelfModelStore>,
+    pub beliefs: Arc<dyn BeliefStore>,
+    pub preferences: Arc<dyn PreferenceStore>,
+    pub interests: Arc<dyn InterestStore>,
+    pub open_questions: Arc<dyn OpenQuestionStore>,
+    pub agenda: Arc<dyn AgendaStore>,
+    pub episodes: Arc<dyn EpisodeStore>,
+}
+```
+
+以及一个聚合读取边界：
+
+```rust
+pub trait MindSnapshotProvider: Send + Sync {
+    fn snapshot<'a>(
+        &'a self,
+        request: &'a MindSnapshotRequest,
+    ) -> MindSnapshotFuture<'a>;
+}
+```
+
+Planner integration 优先依赖：
 
 ```text
-MindStore
+MindSnapshotProvider
 ```
 
-但不要做一个巨大万能 trait。
+而不是依赖七个 Store。
 
-建议按实际实现平衡。
+好处：
 
----
+```text
+V1 CoreServices 保持稳定
+Mind persistence 可独立替换
+Planner 只看到 bounded Snapshot
+测试容易做 fake
+```
+
+Store 仍然不要做成一个拥有几十个方法的万能数据库 trait。
 
 # 72. PostgreSQL 实现
 
@@ -2718,24 +3042,46 @@ yunxi_mind_agenda_resumed_total
 
 # 124. Trace
 
-Reflection / Agenda / Planner：
 
-沿用 v1 TraceContext。
+V1 已经拥有：
 
-不要另建第二套 trace。
+```text
+TraceContext
+```
 
----
+V2 必须继续沿用它。
+
+不要在 V2 新建：
+
+```text
+EventMeta
+MindTrace
+ReflectionTrace
+```
+
+等第二套跨系统 trace contract。
+
+Reflection / Consolidation / Agenda activation 可以附加：
+
+```text
+ReasonTag / local metadata
+```
+
+但因果链仍通过 V1 `TraceContext` 与现有 `WorldEvent` 体系关联。
+
+等未来 Runtime 层统一 trace contract 时再集中迁移；V2 不把这个迁移作为前置任务。
 
 # 125. Phase 顺序
 
-建议严格：
+
+建议严格按“**不破坏 V1 → Shadow → 小范围生效**”实施：
 
 ```text
 Phase 0
-Mind domain types + ports + no behavior change
+V1 Contract Freeze + Mind Domain Skeleton
 
 Phase 1
-SelfModel + ValueProfile
+SelfModel + ValueProfile + MindServices
 
 Phase 2
 BeliefState
@@ -2750,37 +3096,77 @@ Phase 5
 InnerAgenda
 
 Phase 6
-PlannerInput v2 integration
+MindSnapshot retrieval + PlannerInput additive integration
 
 Phase 7
-Autonomous disagree / uncertainty / change-mind behavior
+Shadow Mind Influence
 
 Phase 8
-Associative retrieval + controlled topic resume
+Opinion / uncertainty / change-mind behavior
 
 Phase 9
-Reflection + Episode
+Associative retrieval + controlled agenda resume
 
 Phase 10
-Consolidation + bounded state update
+Reflection + Episode
 
 Phase 11
-Proactive integration with InnerAgenda
+Consolidation + bounded state update
 
 Phase 12
-Persistence / migration hardening
+Proactive integration with InnerAgenda
 
 Phase 13
-Behavioral evaluation + tuning
+Persistence hardening + restart
+
+Phase 14
+Behavioral evaluation + token/latency tuning
 ```
 
----
+与旧顺序最大的区别：
+
+```text
+先冻结并验证现有 V1
+↓
+再加数据结构
+↓
+再加 Snapshot
+↓
+先 Shadow
+↓
+最后改变用户可见行为
+```
+
+这样即使 V2 中途暂停，V1 仍是完整可运行系统。
 
 # 126. Phase 0：Domain Skeleton
 
-新增类型：
+
+Phase 0 第一件事不是写 Belief，而是锁定 V1 兼容基线。
+
+建立一份测试 / 文档清单，确认以下 V1 类型由现有模块继续拥有：
+
+```text
+WorldEvent
+PlannerInput
+PlannerStateSnapshot
+DecisionDisposition
+DecisionPlan
+AffectState
+RelationState
+ActionDescriptor
+ActionResult
+TraceContext
+MemoryScope
+PersonId
+ConversationId
+MessageId
+```
+
+然后新增 Mind 类型：
 
 - SelfModel
+- ValueProfile
 - Belief
 - Preference
 - Interest
@@ -2789,33 +3175,64 @@ Behavioral evaluation + tuning
 - InnerAgenda
 - AgendaItem
 - Episode
+- MindSnapshot
 
-先不接 Planner。
+这一 Phase：
 
-只：
+```text
+不接 Planner 行为
+不改变 proactive
+不改变 ActionArbiter
+不改 Event Bus
+```
 
+只要求：
+
+```text
 compile
 serialize
+validation
 unit tests
-
----
+```
 
 # 127. Phase 0 验收
 
-要求：
+
+必须保证：
 
 ```text
+cargo fmt --check
+cargo clippy --workspace --all-targets --all-features
+cargo test --workspace
 cargo test -p yunxi-core
 ```
 
-继续无需：
+在新增 Mind domain 后继续通过。
 
-- QQ；
-- PostgreSQL；
-- Kovi；
-- network。
+此外加入 V1 contract regression：
 
----
+```text
+V1 PlannerInput without active Mind behavior
+→ 与原 V1 行为一致
+
+V1 DecisionDisposition wire values
+→ 不变
+
+V1 ActionResult / ActionArbiter behavior
+→ 不变
+
+V1 MemoryScope / IDs serialization
+→ 不变
+```
+
+Phase 0 不要求：
+
+- QQ 在线；
+- PostgreSQL 必须连接；
+- Kovi 必须启动；
+- 网络模型必须可用。
+
+Fake / in-memory tests 应可以完成核心验收。
 
 # 128. Phase 1：SelfModel
 
@@ -2902,15 +3319,50 @@ bounded agenda。
 
 # 133. Phase 6：Planner v2
 
-将 MindSnapshot 加入 PlannerInput。
 
-开始让 Planner 真正考虑：
+将：
 
-- beliefs；
-- preferences；
-- agenda。
+```text
+MindSnapshotProvider
+```
 
----
+接入 Planner 组装路径。
+
+对 V1 `PlannerInput` 做唯一必要的 additive 扩展：
+
+```text
+mind: MindSnapshot
+```
+
+要求：
+
+```text
+MindSnapshot::empty()
+→ V1-compatible behavior
+
+Mind unavailable
+→ fail soft to empty snapshot
+
+Mind retrieval timeout
+→ direct reply must not被后台 Mind 阻塞
+
+Mind snapshot
+→ bounded + versioned
+```
+
+不要让 `ModelBackend` 自己访问 PostgreSQL / MindStore。
+
+最终：
+
+```text
+Runtime / Context assembly
+→ retrieve bounded V1 context
+→ retrieve bounded MindSnapshot
+→ PlannerInput
+→ Planner
+```
+
+这保证 Planner 调用可重放。
 
 # 134. Phase 7：Opinion Behavior
 
@@ -3536,29 +3988,51 @@ mind_planner_enabled
 
 # 170. Shadow Mode
 
-建议每个新增层：
 
-先 Shadow。
+V2 的 Mind Influence 必须先经过 Shadow。
 
-例如：
+Shadow 阶段：
 
 ```text
-Belief Shadow
-Agenda Shadow
-Reflection Shadow
+真实 V1 Decision
++
+V2 would-have-used MindSnapshot
++
+V2 would-have-chosen disposition / relevance bonus
 ```
 
-只 log：
+只记录差异，不改变实际 Action。
+
+重点记录：
 
 ```text
-would_update
-would_resume
 would_disagree
+would_silent
+would_resume_agenda
+would_ask_question
+would_change_topic
+retrieved_beliefs
+retrieved_preferences
+active_agenda
+extra model calls
+extra tokens
+latency delta
 ```
 
-不影响用户行为。
+禁止 Shadow：
 
----
+```text
+发送额外消息
+创建真实 proactive
+修改 V1 Action
+执行 Tool
+```
+
+Mind 本身的确定性低风险状态写入可以在对应 Phase 单独开启；任何会改变用户可见行为的 Planner influence，应先 Shadow。
+
+Shadow 的目标是回答：
+
+> **如果今天打开 V2，它到底会让已经稳定的 V1 行为改变多少？**
 
 # 171. Rollout
 
@@ -3632,154 +4106,158 @@ READ
 
 # 175. v1 兼容测试
 
-每个 Phase 必须继续保证：
 
-- QQ direct reply；
-- group reply；
-- ReplyTicket；
-- Stop；
-- Reminder；
-- AgentTask；
-- Proactive；
-- Tool；
-- OpenLoop；
-- Memory；
-- Identity；
+V2 合并前必须证明当前已完成的 V1 仍然成立。
 
-不回归。
+至少覆盖：
 
----
+```text
+WorldEvent validation / trace
+Attention MustHandle semantics
+WorkingState bounded behavior
+Memory scope isolation
+OpenLoop lifecycle
+Goal lifecycle
+PlannerInput validation
+DecisionDisposition serialization
+ModelBackend boundary
+ActionArbiter authorization / rate limit / idempotency
+AffectState / RelationState validation
+CoreServices fake/unavailable adapters
+Proactive existing cooldown / candidate rules
+```
+
+特别要求：
+
+```text
+Mind disabled
+or
+MindSnapshot::empty()
+```
+
+时：
+
+> **系统必须能够退回 V1 兼容路径，而不是因为 V2 数据缺失就无法工作。**
+
+这条是 V2 最重要的迁移安全网。
 
 # 176. 最终 Architecture
 
+
 ```text
-                        WORLD
-                          │
-                          ▼
-                       ADAPTER
-                          │
-                          ▼
-                     WORLD EVENT
-                          │
-                          ▼
-                      ATTENTION
-                          │
-                          ▼
-                    WORKING STATE
-                          │
-         ┌────────────────┼─────────────────┐
-         │                │                 │
-         ▼                ▼                 ▼
-       MEMORY          SELF MODEL        RELATION
-         │                │                 │
-         ▼                ▼                 ▼
-      EPISODES          VALUES            AFFECT
-         │                │                 │
-         ├──────────┬─────┴─────┬──────────┤
-         ▼          ▼           ▼          ▼
-      BELIEFS   PREFERENCES  INTERESTS  OPEN QUESTIONS
-         │          │           │          │
-         └──────────┴─────┬─────┴──────────┘
-                          ▼
-                     INNER AGENDA
-                          │
-                          ▼
-                       PLANNER
-                          │
-             ┌────────────┼────────────┐
-             ▼            ▼            ▼
-           REPLY        SILENT       DEFER
-             │                         │
-             └────────────┬────────────┘
-                          ▼
-                        INTENT
-                          │
-                          ▼
-                  PLATFORM ACTION
-                          │
-                          ▼
-                        WORLD
+                        Existing Yunxi Core V1
+                                  │
+            ┌─────────────────────┼─────────────────────┐
+            ▼                     ▼                     ▼
+        WorldEvent            WorkingState          V1 Stores
+            │                                           │
+            ▼                                           │
+        Attention                                        │
+            │                                           │
+            ├──────────────────────┐                    │
+            ▼                      ▼                    │
+      V1 bounded context       MindSnapshotProvider ◄───┘
+            │                      │
+            │                 ┌────┴───────────────┐
+            │                 ▼                    ▼
+            │             SelfModel          Belief/Preference
+            │                 │             Interest/Question
+            │                 └──────┬─────────────┘
+            │                        ▼
+            │                   InnerAgenda
+            │                        │
+            └────────────┬───────────┘
+                         ▼
+                    PlannerInput
+                (V1 fields + MindSnapshot)
+                         │
+                         ▼
+                     V1 Planner
+                         │
+                         ▼
+                  DecisionDisposition
+                         │
+                         ▼
+                   CognitiveIntent
+                         │
+                         ▼
+                   ActionArbiter
+                         │
+                         ▼
+                     ActionResult
+                         │
+                         ▼
+                     WorldEvent
 ```
 
----
+低频旁路：
+
+```text
+bounded recent events
++
+Mind state
+↓
+Reflection
+↓
+ReflectionProposal
+↓
+Rust Consolidation
+↓
+Mind Stores
+↓
+next MindSnapshot
+```
+
+架构不变量：
+
+```text
+V1 owns runtime contracts
+V2 owns mind state
+Model proposes
+Rust validates
+Planner decides
+Arbiter controls action
+Reflection never directly sends
+```
 
 # 177. 最终 Definition of Done
 
-Yunxi Mind v2 完成至少满足：
 
-## SelfModel
+完成 V2 必须满足：
 
-- 持久；
-- 平台无关；
-- 高稳定 identity 不受普通聊天覆盖。
+```text
+[ ] 当前 V1 公共契约不被“整理式重写”
+[ ] WorldEvent / PlannerInput / DecisionDisposition / ActionResult 不被 V2 重复定义
+[ ] Trace 继续使用 V1 TraceContext
+[ ] AffectState / RelationState 继续使用 V1 实现
+[ ] SelfModel 不复制实时 Action capabilities 作为第二真相源
+[ ] Mind domain 完全平台无关
+[ ] MindServices / MindSnapshotProvider 可被 fake
+[ ] MindSnapshot bounded + versioned
+[ ] Mind unavailable 时可回退 V1-compatible behavior
+[ ] PlannerInput 只做 additive MindSnapshot 集成
+[ ] Belief 有 confidence / stability / source / evidence
+[ ] Preference 与 Belief 分离
+[ ] Interest 有 long-term affinity 与 activation
+[ ] Curiosity 不等于自动提问
+[ ] OpenQuestion 与 OpenLoop 分离
+[ ] InnerAgenda bounded + decay + cooldown
+[ ] DecisionDisposition 复用 V1 已有 enum
+[ ] MustHandle != MustReply
+[ ] Reflection 低频
+[ ] Reflection 不直接发送消息
+[ ] LLM 不直接写 Mind Store
+[ ] Consolidation 有 clamp / dedupe / version check
+[ ] Episode 第一版不要求修改 V1 MemoryKind
+[ ] private Person knowledge 不跨 scope 泄露
+[ ] 不持久化无依据敏感属性推断
+[ ] Shadow 在用户可见行为改变前完成
+[ ] V2 不让每条消息额外调用一次大模型
+[ ] V1 compatibility regression 全部通过
+[ ] Mind disabled / empty 时系统仍能按 V1 工作
+```
 
-## Belief
-
-- 有 confidence；
-- 有 source；
-- 可更新；
-- 可冲突；
-- 可改变观点。
-
-## Preference
-
-- 与 Belief 分离；
-- 缓慢变化；
-- 能影响行为。
-
-## Interest
-
-- 有 activation；
-- 有 decay；
-- 能影响 Attention。
-
-## Curiosity
-
-- 可以产生内部问题；
-- 不等于自动问用户。
-
-## OpenQuestion
-
-- 保留未解决认知问题；
-- 可后续解决。
-
-## InnerAgenda
-
-- bounded；
-- 会激活；
-- 会衰减；
-- 可 resume。
-
-## Reflection
-
-- 低频；
-- 结构化；
-- 不直接发消息；
-- 不保存隐藏 chain-of-thought。
-
-## Planner
-
-- 当前输入不再是唯一依据；
-- 可以 Reply；
-- Silent；
-- Defer；
-- Disagree；
-- Uncertain；
-- ChangeMind。
-
-## Platform Independence
-
-以上全部存在于 Yunxi Core。
-
-不依赖：
-
-- QQ；
-- Kovi；
-- OneBot；
-- PostgreSQL client；
-- GUI。
-
----
+完成这些后，V2 才算真正建立在“已经完成的 V1”之上，而不是把 V1 重新设计一遍。
 
 # 178. 最终行为验收
 
@@ -3847,6 +4325,131 @@ Yunxi Mind v2 的目标不是：
 ```
 
 Yunxi Mind v2 才算真正完成。
+
+
+
+# Appendix A：当前仓库 V1 对齐表
+
+本 V2 文档按当前 `yunshenya/kovi-bot` 的 V1 实现对齐。
+
+当前 V1 已有：
+
+```text
+crates/yunxi-core/src/action.rs
+crates/yunxi-core/src/arbiter.rs
+crates/yunxi-core/src/attention.rs
+crates/yunxi-core/src/event.rs
+crates/yunxi-core/src/goal.rs
+crates/yunxi-core/src/identity.rs
+crates/yunxi-core/src/intent.rs
+crates/yunxi-core/src/memory.rs
+crates/yunxi-core/src/open_loop.rs
+crates/yunxi-core/src/planner.rs
+crates/yunxi-core/src/ports.rs
+crates/yunxi-core/src/proactive.rs
+crates/yunxi-core/src/runtime.rs
+crates/yunxi-core/src/working_state.rs
+```
+
+V2 对这些模块的原则：
+
+```text
+action / arbiter
+→ reuse
+
+attention
+→ reuse, Mind only provides salience/relevance inputs
+
+event
+→ reuse WorldEvent / TraceContext
+
+goal
+→ reuse
+
+identity
+→ reuse all canonical IDs
+
+intent
+→ reuse CognitiveIntent
+
+memory
+→ reuse Memory/MemoryScope; Episode first uses separate store
+
+open_loop
+→ reuse; never merge with OpenQuestion
+
+planner
+→ reuse Planner/ModelBackend/DecisionDisposition;
+   additive MindSnapshot only
+
+ports
+→ keep CoreServices stable;
+   add companion MindServices
+
+proactive
+→ later consume InnerAgenda;
+   do not rewrite proactive runtime first
+
+runtime
+→ reuse; Mind is not a second runtime
+
+working_state
+→ reuse; MindSnapshot is separate bounded state
+```
+
+---
+
+# Appendix B：V2 明确禁止的重复类型
+
+V2 不得新建这些“看起来更现代”的替代类型：
+
+```text
+V2WorldEvent
+MindWorldEvent
+V2PersonId
+MindPersonId
+V2ConversationId
+MindActionResult
+MindAffectState
+MindRelationState
+MindDecisionDisposition
+MindTraceContext
+```
+
+如果需要附加 Mind 信息：
+
+```text
+使用新字段
+新 Snapshot
+新 Proposal
+```
+
+而不是复制整个 V1 contract。
+
+---
+
+# Appendix C：未来 Shared Contracts 迁移策略
+
+未来 V6～V10 如果需要把共享 ID / Trace / Privacy 等抽到独立 crate：
+
+```text
+那应该是独立的 architecture migration
+```
+
+不能把它绑在 V2 实施上。
+
+届时原则：
+
+```text
+re-export
+type-compatible migration
+behavior freeze
+tests first
+```
+
+V2 当前只需要：
+
+> **把 Mind 正确地建立在现有 V1 上。**
 
 
 # Conversation Concurrency Integration
