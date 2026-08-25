@@ -47,13 +47,14 @@ YUNXI_CLI_JOURNAL=./yunxi-cli-turns.jsonl \
 cargo run -p yunxi-cli
 ```
 
-私聊安全纯文本和群聊中明确 `@` 芸汐的纯文本默认由 Yunxi Core 接管；命令、提醒、Agent
-Run、附件和群聊环境消息继续由成熟的 Kovi handler 处理。生产出现异常时可在重启前显式
-回退到 legacy：
+私聊安全纯文本和群聊中明确 `@` 芸汐的纯文本默认继续由成熟的 Kovi handler 处理；命令、提醒、Agent
+Run、附件和群聊环境消息也保留在 Host。完成验证后，可在重启前显式启用 Core：
 
 ```bash
-YUNXI_CORE_PRIVATE_CUTOVER=0 YUNXI_CORE_GROUP_CUTOVER=0 cargo run --locked
+YUNXI_CORE_PRIVATE_CUTOVER=1 YUNXI_CORE_GROUP_CUTOVER=1 cargo run --locked
 ```
+
+出现异常时，将两个变量设为 `0` 或移除变量即可回到 legacy。
 
 建议在 `[identity]` 配置 canonical owner 的 Core `PersonId`。该 Person 必须在 PostgreSQL
 中恰好有一个 QQ ExternalIdentity；缺失或歧义时权限、主动投递和故障通知会 fail-closed，

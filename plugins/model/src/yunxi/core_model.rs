@@ -9,7 +9,7 @@ use crate::model::{
     OutgoingExecutiveContext, ReplyPlan, ReplyScope, ReplyTicket, Roles,
 };
 use crate::model::{
-    OutgoingSource, interrupt, mark_active, mark_outgoing_failed, outgoing_fingerprint,
+    OutgoingSource, interrupt, is_current, mark_active, mark_outgoing_failed, outgoing_fingerprint,
     prepare_outgoing_with_semantic_preview,
 };
 use crate::yunxi::identity_store::PostgresIdentityStore;
@@ -38,6 +38,7 @@ const MAX_CORE_TOOL_CALL_CHARS: usize = 4_096;
 const CORE_INTERACTION_CUES_START: &str = "[[INTERACTION_CUES]]";
 const CORE_INTERACTION_CUES_END: &str = "[[/INTERACTION_CUES]]";
 const MAX_CORE_INTERACTION_CUES_PAYLOAD_BYTES: usize = 256;
+const CORE_DIRECT_FALLBACK_REPLY: &str = "我刚才处理回复时出了点问题，请再发一次。";
 
 fn prepared_outgoing_semantic_context(content: &str) -> String {
     let encoded = serde_json::to_string(content)
@@ -748,6 +749,48 @@ fn visible_reply_intent(target: VisibleReplyTarget, content: String) -> Option<C
     }
 }
 
+fn direct_reply_expected(input: &PlannerInput) -> bool {
+    matches!(
+        input.event.kind(),
+        WorldEventKind::MessageReceived(message)
+            if message.conversation_kind == ConversationKind::Direct
+                && message.visible_reply_allowed
+                && !message.stop_requested
+    )
+}
+
+fn direct_fallback_plan(input: &PlannerInput, cues: InteractionCues) -> Option<DecisionPlan> {
+    let WorldEventKind::MessageReceived(message) = input.event.kind() else {
+        return None;
+    };
+    if !direct_reply_expected(input) {
+        return None;
+    }
+    Some(DecisionPlan {
+        disposition: DecisionDisposition::Reply,
+        intents: vec![CognitiveIntent::respond_to(
+            message.conversation_id,
+            MessageContent::text(CORE_DIRECT_FALLBACK_REPLY),
+            Some(message.message_id),
+        )],
+        state_updates: interaction_state_updates_with_cues(input, cues),
+    })
+}
+
+fn message_id_for_log(input: &PlannerInput) -> MessageId {
+    match input.event.kind() {
+        WorldEventKind::MessageReceived(message) => message.message_id,
+        _ => unreachable!("message id logging requires a message event"),
+    }
+}
+
+fn conversation_id_for_log(input: &PlannerInput) -> ConversationId {
+    match input.event.kind() {
+        WorldEventKind::MessageReceived(message) => message.conversation_id,
+        _ => unreachable!("conversation id logging requires a message event"),
+    }
+}
+
 fn due_reply_target(scope: yunxi_core::EventScope) -> Option<VisibleReplyTarget> {
     match scope {
         yunxi_core::EventScope::Person { person_id } => {
@@ -850,6 +893,16 @@ impl ModelBackend for KoviModelBackend {
                         // captured before it entered either asynchronous queue.
                         // Borrowing the latest scope ticket could answer an old
                         // event after a newer turn has already arrived.
+                        if direct_reply_expected(input) && crate::core_private_cutover_enabled() {
+                            kovi::log::warn!(
+                                "Yunxi Core direct reply fallback: event_id={} message_id={} conversation_id={} reason=missing_incoming_admission",
+                                input.event.id(),
+                                message.message_id,
+                                message.conversation_id,
+                            );
+                            return Ok(direct_fallback_plan(input, InteractionCues::default())
+                                .unwrap_or_else(|| silent_with_interaction_state(input)));
+                        }
                         return Ok(silent_with_interaction_state(input));
                     };
                     Some(IncomingAdmissionReleaseGuard::new(admission))
@@ -1089,17 +1142,35 @@ impl ModelBackend for KoviModelBackend {
             if !mark_active(ticket).await {
                 return Ok(silent_with_interaction_state(input));
             }
-            let response =
-                ModelGateway::complete_without_tools(&mut messages, ticket, None, &[], None).await;
-            let Some(response) = response else {
-                crate::model::finish(ticket).await;
-                return Ok(silent_with_interaction_state(input));
+            let response_content = match ModelGateway::complete_without_tools(
+                &mut messages,
+                ticket,
+                None,
+                &[],
+                None,
+            )
+            .await
+            {
+                Some(response) => response.content,
+                None if direct_reply_expected(input) && is_current(ticket).await => {
+                    kovi::log::warn!(
+                        "Yunxi Core direct reply fallback: event_id={} message_id={} conversation_id={} reason=model_cancelled_or_failed",
+                        input.event.id(),
+                        message_id_for_log(input),
+                        conversation_id_for_log(input),
+                    );
+                    CORE_DIRECT_FALLBACK_REPLY.to_string()
+                }
+                None => {
+                    crate::model::finish(ticket).await;
+                    return Ok(silent_with_interaction_state(input));
+                }
             };
             let parsed_response = if message.is_some() {
-                parse_core_response(&response.content)
+                parse_core_response(&response_content)
             } else {
                 ParsedCoreResponse {
-                    content: response.content,
+                    content: response_content,
                     interaction_cues: InteractionCues::default(),
                     incoming_impact: None,
                 }
@@ -1175,7 +1246,29 @@ impl ModelBackend for KoviModelBackend {
                     ),
                 });
             }
-            let response_content = if !allow_tool_call
+            let invalid_tool_output = if parsed_response.content.contains(CORE_TOOL_CALL_START)
+                || parsed_response.content.contains(CORE_TOOL_CALL_END)
+            {
+                !allow_tool_call
+                    || action_scope.is_none_or(|scope| {
+                        parse_core_tool_intent(&parsed_response.content, scope).is_none()
+                    })
+            } else {
+                false
+            };
+            let response_content = if invalid_tool_output {
+                if direct_reply_expected(input) {
+                    kovi::log::warn!(
+                        "Yunxi Core direct reply fallback: event_id={} message_id={} conversation_id={} reason=invalid_tool_protocol",
+                        input.event.id(),
+                        message_id_for_log(input),
+                        conversation_id_for_log(input),
+                    );
+                    CORE_DIRECT_FALLBACK_REPLY.to_string()
+                } else {
+                    "工具调用协议无效，但我暂时没能安全地整理它。".to_string()
+                }
+            } else if !allow_tool_call
                 && (parsed_response.content.contains(CORE_TOOL_CALL_START)
                     || parsed_response.content.contains(CORE_TOOL_CALL_END))
             {
@@ -1183,7 +1276,23 @@ impl ModelBackend for KoviModelBackend {
             } else {
                 parsed_response.content
             };
-            let plan = ReplyPlan::from_model_output(conversation.scope(), &response_content).await;
+            let mut plan =
+                ReplyPlan::from_model_output(conversation.scope(), &response_content).await;
+            if (!plan.has_visible_reply() || plan.content.trim().is_empty())
+                && direct_reply_expected(input)
+                && is_current(ticket).await
+            {
+                kovi::log::warn!(
+                    "Yunxi Core direct reply fallback: event_id={} message_id={} conversation_id={} reason=empty_or_silent_plan disposition={:?}",
+                    input.event.id(),
+                    message_id_for_log(input),
+                    conversation_id_for_log(input),
+                    plan.disposition,
+                );
+                plan =
+                    ReplyPlan::from_model_output(conversation.scope(), CORE_DIRECT_FALLBACK_REPLY)
+                        .await;
+            }
             if !plan.has_visible_reply() || plan.content.trim().is_empty() {
                 crate::model::finish(ticket).await;
                 return Ok(silent_with_interaction_cues(
@@ -1200,12 +1309,28 @@ impl ModelBackend for KoviModelBackend {
             .await;
             crate::model::finish(ticket).await;
             let Some(prepared) = prepared else {
+                if direct_reply_expected(input) {
+                    kovi::log::warn!(
+                        "Yunxi Core direct reply unresolved: event_id={} message_id={} conversation_id={} reason=prepare_outgoing_rejected",
+                        input.event.id(),
+                        message_id_for_log(input),
+                        conversation_id_for_log(input),
+                    );
+                }
                 return Ok(silent_with_interaction_cues(
                     input,
                     parsed_response.interaction_cues,
                 ));
             };
             let Some(intent) = visible_reply_intent(reply_target, plan.content) else {
+                if direct_reply_expected(input) {
+                    kovi::log::warn!(
+                        "Yunxi Core direct reply unresolved: event_id={} message_id={} conversation_id={} reason=reply_intent_conversion_failed",
+                        input.event.id(),
+                        message_id_for_log(input),
+                        conversation_id_for_log(input),
+                    );
+                }
                 mark_outgoing_failed(prepared).await;
                 return Ok(silent_with_interaction_cues(
                     input,
@@ -1292,14 +1417,14 @@ fn visible_reply_state_updates(event: &WorldEventKind) -> Vec<StateUpdateProposa
 #[cfg(test)]
 mod tests {
     use super::{
-        BoundedCache, BoundedRouteCache, HostToolTurnRegistry, LegacyConversation,
-        PersistentRouteLookup, RouteContext, VisibleReplyTarget,
-        classify_persistent_person_identity, defer_unroutable_due, due_reply_target,
-        interaction_state_updates_with_cues, keeps_existing_prepared_plan, parse_core_response,
-        parse_core_tool_intent, parse_qq_conversation, pre_model_plan,
-        prepared_outgoing_semantic_context, purge_group_routes_from_cache, refine_core_incoming,
-        route_from_lookup, route_lookup_with_fallback, visible_reply_intent,
-        visible_reply_state_updates,
+        BoundedCache, BoundedRouteCache, CORE_DIRECT_FALLBACK_REPLY, HostToolTurnRegistry,
+        LegacyConversation, PersistentRouteLookup, RouteContext, VisibleReplyTarget,
+        classify_persistent_person_identity, defer_unroutable_due, direct_fallback_plan,
+        direct_reply_expected, due_reply_target, interaction_state_updates_with_cues,
+        keeps_existing_prepared_plan, parse_core_response, parse_core_tool_intent,
+        parse_qq_conversation, pre_model_plan, prepared_outgoing_semantic_context,
+        purge_group_routes_from_cache, refine_core_incoming, route_from_lookup,
+        route_lookup_with_fallback, visible_reply_intent, visible_reply_state_updates,
     };
     use crate::model::{
         ConversationCoordinator, IncomingTurnImpact, OutgoingExecutiveDecision, OutgoingSource,
@@ -1352,6 +1477,28 @@ mod tests {
         assert_eq!(parsed.interaction_cues.gratitude_strength, 0.8);
         assert_eq!(parsed.incoming_impact, None);
         assert!(!parsed.content.contains("INTERACTION_CUES"));
+    }
+
+    #[test]
+    fn visible_direct_turn_has_a_nonempty_fallback_reply() {
+        let input = message_input(PersonId::new(), true);
+        assert!(direct_reply_expected(&input));
+
+        let plan = direct_fallback_plan(&input, InteractionCues::default())
+            .expect("visible direct turns must have a fallback plan");
+        assert_eq!(plan.disposition, yunxi_core::DecisionDisposition::Reply);
+        assert_eq!(plan.intents.len(), 1);
+        let CognitiveIntent::SendMessage { content, .. } = &plan.intents[0] else {
+            panic!("direct fallback must be a SendMessage intent");
+        };
+        assert_eq!(content.as_text(), CORE_DIRECT_FALLBACK_REPLY);
+    }
+
+    #[test]
+    fn observation_only_direct_turn_remains_silent() {
+        let input = message_input(PersonId::new(), false);
+        assert!(!direct_reply_expected(&input));
+        assert!(direct_fallback_plan(&input, InteractionCues::default()).is_none());
     }
 
     #[test]
