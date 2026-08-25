@@ -2028,22 +2028,42 @@ async fn run_runtime(
             match outcome {
                 Ok(PlannedProcessingOutcome::Planned {
                     observation,
+                    plan,
                     actions,
                     ..
                 }) => {
-                    kovi::log::debug!(
-                        "Yunxi Core turn completed: id={} type={:?} actions={}",
-                        observation.event_id,
-                        observation.event_type,
-                        actions.len(),
-                    );
+                    let has_action_failure = actions.iter().any(|action| !action.is_success());
+                    if actions.is_empty() || has_action_failure {
+                        kovi::log::warn!(
+                            "Yunxi Core turn outcome: event_id={} type={:?} scope={:?} attention={:?} disposition={:?} intents={} actions={:?}",
+                            observation.event_id,
+                            observation.event_type,
+                            observation.scope,
+                            observation.attention,
+                            plan.disposition,
+                            plan.intents.len(),
+                            actions,
+                        );
+                    } else {
+                        kovi::log::debug!(
+                            "Yunxi Core turn completed: event_id={} type={:?} scope={:?} disposition={:?} intents={} actions={}",
+                            observation.event_id,
+                            observation.event_type,
+                            observation.scope,
+                            plan.disposition,
+                            plan.intents.len(),
+                            actions.len(),
+                        );
+                    }
                 }
                 Ok(PlannedProcessingOutcome::RejectedEvent { event, .. })
                 | Ok(PlannedProcessingOutcome::RejectedState { event, .. }) => {
                     release_rejected_incoming(&event, incoming_releaser.as_deref()).await;
                     kovi::log::warn!("Yunxi Core planner rejected an event");
                 }
-                Err(error) => kovi::log::warn!("Yunxi Core planner failed: {error}"),
+                Err(error) => {
+                    kovi::log::error!("Yunxi Core planner failed before action outcome: {error}")
+                }
             }
         }
         return;

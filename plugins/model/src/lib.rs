@@ -159,9 +159,10 @@ const DATABASE_INIT_MAX_ATTEMPTS: u32 = 8;
 const CORE_PRIVATE_CUTOVER_ENV: &str = "YUNXI_CORE_PRIVATE_CUTOVER";
 const CORE_GROUP_CUTOVER_ENV: &str = "YUNXI_CORE_GROUP_CUTOVER";
 
-/// Exactly one runtime owns a private message. Safe plain-text conversations
-/// are Core-owned by default; the environment variable remains an explicit
-/// emergency rollback switch (`0`, `false`, or `off`) for a process restart.
+/// Exactly one runtime owns a private message. Core ownership is opt-in until
+/// its visible-reply failure paths are proven in production; setting the
+/// environment variable to `1`, `true`, or `on` enables the cutover. The
+/// explicit `0`, `false`, or `off` values remain an emergency rollback switch.
 /// Unsupported host features still fall back to the mature legacy handler.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PrivateMessageOwner {
@@ -171,10 +172,10 @@ enum PrivateMessageOwner {
 }
 
 fn core_private_cutover_enabled_from(value: Option<&str>) -> bool {
-    value.is_none_or(|value| {
-        !matches!(
+    value.is_some_and(|value| {
+        matches!(
             value.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "off" | "no"
+            "1" | "true" | "on" | "yes"
         )
     })
 }
@@ -768,20 +769,21 @@ mod tests {
     use std::fs;
 
     #[test]
-    fn private_core_cutover_is_enabled_by_default_and_supports_emergency_rollback() {
-        assert!(core_private_cutover_enabled_from(None));
-        assert!(core_private_cutover_enabled_from(Some("")));
+    fn private_core_cutover_is_opt_in_and_supports_explicit_values() {
+        assert!(!core_private_cutover_enabled_from(None));
+        assert!(!core_private_cutover_enabled_from(Some("")));
         assert!(!core_private_cutover_enabled_from(Some("0")));
         assert!(!core_private_cutover_enabled_from(Some("false")));
         assert!(!core_private_cutover_enabled_from(Some("off")));
         assert!(core_private_cutover_enabled_from(Some("1")));
         assert!(core_private_cutover_enabled_from(Some(" TRUE ")));
         assert!(core_private_cutover_enabled_from(Some("on")));
+        assert!(!core_private_cutover_enabled_from(Some("unexpected")));
     }
 
     #[test]
-    fn group_core_cutover_defaults_to_core_and_supports_emergency_rollback() {
-        assert!(core_group_cutover_enabled_from(None));
+    fn group_core_cutover_is_opt_in_and_supports_explicit_values() {
+        assert!(!core_group_cutover_enabled_from(None));
         assert!(!core_group_cutover_enabled_from(Some("false")));
         assert!(core_group_cutover_enabled_from(Some("on")));
     }
