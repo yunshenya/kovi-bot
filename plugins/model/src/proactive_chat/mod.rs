@@ -22,7 +22,10 @@ use rand::Rng;
 use rand::prelude::IndexedRandom;
 use std::sync::Arc;
 use std::time::Duration;
-use yunxi_core::{MessageContent, ProactiveOpportunity, ReachOutIntent};
+use yunxi_core::{
+    ActionPortOutcome, ActionResult, MessageContent, ProactiveOpportunity, ProposedAction,
+    ReachOutAction, ReachOutIntent,
+};
 
 pub mod startup;
 
@@ -248,6 +251,20 @@ impl ProactiveChatManager {
     }
 
     async fn deliver_private_reach_out(&self, user_id: i64, intent: &ReachOutIntent) -> bool {
+        if let Some(bridge) = &self.yunxi_bridge {
+            let Ok(action) = ReachOutAction::from_intent(intent.clone()) else {
+                return false;
+            };
+            return matches!(
+                bridge
+                    .dispatch_action(ProposedAction::ReachOut(action))
+                    .await,
+                Some(ActionResult::Executed {
+                    outcome: ActionPortOutcome::Delivered { .. },
+                    ..
+                })
+            );
+        }
         let Some(identity_store) = yunxi::identity_store() else {
             return false;
         };

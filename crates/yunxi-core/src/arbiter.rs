@@ -9,6 +9,7 @@ use crate::action::{ActionId, ActionScope, ActionValidationError, ProposedAction
 use crate::delivery::{DeliveryResolutionError, DeliveryResolver};
 use crate::identity::{ConversationId, PersonId};
 use chrono::{DateTime, NaiveDate, Utc};
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::sync::{Arc, Mutex};
@@ -20,7 +21,8 @@ pub const MAX_TRACKED_ACTION_SCOPES: usize = 4_096;
 pub const MAX_RATE_LIMIT_WINDOW_ENTRIES: usize = 4_096;
 
 /// Capabilities exposed by a host adapter.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ActionCapability {
     SendMessage,
     ReachOut,
@@ -43,7 +45,8 @@ impl fmt::Display for ActionCapability {
 }
 
 /// A host capability, optionally restricted to a set of Core scopes.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ActionDescriptor {
     pub capability: ActionCapability,
     pub allowed_scopes: Option<Vec<ActionScope>>,
@@ -78,7 +81,8 @@ impl ActionDescriptor {
 }
 
 /// The set of actions currently exposed by an environment.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EnvironmentCapabilities {
     pub actions: Vec<ActionDescriptor>,
 }

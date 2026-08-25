@@ -167,7 +167,7 @@ struct ConversationWorkingState {
     version: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConversationSnapshot {
     conversation_id: ConversationId,
     pub conversation_kind: Option<crate::identity::ConversationKind>,
