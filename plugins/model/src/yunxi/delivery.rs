@@ -114,6 +114,7 @@ struct CoreToolEffectRevalidator {
     registry: Arc<ToolRegistry>,
     action: ToolAction,
     ticket: crate::model::ReplyTicket,
+    source_message_id: Option<i32>,
     expected_actor_user_id: i64,
     expected_conversation_id: ConversationId,
     expected_destination: QqDestination,
@@ -288,7 +289,7 @@ impl QqActionAdapter {
             is_main_admin,
             context: "yunxi_core_tool",
             destination: destination.message_destination(),
-            source_message_id: None,
+            source_message_id: binding.source_message_id,
             scheduled: false,
             group_paused,
             runtime_bot: Some(Arc::clone(&self.bot)),
@@ -734,9 +735,9 @@ impl QqActionAdapter {
         &self,
         action: &ToolAction,
     ) -> Result<ActionPortOutcome, ActionPortError> {
-        let Some(ticket) = self
+        let Some(claim) = self
             .tool_turns
-            .claim(
+            .claim_with_context(
                 action.idempotency_key(),
                 action.scope,
                 &action.tool_name,
@@ -748,6 +749,8 @@ impl QqActionAdapter {
                 reason: "tool_turn_capability_missing".to_string(),
             });
         };
+        let ticket = claim.ticket;
+        let source_message_id = claim.source_message_id;
         let Some(registry) = tool_registry() else {
             return Ok(ActionPortOutcome::Deferred {
                 reason: "tool_registry_unavailable".to_string(),
@@ -939,7 +942,7 @@ impl QqActionAdapter {
             is_main_admin,
             context: "yunxi_core_tool",
             destination: destination.message_destination(),
-            source_message_id: None,
+            source_message_id,
             scheduled: false,
             group_paused,
             runtime_bot: Some(Arc::clone(&self.bot)),
@@ -957,6 +960,7 @@ impl QqActionAdapter {
             registry: Arc::clone(&registry),
             action: action.clone(),
             ticket,
+            source_message_id,
             expected_actor_user_id: actor_user_id,
             expected_conversation_id,
             expected_destination,

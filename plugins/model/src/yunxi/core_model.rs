@@ -5,8 +5,9 @@
 //! turns the visible reply back into a declarative Core plan.
 
 use crate::model::{
-    BotMemory, ConversationCoordinator, IncomingAdmission, IncomingTurnImpact, ModelGateway,
-    OutgoingExecutiveContext, ReplyPlan, ReplyScope, ReplyTicket, Roles,
+    BotMemory, ConversationCoordinator, IncomingAdmission, IncomingTurnImpact, MessageDestination,
+    ModelGateway, OutgoingExecutiveContext, ReplyPlan, ReplyScope, ReplyTicket, Roles,
+    ToolExecutionContext, tool_registry,
 };
 use crate::model::{
     OutgoingSource, interrupt, is_current, mark_active, mark_outgoing_failed, outgoing_fingerprint,
@@ -39,7 +40,7 @@ const CORE_INTERACTION_CUES_START: &str = "[[INTERACTION_CUES]]";
 const CORE_INTERACTION_CUES_END: &str = "[[/INTERACTION_CUES]]";
 const MAX_CORE_INTERACTION_CUES_PAYLOAD_BYTES: usize = 256;
 const CORE_DIRECT_FALLBACK_REPLY: &str = "我刚才处理回复时出了点问题，请再发一次。";
-const CORE_DIRECT_REPAIR_PROMPT: &str = "Core 私聊回复修复：上一轮没有形成可见回复，但当前用户消息明确需要回应。现在必须只生成一条自然、简短的中文聊天回复，不能选择 silent，不能调用工具，不能输出 JSON、协议标记或解释这次修复，也不能返回空字符串。直接输出要发给用户看的正文。";
+const CORE_DIRECT_REPAIR_PROMPT: &str = "Core 私聊回复修复：上一轮没有形成可见回复，但当前用户消息明确需要回应。现在必须给出可执行结果：如果用户明确要求执行受控工具操作，按已有 Core 工具协议只输出一个完整且唯一的 [[TOOL_CALL]]{\"name\":\"工具名\",\"arguments\":{}}[[/TOOL_CALL]]；否则只输出一条自然、简短的中文聊天回复。不能选择 silent，不能输出多个调用、JSON、解释这次修复或空字符串。";
 
 fn prepared_outgoing_semantic_context(content: &str) -> String {
     let encoded = serde_json::to_string(content)
@@ -95,6 +96,11 @@ struct ParsedCoreResponse {
     content: String,
     interaction_cues: InteractionCues,
     incoming_impact: Option<IncomingTurnImpact>,
+}
+
+enum CoreDirectRepair {
+    Reply(ReplyPlan),
+    Tool(CognitiveIntent),
 }
 
 /// Parse the optional model-produced semantic sidecar and always remove
@@ -157,7 +163,9 @@ async fn repair_direct_reply(
     messages: &[BotMemory],
     reply_ticket: ReplyTicket,
     scope: ReplyScope,
-) -> Option<ReplyPlan> {
+    allow_tool_call: bool,
+    action_scope: Option<ActionScope>,
+) -> Option<CoreDirectRepair> {
     let mut repair_messages = messages.to_vec();
     repair_messages.push(BotMemory {
         role: Roles::System,
@@ -170,14 +178,59 @@ async fn repair_direct_reply(
         return None;
     }
     let parsed = parse_core_response(&response.content);
-    if parsed.content.trim().is_empty()
-        || parsed.content.contains(CORE_TOOL_CALL_START)
-        || parsed.content.contains(CORE_TOOL_CALL_END)
+    if parsed.content.trim().is_empty() {
+        return None;
+    }
+    if allow_tool_call
+        && let Some(action_scope) = action_scope
+        && let Some(intent) = parse_core_tool_intent(&parsed.content, action_scope)
+    {
+        return Some(CoreDirectRepair::Tool(intent));
+    }
+    if parsed.content.contains(CORE_TOOL_CALL_START) || parsed.content.contains(CORE_TOOL_CALL_END)
     {
         return None;
     }
     let plan = ReplyPlan::from_model_output(scope, &parsed.content).await;
-    plan.has_visible_reply().then_some(plan)
+    plan.has_visible_reply()
+        .then_some(CoreDirectRepair::Reply(plan))
+}
+
+async fn register_core_tool_intent(
+    registry: &HostToolTurnRegistry,
+    input: &PlannerInput,
+    intent: CognitiveIntent,
+    ticket: ReplyTicket,
+    interaction_cues: InteractionCues,
+    source_message_id: Option<i32>,
+) -> Option<DecisionPlan> {
+    let CognitiveIntent::UseTool {
+        tool_name,
+        input: tool_input,
+        scope,
+    } = &intent
+    else {
+        return None;
+    };
+    let idempotency_key = yunxi_core::planned_action_idempotency_key(&input.event, 0);
+    if !registry
+        .register_with_source(
+            &idempotency_key,
+            *scope,
+            tool_name,
+            tool_input,
+            ticket,
+            source_message_id,
+        )
+        .await
+    {
+        return None;
+    }
+    Some(DecisionPlan {
+        disposition: DecisionDisposition::SpecialAction,
+        intents: vec![intent],
+        state_updates: interaction_state_updates_with_cues(input, interaction_cues),
+    })
 }
 
 fn strip_core_interaction_cues(content: &str) -> String {
@@ -370,6 +423,13 @@ type IncomingAdmissionCache = BoundedCache<MessageId, IncomingAdmission>;
 struct HostToolTurnCapability {
     envelope_fingerprint: [u8; 32],
     ticket: ReplyTicket,
+    source_message_id: Option<i32>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct HostToolTurnClaim {
+    pub(crate) ticket: ReplyTicket,
+    pub(crate) source_message_id: Option<i32>,
 }
 
 #[derive(Debug)]
@@ -400,6 +460,7 @@ impl HostToolTurnRegistry {
     /// Registering the same event-local capability twice is rejected. It must
     /// never replace an older ticket that an already-materialized action could
     /// subsequently claim.
+    #[allow(dead_code)]
     async fn register(
         &self,
         idempotency_key: &str,
@@ -407,6 +468,19 @@ impl HostToolTurnRegistry {
         tool_name: &str,
         input: &str,
         ticket: ReplyTicket,
+    ) -> bool {
+        self.register_with_source(idempotency_key, scope, tool_name, input, ticket, None)
+            .await
+    }
+
+    async fn register_with_source(
+        &self,
+        idempotency_key: &str,
+        scope: ActionScope,
+        tool_name: &str,
+        input: &str,
+        ticket: ReplyTicket,
+        source_message_id: Option<i32>,
     ) -> bool {
         let envelope_fingerprint = tool_turn_envelope_fingerprint(scope, tool_name, input);
         let mut state = self.state.lock().await;
@@ -427,6 +501,7 @@ impl HostToolTurnRegistry {
             HostToolTurnCapability {
                 envelope_fingerprint,
                 ticket,
+                source_message_id,
             },
         );
         state.insertion_order.push_back(idempotency_key.to_owned());
@@ -435,6 +510,7 @@ impl HostToolTurnRegistry {
 
     /// Consume one exact capability. Any mismatch leaves the registered entry
     /// untouched, so a forged action cannot revoke the legitimate action.
+    #[allow(dead_code)]
     pub(crate) async fn claim(
         &self,
         idempotency_key: &str,
@@ -442,6 +518,18 @@ impl HostToolTurnRegistry {
         tool_name: &str,
         input: &str,
     ) -> Option<ReplyTicket> {
+        self.claim_with_context(idempotency_key, scope, tool_name, input)
+            .await
+            .map(|claim| claim.ticket)
+    }
+
+    pub(crate) async fn claim_with_context(
+        &self,
+        idempotency_key: &str,
+        scope: ActionScope,
+        tool_name: &str,
+        input: &str,
+    ) -> Option<HostToolTurnClaim> {
         let mut state = self.state.lock().await;
         let expected_fingerprint = tool_turn_envelope_fingerprint(scope, tool_name, input);
         let capability = state.entries.get(idempotency_key)?;
@@ -452,7 +540,10 @@ impl HostToolTurnRegistry {
         state
             .insertion_order
             .retain(|candidate| candidate != idempotency_key);
-        Some(capability.ticket)
+        Some(HostToolTurnClaim {
+            ticket: capability.ticket,
+            source_message_id: capability.source_message_id,
+        })
     }
 
     #[cfg(test)]
@@ -514,6 +605,7 @@ impl Drop for IncomingAdmissionReleaseGuard {
 
 #[derive(Clone)]
 pub(crate) struct KoviModelBackend {
+    bot: Arc<RuntimeBot>,
     identities: Arc<PostgresIdentityStore>,
     conversations: Arc<Mutex<BoundedRouteCache<ConversationId>>>,
     people: Arc<Mutex<BoundedRouteCache<PersonId>>>,
@@ -531,8 +623,9 @@ impl std::fmt::Debug for KoviModelBackend {
 }
 
 impl KoviModelBackend {
-    pub(crate) fn new(_bot: Arc<RuntimeBot>, identities: Arc<PostgresIdentityStore>) -> Arc<Self> {
+    pub(crate) fn new(bot: Arc<RuntimeBot>, identities: Arc<PostgresIdentityStore>) -> Arc<Self> {
         Arc::new(Self {
+            bot,
             identities,
             conversations: Arc::new(Mutex::new(BoundedRouteCache::new(FALLBACK_ROUTE_CAPACITY))),
             people: Arc::new(Mutex::new(BoundedRouteCache::new(FALLBACK_ROUTE_CAPACITY))),
@@ -545,6 +638,71 @@ impl KoviModelBackend {
 
     pub(crate) fn tool_turn_registry(&self) -> Arc<HostToolTurnRegistry> {
         Arc::clone(&self.tool_turns)
+    }
+
+    async fn tool_context_for(&self, conversation: LegacyConversation) -> ToolExecutionContext {
+        let (subject_id, actor_user_id, destination, is_admin, is_main_admin, group_paused) =
+            match conversation {
+                LegacyConversation::Private { user_id } => (
+                    user_id,
+                    user_id,
+                    MessageDestination::Private(user_id),
+                    crate::model::utils::is_bot_admin(&self.bot, user_id),
+                    crate::model::utils::is_main_admin(&self.bot, user_id),
+                    false,
+                ),
+                LegacyConversation::Group { group_id } => (
+                    group_id,
+                    0,
+                    MessageDestination::Group(group_id),
+                    false,
+                    false,
+                    crate::model::utils::is_group_paused(group_id).await,
+                ),
+            };
+        ToolExecutionContext {
+            subject_id,
+            actor_user_id,
+            is_admin,
+            is_main_admin,
+            context: "yunxi_core",
+            destination,
+            source_message_id: None,
+            scheduled: false,
+            group_paused,
+            runtime_bot: Some(Arc::clone(&self.bot)),
+            sticker_teaching: None,
+            requires_reminder_create: false,
+            requires_agent_run_create: false,
+            requires_group_message_send: false,
+            requires_group_followup: false,
+            requires_external_tool: false,
+        }
+    }
+
+    async fn source_message_id_for(&self, input: &PlannerInput) -> Option<i32> {
+        let WorldEventKind::MessageReceived(message) = input.event.kind() else {
+            return None;
+        };
+        match self
+            .identities
+            .qq_message_id_for_core(message.message_id, message.conversation_id)
+            .await
+        {
+            Ok(Some(message_id)) => i32::try_from(message_id)
+                .ok()
+                .filter(|message_id| *message_id > 0),
+            Ok(None) => None,
+            Err(error) => {
+                kovi::log::warn!(
+                    "Yunxi Core source message mapping unavailable: event_id={} message_id={} conversation_id={} reason={error}",
+                    input.event.id(),
+                    message.message_id,
+                    message.conversation_id,
+                );
+                None
+            }
+        }
     }
 
     /// Bind the host admission captured at ingress to the exact Core message.
@@ -1092,12 +1250,31 @@ impl ModelBackend for KoviModelBackend {
                 .conversation_id()
                 .or_else(|| input.event.scope().conversation_id())
                 .map(ActionScope::Conversation);
+            let source_message_id = if allow_tool_call && input.supports(ActionCapability::UseTool)
+            {
+                self.source_message_id_for(input).await
+            } else {
+                None
+            };
             if allow_tool_call && input.supports(ActionCapability::UseTool) {
                 messages.insert(
                     0,
                     BotMemory {
                         role: Roles::System,
                         content: "Core 工具协议：确实需要调用受控工具时，在本轮要求的 INTERACTION_CUES 前缀之后，只输出一个完整且唯一的 [[TOOL_CALL]]{\"name\":\"工具名\",\"arguments\":{}}[[/TOOL_CALL]]。不要输出前后解释、代码块、多个调用或把工具结果写成已完成；普通回复保持自然文本。工具名称和参数必须是 JSON 对象。".to_string(),
+                    },
+                );
+                let tool_instruction = if let Some(registry) = tool_registry() {
+                    let tool_context = self.tool_context_for(conversation).await;
+                    registry.instruction_for(&tool_context)
+                } else {
+                    "Core 工具清单当前不可用；本轮不要调用工具，只生成自然语言回复。".to_string()
+                };
+                messages.insert(
+                    0,
+                    BotMemory {
+                        role: Roles::System,
+                        content: tool_instruction,
                     },
                 );
             }
@@ -1244,35 +1421,24 @@ impl ModelBackend for KoviModelBackend {
                 && let Some(action_scope) = action_scope
                 && let Some(intent) = parse_core_tool_intent(&parsed_response.content, action_scope)
             {
-                let CognitiveIntent::UseTool {
-                    tool_name,
-                    input: tool_input,
-                    scope,
-                } = &intent
+                let Some(tool_plan) = register_core_tool_intent(
+                    &self.tool_turns,
+                    input,
+                    intent,
+                    ticket,
+                    parsed_response.interaction_cues,
+                    source_message_id,
+                )
+                .await
                 else {
-                    unreachable!("the Core tool parser only returns UseTool intents")
-                };
-                let idempotency_key = yunxi_core::planned_action_idempotency_key(&input.event, 0);
-                if !self
-                    .tool_turns
-                    .register(&idempotency_key, *scope, tool_name, tool_input, ticket)
-                    .await
-                {
                     crate::model::finish(ticket).await;
                     return Ok(silent_with_interaction_cues(
                         input,
                         parsed_response.interaction_cues,
                     ));
-                }
+                };
                 crate::model::finish(ticket).await;
-                return Ok(DecisionPlan {
-                    disposition: DecisionDisposition::SpecialAction,
-                    intents: vec![intent],
-                    state_updates: interaction_state_updates_with_cues(
-                        input,
-                        parsed_response.interaction_cues,
-                    ),
-                });
+                return Ok(tool_plan);
             }
             let invalid_tool_output = if parsed_response.content.contains(CORE_TOOL_CALL_START)
                 || parsed_response.content.contains(CORE_TOOL_CALL_END)
@@ -1317,28 +1483,69 @@ impl ModelBackend for KoviModelBackend {
                     conversation_id_for_log(input),
                     plan.disposition,
                 );
-                if let Some(repaired) =
-                    repair_direct_reply(&messages, ticket, conversation.scope()).await
+                match repair_direct_reply(
+                    &messages,
+                    ticket,
+                    conversation.scope(),
+                    allow_tool_call && input.supports(ActionCapability::UseTool),
+                    action_scope,
+                )
+                .await
                 {
-                    plan = repaired;
-                    kovi::log::info!(
-                        "Yunxi Core direct reply repair succeeded: event_id={} message_id={} conversation_id={}",
-                        input.event.id(),
-                        message_id_for_log(input),
-                        conversation_id_for_log(input),
-                    );
-                } else {
-                    kovi::log::warn!(
-                        "Yunxi Core direct reply fallback: event_id={} message_id={} conversation_id={} reason=repair_failed",
-                        input.event.id(),
-                        message_id_for_log(input),
-                        conversation_id_for_log(input),
-                    );
-                    plan = ReplyPlan::from_model_output(
-                        conversation.scope(),
-                        CORE_DIRECT_FALLBACK_REPLY,
-                    )
-                    .await;
+                    Some(CoreDirectRepair::Reply(repaired)) => {
+                        plan = repaired;
+                        kovi::log::info!(
+                            "Yunxi Core direct reply repair succeeded: event_id={} message_id={} conversation_id={}",
+                            input.event.id(),
+                            message_id_for_log(input),
+                            conversation_id_for_log(input),
+                        );
+                    }
+                    Some(CoreDirectRepair::Tool(intent)) => {
+                        if let Some(tool_plan) = register_core_tool_intent(
+                            &self.tool_turns,
+                            input,
+                            intent,
+                            ticket,
+                            parsed_response.interaction_cues,
+                            source_message_id,
+                        )
+                        .await
+                        {
+                            crate::model::finish(ticket).await;
+                            kovi::log::info!(
+                                "Yunxi Core direct reply repair produced tool action: event_id={} message_id={} conversation_id={}",
+                                input.event.id(),
+                                message_id_for_log(input),
+                                conversation_id_for_log(input),
+                            );
+                            return Ok(tool_plan);
+                        }
+                        kovi::log::warn!(
+                            "Yunxi Core direct reply fallback: event_id={} message_id={} conversation_id={} reason=repair_tool_registration_failed",
+                            input.event.id(),
+                            message_id_for_log(input),
+                            conversation_id_for_log(input),
+                        );
+                        plan = ReplyPlan::from_model_output(
+                            conversation.scope(),
+                            CORE_DIRECT_FALLBACK_REPLY,
+                        )
+                        .await;
+                    }
+                    None => {
+                        kovi::log::warn!(
+                            "Yunxi Core direct reply fallback: event_id={} message_id={} conversation_id={} reason=repair_failed",
+                            input.event.id(),
+                            message_id_for_log(input),
+                            conversation_id_for_log(input),
+                        );
+                        plan = ReplyPlan::from_model_output(
+                            conversation.scope(),
+                            CORE_DIRECT_FALLBACK_REPLY,
+                        )
+                        .await;
+                    }
                 }
             }
             if !plan.has_visible_reply() || plan.content.trim().is_empty() {
@@ -1949,6 +2156,36 @@ mod tests {
                     .is_none(),
                 "a claimed capability must never be reusable"
             );
+        });
+    }
+
+    #[test]
+    fn tool_turn_claim_preserves_source_message_id() {
+        let runtime = kovi::tokio::runtime::Runtime::new().expect("test runtime");
+        runtime.block_on(async {
+            let registry = HostToolTurnRegistry::new(1);
+            let scope = ActionScope::Conversation(ConversationId::new());
+            let ticket = interrupt(ReplyScope::Private(9_371_020)).await;
+            let key = event_action_idempotency_key(EventId::new(), 0);
+
+            assert!(
+                registry
+                    .register_with_source(
+                        &key,
+                        scope,
+                        "group.message.send",
+                        "{}",
+                        ticket,
+                        Some(321)
+                    )
+                    .await
+            );
+            let claim = registry
+                .claim_with_context(&key, scope, "group.message.send", "{}")
+                .await
+                .expect("the exact capability should be claimable");
+            assert_eq!(claim.ticket, ticket);
+            assert_eq!(claim.source_message_id, Some(321));
         });
     }
 
