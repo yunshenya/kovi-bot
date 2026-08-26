@@ -60,6 +60,40 @@ YUNXI_CORE_PRIVATE_CUTOVER=1 YUNXI_CORE_GROUP_CUTOVER=1 cargo run --locked
 中恰好有一个 QQ ExternalIdentity；缺失或歧义时权限、主动投递和故障通知会 fail-closed，
 不会猜测旧账号。未配置时才兼容 `[proactive].main_admin`。
 
+### Yunxi Mind v2
+
+Mind v2 在 PostgreSQL 中维护有界、版本化的 SelfModel、Belief、Preference、Interest、
+OpenQuestion、Agenda 和 Episode。默认启用持久状态与低频确定性 Reflection，但
+`influence_mode = "shadow"` 不会把 Mind 内容加入真实回复提示，也不会创建真实主动消息；
+它只记录“如果启用会怎样”的结构化指标。确认 `#mind-status` 指标后，管理员可将模式改为
+`active`，再重启进程，让 Mind 参与回复上下文和现有主动聊天候选。`disabled` 会关闭新增与
+影响，但数据删除仍会覆盖已经持久化的 Mind 数据。
+
+```toml
+[mind]
+enabled = true
+belief_enabled = true
+preference_enabled = true
+interest_enabled = true
+curiosity_enabled = true
+agenda_enabled = true
+reflection_enabled = true
+mind_planner_enabled = true
+influence_mode = "shadow" # disabled / shadow / active
+snapshot_timeout_ms = 75
+event_update_timeout_ms = 40
+reflection_min_interval_minutes = 60
+reflection_max_events = 32
+question_cooldown_minutes = 120
+```
+
+Mind 候选复用正常回复已有的 bounded structured sidecar，不会为每条消息增加第二次模型
+调用；Reflection 第一版也完全是确定性处理。快照读取和入站状态更新都有独立超时，数据库
+不可用或超时时会 fail-soft 到空快照，不阻断直接回复。候选只有在对应 outgoing 赢得现有
+提交竞争后才会写入，发送被 supersede/cancel、repair、fallback、stop 或无效工具输出时均会
+丢弃。管理员只能在私聊中使用 `#mind-status` 查看版本、计数、Reflection 与更新指标；该命令
+不显示私聊内容、隐藏推理或 chain-of-thought。
+
 ## 连接 NapCat
 
 `6099` 是 NapCat WebUI 管理端口，不是机器人连接端口。本项目连接 NapCat 的 OneBot 11
@@ -426,6 +460,7 @@ export VISION_REQUIRES_AUTH="true"
 - Kovi 管理员：`#帮助`，查看常用指令和权限说明；非管理员发送会保持静默
 - 私聊用户：`#删除我的数据`，再次发送 `#删除我的数据 确认` 后删除可直接归属到自己的数据
 - Kovi 管理员（群聊）：`#系统信息`、`#健康检查`、`#禁言` / `#结束禁言`
+- Kovi 管理员（私聊）：`#mind-status`，查看 Yunxi Mind 版本、状态计数和运行指标
 - Kovi 管理员也可以在对应会话中直接说“查看系统信息”“检查健康状态”“暂停本群回复”或“恢复本群回复”；原指令仍然兼容
 - Kovi 管理员（群聊）：`#删除本群数据`，再次发送 `#删除本群数据 确认` 后删除本群数据
 - Kovi 管理员：`#授权群 群号`、`#取消授权群 群号`、`#授权群列表`；可在私聊中管理群聊白名单，授权后立即生效
@@ -458,6 +493,8 @@ DATABASE_URL="postgresql://…" cargo test -p model --lib \
   memory::tests::normalized_postgres_storage_round_trips -- --ignored --exact
 DATABASE_URL="postgresql://…" cargo test -p model --lib \
   agent_tasks::tests::postgres_task_reservation_is_atomic_and_event_recording_is_idempotent -- --ignored --exact
+DATABASE_URL="postgresql://…" cargo test -p model --lib \
+  yunxi::mind_store::tests::postgres_mind_store_contracts_are_durable_bounded_and_atomic -- --ignored --exact
 REDIS_URL="redis://127.0.0.1:6379/15" cargo test -p model --lib \
   redis_store::tests::redis_runtime_store_round_trips -- --ignored --exact
 ```

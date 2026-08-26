@@ -79,6 +79,11 @@ pub struct ProactiveChatManager {
     yunxi_bridge: Option<Arc<ShadowBridge>>,
 }
 
+struct PlannedPrivateReachOut {
+    intent: ReachOutIntent,
+    mind_reference: Option<yunxi::MindProactiveReference>,
+}
+
 impl ProactiveChatManager {
     pub fn new(memory_manager: Arc<MemoryManager>, bot: Arc<RuntimeBot>) -> Self {
         Self::new_with_bridge(memory_manager, bot, None)
@@ -218,7 +223,10 @@ impl ProactiveChatManager {
         Ok(())
     }
 
-    async fn plan_private_reach_out(&self, user_id: i64) -> Result<Option<ProactiveOpportunity>> {
+    async fn plan_private_reach_out(
+        &self,
+        user_id: i64,
+    ) -> Result<Option<(ProactiveOpportunity, yunxi::MindProactiveSignals)>> {
         let Some(identity_store) = yunxi::identity_store() else {
             kovi::log::warn!("Yunxi proactive identity store is unavailable");
             return Ok(None);
@@ -245,25 +253,36 @@ impl ProactiveChatManager {
             .memory_manager
             .get_recent_memories_for_subject(user_id, Some("private"), 16)
             .await;
+        let mind_signals = yunxi::mind_proactive_signals(person_id).await;
         yunxi::proactive::project_private_opportunity(
             person_id,
             &profile,
             &personality,
             &memories,
+            mind_signals.salience,
             Local::now(),
             crate::model::utils::model_load_percent(),
         )
+        .map(|opportunity| opportunity.map(|opportunity| (opportunity, mind_signals)))
         .map_err(Into::into)
     }
 
-    async fn generate_private_reach_out(&self, user_id: i64) -> Result<Option<ReachOutIntent>> {
-        let Some(opportunity) = self.plan_private_reach_out(user_id).await? else {
+    async fn generate_private_reach_out(
+        &self,
+        user_id: i64,
+    ) -> Result<Option<PlannedPrivateReachOut>> {
+        let Some((opportunity, mind_signals)) = self.plan_private_reach_out(user_id).await? else {
             return Ok(None);
         };
         let motive = opportunity.motive();
         let Some(topic) = self
             .topic_generator
-            .generate_memory_based_topic_with_motive(None, Some(user_id), Some(motive))
+            .generate_memory_based_topic_with_motive_and_mind_topic(
+                None,
+                Some(user_id),
+                Some(motive),
+                mind_signals.topic.as_deref(),
+            )
             .await?
         else {
             return Ok(None);
@@ -272,7 +291,12 @@ impl ProactiveChatManager {
             return Ok(None);
         }
         ReachOutIntent::from_opportunity(opportunity, MessageContent::text(topic.content))
-            .map(Some)
+            .map(|intent| {
+                Some(PlannedPrivateReachOut {
+                    intent,
+                    mind_reference: mind_signals.reference,
+                })
+            })
             .map_err(Into::into)
     }
 
@@ -316,10 +340,10 @@ impl ProactiveChatManager {
             .record_proactive_event(Some(&decision_key), &[], Local::now())
             .await?;
 
-        let Some(intent) = self.generate_private_reach_out(main_admin).await? else {
+        let Some(planned) = self.generate_private_reach_out(main_admin).await? else {
             return Ok(false);
         };
-        let message = intent.message().as_text().to_string();
+        let message = planned.intent.message().as_text().to_string();
 
         // Model generation can take long enough for another event to invalidate
         // cooldown, daily-limit, or recent-interaction state.
@@ -328,7 +352,9 @@ impl ProactiveChatManager {
         {
             return Ok(false);
         }
-        let delivery = self.deliver_private_reach_out(main_admin, &intent).await;
+        let delivery = self
+            .deliver_private_reach_out(main_admin, &planned.intent)
+            .await;
         if !delivery.is_terminal_attempt() {
             return Ok(false);
         }
@@ -345,6 +371,9 @@ impl ProactiveChatManager {
             )
             .await?;
         if delivery.confirms_delivery() {
+            if let Some(reference) = planned.mind_reference {
+                yunxi::mark_mind_proactive_used(reference);
+            }
             self.memory_manager
                 .add_conversation_memory(
                     main_admin,
@@ -610,16 +639,18 @@ impl ProactiveChatManager {
             return Ok(false);
         }
 
-        let Some(intent) = self.generate_private_reach_out(user_id).await? else {
+        let Some(planned) = self.generate_private_reach_out(user_id).await? else {
             return Ok(false);
         };
-        let content = intent.message().as_text().to_string();
+        let content = planned.intent.message().as_text().to_string();
 
         if !self.can_send_regular_chat().await || !self.can_send_to_target("private", user_id).await
         {
             return Ok(false);
         }
-        let delivery = self.deliver_private_reach_out(user_id, &intent).await;
+        let delivery = self
+            .deliver_private_reach_out(user_id, &planned.intent)
+            .await;
         if !delivery.is_terminal_attempt() {
             return Ok(false);
         }
@@ -633,6 +664,9 @@ impl ProactiveChatManager {
             )
             .await?;
         if delivery.confirms_delivery() {
+            if let Some(reference) = planned.mind_reference {
+                yunxi::mark_mind_proactive_used(reference);
+            }
             self.memory_manager
                 .add_conversation_memory(
                     user_id,

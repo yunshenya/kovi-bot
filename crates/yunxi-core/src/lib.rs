@@ -13,6 +13,7 @@ pub mod goal;
 pub mod identity;
 pub mod intent;
 pub mod memory;
+pub mod mind;
 pub mod open_loop;
 pub mod planner;
 pub mod ports;
@@ -62,6 +63,7 @@ pub use memory::{
     MAX_MEMORY_TAG_BYTES, MAX_MEMORY_TAGS, Memory, MemoryDraft, MemoryKind, MemoryQuery,
     MemoryScope, MemoryValidationError,
 };
+pub use mind::*;
 pub use open_loop::{
     MAX_OPEN_LOOP_DEDUPE_KEY_BYTES, MAX_OPEN_LOOP_SALIENCE, MAX_OPEN_LOOP_SUMMARY_BYTES,
     MAX_OPEN_LOOP_SUMMARY_CHARS, OpenLoop, OpenLoopDraft, OpenLoopKind, OpenLoopOwner,

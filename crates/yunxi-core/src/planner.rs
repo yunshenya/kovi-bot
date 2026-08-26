@@ -11,6 +11,7 @@ use crate::goal::Goal;
 use crate::identity::{ConversationId, ConversationKind, OpenLoopId, PersonId};
 use crate::intent::{CognitiveIntent, IntentValidationError};
 use crate::memory::Memory;
+use crate::mind::{MindSnapshot, MindValidationError};
 use crate::open_loop::OpenLoop;
 use crate::working_state::ConversationSnapshot;
 use chrono::{DateTime, Utc};
@@ -527,6 +528,10 @@ pub struct PlannerInput {
     pub relation: Option<RelationState>,
     pub affect: AffectState,
     pub capabilities: Vec<ActionDescriptor>,
+    /// Bounded, replayable Mind v2 context. Older payloads and V1 hosts
+    /// deserialize to an empty snapshot and preserve their original behavior.
+    #[serde(default)]
+    pub mind: MindSnapshot,
 }
 
 impl PlannerInput {
@@ -541,6 +546,7 @@ impl PlannerInput {
             relation: None,
             affect: AffectState::default(),
             capabilities: Vec::new(),
+            mind: MindSnapshot::empty(),
         }
     }
 
@@ -580,6 +586,12 @@ impl PlannerInput {
         self
     }
 
+    #[must_use]
+    pub fn with_mind(mut self, mind: MindSnapshot) -> Self {
+        self.mind = mind;
+        self
+    }
+
     pub fn validate(&self, max_trace_depth: u8) -> Result<(), PlannerInputValidationError> {
         self.event
             .validate(max_trace_depth)
@@ -606,6 +618,7 @@ impl PlannerInput {
         if let Some(relation) = self.relation {
             relation.validate()?;
         }
+        self.mind.validate()?;
         Ok(())
     }
 
@@ -886,6 +899,8 @@ pub enum PlannerInputValidationError {
     NonFiniteRelation,
     #[error("relation value is outside its supported range")]
     RelationOutOfRange,
+    #[error("mind snapshot is invalid: {0}")]
+    InvalidMind(#[from] MindValidationError),
 }
 
 #[derive(Debug, Error)]
@@ -1377,8 +1392,17 @@ mod tests {
             .as_object_mut()
             .expect("planner input serializes as an object")
             .remove("goals");
+        encoded
+            .as_object_mut()
+            .expect("planner input serializes as an object")
+            .remove("mind");
         let legacy: PlannerInput =
             serde_json::from_value(encoded).expect("older planner input should remain readable");
         assert!(legacy.goals.is_empty());
+        assert!(legacy.mind.is_empty());
+        assert_eq!(
+            legacy.mind.influence_mode(),
+            crate::MindInfluenceMode::Disabled
+        );
     }
 }

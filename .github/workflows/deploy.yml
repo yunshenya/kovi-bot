@@ -24,7 +24,7 @@ env:
   # Keep the production group allowlist empty unless it is explicitly configured.
   KOVI_ALLOWED_GROUPS: ${{ vars.KOVI_ALLOWED_GROUPS || '' }}
   MODEL_API_URL: ${{ vars.MODEL_API_URL || 'https://codex666ai.com' }}
-  MODEL_NAME: ${{ vars.MODEL_NAME || 'gpt-5.5-openai-compact' }}
+  MODEL_NAME: ${{ vars.MODEL_NAME || 'gpt-5.5' }}
   MODEL_WIRE_API: ${{ vars.MODEL_WIRE_API || 'responses' }}
   MODEL_SUPPORTS_VISION: ${{ vars.MODEL_SUPPORTS_VISION || 'true' }}
   MODEL_API_KEY_ENV: ${{ vars.MODEL_API_KEY_ENV || 'OPENAI_API_KEY' }}
@@ -52,7 +52,7 @@ jobs:
       KOVI_MAIN_ADMIN: ${{ secrets.KOVI_MAIN_ADMIN || vars.KOVI_MAIN_ADMIN }}
       KOVI_ALLOWED_GROUPS: ${{ secrets.KOVI_ALLOWED_GROUPS || vars.KOVI_ALLOWED_GROUPS || '' }}
       MODEL_API_URL: ${{ secrets.MODEL_API_URL || vars.MODEL_API_URL || 'https://codex666ai.com' }}
-      MODEL_NAME: ${{ secrets.MODEL_NAME || vars.MODEL_NAME || 'gpt-5.5-openai-compact' }}
+      MODEL_NAME: ${{ secrets.MODEL_NAME || vars.MODEL_NAME || 'gpt-5.5' }}
       MODEL_WIRE_API: ${{ secrets.MODEL_WIRE_API || vars.MODEL_WIRE_API || 'responses' }}
       MODEL_SUPPORTS_VISION: ${{ secrets.MODEL_SUPPORTS_VISION || vars.MODEL_SUPPORTS_VISION || 'true' }}
       MODEL_API_KEY_ENV: ${{ secrets.MODEL_API_KEY_ENV || vars.MODEL_API_KEY_ENV || 'OPENAI_API_KEY' }}

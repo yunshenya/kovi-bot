@@ -219,6 +219,13 @@ pub(crate) async fn group_message_event_after_ingress(
         );
         return;
     }
+    if message.trim() == "#mind-status" {
+        println!(
+            "[INFO] 群聊 Mind 状态命令已忽略（仅限管理员私聊） (群组: {}, 用户: {})",
+            group_id, event.user_id
+        );
+        return;
+    }
     let stickers = extract_stickers(&event.message);
     let current_images = extract_image_attachments(&event.message);
     let vision_command = is_vision_command(message);
@@ -1001,6 +1008,28 @@ async fn delete_group_data(group_id: i64, bot: &RuntimeBot) {
             return;
         }
     };
+    let mind_conversation_ids = core_erasure.conversation_ids().to_vec();
+
+    // Preserve the canonical conversation mapping until Mind deletion has
+    // succeeded, otherwise a restart cannot reliably retry a failed erase.
+    let mind_erasure = match crate::yunxi::delete_mind_conversation_data(&mind_conversation_ids)
+        .await
+    {
+        Ok(erasure) => erasure,
+        Err(error) => {
+            eprintln!(
+                "[ERROR] 群 Mind 数据删除失败，保留入口屏障 (群组: {}): {}",
+                group_id, error
+            );
+            send_group_erasure_receipt(
+                bot,
+                group_id,
+                "群 Mind 数据删除未完成；为防止数据被重新写入，当前入口已保持关闭，请让管理员检查日志后重启并重试。",
+            )
+            .await;
+            return;
+        }
+    };
 
     let memory_result = MEMORY_MANAGER.delete_group_data(group_id).await;
     let sticker_result = sticker_memory::delete_group_data(group_id).await;
@@ -1008,6 +1037,11 @@ async fn delete_group_data(group_id: i64, bot: &RuntimeBot) {
     let agent_goal_result = crate::agent_runtime::delete_group_data(group_id).await;
     let core_result = crate::yunxi::delete_qq_group_domain_data(group_id).await;
     let barrier_result = core_erasure.finish().await;
+    if barrier_result.is_ok()
+        && let Some(mind_erasure) = mind_erasure
+    {
+        mind_erasure.finish().await;
+    }
     match (
         memory_result,
         sticker_result,

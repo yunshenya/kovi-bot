@@ -659,6 +659,16 @@ async fn main() {
                     Ok(_) => {}
                     Err(error) => eprintln!("[ERROR] 定期 Agent Run 清理失败: {}", error),
                 }
+                if let Some(store) = yunxi::mind_store() {
+                    match store.cleanup(chrono::Utc::now()).await {
+                        Ok(removed) if removed > 0 => {
+                            println!("[INFO] Yunxi Mind 过期状态清理完成，移除 {} 条", removed);
+                        }
+                        Ok(_) => {}
+                        Err(error) => eprintln!("[ERROR] Yunxi Mind 定期清理失败: {}", error),
+                    }
+                }
+                yunxi::observe_mind_maintenance_tick();
                 let interval = config::get().memory().maintenance_interval_secs();
                 kovi::tokio::time::sleep(kovi::tokio::time::Duration::from_secs(interval)).await;
             }

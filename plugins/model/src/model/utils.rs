@@ -180,7 +180,7 @@ pub(crate) fn is_help_command(message: &str) -> bool {
 }
 
 pub(crate) fn command_help() -> &'static str {
-    "管理员可用指令：\n聊天：直接发送消息，或 @芸汐。\n图片：#看图、#看截图、#识图。\n提醒：直接说“提醒我……”即可创建提醒。\n持续任务：主管理员可在私聊中直接要求定期监测公开 URL，并自然地查看或取消任务。\n管理员：#系统信息、#健康检查、#禁言、#结束禁言。\n表情：引用或附带表情后直接描述含义即可教学，也可使用 #教芸汐、#待确认表情、#确认表情 编号 含义、#驳回表情 编号、#忽略表情 编号。\n群授权：#授权群 群号、#取消授权群 群号、#授权群列表。\n主管理员：#授权管理员 QQ号、#取消授权管理员 QQ号、#授权管理员列表；私聊中可以直接让芸汐去已授权群发消息。\n跨群问答：#群问答、#群问答状态 任务编号、#取消群问答 任务编号。\n数据：私聊发送 #删除我的数据；群内发送 #删除本群数据。\n也可以直接说“查看系统信息”“检查健康状态”“暂停本群回复”或“恢复本群回复”。"
+    "管理员可用指令：\n聊天：直接发送消息，或 @芸汐。\n图片：#看图、#看截图、#识图。\n提醒：直接说“提醒我……”即可创建提醒。\n持续任务：主管理员可在私聊中直接要求定期监测公开 URL，并自然地查看或取消任务。\n管理员：#系统信息、#健康检查、#禁言、#结束禁言；私聊可用 #mind-status 查看 Mind 计数与运行指标。\n表情：引用或附带表情后直接描述含义即可教学，也可使用 #教芸汐、#待确认表情、#确认表情 编号 含义、#驳回表情 编号、#忽略表情 编号。\n群授权：#授权群 群号、#取消授权群 群号、#授权群列表。\n主管理员：#授权管理员 QQ号、#取消授权管理员 QQ号、#授权管理员列表；私聊中可以直接让芸汐去已授权群发消息。\n跨群问答：#群问答、#群问答状态 任务编号、#取消群问答 任务编号。\n数据：私聊发送 #删除我的数据；群内发送 #删除本群数据。\n也可以直接说“查看系统信息”“检查健康状态”“暂停本群回复”或“恢复本群回复”。"
 }
 
 pub(crate) fn is_restricted_command(message: &str) -> bool {
@@ -189,6 +189,7 @@ pub(crate) fn is_restricted_command(message: &str) -> bool {
         || group_access::is_authorization_command(text)
         || is_group_admin_command(text)
         || is_agent_task_command(text)
+        || text == "#mind-status"
         || text.starts_with("#教芸汐")
         || text.starts_with("#教云汐")
         || text == "#待确认表情"
@@ -2836,6 +2837,7 @@ mod tests {
         assert!(is_restricted_command("#教芸汐 这个表情是开心"));
         assert!(is_restricted_command("#教云汐"));
         assert!(is_restricted_command("#看图：这个报错是什么意思"));
+        assert!(is_restricted_command(" #mind-status "));
         assert!(is_group_admin_command(" #健康检查 "));
         assert!(!is_restricted_command("请看看截图"));
         assert!(!is_restricted_command("芸汐，今天开心吗"));

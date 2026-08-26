@@ -4,6 +4,9 @@ use crate::event::{EventPriority, EventScope, EventType, EventValidationError, W
 use crate::goal::GoalOwner;
 use crate::identity::{ConversationId, EventId, PersonId};
 use crate::memory::{MemoryQuery, MemoryScope};
+use crate::mind::{
+    MindInfluenceMode, MindSnapshotLimits, MindSnapshotProvider, MindSnapshotRequest,
+};
 use crate::open_loop::OpenLoopOwner;
 use crate::planner::{
     DecisionPlan, MAX_PLANNER_GOALS, Planner, PlannerError, PlannerInput,
@@ -18,10 +21,12 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
+use tokio::time::timeout;
 
 const MAX_EVENT_QUEUE_CAPACITY: usize = 4_096;
 const MAX_GOALS_PER_CONTEXT_OWNER: usize = 32;
 const MAX_PENDING_TOOL_FOLLOW_UPS: usize = 128;
+const DEFAULT_MIND_SNAPSHOT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(75);
 pub const MAX_DATA_ERASURE_CONVERSATIONS: usize = 256;
 pub const MAX_BLOCKED_DATA_ERASURE_PEOPLE: usize = 256;
 pub const MAX_BLOCKED_DATA_ERASURE_CONVERSATIONS: usize = 4_096;
@@ -361,6 +366,26 @@ pub struct CognitiveRuntime {
     max_trace_depth: u8,
     planner: Option<Planner>,
     services: Option<Arc<CoreServices>>,
+    mind: Option<InstalledMindProvider>,
+}
+
+#[derive(Clone)]
+struct InstalledMindProvider {
+    provider: Arc<dyn MindSnapshotProvider>,
+    limits: MindSnapshotLimits,
+    influence_mode: MindInfluenceMode,
+    timeout: std::time::Duration,
+}
+
+impl std::fmt::Debug for InstalledMindProvider {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("InstalledMindProvider")
+            .field("limits", &self.limits)
+            .field("influence_mode", &self.influence_mode)
+            .field("timeout", &self.timeout)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Default)]
@@ -502,6 +527,7 @@ impl CognitiveRuntime {
                 max_trace_depth: config.max_trace_depth,
                 planner: None,
                 services: None,
+                mind: None,
             },
         ))
     }
@@ -531,6 +557,56 @@ impl CognitiveRuntime {
             Planner::new(services.model.clone()).with_max_trace_depth(self.max_trace_depth);
         self.planner = Some(planner);
         self.services = Some(Arc::new(services));
+    }
+
+    /// Installs the optional Mind v2 retrieval boundary. Retrieval is
+    /// fail-soft and starts in shadow mode so V1-visible behavior is unchanged.
+    #[must_use]
+    pub fn with_mind_snapshot_provider(mut self, provider: Arc<dyn MindSnapshotProvider>) -> Self {
+        self.install_mind_snapshot_provider(provider);
+        self
+    }
+
+    pub fn install_mind_snapshot_provider(&mut self, provider: Arc<dyn MindSnapshotProvider>) {
+        self.mind = Some(InstalledMindProvider {
+            provider,
+            limits: MindSnapshotLimits::default(),
+            influence_mode: MindInfluenceMode::Shadow,
+            timeout: DEFAULT_MIND_SNAPSHOT_TIMEOUT,
+        });
+    }
+
+    /// Configures whether retrieved Mind state is disabled, shadow-only, or
+    /// active. This has no effect until a provider is installed.
+    #[must_use]
+    pub fn with_mind_influence_mode(mut self, mode: MindInfluenceMode) -> Self {
+        if let Some(mind) = self.mind.as_mut() {
+            mind.influence_mode = mode;
+        }
+        self
+    }
+
+    pub fn set_mind_influence_mode(&mut self, mode: MindInfluenceMode) {
+        if let Some(mind) = self.mind.as_mut() {
+            mind.influence_mode = mode;
+        }
+    }
+
+    pub fn set_mind_snapshot_limits(
+        &mut self,
+        limits: MindSnapshotLimits,
+    ) -> Result<(), crate::MindValidationError> {
+        limits.validate()?;
+        if let Some(mind) = self.mind.as_mut() {
+            mind.limits = limits;
+        }
+        Ok(())
+    }
+
+    pub fn set_mind_snapshot_timeout(&mut self, timeout: std::time::Duration) {
+        if let Some(mind) = self.mind.as_mut() {
+            mind.timeout = timeout.max(std::time::Duration::from_millis(1));
+        }
     }
 
     #[must_use]
@@ -870,11 +946,13 @@ impl CognitiveRuntime {
     /// intentionally non-fatal during migration: a host can bring the new
     /// runtime online before every legacy store has been moved.
     pub async fn planner_input_with_context(&self, event: WorldEvent) -> PlannerInput {
-        let Some(services) = self.services.as_ref() else {
-            return self.planner_input(event);
-        };
-
         let mut input = self.planner_input(event.clone());
+        let mind = self.retrieve_mind_snapshot(&input).await;
+        input = input.with_mind(mind);
+
+        let Some(services) = self.services.as_ref() else {
+            return input;
+        };
         let conversation_id = event.scope().conversation_id();
         let person_id = event_person_id(&event).or_else(|| match event.scope() {
             EventScope::Person { person_id } => Some(person_id),
@@ -952,6 +1030,29 @@ impl CognitiveRuntime {
             }
         }
         input
+    }
+
+    async fn retrieve_mind_snapshot(&self, input: &PlannerInput) -> crate::MindSnapshot {
+        let Some(mind) = self.mind.as_ref() else {
+            return crate::MindSnapshot::empty();
+        };
+        if mind.influence_mode == MindInfluenceMode::Disabled {
+            return crate::MindSnapshot::empty();
+        }
+        let topic = input
+            .state
+            .conversation
+            .as_ref()
+            .and_then(|conversation| conversation.current_topic.as_deref());
+        let Ok(request) =
+            MindSnapshotRequest::for_event(&input.event, topic, mind.limits, mind.influence_mode)
+        else {
+            return crate::MindSnapshot::empty();
+        };
+        match timeout(mind.timeout, mind.provider.snapshot(&request)).await {
+            Ok(Ok(snapshot)) => snapshot,
+            Ok(Err(_)) | Err(_) => crate::MindSnapshot::empty(),
+        }
     }
 
     async fn apply_state_updates(
@@ -1698,6 +1799,10 @@ mod tests {
         ConversationId, ConversationKind, EventId, GoalId, MessageId, OpenLoopId, PersonId,
     };
     use crate::memory::{Memory, MemoryDraft, MemoryKind, MemoryQuery, MemoryScope};
+    use crate::mind::{
+        MindInfluenceMode, MindSnapshot, MindSnapshotFuture, MindSnapshotProvider,
+        MindSnapshotRequest, SelfModel, SelfModelSnapshot,
+    };
     use crate::open_loop::{OpenLoop, OpenLoopDraft, OpenLoopKind, OpenLoopOwner, OpenLoopStatus};
     use crate::planner::{
         AffectState, DecisionDisposition, DecisionPlan, InteractionCues, ModelBackend,
@@ -1711,6 +1816,28 @@ mod tests {
     use chrono::Utc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+
+    struct StaticMindProvider {
+        snapshot: MindSnapshot,
+    }
+
+    impl MindSnapshotProvider for StaticMindProvider {
+        fn snapshot<'a>(&'a self, _request: &'a MindSnapshotRequest) -> MindSnapshotFuture<'a> {
+            let snapshot = self.snapshot.clone();
+            Box::pin(async move { Ok(snapshot) })
+        }
+    }
+
+    struct SlowMindProvider;
+
+    impl MindSnapshotProvider for SlowMindProvider {
+        fn snapshot<'a>(&'a self, _request: &'a MindSnapshotRequest) -> MindSnapshotFuture<'a> {
+            Box::pin(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                Ok(MindSnapshot::empty())
+            })
+        }
+    }
 
     fn event(priority: EventPriority) -> WorldEvent {
         WorldEvent::new(
@@ -4791,6 +4918,68 @@ mod tests {
                 error: crate::working_state::WorkingStateError::ConversationKindMismatch,
             }) if event.id() == event_id
         ));
+    }
+
+    #[tokio::test]
+    async fn optional_mind_provider_hydrates_replayable_planner_input() {
+        let timestamp = Utc::now();
+        let self_model = SelfModel::seed_yunxi(timestamp);
+        let snapshot = MindSnapshot::new(
+            Some(SelfModelSnapshot::from_model(&self_model).expect("self snapshot")),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            MindInfluenceMode::Shadow,
+            7,
+            timestamp,
+        )
+        .expect("valid mind snapshot");
+        let (_, runtime) = CognitiveRuntime::new(RuntimeConfig::default()).expect("runtime");
+        let runtime =
+            runtime.with_mind_snapshot_provider(Arc::new(StaticMindProvider { snapshot }));
+        let input = runtime
+            .planner_input_with_context(direct_message(ConversationId::new(), PersonId::new()))
+            .await;
+
+        assert_eq!(input.mind.version(), 7);
+        assert_eq!(input.mind.influence_mode(), MindInfluenceMode::Shadow);
+        assert_eq!(
+            input
+                .mind
+                .self_model()
+                .expect("self model")
+                .identity()
+                .name(),
+            "芸汐"
+        );
+    }
+
+    #[tokio::test]
+    async fn mind_timeout_fails_soft_to_v1_empty_snapshot() {
+        let (_, mut runtime) = CognitiveRuntime::new(RuntimeConfig::default()).expect("runtime");
+        runtime.install_mind_snapshot_provider(Arc::new(SlowMindProvider));
+        runtime.set_mind_snapshot_timeout(std::time::Duration::from_millis(1));
+        let started = std::time::Instant::now();
+        let input = runtime
+            .planner_input_with_context(direct_message(ConversationId::new(), PersonId::new()))
+            .await;
+
+        assert!(input.mind.is_empty());
+        assert!(started.elapsed() < std::time::Duration::from_millis(25));
+    }
+
+    #[tokio::test]
+    async fn runtime_without_mind_provider_preserves_v1_empty_snapshot() {
+        let (_, runtime) = CognitiveRuntime::new(RuntimeConfig::default()).expect("runtime");
+        let input = runtime
+            .planner_input_with_context(direct_message(ConversationId::new(), PersonId::new()))
+            .await;
+
+        assert!(input.mind.is_empty());
+        assert_eq!(input.mind.influence_mode(), MindInfluenceMode::Disabled);
     }
 
     #[test]

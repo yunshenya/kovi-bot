@@ -19,10 +19,12 @@ pub(crate) fn project_private_opportunity(
     profile: &UserProfile,
     personality: &BotPersonality,
     memories: &[MemoryEntry],
+    mind_salience: u8,
     now: DateTime<Local>,
     system_load: u8,
 ) -> Result<Option<ProactiveOpportunity>, ProactiveValidationError> {
-    let signals = project_signals(memories, now);
+    let mut signals = project_signals(memories, now);
+    signals.memory_salience = signals.memory_salience.max(mind_salience);
     let idle_hours = profile
         .last_private_interaction
         .map(|last| now.signed_duration_since(last).num_hours().max(0))
@@ -143,6 +145,7 @@ mod tests {
             &profile(now),
             &personality(),
             &[memory(now, "这两天工作太累了，有点忙不过来", 5)],
+            0,
             now,
             0,
         )
@@ -160,11 +163,27 @@ mod tests {
                 &profile(now),
                 &personality(),
                 &[],
+                0,
                 now,
                 0,
             )
             .expect("valid projection")
             .is_none()
         );
+    }
+
+    #[test]
+    fn active_mind_salience_can_ground_a_candidate_while_shadow_cannot() {
+        let now = Local::now();
+        let person_id = PersonId::new();
+        let shadow =
+            project_private_opportunity(person_id, &profile(now), &personality(), &[], 0, now, 0)
+                .expect("valid shadow projection");
+        let active =
+            project_private_opportunity(person_id, &profile(now), &personality(), &[], 80, now, 0)
+                .expect("valid active projection");
+
+        assert!(shadow.is_none());
+        assert!(active.is_some());
     }
 }

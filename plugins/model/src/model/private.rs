@@ -133,6 +133,16 @@ pub(crate) async fn private_message_event_after_ingress(
         send_sys_info_private(Arc::clone(&bot), user_id).await;
         return;
     }
+    if message.trim() == "#mind-status" && sender_is_admin {
+        let report = crate::yunxi::mind_status_report()
+            .await
+            .unwrap_or_else(|error| {
+                eprintln!("[ERROR] 读取 Yunxi Mind 状态失败: {}", error);
+                "暂时读取不到 Yunxi Mind 状态，请稍后再试。".to_string()
+            });
+        send_tracked_private_message(&bot, user_id, report).await;
+        return;
+    }
     if is_group_admin_command(message) {
         println!(
             "[INFO] 私聊群聊专用命令已忽略 (用户: {}, 命令: {})",
@@ -732,9 +742,36 @@ async fn delete_private_user_data(user_id: i64, self_id: i64, bot: &RuntimeBot) 
         }
     };
     let qq_user_ids = erasure.qq_user_ids().to_vec();
+    let canonical_person_id = erasure.canonical_person_id();
+    let direct_conversation_ids = erasure.direct_conversation_ids().to_vec();
     for alias_user_id in &qq_user_ids {
         clear_private_erasure_runtime_state(*alias_user_id).await;
     }
+
+    // Mind owns the canonical IDs that the Core identity deletion removes.
+    // Delete it first so a failed attempt can be retried after restart without
+    // losing the only authoritative scope mapping.
+    let mind_erasure = match crate::yunxi::delete_mind_person_domain_data(
+        canonical_person_id,
+        &direct_conversation_ids,
+    )
+    .await
+    {
+        Ok(erasure) => erasure,
+        Err(error) => {
+            eprintln!(
+                "[ERROR] Mind 数据删除失败，保留入口屏障 (用户: {}): {}",
+                user_id, error
+            );
+            send_erasure_receipt(
+                bot,
+                user_id,
+                "Mind 数据删除未完成；为防止数据被重新写入，当前入口已保持关闭，请联系管理员检查日志后重启并重试。",
+            )
+            .await;
+            return;
+        }
+    };
 
     let mut memory_rows = 0_u64;
     let mut sticker_rows = 0_u64;
@@ -778,8 +815,15 @@ async fn delete_private_user_data(user_id: i64, self_id: i64, bot: &RuntimeBot) 
             0
         }
     };
-    if let Err(error) = erasure.finish().await {
-        failures.push(format!("core-barrier-resume: {error}"));
+    match erasure.finish().await {
+        Ok(()) => {
+            if let Some(mind_erasure) = mind_erasure {
+                mind_erasure.finish().await;
+            }
+        }
+        Err(error) => {
+            failures.push(format!("core-barrier-resume: {error}"));
+        }
     }
 
     if failures.is_empty() {

@@ -84,6 +84,39 @@ autonomous_query_max_rounds = 2
 autonomous_query_max_results = 8
 autonomous_query_max_days = 3650
 
+[mind]
+enabled = true
+belief_enabled = true
+preference_enabled = true
+interest_enabled = true
+curiosity_enabled = true
+agenda_enabled = true
+reflection_enabled = true
+mind_planner_enabled = true
+# disabled / shadow / active。首次上线保持 shadow，确认指标后再切 active。
+influence_mode = "shadow"
+snapshot_timeout_ms = 75
+# 新消息进入 Core 前的 Mind 确定性更新预算；超时会 fail-soft，不阻塞回复。
+event_update_timeout_ms = 40
+max_relevant_beliefs = 8
+max_relevant_preferences = 8
+max_relevant_interests = 8
+max_open_questions = 6
+max_agenda_items = 8
+max_learned_beliefs_per_scope = 64
+max_preferences = 32
+max_interests = 32
+max_open_questions_per_scope = 8
+max_curiosity_per_person = 8
+max_global_agenda = 24
+max_agenda_per_person = 12
+max_agenda_per_conversation = 12
+agenda_half_life_hours = 24
+question_cooldown_minutes = 120
+conversation_end_idle_minutes = 10
+reflection_min_interval_minutes = 60
+reflection_max_events = 32
+
 [message_batch]
 enabled = true
 complete_delay_ms = 900

@@ -588,6 +588,10 @@ impl QqActionAdapter {
                 });
             }
         };
+        // Mind proposals are tied to the same outgoing action key. Releasing
+        // them only after the serialized commit prevents a superseded reply
+        // from writing state inferred by a turn that never won the race.
+        crate::yunxi::commit_mind_candidates(idempotency_key);
         let durable_commit = self
             .delivery_ledger
             .commit_attempt(idempotency_key, &durable_attempt)

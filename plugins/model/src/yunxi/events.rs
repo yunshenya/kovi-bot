@@ -87,6 +87,18 @@ async fn project_interaction_cues_inner(
         .resolve_external_identity(&external)
         .await
         .map_err(|error| error.to_string())?;
+    if let Some(mind) = super::mind_runtime() {
+        let wait = Duration::from_millis(mind.config().event_update_timeout_ms());
+        match timeout(wait, mind.observe_interaction_cues(person_id, cues)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                kovi::log::warn!("Yunxi Mind interaction-cue update failed soft: {error}");
+            }
+            Err(_) => {
+                kovi::log::warn!("Yunxi Mind interaction-cue update timed out and failed soft");
+            }
+        }
+    }
     let observed =
         InteractionCuesObservedEvent::new(person_id, cues).map_err(|error| error.to_string())?;
     bridge

@@ -29,6 +29,7 @@ mod group_interjection;
 mod identity;
 mod memory;
 mod message_batch;
+mod mind;
 mod mood;
 mod proactive;
 mod prompt;
@@ -42,6 +43,7 @@ mod vision;
 pub use agent_runs::AgentRunConfig;
 pub use agent_tasks::AgentTaskConfig;
 pub use identity::IdentityConfig;
+pub use mind::MindConfig;
 pub use reminders::ReminderConfig;
 pub use tools::{McpServerConfig, ToolsConfig};
 pub use vision::VisionConfig;
@@ -74,6 +76,8 @@ pub struct ModelConfig {
     group_interjection: GroupInterjectionConfig,
     /// 长期记忆与短期上下文配置
     memory: MemoryConfig,
+    /// Persistent Mind v2 state and gradual behavior activation.
+    mind: MindConfig,
     /// 连续消息气泡的本地合并配置
     message_batch: MessageBatchConfig,
     /// 情绪缓存与自然漂移配置
@@ -127,6 +131,7 @@ impl ModelConfig {
         self.proactive.validate()?;
         self.group_interjection.validate()?;
         self.memory.validate()?;
+        self.mind.validate()?;
         self.message_batch.validate()?;
         self.mood.validate()?;
         self.topic.validate()?;
@@ -179,6 +184,10 @@ impl ModelConfig {
 
     pub fn memory(&self) -> &MemoryConfig {
         &self.memory
+    }
+
+    pub fn mind(&self) -> &MindConfig {
+        &self.mind
     }
 
     pub fn message_batch(&self) -> &MessageBatchConfig {

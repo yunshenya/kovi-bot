@@ -8,6 +8,8 @@ mod goal_store;
 mod identity_store;
 pub(crate) mod memory_migration;
 mod memory_store;
+mod mind_runtime;
+mod mind_store;
 mod open_loop_scheduler;
 mod open_loop_store;
 mod owner_lock;
@@ -23,10 +25,17 @@ use goal_store::PostgresGoalStore;
 use identity_store::PostgresIdentityStore;
 use kovi::tokio::sync::{RwLock as AsyncRwLock, RwLockReadGuard};
 use memory_store::PostgresMemoryStore;
+use mind_runtime::{MindCandidateContext, MindCandidates, MindErasureGuard, MindRuntime};
+pub(crate) use mind_runtime::{MindProactiveReference, MindProactiveSignals};
+use mind_store::PostgresMindStore;
 use open_loop_store::PostgresOpenLoopStore;
 use relation_store::PostgresRelationStore;
 use std::sync::{Arc, OnceLock, RwLock};
-use yunxi_core::{AffectState, IdentityStore, RelationState};
+use yunxi_core::{
+    AffectState, ConversationId, IdentityStore, MindDataErasure, PersonId, RelationState,
+};
+
+const MIND_ERASURE_MAX_ATTEMPTS: usize = 3;
 
 static IDENTITY_STORE: OnceLock<Arc<PostgresIdentityStore>> = OnceLock::new();
 static OPEN_LOOP_STORE: OnceLock<Arc<PostgresOpenLoopStore>> = OnceLock::new();
@@ -35,6 +44,8 @@ static AFFECT_STORE: OnceLock<Arc<PostgresAffectStore>> = OnceLock::new();
 static RELATION_STORE: OnceLock<Arc<PostgresRelationStore>> = OnceLock::new();
 static GOAL_STORE: OnceLock<Arc<PostgresGoalStore>> = OnceLock::new();
 static DELIVERY_LEDGER: OnceLock<Arc<PostgresDeliveryLedger>> = OnceLock::new();
+static MIND_STORE: OnceLock<Arc<PostgresMindStore>> = OnceLock::new();
+static MIND_RUNTIME: OnceLock<Arc<MindRuntime>> = OnceLock::new();
 static SHADOW_BRIDGE: OnceLock<Arc<bridge::ShadowBridge>> = OnceLock::new();
 static DELIVERY_ROUTE_LOCK: AsyncRwLock<()> = AsyncRwLock::const_new(());
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,6 +80,8 @@ pub(crate) async fn initialize_database() -> Result<()> {
         && RELATION_STORE.get().is_some()
         && GOAL_STORE.get().is_some()
         && DELIVERY_LEDGER.get().is_some()
+        && MIND_STORE.get().is_some()
+        && MIND_RUNTIME.get().is_some()
     {
         return Ok(());
     }
@@ -117,9 +130,26 @@ pub(crate) async fn initialize_database() -> Result<()> {
         let _ = RELATION_STORE.set(store);
     }
     if GOAL_STORE.get().is_none() {
-        let store = Arc::new(PostgresGoalStore::new(pool));
+        let store = Arc::new(PostgresGoalStore::new(pool.clone()));
         store.initialize_schema().await?;
         let _ = GOAL_STORE.set(store);
+    }
+    if MIND_STORE.get().is_none() {
+        let store = Arc::new(PostgresMindStore::new(pool));
+        store.initialize_schema().await?;
+        store.seed_self_model_if_absent().await?;
+        let _ = MIND_STORE.set(store);
+    }
+    if MIND_RUNTIME.get().is_none() {
+        let store = MIND_STORE
+            .get()
+            .cloned()
+            .context("Yunxi Mind store 尚未初始化")?;
+        let runtime = Arc::new(MindRuntime::new(
+            store.services(),
+            crate::config::get().mind().clone(),
+        )?);
+        let _ = MIND_RUNTIME.set(runtime);
     }
     Ok(())
 }
@@ -279,6 +309,91 @@ pub(crate) fn delivery_ledger() -> Option<Arc<PostgresDeliveryLedger>> {
     DELIVERY_LEDGER.get().cloned()
 }
 
+pub(crate) fn mind_store() -> Option<Arc<PostgresMindStore>> {
+    MIND_STORE.get().cloned()
+}
+
+pub(crate) fn mind_runtime() -> Option<Arc<MindRuntime>> {
+    MIND_RUNTIME.get().cloned()
+}
+
+pub(crate) fn register_mind_candidates(
+    idempotency_key: String,
+    context: MindCandidateContext,
+    candidates: MindCandidates,
+) -> bool {
+    MIND_RUNTIME
+        .get()
+        .is_some_and(|runtime| runtime.register_candidates(idempotency_key, context, candidates))
+}
+
+pub(crate) fn commit_mind_candidates(idempotency_key: &str) {
+    if let Some(runtime) = MIND_RUNTIME.get() {
+        runtime.commit_candidates(idempotency_key);
+    }
+}
+
+pub(crate) async fn mind_proactive_signals(person_id: PersonId) -> MindProactiveSignals {
+    let Some(runtime) = MIND_RUNTIME.get() else {
+        return MindProactiveSignals::default();
+    };
+    runtime
+        .proactive_signals(person_id)
+        .await
+        .unwrap_or_else(|error| {
+            kovi::log::warn!("Yunxi Mind proactive retrieval failed: {error}");
+            MindProactiveSignals::default()
+        })
+}
+
+pub(crate) fn mark_mind_proactive_used(reference: MindProactiveReference) {
+    if let Some(runtime) = MIND_RUNTIME.get() {
+        runtime.mark_proactive_used(reference);
+    }
+}
+
+pub(crate) fn observe_mind_maintenance_tick() {
+    if let Some(bridge) = SHADOW_BRIDGE.get() {
+        bridge.observe_maintenance_tick();
+    }
+}
+
+pub(crate) async fn mind_status_report() -> Result<String> {
+    let store = MIND_STORE.get().context("Yunxi Mind store 尚未初始化")?;
+    let runtime = MIND_RUNTIME
+        .get()
+        .context("Yunxi Mind runtime 尚未初始化")?;
+    let stored = store.status().await.map_err(anyhow::Error::from)?;
+    let metrics = runtime.metrics();
+    let last_reflection =
+        chrono::DateTime::<chrono::Utc>::from_timestamp_millis(metrics.last_reflection_unix_ms)
+            .map_or_else(|| "尚未执行".to_string(), |at| at.to_rfc3339());
+    Ok(format!(
+        "Yunxi Mind 状态\n模式：{:?}\n版本：{}\n持久状态：belief {}，preference {}，interest {}，open question {}，active agenda {}\n候选：registered {}，applied {}，rejected {}\n反思：total {}，failed {}，last {}，额外模型调用 0\n更新：belief {}，preference {}，interest {}，agenda {}\n运行：events {}，proactive uses {}，erasures {}，blocked snapshots {}",
+        runtime.config().influence_mode(),
+        stored.version,
+        stored.beliefs,
+        stored.preferences,
+        stored.interests,
+        stored.open_questions,
+        stored.active_agenda,
+        metrics.candidates_registered,
+        metrics.candidates_applied,
+        metrics.candidates_rejected,
+        metrics.reflections,
+        metrics.reflection_failures,
+        last_reflection,
+        metrics.belief_updates,
+        metrics.preference_updates,
+        metrics.interest_updates,
+        metrics.agenda_updates,
+        metrics.events_observed,
+        metrics.proactive_uses,
+        metrics.erasures,
+        metrics.blocked_snapshots,
+    ))
+}
+
 /// Bootstrap canonical state from the legacy per-user profile. Existing rows
 /// are Core-owned and must never be replaced by a later legacy projection;
 /// both inserts therefore use an atomic `ON CONFLICT DO NOTHING` boundary.
@@ -360,6 +475,75 @@ pub(crate) async fn begin_qq_user_data_erasure(user_id: i64) -> Result<bridge::U
 pub(crate) async fn begin_qq_group_data_erasure(group_id: i64) -> Result<bridge::GroupDataErasure> {
     let bridge = SHADOW_BRIDGE.get().context("Yunxi ShadowBridge 尚未安装")?;
     bridge.begin_group_data_erasure(group_id).await
+}
+
+pub(crate) async fn delete_mind_person_domain_data(
+    person_id: Option<PersonId>,
+    conversation_ids: &[ConversationId],
+) -> Result<Option<MindErasureGuard>> {
+    let store = MIND_STORE
+        .get()
+        .context("Yunxi Mind store 尚未初始化，删除屏障保持关闭")?;
+    let runtime = MIND_RUNTIME
+        .get()
+        .context("Yunxi Mind runtime 尚未初始化，删除屏障保持关闭")?;
+    let erasure = runtime.begin_erasure(person_id, conversation_ids).await;
+    retry_mind_erasure(|| async {
+        if let Some(person_id) = person_id {
+            MindDataErasure::erase_person(store.as_ref(), person_id).await?;
+        }
+        for conversation_id in conversation_ids {
+            MindDataErasure::erase_conversation(store.as_ref(), *conversation_id).await?;
+        }
+        Ok(())
+    })
+    .await?;
+    Ok(Some(erasure))
+}
+
+pub(crate) async fn delete_mind_conversation_data(
+    conversation_ids: &[ConversationId],
+) -> Result<Option<MindErasureGuard>> {
+    let store = MIND_STORE
+        .get()
+        .context("Yunxi Mind store 尚未初始化，删除屏障保持关闭")?;
+    let runtime = MIND_RUNTIME
+        .get()
+        .context("Yunxi Mind runtime 尚未初始化，删除屏障保持关闭")?;
+    let erasure = runtime.begin_erasure(None, conversation_ids).await;
+    retry_mind_erasure(|| async {
+        for conversation_id in conversation_ids {
+            MindDataErasure::erase_conversation(store.as_ref(), *conversation_id).await?;
+        }
+        Ok(())
+    })
+    .await?;
+    Ok(Some(erasure))
+}
+
+async fn retry_mind_erasure<F, Fut>(mut operation: F) -> Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<(), yunxi_core::MindDataErasureError>>,
+{
+    let mut last_error = None;
+    for attempt in 1..=MIND_ERASURE_MAX_ATTEMPTS {
+        match operation().await {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                last_error = Some(error);
+                if attempt < MIND_ERASURE_MAX_ATTEMPTS {
+                    kovi::tokio::time::sleep(std::time::Duration::from_millis(
+                        100 * attempt as u64,
+                    ))
+                    .await;
+                }
+            }
+        }
+    }
+    Err(anyhow::Error::new(last_error.expect(
+        "Mind erasure loop always records a failed attempt",
+    )))
 }
 
 /// Remove the canonical Core person and all QQ direct conversations belonging

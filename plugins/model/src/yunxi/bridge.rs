@@ -94,6 +94,7 @@ struct DataErasureAck {
     canonical_person_id: Option<yunxi_core::PersonId>,
     runtime_barrier_person_id: yunxi_core::PersonId,
     blocked_user_ids: Vec<i64>,
+    direct_conversation_ids: Vec<ConversationId>,
     purged_conversations: usize,
     cleared_references: usize,
     cleared_person_routes: usize,
@@ -120,6 +121,10 @@ pub(crate) struct GroupDataErasure {
 }
 
 impl GroupDataErasure {
+    pub(crate) fn conversation_ids(&self) -> &[ConversationId] {
+        &self.conversation_ids
+    }
+
     pub(crate) async fn finish(mut self) -> anyhow::Result<()> {
         self.bridge
             .end_group_data_erasure(self.group_id, self.conversation_ids.clone())
@@ -158,6 +163,14 @@ pub(crate) struct UserDataErasure {
 impl UserDataErasure {
     pub(crate) fn qq_user_ids(&self) -> &[i64] {
         &self.blocked_user_ids
+    }
+
+    pub(crate) const fn canonical_person_id(&self) -> Option<yunxi_core::PersonId> {
+        self.ack.canonical_person_id
+    }
+
+    pub(crate) fn direct_conversation_ids(&self) -> &[ConversationId] {
+        &self.ack.direct_conversation_ids
     }
 
     pub(crate) async fn finish(mut self) -> anyhow::Result<()> {
@@ -461,7 +474,7 @@ impl ShadowBridge {
             Arc::new(PrivateHandlerGateRegistry::new(MAX_PRIVATE_HANDLER_GATES));
         let group_handler_gates =
             Arc::new(PrivateHandlerGateRegistry::new(MAX_PRIVATE_HANDLER_GATES));
-        let (runtime_handle, runtime) = services.map_or_else(
+        let (runtime_handle, mut runtime) = services.map_or_else(
             || {
                 CognitiveRuntime::new(RuntimeConfig::default())
                     .expect("default Yunxi runtime configuration must be valid")
@@ -471,6 +484,19 @@ impl ShadowBridge {
                     .expect("default Yunxi runtime configuration must be valid")
             },
         );
+        let mind_config = crate::config::get().mind().clone();
+        if mind_config.mind_planner_enabled()
+            && let Some(provider) = super::mind_runtime()
+        {
+            runtime.install_mind_snapshot_provider(provider);
+            runtime.set_mind_influence_mode(mind_config.influence_mode());
+            runtime
+                .set_mind_snapshot_limits(mind_config.snapshot_limits())
+                .expect("validated Mind snapshot limits");
+            runtime.set_mind_snapshot_timeout(std::time::Duration::from_millis(
+                mind_config.snapshot_timeout_ms(),
+            ));
+        }
 
         let (action_arbiter, action_port): (
             Option<Arc<ActionArbiter>>,
@@ -982,7 +1008,28 @@ impl ShadowBridge {
     pub(crate) fn observe_idle_tick(&self) {
         let runtime = self.runtime.clone();
         kovi::tokio::spawn(async move {
+            if let Some(mind) = super::mind_runtime() {
+                mind.trigger_reflection(yunxi_core::ReflectionTrigger::Idle)
+                    .await;
+            }
             let event = idle_tick_event(Utc::now());
+            let _ = runtime.submit(event).await;
+        });
+    }
+
+    pub(crate) fn observe_maintenance_tick(&self) {
+        let runtime = self.runtime.clone();
+        kovi::tokio::spawn(async move {
+            if let Some(mind) = super::mind_runtime() {
+                mind.trigger_reflection(yunxi_core::ReflectionTrigger::Maintenance)
+                    .await;
+            }
+            let event = WorldEvent::new(
+                Utc::now(),
+                EventScope::Global,
+                EventPriority::Low,
+                WorldEventKind::MaintenanceTick,
+            );
             let _ = runtime.submit(event).await;
         });
     }
@@ -1725,6 +1772,7 @@ async fn begin_data_erasure_at_ingress_barrier(
         canonical_person_id: targets.canonical_person_id,
         runtime_barrier_person_id: targets.runtime_barrier_person_id,
         blocked_user_ids: targets.blocked_user_ids,
+        direct_conversation_ids: targets.direct_conversation_ids,
         purged_conversations,
         cleared_references,
         cleared_person_routes,
@@ -2292,6 +2340,14 @@ async fn resolve_and_submit_inner(
         }
         false
     };
+    if let Some(mind) = super::mind_runtime() {
+        let timeout = std::time::Duration::from_millis(mind.config().event_update_timeout_ms());
+        match kovi::tokio::time::timeout(timeout, mind.observe_event(&event)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => kovi::log::warn!("Yunxi Mind event update failed soft: {error}"),
+            Err(_) => kovi::log::warn!("Yunxi Mind event update timed out and failed soft"),
+        }
+    }
     let admission = match runtime.submit(event).await {
         Ok(admission) => admission,
         Err(error) => {
