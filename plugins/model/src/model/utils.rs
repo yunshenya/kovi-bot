@@ -83,6 +83,7 @@ const MAX_RUNTIME_CONVERSATIONS: usize = 512;
 const MAX_STREAM_ENVELOPE_BYTES: usize = 16 * 1024 * 1024;
 const EMPTY_REPLY_ALERT_WINDOW: Duration = Duration::from_secs(10 * 60);
 const VISION_FAILURE_RESPONSE_PREFIX: &str = "[[VISION_FAILURE]]";
+const DEFAULT_RESPONSES_INSTRUCTIONS: &str = "请根据输入消息完成当前请求。";
 const EMPTY_REPLY_REPAIR_PROMPT: &str = "上一轮没有形成可发送的回复。现在只做一次回复协议修复：重新结合当前用户消息判断本轮意图，需要文字回应时输出自然聊天正文；如果用户只要求发送结构化 @，可以只输出完整动作，不要为了凑正文添加无关套话。自然语言中的“@我”“艾特我”“提及我”必须输出 [[REPLY_ACTION]]{\"disposition\":\"reply\",\"at_current_sender\":true}[[/REPLY_ACTION]]，程序会绑定本轮真实发送者，不要调用成员搜索，也不要填写真实 QQ 号。@其他人时才使用动作候选中的 at_user_ref 并放入 at_user_ids。如果需要引用或撤回消息，也必须使用动作候选中的临时引用，不要只把动作写成正文里的普通文字。不要输出工具调用、解释、分析、代码块或协议之外的 JSON；若确实不应回应，只输出完整的 [[REPLY_ACTION]]{\"disposition\":\"silent\"}[[/REPLY_ACTION]]。不要编造工具结果，也不要把本次修复当成新的用户消息。";
 
 struct EmptyReplyIncident {
@@ -1302,12 +1303,12 @@ pub(crate) async fn params_model_with_token_limit_and_progress_for_reply(
         .unwrap_or_else(|| server_config.max_output_tokens())
         .min(server_config.max_output_tokens());
     let request_body = if server_config.wire_api() == "responses" {
-        json!({
-            "model": server_config.model_name(),
-            "input": build_responses_input(&request_messages, model_vision_images),
-            "stream": true,
-            "max_output_tokens": max_output_tokens,
-        })
+        build_responses_request_body(
+            server_config.model_name(),
+            &request_messages,
+            model_vision_images,
+            max_output_tokens,
+        )
     } else {
         let request_messages = build_model_messages(&request_messages, model_vision_images);
         let bot_conf = ModelConf {
@@ -1605,9 +1606,9 @@ fn build_responses_input(messages: &[BotMemory], vision_images: &[VisionImage]) 
     messages
         .iter()
         .enumerate()
-        .map(|(index, message)| {
+        .filter_map(|(index, message)| {
             let role = match message.role {
-                Roles::System => "system",
+                Roles::System => return None,
                 Roles::User | Roles::Data => "user",
                 Roles::Assistant => "assistant",
             };
@@ -1627,9 +1628,39 @@ fn build_responses_input(messages: &[BotMemory], vision_images: &[VisionImage]) 
             } else {
                 Value::String(message.content.clone())
             };
-            json!({"role": role, "content": content})
+            Some(json!({"role": role, "content": content}))
         })
         .collect()
+}
+
+fn build_responses_instructions(messages: &[BotMemory]) -> String {
+    let instructions = messages
+        .iter()
+        .filter(|message| message.role == Roles::System)
+        .map(|message| message.content.trim())
+        .filter(|content| !content.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    if instructions.is_empty() {
+        DEFAULT_RESPONSES_INSTRUCTIONS.to_string()
+    } else {
+        instructions
+    }
+}
+
+fn build_responses_request_body(
+    model: &str,
+    messages: &[BotMemory],
+    vision_images: &[VisionImage],
+    max_output_tokens: u32,
+) -> Value {
+    json!({
+        "model": model,
+        "instructions": build_responses_instructions(messages),
+        "input": build_responses_input(messages, vision_images),
+        "stream": true,
+        "max_output_tokens": max_output_tokens,
+    })
 }
 
 fn model_error(error: &str) -> BotMemory {
@@ -2602,9 +2633,10 @@ pub fn get_file_modified_time_formatted() -> anyhow::Result<String> {
 mod tests {
     use super::{
         BotMemory, EMPTY_REPLY_REPAIR_PROMPT, MessageUnderstanding, Roles, VisionImage,
-        append_stream_delta, build_model_messages, build_responses_input, compression_cutoff,
-        extract_stream_delta, group_system_prompt, is_group_admin_command, is_help_command,
-        is_restricted_command, limit_memory_size, model_attempt_count, sanitize_scheduled_output,
+        append_stream_delta, build_model_messages, build_responses_input,
+        build_responses_request_body, compression_cutoff, extract_stream_delta,
+        group_system_prompt, is_group_admin_command, is_help_command, is_restricted_command,
+        limit_memory_size, model_attempt_count, sanitize_scheduled_output,
         should_repair_empty_reply, with_reference_context,
     };
     use crate::memory::{BotPersonality, UserProfile};
@@ -2844,10 +2876,52 @@ mod tests {
                 url: "data:image/png;base64,abc".to_string(),
             }],
         );
-        assert!(request[0]["content"].is_string());
-        assert_eq!(request[1]["content"][0]["type"], "input_text");
-        assert_eq!(request[1]["content"][1]["type"], "input_image");
-        assert_eq!(request[1]["content"][1]["detail"], "high");
+        assert_eq!(request.len(), 1);
+        assert_eq!(request[0]["role"], "user");
+        assert_eq!(request[0]["content"][0]["type"], "input_text");
+        assert_eq!(request[0]["content"][1]["type"], "input_image");
+        assert_eq!(request[0]["content"][1]["detail"], "high");
+    }
+
+    #[test]
+    fn responses_request_moves_system_messages_to_explicit_instructions() {
+        let messages = vec![
+            BotMemory {
+                role: Roles::System,
+                content: "角色要求".to_string(),
+            },
+            BotMemory {
+                role: Roles::User,
+                content: "你好".to_string(),
+            },
+            BotMemory {
+                role: Roles::System,
+                content: "回复协议".to_string(),
+            },
+        ];
+
+        let request = build_responses_request_body("test-model", &messages, &[], 512);
+
+        assert_eq!(request["instructions"], "角色要求\n\n回复协议");
+        assert_eq!(request["input"].as_array().map(Vec::len), Some(1));
+        assert_eq!(request["input"][0]["role"], "user");
+        assert_eq!(request["input"][0]["content"], "你好");
+    }
+
+    #[test]
+    fn responses_request_always_sets_non_empty_instructions() {
+        let messages = vec![BotMemory {
+            role: Roles::User,
+            content: "你好".to_string(),
+        }];
+
+        let request = build_responses_request_body("test-model", &messages, &[], 512);
+
+        assert!(
+            request["instructions"]
+                .as_str()
+                .is_some_and(|instructions| !instructions.trim().is_empty())
+        );
     }
 
     #[test]
