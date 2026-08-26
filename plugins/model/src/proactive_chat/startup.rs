@@ -1,5 +1,5 @@
 use crate::proactive_chat::ProactiveChatManager;
-use crate::yunxi::bridge::ShadowBridge;
+use crate::yunxi::bridge::CoreBridge;
 use kovi::RuntimeBot;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -9,7 +9,7 @@ static IS_STARTED: AtomicBool = AtomicBool::new(false);
 
 pub(crate) async fn get_or_create_proactive_manager_with_bridge(
     bot: Arc<RuntimeBot>,
-    bridge: Option<Arc<ShadowBridge>>,
+    bridge: Option<Arc<CoreBridge>>,
 ) -> Option<Arc<ProactiveChatManager>> {
     // 原子抢占启动权，避免群聊和私聊事件并发时创建两个循环。
     if IS_STARTED

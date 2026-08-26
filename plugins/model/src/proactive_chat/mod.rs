@@ -15,7 +15,7 @@ use crate::model::{
 use crate::mood_system::MOOD_SYSTEM;
 use crate::topic_generator::TopicGenerator;
 use crate::yunxi;
-use crate::yunxi::bridge::ShadowBridge;
+use crate::yunxi::bridge::CoreBridge;
 use crate::yunxi::delivery::ReachOutDeliveryOutcome;
 use anyhow::Result;
 use chrono::Local;
@@ -76,7 +76,7 @@ pub struct ProactiveChatManager {
     /// 机器人实例，用于发送消息
     bot: Arc<RuntimeBot>,
     /// Shared Core bridge used only for best-effort idle observations.
-    yunxi_bridge: Option<Arc<ShadowBridge>>,
+    yunxi_bridge: Option<Arc<CoreBridge>>,
 }
 
 struct PlannedPrivateReachOut {
@@ -92,7 +92,7 @@ impl ProactiveChatManager {
     pub(crate) fn new_with_bridge(
         memory_manager: Arc<MemoryManager>,
         bot: Arc<RuntimeBot>,
-        yunxi_bridge: Option<Arc<ShadowBridge>>,
+        yunxi_bridge: Option<Arc<CoreBridge>>,
     ) -> Self {
         let topic_generator = TopicGenerator::new(Arc::clone(&memory_manager));
         Self {

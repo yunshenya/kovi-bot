@@ -49,7 +49,10 @@ pub(crate) use crate::model::conversation_coordinator::OutgoingExecutiveDecision
 pub(crate) use crate::model::conversation_coordinator::{
     ConversationCoordinator, IncomingAdmission, IncomingTurnImpact, OutgoingExecutiveContext,
 };
-pub(crate) use crate::model::group::group_message_event_after_ingress;
+pub(crate) use crate::model::group::{
+    group_message_event_after_ingress, record_group_message_observation,
+    should_suppress_core_group_message,
+};
 
 pub(crate) use crate::model::private::private_message_event_after_ingress;
 pub(crate) use crate::model::recall::{

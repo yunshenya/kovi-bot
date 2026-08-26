@@ -524,6 +524,11 @@ pub struct MessageSentEvent {
     pub message_id: MessageId,
     pub conversation_id: ConversationId,
     pub timestamp: DateTime<Utc>,
+    /// Bounded content of a successfully delivered Core action. Older event
+    /// payloads may omit it, in which case WorkingState still records timing
+    /// and identity without inventing conversation text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<MessageContent>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -912,24 +917,13 @@ impl WorldEvent {
         const MAX_ERROR_CATEGORY_BYTES: usize = 256;
 
         match &self.kind {
-            WorldEventKind::MessageReceived(message) => match message.content.validate() {
-                Ok(()) => Ok(()),
-                Err(MessageValidationError::TextTooLong { length, maximum }) => {
-                    Err(EventValidationError::PayloadTooLarge {
-                        field: "message_content",
-                        length,
-                        maximum,
-                    })
-                }
-                Err(MessageValidationError::TextTooManyCharacters { length, maximum }) => {
-                    Err(EventValidationError::PayloadTooLong {
-                        field: "message_content",
-                        length,
-                        maximum,
-                    })
-                }
-                Err(error) => Err(EventValidationError::InvalidMessageContent(error)),
-            },
+            WorldEventKind::MessageReceived(message) => {
+                validate_event_message_content(&message.content)
+            }
+            WorldEventKind::MessageSent(message) => message
+                .content
+                .as_ref()
+                .map_or(Ok(()), validate_event_message_content),
             WorldEventKind::ToolCompleted(tool) => {
                 check_payload_size("tool_operation", tool.operation.len(), MAX_OPERATION_BYTES)?;
                 check_payload_size("tool_output", tool.output.len(), MAX_TOOL_RESULT_BYTES)?;
@@ -997,6 +991,27 @@ impl WorldEvent {
     }
 }
 
+fn validate_event_message_content(content: &MessageContent) -> Result<(), EventValidationError> {
+    match content.validate() {
+        Ok(()) => Ok(()),
+        Err(MessageValidationError::TextTooLong { length, maximum }) => {
+            Err(EventValidationError::PayloadTooLarge {
+                field: "message_content",
+                length,
+                maximum,
+            })
+        }
+        Err(MessageValidationError::TextTooManyCharacters { length, maximum }) => {
+            Err(EventValidationError::PayloadTooLong {
+                field: "message_content",
+                length,
+                maximum,
+            })
+        }
+        Err(error) => Err(EventValidationError::InvalidMessageContent(error)),
+    }
+}
+
 fn check_payload_size(
     field: &'static str,
     length: usize,
@@ -1061,8 +1076,8 @@ mod tests {
         Attachment, AttachmentKind, EventPriority, EventScope, EventValidationError,
         GoalCompletedEvent, GoalUpdatedEvent, InteractionCuesObservedEvent,
         MAX_MESSAGE_ATTACHMENTS, MAX_TOOL_ERROR_DETAIL_CHARS, MAX_TOOL_RESULT_BYTES, Message,
-        MessageContent, MessageReceivedEvent, MessageValidationError, ToolCompletedEvent,
-        ToolFailedEvent, TraceError, WorldEvent, WorldEventKind,
+        MessageContent, MessageReceivedEvent, MessageSentEvent, MessageValidationError,
+        ToolCompletedEvent, ToolFailedEvent, TraceError, WorldEvent, WorldEventKind,
     };
     use crate::{
         ConversationId, ConversationKind, EventId, GoalId, InteractionCues, MessageId, PersonId,
@@ -1391,6 +1406,56 @@ mod tests {
             }
             _ => unreachable!("fixture is a received message"),
         };
+        assert_eq!(
+            oversized.validate(8),
+            Err(EventValidationError::PayloadTooLarge {
+                field: "message_content",
+                length: 32 * 1_024 + 1,
+                maximum: 32 * 1_024,
+            })
+        );
+    }
+
+    #[test]
+    fn sent_message_content_is_bounded_and_backward_compatible() {
+        let timestamp = Utc::now();
+        let conversation_id = ConversationId::new();
+        let event = WorldEvent::new(
+            timestamp,
+            EventScope::Conversation { conversation_id },
+            EventPriority::High,
+            WorldEventKind::MessageSent(MessageSentEvent {
+                message_id: MessageId::new(),
+                conversation_id,
+                timestamp,
+                content: Some(MessageContent::text("已经发出的回复")),
+            }),
+        );
+        assert_eq!(event.validate(8), Ok(()));
+
+        let mut older = serde_json::to_value(&event).expect("sent event should serialize");
+        older["kind"]["payload"]
+            .as_object_mut()
+            .expect("sent message payload")
+            .remove("content");
+        let older: WorldEvent =
+            serde_json::from_value(older).expect("older sent event should deserialize");
+        assert!(matches!(
+            older.kind(),
+            WorldEventKind::MessageSent(message) if message.content.is_none()
+        ));
+
+        let oversized = WorldEvent::new(
+            timestamp,
+            EventScope::Conversation { conversation_id },
+            EventPriority::High,
+            WorldEventKind::MessageSent(MessageSentEvent {
+                message_id: MessageId::new(),
+                conversation_id,
+                timestamp,
+                content: Some(MessageContent::text("x".repeat(32 * 1_024 + 1))),
+            }),
+        );
         assert_eq!(
             oversized.validate(8),
             Err(EventValidationError::PayloadTooLarge {

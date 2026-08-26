@@ -23,8 +23,8 @@ pub(crate) async fn project_destination(
     kind: WorldEventKind,
 ) {
     let wait = projection_timeout(priority);
-    let Some(bridge) = super::SHADOW_BRIDGE.get() else {
-        kovi::log::warn!("Yunxi event projection failed: shadow bridge is not installed");
+    let Some(bridge) = super::CORE_BRIDGE.get() else {
+        kovi::log::warn!("Yunxi event projection failed: Core bridge is not installed");
         return;
     };
     match timeout(
@@ -79,9 +79,9 @@ async fn project_interaction_cues_inner(
     let identities = super::IDENTITY_STORE
         .get()
         .ok_or_else(|| "identity store is not installed".to_string())?;
-    let bridge = super::SHADOW_BRIDGE
+    let bridge = super::CORE_BRIDGE
         .get()
-        .ok_or_else(|| "shadow bridge is not installed".to_string())?;
+        .ok_or_else(|| "Core bridge is not installed".to_string())?;
     let external = super::qq::person(user_id).map_err(|error| error.to_string())?;
     let person_id = identities
         .resolve_external_identity(&external)
@@ -148,9 +148,9 @@ async fn project_agent_task_inner(
     let goals = super::GOAL_STORE
         .get()
         .ok_or_else(|| "goal store is not installed".to_string())?;
-    let bridge = super::SHADOW_BRIDGE
+    let bridge = super::CORE_BRIDGE
         .get()
-        .ok_or_else(|| "shadow bridge is not installed".to_string())?;
+        .ok_or_else(|| "Core bridge is not installed".to_string())?;
     let external = super::qq::person(actor_user_id).map_err(|error| error.to_string())?;
     let person_id = identities
         .resolve_external_identity(&external)

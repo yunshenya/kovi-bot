@@ -7,7 +7,7 @@ use crate::image_security::{
 use crate::model::{ReplyTicket, is_current};
 use crate::redis_store;
 use anyhow::{Result, anyhow};
-use kovi::bot::message::Message;
+use kovi::bot::message::{Message, Segment};
 use kovi::tokio::sync::Mutex;
 use kovi::{RuntimeBot, serde_json::Value};
 use reqwest::Client;
@@ -263,19 +263,44 @@ pub(crate) fn extract_image_attachments(message: &Message) -> Vec<ImageAttachmen
     message
         .iter()
         .filter(|segment| segment.type_ == "image")
-        .filter_map(|segment| {
-            let file = value_as_bounded_string(&segment.data, "file", 512);
-            let url = value_as_image_url(&segment.data, "url");
-            let identifier = value_as_bounded_string(&segment.data, "file_unique", 512)
-                .or_else(|| value_as_bounded_string(&segment.data, "md5", 512))
-                .or_else(|| file.clone())
-                .or_else(|| url.as_deref().map(hashed_image_url_key))?;
-            let key = format!("image:{identifier}");
-            seen.insert(key.clone())
-                .then_some(ImageAttachment { key, file, url })
-        })
+        .filter_map(image_attachment_from_segment)
+        .filter(|attachment| seen.insert(attachment.key.clone()))
         .take(MAX_VISION_IMAGES)
         .collect()
+}
+
+pub(crate) fn image_segments_are_resolvable(message: &Message) -> bool {
+    message
+        .iter()
+        .filter(|segment| segment.type_ == "image")
+        .all(|segment| {
+            let Some(attachment) = image_attachment_from_segment(segment) else {
+                return false;
+            };
+            attachment.url.as_deref().is_some_and(is_supported_url)
+                || attachment
+                    .file
+                    .as_deref()
+                    .is_some_and(is_safe_onebot_image_file)
+        })
+}
+
+fn image_attachment_from_segment(segment: &Segment) -> Option<ImageAttachment> {
+    let file = value_as_bounded_string(&segment.data, "file", 512);
+    let url = value_as_image_url(&segment.data, "url").or_else(|| {
+        file.as_deref()
+            .filter(|file| is_supported_url(file))
+            .map(ToString::to_string)
+    });
+    let identifier = value_as_bounded_string(&segment.data, "file_unique", 512)
+        .or_else(|| value_as_bounded_string(&segment.data, "md5", 512))
+        .or_else(|| file.clone())
+        .or_else(|| url.as_deref().map(hashed_image_url_key))?;
+    Some(ImageAttachment {
+        key: format!("image:{identifier}"),
+        file,
+        url,
+    })
 }
 
 pub(crate) fn merge_image_attachments(
@@ -631,8 +656,8 @@ fn hashed_image_url_key(url: &str) -> String {
 mod tests {
     use super::{
         default_vision_prompt, extract_image_attachments, extract_response_content,
-        is_vision_command, merge_image_attachments, strip_vision_command, validate_vision_endpoint,
-        vision_endpoint,
+        image_segments_are_resolvable, is_vision_command, merge_image_attachments,
+        strip_vision_command, validate_vision_endpoint, vision_endpoint,
     };
     use kovi::Message;
     use kovi::bot::message::Segment;
@@ -654,6 +679,22 @@ mod tests {
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].file.as_deref(), Some("a.png"));
         assert_eq!(images[0].url.as_deref(), Some("https://example.com/a"));
+        assert!(image_segments_are_resolvable(&message));
+
+        let invalid = Message::from(vec![Segment::new("image", json!({}))]);
+        assert!(!image_segments_are_resolvable(&invalid));
+
+        let file_url = Message::from(vec![Segment::new(
+            "image",
+            json!({"file": "https://example.com/from-file-field.png"}),
+        )]);
+        let file_url_images = extract_image_attachments(&file_url);
+        assert_eq!(file_url_images.len(), 1);
+        assert_eq!(
+            file_url_images[0].url.as_deref(),
+            Some("https://example.com/from-file-field.png")
+        );
+        assert!(image_segments_are_resolvable(&file_url));
     }
 
     #[test]

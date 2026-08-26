@@ -94,7 +94,18 @@ fn active_snapshot(
 
 fn projected(event: WorldEvent, snapshot: MindSnapshot) -> MindDecisionProjection {
     let input = PlannerInput::new(event, PlannerStateSnapshot::empty()).with_mind(snapshot);
-    MindDecisionProjection::for_input(&input, DecisionDisposition::Reply)
+    let baseline = match input.event.kind() {
+        WorldEventKind::MessageReceived(message)
+            if message.conversation_kind == ConversationKind::Group
+                && !message.addressed_to_agent
+                && !message.replies_to_agent
+                && !message.explicit_request =>
+        {
+            DecisionDisposition::Silent
+        }
+        _ => DecisionDisposition::Reply,
+    };
+    MindDecisionProjection::for_input(&input, baseline)
 }
 
 #[test]
@@ -804,7 +815,7 @@ async fn snapshot_is_bounded_and_group_scope_does_not_leak_person_beliefs() {
     assert_eq!(snapshot.influence_mode(), MindInfluenceMode::Shadow);
 
     let group = match direct.kind().clone() {
-        crate::WorldEventKind::MessageReceived(mut message) => {
+        WorldEventKind::MessageReceived(mut message) => {
             message.conversation_kind = ConversationKind::Group;
             WorldEvent::message_received(EventPriority::Normal, message)
         }
@@ -999,7 +1010,7 @@ async fn consolidation_clamps_updates_and_rejects_stale_snapshot() {
         .beliefs
         .find_by_key(
             MindScope::Global,
-            &super::common::normalized_key("Rust 类型系统总体有价值"),
+            &common::normalized_key("Rust 类型系统总体有价值"),
         )
         .await
         .expect("lookup")

@@ -169,6 +169,54 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
     ConversationCoordinator::abandon_incoming(admission).await;
 }
 
+/// Core owns ordinary group replies, but agent tasks still need a cheap raw
+/// observation of every member message to complete their cross-group loop.
+pub(crate) async fn record_group_message_observation(event: &GroupMsgEvent) {
+    let sender_identity = GroupSenderIdentity::from_event(event);
+    let message = bounded_input(event.borrow_text().unwrap_or_default());
+    if let Err(error) = crate::agent_tasks::record_group_message(
+        event.group_id,
+        event.message_id,
+        event.user_id,
+        sender_identity.display_name(),
+        &message,
+        &event.message,
+        event.self_id,
+    )
+    .await
+    {
+        eprintln!(
+            "[WARN] 保存跨群问答群成员回复失败 (群组: {}, 消息: {}): {}",
+            event.group_id, event.message_id, error
+        );
+    }
+}
+
+/// Apply the same bounded traffic and direct-address limits used by the Host
+/// before a Core-owned group message can consume ingress or model capacity.
+pub(crate) async fn should_suppress_core_group_message(
+    event: &GroupMsgEvent,
+    bot: &RuntimeBot,
+) -> bool {
+    let sender_is_admin = is_bot_admin(bot, event.user_id);
+    if should_suppress(
+        InboundScope::Group {
+            group_id: event.group_id,
+            user_id: event.user_id,
+        },
+        sender_is_admin,
+    )
+    .await
+    {
+        return true;
+    }
+    let directly_addressed = message_at_self(&event.message, event.self_id)
+        || event.borrow_text().is_some_and(text_mentions_bot);
+    directly_addressed
+        && !sender_is_admin
+        && should_suppress_direct_trigger(event.group_id, event.user_id).await
+}
+
 pub(crate) async fn group_message_event_after_ingress(
     event: Arc<GroupMsgEvent>,
     bot: Arc<RuntimeBot>,

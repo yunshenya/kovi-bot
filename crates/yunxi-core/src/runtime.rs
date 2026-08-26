@@ -1744,15 +1744,17 @@ fn message_sent_event(
     else {
         return None;
     };
-    let conversation_id = match action {
+    let (conversation_id, content) = match action {
         crate::ProposedAction::SendMessage(send) => {
             if delivered_conversation_id.is_some_and(|delivered| delivered != send.conversation_id)
             {
                 return None;
             }
-            send.conversation_id
+            (send.conversation_id, send.content.clone())
         }
-        crate::ProposedAction::ReachOut(_) => (*delivered_conversation_id)?,
+        crate::ProposedAction::ReachOut(reach_out) => {
+            ((*delivered_conversation_id)?, reach_out.message.clone())
+        }
         crate::ProposedAction::UseTool(_)
         | crate::ProposedAction::CreateOpenLoop(_)
         | crate::ProposedAction::ResolveOpenLoop(_)
@@ -1770,6 +1772,7 @@ fn message_sent_event(
             message_id: *message_id,
             conversation_id,
             timestamp: delivered_at,
+            content: Some(content),
         }),
         max_trace_depth,
     )
@@ -4460,6 +4463,10 @@ mod tests {
         };
         assert_eq!(sent.message_id, message_id);
         assert_eq!(sent.timestamp, feedback.occurred_at());
+        assert_eq!(
+            sent.content.as_ref().map(MessageContent::as_text),
+            Some("delivered")
+        );
     }
 
     #[test]
@@ -4501,6 +4508,10 @@ mod tests {
         };
         assert_eq!(sent.message_id, message_id);
         assert_eq!(sent.conversation_id, delivered_conversation_id);
+        assert_eq!(
+            sent.content.as_ref().map(MessageContent::as_text),
+            Some("checking in")
+        );
     }
 
     #[test]
@@ -4658,6 +4669,7 @@ mod tests {
                     message_id: MessageId::new(),
                     conversation_id,
                     timestamp: message_sent_at,
+                    content: None,
                 }),
             ))
             .await

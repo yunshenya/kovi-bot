@@ -47,7 +47,7 @@ impl Default for MindConfig {
             agenda_enabled: true,
             reflection_enabled: true,
             mind_planner_enabled: true,
-            influence_mode: MindInfluenceMode::Shadow,
+            influence_mode: MindInfluenceMode::Active,
             snapshot_timeout_ms: 75,
             event_update_timeout_ms: 40,
             max_relevant_beliefs: 8,

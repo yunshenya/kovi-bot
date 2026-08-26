@@ -66,6 +66,10 @@ autonomous_query_max_rounds = 2
 autonomous_query_max_results = 8
 autonomous_query_max_days = 3650
 
+[mind]
+# Mind v2 participates in normal Core decisions by default.
+influence_mode = "active"
+
 [message_batch]
 enabled = true
 complete_delay_ms = 900

@@ -112,6 +112,10 @@ pub struct CompactEvent {
     pub event_type: EventType,
     pub priority: EventPriority,
     pub disposition: AttentionDisposition,
+    /// Present for received messages so a bounded group snapshot can keep
+    /// speakers distinct without retaining host-specific identifiers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub person_id: Option<PersonId>,
     pub text: Option<String>,
 }
 
@@ -125,6 +129,10 @@ impl CompactEvent {
         let text = include_text
             .then(|| match event.kind() {
                 WorldEventKind::MessageReceived(message) => message.content.as_text(),
+                WorldEventKind::MessageSent(message) => message
+                    .content
+                    .as_ref()
+                    .map_or("", crate::MessageContent::as_text),
                 WorldEventKind::ToolFailed(tool) => tool.error_category.as_str(),
                 WorldEventKind::ActionFailed(action) => action.error_category.as_str(),
                 _ => "",
@@ -143,6 +151,10 @@ impl CompactEvent {
             event_type: event.kind().event_type(),
             priority: event.priority(),
             disposition: attention.disposition,
+            person_id: match event.kind() {
+                WorldEventKind::MessageReceived(message) => Some(message.sender),
+                _ => None,
+            },
             text,
         }
     }

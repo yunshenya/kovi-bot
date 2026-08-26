@@ -1,9 +1,9 @@
-//! Bounded QQ -> Yunxi Core shadow bridge.
+//! Bounded QQ -> Yunxi Core bridge.
 //!
 //! The bridge deliberately sits beside the existing Kovi handlers. It copies
 //! only the small set of fields needed by Core, then resolves platform
-//! identities on a single background worker. The legacy handlers remain the
-//! owner of all model calls and QQ side effects.
+//! identities on a single background worker. Core owns admitted supported
+//! messages; Host handlers remain responsible for specialized capabilities.
 
 use super::qq;
 use crate::model::{
@@ -19,9 +19,11 @@ use kovi::tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock, mps
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::future::Future;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, Instant};
 use yunxi_core::{
     ActionArbiter, ActionArbiterConfig, ActionPort, ActionResult, Admission, Attachment,
     AttachmentKind, CognitiveRuntime, ConversationId, ConversationKind, ConversationMemberStore,
@@ -31,7 +33,7 @@ use yunxi_core::{
     RuntimeConfig, RuntimeHandle, WorldEvent, WorldEventKind,
 };
 
-pub(crate) const SHADOW_INGRESS_CAPACITY: usize = 256;
+pub(crate) const CORE_INGRESS_CAPACITY: usize = 256;
 pub(crate) const MESSAGE_REFERENCE_CAPACITY: usize = 4_096;
 const MAX_TRACKED_USERS: usize = 256;
 const MAX_TRACKED_DIRECT_CONVERSATIONS_PER_USER: usize = 256;
@@ -40,6 +42,116 @@ const MAX_BLOCKED_GROUPS: usize = 256;
 const MAX_PRIVATE_HANDLER_GATES: usize = 1_024;
 const MAX_MESSAGE_CHARS: usize = 8_192;
 const MAX_MESSAGE_BYTES: usize = 32 * 1_024;
+const MAX_AMBIENT_ATTENTION_GATES: usize = 256;
+
+#[derive(Debug, Default)]
+struct AmbientAttentionGate {
+    eligible_messages_since_sample: u32,
+    last_candidate: Option<Instant>,
+    decision_attempts: VecDeque<Instant>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AmbientAttentionPolicy {
+    enabled: bool,
+    min_eligible_messages: u32,
+    candidate_cooldown_secs: u64,
+    response_probability_percent: u8,
+    min_message_chars: usize,
+    decision_rate_window_secs: u64,
+    decision_rate_limit: usize,
+}
+
+#[derive(Debug)]
+struct AmbientAttentionRegistry {
+    entries: HashMap<i64, AmbientAttentionGate>,
+    order: VecDeque<i64>,
+}
+
+impl AmbientAttentionRegistry {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::with_capacity(MAX_AMBIENT_ATTENTION_GATES),
+            order: VecDeque::with_capacity(MAX_AMBIENT_ATTENTION_GATES),
+        }
+    }
+
+    fn gate_mut(&mut self, group_id: i64) -> &mut AmbientAttentionGate {
+        if !self.entries.contains_key(&group_id) {
+            if self.entries.len() >= MAX_AMBIENT_ATTENTION_GATES
+                && let Some(evicted) = self.order.pop_front()
+            {
+                self.entries.remove(&evicted);
+            }
+            self.order.push_back(group_id);
+            self.entries
+                .insert(group_id, AmbientAttentionGate::default());
+        }
+        self.entries
+            .get_mut(&group_id)
+            .expect("ambient attention gate was inserted above")
+    }
+
+    fn should_request(
+        &mut self,
+        group_id: i64,
+        message_id: i32,
+        text_chars: usize,
+        has_image: bool,
+        policy: AmbientAttentionPolicy,
+    ) -> bool {
+        if !policy.enabled || (!has_image && text_chars < policy.min_message_chars) {
+            return false;
+        }
+        let now = Instant::now();
+        let gate = self.gate_mut(group_id);
+        gate.eligible_messages_since_sample = gate.eligible_messages_since_sample.saturating_add(1);
+        if gate.eligible_messages_since_sample < policy.min_eligible_messages {
+            return false;
+        }
+        gate.eligible_messages_since_sample = 0;
+
+        if gate.last_candidate.is_some_and(|last| {
+            now.duration_since(last) < Duration::from_secs(policy.candidate_cooldown_secs)
+        }) {
+            return false;
+        }
+        let rate_window = Duration::from_secs(policy.decision_rate_window_secs);
+        while gate
+            .decision_attempts
+            .front()
+            .is_some_and(|attempt| now.duration_since(*attempt) >= rate_window)
+        {
+            gate.decision_attempts.pop_front();
+        }
+        if gate.decision_attempts.len() >= policy.decision_rate_limit {
+            return false;
+        }
+
+        let mut hasher = DefaultHasher::new();
+        group_id.hash(&mut hasher);
+        message_id.hash(&mut hasher);
+        let sample = hasher.finish() % 100;
+        if sample >= u64::from(policy.response_probability_percent) {
+            return false;
+        }
+
+        gate.last_candidate = Some(now);
+        gate.decision_attempts.push_back(now);
+        true
+    }
+
+    fn clear(&mut self, group_id: i64) {
+        self.entries.remove(&group_id);
+        self.order.retain(|candidate| *candidate != group_id);
+    }
+}
+
+impl Default for AmbientAttentionRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// The result of the synchronous, non-blocking ingress operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +160,15 @@ pub(crate) enum EnqueueOutcome {
     DroppedAtCapacity,
     Blocked,
     SkippedInvalid,
+}
+
+/// The Core-owned handling mode selected before conversation admission.
+/// Observation-only group chatter must never interrupt an in-flight reply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GroupCoreHandling {
+    Unsupported,
+    Observe,
+    Decide,
 }
 
 enum IngressCommand {
@@ -112,7 +233,7 @@ struct GroupDataErasureAck {
 }
 
 pub(crate) struct GroupDataErasure {
-    bridge: Arc<ShadowBridge>,
+    bridge: Arc<CoreBridge>,
     group_id: i64,
     conversation_ids: Vec<ConversationId>,
     #[cfg_attr(not(test), allow(dead_code))]
@@ -151,7 +272,7 @@ impl Drop for GroupDataErasure {
 }
 
 pub(crate) struct UserDataErasure {
-    bridge: Arc<ShadowBridge>,
+    bridge: Arc<CoreBridge>,
     user_id: i64,
     blocked_user_ids: Vec<i64>,
     runtime_barrier_person_id: yunxi_core::PersonId,
@@ -357,7 +478,7 @@ impl Drop for PrivateDataErasurePermit {
 /// A handle held by the host's event closures. It owns no Kovi event and never
 /// performs an await on the hot path.
 #[derive(Clone)]
-pub(crate) struct ShadowBridge {
+pub(crate) struct CoreBridge {
     ingress: mpsc::Sender<IngressCommand>,
     runtime: RuntimeHandle,
     action_arbiter: Option<Arc<ActionArbiter>>,
@@ -366,12 +487,13 @@ pub(crate) struct ShadowBridge {
     blocked_groups: Arc<StdMutex<HashSet<i64>>>,
     private_handler_gates: Arc<PrivateHandlerGateRegistry>,
     group_handler_gates: Arc<PrivateHandlerGateRegistry>,
+    ambient_attention: Arc<StdMutex<AmbientAttentionRegistry>>,
 }
 
-impl fmt::Debug for ShadowBridge {
+impl fmt::Debug for CoreBridge {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("ShadowBridge")
+            .debug_struct("CoreBridge")
             .field("action_arbiter", &self.action_arbiter.is_some())
             .field("action_port", &self.action_port.is_some())
             .field(
@@ -390,11 +512,12 @@ impl fmt::Debug for ShadowBridge {
             )
             .field("private_handler_gates", &"bounded per-user epochs")
             .field("group_handler_gates", &"bounded per-group epochs")
+            .field("ambient_attention", &"bounded per-group sampling")
             .finish_non_exhaustive()
     }
 }
 
-impl ShadowBridge {
+impl CoreBridge {
     #[allow(dead_code)]
     pub(crate) fn start(store: Arc<dyn IdentityStore>) -> Arc<Self> {
         Self::start_inner(store, None, None, None, None, None)
@@ -463,7 +586,7 @@ impl ShadowBridge {
         model_backend: Option<Arc<super::core_model::KoviModelBackend>>,
         message_store: Option<Arc<super::identity_store::PostgresIdentityStore>>,
     ) -> Arc<Self> {
-        let (ingress, receiver) = mpsc::channel(SHADOW_INGRESS_CAPACITY);
+        let (ingress, receiver) = mpsc::channel(CORE_INGRESS_CAPACITY);
         let blocked_users = Arc::new(StdMutex::new(HashSet::with_capacity(
             MAX_BLOCKED_USERS.min(32),
         )));
@@ -474,6 +597,7 @@ impl ShadowBridge {
             Arc::new(PrivateHandlerGateRegistry::new(MAX_PRIVATE_HANDLER_GATES));
         let group_handler_gates =
             Arc::new(PrivateHandlerGateRegistry::new(MAX_PRIVATE_HANDLER_GATES));
+        let ambient_attention = Arc::new(StdMutex::new(AmbientAttentionRegistry::new()));
         let (runtime_handle, mut runtime) = services.map_or_else(
             || {
                 CognitiveRuntime::new(RuntimeConfig::default())
@@ -556,6 +680,7 @@ impl ShadowBridge {
             blocked_groups,
             private_handler_gates,
             group_handler_gates,
+            ambient_attention,
         })
     }
 
@@ -627,7 +752,7 @@ impl ShadowBridge {
         event: &GroupMsgEvent,
         incoming_admission: IncomingAdmission,
     ) -> EnqueueOutcome {
-        let Some(mut message) = InboundMessage::from_group(event) else {
+        let Some(mut message) = InboundMessage::from_group(event, true) else {
             return EnqueueOutcome::SkippedInvalid;
         };
         message.incoming_admission = Some(incoming_admission);
@@ -635,7 +760,7 @@ impl ShadowBridge {
     }
 
     pub(crate) fn enqueue_group_observation(&self, event: &GroupMsgEvent) -> EnqueueOutcome {
-        let Some(mut message) = InboundMessage::from_group(event) else {
+        let Some(mut message) = InboundMessage::from_group(event, false) else {
             return EnqueueOutcome::SkippedInvalid;
         };
         message.visible_reply_allowed = false;
@@ -662,21 +787,21 @@ impl ShadowBridge {
         self.try_enqueue(message)
     }
 
-    /// Reliably flush collision records for a legacy-owned group event. Unlike
+    /// Reliably flush collision records for a Host-owned group event. Unlike
     /// normal message ingress, this waits for queue capacity and worker
-    /// acknowledgement so a full shadow queue cannot hide a committed send.
+    /// acknowledgement so a full Core queue cannot hide a committed send.
     pub(crate) async fn flush_group_collisions(
         &self,
         event: &GroupMsgEvent,
     ) -> anyhow::Result<usize> {
-        let Some(message) = InboundMessage::from_group(event) else {
+        let Some(message) = InboundMessage::from_group(event, false) else {
             return Ok(0);
         };
         self.flush_message_collisions(message.sender_user_id, message.address)
             .await
     }
 
-    /// Reliably flush collision records for a legacy-owned direct event.
+    /// Reliably flush collision records for a Host-owned direct event.
     pub(crate) async fn flush_private_collisions(
         &self,
         event: &PrivateMsgEvent,
@@ -714,37 +839,71 @@ impl ShadowBridge {
         })?
     }
 
-    /// Whether this private event is now owned by the Core direct-conversation
-    /// path. Control commands and any structured stop signal stay on the
-    /// legacy handler so their specialized host behavior remains available.
+    /// Whether this private event is owned by the Core direct-conversation
+    /// path. Ordinary images are supported; control commands and other media
+    /// stay on the Host handler so their specialized behavior remains.
     pub(crate) fn handles_private(&self, event: &PrivateMsgEvent) -> bool {
         self.action_arbiter.is_some()
             && self.action_port.is_some()
-            && event.message.iter().all(|segment| segment.type_ == "text")
-            && InboundMessage::from_private(event).is_some_and(|message| {
-                !message.text.trim().is_empty()
-                    && !message.stop_requested
-                    && !message.text.trim_start().starts_with('#')
-            })
+            && core_private_payload_is_supported(&event.message, event.borrow_text())
+            && InboundMessage::from_private(event).is_some()
     }
 
-    /// Group Core canary admission is deliberately narrower than private
-    /// admission: only a plain-text message that explicitly addresses the bot
-    /// can be handed to the Core owner. Ambient group chatter remains on the
-    /// mature coalescing handler.
-    pub(crate) fn handles_group(&self, event: &GroupMsgEvent) -> bool {
+    /// Core owns ordinary group text/images as bounded observations. Only an
+    /// explicit address or a locally sampled ambient candidate receives a
+    /// reply admission; background chatter cannot supersede an active reply.
+    pub(crate) fn supports_group(&self, event: &GroupMsgEvent) -> bool {
         self.action_arbiter.is_some()
             && self.action_port.is_some()
-            && InboundMessage::from_group(event).is_some_and(|message| {
-                message.addressed_to_agent
-                    && !message.stop_requested
-                    && !message.text.trim().is_empty()
-                    && !message.text.trim_start().starts_with('#')
+            && core_group_payload_is_supported(&event.message, event.borrow_text())
+            && InboundMessage::from_group(event, false).is_some()
+    }
+
+    pub(crate) fn classify_group(&self, event: &GroupMsgEvent) -> GroupCoreHandling {
+        if !self.supports_group(event) {
+            return GroupCoreHandling::Unsupported;
+        }
+        let addressed = message_at_self(&event.message, event.self_id)
+            || event.borrow_text().is_some_and(text_mentions_agent);
+        if addressed || self.should_request_ambient_attention(event) {
+            GroupCoreHandling::Decide
+        } else {
+            GroupCoreHandling::Observe
+        }
+    }
+
+    fn should_request_ambient_attention(&self, event: &GroupMsgEvent) -> bool {
+        // Messages explicitly routed to another member, or quote replies that
+        // require Host-side context resolution, are observations rather than
+        // opportunities for an unsolicited interjection.
+        if !ambient_group_payload_can_be_sampled(&event.message) {
+            return false;
+        }
+        let text = event.borrow_text().unwrap_or_default().trim();
+        let has_image = event.message.iter().any(|segment| segment.type_ == "image");
+        let model_config = crate::config::get();
+        let config = model_config.group_interjection();
+        let policy = AmbientAttentionPolicy {
+            enabled: config.enabled(),
+            min_eligible_messages: config.min_eligible_messages(),
+            candidate_cooldown_secs: config.cooldown_secs().max(config.decision_cooldown_secs()),
+            response_probability_percent: config.response_probability_percent(),
+            min_message_chars: config.min_message_chars(),
+            decision_rate_window_secs: config.decision_rate_window_secs(),
+            decision_rate_limit: config.decision_rate_limit(),
+        };
+        self.ambient_attention
+            .lock()
+            .ok()
+            .is_some_and(|mut registry| {
+                registry.should_request(
+                    event.group_id,
+                    event.message_id,
+                    text.chars().count(),
+                    has_image,
+                    policy,
+                )
             })
-            && event
-                .message
-                .iter()
-                .all(|segment| segment.type_ == "text" || segment.type_ == "at")
     }
 
     fn try_enqueue(&self, message: InboundMessage) -> EnqueueOutcome {
@@ -935,6 +1094,9 @@ impl ShadowBridge {
                 "too many concurrent Yunxi group data erasures"
             );
             blocked.insert(group_id);
+        }
+        if let Ok(mut attention) = self.ambient_attention.lock() {
+            attention.clear(group_id);
         }
 
         let (acknowledge, acknowledged) = oneshot::channel();
@@ -1164,11 +1326,18 @@ struct InboundMessage {
     reply_to_external_message_id: Option<i64>,
     text: String,
     attachments: Vec<Attachment>,
+    /// Host-only locators used to materialize the current turn's images. They
+    /// are bound to the Core MessageId in a bounded one-shot cache and never
+    /// enter the platform-neutral event or persistent state.
+    vision_attachments: Vec<crate::vision::ImageAttachment>,
     timestamp: DateTime<Utc>,
     addressed_to_agent: bool,
     visible_reply_allowed: bool,
     explicit_request: bool,
     stop_requested: bool,
+    /// Ambient group turns set this only when the local sampler has decided
+    /// that Core may spend a model turn evaluating a possible interjection.
+    planner_attention_requested: bool,
     /// Host conversation admission captured before this event entered the
     /// asynchronous Core queues. It is consumed exactly once by the model
     /// backend and never crosses into the platform-neutral Core event schema.
@@ -1176,7 +1345,7 @@ struct InboundMessage {
 }
 
 impl InboundMessage {
-    fn from_group(event: &GroupMsgEvent) -> Option<Self> {
+    fn from_group(event: &GroupMsgEvent, planner_attention_requested: bool) -> Option<Self> {
         valid_qq_id(event.self_id)
             .then_some(())
             .and_then(|()| valid_qq_id(event.group_id).then_some(()))
@@ -1186,6 +1355,7 @@ impl InboundMessage {
         }
         let text = bounded_text(event.borrow_text().unwrap_or_default());
         let attachments = normalize_attachments(&event.message);
+        let vision_attachments = crate::vision::extract_image_attachments(&event.message);
         Some(Self {
             address: ConversationAddress::Group {
                 group_id: event.group_id,
@@ -1198,9 +1368,11 @@ impl InboundMessage {
             visible_reply_allowed: true,
             explicit_request: false,
             stop_requested: false,
+            planner_attention_requested,
             incoming_admission: None,
             text,
             attachments,
+            vision_attachments,
             timestamp: event_timestamp(event.time),
         })
     }
@@ -1213,6 +1385,7 @@ impl InboundMessage {
         }
         let text = bounded_text(event.borrow_text().unwrap_or_default());
         let attachments = normalize_attachments(&event.message);
+        let vision_attachments = crate::vision::extract_image_attachments(&event.message);
         Some(Self {
             address: ConversationAddress::Direct {
                 self_id: event.self_id,
@@ -1225,9 +1398,11 @@ impl InboundMessage {
             visible_reply_allowed: true,
             explicit_request: true,
             stop_requested: false,
+            planner_attention_requested: true,
             incoming_admission: None,
             text,
             attachments,
+            vision_attachments,
             timestamp: event_timestamp(event.time),
         })
     }
@@ -1438,7 +1613,7 @@ async fn run_ingress(
                         crate::model::ConversationCoordinator::abandon_incoming(admission).await;
                     }
                     eprintln!(
-                        "[WARN] Yunxi shadow message dropped during identity resolution: {error}"
+                        "[WARN] Yunxi Core message dropped during identity resolution: {error}"
                     );
                 }
             }
@@ -1753,6 +1928,9 @@ async fn begin_data_erasure_at_ingress_barrier(
     let cleared_references = references.remove_conversations(&targets.direct_conversation_ids);
     let (cleared_person_routes, cleared_conversation_routes) =
         if let Some(model_backend) = model_backend {
+            let _ = model_backend
+                .purge_private_message_contexts(&targets.blocked_user_ids)
+                .await;
             model_backend
                 .purge_routes(
                     targets.canonical_person_id,
@@ -1934,6 +2112,9 @@ async fn begin_group_data_erasure_at_ingress_barrier(
             .map_err(anyhow::Error::from)?
     };
     let cleared_references = references.remove_conversations(&conversation_ids);
+    if let Some(model_backend) = model_backend {
+        let _ = model_backend.purge_group_message_contexts(group_id).await;
+    }
     active.insert(group_id, conversation_ids.clone());
     Ok(GroupDataErasureAck {
         conversation_ids,
@@ -2037,7 +2218,7 @@ trait IncomingAdmissionReleaser: Send + Sync {
 }
 
 impl IncomingAdmissionReleaser for super::core_model::KoviModelBackend {
-    fn discard<'a>(&'a self, message_id: MessageId) -> IncomingAdmissionReleaseFuture<'a> {
+    fn discard(&self, message_id: MessageId) -> IncomingAdmissionReleaseFuture<'_> {
         Box::pin(async move {
             self.discard_incoming(message_id).await;
         })
@@ -2116,7 +2297,7 @@ async fn run_runtime(
         match outcome {
             ProcessingOutcome::Observed(observation) => {
                 kovi::log::debug!(
-                    "Yunxi shadow event observed: id={} type={:?} scope={:?} priority={:?} attention={:?} state={:?}",
+                    "Yunxi Core event observed: id={} type={:?} scope={:?} priority={:?} attention={:?} state={:?}",
                     observation.event_id,
                     observation.event_type,
                     observation.scope,
@@ -2128,7 +2309,7 @@ async fn run_runtime(
             ProcessingOutcome::RejectedEvent { event, .. }
             | ProcessingOutcome::RejectedState { event, .. } => {
                 release_rejected_incoming(&event, incoming_releaser.as_deref()).await;
-                kovi::log::warn!("Yunxi shadow runtime rejected an event");
+                kovi::log::warn!("Yunxi Core runtime rejected an event");
             }
         }
     }
@@ -2226,10 +2407,10 @@ async fn resolve_and_submit_inner(
     if let Some(model_backend) = model_backend {
         let conversation = match message.address {
             ConversationAddress::Group { group_id } => {
-                super::core_model::LegacyConversation::Group { group_id }
+                super::core_model::QqConversation::Group { group_id }
             }
             ConversationAddress::Direct { peer_user_id, .. } => {
-                super::core_model::LegacyConversation::Private {
+                super::core_model::QqConversation::Private {
                     user_id: peer_user_id,
                 }
             }
@@ -2282,6 +2463,7 @@ async fn resolve_and_submit_inner(
         || recent_agent_reply
         || message.stop_requested
         || message.explicit_request
+        || message.planner_attention_requested
     {
         EventPriority::High
     } else {
@@ -2320,9 +2502,16 @@ async fn resolve_and_submit_inner(
     let registered_incoming = if let (Some(model_backend), Some(incoming_admission)) =
         (model_backend, message.incoming_admission)
     {
-        if incoming_admission.ticket.scope() == reply_scope {
+        if priority != EventPriority::High {
+            crate::model::ConversationCoordinator::abandon_incoming(incoming_admission).await;
+            false
+        } else if incoming_admission.ticket.scope() == reply_scope {
             model_backend
-                .register_incoming(message_id, incoming_admission)
+                .register_incoming(
+                    message_id,
+                    incoming_admission,
+                    message.vision_attachments.clone(),
+                )
                 .await;
             true
         } else {
@@ -2333,9 +2522,7 @@ async fn resolve_and_submit_inner(
             false
         }
     } else {
-        if model_backend.is_none()
-            && let Some(incoming_admission) = message.incoming_admission
-        {
+        if let Some(incoming_admission) = message.incoming_admission {
             crate::model::ConversationCoordinator::abandon_incoming(incoming_admission).await;
         }
         false
@@ -2519,7 +2706,7 @@ fn normalize_attachments(message: &Message) -> Vec<Attachment> {
                 "file" => AttachmentKind::File,
                 _ => return None,
             };
-            let reference = ["file_unique", "file_id", "file", "url"]
+            let reference = ["file_unique", "md5", "file_id", "file", "url"]
                 .iter()
                 .find_map(|field| segment.data.get(*field).and_then(|value| value.as_str()))
                 .map(bounded_text)
@@ -2528,6 +2715,29 @@ fn normalize_attachments(message: &Message) -> Vec<Attachment> {
         })
         .take(16)
         .collect()
+}
+
+fn core_private_payload_is_supported(message: &Message, text: Option<&str>) -> bool {
+    core_chat_payload_is_supported(message, text, false)
+}
+
+fn core_group_payload_is_supported(message: &Message, text: Option<&str>) -> bool {
+    core_chat_payload_is_supported(message, text, true)
+}
+
+fn core_chat_payload_is_supported(message: &Message, text: Option<&str>, group: bool) -> bool {
+    let text = text.unwrap_or_default().trim();
+    let image_segments = message
+        .iter()
+        .filter(|segment| segment.type_ == "image")
+        .count();
+    let segments_supported = message.iter().all(|segment| {
+        matches!(segment.type_.as_str(), "text" | "image") || (group && segment.type_ == "at")
+    });
+    segments_supported
+        && (!text.is_empty() || image_segments > 0)
+        && !text.starts_with('#')
+        && crate::vision::image_segments_are_resolvable(message)
 }
 
 fn message_at_self(message: &Message, self_id: i64) -> bool {
@@ -2561,13 +2771,21 @@ fn text_mentions_agent(message: &str) -> bool {
     ["芸汐", "云汐"].iter().any(|name| message.contains(name))
 }
 
+fn ambient_group_payload_can_be_sampled(message: &Message) -> bool {
+    !message
+        .iter()
+        .any(|segment| matches!(segment.type_.as_str(), "at" | "reply"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        ConversationAddress, EnqueueOutcome, InboundMessage, IncomingAdmissionReleaseFuture,
-        IncomingAdmissionReleaser, IngressRouteTracker, MessageReference, MessageReferenceCache,
-        MessageReferenceKey, ShadowBridge, acquire_alias_handler_barriers, action_result_event,
-        block_user_aliases, bounded_text, idle_tick_event, merge_data_erasure_targets,
+        ConversationAddress, CoreBridge, EnqueueOutcome, InboundMessage,
+        IncomingAdmissionReleaseFuture, IncomingAdmissionReleaser, IngressRouteTracker,
+        MessageReference, MessageReferenceCache, MessageReferenceKey,
+        acquire_alias_handler_barriers, action_result_event, ambient_group_payload_can_be_sampled,
+        block_user_aliases, bounded_text, core_group_payload_is_supported,
+        core_private_payload_is_supported, idle_tick_event, merge_data_erasure_targets,
         message_at_self, normalize_attachments, reply_message_id, resolve_and_submit, run_ingress,
         run_runtime, submit_message_collisions, text_mentions_agent, unblock_users,
     };
@@ -2699,11 +2917,13 @@ mod tests {
             reply_to_external_message_id: None,
             text: "hello".to_string(),
             attachments: Vec::new(),
+            vision_attachments: Vec::new(),
             timestamp: Utc::now(),
             addressed_to_agent,
             visible_reply_allowed: true,
             explicit_request: false,
             stop_requested: false,
+            planner_attention_requested: addressed_to_agent,
             incoming_admission: None,
         }
     }
@@ -2729,7 +2949,97 @@ mod tests {
         let at = Message::from(vec![Segment::new("at", json!({"qq": "123"}))]);
         assert!(message_at_self(&at, 123));
         assert!(!message_at_self(&at, 456));
+        assert!(!ambient_group_payload_can_be_sampled(&at));
+        let reply = Message::from(vec![Segment::new("reply", json!({"id": "456"}))]);
+        assert!(!ambient_group_payload_can_be_sampled(&reply));
+        assert!(ambient_group_payload_can_be_sampled(&Message::from(
+            "大家觉得这个怎么样"
+        )));
         assert!(text_mentions_agent("芸汐，看看这个"));
+    }
+
+    #[test]
+    fn core_private_media_support_is_limited_to_resolvable_images() {
+        let text = Message::from("你好呀");
+        assert!(core_private_payload_is_supported(&text, Some("你好呀")));
+
+        let image = Message::from(vec![Segment::new(
+            "image",
+            json!({"file_unique": "image-hash", "file": "image.png"}),
+        )]);
+        assert!(core_private_payload_is_supported(&image, None));
+
+        let text_and_image = Message::from(vec![
+            Segment::new("text", json!({"text": "看看这个"})),
+            Segment::new(
+                "image",
+                json!({"file_unique": "image-hash", "url": "https://example.test/image.png"}),
+            ),
+        ]);
+        assert!(core_private_payload_is_supported(
+            &text_and_image,
+            Some("看看这个")
+        ));
+
+        let unusable_image = Message::from(vec![Segment::new("image", json!({}))]);
+        assert!(!core_private_payload_is_supported(&unusable_image, None));
+        let audio = Message::from(vec![Segment::new("record", json!({"file": "voice.amr"}))]);
+        assert!(!core_private_payload_is_supported(&audio, None));
+        assert!(!core_private_payload_is_supported(
+            &Message::from("#看图"),
+            Some("#看图")
+        ));
+    }
+
+    #[test]
+    fn core_group_media_accepts_ambient_content() {
+        let addressed = Message::from(vec![
+            Segment::new("text", json!({"text": "芸汐看看这个"})),
+            Segment::new(
+                "image",
+                json!({"file_unique": "image-hash", "file": "image.png"}),
+            ),
+        ]);
+        assert!(core_group_payload_is_supported(
+            &addressed,
+            Some("芸汐看看这个")
+        ));
+
+        let structured_at = Message::from(vec![
+            Segment::new("at", json!({"qq": "123"})),
+            Segment::new(
+                "image",
+                json!({"file_unique": "image-hash", "file": "image.png"}),
+            ),
+        ]);
+        assert!(core_group_payload_is_supported(&structured_at, None));
+
+        let ambient = Message::from(vec![Segment::new(
+            "image",
+            json!({"file_unique": "image-hash", "file": "image.png"}),
+        )]);
+        assert!(core_group_payload_is_supported(&ambient, None));
+    }
+
+    #[test]
+    fn ambient_attention_is_sampled_after_a_bounded_message_floor() {
+        let mut registry = super::AmbientAttentionRegistry::new();
+        let policy = super::AmbientAttentionPolicy {
+            enabled: true,
+            min_eligible_messages: 2,
+            candidate_cooldown_secs: 180,
+            response_probability_percent: 100,
+            min_message_chars: 4,
+            decision_rate_window_secs: 600,
+            decision_rate_limit: 3,
+        };
+        let sample = |registry: &mut super::AmbientAttentionRegistry, message_id| {
+            registry.should_request(123, message_id, 8, false, policy)
+        };
+
+        assert!(!sample(&mut registry, 1));
+        assert!(sample(&mut registry, 2));
+        assert!(!sample(&mut registry, 3));
     }
 
     #[test]
@@ -2793,7 +3103,7 @@ mod tests {
         let (ingress, _receiver) = mpsc::channel(1);
         let (runtime, _consumer) =
             yunxi_core::CognitiveRuntime::new(RuntimeConfig::default()).expect("valid runtime");
-        let bridge = ShadowBridge {
+        let bridge = CoreBridge {
             ingress,
             runtime,
             action_arbiter: None,
@@ -2802,6 +3112,7 @@ mod tests {
             blocked_groups: Arc::new(StdMutex::new(HashSet::new())),
             private_handler_gates: Arc::new(super::PrivateHandlerGateRegistry::new(4)),
             group_handler_gates: Arc::new(super::PrivateHandlerGateRegistry::new(4)),
+            ambient_attention: Arc::new(StdMutex::new(super::AmbientAttentionRegistry::new())),
         };
         let message = inbound(ConversationAddress::Group { group_id: 123 }, false);
 
@@ -2820,7 +3131,7 @@ mod tests {
         let (ingress, _receiver) = mpsc::channel(1);
         let (runtime, _consumer) =
             yunxi_core::CognitiveRuntime::new(RuntimeConfig::default()).expect("valid runtime");
-        let bridge = ShadowBridge {
+        let bridge = CoreBridge {
             ingress,
             runtime,
             action_arbiter: None,
@@ -2829,6 +3140,7 @@ mod tests {
             blocked_groups: Arc::new(StdMutex::new(HashSet::from([123]))),
             private_handler_gates: Arc::new(super::PrivateHandlerGateRegistry::new(4)),
             group_handler_gates: Arc::new(super::PrivateHandlerGateRegistry::new(4)),
+            ambient_attention: Arc::new(StdMutex::new(super::AmbientAttentionRegistry::new())),
         };
 
         assert!(bridge.is_group_blocked(123));
@@ -2876,7 +3188,7 @@ mod tests {
                 yunxi_core::CognitiveRuntime::new(RuntimeConfig::default()).expect("valid runtime");
             let blocked_users = Arc::new(StdMutex::new(HashSet::new()));
             let blocked_groups = Arc::new(StdMutex::new(HashSet::new()));
-            let bridge = Arc::new(ShadowBridge {
+            let bridge = Arc::new(CoreBridge {
                 ingress,
                 runtime: runtime_handle.clone(),
                 action_arbiter: None,
@@ -2885,6 +3197,7 @@ mod tests {
                 blocked_groups: Arc::clone(&blocked_groups),
                 private_handler_gates: Arc::new(super::PrivateHandlerGateRegistry::new(4)),
                 group_handler_gates: Arc::new(super::PrivateHandlerGateRegistry::new(4)),
+                ambient_attention: Arc::new(StdMutex::new(super::AmbientAttentionRegistry::new())),
             });
             let mut queued = inbound(
                 ConversationAddress::Direct {
@@ -3009,7 +3322,7 @@ mod tests {
             let (ingress, mut receiver) = mpsc::channel(1);
             let (runtime_handle, _consumer) =
                 yunxi_core::CognitiveRuntime::new(RuntimeConfig::default()).expect("valid runtime");
-            let bridge = Arc::new(ShadowBridge {
+            let bridge = Arc::new(CoreBridge {
                 ingress,
                 runtime: runtime_handle,
                 action_arbiter: None,
@@ -3018,6 +3331,7 @@ mod tests {
                 blocked_groups: Arc::new(StdMutex::new(HashSet::new())),
                 private_handler_gates: Arc::new(super::PrivateHandlerGateRegistry::new(4)),
                 group_handler_gates: Arc::new(super::PrivateHandlerGateRegistry::new(4)),
+                ambient_attention: Arc::new(StdMutex::new(super::AmbientAttentionRegistry::new())),
             });
             kovi::tokio::spawn(async move {
                 let Some(super::IngressCommand::BeginDataErasure { acknowledge, .. }) =
@@ -3043,7 +3357,7 @@ mod tests {
             let (ingress, mut receiver) = mpsc::channel(1);
             let (runtime_handle, _consumer) =
                 yunxi_core::CognitiveRuntime::new(RuntimeConfig::default()).expect("valid runtime");
-            let bridge = Arc::new(ShadowBridge {
+            let bridge = Arc::new(CoreBridge {
                 ingress,
                 runtime: runtime_handle,
                 action_arbiter: None,
@@ -3052,6 +3366,7 @@ mod tests {
                 blocked_groups: Arc::new(StdMutex::new(HashSet::new())),
                 private_handler_gates: Arc::new(super::PrivateHandlerGateRegistry::new(4)),
                 group_handler_gates: Arc::new(super::PrivateHandlerGateRegistry::new(4)),
+                ambient_attention: Arc::new(StdMutex::new(super::AmbientAttentionRegistry::new())),
             });
             kovi::tokio::spawn(async move {
                 let Some(super::IngressCommand::BeginGroupDataErasure { acknowledge, .. }) =
@@ -3118,7 +3433,7 @@ mod tests {
                 while core_runtime.process_next().await.is_some() {}
                 core_runtime
             });
-            let bridge = Arc::new(ShadowBridge {
+            let bridge = Arc::new(CoreBridge {
                 ingress,
                 runtime: runtime_handle.clone(),
                 action_arbiter: None,
@@ -3127,6 +3442,7 @@ mod tests {
                 blocked_groups,
                 private_handler_gates: Arc::new(super::PrivateHandlerGateRegistry::new(4)),
                 group_handler_gates: Arc::new(super::PrivateHandlerGateRegistry::new(4)),
+                ambient_attention: Arc::new(StdMutex::new(super::AmbientAttentionRegistry::new())),
             });
             let mut message = inbound(ConversationAddress::Group { group_id }, true);
             message.sender_user_id = user_id;
@@ -3239,7 +3555,7 @@ mod tests {
                 conversation_id: ConversationId::new(),
                 stored_kind: ConversationKind::Direct,
             });
-            let bridge = ShadowBridge::start(store);
+            let bridge = CoreBridge::start(store);
             let active = bridge
                 .capture_private_handler(456)
                 .expect("handler token")
@@ -3291,7 +3607,7 @@ mod tests {
                 conversation_id: ConversationId::new(),
                 stored_kind: ConversationKind::Group,
             });
-            let bridge = ShadowBridge::start(store);
+            let bridge = CoreBridge::start(store);
             let active = bridge
                 .capture_group_handler(456)
                 .expect("group handler token")
@@ -3412,7 +3728,7 @@ mod tests {
                 conversation_id,
                 stored_kind: ConversationKind::Direct,
             });
-            let bridge = ShadowBridge::start(store);
+            let bridge = CoreBridge::start(store);
             let message = inbound(
                 ConversationAddress::Direct {
                     self_id: 111,
@@ -3456,7 +3772,7 @@ mod tests {
                 conversation_id,
                 stored_kind: ConversationKind::Direct,
             });
-            let (ingress, receiver) = mpsc::channel(super::SHADOW_INGRESS_CAPACITY);
+            let (ingress, receiver) = mpsc::channel(super::CORE_INGRESS_CAPACITY);
             let (runtime_handle, core_runtime) =
                 yunxi_core::CognitiveRuntime::new(RuntimeConfig::default()).expect("valid runtime");
             let blocked_users = Arc::new(StdMutex::new(HashSet::new()));
@@ -3484,7 +3800,7 @@ mod tests {
                 Arc::new(super::PrivateHandlerGateRegistry::new(4)),
             ));
             kovi::tokio::spawn(run_runtime(core_runtime, None, None, None));
-            let bridge = Arc::new(ShadowBridge {
+            let bridge = Arc::new(CoreBridge {
                 ingress,
                 runtime: runtime_handle,
                 action_arbiter: Some(arbiter),
@@ -3493,6 +3809,7 @@ mod tests {
                 blocked_groups,
                 private_handler_gates: Arc::new(super::PrivateHandlerGateRegistry::new(4)),
                 group_handler_gates: Arc::new(super::PrivateHandlerGateRegistry::new(4)),
+                ambient_attention: Arc::new(StdMutex::new(super::AmbientAttentionRegistry::new())),
             });
             let action = ProposedAction::send_message(
                 conversation_id,
@@ -3617,7 +3934,7 @@ mod tests {
                 conversation_id: ConversationId::new(),
                 stored_kind: ConversationKind::Direct,
             });
-            let bridge = ShadowBridge::start(store);
+            let bridge = CoreBridge::start(store);
             let active = bridge
                 .capture_private_handler(789)
                 .expect("alias handler token")
@@ -3783,6 +4100,43 @@ mod tests {
                 };
                 assert_eq!(observation.priority, expected_priority);
             }
+        });
+    }
+
+    #[test]
+    fn sampled_ambient_group_messages_use_reliable_priority() {
+        let runtime = kovi::tokio::runtime::Runtime::new().expect("test runtime");
+        runtime.block_on(async {
+            let address = ConversationAddress::Group { group_id: 123 };
+            let store: Arc<dyn IdentityStore> = Arc::new(FakeIdentityStore {
+                person_id: PersonId::new(),
+                conversation_id: ConversationId::new(),
+                stored_kind: ConversationKind::Group,
+            });
+            let (handle, mut runtime) =
+                yunxi_core::CognitiveRuntime::new(RuntimeConfig::default()).expect("runtime");
+            let mut message = inbound(address, false);
+            message.planner_attention_requested = true;
+            resolve_and_submit(
+                &message,
+                store.as_ref(),
+                &handle,
+                &mut MessageReferenceCache::new(4),
+            )
+            .await
+            .expect("fake mappings should resolve");
+            let ProcessingOutcome::Observed(observation) = runtime
+                .process_next()
+                .await
+                .expect("submitted event should be processed")
+            else {
+                panic!("event should be observed");
+            };
+            assert_eq!(observation.priority, EventPriority::High);
+            assert_eq!(
+                observation.attention.disposition,
+                AttentionDisposition::Attend
+            );
         });
     }
 

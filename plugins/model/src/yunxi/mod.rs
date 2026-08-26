@@ -49,7 +49,7 @@ static GOAL_STORE: OnceLock<Arc<PostgresGoalStore>> = OnceLock::new();
 static DELIVERY_LEDGER: OnceLock<Arc<PostgresDeliveryLedger>> = OnceLock::new();
 static MIND_STORE: OnceLock<Arc<PostgresMindStore>> = OnceLock::new();
 static MIND_RUNTIME: OnceLock<Arc<MindRuntime>> = OnceLock::new();
-static SHADOW_BRIDGE: OnceLock<Arc<bridge::ShadowBridge>> = OnceLock::new();
+static CORE_BRIDGE: OnceLock<Arc<bridge::CoreBridge>> = OnceLock::new();
 static DELIVERY_ROUTE_LOCK: AsyncRwLock<()> = AsyncRwLock::const_new(());
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OwnerQqRoute {
@@ -408,7 +408,7 @@ pub(crate) async fn pin_mind_proactive_reference(
 }
 
 pub(crate) fn observe_mind_maintenance_tick() {
-    if let Some(bridge) = SHADOW_BRIDGE.get() {
+    if let Some(bridge) = CORE_BRIDGE.get() {
         bridge.observe_maintenance_tick();
     }
 }
@@ -539,19 +539,19 @@ fn legacy_mood_projection(mood: &str, intensity: u8) -> (f32, f32, f32) {
     (valence, arousal, curiosity)
 }
 
-pub(crate) fn install_shadow_bridge(bridge: Arc<bridge::ShadowBridge>) -> Result<()> {
-    SHADOW_BRIDGE
+pub(crate) fn install_core_bridge(bridge: Arc<bridge::CoreBridge>) -> Result<()> {
+    CORE_BRIDGE
         .set(bridge)
-        .map_err(|_| anyhow::anyhow!("Yunxi ShadowBridge 已经安装"))
+        .map_err(|_| anyhow::anyhow!("Yunxi CoreBridge 已经安装"))
 }
 
 pub(crate) async fn begin_qq_user_data_erasure(user_id: i64) -> Result<bridge::UserDataErasure> {
-    let bridge = SHADOW_BRIDGE.get().context("Yunxi ShadowBridge 尚未安装")?;
+    let bridge = CORE_BRIDGE.get().context("Yunxi CoreBridge 尚未安装")?;
     bridge.begin_user_data_erasure(user_id).await
 }
 
 pub(crate) async fn begin_qq_group_data_erasure(group_id: i64) -> Result<bridge::GroupDataErasure> {
-    let bridge = SHADOW_BRIDGE.get().context("Yunxi ShadowBridge 尚未安装")?;
+    let bridge = CORE_BRIDGE.get().context("Yunxi CoreBridge 尚未安装")?;
     bridge.begin_group_data_erasure(group_id).await
 }
 

@@ -80,9 +80,7 @@ impl MindDecisionProjection {
                     && !message.replies_to_agent
                     && !message.explicit_request
                 {
-                    projection.disposition = DecisionDisposition::Silent;
                     projection.push_reason(MindReasonTag::LowSocialValue);
-                    return projection;
                 }
 
                 // A clear current-turn request outranks optional long-lived

@@ -1,6 +1,6 @@
 #![expect(
     dead_code,
-    reason = "QQ canonical reference helpers are consumed by the Phase 2 shadow bridge"
+    reason = "QQ canonical reference helpers are consumed by the Core bridge"
 )]
 
 use thiserror::Error;

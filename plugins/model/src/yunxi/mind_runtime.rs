@@ -3057,6 +3057,20 @@ mod tests {
         (runtime, store)
     }
 
+    fn shadow_test_runtime() -> (Arc<MindRuntime>, Arc<InMemoryMindStore>) {
+        let store = Arc::new(InMemoryMindStore::new());
+        let services = MindServices::from_store(Arc::clone(&store));
+        let runtime = Arc::new(
+            MindRuntime::new(
+                services,
+                serde_json::from_value(serde_json::json!({"influence_mode": "shadow"}))
+                    .expect("shadow Mind config"),
+            )
+            .expect("valid shadow Mind runtime"),
+        );
+        (runtime, store)
+    }
+
     fn active_runtime_with_open_loops(
         open_loops: Arc<StatefulOpenLoopStore>,
     ) -> (Arc<MindRuntime>, Arc<InMemoryMindStore>) {
@@ -3709,7 +3723,7 @@ mod tests {
     fn shadow_decision_metrics_capture_token_and_snapshot_latency_delta() {
         let executor = kovi::tokio::runtime::Runtime::new().expect("test runtime");
         executor.block_on(async {
-            let (runtime, store) = test_runtime();
+            let (runtime, store) = shadow_test_runtime();
             let now = Utc::now();
             let interest = Interest::new(
                 yunxi_core::InterestId::new(),
