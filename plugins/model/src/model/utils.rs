@@ -81,6 +81,8 @@ static PRIVATE_HISTORY_ACCESS: LazyLock<Mutex<HashMap<i64, Instant>>> =
 
 const MAX_RUNTIME_CONVERSATIONS: usize = 512;
 const MAX_STREAM_ENVELOPE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_MODEL_ERROR_BODY_BYTES: usize = 16 * 1024;
+const MODEL_ERROR_BODY_TIMEOUT: Duration = Duration::from_secs(2);
 const EMPTY_REPLY_ALERT_WINDOW: Duration = Duration::from_secs(10 * 60);
 const VISION_FAILURE_RESPONSE_PREFIX: &str = "[[VISION_FAILURE]]";
 const DEFAULT_RESPONSES_INSTRUCTIONS: &str = "请根据输入消息完成当前请求。";
@@ -1261,15 +1263,54 @@ pub(crate) async fn params_model_with_token_limit_and_progress_for_reply(
     progress: Option<Arc<ThinkingReporter>>,
     reply_ticket: Option<ReplyTicket>,
 ) -> BotMemory {
+    params_model_with_token_limit_and_progress_for_reply_mode(
+        messages,
+        max_tokens,
+        vision_images,
+        progress,
+        reply_ticket,
+        true,
+    )
+    .await
+}
+
+pub(crate) async fn params_model_without_reply_guidance(
+    messages: &mut [BotMemory],
+    max_tokens: Option<u32>,
+    vision_images: &[VisionImage],
+    progress: Option<Arc<ThinkingReporter>>,
+    reply_ticket: Option<ReplyTicket>,
+) -> BotMemory {
+    params_model_with_token_limit_and_progress_for_reply_mode(
+        messages,
+        max_tokens,
+        vision_images,
+        progress,
+        reply_ticket,
+        false,
+    )
+    .await
+}
+
+async fn params_model_with_token_limit_and_progress_for_reply_mode(
+    messages: &mut [BotMemory],
+    max_tokens: Option<u32>,
+    vision_images: &[VisionImage],
+    progress: Option<Arc<ThinkingReporter>>,
+    reply_ticket: Option<ReplyTicket>,
+    append_reply_guidance: bool,
+) -> BotMemory {
     let config = config::get();
     let server_config = config.server_config();
 
     // 回复引导只用于本次请求，不写回长期会话，避免 system 消息不断累积。
     let mut request_messages = messages.to_owned();
-    request_messages.push(BotMemory {
-        role: Roles::System,
-        content: generate_reply_guidance(messages).await,
-    });
+    if append_reply_guidance {
+        request_messages.push(BotMemory {
+            role: Roles::System,
+            content: generate_reply_guidance(messages).await,
+        });
+    }
     if progress.is_some() {
         request_messages.push(BotMemory {
             role: Roles::System,
@@ -1389,7 +1430,17 @@ pub(crate) async fn params_model_with_token_limit_and_progress_for_reply(
             }
             Ok(response) => {
                 let status = response.status();
-                last_error = format!("模型请求返回 HTTP {status}");
+                let detail = kovi::tokio::time::timeout(
+                    MODEL_ERROR_BODY_TIMEOUT,
+                    model_error_response_detail(response),
+                )
+                .await
+                .ok()
+                .flatten();
+                last_error = match detail {
+                    Some(detail) => format!("模型请求返回 HTTP {status}: {detail}"),
+                    None => format!("模型请求返回 HTTP {status}"),
+                };
                 if !status.is_server_error()
                     && status != reqwest::StatusCode::TOO_MANY_REQUESTS
                     && status != reqwest::StatusCode::REQUEST_TIMEOUT
@@ -1399,7 +1450,16 @@ pub(crate) async fn params_model_with_token_limit_and_progress_for_reply(
             }
             Err(error) => {
                 let retryable = error.is_timeout() || error.is_connect() || error.is_request();
-                last_error = format!("模型请求失败: {error}");
+                let category = if error.is_timeout() {
+                    "超时"
+                } else if error.is_connect() {
+                    "连接"
+                } else if error.is_request() {
+                    "请求"
+                } else {
+                    "网络"
+                };
+                last_error = format!("模型请求失败（{category}）: {error}");
                 if !retryable {
                     break;
                 }
@@ -1434,6 +1494,42 @@ fn model_attempt_count(configured_retries: u8) -> usize {
     usize::from(configured_retries.saturating_add(1))
 }
 
+async fn model_error_response_detail(mut response: reqwest::Response) -> Option<String> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_MODEL_ERROR_BODY_BYTES as u64)
+    {
+        return None;
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.ok()? {
+        if body.len().saturating_add(chunk.len()) > MAX_MODEL_ERROR_BODY_BYTES {
+            return None;
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let value = serde_json::from_slice::<Value>(&body).ok()?;
+    let error = value.get("error");
+    let kind = error
+        .and_then(|error| error.get("type"))
+        .and_then(Value::as_str)
+        .or_else(|| value.get("type").and_then(Value::as_str));
+    let message = error
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+        .or_else(|| value.get("message").and_then(Value::as_str));
+    match (kind, message) {
+        (Some(kind), Some(message)) => Some(format!(
+            "{}: {}",
+            compact_incident_text(kind, 80, "upstream_error"),
+            compact_incident_text(message, 240, "上游未提供错误详情")
+        )),
+        (Some(kind), None) => Some(compact_incident_text(kind, 80, "upstream_error")),
+        (None, Some(message)) => Some(compact_incident_text(message, 240, "上游未提供错误详情")),
+        (None, None) => None,
+    }
+}
+
 async fn read_model_content(
     mut response: reqwest::Response,
     reporter: Option<&ThinkingReporter>,
@@ -1465,8 +1561,9 @@ async fn read_model_content(
     let mut raw_body = Vec::new();
     let mut pending = Vec::new();
     let mut streamed_content = String::new();
+    let mut stream_completed = false;
 
-    while let Some(chunk) = response
+    'stream: while let Some(chunk) = response
         .chunk()
         .await
         .map_err(|error| format!("模型响应读取失败: {error}"))?
@@ -1478,18 +1575,28 @@ async fn read_model_content(
         pending.extend_from_slice(&chunk);
         while let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
             let line = pending.drain(..=newline).collect::<Vec<_>>();
-            observe_stream_line(&line, &mut streamed_content, reporter).await;
+            if observe_stream_line(&line, &mut streamed_content, reporter).await? {
+                stream_completed = true;
+                break 'stream;
+            }
         }
     }
-    if !pending.is_empty() {
-        observe_stream_line(&pending, &mut streamed_content, reporter).await;
+    if !stream_completed && !pending.is_empty() {
+        stream_completed = observe_stream_line(&pending, &mut streamed_content, reporter).await?;
     }
 
     if !streamed_content.trim().is_empty() {
         if streamed_content.len() > max_response_bytes {
             return Err(format!("模型正文超过 {} 字节上限", max_response_bytes));
         }
+        if is_event_stream && !stream_completed {
+            eprintln!("[WARN] 模型流式响应在终态事件前结束，使用已接收的完整正文");
+        }
         return Ok(strip_thinking_notices(&streamed_content));
+    }
+
+    if is_event_stream {
+        return Err("模型流式响应中缺少可读内容".to_string());
     }
 
     let body =
@@ -1508,25 +1615,75 @@ async fn observe_stream_line(
     line: &[u8],
     streamed_content: &mut String,
     reporter: Option<&ThinkingReporter>,
-) {
+) -> Result<bool, String> {
+    let previous_len = streamed_content.len();
+    let completed = parse_stream_line(line, streamed_content)?;
+    if streamed_content.len() != previous_len
+        && let Some(reporter) = reporter
+    {
+        reporter.observe_model_output(streamed_content).await;
+    }
+    Ok(completed)
+}
+
+fn parse_stream_line(line: &[u8], streamed_content: &mut String) -> Result<bool, String> {
     let line = String::from_utf8_lossy(line);
     let line = line.trim().trim_end_matches('\r');
     let Some(data) = line.strip_prefix("data:").map(str::trim) else {
-        return;
+        return Ok(false);
     };
-    if data.is_empty() || data == "[DONE]" {
-        return;
+    if data.is_empty() {
+        return Ok(false);
+    }
+    if data == "[DONE]" {
+        return Ok(true);
     }
     let Ok(value) = serde_json::from_str::<Value>(data) else {
-        return;
+        return Ok(false);
     };
-    let Some(delta) = extract_stream_delta(&value) else {
-        return;
-    };
-    append_stream_delta(streamed_content, delta);
-    if let Some(reporter) = reporter {
-        reporter.observe_model_output(streamed_content).await;
+
+    match value.get("type").and_then(Value::as_str) {
+        Some("response.output_text.done") => {
+            if let Some(text) = value.get("text").and_then(Value::as_str) {
+                append_stream_delta(streamed_content, text);
+            }
+        }
+        Some("response.completed") => {
+            if let Some(content) = value
+                .get("response")
+                .and_then(extract_response_content)
+                .or_else(|| extract_response_content(&value))
+            {
+                streamed_content.clear();
+                streamed_content.push_str(&content);
+            }
+            return Ok(true);
+        }
+        Some("response.failed" | "response.incomplete" | "error") => {
+            return Err(stream_terminal_error(&value));
+        }
+        _ => {
+            if let Some(delta) = extract_stream_delta(&value) {
+                append_stream_delta(streamed_content, delta);
+            }
+        }
     }
+    Ok(false)
+}
+
+fn stream_terminal_error(value: &Value) -> String {
+    let event_type = value.get("type").and_then(Value::as_str).unwrap_or("error");
+    let detail = value
+        .pointer("/response/error/message")
+        .or_else(|| value.pointer("/error/message"))
+        .or_else(|| value.get("message"))
+        .and_then(Value::as_str)
+        .map(|message| truncate_chars(message.trim(), 240))
+        .filter(|message| !message.is_empty());
+    detail.map_or_else(
+        || format!("模型流式响应异常终止: {event_type}"),
+        |detail| format!("模型流式响应异常终止: {event_type}: {detail}"),
+    )
 }
 
 /// Accept both standard incremental SSE deltas and gateways that incorrectly
@@ -2636,7 +2793,7 @@ mod tests {
         append_stream_delta, build_model_messages, build_responses_input,
         build_responses_request_body, compression_cutoff, extract_stream_delta,
         group_system_prompt, is_group_admin_command, is_help_command, is_restricted_command,
-        limit_memory_size, model_attempt_count, sanitize_scheduled_output,
+        limit_memory_size, model_attempt_count, parse_stream_line, sanitize_scheduled_output,
         should_repair_empty_reply, with_reference_context,
     };
     use crate::memory::{BotPersonality, UserProfile};
@@ -2906,6 +3063,7 @@ mod tests {
         assert_eq!(request["input"].as_array().map(Vec::len), Some(1));
         assert_eq!(request["input"][0]["role"], "user");
         assert_eq!(request["input"][0]["content"], "你好");
+        assert_eq!(request["stream"], true);
     }
 
     #[test]
@@ -2935,6 +3093,104 @@ mod tests {
         });
         assert_eq!(extract_stream_delta(&responses_event), Some("先看一下"));
         assert_eq!(extract_stream_delta(&chat_event), Some("再回答"));
+    }
+
+    #[test]
+    fn responses_completed_event_ends_stream_and_keeps_final_text() {
+        let mut content = String::new();
+        let delta = serde_json::json!({
+            "type": "response.output_text.delta",
+            "delta": "先"
+        });
+        assert!(
+            !parse_stream_line(format!("data: {delta}").as_bytes(), &mut content,)
+                .expect("delta should parse")
+        );
+        let completed = serde_json::json!({
+            "type": "response.completed",
+            "response": {
+                "output": [{
+                    "content": [{"type": "output_text", "text": "先完成"}]
+                }]
+            }
+        });
+        assert!(
+            parse_stream_line(format!("data: {completed}").as_bytes(), &mut content,)
+                .expect("completed event should parse")
+        );
+        assert_eq!(content, "先完成");
+    }
+
+    #[test]
+    fn responses_completed_event_replaces_multipart_snapshots() {
+        let mut content = String::new();
+        for event in [
+            serde_json::json!({
+                "type": "response.output_text.delta",
+                "delta": "第一段"
+            }),
+            serde_json::json!({
+                "type": "response.output_text.done",
+                "text": "第一段"
+            }),
+            serde_json::json!({
+                "type": "response.output_text.delta",
+                "delta": "第二段"
+            }),
+            serde_json::json!({
+                "type": "response.output_text.done",
+                "text": "第二段"
+            }),
+        ] {
+            assert!(
+                !parse_stream_line(format!("data: {event}").as_bytes(), &mut content)
+                    .expect("multipart event should parse")
+            );
+        }
+        let completed = serde_json::json!({
+            "type": "response.completed",
+            "response": {
+                "output": [{
+                    "content": [
+                        {"type": "output_text", "text": "第一段"},
+                        {"type": "output_text", "text": "第二段"}
+                    ]
+                }]
+            }
+        });
+        assert!(
+            parse_stream_line(format!("data: {completed}").as_bytes(), &mut content)
+                .expect("completed event should parse")
+        );
+        assert_eq!(content, "第一段\n第二段");
+    }
+
+    #[test]
+    fn responses_done_event_can_supply_text_without_a_delta() {
+        let mut content = String::new();
+        let done = serde_json::json!({
+            "type": "response.output_text.done",
+            "text": "完整回复"
+        });
+        assert!(
+            !parse_stream_line(format!("data: {done}").as_bytes(), &mut content,)
+                .expect("done event should parse")
+        );
+        assert_eq!(content, "完整回复");
+        assert!(parse_stream_line(b"data: [DONE]", &mut content).expect("done marker"));
+    }
+
+    #[test]
+    fn responses_failed_event_is_reported_immediately() {
+        let mut content = String::new();
+        let failed = serde_json::json!({
+            "type": "response.failed",
+            "response": {"error": {"message": "上游失败"}}
+        });
+        let error = parse_stream_line(format!("data: {failed}").as_bytes(), &mut content)
+            .expect_err("failed event should stop the stream");
+        assert!(error.contains("response.failed"));
+        assert!(error.contains("上游失败"));
     }
 
     #[test]

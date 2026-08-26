@@ -6,7 +6,8 @@ use super::thinking::ThinkingReporter;
 use super::tool_access::{ToolExecutionContext, ToolExecutionResult, tool_registry};
 use super::utils::{
     BotMemory, Roles, complete_truncated_json_object, is_model_error_response,
-    params_model_with_token_limit_and_progress_for_reply, vision_failure_detail,
+    params_model_with_token_limit_and_progress_for_reply, params_model_without_reply_guidance,
+    vision_failure_detail,
 };
 use crate::config;
 use crate::vision::VisionImage;
@@ -767,17 +768,66 @@ pub(crate) async fn interruptible_model_call(
     vision_images: &[VisionImage],
     progress: Option<Arc<ThinkingReporter>>,
 ) -> Option<BotMemory> {
+    interruptible_model_call_mode(
+        messages,
+        reply_ticket,
+        max_output_tokens,
+        vision_images,
+        progress,
+        true,
+    )
+    .await
+}
+
+pub(crate) async fn interruptible_model_call_without_reply_guidance(
+    messages: &mut [BotMemory],
+    reply_ticket: ReplyTicket,
+    max_output_tokens: Option<u32>,
+    vision_images: &[VisionImage],
+    progress: Option<Arc<ThinkingReporter>>,
+) -> Option<BotMemory> {
+    interruptible_model_call_mode(
+        messages,
+        reply_ticket,
+        max_output_tokens,
+        vision_images,
+        progress,
+        false,
+    )
+    .await
+}
+
+async fn interruptible_model_call_mode(
+    messages: &mut [BotMemory],
+    reply_ticket: ReplyTicket,
+    max_output_tokens: Option<u32>,
+    vision_images: &[VisionImage],
+    progress: Option<Arc<ThinkingReporter>>,
+    append_reply_guidance: bool,
+) -> Option<BotMemory> {
     if !is_current(reply_ticket).await {
         return None;
     }
     kovi::tokio::select! {
-        response = params_model_with_token_limit_and_progress_for_reply(
-            messages,
-            max_output_tokens,
-            vision_images,
-            progress,
-            Some(reply_ticket),
-        ) => {
+        response = async {
+            if append_reply_guidance {
+                params_model_with_token_limit_and_progress_for_reply(
+                    messages,
+                    max_output_tokens,
+                    vision_images,
+                    progress,
+                    Some(reply_ticket),
+                ).await
+            } else {
+                params_model_without_reply_guidance(
+                    messages,
+                    max_output_tokens,
+                    vision_images,
+                    progress,
+                    Some(reply_ticket),
+                ).await
+            }
+        } => {
             is_current(reply_ticket).await.then_some(response)
         }
         () = wait_until_interrupted(reply_ticket) => None,

@@ -199,10 +199,15 @@ async fn repair_direct_reply(
     // INTERACTION_CUES protocol. Conflicting protocol instructions were the
     // source of the production repair returning another empty result.
     let mut repair_messages = repair_context_messages(messages, allow_tool_call);
-    let response =
-        ModelGateway::complete_without_tools(&mut repair_messages, reply_ticket, None, &[], None)
-            .await
-            .ok_or(CoreDirectRepairFailure::ModelCancelledOrFailed)?;
+    let response = ModelGateway::complete_without_tools_or_reply_guidance(
+        &mut repair_messages,
+        reply_ticket,
+        None,
+        &[],
+        None,
+    )
+    .await
+    .ok_or(CoreDirectRepairFailure::ModelCancelledOrFailed)?;
     if crate::model::utils::is_model_error_response(&response.content) {
         return Err(CoreDirectRepairFailure::ModelErrorResponse);
     }

@@ -1,7 +1,10 @@
 //! 模型调用边界。
 
 use super::interrupt::ReplyTicket;
-use super::memory_query::{interruptible_model_call, params_model_with_tool_access};
+use super::memory_query::{
+    interruptible_model_call, interruptible_model_call_without_reply_guidance,
+    params_model_with_tool_access,
+};
 use super::thinking::ThinkingReporter;
 use super::tool_access::ToolExecutionContext;
 use super::utils::BotMemory;
@@ -27,6 +30,25 @@ impl ModelGateway {
         progress: Option<Arc<ThinkingReporter>>,
     ) -> Option<BotMemory> {
         interruptible_model_call(
+            messages,
+            reply_ticket,
+            max_output_tokens,
+            vision_images,
+            progress,
+        )
+        .await
+    }
+
+    /// Complete a tightly scoped protocol repair without appending the style
+    /// guidance used by normal chat replies.
+    pub(crate) async fn complete_without_tools_or_reply_guidance(
+        messages: &mut [BotMemory],
+        reply_ticket: ReplyTicket,
+        max_output_tokens: Option<u32>,
+        vision_images: &[VisionImage],
+        progress: Option<Arc<ThinkingReporter>>,
+    ) -> Option<BotMemory> {
+        interruptible_model_call_without_reply_guidance(
             messages,
             reply_ticket,
             max_output_tokens,
