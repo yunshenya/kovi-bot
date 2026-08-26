@@ -348,11 +348,6 @@ pub(crate) async fn private_message_event_after_ingress(
             None
         };
     let sticker_reaction = recent_sticker_reaction.is_some();
-    if looks_like_immediate_stop_request(message) {
-        stop_private_reply(user_id, ingress).await;
-        println!("[INFO] 私聊用户打断回复 (用户: {})", user_id);
-        return;
-    }
     let initial_recent_reference = if vision_command && !text_message.trim().is_empty() {
         ImageReferenceIntent::Described
     } else if vision_command {
@@ -864,27 +859,6 @@ fn normalized_private_sender_name(value: &str) -> String {
     }
 }
 
-fn looks_like_immediate_stop_request(message: &str) -> bool {
-    let normalized = message
-        .trim()
-        .trim_matches(|character: char| {
-            character.is_ascii_punctuation() || "，。！？…".contains(character)
-        })
-        .to_ascii_lowercase();
-    matches!(
-        normalized.as_str(),
-        "别说了"
-            | "不要说了"
-            | "别回复了"
-            | "不要回复了"
-            | "停下"
-            | "停止回复"
-            | "闭嘴"
-            | "stop"
-            | "stop replying"
-    )
-}
-
 fn private_social_image_prompt() -> &'static str {
     "对方发来了一张图片或表情包。请先看清画面传达的情绪、动作和重点，再像熟悉的朋友一样自然接话；不要把回复写成识图报告，也不要无缘无故逐项描述画面。"
 }
@@ -1133,9 +1107,9 @@ async fn take_pending_private_turn(
 mod tests {
     use super::{
         AgentTaskCommand, PENDING_PRIVATE_MESSAGES, admit_understood_private_turn,
-        looks_like_immediate_stop_request, normalized_private_sender_name,
-        parse_agent_task_command, queue_pending_private_message, select_recent_images,
-        should_queue_after_executive, take_pending_private_turn, with_recent_image_context,
+        normalized_private_sender_name, parse_agent_task_command, queue_pending_private_message,
+        select_recent_images, should_queue_after_executive, take_pending_private_turn,
+        with_recent_image_context,
     };
     use crate::model::conversation_coordinator::{
         ConversationCoordinator, OutgoingExecutiveDecision,
@@ -1170,13 +1144,6 @@ mod tests {
                 .count(),
             80
         );
-    }
-
-    #[test]
-    fn exact_private_stop_phrases_are_local_and_conservative() {
-        assert!(looks_like_immediate_stop_request("不要回复了。"));
-        assert!(looks_like_immediate_stop_request("stop replying"));
-        assert!(!looks_like_immediate_stop_request("为什么他说不要回复了？"));
     }
 
     #[test]

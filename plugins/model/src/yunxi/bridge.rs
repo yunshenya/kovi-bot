@@ -689,8 +689,8 @@ impl ShadowBridge {
     }
 
     /// Whether this private event is now owned by the Core direct-conversation
-    /// path. Control commands and stop requests stay on the legacy handler so
-    /// their specialized host behavior remains available during migration.
+    /// path. Control commands and any structured stop signal stay on the
+    /// legacy handler so their specialized host behavior remains available.
     pub(crate) fn handles_private(&self, event: &PrivateMsgEvent) -> bool {
         self.action_arbiter.is_some()
             && self.action_port.is_some()
@@ -1150,7 +1150,7 @@ impl InboundMessage {
                 || text_mentions_agent(&text),
             visible_reply_allowed: true,
             explicit_request: false,
-            stop_requested: looks_like_stop_request(&text),
+            stop_requested: false,
             incoming_admission: None,
             text,
             attachments,
@@ -1177,7 +1177,7 @@ impl InboundMessage {
             addressed_to_agent: true,
             visible_reply_allowed: true,
             explicit_request: true,
-            stop_requested: looks_like_stop_request(&text),
+            stop_requested: false,
             incoming_admission: None,
             text,
             attachments,
@@ -2493,37 +2493,15 @@ fn text_mentions_agent(message: &str) -> bool {
     ["芸汐", "云汐"].iter().any(|name| message.contains(name))
 }
 
-fn looks_like_stop_request(message: &str) -> bool {
-    let normalized = message
-        .trim()
-        .trim_matches(|character: char| {
-            character.is_ascii_punctuation() || "，。！？…".contains(character)
-        })
-        .to_ascii_lowercase();
-    matches!(
-        normalized.as_str(),
-        "别说了"
-            | "不要说了"
-            | "别回复了"
-            | "不要回复了"
-            | "停下"
-            | "停止回复"
-            | "闭嘴"
-            | "stop"
-            | "stop replying"
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
         ConversationAddress, EnqueueOutcome, InboundMessage, IncomingAdmissionReleaseFuture,
         IncomingAdmissionReleaser, IngressRouteTracker, MessageReference, MessageReferenceCache,
         MessageReferenceKey, ShadowBridge, acquire_alias_handler_barriers, action_result_event,
-        block_user_aliases, bounded_text, idle_tick_event, looks_like_stop_request,
-        merge_data_erasure_targets, message_at_self, normalize_attachments, reply_message_id,
-        resolve_and_submit, run_ingress, run_runtime, submit_message_collisions,
-        text_mentions_agent, unblock_users,
+        block_user_aliases, bounded_text, idle_tick_event, merge_data_erasure_targets,
+        message_at_self, normalize_attachments, reply_message_id, resolve_and_submit, run_ingress,
+        run_runtime, submit_message_collisions, text_mentions_agent, unblock_users,
     };
     use crate::model::{
         OutgoingSource, ReplyScope, commit_outgoing, interrupt, mark_active, mark_outgoing_sent,
@@ -2679,13 +2657,11 @@ mod tests {
     }
 
     #[test]
-    fn structured_at_and_stop_detection_are_conservative() {
+    fn structured_at_and_name_detection_are_conservative() {
         let at = Message::from(vec![Segment::new("at", json!({"qq": "123"}))]);
         assert!(message_at_self(&at, 123));
         assert!(!message_at_self(&at, 456));
         assert!(text_mentions_agent("芸汐，看看这个"));
-        assert!(looks_like_stop_request("STOP！"));
-        assert!(!looks_like_stop_request("他说‘别说了’，然后离开了"));
     }
 
     #[test]

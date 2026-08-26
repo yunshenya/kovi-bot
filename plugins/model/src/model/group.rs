@@ -139,27 +139,6 @@ fn normalized_sender_name(value: Option<&str>) -> Option<String> {
     (!normalized.is_empty()).then_some(normalized)
 }
 
-fn looks_like_immediate_stop_request(message: &str) -> bool {
-    let normalized = message
-        .trim()
-        .trim_matches(|character: char| {
-            character.is_ascii_punctuation() || "，。！？…".contains(character)
-        })
-        .to_ascii_lowercase();
-    matches!(
-        normalized.as_str(),
-        "别说了"
-            | "不要说了"
-            | "别回复了"
-            | "不要回复了"
-            | "停下"
-            | "停止回复"
-            | "闭嘴"
-            | "stop"
-            | "stop replying"
-    )
-}
-
 /// 当前回复期间使用有界 FIFO 保存完整 turn，避免跨成员混合正文和附件。
 static PENDING_WINDOW_MESSAGES: LazyLock<Mutex<HashMap<i64, VecDeque<PendingWindowMessage>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -528,11 +507,6 @@ pub(crate) async fn group_message_event_after_ingress(
     }
     let active_reply = is_active(reply_scope).await;
     let conversation_open = has_open_conversation_window(group_id).await;
-    if looks_like_immediate_stop_request(message) {
-        stop_group_reply(group_id, event.user_id, ingress).await;
-        println!("[INFO] 群聊用户打断回复 (群组: {})", group_id);
-        return;
-    }
     // 合并前只做确定性的本地判断，完整语义理解在批次形成后只调用一次。
     let mut vision_requested = vision_command
         || pending_image_request
@@ -1802,11 +1776,11 @@ mod tests {
         PENDING_WINDOW_MESSAGES, admit_understood_group_turn,
         clear_group_erasure_reply_state_locked, complete_interjection_attempt,
         conversation_message_is_relevant, decision_budget_available,
-        group_erasure_receipt_destination, has_active_conversation_window,
-        looks_like_immediate_stop_request, message_at_self, normalized_sender_name,
-        prune_decision_attempts, queue_pending_window_message, roll_conversation_window,
-        should_queue_after_executive, sticker_reaction_budget_available, suppress_direct_trigger,
-        take_pending_window_turn, text_mentions_bot, with_structured_bot_mention_context,
+        group_erasure_receipt_destination, has_active_conversation_window, message_at_self,
+        normalized_sender_name, prune_decision_attempts, queue_pending_window_message,
+        roll_conversation_window, should_queue_after_executive, sticker_reaction_budget_available,
+        suppress_direct_trigger, take_pending_window_turn, text_mentions_bot,
+        with_structured_bot_mention_context,
     };
     use crate::model::MessageDestination;
     use crate::model::conversation_coordinator::{
@@ -1936,15 +1910,6 @@ mod tests {
             Some("群 名片 测试")
         );
         assert_eq!(normalized_sender_name(Some("   ")), None);
-    }
-
-    #[test]
-    fn exact_stop_phrases_can_interrupt_without_a_semantic_round_trip() {
-        assert!(looks_like_immediate_stop_request("别说了！"));
-        assert!(looks_like_immediate_stop_request("STOP"));
-        assert!(!looks_like_immediate_stop_request(
-            "他说‘别说了’，然后就走了"
-        ));
     }
 
     #[test]

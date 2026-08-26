@@ -408,6 +408,16 @@ mod tests {
     }
 
     #[test]
+    fn stop_intent_comes_from_model_output_instead_of_local_phrases() {
+        let request = UnderstandingRequest::text("不要回复了", "private_chat");
+        let understood = parse_understanding(r#"{"wants_stop":true}"#, &request);
+        assert!(understood.wants_stop);
+
+        let unclassified = parse_understanding("不是 JSON", &request);
+        assert!(!unclassified.wants_stop);
+    }
+
+    #[test]
     fn parses_cross_group_action_intent_as_structured_data() {
         let request = UnderstandingRequest::text("去开发群说今晚八点开会", "private_chat");
         let result = parse_understanding(

@@ -832,6 +832,8 @@ mod tests {
             "每隔30秒请求一下 https://example.com/health，直到返回 ready 之后告诉我",
             "查看接口监控任务状态",
             "停止监控这个链接",
+            "不要回复了",
+            "stop replying",
         ] {
             let message = Message::from(text);
             assert!(
