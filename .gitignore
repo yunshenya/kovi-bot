@@ -9,3 +9,4 @@ kovi.plugin.toml
 bot_memory.json
 bot_memory.json.tmp
 bot_memory.json.corrupt.*
+.DS_Store

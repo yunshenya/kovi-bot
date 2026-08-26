@@ -6,6 +6,7 @@
 **适用项目：** Yunxi Core / kovi-bot  
 **主要语言：** Rust  
 **前置依赖：** Yunxi Core v1 已全部实现并作为稳定运行基线  
+**本次实现复核基线：** `yunshenya/kovi-bot` main @ `f304018362f01610b535fc3e977d5d9d1c283a56`；后续若 main 更新，仍以最新稳定代码为准  
 **文档定位：** 以当前仓库已经实现完成的 Yunxi Core v1 为权威基线，在不重写、不迁移、不破坏既有 V1 公共契约的前提下，为芸汐增加持续心智状态、自我一致性、内部议程与低频反思能力。
 
 ---
@@ -216,6 +217,224 @@ V10 training pipeline
 ```
 
 可以预留接口，但不能把后续版本职责提前塞进 Mind。
+
+## 2.5 对齐当前 V1 已有的语义证据、Stop 与恢复路径
+
+当前 V1 已经进一步实现：
+
+```text
+InteractionCues
+InteractionCuesObservedEvent
+structured stop_requested
+Core direct reply repair / fallback
+Person / Conversation data-erasure barrier
+```
+
+V2 必须直接复用这些已有能力。
+
+### 2.5.1 InteractionCues 是已有语义证据入口
+
+当前 V1 已经可以由 Host 的同一次模型理解结果产生：
+
+```text
+sentiment valence
+sentiment arousal
+sentiment confidence
+gratitude strength
+```
+
+并投影为：
+
+```text
+WorldEventKind::InteractionCuesObserved
+```
+
+V2 不增加第二套：
+
+```text
+sentiment analyzer
+emotion classifier
+gratitude classifier
+```
+
+来重复处理同一轮消息。
+
+V2 可以使用已有 `InteractionCues` 影响：
+
+```text
+Interest activation
+Curiosity activation
+Agenda salience
+Mind retrieval ranking
+```
+
+但不能仅凭 cue 直接生成长期：
+
+```text
+Belief
+Preference
+Fact
+```
+
+因为 cue 是当前交互证据，不是长期命题。
+
+### 2.5.2 Mind inference 不得默认造成每条消息第二次大模型调用
+
+第一版优先：
+
+```text
+existing reply/model pass
++
+existing InteractionCues
++
+deterministic event features
++
+low-frequency Reflection
+```
+
+如果以后确实需要每轮产生：
+
+```text
+MindHint
+BeliefCandidate
+CuriosityCandidate
+```
+
+优先：
+
+```text
+扩展已有 bounded structured sidecar
+```
+
+或：
+
+```text
+使用低成本本地模型
+```
+
+禁止默认：
+
+```text
+正常回复大模型一次
++
+再调用一次大模型做 Mind extraction
+```
+
+### 2.5.3 structured stop_requested 优先级高于 Mind
+
+当前 V1 已存在结构化 Stop 识别和回复取消路径。
+
+当：
+
+```text
+stop_requested = true
+```
+
+时：
+
+```text
+Mind
+Belief
+Curiosity
+Agenda
+Reflection
+```
+
+都不能把当前可见回复重新恢复。
+
+保持：
+
+```text
+Stop
+→ cancel / silent
+```
+
+V2 不增加第二套 Stop classifier。
+
+### 2.5.4 Provider repair / fallback 允许忽略 Mind
+
+当前 V1 已经存在直接回复 provider failure repair / fallback。
+
+Repair 的第一目标：
+
+```text
+得到安全、可见、不过期的回复
+```
+
+不是：
+
+```text
+恢复完整人格和所有 Mind 上下文
+```
+
+因此遇到：
+
+```text
+MindSnapshot unavailable
+MindSnapshot timeout
+Mind snapshot stale
+provider repair path active
+```
+
+允许：
+
+```text
+omit MindSnapshot
+→ use V1 repair/fallback
+```
+
+V2 不能把 Mind 的故障扩大成原本 V1 不会发生的整轮回复失败。
+
+### 2.5.5 V1 data-erasure barrier 必须覆盖 V2 Mind 数据
+
+V1 当前已经支持 Person / Conversation data-erasure barrier。
+
+V2 新增：
+
+```text
+Belief
+Preference
+Interest
+Curiosity
+OpenQuestion
+Agenda
+Episode
+```
+
+之后，这些持久状态必须进入同一删除语义。
+
+正确顺序：
+
+```text
+begin V1 data-erasure barrier
+↓
+block new matching ingress
+↓
+erase V1 persistent user/conversation data
+↓
+erase matching Mind persistent data
+↓
+invalidate Mind snapshot / retrieval caches
+↓
+finish barrier
+```
+
+如果 Mind 删除失败：
+
+```text
+不要提前解除 barrier
+```
+
+必须 fail closed / retry / report internal failure。
+
+否则可能出现：
+
+```text
+Memory 已删除
+但 Belief / Episode 仍保存用户数据
+```
+
+这是 V2 的 blocking defect。
 
 # 3. 核心设计目标
 
@@ -1601,33 +1820,56 @@ Reflection 是：
 
 # 55. ReflectTick
 
-新增：
+V2 第一版不新增：
 
 ```text
-WorldEvent::ReflectTick
+V2-internal ReflectionTrigger
 ```
 
-但不应高频。
+当前 V1 已经拥有：
 
-建议：
+```text
+WorldEventKind::IdleTick
+WorldEventKind::MaintenanceTick
+```
+
+Reflection 使用 V2 内部调度概念：
+
+```rust
+pub enum ReflectionTrigger {
+    Idle,
+    Maintenance,
+    ConversationLikelyEnded,
+    HighSalienceEvent,
+    MemoryPressure,
+    AgendaPressure,
+    DayBoundary,
+}
+```
+
+触发来源可以包括：
+
+```text
+IdleTick
+MaintenanceTick
+conversation-end heuristic
+host scheduler
+high-salience event
+```
+
+这样不需要为了 V2 修改 V1 `WorldEventKind`。
+
+默认仍建议：
 
 ```text
 30～120 分钟级
 ```
 
-或基于：
-
-- recent salient event；
-- idle period；
-- memory pressure；
-- unresolved agenda；
-- day boundary。
-
-具体由配置决定。
+或基于事件按需触发。
 
 ---
 
-# 56. ReflectTick 不等于一定调用模型
+# 56. Reflection Trigger 不等于一定调用模型
 
 先用 Rust 判断：
 
@@ -1643,11 +1885,23 @@ OR
 unresolved agenda
 OR
 memory consolidation needed
+OR
+meaningful belief conflict
 ```
 
 才进入 Reflection model。
 
----
+当前 V1 的 `MaintenanceTick` 本身属于维护路径。
+
+因此：
+
+```text
+MaintenanceTick
+```
+
+不能因为 V2 而强制触发普通 Planner 大模型调用。
+
+Reflection scheduler 独立决定是否启动后台 Reflection。
 
 # 57. Reflection 输入
 
@@ -2023,6 +2277,78 @@ Planner 只看到 bounded Snapshot
 ```
 
 Store 仍然不要做成一个拥有几十个方法的万能数据库 trait。
+
+## 71.1 Mind Data Erasure Port
+
+V2 增加聚合删除边界：
+
+```rust
+pub trait MindDataErasure: Send + Sync {
+    fn erase_person<'a>(
+        &'a self,
+        person_id: PersonId,
+    ) -> MindDataErasureFuture<'a>;
+
+    fn erase_conversation<'a>(
+        &'a self,
+        conversation_id: ConversationId,
+    ) -> MindDataErasureFuture<'a>;
+}
+```
+
+实现必须覆盖：
+
+```text
+person-scoped beliefs
+person-scoped open questions
+person/conversation agenda
+curiosity
+episodes
+derived indexes
+Mind snapshot cache
+retrieval cache
+```
+
+全局：
+
+```text
+SelfModel
+Yunxi global Preference
+```
+
+不因删除单一 Person 而删除。
+
+但这些全局结构原则上也不应存放可识别的 Person 私有数据。
+
+## 71.2 与当前 V1 data-erasure barrier 集成
+
+Host 删除流程：
+
+```text
+V1 begin_user/group_data_erasure
+↓
+MindDataErasure
+↓
+other persistent data deletion
+↓
+V1 finish barrier
+```
+
+必须保证：
+
+```text
+同 scope 的新事件在删除完成前不能重新写回 Mind
+```
+
+测试至少包括：
+
+```text
+erase person while Reflection pending
+erase conversation while Agenda update pending
+erase person while MindSnapshot retrieval pending
+restart after completed erase
+failed Mind erase keeps barrier closed
+```
 
 # 72. PostgreSQL 实现
 
@@ -2723,6 +3049,59 @@ mood bad
 
 ---
 
+## 106.1 复用 V1 InteractionCues
+
+当前 V1 已经拥有：
+
+```rust
+pub struct InteractionCues {
+    pub sentiment_valence: f32,
+    pub sentiment_arousal: f32,
+    pub sentiment_confidence: f32,
+    pub gratitude_strength: f32,
+}
+```
+
+并能投影：
+
+```text
+InteractionCuesObservedEvent
+```
+
+V2 固定规则：
+
+```text
+InteractionCues
+→ transient evidence
+
+Affect / Relation
+→ 继续使用 V1 deterministic evolution
+
+Interest / Curiosity / Agenda
+→ 可以把 cue 作为 bounded bonus
+
+Belief / Preference
+→ 不允许仅凭 cue 直接持久化
+```
+
+例如：
+
+```text
+gratitude_strength high
+```
+
+可以轻微增加当前 social salience。
+
+但不能仅凭这一项生成：
+
+```text
+“这个人非常信任我”
+```
+
+之类长期高置信 Belief。
+
+V2 不新增第二次 sentiment 模型调用。
+
 # 107. Interest 与 User Preference 分离
 
 必须区分：
@@ -3283,22 +3662,56 @@ would add attention bonus +X
 
 # 131. Phase 4：Curiosity / OpenQuestion
 
-模型结构化提议：
+第一版优先使用：
+
+```text
+existing WorldEvent
++
+existing InteractionCues
++
+deterministic heuristics
++
+low-frequency Reflection
+```
+
+产生：
+
+```text
+CuriosityCandidate
+OpenQuestionCandidate
+```
+
+如果确实需要模型结构化提议：
 
 ```text
 create curiosity?
 create open question?
 ```
 
-Rust 校验。
+优先：
 
-第一阶段先：
+```text
+已有模型 pass 的 bounded sidecar
+```
 
-Shadow。
+或：
 
-不马上主动问。
+```text
+低成本本地模型
+```
 
----
+不要默认每条消息额外调用一次大模型。
+
+所有 Candidate：
+
+```text
+→ Rust validate
+→ dedupe
+→ scope check
+→ Shadow
+```
+
+第一阶段不马上主动问。
 
 # 132. Phase 5：InnerAgenda
 
@@ -3364,7 +3777,75 @@ Runtime / Context assembly
 
 这保证 Planner 调用可重放。
 
+
+实际接线建议：
+
+```text
+CognitiveRuntime
+→ optional MindSnapshotProvider
+→ default None
+```
+
+增加 additive builder，例如：
+
+```rust
+pub fn with_mind_snapshot_provider(
+    mut self,
+    provider: Arc<dyn MindSnapshotProvider>,
+) -> Self
+```
+
+这样：
+
+```text
+现有 V1 runtime constructor
+→ 行为不变
+
+V2-enabled runtime
+→ 显式安装 Mind provider
+```
+
+不要把七个 Mind Store 直接塞进 `CoreServices`。
 # 134. Phase 7：Opinion Behavior
+
+V2 的用户可见 Mind Influence 必须先进入 Shadow。
+
+运行：
+
+```text
+V1 real decision
++
+V2 shadow decision
+```
+
+记录：
+
+```text
+would_disagree
+would_silent
+would_resume_agenda
+would_ask_question
+would_change_topic
+retrieved_beliefs
+retrieved_preferences
+active_agenda
+extra model calls
+extra tokens
+latency delta
+```
+
+Shadow 不允许：
+
+```text
+额外发送消息
+额外执行 Tool
+改变真实 Action
+创建真实 proactive
+```
+
+---
+
+# 135. Phase 8：Opinion Behavior
 
 允许：
 
@@ -3375,12 +3856,22 @@ Runtime / Context assembly
 
 重点测试：
 
-不 sycophantic
-不 contrarian
+```text
+not sycophantic
+not contrarian
+```
+
+并保证：
+
+```text
+structured stop_requested
+```
+
+永远优先于 Opinion 行为。
 
 ---
 
-# 135. Phase 8：Association
+# 136. Phase 9：Association
 
 实现：
 
@@ -3390,52 +3881,80 @@ current topic
 → optional topic resume
 ```
 
-严格 cooldown。
+严格：
+
+```text
+cooldown
+scope isolation
+private-memory isolation
+```
 
 ---
 
-# 136. Phase 9：Reflection
+# 137. Phase 10：Reflection
 
-增加：
+实现：
 
-ReflectTick
-
+```text
+ReflectionTrigger
 LightReflection
-
 DeepReflection
+Episode generation
+```
 
-Episode generation。
+ReflectionTrigger 复用：
+
+```text
+IdleTick
+MaintenanceTick
+conversation-end heuristic
+host scheduler
+```
+
+不新增 `V2-internal ReflectionTrigger`。
 
 ---
 
-# 137. Phase 10：Consolidation
+# 138. Phase 11：Consolidation
 
-ReflectionProposal：
-
-必须通过 Rust validation。
+ReflectionProposal 必须经过 Rust validation。
 
 加入：
 
 - max update per reflection；
 - dedupe；
 - version check；
-- persistence transaction。
+- scope check；
+- persistence transaction；
+- data-erasure barrier / epoch check。
 
 ---
 
-# 138. Phase 11：Proactive
+# 139. Phase 12：Proactive
 
-让主动行为更多受：
+主动行为更多受：
 
+```text
 InnerAgenda
+```
 
 而不是：
 
-Random eligible target。
+```text
+Random eligible target
+```
+
+继续复用 V1：
+
+```text
+ActionArbiter
+ConversationCoordinator
+Outgoing lifecycle
+```
 
 ---
 
-# 139. Phase 12：Persistence Hardening
+# 140. Phase 13：Persistence Hardening
 
 加入：
 
@@ -3444,19 +3963,33 @@ Random eligible target。
 - retention；
 - backup compatibility；
 - restart；
-- migration idempotency。
+- migration idempotency；
+- MindDataErasure；
+- Person / Conversation erase integration；
+- pending Reflection invalidation；
+- stale MindSnapshot invalidation。
 
----
-
-# 140. Phase 13：Behavior Evaluation
+## Phase 14：Behavior Evaluation
 
 建立固定行为测试集。
 
-不要只测试：
+除了：
 
-compile passed。
+```text
+compile passed
+```
 
----
+还必须验证：
+
+```text
+V1-compatible fallback
+Mind shadow delta
+Stop compliance
+Data erasure completeness
+No duplicate semantic model pass
+Token delta
+Latency delta
+```
 
 # 141. Behavioral Scenario A
 
@@ -4125,6 +4658,10 @@ ActionArbiter authorization / rate limit / idempotency
 AffectState / RelationState validation
 CoreServices fake/unavailable adapters
 Proactive existing cooldown / candidate rules
+InteractionCuesObserved deterministic path
+structured stop_requested cancellation
+Core provider repair / fallback
+Person / Conversation data-erasure barrier
 ```
 
 特别要求：
@@ -4255,6 +4792,15 @@ Reflection never directly sends
 [ ] V2 不让每条消息额外调用一次大模型
 [ ] V1 compatibility regression 全部通过
 [ ] Mind disabled / empty 时系统仍能按 V1 工作
+[ ] 复用 V1 InteractionCues / InteractionCuesObservedEvent
+[ ] 不增加第二套 sentiment / gratitude classifier
+[ ] structured stop_requested 不能被 Mind 覆盖
+[ ] Provider repair/fallback 可在无 Mind 时继续工作
+[ ] V2 不新增 WorldEvent::ReflectTick
+[ ] Reflection 使用内部 ReflectionTrigger
+[ ] MindDataErasure 覆盖 Person / Conversation scope
+[ ] V1 data-erasure barrier 未完成前不得重新写入 Mind
+[ ] Phase 7～14 与详细实施章节一致
 ```
 
 完成这些后，V2 才算真正建立在“已经完成的 V1”之上，而不是把 V1 重新设计一遍。
@@ -4361,7 +4907,7 @@ attention
 → reuse, Mind only provides salience/relevance inputs
 
 event
-→ reuse WorldEvent / TraceContext
+→ reuse WorldEvent / TraceContext / InteractionCuesObservedEvent
 
 goal
 → reuse
@@ -4379,7 +4925,7 @@ open_loop
 → reuse; never merge with OpenQuestion
 
 planner
-→ reuse Planner/ModelBackend/DecisionDisposition;
+→ reuse Planner/ModelBackend/DecisionDisposition/InteractionCues;
    additive MindSnapshot only
 
 ports
@@ -4391,7 +4937,8 @@ proactive
    do not rewrite proactive runtime first
 
 runtime
-→ reuse; Mind is not a second runtime
+→ reuse; Mind is not a second runtime;
+   reuse current Person/Conversation data-erasure barrier semantics
 
 working_state
 → reuse; MindSnapshot is separate bounded state
@@ -4452,6 +4999,51 @@ V2 当前只需要：
 > **把 Mind 正确地建立在现有 V1 上。**
 
 
+# Appendix D：V2 开工前 Implementation Gate
+
+按当前 V1 复核后，V2 可以开始实现，但先满足：
+
+```text
+Gate 1
+V1 regression tests green
+
+Gate 2
+Mind disabled == V1 behavior
+
+Gate 3
+Mind data erase integrated with V1 barrier
+
+Gate 4
+No per-message second large-model call by default
+```
+
+推荐第一批 PR：
+
+```text
+PR 1
+mind domain types + validation only
+
+PR 2
+MindServices / MindSnapshotProvider + fake implementation
+
+PR 3
+MindDataErasure + erasure race tests
+
+PR 4
+SelfModel / Belief persistence
+
+PR 5
+PlannerInput additive MindSnapshot + Shadow only
+```
+
+在 PR 5 以前：
+
+```text
+不改变真实回复行为
+```
+
+这样最大程度保护当前已经稳定的 V1。
+
 # Conversation Concurrency Integration
 
 
@@ -4506,7 +5098,8 @@ New User Message:
 
 ```text
 New Message
-→ Observation / Semantic Update
+→ V1 WorldEvent / existing semantic cues
+→ Mind candidate update
 → OpenLoop resolved
 → Curiosity resolved
 → OpenQuestion resolved if applicable
