@@ -40,7 +40,7 @@ const CORE_INTERACTION_CUES_START: &str = "[[INTERACTION_CUES]]";
 const CORE_INTERACTION_CUES_END: &str = "[[/INTERACTION_CUES]]";
 const MAX_CORE_INTERACTION_CUES_PAYLOAD_BYTES: usize = 256;
 const CORE_DIRECT_FALLBACK_REPLY: &str = "我刚才处理回复时出了点问题，请再发一次。";
-const CORE_DIRECT_REPAIR_PROMPT: &str = "Core 私聊回复修复：上一轮没有形成可见回复，但当前用户消息明确需要回应。现在必须给出可执行结果：如果用户明确要求执行受控工具操作，按已有 Core 工具协议只输出一个完整且唯一的 [[TOOL_CALL]]{\"name\":\"工具名\",\"arguments\":{}}[[/TOOL_CALL]]；否则只输出一条自然、简短的中文聊天回复。不能选择 silent，不能输出多个调用、JSON、解释这次修复或空字符串。";
+const CORE_DIRECT_REPAIR_PROMPT: &str = "Core 私聊回复修复：只根据下面给出的用户原话生成本轮结果。目标和参数明确且确实需要受控工具时，只输出一个完整且唯一的 [[TOOL_CALL]]{\"name\":\"工具名\",\"arguments\":{}}[[/TOOL_CALL]]；其他情况只输出一条自然、简短的中文聊天正文。禁止 silent、INTERACTION_CUES、REPLY_ACTION、其他 JSON、代码块、解释、空字符串或多个工具调用。跨群目标不明确时直接询问群号或准确群名，不要调用 group.message.targets。";
 
 fn prepared_outgoing_semantic_context(content: &str) -> String {
     let encoded = serde_json::to_string(content)
@@ -101,6 +101,27 @@ struct ParsedCoreResponse {
 enum CoreDirectRepair {
     Reply(ReplyPlan),
     Tool(CognitiveIntent),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CoreDirectRepairFailure {
+    ModelCancelledOrFailed,
+    ModelErrorResponse,
+    EmptyOutput,
+    InvalidProtocol,
+    SilentOrInvisibleReply,
+}
+
+impl CoreDirectRepairFailure {
+    const fn as_log_reason(self) -> &'static str {
+        match self {
+            Self::ModelCancelledOrFailed => "model_cancelled_or_failed",
+            Self::ModelErrorResponse => "model_error_response",
+            Self::EmptyOutput => "empty_output",
+            Self::InvalidProtocol => "invalid_protocol",
+            Self::SilentOrInvisibleReply => "silent_or_invisible_reply",
+        }
+    }
 }
 
 /// Parse the optional model-produced semantic sidecar and always remove
@@ -165,35 +186,112 @@ async fn repair_direct_reply(
     scope: ReplyScope,
     allow_tool_call: bool,
     action_scope: Option<ActionScope>,
-) -> Option<CoreDirectRepair> {
-    let mut repair_messages = messages.to_vec();
-    repair_messages.push(BotMemory {
+) -> Result<CoreDirectRepair, CoreDirectRepairFailure> {
+    // Keep the repair turn independent from the first completion's mandatory
+    // INTERACTION_CUES protocol. Conflicting protocol instructions were the
+    // source of the production repair returning another empty result.
+    let mut repair_messages = repair_context_messages(messages, allow_tool_call);
+    let response =
+        ModelGateway::complete_without_tools(&mut repair_messages, reply_ticket, None, &[], None)
+            .await
+            .ok_or(CoreDirectRepairFailure::ModelCancelledOrFailed)?;
+    if crate::model::utils::is_model_error_response(&response.content) {
+        return Err(CoreDirectRepairFailure::ModelErrorResponse);
+    }
+    parse_direct_repair_output(&response.content, scope, allow_tool_call, action_scope).await
+}
+
+fn repair_context_messages(messages: &[BotMemory], allow_tool_call: bool) -> Vec<BotMemory> {
+    // Replaying memories, open loops, or an old prepared reply can reintroduce
+    // untrusted instructions after the first completion failed. Keep only
+    // trusted host instructions that are useful for a repair, notably the
+    // current tool registry schema when a tool call is allowed.
+    let mut repair = messages
+        .iter()
+        .filter(|message| {
+            if !matches!(message.role, Roles::System) {
+                return false;
+            }
+            if is_conflicting_core_protocol(&message.content) {
+                return false;
+            }
+            allow_tool_call || !is_tool_registry_instruction(&message.content)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if let Some(user_message) = messages
+        .iter()
+        .rev()
+        .find(|message| matches!(message.role, Roles::User))
+        .cloned()
+    {
+        repair.push(user_message);
+    }
+    repair.push(BotMemory {
         role: Roles::System,
         content: CORE_DIRECT_REPAIR_PROMPT.to_string(),
     });
-    let response =
-        ModelGateway::complete_without_tools(&mut repair_messages, reply_ticket, None, &[], None)
-            .await?;
-    if crate::model::utils::is_model_error_response(&response.content) {
-        return None;
+    repair
+}
+
+fn is_conflicting_core_protocol(content: &str) -> bool {
+    [
+        "Core 单轮语义协议",
+        "Core 工具协议",
+        "Core 并发裁决",
+        "Core 私聊回复修复",
+    ]
+    .iter()
+    .any(|prefix| content.starts_with(prefix))
+}
+
+fn is_tool_registry_instruction(content: &str) -> bool {
+    content.starts_with("你可以在确实需要外部资料")
+        || content.starts_with("你正在执行已经由用户授权的定时任务")
+        || content.starts_with("Core 工具清单当前不可用")
+}
+
+async fn parse_direct_repair_output(
+    content: &str,
+    scope: ReplyScope,
+    allow_tool_call: bool,
+    action_scope: Option<ActionScope>,
+) -> Result<CoreDirectRepair, CoreDirectRepairFailure> {
+    let content = content.trim();
+    if content.is_empty() {
+        return Err(CoreDirectRepairFailure::EmptyOutput);
     }
-    let parsed = parse_core_response(&response.content);
-    if parsed.content.trim().is_empty() {
-        return None;
+    // `model_error` responses are user-facing diagnostics from the gateway,
+    // not a repair candidate. Trim first because providers occasionally add
+    // a leading newline around the response.
+    if crate::model::utils::is_model_error_response(content) {
+        return Err(CoreDirectRepairFailure::ModelErrorResponse);
+    }
+    if content.contains(CORE_INTERACTION_CUES_START)
+        || content.contains(CORE_INTERACTION_CUES_END)
+        || content.contains("[[REPLY_ACTION]]")
+        || content.contains("[[/REPLY_ACTION]]")
+        || content.contains("[[NEXT_MESSAGE]]")
+    {
+        return Err(CoreDirectRepairFailure::InvalidProtocol);
     }
     if allow_tool_call
         && let Some(action_scope) = action_scope
-        && let Some(intent) = parse_core_tool_intent(&parsed.content, action_scope)
+        && let Some(intent) = parse_core_tool_intent(content, action_scope)
     {
-        return Some(CoreDirectRepair::Tool(intent));
+        return Ok(CoreDirectRepair::Tool(intent));
     }
-    if parsed.content.contains(CORE_TOOL_CALL_START) || parsed.content.contains(CORE_TOOL_CALL_END)
-    {
-        return None;
+    if content.contains(CORE_TOOL_CALL_START) || content.contains(CORE_TOOL_CALL_END) {
+        return Err(CoreDirectRepairFailure::InvalidProtocol);
     }
-    let plan = ReplyPlan::from_model_output(scope, &parsed.content).await;
-    plan.has_visible_reply()
-        .then_some(CoreDirectRepair::Reply(plan))
+    if serde_json::from_str::<serde_json::Value>(content).is_ok() {
+        return Err(CoreDirectRepairFailure::InvalidProtocol);
+    }
+    let plan = ReplyPlan::from_model_output(scope, content).await;
+    if !plan.has_visible_reply() || plan.content.trim().is_empty() || plan.is_silent() {
+        return Err(CoreDirectRepairFailure::SilentOrInvisibleReply);
+    }
+    Ok(CoreDirectRepair::Reply(plan))
 }
 
 async fn register_core_tool_intent(
@@ -945,6 +1043,18 @@ fn direct_reply_expected(input: &PlannerInput) -> bool {
     )
 }
 
+async fn direct_fallback_reply_plan(scope: ReplyScope) -> ReplyPlan {
+    ReplyPlan::from_model_output(scope, CORE_DIRECT_FALLBACK_REPLY).await
+}
+
+/// Core intents currently carry only text (plus an optional reply target), so
+/// a structured reply plan with only an @ action cannot be represented by the
+/// platform-neutral `CognitiveIntent`. Treat it as invisible here rather than
+/// preparing an empty outgoing envelope that the action adapter cannot send.
+fn core_plan_has_visible_text(plan: &ReplyPlan) -> bool {
+    plan.has_visible_reply() && !plan.content.trim().is_empty()
+}
+
 fn direct_fallback_plan(input: &PlannerInput, cues: InteractionCues) -> Option<DecisionPlan> {
     let WorldEventKind::MessageReceived(message) = input.event.kind() else {
         return None;
@@ -1347,7 +1457,7 @@ impl ModelBackend for KoviModelBackend {
             if !mark_active(ticket).await {
                 return Ok(silent_with_interaction_state(input));
             }
-            let response_content = match ModelGateway::complete_without_tools(
+            let (response_content, fallback_response) = match ModelGateway::complete_without_tools(
                 &mut messages,
                 ticket,
                 None,
@@ -1356,7 +1466,20 @@ impl ModelBackend for KoviModelBackend {
             )
             .await
             {
-                Some(response) => response.content,
+                Some(response)
+                    if direct_reply_expected(input)
+                        && crate::model::utils::is_model_error_response(&response.content)
+                        && is_current(ticket).await =>
+                {
+                    kovi::log::warn!(
+                        "Yunxi Core direct reply fallback: event_id={} message_id={} conversation_id={} reason=model_error_response",
+                        input.event.id(),
+                        message_id_for_log(input),
+                        conversation_id_for_log(input),
+                    );
+                    (CORE_DIRECT_FALLBACK_REPLY.to_string(), true)
+                }
+                Some(response) => (response.content, false),
                 None if direct_reply_expected(input) && is_current(ticket).await => {
                     kovi::log::warn!(
                         "Yunxi Core direct reply fallback: event_id={} message_id={} conversation_id={} reason=model_cancelled_or_failed",
@@ -1364,14 +1487,23 @@ impl ModelBackend for KoviModelBackend {
                         message_id_for_log(input),
                         conversation_id_for_log(input),
                     );
-                    CORE_DIRECT_FALLBACK_REPLY.to_string()
+                    (CORE_DIRECT_FALLBACK_REPLY.to_string(), true)
                 }
                 None => {
                     crate::model::finish(ticket).await;
                     return Ok(silent_with_interaction_state(input));
                 }
             };
-            let parsed_response = if message.is_some() {
+            let parsed_response = if fallback_response && message.is_some() {
+                ParsedCoreResponse {
+                    content: response_content,
+                    interaction_cues: InteractionCues::default(),
+                    // A fallback response is a replacement for any prepared
+                    // response from an earlier turn; it must never be
+                    // classified as `None` and accidentally kept.
+                    incoming_impact: Some(IncomingTurnImpact::Unrelated),
+                }
+            } else if message.is_some() {
                 parse_core_response(&response_content)
             } else {
                 ParsedCoreResponse {
@@ -1472,7 +1604,7 @@ impl ModelBackend for KoviModelBackend {
             };
             let mut plan =
                 ReplyPlan::from_model_output(conversation.scope(), &response_content).await;
-            if (!plan.has_visible_reply() || plan.content.trim().is_empty())
+            if !core_plan_has_visible_text(&plan)
                 && direct_reply_expected(input)
                 && is_current(ticket).await
             {
@@ -1492,7 +1624,7 @@ impl ModelBackend for KoviModelBackend {
                 )
                 .await
                 {
-                    Some(CoreDirectRepair::Reply(repaired)) => {
+                    Ok(CoreDirectRepair::Reply(repaired)) => {
                         plan = repaired;
                         kovi::log::info!(
                             "Yunxi Core direct reply repair succeeded: event_id={} message_id={} conversation_id={}",
@@ -1501,7 +1633,7 @@ impl ModelBackend for KoviModelBackend {
                             conversation_id_for_log(input),
                         );
                     }
-                    Some(CoreDirectRepair::Tool(intent)) => {
+                    Ok(CoreDirectRepair::Tool(intent)) => {
                         if let Some(tool_plan) = register_core_tool_intent(
                             &self.tool_turns,
                             input,
@@ -1527,28 +1659,33 @@ impl ModelBackend for KoviModelBackend {
                             message_id_for_log(input),
                             conversation_id_for_log(input),
                         );
-                        plan = ReplyPlan::from_model_output(
-                            conversation.scope(),
-                            CORE_DIRECT_FALLBACK_REPLY,
-                        )
-                        .await;
+                        plan = direct_fallback_reply_plan(conversation.scope()).await;
                     }
-                    None => {
+                    Err(failure) => {
                         kovi::log::warn!(
-                            "Yunxi Core direct reply fallback: event_id={} message_id={} conversation_id={} reason=repair_failed",
+                            "Yunxi Core direct reply fallback: event_id={} message_id={} conversation_id={} reason={}",
                             input.event.id(),
                             message_id_for_log(input),
                             conversation_id_for_log(input),
+                            failure.as_log_reason(),
                         );
-                        plan = ReplyPlan::from_model_output(
-                            conversation.scope(),
-                            CORE_DIRECT_FALLBACK_REPLY,
-                        )
-                        .await;
+                        plan = direct_fallback_reply_plan(conversation.scope()).await;
                     }
                 }
             }
-            if !plan.has_visible_reply() || plan.content.trim().is_empty() {
+            if !core_plan_has_visible_text(&plan)
+                && direct_reply_expected(input)
+                && is_current(ticket).await
+            {
+                kovi::log::warn!(
+                    "Yunxi Core direct reply fallback: event_id={} message_id={} conversation_id={} reason=final_plan_still_invisible",
+                    input.event.id(),
+                    message_id_for_log(input),
+                    conversation_id_for_log(input),
+                );
+                plan = direct_fallback_reply_plan(conversation.scope()).await;
+            }
+            if !core_plan_has_visible_text(&plan) {
                 crate::model::finish(ticket).await;
                 return Ok(silent_with_interaction_cues(
                     input,
@@ -1672,19 +1809,21 @@ fn visible_reply_state_updates(event: &WorldEventKind) -> Vec<StateUpdateProposa
 #[cfg(test)]
 mod tests {
     use super::{
-        BoundedCache, BoundedRouteCache, CORE_DIRECT_FALLBACK_REPLY, HostToolTurnRegistry,
-        LegacyConversation, PersistentRouteLookup, RouteContext, VisibleReplyTarget,
-        classify_persistent_person_identity, defer_unroutable_due, direct_fallback_plan,
-        direct_reply_expected, due_reply_target, interaction_state_updates_with_cues,
-        keeps_existing_prepared_plan, parse_core_response, parse_core_tool_intent,
-        parse_qq_conversation, pre_model_plan, prepared_outgoing_semantic_context,
-        purge_group_routes_from_cache, refine_core_incoming, route_from_lookup,
-        route_lookup_with_fallback, visible_reply_intent, visible_reply_state_updates,
+        BoundedCache, BoundedRouteCache, CORE_DIRECT_FALLBACK_REPLY, CORE_DIRECT_REPAIR_PROMPT,
+        CoreDirectRepair, HostToolTurnRegistry, LegacyConversation, PersistentRouteLookup,
+        RouteContext, VisibleReplyTarget, classify_persistent_person_identity,
+        core_plan_has_visible_text, defer_unroutable_due, direct_fallback_plan,
+        direct_fallback_reply_plan, direct_reply_expected, due_reply_target,
+        interaction_state_updates_with_cues, keeps_existing_prepared_plan, parse_core_response,
+        parse_core_tool_intent, parse_direct_repair_output, parse_qq_conversation, pre_model_plan,
+        prepared_outgoing_semantic_context, purge_group_routes_from_cache, refine_core_incoming,
+        repair_context_messages, route_from_lookup, route_lookup_with_fallback,
+        visible_reply_intent, visible_reply_state_updates,
     };
     use crate::model::{
-        ConversationCoordinator, IncomingTurnImpact, OutgoingExecutiveDecision, OutgoingSource,
-        ReplyScope, commit_outgoing, interrupt, mark_active, mark_outgoing_failed,
-        outgoing_fingerprint, prepare_outgoing,
+        BotMemory, ConversationCoordinator, IncomingTurnImpact, OutgoingExecutiveDecision,
+        OutgoingSource, ReplyPlan, ReplyScope, Roles, commit_outgoing, interrupt, mark_active,
+        mark_outgoing_failed, outgoing_fingerprint, prepare_outgoing,
     };
     use chrono::Utc;
     use yunxi_core::{
@@ -1754,6 +1893,149 @@ mod tests {
         let input = message_input(PersonId::new(), false);
         assert!(!direct_reply_expected(&input));
         assert!(direct_fallback_plan(&input, InteractionCues::default()).is_none());
+    }
+
+    #[test]
+    fn direct_repair_context_removes_conflicting_core_protocols() {
+        let messages = vec![
+            BotMemory {
+                role: Roles::System,
+                content: "Core 单轮语义协议：必须输出 cues".to_string(),
+            },
+            BotMemory {
+                role: Roles::System,
+                content: "Core 工具协议：必须输出 TOOL_CALL".to_string(),
+            },
+            BotMemory {
+                role: Roles::User,
+                content: "你可以去群里早上好".to_string(),
+            },
+        ];
+        let repaired = repair_context_messages(&messages, true);
+        assert_eq!(repaired.len(), 2);
+        assert_eq!(repaired[0].role, Roles::User);
+        assert_eq!(repaired[0].content, "你可以去群里早上好");
+        assert_eq!(repaired[1].role, Roles::System);
+        assert_eq!(repaired[1].content, CORE_DIRECT_REPAIR_PROMPT);
+        assert!(!CORE_DIRECT_REPAIR_PROMPT.contains("[[INTERACTION_CUES]]"));
+    }
+
+    #[test]
+    fn direct_repair_context_keeps_tool_schema_without_conflicting_protocols() {
+        let messages = vec![
+            BotMemory {
+                role: Roles::System,
+                content: "你可以在确实需要外部资料时调用工具。工具：time.now".to_string(),
+            },
+            BotMemory {
+                role: Roles::System,
+                content: "Core 工具协议：必须输出 TOOL_CALL".to_string(),
+            },
+            BotMemory {
+                role: Roles::System,
+                content: "Core 单轮语义协议：必须输出 cues".to_string(),
+            },
+            BotMemory {
+                role: Roles::Data,
+                content: "Core memory context: stale data".to_string(),
+            },
+            BotMemory {
+                role: Roles::User,
+                content: "现在几点？".to_string(),
+            },
+        ];
+        let repaired = repair_context_messages(&messages, true);
+        assert_eq!(repaired.len(), 3);
+        assert_eq!(repaired[0].content, messages[0].content);
+        assert_eq!(repaired[1].content, messages[4].content);
+        assert_eq!(repaired[2].content, CORE_DIRECT_REPAIR_PROMPT);
+
+        let text_only = repair_context_messages(&messages, false);
+        assert_eq!(text_only.len(), 2);
+        assert_eq!(text_only[0].content, messages[4].content);
+        assert_eq!(text_only[1].content, CORE_DIRECT_REPAIR_PROMPT);
+    }
+
+    #[test]
+    fn direct_repair_output_rejects_protocol_markers_and_silent_plans() {
+        let runtime = kovi::tokio::runtime::Runtime::new().expect("test runtime");
+        runtime.block_on(async {
+            let scope = ReplyScope::Private(9_370_100);
+            let action_scope = ActionScope::Conversation(ConversationId::new());
+            for candidate in [
+                "",
+                "[sp]",
+                "[[REPLY_ACTION]]{\"disposition\":\"silent\"}[[/REPLY_ACTION]]",
+                "[[INTERACTION_CUES]]{}[[/INTERACTION_CUES]]你好",
+                "[[TOOL_CALL]]坏的[[/TOOL_CALL]]",
+                "{\"answer\":\"你好\"}",
+                "第一句[[NEXT_MESSAGE]]第二句",
+                "  抱歉，模型服务暂时不可用（上游超时）。",
+            ] {
+                assert!(
+                    parse_direct_repair_output(candidate, scope, true, Some(action_scope))
+                        .await
+                        .is_err(),
+                    "repair candidate must be rejected: {candidate:?}"
+                );
+            }
+
+            let valid =
+                parse_direct_repair_output("可以，我来处理。", scope, true, Some(action_scope))
+                    .await
+                    .expect("ordinary repair text should be accepted");
+            let CoreDirectRepair::Reply(plan) = valid else {
+                panic!("ordinary repair text must become a visible reply");
+            };
+            assert!(plan.has_visible_reply());
+            assert!(!plan.is_silent());
+
+            let tool = parse_direct_repair_output(
+                "[[TOOL_CALL]]{\"name\":\"time.now\",\"arguments\":{}}[[/TOOL_CALL]]",
+                scope,
+                true,
+                Some(action_scope),
+            )
+            .await
+            .expect("valid repair tool call should be accepted");
+            assert!(matches!(tool, CoreDirectRepair::Tool(_)));
+        });
+    }
+
+    #[test]
+    fn rejected_silent_repair_uses_a_visible_fixed_fallback() {
+        let runtime = kovi::tokio::runtime::Runtime::new().expect("test runtime");
+        runtime.block_on(async {
+            let scope = ReplyScope::Private(9_370_101);
+            assert!(matches!(
+                parse_direct_repair_output("[sp]", scope, false, None).await,
+                Err(super::CoreDirectRepairFailure::SilentOrInvisibleReply)
+            ));
+
+            let fallback = direct_fallback_reply_plan(scope).await;
+            assert!(fallback.has_visible_reply());
+            assert!(!fallback.is_silent());
+            assert_eq!(fallback.content, CORE_DIRECT_FALLBACK_REPLY);
+        });
+    }
+
+    #[test]
+    fn core_rejects_action_only_mentions_without_text() {
+        let runtime = kovi::tokio::runtime::Runtime::new().expect("test runtime");
+        runtime.block_on(async {
+            let plan = ReplyPlan::from_model_output_for_sender(
+                ReplyScope::Group(9_370_102),
+                r#"[[REPLY_ACTION]]{"at_current_sender":true}[[/REPLY_ACTION]]"#,
+                Some(123),
+            )
+            .await;
+            assert!(plan.has_visible_reply());
+            assert!(plan.content.is_empty());
+            assert!(!core_plan_has_visible_text(&plan));
+
+            let text = ReplyPlan::from_model_output(ReplyScope::Private(9_370_102), "收到").await;
+            assert!(core_plan_has_visible_text(&text));
+        });
     }
 
     #[test]
