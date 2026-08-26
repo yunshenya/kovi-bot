@@ -156,104 +156,45 @@ pub mod test_support {
 /// 后台任务启动标志，确保只启动一次
 static BACKGROUND_TASK_STARTED: AtomicBool = AtomicBool::new(false);
 const DATABASE_INIT_MAX_ATTEMPTS: u32 = 8;
-const CORE_PRIVATE_CUTOVER_ENV: &str = "YUNXI_CORE_PRIVATE_CUTOVER";
-const CORE_GROUP_CUTOVER_ENV: &str = "YUNXI_CORE_GROUP_CUTOVER";
 
-/// Exactly one runtime owns a private message. Core ownership is opt-in until
-/// its visible-reply failure paths are proven in production; setting the
-/// environment variable to `1`, `true`, or `on` enables the cutover. The
-/// explicit `0`, `false`, or `off` values remain an emergency rollback switch.
-/// Unsupported host features still fall back to the mature legacy handler.
+/// Exactly one runtime owns a message. Core owns every supported event; the
+/// mature Host handler is used only for payloads that Core does not accept.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PrivateMessageOwner {
-    Legacy,
+enum MessageOwner {
+    Host,
     Core,
     Dropped,
 }
 
-fn core_private_cutover_enabled_from(value: Option<&str>) -> bool {
-    value.is_some_and(|value| {
-        matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "on" | "yes"
-        )
-    })
-}
-
-fn core_private_cutover_enabled() -> bool {
-    core_private_cutover_enabled_from(
-        std::env::var_os(CORE_PRIVATE_CUTOVER_ENV)
-            .as_deref()
-            .and_then(std::ffi::OsStr::to_str),
-    )
-}
-
-fn core_group_cutover_enabled_from(value: Option<&str>) -> bool {
-    core_private_cutover_enabled_from(value)
-}
-
-fn core_group_cutover_enabled() -> bool {
-    core_group_cutover_enabled_from(
-        std::env::var_os(CORE_GROUP_CUTOVER_ENV)
-            .as_deref()
-            .and_then(std::ffi::OsStr::to_str),
-    )
-}
-
-/// When the private Core cutover is enabled, every supported text turn belongs
-/// to Core. Only commands, empty input, and non-text payloads stay on legacy.
-fn core_private_canary_payload_is_safe(
-    message: &kovi::Message,
-    text: Option<&str>,
-    _sender_is_admin: bool,
-) -> bool {
-    message.iter().all(|segment| segment.type_ == "text")
-        && text.is_some_and(|text| {
-            let text = text.trim();
-            !text.is_empty() && !text.starts_with('#')
-        })
-}
-
 /// Select a single owner at the Kovi ingress boundary.
 ///
-/// Unsupported events always stay with the legacy handler. Every event first
-/// advances the shared conversation version so a stale prepared output cannot
-/// survive merely because Core is disabled, lacks the host feature, or its
-/// ingress queue is full. Once Core accepts the event, legacy must not run as
-/// well because both paths can send a visible reply.
-async fn select_private_message_owner<Interrupt, InterruptFuture, Admission>(
-    core_cutover_enabled: bool,
+/// Unsupported events stay with the specialized Host handler. Every event
+/// first advances the shared conversation version so a stale prepared output
+/// cannot survive an ownership decision. Once Core is selected, the Host
+/// handler must not run as well because both paths can send a visible reply.
+async fn select_message_owner<Interrupt, InterruptFuture, Admission>(
     core_supports_event: bool,
     interrupt_core: Interrupt,
     enqueue_core: impl FnOnce(&Admission) -> yunxi::bridge::EnqueueOutcome,
-) -> (PrivateMessageOwner, Admission)
+) -> (MessageOwner, Admission)
 where
     Interrupt: FnOnce() -> InterruptFuture,
     InterruptFuture: std::future::Future<Output = Admission>,
 {
     // This is the earliest common linearization point for supported and
-    // legacy-owned events. The legacy handler may claim another generation,
-    // but a second interrupt cannot revive an output invalidated here.
+    // Host-owned events. A second interrupt cannot revive an output invalidated
+    // here.
     let admission = interrupt_core().await;
 
-    if !core_cutover_enabled {
-        // The backend is observe-only for direct MessageReceived events while
-        // cutover is disabled, so shadowing cannot create a duplicate reply.
-        if core_supports_event && enqueue_core(&admission) == yunxi::bridge::EnqueueOutcome::Blocked
-        {
-            return (PrivateMessageOwner::Dropped, admission);
-        }
-        return (PrivateMessageOwner::Legacy, admission);
-    }
     if !core_supports_event {
-        return (PrivateMessageOwner::Legacy, admission);
+        return (MessageOwner::Host, admission);
     }
 
     let owner = match enqueue_core(&admission) {
-        yunxi::bridge::EnqueueOutcome::Accepted => PrivateMessageOwner::Core,
+        yunxi::bridge::EnqueueOutcome::Accepted => MessageOwner::Core,
         yunxi::bridge::EnqueueOutcome::DroppedAtCapacity
-        | yunxi::bridge::EnqueueOutcome::SkippedInvalid => PrivateMessageOwner::Legacy,
-        yunxi::bridge::EnqueueOutcome::Blocked => PrivateMessageOwner::Dropped,
+        | yunxi::bridge::EnqueueOutcome::Blocked
+        | yunxi::bridge::EnqueueOutcome::SkippedInvalid => MessageOwner::Dropped,
     };
     (owner, admission)
 }
@@ -347,24 +288,6 @@ async fn main() {
     let private_bridge = Arc::clone(&yunxi_bridge);
     let group_bot = Arc::clone(&proactive_bot);
     let private_bot = Arc::clone(&proactive_bot);
-    let core_private_cutover = core_private_cutover_enabled();
-    let core_group_cutover = core_group_cutover_enabled();
-    println!(
-        "[INFO] 私聊回复所有者: {} ({CORE_PRIVATE_CUTOVER_ENV}=0 可紧急回退 legacy)",
-        if core_private_cutover {
-            "Yunxi Core"
-        } else {
-            "legacy"
-        }
-    );
-    println!(
-        "[INFO] 群聊 @ 回复所有者: {} ({CORE_GROUP_CUTOVER_ENV}=0 可紧急回退 legacy)",
-        if core_group_cutover {
-            "Yunxi Core"
-        } else {
-            "legacy"
-        }
-    );
     let group_message = move |event: Arc<kovi::event::GroupMsgEvent>| {
         let bridge = Arc::clone(&group_bridge);
         let bot = Arc::clone(&group_bot);
@@ -414,24 +337,7 @@ async fn main() {
                 println!("[INFO] 群数据删除屏障期间丢弃入站 (群组: {group_id})");
                 return;
             }
-            if !core_group_cutover {
-                let admission = ConversationCoordinator::begin_incoming(
-                    crate::model::ReplyScope::Group(group_id),
-                )
-                .await;
-                // Emergency rollback keeps the complete group ingress stream
-                // in Shadow mode, including attachments and ambient messages
-                // that the Core owner cannot yet answer.
-                let _ = bridge.enqueue_group_observation(&ingress_event);
-                if let Err(error) = bridge.flush_group_collisions(&ingress_event).await {
-                    kovi::log::warn!("Yunxi group collision flush failed before rollback: {error}");
-                }
-                group_message_event_after_ingress(event, bot, admission).await;
-                ConversationCoordinator::abandon_incoming(admission).await;
-                return;
-            }
-            let (owner, admission) = select_private_message_owner(
-                true,
+            let (owner, admission) = select_message_owner(
                 core_supports_event,
                 || async move {
                     ConversationCoordinator::begin_incoming(crate::model::ReplyScope::Group(
@@ -442,22 +348,22 @@ async fn main() {
                 |admission| bridge.enqueue_group(&ingress_event, *admission),
             )
             .await;
-            if owner == PrivateMessageOwner::Legacy {
+            if owner == MessageOwner::Host {
                 if !bridge.is_user_blocked(event.user_id) {
-                    // Legacy keeps the only visible reply permission while Core
-                    // still observes commands, attachments, and ambient turns.
+                    // Core observes unsupported events while the Host keeps the
+                    // only visible reply permission for them.
                     let _ = bridge.enqueue_group_observation(&ingress_event);
                     if let Err(error) = bridge.flush_group_collisions(&ingress_event).await {
                         kovi::log::warn!(
-                            "Yunxi group collision flush failed before legacy fallback: {error}"
+                            "Yunxi group collision flush failed before Host handling: {error}"
                         );
                     }
                     group_message_event_after_ingress(event, bot, admission).await;
                 }
-                // The erasure barrier can close after owner selection. Legacy
+                // The erasure barrier can close after owner selection. Host
                 // still owns the admission in that race and must release it.
                 ConversationCoordinator::abandon_incoming(admission).await;
-            } else if owner == PrivateMessageOwner::Dropped {
+            } else if owner == MessageOwner::Dropped {
                 ConversationCoordinator::abandon_incoming(admission).await;
             }
         }
@@ -475,12 +381,7 @@ async fn main() {
         let handler_token = (!confirmed_data_erasure)
             .then(|| bridge.capture_private_handler(user_id))
             .flatten();
-        let sender_is_admin = crate::model::utils::is_bot_admin(&bot, event.user_id);
-        let core_supports_event = core_private_canary_payload_is_safe(
-            &event.message,
-            event.borrow_text(),
-            sender_is_admin,
-        ) && bridge.handles_private(&event);
+        let core_supports_event = bridge.handles_private(&event);
         async move {
             if event.user_id == event.self_id {
                 println!(
@@ -520,8 +421,7 @@ async fn main() {
                 println!("[INFO] 私聊数据删除屏障期间丢弃入站 (用户: {user_id})");
                 return;
             }
-            let (owner, admission) = select_private_message_owner(
-                core_private_cutover,
+            let (owner, admission) = select_message_owner(
                 core_supports_event,
                 || async move {
                     ConversationCoordinator::begin_incoming(crate::model::ReplyScope::Private(
@@ -529,31 +429,23 @@ async fn main() {
                     ))
                     .await
                 },
-                |admission| {
-                    if core_private_cutover {
-                        bridge.enqueue_private(&event, *admission)
-                    } else {
-                        bridge.enqueue_private_observation(&event)
-                    }
-                },
+                |admission| bridge.enqueue_private(&event, *admission),
             )
             .await;
-            if owner == PrivateMessageOwner::Legacy {
+            if owner == MessageOwner::Host {
                 if !bridge.is_user_blocked(user_id) {
-                    if core_private_cutover || !core_supports_event {
-                        let _ = bridge.enqueue_private_observation(&event);
-                    }
+                    let _ = bridge.enqueue_private_observation(&event);
                     if let Err(error) = bridge.flush_private_collisions(&event).await {
                         kovi::log::warn!(
-                            "Yunxi private collision flush failed before legacy fallback: {error}"
+                            "Yunxi private collision flush failed before Host handling: {error}"
                         );
                     }
                     private_message_event_after_ingress(event, bot, admission).await;
                 }
-                // A concurrently-started erasure may block the handler after
+                // A concurrently-started erasure may block the Host handler after
                 // owner selection; the reservation cannot be left to expire.
                 ConversationCoordinator::abandon_incoming(admission).await;
-            } else if owner == PrivateMessageOwner::Dropped {
+            } else if owner == MessageOwner::Dropped {
                 ConversationCoordinator::abandon_incoming(admission).await;
             }
         }
@@ -722,45 +614,18 @@ fn write_ready_marker() -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        PrivateMessageOwner, clear_ready_marker, core_group_cutover_enabled_from,
-        core_private_canary_payload_is_safe, core_private_cutover_enabled_from,
-        select_private_message_owner, write_ready_marker,
-    };
+    use super::{MessageOwner, clear_ready_marker, select_message_owner, write_ready_marker};
     use crate::yunxi::bridge::EnqueueOutcome;
-    use kovi::bot::message::{Message, Segment};
-    use serde_json::json;
     use std::cell::Cell;
     use std::fs;
 
     #[test]
-    fn private_core_cutover_is_opt_in_and_supports_explicit_values() {
-        assert!(!core_private_cutover_enabled_from(None));
-        assert!(!core_private_cutover_enabled_from(Some("")));
-        assert!(!core_private_cutover_enabled_from(Some("0")));
-        assert!(!core_private_cutover_enabled_from(Some("false")));
-        assert!(!core_private_cutover_enabled_from(Some("off")));
-        assert!(core_private_cutover_enabled_from(Some("1")));
-        assert!(core_private_cutover_enabled_from(Some(" TRUE ")));
-        assert!(core_private_cutover_enabled_from(Some("on")));
-        assert!(!core_private_cutover_enabled_from(Some("unexpected")));
-    }
-
-    #[test]
-    fn group_core_cutover_is_opt_in_and_supports_explicit_values() {
-        assert!(!core_group_cutover_enabled_from(None));
-        assert!(!core_group_cutover_enabled_from(Some("false")));
-        assert!(core_group_cutover_enabled_from(Some("on")));
-    }
-
-    #[test]
-    fn private_messages_can_be_rolled_back_to_legacy_while_shadowing_core_once() {
+    fn unsupported_messages_stay_on_the_host_path() {
         let runtime = kovi::tokio::runtime::Runtime::new().expect("应创建测试运行时");
         let interrupt_calls = Cell::new(0);
         let enqueue_calls = Cell::new(0);
-        let (owner, _) = runtime.block_on(select_private_message_owner(
+        let (owner, _) = runtime.block_on(select_message_owner(
             false,
-            true,
             || async {
                 interrupt_calls.set(interrupt_calls.get() + 1);
             },
@@ -770,14 +635,13 @@ mod tests {
             },
         ));
 
-        assert_eq!(owner, PrivateMessageOwner::Legacy);
+        assert_eq!(owner, MessageOwner::Host);
         assert_eq!(interrupt_calls.get(), 1);
-        assert_eq!(enqueue_calls.get(), 1);
+        assert_eq!(enqueue_calls.get(), 0);
 
         let unsupported_interrupt_calls = Cell::new(0);
         let unsupported_enqueue_calls = Cell::new(0);
-        let (owner, _) = runtime.block_on(select_private_message_owner(
-            false,
+        let (owner, _) = runtime.block_on(select_message_owner(
             false,
             || async {
                 unsupported_interrupt_calls.set(unsupported_interrupt_calls.get() + 1);
@@ -787,96 +651,41 @@ mod tests {
                 EnqueueOutcome::Accepted
             },
         ));
-        assert_eq!(owner, PrivateMessageOwner::Legacy);
+        assert_eq!(owner, MessageOwner::Host);
         assert_eq!(unsupported_interrupt_calls.get(), 1);
         assert_eq!(unsupported_enqueue_calls.get(), 0);
     }
 
     #[test]
-    fn commands_and_non_text_private_events_stay_on_legacy() {
-        let command = Message::from("#删除我的数据");
-        assert!(!core_private_canary_payload_is_safe(
-            &command,
-            Some("#删除我的数据"),
-            false,
-        ));
-
-        let non_text = Message::from(vec![
-            Segment::new("text", json!({"text": "看看这张图"})),
-            Segment::new("image", json!({"url": "https://example.test/image.png"})),
-        ]);
-        assert!(!core_private_canary_payload_is_safe(
-            &non_text,
-            Some("看看这张图"),
-            false,
-        ));
-
+    fn bridge_rejected_private_events_stay_on_the_host() {
         let runtime = kovi::tokio::runtime::Runtime::new().expect("应创建测试运行时");
-        for unsupported_event in ["command", "non-text", "bridge-rejected"] {
-            let interrupt_calls = Cell::new(0);
-            let enqueue_calls = Cell::new(0);
-            let (owner, _) = runtime.block_on(select_private_message_owner(
-                true,
-                false,
-                || async {
-                    interrupt_calls.set(interrupt_calls.get() + 1);
-                },
-                |_| {
-                    enqueue_calls.set(enqueue_calls.get() + 1);
-                    EnqueueOutcome::Accepted
-                },
-            ));
-
-            assert_eq!(owner, PrivateMessageOwner::Legacy, "{unsupported_event}");
-            assert_eq!(interrupt_calls.get(), 1, "{unsupported_event}");
-            assert_eq!(enqueue_calls.get(), 0, "{unsupported_event}");
-        }
-    }
-
-    #[test]
-    fn supported_private_text_stays_on_core_when_cutover_is_enabled() {
-        for text in [
-            "明天早上提醒我吃饭",
-            "取消定时任务 3",
-            "查看我的提醒列表",
-            "每隔30秒请求一下 https://example.com/health，直到返回 ready 之后告诉我",
-            "查看接口监控任务状态",
-            "停止监控这个链接",
-            "不要回复了",
-            "stop replying",
-        ] {
-            let message = Message::from(text);
-            assert!(
-                core_private_canary_payload_is_safe(&message, Some(text), false),
-                "{text}"
-            );
-        }
-
-        let ordinary_admin_message = Message::from("今天过得怎么样");
-        assert!(core_private_canary_payload_is_safe(
-            &ordinary_admin_message,
-            Some("今天过得怎么样"),
-            true,
-        ));
-
-        let ordinary_non_admin_message = Message::from("今天过得怎么样");
-        assert!(core_private_canary_payload_is_safe(
-            &ordinary_non_admin_message,
-            Some("今天过得怎么样"),
+        let interrupt_calls = Cell::new(0);
+        let enqueue_calls = Cell::new(0);
+        let (owner, _) = runtime.block_on(select_message_owner(
             false,
+            || async {
+                interrupt_calls.set(interrupt_calls.get() + 1);
+            },
+            |_| {
+                enqueue_calls.set(enqueue_calls.get() + 1);
+                EnqueueOutcome::Accepted
+            },
         ));
+
+        assert_eq!(owner, MessageOwner::Host);
+        assert_eq!(interrupt_calls.get(), 1);
+        assert_eq!(enqueue_calls.get(), 0);
     }
 
     #[test]
-    fn core_ingress_failure_falls_back_to_legacy() {
+    fn core_ingress_failure_does_not_fall_back_to_the_host() {
         let runtime = kovi::tokio::runtime::Runtime::new().expect("应创建测试运行时");
         for outcome in [
             EnqueueOutcome::DroppedAtCapacity,
             EnqueueOutcome::SkippedInvalid,
         ] {
             let order = Cell::new(0);
-            let (owner, _) = runtime.block_on(select_private_message_owner(
-                true,
+            let (owner, _) = runtime.block_on(select_message_owner(
                 true,
                 || async {
                     assert_eq!(order.get(), 0);
@@ -888,42 +697,38 @@ mod tests {
                     outcome
                 },
             ));
-            assert_eq!(owner, PrivateMessageOwner::Legacy, "{outcome:?}");
+            assert_eq!(owner, MessageOwner::Dropped, "{outcome:?}");
             assert_eq!(order.get(), 2, "{outcome:?}");
         }
     }
 
     #[test]
-    fn data_erasure_block_never_falls_back_to_legacy_private_handling() {
+    fn data_erasure_block_drops_core_private_handling() {
         let runtime = kovi::tokio::runtime::Runtime::new().expect("应创建测试运行时");
-        for core_cutover_enabled in [false, true] {
-            let interrupt_calls = Cell::new(0);
-            let enqueue_calls = Cell::new(0);
-            let (owner, _) = runtime.block_on(select_private_message_owner(
-                core_cutover_enabled,
-                true,
-                || async {
-                    interrupt_calls.set(interrupt_calls.get() + 1);
-                },
-                |_| {
-                    enqueue_calls.set(enqueue_calls.get() + 1);
-                    EnqueueOutcome::Blocked
-                },
-            ));
+        let interrupt_calls = Cell::new(0);
+        let enqueue_calls = Cell::new(0);
+        let (owner, _) = runtime.block_on(select_message_owner(
+            true,
+            || async {
+                interrupt_calls.set(interrupt_calls.get() + 1);
+            },
+            |_| {
+                enqueue_calls.set(enqueue_calls.get() + 1);
+                EnqueueOutcome::Blocked
+            },
+        ));
 
-            assert_eq!(owner, PrivateMessageOwner::Dropped);
-            assert_eq!(enqueue_calls.get(), 1);
-            assert_eq!(interrupt_calls.get(), 1);
-        }
+        assert_eq!(owner, MessageOwner::Dropped);
+        assert_eq!(enqueue_calls.get(), 1);
+        assert_eq!(interrupt_calls.get(), 1);
     }
 
     #[test]
-    fn accepted_core_canary_has_exactly_one_reply_owner() {
+    fn accepted_core_message_has_exactly_one_reply_owner() {
         let runtime = kovi::tokio::runtime::Runtime::new().expect("应创建测试运行时");
         let order = Cell::new(0);
         let enqueue_calls = Cell::new(0);
-        let (owner, admission) = runtime.block_on(select_private_message_owner(
-            true,
+        let (owner, admission) = runtime.block_on(select_message_owner(
             true,
             || async {
                 assert_eq!(order.get(), 0);
@@ -939,23 +744,22 @@ mod tests {
             },
         ));
 
-        assert_eq!(owner, PrivateMessageOwner::Core);
+        assert_eq!(owner, MessageOwner::Core);
         assert_eq!(admission, 42);
         assert_eq!(order.get(), 2);
         assert_eq!(enqueue_calls.get(), 1);
-        assert_ne!(owner, PrivateMessageOwner::Legacy);
+        assert_ne!(owner, MessageOwner::Host);
     }
 
     #[test]
-    fn core_takeover_invalidates_the_existing_private_reply_generation() {
+    fn core_owner_invalidates_the_existing_private_reply_generation() {
         let runtime = kovi::tokio::runtime::Runtime::new().expect("应创建测试运行时");
         runtime.block_on(async {
             let scope = crate::model::ReplyScope::Private(9_200_001);
             let previous = crate::model::interrupt(scope).await;
             assert!(crate::model::is_current(previous).await);
 
-            let (owner, _) = select_private_message_owner(
-                true,
+            let (owner, _) = select_message_owner(
                 true,
                 || async {
                     let _ = crate::model::interrupt(scope).await;
@@ -964,13 +768,13 @@ mod tests {
             )
             .await;
 
-            assert_eq!(owner, PrivateMessageOwner::Core);
+            assert_eq!(owner, MessageOwner::Core);
             assert!(!crate::model::is_current(previous).await);
         });
     }
 
     #[test]
-    fn legacy_owned_ingress_freezes_then_supersedes_prepared_output() {
+    fn host_owned_ingress_freezes_then_supersedes_prepared_output() {
         let runtime = kovi::tokio::runtime::Runtime::new().expect("应创建测试运行时");
         runtime.block_on(async {
             let scope = crate::model::ReplyScope::Private(9_200_002);
@@ -984,15 +788,14 @@ mod tests {
             .await
             .expect("current reply should prepare");
 
-            let (owner, admission) = select_private_message_owner(
-                true,
+            let (owner, admission) = select_message_owner(
                 false,
                 || async { crate::model::ConversationCoordinator::begin_incoming(scope).await },
                 |_| EnqueueOutcome::Accepted,
             )
             .await;
 
-            assert_eq!(owner, PrivateMessageOwner::Legacy);
+            assert_eq!(owner, MessageOwner::Host);
             assert_eq!(
                 admission.decision,
                 crate::model::OutgoingExecutiveDecision::Rewrite
@@ -1004,7 +807,7 @@ mod tests {
                 crate::model::OutgoingExecutiveContext::default(),
             )
             .await
-            .expect("legacy semantic refinement should remain current");
+            .expect("Host semantic refinement should remain current");
             assert_eq!(
                 refined.decision,
                 crate::model::OutgoingExecutiveDecision::Rewrite
@@ -1033,15 +836,14 @@ mod tests {
             .await
             .expect("proactive output should prepare");
 
-            let (owner, admission) = select_private_message_owner(
-                true,
+            let (owner, admission) = select_message_owner(
                 false,
                 || async { crate::model::ConversationCoordinator::begin_incoming(scope).await },
                 |_| EnqueueOutcome::Accepted,
             )
             .await;
 
-            assert_eq!(owner, PrivateMessageOwner::Legacy);
+            assert_eq!(owner, MessageOwner::Host);
             assert_eq!(
                 admission.decision,
                 crate::model::OutgoingExecutiveDecision::Defer
@@ -1052,7 +854,7 @@ mod tests {
                 crate::model::OutgoingExecutiveContext::default(),
             )
             .await
-            .expect("legacy semantic refinement should remain current");
+            .expect("Host semantic refinement should remain current");
             assert_eq!(
                 refined.decision,
                 crate::model::OutgoingExecutiveDecision::Defer

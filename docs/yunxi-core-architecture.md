@@ -3622,7 +3622,7 @@ Effector / Adapter
 | 4 Memory Bridge | 已完成 | `MemoryStore` port 已接入现有记忆系统，并提供规范化 Core 存储。 |
 | 5 Proactive | 当前范围完成 | Core 已有 motive/candidate/opportunity/`ReachOut`，旧主动聊天也会投影到 Core，canonical owner 路由已用于 owner 主动聊天；真实调度、画像/冷却策略和投递属于 Host/Adapter，保留现有实现符合当前边界。将可跨宿主复用的选择策略进一步迁入 Core 是长期可选工作。 |
 | 6 Intent / Action | 当前范围完成 | 已接通 Planner、`SendMessage`、`ReachOut`、`UseTool`、Goal/OpenLoop 管理类 Action、ActionArbiter、DeliveryResolver 和 QQ ActionPort。普通 action 使用 event-local deterministic idempotency key；Tool 要求 actor 与唯一 QQ 路由，并由有界 one-shot Host capability 将 exact key + tool envelope 指纹绑定原 `ReplyTicket`，副作用 builtin/MCP 在 dispatch 前重验 ticket、actor route、membership/route、管理员、群授权和 context，缺失时 fail-closed。`SendMessage`/`ReachOut` 使用 PostgreSQL delivery ledger，以业务 key 和完整 envelope 指纹持久化 `Committed`/`Sent`/`Unknown`/`Failed`，跨重启阻止重放；不可确认的投递返回非成功终态 `DeliveryIndeterminate`，不会伪造成功事件。Person 数据删除在同一事务内清理可归属账本，snapshot 不携带 Host 投递证据；详细合同见并发规范。 |
-| 7 Direct Conversation | 当前范围完成 | 私聊安全纯文本和群聊 @ 纯文本默认仍由成熟 Kovi Host/Adapter 处理；设置 `YUNXI_CORE_PRIVATE_CUTOVER=1`、`YUNXI_CORE_GROUP_CUTOVER=1` 后才由 Core 接管。Core ingress admission 绑定 exact `MessageId`，同一次模型回复会读取与 exact frozen ticket/reservation 绑定、最多 4096 字符的非可信 Prepared preview，并以受限 `incoming_impact` sidecar 精化为 `Keep / Rewrite / Merge / Defer`；可见直聊遇到模型取消、协议异常或空计划时走固定保底回复并记录原因。直接回复场景下，`Unrelated` 对 proactive 使用 `Defer`、对 reactive 使用 `Rewrite`；缺失或非法分类按 `Unknown` fail-closed，不增加第二次模型调用。runtime 拒绝 collision 会原序恢复未提交尾部，`RejectedState` 会释放 exact admission。将任一变量设为 `0` 或移除变量即可回到 legacy。命令、管理员控制面、附件/Vision/sticker、coalescing/queue 及群聊环境消息保留在成熟 Kovi Host/Adapter，符合当前范围。 |
+| 7 Direct Conversation | 当前范围完成 | 私聊安全纯文本/普通图片和群聊 @ 纯文本/普通图片默认由 Yunxi Core 接管；图片在 Host 侧安全物化后作为同一轮视觉输入交给主模型或独立视觉 Provider。Core 是支持事件的唯一可见回复 owner，入队失败时丢弃并释放 admission，不回退到 Host。Core ingress admission 绑定 exact `MessageId`，同一次模型回复会读取与 exact frozen ticket/reservation 绑定、最多 4096 字符的非可信 Prepared preview，并以受限 `incoming_impact` sidecar 精化为 `Keep / Rewrite / Merge / Defer`；可见直聊遇到模型取消、协议异常或空计划时走固定保底回复并记录原因。直接回复场景下，`Unrelated` 对 proactive 使用 `Defer`、对 reactive 使用 `Rewrite`；缺失或非法分类按 `Unknown` fail-closed，不增加第二次模型调用。runtime 拒绝 collision 会原序恢复未提交尾部，`RejectedState` 会释放 exact admission。命令、管理员控制面、音视频/文件、表情协议、coalescing/queue 及未点名群聊环境消息保留在成熟 Kovi Host/Adapter，符合当前范围。 |
 | 8 Affect | 部分完成 | Core state/port 和 PostgreSQL store 已有；结构信号和有界 `InteractionCues` 会缓慢更新 state。legacy `MessageUnderstanding` 的 mood/confidence/gratitude 已归一化并 best-effort 投射，Core 直聊也可复用同一次模型回复的受限 cue sidecar，不增加一次模型调用。Core 已提供确定性时间衰减，PostgreSQL 读取时按 `updated_at` 应用并忽略负时间差和 60 秒内抖动。legacy mood 只填充缺失行；global `BotPersonality`/mood 兼容策略留在 Host 不阻塞当前 DoD，剩余项是长期人工验收。 |
 | 9 Relation | 部分完成 | Relation 绑定 `PersonId`；Core 会以递减步幅更新 familiarity，并根据有界 gratitude/sentiment cue 保守更新 affinity/trust/comfort/tension，错误 Person 的已加载状态不会传播。PostgreSQL 读取时同样应用确定性时间衰减，legacy profile 只填充缺失行；跨天、跨重启和跨平台人工验收仍待完成。 |
 | 10 Memory v2 | 基础完成 | 新表、双读/双写、按批次 backfill、数量/哈希校验、审计记录、rollback 和独立 migration CLI 已完成；仍需生产数据抽样、生产回滚演练和真实第二宿主导入的人工验收。 |
@@ -3640,24 +3640,26 @@ QQ 到未来 App 的同一 Person/Memory/Relation/OpenLoop 连续性只能在真
 人工验收，当前没有完成。Desktop/Mobile/Web/App 产品和高级多模态/具身能力属于未来 /
 非目标，不计作当前迁移缺陷。
 
-现有 Kovi 命令、管理员控制面、附件/Vision/sticker、coalescing/queue、群聊 ambient 和主动
-投递可以继续作为 Host/Adapter 能力；把这些兼容层进一步变薄是可选后续，不是当前 DoD
-未完成项。
+现有 Kovi 命令、管理员控制面、音视频/文件、视觉命令与视觉 Provider 适配、表情协议、
+coalescing/queue、群聊 ambient 和主动投递可以继续作为 Host/Adapter 能力；支持的普通图片
+消息可见回复已由 Core 负责，Host 侧只负责安全取图并把视觉输入交给 Core。把这些兼容层
+进一步变薄是可选后续，不是当前 DoD 未完成项。
 
 ## 137.2 当前 Core / Adapter 边界
 
-前文大部分边界描述是目标规范；仓库当前仍处于 bridge/dual-path 过渡期：
+前文大部分边界描述是目标规范；仓库当前已由 Core 负责支持事件的可见回复，Host/Adapter 仅保留未支持能力：
 
 | 层 | 当前职责 | 当前限制 |
 | --- | --- | --- |
 | `crates/yunxi-core` | 平台无关 ID、Event、Runtime、Planner、Affect/Relation/OpenLoop/Goal、Intent/Action、Ports 和确定性领域规则；不依赖 Kovi、OneBot、QQ 或 SQL 实现。 | 不负责 provider 配置、SQL、QQ 路由、权限和真实发送。 |
 | `plugins/model/src/yunxi` | Kovi Host bridge/adapter：QQ identity/conversation mapping、PostgreSQL stores、到期 scheduler、旧 ModelGateway 适配、Action 仲裁与 QQ delivery。 | 这是宿主集成，不是第二套 Core；出现 QQ/SQL 属于预期边界。 |
-| legacy `plugins/model` | 仍承载命令、管理员控制面、附件/视觉、群聊 ambient、提醒、Agent Task、主动调度、部分画像/冷却和 global `BotPersonality`/mood 兼容策略；部分结果以通用 Event/cue 投射给 Core。 | 这些成熟 Host/Adapter 能力可按当前范围保留；其中可跨宿主复用的领域规则可在长期迁移，进一步变薄不是当前 DoD 缺口。 |
+| `plugins/model` Host 兼容层 | 仍承载命令、管理员控制面、音视频/文件、视觉命令与 Provider 适配、表情协议、未点名群聊 ambient、提醒、Agent Task、主动调度、部分画像/冷却和 global `BotPersonality`/mood 兼容策略；支持的普通图片消息由 Core 负责可见回复，Host 仅提供安全取图和 Provider 适配。 | 这些成熟 Host/Adapter 能力可按当前范围保留；其中可跨宿主复用的领域规则可在长期迁移，进一步变薄不是当前 DoD 缺口。 |
 | Desktop/Mobile/Web/App | 尚无真实 Host。 | 产品、协议、同步、认证、通知和 UI 全部是未来工作。 |
 
 `KoviModelBackend` 复用现有 ModelGateway 的 provider 与工具策略，并把结果翻译成声明式 Core
-plan；这是 Host adapter，不是 Core 对旧模型模块的依赖。当前 Core 直聊只接管私聊安全纯
-文本和群聊 `@` 安全纯文本，其他入口继续使用成熟 legacy handler。
+plan；这是 Host adapter，不是 Core 对旧模型模块的依赖。当前 Core 直聊接管私聊安全纯文本/
+普通图片和群聊 `@` 安全纯文本/普通图片；命令、音视频/文件、表情协议、未点名群聊 ambient
+等暂不支持的入口继续由 Host/Adapter 处理。
 
 ## 137.3 OpenLoop 到期 owner 路由合同
 

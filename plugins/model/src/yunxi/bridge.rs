@@ -1,9 +1,9 @@
-//! Bounded QQ -> Yunxi Core shadow bridge.
+//! Bounded QQ -> Yunxi Core bridge.
 //!
 //! The bridge deliberately sits beside the existing Kovi handlers. It copies
 //! only the small set of fields needed by Core, then resolves platform
-//! identities on a single background worker. The legacy handlers remain the
-//! owner of all model calls and QQ side effects.
+//! identities on a single background worker. Core owns admitted supported
+//! messages; Host handlers remain responsible for specialized capabilities.
 
 use super::qq;
 use crate::model::{
@@ -662,7 +662,7 @@ impl ShadowBridge {
         self.try_enqueue(message)
     }
 
-    /// Reliably flush collision records for a legacy-owned group event. Unlike
+    /// Reliably flush collision records for a Host-owned group event. Unlike
     /// normal message ingress, this waits for queue capacity and worker
     /// acknowledgement so a full shadow queue cannot hide a committed send.
     pub(crate) async fn flush_group_collisions(
@@ -676,7 +676,7 @@ impl ShadowBridge {
             .await
     }
 
-    /// Reliably flush collision records for a legacy-owned direct event.
+    /// Reliably flush collision records for a Host-owned direct event.
     pub(crate) async fn flush_private_collisions(
         &self,
         event: &PrivateMsgEvent,
@@ -714,37 +714,24 @@ impl ShadowBridge {
         })?
     }
 
-    /// Whether this private event is now owned by the Core direct-conversation
-    /// path. Control commands and any structured stop signal stay on the
-    /// legacy handler so their specialized host behavior remains available.
+    /// Whether this private event is owned by the Core direct-conversation
+    /// path. Ordinary images are supported; control commands and other media
+    /// stay on the Host handler so their specialized behavior remains.
     pub(crate) fn handles_private(&self, event: &PrivateMsgEvent) -> bool {
         self.action_arbiter.is_some()
             && self.action_port.is_some()
-            && event.message.iter().all(|segment| segment.type_ == "text")
-            && InboundMessage::from_private(event).is_some_and(|message| {
-                !message.text.trim().is_empty()
-                    && !message.stop_requested
-                    && !message.text.trim_start().starts_with('#')
-            })
+            && core_private_payload_is_supported(&event.message, event.borrow_text())
+            && InboundMessage::from_private(event).is_some()
     }
 
-    /// Group Core canary admission is deliberately narrower than private
-    /// admission: only a plain-text message that explicitly addresses the bot
-    /// can be handed to the Core owner. Ambient group chatter remains on the
-    /// mature coalescing handler.
+    /// Group admission remains narrower than private admission: only text and
+    /// ordinary images that explicitly address the bot can be handed to Core.
+    /// Ambient group chatter and other media stay on the mature Host handler.
     pub(crate) fn handles_group(&self, event: &GroupMsgEvent) -> bool {
         self.action_arbiter.is_some()
             && self.action_port.is_some()
-            && InboundMessage::from_group(event).is_some_and(|message| {
-                message.addressed_to_agent
-                    && !message.stop_requested
-                    && !message.text.trim().is_empty()
-                    && !message.text.trim_start().starts_with('#')
-            })
-            && event
-                .message
-                .iter()
-                .all(|segment| segment.type_ == "text" || segment.type_ == "at")
+            && core_group_payload_is_supported(&event.message, event.borrow_text(), event.self_id)
+            && InboundMessage::from_group(event).is_some()
     }
 
     fn try_enqueue(&self, message: InboundMessage) -> EnqueueOutcome {
@@ -1164,6 +1151,10 @@ struct InboundMessage {
     reply_to_external_message_id: Option<i64>,
     text: String,
     attachments: Vec<Attachment>,
+    /// Host-only locators used to materialize the current turn's images. They
+    /// are bound to the Core MessageId in a bounded one-shot cache and never
+    /// enter the platform-neutral event or persistent state.
+    vision_attachments: Vec<crate::vision::ImageAttachment>,
     timestamp: DateTime<Utc>,
     addressed_to_agent: bool,
     visible_reply_allowed: bool,
@@ -1186,6 +1177,7 @@ impl InboundMessage {
         }
         let text = bounded_text(event.borrow_text().unwrap_or_default());
         let attachments = normalize_attachments(&event.message);
+        let vision_attachments = crate::vision::extract_image_attachments(&event.message);
         Some(Self {
             address: ConversationAddress::Group {
                 group_id: event.group_id,
@@ -1201,6 +1193,7 @@ impl InboundMessage {
             incoming_admission: None,
             text,
             attachments,
+            vision_attachments,
             timestamp: event_timestamp(event.time),
         })
     }
@@ -1213,6 +1206,7 @@ impl InboundMessage {
         }
         let text = bounded_text(event.borrow_text().unwrap_or_default());
         let attachments = normalize_attachments(&event.message);
+        let vision_attachments = crate::vision::extract_image_attachments(&event.message);
         Some(Self {
             address: ConversationAddress::Direct {
                 self_id: event.self_id,
@@ -1228,6 +1222,7 @@ impl InboundMessage {
             incoming_admission: None,
             text,
             attachments,
+            vision_attachments,
             timestamp: event_timestamp(event.time),
         })
     }
@@ -1753,6 +1748,9 @@ async fn begin_data_erasure_at_ingress_barrier(
     let cleared_references = references.remove_conversations(&targets.direct_conversation_ids);
     let (cleared_person_routes, cleared_conversation_routes) =
         if let Some(model_backend) = model_backend {
+            let _ = model_backend
+                .purge_private_message_contexts(&targets.blocked_user_ids)
+                .await;
             model_backend
                 .purge_routes(
                     targets.canonical_person_id,
@@ -1934,6 +1932,9 @@ async fn begin_group_data_erasure_at_ingress_barrier(
             .map_err(anyhow::Error::from)?
     };
     let cleared_references = references.remove_conversations(&conversation_ids);
+    if let Some(model_backend) = model_backend {
+        let _ = model_backend.purge_group_message_contexts(group_id).await;
+    }
     active.insert(group_id, conversation_ids.clone());
     Ok(GroupDataErasureAck {
         conversation_ids,
@@ -2226,10 +2227,10 @@ async fn resolve_and_submit_inner(
     if let Some(model_backend) = model_backend {
         let conversation = match message.address {
             ConversationAddress::Group { group_id } => {
-                super::core_model::LegacyConversation::Group { group_id }
+                super::core_model::QqConversation::Group { group_id }
             }
             ConversationAddress::Direct { peer_user_id, .. } => {
-                super::core_model::LegacyConversation::Private {
+                super::core_model::QqConversation::Private {
                     user_id: peer_user_id,
                 }
             }
@@ -2322,7 +2323,11 @@ async fn resolve_and_submit_inner(
     {
         if incoming_admission.ticket.scope() == reply_scope {
             model_backend
-                .register_incoming(message_id, incoming_admission)
+                .register_incoming(
+                    message_id,
+                    incoming_admission,
+                    message.vision_attachments.clone(),
+                )
                 .await;
             true
         } else {
@@ -2519,7 +2524,7 @@ fn normalize_attachments(message: &Message) -> Vec<Attachment> {
                 "file" => AttachmentKind::File,
                 _ => return None,
             };
-            let reference = ["file_unique", "file_id", "file", "url"]
+            let reference = ["file_unique", "md5", "file_id", "file", "url"]
                 .iter()
                 .find_map(|field| segment.data.get(*field).and_then(|value| value.as_str()))
                 .map(bounded_text)
@@ -2528,6 +2533,36 @@ fn normalize_attachments(message: &Message) -> Vec<Attachment> {
         })
         .take(16)
         .collect()
+}
+
+fn core_private_payload_is_supported(message: &Message, text: Option<&str>) -> bool {
+    core_chat_payload_is_supported(message, text, false, 0)
+}
+
+fn core_group_payload_is_supported(message: &Message, text: Option<&str>, self_id: i64) -> bool {
+    core_chat_payload_is_supported(message, text, true, self_id)
+}
+
+fn core_chat_payload_is_supported(
+    message: &Message,
+    text: Option<&str>,
+    group: bool,
+    self_id: i64,
+) -> bool {
+    let text = text.unwrap_or_default().trim();
+    let image_segments = message
+        .iter()
+        .filter(|segment| segment.type_ == "image")
+        .count();
+    let segments_supported = message.iter().all(|segment| {
+        matches!(segment.type_.as_str(), "text" | "image") || (group && segment.type_ == "at")
+    });
+    let addressed = !group || message_at_self(message, self_id) || text_mentions_agent(text);
+    segments_supported
+        && addressed
+        && (!text.is_empty() || image_segments > 0)
+        && !text.starts_with('#')
+        && crate::vision::image_segments_are_resolvable(message)
 }
 
 fn message_at_self(message: &Message, self_id: i64) -> bool {
@@ -2567,7 +2602,8 @@ mod tests {
         ConversationAddress, EnqueueOutcome, InboundMessage, IncomingAdmissionReleaseFuture,
         IncomingAdmissionReleaser, IngressRouteTracker, MessageReference, MessageReferenceCache,
         MessageReferenceKey, ShadowBridge, acquire_alias_handler_barriers, action_result_event,
-        block_user_aliases, bounded_text, idle_tick_event, merge_data_erasure_targets,
+        block_user_aliases, bounded_text, core_group_payload_is_supported,
+        core_private_payload_is_supported, idle_tick_event, merge_data_erasure_targets,
         message_at_self, normalize_attachments, reply_message_id, resolve_and_submit, run_ingress,
         run_runtime, submit_message_collisions, text_mentions_agent, unblock_users,
     };
@@ -2699,6 +2735,7 @@ mod tests {
             reply_to_external_message_id: None,
             text: "hello".to_string(),
             attachments: Vec::new(),
+            vision_attachments: Vec::new(),
             timestamp: Utc::now(),
             addressed_to_agent,
             visible_reply_allowed: true,
@@ -2730,6 +2767,71 @@ mod tests {
         assert!(message_at_self(&at, 123));
         assert!(!message_at_self(&at, 456));
         assert!(text_mentions_agent("芸汐，看看这个"));
+    }
+
+    #[test]
+    fn core_private_media_support_is_limited_to_resolvable_images() {
+        let text = Message::from("你好呀");
+        assert!(core_private_payload_is_supported(&text, Some("你好呀")));
+
+        let image = Message::from(vec![Segment::new(
+            "image",
+            json!({"file_unique": "image-hash", "file": "image.png"}),
+        )]);
+        assert!(core_private_payload_is_supported(&image, None));
+
+        let text_and_image = Message::from(vec![
+            Segment::new("text", json!({"text": "看看这个"})),
+            Segment::new(
+                "image",
+                json!({"file_unique": "image-hash", "url": "https://example.test/image.png"}),
+            ),
+        ]);
+        assert!(core_private_payload_is_supported(
+            &text_and_image,
+            Some("看看这个")
+        ));
+
+        let unusable_image = Message::from(vec![Segment::new("image", json!({}))]);
+        assert!(!core_private_payload_is_supported(&unusable_image, None));
+        let audio = Message::from(vec![Segment::new("record", json!({"file": "voice.amr"}))]);
+        assert!(!core_private_payload_is_supported(&audio, None));
+        assert!(!core_private_payload_is_supported(
+            &Message::from("#看图"),
+            Some("#看图")
+        ));
+    }
+
+    #[test]
+    fn core_group_images_require_an_explicit_address() {
+        let addressed = Message::from(vec![
+            Segment::new("text", json!({"text": "芸汐看看这个"})),
+            Segment::new(
+                "image",
+                json!({"file_unique": "image-hash", "file": "image.png"}),
+            ),
+        ]);
+        assert!(core_group_payload_is_supported(
+            &addressed,
+            Some("芸汐看看这个"),
+            123
+        ));
+
+        let structured_at = Message::from(vec![
+            Segment::new("at", json!({"qq": "123"})),
+            Segment::new(
+                "image",
+                json!({"file_unique": "image-hash", "file": "image.png"}),
+            ),
+        ]);
+        assert!(core_group_payload_is_supported(&structured_at, None, 123));
+        assert!(!core_group_payload_is_supported(&structured_at, None, 456));
+
+        let ambient = Message::from(vec![Segment::new(
+            "image",
+            json!({"file_unique": "image-hash", "file": "image.png"}),
+        )]);
+        assert!(!core_group_payload_is_supported(&ambient, None, 123));
     }
 
     #[test]
