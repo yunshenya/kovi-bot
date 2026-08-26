@@ -1036,19 +1036,12 @@ async fn delete_group_data(group_id: i64, bot: &RuntimeBot) {
     let reminder_result = reminders::delete_group_data(group_id).await;
     let agent_goal_result = crate::agent_runtime::delete_group_data(group_id).await;
     let core_result = crate::yunxi::delete_qq_group_domain_data(group_id).await;
-    let barrier_result = core_erasure.finish().await;
-    if barrier_result.is_ok()
-        && let Some(mind_erasure) = mind_erasure
-    {
-        mind_erasure.finish().await;
-    }
     match (
         memory_result,
         sticker_result,
         reminder_result,
         agent_goal_result,
         core_result,
-        barrier_result,
     ) {
         (
             Ok(memory_rows),
@@ -1056,26 +1049,42 @@ async fn delete_group_data(group_id: i64, bot: &RuntimeBot) {
             Ok(reminder_rows),
             Ok(agent_goal_rows),
             Ok(core_rows),
-            Ok(()),
-        ) => {
-            send_group_erasure_receipt(
-                bot,
-                group_id,
-                format!(
-                    "本群可归属数据已删除（记忆/档案/摘要 {memory_rows} 项，表情记忆 {sticker_rows} 项，提醒 {reminder_rows} 项，角色目标 {agent_goal_rows} 项，Core 数据 {core_rows} 项）。"
-                ),
-            )
-            .await;
-        }
-        (memory, stickers, reminders, agent_goals, core, barrier) => {
+        ) => match core_erasure.finish().await {
+            Ok(()) => {
+                if let Some(mind_erasure) = mind_erasure {
+                    mind_erasure.finish().await;
+                }
+                send_group_erasure_receipt(
+                        bot,
+                        group_id,
+                        format!(
+                            "本群可归属数据已删除（记忆/档案/摘要 {memory_rows} 项，表情记忆 {sticker_rows} 项，提醒 {reminder_rows} 项，角色目标 {agent_goal_rows} 项，Core 数据 {core_rows} 项）。"
+                        ),
+                    )
+                    .await;
+            }
+            Err(error) => {
+                eprintln!(
+                    "[ERROR] 群数据已删除但屏障恢复失败，继续保持关闭 (群组: {}): {}",
+                    group_id, error
+                );
+                send_group_erasure_receipt(
+                        bot,
+                        group_id,
+                        "群数据已删除但安全屏障未能恢复；当前入口继续保持关闭，请让管理员检查日志后重启。",
+                    )
+                    .await;
+            }
+        },
+        (memory, stickers, reminders, agent_goals, core) => {
             eprintln!(
-                "[ERROR] 群数据删除未完全成功 (群组: {}, 记忆: {:?}, 表情: {:?}, 提醒: {:?}, 角色目标: {:?}, Core: {:?}, 屏障恢复: {:?})",
-                group_id, memory, stickers, reminders, agent_goals, core, barrier
+                "[ERROR] 群数据删除未完全成功，保留安全屏障 (群组: {}, 记忆: {:?}, 表情: {:?}, 提醒: {:?}, 角色目标: {:?}, Core: {:?})",
+                group_id, memory, stickers, reminders, agent_goals, core
             );
             send_group_erasure_receipt(
                 bot,
                 group_id,
-                "群数据删除没有全部完成，请稍后重试或让管理员检查日志。",
+                "群数据删除没有全部完成；为防止数据被重新写入，当前入口已保持关闭，请让管理员检查日志后重启并重试。",
             )
             .await;
         }

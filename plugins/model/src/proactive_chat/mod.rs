@@ -352,9 +352,15 @@ impl ProactiveChatManager {
         {
             return Ok(false);
         }
+        let Some(mind_delivery_permit) =
+            yunxi::pin_mind_proactive_reference(planned.mind_reference).await
+        else {
+            return Ok(false);
+        };
         let delivery = self
             .deliver_private_reach_out(main_admin, &planned.intent)
             .await;
+        drop(mind_delivery_permit);
         if !delivery.is_terminal_attempt() {
             return Ok(false);
         }
@@ -648,9 +654,15 @@ impl ProactiveChatManager {
         {
             return Ok(false);
         }
+        let Some(mind_delivery_permit) =
+            yunxi::pin_mind_proactive_reference(planned.mind_reference).await
+        else {
+            return Ok(false);
+        };
         let delivery = self
             .deliver_private_reach_out(user_id, &planned.intent)
             .await;
+        drop(mind_delivery_permit);
         if !delivery.is_terminal_attempt() {
             return Ok(false);
         }

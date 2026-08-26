@@ -14,7 +14,7 @@ use yunxi_core::{
     MindConsolidationStore, MindDataErasure, MindDataErasureError, MindDataErasureFuture,
     MindScope, MindServices, MindStoreError, MindStoreFuture, OpenQuestion, OpenQuestionId,
     OpenQuestionStatus, OpenQuestionStore, Preference, PreferenceId, PreferenceStore, SelfModel,
-    SelfModelStore,
+    SelfModelStore, lexical_terms,
 };
 
 const MAX_LIST_LIMIT: usize = 128;
@@ -262,6 +262,39 @@ impl PostgresMindStore {
     pub(crate) async fn cleanup(&self, now: DateTime<Utc>) -> Result<u64, MindStoreError> {
         let mut transaction = self.pool.begin().await.map_err(MindStoreError::storage)?;
         lock_meta(&mut transaction).await?;
+        let orphaned_agenda = query(
+            r#"
+            DELETE FROM yunxi_agenda_items AS agenda
+            WHERE agenda.status IN ('active', 'deferred')
+              AND (
+                    (
+                        agenda.dedupe_key LIKE 'curiosity:%'
+                        AND NOT EXISTS (
+                            SELECT 1
+                            FROM yunxi_curiosities AS curiosity
+                            WHERE agenda.dedupe_key = 'curiosity:' || curiosity.id::text
+                              AND curiosity.status IN ('open', 'asked')
+                              AND (curiosity.expires_at IS NULL OR curiosity.expires_at > $1)
+                        )
+                    )
+                    OR
+                    (
+                        agenda.dedupe_key LIKE 'open_question:%'
+                        AND NOT EXISTS (
+                            SELECT 1
+                            FROM yunxi_open_questions AS question
+                            WHERE agenda.dedupe_key = 'open_question:' || question.id::text
+                              AND question.status = 'open'
+                        )
+                    )
+              )
+            "#,
+        )
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(MindStoreError::storage)?
+        .rows_affected();
         let curiosities = query(
             "DELETE FROM yunxi_curiosities WHERE expires_at IS NOT NULL AND expires_at <= $1",
         )
@@ -278,14 +311,14 @@ impl PostgresMindStore {
         .await
         .map_err(MindStoreError::storage)?
         .rows_affected();
-        if curiosities + agenda > 0 {
+        if orphaned_agenda + curiosities + agenda > 0 {
             bump_meta(&mut transaction).await?;
         }
         transaction
             .commit()
             .await
             .map_err(MindStoreError::storage)?;
-        Ok(curiosities + agenda)
+        Ok(orphaned_agenda + curiosities + agenda)
     }
 }
 
@@ -418,7 +451,12 @@ async fn list_payloads<T: DeserializeOwned>(
         return Ok(Vec::new());
     }
     let scope_keys = scope_keys(scopes);
-    let search = search.trim().to_lowercase();
+    let search = search.trim();
+    let search_enabled = !search.is_empty();
+    let search_terms = lexical_terms(search);
+    if search_enabled && search_terms.is_empty() {
+        return Ok(Vec::new());
+    }
     let statement = format!(
         r#"
         SELECT payload
@@ -426,15 +464,37 @@ async fn list_payloads<T: DeserializeOwned>(
         WHERE scope_key = ANY($1)
           AND ($2::TEXT[] IS NULL OR status = ANY($2))
           AND ($3::TIMESTAMPTZ IS NULL OR expires_at IS NULL OR expires_at > $3)
+          AND (
+            NOT $4::BOOLEAN
+            OR EXISTS (
+              SELECT 1
+              FROM unnest($5::TEXT[]) AS search_term
+              WHERE CASE
+                WHEN search_term ~ '^[a-z0-9]+$' THEN
+                  search_term = ANY(
+                    regexp_split_to_array(lower(dedupe_key), '[^a-z0-9]+')
+                  )
+                ELSE strpos(lower(dedupe_key), search_term) > 0
+              END
+            )
+          )
         ORDER BY
-          CASE WHEN $4 = '' THEN 0
-               WHEN lower(dedupe_key) LIKE '%' || $4 || '%' THEN 1
-               ELSE 0 END DESC,
+          CASE WHEN NOT $4::BOOLEAN THEN 0 ELSE (
+            SELECT COUNT(*)
+            FROM unnest($5::TEXT[]) AS search_term
+            WHERE CASE
+              WHEN search_term ~ '^[a-z0-9]+$' THEN
+                search_term = ANY(
+                  regexp_split_to_array(lower(dedupe_key), '[^a-z0-9]+')
+                )
+              ELSE strpos(lower(dedupe_key), search_term) > 0
+            END
+          ) END DESC,
           primary_score DESC,
           secondary_score DESC,
           updated_at DESC,
           id
-        LIMIT $5
+        LIMIT $6
         "#,
         table.name()
     );
@@ -443,7 +503,8 @@ async fn list_payloads<T: DeserializeOwned>(
         .bind(scope_keys)
         .bind(status_values)
         .bind(now)
-        .bind(search)
+        .bind(search_enabled)
+        .bind(search_terms)
         .bind(limit)
         .fetch_all(pool)
         .await
@@ -1631,10 +1692,11 @@ mod tests {
     use sqlx_postgres::PgPoolOptions;
     use uuid::Uuid;
     use yunxi_core::{
-        Belief, BeliefId, BeliefSource, BeliefStore, ConsolidationConfig, ConsolidationPlan,
-        ConversationId, CuriosityId, CuriosityItem, CuriosityStore, EventId, Interest, InterestId,
-        InterestStore, MindConsolidationStore, MindDataErasure, MindScope, MindSource,
-        MindStoreError, MindUpsert, PersonId, TraceContext,
+        AgendaItem, AgendaItemId, AgendaSource, AgendaStore, AgendaSubject, Belief, BeliefId,
+        BeliefSource, BeliefStore, ConsolidationConfig, ConsolidationPlan, ConversationId,
+        CuriosityId, CuriosityItem, CuriosityStore, EventId, Interest, InterestId, InterestStore,
+        MindConsolidationStore, MindDataErasure, MindScope, MindSource, MindStoreError, MindUpsert,
+        PersonId, TraceContext,
     };
 
     fn belief(
@@ -1737,6 +1799,19 @@ mod tests {
             .await
             .expect("bounded retrieval should succeed");
             assert_eq!(bounded.len(), 2);
+            let no_opinion = BeliefStore::relevant(
+                &restarted,
+                &[MindScope::Global],
+                &format!("absent-topic-{}", Uuid::new_v4()),
+                now,
+                2,
+            )
+            .await
+            .expect("irrelevant retrieval should succeed");
+            assert!(
+                no_opinion.is_empty(),
+                "a nonempty query without topic overlap must represent NoOpinion"
+            );
 
             let duplicate = belief(
                 BeliefId::new(),
@@ -1857,14 +1932,35 @@ mod tests {
             )
             .expect("expired test curiosity should be valid");
             cleanup_ids.push(expired.id().into_uuid());
+            let expired_agenda = AgendaItem::new(
+                AgendaItemId::new(),
+                MindScope::Global,
+                AgendaSubject::Curiosity(expired.id()),
+                0.5,
+                0.5,
+                0.5,
+                AgendaSource::Curiosity,
+                now - Duration::hours(2),
+            )
+            .expect("expired curiosity agenda should be valid");
+            cleanup_ids.push(expired_agenda.id().into_uuid());
             CuriosityStore::put(&store, &expired, None)
                 .await
                 .expect("expired curiosity should persist before cleanup");
-            assert!(store.cleanup(now).await.expect("cleanup should run") >= 1);
+            AgendaStore::put(&store, &expired_agenda, None)
+                .await
+                .expect("expired curiosity agenda should persist before cleanup");
+            assert!(store.cleanup(now).await.expect("cleanup should run") >= 2);
             assert!(
                 CuriosityStore::get(&store, expired.id())
                     .await
                     .expect("cleaned curiosity lookup should succeed")
+                    .is_none()
+            );
+            assert!(
+                AgendaStore::get(&store, expired_agenda.id())
+                    .await
+                    .expect("cleaned agenda lookup should succeed")
                     .is_none()
             );
 
@@ -1908,12 +2004,31 @@ mod tests {
                     .expect("conversation erasure lookup should succeed")
                     .is_none()
             );
+            drop(restarted);
+            drop(store);
+            let restarted_after_erasure = PostgresMindStore::new(pool.clone());
+            restarted_after_erasure
+                .initialize_schema()
+                .await
+                .expect("schema initialization after erasure should be restart-safe");
             assert!(
-                BeliefStore::get(&store, global_beliefs[0].id())
+                BeliefStore::get(&restarted_after_erasure, person_belief.id())
                     .await
-                    .expect("global state lookup should succeed")
+                    .expect("post-restart person lookup should succeed")
+                    .is_none()
+            );
+            assert!(
+                BeliefStore::get(&restarted_after_erasure, conversation_belief.id())
+                    .await
+                    .expect("post-restart conversation lookup should succeed")
+                    .is_none()
+            );
+            assert!(
+                BeliefStore::get(&restarted_after_erasure, global_beliefs[0].id())
+                    .await
+                    .expect("post-restart global state lookup should succeed")
                     .is_some(),
-                "person erasure must preserve Yunxi-global state"
+                "person erasure must survive restart and preserve Yunxi-global state"
             );
 
             delete_test_rows(&pool, &cleanup_ids).await;

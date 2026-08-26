@@ -1,6 +1,6 @@
 use super::{
-    AgendaItem, AgendaItemId, AgendaItemKind, AgendaStatus, Belief, BeliefId, BeliefSource,
-    Interest, InterestId, MindInfluenceMode, MindReasonTag, MindScope, MindServices,
+    AgendaItem, AgendaItemId, AgendaItemKind, AgendaStatus, AgendaSubject, Belief, BeliefId,
+    BeliefSource, Interest, InterestId, MindInfluenceMode, MindReasonTag, MindScope, MindServices,
     MindStoreError, MindValidationError, OpenQuestion, OpenQuestionId, Preference, PreferenceId,
     PreferenceSource, SelfIdentity, SelfModel, SelfTrait, ValueProfile,
 };
@@ -760,11 +760,34 @@ impl MindSnapshotProvider for MindSnapshotStoreProvider {
                 .iter()
                 .map(PreferenceSnapshot::try_from)
                 .collect::<Result<Vec<_>, _>>()?;
-            let interests = self
+            let agenda_items = self
+                .services
+                .agenda
+                .list_active(&scopes, request.at, request.limits.agenda_items)
+                .await?;
+            let mut interest_values = self
                 .services
                 .interests
                 .relevant(&query, request.limits.interests)
-                .await?
+                .await?;
+            for item in &agenda_items {
+                if interest_values.len() == request.limits.interests {
+                    break;
+                }
+                let AgendaSubject::Interest(interest_id) = item.subject() else {
+                    continue;
+                };
+                if interest_values
+                    .iter()
+                    .any(|interest| interest.id() == *interest_id)
+                {
+                    continue;
+                }
+                if let Some(interest) = self.services.interests.get(*interest_id).await? {
+                    interest_values.push(interest);
+                }
+            }
+            let interests = interest_values
                 .iter()
                 .map(InterestSnapshot::try_from)
                 .collect::<Result<Vec<_>, _>>()?;
@@ -776,11 +799,7 @@ impl MindSnapshotProvider for MindSnapshotStoreProvider {
                 .iter()
                 .map(OpenQuestionSnapshot::try_from)
                 .collect::<Result<Vec<_>, _>>()?;
-            let agenda = self
-                .services
-                .agenda
-                .list_active(&scopes, request.at, request.limits.agenda_items)
-                .await?
+            let agenda = agenda_items
                 .iter()
                 .map(AgendaItemSnapshot::try_from)
                 .collect::<Result<Vec<_>, _>>()?;

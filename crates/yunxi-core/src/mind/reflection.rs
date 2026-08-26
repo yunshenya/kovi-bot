@@ -105,7 +105,8 @@ impl ReflectionInput {
         let high_salience = self.recent_events.iter().any(|event| event.salience >= 0.7);
         let unresolved = !self.mind.open_questions().is_empty()
             || !self.mind.agenda().is_empty()
-            || !self.open_loop_summaries.is_empty();
+            || !self.open_loop_summaries.is_empty()
+            || !self.goal_summaries.is_empty();
         high_salience
             || unresolved
             || matches!(

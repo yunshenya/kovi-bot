@@ -81,6 +81,7 @@ mod belief;
 mod common;
 mod consolidation;
 mod curiosity;
+mod decision;
 mod episode;
 mod in_memory;
 mod interest;
@@ -88,6 +89,7 @@ mod open_question;
 mod ports;
 mod preference;
 mod reflection;
+mod relevance;
 mod self_model;
 mod snapshot;
 
@@ -112,6 +114,7 @@ pub use consolidation::{
     PreferenceUpdateProposal,
 };
 pub use curiosity::{CuriosityId, CuriosityItem, CuriosityStatus};
+pub use decision::{MindDecisionProjection, MindDecisionReference};
 pub use episode::{Episode, EpisodeId};
 pub use in_memory::InMemoryMindStore;
 pub use interest::{Interest, InterestId};
@@ -126,6 +129,7 @@ pub use reflection::{
     ReflectionDepth, ReflectionEvent, ReflectionInput, ReflectionProposal, ReflectionQueue,
     ReflectionQueueConfig, ReflectionTrigger,
 };
+pub use relevance::{MAX_LEXICAL_TERMS, lexical_relevance, lexical_terms};
 pub use self_model::{SelfIdentity, SelfLimitation, SelfModel, SelfTrait, TraitName, ValueProfile};
 pub use snapshot::{
     AgendaItemSnapshot, BeliefSnapshot, InterestSnapshot, MindSnapshot, MindSnapshotFuture,

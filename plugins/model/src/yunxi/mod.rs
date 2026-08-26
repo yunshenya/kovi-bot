@@ -25,7 +25,10 @@ use goal_store::PostgresGoalStore;
 use identity_store::PostgresIdentityStore;
 use kovi::tokio::sync::{RwLock as AsyncRwLock, RwLockReadGuard};
 use memory_store::PostgresMemoryStore;
-use mind_runtime::{MindCandidateContext, MindCandidates, MindErasureGuard, MindRuntime};
+use mind_runtime::{
+    MindCandidateContext, MindCandidates, MindContextServices, MindDeliveryPermit,
+    MindErasureGuard, MindRuntime,
+};
 pub(crate) use mind_runtime::{MindProactiveReference, MindProactiveSignals};
 use mind_store::PostgresMindStore;
 use open_loop_store::PostgresOpenLoopStore;
@@ -145,10 +148,22 @@ pub(crate) async fn initialize_database() -> Result<()> {
             .get()
             .cloned()
             .context("Yunxi Mind store 尚未初始化")?;
-        let runtime = Arc::new(MindRuntime::new(
-            store.services(),
-            crate::config::get().mind().clone(),
-        )?);
+        let memory: Arc<dyn yunxi_core::MemoryStore> = MEMORY_STORE
+            .get()
+            .cloned()
+            .context("Yunxi memory store 尚未初始化")?;
+        let open_loops: Arc<dyn yunxi_core::OpenLoopStore> = OPEN_LOOP_STORE
+            .get()
+            .cloned()
+            .context("Yunxi open-loop store 尚未初始化")?;
+        let goals: Arc<dyn yunxi_core::GoalStore> = GOAL_STORE
+            .get()
+            .cloned()
+            .context("Yunxi goal store 尚未初始化")?;
+        let runtime = Arc::new(
+            MindRuntime::new(store.services(), crate::config::get().mind().clone())?
+                .with_context_services(MindContextServices::new(memory, open_loops, goals)),
+        );
         let _ = MIND_RUNTIME.set(runtime);
     }
     Ok(())
@@ -327,6 +342,36 @@ pub(crate) fn register_mind_candidates(
         .is_some_and(|runtime| runtime.register_candidates(idempotency_key, context, candidates))
 }
 
+pub(crate) fn observe_mind_decision(
+    projection: yunxi_core::MindDecisionProjection,
+    estimated_extra_tokens: usize,
+) {
+    if let Some(runtime) = MIND_RUNTIME.get() {
+        runtime.observe_decision(projection, estimated_extra_tokens);
+    }
+}
+
+pub(crate) fn register_mind_outgoing_fence(
+    idempotency_key: String,
+    input: &yunxi_core::PlannerInput,
+    projection: yunxi_core::MindDecisionProjection,
+) -> bool {
+    MIND_RUNTIME
+        .get()
+        .is_some_and(|runtime| runtime.register_outgoing_fence(idempotency_key, input, projection))
+}
+
+pub(crate) async fn pin_mind_outgoing_fence(
+    idempotency_key: &str,
+) -> Option<MindDeliveryPermit<'static>> {
+    let Some(runtime) = MIND_RUNTIME.get() else {
+        return Some(MindDeliveryPermit::untracked());
+    };
+    runtime
+        .pin_revalidated_outgoing_fence(idempotency_key)
+        .await
+}
+
 pub(crate) fn commit_mind_candidates(idempotency_key: &str) {
     if let Some(runtime) = MIND_RUNTIME.get() {
         runtime.commit_candidates(idempotency_key);
@@ -352,6 +397,16 @@ pub(crate) fn mark_mind_proactive_used(reference: MindProactiveReference) {
     }
 }
 
+pub(crate) async fn pin_mind_proactive_reference(
+    reference: Option<MindProactiveReference>,
+) -> Option<MindDeliveryPermit<'static>> {
+    let Some(reference) = reference else {
+        return Some(MindDeliveryPermit::untracked());
+    };
+    let runtime = MIND_RUNTIME.get()?;
+    runtime.pin_proactive_reference(reference).await
+}
+
 pub(crate) fn observe_mind_maintenance_tick() {
     if let Some(bridge) = SHADOW_BRIDGE.get() {
         bridge.observe_maintenance_tick();
@@ -365,11 +420,12 @@ pub(crate) async fn mind_status_report() -> Result<String> {
         .context("Yunxi Mind runtime 尚未初始化")?;
     let stored = store.status().await.map_err(anyhow::Error::from)?;
     let metrics = runtime.metrics();
+    let reasons = runtime.reasons();
     let last_reflection =
         chrono::DateTime::<chrono::Utc>::from_timestamp_millis(metrics.last_reflection_unix_ms)
             .map_or_else(|| "尚未执行".to_string(), |at| at.to_rfc3339());
     Ok(format!(
-        "Yunxi Mind 状态\n模式：{:?}\n版本：{}\n持久状态：belief {}，preference {}，interest {}，open question {}，active agenda {}\n候选：registered {}，applied {}，rejected {}\n反思：total {}，failed {}，last {}，额外模型调用 0\n更新：belief {}，preference {}，interest {}，agenda {}\n运行：events {}，proactive uses {}，erasures {}，blocked snapshots {}",
+        "Yunxi Mind 状态\n模式：{:?}\n版本：{}\n持久状态：belief {}，preference {}，interest {}，open question {}，active agenda {}\n候选：registered {}，applied {}，rejected {}\n反思：total {}，failed {}，last {}，额外模型调用 0\n更新：belief {}，preference {}，interest {}，agenda {}\n决策：observed {}，shadow delta {}，active delta {}，estimated extra tokens {}\n快照：requests {}，latency last/avg/max {:.2}/{:.2}/{:.2} ms，blocked {}\n发送栅栏：registered {}，rejected {}，stale {}\n原因：disposition={:?} tags={:?}，agenda={:?}，belief={:?}，proactive={:?}\n运行：events {}，proactive uses {}，erasures {}",
         runtime.config().influence_mode(),
         stored.version,
         stored.beliefs,
@@ -387,10 +443,32 @@ pub(crate) async fn mind_status_report() -> Result<String> {
         metrics.preference_updates,
         metrics.interest_updates,
         metrics.agenda_updates,
+        metrics.decision_observations,
+        metrics.shadow_decision_deltas,
+        metrics.active_decision_deltas,
+        metrics.estimated_extra_prompt_tokens,
+        metrics.snapshot_requests,
+        metrics.snapshot_latency_last_micros as f64 / 1_000.0,
+        if metrics.snapshot_requests == 0 {
+            0.0
+        } else {
+            metrics.snapshot_latency_total_micros as f64
+                / metrics.snapshot_requests as f64
+                / 1_000.0
+        },
+        metrics.snapshot_latency_max_micros as f64 / 1_000.0,
+        metrics.blocked_snapshots,
+        metrics.outgoing_fences_registered,
+        metrics.outgoing_fences_rejected,
+        metrics.outgoing_fences_stale,
+        reasons.last_disposition,
+        reasons.last_decision_reasons,
+        reasons.last_agenda_source,
+        reasons.last_belief_source,
+        reasons.last_proactive_kind,
         metrics.events_observed,
         metrics.proactive_uses,
         metrics.erasures,
-        metrics.blocked_snapshots,
     ))
 }
 

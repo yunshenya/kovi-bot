@@ -568,6 +568,16 @@ impl QqActionAdapter {
                 ));
             }
         };
+        let Some(mind_delivery_permit) =
+            crate::yunxi::pin_mind_outgoing_fence(idempotency_key).await
+        else {
+            drop(authorization);
+            drop(route_guard);
+            drop(precommit);
+            return Ok(ActionPortOutcome::Deferred {
+                reason: "mind_snapshot_changed_before_commit".to_string(),
+            });
+        };
         let delivery_ticket = outgoing.ticket();
         let commit_result = precommit.commit(fingerprint, Some(idempotency_key)).await;
         let committed = match commit_result {
@@ -628,6 +638,7 @@ impl QqActionAdapter {
         let send_result = MessageTransport::new(&self.bot)
             .send(destination.message_destination(), message)
             .await;
+        drop(mind_delivery_permit);
         let message_id = match send_result {
             Ok(message_id) => {
                 if let Err(error) = durable_committed.mark_sent(i64::from(message_id)).await {
@@ -924,6 +935,16 @@ impl QqActionAdapter {
             QqDestination::Group(group_id) => crate::model::utils::is_group_paused(group_id).await,
             QqDestination::Private(_) => false,
         };
+        let Some(mind_delivery_permit) =
+            crate::yunxi::pin_mind_outgoing_fence(action.idempotency_key()).await
+        else {
+            drop(group_authorization);
+            drop(route_guard);
+            finish(ticket).await;
+            return Ok(ActionPortOutcome::Deferred {
+                reason: "mind_snapshot_changed_before_tool_effect".to_string(),
+            });
+        };
         if !mark_active(ticket).await {
             drop(group_authorization);
             drop(route_guard);
@@ -959,6 +980,7 @@ impl QqActionAdapter {
         };
         drop(group_authorization);
         drop(route_guard);
+        crate::yunxi::commit_mind_candidates(action.idempotency_key());
         let revalidator: Arc<dyn ToolEffectRevalidator> = Arc::new(CoreToolEffectRevalidator {
             adapter: self.clone(),
             registry: Arc::clone(&registry),
@@ -972,6 +994,7 @@ impl QqActionAdapter {
         let result = registry
             .execute_with_revalidation(&action.tool_name, arguments, context, ticket, revalidator)
             .await;
+        drop(mind_delivery_permit);
         finish(ticket).await;
         if result.succeeded {
             return Ok(ActionPortOutcome::ToolCompleted {

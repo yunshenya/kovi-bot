@@ -815,14 +815,16 @@ async fn delete_private_user_data(user_id: i64, self_id: i64, bot: &RuntimeBot) 
             0
         }
     };
-    match erasure.finish().await {
-        Ok(()) => {
-            if let Some(mind_erasure) = mind_erasure {
-                mind_erasure.finish().await;
+    if failures.is_empty() {
+        match erasure.finish().await {
+            Ok(()) => {
+                if let Some(mind_erasure) = mind_erasure {
+                    mind_erasure.finish().await;
+                }
             }
-        }
-        Err(error) => {
-            failures.push(format!("core-barrier-resume: {error}"));
+            Err(error) => {
+                failures.push(format!("core-barrier-resume: {error}"));
+            }
         }
     }
 
@@ -845,7 +847,7 @@ async fn delete_private_user_data(user_id: i64, self_id: i64, bot: &RuntimeBot) 
         send_erasure_receipt(
             bot,
             user_id,
-            "数据删除没有全部完成；已尝试其余可归属数据，请稍后重试或联系管理员检查日志。",
+            "数据删除没有全部完成；为防止数据被重新写入，当前入口已保持关闭，请联系管理员检查日志后重启并重试。",
         )
         .await;
     }

@@ -1,19 +1,23 @@
 use crate::config::MindConfig;
 use chrono::{DateTime, Duration, Utc};
-use kovi::tokio::sync::{Mutex as AsyncMutex, RwLock};
+use kovi::tokio::sync::{Mutex as AsyncMutex, RwLock, RwLockReadGuard};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use yunxi_core::{
     AgendaItemId, AgendaOperation, AgendaSource, AgendaSubject, AgendaUpdateProposal, Belief,
     BeliefId, BeliefOperation, BeliefSource, BeliefUpdateProposal, Consolidation,
     ConsolidationConfig, ConsolidationError, CuriosityId, CuriosityItem, CuriosityStatus, Episode,
     EpisodeId, EventId, EventPriority, EventScope, EvidenceKind, EvidencePolarity, EvidenceRef,
-    Interest, InterestOperation, InterestUpdateProposal, MindInfluenceMode, MindReasonTag,
-    MindScope, MindServices, MindSnapshot, MindSnapshotFuture, MindSnapshotProvider,
-    MindSnapshotRequest, MindSnapshotStoreProvider, MindSource, OpenQuestion, OpenQuestionId,
-    OpenQuestionOperation, OpenQuestionUpdateProposal, PlannerInput, Preference,
-    PreferenceOperation, PreferenceSource, PreferenceUpdateProposal, ReflectionDepth,
+    Goal, GoalOwner, GoalState, GoalStore, Interest, InterestOperation, InterestUpdateProposal,
+    Memory, MemoryQuery, MemoryScope, MemoryStore, MindDecisionProjection, MindDecisionReference,
+    MindInfluenceMode, MindReasonTag, MindScope, MindServices, MindSnapshot, MindSnapshotFuture,
+    MindSnapshotProvider, MindSnapshotRequest, MindSnapshotStoreProvider, MindSource, OpenLoop,
+    OpenLoopKind, OpenLoopOwner, OpenLoopStore, OpenQuestion, OpenQuestionId,
+    OpenQuestionOperation, OpenQuestionStatus, OpenQuestionUpdateProposal, PlannerInput,
+    Preference, PreferenceOperation, PreferenceSource, PreferenceUpdateProposal, ReflectionDepth,
     ReflectionEvent, ReflectionInput, ReflectionProposal, ReflectionQueue, ReflectionQueueConfig,
     ReflectionTrigger, TraceContext, WorldEvent, WorldEventKind,
 };
@@ -26,6 +30,8 @@ const MAX_REFLECTION_SCOPES_PER_TICK: usize = 32;
 const MAX_REFLECTION_DECAYS: usize = 8;
 const MAX_EPISODE_SOURCE_EVENTS: usize = 16;
 const CURIOSITY_TTL_DAYS: i64 = 30;
+const MAX_OUTGOING_FENCES: usize = 512;
+const OUTGOING_FENCE_TTL_MINUTES: i64 = 10;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct MindInterestCandidate {
@@ -134,6 +140,17 @@ pub(crate) struct MindMetricsSnapshot {
     pub proactive_uses: u64,
     pub erasures: u64,
     pub blocked_snapshots: u64,
+    pub snapshot_requests: u64,
+    pub snapshot_latency_total_micros: u64,
+    pub snapshot_latency_max_micros: u64,
+    pub snapshot_latency_last_micros: u64,
+    pub decision_observations: u64,
+    pub shadow_decision_deltas: u64,
+    pub active_decision_deltas: u64,
+    pub estimated_extra_prompt_tokens: u64,
+    pub outgoing_fences_registered: u64,
+    pub outgoing_fences_rejected: u64,
+    pub outgoing_fences_stale: u64,
     pub last_reflection_unix_ms: i64,
 }
 
@@ -152,6 +169,17 @@ struct MindMetrics {
     proactive_uses: AtomicU64,
     erasures: AtomicU64,
     blocked_snapshots: AtomicU64,
+    snapshot_requests: AtomicU64,
+    snapshot_latency_total_micros: AtomicU64,
+    snapshot_latency_max_micros: AtomicU64,
+    snapshot_latency_last_micros: AtomicU64,
+    decision_observations: AtomicU64,
+    shadow_decision_deltas: AtomicU64,
+    active_decision_deltas: AtomicU64,
+    estimated_extra_prompt_tokens: AtomicU64,
+    outgoing_fences_registered: AtomicU64,
+    outgoing_fences_rejected: AtomicU64,
+    outgoing_fences_stale: AtomicU64,
     last_reflection_unix_ms: AtomicI64,
 }
 
@@ -171,13 +199,97 @@ impl MindMetrics {
             proactive_uses: self.proactive_uses.load(Ordering::Relaxed),
             erasures: self.erasures.load(Ordering::Relaxed),
             blocked_snapshots: self.blocked_snapshots.load(Ordering::Relaxed),
+            snapshot_requests: self.snapshot_requests.load(Ordering::Relaxed),
+            snapshot_latency_total_micros: self
+                .snapshot_latency_total_micros
+                .load(Ordering::Relaxed),
+            snapshot_latency_max_micros: self.snapshot_latency_max_micros.load(Ordering::Relaxed),
+            snapshot_latency_last_micros: self.snapshot_latency_last_micros.load(Ordering::Relaxed),
+            decision_observations: self.decision_observations.load(Ordering::Relaxed),
+            shadow_decision_deltas: self.shadow_decision_deltas.load(Ordering::Relaxed),
+            active_decision_deltas: self.active_decision_deltas.load(Ordering::Relaxed),
+            estimated_extra_prompt_tokens: self
+                .estimated_extra_prompt_tokens
+                .load(Ordering::Relaxed),
+            outgoing_fences_registered: self.outgoing_fences_registered.load(Ordering::Relaxed),
+            outgoing_fences_rejected: self.outgoing_fences_rejected.load(Ordering::Relaxed),
+            outgoing_fences_stale: self.outgoing_fences_stale.load(Ordering::Relaxed),
             last_reflection_unix_ms: self.last_reflection_unix_ms.load(Ordering::Relaxed),
         }
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct MindReasonSnapshot {
+    pub last_disposition: Option<yunxi_core::DecisionDisposition>,
+    pub last_decision_reasons: Vec<MindReasonTag>,
+    pub last_agenda_source: Option<AgendaSource>,
+    pub last_belief_source: Option<BeliefSource>,
+    pub last_proactive_kind: Option<yunxi_core::AgendaItemKind>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingMindFence {
+    idempotency_key: String,
+    request: MindSnapshotRequest,
+    expected_signature: [u8; 32],
+    projection: MindDecisionProjection,
+    erasure_epoch: u64,
+    registered_at: DateTime<Utc>,
+}
+
+#[derive(Debug)]
+pub(crate) struct MindDeliveryPermit<'a> {
+    _barrier: Option<RwLockReadGuard<'a, BarrierState>>,
+}
+
+impl MindDeliveryPermit<'_> {
+    #[must_use]
+    pub(crate) const fn untracked() -> Self {
+        Self { _barrier: None }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct MindContextServices {
+    memory: Arc<dyn MemoryStore>,
+    open_loops: Arc<dyn OpenLoopStore>,
+    goals: Arc<dyn GoalStore>,
+}
+
+impl std::fmt::Debug for MindContextServices {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MindContextServices")
+            .finish_non_exhaustive()
+    }
+}
+
+impl MindContextServices {
+    #[must_use]
+    pub(crate) fn new(
+        memory: Arc<dyn MemoryStore>,
+        open_loops: Arc<dyn OpenLoopStore>,
+        goals: Arc<dyn GoalStore>,
+    ) -> Self {
+        Self {
+            memory,
+            open_loops,
+            goals,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct V1MindContext {
+    memories: Vec<Memory>,
+    open_loops: Vec<OpenLoop>,
+    goals: Vec<Goal>,
+}
+
 #[derive(Debug, Default)]
 struct BarrierState {
+    epoch: u64,
     persons: HashMap<yunxi_core::PersonId, usize>,
     conversations: HashMap<yunxi_core::ConversationId, usize>,
 }
@@ -207,6 +319,7 @@ impl BarrierState {
         person_id: Option<yunxi_core::PersonId>,
         conversation_ids: &[yunxi_core::ConversationId],
     ) {
+        self.epoch = self.epoch.wrapping_add(1).max(1);
         if let Some(person_id) = person_id {
             *self.persons.entry(person_id).or_default() += 1;
         }
@@ -244,6 +357,7 @@ struct PendingCandidates {
     idempotency_key: String,
     context: MindCandidateContext,
     candidates: MindCandidates,
+    erasure_epoch: u64,
     registered_at: DateTime<Utc>,
 }
 
@@ -316,12 +430,15 @@ pub(crate) struct MindRuntime {
     services: MindServices,
     snapshot_provider: MindSnapshotStoreProvider,
     config: MindConfig,
+    context_services: Option<MindContextServices>,
     consolidation: Consolidation,
     reflection_queue: ReflectionQueue,
     barrier: RwLock<BarrierState>,
     pending_candidates: Mutex<VecDeque<PendingCandidates>>,
+    outgoing_fences: Mutex<VecDeque<PendingMindFence>>,
     recent_events: Mutex<RecentEvents>,
     last_reflections: Mutex<HashMap<MindScope, DateTime<Utc>>>,
+    reasons: Mutex<MindReasonSnapshot>,
     reflection_worker: AsyncMutex<()>,
     metrics: MindMetrics,
 }
@@ -333,15 +450,24 @@ impl MindRuntime {
             services,
             snapshot_provider,
             config,
+            context_services: None,
             consolidation: Consolidation::new(ConsolidationConfig::default())?,
             reflection_queue: ReflectionQueue::new(ReflectionQueueConfig::default())?,
             barrier: RwLock::new(BarrierState::default()),
             pending_candidates: Mutex::new(VecDeque::new()),
+            outgoing_fences: Mutex::new(VecDeque::new()),
             recent_events: Mutex::new(RecentEvents::default()),
             last_reflections: Mutex::new(HashMap::new()),
+            reasons: Mutex::new(MindReasonSnapshot::default()),
             reflection_worker: AsyncMutex::new(()),
             metrics: MindMetrics::default(),
         })
+    }
+
+    #[must_use]
+    pub(crate) fn with_context_services(mut self, services: MindContextServices) -> Self {
+        self.context_services = Some(services);
+        self
     }
 
     #[must_use]
@@ -352,6 +478,194 @@ impl MindRuntime {
     #[must_use]
     pub(crate) fn metrics(&self) -> MindMetricsSnapshot {
         self.metrics.snapshot()
+    }
+
+    #[must_use]
+    pub(crate) fn reasons(&self) -> MindReasonSnapshot {
+        self.reasons
+            .lock()
+            .unwrap_or_else(|lock| lock.into_inner())
+            .clone()
+    }
+
+    pub(crate) fn observe_decision(
+        &self,
+        projection: MindDecisionProjection,
+        estimated_extra_tokens: usize,
+    ) {
+        self.metrics
+            .decision_observations
+            .fetch_add(1, Ordering::Relaxed);
+        self.metrics.estimated_extra_prompt_tokens.fetch_add(
+            u64::try_from(estimated_extra_tokens).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        if projection.changes_baseline() {
+            match self.config.influence_mode() {
+                MindInfluenceMode::Shadow => {
+                    self.metrics
+                        .shadow_decision_deltas
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                MindInfluenceMode::Active => {
+                    self.metrics
+                        .active_decision_deltas
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                MindInfluenceMode::Disabled => {}
+            }
+        }
+        let mut reasons = self.reasons.lock().unwrap_or_else(|lock| lock.into_inner());
+        reasons.last_disposition = Some(projection.disposition());
+        reasons.last_decision_reasons = projection.reason_tags().to_vec();
+    }
+
+    pub(crate) fn register_outgoing_fence(
+        &self,
+        idempotency_key: String,
+        input: &PlannerInput,
+        projection: MindDecisionProjection,
+    ) -> bool {
+        if self.config.influence_mode() != MindInfluenceMode::Active
+            || input.mind.influence_mode() != MindInfluenceMode::Active
+            || input.mind.is_empty()
+            || input.mind.version() == 0
+            || idempotency_key.is_empty()
+        {
+            self.metrics
+                .outgoing_fences_rejected
+                .fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        let topic = input
+            .state
+            .conversation
+            .as_ref()
+            .and_then(|conversation| conversation.current_topic.as_deref());
+        let Ok(request) = MindSnapshotRequest::for_event(
+            &input.event,
+            topic,
+            self.config.snapshot_limits(),
+            MindInfluenceMode::Active,
+        ) else {
+            self.metrics
+                .outgoing_fences_rejected
+                .fetch_add(1, Ordering::Relaxed);
+            return false;
+        };
+        let Ok(barrier) = self.barrier.try_read() else {
+            self.metrics
+                .outgoing_fences_rejected
+                .fetch_add(1, Ordering::Relaxed);
+            return false;
+        };
+        if barrier.blocks_origin(request.person_id(), request.conversation_id())
+            || request
+                .scopes()
+                .iter()
+                .any(|scope| barrier.blocks_scope(*scope))
+        {
+            self.metrics
+                .outgoing_fences_rejected
+                .fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        let now = Utc::now();
+        let mut fences = self
+            .outgoing_fences
+            .lock()
+            .unwrap_or_else(|lock| lock.into_inner());
+        fences.retain(|fence| {
+            fence.idempotency_key != idempotency_key
+                && now.signed_duration_since(fence.registered_at)
+                    < Duration::minutes(OUTGOING_FENCE_TTL_MINUTES)
+        });
+        if fences.len() >= MAX_OUTGOING_FENCES {
+            self.metrics
+                .outgoing_fences_rejected
+                .fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        fences.push_back(PendingMindFence {
+            idempotency_key,
+            request,
+            expected_signature: mind_snapshot_signature(&input.mind),
+            projection,
+            erasure_epoch: barrier.epoch,
+            registered_at: now,
+        });
+        drop(fences);
+        drop(barrier);
+        self.metrics
+            .outgoing_fences_registered
+            .fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
+    pub(crate) async fn pin_revalidated_outgoing_fence(
+        &self,
+        idempotency_key: &str,
+    ) -> Option<MindDeliveryPermit<'_>> {
+        let fence = self
+            .outgoing_fences
+            .lock()
+            .unwrap_or_else(|lock| lock.into_inner())
+            .iter()
+            .find(|fence| fence.idempotency_key == idempotency_key)
+            .cloned();
+        let Some(fence) = fence else {
+            return Some(MindDeliveryPermit::untracked());
+        };
+        if Utc::now().signed_duration_since(fence.registered_at)
+            >= Duration::minutes(OUTGOING_FENCE_TTL_MINUTES)
+        {
+            self.discard_pending_candidates(idempotency_key);
+            self.metrics
+                .outgoing_fences_stale
+                .fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        let barrier = self.barrier.read().await;
+        if barrier.epoch != fence.erasure_epoch
+            || barrier.blocks_origin(fence.request.person_id(), fence.request.conversation_id())
+            || fence
+                .request
+                .scopes()
+                .iter()
+                .any(|scope| barrier.blocks_scope(*scope))
+        {
+            self.discard_pending_candidates(idempotency_key);
+            self.metrics
+                .outgoing_fences_stale
+                .fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        let current = self.snapshot_provider.snapshot(&fence.request).await;
+        let valid = current.is_ok_and(|snapshot| {
+            !snapshot.is_empty() && mind_snapshot_signature(&snapshot) == fence.expected_signature
+        });
+        if !valid {
+            self.discard_pending_candidates(idempotency_key);
+            self.metrics
+                .outgoing_fences_stale
+                .fetch_add(1, Ordering::Relaxed);
+            kovi::log::info!(
+                "Yunxi Mind outgoing fence rejected: key={} disposition={:?} reasons={:?}",
+                idempotency_key,
+                fence.projection.disposition(),
+                fence.projection.reason_tags(),
+            );
+        }
+        valid.then_some(MindDeliveryPermit {
+            _barrier: Some(barrier),
+        })
+    }
+
+    fn discard_pending_candidates(&self, idempotency_key: &str) {
+        self.pending_candidates
+            .lock()
+            .unwrap_or_else(|lock| lock.into_inner())
+            .retain(|pending| pending.idempotency_key != idempotency_key);
     }
 
     pub(crate) fn register_candidates(
@@ -375,8 +689,6 @@ impl MindRuntime {
                 .fetch_add(1, Ordering::Relaxed);
             return false;
         }
-        drop(barrier);
-
         let now = Utc::now();
         let mut pending = self
             .pending_candidates
@@ -391,6 +703,7 @@ impl MindRuntime {
             idempotency_key,
             context,
             candidates,
+            erasure_epoch: barrier.epoch,
             registered_at: now,
         });
         while pending.len() > MAX_PENDING_CANDIDATES {
@@ -402,6 +715,8 @@ impl MindRuntime {
         self.metrics
             .candidates_registered
             .fetch_add(1, Ordering::Relaxed);
+        drop(pending);
+        drop(barrier);
         true
     }
 
@@ -416,12 +731,30 @@ impl MindRuntime {
                 .position(|item| item.idempotency_key == idempotency_key)
                 .and_then(|index| queue.remove(index))
         };
-        let Some(pending) = pending else {
-            return;
+        let fence = {
+            let mut fences = self
+                .outgoing_fences
+                .lock()
+                .unwrap_or_else(|lock| lock.into_inner());
+            fences
+                .iter()
+                .position(|item| item.idempotency_key == idempotency_key)
+                .and_then(|index| fences.remove(index))
         };
+        if pending.is_none() && fence.is_none() {
+            return;
+        }
         let runtime = Arc::clone(self);
         kovi::tokio::spawn(async move {
-            if let Err(error) = runtime.persist_candidates(pending).await {
+            if let Some(fence) = fence
+                && let Some(reference) = fence.projection.reference()
+                && let Err(error) = runtime.mark_decision_used_inner(reference).await
+            {
+                kovi::log::warn!("Yunxi Mind decision cooldown update failed: {error}");
+            }
+            if let Some(pending) = pending
+                && let Err(error) = runtime.persist_candidates(pending).await
+            {
                 runtime
                     .metrics
                     .candidates_rejected
@@ -433,6 +766,33 @@ impl MindRuntime {
 
     pub(crate) async fn observe_event(&self, event: &WorldEvent) -> anyhow::Result<()> {
         if !self.config.enabled() {
+            return Ok(());
+        }
+        if let WorldEventKind::MessageCollisionDetected(collision) = event.kind() {
+            let scope = MindScope::Conversation {
+                conversation_id: collision.conversation_id,
+            };
+            let barrier = self.barrier.read().await;
+            if barrier.blocks_scope(scope) {
+                return Ok(());
+            }
+            self.metrics.events_observed.fetch_add(1, Ordering::Relaxed);
+            self.recent_events
+                .lock()
+                .unwrap_or_else(|lock| lock.into_inner())
+                .push(
+                    ObservedReflectionEvent {
+                        event: ReflectionEvent {
+                            event_id: event.id(),
+                            scope,
+                            summary: "message collision changed pending outgoing".to_string(),
+                            salience: 0.45,
+                            occurred_at: event.occurred_at(),
+                        },
+                        trace: event.trace(),
+                    },
+                    self.config.reflection_max_events(),
+                );
             return Ok(());
         }
         let WorldEventKind::MessageReceived(message) = event.kind() else {
@@ -481,7 +841,198 @@ impl MindRuntime {
             }
         }
         self.resolve_answered_state(event, &scopes).await?;
+        self.refresh_agenda_for_scopes(
+            &scopes,
+            message.content.as_text(),
+            event.occurred_at(),
+            event.trace(),
+        )
+        .await?;
         Ok(())
+    }
+
+    async fn load_v1_context(&self, scope: MindScope, query: &str) -> V1MindContext {
+        let Some(services) = self.context_services.as_ref() else {
+            return V1MindContext::default();
+        };
+        let (memory_scope, open_loop_owner, goal_owner) = match scope {
+            MindScope::Global => (
+                MemoryScope::Global,
+                OpenLoopOwner::Global,
+                GoalOwner::Global,
+            ),
+            MindScope::Person { person_id } => (
+                MemoryScope::Person(person_id),
+                OpenLoopOwner::Person(person_id),
+                GoalOwner::Person(person_id),
+            ),
+            MindScope::Conversation { conversation_id } => (
+                MemoryScope::Conversation(conversation_id),
+                OpenLoopOwner::Conversation(conversation_id),
+                GoalOwner::Conversation(conversation_id),
+            ),
+        };
+        let memories = match MemoryQuery::new(memory_scope, query, 16) {
+            Ok(memory_query) => {
+                services
+                    .memory
+                    .recall(&memory_query)
+                    .await
+                    .unwrap_or_else(|error| {
+                        kovi::log::warn!("Yunxi Mind V1 memory context failed soft: {error}");
+                        Vec::new()
+                    })
+            }
+            Err(error) => {
+                kovi::log::warn!("Yunxi Mind V1 memory query rejected: {error}");
+                Vec::new()
+            }
+        };
+        let open_loops = services
+            .open_loops
+            .list(&open_loop_owner, 16)
+            .await
+            .unwrap_or_else(|error| {
+                kovi::log::warn!("Yunxi Mind V1 open-loop context failed soft: {error}");
+                Vec::new()
+            });
+        let goals = services
+            .goals
+            .list(&goal_owner, 16)
+            .await
+            .unwrap_or_else(|error| {
+                kovi::log::warn!("Yunxi Mind V1 goal context failed soft: {error}");
+                Vec::new()
+            });
+        V1MindContext {
+            memories,
+            open_loops,
+            goals,
+        }
+    }
+
+    async fn refresh_agenda_for_scopes(
+        &self,
+        scopes: &[MindScope],
+        query: &str,
+        now: DateTime<Utc>,
+        trace: TraceContext,
+    ) -> anyhow::Result<()> {
+        if !self.config.agenda_enabled() {
+            return Ok(());
+        }
+        for scope in scopes.iter().copied() {
+            let context = self.load_v1_context(scope, query).await;
+            for open_loop in context
+                .open_loops
+                .into_iter()
+                .filter(|item| !item.status().is_terminal())
+            {
+                let due_bonus = open_loop
+                    .due_at()
+                    .is_some_and(|due| due <= now + Duration::days(1));
+                let salience = (f32::from(open_loop.salience()) / 100.0).max(if due_bonus {
+                    0.8
+                } else {
+                    0.45
+                });
+                if self
+                    .ensure_agenda(
+                        scope,
+                        AgendaSubject::OpenLoop(open_loop.id()),
+                        AgendaSource::OpenLoop,
+                        salience,
+                        0.8,
+                        now,
+                        trace,
+                    )
+                    .await?
+                {
+                    self.record_agenda_reason(AgendaSource::OpenLoop);
+                }
+            }
+            for goal in context
+                .goals
+                .into_iter()
+                .filter(|goal| goal.state() == GoalState::Active)
+            {
+                let salience = if goal
+                    .due_at()
+                    .is_some_and(|due| due <= now + Duration::days(7))
+                {
+                    0.8
+                } else {
+                    0.6
+                };
+                if self
+                    .ensure_agenda(
+                        scope,
+                        AgendaSubject::Goal(goal.id()),
+                        AgendaSource::Goal,
+                        salience,
+                        0.8,
+                        now,
+                        trace,
+                    )
+                    .await?
+                {
+                    self.record_agenda_reason(AgendaSource::Goal);
+                }
+            }
+            for memory in context
+                .memories
+                .into_iter()
+                .filter(|memory| memory.importance() >= 70)
+            {
+                let salience = f32::from(memory.importance()) / 100.0;
+                if self
+                    .ensure_agenda(
+                        scope,
+                        AgendaSubject::SalientMemory(memory.id()),
+                        AgendaSource::Memory,
+                        salience,
+                        0.5,
+                        now,
+                        trace,
+                    )
+                    .await?
+                {
+                    self.record_agenda_reason(AgendaSource::Memory);
+                }
+            }
+        }
+        if self.config.interest_enabled() {
+            for interest in self.services.interests.relevant(query, 8).await? {
+                let salience = interest
+                    .activation()
+                    .max(interest.long_term_affinity() * 0.8);
+                if salience < 0.5 {
+                    continue;
+                }
+                if self
+                    .ensure_agenda(
+                        MindScope::Global,
+                        AgendaSubject::Interest(interest.id()),
+                        AgendaSource::Interest,
+                        salience,
+                        0.55,
+                        now,
+                        trace,
+                    )
+                    .await?
+                {
+                    self.record_agenda_reason(AgendaSource::Interest);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn record_agenda_reason(&self, source: AgendaSource) {
+        self.reasons
+            .lock()
+            .unwrap_or_else(|lock| lock.into_inner())
+            .last_agenda_source = Some(source);
     }
 
     pub(crate) async fn observe_interaction_cues(
@@ -578,19 +1129,31 @@ impl MindRuntime {
             scopes.push(MindScope::Global);
         }
         scopes.truncate(MAX_REFLECTION_SCOPES_PER_TICK);
+        let mut processed = 0;
+        while processed < MAX_REFLECTIONS_PER_TICK && self.process_next_reflection().await {
+            processed += 1;
+        }
         for scope in scopes {
+            if processed >= MAX_REFLECTIONS_PER_TICK {
+                break;
+            }
             if !self.reflection_due(scope, now) {
                 continue;
             }
             match self.reflection_input(scope, trigger, now).await {
-                Ok(Some(input)) => {
-                    if let Err(error) = self.reflection_queue.enqueue(input) {
+                Ok(Some(input)) => match self.reflection_queue.enqueue(input) {
+                    Ok(_) => {
+                        if self.process_next_reflection().await {
+                            processed += 1;
+                        }
+                    }
+                    Err(error) => {
                         self.metrics
                             .reflection_failures
                             .fetch_add(1, Ordering::Relaxed);
                         kovi::log::warn!("Yunxi Mind reflection enqueue rejected: {error}");
                     }
-                }
+                },
                 Ok(None) => {}
                 Err(error) => {
                     self.metrics
@@ -600,17 +1163,19 @@ impl MindRuntime {
                 }
             }
         }
-        for _ in 0..MAX_REFLECTIONS_PER_TICK {
-            let Some(input) = self.reflection_queue.dequeue() else {
-                break;
-            };
-            if let Err(error) = self.process_reflection(input).await {
-                self.metrics
-                    .reflection_failures
-                    .fetch_add(1, Ordering::Relaxed);
-                kovi::log::warn!("Yunxi Mind reflection failed: {error}");
-            }
+    }
+
+    async fn process_next_reflection(&self) -> bool {
+        let Some(input) = self.reflection_queue.dequeue() else {
+            return false;
+        };
+        if let Err(error) = self.process_reflection(input).await {
+            self.metrics
+                .reflection_failures
+                .fetch_add(1, Ordering::Relaxed);
+            kovi::log::warn!("Yunxi Mind reflection failed: {error}");
         }
+        true
     }
 
     pub(crate) async fn proactive_signals(
@@ -626,6 +1191,8 @@ impl MindRuntime {
         }
         let now = Utc::now();
         let scopes = [MindScope::Global, MindScope::Person { person_id }];
+        self.refresh_agenda_for_scopes(&scopes, "", now, TraceContext::root(EventId::new()))
+            .await?;
         let agenda = self.services.agenda.list_active(&scopes, now, 8).await?;
         let questions = self.services.open_questions.list_open(&scopes, 8).await?;
         let curiosities = self.services.curiosities.list_open(&scopes, now, 8).await?;
@@ -647,12 +1214,16 @@ impl MindRuntime {
             let score = item.rank_score();
             best_score = best_score.max(score);
             if score >= topic_score
-                && let AgendaSubject::SocialMotive(label) = item.subject()
-                && safe_proactive_topic(label)
+                && let Some(label) = self.agenda_topic(&item).await
+                && safe_proactive_topic(&label)
             {
                 topic_score = score;
-                topic = Some(label.clone());
+                topic = Some(label);
                 reference = Some(MindProactiveReference::Agenda(item.id()));
+                self.reasons
+                    .lock()
+                    .unwrap_or_else(|lock| lock.into_inner())
+                    .last_proactive_kind = Some(item.kind());
             }
         }
 
@@ -670,12 +1241,19 @@ impl MindRuntime {
                 topic_score = question.salience();
                 topic = Some(question.question().to_owned());
                 reference = Some(MindProactiveReference::OpenQuestion(question.id()));
+                self.reasons
+                    .lock()
+                    .unwrap_or_else(|lock| lock.into_inner())
+                    .last_proactive_kind = Some(yunxi_core::AgendaItemKind::OpenQuestion);
             }
         }
         for curiosity in curiosities {
             if curiosity.status() != CuriosityStatus::Open
                 || !safe_proactive_topic(curiosity.question())
                 || curiosity.updated_at() > cooldown_boundary
+                || !self
+                    .curiosity_agenda_available(curiosity.id(), curiosity.scope(), now)
+                    .await?
             {
                 continue;
             }
@@ -684,6 +1262,10 @@ impl MindRuntime {
                 topic_score = curiosity.salience();
                 topic = Some(curiosity.question().to_owned());
                 reference = Some(MindProactiveReference::Curiosity(curiosity.id()));
+                self.reasons
+                    .lock()
+                    .unwrap_or_else(|lock| lock.into_inner())
+                    .last_proactive_kind = Some(yunxi_core::AgendaItemKind::Curiosity);
             }
         }
         let projected = MindProactiveSignals {
@@ -703,6 +1285,120 @@ impl MindRuntime {
         } else {
             Ok(projected)
         }
+    }
+
+    async fn agenda_topic(&self, item: &yunxi_core::AgendaItem) -> Option<String> {
+        match item.subject() {
+            AgendaSubject::OpenLoop(id) => self
+                .context_services
+                .as_ref()?
+                .open_loops
+                .get(*id)
+                .await
+                .ok()
+                .flatten()
+                .filter(|open_loop| !open_loop.status().is_terminal())
+                .map(|open_loop| open_loop.summary().to_owned()),
+            AgendaSubject::Goal(id) => self
+                .context_services
+                .as_ref()?
+                .goals
+                .get(*id)
+                .await
+                .ok()
+                .flatten()
+                .filter(|goal| goal.state() == GoalState::Active)
+                .map(|goal| goal.title().to_owned()),
+            AgendaSubject::Interest(id) => self
+                .services
+                .interests
+                .get(*id)
+                .await
+                .ok()
+                .flatten()
+                .map(|interest| interest.topic().to_owned()),
+            AgendaSubject::SalientMemory(id) => self
+                .load_v1_context(item.scope(), "")
+                .await
+                .memories
+                .into_iter()
+                .find(|memory| memory.id() == *id)
+                .map(|memory| memory.content().to_owned()),
+            AgendaSubject::SocialMotive(label) => Some(label.clone()),
+            AgendaSubject::Curiosity(_)
+            | AgendaSubject::OpenQuestion(_)
+            | AgendaSubject::UnresolvedConversation(_) => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn proactive_reference_current(
+        &self,
+        reference: MindProactiveReference,
+    ) -> bool {
+        self.pin_proactive_reference(reference).await.is_some()
+    }
+
+    pub(crate) async fn pin_proactive_reference(
+        &self,
+        reference: MindProactiveReference,
+    ) -> Option<MindDeliveryPermit<'_>> {
+        let barrier = self.barrier.read().await;
+        let now = Utc::now();
+        let current = match reference {
+            MindProactiveReference::Curiosity(id) => {
+                let curiosity = self
+                    .services
+                    .curiosities
+                    .get(id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .filter(|item| {
+                        item.status() == CuriosityStatus::Open
+                            && item.expires_at().is_none_or(|expires| expires > now)
+                    })?;
+                if barrier.blocks_origin(curiosity.subject(), curiosity.conversation_id()) {
+                    return None;
+                }
+                self.curiosity_agenda_available(id, curiosity.scope(), now)
+                    .await
+                    .unwrap_or(false)
+            }
+            MindProactiveReference::OpenQuestion(id) => {
+                let question = self
+                    .services
+                    .open_questions
+                    .get(id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .filter(|question| question.status() == OpenQuestionStatus::Open)?;
+                if barrier.blocks_scope(question.scope()) {
+                    return None;
+                }
+                self.question_agenda_available(id, question.scope(), now)
+                    .await
+                    .unwrap_or(false)
+            }
+            MindProactiveReference::Agenda(id) => {
+                let item = self
+                    .services
+                    .agenda
+                    .get(id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .filter(|item| item.is_available_at(now))?;
+                if barrier.blocks_scope(item.scope()) {
+                    return None;
+                }
+                self.agenda_topic(&item).await.is_some()
+            }
+        };
+        current.then_some(MindDeliveryPermit {
+            _barrier: Some(barrier),
+        })
     }
 
     pub(crate) fn mark_proactive_used(self: &Arc<Self>, reference: MindProactiveReference) {
@@ -768,14 +1464,21 @@ impl MindRuntime {
 
     async fn persist_candidates(&self, pending: PendingCandidates) -> anyhow::Result<()> {
         let barrier = self.barrier.read().await;
-        if barrier.blocks_origin(
-            Some(pending.context.person_id),
-            Some(pending.context.conversation_id),
-        ) {
+        if barrier.epoch != pending.erasure_epoch
+            || barrier.blocks_origin(
+                Some(pending.context.person_id),
+                Some(pending.context.conversation_id),
+            )
+        {
             return Ok(());
         }
         let now = Utc::now().max(pending.context.occurred_at);
         let mut applied = 0_u64;
+        let interest_agenda_topic = pending
+            .candidates
+            .interest
+            .as_ref()
+            .map(|candidate| candidate.topic.clone());
 
         let mut global = self
             .empty_proposal(MindScope::Global, now, pending.context.trace)
@@ -785,9 +1488,15 @@ impl MindRuntime {
             && safe_global_state_text(&candidate.proposition)
             && self.can_upsert_belief(&candidate.proposition, now).await?
         {
+            let confidence_delta = candidate.confidence_delta.clamp(-0.2, 0.2);
+            let polarity = if confidence_delta < 0.0 {
+                EvidencePolarity::Contradicts
+            } else {
+                EvidencePolarity::Supports
+            };
             let evidence = EvidenceRef::new(
                 EvidenceKind::Event(pending.context.event_id),
-                EvidencePolarity::Supports,
+                polarity,
                 0.55,
                 pending.context.occurred_at,
             )?;
@@ -797,7 +1506,7 @@ impl MindRuntime {
                 expected_version: None,
                 scope: MindScope::Global,
                 proposition: candidate.proposition,
-                confidence_delta: candidate.confidence_delta.clamp(-0.2, 0.2),
+                confidence_delta,
                 stability_delta: 0.02,
                 source: BeliefSource::Inference,
                 evidence_refs: vec![evidence],
@@ -850,7 +1559,39 @@ impl MindRuntime {
             self.metrics
                 .interest_updates
                 .fetch_add(interest_count, Ordering::Relaxed);
+            if belief_count > 0 {
+                self.reasons
+                    .lock()
+                    .unwrap_or_else(|lock| lock.into_inner())
+                    .last_belief_source = Some(BeliefSource::Inference);
+            }
             applied += belief_count + preference_count + interest_count;
+        }
+        if self.config.agenda_enabled()
+            && let Some(topic) = interest_agenda_topic
+            && let Some(interest) = self
+                .services
+                .interests
+                .relevant(&topic, 4)
+                .await?
+                .into_iter()
+                .find(|interest| interest.topic().eq_ignore_ascii_case(topic.trim()))
+            && self
+                .ensure_agenda(
+                    MindScope::Global,
+                    AgendaSubject::Interest(interest.id()),
+                    AgendaSource::Interest,
+                    interest
+                        .activation()
+                        .max(interest.long_term_affinity() * 0.8),
+                    0.55,
+                    now,
+                    pending.context.trace,
+                )
+                .await?
+        {
+            self.record_agenda_reason(AgendaSource::Interest);
+            applied += 1;
         }
 
         let scope = pending.context.scoped_state();
@@ -880,6 +1621,7 @@ impl MindRuntime {
                         AgendaSubject::Curiosity(curiosity.id()),
                         AgendaSource::Curiosity,
                         curiosity.salience(),
+                        0.35,
                         now,
                         pending.context.trace,
                     )
@@ -902,6 +1644,7 @@ impl MindRuntime {
                         AgendaSubject::OpenQuestion(open_question.id()),
                         AgendaSource::OpenQuestion,
                         open_question.salience(),
+                        0.4,
                         now,
                         pending.context.trace,
                     )
@@ -921,6 +1664,7 @@ impl MindRuntime {
                     AgendaSubject::SocialMotive(label),
                     AgendaSource::Interaction,
                     0.55,
+                    0.3,
                     now,
                     pending.context.trace,
                 )
@@ -953,7 +1697,47 @@ impl MindRuntime {
         if looks_like_question(answer) {
             return Ok(());
         }
-        let now = event.occurred_at();
+        let now = Utc::now().max(event.occurred_at());
+        let mut resolved_open_loops = Vec::new();
+        if let Some(context_services) = self.context_services.as_ref() {
+            for scope in scopes.iter().copied() {
+                let context = self.load_v1_context(scope, answer).await;
+                for open_loop in context.open_loops.into_iter().filter(|item| {
+                    !item.status().is_terminal()
+                        && matches!(
+                            item.kind(),
+                            OpenLoopKind::FollowUp
+                                | OpenLoopKind::AwaitingOutcome
+                                | OpenLoopKind::PendingQuestion
+                        )
+                        && answer_matches_question(item.summary(), answer)
+                }) {
+                    match context_services
+                        .open_loops
+                        .resolve(open_loop.id(), now)
+                        .await
+                    {
+                        Ok(_) => resolved_open_loops.push(open_loop.id()),
+                        Err(error) => {
+                            let already_terminal = context_services
+                                .open_loops
+                                .get(open_loop.id())
+                                .await
+                                .ok()
+                                .flatten()
+                                .is_some_and(|current| current.status().is_terminal());
+                            if already_terminal {
+                                resolved_open_loops.push(open_loop.id());
+                            } else {
+                                kovi::log::warn!(
+                                    "Yunxi Mind answered open-loop resolution failed soft: {error}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
         let mut resolved_curiosities = Vec::new();
         for curiosity in self.services.curiosities.list_open(scopes, now, 16).await? {
             if answer_matches_question(curiosity.question(), answer)
@@ -970,7 +1754,11 @@ impl MindRuntime {
         }
 
         let questions = self.services.open_questions.list_open(scopes, 16).await?;
-        let agenda = self.services.agenda.list_active(scopes, now, 32).await?;
+        let agenda = self
+            .services
+            .agenda
+            .list_active(scopes, DateTime::<Utc>::MAX_UTC, 32)
+            .await?;
         let mut updates: HashMap<MindScope, ReflectionProposal> = HashMap::new();
         let mut resolved_questions = Vec::new();
         for question in questions {
@@ -996,6 +1784,7 @@ impl MindRuntime {
         }
         for item in agenda {
             let resolved = match item.subject() {
+                AgendaSubject::OpenLoop(id) => resolved_open_loops.contains(id),
                 AgendaSubject::Curiosity(id) => resolved_curiosities.contains(id),
                 AgendaSubject::OpenQuestion(id) => resolved_questions.contains(id),
                 _ => false,
@@ -1027,6 +1816,9 @@ impl MindRuntime {
                 .agenda_updates
                 .fetch_add(agenda_count, Ordering::Relaxed);
         }
+        if !resolved_open_loops.is_empty() {
+            self.record_agenda_reason(AgendaSource::OpenLoop);
+        }
         Ok(())
     }
 
@@ -1040,12 +1832,14 @@ impl MindRuntime {
         if barrier.blocks_scope(scope) {
             return Ok(None);
         }
-        drop(barrier);
         let observed = self
             .recent_events
             .lock()
             .unwrap_or_else(|lock| lock.into_inner())
             .for_scope(scope);
+        let context = self.load_v1_context(scope, "").await;
+        self.refresh_agenda_for_scopes(&[scope], "", now, TraceContext::root(EventId::new()))
+            .await?;
         let synthetic_scope = match scope {
             MindScope::Global => EventScope::Global,
             MindScope::Person { person_id } => EventScope::Person { person_id },
@@ -1079,23 +1873,59 @@ impl MindRuntime {
         } else {
             trigger
         };
+        let collision_count = observed
+            .iter()
+            .filter(|item| {
+                item.event
+                    .summary
+                    .starts_with("message collision changed pending outgoing")
+            })
+            .count();
+        let deep = observed.iter().any(|item| item.event.salience >= 0.85)
+            || collision_count >= 2
+            || matches!(
+                effective_trigger,
+                ReflectionTrigger::HighSalienceEvent
+                    | ReflectionTrigger::MemoryPressure
+                    | ReflectionTrigger::AgendaPressure
+                    | ReflectionTrigger::DayBoundary
+            );
         let input = ReflectionInput {
             trigger: effective_trigger,
-            depth: if observed.iter().any(|item| item.event.salience >= 0.85) {
+            depth: if deep {
                 ReflectionDepth::Deep
             } else {
                 ReflectionDepth::Light
             },
             scope,
             recent_events: observed.iter().map(|item| item.event.clone()).collect(),
-            salient_memories: Vec::new(),
-            open_loop_summaries: Vec::new(),
-            goal_summaries: Vec::new(),
+            salient_memories: context
+                .memories
+                .iter()
+                .filter(|memory| memory.importance() >= 60)
+                .take(16)
+                .map(|memory| bounded_summary(memory.content()))
+                .collect(),
+            open_loop_summaries: context
+                .open_loops
+                .iter()
+                .filter(|item| !item.status().is_terminal())
+                .take(16)
+                .map(|item| bounded_summary(item.summary()))
+                .collect(),
+            goal_summaries: context
+                .goals
+                .iter()
+                .filter(|goal| goal.state() == GoalState::Active)
+                .take(16)
+                .map(|goal| bounded_summary(goal.title()))
+                .collect(),
             mind,
             requested_at: now,
             trace: observed.last().map_or(event.trace(), |item| item.trace),
         };
         input.validate()?;
+        drop(barrier);
         Ok(input.should_reflect().then_some(input))
     }
 
@@ -1104,32 +1934,55 @@ impl MindRuntime {
         if barrier.blocks_scope(input.scope) {
             return Ok(());
         }
+        let current_version = self.services.consolidation.current_version().await?;
+        if current_version != input.mind.version() {
+            kovi::log::info!(
+                "Yunxi Mind stale reflection discarded: scope={:?} expected_version={} actual_version={}",
+                input.scope,
+                input.mind.version(),
+                current_version,
+            );
+            return Ok(());
+        }
         let mut proposal = ReflectionProposal::empty(&input);
         proposal
             .reason_tags
             .push(MindReasonTag::ReflectionConsolidation);
-        if !input.recent_events.is_empty() {
+        let max_event_salience = input
+            .recent_events
+            .iter()
+            .map(|event| event.salience)
+            .fold(0.0_f32, f32::max);
+        let should_create_episode = !input.recent_events.is_empty()
+            && (input.depth == ReflectionDepth::Deep
+                || max_event_salience >= 0.7
+                || input.recent_events.len() >= 2);
+        if should_create_episode {
+            let summary_event_limit = if input.depth == ReflectionDepth::Deep {
+                6
+            } else {
+                3
+            };
             let source_events = input
                 .recent_events
                 .iter()
                 .map(|event| event.event_id)
-                .take(MAX_EPISODE_SOURCE_EVENTS)
+                .take(if input.depth == ReflectionDepth::Deep {
+                    MAX_EPISODE_SOURCE_EVENTS
+                } else {
+                    MAX_EPISODE_SOURCE_EVENTS / 2
+                })
                 .collect::<Vec<_>>();
             let summary = bounded_summary(
                 &input
                     .recent_events
                     .iter()
                     .rev()
-                    .take(3)
+                    .take(summary_event_limit)
                     .map(|event| event.summary.as_str())
                     .collect::<Vec<_>>()
                     .join(" | "),
             );
-            let salience = input
-                .recent_events
-                .iter()
-                .map(|event| event.salience)
-                .fold(0.0_f32, f32::max);
             let participants = input.scope.person_id().into_iter().collect::<Vec<_>>();
             proposal.episodes.push(Episode::new(
                 EpisodeId::new(),
@@ -1137,9 +1990,12 @@ impl MindRuntime {
                 participants,
                 source_events,
                 summary,
-                salience,
+                max_event_salience,
                 0.0,
-                !input.mind.open_questions().is_empty() || !input.mind.agenda().is_empty(),
+                !input.mind.open_questions().is_empty()
+                    || !input.mind.agenda().is_empty()
+                    || !input.open_loop_summaries.is_empty()
+                    || !input.goal_summaries.is_empty(),
                 MindSource::Reflection,
                 input
                     .recent_events
@@ -1149,7 +2005,12 @@ impl MindRuntime {
             )?);
         }
         if self.config.interest_enabled() {
-            for interest in input.mind.interests().iter().take(MAX_REFLECTION_DECAYS) {
+            let decay_limit = if input.depth == ReflectionDepth::Deep {
+                MAX_REFLECTION_DECAYS
+            } else {
+                MAX_REFLECTION_DECAYS / 2
+            };
+            for interest in input.mind.interests().iter().take(decay_limit) {
                 proposal.interest_updates.push(InterestUpdateProposal {
                     operation: InterestOperation::Decay,
                     interest_id: Some(interest.id),
@@ -1190,11 +2051,14 @@ impl MindRuntime {
             .unwrap_or_else(|lock| lock.into_inner())
             .remove_through(input.scope, input.requested_at);
         kovi::log::info!(
-            "Yunxi Mind reflection: scope={:?} trigger={:?} depth={:?} events={} episodes={} extra_model_calls=0",
+            "Yunxi Mind reflection: scope={:?} trigger={:?} depth={:?} events={} memories={} open_loops={} goals={} episodes={} extra_model_calls=0",
             input.scope,
             input.trigger,
             input.depth,
             input.recent_events.len(),
+            input.salient_memories.len(),
+            input.open_loop_summaries.len(),
+            input.goal_summaries.len(),
             proposal.episodes.len(),
         );
         Ok(())
@@ -1473,6 +2337,7 @@ impl MindRuntime {
         subject: AgendaSubject,
         source: AgendaSource,
         salience: f32,
+        stability: f32,
         now: DateTime<Utc>,
         trace: TraceContext,
     ) -> anyhow::Result<bool> {
@@ -1488,7 +2353,11 @@ impl MindRuntime {
         if self
             .services
             .agenda
-            .list_active(&[scope], now, self.config.max_agenda_for_scope(scope))
+            .list_active(
+                &[scope],
+                DateTime::<Utc>::MAX_UTC,
+                self.config.max_agenda_for_scope(scope),
+            )
             .await?
             .len()
             >= self.config.max_agenda_for_scope(scope)
@@ -1504,7 +2373,7 @@ impl MindRuntime {
             subject,
             salience,
             activation: salience,
-            stability: 0.3,
+            stability,
             source,
             defer_until: None,
         });
@@ -1526,6 +2395,20 @@ impl MindRuntime {
                 scope,
                 &AgendaSubject::OpenQuestion(question_id).dedupe_key(),
             )
+            .await?
+            .is_some_and(|item| item.is_available_at(now)))
+    }
+
+    async fn curiosity_agenda_available(
+        &self,
+        curiosity_id: CuriosityId,
+        scope: MindScope,
+        now: DateTime<Utc>,
+    ) -> anyhow::Result<bool> {
+        Ok(self
+            .services
+            .agenda
+            .find_active_by_key(scope, &AgendaSubject::Curiosity(curiosity_id).dedupe_key())
             .await?
             .is_some_and(|item| item.is_available_at(now)))
     }
@@ -1602,6 +2485,46 @@ impl MindRuntime {
         self.metrics.proactive_uses.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
+
+    async fn mark_decision_used_inner(
+        &self,
+        reference: MindDecisionReference,
+    ) -> anyhow::Result<()> {
+        match reference {
+            MindDecisionReference::Agenda(id) => {
+                self.mark_proactive_used_inner(MindProactiveReference::Agenda(id))
+                    .await
+            }
+            MindDecisionReference::OpenQuestion(id) => {
+                self.mark_proactive_used_inner(MindProactiveReference::OpenQuestion(id))
+                    .await
+            }
+            MindDecisionReference::Interest(id) => {
+                let now = Utc::now();
+                let barrier = self.barrier.read().await;
+                let subject = AgendaSubject::Interest(id);
+                if let Some(item) = self
+                    .services
+                    .agenda
+                    .find_active_by_key(MindScope::Global, &subject.dedupe_key())
+                    .await?
+                    && !barrier.blocks_scope(item.scope())
+                {
+                    let updated = item.with_cooldown(
+                        Some(
+                            now + Duration::minutes(self.config.question_cooldown_minutes() as i64),
+                        ),
+                        now,
+                    )?;
+                    self.services
+                        .agenda
+                        .put(&updated, Some(item.version()))
+                        .await?;
+                }
+                Ok(())
+            }
+        }
+    }
 }
 
 impl MindSnapshotProvider for MindRuntime {
@@ -1619,7 +2542,22 @@ impl MindSnapshotProvider for MindRuntime {
                     .fetch_add(1, Ordering::Relaxed);
                 return Ok(MindSnapshot::empty());
             }
-            self.snapshot_provider.snapshot(request).await
+            let started = Instant::now();
+            let result = self.snapshot_provider.snapshot(request).await;
+            let elapsed = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+            self.metrics
+                .snapshot_requests
+                .fetch_add(1, Ordering::Relaxed);
+            self.metrics
+                .snapshot_latency_total_micros
+                .fetch_add(elapsed, Ordering::Relaxed);
+            self.metrics
+                .snapshot_latency_max_micros
+                .fetch_max(elapsed, Ordering::Relaxed);
+            self.metrics
+                .snapshot_latency_last_micros
+                .store(elapsed, Ordering::Relaxed);
+            result
         })
     }
 }
@@ -1658,6 +2596,51 @@ fn proposal_is_empty(proposal: &ReflectionProposal) -> bool {
         && proposal.interest_updates.is_empty()
         && proposal.open_question_updates.is_empty()
         && proposal.agenda_updates.is_empty()
+}
+
+fn mind_snapshot_signature(snapshot: &MindSnapshot) -> [u8; 32] {
+    let mut entries = Vec::new();
+    if let Some(model) = snapshot.self_model() {
+        entries.push(format!("self:{}", model.version()));
+    }
+    entries.extend(
+        snapshot
+            .beliefs()
+            .iter()
+            .map(|item| format!("belief:{}:{}", item.id, item.version)),
+    );
+    entries.extend(
+        snapshot
+            .preferences()
+            .iter()
+            .map(|item| format!("preference:{}:{}", item.id, item.version)),
+    );
+    entries.extend(
+        snapshot
+            .interests()
+            .iter()
+            .map(|item| format!("interest:{}:{}", item.id, item.version)),
+    );
+    entries.extend(
+        snapshot
+            .open_questions()
+            .iter()
+            .map(|item| format!("question:{}:{}", item.id, item.version)),
+    );
+    entries.extend(
+        snapshot
+            .agenda()
+            .iter()
+            .map(|item| format!("agenda:{}:{}", item.id, item.version)),
+    );
+    entries.sort_unstable();
+    let mut hasher = Sha256::new();
+    hasher.update(format!("mode:{:?}", snapshot.influence_mode()));
+    for entry in entries {
+        hasher.update([0]);
+        hasher.update(entry.as_bytes());
+    }
+    hasher.finalize().into()
 }
 
 fn message_salience(message: &yunxi_core::MessageReceivedEvent) -> f32 {
@@ -1832,18 +2815,262 @@ fn is_informative_chinese_term(term: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
     use yunxi_core::{
-        AgendaItem, AgendaStore, BeliefStore, ConversationId, ConversationKind, InMemoryMindStore,
-        InterestStore, MessageContent, MessageId, MessageReceivedEvent, MindSnapshotLimits,
-        OpenQuestionStore, PreferenceStore,
+        AgendaItem, AgendaStore, BeliefStore, ConversationId, ConversationKind, CuriosityStore,
+        EpisodeStore, GoalStoreFuture, InMemoryMindStore, InterestStore, MemoryDraft, MemoryId,
+        MemoryStoreError, MemoryStoreFuture, MessageCollisionDetectedEvent, MessageContent,
+        MessageId, MessageReceivedEvent, MindDataErasure, MindSnapshotLimits, OpenLoopDraft,
+        OpenLoopStatus, OpenLoopStoreError, OpenLoopStoreFuture, OpenQuestionStore,
+        PlannerStateSnapshot, PreferenceStore,
     };
+
+    struct EmptyMemoryStore;
+
+    impl MemoryStore for EmptyMemoryStore {
+        fn remember<'a>(&'a self, draft: &'a MemoryDraft) -> MemoryStoreFuture<'a, Memory> {
+            Box::pin(async move {
+                Memory::from_draft(MemoryId::new(), draft, Utc::now()).map_err(|error| {
+                    MemoryStoreError::InvalidRequest {
+                        reason: error.to_string(),
+                    }
+                })
+            })
+        }
+
+        fn recall<'a>(&'a self, _query: &'a MemoryQuery) -> MemoryStoreFuture<'a, Vec<Memory>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn forget(&self, _scope: MemoryScope, _id: MemoryId) -> MemoryStoreFuture<'_, bool> {
+            Box::pin(async { Ok(false) })
+        }
+    }
+
+    struct BlockingRecallStore {
+        entered: Mutex<Option<kovi::tokio::sync::oneshot::Sender<()>>>,
+        release: Arc<kovi::tokio::sync::Semaphore>,
+    }
+
+    impl MemoryStore for BlockingRecallStore {
+        fn remember<'a>(&'a self, draft: &'a MemoryDraft) -> MemoryStoreFuture<'a, Memory> {
+            Box::pin(async move {
+                Memory::from_draft(MemoryId::new(), draft, Utc::now()).map_err(|error| {
+                    MemoryStoreError::InvalidRequest {
+                        reason: error.to_string(),
+                    }
+                })
+            })
+        }
+
+        fn recall<'a>(&'a self, _query: &'a MemoryQuery) -> MemoryStoreFuture<'a, Vec<Memory>> {
+            let entered = self
+                .entered
+                .lock()
+                .unwrap_or_else(|lock| lock.into_inner())
+                .take();
+            let release = Arc::clone(&self.release);
+            Box::pin(async move {
+                if let Some(entered) = entered {
+                    let _ = entered.send(());
+                    release
+                        .acquire()
+                        .await
+                        .expect("test recall semaphore remains open")
+                        .forget();
+                }
+                Ok(Vec::new())
+            })
+        }
+
+        fn forget(&self, _scope: MemoryScope, _id: MemoryId) -> MemoryStoreFuture<'_, bool> {
+            Box::pin(async { Ok(false) })
+        }
+    }
+
+    struct EmptyGoalStore;
+
+    impl GoalStore for EmptyGoalStore {
+        fn get(&self, _id: yunxi_core::GoalId) -> GoalStoreFuture<'_, Option<Goal>> {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn list<'a>(
+            &'a self,
+            _owner: &'a GoalOwner,
+            _limit: usize,
+        ) -> GoalStoreFuture<'a, Vec<Goal>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    #[derive(Default)]
+    struct StatefulOpenLoopStore {
+        items: Mutex<HashMap<yunxi_core::OpenLoopId, OpenLoop>>,
+    }
+
+    impl StatefulOpenLoopStore {
+        fn with_item(item: OpenLoop) -> Self {
+            Self {
+                items: Mutex::new(HashMap::from([(item.id(), item)])),
+            }
+        }
+
+        fn transition(
+            &self,
+            id: yunxi_core::OpenLoopId,
+            status: OpenLoopStatus,
+            now: DateTime<Utc>,
+        ) -> Result<OpenLoop, OpenLoopStoreError> {
+            let mut items = self.items.lock().unwrap_or_else(|lock| lock.into_inner());
+            let current = items
+                .get(&id)
+                .cloned()
+                .ok_or(OpenLoopStoreError::NotFound { id })?;
+            let updated = current.transition(status, now).map_err(|error| {
+                OpenLoopStoreError::InvalidRequest {
+                    reason: error.to_string(),
+                }
+            })?;
+            items.insert(id, updated.clone());
+            Ok(updated)
+        }
+    }
+
+    impl OpenLoopStore for StatefulOpenLoopStore {
+        fn create<'a>(&'a self, draft: &'a OpenLoopDraft) -> OpenLoopStoreFuture<'a, OpenLoop> {
+            Box::pin(async move {
+                let item = OpenLoop::from_draft(yunxi_core::OpenLoopId::new(), draft, Utc::now())
+                    .map_err(|error| OpenLoopStoreError::InvalidRequest {
+                    reason: error.to_string(),
+                })?;
+                self.items
+                    .lock()
+                    .unwrap_or_else(|lock| lock.into_inner())
+                    .insert(item.id(), item.clone());
+                Ok(item)
+            })
+        }
+
+        fn get<'a>(
+            &'a self,
+            id: yunxi_core::OpenLoopId,
+        ) -> OpenLoopStoreFuture<'a, Option<OpenLoop>> {
+            Box::pin(async move {
+                Ok(self
+                    .items
+                    .lock()
+                    .unwrap_or_else(|lock| lock.into_inner())
+                    .get(&id)
+                    .cloned())
+            })
+        }
+
+        fn list<'a>(
+            &'a self,
+            owner: &'a OpenLoopOwner,
+            limit: usize,
+        ) -> OpenLoopStoreFuture<'a, Vec<OpenLoop>> {
+            Box::pin(async move {
+                Ok(self
+                    .items
+                    .lock()
+                    .unwrap_or_else(|lock| lock.into_inner())
+                    .values()
+                    .filter(|item| item.owner() == *owner)
+                    .take(limit)
+                    .cloned()
+                    .collect())
+            })
+        }
+
+        fn claim_due(
+            &self,
+            _now: DateTime<Utc>,
+            _limit: usize,
+        ) -> OpenLoopStoreFuture<'_, Vec<OpenLoop>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn defer(
+            &self,
+            id: yunxi_core::OpenLoopId,
+            _due_at: Option<DateTime<Utc>>,
+            _now: DateTime<Utc>,
+        ) -> OpenLoopStoreFuture<'_, OpenLoop> {
+            Box::pin(async move {
+                self.items
+                    .lock()
+                    .unwrap_or_else(|lock| lock.into_inner())
+                    .get(&id)
+                    .cloned()
+                    .ok_or(OpenLoopStoreError::NotFound { id })
+            })
+        }
+
+        fn resolve(
+            &self,
+            id: yunxi_core::OpenLoopId,
+            now: DateTime<Utc>,
+        ) -> OpenLoopStoreFuture<'_, OpenLoop> {
+            Box::pin(async move { self.transition(id, OpenLoopStatus::Resolved, now) })
+        }
+
+        fn cancel(
+            &self,
+            id: yunxi_core::OpenLoopId,
+            now: DateTime<Utc>,
+        ) -> OpenLoopStoreFuture<'_, OpenLoop> {
+            Box::pin(async move { self.transition(id, OpenLoopStatus::Cancelled, now) })
+        }
+
+        fn recover_stale_triggered(
+            &self,
+            _now: DateTime<Utc>,
+            _limit: usize,
+        ) -> OpenLoopStoreFuture<'_, usize> {
+            Box::pin(async { Ok(0) })
+        }
+    }
 
     fn test_runtime() -> (Arc<MindRuntime>, Arc<InMemoryMindStore>) {
         let store = Arc::new(InMemoryMindStore::new());
         let services = MindServices::from_store(Arc::clone(&store));
         let runtime = Arc::new(
             MindRuntime::new(services, MindConfig::default()).expect("valid test Mind runtime"),
+        );
+        (runtime, store)
+    }
+
+    fn active_config() -> MindConfig {
+        serde_json::from_value(serde_json::json!({"influence_mode": "active"}))
+            .expect("active Mind config")
+    }
+
+    fn active_test_runtime() -> (Arc<MindRuntime>, Arc<InMemoryMindStore>) {
+        let store = Arc::new(InMemoryMindStore::new());
+        let services = MindServices::from_store(Arc::clone(&store));
+        let runtime = Arc::new(
+            MindRuntime::new(services, active_config()).expect("valid active Mind runtime"),
+        );
+        (runtime, store)
+    }
+
+    fn active_runtime_with_open_loops(
+        open_loops: Arc<StatefulOpenLoopStore>,
+    ) -> (Arc<MindRuntime>, Arc<InMemoryMindStore>) {
+        let store = Arc::new(InMemoryMindStore::new());
+        let services = MindServices::from_store(Arc::clone(&store));
+        let context = MindContextServices::new(
+            Arc::new(EmptyMemoryStore),
+            open_loops,
+            Arc::new(EmptyGoalStore),
+        );
+        let runtime = Arc::new(
+            MindRuntime::new(services, active_config())
+                .expect("valid active Mind runtime")
+                .with_context_services(context),
         );
         (runtime, store)
     }
@@ -1870,6 +3097,39 @@ mod tests {
                 visible_reply_allowed: true,
             },
         )
+    }
+
+    fn casual_direct_message(
+        person_id: yunxi_core::PersonId,
+        conversation_id: ConversationId,
+        content: &str,
+    ) -> WorldEvent {
+        let WorldEventKind::MessageReceived(mut message) =
+            direct_message(person_id, conversation_id, content)
+                .kind()
+                .clone()
+        else {
+            unreachable!()
+        };
+        message.addressed_to_agent = false;
+        message.explicit_request = false;
+        WorldEvent::message_received(EventPriority::Normal, message)
+    }
+
+    async fn active_planner_input(runtime: &MindRuntime, event: WorldEvent) -> PlannerInput {
+        let request = MindSnapshotRequest::for_event(
+            &event,
+            None,
+            runtime.config().snapshot_limits(),
+            MindInfluenceMode::Active,
+        )
+        .expect("active snapshot request");
+        let snapshot = MindSnapshotProvider::snapshot(runtime, &request)
+            .await
+            .expect("active snapshot");
+        assert!(!snapshot.is_empty());
+        assert_eq!(snapshot.influence_mode(), MindInfluenceMode::Active);
+        PlannerInput::new(event, PlannerStateSnapshot::empty()).with_mind(snapshot)
     }
 
     fn candidate_context(event: &WorldEvent) -> MindCandidateContext {
@@ -1912,6 +3172,76 @@ mod tests {
     }
 
     #[test]
+    fn negative_belief_candidate_records_contradicting_evidence() {
+        let executor = kovi::tokio::runtime::Runtime::new().expect("test runtime");
+        executor.block_on(async {
+            let (runtime, store) = test_runtime();
+            let person_id = yunxi_core::PersonId::new();
+            let conversation_id = ConversationId::new();
+            let proposition = "静态类型总能提高开发效率";
+            let supporting_event = direct_message(person_id, conversation_id, "最初我赞同这个观点");
+            runtime
+                .persist_candidates(PendingCandidates {
+                    idempotency_key: "supporting-belief".to_string(),
+                    context: candidate_context(&supporting_event),
+                    candidates: MindCandidates {
+                        belief: Some(MindBeliefCandidate {
+                            proposition: proposition.to_string(),
+                            confidence_delta: 0.2,
+                        }),
+                        ..MindCandidates::default()
+                    },
+                    erasure_epoch: 0,
+                    registered_at: Utc::now(),
+                })
+                .await
+                .expect("persist supporting belief");
+            let before = BeliefStore::relevant(
+                store.as_ref(),
+                &[MindScope::Global],
+                proposition,
+                Utc::now(),
+                1,
+            )
+            .await
+            .expect("belief query")
+            .into_iter()
+            .next()
+            .expect("stored belief");
+
+            let contradicting_event =
+                direct_message(person_id, conversation_id, "后来我发现这个观点并不总成立");
+            runtime
+                .persist_candidates(PendingCandidates {
+                    idempotency_key: "contradicting-belief".to_string(),
+                    context: candidate_context(&contradicting_event),
+                    candidates: MindCandidates {
+                        belief: Some(MindBeliefCandidate {
+                            proposition: proposition.to_string(),
+                            confidence_delta: -0.2,
+                        }),
+                        ..MindCandidates::default()
+                    },
+                    erasure_epoch: 0,
+                    registered_at: Utc::now(),
+                })
+                .await
+                .expect("persist contradicting belief");
+
+            let updated = BeliefStore::get(store.as_ref(), before.id())
+                .await
+                .expect("belief lookup")
+                .expect("updated belief");
+            assert!(updated.confidence() < before.confidence());
+            assert_eq!(updated.contradiction_count(), 1);
+            assert!(updated.evidence_refs().iter().any(|evidence| {
+                evidence.kind() == EvidenceKind::Event(contradicting_event.id())
+                    && evidence.polarity() == EvidencePolarity::Contradicts
+            }));
+        });
+    }
+
+    #[test]
     fn erasure_purges_pending_candidates_before_they_can_commit() {
         let executor = kovi::tokio::runtime::Runtime::new().expect("test runtime");
         executor.block_on(async {
@@ -1951,6 +3281,135 @@ mod tests {
                     .is_empty()
             );
             guard.finish().await;
+        });
+    }
+
+    #[test]
+    fn completed_erasure_invalidates_candidate_already_removed_from_pending_queue() {
+        let executor = kovi::tokio::runtime::Runtime::new().expect("test runtime");
+        executor.block_on(async {
+            let (runtime, store) = test_runtime();
+            let person_id = yunxi_core::PersonId::new();
+            let conversation_id = ConversationId::new();
+            let event = direct_message(person_id, conversation_id, "以后继续聊 Rust");
+            let pending = PendingCandidates {
+                idempotency_key: "already-claimed-before-erasure".to_string(),
+                context: candidate_context(&event),
+                candidates: MindCandidates {
+                    agenda: Some("以后继续聊 Rust".to_string()),
+                    ..MindCandidates::default()
+                },
+                erasure_epoch: 0,
+                registered_at: Utc::now(),
+            };
+
+            let guard = runtime
+                .begin_erasure(Some(person_id), &[conversation_id])
+                .await;
+            MindDataErasure::erase_person(store.as_ref(), person_id)
+                .await
+                .expect("person erasure");
+            MindDataErasure::erase_conversation(store.as_ref(), conversation_id)
+                .await
+                .expect("conversation erasure");
+            guard.finish().await;
+
+            runtime
+                .persist_candidates(pending)
+                .await
+                .expect("stale candidate should fail closed");
+            assert!(
+                AgendaStore::list_active(
+                    store.as_ref(),
+                    &[MindScope::Person { person_id }],
+                    Utc::now(),
+                    8,
+                )
+                .await
+                .expect("agenda query")
+                .is_empty()
+            );
+        });
+    }
+
+    #[test]
+    fn unfinished_mind_erasure_guard_keeps_scope_fail_closed() {
+        let executor = kovi::tokio::runtime::Runtime::new().expect("test runtime");
+        executor.block_on(async {
+            let (runtime, _) = test_runtime();
+            let person_id = yunxi_core::PersonId::new();
+            let conversation_id = ConversationId::new();
+            let event = direct_message(person_id, conversation_id, "屏障仍应关闭");
+            let request = MindSnapshotRequest::for_event(
+                &event,
+                None,
+                MindSnapshotLimits::default(),
+                MindInfluenceMode::Shadow,
+            )
+            .expect("snapshot request");
+
+            let guard = runtime
+                .begin_erasure(Some(person_id), &[conversation_id])
+                .await;
+            drop(guard);
+
+            let snapshot = MindSnapshotProvider::snapshot(runtime.as_ref(), &request)
+                .await
+                .expect("blocked snapshot fails soft");
+            assert!(snapshot.is_empty());
+            assert!(!runtime.register_candidates(
+                "blocked-after-failed-erasure".to_string(),
+                candidate_context(&event),
+                MindCandidates {
+                    agenda: Some("不应写入".to_string()),
+                    ..MindCandidates::default()
+                },
+            ));
+        });
+    }
+
+    #[test]
+    fn reflection_snapshot_from_before_erasure_cannot_write_an_episode() {
+        let executor = kovi::tokio::runtime::Runtime::new().expect("test runtime");
+        executor.block_on(async {
+            let (runtime, store) = test_runtime();
+            let person_id = yunxi_core::PersonId::new();
+            let conversation_id = ConversationId::new();
+            let scope = MindScope::Person { person_id };
+            let event = direct_message(person_id, conversation_id, "请认真记住这次很重要的变化");
+            runtime.observe_event(&event).await.expect("observe event");
+            let input = runtime
+                .reflection_input(scope, ReflectionTrigger::HighSalienceEvent, Utc::now())
+                .await
+                .expect("reflection input")
+                .expect("high-salience reflection");
+
+            let guard = runtime
+                .begin_erasure(Some(person_id), &[conversation_id])
+                .await;
+            MindDataErasure::erase_person(store.as_ref(), person_id)
+                .await
+                .expect("person erasure");
+            MindDataErasure::erase_conversation(store.as_ref(), conversation_id)
+                .await
+                .expect("conversation erasure");
+            guard.finish().await;
+
+            runtime
+                .process_reflection(input)
+                .await
+                .expect("stale reflection should be discarded");
+            assert!(
+                EpisodeStore::list_recent(
+                    store.as_ref(),
+                    &[scope],
+                    Utc::now() - Duration::days(1),
+                    8,
+                )
+                .await
+                .expect("episode query")
+                .is_empty()
+            );
         });
     }
 
@@ -2047,6 +3506,270 @@ mod tests {
             assert!(blocked.is_empty());
             assert_eq!(runtime.metrics().blocked_snapshots, 1);
             guard.finish().await;
+        });
+    }
+
+    #[test]
+    fn person_erasure_waits_for_pending_snapshot_retrieval() {
+        let executor = kovi::tokio::runtime::Runtime::new().expect("test runtime");
+        executor.block_on(async {
+            let store = Arc::new(InMemoryMindStore::new());
+            let services = MindServices::from_store(Arc::clone(&store));
+            let person_id = yunxi_core::PersonId::new();
+            let conversation_id = ConversationId::new();
+            let scope = MindScope::Person { person_id };
+            let event = direct_message(person_id, conversation_id, "请认真记住这次很重要的变化");
+            let runtime =
+                MindRuntime::new(services, MindConfig::default()).expect("valid test Mind runtime");
+            runtime.observe_event(&event).await.expect("observe event");
+
+            let (recall_entered, recall_pending) = kovi::tokio::sync::oneshot::channel();
+            let recall_release = Arc::new(kovi::tokio::sync::Semaphore::new(0));
+            let context = MindContextServices::new(
+                Arc::new(BlockingRecallStore {
+                    entered: Mutex::new(Some(recall_entered)),
+                    release: Arc::clone(&recall_release),
+                }),
+                Arc::new(StatefulOpenLoopStore::default()),
+                Arc::new(EmptyGoalStore),
+            );
+            let runtime = Arc::new(runtime.with_context_services(context));
+            let snapshot_runtime = Arc::clone(&runtime);
+            let pending_snapshot = kovi::tokio::spawn(async move {
+                snapshot_runtime
+                    .reflection_input(scope, ReflectionTrigger::HighSalienceEvent, Utc::now())
+                    .await
+            });
+            recall_pending.await.expect("snapshot retrieval started");
+
+            let (erase_started, erase_pending) = kovi::tokio::sync::oneshot::channel();
+            let erasure_runtime = Arc::clone(&runtime);
+            let pending_erasure = kovi::tokio::spawn(async move {
+                let _ = erase_started.send(());
+                erasure_runtime
+                    .begin_erasure(Some(person_id), &[conversation_id])
+                    .await
+            });
+            erase_pending.await.expect("erasure task started");
+            kovi::tokio::task::yield_now().await;
+            assert!(
+                !pending_erasure.is_finished(),
+                "erasure must wait while snapshot retrieval holds the read barrier"
+            );
+
+            recall_release.add_permits(1);
+            let input = pending_snapshot
+                .await
+                .expect("snapshot task")
+                .expect("reflection input retrieval")
+                .expect("high-salience reflection input");
+            let guard = pending_erasure
+                .await
+                .expect("erasure acquires barrier after retrieval");
+            MindDataErasure::erase_person(store.as_ref(), person_id)
+                .await
+                .expect("person erasure");
+            MindDataErasure::erase_conversation(store.as_ref(), conversation_id)
+                .await
+                .expect("conversation erasure");
+            guard.finish().await;
+
+            runtime
+                .process_reflection(input)
+                .await
+                .expect("pre-erasure reflection is discarded");
+            assert!(
+                EpisodeStore::list_recent(
+                    store.as_ref(),
+                    &[scope],
+                    Utc::now() - Duration::days(1),
+                    8,
+                )
+                .await
+                .expect("episode query")
+                .is_empty()
+            );
+        });
+    }
+
+    #[test]
+    fn outgoing_mind_permit_pins_erasure_through_delivery_window() {
+        let executor = kovi::tokio::runtime::Runtime::new().expect("test runtime");
+        executor.block_on(async {
+            let (runtime, store) = active_test_runtime();
+            let now = Utc::now();
+            InterestStore::put(
+                store.as_ref(),
+                &Interest::new(
+                    yunxi_core::InterestId::new(),
+                    "Rust",
+                    0.8,
+                    0.7,
+                    0.6,
+                    MindSource::Seed,
+                    now,
+                )
+                .expect("valid interest"),
+                None,
+            )
+            .await
+            .expect("seed interest");
+            let person_id = yunxi_core::PersonId::new();
+            let conversation_id = ConversationId::new();
+            let input = active_planner_input(
+                runtime.as_ref(),
+                direct_message(person_id, conversation_id, "聊聊 Rust"),
+            )
+            .await;
+            let projection =
+                MindDecisionProjection::for_input(&input, yunxi_core::DecisionDisposition::Reply);
+            let key = "pinned-mind-delivery";
+            assert!(runtime.register_outgoing_fence(key.to_string(), &input, projection));
+            let permit = runtime
+                .pin_revalidated_outgoing_fence(key)
+                .await
+                .expect("current Mind snapshot should receive a delivery permit");
+
+            let erasure_runtime = Arc::clone(&runtime);
+            let pending_erasure = kovi::tokio::spawn(async move {
+                erasure_runtime
+                    .begin_erasure(Some(person_id), &[conversation_id])
+                    .await
+            });
+            kovi::tokio::task::yield_now().await;
+            assert!(
+                !pending_erasure.is_finished(),
+                "erasure must wait until the outgoing delivery permit is released"
+            );
+
+            drop(permit);
+            pending_erasure.await.expect("erasure task").finish().await;
+        });
+    }
+
+    #[test]
+    fn proactive_mind_permit_pins_erasure_through_delivery_window() {
+        let executor = kovi::tokio::runtime::Runtime::new().expect("test runtime");
+        executor.block_on(async {
+            let (runtime, store) = active_test_runtime();
+            let person_id = yunxi_core::PersonId::new();
+            let conversation_id = ConversationId::new();
+            let scope = MindScope::Person { person_id };
+            let now = Utc::now() - Duration::hours(3);
+            let curiosity = CuriosityItem::new(
+                CuriosityId::new(),
+                "你为什么换工作？",
+                Some(person_id),
+                None,
+                0.9,
+                now,
+                Some(now + Duration::days(30)),
+            )
+            .expect("valid curiosity");
+            let agenda = AgendaItem::new(
+                AgendaItemId::new(),
+                scope,
+                AgendaSubject::Curiosity(curiosity.id()),
+                0.9,
+                0.9,
+                0.5,
+                AgendaSource::Curiosity,
+                now,
+            )
+            .expect("valid curiosity agenda");
+            CuriosityStore::put(store.as_ref(), &curiosity, None)
+                .await
+                .expect("seed curiosity");
+            AgendaStore::put(store.as_ref(), &agenda, None)
+                .await
+                .expect("seed curiosity agenda");
+            let permit = runtime
+                .pin_proactive_reference(MindProactiveReference::Curiosity(curiosity.id()))
+                .await
+                .expect("current proactive reference should receive a delivery permit");
+
+            let erasure_runtime = Arc::clone(&runtime);
+            let pending_erasure = kovi::tokio::spawn(async move {
+                erasure_runtime
+                    .begin_erasure(Some(person_id), &[conversation_id])
+                    .await
+            });
+            kovi::tokio::task::yield_now().await;
+            assert!(
+                !pending_erasure.is_finished(),
+                "erasure must wait until the proactive delivery permit is released"
+            );
+
+            drop(permit);
+            pending_erasure.await.expect("erasure task").finish().await;
+        });
+    }
+
+    #[test]
+    fn shadow_decision_metrics_capture_token_and_snapshot_latency_delta() {
+        let executor = kovi::tokio::runtime::Runtime::new().expect("test runtime");
+        executor.block_on(async {
+            let (runtime, store) = test_runtime();
+            let now = Utc::now();
+            let interest = Interest::new(
+                yunxi_core::InterestId::new(),
+                "Rust 类型系统",
+                0.9,
+                0.8,
+                0.7,
+                MindSource::Experience,
+                now,
+            )
+            .expect("active interest");
+            InterestStore::put(store.as_ref(), &interest, None)
+                .await
+                .expect("seed interest");
+            AgendaStore::put(
+                store.as_ref(),
+                &AgendaItem::new(
+                    AgendaItemId::new(),
+                    MindScope::Global,
+                    AgendaSubject::Interest(interest.id()),
+                    0.9,
+                    0.9,
+                    0.5,
+                    AgendaSource::Interest,
+                    now,
+                )
+                .expect("interest agenda"),
+                None,
+            )
+            .await
+            .expect("seed interest agenda");
+            let event = casual_direct_message(
+                yunxi_core::PersonId::new(),
+                ConversationId::new(),
+                "这个话题已经聊完了。",
+            );
+            let request = MindSnapshotRequest::for_event(
+                &event,
+                None,
+                runtime.config().snapshot_limits(),
+                MindInfluenceMode::Shadow,
+            )
+            .expect("shadow snapshot request");
+            let snapshot = MindSnapshotProvider::snapshot(runtime.as_ref(), &request)
+                .await
+                .expect("shadow snapshot");
+            let input = PlannerInput::new(event, PlannerStateSnapshot::empty()).with_mind(snapshot);
+            let projection =
+                MindDecisionProjection::for_input(&input, yunxi_core::DecisionDisposition::Reply);
+            assert!(projection.changes_baseline());
+
+            runtime.observe_decision(projection, 37);
+            let metrics = runtime.metrics();
+            assert_eq!(metrics.snapshot_requests, 1);
+            assert!(metrics.snapshot_latency_total_micros >= metrics.snapshot_latency_last_micros);
+            assert!(metrics.snapshot_latency_max_micros >= metrics.snapshot_latency_last_micros);
+            assert_eq!(metrics.decision_observations, 1);
+            assert_eq!(metrics.shadow_decision_deltas, 1);
+            assert_eq!(metrics.active_decision_deltas, 0);
+            assert_eq!(metrics.estimated_extra_prompt_tokens, 37);
         });
     }
 
@@ -2156,6 +3879,132 @@ mod tests {
     }
 
     #[test]
+    fn cooldown_agenda_items_still_count_toward_scope_capacity() {
+        let executor = kovi::tokio::runtime::Runtime::new().expect("test runtime");
+        executor.block_on(async {
+            let store = Arc::new(InMemoryMindStore::new());
+            let services = MindServices::from_store(Arc::clone(&store));
+            let config: MindConfig =
+                serde_json::from_value(serde_json::json!({"max_agenda_per_person": 1}))
+                    .expect("bounded agenda config");
+            let runtime = MindRuntime::new(services, config).expect("valid Mind runtime");
+            let now = Utc::now();
+            let scope = MindScope::Person {
+                person_id: yunxi_core::PersonId::new(),
+            };
+            let item = AgendaItem::new(
+                AgendaItemId::new(),
+                scope,
+                AgendaSubject::OpenQuestion(OpenQuestionId::new()),
+                0.8,
+                0.8,
+                0.5,
+                AgendaSource::OpenQuestion,
+                now,
+            )
+            .expect("valid agenda");
+            AgendaStore::put(store.as_ref(), &item, None)
+                .await
+                .expect("seed agenda");
+            let cooled = item
+                .with_cooldown(Some(now + Duration::hours(2)), now)
+                .expect("valid cooldown");
+            AgendaStore::put(store.as_ref(), &cooled, Some(item.version()))
+                .await
+                .expect("persist cooldown");
+
+            assert!(
+                !runtime
+                    .ensure_agenda(
+                        scope,
+                        AgendaSubject::Curiosity(CuriosityId::new()),
+                        AgendaSource::Curiosity,
+                        0.7,
+                        0.4,
+                        now,
+                        TraceContext::root(EventId::new()),
+                    )
+                    .await
+                    .expect("capacity check")
+            );
+            assert_eq!(
+                AgendaStore::list_active(store.as_ref(), &[scope], DateTime::<Utc>::MAX_UTC, 8)
+                    .await
+                    .expect("all active agenda query")
+                    .len(),
+                1
+            );
+        });
+    }
+
+    #[test]
+    fn curiosity_proactive_requires_an_available_agenda_item() {
+        let executor = kovi::tokio::runtime::Runtime::new().expect("test runtime");
+        executor.block_on(async {
+            let (runtime, store) = active_test_runtime();
+            let now = Utc::now();
+            let person_id = yunxi_core::PersonId::new();
+            let scope = MindScope::Person { person_id };
+            let curiosity = CuriosityItem::new(
+                CuriosityId::new(),
+                "你换工作主要是出于什么考虑？",
+                Some(person_id),
+                None,
+                0.8,
+                now - Duration::hours(3),
+                Some(now + Duration::days(1)),
+            )
+            .expect("valid curiosity");
+            CuriosityStore::put(store.as_ref(), &curiosity, None)
+                .await
+                .expect("seed curiosity");
+
+            assert_eq!(
+                runtime
+                    .proactive_signals(person_id)
+                    .await
+                    .expect("signals without agenda"),
+                MindProactiveSignals::default()
+            );
+            assert!(
+                !runtime
+                    .proactive_reference_current(MindProactiveReference::Curiosity(curiosity.id()))
+                    .await
+            );
+
+            let agenda = AgendaItem::new(
+                AgendaItemId::new(),
+                scope,
+                AgendaSubject::Curiosity(curiosity.id()),
+                0.8,
+                0.8,
+                0.5,
+                AgendaSource::Curiosity,
+                now,
+            )
+            .expect("valid curiosity agenda");
+            AgendaStore::put(store.as_ref(), &agenda, None)
+                .await
+                .expect("seed curiosity agenda");
+
+            let signals = runtime
+                .proactive_signals(person_id)
+                .await
+                .expect("signals with agenda");
+            assert_eq!(signals.topic.as_deref(), Some(curiosity.question()));
+            assert_eq!(
+                signals.reference,
+                Some(MindProactiveReference::Curiosity(curiosity.id()))
+            );
+            assert!(
+                runtime
+                    .proactive_reference_current(MindProactiveReference::Curiosity(curiosity.id()))
+                    .await
+            );
+        });
+    }
+
+    #[test]
     fn incoming_answer_resolves_question_and_agenda_before_next_plan() {
         let executor = kovi::tokio::runtime::Runtime::new().expect("test runtime");
         executor.block_on(async {
@@ -2171,24 +4020,34 @@ mod tests {
                         open_question: Some("你今天面试结果怎么样？".to_string()),
                         ..MindCandidates::default()
                     },
+                    erasure_epoch: 0,
                     registered_at: Utc::now(),
                 })
                 .await
                 .expect("persist question candidate");
             let scope = MindScope::Person { person_id };
-            assert_eq!(
-                OpenQuestionStore::list_open(store.as_ref(), &[scope], 8)
-                    .await
-                    .expect("open-question query")
-                    .len(),
-                1
-            );
+            let question = OpenQuestionStore::list_open(store.as_ref(), &[scope], 8)
+                .await
+                .expect("open-question query")
+                .into_iter()
+                .next()
+                .expect("stored open question");
             assert_eq!(
                 AgendaStore::list_active(store.as_ref(), &[scope], Utc::now(), 8)
                     .await
                     .expect("agenda query")
                     .len(),
                 1
+            );
+            runtime
+                .mark_decision_used_inner(MindDecisionReference::OpenQuestion(question.id()))
+                .await
+                .expect("mark question as used");
+            assert!(
+                AgendaStore::list_active(store.as_ref(), &[scope], Utc::now(), 8)
+                    .await
+                    .expect("cooled agenda query")
+                    .is_empty()
             );
 
             let answer = direct_message(person_id, conversation_id, "我面试过了，结果还不错");
@@ -2204,10 +4063,499 @@ mod tests {
                     .is_empty()
             );
             assert!(
+                AgendaStore::list_active(store.as_ref(), &[scope], DateTime::<Utc>::MAX_UTC, 8,)
+                    .await
+                    .expect("resolved cooled agenda query")
+                    .is_empty()
+            );
+        });
+    }
+
+    #[test]
+    fn curiosity_resolved_before_pending_question_commit() {
+        let executor = kovi::tokio::runtime::Runtime::new().expect("test runtime");
+        executor.block_on(async {
+            let (runtime, store) = active_test_runtime();
+            let person_id = yunxi_core::PersonId::new();
+            let conversation_id = ConversationId::new();
+            let scope = MindScope::Person { person_id };
+            let created_at = Utc::now() - Duration::hours(3);
+            let curiosity = CuriosityItem::new(
+                CuriosityId::new(),
+                "你为什么换工作？",
+                Some(person_id),
+                None,
+                0.8,
+                created_at,
+                Some(created_at + Duration::days(30)),
+            )
+            .expect("curiosity");
+            let agenda = AgendaItem::new(
+                AgendaItemId::new(),
+                scope,
+                AgendaSubject::Curiosity(curiosity.id()),
+                0.8,
+                0.8,
+                0.5,
+                AgendaSource::Curiosity,
+                created_at,
+            )
+            .expect("curiosity agenda");
+            CuriosityStore::put(store.as_ref(), &curiosity, None)
+                .await
+                .expect("seed curiosity");
+            AgendaStore::put(store.as_ref(), &agenda, None)
+                .await
+                .expect("seed agenda");
+
+            let input = active_planner_input(
+                runtime.as_ref(),
+                casual_direct_message(person_id, conversation_id, "刚才的话题说完了。"),
+            )
+            .await;
+            let projection =
+                MindDecisionProjection::for_input(&input, yunxi_core::DecisionDisposition::Reply);
+            assert!(runtime.register_outgoing_fence(
+                "pending-curiosity-question".to_string(),
+                &input,
+                projection,
+            ));
+            assert!(
+                runtime
+                    .proactive_reference_current(MindProactiveReference::Curiosity(curiosity.id()))
+                    .await
+            );
+
+            runtime
+                .observe_event(&direct_message(
+                    person_id,
+                    conversation_id,
+                    "换工作主要是因为上一份工作太远了。",
+                ))
+                .await
+                .expect("observe natural answer");
+
+            assert!(
+                !runtime
+                    .proactive_reference_current(MindProactiveReference::Curiosity(curiosity.id()))
+                    .await
+            );
+            assert!(
+                !runtime
+                    .pin_revalidated_outgoing_fence("pending-curiosity-question")
+                    .await
+                    .is_some()
+            );
+            assert_eq!(
+                CuriosityStore::get(store.as_ref(), curiosity.id())
+                    .await
+                    .expect("curiosity lookup")
+                    .expect("stored curiosity")
+                    .status(),
+                CuriosityStatus::Resolved
+            );
+            assert!(
                 AgendaStore::list_active(store.as_ref(), &[scope], Utc::now(), 8)
                     .await
                     .expect("resolved agenda query")
                     .is_empty()
+            );
+        });
+    }
+
+    #[test]
+    fn open_question_resolved_before_pending_question_commit() {
+        let executor = kovi::tokio::runtime::Runtime::new().expect("test runtime");
+        executor.block_on(async {
+            let (runtime, store) = active_test_runtime();
+            let person_id = yunxi_core::PersonId::new();
+            let conversation_id = ConversationId::new();
+            let scope = MindScope::Person { person_id };
+            let created_at = Utc::now() - Duration::hours(3);
+            let question = OpenQuestion::new(
+                OpenQuestionId::new(),
+                scope,
+                "你今天面试结果怎么样？",
+                Vec::new(),
+                0.8,
+                created_at,
+            )
+            .expect("open question");
+            let agenda = AgendaItem::new(
+                AgendaItemId::new(),
+                scope,
+                AgendaSubject::OpenQuestion(question.id()),
+                0.8,
+                0.8,
+                0.5,
+                AgendaSource::OpenQuestion,
+                created_at,
+            )
+            .expect("question agenda");
+            OpenQuestionStore::put(store.as_ref(), &question, None)
+                .await
+                .expect("seed question");
+            AgendaStore::put(store.as_ref(), &agenda, None)
+                .await
+                .expect("seed agenda");
+
+            let input = active_planner_input(
+                runtime.as_ref(),
+                casual_direct_message(person_id, conversation_id, "之前那个话题先到这里。"),
+            )
+            .await;
+            let projection =
+                MindDecisionProjection::for_input(&input, yunxi_core::DecisionDisposition::Reply);
+            assert_eq!(
+                projection.disposition(),
+                yunxi_core::DecisionDisposition::AskQuestion
+            );
+            assert!(runtime.register_outgoing_fence(
+                "pending-open-question".to_string(),
+                &input,
+                projection,
+            ));
+
+            runtime
+                .observe_event(&direct_message(
+                    person_id,
+                    conversation_id,
+                    "我今天面试过了，结果还不错。",
+                ))
+                .await
+                .expect("observe answer");
+
+            assert!(
+                !runtime
+                    .pin_revalidated_outgoing_fence("pending-open-question")
+                    .await
+                    .is_some()
+            );
+            assert!(
+                OpenQuestionStore::list_open(store.as_ref(), &[scope], 8)
+                    .await
+                    .expect("resolved question query")
+                    .is_empty()
+            );
+            assert!(
+                AgendaStore::list_active(store.as_ref(), &[scope], Utc::now(), 8)
+                    .await
+                    .expect("resolved agenda query")
+                    .is_empty()
+            );
+        });
+    }
+
+    #[test]
+    fn open_loop_resolved_before_proactive_commit() {
+        let executor = kovi::tokio::runtime::Runtime::new().expect("test runtime");
+        executor.block_on(async {
+            let person_id = yunxi_core::PersonId::new();
+            let conversation_id = ConversationId::new();
+            let scope = MindScope::Person { person_id };
+            let created_at = Utc::now() - Duration::hours(3);
+            let open_loop = OpenLoop::new(
+                yunxi_core::OpenLoopId::new(),
+                OpenLoopOwner::Person(person_id),
+                OpenLoopKind::FollowUp,
+                "你今天面试结果怎么样？",
+                created_at,
+            )
+            .expect("open loop");
+            let open_loop_id = open_loop.id();
+            let open_loops = Arc::new(StatefulOpenLoopStore::with_item(open_loop));
+            let (runtime, store) = active_runtime_with_open_loops(Arc::clone(&open_loops));
+            let agenda = AgendaItem::new(
+                AgendaItemId::new(),
+                scope,
+                AgendaSubject::OpenLoop(open_loop_id),
+                0.9,
+                0.9,
+                0.7,
+                AgendaSource::OpenLoop,
+                created_at,
+            )
+            .expect("open-loop agenda");
+            let agenda_id = agenda.id();
+            AgendaStore::put(store.as_ref(), &agenda, None)
+                .await
+                .expect("seed agenda");
+
+            assert!(
+                runtime
+                    .proactive_reference_current(MindProactiveReference::Agenda(agenda_id))
+                    .await
+            );
+            let input = active_planner_input(
+                runtime.as_ref(),
+                casual_direct_message(person_id, conversation_id, "技术问题已经聊完了。"),
+            )
+            .await;
+            let projection =
+                MindDecisionProjection::for_input(&input, yunxi_core::DecisionDisposition::Reply);
+            assert_eq!(
+                projection.disposition(),
+                yunxi_core::DecisionDisposition::ResumeAgenda
+            );
+            assert!(runtime.register_outgoing_fence(
+                "pending-open-loop-proactive".to_string(),
+                &input,
+                projection,
+            ));
+
+            runtime
+                .observe_event(&direct_message(
+                    person_id,
+                    conversation_id,
+                    "我今天面试过了，结果还不错。",
+                ))
+                .await
+                .expect("observe open-loop answer");
+
+            assert!(
+                !runtime
+                    .proactive_reference_current(MindProactiveReference::Agenda(agenda_id))
+                    .await
+            );
+            assert!(
+                !runtime
+                    .pin_revalidated_outgoing_fence("pending-open-loop-proactive")
+                    .await
+                    .is_some()
+            );
+            assert!(
+                OpenLoopStore::get(open_loops.as_ref(), open_loop_id)
+                    .await
+                    .expect("open-loop lookup")
+                    .expect("stored open loop")
+                    .status()
+                    .is_terminal()
+            );
+            assert!(
+                AgendaStore::list_active(store.as_ref(), &[scope], Utc::now(), 8)
+                    .await
+                    .expect("resolved agenda query")
+                    .is_empty()
+            );
+        });
+    }
+
+    #[test]
+    fn inner_agenda_changes_affect_revalidation() {
+        let executor = kovi::tokio::runtime::Runtime::new().expect("test runtime");
+        executor.block_on(async {
+            let (runtime, store) = active_test_runtime();
+            let person_id = yunxi_core::PersonId::new();
+            let conversation_id = ConversationId::new();
+            let scope = MindScope::Person { person_id };
+            let created_at = Utc::now() - Duration::hours(1);
+            let agenda = AgendaItem::new(
+                AgendaItemId::new(),
+                scope,
+                AgendaSubject::SocialMotive("继续聊之前的系统设计".to_string()),
+                0.8,
+                0.8,
+                0.6,
+                AgendaSource::Interaction,
+                created_at,
+            )
+            .expect("agenda");
+            AgendaStore::put(store.as_ref(), &agenda, None)
+                .await
+                .expect("seed agenda");
+            let input = active_planner_input(
+                runtime.as_ref(),
+                casual_direct_message(person_id, conversation_id, "现在空下来了。"),
+            )
+            .await;
+            let projection =
+                MindDecisionProjection::for_input(&input, yunxi_core::DecisionDisposition::Reply);
+            assert!(runtime.register_outgoing_fence(
+                "pending-agenda-resume".to_string(),
+                &input,
+                projection,
+            ));
+
+            let changed = agenda
+                .activate(1.0, Utc::now())
+                .expect("agenda activation update");
+            AgendaStore::put(store.as_ref(), &changed, Some(agenda.version()))
+                .await
+                .expect("persist agenda update");
+
+            assert!(
+                !runtime
+                    .pin_revalidated_outgoing_fence("pending-agenda-resume")
+                    .await
+                    .is_some()
+            );
+            assert_eq!(runtime.metrics().outgoing_fences_stale, 1);
+        });
+    }
+
+    #[test]
+    fn collision_does_not_duplicate_curiosity() {
+        let executor = kovi::tokio::runtime::Runtime::new().expect("test runtime");
+        executor.block_on(async {
+            let (runtime, store) = test_runtime();
+            let person_id = yunxi_core::PersonId::new();
+            let conversation_id = ConversationId::new();
+            let source = direct_message(person_id, conversation_id, "我最近换工作了");
+            let candidates = MindCandidates {
+                curiosity: Some("你为什么换工作？".to_string()),
+                ..MindCandidates::default()
+            };
+            runtime
+                .persist_candidates(PendingCandidates {
+                    idempotency_key: "first-curiosity".to_string(),
+                    context: candidate_context(&source),
+                    candidates: candidates.clone(),
+                    erasure_epoch: 0,
+                    registered_at: Utc::now(),
+                })
+                .await
+                .expect("persist first curiosity");
+            let collision = WorldEvent::new(
+                Utc::now(),
+                EventScope::Conversation { conversation_id },
+                EventPriority::High,
+                WorldEventKind::MessageCollisionDetected(MessageCollisionDetectedEvent {
+                    conversation_id,
+                    outgoing_generation: 1,
+                    conversation_version: 2,
+                    fingerprint: 3,
+                }),
+            );
+            runtime
+                .observe_event(&collision)
+                .await
+                .expect("observe collision");
+            runtime
+                .persist_candidates(PendingCandidates {
+                    idempotency_key: "replacement-curiosity".to_string(),
+                    context: candidate_context(&source),
+                    candidates,
+                    erasure_epoch: 0,
+                    registered_at: Utc::now(),
+                })
+                .await
+                .expect("persist replacement curiosity");
+
+            let scope = MindScope::Person { person_id };
+            assert_eq!(
+                CuriosityStore::list_open(store.as_ref(), &[scope], Utc::now(), 8)
+                    .await
+                    .expect("curiosity query")
+                    .len(),
+                1
+            );
+            assert_eq!(
+                AgendaStore::list_active(store.as_ref(), &[scope], Utc::now(), 8)
+                    .await
+                    .expect("agenda query")
+                    .len(),
+                1
+            );
+            assert_eq!(
+                runtime
+                    .recent_events
+                    .lock()
+                    .unwrap_or_else(|lock| lock.into_inner())
+                    .for_scope(MindScope::Conversation { conversation_id })
+                    .len(),
+                1
+            );
+        });
+    }
+
+    #[test]
+    fn stale_pending_outgoing_does_not_write_wrong_episode() {
+        let executor = kovi::tokio::runtime::Runtime::new().expect("test runtime");
+        executor.block_on(async {
+            let (runtime, store) = active_test_runtime();
+            let person_id = yunxi_core::PersonId::new();
+            let conversation_id = ConversationId::new();
+            let scope = MindScope::Conversation { conversation_id };
+            let created_at = Utc::now() - Duration::hours(1);
+            let agenda = AgendaItem::new(
+                AgendaItemId::new(),
+                scope,
+                AgendaSubject::SocialMotive("继续问面试结果".to_string()),
+                0.8,
+                0.8,
+                0.5,
+                AgendaSource::Interaction,
+                created_at,
+            )
+            .expect("agenda");
+            AgendaStore::put(store.as_ref(), &agenda, None)
+                .await
+                .expect("seed agenda");
+            let source = casual_direct_message(person_id, conversation_id, "之前的话题结束了。");
+            let input = active_planner_input(runtime.as_ref(), source.clone()).await;
+            let projection =
+                MindDecisionProjection::for_input(&input, yunxi_core::DecisionDisposition::Reply);
+            let key = "stale-pending-with-candidate";
+            assert!(runtime.register_outgoing_fence(key.to_string(), &input, projection));
+            assert!(runtime.register_candidates(
+                key.to_string(),
+                candidate_context(&source),
+                MindCandidates {
+                    curiosity: Some("你为什么换工作？".to_string()),
+                    ..MindCandidates::default()
+                },
+            ));
+            let changed = agenda.activate(1.0, Utc::now()).expect("agenda update");
+            AgendaStore::put(store.as_ref(), &changed, Some(agenda.version()))
+                .await
+                .expect("persist agenda update");
+            runtime
+                .observe_event(&WorldEvent::new(
+                    Utc::now(),
+                    EventScope::Conversation { conversation_id },
+                    EventPriority::High,
+                    WorldEventKind::MessageCollisionDetected(MessageCollisionDetectedEvent {
+                        conversation_id,
+                        outgoing_generation: 5,
+                        conversation_version: 6,
+                        fingerprint: 7,
+                    }),
+                ))
+                .await
+                .expect("observe collision");
+
+            assert!(runtime.pin_revalidated_outgoing_fence(key).await.is_none());
+            assert!(
+                runtime
+                    .pending_candidates
+                    .lock()
+                    .unwrap_or_else(|lock| lock.into_inner())
+                    .iter()
+                    .all(|pending| pending.idempotency_key != key)
+            );
+            runtime.trigger_reflection(ReflectionTrigger::Idle).await;
+
+            assert!(
+                CuriosityStore::list_open(
+                    store.as_ref(),
+                    &[MindScope::Person { person_id }],
+                    Utc::now(),
+                    8,
+                )
+                .await
+                .expect("curiosity query")
+                .is_empty()
+            );
+            assert!(
+                EpisodeStore::list_recent(
+                    store.as_ref(),
+                    &[scope, MindScope::Person { person_id }],
+                    Utc::now() - Duration::days(1),
+                    8,
+                )
+                .await
+                .expect("episode query")
+                .is_empty()
             );
         });
     }

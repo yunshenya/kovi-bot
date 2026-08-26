@@ -587,7 +587,11 @@ impl Consolidation {
                         .intensity_delta
                         .abs()
                         .min(self.config.max_preference_delta),
-                    (0.4 + proposal.confidence_delta).clamp(0.0, 1.0),
+                    (0.4 + proposal.confidence_delta.clamp(
+                        -self.config.max_preference_delta,
+                        self.config.max_preference_delta,
+                    ))
+                    .clamp(0.0, 1.0),
                     0.25,
                     proposal.source,
                     now,

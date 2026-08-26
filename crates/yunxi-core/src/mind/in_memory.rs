@@ -249,6 +249,10 @@ impl BeliefStore for InMemoryMindStore {
                 .beliefs
                 .values()
                 .filter(|belief| scopes.contains(&belief.scope()) && belief.is_active_at(now))
+                .filter(|belief| {
+                    query.trim().is_empty()
+                        || super::relevance::lexical_relevance(belief.proposition(), query) > 0.0
+                })
                 .cloned()
                 .collect::<Vec<_>>();
             values.sort_by(|left, right| {
@@ -315,6 +319,10 @@ impl PreferenceStore for InMemoryMindStore {
                 .read()
                 .preferences
                 .values()
+                .filter(|preference| {
+                    query.trim().is_empty()
+                        || super::relevance::lexical_relevance(preference.subject(), query) > 0.0
+                })
                 .cloned()
                 .collect::<Vec<_>>();
             values.sort_by(|left, right| {
@@ -373,7 +381,16 @@ impl InterestStore for InMemoryMindStore {
     fn relevant<'a>(&'a self, query: &'a str, limit: usize) -> MindStoreFuture<'a, Vec<Interest>> {
         Box::pin(async move {
             Self::validate_limit(limit)?;
-            let mut values = self.read().interests.values().cloned().collect::<Vec<_>>();
+            let mut values = self
+                .read()
+                .interests
+                .values()
+                .filter(|interest| {
+                    query.trim().is_empty()
+                        || super::relevance::lexical_relevance(interest.topic(), query) > 0.0
+                })
+                .cloned()
+                .collect::<Vec<_>>();
             values.sort_by(|left, right| {
                 score_cmp(interest_score(right, query), interest_score(left, query))
             });
@@ -794,27 +811,7 @@ fn enforce_capacity(length: usize, already_exists: bool) -> Result<(), MindStore
 }
 
 fn lexical_score(value: &str, query: &str) -> f32 {
-    let query = super::common::normalized_key(query);
-    if query.is_empty() {
-        return 0.0;
-    }
-    let value = super::common::normalized_key(value);
-    if value == query {
-        return 1.0;
-    }
-    if value.contains(&query) || query.contains(&value) {
-        return 0.8;
-    }
-    let tokens = query.split_whitespace().collect::<Vec<_>>();
-    if tokens.is_empty() {
-        0.0
-    } else {
-        tokens
-            .iter()
-            .filter(|token| value.contains(**token))
-            .count() as f32
-            / tokens.len() as f32
-    }
+    super::relevance::lexical_relevance(value, query)
 }
 
 fn recency_score(updated_at: DateTime<Utc>, now: DateTime<Utc>) -> f32 {
