@@ -504,12 +504,7 @@ async fn build_generic_task(reminder: &ClaimedReminder) -> Result<String> {
         config::get().reminders().max_task_instruction_chars(),
     )?;
     let ticket = crate::model::interrupt(reminder_scope(reminder.id)).await;
-    let external_task = task_requires_external_tool(&instruction);
-    let delivery_style = if external_task {
-        "请保持芸汐平时聊天的语气，像刚替对方打开浏览器看过一遍、回来顺手分享：不要先汇报‘任务已执行’，也不要写成客服或新闻播报。查到新闻时先自然说最值得看的结论，再列 2 到 5 条；查天气时先说地点、时间和体感，再补一句实用建议。可以自然使用‘我刚看了一下’、‘我搜到几条’或直接说重点，但每次不要固定套同一句。不要使用‘搜索结果如下’、‘根据工具/接口返回’、‘本次未能可靠获取’等系统式措辞，不复述网页摘要，不编造资料，也不要输出工具、模型、协议或实现细节。"
-    } else {
-        "请保持芸汐平时聊天的语气，像刚替对方查过资料后回来聊天一样直接说结果；语气自然、亲近、简洁，不要先汇报任务状态，也不要提到工具、模型、协议或实现细节。"
-    };
+    let delivery_style = "请保持芸汐平时聊天的语气，像刚替对方完成任务后回来聊天一样直接说结果；语气自然、亲近、简洁，不要先汇报任务状态，也不要提到工具、模型、协议或实现细节。任务需要外部资料时，先调用当前清单中的只读查询工具；不需要时直接完成任务，不要为了凑流程调用工具。";
     let mut messages = vec![
         crate::model::BotMemory {
             role: crate::model::Roles::System,
@@ -543,7 +538,7 @@ async fn build_generic_task(reminder: &ClaimedReminder) -> Result<String> {
             requires_agent_run_create: false,
             requires_group_message_send: false,
             requires_group_followup: false,
-            requires_external_tool: external_task,
+            requires_external_tool: false,
         },
         ticket,
         Some(1_200),
@@ -574,32 +569,6 @@ async fn build_generic_task(reminder: &ClaimedReminder) -> Result<String> {
         &content,
         config::get().reminders().max_task_output_chars(),
     ))
-}
-
-fn task_requires_external_tool(instruction: &str) -> bool {
-    [
-        "新闻",
-        "资讯",
-        "天气",
-        "最新",
-        "今日",
-        "实时",
-        "搜索",
-        "查询",
-        "网页",
-        "互联网",
-        "在线",
-        "价格",
-        "汇率",
-        "股价",
-        "比赛",
-        "赛事",
-        "航班",
-        "路况",
-        "日程",
-    ]
-    .iter()
-    .any(|keyword| instruction.contains(keyword))
 }
 
 async fn maybe_cleanup_terminal_rows() {
@@ -636,85 +605,6 @@ pub(crate) async fn create_from_tool(
             }
         })?;
     Ok(format_created_message(id, &request))
-}
-
-/// 只用于决定是否强制模型走 reminder.create；这里不解析时间，也不创建任务。
-///
-/// 这是一个协议闸门，不是提醒实现。真正的时间解析、权限校验和数据库写入仍然只
-/// 发生在 reminder.create 工具内部，避免模型用一段确认话术冒充已经创建成功。
-pub(crate) fn looks_like_reminder_request(text: &str) -> bool {
-    let text = text.trim();
-    if text.is_empty() {
-        return false;
-    }
-    let is_cancellation = [
-        "取消提醒",
-        "取消定时",
-        "不用提醒",
-        "不要提醒",
-        "别提醒",
-        "不用发",
-        "不要发",
-        "别发",
-        "不用了",
-    ]
-    .iter()
-    .any(|marker| text.contains(marker));
-    if is_cancellation {
-        return false;
-    }
-    let has_time = [
-        "秒后",
-        "分后",
-        "分钟后",
-        "小时后",
-        "天后",
-        "周后",
-        "星期后",
-        "礼拜后",
-        "之后",
-        "以后",
-        "今天",
-        "明天",
-        "后天",
-        "每天",
-        "每周",
-        "下周",
-        "今早",
-        "明早",
-        "今晚",
-        "明晚",
-    ]
-    .iter()
-    .any(|marker| text.contains(marker));
-    let has_action = [
-        "提醒",
-        "定时",
-        "发消息",
-        "发一条消息",
-        "发条消息",
-        "发个消息",
-        "发条",
-        "给我发",
-        "发给我",
-        "帮我",
-        "替我",
-        "为我",
-        "记得",
-        "通知",
-        "叫我",
-        "喊我",
-        "告诉我",
-        "搜索",
-        "查询",
-        "查一下",
-        "整理",
-        "总结",
-        "执行",
-    ]
-    .iter()
-    .any(|marker| text.contains(marker));
-    has_time && has_action
 }
 
 /// 由内置工具调用：列出当前私聊或当前群的未完成提醒。
@@ -1597,7 +1487,6 @@ mod tests {
         ReminderKind, ReminderToolFailureKind, RepeatRule, classify_tool_error,
         failure_notice_for_execution, lease_heartbeat_interval_secs, next_occurrence,
         next_occurrence_after, parse_create_request, reminder_tool_error,
-        task_requires_external_tool,
     };
     use crate::config::ReminderConfig;
     use chrono::{Duration, TimeZone, Utc};
@@ -1610,13 +1499,6 @@ mod tests {
         assert_eq!(lease_heartbeat_interval_secs(60), 20);
         assert_eq!(lease_heartbeat_interval_secs(180), 60);
         assert_eq!(lease_heartbeat_interval_secs(600), 60);
-    }
-
-    #[test]
-    fn external_data_tasks_are_detected_without_marking_memory_lookup() {
-        assert!(task_requires_external_tool("搜索今天的新闻"));
-        assert!(task_requires_external_tool("三分钟后查询最新天气"));
-        assert!(!task_requires_external_tool("整理我之前说过的记忆"));
     }
 
     #[test]
@@ -1634,21 +1516,6 @@ mod tests {
         assert_eq!(request.message, "记得 吃饭");
         assert_eq!(request.repeat, RepeatRule::None);
         assert_eq!(request.due_at - now, Duration::seconds(600));
-    }
-
-    #[test]
-    fn detects_reminder_intent_without_creating_a_task() {
-        assert!(super::looks_like_reminder_request(
-            "三分钟后随便给我发一条消息"
-        ));
-        assert!(super::looks_like_reminder_request("明天早上提醒我吃饭"));
-        assert!(super::looks_like_reminder_request(
-            "十分钟后搜索早上的新闻发给我"
-        ));
-        assert!(super::looks_like_reminder_request("明天早上帮我检查日程"));
-        assert!(!super::looks_like_reminder_request("我三分钟后下班"));
-        assert!(!super::looks_like_reminder_request("提醒我吃饭"));
-        assert!(!super::looks_like_reminder_request("明天早上不用提醒我了"));
     }
 
     #[test]

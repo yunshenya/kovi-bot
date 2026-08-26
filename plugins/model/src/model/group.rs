@@ -746,7 +746,6 @@ pub(crate) async fn group_message_event_after_ingress(
         group_id,
         event.user_id,
         understanding.conversation_relevant,
-        is_natural_short_follow_up(&intent_text),
     )
     .await;
     // 被点名时始终处理；未点名消息仅由本地节流器偶尔抽样，不逐条调用模型。
@@ -762,13 +761,8 @@ pub(crate) async fn group_message_event_after_ingress(
     let continue_conversation = if primary_reply_expected {
         false
     } else {
-        should_continue_conversation(
-            group_id,
-            event.user_id,
-            understanding.conversation_relevant,
-            is_natural_short_follow_up(&intent_text),
-        )
-        .await
+        should_continue_conversation(group_id, event.user_id, understanding.conversation_relevant)
+            .await
     };
     let direct_reply_expected = primary_reply_expected
         || continue_conversation
@@ -1249,7 +1243,6 @@ async fn is_conversation_participant_message(
     group_id: i64,
     user_id: i64,
     semantic_relevant: bool,
-    short_follow_up: bool,
 ) -> bool {
     let now = Instant::now();
     let open_floor = Duration::from_secs(
@@ -1265,14 +1258,8 @@ async fn is_conversation_participant_message(
     if !has_active_conversation_window(state.conversation_until, now) {
         state.conversation_until = None;
     }
-    let relevant = conversation_message_is_relevant(
-        state,
-        user_id,
-        semantic_relevant,
-        short_follow_up,
-        now,
-        open_floor,
-    );
+    let relevant =
+        conversation_message_is_relevant(state, user_id, semantic_relevant, now, open_floor);
     if relevant {
         roll_conversation_window(
             state,
@@ -1292,16 +1279,14 @@ async fn should_continue_conversation(
     group_id: i64,
     user_id: i64,
     semantic_relevant: bool,
-    short_follow_up: bool,
 ) -> bool {
-    is_conversation_participant_message(group_id, user_id, semantic_relevant, short_follow_up).await
+    is_conversation_participant_message(group_id, user_id, semantic_relevant).await
 }
 
 fn conversation_message_is_relevant(
     state: &GroupInterjectionState,
     user_id: i64,
     semantic_relevant: bool,
-    short_follow_up: bool,
     now: Instant,
     open_floor: Duration,
 ) -> bool {
@@ -1314,21 +1299,11 @@ fn conversation_message_is_relevant(
         .get(&user_id)
         .is_some_and(|deadline| *deadline > now);
 
-    // A pending turn is still a live conversation even before the first reply
-    // has opened the normal rolling window.
-    if short_follow_up && pending_participant {
-        return true;
-    }
     if semantic_relevant && pending_participant {
         return true;
     }
     if !has_active_conversation_window(state.conversation_until, now) {
         return false;
-    }
-    // A short question from a member who is already in this active window is
-    // a safe local fallback when the semantic pass misses the context.
-    if short_follow_up && known_participant {
-        return true;
     }
     if !semantic_relevant {
         return false;
@@ -1337,25 +1312,6 @@ fn conversation_message_is_relevant(
         || state
             .last_bot_reply_at
             .is_some_and(|last_reply| now.duration_since(last_reply) < open_floor)
-}
-
-/// Keep the local fallback narrow: only short, question-shaped follow-ups from
-/// an existing participant should bypass a missed semantic relevance flag.
-fn is_natural_short_follow_up(message: &str) -> bool {
-    let text = message.trim();
-    if text.is_empty() || text.starts_with('#') {
-        return false;
-    }
-    let char_count = text.chars().count();
-    if char_count > 16 || text.contains('\n') {
-        return false;
-    }
-    text.chars().last().is_some_and(|last| {
-        matches!(
-            last,
-            '?' | '？' | '吗' | '嘛' | '呢' | '吧' | '呀' | '啊' | '么'
-        )
-    })
 }
 
 /// 有效的连续对话消息会把窗口向后滚动，避免窗口从第一次回复开始固定倒计时。
@@ -1847,11 +1803,10 @@ mod tests {
         clear_group_erasure_reply_state_locked, complete_interjection_attempt,
         conversation_message_is_relevant, decision_budget_available,
         group_erasure_receipt_destination, has_active_conversation_window,
-        is_natural_short_follow_up, looks_like_immediate_stop_request, message_at_self,
-        normalized_sender_name, prune_decision_attempts, queue_pending_window_message,
-        roll_conversation_window, should_queue_after_executive, sticker_reaction_budget_available,
-        suppress_direct_trigger, take_pending_window_turn, text_mentions_bot,
-        with_structured_bot_mention_context,
+        looks_like_immediate_stop_request, message_at_self, normalized_sender_name,
+        prune_decision_attempts, queue_pending_window_message, roll_conversation_window,
+        should_queue_after_executive, sticker_reaction_budget_available, suppress_direct_trigger,
+        take_pending_window_turn, text_mentions_bot, with_structured_bot_mention_context,
     };
     use crate::model::MessageDestination;
     use crate::model::conversation_coordinator::{
@@ -2185,7 +2140,6 @@ mod tests {
             &state,
             42,
             true,
-            false,
             now,
             Duration::from_secs(45),
         ));
@@ -2193,7 +2147,6 @@ mod tests {
             &state,
             42,
             true,
-            false,
             now,
             Duration::from_secs(45),
         ));
@@ -2201,14 +2154,12 @@ mod tests {
             &state,
             42,
             false,
-            false,
             now,
             Duration::from_secs(45),
         ));
         assert!(!conversation_message_is_relevant(
             &state,
             99,
-            false,
             false,
             now,
             Duration::from_secs(45),
@@ -2219,7 +2170,6 @@ mod tests {
             &state,
             99,
             true,
-            false,
             now,
             Duration::from_secs(45),
         ));
@@ -2227,14 +2177,13 @@ mod tests {
             &state,
             42,
             false,
-            false,
             now,
             Duration::from_secs(45),
         ));
     }
 
     #[test]
-    fn known_participant_short_follow_up_survives_semantic_miss() {
+    fn known_participant_requires_semantic_relevance() {
         let now = Instant::now();
         let deadline = now + Duration::from_secs(180);
         let mut state = GroupInterjectionState {
@@ -2243,11 +2192,10 @@ mod tests {
         };
         state.conversation_participants.insert(42, deadline);
 
-        assert!(conversation_message_is_relevant(
+        assert!(!conversation_message_is_relevant(
             &state,
             42,
             false,
-            true,
             now,
             Duration::from_secs(45),
         ));
@@ -2255,7 +2203,6 @@ mod tests {
             &state,
             99,
             false,
-            true,
             now,
             Duration::from_secs(45),
         ));
@@ -2265,7 +2212,6 @@ mod tests {
             &state,
             42,
             false,
-            true,
             now,
             Duration::from_secs(45),
         ));
@@ -2282,23 +2228,9 @@ mod tests {
             &pending_state,
             42,
             true,
-            false,
             now,
             Duration::from_secs(45),
         ));
-    }
-
-    #[test]
-    fn natural_short_follow_up_requires_a_compact_question_shape() {
-        assert!(is_natural_short_follow_up("好看吗？"));
-        assert!(is_natural_short_follow_up("真的吗"));
-        assert!(is_natural_short_follow_up("继续说?"));
-        assert!(!is_natural_short_follow_up("今天群里天气很好"));
-        assert!(!is_natural_short_follow_up("#帮助"));
-        assert!(!is_natural_short_follow_up(
-            "这是一个过长的普通群消息，不能走本地兜底"
-        ));
-        assert!(!is_natural_short_follow_up("好看吗？\n还有别的吗？"));
     }
 
     #[test]
@@ -2373,7 +2305,6 @@ mod tests {
             &state,
             42,
             true,
-            false,
             first_message_at,
             Duration::from_secs(45),
         ));
@@ -2394,7 +2325,6 @@ mod tests {
             &state,
             42,
             true,
-            false,
             second_message_at,
             Duration::from_secs(45),
         ));

@@ -35,8 +35,7 @@ pub(crate) fn project_private_opportunity(
         signals.memory_salience,
         signals.recent_event_salience,
         idle_hours,
-    )?
-    .with_wellbeing_salience(signals.wellbeing_salience)?;
+    )?;
     let social_energy = ((u16::from(personality.energy_level.min(10))
         + u16::from(personality.social_confidence.min(10)))
         * 5) as u8;
@@ -52,7 +51,6 @@ pub(crate) fn project_private_opportunity(
 struct ProjectedSignals {
     memory_salience: u8,
     recent_event_salience: u8,
-    wellbeing_salience: u8,
 }
 
 fn project_signals(memories: &[MemoryEntry], now: DateTime<Local>) -> ProjectedSignals {
@@ -74,9 +72,6 @@ fn project_signals(memories: &[MemoryEntry], now: DateTime<Local>) -> ProjectedS
                 .recent_event_salience
                 .max(importance.saturating_add(type_bonus).min(100));
         }
-        if has_wellbeing_anchor(&memory.content) {
-            signals.wellbeing_salience = signals.wellbeing_salience.max(75);
-        }
     }
     signals
 }
@@ -92,25 +87,6 @@ fn is_grounded_memory(memory: &MemoryEntry) -> bool {
     }
     let content = memory.content.trim();
     content.chars().count() >= 8 && !content.starts_with("芸汐:") && !content.starts_with("芸汐：")
-}
-
-fn has_wellbeing_anchor(content: &str) -> bool {
-    [
-        "累",
-        "难受",
-        "不舒服",
-        "生病",
-        "医院",
-        "焦虑",
-        "失眠",
-        "压力",
-        "烦",
-        "低落",
-        "忙不过来",
-        "卡住",
-    ]
-    .iter()
-    .any(|cue| content.contains(cue))
 }
 
 #[cfg(test)]
@@ -160,7 +136,7 @@ mod tests {
     }
 
     #[test]
-    fn wellbeing_anchor_becomes_core_check_in() {
+    fn natural_language_content_does_not_override_structured_signal_type() {
         let now = Local::now();
         let opportunity = project_private_opportunity(
             PersonId::new(),
@@ -172,7 +148,7 @@ mod tests {
         )
         .expect("valid projection")
         .expect("grounded opportunity");
-        assert_eq!(opportunity.motive(), ProactiveMotive::CheckIn);
+        assert_eq!(opportunity.motive(), ProactiveMotive::Share);
     }
 
     #[test]

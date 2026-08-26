@@ -20,7 +20,6 @@ use sqlx_core::query::query;
 use sqlx_core::query_scalar::query_scalar;
 use sqlx_core::row::Row;
 use sqlx_postgres::{PgPool, Postgres};
-use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -1357,7 +1356,7 @@ fn text_mentions_bot(content: &str) -> bool {
 }
 
 fn classify_event(
-    question: &str,
+    _question: &str,
     content: &str,
     reply_to_message_id: Option<i32>,
     outbound_message_id: Option<i32>,
@@ -1382,234 +1381,21 @@ fn classify_event(
     if is_url_only(content) {
         return None;
     }
-    if is_generic_chatter(content) {
-        return None;
-    }
 
-    let overlap = keyword_overlap(question, content);
-    if overlap >= 2 {
-        return Some(EventRelevance {
-            score: 3,
-            kind: "keyword_match",
-        });
-    }
-    if overlap == 1 {
-        return Some(EventRelevance {
-            score: 2,
-            kind: "keyword_match",
-        });
-    }
-    if is_question_like(question) && is_answer_like(question, content) {
-        return Some(EventRelevance {
-            score: 1,
-            kind: "answer_shape",
-        });
-    }
-    None
+    // Once a task is active, ordinary text is a candidate response. The
+    // report model receives the bounded raw messages and can use the full
+    // question context; keeping a second host-side keyword classifier here
+    // caused false negatives for short or indirect answers.
+    Some(EventRelevance {
+        score: 1,
+        kind: "natural_language",
+    })
 }
 
 fn is_url_only(value: &str) -> bool {
     let compact = value.trim();
     (compact.starts_with("http://") || compact.starts_with("https://"))
         && !compact.chars().any(char::is_whitespace)
-}
-
-fn is_generic_chatter(value: &str) -> bool {
-    let compact: String = value
-        .chars()
-        .filter(|character| {
-            !character.is_whitespace()
-                && !character.is_ascii_punctuation()
-                && !"，。！？；：、…".contains(*character)
-        })
-        .collect();
-    let lower = compact.to_ascii_lowercase();
-    [
-        "哈哈",
-        "哈哈哈",
-        "笑死",
-        "早",
-        "早安",
-        "晚安",
-        "来了",
-        "路过",
-        "顶",
-        "收到",
-        "ok",
-        "okay",
-        "lol",
-        "👍",
-        "😂",
-    ]
-    .iter()
-    .any(|candidate| compact == *candidate || lower == *candidate)
-}
-
-fn is_question_like(value: &str) -> bool {
-    [
-        "吗",
-        "谁",
-        "什么",
-        "哪",
-        "怎么",
-        "几点",
-        "什么时候",
-        "时间",
-        "日期",
-        "是否",
-        "有没有",
-        "能不能",
-        "可以吗",
-        "觉得",
-        "意见",
-        "有空",
-        "方便",
-        "愿意",
-        "参加",
-        "报名",
-        "投票",
-        "请",
-        "告诉",
-        "看法",
-        "建议",
-    ]
-    .iter()
-    .any(|marker| value.contains(marker))
-}
-
-fn is_answer_like(question: &str, value: &str) -> bool {
-    let compact = value.trim();
-    if compact.chars().count() <= 12
-        && [
-            "我",
-            "我们",
-            "有",
-            "没有",
-            "有空",
-            "没空",
-            "可以",
-            "不行",
-            "能",
-            "不能",
-            "同意",
-            "不同意",
-        ]
-        .contains(&compact)
-    {
-        return true;
-    }
-    if compact.chars().count() <= 20
-        && (question.contains("几点")
-            || question.contains("什么时候")
-            || question.contains("时间")
-            || question.contains("日期"))
-        && (compact.chars().any(|character| character.is_ascii_digit())
-            || compact.contains('点')
-            || compact.contains('号'))
-    {
-        return true;
-    }
-    if compact.chars().count() <= 12
-        && (question.contains("投票") || question.contains("哪个") || question.contains("选"))
-        && !compact.chars().all(chinese_stop_character)
-    {
-        return true;
-    }
-    [
-        "我觉得",
-        "我来",
-        "我去",
-        "我选",
-        "挺好",
-        "不错",
-        "一般",
-        "喜欢",
-        "不喜欢",
-        "建议",
-        "可以",
-        "不可以",
-        "支持",
-        "反对",
-        "参加",
-        "报名",
-        "有空",
-        "没空",
-        "方便",
-        "不方便",
-        "同意",
-        "不同意",
-    ]
-    .iter()
-    .any(|marker| compact.contains(marker))
-}
-
-fn keyword_overlap(left: &str, right: &str) -> usize {
-    let left = keyword_units(left).into_iter().collect::<HashSet<_>>();
-    keyword_units(right)
-        .into_iter()
-        .filter(|unit| left.contains(unit))
-        .collect::<HashSet<_>>()
-        .len()
-}
-
-fn keyword_units(value: &str) -> Vec<String> {
-    let chars = value.chars().collect::<Vec<_>>();
-    let mut units = Vec::new();
-    let mut index = 0;
-    while index < chars.len() {
-        if chars[index].is_ascii_alphanumeric() {
-            let start = index;
-            index += 1;
-            while index < chars.len() && chars[index].is_ascii_alphanumeric() {
-                index += 1;
-            }
-            let unit = chars[start..index]
-                .iter()
-                .collect::<String>()
-                .to_ascii_lowercase();
-            if unit.chars().count() >= 2 && !ascii_stop_word(&unit) {
-                units.push(unit);
-            }
-            continue;
-        }
-        if is_cjk(chars[index]) {
-            let start = index;
-            index += 1;
-            while index < chars.len() && is_cjk(chars[index]) {
-                index += 1;
-            }
-            let run = &chars[start..index];
-            for width in [2, 3] {
-                if run.len() < width {
-                    continue;
-                }
-                for window in run.windows(width) {
-                    let unit = window.iter().collect::<String>();
-                    if !unit.chars().all(chinese_stop_character) {
-                        units.push(unit);
-                    }
-                }
-            }
-            continue;
-        }
-        index += 1;
-    }
-    units
-}
-
-fn is_cjk(character: char) -> bool {
-    ('\u{4e00}'..='\u{9fff}').contains(&character) || ('\u{3400}'..='\u{4dbf}').contains(&character)
-}
-
-fn chinese_stop_character(character: char) -> bool {
-    "的了是吗呢吧啊我你他她它们我们大家请一下有能否这那和与在去要了么".contains(character)
-}
-
-fn ascii_stop_word(value: &str) -> bool {
-    matches!(
-        value,
-        "the" | "and" | "you" | "are" | "is" | "to" | "of" | "in"
-    )
 }
 
 fn normalize_question(value: &str) -> Result<String> {
@@ -1766,23 +1552,21 @@ mod tests {
     }
 
     #[test]
-    fn event_quality_keeps_direct_replies_and_related_answers() {
+    fn event_quality_keeps_structured_replies_and_forwards_text_to_report_model() {
         assert_eq!(
             classify_event("今晚有空吗", "有空", None, Some(10), false)
                 .expect("简短答案应被保留")
                 .kind,
-            "keyword_match"
+            "natural_language"
         );
         assert_eq!(
-            classify_event("今晚有空吗", "完全不同的话题", None, Some(10), false),
-            None
+            classify_event("今晚有空吗", "完全不同的话题", None, Some(10), false)
+                .map(|relevance| relevance.kind),
+            Some("natural_language")
         );
         assert!(classify_event("周末聚餐谁来", "我来", None, Some(10), false).is_some());
         assert!(classify_event("活动几点开始", "八点", None, Some(10), false).is_some());
-        assert_eq!(
-            classify_event("今晚有空吗", "哈哈！", None, Some(10), false),
-            None
-        );
+        assert!(classify_event("今晚有空吗", "哈哈！", None, Some(10), false).is_some());
         assert_eq!(
             classify_event("今晚有空吗", "哈哈", Some(10), Some(10), false)
                 .expect("引用机器人问题应优先保留")

@@ -671,13 +671,9 @@ fn is_memory_anchor_candidate(memory: &MemoryEntry) -> bool {
     }
     let display_content = memory_display_content(&memory.content);
     let content = display_content.trim();
-    if content.chars().count() < 8
-        || is_bot_message_content(content)
-        || matches!(content, "[image]" | "[图片]" | "图片" | "表情包")
-    {
-        return false;
-    }
-    !content.contains("主动关心决策") && !content.contains("主动发起话题")
+    content.chars().count() >= 8
+        && !is_bot_message_content(content)
+        && !matches!(content, "[image]" | "[图片]" | "图片" | "表情包")
 }
 
 fn is_bot_message_content(content: &str) -> bool {
@@ -710,30 +706,6 @@ fn memory_anchor_score(memory: &MemoryEntry, now: DateTime<Local>) -> i32 {
     }
     if !memory.tags.is_empty() {
         score += 2;
-    }
-    if content.contains('？') || content.contains('?') {
-        score += 4;
-    }
-    for cue in [
-        "还没",
-        "后来",
-        "准备",
-        "打算",
-        "正在",
-        "最近在",
-        "卡住",
-        "解决",
-        "忙",
-        "累",
-        "烦",
-        "开心",
-        "喜欢",
-        "想要",
-        "记得",
-    ] {
-        if content.contains(cue) {
-            score += 2;
-        }
     }
     score
 }
@@ -911,59 +883,11 @@ fn clean_outreach_message(content: &str) -> Option<String> {
         || content.contains("]]")
         || content.chars().count() > 180
         || content.matches(['?', '？']).count() > 1
-        || content.contains("根据资料")
-        || content.contains("根据记忆")
-        || content.starts_with("作为一个")
         || (content.starts_with('{') && content.ends_with('}'))
-        || looks_like_generic_outreach(&content)
     {
         return None;
     }
     Some(content)
-}
-
-fn looks_like_generic_outreach(content: &str) -> bool {
-    let generic_opening = [
-        "你最近怎么样",
-        "你今天过得怎么样",
-        "最近还好吗",
-        "你还好吗",
-        "最近在忙什么",
-        "最近在干什么",
-        "今天有什么安排",
-        "最近有什么计划",
-        "最近有什么",
-        "你最喜欢",
-        "你最欣赏",
-        "如果让你",
-        "你觉得什么是真正",
-        "有没有什么让你",
-        "今天天气怎么样",
-        "最近有什么好看的",
-    ];
-    let specific_reference = [
-        "上次",
-        "之前",
-        "前面",
-        "刚才",
-        "后来",
-        "那个",
-        "那只",
-        "那部",
-        "这件",
-        "这次",
-        "你提到",
-        "你说",
-        "还在",
-        "记得",
-        "突然想起",
-    ];
-    generic_opening
-        .iter()
-        .any(|opening| content.starts_with(opening))
-        && !specific_reference
-            .iter()
-            .any(|reference| content.contains(reference))
 }
 
 #[cfg(test)]
@@ -1096,17 +1020,11 @@ mod tests {
     }
 
     #[test]
-    fn outreach_parser_rejects_survey_style_messages() {
-        assert!(
+    fn outreach_parser_leaves_natural_language_quality_to_the_model() {
+        let generic =
             parse_outreach_draft(r#"{"motive":"share","message":"最近有什么让你开心的小事吗？"}"#)
-                .is_none()
-        );
-        assert!(
-            parse_outreach_draft(
-                r#"{"motive":"follow_up","message":"如果让你选择一种超能力，你会选什么？"}"#
-            )
-            .is_none()
-        );
+                .expect("合法的自然语言不应由本地关键词黑名单拒绝");
+        assert_eq!(generic.message, "最近有什么让你开心的小事吗？");
 
         let draft = parse_outreach_draft(
             r#"{"motive":"follow_up","message":"你前面说的 MCP 定时任务后来弄好了吗？"}"#,
@@ -1141,7 +1059,7 @@ mod tests {
     }
 
     #[test]
-    fn memory_anchor_selection_prefers_specific_user_context() {
+    fn memory_anchor_selection_prefers_structurally_salient_user_context() {
         let memories = vec![
             conversation_memory("bot", "芸汐: 你最近还好吗？", 10, &["近况"], "private_chat"),
             conversation_memory("short", "嗯嗯", 10, &[], "private_chat"),

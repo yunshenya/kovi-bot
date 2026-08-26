@@ -295,25 +295,7 @@ fn looks_incomplete(text: &str) -> bool {
     if text.ends_with(['，', ',', '、', '：', ':', '；', ';', '…', '-', '—']) {
         return true;
     }
-    [
-        "但是",
-        "然后",
-        "因为",
-        "所以",
-        "而且",
-        "不过",
-        "还有",
-        "其实",
-        "就是",
-        "比如",
-        "如果",
-        "虽然",
-        "可能",
-        "我想",
-        "我觉得",
-    ]
-    .iter()
-    .any(|ending| text.ends_with(ending))
+    false
 }
 
 fn ends_complete_sentence(text: &str) -> bool {
@@ -397,8 +379,9 @@ mod tests {
     #[test]
     fn incomplete_fragments_wait_longer_than_complete_sentences() {
         let policy = BatchPolicy::testing();
-        assert_eq!(adaptive_delay("因为", policy), policy.incomplete_delay);
+        assert_eq!(adaptive_delay("还有，", policy), policy.incomplete_delay);
         assert_eq!(adaptive_delay("我今天", policy), policy.incomplete_delay);
+        assert_eq!(adaptive_delay("因为这个原因", policy), policy.normal_delay);
         assert_eq!(adaptive_delay("我知道了。", policy), policy.complete_delay);
         assert_eq!(adaptive_delay("我们晚点再聊", policy), policy.normal_delay);
     }

@@ -517,7 +517,10 @@ pub async fn control_model(
                 message,
                 scope: StickerScope::Group(group_id),
             }),
-            requires_reminder_create: crate::reminders::looks_like_reminder_request(message),
+            // Natural-language tool intent is decided by the model/tool
+            // protocol. Host routing only handles explicit commands and
+            // structured message features.
+            requires_reminder_create: false,
             requires_agent_run_create: false,
             requires_group_message_send: false,
             requires_group_followup: false,
@@ -2212,8 +2215,6 @@ async fn private_chat_inner(
     )
     .await;
     let is_main_admin = crate::model::utils::is_main_admin(&bot, user_id);
-    let requires_agent_run_create =
-        is_main_admin && crate::agent_runs::looks_like_agent_run_request(message);
     let bot_content = ModelGateway::complete(
         &mut request_messages,
         ToolExecutionContext {
@@ -2231,9 +2232,8 @@ async fn private_chat_inner(
                 message,
                 scope: StickerScope::Private(user_id),
             }),
-            requires_reminder_create: !requires_agent_run_create
-                && crate::reminders::looks_like_reminder_request(message),
-            requires_agent_run_create,
+            requires_reminder_create: false,
+            requires_agent_run_create: false,
             requires_group_message_send: is_main_admin && understanding.cross_group_message_request,
             requires_group_followup: is_main_admin && understanding.cross_group_followup_request,
             requires_external_tool: false,

@@ -11,7 +11,7 @@ use crate::model::{
     take_message_collisions,
 };
 use anyhow::Context;
-use chrono::{DateTime, Duration, TimeZone, Utc};
+use chrono::{DateTime, TimeZone, Utc};
 use kovi::RuntimeBot;
 use kovi::bot::message::Message;
 use kovi::event::{GroupMsgEvent, PrivateMsgEvent};
@@ -27,9 +27,8 @@ use yunxi_core::{
     AttachmentKind, CognitiveRuntime, ConversationId, ConversationKind, ConversationMemberStore,
     CoreServices, EnvironmentCapabilities, EventPriority, EventScope, ExternalConversation,
     IdentityStore, MessageCollisionDetectedEvent, MessageContent, MessageId, MessageReceivedEvent,
-    ModelBackend, OpenLoopDraft, OpenLoopKind, OpenLoopOwner, OpenLoopStore,
-    PlannedProcessingOutcome, ProcessingOutcome, ProposedAction, RuntimeConfig, RuntimeHandle,
-    WorldEvent, WorldEventKind,
+    ModelBackend, OpenLoopStore, PlannedProcessingOutcome, ProcessingOutcome, ProposedAction,
+    RuntimeConfig, RuntimeHandle, WorldEvent, WorldEventKind,
 };
 
 pub(crate) const SHADOW_INGRESS_CAPACITY: usize = 256;
@@ -505,7 +504,6 @@ impl ShadowBridge {
             receiver,
             store,
             runtime_handle,
-            open_loop_store.clone(),
             model_backend,
             message_store,
             Arc::clone(&blocked_users),
@@ -1348,7 +1346,6 @@ async fn run_ingress(
     mut receiver: mpsc::Receiver<IngressCommand>,
     store: Arc<dyn IdentityStore>,
     runtime: RuntimeHandle,
-    open_loop_store: Option<Arc<dyn OpenLoopStore>>,
     model_backend: Option<Arc<super::core_model::KoviModelBackend>>,
     message_store: Option<Arc<super::identity_store::PostgresIdentityStore>>,
     blocked_users: Arc<StdMutex<HashSet<i64>>>,
@@ -1384,7 +1381,6 @@ async fn run_ingress(
                     store.as_ref(),
                     &runtime,
                     &mut references,
-                    open_loop_store.as_deref(),
                     model_backend.as_deref(),
                     message_store.as_deref(),
                     Some(&mut routes),
@@ -2097,7 +2093,7 @@ async fn resolve_and_submit(
     runtime: &RuntimeHandle,
     references: &mut MessageReferenceCache,
 ) -> anyhow::Result<()> {
-    resolve_and_submit_inner(message, store, runtime, references, None, None, None, None).await
+    resolve_and_submit_inner(message, store, runtime, references, None, None, None).await
 }
 
 async fn resolve_projected_destination(
@@ -2137,7 +2133,6 @@ async fn resolve_and_submit_inner(
     store: &dyn IdentityStore,
     runtime: &RuntimeHandle,
     references: &mut MessageReferenceCache,
-    open_loop_store: Option<&dyn OpenLoopStore>,
     model_backend: Option<&super::core_model::KoviModelBackend>,
     message_store: Option<&super::identity_store::PostgresIdentityStore>,
     route_tracker: Option<&mut IngressRouteTracker>,
@@ -2316,18 +2311,6 @@ async fn resolve_and_submit_inner(
         kovi::log::warn!("Yunxi message collision event was not admitted: {error}");
     }
     if matches!(admission, Admission::Accepted)
-        && let Some(open_loop_store) = open_loop_store
-    {
-        process_open_loop_candidate(
-            open_loop_store,
-            message,
-            person_id,
-            conversation_id,
-            message_id,
-        )
-        .await?;
-    }
-    if matches!(admission, Admission::Accepted)
         && let Some(key) = reference_key
     {
         references.insert(
@@ -2428,201 +2411,6 @@ async fn recent_bot_message(
         return false;
     };
     is_recent_bot_message(address.reply_scope(), message_id).await
-}
-
-async fn process_open_loop_candidate(
-    open_loop_store: &dyn OpenLoopStore,
-    message: &InboundMessage,
-    person_id: yunxi_core::PersonId,
-    conversation_id: ConversationId,
-    message_id: MessageId,
-) -> anyhow::Result<()> {
-    let owner = match message.address {
-        ConversationAddress::Direct { .. } => OpenLoopOwner::Person(person_id),
-        ConversationAddress::Group { .. } => OpenLoopOwner::Conversation(conversation_id),
-    };
-
-    if looks_like_outcome_completion(&message.text) {
-        resolve_matching_open_loop(open_loop_store, owner, &message.text).await;
-        return Ok(());
-    }
-
-    let Some(external_message_id) = message.external_message_id else {
-        return Ok(());
-    };
-    let Some(draft) = detect_open_loop_candidate(
-        owner,
-        &message.text,
-        message.timestamp,
-        message_id,
-        format!("qq-message:{conversation_id}:{external_message_id}"),
-    )?
-    else {
-        return Ok(());
-    };
-    if let Err(error) = open_loop_store.create(&draft).await {
-        kovi::log::warn!("Yunxi open-loop candidate was not persisted: {error}");
-    }
-    Ok(())
-}
-
-fn detect_open_loop_candidate(
-    owner: OpenLoopOwner,
-    text: &str,
-    timestamp: DateTime<Utc>,
-    source_message_id: MessageId,
-    dedupe_key: String,
-) -> anyhow::Result<Option<OpenLoopDraft>> {
-    let text = text.trim();
-    if text.is_empty()
-        || crate::reminders::looks_like_reminder_request(text)
-        || !has_future_marker(text)
-        || !has_future_event_marker(text)
-    {
-        return Ok(None);
-    }
-
-    let due_at = infer_future_due_at(text, timestamp);
-    let expires_at = due_at.map(|value| value + Duration::days(14));
-    let kind = if has_outcome_marker(text) {
-        OpenLoopKind::AwaitingOutcome
-    } else {
-        OpenLoopKind::FutureEvent
-    };
-    let draft = OpenLoopDraft::new(owner, kind, text.to_owned())?
-        .with_source_message_id(Some(source_message_id))
-        .with_due_at(due_at)
-        .with_expires_at(expires_at)
-        .with_dedupe_key(Some(dedupe_key))?;
-    Ok(Some(draft))
-}
-
-fn has_future_marker(text: &str) -> bool {
-    [
-        "明天",
-        "后天",
-        "下周",
-        "下个月",
-        "下星期",
-        "下礼拜",
-        "之后",
-        "以后",
-        "月底",
-        "周末",
-    ]
-    .iter()
-    .any(|marker| text.contains(marker))
-        || text.contains('日') && text.chars().any(|character| character.is_ascii_digit())
-}
-
-fn has_future_event_marker(text: &str) -> bool {
-    [
-        "面试", "考试", "面谈", "结果", "回复", "答复", "申请", "会议", "比赛", "旅行", "出差",
-        "生日", "发布", "上线", "项目", "约会", "演出", "手术", "预约",
-    ]
-    .iter()
-    .any(|marker| text.contains(marker))
-}
-
-fn has_outcome_marker(text: &str) -> bool {
-    [
-        "面试", "考试", "面谈", "结果", "回复", "答复", "申请", "审核", "比赛",
-    ]
-    .iter()
-    .any(|marker| text.contains(marker))
-}
-
-fn infer_future_due_at(text: &str, timestamp: DateTime<Utc>) -> Option<DateTime<Utc>> {
-    let offset_days = if text.contains("后天") {
-        2
-    } else if text.contains("明天") {
-        1
-    } else if text.contains("下周") || text.contains("下星期") || text.contains("下礼拜") {
-        7
-    } else if text.contains("下个月") {
-        30
-    } else {
-        return None;
-    };
-    let date = timestamp.date_naive() + Duration::days(offset_days);
-    let hour = number_before(text, '点').unwrap_or(9);
-    let hour = if (text.contains("下午") || text.contains("晚上")) && hour < 12 {
-        hour + 12
-    } else {
-        hour
-    };
-    let minute = if text.contains("点半") {
-        30
-    } else {
-        number_after(text, '点')
-            .filter(|value| *value < 60)
-            .unwrap_or(0)
-    };
-    let time = chrono::NaiveTime::from_hms_opt(hour.min(23), minute, 0)?;
-    Some(DateTime::<Utc>::from_naive_utc_and_offset(
-        date.and_time(time),
-        Utc,
-    ))
-}
-
-fn number_before(text: &str, marker: char) -> Option<u32> {
-    let position = text.find(marker)?;
-    let digits: String = text[..position]
-        .chars()
-        .rev()
-        .take_while(|character| character.is_ascii_digit())
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect();
-    (!digits.is_empty()).then(|| digits.parse().ok()).flatten()
-}
-
-fn number_after(text: &str, marker: char) -> Option<u32> {
-    let position = text.find(marker)? + marker.len_utf8();
-    let digits: String = text[position..]
-        .chars()
-        .take_while(|character| character.is_ascii_digit())
-        .collect();
-    (!digits.is_empty()).then(|| digits.parse().ok()).flatten()
-}
-
-fn looks_like_outcome_completion(text: &str) -> bool {
-    ["过了", "完成了", "结束了", "有结果了", "收到回复", "答复了"]
-        .iter()
-        .any(|marker| text.contains(marker))
-}
-
-async fn resolve_matching_open_loop(
-    open_loop_store: &dyn OpenLoopStore,
-    owner: OpenLoopOwner,
-    text: &str,
-) {
-    let Ok(items) = open_loop_store.list(&owner, 32).await else {
-        return;
-    };
-    let Some(item) = items.into_iter().find(|item| {
-        matches!(
-            item.kind(),
-            OpenLoopKind::AwaitingOutcome | OpenLoopKind::FutureEvent | OpenLoopKind::FollowUp
-        ) && outcome_terms_overlap(item.summary(), text)
-    }) else {
-        return;
-    };
-    if let Err(error) = open_loop_store.resolve(item.id(), Utc::now()).await {
-        kovi::log::warn!(
-            "Yunxi open-loop completion could not resolve {}: {error}",
-            item.id()
-        );
-    }
-}
-
-fn outcome_terms_overlap(summary: &str, text: &str) -> bool {
-    [
-        "面试", "考试", "面谈", "申请", "审核", "比赛", "结果", "回复", "答复",
-    ]
-    .iter()
-    .any(|term| summary.contains(term) && text.contains(term))
 }
 
 fn valid_qq_id(value: i64) -> bool {
@@ -2732,10 +2520,10 @@ mod tests {
         ConversationAddress, EnqueueOutcome, InboundMessage, IncomingAdmissionReleaseFuture,
         IncomingAdmissionReleaser, IngressRouteTracker, MessageReference, MessageReferenceCache,
         MessageReferenceKey, ShadowBridge, acquire_alias_handler_barriers, action_result_event,
-        block_user_aliases, bounded_text, detect_open_loop_candidate, idle_tick_event,
-        looks_like_stop_request, merge_data_erasure_targets, message_at_self,
-        normalize_attachments, reply_message_id, resolve_and_submit, run_ingress, run_runtime,
-        submit_message_collisions, text_mentions_agent, unblock_users,
+        block_user_aliases, bounded_text, idle_tick_event, looks_like_stop_request,
+        merge_data_erasure_targets, message_at_self, normalize_attachments, reply_message_id,
+        resolve_and_submit, run_ingress, run_runtime, submit_message_collisions,
+        text_mentions_agent, unblock_users,
     };
     use crate::model::{
         OutgoingSource, ReplyScope, commit_outgoing, interrupt, mark_active, mark_outgoing_sent,
@@ -2755,8 +2543,8 @@ mod tests {
         ActionRejection, ActionResult, Admission, AttachmentKind, AttentionDisposition,
         ConversationId, ConversationKind, EnvironmentCapabilities, EventPriority, EventType,
         IdentityStore, IdentityStoreError, IdentityStoreFuture, MessageContent, MessageId,
-        MessageReceivedEvent, OpenLoopKind, OpenLoopOwner, PersonId, ProcessingOutcome,
-        ProposedAction, RuntimeConfig, WorldEvent,
+        MessageReceivedEvent, PersonId, ProcessingOutcome, ProposedAction, RuntimeConfig,
+        WorldEvent,
     };
 
     struct FakeIdentityStore {
@@ -3100,7 +2888,6 @@ mod tests {
                 runtime_handle,
                 None,
                 None,
-                None,
                 blocked_users,
                 blocked_groups,
                 None,
@@ -3275,7 +3062,6 @@ mod tests {
                 receiver,
                 identity_store,
                 runtime_handle.clone(),
-                None,
                 None,
                 Some(Arc::clone(&store)),
                 Arc::clone(&blocked_users),
@@ -3645,7 +3431,6 @@ mod tests {
                 receiver,
                 store,
                 runtime_handle.clone(),
-                None,
                 None,
                 None,
                 Arc::clone(&blocked_users),
@@ -4090,46 +3875,6 @@ mod tests {
                 Some(ProcessingOutcome::Observed(_))
             ));
         });
-    }
-
-    #[test]
-    fn open_loop_candidate_detector_keeps_future_event_distinct_from_reminder() {
-        let now = Utc::now();
-        let owner = OpenLoopOwner::Person(PersonId::new());
-        let source = MessageId::new();
-        let candidate = detect_open_loop_candidate(
-            owner,
-            "我明天下午3点面试",
-            now,
-            source,
-            "message:1".to_string(),
-        )
-        .expect("detector should not fail")
-        .expect("future event should create a candidate");
-        assert_eq!(candidate.kind(), OpenLoopKind::AwaitingOutcome);
-        assert!(candidate.due_at().is_some());
-        assert!(
-            detect_open_loop_candidate(
-                owner,
-                "我喜欢看面试节目",
-                now,
-                source,
-                "message:2".to_string(),
-            )
-            .expect("detector should not fail")
-            .is_none()
-        );
-        assert!(
-            detect_open_loop_candidate(
-                owner,
-                "明天下午3点提醒我面试",
-                now,
-                source,
-                "message:3".to_string(),
-            )
-            .expect("detector should not fail")
-            .is_none()
-        );
     }
 
     #[test]
