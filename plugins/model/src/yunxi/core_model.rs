@@ -67,6 +67,8 @@ struct CoreInteractionCues {
     #[serde(default)]
     incoming_impact: Option<CoreIncomingImpact>,
     #[serde(default)]
+    stop_requested: bool,
+    #[serde(default)]
     sentiment_valence_milli: Option<i32>,
     #[serde(default)]
     sentiment_arousal_milli: Option<i32>,
@@ -99,6 +101,7 @@ struct ParsedCoreResponse {
     content: String,
     interaction_cues: InteractionCues,
     incoming_impact: Option<IncomingTurnImpact>,
+    stop_requested: bool,
 }
 
 enum CoreDirectRepair {
@@ -171,6 +174,7 @@ fn parse_core_response(content: &str) -> ParsedCoreResponse {
                     content: remainder.trim_start().to_owned(),
                     interaction_cues,
                     incoming_impact: wire.incoming_impact.map(Into::into),
+                    stop_requested: wire.stop_requested,
                 };
             }
         }
@@ -180,6 +184,7 @@ fn parse_core_response(content: &str) -> ParsedCoreResponse {
         content: strip_core_interaction_cues(content),
         interaction_cues: InteractionCues::default(),
         incoming_impact: None,
+        stop_requested: false,
     }
 }
 
@@ -1447,7 +1452,7 @@ impl ModelBackend for KoviModelBackend {
                     0,
                     BotMemory {
                         role: Roles::System,
-                        content: "Core 单轮语义协议：输出的第一个非空字符必须开始唯一一个 [[INTERACTION_CUES]]{\"incoming_impact\":\"取值\"}[[/INTERACTION_CUES]] 前缀。incoming_impact 只能是 none、extends_pending_topic、invalidates_pending_content、unrelated。none 表示新消息对已准备内容没有实质影响；extends_pending_topic 表示兼容地补充当前话题；invalidates_pending_content 表示回答、纠正或推翻其前提；unrelated 表示独立话题。只有能可靠判断用户情绪或明确感谢时，才在同一 JSON 中同时增加 sentiment_valence_milli（-1000 到 1000）、sentiment_arousal_milli（-1000 到 1000）、gratitude_milli（0 到 1000）三个整数；否则省略这三个字段。前缀后直接输出自然语言回复或完整 TOOL_CALL。不得增加其他字段、重复前缀、放进代码块或在正文解释协议。".to_string(),
+                        content: "Core 单轮语义协议：输出的第一个非空字符必须开始唯一一个 [[INTERACTION_CUES]]{\"incoming_impact\":\"取值\",\"stop_requested\":false}[[/INTERACTION_CUES]] 前缀。incoming_impact 只能是 none、extends_pending_topic、invalidates_pending_content、unrelated。none 表示新消息对已准备内容没有实质影响；extends_pending_topic 表示兼容地补充当前话题；invalidates_pending_content 表示回答、纠正或推翻其前提；unrelated 表示独立话题。stop_requested 只有在当前用户明确要求停止正在生成或发送的回复时才设为 true；否则设为 false。只有能可靠判断用户情绪或明确感谢时，才在同一 JSON 中同时增加 sentiment_valence_milli（-1000 到 1000）、sentiment_arousal_milli（-1000 到 1000）、gratitude_milli（0 到 1000）三个整数；否则省略这三个字段。stop_requested 为 true 时，前缀后不要输出可见正文或工具调用。前缀后直接输出自然语言回复或完整 TOOL_CALL。不得增加其他字段、重复前缀、放进代码块或在正文解释协议。".to_string(),
                     },
                 );
             }
@@ -1556,6 +1561,7 @@ impl ModelBackend for KoviModelBackend {
                     // response from an earlier turn; it must never be
                     // classified as `None` and accidentally kept.
                     incoming_impact: Some(IncomingTurnImpact::Unrelated),
+                    stop_requested: false,
                 }
             } else if message.is_some() {
                 parse_core_response(&response_content)
@@ -1564,8 +1570,26 @@ impl ModelBackend for KoviModelBackend {
                     content: response_content,
                     interaction_cues: InteractionCues::default(),
                     incoming_impact: None,
+                    stop_requested: false,
                 }
             };
+            if message.is_some() && parsed_response.stop_requested {
+                if let Some(guard) = incoming_guard.as_mut() {
+                    guard.disarm();
+                }
+                ConversationCoordinator::cancel_current_incoming(ticket).await;
+                crate::model::finish(ticket).await;
+                kovi::log::info!(
+                    "Yunxi Core stop intent cancelled current reply: event_id={} message_id={} conversation_id={}",
+                    input.event.id(),
+                    message_id_for_log(input),
+                    conversation_id_for_log(input),
+                );
+                return Ok(silent_with_interaction_cues(
+                    input,
+                    parsed_response.interaction_cues,
+                ));
+            }
             let refined_admission = if let Some(initial) = incoming_admission {
                 let refined = refine_core_incoming(initial, parsed_response.incoming_impact).await;
                 if let Some(guard) = incoming_guard.as_mut() {
@@ -1926,7 +1950,19 @@ mod tests {
         assert_eq!(parsed.interaction_cues.sentiment_confidence, 1.0);
         assert_eq!(parsed.interaction_cues.gratitude_strength, 0.8);
         assert_eq!(parsed.incoming_impact, None);
+        assert!(!parsed.stop_requested);
         assert!(!parsed.content.contains("INTERACTION_CUES"));
+    }
+
+    #[test]
+    fn core_response_cue_prefix_parses_structured_stop_intent() {
+        let parsed = parse_core_response(
+            r#"[[INTERACTION_CUES]]{"incoming_impact":"unrelated","stop_requested":true}[[/INTERACTION_CUES]]"#,
+        );
+
+        assert!(parsed.stop_requested);
+        assert_eq!(parsed.content, "");
+        assert_eq!(parsed.incoming_impact, Some(IncomingTurnImpact::Unrelated));
     }
 
     #[test]
