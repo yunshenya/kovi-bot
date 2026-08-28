@@ -1,6 +1,9 @@
 use crate::arbiter::{ActionArbiter, ActionPort, ActionResult};
 use crate::attention::{AttentionResult, AttentionSystem};
 use crate::event::{EventPriority, EventScope, EventType, EventValidationError, WorldEvent};
+use crate::executive::{
+    DecisionActionKind, DecisionRecord, ExecutiveController, ExecutiveReasonTag, ExecutiveScope,
+};
 use crate::goal::GoalOwner;
 use crate::identity::{ConversationId, EventId, PersonId};
 use crate::memory::{MemoryQuery, MemoryScope};
@@ -367,6 +370,7 @@ pub struct CognitiveRuntime {
     planner: Option<Planner>,
     services: Option<Arc<CoreServices>>,
     mind: Option<InstalledMindProvider>,
+    executive: ExecutiveController,
 }
 
 #[derive(Clone)]
@@ -528,6 +532,7 @@ impl CognitiveRuntime {
                 planner: None,
                 services: None,
                 mind: None,
+                executive: ExecutiveController::default(),
             },
         ))
     }
@@ -549,6 +554,24 @@ impl CognitiveRuntime {
     pub fn with_planner(mut self, planner: Planner) -> Self {
         self.planner = Some(planner);
         self
+    }
+
+    /// Installs the bounded Executive state holder used to enrich planner
+    /// inputs. The controller owns policy and metadata only; it never runs a
+    /// model or holds a lock across an await.
+    #[must_use]
+    pub fn with_executive(mut self, executive: ExecutiveController) -> Self {
+        self.executive = executive;
+        self
+    }
+
+    pub fn set_executive(&mut self, executive: ExecutiveController) {
+        self.executive = executive;
+    }
+
+    #[must_use]
+    pub fn executive(&self) -> &ExecutiveController {
+        &self.executive
     }
 
     /// Installs Core services and uses their model backend for planning.
@@ -685,6 +708,7 @@ impl CognitiveRuntime {
                 return ProcessingOutcome::RejectedState { event, error };
             }
         };
+        self.executive.observe_expectations(&event);
         ProcessingOutcome::Observed(RuntimeObservation {
             event_id: event.id(),
             event_type: event.kind().event_type(),
@@ -731,6 +755,7 @@ impl CognitiveRuntime {
         let deferred_due_resolution = deferred_due_open_loop_resolution(&planner_event, &plan);
         self.apply_state_updates(&input, &plan, deferred_due_resolution)
             .await?;
+        record_planner_decision(&self.executive, &input, &plan, None);
         Ok(PlannedProcessingOutcome::Planned {
             observation,
             plan,
@@ -795,6 +820,7 @@ impl CognitiveRuntime {
         let mut due_terminal_non_success = false;
         let mut actions = Vec::with_capacity(plan.intents.len());
         let mut feedback = Vec::new();
+        let mut selected_action = None;
         for (intent_index, intent) in plan.intents.iter().enumerate() {
             let mut proposed = intent.propose_action().map_err(|error| {
                 PlannerError::InvalidOutput(PlannerOutputValidationError::InvalidIntent(error))
@@ -811,6 +837,9 @@ impl CognitiveRuntime {
                     ))
                 },
             )?;
+            if selected_action.is_none() && !matches!(&proposed, crate::ProposedAction::Noop) {
+                selected_action = Some(proposed.clone());
+            }
             let result = arbiter.dispatch(proposed.clone(), port).await;
             let replay_terminal = match &result {
                 ActionResult::Rejected(crate::ActionRejection::Duplicate {
@@ -898,6 +927,7 @@ impl CognitiveRuntime {
             self.resolve_due_open_loop(&input, applied_state_updates)
                 .await?;
         }
+        record_planner_decision(&self.executive, &input, &plan, selected_action.as_ref());
         Ok(PlannedProcessingOutcome::Planned {
             observation,
             plan,
@@ -935,10 +965,12 @@ impl CognitiveRuntime {
             .scope()
             .conversation_id()
             .and_then(|conversation_id| self.state.conversation(conversation_id));
+        let executive_scope = executive_scope_for_event(&event);
         PlannerInput::new(
             event,
             PlannerStateSnapshot::new(self.state.global_version(), conversation),
         )
+        .with_executive(self.executive.snapshot_for_scope(&executive_scope))
     }
 
     /// Builds a planner input and opportunistically hydrates bounded durable
@@ -1348,11 +1380,155 @@ fn observed_without_planning(observation: RuntimeObservation) -> PlannedProcessi
     }
 }
 
+/// Append only bounded metadata that is useful for future arbitration.
+/// PlannerInput deliberately has no model-confidence field, so zero means
+/// "unknown" rather than inventing confidence from event salience or output
+/// quality. A failed record write is telemetry loss, not a runtime failure.
+fn record_planner_decision(
+    executive: &ExecutiveController,
+    input: &PlannerInput,
+    plan: &DecisionPlan,
+    materialized_action: Option<&crate::ProposedAction>,
+) {
+    let capability = &input.executive.cognitive_capability;
+    let selected_cognitive_tier = capability.current_tier;
+    let fallback_used = selected_cognitive_tier == crate::CognitiveTier::Intrinsic
+        && capability.preferred_tier.is_strong();
+    let mut record = DecisionRecord::new(input.event.id(), plan.disposition, Utc::now());
+    record.selected_action = materialized_action
+        .and_then(decision_action_kind_from_proposed_action)
+        .or_else(|| {
+            plan.intents
+                .iter()
+                .find_map(decision_action_kind_from_intent)
+        });
+    record.selected_action_id = materialized_action.and_then(crate::ProposedAction::action_id);
+    record.relevant_goals = input
+        .executive
+        .prioritized_goals
+        .iter()
+        .take(crate::MAX_SNAPSHOT_ITEMS)
+        .map(|goal| goal.goal_id)
+        .collect();
+    record.relevant_agenda_items = input
+        .mind
+        .agenda()
+        .iter()
+        .take(crate::MAX_SNAPSHOT_ITEMS)
+        .map(|item| item.id)
+        .collect();
+    record.relevant_conflicts = input
+        .executive
+        .active_conflicts
+        .iter()
+        .take(crate::MAX_SNAPSHOT_ITEMS)
+        .map(|conflict| conflict.id)
+        .collect();
+    record.selected_cognitive_tier = selected_cognitive_tier;
+    record.fallback_used = fallback_used;
+    record.intrinsic_model_version =
+        if selected_cognitive_tier == crate::CognitiveTier::Intrinsic || fallback_used {
+            capability.intrinsic_version.clone()
+        } else {
+            None
+        };
+    record.reason_tags = decision_reason_tags(input, selected_cognitive_tier, fallback_used);
+
+    let _ = executive.record_decision_for_scope(executive_scope_for_event(&input.event), record);
+}
+
+fn decision_action_kind_from_intent(intent: &crate::CognitiveIntent) -> Option<DecisionActionKind> {
+    Some(match intent {
+        crate::CognitiveIntent::SendMessage { .. } => DecisionActionKind::SendMessage,
+        crate::CognitiveIntent::ReachOut(_) => DecisionActionKind::ReachOut,
+        crate::CognitiveIntent::UseTool { .. } => DecisionActionKind::UseTool,
+        crate::CognitiveIntent::CreateOpenLoop(_) => DecisionActionKind::CreateOpenLoop,
+        crate::CognitiveIntent::ResolveOpenLoop { .. } => DecisionActionKind::ResolveOpenLoop,
+        crate::CognitiveIntent::StartGoal(_) => DecisionActionKind::StartGoal,
+        crate::CognitiveIntent::CancelGoal { .. } => DecisionActionKind::CancelGoal,
+        crate::CognitiveIntent::Noop => return None,
+    })
+}
+
+fn decision_action_kind_from_proposed_action(
+    action: &crate::ProposedAction,
+) -> Option<DecisionActionKind> {
+    Some(match action {
+        crate::ProposedAction::SendMessage(_) => DecisionActionKind::SendMessage,
+        crate::ProposedAction::ReachOut(_) => DecisionActionKind::ReachOut,
+        crate::ProposedAction::UseTool(_) => DecisionActionKind::UseTool,
+        crate::ProposedAction::CreateOpenLoop(_) => DecisionActionKind::CreateOpenLoop,
+        crate::ProposedAction::ResolveOpenLoop(_) => DecisionActionKind::ResolveOpenLoop,
+        crate::ProposedAction::StartGoal(_) => DecisionActionKind::StartGoal,
+        crate::ProposedAction::CancelGoal(_) => DecisionActionKind::CancelGoal,
+        crate::ProposedAction::Noop => return None,
+    })
+}
+
+fn decision_reason_tags(
+    input: &PlannerInput,
+    selected_cognitive_tier: crate::CognitiveTier,
+    fallback_used: bool,
+) -> Vec<ExecutiveReasonTag> {
+    let capability = &input.executive.cognitive_capability;
+    let mut tags = Vec::new();
+    let mut add = |tag| {
+        if !tags.contains(&tag) && tags.len() < crate::MAX_REASON_TAGS {
+            tags.push(tag);
+        }
+    };
+
+    if !capability.strong_available {
+        add(ExecutiveReasonTag::StrongModelUnavailable);
+    }
+    if !capability.intrinsic_health.can_serve() {
+        add(ExecutiveReasonTag::IntrinsicModelUnavailable);
+    }
+    if selected_cognitive_tier == crate::CognitiveTier::Intrinsic {
+        add(ExecutiveReasonTag::CognitiveTierIntrinsic);
+    }
+    if selected_cognitive_tier == crate::CognitiveTier::Reflex {
+        add(ExecutiveReasonTag::ReflexOnly);
+    }
+    if selected_cognitive_tier < capability.preferred_tier {
+        add(ExecutiveReasonTag::CognitiveTierDowngraded);
+    }
+    if fallback_used {
+        add(ExecutiveReasonTag::IntrinsicFallbackUsed);
+    }
+    if !input.executive.active_conflicts.is_empty() {
+        add(ExecutiveReasonTag::ConflictHigh);
+    }
+    if !input.executive.pending_expectations.is_empty() {
+        add(ExecutiveReasonTag::ExpectationPending);
+    }
+    if input
+        .executive
+        .active_plan
+        .as_ref()
+        .is_some_and(|plan| plan.stale_reason.is_some())
+    {
+        add(ExecutiveReasonTag::PlanStale);
+    }
+    tags
+}
+
 fn event_person_id(event: &WorldEvent) -> Option<PersonId> {
     match event.kind() {
         crate::WorldEventKind::MessageReceived(message) => Some(message.sender),
         crate::WorldEventKind::InteractionCuesObserved(cues) => Some(cues.person_id),
         _ => None,
+    }
+}
+
+fn executive_scope_for_event(event: &WorldEvent) -> ExecutiveScope {
+    match event.scope() {
+        EventScope::Global => ExecutiveScope::Global,
+        EventScope::Conversation { conversation_id } => {
+            ExecutiveScope::Conversation { conversation_id }
+        }
+        EventScope::Person { person_id } => ExecutiveScope::Person { person_id },
+        EventScope::Goal { goal_id } => ExecutiveScope::Goal { goal_id },
     }
 }
 
@@ -1816,6 +1992,7 @@ mod tests {
         AffectStore, AffectStoreFuture, CoreServices, GoalStore, GoalStoreFuture, MemoryStore,
         MemoryStoreFuture, OpenLoopStore, OpenLoopStoreFuture, RelationStore, RelationStoreFuture,
     };
+    use crate::{DecisionActionKind, ExecutiveScope};
     use chrono::Utc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -2733,17 +2910,25 @@ mod tests {
         }
         assert_eq!(calls.load(Ordering::SeqCst), 0);
 
+        let planned_event = WorldEvent::new(
+            Utc::now(),
+            EventScope::Global,
+            EventPriority::High,
+            WorldEventKind::HostStarted,
+        );
+        let planned_event_id = planned_event.id();
         runtime
-            .process_event_with_planner(WorldEvent::new(
-                Utc::now(),
-                EventScope::Global,
-                EventPriority::High,
-                WorldEventKind::HostStarted,
-            ))
+            .process_event_with_planner(planned_event)
             .await
             .expect("attended event should plan");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(runtime.state().global_version(), 3);
+        let records = runtime.executive().snapshot().recent_decisions;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].event_id, planned_event_id);
+        assert_eq!(records[0].disposition, DecisionDisposition::Silent);
+        assert_eq!(records[0].selected_action, None);
+        assert_eq!(records[0].selected_action_id, None);
     }
 
     #[tokio::test]
@@ -2762,6 +2947,13 @@ mod tests {
             .process_event_with_planner_and_actions(event, &arbiter, &FakeActionPort)
             .await
             .expect("planner and action dispatch should succeed");
+        let action_id = match &output {
+            PlannedProcessingOutcome::Planned { actions, .. } => match actions.first() {
+                Some(ActionResult::Executed { receipt, .. }) => receipt.action_id,
+                _ => None,
+            },
+            _ => None,
+        };
         assert!(matches!(
             output,
             PlannedProcessingOutcome::Planned {
@@ -2771,6 +2963,17 @@ mod tests {
             } if actions.len() == 1 && feedback.len() == 1
         ));
         assert_eq!(runtime.state().global_version(), 2);
+        let records = runtime
+            .executive()
+            .snapshot_for_scope(&ExecutiveScope::Conversation { conversation_id })
+            .recent_decisions;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].disposition, DecisionDisposition::Reply);
+        assert_eq!(
+            records[0].selected_action,
+            Some(DecisionActionKind::SendMessage)
+        );
+        assert_eq!(records[0].selected_action_id, action_id);
     }
 
     #[tokio::test]

@@ -97,6 +97,20 @@ impl ReplyPlan {
         }
     }
 
+    /// Intrinsic produces one bounded conversational turn. Keep the normal
+    /// parser for sanitization, but collapse legacy separators into the one
+    /// logical message sent by the Core action port.
+    pub(crate) async fn from_intrinsic_output(scope: ReplyScope, content: &str) -> Self {
+        let mut plan = Self::from_model_output(scope, content).await;
+        if plan.is_silent() || plan.bubbles.is_empty() {
+            return plan;
+        }
+        let content = plan.bubbles.join("\n");
+        plan.content = content.clone();
+        plan.bubbles = vec![content];
+        plan
+    }
+
     pub(crate) fn is_silent(&self) -> bool {
         self.disposition.is_silent()
     }
@@ -471,6 +485,21 @@ mod tests {
                 assert_eq!(plan.bubbles, vec!["第一条", "第二条"]);
                 assert_eq!(plan.content, "第一条\n第二条");
                 assert!(plan.has_visible_reply());
+            });
+    }
+
+    #[test]
+    fn intrinsic_output_is_always_one_logical_bubble() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let plan = ReplyPlan::from_intrinsic_output(
+                    ReplyScope::Private(9_100_010),
+                    "第一段 [[NEXT_MESSAGE]] 第二段",
+                )
+                .await;
+                assert_eq!(plan.bubbles, vec!["第一段\n第二段"]);
+                assert_eq!(plan.content, "第一段\n第二段");
             });
     }
 

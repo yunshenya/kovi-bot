@@ -24,10 +24,6 @@ pub struct GroupInterjectionConfig {
     decision_rate_limit: usize,
     /// 未点名接话单次允许生成的最大 token 数。
     interjection_max_output_tokens: u32,
-    /// 机器人成功接话后，允许无称呼继续对话的滚动窗口（秒）；每条有效接话都会续期。
-    conversation_window_secs: u64,
-    /// 机器人刚发言后，允许新成员自然接话并加入窗口的时间（秒）。
-    conversation_open_floor_secs: u64,
     /// 连续刷屏后暂停处理该成员直接点名的时间（秒）。
     direct_spam_cooldown_secs: u64,
     /// 高频点名计数窗口（秒）。
@@ -81,14 +77,6 @@ impl GroupInterjectionConfig {
         self.interjection_max_output_tokens
     }
 
-    pub fn conversation_window_secs(&self) -> u64 {
-        self.conversation_window_secs
-    }
-
-    pub fn conversation_open_floor_secs(&self) -> u64 {
-        self.conversation_open_floor_secs
-    }
-
     pub fn direct_spam_cooldown_secs(&self) -> u64 {
         self.direct_spam_cooldown_secs
     }
@@ -137,9 +125,6 @@ impl GroupInterjectionConfig {
         {
             return Err(anyhow::anyhow!("群聊未点名判断额度必须大于0"));
         }
-        if self.conversation_window_secs == 0 || self.conversation_open_floor_secs == 0 {
-            return Err(anyhow::anyhow!("群聊接话对话窗口必须大于0秒"));
-        }
         if self.direct_spam_cooldown_secs == 0 || self.direct_rate_window_secs == 0 {
             return Err(anyhow::anyhow!("群聊防刷时间配置必须大于0秒"));
         }
@@ -169,8 +154,6 @@ impl Default for GroupInterjectionConfig {
             decision_rate_window_secs: 600,
             decision_rate_limit: 3,
             interjection_max_output_tokens: 240,
-            conversation_window_secs: 180,
-            conversation_open_floor_secs: 45,
             direct_spam_cooldown_secs: 600,
             direct_rate_window_secs: 60,
             direct_rate_limit: 4,

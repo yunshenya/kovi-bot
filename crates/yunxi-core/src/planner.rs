@@ -7,6 +7,7 @@
 use crate::arbiter::ActionCapability;
 use crate::arbiter::ActionDescriptor;
 use crate::event::{MessageReceivedEvent, WorldEvent};
+use crate::executive::ExecutiveSnapshot;
 use crate::goal::Goal;
 use crate::identity::{ConversationId, ConversationKind, OpenLoopId, PersonId};
 use crate::intent::{CognitiveIntent, IntentValidationError};
@@ -532,6 +533,10 @@ pub struct PlannerInput {
     /// deserialize to an empty snapshot and preserve their original behavior.
     #[serde(default)]
     pub mind: MindSnapshot,
+    /// Bounded Executive context. This is additive so V1/V2 hosts can keep
+    /// deserializing old planner inputs without manufacturing executive data.
+    #[serde(default)]
+    pub executive: ExecutiveSnapshot,
 }
 
 impl PlannerInput {
@@ -547,6 +552,7 @@ impl PlannerInput {
             affect: AffectState::default(),
             capabilities: Vec::new(),
             mind: MindSnapshot::empty(),
+            executive: ExecutiveSnapshot::default(),
         }
     }
 
@@ -592,6 +598,12 @@ impl PlannerInput {
         self
     }
 
+    #[must_use]
+    pub fn with_executive(mut self, executive: ExecutiveSnapshot) -> Self {
+        self.executive = executive;
+        self
+    }
+
     pub fn validate(&self, max_trace_depth: u8) -> Result<(), PlannerInputValidationError> {
         self.event
             .validate(max_trace_depth)
@@ -619,6 +631,9 @@ impl PlannerInput {
             relation.validate()?;
         }
         self.mind.validate()?;
+        self.executive
+            .validate()
+            .map_err(|reason| PlannerInputValidationError::InvalidExecutive(reason.to_owned()))?;
         Ok(())
     }
 
@@ -901,6 +916,8 @@ pub enum PlannerInputValidationError {
     RelationOutOfRange,
     #[error("mind snapshot is invalid: {0}")]
     InvalidMind(#[from] MindValidationError),
+    #[error("executive snapshot is invalid: {0}")]
+    InvalidExecutive(String),
 }
 
 #[derive(Debug, Error)]

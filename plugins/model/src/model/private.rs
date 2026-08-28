@@ -143,6 +143,16 @@ pub(crate) async fn private_message_event_after_ingress(
         send_tracked_private_message(&bot, user_id, report).await;
         return;
     }
+    if message.trim() == "#intrinsic-status" && sender_is_admin {
+        let report = crate::yunxi::intrinsic_status_report();
+        send_tracked_private_message(&bot, user_id, report).await;
+        return;
+    }
+    if message.trim() == "#executive-status" && sender_is_admin {
+        let report = crate::yunxi::executive_status_report();
+        send_tracked_private_message(&bot, user_id, report).await;
+        return;
+    }
     if is_group_admin_command(message) {
         println!(
             "[INFO] 私聊群聊专用命令已忽略 (用户: {}, 命令: {})",
@@ -449,8 +459,13 @@ pub(crate) async fn private_message_event_after_ingress(
         mut images,
         source_message_ids,
     ) = if !message.trim_start().starts_with('#') {
+        let completion = if let Some(runtime) = crate::yunxi::intrinsic_runtime::get() {
+            runtime.classify_input_completion(&text_message).await
+        } else {
+            yunxi_core::InputCompletion::Incomplete
+        };
         let Some(combined) = PRIVATE_MESSAGE_BATCHES
-            .push(
+            .push_with_completion(
                 user_id,
                 MessagePart {
                     text: model_message,
@@ -462,6 +477,7 @@ pub(crate) async fn private_message_event_after_ingress(
                     images,
                     message_ids: vec![event.message_id],
                 },
+                completion,
             )
             .await
         else {
@@ -505,7 +521,8 @@ pub(crate) async fn private_message_event_after_ingress(
         explicit_vision_command: batch_vision_requested,
         pending_image_request: false,
         addressed_to_bot: false,
-        conversation_open: is_active(reply_scope).await,
+        conversation_active: is_active(reply_scope).await,
+        conversation_context: String::new(),
         sticker_reaction: batch_sticker_reaction,
     };
     let understanding = if intent_text.trim_start().starts_with('#') {

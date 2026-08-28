@@ -40,7 +40,8 @@ pub(crate) struct UnderstandingRequest {
     pub(crate) explicit_vision_command: bool,
     pub(crate) pending_image_request: bool,
     pub(crate) addressed_to_bot: bool,
-    pub(crate) conversation_open: bool,
+    pub(crate) conversation_active: bool,
+    pub(crate) conversation_context: String,
     pub(crate) sticker_reaction: bool,
 }
 
@@ -56,7 +57,8 @@ impl UnderstandingRequest {
             explicit_vision_command: false,
             pending_image_request: false,
             addressed_to_bot: false,
-            conversation_open: false,
+            conversation_active: false,
+            conversation_context: String::new(),
             sticker_reaction: false,
         }
     }
@@ -74,6 +76,8 @@ pub(crate) struct MessageUnderstanding {
     pub(crate) image_intent: SemanticImageIntent,
     pub(crate) image_reference: ImageReferenceIntent,
     pub(crate) conversation_relevant: bool,
+    pub(crate) conversation_end: bool,
+    pub(crate) topic_shift: bool,
     pub(crate) interjection_worthy: bool,
     pub(crate) gratitude: bool,
     pub(crate) interests: Vec<String>,
@@ -95,6 +99,8 @@ impl Default for MessageUnderstanding {
             image_intent: SemanticImageIntent::Social,
             image_reference: ImageReferenceIntent::None,
             conversation_relevant: false,
+            conversation_end: false,
+            topic_shift: false,
             interjection_worthy: false,
             gratitude: false,
             interests: Vec::new(),
@@ -206,6 +212,8 @@ struct RawUnderstanding {
     image_intent: String,
     image_reference: String,
     conversation_relevant: bool,
+    conversation_end: bool,
+    topic_shift: bool,
     interjection_worthy: bool,
     gratitude: bool,
     interests: Vec<String>,
@@ -235,6 +243,8 @@ pub(crate) async fn understand(request: UnderstandingRequest) -> MessageUndersta
   "image_intent": "social|conversational|understand",
   "image_reference": "none|recent|described",
   "conversation_relevant": false,
+  "conversation_end": false,
+  "topic_shift": false,
   "interjection_worthy": false,
   "gratitude": false,
   "interests": [],
@@ -252,7 +262,9 @@ pub(crate) async fn understand(request: UnderstandingRequest) -> MessageUndersta
 - image_reference：当前文字是否在回指之前发过的图片。recent 表示“那张图/刚才的截图”等泛指，described 表示“有猫的那张/带红色按钮的截图”等按内容寻找；没有回指时填 none。
   当前消息已直接附图或明确引用图片时，优先理解当前图片；只有没有当前图片时，才按历史图片指代寻找。
   在确有近期图片时，“我说的是穿红衣服那个”这类省略了“图片”二字的表达，也可以是 described。
-- conversation_relevant：在已有对话窗口中，这条消息是否自然地接着当前话题。
+- conversation_relevant：在已有连续会话中，这条消息是否自然地接着当前话题。不要因为距离上次发言较久就判为无关。
+- conversation_end：用户是否明确结束当前聊天线程，例如明确说先聊到这里、不要再接着聊；普通一句话说完、谢谢或换行不自动算结束。
+- topic_shift：当前消息是否明确开启了独立的新主题；新主题可以作为一轮新的聊天继续，但不要因此把普通的补充说明判成换题。
 - interjection_worthy：没有被点名时，是否有自然、具体、能增加交流价值的接话空间。
 - sticker_reaction：如果为 true，这是一条紧跟芸汐发言的表情回应；不要把它当成无内容消息，结合上一条芸汐消息判断是否自然接住。
 - interests、personality_traits、topics：只有从整体语义中有足够把握时才填写，最多各 6 项。
@@ -285,7 +297,8 @@ fn build_prompt(request: &UnderstandingRequest) -> String {
         "explicit_vision_command": request.explicit_vision_command,
         "pending_image_request": request.pending_image_request,
         "addressed_to_bot": request.addressed_to_bot,
-        "conversation_open": request.conversation_open,
+        "conversation_active": request.conversation_active,
+        "conversation_context": truncate(&request.conversation_context, MAX_CONTEXT_CHARS / 4),
         "sticker_reaction": request.sticker_reaction,
     });
     format!(
@@ -314,6 +327,8 @@ fn parse_understanding(content: &str, request: &UnderstandingRequest) -> Message
         image_intent: normalize_image_intent(&raw.image_intent),
         image_reference: normalize_image_reference(&raw.image_reference),
         conversation_relevant: raw.conversation_relevant,
+        conversation_end: raw.conversation_end,
+        topic_shift: raw.topic_shift,
         interjection_worthy: raw.interjection_worthy,
         gratitude: raw.gratitude,
         interests: normalize_list(raw.interests),

@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::hash::Hash;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use yunxi_core::InputCompletion;
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct TextBatch {
@@ -43,6 +44,7 @@ struct PendingBatch {
     message_ids: Vec<i32>,
     started_at: Instant,
     updated_at: Instant,
+    completion: Option<InputCompletion>,
 }
 
 #[derive(Debug)]
@@ -63,6 +65,7 @@ impl Default for PendingBatch {
             message_ids: Vec::new(),
             started_at: Instant::now(),
             updated_at: Instant::now(),
+            completion: None,
         }
     }
 }
@@ -126,8 +129,16 @@ impl<K> MessageCoalescer<K>
 where
     K: Copy + Eq + Hash,
 {
-    pub(crate) async fn push(&self, key: K, part: MessagePart) -> Option<TextBatch> {
-        self.push_with_policy(key, part, BatchPolicy::from_config())
+    /// Use the model-backed completion result at production ingress. Complete
+    /// turns flush immediately; incomplete turns wait for another message and
+    /// use only `max_wait` as a liveness watchdog.
+    pub(crate) async fn push_with_completion(
+        &self,
+        key: K,
+        part: MessagePart,
+        completion: InputCompletion,
+    ) -> Option<TextBatch> {
+        self.push_with_completion_policy(key, part, completion, BatchPolicy::from_config())
             .await
     }
 
@@ -139,7 +150,7 @@ where
         policy: BatchPolicy,
         hook: Arc<BatchPushHook>,
     ) -> Option<TextBatch> {
-        self.push_with_policy_internal(key, part, policy, Some(hook))
+        self.push_with_policy_internal(key, part, policy, Some(hook), None)
             .await
     }
 
@@ -151,13 +162,25 @@ where
         self.pending.lock().await.retain(|key, _| !predicate(key));
     }
 
+    #[cfg(test)]
     async fn push_with_policy(
         &self,
         key: K,
         part: MessagePart,
         policy: BatchPolicy,
     ) -> Option<TextBatch> {
-        self.push_with_policy_internal(key, part, policy, None)
+        self.push_with_policy_internal(key, part, policy, None, None)
+            .await
+    }
+
+    async fn push_with_completion_policy(
+        &self,
+        key: K,
+        part: MessagePart,
+        completion: InputCompletion,
+        policy: BatchPolicy,
+    ) -> Option<TextBatch> {
+        self.push_with_policy_internal(key, part, policy, None, Some(completion))
             .await
     }
 
@@ -167,6 +190,7 @@ where
         mut part: MessagePart,
         policy: BatchPolicy,
         hook: Option<Arc<BatchPushHook>>,
+        semantic_completion: Option<InputCompletion>,
     ) -> Option<TextBatch> {
         part.text = truncate_chars(&part.text, policy.max_input_chars);
         part.intent_text = truncate_chars(&part.intent_text, policy.max_input_chars);
@@ -198,6 +222,7 @@ where
                 batch.started_at = now;
             }
             batch.identity = Arc::clone(&identity);
+            batch.completion = semantic_completion;
             let remaining = policy.max_input_chars.saturating_sub(batch.char_count);
             let bounded_text = truncate_chars(&part.text, remaining.max(1));
             let bounded_intent = truncate_chars(&part.intent_text, policy.max_input_chars);
@@ -224,6 +249,12 @@ where
             let remaining = policy.max_wait.saturating_sub(batch.started_at.elapsed());
             // 图片常常先发、文字问题随后补发；给首个纯图片批次完整窗口，避免过早启动模型请求。
             let semantic_delay = if batch.parts.len() == 1 && image_only_part {
+                policy.max_wait
+            } else if matches!(batch.completion, Some(InputCompletion::Complete)) {
+                Duration::ZERO
+            } else if matches!(batch.completion, Some(InputCompletion::Incomplete)) {
+                // Wait for a follow-up ingress. max_wait is only a watchdog
+                // for a client that never sends the rest of its thought.
                 policy.max_wait
             } else {
                 adaptive_delay(

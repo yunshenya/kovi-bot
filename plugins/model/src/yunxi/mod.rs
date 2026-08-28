@@ -4,8 +4,10 @@ pub(crate) mod core_model;
 pub(crate) mod delivery;
 mod delivery_ledger;
 pub(crate) mod events;
+mod executive_store;
 mod goal_store;
 mod identity_store;
+pub(crate) mod intrinsic_runtime;
 pub(crate) mod memory_migration;
 mod memory_store;
 mod mind_runtime;
@@ -21,9 +23,10 @@ mod schema;
 use affect_store::PostgresAffectStore;
 use anyhow::{Context, Result};
 use delivery_ledger::PostgresDeliveryLedger;
+use executive_store::PostgresExecutiveStore;
 use goal_store::PostgresGoalStore;
 use identity_store::PostgresIdentityStore;
-use kovi::tokio::sync::{RwLock as AsyncRwLock, RwLockReadGuard};
+use kovi::tokio::sync::{Mutex as AsyncMutex, Notify, RwLock as AsyncRwLock, RwLockReadGuard};
 use memory_store::PostgresMemoryStore;
 use mind_runtime::{
     MindCandidateContext, MindCandidates, MindContextServices, MindDeliveryPermit,
@@ -33,12 +36,21 @@ pub(crate) use mind_runtime::{MindProactiveReference, MindProactiveSignals};
 use mind_store::PostgresMindStore;
 use open_loop_store::PostgresOpenLoopStore;
 use relation_store::PostgresRelationStore;
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{
+    Arc, OnceLock, RwLock,
+    atomic::{AtomicBool, Ordering},
+};
+use std::time::Duration;
 use yunxi_core::{
     AffectState, ConversationId, IdentityStore, MindDataErasure, PersonId, RelationState,
 };
 
 const MIND_ERASURE_MAX_ATTEMPTS: usize = 3;
+const EXECUTIVE_SAVE_TIMEOUT: Duration = Duration::from_secs(2);
+const EXECUTIVE_ERASURE_TIMEOUT: Duration = Duration::from_secs(5);
+const EXECUTIVE_ERASURE_MAX_ATTEMPTS: usize = 3;
+const EXECUTIVE_ERASURE_RETRY_DELAY: Duration = Duration::from_millis(250);
+const EXECUTIVE_SAVE_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 static IDENTITY_STORE: OnceLock<Arc<PostgresIdentityStore>> = OnceLock::new();
 static OPEN_LOOP_STORE: OnceLock<Arc<PostgresOpenLoopStore>> = OnceLock::new();
@@ -49,7 +61,14 @@ static GOAL_STORE: OnceLock<Arc<PostgresGoalStore>> = OnceLock::new();
 static DELIVERY_LEDGER: OnceLock<Arc<PostgresDeliveryLedger>> = OnceLock::new();
 static MIND_STORE: OnceLock<Arc<PostgresMindStore>> = OnceLock::new();
 static MIND_RUNTIME: OnceLock<Arc<MindRuntime>> = OnceLock::new();
+static EXECUTIVE_STORE: OnceLock<Arc<PostgresExecutiveStore>> = OnceLock::new();
+static EXECUTIVE_BOOTSTRAP: OnceLock<Option<yunxi_core::ExecutiveSnapshot>> = OnceLock::new();
+static EXECUTIVE_SAVE_LOCK: OnceLock<Arc<AsyncMutex<()>>> = OnceLock::new();
+static EXECUTIVE_SAVE_STATE: OnceLock<Arc<AsyncMutex<ExecutiveSaveState>>> = OnceLock::new();
+static EXECUTIVE_SAVE_WORKER: OnceLock<Arc<ExecutiveSaveWorker>> = OnceLock::new();
+static EXECUTIVE_SAVE_WORKER_STARTED: AtomicBool = AtomicBool::new(false);
 static CORE_BRIDGE: OnceLock<Arc<bridge::CoreBridge>> = OnceLock::new();
+static EXECUTIVE_CONTROLLER: OnceLock<yunxi_core::ExecutiveController> = OnceLock::new();
 static DELIVERY_ROUTE_LOCK: AsyncRwLock<()> = AsyncRwLock::const_new(());
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OwnerQqRoute {
@@ -59,6 +78,19 @@ enum OwnerQqRoute {
 }
 
 static OWNER_QQ_ROUTE: OnceLock<RwLock<OwnerQqRoute>> = OnceLock::new();
+
+struct ExecutiveSaveWorker {
+    notify: Notify,
+}
+
+#[derive(Debug, Default)]
+struct ExecutiveSaveState {
+    dirty: bool,
+    requested_version: u64,
+    erasure_epoch: u64,
+    erasure_blocked: bool,
+    erasure_start_version: u64,
+}
 
 #[must_use]
 pub(crate) struct CanonicalOwnerRouteGuard {
@@ -85,6 +117,8 @@ pub(crate) async fn initialize_database() -> Result<()> {
         && DELIVERY_LEDGER.get().is_some()
         && MIND_STORE.get().is_some()
         && MIND_RUNTIME.get().is_some()
+        && EXECUTIVE_STORE.get().is_some()
+        && EXECUTIVE_BOOTSTRAP.get().is_some()
     {
         return Ok(());
     }
@@ -138,7 +172,7 @@ pub(crate) async fn initialize_database() -> Result<()> {
         let _ = GOAL_STORE.set(store);
     }
     if MIND_STORE.get().is_none() {
-        let store = Arc::new(PostgresMindStore::new(pool));
+        let store = Arc::new(PostgresMindStore::new(pool.clone()));
         store.initialize_schema().await?;
         store.seed_self_model_if_absent().await?;
         let _ = MIND_STORE.set(store);
@@ -165,6 +199,22 @@ pub(crate) async fn initialize_database() -> Result<()> {
                 .with_context_services(MindContextServices::new(memory, open_loops, goals)),
         );
         let _ = MIND_RUNTIME.set(runtime);
+    }
+    if EXECUTIVE_STORE.get().is_none() {
+        let store = Arc::new(PostgresExecutiveStore::new(pool));
+        store.initialize_schema().await?;
+        let bootstrap = match store.load_bootstrap().await {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                // A malformed or temporarily unreadable Executive row must
+                // never prevent deterministic Core, Reminder, or erasure
+                // startup. The next bounded turn can write a fresh snapshot.
+                kovi::log::warn!("Yunxi Executive bootstrap was discarded: {error}");
+                None
+            }
+        };
+        let _ = EXECUTIVE_STORE.set(store);
+        let _ = EXECUTIVE_BOOTSTRAP.set(bootstrap);
     }
     Ok(())
 }
@@ -332,6 +382,317 @@ pub(crate) fn mind_runtime() -> Option<Arc<MindRuntime>> {
     MIND_RUNTIME.get().cloned()
 }
 
+pub(crate) fn executive_store() -> Option<Arc<PostgresExecutiveStore>> {
+    EXECUTIVE_STORE.get().cloned()
+}
+
+pub(crate) fn executive_bootstrap_snapshot() -> Option<yunxi_core::ExecutiveSnapshot> {
+    EXECUTIVE_BOOTSTRAP.get().and_then(Clone::clone)
+}
+
+/// Request persistence of the latest bounded Executive state.
+///
+/// The request is deliberately coalesced. A turn must not wait behind a
+/// database round trip, and a busy runtime must not create one Tokio task per
+/// event. The single worker below snapshots the controller only after taking
+/// the shared operation lock, then checks the version again after the write.
+pub(crate) async fn persist_executive_snapshot() -> Result<()> {
+    if EXECUTIVE_STORE.get().is_none() {
+        return Ok(());
+    }
+    let Some(controller) = EXECUTIVE_CONTROLLER.get() else {
+        return Ok(());
+    };
+    let state = executive_save_state();
+    let mut state = state.lock().await;
+    let version = controller.version();
+    state.requested_version = state.requested_version.max(version);
+    state.dirty = true;
+    if state.erasure_blocked {
+        return Err(anyhow::anyhow!(
+            "Yunxi Executive persistence is blocked by an incomplete data erasure"
+        ));
+    }
+    drop(state);
+    wake_executive_save_worker();
+    Ok(())
+}
+
+fn executive_save_state() -> Arc<AsyncMutex<ExecutiveSaveState>> {
+    EXECUTIVE_SAVE_STATE
+        .get_or_init(|| Arc::new(AsyncMutex::new(ExecutiveSaveState::default())))
+        .clone()
+}
+
+fn wake_executive_save_worker() {
+    let worker = EXECUTIVE_SAVE_WORKER
+        .get_or_init(|| {
+            Arc::new(ExecutiveSaveWorker {
+                notify: Notify::new(),
+            })
+        })
+        .clone();
+    if !EXECUTIVE_SAVE_WORKER_STARTED.swap(true, Ordering::AcqRel) {
+        let worker_for_task = Arc::clone(&worker);
+        kovi::tokio::spawn(async move {
+            executive_save_worker(worker_for_task).await;
+        });
+    }
+    worker.notify.notify_one();
+}
+
+async fn executive_save_worker(worker: Arc<ExecutiveSaveWorker>) {
+    loop {
+        worker.notify.notified().await;
+        loop {
+            let Some(store) = EXECUTIVE_STORE.get().cloned() else {
+                break;
+            };
+            let Some(controller) = EXECUTIVE_CONTROLLER.get().cloned() else {
+                break;
+            };
+            let save_lock = EXECUTIVE_SAVE_LOCK
+                .get_or_init(|| Arc::new(AsyncMutex::new(())))
+                .clone();
+            let operation_guard = save_lock.lock().await;
+            let state_lock = executive_save_state();
+            let mut state = state_lock.lock().await;
+            if !state.dirty || state.erasure_blocked {
+                drop(operation_guard);
+                break;
+            }
+            let epoch = state.erasure_epoch;
+            let snapshot = controller.snapshot();
+            let saved_version = snapshot.version;
+            state.dirty = false;
+            let requested_version = state.requested_version;
+            drop(state);
+            let result = kovi::tokio::time::timeout(
+                EXECUTIVE_SAVE_TIMEOUT,
+                store.save_runtime_snapshot(&snapshot),
+            )
+            .await;
+            let current_version = controller.version();
+            let mut state = state_lock.lock().await;
+            let epoch_changed = epoch != state.erasure_epoch;
+            let blocked = state.erasure_blocked;
+            drop(operation_guard);
+
+            match result {
+                Ok(Ok(())) if !epoch_changed && !blocked => {
+                    if state.dirty
+                        || current_version > saved_version
+                        || requested_version > saved_version
+                    {
+                        state.dirty = true;
+                        state.requested_version = state.requested_version.max(current_version);
+                    } else {
+                        state.requested_version = saved_version;
+                    }
+                }
+                Ok(Ok(())) => {
+                    // An erasure cannot normally change the epoch while the
+                    // operation lock is held. If a future alternate path does
+                    // so, preserve any newer request/version and never mark
+                    // the stale snapshot as the latest durable state.
+                    if state.dirty || current_version > saved_version {
+                        state.dirty = true;
+                        state.requested_version = state.requested_version.max(current_version);
+                    } else {
+                        state.requested_version = 0;
+                    }
+                }
+                Ok(Err(error)) => {
+                    state.dirty = true;
+                    state.requested_version = state.requested_version.max(current_version);
+                    kovi::log::warn!("Yunxi Executive persistence failed: {error}");
+                    drop(state);
+                    wait_for_executive_save_retry(&worker).await;
+                    continue;
+                }
+                Err(_) => {
+                    state.dirty = true;
+                    state.requested_version = state.requested_version.max(current_version);
+                    kovi::log::warn!(
+                        "Yunxi Executive persistence exceeded {:?}; latest state remains dirty",
+                        EXECUTIVE_SAVE_TIMEOUT
+                    );
+                    drop(state);
+                    wait_for_executive_save_retry(&worker).await;
+                    continue;
+                }
+            }
+            drop(state);
+        }
+    }
+}
+
+async fn wait_for_executive_save_retry(worker: &ExecutiveSaveWorker) {
+    kovi::tokio::select! {
+        _ = kovi::tokio::time::sleep(EXECUTIVE_SAVE_RETRY_DELAY) => {}
+        _ = worker.notify.notified() => {}
+    }
+}
+
+/// Erase Executive state through an explicitly selected store. Production
+/// callers and isolated integration tests use the same bounded barrier while
+/// supplying the store explicitly.
+pub(crate) async fn erase_executive_scopes_with_store(
+    scopes: &[yunxi_core::ExecutiveScope],
+    require_store: bool,
+    store: Option<&PostgresExecutiveStore>,
+) -> Result<usize> {
+    let mut ordered = scopes
+        .iter()
+        .map(|scope| {
+            executive_store::scope_key(scope)
+                .map(|key| (key, scope.clone()))
+                .map_err(anyhow::Error::from)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    ordered.sort_by(|left, right| left.0.cmp(&right.0));
+    ordered.dedup_by(|left, right| left.0 == right.0);
+    if ordered.is_empty() {
+        return Ok(0);
+    }
+
+    let save_lock = EXECUTIVE_SAVE_LOCK
+        .get_or_init(|| Arc::new(AsyncMutex::new(())))
+        .clone();
+    let _operation_guard = save_lock.lock().await;
+    let state_lock = executive_save_state();
+    let mut state = state_lock.lock().await;
+    let was_blocked = state.erasure_blocked;
+    state.erasure_blocked = true;
+    if !was_blocked {
+        state.erasure_epoch = state.erasure_epoch.saturating_add(1);
+        state.erasure_start_version = EXECUTIVE_CONTROLLER
+            .get()
+            .map_or(0, yunxi_core::ExecutiveController::version);
+        // Any request made before this barrier belongs to the state that is
+        // about to be erased. Requests arriving while blocked are retained.
+        state.dirty = false;
+        state.requested_version = 0;
+    }
+    drop(state);
+
+    let result = async {
+        let mut last_error = None;
+        for attempt in 1..=EXECUTIVE_ERASURE_MAX_ATTEMPTS {
+            match erase_executive_scopes_once(&ordered, require_store, store).await {
+                Ok(removed) => return Ok(removed),
+                Err(error) => {
+                    kovi::log::warn!(
+                        "Yunxi Executive scope erasure attempt {attempt}/{} failed: {error}",
+                        EXECUTIVE_ERASURE_MAX_ATTEMPTS
+                    );
+                    last_error = Some(error);
+                    if attempt < EXECUTIVE_ERASURE_MAX_ATTEMPTS {
+                        kovi::tokio::time::sleep(
+                            EXECUTIVE_ERASURE_RETRY_DELAY.saturating_mul(attempt as u32),
+                        )
+                        .await;
+                    }
+                }
+            }
+        }
+        Err(last_error.expect("bounded Executive erasure loop always records a failed attempt"))
+    }
+    .await;
+
+    match result {
+        Ok(removed) => {
+            let cleared_version = if ordered
+                .iter()
+                .any(|(_, scope)| matches!(scope, yunxi_core::ExecutiveScope::Global))
+            {
+                if let Some(controller) = EXECUTIVE_CONTROLLER.get() {
+                    controller.clear_for_scope_data_erasure(&yunxi_core::ExecutiveScope::Global);
+                    Some(controller.version())
+                } else {
+                    None
+                }
+            } else {
+                if let Some(controller) = EXECUTIVE_CONTROLLER.get() {
+                    for (_, scope) in &ordered {
+                        controller.clear_for_scope_data_erasure(scope);
+                    }
+                }
+                None
+            };
+            let current_version = EXECUTIVE_CONTROLLER
+                .get()
+                .map_or(0, yunxi_core::ExecutiveController::version);
+            let mut state = state_lock.lock().await;
+            let wake = finish_executive_erasure_state(&mut state, current_version, cleared_version);
+            drop(state);
+            if wake {
+                wake_executive_save_worker();
+            }
+            Ok(removed)
+        }
+        Err(error) => {
+            // Keep the block and epoch active. A later retry must acquire this
+            // same lock and complete successfully before any save is allowed.
+            Err(error)
+        }
+    }
+}
+
+/// Release a successful erase barrier without losing state that was produced
+/// after the barrier began. `cleared_version` is the post-reset baseline for a
+/// global erase; scoped erasures compare against the version at barrier start.
+fn finish_executive_erasure_state(
+    state: &mut ExecutiveSaveState,
+    current_version: u64,
+    cleared_version: Option<u64>,
+) -> bool {
+    let baseline = cleared_version.unwrap_or(state.erasure_start_version);
+    let changed_after_barrier = current_version > baseline;
+    let needs_save = state.dirty || changed_after_barrier;
+    state.erasure_blocked = false;
+    state.erasure_start_version = 0;
+    state.dirty = needs_save;
+    if needs_save {
+        state.requested_version = state.requested_version.max(current_version);
+    } else {
+        state.requested_version = 0;
+    }
+    needs_save
+}
+
+async fn erase_executive_scopes_once(
+    ordered: &[(String, yunxi_core::ExecutiveScope)],
+    require_store: bool,
+    store: Option<&PostgresExecutiveStore>,
+) -> Result<usize> {
+    let mut removed = 0_usize;
+    if let Some(store) = store {
+        for (_, scope) in ordered {
+            let count = kovi::tokio::time::timeout(
+                EXECUTIVE_ERASURE_TIMEOUT,
+                store.erase_scope_data(scope),
+            )
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "Yunxi Executive scope erasure exceeded {:?}",
+                    EXECUTIVE_ERASURE_TIMEOUT
+                )
+            })?
+            .map_err(anyhow::Error::from)?;
+            removed = removed
+                .checked_add(count)
+                .ok_or_else(|| anyhow::anyhow!("Yunxi Executive erased row count overflow"))?;
+        }
+    } else if require_store {
+        return Err(anyhow::anyhow!(
+            "Yunxi Executive store is unavailable; erasure barrier remains closed"
+        ));
+    }
+    Ok(removed)
+}
+
 pub(crate) fn register_mind_candidates(
     idempotency_key: String,
     context: MindCandidateContext,
@@ -472,6 +833,150 @@ pub(crate) async fn mind_status_report() -> Result<String> {
     ))
 }
 
+/// Return a deliberately metadata-only Intrinsic report.  The runtime report
+/// is already bounded at its source; this final cap protects the chat command
+/// if a future engine adds another diagnostic field.
+pub(crate) fn intrinsic_status_report() -> String {
+    let report = intrinsic_runtime::get()
+        .map(|runtime| runtime.status_report())
+        .unwrap_or_else(|| {
+            "Intrinsic 状态\n加载状态：尚未安装\n能力：text=false，vision=false".to_owned()
+        });
+    bound_status_report(report)
+}
+
+/// Render Executive state without exposing natural-language state payloads.
+/// IDs, enum values, counts, and reason tags are sufficient for operations;
+/// prompts, expectation patterns, goal text, and model outputs stay private.
+pub(crate) fn executive_status_report() -> String {
+    let Some(controller) = executive_controller() else {
+        return "Yunxi Executive 状态\n加载状态：尚未安装".to_owned();
+    };
+    let snapshot = controller.snapshot();
+    let policy = controller.policy();
+    let capability = &snapshot.cognitive_capability;
+    let intrinsic = intrinsic_runtime::get();
+    let (queue, inferences, vision_inferences, failures, fallbacks) = intrinsic
+        .as_ref()
+        .map(|runtime| {
+            let metrics = runtime.metrics();
+            (
+                format!(
+                    "parallel={} timeout_ms={}",
+                    runtime.runtime().config().max_parallel,
+                    runtime.runtime().config().queue_timeout_ms
+                ),
+                metrics.inferences,
+                metrics.vision_inferences,
+                metrics.failures,
+                metrics.fallbacks,
+            )
+        })
+        .unwrap_or_else(|| ("unavailable".to_owned(), 0, 0, 0, 0));
+    let conflict_summary = snapshot
+        .active_conflicts
+        .iter()
+        .take(yunxi_core::MAX_SNAPSHOT_ITEMS)
+        .map(|conflict| {
+            format!(
+                "{}:{:?}:{:.2}",
+                conflict.id, conflict.kind, conflict.severity
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let goal_summary = snapshot
+        .prioritized_goals
+        .iter()
+        .take(yunxi_core::MAX_SNAPSHOT_ITEMS)
+        .map(|goal| format!("{}:{:?}:{:.2}", goal.goal_id, goal.state, goal.score))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let plan_summary = snapshot.active_plan.as_ref().map_or_else(
+        || "none".to_owned(),
+        |plan| {
+            format!(
+                "status={:?} version={} step={}/{} revisions={}",
+                plan.status,
+                plan.version,
+                plan.current_step,
+                plan.steps.len(),
+                plan.revision_count
+            )
+        },
+    );
+    let decision_tags = snapshot
+        .recent_decisions
+        .iter()
+        .flat_map(|decision| decision.reason_tags.iter())
+        .take(yunxi_core::MAX_REASON_TAGS)
+        .map(|tag| format!("{:?}", tag))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let reflection = mind_runtime().map_or_else(
+        || "unavailable".to_owned(),
+        |runtime| {
+            let metrics = runtime.metrics();
+            format!(
+                "total={} failed={} last_unix_ms={}",
+                metrics.reflections, metrics.reflection_failures, metrics.last_reflection_unix_ms
+            )
+        },
+    );
+    bound_status_report(format!(
+        "Yunxi Executive 状态\n版本：{}\n当前/偏好 tier：{}/{}\nIntrinsic：health={:?} text={} vision={} version={} adapter={} manifest={}\nStrong：{}\n预算：available={:.2}/{:.2} reserve={:.2} replenishment={:.2}\n队列/指标：{}；text={} vision={} failures={} fallbacks={}\n冲突({})：{}\n目标({})：{}\n计划：{}\n期待({})：pending-only metadata\n最近决策({}) tags：{}\n反思：{}\n策略：max_plan_revisions={} candidates={} conflict_threshold={:.2} deep_reflection_budget={}",
+        snapshot.version,
+        capability.current_tier,
+        capability.preferred_tier,
+        capability.intrinsic_health,
+        capability.text_available,
+        capability.vision_available,
+        capability
+            .intrinsic_version
+            .as_ref()
+            .map(|version| version.model_id.as_str())
+            .unwrap_or("unknown"),
+        capability
+            .intrinsic_version
+            .as_ref()
+            .and_then(|version| version.adapter_version.as_deref())
+            .unwrap_or("none"),
+        capability
+            .intrinsic_version
+            .as_ref()
+            .map(|version| version.manifest_hash.as_str())
+            .unwrap_or("unknown"),
+        capability.strong_available,
+        snapshot.attention_budget.available,
+        snapshot.attention_budget.total,
+        snapshot.attention_budget.reserved_for_critical,
+        snapshot.attention_budget.replenishment_rate,
+        queue,
+        inferences,
+        vision_inferences,
+        failures,
+        fallbacks,
+        snapshot.active_conflicts.len(),
+        conflict_summary,
+        snapshot.prioritized_goals.len(),
+        goal_summary,
+        plan_summary,
+        snapshot.pending_expectations.len(),
+        snapshot.recent_decisions.len(),
+        decision_tags,
+        reflection,
+        policy.max_plan_revisions,
+        policy.max_candidate_count,
+        policy.conflict_threshold,
+        policy.deep_reflection_budget,
+    ))
+}
+
+fn bound_status_report(report: String) -> String {
+    const MAX_STATUS_CHARS: usize = 4_096;
+    report.chars().take(MAX_STATUS_CHARS).collect()
+}
+
 /// Bootstrap canonical state from the legacy per-user profile. Existing rows
 /// are Core-owned and must never be replaced by a later legacy projection;
 /// both inserts therefore use an atomic `ON CONFLICT DO NOTHING` boundary.
@@ -543,6 +1048,32 @@ pub(crate) fn install_core_bridge(bridge: Arc<bridge::CoreBridge>) -> Result<()>
     CORE_BRIDGE
         .set(bridge)
         .map_err(|_| anyhow::anyhow!("Yunxi CoreBridge 已经安装"))
+}
+
+pub(crate) fn install_executive_controller(
+    executive: yunxi_core::ExecutiveController,
+) -> Result<()> {
+    EXECUTIVE_CONTROLLER
+        .set(executive)
+        .map_err(|_| anyhow::anyhow!("Yunxi Executive 已经安装"))
+}
+
+pub(crate) fn executive_controller() -> Option<yunxi_core::ExecutiveController> {
+    EXECUTIVE_CONTROLLER.get().cloned()
+}
+
+/// Refresh startup/runtime capability facts before a new planning turn. The
+/// Intrinsic self-test can finish after the bridge is installed, so the
+/// Executive must not retain a stale healthy bit in its bounded snapshot.
+pub(crate) fn refresh_executive_capability() {
+    let (Some(controller), Some(intrinsic)) =
+        (EXECUTIVE_CONTROLLER.get(), intrinsic_runtime::get())
+    else {
+        return;
+    };
+    if let Err(error) = controller.set_capability(intrinsic.capability_snapshot()) {
+        kovi::log::warn!("Yunxi Executive capability refresh rejected: {error}");
+    }
 }
 
 pub(crate) async fn begin_qq_user_data_erasure(user_id: i64) -> Result<bridge::UserDataErasure> {
@@ -622,6 +1153,59 @@ where
     Err(anyhow::Error::new(last_error.expect(
         "Mind erasure loop always records a failed attempt",
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ExecutiveSaveState, finish_executive_erasure_state};
+
+    #[test]
+    fn successful_global_erasure_keeps_post_clear_requests_dirty() {
+        let mut state = ExecutiveSaveState {
+            dirty: true,
+            requested_version: 12,
+            erasure_epoch: 1,
+            erasure_blocked: true,
+            erasure_start_version: 10,
+        };
+
+        assert!(finish_executive_erasure_state(&mut state, 14, Some(13)));
+        assert!(!state.erasure_blocked);
+        assert!(state.dirty);
+        assert_eq!(state.requested_version, 14);
+        assert_eq!(state.erasure_start_version, 0);
+    }
+
+    #[test]
+    fn successful_scoped_erasure_drops_only_pre_barrier_state() {
+        let mut state = ExecutiveSaveState {
+            dirty: false,
+            requested_version: 9,
+            erasure_epoch: 1,
+            erasure_blocked: true,
+            erasure_start_version: 9,
+        };
+
+        assert!(!finish_executive_erasure_state(&mut state, 9, None));
+        assert!(!state.erasure_blocked);
+        assert!(!state.dirty);
+        assert_eq!(state.requested_version, 0);
+    }
+
+    #[test]
+    fn request_recorded_while_blocked_is_not_lost_when_version_is_unchanged() {
+        let mut state = ExecutiveSaveState {
+            dirty: true,
+            requested_version: 9,
+            erasure_epoch: 1,
+            erasure_blocked: true,
+            erasure_start_version: 9,
+        };
+
+        assert!(finish_executive_erasure_state(&mut state, 9, None));
+        assert!(state.dirty);
+        assert_eq!(state.requested_version, 9);
+    }
 }
 
 /// Remove the canonical Core person and all QQ direct conversations belonging

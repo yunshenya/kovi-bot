@@ -539,7 +539,12 @@ impl CoreBridge {
         open_loop_store: Arc<dyn OpenLoopStore>,
         bot: Arc<RuntimeBot>,
     ) -> Arc<Self> {
-        let model = super::core_model::KoviModelBackend::new(Arc::clone(&bot), Arc::clone(&store));
+        let intrinsic = super::intrinsic_runtime::install();
+        let model = super::core_model::KoviModelBackend::new_with_intrinsic(
+            Arc::clone(&bot),
+            Arc::clone(&store),
+            Arc::clone(&intrinsic),
+        );
         let open_loop_store_for_adapter = Arc::clone(&open_loop_store);
         let goal_store_for_adapter: Arc<dyn yunxi_core::GoalStore> = super::goal_store()
             .expect("Yunxi goal store must be initialized before the action adapter");
@@ -608,6 +613,34 @@ impl CoreBridge {
                     .expect("default Yunxi runtime configuration must be valid")
             },
         );
+        let intrinsic = model_backend
+            .as_ref()
+            .map(|backend| backend.intrinsic_runtime())
+            .unwrap_or_else(super::intrinsic_runtime::install);
+        let executive =
+            yunxi_core::ExecutiveController::new(crate::config::get().executive().policy())
+                .expect("validated Yunxi Executive policy must be constructible");
+        let current_capability = intrinsic.capability_snapshot();
+        executive
+            .set_capability(current_capability.clone())
+            .expect("validated Intrinsic capability snapshot must be accepted");
+        if let Some(mut persisted) = super::executive_bootstrap_snapshot() {
+            // Health, external availability, and the loaded manifest are
+            // startup facts. Never trust a previous process's capability bit.
+            persisted.cognitive_capability = current_capability;
+            if let Err(error) = executive.restore_snapshot(persisted) {
+                kovi::log::warn!(
+                    "Yunxi Executive bootstrap restore was rejected; starting with clean state: {error}"
+                );
+            }
+        }
+        let _ = super::install_executive_controller(executive.clone());
+        runtime.set_executive(executive);
+        kovi::tokio::spawn(async {
+            if let Err(error) = super::persist_executive_snapshot().await {
+                kovi::log::warn!("Yunxi Executive initial persistence failed: {error}");
+            }
+        });
         let mind_config = crate::config::get().mind().clone();
         if mind_config.mind_planner_enabled()
             && let Some(provider) = super::mind_runtime()
@@ -650,12 +683,14 @@ impl CoreBridge {
         let incoming_releaser = model_backend
             .as_ref()
             .map(|backend| Arc::clone(backend) as Arc<dyn IncomingAdmissionReleaser>);
+        let executive_store = super::executive_store();
         kovi::tokio::spawn(run_ingress(
             receiver,
             store,
             runtime_handle,
             model_backend,
             message_store,
+            executive_store,
             Arc::clone(&blocked_users),
             Arc::clone(&blocked_groups),
             action_arbiter.clone(),
@@ -1570,6 +1605,7 @@ async fn run_ingress(
     runtime: RuntimeHandle,
     model_backend: Option<Arc<super::core_model::KoviModelBackend>>,
     message_store: Option<Arc<super::identity_store::PostgresIdentityStore>>,
+    executive_store: Option<Arc<super::executive_store::PostgresExecutiveStore>>,
     blocked_users: Arc<StdMutex<HashSet<i64>>>,
     blocked_groups: Arc<StdMutex<HashSet<i64>>>,
     action_arbiter: Option<Arc<ActionArbiter>>,
@@ -1720,6 +1756,7 @@ async fn run_ingress(
                     &mut routes,
                     model_backend.as_deref(),
                     message_store.as_deref(),
+                    executive_store.as_deref(),
                     &mut blocked_at_ingress,
                     &blocked_users,
                     &private_handler_gates,
@@ -1739,7 +1776,10 @@ async fn run_ingress(
                         ack.cleared_tracked_routes,
                     );
                 }
-                if result.is_err() {
+                if result.is_err() && !alias_handler_barriers.contains_key(&user_id) {
+                    // A failure before Core's FIFO barrier was established is
+                    // recoverable in this process. Once the alias permit map
+                    // exists, the barrier is intentionally retained closed.
                     blocked_at_ingress.remove(&user_id);
                     unblock(&blocked_users, user_id);
                 }
@@ -1801,6 +1841,7 @@ async fn run_ingress(
                     &mut references,
                     model_backend.as_deref(),
                     message_store.as_deref(),
+                    executive_store.as_deref(),
                     &mut group_erasure_conversations,
                 )
                 .await;
@@ -1815,7 +1856,7 @@ async fn run_ingress(
                         ack.cleared_conversation_routes,
                     );
                 }
-                if result.is_err() {
+                if result.is_err() && !group_erasure_conversations.contains_key(&group_id) {
                     blocked_groups_at_ingress.remove(&group_id);
                     unblock(&blocked_groups, group_id);
                 }
@@ -1870,6 +1911,7 @@ async fn begin_data_erasure_at_ingress_barrier(
     routes: &mut IngressRouteTracker,
     model_backend: Option<&super::core_model::KoviModelBackend>,
     message_store: Option<&super::identity_store::PostgresIdentityStore>,
+    executive_store: Option<&super::executive_store::PostgresExecutiveStore>,
     blocked_at_ingress: &mut HashSet<i64>,
     blocked_users: &StdMutex<HashSet<i64>>,
     private_handler_gates: &PrivateHandlerGateRegistry,
@@ -1925,12 +1967,16 @@ async fn begin_data_erasure_at_ingress_barrier(
             return Err(anyhow::Error::from(error));
         }
     };
+    // From this point onward Core's FIFO barrier is live. Retain the host
+    // permits even if a later purge fails, so ingress cannot reopen around
+    // data that has not yet been fully erased.
+    alias_handler_barriers.insert(user_id, alias_permits);
     let cleared_references = references.remove_conversations(&targets.direct_conversation_ids);
     let (cleared_person_routes, cleared_conversation_routes) =
         if let Some(model_backend) = model_backend {
-            let _ = model_backend
+            model_backend
                 .purge_private_message_contexts(&targets.blocked_user_ids)
-                .await;
+                .await?;
             model_backend
                 .purge_routes(
                     targets.canonical_person_id,
@@ -1940,12 +1986,31 @@ async fn begin_data_erasure_at_ingress_barrier(
         } else {
             (0, 0)
         };
+    let mut executive_scopes = Vec::with_capacity(
+        usize::from(targets.canonical_person_id.is_some())
+            .saturating_add(targets.direct_conversation_ids.len()),
+    );
+    if let Some(person_id) = targets.canonical_person_id {
+        executive_scopes.push(yunxi_core::ExecutiveScope::Person { person_id });
+    }
+    executive_scopes.extend(
+        targets
+            .direct_conversation_ids
+            .iter()
+            .copied()
+            .map(|conversation_id| yunxi_core::ExecutiveScope::Conversation { conversation_id }),
+    );
+    super::erase_executive_scopes_with_store(
+        &executive_scopes,
+        message_store.is_some(),
+        executive_store,
+    )
+    .await?;
     let cleared_tracked_routes = targets
         .blocked_user_ids
         .iter()
         .filter(|user_id| routes.remove(**user_id))
         .count();
-    alias_handler_barriers.insert(user_id, alias_permits);
     Ok(DataErasureAck {
         canonical_person_id: targets.canonical_person_id,
         runtime_barrier_person_id: targets.runtime_barrier_person_id,
@@ -2080,6 +2145,7 @@ async fn begin_group_data_erasure_at_ingress_barrier(
     references: &mut MessageReferenceCache,
     model_backend: Option<&super::core_model::KoviModelBackend>,
     message_store: Option<&super::identity_store::PostgresIdentityStore>,
+    executive_store: Option<&super::executive_store::PostgresExecutiveStore>,
     active: &mut HashMap<i64, Vec<ConversationId>>,
 ) -> anyhow::Result<GroupDataErasureAck> {
     anyhow::ensure!(
@@ -2111,11 +2177,19 @@ async fn begin_group_data_erasure_at_ingress_barrier(
             .await
             .map_err(anyhow::Error::from)?
     };
+    // Mark the barrier before later cleanup can fail. An error after this
+    // point deliberately leaves both Core and host ingress closed.
+    active.insert(group_id, conversation_ids.clone());
     let cleared_references = references.remove_conversations(&conversation_ids);
     if let Some(model_backend) = model_backend {
-        let _ = model_backend.purge_group_message_contexts(group_id).await;
+        model_backend.purge_group_message_contexts(group_id).await?;
     }
-    active.insert(group_id, conversation_ids.clone());
+    let executive_scopes = conversation_ids
+        .iter()
+        .copied()
+        .map(|conversation_id| yunxi_core::ExecutiveScope::Conversation { conversation_id })
+        .collect::<Vec<_>>();
+    super::erase_executive_scopes_with_store(&executive_scopes, true, executive_store).await?;
     Ok(GroupDataErasureAck {
         conversation_ids,
         purged_runtime_states,
@@ -2246,10 +2320,12 @@ async fn run_runtime(
     if planned
         && let (Some(arbiter), Some(port)) = (action_arbiter.as_deref(), action_port.as_deref())
     {
-        while let Some(outcome) = runtime
-            .process_next_with_planner_and_actions(arbiter, port)
-            .await
-        {
+        while let Some(outcome) = {
+            super::refresh_executive_capability();
+            runtime
+                .process_next_with_planner_and_actions(arbiter, port)
+                .await
+        } {
             match outcome {
                 Ok(PlannedProcessingOutcome::Planned {
                     observation,
@@ -2290,10 +2366,14 @@ async fn run_runtime(
                     kovi::log::error!("Yunxi Core planner failed before action outcome: {error}")
                 }
             }
+            persist_executive_after_turn().await;
         }
         return;
     }
-    while let Some(outcome) = runtime.process_next().await {
+    while let Some(outcome) = {
+        super::refresh_executive_capability();
+        runtime.process_next().await
+    } {
         match outcome {
             ProcessingOutcome::Observed(observation) => {
                 kovi::log::debug!(
@@ -2312,6 +2392,15 @@ async fn run_runtime(
                 kovi::log::warn!("Yunxi Core runtime rejected an event");
             }
         }
+        persist_executive_after_turn().await;
+    }
+}
+
+async fn persist_executive_after_turn() {
+    if let Err(error) = super::persist_executive_snapshot().await {
+        // Persistence is a recovery aid, not a reason to stop the bounded
+        // deterministic runtime. The next turn will retry the latest state.
+        kovi::log::warn!("Yunxi Executive turn persistence failed: {error}");
     }
 }
 
@@ -3245,6 +3334,7 @@ mod tests {
                 runtime_handle,
                 None,
                 None,
+                None,
                 blocked_users,
                 blocked_groups,
                 None,
@@ -3396,6 +3486,13 @@ mod tests {
                 .connect(&database_url)
                 .await
                 .expect("connect PostgreSQL");
+            let executive_store = Arc::new(
+                crate::yunxi::executive_store::PostgresExecutiveStore::new(pool.clone()),
+            );
+            executive_store
+                .initialize_schema()
+                .await
+                .expect("initialize Executive schema");
             let store = Arc::new(crate::yunxi::identity_store::PostgresIdentityStore::new(
                 pool,
             ));
@@ -3423,6 +3520,7 @@ mod tests {
                 runtime_handle.clone(),
                 None,
                 Some(Arc::clone(&store)),
+                Some(executive_store),
                 Arc::clone(&blocked_users),
                 Arc::clone(&blocked_groups),
                 None,
@@ -3791,6 +3889,7 @@ mod tests {
                 receiver,
                 store,
                 runtime_handle.clone(),
+                None,
                 None,
                 None,
                 Arc::clone(&blocked_users),

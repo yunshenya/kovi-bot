@@ -9,11 +9,13 @@ pub mod arbiter;
 pub mod attention;
 pub mod delivery;
 pub mod event;
+pub mod executive;
 pub mod goal;
 pub mod identity;
 pub mod intent;
 pub mod memory;
 pub mod mind;
+pub mod model;
 pub mod open_loop;
 pub mod planner;
 pub mod ports;
@@ -47,6 +49,31 @@ pub use event::{
     MessageValidationError, ProspectiveMemoryEvent, ReminderDueEvent, ToolCompletedEvent,
     ToolFailedEvent, TraceContext, TraceError, WorldEvent, WorldEventKind,
 };
+pub use executive::EvidencePolarity as ExecutiveEvidencePolarity;
+pub use executive::{
+    AttentionBudget, AttentionBudgetSnapshot, AttentionCost, BudgetError, BudgetGrant, Candidate,
+    CandidateEvaluation, CandidateEvaluator, CandidateId, CandidateKind, CandidateScore,
+    CognitiveBudget, ConfidenceCalibration, ConfidenceLevel, ConfidenceUpdate, ConflictId,
+    ConflictKind, ConflictMonitor, ConflictMonitorConfig, ConflictRef, ConflictSnapshot,
+    ConflictStatus, ConflictValidationError, ConsistencyAssessment, ConsistencyDecision,
+    ConsistencyKind, ConsistencySeverity, DecisionActionKind, DecisionRecord, DecisionRecordId,
+    DecisionRecordPersistence, DecisionRecordRetention, DecisionRecordSnapshot, DeferUntil,
+    EvidenceSource, EvidenceWeight, ExecutiveConflict, ExecutiveController,
+    ExecutivePersistenceError, ExecutivePolicy, ExecutivePolicyError, ExecutiveReasonTag,
+    ExecutiveRuntime, ExecutiveScope, ExecutiveSnapshot, ExecutiveStore, ExecutiveStoreFuture,
+    ExecutiveTierDecision, Expectation, ExpectationId, ExpectationObservation, ExpectationSnapshot,
+    ExpectationStatus, ExpectationStore, ExpectationTracker, ExpectationTrackerConfig,
+    GoalArbitration, GoalArbitrator, GoalArbitratorConfig, GoalPriority, GoalPrioritySnapshot,
+    HardPriority, HypothesisState, IncomingOutgoingChange, MAX_ACTIVE_PLANS, MAX_CANDIDATES,
+    MAX_CONFLICT_PARTICIPANTS, MAX_PLAN_REVISIONS, MAX_PLAN_STEPS, MAX_REASON_TAGS,
+    MAX_SNAPSHOT_ITEMS, MIN_CANDIDATES, MergeRequest, OutgoingRevalidation,
+    OutgoingRevalidationContext, OutgoingRevalidator, OutgoingSource, PendingOutgoing, PlanError,
+    PlanId, PlanRevision, PlanSnapshot, PlanStaleReason, PlanState, PlanStatus, PlanStep,
+    PlanStepId, PlanStepKind, PlanStepStatus, PlanStore, PlanValidationError, PrioritizedGoal,
+    ReflectionController, ReflectionDecision, ReflectionGateContext, RetryPolicy, RewriteRequest,
+    SelfConsistencyConflict, SelfConsistencyMonitor, SnapshotExpectation, SnapshotPlan, SocialCost,
+    confidence_level, hypothesis_state, update_confidence,
+};
 pub use goal::{
     Goal, GoalDraft, GoalKind, GoalOwner, GoalState, GoalValidationError, MAX_GOAL_DETAILS_BYTES,
     MAX_GOAL_DETAILS_CHARS, MAX_GOAL_TITLE_BYTES, MAX_GOAL_TITLE_CHARS,
@@ -64,6 +91,7 @@ pub use memory::{
     MemoryScope, MemoryValidationError,
 };
 pub use mind::*;
+pub use model::*;
 pub use open_loop::{
     MAX_OPEN_LOOP_DEDUPE_KEY_BYTES, MAX_OPEN_LOOP_SALIENCE, MAX_OPEN_LOOP_SUMMARY_BYTES,
     MAX_OPEN_LOOP_SUMMARY_CHARS, OpenLoop, OpenLoopDraft, OpenLoopKind, OpenLoopOwner,

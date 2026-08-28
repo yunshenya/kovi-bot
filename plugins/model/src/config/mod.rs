@@ -25,6 +25,8 @@ use std::sync::{Arc, LazyLock, RwLock};
 
 mod agent_runs;
 mod agent_tasks;
+mod cognitive_model;
+mod executive;
 mod group_interjection;
 mod identity;
 mod memory;
@@ -42,6 +44,13 @@ mod vision;
 
 pub use agent_runs::AgentRunConfig;
 pub use agent_tasks::AgentTaskConfig;
+pub use cognitive_model::{CognitiveModelConfig, IntrinsicConfig, ModelFallbackConfig};
+pub use executive::{
+    ExecutiveAttentionBudgetConfig, ExecutiveCandidateConfig, ExecutiveConfidenceConfig,
+    ExecutiveConfig, ExecutiveConsistencyConfig, ExecutiveDecisionRecordConfig,
+    ExecutiveExpectationConfig, ExecutivePlanConfig, ExecutivePriorityConfig,
+    ExecutiveReflectionConfig,
+};
 pub use identity::IdentityConfig;
 pub use mind::MindConfig;
 pub use reminders::ReminderConfig;
@@ -96,6 +105,11 @@ pub struct ModelConfig {
     agent_runs: AgentRunConfig,
     /// 图片理解 Provider 路由配置。
     vision: VisionConfig,
+    /// Executive v3 deterministic control configuration.
+    executive: ExecutiveConfig,
+    /// Intrinsic model and bounded fallback configuration.
+    #[serde(rename = "model")]
+    model: CognitiveModelConfig,
 }
 
 impl ModelConfig {
@@ -141,6 +155,8 @@ impl ModelConfig {
         self.agent_tasks.validate()?;
         self.agent_runs.validate()?;
         self.vision.validate()?;
+        self.executive.validate()?;
+        self.model.validate()?;
         if !self.vision.mcp_server().is_empty() && !self.tools.enabled() {
             return Err(anyhow::anyhow!(
                 "配置 vision.mcp_server 时必须启用 tools.enabled"
@@ -224,6 +240,14 @@ impl ModelConfig {
 
     pub fn vision(&self) -> &VisionConfig {
         &self.vision
+    }
+
+    pub fn executive(&self) -> &ExecutiveConfig {
+        &self.executive
+    }
+
+    pub fn model(&self) -> &CognitiveModelConfig {
+        &self.model
     }
 
     fn create_default_config_file(config_path: &Path) -> anyhow::Result<()> {

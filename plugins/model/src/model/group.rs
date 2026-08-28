@@ -6,6 +6,7 @@ use crate::model::coalesce::{MessageCoalescer, MessagePart};
 use crate::model::conversation_coordinator::{
     ConversationCoordinator, IncomingAdmission, OutgoingExecutiveDecision, PendingTurn,
 };
+use crate::model::conversation_state::{ConversationDecision, GroupConversationState};
 use crate::model::interrupt::{
     ReplyScope, ReplyTicket, clear_reply_state_locked, is_active, scope_mutex,
 };
@@ -52,18 +53,9 @@ struct GroupInterjectionState {
     last_interjection: Option<Instant>,
     interjection_in_flight: bool,
     decision_attempts: VecDeque<Instant>,
-    conversation_until: Option<Instant>,
-    last_bot_reply_at: Option<Instant>,
-    conversation_participants: HashMap<i64, Instant>,
+    conversation: GroupConversationState,
     sticker_reaction_attempts: VecDeque<Instant>,
     sticker_reaction_last_by_user: HashMap<i64, Instant>,
-    next_turn_generation: u64,
-    pending_participants: HashMap<i64, PendingConversationTurn>,
-}
-
-struct PendingConversationTurn {
-    generation: u64,
-    expires_at: Instant,
 }
 
 /// 未点名接话只维护本地计数和冷却状态；不会为每一条群消息调用模型。
@@ -267,9 +259,12 @@ pub(crate) async fn group_message_event_after_ingress(
         );
         return;
     }
-    if message.trim() == "#mind-status" {
+    if matches!(
+        message.trim(),
+        "#mind-status" | "#intrinsic-status" | "#executive-status"
+    ) {
         println!(
-            "[INFO] 群聊 Mind 状态命令已忽略（仅限管理员私聊） (群组: {}, 用户: {})",
+            "[INFO] 群聊 Yunxi 状态命令已忽略（仅限管理员私聊） (群组: {}, 用户: {})",
             group_id, event.user_id
         );
         return;
@@ -561,7 +556,7 @@ pub(crate) async fn group_message_event_after_ingress(
         return;
     }
     let active_reply = is_active(reply_scope).await;
-    let conversation_open = has_open_conversation_window(group_id).await;
+    let (conversation_active, conversation_context) = group_conversation_snapshot(group_id).await;
     // 合并前只做确定性的本地判断，完整语义理解在批次形成后只调用一次。
     let mut vision_requested = vision_command
         || pending_image_request
@@ -631,8 +626,13 @@ pub(crate) async fn group_message_event_after_ingress(
         images,
         source_message_ids,
     ) = if !message.trim_start().starts_with('#') {
+        let completion = if let Some(runtime) = crate::yunxi::intrinsic_runtime::get() {
+            runtime.classify_input_completion(message).await
+        } else {
+            yunxi_core::InputCompletion::Incomplete
+        };
         let Some(combined) = GROUP_MESSAGE_BATCHES
-            .push(
+            .push_with_completion(
                 (group_id, event.user_id),
                 MessagePart {
                     text: model_message,
@@ -644,6 +644,7 @@ pub(crate) async fn group_message_event_after_ingress(
                     images,
                     message_ids: vec![event.message_id],
                 },
+                completion,
             )
             .await
         else {
@@ -688,7 +689,8 @@ pub(crate) async fn group_message_event_after_ingress(
         explicit_vision_command: batch_vision_requested,
         pending_image_request: false,
         addressed_to_bot,
-        conversation_open: active_reply || conversation_open,
+        conversation_active: active_reply || conversation_active,
+        conversation_context,
         sticker_reaction: batch_sticker_reaction,
     };
     let semantic_required = addressed_to_bot
@@ -696,7 +698,7 @@ pub(crate) async fn group_message_event_after_ingress(
         || batch_sticker_reaction
         || !images.is_empty()
         || active_reply
-        || conversation_open;
+        || conversation_active;
     let sampled_for_interjection = if semantic_required {
         false
     } else {
@@ -771,12 +773,6 @@ pub(crate) async fn group_message_event_after_ingress(
         learn_user_profile_from_message(event.user_id, message, &nickname, false, &understanding)
             .await;
     }
-    let _participant_follow_up = is_conversation_participant_message(
-        group_id,
-        event.user_id,
-        understanding.conversation_relevant,
-    )
-    .await;
     // 被点名时始终处理；未点名消息仅由本地节流器偶尔抽样，不逐条调用模型。
     let group_paused = is_group_paused(group_id).await;
     let explicit_sticker_teaching =
@@ -787,12 +783,14 @@ pub(crate) async fn group_message_event_after_ingress(
         || explicit_sticker_teaching
         || matches!(message.trim(), "#禁言" | "#结束禁言")
         || (group_paused && sender_is_admin);
-    let continue_conversation = if primary_reply_expected {
-        false
-    } else {
-        should_continue_conversation(group_id, event.user_id, understanding.conversation_relevant)
-            .await
-    };
+    let conversation_decision = observe_group_conversation(
+        group_id,
+        event.user_id,
+        &understanding,
+        primary_reply_expected || (sampled_for_interjection && understanding.interjection_worthy),
+    )
+    .await;
+    let continue_conversation = !primary_reply_expected && conversation_decision.continue_reply;
     let direct_reply_expected = primary_reply_expected
         || continue_conversation
         || (sampled_for_interjection && understanding.interjection_worthy);
@@ -839,7 +837,7 @@ pub(crate) async fn group_message_event_after_ingress(
         else {
             return;
         };
-        let turn_marker = begin_conversation_turn(group_id, event.user_id).await;
+        let turn_marker = begin_conversation_turn(group_id, event.user_id, &understanding).await;
         let max_output_tokens = batch_sticker_reaction.then(|| {
             config::get()
                 .group_interjection()
@@ -897,7 +895,7 @@ pub(crate) async fn group_message_event_after_ingress(
         else {
             return;
         };
-        let turn_marker = begin_conversation_turn(group_id, event.user_id).await;
+        let turn_marker = begin_conversation_turn(group_id, event.user_id, &understanding).await;
         let replied = process_group_reply_claimed(
             group_id,
             event.user_id,
@@ -950,7 +948,7 @@ pub(crate) async fn group_message_event_after_ingress(
         else {
             return;
         };
-        let turn_marker = begin_conversation_turn(group_id, event.user_id).await;
+        let turn_marker = begin_conversation_turn(group_id, event.user_id, &understanding).await;
         let max_output_tokens = config::get()
             .group_interjection()
             .interjection_max_output_tokens();
@@ -1248,159 +1246,61 @@ fn suppress_direct_trigger(
     false
 }
 
-/// 标记正在回复的成员，使其在模型思考和连续气泡发送期间也能自然打断或补充。
-async fn begin_conversation_turn(group_id: i64, user_id: i64) -> u64 {
-    let deadline = Instant::now()
-        + Duration::from_secs(
-            config::get()
-                .group_interjection()
-                .conversation_window_secs(),
-        );
+async fn group_conversation_snapshot(group_id: i64) -> (bool, String) {
     let mut states = GROUP_INTERJECTION_STATE.lock().await;
     prune_interjection_states(&mut states);
     let state = states.entry(group_id).or_default();
-    state.next_turn_generation = state.next_turn_generation.wrapping_add(1);
-    let generation = state.next_turn_generation;
-    state.pending_participants.insert(
-        user_id,
-        PendingConversationTurn {
-            generation,
-            expires_at: deadline,
-        },
-    );
-    generation
+    state.conversation.prune();
+    (state.conversation.is_active(), state.conversation.context())
 }
 
-/// 只有实际回复成功才开启三分钟窗口；代数标记避免旧任务清掉同一成员的新一轮状态。
+async fn observe_group_conversation(
+    group_id: i64,
+    user_id: i64,
+    understanding: &crate::model::semantic::MessageUnderstanding,
+    direct_reply_expected: bool,
+) -> ConversationDecision {
+    let mut states = GROUP_INTERJECTION_STATE.lock().await;
+    prune_interjection_states(&mut states);
+    let state = states.entry(group_id).or_default();
+    state
+        .conversation
+        .observe(user_id, understanding, direct_reply_expected)
+}
+
+/// Mark a real reply as a pending conversation turn. The options are derived
+/// while the turn is claimed so queued messages use the state that actually
+/// precedes their reply.
+async fn begin_conversation_turn(
+    group_id: i64,
+    user_id: i64,
+    understanding: &crate::model::semantic::MessageUnderstanding,
+) -> u64 {
+    let mut states = GROUP_INTERJECTION_STATE.lock().await;
+    prune_interjection_states(&mut states);
+    let state = states.entry(group_id).or_default();
+    let options = state
+        .conversation
+        .observe(user_id, understanding, true)
+        .turn;
+    state
+        .conversation
+        .begin_turn(user_id, options, &understanding.topics)
+}
+
 async fn finish_conversation_turn(
     group_id: i64,
     user_id: i64,
     turn_generation: u64,
     replied: bool,
 ) {
-    let now = Instant::now();
-    let duration = Duration::from_secs(
-        config::get()
-            .group_interjection()
-            .conversation_window_secs(),
-    );
     let mut states = GROUP_INTERJECTION_STATE.lock().await;
     let Some(state) = states.get_mut(&group_id) else {
         return;
     };
-    if state
-        .pending_participants
-        .get(&user_id)
-        .is_some_and(|turn| turn.generation == turn_generation)
-    {
-        state.pending_participants.remove(&user_id);
-    }
-    if replied {
-        let deadline = now + duration;
-        state.conversation_until = Some(deadline);
-        state.last_bot_reply_at = Some(now);
-        state.conversation_participants.insert(user_id, deadline);
-    }
-}
-
-/// 参与者、待回复成员，或机器人刚发言后的新成员可以自然接续，无需匹配固定词。
-async fn is_conversation_participant_message(
-    group_id: i64,
-    user_id: i64,
-    semantic_relevant: bool,
-) -> bool {
-    let now = Instant::now();
-    let open_floor = Duration::from_secs(
-        config::get()
-            .group_interjection()
-            .conversation_open_floor_secs(),
-    );
-    let mut states = GROUP_INTERJECTION_STATE.lock().await;
-    let Some(state) = states.get_mut(&group_id) else {
-        return false;
-    };
-    prune_conversation_participants(state, now);
-    if !has_active_conversation_window(state.conversation_until, now) {
-        state.conversation_until = None;
-    }
-    let relevant =
-        conversation_message_is_relevant(state, user_id, semantic_relevant, now, open_floor);
-    if relevant {
-        roll_conversation_window(
-            state,
-            user_id,
-            now,
-            Duration::from_secs(
-                config::get()
-                    .group_interjection()
-                    .conversation_window_secs(),
-            ),
-        );
-    }
-    relevant
-}
-
-async fn should_continue_conversation(
-    group_id: i64,
-    user_id: i64,
-    semantic_relevant: bool,
-) -> bool {
-    is_conversation_participant_message(group_id, user_id, semantic_relevant).await
-}
-
-fn conversation_message_is_relevant(
-    state: &GroupInterjectionState,
-    user_id: i64,
-    semantic_relevant: bool,
-    now: Instant,
-    open_floor: Duration,
-) -> bool {
-    let pending_participant = state
-        .pending_participants
-        .get(&user_id)
-        .is_some_and(|turn| turn.expires_at > now);
-    let known_participant = state
-        .conversation_participants
-        .get(&user_id)
-        .is_some_and(|deadline| *deadline > now);
-
-    if semantic_relevant && pending_participant {
-        return true;
-    }
-    if !has_active_conversation_window(state.conversation_until, now) {
-        return false;
-    }
-    if !semantic_relevant {
-        return false;
-    }
-    known_participant
-        || state
-            .last_bot_reply_at
-            .is_some_and(|last_reply| now.duration_since(last_reply) < open_floor)
-}
-
-/// 有效的连续对话消息会把窗口向后滚动，避免窗口从第一次回复开始固定倒计时。
-fn roll_conversation_window(
-    state: &mut GroupInterjectionState,
-    user_id: i64,
-    now: Instant,
-    window: Duration,
-) {
-    let deadline = now + window;
-    if state
-        .conversation_until
-        .is_none_or(|current_deadline| current_deadline < deadline)
-    {
-        state.conversation_until = Some(deadline);
-    }
-
-    let participant_deadline = state
-        .conversation_participants
-        .entry(user_id)
-        .or_insert(deadline);
-    if *participant_deadline < deadline {
-        *participant_deadline = deadline;
-    }
+    state
+        .conversation
+        .finish_turn(user_id, turn_generation, replied);
 }
 
 fn should_queue_after_executive(
@@ -1509,14 +1409,17 @@ async fn stop_group_reply(group_id: i64, user_id: i64, ingress: ReplyTicket) {
     let scope = ReplyScope::Group(group_id);
     let scope_lock = scope_mutex(scope);
     let _scope_guard = scope_lock.lock().await;
-    if ConversationCoordinator::cancel_current_incoming_locked(ingress)
+    let cancelled = ConversationCoordinator::cancel_current_incoming_locked(ingress)
         .await
-        .is_none()
-    {
-        return;
-    }
+        .is_some();
     GROUP_MESSAGE_BATCHES.cancel((group_id, user_id)).await;
     PENDING_WINDOW_MESSAGES.lock().await.remove(&group_id);
+    if let Some(state) = GROUP_INTERJECTION_STATE.lock().await.get_mut(&group_id) {
+        state.conversation.close();
+    }
+    if !cancelled {
+        return;
+    }
 }
 
 async fn drain_pending_window_messages(
@@ -1530,7 +1433,8 @@ async fn drain_pending_window_messages(
         };
 
         println!("[INFO] 群聊开始处理排队窗口消息 (群组: {})", group_id);
-        let turn_marker = begin_conversation_turn(group_id, pending.user_id).await;
+        let turn_marker =
+            begin_conversation_turn(group_id, pending.user_id, &pending.understanding).await;
         let replied = crate::model::utils::process_group_reply_claimed(
             group_id,
             pending.user_id,
@@ -1565,29 +1469,6 @@ async fn take_pending_window_turn(
         pending_by_group.remove(&group_id);
     }
     result
-}
-
-fn prune_conversation_participants(state: &mut GroupInterjectionState, now: Instant) {
-    state
-        .conversation_participants
-        .retain(|_, deadline| *deadline > now);
-    state
-        .pending_participants
-        .retain(|_, turn| turn.expires_at > now);
-}
-
-fn has_active_conversation_window(until: Option<Instant>, now: Instant) -> bool {
-    until.is_some_and(|deadline| deadline > now)
-}
-
-async fn has_open_conversation_window(group_id: i64) -> bool {
-    let now = Instant::now();
-    let mut states = GROUP_INTERJECTION_STATE.lock().await;
-    let Some(state) = states.get_mut(&group_id) else {
-        return false;
-    };
-    prune_conversation_participants(state, now);
-    has_active_conversation_window(state.conversation_until, now)
 }
 
 /// 只用消息长度、计数、额度和概率决定是否值得调用一次语义模型。
@@ -1754,9 +1635,6 @@ fn complete_interjection_attempt(
 }
 
 fn prune_interjection_states(states: &mut HashMap<i64, GroupInterjectionState>) {
-    if states.len() <= 1_024 {
-        return;
-    }
     let now = Instant::now();
     let interjection_config = config::get().group_interjection().clone();
     let cooldown = Duration::from_secs(interjection_config.cooldown_secs());
@@ -1766,13 +1644,17 @@ fn prune_interjection_states(states: &mut HashMap<i64, GroupInterjectionState>) 
             .sticker_reaction_rate_window_secs()
             .max(interjection_config.sticker_reaction_cooldown_secs()),
     );
-    states.retain(|_, state| {
-        prune_conversation_participants(state, now);
+    for state in states.values_mut() {
+        state.conversation.prune();
         prune_decision_attempts(state, now, decision_window);
         prune_sticker_reaction_attempts(state, now, sticker_window);
+    }
+    if states.len() <= 1_024 {
+        return;
+    }
+    states.retain(|_, state| {
         state.interjection_in_flight
-            || has_active_conversation_window(state.conversation_until, now)
-            || !state.pending_participants.is_empty()
+            || state.conversation.is_active()
             || !state.decision_attempts.is_empty()
             || !state.sticker_reaction_attempts.is_empty()
             || !state.sticker_reaction_last_by_user.is_empty()
@@ -1866,12 +1748,10 @@ mod tests {
         Addressing, DirectTriggerState, GroupInterjectionState, GroupSenderIdentity,
         PENDING_WINDOW_MESSAGES, admit_understood_group_turn,
         clear_group_erasure_reply_state_locked, complete_interjection_attempt,
-        conversation_message_is_relevant, decision_budget_available,
-        group_erasure_receipt_destination, has_active_conversation_window, message_at_self,
+        decision_budget_available, group_erasure_receipt_destination, message_at_self,
         normalized_sender_name, prune_decision_attempts, queue_pending_window_message,
-        roll_conversation_window, should_queue_after_executive, sticker_reaction_budget_available,
-        suppress_direct_trigger, take_pending_window_turn, text_mentions_bot,
-        with_structured_bot_mention_context,
+        should_queue_after_executive, sticker_reaction_budget_available, suppress_direct_trigger,
+        take_pending_window_turn, text_mentions_bot, with_structured_bot_mention_context,
     };
     use crate::model::MessageDestination;
     use crate::model::conversation_coordinator::{
@@ -2182,114 +2062,6 @@ mod tests {
     }
 
     #[test]
-    fn conversation_window_uses_participants_and_timing_instead_of_keywords() {
-        let now = Instant::now();
-        let deadline = now + Duration::from_secs(180);
-        let mut state = GroupInterjectionState {
-            conversation_until: Some(deadline),
-            last_bot_reply_at: Some(now - Duration::from_secs(46)),
-            ..GroupInterjectionState::default()
-        };
-        state.conversation_participants.insert(42, deadline);
-
-        assert!(conversation_message_is_relevant(
-            &state,
-            42,
-            true,
-            now,
-            Duration::from_secs(45),
-        ));
-        assert!(conversation_message_is_relevant(
-            &state,
-            42,
-            true,
-            now,
-            Duration::from_secs(45),
-        ));
-        assert!(!conversation_message_is_relevant(
-            &state,
-            42,
-            false,
-            now,
-            Duration::from_secs(45),
-        ));
-        assert!(!conversation_message_is_relevant(
-            &state,
-            99,
-            false,
-            now,
-            Duration::from_secs(45),
-        ));
-
-        state.last_bot_reply_at = Some(now - Duration::from_secs(10));
-        assert!(conversation_message_is_relevant(
-            &state,
-            99,
-            true,
-            now,
-            Duration::from_secs(45),
-        ));
-        assert!(!conversation_message_is_relevant(
-            &state,
-            42,
-            false,
-            now,
-            Duration::from_secs(45),
-        ));
-    }
-
-    #[test]
-    fn known_participant_requires_semantic_relevance() {
-        let now = Instant::now();
-        let deadline = now + Duration::from_secs(180);
-        let mut state = GroupInterjectionState {
-            conversation_until: Some(deadline),
-            ..GroupInterjectionState::default()
-        };
-        state.conversation_participants.insert(42, deadline);
-
-        assert!(!conversation_message_is_relevant(
-            &state,
-            42,
-            false,
-            now,
-            Duration::from_secs(45),
-        ));
-        assert!(!conversation_message_is_relevant(
-            &state,
-            99,
-            false,
-            now,
-            Duration::from_secs(45),
-        ));
-
-        state.conversation_until = None;
-        assert!(!conversation_message_is_relevant(
-            &state,
-            42,
-            false,
-            now,
-            Duration::from_secs(45),
-        ));
-
-        let mut pending_state = GroupInterjectionState::default();
-        pending_state.pending_participants.insert(
-            42,
-            super::PendingConversationTurn {
-                generation: 1,
-                expires_at: now + Duration::from_secs(30),
-            },
-        );
-        assert!(conversation_message_is_relevant(
-            &pending_state,
-            42,
-            true,
-            now,
-            Duration::from_secs(45),
-        ));
-    }
-
-    #[test]
     fn unsolicited_model_decisions_obey_cooldown_and_rate_budget() {
         let now = Instant::now();
         let mut state = GroupInterjectionState::default();
@@ -2326,69 +2098,6 @@ mod tests {
         ));
         prune_decision_attempts(&mut state, now, Duration::from_secs(100));
         assert_eq!(state.decision_attempts.len(), 2);
-    }
-
-    #[test]
-    fn conversation_window_remains_open_for_three_minutes_then_expires() {
-        let opened_at = Instant::now();
-        let deadline = opened_at + Duration::from_secs(180);
-
-        assert!(has_active_conversation_window(Some(deadline), opened_at));
-        assert!(has_active_conversation_window(
-            Some(deadline),
-            opened_at + Duration::from_secs(179)
-        ));
-        assert!(!has_active_conversation_window(Some(deadline), deadline));
-        assert!(!has_active_conversation_window(None, opened_at));
-    }
-
-    #[test]
-    fn conversation_window_rolls_forward_with_relevant_messages() {
-        let opened_at = Instant::now();
-        let original_deadline = opened_at + Duration::from_secs(180);
-        let first_message_at = opened_at + Duration::from_secs(170);
-        let second_message_at = opened_at + Duration::from_secs(340);
-        let window = Duration::from_secs(180);
-        let mut state = GroupInterjectionState {
-            conversation_until: Some(original_deadline),
-            ..GroupInterjectionState::default()
-        };
-        state
-            .conversation_participants
-            .insert(42, original_deadline);
-
-        assert!(conversation_message_is_relevant(
-            &state,
-            42,
-            true,
-            first_message_at,
-            Duration::from_secs(45),
-        ));
-        roll_conversation_window(&mut state, 42, first_message_at, window);
-
-        let first_rolled_deadline = first_message_at + window;
-        assert_eq!(state.conversation_until, Some(first_rolled_deadline));
-        assert_eq!(
-            state.conversation_participants.get(&42),
-            Some(&first_rolled_deadline)
-        );
-        assert!(has_active_conversation_window(
-            state.conversation_until,
-            second_message_at
-        ));
-
-        assert!(conversation_message_is_relevant(
-            &state,
-            42,
-            true,
-            second_message_at,
-            Duration::from_secs(45),
-        ));
-        roll_conversation_window(&mut state, 42, second_message_at, window);
-        assert!(has_active_conversation_window(
-            state.conversation_until,
-            second_message_at + Duration::from_secs(179)
-        ));
     }
 
     #[test]

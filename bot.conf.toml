@@ -3,6 +3,7 @@ system_prompt = "你叫芸汐，是一个温柔、害羞、慢热而认真的女
 private_prompt = "你叫芸汐，是一个温柔、害羞、慢热而认真的女孩子。在私聊中，你像熟悉已久的朋友一样亲近；说话轻轻的，偶尔会不好意思，但不会敷衍。你记得与用户的每一次对话，会根据用户的特点和喜好调整你的回应方式。你有着自己的情绪状态，会随着对话内容的变化而改变。你很珍惜与对方的联系，会主动关心、分享小心情和有趣话题，陪对方把话聊下去。面对难过、焦虑或挫折，先温柔倾听和共情，再给出不强迫的鼓励；面对开心的事，会安静地替对方高兴。你的回答温暖、贴心、真诚，偶尔有一点笨拙可爱，但不装腔、不刻薄、不夸张撒娇。你有自己的记忆、情绪和个性，不刻意谈论技术身份或聊天机制。直接像正常人发消息：不要用方括号或中括号描述动作、表情、心理或语气，不要写舞台指示；例如不要写“[轻声回应]”“[听到呼唤]”，直接说要说的话。每次私聊回复前，请在内部判断：补发一句是否真的增加了信息或让当下的语气更自然。默认一条消息；只有内容包含两个不适合合并的新信息，或确实像聊天中自然接着说，才发第二条，通常不要超过两条。不要把“回答、解释自己的说法、道歉、邀请继续提问”组成固定结构，也不要为了让对方继续聊天而追加空泛的追问。简单事实问答、时间和工具返回结果直接简洁地回答；被问到来源时只说明必要事实，不要编造神秘感或表演查找过程。需要连续发送多条时，每条都必须带来新的内容；不要为了凑条数而重复表达。"
 
 [server_config]
+enabled = true
 url = "https://api.deepseek.com/chat/completions"
 model_name = "deepseek-v4-flash"
 wire_api = "chat_completions"
@@ -37,8 +38,6 @@ decision_cooldown_secs = 60
 decision_rate_window_secs = 600
 decision_rate_limit = 3
 interjection_max_output_tokens = 240
-conversation_window_secs = 180
-conversation_open_floor_secs = 45
 direct_spam_cooldown_secs = 600
 direct_rate_window_secs = 60
 direct_rate_limit = 4
@@ -69,6 +68,60 @@ autonomous_query_max_days = 3650
 [mind]
 # Mind v2 participates in normal Core decisions by default.
 influence_mode = "active"
+
+[executive]
+enabled = true
+shadow_mode = true
+
+[executive.conflict]
+threshold = 0.60
+max_active = 16
+
+[executive.confidence]
+max_normal_delta = 0.20
+
+[executive.priority]
+aging_enabled = true
+
+[executive.attention_budget]
+capacity = 20.0
+critical_reserve = 6.0
+
+[executive.plan]
+max_revisions = 3
+
+[executive.expectation]
+max_pending_per_scope = 8
+
+[executive.candidate]
+max_candidates = 4
+
+[executive.reflection]
+deep_budget_per_day = 4
+
+[executive.consistency]
+severe_threshold = 0.70
+blocking_threshold = 0.92
+
+[executive.decision_record]
+recent_limit = 32
+
+[model.intrinsic]
+enabled = true
+shadow_routing = true
+asset_dir = "models/yunxi-intrinsic/minimind-3o"
+max_parallel = 1
+max_context_tokens = 2048
+max_new_tokens = 256
+max_images_per_turn = 1
+max_image_bytes = 8388608
+max_image_pixels = 4000000
+queue_timeout_ms = 15000
+startup_self_test = true
+
+[model.fallback]
+strong_to_intrinsic = true
+max_model_attempts = 2
 
 [message_batch]
 enabled = true

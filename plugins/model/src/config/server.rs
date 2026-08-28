@@ -12,6 +12,8 @@ use url::Url;
 #[derive(Deserialize, Debug, Serialize, Clone, PartialEq)]
 #[serde(default)]
 pub struct ServerConfig {
+    /// 是否启用外部强模型。关闭后 Core/Intrinsic 仍可独立运行。
+    enabled: bool,
     /// AI模型服务器API地址
     url: String,
     /// 使用的模型名称
@@ -35,6 +37,10 @@ pub struct ServerConfig {
 }
 
 impl ServerConfig {
+    pub const fn enabled(&self) -> bool {
+        self.enabled
+    }
+
     pub fn url(&self) -> &str {
         self.url.as_str()
     }
@@ -91,6 +97,23 @@ impl ServerConfig {
 
     /// 验证服务器配置
     pub fn validate(&self) -> anyhow::Result<()> {
+        if !matches!(self.wire_api.as_str(), "responses" | "chat_completions") {
+            return Err(anyhow::anyhow!(
+                "server.wire_api 只支持 responses 或 chat_completions"
+            ));
+        }
+        if self.max_output_tokens < 128 {
+            return Err(anyhow::anyhow!("server.max_output_tokens 不能小于 128"));
+        }
+        if self.request_timeout_secs == 0 {
+            return Err(anyhow::anyhow!("server.request_timeout_secs 必须大于 0"));
+        }
+
+        if !self.enabled {
+            println!("[INFO] 外部强模型已禁用，使用本地 Core/Intrinsic 能力");
+            return Ok(());
+        }
+
         if self.url.is_empty() {
             return Err(anyhow::anyhow!("服务器URL不能为空"));
         }
@@ -100,19 +123,8 @@ impl ServerConfig {
         if self.model_name.is_empty() {
             return Err(anyhow::anyhow!("模型名称不能为空"));
         }
-        if !matches!(self.wire_api.as_str(), "responses" | "chat_completions") {
-            return Err(anyhow::anyhow!(
-                "server.wire_api 只支持 responses 或 chat_completions"
-            ));
-        }
         if self.api_key_env.trim().is_empty() {
             return Err(anyhow::anyhow!("server.api_key_env 不能为空"));
-        }
-        if self.max_output_tokens < 128 {
-            return Err(anyhow::anyhow!("server.max_output_tokens 不能小于 128"));
-        }
-        if self.request_timeout_secs == 0 {
-            return Err(anyhow::anyhow!("server.request_timeout_secs 必须大于 0"));
         }
 
         println!(
@@ -150,6 +162,7 @@ fn is_loopback_host(host: &str) -> bool {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
+            enabled: true,
             url: "https://api.deepseek.com/chat/completions".to_string(),
             model_name: "deepseek-v4-flash".to_string(),
             wire_api: "chat_completions".to_string(),
@@ -171,6 +184,7 @@ mod tests {
     #[test]
     fn deepseek_default_is_text_only() {
         let config = ServerConfig::default();
+        assert!(config.enabled());
         assert_eq!(config.wire_api(), "chat_completions");
         assert!(!config.supports_vision());
         assert_eq!(config.api_key_env(), "BOT_API_TOKEN");
@@ -200,5 +214,17 @@ mod tests {
             ..ServerConfig::default()
         };
         assert!(loopback.validate().is_ok());
+    }
+
+    #[test]
+    fn disabled_external_model_does_not_require_endpoint_or_token() {
+        let config = ServerConfig {
+            enabled: false,
+            url: String::new(),
+            model_name: String::new(),
+            api_key_env: String::new(),
+            ..ServerConfig::default()
+        };
+        assert!(config.validate().is_ok());
     }
 }
