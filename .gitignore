@@ -10,3 +10,7 @@ bot_memory.json
 bot_memory.json.tmp
 bot_memory.json.corrupt.*
 .DS_Store
+
+# Intrinsic model runtime bundles are distributed as versioned external assets.
+# Keep the default asset directory out of Git; the downloader recreates it.
+/models/yunxi-intrinsic/

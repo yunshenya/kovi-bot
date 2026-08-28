@@ -1,0 +1,25 @@
+Yunxi Intrinsic model asset notice
+==================================
+
+Model: jingyaogong/minimind-3o
+Source repository: https://github.com/jingyaogong/minimind-o
+Upstream revision: ccab6d98520ac5ac5d7583a3fa21a65105137e28
+Hugging Face revision: ee3febbd08cc5b2bd41c039c825a8934232fee33
+
+The upstream MiniMind project is distributed under the Apache License 2.0.
+The license text and any additional upstream notices should be reviewed from
+the source repository before redistribution outside this repository.
+
+The full bundle uses the text Thinker weights and the vision projector from
+the Omni checkpoint. The audio path is intentionally outside the V3 runtime
+boundary.
+
+The vision encoder is a trimmed SigLIP2 ViT-B/32 checkpoint:
+  Source model: google/siglip2-base-patch32-256
+  Distribution: jingyaogong/siglip2-base-p32-256-ve
+  Hugging Face revision: 9465d1dc89db6bc6227c5b6b0e0ca9b940325d62
+  License metadata: Apache-2.0 (see vision/README.md in the full bundle)
+
+The vision weights are used only for local, inference-only image encoding.
+The corresponding source model license and any applicable notices remain part
+of the distribution obligations for this asset.

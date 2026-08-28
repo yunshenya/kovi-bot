@@ -31,6 +31,28 @@ set +a
 cargo run --locked
 ```
 
+### 可选的本地 Intrinsic 模型
+
+Intrinsic 模型不是编译进可执行文件的；运行时会从
+`model.intrinsic.asset_dir` 读取外部 bundle。权重不放进 Git，首次需要本地推理时再下载：
+
+```bash
+# 只下载文字模型（约 216 MiB）
+./scripts/download-model.sh --variant text
+
+# 需要本地截图/图片推理时，下载包含视觉编码器的完整 bundle（约 416 MB）
+./scripts/download-model.sh --variant full
+```
+
+脚本默认从固定 revision 的 Hugging Face 地址下载，并在安装前按 bundle manifest 校验每个
+文件的大小和 SHA-256；可通过 `--language-base-url`、`--vision-base-url` 或对应环境变量
+切换到镜像。模型包的 manifest、来源和第三方许可说明保存在 `model-assets/`，实际运行目录
+`models/yunxi-intrinsic/` 被 `.gitignore` 忽略。
+
+没有下载模型时，Core 仍会使用内置的 deterministic fallback；要启用完整本地模型，必须把
+对应变体下载到默认目录，并从项目根目录启动程序。文字包的 manifest 明确关闭视觉能力，不能
+只下载视觉权重后单独使用。
+
 不依赖 Kovi、OneBot 或 QQ 的 Core 验收宿主：
 
 ```bash
@@ -155,7 +177,6 @@ min_eligible_messages = 8
 cooldown_secs = 180
 response_probability_percent = 35
 min_message_chars = 5
-conversation_window_secs = 180
 direct_spam_cooldown_secs = 600
 direct_rate_window_secs = 60
 direct_rate_limit = 4

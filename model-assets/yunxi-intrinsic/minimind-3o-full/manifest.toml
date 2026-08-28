@@ -1,0 +1,66 @@
+manifest_version = 1
+model_id = "jingyaogong/minimind-3o"
+model_version = "hf-ee3febbd08cc5b2bd41c039c825a8934232fee33"
+architecture = "MiniMindOmni/Thinker"
+upstream_repository = "https://github.com/jingyaogong/minimind-o"
+upstream_revision = "ccab6d98520ac5ac5d7583a3fa21a65105137e28"
+supports_text = true
+supports_vision = true
+supports_audio = false
+context_limit = 2048
+image_size = 256
+
+[[assets]]
+path = "config.json"
+sha256 = "13ed7f8f6759d292b1948fc29d03a1ebf5c1b131d26cefcb19e86dad975784b6"
+size_bytes = 1332
+
+[[assets]]
+path = "tokenizer.json"
+sha256 = "71f32c68cf63a15355a8fc171b7594b3d41870fe0ddb54fc6aefa55f73a4a668"
+size_bytes = 451182
+
+[[assets]]
+path = "tokenizer_config.json"
+sha256 = "04ae7620b9cf93fd2d6fbf94936b0c3c4be65f30cd6ef6fa8741baac986525d1"
+size_bytes = 7545
+
+[[assets]]
+path = "special_tokens_map.json"
+sha256 = "f85ecedc16cf0083242e21ac2ef23ac613153b71240c7d2ab61de24f085d2db9"
+size_bytes = 1059
+
+[[assets]]
+path = "generation_config.json"
+sha256 = "cd22f08997eb2353c809a1d9b523c42c924247eb8619aa3e408bba3448f6e270"
+size_bytes = 111
+
+[[assets]]
+path = "chat_template.jinja"
+sha256 = "97c6a9ef3f8d35044f435bb7773f1af160a7328ab6e8d2e9d67702941320a711"
+size_bytes = 3895
+
+[[assets]]
+path = "pytorch_model.bin"
+sha256 = "21530f9bbc540f461e2c0e29292ad359781d4d984d1e0c994510945f9b0edaab"
+size_bytes = 226324754
+
+[[assets]]
+path = "vision/config.json"
+sha256 = "5ad8dda7d55541c7749f9b1cc43fe8eb8c70d8664588d89f710242ce06b3167e"
+size_bytes = 410
+
+[[assets]]
+path = "vision/preprocessor_config.json"
+sha256 = "d14ba2ee3fd816f3de8abaddc31953565128eaf37c73ad4bed32101a98465aff"
+size_bytes = 394
+
+[[assets]]
+path = "vision/README.md"
+sha256 = "7276ff3ab08b8d2bdd16e11de24c523d860e08141160529806a75c0526f03aa4"
+size_bytes = 1432
+
+[[assets]]
+path = "vision/model.safetensors"
+sha256 = "c1e9cc19ed6704b87353ee00b9ff5d6191886d741898339984364f789c62810d"
+size_bytes = 189129296
