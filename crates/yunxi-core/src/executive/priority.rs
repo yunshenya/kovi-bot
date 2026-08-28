@@ -156,17 +156,9 @@ pub struct GoalArbitration {
     pub ranked: Vec<PrioritizedGoal>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct GoalArbitrator {
     config: GoalArbitratorConfig,
-}
-
-impl Default for GoalArbitrator {
-    fn default() -> Self {
-        Self {
-            config: GoalArbitratorConfig::default(),
-        }
-    }
 }
 
 impl GoalArbitrator {

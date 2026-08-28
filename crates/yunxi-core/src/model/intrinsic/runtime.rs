@@ -392,9 +392,8 @@ impl IntrinsicModelRuntime {
         let result = self.engine.classify_completion(&request).await;
         drop(permit);
         self.metrics.inferences.fetch_add(1, Ordering::Relaxed);
-        result.map_err(|error| {
+        result.inspect_err(|_| {
             self.metrics.failures.fetch_add(1, Ordering::Relaxed);
-            error
         })
     }
 

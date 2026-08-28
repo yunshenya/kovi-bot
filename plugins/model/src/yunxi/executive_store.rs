@@ -1303,7 +1303,7 @@ impl ExpectationStore for PostgresExecutiveStore {
                 .map_err(|reason| invalid(reason.to_owned()))?;
             let value = encode_value(expectation, MAX_EXPECTATION_BYTES, "expectation")?;
             let expected_event = serde_json::to_value(&expectation.expected_event)
-                .map_err(|error| ExecutivePersistenceError::storage(error))?;
+                .map_err(ExecutivePersistenceError::storage)?;
             let parts = scope_parts(&ExecutiveScope::Global)?;
             let mut transaction = self
                 .pool
@@ -1355,7 +1355,7 @@ impl ExpectationStore for PostgresExecutiveStore {
                 .map_err(|reason| invalid(reason.to_owned()))?;
             let value = encode_value(expectation, MAX_EXPECTATION_BYTES, "expectation")?;
             let expected_event = serde_json::to_value(&expectation.expected_event)
-                .map_err(|error| ExecutivePersistenceError::storage(error))?;
+                .map_err(ExecutivePersistenceError::storage)?;
             let mut transaction = self
                 .pool
                 .begin()
@@ -2291,9 +2291,10 @@ mod tests {
     }
 
     fn snapshot(version: u64) -> ExecutiveSnapshot {
-        let mut snapshot = ExecutiveSnapshot::default();
-        snapshot.version = version;
-        snapshot
+        ExecutiveSnapshot {
+            version,
+            ..ExecutiveSnapshot::default()
+        }
     }
 
     fn plan(now: chrono::DateTime<Utc>) -> PlanState {

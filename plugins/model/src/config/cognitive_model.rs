@@ -2,7 +2,7 @@ use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use yunxi_core::{IntrinsicRuntimeConfig, ModelFallbackPolicy, ModelMediaLimits};
 
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+#[derive(Debug, Default, Deserialize, Serialize, Clone, PartialEq)]
 #[serde(default)]
 pub struct CognitiveModelConfig {
     intrinsic: IntrinsicConfig,
@@ -30,15 +30,6 @@ pub struct IntrinsicConfig {
 pub struct ModelFallbackConfig {
     strong_to_intrinsic: bool,
     max_model_attempts: u8,
-}
-
-impl Default for CognitiveModelConfig {
-    fn default() -> Self {
-        Self {
-            intrinsic: IntrinsicConfig::default(),
-            fallback: ModelFallbackConfig::default(),
-        }
-    }
 }
 
 impl Default for IntrinsicConfig {

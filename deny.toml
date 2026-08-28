@@ -7,7 +7,9 @@ targets = [
 [advisories]
 version = 2
 yanked = "deny"
-ignore = []
+ignore = [
+    { id = "RUSTSEC-2024-0436", reason = "paste is a transitive proc-macro dependency of candle-core/tokenizers; no compatible maintained replacement is available in the current dependency versions. Revisit when those upstream crates update." },
+]
 
 [licenses]
 version = 2

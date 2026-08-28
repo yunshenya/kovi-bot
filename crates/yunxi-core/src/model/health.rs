@@ -2,12 +2,13 @@
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelHealth {
     Loading,
     Healthy,
     Degraded,
+    #[default]
     Unavailable,
 }
 
@@ -25,11 +26,5 @@ impl ModelHealth {
     #[must_use]
     pub const fn can_serve(self) -> bool {
         self.is_available()
-    }
-}
-
-impl Default for ModelHealth {
-    fn default() -> Self {
-        Self::Unavailable
     }
 }

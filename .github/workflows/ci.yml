@@ -226,7 +226,8 @@ jobs:
         run: ripsecrets --strict-ignore .
 
       - name: Check advisories
-        run: cargo audit --deny warnings
+        # paste is transitive from candle-core/tokenizers; see deny.toml for the review rationale.
+        run: cargo audit --deny warnings --ignore RUSTSEC-2024-0436
 
       - name: Check licenses, sources, and dependency policy
         run: cargo deny --all-features check

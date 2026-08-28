@@ -486,10 +486,13 @@ fn validate_config(config: &SiglipConfigFile) -> Result<(), String> {
             config.num_channels
         ));
     }
-    if config.image_size % config.patch_size != 0 {
+    if !config.image_size.is_multiple_of(config.patch_size) {
         return Err("SigLIP image size must be divisible by patch size".to_owned());
     }
-    if config.hidden_size % config.num_attention_heads != 0 {
+    if !config
+        .hidden_size
+        .is_multiple_of(config.num_attention_heads)
+    {
         return Err("SigLIP hidden size is not divisible by attention heads".to_owned());
     }
     if !config.layer_norm_eps.is_finite() || config.layer_norm_eps <= 0.0 {

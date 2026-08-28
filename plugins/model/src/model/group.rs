@@ -1409,16 +1409,11 @@ async fn stop_group_reply(group_id: i64, user_id: i64, ingress: ReplyTicket) {
     let scope = ReplyScope::Group(group_id);
     let scope_lock = scope_mutex(scope);
     let _scope_guard = scope_lock.lock().await;
-    let cancelled = ConversationCoordinator::cancel_current_incoming_locked(ingress)
-        .await
-        .is_some();
+    let _ = ConversationCoordinator::cancel_current_incoming_locked(ingress).await;
     GROUP_MESSAGE_BATCHES.cancel((group_id, user_id)).await;
     PENDING_WINDOW_MESSAGES.lock().await.remove(&group_id);
     if let Some(state) = GROUP_INTERJECTION_STATE.lock().await.get_mut(&group_id) {
         state.conversation.close();
-    }
-    if !cancelled {
-        return;
     }
 }
 

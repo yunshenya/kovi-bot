@@ -1155,59 +1155,6 @@ where
     )))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{ExecutiveSaveState, finish_executive_erasure_state};
-
-    #[test]
-    fn successful_global_erasure_keeps_post_clear_requests_dirty() {
-        let mut state = ExecutiveSaveState {
-            dirty: true,
-            requested_version: 12,
-            erasure_epoch: 1,
-            erasure_blocked: true,
-            erasure_start_version: 10,
-        };
-
-        assert!(finish_executive_erasure_state(&mut state, 14, Some(13)));
-        assert!(!state.erasure_blocked);
-        assert!(state.dirty);
-        assert_eq!(state.requested_version, 14);
-        assert_eq!(state.erasure_start_version, 0);
-    }
-
-    #[test]
-    fn successful_scoped_erasure_drops_only_pre_barrier_state() {
-        let mut state = ExecutiveSaveState {
-            dirty: false,
-            requested_version: 9,
-            erasure_epoch: 1,
-            erasure_blocked: true,
-            erasure_start_version: 9,
-        };
-
-        assert!(!finish_executive_erasure_state(&mut state, 9, None));
-        assert!(!state.erasure_blocked);
-        assert!(!state.dirty);
-        assert_eq!(state.requested_version, 0);
-    }
-
-    #[test]
-    fn request_recorded_while_blocked_is_not_lost_when_version_is_unchanged() {
-        let mut state = ExecutiveSaveState {
-            dirty: true,
-            requested_version: 9,
-            erasure_epoch: 1,
-            erasure_blocked: true,
-            erasure_start_version: 9,
-        };
-
-        assert!(finish_executive_erasure_state(&mut state, 9, None));
-        assert!(state.dirty);
-        assert_eq!(state.requested_version, 9);
-    }
-}
-
 /// Remove the canonical Core person and all QQ direct conversations belonging
 /// to this user across bot accounts. This complements the legacy subsystem
 /// deletions used by `#删除我的数据 确认`.
@@ -1290,4 +1237,57 @@ pub(crate) async fn unlink_external_identity(platform: &str, external_id: &str) 
     let _ = refresh_owner_route_while_locked().await;
     let unlinked = unlinked?;
     Ok(unlinked)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ExecutiveSaveState, finish_executive_erasure_state};
+
+    #[test]
+    fn successful_global_erasure_keeps_post_clear_requests_dirty() {
+        let mut state = ExecutiveSaveState {
+            dirty: true,
+            requested_version: 12,
+            erasure_epoch: 1,
+            erasure_blocked: true,
+            erasure_start_version: 10,
+        };
+
+        assert!(finish_executive_erasure_state(&mut state, 14, Some(13)));
+        assert!(!state.erasure_blocked);
+        assert!(state.dirty);
+        assert_eq!(state.requested_version, 14);
+        assert_eq!(state.erasure_start_version, 0);
+    }
+
+    #[test]
+    fn successful_scoped_erasure_drops_only_pre_barrier_state() {
+        let mut state = ExecutiveSaveState {
+            dirty: false,
+            requested_version: 9,
+            erasure_epoch: 1,
+            erasure_blocked: true,
+            erasure_start_version: 9,
+        };
+
+        assert!(!finish_executive_erasure_state(&mut state, 9, None));
+        assert!(!state.erasure_blocked);
+        assert!(!state.dirty);
+        assert_eq!(state.requested_version, 0);
+    }
+
+    #[test]
+    fn request_recorded_while_blocked_is_not_lost_when_version_is_unchanged() {
+        let mut state = ExecutiveSaveState {
+            dirty: true,
+            requested_version: 9,
+            erasure_epoch: 1,
+            erasure_blocked: true,
+            erasure_start_version: 9,
+        };
+
+        assert!(finish_executive_erasure_state(&mut state, 9, None));
+        assert!(state.dirty);
+        assert_eq!(state.requested_version, 9);
+    }
 }

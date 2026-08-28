@@ -188,7 +188,7 @@ impl IntrinsicHostRuntime {
             return InputCompletion::Incomplete;
         }
         let config = self.runtime.config();
-        let max_context_tokens = config.max_context_tokens.min(512).max(1);
+        let max_context_tokens = config.max_context_tokens.clamp(1, 512);
         let input_budget = max_context_tokens.saturating_sub(128).max(1);
         let bounded = yunxi_core::truncate_to_tokens(text, input_budget);
         let request = TextInferenceRequest {
@@ -220,9 +220,7 @@ impl IntrinsicHostRuntime {
 
 pub(crate) fn install() -> Arc<IntrinsicHostRuntime> {
     let runtime = IntrinsicHostRuntime::load();
-    HOST_RUNTIME
-        .set(Arc::clone(&runtime))
-        .unwrap_or_else(|_| ());
+    HOST_RUNTIME.set(Arc::clone(&runtime)).unwrap_or(());
     HOST_RUNTIME.get().cloned().unwrap_or(runtime)
 }
 

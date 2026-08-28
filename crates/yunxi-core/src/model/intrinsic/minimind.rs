@@ -983,7 +983,10 @@ fn validate_config(config: &MiniMindConfigFile) -> Result<(), String> {
     {
         return Err("MiniMind config contains a zero dimension".to_owned());
     }
-    if config.num_attention_heads % config.num_key_value_heads != 0 {
+    if !config
+        .num_attention_heads
+        .is_multiple_of(config.num_key_value_heads)
+    {
         return Err("attention heads are not divisible by key/value heads".to_owned());
     }
     if !config.rms_norm_eps.is_finite() || config.rms_norm_eps <= 0.0 {

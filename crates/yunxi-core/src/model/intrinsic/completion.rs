@@ -67,8 +67,7 @@ pub fn lexical_completion(text: &str) -> Option<InputCompletion> {
         "哈哈",
         "哈哈哈",
     ]
-    .iter()
-    .any(|phrase| text == *phrase)
+    .contains(&text)
     {
         return Some(InputCompletion::Complete);
     }

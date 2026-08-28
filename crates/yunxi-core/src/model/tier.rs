@@ -4,12 +4,15 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// A capability level is deliberately independent from a provider name.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum CognitiveTier {
     /// Rust-only deterministic behavior. No generative quality is promised.
     Reflex,
     /// The model shipped with Yunxi, when healthy enough for the request.
+    #[default]
     Intrinsic,
     /// A host-provided normal model.
     Standard,
@@ -41,12 +44,6 @@ impl CognitiveTier {
     #[must_use]
     pub const fn at_least(self, other: Self) -> bool {
         (self as u8) >= (other as u8)
-    }
-}
-
-impl Default for CognitiveTier {
-    fn default() -> Self {
-        Self::Intrinsic
     }
 }
 

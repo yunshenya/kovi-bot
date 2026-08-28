@@ -179,18 +179,16 @@ fn detect_dimensions(
             u32::from(u16::from_le_bytes([bytes[8], bytes[9]])),
         ));
     }
-    if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
-        if bytes.len() >= 30 && &bytes[12..16] == b"VP8X" {
-            let width = 1
-                + u32::from(bytes[24])
-                + (u32::from(bytes[25]) << 8)
-                + (u32::from(bytes[26]) << 16);
-            let height = 1
-                + u32::from(bytes[27])
-                + (u32::from(bytes[28]) << 8)
-                + (u32::from(bytes[29]) << 16);
-            return Ok((width, height));
-        }
+    if bytes.len() >= 30
+        && &bytes[..4] == b"RIFF"
+        && &bytes[8..12] == b"WEBP"
+        && &bytes[12..16] == b"VP8X"
+    {
+        let width =
+            1 + u32::from(bytes[24]) + (u32::from(bytes[25]) << 8) + (u32::from(bytes[26]) << 16);
+        let height =
+            1 + u32::from(bytes[27]) + (u32::from(bytes[28]) << 8) + (u32::from(bytes[29]) << 16);
+        return Ok((width, height));
     }
     if bytes.len() >= 4 && bytes[..2] == [0xff, 0xd8] {
         return jpeg_dimensions(bytes).ok_or(ModelMediaError::InvalidFormat);
