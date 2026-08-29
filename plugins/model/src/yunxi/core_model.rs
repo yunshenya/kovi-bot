@@ -2517,18 +2517,23 @@ fn direct_fallback_plan(input: &PlannerInput, cues: InteractionCues) -> Option<D
     })
 }
 
-fn message_id_for_log(input: &PlannerInput) -> MessageId {
-    match input.event.kind() {
-        WorldEventKind::MessageReceived(message) => message.message_id,
-        _ => unreachable!("message id logging requires a message event"),
-    }
+fn message_id_for_log(input: &PlannerInput) -> String {
+    input
+        .event
+        .source_message_id()
+        .map_or_else(|| "none".to_string(), |message_id| message_id.to_string())
 }
 
-fn conversation_id_for_log(input: &PlannerInput) -> ConversationId {
-    match input.event.kind() {
-        WorldEventKind::MessageReceived(message) => message.conversation_id,
-        _ => unreachable!("conversation id logging requires a message event"),
-    }
+fn conversation_id_for_log(input: &PlannerInput) -> String {
+    input
+        .event
+        .scope()
+        .conversation_id()
+        .or_else(|| input.state.conversation_id())
+        .map_or_else(
+            || "none".to_string(),
+            |conversation_id| conversation_id.to_string(),
+        )
 }
 
 fn due_reply_target(scope: yunxi_core::EventScope) -> Option<VisibleReplyTarget> {
@@ -3277,11 +3282,12 @@ impl ModelBackend for KoviModelBackend {
             );
             if invalid_tool_output {
                 kovi::log::warn!(
-                    "Yunxi Core invalid tool protocol: event_id={} message_id={} conversation_id={} direct_reply_expected={} {}",
+                    "Yunxi Core invalid tool protocol: event_id={} message_id={} conversation_id={} direct_reply_expected={} tool_follow_up={} {}",
                     input.event.id(),
                     message_id_for_log(input),
                     conversation_id_for_log(input),
                     direct_reply_expected(input),
+                    tool_follow_up,
                     core_tool_protocol_diagnostic(&parsed_response.content),
                 );
             }
@@ -3307,14 +3313,14 @@ impl ModelBackend for KoviModelBackend {
                 ReplyPlan::from_model_output(conversation.scope(), &response_content).await
             };
             if invalid_tool_output
-                && direct_reply_expected(input)
+                && (direct_reply_expected(input) || tool_follow_up)
                 && is_current(ticket).await
                 && !fallback_response
                 && !intrinsic_response
             {
                 mind_candidates = MindCandidates::default();
                 kovi::log::warn!(
-                    "Yunxi Core direct reply repair: event_id={} message_id={} conversation_id={} reason=invalid_tool_protocol",
+                    "Yunxi Core reply repair: event_id={} message_id={} conversation_id={} reason=invalid_tool_protocol",
                     input.event.id(),
                     message_id_for_log(input),
                     conversation_id_for_log(input),
@@ -3334,7 +3340,7 @@ impl ModelBackend for KoviModelBackend {
                         mind_output_eligible = false;
                         plan = repaired;
                         kovi::log::info!(
-                            "Yunxi Core direct reply repair succeeded: event_id={} message_id={} conversation_id={} repair_result=reply",
+                            "Yunxi Core reply repair succeeded: event_id={} message_id={} conversation_id={} repair_result=reply",
                             input.event.id(),
                             message_id_for_log(input),
                             conversation_id_for_log(input),
@@ -3355,7 +3361,7 @@ impl ModelBackend for KoviModelBackend {
                         {
                             crate::model::finish(ticket).await;
                             kovi::log::info!(
-                                "Yunxi Core direct reply repair produced tool action: event_id={} message_id={} conversation_id={} reason=invalid_tool_protocol",
+                                "Yunxi Core reply repair produced tool action: event_id={} message_id={} conversation_id={} reason=invalid_tool_protocol",
                                 input.event.id(),
                                 message_id_for_log(input),
                                 conversation_id_for_log(input),
@@ -3384,14 +3390,14 @@ impl ModelBackend for KoviModelBackend {
                 }
             }
             if !core_plan_has_visible_text(&plan)
-                && direct_reply_expected(input)
+                && (direct_reply_expected(input) || tool_follow_up)
                 && is_current(ticket).await
                 && !fallback_response
                 && !intrinsic_response
             {
                 mind_candidates = MindCandidates::default();
                 kovi::log::warn!(
-                    "Yunxi Core direct reply repair: event_id={} message_id={} conversation_id={} reason=empty_or_silent_plan disposition={:?}",
+                    "Yunxi Core reply repair: event_id={} message_id={} conversation_id={} reason=empty_or_silent_plan disposition={:?}",
                     input.event.id(),
                     message_id_for_log(input),
                     conversation_id_for_log(input),
@@ -3412,7 +3418,7 @@ impl ModelBackend for KoviModelBackend {
                         mind_output_eligible = false;
                         plan = repaired;
                         kovi::log::info!(
-                            "Yunxi Core direct reply repair succeeded: event_id={} message_id={} conversation_id={}",
+                            "Yunxi Core reply repair succeeded: event_id={} message_id={} conversation_id={}",
                             input.event.id(),
                             message_id_for_log(input),
                             conversation_id_for_log(input),
@@ -3433,7 +3439,7 @@ impl ModelBackend for KoviModelBackend {
                         {
                             crate::model::finish(ticket).await;
                             kovi::log::info!(
-                                "Yunxi Core direct reply repair produced tool action: event_id={} message_id={} conversation_id={}",
+                                "Yunxi Core reply repair produced tool action: event_id={} message_id={} conversation_id={}",
                                 input.event.id(),
                                 message_id_for_log(input),
                                 conversation_id_for_log(input),
@@ -3462,11 +3468,11 @@ impl ModelBackend for KoviModelBackend {
                 }
             }
             if !core_plan_has_visible_text(&plan)
-                && direct_reply_expected(input)
+                && (direct_reply_expected(input) || tool_follow_up)
                 && is_current(ticket).await
             {
                 kovi::log::warn!(
-                    "Yunxi Core direct reply fallback: event_id={} message_id={} conversation_id={} reason=final_plan_still_invisible",
+                    "Yunxi Core reply fallback: event_id={} message_id={} conversation_id={} reason=final_plan_still_invisible",
                     input.event.id(),
                     message_id_for_log(input),
                     conversation_id_for_log(input),
@@ -3656,14 +3662,15 @@ mod tests {
         HostModelRoutingContext, HostToolTurnRegistrationPolicy, HostToolTurnRegistry,
         MAX_CORE_PROTOCOL_LOG_PREVIEW_CHARS, PersistentRouteLookup, QqConversation, RouteContext,
         VisibleReplyTarget, baseline_disposition, classify_persistent_person_identity,
-        core_message_prompt, core_plan_has_visible_text, core_tool_protocol_diagnostic,
-        defer_unroutable_due, direct_fallback_plan, direct_fallback_reply_plan,
-        direct_reply_expected, due_reply_target, eligible_mind_candidates,
-        interaction_state_updates_with_cues, intrinsic_output_is_unsafe, intrinsic_prompt,
-        keeps_existing_prepared_plan, mind_context_messages, parse_core_response,
-        parse_core_tool_intent, parse_core_tool_intents, parse_core_tool_intents_with_policy,
-        parse_direct_repair_output, parse_direct_repair_output_with_policy, parse_qq_conversation,
-        pre_model_plan, prepared_outgoing_semantic_context, purge_group_routes_from_cache,
+        conversation_id_for_log, core_message_prompt, core_plan_has_visible_text,
+        core_tool_protocol_diagnostic, defer_unroutable_due, direct_fallback_plan,
+        direct_fallback_reply_plan, direct_reply_expected, due_reply_target,
+        eligible_mind_candidates, interaction_state_updates_with_cues, intrinsic_output_is_unsafe,
+        intrinsic_prompt, keeps_existing_prepared_plan, message_id_for_log, mind_context_messages,
+        parse_core_response, parse_core_tool_intent, parse_core_tool_intents,
+        parse_core_tool_intents_with_policy, parse_direct_repair_output,
+        parse_direct_repair_output_with_policy, parse_qq_conversation, pre_model_plan,
+        prepared_outgoing_semantic_context, purge_group_routes_from_cache,
         recent_conversation_messages, recent_direct_conversation_messages,
         recent_group_conversation_messages, refine_core_incoming, register_core_tool_intents,
         repair_context_messages, reply_expected_for_incoming, route_from_lookup,
@@ -4192,6 +4199,27 @@ mod tests {
         let input = message_input(PersonId::new(), false);
         assert!(!direct_reply_expected(&input));
         assert!(direct_fallback_plan(&input, InteractionCues::default()).is_none());
+    }
+
+    #[test]
+    fn log_identifiers_support_tool_follow_up_events() {
+        let conversation_id = ConversationId::new();
+        let input = PlannerInput::new(
+            WorldEvent::new(
+                Utc::now(),
+                EventScope::Conversation { conversation_id },
+                EventPriority::High,
+                WorldEventKind::ToolCompleted(yunxi_core::ToolCompletedEvent {
+                    operation: "weather.current".to_string(),
+                    output: "晴".to_string(),
+                    requires_follow_up: true,
+                }),
+            ),
+            PlannerStateSnapshot::empty(),
+        );
+
+        assert_eq!(message_id_for_log(&input), "none");
+        assert_eq!(conversation_id_for_log(&input), conversation_id.to_string());
     }
 
     #[test]
