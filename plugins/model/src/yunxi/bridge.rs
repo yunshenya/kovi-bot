@@ -26,11 +26,11 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 use yunxi_core::{
     ActionArbiter, ActionArbiterConfig, ActionPort, ActionResult, Admission, Attachment,
-    AttachmentKind, CognitiveRuntime, ConversationId, ConversationKind, ConversationMemberStore,
-    CoreServices, EnvironmentCapabilities, EventPriority, EventScope, ExternalConversation,
-    IdentityStore, MessageCollisionDetectedEvent, MessageContent, MessageId, MessageReceivedEvent,
-    ModelBackend, OpenLoopStore, PlannedProcessingOutcome, ProcessingOutcome, ProposedAction,
-    RuntimeConfig, RuntimeHandle, WorldEvent, WorldEventKind,
+    AttachmentKind, CognitiveIntent, CognitiveRuntime, ConversationId, ConversationKind,
+    ConversationMemberStore, CoreServices, EnvironmentCapabilities, EventPriority, EventScope,
+    EventType, ExternalConversation, IdentityStore, MessageCollisionDetectedEvent, MessageContent,
+    MessageId, MessageReceivedEvent, ModelBackend, OpenLoopStore, PlannedProcessingOutcome,
+    ProcessingOutcome, ProposedAction, RuntimeConfig, RuntimeHandle, WorldEvent, WorldEventKind,
 };
 
 pub(crate) const CORE_INGRESS_CAPACITY: usize = 256;
@@ -756,6 +756,26 @@ impl CoreBridge {
         event: WorldEvent,
     ) -> Result<Admission, yunxi_core::SubmitError> {
         self.runtime.submit(event).await
+    }
+
+    /// Submit one bounded autonomous conversation turn. The caller has already
+    /// claimed the conversation in the host-side autonomous registry; Core
+    /// still applies its normal event queue, attention, planner, arbiter, and
+    /// delivery boundaries.
+    pub(crate) async fn submit_autonomous_conversation_tick(
+        &self,
+        conversation_id: ConversationId,
+    ) -> Result<Admission, yunxi_core::SubmitError> {
+        self.runtime
+            .submit(WorldEvent::new(
+                Utc::now(),
+                EventScope::Conversation { conversation_id },
+                EventPriority::Low,
+                WorldEventKind::AutonomousConversationTick(
+                    yunxi_core::AutonomousConversationTickEvent,
+                ),
+            ))
+            .await
     }
 
     pub(crate) async fn project_destination(
@@ -1966,6 +1986,7 @@ async fn begin_data_erasure_at_ingress_barrier(
             return Err(anyhow::Error::from(error));
         }
     };
+    super::autonomous::forget(&targets.direct_conversation_ids);
     // From this point onward Core's FIFO barrier is live. Retain the host
     // permits even if a later purge fails, so ingress cannot reopen around
     // data that has not yet been fully erased.
@@ -2176,6 +2197,7 @@ async fn begin_group_data_erasure_at_ingress_barrier(
             .await
             .map_err(anyhow::Error::from)?
     };
+    super::autonomous::forget(&conversation_ids);
     // Mark the barrier before later cleanup can fail. An error after this
     // point deliberately leaves both Core and host ingress closed.
     active.insert(group_id, conversation_ids.clone());
@@ -2332,6 +2354,46 @@ async fn run_runtime(
                     actions,
                     ..
                 }) => {
+                    let autonomous_tick =
+                        observation.event_type == EventType::AutonomousConversationTick;
+                    let mut autonomous_delivered = false;
+                    for (intent, action) in plan.intents.iter().zip(actions.iter()) {
+                        if let CognitiveIntent::SendMessage {
+                            conversation_id, ..
+                        } = intent
+                            && matches!(
+                                action,
+                                ActionResult::Executed {
+                                    outcome: yunxi_core::ActionPortOutcome::Delivered { .. },
+                                    ..
+                                }
+                            )
+                        {
+                            super::autonomous::record_outbound(*conversation_id, Utc::now());
+                            if autonomous_tick {
+                                autonomous_delivered = true;
+                            }
+                        }
+                    }
+                    if autonomous_tick {
+                        if let Some(conversation_id) = observation.scope.conversation_id() {
+                            super::autonomous::finish_claim(conversation_id, Utc::now());
+                        }
+                        if autonomous_delivered
+                            && let Err(error) = crate::memory::MEMORY_MANAGER
+                                .record_proactive_event(
+                                    None,
+                                    &[crate::proactive_chat::GLOBAL_PROACTIVE_STATE_KEY
+                                        .to_string()],
+                                    chrono::Local::now(),
+                                )
+                                .await
+                        {
+                            kovi::log::warn!(
+                                "Yunxi autonomous conversation quota persistence failed: {error}"
+                            );
+                        }
+                    }
                     let has_action_failure = actions.iter().any(|action| !action.is_success());
                     if actions.is_empty() || has_action_failure {
                         kovi::log::warn!(
@@ -2650,6 +2712,18 @@ async fn resolve_and_submit_inner(
                 message_id,
                 from_agent: false,
             },
+        );
+    }
+    if matches!(admission, Admission::Accepted) {
+        super::autonomous::observe_inbound(
+            conversation_id,
+            message.address.kind(),
+            message.timestamp,
+            message.address.kind() == ConversationKind::Direct
+                || message.addressed_to_agent
+                || message.explicit_request
+                || message.planner_attention_requested
+                || recent_agent_reply,
         );
     }
     Ok(())

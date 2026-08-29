@@ -97,6 +97,11 @@ impl AttentionSystem {
                 reason: AttentionReason::ProspectiveMemory,
                 salience: 80,
             },
+            WorldEventKind::AutonomousConversationTick(_) => AttentionResult {
+                disposition: AttentionDisposition::Attend,
+                reason: AttentionReason::RelevantEvent,
+                salience: 55,
+            },
             WorldEventKind::MaintenanceTick => AttentionResult {
                 disposition: AttentionDisposition::Ignore,
                 reason: AttentionReason::Maintenance,
@@ -133,9 +138,9 @@ const fn must_handle(reason: AttentionReason) -> AttentionResult {
 mod tests {
     use super::{AttentionDisposition, AttentionReason, AttentionSystem};
     use crate::event::{
-        EventPriority, EventScope, InteractionCuesObservedEvent, MessageContent,
-        MessageReceivedEvent, ProspectiveMemoryEvent, ReminderDueEvent, ToolCompletedEvent,
-        ToolFailedEvent, WorldEvent, WorldEventKind,
+        AutonomousConversationTickEvent, EventPriority, EventScope, InteractionCuesObservedEvent,
+        MessageContent, MessageReceivedEvent, ProspectiveMemoryEvent, ReminderDueEvent,
+        ToolCompletedEvent, ToolFailedEvent, WorldEvent, WorldEventKind,
     };
     use crate::identity::{ConversationId, ConversationKind, MessageId, PersonId};
     use crate::planner::InteractionCues;
@@ -300,5 +305,22 @@ mod tests {
         let result = AttentionSystem.evaluate(&event);
         assert_eq!(result.disposition, AttentionDisposition::Attend);
         assert_eq!(result.reason, AttentionReason::ProspectiveMemory);
+    }
+
+    #[test]
+    fn autonomous_conversation_ticks_invoke_the_planner() {
+        let event = WorldEvent::new(
+            Utc::now(),
+            EventScope::Conversation {
+                conversation_id: ConversationId::new(),
+            },
+            EventPriority::Low,
+            WorldEventKind::AutonomousConversationTick(AutonomousConversationTickEvent),
+        );
+
+        let result = AttentionSystem.evaluate(&event);
+        assert_eq!(result.disposition, AttentionDisposition::Attend);
+        assert_eq!(result.reason, AttentionReason::RelevantEvent);
+        assert!(result.should_invoke_planner());
     }
 }

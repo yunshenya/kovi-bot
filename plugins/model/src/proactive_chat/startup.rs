@@ -32,6 +32,12 @@ pub(crate) async fn get_or_create_proactive_manager_with_bridge(
     kovi::tokio::spawn(async move {
         manager_clone.start_proactive_chat_loop().await;
     });
+    let autonomous_manager_clone = Arc::clone(&manager);
+    kovi::tokio::spawn(async move {
+        autonomous_manager_clone
+            .start_autonomous_conversation_loop()
+            .await;
+    });
 
     Some(manager)
 }

@@ -33,6 +33,12 @@ daily_limit = 4
 main_admin_daily_limit = 2
 target_cooldown_secs = 21600
 recent_interaction_cooldown_secs = 7200
+# Neuro-sama 风格自主会话：仅对近期已实际回复的会话触发，受单次互动回合数限制。
+autonomous_conversation_enabled = true
+autonomous_conversation_check_interval_secs = 15
+autonomous_conversation_idle_secs = 90
+autonomous_conversation_cooldown_secs = 900
+autonomous_conversation_max_turns = 2
 
 [traffic]
 enabled = true

@@ -32,7 +32,7 @@ use yunxi_core::{
 
 pub mod startup;
 
-const GLOBAL_PROACTIVE_STATE_KEY: &str = "proactive:global";
+pub(crate) const GLOBAL_PROACTIVE_STATE_KEY: &str = "proactive:global";
 
 fn bridge_reach_out_outcome(outcome: &ActionPortOutcome) -> ReachOutDeliveryOutcome {
     match outcome {
@@ -136,6 +136,73 @@ impl ProactiveChatManager {
 
             // 等待一段时间再检查
             sleep(Duration::from_secs(proactive_config.check_interval_secs())).await;
+        }
+    }
+
+    /// Neuro-sama 风格的自主会话心跳。它和低频随机主动消息分开运行，
+    /// 只处理已经有真实对话、且最近收到过芸汐回复的会话。
+    pub async fn start_autonomous_conversation_loop(&self) {
+        let initial_interval = crate::config::get()
+            .proactive()
+            .autonomous_conversation_check_interval_secs();
+        sleep(Duration::from_secs(initial_interval)).await;
+        loop {
+            let proactive_config = crate::config::get().proactive().clone();
+            if proactive_config.enabled() && proactive_config.autonomous_conversation_enabled() {
+                self.run_autonomous_conversation_tick(&proactive_config)
+                    .await;
+            }
+            sleep(Duration::from_secs(
+                proactive_config.autonomous_conversation_check_interval_secs(),
+            ))
+            .await;
+        }
+    }
+
+    async fn run_autonomous_conversation_tick(
+        &self,
+        proactive_config: &crate::config::ProactiveConfig,
+    ) {
+        let Some(bridge) = &self.yunxi_bridge else {
+            return;
+        };
+        let today = Local::now().format("%Y-%m-%d").to_string();
+        if self
+            .memory_manager
+            .get_proactive_state(GLOBAL_PROACTIVE_STATE_KEY)
+            .await
+            .is_some_and(|state| {
+                state.daily_count_for(&today) >= proactive_config.daily_limit() as u32
+            })
+        {
+            return;
+        }
+        let Some(conversation_id) =
+            yunxi::autonomous::claim_due(proactive_config, chrono::Utc::now())
+        else {
+            return;
+        };
+        match bridge
+            .submit_autonomous_conversation_tick(conversation_id)
+            .await
+        {
+            Ok(yunxi_core::Admission::Accepted) => {
+                kovi::log::debug!(
+                    "Yunxi autonomous conversation tick admitted: conversation_id={conversation_id}"
+                );
+            }
+            Ok(admission) => {
+                yunxi::autonomous::release_claim(conversation_id);
+                kovi::log::debug!(
+                    "Yunxi autonomous conversation tick not admitted: conversation_id={conversation_id} admission={admission:?}"
+                );
+            }
+            Err(error) => {
+                yunxi::autonomous::release_claim(conversation_id);
+                kovi::log::warn!(
+                    "Yunxi autonomous conversation tick submission failed: conversation_id={conversation_id} error={error}"
+                );
+            }
         }
     }
 

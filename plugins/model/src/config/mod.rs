@@ -10,7 +10,7 @@ use crate::config::group_interjection::GroupInterjectionConfig;
 use crate::config::memory::MemoryConfig;
 use crate::config::message_batch::MessageBatchConfig;
 use crate::config::mood::MoodConfig;
-use crate::config::proactive::ProactiveConfig;
+pub use crate::config::proactive::ProactiveConfig;
 use crate::config::prompt::Prompt;
 use crate::config::server::ServerConfig;
 use crate::config::topic::TopicConfig;

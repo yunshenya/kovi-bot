@@ -1,4 +1,5 @@
 mod affect_store;
+pub(crate) mod autonomous;
 pub(crate) mod bridge;
 pub(crate) mod core_model;
 pub(crate) mod delivery;

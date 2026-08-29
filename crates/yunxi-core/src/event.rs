@@ -640,6 +640,15 @@ pub struct ProspectiveMemoryEvent {
     pub open_loop_id: OpenLoopId,
 }
 
+/// A host-generated opportunity for the agent to continue an active
+/// conversation without a new inbound message.
+///
+/// This is intentionally a marker event. The conversation scope carries the
+/// only routing identity; the host remains responsible for admission,
+/// cooldowns, and deciding which conversations are eligible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct AutonomousConversationTickEvent;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActionSucceededEvent {
     pub idempotency_key: String,
@@ -675,6 +684,7 @@ pub enum WorldEventKind {
     GoalUpdated(GoalUpdatedEvent),
     GoalCompleted(GoalCompletedEvent),
     ProspectiveMemoryDue(ProspectiveMemoryEvent),
+    AutonomousConversationTick(AutonomousConversationTickEvent),
     ActionSucceeded(ActionSucceededEvent),
     ActionFailed(ActionFailedEvent),
     ActionRejected(ActionRejectedEvent),
@@ -698,6 +708,7 @@ impl WorldEventKind {
             Self::GoalUpdated(_) => EventType::GoalUpdated,
             Self::GoalCompleted(_) => EventType::GoalCompleted,
             Self::ProspectiveMemoryDue(_) => EventType::ProspectiveMemoryDue,
+            Self::AutonomousConversationTick(_) => EventType::AutonomousConversationTick,
             Self::ActionSucceeded(_) => EventType::ActionSucceeded,
             Self::ActionFailed(_) => EventType::ActionFailed,
             Self::ActionRejected(_) => EventType::ActionRejected,
@@ -722,6 +733,7 @@ pub enum EventType {
     GoalUpdated,
     GoalCompleted,
     ProspectiveMemoryDue,
+    AutonomousConversationTick,
     ActionSucceeded,
     ActionFailed,
     ActionRejected,
@@ -972,6 +984,11 @@ impl WorldEvent {
         {
             return Err(EventValidationError::ScopeMismatch);
         }
+        if matches!(self.kind, WorldEventKind::AutonomousConversationTick(_))
+            && !matches!(self.scope, EventScope::Conversation { .. })
+        {
+            return Err(EventValidationError::ScopeMismatch);
+        }
         Ok(())
     }
 
@@ -1138,8 +1155,8 @@ pub enum EventValidationError {
 #[cfg(test)]
 mod tests {
     use super::{
-        Attachment, AttachmentKind, EventPriority, EventScope, EventValidationError,
-        GoalCompletedEvent, GoalUpdatedEvent, InteractionCuesObservedEvent,
+        Attachment, AttachmentKind, AutonomousConversationTickEvent, EventPriority, EventScope,
+        EventValidationError, GoalCompletedEvent, GoalUpdatedEvent, InteractionCuesObservedEvent,
         MAX_MESSAGE_ATTACHMENTS, MAX_TOOL_ERROR_DETAIL_CHARS, MAX_TOOL_RESULT_BYTES, Message,
         MessageContent, MessageReceivedEvent, MessageSentEvent, MessageValidationError,
         ToolCompletedEvent, ToolFailedEvent, TraceError, WorldEvent, WorldEventKind,
@@ -1325,6 +1342,30 @@ mod tests {
         );
 
         assert_eq!(event.validate(8), Err(EventValidationError::ScopeMismatch));
+    }
+
+    #[test]
+    fn autonomous_conversation_ticks_require_conversation_scope() {
+        let valid = WorldEvent::new(
+            Utc::now(),
+            EventScope::Conversation {
+                conversation_id: ConversationId::new(),
+            },
+            EventPriority::Low,
+            WorldEventKind::AutonomousConversationTick(AutonomousConversationTickEvent),
+        );
+        assert_eq!(valid.validate(8), Ok(()));
+
+        let invalid = WorldEvent::new(
+            Utc::now(),
+            EventScope::Global,
+            EventPriority::Low,
+            WorldEventKind::AutonomousConversationTick(AutonomousConversationTickEvent),
+        );
+        assert_eq!(
+            invalid.validate(8),
+            Err(EventValidationError::ScopeMismatch)
+        );
     }
 
     #[test]

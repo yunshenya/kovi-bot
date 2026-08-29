@@ -32,6 +32,16 @@ pub struct ProactiveConfig {
     recent_interaction_cooldown_secs: u64,
     /// 主动消息进入 Prepared 后的短竞争窗口；0 关闭，否则限 300-1000ms。
     prepared_grace_ms: u64,
+    /// 是否启用 Neuro-sama 风格的自主会话续聊。
+    autonomous_conversation_enabled: bool,
+    /// 自主会话循环的检查间隔（秒）。
+    autonomous_conversation_check_interval_secs: u64,
+    /// 用户回复后，进入自主续聊前至少等待的时间（秒）。
+    autonomous_conversation_idle_secs: u64,
+    /// 自主续聊两次模型回合之间的最短间隔（秒）。
+    autonomous_conversation_cooldown_secs: u64,
+    /// 一次用户互动最多允许连续自主续聊的回合数。
+    autonomous_conversation_max_turns: u8,
 }
 
 impl ProactiveConfig {
@@ -87,6 +97,26 @@ impl ProactiveConfig {
         self.prepared_grace_ms
     }
 
+    pub fn autonomous_conversation_enabled(&self) -> bool {
+        self.autonomous_conversation_enabled
+    }
+
+    pub fn autonomous_conversation_check_interval_secs(&self) -> u64 {
+        self.autonomous_conversation_check_interval_secs
+    }
+
+    pub fn autonomous_conversation_idle_secs(&self) -> u64 {
+        self.autonomous_conversation_idle_secs
+    }
+
+    pub fn autonomous_conversation_cooldown_secs(&self) -> u64 {
+        self.autonomous_conversation_cooldown_secs
+    }
+
+    pub fn autonomous_conversation_max_turns(&self) -> u8 {
+        self.autonomous_conversation_max_turns
+    }
+
     pub fn validate(&self) -> anyhow::Result<()> {
         if self.check_interval_secs == 0 {
             return Err(anyhow::anyhow!("主动消息检查间隔必须大于0秒"));
@@ -123,6 +153,21 @@ impl ProactiveConfig {
                 "主动消息 Prepared 竞争窗口必须为0或300到1000毫秒"
             ));
         }
+        if self.autonomous_conversation_check_interval_secs == 0 {
+            return Err(anyhow::anyhow!("自主会话循环检查间隔必须大于0秒"));
+        }
+        if self.autonomous_conversation_idle_secs == 0 {
+            return Err(anyhow::anyhow!("自主会话空闲阈值必须大于0秒"));
+        }
+        if self.autonomous_conversation_cooldown_secs == 0 {
+            return Err(anyhow::anyhow!("自主会话冷却时间必须大于0秒"));
+        }
+        if self.autonomous_conversation_max_turns == 0 || self.autonomous_conversation_max_turns > 8
+        {
+            return Err(anyhow::anyhow!(
+                "自主会话单次互动最多连续回合数必须在1到8之间"
+            ));
+        }
         Ok(())
     }
 }
@@ -143,6 +188,11 @@ impl Default for ProactiveConfig {
             target_cooldown_secs: 21_600,
             recent_interaction_cooldown_secs: 7_200,
             prepared_grace_ms: 500,
+            autonomous_conversation_enabled: true,
+            autonomous_conversation_check_interval_secs: 15,
+            autonomous_conversation_idle_secs: 90,
+            autonomous_conversation_cooldown_secs: 900,
+            autonomous_conversation_max_turns: 2,
         }
     }
 }
@@ -183,6 +233,8 @@ mod tests {
         assert_eq!(config.main_admin_daily_limit(), 2);
         assert_eq!(config.target_cooldown_secs(), 21_600);
         assert_eq!(config.prepared_grace_ms(), 500);
+        assert_eq!(config.autonomous_conversation_check_interval_secs(), 15);
+        assert_eq!(config.autonomous_conversation_max_turns(), 2);
     }
 
     #[test]

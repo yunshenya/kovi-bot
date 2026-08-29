@@ -797,6 +797,7 @@ fn baseline_disposition(input: &PlannerInput) -> DecisionDisposition {
             }
         }
         WorldEventKind::ProspectiveMemoryDue(_)
+        | WorldEventKind::AutonomousConversationTick(_)
         | WorldEventKind::ToolCompleted(_)
         | WorldEventKind::ToolFailed(_) => DecisionDisposition::Reply,
         _ => DecisionDisposition::Silent,
@@ -2107,6 +2108,9 @@ impl KoviModelBackend {
                     PersistentRouteLookup::AuthoritativeMiss
                 }
             },
+            WorldEventKind::AutonomousConversationTick(_) => {
+                self.context_for_scope(input.event.scope()).await
+            }
             WorldEventKind::ToolCompleted(tool) if tool.requires_follow_up => {
                 self.context_for_scope(input.event.scope()).await
             }
@@ -2361,6 +2365,7 @@ fn intrinsic_turn_is_eligible(
                 && !message.content.as_text().trim_start().starts_with('#')
         }
         WorldEventKind::ProspectiveMemoryDue(_) => true,
+        WorldEventKind::AutonomousConversationTick(_) => true,
         WorldEventKind::ToolCompleted(tool) => tool.requires_follow_up,
         WorldEventKind::ToolFailed(tool) => tool.requires_follow_up,
         _ => false,
@@ -2810,6 +2815,18 @@ impl ModelBackend for KoviModelBackend {
                             "请根据这个到期的待办事项自然地联系对方：{}",
                             open_loop.summary()
                         ),
+                        OutgoingSource::Proactive,
+                        false,
+                    )
+                }
+                WorldEventKind::AutonomousConversationTick(_) => {
+                    let Some(conversation_id) = input.event.scope().conversation_id() else {
+                        return Ok(DecisionPlan::silent());
+                    };
+                    (
+                        None,
+                        VisibleReplyTarget::Send { conversation_id },
+                        "这是一次自主会话心跳。结合当前会话最近的真实对话、当前话题和 Mind 状态，判断是否有自然且有价值的下一句。只有确实想继续聊天、回应未完话题或提出一个自然问题时才回复；如果现在没有合适内容，请保持沉默。不要提及这是心跳、内部状态或任何系统协议。只生成一条简短自然的中文聊天消息。".to_owned(),
                         OutgoingSource::Proactive,
                         false,
                     )
