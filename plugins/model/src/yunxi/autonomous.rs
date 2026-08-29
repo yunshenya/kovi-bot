@@ -11,7 +11,7 @@ use chrono::{DateTime, Utc};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
-use yunxi_core::{ConversationId, ConversationKind};
+use yunxi_core::{ConversationId, ConversationKind, ConversationTurnDirective};
 
 const MAX_TRACKED_CONVERSATIONS: usize = 512;
 const IN_FLIGHT_TIMEOUT: Duration = Duration::from_secs(180);
@@ -23,6 +23,8 @@ struct ConversationActivity {
     last_bot_at: Option<DateTime<Utc>>,
     last_autonomous_at: Option<DateTime<Utc>>,
     autonomous_turns: u8,
+    directive: ConversationTurnDirective,
+    next_wake_at: Option<DateTime<Utc>>,
     in_flight_since: Option<Instant>,
 }
 
@@ -65,6 +67,8 @@ pub(crate) fn observe_inbound(
             last_bot_at: None,
             last_autonomous_at: None,
             autonomous_turns: 0,
+            directive: ConversationTurnDirective::Wait,
+            next_wake_at: None,
             in_flight_since: None,
         });
     entry.kind = kind;
@@ -73,6 +77,8 @@ pub(crate) fn observe_inbound(
     // heartbeat claim that was waiting behind the incoming message.
     entry.autonomous_turns = 0;
     entry.last_autonomous_at = None;
+    entry.directive = ConversationTurnDirective::Wait;
+    entry.next_wake_at = None;
     entry.in_flight_since = None;
 }
 
@@ -105,7 +111,6 @@ pub(crate) fn claim_due(config: &ProactiveConfig, now: DateTime<Utc>) -> Option<
         return None;
     };
     let idle = chrono::Duration::seconds(config.autonomous_conversation_idle_secs() as i64);
-    let cooldown = chrono::Duration::seconds(config.autonomous_conversation_cooldown_secs() as i64);
     let max_turns = config.autonomous_conversation_max_turns();
     let candidate = registry.order.iter().copied().find(|conversation_id| {
         let Some(entry) = registry.entries.get(conversation_id) else {
@@ -123,12 +128,11 @@ pub(crate) fn claim_due(config: &ProactiveConfig, now: DateTime<Utc>) -> Option<
         if entry.autonomous_turns >= max_turns || last_bot_at < entry.last_inbound_at {
             return false;
         }
-        if now - entry.last_inbound_at < idle {
-            return false;
+        if entry.last_autonomous_at.is_none() {
+            return now - entry.last_inbound_at >= idle;
         }
-        entry
-            .last_autonomous_at
-            .is_none_or(|last| now - last >= cooldown)
+        entry.directive == ConversationTurnDirective::Continue
+            && entry.next_wake_at.is_some_and(|wake| now >= wake)
     })?;
     if let Some(entry) = registry.entries.get_mut(&candidate) {
         entry.in_flight_since = Some(Instant::now());
@@ -148,13 +152,25 @@ pub(crate) fn release_claim(conversation_id: ConversationId) {
 
 /// Finish a claimed autonomous turn. Even a model-selected silence consumes a
 /// turn budget, preventing a silent model from being polled on every heartbeat.
-pub(crate) fn finish_claim(conversation_id: ConversationId, occurred_at: DateTime<Utc>) {
+pub(crate) fn finish_claim(
+    conversation_id: ConversationId,
+    occurred_at: DateTime<Utc>,
+    directive: ConversationTurnDirective,
+    continue_delay_secs: u64,
+) {
     if let Ok(mut registry) = REGISTRY.lock()
         && let Some(entry) = registry.entries.get_mut(&conversation_id)
         && entry.in_flight_since.take().is_some()
     {
         entry.last_autonomous_at = Some(occurred_at);
         entry.autonomous_turns = entry.autonomous_turns.saturating_add(1);
+        entry.directive = directive;
+        entry.next_wake_at = match directive {
+            ConversationTurnDirective::Continue => {
+                Some(occurred_at + chrono::Duration::seconds(continue_delay_secs.max(1) as i64))
+            }
+            ConversationTurnDirective::Wait | ConversationTurnDirective::End => None,
+        };
     }
 }
 
@@ -180,7 +196,7 @@ mod tests {
     use crate::config::ProactiveConfig;
     use chrono::{Duration, Utc};
     use std::sync::{LazyLock, Mutex};
-    use yunxi_core::{ConversationId, ConversationKind};
+    use yunxi_core::{ConversationId, ConversationKind, ConversationTurnDirective};
 
     static TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
@@ -206,7 +222,7 @@ mod tests {
         assert!(claim_due(&config, now).is_none());
         record_outbound(id, now - Duration::minutes(4));
         assert_eq!(claim_due(&config, now), Some(id));
-        finish_claim(id, now);
+        finish_claim(id, now, ConversationTurnDirective::Wait, 15);
         assert!(claim_due(&config, now + Duration::seconds(30)).is_none());
         clear();
     }
@@ -227,9 +243,35 @@ mod tests {
         record_outbound(id, now - Duration::minutes(2));
         assert_eq!(claim_due(&config, now), Some(id));
         observe_inbound(id, ConversationKind::Group, now, true);
-        finish_claim(id, now);
+        finish_claim(id, now, ConversationTurnDirective::Continue, 15);
         record_outbound(id, now);
         assert_eq!(claim_due(&config, now + Duration::minutes(2)), Some(id));
+        clear();
+    }
+
+    #[test]
+    fn end_directive_waits_for_a_new_inbound_turn() {
+        let _guard = TEST_LOCK.lock().expect("test lock");
+        clear();
+        let id = ConversationId::new();
+        let now = Utc::now();
+        let config = ProactiveConfig::default();
+        observe_inbound(
+            id,
+            ConversationKind::Direct,
+            now - Duration::minutes(2),
+            true,
+        );
+        record_outbound(id, now - Duration::minutes(2));
+        assert_eq!(claim_due(&config, now), Some(id));
+        finish_claim(id, now, ConversationTurnDirective::End, 15);
+        assert!(claim_due(&config, now + Duration::hours(2)).is_none());
+        observe_inbound(id, ConversationKind::Direct, now + Duration::hours(2), true);
+        record_outbound(id, now + Duration::hours(2));
+        assert_eq!(
+            claim_due(&config, now + Duration::hours(2) + Duration::minutes(2)),
+            Some(id)
+        );
         clear();
     }
 }

@@ -162,8 +162,8 @@ main_admin_decision_interval_secs = 10800
 autonomous_conversation_enabled = true
 autonomous_conversation_check_interval_secs = 15
 autonomous_conversation_idle_secs = 90
-autonomous_conversation_cooldown_secs = 900
-autonomous_conversation_max_turns = 2
+autonomous_conversation_cooldown_secs = 15
+autonomous_conversation_max_turns = 4
 
 [traffic]
 enabled = true

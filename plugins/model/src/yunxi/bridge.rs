@@ -27,10 +27,11 @@ use std::time::{Duration, Instant};
 use yunxi_core::{
     ActionArbiter, ActionArbiterConfig, ActionPort, ActionResult, Admission, Attachment,
     AttachmentKind, CognitiveIntent, CognitiveRuntime, ConversationId, ConversationKind,
-    ConversationMemberStore, CoreServices, EnvironmentCapabilities, EventPriority, EventScope,
-    EventType, ExternalConversation, IdentityStore, MessageCollisionDetectedEvent, MessageContent,
-    MessageId, MessageReceivedEvent, ModelBackend, OpenLoopStore, PlannedProcessingOutcome,
-    ProcessingOutcome, ProposedAction, RuntimeConfig, RuntimeHandle, WorldEvent, WorldEventKind,
+    ConversationMemberStore, ConversationTurnDirective, CoreServices, EnvironmentCapabilities,
+    EventPriority, EventScope, EventType, ExternalConversation, IdentityStore,
+    MessageCollisionDetectedEvent, MessageContent, MessageId, MessageReceivedEvent, ModelBackend,
+    OpenLoopStore, PlannedProcessingOutcome, ProcessingOutcome, ProposedAction, RuntimeConfig,
+    RuntimeHandle, WorldEvent, WorldEventKind,
 };
 
 pub(crate) const CORE_INGRESS_CAPACITY: usize = 256;
@@ -2377,7 +2378,31 @@ async fn run_runtime(
                     }
                     if autonomous_tick {
                         if let Some(conversation_id) = observation.scope.conversation_id() {
-                            super::autonomous::finish_claim(conversation_id, Utc::now());
+                            let requested_directive =
+                                plan.state_updates.iter().find_map(|update| match update {
+                                    yunxi_core::StateUpdateProposal::ConversationDirective {
+                                        conversation_id: update_conversation_id,
+                                        directive,
+                                    } if *update_conversation_id == conversation_id => {
+                                        Some(*directive)
+                                    }
+                                    _ => None,
+                                });
+                            let directive = match (autonomous_delivered, requested_directive) {
+                                (true, Some(directive)) => directive,
+                                (false, Some(ConversationTurnDirective::End)) => {
+                                    ConversationTurnDirective::End
+                                }
+                                _ => ConversationTurnDirective::Wait,
+                            };
+                            super::autonomous::finish_claim(
+                                conversation_id,
+                                Utc::now(),
+                                directive,
+                                crate::config::get()
+                                    .proactive()
+                                    .autonomous_conversation_cooldown_secs(),
+                            );
                         }
                         if autonomous_delivered
                             && let Err(error) = crate::memory::MEMORY_MANAGER

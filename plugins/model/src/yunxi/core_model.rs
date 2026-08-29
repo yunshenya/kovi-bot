@@ -31,12 +31,12 @@ use std::hash::Hash;
 use std::sync::Arc;
 use yunxi_core::{
     ActionCapability, ActionScope, AttachmentKind, CognitiveIntent, ConversationId,
-    ConversationKind, DecisionDisposition, DecisionPlan, EventType, IdentityStoreError,
-    InteractionCues, IntrinsicGenerationControl, MessageContent, MessageId, MindDecisionProjection,
-    MindDecisionReference, MindInfluenceMode, ModelBackend, ModelBackendError, ModelBackendFuture,
-    PersonId, PlannerInput, ProactiveMotive, ReachOutIntent, StateUpdateProposal,
-    TextInferenceRequest, ToolNotificationPolicy, VisionInferenceRequest, WorldEventKind,
-    apply_interaction_cues, evolve_interaction_state,
+    ConversationKind, ConversationTurnDirective, DecisionDisposition, DecisionPlan, EventType,
+    IdentityStoreError, InteractionCues, IntrinsicGenerationControl, MessageContent, MessageId,
+    MindDecisionProjection, MindDecisionReference, MindInfluenceMode, ModelBackend,
+    ModelBackendError, ModelBackendFuture, PersonId, PlannerInput, ProactiveMotive, ReachOutIntent,
+    StateUpdateProposal, TextInferenceRequest, ToolNotificationPolicy, VisionInferenceRequest,
+    WorldEventKind, apply_interaction_cues, evolve_interaction_state,
 };
 
 const FALLBACK_ROUTE_CAPACITY: usize = 256;
@@ -175,6 +175,8 @@ struct CoreInteractionCues {
     mind_candidates: Option<serde_json::Value>,
     #[serde(default)]
     tool_notification_policy: Option<ToolNotificationPolicy>,
+    #[serde(default)]
+    conversation_directive: Option<ConversationTurnDirective>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -243,6 +245,7 @@ struct ParsedCoreResponse {
     stop_requested: bool,
     mind_candidates: MindCandidates,
     tool_notification_policy: ToolNotificationPolicy,
+    conversation_directive: Option<ConversationTurnDirective>,
 }
 
 enum CoreDirectRepair {
@@ -318,6 +321,7 @@ fn parse_core_response(content: &str) -> ParsedCoreResponse {
                     stop_requested: wire.stop_requested,
                     mind_candidates: parse_mind_candidates(wire.mind_candidates),
                     tool_notification_policy: wire.tool_notification_policy.unwrap_or_default(),
+                    conversation_directive: wire.conversation_directive,
                 };
             }
         }
@@ -330,6 +334,7 @@ fn parse_core_response(content: &str) -> ParsedCoreResponse {
         stop_requested: false,
         mind_candidates: MindCandidates::default(),
         tool_notification_policy: ToolNotificationPolicy::Final,
+        conversation_directive: None,
     }
 }
 
@@ -546,7 +551,9 @@ fn is_core_direct_history(content: &str) -> bool {
 fn recent_direct_conversation_messages(input: &PlannerInput) -> Vec<BotMemory> {
     let conversation_kind = match input.event.kind() {
         WorldEventKind::MessageReceived(current) => Some(current.conversation_kind),
-        WorldEventKind::ToolCompleted(_) | WorldEventKind::ToolFailed(_) => input
+        WorldEventKind::ToolCompleted(_)
+        | WorldEventKind::ToolFailed(_)
+        | WorldEventKind::AutonomousConversationTick(_) => input
             .state
             .conversation
             .as_ref()
@@ -606,7 +613,9 @@ fn recent_direct_conversation_messages(input: &PlannerInput) -> Vec<BotMemory> {
 fn recent_group_conversation_messages(input: &PlannerInput) -> Vec<BotMemory> {
     let conversation_kind = match input.event.kind() {
         WorldEventKind::MessageReceived(current) => Some(current.conversation_kind),
-        WorldEventKind::ToolCompleted(_) | WorldEventKind::ToolFailed(_) => input
+        WorldEventKind::ToolCompleted(_)
+        | WorldEventKind::ToolFailed(_)
+        | WorldEventKind::AutonomousConversationTick(_) => input
             .state
             .conversation
             .as_ref()
@@ -684,8 +693,42 @@ fn recent_conversation_messages(input: &PlannerInput) -> Vec<BotMemory> {
         WorldEventKind::ToolFailed(tool) if tool.requires_follow_up => {
             recent_tool_follow_up_messages(input)
         }
+        WorldEventKind::AutonomousConversationTick(_) => {
+            recent_autonomous_conversation_messages(input)
+        }
         _ => Vec::new(),
     }
+}
+
+fn recent_autonomous_conversation_messages(input: &PlannerInput) -> Vec<BotMemory> {
+    let mut messages = match input
+        .state
+        .conversation
+        .as_ref()
+        .and_then(|conversation| conversation.conversation_kind)
+    {
+        Some(ConversationKind::Direct) => recent_direct_conversation_messages(input),
+        Some(ConversationKind::Group) => recent_group_conversation_messages(input),
+        Some(ConversationKind::System) | None => Vec::new(),
+    };
+    if let Some(topic) = input
+        .state
+        .conversation
+        .as_ref()
+        .and_then(|conversation| conversation.current_topic.as_deref())
+    {
+        messages.insert(
+            0,
+            BotMemory {
+                role: Roles::Data,
+                content: format!(
+                    "Core current conversation topic (data-only): {}",
+                    topic.trim()
+                ),
+            },
+        );
+    }
+    messages
 }
 
 fn recent_tool_follow_up_messages(input: &PlannerInput) -> Vec<BotMemory> {
@@ -2239,6 +2282,13 @@ fn direct_reply_expected(input: &PlannerInput) -> bool {
     )
 }
 
+fn is_autonomous_conversation_tick(input: &PlannerInput) -> bool {
+    matches!(
+        input.event.kind(),
+        WorldEventKind::AutonomousConversationTick(_)
+    )
+}
+
 fn reply_expected_for_incoming(input: &PlannerInput) -> bool {
     matches!(
         input.event.kind(),
@@ -2888,6 +2938,15 @@ impl ModelBackend for KoviModelBackend {
                     },
                 );
             }
+            if is_autonomous_conversation_tick(input) {
+                messages.insert(
+                    0,
+                    BotMemory {
+                        role: Roles::System,
+                        content: "自主会话协议：这是芸汐自己的会话回合，不是对用户新消息的被动回复。输出的第一个非空字符必须开始唯一一个 [[INTERACTION_CUES]] 前缀，JSON 中必须包含 conversation_directive，取值只能是 continue、wait、end。continue 表示当前话题还有自然的下一句，芸汐可以在短暂间隔后继续；wait 表示这句说完后等待用户，不要自行追加；end 表示自然结束当前话题，直到用户再次发言才重新开始。只有选择 continue 时才发送一条简短自然的中文消息；选择 wait 或 end 时，前缀后不要输出正文。不要提及这个协议、心跳或内部状态。若当前话题已完整、没有真实想说的内容，选择 wait 或 end，不要为了保持在线而填充套话。".to_string(),
+                    },
+                );
+            }
             let action_scope = input
                 .state
                 .conversation_id()
@@ -3242,8 +3301,9 @@ impl ModelBackend for KoviModelBackend {
                     stop_requested: false,
                     mind_candidates: MindCandidates::default(),
                     tool_notification_policy: ToolNotificationPolicy::Final,
+                    conversation_directive: None,
                 }
-            } else if message.is_some() {
+            } else if message.is_some() || is_autonomous_conversation_tick(input) {
                 parse_core_response(&response_content)
             } else {
                 ParsedCoreResponse {
@@ -3253,6 +3313,7 @@ impl ModelBackend for KoviModelBackend {
                     stop_requested: false,
                     mind_candidates: MindCandidates::default(),
                     tool_notification_policy: ToolNotificationPolicy::Final,
+                    conversation_directive: None,
                 }
             };
             let tool_notification_policy = input
@@ -3430,8 +3491,15 @@ impl ModelBackend for KoviModelBackend {
                     || parsed_response.content.contains(CORE_TOOL_CALL_END))
             {
                 "工具结果已经返回，但我暂时没能安全地整理它。".to_string()
+            } else if is_autonomous_conversation_tick(input)
+                && matches!(
+                    parsed_response.conversation_directive,
+                    Some(ConversationTurnDirective::Wait | ConversationTurnDirective::End)
+                )
+            {
+                String::new()
             } else {
-                parsed_response.content
+                parsed_response.content.clone()
             };
             let mut plan = if intrinsic_response {
                 ReplyPlan::from_intrinsic_output(conversation.scope(), &response_content).await
@@ -3607,9 +3675,10 @@ impl ModelBackend for KoviModelBackend {
             }
             if !core_plan_has_visible_text(&plan) {
                 crate::model::finish(ticket).await;
-                return Ok(silent_with_interaction_cues(
+                return Ok(autonomous_or_silent_plan(
                     input,
                     parsed_response.interaction_cues,
+                    parsed_response.conversation_directive,
                 ));
             }
             let prepared = prepare_outgoing_with_semantic_preview(
@@ -3635,7 +3704,7 @@ impl ModelBackend for KoviModelBackend {
                 ));
             };
             let visible_content = plan.content.clone();
-            let Some(intent) = visible_reply_intent(reply_target, plan.content) else {
+            let Some(intent) = visible_reply_intent(reply_target, plan.content.clone()) else {
                 if direct_reply_expected(input) {
                     kovi::log::warn!(
                         "Yunxi Core direct reply unresolved: event_id={} message_id={} conversation_id={} reason=reply_intent_conversion_failed",
@@ -3682,6 +3751,20 @@ impl ModelBackend for KoviModelBackend {
             } else {
                 visible_reply_state_updates(input.event.kind())
             };
+            if is_autonomous_conversation_tick(input)
+                && let Some(conversation_id) = input.event.scope().conversation_id()
+            {
+                state_updates.push(StateUpdateProposal::ConversationDirective {
+                    conversation_id,
+                    directive: parsed_response.conversation_directive.unwrap_or(
+                        if core_plan_has_visible_text(&plan) {
+                            ConversationTurnDirective::Continue
+                        } else {
+                            ConversationTurnDirective::End
+                        },
+                    ),
+                });
+            }
             if disposition == DecisionDisposition::ChangeTopic
                 && let Some(MindDecisionReference::Interest(interest_id)) =
                     mind_projection.reference()
@@ -3767,6 +3850,24 @@ fn silent_with_interaction_cues(input: &PlannerInput, cues: InteractionCues) -> 
         intents: Vec::new(),
         state_updates: interaction_state_updates_with_cues(input, cues),
     }
+}
+
+fn autonomous_or_silent_plan(
+    input: &PlannerInput,
+    cues: InteractionCues,
+    directive: Option<ConversationTurnDirective>,
+) -> DecisionPlan {
+    let mut plan = silent_with_interaction_cues(input, cues);
+    if is_autonomous_conversation_tick(input)
+        && let Some(conversation_id) = input.event.scope().conversation_id()
+    {
+        plan.state_updates
+            .push(StateUpdateProposal::ConversationDirective {
+                conversation_id,
+                directive: directive.unwrap_or(ConversationTurnDirective::End),
+            });
+    }
+    plan
 }
 
 fn visible_reply_state_updates(event: &WorldEventKind) -> Vec<StateUpdateProposal> {
@@ -4156,6 +4257,19 @@ mod tests {
             ToolNotificationPolicy::Final
         );
         assert!(!parsed.content.contains("INTERACTION_CUES"));
+    }
+
+    #[test]
+    fn autonomous_directive_is_parsed_from_the_semantic_prefix() {
+        let parsed = parse_core_response(
+            "[[INTERACTION_CUES]]{\"conversation_directive\":\"continue\"}[[/INTERACTION_CUES]]\n还有一个细节。",
+        );
+
+        assert_eq!(
+            parsed.conversation_directive,
+            Some(yunxi_core::ConversationTurnDirective::Continue)
+        );
+        assert_eq!(parsed.content, "还有一个细节。");
     }
 
     #[test]
@@ -4568,6 +4682,64 @@ mod tests {
             payload["messages"][0]["content"],
             "查一下成都的天气，然后搜索一下猫眼星云"
         );
+    }
+
+    #[test]
+    fn autonomous_context_reuses_recent_conversation_history() {
+        let conversation_id = ConversationId::new();
+        let sender = PersonId::new();
+        let mut state = WorkingState::new(WorkingStateConfig::default()).expect("working state");
+        let attention = AttentionSystem;
+        let original = WorldEvent::message_received(
+            EventPriority::High,
+            MessageReceivedEvent {
+                message_id: MessageId::new(),
+                conversation_id,
+                sender,
+                content: MessageContent::text("刚才那个话题还没聊完"),
+                reply_to: None,
+                timestamp: Utc::now(),
+                conversation_kind: ConversationKind::Direct,
+                addressed_to_agent: true,
+                replies_to_agent: false,
+                stop_requested: false,
+                explicit_request: true,
+                visible_reply_allowed: true,
+            },
+        );
+        state
+            .observe(&original, attention.evaluate(&original))
+            .expect("observe original request");
+        let reply_timestamp = Utc::now();
+        let reply = WorldEvent::new(
+            reply_timestamp,
+            EventScope::Conversation { conversation_id },
+            EventPriority::High,
+            WorldEventKind::MessageSent(MessageSentEvent {
+                message_id: MessageId::new(),
+                conversation_id,
+                timestamp: reply_timestamp,
+                content: Some(MessageContent::text("那我们接着说")),
+            }),
+        );
+        state
+            .observe(&reply, attention.evaluate(&reply))
+            .expect("observe agent reply");
+        let tick = WorldEvent::new(
+            Utc::now(),
+            EventScope::Conversation { conversation_id },
+            EventPriority::Low,
+            WorldEventKind::AutonomousConversationTick(yunxi_core::AutonomousConversationTickEvent),
+        );
+        let input = PlannerInput::new(
+            tick,
+            PlannerStateSnapshot::new(state.global_version(), state.conversation(conversation_id)),
+        );
+
+        let context = recent_conversation_messages(&input);
+        assert_eq!(context.len(), 2);
+        assert!(context[1].content.contains("刚才那个话题还没聊完"));
+        assert!(context[1].content.contains("那我们接着说"));
     }
 
     #[test]

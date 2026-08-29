@@ -100,14 +100,14 @@ pub use open_loop::{
     OpenLoopStatus, OpenLoopValidationError,
 };
 pub use planner::{
-    AffectState, DecisionDisposition, DecisionPlan, InteractionCueValidationError, InteractionCues,
-    InteractionStateEvolution, MAX_PLANNER_GOALS, MAX_PLANNER_INTENTS, MAX_PLANNER_MEMORIES,
-    MAX_PLANNER_OPEN_LOOPS, MAX_PLANNER_STATE_UPDATES, MAX_PLANNER_TOPIC_BYTES,
-    MAX_PLANNER_TOPIC_CHARS, ModelBackend, ModelBackendError, ModelBackendFuture, Planner,
-    PlannerError, PlannerInput, PlannerInputValidationError, PlannerOutput,
-    PlannerOutputValidationError, PlannerStateSnapshot, RelationState, StateUpdateProposal,
-    apply_interaction_cues, drift_affect_state, drift_relation_state, evolve_interaction_state,
-    evolve_interaction_state_with_cues,
+    AffectState, ConversationTurnDirective, DecisionDisposition, DecisionPlan,
+    InteractionCueValidationError, InteractionCues, InteractionStateEvolution, MAX_PLANNER_GOALS,
+    MAX_PLANNER_INTENTS, MAX_PLANNER_MEMORIES, MAX_PLANNER_OPEN_LOOPS, MAX_PLANNER_STATE_UPDATES,
+    MAX_PLANNER_TOPIC_BYTES, MAX_PLANNER_TOPIC_CHARS, ModelBackend, ModelBackendError,
+    ModelBackendFuture, Planner, PlannerError, PlannerInput, PlannerInputValidationError,
+    PlannerOutput, PlannerOutputValidationError, PlannerStateSnapshot, RelationState,
+    StateUpdateProposal, apply_interaction_cues, drift_affect_state, drift_relation_state,
+    evolve_interaction_state, evolve_interaction_state_with_cues,
 };
 pub use ports::{
     AffectStore, AffectStoreError, AffectStoreFuture, Clock, ConversationMemberStore,

@@ -38,7 +38,7 @@ pub struct ProactiveConfig {
     autonomous_conversation_check_interval_secs: u64,
     /// 用户回复后，进入自主续聊前至少等待的时间（秒）。
     autonomous_conversation_idle_secs: u64,
-    /// 自主续聊两次模型回合之间的最短间隔（秒）。
+    /// 自主会话选择继续时，两次模型回合之间的最短间隔（秒）。
     autonomous_conversation_cooldown_secs: u64,
     /// 一次用户互动最多允许连续自主续聊的回合数。
     autonomous_conversation_max_turns: u8,
@@ -191,8 +191,8 @@ impl Default for ProactiveConfig {
             autonomous_conversation_enabled: true,
             autonomous_conversation_check_interval_secs: 15,
             autonomous_conversation_idle_secs: 90,
-            autonomous_conversation_cooldown_secs: 900,
-            autonomous_conversation_max_turns: 2,
+            autonomous_conversation_cooldown_secs: 15,
+            autonomous_conversation_max_turns: 4,
         }
     }
 }
@@ -234,7 +234,8 @@ mod tests {
         assert_eq!(config.target_cooldown_secs(), 21_600);
         assert_eq!(config.prepared_grace_ms(), 500);
         assert_eq!(config.autonomous_conversation_check_interval_secs(), 15);
-        assert_eq!(config.autonomous_conversation_max_turns(), 2);
+        assert_eq!(config.autonomous_conversation_cooldown_secs(), 15);
+        assert_eq!(config.autonomous_conversation_max_turns(), 4);
     }
 
     #[test]

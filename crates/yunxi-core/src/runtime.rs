@@ -1449,6 +1449,15 @@ impl CognitiveRuntime {
                         0,
                     ));
                 }
+                StateUpdateProposal::ConversationDirective {
+                    conversation_id, ..
+                } if event.scope().conversation_id() != Some(*conversation_id) => {
+                    return Err(state_update_error(
+                        "conversation_directive",
+                        "the update targets a conversation outside this turn",
+                        0,
+                    ));
+                }
                 StateUpdateProposal::ResolveOpenLoop { open_loop_id }
                     if !planner_input_contains_open_loop(input, *open_loop_id) =>
                 {
@@ -1536,6 +1545,7 @@ impl CognitiveRuntime {
                             state_update_error("set_topic", error.to_string(), applied_updates)
                         })?;
                 }
+                StateUpdateProposal::ConversationDirective { .. } => {}
                 StateUpdateProposal::ResolveOpenLoop { open_loop_id } => {
                     if deferred_open_loop_resolution == Some(*open_loop_id) {
                         continue;

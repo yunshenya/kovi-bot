@@ -666,6 +666,18 @@ pub enum DecisionDisposition {
     SpecialAction,
 }
 
+/// Model-selected lifecycle for an autonomous conversation turn.
+///
+/// Disposition describes the visible turn; this directive tells the host
+/// whether the session should wake again without a new inbound message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConversationTurnDirective {
+    Continue,
+    Wait,
+    End,
+}
+
 impl DecisionDisposition {
     /// Compatibility spelling for callers that use "respond" in their
     /// product language while the wire representation remains `reply`.
@@ -684,6 +696,10 @@ pub enum StateUpdateProposal {
     SetTopic {
         conversation_id: ConversationId,
         topic: String,
+    },
+    ConversationDirective {
+        conversation_id: ConversationId,
+        directive: ConversationTurnDirective,
     },
     ResolveOpenLoop {
         open_loop_id: OpenLoopId,
@@ -704,6 +720,7 @@ impl StateUpdateProposal {
                 .validate()
                 .map_err(PlannerOutputValidationError::InvalidRelation),
             Self::SetTopic { topic, .. } => validate_topic(topic),
+            Self::ConversationDirective { .. } => Ok(()),
             Self::ResolveOpenLoop { .. } | Self::DeferOpenLoop { .. } => Ok(()),
         }
     }
