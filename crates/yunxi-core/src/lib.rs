@@ -85,7 +85,7 @@ pub use identity::{
     MAX_CONVERSATION_MEMBER_ROLE_BYTES, MAX_CONVERSATION_MEMBER_ROLE_CHARS, MAX_EXTERNAL_ID_BYTES,
     MAX_PLATFORM_ID_BYTES, MemoryId, MessageId, OpenLoopId, PersonId, PlatformId,
 };
-pub use intent::{CognitiveIntent, IntentValidationError};
+pub use intent::{CognitiveIntent, IntentValidationError, ToolNotificationPolicy};
 pub use memory::{
     MAX_MEMORY_CONTENT_BYTES, MAX_MEMORY_CONTENT_CHARS, MAX_MEMORY_QUERY_BYTES,
     MAX_MEMORY_TAG_BYTES, MAX_MEMORY_TAGS, Memory, MemoryDraft, MemoryKind, MemoryQuery,

@@ -1,6 +1,7 @@
 use crate::identity::{
     ConversationId, ConversationKind, EventId, GoalId, MessageId, OpenLoopId, PersonId,
 };
+use crate::intent::ToolNotificationPolicy;
 use crate::planner::{InteractionCueValidationError, InteractionCues};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -753,6 +754,11 @@ pub struct WorldEvent {
     /// platform message; it is never accepted from or emitted to the wire.
     #[serde(skip)]
     source_message_id: Option<MessageId>,
+    /// Trusted request-level preference for how tool result follow-ups should
+    /// be delivered. It follows the causal chain but cannot be set by wire
+    /// input.
+    #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
+    tool_notification_policy: Option<ToolNotificationPolicy>,
 }
 
 impl WorldEvent {
@@ -773,6 +779,7 @@ impl WorldEvent {
             kind,
             actor: None,
             source_message_id: None,
+            tool_notification_policy: None,
         }
     }
 
@@ -809,6 +816,7 @@ impl WorldEvent {
             kind,
             actor: None,
             source_message_id: parent.source_message_id(),
+            tool_notification_policy: parent.tool_notification_policy(),
         })
     }
 
@@ -867,6 +875,17 @@ impl WorldEvent {
                 _ => None,
             },
         }
+    }
+
+    #[must_use]
+    pub const fn tool_notification_policy(&self) -> Option<ToolNotificationPolicy> {
+        self.tool_notification_policy
+    }
+
+    #[must_use]
+    pub const fn with_tool_notification_policy(mut self, policy: ToolNotificationPolicy) -> Self {
+        self.tool_notification_policy = Some(policy);
+        self
     }
 
     pub fn validate(&self, max_trace_depth: u8) -> Result<(), EventValidationError> {
@@ -1127,6 +1146,7 @@ mod tests {
     };
     use crate::{
         ConversationId, ConversationKind, EventId, GoalId, InteractionCues, MessageId, PersonId,
+        ToolNotificationPolicy,
     };
     use chrono::Utc;
 
@@ -1525,6 +1545,41 @@ mod tests {
         let decoded: WorldEvent =
             serde_json::from_value(encoded).expect("event should deserialize");
         assert_eq!(decoded.actor(), None);
+    }
+
+    #[test]
+    fn tool_notification_policy_is_trusted_and_propagates_to_children() {
+        let root = WorldEvent::new(
+            Utc::now(),
+            EventScope::Global,
+            EventPriority::High,
+            WorldEventKind::HostStarted,
+        )
+        .with_tool_notification_policy(ToolNotificationPolicy::EachAndFinal);
+        let child = WorldEvent::derived_from(
+            &root,
+            Utc::now(),
+            EventScope::Global,
+            EventPriority::High,
+            WorldEventKind::IdleTick,
+            8,
+        )
+        .expect("derived event should be valid");
+        assert_eq!(
+            child.tool_notification_policy(),
+            Some(ToolNotificationPolicy::EachAndFinal)
+        );
+
+        let encoded = serde_json::to_value(child).expect("event should serialize");
+        assert_eq!(
+            encoded
+                .get("tool_notification_policy")
+                .and_then(serde_json::Value::as_str),
+            Some("each_and_final")
+        );
+        let decoded: WorldEvent =
+            serde_json::from_value(encoded).expect("event should deserialize");
+        assert_eq!(decoded.tool_notification_policy(), None);
     }
 
     #[test]

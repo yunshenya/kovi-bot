@@ -705,6 +705,19 @@ impl CognitiveRuntime {
             .any(|event| event.trace().root_event_id() == root)
     }
 
+    fn enqueue_tool_follow_up(
+        &mut self,
+        event: WorldEvent,
+        feedback: &mut Vec<RuntimeObservation>,
+    ) {
+        if self.pending_tool_follow_ups.len() < MAX_PENDING_TOOL_FOLLOW_UPS {
+            self.pending_tool_follow_ups.push_back(event);
+        } else if let ProcessingOutcome::Observed(feedback_observation) = self.process_event(event)
+        {
+            feedback.push(feedback_observation);
+        }
+    }
+
     /// Releases a completed root after its final action turn. Pending
     /// follow-ups pin the entry so a delayed child can never observe a reset
     /// budget. The ledger remains bounded while allowing sequential roots to
@@ -1053,6 +1066,7 @@ impl CognitiveRuntime {
         let mut tool_follow_up_events = Vec::new();
         let mut selected_action = None;
         for (intent_index, intent) in plan.intents.iter().enumerate() {
+            let tool_notification_policy = intent.tool_notification_policy().unwrap_or_default();
             let mut proposed = match intent.propose_action() {
                 Ok(proposed) => proposed,
                 Err(error) => {
@@ -1167,7 +1181,8 @@ impl CognitiveRuntime {
                         self.max_trace_depth,
                     )
                 {
-                    tool_follow_up_events.push(tool_event);
+                    tool_follow_up_events
+                        .push(tool_event.with_tool_notification_policy(tool_notification_policy));
                 }
             } else if let Some(feedback_event) =
                 action_result_event(&planner_event, &proposed, &result, self.max_trace_depth)
@@ -1176,13 +1191,7 @@ impl CognitiveRuntime {
                 // including the defensive case where a host returns a tool
                 // outcome for a different proposed action.
                 if tool_event_requires_follow_up(&feedback_event) {
-                    if self.pending_tool_follow_ups.len() < MAX_PENDING_TOOL_FOLLOW_UPS {
-                        self.pending_tool_follow_ups.push_back(feedback_event);
-                    } else if let ProcessingOutcome::Observed(feedback_observation) =
-                        self.process_event(feedback_event)
-                    {
-                        feedback.push(feedback_observation);
-                    }
+                    self.enqueue_tool_follow_up(feedback_event, &mut feedback);
                 } else if let ProcessingOutcome::Observed(feedback_observation) =
                     self.process_event(feedback_event)
                 {
@@ -1198,22 +1207,37 @@ impl CognitiveRuntime {
             }
             actions.push(result);
         }
+        let mut final_tool_follow_ups = Vec::new();
+        for tool_event in tool_follow_up_events {
+            match tool_event.tool_notification_policy().unwrap_or_default() {
+                crate::ToolNotificationPolicy::Final => final_tool_follow_ups.push(tool_event),
+                crate::ToolNotificationPolicy::Each => {
+                    if let Some(tool_follow_up) = bounded_single_tool_follow_up_event(
+                        &planner_event,
+                        tool_event,
+                        self.max_trace_depth,
+                    ) {
+                        self.enqueue_tool_follow_up(tool_follow_up, &mut feedback);
+                    }
+                }
+                crate::ToolNotificationPolicy::EachAndFinal => {
+                    if let Some(tool_follow_up) = bounded_single_tool_follow_up_event(
+                        &planner_event,
+                        tool_event.clone(),
+                        self.max_trace_depth,
+                    ) {
+                        self.enqueue_tool_follow_up(tool_follow_up, &mut feedback);
+                    }
+                    final_tool_follow_ups.push(tool_event);
+                }
+            }
+        }
         if let Some(tool_follow_up) = aggregate_tool_follow_up_events(
             &planner_event,
-            tool_follow_up_events,
+            final_tool_follow_ups,
             self.max_trace_depth,
         ) {
-            if self.pending_tool_follow_ups.len() < MAX_PENDING_TOOL_FOLLOW_UPS {
-                // Tool output gets one fresh, bounded planner turn after this
-                // action turn completes. Sibling tool results are coalesced
-                // before entering the FIFO so one user request has one
-                // coherent follow-up context.
-                self.pending_tool_follow_ups.push_back(tool_follow_up);
-            } else if let ProcessingOutcome::Observed(feedback_observation) =
-                self.process_event(tool_follow_up)
-            {
-                feedback.push(feedback_observation);
-            }
+            self.enqueue_tool_follow_up(tool_follow_up, &mut feedback);
         }
         if due_open_loop.is_some() && due_terminal_non_success {
             self.defer_due_open_loop_without_schedule(&input, applied_state_updates)
@@ -2401,6 +2425,13 @@ fn aggregate_tool_follow_up_events(
         .first()
         .and_then(WorldEvent::actor)
         .filter(|actor| events.iter().all(|event| event.actor() == Some(*actor)));
+    let notification_policy = if events.iter().any(|event| {
+        event.tool_notification_policy() == Some(crate::ToolNotificationPolicy::EachAndFinal)
+    }) {
+        crate::ToolNotificationPolicy::EachAndFinal
+    } else {
+        crate::ToolNotificationPolicy::Final
+    };
     let event = WorldEvent::derived_from(
         parent,
         Utc::now(),
@@ -2413,7 +2444,8 @@ fn aggregate_tool_follow_up_events(
         }),
         max_trace_depth,
     )
-    .ok()?;
+    .ok()?
+    .with_tool_notification_policy(notification_policy);
     Some(match actor {
         Some(actor) => event.with_actor(actor),
         None => event,
@@ -2553,6 +2585,7 @@ fn bounded_single_tool_follow_up_event(
         _ => return None,
     };
     let actor = event.actor();
+    let notification_policy = event.tool_notification_policy();
     let bounded = WorldEvent::derived_from(
         parent,
         event.occurred_at(),
@@ -2563,6 +2596,10 @@ fn bounded_single_tool_follow_up_event(
     )
     .ok()?;
     bounded.validate(max_trace_depth).ok()?;
+    let bounded = match notification_policy {
+        Some(policy) => bounded.with_tool_notification_policy(policy),
+        None => bounded,
+    };
     Some(match actor {
         Some(actor) => bounded.with_actor(actor),
         None => bounded,
@@ -2669,7 +2706,7 @@ mod tests {
         AffectStore, AffectStoreFuture, CoreServices, GoalStore, GoalStoreFuture, MemoryStore,
         MemoryStoreFuture, OpenLoopStore, OpenLoopStoreFuture, RelationStore, RelationStoreFuture,
     };
-    use crate::{DecisionActionKind, ExecutiveScope};
+    use crate::{DecisionActionKind, ExecutiveScope, ToolNotificationPolicy};
     use chrono::Utc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -2917,6 +2954,47 @@ mod tests {
                 }
                 WorldEventKind::ToolFailed(_) => {
                     panic!("multi-tool test should aggregate failures too")
+                }
+                _ => DecisionPlan::silent(),
+            };
+            Box::pin(async move { Ok(plan) })
+        }
+    }
+
+    struct NotificationPolicyModel {
+        conversation_id: ConversationId,
+        policy: ToolNotificationPolicy,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ModelBackend for NotificationPolicyModel {
+        fn plan<'a>(&'a self, input: &'a PlannerInput) -> ModelBackendFuture<'a> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let conversation_id = self.conversation_id;
+            let policy = self.policy;
+            let plan = match input.event.kind() {
+                WorldEventKind::MessageReceived(_) => {
+                    DecisionPlan::new(DecisionDisposition::SpecialAction)
+                        .with_intent(crate::CognitiveIntent::use_tool_with_notification_policy(
+                            "weather.current",
+                            r#"{"location":"成都"}"#,
+                            crate::ActionScope::Conversation(conversation_id),
+                            policy,
+                        ))
+                        .with_intent(crate::CognitiveIntent::use_tool_with_notification_policy(
+                            "web.search",
+                            r#"{"query":"猫眼星云"}"#,
+                            crate::ActionScope::Conversation(conversation_id),
+                            policy,
+                        ))
+                }
+                WorldEventKind::ToolCompleted(_) | WorldEventKind::ToolFailed(_) => {
+                    DecisionPlan::new(DecisionDisposition::Reply).with_intent(
+                        crate::CognitiveIntent::send_message(
+                            conversation_id,
+                            MessageContent::text("已完成一项查询"),
+                        ),
+                    )
                 }
                 _ => DecisionPlan::silent(),
             };
@@ -4094,6 +4172,88 @@ mod tests {
         assert_eq!(model_calls.load(Ordering::SeqCst), 2);
         // Two tool executions and exactly one final visible delivery.
         assert_eq!(port_calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn tool_notification_policy_controls_follow_up_message_cadence() {
+        for (policy, expected_operations) in [
+            (
+                ToolNotificationPolicy::Each,
+                vec!["weather.current", "web.search"],
+            ),
+            (
+                ToolNotificationPolicy::EachAndFinal,
+                vec!["weather.current", "web.search", "core.tool_batch"],
+            ),
+        ] {
+            let conversation_id = ConversationId::new();
+            let model_calls = Arc::new(AtomicUsize::new(0));
+            let (_handle, mut runtime) = CognitiveRuntime::new_with_services(
+                RuntimeConfig::default(),
+                CoreServices::with_model(NotificationPolicyModel {
+                    conversation_id,
+                    policy,
+                    calls: Arc::clone(&model_calls),
+                }),
+            )
+            .expect("valid runtime");
+            let arbiter = ActionArbiter::new(
+                ActionArbiterConfig::default().with_capabilities(EnvironmentCapabilities::all()),
+            );
+            let port_calls = Arc::new(AtomicUsize::new(0));
+            let port = ToolThenDeliveryPort {
+                calls: Arc::clone(&port_calls),
+            };
+
+            runtime
+                .process_event_with_planner_and_actions(
+                    direct_message(conversation_id, PersonId::new()),
+                    &arbiter,
+                    &port,
+                )
+                .await
+                .expect("tool request should execute");
+
+            let queued_operations = runtime
+                .pending_tool_follow_ups
+                .iter()
+                .map(|event| match event.kind() {
+                    WorldEventKind::ToolCompleted(tool) => tool.operation.as_str(),
+                    WorldEventKind::ToolFailed(tool) => tool.operation.as_str(),
+                    _ => panic!("only tool follow-ups should be queued"),
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(queued_operations, expected_operations);
+            assert!(
+                runtime
+                    .pending_tool_follow_ups
+                    .iter()
+                    .all(|event| { event.tool_notification_policy() == Some(policy) })
+            );
+
+            let expected_replies = expected_operations.len();
+            for _ in 0..expected_replies {
+                let outcome = runtime
+                    .process_next_with_planner_and_actions(&arbiter, &port)
+                    .await
+                    .expect("tool follow-up should be queued")
+                    .expect("tool follow-up should plan");
+                assert!(matches!(
+                    outcome,
+                    PlannedProcessingOutcome::Planned { actions, .. }
+                        if matches!(
+                            actions.as_slice(),
+                            [ActionResult::Executed {
+                                outcome: ActionPortOutcome::Delivered { .. },
+                                ..
+                            }]
+                        )
+                ));
+            }
+            assert!(runtime.pending_tool_follow_ups.is_empty());
+            assert_eq!(model_calls.load(Ordering::SeqCst), expected_replies + 1);
+            assert_eq!(port_calls.load(Ordering::SeqCst), expected_replies + 2);
+        }
     }
 
     #[tokio::test]

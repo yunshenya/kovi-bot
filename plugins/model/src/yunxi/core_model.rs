@@ -35,8 +35,8 @@ use yunxi_core::{
     InteractionCues, IntrinsicGenerationControl, MessageContent, MessageId, MindDecisionProjection,
     MindDecisionReference, MindInfluenceMode, ModelBackend, ModelBackendError, ModelBackendFuture,
     PersonId, PlannerInput, ProactiveMotive, ReachOutIntent, StateUpdateProposal,
-    TextInferenceRequest, VisionInferenceRequest, WorldEventKind, apply_interaction_cues,
-    evolve_interaction_state,
+    TextInferenceRequest, ToolNotificationPolicy, VisionInferenceRequest, WorldEventKind,
+    apply_interaction_cues, evolve_interaction_state,
 };
 
 const FALLBACK_ROUTE_CAPACITY: usize = 256;
@@ -172,6 +172,8 @@ struct CoreInteractionCues {
     gratitude_milli: Option<i32>,
     #[serde(default)]
     mind_candidates: Option<serde_json::Value>,
+    #[serde(default)]
+    tool_notification_policy: Option<ToolNotificationPolicy>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -239,6 +241,7 @@ struct ParsedCoreResponse {
     incoming_impact: Option<IncomingTurnImpact>,
     stop_requested: bool,
     mind_candidates: MindCandidates,
+    tool_notification_policy: ToolNotificationPolicy,
 }
 
 enum CoreDirectRepair {
@@ -313,6 +316,7 @@ fn parse_core_response(content: &str) -> ParsedCoreResponse {
                     incoming_impact: wire.incoming_impact.map(Into::into),
                     stop_requested: wire.stop_requested,
                     mind_candidates: parse_mind_candidates(wire.mind_candidates),
+                    tool_notification_policy: wire.tool_notification_policy.unwrap_or_default(),
                 };
             }
         }
@@ -324,6 +328,7 @@ fn parse_core_response(content: &str) -> ParsedCoreResponse {
         incoming_impact: None,
         stop_requested: false,
         mind_candidates: MindCandidates::default(),
+        tool_notification_policy: ToolNotificationPolicy::Final,
     }
 }
 
@@ -457,6 +462,7 @@ async fn repair_direct_reply(
     scope: ReplyScope,
     allow_tool_call: bool,
     action_scope: Option<ActionScope>,
+    notification_policy: ToolNotificationPolicy,
     vision_images: &[crate::vision::VisionImage],
 ) -> Result<CoreDirectRepair, CoreDirectRepairFailure> {
     // Keep the repair turn independent from the first completion's mandatory
@@ -475,7 +481,14 @@ async fn repair_direct_reply(
     if crate::model::utils::is_model_error_response(&response.content) {
         return Err(CoreDirectRepairFailure::ModelErrorResponse);
     }
-    parse_direct_repair_output(&response.content, scope, allow_tool_call, action_scope).await
+    parse_direct_repair_output_with_policy(
+        &response.content,
+        scope,
+        allow_tool_call,
+        action_scope,
+        notification_policy,
+    )
+    .await
 }
 
 fn repair_context_messages(messages: &[BotMemory], allow_tool_call: bool) -> Vec<BotMemory> {
@@ -893,11 +906,29 @@ fn is_tool_registry_instruction(content: &str) -> bool {
         || content.starts_with("Core 工具清单当前不可用")
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 async fn parse_direct_repair_output(
     content: &str,
     scope: ReplyScope,
     allow_tool_call: bool,
     action_scope: Option<ActionScope>,
+) -> Result<CoreDirectRepair, CoreDirectRepairFailure> {
+    parse_direct_repair_output_with_policy(
+        content,
+        scope,
+        allow_tool_call,
+        action_scope,
+        ToolNotificationPolicy::Final,
+    )
+    .await
+}
+
+async fn parse_direct_repair_output_with_policy(
+    content: &str,
+    scope: ReplyScope,
+    allow_tool_call: bool,
+    action_scope: Option<ActionScope>,
+    notification_policy: ToolNotificationPolicy,
 ) -> Result<CoreDirectRepair, CoreDirectRepairFailure> {
     let content = content.trim();
     if content.is_empty() {
@@ -919,7 +950,8 @@ async fn parse_direct_repair_output(
     }
     if allow_tool_call
         && let Some(action_scope) = action_scope
-        && let Some(intents) = parse_core_tool_intents(content, action_scope)
+        && let Some(intents) =
+            parse_core_tool_intents_with_policy(content, action_scope, notification_policy)
     {
         return Ok(CoreDirectRepair::Tool(intents));
     }
@@ -980,6 +1012,7 @@ async fn register_core_tool_intents(
                 tool_name,
                 input: tool_input,
                 scope,
+                ..
             } = intent
             else {
                 unreachable!("Core tool intents were validated before registration");
@@ -1044,6 +1077,14 @@ fn strip_core_interaction_cues(content: &str) -> String {
 /// adjacent (apart from whitespace), and contain no visible text. Each JSON
 /// object is independently validated before it reaches an adapter.
 fn parse_core_tool_intents(content: &str, scope: ActionScope) -> Option<Vec<CognitiveIntent>> {
+    parse_core_tool_intents_with_policy(content, scope, ToolNotificationPolicy::Final)
+}
+
+fn parse_core_tool_intents_with_policy(
+    content: &str,
+    scope: ActionScope,
+    notification_policy: ToolNotificationPolicy,
+) -> Option<Vec<CognitiveIntent>> {
     let trimmed = content.trim();
     if trimmed.is_empty() || trimmed.chars().count() > MAX_CORE_TOOL_CALL_CHARS {
         return None;
@@ -1060,7 +1101,12 @@ fn parse_core_tool_intents(content: &str, scope: ActionScope) -> Option<Vec<Cogn
             return None;
         }
         let input = serde_json::to_string(&call.arguments).ok()?;
-        let intent = CognitiveIntent::use_tool(call.name, input, scope);
+        let intent = CognitiveIntent::use_tool_with_notification_policy(
+            call.name,
+            input,
+            scope,
+            notification_policy,
+        );
         intent.validate().ok()?;
         intents.push(intent);
         if intents.len() > MAX_CORE_TOOL_CALLS {
@@ -2745,7 +2791,7 @@ impl ModelBackend for KoviModelBackend {
                     0,
                     BotMemory {
                         role: Roles::System,
-                        content: "Core 单轮语义协议：输出的第一个非空字符必须开始唯一一个 [[INTERACTION_CUES]]{\"incoming_impact\":\"取值\",\"stop_requested\":false}[[/INTERACTION_CUES]] 前缀。incoming_impact 只能是 none、extends_pending_topic、invalidates_pending_content、unrelated。none 表示新消息对已准备内容没有实质影响；extends_pending_topic 表示兼容地补充当前话题；invalidates_pending_content 表示回答、纠正或推翻其前提；unrelated 表示独立话题。stop_requested 只有在当前用户明确要求停止正在生成或发送的回复时才设为 true；否则设为 false。只有能可靠判断用户情绪或明确感谢时，才在同一 JSON 中同时增加 sentiment_valence_milli（-1000 到 1000）、sentiment_arousal_milli（-1000 到 1000）、gratitude_milli（0 到 1000）三个整数；否则省略这三个字段。可选 mind_candidates 只能在当前输入提供了明确、非敏感依据时给出，每种最多一个：interest 为 {\"topic\":\"...\",\"novelty_milli\":0到1000}，curiosity/open_question/agenda 为短字符串，belief 为 {\"proposition\":\"以我认为开头的全局观点\",\"confidence_delta_milli\":-200到200且非0}，preference 为 {\"subject\":\"芸汐自己的偏好对象\",\"valence_delta_milli\":-100到100且非0}。不得从情绪线索推断长期 belief/preference，不得写用户身份、健康、政治、宗教、性取向、联系方式、密码或其他敏感信息；没有可靠候选就省略 mind_candidates。stop_requested 为 true 时，前缀后不要输出可见正文或工具调用。前缀后直接输出自然语言回复、一个或多个连续的完整 TOOL_CALL（调用之间只能有空白），或在低频未点名群聊候选中输出完整的 [[REPLY_ACTION]]{\"disposition\":\"silent\"}[[/REPLY_ACTION]]。不得增加其他字段、重复前缀、放进代码块或在正文解释协议。".to_string(),
+                        content: "Core 单轮语义协议：输出的第一个非空字符必须开始唯一一个 [[INTERACTION_CUES]]{\"incoming_impact\":\"取值\",\"stop_requested\":false}[[/INTERACTION_CUES]] 前缀。incoming_impact 只能是 none、extends_pending_topic、invalidates_pending_content、unrelated。none 表示新消息对已准备内容没有实质影响；extends_pending_topic 表示兼容地补充当前话题；invalidates_pending_content 表示回答、纠正或推翻其前提；unrelated 表示独立话题。stop_requested 只有在当前用户明确要求停止正在生成或发送的回复时才设为 true；否则设为 false。可选 tool_notification_policy 只能是 final、each、each_and_final：用户未明确指定消息节奏时省略或使用 final；用户明确要求每完成一项就通知时使用 each；只有用户明确要求逐项通知并在全部结束后再汇总时才使用 each_and_final。不得因为一次输出多个工具调用就自行选择 each 或 each_and_final。只有能可靠判断用户情绪或明确感谢时，才在同一 JSON 中同时增加 sentiment_valence_milli（-1000 到 1000）、sentiment_arousal_milli（-1000 到 1000）、gratitude_milli（0 到 1000）三个整数；否则省略这三个字段。可选 mind_candidates 只能在当前输入提供了明确、非敏感依据时给出，每种最多一个：interest 为 {\"topic\":\"...\",\"novelty_milli\":0到1000}，curiosity/open_question/agenda 为短字符串，belief 为 {\"proposition\":\"以我认为开头的全局观点\",\"confidence_delta_milli\":-200到200且非0}，preference 为 {\"subject\":\"芸汐自己的偏好对象\",\"valence_delta_milli\":-100到100且非0}。不得从情绪线索推断长期 belief/preference，不得写用户身份、健康、政治、宗教、性取向、联系方式、密码或其他敏感信息；没有可靠候选就省略 mind_candidates。stop_requested 为 true 时，前缀后不要输出可见正文或工具调用。前缀后直接输出自然语言回复、一个或多个连续的完整 TOOL_CALL（调用之间只能有空白），或在低频未点名群聊候选中输出完整的 [[REPLY_ACTION]]{\"disposition\":\"silent\"}[[/REPLY_ACTION]]。不得增加其他字段、重复前缀、放进代码块或在正文解释协议。".to_string(),
                     },
                 );
             }
@@ -2867,7 +2913,7 @@ impl ModelBackend for KoviModelBackend {
                     0,
                     BotMemory {
                         role: Roles::System,
-                        content: "Core 工具协议：确实需要调用受控工具时，在本轮要求的 INTERACTION_CUES 前缀之后，只输出一个或多个连续的完整 [[TOOL_CALL]]{\"name\":\"工具名\",\"arguments\":{}}[[/TOOL_CALL]]（调用之间只能有空白）。不要输出前后解释、代码块或把工具结果写成已完成；普通回复保持自然文本。工具名称和参数必须是 JSON 对象。".to_string(),
+                        content: "Core 工具协议：确实需要调用受控工具时，在本轮要求的 INTERACTION_CUES 前缀之后，只输出一个或多个连续的完整 [[TOOL_CALL]]{\"name\":\"工具名\",\"arguments\":{}}[[/TOOL_CALL]]（调用之间只能有空白）。消息通知节奏只由 INTERACTION_CUES 中经过校验的 tool_notification_policy 决定，不要把它写入 TOOL_CALL。不要输出前后解释、代码块或把工具结果写成已完成；普通回复保持自然文本。工具名称和参数必须是 JSON 对象。".to_string(),
                     },
                 );
                 let tool_instruction = if let Some(registry) = tool_registry() {
@@ -3082,6 +3128,7 @@ impl ModelBackend for KoviModelBackend {
                     incoming_impact: Some(IncomingTurnImpact::Unrelated),
                     stop_requested: false,
                     mind_candidates: MindCandidates::default(),
+                    tool_notification_policy: ToolNotificationPolicy::Final,
                 }
             } else if message.is_some() {
                 parse_core_response(&response_content)
@@ -3092,8 +3139,13 @@ impl ModelBackend for KoviModelBackend {
                     incoming_impact: None,
                     stop_requested: false,
                     mind_candidates: MindCandidates::default(),
+                    tool_notification_policy: ToolNotificationPolicy::Final,
                 }
             };
+            let tool_notification_policy = input
+                .event
+                .tool_notification_policy()
+                .unwrap_or(parsed_response.tool_notification_policy);
             if message.is_some() && parsed_response.stop_requested {
                 if let Some(guard) = incoming_guard.as_mut() {
                     guard.disarm();
@@ -3155,8 +3207,11 @@ impl ModelBackend for KoviModelBackend {
             if allow_tool_call
                 && input.supports(ActionCapability::UseTool)
                 && let Some(action_scope) = action_scope
-                && let Some(intents) =
-                    parse_core_tool_intents(&parsed_response.content, action_scope)
+                && let Some(intents) = parse_core_tool_intents_with_policy(
+                    &parsed_response.content,
+                    action_scope,
+                    tool_notification_policy,
+                )
             {
                 let Some(tool_plan) = register_core_tool_intents(
                     &self.tool_turns,
@@ -3183,7 +3238,12 @@ impl ModelBackend for KoviModelBackend {
             {
                 !allow_tool_call
                     || action_scope.is_none_or(|scope| {
-                        parse_core_tool_intents(&parsed_response.content, scope).is_none()
+                        parse_core_tool_intents_with_policy(
+                            &parsed_response.content,
+                            scope,
+                            tool_notification_policy,
+                        )
+                        .is_none()
                     })
             } else {
                 false
@@ -3243,6 +3303,7 @@ impl ModelBackend for KoviModelBackend {
                     conversation.scope(),
                     allow_tool_call && input.supports(ActionCapability::UseTool),
                     action_scope,
+                    tool_notification_policy,
                     &vision_images,
                 )
                 .await
@@ -3499,14 +3560,14 @@ mod tests {
         direct_fallback_reply_plan, direct_reply_expected, due_reply_target,
         eligible_mind_candidates, interaction_state_updates_with_cues, intrinsic_output_is_unsafe,
         intrinsic_prompt, keeps_existing_prepared_plan, mind_context_messages, parse_core_response,
-        parse_core_tool_intent, parse_core_tool_intents, parse_direct_repair_output,
-        parse_qq_conversation, pre_model_plan, prepared_outgoing_semantic_context,
-        purge_group_routes_from_cache, recent_conversation_messages,
-        recent_direct_conversation_messages, recent_group_conversation_messages,
-        refine_core_incoming, register_core_tool_intents, repair_context_messages,
-        reply_expected_for_incoming, route_from_lookup, route_lookup_with_fallback,
-        select_host_model_route_from_capability, shadow_projection_for_completed_plan,
-        visible_reply_intent, visible_reply_state_updates,
+        parse_core_tool_intent, parse_core_tool_intents, parse_core_tool_intents_with_policy,
+        parse_direct_repair_output, parse_direct_repair_output_with_policy, parse_qq_conversation,
+        pre_model_plan, prepared_outgoing_semantic_context, purge_group_routes_from_cache,
+        recent_conversation_messages, recent_direct_conversation_messages,
+        recent_group_conversation_messages, refine_core_incoming, register_core_tool_intents,
+        repair_context_messages, reply_expected_for_incoming, route_from_lookup,
+        route_lookup_with_fallback, select_host_model_route_from_capability,
+        shadow_projection_for_completed_plan, visible_reply_intent, visible_reply_state_updates,
     };
     use crate::model::{
         BotMemory, ConversationCoordinator, IncomingTurnImpact, OutgoingExecutiveDecision,
@@ -3523,8 +3584,9 @@ mod tests {
         MessageId, MessageReceivedEvent, MessageSentEvent, MindDecisionProjection, ModelHealth,
         OpenLoop, OpenLoopId, OpenLoopKind, OpenLoopOwner, PersonId, PlannerInput,
         PlannerStateSnapshot, ProactiveMotive, ProspectiveMemoryEvent, RelationState, SelfModel,
-        SelfModelSnapshot, StateUpdateProposal, WorkingState, WorkingStateConfig, WorldEvent,
-        WorldEventKind, event_action_idempotency_key, evolve_interaction_state,
+        SelfModelSnapshot, StateUpdateProposal, ToolNotificationPolicy, WorkingState,
+        WorkingStateConfig, WorldEvent, WorldEventKind, event_action_idempotency_key,
+        evolve_interaction_state,
     };
 
     fn message_input(person_id: PersonId, visible_reply_allowed: bool) -> PlannerInput {
@@ -3855,7 +3917,41 @@ mod tests {
         assert_eq!(parsed.interaction_cues.gratitude_strength, 0.8);
         assert_eq!(parsed.incoming_impact, None);
         assert!(!parsed.stop_requested);
+        assert_eq!(
+            parsed.tool_notification_policy,
+            ToolNotificationPolicy::Final
+        );
         assert!(!parsed.content.contains("INTERACTION_CUES"));
+    }
+
+    #[test]
+    fn core_response_notification_policy_is_explicit_and_propagates_to_tools() {
+        let conversation_id = ConversationId::new();
+        let parsed = parse_core_response(
+            r#"[[INTERACTION_CUES]]{"tool_notification_policy":"each_and_final"}[[/INTERACTION_CUES]][[TOOL_CALL]]{"name":"time.now","arguments":{}}[[/TOOL_CALL]][[TOOL_CALL]]{"name":"web.search","arguments":{"query":"猫眼星云"}}[[/TOOL_CALL]]"#,
+        );
+        assert_eq!(
+            parsed.tool_notification_policy,
+            ToolNotificationPolicy::EachAndFinal
+        );
+        let intents = parse_core_tool_intents_with_policy(
+            &parsed.content,
+            ActionScope::Conversation(conversation_id),
+            parsed.tool_notification_policy,
+        )
+        .expect("valid tool sequence");
+        assert_eq!(intents.len(), 2);
+        assert!(intents.iter().all(|intent| {
+            intent.tool_notification_policy() == Some(ToolNotificationPolicy::EachAndFinal)
+        }));
+
+        let invalid = parse_core_response(
+            r#"[[INTERACTION_CUES]]{"tool_notification_policy":"sometimes"}[[/INTERACTION_CUES]]reply"#,
+        );
+        assert_eq!(
+            invalid.tool_notification_policy,
+            ToolNotificationPolicy::Final
+        );
     }
 
     #[test]
@@ -4324,6 +4420,23 @@ mod tests {
                 panic!("valid repair tool calls must become tool intents");
             };
             assert_eq!(intents.len(), 2);
+
+            let tool = parse_direct_repair_output_with_policy(
+                "[[TOOL_CALL]]{\"name\":\"time.now\",\"arguments\":{}}[[/TOOL_CALL]]",
+                scope,
+                true,
+                Some(action_scope),
+                ToolNotificationPolicy::Each,
+            )
+            .await
+            .expect("repair should preserve the original request policy");
+            let CoreDirectRepair::Tool(intents) = tool else {
+                panic!("valid repair tool call must become a tool intent");
+            };
+            assert_eq!(
+                intents[0].tool_notification_policy(),
+                Some(ToolNotificationPolicy::Each)
+            );
         });
     }
 

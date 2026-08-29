@@ -11,6 +11,15 @@ use crate::{ConversationId, GoalId, MessageContent, MessageId, OpenLoopId};
 use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolNotificationPolicy {
+    #[default]
+    Final,
+    Each,
+    EachAndFinal,
+}
+
 /// A high-level thing Yunxi wants to accomplish.  Intents do not imply that a
 /// delivery channel exists; conversion into a proposed action is still
 /// subject to host capabilities and arbiter policy.
@@ -27,6 +36,8 @@ pub enum CognitiveIntent {
         tool_name: String,
         input: String,
         scope: ActionScope,
+        #[serde(default)]
+        notification_policy: ToolNotificationPolicy,
     },
     CreateOpenLoop(OpenLoopDraft),
     ResolveOpenLoop {
@@ -60,6 +71,8 @@ impl<'de> Deserialize<'de> for CognitiveIntent {
                 tool_name: String,
                 input: String,
                 scope: ActionScope,
+                #[serde(default)]
+                notification_policy: ToolNotificationPolicy,
             },
             CreateOpenLoop(OpenLoopDraft),
             ResolveOpenLoop {
@@ -89,10 +102,12 @@ impl<'de> Deserialize<'de> for CognitiveIntent {
                 tool_name,
                 input,
                 scope,
+                notification_policy,
             } => Self::UseTool {
                 tool_name,
                 input,
                 scope,
+                notification_policy,
             },
             Wire::CreateOpenLoop(draft) => Self::CreateOpenLoop(draft),
             Wire::ResolveOpenLoop {
@@ -144,10 +159,26 @@ impl CognitiveIntent {
         input: impl Into<String>,
         scope: ActionScope,
     ) -> Self {
+        Self::use_tool_with_notification_policy(
+            tool_name,
+            input,
+            scope,
+            ToolNotificationPolicy::Final,
+        )
+    }
+
+    #[must_use]
+    pub fn use_tool_with_notification_policy(
+        tool_name: impl Into<String>,
+        input: impl Into<String>,
+        scope: ActionScope,
+        notification_policy: ToolNotificationPolicy,
+    ) -> Self {
         Self::UseTool {
             tool_name: tool_name.into(),
             input: input.into(),
             scope,
+            notification_policy,
         }
     }
 
@@ -194,6 +225,7 @@ impl CognitiveIntent {
                 tool_name,
                 input,
                 scope,
+                ..
             } => ToolAction::new(tool_name.clone(), input.clone(), *scope)
                 .map(|_| ())
                 .map_err(IntentValidationError::Action),
@@ -233,6 +265,7 @@ impl CognitiveIntent {
                 tool_name,
                 input,
                 scope,
+                ..
             } => ToolAction::new(tool_name.clone(), input.clone(), *scope)
                 .map(ProposedAction::UseTool)
                 .map_err(IntentValidationError::Action),
@@ -268,6 +301,17 @@ impl CognitiveIntent {
             Self::StartGoal(draft) => ActionScope::for_goal_owner(draft.owner()),
             Self::CancelGoal { owner, .. } => ActionScope::for_goal_owner(*owner),
             Self::Noop => ActionScope::Global,
+        }
+    }
+
+    #[must_use]
+    pub const fn tool_notification_policy(&self) -> Option<ToolNotificationPolicy> {
+        match self {
+            Self::UseTool {
+                notification_policy,
+                ..
+            } => Some(*notification_policy),
+            _ => None,
         }
     }
 }
@@ -368,5 +412,24 @@ mod tests {
             assert_eq!(decoded.action_scope(), scope);
             assert_eq!(decoded.propose_action().expect("propose").scope(), scope);
         }
+    }
+
+    #[test]
+    fn legacy_tool_intents_default_to_final_notification() {
+        let scope = ActionScope::Global;
+        let legacy = serde_json::json!({
+            "type": "use_tool",
+            "payload": {
+                "tool_name": "weather.current",
+                "input": "{}",
+                "scope": scope
+            }
+        });
+        let decoded: CognitiveIntent =
+            serde_json::from_value(legacy).expect("legacy tool intent should deserialize");
+        assert_eq!(
+            decoded.tool_notification_policy(),
+            Some(ToolNotificationPolicy::Final)
+        );
     }
 }
