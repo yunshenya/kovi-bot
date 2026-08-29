@@ -482,14 +482,25 @@ async fn repair_direct_reply(
     if crate::model::utils::is_model_error_response(&response.content) {
         return Err(CoreDirectRepairFailure::ModelErrorResponse);
     }
-    parse_direct_repair_output_with_policy(
+    let result = parse_direct_repair_output_with_policy(
         &response.content,
         scope,
         allow_tool_call,
         action_scope,
         notification_policy,
     )
-    .await
+    .await;
+    match result {
+        Ok(repaired) => Ok(repaired),
+        Err(failure) => {
+            kovi::log::warn!(
+                "Yunxi Core repair output rejected: reason={} {}",
+                failure.as_log_reason(),
+                core_tool_protocol_diagnostic(&response.content),
+            );
+            Err(failure)
+        }
+    }
 }
 
 fn repair_context_messages(messages: &[BotMemory], allow_tool_call: bool) -> Vec<BotMemory> {
@@ -1119,6 +1130,67 @@ fn parse_core_tool_intents_with_policy(
         }
     }
     (!intents.is_empty()).then_some(intents)
+}
+
+/// Accept the narrow mixed shape that can occur on a tool-result follow-up:
+/// one or more validated tool markers followed by the visible result for the
+/// completed operation. This is deliberately separate from the strict parser;
+/// callers must opt in only when a tool result is already being processed.
+fn parse_core_tool_intents_with_visible_suffix(
+    content: &str,
+    scope: ActionScope,
+    notification_policy: ToolNotificationPolicy,
+) -> Option<(Vec<CognitiveIntent>, String)> {
+    let trimmed = content.trim();
+    if trimmed.is_empty() || trimmed.chars().count() > MAX_CORE_TOOL_CALL_CHARS {
+        return None;
+    }
+    let mut remaining = trimmed;
+    let mut intents = Vec::new();
+    loop {
+        let payload = remaining.strip_prefix(CORE_TOOL_CALL_START)?;
+        let end = payload.find(CORE_TOOL_CALL_END)?;
+        let payload_json = payload[..end].trim();
+        let call = serde_json::from_str::<CoreToolCall>(payload_json).ok()?;
+        if call.name.trim() != call.name || call.name.is_empty() || call.name.chars().count() > 128
+        {
+            return None;
+        }
+        let input = serde_json::to_string(&call.arguments).ok()?;
+        let intent = CognitiveIntent::use_tool_with_notification_policy(
+            call.name,
+            input,
+            scope,
+            notification_policy,
+        );
+        intent.validate().ok()?;
+        intents.push(intent);
+        if intents.len() >= MAX_CORE_TOOL_CALLS {
+            return None;
+        }
+        remaining = payload[end + CORE_TOOL_CALL_END.len()..].trim_start();
+        if remaining.is_empty() {
+            return None;
+        }
+        if !remaining.starts_with(CORE_TOOL_CALL_START) {
+            break;
+        }
+    }
+
+    let suffix = remaining.trim();
+    if suffix.is_empty()
+        || suffix.chars().count() > MAX_CORE_TOOL_CALL_CHARS
+        || suffix.contains(CORE_TOOL_CALL_START)
+        || suffix.contains(CORE_TOOL_CALL_END)
+        || suffix.contains(CORE_INTERACTION_CUES_START)
+        || suffix.contains(CORE_INTERACTION_CUES_END)
+        || suffix.contains("[[REPLY_ACTION]]")
+        || suffix.contains("[[/REPLY_ACTION]]")
+        || suffix.contains("[[NEXT_MESSAGE]]")
+    {
+        return None;
+    }
+    Some((intents, suffix.to_owned()))
 }
 
 fn core_tool_protocol_diagnostic(content: &str) -> String {
@@ -3257,6 +3329,43 @@ impl ModelBackend for KoviModelBackend {
                 crate::model::finish(ticket).await;
                 return Ok(tool_plan);
             }
+            if tool_follow_up
+                && allow_tool_call
+                && input.supports(ActionCapability::UseTool)
+                && let Some(action_scope) = action_scope
+                && let Some((intents, visible_suffix)) = parse_core_tool_intents_with_visible_suffix(
+                    &parsed_response.content,
+                    action_scope,
+                    tool_notification_policy,
+                )
+            {
+                let visible_plan =
+                    ReplyPlan::from_model_output(conversation.scope(), &visible_suffix).await;
+                if core_plan_has_visible_text(&visible_plan)
+                    && let Some(reply_intent) =
+                        visible_reply_intent(reply_target, visible_plan.content)
+                    && let Some(mut tool_plan) = register_core_tool_intents(
+                        &self.tool_turns,
+                        input,
+                        &mind_projection,
+                        intents,
+                        ticket,
+                        parsed_response.interaction_cues,
+                        source_message_id,
+                    )
+                    .await
+                {
+                    tool_plan.intents.push(reply_intent);
+                    crate::model::finish(ticket).await;
+                    kovi::log::warn!(
+                        "Yunxi Core mixed tool/reply protocol recovered: event_id={} message_id={} conversation_id={} tool_follow_up=true",
+                        input.event.id(),
+                        message_id_for_log(input),
+                        conversation_id_for_log(input),
+                    );
+                    return Ok(tool_plan);
+                }
+            }
             let invalid_tool_output = if parsed_response.content.contains(CORE_TOOL_CALL_START)
                 || parsed_response.content.contains(CORE_TOOL_CALL_END)
             {
@@ -3668,9 +3777,9 @@ mod tests {
         eligible_mind_candidates, interaction_state_updates_with_cues, intrinsic_output_is_unsafe,
         intrinsic_prompt, keeps_existing_prepared_plan, message_id_for_log, mind_context_messages,
         parse_core_response, parse_core_tool_intent, parse_core_tool_intents,
-        parse_core_tool_intents_with_policy, parse_direct_repair_output,
-        parse_direct_repair_output_with_policy, parse_qq_conversation, pre_model_plan,
-        prepared_outgoing_semantic_context, purge_group_routes_from_cache,
+        parse_core_tool_intents_with_policy, parse_core_tool_intents_with_visible_suffix,
+        parse_direct_repair_output, parse_direct_repair_output_with_policy, parse_qq_conversation,
+        pre_model_plan, prepared_outgoing_semantic_context, purge_group_routes_from_cache,
         recent_conversation_messages, recent_direct_conversation_messages,
         recent_group_conversation_messages, refine_core_incoming, register_core_tool_intents,
         repair_context_messages, reply_expected_for_incoming, route_from_lookup,
@@ -4076,6 +4185,30 @@ mod tests {
         assert!(diagnostic.contains("preview="));
         assert!(diagnostic.contains("..."));
         assert!(diagnostic.len() < MAX_CORE_PROTOCOL_LOG_PREVIEW_CHARS + 128);
+    }
+
+    #[test]
+    fn mixed_tool_result_output_recovers_valid_calls_and_visible_suffix() {
+        let scope = ActionScope::Conversation(ConversationId::new());
+        let parsed = parse_core_tool_intents_with_visible_suffix(
+            "[[TOOL_CALL]]{\"name\":\"web.search\",\"arguments\":{\"query\":\"猫眼星云\"}}[[/TOOL_CALL]] 成都今天晴间多云。",
+            scope,
+            ToolNotificationPolicy::Each,
+        )
+        .expect("leading tool call and visible suffix should be recoverable");
+        assert_eq!(parsed.0.len(), 1);
+        assert_eq!(parsed.1, "成都今天晴间多云。");
+        assert_eq!(
+            parsed.0[0].tool_notification_policy(),
+            Some(ToolNotificationPolicy::Each)
+        );
+
+        assert!(parse_core_tool_intents_with_visible_suffix(
+            "[[TOOL_CALL]]{\"name\":\"web.search\",\"arguments\":{}}[[/TOOL_CALL]] 文本 [[TOOL_CALL]]",
+            scope,
+            ToolNotificationPolicy::Each,
+        )
+        .is_none());
     }
 
     #[test]
