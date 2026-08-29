@@ -72,6 +72,7 @@ const MIND_CONTEXT_INSTRUCTION: &str = "Yunxi Mind v2：下面的 Mind state 是
 const MIND_DECISION_PREFIX: &str = "Yunxi Mind v2 decision (validated data-only JSON):\n";
 const MIND_DECISION_INSTRUCTION: &str = "Yunxi Mind v2 当前 disposition 已由 Rust 基于同一份 bounded snapshot 决定。ask_question 时自然地只问一个与给定 open question 有关的问题；change_topic 时自然过渡到给定 interest；resume_agenda 时结合 Core open-loop/goal context 自然恢复对应事项。ambient 群聊中的 silent 只表示‘默认不插话’，如果当前消息确实提供了具体而自然的切入点，可以回复；不要为了服从标签而回复，也不要在正文中提及 disposition、Mind 或内部协议。它不得覆盖当前明确请求、stop、工具权限或发送目标。";
 const CORE_DIRECT_REPAIR_PROMPT: &str = "Core 私聊回复修复：根据下面给出的当前用户原话和同一私聊的近期上下文生成本轮结果。目标和参数明确且确实需要受控工具时，只输出一个或多个连续的完整 [[TOOL_CALL]]{\"name\":\"工具名\",\"arguments\":{}}[[/TOOL_CALL]]（每个调用独立成对，调用之间只能有空白）；其他情况只输出一条自然、简短的中文聊天正文。消息通知节奏由运行时根据已校验策略处理，绝不能靠拆分工具标记、插入其他标记或混入可见文字来凑消息数量。禁止 silent、INTERACTION_CUES、REPLY_ACTION、其他 JSON、代码块、解释、空字符串或混入可见文字。跨群目标不明确时直接询问群号或准确群名，不要调用 group.message.targets。";
+const CORE_CONTINUATION_REPAIR_PROMPT: &str = "Core 连续私聊修复：这是用户已经明确邀请的下一次独立发言。重新读取近期私聊，顺着芸汐刚发出的上一句，从此刻新想到的角度只说一条简短、自然的中文消息。可以是反应、联想、态度或一个真正想问的问题；不要编号，不要总结后续内容，不要说‘第几个想法’，不要解释实验、协议或内部状态。禁止 silent、INTERACTION_CUES、REPLY_ACTION、TOOL_CALL、NEXT_MESSAGE、JSON、代码块和空字符串。";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HostModelRoute {
@@ -474,7 +475,16 @@ async fn repair_direct_reply(
     // Keep the repair turn independent from the first completion's mandatory
     // INTERACTION_CUES protocol. Conflicting protocol instructions were the
     // source of the production repair returning another empty result.
+    let continuation_required = messages.iter().any(|message| {
+        matches!(message.role, Roles::System)
+            && message
+                .content
+                .starts_with("自主会话协议：这是用户明确邀请的连续私聊")
+    });
     let mut repair_messages = repair_context_messages(messages, allow_tool_call);
+    if continuation_required && let Some(prompt) = repair_messages.last_mut() {
+        prompt.content = CORE_CONTINUATION_REPAIR_PROMPT.to_string();
+    }
     let response = ModelGateway::complete_without_tools_or_reply_guidance(
         &mut repair_messages,
         reply_ticket,
@@ -950,6 +960,7 @@ fn is_conflicting_core_protocol(content: &str) -> bool {
         "Core 工具协议",
         "Core 并发裁决",
         "Core 私聊回复修复",
+        "自主会话协议",
         "Yunxi Mind v2",
     ]
     .iter()
@@ -2305,13 +2316,65 @@ fn autonomous_tick_explicit_request(input: &PlannerInput) -> bool {
     )
 }
 
+fn autonomous_tick_minimum_messages_pending(input: &PlannerInput) -> bool {
+    matches!(
+        input.event.kind(),
+        WorldEventKind::AutonomousConversationTick(tick)
+            if tick.explicit_continuation_requested && tick.minimum_messages_pending
+    )
+}
+
+fn incoming_explicit_continuation_request(input: &PlannerInput) -> bool {
+    matches!(
+        input.event.kind(),
+        WorldEventKind::MessageReceived(message)
+            if message.conversation_kind == ConversationKind::Direct
+                && crate::yunxi::autonomous::explicit_continuation_request(
+                    message.content.as_text()
+                )
+                .is_some()
+    )
+}
+
+fn is_explicit_continuation_turn(input: &PlannerInput) -> bool {
+    autonomous_tick_explicit_request(input) || incoming_explicit_continuation_request(input)
+}
+
 fn autonomous_conversation_prompt(input: &PlannerInput) -> String {
     match autonomous_conversation_kind(input) {
         Some(ConversationKind::Group) => "这是一次群聊自主会话心跳。结合同一群聊最近的真实消息、当前话题和 Mind 状态，先判断这句话是否对整个群有公共价值，并且话题仍然活跃、不会打断其他成员。只有在能提供具体信息、自然推进公共话题，或明确承接刚才对芸汐的点名/回复时才选择 continue 并发送一条简短消息；只对某个人有意义、属于私人情绪、话题已经冷却或群里已有新讨论时选择 wait 或 end。每次 continue 必须对应一个新的、独立的想法，不要把同一完整想法拆成多个气泡。不要在群里为了保持在线而自言自语，不要猜测 speaker_id 对应的现实身份，不要提及心跳、协议或内部状态。".to_owned(),
-        Some(ConversationKind::Direct) if autonomous_tick_explicit_request(input) => "这是用户明确请求的私聊连续对话实验中的下一回合。重新读取同一私聊最近的真实对话、当前话题和 Mind 状态；不要复述上一条，也不要拆分上一条。只要现在还能想到一个新的、独立且值得单独发送的观点、反应或问题，就选择 continue 并只发送这一条；不要仅仅因为上一句语法完整就停止。确实没有新内容时选择 wait 或 end。不要提及实验协议、心跳或内部状态。".to_owned(),
+        Some(ConversationKind::Direct) if autonomous_tick_minimum_messages_pending(input) => "顺着同一私聊里芸汐刚刚发出的上一句话，再自然地说一句此刻新想到的话。这是一次新的模型回合，只能生成一个独立气泡；直接接着聊，可以表达反应、联想、态度或问一个真正在意的问题。必须选择 continue 并输出正文。不要编号，不要用‘第几个想法’组织内容，不要预告或总结还没说的话，也不要解释实验、协议和内部状态。语气要像即时聊天，不要写成提纲或说明文。".to_owned(),
+        Some(ConversationKind::Direct) if autonomous_tick_explicit_request(input) => "重新读取同一私聊，先感受芸汐刚刚说完的上一句话，再判断此刻是否自然冒出了另一句值得单独发出的内容。可以继续联想、补一个态度、改口、开个轻微玩笑或问一个真正想问的问题；有就选择 continue 并只发这一句，没有才选择 wait 或 end。不要编号，不要写成总结或提纲，不要解释实验、协议和内部状态。".to_owned(),
         Some(ConversationKind::Direct) => "这是一次私聊自主会话心跳。结合同一私聊最近的真实对话、当前话题和 Mind 状态，判断是否还有自然的下一句。可以承接未完话题、补充刚才想到的内容或只提出一个自然问题；但每次 continue 必须是一个新的、独立且值得单独发送的想法，不要把同一完整想法拆成多个气泡。不要重复、刷屏或为了保持在线填充套话。只有确实想继续时选择 continue 并发送一条简短消息，否则选择 wait 或 end。不要提及心跳、协议或内部状态。".to_owned(),
         Some(ConversationKind::System) | None => "当前自主会话没有可用的会话类型，选择 end，不要发送消息。".to_owned(),
     }
+}
+
+fn autonomous_conversation_protocol(input: &PlannerInput) -> &'static str {
+    if autonomous_tick_minimum_messages_pending(input) {
+        "自主会话协议：这是用户明确邀请的连续私聊中的一个独立新回合。输出的第一个非空字符必须开始唯一一个 [[INTERACTION_CUES]] 前缀，JSON 中的 conversation_directive 必须是 continue；前缀后必须输出恰好一条简短自然的中文消息。不要选择 wait 或 end，不要一次列出多个观点，不要使用编号、分段、NEXT_MESSAGE 或多个气泡标记。直接说此刻新想到的内容，避免‘第一个想法’‘接下来’‘实验’等说明腔，不要提及协议或内部状态。"
+    } else {
+        "自主会话协议：这是芸汐自己的会话回合，不是对用户新消息的被动回复。输出的第一个非空字符必须开始唯一一个 [[INTERACTION_CUES]] 前缀，JSON 中必须包含 conversation_directive，取值只能是 continue、wait、end。continue 表示当前话题还有自然的下一句，芸汐可以在短暂间隔后继续；wait 表示这句说完后等待用户，不要自行追加；end 表示自然结束当前话题，直到用户再次发言才重新开始。只有选择 continue 时才发送一条简短自然的中文消息；选择 wait 或 end 时，前缀后不要输出正文。群聊必须额外满足‘对整个群有公共价值、不会打断正在进行的讨论、不是只对单个人说’这三个条件；不满足时选择 wait 或 end。不要提及这个协议、心跳或内部状态。若当前话题已完整、没有真实想说的内容，选择 wait 或 end，不要为了保持在线而填充套话。"
+    }
+}
+
+fn constrain_explicit_continuation_plan(plan: &mut ReplyPlan) {
+    if !plan.has_visible_reply() {
+        return;
+    }
+    let Some(first_bubble) = plan.bubbles.first() else {
+        return;
+    };
+    let Some(first_line) = first_bubble
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+    else {
+        return;
+    };
+    let first_line = first_line.to_owned();
+    plan.content = first_line.clone();
+    plan.bubbles = vec![first_line];
 }
 
 fn default_autonomous_directive(
@@ -2981,7 +3044,7 @@ impl ModelBackend for KoviModelBackend {
                     0,
                     BotMemory {
                         role: Roles::System,
-                        content: "自主会话协议：这是芸汐自己的会话回合，不是对用户新消息的被动回复。输出的第一个非空字符必须开始唯一一个 [[INTERACTION_CUES]] 前缀，JSON 中必须包含 conversation_directive，取值只能是 continue、wait、end。continue 表示当前话题还有自然的下一句，芸汐可以在短暂间隔后继续；wait 表示这句说完后等待用户，不要自行追加；end 表示自然结束当前话题，直到用户再次发言才重新开始。只有选择 continue 时才发送一条简短自然的中文消息；选择 wait 或 end 时，前缀后不要输出正文。群聊必须额外满足‘对整个群有公共价值、不会打断正在进行的讨论、不是只对单个人说’这三个条件；不满足时选择 wait 或 end。不要提及这个协议、心跳或内部状态。若当前话题已完整、没有真实想说的内容，选择 wait 或 end，不要为了保持在线而填充套话。".to_string(),
+                        content: autonomous_conversation_protocol(input).to_string(),
                     },
                 );
             }
@@ -3002,6 +3065,15 @@ impl ModelBackend for KoviModelBackend {
                     BotMemory {
                         role: Roles::System,
                         content: "Core 单轮语义协议：输出的第一个非空字符必须开始唯一一个 [[INTERACTION_CUES]]{\"incoming_impact\":\"取值\",\"stop_requested\":false}[[/INTERACTION_CUES]] 前缀。incoming_impact 只能是 none、extends_pending_topic、invalidates_pending_content、unrelated。none 表示新消息对已准备内容没有实质影响；extends_pending_topic 表示兼容地补充当前话题；invalidates_pending_content 表示回答、纠正或推翻其前提；unrelated 表示独立话题。stop_requested 只有在当前用户明确要求停止正在生成或发送的回复时才设为 true；否则设为 false。conversation_directive 可选取值为 continue、wait、end：只有在私聊或明确点名/回复的群聊中，且当前回复之后确实还有一个新的、独立且值得稍后补充的想法时才使用 continue；wait/end 表示这条回复已经完整，不要继续追加。不要把同一个完整想法按标点或短句拆成多个气泡，continue 只能表示下一回合会说一条新的独立内容；普通未点名群聊不要使用 continue。可选 tool_notification_policy 只能是 final、each、each_and_final：用户未明确指定消息节奏时省略或使用 final；用户明确要求每完成一项就通知、逐项发我或分两次发我时使用 each；只有用户明确要求逐项通知并在全部结束后再汇总时才使用 each_and_final。不得因为一次输出多个工具调用就自行选择 each 或 each_and_final；消息节奏由运行时执行，绝不能通过拆分 TOOL_CALL、插入内部标记或混入正文来凑消息数量。只有能可靠判断用户情绪或明确感谢时，才在同一 JSON 中同时增加 sentiment_valence_milli（-1000 到 1000）、sentiment_arousal_milli（-1000 到 1000）、gratitude_milli（0 到 1000）三个整数；否则省略这三个字段。可选 mind_candidates 只能在当前输入提供了明确、非敏感依据时给出，每种最多一个：interest 为 {\"topic\":\"...\",\"novelty_milli\":0到1000}，curiosity/open_question/agenda 为短字符串，belief 为 {\"proposition\":\"以我认为开头的全局观点\",\"confidence_delta_milli\":-200到200且非0}，preference 为 {\"subject\":\"芸汐自己的偏好对象\",\"valence_delta_milli\":-100到100且非0}。不得从情绪线索推断长期 belief/preference，不得写用户身份、健康、政治、宗教、性取向、联系方式、密码或其他敏感信息；没有可靠候选就省略 mind_candidates。stop_requested 为 true 时，前缀后不要输出可见正文或工具调用。前缀后直接输出自然语言回复、一个或多个连续的完整 TOOL_CALL（调用之间只能有空白），或在低频未点名群聊候选中输出完整的 [[REPLY_ACTION]]{\"disposition\":\"silent\"}[[/REPLY_ACTION]]。不得增加其他字段、重复前缀、放进代码块或在正文解释协议。".to_string(),
+                    },
+                );
+            }
+            if incoming_explicit_continuation_request(input) {
+                messages.insert(
+                    0,
+                    BotMemory {
+                        role: Roles::System,
+                        content: "连续私聊单气泡约束：用户要求的是多次真正独立的生成回合。本轮只负责现在这一条，必须直接输出一条简短自然的中文消息，不得提前列出后面的观点，不得分段、编号或使用‘第一个想法/第二个想法’等说明腔。后续内容会在消息成功发送后由新的模型回合结合聊天记录重新生成；不要在本轮代替后续回合完成它们。conversation_directive 使用 continue。像即时聊天一样直接接住话题，不要解释实验或协议。".to_string(),
                     },
                 );
             }
@@ -3524,8 +3596,11 @@ impl ModelBackend for KoviModelBackend {
                     core_tool_protocol_diagnostic(&parsed_response.content),
                 );
             }
+            let continuation_message_required = autonomous_tick_minimum_messages_pending(input);
             let response_content = if invalid_tool_output {
-                if direct_reply_expected(input) {
+                if continuation_message_required {
+                    String::new()
+                } else if direct_reply_expected(input) {
                     CORE_DIRECT_FALLBACK_REPLY.to_string()
                 } else if ambient_group_turn {
                     String::new()
@@ -3538,6 +3613,7 @@ impl ModelBackend for KoviModelBackend {
             {
                 "工具结果已经返回，但我暂时没能安全地整理它。".to_string()
             } else if is_autonomous_conversation_tick(input)
+                && !continuation_message_required
                 && matches!(
                     parsed_response.conversation_directive,
                     Some(ConversationTurnDirective::Wait | ConversationTurnDirective::End)
@@ -3630,7 +3706,7 @@ impl ModelBackend for KoviModelBackend {
                 }
             }
             if !core_plan_has_visible_text(&plan)
-                && (direct_reply_expected(input) || tool_follow_up)
+                && (direct_reply_expected(input) || tool_follow_up || continuation_message_required)
                 && is_current(ticket).await
                 && !fallback_response
                 && !intrinsic_response
@@ -3692,7 +3768,9 @@ impl ModelBackend for KoviModelBackend {
                             message_id_for_log(input),
                             conversation_id_for_log(input),
                         );
-                        plan = direct_fallback_reply_plan(conversation.scope()).await;
+                        if !continuation_message_required {
+                            plan = direct_fallback_reply_plan(conversation.scope()).await;
+                        }
                     }
                     Err(failure) => {
                         mind_output_eligible = false;
@@ -3703,7 +3781,9 @@ impl ModelBackend for KoviModelBackend {
                             conversation_id_for_log(input),
                             failure.as_log_reason(),
                         );
-                        plan = direct_fallback_reply_plan(conversation.scope()).await;
+                        if !continuation_message_required {
+                            plan = direct_fallback_reply_plan(conversation.scope()).await;
+                        }
                     }
                 }
             }
@@ -3718,6 +3798,9 @@ impl ModelBackend for KoviModelBackend {
                     conversation_id_for_log(input),
                 );
                 plan = direct_fallback_reply_plan(conversation.scope()).await;
+            }
+            if is_explicit_continuation_turn(input) {
+                constrain_explicit_continuation_plan(&mut plan);
             }
             if !core_plan_has_visible_text(&plan) {
                 crate::model::finish(ticket).await;
@@ -3799,9 +3882,13 @@ impl ModelBackend for KoviModelBackend {
             };
             if let Some(conversation_id) = input.event.scope().conversation_id() {
                 let directive = if is_autonomous_conversation_tick(input) {
-                    Some(parsed_response.conversation_directive.unwrap_or_else(|| {
-                        default_autonomous_directive(input, core_plan_has_visible_text(&plan))
-                    }))
+                    Some(if continuation_message_required {
+                        ConversationTurnDirective::Continue
+                    } else {
+                        parsed_response.conversation_directive.unwrap_or_else(|| {
+                            default_autonomous_directive(input, core_plan_has_visible_text(&plan))
+                        })
+                    })
                 } else if message.is_some() {
                     parsed_response.conversation_directive
                 } else {
@@ -3937,8 +4024,9 @@ mod tests {
         CoreDirectRepair, HostMessageContext, HostMessageContextCache, HostModelRoute,
         HostModelRoutingContext, HostToolTurnRegistrationPolicy, HostToolTurnRegistry,
         MAX_CORE_PROTOCOL_LOG_PREVIEW_CHARS, PersistentRouteLookup, QqConversation, RouteContext,
-        VisibleReplyTarget, autonomous_conversation_prompt, baseline_disposition,
-        classify_persistent_person_identity, conversation_id_for_log, core_message_prompt,
+        VisibleReplyTarget, autonomous_conversation_prompt, autonomous_conversation_protocol,
+        baseline_disposition, classify_persistent_person_identity,
+        constrain_explicit_continuation_plan, conversation_id_for_log, core_message_prompt,
         core_plan_has_visible_text, core_tool_protocol_diagnostic, default_autonomous_directive,
         defer_unroutable_due, direct_fallback_plan, direct_fallback_reply_plan,
         direct_reply_expected, due_reply_target, eligible_mind_candidates,
@@ -4805,6 +4893,7 @@ mod tests {
             WorldEventKind::AutonomousConversationTick(
                 yunxi_core::AutonomousConversationTickEvent {
                     explicit_continuation_requested: true,
+                    minimum_messages_pending: false,
                 },
             ),
         );
@@ -4812,10 +4901,45 @@ mod tests {
             explicit_tick,
             PlannerStateSnapshot::new(state.global_version(), state.conversation(conversation_id)),
         );
-        assert!(
-            autonomous_conversation_prompt(&explicit_input)
-                .contains("用户明确请求的私聊连续对话实验")
+        assert!(autonomous_conversation_prompt(&explicit_input).contains("重新读取同一私聊"));
+
+        let required_tick = WorldEvent::new(
+            Utc::now(),
+            EventScope::Conversation { conversation_id },
+            EventPriority::Low,
+            WorldEventKind::AutonomousConversationTick(
+                yunxi_core::AutonomousConversationTickEvent {
+                    explicit_continuation_requested: true,
+                    minimum_messages_pending: true,
+                },
+            ),
         );
+        let required_input = PlannerInput::new(
+            required_tick,
+            PlannerStateSnapshot::new(state.global_version(), state.conversation(conversation_id)),
+        );
+        assert!(autonomous_conversation_prompt(&required_input).contains("必须选择 continue"));
+        assert!(
+            autonomous_conversation_protocol(&required_input)
+                .contains("conversation_directive 必须是 continue")
+        );
+    }
+
+    #[test]
+    fn explicit_continuation_keeps_only_one_model_utterance() {
+        let runtime = kovi::tokio::runtime::Runtime::new().expect("test runtime");
+        runtime.block_on(async {
+            let mut plan = ReplyPlan::from_model_output(
+                ReplyScope::Private(9_370_104),
+                "先说现在想到的这一句。\n\n第二个想法提前跑出来了。\n第三个也不该在这里。",
+            )
+            .await;
+
+            constrain_explicit_continuation_plan(&mut plan);
+
+            assert_eq!(plan.content, "先说现在想到的这一句。");
+            assert_eq!(plan.bubbles, vec!["先说现在想到的这一句。"]);
+        });
     }
 
     #[test]

@@ -767,6 +767,7 @@ impl CoreBridge {
         &self,
         conversation_id: ConversationId,
         explicit_continuation_requested: bool,
+        minimum_messages_pending: bool,
     ) -> Result<Admission, yunxi_core::SubmitError> {
         self.runtime
             .submit(WorldEvent::new(
@@ -776,6 +777,7 @@ impl CoreBridge {
                 WorldEventKind::AutonomousConversationTick(
                     yunxi_core::AutonomousConversationTickEvent {
                         explicit_continuation_requested,
+                        minimum_messages_pending,
                     },
                 ),
             ))
@@ -2421,6 +2423,7 @@ async fn run_runtime(
                                 conversation_id,
                                 Utc::now(),
                                 directive,
+                                autonomous_delivered,
                                 crate::config::get().proactive(),
                             );
                         }

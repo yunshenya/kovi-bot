@@ -650,6 +650,11 @@ pub struct ProspectiveMemoryEvent {
 pub struct AutonomousConversationTickEvent {
     #[serde(default)]
     pub explicit_continuation_requested: bool,
+    /// The explicit request has not yet produced its minimum number of
+    /// independently generated messages, so this turn should speak rather
+    /// than merely evaluate an optional continuation.
+    #[serde(default)]
+    pub minimum_messages_pending: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -15,6 +15,7 @@ use yunxi_core::{ConversationId, ConversationKind, ConversationTurnDirective};
 
 const MAX_TRACKED_CONVERSATIONS: usize = 512;
 const IN_FLIGHT_TIMEOUT: Duration = Duration::from_secs(180);
+const EXPLICIT_CONTINUATION_RETRY_SLACK: u8 = 2;
 
 #[derive(Debug, Clone, Copy)]
 struct ConversationActivity {
@@ -22,10 +23,12 @@ struct ConversationActivity {
     last_inbound_at: DateTime<Utc>,
     last_bot_at: Option<DateTime<Utc>>,
     last_autonomous_at: Option<DateTime<Utc>>,
+    autonomous_messages: u8,
     autonomous_turns: u8,
     directive: ConversationTurnDirective,
     continuation_decided: bool,
     explicit_continuation_requested: bool,
+    explicit_min_autonomous_messages: u8,
     explicit_max_autonomous_turns: u8,
     next_wake_at: Option<DateTime<Utc>>,
     in_flight_since: Option<Instant>,
@@ -69,10 +72,12 @@ pub(crate) fn observe_inbound(
             last_inbound_at: occurred_at,
             last_bot_at: None,
             last_autonomous_at: None,
+            autonomous_messages: 0,
             autonomous_turns: 0,
             directive: ConversationTurnDirective::Wait,
             continuation_decided: false,
             explicit_continuation_requested: false,
+            explicit_min_autonomous_messages: 0,
             explicit_max_autonomous_turns: 0,
             next_wake_at: None,
             in_flight_since: None,
@@ -81,11 +86,13 @@ pub(crate) fn observe_inbound(
     entry.last_inbound_at = entry.last_inbound_at.max(occurred_at);
     // A new user turn reopens the autonomous budget and invalidates any stale
     // heartbeat claim that was waiting behind the incoming message.
+    entry.autonomous_messages = 0;
     entry.autonomous_turns = 0;
     entry.last_autonomous_at = None;
     entry.directive = ConversationTurnDirective::Wait;
     entry.continuation_decided = false;
     entry.explicit_continuation_requested = false;
+    entry.explicit_min_autonomous_messages = 0;
     entry.explicit_max_autonomous_turns = 0;
     entry.next_wake_at = None;
     entry.in_flight_since = None;
@@ -105,11 +112,13 @@ pub(crate) fn observe_group_activity(conversation_id: ConversationId, occurred_a
         return;
     }
     entry.last_inbound_at = occurred_at;
+    entry.autonomous_messages = 0;
     entry.autonomous_turns = 0;
     entry.last_autonomous_at = None;
     entry.directive = ConversationTurnDirective::Wait;
     entry.continuation_decided = false;
     entry.explicit_continuation_requested = false;
+    entry.explicit_min_autonomous_messages = 0;
     entry.explicit_max_autonomous_turns = 0;
     entry.next_wake_at = None;
     entry.in_flight_since = None;
@@ -165,15 +174,17 @@ pub(crate) fn record_outbound_with_directive(
 }
 
 /// Mark a direct-message request for multiple independent follow-up turns.
-/// This is only a scheduling fallback for an explicit user request; every
-/// autonomous turn still gets a fresh model decision and can stop itself.
+/// The first two follow-ups establish a real three-message sequence; any
+/// remaining budget is optional and still receives a fresh model decision.
 pub(crate) fn request_continuation(conversation_id: ConversationId, max_autonomous_turns: u8) {
     if let Ok(mut registry) = REGISTRY.lock()
         && let Some(entry) = registry.entries.get_mut(&conversation_id)
         && entry.kind == ConversationKind::Direct
     {
+        let max_autonomous_turns = max_autonomous_turns.max(1);
         entry.explicit_continuation_requested = true;
-        entry.explicit_max_autonomous_turns = max_autonomous_turns.max(1);
+        entry.explicit_min_autonomous_messages = max_autonomous_turns.min(2);
+        entry.explicit_max_autonomous_turns = max_autonomous_turns;
     }
 }
 
@@ -259,7 +270,14 @@ pub(crate) fn claim_due(config: &ProactiveConfig, now: DateTime<Utc>) -> Option<
         let Some(last_bot_at) = entry.last_bot_at else {
             return false;
         };
-        if entry.autonomous_turns >= max_turns || last_bot_at < entry.last_inbound_at {
+        let exhausted = if entry.explicit_continuation_requested {
+            entry.autonomous_messages >= max_turns
+                || entry.autonomous_turns
+                    >= max_turns.saturating_add(EXPLICIT_CONTINUATION_RETRY_SLACK)
+        } else {
+            entry.autonomous_turns >= max_turns
+        };
+        if exhausted || last_bot_at < entry.last_inbound_at {
             return false;
         }
         if entry.last_autonomous_at.is_none() {
@@ -296,12 +314,26 @@ pub(crate) fn explicit_continuation_claimed(conversation_id: ConversationId) -> 
     })
 }
 
-/// Finish a claimed autonomous turn. Even a model-selected silence consumes a
-/// turn budget, preventing a silent model from being polled on every heartbeat.
+pub(crate) fn explicit_continuation_message_required_claimed(
+    conversation_id: ConversationId,
+) -> bool {
+    REGISTRY.lock().is_ok_and(|registry| {
+        registry.entries.get(&conversation_id).is_some_and(|entry| {
+            entry.in_flight_since.is_some()
+                && entry.explicit_continuation_requested
+                && entry.autonomous_messages < entry.explicit_min_autonomous_messages
+        })
+    })
+}
+
+/// Finish a claimed autonomous turn. Attempts remain bounded separately from
+/// delivered messages so a transient silence cannot satisfy an explicit
+/// request without producing a real QQ bubble.
 pub(crate) fn finish_claim(
     conversation_id: ConversationId,
     occurred_at: DateTime<Utc>,
     directive: ConversationTurnDirective,
+    delivered: bool,
     config: &ProactiveConfig,
 ) {
     if let Ok(mut registry) = REGISTRY.lock()
@@ -315,6 +347,16 @@ pub(crate) fn finish_claim(
         };
         entry.last_autonomous_at = Some(occurred_at);
         entry.autonomous_turns = entry.autonomous_turns.saturating_add(1);
+        if delivered {
+            entry.autonomous_messages = entry.autonomous_messages.saturating_add(1);
+        }
+        let minimum_messages_pending = entry.explicit_continuation_requested
+            && entry.autonomous_messages < entry.explicit_min_autonomous_messages;
+        let directive = if minimum_messages_pending {
+            ConversationTurnDirective::Continue
+        } else {
+            directive
+        };
         entry.directive = directive;
         entry.continuation_decided = true;
         entry.next_wake_at = match directive {
@@ -345,8 +387,9 @@ fn touch(order: &mut VecDeque<ConversationId>, conversation_id: ConversationId) 
 #[cfg(test)]
 mod tests {
     use super::{
-        REGISTRY, claim_due, explicit_continuation_request, finish_claim, observe_group_activity,
-        observe_inbound, record_outbound, record_outbound_with_directive, request_continuation,
+        REGISTRY, claim_due, explicit_continuation_message_required_claimed,
+        explicit_continuation_request, finish_claim, observe_group_activity, observe_inbound,
+        record_outbound, record_outbound_with_directive, request_continuation,
     };
     use crate::config::ProactiveConfig;
     use chrono::{Duration, Utc};
@@ -377,7 +420,7 @@ mod tests {
         assert!(claim_due(&config, now).is_none());
         record_outbound(id, now - Duration::minutes(4));
         assert_eq!(claim_due(&config, now), Some(id));
-        finish_claim(id, now, ConversationTurnDirective::Wait, &config);
+        finish_claim(id, now, ConversationTurnDirective::Wait, false, &config);
         assert!(claim_due(&config, now + Duration::seconds(30)).is_none());
         clear();
     }
@@ -398,7 +441,7 @@ mod tests {
         record_outbound(id, now - Duration::minutes(4));
         assert_eq!(claim_due(&config, now), Some(id));
         observe_inbound(id, ConversationKind::Group, now, true);
-        finish_claim(id, now, ConversationTurnDirective::Continue, &config);
+        finish_claim(id, now, ConversationTurnDirective::Continue, false, &config);
         record_outbound(id, now);
         assert_eq!(claim_due(&config, now + Duration::minutes(4)), Some(id));
         clear();
@@ -419,7 +462,7 @@ mod tests {
         );
         record_outbound(id, now - Duration::minutes(2));
         assert_eq!(claim_due(&config, now), Some(id));
-        finish_claim(id, now, ConversationTurnDirective::End, &config);
+        finish_claim(id, now, ConversationTurnDirective::End, false, &config);
         assert!(claim_due(&config, now + Duration::hours(2)).is_none());
         observe_inbound(id, ConversationKind::Direct, now + Duration::hours(2), true);
         record_outbound(id, now + Duration::hours(2));
@@ -445,7 +488,7 @@ mod tests {
         );
         record_outbound(id, now - Duration::minutes(4));
         assert_eq!(claim_due(&config, now), Some(id));
-        finish_claim(id, now, ConversationTurnDirective::Continue, &config);
+        finish_claim(id, now, ConversationTurnDirective::Continue, true, &config);
         assert!(claim_due(&config, now + Duration::minutes(5)).is_none());
         clear();
     }
@@ -466,7 +509,7 @@ mod tests {
         record_outbound(id, now - Duration::minutes(4));
         assert_eq!(claim_due(&config, now), Some(id));
         observe_group_activity(id, now);
-        finish_claim(id, now, ConversationTurnDirective::Continue, &config);
+        finish_claim(id, now, ConversationTurnDirective::Continue, false, &config);
         assert!(claim_due(&config, now + Duration::minutes(5)).is_none());
         clear();
     }
@@ -515,6 +558,70 @@ mod tests {
         request_continuation(id, 3);
         record_outbound_with_directive(id, now, None, Some(&config));
         assert_eq!(claim_due(&config, now + Duration::seconds(15)), Some(id));
+        clear();
+    }
+
+    #[test]
+    fn explicit_request_produces_two_fresh_follow_up_messages_before_waiting() {
+        let _guard = TEST_LOCK.lock().expect("test lock");
+        clear();
+        let id = ConversationId::new();
+        let now = Utc::now();
+        let config = ProactiveConfig::default();
+        observe_inbound(id, ConversationKind::Direct, now, true);
+        request_continuation(id, 3);
+        record_outbound_with_directive(id, now, None, Some(&config));
+
+        let first_follow_up = now + Duration::seconds(15);
+        assert_eq!(claim_due(&config, first_follow_up), Some(id));
+        assert!(explicit_continuation_message_required_claimed(id));
+        finish_claim(
+            id,
+            first_follow_up,
+            ConversationTurnDirective::Wait,
+            true,
+            &config,
+        );
+
+        let second_follow_up = first_follow_up + Duration::seconds(15);
+        assert_eq!(claim_due(&config, second_follow_up), Some(id));
+        assert!(explicit_continuation_message_required_claimed(id));
+        finish_claim(
+            id,
+            second_follow_up,
+            ConversationTurnDirective::Wait,
+            true,
+            &config,
+        );
+
+        assert!(claim_due(&config, second_follow_up + Duration::hours(1)).is_none());
+        clear();
+    }
+
+    #[test]
+    fn explicit_silence_is_retried_without_counting_as_a_message() {
+        let _guard = TEST_LOCK.lock().expect("test lock");
+        clear();
+        let id = ConversationId::new();
+        let now = Utc::now();
+        let config = ProactiveConfig::default();
+        observe_inbound(id, ConversationKind::Direct, now, true);
+        request_continuation(id, 3);
+        record_outbound_with_directive(id, now, None, Some(&config));
+
+        let first_attempt = now + Duration::seconds(15);
+        assert_eq!(claim_due(&config, first_attempt), Some(id));
+        finish_claim(
+            id,
+            first_attempt,
+            ConversationTurnDirective::Wait,
+            false,
+            &config,
+        );
+
+        let retry = first_attempt + Duration::seconds(15);
+        assert_eq!(claim_due(&config, retry), Some(id));
+        assert!(explicit_continuation_message_required_claimed(id));
         clear();
     }
 
