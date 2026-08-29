@@ -170,11 +170,13 @@ enum MessageOwner {
 /// Select a single owner at the Kovi ingress boundary.
 ///
 /// Unsupported events stay with the specialized Host handler. Events that may
-/// reply first advance the shared conversation version so a stale prepared
-/// output cannot survive an ownership decision. Core observation-only chatter
-/// never enters this function and cannot disturb an active reply. Once Core is
-/// selected, the Host handler must not run as well because both paths can send
-/// a visible reply.
+/// reply first obtain a shared admission: a stale prepared output is resolved
+/// by the executive policy, while an already-generating reply stays on its
+/// ticket until semantic refinement decides whether it still matters. Core
+/// observation-only chatter never enters this function and cannot disturb an
+/// active reply. Once Core is selected, the Host handler must not run as well
+/// because both paths can send a visible reply.
+#[cfg_attr(not(test), allow(dead_code))]
 async fn select_message_owner<Interrupt, InterruptFuture, Admission>(
     core_supports_event: bool,
     interrupt_core: Interrupt,
@@ -185,11 +187,45 @@ where
     InterruptFuture: std::future::Future<Output = Admission>,
 {
     // This is the earliest common linearization point for supported and
-    // Host-owned events. A second interrupt cannot revive an output invalidated
-    // here.
+    // Host-owned events. The exact admission is carried into the owner path;
+    // later semantic refinement cannot revive a generation that was superseded.
     let admission = interrupt_core().await;
 
     if !core_supports_event {
+        return (MessageOwner::Host, admission);
+    }
+
+    let owner = match enqueue_core(&admission) {
+        yunxi::bridge::EnqueueOutcome::Accepted => MessageOwner::Core,
+        yunxi::bridge::EnqueueOutcome::DroppedAtCapacity
+        | yunxi::bridge::EnqueueOutcome::Blocked
+        | yunxi::bridge::EnqueueOutcome::SkippedInvalid => MessageOwner::Dropped,
+    };
+    (owner, admission)
+}
+
+/// Select an owner when the admission may require Host-side serialization.
+/// An already-generating reply cannot safely share its ticket with a Core
+/// planner turn; Host's existing semantic queue is the single-owner path for
+/// that case. Core still receives an observation from the Host branch.
+async fn select_message_owner_with_admission_policy<
+    Interrupt,
+    InterruptFuture,
+    Admission,
+    HostPolicy,
+>(
+    core_supports_event: bool,
+    interrupt_core: Interrupt,
+    host_policy: HostPolicy,
+    enqueue_core: impl FnOnce(&Admission) -> yunxi::bridge::EnqueueOutcome,
+) -> (MessageOwner, Admission)
+where
+    Interrupt: FnOnce() -> InterruptFuture,
+    InterruptFuture: std::future::Future<Output = Admission>,
+    HostPolicy: FnOnce(&Admission) -> bool,
+{
+    let admission = interrupt_core().await;
+    if !core_supports_event || host_policy(&admission) {
         return (MessageOwner::Host, admission);
     }
 
@@ -361,7 +397,7 @@ async fn main() {
                 return;
             }
             let core_supports_event = core_handling == yunxi::bridge::GroupCoreHandling::Decide;
-            let (owner, admission) = select_message_owner(
+            let (owner, admission) = select_message_owner_with_admission_policy(
                 core_supports_event,
                 || async move {
                     ConversationCoordinator::begin_incoming(crate::model::ReplyScope::Group(
@@ -369,6 +405,7 @@ async fn main() {
                     ))
                     .await
                 },
+                |admission| admission.active_reply_preserved,
                 |admission| bridge.enqueue_group(&ingress_event, *admission),
             )
             .await;
@@ -445,7 +482,7 @@ async fn main() {
                 println!("[INFO] 私聊数据删除屏障期间丢弃入站 (用户: {user_id})");
                 return;
             }
-            let (owner, admission) = select_message_owner(
+            let (owner, admission) = select_message_owner_with_admission_policy(
                 core_supports_event,
                 || async move {
                     ConversationCoordinator::begin_incoming(crate::model::ReplyScope::Private(
@@ -453,6 +490,7 @@ async fn main() {
                     ))
                     .await
                 },
+                |admission| admission.active_reply_preserved,
                 |admission| bridge.enqueue_private(&event, *admission),
             )
             .await;
@@ -638,7 +676,10 @@ fn write_ready_marker() -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{MessageOwner, clear_ready_marker, select_message_owner, write_ready_marker};
+    use super::{
+        MessageOwner, clear_ready_marker, select_message_owner,
+        select_message_owner_with_admission_policy, write_ready_marker,
+    };
     use crate::yunxi::bridge::EnqueueOutcome;
     use std::cell::Cell;
     use std::fs;
@@ -776,6 +817,33 @@ mod tests {
     }
 
     #[test]
+    fn active_admission_routes_core_capable_follow_up_to_host_queue() {
+        let runtime = kovi::tokio::runtime::Runtime::new().expect("应创建测试运行时");
+        runtime.block_on(async {
+            let scope = crate::model::ReplyScope::Group(9_200_004);
+            let active = crate::model::interrupt(scope).await;
+            assert!(crate::model::mark_active(active).await);
+            let enqueue_calls = Cell::new(0);
+            let (owner, admission) = select_message_owner_with_admission_policy(
+                true,
+                || async { crate::model::ConversationCoordinator::begin_incoming(scope).await },
+                |admission| admission.active_reply_preserved,
+                |_| {
+                    enqueue_calls.set(enqueue_calls.get() + 1);
+                    EnqueueOutcome::Accepted
+                },
+            )
+            .await;
+
+            assert_eq!(owner, MessageOwner::Host);
+            assert_eq!(enqueue_calls.get(), 0);
+            assert!(admission.active_reply_preserved);
+            assert!(crate::model::ConversationCoordinator::abandon_incoming(admission).await);
+            crate::model::finish(active).await;
+        });
+    }
+
+    #[test]
     fn core_owner_invalidates_the_existing_private_reply_generation() {
         let runtime = kovi::tokio::runtime::Runtime::new().expect("应创建测试运行时");
         runtime.block_on(async {
@@ -811,6 +879,7 @@ mod tests {
             )
             .await
             .expect("current reply should prepare");
+            crate::model::finish(previous).await;
 
             let (owner, admission) = select_message_owner(
                 false,
@@ -859,6 +928,7 @@ mod tests {
             )
             .await
             .expect("proactive output should prepare");
+            crate::model::finish(previous).await;
 
             let (owner, admission) = select_message_owner(
                 false,

@@ -94,6 +94,7 @@ jobs:
           [[ -z "$KOVI_ALLOWED_GROUPS" || "$KOVI_ALLOWED_GROUPS" =~ ^[1-9][0-9]*(,[1-9][0-9]*)*$ ]] || { echo "Invalid KOVI_ALLOWED_GROUPS"; exit 1; }
           [[ "$MODEL_API_URL" =~ ^https://[A-Za-z0-9._~:/?%+=,-]+$ ]] || { echo "Invalid or missing HTTPS MODEL_API_URL"; exit 1; }
           [[ "$MODEL_NAME" =~ ^[A-Za-z0-9._:/-]+$ ]] || { echo "Invalid or missing MODEL_NAME"; exit 1; }
+          [[ "$MODEL_NAME" != "-" ]] || { echo "MODEL_NAME must be a configured provider model, not '-'"; exit 1; }
           [[ "$MODEL_WIRE_API" == "responses" || "$MODEL_WIRE_API" == "chat_completions" ]] || { echo "Invalid MODEL_WIRE_API"; exit 1; }
           [[ "$MODEL_SUPPORTS_VISION" == "true" || "$MODEL_SUPPORTS_VISION" == "false" ]] || { echo "Invalid MODEL_SUPPORTS_VISION"; exit 1; }
           [[ "$MODEL_API_KEY_ENV" == "OPENAI_API_KEY" || "$MODEL_API_KEY_ENV" == "BOT_API_TOKEN" ]] || { echo "Invalid MODEL_API_KEY_ENV"; exit 1; }
@@ -296,8 +297,11 @@ jobs:
           install -d -m 0750 "$app_dir"
           install -d -m 0700 "$app_dir/incoming" "$app_dir/runtime"
           install -d -m 0750 "$app_dir/releases"
+          install -d -m 0750 "$app_dir/models" "$app_dir/models/yunxi-intrinsic"
           test "$(stat -c '%U' "$app_dir")" = "$deploy_user"
           test "$(stat -c '%U' "$app_dir/runtime")" = "$deploy_user"
+          test "$(stat -c '%U' "$app_dir/models")" = "$deploy_user"
+          test "$(stat -c '%U' "$app_dir/models/yunxi-intrinsic")" = "$deploy_user"
           test -r "$app_dir/runtime" && test -w "$app_dir/runtime" && test -x "$app_dir/runtime"
           umask 077
           install -d -m 700 "$app_dir/incoming"
@@ -364,7 +368,27 @@ jobs:
             find "$target" -type d -exec chmod 0750 {} +
             find "$target" -type f -exec chmod 0640 {} +
             chmod 0550 "$target/kovi-bot"
-            test -z "$(find "$target" \( -perm -0020 -o -perm -0002 \) -print -quit)"
+            test -z "$(find "$target" ! -type l \( -perm -0020 -o -perm -0002 \) -print -quit)"
+          }
+
+          ensure_model_link() {
+            target="$1"
+            case "$target" in
+              "$releases_dir"/*) ;;
+              *) echo "Refusing to change paths outside releases" >&2; exit 1 ;;
+            esac
+            model_path="$target/models"
+            if test -L "$model_path"; then
+              test "$(readlink "$model_path")" = "$app_dir/models" || {
+                echo "Unexpected models link in $target" >&2
+                exit 1
+              }
+            elif test -e "$model_path"; then
+              echo "Refusing to replace existing models directory in $target" >&2
+              exit 1
+            else
+              ln -s "$app_dir/models" "$model_path"
+            fi
           }
 
           if ! test -d "$release"; then
@@ -401,12 +425,18 @@ jobs:
             make_service_read_only "$staging"
             mv "$staging" "$release"
           fi
+          ensure_model_link "$release"
+          if test -n "$previous" && test -d "$previous"; then
+            ensure_model_link "$previous"
+          fi
           make_service_read_only "$release"
           test -x "$release/kovi-bot"
           test "$(cat "$release/REVISION")" = "$revision"
           test -s "$release/.env"
           test -s "$release/kovi.conf.toml"
           test -s "$release/kovi.plugin.toml"
+          test -L "$release/models"
+          test "$(readlink "$release/models")" = "$app_dir/models"
 
           rm -f -- "$app_dir/current.next"
           ln -s "$release" "$app_dir/current.next"

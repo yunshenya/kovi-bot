@@ -95,14 +95,14 @@ pub(crate) async fn private_message_event_after_ingress(
         return;
     }
     if is_help_command(message) {
-        send_tracked_private_message(&bot, user_id, command_help()).await;
+        send_private_direct_response(&bot, user_id, initial_admission, command_help()).await;
         return;
     }
     if group_access::is_authorization_command(message) {
         let reply = group_access::handle_command(&bot, message, None, user_id)
             .await
             .unwrap_or_else(|| group_access::command_help().to_string());
-        send_tracked_private_message(&bot, user_id, &reply).await;
+        send_private_direct_response(&bot, user_id, initial_admission, &reply).await;
         return;
     }
     if let Some(command) = parse_agent_task_command(message) {
@@ -110,9 +110,11 @@ pub(crate) async fn private_message_event_after_ingress(
             println!("[INFO] 私聊跨群任务命令未授权 (用户: {})", user_id);
             return;
         }
-        if matches!(command, AgentTaskCommand::Cancel(_)) {
-            stop_private_reply(user_id, ingress).await;
-        }
+        let stopped_for_cancel = if matches!(command, AgentTaskCommand::Cancel(_)) {
+            stop_private_reply(user_id, ingress).await
+        } else {
+            false
+        };
         let reply = match command {
             AgentTaskCommand::List => agent_tasks::task_status_report(user_id, None).await,
             AgentTaskCommand::Status(task_id) => {
@@ -126,11 +128,23 @@ pub(crate) async fn private_message_event_after_ingress(
             eprintln!("[ERROR] 处理私聊跨群任务命令失败: {}", error);
             "这次没能读取跨群问答任务，请稍后再试。".to_string()
         });
-        send_tracked_private_message(&bot, user_id, reply).await;
+        if stopped_for_cancel {
+            send_tracked_private_message(&bot, user_id, reply).await;
+            // 取消旧回复后，控制回复会创建一个新的代数；把该代数交给
+            // drainer，避免取消窗口内后来入队的 turn 无人消费。
+            drain_pending_private_messages_from_current(user_id, &bot).await;
+        } else {
+            send_private_direct_response(&bot, user_id, initial_admission, reply).await;
+        }
         return;
     }
     if message.trim() == "#系统信息" && sender_is_admin {
-        send_sys_info_private(Arc::clone(&bot), user_id).await;
+        if ConversationCoordinator::resolve_active_reply_for_direct_response(initial_admission)
+            .await
+        {
+            send_sys_info_private(Arc::clone(&bot), user_id).await;
+        }
+        drain_pending_private_messages_from_current(user_id, &bot).await;
         return;
     }
     if message.trim() == "#mind-status" && sender_is_admin {
@@ -140,17 +154,17 @@ pub(crate) async fn private_message_event_after_ingress(
                 eprintln!("[ERROR] 读取 Yunxi Mind 状态失败: {}", error);
                 "暂时读取不到 Yunxi Mind 状态，请稍后再试。".to_string()
             });
-        send_tracked_private_message(&bot, user_id, report).await;
+        send_private_direct_response(&bot, user_id, initial_admission, report).await;
         return;
     }
     if message.trim() == "#intrinsic-status" && sender_is_admin {
         let report = crate::yunxi::intrinsic_status_report();
-        send_tracked_private_message(&bot, user_id, report).await;
+        send_private_direct_response(&bot, user_id, initial_admission, report).await;
         return;
     }
     if message.trim() == "#executive-status" && sender_is_admin {
         let report = crate::yunxi::executive_status_report();
-        send_tracked_private_message(&bot, user_id, report).await;
+        send_private_direct_response(&bot, user_id, initial_admission, report).await;
         return;
     }
     if is_group_admin_command(message) {
@@ -206,14 +220,15 @@ pub(crate) async fn private_message_event_after_ingress(
                     .to_string()
             }
         };
-        send_tracked_private_message(&bot, user_id, reply).await;
+        send_private_direct_response(&bot, user_id, initial_admission, reply).await;
         return;
     }
     match message.trim() {
         "#删除我的数据" => {
-            send_tracked_private_message(
+            send_private_direct_response(
                 &bot,
                 user_id,
+                initial_admission,
                 "这会删除你的私聊记忆、用户档案、摘要、近期图片、与你关联的表情记忆、角色动作记录，以及 Yunxi Core 中的身份映射、关系、情绪、待办和目标。若确认，请发送：#删除我的数据 确认",
             )
             .await;
@@ -260,18 +275,20 @@ pub(crate) async fn private_message_event_after_ingress(
                 .await
                 {
                     Ok(count) => {
-                        send_tracked_private_message(
+                        send_private_direct_response(
                             &bot,
                             user_id,
+                            initial_admission,
                             format!("记住啦，这 {count} 个表情以后表示“{label}”。"),
                         )
                         .await;
                     }
                     Err(error) => {
                         eprintln!("[ERROR] 私聊保存表情包记忆失败: {}", error);
-                        send_tracked_private_message(
+                        send_private_direct_response(
                             &bot,
                             user_id,
+                            initial_admission,
                             "这次没能记住，稍后再教我一次吧。",
                         )
                         .await;
@@ -279,18 +296,20 @@ pub(crate) async fn private_message_event_after_ingress(
                 }
             }
             Ok(_) => {
-                send_tracked_private_message(
+                send_private_direct_response(
                     &bot,
                     user_id,
+                    initial_admission,
                     "请回复（引用）那张表情包，再发送 #教芸汐 这个表情是……哦。",
                 )
                 .await;
             }
             Err(error) => {
                 eprintln!("[ERROR] 私聊读取被引用表情失败: {}", error);
-                send_tracked_private_message(
+                send_private_direct_response(
                     &bot,
                     user_id,
+                    initial_admission,
                     "我没能读到被引用的表情，请重新引用后再试一次哦。",
                 )
                 .await;
@@ -397,9 +416,10 @@ pub(crate) async fn private_message_event_after_ingress(
         || conversational_image
         || !initial_recent_images.is_empty();
     if vision_command && images.is_empty() {
-        send_tracked_private_message(
+        send_private_direct_response(
             &bot,
             user_id,
+            initial_admission,
             "我没在最近的对话里找到可以看的图片，引用那张图或重新发一次给我吧。",
         )
         .await;
@@ -590,9 +610,10 @@ pub(crate) async fn private_message_event_after_ingress(
         match resolve_image_urls(&images, &bot).await {
             Ok(images) if !images.is_empty() => images,
             Ok(_) => {
-                send_tracked_private_message(
+                send_private_direct_response(
                     &bot,
                     user_id,
+                    initial_admission,
                     "我暂时拿不到这张截图的内容，再发一次或换张图试试吧。",
                 )
                 .await;
@@ -600,9 +621,10 @@ pub(crate) async fn private_message_event_after_ingress(
             }
             Err(error) => {
                 eprintln!("[ERROR] 私聊读取截图失败 (用户: {}): {}", user_id, error);
-                send_tracked_private_message(
+                send_private_direct_response(
                     &bot,
                     user_id,
+                    initial_admission,
                     "我暂时读不到这张截图，再发一次或换张图试试吧。",
                 )
                 .await;
@@ -686,8 +708,12 @@ async fn claim_or_queue_private_reply(
         .await
         .get(&user_id)
         .is_some_and(|queue| !queue.is_empty());
+    let has_pending_admission =
+        ConversationCoordinator::has_other_pending_incoming_locked(admission).await;
     if should_queue_after_executive(
-        active || has_queued,
+        active,
+        has_queued,
+        has_pending_admission,
         admission.decision,
         admission.preserved_prepared,
     ) {
@@ -705,15 +731,33 @@ async fn claim_or_queue_private_reply(
             understanding,
         )
         .await;
+        // The payload now lives in the FIFO; release this admission's own
+        // coordinator reservation so it cannot block the next turn.
+        ConversationCoordinator::abandon_incoming_locked(admission).await;
         return None;
     }
     let ticket = admission.ticket;
-    ConversationCoordinator::begin_reply_locked(scope, ticket, message_ids)
-        .await
-        .then_some(ticket)
+    if ConversationCoordinator::begin_reply_locked(scope, ticket, message_ids.clone()).await {
+        Some(ticket)
+    } else {
+        // A newer semantic hand-off may have won between refinement and this
+        // claim. Keep the complete turn for the FIFO instead of dropping it.
+        queue_pending_private_message(
+            user_id,
+            nickname,
+            message,
+            vision_images,
+            message_ids,
+            sticker_teaching_message,
+            understanding,
+        )
+        .await;
+        ConversationCoordinator::abandon_incoming_locked(admission).await;
+        None
+    }
 }
 
-async fn stop_private_reply(user_id: i64, ingress: ReplyTicket) {
+async fn stop_private_reply(user_id: i64, ingress: ReplyTicket) -> bool {
     let scope = ReplyScope::Private(user_id);
     let scope_lock = scope_mutex(scope);
     let _scope_guard = scope_lock.lock().await;
@@ -721,10 +765,11 @@ async fn stop_private_reply(user_id: i64, ingress: ReplyTicket) {
         .await
         .is_none()
     {
-        return;
+        return false;
     }
     PRIVATE_MESSAGE_BATCHES.cancel(user_id).await;
     PENDING_PRIVATE_MESSAGES.lock().await.remove(&user_id);
+    true
 }
 
 async fn delete_private_user_data(user_id: i64, self_id: i64, bot: &RuntimeBot) {
@@ -1077,11 +1122,42 @@ fn parse_task_id(value: &str) -> Option<i64> {
 }
 
 fn should_queue_after_executive(
-    active_or_queued: bool,
+    active: bool,
+    has_queued: bool,
+    has_pending_admission: bool,
     decision: OutgoingExecutiveDecision,
     preserved_prepared: bool,
 ) -> bool {
-    preserved_prepared || (active_or_queued && decision == OutgoingExecutiveDecision::Keep)
+    preserved_prepared
+        || has_queued
+        || has_pending_admission
+        || (active && decision == OutgoingExecutiveDecision::Keep)
+}
+
+async fn send_private_direct_response(
+    bot: &Arc<RuntimeBot>,
+    user_id: i64,
+    admission: IncomingAdmission,
+    content: impl Into<String>,
+) -> bool {
+    let resolved =
+        ConversationCoordinator::resolve_active_reply_for_direct_response(admission).await;
+    let sent = if resolved {
+        send_tracked_private_message(bot, user_id, content).await
+    } else {
+        false
+    };
+    // Direct control responses may replace an active model turn. Always kick
+    // the same-scope FIFO after the send attempt so queued turns cannot stall.
+    drain_pending_private_messages_from_current(user_id, bot).await;
+    sent
+}
+
+async fn drain_pending_private_messages_from_current(user_id: i64, bot: &Arc<RuntimeBot>) {
+    let scope = ReplyScope::Private(user_id);
+    if let Some(ticket) = ConversationCoordinator::current_ticket(scope).await {
+        drain_pending_private_messages(user_id, Arc::clone(bot), ticket).await;
+    }
 }
 
 async fn admit_understood_private_turn(
@@ -1155,15 +1231,29 @@ async fn take_pending_private_turn(
     mut completed: crate::model::ReplyTicket,
 ) -> Option<(PendingPrivateMessage, crate::model::ReplyTicket)> {
     let scope = ReplyScope::Private(user_id);
-    let scope_lock = scope_mutex(scope);
-    let _scope_guard = scope_lock.lock().await;
-    let mut pending_by_user = PENDING_PRIVATE_MESSAGES.lock().await;
-    let queue = pending_by_user.entry(user_id).or_default();
-    let result = ConversationCoordinator::claim_next_locked(scope, &mut completed, queue).await;
-    if queue.is_empty() {
-        pending_by_user.remove(&user_id);
+    loop {
+        let (result, should_wait) = {
+            let scope_lock = scope_mutex(scope);
+            let _scope_guard = scope_lock.lock().await;
+            let mut pending_by_user = PENDING_PRIVATE_MESSAGES.lock().await;
+            let queue = pending_by_user.entry(user_id).or_default();
+            let result =
+                ConversationCoordinator::claim_next_locked(scope, &mut completed, queue).await;
+            let should_wait = result.is_none()
+                && !queue.is_empty()
+                && ConversationCoordinator::pending_incoming_for_ticket_locked(completed).await;
+            if queue.is_empty() {
+                pending_by_user.remove(&user_id);
+            }
+            (result, should_wait)
+        };
+        if let Some(result) = result {
+            return Some(result);
+        }
+        if !should_wait || !ConversationCoordinator::wait_for_pending_incoming(completed).await {
+            return None;
+        }
     }
-    result
 }
 
 #[cfg(test)]
@@ -1186,6 +1276,8 @@ mod tests {
     #[test]
     fn preserved_prepared_reply_queues_the_new_private_turn() {
         assert!(should_queue_after_executive(
+            false,
+            false,
             false,
             OutgoingExecutiveDecision::Keep,
             true,
@@ -1307,7 +1399,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_private_drainer_leaves_a_turn_queued_after_a_new_message_wins() {
+    fn stale_private_drainer_adopts_successor_and_preserves_fifo() {
         kovi::tokio::runtime::Runtime::new()
             .expect("应创建测试运行时")
             .block_on(async {
@@ -1343,17 +1435,72 @@ mod tests {
                     take_pending_private_turn(user_id, completed).await
                 });
                 let new_ticket = new_task.await.expect("新消息任务应正常结束");
-                assert!(drainer.await.expect("旧 drainer 应正常结束").is_none());
-
-                let mut pending = PENDING_PRIVATE_MESSAGES.lock().await;
-                let queue = pending.get(&user_id).expect("旧 turn 应被放回队列");
-                assert_eq!(queue.len(), 1);
-                assert_eq!(queue[0].message, "旧排队消息");
-                assert_eq!(queue[0].message_ids, vec![303]);
-                pending.remove(&user_id);
-                assert!(is_current(new_ticket).await);
+                let (pending, claimed_ticket) = drainer
+                    .await
+                    .expect("旧 drainer 应正常结束")
+                    .expect("旧 drainer 应接管 successor 并领取 FIFO turn");
+                assert_eq!(pending.message, "旧排队消息");
+                assert_eq!(pending.message_ids, vec![303]);
+                assert!(is_current(claimed_ticket).await);
+                crate::model::finish(claimed_ticket).await;
+                PENDING_PRIVATE_MESSAGES.lock().await.remove(&user_id);
+                assert!(!is_current(new_ticket).await);
             });
     }
+
+    #[test]
+    fn private_drainer_waits_for_unresolved_active_admission() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let user_id = 9_200_005;
+                let scope = ReplyScope::Private(user_id);
+                PENDING_PRIVATE_MESSAGES.lock().await.remove(&user_id);
+                let completed = interrupt(scope).await;
+                assert!(mark_active(completed).await);
+                let blocker = ConversationCoordinator::begin_incoming(scope).await;
+                queue_pending_private_message(
+                    user_id,
+                    "昵称".to_string(),
+                    "应先处理的私聊消息".to_string(),
+                    Vec::new(),
+                    vec![405],
+                    None,
+                    MessageUnderstanding::default(),
+                )
+                .await;
+                crate::model::finish(completed).await;
+
+                let drainer = kovi::tokio::spawn(async move {
+                    take_pending_private_turn(user_id, completed).await
+                });
+                kovi::tokio::task::yield_now().await;
+                assert!(!drainer.is_finished());
+
+                let refined = ConversationCoordinator::refine_current_incoming(
+                    blocker,
+                    ConversationCoordinator::context_for_understood_turn(
+                        &MessageUnderstanding::default(),
+                        true,
+                    ),
+                )
+                .await
+                .expect("活动 admission 应保持当前");
+                assert_eq!(refined.decision, OutgoingExecutiveDecision::Keep);
+
+                let (pending, ticket) =
+                    kovi::tokio::time::timeout(std::time::Duration::from_secs(1), drainer)
+                        .await
+                        .expect("drainer 应被 admission 释放唤醒")
+                        .expect("drainer 任务应正常完成")
+                        .expect("应领取原队首消息");
+                assert_eq!(pending.message, "应先处理的私聊消息");
+                assert_eq!(pending.message_ids, vec![405]);
+                crate::model::finish(ticket).await;
+                PENDING_PRIVATE_MESSAGES.lock().await.remove(&user_id);
+            });
+    }
+
     fn image(key: &str) -> ImageAttachment {
         ImageAttachment {
             key: key.to_string(),

@@ -32,9 +32,10 @@ pub use action::{
 };
 pub use arbiter::{
     ActionArbiter, ActionArbiterConfig, ActionCapability, ActionDescriptor, ActionPort,
-    ActionPortError, ActionPortFuture, ActionPortOutcome, ActionReceipt, ActionRejection,
-    ActionResult, AuthorizationPolicy, EnvironmentCapabilities, MAX_RATE_LIMIT_WINDOW_ENTRIES,
-    MAX_TRACKED_ACTION_KEYS, MAX_TRACKED_ACTION_SCOPES, RateLimit, StaleReason,
+    ActionPortError, ActionPortFuture, ActionPortOutcome, ActionPortReleaseFuture, ActionReceipt,
+    ActionRejection, ActionResult, AuthorizationPolicy, EnvironmentCapabilities,
+    MAX_RATE_LIMIT_WINDOW_ENTRIES, MAX_TRACKED_ACTION_KEYS, MAX_TRACKED_ACTION_SCOPES, RateLimit,
+    StaleReason,
 };
 pub use attention::{AttentionDisposition, AttentionReason, AttentionResult, AttentionSystem};
 pub use delivery::{
@@ -122,9 +123,9 @@ pub use proactive::{
 };
 pub use runtime::{
     Admission, CognitiveRuntime, DataErasureError, MAX_BLOCKED_DATA_ERASURE_CONVERSATIONS,
-    MAX_BLOCKED_DATA_ERASURE_PEOPLE, MAX_DATA_ERASURE_CONVERSATIONS, PlannedProcessingOutcome,
-    ProcessingOutcome, RuntimeConfig, RuntimeConfigError, RuntimeHandle, RuntimeObservation,
-    SubmitError, planned_action_idempotency_key,
+    MAX_BLOCKED_DATA_ERASURE_PEOPLE, MAX_DATA_ERASURE_CONVERSATIONS, MAX_TOOL_ACTIONS_PER_TRACE,
+    PlannedProcessingOutcome, ProcessingOutcome, RuntimeConfig, RuntimeConfigError, RuntimeHandle,
+    RuntimeObservation, SubmitError, planned_action_idempotency_key,
 };
 pub use working_state::{
     CompactEvent, ConversationSnapshot, StateUpdate, WorkingState, WorkingStateConfig,

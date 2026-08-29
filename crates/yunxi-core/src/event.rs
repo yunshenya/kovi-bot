@@ -738,6 +738,21 @@ pub struct WorldEvent {
     priority: EventPriority,
     trace: TraceContext,
     kind: WorldEventKind,
+    /// Optional trusted actor provenance for host-produced action results.
+    ///
+    /// This lives on the envelope rather than the public payload structs so
+    /// older callers that construct `ToolCompletedEvent`/`ToolFailedEvent`
+    /// remain source-compatible. Missing provenance is intentionally treated
+    /// as unauthorised for actions that require an actor.
+    // Provenance is process-local trust data. It may be serialized for
+    // diagnostics, but wire input must never be able to mint an actor.
+    #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
+    actor: Option<PersonId>,
+    /// Opaque originating Core message for derived action results. This is
+    /// process-local context used by adapters that need to map back to a
+    /// platform message; it is never accepted from or emitted to the wire.
+    #[serde(skip)]
+    source_message_id: Option<MessageId>,
 }
 
 impl WorldEvent {
@@ -756,6 +771,8 @@ impl WorldEvent {
             priority,
             trace: TraceContext::root(id),
             kind,
+            actor: None,
+            source_message_id: None,
         }
     }
 
@@ -790,6 +807,8 @@ impl WorldEvent {
             priority,
             trace: parent.trace.child(parent.id, max_depth)?,
             kind,
+            actor: None,
+            source_message_id: parent.source_message_id(),
         })
     }
 
@@ -821,6 +840,33 @@ impl WorldEvent {
     #[must_use]
     pub const fn kind(&self) -> &WorldEventKind {
         &self.kind
+    }
+
+    /// Returns the trusted actor provenance attached by the producing host.
+    #[must_use]
+    pub const fn actor(&self) -> Option<PersonId> {
+        self.actor
+    }
+
+    /// Attaches trusted actor provenance to a derived event.
+    #[must_use]
+    pub const fn with_actor(mut self, actor: PersonId) -> Self {
+        self.actor = Some(actor);
+        self
+    }
+
+    /// Returns the originating Core message for this event's causal chain.
+    /// Received messages derive it from their payload; later derived events
+    /// carry it on the private envelope.
+    #[must_use]
+    pub const fn source_message_id(&self) -> Option<MessageId> {
+        match self.source_message_id {
+            Some(message_id) => Some(message_id),
+            None => match &self.kind {
+                WorldEventKind::MessageReceived(message) => Some(message.message_id),
+                _ => None,
+            },
+        }
     }
 
     pub fn validate(&self, max_trace_depth: u8) -> Result<(), EventValidationError> {
@@ -1123,6 +1169,44 @@ mod tests {
     }
 
     #[test]
+    fn derived_events_keep_the_opaque_source_message_context() {
+        let message_id = MessageId::new();
+        let conversation_id = ConversationId::new();
+        let root = WorldEvent::message_received(
+            EventPriority::High,
+            MessageReceivedEvent {
+                message_id,
+                conversation_id,
+                sender: PersonId::new(),
+                content: MessageContent::text("查资料"),
+                reply_to: None,
+                timestamp: Utc::now(),
+                conversation_kind: ConversationKind::Direct,
+                addressed_to_agent: true,
+                replies_to_agent: false,
+                stop_requested: false,
+                explicit_request: true,
+                visible_reply_allowed: true,
+            },
+        );
+        let child = WorldEvent::derived_from(
+            &root,
+            Utc::now(),
+            EventScope::Conversation { conversation_id },
+            EventPriority::High,
+            WorldEventKind::ToolCompleted(ToolCompletedEvent {
+                operation: "web.search".to_owned(),
+                output: "结果".to_owned(),
+                requires_follow_up: true,
+            }),
+            8,
+        )
+        .expect("derived tool event should be valid");
+        assert_eq!(root.source_message_id(), Some(message_id));
+        assert_eq!(child.source_message_id(), Some(message_id));
+    }
+
+    #[test]
     fn legacy_tool_events_default_to_observation_only() {
         let completed: ToolCompletedEvent = serde_json::from_value(serde_json::json!({
             "operation": "weather.current"
@@ -1414,6 +1498,33 @@ mod tests {
                 maximum: 32 * 1_024,
             })
         );
+    }
+
+    #[test]
+    fn actor_provenance_is_not_accepted_from_wire_input() {
+        let actor = PersonId::new();
+        let event = WorldEvent::new(
+            Utc::now(),
+            EventScope::Conversation {
+                conversation_id: ConversationId::new(),
+            },
+            EventPriority::High,
+            WorldEventKind::ToolCompleted(ToolCompletedEvent {
+                operation: "weather.current".to_owned(),
+                output: "晴".to_owned(),
+                requires_follow_up: true,
+            }),
+        )
+        .with_actor(actor);
+        let encoded = serde_json::to_value(&event).expect("event should serialize");
+        let actor_wire = actor.to_string();
+        assert_eq!(
+            encoded.get("actor").and_then(serde_json::Value::as_str),
+            Some(actor_wire.as_str())
+        );
+        let decoded: WorldEvent =
+            serde_json::from_value(encoded).expect("event should deserialize");
+        assert_eq!(decoded.actor(), None);
     }
 
     #[test]

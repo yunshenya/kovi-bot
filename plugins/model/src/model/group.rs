@@ -242,14 +242,14 @@ pub(crate) async fn group_message_event_after_ingress(
         return;
     }
     if is_help_command(message) {
-        send_tracked_group_message(&bot, group_id, command_help()).await;
+        send_group_direct_response(&bot, group_id, initial_admission, command_help()).await;
         return;
     }
     if group_access::is_authorization_command(message) {
         let reply = group_access::handle_command(&bot, message, Some(group_id), event.user_id)
             .await
             .unwrap_or_else(|| group_access::command_help().to_string());
-        send_tracked_group_message(&bot, group_id, reply).await;
+        send_group_direct_response(&bot, group_id, initial_admission, reply).await;
         return;
     }
     if is_agent_task_command(message) {
@@ -317,9 +317,10 @@ pub(crate) async fn group_message_event_after_ingress(
     }
     match message.trim() {
         "#删除本群数据" => {
-            send_tracked_group_message(
+            send_group_direct_response(
                 &bot,
                 group_id,
+                initial_admission,
                 "这会删除本群的长期记忆、群档案、摘要、本群表情记忆和以本群为目标的角色动作记录。若确认，请发送：#删除本群数据 确认",
             )
             .await;
@@ -331,11 +332,23 @@ pub(crate) async fn group_message_event_after_ingress(
         }
         "#系统信息" => {
             println!("[INFO] 群聊系统信息命令进入处理分支 (群组: {})", group_id);
-            send_sys_info(Arc::clone(&bot), group_id).await;
+            if ConversationCoordinator::resolve_active_reply_for_direct_response(initial_admission)
+                .await
+            {
+                send_sys_info(Arc::clone(&bot), group_id).await;
+            }
+            // 系统信息使用独立的工具发送路径；无论解析或发送是否成功，
+            // 都要把显式命令替换后留下的 FIFO 交回 drainer。
+            drain_pending_window_messages_from_current(group_id, &bot).await;
             return;
         }
         "#健康检查" => {
-            send_health_status(&bot, group_id).await;
+            if ConversationCoordinator::resolve_active_reply_for_direct_response(initial_admission)
+                .await
+            {
+                send_health_status(&bot, group_id).await;
+            }
+            drain_pending_window_messages_from_current(group_id, &bot).await;
             return;
         }
         _ => {}
@@ -398,7 +411,7 @@ pub(crate) async fn group_message_event_after_ingress(
                     .to_string()
             }
         };
-        send_tracked_group_message(&bot, group_id, reply).await;
+        send_group_direct_response(&bot, group_id, initial_admission, reply).await;
         return;
     }
     if is_recent_bot_message(reply_scope, event.message_id).await {
@@ -433,18 +446,20 @@ pub(crate) async fn group_message_event_after_ingress(
             Ok(teaching_stickers) if !teaching_stickers.is_empty() => {
                 match teach(&teaching_stickers, &label, event.user_id, sticker_scope).await {
                     Ok(count) => {
-                        send_tracked_group_message(
+                        send_group_direct_response(
                             &bot,
                             group_id,
+                            initial_admission,
                             format!("记住啦，这 {count} 个表情以后表示“{label}”。"),
                         )
                         .await;
                     }
                     Err(error) => {
                         eprintln!("[ERROR] 群聊保存表情包记忆失败: {}", error);
-                        send_tracked_group_message(
+                        send_group_direct_response(
                             &bot,
                             group_id,
+                            initial_admission,
                             "这次没能记住，稍后再教我一次吧。",
                         )
                         .await;
@@ -452,18 +467,20 @@ pub(crate) async fn group_message_event_after_ingress(
                 }
             }
             Ok(_) => {
-                send_tracked_group_message(
+                send_group_direct_response(
                     &bot,
                     group_id,
+                    initial_admission,
                     "请回复（引用）那张表情包，再发送 #教芸汐 这个表情是……哦。",
                 )
                 .await;
             }
             Err(error) => {
                 eprintln!("[ERROR] 群聊读取被引用表情失败: {}", error);
-                send_tracked_group_message(
+                send_group_direct_response(
                     &bot,
                     group_id,
+                    initial_admission,
                     "我没能读到被引用的表情，请重新引用后再试一次哦。",
                 )
                 .await;
@@ -562,9 +579,10 @@ pub(crate) async fn group_message_event_after_ingress(
         || pending_image_request
         || (addressed_to_bot && !images.is_empty() && labels.is_empty());
     if vision_command && images.is_empty() {
-        send_tracked_group_message(
+        send_group_direct_response(
             &bot,
             group_id,
+            initial_admission,
             "请把截图和 #看截图 放在一起，或回复那张截图再发送命令哦。",
         )
         .await;
@@ -987,6 +1005,34 @@ pub(crate) async fn group_message_event_after_ingress(
     }
 }
 
+async fn send_group_direct_response(
+    bot: &Arc<RuntimeBot>,
+    group_id: i64,
+    admission: IncomingAdmission,
+    content: impl Into<String>,
+) -> bool {
+    let resolved =
+        ConversationCoordinator::resolve_active_reply_for_direct_response(admission).await;
+    let sent = if resolved {
+        send_tracked_group_message(bot, group_id, content).await
+    } else {
+        false
+    };
+    // A direct response may have advanced the generation after replacing an
+    // active model turn. Always kick the scope drainer, including failed
+    // sends, so a queue cannot be left behind when the transport rejects the
+    // control response.
+    drain_pending_window_messages_from_current(group_id, bot).await;
+    sent
+}
+
+async fn drain_pending_window_messages_from_current(group_id: i64, bot: &Arc<RuntimeBot>) {
+    let scope = ReplyScope::Group(group_id);
+    if let Some(ticket) = ConversationCoordinator::current_ticket(scope).await {
+        drain_pending_window_messages(group_id, Arc::clone(bot), ticket).await;
+    }
+}
+
 async fn send_health_status(bot: &Arc<RuntimeBot>, group_id: i64) {
     let mut health_checker = HealthChecker::new(Arc::clone(&MEMORY_MANAGER));
     let health_status = health_checker.check_health().await;
@@ -1304,11 +1350,16 @@ async fn finish_conversation_turn(
 }
 
 fn should_queue_after_executive(
-    active_or_queued: bool,
+    active: bool,
+    has_queued: bool,
+    has_pending_admission: bool,
     decision: OutgoingExecutiveDecision,
     preserved_prepared: bool,
 ) -> bool {
-    preserved_prepared || (active_or_queued && decision == OutgoingExecutiveDecision::Keep)
+    preserved_prepared
+        || has_queued
+        || has_pending_admission
+        || (active && decision == OutgoingExecutiveDecision::Keep)
 }
 
 async fn admit_understood_group_turn(
@@ -1376,8 +1427,12 @@ async fn claim_or_queue_group_reply(
         .await
         .get(&group_id)
         .is_some_and(|queue| !queue.is_empty());
+    let has_pending_admission =
+        ConversationCoordinator::has_other_pending_incoming_locked(admission).await;
     if should_queue_after_executive(
-        active || has_queued,
+        active,
+        has_queued,
+        has_pending_admission,
         admission.decision,
         admission.preserved_prepared,
     ) {
@@ -1397,12 +1452,32 @@ async fn claim_or_queue_group_reply(
             understanding,
         )
         .await;
+        // The payload now lives in the FIFO; release this admission's own
+        // coordinator reservation so it cannot block the next turn.
+        ConversationCoordinator::abandon_incoming_locked(admission).await;
         return None;
     }
     let ticket = admission.ticket;
-    ConversationCoordinator::begin_reply_locked(scope, ticket, message_ids)
-        .await
-        .then_some(ticket)
+    if ConversationCoordinator::begin_reply_locked(scope, ticket, message_ids.clone()).await {
+        Some(ticket)
+    } else {
+        // A newer semantic hand-off may have won between refinement and this
+        // claim. Keep the complete turn for the FIFO instead of dropping it.
+        queue_pending_window_message(
+            group_id,
+            user_id,
+            reply_expected,
+            sender,
+            message,
+            vision_images,
+            message_ids,
+            sticker_teaching_message,
+            understanding,
+        )
+        .await;
+        ConversationCoordinator::abandon_incoming_locked(admission).await;
+        None
+    }
 }
 
 async fn stop_group_reply(group_id: i64, user_id: i64, ingress: ReplyTicket) {
@@ -1455,15 +1530,29 @@ async fn take_pending_window_turn(
     mut completed: crate::model::ReplyTicket,
 ) -> Option<(PendingWindowMessage, crate::model::ReplyTicket)> {
     let scope = ReplyScope::Group(group_id);
-    let scope_lock = scope_mutex(scope);
-    let _scope_guard = scope_lock.lock().await;
-    let mut pending_by_group = PENDING_WINDOW_MESSAGES.lock().await;
-    let queue = pending_by_group.entry(group_id).or_default();
-    let result = ConversationCoordinator::claim_next_locked(scope, &mut completed, queue).await;
-    if queue.is_empty() {
-        pending_by_group.remove(&group_id);
+    loop {
+        let (result, should_wait) = {
+            let scope_lock = scope_mutex(scope);
+            let _scope_guard = scope_lock.lock().await;
+            let mut pending_by_group = PENDING_WINDOW_MESSAGES.lock().await;
+            let queue = pending_by_group.entry(group_id).or_default();
+            let result =
+                ConversationCoordinator::claim_next_locked(scope, &mut completed, queue).await;
+            let should_wait = result.is_none()
+                && !queue.is_empty()
+                && ConversationCoordinator::pending_incoming_for_ticket_locked(completed).await;
+            if queue.is_empty() {
+                pending_by_group.remove(&group_id);
+            }
+            (result, should_wait)
+        };
+        if let Some(result) = result {
+            return Some(result);
+        }
+        if !should_wait || !ConversationCoordinator::wait_for_pending_incoming(completed).await {
+            return None;
+        }
     }
-    result
 }
 
 /// 只用消息长度、计数、额度和概率决定是否值得调用一次语义模型。
@@ -1932,7 +2021,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_group_drainer_leaves_a_turn_queued_after_a_new_message_wins() {
+    fn stale_group_drainer_adopts_successor_and_preserves_fifo() {
         kovi::tokio::runtime::Runtime::new()
             .expect("应创建测试运行时")
             .block_on(async {
@@ -1970,15 +2059,70 @@ mod tests {
                     take_pending_window_turn(group_id, completed).await
                 });
                 let new_ticket = new_task.await.expect("新消息任务应正常结束");
-                assert!(drainer.await.expect("旧 drainer 应正常结束").is_none());
+                let (pending, claimed_ticket) = drainer
+                    .await
+                    .expect("旧 drainer 应正常结束")
+                    .expect("旧 drainer 应接管 successor 并领取 FIFO turn");
+                assert_eq!(pending.message, "旧排队消息");
+                assert_eq!(pending.message_ids, vec![303]);
+                assert!(is_current(claimed_ticket).await);
+                crate::model::finish(claimed_ticket).await;
+                PENDING_WINDOW_MESSAGES.lock().await.remove(&group_id);
+                assert!(!is_current(new_ticket).await);
+            });
+    }
 
-                let mut pending = PENDING_WINDOW_MESSAGES.lock().await;
-                let queue = pending.get(&group_id).expect("旧 turn 应被放回队列");
-                assert_eq!(queue.len(), 1);
-                assert_eq!(queue[0].message, "旧排队消息");
-                assert_eq!(queue[0].message_ids, vec![303]);
-                pending.remove(&group_id);
-                assert!(is_current(new_ticket).await);
+    #[test]
+    fn group_drainer_waits_for_unresolved_active_admission() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let group_id = 9_200_005;
+                let scope = ReplyScope::Group(group_id);
+                PENDING_WINDOW_MESSAGES.lock().await.remove(&group_id);
+                let completed = interrupt(scope).await;
+                assert!(mark_active(completed).await);
+                let blocker = ConversationCoordinator::begin_incoming(scope).await;
+                queue_pending_window_message(
+                    group_id,
+                    44,
+                    true,
+                    "成员".to_string(),
+                    "应先处理的排队消息".to_string(),
+                    Vec::new(),
+                    vec![404],
+                    None,
+                    MessageUnderstanding::default(),
+                )
+                .await;
+                crate::model::finish(completed).await;
+
+                let drainer = kovi::tokio::spawn(async move {
+                    take_pending_window_turn(group_id, completed).await
+                });
+                kovi::tokio::task::yield_now().await;
+                assert!(!drainer.is_finished());
+
+                let refined = ConversationCoordinator::refine_current_incoming(
+                    blocker,
+                    ConversationCoordinator::context_for_understood_turn(
+                        &MessageUnderstanding::default(),
+                        false,
+                    ),
+                )
+                .await
+                .expect("活动 admission 应保持当前");
+                assert_eq!(refined.decision, OutgoingExecutiveDecision::Keep);
+
+                let (pending, ticket) = kovi::tokio::time::timeout(Duration::from_secs(1), drainer)
+                    .await
+                    .expect("drainer 应被 admission 释放唤醒")
+                    .expect("drainer 任务应正常完成")
+                    .expect("应领取原队首消息");
+                assert_eq!(pending.message, "应先处理的排队消息");
+                assert_eq!(pending.message_ids, vec![404]);
+                crate::model::finish(ticket).await;
+                PENDING_WINDOW_MESSAGES.lock().await.remove(&group_id);
             });
     }
 
@@ -2099,6 +2243,8 @@ mod tests {
     fn executive_keep_queues_behind_active_work_but_other_decisions_regenerate() {
         assert!(should_queue_after_executive(
             true,
+            false,
+            false,
             OutgoingExecutiveDecision::Keep,
             false,
         ));
@@ -2107,17 +2253,37 @@ mod tests {
             OutgoingExecutiveDecision::Merge,
             OutgoingExecutiveDecision::Defer,
         ] {
-            assert!(!should_queue_after_executive(true, decision, false));
+            assert!(!should_queue_after_executive(
+                true, false, false, decision, false
+            ));
         }
         assert!(!should_queue_after_executive(
+            false,
+            false,
             false,
             OutgoingExecutiveDecision::Keep,
             false,
         ));
         assert!(should_queue_after_executive(
             false,
+            false,
+            false,
             OutgoingExecutiveDecision::Keep,
             true,
+        ));
+        assert!(should_queue_after_executive(
+            false,
+            true,
+            false,
+            OutgoingExecutiveDecision::Rewrite,
+            false,
+        ));
+        assert!(should_queue_after_executive(
+            false,
+            false,
+            true,
+            OutgoingExecutiveDecision::Rewrite,
+            false,
         ));
     }
 

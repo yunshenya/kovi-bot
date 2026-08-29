@@ -87,6 +87,15 @@ classification, a second ingress, or reservation expiry resolves it fail
 closed. An ingress with no existing Prepared envelope reserves its newly
 advanced generation until the handler becomes active, so an idle proactive
 fallback cannot overtake an event already accepted into an asynchronous queue.
+
+When ingress observes a reply that is still being generated, it retains the
+active reply's current ticket with a bounded reservation instead of advancing
+the generation blindly. The existing semantic result then decides the outcome:
+`None`, `Unrelated`, and `Unknown` keep the in-flight reply; `ExtendsPendingTopic`
+merges by starting a replacement turn; `InvalidatesPendingContent` replaces it.
+The active reservation blocks proactive work while classification is pending,
+but it does not block the current Core turn's commit because Core processes
+later events FIFO. Expiry is fail-closed and supersedes the stale generation.
 If runtime submission closes or rejects capacity, the current collision and
 the unsent tail are restored in original order unless erasure already removed
 the scope. A Core `RejectedState` result releases the exact `MessageId`

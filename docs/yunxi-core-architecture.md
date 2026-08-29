@@ -3704,6 +3704,9 @@ plan；这是 Host adapter，不是 Core 对旧模型模块的依赖。当前 Co
 - Prepared 正文只可在 exact frozen `ReplyTicket` 和 pending-inbound reservation 同时匹配时，
   以最多 4096 字符的非可信 JSON Data 进入同一次语义调用；不得增加第二次分类调用或读取
   更新后的 envelope。
+- 回复仍在生成时，新的入站先保留当前 active ticket 并等待既有语义结果：`None`、`Unrelated`
+  和 `Unknown` 保留旧回复，`ExtendsPendingTopic` 合并生成，`InvalidatesPendingContent` 才替换；
+  语义等待期间阻止 proactive 抢占，但不阻塞当前 Core FIFO 轮次提交，超时则 fail-closed 推进代数。
 - 需要直接回复时，`Unrelated` 对 proactive Prepared 使用 `Defer`，对 reactive Prepared 使用
   `Rewrite`；无需回复的观察才允许 `Keep`。
 - runtime 关闭或容量拒绝 collision 投影时，当前项和未提交尾部按原序恢复；若 erasure 已清

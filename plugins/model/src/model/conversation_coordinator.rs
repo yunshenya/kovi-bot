@@ -1,12 +1,16 @@
 //! 群聊和私聊共享的会话生命周期与排队策略。
 
 use super::interrupt::{
-    OutgoingSource, OutgoingToken, ReplyScope, ReplyTicket, cancel_if_current_locked,
-    cancel_prepared_proactive_locked, claim_follow_up_locked, incoming_reservation_matches_locked,
-    interrupt_locked as supersede_locked, is_active_locked, is_current_locked,
+    OutgoingSource, OutgoingState, OutgoingToken, ReplyScope, ReplyTicket,
+    active_incoming_reservation_matches_locked, active_ticket_locked, cancel_if_current_locked,
+    cancel_prepared_proactive_locked, claim_follow_up_locked, has_other_pending_incoming_locked,
+    incoming_reservation_matches_locked, interrupt_locked as supersede_locked, is_active_locked,
+    is_current_locked, pending_incoming_for_ticket_locked,
     prepared_outgoing_source_for_token_locked, prepared_outgoing_source_locked,
-    prepared_semantic_preview_for_token_locked, release_incoming, release_incoming_locked,
-    reserve_incoming_locked, scope_mutex, try_freeze_prepared_for_incoming_locked,
+    prepared_semantic_preview_for_token_locked, release_active_incoming_by_id_locked,
+    release_incoming_locked, reserve_active_incoming_locked, reserve_incoming_locked, scope_mutex,
+    supersede_active_incoming_locked, try_freeze_prepared_for_incoming_locked,
+    wait_for_active_incoming_clear, wait_for_active_incoming_turn, wait_for_pending_incoming,
 };
 use super::recall::begin_reply_locked;
 use super::semantic::MessageUnderstanding;
@@ -80,6 +84,10 @@ pub(crate) struct IncomingAdmission {
     /// The ingress linearization point retained an existing Prepared envelope
     /// until semantic refinement. Only the exact admission may resolve it.
     pub(crate) frozen_prepared: bool,
+    /// The ingress observed a reply that is still being generated. Keep the
+    /// current ticket until the semantic pass decides whether that reply is
+    /// still meaningful; this is intentionally separate from a Prepared token.
+    pub(crate) active_reply_preserved: bool,
     reservation_id: u64,
     frozen_token: Option<OutgoingToken>,
 }
@@ -134,6 +142,22 @@ impl ConversationCoordinator {
         }
     }
 
+    /// Decide how a message affects a reply that is still inside model
+    /// generation and therefore has no trustworthy outgoing preview yet.
+    /// Independent or observational traffic must not erase that reply before
+    /// the current turn has a chance to finish. An unknown result also keeps
+    /// the in-flight reply: without a trustworthy classification there is no
+    /// evidence that it became meaningless.
+    fn decide_active_reply(context: OutgoingExecutiveContext) -> OutgoingExecutiveDecision {
+        match context.incoming_impact {
+            IncomingTurnImpact::ExtendsPendingTopic => OutgoingExecutiveDecision::Merge,
+            IncomingTurnImpact::InvalidatesPendingContent => OutgoingExecutiveDecision::Rewrite,
+            IncomingTurnImpact::None
+            | IncomingTurnImpact::Unrelated
+            | IncomingTurnImpact::Unknown => OutgoingExecutiveDecision::Keep,
+        }
+    }
+
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn interrupt(scope: ReplyScope) -> ReplyTicket {
         Self::begin_incoming(scope).await.ticket
@@ -141,7 +165,8 @@ impl ConversationCoordinator {
 
     /// Earliest fail-closed ingress admission. Unlike `interrupt`, this keeps
     /// the Executive decision so the production handler can preserve an
-    /// initial proactive Defer through its later semantic refinement.
+    /// initial proactive Defer, or an already-generating reply, through its
+    /// later semantic refinement.
     pub(crate) async fn begin_incoming(scope: ReplyScope) -> IncomingAdmission {
         let scope_lock = scope_mutex(scope);
         let _scope_guard = scope_lock.lock().await;
@@ -153,6 +178,26 @@ impl ConversationCoordinator {
     }
 
     pub(crate) async fn begin_incoming_locked(scope: ReplyScope) -> IncomingAdmission {
+        // An active turn takes precedence over a Prepared envelope it may have
+        // produced moments ago. Letting the envelope freeze first could route
+        // a second owner onto the same active ticket.
+        if let Some(ticket) = active_ticket_locked(scope).await
+            && let Some(reservation_id) = reserve_active_incoming_locked(ticket).await
+        {
+            return IncomingAdmission {
+                decision: OutgoingExecutiveDecision::Keep,
+                ticket,
+                preserved_prepared: false,
+                frozen_prepared: false,
+                active_reply_preserved: true,
+                reservation_id,
+                frozen_token: None,
+            };
+        }
+        // A marker may have expired between the observation and the
+        // reservation attempt. Continue through the ordinary admission path
+        // against the now-current state instead of blindly invalidating an
+        // in-flight reply.
         if let Some((token, source, reservation_id)) =
             try_freeze_prepared_for_incoming_locked(scope).await
         {
@@ -164,6 +209,7 @@ impl ConversationCoordinator {
                 ticket: token.ticket(),
                 preserved_prepared: false,
                 frozen_prepared: true,
+                active_reply_preserved: false,
                 reservation_id,
                 frozen_token: Some(token),
             };
@@ -179,6 +225,7 @@ impl ConversationCoordinator {
             ticket,
             preserved_prepared: false,
             frozen_prepared: false,
+            active_reply_preserved: false,
             reservation_id,
             frozen_token: None,
         }
@@ -211,16 +258,73 @@ impl ConversationCoordinator {
     /// first pass already deferred and cancelled a proactive envelope, Defer
     /// remains authoritative: the payload is intentionally not resurrected.
     /// With no newly prepared envelope, other semantic decisions reuse the
-    /// ingress generation instead of advancing it redundantly.
+    /// ingress generation instead of advancing it redundantly. An active
+    /// reply is advanced only when the semantic result says it is invalidated
+    /// or must be merged into a replacement turn.
     pub(crate) async fn refine_current_incoming(
-        initial: IncomingAdmission,
+        mut initial: IncomingAdmission,
         context: OutgoingExecutiveContext,
     ) -> Option<IncomingAdmission> {
         let scope = initial.ticket.scope();
+        // Active reservations are refined in ingress order. A later semantic
+        // task waits for earlier reservations to resolve; the wait also
+        // returns the reservation's rebound successor ticket when an earlier
+        // turn replaced the in-flight reply.
+        if initial.active_reply_preserved && initial.reservation_id != 0 {
+            initial.ticket = wait_for_active_incoming_turn(scope, initial.reservation_id).await?;
+        }
         let scope_lock = scope_mutex(scope);
         let _scope_guard = scope_lock.lock().await;
         if !is_current_locked(initial.ticket).await {
             return None;
+        }
+        if initial.active_reply_preserved {
+            if !active_incoming_reservation_matches_locked(initial.ticket, initial.reservation_id)
+                .await
+                && initial.reservation_id != 0
+            {
+                return None;
+            }
+            let decision = Self::decide_active_reply(context);
+            if decision == OutgoingExecutiveDecision::Keep {
+                release_active_incoming_by_id_locked(scope, initial.reservation_id).await?;
+                return Some(IncomingAdmission {
+                    decision,
+                    ticket: initial.ticket,
+                    preserved_prepared: false,
+                    frozen_prepared: false,
+                    active_reply_preserved: false,
+                    // The active marker has already been released. Keeping a
+                    // second normal reservation here would block the FIFO
+                    // drainer even though this message is intentionally
+                    // allowed to wait behind the current reply.
+                    reservation_id: 0,
+                    frozen_token: None,
+                });
+            }
+            // The active reply has no safe semantic preview yet. Once the
+            // classifier says it must be replaced, advance exactly once. Keep
+            // later active reservations attached to the successor so their
+            // semantic tasks cannot become stale or disappear.
+            let next_ticket = supersede_active_incoming_locked(
+                scope,
+                initial.reservation_id,
+                OutgoingState::Superseded,
+            )
+            .await?;
+            // The replacing turn owns the successor generation until its
+            // handler claims it. Later ingress is attached behind it rather
+            // than making this admission stale in the hand-off window.
+            let reservation_id = reserve_incoming_locked(next_ticket).await.unwrap_or(0);
+            return Some(IncomingAdmission {
+                decision,
+                ticket: next_ticket,
+                preserved_prepared: false,
+                frozen_prepared: false,
+                active_reply_preserved: false,
+                reservation_id,
+                frozen_token: None,
+            });
         }
         if initial.frozen_prepared {
             if !incoming_reservation_matches_locked(
@@ -262,6 +366,7 @@ impl ConversationCoordinator {
                     ticket: initial.ticket,
                     preserved_prepared: true,
                     frozen_prepared: false,
+                    active_reply_preserved: false,
                     reservation_id: initial.reservation_id,
                     frozen_token: None,
                 });
@@ -272,6 +377,7 @@ impl ConversationCoordinator {
                 ticket: next_ticket.unwrap_or(initial.ticket),
                 preserved_prepared: false,
                 frozen_prepared: false,
+                active_reply_preserved: false,
                 reservation_id: initial.reservation_id,
                 frozen_token: None,
             });
@@ -285,6 +391,7 @@ impl ConversationCoordinator {
                 ticket: initial.ticket,
                 preserved_prepared: false,
                 frozen_prepared: false,
+                active_reply_preserved: false,
                 reservation_id: initial.reservation_id,
                 frozen_token: None,
             });
@@ -295,16 +402,68 @@ impl ConversationCoordinator {
             ticket: next_ticket.unwrap_or(initial.ticket),
             preserved_prepared: decision == OutgoingExecutiveDecision::Keep,
             frozen_prepared: false,
+            active_reply_preserved: false,
             reservation_id: initial.reservation_id,
             frozen_token: None,
         })
+    }
+
+    /// A control command has an explicit user-visible response and cannot be
+    /// silently dropped just because an older model reply is still running.
+    /// Treat that command as an intentional replacement, then let the normal
+    /// tracked sender acquire a fresh generation. Ordinary conversational
+    /// turns never use this escape hatch; they go through semantic refinement.
+    pub(crate) async fn resolve_active_reply_for_direct_response(
+        admission: IncomingAdmission,
+    ) -> bool {
+        if !admission.active_reply_preserved {
+            return true;
+        }
+        let scope = admission.ticket.scope();
+        let Some(resolved) = Self::refine_current_incoming(
+            admission,
+            OutgoingExecutiveContext {
+                incoming_impact: IncomingTurnImpact::InvalidatesPendingContent,
+                direct_reply_expected: true,
+            },
+        )
+        .await
+        else {
+            return false;
+        };
+        let replacing = resolved.decision == OutgoingExecutiveDecision::Rewrite;
+        if replacing {
+            // The direct sender will establish its own tracked generation.
+            // Release the temporary successor reservation first, otherwise a
+            // subsequent `interrupt` would mistake it for another owner and
+            // leave the command response waiting behind itself.
+            Self::abandon_incoming(resolved).await;
+        }
+        replacing && wait_for_active_incoming_clear(scope).await
     }
 
     /// Release an admission that cannot reach semantic refinement. Frozen
     /// content is resolved with the admission's conservative Unknown policy;
     /// an ordinary queued reservation is simply relinquished.
     pub(crate) async fn abandon_incoming(admission: IncomingAdmission) -> bool {
-        release_incoming(
+        let scope_lock = scope_mutex(admission.ticket.scope());
+        let _scope_guard = scope_lock.lock().await;
+        Self::abandon_incoming_locked(admission).await
+    }
+
+    /// Release an admission while the caller already holds the scope lock.
+    /// Queue hand-off paths use this to avoid leaving their own reservation in
+    /// the coordinator after moving the payload into the adapter FIFO.
+    pub(crate) async fn abandon_incoming_locked(admission: IncomingAdmission) -> bool {
+        if admission.active_reply_preserved {
+            return release_active_incoming_by_id_locked(
+                admission.ticket.scope(),
+                admission.reservation_id,
+            )
+            .await
+            .is_some();
+        }
+        release_incoming_locked(
             admission.ticket,
             admission.reservation_id,
             admission.frozen_token,
@@ -402,6 +561,18 @@ impl ConversationCoordinator {
         is_active_locked(scope).await
     }
 
+    pub(crate) async fn has_other_pending_incoming_locked(admission: IncomingAdmission) -> bool {
+        has_other_pending_incoming_locked(admission.ticket, admission.reservation_id).await
+    }
+
+    pub(crate) async fn current_ticket(scope: ReplyScope) -> Option<ReplyTicket> {
+        super::interrupt::current_ticket(scope).await
+    }
+
+    pub(crate) async fn current_ticket_locked(scope: ReplyScope) -> Option<ReplyTicket> {
+        super::interrupt::current_ticket_locked(scope).await
+    }
+
     pub(crate) async fn begin_reply_locked(
         scope: ReplyScope,
         ticket: ReplyTicket,
@@ -412,6 +583,14 @@ impl ConversationCoordinator {
 
     pub(crate) async fn claim_follow_up_locked(completed: ReplyTicket) -> Option<ReplyTicket> {
         claim_follow_up_locked(completed).await
+    }
+
+    pub(crate) async fn pending_incoming_for_ticket_locked(ticket: ReplyTicket) -> bool {
+        pending_incoming_for_ticket_locked(ticket).await
+    }
+
+    pub(crate) async fn wait_for_pending_incoming(ticket: ReplyTicket) -> bool {
+        wait_for_pending_incoming(ticket).await
     }
 
     /// 统一队列上限，保证两个入口不会各自演化出不同的丢弃策略。
@@ -439,6 +618,17 @@ impl ConversationCoordinator {
         queue: &mut VecDeque<PendingTurn>,
     ) -> Option<(PendingTurn, ReplyTicket)> {
         loop {
+            // A front active admission may have replaced the completed reply
+            // while its drainer was waiting. Adopt that successor only when
+            // no newer handler is already active; this keeps the old drainer
+            // alive for the FIFO queue without letting it steal a live turn.
+            if !is_current_locked(*completed).await
+                && !is_active_locked(scope).await
+                && let Some(current) = Self::current_ticket_locked(scope).await
+                && current.scope_epoch() == completed.scope_epoch()
+            {
+                *completed = current;
+            }
             let pending = queue.pop_front()?;
             let Some(ticket) = Self::claim_follow_up_locked(*completed).await else {
                 queue.push_front(pending);
@@ -461,7 +651,8 @@ mod tests {
     use crate::model::interrupt::{
         OutgoingSource, OutgoingState, ReplyScope, commit_outgoing, finish, is_current,
         mark_active, mark_outgoing_failed, outgoing_fingerprint, prepare_outgoing,
-        prepare_outgoing_with_semantic_preview, test_outgoing_state,
+        prepare_outgoing_with_semantic_preview, prepare_proactive_outgoing_if_idle,
+        test_outgoing_state,
     };
     use crate::model::semantic::MessageUnderstanding;
 
@@ -616,6 +807,375 @@ mod tests {
     }
 
     #[test]
+    fn active_reply_survives_unrelated_ingress_until_semantic_refinement() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("should create test runtime")
+            .block_on(async {
+                let scope = ReplyScope::Group(9_300_030);
+                let ticket = ConversationCoordinator::interrupt(scope).await;
+                assert!(mark_active(ticket).await);
+
+                let admission = ConversationCoordinator::begin_incoming(scope).await;
+                assert_eq!(admission.ticket, ticket);
+                assert!(admission.active_reply_preserved);
+                assert!(is_current(ticket).await);
+
+                let refined = ConversationCoordinator::refine_current_incoming(
+                    admission,
+                    OutgoingExecutiveContext {
+                        incoming_impact: IncomingTurnImpact::Unrelated,
+                        direct_reply_expected: true,
+                    },
+                )
+                .await
+                .expect("active admission should remain current");
+
+                assert_eq!(refined.decision, OutgoingExecutiveDecision::Keep);
+                assert!(!refined.preserved_prepared);
+                assert!(is_current(ticket).await);
+                finish(ticket).await;
+            });
+    }
+
+    #[test]
+    fn active_reply_survives_when_semantic_classification_is_unavailable() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("should create test runtime")
+            .block_on(async {
+                let scope = ReplyScope::Group(9_300_034);
+                let ticket = ConversationCoordinator::interrupt(scope).await;
+                assert!(mark_active(ticket).await);
+                let admission = ConversationCoordinator::begin_incoming(scope).await;
+
+                let refined = ConversationCoordinator::refine_current_incoming(
+                    admission,
+                    OutgoingExecutiveContext::default(),
+                )
+                .await
+                .expect("unknown classification should keep the active turn current");
+
+                assert_eq!(refined.decision, OutgoingExecutiveDecision::Keep);
+                assert!(is_current(ticket).await);
+                finish(ticket).await;
+            });
+    }
+
+    #[test]
+    fn pending_admission_is_not_superseded_by_later_ingress() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("should create test runtime")
+            .block_on(async {
+                let scope = ReplyScope::Group(9_300_041);
+                let first = ConversationCoordinator::begin_incoming(scope).await;
+                let second = ConversationCoordinator::begin_incoming(scope).await;
+
+                assert!(!first.active_reply_preserved);
+                assert!(second.active_reply_preserved);
+                assert_eq!(first.ticket, second.ticket);
+                assert!(is_current(first.ticket).await);
+
+                let first = ConversationCoordinator::refine_current_incoming(
+                    first,
+                    OutgoingExecutiveContext {
+                        incoming_impact: IncomingTurnImpact::None,
+                        direct_reply_expected: false,
+                    },
+                )
+                .await
+                .expect("the first admission must remain claimable");
+                assert!(mark_active(first.ticket).await);
+
+                let second = ConversationCoordinator::refine_current_incoming(
+                    second,
+                    OutgoingExecutiveContext {
+                        incoming_impact: IncomingTurnImpact::None,
+                        direct_reply_expected: false,
+                    },
+                )
+                .await
+                .expect("the later admission must remain current");
+                assert_eq!(second.decision, OutgoingExecutiveDecision::Keep);
+                finish(first.ticket).await;
+            });
+    }
+
+    #[test]
+    fn multiple_active_admissions_release_independently() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("should create test runtime")
+            .block_on(async {
+                let scope = ReplyScope::Group(9_300_035);
+                let ticket = ConversationCoordinator::interrupt(scope).await;
+                assert!(mark_active(ticket).await);
+                let first = ConversationCoordinator::begin_incoming(scope).await;
+                let second = ConversationCoordinator::begin_incoming(scope).await;
+                assert!(first.active_reply_preserved);
+                assert!(second.active_reply_preserved);
+                assert_ne!(first.reservation_id, second.reservation_id);
+
+                let first_refined = ConversationCoordinator::refine_current_incoming(
+                    first,
+                    OutgoingExecutiveContext {
+                        incoming_impact: IncomingTurnImpact::None,
+                        direct_reply_expected: false,
+                    },
+                )
+                .await
+                .expect("first active admission should remain current");
+                assert_eq!(first_refined.decision, OutgoingExecutiveDecision::Keep);
+                assert!(
+                    prepare_proactive_outgoing_if_idle(
+                        scope,
+                        outgoing_fingerprint("still blocked")
+                    )
+                    .await
+                    .is_none(),
+                    "the second admission must keep proactive work blocked"
+                );
+
+                let second_refined = ConversationCoordinator::refine_current_incoming(
+                    second,
+                    OutgoingExecutiveContext {
+                        incoming_impact: IncomingTurnImpact::None,
+                        direct_reply_expected: false,
+                    },
+                )
+                .await
+                .expect("second active admission should remain current");
+                assert_eq!(second_refined.decision, OutgoingExecutiveDecision::Keep);
+                finish(ticket).await;
+                let proactive = prepare_proactive_outgoing_if_idle(
+                    scope,
+                    outgoing_fingerprint("allowed after both admissions"),
+                )
+                .await
+                .expect("proactive work should resume after both admissions");
+                mark_outgoing_failed(proactive).await;
+            });
+    }
+
+    #[test]
+    fn active_reply_waits_for_semantic_refinement_before_commit() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("should create test runtime")
+            .block_on(async {
+                let scope = ReplyScope::Group(9_300_031);
+                let ticket = ConversationCoordinator::interrupt(scope).await;
+                assert!(mark_active(ticket).await);
+                let admission = ConversationCoordinator::begin_incoming(scope).await;
+                let outgoing = prepare_outgoing(
+                    ticket,
+                    outgoing_fingerprint("reply generated before the new message"),
+                    OutgoingSource::Reply,
+                )
+                .await
+                .expect("active reply should prepare");
+
+                let commit = kovi::tokio::spawn(async move { commit_outgoing(outgoing).await });
+                kovi::tokio::task::yield_now().await;
+                assert!(
+                    !commit.is_finished(),
+                    "an active reply must wait while semantic refinement is pending"
+                );
+
+                let refined = ConversationCoordinator::refine_current_incoming(
+                    admission,
+                    OutgoingExecutiveContext {
+                        incoming_impact: IncomingTurnImpact::None,
+                        direct_reply_expected: false,
+                    },
+                )
+                .await
+                .expect("active admission should remain current");
+                assert_eq!(refined.decision, OutgoingExecutiveDecision::Keep);
+                assert!(
+                    commit.await.expect("commit task should finish"),
+                    "the preserved active reply should commit after Keep"
+                );
+                mark_outgoing_failed(outgoing).await;
+                finish(ticket).await;
+            });
+    }
+
+    #[test]
+    fn active_reply_precedes_a_prepared_envelope_at_ingress() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("should create test runtime")
+            .block_on(async {
+                let scope = ReplyScope::Group(9_300_036);
+                let ticket = ConversationCoordinator::interrupt(scope).await;
+                assert!(mark_active(ticket).await);
+                let outgoing = prepare_outgoing(
+                    ticket,
+                    outgoing_fingerprint("active reply is already at the send boundary"),
+                    OutgoingSource::Reply,
+                )
+                .await
+                .expect("active reply should prepare");
+
+                let admission = ConversationCoordinator::begin_incoming(scope).await;
+                assert!(admission.active_reply_preserved);
+                assert!(!admission.frozen_prepared);
+                assert_eq!(admission.ticket, ticket);
+                assert_eq!(
+                    test_outgoing_state(outgoing).await,
+                    Some(OutgoingState::Prepared)
+                );
+
+                let refined = ConversationCoordinator::refine_current_incoming(
+                    admission,
+                    OutgoingExecutiveContext {
+                        incoming_impact: IncomingTurnImpact::None,
+                        direct_reply_expected: false,
+                    },
+                )
+                .await
+                .expect("active admission should remain current");
+                assert_eq!(refined.decision, OutgoingExecutiveDecision::Keep);
+                assert!(commit_outgoing(outgoing).await);
+                mark_outgoing_failed(outgoing).await;
+                finish(ticket).await;
+            });
+    }
+
+    #[test]
+    fn direct_control_response_replaces_an_active_reply() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("should create test runtime")
+            .block_on(async {
+                let scope = ReplyScope::Private(9_300_038);
+                let ticket = ConversationCoordinator::interrupt(scope).await;
+                assert!(mark_active(ticket).await);
+                let admission = ConversationCoordinator::begin_incoming(scope).await;
+
+                assert!(
+                    ConversationCoordinator::resolve_active_reply_for_direct_response(admission)
+                        .await
+                );
+                assert!(!is_current(ticket).await);
+
+                let command_ticket = ConversationCoordinator::interrupt(scope).await;
+                assert!(mark_active(command_ticket).await);
+                let command_reply = prepare_outgoing(
+                    command_ticket,
+                    outgoing_fingerprint("command response"),
+                    OutgoingSource::Reply,
+                )
+                .await
+                .expect("the command response should acquire a fresh generation");
+                assert!(commit_outgoing(command_reply).await);
+                mark_outgoing_failed(command_reply).await;
+                finish(command_ticket).await;
+            });
+    }
+
+    #[test]
+    fn active_reply_is_replaced_only_for_semantic_invalidation() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("should create test runtime")
+            .block_on(async {
+                let scope = ReplyScope::Group(9_300_032);
+                let ticket = ConversationCoordinator::interrupt(scope).await;
+                assert!(mark_active(ticket).await);
+                let admission = ConversationCoordinator::begin_incoming(scope).await;
+
+                let refined = ConversationCoordinator::refine_current_incoming(
+                    admission,
+                    OutgoingExecutiveContext {
+                        incoming_impact: IncomingTurnImpact::InvalidatesPendingContent,
+                        direct_reply_expected: true,
+                    },
+                )
+                .await
+                .expect("invalidating admission should advance to a new ticket");
+
+                assert_eq!(refined.decision, OutgoingExecutiveDecision::Rewrite);
+                assert_ne!(refined.ticket, ticket);
+                assert!(!is_current(ticket).await);
+                assert!(is_current(refined.ticket).await);
+                finish(refined.ticket).await;
+            });
+    }
+
+    #[test]
+    fn active_admission_blocks_proactive_work_until_it_is_resolved() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("should create test runtime")
+            .block_on(async {
+                let scope = ReplyScope::Group(9_300_033);
+                let ticket = ConversationCoordinator::interrupt(scope).await;
+                assert!(mark_active(ticket).await);
+                let admission = ConversationCoordinator::begin_incoming(scope).await;
+                finish(ticket).await;
+
+                assert!(
+                    prepare_proactive_outgoing_if_idle(scope, outgoing_fingerprint("blocked"))
+                        .await
+                        .is_none(),
+                    "pending semantic admission must keep proactive work out"
+                );
+                let refined = ConversationCoordinator::refine_current_incoming(
+                    admission,
+                    OutgoingExecutiveContext {
+                        incoming_impact: IncomingTurnImpact::None,
+                        direct_reply_expected: false,
+                    },
+                )
+                .await
+                .expect("active admission should remain current");
+                assert_eq!(refined.decision, OutgoingExecutiveDecision::Keep);
+
+                let proactive = prepare_proactive_outgoing_if_idle(
+                    scope,
+                    outgoing_fingerprint("allowed after refinement"),
+                )
+                .await
+                .expect("proactive work should resume after refinement");
+                mark_outgoing_failed(proactive).await;
+            });
+    }
+
+    #[test]
+    fn active_admission_survives_the_original_reply_finishing_first() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("should create test runtime")
+            .block_on(async {
+                let scope = ReplyScope::Group(9_300_037);
+                let ticket = ConversationCoordinator::interrupt(scope).await;
+                assert!(mark_active(ticket).await);
+                let first = ConversationCoordinator::begin_incoming(scope).await;
+                finish(ticket).await;
+
+                let second = ConversationCoordinator::begin_incoming(scope).await;
+                assert!(first.active_reply_preserved);
+                assert!(second.active_reply_preserved);
+                assert_eq!(second.ticket, ticket);
+                assert_ne!(first.reservation_id, second.reservation_id);
+
+                let first = ConversationCoordinator::refine_current_incoming(
+                    first,
+                    OutgoingExecutiveContext {
+                        incoming_impact: IncomingTurnImpact::None,
+                        direct_reply_expected: false,
+                    },
+                )
+                .await
+                .expect("first active admission should remain current");
+                assert_eq!(first.decision, OutgoingExecutiveDecision::Keep);
+                let second = ConversationCoordinator::refine_current_incoming(
+                    second,
+                    OutgoingExecutiveContext {
+                        incoming_impact: IncomingTurnImpact::None,
+                        direct_reply_expected: false,
+                    },
+                )
+                .await
+                .expect("second active admission should remain current");
+                assert_eq!(second.decision, OutgoingExecutiveDecision::Keep);
+            });
+    }
+
+    #[test]
     fn rewrite_and_merge_both_supersede_prepared_content() {
         kovi::tokio::runtime::Runtime::new()
             .expect("should create test runtime")
@@ -710,6 +1270,7 @@ mod tests {
                 )
                 .await
                 .expect("proactive output should prepare");
+                finish(proactive_ticket).await;
 
                 let initial = ConversationCoordinator::begin_incoming(scope).await;
                 assert_eq!(initial.decision, OutgoingExecutiveDecision::Defer);
@@ -756,6 +1317,7 @@ mod tests {
                 )
                 .await
                 .expect("reply output should prepare");
+                finish(reply_ticket).await;
 
                 let initial = ConversationCoordinator::begin_incoming(scope).await;
                 assert_eq!(initial.decision, OutgoingExecutiveDecision::Rewrite);

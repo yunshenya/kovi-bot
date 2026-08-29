@@ -30,11 +30,12 @@ use std::fmt;
 use std::sync::Arc;
 use thiserror::Error;
 use yunxi_core::{
-    ActionPort, ActionPortError, ActionPortFuture, ActionPortOutcome, ActionScope, ConversationId,
-    ConversationKind, ConversationMemberStore, DeliveryResolutionError, DeliveryResolver,
-    DeliveryResolverFuture, DeliveryRoute, GoalState, GoalStore, MAX_TOOL_ERROR_DETAIL_BYTES,
-    MAX_TOOL_ERROR_DETAIL_CHARS, MAX_TOOL_RESULT_BYTES, MAX_TOOL_RESULT_CHARS, MessageContent,
-    MessageId, OpenLoopStore, ProposedAction, ReachOutIntent, ToolAction,
+    ActionPort, ActionPortError, ActionPortFuture, ActionPortOutcome, ActionPortReleaseFuture,
+    ActionScope, ConversationId, ConversationKind, ConversationMemberStore,
+    DeliveryResolutionError, DeliveryResolver, DeliveryResolverFuture, DeliveryRoute, GoalState,
+    GoalStore, MAX_TOOL_ERROR_DETAIL_BYTES, MAX_TOOL_ERROR_DETAIL_CHARS, MAX_TOOL_RESULT_BYTES,
+    MAX_TOOL_RESULT_CHARS, MessageContent, MessageId, OpenLoopStore, ProposedAction,
+    ReachOutIntent, ToolAction,
 };
 
 /// Concrete QQ destination after a canonical Core conversation has been
@@ -765,256 +766,288 @@ impl QqActionAdapter {
             });
         };
         let ticket = claim.ticket;
-        let source_message_id = claim.source_message_id;
-        let Some(registry) = tool_registry() else {
-            return Ok(ActionPortOutcome::Deferred {
-                reason: "tool_registry_unavailable".to_string(),
-            });
-        };
-        let actor = action
-            .actor()
-            .ok_or_else(|| ActionPortError::new("tool_actor_required", false))?;
-        let actor_user_id = self.resolve_tool_actor_user_id(actor).await?;
-
-        let (expected_conversation_id, expected_destination) = match action.scope {
-            ActionScope::Conversation(conversation_id) => {
-                if self
-                    .identity_store
-                    .get(conversation_id, actor)
-                    .await
-                    .map_err(|error| {
-                        ActionPortError::new(format!("tool_scope_membership_failed:{error}"), true)
-                    })?
-                    .is_none()
-                {
-                    return Err(ActionPortError::new(
-                        "tool_scope_membership_required",
-                        false,
-                    ));
-                }
-                let destination = self
-                    .resolve_conversation_destination_without_authorization(conversation_id)
-                    .await?;
-                (conversation_id, destination)
-            }
-            ActionScope::Person(person_id) => {
-                if person_id != actor {
-                    return Err(ActionPortError::new(
-                        "tool_person_scope_actor_mismatch",
-                        false,
-                    ));
-                }
-                let (route, destination) = self
-                    .resolve_person_destination(person_id)
-                    .await
-                    .map_err(|error| ActionPortError::new(error.to_string(), true))?;
-                (route.conversation_id, destination)
-            }
-            ActionScope::Global => {
+        let result = async {
+            let source_message_id = claim.source_message_id;
+            let read_only_only = claim.read_only_only;
+            let Some(registry) = tool_registry() else {
                 return Ok(ActionPortOutcome::Deferred {
-                    reason: "global_tool_scope_requires_host_context".to_string(),
+                    reason: "tool_registry_unavailable".to_string(),
+                });
+            };
+            let actor = action
+                .actor()
+                .ok_or_else(|| ActionPortError::new("tool_actor_required", false))?;
+            let actor_user_id = self.resolve_tool_actor_user_id(actor).await?;
+
+            let (expected_conversation_id, expected_destination) = match action.scope {
+                ActionScope::Conversation(conversation_id) => {
+                    if self
+                        .identity_store
+                        .get(conversation_id, actor)
+                        .await
+                        .map_err(|error| {
+                            ActionPortError::new(
+                                format!("tool_scope_membership_failed:{error}"),
+                                true,
+                            )
+                        })?
+                        .is_none()
+                    {
+                        return Err(ActionPortError::new(
+                            "tool_scope_membership_required",
+                            false,
+                        ));
+                    }
+                    let destination = self
+                        .resolve_conversation_destination_without_authorization(conversation_id)
+                        .await?;
+                    (conversation_id, destination)
+                }
+                ActionScope::Person(person_id) => {
+                    if person_id != actor {
+                        return Err(ActionPortError::new(
+                            "tool_person_scope_actor_mismatch",
+                            false,
+                        ));
+                    }
+                    let (route, destination) = self
+                        .resolve_person_destination(person_id)
+                        .await
+                        .map_err(|error| ActionPortError::new(error.to_string(), true))?;
+                    (route.conversation_id, destination)
+                }
+                ActionScope::Global => {
+                    return Ok(ActionPortOutcome::Deferred {
+                        reason: "global_tool_scope_requires_host_context".to_string(),
+                    });
+                }
+            };
+            if ticket.scope() != expected_destination.reply_scope() {
+                return Ok(ActionPortOutcome::Deferred {
+                    reason: "tool_turn_capability_scope_mismatch".to_string(),
                 });
             }
-        };
-        if ticket.scope() != expected_destination.reply_scope() {
-            return Ok(ActionPortOutcome::Deferred {
-                reason: "tool_turn_capability_scope_mismatch".to_string(),
-            });
-        }
 
-        let arguments = serde_json::from_str::<serde_json::Value>(&action.input)
-            .map_err(|error| ActionPortError::new(format!("tool_input_invalid:{error}"), false))?;
-        let Some(arguments) = arguments.as_object().cloned() else {
-            return Err(ActionPortError::new(
-                "tool_input_must_be_json_object",
-                false,
-            ));
-        };
-        // Route deletion and authorization revocation take the corresponding
-        // write locks. Pin both snapshots through the Host commit point, but
-        // never across ToolRegistry execution or external I/O.
-        let route_guard = crate::yunxi::pin_delivery_routes().await;
-        let current_actor_user_id = match self.resolve_tool_actor_user_id(actor).await {
-            Ok(user_id) if user_id == actor_user_id => user_id,
-            Ok(_) => {
-                drop(route_guard);
-                return Ok(ActionPortOutcome::Deferred {
-                    reason: "tool_actor_route_changed_before_commit".to_string(),
-                });
-            }
-            Err(error) => {
-                drop(route_guard);
-                return Err(error);
-            }
-        };
-        if let ActionScope::Conversation(conversation_id) = action.scope {
-            match self.identity_store.get(conversation_id, actor).await {
-                Ok(Some(_)) => {}
-                Ok(None) => {
+            let arguments =
+                serde_json::from_str::<serde_json::Value>(&action.input).map_err(|error| {
+                    ActionPortError::new(format!("tool_input_invalid:{error}"), false)
+                })?;
+            let Some(arguments) = arguments.as_object().cloned() else {
+                return Err(ActionPortError::new(
+                    "tool_input_must_be_json_object",
+                    false,
+                ));
+            };
+            // Route deletion and authorization revocation take the corresponding
+            // write locks. Pin both snapshots through the Host commit point, but
+            // never across ToolRegistry execution or external I/O.
+            let route_guard = crate::yunxi::pin_delivery_routes().await;
+            let current_actor_user_id = match self.resolve_tool_actor_user_id(actor).await {
+                Ok(user_id) if user_id == actor_user_id => user_id,
+                Ok(_) => {
                     drop(route_guard);
-                    return Err(ActionPortError::new(
-                        "tool_scope_membership_revoked_before_commit",
-                        false,
-                    ));
+                    return Ok(ActionPortOutcome::Deferred {
+                        reason: "tool_actor_route_changed_before_commit".to_string(),
+                    });
                 }
                 Err(error) => {
                     drop(route_guard);
-                    return Err(ActionPortError::new(
-                        format!("tool_scope_membership_revalidation_failed:{error}"),
-                        true,
-                    ));
+                    return Err(error);
                 }
-            }
-        }
-        let current_route = match action.scope {
-            ActionScope::Conversation(conversation_id) => self
-                .resolve_conversation_destination_without_authorization(conversation_id)
-                .await
-                .map(|destination| (conversation_id, destination)),
-            ActionScope::Person(person_id) => self
-                .resolve_person_destination(person_id)
-                .await
-                .map_err(|error| ActionPortError::new(error.to_string(), true))
-                .map(|(route, destination)| (route.conversation_id, destination)),
-            ActionScope::Global => unreachable!("global tool scopes return before revalidation"),
-        };
-        let (_, destination) = match current_route {
-            Ok(current)
-                if delivery_route_is_unchanged(
-                    expected_conversation_id,
-                    expected_destination,
-                    Some(current),
-                ) =>
-            {
-                current
-            }
-            Ok(_) => {
-                drop(route_guard);
-                return Ok(ActionPortOutcome::Deferred {
-                    reason: "tool_route_changed_before_commit".to_string(),
-                });
-            }
-            Err(error) => {
-                drop(route_guard);
-                return Err(error);
-            }
-        };
-        if ticket.scope() != destination.reply_scope() {
-            drop(route_guard);
-            return Ok(ActionPortOutcome::Deferred {
-                reason: "tool_turn_capability_route_mismatch".to_string(),
-            });
-        }
-        let group_authorization = match destination {
-            QqDestination::Group(group_id) => {
-                match crate::group_access::authorize_group_send(group_id).await {
-                    Ok(authorization) => Some(authorization),
+            };
+            if let ActionScope::Conversation(conversation_id) = action.scope {
+                match self.identity_store.get(conversation_id, actor).await {
+                    Ok(Some(_)) => {}
+                    Ok(None) => {
+                        drop(route_guard);
+                        return Err(ActionPortError::new(
+                            "tool_scope_membership_revoked_before_commit",
+                            false,
+                        ));
+                    }
                     Err(error) => {
                         drop(route_guard);
                         return Err(ActionPortError::new(
-                            format!("tool_group_authorization_revoked:{error}"),
-                            false,
+                            format!("tool_scope_membership_revalidation_failed:{error}"),
+                            true,
                         ));
                     }
                 }
             }
-            QqDestination::Private(_) => None,
-        };
-        let configured_owner = crate::config::get().identity().owner_person_id();
-        let is_main_admin = configured_owner.is_some_and(|owner| owner == actor.into_uuid())
-            || (configured_owner.is_none()
-                && self
-                    .bot
-                    .get_main_admin()
-                    .ok()
-                    .is_some_and(|main_admin| main_admin == current_actor_user_id));
-        // The Core action has no raw group-admin proof. Restrict admin tools
-        // to the Host's main administrator, re-evaluated at commit time.
-        let is_admin = is_main_admin;
-        let group_paused = match destination {
-            QqDestination::Group(group_id) => crate::model::utils::is_group_paused(group_id).await,
-            QqDestination::Private(_) => false,
-        };
-        let Some(mind_delivery_permit) =
-            crate::yunxi::pin_mind_outgoing_fence(action.idempotency_key()).await
-        else {
+            let current_route = match action.scope {
+                ActionScope::Conversation(conversation_id) => self
+                    .resolve_conversation_destination_without_authorization(conversation_id)
+                    .await
+                    .map(|destination| (conversation_id, destination)),
+                ActionScope::Person(person_id) => self
+                    .resolve_person_destination(person_id)
+                    .await
+                    .map_err(|error| ActionPortError::new(error.to_string(), true))
+                    .map(|(route, destination)| (route.conversation_id, destination)),
+                ActionScope::Global => {
+                    unreachable!("global tool scopes return before revalidation")
+                }
+            };
+            let (_, destination) = match current_route {
+                Ok(current)
+                    if delivery_route_is_unchanged(
+                        expected_conversation_id,
+                        expected_destination,
+                        Some(current),
+                    ) =>
+                {
+                    current
+                }
+                Ok(_) => {
+                    drop(route_guard);
+                    return Ok(ActionPortOutcome::Deferred {
+                        reason: "tool_route_changed_before_commit".to_string(),
+                    });
+                }
+                Err(error) => {
+                    drop(route_guard);
+                    return Err(error);
+                }
+            };
+            if ticket.scope() != destination.reply_scope() {
+                drop(route_guard);
+                return Ok(ActionPortOutcome::Deferred {
+                    reason: "tool_turn_capability_route_mismatch".to_string(),
+                });
+            }
+            let group_authorization = match destination {
+                QqDestination::Group(group_id) => {
+                    match crate::group_access::authorize_group_send(group_id).await {
+                        Ok(authorization) => Some(authorization),
+                        Err(error) => {
+                            drop(route_guard);
+                            return Err(ActionPortError::new(
+                                format!("tool_group_authorization_revoked:{error}"),
+                                false,
+                            ));
+                        }
+                    }
+                }
+                QqDestination::Private(_) => None,
+            };
+            let configured_owner = crate::config::get().identity().owner_person_id();
+            let is_main_admin = configured_owner.is_some_and(|owner| owner == actor.into_uuid())
+                || (configured_owner.is_none()
+                    && self
+                        .bot
+                        .get_main_admin()
+                        .ok()
+                        .is_some_and(|main_admin| main_admin == current_actor_user_id));
+            // The Core action has no raw group-admin proof. Restrict admin tools
+            // to the Host's main administrator, re-evaluated at commit time.
+            let is_admin = is_main_admin;
+            let group_paused = match destination {
+                QqDestination::Group(group_id) => {
+                    crate::model::utils::is_group_paused(group_id).await
+                }
+                QqDestination::Private(_) => false,
+            };
+            let Some(mind_delivery_permit) =
+                crate::yunxi::pin_mind_outgoing_fence(action.idempotency_key()).await
+            else {
+                drop(group_authorization);
+                drop(route_guard);
+                return Ok(ActionPortOutcome::Deferred {
+                    reason: "mind_snapshot_changed_before_tool_effect".to_string(),
+                });
+            };
+            if !mark_active(ticket).await {
+                drop(group_authorization);
+                drop(route_guard);
+                return Ok(ActionPortOutcome::Deferred {
+                    reason: "tool_turn_capability_stale_before_commit".to_string(),
+                });
+            }
+            if !is_current(ticket).await {
+                drop(group_authorization);
+                drop(route_guard);
+                return Ok(ActionPortOutcome::Deferred {
+                    reason: "tool_turn_capability_stale_at_effect_boundary".to_string(),
+                });
+            }
+            let context = ToolExecutionContext {
+                subject_id: current_actor_user_id,
+                actor_user_id: current_actor_user_id,
+                is_admin,
+                is_main_admin,
+                context: "yunxi_core_tool",
+                destination: destination.message_destination(),
+                source_message_id,
+                scheduled: false,
+                group_paused,
+                runtime_bot: Some(Arc::clone(&self.bot)),
+                sticker_teaching: None,
+                requires_reminder_create: false,
+                requires_agent_run_create: false,
+                requires_group_message_send: false,
+                requires_group_followup: false,
+                requires_external_tool: false,
+            };
+            if read_only_only
+                && !registry.available_read_only_for_context(&action.tool_name, &context)
+            {
+                drop(mind_delivery_permit);
+                drop(group_authorization);
+                drop(route_guard);
+                return Ok(ActionPortOutcome::Deferred {
+                    reason: "tool_follow_up_requires_read_only_tool".to_string(),
+                });
+            }
             drop(group_authorization);
             drop(route_guard);
-            finish(ticket).await;
-            return Ok(ActionPortOutcome::Deferred {
-                reason: "mind_snapshot_changed_before_tool_effect".to_string(),
+            crate::yunxi::commit_mind_candidates(action.idempotency_key());
+            let revalidator: Arc<dyn ToolEffectRevalidator> = Arc::new(CoreToolEffectRevalidator {
+                adapter: self.clone(),
+                registry: Arc::clone(&registry),
+                action: action.clone(),
+                ticket,
+                source_message_id,
+                expected_actor_user_id: actor_user_id,
+                expected_conversation_id,
+                expected_destination,
             });
-        };
-        if !mark_active(ticket).await {
-            drop(group_authorization);
-            drop(route_guard);
-            return Ok(ActionPortOutcome::Deferred {
-                reason: "tool_turn_capability_stale_before_commit".to_string(),
-            });
-        }
-        if !is_current(ticket).await {
-            drop(group_authorization);
-            drop(route_guard);
-            finish(ticket).await;
-            return Ok(ActionPortOutcome::Deferred {
-                reason: "tool_turn_capability_stale_at_effect_boundary".to_string(),
-            });
-        }
-        let context = ToolExecutionContext {
-            subject_id: current_actor_user_id,
-            actor_user_id: current_actor_user_id,
-            is_admin,
-            is_main_admin,
-            context: "yunxi_core_tool",
-            destination: destination.message_destination(),
-            source_message_id,
-            scheduled: false,
-            group_paused,
-            runtime_bot: Some(Arc::clone(&self.bot)),
-            sticker_teaching: None,
-            requires_reminder_create: false,
-            requires_agent_run_create: false,
-            requires_group_message_send: false,
-            requires_group_followup: false,
-            requires_external_tool: false,
-        };
-        drop(group_authorization);
-        drop(route_guard);
-        crate::yunxi::commit_mind_candidates(action.idempotency_key());
-        let revalidator: Arc<dyn ToolEffectRevalidator> = Arc::new(CoreToolEffectRevalidator {
-            adapter: self.clone(),
-            registry: Arc::clone(&registry),
-            action: action.clone(),
-            ticket,
-            source_message_id,
-            expected_actor_user_id: actor_user_id,
-            expected_conversation_id,
-            expected_destination,
-        });
-        let result = registry
-            .execute_with_revalidation(&action.tool_name, arguments, context, ticket, revalidator)
-            .await;
-        drop(mind_delivery_permit);
-        finish(ticket).await;
-        if result.succeeded {
-            return Ok(ActionPortOutcome::ToolCompleted {
+            let result = registry
+                .execute_with_revalidation(
+                    &action.tool_name,
+                    arguments,
+                    context,
+                    ticket,
+                    revalidator,
+                    read_only_only,
+                )
+                .await;
+            drop(mind_delivery_permit);
+            if result.succeeded {
+                return Ok(ActionPortOutcome::ToolCompleted {
+                    operation: action.tool_name.clone(),
+                    output: bounded_core_tool_text(
+                        &result.content,
+                        MAX_TOOL_RESULT_CHARS,
+                        MAX_TOOL_RESULT_BYTES,
+                    ),
+                });
+            }
+            Ok(ActionPortOutcome::ToolFailed {
                 operation: action.tool_name.clone(),
-                output: bounded_core_tool_text(
+                error_category: "tool_execution_failed".to_string(),
+                detail: bounded_core_tool_text(
                     &result.content,
-                    MAX_TOOL_RESULT_CHARS,
-                    MAX_TOOL_RESULT_BYTES,
+                    MAX_TOOL_ERROR_DETAIL_CHARS,
+                    MAX_TOOL_ERROR_DETAIL_BYTES,
                 ),
-            });
+            })
         }
-        Ok(ActionPortOutcome::ToolFailed {
-            operation: action.tool_name.clone(),
-            error_category: "tool_execution_failed".to_string(),
-            detail: bounded_core_tool_text(
-                &result.content,
-                MAX_TOOL_ERROR_DETAIL_CHARS,
-                MAX_TOOL_ERROR_DETAIL_BYTES,
-            ),
-        })
+        .await;
+        // Capability claims carry the active incoming ticket. Every path
+        // after a successful claim, including validation and authorization
+        // failures above, must release that ticket before returning.
+        finish(ticket).await;
+        result
     }
 }
 
@@ -1175,6 +1208,14 @@ impl ActionPort for QqActionAdapter {
                     message_id: None,
                     conversation_id: None,
                 }),
+            }
+        })
+    }
+
+    fn release_unexecuted<'a>(&'a self, action: &'a ProposedAction) -> ActionPortReleaseFuture<'a> {
+        Box::pin(async move {
+            if let ProposedAction::UseTool(tool) = action {
+                self.tool_turns.revoke(tool.idempotency_key()).await;
             }
         })
     }

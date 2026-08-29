@@ -924,6 +924,14 @@ pub enum PlannerInputValidationError {
 pub enum PlannerOutputValidationError {
     #[error("planner returned too many intents: {length}, maximum {maximum}")]
     TooManyIntents { length: usize, maximum: usize },
+    #[error(
+        "planner requested too many tool actions for this causal trace: used {used}, requested {requested}, maximum {maximum}"
+    )]
+    ToolActionBudgetExceeded {
+        used: usize,
+        requested: usize,
+        maximum: usize,
+    },
     #[error("planner returned too many state updates: {length}, maximum {maximum}")]
     TooManyStateUpdates { length: usize, maximum: usize },
     #[error("planner returned an invalid intent: {0}")]

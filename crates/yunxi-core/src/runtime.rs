@@ -1,6 +1,9 @@
 use crate::arbiter::{ActionArbiter, ActionPort, ActionResult};
 use crate::attention::{AttentionResult, AttentionSystem};
-use crate::event::{EventPriority, EventScope, EventType, EventValidationError, WorldEvent};
+use crate::event::{
+    EventPriority, EventScope, EventType, EventValidationError, MAX_TOOL_RESULT_BYTES,
+    MAX_TOOL_RESULT_CHARS, WorldEvent, WorldEventKind,
+};
 use crate::executive::{
     DecisionActionKind, DecisionRecord, ExecutiveController, ExecutiveReasonTag, ExecutiveScope,
 };
@@ -12,7 +15,7 @@ use crate::mind::{
 };
 use crate::open_loop::OpenLoopOwner;
 use crate::planner::{
-    DecisionPlan, MAX_PLANNER_GOALS, Planner, PlannerError, PlannerInput,
+    DecisionPlan, MAX_PLANNER_GOALS, MAX_PLANNER_INTENTS, Planner, PlannerError, PlannerInput,
     PlannerOutputValidationError, PlannerStateSnapshot, StateUpdateProposal,
 };
 use crate::ports::CoreServices;
@@ -29,6 +32,22 @@ use tokio::time::timeout;
 const MAX_EVENT_QUEUE_CAPACITY: usize = 4_096;
 const MAX_GOALS_PER_CONTEXT_OWNER: usize = 32;
 const MAX_PENDING_TOOL_FOLLOW_UPS: usize = 128;
+/// Maximum number of tool actions allowed across one causal trace.
+///
+/// This intentionally matches the per-plan intent bound. A model can still
+/// use multiple tools, but a recursive chain cannot grow without limit.
+pub const MAX_TOOL_ACTIONS_PER_TRACE: usize = MAX_PLANNER_INTENTS;
+/// Number of root traces retained by the cumulative tool-budget ledger.
+/// Entries contain only event IDs and counters, never user content.
+const MAX_TOOL_TRACE_BUDGET_ENTRIES: usize = 1_024;
+/// Recently completed roots are kept as tombstones so replaying the same
+/// depth-zero event cannot create a fresh cumulative budget entry. The set is
+/// bounded because event IDs are opaque and contain no user content.
+const MAX_CLOSED_TOOL_TRACE_TOMBSTONES: usize = 4_096;
+const MAX_TOOL_BATCH_OPERATION_CHARS: usize = 128;
+const MAX_TOOL_OPERATION_BYTES: usize = 1_024;
+const MAX_TOOL_ERROR_CATEGORY_BYTES: usize = 256;
+const INITIAL_TOOL_BATCH_FIELD_CHARS: usize = 1_024;
 const DEFAULT_MIND_SNAPSHOT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(75);
 pub const MAX_DATA_ERASURE_CONVERSATIONS: usize = 256;
 pub const MAX_BLOCKED_DATA_ERASURE_PEOPLE: usize = 256;
@@ -255,6 +274,7 @@ where
 }
 
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 enum RuntimeCommand {
     Event(WorldEvent),
     BeginDataErasure {
@@ -363,6 +383,10 @@ pub enum PlannedProcessingOutcome {
 pub struct CognitiveRuntime {
     receiver: mpsc::Receiver<RuntimeCommand>,
     pending_tool_follow_ups: VecDeque<WorldEvent>,
+    tool_action_budget_by_trace: HashMap<EventId, usize>,
+    tool_action_budget_order: VecDeque<EventId>,
+    closed_tool_budget_roots: HashSet<EventId>,
+    closed_tool_budget_order: VecDeque<EventId>,
     state: WorkingState,
     data_erasure: DataErasureState,
     attention: AttentionSystem,
@@ -525,6 +549,10 @@ impl CognitiveRuntime {
             Self {
                 receiver,
                 pending_tool_follow_ups: VecDeque::new(),
+                tool_action_budget_by_trace: HashMap::new(),
+                tool_action_budget_order: VecDeque::new(),
+                closed_tool_budget_roots: HashSet::new(),
+                closed_tool_budget_order: VecDeque::new(),
                 state,
                 data_erasure: DataErasureState::default(),
                 attention: AttentionSystem,
@@ -642,9 +670,156 @@ impl CognitiveRuntime {
         self.services.as_deref()
     }
 
+    #[cfg(test)]
+    fn tool_actions_used(&self, event: &WorldEvent) -> usize {
+        self.effective_tool_actions_used(event)
+    }
+
+    fn effective_tool_actions_used(&self, event: &WorldEvent) -> usize {
+        let root = event.trace().root_event_id();
+        if let Some(used) = self.tool_action_budget_by_trace.get(&root).copied() {
+            return used;
+        }
+        if self.closed_tool_budget_roots.contains(&root) {
+            return MAX_TOOL_ACTIONS_PER_TRACE;
+        }
+        // A derived event with no ledger entry may be a delayed child of a
+        // completed trace. Treating it as a fresh budget would reset the
+        // cumulative limit, so unknown descendants fail closed.
+        if event.trace().depth() > 0
+            || self.tool_action_budget_by_trace.len() >= MAX_TOOL_TRACE_BUDGET_ENTRIES
+        {
+            MAX_TOOL_ACTIONS_PER_TRACE
+        } else {
+            0
+        }
+    }
+
+    fn tool_actions_remaining(&self, event: &WorldEvent) -> usize {
+        MAX_TOOL_ACTIONS_PER_TRACE.saturating_sub(self.effective_tool_actions_used(event))
+    }
+
+    fn root_has_pending_tool_follow_up(&self, root: EventId) -> bool {
+        self.pending_tool_follow_ups
+            .iter()
+            .any(|event| event.trace().root_event_id() == root)
+    }
+
+    /// Releases a completed root after its final action turn. Pending
+    /// follow-ups pin the entry so a delayed child can never observe a reset
+    /// budget. The ledger remains bounded while allowing sequential roots to
+    /// reuse capacity.
+    fn release_tool_budget_root_if_terminal(&mut self, root: EventId) {
+        if self.root_has_pending_tool_follow_up(root) {
+            return;
+        }
+        if self.tool_action_budget_by_trace.remove(&root).is_some() {
+            self.tool_action_budget_order
+                .retain(|candidate| *candidate != root);
+            self.closed_tool_budget_roots.insert(root);
+            self.closed_tool_budget_order
+                .retain(|candidate| *candidate != root);
+            self.closed_tool_budget_order.push_back(root);
+            while self.closed_tool_budget_order.len() > MAX_CLOSED_TOOL_TRACE_TOMBSTONES {
+                let Some(expired) = self.closed_tool_budget_order.pop_front() else {
+                    break;
+                };
+                self.closed_tool_budget_roots.remove(&expired);
+            }
+        }
+    }
+
+    fn touch_tool_budget_root(&mut self, root: EventId) -> bool {
+        if self.closed_tool_budget_roots.contains(&root) {
+            return false;
+        }
+        if self.tool_action_budget_by_trace.contains_key(&root) {
+            if let Some(position) = self
+                .tool_action_budget_order
+                .iter()
+                .position(|existing| *existing == root)
+            {
+                self.tool_action_budget_order.remove(position);
+            }
+        } else {
+            if self.tool_action_budget_by_trace.len() >= MAX_TOOL_TRACE_BUDGET_ENTRIES {
+                // Existing roots are never evicted: doing so could reset the
+                // cumulative budget of a delayed child trace. A new root is
+                // rejected once the bounded ledger is full.
+                return false;
+            }
+            self.tool_action_budget_by_trace.insert(root, 0);
+        }
+        self.tool_action_budget_order.push_back(root);
+        true
+    }
+
+    fn validate_tool_action_budget(
+        &self,
+        event: &WorldEvent,
+        plan: &DecisionPlan,
+    ) -> Result<(), PlannerError> {
+        let requested = tool_intent_count(plan);
+        let used = self.effective_tool_actions_used(event);
+        if requested > MAX_TOOL_ACTIONS_PER_TRACE.saturating_sub(used) {
+            return Err(PlannerError::InvalidOutput(
+                PlannerOutputValidationError::ToolActionBudgetExceeded {
+                    used,
+                    requested,
+                    maximum: MAX_TOOL_ACTIONS_PER_TRACE,
+                },
+            ));
+        }
+        Ok(())
+    }
+
+    /// Reserves one or more tool-action budget units immediately before
+    /// dispatch. The caller must run the whole-plan preflight first so a
+    /// malformed or over-budget plan cannot partially execute.
+    fn reserve_tool_actions(
+        &mut self,
+        event: &WorldEvent,
+        requested: usize,
+    ) -> Result<(), PlannerError> {
+        if requested == 0 {
+            return Ok(());
+        }
+        let root = event.trace().root_event_id();
+        let used = self.effective_tool_actions_used(event);
+        if requested > MAX_TOOL_ACTIONS_PER_TRACE.saturating_sub(used) {
+            return Err(PlannerError::InvalidOutput(
+                PlannerOutputValidationError::ToolActionBudgetExceeded {
+                    used,
+                    requested,
+                    maximum: MAX_TOOL_ACTIONS_PER_TRACE,
+                },
+            ));
+        }
+        if !self.touch_tool_budget_root(root) {
+            return Err(PlannerError::InvalidOutput(
+                PlannerOutputValidationError::ToolActionBudgetExceeded {
+                    used: MAX_TOOL_ACTIONS_PER_TRACE,
+                    requested,
+                    maximum: MAX_TOOL_ACTIONS_PER_TRACE,
+                },
+            ));
+        }
+        let entry = self
+            .tool_action_budget_by_trace
+            .get_mut(&root)
+            .expect("touched tool budget root must exist");
+        *entry += requested;
+        Ok(())
+    }
+
     pub async fn process_next(&mut self) -> Option<ProcessingOutcome> {
         let event = self.next_event().await?;
-        Some(self.process_event(event))
+        let root = event.trace().root_event_id();
+        let outcome = self.process_event(event);
+        // This observe-only queue API consumes the event without handing it to
+        // a planner, so an otherwise terminal tool root can be released here.
+        self.release_tool_budget_root_if_terminal(root);
+        Some(outcome)
     }
 
     async fn next_event(&mut self) -> Option<WorldEvent> {
@@ -653,6 +828,7 @@ impl CognitiveRuntime {
                 if !self.data_erasure.blocks(&event) {
                     return Some(event);
                 }
+                self.release_tool_budget_root_if_terminal(event.trace().root_event_id());
                 continue;
             }
             match self.receiver.recv().await? {
@@ -660,6 +836,7 @@ impl CognitiveRuntime {
                     if !self.data_erasure.blocks(&event) {
                         return Some(event);
                     }
+                    self.release_tool_budget_root_if_terminal(event.trace().root_event_id());
                 }
                 RuntimeCommand::BeginDataErasure {
                     person_id,
@@ -725,6 +902,26 @@ impl CognitiveRuntime {
         &mut self,
         event: WorldEvent,
     ) -> Result<PlannedProcessingOutcome, PlannerError> {
+        let root = event.trace().root_event_id();
+        let result = self.process_event_with_planner_inner(event).await;
+        // This API does not dispatch actions itself. A plan that still
+        // contains tools remains live for its caller; every other outcome,
+        // including planner errors, is terminal once no child is pending.
+        let keeps_root_live = matches!(
+            &result,
+            Ok(PlannedProcessingOutcome::Planned { plan, .. })
+                if tool_intent_count(plan) > 0
+        );
+        if !keeps_root_live {
+            self.release_tool_budget_root_if_terminal(root);
+        }
+        result
+    }
+
+    async fn process_event_with_planner_inner(
+        &mut self,
+        event: WorldEvent,
+    ) -> Result<PlannedProcessingOutcome, PlannerError> {
         let planner_event = event.clone();
         let observed = self.process_event(event);
         let ProcessingOutcome::Observed(observation) = observed else {
@@ -751,6 +948,7 @@ impl CognitiveRuntime {
             .with_capabilities(Vec::new());
         validate_due_open_loop_context(&input)?;
         let plan = planner.plan(&input).await?;
+        self.validate_tool_action_budget(&planner_event, &plan)?;
         validate_intent_targets(&planner_event, &plan)?;
         let deferred_due_resolution = deferred_due_open_loop_resolution(&planner_event, &plan);
         self.apply_state_updates(&input, &plan, deferred_due_resolution)
@@ -767,9 +965,26 @@ impl CognitiveRuntime {
     /// Runs one complete Core decision turn. Every intent is converted to a
     /// proposed action, admitted by the arbiter, executed by the host port,
     /// and represented as a derived WorldEvent that is observed by this
-    /// runtime. The method deliberately does not call the planner again for
-    /// feedback events, preventing action-result loops.
+    /// runtime. Tool results may enqueue bounded follow-up planner turns;
+    /// queue and trace limits remain the loop-safety boundary.
     pub async fn process_event_with_planner_and_actions(
+        &mut self,
+        event: WorldEvent,
+        arbiter: &ActionArbiter,
+        port: &dyn ActionPort,
+    ) -> Result<PlannedProcessingOutcome, PlannerError> {
+        let root = event.trace().root_event_id();
+        let result = self
+            .process_event_with_planner_and_actions_inner(event, arbiter, port)
+            .await;
+        // Any completed or failed turn is terminal once no child is pending;
+        // retaining errored roots indefinitely would let malformed/backend
+        // failure traffic exhaust the bounded ledger and deny new requests.
+        self.release_tool_budget_root_if_terminal(root);
+        result
+    }
+
+    async fn process_event_with_planner_and_actions_inner(
         &mut self,
         event: WorldEvent,
         arbiter: &ActionArbiter,
@@ -793,14 +1008,15 @@ impl CognitiveRuntime {
             .planner
             .as_ref()
             .ok_or(PlannerError::Model(crate::ModelBackendError::Unavailable))?;
+        let tool_actions_remaining = self.tool_actions_remaining(&planner_event);
         let capabilities = arbiter
             .config()
             .capabilities
             .actions()
             .iter()
             .filter(|descriptor| {
-                !(tool_event_requires_follow_up(&planner_event)
-                    && descriptor.capability == crate::ActionCapability::UseTool)
+                descriptor.capability != crate::ActionCapability::UseTool
+                    || tool_actions_remaining > 0
             })
             .cloned()
             .collect();
@@ -810,37 +1026,82 @@ impl CognitiveRuntime {
             .with_capabilities(capabilities);
         validate_due_open_loop_context(&input)?;
         let plan = planner.plan(&input).await?;
-        validate_intent_targets(&planner_event, &plan)?;
+        if let Err(error) = self.validate_tool_action_budget(&planner_event, &plan) {
+            release_unexecuted_tool_intents(&planner_event, &plan, port).await;
+            return Err(error);
+        }
+        if let Err(error) = validate_intent_targets(&planner_event, &plan) {
+            release_unexecuted_tool_intents(&planner_event, &plan, port).await;
+            return Err(error);
+        }
         let due_open_loop = due_open_loop_id(&planner_event);
         let deferred_due_resolution = deferred_due_open_loop_resolution(&planner_event, &plan);
-        let applied_state_updates = self
+        let applied_state_updates = match self
             .apply_state_updates(&input, &plan, deferred_due_resolution)
-            .await?;
+            .await
+        {
+            Ok(applied) => applied,
+            Err(error) => {
+                release_unexecuted_tool_intents(&planner_event, &plan, port).await;
+                return Err(error);
+            }
+        };
         let mut all_due_deliveries_succeeded = true;
         let mut due_terminal_non_success = false;
         let mut actions = Vec::with_capacity(plan.intents.len());
         let mut feedback = Vec::new();
+        let mut tool_follow_up_events = Vec::new();
         let mut selected_action = None;
         for (intent_index, intent) in plan.intents.iter().enumerate() {
-            let mut proposed = intent.propose_action().map_err(|error| {
-                PlannerError::InvalidOutput(PlannerOutputValidationError::InvalidIntent(error))
-            })?;
+            let mut proposed = match intent.propose_action() {
+                Ok(proposed) => proposed,
+                Err(error) => {
+                    release_unexecuted_tool_intents_from(&planner_event, &plan, intent_index, port)
+                        .await;
+                    return Err(PlannerError::InvalidOutput(
+                        PlannerOutputValidationError::InvalidIntent(error),
+                    ));
+                }
+            };
             if proposed.actor().is_none()
                 && let Some(actor) = trusted_action_actor(&planner_event)
             {
                 proposed = proposed.with_actor(actor);
             }
-            apply_planned_action_idempotency(&mut proposed, &planner_event, intent_index).map_err(
-                |error| {
-                    PlannerError::InvalidOutput(PlannerOutputValidationError::InvalidIntent(
+            if let Err(error) =
+                apply_planned_action_idempotency(&mut proposed, &planner_event, intent_index)
+            {
+                release_unexecuted_tool_intents_from(&planner_event, &plan, intent_index, port)
+                    .await;
+                return Err(PlannerError::InvalidOutput(
+                    PlannerOutputValidationError::InvalidIntent(
                         crate::IntentValidationError::Action(error),
-                    ))
-                },
-            )?;
+                    ),
+                ));
+            }
+            if matches!(&proposed, crate::ProposedAction::UseTool(_))
+                && let Err(error) = self.reserve_tool_actions(&planner_event, 1)
+            {
+                release_unexecuted_tool_intents_from(&planner_event, &plan, intent_index, port)
+                    .await;
+                return Err(error);
+            }
             if selected_action.is_none() && !matches!(&proposed, crate::ProposedAction::Noop) {
                 selected_action = Some(proposed.clone());
             }
             let result = arbiter.dispatch(proposed.clone(), port).await;
+            if matches!(
+                &result,
+                ActionResult::Rejected(rejection)
+                    if !matches!(rejection, crate::ActionRejection::Duplicate { .. })
+            ) {
+                // The arbiter rejected the action before calling the port, so
+                // any host-side capability registered for this action is still
+                // live and must be released explicitly. A duplicate may refer
+                // to another dispatch that has already crossed this boundary,
+                // so its capability must be left alone.
+                port.release_unexecuted(&proposed).await;
+            }
             let replay_terminal = match &result {
                 ActionResult::Rejected(crate::ActionRejection::Duplicate {
                     idempotency_key,
@@ -894,17 +1155,34 @@ impl CognitiveRuntime {
                     all_due_deliveries_succeeded = false;
                 }
             }
-            if let Some(feedback_event) =
+            if matches!(&proposed, crate::ProposedAction::UseTool(_)) {
+                // A successful duplicate already produced its result during
+                // the original turn. Replaying it as a rejection would turn a
+                // known success into a false ToolFailed follow-up.
+                if !duplicate_action_already_succeeded(&result, replay_terminal)
+                    && let Some(tool_event) = tool_follow_up_event(
+                        &planner_event,
+                        &proposed,
+                        &result,
+                        self.max_trace_depth,
+                    )
+                {
+                    tool_follow_up_events.push(tool_event);
+                }
+            } else if let Some(feedback_event) =
                 action_result_event(&planner_event, &proposed, &result, self.max_trace_depth)
             {
-                if tool_event_requires_follow_up(&feedback_event)
-                    && self.pending_tool_follow_ups.len() < MAX_PENDING_TOOL_FOLLOW_UPS
-                {
-                    // Tool output gets a fresh, bounded planner turn after this
-                    // action turn completes. Keeping it on an internal FIFO
-                    // preserves causal ordering without recursively invoking
-                    // the planner from inside an ActionPort call.
-                    self.pending_tool_follow_ups.push_back(feedback_event);
+                // Non-tool action feedback retains its historical behavior,
+                // including the defensive case where a host returns a tool
+                // outcome for a different proposed action.
+                if tool_event_requires_follow_up(&feedback_event) {
+                    if self.pending_tool_follow_ups.len() < MAX_PENDING_TOOL_FOLLOW_UPS {
+                        self.pending_tool_follow_ups.push_back(feedback_event);
+                    } else if let ProcessingOutcome::Observed(feedback_observation) =
+                        self.process_event(feedback_event)
+                    {
+                        feedback.push(feedback_observation);
+                    }
                 } else if let ProcessingOutcome::Observed(feedback_observation) =
                     self.process_event(feedback_event)
                 {
@@ -919,6 +1197,23 @@ impl CognitiveRuntime {
                 feedback.push(feedback_observation);
             }
             actions.push(result);
+        }
+        if let Some(tool_follow_up) = aggregate_tool_follow_up_events(
+            &planner_event,
+            tool_follow_up_events,
+            self.max_trace_depth,
+        ) {
+            if self.pending_tool_follow_ups.len() < MAX_PENDING_TOOL_FOLLOW_UPS {
+                // Tool output gets one fresh, bounded planner turn after this
+                // action turn completes. Sibling tool results are coalesced
+                // before entering the FIFO so one user request has one
+                // coherent follow-up context.
+                self.pending_tool_follow_ups.push_back(tool_follow_up);
+            } else if let ProcessingOutcome::Observed(feedback_observation) =
+                self.process_event(tool_follow_up)
+            {
+                feedback.push(feedback_observation);
+            }
         }
         if due_open_loop.is_some() && due_terminal_non_success {
             self.defer_due_open_loop_without_schedule(&input, applied_state_updates)
@@ -1614,17 +1909,51 @@ fn validate_due_open_loop_context(input: &PlannerInput) -> Result<(), PlannerErr
     }
 }
 
+fn tool_intent_count(plan: &DecisionPlan) -> usize {
+    plan.intents
+        .iter()
+        .filter(|intent| matches!(intent, crate::CognitiveIntent::UseTool { .. }))
+        .count()
+}
+
+/// Release host reservations for tool intents that were materialized by a
+/// planner but never entered the arbiter/port execution boundary. This is a
+/// best-effort cleanup hook: a validated planner intent should always convert
+/// to an action, while a malformed custom backend is simply ignored here.
+async fn release_unexecuted_tool_intents(
+    event: &WorldEvent,
+    plan: &DecisionPlan,
+    port: &dyn ActionPort,
+) {
+    release_unexecuted_tool_intents_from(event, plan, 0, port).await;
+}
+
+async fn release_unexecuted_tool_intents_from(
+    event: &WorldEvent,
+    plan: &DecisionPlan,
+    start_index: usize,
+    port: &dyn ActionPort,
+) {
+    for (intent_index, intent) in plan.intents.iter().enumerate().skip(start_index) {
+        if !matches!(intent, crate::CognitiveIntent::UseTool { .. }) {
+            continue;
+        }
+        let Ok(mut action) = intent.propose_action() else {
+            continue;
+        };
+        if action.actor().is_none()
+            && let Some(actor) = trusted_action_actor(event)
+        {
+            action = action.with_actor(actor);
+        }
+        if apply_planned_action_idempotency(&mut action, event, intent_index).is_ok() {
+            port.release_unexecuted(&action).await;
+        }
+    }
+}
+
 fn validate_intent_targets(event: &WorldEvent, plan: &DecisionPlan) -> Result<(), PlannerError> {
     for intent in &plan.intents {
-        if tool_event_requires_follow_up(event)
-            && matches!(intent, crate::CognitiveIntent::UseTool { .. })
-        {
-            return Err(PlannerError::InvalidOutput(
-                PlannerOutputValidationError::IntentOutsideEventScope {
-                    reason: "tool-result follow-up turns cannot invoke another tool".to_string(),
-                },
-            ));
-        }
         let allowed = match (event.scope(), intent) {
             (_, crate::CognitiveIntent::Noop) => true,
             (
@@ -1808,8 +2137,21 @@ fn extend_unique_goals(
 fn trusted_action_actor(event: &WorldEvent) -> Option<crate::PersonId> {
     match event.kind() {
         crate::WorldEventKind::MessageReceived(message) => Some(message.sender),
+        crate::WorldEventKind::ToolCompleted(_) | crate::WorldEventKind::ToolFailed(_) => {
+            event.actor()
+        }
         _ => None,
     }
+}
+
+fn duplicate_action_already_succeeded(
+    result: &ActionResult,
+    terminal: Option<crate::arbiter::AdmittedTerminal>,
+) -> bool {
+    matches!(
+        result,
+        ActionResult::Rejected(crate::ActionRejection::Duplicate { .. })
+    ) && terminal == Some(crate::arbiter::AdmittedTerminal::Succeeded)
 }
 
 fn action_result_event(
@@ -1831,8 +2173,12 @@ fn action_result_event(
             outcome: crate::ActionPortOutcome::ToolCompleted { operation, output },
             ..
         } => crate::WorldEventKind::ToolCompleted(crate::ToolCompletedEvent {
-            operation: operation.clone(),
-            output: output.clone(),
+            operation: bounded_tool_text(
+                operation,
+                MAX_TOOL_BATCH_OPERATION_CHARS,
+                MAX_TOOL_OPERATION_BYTES,
+            ),
+            output: bounded_tool_text(output, MAX_TOOL_RESULT_CHARS, MAX_TOOL_RESULT_BYTES),
             requires_follow_up: true,
         }),
         ActionResult::Executed {
@@ -1844,9 +2190,21 @@ fn action_result_event(
                 },
             ..
         } => crate::WorldEventKind::ToolFailed(crate::ToolFailedEvent {
-            operation: operation.clone(),
-            error_category: error_category.clone(),
-            detail: detail.clone(),
+            operation: bounded_tool_text(
+                operation,
+                MAX_TOOL_BATCH_OPERATION_CHARS,
+                MAX_TOOL_OPERATION_BYTES,
+            ),
+            error_category: bounded_tool_text(
+                error_category,
+                MAX_TOOL_BATCH_OPERATION_CHARS,
+                MAX_TOOL_ERROR_CATEGORY_BYTES,
+            ),
+            detail: bounded_tool_text(
+                detail,
+                crate::MAX_TOOL_ERROR_DETAIL_CHARS,
+                crate::MAX_TOOL_ERROR_DETAIL_BYTES,
+            ),
             requires_follow_up: true,
         }),
         ActionResult::Executed {
@@ -1883,7 +2241,7 @@ fn action_result_event(
         }
         ActionResult::Noop => return None,
     };
-    WorldEvent::derived_from(
+    let event = WorldEvent::derived_from(
         parent,
         Utc::now(),
         scope,
@@ -1891,13 +2249,330 @@ fn action_result_event(
         kind,
         max_trace_depth,
     )
-    .ok()
+    .ok()?;
+    Some(match action.actor() {
+        Some(actor) => event.with_actor(actor),
+        None => event,
+    })
+}
+
+/// Converts every tool action result into one follow-up event. Normal adapter
+/// completions retain their richer result kind; failures that happen before a
+/// `ToolCompleted`/`ToolFailed` outcome are normalized to `ToolFailed` so a
+/// sibling batch cannot hide a requested operation.
+fn tool_follow_up_event(
+    parent: &WorldEvent,
+    action: &crate::ProposedAction,
+    result: &ActionResult,
+    max_trace_depth: u8,
+) -> Option<WorldEvent> {
+    let event = action_result_event(parent, action, result, max_trace_depth);
+    if event.as_ref().is_some_and(|event| {
+        matches!(
+            event.kind(),
+            WorldEventKind::ToolCompleted(_) | WorldEventKind::ToolFailed(_)
+        )
+    }) {
+        return event;
+    }
+    tool_failure_follow_up_event(parent, action, result, max_trace_depth)
+}
+
+/// Normalizes failures that happen outside the tool adapter into the same
+/// follow-up envelope as an ordinary `ToolFailed` result. Without this, a
+/// mixed batch could hide rejected/deferred operations from the model.
+fn tool_failure_follow_up_event(
+    parent: &WorldEvent,
+    action: &crate::ProposedAction,
+    result: &ActionResult,
+    max_trace_depth: u8,
+) -> Option<WorldEvent> {
+    let crate::ProposedAction::UseTool(tool) = action else {
+        return None;
+    };
+    let (category, detail) = match result {
+        ActionResult::Executed {
+            outcome: crate::ActionPortOutcome::Deferred { reason },
+            ..
+        } => ("deferred".to_owned(), reason.clone()),
+        ActionResult::Executed {
+            outcome: crate::ActionPortOutcome::DeliveryIndeterminate { reason, .. },
+            ..
+        } => ("delivery_indeterminate".to_owned(), reason.clone()),
+        ActionResult::Failed { error, .. } => (error.category.clone(), error.to_string()),
+        ActionResult::Rejected(rejection) => ("rejected".to_owned(), rejection.to_string()),
+        ActionResult::Executed {
+            outcome: crate::ActionPortOutcome::Delivered { .. },
+            ..
+        } => (
+            "unexpected_tool_outcome".to_owned(),
+            "tool action returned a message delivery outcome".to_owned(),
+        ),
+        ActionResult::Noop => (
+            "noop".to_owned(),
+            "tool action produced no result".to_owned(),
+        ),
+        ActionResult::Executed {
+            outcome:
+                crate::ActionPortOutcome::ToolCompleted { .. }
+                | crate::ActionPortOutcome::ToolFailed { .. },
+            ..
+        } => return None,
+    };
+    let scope = match tool.scope {
+        crate::ActionScope::Conversation(conversation_id) => {
+            EventScope::Conversation { conversation_id }
+        }
+        crate::ActionScope::Person(person_id) => EventScope::Person { person_id },
+        crate::ActionScope::Global => EventScope::Global,
+    };
+    let event = WorldEvent::derived_from(
+        parent,
+        Utc::now(),
+        scope,
+        EventPriority::High,
+        WorldEventKind::ToolFailed(crate::ToolFailedEvent {
+            operation: bounded_tool_text(
+                &tool.tool_name,
+                MAX_TOOL_BATCH_OPERATION_CHARS,
+                MAX_TOOL_OPERATION_BYTES,
+            ),
+            error_category: bounded_tool_text(
+                &category,
+                MAX_TOOL_BATCH_OPERATION_CHARS,
+                MAX_TOOL_ERROR_CATEGORY_BYTES,
+            ),
+            detail: bounded_tool_text(
+                &detail,
+                crate::MAX_TOOL_ERROR_DETAIL_CHARS,
+                crate::MAX_TOOL_ERROR_DETAIL_BYTES,
+            ),
+            requires_follow_up: true,
+        }),
+        max_trace_depth,
+    )
+    .ok()?;
+    Some(match action.actor() {
+        Some(actor) => event.with_actor(actor),
+        None => event,
+    })
+}
+
+/// Coalesces sibling tool results from one planner turn into one follow-up
+/// event. Keeping the aggregate as a normal `ToolCompleted` event preserves
+/// the existing attention/state path while giving the model one coherent
+/// result set to summarize.
+fn aggregate_tool_follow_up_events(
+    parent: &WorldEvent,
+    mut events: Vec<WorldEvent>,
+    max_trace_depth: u8,
+) -> Option<WorldEvent> {
+    match events.len() {
+        0 => return None,
+        1 => {
+            return bounded_single_tool_follow_up_event(parent, events.pop()?, max_trace_depth);
+        }
+        _ => {}
+    }
+
+    let mut operation_limit = MAX_TOOL_BATCH_OPERATION_CHARS;
+    let mut field_limit = INITIAL_TOOL_BATCH_FIELD_CHARS;
+    let output = loop {
+        let encoded = serialize_tool_batch(&events, operation_limit, field_limit)?;
+        if encoded.len() <= MAX_TOOL_RESULT_BYTES
+            && encoded.chars().count() <= MAX_TOOL_RESULT_CHARS
+        {
+            break encoded;
+        }
+
+        if field_limit > 0 {
+            field_limit = field_limit.saturating_sub(field_limit.div_ceil(2));
+        } else if operation_limit > 1 {
+            operation_limit = operation_limit.saturating_sub(operation_limit.div_ceil(2));
+        } else {
+            // The fixed envelope itself should fit comfortably under the
+            // event bound. Returning None is safer than emitting an invalid
+            // event if a future schema change makes that assumption false.
+            return None;
+        }
+    };
+
+    let actor = events
+        .first()
+        .and_then(WorldEvent::actor)
+        .filter(|actor| events.iter().all(|event| event.actor() == Some(*actor)));
+    let event = WorldEvent::derived_from(
+        parent,
+        Utc::now(),
+        parent.scope(),
+        EventPriority::High,
+        WorldEventKind::ToolCompleted(crate::ToolCompletedEvent {
+            operation: "core.tool_batch".to_owned(),
+            output,
+            requires_follow_up: true,
+        }),
+        max_trace_depth,
+    )
+    .ok()?;
+    Some(match actor {
+        Some(actor) => event.with_actor(actor),
+        None => event,
+    })
+}
+
+fn serialize_tool_batch(
+    events: &[WorldEvent],
+    operation_limit: usize,
+    field_limit: usize,
+) -> Option<String> {
+    let results = events
+        .iter()
+        .map(|event| {
+            let mut result = serde_json::Map::new();
+            match event.kind() {
+                WorldEventKind::ToolCompleted(tool) => {
+                    result.insert(
+                        "operation".to_owned(),
+                        serde_json::Value::String(bounded_tool_batch_text(
+                            &tool.operation,
+                            operation_limit,
+                        )),
+                    );
+                    result.insert(
+                        "status".to_owned(),
+                        serde_json::Value::String("completed".to_owned()),
+                    );
+                    result.insert(
+                        "output".to_owned(),
+                        serde_json::Value::String(bounded_tool_batch_text(
+                            &tool.output,
+                            field_limit,
+                        )),
+                    );
+                    result.insert("error".to_owned(), serde_json::Value::Null);
+                }
+                WorldEventKind::ToolFailed(tool) => {
+                    result.insert(
+                        "operation".to_owned(),
+                        serde_json::Value::String(bounded_tool_batch_text(
+                            &tool.operation,
+                            operation_limit,
+                        )),
+                    );
+                    result.insert(
+                        "status".to_owned(),
+                        serde_json::Value::String("failed".to_owned()),
+                    );
+                    result.insert(
+                        "output".to_owned(),
+                        serde_json::Value::String(String::new()),
+                    );
+                    let mut error = serde_json::Map::new();
+                    error.insert(
+                        "category".to_owned(),
+                        serde_json::Value::String(bounded_tool_batch_text(
+                            &tool.error_category,
+                            field_limit,
+                        )),
+                    );
+                    error.insert(
+                        "detail".to_owned(),
+                        serde_json::Value::String(bounded_tool_batch_text(
+                            &tool.detail,
+                            field_limit,
+                        )),
+                    );
+                    result.insert("error".to_owned(), serde_json::Value::Object(error));
+                }
+                _ => return None,
+            }
+            Some(serde_json::Value::Object(result))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    serde_json::to_string(&serde_json::json!({ "results": results })).ok()
+}
+
+fn bounded_tool_batch_text(value: &str, max_chars: usize) -> String {
+    bounded_tool_text(value, max_chars, MAX_TOOL_RESULT_BYTES)
+}
+
+fn bounded_tool_text(value: &str, max_chars: usize, max_bytes: usize) -> String {
+    let mut bounded = String::with_capacity(value.len().min(max_bytes));
+    for character in value.chars().take(max_chars) {
+        if bounded.len().saturating_add(character.len_utf8()) > max_bytes {
+            break;
+        }
+        bounded.push(character);
+    }
+    bounded
+}
+
+fn bounded_single_tool_follow_up_event(
+    parent: &WorldEvent,
+    event: WorldEvent,
+    max_trace_depth: u8,
+) -> Option<WorldEvent> {
+    if event.validate(max_trace_depth).is_ok() {
+        return Some(event);
+    }
+
+    let kind = match event.kind() {
+        WorldEventKind::ToolCompleted(tool) => {
+            WorldEventKind::ToolCompleted(crate::ToolCompletedEvent {
+                operation: bounded_tool_text(
+                    &tool.operation,
+                    MAX_TOOL_BATCH_OPERATION_CHARS,
+                    MAX_TOOL_OPERATION_BYTES,
+                ),
+                output: bounded_tool_text(
+                    &tool.output,
+                    MAX_TOOL_RESULT_CHARS,
+                    MAX_TOOL_RESULT_BYTES,
+                ),
+                requires_follow_up: tool.requires_follow_up,
+            })
+        }
+        WorldEventKind::ToolFailed(tool) => WorldEventKind::ToolFailed(crate::ToolFailedEvent {
+            operation: bounded_tool_text(
+                &tool.operation,
+                MAX_TOOL_BATCH_OPERATION_CHARS,
+                MAX_TOOL_OPERATION_BYTES,
+            ),
+            error_category: bounded_tool_text(
+                &tool.error_category,
+                MAX_TOOL_BATCH_OPERATION_CHARS,
+                MAX_TOOL_ERROR_CATEGORY_BYTES,
+            ),
+            detail: bounded_tool_text(
+                &tool.detail,
+                crate::MAX_TOOL_ERROR_DETAIL_CHARS,
+                crate::MAX_TOOL_ERROR_DETAIL_BYTES,
+            ),
+            requires_follow_up: tool.requires_follow_up,
+        }),
+        _ => return None,
+    };
+    let actor = event.actor();
+    let bounded = WorldEvent::derived_from(
+        parent,
+        event.occurred_at(),
+        event.scope(),
+        event.priority(),
+        kind,
+        max_trace_depth,
+    )
+    .ok()?;
+    bounded.validate(max_trace_depth).ok()?;
+    Some(match actor {
+        Some(actor) => bounded.with_actor(actor),
+        None => bounded,
+    })
 }
 
 fn tool_event_requires_follow_up(event: &WorldEvent) -> bool {
     match event.kind() {
-        crate::WorldEventKind::ToolCompleted(tool) => tool.requires_follow_up,
-        crate::WorldEventKind::ToolFailed(tool) => tool.requires_follow_up,
+        WorldEventKind::ToolCompleted(tool) => tool.requires_follow_up,
+        WorldEventKind::ToolFailed(tool) => tool.requires_follow_up,
         _ => false,
     }
 }
@@ -1960,13 +2635,15 @@ mod tests {
     use super::{
         Admission, CognitiveRuntime, DataErasureError, MAX_DATA_ERASURE_CONVERSATIONS,
         MAX_GOALS_PER_CONTEXT_OWNER, PlannedProcessingOutcome, ProcessingOutcome, RuntimeConfig,
-        RuntimeConfigError, SubmitError, apply_due_action_idempotency,
-        apply_event_action_idempotency, bounded_conversation_ids, message_sent_event,
+        RuntimeConfigError, SubmitError, aggregate_tool_follow_up_events,
+        apply_due_action_idempotency, apply_event_action_idempotency, bounded_conversation_ids,
+        duplicate_action_already_succeeded, message_sent_event, tool_follow_up_event,
         validate_intent_targets,
     };
     use crate::arbiter::{
         ActionArbiter, ActionArbiterConfig, ActionPort, ActionPortFuture, ActionPortOutcome,
-        ActionReceipt, ActionRejection, ActionResult, EnvironmentCapabilities,
+        ActionPortReleaseFuture, ActionReceipt, ActionRejection, ActionResult,
+        EnvironmentCapabilities,
     };
     use crate::event::{
         EventPriority, EventScope, EventValidationError, GoalUpdatedEvent,
@@ -2135,6 +2812,170 @@ mod tests {
         }
     }
 
+    struct ToolWithInvalidStateModel {
+        conversation_id: ConversationId,
+        foreign_conversation_id: ConversationId,
+    }
+
+    impl ModelBackend for ToolWithInvalidStateModel {
+        fn plan<'a>(&'a self, _input: &'a PlannerInput) -> ModelBackendFuture<'a> {
+            let conversation_id = self.conversation_id;
+            let foreign_conversation_id = self.foreign_conversation_id;
+            Box::pin(async move {
+                Ok(DecisionPlan::new(DecisionDisposition::SpecialAction)
+                    .with_intent(crate::CognitiveIntent::use_tool(
+                        "calculator",
+                        r#"{"expression":"1+1"}"#,
+                        crate::ActionScope::Conversation(conversation_id),
+                    ))
+                    // This target is deliberately outside the incoming
+                    // conversation. Runtime preflight must reject it before
+                    // dispatching the tool, then release the capability.
+                    .with_state_update(StateUpdateProposal::SetTopic {
+                        conversation_id: foreign_conversation_id,
+                        topic: "invalid target".to_owned(),
+                    }))
+            })
+        }
+    }
+
+    struct BudgetProbeModel {
+        conversation_id: ConversationId,
+        saw_tool_capability: Arc<Mutex<Option<bool>>>,
+    }
+
+    impl ModelBackend for BudgetProbeModel {
+        fn plan<'a>(&'a self, input: &'a PlannerInput) -> ModelBackendFuture<'a> {
+            *self.saw_tool_capability.lock().expect("budget probe lock") =
+                Some(input.supports(crate::ActionCapability::UseTool));
+            let conversation_id = self.conversation_id;
+            Box::pin(async move {
+                Ok(
+                    DecisionPlan::new(DecisionDisposition::SpecialAction).with_intent(
+                        crate::CognitiveIntent::use_tool(
+                            "calculator",
+                            r#"{"expression":"1+1"}"#,
+                            crate::ActionScope::Conversation(conversation_id),
+                        ),
+                    ),
+                )
+            })
+        }
+    }
+
+    struct MultiToolModel {
+        conversation_id: ConversationId,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ModelBackend for MultiToolModel {
+        fn plan<'a>(&'a self, input: &'a PlannerInput) -> ModelBackendFuture<'a> {
+            let call_number = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            let conversation_id = self.conversation_id;
+            let plan = match input.event.kind() {
+                WorldEventKind::MessageReceived(_) => {
+                    DecisionPlan::new(DecisionDisposition::SpecialAction)
+                        .with_intent(crate::CognitiveIntent::use_tool(
+                            "weather.current",
+                            r#"{"location":"成都"}"#,
+                            crate::ActionScope::Conversation(conversation_id),
+                        ))
+                        .with_intent(crate::CognitiveIntent::use_tool(
+                            "web.search",
+                            r#"{"query":"猫眼星云"}"#,
+                            crate::ActionScope::Conversation(conversation_id),
+                        ))
+                }
+                WorldEventKind::ToolCompleted(tool) => {
+                    assert_eq!(call_number, 2);
+                    assert_eq!(tool.operation, "core.tool_batch");
+                    let payload: serde_json::Value =
+                        serde_json::from_str(&tool.output).expect("tool batch JSON");
+                    let results = payload
+                        .get("results")
+                        .and_then(serde_json::Value::as_array)
+                        .expect("tool batch results");
+                    assert_eq!(results.len(), 2);
+                    let operations = results
+                        .iter()
+                        .filter_map(|result| {
+                            result.get("operation").and_then(serde_json::Value::as_str)
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(operations, ["weather.current", "web.search"]);
+                    assert!(results.iter().all(|result| {
+                        result.get("status").is_some()
+                            && result.get("output").is_some()
+                            && result.get("error").is_some()
+                    }));
+                    DecisionPlan::new(DecisionDisposition::Reply).with_intent(
+                        crate::CognitiveIntent::send_message(
+                            conversation_id,
+                            MessageContent::text("已整理查询结果"),
+                        ),
+                    )
+                }
+                WorldEventKind::ToolFailed(_) => {
+                    panic!("multi-tool test should aggregate failures too")
+                }
+                _ => DecisionPlan::silent(),
+            };
+            Box::pin(async move { Ok(plan) })
+        }
+    }
+
+    struct MixedOutcomeToolModel {
+        conversation_id: ConversationId,
+        expected_statuses: Vec<&'static str>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ModelBackend for MixedOutcomeToolModel {
+        fn plan<'a>(&'a self, input: &'a PlannerInput) -> ModelBackendFuture<'a> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let conversation_id = self.conversation_id;
+            let expected_statuses = self.expected_statuses.clone();
+            let plan = match input.event.kind() {
+                WorldEventKind::MessageReceived(_) => {
+                    DecisionPlan::new(DecisionDisposition::SpecialAction)
+                        .with_intent(crate::CognitiveIntent::use_tool(
+                            "weather.current",
+                            r#"{"location":"成都"}"#,
+                            crate::ActionScope::Conversation(conversation_id),
+                        ))
+                        .with_intent(crate::CognitiveIntent::use_tool(
+                            "web.search",
+                            r#"{"query":"猫眼星云"}"#,
+                            crate::ActionScope::Conversation(conversation_id),
+                        ))
+                }
+                WorldEventKind::ToolCompleted(tool) => {
+                    assert_eq!(tool.operation, "core.tool_batch");
+                    let payload: serde_json::Value =
+                        serde_json::from_str(&tool.output).expect("tool batch JSON");
+                    let statuses = payload
+                        .get("results")
+                        .and_then(serde_json::Value::as_array)
+                        .expect("tool batch results")
+                        .iter()
+                        .filter_map(|result| {
+                            result.get("status").and_then(serde_json::Value::as_str)
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(statuses, expected_statuses);
+                    DecisionPlan::new(DecisionDisposition::Reply).with_intent(
+                        crate::CognitiveIntent::send_message(
+                            conversation_id,
+                            MessageContent::text("已整理查询结果"),
+                        ),
+                    )
+                }
+                _ => DecisionPlan::silent(),
+            };
+            Box::pin(async move { Ok(plan) })
+        }
+    }
+
     struct ToolFollowUpModel {
         conversation_id: ConversationId,
         calls: Arc<AtomicUsize>,
@@ -2143,7 +2984,7 @@ mod tests {
 
     impl ModelBackend for ToolFollowUpModel {
         fn plan<'a>(&'a self, input: &'a PlannerInput) -> ModelBackendFuture<'a> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
+            let call_number = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
             let conversation_id = self.conversation_id;
             let plan = match input.event.kind() {
                 WorldEventKind::MessageReceived(_) => {
@@ -2159,8 +3000,11 @@ mod tests {
                 WorldEventKind::ToolCompleted(tool) => {
                     assert!(tool.requires_follow_up);
                     assert_eq!(tool.output, "2");
-                    assert!(!input.supports(crate::ActionCapability::UseTool));
-                    if self.recurse_on_result {
+                    assert!(input.supports(crate::ActionCapability::UseTool));
+                    // Exercise one bounded tool chain, then finish with a
+                    // visible reply so the test does not rely on trace-limit
+                    // exhaustion to terminate.
+                    if self.recurse_on_result && call_number == 2 {
                         DecisionPlan::new(DecisionDisposition::SpecialAction).with_intent(
                             crate::CognitiveIntent::use_tool(
                                 "calculator",
@@ -2304,6 +3148,53 @@ mod tests {
         }
     }
 
+    struct CountingPort {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ActionPort for CountingPort {
+        fn execute<'a>(&'a self, _action: &'a crate::ProposedAction) -> ActionPortFuture<'a> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {
+                Ok(ActionPortOutcome::ToolCompleted {
+                    operation: "calculator".to_owned(),
+                    output: "2".to_owned(),
+                })
+            })
+        }
+    }
+
+    struct ReleaseRecordingPort {
+        calls: Arc<AtomicUsize>,
+        released_keys: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl ActionPort for ReleaseRecordingPort {
+        fn execute<'a>(&'a self, _action: &'a crate::ProposedAction) -> ActionPortFuture<'a> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {
+                Ok(ActionPortOutcome::ToolCompleted {
+                    operation: "calculator".to_owned(),
+                    output: "2".to_owned(),
+                })
+            })
+        }
+
+        fn release_unexecuted<'a>(
+            &'a self,
+            action: &'a crate::ProposedAction,
+        ) -> ActionPortReleaseFuture<'a> {
+            Box::pin(async move {
+                if let Some(key) = action.idempotency_key() {
+                    self.released_keys
+                        .lock()
+                        .expect("released key recorder lock")
+                        .push(key.to_owned());
+                }
+            })
+        }
+    }
+
     struct ToolThenDeliveryPort {
         calls: Arc<AtomicUsize>,
     }
@@ -2326,6 +3217,57 @@ mod tests {
                 },
             };
             Box::pin(async move { Ok(outcome) })
+        }
+    }
+
+    struct MixedToolPort {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ActionPort for MixedToolPort {
+        fn execute<'a>(&'a self, action: &'a crate::ProposedAction) -> ActionPortFuture<'a> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let outcome = match action {
+                crate::ProposedAction::UseTool(tool) if tool.tool_name == "weather.current" => {
+                    ActionPortOutcome::ToolCompleted {
+                        operation: tool.tool_name.clone(),
+                        output: "晴".to_owned(),
+                    }
+                }
+                crate::ProposedAction::UseTool(_) => ActionPortOutcome::Deferred {
+                    reason: "search temporarily unavailable".to_owned(),
+                },
+                crate::ProposedAction::SendMessage(send) => ActionPortOutcome::Delivered {
+                    external_reference: Some("fake-message".to_owned()),
+                    message_id: Some(MessageId::new()),
+                    conversation_id: Some(send.conversation_id),
+                },
+                _ => ActionPortOutcome::Deferred {
+                    reason: "unexpected_action".to_owned(),
+                },
+            };
+            Box::pin(async move { Ok(outcome) })
+        }
+    }
+
+    struct AllFailedToolPort {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ActionPort for AllFailedToolPort {
+        fn execute<'a>(&'a self, action: &'a crate::ProposedAction) -> ActionPortFuture<'a> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if matches!(action, crate::ProposedAction::UseTool(_)) {
+                Box::pin(async { Err(crate::ActionPortError::new("upstream_unavailable", true)) })
+            } else {
+                Box::pin(async {
+                    Ok(ActionPortOutcome::Delivered {
+                        external_reference: Some("fake-message".to_owned()),
+                        message_id: Some(MessageId::new()),
+                        conversation_id: None,
+                    })
+                })
+            }
         }
     }
 
@@ -3074,8 +4016,726 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tool_follow_up_cannot_recursively_invoke_another_tool() {
+    async fn one_core_turn_dispatches_multiple_tool_intents() {
         let conversation_id = ConversationId::new();
+        let sender = PersonId::new();
+        let model_calls = Arc::new(AtomicUsize::new(0));
+        let (_handle, mut runtime) = CognitiveRuntime::new_with_services(
+            RuntimeConfig::default(),
+            CoreServices::with_model(MultiToolModel {
+                conversation_id,
+                calls: Arc::clone(&model_calls),
+            }),
+        )
+        .expect("valid runtime");
+        let arbiter = ActionArbiter::new(
+            ActionArbiterConfig::default().with_capabilities(EnvironmentCapabilities::all()),
+        );
+        let port_calls = Arc::new(AtomicUsize::new(0));
+        let port = ToolThenDeliveryPort {
+            calls: Arc::clone(&port_calls),
+        };
+
+        let outcome = runtime
+            .process_event_with_planner_and_actions(
+                direct_message(conversation_id, sender),
+                &arbiter,
+                &port,
+            )
+            .await
+            .expect("multiple tool intents should dispatch");
+        let keys = match &outcome {
+            PlannedProcessingOutcome::Planned { actions, .. } => actions
+                .iter()
+                .filter_map(|action| match action {
+                    ActionResult::Executed { receipt, .. } => receipt.idempotency_key.clone(),
+                    ActionResult::Rejected(_)
+                    | ActionResult::Failed { .. }
+                    | ActionResult::Noop => None,
+                })
+                .collect::<Vec<_>>(),
+            _ => Vec::new(),
+        };
+        assert!(matches!(
+            outcome,
+            PlannedProcessingOutcome::Planned { actions, .. } if actions.len() == 2
+        ));
+        assert_eq!(keys.len(), 2);
+        assert_ne!(keys[0], keys[1]);
+        assert_eq!(runtime.pending_tool_follow_ups.len(), 1);
+        assert_eq!(model_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(port_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            runtime
+                .pending_tool_follow_ups
+                .front()
+                .and_then(WorldEvent::actor),
+            Some(sender)
+        );
+        let follow_up = runtime
+            .process_next_with_planner_and_actions(&arbiter, &port)
+            .await
+            .expect("aggregated tool result should be queued")
+            .expect("aggregated follow-up planning should succeed");
+        assert!(matches!(
+            follow_up,
+            PlannedProcessingOutcome::Planned {
+                actions,
+                ..
+            } if matches!(
+                actions.as_slice(),
+                [ActionResult::Executed {
+                    outcome: ActionPortOutcome::Delivered { .. },
+                    ..
+                }]
+            )
+        ));
+        assert!(runtime.pending_tool_follow_ups.is_empty());
+        assert_eq!(model_calls.load(Ordering::SeqCst), 2);
+        // Two tool executions and exactly one final visible delivery.
+        assert_eq!(port_calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn mixed_tool_success_and_deferred_results_share_one_follow_up() {
+        let conversation_id = ConversationId::new();
+        let sender = PersonId::new();
+        let model_calls = Arc::new(AtomicUsize::new(0));
+        let (_handle, mut runtime) = CognitiveRuntime::new_with_services(
+            RuntimeConfig::default(),
+            CoreServices::with_model(MixedOutcomeToolModel {
+                conversation_id,
+                expected_statuses: vec!["completed", "failed"],
+                calls: Arc::clone(&model_calls),
+            }),
+        )
+        .expect("valid runtime");
+        let arbiter = ActionArbiter::new(
+            ActionArbiterConfig::default().with_capabilities(EnvironmentCapabilities::all()),
+        );
+        let port_calls = Arc::new(AtomicUsize::new(0));
+        let port = MixedToolPort {
+            calls: Arc::clone(&port_calls),
+        };
+
+        let first = runtime
+            .process_event_with_planner_and_actions(
+                direct_message(conversation_id, sender),
+                &arbiter,
+                &port,
+            )
+            .await
+            .expect("mixed tool turn should execute");
+        assert!(matches!(
+            first,
+            PlannedProcessingOutcome::Planned { actions, .. }
+                if actions.len() == 2
+                    && matches!(
+                        actions[0],
+                        ActionResult::Executed {
+                            outcome: ActionPortOutcome::ToolCompleted { .. },
+                            ..
+                        }
+                    )
+                    && matches!(
+                        actions[1],
+                        ActionResult::Executed {
+                            outcome: ActionPortOutcome::Deferred { .. },
+                            ..
+                        }
+                    )
+        ));
+        assert_eq!(runtime.pending_tool_follow_ups.len(), 1);
+
+        let second = runtime
+            .process_next_with_planner_and_actions(&arbiter, &port)
+            .await
+            .expect("mixed result should be queued")
+            .expect("mixed follow-up should plan");
+        assert!(matches!(
+            second,
+            PlannedProcessingOutcome::Planned {
+                actions,
+                observation,
+                ..
+            } if observation.event_type == crate::EventType::ToolCompleted
+                && matches!(
+                    actions.as_slice(),
+                    [ActionResult::Executed {
+                        outcome: ActionPortOutcome::Delivered { .. },
+                        ..
+                    }]
+                )
+        ));
+        assert!(runtime.pending_tool_follow_ups.is_empty());
+        assert_eq!(model_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(port_calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn all_failed_tool_results_still_share_one_follow_up() {
+        let conversation_id = ConversationId::new();
+        let sender = PersonId::new();
+        let model_calls = Arc::new(AtomicUsize::new(0));
+        let (_handle, mut runtime) = CognitiveRuntime::new_with_services(
+            RuntimeConfig::default(),
+            CoreServices::with_model(MixedOutcomeToolModel {
+                conversation_id,
+                expected_statuses: vec!["failed", "failed"],
+                calls: Arc::clone(&model_calls),
+            }),
+        )
+        .expect("valid runtime");
+        let arbiter = ActionArbiter::new(
+            ActionArbiterConfig::default().with_capabilities(EnvironmentCapabilities::all()),
+        );
+        let port_calls = Arc::new(AtomicUsize::new(0));
+        let port = AllFailedToolPort {
+            calls: Arc::clone(&port_calls),
+        };
+
+        let first = runtime
+            .process_event_with_planner_and_actions(
+                direct_message(conversation_id, sender),
+                &arbiter,
+                &port,
+            )
+            .await
+            .expect("all-failed tool turn should return actions");
+        assert!(matches!(
+            first,
+            PlannedProcessingOutcome::Planned { actions, .. }
+                if actions.len() == 2
+                    && actions
+                        .iter()
+                        .all(|action| matches!(action, ActionResult::Failed { .. }))
+        ));
+        assert_eq!(runtime.pending_tool_follow_ups.len(), 1);
+
+        let second = runtime
+            .process_next_with_planner_and_actions(&arbiter, &port)
+            .await
+            .expect("all-failed result should be queued")
+            .expect("all-failed follow-up should plan");
+        assert!(matches!(
+            second,
+            PlannedProcessingOutcome::Planned { actions, .. }
+                if matches!(
+                    actions.as_slice(),
+                    [ActionResult::Executed {
+                        outcome: ActionPortOutcome::Delivered { .. },
+                        ..
+                    }]
+                )
+        ));
+        assert!(runtime.pending_tool_follow_ups.is_empty());
+        assert_eq!(model_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(port_calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn aggregated_tool_follow_up_is_structured_and_bounded() {
+        let conversation_id = ConversationId::new();
+        let sender = PersonId::new();
+        let parent = direct_message(conversation_id, sender);
+        let completed = WorldEvent::derived_from(
+            &parent,
+            Utc::now(),
+            EventScope::Conversation { conversation_id },
+            EventPriority::High,
+            WorldEventKind::ToolCompleted(crate::ToolCompletedEvent {
+                operation: "weather.current".to_owned(),
+                output: "晴".repeat(crate::MAX_TOOL_RESULT_CHARS),
+                requires_follow_up: true,
+            }),
+            8,
+        )
+        .expect("completed event");
+        let failed = WorldEvent::derived_from(
+            &parent,
+            Utc::now(),
+            EventScope::Conversation { conversation_id },
+            EventPriority::High,
+            WorldEventKind::ToolFailed(crate::ToolFailedEvent {
+                operation: "web.search".to_owned(),
+                error_category: "upstream_timeout".to_owned(),
+                detail: "e".repeat(crate::MAX_TOOL_ERROR_DETAIL_CHARS),
+                requires_follow_up: true,
+            }),
+            8,
+        )
+        .expect("failed event");
+        let aggregate = aggregate_tool_follow_up_events(
+            &parent,
+            vec![completed.with_actor(sender), failed.with_actor(sender)],
+            8,
+        )
+        .expect("aggregate event");
+        assert_eq!(aggregate.actor(), Some(sender));
+        assert!(aggregate.validate(8).is_ok());
+        let WorldEventKind::ToolCompleted(tool) = aggregate.kind() else {
+            panic!("aggregate must be a completed tool event");
+        };
+        assert_eq!(tool.operation, "core.tool_batch");
+        assert!(tool.output.len() <= crate::MAX_TOOL_RESULT_BYTES);
+        assert!(tool.output.chars().count() <= crate::MAX_TOOL_RESULT_CHARS);
+        let payload: serde_json::Value =
+            serde_json::from_str(&tool.output).expect("aggregate output JSON");
+        let results = payload
+            .get("results")
+            .and_then(serde_json::Value::as_array)
+            .expect("aggregate results");
+        assert_eq!(results.len(), 2);
+        assert_eq!(
+            results[0]
+                .get("operation")
+                .and_then(serde_json::Value::as_str),
+            Some("weather.current")
+        );
+        assert_eq!(
+            results[0].get("status").and_then(serde_json::Value::as_str),
+            Some("completed")
+        );
+        assert!(results[0].get("output").is_some());
+        assert!(results[0].get("error").is_some());
+        assert_eq!(
+            results[1]
+                .get("operation")
+                .and_then(serde_json::Value::as_str),
+            Some("web.search")
+        );
+        assert_eq!(
+            results[1].get("status").and_then(serde_json::Value::as_str),
+            Some("failed")
+        );
+        assert!(results[1].get("output").is_some());
+        assert!(results[1].get("error").is_some());
+    }
+
+    #[test]
+    fn single_tool_follow_up_is_normalized_to_utf8_byte_limits() {
+        let conversation_id = ConversationId::new();
+        let sender = PersonId::new();
+        let parent = direct_message(conversation_id, sender);
+        let valid = WorldEvent::derived_from(
+            &parent,
+            Utc::now(),
+            EventScope::Conversation { conversation_id },
+            EventPriority::High,
+            WorldEventKind::ToolCompleted(crate::ToolCompletedEvent {
+                operation: "weather.current".to_owned(),
+                output: "晴".to_owned(),
+                requires_follow_up: true,
+            }),
+            8,
+        )
+        .expect("valid tool event")
+        .with_actor(sender);
+        let valid_id = valid.id();
+        let preserved = aggregate_tool_follow_up_events(&parent, vec![valid], 8)
+            .expect("valid single completion should be preserved");
+        assert_eq!(preserved.id(), valid_id);
+
+        let oversized_completed = WorldEvent::derived_from(
+            &parent,
+            Utc::now(),
+            EventScope::Conversation { conversation_id },
+            EventPriority::High,
+            WorldEventKind::ToolCompleted(crate::ToolCompletedEvent {
+                operation: "x".repeat(2_000),
+                output: "🌟".repeat(crate::MAX_TOOL_RESULT_CHARS + 1),
+                requires_follow_up: true,
+            }),
+            8,
+        )
+        .expect("trace should derive even before payload normalization")
+        .with_actor(sender);
+        assert!(oversized_completed.validate(8).is_err());
+
+        let completed = aggregate_tool_follow_up_events(&parent, vec![oversized_completed], 8)
+            .expect("single completion should be normalized");
+        assert_eq!(completed.actor(), Some(sender));
+        completed
+            .validate(8)
+            .expect("normalized completion must validate");
+        let WorldEventKind::ToolCompleted(tool) = completed.kind() else {
+            panic!("completion kind must be preserved");
+        };
+        assert!(tool.operation.len() <= super::MAX_TOOL_OPERATION_BYTES);
+        assert!(tool.output.len() <= crate::MAX_TOOL_RESULT_BYTES);
+        assert!(tool.output.chars().count() <= crate::MAX_TOOL_RESULT_CHARS);
+
+        let oversized_failed = WorldEvent::derived_from(
+            &parent,
+            Utc::now(),
+            EventScope::Conversation { conversation_id },
+            EventPriority::High,
+            WorldEventKind::ToolFailed(crate::ToolFailedEvent {
+                operation: "web.search".to_owned(),
+                error_category: "🔥".repeat(128),
+                detail: "🌟".repeat(crate::MAX_TOOL_ERROR_DETAIL_CHARS + 1),
+                requires_follow_up: true,
+            }),
+            8,
+        )
+        .expect("trace should derive even before payload normalization");
+        assert!(oversized_failed.validate(8).is_err());
+
+        let failed = aggregate_tool_follow_up_events(&parent, vec![oversized_failed], 8)
+            .expect("single failure should be normalized");
+        failed
+            .validate(8)
+            .expect("normalized failure must validate");
+        let WorldEventKind::ToolFailed(tool) = failed.kind() else {
+            panic!("failure kind must be preserved");
+        };
+        assert!(tool.error_category.len() <= super::MAX_TOOL_ERROR_CATEGORY_BYTES);
+        assert!(tool.detail.len() <= crate::MAX_TOOL_ERROR_DETAIL_BYTES);
+        assert!(tool.detail.chars().count() <= crate::MAX_TOOL_ERROR_DETAIL_CHARS);
+    }
+
+    #[test]
+    fn successful_duplicate_tool_action_does_not_become_a_false_failure() {
+        let result = ActionResult::Rejected(ActionRejection::Duplicate {
+            action_id: None,
+            idempotency_key: "duplicate-tool".to_owned(),
+            original_action_id: crate::ActionId::new(),
+        });
+        assert!(duplicate_action_already_succeeded(
+            &result,
+            Some(crate::arbiter::AdmittedTerminal::Succeeded)
+        ));
+        assert!(!duplicate_action_already_succeeded(
+            &result,
+            Some(crate::arbiter::AdmittedTerminal::Failed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn tool_budget_is_exposed_and_enforced_per_root_trace() {
+        let conversation_id = ConversationId::new();
+        let sender = PersonId::new();
+        let saw_tool_capability = Arc::new(Mutex::new(None));
+        let (_handle, mut runtime) = CognitiveRuntime::new_with_services(
+            RuntimeConfig::default(),
+            CoreServices::with_model(BudgetProbeModel {
+                conversation_id,
+                saw_tool_capability: Arc::clone(&saw_tool_capability),
+            }),
+        )
+        .expect("valid runtime");
+        let event = direct_message(conversation_id, sender);
+        runtime
+            .reserve_tool_actions(&event, super::MAX_TOOL_ACTIONS_PER_TRACE)
+            .expect("preload the root trace budget");
+        let arbiter = ActionArbiter::new(
+            ActionArbiterConfig::default().with_capabilities(EnvironmentCapabilities::all()),
+        );
+        let port_calls = Arc::new(AtomicUsize::new(0));
+        let port = CountingPort {
+            calls: Arc::clone(&port_calls),
+        };
+
+        let result = runtime
+            .process_event_with_planner_and_actions(event.clone(), &arbiter, &port)
+            .await;
+        assert!(matches!(
+            result,
+            Err(PlannerError::InvalidOutput(
+                crate::PlannerOutputValidationError::ToolActionBudgetExceeded {
+                    used,
+                    requested: 1,
+                    maximum,
+                }
+            )) if used == super::MAX_TOOL_ACTIONS_PER_TRACE
+                && maximum == super::MAX_TOOL_ACTIONS_PER_TRACE
+        ));
+        assert_eq!(
+            *saw_tool_capability.lock().expect("budget probe lock"),
+            Some(false)
+        );
+        assert_eq!(port_calls.load(Ordering::SeqCst), 0);
+
+        assert_eq!(
+            runtime.tool_actions_used(&event),
+            super::MAX_TOOL_ACTIONS_PER_TRACE
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_preflight_releases_materialized_tool_capabilities() {
+        let conversation_id = ConversationId::new();
+        let sender = PersonId::new();
+        let event = direct_message(conversation_id, sender);
+        let expected_key = crate::event_action_idempotency_key(event.id(), 0);
+        let (_handle, mut runtime) = CognitiveRuntime::new_with_services(
+            RuntimeConfig::default(),
+            CoreServices::with_model(ToolWithInvalidStateModel {
+                conversation_id,
+                foreign_conversation_id: ConversationId::new(),
+            }),
+        )
+        .expect("valid runtime");
+        let arbiter = ActionArbiter::new(
+            ActionArbiterConfig::default().with_capabilities(EnvironmentCapabilities::all()),
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let released_keys = Arc::new(Mutex::new(Vec::new()));
+        let port = ReleaseRecordingPort {
+            calls: Arc::clone(&calls),
+            released_keys: Arc::clone(&released_keys),
+        };
+
+        let result = runtime
+            .process_event_with_planner_and_actions(event, &arbiter, &port)
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(PlannerError::StateUpdate {
+                kind: "set_topic",
+                applied_before_failure: 0,
+                ..
+            })
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            released_keys
+                .lock()
+                .expect("released key recorder lock")
+                .as_slice(),
+            &[expected_key]
+        );
+    }
+
+    #[test]
+    fn every_noncompletion_tool_result_becomes_a_failed_batch_record() {
+        let conversation_id = ConversationId::new();
+        let sender = PersonId::new();
+        let parent = direct_message(conversation_id, sender);
+        let action = crate::ProposedAction::use_tool(
+            "web.search",
+            r#"{"query":"猫眼星云"}"#,
+            crate::ActionScope::Conversation(conversation_id),
+        )
+        .expect("valid tool action")
+        .with_actor(sender);
+        let receipt = ActionReceipt {
+            action_id: action.action_id(),
+            idempotency_key: action.idempotency_key().map(ToOwned::to_owned),
+            admitted_at: Utc::now(),
+        };
+        let results = [
+            ActionResult::Executed {
+                receipt: receipt.clone(),
+                outcome: ActionPortOutcome::Deferred {
+                    reason: "tool_turn_capability_missing".to_owned(),
+                },
+            },
+            ActionResult::Failed {
+                receipt,
+                error: crate::ActionPortError::new("upstream_unavailable", true),
+            },
+            ActionResult::Rejected(ActionRejection::CapabilityUnavailable {
+                action_id: action.action_id(),
+                capability: crate::ActionCapability::UseTool,
+            }),
+            ActionResult::Noop,
+        ];
+        let failure_events = results
+            .iter()
+            .map(|result| {
+                let event = tool_follow_up_event(&parent, &action, result, 8)
+                    .expect("tool result should become a follow-up event");
+                event.validate(8).expect("failure event must be valid");
+                assert_eq!(event.actor(), Some(sender));
+                let WorldEventKind::ToolFailed(tool) = event.kind() else {
+                    panic!("noncompletion tool result must become ToolFailed");
+                };
+                assert_eq!(tool.operation, "web.search");
+                assert!(tool.requires_follow_up);
+                event
+            })
+            .collect::<Vec<_>>();
+
+        let batch = aggregate_tool_follow_up_events(&parent, failure_events, 8)
+            .expect("failed tool outcomes should aggregate");
+        let WorldEventKind::ToolCompleted(tool) = batch.kind() else {
+            panic!("a failed tool batch must use a completed envelope");
+        };
+        let payload: serde_json::Value =
+            serde_json::from_str(&tool.output).expect("batch output must be JSON");
+        let results = payload
+            .get("results")
+            .and_then(serde_json::Value::as_array)
+            .expect("batch results");
+        assert_eq!(results.len(), 4);
+        assert!(results.iter().all(|result| result["status"] == "failed"));
+        assert!(
+            results
+                .iter()
+                .all(|result| result["operation"] == "web.search")
+        );
+    }
+
+    #[test]
+    fn full_budget_ledger_never_resets_an_existing_trace() {
+        let conversation_id = ConversationId::new();
+        let sender = PersonId::new();
+        let mut runtime = CognitiveRuntime::new(RuntimeConfig::default())
+            .expect("valid runtime")
+            .1;
+        let retained_root = direct_message(conversation_id, sender);
+        runtime
+            .reserve_tool_actions(&retained_root, 1)
+            .expect("root budget should reserve");
+        let pending = WorldEvent::derived_from(
+            &retained_root,
+            Utc::now(),
+            retained_root.scope(),
+            EventPriority::High,
+            WorldEventKind::ToolCompleted(crate::ToolCompletedEvent {
+                operation: "web.search".to_owned(),
+                output: "结果".to_owned(),
+                requires_follow_up: true,
+            }),
+            8,
+        )
+        .expect("pending event should be valid");
+        runtime.pending_tool_follow_ups.push_back(pending);
+
+        for _ in 0..super::MAX_TOOL_TRACE_BUDGET_ENTRIES.saturating_sub(1) {
+            let root = direct_message(conversation_id, sender);
+            runtime
+                .reserve_tool_actions(&root, 1)
+                .expect("fresh root budget should reserve");
+        }
+        assert_eq!(
+            runtime.tool_action_budget_by_trace.len(),
+            super::MAX_TOOL_TRACE_BUDGET_ENTRIES
+        );
+        for _ in 0..8 {
+            let new_root = direct_message(conversation_id, sender);
+            assert_eq!(runtime.tool_actions_remaining(&new_root), 0);
+            assert!(matches!(
+                runtime.reserve_tool_actions(&new_root, 1),
+                Err(PlannerError::InvalidOutput(
+                    crate::PlannerOutputValidationError::ToolActionBudgetExceeded {
+                        used,
+                        requested: 1,
+                        maximum,
+                    }
+                )) if used == super::MAX_TOOL_ACTIONS_PER_TRACE
+                    && maximum == super::MAX_TOOL_ACTIONS_PER_TRACE
+            ));
+        }
+
+        // Overflow attempts neither evict nor reset the retained root. It can
+        // still consume exactly the remainder of its original allowance.
+        assert_eq!(runtime.tool_actions_used(&retained_root), 1);
+        runtime
+            .reserve_tool_actions(
+                &retained_root,
+                super::MAX_TOOL_ACTIONS_PER_TRACE.saturating_sub(1),
+            )
+            .expect("tracked root should retain its remaining budget");
+        assert_eq!(
+            runtime.tool_actions_used(&retained_root),
+            super::MAX_TOOL_ACTIONS_PER_TRACE
+        );
+        assert!(
+            runtime
+                .tool_action_budget_by_trace
+                .contains_key(&retained_root.trace().root_event_id())
+        );
+        assert_eq!(
+            runtime.tool_action_budget_by_trace.len(),
+            super::MAX_TOOL_TRACE_BUDGET_ENTRIES
+        );
+        assert_eq!(
+            runtime.tool_action_budget_by_trace.len(),
+            runtime.tool_action_budget_order.len()
+        );
+    }
+
+    #[test]
+    fn completed_roots_release_budget_capacity_without_resetting_late_children() {
+        let conversation_id = ConversationId::new();
+        let sender = PersonId::new();
+        let mut runtime = CognitiveRuntime::new(RuntimeConfig::default())
+            .expect("valid runtime")
+            .1;
+
+        // Sequentially completed traces can reuse the bounded ledger instead
+        // of permanently exhausting it after 1024 independent requests.
+        for _ in 0..(super::MAX_TOOL_TRACE_BUDGET_ENTRIES + 32) {
+            let root = direct_message(conversation_id, sender);
+            runtime
+                .reserve_tool_actions(&root, 1)
+                .expect("fresh root should reserve");
+            runtime.release_tool_budget_root_if_terminal(root.trace().root_event_id());
+            assert!(runtime.tool_action_budget_by_trace.is_empty());
+            assert!(runtime.tool_action_budget_order.is_empty());
+        }
+
+        // A queued descendant pins the root until it is consumed.
+        let active_root = direct_message(conversation_id, sender);
+        runtime
+            .reserve_tool_actions(&active_root, 1)
+            .expect("active root should reserve");
+        let late_child = WorldEvent::derived_from(
+            &active_root,
+            Utc::now(),
+            active_root.scope(),
+            EventPriority::High,
+            WorldEventKind::ToolCompleted(crate::ToolCompletedEvent {
+                operation: "calculator".to_owned(),
+                output: "2".to_owned(),
+                requires_follow_up: true,
+            }),
+            8,
+        )
+        .expect("child event should be valid");
+        runtime
+            .pending_tool_follow_ups
+            .push_back(late_child.clone());
+        runtime.release_tool_budget_root_if_terminal(active_root.trace().root_event_id());
+        assert!(
+            runtime
+                .tool_action_budget_by_trace
+                .contains_key(&active_root.trace().root_event_id())
+        );
+
+        runtime.pending_tool_follow_ups.pop_front();
+        runtime.release_tool_budget_root_if_terminal(active_root.trace().root_event_id());
+        assert!(
+            !runtime
+                .tool_action_budget_by_trace
+                .contains_key(&active_root.trace().root_event_id())
+        );
+
+        // Neither a root replay nor a delayed child can recreate the released
+        // cumulative budget.
+        assert_eq!(runtime.tool_actions_remaining(&active_root), 0);
+        assert!(matches!(
+            runtime.reserve_tool_actions(&active_root, 1),
+            Err(PlannerError::InvalidOutput(
+                crate::PlannerOutputValidationError::ToolActionBudgetExceeded { .. }
+            ))
+        ));
+        assert_eq!(runtime.tool_actions_remaining(&late_child), 0);
+        assert!(matches!(
+            runtime.reserve_tool_actions(&late_child, 1),
+            Err(PlannerError::InvalidOutput(
+                crate::PlannerOutputValidationError::ToolActionBudgetExceeded { .. }
+            ))
+        ));
+    }
+
+    #[tokio::test]
+    async fn tool_follow_up_can_invoke_another_tool_with_actor_context() {
+        let conversation_id = ConversationId::new();
+        let sender = PersonId::new();
         let model_calls = Arc::new(AtomicUsize::new(0));
         let (_handle, mut runtime) = CognitiveRuntime::new_with_services(
             RuntimeConfig::default(),
@@ -3096,24 +4756,64 @@ mod tests {
 
         runtime
             .process_event_with_planner_and_actions(
-                direct_message(conversation_id, PersonId::new()),
+                direct_message(conversation_id, sender),
                 &arbiter,
                 &port,
             )
             .await
             .expect("first tool request should execute");
+        assert!(matches!(
+            runtime
+                .pending_tool_follow_ups
+                .front()
+                .map(WorldEvent::kind),
+            Some(WorldEventKind::ToolCompleted(_))
+        ));
+        assert_eq!(
+            runtime
+                .pending_tool_follow_ups
+                .front()
+                .and_then(WorldEvent::actor),
+            Some(sender)
+        );
         let follow_up = runtime
             .process_next_with_planner_and_actions(&arbiter, &port)
             .await
             .expect("tool result should be queued");
         assert!(matches!(
             follow_up,
-            Err(PlannerError::InvalidOutput(
-                crate::PlannerOutputValidationError::IntentOutsideEventScope { .. }
-            ))
+            Ok(PlannedProcessingOutcome::Planned {
+                actions,
+                ..
+            }) if matches!(
+                actions.as_slice(),
+                [ActionResult::Executed {
+                    outcome: ActionPortOutcome::ToolCompleted { .. },
+                    ..
+                }]
+            )
         ));
-        assert_eq!(model_calls.load(Ordering::SeqCst), 2);
-        assert_eq!(port_calls.load(Ordering::SeqCst), 1);
+        let final_follow_up = runtime
+            .process_next_with_planner_and_actions(&arbiter, &port)
+            .await
+            .expect("second tool result should be queued")
+            .expect("final reply planning should succeed");
+        assert!(matches!(
+            final_follow_up,
+            PlannedProcessingOutcome::Planned {
+                actions,
+                ..
+            } if matches!(
+                actions.as_slice(),
+                [ActionResult::Executed {
+                    outcome: ActionPortOutcome::Delivered { .. },
+                    ..
+                }]
+            )
+        ));
+        assert!(runtime.pending_tool_follow_ups.is_empty());
+        assert_eq!(model_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(port_calls.load(Ordering::SeqCst), 3);
     }
 
     #[tokio::test]

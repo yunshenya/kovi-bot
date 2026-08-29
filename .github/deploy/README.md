@@ -59,7 +59,8 @@ reviewers。截图中的敏感配置放在仓库级 Actions Secrets：
   非空，并且必须与 NapCat 配置完全一致。
 - `POSTGRES_PASSWORD`：服务器 `postgres` 用户密码；工作流会据此生成本机 PostgreSQL 的连接串。
 - `KOVI_MAIN_ADMIN`：机器人所有者 QQ 号。
-- `MODEL_API_URL`、`MODEL_NAME`、`MODEL_SUPPORTS_VISION`、`MODEL_WIRE_API`。
+- `MODEL_API_URL`、`MODEL_NAME`、`MODEL_SUPPORTS_VISION`、`MODEL_WIRE_API`。`MODEL_NAME` 必须是
+  服务端实际提供的模型 ID（例如 `gpt-5.5`），不能填 `-` 这类占位值。
 - `MODEL_ACTOR_AUTHORIZATION`、`VISION_API_TOKEN`。
 - `VISION_ACTOR_AUTHORIZATION`、`VISION_API_URL`、`VISION_MODEL_NAME`、
   `VISION_REQUIRES_AUTH`、`VISION_WIRE_API`。
@@ -85,11 +86,13 @@ reviewers。截图中的敏感配置放在仓库级 Actions Secrets：
 不会自动下载模型；如果服务器没有预装完整 bundle，`model.intrinsic.asset_dir` 找不到
 `manifest.toml` 时会按设计退回 deterministic fallback。
 
-如果生产需要本地 Intrinsic 推理，应在发布前从固定 revision 的模型发行地址下载 text 或
-full bundle，校验其中 manifest 的文件大小和 SHA-256，再安装到当前 release 的
-`models/yunxi-intrinsic/minimind-3o`。不要直接从可变的 `main`、`latest` 或未经校验的 URL
-复制权重。模型版本应和二进制 release 一起记录，回滚时保留对应的模型版本；只使用远程
-OpenAI-compatible 模型时则无需下载本地 bundle。
+如果生产需要本地 Intrinsic 推理，应从固定 revision 的模型发行地址下载 text 或 full bundle，
+校验其中 manifest 的文件大小和 SHA-256，再安装到稳定目录
+`/home/ubuntu/kovi-bot/models/yunxi-intrinsic/minimind-3o`。不要把权重放进
+`current` 或某个具体的 `releases/<sha>`，也不要直接从可变的 `main`、`latest` 或未经校验的
+URL 复制。发布工作流会在每个 release 下创建 `models` 到稳定目录的软链接，因此原子切换、
+回滚和旧 release 清理都不会影响已安装的 bundle；升级模型后应重新校验 manifest 并重启服务。
+只使用远程 OpenAI-compatible 模型时则无需下载本地 bundle。
 
 本地手动安装可以在源码目录执行：
 

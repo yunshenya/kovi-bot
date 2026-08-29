@@ -2092,7 +2092,13 @@ async fn process_group_reply_inner(
     clear_mention_context(scope).await;
     if message.trim() == "#禁言" {
         set_group_paused(group_id, true).await;
-        send_tracked_group_message(&bot, group_id, "禁言成功").await;
+        send_tracked_reply_text(
+            &bot,
+            MessageDestination::Group(group_id),
+            "禁言成功",
+            reply_ticket,
+        )
+        .await;
         if already_claimed {
             finish_reply(scope, reply_ticket).await;
         }
@@ -2100,7 +2106,13 @@ async fn process_group_reply_inner(
     }
     if message.trim() == "#结束禁言" {
         set_group_paused(group_id, false).await;
-        send_tracked_group_message(&bot, group_id, "结束成功").await;
+        send_tracked_reply_text(
+            &bot,
+            MessageDestination::Group(group_id),
+            "结束成功",
+            reply_ticket,
+        )
+        .await;
         if already_claimed {
             finish_reply(scope, reply_ticket).await;
         }

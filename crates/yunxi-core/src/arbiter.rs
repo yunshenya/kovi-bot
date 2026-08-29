@@ -628,9 +628,26 @@ pub type ActionPortFuture<'a> = std::pin::Pin<
     Box<dyn std::future::Future<Output = Result<ActionPortOutcome, ActionPortError>> + Send + 'a>,
 >;
 
+/// Future returned when a host releases a capability that was materialized by
+/// a plan but never reached the action port's execution boundary.
+pub type ActionPortReleaseFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>;
+
 /// Object-safe side-effect boundary implemented by each host adapter.
 pub trait ActionPort: Send + Sync {
     fn execute<'a>(&'a self, action: &'a ProposedAction) -> ActionPortFuture<'a>;
+
+    /// Release host-side reservations for an action that was never executed.
+    ///
+    /// The default is a no-op so existing adapters remain source-compatible.
+    /// Implementations must keep this operation idempotent and must not cross
+    /// an external side-effect boundary.
+    fn release_unexecuted<'a>(
+        &'a self,
+        _action: &'a ProposedAction,
+    ) -> ActionPortReleaseFuture<'a> {
+        Box::pin(async {})
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

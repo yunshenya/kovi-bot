@@ -1,6 +1,6 @@
 //! 会话回复打断状态。
 
-use kovi::tokio::sync::{Mutex, watch};
+use kovi::tokio::sync::{Mutex, Notify, watch};
 use std::collections::{HashMap, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -35,6 +35,10 @@ pub(crate) struct ReplyTicket {
 impl ReplyTicket {
     pub(crate) fn scope(self) -> ReplyScope {
         self.scope
+    }
+
+    pub(crate) fn scope_epoch(self) -> u64 {
+        self.scope_epoch
     }
 }
 
@@ -182,6 +186,19 @@ struct PendingIncoming {
     resolved: watch::Sender<bool>,
 }
 
+/// An inbound turn observed while a reply is still generating. Unlike a
+/// normal reservation, it keeps the current generation intact until the
+/// semantic pass decides whether the in-flight reply still matters. It also
+/// blocks proactive work and lets the old reply wait at its commit boundary
+/// until this reservation is resolved.
+#[derive(Debug)]
+struct ActiveIncomingReservation {
+    reservation_id: u64,
+    ticket: ReplyTicket,
+    expires_at: Instant,
+    resolved: watch::Sender<bool>,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct PendingPrecommit {
     token: OutgoingToken,
@@ -205,6 +222,7 @@ struct ReplyState {
     incoming_sequence: u64,
     active_generation: Option<u64>,
     pending_incoming: Option<PendingIncoming>,
+    active_incoming: VecDeque<ActiveIncomingReservation>,
     pending_precommit: Option<PendingPrecommit>,
     outgoing_sequence: u64,
     pending_outgoing: VecDeque<PendingOutgoing>,
@@ -221,6 +239,7 @@ impl Default for ReplyState {
             incoming_sequence: 0,
             active_generation: None,
             pending_incoming: None,
+            active_incoming: VecDeque::new(),
             pending_precommit: None,
             outgoing_sequence: 0,
             pending_outgoing: VecDeque::new(),
@@ -240,16 +259,30 @@ static SCOPE_LOCKS: LazyLock<Vec<Arc<Mutex<()>>>> = LazyLock::new(|| {
         .map(|_| Arc::new(Mutex::new(())))
         .collect()
 });
+static SCOPE_NOTIFIERS: LazyLock<Vec<Arc<Notify>>> = LazyLock::new(|| {
+    (0..SCOPE_LOCK_SHARDS)
+        .map(|_| Arc::new(Notify::new()))
+        .collect()
+});
 
 /// 同一会话的队列、回复代数和消息生命周期必须共用线性化点；分片只减少
 /// 不同会话之间的锁竞争，不改变同一会话内的顺序。
 pub(crate) fn scope_mutex(scope: ReplyScope) -> Arc<Mutex<()>> {
-    let mut hasher = DefaultHasher::new();
-    scope.hash(&mut hasher);
-    Arc::clone(&SCOPE_LOCKS[(hasher.finish() as usize) % SCOPE_LOCK_SHARDS])
+    Arc::clone(&SCOPE_LOCKS[scope_shard(scope)])
 }
 
-/// 新的相关消息到达时推进代数，使此前的模型结果和未发气泡全部失效。
+fn scope_shard(scope: ReplyScope) -> usize {
+    let mut hasher = DefaultHasher::new();
+    scope.hash(&mut hasher);
+    (hasher.finish() as usize) % SCOPE_LOCK_SHARDS
+}
+
+fn scope_notifier(scope: ReplyScope) -> Arc<Notify> {
+    Arc::clone(&SCOPE_NOTIFIERS[scope_shard(scope)])
+}
+
+/// 对尚未完成语义判定的入站先保留当前代数；确认内容失效，或调用通用打断时，
+/// 才推进代数，使此前的模型结果和未发气泡失效。
 pub(crate) async fn interrupt(scope: ReplyScope) -> ReplyTicket {
     let lock = scope_mutex(scope);
     let _scope_guard = lock.lock().await;
@@ -330,6 +363,67 @@ pub(crate) async fn reserve_incoming_locked(ticket: ReplyTicket) -> Option<u64> 
     Some(reservation_id)
 }
 
+/// Keep the current generation protected while an inbound turn is being
+/// semantically classified against an in-flight reply. Multiple messages may
+/// be waiting for the same active reply, so each admission receives its own
+/// bounded reservation and can release it independently.
+pub(crate) async fn reserve_active_incoming_locked(ticket: ReplyTicket) -> Option<u64> {
+    let mut states = REPLY_STATES.lock().await;
+    let state = states.get_mut(&ticket.scope)?;
+    let now = Instant::now();
+    expire_coordination(ticket.scope, state, now);
+    if !ticket_matches(state, ticket) {
+        return None;
+    }
+    state.incoming_sequence = state.incoming_sequence.wrapping_add(1).max(1);
+    let reservation_id = state.incoming_sequence;
+    state.active_incoming.push_back(ActiveIncomingReservation {
+        reservation_id,
+        ticket,
+        expires_at: now + INCOMING_RESERVATION_LEASE,
+        resolved: watch::channel(false).0,
+    });
+    state.last_seen = now;
+    Some(reservation_id)
+}
+
+/// Release an active reservation by its id. Reservation ids are unique within
+/// a scope and remain authoritative when a semantic replacement rebinds the
+/// reservation to a successor generation.
+pub(crate) async fn release_active_incoming_by_id_locked(
+    scope: ReplyScope,
+    reservation_id: u64,
+) -> Option<ReplyTicket> {
+    if reservation_id == 0 {
+        return None;
+    }
+    let mut states = REPLY_STATES.lock().await;
+    let state = states.get_mut(&scope)?;
+    expire_coordination(scope, state, Instant::now());
+    let position = state
+        .active_incoming
+        .iter()
+        .position(|pending| pending.reservation_id == reservation_id)?;
+    let reservation = state
+        .active_incoming
+        .remove(position)
+        .expect("the active incoming reservation position must remain valid");
+    let ticket = reservation.ticket;
+    reservation.resolved.send_replace(true);
+    state.last_seen = Instant::now();
+    scope_notifier(scope).notify_waiters();
+    Some(ticket)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) async fn release_active_incoming(ticket: ReplyTicket, reservation_id: u64) -> bool {
+    let lock = scope_mutex(ticket.scope);
+    let _scope_guard = lock.lock().await;
+    release_active_incoming_by_id_locked(ticket.scope, reservation_id)
+        .await
+        .is_some()
+}
+
 pub(crate) async fn release_incoming_locked(
     ticket: ReplyTicket,
     reservation_id: u64,
@@ -352,6 +446,7 @@ pub(crate) async fn release_incoming_locked(
         return false;
     }
     reservation.resolved.send_replace(true);
+    scope_notifier(ticket.scope).notify_waiters();
     let frozen_token_is_current = reservation.frozen_token.is_some_and(|token| {
         ticket_matches(state, ticket)
             && state
@@ -384,15 +479,137 @@ pub(crate) async fn incoming_reservation_matches_locked(
     })
 }
 
-pub(crate) async fn release_incoming(
+pub(crate) async fn active_incoming_reservation_matches_locked(
     ticket: ReplyTicket,
     reservation_id: u64,
-    frozen_token: Option<OutgoingToken>,
-    fail_closed: bool,
 ) -> bool {
-    let lock = scope_mutex(ticket.scope);
-    let _scope_guard = lock.lock().await;
-    release_incoming_locked(ticket, reservation_id, frozen_token, fail_closed).await
+    if reservation_id == 0 {
+        return true;
+    }
+    let mut states = REPLY_STATES.lock().await;
+    let Some(state) = states.get_mut(&ticket.scope) else {
+        return false;
+    };
+    expire_coordination(ticket.scope, state, Instant::now());
+    state
+        .active_incoming
+        .iter()
+        .any(|pending| pending.ticket == ticket && pending.reservation_id == reservation_id)
+}
+
+/// Wait until an active admission reaches the head of its scope's FIFO. The
+/// returned ticket is the reservation's current ticket after any generation
+/// hand-off. A missing reservation means it was resolved or invalidated.
+pub(crate) async fn wait_for_active_incoming_turn(
+    scope: ReplyScope,
+    reservation_id: u64,
+) -> Option<ReplyTicket> {
+    if reservation_id == 0 {
+        return current_ticket(scope).await;
+    }
+    let notifier = scope_notifier(scope);
+    loop {
+        let mut notified = Box::pin(notifier.notified());
+        notified.as_mut().enable();
+        let wait = {
+            let lock = scope_mutex(scope);
+            let _scope_guard = lock.lock().await;
+            let mut states = REPLY_STATES.lock().await;
+            let state = states.get_mut(&scope)?;
+            let now = Instant::now();
+            expire_coordination(scope, state, now);
+            let position = state
+                .active_incoming
+                .iter()
+                .position(|pending| pending.reservation_id == reservation_id)?;
+            let reservation = &state.active_incoming[position];
+            if position == 0 {
+                return Some(reservation.ticket);
+            }
+            reservation.expires_at.saturating_duration_since(now)
+        };
+        let _ = kovi::tokio::time::timeout(wait, notified).await;
+    }
+}
+
+/// Wait until all active semantic admissions have resolved. Direct control
+/// responses use this after replacing an in-flight reply so the generic
+/// tracked sender cannot observe a later marker and fail with `ConversationBusy`.
+pub(crate) async fn wait_for_active_incoming_clear(scope: ReplyScope) -> bool {
+    let notifier = scope_notifier(scope);
+    loop {
+        // Register before checking state so a resolution cannot race the
+        // check and leave the waiter asleep indefinitely.
+        let mut notified = Box::pin(notifier.notified());
+        notified.as_mut().enable();
+        let remaining = {
+            let lock = scope_mutex(scope);
+            let _scope_guard = lock.lock().await;
+            let mut states = REPLY_STATES.lock().await;
+            let Some(state) = states.get_mut(&scope) else {
+                return true;
+            };
+            let now = Instant::now();
+            expire_coordination(scope, state, now);
+            state
+                .active_incoming
+                .iter()
+                .map(|pending| pending.expires_at.saturating_duration_since(now))
+                .min()
+        };
+        let Some(remaining) = remaining else {
+            return true;
+        };
+        let _ = kovi::tokio::time::timeout(remaining, notified).await;
+    }
+}
+
+/// Replace the active reply for the front admission while preserving all
+/// later admissions. The remaining reservations are rebound to the returned
+/// successor ticket, keeping their FIFO order across the generation change.
+pub(crate) async fn supersede_active_incoming_locked(
+    scope: ReplyScope,
+    reservation_id: u64,
+    prepared_terminal: OutgoingState,
+) -> Option<ReplyTicket> {
+    let mut states = REPLY_STATES.lock().await;
+    let state = states.get_mut(&scope)?;
+    expire_coordination(scope, state, Instant::now());
+    if reservation_id == 0 {
+        return Some(advance_generation_preserving_active(
+            scope,
+            state,
+            prepared_terminal,
+        ));
+    }
+    let position = state
+        .active_incoming
+        .iter()
+        .position(|pending| pending.reservation_id == reservation_id)?;
+    if position != 0 {
+        return None;
+    }
+    let reservation = state
+        .active_incoming
+        .pop_front()
+        .expect("the active incoming reservation must remain present");
+    reservation.resolved.send_replace(true);
+    // A previous replacement may already own a normal reservation on this
+    // generation while this later active marker reaches the front. Reusing
+    // that successor keeps the earlier turn alive; advancing here would
+    // otherwise discard its still-unclaimed admission.
+    if state.active_generation.is_none()
+        && let Some(pending) = state.pending_incoming.as_ref().filter(|pending| {
+            pending.frozen_token.is_none() && ticket_matches(state, pending.ticket)
+        })
+    {
+        let next = pending.ticket;
+        scope_notifier(scope).notify_waiters();
+        return Some(next);
+    }
+    let next = advance_generation_preserving_active(scope, state, prepared_terminal);
+    scope_notifier(scope).notify_waiters();
+    Some(next)
 }
 
 /// A stop request advances the conversation just like any other interrupt, but
@@ -464,7 +681,11 @@ pub(crate) async fn claim_follow_up(completed: ReplyTicket) -> Option<ReplyTicke
 pub(crate) async fn claim_follow_up_locked(completed: ReplyTicket) -> Option<ReplyTicket> {
     let mut states = REPLY_STATES.lock().await;
     let state = states.get_mut(&completed.scope)?;
-    if !ticket_matches(state, completed) || state.active_generation.is_some() {
+    if !ticket_matches(state, completed)
+        || state.active_generation.is_some()
+        || state.pending_incoming.is_some()
+        || !state.active_incoming.is_empty()
+    {
         return None;
     }
     state.generation = state.generation.wrapping_add(1);
@@ -521,13 +742,25 @@ pub(crate) async fn claim_active_locked(ticket: ReplyTicket) -> bool {
     if !ticket_matches(state, ticket) {
         return false;
     }
-    if state
+    // A later reply must not claim a generation while an earlier active
+    // admission is still awaiting semantic refinement. The coordinator will
+    // either release that admission or rebind it to a successor generation
+    // before allowing the next turn to start.
+    let owner_pending = state
         .pending_incoming
         .as_ref()
-        .is_some_and(|pending| pending.ticket == ticket && pending.frozen_token.is_none())
-        && let Some(pending) = state.pending_incoming.take()
+        .is_some_and(|pending| pending.ticket == ticket && pending.frozen_token.is_none());
+    if !owner_pending
+        && state
+            .active_incoming
+            .iter()
+            .any(|pending| pending.ticket == ticket)
     {
+        return false;
+    }
+    if owner_pending && let Some(pending) = state.pending_incoming.take() {
         pending.resolved.send_replace(true);
+        scope_notifier(ticket.scope).notify_waiters();
     }
     state.active_generation = Some(ticket.generation);
     state.last_seen = Instant::now();
@@ -565,19 +798,55 @@ pub(crate) async fn is_active_locked(scope: ReplyScope) -> bool {
         .is_some_and(|state| state.active_generation.is_some())
 }
 
-/// Return the current active ticket while the caller holds `scope_mutex`.
-/// Reactive host-side sends can borrow this ticket without advancing or
-/// finishing the conversation generation owned by the active handler.
+/// Return the latest coordination ticket for a scope. This is intentionally
+/// separate from `active_ticket_locked`: a completed drainer may need to adopt
+/// a successor generation after an active admission performed a semantic
+/// replacement.
+pub(crate) async fn current_ticket(scope: ReplyScope) -> Option<ReplyTicket> {
+    let lock = scope_mutex(scope);
+    let _scope_guard = lock.lock().await;
+    current_ticket_locked(scope).await
+}
+
+pub(crate) async fn current_ticket_locked(scope: ReplyScope) -> Option<ReplyTicket> {
+    let states = REPLY_STATES.lock().await;
+    let state = states.get(&scope)?;
+    Some(ticket_for_state(scope, state))
+}
+
+fn ticket_for_state(scope: ReplyScope, state: &ReplyState) -> ReplyTicket {
+    ReplyTicket {
+        scope,
+        scope_epoch: state.scope_epoch,
+        generation: state.generation,
+        conversation_version: state.conversation_version,
+    }
+}
+
+/// Return the current coordination ticket while the caller holds
+/// `scope_mutex`. This includes semantic admissions waiting behind a turn
+/// whose active handler has just finished; later ingress must not supersede
+/// that still-unresolved admission.
 pub(crate) async fn active_ticket_locked(scope: ReplyScope) -> Option<ReplyTicket> {
     let states = REPLY_STATES.lock().await;
     let state = states.get(&scope)?;
-    let generation = state.active_generation?;
-    (generation == state.generation).then_some(ReplyTicket {
-        scope,
-        scope_epoch: state.scope_epoch,
-        generation,
-        conversation_version: state.conversation_version,
-    })
+    if let Some(generation) = state.active_generation
+        && generation == state.generation
+    {
+        return Some(ticket_for_state(scope, state));
+    }
+    if let Some(pending) = state
+        .pending_incoming
+        .as_ref()
+        .filter(|pending| pending.frozen_token.is_none() && ticket_matches(state, pending.ticket))
+    {
+        return Some(pending.ticket);
+    }
+    state
+        .active_incoming
+        .front()
+        .filter(|pending| ticket_matches(state, pending.ticket))
+        .map(|pending| pending.ticket)
 }
 
 /// Remove all reply-generation state for a scope while its `scope_mutex` is
@@ -586,7 +855,7 @@ pub(crate) async fn active_ticket_locked(scope: ReplyScope) -> Option<ReplyTicke
 pub(crate) async fn clear_reply_state_locked(scope: ReplyScope) -> bool {
     let removed = REPLY_STATES.lock().await.remove(&scope);
     if let Some(mut state) = removed {
-        clear_pending_incoming(&mut state);
+        clear_pending_incoming(scope, &mut state);
         true
     } else {
         false
@@ -691,7 +960,95 @@ pub(crate) async fn has_pending_incoming_locked(scope: ReplyScope) -> bool {
         return false;
     };
     expire_coordination(scope, state, Instant::now());
-    state.pending_incoming.is_some()
+    state.pending_incoming.is_some() || !state.active_incoming.is_empty()
+}
+
+/// Check whether an admission has another unresolved inbound turn ahead of it.
+/// The caller must hold `scope_mutex`; the admission's own reservation is
+/// deliberately excluded so a first turn can claim its generation normally.
+pub(crate) async fn has_other_pending_incoming_locked(
+    ticket: ReplyTicket,
+    reservation_id: u64,
+) -> bool {
+    let mut states = REPLY_STATES.lock().await;
+    let Some(state) = states.get_mut(&ticket.scope) else {
+        return false;
+    };
+    expire_coordination(ticket.scope, state, Instant::now());
+    state
+        .pending_incoming
+        .as_ref()
+        .is_some_and(|pending| pending.ticket != ticket || pending.reservation_id != reservation_id)
+        || state
+            .active_incoming
+            .iter()
+            .any(|pending| pending.ticket != ticket || pending.reservation_id != reservation_id)
+}
+
+/// Check whether an inbound admission still blocks the completed ticket from
+/// claiming a queued follow-up. The caller must hold `scope_mutex`.
+pub(crate) async fn pending_incoming_for_ticket_locked(ticket: ReplyTicket) -> bool {
+    let mut states = REPLY_STATES.lock().await;
+    let Some(state) = states.get_mut(&ticket.scope) else {
+        return false;
+    };
+    expire_coordination(ticket.scope, state, Instant::now());
+    if !ticket_matches(state, ticket) {
+        return false;
+    }
+    state
+        .pending_incoming
+        .as_ref()
+        .is_some_and(|pending| pending.ticket == ticket)
+        || state
+            .active_incoming
+            .iter()
+            .any(|pending| pending.ticket == ticket)
+}
+
+/// Wait until all admissions attached to `ticket` resolve, or until the
+/// ticket becomes stale. The notifier is process-local and deliberately
+/// independent of `ReplyState`, so data-erasure removal also wakes waiters.
+pub(crate) async fn wait_for_pending_incoming(ticket: ReplyTicket) -> bool {
+    let notifier = scope_notifier(ticket.scope);
+    loop {
+        // Register before checking state so `notify_waiters` cannot slip
+        // between the check and the await without waking this waiter.
+        let mut notified = Box::pin(notifier.notified());
+        notified.as_mut().enable();
+        let remaining = {
+            let lock = scope_mutex(ticket.scope);
+            let _scope_guard = lock.lock().await;
+            let mut states = REPLY_STATES.lock().await;
+            let Some(state) = states.get_mut(&ticket.scope) else {
+                return false;
+            };
+            let now = Instant::now();
+            expire_coordination(ticket.scope, state, now);
+            if !ticket_matches(state, ticket) {
+                return false;
+            }
+            let next_expiry = state
+                .pending_incoming
+                .as_ref()
+                .filter(|pending| pending.ticket == ticket)
+                .map(|pending| pending.expires_at)
+                .into_iter()
+                .chain(
+                    state
+                        .active_incoming
+                        .iter()
+                        .filter(|pending| pending.ticket == ticket)
+                        .map(|pending| pending.expires_at),
+                )
+                .min();
+            let Some(next_expiry) = next_expiry else {
+                return true;
+            };
+            next_expiry.saturating_duration_since(now)
+        };
+        let _ = kovi::tokio::time::timeout(remaining, notified).await;
+    }
 }
 
 async fn prepare_outgoing_locked(
@@ -773,10 +1130,9 @@ async fn commit_outgoing_with_context(
         .map(|_| ())
 }
 
-/// Wait for any earlier semantic admission before pinning the Prepared token
-/// for final route and authorization checks. No caller-owned guard is held
-/// during this wait. Once returned, later ingress supersedes this token rather
-/// than installing another reservation, so final commit itself never waits.
+/// Wait for any earlier semantic admission before pinning the token for final
+/// route and authorization checks. Active-reply admissions are installed only
+/// on the Host-serialized path, so this wait cannot deadlock Core's FIFO.
 pub(crate) async fn begin_outgoing_commit(
     token: OutgoingToken,
 ) -> Result<PreparedOutgoingCommit, OutgoingCommitRejection> {
@@ -802,6 +1158,15 @@ pub(crate) async fn begin_outgoing_commit(
                 .pending_incoming
                 .as_ref()
                 .filter(|incoming| incoming.frozen_token == Some(token))
+            {
+                Some((
+                    incoming.resolved.subscribe(),
+                    incoming.expires_at.saturating_duration_since(now),
+                ))
+            } else if let Some(incoming) = state
+                .active_incoming
+                .iter()
+                .find(|incoming| incoming.ticket == token.ticket)
             {
                 Some((
                     incoming.resolved.subscribe(),
@@ -1121,8 +1486,36 @@ fn advance_generation(
     state: &mut ReplyState,
     prepared_terminal: OutgoingState,
 ) -> ReplyTicket {
+    advance_generation_with_active(scope, state, prepared_terminal, false)
+}
+
+/// Advance a generation while retaining unresolved active admissions. This is
+/// used only after the FIFO-front admission has explicitly chosen Rewrite or
+/// Merge; all later reservations are rebound to the successor ticket instead
+/// of being discarded as stale.
+fn advance_generation_preserving_active(
+    scope: ReplyScope,
+    state: &mut ReplyState,
+    prepared_terminal: OutgoingState,
+) -> ReplyTicket {
+    advance_generation_with_active(scope, state, prepared_terminal, true)
+}
+
+fn advance_generation_with_active(
+    scope: ReplyScope,
+    state: &mut ReplyState,
+    prepared_terminal: OutgoingState,
+    preserve_active: bool,
+) -> ReplyTicket {
     let now = Instant::now();
-    clear_pending_incoming(state);
+    if preserve_active {
+        if let Some(incoming) = state.pending_incoming.take() {
+            incoming.resolved.send_replace(true);
+            scope_notifier(scope).notify_waiters();
+        }
+    } else {
+        clear_pending_incoming(scope, state);
+    }
     state.pending_precommit = None;
     for pending in &mut state.pending_outgoing {
         match pending.state {
@@ -1156,18 +1549,29 @@ fn advance_generation(
     state.conversation_version = state.conversation_version.wrapping_add(1);
     state.active_generation = None;
     state.last_seen = now;
+    scope_notifier(scope).notify_waiters();
     prune_outgoing(state);
-    ReplyTicket {
-        scope,
-        scope_epoch: state.scope_epoch,
-        generation: state.generation,
-        conversation_version: state.conversation_version,
+    let next = ticket_for_state(scope, state);
+    if preserve_active {
+        for incoming in &mut state.active_incoming {
+            incoming.ticket = next;
+        }
     }
+    next
 }
 
-fn clear_pending_incoming(state: &mut ReplyState) {
+fn clear_pending_incoming(scope: ReplyScope, state: &mut ReplyState) {
+    let mut cleared = false;
     if let Some(incoming) = state.pending_incoming.take() {
         incoming.resolved.send_replace(true);
+        cleared = true;
+    }
+    for incoming in state.active_incoming.drain(..) {
+        incoming.resolved.send_replace(true);
+        cleared = true;
+    }
+    if cleared {
+        scope_notifier(scope).notify_waiters();
     }
 }
 
@@ -1178,6 +1582,7 @@ fn expire_coordination(scope: ReplyScope, state: &mut ReplyState, now: Instant) 
         .is_some_and(|pending| pending.expires_at <= now);
     if expired_incoming && let Some(incoming) = state.pending_incoming.take() {
         incoming.resolved.send_replace(true);
+        scope_notifier(scope).notify_waiters();
         let frozen_token_is_current = incoming.frozen_token.is_some_and(|token| {
             ticket_matches(state, incoming.ticket)
                 && state.pending_outgoing.iter().any(|pending| {
@@ -1187,6 +1592,25 @@ fn expire_coordination(scope: ReplyScope, state: &mut ReplyState, now: Instant) 
         if frozen_token_is_current {
             advance_generation(scope, state, incoming.fail_closed_terminal);
         }
+    }
+
+    // Remove only expired active admissions. Expiration is a lease cleanup,
+    // not evidence that the in-flight reply became meaningless; therefore it
+    // must never advance the generation or cancel a still-valid reply.
+    let mut active_incoming_expired = false;
+    let mut retained_active_incoming = VecDeque::with_capacity(state.active_incoming.len());
+    while let Some(incoming) = state.active_incoming.pop_front() {
+        if incoming.expires_at <= now {
+            incoming.resolved.send_replace(true);
+            active_incoming_expired = true;
+        } else {
+            retained_active_incoming.push_back(incoming);
+        }
+    }
+    state.active_incoming = retained_active_incoming;
+    if active_incoming_expired {
+        state.last_seen = now;
+        scope_notifier(scope).notify_waiters();
     }
 
     let expired_precommit = state
@@ -1267,6 +1691,7 @@ fn prune_states(states: &mut HashMap<ReplyScope, ReplyState>) {
     states.retain(|_, state| {
         state.active_generation.is_some()
             || state.pending_incoming.is_some()
+            || !state.active_incoming.is_empty()
             || state.pending_precommit.is_some()
             || state.pending_outgoing.iter().any(|pending| {
                 matches!(
@@ -1303,7 +1728,8 @@ mod tests {
         find_prepared_outgoing, finish, interrupt, interrupt_if_current, is_active, is_current,
         mark_active, mark_outgoing_failed, mark_outgoing_sent, outgoing_fingerprint,
         prepare_outgoing, prepare_proactive_outgoing_if_idle, prepared_outgoing_source_locked,
-        scope_mutex, take_message_collisions,
+        release_active_incoming, reserve_active_incoming_locked, scope_mutex,
+        take_message_collisions, wait_for_pending_incoming,
     };
 
     async fn outgoing_state(token: OutgoingToken) -> Option<OutgoingState> {
@@ -1540,6 +1966,86 @@ mod tests {
                 let newer = interrupt(scope).await;
                 assert!(claim_follow_up(claimed).await.is_none());
                 assert!(is_current(newer).await);
+            });
+    }
+
+    #[test]
+    fn follow_up_waits_for_all_active_admissions_to_resolve() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let scope = ReplyScope::Group(9_000_012);
+                let completed = interrupt(scope).await;
+                assert!(mark_active(completed).await);
+                let first = {
+                    let lock = scope_mutex(scope);
+                    let _guard = lock.lock().await;
+                    reserve_active_incoming_locked(completed)
+                        .await
+                        .expect("应保留第一条活动入站")
+                };
+                let second = {
+                    let lock = scope_mutex(scope);
+                    let _guard = lock.lock().await;
+                    reserve_active_incoming_locked(completed)
+                        .await
+                        .expect("应保留第二条活动入站")
+                };
+                finish(completed).await;
+
+                assert!(claim_follow_up(completed).await.is_none());
+                let waiter =
+                    kovi::tokio::spawn(async move { wait_for_pending_incoming(completed).await });
+                kovi::tokio::task::yield_now().await;
+                assert!(!waiter.is_finished());
+
+                assert!(release_active_incoming(completed, first).await);
+                kovi::tokio::task::yield_now().await;
+                assert!(!waiter.is_finished());
+                assert!(claim_follow_up(completed).await.is_none());
+
+                assert!(release_active_incoming(completed, second).await);
+                assert!(waiter.await.expect("等待任务应完成"));
+                let follow_up = claim_follow_up(completed)
+                    .await
+                    .expect("所有语义入站完成后应能领取排队回复");
+                finish(follow_up).await;
+            });
+    }
+
+    #[test]
+    fn expired_admission_after_reply_finish_does_not_invalidate_the_queue_ticket() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let scope = ReplyScope::Group(9_000_013);
+                let completed = interrupt(scope).await;
+                assert!(mark_active(completed).await);
+                let reservation = {
+                    let lock = scope_mutex(scope);
+                    let _guard = lock.lock().await;
+                    reserve_active_incoming_locked(completed)
+                        .await
+                        .expect("应保留活动入站")
+                };
+                finish(completed).await;
+                {
+                    let mut states = REPLY_STATES.lock().await;
+                    let state = states.get_mut(&scope).expect("应保留会话状态");
+                    let pending = state
+                        .active_incoming
+                        .iter_mut()
+                        .find(|pending| pending.reservation_id == reservation)
+                        .expect("应保留 admission");
+                    pending.expires_at = std::time::Instant::now();
+                }
+
+                assert!(wait_for_pending_incoming(completed).await);
+                assert!(is_current(completed).await);
+                let follow_up = claim_follow_up(completed)
+                    .await
+                    .expect("过期 admission 释放后应能领取排队回复");
+                finish(follow_up).await;
             });
     }
 

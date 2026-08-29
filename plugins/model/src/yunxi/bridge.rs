@@ -1301,12 +1301,11 @@ fn action_result_event(
         }
         ActionResult::Noop => return None,
     };
-    Some(WorldEvent::new(
-        occurred_at,
-        scope,
-        EventPriority::High,
-        kind,
-    ))
+    let event = WorldEvent::new(occurred_at, scope, EventPriority::High, kind);
+    Some(match action.actor() {
+        Some(actor) => event.with_actor(actor),
+        None => event,
+    })
 }
 
 fn idle_tick_event(occurred_at: DateTime<Utc>) -> WorldEvent {
