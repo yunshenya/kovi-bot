@@ -24,6 +24,7 @@ struct ConversationActivity {
     last_autonomous_at: Option<DateTime<Utc>>,
     autonomous_turns: u8,
     directive: ConversationTurnDirective,
+    continuation_decided: bool,
     next_wake_at: Option<DateTime<Utc>>,
     in_flight_since: Option<Instant>,
 }
@@ -68,6 +69,7 @@ pub(crate) fn observe_inbound(
             last_autonomous_at: None,
             autonomous_turns: 0,
             directive: ConversationTurnDirective::Wait,
+            continuation_decided: false,
             next_wake_at: None,
             in_flight_since: None,
         });
@@ -78,6 +80,29 @@ pub(crate) fn observe_inbound(
     entry.autonomous_turns = 0;
     entry.last_autonomous_at = None;
     entry.directive = ConversationTurnDirective::Wait;
+    entry.continuation_decided = false;
+    entry.next_wake_at = None;
+    entry.in_flight_since = None;
+}
+
+/// Record ambient group activity without activating autonomous conversation.
+/// A new group message means the old continuation may no longer be relevant,
+/// so any pending claim is cancelled before the next scheduler pass.
+pub(crate) fn observe_group_activity(conversation_id: ConversationId, occurred_at: DateTime<Utc>) {
+    let Ok(mut registry) = REGISTRY.lock() else {
+        return;
+    };
+    let Some(entry) = registry.entries.get_mut(&conversation_id) else {
+        return;
+    };
+    if entry.kind != ConversationKind::Group || occurred_at <= entry.last_inbound_at {
+        return;
+    }
+    entry.last_inbound_at = occurred_at;
+    entry.autonomous_turns = 0;
+    entry.last_autonomous_at = None;
+    entry.directive = ConversationTurnDirective::Wait;
+    entry.continuation_decided = false;
     entry.next_wake_at = None;
     entry.in_flight_since = None;
 }
@@ -86,6 +111,18 @@ pub(crate) fn observe_inbound(
 /// This is separate from `observe_inbound` so a normal reply can establish the
 /// "agent answered, now wait before continuing" boundary.
 pub(crate) fn record_outbound(conversation_id: ConversationId, occurred_at: DateTime<Utc>) {
+    record_outbound_with_directive(conversation_id, occurred_at, None, None);
+}
+
+/// Record a normal reply that explicitly opted into a later, distinct
+/// continuation. The model must opt in; the registry only schedules the next
+/// turn and never infers continuation from message punctuation or length.
+pub(crate) fn record_outbound_with_directive(
+    conversation_id: ConversationId,
+    occurred_at: DateTime<Utc>,
+    directive: Option<ConversationTurnDirective>,
+    config: Option<&ProactiveConfig>,
+) {
     let Ok(mut registry) = REGISTRY.lock() else {
         return;
     };
@@ -97,6 +134,21 @@ pub(crate) fn record_outbound(conversation_id: ConversationId, occurred_at: Date
             .last_bot_at
             .map_or(occurred_at, |current| current.max(occurred_at)),
     );
+    if let (Some(directive), Some(config)) = (directive, config) {
+        let continue_delay_secs = match entry.kind {
+            ConversationKind::Direct => config.autonomous_conversation_cooldown_secs(),
+            ConversationKind::Group => config.autonomous_conversation_group_cooldown_secs(),
+            ConversationKind::System => 0,
+        };
+        entry.directive = directive;
+        entry.continuation_decided = true;
+        entry.next_wake_at = match directive {
+            ConversationTurnDirective::Continue => {
+                Some(occurred_at + chrono::Duration::seconds(continue_delay_secs.max(1) as i64))
+            }
+            ConversationTurnDirective::Wait | ConversationTurnDirective::End => None,
+        };
+    }
     touch(&mut registry.order, conversation_id);
 }
 
@@ -110,12 +162,22 @@ pub(crate) fn claim_due(config: &ProactiveConfig, now: DateTime<Utc>) -> Option<
     let Ok(mut registry) = REGISTRY.lock() else {
         return None;
     };
-    let idle = chrono::Duration::seconds(config.autonomous_conversation_idle_secs() as i64);
-    let max_turns = config.autonomous_conversation_max_turns();
     let candidate = registry.order.iter().copied().find(|conversation_id| {
         let Some(entry) = registry.entries.get(conversation_id) else {
             return false;
         };
+        let (idle_secs, max_turns) = match entry.kind {
+            ConversationKind::Direct => (
+                config.autonomous_conversation_idle_secs(),
+                config.autonomous_conversation_max_turns(),
+            ),
+            ConversationKind::Group => (
+                config.autonomous_conversation_group_idle_secs(),
+                config.autonomous_conversation_group_max_turns(),
+            ),
+            ConversationKind::System => return false,
+        };
+        let idle = chrono::Duration::seconds(idle_secs as i64);
         if entry
             .in_flight_since
             .is_some_and(|started| started.elapsed() < IN_FLIGHT_TIMEOUT)
@@ -129,6 +191,10 @@ pub(crate) fn claim_due(config: &ProactiveConfig, now: DateTime<Utc>) -> Option<
             return false;
         }
         if entry.last_autonomous_at.is_none() {
+            if entry.continuation_decided {
+                return entry.directive == ConversationTurnDirective::Continue
+                    && entry.next_wake_at.is_some_and(|wake| now >= wake);
+            }
             return now - entry.last_inbound_at >= idle;
         }
         entry.directive == ConversationTurnDirective::Continue
@@ -156,15 +222,21 @@ pub(crate) fn finish_claim(
     conversation_id: ConversationId,
     occurred_at: DateTime<Utc>,
     directive: ConversationTurnDirective,
-    continue_delay_secs: u64,
+    config: &ProactiveConfig,
 ) {
     if let Ok(mut registry) = REGISTRY.lock()
         && let Some(entry) = registry.entries.get_mut(&conversation_id)
         && entry.in_flight_since.take().is_some()
     {
+        let continue_delay_secs = match entry.kind {
+            ConversationKind::Direct => config.autonomous_conversation_cooldown_secs(),
+            ConversationKind::Group => config.autonomous_conversation_group_cooldown_secs(),
+            ConversationKind::System => 0,
+        };
         entry.last_autonomous_at = Some(occurred_at);
         entry.autonomous_turns = entry.autonomous_turns.saturating_add(1);
         entry.directive = directive;
+        entry.continuation_decided = true;
         entry.next_wake_at = match directive {
             ConversationTurnDirective::Continue => {
                 Some(occurred_at + chrono::Duration::seconds(continue_delay_secs.max(1) as i64))
@@ -192,7 +264,10 @@ fn touch(order: &mut VecDeque<ConversationId>, conversation_id: ConversationId) 
 
 #[cfg(test)]
 mod tests {
-    use super::{REGISTRY, claim_due, finish_claim, observe_inbound, record_outbound};
+    use super::{
+        REGISTRY, claim_due, finish_claim, observe_group_activity, observe_inbound,
+        record_outbound, record_outbound_with_directive,
+    };
     use crate::config::ProactiveConfig;
     use chrono::{Duration, Utc};
     use std::sync::{LazyLock, Mutex};
@@ -222,7 +297,7 @@ mod tests {
         assert!(claim_due(&config, now).is_none());
         record_outbound(id, now - Duration::minutes(4));
         assert_eq!(claim_due(&config, now), Some(id));
-        finish_claim(id, now, ConversationTurnDirective::Wait, 15);
+        finish_claim(id, now, ConversationTurnDirective::Wait, &config);
         assert!(claim_due(&config, now + Duration::seconds(30)).is_none());
         clear();
     }
@@ -237,15 +312,15 @@ mod tests {
         observe_inbound(
             id,
             ConversationKind::Group,
-            now - Duration::minutes(2),
+            now - Duration::minutes(4),
             true,
         );
-        record_outbound(id, now - Duration::minutes(2));
+        record_outbound(id, now - Duration::minutes(4));
         assert_eq!(claim_due(&config, now), Some(id));
         observe_inbound(id, ConversationKind::Group, now, true);
-        finish_claim(id, now, ConversationTurnDirective::Continue, 15);
+        finish_claim(id, now, ConversationTurnDirective::Continue, &config);
         record_outbound(id, now);
-        assert_eq!(claim_due(&config, now + Duration::minutes(2)), Some(id));
+        assert_eq!(claim_due(&config, now + Duration::minutes(4)), Some(id));
         clear();
     }
 
@@ -264,7 +339,7 @@ mod tests {
         );
         record_outbound(id, now - Duration::minutes(2));
         assert_eq!(claim_due(&config, now), Some(id));
-        finish_claim(id, now, ConversationTurnDirective::End, 15);
+        finish_claim(id, now, ConversationTurnDirective::End, &config);
         assert!(claim_due(&config, now + Duration::hours(2)).is_none());
         observe_inbound(id, ConversationKind::Direct, now + Duration::hours(2), true);
         record_outbound(id, now + Duration::hours(2));
@@ -272,6 +347,84 @@ mod tests {
             claim_due(&config, now + Duration::hours(2) + Duration::minutes(2)),
             Some(id)
         );
+        clear();
+    }
+
+    #[test]
+    fn group_budget_is_more_conservative_than_direct_budget() {
+        let _guard = TEST_LOCK.lock().expect("test lock");
+        clear();
+        let id = ConversationId::new();
+        let now = Utc::now();
+        let config = ProactiveConfig::default();
+        observe_inbound(
+            id,
+            ConversationKind::Group,
+            now - Duration::minutes(4),
+            true,
+        );
+        record_outbound(id, now - Duration::minutes(4));
+        assert_eq!(claim_due(&config, now), Some(id));
+        finish_claim(id, now, ConversationTurnDirective::Continue, &config);
+        assert!(claim_due(&config, now + Duration::minutes(5)).is_none());
+        clear();
+    }
+
+    #[test]
+    fn ambient_group_activity_cancels_a_pending_continuation() {
+        let _guard = TEST_LOCK.lock().expect("test lock");
+        clear();
+        let id = ConversationId::new();
+        let now = Utc::now();
+        let config = ProactiveConfig::default();
+        observe_inbound(
+            id,
+            ConversationKind::Group,
+            now - Duration::minutes(5),
+            true,
+        );
+        record_outbound(id, now - Duration::minutes(4));
+        assert_eq!(claim_due(&config, now), Some(id));
+        observe_group_activity(id, now);
+        finish_claim(id, now, ConversationTurnDirective::Continue, &config);
+        assert!(claim_due(&config, now + Duration::minutes(5)).is_none());
+        clear();
+    }
+
+    #[test]
+    fn explicit_continuation_schedules_after_normal_reply_cooldown() {
+        let _guard = TEST_LOCK.lock().expect("test lock");
+        clear();
+        let id = ConversationId::new();
+        let now = Utc::now();
+        let config = ProactiveConfig::default();
+        observe_inbound(id, ConversationKind::Direct, now, true);
+        record_outbound_with_directive(
+            id,
+            now,
+            Some(ConversationTurnDirective::Continue),
+            Some(&config),
+        );
+        assert!(claim_due(&config, now + Duration::seconds(14)).is_none());
+        assert_eq!(claim_due(&config, now + Duration::seconds(15)), Some(id));
+        clear();
+    }
+
+    #[test]
+    fn explicit_wait_suppresses_legacy_idle_fallback() {
+        let _guard = TEST_LOCK.lock().expect("test lock");
+        clear();
+        let id = ConversationId::new();
+        let now = Utc::now();
+        let config = ProactiveConfig::default();
+        observe_inbound(id, ConversationKind::Direct, now - Duration::hours(2), true);
+        record_outbound_with_directive(
+            id,
+            now,
+            Some(ConversationTurnDirective::Wait),
+            Some(&config),
+        );
+        assert!(claim_due(&config, now + Duration::hours(2)).is_none());
         clear();
     }
 }

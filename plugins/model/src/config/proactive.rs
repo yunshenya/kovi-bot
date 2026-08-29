@@ -42,6 +42,12 @@ pub struct ProactiveConfig {
     autonomous_conversation_cooldown_secs: u64,
     /// 一次用户互动最多允许连续自主续聊的回合数。
     autonomous_conversation_max_turns: u8,
+    /// 群聊进入自主续聊前至少等待的时间（秒）。群聊默认比私聊更克制。
+    autonomous_conversation_group_idle_secs: u64,
+    /// 群聊自主续聊选择继续时，两次模型回合之间的最短间隔（秒）。
+    autonomous_conversation_group_cooldown_secs: u64,
+    /// 一次群聊互动最多允许连续自主续聊的回合数。
+    autonomous_conversation_group_max_turns: u8,
 }
 
 impl ProactiveConfig {
@@ -117,6 +123,18 @@ impl ProactiveConfig {
         self.autonomous_conversation_max_turns
     }
 
+    pub fn autonomous_conversation_group_idle_secs(&self) -> u64 {
+        self.autonomous_conversation_group_idle_secs
+    }
+
+    pub fn autonomous_conversation_group_cooldown_secs(&self) -> u64 {
+        self.autonomous_conversation_group_cooldown_secs
+    }
+
+    pub fn autonomous_conversation_group_max_turns(&self) -> u8 {
+        self.autonomous_conversation_group_max_turns
+    }
+
     pub fn validate(&self) -> anyhow::Result<()> {
         if self.check_interval_secs == 0 {
             return Err(anyhow::anyhow!("主动消息检查间隔必须大于0秒"));
@@ -168,6 +186,19 @@ impl ProactiveConfig {
                 "自主会话单次互动最多连续回合数必须在1到8之间"
             ));
         }
+        if self.autonomous_conversation_group_idle_secs == 0 {
+            return Err(anyhow::anyhow!("群聊自主会话空闲阈值必须大于0秒"));
+        }
+        if self.autonomous_conversation_group_cooldown_secs == 0 {
+            return Err(anyhow::anyhow!("群聊自主会话冷却时间必须大于0秒"));
+        }
+        if self.autonomous_conversation_group_max_turns == 0
+            || self.autonomous_conversation_group_max_turns > 8
+        {
+            return Err(anyhow::anyhow!(
+                "群聊自主会话单次互动最多连续回合数必须在1到8之间"
+            ));
+        }
         Ok(())
     }
 }
@@ -193,6 +224,9 @@ impl Default for ProactiveConfig {
             autonomous_conversation_idle_secs: 90,
             autonomous_conversation_cooldown_secs: 15,
             autonomous_conversation_max_turns: 4,
+            autonomous_conversation_group_idle_secs: 180,
+            autonomous_conversation_group_cooldown_secs: 90,
+            autonomous_conversation_group_max_turns: 1,
         }
     }
 }
@@ -236,6 +270,9 @@ mod tests {
         assert_eq!(config.autonomous_conversation_check_interval_secs(), 15);
         assert_eq!(config.autonomous_conversation_cooldown_secs(), 15);
         assert_eq!(config.autonomous_conversation_max_turns(), 4);
+        assert_eq!(config.autonomous_conversation_group_idle_secs(), 180);
+        assert_eq!(config.autonomous_conversation_group_cooldown_secs(), 90);
+        assert_eq!(config.autonomous_conversation_group_max_turns(), 1);
     }
 
     #[test]

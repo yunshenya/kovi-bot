@@ -2357,6 +2357,18 @@ async fn run_runtime(
                 }) => {
                     let autonomous_tick =
                         observation.event_type == EventType::AutonomousConversationTick;
+                    let conversation_id = observation.scope.conversation_id();
+                    let requested_directive = conversation_id.and_then(|conversation_id| {
+                        plan.state_updates.iter().find_map(|update| match update {
+                            yunxi_core::StateUpdateProposal::ConversationDirective {
+                                conversation_id: update_conversation_id,
+                                directive,
+                            } if *update_conversation_id == conversation_id => Some(*directive),
+                            _ => None,
+                        })
+                    });
+                    let model_config_for_continuation =
+                        requested_directive.is_some().then(crate::config::get);
                     let mut autonomous_delivered = false;
                     for (intent, action) in plan.intents.iter().zip(actions.iter()) {
                         if let CognitiveIntent::SendMessage {
@@ -2370,7 +2382,18 @@ async fn run_runtime(
                                 }
                             )
                         {
-                            super::autonomous::record_outbound(*conversation_id, Utc::now());
+                            if autonomous_tick {
+                                super::autonomous::record_outbound(*conversation_id, Utc::now());
+                            } else {
+                                super::autonomous::record_outbound_with_directive(
+                                    *conversation_id,
+                                    Utc::now(),
+                                    requested_directive,
+                                    model_config_for_continuation
+                                        .as_ref()
+                                        .map(|config| config.proactive()),
+                                );
+                            }
                             if autonomous_tick {
                                 autonomous_delivered = true;
                             }
@@ -2378,16 +2401,6 @@ async fn run_runtime(
                     }
                     if autonomous_tick {
                         if let Some(conversation_id) = observation.scope.conversation_id() {
-                            let requested_directive =
-                                plan.state_updates.iter().find_map(|update| match update {
-                                    yunxi_core::StateUpdateProposal::ConversationDirective {
-                                        conversation_id: update_conversation_id,
-                                        directive,
-                                    } if *update_conversation_id == conversation_id => {
-                                        Some(*directive)
-                                    }
-                                    _ => None,
-                                });
                             let directive = match (autonomous_delivered, requested_directive) {
                                 (true, Some(directive)) => directive,
                                 (false, Some(ConversationTurnDirective::End)) => {
@@ -2399,9 +2412,7 @@ async fn run_runtime(
                                 conversation_id,
                                 Utc::now(),
                                 directive,
-                                crate::config::get()
-                                    .proactive()
-                                    .autonomous_conversation_cooldown_secs(),
+                                crate::config::get().proactive(),
                             );
                         }
                         if autonomous_delivered
@@ -2740,6 +2751,9 @@ async fn resolve_and_submit_inner(
         );
     }
     if matches!(admission, Admission::Accepted) {
+        if message.address.kind() == ConversationKind::Group {
+            super::autonomous::observe_group_activity(conversation_id, message.timestamp);
+        }
         super::autonomous::observe_inbound(
             conversation_id,
             message.address.kind(),

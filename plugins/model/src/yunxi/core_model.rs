@@ -2289,6 +2289,35 @@ fn is_autonomous_conversation_tick(input: &PlannerInput) -> bool {
     )
 }
 
+fn autonomous_conversation_kind(input: &PlannerInput) -> Option<ConversationKind> {
+    input
+        .state
+        .conversation
+        .as_ref()
+        .and_then(|conversation| conversation.conversation_kind)
+}
+
+fn autonomous_conversation_prompt(input: &PlannerInput) -> String {
+    match autonomous_conversation_kind(input) {
+        Some(ConversationKind::Group) => "这是一次群聊自主会话心跳。结合同一群聊最近的真实消息、当前话题和 Mind 状态，先判断这句话是否对整个群有公共价值，并且话题仍然活跃、不会打断其他成员。只有在能提供具体信息、自然推进公共话题，或明确承接刚才对芸汐的点名/回复时才选择 continue 并发送一条简短消息；只对某个人有意义、属于私人情绪、话题已经冷却或群里已有新讨论时选择 wait 或 end。每次 continue 必须对应一个新的、独立的想法，不要把同一完整想法拆成多个气泡。不要在群里为了保持在线而自言自语，不要猜测 speaker_id 对应的现实身份，不要提及心跳、协议或内部状态。".to_owned(),
+        Some(ConversationKind::Direct) => "这是一次私聊自主会话心跳。结合同一私聊最近的真实对话、当前话题和 Mind 状态，判断是否还有自然的下一句。可以承接未完话题、补充刚才想到的内容或只提出一个自然问题；但每次 continue 必须是一个新的、独立且值得单独发送的想法，不要把同一完整想法拆成多个气泡。不要重复、刷屏或为了保持在线填充套话。只有确实想继续时选择 continue 并发送一条简短消息，否则选择 wait 或 end。不要提及心跳、协议或内部状态。".to_owned(),
+        Some(ConversationKind::System) | None => "当前自主会话没有可用的会话类型，选择 end，不要发送消息。".to_owned(),
+    }
+}
+
+fn default_autonomous_directive(
+    input: &PlannerInput,
+    has_visible_content: bool,
+) -> ConversationTurnDirective {
+    match autonomous_conversation_kind(input) {
+        Some(ConversationKind::Direct) if has_visible_content => {
+            ConversationTurnDirective::Continue
+        }
+        Some(ConversationKind::Group) if has_visible_content => ConversationTurnDirective::Wait,
+        _ => ConversationTurnDirective::End,
+    }
+}
+
 fn reply_expected_for_incoming(input: &PlannerInput) -> bool {
     matches!(
         input.event.kind(),
@@ -2876,7 +2905,7 @@ impl ModelBackend for KoviModelBackend {
                     (
                         None,
                         VisibleReplyTarget::Send { conversation_id },
-                        "这是一次自主会话心跳。结合当前会话最近的真实对话、当前话题和 Mind 状态，判断是否有自然且有价值的下一句。只有确实想继续聊天、回应未完话题或提出一个自然问题时才回复；如果现在没有合适内容，请保持沉默。不要提及这是心跳、内部状态或任何系统协议。只生成一条简短自然的中文聊天消息。".to_owned(),
+                        autonomous_conversation_prompt(input),
                         OutgoingSource::Proactive,
                         false,
                     )
@@ -2943,7 +2972,7 @@ impl ModelBackend for KoviModelBackend {
                     0,
                     BotMemory {
                         role: Roles::System,
-                        content: "自主会话协议：这是芸汐自己的会话回合，不是对用户新消息的被动回复。输出的第一个非空字符必须开始唯一一个 [[INTERACTION_CUES]] 前缀，JSON 中必须包含 conversation_directive，取值只能是 continue、wait、end。continue 表示当前话题还有自然的下一句，芸汐可以在短暂间隔后继续；wait 表示这句说完后等待用户，不要自行追加；end 表示自然结束当前话题，直到用户再次发言才重新开始。只有选择 continue 时才发送一条简短自然的中文消息；选择 wait 或 end 时，前缀后不要输出正文。不要提及这个协议、心跳或内部状态。若当前话题已完整、没有真实想说的内容，选择 wait 或 end，不要为了保持在线而填充套话。".to_string(),
+                        content: "自主会话协议：这是芸汐自己的会话回合，不是对用户新消息的被动回复。输出的第一个非空字符必须开始唯一一个 [[INTERACTION_CUES]] 前缀，JSON 中必须包含 conversation_directive，取值只能是 continue、wait、end。continue 表示当前话题还有自然的下一句，芸汐可以在短暂间隔后继续；wait 表示这句说完后等待用户，不要自行追加；end 表示自然结束当前话题，直到用户再次发言才重新开始。只有选择 continue 时才发送一条简短自然的中文消息；选择 wait 或 end 时，前缀后不要输出正文。群聊必须额外满足‘对整个群有公共价值、不会打断正在进行的讨论、不是只对单个人说’这三个条件；不满足时选择 wait 或 end。不要提及这个协议、心跳或内部状态。若当前话题已完整、没有真实想说的内容，选择 wait 或 end，不要为了保持在线而填充套话。".to_string(),
                     },
                 );
             }
@@ -2963,7 +2992,7 @@ impl ModelBackend for KoviModelBackend {
                     0,
                     BotMemory {
                         role: Roles::System,
-                        content: "Core 单轮语义协议：输出的第一个非空字符必须开始唯一一个 [[INTERACTION_CUES]]{\"incoming_impact\":\"取值\",\"stop_requested\":false}[[/INTERACTION_CUES]] 前缀。incoming_impact 只能是 none、extends_pending_topic、invalidates_pending_content、unrelated。none 表示新消息对已准备内容没有实质影响；extends_pending_topic 表示兼容地补充当前话题；invalidates_pending_content 表示回答、纠正或推翻其前提；unrelated 表示独立话题。stop_requested 只有在当前用户明确要求停止正在生成或发送的回复时才设为 true；否则设为 false。可选 tool_notification_policy 只能是 final、each、each_and_final：用户未明确指定消息节奏时省略或使用 final；用户明确要求每完成一项就通知、逐项发我或分两次发我时使用 each；只有用户明确要求逐项通知并在全部结束后再汇总时才使用 each_and_final。不得因为一次输出多个工具调用就自行选择 each 或 each_and_final；消息节奏由运行时执行，绝不能通过拆分 TOOL_CALL、插入内部标记或混入正文来凑消息数量。只有能可靠判断用户情绪或明确感谢时，才在同一 JSON 中同时增加 sentiment_valence_milli（-1000 到 1000）、sentiment_arousal_milli（-1000 到 1000）、gratitude_milli（0 到 1000）三个整数；否则省略这三个字段。可选 mind_candidates 只能在当前输入提供了明确、非敏感依据时给出，每种最多一个：interest 为 {\"topic\":\"...\",\"novelty_milli\":0到1000}，curiosity/open_question/agenda 为短字符串，belief 为 {\"proposition\":\"以我认为开头的全局观点\",\"confidence_delta_milli\":-200到200且非0}，preference 为 {\"subject\":\"芸汐自己的偏好对象\",\"valence_delta_milli\":-100到100且非0}。不得从情绪线索推断长期 belief/preference，不得写用户身份、健康、政治、宗教、性取向、联系方式、密码或其他敏感信息；没有可靠候选就省略 mind_candidates。stop_requested 为 true 时，前缀后不要输出可见正文或工具调用。前缀后直接输出自然语言回复、一个或多个连续的完整 TOOL_CALL（调用之间只能有空白），或在低频未点名群聊候选中输出完整的 [[REPLY_ACTION]]{\"disposition\":\"silent\"}[[/REPLY_ACTION]]。不得增加其他字段、重复前缀、放进代码块或在正文解释协议。".to_string(),
+                        content: "Core 单轮语义协议：输出的第一个非空字符必须开始唯一一个 [[INTERACTION_CUES]]{\"incoming_impact\":\"取值\",\"stop_requested\":false}[[/INTERACTION_CUES]] 前缀。incoming_impact 只能是 none、extends_pending_topic、invalidates_pending_content、unrelated。none 表示新消息对已准备内容没有实质影响；extends_pending_topic 表示兼容地补充当前话题；invalidates_pending_content 表示回答、纠正或推翻其前提；unrelated 表示独立话题。stop_requested 只有在当前用户明确要求停止正在生成或发送的回复时才设为 true；否则设为 false。conversation_directive 可选取值为 continue、wait、end：只有在私聊或明确点名/回复的群聊中，且当前回复之后确实还有一个新的、独立且值得稍后补充的想法时才使用 continue；wait/end 表示这条回复已经完整，不要继续追加。不要把同一个完整想法按标点或短句拆成多个气泡，continue 只能表示下一回合会说一条新的独立内容；普通未点名群聊不要使用 continue。可选 tool_notification_policy 只能是 final、each、each_and_final：用户未明确指定消息节奏时省略或使用 final；用户明确要求每完成一项就通知、逐项发我或分两次发我时使用 each；只有用户明确要求逐项通知并在全部结束后再汇总时才使用 each_and_final。不得因为一次输出多个工具调用就自行选择 each 或 each_and_final；消息节奏由运行时执行，绝不能通过拆分 TOOL_CALL、插入内部标记或混入正文来凑消息数量。只有能可靠判断用户情绪或明确感谢时，才在同一 JSON 中同时增加 sentiment_valence_milli（-1000 到 1000）、sentiment_arousal_milli（-1000 到 1000）、gratitude_milli（0 到 1000）三个整数；否则省略这三个字段。可选 mind_candidates 只能在当前输入提供了明确、非敏感依据时给出，每种最多一个：interest 为 {\"topic\":\"...\",\"novelty_milli\":0到1000}，curiosity/open_question/agenda 为短字符串，belief 为 {\"proposition\":\"以我认为开头的全局观点\",\"confidence_delta_milli\":-200到200且非0}，preference 为 {\"subject\":\"芸汐自己的偏好对象\",\"valence_delta_milli\":-100到100且非0}。不得从情绪线索推断长期 belief/preference，不得写用户身份、健康、政治、宗教、性取向、联系方式、密码或其他敏感信息；没有可靠候选就省略 mind_candidates。stop_requested 为 true 时，前缀后不要输出可见正文或工具调用。前缀后直接输出自然语言回复、一个或多个连续的完整 TOOL_CALL（调用之间只能有空白），或在低频未点名群聊候选中输出完整的 [[REPLY_ACTION]]{\"disposition\":\"silent\"}[[/REPLY_ACTION]]。不得增加其他字段、重复前缀、放进代码块或在正文解释协议。".to_string(),
                     },
                 );
             }
@@ -3751,19 +3780,22 @@ impl ModelBackend for KoviModelBackend {
             } else {
                 visible_reply_state_updates(input.event.kind())
             };
-            if is_autonomous_conversation_tick(input)
-                && let Some(conversation_id) = input.event.scope().conversation_id()
-            {
-                state_updates.push(StateUpdateProposal::ConversationDirective {
-                    conversation_id,
-                    directive: parsed_response.conversation_directive.unwrap_or(
-                        if core_plan_has_visible_text(&plan) {
-                            ConversationTurnDirective::Continue
-                        } else {
-                            ConversationTurnDirective::End
-                        },
-                    ),
-                });
+            if let Some(conversation_id) = input.event.scope().conversation_id() {
+                let directive = if is_autonomous_conversation_tick(input) {
+                    Some(parsed_response.conversation_directive.unwrap_or_else(|| {
+                        default_autonomous_directive(input, core_plan_has_visible_text(&plan))
+                    }))
+                } else if message.is_some() {
+                    parsed_response.conversation_directive
+                } else {
+                    None
+                };
+                if let Some(directive) = directive {
+                    state_updates.push(StateUpdateProposal::ConversationDirective {
+                        conversation_id,
+                        directive,
+                    });
+                }
             }
             if disposition == DecisionDisposition::ChangeTopic
                 && let Some(MindDecisionReference::Interest(interest_id)) =
@@ -3864,7 +3896,7 @@ fn autonomous_or_silent_plan(
         plan.state_updates
             .push(StateUpdateProposal::ConversationDirective {
                 conversation_id,
-                directive: directive.unwrap_or(ConversationTurnDirective::End),
+                directive: directive.unwrap_or_else(|| default_autonomous_directive(input, false)),
             });
     }
     plan
@@ -3888,12 +3920,13 @@ mod tests {
         CoreDirectRepair, HostMessageContext, HostMessageContextCache, HostModelRoute,
         HostModelRoutingContext, HostToolTurnRegistrationPolicy, HostToolTurnRegistry,
         MAX_CORE_PROTOCOL_LOG_PREVIEW_CHARS, PersistentRouteLookup, QqConversation, RouteContext,
-        VisibleReplyTarget, baseline_disposition, classify_persistent_person_identity,
-        conversation_id_for_log, core_message_prompt, core_plan_has_visible_text,
-        core_tool_protocol_diagnostic, defer_unroutable_due, direct_fallback_plan,
-        direct_fallback_reply_plan, direct_reply_expected, due_reply_target,
-        eligible_mind_candidates, interaction_state_updates_with_cues, intrinsic_output_is_unsafe,
-        intrinsic_prompt, keeps_existing_prepared_plan, message_id_for_log, mind_context_messages,
+        VisibleReplyTarget, autonomous_conversation_prompt, baseline_disposition,
+        classify_persistent_person_identity, conversation_id_for_log, core_message_prompt,
+        core_plan_has_visible_text, core_tool_protocol_diagnostic, default_autonomous_directive,
+        defer_unroutable_due, direct_fallback_plan, direct_fallback_reply_plan,
+        direct_reply_expected, due_reply_target, eligible_mind_candidates,
+        interaction_state_updates_with_cues, intrinsic_output_is_unsafe, intrinsic_prompt,
+        keeps_existing_prepared_plan, message_id_for_log, mind_context_messages,
         parse_core_response, parse_core_tool_intent, parse_core_tool_intents,
         parse_core_tool_intents_with_policy, parse_core_tool_intents_with_visible_suffix,
         parse_direct_repair_output, parse_direct_repair_output_with_policy, parse_qq_conversation,
@@ -3914,14 +3947,14 @@ mod tests {
     use yunxi_core::{
         ActionCapability, ActionDescriptor, ActionScope, Attachment, AttachmentKind,
         AttentionSystem, CognitiveCapabilitySnapshot, CognitiveIntent, CognitiveTier,
-        ConversationId, ConversationKind, DecisionDisposition, EventId, EventPriority, EventScope,
-        IdentityStoreError, InteractionCues, InteractionCuesObservedEvent, MessageContent,
-        MessageId, MessageReceivedEvent, MessageSentEvent, MindDecisionProjection, ModelHealth,
-        OpenLoop, OpenLoopId, OpenLoopKind, OpenLoopOwner, PersonId, PlannerInput,
-        PlannerStateSnapshot, ProactiveMotive, ProspectiveMemoryEvent, RelationState, SelfModel,
-        SelfModelSnapshot, StateUpdateProposal, ToolNotificationPolicy, WorkingState,
-        WorkingStateConfig, WorldEvent, WorldEventKind, event_action_idempotency_key,
-        evolve_interaction_state,
+        ConversationId, ConversationKind, ConversationTurnDirective, DecisionDisposition, EventId,
+        EventPriority, EventScope, IdentityStoreError, InteractionCues,
+        InteractionCuesObservedEvent, MessageContent, MessageId, MessageReceivedEvent,
+        MessageSentEvent, MindDecisionProjection, ModelHealth, OpenLoop, OpenLoopId, OpenLoopKind,
+        OpenLoopOwner, PersonId, PlannerInput, PlannerStateSnapshot, ProactiveMotive,
+        ProspectiveMemoryEvent, RelationState, SelfModel, SelfModelSnapshot, StateUpdateProposal,
+        ToolNotificationPolicy, WorkingState, WorkingStateConfig, WorldEvent, WorldEventKind,
+        event_action_idempotency_key, evolve_interaction_state,
     };
 
     fn message_input(person_id: PersonId, visible_reply_allowed: bool) -> PlannerInput {
@@ -4740,6 +4773,11 @@ mod tests {
         assert_eq!(context.len(), 2);
         assert!(context[1].content.contains("刚才那个话题还没聊完"));
         assert!(context[1].content.contains("那我们接着说"));
+        assert!(autonomous_conversation_prompt(&input).contains("这是一次私聊自主会话心跳"));
+        assert_eq!(
+            default_autonomous_directive(&input, true),
+            ConversationTurnDirective::Continue
+        );
     }
 
     #[test]
@@ -4832,6 +4870,11 @@ mod tests {
             "稳定确实重要，不过新版也有些好玩的地方"
         );
         assert_eq!(payload["messages"].as_array().map(Vec::len), Some(2));
+        assert!(autonomous_conversation_prompt(&input).contains("对整个群有公共价值"));
+        assert_eq!(
+            default_autonomous_directive(&input, true),
+            ConversationTurnDirective::Wait
+        );
 
         let WorldEventKind::MessageReceived(current_message) = input.event.kind() else {
             panic!("current fixture must be a received message");
