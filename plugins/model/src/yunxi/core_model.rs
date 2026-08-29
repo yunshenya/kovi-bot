@@ -2289,6 +2289,35 @@ fn is_autonomous_conversation_tick(input: &PlannerInput) -> bool {
     )
 }
 
+fn autonomous_conversation_kind(input: &PlannerInput) -> Option<ConversationKind> {
+    input
+        .state
+        .conversation
+        .as_ref()
+        .and_then(|conversation| conversation.conversation_kind)
+}
+
+fn autonomous_conversation_prompt(input: &PlannerInput) -> String {
+    match autonomous_conversation_kind(input) {
+        Some(ConversationKind::Group) => "这是一次群聊自主会话心跳。结合同一群聊最近的真实消息、当前话题和 Mind 状态，先判断这句话是否对整个群有公共价值，并且话题仍然活跃、不会打断其他成员。只有在能提供具体信息、自然推进公共话题，或明确承接刚才对芸汐的点名/回复时才选择 continue 并发送一条简短消息；只对某个人有意义、属于私人情绪、话题已经冷却或群里已有新讨论时选择 wait 或 end。不要在群里为了保持在线而自言自语，不要猜测 speaker_id 对应的现实身份，不要提及心跳、协议或内部状态。".to_owned(),
+        Some(ConversationKind::Direct) => "这是一次私聊自主会话心跳。结合同一私聊最近的真实对话、当前话题和 Mind 状态，判断是否还有自然的下一句。可以承接未完话题、补充刚才想到的内容或只提出一个自然问题；但不要重复、刷屏或为了保持在线填充套话。只有确实想继续时选择 continue 并发送一条简短消息，否则选择 wait 或 end。不要提及心跳、协议或内部状态。".to_owned(),
+        Some(ConversationKind::System) | None => "当前自主会话没有可用的会话类型，选择 end，不要发送消息。".to_owned(),
+    }
+}
+
+fn default_autonomous_directive(
+    input: &PlannerInput,
+    has_visible_content: bool,
+) -> ConversationTurnDirective {
+    match autonomous_conversation_kind(input) {
+        Some(ConversationKind::Direct) if has_visible_content => {
+            ConversationTurnDirective::Continue
+        }
+        Some(ConversationKind::Group) if has_visible_content => ConversationTurnDirective::Wait,
+        _ => ConversationTurnDirective::End,
+    }
+}
+
 fn reply_expected_for_incoming(input: &PlannerInput) -> bool {
     matches!(
         input.event.kind(),
@@ -2876,7 +2905,7 @@ impl ModelBackend for KoviModelBackend {
                     (
                         None,
                         VisibleReplyTarget::Send { conversation_id },
-                        "这是一次自主会话心跳。结合当前会话最近的真实对话、当前话题和 Mind 状态，判断是否有自然且有价值的下一句。只有确实想继续聊天、回应未完话题或提出一个自然问题时才回复；如果现在没有合适内容，请保持沉默。不要提及这是心跳、内部状态或任何系统协议。只生成一条简短自然的中文聊天消息。".to_owned(),
+                        autonomous_conversation_prompt(input),
                         OutgoingSource::Proactive,
                         false,
                     )
@@ -2943,7 +2972,7 @@ impl ModelBackend for KoviModelBackend {
                     0,
                     BotMemory {
                         role: Roles::System,
-                        content: "自主会话协议：这是芸汐自己的会话回合，不是对用户新消息的被动回复。输出的第一个非空字符必须开始唯一一个 [[INTERACTION_CUES]] 前缀，JSON 中必须包含 conversation_directive，取值只能是 continue、wait、end。continue 表示当前话题还有自然的下一句，芸汐可以在短暂间隔后继续；wait 表示这句说完后等待用户，不要自行追加；end 表示自然结束当前话题，直到用户再次发言才重新开始。只有选择 continue 时才发送一条简短自然的中文消息；选择 wait 或 end 时，前缀后不要输出正文。不要提及这个协议、心跳或内部状态。若当前话题已完整、没有真实想说的内容，选择 wait 或 end，不要为了保持在线而填充套话。".to_string(),
+                    content: "自主会话协议：这是芸汐自己的会话回合，不是对用户新消息的被动回复。输出的第一个非空字符必须开始唯一一个 [[INTERACTION_CUES]] 前缀，JSON 中必须包含 conversation_directive，取值只能是 continue、wait、end。continue 表示当前话题还有自然的下一句，芸汐可以在短暂间隔后继续；wait 表示这句说完后等待用户，不要自行追加；end 表示自然结束当前话题，直到用户再次发言才重新开始。只有选择 continue 时才发送一条简短自然的中文消息；选择 wait 或 end 时，前缀后不要输出正文。群聊必须额外满足‘对整个群有公共价值、不会打断正在进行的讨论、不是只对单个人说’这三个条件；不满足时选择 wait 或 end。不要提及这个协议、心跳或内部状态。若当前话题已完整、没有真实想说的内容，选择 wait 或 end，不要为了保持在线而填充套话。".to_string(),
                     },
                 );
             }
@@ -3756,13 +3785,9 @@ impl ModelBackend for KoviModelBackend {
             {
                 state_updates.push(StateUpdateProposal::ConversationDirective {
                     conversation_id,
-                    directive: parsed_response.conversation_directive.unwrap_or(
-                        if core_plan_has_visible_text(&plan) {
-                            ConversationTurnDirective::Continue
-                        } else {
-                            ConversationTurnDirective::End
-                        },
-                    ),
+                    directive: parsed_response.conversation_directive.unwrap_or_else(|| {
+                        default_autonomous_directive(input, core_plan_has_visible_text(&plan))
+                    }),
                 });
             }
             if disposition == DecisionDisposition::ChangeTopic
@@ -3864,7 +3889,7 @@ fn autonomous_or_silent_plan(
         plan.state_updates
             .push(StateUpdateProposal::ConversationDirective {
                 conversation_id,
-                directive: directive.unwrap_or(ConversationTurnDirective::End),
+                directive: directive.unwrap_or_else(|| default_autonomous_directive(input, false)),
             });
     }
     plan
@@ -3888,12 +3913,13 @@ mod tests {
         CoreDirectRepair, HostMessageContext, HostMessageContextCache, HostModelRoute,
         HostModelRoutingContext, HostToolTurnRegistrationPolicy, HostToolTurnRegistry,
         MAX_CORE_PROTOCOL_LOG_PREVIEW_CHARS, PersistentRouteLookup, QqConversation, RouteContext,
-        VisibleReplyTarget, baseline_disposition, classify_persistent_person_identity,
-        conversation_id_for_log, core_message_prompt, core_plan_has_visible_text,
-        core_tool_protocol_diagnostic, defer_unroutable_due, direct_fallback_plan,
-        direct_fallback_reply_plan, direct_reply_expected, due_reply_target,
-        eligible_mind_candidates, interaction_state_updates_with_cues, intrinsic_output_is_unsafe,
-        intrinsic_prompt, keeps_existing_prepared_plan, message_id_for_log, mind_context_messages,
+        VisibleReplyTarget, autonomous_conversation_prompt, baseline_disposition,
+        classify_persistent_person_identity, conversation_id_for_log, core_message_prompt,
+        core_plan_has_visible_text, core_tool_protocol_diagnostic, default_autonomous_directive,
+        defer_unroutable_due, direct_fallback_plan, direct_fallback_reply_plan,
+        direct_reply_expected, due_reply_target, eligible_mind_candidates,
+        interaction_state_updates_with_cues, intrinsic_output_is_unsafe, intrinsic_prompt,
+        keeps_existing_prepared_plan, message_id_for_log, mind_context_messages,
         parse_core_response, parse_core_tool_intent, parse_core_tool_intents,
         parse_core_tool_intents_with_policy, parse_core_tool_intents_with_visible_suffix,
         parse_direct_repair_output, parse_direct_repair_output_with_policy, parse_qq_conversation,
@@ -3914,14 +3940,14 @@ mod tests {
     use yunxi_core::{
         ActionCapability, ActionDescriptor, ActionScope, Attachment, AttachmentKind,
         AttentionSystem, CognitiveCapabilitySnapshot, CognitiveIntent, CognitiveTier,
-        ConversationId, ConversationKind, DecisionDisposition, EventId, EventPriority, EventScope,
-        IdentityStoreError, InteractionCues, InteractionCuesObservedEvent, MessageContent,
-        MessageId, MessageReceivedEvent, MessageSentEvent, MindDecisionProjection, ModelHealth,
-        OpenLoop, OpenLoopId, OpenLoopKind, OpenLoopOwner, PersonId, PlannerInput,
-        PlannerStateSnapshot, ProactiveMotive, ProspectiveMemoryEvent, RelationState, SelfModel,
-        SelfModelSnapshot, StateUpdateProposal, ToolNotificationPolicy, WorkingState,
-        WorkingStateConfig, WorldEvent, WorldEventKind, event_action_idempotency_key,
-        evolve_interaction_state,
+        ConversationId, ConversationKind, ConversationTurnDirective, DecisionDisposition, EventId,
+        EventPriority, EventScope, IdentityStoreError, InteractionCues,
+        InteractionCuesObservedEvent, MessageContent, MessageId, MessageReceivedEvent,
+        MessageSentEvent, MindDecisionProjection, ModelHealth, OpenLoop, OpenLoopId, OpenLoopKind,
+        OpenLoopOwner, PersonId, PlannerInput, PlannerStateSnapshot, ProactiveMotive,
+        ProspectiveMemoryEvent, RelationState, SelfModel, SelfModelSnapshot, StateUpdateProposal,
+        ToolNotificationPolicy, WorkingState, WorkingStateConfig, WorldEvent, WorldEventKind,
+        event_action_idempotency_key, evolve_interaction_state,
     };
 
     fn message_input(person_id: PersonId, visible_reply_allowed: bool) -> PlannerInput {
@@ -4740,6 +4766,11 @@ mod tests {
         assert_eq!(context.len(), 2);
         assert!(context[1].content.contains("刚才那个话题还没聊完"));
         assert!(context[1].content.contains("那我们接着说"));
+        assert!(autonomous_conversation_prompt(&input).contains("这是一次私聊自主会话心跳"));
+        assert_eq!(
+            default_autonomous_directive(&input, true),
+            ConversationTurnDirective::Continue
+        );
     }
 
     #[test]
@@ -4832,6 +4863,11 @@ mod tests {
             "稳定确实重要，不过新版也有些好玩的地方"
         );
         assert_eq!(payload["messages"].as_array().map(Vec::len), Some(2));
+        assert!(autonomous_conversation_prompt(&input).contains("对整个群有公共价值"));
+        assert_eq!(
+            default_autonomous_directive(&input, true),
+            ConversationTurnDirective::Wait
+        );
 
         let WorldEventKind::MessageReceived(current_message) = input.event.kind() else {
             panic!("current fixture must be a received message");

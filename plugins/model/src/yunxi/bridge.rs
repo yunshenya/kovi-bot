@@ -2399,9 +2399,7 @@ async fn run_runtime(
                                 conversation_id,
                                 Utc::now(),
                                 directive,
-                                crate::config::get()
-                                    .proactive()
-                                    .autonomous_conversation_cooldown_secs(),
+                                crate::config::get().proactive(),
                             );
                         }
                         if autonomous_delivered
@@ -2740,6 +2738,9 @@ async fn resolve_and_submit_inner(
         );
     }
     if matches!(admission, Admission::Accepted) {
+        if message.address.kind() == ConversationKind::Group {
+            super::autonomous::observe_group_activity(conversation_id, message.timestamp);
+        }
         super::autonomous::observe_inbound(
             conversation_id,
             message.address.kind(),

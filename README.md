@@ -158,12 +158,15 @@ cooldown_secs = 7200
 push_probability_percent = 35
 # main_admin 可选，只应写在未跟踪的运行时配置中
 main_admin_decision_interval_secs = 10800
-# Neuro-sama 风格自主会话（只续接近期已回复的会话，且有冷却和回合上限）
+# Neuro-sama 风格自主会话（私聊更连续，群聊更克制；均有冷却和回合上限）
 autonomous_conversation_enabled = true
 autonomous_conversation_check_interval_secs = 15
 autonomous_conversation_idle_secs = 90
 autonomous_conversation_cooldown_secs = 15
 autonomous_conversation_max_turns = 4
+autonomous_conversation_group_idle_secs = 180
+autonomous_conversation_group_cooldown_secs = 90
+autonomous_conversation_group_max_turns = 1
 
 [traffic]
 enabled = true
