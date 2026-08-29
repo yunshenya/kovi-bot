@@ -766,6 +766,7 @@ impl CoreBridge {
     pub(crate) async fn submit_autonomous_conversation_tick(
         &self,
         conversation_id: ConversationId,
+        explicit_continuation_requested: bool,
     ) -> Result<Admission, yunxi_core::SubmitError> {
         self.runtime
             .submit(WorldEvent::new(
@@ -773,7 +774,9 @@ impl CoreBridge {
                 EventScope::Conversation { conversation_id },
                 EventPriority::Low,
                 WorldEventKind::AutonomousConversationTick(
-                    yunxi_core::AutonomousConversationTickEvent,
+                    yunxi_core::AutonomousConversationTickEvent {
+                        explicit_continuation_requested,
+                    },
                 ),
             ))
             .await
@@ -2358,6 +2361,9 @@ async fn run_runtime(
                     let autonomous_tick =
                         observation.event_type == EventType::AutonomousConversationTick;
                     let conversation_id = observation.scope.conversation_id();
+                    let explicit_continuation_requested = autonomous_tick
+                        && conversation_id
+                            .is_some_and(super::autonomous::explicit_continuation_claimed);
                     let requested_directive = conversation_id.and_then(|conversation_id| {
                         plan.state_updates.iter().find_map(|update| match update {
                             yunxi_core::StateUpdateProposal::ConversationDirective {
@@ -2367,8 +2373,6 @@ async fn run_runtime(
                             _ => None,
                         })
                     });
-                    let model_config_for_continuation =
-                        requested_directive.is_some().then(crate::config::get);
                     let mut autonomous_delivered = false;
                     for (intent, action) in plan.intents.iter().zip(actions.iter()) {
                         if let CognitiveIntent::SendMessage {
@@ -2385,14 +2389,19 @@ async fn run_runtime(
                             if autonomous_tick {
                                 super::autonomous::record_outbound(*conversation_id, Utc::now());
                             } else {
-                                super::autonomous::record_outbound_with_directive(
-                                    *conversation_id,
-                                    Utc::now(),
-                                    requested_directive,
-                                    model_config_for_continuation
-                                        .as_ref()
-                                        .map(|config| config.proactive()),
-                                );
+                                let proactive_config = crate::config::get().proactive().clone();
+                                let effective_directive =
+                                    super::autonomous::record_outbound_with_directive(
+                                        *conversation_id,
+                                        Utc::now(),
+                                        requested_directive,
+                                        Some(&proactive_config),
+                                    );
+                                if let Some(directive) = effective_directive {
+                                    kovi::log::info!(
+                                        "Yunxi conversation continuation registered: conversation_id={conversation_id} model_directive={requested_directive:?} effective_directive={directive:?}"
+                                    );
+                                }
                             }
                             if autonomous_tick {
                                 autonomous_delivered = true;
@@ -2416,6 +2425,7 @@ async fn run_runtime(
                             );
                         }
                         if autonomous_delivered
+                            && !explicit_continuation_requested
                             && let Err(error) = crate::memory::MEMORY_MANAGER
                                 .record_proactive_event(
                                     None,
@@ -2764,6 +2774,15 @@ async fn resolve_and_submit_inner(
                 || message.planner_attention_requested
                 || recent_agent_reply,
         );
+        if message.address.kind() == ConversationKind::Direct
+            && let Some(max_autonomous_turns) =
+                super::autonomous::explicit_continuation_request(&message.text)
+        {
+            super::autonomous::request_continuation(conversation_id, max_autonomous_turns);
+            kovi::log::info!(
+                "Yunxi explicit conversation continuation requested: conversation_id={conversation_id} max_autonomous_turns={max_autonomous_turns}"
+            );
+        }
     }
     Ok(())
 }

@@ -643,11 +643,14 @@ pub struct ProspectiveMemoryEvent {
 /// A host-generated opportunity for the agent to continue an active
 /// conversation without a new inbound message.
 ///
-/// This is intentionally a marker event. The conversation scope carries the
-/// only routing identity; the host remains responsible for admission,
-/// cooldowns, and deciding which conversations are eligible.
+/// The conversation scope carries the routing identity; the optional flag
+/// records whether a user explicitly requested a bounded multi-turn exchange.
+/// The host remains responsible for admission, cooldowns, and eligibility.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct AutonomousConversationTickEvent;
+pub struct AutonomousConversationTickEvent {
+    #[serde(default)]
+    pub explicit_continuation_requested: bool,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActionSucceededEvent {
@@ -1352,7 +1355,7 @@ mod tests {
                 conversation_id: ConversationId::new(),
             },
             EventPriority::Low,
-            WorldEventKind::AutonomousConversationTick(AutonomousConversationTickEvent),
+            WorldEventKind::AutonomousConversationTick(AutonomousConversationTickEvent::default()),
         );
         assert_eq!(valid.validate(8), Ok(()));
 
@@ -1360,7 +1363,7 @@ mod tests {
             Utc::now(),
             EventScope::Global,
             EventPriority::Low,
-            WorldEventKind::AutonomousConversationTick(AutonomousConversationTickEvent),
+            WorldEventKind::AutonomousConversationTick(AutonomousConversationTickEvent::default()),
         );
         assert_eq!(
             invalid.validate(8),

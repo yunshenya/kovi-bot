@@ -315,7 +315,7 @@ mod tests {
                 conversation_id: ConversationId::new(),
             },
             EventPriority::Low,
-            WorldEventKind::AutonomousConversationTick(AutonomousConversationTickEvent),
+            WorldEventKind::AutonomousConversationTick(AutonomousConversationTickEvent::default()),
         );
 
         let result = AttentionSystem.evaluate(&event);

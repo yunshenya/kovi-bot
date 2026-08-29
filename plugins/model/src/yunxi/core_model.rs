@@ -2297,9 +2297,18 @@ fn autonomous_conversation_kind(input: &PlannerInput) -> Option<ConversationKind
         .and_then(|conversation| conversation.conversation_kind)
 }
 
+fn autonomous_tick_explicit_request(input: &PlannerInput) -> bool {
+    matches!(
+        input.event.kind(),
+        WorldEventKind::AutonomousConversationTick(tick)
+            if tick.explicit_continuation_requested
+    )
+}
+
 fn autonomous_conversation_prompt(input: &PlannerInput) -> String {
     match autonomous_conversation_kind(input) {
         Some(ConversationKind::Group) => "这是一次群聊自主会话心跳。结合同一群聊最近的真实消息、当前话题和 Mind 状态，先判断这句话是否对整个群有公共价值，并且话题仍然活跃、不会打断其他成员。只有在能提供具体信息、自然推进公共话题，或明确承接刚才对芸汐的点名/回复时才选择 continue 并发送一条简短消息；只对某个人有意义、属于私人情绪、话题已经冷却或群里已有新讨论时选择 wait 或 end。每次 continue 必须对应一个新的、独立的想法，不要把同一完整想法拆成多个气泡。不要在群里为了保持在线而自言自语，不要猜测 speaker_id 对应的现实身份，不要提及心跳、协议或内部状态。".to_owned(),
+        Some(ConversationKind::Direct) if autonomous_tick_explicit_request(input) => "这是用户明确请求的私聊连续对话实验中的下一回合。重新读取同一私聊最近的真实对话、当前话题和 Mind 状态；不要复述上一条，也不要拆分上一条。只要现在还能想到一个新的、独立且值得单独发送的观点、反应或问题，就选择 continue 并只发送这一条；不要仅仅因为上一句语法完整就停止。确实没有新内容时选择 wait 或 end。不要提及实验协议、心跳或内部状态。".to_owned(),
         Some(ConversationKind::Direct) => "这是一次私聊自主会话心跳。结合同一私聊最近的真实对话、当前话题和 Mind 状态，判断是否还有自然的下一句。可以承接未完话题、补充刚才想到的内容或只提出一个自然问题；但每次 continue 必须是一个新的、独立且值得单独发送的想法，不要把同一完整想法拆成多个气泡。不要重复、刷屏或为了保持在线填充套话。只有确实想继续时选择 continue 并发送一条简短消息，否则选择 wait 或 end。不要提及心跳、协议或内部状态。".to_owned(),
         Some(ConversationKind::System) | None => "当前自主会话没有可用的会话类型，选择 end，不要发送消息。".to_owned(),
     }
@@ -3319,6 +3328,14 @@ impl ModelBackend for KoviModelBackend {
                     }
                 }
             };
+            if fallback_response && is_autonomous_conversation_tick(input) {
+                crate::model::finish(ticket).await;
+                return Ok(autonomous_or_silent_plan(
+                    input,
+                    InteractionCues::default(),
+                    Some(ConversationTurnDirective::Wait),
+                ));
+            }
             let parsed_response = if fallback_response && message.is_some() {
                 ParsedCoreResponse {
                     content: response_content,
@@ -4762,7 +4779,9 @@ mod tests {
             Utc::now(),
             EventScope::Conversation { conversation_id },
             EventPriority::Low,
-            WorldEventKind::AutonomousConversationTick(yunxi_core::AutonomousConversationTickEvent),
+            WorldEventKind::AutonomousConversationTick(
+                yunxi_core::AutonomousConversationTickEvent::default(),
+            ),
         );
         let input = PlannerInput::new(
             tick,
@@ -4777,6 +4796,25 @@ mod tests {
         assert_eq!(
             default_autonomous_directive(&input, true),
             ConversationTurnDirective::Continue
+        );
+
+        let explicit_tick = WorldEvent::new(
+            Utc::now(),
+            EventScope::Conversation { conversation_id },
+            EventPriority::Low,
+            WorldEventKind::AutonomousConversationTick(
+                yunxi_core::AutonomousConversationTickEvent {
+                    explicit_continuation_requested: true,
+                },
+            ),
+        );
+        let explicit_input = PlannerInput::new(
+            explicit_tick,
+            PlannerStateSnapshot::new(state.global_version(), state.conversation(conversation_id)),
+        );
+        assert!(
+            autonomous_conversation_prompt(&explicit_input)
+                .contains("用户明确请求的私聊连续对话实验")
         );
     }
 
