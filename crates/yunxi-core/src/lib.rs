@@ -7,6 +7,8 @@
 pub mod action;
 pub mod arbiter;
 pub mod attention;
+pub mod channel;
+pub mod conversation;
 pub mod delivery;
 pub mod event;
 pub mod executive;
@@ -38,6 +40,11 @@ pub use arbiter::{
     StaleReason,
 };
 pub use attention::{AttentionDisposition, AttentionReason, AttentionResult, AttentionSystem};
+pub use channel::{ChannelAdapter, CoreHost, services_with_model};
+pub use conversation::{
+    AutonomyPolicy, ConversationLifecycle, ConversationLifecycleError, ConversationPhase,
+    MAX_LIFECYCLE_PARTICIPANTS,
+};
 pub use delivery::{
     DeliveryResolutionError, DeliveryResolver, DeliveryResolverFuture, DeliveryRoute,
 };

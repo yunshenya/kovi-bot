@@ -26,8 +26,8 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 use yunxi_core::{
     ActionArbiter, ActionArbiterConfig, ActionPort, ActionResult, Admission, Attachment,
-    AttachmentKind, CognitiveIntent, CognitiveRuntime, ConversationId, ConversationKind,
-    ConversationMemberStore, ConversationTurnDirective, CoreServices, EnvironmentCapabilities,
+    AttachmentKind, ChannelAdapter, CognitiveIntent, CognitiveRuntime, ConversationId,
+    ConversationKind, ConversationMemberStore, ConversationTurnDirective, CoreServices,
     EventPriority, EventScope, EventType, ExternalConversation, IdentityStore,
     MessageCollisionDetectedEvent, MessageContent, MessageId, MessageReceivedEvent, ModelBackend,
     OpenLoopStore, PlannedProcessingOutcome, ProcessingOutcome, ProposedAction, RuntimeConfig,
@@ -574,6 +574,9 @@ impl CoreBridge {
         if let Some(goals) = super::goal_store() {
             services = services.with_goals(goals);
         }
+        if let Some(provider) = super::mind_runtime() {
+            services = services.with_mind_snapshot_provider(provider);
+        }
         Self::start_inner(
             store.clone(),
             Some(open_loop_store),
@@ -661,19 +664,9 @@ impl CoreBridge {
             Option<Arc<dyn ActionPort>>,
         ) = action_adapter.map_or((None, None), |adapter| {
             let resolver: Arc<dyn yunxi_core::DeliveryResolver> = adapter.clone();
-            let arbiter = ActionArbiter::new(ActionArbiterConfig::default().with_capabilities(
-                EnvironmentCapabilities::new([
-                    yunxi_core::ActionDescriptor::new(yunxi_core::ActionCapability::SendMessage),
-                    yunxi_core::ActionDescriptor::new(yunxi_core::ActionCapability::ReachOut),
-                    yunxi_core::ActionDescriptor::new(yunxi_core::ActionCapability::UseTool),
-                    yunxi_core::ActionDescriptor::new(yunxi_core::ActionCapability::CreateOpenLoop),
-                    yunxi_core::ActionDescriptor::new(
-                        yunxi_core::ActionCapability::ResolveOpenLoop,
-                    ),
-                    yunxi_core::ActionDescriptor::new(yunxi_core::ActionCapability::StartGoal),
-                    yunxi_core::ActionDescriptor::new(yunxi_core::ActionCapability::CancelGoal),
-                ]),
-            ))
+            let arbiter = ActionArbiter::new(
+                ActionArbiterConfig::default().with_capabilities(adapter.capabilities()),
+            )
             .with_delivery_resolver(resolver);
             let port: Arc<dyn ActionPort> = adapter;
             (Some(Arc::new(arbiter)), Some(port))
@@ -2380,9 +2373,7 @@ async fn run_runtime(
                                 }
                             )
                         {
-                            if autonomous_tick {
-                                super::autonomous::record_outbound(*conversation_id, Utc::now());
-                            } else {
+                            if !autonomous_tick {
                                 let proactive_config = crate::config::get().proactive().clone();
                                 let effective_directive =
                                     super::autonomous::record_outbound_with_directive(
@@ -2415,6 +2406,7 @@ async fn run_runtime(
                         super::autonomous::finish_claim(
                             conversation_id,
                             Utc::now(),
+                            autonomous_delivered,
                             directive,
                             crate::config::get().proactive(),
                         );
@@ -2743,7 +2735,7 @@ async fn resolve_and_submit_inner(
         if message.address.kind() == ConversationKind::Group {
             super::autonomous::observe_group_activity(conversation_id, message.timestamp);
         }
-        super::autonomous::observe_inbound(
+        super::autonomous::observe_inbound_from_person(
             conversation_id,
             message.address.kind(),
             message.timestamp,
@@ -2752,6 +2744,7 @@ async fn resolve_and_submit_inner(
                 || message.explicit_request
                 || message.planner_attention_requested
                 || recent_agent_reply,
+            person_id,
         );
     }
     Ok(())

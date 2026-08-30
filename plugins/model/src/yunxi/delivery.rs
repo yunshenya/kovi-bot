@@ -30,11 +30,12 @@ use std::fmt;
 use std::sync::Arc;
 use thiserror::Error;
 use yunxi_core::{
-    ActionPort, ActionPortError, ActionPortFuture, ActionPortOutcome, ActionPortReleaseFuture,
-    ActionScope, ConversationId, ConversationKind, ConversationMemberStore,
-    DeliveryResolutionError, DeliveryResolver, DeliveryResolverFuture, DeliveryRoute, GoalState,
-    GoalStore, MAX_TOOL_ERROR_DETAIL_BYTES, MAX_TOOL_ERROR_DETAIL_CHARS, MAX_TOOL_RESULT_BYTES,
-    MAX_TOOL_RESULT_CHARS, MessageContent, MessageId, OpenLoopStore, ProposedAction,
+    ActionCapability, ActionDescriptor, ActionPort, ActionPortError, ActionPortFuture,
+    ActionPortOutcome, ActionPortReleaseFuture, ActionScope, ChannelAdapter, ConversationId,
+    ConversationKind, ConversationMemberStore, DeliveryResolutionError, DeliveryResolver,
+    DeliveryResolverFuture, DeliveryRoute, EnvironmentCapabilities, GoalState, GoalStore,
+    MAX_TOOL_ERROR_DETAIL_BYTES, MAX_TOOL_ERROR_DETAIL_CHARS, MAX_TOOL_RESULT_BYTES,
+    MAX_TOOL_RESULT_CHARS, MessageContent, MessageId, OpenLoopStore, PlatformId, ProposedAction,
     ReachOutIntent, ToolAction,
 };
 
@@ -1069,6 +1070,24 @@ impl DeliveryResolver for QqActionAdapter {
                 .await
                 .map(|(route, _)| route)
         })
+    }
+}
+
+impl ChannelAdapter for QqActionAdapter {
+    fn platform_id(&self) -> PlatformId {
+        PlatformId::new("qq").expect("qq is a valid Core platform id")
+    }
+
+    fn capabilities(&self) -> EnvironmentCapabilities {
+        EnvironmentCapabilities::new([
+            ActionDescriptor::new(ActionCapability::SendMessage),
+            ActionDescriptor::new(ActionCapability::ReachOut),
+            ActionDescriptor::new(ActionCapability::UseTool),
+            ActionDescriptor::new(ActionCapability::CreateOpenLoop),
+            ActionDescriptor::new(ActionCapability::ResolveOpenLoop),
+            ActionDescriptor::new(ActionCapability::StartGoal),
+            ActionDescriptor::new(ActionCapability::CancelGoal),
+        ])
     }
 }
 

@@ -15,8 +15,9 @@ use crate::mind::{
 };
 use crate::open_loop::OpenLoopOwner;
 use crate::planner::{
-    DecisionPlan, MAX_PLANNER_GOALS, MAX_PLANNER_INTENTS, Planner, PlannerError, PlannerInput,
-    PlannerOutputValidationError, PlannerStateSnapshot, StateUpdateProposal,
+    DecisionPlan, MAX_PLANNER_GOALS, MAX_PLANNER_INTENTS, MAX_PLANNER_PARTICIPANTS, Planner,
+    PlannerError, PlannerInput, PlannerOutputValidationError, PlannerStateSnapshot,
+    StateUpdateProposal,
 };
 use crate::ports::CoreServices;
 use crate::working_state::{
@@ -604,10 +605,14 @@ impl CognitiveRuntime {
 
     /// Installs Core services and uses their model backend for planning.
     pub fn install_services(&mut self, services: CoreServices) {
+        let mind_snapshot_provider = services.mind_snapshot_provider.clone();
         let planner =
             Planner::new(services.model.clone()).with_max_trace_depth(self.max_trace_depth);
         self.planner = Some(planner);
         self.services = Some(Arc::new(services));
+        if let Some(provider) = mind_snapshot_provider {
+            self.install_mind_snapshot_provider(provider);
+        }
     }
 
     /// Installs the optional Mind v2 retrieval boundary. Retrieval is
@@ -1315,6 +1320,7 @@ impl CognitiveRuntime {
         let mut memories = Vec::new();
         let mut open_loops = Vec::new();
         let mut goals = Vec::new();
+        let mut participants = Vec::new();
 
         if let Some(conversation_id) = conversation_id {
             let scope = MemoryScope::Conversation(conversation_id);
@@ -1333,6 +1339,13 @@ impl CognitiveRuntime {
                 &mut goals,
             )
             .await;
+            if let Ok(listed) = services
+                .conversation_members
+                .list(conversation_id, MAX_PLANNER_PARTICIPANTS)
+                .await
+            {
+                participants = listed;
+            }
         }
         if let Some(person_id) = person_id {
             let scope = MemoryScope::Person(person_id);
@@ -1372,7 +1385,8 @@ impl CognitiveRuntime {
         input = input
             .with_memories(memories)
             .with_open_loops(open_loops)
-            .with_goals(goals);
+            .with_goals(goals)
+            .with_participants(participants);
 
         if let Some(person_id) = person_id {
             if let Ok(relation) = services.relations.get(person_id).await {
@@ -7060,6 +7074,34 @@ mod tests {
                 .name(),
             "芸汐"
         );
+    }
+
+    #[tokio::test]
+    async fn services_container_installs_mind_provider_for_any_host() {
+        let timestamp = Utc::now();
+        let snapshot = MindSnapshot::new(
+            None,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            MindInfluenceMode::Shadow,
+            11,
+            timestamp,
+        )
+        .expect("valid mind snapshot");
+        let services = CoreServices::with_model(FakeModel)
+            .with_mind_snapshot_provider(Arc::new(StaticMindProvider { snapshot }));
+        let (_, runtime) = CognitiveRuntime::new_with_services(RuntimeConfig::default(), services)
+            .expect("runtime with shared services");
+        let input = runtime
+            .planner_input_with_context(direct_message(ConversationId::new(), PersonId::new()))
+            .await;
+
+        assert_eq!(input.mind.version(), 11);
+        assert_eq!(input.mind.influence_mode(), MindInfluenceMode::Shadow);
     }
 
     #[tokio::test]

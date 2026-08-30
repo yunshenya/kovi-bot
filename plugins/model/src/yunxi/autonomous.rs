@@ -10,21 +10,17 @@ use chrono::{DateTime, Utc};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
-use yunxi_core::{ConversationId, ConversationKind, ConversationTurnDirective};
+use yunxi_core::{
+    AutonomyPolicy, ConversationId, ConversationKind, ConversationLifecycle,
+    ConversationTurnDirective, PersonId,
+};
 
 const MAX_TRACKED_CONVERSATIONS: usize = 512;
 const IN_FLIGHT_TIMEOUT: Duration = Duration::from_secs(180);
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct ConversationActivity {
-    kind: ConversationKind,
-    last_inbound_at: DateTime<Utc>,
-    last_bot_at: Option<DateTime<Utc>>,
-    last_autonomous_at: Option<DateTime<Utc>>,
-    autonomous_turns: u8,
-    directive: ConversationTurnDirective,
-    continuation_decided: bool,
-    next_wake_at: Option<DateTime<Utc>>,
+    lifecycle: ConversationLifecycle,
     in_flight_since: Option<Instant>,
 }
 
@@ -39,11 +35,41 @@ static REGISTRY: LazyLock<Mutex<Registry>> = LazyLock::new(|| Mutex::new(Registr
 /// Record a high-value inbound turn. Ordinary ambient group observations are
 /// deliberately excluded by the caller so they cannot activate autonomous
 /// speaking for every busy group.
+#[allow(dead_code)]
 pub(crate) fn observe_inbound(
     conversation_id: ConversationId,
     kind: ConversationKind,
     occurred_at: DateTime<Utc>,
     eligible: bool,
+) {
+    observe_inbound_with_person(conversation_id, kind, occurred_at, eligible, None);
+}
+
+/// Record an inbound turn together with its stable Core person identity. The
+/// identity is optional at the generic boundary so hosts that cannot resolve a
+/// sender yet can still participate in the same lifecycle scheduler.
+pub(crate) fn observe_inbound_from_person(
+    conversation_id: ConversationId,
+    kind: ConversationKind,
+    occurred_at: DateTime<Utc>,
+    eligible: bool,
+    person_id: PersonId,
+) {
+    observe_inbound_with_person(
+        conversation_id,
+        kind,
+        occurred_at,
+        eligible,
+        Some(person_id),
+    );
+}
+
+fn observe_inbound_with_person(
+    conversation_id: ConversationId,
+    kind: ConversationKind,
+    occurred_at: DateTime<Utc>,
+    eligible: bool,
+    person_id: Option<PersonId>,
 ) {
     if !eligible {
         return;
@@ -61,26 +87,22 @@ pub(crate) fn observe_inbound(
     let entry = registry
         .entries
         .entry(conversation_id)
-        .or_insert(ConversationActivity {
-            kind,
-            last_inbound_at: occurred_at,
-            last_bot_at: None,
-            last_autonomous_at: None,
-            autonomous_turns: 0,
-            directive: ConversationTurnDirective::Wait,
-            continuation_decided: false,
-            next_wake_at: None,
+        .or_insert_with(|| ConversationActivity {
+            lifecycle: ConversationLifecycle::new(conversation_id, kind)
+                .expect("default autonomy lifecycle policy must be valid"),
             in_flight_since: None,
         });
-    entry.kind = kind;
-    entry.last_inbound_at = entry.last_inbound_at.max(occurred_at);
+    let observed = match person_id {
+        Some(person_id) => entry
+            .lifecycle
+            .observe_inbound(kind, person_id, occurred_at),
+        None => entry.lifecycle.observe_inbound_activity(kind, occurred_at),
+    };
+    if observed.is_err() {
+        return;
+    }
     // A new user turn resets the autonomous lifecycle and invalidates any
     // stale heartbeat claim that was waiting behind the incoming message.
-    entry.autonomous_turns = 0;
-    entry.last_autonomous_at = None;
-    entry.directive = ConversationTurnDirective::Wait;
-    entry.continuation_decided = false;
-    entry.next_wake_at = None;
     entry.in_flight_since = None;
 }
 
@@ -94,21 +116,19 @@ pub(crate) fn observe_group_activity(conversation_id: ConversationId, occurred_a
     let Some(entry) = registry.entries.get_mut(&conversation_id) else {
         return;
     };
-    if entry.kind != ConversationKind::Group || occurred_at <= entry.last_inbound_at {
+    if entry.lifecycle.kind() != ConversationKind::Group {
         return;
     }
-    entry.last_inbound_at = occurred_at;
-    entry.autonomous_turns = 0;
-    entry.last_autonomous_at = None;
-    entry.directive = ConversationTurnDirective::Wait;
-    entry.continuation_decided = false;
-    entry.next_wake_at = None;
+    if entry.lifecycle.observe_ambient_group(occurred_at).is_err() {
+        return;
+    }
     entry.in_flight_since = None;
 }
 
 /// Record a successfully delivered Core message for a tracked conversation.
 /// This is separate from `observe_inbound` so a normal reply can establish the
 /// "agent answered, now wait before continuing" boundary.
+#[cfg(test)]
 pub(crate) fn record_outbound(conversation_id: ConversationId, occurred_at: DateTime<Utc>) {
     let _ = record_outbound_with_directive(conversation_id, occurred_at, None, None);
 }
@@ -125,26 +145,11 @@ pub(crate) fn record_outbound_with_directive(
         return None;
     };
     let entry = registry.entries.get_mut(&conversation_id)?;
-    entry.last_bot_at = Some(
-        entry
-            .last_bot_at
-            .map_or(occurred_at, |current| current.max(occurred_at)),
-    );
-    if let (Some(directive), Some(config)) = (directive, config) {
-        let continue_delay_secs = match entry.kind {
-            ConversationKind::Direct => config.autonomous_conversation_cooldown_secs(),
-            ConversationKind::Group => config.autonomous_conversation_group_cooldown_secs(),
-            ConversationKind::System => 0,
-        };
-        entry.directive = directive;
-        entry.continuation_decided = true;
-        entry.next_wake_at = match directive {
-            ConversationTurnDirective::Continue => {
-                Some(occurred_at + chrono::Duration::seconds(continue_delay_secs.max(1) as i64))
-            }
-            ConversationTurnDirective::Wait | ConversationTurnDirective::End => None,
-        };
-    }
+    let policy = config.map(autonomy_policy).unwrap_or_default();
+    entry
+        .lifecycle
+        .record_outbound(occurred_at, directive, policy)
+        .ok()?;
     touch(&mut registry.order, conversation_id);
     directive
 }
@@ -159,43 +164,35 @@ pub(crate) fn claim_due(config: &ProactiveConfig, now: DateTime<Utc>) -> Option<
     let Ok(mut registry) = REGISTRY.lock() else {
         return None;
     };
+    let policy = autonomy_policy(config);
     let candidate = registry.order.iter().copied().find(|conversation_id| {
         let Some(entry) = registry.entries.get(conversation_id) else {
             return false;
         };
-        let idle_secs = match entry.kind {
-            ConversationKind::Direct => config.autonomous_conversation_idle_secs(),
-            ConversationKind::Group => config.autonomous_conversation_group_idle_secs(),
-            ConversationKind::System => return false,
-        };
-        let idle = chrono::Duration::seconds(idle_secs as i64);
         if entry
             .in_flight_since
             .is_some_and(|started| started.elapsed() < IN_FLIGHT_TIMEOUT)
         {
             return false;
         }
-        let Some(last_bot_at) = entry.last_bot_at else {
-            return false;
-        };
-        // There is deliberately no host-side conversation-length cap. The
-        // model's semantic directive and new inbound activity are the only
-        // lifecycle decisions; a fixed group budget makes conversation feel
-        // scripted and prevents a genuine continuation.
-        if last_bot_at < entry.last_inbound_at {
-            return false;
-        }
-        if entry.last_autonomous_at.is_none() {
-            if entry.continuation_decided {
-                return entry.directive == ConversationTurnDirective::Continue
-                    && entry.next_wake_at.is_some_and(|wake| now >= wake);
-            }
-            return now - entry.last_inbound_at >= idle;
-        }
-        entry.directive == ConversationTurnDirective::Continue
-            && entry.next_wake_at.is_some_and(|wake| now >= wake)
+        entry
+            .lifecycle
+            .autonomous_due(now, policy)
+            .is_ok_and(|due| due)
     })?;
     if let Some(entry) = registry.entries.get_mut(&candidate) {
+        if entry
+            .in_flight_since
+            .is_some_and(|started| started.elapsed() >= IN_FLIGHT_TIMEOUT)
+        {
+            // A stale host lease can be recovered after a process/task crash;
+            // the serializable Core lifecycle remains the source of truth.
+            entry.in_flight_since = None;
+            let _ = entry.lifecycle.release_autonomous_claim();
+        }
+        if entry.lifecycle.claim_autonomous(now, policy).ok() != Some(true) {
+            return None;
+        }
         entry.in_flight_since = Some(Instant::now());
     }
     Some(candidate)
@@ -208,6 +205,7 @@ pub(crate) fn release_claim(conversation_id: ConversationId) {
         && let Some(entry) = registry.entries.get_mut(&conversation_id)
     {
         entry.in_flight_since = None;
+        let _ = entry.lifecycle.release_autonomous_claim();
     }
 }
 
@@ -216,6 +214,7 @@ pub(crate) fn release_claim(conversation_id: ConversationId) {
 pub(crate) fn finish_claim(
     conversation_id: ConversationId,
     occurred_at: DateTime<Utc>,
+    delivered: bool,
     directive: ConversationTurnDirective,
     config: &ProactiveConfig,
 ) {
@@ -223,25 +222,29 @@ pub(crate) fn finish_claim(
         && let Some(entry) = registry.entries.get_mut(&conversation_id)
         && entry.in_flight_since.take().is_some()
     {
-        let continue_delay_secs = match entry.kind {
-            ConversationKind::Direct => config.autonomous_conversation_cooldown_secs(),
-            ConversationKind::Group => config.autonomous_conversation_group_cooldown_secs(),
-            ConversationKind::System => 0,
-        };
-        entry.last_autonomous_at = Some(occurred_at);
-        // Only group conversations use a per-interaction turn budget. Direct
-        // conversations remain open-ended and never accumulate a gate counter.
-        if entry.kind == ConversationKind::Group {
-            entry.autonomous_turns = entry.autonomous_turns.saturating_add(1);
-        }
-        entry.directive = directive;
-        entry.continuation_decided = true;
-        entry.next_wake_at = match directive {
-            ConversationTurnDirective::Continue => {
-                Some(occurred_at + chrono::Duration::seconds(continue_delay_secs.max(1) as i64))
-            }
-            ConversationTurnDirective::Wait | ConversationTurnDirective::End => None,
-        };
+        let _ = entry.lifecycle.finish_autonomous_claim(
+            occurred_at,
+            delivered,
+            directive,
+            autonomy_policy(config),
+        );
+    }
+}
+
+fn autonomy_policy(config: &ProactiveConfig) -> AutonomyPolicy {
+    AutonomyPolicy {
+        direct_idle: chrono::Duration::seconds(
+            config.autonomous_conversation_idle_secs().max(1) as i64
+        ),
+        group_idle: chrono::Duration::seconds(
+            config.autonomous_conversation_group_idle_secs().max(1) as i64,
+        ),
+        direct_cooldown: chrono::Duration::seconds(
+            config.autonomous_conversation_cooldown_secs().max(1) as i64,
+        ),
+        group_cooldown: chrono::Duration::seconds(
+            config.autonomous_conversation_group_cooldown_secs().max(1) as i64,
+        ),
     }
 }
 
@@ -265,12 +268,13 @@ fn touch(order: &mut VecDeque<ConversationId>, conversation_id: ConversationId) 
 mod tests {
     use super::{
         REGISTRY, claim_due, finish_claim, observe_group_activity, observe_inbound,
-        record_outbound, record_outbound_with_directive,
+        observe_inbound_from_person, record_outbound, record_outbound_with_directive,
+        release_claim,
     };
     use crate::config::ProactiveConfig;
     use chrono::{Duration, Utc};
     use std::sync::{LazyLock, Mutex};
-    use yunxi_core::{ConversationId, ConversationKind, ConversationTurnDirective};
+    use yunxi_core::{ConversationId, ConversationKind, ConversationTurnDirective, PersonId};
 
     static TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
@@ -296,7 +300,7 @@ mod tests {
         assert!(claim_due(&config, now).is_none());
         record_outbound(id, now - Duration::minutes(4));
         assert_eq!(claim_due(&config, now), Some(id));
-        finish_claim(id, now, ConversationTurnDirective::Wait, &config);
+        finish_claim(id, now, true, ConversationTurnDirective::Wait, &config);
         assert!(claim_due(&config, now + Duration::seconds(30)).is_none());
         clear();
     }
@@ -317,7 +321,7 @@ mod tests {
         record_outbound(id, now - Duration::minutes(4));
         assert_eq!(claim_due(&config, now), Some(id));
         observe_inbound(id, ConversationKind::Group, now, true);
-        finish_claim(id, now, ConversationTurnDirective::Continue, &config);
+        finish_claim(id, now, true, ConversationTurnDirective::Continue, &config);
         record_outbound(id, now);
         assert_eq!(claim_due(&config, now + Duration::minutes(4)), Some(id));
         clear();
@@ -338,7 +342,7 @@ mod tests {
         );
         record_outbound(id, now - Duration::minutes(2));
         assert_eq!(claim_due(&config, now), Some(id));
-        finish_claim(id, now, ConversationTurnDirective::End, &config);
+        finish_claim(id, now, true, ConversationTurnDirective::End, &config);
         assert!(claim_due(&config, now + Duration::hours(2)).is_none());
         observe_inbound(id, ConversationKind::Direct, now + Duration::hours(2), true);
         record_outbound(id, now + Duration::hours(2));
@@ -364,10 +368,10 @@ mod tests {
         );
         record_outbound(id, now - Duration::minutes(4));
         assert_eq!(claim_due(&config, now), Some(id));
-        finish_claim(id, now, ConversationTurnDirective::Continue, &config);
+        finish_claim(id, now, true, ConversationTurnDirective::Continue, &config);
         let next = now + Duration::minutes(5);
         assert_eq!(claim_due(&config, next), Some(id));
-        finish_claim(id, next, ConversationTurnDirective::Continue, &config);
+        finish_claim(id, next, true, ConversationTurnDirective::Continue, &config);
         assert_eq!(claim_due(&config, next + Duration::minutes(5)), Some(id));
         clear();
     }
@@ -388,7 +392,7 @@ mod tests {
         record_outbound(id, now - Duration::minutes(4));
         assert_eq!(claim_due(&config, now), Some(id));
         observe_group_activity(id, now);
-        finish_claim(id, now, ConversationTurnDirective::Continue, &config);
+        finish_claim(id, now, true, ConversationTurnDirective::Continue, &config);
         assert!(claim_due(&config, now + Duration::minutes(5)).is_none());
         clear();
     }
@@ -443,11 +447,17 @@ mod tests {
         let mut follow_up = now + Duration::seconds(15);
         for _ in 0..8 {
             assert_eq!(claim_due(&config, follow_up), Some(id));
-            finish_claim(id, follow_up, ConversationTurnDirective::Continue, &config);
+            finish_claim(
+                id,
+                follow_up,
+                true,
+                ConversationTurnDirective::Continue,
+                &config,
+            );
             follow_up += Duration::seconds(15);
         }
         assert_eq!(claim_due(&config, follow_up), Some(id));
-        finish_claim(id, follow_up, ConversationTurnDirective::End, &config);
+        finish_claim(id, follow_up, true, ConversationTurnDirective::End, &config);
         assert!(claim_due(&config, follow_up + Duration::hours(1)).is_none());
         clear();
     }
@@ -467,6 +477,79 @@ mod tests {
             Some(&config),
         );
         assert!(claim_due(&config, now + Duration::hours(2)).is_none());
+        clear();
+    }
+
+    #[test]
+    fn failed_autonomous_delivery_releases_claim_without_scheduling_follow_up() {
+        let _guard = TEST_LOCK.lock().expect("test lock");
+        clear();
+        let id = ConversationId::new();
+        let now = Utc::now();
+        let config = ProactiveConfig::default();
+        observe_inbound(id, ConversationKind::Direct, now, true);
+        record_outbound_with_directive(
+            id,
+            now,
+            Some(ConversationTurnDirective::Continue),
+            Some(&config),
+        );
+        let due = now + Duration::seconds(15);
+        assert_eq!(claim_due(&config, due), Some(id));
+        finish_claim(id, due, false, ConversationTurnDirective::Continue, &config);
+        assert!(claim_due(&config, due + Duration::hours(1)).is_none());
+        clear();
+    }
+
+    #[test]
+    fn rejected_submission_can_release_and_retry_the_same_heartbeat() {
+        let _guard = TEST_LOCK.lock().expect("test lock");
+        clear();
+        let id = ConversationId::new();
+        let now = Utc::now();
+        let config = ProactiveConfig::default();
+        observe_inbound(id, ConversationKind::Direct, now, true);
+        record_outbound_with_directive(
+            id,
+            now,
+            Some(ConversationTurnDirective::Continue),
+            Some(&config),
+        );
+        let due = now + Duration::seconds(15);
+        assert_eq!(claim_due(&config, due), Some(id));
+        assert!(claim_due(&config, due).is_none());
+        release_claim(id);
+        assert_eq!(claim_due(&config, due), Some(id));
+        finish_claim(id, due, true, ConversationTurnDirective::Wait, &config);
+        clear();
+    }
+
+    #[test]
+    fn person_aware_inbound_keeps_group_social_context_in_core_state() {
+        let _guard = TEST_LOCK.lock().expect("test lock");
+        clear();
+        let id = ConversationId::new();
+        let first = PersonId::new();
+        let second = PersonId::new();
+        let now = Utc::now();
+        observe_inbound_from_person(id, ConversationKind::Group, now, true, first);
+        observe_inbound_from_person(
+            id,
+            ConversationKind::Group,
+            now + Duration::seconds(1),
+            true,
+            second,
+        );
+        let registry = REGISTRY.lock().expect("registry lock");
+        let people = registry
+            .entries
+            .get(&id)
+            .expect("conversation is tracked")
+            .lifecycle
+            .active_people()
+            .collect::<Vec<_>>();
+        assert_eq!(people, vec![first, second]);
+        drop(registry);
         clear();
     }
 }

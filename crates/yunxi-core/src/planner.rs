@@ -9,7 +9,7 @@ use crate::arbiter::ActionDescriptor;
 use crate::event::{MessageReceivedEvent, WorldEvent};
 use crate::executive::ExecutiveSnapshot;
 use crate::goal::Goal;
-use crate::identity::{ConversationId, ConversationKind, OpenLoopId, PersonId};
+use crate::identity::{ConversationId, ConversationKind, ConversationMember, OpenLoopId, PersonId};
 use crate::intent::{CognitiveIntent, IntentValidationError};
 use crate::memory::Memory;
 use crate::mind::{MindSnapshot, MindValidationError};
@@ -28,6 +28,7 @@ pub const MAX_PLANNER_STATE_UPDATES: usize = 32;
 pub const MAX_PLANNER_MEMORIES: usize = 128;
 pub const MAX_PLANNER_OPEN_LOOPS: usize = 128;
 pub const MAX_PLANNER_GOALS: usize = 128;
+pub const MAX_PLANNER_PARTICIPANTS: usize = 256;
 pub const MAX_PLANNER_TOPIC_CHARS: usize = 512;
 pub const MAX_PLANNER_TOPIC_BYTES: usize = 2 * 1_024;
 
@@ -526,6 +527,11 @@ pub struct PlannerInput {
     pub open_loops: Vec<OpenLoop>,
     #[serde(default)]
     pub goals: Vec<Goal>,
+    /// Membership is a Core identity projection, never a platform-specific
+    /// nickname or external user id. It lets group-capable model backends
+    /// reason about roles and stable speakers without coupling to QQ.
+    #[serde(default)]
+    pub participants: Vec<ConversationMember>,
     pub relation: Option<RelationState>,
     pub affect: AffectState,
     pub capabilities: Vec<ActionDescriptor>,
@@ -548,6 +554,7 @@ impl PlannerInput {
             memories: Vec::new(),
             open_loops: Vec::new(),
             goals: Vec::new(),
+            participants: Vec::new(),
             relation: None,
             affect: AffectState::default(),
             capabilities: Vec::new(),
@@ -571,6 +578,12 @@ impl PlannerInput {
     #[must_use]
     pub fn with_goals(mut self, goals: Vec<Goal>) -> Self {
         self.goals = goals;
+        self
+    }
+
+    #[must_use]
+    pub fn with_participants(mut self, participants: Vec<ConversationMember>) -> Self {
+        self.participants = participants;
         self
     }
 
@@ -625,6 +638,20 @@ impl PlannerInput {
                 length: self.goals.len(),
                 maximum: MAX_PLANNER_GOALS,
             });
+        }
+        if self.participants.len() > MAX_PLANNER_PARTICIPANTS {
+            return Err(PlannerInputValidationError::TooManyParticipants {
+                length: self.participants.len(),
+                maximum: MAX_PLANNER_PARTICIPANTS,
+            });
+        }
+        if let Some(conversation_id) = self.state.conversation_id()
+            && self
+                .participants
+                .iter()
+                .any(|member| member.conversation_id() != conversation_id)
+        {
+            return Err(PlannerInputValidationError::ParticipantOutsideConversation);
         }
         self.affect.validate()?;
         if let Some(relation) = self.relation {
@@ -923,6 +950,10 @@ pub enum PlannerInputValidationError {
     TooManyOpenLoops { length: usize, maximum: usize },
     #[error("planner received too many goals: {length}, maximum {maximum}")]
     TooManyGoals { length: usize, maximum: usize },
+    #[error("planner received too many conversation participants: {length}, maximum {maximum}")]
+    TooManyParticipants { length: usize, maximum: usize },
+    #[error("planner received a participant outside the current conversation")]
+    ParticipantOutsideConversation,
     #[error("affect contains a non-finite value")]
     NonFiniteAffect,
     #[error("affect value is outside its supported range")]
@@ -1387,6 +1418,85 @@ mod tests {
         );
         let decoded: PlannerInput = serde_json::from_value(encoded).expect("round trip");
         assert_eq!(decoded.capabilities, input.capabilities);
+    }
+
+    #[test]
+    fn planner_input_carries_platform_neutral_group_membership() {
+        let conversation_id = ConversationId::new();
+        let member = ConversationMember::new(conversation_id, PersonId::new())
+            .with_role(Some("moderator".to_owned()))
+            .expect("valid role");
+        let event = WorldEvent::message_received(
+            EventPriority::Normal,
+            MessageReceivedEvent {
+                message_id: crate::MessageId::new(),
+                conversation_id,
+                sender: member.person_id(),
+                content: crate::MessageContent::text("hello"),
+                reply_to: None,
+                timestamp: Utc::now(),
+                conversation_kind: ConversationKind::Group,
+                addressed_to_agent: true,
+                replies_to_agent: false,
+                stop_requested: false,
+                explicit_request: false,
+                visible_reply_allowed: true,
+            },
+        );
+        let mut working_state =
+            crate::WorkingState::new(crate::WorkingStateConfig::default()).expect("working state");
+        let attention = crate::AttentionSystem;
+        working_state
+            .observe(&event, attention.evaluate(&event))
+            .expect("event should be observed");
+        let state = PlannerStateSnapshot::new(
+            working_state.global_version(),
+            working_state.conversation(conversation_id),
+        );
+        let input = PlannerInput::new(event, state).with_participants(vec![member.clone()]);
+        let encoded = serde_json::to_value(&input).expect("participant context serializes");
+        let decoded: PlannerInput = serde_json::from_value(encoded).expect("round trip");
+        assert_eq!(decoded.participants, vec![member]);
+        assert!(decoded.validate(8).is_ok());
+    }
+
+    #[test]
+    fn planner_rejects_membership_from_another_conversation() {
+        let conversation_id = ConversationId::new();
+        let foreign = ConversationMember::new(ConversationId::new(), PersonId::new());
+        let event = WorldEvent::message_received(
+            EventPriority::Normal,
+            MessageReceivedEvent {
+                message_id: crate::MessageId::new(),
+                conversation_id,
+                sender: foreign.person_id(),
+                content: crate::MessageContent::text("hello"),
+                reply_to: None,
+                timestamp: Utc::now(),
+                conversation_kind: ConversationKind::Group,
+                addressed_to_agent: true,
+                replies_to_agent: false,
+                stop_requested: false,
+                explicit_request: false,
+                visible_reply_allowed: true,
+            },
+        );
+        let mut working_state =
+            crate::WorkingState::new(crate::WorkingStateConfig::default()).expect("working state");
+        let attention = crate::AttentionSystem;
+        working_state
+            .observe(&event, attention.evaluate(&event))
+            .expect("event should be observed");
+        let state = PlannerStateSnapshot::new(
+            working_state.global_version(),
+            working_state.conversation(conversation_id),
+        );
+        assert_eq!(
+            PlannerInput::new(event, state)
+                .with_participants(vec![foreign])
+                .validate(8),
+            Err(PlannerInputValidationError::ParticipantOutsideConversation)
+        );
     }
 
     #[test]

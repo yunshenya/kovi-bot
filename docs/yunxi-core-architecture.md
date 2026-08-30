@@ -3606,23 +3606,29 @@ Effector / Adapter
 
 ---
 
-# 137.1 当前实现状态（2026-08-27）
+# 137.1 当前实现状态（2026-08-30）
 
 本节记录仓库当前实现，不改变前文的长期目标。状态中的“部分完成”表示领域类型或
 基础设施已经存在，但部分专用行为仍由 Kovi/QQ Host 承担，不能据此视为迁移完成。
 本次审计的非数据库自动测试已通过；需要 `DATABASE_URL` 的 PostgreSQL fixture 在当前环境中
 未执行，自动测试也不能替代下文列出的生产数据、真实宿主和长期运行人工验收。
 
+本轮升级把五个能力指标对应的共享机制补齐到可持续演进的基线：Core 新增
+`ChannelAdapter`/`CoreHost` 组合根，QQ 只实现该适配器；`ConversationLifecycle` 提供可序列化、
+无固定回合上限的私聊/群聊连续会话语义；Planner 上下文携带平台无关的群成员与角色投影；Mind
+上下文继续由 Core 读取并参与决策。这里的“约 90%”表示共享领域边界和自动化回路已经具备，
+不表示真实微信 Host、跨进程恢复或跨天人工体验已经验收。
+
 | Phase | 状态 | 当前实现与剩余工作 |
 | --- | --- | --- |
-| 0 Core crate | 已完成 | `yunxi-core` 已独立成 crate，可离线测试；CI 检查 Kovi、QQ、SQL 存储依赖边界。 |
+| 0 Core crate | 已完成 | `yunxi-core` 已独立成 crate，可离线测试；`ChannelAdapter` 与 `CoreHost` 提供不含 QQ 类型的 Host 组合根；CI 检查 Kovi、QQ、SQL 存储依赖边界。 |
 | 1 Identity | 已完成 | 已有 Core ID、PostgreSQL identity/conversation mapping、`ConversationMember` 懒 upsert、附件归一化和 identity unlink；Person import、direct route 与删除固定采用 `Person -> route -> Conversation` 锁序，删除按 canonical membership 枚举跨平台 direct conversation、保留 Group，并拒绝误删其他 Person 的 direct route；一致性 export/import 携带 Person Memory/Relation/Affect/OpenLoop/Goal，超限与跨 Person 冲突均 fail-closed。仍需真实跨平台 host 验收。 |
 | 2 Core Runtime | 已完成 | QQ ingress 会生成通用 `WorldEvent`，进入 bounded runtime、Attention 和 WorkingState。 |
 | 3 OpenLoop | 基础完成 | 已有平台无关领域模型、PostgreSQL store、去重、容量、atomic claim、lease recovery 和到期调度。Person 到期走 `ReachOut`，Conversation 到期走同会话非引用 `SendMessage`，Global 无安全路由时恢复为无 `due_at` 的 `Open`；真实 QQ 投递、跨重启和长时间运行仍需人工验收。 |
 | 4 Memory Bridge | 已完成 | `MemoryStore` port 已接入现有记忆系统，并提供规范化 Core 存储。 |
-| 5 Proactive | 当前范围完成 | Core 已有 motive/candidate/opportunity/`ReachOut`，旧主动聊天也会投影到 Core，canonical owner 路由已用于 owner 主动聊天；真实调度、画像/冷却策略和投递属于 Host/Adapter，保留现有实现符合当前边界。将可跨宿主复用的选择策略进一步迁入 Core 是长期可选工作。 |
+| 5 Proactive | 当前范围完成 | Core 已有 motive/candidate/opportunity/`ReachOut`，旧主动聊天也会投影到 Core，canonical owner 路由已用于 owner 主动聊天；`ConversationLifecycle` 在 Core 内统一 idle/cooldown、Continue/Wait/End 和并发 claim 语义，不再使用群聊固定回合上限；真实调度、画像/冷却策略和投递仍由 Host/Adapter 驱动。 |
 | 6 Intent / Action | 当前范围完成 | 已接通 Planner、`SendMessage`、`ReachOut`、`UseTool`、Goal/OpenLoop 管理类 Action、ActionArbiter、DeliveryResolver 和 QQ ActionPort。普通 action 使用 event-local deterministic idempotency key；Tool 要求 actor 与唯一 QQ 路由，并由有界 one-shot Host capability 将 exact key + tool envelope 指纹绑定原 `ReplyTicket`，副作用 builtin/MCP 在 dispatch 前重验 ticket、actor route、membership/route、管理员、群授权和 context，缺失时 fail-closed。`SendMessage`/`ReachOut` 使用 PostgreSQL delivery ledger，以业务 key 和完整 envelope 指纹持久化 `Committed`/`Sent`/`Unknown`/`Failed`，跨重启阻止重放；不可确认的投递返回非成功终态 `DeliveryIndeterminate`，不会伪造成功事件。Person 数据删除在同一事务内清理可归属账本，snapshot 不携带 Host 投递证据；详细合同见并发规范。 |
-| 7 Conversation | 当前范围完成 | 私聊安全纯文本/普通图片及群聊普通文本/普通图片默认由 Yunxi Core 接管。普通群聊先作为有界观察写入 WorkingState，不申请回复 admission，也不会打断正在生成的回复；明确 `@`、文本点名和本地限流抽中的未点名消息才进入 Planner。群聊近期上下文保留匿名成员 `speaker_id` 与 Core 自身成功回复，图片由 Host 安全物化后作为同一轮视觉输入交给主模型或独立视觉 Provider。Core 是支持事件的唯一可见回复 owner，入队失败时丢弃并释放 admission，不回退到 Host。Core ingress admission 绑定 exact `MessageId`，同一次模型回复会读取与 exact frozen ticket/reservation 绑定、最多 4096 字符的非可信 Prepared preview，并以受限 `incoming_impact` sidecar 精化为 `Keep / Rewrite / Merge / Defer`；可见直聊遇到模型取消、协议异常或空计划时走固定保底回复并记录原因。直接回复场景下，`Unrelated` 对 proactive 使用 `Defer`、对 reactive 使用 `Rewrite`；缺失或非法分类按 `Unknown` fail-closed，不增加第二次模型调用。runtime 拒绝 collision 会原序恢复未提交尾部，`RejectedState` 会释放 exact admission。命令、管理员控制面、引用回复、音视频/文件、表情协议及 coalescing/queue 保留在成熟 Kovi Host/Adapter。 |
+| 7 Conversation | 当前范围完成 | 私聊安全纯文本/普通图片及群聊普通文本/普通图片默认由 Yunxi Core 接管。普通群聊先作为有界观察写入 WorkingState，不申请回复 admission，也不会打断正在生成的回复；明确 `@`、文本点名和本地限流抽中的未点名消息才进入 Planner。Planner 同时读取有界、平台无关的 `ConversationMember` 身份与角色投影；群聊近期上下文保留匿名成员 `speaker_id` 与 Core 自身成功回复，图片由 Host 安全物化后作为同一轮视觉输入交给主模型或独立视觉 Provider。Core 是支持事件的唯一可见回复 owner，入队失败时丢弃并释放 admission，不回退到 Host。`ConversationLifecycle` 统一私聊/群聊的语义续聊、环境活动取消、租约恢复和可序列化状态形态，不把一次思考拆成固定消息数。Core ingress admission 绑定 exact `MessageId`，同一次模型回复会读取与 exact frozen ticket/reservation 绑定、最多 4096 字符的非可信 Prepared preview，并以受限 `incoming_impact` sidecar 精化为 `Keep / Rewrite / Merge / Defer`；可见直聊遇到模型取消、协议异常或空计划时走固定保底回复并记录原因。直接回复场景下，`Unrelated` 对 proactive 使用 `Defer`、对 reactive 使用 `Rewrite`；缺失或非法分类按 `Unknown` fail-closed，不增加第二次模型调用。runtime 拒绝 collision 会原序恢复未提交尾部，`RejectedState` 会释放 exact admission。命令、管理员控制面、引用回复、音视频/文件、表情协议及 coalescing/queue 保留在成熟 Kovi Host/Adapter。 |
 | 8 Affect | 部分完成 | Core state/port 和 PostgreSQL store 已有；结构信号和有界 `InteractionCues` 会缓慢更新 state。legacy `MessageUnderstanding` 的 mood/confidence/gratitude 已归一化并 best-effort 投射，Core 直聊也可复用同一次模型回复的受限 cue sidecar，不增加一次模型调用。Core 已提供确定性时间衰减，PostgreSQL 读取时按 `updated_at` 应用并忽略负时间差和 60 秒内抖动。legacy mood 只填充缺失行；global `BotPersonality`/mood 兼容策略留在 Host 不阻塞当前 DoD，剩余项是长期人工验收。 |
 | 9 Relation | 部分完成 | Relation 绑定 `PersonId`；Core 会以递减步幅更新 familiarity，并根据有界 gratitude/sentiment cue 保守更新 affinity/trust/comfort/tension，错误 Person 的已加载状态不会传播。PostgreSQL 读取时同样应用确定性时间衰减，legacy profile 只填充缺失行；跨天、跨重启和跨平台人工验收仍待完成。 |
 | 10 Memory v2 | 基础完成 | 新表、双读/双写、按批次 backfill、数量/哈希校验、审计记录、rollback 和独立 migration CLI 已完成；仍需生产数据抽样、生产回滚演练和真实第二宿主导入的人工验收。 |

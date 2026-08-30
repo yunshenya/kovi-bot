@@ -4,6 +4,7 @@ use crate::identity::{
     ConversationId, ConversationKind, ConversationMember, ExternalConversation, ExternalIdentity,
     OpenLoopId, PersonId,
 };
+use crate::mind::MindSnapshotProvider;
 use crate::open_loop::{OpenLoop, OpenLoopDraft, OpenLoopOwner};
 use crate::planner::{AffectState, ModelBackend, RelationState};
 use crate::{Memory, MemoryDraft, MemoryId, MemoryQuery, MemoryScope};
@@ -156,6 +157,8 @@ pub struct CoreServices {
     pub relations: Arc<dyn RelationStore>,
     pub affect: Arc<dyn AffectStore>,
     pub goals: Arc<dyn GoalStore>,
+    /// Optional durable Mind retrieval shared by every host.
+    pub mind_snapshot_provider: Option<Arc<dyn MindSnapshotProvider>>,
     pub model: Arc<dyn ModelBackend>,
 }
 
@@ -170,6 +173,10 @@ impl std::fmt::Debug for CoreServices {
             .field("relations", &true)
             .field("affect", &true)
             .field("goals", &true)
+            .field(
+                "mind_snapshot_provider",
+                &self.mind_snapshot_provider.is_some(),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -185,6 +192,7 @@ impl CoreServices {
             relations: Arc::new(UnavailableRelationStore),
             affect: Arc::new(UnavailableAffectStore),
             goals: Arc::new(UnavailableGoalStore),
+            mind_snapshot_provider: None,
             model,
         }
     }
@@ -239,6 +247,12 @@ impl CoreServices {
     #[must_use]
     pub fn with_goals(mut self, goals: Arc<dyn GoalStore>) -> Self {
         self.goals = goals;
+        self
+    }
+
+    #[must_use]
+    pub fn with_mind_snapshot_provider(mut self, provider: Arc<dyn MindSnapshotProvider>) -> Self {
+        self.mind_snapshot_provider = Some(provider);
         self
     }
 }
