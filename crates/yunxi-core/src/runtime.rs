@@ -1305,10 +1305,12 @@ impl CognitiveRuntime {
             return input;
         };
         let conversation_id = event.scope().conversation_id();
-        let person_id = event_person_id(&event).or_else(|| match event.scope() {
-            EventScope::Person { person_id } => Some(person_id),
-            _ => None,
-        });
+        let person_id = event_person_id(&event)
+            .or_else(|| match event.scope() {
+                EventScope::Person { person_id } => Some(person_id),
+                _ => None,
+            })
+            .or_else(|| autonomous_direct_person(&input));
 
         let mut memories = Vec::new();
         let mut open_loops = Vec::new();
@@ -1395,9 +1397,14 @@ impl CognitiveRuntime {
             .conversation
             .as_ref()
             .and_then(|conversation| conversation.current_topic.as_deref());
-        let Ok(request) =
-            MindSnapshotRequest::for_event(&input.event, topic, mind.limits, mind.influence_mode)
-        else {
+        let person_id = autonomous_direct_person(input);
+        let Ok(request) = MindSnapshotRequest::for_autonomous_conversation(
+            &input.event,
+            person_id,
+            topic,
+            mind.limits,
+            mind.influence_mode,
+        ) else {
             return crate::MindSnapshot::empty();
         };
         match timeout(mind.timeout, mind.provider.snapshot(&request)).await {
@@ -1848,6 +1855,19 @@ fn event_person_id(event: &WorldEvent) -> Option<PersonId> {
         crate::WorldEventKind::InteractionCuesObserved(cues) => Some(cues.person_id),
         _ => None,
     }
+}
+
+fn autonomous_direct_person(input: &PlannerInput) -> Option<PersonId> {
+    if !matches!(
+        input.event.kind(),
+        crate::WorldEventKind::AutonomousConversationTick(_)
+    ) {
+        return None;
+    }
+    let conversation = input.state.conversation.as_ref()?;
+    (conversation.conversation_kind == Some(crate::ConversationKind::Direct))
+        .then(|| conversation.active_people.first().copied())
+        .flatten()
 }
 
 fn executive_scope_for_event(event: &WorldEvent) -> ExecutiveScope {

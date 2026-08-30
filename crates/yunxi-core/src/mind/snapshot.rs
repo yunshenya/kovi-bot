@@ -631,6 +631,25 @@ impl MindSnapshotRequest {
         })
     }
 
+    /// Builds the snapshot request for a host-generated autonomous heartbeat.
+    /// Such an event is scoped to a conversation and therefore has no sender
+    /// field; a direct conversation may provide its already-resolved person so
+    /// the private Mind scope can be restored without guessing in group chat.
+    pub fn for_autonomous_conversation(
+        event: &WorldEvent,
+        person_id: Option<PersonId>,
+        topic: Option<&str>,
+        limits: MindSnapshotLimits,
+        influence_mode: MindInfluenceMode,
+    ) -> Result<Self, MindValidationError> {
+        let mut request = Self::for_event(event, topic, limits, influence_mode)?;
+        if matches!(event.kind(), WorldEventKind::AutonomousConversationTick(_)) {
+            request.person_id = person_id;
+            request.include_private_person_state = person_id.is_some();
+        }
+        Ok(request)
+    }
+
     #[must_use]
     pub fn scopes(&self) -> Vec<MindScope> {
         let mut scopes = vec![MindScope::Global];
@@ -817,5 +836,43 @@ impl MindSnapshotProvider for MindSnapshotStoreProvider {
             )
             .map_err(Into::into)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MindInfluenceMode, MindSnapshotLimits, MindSnapshotRequest};
+    use crate::{
+        AutonomousConversationTickEvent, ConversationId, EventPriority, EventScope, WorldEvent,
+        WorldEventKind,
+    };
+    use chrono::Utc;
+
+    #[test]
+    fn autonomous_request_can_restore_private_direct_person_scope() {
+        let conversation_id = ConversationId::new();
+        let person_id = crate::PersonId::new();
+        let event = WorldEvent::new(
+            Utc::now(),
+            EventScope::Conversation { conversation_id },
+            EventPriority::Low,
+            WorldEventKind::AutonomousConversationTick(AutonomousConversationTickEvent::default()),
+        );
+
+        let request = MindSnapshotRequest::for_autonomous_conversation(
+            &event,
+            Some(person_id),
+            None,
+            MindSnapshotLimits::default(),
+            MindInfluenceMode::Active,
+        )
+        .expect("autonomous request should validate");
+
+        assert_eq!(request.person_id(), Some(person_id));
+        assert!(
+            request
+                .scopes()
+                .contains(&super::MindScope::Person { person_id })
+        );
     }
 }
