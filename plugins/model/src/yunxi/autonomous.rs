@@ -135,12 +135,12 @@ pub(crate) fn record_outbound(conversation_id: ConversationId, occurred_at: Date
 
 /// Record a normal reply and its model-selected conversation directive.
 ///
-/// A delivered direct-chat reply without a directive enters a short
-/// continuation cooldown. A model `end` on a normal direct reply is treated
-/// the same way: it is often a statement that this particular answer is
-/// complete, not an explicit request to close the conversation. The next
-/// autonomous turn still asks the model whether there is a real next thought
-/// worth sending. This is based on conversation kind, never message text.
+/// A delivered direct-chat reply enters a short continuation cooldown even
+/// when its normal-turn directive is `wait`, `end`, or missing. Those values
+/// describe the current answer, not an explicit request to close the private
+/// conversation; the next autonomous turn still asks the model whether there
+/// is a real next thought worth sending. This is based on conversation kind,
+/// never message text. Group directives retain their terminal semantics.
 pub(crate) fn record_outbound_with_directive(
     conversation_id: ConversationId,
     occurred_at: DateTime<Utc>,
@@ -153,11 +153,10 @@ pub(crate) fn record_outbound_with_directive(
     let entry = registry.entries.get_mut(&conversation_id)?;
     let policy = config.map(autonomy_policy).unwrap_or_default();
     let direct_conversation = entry.lifecycle.kind() == ConversationKind::Direct;
-    let effective_directive = match directive {
-        Some(ConversationTurnDirective::End) | None if direct_conversation => {
-            Some(ConversationTurnDirective::Continue)
-        }
-        other => other,
+    let effective_directive = if direct_conversation {
+        Some(ConversationTurnDirective::Continue)
+    } else {
+        directive
     };
     entry
         .lifecycle
@@ -477,6 +476,30 @@ mod tests {
     }
 
     #[test]
+    fn direct_wait_is_rechecked_before_terminal() {
+        let _guard = TEST_LOCK.lock().expect("test lock");
+        clear();
+        let id = ConversationId::new();
+        let now = Utc::now();
+        let config = ProactiveConfig::default();
+        observe_inbound(id, ConversationKind::Direct, now, true);
+        record_outbound_with_directive(
+            id,
+            now,
+            Some(ConversationTurnDirective::Wait),
+            Some(&config),
+        );
+        assert_eq!(
+            claim_due(
+                &config,
+                now + Duration::seconds(config.autonomous_conversation_cooldown_secs() as i64)
+            ),
+            Some(id)
+        );
+        clear();
+    }
+
+    #[test]
     fn direct_autonomous_turn_is_open_ended() {
         let _guard = TEST_LOCK.lock().expect("test lock");
         clear();
@@ -511,7 +534,7 @@ mod tests {
     }
 
     #[test]
-    fn wait_suppresses_legacy_idle_fallback() {
+    fn direct_wait_is_rechecked_instead_of_suppressing_autonomy() {
         let _guard = TEST_LOCK.lock().expect("test lock");
         clear();
         let id = ConversationId::new();
@@ -524,7 +547,13 @@ mod tests {
             Some(ConversationTurnDirective::Wait),
             Some(&config),
         );
-        assert!(claim_due(&config, now + Duration::hours(2)).is_none());
+        assert_eq!(
+            claim_due(
+                &config,
+                now + Duration::seconds(config.autonomous_conversation_cooldown_secs() as i64)
+            ),
+            Some(id)
+        );
         clear();
     }
 
