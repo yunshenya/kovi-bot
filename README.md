@@ -158,13 +158,14 @@ cooldown_secs = 7200
 push_probability_percent = 35
 # main_admin 可选，只应写在未跟踪的运行时配置中
 main_admin_decision_interval_secs = 10800
-# Neuro-sama 风格自主会话（私聊由模型决定是否继续；群聊保留公共语境策略）
+# Neuro-sama 风格自主会话（私聊和群聊都由模型结合语境决定是否继续）
 autonomous_conversation_enabled = true
 autonomous_conversation_check_interval_secs = 15
 autonomous_conversation_idle_secs = 90
 autonomous_conversation_cooldown_secs = 15
 autonomous_conversation_group_idle_secs = 180
 autonomous_conversation_group_cooldown_secs = 90
+# Legacy compatibility field; autonomous continuation is decided by the model.
 autonomous_conversation_group_max_turns = 1
 # 私聊是否继续完全由模型根据 conversation_directive 决定；每轮都会重新读取上下文。
 

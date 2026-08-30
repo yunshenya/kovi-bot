@@ -163,12 +163,9 @@ pub(crate) fn claim_due(config: &ProactiveConfig, now: DateTime<Utc>) -> Option<
         let Some(entry) = registry.entries.get(conversation_id) else {
             return false;
         };
-        let (idle_secs, max_turns) = match entry.kind {
-            ConversationKind::Direct => (config.autonomous_conversation_idle_secs(), None),
-            ConversationKind::Group => (
-                config.autonomous_conversation_group_idle_secs(),
-                Some(config.autonomous_conversation_group_max_turns()),
-            ),
+        let idle_secs = match entry.kind {
+            ConversationKind::Direct => config.autonomous_conversation_idle_secs(),
+            ConversationKind::Group => config.autonomous_conversation_group_idle_secs(),
             ConversationKind::System => return false,
         };
         let idle = chrono::Duration::seconds(idle_secs as i64);
@@ -181,8 +178,11 @@ pub(crate) fn claim_due(config: &ProactiveConfig, now: DateTime<Utc>) -> Option<
         let Some(last_bot_at) = entry.last_bot_at else {
             return false;
         };
-        let exhausted = max_turns.is_some_and(|max_turns| entry.autonomous_turns >= max_turns);
-        if exhausted || last_bot_at < entry.last_inbound_at {
+        // There is deliberately no host-side conversation-length cap. The
+        // model's semantic directive and new inbound activity are the only
+        // lifecycle decisions; a fixed group budget makes conversation feel
+        // scripted and prevents a genuine continuation.
+        if last_bot_at < entry.last_inbound_at {
             return false;
         }
         if entry.last_autonomous_at.is_none() {
@@ -350,7 +350,7 @@ mod tests {
     }
 
     #[test]
-    fn group_budget_is_more_conservative_than_direct_budget() {
+    fn group_continuation_is_semantic_not_fixed_budgeted() {
         let _guard = TEST_LOCK.lock().expect("test lock");
         clear();
         let id = ConversationId::new();
@@ -365,7 +365,10 @@ mod tests {
         record_outbound(id, now - Duration::minutes(4));
         assert_eq!(claim_due(&config, now), Some(id));
         finish_claim(id, now, ConversationTurnDirective::Continue, &config);
-        assert!(claim_due(&config, now + Duration::minutes(5)).is_none());
+        let next = now + Duration::minutes(5);
+        assert_eq!(claim_due(&config, next), Some(id));
+        finish_claim(id, next, ConversationTurnDirective::Continue, &config);
+        assert_eq!(claim_due(&config, next + Duration::minutes(5)), Some(id));
         clear();
     }
 

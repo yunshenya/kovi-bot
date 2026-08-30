@@ -44,7 +44,8 @@ pub struct ProactiveConfig {
     autonomous_conversation_group_idle_secs: u64,
     /// 群聊自主续聊选择继续时，两次模型回合之间的最短间隔（秒）。
     autonomous_conversation_group_cooldown_secs: u64,
-    /// 一次群聊互动最多允许连续自主续聊的回合数。
+    /// 旧版群聊自主续聊上限。保留用于配置反序列化兼容，当前自主会话
+    /// 不再读取这个字段，是否继续完全由模型语义决定。
     autonomous_conversation_group_max_turns: u8,
 }
 
@@ -179,13 +180,6 @@ impl ProactiveConfig {
         }
         if self.autonomous_conversation_group_cooldown_secs == 0 {
             return Err(anyhow::anyhow!("群聊自主会话冷却时间必须大于0秒"));
-        }
-        if self.autonomous_conversation_group_max_turns == 0
-            || self.autonomous_conversation_group_max_turns > 8
-        {
-            return Err(anyhow::anyhow!(
-                "群聊自主会话单次互动最多连续回合数必须在1到8之间"
-            ));
         }
         Ok(())
     }

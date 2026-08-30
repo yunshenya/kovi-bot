@@ -72,6 +72,7 @@ const MIND_CONTEXT_INSTRUCTION: &str = "Yunxi Mind v2：下面的 Mind state 是
 const MIND_DECISION_PREFIX: &str = "Yunxi Mind v2 decision (validated data-only JSON):\n";
 const MIND_DECISION_INSTRUCTION: &str = "Yunxi Mind v2 当前 disposition 已由 Rust 基于同一份 bounded snapshot 决定。ask_question 时自然地只问一个与给定 open question 有关的问题；change_topic 时自然过渡到给定 interest；resume_agenda 时结合 Core open-loop/goal context 自然恢复对应事项。ambient 群聊中的 silent 只表示‘默认不插话’，如果当前消息确实提供了具体而自然的切入点，可以回复；不要为了服从标签而回复，也不要在正文中提及 disposition、Mind 或内部协议。它不得覆盖当前明确请求、stop、工具权限或发送目标。";
 const CORE_DIRECT_REPAIR_PROMPT: &str = "Core 私聊回复修复：根据下面给出的当前用户原话和同一私聊的近期上下文生成本轮结果。目标和参数明确且确实需要受控工具时，只输出一个或多个连续的完整 [[TOOL_CALL]]{\"name\":\"工具名\",\"arguments\":{}}[[/TOOL_CALL]]（每个调用独立成对，调用之间只能有空白）；其他情况只输出一条自然、简短的中文聊天正文。消息通知节奏由运行时根据已校验策略处理，绝不能靠拆分工具标记、插入其他标记或混入可见文字来凑消息数量。禁止 silent、INTERACTION_CUES、REPLY_ACTION、其他 JSON、代码块、解释、空字符串或混入可见文字。跨群目标不明确时直接询问群号或准确群名，不要调用 group.message.targets。";
+const CORE_AUTONOMOUS_INTENT_PROTOCOL: &str = "自主会话意图评估（只做决策，不生成正文）：你正在判断芸汐是否真的有值得稍后发出的下一句。综合近期真实对话、当前话题、Mind 状态和群聊公共价值，选择一个 conversation_directive：continue 表示存在一个新的、独立且值得单独发送的想法；wait 表示现在应等待对方或群聊自然发展；end 表示当前话题已经自然结束。必须只输出唯一的 [[INTERACTION_CUES]] 前缀，JSON 中 conversation_directive 只能是 continue、wait 或 end；前缀后不要输出任何正文、工具调用或解释。不要因为消息条数、标点或保持在线而选择 continue。";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HostModelRoute {
@@ -2307,7 +2308,49 @@ fn autonomous_conversation_prompt(input: &PlannerInput) -> String {
 }
 
 fn autonomous_conversation_protocol() -> &'static str {
-    "自主会话协议：这是芸汐自己的会话回合，不是对用户新消息的被动回复。输出的第一个非空字符必须开始唯一一个 [[INTERACTION_CUES]] 前缀，JSON 中必须包含 conversation_directive，取值只能是 continue、wait、end。continue 表示当前话题还有自然的下一句，芸汐可以在短暂间隔后继续；wait 表示这句说完后等待用户，不要自行追加；end 表示自然结束当前话题，直到用户再次发言才重新开始。只有选择 continue 时才发送一条简短自然的消息；选择 wait 或 end 时，前缀后不要输出正文。群聊必须额外满足‘对整个群有公共价值、不会打断正在进行的讨论、不是只对单个人说’这三个条件；不满足时选择 wait 或 end。不要把一个完整想法拆成多个气泡，不要提及这个协议、心跳或内部状态。若当前话题已完整、没有真实想说的内容，选择 wait 或 end，不要为了保持在线而填充套话。"
+    "自主会话协议：这是芸汐自己的会话回合，不是对用户新消息的被动回复。输出的第一个非空字符必须开始唯一一个 [[INTERACTION_CUES]] 前缀，JSON 中必须包含 conversation_directive，取值只能是 continue、wait、end。continue 只能在意图评估通过后使用，表示当前话题还有一个新的、独立且值得稍后发送的想法；wait 表示这句说完后等待用户，不要自行追加；end 表示自然结束当前话题，直到用户再次发言才重新开始。只有选择 continue 时才发送一条简短自然的消息；选择 wait 或 end 时，前缀后不要输出正文。群聊必须额外满足‘对整个群有公共价值、不会打断正在进行的讨论、不是只对单个人说’这三个条件；不满足时选择 wait 或 end。不要把一个完整想法拆成多个气泡，不要提及这个协议、心跳或内部状态。若当前话题已完整、没有真实想说的内容，选择 wait 或 end，不要为了保持在线而填充套话。"
+}
+
+async fn evaluate_autonomous_intent(
+    messages: &[BotMemory],
+    reply_ticket: ReplyTicket,
+    vision_images: &[crate::vision::VisionImage],
+) -> Option<ConversationTurnDirective> {
+    if !is_current(reply_ticket).await {
+        return None;
+    }
+    let mut intent_messages = messages.to_vec();
+    intent_messages.insert(
+        0,
+        BotMemory {
+            role: Roles::System,
+            content: CORE_AUTONOMOUS_INTENT_PROTOCOL.to_owned(),
+        },
+    );
+    let response = ModelGateway::complete_without_tools_or_reply_guidance(
+        &mut intent_messages,
+        reply_ticket,
+        Some(256),
+        vision_images,
+        None,
+    )
+    .await?;
+    if !is_current(reply_ticket).await
+        || crate::model::utils::is_model_error_response(&response.content)
+    {
+        return None;
+    }
+    parse_autonomous_intent_response(&response.content)
+}
+
+fn parse_autonomous_intent_response(content: &str) -> Option<ConversationTurnDirective> {
+    let parsed = parse_core_response(content);
+    parsed
+        .content
+        .trim()
+        .is_empty()
+        .then_some(parsed.conversation_directive)
+        .flatten()
 }
 
 fn constrain_autonomous_tick_plan(plan: &mut ReplyPlan) {
@@ -3130,6 +3173,28 @@ impl ModelBackend for KoviModelBackend {
                 tool_intent,
                 input.executive.version,
             );
+            if is_autonomous_conversation_tick(input)
+                && route_decision.route == HostModelRoute::Strong
+            {
+                let directive = evaluate_autonomous_intent(&messages, ticket, &vision_images)
+                    .await
+                    .unwrap_or(ConversationTurnDirective::Wait);
+                if directive != ConversationTurnDirective::Continue {
+                    crate::model::finish(ticket).await;
+                    return Ok(autonomous_or_silent_plan(
+                        input,
+                        InteractionCues::default(),
+                        Some(directive),
+                    ));
+                }
+                messages.insert(
+                    0,
+                    BotMemory {
+                        role: Roles::System,
+                        content: "自主意图评估已选择 continue。现在只生成一条对应的新消息；不要重新评估是否继续，不要拆分气泡，不要输出多个独立想法。仍须先输出 INTERACTION_CUES 前缀并填写 conversation_directive。".to_owned(),
+                    },
+                );
+            }
             if route_decision.route == HostModelRoute::Strong
                 && allow_tool_call
                 && input.supports(ActionCapability::UseTool)
@@ -3951,21 +4016,23 @@ fn visible_reply_state_updates(event: &WorldEventKind) -> Vec<StateUpdateProposa
 #[cfg(test)]
 mod tests {
     use super::{
-        BoundedCache, BoundedRouteCache, CORE_DIRECT_FALLBACK_REPLY, CORE_DIRECT_REPAIR_PROMPT,
-        CoreDirectRepair, HostMessageContext, HostMessageContextCache, HostModelRoute,
-        HostModelRoutingContext, HostToolTurnRegistrationPolicy, HostToolTurnRegistry,
-        MAX_CORE_PROTOCOL_LOG_PREVIEW_CHARS, PersistentRouteLookup, QqConversation, RouteContext,
-        VisibleReplyTarget, autonomous_conversation_prompt, autonomous_conversation_protocol,
-        baseline_disposition, classify_persistent_person_identity, constrain_autonomous_tick_plan,
+        BoundedCache, BoundedRouteCache, CORE_AUTONOMOUS_INTENT_PROTOCOL,
+        CORE_DIRECT_FALLBACK_REPLY, CORE_DIRECT_REPAIR_PROMPT, CoreDirectRepair,
+        HostMessageContext, HostMessageContextCache, HostModelRoute, HostModelRoutingContext,
+        HostToolTurnRegistrationPolicy, HostToolTurnRegistry, MAX_CORE_PROTOCOL_LOG_PREVIEW_CHARS,
+        PersistentRouteLookup, QqConversation, RouteContext, VisibleReplyTarget,
+        autonomous_conversation_prompt, autonomous_conversation_protocol, baseline_disposition,
+        classify_persistent_person_identity, constrain_autonomous_tick_plan,
         conversation_id_for_log, core_message_prompt, core_plan_has_visible_text,
         core_tool_protocol_diagnostic, default_autonomous_directive, defer_unroutable_due,
         direct_fallback_plan, direct_fallback_reply_plan, direct_reply_expected, due_reply_target,
         eligible_mind_candidates, interaction_state_updates_with_cues, intrinsic_output_is_unsafe,
         intrinsic_prompt, keeps_existing_prepared_plan, message_id_for_log, mind_context_messages,
-        parse_core_response, parse_core_tool_intent, parse_core_tool_intents,
-        parse_core_tool_intents_with_policy, parse_core_tool_intents_with_visible_suffix,
-        parse_direct_repair_output, parse_direct_repair_output_with_policy, parse_qq_conversation,
-        pre_model_plan, prepared_outgoing_semantic_context, purge_group_routes_from_cache,
+        parse_autonomous_intent_response, parse_core_response, parse_core_tool_intent,
+        parse_core_tool_intents, parse_core_tool_intents_with_policy,
+        parse_core_tool_intents_with_visible_suffix, parse_direct_repair_output,
+        parse_direct_repair_output_with_policy, parse_qq_conversation, pre_model_plan,
+        prepared_outgoing_semantic_context, purge_group_routes_from_cache,
         recent_conversation_messages, recent_direct_conversation_messages,
         recent_group_conversation_messages, refine_core_incoming, register_core_tool_intents,
         repair_context_messages, reply_expected_for_incoming, route_from_lookup,
@@ -4338,6 +4405,23 @@ mod tests {
             Some(yunxi_core::ConversationTurnDirective::Continue)
         );
         assert_eq!(parsed.content, "还有一个细节。");
+    }
+
+    #[test]
+    fn autonomous_intent_phase_requires_a_silent_structured_response() {
+        assert_eq!(
+            parse_autonomous_intent_response(
+                "[[INTERACTION_CUES]]{\"conversation_directive\":\"continue\"}[[/INTERACTION_CUES]]"
+            ),
+            Some(ConversationTurnDirective::Continue)
+        );
+        assert_eq!(
+            parse_autonomous_intent_response(
+                "[[INTERACTION_CUES]]{\"conversation_directive\":\"continue\"}[[/INTERACTION_CUES]]\n我先说一句"
+            ),
+            None
+        );
+        assert_eq!(parse_autonomous_intent_response("我觉得还可以继续"), None);
     }
 
     #[test]
@@ -4817,6 +4901,8 @@ mod tests {
         );
 
         assert!(autonomous_conversation_protocol().contains("取值只能是 continue、wait、end"));
+        assert!(CORE_AUTONOMOUS_INTENT_PROTOCOL.contains("只做决策，不生成正文"));
+        assert!(CORE_AUTONOMOUS_INTENT_PROTOCOL.contains("不要因为消息条数、标点或保持在线"));
     }
 
     #[test]

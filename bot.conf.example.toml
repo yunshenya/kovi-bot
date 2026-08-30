@@ -38,9 +38,10 @@ autonomous_conversation_enabled = true
 autonomous_conversation_check_interval_secs = 15
 autonomous_conversation_idle_secs = 90
 autonomous_conversation_cooldown_secs = 15
-# 群聊自主续聊更克制：等待更久，默认每次互动最多追加一回合。
+# 群聊自主续聊更克制：等待更久，但是否继续由模型根据公共语境决定。
 autonomous_conversation_group_idle_secs = 180
 autonomous_conversation_group_cooldown_secs = 90
+# Legacy compatibility field; autonomous continuation is decided by the model.
 autonomous_conversation_group_max_turns = 1
 # 私聊是否继续完全由模型根据 conversation_directive 决定；每轮都会重新读取上下文。
 
