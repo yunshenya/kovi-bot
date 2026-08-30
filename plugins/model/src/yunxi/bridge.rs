@@ -759,7 +759,7 @@ impl CoreBridge {
         self.runtime.submit(event).await
     }
 
-    /// Submit one bounded autonomous conversation turn. The caller has already
+    /// Submit one autonomous conversation turn. The caller has already
     /// claimed the conversation in the host-side autonomous registry; Core
     /// still applies its normal event queue, attention, planner, arbiter, and
     /// delivery boundaries.
@@ -767,7 +767,6 @@ impl CoreBridge {
         &self,
         conversation_id: ConversationId,
         explicit_continuation_requested: bool,
-        minimum_messages_pending: bool,
     ) -> Result<Admission, yunxi_core::SubmitError> {
         self.runtime
             .submit(WorldEvent::new(
@@ -777,7 +776,7 @@ impl CoreBridge {
                 WorldEventKind::AutonomousConversationTick(
                     yunxi_core::AutonomousConversationTickEvent {
                         explicit_continuation_requested,
-                        minimum_messages_pending,
+                        minimum_messages_pending: false,
                     },
                 ),
             ))
@@ -2423,7 +2422,6 @@ async fn run_runtime(
                                 conversation_id,
                                 Utc::now(),
                                 directive,
-                                autonomous_delivered,
                                 crate::config::get().proactive(),
                             );
                         }
@@ -2778,12 +2776,11 @@ async fn resolve_and_submit_inner(
                 || recent_agent_reply,
         );
         if message.address.kind() == ConversationKind::Direct
-            && let Some(max_autonomous_turns) =
-                super::autonomous::explicit_continuation_request(&message.text)
+            && super::autonomous::explicit_continuation_request(&message.text).is_some()
         {
-            super::autonomous::request_continuation(conversation_id, max_autonomous_turns);
+            super::autonomous::request_continuation(conversation_id);
             kovi::log::info!(
-                "Yunxi explicit conversation continuation requested: conversation_id={conversation_id} max_autonomous_turns={max_autonomous_turns}"
+                "Yunxi explicit open-ended conversation continuation requested: conversation_id={conversation_id}"
             );
         }
     }

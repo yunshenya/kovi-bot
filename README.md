@@ -158,15 +158,16 @@ cooldown_secs = 7200
 push_probability_percent = 35
 # main_admin 可选，只应写在未跟踪的运行时配置中
 main_admin_decision_interval_secs = 10800
-# Neuro-sama 风格自主会话（私聊更连续，群聊更克制；均有冷却和回合上限）
+# Neuro-sama 风格自主会话（明确邀请的私聊开放式续聊；普通私聊和群聊仍有策略上限）
 autonomous_conversation_enabled = true
 autonomous_conversation_check_interval_secs = 15
 autonomous_conversation_idle_secs = 90
 autonomous_conversation_cooldown_secs = 15
-autonomous_conversation_max_turns = 4
+autonomous_conversation_max_turns = 4 # 普通自主会话；明确邀请连续聊天时由模型决定何时结束
 autonomous_conversation_group_idle_secs = 180
 autonomous_conversation_group_cooldown_secs = 90
 autonomous_conversation_group_max_turns = 1
+# 私聊中说“接着说”“一直聊下去”或“不要设上限”即可开启开放式连续聊天。
 
 [traffic]
 enabled = true

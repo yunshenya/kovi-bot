@@ -644,15 +644,15 @@ pub struct ProspectiveMemoryEvent {
 /// conversation without a new inbound message.
 ///
 /// The conversation scope carries the routing identity; the optional flag
-/// records whether a user explicitly requested a bounded multi-turn exchange.
-/// The host remains responsible for admission, cooldowns, and eligibility.
+/// records whether a user explicitly requested an open-ended multi-turn
+/// exchange. The host remains responsible for admission, cooldowns, and
+/// eligibility.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct AutonomousConversationTickEvent {
     #[serde(default)]
     pub explicit_continuation_requested: bool,
-    /// The explicit request has not yet produced its minimum number of
-    /// independently generated messages, so this turn should speak rather
-    /// than merely evaluate an optional continuation.
+    /// Legacy compatibility field. Open-ended continuation no longer forces a
+    /// minimum number of messages; this value is ignored by current runtimes.
     #[serde(default)]
     pub minimum_messages_pending: bool,
 }
