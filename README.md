@@ -158,16 +158,15 @@ cooldown_secs = 7200
 push_probability_percent = 35
 # main_admin 可选，只应写在未跟踪的运行时配置中
 main_admin_decision_interval_secs = 10800
-# Neuro-sama 风格自主会话（明确邀请的私聊开放式续聊；普通私聊和群聊仍有策略上限）
+# Neuro-sama 风格自主会话（私聊由模型决定是否继续；群聊保留公共语境策略）
 autonomous_conversation_enabled = true
 autonomous_conversation_check_interval_secs = 15
 autonomous_conversation_idle_secs = 90
 autonomous_conversation_cooldown_secs = 15
-autonomous_conversation_max_turns = 4 # 普通自主会话；明确邀请连续聊天时由模型决定何时结束
 autonomous_conversation_group_idle_secs = 180
 autonomous_conversation_group_cooldown_secs = 90
 autonomous_conversation_group_max_turns = 1
-# 私聊中说“接着说”“一直聊下去”或“不要设上限”即可开启开放式连续聊天。
+# 私聊是否继续完全由模型根据 conversation_directive 决定；每轮都会重新读取上下文。
 
 [traffic]
 enabled = true
@@ -306,7 +305,7 @@ recent_topic_cooldown_secs = 604800
 
 回复生成和连续气泡发送支持有条件打断。私聊中的普通新消息会作为完整 turn 排队，不会仅因为到达较晚就丢弃正在生成的回复；明确停止请求或新的识图命令会中断当前轮。群聊中的再次 `@`/回复、明确停止请求或识图命令可以中断当前轮，其他成员的无关消息不会影响她。ticket 在撤回、发送和状态更新等副作用前会重新校验；已经成功发出的气泡不会自动撤回，历史只记录实际发送的部分。
 
-直接 `@`、回复或文字点名还带有按“群 + 成员”隔离的防刷限制：不比较消息文本，只按 60 秒内的触发次数计数，超过 4 次进入 10 分钟冷却。管理员不受此限制。群聊和私聊回复默认采用一条消息；只有确实存在无法自然合并的新信息时才使用第二条连续气泡，详细解释、步骤、复杂分析或不能过度缩短的安慰仍可按内容需要完整回答，不会被固定字数截断。
+直接 `@`、回复或文字点名还带有按“群 + 成员”隔离的防刷限制：不比较消息文本，只按 60 秒内的触发次数计数，超过 4 次进入 10 分钟冷却。管理员不受此限制。群聊和私聊的气泡数量由内容和 `conversation_directive` 决定；每个气泡都应承载新的、无法自然合并的信息，详细解释、步骤、复杂分析或不能过度缩短的安慰仍可按内容需要完整回答，不会被固定字数截断。
 
 模型的“正常回复或保持静默”是独立的结构化回复决策，不再通过正文中的 `[sp]` 魔法字符串判断。静默可以与主动撤回组合，但不会发送正文、引用或 `@`，也不会写入短期聊天历史或开启群聊接续窗口；无正文的纯撤回则作为 action-only 计划执行。解析器暂时只为旧模型输出保留精确 `[sp]` 兼容，运行提示词不会再要求模型生成它。
 

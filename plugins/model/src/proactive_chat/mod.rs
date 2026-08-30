@@ -171,28 +171,13 @@ impl ProactiveChatManager {
         else {
             return;
         };
-        let explicit_continuation_requested =
-            yunxi::autonomous::explicit_continuation_claimed(conversation_id);
-        let today = Local::now().format("%Y-%m-%d").to_string();
-        if !explicit_continuation_requested
-            && self
-                .memory_manager
-                .get_proactive_state(GLOBAL_PROACTIVE_STATE_KEY)
-                .await
-                .is_some_and(|state| {
-                    state.daily_count_for(&today) >= proactive_config.daily_limit() as u32
-                })
-        {
-            yunxi::autonomous::release_claim(conversation_id);
-            return;
-        }
         match bridge
-            .submit_autonomous_conversation_tick(conversation_id, explicit_continuation_requested)
+            .submit_autonomous_conversation_tick(conversation_id)
             .await
         {
             Ok(yunxi_core::Admission::Accepted) => {
                 kovi::log::info!(
-                    "Yunxi autonomous conversation tick admitted: conversation_id={conversation_id} explicit_request={explicit_continuation_requested}"
+                    "Yunxi autonomous conversation tick admitted: conversation_id={conversation_id}"
                 );
             }
             Ok(admission) => {

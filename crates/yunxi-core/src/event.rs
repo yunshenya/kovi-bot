@@ -643,19 +643,10 @@ pub struct ProspectiveMemoryEvent {
 /// A host-generated opportunity for the agent to continue an active
 /// conversation without a new inbound message.
 ///
-/// The conversation scope carries the routing identity; the optional flag
-/// records whether a user explicitly requested an open-ended multi-turn
-/// exchange. The host remains responsible for admission, cooldowns, and
-/// eligibility.
+/// The conversation scope carries the routing identity. The host remains
+/// responsible for admission, cooldowns, and eligibility.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct AutonomousConversationTickEvent {
-    #[serde(default)]
-    pub explicit_continuation_requested: bool,
-    /// Legacy compatibility field. Open-ended continuation no longer forces a
-    /// minimum number of messages; this value is ignored by current runtimes.
-    #[serde(default)]
-    pub minimum_messages_pending: bool,
-}
+pub struct AutonomousConversationTickEvent {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActionSucceededEvent {

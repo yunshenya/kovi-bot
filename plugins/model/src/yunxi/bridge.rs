@@ -766,7 +766,6 @@ impl CoreBridge {
     pub(crate) async fn submit_autonomous_conversation_tick(
         &self,
         conversation_id: ConversationId,
-        explicit_continuation_requested: bool,
     ) -> Result<Admission, yunxi_core::SubmitError> {
         self.runtime
             .submit(WorldEvent::new(
@@ -774,10 +773,7 @@ impl CoreBridge {
                 EventScope::Conversation { conversation_id },
                 EventPriority::Low,
                 WorldEventKind::AutonomousConversationTick(
-                    yunxi_core::AutonomousConversationTickEvent {
-                        explicit_continuation_requested,
-                        minimum_messages_pending: false,
-                    },
+                    yunxi_core::AutonomousConversationTickEvent::default(),
                 ),
             ))
             .await
@@ -2362,9 +2358,6 @@ async fn run_runtime(
                     let autonomous_tick =
                         observation.event_type == EventType::AutonomousConversationTick;
                     let conversation_id = observation.scope.conversation_id();
-                    let explicit_continuation_requested = autonomous_tick
-                        && conversation_id
-                            .is_some_and(super::autonomous::explicit_continuation_claimed);
                     let requested_directive = conversation_id.and_then(|conversation_id| {
                         plan.state_updates.iter().find_map(|update| match update {
                             yunxi_core::StateUpdateProposal::ConversationDirective {
@@ -2409,37 +2402,22 @@ async fn run_runtime(
                             }
                         }
                     }
-                    if autonomous_tick {
-                        if let Some(conversation_id) = observation.scope.conversation_id() {
-                            let directive = match (autonomous_delivered, requested_directive) {
-                                (true, Some(directive)) => directive,
-                                (false, Some(ConversationTurnDirective::End)) => {
-                                    ConversationTurnDirective::End
-                                }
-                                _ => ConversationTurnDirective::Wait,
-                            };
-                            super::autonomous::finish_claim(
-                                conversation_id,
-                                Utc::now(),
-                                directive,
-                                crate::config::get().proactive(),
-                            );
-                        }
-                        if autonomous_delivered
-                            && !explicit_continuation_requested
-                            && let Err(error) = crate::memory::MEMORY_MANAGER
-                                .record_proactive_event(
-                                    None,
-                                    &[crate::proactive_chat::GLOBAL_PROACTIVE_STATE_KEY
-                                        .to_string()],
-                                    chrono::Local::now(),
-                                )
-                                .await
-                        {
-                            kovi::log::warn!(
-                                "Yunxi autonomous conversation quota persistence failed: {error}"
-                            );
-                        }
+                    if autonomous_tick
+                        && let Some(conversation_id) = observation.scope.conversation_id()
+                    {
+                        let directive = match (autonomous_delivered, requested_directive) {
+                            (true, Some(directive)) => directive,
+                            (false, Some(ConversationTurnDirective::End)) => {
+                                ConversationTurnDirective::End
+                            }
+                            _ => ConversationTurnDirective::Wait,
+                        };
+                        super::autonomous::finish_claim(
+                            conversation_id,
+                            Utc::now(),
+                            directive,
+                            crate::config::get().proactive(),
+                        );
                     }
                     let has_action_failure = actions.iter().any(|action| !action.is_success());
                     if actions.is_empty() || has_action_failure {
@@ -2775,14 +2753,6 @@ async fn resolve_and_submit_inner(
                 || message.planner_attention_requested
                 || recent_agent_reply,
         );
-        if message.address.kind() == ConversationKind::Direct
-            && super::autonomous::explicit_continuation_request(&message.text).is_some()
-        {
-            super::autonomous::request_continuation(conversation_id);
-            kovi::log::info!(
-                "Yunxi explicit open-ended conversation continuation requested: conversation_id={conversation_id}"
-            );
-        }
     }
     Ok(())
 }
