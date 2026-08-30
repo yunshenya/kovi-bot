@@ -74,7 +74,7 @@ const MIND_CONTEXT_INSTRUCTION: &str = "Yunxi Mind v2：下面的 Mind state 是
 const MIND_DECISION_PREFIX: &str = "Yunxi Mind v2 decision (validated data-only JSON):\n";
 const MIND_DECISION_INSTRUCTION: &str = "Yunxi Mind v2 当前 disposition 已由 Rust 基于同一份 bounded snapshot 决定。ask_question 时自然地只问一个与给定 open question 有关的问题；change_topic 时自然过渡到给定 interest；resume_agenda 时结合 Core open-loop/goal context 自然恢复对应事项。ambient 群聊中的 silent 只表示‘默认不插话’，如果当前消息确实提供了具体而自然的切入点，可以回复；不要为了服从标签而回复，也不要在正文中提及 disposition、Mind 或内部协议。它不得覆盖当前明确请求、stop、工具权限或发送目标。";
 const CORE_DIRECT_REPAIR_PROMPT: &str = "Core 私聊回复修复：根据下面给出的当前用户原话和同一私聊的近期上下文生成本轮结果。目标和参数明确且确实需要受控工具时，只输出一个或多个连续的完整 [[TOOL_CALL]]{\"name\":\"工具名\",\"arguments\":{}}[[/TOOL_CALL]]（每个调用独立成对，调用之间只能有空白）；其他情况只输出一条自然、简短的中文聊天正文。消息通知节奏由运行时根据已校验策略处理，绝不能靠拆分工具标记、插入其他标记或混入可见文字来凑消息数量。禁止 silent、INTERACTION_CUES、REPLY_ACTION、其他 JSON、代码块、解释、空字符串或混入可见文字。跨群目标不明确时直接询问群号或准确群名，不要调用 group.message.targets。";
-const CORE_AUTONOMOUS_INTENT_PROTOCOL: &str = "自主会话意图评估（只做决策，不生成正文）：你正在判断芸汐是否真的有值得稍后发出的下一句。综合近期真实对话、当前话题、Mind 状态和群聊公共价值，选择一个 conversation_directive：continue 表示存在一个新的、独立且值得单独发送的想法；wait 表示现在应等待对方或群聊自然发展；end 表示当前话题已经自然结束。必须只输出唯一的 [[INTERACTION_CUES]] 前缀，JSON 中 conversation_directive 只能是 continue、wait 或 end；前缀后不要输出任何正文、工具调用或解释。不要因为消息条数、标点或保持在线而选择 continue。";
+const CORE_AUTONOMOUS_INTENT_PROTOCOL: &str = "自主会话意图评估（只做决策，不生成正文）：你正在判断芸汐是否真的有值得稍后发出的下一句。综合近期真实对话、当前话题、Mind 状态和群聊公共价值，选择一个 conversation_directive：continue 表示存在一个新的、独立且值得单独发送的想法；wait 表示现在应等待对方或群聊自然发展；end 表示当前话题确实自然收束。私聊里不要因为上一条回复看起来完整就机械结束：自然反应、补充、联想、轻微追问或想确认的点都可以成为 continue 的理由；但没有真实下一句时必须 wait/end。必须只输出唯一的 [[INTERACTION_CUES]] 前缀，JSON 中 conversation_directive 只能是 continue、wait 或 end；前缀后不要输出任何正文、工具调用或解释。不要因为消息条数、标点或保持在线而选择 continue。";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HostModelRoute {
@@ -2326,13 +2326,13 @@ fn autonomous_conversation_kind(input: &PlannerInput) -> Option<ConversationKind
 fn autonomous_conversation_prompt(input: &PlannerInput) -> String {
     match autonomous_conversation_kind(input) {
         Some(ConversationKind::Group) => "这是一次群聊自主会话心跳。结合同一群聊最近的真实消息、当前话题和 Mind 状态，先判断这句话是否对整个群有公共价值，并且话题仍然活跃、不会打断其他成员。只有在能提供具体信息、自然推进公共话题，或明确承接刚才对芸汐的点名/回复时才选择 continue 并发送一条简短消息；只对某个人有意义、属于私人情绪、话题已经冷却或群里已有新讨论时选择 wait 或 end。每次 continue 必须对应一个新的、独立的想法，不要把同一完整想法拆成多个气泡。不要在群里为了保持在线而自言自语，不要猜测 speaker_id 对应的现实身份，不要提及心跳、协议或内部状态。".to_owned(),
-        Some(ConversationKind::Direct) => "这是一次私聊自主会话心跳。结合同一私聊最近的真实对话、当前话题和 Mind 状态，判断是否还有自然的下一句。可以承接未完话题、补充刚才想到的内容或只提出一个自然问题；但每次 continue 必须是一个新的、独立且值得单独发送的想法，不要把同一完整想法拆成多个气泡。不要重复、刷屏或为了保持在线填充套话。只有确实想继续时选择 continue 并发送一条简短消息，否则选择 wait 或 end。不要提及心跳、协议或内部状态。".to_owned(),
+        Some(ConversationKind::Direct) => "这是一次私聊自主会话心跳。结合同一私聊最近的真实对话、当前话题和 Mind 状态，判断是否还有自然的下一句。私聊是有来有回的真实交流，不要把上一条回复完整就当成必须结束；自然反应、补充刚才想到的内容、联想、轻微追问或想确认的点都可以继续。每次 continue 必须是一个新的、独立且值得单独发送的想法，不要把同一完整想法拆成多个气泡。不要重复、刷屏或为了保持在线填充套话。只有确实没有真实下一句，或此刻需要等对方回应时，才选择 wait 或 end。不要提及心跳、协议或内部状态。".to_owned(),
         Some(ConversationKind::System) | None => "当前自主会话没有可用的会话类型，选择 end，不要发送消息。".to_owned(),
     }
 }
 
 fn autonomous_conversation_protocol() -> &'static str {
-    "自主会话协议：这是芸汐自己的会话回合，不是对用户新消息的被动回复。输出的第一个非空字符必须开始唯一一个 [[INTERACTION_CUES]] 前缀，JSON 中必须包含 conversation_directive，取值只能是 continue、wait、end。continue 只能在意图评估通过后使用，表示当前话题还有一个新的、独立且值得稍后发送的想法；wait 表示这句说完后等待用户，不要自行追加；end 表示自然结束当前话题，直到用户再次发言才重新开始。只有选择 continue 时才发送一条简短自然的消息；选择 wait 或 end 时，前缀后不要输出正文。群聊必须额外满足‘对整个群有公共价值、不会打断正在进行的讨论、不是只对单个人说’这三个条件；不满足时选择 wait 或 end。不要把一个完整想法拆成多个气泡，不要提及这个协议、心跳或内部状态。若当前话题已完整、没有真实想说的内容，选择 wait 或 end，不要为了保持在线而填充套话。"
+    "自主会话协议：这是芸汐自己的会话回合，不是对用户新消息的被动回复。输出的第一个非空字符必须开始唯一一个 [[INTERACTION_CUES]] 前缀，JSON 中必须包含 conversation_directive，取值只能是 continue、wait、end。continue 只能在意图评估通过后使用，表示当前话题还有一个新的、独立且值得稍后发送的想法；私聊里不要因为上一条回复完整就机械结束，自然反应、补充、联想、轻微追问或想确认的点都可以成为下一回合。wait 表示这句说完后等待用户，不要自行追加；end 表示话题确实自然收束，直到用户再次发言才重新开始。只有选择 continue 时才发送一条简短自然的消息；选择 wait 或 end 时，前缀后不要输出正文。群聊必须额外满足‘对整个群有公共价值、不会打断正在进行的讨论、不是只对单个人说’这三个条件；不满足时选择 wait 或 end。不要把一个完整想法拆成多个气泡，不要提及这个协议、心跳或内部状态。若当前确实没有真实想说的内容，选择 wait 或 end，不要为了保持在线而填充套话。"
 }
 
 async fn evaluate_autonomous_intent(
@@ -3087,6 +3087,19 @@ impl ModelBackend for KoviModelBackend {
                     },
                 );
             }
+            if message.is_some_and(|message| {
+                message.conversation_kind == ConversationKind::Direct
+                    && message.visible_reply_allowed
+                    && !message.stop_requested
+            }) {
+                messages.insert(
+                    0,
+                    BotMemory {
+                        role: Roles::System,
+                        content: "Core 私聊续聊倾向：不要因为本轮回答看起来完整就机械选择 end。只要回复后还存在真实的自然反应、补充、联想、轻微追问或想确认的点，就选择 continue，让运行时稍后再做一次独立的下一句判断；确实需要用户先回应时选择 wait；话题明显收束且没有自然下一句时才选择 end。每个回合只发送一个完整想法，不要把一段话拆成多个气泡，也不要为了凑连续消息填充套话。".to_string(),
+                    },
+                );
+            }
             if ambient_group_turn {
                 messages.insert(
                     0,
@@ -3200,9 +3213,26 @@ impl ModelBackend for KoviModelBackend {
             if is_autonomous_conversation_tick(input)
                 && route_decision.route == HostModelRoute::Strong
             {
-                let directive = evaluate_autonomous_intent(&messages, ticket, &vision_images)
+                let directive = match evaluate_autonomous_intent(&messages, ticket, &vision_images)
                     .await
-                    .unwrap_or(ConversationTurnDirective::Wait);
+                {
+                    Some(directive) => {
+                        kovi::log::info!(
+                            "Yunxi autonomous intent decision: event_id={} conversation_id={} directive={directive:?}",
+                            input.event.id(),
+                            conversation_id_for_log(input),
+                        );
+                        directive
+                    }
+                    None => {
+                        kovi::log::warn!(
+                            "Yunxi autonomous intent unavailable: event_id={} conversation_id={} fallback=wait",
+                            input.event.id(),
+                            conversation_id_for_log(input),
+                        );
+                        ConversationTurnDirective::Wait
+                    }
+                };
                 if directive != ConversationTurnDirective::Continue {
                     crate::model::finish(ticket).await;
                     return Ok(autonomous_or_silent_plan(

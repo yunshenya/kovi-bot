@@ -160,11 +160,11 @@ push_probability_percent = 35
 main_admin_decision_interval_secs = 10800
 # Neuro-sama 风格自主会话（私聊和群聊都由模型结合语境决定是否继续）
 autonomous_conversation_enabled = true
-autonomous_conversation_check_interval_secs = 15
-autonomous_conversation_idle_secs = 90
-autonomous_conversation_cooldown_secs = 15
-autonomous_conversation_group_idle_secs = 180
-autonomous_conversation_group_cooldown_secs = 90
+autonomous_conversation_check_interval_secs = 3
+autonomous_conversation_idle_secs = 5
+autonomous_conversation_cooldown_secs = 3
+autonomous_conversation_group_idle_secs = 45
+autonomous_conversation_group_cooldown_secs = 15
 # Legacy compatibility field; autonomous continuation is decided by the model.
 autonomous_conversation_group_max_turns = 1
 # 私聊是否继续完全由模型根据 conversation_directive 决定；每轮都会重新读取上下文。

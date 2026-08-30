@@ -133,8 +133,13 @@ pub(crate) fn record_outbound(conversation_id: ConversationId, occurred_at: Date
     let _ = record_outbound_with_directive(conversation_id, occurred_at, None, None);
 }
 
-/// Record a normal reply and its model-selected conversation directive. The
-/// registry never infers continuation from message text or punctuation.
+/// Record a normal reply and its model-selected conversation directive.
+///
+/// A delivered direct-chat reply without a directive enters a short
+/// continuation cooldown. This is a semantic default based on the
+/// platform-neutral conversation kind, not a text or keyword heuristic; the
+/// next autonomous turn still asks the model whether there is a real next
+/// thought worth sending.
 pub(crate) fn record_outbound_with_directive(
     conversation_id: ConversationId,
     occurred_at: DateTime<Utc>,
@@ -146,12 +151,16 @@ pub(crate) fn record_outbound_with_directive(
     };
     let entry = registry.entries.get_mut(&conversation_id)?;
     let policy = config.map(autonomy_policy).unwrap_or_default();
+    let effective_directive = directive.or_else(|| {
+        (entry.lifecycle.kind() == ConversationKind::Direct)
+            .then_some(ConversationTurnDirective::Continue)
+    });
     entry
         .lifecycle
-        .record_outbound(occurred_at, directive, policy)
+        .record_outbound(occurred_at, effective_directive, policy)
         .ok()?;
     touch(&mut registry.order, conversation_id);
-    directive
+    effective_directive
 }
 
 /// Claim at most one eligible autonomous turn per call. The scheduler calls
@@ -411,13 +420,17 @@ mod tests {
             Some(ConversationTurnDirective::Continue),
             Some(&config),
         );
-        assert!(claim_due(&config, now + Duration::seconds(14)).is_none());
-        assert_eq!(claim_due(&config, now + Duration::seconds(15)), Some(id));
+        let cooldown = config.autonomous_conversation_cooldown_secs() as i64;
+        assert!(claim_due(&config, now + Duration::seconds(cooldown - 1)).is_none());
+        assert_eq!(
+            claim_due(&config, now + Duration::seconds(cooldown)),
+            Some(id)
+        );
         clear();
     }
 
     #[test]
-    fn omitted_directive_does_not_start_a_new_autonomous_turn() {
+    fn omitted_directive_defaults_to_direct_continuation() {
         let _guard = TEST_LOCK.lock().expect("test lock");
         clear();
         let id = ConversationId::new();
@@ -425,7 +438,13 @@ mod tests {
         let config = ProactiveConfig::default();
         observe_inbound(id, ConversationKind::Direct, now, true);
         record_outbound_with_directive(id, now, None, Some(&config));
-        assert!(claim_due(&config, now + Duration::seconds(15)).is_none());
+        assert_eq!(
+            claim_due(
+                &config,
+                now + Duration::seconds(config.autonomous_conversation_cooldown_secs() as i64)
+            ),
+            Some(id)
+        );
         clear();
     }
 
@@ -444,7 +463,8 @@ mod tests {
             Some(&config),
         );
 
-        let mut follow_up = now + Duration::seconds(15);
+        let cooldown = config.autonomous_conversation_cooldown_secs() as i64;
+        let mut follow_up = now + Duration::seconds(cooldown);
         for _ in 0..8 {
             assert_eq!(claim_due(&config, follow_up), Some(id));
             finish_claim(
@@ -454,7 +474,7 @@ mod tests {
                 ConversationTurnDirective::Continue,
                 &config,
             );
-            follow_up += Duration::seconds(15);
+            follow_up += Duration::seconds(cooldown);
         }
         assert_eq!(claim_due(&config, follow_up), Some(id));
         finish_claim(id, follow_up, true, ConversationTurnDirective::End, &config);
@@ -494,7 +514,7 @@ mod tests {
             Some(ConversationTurnDirective::Continue),
             Some(&config),
         );
-        let due = now + Duration::seconds(15);
+        let due = now + Duration::seconds(config.autonomous_conversation_cooldown_secs() as i64);
         assert_eq!(claim_due(&config, due), Some(id));
         finish_claim(id, due, false, ConversationTurnDirective::Continue, &config);
         assert!(claim_due(&config, due + Duration::hours(1)).is_none());
@@ -515,7 +535,7 @@ mod tests {
             Some(ConversationTurnDirective::Continue),
             Some(&config),
         );
-        let due = now + Duration::seconds(15);
+        let due = now + Duration::seconds(config.autonomous_conversation_cooldown_secs() as i64);
         assert_eq!(claim_due(&config, due), Some(id));
         assert!(claim_due(&config, due).is_none());
         release_claim(id);

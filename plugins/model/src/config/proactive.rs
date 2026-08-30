@@ -202,11 +202,11 @@ impl Default for ProactiveConfig {
             recent_interaction_cooldown_secs: 7_200,
             prepared_grace_ms: 500,
             autonomous_conversation_enabled: true,
-            autonomous_conversation_check_interval_secs: 15,
-            autonomous_conversation_idle_secs: 90,
-            autonomous_conversation_cooldown_secs: 15,
-            autonomous_conversation_group_idle_secs: 180,
-            autonomous_conversation_group_cooldown_secs: 90,
+            autonomous_conversation_check_interval_secs: 3,
+            autonomous_conversation_idle_secs: 5,
+            autonomous_conversation_cooldown_secs: 3,
+            autonomous_conversation_group_idle_secs: 45,
+            autonomous_conversation_group_cooldown_secs: 15,
             autonomous_conversation_group_max_turns: 1,
         }
     }
@@ -248,10 +248,11 @@ mod tests {
         assert_eq!(config.main_admin_daily_limit(), 2);
         assert_eq!(config.target_cooldown_secs(), 21_600);
         assert_eq!(config.prepared_grace_ms(), 500);
-        assert_eq!(config.autonomous_conversation_check_interval_secs(), 15);
-        assert_eq!(config.autonomous_conversation_cooldown_secs(), 15);
-        assert_eq!(config.autonomous_conversation_group_idle_secs(), 180);
-        assert_eq!(config.autonomous_conversation_group_cooldown_secs(), 90);
+        assert_eq!(config.autonomous_conversation_check_interval_secs(), 3);
+        assert_eq!(config.autonomous_conversation_idle_secs(), 5);
+        assert_eq!(config.autonomous_conversation_cooldown_secs(), 3);
+        assert_eq!(config.autonomous_conversation_group_idle_secs(), 45);
+        assert_eq!(config.autonomous_conversation_group_cooldown_secs(), 15);
         assert_eq!(config.autonomous_conversation_group_max_turns(), 1);
     }
 

@@ -33,10 +33,12 @@ pub struct AutonomyPolicy {
 impl Default for AutonomyPolicy {
     fn default() -> Self {
         Self {
-            direct_idle: Duration::seconds(90),
-            group_idle: Duration::seconds(180),
-            direct_cooldown: Duration::seconds(15),
-            group_cooldown: Duration::seconds(30),
+            // Direct chat should feel live while still giving the user a
+            // chance to answer before a new autonomous turn is considered.
+            direct_idle: Duration::seconds(5),
+            group_idle: Duration::seconds(45),
+            direct_cooldown: Duration::seconds(3),
+            group_cooldown: Duration::seconds(15),
         }
     }
 }
