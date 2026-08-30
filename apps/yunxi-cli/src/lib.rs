@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::thread;
 
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 pub use journal::{CliJournal, JournalError, JournalRecord, MAX_JOURNAL_INPUT_BYTES};
 use serde::{Deserialize, Serialize};
 pub use state::{
@@ -24,12 +25,17 @@ pub use state::{
 use yunxi_core::{
     ActionArbiter, ActionArbiterConfig, ActionCapability, ActionDescriptor, ActionPort,
     ActionPortError, ActionPortFuture, ActionPortOutcome, ActionRejection, ActionResult,
-    CognitiveRuntime, ConversationId, CoreServices, DecisionDisposition, DecisionPlan,
-    EnvironmentCapabilities, MemoryStore, MessageContent, ModelBackend as CoreModelBackend,
-    OpenLoopDraft, OpenLoopKind, OpenLoopOwner, OpenLoopStore, PersonId, PlannedProcessingOutcome,
-    PlannerError, PlannerInput, ProposedAction, RuntimeConfig, StateUpdateProposal, WorldEvent,
-    WorldEventKind,
+    AutonomousConversationTickEvent, AutonomyPolicy, CognitiveRuntime, ConversationId,
+    ConversationKind, ConversationLifecycle, ConversationLifecycleError, ConversationTurnDirective,
+    CoreServices, DecisionDisposition, DecisionPlan, EnvironmentCapabilities, EventPriority,
+    EventScope, MemoryStore, MessageContent, ModelBackend as CoreModelBackend, OpenLoopDraft,
+    OpenLoopKind, OpenLoopOwner, OpenLoopStore, PersonId, PlannedProcessingOutcome, PlannerError,
+    PlannerInput, ProposedAction, RuntimeConfig, StateUpdateProposal, WorldEvent, WorldEventKind,
 };
+
+/// Input marker used for autonomous turns in the optional CLI journal.
+pub const AUTONOMOUS_TICK_INPUT: &str = "[autonomous tick]";
+const AUTONOMOUS_RETRY_BACKOFF: ChronoDuration = ChronoDuration::seconds(1);
 
 /// Deterministic model used by the standalone demo and acceptance tests.
 #[derive(Debug, Clone, Copy, Default)]
@@ -38,6 +44,55 @@ pub struct FakeModel;
 impl CoreModelBackend for FakeModel {
     fn plan<'a>(&'a self, input: &'a PlannerInput) -> yunxi_core::ModelBackendFuture<'a> {
         Box::pin(async move {
+            if let WorldEventKind::AutonomousConversationTick(_) = input.event.kind() {
+                let Some(conversation_id) = input.event.scope().conversation_id() else {
+                    return Ok(DecisionPlan::silent());
+                };
+                let conversation = input.state.conversation.as_ref();
+                let tick_count = conversation
+                    .map(|conversation| {
+                        conversation
+                            .recent_events
+                            .iter()
+                            .filter(|event| {
+                                event.event_type
+                                    == yunxi_core::EventType::AutonomousConversationTick
+                            })
+                            .count()
+                    })
+                    .unwrap_or_default();
+                let previous_user_message = conversation.and_then(|conversation| {
+                    conversation
+                        .recent_events
+                        .iter()
+                        .rev()
+                        .find(|event| event.event_type == yunxi_core::EventType::MessageReceived)
+                        .and_then(|event| event.text.clone())
+                });
+                let (text, directive) = if tick_count <= 1 {
+                    let text = previous_user_message.map_or_else(
+                        || "I had another thought while we were quiet.".to_owned(),
+                        |previous| format!("I kept thinking about that: {previous}"),
+                    );
+                    (text, ConversationTurnDirective::Continue)
+                } else {
+                    (
+                        "That is enough of a thought for now; I will pause here.".to_owned(),
+                        ConversationTurnDirective::End,
+                    )
+                };
+                return Ok(DecisionPlan {
+                    disposition: DecisionDisposition::Reply,
+                    intents: vec![yunxi_core::CognitiveIntent::send_message(
+                        conversation_id,
+                        MessageContent::text(text),
+                    )],
+                    state_updates: vec![StateUpdateProposal::ConversationDirective {
+                        conversation_id,
+                        directive,
+                    }],
+                });
+            }
             let Some(WorldEventKind::MessageReceived(message)) = Some(input.event.kind()) else {
                 return Ok(DecisionPlan::silent());
             };
@@ -205,6 +260,7 @@ pub enum CliError {
     Port(ActionPortError),
     Journal(JournalError),
     State(CliStateError),
+    Autonomy(ConversationLifecycleError),
     Runtime(String),
 }
 
@@ -216,6 +272,7 @@ impl fmt::Display for CliError {
             Self::Port(error) => write!(formatter, "action port failed: {error}"),
             Self::Journal(error) => write!(formatter, "journal error: {error}"),
             Self::State(error) => write!(formatter, "state error: {error}"),
+            Self::Autonomy(error) => write!(formatter, "autonomy error: {error}"),
             Self::Runtime(error) => write!(formatter, "runtime error: {error}"),
         }
     }
@@ -233,6 +290,10 @@ pub struct CliHost<M, E> {
     runtime: Mutex<CognitiveRuntime>,
     journal: Option<Arc<CliJournal>>,
     core_state: Arc<CliCoreState>,
+    autonomy_policy: AutonomyPolicy,
+    lifecycle: Mutex<ConversationLifecycle>,
+    autonomy_retry_after: Mutex<Option<DateTime<Utc>>>,
+    turn_gate: Mutex<()>,
 }
 
 impl<M, E> fmt::Debug for CliHost<M, E>
@@ -247,6 +308,7 @@ where
             .field("environment", &self.environment)
             .field("person_id", &self.person_id)
             .field("conversation_id", &self.conversation_id)
+            .field("autonomy_policy", &self.autonomy_policy)
             .field("journal", &self.journal)
             .field("core_state", &self.core_state.path())
             .finish_non_exhaustive()
@@ -275,6 +337,9 @@ where
         .expect("default CLI runtime configuration must be valid");
         let arbiter =
             ActionArbiter::new(ActionArbiterConfig::default().with_capabilities(capabilities));
+        let autonomy_policy = AutonomyPolicy::default();
+        let lifecycle = ConversationLifecycle::new(conversation_id, ConversationKind::Direct)
+            .expect("default CLI autonomy policy must be valid");
         Self {
             model,
             environment,
@@ -284,6 +349,10 @@ where
             runtime: Mutex::new(runtime),
             journal: None,
             core_state,
+            autonomy_policy,
+            lifecycle: Mutex::new(lifecycle),
+            autonomy_retry_after: Mutex::new(None),
+            turn_gate: Mutex::new(()),
         }
     }
 
@@ -298,6 +367,16 @@ where
             .get_mut()
             .expect("owned CLI runtime lock cannot be poisoned")
             .install_services(core_services(&self.model, &core_state));
+        let lifecycle = ConversationLifecycle::new(self.conversation_id, ConversationKind::Direct)
+            .expect("default CLI autonomy policy must be valid");
+        *self
+            .lifecycle
+            .get_mut()
+            .expect("owned CLI lifecycle lock cannot be poisoned") = lifecycle;
+        *self
+            .autonomy_retry_after
+            .get_mut()
+            .expect("owned CLI autonomy retry lock cannot be poisoned") = None;
         self.core_state = core_state;
         self
     }
@@ -307,6 +386,29 @@ where
     pub fn with_journal(mut self, journal: Arc<CliJournal>) -> Self {
         self.journal = Some(journal);
         self
+    }
+
+    /// Replaces the default idle and cooldown windows used by the standalone
+    /// autonomous conversation loop. This is primarily useful for deterministic
+    /// host tests; production-like callers should keep the defaults.
+    pub fn try_with_autonomy_policy(mut self, policy: AutonomyPolicy) -> Result<Self, CliError> {
+        policy.validate().map_err(CliError::Autonomy)?;
+        self.autonomy_policy = policy;
+        Ok(self)
+    }
+
+    /// Returns a copy of the current host autonomy policy.
+    #[must_use]
+    pub const fn autonomy_policy(&self) -> AutonomyPolicy {
+        self.autonomy_policy
+    }
+
+    /// Returns the serializable lifecycle snapshot used by the scheduler.
+    pub fn lifecycle(&self) -> Result<ConversationLifecycle, CliError> {
+        self.lifecycle
+            .lock()
+            .map_err(|_| CliError::Runtime("autonomy lifecycle lock poisoned".to_owned()))
+            .map(|lifecycle| lifecycle.clone())
     }
 
     /// Returns the configured journal, if this host was built with one.
@@ -343,10 +445,38 @@ where
     /// Processes one line of user input through model, intent, arbiter, and
     /// environment boundaries.
     pub fn process_line(&self, input: &str) -> Result<HostResponse, CliError> {
+        self.process_line_at(input, Utc::now())
+    }
+
+    /// Deterministic-clock variant of [`Self::process_line`]. Hosts and tests
+    /// can use this to advance the lifecycle without sleeping.
+    pub fn process_line_at(
+        &self,
+        input: &str,
+        occurred_at: DateTime<Utc>,
+    ) -> Result<HostResponse, CliError> {
+        let _turn_guard = self
+            .turn_gate
+            .lock()
+            .map_err(|_| CliError::Runtime("CLI turn gate poisoned".to_owned()))?;
         let input = input.trim();
         if input.is_empty() {
             return Ok(HostResponse::Empty);
         }
+
+        {
+            let mut lifecycle = self
+                .lifecycle
+                .lock()
+                .map_err(|_| CliError::Runtime("autonomy lifecycle lock poisoned".to_owned()))?;
+            lifecycle
+                .observe_inbound(ConversationKind::Direct, self.person_id, occurred_at)
+                .map_err(CliError::Autonomy)?;
+        }
+        *self
+            .autonomy_retry_after
+            .lock()
+            .map_err(|_| CliError::Runtime("CLI autonomy retry lock poisoned".to_owned()))? = None;
 
         let journal = self.journal.clone();
         let journal_sequence = journal
@@ -358,17 +488,16 @@ where
             })
             .transpose()?;
 
-        let timestamp = chrono::Utc::now();
         let event = WorldEvent::message_received(
-            yunxi_core::EventPriority::High,
+            EventPriority::High,
             yunxi_core::MessageReceivedEvent {
                 message_id: yunxi_core::MessageId::new(),
                 conversation_id: self.conversation_id,
                 sender: self.person_id,
                 content: MessageContent::text(input),
                 reply_to: None,
-                timestamp,
-                conversation_kind: yunxi_core::ConversationKind::Direct,
+                timestamp: occurred_at,
+                conversation_kind: ConversationKind::Direct,
                 addressed_to_agent: true,
                 replies_to_agent: false,
                 stop_requested: false,
@@ -378,50 +507,218 @@ where
         );
         let result = self
             .core_state
-            .remember_message(self.conversation_id, input, timestamp)
+            .remember_message(self.conversation_id, input, occurred_at)
             .map_err(CliError::State)
-            .and_then(|_| {
-                let mut runtime = self
-                    .runtime
-                    .lock()
-                    .map_err(|_| CliError::Runtime("runtime lock poisoned".to_owned()))?;
-                let action_port = CliActionPort {
-                    environment: &self.environment,
-                    core_state: &self.core_state,
-                };
-                block_on(runtime.process_event_with_planner_and_actions(
-                    event,
-                    &self.arbiter,
-                    &action_port,
-                ))
-                .map_err(CliError::Planner)
-            })
-            .and_then(|outcome| {
-                let PlannedProcessingOutcome::Planned { plan, actions, .. } = outcome else {
-                    return Err(CliError::Runtime(
-                        "runtime rejected the CLI event".to_owned(),
-                    ));
-                };
-                response_from_actions(&plan, actions)
+            .and_then(|_| self.run_event(event))
+            .and_then(|(plan, response)| {
+                if response_is_delivered(&response) {
+                    self.record_reactive_outbound(occurred_at, &plan)?;
+                }
+                Ok(response)
             });
 
-        if let (Some(journal), Some(sequence)) = (journal.as_deref(), journal_sequence) {
-            let journal_result = match &result {
-                Ok(response) => journal.complete(sequence, response),
-                Err(error) => journal.fail(sequence, error.to_string()),
-            };
-            // A completed action must not be reported as a planner failure if
-            // only the post-action audit record could not be written. For a
-            // successful turn, however, surface the journal failure so a host
-            // can repair its storage rather than silently lose durability.
-            if let Err(error) = journal_result
-                && result.is_ok()
-            {
-                return Err(CliError::Journal(error));
-            }
-        }
-        result
+        finish_journal(journal.as_deref(), journal_sequence, result)
     }
+
+    /// Runs one due autonomous conversation turn, if the lifecycle says the
+    /// conversation is idle and its continuation cooldown has elapsed.
+    pub fn process_autonomous_tick(&self) -> Result<Option<HostResponse>, CliError> {
+        self.process_autonomous_tick_at(Utc::now())
+    }
+
+    /// Deterministic-clock variant used by hosts and acceptance tests.
+    /// Returning `None` means no turn was due; `Some(Noop)` means a due turn
+    /// was claimed but the planner elected not to speak.
+    pub fn process_autonomous_tick_at(
+        &self,
+        occurred_at: DateTime<Utc>,
+    ) -> Result<Option<HostResponse>, CliError> {
+        let _turn_guard = self
+            .turn_gate
+            .lock()
+            .map_err(|_| CliError::Runtime("CLI turn gate poisoned".to_owned()))?;
+        if self
+            .autonomy_retry_after
+            .lock()
+            .map_err(|_| CliError::Runtime("CLI autonomy retry lock poisoned".to_owned()))?
+            .is_some_and(|retry_after| occurred_at < retry_after)
+        {
+            return Ok(None);
+        }
+        let claimed = {
+            let mut lifecycle = self
+                .lifecycle
+                .lock()
+                .map_err(|_| CliError::Runtime("autonomy lifecycle lock poisoned".to_owned()))?;
+            lifecycle
+                .claim_autonomous(occurred_at, self.autonomy_policy)
+                .map_err(CliError::Autonomy)?
+        };
+        if !claimed {
+            return Ok(None);
+        }
+
+        let journal = self.journal.clone();
+        let journal_sequence = match journal.as_deref() {
+            Some(journal) => match journal.start(self.conversation_id, AUTONOMOUS_TICK_INPUT) {
+                Ok(sequence) => Some(sequence),
+                Err(error) => {
+                    self.release_autonomous_claim_for_retry(occurred_at)?;
+                    return Err(CliError::Journal(error));
+                }
+            },
+            None => None,
+        };
+        let event = WorldEvent::new(
+            occurred_at,
+            EventScope::Conversation {
+                conversation_id: self.conversation_id,
+            },
+            EventPriority::High,
+            WorldEventKind::AutonomousConversationTick(AutonomousConversationTickEvent {
+                conversation_kind: Some(ConversationKind::Direct),
+                person_id: Some(self.person_id),
+                claim_token: None,
+            }),
+        );
+        let result = self.run_event(event);
+        let host_result = match result {
+            Ok((plan, response)) => {
+                let delivered = response_is_delivered(&response);
+                let directive = plan_directive(&plan, self.conversation_id)
+                    .unwrap_or(ConversationTurnDirective::Continue);
+                self.finish_autonomous_claim(occurred_at, delivered, directive)?;
+                *self.autonomy_retry_after.lock().map_err(|_| {
+                    CliError::Runtime("CLI autonomy retry lock poisoned".to_owned())
+                })? = None;
+                Ok(response)
+            }
+            Err(error) => {
+                self.release_autonomous_claim_for_retry(occurred_at)?;
+                Err(error)
+            }
+        };
+
+        finish_journal(journal.as_deref(), journal_sequence, host_result).map(Some)
+    }
+
+    fn run_event(&self, event: WorldEvent) -> Result<(DecisionPlan, HostResponse), CliError> {
+        let mut runtime = self
+            .runtime
+            .lock()
+            .map_err(|_| CliError::Runtime("runtime lock poisoned".to_owned()))?;
+        let action_port = CliActionPort {
+            environment: &self.environment,
+            core_state: &self.core_state,
+        };
+        let outcome = block_on(runtime.process_event_with_planner_and_actions(
+            event,
+            &self.arbiter,
+            &action_port,
+        ))
+        .map_err(CliError::Planner)?;
+        let PlannedProcessingOutcome::Planned { plan, actions, .. } = outcome else {
+            return Err(CliError::Runtime(
+                "runtime rejected the CLI event".to_owned(),
+            ));
+        };
+        let response = response_from_actions(&plan, actions)?;
+        Ok((plan, response))
+    }
+
+    fn record_reactive_outbound(
+        &self,
+        occurred_at: DateTime<Utc>,
+        plan: &DecisionPlan,
+    ) -> Result<(), CliError> {
+        let directive = plan_directive(plan, self.conversation_id)
+            .unwrap_or(ConversationTurnDirective::Continue);
+        let mut lifecycle = self
+            .lifecycle
+            .lock()
+            .map_err(|_| CliError::Runtime("autonomy lifecycle lock poisoned".to_owned()))?;
+        lifecycle
+            .record_outbound(occurred_at, Some(directive), self.autonomy_policy)
+            .map_err(CliError::Autonomy)
+    }
+
+    fn finish_autonomous_claim(
+        &self,
+        occurred_at: DateTime<Utc>,
+        delivered: bool,
+        directive: ConversationTurnDirective,
+    ) -> Result<(), CliError> {
+        let mut lifecycle = self
+            .lifecycle
+            .lock()
+            .map_err(|_| CliError::Runtime("autonomy lifecycle lock poisoned".to_owned()))?;
+        lifecycle
+            .finish_autonomous_claim(occurred_at, delivered, directive, self.autonomy_policy)
+            .map_err(CliError::Autonomy)
+    }
+
+    fn release_autonomous_claim_for_retry(
+        &self,
+        occurred_at: DateTime<Utc>,
+    ) -> Result<(), CliError> {
+        let mut lifecycle = self
+            .lifecycle
+            .lock()
+            .map_err(|_| CliError::Runtime("autonomy lifecycle lock poisoned".to_owned()))?;
+        lifecycle
+            .release_autonomous_claim()
+            .map_err(CliError::Autonomy)?;
+        drop(lifecycle);
+        *self
+            .autonomy_retry_after
+            .lock()
+            .map_err(|_| CliError::Runtime("CLI autonomy retry lock poisoned".to_owned()))? =
+            Some(occurred_at + AUTONOMOUS_RETRY_BACKOFF);
+        Ok(())
+    }
+}
+
+fn finish_journal(
+    journal: Option<&CliJournal>,
+    sequence: Option<u64>,
+    result: Result<HostResponse, CliError>,
+) -> Result<HostResponse, CliError> {
+    if let (Some(journal), Some(sequence)) = (journal, sequence) {
+        let journal_result = match &result {
+            Ok(response) => journal.complete(sequence, response),
+            Err(error) => journal.fail(sequence, error.to_string()),
+        };
+        // A completed action must not be reported as a planner failure if
+        // only the post-action audit record could not be written. For a
+        // successful turn, however, surface the journal failure so a host
+        // can repair its storage rather than silently lose durability.
+        if let Err(error) = journal_result
+            && result.is_ok()
+        {
+            return Err(CliError::Journal(error));
+        }
+    }
+    result
+}
+
+fn response_is_delivered(response: &HostResponse) -> bool {
+    matches!(response, HostResponse::Delivered { .. })
+}
+
+fn plan_directive(
+    plan: &DecisionPlan,
+    conversation_id: ConversationId,
+) -> Option<ConversationTurnDirective> {
+    plan.state_updates.iter().find_map(|update| {
+        let StateUpdateProposal::ConversationDirective {
+            conversation_id: target,
+            directive,
+        } = update
+        else {
+            return None;
+        };
+        (*target == conversation_id).then_some(*directive)
+    })
 }
 
 fn response_from_actions(

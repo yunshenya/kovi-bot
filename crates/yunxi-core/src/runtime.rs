@@ -840,6 +840,17 @@ impl CognitiveRuntime {
         Some(outcome)
     }
 
+    /// Observe-only queue variant that also returns the consumed event. This
+    /// lets a host release an external lease for compatibility runtimes that
+    /// do not install a planner/action adapter.
+    pub async fn process_next_with_event(&mut self) -> Option<(WorldEvent, ProcessingOutcome)> {
+        let event = self.next_event().await?;
+        let root = event.trace().root_event_id();
+        let outcome = self.process_event(event.clone());
+        self.release_tool_budget_root_if_terminal(root);
+        Some((event, outcome))
+    }
+
     async fn next_event(&mut self) -> Option<WorldEvent> {
         loop {
             if let Some(event) = self.pending_tool_follow_ups.pop_front() {
@@ -991,9 +1002,34 @@ impl CognitiveRuntime {
         arbiter: &ActionArbiter,
         port: &dyn ActionPort,
     ) -> Result<PlannedProcessingOutcome, PlannerError> {
+        self.process_event_with_planner_and_actions_impl(event, arbiter, port, None)
+            .await
+    }
+
+    /// Variant that lets a host cancel a turn while an external lease is
+    /// still valid. The guard is checked after planning and immediately before
+    /// each action crosses the arbiter/port boundary.
+    pub async fn process_event_with_planner_and_actions_guarded(
+        &mut self,
+        event: WorldEvent,
+        arbiter: &ActionArbiter,
+        port: &dyn ActionPort,
+        guard: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Result<PlannedProcessingOutcome, PlannerError> {
+        self.process_event_with_planner_and_actions_impl(event, arbiter, port, Some(guard))
+            .await
+    }
+
+    async fn process_event_with_planner_and_actions_impl(
+        &mut self,
+        event: WorldEvent,
+        arbiter: &ActionArbiter,
+        port: &dyn ActionPort,
+        guard: Option<&(dyn Fn() -> bool + Send + Sync)>,
+    ) -> Result<PlannedProcessingOutcome, PlannerError> {
         let root = event.trace().root_event_id();
         let result = self
-            .process_event_with_planner_and_actions_inner(event, arbiter, port)
+            .process_event_with_planner_and_actions_inner(event, arbiter, port, guard)
             .await;
         // Any completed or failed turn is terminal once no child is pending;
         // retaining errored roots indefinitely would let malformed/backend
@@ -1007,6 +1043,7 @@ impl CognitiveRuntime {
         event: WorldEvent,
         arbiter: &ActionArbiter,
         port: &dyn ActionPort,
+        guard: Option<&(dyn Fn() -> bool + Send + Sync)>,
     ) -> Result<PlannedProcessingOutcome, PlannerError> {
         let planner_event = event.clone();
         let observed = self.process_event(event);
@@ -1019,6 +1056,14 @@ impl CognitiveRuntime {
                 return Ok(PlannedProcessingOutcome::RejectedState { event, error });
             }
         };
+        if guard.is_some_and(|guard| !guard()) {
+            return Ok(PlannedProcessingOutcome::Planned {
+                observation,
+                plan: DecisionPlan::silent(),
+                actions: Vec::new(),
+                feedback: Vec::new(),
+            });
+        }
         if !observation.attention.should_invoke_planner() {
             return Ok(observed_without_planning(observation));
         }
@@ -1052,6 +1097,15 @@ impl CognitiveRuntime {
             release_unexecuted_tool_intents(&planner_event, &plan, port).await;
             return Err(error);
         }
+        if guard.is_some_and(|guard| !guard()) {
+            release_unexecuted_tool_intents(&planner_event, &plan, port).await;
+            return Ok(PlannedProcessingOutcome::Planned {
+                observation,
+                plan: DecisionPlan::silent(),
+                actions: Vec::new(),
+                feedback: Vec::new(),
+            });
+        }
         let due_open_loop = due_open_loop_id(&planner_event);
         let deferred_due_resolution = deferred_due_open_loop_resolution(&planner_event, &plan);
         let applied_state_updates = match self
@@ -1071,6 +1125,16 @@ impl CognitiveRuntime {
         let mut tool_follow_up_events = Vec::new();
         let mut selected_action = None;
         for (intent_index, intent) in plan.intents.iter().enumerate() {
+            if guard.is_some_and(|guard| !guard()) {
+                release_unexecuted_tool_intents_from(&planner_event, &plan, intent_index, port)
+                    .await;
+                return Ok(PlannedProcessingOutcome::Planned {
+                    observation,
+                    plan: DecisionPlan::silent(),
+                    actions: Vec::new(),
+                    feedback: Vec::new(),
+                });
+            }
             let tool_notification_policy = intent.tool_notification_policy().unwrap_or_default();
             let mut proposed = match intent.propose_action() {
                 Ok(proposed) => proposed,
@@ -1274,11 +1338,46 @@ impl CognitiveRuntime {
         arbiter: &ActionArbiter,
         port: &dyn ActionPort,
     ) -> Option<Result<PlannedProcessingOutcome, PlannerError>> {
+        self.process_next_with_planner_and_actions_with_event(arbiter, port)
+            .await
+            .map(|(_, result)| result)
+    }
+
+    /// Queue variant that also returns the event being processed. Hosts that
+    /// maintain an external lease (for example the autonomous conversation
+    /// scheduler) can use the event to release that lease when planning fails
+    /// before a normal `PlannedProcessingOutcome` is available.
+    pub async fn process_next_with_planner_and_actions_with_event(
+        &mut self,
+        arbiter: &ActionArbiter,
+        port: &dyn ActionPort,
+    ) -> Option<(WorldEvent, Result<PlannedProcessingOutcome, PlannerError>)> {
         let event = self.next_event().await?;
-        Some(
-            self.process_event_with_planner_and_actions(event, arbiter, port)
-                .await,
-        )
+        let result = self
+            .process_event_with_planner_and_actions(event.clone(), arbiter, port)
+            .await;
+        Some((event, result))
+    }
+
+    /// Queue variant with a host cancellation guard. The event is returned so
+    /// the host can correlate any planner error with its external lease.
+    pub async fn process_next_with_planner_and_actions_with_event_and_guard(
+        &mut self,
+        arbiter: &ActionArbiter,
+        port: &dyn ActionPort,
+        guard: &(dyn Fn(&WorldEvent) -> bool + Send + Sync),
+    ) -> Option<(WorldEvent, Result<PlannedProcessingOutcome, PlannerError>)> {
+        let event = self.next_event().await?;
+        let should_continue = || guard(&event);
+        let result = self
+            .process_event_with_planner_and_actions_guarded(
+                event.clone(),
+                arbiter,
+                port,
+                &should_continue,
+            )
+            .await;
+        Some((event, result))
     }
 
     /// Builds a planner context from the current runtime state.  Hosts that
@@ -1867,21 +1966,32 @@ fn event_person_id(event: &WorldEvent) -> Option<PersonId> {
     match event.kind() {
         crate::WorldEventKind::MessageReceived(message) => Some(message.sender),
         crate::WorldEventKind::InteractionCuesObserved(cues) => Some(cues.person_id),
+        crate::WorldEventKind::AutonomousConversationTick(tick) => tick.person_id,
         _ => None,
     }
 }
 
 fn autonomous_direct_person(input: &PlannerInput) -> Option<PersonId> {
-    if !matches!(
-        input.event.kind(),
-        crate::WorldEventKind::AutonomousConversationTick(_)
-    ) {
+    let crate::WorldEventKind::AutonomousConversationTick(tick) = input.event.kind() else {
+        return None;
+    };
+    let conversation_kind = tick.conversation_kind.or_else(|| {
+        input
+            .state
+            .conversation
+            .as_ref()
+            .and_then(|conversation| conversation.conversation_kind)
+    });
+    if conversation_kind != Some(crate::ConversationKind::Direct) {
         return None;
     }
-    let conversation = input.state.conversation.as_ref()?;
-    (conversation.conversation_kind == Some(crate::ConversationKind::Direct))
-        .then(|| conversation.active_people.first().copied())
-        .flatten()
+    tick.person_id.or_else(|| {
+        input
+            .state
+            .conversation
+            .as_ref()
+            .and_then(|conversation| conversation.active_people.first().copied())
+    })
 }
 
 fn executive_scope_for_event(event: &WorldEvent) -> ExecutiveScope {

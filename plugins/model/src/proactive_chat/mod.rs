@@ -166,30 +166,40 @@ impl ProactiveChatManager {
         let Some(bridge) = &self.yunxi_bridge else {
             return;
         };
-        let Some(conversation_id) =
-            yunxi::autonomous::claim_due(proactive_config, chrono::Utc::now())
+        let Some(claim) =
+            yunxi::autonomous::claim_due_with_context(proactive_config, chrono::Utc::now())
         else {
             return;
         };
         match bridge
-            .submit_autonomous_conversation_tick(conversation_id)
+            .submit_autonomous_conversation_tick(
+                claim.conversation_id,
+                claim.conversation_kind,
+                claim.person_id,
+                claim.token,
+            )
             .await
         {
             Ok(yunxi_core::Admission::Accepted) => {
                 kovi::log::info!(
-                    "Yunxi autonomous conversation tick admitted: conversation_id={conversation_id}"
+                    "Yunxi autonomous conversation tick admitted: conversation_id={} kind={:?} person_id={:?}",
+                    claim.conversation_id,
+                    claim.conversation_kind,
+                    claim.person_id,
                 );
             }
             Ok(admission) => {
-                yunxi::autonomous::release_claim(conversation_id);
+                yunxi::autonomous::release_claim_token(claim.conversation_id, claim.token);
                 kovi::log::debug!(
-                    "Yunxi autonomous conversation tick not admitted: conversation_id={conversation_id} admission={admission:?}"
+                    "Yunxi autonomous conversation tick not admitted: conversation_id={} admission={admission:?}",
+                    claim.conversation_id,
                 );
             }
             Err(error) => {
-                yunxi::autonomous::release_claim(conversation_id);
+                yunxi::autonomous::release_claim_token(claim.conversation_id, claim.token);
                 kovi::log::warn!(
-                    "Yunxi autonomous conversation tick submission failed: conversation_id={conversation_id} error={error}"
+                    "Yunxi autonomous conversation tick submission failed: conversation_id={} error={error}",
+                    claim.conversation_id,
                 );
             }
         }

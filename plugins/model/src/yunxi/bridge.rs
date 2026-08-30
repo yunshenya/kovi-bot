@@ -30,8 +30,8 @@ use yunxi_core::{
     ConversationKind, ConversationMemberStore, ConversationTurnDirective, CoreServices,
     EventPriority, EventScope, EventType, ExternalConversation, IdentityStore,
     MessageCollisionDetectedEvent, MessageContent, MessageId, MessageReceivedEvent, ModelBackend,
-    OpenLoopStore, PlannedProcessingOutcome, ProcessingOutcome, ProposedAction, RuntimeConfig,
-    RuntimeHandle, WorldEvent, WorldEventKind,
+    OpenLoopStore, PersonId, PlannedProcessingOutcome, ProcessingOutcome, ProposedAction,
+    RuntimeConfig, RuntimeHandle, WorldEvent, WorldEventKind,
 };
 
 pub(crate) const CORE_INGRESS_CAPACITY: usize = 256;
@@ -759,6 +759,9 @@ impl CoreBridge {
     pub(crate) async fn submit_autonomous_conversation_tick(
         &self,
         conversation_id: ConversationId,
+        conversation_kind: ConversationKind,
+        person_id: Option<PersonId>,
+        claim_token: u64,
     ) -> Result<Admission, yunxi_core::SubmitError> {
         self.runtime
             .submit(WorldEvent::new(
@@ -766,7 +769,11 @@ impl CoreBridge {
                 EventScope::Conversation { conversation_id },
                 EventPriority::Low,
                 WorldEventKind::AutonomousConversationTick(
-                    yunxi_core::AutonomousConversationTickEvent::default(),
+                    yunxi_core::AutonomousConversationTickEvent {
+                        conversation_kind: Some(conversation_kind),
+                        person_id,
+                        claim_token: Some(claim_token),
+                    },
                 ),
             ))
             .await
@@ -892,7 +899,8 @@ impl CoreBridge {
     /// path. Ordinary images are supported; control commands and other media
     /// stay on the Host handler so their specialized behavior remains.
     pub(crate) fn handles_private(&self, event: &PrivateMsgEvent) -> bool {
-        self.action_arbiter.is_some()
+        core_cutover_enabled("YUNXI_CORE_PRIVATE_CUTOVER", true)
+            && self.action_arbiter.is_some()
             && self.action_port.is_some()
             && core_private_payload_is_supported(&event.message, event.borrow_text())
             && InboundMessage::from_private(event).is_some()
@@ -902,7 +910,8 @@ impl CoreBridge {
     /// explicit address or a locally sampled ambient candidate receives a
     /// reply admission; background chatter cannot supersede an active reply.
     pub(crate) fn supports_group(&self, event: &GroupMsgEvent) -> bool {
-        self.action_arbiter.is_some()
+        core_cutover_enabled("YUNXI_CORE_GROUP_CUTOVER", true)
+            && self.action_arbiter.is_some()
             && self.action_port.is_some()
             && core_group_payload_is_supported(&event.message, event.borrow_text())
             && InboundMessage::from_group(event, false).is_some()
@@ -2325,6 +2334,109 @@ async fn release_rejected_incoming(
     releaser.discard(message.message_id).await;
 }
 
+fn autonomous_tick_conversation_id(event: &WorldEvent) -> Option<ConversationId> {
+    matches!(event.kind(), WorldEventKind::AutonomousConversationTick(_))
+        .then(|| event.scope().conversation_id())
+        .flatten()
+}
+
+fn autonomous_tick_claim_token(event: &WorldEvent) -> Option<u64> {
+    match event.kind() {
+        WorldEventKind::AutonomousConversationTick(tick) => tick.claim_token,
+        _ => None,
+    }
+}
+
+fn release_autonomous_claim_for_event(event: &WorldEvent) {
+    let Some(conversation_id) = autonomous_tick_conversation_id(event) else {
+        return;
+    };
+    if let Some(token) = autonomous_tick_claim_token(event) {
+        super::autonomous::release_claim_token(conversation_id, token);
+    } else {
+        // Compatibility for ticks emitted by an older host before claim
+        // tokens were added to the event payload.
+        super::autonomous::release_claim(conversation_id);
+    }
+}
+
+fn retry_autonomous_claim_for_event(event: &WorldEvent) {
+    let Some(conversation_id) = autonomous_tick_conversation_id(event) else {
+        return;
+    };
+    if let Some(token) = autonomous_tick_claim_token(event) {
+        super::autonomous::retry_claim_token(conversation_id, token);
+    } else {
+        super::autonomous::retry_claim(conversation_id);
+    }
+}
+
+fn autonomous_claim_is_current_for_event(event: &WorldEvent) -> bool {
+    let Some(conversation_id) = autonomous_tick_conversation_id(event) else {
+        return true;
+    };
+    let Some(token) = autonomous_tick_claim_token(event) else {
+        // Legacy ticks have no fencing token and are handled by the
+        // compatibility release/finish paths below.
+        return true;
+    };
+    super::autonomous::claim_is_current(conversation_id, token)
+}
+
+/// A failed autonomous action should be retried when it never crossed an
+/// irreversible delivery boundary. Indeterminate delivery is intentionally
+/// terminal: replaying it could duplicate a message whose platform outcome
+/// is unknown.
+fn autonomous_action_needs_retry(actions: &[ActionResult]) -> bool {
+    actions.iter().any(|action| match action {
+        ActionResult::Executed {
+            outcome: yunxi_core::ActionPortOutcome::Deferred { .. },
+            ..
+        } => true,
+        ActionResult::Failed { error, .. } => error.retryable,
+        ActionResult::Rejected(rejection) => matches!(
+            rejection,
+            yunxi_core::ActionRejection::CapabilityUnavailable { .. }
+                | yunxi_core::ActionRejection::CooldownActive { .. }
+                | yunxi_core::ActionRejection::RateLimitExceeded { .. }
+                | yunxi_core::ActionRejection::IdempotencyStateFull { .. }
+                | yunxi_core::ActionRejection::Stale { .. }
+                | yunxi_core::ActionRejection::TargetUnavailable { .. }
+                | yunxi_core::ActionRejection::DeliveryResolutionFailed { .. }
+        ),
+        ActionResult::Noop
+        | ActionResult::Executed {
+            outcome:
+                yunxi_core::ActionPortOutcome::Delivered { .. }
+                | yunxi_core::ActionPortOutcome::DeliveryIndeterminate { .. }
+                | yunxi_core::ActionPortOutcome::ToolCompleted { .. }
+                | yunxi_core::ActionPortOutcome::ToolFailed { .. },
+            ..
+        } => false,
+    })
+}
+
+fn autonomous_tick_should_retry(
+    actions: &[ActionResult],
+    delivered: bool,
+    directive: Option<ConversationTurnDirective>,
+) -> bool {
+    if delivered {
+        return false;
+    }
+    // Action results are stronger evidence than the model's directive. A
+    // deferred/retryable result means the proposed message never crossed the
+    // side-effect boundary and should get another bounded attempt.
+    if !actions.is_empty() {
+        return autonomous_action_needs_retry(actions);
+    }
+    // A Continue directive without a visible action means the planner/model
+    // decided there was another thought but failed to materialize it. Keep a
+    // bounded retry for that explicit signal. A missing/Wait/End directive is
+    // a legitimate silent turn and must not become a hot loop.
+    directive == Some(ConversationTurnDirective::Continue)
+}
+
 async fn run_runtime(
     mut runtime: CognitiveRuntime,
     action_arbiter: Option<Arc<ActionArbiter>>,
@@ -2335,10 +2447,14 @@ async fn run_runtime(
     if planned
         && let (Some(arbiter), Some(port)) = (action_arbiter.as_deref(), action_port.as_deref())
     {
-        while let Some(outcome) = {
+        while let Some((event, outcome)) = {
             super::refresh_executive_capability();
             runtime
-                .process_next_with_planner_and_actions(arbiter, port)
+                .process_next_with_planner_and_actions_with_event_and_guard(
+                    arbiter,
+                    port,
+                    &autonomous_claim_is_current_for_event,
+                )
                 .await
         } {
             match outcome {
@@ -2396,20 +2512,55 @@ async fn run_runtime(
                     if autonomous_tick
                         && let Some(conversation_id) = observation.scope.conversation_id()
                     {
-                        let directive = match (autonomous_delivered, requested_directive) {
-                            (true, Some(directive)) => directive,
-                            (false, Some(ConversationTurnDirective::End)) => {
-                                ConversationTurnDirective::End
-                            }
-                            _ => ConversationTurnDirective::Wait,
-                        };
-                        super::autonomous::finish_claim(
-                            conversation_id,
-                            Utc::now(),
+                        if !autonomous_claim_is_current_for_event(&event) {
+                            kovi::log::info!(
+                                "Yunxi autonomous tick superseded before completion: event_id={} conversation_id={}",
+                                observation.event_id,
+                                conversation_id,
+                            );
+                        } else if autonomous_tick_should_retry(
+                            &actions,
                             autonomous_delivered,
-                            directive,
-                            crate::config::get().proactive(),
-                        );
+                            requested_directive,
+                        ) {
+                            if let Some(token) = autonomous_tick_claim_token(&event) {
+                                super::autonomous::retry_claim_token(conversation_id, token);
+                            } else {
+                                super::autonomous::retry_claim(conversation_id);
+                            }
+                            kovi::log::warn!(
+                                "Yunxi autonomous turn scheduled for retry: event_id={} conversation_id={} directive={requested_directive:?} actions={:?}",
+                                observation.event_id,
+                                conversation_id,
+                                actions,
+                            );
+                        } else {
+                            let directive = match (autonomous_delivered, requested_directive) {
+                                (true, Some(directive)) => directive,
+                                (false, Some(ConversationTurnDirective::End)) => {
+                                    ConversationTurnDirective::End
+                                }
+                                _ => ConversationTurnDirective::Wait,
+                            };
+                            if let Some(token) = autonomous_tick_claim_token(&event) {
+                                super::autonomous::finish_claim_token(
+                                    conversation_id,
+                                    token,
+                                    Utc::now(),
+                                    autonomous_delivered,
+                                    directive,
+                                    crate::config::get().proactive(),
+                                );
+                            } else {
+                                super::autonomous::finish_claim(
+                                    conversation_id,
+                                    Utc::now(),
+                                    autonomous_delivered,
+                                    directive,
+                                    crate::config::get().proactive(),
+                                );
+                            }
+                        }
                     }
                     let has_action_failure = actions.iter().any(|action| !action.is_success());
                     if actions.is_empty() || has_action_failure {
@@ -2437,10 +2588,18 @@ async fn run_runtime(
                 }
                 Ok(PlannedProcessingOutcome::RejectedEvent { event, .. })
                 | Ok(PlannedProcessingOutcome::RejectedState { event, .. }) => {
+                    release_autonomous_claim_for_event(&event);
                     release_rejected_incoming(&event, incoming_releaser.as_deref()).await;
                     kovi::log::warn!("Yunxi Core planner rejected an event");
                 }
                 Err(error) => {
+                    if let Some(conversation_id) = autonomous_tick_conversation_id(&event) {
+                        retry_autonomous_claim_for_event(&event);
+                        kovi::log::warn!(
+                            "Yunxi autonomous planner failure will be retried: conversation_id={} error={error}",
+                            conversation_id,
+                        );
+                    }
                     kovi::log::error!("Yunxi Core planner failed before action outcome: {error}")
                 }
             }
@@ -2448,12 +2607,18 @@ async fn run_runtime(
         }
         return;
     }
-    while let Some(outcome) = {
+    while let Some((event, outcome)) = {
         super::refresh_executive_capability();
-        runtime.process_next().await
+        runtime.process_next_with_event().await
     } {
         match outcome {
             ProcessingOutcome::Observed(observation) => {
+                if autonomous_tick_conversation_id(&event).is_some() {
+                    // A compatibility bridge without planner/action support
+                    // cannot deliver a continuation. Do not leave its host
+                    // claim leased until the timeout.
+                    release_autonomous_claim_for_event(&event);
+                }
                 kovi::log::debug!(
                     "Yunxi Core event observed: id={} type={:?} scope={:?} priority={:?} attention={:?} state={:?}",
                     observation.event_id,
@@ -2466,6 +2631,7 @@ async fn run_runtime(
             }
             ProcessingOutcome::RejectedEvent { event, .. }
             | ProcessingOutcome::RejectedState { event, .. } => {
+                release_autonomous_claim_for_event(&event);
                 release_rejected_incoming(&event, incoming_releaser.as_deref()).await;
                 kovi::log::warn!("Yunxi Core runtime rejected an event");
             }
@@ -2954,6 +3120,29 @@ fn text_mentions_agent(message: &str) -> bool {
     ["芸汐", "云汐"].iter().any(|name| message.contains(name))
 }
 
+/// Read an explicit rollout switch while keeping the repository default
+/// enabled. Unknown values fall back to the supplied default instead of
+/// silently changing ownership at the ingress boundary.
+fn core_cutover_enabled(name: &str, default: bool) -> bool {
+    core_cutover_enabled_from_value(
+        std::env::var_os(name)
+            .as_deref()
+            .and_then(|value| value.to_str()),
+        default,
+    )
+}
+
+fn core_cutover_enabled_from_value(value: Option<&str>, default: bool) -> bool {
+    let Some(value) = value else {
+        return default;
+    };
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => true,
+        "0" | "false" | "no" | "off" => false,
+        _ => default,
+    }
+}
+
 fn ambient_group_payload_can_be_sampled(message: &Message) -> bool {
     !message
         .iter()
@@ -2967,10 +3156,11 @@ mod tests {
         IncomingAdmissionReleaseFuture, IncomingAdmissionReleaser, IngressRouteTracker,
         MessageReference, MessageReferenceCache, MessageReferenceKey,
         acquire_alias_handler_barriers, action_result_event, ambient_group_payload_can_be_sampled,
-        block_user_aliases, bounded_text, core_group_payload_is_supported,
-        core_private_payload_is_supported, idle_tick_event, merge_data_erasure_targets,
-        message_at_self, normalize_attachments, reply_message_id, resolve_and_submit, run_ingress,
-        run_runtime, submit_message_collisions, text_mentions_agent, unblock_users,
+        block_user_aliases, bounded_text, core_cutover_enabled_from_value,
+        core_group_payload_is_supported, core_private_payload_is_supported, idle_tick_event,
+        merge_data_erasure_targets, message_at_self, normalize_attachments, reply_message_id,
+        resolve_and_submit, run_ingress, run_runtime, submit_message_collisions,
+        text_mentions_agent, unblock_users,
     };
     use crate::model::{
         OutgoingSource, ReplyScope, commit_outgoing, interrupt, mark_active, mark_outgoing_sent,
@@ -3139,6 +3329,18 @@ mod tests {
             "大家觉得这个怎么样"
         )));
         assert!(text_mentions_agent("芸汐，看看这个"));
+    }
+
+    #[test]
+    fn cutover_flags_have_explicit_boolean_parsing_and_safe_defaults() {
+        for value in ["1", "true", "YES", "on"] {
+            assert!(core_cutover_enabled_from_value(Some(value), false));
+        }
+        for value in ["0", "false", "NO", "off"] {
+            assert!(!core_cutover_enabled_from_value(Some(value), true));
+        }
+        assert!(core_cutover_enabled_from_value(None, true));
+        assert!(!core_cutover_enabled_from_value(Some("unexpected"), false));
     }
 
     #[test]

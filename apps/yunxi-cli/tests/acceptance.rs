@@ -6,12 +6,14 @@ use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 use std::thread;
 
+use chrono::{Duration, Utc};
 use yunxi_cli::{
     CliCoreState, CliError, CliHost, CliJournal, FakeEnvironment, FakeModel, HostResponse,
     JournalRecord, MAX_CLI_OPEN_LOOPS_PER_OWNER, MAX_JOURNAL_INPUT_BYTES,
 };
 use yunxi_core::{
-    ConversationId, OpenLoopDraft, OpenLoopKind, OpenLoopOwner, OpenLoopStore, ProposedAction,
+    AutonomyPolicy, ConversationId, ConversationTurnDirective, OpenLoopDraft, OpenLoopKind,
+    OpenLoopOwner, OpenLoopStore, ProposedAction,
 };
 
 #[test]
@@ -52,6 +54,128 @@ fn noop_decision_does_not_call_the_environment() {
         HostResponse::Noop
     );
     assert!(host.environment().deliveries().is_empty());
+}
+
+#[test]
+fn autonomous_ticks_continue_a_direct_conversation_after_idle() {
+    let start = Utc::now();
+    let policy = AutonomyPolicy {
+        direct_idle: Duration::seconds(1),
+        direct_cooldown: Duration::seconds(1),
+        group_idle: Duration::seconds(1),
+        group_cooldown: Duration::seconds(1),
+    };
+    let host = CliHost::new(FakeModel, FakeEnvironment::default(), ConversationId::new())
+        .try_with_autonomy_policy(policy)
+        .expect("test policy should be valid");
+
+    assert!(matches!(
+        host.process_line_at("hello", start).expect("initial reply"),
+        HostResponse::Delivered { .. }
+    ));
+    let lifecycle = host.lifecycle().expect("lifecycle snapshot");
+    assert_eq!(lifecycle.directive(), ConversationTurnDirective::Continue);
+    assert_eq!(lifecycle.autonomous_turns(), 0);
+
+    assert!(
+        host.process_autonomous_tick_at(start + Duration::milliseconds(500))
+            .expect("early tick")
+            .is_none()
+    );
+    let autonomous = host
+        .process_autonomous_tick_at(start + Duration::seconds(2))
+        .expect("autonomous tick")
+        .expect("tick should be due");
+    assert!(
+        matches!(autonomous, HostResponse::Delivered { ref message, .. } if message.contains("kept thinking"))
+    );
+    let lifecycle = host.lifecycle().expect("lifecycle snapshot");
+    assert_eq!(lifecycle.autonomous_turns(), 1);
+    assert!(!lifecycle.is_in_flight());
+
+    assert!(
+        host.process_autonomous_tick_at(start + Duration::milliseconds(2_500))
+            .expect("cooldown tick")
+            .is_none()
+    );
+    let second = host
+        .process_autonomous_tick_at(start + Duration::seconds(4))
+        .expect("second autonomous tick")
+        .expect("second tick should be due");
+    assert!(
+        matches!(second, HostResponse::Delivered { ref message, .. } if message.contains("pause here"))
+    );
+    assert_eq!(
+        host.lifecycle()
+            .expect("lifecycle snapshot")
+            .autonomous_turns(),
+        2
+    );
+    assert_eq!(
+        host.lifecycle().expect("lifecycle snapshot").directive(),
+        ConversationTurnDirective::End
+    );
+    assert!(
+        host.process_autonomous_tick_at(start + Duration::hours(1))
+            .expect("tick after autonomous end")
+            .is_none()
+    );
+}
+
+#[test]
+fn a_new_inbound_turn_resets_autonomous_due_state() {
+    let start = Utc::now();
+    let policy = AutonomyPolicy {
+        direct_idle: Duration::seconds(1),
+        direct_cooldown: Duration::seconds(1),
+        ..AutonomyPolicy::default()
+    };
+    let host = CliHost::new(FakeModel, FakeEnvironment::default(), ConversationId::new())
+        .try_with_autonomy_policy(policy)
+        .expect("test policy should be valid");
+    host.process_line_at("first", start).expect("first reply");
+    host.process_autonomous_tick_at(start + Duration::seconds(2))
+        .expect("autonomous turn")
+        .expect("autonomous turn should be due");
+
+    host.process_line_at(
+        "new inbound",
+        start + Duration::seconds(2) + Duration::milliseconds(100),
+    )
+    .expect("new reply");
+    assert!(
+        host.process_autonomous_tick_at(start + Duration::seconds(2) + Duration::milliseconds(200))
+            .expect("tick after inbound")
+            .is_none()
+    );
+    assert_eq!(
+        host.lifecycle()
+            .expect("lifecycle snapshot")
+            .autonomous_turns(),
+        1
+    );
+}
+
+#[test]
+fn a_silent_reactive_turn_does_not_start_an_autonomous_loop() {
+    let start = Utc::now();
+    let policy = AutonomyPolicy {
+        direct_idle: Duration::seconds(1),
+        direct_cooldown: Duration::seconds(1),
+        ..AutonomyPolicy::default()
+    };
+    let host = CliHost::new(FakeModel, FakeEnvironment::default(), ConversationId::new())
+        .try_with_autonomy_policy(policy)
+        .expect("test policy should be valid");
+    assert_eq!(
+        host.process_line_at("/noop", start).expect("noop"),
+        HostResponse::Noop
+    );
+    assert!(
+        host.process_autonomous_tick_at(start + Duration::hours(1))
+            .expect("tick after noop")
+            .is_none()
+    );
 }
 
 #[test]
@@ -158,6 +282,12 @@ fn persistent_core_state_restores_model_context_and_open_loops() {
 
     assert_eq!(host.person_id(), person_id);
     assert_eq!(host.conversation_id(), conversation_id);
+    assert_eq!(
+        host.lifecycle()
+            .expect("lifecycle snapshot")
+            .conversation_id(),
+        conversation_id
+    );
     assert_eq!(
         host.process_line("first persistent turn")
             .expect("first turn"),

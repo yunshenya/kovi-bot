@@ -272,6 +272,15 @@ impl WorkingState {
         {
             return Err(WorkingStateError::ConversationKindMismatch);
         }
+        if let WorldEventKind::AutonomousConversationTick(tick) = event.kind()
+            && let Some(kind) = tick.conversation_kind
+            && let Some(existing_kind) = conversation_id
+                .and_then(|id| self.conversations.get(&id))
+                .and_then(|state| state.conversation_kind)
+            && existing_kind != kind
+        {
+            return Err(WorkingStateError::ConversationKindMismatch);
+        }
         let next_global_version = self
             .global
             .version
@@ -340,6 +349,18 @@ impl WorkingState {
                             .map_or(message.timestamp, |current| current.max(message.timestamp)),
                     );
                     state.last_message_id = Some(message.message_id);
+                }
+                WorldEventKind::AutonomousConversationTick(tick) => {
+                    if let Some(kind) = tick.conversation_kind {
+                        state.conversation_kind = Some(kind);
+                    }
+                    if let Some(person_id) = tick.person_id {
+                        push_unique_bounded(
+                            &mut state.active_people,
+                            person_id,
+                            self.config.max_active_people,
+                        );
+                    }
                 }
                 WorldEventKind::ProspectiveMemoryDue(memory) => push_unique_bounded(
                     &mut state.open_loops,
@@ -612,8 +633,8 @@ mod tests {
     use super::{WorkingState, WorkingStateConfig, WorkingStateConfigError, WorkingStateError};
     use crate::attention::AttentionSystem;
     use crate::event::{
-        EventPriority, EventScope, MessageContent, MessageReceivedEvent, ProspectiveMemoryEvent,
-        WorldEvent, WorldEventKind,
+        AutonomousConversationTickEvent, EventPriority, EventScope, MessageContent,
+        MessageReceivedEvent, ProspectiveMemoryEvent, WorldEvent, WorldEventKind,
     };
     use crate::identity::{ConversationId, ConversationKind, MessageId, OpenLoopId, PersonId};
     use chrono::Utc;
@@ -832,6 +853,56 @@ mod tests {
             Err(WorkingStateError::ConversationKindMismatch)
         );
         assert_eq!(state.global_version(), 1);
+    }
+
+    #[test]
+    fn autonomous_tick_restores_evicted_routing_context() {
+        let mut state = WorkingState::new(limits()).expect("valid limits");
+        let conversation_id = ConversationId::new();
+        let person_id = PersonId::new();
+        let tick = WorldEvent::new(
+            Utc::now(),
+            EventScope::Conversation { conversation_id },
+            EventPriority::Low,
+            WorldEventKind::AutonomousConversationTick(AutonomousConversationTickEvent {
+                conversation_kind: Some(ConversationKind::Direct),
+                person_id: Some(person_id),
+                claim_token: Some(1),
+            }),
+        );
+
+        state
+            .observe(&tick, AttentionSystem.evaluate(&tick))
+            .expect("tick should seed a conversation snapshot");
+        let snapshot = state
+            .conversation(conversation_id)
+            .expect("tick conversation snapshot");
+        assert_eq!(snapshot.conversation_kind, Some(ConversationKind::Direct));
+        assert_eq!(snapshot.active_people, vec![person_id]);
+    }
+
+    #[test]
+    fn autonomous_tick_context_cannot_change_an_existing_conversation_kind() {
+        let mut state = WorkingState::new(limits()).expect("valid limits");
+        let conversation_id = ConversationId::new();
+        let group = event(conversation_id, PersonId::new(), "group");
+        state
+            .observe(&group, AttentionSystem.evaluate(&group))
+            .expect("group should be observed");
+        let tick = WorldEvent::new(
+            Utc::now(),
+            EventScope::Conversation { conversation_id },
+            EventPriority::Low,
+            WorldEventKind::AutonomousConversationTick(AutonomousConversationTickEvent {
+                conversation_kind: Some(ConversationKind::Direct),
+                person_id: Some(PersonId::new()),
+                claim_token: Some(1),
+            }),
+        );
+        assert_eq!(
+            state.observe(&tick, AttentionSystem.evaluate(&tick)),
+            Err(WorkingStateError::ConversationKindMismatch)
+        );
     }
 
     #[test]

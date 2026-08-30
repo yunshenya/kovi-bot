@@ -645,8 +645,25 @@ pub struct ProspectiveMemoryEvent {
 ///
 /// The conversation scope carries the routing identity. The host remains
 /// responsible for admission, cooldowns, and eligibility.
+///
+/// `conversation_kind` and `person_id` are copied from the host-side
+/// lifecycle claim when available. They are deliberately optional so events
+/// written by older hosts (whose payload was `{}`) remain readable. Keeping
+/// this trusted routing context on the event means a tick can still be
+/// planned after the bounded working-state snapshot has evicted the original
+/// inbound message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct AutonomousConversationTickEvent {}
+pub struct AutonomousConversationTickEvent {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_kind: Option<ConversationKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub person_id: Option<PersonId>,
+    /// Host-side claim token. Older hosts may omit it; current schedulers use
+    /// it to ensure a stale tick cannot finish a newer claim for the same
+    /// conversation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_token: Option<u64>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActionSucceededEvent {
@@ -1067,6 +1084,21 @@ impl WorldEvent {
                     MAX_ERROR_CATEGORY_BYTES,
                 )
             }
+            WorldEventKind::AutonomousConversationTick(tick) => {
+                if tick.claim_token == Some(0)
+                    || (tick.claim_token.is_some() && tick.conversation_kind.is_none())
+                {
+                    return Err(EventValidationError::InvalidAutonomousTickContext);
+                }
+                match (tick.conversation_kind, tick.person_id) {
+                    (Some(ConversationKind::Direct), _)
+                    | (Some(ConversationKind::Group), None)
+                    | (None, None) => Ok(()),
+                    (Some(ConversationKind::System), _)
+                    | (Some(ConversationKind::Group), Some(_))
+                    | (None, Some(_)) => Err(EventValidationError::InvalidAutonomousTickContext),
+                }
+            }
             _ => Ok(()),
         }
     }
@@ -1131,6 +1163,8 @@ pub enum EventValidationError {
     InvalidTraceContext,
     #[error("event scope does not match its domain payload")]
     ScopeMismatch,
+    #[error("autonomous conversation tick has an invalid routing context")]
+    InvalidAutonomousTickContext,
     #[error("event timestamp does not match its message payload")]
     TimestampMismatch,
     #[error("event contains invalid message content: {0}")]
@@ -1364,6 +1398,47 @@ mod tests {
         assert_eq!(
             invalid.validate(8),
             Err(EventValidationError::ScopeMismatch)
+        );
+    }
+
+    #[test]
+    fn autonomous_tick_routing_context_is_backward_compatible_and_bounded() {
+        let legacy: AutonomousConversationTickEvent =
+            serde_json::from_value(serde_json::json!({})).expect("legacy empty payload");
+        assert_eq!(legacy, AutonomousConversationTickEvent::default());
+
+        let conversation_id = ConversationId::new();
+        let direct = WorldEvent::new(
+            Utc::now(),
+            EventScope::Conversation { conversation_id },
+            EventPriority::Low,
+            WorldEventKind::AutonomousConversationTick(AutonomousConversationTickEvent {
+                conversation_kind: Some(ConversationKind::Direct),
+                person_id: Some(PersonId::new()),
+                claim_token: Some(1),
+            }),
+        );
+        assert_eq!(direct.validate(8), Ok(()));
+
+        let group_with_person = WorldEvent::new(
+            Utc::now(),
+            EventScope::Conversation { conversation_id },
+            EventPriority::Low,
+            WorldEventKind::AutonomousConversationTick(AutonomousConversationTickEvent {
+                conversation_kind: Some(ConversationKind::Group),
+                person_id: Some(PersonId::new()),
+                claim_token: Some(1),
+            }),
+        );
+        assert_eq!(
+            group_with_person.validate(8),
+            Err(EventValidationError::InvalidAutonomousTickContext)
+        );
+
+        let serialized = serde_json::to_value(direct.kind()).expect("tick should serialize");
+        assert_eq!(
+            serialized["payload"]["conversation_kind"],
+            serde_json::json!("direct")
         );
     }
 
