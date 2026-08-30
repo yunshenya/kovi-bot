@@ -189,16 +189,19 @@ impl ProactiveChatManager {
                 );
             }
             Ok(admission) => {
-                yunxi::autonomous::release_claim_token(claim.conversation_id, claim.token);
+                // A bounded low-priority queue may reject a tick while the
+                // bot is busy. Keep the lifecycle retryable, but back off so
+                // the 3-second scheduler cannot become a hot loop.
+                yunxi::autonomous::retry_claim_token(claim.conversation_id, claim.token);
                 kovi::log::debug!(
-                    "Yunxi autonomous conversation tick not admitted: conversation_id={} admission={admission:?}",
+                    "Yunxi autonomous conversation tick scheduled for retry: conversation_id={} admission={admission:?}",
                     claim.conversation_id,
                 );
             }
             Err(error) => {
-                yunxi::autonomous::release_claim_token(claim.conversation_id, claim.token);
+                yunxi::autonomous::retry_claim_token(claim.conversation_id, claim.token);
                 kovi::log::warn!(
-                    "Yunxi autonomous conversation tick submission failed: conversation_id={} error={error}",
+                    "Yunxi autonomous conversation tick submission failed; scheduled for retry: conversation_id={} error={error}",
                     claim.conversation_id,
                 );
             }
