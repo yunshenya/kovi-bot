@@ -2369,12 +2369,11 @@ async fn evaluate_autonomous_intent(
 
 fn parse_autonomous_intent_response(content: &str) -> Option<ConversationTurnDirective> {
     let parsed = parse_core_response(content);
-    parsed
-        .content
-        .trim()
-        .is_empty()
-        .then_some(parsed.conversation_directive)
-        .flatten()
+    // The intent call has no side effects and its only actionable value is the
+    // enum validated by `parse_core_response`. Providers sometimes append a
+    // short explanation despite the protocol; discard that prose rather than
+    // turning an otherwise valid decision into a silent wait.
+    parsed.conversation_directive
 }
 
 fn constrain_autonomous_tick_plan(plan: &mut ReplyPlan) {
@@ -3225,12 +3224,16 @@ impl ModelBackend for KoviModelBackend {
                         directive
                     }
                     None => {
+                        let fallback = match autonomous_conversation_kind(input) {
+                            Some(ConversationKind::Direct) => ConversationTurnDirective::Continue,
+                            _ => ConversationTurnDirective::Wait,
+                        };
                         kovi::log::warn!(
-                            "Yunxi autonomous intent unavailable: event_id={} conversation_id={} fallback=wait",
+                            "Yunxi autonomous intent unavailable: event_id={} conversation_id={} fallback={fallback:?}",
                             input.event.id(),
                             conversation_id_for_log(input),
                         );
-                        ConversationTurnDirective::Wait
+                        fallback
                     }
                 };
                 if directive != ConversationTurnDirective::Continue {
@@ -4473,7 +4476,7 @@ mod tests {
             parse_autonomous_intent_response(
                 "[[INTERACTION_CUES]]{\"conversation_directive\":\"continue\"}[[/INTERACTION_CUES]]\n我先说一句"
             ),
-            None
+            Some(ConversationTurnDirective::Continue)
         );
         assert_eq!(parse_autonomous_intent_response("我觉得还可以继续"), None);
     }
