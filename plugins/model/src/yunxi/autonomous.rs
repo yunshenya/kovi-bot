@@ -136,10 +136,11 @@ pub(crate) fn record_outbound(conversation_id: ConversationId, occurred_at: Date
 /// Record a normal reply and its model-selected conversation directive.
 ///
 /// A delivered direct-chat reply without a directive enters a short
-/// continuation cooldown. This is a semantic default based on the
-/// platform-neutral conversation kind, not a text or keyword heuristic; the
-/// next autonomous turn still asks the model whether there is a real next
-/// thought worth sending.
+/// continuation cooldown. A model `end` on a normal direct reply is treated
+/// the same way: it is often a statement that this particular answer is
+/// complete, not an explicit request to close the conversation. The next
+/// autonomous turn still asks the model whether there is a real next thought
+/// worth sending. This is based on conversation kind, never message text.
 pub(crate) fn record_outbound_with_directive(
     conversation_id: ConversationId,
     occurred_at: DateTime<Utc>,
@@ -151,10 +152,13 @@ pub(crate) fn record_outbound_with_directive(
     };
     let entry = registry.entries.get_mut(&conversation_id)?;
     let policy = config.map(autonomy_policy).unwrap_or_default();
-    let effective_directive = directive.or_else(|| {
-        (entry.lifecycle.kind() == ConversationKind::Direct)
-            .then_some(ConversationTurnDirective::Continue)
-    });
+    let direct_conversation = entry.lifecycle.kind() == ConversationKind::Direct;
+    let effective_directive = match directive {
+        Some(ConversationTurnDirective::End) | None if direct_conversation => {
+            Some(ConversationTurnDirective::Continue)
+        }
+        other => other,
+    };
     entry
         .lifecycle
         .record_outbound(occurred_at, effective_directive, policy)
@@ -438,6 +442,30 @@ mod tests {
         let config = ProactiveConfig::default();
         observe_inbound(id, ConversationKind::Direct, now, true);
         record_outbound_with_directive(id, now, None, Some(&config));
+        assert_eq!(
+            claim_due(
+                &config,
+                now + Duration::seconds(config.autonomous_conversation_cooldown_secs() as i64)
+            ),
+            Some(id)
+        );
+        clear();
+    }
+
+    #[test]
+    fn direct_end_is_rechecked_before_terminal() {
+        let _guard = TEST_LOCK.lock().expect("test lock");
+        clear();
+        let id = ConversationId::new();
+        let now = Utc::now();
+        let config = ProactiveConfig::default();
+        observe_inbound(id, ConversationKind::Direct, now, true);
+        record_outbound_with_directive(
+            id,
+            now,
+            Some(ConversationTurnDirective::End),
+            Some(&config),
+        );
         assert_eq!(
             claim_due(
                 &config,
