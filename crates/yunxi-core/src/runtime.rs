@@ -54,10 +54,26 @@ const DEFAULT_MIND_SNAPSHOT_TIMEOUT: std::time::Duration = std::time::Duration::
 /// freezing the runtime worker and every later conversation turn. This budget
 /// must still leave room for the adapter's bounded queue/response waits and
 /// durable delivery bookkeeping to report their own terminal outcome.
-const DEFAULT_ACTION_DISPATCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+const DEFAULT_ACTION_DISPATCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Bound the complete action phase of one planner turn. Two fully bounded
+/// deliveries still fit, while a pathological many-intent plan cannot occupy
+/// the single runtime worker for minutes.
+const DEFAULT_PLAN_ACTION_DISPATCH_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(65);
+/// Once the plan budget is exhausted, give each remaining action one poll-sized
+/// deadline so the arbiter records a terminal indeterminate result without
+/// materially extending the turn.
+const MIN_ACTION_DISPATCH_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1);
 pub const MAX_DATA_ERASURE_CONVERSATIONS: usize = 256;
 pub const MAX_BLOCKED_DATA_ERASURE_PEOPLE: usize = 256;
 pub const MAX_BLOCKED_DATA_ERASURE_CONVERSATIONS: usize = 4_096;
+
+fn action_dispatch_timeout_for_elapsed(elapsed: std::time::Duration) -> std::time::Duration {
+    DEFAULT_PLAN_ACTION_DISPATCH_TIMEOUT
+        .saturating_sub(elapsed)
+        .min(DEFAULT_ACTION_DISPATCH_TIMEOUT)
+        .max(MIN_ACTION_DISPATCH_TIMEOUT)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RuntimeConfig {
@@ -1129,6 +1145,7 @@ impl CognitiveRuntime {
         let mut feedback = Vec::new();
         let mut tool_follow_up_events = Vec::new();
         let mut selected_action = None;
+        let action_dispatch_started = std::time::Instant::now();
         for (intent_index, intent) in plan.intents.iter().enumerate() {
             if guard.is_some_and(|guard| !guard()) {
                 release_unexecuted_tool_intents_from(&planner_event, &plan, intent_index, port)
@@ -1177,8 +1194,10 @@ impl CognitiveRuntime {
             if selected_action.is_none() && !matches!(&proposed, crate::ProposedAction::Noop) {
                 selected_action = Some(proposed.clone());
             }
+            let action_timeout =
+                action_dispatch_timeout_for_elapsed(action_dispatch_started.elapsed());
             let result = arbiter
-                .dispatch_with_timeout(proposed.clone(), port, DEFAULT_ACTION_DISPATCH_TIMEOUT)
+                .dispatch_with_timeout(proposed.clone(), port, action_timeout)
                 .await;
             if matches!(
                 &result,
@@ -2839,8 +2858,9 @@ mod tests {
     use super::{
         Admission, CognitiveRuntime, DataErasureError, MAX_DATA_ERASURE_CONVERSATIONS,
         MAX_GOALS_PER_CONTEXT_OWNER, PlannedProcessingOutcome, ProcessingOutcome, RuntimeConfig,
-        RuntimeConfigError, SubmitError, aggregate_tool_follow_up_events,
-        apply_due_action_idempotency, apply_event_action_idempotency, bounded_conversation_ids,
+        RuntimeConfigError, SubmitError, action_dispatch_timeout_for_elapsed,
+        aggregate_tool_follow_up_events, apply_due_action_idempotency,
+        apply_event_action_idempotency, bounded_conversation_ids,
         duplicate_action_already_succeeded, message_sent_event, tool_follow_up_event,
         validate_intent_targets,
     };
@@ -4168,6 +4188,22 @@ mod tests {
         assert_eq!(records[0].disposition, DecisionDisposition::Silent);
         assert_eq!(records[0].selected_action, None);
         assert_eq!(records[0].selected_action_id, None);
+    }
+
+    #[test]
+    fn planner_action_phase_has_one_bounded_deadline() {
+        assert_eq!(
+            action_dispatch_timeout_for_elapsed(std::time::Duration::ZERO),
+            std::time::Duration::from_secs(30)
+        );
+        assert_eq!(
+            action_dispatch_timeout_for_elapsed(std::time::Duration::from_secs(40)),
+            std::time::Duration::from_secs(25)
+        );
+        assert_eq!(
+            action_dispatch_timeout_for_elapsed(std::time::Duration::from_secs(65)),
+            std::time::Duration::from_millis(1)
+        );
     }
 
     #[tokio::test]

@@ -21,7 +21,7 @@ use std::fmt;
 use std::future::Future;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 use yunxi_core::{
@@ -55,11 +55,16 @@ const CORE_INGRESS_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 /// cancelled, so the timeout cannot make a later retry duplicate a send.
 /// Keep this above the transport's bounded enqueue + response waits so the
 /// adapter can persist its own definite or indeterminate terminal outcome.
-const CORE_ACTION_DISPATCH_TIMEOUT: Duration = Duration::from_secs(20);
-/// Action acknowledgement includes the full dispatch plus final runtime
-/// feedback bookkeeping. Queue acquisition remains independently bounded by
-/// `CORE_INGRESS_COMMAND_TIMEOUT`.
-const CORE_ACTION_ACKNOWLEDGEMENT_TIMEOUT: Duration = Duration::from_secs(25);
+const CORE_ACTION_DISPATCH_TIMEOUT: Duration = Duration::from_secs(30);
+/// First action acknowledgement deadline after the command has entered ingress.
+/// A command that is still pending at this boundary is atomically cancelled;
+/// one already claimed by the worker receives a separate completion grace.
+const CORE_ACTION_INITIAL_ACKNOWLEDGEMENT_TIMEOUT: Duration = Duration::from_secs(50);
+/// Once the ingress worker has claimed an action, leave enough time for its
+/// complete bounded dispatch even if it started just before the initial
+/// acknowledgement deadline, including bounded runtime feedback admission.
+const CORE_ACTION_COMPLETION_GRACE: Duration =
+    CORE_ACTION_DISPATCH_TIMEOUT.saturating_add(Duration::from_secs(10));
 /// High-priority runtime events use backpressure in `RuntimeHandle::submit`.
 /// Keep that wait finite so one unhealthy runtime cannot stop the ingress loop.
 const CORE_RUNTIME_SUBMIT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -211,6 +216,80 @@ pub(crate) struct GroupHandlingDecision {
     pub(crate) planner_attention_requested: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum ActionCommandState {
+    Pending = 0,
+    Running = 1,
+    Finished = 2,
+    Cancelled = 3,
+}
+
+#[derive(Debug)]
+struct ActionCommandControl {
+    state: AtomicU8,
+}
+
+impl ActionCommandControl {
+    fn new() -> Self {
+        Self {
+            state: AtomicU8::new(ActionCommandState::Pending as u8),
+        }
+    }
+
+    fn state(&self) -> ActionCommandState {
+        match self.state.load(Ordering::Acquire) {
+            value if value == ActionCommandState::Pending as u8 => ActionCommandState::Pending,
+            value if value == ActionCommandState::Running as u8 => ActionCommandState::Running,
+            value if value == ActionCommandState::Finished as u8 => ActionCommandState::Finished,
+            value if value == ActionCommandState::Cancelled as u8 => ActionCommandState::Cancelled,
+            _ => unreachable!("action command state is always written by this type"),
+        }
+    }
+
+    fn claim(&self) -> bool {
+        self.state
+            .compare_exchange(
+                ActionCommandState::Pending as u8,
+                ActionCommandState::Running as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn cancel_pending(&self) -> bool {
+        self.state
+            .compare_exchange(
+                ActionCommandState::Pending as u8,
+                ActionCommandState::Cancelled as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn finish(&self) {
+        let transitioned = self.state.compare_exchange(
+            ActionCommandState::Running as u8,
+            ActionCommandState::Finished as u8,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        debug_assert_eq!(transitioned, Ok(ActionCommandState::Running as u8));
+    }
+}
+
+struct PendingActionCommandCancellation<'a> {
+    control: &'a ActionCommandControl,
+}
+
+impl Drop for PendingActionCommandCancellation<'_> {
+    fn drop(&mut self) {
+        self.control.cancel_pending();
+    }
+}
+
 enum IngressCommand {
     Message(InboundMessage),
     ProjectDestination {
@@ -227,6 +306,7 @@ enum IngressCommand {
     DispatchAction {
         user_id: i64,
         action: ProposedAction,
+        control: Arc<ActionCommandControl>,
         acknowledge: oneshot::Sender<Result<Option<ActionResult>, IngressCommandError>>,
     },
     BeginDataErasure {
@@ -333,6 +413,68 @@ async fn send_ingress_command_with_ack_timeouts<T>(
             "Yunxi {operation} acknowledgement timed out after {}ms; outcome may be indeterminate",
             acknowledgement_wait.as_millis()
         ))),
+    }
+}
+
+async fn send_action_ingress_command_with_ack<T>(
+    ingress: &mpsc::Sender<IngressCommand>,
+    command: IngressCommand,
+    mut acknowledged: oneshot::Receiver<T>,
+    control: &ActionCommandControl,
+    enqueue_wait: Duration,
+    initial_acknowledgement_wait: Duration,
+    completion_grace: Duration,
+) -> Result<T, IngressCommandError> {
+    match kovi::tokio::time::timeout(enqueue_wait, ingress.send(command)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => {
+            return Err(IngressCommandError::definite(
+                "Yunxi action dispatch ingress is closed",
+            ));
+        }
+        Err(_) => {
+            return Err(IngressCommandError::definite(format!(
+                "Yunxi action dispatch ingress enqueue timed out after {}ms",
+                enqueue_wait.as_millis()
+            )));
+        }
+    }
+    let _cancellation = PendingActionCommandCancellation { control };
+
+    match kovi::tokio::time::timeout(initial_acknowledgement_wait, &mut acknowledged).await {
+        Ok(Ok(result)) => return Ok(result),
+        Ok(Err(_)) => {
+            if control.cancel_pending() || control.state() == ActionCommandState::Cancelled {
+                return Err(IngressCommandError::definite(
+                    "Yunxi action dispatch acknowledgement was dropped before execution",
+                ));
+            }
+            return Err(IngressCommandError::indeterminate(
+                "Yunxi action dispatch acknowledgement was dropped after execution started; outcome may be indeterminate",
+            ));
+        }
+        Err(_) => {}
+    }
+
+    if control.cancel_pending() || control.state() == ActionCommandState::Cancelled {
+        return Err(IngressCommandError::definite(format!(
+            "Yunxi action dispatch was cancelled before execution after waiting {}ms in ingress",
+            initial_acknowledgement_wait.as_millis()
+        )));
+    }
+
+    match kovi::tokio::time::timeout(completion_grace, &mut acknowledged).await {
+        Ok(Ok(result)) => Ok(result),
+        Ok(Err(_)) => Err(IngressCommandError::indeterminate(
+            "Yunxi action dispatch acknowledgement was dropped after execution started; outcome may be indeterminate",
+        )),
+        Err(_) => match acknowledged.try_recv() {
+            Ok(result) => Ok(result),
+            Err(_) => Err(IngressCommandError::indeterminate(format!(
+                "Yunxi action dispatch did not finish within the {}ms completion grace after execution started; outcome may be indeterminate",
+                completion_grace.as_millis()
+            ))),
+        },
     }
 }
 
@@ -839,9 +981,10 @@ impl CoreBridge {
     }
 
     /// Dispatch an admitted Core action through the configured host adapter,
-    /// then feed the result back into the same runtime event stream. Hosts
-    /// using the compatibility constructor receive `None` and keep their
-    /// existing observe-only behavior.
+    /// attempt to feed the result back into the same runtime event stream, and
+    /// then acknowledge the terminal dispatch result. Hosts using the
+    /// compatibility constructor receive `None` and keep their existing
+    /// observe-only behavior.
     #[allow(dead_code)]
     pub(crate) async fn dispatch_action(
         &self,
@@ -856,17 +999,20 @@ impl CoreBridge {
             return Ok(None);
         }
         let (acknowledge, acknowledged) = oneshot::channel();
-        match send_ingress_command_with_ack_timeouts(
+        let control = Arc::new(ActionCommandControl::new());
+        match send_action_ingress_command_with_ack(
             &self.ingress,
             IngressCommand::DispatchAction {
                 user_id,
                 action,
+                control: Arc::clone(&control),
                 acknowledge,
             },
             acknowledged,
+            &control,
             CORE_INGRESS_COMMAND_TIMEOUT,
-            CORE_ACTION_ACKNOWLEDGEMENT_TIMEOUT,
-            "action dispatch",
+            CORE_ACTION_INITIAL_ACKNOWLEDGEMENT_TIMEOUT,
+            CORE_ACTION_COMPLETION_GRACE,
         )
         .await
         {
@@ -2042,8 +2188,13 @@ async fn run_ingress(
             IngressCommand::DispatchAction {
                 user_id,
                 action,
+                control,
                 acknowledge,
             } => {
+                if !control.claim() {
+                    debug_assert_eq!(control.state(), ActionCommandState::Cancelled);
+                    continue;
+                }
                 let blocked_conversation = match action.scope() {
                     yunxi_core::ActionScope::Conversation(conversation_id) => {
                         group_erasure_conversations
@@ -2053,6 +2204,7 @@ async fn run_ingress(
                     yunxi_core::ActionScope::Person(_) | yunxi_core::ActionScope::Global => false,
                 };
                 if blocked_at_ingress.contains(&user_id) || blocked_conversation {
+                    control.finish();
                     let _ = acknowledge.send(Ok(None));
                     continue;
                 }
@@ -2077,7 +2229,8 @@ async fn run_ingress(
                             "Yunxi action dispatch completed with an indeterminate outcome"
                         );
                     }
-                    if let Some(event) = action_result_event(&action, &result, Utc::now())
+                    let feedback = action_result_event(&action, &result, Utc::now());
+                    if let Some(event) = feedback
                         && let Err(error) = submit_runtime_with_timeout(
                             &runtime,
                             event,
@@ -2087,10 +2240,13 @@ async fn run_ingress(
                     {
                         kovi::log::warn!("Yunxi action result could not enter runtime: {error}");
                     }
-                    Ok(Some(result))
+                    control.finish();
+                    let _ = acknowledge.send(Ok(Some(result)));
+                    continue;
                 } else {
                     Ok(None)
                 };
+                control.finish();
                 let _ = acknowledge.send(result);
             }
             IngressCommand::BeginDataErasure {
@@ -3740,17 +3896,17 @@ fn ambient_group_payload_can_be_sampled(message: &Message) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConversationAddress, CoreBridge, EnqueueOutcome, InboundMessage,
-        IncomingAdmissionReleaseFuture, IncomingAdmissionReleaser, IngressRouteTracker,
-        MessageReference, MessageReferenceCache, MessageReferenceKey,
+        ActionCommandControl, ActionCommandState, ConversationAddress, CoreBridge, EnqueueOutcome,
+        InboundMessage, IncomingAdmissionReleaseFuture, IncomingAdmissionReleaser,
+        IngressRouteTracker, MessageReference, MessageReferenceCache, MessageReferenceKey,
         acquire_alias_handler_barriers, action_result_event, ambient_group_payload_can_be_sampled,
         block_user_aliases, bounded_text, core_cutover_enabled_from_value,
         core_group_payload_is_supported, core_private_payload_is_supported,
         dispatch_action_with_timeout, effective_visible_reply_allowed, idle_tick_event,
         merge_data_erasure_targets, message_at_self, normalize_attachments, reply_message_id,
-        resolve_and_submit, run_ingress, run_runtime, send_ingress_command_with_ack,
-        send_ingress_command_with_ack_timeouts, submit_message_collisions,
-        submit_runtime_with_timeout, text_mentions_agent, unblock_users,
+        resolve_and_submit, run_ingress, run_runtime, send_action_ingress_command_with_ack,
+        send_ingress_command_with_ack, send_ingress_command_with_ack_timeouts,
+        submit_message_collisions, submit_runtime_with_timeout, text_mentions_agent, unblock_users,
     };
     use crate::model::{
         OutgoingSource, ReplyScope, commit_outgoing, interrupt, mark_active, mark_outgoing_sent,
@@ -3822,6 +3978,166 @@ mod tests {
                 })
             })
         }
+    }
+
+    #[test]
+    fn pending_action_ack_timeout_cancels_before_worker_side_effect() {
+        let runtime = kovi::tokio::runtime::Runtime::new().expect("test runtime");
+        runtime.block_on(async {
+            let user_id = 456;
+            let conversation_id = ConversationId::new();
+            let person_id = PersonId::new();
+            let (ingress, receiver) = mpsc::channel(2);
+            let (runtime_handle, _core_runtime) =
+                yunxi_core::CognitiveRuntime::new(RuntimeConfig::default()).expect("valid runtime");
+            let arbiter = Arc::new(ActionArbiter::new(
+                ActionArbiterConfig::default().with_capabilities(EnvironmentCapabilities::all()),
+            ));
+            let port = Arc::new(BlockingActionPort {
+                conversation_id,
+                calls: AtomicUsize::new(0),
+                entered: Notify::new(),
+                release: Notify::new(),
+            });
+            let action_port: Arc<dyn ActionPort> = port.clone();
+            let control = Arc::new(ActionCommandControl::new());
+            let action = ProposedAction::send_message(
+                conversation_id,
+                MessageContent::text("must stay cancelled"),
+            )
+            .expect("valid action");
+            let (acknowledge, acknowledged) = kovi::tokio::sync::oneshot::channel();
+
+            let error = send_action_ingress_command_with_ack(
+                &ingress,
+                super::IngressCommand::DispatchAction {
+                    user_id,
+                    action,
+                    control: Arc::clone(&control),
+                    acknowledge,
+                },
+                acknowledged,
+                &control,
+                StdDuration::from_secs(1),
+                StdDuration::from_millis(10),
+                StdDuration::from_millis(100),
+            )
+            .await
+            .expect_err("a pending command must be cancelled at its first deadline");
+            assert!(!error.is_indeterminate());
+            assert_eq!(control.state(), ActionCommandState::Cancelled);
+
+            let store: Arc<dyn IdentityStore> = Arc::new(FakeIdentityStore {
+                person_id,
+                conversation_id,
+                stored_kind: ConversationKind::Direct,
+            });
+            let ingress_task = kovi::tokio::spawn(run_ingress(
+                receiver,
+                store,
+                runtime_handle,
+                None,
+                None,
+                None,
+                Arc::new(StdMutex::new(HashSet::new())),
+                Arc::new(StdMutex::new(HashSet::new())),
+                Some(arbiter),
+                Some(action_port),
+                Arc::new(super::PrivateHandlerGateRegistry::new(4)),
+            ));
+            drop(ingress);
+            kovi::tokio::time::timeout(StdDuration::from_secs(1), ingress_task)
+                .await
+                .expect("cancelled command must not stall the worker")
+                .expect("ingress worker");
+            assert_eq!(port.calls.load(Ordering::SeqCst), 0);
+        });
+    }
+
+    #[test]
+    fn running_action_gets_completion_grace_after_first_ack_deadline() {
+        let runtime = kovi::tokio::runtime::Runtime::new().expect("test runtime");
+        runtime.block_on(async {
+            let user_id = 456;
+            let conversation_id = ConversationId::new();
+            let person_id = PersonId::new();
+            let (ingress, receiver) = mpsc::channel(2);
+            let (runtime_handle, _core_runtime) =
+                yunxi_core::CognitiveRuntime::new(RuntimeConfig::default()).expect("valid runtime");
+            let arbiter = Arc::new(ActionArbiter::new(
+                ActionArbiterConfig::default().with_capabilities(EnvironmentCapabilities::all()),
+            ));
+            let port = Arc::new(BlockingActionPort {
+                conversation_id,
+                calls: AtomicUsize::new(0),
+                entered: Notify::new(),
+                release: Notify::new(),
+            });
+            let action_port: Arc<dyn ActionPort> = port.clone();
+            let store: Arc<dyn IdentityStore> = Arc::new(FakeIdentityStore {
+                person_id,
+                conversation_id,
+                stored_kind: ConversationKind::Direct,
+            });
+            let ingress_task = kovi::tokio::spawn(run_ingress(
+                receiver,
+                store,
+                runtime_handle,
+                None,
+                None,
+                None,
+                Arc::new(StdMutex::new(HashSet::new())),
+                Arc::new(StdMutex::new(HashSet::new())),
+                Some(arbiter),
+                Some(action_port),
+                Arc::new(super::PrivateHandlerGateRegistry::new(4)),
+            ));
+            let control = Arc::new(ActionCommandControl::new());
+            let action = ProposedAction::send_message(
+                conversation_id,
+                MessageContent::text("finish during grace"),
+            )
+            .expect("valid action");
+            let (acknowledge, acknowledged) = kovi::tokio::sync::oneshot::channel();
+            let dispatch = send_action_ingress_command_with_ack(
+                &ingress,
+                super::IngressCommand::DispatchAction {
+                    user_id,
+                    action,
+                    control: Arc::clone(&control),
+                    acknowledge,
+                },
+                acknowledged,
+                &control,
+                StdDuration::from_secs(1),
+                StdDuration::from_millis(10),
+                StdDuration::from_millis(250),
+            );
+            let release = async {
+                kovi::tokio::time::timeout(StdDuration::from_secs(1), port.entered.notified())
+                    .await
+                    .expect("worker must claim the action");
+                kovi::tokio::time::sleep(StdDuration::from_millis(30)).await;
+                assert_eq!(control.state(), ActionCommandState::Running);
+                port.release.notify_one();
+            };
+            let (result, ()) = kovi::tokio::join!(dispatch, release);
+            assert!(matches!(
+                result,
+                Ok(Ok(Some(ActionResult::Executed {
+                    outcome: ActionPortOutcome::Delivered { .. },
+                    ..
+                })))
+            ));
+            assert_eq!(control.state(), ActionCommandState::Finished);
+            assert_eq!(port.calls.load(Ordering::SeqCst), 1);
+
+            drop(ingress);
+            kovi::tokio::time::timeout(StdDuration::from_secs(1), ingress_task)
+                .await
+                .expect("ingress worker must stop")
+                .expect("ingress worker");
+        });
     }
 
     #[test]
