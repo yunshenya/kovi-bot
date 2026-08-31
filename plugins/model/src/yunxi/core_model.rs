@@ -23,7 +23,7 @@ use crate::yunxi::mind_runtime::{
 use anyhow::Result;
 use kovi::RuntimeBot;
 use kovi::tokio::sync::Mutex;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Map;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
@@ -54,6 +54,10 @@ const CORE_INTERACTION_CUES_END: &str = "[[/INTERACTION_CUES]]";
 const MAX_CORE_INTERACTION_CUES_PAYLOAD_BYTES: usize = 4_096;
 const MAX_EXPLICIT_REPLY_MESSAGES: usize = 8;
 const MAX_INTRINSIC_REPLY_PROTOCOL_BYTES: usize = 4_096;
+// Keep this in sync with `model::reply::MAX_REPLY_PROTOCOL_CHARS`. The host
+// parses the JSON payload between the action markers using this character
+// bound, while Core also applies the stricter full-wrapper byte bound above.
+const MAX_MODEL_REPLY_PROTOCOL_CHARS: usize = 4_096;
 const INTRINSIC_GENERATION_SUFFIX: &str = "<|im_start|>assistant\n<think>\n\n</think>\n\n";
 const INTRINSIC_AUTONOMOUS_INTENT_MAX_NEW_TOKENS: usize = 16;
 const MAX_AUTONOMOUS_INTRINSIC_NEW_TOKENS: usize = 64;
@@ -145,7 +149,17 @@ fn requested_message_count(content: &str) -> Option<usize> {
 }
 
 fn is_direct_message_request_prefix(prefix: &str, verb: &str) -> bool {
-    const NEGATIONS: &[&str] = &["不要", "别", "不必", "无需", "不能", "不用", "没", "未"];
+    const NEGATIONS: &[&str] = &[
+        "不要",
+        "不需要",
+        "别",
+        "不必",
+        "无需",
+        "不能",
+        "不用",
+        "没",
+        "未",
+    ];
     const ATTRIBUTION: &[&str] = &["他说", "她说", "对方说", "有人说", "系统说"];
     let recent_prefix = prefix
         .chars()
@@ -210,6 +224,12 @@ struct IntrinsicReplyBatch {
     messages: Vec<String>,
 }
 
+#[derive(Debug, Serialize)]
+struct IntrinsicReplyBatchWire<'a> {
+    disposition: &'static str,
+    messages: &'a [String],
+}
+
 fn safe_structured_reply_batch(content: &str) -> Option<usize> {
     const START: &str = "[[REPLY_ACTION]]";
     const END: &str = "[[/REPLY_ACTION]]";
@@ -235,6 +255,142 @@ fn safe_structured_reply_batch(content: &str) -> Option<usize> {
         return None;
     }
     Some(batch.messages.len())
+}
+
+fn serialize_intrinsic_reply_batch(messages: &[String]) -> Option<(String, usize)> {
+    let payload = serde_json::to_string(&IntrinsicReplyBatchWire {
+        disposition: "reply",
+        messages,
+    })
+    .ok()?;
+    let payload_chars = payload.chars().count();
+    let mut content =
+        String::with_capacity(payload.len() + "[[REPLY_ACTION]]".len() + "[[/REPLY_ACTION]]".len());
+    content.push_str("[[REPLY_ACTION]]");
+    content.push_str(&payload);
+    content.push_str("[[/REPLY_ACTION]]");
+    Some((content, payload_chars))
+}
+
+fn intrinsic_reply_batch_is_accepted(
+    content: &str,
+    payload_chars: usize,
+    expected_count: usize,
+) -> bool {
+    payload_chars <= MAX_MODEL_REPLY_PROTOCOL_CHARS
+        && safe_structured_reply_batch(content) == Some(expected_count)
+}
+
+/// Build the one action wrapper used for an explicit multi-message turn.
+///
+/// Intrinsic replies are generated independently, so their combined JSON can
+/// exceed either the Core byte budget or the host parser's character budget.
+/// Preserve every generated message as a non-empty prefix and trim only the
+/// excess suffix. This keeps the requested message count intact without
+/// synthesizing filler text or silently collapsing the batch to one bubble.
+fn build_bounded_intrinsic_reply_batch(
+    messages: Vec<String>,
+    expected_count: usize,
+) -> Option<String> {
+    if messages.len() != expected_count
+        || !(2..=MAX_EXPLICIT_REPLY_MESSAGES).contains(&expected_count)
+    {
+        return None;
+    }
+    let mut messages = messages
+        .into_iter()
+        .map(|message| message.trim().to_owned())
+        .collect::<Vec<_>>();
+    if messages.iter().any(|message| {
+        message.is_empty() || message.contains('\0') || intrinsic_output_is_unsafe(message)
+    }) {
+        return None;
+    }
+
+    loop {
+        let (content, payload_chars) = serialize_intrinsic_reply_batch(&messages)?;
+        if intrinsic_reply_batch_is_accepted(&content, payload_chars, expected_count) {
+            return Some(content);
+        }
+
+        let bytes_over = content
+            .len()
+            .saturating_sub(MAX_INTRINSIC_REPLY_PROTOCOL_BYTES);
+        let chars_over = payload_chars.saturating_sub(MAX_MODEL_REPLY_PROTOCOL_CHARS);
+        // The shape is already known to be valid apart from a size bound. If
+        // neither bound is exceeded, do not mutate content in an attempt to
+        // repair an unrelated protocol error.
+        if bytes_over == 0 && chars_over == 0 {
+            return None;
+        }
+
+        let reducible = messages
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| message.chars().count() > 1)
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        if reducible.is_empty() {
+            // The fixed action envelope is far below either limit for the
+            // supported maximum of eight messages, but keep the failure mode
+            // explicit if those protocol constants ever change.
+            return None;
+        }
+
+        let byte_reduction = bytes_over.div_ceil(reducible.len());
+        let char_reduction = chars_over.div_ceil(reducible.len());
+        let mut changed = false;
+        for index in reducible {
+            let current = messages[index].clone();
+            let encoded = serde_json::to_string(&current).ok()?;
+            let encoded_chars = encoded.chars().count();
+            let target_bytes = encoded.len().saturating_sub(byte_reduction);
+            let target_chars = encoded_chars.saturating_sub(char_reduction);
+            let bounded = longest_json_prefix(&current, target_bytes, target_chars)?;
+            if bounded.chars().count() < current.chars().count() {
+                messages[index] = bounded;
+                changed = true;
+            }
+        }
+
+        // A one-byte/character excess can be smaller than the encoded width
+        // of one Unicode scalar. Ensure every pass still makes progress.
+        if !changed {
+            let index = messages
+                .iter()
+                .enumerate()
+                .filter(|(_, message)| message.chars().count() > 1)
+                .max_by_key(|(_, message)| message.chars().count())
+                .map(|(index, _)| index)?;
+            let keep = messages[index].chars().count().saturating_sub(1).max(1);
+            messages[index] = messages[index].chars().take(keep).collect();
+        }
+    }
+}
+
+/// Return the longest non-empty prefix whose JSON string encoding fits both
+/// per-message budgets. Prefixing by Unicode scalar boundaries keeps the
+/// resulting JSON valid even when the model emitted multi-byte text.
+fn longest_json_prefix(value: &str, max_bytes: usize, max_chars: usize) -> Option<String> {
+    let total_chars = value.chars().count();
+    if total_chars <= 1 {
+        return Some(value.to_owned());
+    }
+    let mut low = 1;
+    let mut high = total_chars;
+    let mut best = 1;
+    while low <= high {
+        let middle = low + (high - low) / 2;
+        let candidate = value.chars().take(middle).collect::<String>();
+        let encoded = serde_json::to_string(&candidate).ok()?;
+        if encoded.len() <= max_bytes && encoded.chars().count() <= max_chars {
+            best = middle;
+            low = middle + 1;
+        } else {
+            high = middle.saturating_sub(1);
+        }
+    }
+    Some(value.chars().take(best).collect())
 }
 
 fn safe_single_structured_reply_message(content: &str) -> Option<String> {
@@ -2384,16 +2540,12 @@ impl KoviModelBackend {
             // A single-message generation must never smuggle a second model
             // protocol into the batch. The outer Core layer owns the only
             // structured action wrapper.
-            if safe_structured_reply_batch(&output).is_some() {
+            if intrinsic_output_is_unsafe(&output) {
                 return None;
             }
             outputs.push(output);
         }
-        let payload = serde_json::json!({
-            "disposition": "reply",
-            "messages": outputs,
-        });
-        Some(format!("[[REPLY_ACTION]]{payload}[[/REPLY_ACTION]]"))
+        build_bounded_intrinsic_reply_batch(outputs, count)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4065,7 +4217,7 @@ impl ModelBackend for KoviModelBackend {
                     }
                     None => {
                         kovi::log::warn!(
-                            "Yunxi autonomous intent unavailable: event_id={} conversation_id={} source=all action=wait",
+                            "Yunxi autonomous intent unavailable: event_id={} conversation_id={} source=all action=bounded_retry",
                             input.event.id(),
                             conversation_id_for_log(input),
                         );
@@ -4074,10 +4226,9 @@ impl ModelBackend for KoviModelBackend {
                 };
                 let Some(directive) = directive else {
                     crate::model::finish(ticket).await;
-                    return Ok(autonomous_or_silent_plan(
+                    return Ok(autonomous_generation_failure_plan(
                         input,
                         InteractionCues::default(),
-                        Some(ConversationTurnDirective::Wait),
                     ));
                 };
                 if directive != ConversationTurnDirective::Continue {
@@ -4178,14 +4329,20 @@ impl ModelBackend for KoviModelBackend {
                     (content, true)
                 } else {
                     crate::model::finish(ticket).await;
-                    return Ok(silent_wait_plan(input, InteractionCues::default()));
+                    return Ok(autonomous_generation_failure_plan(
+                        input,
+                        InteractionCues::default(),
+                    ));
                 }
             } else if route_decision.route == HostModelRoute::Reflex {
                 let Some(content) =
                     deterministic_route_fallback(input, expects_vision, tool_intent)
                 else {
                     crate::model::finish(ticket).await;
-                    return Ok(silent_wait_plan(input, InteractionCues::default()));
+                    return Ok(autonomous_generation_failure_plan(
+                        input,
+                        InteractionCues::default(),
+                    ));
                 };
                 (content, true)
             } else if let Some(error) = vision_resolution_error {
@@ -4282,7 +4439,10 @@ impl ModelBackend for KoviModelBackend {
                                 conversation_id_for_log(input),
                             );
                             crate::model::finish(ticket).await;
-                            return Ok(silent_wait_plan(input, InteractionCues::default()));
+                            return Ok(autonomous_generation_failure_plan(
+                                input,
+                                InteractionCues::default(),
+                            ));
                         }
                     }
                     Some(response) => {
@@ -4334,21 +4494,30 @@ impl ModelBackend for KoviModelBackend {
                                 conversation_id_for_log(input),
                             );
                             crate::model::finish(ticket).await;
-                            return Ok(silent_wait_plan(input, InteractionCues::default()));
+                            return Ok(autonomous_generation_failure_plan(
+                                input,
+                                InteractionCues::default(),
+                            ));
                         }
                     }
                     None => {
+                        let was_current = is_current(ticket).await;
                         crate::model::finish(ticket).await;
+                        if is_autonomous_conversation_tick(input) && was_current {
+                            return Ok(autonomous_generation_failure_plan(
+                                input,
+                                InteractionCues::default(),
+                            ));
+                        }
                         return Ok(silent_with_interaction_state(input));
                     }
                 }
             };
             if fallback_response && is_autonomous_conversation_tick(input) {
                 crate::model::finish(ticket).await;
-                return Ok(autonomous_or_silent_plan(
+                return Ok(autonomous_generation_failure_plan(
                     input,
                     InteractionCues::default(),
-                    Some(ConversationTurnDirective::Wait),
                 ));
             }
             let parsed_response = if fallback_response && message.is_some() {
@@ -4382,10 +4551,14 @@ impl ModelBackend for KoviModelBackend {
                 .tool_notification_policy()
                 .unwrap_or(parsed_response.tool_notification_policy);
             if message.is_some() && parsed_response.stop_requested {
+                ConversationCoordinator::cancel_current_incoming(ticket).await;
+                // Keep the guard armed until the coordinator has cancelled
+                // the exact admission. If this await is cancelled, Drop can
+                // still release the host reservation instead of leaving a
+                // phantom in-flight turn behind.
                 if let Some(guard) = incoming_guard.as_mut() {
                     guard.disarm();
                 }
-                ConversationCoordinator::cancel_current_incoming(ticket).await;
                 crate::model::finish(ticket).await;
                 kovi::log::info!(
                     "Yunxi Core stop intent cancelled current reply: event_id={} message_id={} conversation_id={}",
@@ -4405,9 +4578,6 @@ impl ModelBackend for KoviModelBackend {
                     reply_expected_for_incoming(input),
                 )
                 .await;
-                if let Some(guard) = incoming_guard.as_mut() {
-                    guard.disarm();
-                }
                 let Some(refined) = refined else {
                     crate::model::finish(ticket).await;
                     return Ok(silent_with_interaction_cues(
@@ -4419,11 +4589,26 @@ impl ModelBackend for KoviModelBackend {
                     crate::model::finish(ticket).await;
                     ticket = refined.ticket;
                     if !mark_active(ticket).await {
+                        // Refinement produced a successor, but another turn
+                        // won the generation before it could become active.
+                        // Release that exact successor before returning; the
+                        // original guard remains armed until this cleanup has
+                        // completed.
+                        ConversationCoordinator::abandon_incoming(refined).await;
+                        if let Some(guard) = incoming_guard.as_mut() {
+                            guard.disarm();
+                        }
                         return Ok(silent_with_interaction_cues(
                             input,
                             parsed_response.interaction_cues,
                         ));
                     }
+                }
+                // Refinement and (when needed) activation now own the live
+                // admission. Transfer host-reservation ownership only after
+                // those operations have completed successfully.
+                if let Some(guard) = incoming_guard.as_mut() {
+                    guard.disarm();
                 }
                 Some(refined)
             } else {
@@ -4826,7 +5011,7 @@ impl ModelBackend for KoviModelBackend {
                 if reply_recovery_required(input, tool_follow_up) {
                     return Ok(silent_wait_plan(input, parsed_response.interaction_cues));
                 }
-                return Ok(autonomous_or_silent_plan(
+                return Ok(autonomous_empty_generation_plan(
                     input,
                     parsed_response.interaction_cues,
                     parsed_response.conversation_directive,
@@ -4843,10 +5028,11 @@ impl ModelBackend for KoviModelBackend {
                     );
                 }
                 crate::model::finish(ticket).await;
-                return Ok(silent_with_interaction_cues(
-                    input,
-                    parsed_response.interaction_cues,
-                ));
+                return Ok(if is_autonomous_conversation_tick(input) {
+                    autonomous_generation_failure_plan(input, parsed_response.interaction_cues)
+                } else {
+                    silent_with_interaction_cues(input, parsed_response.interaction_cues)
+                });
             };
             let idempotency_keys = (0..intents.len())
                 .map(|index| yunxi_core::planned_action_idempotency_key(&input.event, index))
@@ -4875,10 +5061,11 @@ impl ModelBackend for KoviModelBackend {
                         intents.len(),
                     );
                 }
-                return Ok(silent_with_interaction_cues(
-                    input,
-                    parsed_response.interaction_cues,
-                ));
+                return Ok(if is_autonomous_conversation_tick(input) {
+                    autonomous_generation_failure_plan(input, parsed_response.interaction_cues)
+                } else {
+                    silent_with_interaction_cues(input, parsed_response.interaction_cues)
+                });
             };
             let disposition = active_visible_disposition(
                 input,
@@ -4902,10 +5089,11 @@ impl ModelBackend for KoviModelBackend {
                     for token in prepared.iter().copied() {
                         mark_outgoing_failed(token).await;
                     }
-                    return Ok(silent_with_interaction_cues(
-                        input,
-                        parsed_response.interaction_cues,
-                    ));
+                    return Ok(if is_autonomous_conversation_tick(input) {
+                        autonomous_generation_failure_plan(input, parsed_response.interaction_cues)
+                    } else {
+                        silent_with_interaction_cues(input, parsed_response.interaction_cues)
+                    });
                 };
                 if !crate::yunxi::register_mind_outgoing_fence(
                     idempotency_key.to_owned(),
@@ -4916,10 +5104,11 @@ impl ModelBackend for KoviModelBackend {
                         mark_outgoing_failed(token).await;
                     }
                     crate::yunxi::discard_mind_outgoing_fence(idempotency_key);
-                    return Ok(silent_with_interaction_cues(
-                        input,
-                        parsed_response.interaction_cues,
-                    ));
+                    return Ok(if is_autonomous_conversation_tick(input) {
+                        autonomous_generation_failure_plan(input, parsed_response.interaction_cues)
+                    } else {
+                        silent_with_interaction_cues(input, parsed_response.interaction_cues)
+                    });
                 }
             }
             if !mind_candidates.is_empty()
@@ -5055,6 +5244,38 @@ fn silent_wait_plan(input: &PlannerInput, cues: InteractionCues) -> DecisionPlan
     plan
 }
 
+/// A model/provider failure is different from a deliberate silent turn. For
+/// an autonomous tick, keep the host claim retryable with the existing bounded
+/// backoff; ordinary incoming turns retain their normal silent recovery path.
+fn autonomous_generation_failure_plan(input: &PlannerInput, cues: InteractionCues) -> DecisionPlan {
+    if is_autonomous_conversation_tick(input) {
+        autonomous_or_silent_plan(input, cues, Some(ConversationTurnDirective::Continue))
+    } else {
+        silent_wait_plan(input, cues)
+    }
+}
+
+/// Resolve a model turn that produced no visible content. `wait` and `end`
+/// are deliberate autonomous silence; a missing directive, or `continue`
+/// without a message, means the candidate failed to materialize and must use
+/// the bounded retry path.
+fn autonomous_empty_generation_plan(
+    input: &PlannerInput,
+    cues: InteractionCues,
+    directive: Option<ConversationTurnDirective>,
+) -> DecisionPlan {
+    if is_autonomous_conversation_tick(input)
+        && !matches!(
+            directive,
+            Some(ConversationTurnDirective::Wait | ConversationTurnDirective::End)
+        )
+    {
+        autonomous_generation_failure_plan(input, cues)
+    } else {
+        autonomous_or_silent_plan(input, cues, directive)
+    }
+}
+
 fn autonomous_or_silent_plan(
     input: &PlannerInput,
     cues: InteractionCues,
@@ -5091,9 +5312,11 @@ mod tests {
         CORE_GROUP_HISTORY_PREFIX, CORE_REPLY_REPAIR_PROMPT, CoreDirectRepair, HostMessageContext,
         HostMessageContextCache, HostModelRoute, HostModelRoutingContext,
         HostToolTurnRegistrationPolicy, HostToolTurnRegistry, INTRINSIC_GENERATION_SUFFIX,
-        MAX_CORE_PROTOCOL_LOG_PREVIEW_CHARS, MindCandidates, PersistentRouteLookup, QqConversation,
-        RouteContext, VisibleReplyTarget, autonomous_conversation_prompt,
-        autonomous_conversation_protocol, baseline_disposition, batch_fence_action_key,
+        MAX_CORE_PROTOCOL_LOG_PREVIEW_CHARS, MAX_INTRINSIC_REPLY_PROTOCOL_BYTES, MindCandidates,
+        PersistentRouteLookup, QqConversation, RouteContext, VisibleReplyTarget,
+        autonomous_conversation_prompt, autonomous_conversation_protocol,
+        autonomous_empty_generation_plan, autonomous_generation_failure_plan, baseline_disposition,
+        batch_fence_action_key, build_bounded_intrinsic_reply_batch,
         classify_persistent_person_identity, constrain_autonomous_tick_plan,
         conversation_id_for_log, core_message_prompt, core_plan_has_visible_text,
         core_tool_protocol_diagnostic, default_autonomous_directive, defer_unroutable_due,
@@ -5114,8 +5337,8 @@ mod tests {
         route_from_lookup, route_lookup_with_fallback, safe_single_structured_reply_message,
         safe_structured_reply_batch, sanitize_autonomous_intrinsic_output,
         sanitize_intrinsic_output, select_host_model_route_from_capability,
-        shadow_projection_for_completed_plan, silent_wait_plan, visible_reply_intent,
-        visible_reply_intents, visible_reply_state_updates,
+        serialize_intrinsic_reply_batch, shadow_projection_for_completed_plan, silent_wait_plan,
+        visible_reply_intent, visible_reply_intents, visible_reply_state_updates,
     };
     use crate::model::{
         BotMemory, ConversationCoordinator, IncomingTurnImpact, OutgoingExecutiveDecision,
@@ -5463,6 +5686,80 @@ mod tests {
     }
 
     #[test]
+    fn autonomous_generation_failure_stays_retryable_without_visible_fallback() {
+        let conversation_id = ConversationId::new();
+        let input = PlannerInput::new(
+            WorldEvent::new(
+                Utc::now(),
+                EventScope::Conversation { conversation_id },
+                EventPriority::Low,
+                WorldEventKind::AutonomousConversationTick(
+                    yunxi_core::AutonomousConversationTickEvent::default(),
+                ),
+            ),
+            PlannerStateSnapshot::empty(),
+        );
+
+        let plan = autonomous_generation_failure_plan(&input, InteractionCues::default());
+        assert!(plan.intents.is_empty());
+        assert!(plan.state_updates.iter().any(|update| matches!(
+            update,
+            StateUpdateProposal::ConversationDirective {
+                conversation_id: actual,
+                directive: ConversationTurnDirective::Continue,
+            } if *actual == conversation_id
+        )));
+    }
+
+    #[test]
+    fn autonomous_empty_output_retries_unless_model_explicitly_waits_or_ends() {
+        let conversation_id = ConversationId::new();
+        let input = PlannerInput::new(
+            WorldEvent::new(
+                Utc::now(),
+                EventScope::Conversation { conversation_id },
+                EventPriority::Low,
+                WorldEventKind::AutonomousConversationTick(
+                    yunxi_core::AutonomousConversationTickEvent {
+                        conversation_kind: Some(ConversationKind::Direct),
+                        ..Default::default()
+                    },
+                ),
+            ),
+            PlannerStateSnapshot::empty(),
+        );
+
+        for directive in [None, Some(ConversationTurnDirective::Continue)] {
+            let plan =
+                autonomous_empty_generation_plan(&input, InteractionCues::default(), directive);
+            assert!(plan.state_updates.iter().any(|update| matches!(
+                update,
+                StateUpdateProposal::ConversationDirective {
+                    conversation_id: actual,
+                    directive: ConversationTurnDirective::Continue,
+                } if *actual == conversation_id
+            )));
+        }
+        for directive in [
+            ConversationTurnDirective::Wait,
+            ConversationTurnDirective::End,
+        ] {
+            let plan = autonomous_empty_generation_plan(
+                &input,
+                InteractionCues::default(),
+                Some(directive),
+            );
+            assert!(plan.state_updates.iter().any(|update| matches!(
+                update,
+                StateUpdateProposal::ConversationDirective {
+                    conversation_id: actual,
+                    directive: selected,
+                } if *actual == conversation_id && *selected == directive
+            )));
+        }
+    }
+
+    #[test]
     fn ambient_group_candidates_default_to_silence_without_losing_reply_permission() {
         let ambient = group_message_input(false);
         assert_eq!(
@@ -5788,6 +6085,7 @@ mod tests {
         assert_eq!(requested_message_count("给我发12条"), None);
         assert_eq!(requested_message_count("给我发一条"), None);
         assert_eq!(requested_message_count("不要给我发送两条消息"), None);
+        assert_eq!(requested_message_count("不需要给我发两条消息"), None);
         assert_eq!(requested_message_count("别给我发两条消息"), None);
         assert_eq!(requested_message_count("我刚才发两条消息"), None);
         assert_eq!(requested_message_count("他说发两条消息"), None);
@@ -5847,6 +6145,90 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn intrinsic_batch_builder_keeps_two_messages_inside_protocol_limits() {
+        let source = vec!["甲".repeat(2_000), "乙".repeat(2_000)];
+        let bounded = build_bounded_intrinsic_reply_batch(source.clone(), 2)
+            .expect("a bounded two-message batch should remain sendable");
+        assert!(bounded.len() <= MAX_INTRINSIC_REPLY_PROTOCOL_BYTES);
+        assert_eq!(safe_structured_reply_batch(&bounded), Some(2));
+
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let plan =
+                    ReplyPlan::from_model_output(ReplyScope::Private(9_100_101), &bounded).await;
+                assert_eq!(plan.bubbles.len(), 2);
+                assert!(
+                    plan.bubbles
+                        .iter()
+                        .zip(source.iter())
+                        .all(|(bounded, original)| original.starts_with(bounded))
+                );
+                assert!(plan.bubbles.iter().all(|bubble| !bubble.is_empty()));
+            });
+    }
+
+    #[test]
+    fn intrinsic_batch_builder_keeps_eight_multibyte_messages_without_filler() {
+        let source = (0..8)
+            .map(|index| format!("第{index}条：{}", "界".repeat(2_000)))
+            .collect::<Vec<_>>();
+        let bounded = build_bounded_intrinsic_reply_batch(source.clone(), 8)
+            .expect("a bounded eight-message batch should remain sendable");
+        assert!(bounded.len() <= MAX_INTRINSIC_REPLY_PROTOCOL_BYTES);
+        assert_eq!(safe_structured_reply_batch(&bounded), Some(8));
+
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let plan =
+                    ReplyPlan::from_model_output(ReplyScope::Private(9_100_102), &bounded).await;
+                assert_eq!(plan.bubbles.len(), 8);
+                assert!(
+                    plan.bubbles
+                        .iter()
+                        .zip(source.iter())
+                        .all(|(bounded, original)| original.starts_with(bounded))
+                );
+                assert!(plan.bubbles.iter().all(|bubble| !bubble.is_empty()));
+            });
+    }
+
+    #[test]
+    fn intrinsic_batch_builder_accepts_exact_boundary_and_repairs_one_byte_overflow() {
+        let baseline = serialize_intrinsic_reply_batch(&["a".to_owned(), "b".to_owned()])
+            .expect("baseline batch should serialize")
+            .0;
+        let extra = MAX_INTRINSIC_REPLY_PROTOCOL_BYTES
+            .checked_sub(baseline.len())
+            .expect("baseline must fit inside the protocol bound");
+        let exact_messages = vec![format!("a{}", "x".repeat(extra)), "b".to_owned()];
+        let exact = serialize_intrinsic_reply_batch(&exact_messages)
+            .expect("exact-boundary batch should serialize")
+            .0;
+        assert_eq!(exact.len(), MAX_INTRINSIC_REPLY_PROTOCOL_BYTES);
+        assert_eq!(
+            build_bounded_intrinsic_reply_batch(exact_messages.clone(), 2).as_deref(),
+            Some(exact.as_str())
+        );
+
+        let mut over_messages = exact_messages;
+        over_messages[0].push('y');
+        let repaired = build_bounded_intrinsic_reply_batch(over_messages.clone(), 2)
+            .expect("one-byte overflow should be trimmed, not dropped");
+        assert!(repaired.len() <= MAX_INTRINSIC_REPLY_PROTOCOL_BYTES);
+        assert_eq!(safe_structured_reply_batch(&repaired), Some(2));
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let plan =
+                    ReplyPlan::from_model_output(ReplyScope::Private(9_100_103), &repaired).await;
+                assert_eq!(plan.bubbles.len(), 2);
+                assert!(plan.bubbles.iter().all(|bubble| !bubble.is_empty()));
+            });
     }
 
     #[test]

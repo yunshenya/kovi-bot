@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 
 pub const MAX_TRACKED_ACTION_KEYS: usize = 4_096;
@@ -720,6 +720,38 @@ pub(crate) enum AdmittedTerminal {
     Failed,
 }
 
+/// Keeps an idempotency reservation conservative when an action future is
+/// cancelled after admission. The adapter may have crossed its side-effect
+/// boundary before cancellation, so releasing the reservation would permit a
+/// duplicate delivery. Marking it indeterminate makes subsequent replays fail
+/// closed while still allowing terminal entries to be evicted normally.
+struct DispatchReservationGuard<'a> {
+    arbiter: &'a ActionArbiter,
+    receipt: Option<ActionReceipt>,
+}
+
+impl<'a> DispatchReservationGuard<'a> {
+    fn new(arbiter: &'a ActionArbiter, receipt: &ActionReceipt) -> Self {
+        Self {
+            arbiter,
+            receipt: Some(receipt.clone()),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.receipt = None;
+    }
+}
+
+impl Drop for DispatchReservationGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(receipt) = self.receipt.take() {
+            self.arbiter
+                .mark_terminal(&receipt, AdmittedTerminal::Indeterminate);
+        }
+    }
+}
+
 /// Validates and dispatches proposed actions without knowing a platform API.
 pub struct ActionArbiter {
     config: ActionArbiterConfig,
@@ -1026,12 +1058,36 @@ impl ActionArbiter {
         self.dispatch_at(action, port, Utc::now()).await
     }
 
+    /// Dispatches using the current wall clock with a bounded host execution
+    /// budget. A timeout after admission is returned as an indeterminate
+    /// outcome, and the reservation guard prevents the same action from being
+    /// replayed while its platform result is unknown.
+    pub async fn dispatch_with_timeout(
+        &self,
+        action: ProposedAction,
+        port: &dyn ActionPort,
+        timeout: Duration,
+    ) -> ActionResult {
+        self.dispatch_at_with_timeout(action, port, Utc::now(), Some(timeout))
+            .await
+    }
+
     /// Deterministic dispatch entry point used by tests and schedulers.
     pub async fn dispatch_at(
         &self,
         action: ProposedAction,
         port: &dyn ActionPort,
         now: DateTime<Utc>,
+    ) -> ActionResult {
+        self.dispatch_at_with_timeout(action, port, now, None).await
+    }
+
+    async fn dispatch_at_with_timeout(
+        &self,
+        action: ProposedAction,
+        port: &dyn ActionPort,
+        now: DateTime<Utc>,
+        execution_timeout: Option<Duration>,
     ) -> ActionResult {
         // Reject malformed, stale, unauthorized, or unsupported actions before
         // consulting a host resolver. This keeps validation and authorization
@@ -1040,10 +1096,38 @@ impl ActionArbiter {
         if let Err(rejection) = self.validate_at(&action, now) {
             return ActionResult::Rejected(rejection);
         }
+        // The standalone CLI intentionally uses a tiny non-Tokio executor.
+        // Keep that host compatible; production hosts with a Tokio reactor get
+        // the bounded resolver + adapter budget below.
+        let execution_deadline = execution_timeout
+            .filter(|_| tokio::runtime::Handle::try_current().is_ok())
+            .map(|timeout| (Instant::now() + timeout, timeout));
         if let ProposedAction::ReachOut(reach_out) = &action
             && let Some(resolver) = &self.delivery_resolver
         {
-            match resolver.resolve(reach_out.person_id).await {
+            let resolution = match execution_deadline {
+                Some((deadline, timeout)) => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    match tokio::time::timeout(remaining, resolver.resolve(reach_out.person_id))
+                        .await
+                    {
+                        Ok(resolution) => resolution,
+                        Err(_) => {
+                            return ActionResult::Rejected(
+                                ActionRejection::DeliveryResolutionFailed {
+                                    action_id: Some(reach_out.action_id()),
+                                    error: format!(
+                                        "delivery resolution timed out after {}ms",
+                                        timeout.as_millis()
+                                    ),
+                                },
+                            );
+                        }
+                    }
+                }
+                None => resolver.resolve(reach_out.person_id).await,
+            };
+            match resolution {
                 Ok(_route) => {}
                 Err(DeliveryResolutionError::Unavailable { person_id }) => {
                     return ActionResult::Rejected(ActionRejection::TargetUnavailable {
@@ -1067,7 +1151,43 @@ impl ActionArbiter {
             Ok(receipt) => receipt,
             Err(rejection) => return ActionResult::Rejected(rejection),
         };
-        match port.execute(&action).await {
+        let mut cancellation_guard = DispatchReservationGuard::new(self, &receipt);
+        let execution = match execution_deadline {
+            Some((deadline, timeout)) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                match tokio::time::timeout(remaining, port.execute(&action)).await {
+                    Ok(execution) => execution,
+                    Err(_) => {
+                        // The adapter future has been cancelled. Conservatively
+                        // retain the reservation as indeterminate; a caller can
+                        // inspect the returned result without issuing a blind
+                        // duplicate retry.
+                        self.mark_terminal(&receipt, AdmittedTerminal::Indeterminate);
+                        cancellation_guard.disarm();
+                        return ActionResult::Executed {
+                            receipt,
+                            outcome: ActionPortOutcome::DeliveryIndeterminate {
+                                reason: format!(
+                                    "action execution timed out after {}ms",
+                                    timeout.as_millis()
+                                ),
+                                conversation_id: match action.scope() {
+                                    ActionScope::Conversation(conversation_id) => {
+                                        Some(conversation_id)
+                                    }
+                                    ActionScope::Person(_) | ActionScope::Global => None,
+                                },
+                            },
+                        };
+                    }
+                }
+            }
+            None => port.execute(&action).await,
+        };
+        // From this point on the result is available and no further await can
+        // cancel the dispatch before its terminal state is recorded.
+        cancellation_guard.disarm();
+        match execution {
             Ok(
                 outcome @ (ActionPortOutcome::Delivered { .. }
                 | ActionPortOutcome::ToolCompleted { .. }),
@@ -1133,7 +1253,9 @@ mod tests {
     use crate::proactive::ProactiveMotive;
     use crate::{ConversationKind, MessageContent};
     use chrono::Duration as ChronoDuration;
+    use std::future::pending;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::Notify;
 
     struct FakePort {
         calls: AtomicUsize,
@@ -1430,6 +1552,66 @@ mod tests {
         }
     }
 
+    struct PendingPort {
+        entered: Arc<Notify>,
+    }
+
+    impl ActionPort for PendingPort {
+        fn execute<'a>(&'a self, _action: &'a ProposedAction) -> ActionPortFuture<'a> {
+            let entered = Arc::clone(&self.entered);
+            Box::pin(async move {
+                entered.notify_one();
+                pending::<Result<ActionPortOutcome, ActionPortError>>().await
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_admission_marks_the_reservation_indeterminate() {
+        let now = Utc::now();
+        let action = send_with_key(ConversationId::new(), "cancelled-dispatch", now);
+        let action_id = action.action_id().expect("message action has an id");
+        let arbiter = Arc::new(ActionArbiter::new(
+            ActionArbiterConfig::default().with_capabilities(EnvironmentCapabilities::all()),
+        ));
+        let entered = Arc::new(Notify::new());
+        let port = Arc::new(PendingPort {
+            entered: Arc::clone(&entered),
+        });
+        let dispatch_arbiter = Arc::clone(&arbiter);
+        let dispatch_action = action.clone();
+        let dispatch_port = Arc::clone(&port);
+        let dispatch = tokio::spawn(async move {
+            dispatch_arbiter
+                .dispatch_at(dispatch_action, dispatch_port.as_ref(), now)
+                .await
+        });
+
+        entered.notified().await;
+        dispatch.abort();
+        assert!(
+            dispatch
+                .await
+                .expect_err("the pending dispatch should be cancelled")
+                .is_cancelled()
+        );
+        assert_eq!(
+            arbiter.terminal_outcome("cancelled-dispatch", action_id),
+            Some(AdmittedTerminal::Indeterminate)
+        );
+        let replay_port = FakePort {
+            calls: AtomicUsize::new(0),
+        };
+        assert!(matches!(
+            arbiter.dispatch_at(action, &replay_port, now).await,
+            ActionResult::Rejected(ActionRejection::Duplicate {
+                original_action_id,
+                ..
+            }) if original_action_id == action_id
+        ));
+        assert_eq!(replay_port.calls.load(Ordering::SeqCst), 0);
+    }
+
     #[tokio::test]
     async fn indeterminate_delivery_is_terminal_without_being_successful() {
         let now = Utc::now();
@@ -1555,6 +1737,50 @@ mod tests {
         fn resolve<'a>(&'a self, person_id: PersonId) -> DeliveryResolverFuture<'a> {
             Box::pin(async move { Err(DeliveryResolutionError::Unavailable { person_id }) })
         }
+    }
+
+    struct PendingResolver;
+
+    impl DeliveryResolver for PendingResolver {
+        fn resolve<'a>(&'a self, _person_id: PersonId) -> DeliveryResolverFuture<'a> {
+            Box::pin(pending())
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_dispatch_times_out_delivery_resolution_before_admission() {
+        let person = PersonId::new();
+        let action = ProposedAction::ReachOut(
+            ReachOutAction::new(
+                person,
+                MessageContent::text("hello"),
+                ProactiveMotive::CheckIn,
+            )
+            .expect("action"),
+        );
+        let arbiter = ActionArbiter::new(
+            ActionArbiterConfig::default().with_capabilities(EnvironmentCapabilities::all()),
+        )
+        .with_delivery_resolver(Arc::new(PendingResolver));
+        let port = FakePort {
+            calls: AtomicUsize::new(0),
+        };
+
+        assert!(matches!(
+            arbiter
+                .dispatch_with_timeout(action.clone(), &port, Duration::from_millis(10))
+                .await,
+            ActionResult::Rejected(ActionRejection::DeliveryResolutionFailed {
+                error,
+                ..
+            }) if error.contains("timed out")
+        ));
+        assert_eq!(port.calls.load(Ordering::SeqCst), 0);
+
+        let receipt = arbiter
+            .admit_at(&action, Utc::now())
+            .expect("resolver timeout must happen before idempotency admission");
+        arbiter.release_reservation(&receipt);
     }
 
     #[tokio::test]

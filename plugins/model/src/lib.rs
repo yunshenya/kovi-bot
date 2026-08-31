@@ -466,7 +466,7 @@ async fn main() {
                 );
                 return;
             }
-            let group_decision = bridge.classify_group(&event).await;
+            let group_decision = bridge.classify_group(&event);
             if group_decision.handling == yunxi::bridge::GroupCoreHandling::Observe {
                 if !bridge.is_user_blocked(event.user_id) {
                     // No reply admission exists for this background turn.
@@ -489,7 +489,7 @@ async fn main() {
                     bridge.enqueue_group_reliably(
                         &ingress_event,
                         *admission,
-                        group_decision.replies_to_agent,
+                        group_decision.planner_attention_requested,
                     )
                 },
             )

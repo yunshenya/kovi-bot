@@ -382,8 +382,12 @@ impl ProactiveChatManager {
                 .dispatch_action(user_id, ProposedAction::ReachOut(action))
                 .await
             {
-                Some(ActionResult::Executed { outcome, .. }) => bridge_reach_out_outcome(&outcome),
-                _ => ReachOutDeliveryOutcome::Failed,
+                Ok(Some(ActionResult::Executed { outcome, .. })) => {
+                    bridge_reach_out_outcome(&outcome)
+                }
+                Ok(_) => ReachOutDeliveryOutcome::Failed,
+                Err(error) if error.is_indeterminate() => ReachOutDeliveryOutcome::Indeterminate,
+                Err(_) => ReachOutDeliveryOutcome::Failed,
             };
         }
         let Some(identity_store) = yunxi::identity_store() else {

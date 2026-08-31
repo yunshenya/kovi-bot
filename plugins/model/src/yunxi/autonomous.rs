@@ -289,6 +289,30 @@ pub(crate) fn claim_due_with_context(
         return None;
     };
     let policy = autonomy_policy(config);
+    let stale = registry
+        .order
+        .iter()
+        .copied()
+        .filter(|conversation_id| {
+            registry
+                .entries
+                .get(conversation_id)
+                .and_then(|entry| entry.in_flight_since)
+                .is_some_and(|started| started.elapsed() >= in_flight_timeout)
+        })
+        .collect::<Vec<_>>();
+    for conversation_id in stale {
+        let Some(entry) = registry.entries.get_mut(&conversation_id) else {
+            continue;
+        };
+        // A stale lease represents a failed host/model attempt just like an
+        // explicit retry result. Invalidate its token and consume the same
+        // bounded retry budget before another scheduler pass may reclaim it.
+        entry.in_flight_since = None;
+        entry.in_flight_token = None;
+        let _ = entry.lifecycle.release_autonomous_claim();
+        schedule_retry(entry);
+    }
     let candidate = registry.order.iter().copied().find(|conversation_id| {
         let Some(entry) = registry.entries.get(conversation_id) else {
             return false;
@@ -315,16 +339,6 @@ pub(crate) fn claim_due_with_context(
     })?;
     let (conversation_kind, person_id, token) = {
         let entry = registry.entries.get_mut(&candidate)?;
-        if entry
-            .in_flight_since
-            .is_some_and(|started| started.elapsed() >= in_flight_timeout)
-        {
-            // A stale host lease can be recovered after a process/task crash;
-            // the serializable Core lifecycle remains the source of truth.
-            entry.in_flight_since = None;
-            entry.in_flight_token = None;
-            let _ = entry.lifecycle.release_autonomous_claim();
-        }
         if entry.lifecycle.claim_autonomous(now, policy).ok() != Some(true) {
             return None;
         }
@@ -528,7 +542,8 @@ fn touch(order: &mut VecDeque<ConversationId>, conversation_id: ConversationId) 
 #[cfg(test)]
 mod tests {
     use super::{
-        REGISTRY, autonomous_in_flight_timeout_for, autonomous_model_phase_budget, claim_due,
+        MAX_TRANSIENT_FAILURE_RETRIES, REGISTRY, autonomous_in_flight_timeout,
+        autonomous_in_flight_timeout_for, autonomous_model_phase_budget, claim_due,
         claim_due_with_context, claim_is_current, finish_claim, finish_claim_token,
         model_retry_backoff, observe_group_activity, observe_inbound, observe_inbound_from_person,
         record_outbound, record_outbound_with_directive, release_claim, retry_claim,
@@ -537,7 +552,7 @@ mod tests {
     use crate::config::ProactiveConfig;
     use chrono::{Duration, Utc};
     use std::sync::{LazyLock, Mutex};
-    use std::time::Duration as StdDuration;
+    use std::time::{Duration as StdDuration, Instant};
     use yunxi_core::{ConversationId, ConversationKind, ConversationTurnDirective, PersonId};
 
     static TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
@@ -947,6 +962,61 @@ mod tests {
             .get(&id)
             .is_some_and(|entry| entry.retry_after.is_some() && entry.in_flight_since.is_none()));
         drop(registry);
+        clear();
+    }
+
+    #[test]
+    fn stale_claim_recovery_consumes_the_bounded_retry_budget() {
+        let _guard = TEST_LOCK.lock().expect("test lock");
+        clear();
+        let id = ConversationId::new();
+        let now = Utc::now();
+        let config = ProactiveConfig::default();
+        observe_inbound(
+            id,
+            ConversationKind::Direct,
+            now - Duration::minutes(5),
+            true,
+        );
+        record_outbound(id, now - Duration::minutes(4));
+        assert_eq!(claim_due(&config, now), Some(id));
+
+        for attempt in 1..=MAX_TRANSIENT_FAILURE_RETRIES {
+            {
+                let mut registry = REGISTRY.lock().expect("registry lock");
+                let entry = registry.entries.get_mut(&id).expect("tracked conversation");
+                entry.in_flight_since = Some(
+                    Instant::now()
+                        .checked_sub(autonomous_in_flight_timeout() + StdDuration::from_secs(1))
+                        .expect("lease duration should fit in Instant"),
+                );
+            }
+
+            assert!(
+                claim_due(&config, now).is_none(),
+                "a stale lease must back off before it can be reclaimed"
+            );
+
+            let mut registry = REGISTRY.lock().expect("registry lock");
+            let entry = registry.entries.get_mut(&id).expect("tracked conversation");
+            assert_eq!(entry.retry_attempts, attempt);
+            assert_eq!(entry.suspended, attempt == MAX_TRANSIENT_FAILURE_RETRIES);
+            assert!(entry.in_flight_since.is_none());
+            if attempt < MAX_TRANSIENT_FAILURE_RETRIES {
+                entry.retry_after = Some(
+                    Instant::now()
+                        .checked_sub(StdDuration::from_secs(1))
+                        .expect("one second should fit in Instant"),
+                );
+            }
+            drop(registry);
+
+            if attempt < MAX_TRANSIENT_FAILURE_RETRIES {
+                assert_eq!(claim_due(&config, now), Some(id));
+            }
+        }
+
+        assert!(claim_due(&config, now + Duration::hours(1)).is_none());
         clear();
     }
 

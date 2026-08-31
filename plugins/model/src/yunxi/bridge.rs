@@ -36,6 +36,36 @@ use yunxi_core::{
 
 pub(crate) const CORE_INGRESS_CAPACITY: usize = 256;
 pub(crate) const MESSAGE_REFERENCE_CAPACITY: usize = 4_096;
+/// Upper bound for a visible host callback waiting for Core ingress space.
+///
+/// The queue is intentionally bounded, but an unbounded `send().await` here
+/// would let a stalled identity/runtime worker pin every Kovi message handler.
+const CORE_RELIABLE_INGRESS_TIMEOUT: Duration = Duration::from_secs(5);
+/// Total budget for one message on the serialized ingress worker. This covers
+/// identity resolution, durable quote checks, and runtime admission; a slow
+/// database must not hold every later reply behind it indefinitely.
+const CORE_INGRESS_PROCESSING_TIMEOUT: Duration = Duration::from_secs(10);
+/// Commands that require an ingress acknowledgement must not wait forever for
+/// either queue capacity or a stalled worker. An acknowledgement timeout is
+/// intentionally reported as indeterminate because the command was accepted.
+const CORE_INGRESS_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+/// An admitted action must not hold the serialized ingress worker while a
+/// host adapter waits forever on a database, authorization, or platform API.
+/// The arbiter marks an admitted reservation indeterminate if this future is
+/// cancelled, so the timeout cannot make a later retry duplicate a send.
+/// Keep this above the transport's bounded enqueue + response waits so the
+/// adapter can persist its own definite or indeterminate terminal outcome.
+const CORE_ACTION_DISPATCH_TIMEOUT: Duration = Duration::from_secs(20);
+/// Action acknowledgement includes the full dispatch plus final runtime
+/// feedback bookkeeping. Queue acquisition remains independently bounded by
+/// `CORE_INGRESS_COMMAND_TIMEOUT`.
+const CORE_ACTION_ACKNOWLEDGEMENT_TIMEOUT: Duration = Duration::from_secs(25);
+/// High-priority runtime events use backpressure in `RuntimeHandle::submit`.
+/// Keep that wait finite so one unhealthy runtime cannot stop the ingress loop.
+const CORE_RUNTIME_SUBMIT_TIMEOUT: Duration = Duration::from_secs(5);
+/// A durable reply mapping is authoritative, but it must not turn a transient
+/// database outage into a permanently blocked Core ingress worker.
+const CORE_REPLY_MAPPING_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_TRACKED_USERS: usize = 256;
 const MAX_TRACKED_DIRECT_CONVERSATIONS_PER_USER: usize = 256;
 const MAX_BLOCKED_USERS: usize = 256;
@@ -175,9 +205,10 @@ pub(crate) enum GroupCoreHandling {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct GroupHandlingDecision {
     pub(crate) handling: GroupCoreHandling,
-    /// A reply target is resolved before the event enters the Core queue so
-    /// reply-only messages cannot be downgraded to observation-only ingress.
-    pub(crate) replies_to_agent: bool,
+    /// True only for a locally sampled ambient turn. Quote candidates cross
+    /// ingress first and receive visible permission only after their durable
+    /// target mapping is resolved by the worker.
+    pub(crate) planner_attention_requested: bool,
 }
 
 enum IngressCommand {
@@ -196,7 +227,7 @@ enum IngressCommand {
     DispatchAction {
         user_id: i64,
         action: ProposedAction,
-        acknowledge: oneshot::Sender<Option<ActionResult>>,
+        acknowledge: oneshot::Sender<Result<Option<ActionResult>, IngressCommandError>>,
     },
     BeginDataErasure {
         user_id: i64,
@@ -217,6 +248,92 @@ enum IngressCommand {
         conversation_ids: Vec<ConversationId>,
         acknowledge: oneshot::Sender<anyhow::Result<()>>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct IngressCommandError {
+    message: String,
+    indeterminate: bool,
+}
+
+impl IngressCommandError {
+    fn definite(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            indeterminate: false,
+        }
+    }
+
+    fn indeterminate(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            indeterminate: true,
+        }
+    }
+
+    pub(crate) const fn is_indeterminate(&self) -> bool {
+        self.indeterminate
+    }
+}
+
+impl fmt::Display for IngressCommandError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for IngressCommandError {}
+
+async fn send_ingress_command_with_ack<T>(
+    ingress: &mpsc::Sender<IngressCommand>,
+    command: IngressCommand,
+    acknowledged: oneshot::Receiver<T>,
+    wait: Duration,
+    operation: &'static str,
+) -> Result<T, IngressCommandError> {
+    send_ingress_command_with_ack_timeouts(ingress, command, acknowledged, wait, wait, operation)
+        .await
+}
+
+async fn send_ingress_command_with_ack_timeouts<T>(
+    ingress: &mpsc::Sender<IngressCommand>,
+    command: IngressCommand,
+    acknowledged: oneshot::Receiver<T>,
+    enqueue_wait: Duration,
+    acknowledgement_wait: Duration,
+    operation: &'static str,
+) -> Result<T, IngressCommandError> {
+    // Tokio's bounded `send` is cancellation-safe: an enqueue timeout means
+    // the command was not sent. It also detects a receiver that closes at the
+    // capacity boundary, which `Permit::send` cannot report.
+    match kovi::tokio::time::timeout(enqueue_wait, ingress.send(command)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => {
+            return Err(IngressCommandError::definite(format!(
+                "Yunxi {operation} ingress is closed"
+            )));
+        }
+        Err(_) => {
+            return Err(IngressCommandError::definite(format!(
+                "Yunxi {operation} ingress enqueue timed out after {}ms",
+                enqueue_wait.as_millis()
+            )));
+        }
+    }
+    match kovi::tokio::time::timeout(acknowledgement_wait, acknowledged).await {
+        Ok(Ok(result)) => Ok(result),
+        // The command was already accepted by the bounded ingress queue. A
+        // worker cancellation or crash can happen after a host side effect,
+        // so a lost acknowledgement is never proof that the operation did
+        // not run.
+        Ok(Err(_)) => Err(IngressCommandError::indeterminate(format!(
+            "Yunxi {operation} acknowledgement was dropped after enqueue; outcome may be indeterminate"
+        ))),
+        Err(_) => Err(IngressCommandError::indeterminate(format!(
+            "Yunxi {operation} acknowledgement timed out after {}ms; outcome may be indeterminate",
+            acknowledgement_wait.as_millis()
+        ))),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -730,24 +847,41 @@ impl CoreBridge {
         &self,
         user_id: i64,
         action: ProposedAction,
-    ) -> Option<ActionResult> {
+    ) -> Result<Option<ActionResult>, IngressCommandError> {
         if !valid_qq_id(user_id)
             || self.is_user_blocked(user_id)
             || self.action_arbiter.is_none()
             || self.action_port.is_none()
         {
-            return None;
+            return Ok(None);
         }
         let (acknowledge, acknowledged) = oneshot::channel();
-        self.ingress
-            .send(IngressCommand::DispatchAction {
+        match send_ingress_command_with_ack_timeouts(
+            &self.ingress,
+            IngressCommand::DispatchAction {
                 user_id,
                 action,
                 acknowledge,
-            })
-            .await
-            .ok()?;
-        acknowledged.await.ok().flatten()
+            },
+            acknowledged,
+            CORE_INGRESS_COMMAND_TIMEOUT,
+            CORE_ACTION_ACKNOWLEDGEMENT_TIMEOUT,
+            "action dispatch",
+        )
+        .await
+        {
+            Ok(result) => match result {
+                Ok(result) => Ok(result),
+                Err(error) => {
+                    kovi::log::warn!("{error}");
+                    Err(error)
+                }
+            },
+            Err(error) => {
+                kovi::log::warn!("{error}");
+                Err(error)
+            }
+        }
     }
 
     /// Submit an already-canonical host event directly to the Core runtime.
@@ -797,18 +931,20 @@ impl CoreBridge {
             return Err("Yunxi destination is blocked by a data-erasure barrier".to_string());
         }
         let (acknowledge, acknowledged) = oneshot::channel();
-        self.ingress
-            .send(IngressCommand::ProjectDestination {
+        send_ingress_command_with_ack(
+            &self.ingress,
+            IngressCommand::ProjectDestination {
                 destination,
                 priority,
                 kind,
                 acknowledge,
-            })
-            .await
-            .map_err(|_| "Yunxi ingress is closed".to_string())?;
-        acknowledged
-            .await
-            .map_err(|_| "Yunxi projection acknowledgement was dropped".to_string())?
+            },
+            acknowledged,
+            CORE_INGRESS_COMMAND_TIMEOUT,
+            "destination projection",
+        )
+        .await
+        .map_err(|error| error.to_string())?
     }
 
     #[allow(dead_code)]
@@ -826,20 +962,19 @@ impl CoreBridge {
         self.try_enqueue(message)
     }
 
-    /// Enqueue a visible group event with backpressure. Explicitly addressed
-    /// messages and replies are never discarded just because the bounded
-    /// ingress queue is temporarily full; the host callback waits until the
-    /// ingress worker accepts the event or the channel closes.
+    /// Enqueue a visible group event with bounded backpressure. Explicitly
+    /// addressed messages and reply candidates get a short opportunity to
+    /// wait for ingress capacity without pinning the host callback forever.
     pub(crate) async fn enqueue_group_reliably(
         &self,
         event: &GroupMsgEvent,
         incoming_admission: IncomingAdmission,
-        replies_to_agent: bool,
+        planner_attention_requested: bool,
     ) -> EnqueueOutcome {
-        let Some(mut message) = InboundMessage::from_group(event, true) else {
+        let Some(mut message) = InboundMessage::from_group(event, planner_attention_requested)
+        else {
             return EnqueueOutcome::SkippedInvalid;
         };
-        message.replies_to_agent_hint = replies_to_agent;
         message.incoming_admission = Some(incoming_admission);
         self.send_reliably(message).await
     }
@@ -865,9 +1000,9 @@ impl CoreBridge {
         self.try_enqueue(message)
     }
 
-    /// Enqueue a visible private event with backpressure. The event remains
-    /// owned by Core until the ingress worker receives it or the channel is
-    /// known to be closed.
+    /// Enqueue a visible private event with bounded backpressure. The event
+    /// remains owned by Core until the ingress worker receives it, the channel
+    /// closes, or the bounded wait expires.
     pub(crate) async fn enqueue_private_reliably(
         &self,
         event: &PrivateMsgEvent,
@@ -889,6 +1024,15 @@ impl CoreBridge {
     }
 
     async fn send_reliably(&self, message: InboundMessage) -> EnqueueOutcome {
+        self.send_reliably_with_timeout(message, CORE_RELIABLE_INGRESS_TIMEOUT)
+            .await
+    }
+
+    async fn send_reliably_with_timeout(
+        &self,
+        message: InboundMessage,
+        wait: Duration,
+    ) -> EnqueueOutcome {
         if self.is_user_blocked(message.sender_user_id) || self.address_is_blocked(message.address)
         {
             return EnqueueOutcome::Blocked;
@@ -899,9 +1043,11 @@ impl CoreBridge {
             message.external_message_id,
             message.visible_reply_allowed,
         );
-        match self.ingress.send(IngressCommand::Message(message)).await {
-            Ok(()) => EnqueueOutcome::Accepted,
-            Err(_) => {
+        match kovi::tokio::time::timeout(wait, self.ingress.send(IngressCommand::Message(message)))
+            .await
+        {
+            Ok(Ok(())) => EnqueueOutcome::Accepted,
+            Ok(Err(_)) => {
                 kovi::log::error!(
                     "Yunxi Core reliable ingress closed: address={:?} sender_user_id={} external_message_id={:?} visible_reply_allowed={} action=drop",
                     metadata.0,
@@ -910,6 +1056,17 @@ impl CoreBridge {
                     metadata.3,
                 );
                 EnqueueOutcome::SkippedInvalid
+            }
+            Err(_) => {
+                kovi::log::error!(
+                    "Yunxi Core reliable ingress timed out: address={:?} sender_user_id={} external_message_id={:?} visible_reply_allowed={} wait_ms={} action=drop",
+                    metadata.0,
+                    metadata.1,
+                    metadata.2,
+                    metadata.3,
+                    wait.as_millis(),
+                );
+                EnqueueOutcome::DroppedAtCapacity
             }
         }
     }
@@ -949,21 +1106,19 @@ impl CoreBridge {
             return Ok(0);
         }
         let (acknowledge, acknowledged) = oneshot::channel();
-        self.ingress
-            .send(IngressCommand::FlushMessageCollisions {
+        send_ingress_command_with_ack(
+            &self.ingress,
+            IngressCommand::FlushMessageCollisions {
                 sender_user_id,
                 address,
                 acknowledge,
-            })
-            .await
-            .map_err(|_| {
-                anyhow::anyhow!(
-                    "Yunxi collision flush ingress closed; collision records remain queued"
-                )
-            })?;
-        acknowledged.await.map_err(|_| {
-            anyhow::anyhow!("Yunxi collision flush worker stopped before acknowledgement")
-        })?
+            },
+            acknowledged,
+            CORE_INGRESS_COMMAND_TIMEOUT,
+            "collision flush",
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?
     }
 
     /// Whether this private event is owned by the Core direct-conversation
@@ -988,32 +1143,29 @@ impl CoreBridge {
             && InboundMessage::from_group(event, false).is_some()
     }
 
-    pub(crate) async fn classify_group(&self, event: &GroupMsgEvent) -> GroupHandlingDecision {
+    pub(crate) fn classify_group(&self, event: &GroupMsgEvent) -> GroupHandlingDecision {
         if !self.supports_group(event) {
             return GroupHandlingDecision {
                 handling: GroupCoreHandling::Unsupported,
-                replies_to_agent: false,
+                planner_attention_requested: false,
             };
         }
         let addressed = message_at_self(&event.message, event.self_id)
             || event.borrow_text().is_some_and(text_mentions_agent);
-        let replies_to_agent = !addressed
-            && recent_bot_message(
-                ConversationAddress::Group {
-                    group_id: event.group_id,
-                },
-                reply_message_id(&event.message),
-            )
-            .await;
-        let handling =
-            if addressed || replies_to_agent || self.should_request_ambient_attention(event) {
-                GroupCoreHandling::Decide
-            } else {
-                GroupCoreHandling::Observe
-            };
+        // A syntactically valid reply segment must cross the admission boundary
+        // before any Redis/PostgreSQL lookup. The single ingress worker resolves
+        // whether it actually targets Yunxi once the conversation is canonical.
+        let reply_target_candidate = reply_message_id(&event.message).is_some();
+        let planner_attention_requested =
+            !addressed && !reply_target_candidate && self.should_request_ambient_attention(event);
+        let handling = if addressed || reply_target_candidate || planner_attention_requested {
+            GroupCoreHandling::Decide
+        } else {
+            GroupCoreHandling::Observe
+        };
         GroupHandlingDecision {
             handling,
-            replies_to_agent,
+            planner_attention_requested,
         }
     }
 
@@ -1779,24 +1931,43 @@ async fn run_ingress(
                     }
                     continue;
                 }
-                if let Err(error) = resolve_and_submit_inner(
-                    &message,
-                    store.as_ref(),
-                    &runtime,
-                    &mut references,
-                    model_backend.as_deref(),
-                    message_store.as_deref(),
-                    Some(&mut routes),
+                let result = kovi::tokio::time::timeout(
+                    CORE_INGRESS_PROCESSING_TIMEOUT,
+                    resolve_and_submit_inner(
+                        &message,
+                        store.as_ref(),
+                        &runtime,
+                        &mut references,
+                        model_backend.clone(),
+                        message_store.as_deref(),
+                        Some(&mut routes),
+                    ),
                 )
-                .await
-                {
-                    if let Some(admission) = message.incoming_admission {
-                        crate::model::ConversationCoordinator::abandon_incoming(admission).await;
+                .await;
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        // `resolve_and_submit_inner` owns the admission guard
+                        // for both ordinary errors and cancellation. Do not
+                        // abandon it here: an accepted Core event may already
+                        // own the ticket when a later bookkeeping step fails.
+                        eprintln!(
+                            "[WARN] Yunxi Core message dropped during ingress: sender_user_id={} external_message_id={:?} address={:?} error={error}",
+                            message.sender_user_id, message.external_message_id, message.address,
+                        );
                     }
-                    eprintln!(
-                        "[WARN] Yunxi Core message dropped during identity resolution: sender_user_id={} external_message_id={:?} address={:?} error={error}",
-                        message.sender_user_id, message.external_message_id, message.address,
-                    );
+                    Err(_) => {
+                        // Dropping the timed-out future runs the same guard;
+                        // it also removes a context inserted just before the
+                        // cancellation boundary.
+                        eprintln!(
+                            "[WARN] Yunxi Core message ingress processing timed out after {}ms: sender_user_id={} external_message_id={:?} address={:?}",
+                            CORE_INGRESS_PROCESSING_TIMEOUT.as_millis(),
+                            message.sender_user_id,
+                            message.external_message_id,
+                            message.address,
+                        );
+                    }
                 }
             }
             IngressCommand::ProjectDestination {
@@ -1816,14 +1987,24 @@ async fn run_ingress(
                 let result = if blocked {
                     Err("Yunxi destination is blocked by a data-erasure barrier".to_string())
                 } else {
-                    resolve_projected_destination(
-                        destination,
-                        priority,
-                        kind,
-                        store.as_ref(),
-                        &runtime,
+                    match kovi::tokio::time::timeout(
+                        CORE_INGRESS_PROCESSING_TIMEOUT,
+                        resolve_projected_destination(
+                            destination,
+                            priority,
+                            kind,
+                            store.as_ref(),
+                            &runtime,
+                        ),
                     )
                     .await
+                    {
+                        Ok(result) => result,
+                        Err(_) => Err(format!(
+                            "Yunxi destination projection timed out after {}ms",
+                            CORE_INGRESS_PROCESSING_TIMEOUT.as_millis()
+                        )),
+                    }
                 };
                 let _ = acknowledge.send(result);
             }
@@ -1872,21 +2053,43 @@ async fn run_ingress(
                     yunxi_core::ActionScope::Person(_) | yunxi_core::ActionScope::Global => false,
                 };
                 if blocked_at_ingress.contains(&user_id) || blocked_conversation {
-                    let _ = acknowledge.send(None);
+                    let _ = acknowledge.send(Ok(None));
                     continue;
                 }
                 let result = if let (Some(arbiter), Some(port)) =
                     (action_arbiter.as_deref(), action_port.as_deref())
                 {
-                    let result = arbiter.dispatch(action.clone(), port).await;
+                    let result = dispatch_action_with_timeout(
+                        arbiter,
+                        port,
+                        action.clone(),
+                        CORE_ACTION_DISPATCH_TIMEOUT,
+                    )
+                    .await;
+                    if matches!(
+                        result,
+                        ActionResult::Executed {
+                            outcome: yunxi_core::ActionPortOutcome::DeliveryIndeterminate { .. },
+                            ..
+                        }
+                    ) {
+                        kovi::log::warn!(
+                            "Yunxi action dispatch completed with an indeterminate outcome"
+                        );
+                    }
                     if let Some(event) = action_result_event(&action, &result, Utc::now())
-                        && let Err(error) = runtime.submit(event).await
+                        && let Err(error) = submit_runtime_with_timeout(
+                            &runtime,
+                            event,
+                            CORE_RUNTIME_SUBMIT_TIMEOUT,
+                        )
+                        .await
                     {
                         kovi::log::warn!("Yunxi action result could not enter runtime: {error}");
                     }
-                    Some(result)
+                    Ok(Some(result))
                 } else {
-                    None
+                    Ok(None)
                 };
                 let _ = acknowledge.send(result);
             }
@@ -2047,6 +2250,19 @@ async fn run_ingress(
             }
         }
     }
+}
+
+/// Bound host-side action execution independently from the command
+/// acknowledgement. The arbiter owns cancellation safety for an admitted
+/// idempotency reservation, so dropping this future cannot make a later retry
+/// issue a duplicate platform action.
+async fn dispatch_action_with_timeout(
+    arbiter: &ActionArbiter,
+    port: &dyn ActionPort,
+    action: ProposedAction,
+    wait: Duration,
+) -> ActionResult {
+    arbiter.dispatch_with_timeout(action, port, wait).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2458,6 +2674,61 @@ async fn release_rejected_incoming(
     releaser.discard(message.message_id).await;
 }
 
+/// Cancellation-safe ownership for an admission while the serialized Host
+/// ingress worker resolves identities and constructs the Core event. If the
+/// worker is cancelled by its processing deadline after registering a host
+/// context, remove that context before abandoning the admission.
+struct IngressAdmissionGuard {
+    admission: Option<IncomingAdmission>,
+    model_backend: Option<Arc<super::core_model::KoviModelBackend>>,
+    message_id: MessageId,
+    context_registered: bool,
+}
+
+impl IngressAdmissionGuard {
+    fn new(
+        admission: IncomingAdmission,
+        model_backend: Option<Arc<super::core_model::KoviModelBackend>>,
+        message_id: MessageId,
+    ) -> Self {
+        Self {
+            admission: Some(admission),
+            model_backend,
+            message_id,
+            context_registered: false,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.admission = None;
+    }
+
+    fn mark_context_registered(&mut self) {
+        self.context_registered = true;
+    }
+}
+
+impl Drop for IngressAdmissionGuard {
+    fn drop(&mut self) {
+        let Some(admission) = self.admission.take() else {
+            return;
+        };
+        let model_backend = self
+            .context_registered
+            .then(|| self.model_backend.clone())
+            .flatten();
+        let message_id = self.message_id;
+        if let Ok(runtime) = kovi::tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                if let Some(model_backend) = model_backend {
+                    model_backend.discard_incoming(message_id).await;
+                }
+                crate::model::ConversationCoordinator::abandon_incoming(admission).await;
+            });
+        }
+    }
+}
+
 fn autonomous_tick_conversation_id(event: &WorldEvent) -> Option<ConversationId> {
     matches!(event.kind(), WorldEventKind::AutonomousConversationTick(_))
         .then(|| event.scope().conversation_id())
@@ -2712,7 +2983,11 @@ async fn run_runtime(
                 }
                 Ok(PlannedProcessingOutcome::RejectedEvent { event, .. })
                 | Ok(PlannedProcessingOutcome::RejectedState { event, .. }) => {
-                    release_autonomous_claim_for_event(&event);
+                    // A planner/state rejection can be caused by a transient
+                    // queue or persistence race. Use the same bounded retry
+                    // path as a planner error; an invalid autonomous event
+                    // will still suspend after the retry budget is exhausted.
+                    retry_autonomous_claim_for_event(&event);
                     release_rejected_incoming(&event, incoming_releaser.as_deref()).await;
                     kovi::log::warn!("Yunxi Core planner rejected an event");
                 }
@@ -2724,6 +2999,12 @@ async fn run_runtime(
                             conversation_id,
                         );
                     }
+                    // The runtime has consumed the event even when planning
+                    // fails. Release the exact host admission carried by a
+                    // visible message; otherwise the conversation remains
+                    // permanently marked as active and later replies can be
+                    // suppressed behind a phantom turn.
+                    release_rejected_incoming(&event, incoming_releaser.as_deref()).await;
                     kovi::log::error!("Yunxi Core planner failed before action outcome: {error}")
                 }
             }
@@ -2782,6 +3063,40 @@ async fn resolve_and_submit(
     resolve_and_submit_inner(message, store, runtime, references, None, None, None).await
 }
 
+/// Submit an event while bounding the wait imposed by High/Critical runtime
+/// backpressure. The event is moved into the cancellable future, so a timeout
+/// cannot later enqueue it unexpectedly; callers can therefore release any
+/// host-side admission and report a deterministic drop.
+async fn submit_runtime_with_timeout(
+    runtime: &RuntimeHandle,
+    event: WorldEvent,
+    wait: Duration,
+) -> anyhow::Result<Admission> {
+    let event_id = event.id();
+    let event_scope = event.scope();
+    let event_priority = event.priority();
+    match kovi::tokio::time::timeout(wait, runtime.submit(event)).await {
+        Ok(Ok(admission)) => Ok(admission),
+        Ok(Err(error)) => Err(anyhow::anyhow!(error)),
+        Err(_) => {
+            kovi::log::error!(
+                "Yunxi Core runtime submit timed out: event_id={} scope={:?} priority={:?} wait_ms={} action=drop",
+                event_id,
+                event_scope,
+                event_priority,
+                wait.as_millis(),
+            );
+            Err(anyhow::anyhow!(
+                "Yunxi runtime submit timed out: event_id={} scope={:?} priority={:?} wait_ms={}",
+                event_id,
+                event_scope,
+                event_priority,
+                wait.as_millis(),
+            ))
+        }
+    }
+}
+
 async fn resolve_projected_destination(
     destination: crate::model::MessageDestination,
     priority: EventPriority,
@@ -2807,10 +3122,13 @@ async fn resolve_projected_destination(
             EventScope::Conversation { conversation_id }
         }
     };
-    runtime
-        .submit(WorldEvent::new(Utc::now(), scope, priority, kind))
-        .await
-        .map_err(|error| error.to_string())
+    submit_runtime_with_timeout(
+        runtime,
+        WorldEvent::new(Utc::now(), scope, priority, kind),
+        CORE_RUNTIME_SUBMIT_TIMEOUT,
+    )
+    .await
+    .map_err(|error| error.to_string())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2819,10 +3137,14 @@ async fn resolve_and_submit_inner(
     store: &dyn IdentityStore,
     runtime: &RuntimeHandle,
     references: &mut MessageReferenceCache,
-    model_backend: Option<&super::core_model::KoviModelBackend>,
+    model_backend: Option<Arc<super::core_model::KoviModelBackend>>,
     message_store: Option<&super::identity_store::PostgresIdentityStore>,
     route_tracker: Option<&mut IngressRouteTracker>,
 ) -> anyhow::Result<()> {
+    let message_id = MessageId::new();
+    let mut admission_guard = message
+        .incoming_admission
+        .map(|admission| IngressAdmissionGuard::new(admission, model_backend.clone(), message_id));
     let external_identity = qq::person(message.sender_user_id)?;
     let external_conversation = message.address.external()?;
     let person_id = store
@@ -2861,7 +3183,7 @@ async fn resolve_and_submit_inner(
         }
     }
 
-    if let Some(model_backend) = model_backend {
+    if let Some(model_backend) = model_backend.as_deref() {
         let conversation = match message.address {
             ConversationAddress::Group { group_id } => {
                 super::core_model::QqConversation::Group { group_id }
@@ -2895,6 +3217,9 @@ async fn resolve_and_submit_inner(
         if let Some(admission) = message.incoming_admission {
             crate::model::ConversationCoordinator::abandon_incoming(admission).await;
         }
+        if let Some(guard) = admission_guard.as_mut() {
+            guard.disarm();
+        }
         if let Err(error) = submit_message_collisions(reply_scope, conversation_id, runtime).await {
             kovi::log::warn!("Yunxi message collision event was not admitted: {error}");
         }
@@ -2908,15 +3233,10 @@ async fn resolve_and_submit_inner(
                 external_message_id,
             })
         });
-    let recent_agent_reply = if message.replies_to_agent_hint
-        || reply_reference.is_some_and(|reference| reference.from_agent)
-    {
-        true
-    } else {
-        recent_bot_message(message.address, message.reply_to_external_message_id).await
-    };
+    let recent_agent_reply =
+        resolve_recent_agent_reply(message, conversation_id, reply_reference, message_store).await;
+    let visible_reply_allowed = effective_visible_reply_allowed(message, recent_agent_reply);
 
-    let message_id = MessageId::new();
     let priority = if message.address.kind() == ConversationKind::Direct
         || message.addressed_to_agent
         || recent_agent_reply
@@ -2944,7 +3264,7 @@ async fn resolve_and_submit_inner(
             replies_to_agent: recent_agent_reply,
             stop_requested: message.stop_requested,
             explicit_request: message.explicit_request,
-            visible_reply_allowed: message.visible_reply_allowed,
+            visible_reply_allowed,
         },
     );
     // Persist the external reference before admitting the event. The runtime
@@ -2959,12 +3279,20 @@ async fn resolve_and_submit_inner(
         kovi::log::warn!("Yunxi inbound message mapping could not be persisted: {error}");
     }
     let registered_incoming = if let (Some(model_backend), Some(incoming_admission)) =
-        (model_backend, message.incoming_admission)
+        (model_backend.as_deref(), message.incoming_admission)
     {
         if priority != EventPriority::High {
             crate::model::ConversationCoordinator::abandon_incoming(incoming_admission).await;
+            if let Some(guard) = admission_guard.as_mut() {
+                guard.disarm();
+            }
             false
         } else if incoming_admission.ticket.scope() == reply_scope {
+            if let Some(guard) = admission_guard.as_mut() {
+                // `register_incoming` can be cancelled after inserting the
+                // context while it releases a displaced admission.
+                guard.mark_context_registered();
+            }
             model_backend
                 .register_incoming(
                     message_id,
@@ -2978,11 +3306,17 @@ async fn resolve_and_submit_inner(
                 "Yunxi incoming admission scope does not match the resolved message route"
             );
             crate::model::ConversationCoordinator::abandon_incoming(incoming_admission).await;
+            if let Some(guard) = admission_guard.as_mut() {
+                guard.disarm();
+            }
             false
         }
     } else {
         if let Some(incoming_admission) = message.incoming_admission {
             crate::model::ConversationCoordinator::abandon_incoming(incoming_admission).await;
+            if let Some(guard) = admission_guard.as_mut() {
+                guard.disarm();
+            }
         }
         false
     };
@@ -2997,11 +3331,18 @@ async fn resolve_and_submit_inner(
     let event_id = event.id();
     let event_scope = event.scope();
     let event_priority = event.priority();
-    let admission = match runtime.submit(event).await {
+    let admission = match submit_runtime_with_timeout(runtime, event, CORE_RUNTIME_SUBMIT_TIMEOUT)
+        .await
+    {
         Ok(admission) => admission,
         Err(error) => {
-            if registered_incoming && let Some(model_backend) = model_backend {
-                model_backend.discard_incoming(message_id).await;
+            if registered_incoming {
+                if let Some(model_backend) = model_backend.as_ref() {
+                    model_backend.discard_incoming(message_id).await;
+                }
+                if let Some(guard) = admission_guard.as_mut() {
+                    guard.disarm();
+                }
             }
             kovi::log::error!(
                 "Yunxi Core runtime rejected inbound event: event_id={} message_id={} scope={:?} priority={:?} error={error}",
@@ -3024,9 +3365,18 @@ async fn resolve_and_submit_inner(
     }
     if registered_incoming
         && !matches!(admission, Admission::Accepted)
-        && let Some(model_backend) = model_backend
+        && let Some(model_backend) = model_backend.as_ref()
     {
         model_backend.discard_incoming(message_id).await;
+        if let Some(guard) = admission_guard.as_mut() {
+            guard.disarm();
+        }
+    } else if matches!(admission, Admission::Accepted) {
+        // Core now owns the registered host context and will consume it in the
+        // planner, so cancellation of this ingress future must not abandon it.
+        if let Some(guard) = admission_guard.as_mut() {
+            guard.disarm();
+        }
     }
     if let Err(error) = submit_message_collisions(reply_scope, conversation_id, runtime).await {
         kovi::log::warn!("Yunxi message collision event was not admitted: {error}");
@@ -3069,24 +3419,33 @@ async fn resolve_and_submit_collisions(
     runtime: &RuntimeHandle,
 ) -> anyhow::Result<usize> {
     let external_conversation = address.external()?;
-    let conversation_id = if matches!(address, ConversationAddress::Direct { .. })
-        && let Some(message_store) = message_store
-    {
-        let external_identity = qq::person(sender_user_id)?;
-        let person_id = store
-            .resolve_external_identity(&external_identity)
-            .await
-            .map_err(|error| anyhow::anyhow!(error))?;
-        message_store
-            .resolve_direct_for_person(person_id, &external_conversation)
-            .await
-            .map_err(|error| anyhow::anyhow!(error))?
-    } else {
-        store
-            .resolve_external_conversation(&external_conversation)
-            .await
-            .map_err(|error| anyhow::anyhow!(error))?
-    };
+    let conversation_id = kovi::tokio::time::timeout(CORE_INGRESS_PROCESSING_TIMEOUT, async {
+        if matches!(address, ConversationAddress::Direct { .. })
+            && let Some(message_store) = message_store
+        {
+            let external_identity = qq::person(sender_user_id)?;
+            let person_id = store
+                .resolve_external_identity(&external_identity)
+                .await
+                .map_err(|error| anyhow::anyhow!(error))?;
+            message_store
+                .resolve_direct_for_person(person_id, &external_conversation)
+                .await
+                .map_err(|error| anyhow::anyhow!(error))
+        } else {
+            store
+                .resolve_external_conversation(&external_conversation)
+                .await
+                .map_err(|error| anyhow::anyhow!(error))
+        }
+    })
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "Yunxi collision conversation lookup timed out after {}ms",
+            CORE_INGRESS_PROCESSING_TIMEOUT.as_millis()
+        )
+    })??;
     submit_message_collisions(address.reply_scope(), conversation_id, runtime).await
 }
 
@@ -3127,7 +3486,9 @@ async fn submit_message_collisions(
                 }
             }
         }
-        let admission = runtime.submit(collision_event).await;
+        let admission =
+            submit_runtime_with_timeout(runtime, collision_event, CORE_RUNTIME_SUBMIT_TIMEOUT)
+                .await;
         if !matches!(admission, Ok(Admission::Accepted)) {
             let remaining = std::iter::once(collision)
                 .chain(pending)
@@ -3140,7 +3501,7 @@ async fn submit_message_collisions(
                 );
             }
             return match admission {
-                Err(error) => Err(anyhow::anyhow!(error)),
+                Err(error) => Err(error),
                 Ok(Admission::DroppedAtCapacity) => Err(anyhow::anyhow!(
                     "Yunxi runtime dropped a collision at capacity"
                 )),
@@ -3160,6 +3521,83 @@ async fn recent_bot_message(
         return false;
     };
     is_recent_bot_message(address.reply_scope(), message_id).await
+}
+
+/// Resolve a quote after it has crossed ingress admission. Durable outbound
+/// mappings survive Redis restarts and are checked first; the short-lived
+/// recall cache remains useful for legacy sends that predate the mapping.
+///
+/// A storage timeout/error is deliberately fail-open for a syntactically valid
+/// quote. The message is already a bounded, visible Core candidate, and losing
+/// it solely because a side-channel is unhealthy is the failure mode this
+/// bridge is intended to avoid.
+async fn resolve_recent_agent_reply(
+    message: &InboundMessage,
+    conversation_id: ConversationId,
+    reply_reference: Option<MessageReference>,
+    message_store: Option<&super::identity_store::PostgresIdentityStore>,
+) -> bool {
+    if message.replies_to_agent_hint
+        || reply_reference.is_some_and(|reference| reference.from_agent)
+    {
+        return true;
+    }
+    let Some(external_message_id) = message.reply_to_external_message_id else {
+        return false;
+    };
+
+    if let Some(message_store) = message_store {
+        match kovi::tokio::time::timeout(
+            CORE_REPLY_MAPPING_TIMEOUT,
+            message_store.qq_outbound_message_exists(conversation_id, external_message_id),
+        )
+        .await
+        {
+            Ok(Ok(true)) => return true,
+            Ok(Ok(false)) => {}
+            Ok(Err(error)) => {
+                kovi::log::warn!(
+                    "Yunxi durable reply mapping lookup failed; treating quote as a Core reply candidate: {error}"
+                );
+                return true;
+            }
+            Err(_) => {
+                kovi::log::warn!(
+                    "Yunxi durable reply mapping lookup timed out; treating quote as a Core reply candidate"
+                );
+                return true;
+            }
+        }
+    }
+
+    match kovi::tokio::time::timeout(
+        CORE_REPLY_MAPPING_TIMEOUT,
+        recent_bot_message(message.address, Some(external_message_id)),
+    )
+    .await
+    {
+        Ok(found) => found,
+        Err(_) => {
+            kovi::log::warn!(
+                "Yunxi Redis reply mapping lookup timed out; retaining the admitted Core candidate"
+            );
+            false
+        }
+    }
+}
+
+/// A group quote is only a visible turn after the worker proves that it
+/// targets Yunxi (or deliberately fails open on a mapping outage). This keeps
+/// replies to other members from bypassing the ambient-attention sampler just
+/// because they carried a syntactically valid OneBot `reply` segment.
+fn effective_visible_reply_allowed(message: &InboundMessage, recent_agent_reply: bool) -> bool {
+    message.visible_reply_allowed
+        && (message.address.kind() == ConversationKind::Direct
+            || message.addressed_to_agent
+            || recent_agent_reply
+            || message.stop_requested
+            || message.explicit_request
+            || message.planner_attention_requested)
 }
 
 fn valid_qq_id(value: i64) -> bool {
@@ -3225,11 +3663,16 @@ fn core_chat_payload_is_supported(message: &Message, text: Option<&str>, group: 
         .iter()
         .filter(|segment| segment.type_ == "image")
         .count();
+    let reply_segments = message
+        .iter()
+        .filter(|segment| segment.type_ == "reply")
+        .count();
     let segments_supported = message.iter().all(|segment| {
-        matches!(segment.type_.as_str(), "text" | "image") || (group && segment.type_ == "at")
+        matches!(segment.type_.as_str(), "text" | "image" | "reply")
+            || (group && segment.type_ == "at")
     });
     segments_supported
-        && (!text.is_empty() || image_segments > 0)
+        && (!text.is_empty() || image_segments > 0 || reply_segments > 0)
         && !text.starts_with('#')
         && crate::vision::image_segments_are_resolvable(message)
 }
@@ -3302,10 +3745,12 @@ mod tests {
         MessageReference, MessageReferenceCache, MessageReferenceKey,
         acquire_alias_handler_barriers, action_result_event, ambient_group_payload_can_be_sampled,
         block_user_aliases, bounded_text, core_cutover_enabled_from_value,
-        core_group_payload_is_supported, core_private_payload_is_supported, idle_tick_event,
+        core_group_payload_is_supported, core_private_payload_is_supported,
+        dispatch_action_with_timeout, effective_visible_reply_allowed, idle_tick_event,
         merge_data_erasure_targets, message_at_self, normalize_attachments, reply_message_id,
-        resolve_and_submit, run_ingress, run_runtime, submit_message_collisions,
-        text_mentions_agent, unblock_users,
+        resolve_and_submit, run_ingress, run_runtime, send_ingress_command_with_ack,
+        send_ingress_command_with_ack_timeouts, submit_message_collisions,
+        submit_runtime_with_timeout, text_mentions_agent, unblock_users,
     };
     use crate::model::{
         OutgoingSource, ReplyScope, commit_outgoing, interrupt, mark_active, mark_outgoing_sent,
@@ -3379,6 +3824,57 @@ mod tests {
         }
     }
 
+    #[test]
+    fn action_dispatch_timeout_releases_the_worker_without_permitting_replay() {
+        let runtime = kovi::tokio::runtime::Runtime::new().expect("test runtime");
+        runtime.block_on(async {
+            let conversation_id = ConversationId::new();
+            let arbiter = ActionArbiter::new(
+                ActionArbiterConfig::default().with_capabilities(EnvironmentCapabilities::all()),
+            );
+            let port = BlockingActionPort {
+                conversation_id,
+                calls: AtomicUsize::new(0),
+                entered: Notify::new(),
+                release: Notify::new(),
+            };
+            let action =
+                ProposedAction::send_message(conversation_id, MessageContent::text("timeout"))
+                    .expect("valid action");
+            let entered = &port.entered;
+            let action_id = action.action_id().expect("action id");
+            let dispatch = dispatch_action_with_timeout(
+                &arbiter,
+                &port,
+                action.clone(),
+                StdDuration::from_millis(10),
+            );
+            let (result, _) = kovi::tokio::join!(dispatch, entered.notified());
+            assert!(matches!(
+                result,
+                ActionResult::Executed {
+                    outcome: ActionPortOutcome::DeliveryIndeterminate { .. },
+                    ..
+                }
+            ));
+            let replay_port = BlockingActionPort {
+                conversation_id,
+                calls: AtomicUsize::new(0),
+                entered: Notify::new(),
+                release: Notify::new(),
+            };
+            assert!(matches!(
+                arbiter.dispatch(action, &replay_port).await,
+                ActionResult::Rejected(ActionRejection::Duplicate {
+                    original_action_id,
+                    ..
+                }) if original_action_id == action_id
+            ));
+            assert_eq!(port.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(replay_port.calls.load(Ordering::SeqCst), 0);
+        });
+    }
+
     impl IdentityStore for FailingIdentityStore {
         fn resolve_external_identity<'a>(
             &'a self,
@@ -3445,6 +3941,21 @@ mod tests {
             planner_attention_requested: addressed_to_agent,
             incoming_admission: None,
         }
+    }
+
+    #[test]
+    fn quote_candidate_requires_an_agent_mapping_before_visible_reply() {
+        let mut message = inbound(ConversationAddress::Group { group_id: 123 }, false);
+        message.reply_to_external_message_id = Some(456);
+
+        assert!(!effective_visible_reply_allowed(&message, false));
+        assert!(effective_visible_reply_allowed(&message, true));
+
+        message.planner_attention_requested = true;
+        assert!(effective_visible_reply_allowed(&message, false));
+
+        message.visible_reply_allowed = false;
+        assert!(!effective_visible_reply_allowed(&message, true));
     }
 
     #[test]
@@ -3550,6 +4061,19 @@ mod tests {
             json!({"file_unique": "image-hash", "file": "image.png"}),
         )]);
         assert!(core_group_payload_is_supported(&ambient, None));
+
+        let reply_with_text = Message::from(vec![
+            Segment::new("reply", json!({"id": "12345"})),
+            Segment::new("text", json!({"text": "接着说"})),
+        ]);
+        assert!(core_group_payload_is_supported(
+            &reply_with_text,
+            Some("接着说")
+        ));
+
+        let reply_only = Message::from(vec![Segment::new("reply", json!({"id": "12345"}))]);
+        assert!(core_group_payload_is_supported(&reply_only, None));
+        assert!(core_private_payload_is_supported(&reply_only, None));
     }
 
     #[test]
@@ -3704,6 +4228,128 @@ mod tests {
                 receiver.recv().await.is_some(),
                 "waiting message should arrive"
             );
+        });
+    }
+
+    #[test]
+    fn reliable_ingress_times_out_when_capacity_never_returns() {
+        let runtime = kovi::tokio::runtime::Runtime::new().expect("test runtime");
+        runtime.block_on(async {
+            let (ingress, _receiver) = mpsc::channel(1);
+            let (runtime_handle, _consumer) =
+                yunxi_core::CognitiveRuntime::new(RuntimeConfig::default()).expect("valid runtime");
+            let bridge = CoreBridge {
+                ingress,
+                runtime: runtime_handle,
+                action_arbiter: None,
+                action_port: None,
+                blocked_users: Arc::new(StdMutex::new(HashSet::new())),
+                blocked_groups: Arc::new(StdMutex::new(HashSet::new())),
+                private_handler_gates: Arc::new(super::PrivateHandlerGateRegistry::new(4)),
+                group_handler_gates: Arc::new(super::PrivateHandlerGateRegistry::new(4)),
+                ambient_attention: Arc::new(StdMutex::new(super::AmbientAttentionRegistry::new())),
+            };
+            assert_eq!(
+                bridge.try_enqueue(inbound(ConversationAddress::Group { group_id: 123 }, true)),
+                EnqueueOutcome::Accepted
+            );
+            let started = std::time::Instant::now();
+            let outcome = bridge
+                .send_reliably_with_timeout(
+                    inbound(ConversationAddress::Group { group_id: 123 }, true),
+                    StdDuration::from_millis(10),
+                )
+                .await;
+            assert_eq!(outcome, EnqueueOutcome::DroppedAtCapacity);
+            assert!(started.elapsed() < StdDuration::from_secs(1));
+        });
+    }
+
+    #[test]
+    fn acknowledged_ingress_commands_bound_enqueue_and_worker_waits() {
+        let runtime = kovi::tokio::runtime::Runtime::new().expect("test runtime");
+        runtime.block_on(async {
+            let (full_ingress, mut full_receiver) = mpsc::channel(1);
+            full_ingress
+                .send(super::IngressCommand::Message(inbound(
+                    ConversationAddress::Group { group_id: 123 },
+                    false,
+                )))
+                .await
+                .expect("fill ingress queue");
+            let (acknowledge, acknowledged) = kovi::tokio::sync::oneshot::channel();
+            let enqueue_error = send_ingress_command_with_ack(
+                &full_ingress,
+                super::IngressCommand::ProjectDestination {
+                    destination: crate::model::MessageDestination::Group(123),
+                    priority: EventPriority::Normal,
+                    kind: yunxi_core::WorldEventKind::HostStarted,
+                    acknowledge,
+                },
+                acknowledged,
+                StdDuration::from_millis(10),
+                "test projection",
+            )
+            .await
+            .expect_err("full ingress queue must time out");
+            assert!(enqueue_error.to_string().contains("enqueue timed out"));
+            assert!(matches!(
+                full_receiver.recv().await,
+                Some(super::IngressCommand::Message(_))
+            ));
+            assert!(full_receiver.try_recv().is_err());
+
+            let (idle_ingress, _idle_receiver) = mpsc::channel(1);
+            let (acknowledge, acknowledged) = kovi::tokio::sync::oneshot::channel();
+            let acknowledgement_error = send_ingress_command_with_ack_timeouts(
+                &idle_ingress,
+                super::IngressCommand::ProjectDestination {
+                    destination: crate::model::MessageDestination::Group(123),
+                    priority: EventPriority::Normal,
+                    kind: yunxi_core::WorldEventKind::HostStarted,
+                    acknowledge,
+                },
+                acknowledged,
+                StdDuration::from_secs(1),
+                StdDuration::from_millis(10),
+                "test projection",
+            )
+            .await
+            .expect_err("stalled ingress worker must time out");
+            assert!(
+                acknowledgement_error
+                    .to_string()
+                    .contains("outcome may be indeterminate")
+            );
+        });
+    }
+
+    #[test]
+    fn high_priority_runtime_submit_times_out_when_runtime_queue_is_full() {
+        let runtime = kovi::tokio::runtime::Runtime::new().expect("test runtime");
+        runtime.block_on(async {
+            let (handle, _core_runtime) = yunxi_core::CognitiveRuntime::new(RuntimeConfig {
+                event_queue_capacity: 1,
+                ..RuntimeConfig::default()
+            })
+            .expect("valid runtime");
+            let first = WorldEvent::new(
+                Utc::now(),
+                yunxi_core::EventScope::Global,
+                EventPriority::High,
+                yunxi_core::WorldEventKind::HostStarted,
+            );
+            assert_eq!(handle.submit(first).await, Ok(Admission::Accepted));
+            let second = WorldEvent::new(
+                Utc::now(),
+                yunxi_core::EventScope::Global,
+                EventPriority::High,
+                yunxi_core::WorldEventKind::HostStarted,
+            );
+            let error = submit_runtime_with_timeout(&handle, second, StdDuration::from_millis(10))
+                .await
+                .expect_err("full high-priority queue should time out");
+            assert!(error.to_string().contains("timed out"));
         });
     }
 
@@ -4435,7 +5081,7 @@ mod tests {
             port.release.notify_one();
             assert!(matches!(
                 dispatch.await.expect("dispatch task"),
-                Some(ActionResult::Executed { .. })
+                Ok(Some(ActionResult::Executed { .. }))
             ));
             let erasure = begin
                 .await
@@ -4450,7 +5096,7 @@ mod tests {
                 bridge
                     .dispatch_action(user_id, blocked_action)
                     .await
-                    .is_none()
+                    .is_ok_and(|result| result.is_none())
             );
             assert_eq!(port.calls.load(Ordering::SeqCst), 1);
 

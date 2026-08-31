@@ -1328,6 +1328,30 @@ impl PostgresIdentityStore {
         .map_err(IdentityStoreError::storage)
     }
 
+    /// Return whether a QQ message id was durably emitted by Yunxi in this
+    /// conversation. Unlike the Redis recall window, this survives process and
+    /// cache restarts and can therefore classify a late quote reliably.
+    pub(crate) async fn qq_outbound_message_exists(
+        &self,
+        conversation_id: ConversationId,
+        external_message_id: i64,
+    ) -> Result<bool, IdentityStoreError> {
+        query_scalar::<Postgres, bool>(
+            "SELECT EXISTS (
+                 SELECT 1 FROM yunxi_message_mappings
+                 WHERE conversation_id = $1
+                   AND platform = 'qq'
+                   AND external_message_id = $2
+                   AND direction = 'outbound'
+             )",
+        )
+        .bind(conversation_id.into_uuid())
+        .bind(external_message_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(IdentityStoreError::storage)
+    }
+
     pub(crate) async fn initialize_schema(&self) -> anyhow::Result<()> {
         let mut transaction = self.pool.begin().await?;
         super::schema::lock(&mut transaction).await?;

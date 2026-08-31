@@ -50,6 +50,11 @@ const MAX_TOOL_OPERATION_BYTES: usize = 1_024;
 const MAX_TOOL_ERROR_CATEGORY_BYTES: usize = 256;
 const INITIAL_TOOL_BATCH_FIELD_CHARS: usize = 1_024;
 const DEFAULT_MIND_SNAPSHOT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(75);
+/// Host actions are an external I/O boundary. Keep one stuck adapter from
+/// freezing the runtime worker and every later conversation turn. This budget
+/// must still leave room for the adapter's bounded queue/response waits and
+/// durable delivery bookkeeping to report their own terminal outcome.
+const DEFAULT_ACTION_DISPATCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 pub const MAX_DATA_ERASURE_CONVERSATIONS: usize = 256;
 pub const MAX_BLOCKED_DATA_ERASURE_PEOPLE: usize = 256;
 pub const MAX_BLOCKED_DATA_ERASURE_CONVERSATIONS: usize = 4_096;
@@ -1172,7 +1177,9 @@ impl CognitiveRuntime {
             if selected_action.is_none() && !matches!(&proposed, crate::ProposedAction::Noop) {
                 selected_action = Some(proposed.clone());
             }
-            let result = arbiter.dispatch(proposed.clone(), port).await;
+            let result = arbiter
+                .dispatch_with_timeout(proposed.clone(), port, DEFAULT_ACTION_DISPATCH_TIMEOUT)
+                .await;
             if matches!(
                 &result,
                 ActionResult::Rejected(rejection)
