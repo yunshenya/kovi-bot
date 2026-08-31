@@ -23,13 +23,13 @@ env:
   KOVI_ALLOWED_FRIENDS: ${{ vars.KOVI_ALLOWED_FRIENDS }}
   # Keep the production group allowlist empty unless it is explicitly configured.
   KOVI_ALLOWED_GROUPS: ${{ vars.KOVI_ALLOWED_GROUPS || '' }}
-  MODEL_API_URL: ${{ vars.MODEL_API_URL || 'https://codex666ai.com' }}
-  MODEL_NAME: ${{ vars.MODEL_NAME || 'gpt-5.5' }}
-  MODEL_WIRE_API: ${{ vars.MODEL_WIRE_API || 'responses' }}
-  MODEL_SUPPORTS_VISION: ${{ vars.MODEL_SUPPORTS_VISION || 'true' }}
-  MODEL_API_KEY_ENV: ${{ vars.MODEL_API_KEY_ENV || 'OPENAI_API_KEY' }}
+  MODEL_API_URL: ${{ vars.MODEL_API_URL || 'https://api.deepseek.com' }}
+  MODEL_NAME: ${{ vars.MODEL_NAME || 'deepseek-chat' }}
+  MODEL_WIRE_API: ${{ vars.MODEL_WIRE_API || 'chat_completions' }}
+  MODEL_SUPPORTS_VISION: ${{ vars.MODEL_SUPPORTS_VISION || 'false' }}
+  MODEL_API_KEY_ENV: ${{ vars.MODEL_API_KEY_ENV || 'BOT_API_TOKEN' }}
   MODEL_REQUIRES_AUTH: ${{ vars.MODEL_REQUIRES_AUTH || 'true' }}
-  MODEL_ACTOR_AUTHORIZATION: ${{ vars.MODEL_ACTOR_AUTHORIZATION || 'local-image-extension' }}
+  MODEL_ACTOR_AUTHORIZATION: ${{ vars.MODEL_ACTOR_AUTHORIZATION || '' }}
   DEPLOY_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
 
 jobs:
@@ -157,7 +157,6 @@ jobs:
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           BOT_API_TOKEN: ${{ secrets.BOT_API_TOKEN }}
-          MODEL_ACTOR_AUTHORIZATION: ${{ secrets.MODEL_ACTOR_AUTHORIZATION || vars.MODEL_ACTOR_AUTHORIZATION || 'local-image-extension' }}
           VISION_API_TOKEN: ${{ secrets.VISION_API_TOKEN }}
           VISION_ACTOR_AUTHORIZATION: ${{ secrets.VISION_ACTOR_AUTHORIZATION }}
           NAPCAT_ACCESS_TOKEN: ${{ secrets.NAPCAT_ACCESS_TOKEN }}
