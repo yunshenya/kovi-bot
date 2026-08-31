@@ -208,6 +208,7 @@ where
 /// An already-generating reply cannot safely share its ticket with a Core
 /// planner turn; Host's existing semantic queue is the single-owner path for
 /// that case. Core still receives an observation from the Host branch.
+#[cfg_attr(not(test), allow(dead_code))]
 async fn select_message_owner_with_admission_policy<
     Interrupt,
     InterruptFuture,
@@ -236,6 +237,83 @@ where
         | yunxi::bridge::EnqueueOutcome::SkippedInvalid => MessageOwner::Dropped,
     };
     (owner, admission)
+}
+
+/// Select an owner for a visible event whose Core ingress may wait for
+/// capacity. Observation-only traffic deliberately keeps the synchronous
+/// selector above; a message that is expected to receive a reply must not be
+/// discarded merely because the bounded bridge queue is temporarily full.
+async fn select_message_owner_with_async_admission_policy<
+    Interrupt,
+    InterruptFuture,
+    HostPolicy,
+    Enqueue,
+    EnqueueFuture,
+>(
+    core_supports_event: bool,
+    interrupt_core: Interrupt,
+    host_policy: HostPolicy,
+    enqueue_core: Enqueue,
+) -> (MessageOwner, crate::model::IncomingAdmission)
+where
+    Interrupt: FnOnce() -> InterruptFuture,
+    InterruptFuture: std::future::Future<Output = crate::model::IncomingAdmission>,
+    HostPolicy: FnOnce(&crate::model::IncomingAdmission) -> bool,
+    Enqueue: FnOnce(&crate::model::IncomingAdmission) -> EnqueueFuture,
+    EnqueueFuture: std::future::Future<Output = yunxi::bridge::EnqueueOutcome>,
+{
+    let mut admission_guard = IncomingAdmissionGuard::new(interrupt_core().await);
+    if !core_supports_event || host_policy(&admission_guard.admission()) {
+        return (MessageOwner::Host, admission_guard.take());
+    }
+
+    let owner = match enqueue_core(&admission_guard.admission()).await {
+        yunxi::bridge::EnqueueOutcome::Accepted => MessageOwner::Core,
+        yunxi::bridge::EnqueueOutcome::DroppedAtCapacity
+        | yunxi::bridge::EnqueueOutcome::Blocked
+        | yunxi::bridge::EnqueueOutcome::SkippedInvalid => MessageOwner::Dropped,
+    };
+    let admission = admission_guard.take();
+    (owner, admission)
+}
+
+/// An async queue send can be cancelled by the host during shutdown. Keep the
+/// conversation reservation recoverable in that case instead of leaking it
+/// behind a permanently active reply ticket.
+struct IncomingAdmissionGuard {
+    admission: Option<crate::model::IncomingAdmission>,
+}
+
+impl IncomingAdmissionGuard {
+    fn new(admission: crate::model::IncomingAdmission) -> Self {
+        Self {
+            admission: Some(admission),
+        }
+    }
+
+    fn admission(&self) -> crate::model::IncomingAdmission {
+        self.admission
+            .expect("an armed incoming admission guard must carry its admission")
+    }
+
+    fn take(&mut self) -> crate::model::IncomingAdmission {
+        self.admission
+            .take()
+            .expect("an armed incoming admission guard must carry its admission")
+    }
+}
+
+impl Drop for IncomingAdmissionGuard {
+    fn drop(&mut self) {
+        let Some(admission) = self.admission.take() else {
+            return;
+        };
+        if let Ok(runtime) = kovi::tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                ConversationCoordinator::abandon_incoming(admission).await;
+            });
+        }
+    }
 }
 
 /// 插件主入口函数
@@ -388,16 +466,17 @@ async fn main() {
                 );
                 return;
             }
-            let core_handling = bridge.classify_group(&event);
-            if core_handling == yunxi::bridge::GroupCoreHandling::Observe {
+            let group_decision = bridge.classify_group(&event).await;
+            if group_decision.handling == yunxi::bridge::GroupCoreHandling::Observe {
                 if !bridge.is_user_blocked(event.user_id) {
                     // No reply admission exists for this background turn.
                     let _ = bridge.enqueue_group_observation(&ingress_event);
                 }
                 return;
             }
-            let core_supports_event = core_handling == yunxi::bridge::GroupCoreHandling::Decide;
-            let (owner, admission) = select_message_owner_with_admission_policy(
+            let core_supports_event =
+                group_decision.handling == yunxi::bridge::GroupCoreHandling::Decide;
+            let (owner, admission) = select_message_owner_with_async_admission_policy(
                 core_supports_event,
                 || async move {
                     ConversationCoordinator::begin_incoming(crate::model::ReplyScope::Group(
@@ -406,7 +485,13 @@ async fn main() {
                     .await
                 },
                 |admission| admission.active_reply_preserved,
-                |admission| bridge.enqueue_group(&ingress_event, *admission),
+                |admission| {
+                    bridge.enqueue_group_reliably(
+                        &ingress_event,
+                        *admission,
+                        group_decision.replies_to_agent,
+                    )
+                },
             )
             .await;
             if owner == MessageOwner::Host {
@@ -425,6 +510,12 @@ async fn main() {
                 // still owns the admission in that race and must release it.
                 ConversationCoordinator::abandon_incoming(admission).await;
             } else if owner == MessageOwner::Dropped {
+                kovi::log::error!(
+                    "Yunxi Core visible group event was not admitted: group_id={} user_id={} message_id={} action=drop",
+                    group_id,
+                    event.user_id,
+                    event.message_id,
+                );
                 ConversationCoordinator::abandon_incoming(admission).await;
             }
         }
@@ -482,7 +573,7 @@ async fn main() {
                 println!("[INFO] 私聊数据删除屏障期间丢弃入站 (用户: {user_id})");
                 return;
             }
-            let (owner, admission) = select_message_owner_with_admission_policy(
+            let (owner, admission) = select_message_owner_with_async_admission_policy(
                 core_supports_event,
                 || async move {
                     ConversationCoordinator::begin_incoming(crate::model::ReplyScope::Private(
@@ -491,7 +582,7 @@ async fn main() {
                     .await
                 },
                 |admission| admission.active_reply_preserved,
-                |admission| bridge.enqueue_private(&event, *admission),
+                |admission| bridge.enqueue_private_reliably(&event, *admission),
             )
             .await;
             if owner == MessageOwner::Host {
@@ -508,6 +599,11 @@ async fn main() {
                 // owner selection; the reservation cannot be left to expire.
                 ConversationCoordinator::abandon_incoming(admission).await;
             } else if owner == MessageOwner::Dropped {
+                kovi::log::error!(
+                    "Yunxi Core visible private event was not admitted: user_id={} message_id={} action=drop",
+                    user_id,
+                    event.message_id,
+                );
                 ConversationCoordinator::abandon_incoming(admission).await;
             }
         }

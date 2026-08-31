@@ -172,6 +172,14 @@ pub(crate) enum GroupCoreHandling {
     Decide,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GroupHandlingDecision {
+    pub(crate) handling: GroupCoreHandling,
+    /// A reply target is resolved before the event enters the Core queue so
+    /// reply-only messages cannot be downgraded to observation-only ingress.
+    pub(crate) replies_to_agent: bool,
+}
+
 enum IngressCommand {
     Message(InboundMessage),
     ProjectDestination {
@@ -803,16 +811,37 @@ impl CoreBridge {
             .map_err(|_| "Yunxi projection acknowledgement was dropped".to_string())?
     }
 
+    #[allow(dead_code)]
     pub(crate) fn enqueue_group(
         &self,
         event: &GroupMsgEvent,
         incoming_admission: IncomingAdmission,
+        replies_to_agent: bool,
     ) -> EnqueueOutcome {
         let Some(mut message) = InboundMessage::from_group(event, true) else {
             return EnqueueOutcome::SkippedInvalid;
         };
+        message.replies_to_agent_hint = replies_to_agent;
         message.incoming_admission = Some(incoming_admission);
         self.try_enqueue(message)
+    }
+
+    /// Enqueue a visible group event with backpressure. Explicitly addressed
+    /// messages and replies are never discarded just because the bounded
+    /// ingress queue is temporarily full; the host callback waits until the
+    /// ingress worker accepts the event or the channel closes.
+    pub(crate) async fn enqueue_group_reliably(
+        &self,
+        event: &GroupMsgEvent,
+        incoming_admission: IncomingAdmission,
+        replies_to_agent: bool,
+    ) -> EnqueueOutcome {
+        let Some(mut message) = InboundMessage::from_group(event, true) else {
+            return EnqueueOutcome::SkippedInvalid;
+        };
+        message.replies_to_agent_hint = replies_to_agent;
+        message.incoming_admission = Some(incoming_admission);
+        self.send_reliably(message).await
     }
 
     pub(crate) fn enqueue_group_observation(&self, event: &GroupMsgEvent) -> EnqueueOutcome {
@@ -823,6 +852,7 @@ impl CoreBridge {
         self.try_enqueue(message)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn enqueue_private(
         &self,
         event: &PrivateMsgEvent,
@@ -835,12 +865,53 @@ impl CoreBridge {
         self.try_enqueue(message)
     }
 
+    /// Enqueue a visible private event with backpressure. The event remains
+    /// owned by Core until the ingress worker receives it or the channel is
+    /// known to be closed.
+    pub(crate) async fn enqueue_private_reliably(
+        &self,
+        event: &PrivateMsgEvent,
+        incoming_admission: IncomingAdmission,
+    ) -> EnqueueOutcome {
+        let Some(mut message) = InboundMessage::from_private(event) else {
+            return EnqueueOutcome::SkippedInvalid;
+        };
+        message.incoming_admission = Some(incoming_admission);
+        self.send_reliably(message).await
+    }
+
     pub(crate) fn enqueue_private_observation(&self, event: &PrivateMsgEvent) -> EnqueueOutcome {
         let Some(mut message) = InboundMessage::from_private(event) else {
             return EnqueueOutcome::SkippedInvalid;
         };
         message.visible_reply_allowed = false;
         self.try_enqueue(message)
+    }
+
+    async fn send_reliably(&self, message: InboundMessage) -> EnqueueOutcome {
+        if self.is_user_blocked(message.sender_user_id) || self.address_is_blocked(message.address)
+        {
+            return EnqueueOutcome::Blocked;
+        }
+        let metadata = (
+            message.address,
+            message.sender_user_id,
+            message.external_message_id,
+            message.visible_reply_allowed,
+        );
+        match self.ingress.send(IngressCommand::Message(message)).await {
+            Ok(()) => EnqueueOutcome::Accepted,
+            Err(_) => {
+                kovi::log::error!(
+                    "Yunxi Core reliable ingress closed: address={:?} sender_user_id={} external_message_id={:?} visible_reply_allowed={} action=drop",
+                    metadata.0,
+                    metadata.1,
+                    metadata.2,
+                    metadata.3,
+                );
+                EnqueueOutcome::SkippedInvalid
+            }
+        }
     }
 
     /// Reliably flush collision records for a Host-owned group event. Unlike
@@ -917,16 +988,32 @@ impl CoreBridge {
             && InboundMessage::from_group(event, false).is_some()
     }
 
-    pub(crate) fn classify_group(&self, event: &GroupMsgEvent) -> GroupCoreHandling {
+    pub(crate) async fn classify_group(&self, event: &GroupMsgEvent) -> GroupHandlingDecision {
         if !self.supports_group(event) {
-            return GroupCoreHandling::Unsupported;
+            return GroupHandlingDecision {
+                handling: GroupCoreHandling::Unsupported,
+                replies_to_agent: false,
+            };
         }
         let addressed = message_at_self(&event.message, event.self_id)
             || event.borrow_text().is_some_and(text_mentions_agent);
-        if addressed || self.should_request_ambient_attention(event) {
-            GroupCoreHandling::Decide
-        } else {
-            GroupCoreHandling::Observe
+        let replies_to_agent = !addressed
+            && recent_bot_message(
+                ConversationAddress::Group {
+                    group_id: event.group_id,
+                },
+                reply_message_id(&event.message),
+            )
+            .await;
+        let handling =
+            if addressed || replies_to_agent || self.should_request_ambient_attention(event) {
+                GroupCoreHandling::Decide
+            } else {
+                GroupCoreHandling::Observe
+            };
+        GroupHandlingDecision {
+            handling,
+            replies_to_agent,
         }
     }
 
@@ -967,12 +1054,43 @@ impl CoreBridge {
     fn try_enqueue(&self, message: InboundMessage) -> EnqueueOutcome {
         if self.is_user_blocked(message.sender_user_id) || self.address_is_blocked(message.address)
         {
+            kovi::log::debug!(
+                "Yunxi Core ingress blocked: address={:?} sender_user_id={} external_message_id={:?} visible_reply_allowed={}",
+                message.address,
+                message.sender_user_id,
+                message.external_message_id,
+                message.visible_reply_allowed,
+            );
             return EnqueueOutcome::Blocked;
         }
+        let metadata = (
+            message.address,
+            message.sender_user_id,
+            message.external_message_id,
+            message.visible_reply_allowed,
+        );
         match self.ingress.try_send(IngressCommand::Message(message)) {
             Ok(()) => EnqueueOutcome::Accepted,
-            Err(mpsc::error::TrySendError::Full(_)) => EnqueueOutcome::DroppedAtCapacity,
-            Err(mpsc::error::TrySendError::Closed(_)) => EnqueueOutcome::SkippedInvalid,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                kovi::log::warn!(
+                    "Yunxi Core ingress queue full: address={:?} sender_user_id={} external_message_id={:?} visible_reply_allowed={} action=drop",
+                    metadata.0,
+                    metadata.1,
+                    metadata.2,
+                    metadata.3,
+                );
+                EnqueueOutcome::DroppedAtCapacity
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                kovi::log::error!(
+                    "Yunxi Core ingress closed: address={:?} sender_user_id={} external_message_id={:?} visible_reply_allowed={} action=drop",
+                    metadata.0,
+                    metadata.1,
+                    metadata.2,
+                    metadata.3,
+                );
+                EnqueueOutcome::SkippedInvalid
+            }
         }
     }
 
@@ -1381,6 +1499,9 @@ struct InboundMessage {
     sender_user_id: i64,
     external_message_id: Option<i64>,
     reply_to_external_message_id: Option<i64>,
+    /// Resolved during synchronous ingress classification for reply-only
+    /// group messages. This avoids a second asynchronous lookup after queueing.
+    replies_to_agent_hint: bool,
     text: String,
     attachments: Vec<Attachment>,
     /// Host-only locators used to materialize the current turn's images. They
@@ -1420,6 +1541,7 @@ impl InboundMessage {
             sender_user_id: event.user_id,
             external_message_id: positive_message_id(event.message_id),
             reply_to_external_message_id: reply_message_id(&event.message),
+            replies_to_agent_hint: false,
             addressed_to_agent: message_at_self(&event.message, event.self_id)
                 || text_mentions_agent(&text),
             visible_reply_allowed: true,
@@ -1451,6 +1573,7 @@ impl InboundMessage {
             sender_user_id: event.user_id,
             external_message_id: positive_message_id(event.message_id),
             reply_to_external_message_id: reply_message_id(&event.message),
+            replies_to_agent_hint: false,
             addressed_to_agent: true,
             visible_reply_allowed: true,
             explicit_request: true,
@@ -1671,7 +1794,8 @@ async fn run_ingress(
                         crate::model::ConversationCoordinator::abandon_incoming(admission).await;
                     }
                     eprintln!(
-                        "[WARN] Yunxi Core message dropped during identity resolution: {error}"
+                        "[WARN] Yunxi Core message dropped during identity resolution: sender_user_id={} external_message_id={:?} address={:?} error={error}",
+                        message.sender_user_id, message.external_message_id, message.address,
                     );
                 }
             }
@@ -2784,7 +2908,9 @@ async fn resolve_and_submit_inner(
                 external_message_id,
             })
         });
-    let recent_agent_reply = if reply_reference.is_some_and(|reference| reference.from_agent) {
+    let recent_agent_reply = if message.replies_to_agent_hint
+        || reply_reference.is_some_and(|reference| reference.from_agent)
+    {
         true
     } else {
         recent_bot_message(message.address, message.reply_to_external_message_id).await
@@ -2868,15 +2994,34 @@ async fn resolve_and_submit_inner(
             Err(_) => kovi::log::warn!("Yunxi Mind event update timed out and failed soft"),
         }
     }
+    let event_id = event.id();
+    let event_scope = event.scope();
+    let event_priority = event.priority();
     let admission = match runtime.submit(event).await {
         Ok(admission) => admission,
         Err(error) => {
             if registered_incoming && let Some(model_backend) = model_backend {
                 model_backend.discard_incoming(message_id).await;
             }
+            kovi::log::error!(
+                "Yunxi Core runtime rejected inbound event: event_id={} message_id={} scope={:?} priority={:?} error={error}",
+                event_id,
+                message_id,
+                event_scope,
+                event_priority,
+            );
             return Err(anyhow::anyhow!(error));
         }
     };
+    if matches!(admission, Admission::DroppedAtCapacity) {
+        kovi::log::warn!(
+            "Yunxi Core runtime queue full: event_id={} message_id={} scope={:?} priority={:?} action=drop",
+            event_id,
+            message_id,
+            event_scope,
+            event_priority,
+        );
+    }
     if registered_incoming
         && !matches!(admission, Admission::Accepted)
         && let Some(model_backend) = model_backend
@@ -3288,6 +3433,7 @@ mod tests {
             sender_user_id: 456,
             external_message_id: Some(789),
             reply_to_external_message_id: None,
+            replies_to_agent_hint: false,
             text: "hello".to_string(),
             attachments: Vec::new(),
             vision_attachments: Vec::new(),
@@ -3509,6 +3655,56 @@ mod tests {
             bridge.try_enqueue(message),
             EnqueueOutcome::DroppedAtCapacity
         );
+    }
+
+    #[test]
+    fn reliable_ingress_waits_for_capacity_and_then_accepts() {
+        let runtime = kovi::tokio::runtime::Runtime::new().expect("test runtime");
+        runtime.block_on(async {
+            let (ingress, mut receiver) = mpsc::channel(1);
+            let (runtime_handle, _consumer) =
+                yunxi_core::CognitiveRuntime::new(RuntimeConfig::default()).expect("valid runtime");
+            let bridge = Arc::new(CoreBridge {
+                ingress,
+                runtime: runtime_handle,
+                action_arbiter: None,
+                action_port: None,
+                blocked_users: Arc::new(StdMutex::new(HashSet::new())),
+                blocked_groups: Arc::new(StdMutex::new(HashSet::new())),
+                private_handler_gates: Arc::new(super::PrivateHandlerGateRegistry::new(4)),
+                group_handler_gates: Arc::new(super::PrivateHandlerGateRegistry::new(4)),
+                ambient_attention: Arc::new(StdMutex::new(super::AmbientAttentionRegistry::new())),
+            });
+            assert_eq!(
+                bridge.try_enqueue(inbound(ConversationAddress::Group { group_id: 123 }, true)),
+                EnqueueOutcome::Accepted
+            );
+
+            let waiting_bridge = Arc::clone(&bridge);
+            let mut waiting = kovi::tokio::spawn(async move {
+                waiting_bridge
+                    .send_reliably(inbound(ConversationAddress::Group { group_id: 123 }, true))
+                    .await
+            });
+            assert!(
+                kovi::tokio::time::timeout(StdDuration::from_millis(20), &mut waiting)
+                    .await
+                    .is_err(),
+                "reliable ingress must wait while the queue is full"
+            );
+            receiver
+                .recv()
+                .await
+                .expect("first message should be queued");
+            assert_eq!(
+                waiting.await.expect("waiting task should join"),
+                EnqueueOutcome::Accepted
+            );
+            assert!(
+                receiver.recv().await.is_some(),
+                "waiting message should arrive"
+            );
+        });
     }
 
     #[test]
