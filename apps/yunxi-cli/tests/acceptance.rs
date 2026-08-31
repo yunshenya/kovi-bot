@@ -12,9 +12,40 @@ use yunxi_cli::{
     JournalRecord, MAX_CLI_OPEN_LOOPS_PER_OWNER, MAX_JOURNAL_INPUT_BYTES,
 };
 use yunxi_core::{
-    AutonomyPolicy, ConversationId, ConversationTurnDirective, OpenLoopDraft, OpenLoopKind,
-    OpenLoopOwner, OpenLoopStore, ProposedAction,
+    AutonomyPolicy, ConversationId, ConversationTurnDirective, DecisionDisposition, DecisionPlan,
+    MessageContent, ModelBackend as CoreModelBackend, OpenLoopDraft, OpenLoopKind, OpenLoopOwner,
+    OpenLoopStore, PlannerInput, ProposedAction, WorldEventKind,
 };
+
+#[derive(Debug, Clone, Copy)]
+struct TwoMessageModel;
+
+impl CoreModelBackend for TwoMessageModel {
+    fn plan<'a>(&'a self, input: &'a PlannerInput) -> yunxi_core::ModelBackendFuture<'a> {
+        Box::pin(async move {
+            let WorldEventKind::MessageReceived(message) = input.event.kind() else {
+                return Ok(DecisionPlan::silent());
+            };
+            if message.content.as_text() != "给我发两条消息" {
+                return Ok(DecisionPlan::silent());
+            }
+            Ok(DecisionPlan {
+                disposition: DecisionDisposition::Reply,
+                intents: vec![
+                    yunxi_core::CognitiveIntent::send_message(
+                        message.conversation_id,
+                        MessageContent::text("第一条"),
+                    ),
+                    yunxi_core::CognitiveIntent::send_message(
+                        message.conversation_id,
+                        MessageContent::text("第二条"),
+                    ),
+                ],
+                state_updates: Vec::new(),
+            })
+        })
+    }
+}
 
 #[test]
 fn fake_model_and_environment_complete_a_core_action() {
@@ -42,6 +73,33 @@ fn fake_model_and_environment_complete_a_core_action() {
         action.content.as_text(),
         "Yunxi heard: hello from the standalone host"
     );
+}
+
+#[test]
+fn cli_delivers_each_message_in_a_multi_action_plan() {
+    let environment = FakeEnvironment::default();
+    let host = CliHost::new(TwoMessageModel, environment, ConversationId::new());
+
+    let response = host
+        .process_line("给我发两条消息")
+        .expect("response should be delivered");
+    assert!(matches!(
+        response,
+        HostResponse::Delivered { ref message, .. } if message == "第一条"
+    ));
+
+    let deliveries = host.environment().deliveries();
+    assert_eq!(deliveries.len(), 2);
+    let actions = deliveries
+        .iter()
+        .map(|delivery| match delivery {
+            ProposedAction::SendMessage(action) => action,
+            other => panic!("expected send-message action, got {other:?}"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(actions[0].content.as_text(), "第一条");
+    assert_eq!(actions[1].content.as_text(), "第二条");
+    assert_ne!(actions[0].idempotency_key(), actions[1].idempotency_key());
 }
 
 #[test]

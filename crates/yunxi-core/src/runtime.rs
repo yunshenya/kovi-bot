@@ -1177,12 +1177,20 @@ impl CognitiveRuntime {
                 &result,
                 ActionResult::Rejected(rejection)
                     if !matches!(rejection, crate::ActionRejection::Duplicate { .. })
-            ) {
-                // The arbiter rejected the action before calling the port, so
-                // any host-side capability registered for this action is still
-                // live and must be released explicitly. A duplicate may refer
-                // to another dispatch that has already crossed this boundary,
-                // so its capability must be left alone.
+            ) || matches!(&result, ActionResult::Failed { .. })
+                || matches!(
+                    &result,
+                    ActionResult::Executed {
+                        outcome: crate::ActionPortOutcome::Deferred { .. },
+                        ..
+                    }
+                )
+            {
+                // Rejections, port failures, and deferred outcomes can all
+                // leave a host-side capability live. Release is idempotent and
+                // only disarms still-Prepared host state. A duplicate may
+                // refer to another dispatch that already crossed this
+                // boundary, so its capability must be left alone.
                 port.release_unexecuted(&proposed).await;
             }
             let replay_terminal = match &result {
@@ -2094,10 +2102,11 @@ fn tool_intent_count(plan: &DecisionPlan) -> usize {
         .count()
 }
 
-/// Release host reservations for tool intents that were materialized by a
-/// planner but never entered the arbiter/port execution boundary. This is a
-/// best-effort cleanup hook: a validated planner intent should always convert
-/// to an action, while a malformed custom backend is simply ignored here.
+/// Release host reservations for intents that were materialized by a planner
+/// but never entered the arbiter/port execution boundary. Most ports only use
+/// this hook for tools, while message-capable hosts also use it to disarm a
+/// prepared multi-message envelope when validation or a guard aborts a turn.
+/// This is best-effort: a malformed custom backend is simply ignored here.
 async fn release_unexecuted_tool_intents(
     event: &WorldEvent,
     plan: &DecisionPlan,
@@ -2113,9 +2122,6 @@ async fn release_unexecuted_tool_intents_from(
     port: &dyn ActionPort,
 ) {
     for (intent_index, intent) in plan.intents.iter().enumerate().skip(start_index) {
-        if !matches!(intent, crate::CognitiveIntent::UseTool { .. }) {
-            continue;
-        }
         let Ok(mut action) = intent.propose_action() else {
             continue;
         };
@@ -3421,6 +3427,58 @@ mod tests {
                     self.released_keys
                         .lock()
                         .expect("released key recorder lock")
+                        .push(key.to_owned());
+                }
+            })
+        }
+    }
+
+    struct FailingReleaseRecordingPort {
+        released_keys: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl ActionPort for FailingReleaseRecordingPort {
+        fn execute<'a>(&'a self, _action: &'a crate::ProposedAction) -> ActionPortFuture<'a> {
+            Box::pin(async { Err(crate::ActionPortError::new("route_unavailable", true)) })
+        }
+
+        fn release_unexecuted<'a>(
+            &'a self,
+            action: &'a crate::ProposedAction,
+        ) -> ActionPortReleaseFuture<'a> {
+            Box::pin(async move {
+                if let Some(key) = action.idempotency_key() {
+                    self.released_keys
+                        .lock()
+                        .expect("failed action release recorder lock")
+                        .push(key.to_owned());
+                }
+            })
+        }
+    }
+
+    struct DeferredReleaseRecordingPort {
+        released_keys: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl ActionPort for DeferredReleaseRecordingPort {
+        fn execute<'a>(&'a self, _action: &'a crate::ProposedAction) -> ActionPortFuture<'a> {
+            Box::pin(async {
+                Ok(ActionPortOutcome::Deferred {
+                    reason: "prepared_envelope_unavailable".to_owned(),
+                })
+            })
+        }
+
+        fn release_unexecuted<'a>(
+            &'a self,
+            action: &'a crate::ProposedAction,
+        ) -> ActionPortReleaseFuture<'a> {
+            Box::pin(async move {
+                if let Some(key) = action.idempotency_key() {
+                    self.released_keys
+                        .lock()
+                        .expect("deferred action release recorder lock")
                         .push(key.to_owned());
                 }
             })
@@ -4817,6 +4875,88 @@ mod tests {
             released_keys
                 .lock()
                 .expect("released key recorder lock")
+                .as_slice(),
+            &[expected_key]
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_port_action_releases_materialized_host_capability() {
+        let conversation_id = ConversationId::new();
+        let sender = PersonId::new();
+        let event = direct_message(conversation_id, sender);
+        let expected_key = crate::event_action_idempotency_key(event.id(), 0);
+        let (_handle, mut runtime) = CognitiveRuntime::new_with_services(
+            RuntimeConfig::default(),
+            CoreServices::with_model(DueActionWithoutResolutionModel { conversation_id }),
+        )
+        .expect("valid runtime");
+        let arbiter = ActionArbiter::new(
+            ActionArbiterConfig::default().with_capabilities(EnvironmentCapabilities::all()),
+        );
+        let released_keys = Arc::new(Mutex::new(Vec::new()));
+        let port = FailingReleaseRecordingPort {
+            released_keys: Arc::clone(&released_keys),
+        };
+
+        let outcome = runtime
+            .process_event_with_planner_and_actions(event, &arbiter, &port)
+            .await
+            .expect("port failure should remain a structured action result");
+
+        assert!(matches!(
+            outcome,
+            PlannedProcessingOutcome::Planned { actions, .. }
+                if matches!(actions.as_slice(), [ActionResult::Failed { .. }])
+        ));
+        assert_eq!(
+            released_keys
+                .lock()
+                .expect("failed action release recorder lock")
+                .as_slice(),
+            &[expected_key]
+        );
+    }
+
+    #[tokio::test]
+    async fn deferred_port_action_releases_materialized_host_capability() {
+        let conversation_id = ConversationId::new();
+        let sender = PersonId::new();
+        let event = direct_message(conversation_id, sender);
+        let expected_key = crate::event_action_idempotency_key(event.id(), 0);
+        let (_handle, mut runtime) = CognitiveRuntime::new_with_services(
+            RuntimeConfig::default(),
+            CoreServices::with_model(DueActionWithoutResolutionModel { conversation_id }),
+        )
+        .expect("valid runtime");
+        let arbiter = ActionArbiter::new(
+            ActionArbiterConfig::default().with_capabilities(EnvironmentCapabilities::all()),
+        );
+        let released_keys = Arc::new(Mutex::new(Vec::new()));
+        let port = DeferredReleaseRecordingPort {
+            released_keys: Arc::clone(&released_keys),
+        };
+
+        let outcome = runtime
+            .process_event_with_planner_and_actions(event, &arbiter, &port)
+            .await
+            .expect("deferred outcome should remain a structured action result");
+
+        assert!(matches!(
+            outcome,
+            PlannedProcessingOutcome::Planned { actions, .. }
+                if matches!(
+                    actions.as_slice(),
+                    [ActionResult::Executed {
+                        outcome: ActionPortOutcome::Deferred { .. },
+                        ..
+                    }]
+                )
+        ));
+        assert_eq!(
+            released_keys
+                .lock()
+                .expect("deferred action release recorder lock")
                 .as_slice(),
             &[expected_key]
         );

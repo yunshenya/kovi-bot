@@ -723,6 +723,12 @@ pub(crate) fn register_mind_outgoing_fence(
         .is_some_and(|runtime| runtime.register_outgoing_fence(idempotency_key, input, projection))
 }
 
+pub(crate) fn discard_mind_outgoing_fence(idempotency_key: &str) {
+    if let Some(runtime) = MIND_RUNTIME.get() {
+        runtime.discard_outgoing_fence(idempotency_key);
+    }
+}
+
 pub(crate) async fn pin_mind_outgoing_fence(
     idempotency_key: &str,
 ) -> Option<MindDeliveryPermit<'static>> {

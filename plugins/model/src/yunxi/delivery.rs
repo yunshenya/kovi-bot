@@ -16,10 +16,11 @@ use crate::model::tool_access::{
 };
 use crate::model::{
     MessageDestination, MessageTransport, OutgoingCommitRejection, OutgoingSource, OutgoingToken,
-    ReplyScope, ToolExecutionContext, begin_outgoing_commit, contextual_outgoing_fingerprint,
-    find_prepared_outgoing, finish, is_current, mark_active, mark_outgoing_failed,
-    outgoing_fingerprint, prepare_proactive_outgoing_if_idle_with_semantic_preview,
-    record_standalone_bot_message, send_tracked_message_with_revalidation_guard, tool_registry,
+    ReplyScope, ToolExecutionContext, action_outgoing_fingerprint, begin_outgoing_commit,
+    contextual_outgoing_fingerprint, find_prepared_outgoing, find_prepared_outgoing_by_fingerprint,
+    finish, is_current, mark_active, mark_outgoing_failed, outgoing_fingerprint,
+    prepare_proactive_outgoing_if_idle_with_semantic_preview, record_standalone_bot_message,
+    send_tracked_message_with_revalidation_guard, tool_registry,
 };
 use kovi::bot::message::Segment;
 use kovi::serde_json::json;
@@ -434,11 +435,13 @@ impl QqActionAdapter {
         let precommit = match begin_outgoing_commit(outgoing).await {
             Ok(precommit) => precommit,
             Err(OutgoingCommitRejection::Stale) => {
+                crate::yunxi::discard_mind_outgoing_fence(idempotency_key);
                 return Ok(ActionPortOutcome::Deferred {
                     reason: "outgoing_superseded_before_revalidation".to_string(),
                 });
             }
             Err(OutgoingCommitRejection::DuplicateIdempotency) => {
+                crate::yunxi::discard_mind_outgoing_fence(idempotency_key);
                 return Ok(ActionPortOutcome::DeliveryIndeterminate {
                     reason: "outgoing_duplicate_idempotency_key".to_string(),
                     conversation_id: Some(expected_conversation_id),
@@ -505,6 +508,7 @@ impl QqActionAdapter {
             Ok(_) => {
                 drop(route_guard);
                 mark_outgoing_failed(outgoing).await;
+                crate::yunxi::discard_mind_outgoing_fence(idempotency_key);
                 return Ok(ActionPortOutcome::Deferred {
                     reason: "delivery_route_changed_before_commit".to_string(),
                 });
@@ -512,6 +516,7 @@ impl QqActionAdapter {
             Err(error) => {
                 drop(route_guard);
                 mark_outgoing_failed(outgoing).await;
+                crate::yunxi::discard_mind_outgoing_fence(idempotency_key);
                 return Err(error);
             }
         };
@@ -522,6 +527,7 @@ impl QqActionAdapter {
                     Err(error) => {
                         drop(route_guard);
                         mark_outgoing_failed(outgoing).await;
+                        crate::yunxi::discard_mind_outgoing_fence(idempotency_key);
                         return Err(ActionPortError::new(
                             format!("group_not_authorized_before_commit:{error}"),
                             false,
@@ -564,6 +570,7 @@ impl QqActionAdapter {
                 drop(authorization);
                 drop(route_guard);
                 mark_outgoing_failed(outgoing).await;
+                crate::yunxi::discard_mind_outgoing_fence(idempotency_key);
                 return Err(ActionPortError::new(
                     format!("durable_delivery_envelope_invalid:{error}"),
                     false,
@@ -576,6 +583,7 @@ impl QqActionAdapter {
             drop(authorization);
             drop(route_guard);
             drop(precommit);
+            crate::yunxi::discard_mind_outgoing_fence(idempotency_key);
             return Ok(ActionPortOutcome::Deferred {
                 reason: "mind_snapshot_changed_before_commit".to_string(),
             });
@@ -587,6 +595,7 @@ impl QqActionAdapter {
             Err(OutgoingCommitRejection::Stale) => {
                 drop(authorization);
                 drop(route_guard);
+                crate::yunxi::discard_mind_outgoing_fence(idempotency_key);
                 return Ok(ActionPortOutcome::Deferred {
                     reason: "outgoing_superseded_before_commit".to_string(),
                 });
@@ -594,6 +603,7 @@ impl QqActionAdapter {
             Err(OutgoingCommitRejection::DuplicateIdempotency) => {
                 drop(authorization);
                 drop(route_guard);
+                crate::yunxi::discard_mind_outgoing_fence(idempotency_key);
                 return Ok(ActionPortOutcome::DeliveryIndeterminate {
                     reason: "outgoing_duplicate_idempotency_key".to_string(),
                     conversation_id: Some(conversation_id),
@@ -715,10 +725,19 @@ impl QqActionAdapter {
         &self,
         scope: ReplyScope,
         content: &MessageContent,
+        idempotency_key: &str,
         allow_proactive_fallback: bool,
     ) -> Option<OutgoingToken> {
         let fingerprint = outgoing_fingerprint(content.as_text());
-        let prepared = find_prepared_outgoing(scope, fingerprint).await;
+        // Core batches are prepared before the runtime adds platform-specific
+        // envelope fields, so bind lookup to the durable action key. Retain
+        // the legacy content-only lookup for old/proactive callers.
+        let action_fingerprint = action_outgoing_fingerprint(content.as_text(), idempotency_key);
+        let prepared = find_prepared_outgoing(scope, action_fingerprint).await;
+        let prepared = match prepared {
+            Some(prepared) => Some(prepared),
+            None => find_prepared_outgoing(scope, fingerprint).await,
+        };
         let (outgoing, source) = match prepared {
             // ReachOut is always proactive. Even an exact content collision
             // must not let it consume a reactive user's prepared reply.
@@ -1096,12 +1115,24 @@ impl ActionPort for QqActionAdapter {
         Box::pin(async move {
             match action {
                 ProposedAction::SendMessage(send) => {
-                    let destination = self
+                    let destination = match self
                         .resolve_conversation_destination(send.conversation_id)
-                        .await?;
+                        .await
+                    {
+                        Ok(destination) => destination,
+                        Err(error) => {
+                            release_prepared_action(&send.content, send.idempotency_key()).await;
+                            return Err(error);
+                        }
+                    };
                     let reply_to = send.reply_to;
                     let Some(outgoing) = self
-                        .prepared_outgoing(destination.reply_scope(), &send.content, false)
+                        .prepared_outgoing(
+                            destination.reply_scope(),
+                            &send.content,
+                            send.idempotency_key(),
+                            false,
+                        )
                         .await
                     else {
                         return Ok(ActionPortOutcome::Deferred {
@@ -1122,12 +1153,25 @@ impl ActionPort for QqActionAdapter {
                     .await
                 }
                 ProposedAction::ReachOut(reach_out) => {
-                    let (route, destination) = self
-                        .resolve_person_destination(reach_out.person_id)
-                        .await
-                        .map_err(|error| ActionPortError::new(error.to_string(), true))?;
+                    let (route, destination) =
+                        match self.resolve_person_destination(reach_out.person_id).await {
+                            Ok(resolved) => resolved,
+                            Err(error) => {
+                                release_prepared_action(
+                                    &reach_out.message,
+                                    reach_out.idempotency_key(),
+                                )
+                                .await;
+                                return Err(ActionPortError::new(error.to_string(), true));
+                            }
+                        };
                     let Some(outgoing) = self
-                        .prepared_outgoing(destination.reply_scope(), &reach_out.message, true)
+                        .prepared_outgoing(
+                            destination.reply_scope(),
+                            &reach_out.message,
+                            reach_out.idempotency_key(),
+                            true,
+                        )
                         .await
                     else {
                         return Ok(ActionPortOutcome::Deferred {
@@ -1233,11 +1277,29 @@ impl ActionPort for QqActionAdapter {
 
     fn release_unexecuted<'a>(&'a self, action: &'a ProposedAction) -> ActionPortReleaseFuture<'a> {
         Box::pin(async move {
-            if let ProposedAction::UseTool(tool) = action {
-                self.tool_turns.revoke(tool.idempotency_key()).await;
+            match action {
+                ProposedAction::UseTool(tool) => {
+                    self.tool_turns.revoke(tool.idempotency_key()).await;
+                    crate::yunxi::discard_mind_outgoing_fence(tool.idempotency_key());
+                }
+                ProposedAction::SendMessage(send) => {
+                    release_prepared_action(&send.content, send.idempotency_key()).await;
+                }
+                ProposedAction::ReachOut(reach_out) => {
+                    release_prepared_action(&reach_out.message, reach_out.idempotency_key()).await;
+                }
+                _ => {}
             }
         })
     }
+}
+
+async fn release_prepared_action(content: &MessageContent, key: &str) {
+    let action_fingerprint = action_outgoing_fingerprint(content.as_text(), key);
+    if let Some((token, _)) = find_prepared_outgoing_by_fingerprint(action_fingerprint).await {
+        mark_outgoing_failed(token).await;
+    }
+    crate::yunxi::discard_mind_outgoing_fence(key);
 }
 
 fn store_action_error(error: impl std::fmt::Display) -> ActionPortError {

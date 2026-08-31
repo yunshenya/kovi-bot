@@ -97,12 +97,16 @@ impl ReplyPlan {
         }
     }
 
-    /// Intrinsic produces one bounded conversational turn. Keep the normal
-    /// parser for sanitization, but collapse legacy separators into the one
-    /// logical message sent by the Core action port.
+    /// Intrinsic produces one bounded conversational turn for plain text. Keep
+    /// explicit structured message bubbles intact so requests such as "send
+    /// two messages" are delivered as separate QQ messages.
     pub(crate) async fn from_intrinsic_output(scope: ReplyScope, content: &str) -> Self {
+        let has_structured_messages = parse_reply_output(content).messages.is_some();
         let mut plan = Self::from_model_output(scope, content).await;
         if plan.is_silent() || plan.bubbles.is_empty() {
+            return plan;
+        }
+        if has_structured_messages {
             return plan;
         }
         let content = plan.bubbles.join("\n");
@@ -489,7 +493,7 @@ mod tests {
     }
 
     #[test]
-    fn intrinsic_output_is_always_one_logical_bubble() {
+    fn intrinsic_output_collapses_legacy_separator_to_one_logical_bubble() {
         kovi::tokio::runtime::Runtime::new()
             .expect("应创建测试运行时")
             .block_on(async {
@@ -500,6 +504,21 @@ mod tests {
                 .await;
                 assert_eq!(plan.bubbles, vec!["第一段\n第二段"]);
                 assert_eq!(plan.content, "第一段\n第二段");
+            });
+    }
+
+    #[test]
+    fn intrinsic_output_preserves_explicit_structured_message_bubbles() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let plan = ReplyPlan::from_intrinsic_output(
+                    ReplyScope::Private(9_100_011),
+                    "[[REPLY_ACTION]]{\"messages\":[\"第一条\",\"第二条\"]}[[/REPLY_ACTION]]",
+                )
+                .await;
+                assert_eq!(plan.bubbles, vec!["第一条", "第二条"]);
+                assert_eq!(plan.content, "第一条\n第二条");
             });
     }
 

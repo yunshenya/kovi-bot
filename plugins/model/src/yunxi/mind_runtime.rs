@@ -619,7 +619,7 @@ impl MindRuntime {
         if Utc::now().signed_duration_since(fence.registered_at)
             >= Duration::minutes(OUTGOING_FENCE_TTL_MINUTES)
         {
-            self.discard_pending_candidates(idempotency_key);
+            self.discard_outgoing_fence(idempotency_key);
             self.metrics
                 .outgoing_fences_stale
                 .fetch_add(1, Ordering::Relaxed);
@@ -634,7 +634,7 @@ impl MindRuntime {
                 .iter()
                 .any(|scope| barrier.blocks_scope(*scope))
         {
-            self.discard_pending_candidates(idempotency_key);
+            self.discard_outgoing_fence(idempotency_key);
             self.metrics
                 .outgoing_fences_stale
                 .fetch_add(1, Ordering::Relaxed);
@@ -645,7 +645,7 @@ impl MindRuntime {
             !snapshot.is_empty() && mind_snapshot_signature(&snapshot) == fence.expected_signature
         });
         if !valid {
-            self.discard_pending_candidates(idempotency_key);
+            self.discard_outgoing_fence(idempotency_key);
             self.metrics
                 .outgoing_fences_stale
                 .fetch_add(1, Ordering::Relaxed);
@@ -661,11 +661,15 @@ impl MindRuntime {
         })
     }
 
-    fn discard_pending_candidates(&self, idempotency_key: &str) {
+    pub(crate) fn discard_outgoing_fence(&self, idempotency_key: &str) {
         self.pending_candidates
             .lock()
             .unwrap_or_else(|lock| lock.into_inner())
             .retain(|pending| pending.idempotency_key != idempotency_key);
+        self.outgoing_fences
+            .lock()
+            .unwrap_or_else(|lock| lock.into_inner())
+            .retain(|fence| fence.idempotency_key != idempotency_key);
     }
 
     pub(crate) fn register_candidates(
@@ -3658,6 +3662,68 @@ mod tests {
 
             drop(permit);
             pending_erasure.await.expect("erasure task").finish().await;
+        });
+    }
+
+    #[test]
+    fn multi_message_batch_consumes_active_mind_reference_on_first_action_only() {
+        let executor = kovi::tokio::runtime::Runtime::new().expect("test runtime");
+        executor.block_on(async {
+            let (runtime, store) = active_test_runtime();
+            let person_id = yunxi_core::PersonId::new();
+            let conversation_id = ConversationId::new();
+            let scope = MindScope::Person { person_id };
+            let created_at = Utc::now() - Duration::hours(1);
+            let agenda = AgendaItem::new(
+                AgendaItemId::new(),
+                scope,
+                AgendaSubject::SocialMotive("继续聊之前的系统设计".to_owned()),
+                0.8,
+                0.8,
+                0.6,
+                AgendaSource::Interaction,
+                created_at,
+            )
+            .expect("agenda");
+            AgendaStore::put(store.as_ref(), &agenda, None)
+                .await
+                .expect("seed agenda");
+            let input = active_planner_input(
+                runtime.as_ref(),
+                casual_direct_message(person_id, conversation_id, "现在空下来了。"),
+            )
+            .await;
+            let projection =
+                MindDecisionProjection::for_input(&input, yunxi_core::DecisionDisposition::Reply);
+            assert!(projection.reference().is_some());
+
+            let first_key = "mind-batch:0";
+            let second_key = "mind-batch:1";
+            assert!(runtime.register_outgoing_fence(first_key.to_owned(), &input, projection));
+
+            let first_permit = runtime
+                .pin_revalidated_outgoing_fence(first_key)
+                .await
+                .expect("the first bubble receives the active Mind permit");
+            drop(first_permit);
+            runtime.commit_candidates(first_key);
+            kovi::tokio::task::yield_now().await;
+
+            let second_permit = runtime
+                .pin_revalidated_outgoing_fence(second_key)
+                .await
+                .expect("the second bubble is intentionally unfenced");
+            drop(second_permit);
+            runtime.commit_candidates(second_key);
+            kovi::tokio::task::yield_now().await;
+            assert!(
+                runtime
+                    .outgoing_fences
+                    .lock()
+                    .unwrap_or_else(|lock| lock.into_inner())
+                    .iter()
+                    .all(|fence| fence.idempotency_key != first_key)
+            );
         });
     }
 

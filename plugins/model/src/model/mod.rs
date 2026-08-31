@@ -23,9 +23,10 @@ pub(crate) mod utils;
 pub(crate) use interrupt::is_active;
 pub(crate) use interrupt::{
     OutgoingCommitRejection, OutgoingSource, OutgoingToken, ReplyScope, ReplyTicket,
-    begin_outgoing_commit, contextual_outgoing_fingerprint, find_prepared_outgoing, finish,
-    interrupt, is_current, mark_active, mark_outgoing_failed, outgoing_fingerprint,
-    prepare_outgoing_with_semantic_preview,
+    action_outgoing_fingerprint, begin_outgoing_commit, contextual_outgoing_fingerprint,
+    find_prepared_outgoing, find_prepared_outgoing_by_fingerprint, finish, interrupt, is_current,
+    mark_active, mark_outgoing_failed, outgoing_fingerprint,
+    prepare_outgoing_batch_with_semantic_preview,
     prepare_proactive_outgoing_if_idle_with_semantic_preview, restore_message_collisions,
     take_message_collisions,
 };

@@ -315,7 +315,6 @@ pub(crate) async fn try_freeze_prepared_for_incoming_locked(
     let (token, source) = state
         .pending_outgoing
         .iter()
-        .rev()
         .find(|pending| {
             pending.state == OutgoingState::Prepared && ticket_matches(state, pending.token.ticket)
         })
@@ -870,6 +869,18 @@ pub(crate) fn outgoing_fingerprint(content: &str) -> u64 {
     hasher.finish()
 }
 
+/// Fingerprint a planned action before the platform-specific envelope is
+/// available. The idempotency key makes equal bubbles addressable
+/// independently (for example, two deliberately repeated messages in one
+/// response batch).
+pub(crate) fn action_outgoing_fingerprint(content: &str, idempotency_key: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    "yunxi-planned-outgoing-action-v1".hash(&mut hasher);
+    content.hash(&mut hasher);
+    idempotency_key.hash(&mut hasher);
+    hasher.finish()
+}
+
 /// Fingerprint the complete platform envelope that will cross the irreversible
 /// send boundary. Length and option markers are provided by `Hash`, so fields
 /// such as `(content="ab", key="c")` cannot alias `(content="a", key="bc")`
@@ -909,6 +920,24 @@ pub(crate) async fn prepare_outgoing_with_semantic_preview(
     let lock = scope_mutex(ticket.scope);
     let _scope_guard = lock.lock().await;
     prepare_outgoing_locked(ticket, fingerprint, source, semantic_preview).await
+}
+
+/// Atomically prepare a bounded batch of outgoing envelopes for one ticket.
+///
+/// A single call may own several `Prepared` tokens for the same ticket; this
+/// is intentionally separate from `prepare_outgoing_with_semantic_preview`,
+/// whose one-live-token rule protects legacy single-message callers. Capacity,
+/// ticket freshness, and duplicate fingerprints are checked before any token
+/// is inserted, so callers never observe a partial batch.
+pub(crate) async fn prepare_outgoing_batch_with_semantic_preview(
+    ticket: ReplyTicket,
+    fingerprints: &[u64],
+    source: OutgoingSource,
+    semantic_preview: Option<&str>,
+) -> Option<Vec<OutgoingToken>> {
+    let lock = scope_mutex(ticket.scope);
+    let _scope_guard = lock.lock().await;
+    prepare_outgoing_batch_locked(ticket, fingerprints, source, semantic_preview).await
 }
 
 /// Prepare a new proactive envelope only while the conversation is idle.
@@ -1057,6 +1086,26 @@ async fn prepare_outgoing_locked(
     source: OutgoingSource,
     semantic_preview: Option<&str>,
 ) -> Option<OutgoingToken> {
+    prepare_outgoing_batch_locked(ticket, &[fingerprint], source, semantic_preview)
+        .await
+        .and_then(|mut tokens| tokens.pop())
+}
+
+async fn prepare_outgoing_batch_locked(
+    ticket: ReplyTicket,
+    fingerprints: &[u64],
+    source: OutgoingSource,
+    semantic_preview: Option<&str>,
+) -> Option<Vec<OutgoingToken>> {
+    if fingerprints.is_empty()
+        || fingerprints.len() > MAX_PENDING_OUTGOING_PER_SCOPE
+        || fingerprints
+            .iter()
+            .enumerate()
+            .any(|(index, fingerprint)| fingerprints[..index].contains(fingerprint))
+    {
+        return None;
+    }
     let mut states = REPLY_STATES.lock().await;
     let state = states.get_mut(&ticket.scope)?;
     prune_outgoing(state);
@@ -1072,26 +1121,31 @@ async fn prepare_outgoing_locked(
     }) {
         return None;
     }
-    make_outgoing_room(state)?;
-    state.outgoing_sequence = state.outgoing_sequence.wrapping_add(1);
-    let token = OutgoingToken {
-        ticket,
-        fingerprint,
-        sequence: state.outgoing_sequence,
-    };
-    state.pending_outgoing.push_back(PendingOutgoing {
-        token,
-        effective_fingerprint: fingerprint,
-        semantic_preview: semantic_preview.map(bounded_semantic_preview),
-        idempotency_key: None,
-        source,
-        state: OutgoingState::Prepared,
-        committed_at: None,
-        terminal_at: None,
-        collision_reported: false,
-    });
+    make_outgoing_room_for(state, fingerprints.len())?;
+    let semantic_preview = semantic_preview.map(bounded_semantic_preview);
+    let mut tokens = Vec::with_capacity(fingerprints.len());
+    for &fingerprint in fingerprints {
+        state.outgoing_sequence = state.outgoing_sequence.wrapping_add(1);
+        let token = OutgoingToken {
+            ticket,
+            fingerprint,
+            sequence: state.outgoing_sequence,
+        };
+        state.pending_outgoing.push_back(PendingOutgoing {
+            token,
+            effective_fingerprint: fingerprint,
+            semantic_preview: semantic_preview.clone(),
+            idempotency_key: None,
+            source,
+            state: OutgoingState::Prepared,
+            committed_at: None,
+            terminal_at: None,
+            collision_reported: false,
+        });
+        tokens.push(token);
+    }
     state.last_seen = Instant::now();
-    Some(token)
+    Some(tokens)
 }
 
 fn bounded_semantic_preview(content: &str) -> String {
@@ -1293,6 +1347,26 @@ pub(crate) async fn find_prepared_outgoing(
         .map(|pending| (pending.token, pending.source))
 }
 
+/// Find a prepared action without requiring the live platform route. Runtime
+/// cleanup uses the planned action fingerprint, which is globally addressable
+/// by its idempotency key even when identity or route resolution is degraded.
+pub(crate) async fn find_prepared_outgoing_by_fingerprint(
+    fingerprint: u64,
+) -> Option<(OutgoingToken, OutgoingSource)> {
+    let mut states = REPLY_STATES.lock().await;
+    for state in states.values_mut() {
+        prune_outgoing(state);
+        if let Some(pending) = state.pending_outgoing.iter().rev().find(|pending| {
+            pending.state == OutgoingState::Prepared
+                && pending.token.fingerprint == fingerprint
+                && ticket_matches(state, pending.token.ticket)
+        }) {
+            return Some((pending.token, pending.source));
+        }
+    }
+    None
+}
+
 /// Inspect the source of the current prepared envelope while the caller holds
 /// `scope_mutex`. Semantic admission must use this authoritative value instead
 /// of trusting a source label supplied by an ingress caller.
@@ -1359,19 +1433,23 @@ pub(crate) async fn cancel_prepared_proactive_locked(scope: ReplyScope) -> bool 
     prune_outgoing(state);
     let generation = state.generation;
     let conversation_version = state.conversation_version;
-    let Some(pending) = state.pending_outgoing.iter_mut().rev().find(|pending| {
-        pending.state == OutgoingState::Prepared
+    let now = Instant::now();
+    let mut cancelled = false;
+    for pending in &mut state.pending_outgoing {
+        if pending.state == OutgoingState::Prepared
             && pending.source == OutgoingSource::Proactive
             && pending.token.ticket.generation == generation
             && pending.token.ticket.conversation_version == conversation_version
-    }) else {
-        return false;
-    };
-    let now = Instant::now();
-    pending.state = OutgoingState::Cancelled;
-    pending.terminal_at = Some(now);
-    state.last_seen = now;
-    true
+        {
+            pending.state = OutgoingState::Cancelled;
+            pending.terminal_at = Some(now);
+            cancelled = true;
+        }
+    }
+    if cancelled {
+        state.last_seen = now;
+    }
+    cancelled
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -1644,8 +1722,36 @@ fn supersede_prepared(state: &mut ReplyState, token: OutgoingToken) {
     }
 }
 
-fn make_outgoing_room(state: &mut ReplyState) -> Option<()> {
-    while state.pending_outgoing.len() >= MAX_PENDING_OUTGOING_PER_SCOPE {
+/// Reserve capacity for `additional` entries without mutating the queue when
+/// there are not enough terminal records to evict. This all-or-none preflight
+/// is important for multi-message replies: a failed second bubble must not
+/// leave the first bubble armed for delivery.
+fn make_outgoing_room_for(state: &mut ReplyState, additional: usize) -> Option<()> {
+    if additional == 0 || additional > MAX_PENDING_OUTGOING_PER_SCOPE {
+        return None;
+    }
+    let required_removals = state
+        .pending_outgoing
+        .len()
+        .saturating_add(additional)
+        .saturating_sub(MAX_PENDING_OUTGOING_PER_SCOPE);
+    if required_removals == 0 {
+        return Some(());
+    }
+    let removable_count = state
+        .pending_outgoing
+        .iter()
+        .filter(|pending| {
+            !matches!(
+                pending.state,
+                OutgoingState::Prepared | OutgoingState::Committed | OutgoingState::Unknown
+            )
+        })
+        .count();
+    if removable_count < required_removals {
+        return None;
+    }
+    for _ in 0..required_removals {
         let removable = state.pending_outgoing.iter().position(|pending| {
             !matches!(
                 pending.state,
@@ -1722,14 +1828,17 @@ pub(crate) async fn test_outgoing_state(token: OutgoingToken) -> Option<Outgoing
 mod tests {
     use super::{
         MAX_PENDING_OUTGOING_PER_SCOPE, OutgoingCommitRejection, OutgoingSource, OutgoingState,
-        OutgoingToken, REPLY_STATES, ReplyScope, cancel_locked, cancel_prepared_proactive_locked,
-        claim_follow_up, clear_reply_state_locked, commit_outgoing, commit_outgoing_guard,
-        commit_outgoing_guard_with_context, contextual_outgoing_fingerprint,
-        find_prepared_outgoing, finish, interrupt, interrupt_if_current, is_active, is_current,
-        mark_active, mark_outgoing_failed, mark_outgoing_sent, outgoing_fingerprint,
-        prepare_outgoing, prepare_proactive_outgoing_if_idle, prepared_outgoing_source_locked,
-        release_active_incoming, reserve_active_incoming_locked, scope_mutex,
-        take_message_collisions, wait_for_pending_incoming,
+        OutgoingToken, REPLY_STATES, ReplyScope, action_outgoing_fingerprint, cancel_locked,
+        cancel_prepared_proactive_locked, claim_follow_up, clear_reply_state_locked,
+        commit_outgoing, commit_outgoing_guard, commit_outgoing_guard_with_context,
+        contextual_outgoing_fingerprint, find_prepared_outgoing,
+        find_prepared_outgoing_by_fingerprint, finish, interrupt, interrupt_if_current, is_active,
+        is_current, mark_active, mark_outgoing_failed, mark_outgoing_sent, outgoing_fingerprint,
+        prepare_outgoing, prepare_outgoing_batch_with_semantic_preview,
+        prepare_proactive_outgoing_if_idle, prepared_outgoing_source_locked,
+        release_active_incoming, release_incoming_locked, reserve_active_incoming_locked,
+        scope_mutex, take_message_collisions, try_freeze_prepared_for_incoming_locked,
+        wait_for_pending_incoming,
     };
 
     async fn outgoing_state(token: OutgoingToken) -> Option<OutgoingState> {
@@ -1759,6 +1868,281 @@ mod tests {
         if wait.is_err() {
             assert_eq!(outgoing_state(token).await, Some(expected));
         }
+    }
+
+    #[test]
+    fn planned_action_fingerprint_is_stable_and_separates_repeated_content() {
+        let first = action_outgoing_fingerprint("same bubble", "action:0");
+        assert_eq!(
+            first,
+            action_outgoing_fingerprint("same bubble", "action:0")
+        );
+        assert_ne!(
+            first,
+            action_outgoing_fingerprint("same bubble", "action:1")
+        );
+        assert_ne!(
+            first,
+            action_outgoing_fingerprint("other bubble", "action:0")
+        );
+    }
+
+    #[test]
+    fn outgoing_batch_tokens_can_be_looked_up_and_completed_independently() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let scope = ReplyScope::Private(9_200_001);
+                let ticket = interrupt(scope).await;
+                assert!(mark_active(ticket).await);
+                let first_fingerprint = action_outgoing_fingerprint("重复内容", "batch:0");
+                let second_fingerprint = action_outgoing_fingerprint("重复内容", "batch:1");
+                let tokens = prepare_outgoing_batch_with_semantic_preview(
+                    ticket,
+                    &[first_fingerprint, second_fingerprint],
+                    OutgoingSource::Reply,
+                    Some("重复内容\n重复内容"),
+                )
+                .await
+                .expect("批量准备应一次性创建两个 token");
+
+                assert_eq!(tokens.len(), 2);
+                assert_ne!(tokens[0], tokens[1]);
+                assert_eq!(
+                    find_prepared_outgoing(scope, first_fingerprint).await,
+                    Some((tokens[0], OutgoingSource::Reply))
+                );
+                assert_eq!(
+                    find_prepared_outgoing(scope, second_fingerprint).await,
+                    Some((tokens[1], OutgoingSource::Reply))
+                );
+                assert_eq!(
+                    find_prepared_outgoing_by_fingerprint(second_fingerprint).await,
+                    Some((tokens[1], OutgoingSource::Reply))
+                );
+
+                let first_guard = commit_outgoing_guard(tokens[0])
+                    .await
+                    .expect("第一条应能独立提交");
+                first_guard.mark_sent().await;
+                assert_eq!(outgoing_state(tokens[0]).await, Some(OutgoingState::Sent));
+                assert!(
+                    find_prepared_outgoing(scope, first_fingerprint)
+                        .await
+                        .is_none()
+                );
+                assert_eq!(
+                    find_prepared_outgoing(scope, second_fingerprint).await,
+                    Some((tokens[1], OutgoingSource::Reply))
+                );
+
+                let second_guard = commit_outgoing_guard(tokens[1])
+                    .await
+                    .expect("第二条应能独立提交");
+                second_guard.mark_sent().await;
+                assert_eq!(outgoing_state(tokens[1]).await, Some(OutgoingState::Sent));
+                assert!(
+                    find_prepared_outgoing(scope, second_fingerprint)
+                        .await
+                        .is_none()
+                );
+                finish(ticket).await;
+            });
+    }
+
+    #[test]
+    fn outgoing_batch_is_atomic_when_ticket_is_stale_or_capacity_is_busy() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let stale_scope = ReplyScope::Private(9_200_002);
+                let stale_ticket = interrupt(stale_scope).await;
+                assert!(mark_active(stale_ticket).await);
+                let current_ticket = interrupt(stale_scope).await;
+                assert!(mark_active(current_ticket).await);
+                let stale_fingerprints = [
+                    action_outgoing_fingerprint("stale one", "stale:0"),
+                    action_outgoing_fingerprint("stale two", "stale:1"),
+                ];
+                assert!(
+                    prepare_outgoing_batch_with_semantic_preview(
+                        stale_ticket,
+                        &stale_fingerprints,
+                        OutgoingSource::Reply,
+                        Some("stale one\nstale two"),
+                    )
+                    .await
+                    .is_none()
+                );
+                for fingerprint in stale_fingerprints {
+                    assert!(
+                        find_prepared_outgoing(stale_scope, fingerprint)
+                            .await
+                            .is_none()
+                    );
+                }
+                finish(current_ticket).await;
+
+                let busy_scope = ReplyScope::Private(9_200_003);
+                let mut committed = Vec::with_capacity(MAX_PENDING_OUTGOING_PER_SCOPE);
+                for index in 0..MAX_PENDING_OUTGOING_PER_SCOPE {
+                    let ticket = interrupt(busy_scope).await;
+                    assert!(mark_active(ticket).await);
+                    let token = prepare_outgoing(
+                        ticket,
+                        outgoing_fingerprint(&format!("busy {index}")),
+                        OutgoingSource::Reply,
+                    )
+                    .await
+                    .expect("应填满容量");
+                    committed.push(
+                        commit_outgoing_guard(token)
+                            .await
+                            .expect("应保留已提交 token"),
+                    );
+                }
+                let current = interrupt(busy_scope).await;
+                assert!(mark_active(current).await);
+                let batch_fingerprints = [
+                    action_outgoing_fingerprint("new one", "new:0"),
+                    action_outgoing_fingerprint("new two", "new:1"),
+                ];
+                let before_len = REPLY_STATES
+                    .lock()
+                    .await
+                    .get(&busy_scope)
+                    .map(|state| state.pending_outgoing.len())
+                    .expect("会话状态应存在");
+                assert_eq!(before_len, MAX_PENDING_OUTGOING_PER_SCOPE);
+                assert!(
+                    prepare_outgoing_batch_with_semantic_preview(
+                        current,
+                        &batch_fingerprints,
+                        OutgoingSource::Reply,
+                        Some("new one\nnew two"),
+                    )
+                    .await
+                    .is_none()
+                );
+                let after_len = REPLY_STATES
+                    .lock()
+                    .await
+                    .get(&busy_scope)
+                    .map(|state| state.pending_outgoing.len())
+                    .expect("失败后会话状态仍应存在");
+                assert_eq!(after_len, before_len);
+                for fingerprint in batch_fingerprints {
+                    assert!(
+                        find_prepared_outgoing(busy_scope, fingerprint)
+                            .await
+                            .is_none()
+                    );
+                }
+
+                for guard in committed {
+                    guard.mark_failed().await;
+                }
+                finish(current).await;
+            });
+    }
+
+    #[test]
+    fn outgoing_batch_rejects_duplicate_fingerprints_without_partial_state() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let scope = ReplyScope::Group(9_200_004);
+                let ticket = interrupt(scope).await;
+                assert!(mark_active(ticket).await);
+                let fingerprint = action_outgoing_fingerprint("same", "duplicate");
+                assert!(
+                    prepare_outgoing_batch_with_semantic_preview(
+                        ticket,
+                        &[fingerprint, fingerprint],
+                        OutgoingSource::Reply,
+                        Some("same\nsame"),
+                    )
+                    .await
+                    .is_none()
+                );
+                assert!(find_prepared_outgoing(scope, fingerprint).await.is_none());
+                finish(ticket).await;
+            });
+    }
+
+    #[test]
+    fn cancelling_prepared_proactive_batch_cancels_every_token() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let scope = ReplyScope::Private(9_200_005);
+                let ticket = interrupt(scope).await;
+                assert!(mark_active(ticket).await);
+                let fingerprints = [
+                    action_outgoing_fingerprint("proactive one", "proactive:0"),
+                    action_outgoing_fingerprint("proactive two", "proactive:1"),
+                ];
+                let tokens = prepare_outgoing_batch_with_semantic_preview(
+                    ticket,
+                    &fingerprints,
+                    OutgoingSource::Proactive,
+                    Some("proactive one\nproactive two"),
+                )
+                .await
+                .expect("主动批量消息应能准备");
+                let lock = scope_mutex(scope);
+                let _guard = lock.lock().await;
+                assert!(cancel_prepared_proactive_locked(scope).await);
+                drop(_guard);
+                for token in tokens {
+                    assert_eq!(outgoing_state(token).await, Some(OutgoingState::Cancelled));
+                    assert!(!commit_outgoing(token).await);
+                }
+                finish(ticket).await;
+            });
+    }
+
+    #[test]
+    fn inbound_freeze_selects_the_first_prepared_batch_token() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let scope = ReplyScope::Group(9_200_006);
+                let ticket = interrupt(scope).await;
+                assert!(mark_active(ticket).await);
+                let fingerprints = [
+                    action_outgoing_fingerprint("first", "freeze:0"),
+                    action_outgoing_fingerprint("second", "freeze:1"),
+                ];
+                let tokens = prepare_outgoing_batch_with_semantic_preview(
+                    ticket,
+                    &fingerprints,
+                    OutgoingSource::Reply,
+                    Some("first\nsecond"),
+                )
+                .await
+                .expect("批次应能准备");
+
+                let lock = scope_mutex(scope);
+                let _guard = lock.lock().await;
+                let (frozen, source, reservation_id) =
+                    try_freeze_prepared_for_incoming_locked(scope)
+                        .await
+                        .expect("入站应冻结批次");
+                assert_eq!(frozen, tokens[0]);
+                assert_eq!(source, OutgoingSource::Reply);
+                assert!(release_incoming_locked(ticket, reservation_id, Some(frozen), true).await);
+                drop(_guard);
+
+                assert_eq!(
+                    outgoing_state(tokens[0]).await,
+                    Some(OutgoingState::Superseded)
+                );
+                assert_eq!(
+                    outgoing_state(tokens[1]).await,
+                    Some(OutgoingState::Superseded)
+                );
+            });
     }
 
     #[test]
