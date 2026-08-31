@@ -5,7 +5,7 @@ private_prompt = "你叫芸汐，是一个温柔、害羞、慢热而认真的�
 [server_config]
 enabled = true
 url = "https://api.deepseek.com/chat/completions"
-model_name = "deepseek-v4-flash"
+model_name = "deepseek-chat"
 wire_api = "chat_completions"
 supports_vision = false
 api_key_env = "BOT_API_TOKEN"

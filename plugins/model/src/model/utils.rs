@@ -1395,6 +1395,7 @@ async fn params_model_with_token_limit_and_progress_for_reply_mode(
         return model_error("模型请求队列已满，请稍后再试");
     }
     let queue_guard = ModelQueueGuard;
+    let queue_started = Instant::now();
     let permit = kovi::tokio::time::timeout(
         Duration::from_secs(config.traffic().model_queue_timeout_secs()),
         MODEL_REQUEST_LIMIT.acquire(),
@@ -1406,10 +1407,12 @@ async fn params_model_with_token_limit_and_progress_for_reply_mode(
         Ok(Err(error)) => return model_error(&format!("模型请求队列已关闭: {error}")),
         Err(_) => return model_error("等待模型请求配额超时，请稍后再试"),
     };
+    let queue_wait_ms = queue_started.elapsed().as_millis();
     let mut last_error = String::new();
     let mut response_content = None;
     let max_attempts = model_attempt_count(server_config.max_retries());
     for attempt in 0..max_attempts {
+        let attempt_started = Instant::now();
         let mut request = MODEL_CLIENT
             .post(server_config.endpoint())
             .timeout(Duration::from_secs(server_config.request_timeout_secs()))
@@ -1427,6 +1430,7 @@ async fn params_model_with_token_limit_and_progress_for_reply_mode(
 
         match result {
             Ok(response) if response.status().is_success() => {
+                let status = response.status();
                 match read_model_content(
                     response,
                     progress.as_deref(),
@@ -1435,10 +1439,27 @@ async fn params_model_with_token_limit_and_progress_for_reply_mode(
                 .await
                 {
                     Ok(content) => {
+                        kovi::log::info!(
+                            "Model gateway attempt: attempt={}/{} queue_wait_ms={} elapsed_ms={} status={} terminal=success response_chars={}",
+                            attempt + 1,
+                            max_attempts,
+                            queue_wait_ms,
+                            attempt_started.elapsed().as_millis(),
+                            status.as_u16(),
+                            content.chars().count(),
+                        );
                         response_content = Some(content);
                         break;
                     }
                     Err(error) => {
+                        kovi::log::warn!(
+                            "Model gateway attempt: attempt={}/{} queue_wait_ms={} elapsed_ms={} status={} terminal=parse_error",
+                            attempt + 1,
+                            max_attempts,
+                            queue_wait_ms,
+                            attempt_started.elapsed().as_millis(),
+                            status.as_u16(),
+                        );
                         last_error = format!("模型响应解析失败: {error}");
                     }
                 }
@@ -1456,6 +1477,17 @@ async fn params_model_with_token_limit_and_progress_for_reply_mode(
                     Some(detail) => format!("模型请求返回 HTTP {status}: {detail}"),
                     None => format!("模型请求返回 HTTP {status}"),
                 };
+                kovi::log::warn!(
+                    "Model gateway attempt: attempt={}/{} queue_wait_ms={} elapsed_ms={} status={} terminal=http_error retryable={}",
+                    attempt + 1,
+                    max_attempts,
+                    queue_wait_ms,
+                    attempt_started.elapsed().as_millis(),
+                    status.as_u16(),
+                    status.is_server_error()
+                        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                        || status == reqwest::StatusCode::REQUEST_TIMEOUT,
+                );
                 if !status.is_server_error()
                     && status != reqwest::StatusCode::TOO_MANY_REQUESTS
                     && status != reqwest::StatusCode::REQUEST_TIMEOUT
@@ -1474,6 +1506,15 @@ async fn params_model_with_token_limit_and_progress_for_reply_mode(
                 } else {
                     "网络"
                 };
+                kovi::log::warn!(
+                    "Model gateway attempt: attempt={}/{} queue_wait_ms={} elapsed_ms={} status=none terminal=request_error category={} retryable={}",
+                    attempt + 1,
+                    max_attempts,
+                    queue_wait_ms,
+                    attempt_started.elapsed().as_millis(),
+                    category,
+                    retryable,
+                );
                 last_error = format!("模型请求失败（{category}）: {error}");
                 if !retryable {
                     break;

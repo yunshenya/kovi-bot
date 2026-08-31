@@ -146,6 +146,7 @@ struct KvCache {
 struct MiniMindInner {
     version: IntrinsicModelVersion,
     tokenizer: Tokenizer,
+    semantic_start_token_ids: Vec<u32>,
     device: Device,
     embed_tokens: Tensor,
     layers: Vec<MiniMindLayer>,
@@ -210,6 +211,7 @@ impl MiniMindEngine {
                 config.vocab_size
             ));
         }
+        let semantic_start_token_ids = semantic_start_token_ids(&tokenizer, config.vocab_size)?;
 
         let weights_path = root.join("pytorch_model.bin");
         let tensors = PthTensors::new(&weights_path, None)
@@ -330,6 +332,7 @@ impl MiniMindEngine {
             inner: Arc::new(MiniMindInner {
                 version,
                 tokenizer,
+                semantic_start_token_ids,
                 device,
                 embed_tokens,
                 layers,
@@ -714,10 +717,14 @@ impl MiniMindInner {
 
         for _ in 0..generation_limit {
             check_cancelled(control)?;
-            let next_token = logits
-                .argmax(0)
-                .and_then(|tensor| tensor.to_scalar::<u32>())
-                .map_err(|error| GenerateError::Failed(format!("select next token: {error}")))?;
+            let next_token = if generated_ids.is_empty() {
+                self.select_semantic_start_token(&logits)?
+            } else {
+                logits
+                    .argmax(0)
+                    .and_then(|tensor| tensor.to_scalar::<u32>())
+                    .map_err(|error| GenerateError::Failed(format!("select next token: {error}")))?
+            };
             generated_tokens = generated_tokens.saturating_add(1);
             if next_token == self.eos_token_id || next_token == DEFAULT_EOS_TOKEN_ID {
                 break;
@@ -757,6 +764,20 @@ impl MiniMindInner {
         Ok(IntrinsicInferenceOutput {
             text,
             generated_tokens,
+        })
+    }
+
+    /// The 0.1B checkpoint can greedily choose a bullet or dash and then EOS,
+    /// even when the prompt asks for natural prose. Constrain only the first
+    /// visible token to the highest-scoring token that decodes to text or a
+    /// number. This stays inside the same inference attempt and keeps every
+    /// subsequent token under the checkpoint's ordinary greedy distribution.
+    fn select_semantic_start_token(&self, logits: &Tensor) -> GenerateResult<u32> {
+        let scores = logits
+            .to_vec1::<f32>()
+            .map_err(|error| GenerateError::Failed(format!("read next-token logits: {error}")))?;
+        highest_scoring_allowed_token(&scores, &self.semantic_start_token_ids).ok_or_else(|| {
+            GenerateError::Failed("no semantic start token has a finite logit".to_owned())
         })
     }
 
@@ -1182,6 +1203,35 @@ fn generated_completion_label(output: &str) -> Option<InputCompletion> {
     }
 }
 
+fn semantic_start_token_ids(tokenizer: &Tokenizer, vocab_size: usize) -> Result<Vec<u32>, String> {
+    let mut token_ids = Vec::new();
+    for token_id in 0..vocab_size {
+        let text = tokenizer
+            .decode(&[token_id as u32], true)
+            .map_err(|error| format!("decode vocabulary token {token_id}: {error}"))?;
+        let text = clean_generated_text(&text);
+        if text.chars().any(char::is_alphanumeric) {
+            token_ids.push(token_id as u32);
+        }
+    }
+    if token_ids.is_empty() {
+        return Err("tokenizer has no semantic start tokens".to_owned());
+    }
+    Ok(token_ids)
+}
+
+fn highest_scoring_allowed_token(scores: &[f32], allowed: &[u32]) -> Option<u32> {
+    allowed
+        .iter()
+        .copied()
+        .filter_map(|token_id| {
+            let score = scores.get(token_id as usize).copied()?;
+            score.is_finite().then_some((token_id, score))
+        })
+        .max_by(|(_, left), (_, right)| left.total_cmp(right))
+        .map(|(token_id, _)| token_id)
+}
+
 /// Remove model-internal reasoning and transport markers before the result
 /// crosses the Core planner boundary.
 fn clean_generated_text(raw: &str) -> String {
@@ -1205,8 +1255,12 @@ fn clean_generated_text(raw: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{clean_generated_text, generated_completion_label, validate_config};
+    use super::{
+        clean_generated_text, generated_completion_label, highest_scoring_allowed_token,
+        semantic_start_token_ids, validate_config,
+    };
     use crate::model::{InputCompletion, IntrinsicAssetLoader, IntrinsicRuntimeConfig};
+    use tokenizers::Tokenizer;
 
     #[test]
     fn generated_reasoning_and_transport_markers_are_hidden() {
@@ -1228,6 +1282,47 @@ mod tests {
             Some(InputCompletion::Complete)
         );
         assert_eq!(generated_completion_label("天气不错"), None);
+    }
+
+    #[test]
+    fn semantic_start_selector_skips_higher_scoring_nonsemantic_tokens() {
+        let scores = [9.0, 3.0, 7.0, f32::NAN, 6.0];
+        assert_eq!(
+            highest_scoring_allowed_token(&scores, &[1, 2, 3, 4]),
+            Some(2)
+        );
+        assert_eq!(highest_scoring_allowed_token(&scores, &[3]), None);
+        assert_eq!(highest_scoring_allowed_token(&scores, &[]), None);
+    }
+
+    #[test]
+    fn bundled_tokenizer_semantic_start_set_excludes_dash_and_eos() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../models/yunxi-intrinsic/minimind-3o");
+        let tokenizer = Tokenizer::from_file(root.join("tokenizer.json"))
+            .expect("bundled tokenizer should load");
+        let allowed = semantic_start_token_ids(&tokenizer, 6_400)
+            .expect("bundled tokenizer should contain semantic starts");
+        let dash = tokenizer
+            .encode("-", false)
+            .expect("dash should tokenize")
+            .get_ids()
+            .to_vec();
+
+        assert!(!allowed.is_empty());
+        assert!(!allowed.contains(&2));
+        assert!(dash.iter().all(|token_id| !allowed.contains(token_id)));
+        for sample in ["我", "hello", "42"] {
+            let ids = tokenizer
+                .encode(sample, false)
+                .unwrap_or_else(|error| panic!("{sample:?} should tokenize: {error}"));
+            assert!(
+                ids.get_ids()
+                    .iter()
+                    .any(|token_id| allowed.contains(token_id)),
+                "{sample:?} should have at least one allowed start token"
+            );
+        }
     }
 
     #[test]

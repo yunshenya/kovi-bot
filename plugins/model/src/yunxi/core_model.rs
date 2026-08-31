@@ -59,6 +59,8 @@ const MAX_INTRINSIC_REPLY_PROTOCOL_BYTES: usize = 4_096;
 // parses the JSON payload between the action markers using this character
 // bound, while Core also applies the stricter full-wrapper byte bound above.
 const MAX_MODEL_REPLY_PROTOCOL_CHARS: usize = 4_096;
+const CORE_REPLY_REPAIR_MAX_OUTPUT_TOKENS: u32 = 384;
+const CORE_REPLY_REPAIR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 const INTRINSIC_GENERATION_SUFFIX: &str = "<|im_start|>assistant\n<think>\n\n</think>\n\n";
 const INTRINSIC_AUTONOMOUS_INTENT_MAX_NEW_TOKENS: usize = 16;
 const MAX_AUTONOMOUS_INTRINSIC_NEW_TOKENS: usize = 64;
@@ -1142,14 +1144,26 @@ async fn repair_direct_reply(
     // INTERACTION_CUES protocol. Conflicting protocol instructions were the
     // source of the production repair returning another empty result.
     let mut repair_messages = repair_context_messages(messages, allow_tool_call);
-    let response = ModelGateway::complete_without_tools_or_reply_guidance(
-        &mut repair_messages,
-        reply_ticket,
-        None,
-        vision_images,
-        None,
+    let started = std::time::Instant::now();
+    let response = kovi::tokio::time::timeout(
+        CORE_REPLY_REPAIR_TIMEOUT,
+        ModelGateway::complete_without_tools_or_reply_guidance(
+            &mut repair_messages,
+            reply_ticket,
+            Some(CORE_REPLY_REPAIR_MAX_OUTPUT_TOKENS),
+            vision_images,
+            None,
+        ),
     )
     .await
+    .map_err(|_| {
+        kovi::log::warn!(
+            "Yunxi Core reply repair timed out: elapsed_ms={} limit_ms={}",
+            started.elapsed().as_millis(),
+            CORE_REPLY_REPAIR_TIMEOUT.as_millis(),
+        );
+        CoreDirectRepairFailure::ModelCancelledOrFailed
+    })?
     .ok_or(CoreDirectRepairFailure::ModelCancelledOrFailed)?;
     if crate::model::utils::is_model_error_response(&response.content) {
         return Err(CoreDirectRepairFailure::ModelErrorResponse);
@@ -1173,6 +1187,20 @@ async fn repair_direct_reply(
             Err(failure)
         }
     }
+}
+
+fn strong_response_diagnostic(content: &str, parsed: &ParsedCoreResponse) -> String {
+    let trimmed = content.trim_start();
+    format!(
+        "chars={} cues={} reply_action={} tool={} parsed_chars={} parsed_semantic={} directive={:?}",
+        content.chars().count(),
+        trimmed.starts_with(CORE_INTERACTION_CUES_START),
+        content.contains("[[REPLY_ACTION]]"),
+        content.contains(CORE_TOOL_CALL_START),
+        parsed.content.chars().count(),
+        reply_text_has_semantic_content(&parsed.content),
+        parsed.conversation_directive,
+    )
 }
 
 async fn repair_explicit_message_batch(
@@ -3513,6 +3541,22 @@ fn reply_recovery_required(input: &PlannerInput, tool_follow_up: bool) -> bool {
     reply_expected_for_incoming(input) || tool_follow_up
 }
 
+fn strong_reply_repair_needed(
+    has_visible_reply: bool,
+    recovery_required: bool,
+    fallback_response: bool,
+    intrinsic_response: bool,
+    explicit_message_count: Option<usize>,
+    repair_attempted: bool,
+) -> bool {
+    !has_visible_reply
+        && recovery_required
+        && !fallback_response
+        && !intrinsic_response
+        && explicit_message_count.is_none()
+        && !repair_attempted
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct HostModelRouteDecision {
     route: HostModelRoute,
@@ -4534,6 +4578,7 @@ impl ModelBackend for KoviModelBackend {
                 // a text-only retry would silently change its meaning.
                 (CORE_VISION_FALLBACK_REPLY.to_string(), true)
             } else {
+                let strong_started = std::time::Instant::now();
                 match ModelGateway::complete_without_tools(
                     &mut messages,
                     ticket,
@@ -4632,6 +4677,15 @@ impl ModelBackend for KoviModelBackend {
                             crate::model::finish(ticket).await;
                             return Ok(silent_with_interaction_state(input));
                         }
+                        let parsed = parse_core_response(&response.content);
+                        kovi::log::info!(
+                            "Yunxi Core Strong result: event_id={} message_id={} conversation_id={} elapsed_ms={} {}",
+                            input.event.id(),
+                            message_id_for_log(input),
+                            conversation_id_for_log(input),
+                            strong_started.elapsed().as_millis(),
+                            strong_response_diagnostic(&response.content, &parsed),
+                        );
                         (response.content, false)
                     }
                     None if is_current(ticket).await => {
@@ -5006,21 +5060,23 @@ impl ModelBackend for KoviModelBackend {
                     }
                 }
             }
-            if !core_plan_has_visible_text(&plan)
-                && reply_recovery_required(input, tool_follow_up)
-                && is_current(ticket).await
-                && !fallback_response
-                && !intrinsic_response
-                && tool_intent
-                && !repair_attempted
+            if strong_reply_repair_needed(
+                core_plan_has_visible_text(&plan),
+                reply_recovery_required(input, tool_follow_up),
+                fallback_response,
+                intrinsic_response,
+                explicit_message_count,
+                repair_attempted,
+            ) && is_current(ticket).await
             {
                 mind_candidates = MindCandidates::default();
                 kovi::log::warn!(
-                    "Yunxi Core reply repair: event_id={} message_id={} conversation_id={} reason=empty_or_silent_plan disposition={:?}",
+                    "Yunxi Core reply repair: event_id={} message_id={} conversation_id={} reason=empty_or_nonsemantic_plan disposition={:?} tool_intent={}",
                     input.event.id(),
                     message_id_for_log(input),
                     conversation_id_for_log(input),
                     plan.disposition,
+                    tool_intent,
                 );
                 match repair_direct_reply(
                     &messages,
@@ -5517,8 +5573,8 @@ mod tests {
         safe_single_structured_reply_message, safe_structured_reply_batch,
         sanitize_autonomous_intrinsic_output, sanitize_intrinsic_output,
         select_host_model_route_from_capability, serialize_intrinsic_reply_batch,
-        shadow_projection_for_completed_plan, silent_wait_plan, visible_reply_intent,
-        visible_reply_intents, visible_reply_state_updates,
+        shadow_projection_for_completed_plan, silent_wait_plan, strong_reply_repair_needed,
+        visible_reply_intent, visible_reply_intents, visible_reply_state_updates,
     };
     use crate::model::{
         BotMemory, ConversationCoordinator, IncomingTurnImpact, OutgoingExecutiveDecision,
@@ -6929,6 +6985,30 @@ mod tests {
         );
         assert!(reply_recovery_required(&input, true));
         assert!(!reply_recovery_required(&input, false));
+    }
+
+    #[test]
+    fn required_ordinary_strong_reply_gets_one_direct_repair() {
+        assert!(strong_reply_repair_needed(
+            false, true, false, false, None, false,
+        ));
+        assert!(!strong_reply_repair_needed(
+            true, true, false, false, None, false,
+        ));
+        assert!(!strong_reply_repair_needed(
+            false,
+            true,
+            false,
+            false,
+            Some(2),
+            false,
+        ));
+        assert!(!strong_reply_repair_needed(
+            false, true, false, true, None, false,
+        ));
+        assert!(!strong_reply_repair_needed(
+            false, true, false, false, None, true,
+        ));
     }
 
     #[test]

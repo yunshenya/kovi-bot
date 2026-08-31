@@ -51,13 +51,13 @@ jobs:
       REMOTE_APP_DIR: ${{ secrets.REMOTE_APP_DIR || vars.REMOTE_APP_DIR || '/home/ubuntu/kovi-bot' }}
       KOVI_MAIN_ADMIN: ${{ secrets.KOVI_MAIN_ADMIN || vars.KOVI_MAIN_ADMIN }}
       KOVI_ALLOWED_GROUPS: ${{ secrets.KOVI_ALLOWED_GROUPS || vars.KOVI_ALLOWED_GROUPS || '' }}
-      MODEL_API_URL: ${{ secrets.MODEL_API_URL || vars.MODEL_API_URL || 'https://codex666ai.com' }}
-      MODEL_NAME: ${{ secrets.MODEL_NAME || vars.MODEL_NAME || 'gpt-5.5' }}
-      MODEL_WIRE_API: ${{ secrets.MODEL_WIRE_API || vars.MODEL_WIRE_API || 'responses' }}
-      MODEL_SUPPORTS_VISION: ${{ secrets.MODEL_SUPPORTS_VISION || vars.MODEL_SUPPORTS_VISION || 'true' }}
-      MODEL_API_KEY_ENV: ${{ secrets.MODEL_API_KEY_ENV || vars.MODEL_API_KEY_ENV || 'OPENAI_API_KEY' }}
+      MODEL_API_URL: ${{ secrets.MODEL_API_URL || vars.MODEL_API_URL || 'https://api.deepseek.com' }}
+      MODEL_NAME: ${{ secrets.MODEL_NAME || vars.MODEL_NAME || 'deepseek-chat' }}
+      MODEL_WIRE_API: ${{ secrets.MODEL_WIRE_API || vars.MODEL_WIRE_API || 'chat_completions' }}
+      MODEL_SUPPORTS_VISION: ${{ secrets.MODEL_SUPPORTS_VISION || vars.MODEL_SUPPORTS_VISION || 'false' }}
+      MODEL_API_KEY_ENV: ${{ secrets.MODEL_API_KEY_ENV || vars.MODEL_API_KEY_ENV || 'BOT_API_TOKEN' }}
       MODEL_REQUIRES_AUTH: ${{ secrets.MODEL_REQUIRES_AUTH || vars.MODEL_REQUIRES_AUTH || 'true' }}
-      MODEL_ACTOR_AUTHORIZATION: ${{ secrets.MODEL_ACTOR_AUTHORIZATION || vars.MODEL_ACTOR_AUTHORIZATION || 'local-image-extension' }}
+      MODEL_ACTOR_AUTHORIZATION: ${{ secrets.MODEL_ACTOR_AUTHORIZATION || vars.MODEL_ACTOR_AUTHORIZATION || '' }}
 
     steps:
       - name: Checkout verified revision
