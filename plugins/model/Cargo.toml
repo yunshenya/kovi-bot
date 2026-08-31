@@ -28,4 +28,5 @@ sqlx-core.workspace = true
 sqlx-postgres.workspace = true
 url.workspace = true
 uuid.workspace = true
+unicode-properties = "0.1.4"
 yunxi-core.workspace = true
