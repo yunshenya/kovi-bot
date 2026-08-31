@@ -1260,7 +1260,7 @@ mod tests {
         semantic_start_token_ids, validate_config,
     };
     use crate::model::{InputCompletion, IntrinsicAssetLoader, IntrinsicRuntimeConfig};
-    use tokenizers::Tokenizer;
+    use tokenizers::{Tokenizer, models::wordlevel::WordLevel};
 
     #[test]
     fn generated_reasoning_and_transport_markers_are_hidden() {
@@ -1296,33 +1296,28 @@ mod tests {
     }
 
     #[test]
-    fn bundled_tokenizer_semantic_start_set_excludes_dash_and_eos() {
-        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../models/yunxi-intrinsic/minimind-3o");
-        let tokenizer = Tokenizer::from_file(root.join("tokenizer.json"))
-            .expect("bundled tokenizer should load");
-        let allowed = semantic_start_token_ids(&tokenizer, 6_400)
-            .expect("bundled tokenizer should contain semantic starts");
-        let dash = tokenizer
-            .encode("-", false)
-            .expect("dash should tokenize")
-            .get_ids()
-            .to_vec();
+    fn semantic_start_set_excludes_dash_and_transport_tokens() {
+        let model = WordLevel::builder()
+            .vocab(
+                [
+                    ("<|im_start|>".to_owned(), 0),
+                    ("-".to_owned(), 1),
+                    ("<|im_end|>".to_owned(), 2),
+                    ("我".to_owned(), 3),
+                    ("hello".to_owned(), 4),
+                    ("42".to_owned(), 5),
+                ]
+                .into_iter()
+                .collect(),
+            )
+            .unk_token("<|im_start|>".to_owned())
+            .build()
+            .expect("fixture tokenizer model should build");
+        let tokenizer = Tokenizer::new(model);
+        let allowed = semantic_start_token_ids(&tokenizer, 6)
+            .expect("fixture tokenizer should contain semantic starts");
 
-        assert!(!allowed.is_empty());
-        assert!(!allowed.contains(&2));
-        assert!(dash.iter().all(|token_id| !allowed.contains(token_id)));
-        for sample in ["我", "hello", "42"] {
-            let ids = tokenizer
-                .encode(sample, false)
-                .unwrap_or_else(|error| panic!("{sample:?} should tokenize: {error}"));
-            assert!(
-                ids.get_ids()
-                    .iter()
-                    .any(|token_id| allowed.contains(token_id)),
-                "{sample:?} should have at least one allowed start token"
-            );
-        }
+        assert_eq!(allowed, vec![3, 4, 5]);
     }
 
     #[test]
