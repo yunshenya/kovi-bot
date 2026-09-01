@@ -380,15 +380,23 @@ fn safe_structured_reply_batch(content: &str) -> Option<usize> {
     const START: &str = "[[REPLY_ACTION]]";
     const END: &str = "[[/REPLY_ACTION]]";
     let content = content.trim();
-    if content.len() > MAX_INTRINSIC_REPLY_PROTOCOL_BYTES
-        || content.matches(START).count() != 1
-        || content.matches(END).count() != 1
-        || !content.starts_with(START)
-        || !content.ends_with(END)
-    {
+    if content.len() > MAX_INTRINSIC_REPLY_PROTOCOL_BYTES {
         return None;
     }
-    let payload = &content[START.len()..content.len().saturating_sub(END.len())];
+    // DeepSeek occasionally omits the optional wrapper while preserving the
+    // exact action object. Accept that bounded form for repair, but never
+    // accept a prose prefix/suffix or a partially formed marker.
+    let payload = if content.starts_with(START)
+        && content.ends_with(END)
+        && content.matches(START).count() == 1
+        && content.matches(END).count() == 1
+    {
+        &content[START.len()..content.len().saturating_sub(END.len())]
+    } else if content.starts_with('{') && content.ends_with('}') {
+        content
+    } else {
+        return None;
+    };
     let batch = serde_json::from_str::<IntrinsicReplyBatch>(payload).ok()?;
     if !matches!(batch.disposition.as_deref(), None | Some("reply"))
         || !(2..=MAX_EXPLICIT_REPLY_MESSAGES).contains(&batch.messages.len())
@@ -6813,6 +6821,12 @@ mod tests {
             .expect("a bounded two-message batch should remain sendable");
         assert!(bounded.len() <= MAX_INTRINSIC_REPLY_PROTOCOL_BYTES);
         assert_eq!(safe_structured_reply_batch(&bounded), Some(2));
+        assert_eq!(
+            safe_structured_reply_batch(
+                r#"{"disposition":"reply","messages":["第一条","第二条"]}"#
+            ),
+            Some(2)
+        );
 
         kovi::tokio::runtime::Runtime::new()
             .expect("应创建测试运行时")
