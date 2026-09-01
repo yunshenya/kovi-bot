@@ -484,7 +484,9 @@ async fn main() {
                     ))
                     .await
                 },
-                |admission| admission.active_reply_preserved,
+                |admission| {
+                    admission.active_reply_preserved && !group_decision.explicit_batch_request
+                },
                 |admission| {
                     bridge.enqueue_group_reliably(
                         &ingress_event,
@@ -933,6 +935,36 @@ mod tests {
 
             assert_eq!(owner, MessageOwner::Host);
             assert_eq!(enqueue_calls.get(), 0);
+            assert!(admission.active_reply_preserved);
+            assert!(crate::model::ConversationCoordinator::abandon_incoming(admission).await);
+            crate::model::finish(active).await;
+        });
+    }
+
+    #[test]
+    fn explicit_batch_keeps_core_ownership_while_another_reply_is_active() {
+        let runtime = kovi::tokio::runtime::Runtime::new().expect("应创建测试运行时");
+        runtime.block_on(async {
+            let scope = crate::model::ReplyScope::Group(9_200_005);
+            let active = crate::model::interrupt(scope).await;
+            assert!(crate::model::mark_active(active).await);
+            let enqueue_calls = Cell::new(0);
+            let (owner, admission) = select_message_owner_with_admission_policy(
+                true,
+                || async { crate::model::ConversationCoordinator::begin_incoming(scope).await },
+                // The group ingress supplies this false value for a validated
+                // explicit-count command, so it cannot fall through to Host's
+                // single-message legacy handler.
+                |_| false,
+                |_| {
+                    enqueue_calls.set(enqueue_calls.get() + 1);
+                    EnqueueOutcome::Accepted
+                },
+            )
+            .await;
+
+            assert_eq!(owner, MessageOwner::Core);
+            assert_eq!(enqueue_calls.get(), 1);
             assert!(admission.active_reply_preserved);
             assert!(crate::model::ConversationCoordinator::abandon_incoming(admission).await);
             crate::model::finish(active).await;

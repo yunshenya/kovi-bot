@@ -214,6 +214,10 @@ pub(crate) struct GroupHandlingDecision {
     /// ingress first and receive visible permission only after their durable
     /// target mapping is resolved by the worker.
     pub(crate) planner_attention_requested: bool,
+    /// True for an explicit message-count command that should remain Core-owned
+    /// even while another reply is active. This includes @self/reply candidates;
+    /// the worker still resolves whether a reply target is actually Yunxi.
+    pub(crate) explicit_batch_request: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1294,17 +1298,35 @@ impl CoreBridge {
             return GroupHandlingDecision {
                 handling: GroupCoreHandling::Unsupported,
                 planner_attention_requested: false,
+                explicit_batch_request: false,
             };
         }
         let addressed = message_at_self(&event.message, event.self_id)
             || event.borrow_text().is_some_and(text_mentions_agent);
+        let explicit_batch_request = event.borrow_text().is_some_and(|text| {
+            super::core_model::requested_message_count(&bounded_text(text)).is_some()
+                && !event.message.iter().any(|segment| {
+                    segment.type_ == "at"
+                        && segment
+                            .data
+                            .get("qq")
+                            .and_then(value_as_i64)
+                            .is_some_and(|value| value != event.self_id)
+                })
+        });
         // A syntactically valid reply segment must cross the admission boundary
         // before any Redis/PostgreSQL lookup. The single ingress worker resolves
         // whether it actually targets Yunxi once the conversation is canonical.
         let reply_target_candidate = reply_message_id(&event.message).is_some();
-        let planner_attention_requested =
-            !addressed && !reply_target_candidate && self.should_request_ambient_attention(event);
-        let handling = if addressed || reply_target_candidate || planner_attention_requested {
+        let planner_attention_requested = !addressed
+            && !reply_target_candidate
+            && !explicit_batch_request
+            && self.should_request_ambient_attention(event);
+        let handling = if addressed
+            || reply_target_candidate
+            || explicit_batch_request
+            || planner_attention_requested
+        {
             GroupCoreHandling::Decide
         } else {
             GroupCoreHandling::Observe
@@ -1312,6 +1334,7 @@ impl CoreBridge {
         GroupHandlingDecision {
             handling,
             planner_attention_requested,
+            explicit_batch_request,
         }
     }
 
@@ -1830,6 +1853,7 @@ impl InboundMessage {
             return None;
         }
         let text = bounded_text(event.borrow_text().unwrap_or_default());
+        let explicit_request = group_message_requests_explicit_batch(&event.message, &text);
         let attachments = normalize_attachments(&event.message);
         let vision_attachments = crate::vision::extract_image_attachments(&event.message);
         Some(Self {
@@ -1843,7 +1867,7 @@ impl InboundMessage {
             addressed_to_agent: message_at_self(&event.message, event.self_id)
                 || text_mentions_agent(&text),
             visible_reply_allowed: true,
-            explicit_request: false,
+            explicit_request,
             stop_requested: false,
             planner_attention_requested,
             incoming_admission: None,
@@ -3404,6 +3428,12 @@ async fn resolve_and_submit_inner(
     } else {
         EventPriority::Normal
     };
+    let requested_message_count = (message.address.kind() == ConversationKind::Direct
+        || message.addressed_to_agent
+        || recent_agent_reply
+        || message.explicit_request)
+        .then(|| super::core_model::requested_message_count(&message.text))
+        .flatten();
     let event = WorldEvent::message_received(
         priority,
         MessageReceivedEvent {
@@ -3422,7 +3452,8 @@ async fn resolve_and_submit_inner(
             explicit_request: message.explicit_request,
             visible_reply_allowed,
         },
-    );
+    )
+    .with_requested_message_count(requested_message_count);
     // Persist the external reference before admitting the event. The runtime
     // may process a high-priority message immediately and a reply action must
     // be able to resolve its Core MessageId without racing this write.
@@ -3864,6 +3895,11 @@ fn text_mentions_agent(message: &str) -> bool {
     ["芸汐", "云汐"].iter().any(|name| message.contains(name))
 }
 
+fn group_message_requests_explicit_batch(message: &Message, text: &str) -> bool {
+    ambient_group_payload_can_be_sampled(message)
+        && super::core_model::requested_message_count(text).is_some()
+}
+
 /// Read an explicit rollout switch while keeping the repository default
 /// enabled. Unknown values fall back to the supplied default instead of
 /// silently changing ownership at the ingress boundary.
@@ -3902,11 +3938,12 @@ mod tests {
         acquire_alias_handler_barriers, action_result_event, ambient_group_payload_can_be_sampled,
         block_user_aliases, bounded_text, core_cutover_enabled_from_value,
         core_group_payload_is_supported, core_private_payload_is_supported,
-        dispatch_action_with_timeout, effective_visible_reply_allowed, idle_tick_event,
-        merge_data_erasure_targets, message_at_self, normalize_attachments, reply_message_id,
-        resolve_and_submit, run_ingress, run_runtime, send_action_ingress_command_with_ack,
-        send_ingress_command_with_ack, send_ingress_command_with_ack_timeouts,
-        submit_message_collisions, submit_runtime_with_timeout, text_mentions_agent, unblock_users,
+        dispatch_action_with_timeout, effective_visible_reply_allowed,
+        group_message_requests_explicit_batch, idle_tick_event, merge_data_erasure_targets,
+        message_at_self, normalize_attachments, reply_message_id, resolve_and_submit, run_ingress,
+        run_runtime, send_action_ingress_command_with_ack, send_ingress_command_with_ack,
+        send_ingress_command_with_ack_timeouts, submit_message_collisions,
+        submit_runtime_with_timeout, text_mentions_agent, unblock_users,
     };
     use crate::model::{
         OutgoingSource, ReplyScope, commit_outgoing, interrupt, mark_active, mark_outgoing_sent,
@@ -4302,6 +4339,44 @@ mod tests {
             "大家觉得这个怎么样"
         )));
         assert!(text_mentions_agent("芸汐，看看这个"));
+    }
+
+    #[test]
+    fn explicit_group_message_batches_receive_reply_admission_without_a_mention() {
+        let plain = Message::from("给我发两条消息");
+        assert!(group_message_requests_explicit_batch(
+            &plain,
+            "给我发两条消息"
+        ));
+        assert!(group_message_requests_explicit_batch(
+            &Message::from("请发送 3 条自然回复"),
+            "请发送 3 条自然回复"
+        ));
+        assert!(!group_message_requests_explicit_batch(
+            &Message::from("帮我检查这两条消息为什么没发出去"),
+            "帮我检查这两条消息为什么没发出去"
+        ));
+        assert!(!group_message_requests_explicit_batch(
+            &Message::from("他说发两条消息"),
+            "他说发两条消息"
+        ));
+
+        let at_other = Message::from(vec![
+            Segment::new("at", json!({"qq": "456"})),
+            Segment::new("text", json!({"text": "给我发两条消息"})),
+        ]);
+        assert!(!group_message_requests_explicit_batch(
+            &at_other,
+            "给我发两条消息"
+        ));
+        let reply_other = Message::from(vec![
+            Segment::new("reply", json!({"id": "789"})),
+            Segment::new("text", json!({"text": "给我发两条消息"})),
+        ]);
+        assert!(!group_message_requests_explicit_batch(
+            &reply_other,
+            "给我发两条消息"
+        ));
     }
 
     #[test]

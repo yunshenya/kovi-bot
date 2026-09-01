@@ -164,7 +164,7 @@ impl Default for ServerConfig {
         Self {
             enabled: true,
             url: "https://api.deepseek.com/chat/completions".to_string(),
-            model_name: "deepseek-chat".to_string(),
+            model_name: "deepseek-v4-flash".to_string(),
             wire_api: "chat_completions".to_string(),
             supports_vision: false,
             api_key_env: "BOT_API_TOKEN".to_string(),
@@ -185,6 +185,7 @@ mod tests {
     fn deepseek_default_is_text_only() {
         let config = ServerConfig::default();
         assert!(config.enabled());
+        assert_eq!(config.model_name(), "deepseek-v4-flash");
         assert_eq!(config.wire_api(), "chat_completions");
         assert!(!config.supports_vision());
         assert_eq!(config.api_key_env(), "BOT_API_TOKEN");

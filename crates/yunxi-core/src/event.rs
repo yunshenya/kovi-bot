@@ -782,6 +782,11 @@ pub struct WorldEvent {
     /// platform message; it is never accepted from or emitted to the wire.
     #[serde(skip)]
     source_message_id: Option<MessageId>,
+    /// Trusted explicit message-count contract captured by the host at ingress.
+    /// It is process-local envelope metadata, so a wire payload cannot mint or
+    /// alter the contract while derived tool-result events retain it.
+    #[serde(skip)]
+    requested_message_count: Option<u8>,
     /// Trusted request-level preference for how tool result follow-ups should
     /// be delivered. It follows the causal chain but cannot be set by wire
     /// input.
@@ -807,6 +812,7 @@ impl WorldEvent {
             kind,
             actor: None,
             source_message_id: None,
+            requested_message_count: None,
             tool_notification_policy: None,
         }
     }
@@ -844,6 +850,7 @@ impl WorldEvent {
             kind,
             actor: None,
             source_message_id: parent.source_message_id(),
+            requested_message_count: parent.requested_message_count,
             tool_notification_policy: parent.tool_notification_policy(),
         })
     }
@@ -903,6 +910,24 @@ impl WorldEvent {
                 _ => None,
             },
         }
+    }
+
+    /// Returns the host-validated explicit message-count contract carried by
+    /// this event's causal chain.
+    #[must_use]
+    pub const fn requested_message_count(&self) -> Option<u8> {
+        self.requested_message_count
+    }
+
+    /// Attaches a bounded explicit message-count contract to an ingress event.
+    /// Values outside the supported compact range are ignored so callers cannot
+    /// create an unbounded delivery plan through metadata alone.
+    #[must_use]
+    pub fn with_requested_message_count(mut self, count: Option<usize>) -> Self {
+        self.requested_message_count = count
+            .and_then(|count| u8::try_from(count).ok())
+            .filter(|count| (2..=8).contains(count));
+        self
     }
 
     #[must_use]
@@ -1258,7 +1283,8 @@ mod tests {
                 explicit_request: true,
                 visible_reply_allowed: true,
             },
-        );
+        )
+        .with_requested_message_count(Some(2));
         let child = WorldEvent::derived_from(
             &root,
             Utc::now(),
@@ -1274,6 +1300,8 @@ mod tests {
         .expect("derived tool event should be valid");
         assert_eq!(root.source_message_id(), Some(message_id));
         assert_eq!(child.source_message_id(), Some(message_id));
+        assert_eq!(root.requested_message_count(), Some(2));
+        assert_eq!(child.requested_message_count(), Some(2));
     }
 
     #[test]
