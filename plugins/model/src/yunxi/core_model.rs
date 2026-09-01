@@ -380,34 +380,76 @@ fn safe_structured_reply_batch(content: &str) -> Option<usize> {
     const START: &str = "[[REPLY_ACTION]]";
     const END: &str = "[[/REPLY_ACTION]]";
     let content = content.trim();
-    if content.len() > MAX_INTRINSIC_REPLY_PROTOCOL_BYTES {
-        return None;
-    }
-    // DeepSeek occasionally omits the optional wrapper while preserving the
-    // exact action object. Accept that bounded form for repair, but never
-    // accept a prose prefix/suffix or a partially formed marker.
-    let payload = if content.starts_with(START)
+    let payload = if content.len() <= MAX_INTRINSIC_REPLY_PROTOCOL_BYTES
+        && content.starts_with(START)
         && content.ends_with(END)
         && content.matches(START).count() == 1
         && content.matches(END).count() == 1
     {
         &content[START.len()..content.len().saturating_sub(END.len())]
-    } else if content.starts_with('{') && content.ends_with('}') {
+    } else if content.len() <= MAX_INTRINSIC_REPLY_PROTOCOL_BYTES
+        && content.starts_with('{')
+        && content.ends_with('}')
+    {
+        // DeepSeek occasionally omits the optional wrapper while preserving
+        // the exact action object. Accept that bounded form for repair, but
+        // never accept a prose prefix/suffix or a partial marker.
         content
     } else {
         return None;
     };
-    let batch = serde_json::from_str::<IntrinsicReplyBatch>(payload).ok()?;
-    if !matches!(batch.disposition.as_deref(), None | Some("reply"))
-        || !(2..=MAX_EXPLICIT_REPLY_MESSAGES).contains(&batch.messages.len())
-        || batch
-            .messages
-            .iter()
-            .any(|message| !reply_text_has_semantic_content(message))
+
+    let value = serde_json::from_str::<serde_json::Value>(payload).ok()?;
+    let object = value.as_object()?;
+    if object
+        .get("disposition")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|disposition| disposition != "reply")
+        || object
+            .get("disposition")
+            .is_some_and(|disposition| !disposition.is_string())
     {
         return None;
     }
-    Some(batch.messages.len())
+    let messages = object.get("messages")?.as_array()?;
+    if !(2..=MAX_EXPLICIT_REPLY_MESSAGES).contains(&messages.len()) {
+        return None;
+    }
+    if messages.iter().any(|message| {
+        message
+            .as_str()
+            .is_none_or(|message| !reply_text_has_semantic_content(message))
+    }) {
+        return None;
+    }
+    Some(messages.len())
+}
+
+/// Extract only the visible message strings from a repair action and rebuild a
+/// canonical envelope. Providers sometimes copy harmless host-protocol fields
+/// into a repair response; those fields must not reach the normal action parser
+/// where they could acquire @, quote, recall, or other side effects.
+fn canonical_structured_reply_batch(content: &str, expected_count: usize) -> Option<String> {
+    if safe_structured_reply_batch(content) != Some(expected_count) {
+        return None;
+    }
+    const START: &str = "[[REPLY_ACTION]]";
+    const END: &str = "[[/REPLY_ACTION]]";
+    let trimmed = content.trim();
+    let payload = if trimmed.starts_with(START) {
+        &trimmed[START.len()..trimmed.len().saturating_sub(END.len())]
+    } else {
+        trimmed
+    };
+    let value = serde_json::from_str::<serde_json::Value>(payload).ok()?;
+    let messages = value
+        .as_object()?
+        .get("messages")?
+        .as_array()?
+        .iter()
+        .map(|message| message.as_str().map(str::trim).map(ToOwned::to_owned))
+        .collect::<Option<Vec<_>>>()?;
+    serialize_intrinsic_reply_batch(&messages).map(|(content, _)| content)
 }
 
 fn serialize_intrinsic_reply_batch(messages: &[String]) -> Option<(String, usize)> {
@@ -1401,15 +1443,17 @@ async fn repair_explicit_message_batch(
     if crate::model::utils::is_model_error_response(&response.content) {
         return Err(CoreDirectRepairFailure::ModelErrorResponse);
     }
-    if safe_structured_reply_batch(&response.content) != Some(requested_count) {
+    let Some(canonical_content) =
+        canonical_structured_reply_batch(&response.content, requested_count)
+    else {
         kovi::log::warn!(
             "Yunxi Core explicit message batch repair rejected: requested_count={} {}",
             requested_count,
             core_tool_protocol_diagnostic(&response.content),
         );
         return Err(CoreDirectRepairFailure::InvalidProtocol);
-    }
-    let plan = ReplyPlan::from_model_output(scope, &response.content).await;
+    };
+    let plan = ReplyPlan::from_model_output(scope, &canonical_content).await;
     if !core_plan_has_visible_text(&plan)
         || plan.is_silent()
         || plan.bubbles.len() != requested_count
@@ -5782,17 +5826,18 @@ mod tests {
         autonomous_conversation_prompt, autonomous_conversation_protocol,
         autonomous_empty_generation_plan, autonomous_generation_failure_plan, baseline_disposition,
         batch_fence_action_key, build_bounded_intrinsic_reply_batch,
-        classify_persistent_person_identity, constrain_autonomous_tick_plan,
-        conversation_id_for_log, core_message_prompt, core_plan_has_visible_text,
-        core_tool_protocol_diagnostic, default_autonomous_directive, defer_unroutable_due,
-        deterministic_route_fallback, due_reply_target, eligible_mind_candidates,
-        explicit_message_batch_needs_repair, explicit_message_count_for_event,
-        explicit_message_count_for_input, explicit_message_count_instruction,
-        interaction_state_updates_with_cues, intrinsic_autonomous_intent_prompt,
-        intrinsic_fallback_is_eligible, intrinsic_output_is_unsafe, intrinsic_prompt,
-        keeps_existing_prepared_plan, message_id_for_log, mind_context_messages,
-        mind_outgoing_fence_required, parse_autonomous_intent_response, parse_core_response,
-        parse_core_tool_intent, parse_core_tool_intents, parse_core_tool_intents_with_policy,
+        canonical_structured_reply_batch, classify_persistent_person_identity,
+        constrain_autonomous_tick_plan, conversation_id_for_log, core_message_prompt,
+        core_plan_has_visible_text, core_tool_protocol_diagnostic, default_autonomous_directive,
+        defer_unroutable_due, deterministic_route_fallback, due_reply_target,
+        eligible_mind_candidates, explicit_message_batch_needs_repair,
+        explicit_message_count_for_event, explicit_message_count_for_input,
+        explicit_message_count_instruction, interaction_state_updates_with_cues,
+        intrinsic_autonomous_intent_prompt, intrinsic_fallback_is_eligible,
+        intrinsic_output_is_unsafe, intrinsic_prompt, keeps_existing_prepared_plan,
+        message_id_for_log, mind_context_messages, mind_outgoing_fence_required,
+        parse_autonomous_intent_response, parse_core_response, parse_core_tool_intent,
+        parse_core_tool_intents, parse_core_tool_intents_with_policy,
         parse_core_tool_intents_with_visible_suffix, parse_direct_repair_output,
         parse_direct_repair_output_with_policy, parse_intrinsic_autonomous_directive,
         parse_qq_conversation, pre_model_plan, prepared_outgoing_semantic_context,
@@ -6826,6 +6871,14 @@ mod tests {
                 r#"{"disposition":"reply","messages":["第一条","第二条"]}"#
             ),
             Some(2)
+        );
+        let provider_extra_fields = r#"[[REPLY_ACTION]]{"disposition":"reply","messages":["第一条有内容","第二条也有内容"],"requests_image":false,"conversation_directive":"wait"}[[/REPLY_ACTION]]"#;
+        assert_eq!(safe_structured_reply_batch(provider_extra_fields), Some(2));
+        let canonical = canonical_structured_reply_batch(provider_extra_fields, 2)
+            .expect("repair should canonicalize provider metadata");
+        assert_eq!(
+            canonical,
+            r#"[[REPLY_ACTION]]{"disposition":"reply","messages":["第一条有内容","第二条也有内容"]}[[/REPLY_ACTION]]"#
         );
 
         kovi::tokio::runtime::Runtime::new()
