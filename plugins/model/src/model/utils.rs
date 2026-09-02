@@ -878,10 +878,9 @@ pub(crate) fn likely_requires_tool_protocol(content: &str) -> bool {
         .iter()
         .filter_map(|marker| text.find(marker))
         .min()
+        && !has_explicit_tool_action_before(&text, marker_start)
     {
-        if !has_explicit_tool_action_before(&text, marker_start) {
-            return false;
-        }
+        return false;
     }
 
     // These are explicit negative instructions.  Do not let a quoted or
@@ -2623,7 +2622,7 @@ fn build_responses_request_body(
     })
 }
 
-fn model_error(error: &str) -> BotMemory {
+pub(crate) fn model_error(error: &str) -> BotMemory {
     eprintln!("[ERROR] {}", error);
     BotMemory {
         role: Roles::Assistant,
@@ -2662,6 +2661,7 @@ fn append_vision_analysis(messages: &mut [BotMemory], analysis: &str) {
 }
 
 pub(crate) fn is_model_error_response(content: &str) -> bool {
+    let content = content.trim_start();
     content.starts_with(MODEL_FAILURE_RESPONSE_PREFIX)
         // Accept the previous marker while rolling releases are mixed, but do
         // not generate it for new requests.

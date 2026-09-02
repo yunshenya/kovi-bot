@@ -6,7 +6,7 @@ use super::thinking::ThinkingReporter;
 use super::tool_access::{ToolExecutionContext, ToolExecutionResult, tool_registry};
 use super::utils::{
     BotMemory, Roles, complete_truncated_json_object, is_model_error_response,
-    likely_requires_tool_protocol, params_model_with_plain_style_context,
+    likely_requires_tool_protocol, model_error, params_model_with_plain_style_context,
     params_model_with_plain_style_context_allow_empty,
     params_model_with_token_limit_and_progress_for_reply, params_model_without_reply_guidance,
     vision_failure_detail,
@@ -72,33 +72,69 @@ fn latest_user_message(messages: &[BotMemory]) -> Option<&str> {
         .map(|message| message.content.as_str())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContextPromptMode {
+    LegacyReplyActions,
+    PlainText,
+    ToolProtocol,
+}
+
+fn context_prompt_mode(
+    tool_context: &ToolExecutionContext,
+    tools_exposed: bool,
+) -> ContextPromptMode {
+    if tools_exposed || tool_context.requires_structured_tool_turn() {
+        ContextPromptMode::ToolProtocol
+    } else if tool_context.allow_reply_actions {
+        ContextPromptMode::LegacyReplyActions
+    } else {
+        ContextPromptMode::PlainText
+    }
+}
+
 async fn interruptible_model_call_for_context(
     messages: &mut [BotMemory],
     tool_context: &ToolExecutionContext,
+    tools_exposed: bool,
     reply_ticket: ReplyTicket,
     max_output_tokens: Option<u32>,
     vision_images: &[VisionImage],
     progress: Option<Arc<ThinkingReporter>>,
 ) -> Option<BotMemory> {
-    if tool_context.allow_reply_actions {
-        interruptible_model_call(
-            messages,
-            reply_ticket,
-            max_output_tokens,
-            vision_images,
-            progress,
-        )
-        .await
-    } else {
-        // Plain turns must not receive the ThinkingReporter output marker.
-        interruptible_model_call_with_plain_style_context(
-            messages,
-            reply_ticket,
-            max_output_tokens,
-            vision_images,
-            None,
-        )
-        .await
+    match context_prompt_mode(tool_context, tools_exposed) {
+        // Once the host has appended a tool registry, that registry is the
+        // only structured-output contract for this request. Do not append the
+        // normal visible-reply style context as a competing instruction.
+        ContextPromptMode::ToolProtocol => {
+            interruptible_model_call_without_reply_guidance(
+                messages,
+                reply_ticket,
+                max_output_tokens,
+                vision_images,
+                None,
+            )
+            .await
+        }
+        ContextPromptMode::LegacyReplyActions => {
+            interruptible_model_call(
+                messages,
+                reply_ticket,
+                max_output_tokens,
+                vision_images,
+                progress,
+            )
+            .await
+        }
+        ContextPromptMode::PlainText => {
+            interruptible_model_call_with_plain_style_context(
+                messages,
+                reply_ticket,
+                max_output_tokens,
+                vision_images,
+                None,
+            )
+            .await
+        }
     }
 }
 
@@ -118,6 +154,7 @@ pub(crate) async fn params_model_with_tool_access(
         return interruptible_model_call_for_context(
             messages,
             &tool_context,
+            false,
             reply_ticket,
             max_output_tokens,
             vision_images,
@@ -173,6 +210,7 @@ pub(crate) async fn params_model_with_tool_access(
         return interruptible_model_call_for_context(
             messages,
             &tool_context,
+            false,
             reply_ticket,
             max_output_tokens,
             vision_images,
@@ -229,6 +267,7 @@ pub(crate) async fn params_model_with_tool_access(
         let Some(response) = interruptible_model_call_for_context(
             &mut request,
             &tool_context,
+            true,
             reply_ticket,
             max_output_tokens,
             vision_images,
@@ -570,6 +609,7 @@ pub(crate) async fn params_model_with_tool_access(
     let Some(response) = interruptible_model_call_for_context(
         &mut request,
         &tool_context,
+        true,
         reply_ticket,
         max_output_tokens,
         vision_images,
@@ -603,10 +643,10 @@ pub(crate) async fn params_model_with_tool_access(
     } else if agent_run_create_succeeded {
         completed_agent_run_response()
     } else {
-        BotMemory {
-            role: Roles::Assistant,
-            content: "我暂时没能把外部资料查完整……你可以换个说法再问我一次。".to_string(),
-        }
+        // A remaining tool marker after the bounded loop is an internal
+        // execution failure. Keep it out of the visible reply path; callers
+        // handle the marker as a silent/retryable incident.
+        model_error("工具调用轮次耗尽，未能完成外部资料查询")
     }
 }
 
@@ -1147,10 +1187,11 @@ fn format_tool_result(name: &str, result: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ParsedToolCall, ReminderCreateFailure, completed_group_followup_response,
-        completed_group_message_response, interrupted_response, likely_requires_tool_protocol,
-        merge_group_send_result, parse_tool_call_with_wrapping, reminder_failure_response,
-        required_group_followup_failure, required_group_message_failure,
+        ContextPromptMode, ParsedToolCall, ReminderCreateFailure,
+        completed_group_followup_response, completed_group_message_response, context_prompt_mode,
+        interrupted_response, is_model_error_response, likely_requires_tool_protocol,
+        merge_group_send_result, model_error, parse_tool_call_with_wrapping,
+        reminder_failure_response, required_group_followup_failure, required_group_message_failure,
         tool_result_has_task_status, tool_round_limit,
     };
     use crate::model::MessageDestination;
@@ -1199,6 +1240,64 @@ mod tests {
                 "external-tool intent should still expose tools: {content}"
             );
         }
+    }
+
+    #[test]
+    fn tool_registry_turn_does_not_receive_plain_reply_guidance() {
+        let context = ToolExecutionContext {
+            subject_id: 42,
+            actor_user_id: 42,
+            is_admin: false,
+            is_main_admin: false,
+            context: "tool_prompt_test",
+            destination: MessageDestination::Private(42),
+            source_message_id: None,
+            scheduled: false,
+            group_paused: false,
+            runtime_bot: None,
+            sticker_teaching: None,
+            requires_reminder_create: false,
+            requires_agent_run_create: false,
+            requires_group_message_send: false,
+            requires_group_followup: false,
+            requires_external_tool: false,
+            allow_reply_actions: false,
+        };
+        assert_eq!(
+            context_prompt_mode(&context, true),
+            ContextPromptMode::ToolProtocol
+        );
+        assert_eq!(
+            context_prompt_mode(
+                &ToolExecutionContext {
+                    scheduled: true,
+                    ..context.clone()
+                },
+                false,
+            ),
+            ContextPromptMode::ToolProtocol
+        );
+        assert_eq!(
+            context_prompt_mode(
+                &ToolExecutionContext {
+                    allow_reply_actions: true,
+                    ..context.clone()
+                },
+                false,
+            ),
+            ContextPromptMode::LegacyReplyActions
+        );
+        assert_eq!(
+            context_prompt_mode(&context, false),
+            ContextPromptMode::PlainText
+        );
+    }
+
+    #[test]
+    fn exhausted_optional_tool_turn_returns_internal_failure_marker() {
+        let response = model_error("工具调用轮次耗尽，未能完成外部资料查询");
+        assert!(is_model_error_response(&response.content));
+        assert!(!response.content.contains("换个说法再问我一次"));
     }
 
     #[test]
