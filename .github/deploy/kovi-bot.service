@@ -9,6 +9,9 @@ User=ubuntu
 Group=ubuntu
 WorkingDirectory=/home/ubuntu/kovi-bot/current
 EnvironmentFile=/home/ubuntu/kovi-bot/current/.env
+# PostgreSQL's idempotent CREATE/ALTER IF NOT EXISTS notices are routine startup noise.
+# Keep warnings and errors visible while suppressing only SQLx's info-level notices.
+Environment=RUST_LOG=info,sqlx::postgres::notice=warn
 ExecStartPre=/usr/bin/rm -f /home/ubuntu/kovi-bot/runtime/ready
 ExecStart=/home/ubuntu/kovi-bot/current/kovi-bot
 Restart=on-failure
