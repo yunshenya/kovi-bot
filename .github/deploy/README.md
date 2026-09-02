@@ -59,7 +59,8 @@ reviewers。截图中的敏感配置放在仓库级 Actions Secrets：
   非空，并且必须与 NapCat 配置完全一致。
 - `POSTGRES_PASSWORD`：服务器 `postgres` 用户密码；工作流会据此生成本机 PostgreSQL 的连接串。
 - `KOVI_MAIN_ADMIN`：机器人所有者 QQ 号。
-- `MODEL_API_URL`、`MODEL_NAME`、`MODEL_SUPPORTS_VISION`、`MODEL_WIRE_API`。`MODEL_NAME` 必须是
+- `MODEL_API_URL`、`MODEL_NAME`、`MODEL_SUPPORTS_VISION`、`MODEL_WIRE_API`、`MODEL_THINKING_MODE`。
+  `MODEL_NAME` 必须是
   服务端实际提供的模型 ID（例如 `gpt-5.5`），不能填 `-` 这类占位值。
 - `MODEL_ACTOR_AUTHORIZATION`、`VISION_API_TOKEN`。
 - `VISION_ACTOR_AUTHORIZATION`、`VISION_API_URL`、`VISION_MODEL_NAME`、
@@ -77,6 +78,7 @@ reviewers。截图中的敏感配置放在仓库级 Actions Secrets：
   `kovi_bot_authorized_admins` 表；配置文件中的 `admins` 会在首次初始化时迁移。
 - `MODEL_API_KEY_ENV`：`OPENAI_API_KEY`（默认）或 `BOT_API_TOKEN`。
 - `MODEL_REQUIRES_AUTH`：默认 `true`；外部 HTTPS 模型服务应保持启用，以发送 `OPENAI_API_KEY` 的 Bearer Token。
+- `MODEL_THINKING_MODE`：`disabled`（生产默认，适用于 DeepSeek v4）或 `auto`（不发送供应商特定的推理开关）。
 - `DATABASE_URL` 如果不想使用 `POSTGRES_PASSWORD` 自动生成的默认连接串。
 - `BRAVE_SEARCH_API_KEY`、`REDIS_URL`：按需配置。
 

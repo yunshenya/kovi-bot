@@ -309,10 +309,17 @@ mod tests {
     #[test]
     fn repository_configuration_loads_with_all_sections() {
         let config = ModelConfig::load().expect("仓库配置应可加载");
+        assert_eq!(config.server_config().thinking_mode(), "disabled");
         assert_eq!(config.memory().max_entries(), 1000);
         assert_eq!(config.mood().cache_ttl_secs(), 300);
         assert_eq!(config.topic().recent_topic_cooldown_secs(), 604_800);
         assert!(!config.prompt().system_prompt().contains("NEXT_MESSAGE"));
         assert!(!config.prompt().private_prompt().contains("NEXT_MESSAGE"));
+        assert!(!config.prompt().system_prompt().contains("回复协议"));
+        assert!(!config.prompt().private_prompt().contains("回复协议"));
+        assert!(!config.prompt().system_prompt().contains("silent 决策"));
+        assert!(!config.prompt().private_prompt().contains("silent 决策"));
+        assert!(!config.prompt().system_prompt().contains("REPLY_ACTION"));
+        assert!(!config.prompt().private_prompt().contains("REPLY_ACTION"));
     }
 }

@@ -22,7 +22,7 @@ use crate::model::traffic::{InboundScope, bounded_input, clear_private_traffic, 
 use crate::model::utils::{
     clear_private_runtime_data, command_help, is_bot_admin, is_group_admin_command,
     is_help_command, is_main_admin, is_restricted_command, private_chat_claimed,
-    send_sys_info_private,
+    report_vision_failure, send_sys_info_private,
 };
 use crate::private_image_memory::{
     RecentPrivateImage, forget_private_user_images, recent_private_images, remember_private_images,
@@ -610,22 +610,21 @@ pub(crate) async fn private_message_event_after_ingress(
         match resolve_image_urls(&images, &bot).await {
             Ok(images) if !images.is_empty() => images,
             Ok(_) => {
-                send_private_direct_response(
+                report_vision_failure(
                     &bot,
-                    user_id,
-                    initial_admission,
-                    "我暂时拿不到这张截图的内容，再发一次或换张图试试吧。",
+                    &format!("私聊 {}", user_id),
+                    message,
+                    "未解析到可用图片地址",
                 )
                 .await;
                 return;
             }
             Err(error) => {
-                eprintln!("[ERROR] 私聊读取截图失败 (用户: {}): {}", user_id, error);
-                send_private_direct_response(
+                report_vision_failure(
                     &bot,
-                    user_id,
-                    initial_admission,
-                    "我暂时读不到这张截图，再发一次或换张图试试吧。",
+                    &format!("私聊 {}", user_id),
+                    message,
+                    &error.to_string(),
                 )
                 .await;
                 return;

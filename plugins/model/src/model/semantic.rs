@@ -2,8 +2,14 @@
 //!
 //! 这里负责理解自然语言，不负责发送消息或执行副作用。上层只消费结构化结果，
 //! 仍然由程序负责权限、协议标记、限流、撤回白名单和资源限制。
+//!
+//! 重要边界：本模块的结构化结果是**内部控制面快照**，不是回复格式。它只用于
+//! 情绪、图片指代和会话相关性等低权限决策；解析失败时按未知/中性处理。模型输出
+//! 永远不会直接传给 `ReplyPlan`、消息传输层或 QQ。可见回复走 `plain_style_context`
+//! 路径，由宿主决定是否发送、气泡数量、顺序和动作。不要把本模块的 JSON 合同
+//! 复用到可见回复或动作协议中。
 
-use super::utils::{BotMemory, Roles, params_model_with_token_limit};
+use super::utils::{BotMemory, Roles, params_model_without_reply_guidance};
 use serde::Deserialize;
 use serde_json::json;
 use yunxi_core::InteractionCues;
@@ -12,6 +18,14 @@ const MAX_SEMANTIC_OUTPUT_TOKENS: u32 = 420;
 const MAX_CONTEXT_CHARS: usize = 6_000;
 const MAX_LIST_ITEMS: usize = 6;
 const MAX_LIST_ITEM_CHARS: usize = 40;
+const REPLY_OR_TOOL_PROTOCOL_MARKERS: &[&str] = &[
+    "[[REPLY_ACTION]]",
+    "[[/REPLY_ACTION]]",
+    "[[TOOL_CALL]]",
+    "[[/TOOL_CALL]]",
+    "[[INTERACTION_CUES]]",
+    "[[/INTERACTION_CUES]]",
+];
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum SemanticImageIntent {
@@ -199,6 +213,11 @@ impl MessageUnderstanding {
     }
 }
 
+/// Internal-only semantic snapshot returned by the classifier model.
+///
+/// This type deliberately does not contain reply text or transport actions. Keep it
+/// separate from `ReplyPlan` so a malformed/hostile model response can at most lose
+/// semantic hints and can never manufacture a visible message or side effect.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct RawUnderstanding {
@@ -231,7 +250,7 @@ pub(crate) async fn understand(request: UnderstandingRequest) -> MessageUndersta
 请结合完整语境、否定、反讽、语气、上下文和对话关系判断，不要因为某个词单独出现就下结论。
 尤其注意：用户可能是在引用别人、转述、开玩笑，或者表达与字面相反的意思。
 
-只输出一个合法 JSON 对象，不要 Markdown，不要解释：
+这是宿主内部的控制面快照，不是给用户看的回复，也不是发送动作协议。只输出一个合法 JSON 对象，不要 Markdown，不要解释；解析失败时宿主会按未知/中性处理，绝不会把原文直接发给用户：
 {
   "mood": "happy|sad|angry|excited|calm|curious|playful|thoughtful|lonely|confident|shy|neutral",
   "mood_intensity": 0,
@@ -276,8 +295,18 @@ pub(crate) async fn understand(request: UnderstandingRequest) -> MessageUndersta
             content: prompt,
         },
     ];
-    let response =
-        params_model_with_token_limit(&mut messages, Some(MAX_SEMANTIC_OUTPUT_TOKENS), &[]).await;
+    // This is an internal classifier call, not a visible reply. Do not append
+    // the legacy reply/action guidance here: mixing two output contracts is a
+    // common source of JSON/protocol leakage and makes an otherwise valid
+    // semantic result unnecessarily fragile.
+    let response = params_model_without_reply_guidance(
+        &mut messages,
+        Some(MAX_SEMANTIC_OUTPUT_TOKENS),
+        &[],
+        None,
+        None,
+    )
+    .await;
     parse_understanding(&response.content, &request)
 }
 
@@ -308,6 +337,15 @@ fn build_prompt(request: &UnderstandingRequest) -> String {
 }
 
 fn parse_understanding(content: &str, request: &UnderstandingRequest) -> MessageUnderstanding {
+    // A classifier response that contains a visible/action protocol has crossed
+    // prompt boundaries. Treat the whole snapshot as unavailable instead of
+    // partially accepting fields from the mixed response.
+    if REPLY_OR_TOOL_PROTOCOL_MARKERS
+        .iter()
+        .any(|marker| content.contains(marker))
+    {
+        return MessageUnderstanding::default();
+    }
     let Some(value) = extract_json(content) else {
         return MessageUnderstanding::default();
     };
@@ -514,6 +552,23 @@ mod tests {
         let result = parse_understanding("不是 JSON", &request);
         assert_eq!(result.mood, MessageUnderstanding::default().mood);
         assert_eq!(result.image_intent, SemanticImageIntent::Social);
+    }
+
+    #[test]
+    fn mixed_reply_or_tool_protocol_is_not_partially_accepted() {
+        let request = UnderstandingRequest::text("测试", "private_chat");
+        let result = parse_understanding(
+            r#"[[REPLY_ACTION]]{"mood":"happy","wants_stop":false}[[/REPLY_ACTION]]"#,
+            &request,
+        );
+        assert_eq!(result.mood, MessageUnderstanding::default().mood);
+        assert_eq!(result.mood_confidence, 0);
+
+        let tool_result = parse_understanding(
+            r#"[[TOOL_CALL]]{"name":"time.now","arguments":{}}[[/TOOL_CALL]]{"mood":"sad"}"#,
+            &request,
+        );
+        assert_eq!(tool_result.mood, MessageUnderstanding::default().mood);
     }
 
     #[test]

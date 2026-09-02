@@ -46,6 +46,59 @@ pub(crate) struct ReplyPlan {
 }
 
 impl ReplyPlan {
+    /// An empty visible-reply plan used when a plain-text completion did not
+    /// produce usable text. Keeping the disposition as Reply lets the caller
+    /// make one bounded repair attempt instead of confusing a model failure
+    /// with an intentional silent decision.
+    pub(crate) fn empty_reply() -> Self {
+        Self {
+            content: String::new(),
+            disposition: ReplyDisposition::Reply,
+            action: ReplyAction::default(),
+            bubbles: Vec::new(),
+            requests_image: false,
+        }
+    }
+
+    /// A host-owned silent plan. No model output is parsed to construct it.
+    #[allow(dead_code)]
+    pub(crate) fn silent() -> Self {
+        Self {
+            content: String::new(),
+            disposition: ReplyDisposition::Silent,
+            action: ReplyAction::default(),
+            bubbles: Vec::new(),
+            requests_image: false,
+        }
+    }
+
+    /// Build a visible reply from host-owned plain text bubbles.
+    ///
+    /// This is used by Core when it deliberately asks the model for one
+    /// natural message at a time. The model never needs to know the reply
+    /// action envelope; the host keeps ordering and delivery semantics here.
+    pub(crate) fn from_plain_bubbles(_scope: ReplyScope, bubbles: Vec<String>) -> Option<Self> {
+        let bubbles = bubbles
+            .into_iter()
+            .map(|bubble| bubble.trim().to_owned())
+            .collect::<Vec<_>>();
+        if bubbles.is_empty()
+            || bubbles
+                .iter()
+                .any(|bubble| bubble.trim().is_empty() || bubble == "……")
+        {
+            return None;
+        }
+        let content = bubbles.join("\n");
+        Some(Self {
+            content,
+            disposition: ReplyDisposition::Reply,
+            action: ReplyAction::default(),
+            bubbles,
+            requests_image: false,
+        })
+    }
+
     pub(crate) async fn from_model_output(scope: ReplyScope, content: &str) -> Self {
         Self::from_model_output_for_sender(scope, content, None).await
     }
@@ -474,6 +527,28 @@ mod tests {
             bubbles: vec!["你好".to_string()],
             requests_image: false,
         };
+    }
+
+    #[test]
+    fn plain_bubbles_build_a_host_owned_plan_without_protocol_parsing() {
+        let plan = ReplyPlan::from_plain_bubbles(
+            ReplyScope::Private(9_100_012),
+            vec!["第一条 **重点**".to_owned(), "[轻声]第二条".to_owned()],
+        )
+        .expect("plain bubbles should become a visible plan");
+        assert_eq!(plan.bubbles, vec!["第一条 **重点**", "[轻声]第二条"]);
+        assert_eq!(plan.content, "第一条 **重点**\n[轻声]第二条");
+        assert_eq!(plan.disposition, ReplyDisposition::Reply);
+        assert!(plan.action.quote_message_id.is_none());
+        assert!(
+            ReplyPlan::from_plain_bubbles(
+                ReplyScope::Private(9_100_012),
+                vec!["第一条".to_owned(), "".to_owned(),]
+            )
+            .is_none()
+        );
+        assert!(!ReplyPlan::empty_reply().has_visible_reply());
+        assert!(ReplyPlan::silent().is_silent());
     }
 
     #[test]

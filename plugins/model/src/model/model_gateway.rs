@@ -2,8 +2,9 @@
 
 use super::interrupt::ReplyTicket;
 use super::memory_query::{
-    interruptible_model_call, interruptible_model_call_without_reply_guidance,
-    params_model_with_tool_access,
+    interruptible_model_call, interruptible_model_call_with_plain_style_context,
+    interruptible_model_call_with_plain_style_context_allow_empty,
+    interruptible_model_call_without_reply_guidance, params_model_with_tool_access,
 };
 use super::thinking::ThinkingReporter;
 use super::tool_access::ToolExecutionContext;
@@ -22,6 +23,7 @@ impl ModelGateway {
     /// intents and only happen later through the arbiter and action port. A
     /// cancelled request therefore stays distinguishable from a model-produced
     /// silent reply by returning `None`.
+    #[allow(dead_code)]
     pub(crate) async fn complete_without_tools(
         messages: &mut [BotMemory],
         reply_ticket: ReplyTicket,
@@ -49,6 +51,42 @@ impl ModelGateway {
         progress: Option<Arc<ThinkingReporter>>,
     ) -> Option<BotMemory> {
         interruptible_model_call_without_reply_guidance(
+            messages,
+            reply_ticket,
+            max_output_tokens,
+            vision_images,
+            progress,
+        )
+        .await
+    }
+
+    /// Complete a visible plain-text turn with host-owned persona/state
+    /// context, without exposing the legacy reply/action envelope.
+    pub(crate) async fn complete_without_tools_with_plain_style_context(
+        messages: &mut [BotMemory],
+        reply_ticket: ReplyTicket,
+        max_output_tokens: Option<u32>,
+        vision_images: &[VisionImage],
+        progress: Option<Arc<ThinkingReporter>>,
+    ) -> Option<BotMemory> {
+        interruptible_model_call_with_plain_style_context(
+            messages,
+            reply_ticket,
+            max_output_tokens,
+            vision_images,
+            progress,
+        )
+        .await
+    }
+
+    pub(crate) async fn complete_without_tools_with_plain_style_context_allow_empty(
+        messages: &mut [BotMemory],
+        reply_ticket: ReplyTicket,
+        max_output_tokens: Option<u32>,
+        vision_images: &[VisionImage],
+        progress: Option<Arc<ThinkingReporter>>,
+    ) -> Option<BotMemory> {
+        interruptible_model_call_with_plain_style_context_allow_empty(
             messages,
             reply_ticket,
             max_output_tokens,

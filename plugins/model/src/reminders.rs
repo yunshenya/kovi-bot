@@ -539,6 +539,7 @@ async fn build_generic_task(reminder: &ClaimedReminder) -> Result<String> {
             requires_group_message_send: false,
             requires_group_followup: false,
             requires_external_tool: false,
+            allow_reply_actions: false,
         },
         ticket,
         Some(1_200),

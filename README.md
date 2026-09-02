@@ -49,9 +49,9 @@ Intrinsic 模型不是编译进可执行文件的；运行时会从
 切换到镜像。模型包的 manifest、来源和第三方许可说明保存在 `model-assets/`，实际运行目录
 `models/yunxi-intrinsic/` 被 `.gitignore` 忽略。
 
-没有下载模型时，Core 仍会使用内置的 deterministic fallback；要启用完整本地模型，必须把
-对应变体下载到默认目录，并从项目根目录启动程序。文字包的 manifest 明确关闭视觉能力，不能
-只下载视觉权重后单独使用。
+没有下载模型时，Core 不会编造固定的可见保底文案；需要本地生成时会进入无模型静默路径。
+要启用完整本地模型，必须把对应变体下载到默认目录，并从项目根目录启动程序。文字包的
+manifest 明确关闭视觉能力，不能只下载视觉权重后单独使用。
 
 不依赖 Kovi、OneBot 或 QQ 的 Core 验收宿主：
 
@@ -146,6 +146,7 @@ supports_vision = true
 api_key_env = "OPENAI_API_KEY"
 requires_auth = true
 actor_authorization = ""
+thinking_mode = "auto" # auto 或 disabled；DeepSeek v4 建议 disabled
 max_output_tokens = 1200
 request_timeout_secs = 60
 max_retries = 2
@@ -158,16 +159,16 @@ cooldown_secs = 7200
 push_probability_percent = 35
 # main_admin 可选，只应写在未跟踪的运行时配置中
 main_admin_decision_interval_secs = 10800
-# Neuro-sama 风格自主会话（私聊和群聊都由模型结合语境决定是否继续）
+# Neuro-sama 风格自主会话（宿主状态机结合语境和已发送结果决定是否继续，模型只生成候选正文）
 autonomous_conversation_enabled = true
 autonomous_conversation_check_interval_secs = 3
 autonomous_conversation_idle_secs = 5
 autonomous_conversation_cooldown_secs = 3
 autonomous_conversation_group_idle_secs = 45
 autonomous_conversation_group_cooldown_secs = 15
-# Legacy compatibility field; autonomous continuation is decided by the model.
+# Legacy compatibility field; autonomous continuation is decided by the host state machine.
 autonomous_conversation_group_max_turns = 1
-# 私聊是否继续完全由模型根据 conversation_directive 决定；每轮都会重新读取上下文。
+# 私聊连续回合由宿主根据对话状态处理；模型只生成当前回合的自然正文。
 
 [traffic]
 enabled = true
@@ -306,11 +307,11 @@ recent_topic_cooldown_secs = 604800
 
 回复生成和连续气泡发送支持有条件打断。私聊中的普通新消息会作为完整 turn 排队，不会仅因为到达较晚就丢弃正在生成的回复；明确停止请求或新的识图命令会中断当前轮。群聊中的再次 `@`/回复、明确停止请求或识图命令可以中断当前轮，其他成员的无关消息不会影响她。ticket 在撤回、发送和状态更新等副作用前会重新校验；已经成功发出的气泡不会自动撤回，历史只记录实际发送的部分。
 
-直接 `@`、回复或文字点名还带有按“群 + 成员”隔离的防刷限制：不比较消息文本，只按 60 秒内的触发次数计数，超过 4 次进入 10 分钟冷却。管理员不受此限制。群聊和私聊的气泡数量由内容和 `conversation_directive` 决定；每个气泡都应承载新的、无法自然合并的信息，详细解释、步骤、复杂分析或不能过度缩短的安慰仍可按内容需要完整回答，不会被固定字数截断。
+直接 `@`、回复或文字点名还带有按“群 + 成员”隔离的防刷限制：不比较消息文本，只按 60 秒内的触发次数计数，超过 4 次进入 10 分钟冷却。管理员不受此限制。普通模型只生成可见自然正文；是否发送、气泡数量、顺序和连续回合都由宿主状态机编排。每个气泡都应承载新的、无法自然合并的信息，详细解释、步骤、复杂分析或不能过度缩短的安慰仍可按内容需要完整回答，不会被固定字数截断。
 
-模型的“正常回复或保持静默”是独立的结构化回复决策，不再通过正文中的 `[sp]` 魔法字符串判断。静默可以与主动撤回组合，但不会发送正文、引用或 `@`，也不会写入短期聊天历史或开启群聊接续窗口；无正文的纯撤回则作为 action-only 计划执行。解析器暂时只为旧模型输出保留精确 `[sp]` 兼容，运行提示词不会再要求模型生成它。
+普通聊天是否发送由入站语义、权限和宿主状态机决定；模型正文为空或包含内部标记时会被拒绝并进入有界修复，不会把模型自行构造的 silent/JSON 当作控制信号。引用、`@`、撤回等显式消息动作仍走独立的受控动作分支，不会混入普通正文。
 
-连续气泡同样由回复协议中的结构化 `messages` 数组表达，可与引用、`@` 和撤回动作组合；普通回复仍直接输出正文。旧版 `[[NEXT_MESSAGE]]` 仅在本地兼容解析器中保留，角色配置、摘要提示和运行协议都不会再要求模型生成这个标记。
+连续气泡由宿主按内容逐条调用纯文本生成并按序发送；普通回复不会要求模型构造 `messages` 数组或其他协议。显式动作分支仍可使用独立的受控动作格式；旧版 `[[NEXT_MESSAGE]]` 仅在本地兼容解析器中保留，角色配置和运行提示都不会再要求模型生成它。
 
 群聊与私聊都会展开被引用消息的文字和已学习表情含义交给模型。回复前模型会判断是否值得自然延续；每条之间的停顿会随当前情绪、能量、社交信心和随机浮动变化。私聊还会持续更新用户的兴趣、性格、关系等级和情绪历史。
 
@@ -397,6 +398,9 @@ export VISION_REQUIRES_AUTH="true"
 ```
 
 `VISION_WIRE_API=responses` 时，`VISION_API_URL` 可以填写服务根地址，程序会补上 `/responses`；如果服务实际要求 `/v1/responses`，直接填写完整地址即可。若使用旧式 Chat Completions 接口，将其设为 `chat_completions`，程序会发送 `messages[].content` 中的 `image_url` 图片输入。
+
+主模型的 `thinking_mode` 只控制上游推理开关，不是回复协议。`disabled` 会在 Chat Completions 请求中发送
+DeepSeek 的 `thinking.type=disabled`，在 Responses 请求中发送 `reasoning.effort=none`；`auto` 不添加该字段，适合不支持这些 DeepSeek 扩展的兼容服务。生产默认的 DeepSeek v4 使用 `disabled`，避免隐藏推理耗尽可见输出预算。
 
 `provider = "auto"` 时，视觉主模型优先直接接收图片；只有主模型的 `supports_vision = false` 时才启用独立视觉接口。若将 Provider 明确设为 `builtin` 或 `mcp`，则会强制先做独立图片分析，再把文字结果交给主模型。
 

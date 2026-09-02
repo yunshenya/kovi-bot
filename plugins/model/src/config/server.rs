@@ -28,12 +28,24 @@ pub struct ServerConfig {
     requires_auth: bool,
     /// 可选的自定义请求头 x-openai-actor-authorization
     actor_authorization: String,
+    /// Provider reasoning mode. `auto` leaves the provider default untouched;
+    /// `disabled` reserves the output budget for visible text. This is useful
+    /// for DeepSeek v4, whose hidden reasoning otherwise counts against
+    /// `max_tokens` and can leave an otherwise successful stream without text.
+    #[serde(default = "default_thinking_mode")]
+    thinking_mode: String,
     /// 单次回复允许模型生成的最大 token 数
     max_output_tokens: u32,
     /// 单次 HTTP 请求超时秒数
     request_timeout_secs: u64,
     /// 可重试错误的额外重试次数
     max_retries: u8,
+}
+
+fn default_thinking_mode() -> String {
+    // The built-in model is DeepSeek v4. Operators using a provider with a
+    // different reasoning contract can opt into `auto` explicitly.
+    "disabled".to_string()
 }
 
 impl ServerConfig {
@@ -69,6 +81,10 @@ impl ServerConfig {
         self.actor_authorization.as_str()
     }
 
+    pub fn thinking_mode(&self) -> &str {
+        self.thinking_mode.as_str()
+    }
+
     pub fn endpoint(&self) -> String {
         let base_url = self.url.trim_end_matches('/');
         let suffix = if self.wire_api == "responses" {
@@ -100,6 +116,11 @@ impl ServerConfig {
         if !matches!(self.wire_api.as_str(), "responses" | "chat_completions") {
             return Err(anyhow::anyhow!(
                 "server.wire_api 只支持 responses 或 chat_completions"
+            ));
+        }
+        if !matches!(self.thinking_mode.as_str(), "auto" | "disabled") {
+            return Err(anyhow::anyhow!(
+                "server.thinking_mode 只支持 auto 或 disabled"
             ));
         }
         if self.max_output_tokens < 128 {
@@ -170,6 +191,11 @@ impl Default for ServerConfig {
             api_key_env: "BOT_API_TOKEN".to_string(),
             requires_auth: true,
             actor_authorization: String::new(),
+            // The built-in model is DeepSeek v4, whose hidden reasoning can
+            // consume the whole visible-output budget when left implicit.
+            // Providers that support their own reasoning defaults can opt back
+            // into `auto` in bot.conf.toml.
+            thinking_mode: default_thinking_mode(),
             max_output_tokens: 1_200,
             request_timeout_secs: 60,
             max_retries: 2,
@@ -190,6 +216,7 @@ mod tests {
         assert!(!config.supports_vision());
         assert_eq!(config.api_key_env(), "BOT_API_TOKEN");
         assert!(config.requires_auth());
+        assert_eq!(config.thinking_mode(), "disabled");
     }
 
     #[test]
@@ -227,5 +254,36 @@ mod tests {
             ..ServerConfig::default()
         };
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn missing_thinking_mode_uses_the_safe_builtin_default() {
+        let value: kovi::toml::Value = kovi::toml::from_str(
+            r#"
+                enabled = true
+                url = "https://example.com/v1"
+                model_name = "example"
+                wire_api = "chat_completions"
+                supports_vision = false
+                api_key_env = "BOT_API_TOKEN"
+                requires_auth = true
+                actor_authorization = ""
+                max_output_tokens = 1200
+                request_timeout_secs = 60
+                max_retries = 2
+            "#,
+        )
+        .expect("valid server config TOML");
+        let config: ServerConfig = value.try_into().expect("server config should deserialize");
+        assert_eq!(config.thinking_mode(), "disabled");
+    }
+
+    #[test]
+    fn unsupported_thinking_mode_is_rejected() {
+        let config = ServerConfig {
+            thinking_mode: "sometimes".to_string(),
+            ..ServerConfig::default()
+        };
+        assert!(config.validate().is_err());
     }
 }

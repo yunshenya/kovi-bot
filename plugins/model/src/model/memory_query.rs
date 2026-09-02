@@ -6,6 +6,8 @@ use super::thinking::ThinkingReporter;
 use super::tool_access::{ToolExecutionContext, ToolExecutionResult, tool_registry};
 use super::utils::{
     BotMemory, Roles, complete_truncated_json_object, is_model_error_response,
+    likely_requires_tool_protocol, params_model_with_plain_style_context,
+    params_model_with_plain_style_context_allow_empty,
     params_model_with_token_limit_and_progress_for_reply, params_model_without_reply_guidance,
     vision_failure_detail,
 };
@@ -62,6 +64,44 @@ impl ReminderCreateFailure {
     }
 }
 
+fn latest_user_message(messages: &[BotMemory]) -> Option<&str> {
+    messages
+        .iter()
+        .rev()
+        .find(|message| matches!(message.role, Roles::User))
+        .map(|message| message.content.as_str())
+}
+
+async fn interruptible_model_call_for_context(
+    messages: &mut [BotMemory],
+    tool_context: &ToolExecutionContext,
+    reply_ticket: ReplyTicket,
+    max_output_tokens: Option<u32>,
+    vision_images: &[VisionImage],
+    progress: Option<Arc<ThinkingReporter>>,
+) -> Option<BotMemory> {
+    if tool_context.allow_reply_actions {
+        interruptible_model_call(
+            messages,
+            reply_ticket,
+            max_output_tokens,
+            vision_images,
+            progress,
+        )
+        .await
+    } else {
+        // Plain turns must not receive the ThinkingReporter output marker.
+        interruptible_model_call_with_plain_style_context(
+            messages,
+            reply_ticket,
+            max_output_tokens,
+            vision_images,
+            None,
+        )
+        .await
+    }
+}
+
 /// 普通回复只调用一次模型；只有模型明确请求工具时才进入有限工具循环。
 pub(crate) async fn params_model_with_tool_access(
     messages: &mut [BotMemory],
@@ -71,6 +111,21 @@ pub(crate) async fn params_model_with_tool_access(
     vision_images: &[VisionImage],
     progress: Option<Arc<ThinkingReporter>>,
 ) -> BotMemory {
+    let expose_tools = tool_context.group_paused
+        || tool_context.requires_structured_tool_turn()
+        || latest_user_message(messages).is_some_and(likely_requires_tool_protocol);
+    if !expose_tools {
+        return interruptible_model_call_for_context(
+            messages,
+            &tool_context,
+            reply_ticket,
+            max_output_tokens,
+            vision_images,
+            progress,
+        )
+        .await
+        .unwrap_or_else(interrupted_response);
+    }
     let Some(registry) = tool_registry() else {
         if tool_context.group_paused {
             return BotMemory {
@@ -115,8 +170,9 @@ pub(crate) async fn params_model_with_tool_access(
             }
             return required_group_message_failure(false, false);
         }
-        return interruptible_model_call(
+        return interruptible_model_call_for_context(
             messages,
+            &tool_context,
             reply_ticket,
             max_output_tokens,
             vision_images,
@@ -170,8 +226,9 @@ pub(crate) async fn params_model_with_tool_access(
     let mut group_followup_succeeded = false;
 
     for round in 0..max_tool_rounds {
-        let Some(response) = interruptible_model_call(
+        let Some(response) = interruptible_model_call_for_context(
             &mut request,
+            &tool_context,
             reply_ticket,
             max_output_tokens,
             vision_images,
@@ -510,8 +567,9 @@ pub(crate) async fn params_model_with_tool_access(
         content: "本轮工具调用次数已用完。请使用已有结果直接回答，不要再输出工具调用标记。"
             .to_string(),
     });
-    let Some(response) = interruptible_model_call(
+    let Some(response) = interruptible_model_call_for_context(
         &mut request,
+        &tool_context,
         reply_ticket,
         max_output_tokens,
         vision_images,
@@ -774,7 +832,48 @@ pub(crate) async fn interruptible_model_call(
         max_output_tokens,
         vision_images,
         progress,
-        true,
+        ModelPromptMode::LegacyReplyGuidance,
+    )
+    .await
+}
+
+/// Run a plain-text completion with host-owned persona/state context while
+/// keeping legacy reply/action guidance out of the request.
+pub(crate) async fn interruptible_model_call_with_plain_style_context(
+    messages: &mut [BotMemory],
+    reply_ticket: ReplyTicket,
+    max_output_tokens: Option<u32>,
+    vision_images: &[VisionImage],
+    progress: Option<Arc<ThinkingReporter>>,
+) -> Option<BotMemory> {
+    interruptible_model_call_mode(
+        messages,
+        reply_ticket,
+        max_output_tokens,
+        vision_images,
+        progress,
+        ModelPromptMode::PlainStyleContext,
+    )
+    .await
+}
+
+/// Run a plain-text completion where an empty successful response means that
+/// the host should remain quiet. Provider/network failures remain observable
+/// as the normal model-error response.
+pub(crate) async fn interruptible_model_call_with_plain_style_context_allow_empty(
+    messages: &mut [BotMemory],
+    reply_ticket: ReplyTicket,
+    max_output_tokens: Option<u32>,
+    vision_images: &[VisionImage],
+    progress: Option<Arc<ThinkingReporter>>,
+) -> Option<BotMemory> {
+    interruptible_model_call_mode(
+        messages,
+        reply_ticket,
+        max_output_tokens,
+        vision_images,
+        progress,
+        ModelPromptMode::PlainStyleContextAllowEmpty,
     )
     .await
 }
@@ -792,9 +891,17 @@ pub(crate) async fn interruptible_model_call_without_reply_guidance(
         max_output_tokens,
         vision_images,
         progress,
-        false,
+        ModelPromptMode::None,
     )
     .await
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelPromptMode {
+    LegacyReplyGuidance,
+    PlainStyleContext,
+    PlainStyleContextAllowEmpty,
+    None,
 }
 
 async fn interruptible_model_call_mode(
@@ -803,29 +910,50 @@ async fn interruptible_model_call_mode(
     max_output_tokens: Option<u32>,
     vision_images: &[VisionImage],
     progress: Option<Arc<ThinkingReporter>>,
-    append_reply_guidance: bool,
+    prompt_mode: ModelPromptMode,
 ) -> Option<BotMemory> {
     if !is_current(reply_ticket).await {
         return None;
     }
     kovi::tokio::select! {
         response = async {
-            if append_reply_guidance {
-                params_model_with_token_limit_and_progress_for_reply(
-                    messages,
-                    max_output_tokens,
-                    vision_images,
-                    progress,
-                    Some(reply_ticket),
-                ).await
-            } else {
-                params_model_without_reply_guidance(
-                    messages,
-                    max_output_tokens,
-                    vision_images,
-                    progress,
-                    Some(reply_ticket),
-                ).await
+            match prompt_mode {
+                ModelPromptMode::LegacyReplyGuidance => {
+                    params_model_with_token_limit_and_progress_for_reply(
+                        messages,
+                        max_output_tokens,
+                        vision_images,
+                        progress,
+                        Some(reply_ticket),
+                    ).await
+                }
+                ModelPromptMode::PlainStyleContext => {
+                    params_model_with_plain_style_context(
+                        messages,
+                        max_output_tokens,
+                        vision_images,
+                        progress,
+                        Some(reply_ticket),
+                    ).await
+                }
+                ModelPromptMode::PlainStyleContextAllowEmpty => {
+                    params_model_with_plain_style_context_allow_empty(
+                        messages,
+                        max_output_tokens,
+                        vision_images,
+                        progress,
+                        Some(reply_ticket),
+                    ).await
+                }
+                ModelPromptMode::None => {
+                    params_model_without_reply_guidance(
+                        messages,
+                        max_output_tokens,
+                        vision_images,
+                        progress,
+                        Some(reply_ticket),
+                    ).await
+                }
             }
         } => {
             is_current(reply_ticket).await.then_some(response)
@@ -1020,9 +1148,10 @@ fn format_tool_result(name: &str, result: &str) -> String {
 mod tests {
     use super::{
         ParsedToolCall, ReminderCreateFailure, completed_group_followup_response,
-        completed_group_message_response, interrupted_response, merge_group_send_result,
-        parse_tool_call_with_wrapping, reminder_failure_response, required_group_followup_failure,
-        required_group_message_failure, tool_result_has_task_status, tool_round_limit,
+        completed_group_message_response, interrupted_response, likely_requires_tool_protocol,
+        merge_group_send_result, parse_tool_call_with_wrapping, reminder_failure_response,
+        required_group_followup_failure, required_group_message_failure,
+        tool_result_has_task_status, tool_round_limit,
     };
     use crate::model::MessageDestination;
     use crate::model::reply::parse_reply_output;
@@ -1045,6 +1174,34 @@ mod tests {
     }
 
     #[test]
+    fn message_action_words_do_not_expose_the_tool_registry() {
+        // @/quote/recall are handled by the separate, explicitly authorized
+        // reply-action path. They must not make an ordinary turn receive the
+        // tool registry, especially when the user is discussing the syntax.
+        for content in [
+            "这个 @ 符号在群里是什么意思？",
+            "引用这条消息是什么意思？",
+            "请解释一下怎么撤回消息",
+            "艾特和提及有什么区别？",
+            "删除消息这个功能怎么用？",
+            "搜索功能怎么用？",
+            "为什么要查询天气？",
+        ] {
+            assert!(
+                !likely_requires_tool_protocol(content),
+                "message-action discussion must stay out of tool mode: {content}"
+            );
+        }
+        for content in ["搜索 Rust 最新版本", "提醒我明天开会", "查一下现在天气"]
+        {
+            assert!(
+                likely_requires_tool_protocol(content),
+                "external-tool intent should still expose tools: {content}"
+            );
+        }
+    }
+
+    #[test]
     fn main_admin_private_actions_have_two_tool_rounds() {
         let context = ToolExecutionContext {
             subject_id: 42,
@@ -1063,6 +1220,7 @@ mod tests {
             requires_group_message_send: false,
             requires_group_followup: false,
             requires_external_tool: false,
+            allow_reply_actions: false,
         };
         assert_eq!(tool_round_limit(1, &context), 2);
         assert_eq!(tool_round_limit(3, &context), 3);

@@ -153,6 +153,25 @@ pub(crate) struct ToolExecutionContext {
     /// 定时任务指令依赖外部资料时，必须至少成功执行一个只读外部工具，
     /// 否则调度器会把本次执行视为失败并安排重试，而不是发送未经核实的兜底文本。
     pub(crate) requires_external_tool: bool,
+    /// Allow the legacy reply-action envelope for this turn. Ordinary visible
+    /// replies keep this false; only a host-confirmed quote/@/recall request
+    /// may ask the model for action fields.
+    pub(crate) allow_reply_actions: bool,
+}
+
+impl ToolExecutionContext {
+    /// Whether this turn must expose the structured tool channel. The model
+    /// still writes ordinary final text after a tool result; this flag only
+    /// describes the tool phase or a host-authorized side effect.
+    pub(crate) fn requires_structured_tool_turn(&self) -> bool {
+        self.scheduled
+            || self.sticker_teaching.is_some()
+            || self.requires_reminder_create
+            || self.requires_agent_run_create
+            || self.requires_group_message_send
+            || self.requires_group_followup
+            || self.requires_external_tool
+    }
 }
 
 pub(crate) struct ToolExecutionResult {
@@ -3481,6 +3500,7 @@ mod tests {
             requires_group_message_send: false,
             requires_group_followup: false,
             requires_external_tool: false,
+            allow_reply_actions: false,
         }
     }
 

@@ -302,6 +302,7 @@ impl QqActionAdapter {
             requires_group_message_send: false,
             requires_group_followup: false,
             requires_external_tool: false,
+            allow_reply_actions: false,
         };
         if !binding
             .registry
@@ -1007,6 +1008,7 @@ impl QqActionAdapter {
                 requires_group_message_send: false,
                 requires_group_followup: false,
                 requires_external_tool: false,
+                allow_reply_actions: false,
             };
             if read_only_only
                 && !registry.available_read_only_for_context(&action.tool_name, &context)

@@ -30,6 +30,7 @@ env:
   MODEL_API_KEY_ENV: ${{ vars.MODEL_API_KEY_ENV || 'BOT_API_TOKEN' }}
   MODEL_REQUIRES_AUTH: ${{ vars.MODEL_REQUIRES_AUTH || 'true' }}
   MODEL_ACTOR_AUTHORIZATION: ${{ vars.MODEL_ACTOR_AUTHORIZATION || '' }}
+  MODEL_THINKING_MODE: ${{ vars.MODEL_THINKING_MODE || 'disabled' }}
   DEPLOY_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
 
 jobs:
@@ -58,6 +59,7 @@ jobs:
       MODEL_API_KEY_ENV: ${{ secrets.MODEL_API_KEY_ENV || vars.MODEL_API_KEY_ENV || 'BOT_API_TOKEN' }}
       MODEL_REQUIRES_AUTH: ${{ secrets.MODEL_REQUIRES_AUTH || vars.MODEL_REQUIRES_AUTH || 'true' }}
       MODEL_ACTOR_AUTHORIZATION: ${{ secrets.MODEL_ACTOR_AUTHORIZATION || vars.MODEL_ACTOR_AUTHORIZATION || '' }}
+      MODEL_THINKING_MODE: ${{ secrets.MODEL_THINKING_MODE || vars.MODEL_THINKING_MODE || 'disabled' }}
 
     steps:
       - name: Checkout verified revision
@@ -100,6 +102,7 @@ jobs:
           [[ "$MODEL_API_KEY_ENV" == "OPENAI_API_KEY" || "$MODEL_API_KEY_ENV" == "BOT_API_TOKEN" ]] || { echo "Invalid MODEL_API_KEY_ENV"; exit 1; }
           [[ "$MODEL_REQUIRES_AUTH" == "true" || "$MODEL_REQUIRES_AUTH" == "false" ]] || { echo "Invalid MODEL_REQUIRES_AUTH"; exit 1; }
           [[ "$MODEL_REQUIRES_AUTH" == "true" ]] || { echo "Production model endpoints must require Bearer authentication"; exit 1; }
+          [[ "$MODEL_THINKING_MODE" == "auto" || "$MODEL_THINKING_MODE" == "disabled" ]] || { echo "Invalid MODEL_THINKING_MODE"; exit 1; }
           test -n "$DEPLOY_PASSWORD" || { echo "Missing repository secret DEPLOY_PASSWORD"; exit 1; }
           if test "$MODEL_API_KEY_ENV" = "OPENAI_API_KEY"; then
             test -n "$OPENAI_API_KEY" || { echo "Missing OPENAI_API_KEY"; exit 1; }
@@ -193,7 +196,8 @@ jobs:
           awk -v url="$MODEL_API_URL" -v model="$MODEL_NAME" \
             -v wire="$MODEL_WIRE_API" -v vision="$MODEL_SUPPORTS_VISION" \
             -v keyenv="$MODEL_API_KEY_ENV" -v auth="$MODEL_REQUIRES_AUTH" \
-            -v actor="$MODEL_ACTOR_AUTHORIZATION" -v admin="$KOVI_MAIN_ADMIN" '
+            -v actor="$MODEL_ACTOR_AUTHORIZATION" -v thinking="$MODEL_THINKING_MODE" \
+            -v admin="$KOVI_MAIN_ADMIN" '
             $0 == "url = \"https://api.example.com/v1/responses\"" {
               print "url = \"" url "\""
               next
@@ -220,6 +224,10 @@ jobs:
             }
             $0 == "actor_authorization = \"\"" {
               print "actor_authorization = \"" actor "\""
+              next
+            }
+            $0 ~ /^thinking_mode = \"(auto|disabled)\"$/ {
+              print "thinking_mode = \"" thinking "\""
               next
             }
             $0 == "push_probability_percent = 35" {

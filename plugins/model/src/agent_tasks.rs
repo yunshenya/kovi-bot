@@ -800,8 +800,14 @@ async fn build_report(task: &ClaimedTask, events: &[TaskEvent]) -> Result<String
     ];
     // 汇报只需要一次无工具的模型调用；把成员回复作为 data-only 资料传入，
     // 避免报告模型获得任何可执行的跨群或外部工具权限。
-    let response =
-        crate::model::utils::params_model_with_token_limit(&mut messages, Some(1_200), &[]).await;
+    let response = crate::model::utils::params_model_with_plain_style_context(
+        &mut messages,
+        Some(1_200),
+        &[],
+        None,
+        None,
+    )
+    .await;
     if crate::model::utils::is_model_error_response(&response.content)
         || crate::model::utils::vision_failure_detail(&response.content).is_some()
     {
