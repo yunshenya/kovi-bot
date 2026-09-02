@@ -92,8 +92,6 @@ impl HealthChecker {
                 "记忆数量 {} 超过配置上限 {}",
                 memory_usage.total_memories, max_entries
             ));
-        } else if memory_usage.total_memories >= max_entries.saturating_mul(9) / 10 {
-            warnings.push("记忆数量接近配置上限，将优先保留重要记忆".to_string());
         }
 
         // 检查用户档案数量
