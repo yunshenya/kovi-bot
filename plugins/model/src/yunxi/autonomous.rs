@@ -352,6 +352,10 @@ pub(crate) fn claim_due_with_context(
             .flatten();
         (conversation_kind, person_id, token)
     };
+    // Move the claimed conversation to the back before returning. A session
+    // that keeps selecting Continue must not monopolize the scheduler and
+    // starve other due conversations.
+    touch(&mut registry.order, candidate);
     Some(AutonomousConversationClaim {
         conversation_id: candidate,
         conversation_kind,
@@ -546,8 +550,8 @@ mod tests {
         autonomous_in_flight_timeout_for, autonomous_model_phase_budget, claim_due,
         claim_due_with_context, claim_is_current, finish_claim, finish_claim_token,
         model_retry_backoff, observe_group_activity, observe_inbound, observe_inbound_from_person,
-        record_outbound, record_outbound_with_directive, release_claim, retry_claim,
-        retry_claim_token,
+        record_outbound, record_outbound_with_directive, release_claim, release_claim_token,
+        retry_claim, retry_claim_token,
     };
     use crate::config::ProactiveConfig;
     use chrono::{Duration, Utc};
@@ -936,6 +940,47 @@ mod tests {
         assert_eq!(claim.conversation_kind, ConversationKind::Direct);
         assert_eq!(claim.person_id, Some(person));
         release_claim(id);
+        clear();
+    }
+
+    #[test]
+    fn scheduler_round_robins_continuing_conversations() {
+        let _guard = TEST_LOCK.lock().expect("test lock");
+        clear();
+        let first = ConversationId::new();
+        let second = ConversationId::new();
+        let now = Utc::now();
+        let config = ProactiveConfig::default();
+        for id in [first, second] {
+            observe_inbound(
+                id,
+                ConversationKind::Direct,
+                now - Duration::minutes(5),
+                true,
+            );
+            record_outbound_with_directive(
+                id,
+                now - Duration::minutes(4),
+                Some(ConversationTurnDirective::Continue),
+                Some(&config),
+            );
+        }
+
+        let first_claim = claim_due_with_context(&config, now).expect("first claim");
+        finish_claim_token(
+            first_claim.conversation_id,
+            first_claim.token,
+            now,
+            true,
+            ConversationTurnDirective::Continue,
+            &config,
+        );
+        let next_wake =
+            now + Duration::seconds(config.autonomous_conversation_cooldown_secs() as i64);
+        let second_claim =
+            claim_due_with_context(&config, next_wake).expect("second conversation should claim");
+        assert_eq!(second_claim.conversation_id, second);
+        release_claim_token(second_claim.conversation_id, second_claim.token);
         clear();
     }
 

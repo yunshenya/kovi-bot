@@ -683,6 +683,15 @@ async fn main() {
                 if let Err(error) = maintenance_memory_manager.compact_memories().await {
                     eprintln!("[ERROR] 定期记忆清理失败: {}", error);
                 }
+                if let Some(store) = yunxi::memory_store() {
+                    match store.cleanup(chrono::Utc::now()).await {
+                        Ok(removed) if removed > 0 => {
+                            println!("[INFO] Yunxi Core 记忆清理完成，移除 {} 条", removed);
+                        }
+                        Ok(_) => {}
+                        Err(error) => eprintln!("[ERROR] Yunxi Core 记忆清理失败: {}", error),
+                    }
+                }
                 match sticker_memory::compact_expired().await {
                     Ok(removed) if removed > 0 => {
                         println!("[INFO] 过期表情标签清理完成，移除 {} 条", removed);

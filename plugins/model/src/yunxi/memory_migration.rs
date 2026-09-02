@@ -4,6 +4,7 @@
 //! is intentionally an offline service: every invocation processes one
 //! bounded, auditable batch and never deletes a legacy row.
 
+use super::owner_lock;
 use crate::memory::{MemoryEntry, MemoryType};
 use anyhow::{Context, Result, bail, ensure};
 use chrono::{DateTime, SecondsFormat, Timelike, Utc};
@@ -152,6 +153,15 @@ impl MemoryMigrationService {
         ] {
             query(statement).execute(&mut *transaction).await?;
         }
+        // Older installations may have created the ledger before the
+        // insertion provenance bit was added. Keep the upgrade additive and
+        // default old rows to unproven so cleanup remains fail-closed.
+        query(
+            "ALTER TABLE yunxi_memory_migration_items
+             ADD COLUMN IF NOT EXISTS inserted BOOLEAN NOT NULL DEFAULT FALSE",
+        )
+        .execute(&mut *transaction)
+        .await?;
         transaction.commit().await?;
         Ok(())
     }
@@ -162,6 +172,7 @@ impl MemoryMigrationService {
         let batch_id = Uuid::new_v4();
         let mut transaction = self.pool.begin().await?;
         super::schema::lock(&mut transaction).await?;
+        owner_lock::lock_memory_maintenance(&mut transaction).await?;
         let mode = if options.dry_run {
             "dry_run"
         } else {
@@ -424,6 +435,7 @@ impl MemoryMigrationService {
     pub(crate) async fn rollback(&self, batch_id: Uuid, dry_run: bool) -> Result<RollbackReport> {
         self.initialize_schema().await?;
         let mut transaction = self.pool.begin().await?;
+        owner_lock::lock_memory_maintenance(&mut transaction).await?;
         let status = query_scalar::<Postgres, String>(
             "SELECT status FROM yunxi_memory_migration_batches WHERE id = $1 FOR UPDATE",
         )

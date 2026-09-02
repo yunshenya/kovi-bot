@@ -5,6 +5,16 @@ use serde::{Deserialize, Serialize};
 pub struct MemoryConfig {
     max_entries: usize,
     retention_days: i64,
+    /// Episode records have a longer, independent retention window than the
+    /// short-lived V1 memory cache.
+    episode_retention_days: i64,
+    /// Hard maximum for known Episode statuses in one Mind scope. Protected
+    /// known records are ranked first; unknown statuses are retained fail-closed
+    /// and do not participate in eviction.
+    episode_max_per_scope: usize,
+    /// Salience at or above this value protects an episode from maintenance
+    /// cleanup. The same threshold also protects strongly emotional episodes.
+    episode_protected_salience: f32,
     profile_ttl_days: i64,
     summary_ttl_days: i64,
     sticker_ttl_days: i64,
@@ -33,6 +43,18 @@ impl MemoryConfig {
 
     pub fn retention_days(&self) -> i64 {
         self.retention_days
+    }
+
+    pub fn episode_retention_days(&self) -> i64 {
+        self.episode_retention_days
+    }
+
+    pub fn episode_max_per_scope(&self) -> usize {
+        self.episode_max_per_scope
+    }
+
+    pub fn episode_protected_salience(&self) -> f32 {
+        self.episode_protected_salience
     }
 
     pub fn profile_ttl_days(&self) -> i64 {
@@ -102,6 +124,23 @@ impl MemoryConfig {
         if self.retention_days <= 0 {
             return Err(anyhow::anyhow!("memory.retention_days 必须大于 0"));
         }
+        if !(1..=3_650).contains(&self.episode_retention_days) {
+            return Err(anyhow::anyhow!(
+                "memory.episode_retention_days 必须在 1 到 3650 天之间"
+            ));
+        }
+        if !(1..=4_096).contains(&self.episode_max_per_scope) {
+            return Err(anyhow::anyhow!(
+                "memory.episode_max_per_scope 必须在 1 到 4096 之间"
+            ));
+        }
+        if !self.episode_protected_salience.is_finite()
+            || !(0.0..=1.0).contains(&self.episode_protected_salience)
+        {
+            return Err(anyhow::anyhow!(
+                "memory.episode_protected_salience 必须在 0 到 1 之间"
+            ));
+        }
         if self.profile_ttl_days <= 0 {
             return Err(anyhow::anyhow!("memory.profile_ttl_days 必须大于 0"));
         }
@@ -168,6 +207,9 @@ impl Default for MemoryConfig {
         Self {
             max_entries: 1000,
             retention_days: 30,
+            episode_retention_days: 365,
+            episode_max_per_scope: 128,
+            episode_protected_salience: 0.7,
             profile_ttl_days: 90,
             summary_ttl_days: 30,
             sticker_ttl_days: 90,
@@ -184,5 +226,51 @@ impl Default for MemoryConfig {
             autonomous_query_max_results: 8,
             autonomous_query_max_days: 3_650,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MemoryConfig;
+
+    #[test]
+    fn episode_retention_defaults_are_longer_and_bounded() {
+        let config = MemoryConfig::default();
+        assert_eq!(config.episode_retention_days(), 365);
+        assert_eq!(config.episode_max_per_scope(), 128);
+        assert!((config.episode_protected_salience() - 0.7).abs() < f32::EPSILON);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn episode_retention_rejects_invalid_limits() {
+        let config = MemoryConfig {
+            episode_retention_days: 0,
+            ..MemoryConfig::default()
+        };
+        assert!(config.validate().is_err());
+
+        let config = MemoryConfig {
+            episode_max_per_scope: 0,
+            ..MemoryConfig::default()
+        };
+        assert!(config.validate().is_err());
+
+        let config = MemoryConfig {
+            episode_protected_salience: f32::NAN,
+            ..MemoryConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn older_memory_configuration_uses_episode_defaults() {
+        let config: MemoryConfig = kovi::toml::from_str(
+            "max_entries = 1000\nretention_days = 30\nprofile_ttl_days = 90\nsummary_ttl_days = 30\nsticker_ttl_days = 90\nruntime_history_ttl_secs = 3600\nmax_conversation_messages = 25\nmax_conversation_tokens = 6000\ncontextual_memory_limit = 5\nmaintenance_interval_secs = 86400\nsummary_keep_recent_messages = 15\nsummary_max_chars = 1500\nautonomous_query_enabled = true\nautonomous_query_max_rounds = 2\nautonomous_query_max_results = 8\nautonomous_query_max_days = 3650\n",
+        )
+        .expect("older memory configuration should remain compatible");
+        assert_eq!(config.episode_retention_days(), 365);
+        assert_eq!(config.episode_max_per_scope(), 128);
+        assert!((config.episode_protected_salience() - 0.7).abs() < f32::EPSILON);
     }
 }

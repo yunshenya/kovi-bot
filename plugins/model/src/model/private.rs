@@ -834,12 +834,12 @@ async fn delete_private_user_data(user_id: i64, self_id: i64, bot: &RuntimeBot) 
         }
     };
 
+    let mut failures = Vec::new();
     let mut memory_rows = 0_u64;
     let mut sticker_rows = 0_u64;
     let mut reminder_rows = 0_u64;
     let mut agent_goal_rows = 0_u64;
     let mut agent_run_rows = 0_u64;
-    let mut failures = Vec::new();
     for alias_user_id in &qq_user_ids {
         let (memory, stickers, reminders, agent_goals, agent_runs) = kovi::tokio::join!(
             MEMORY_MANAGER.delete_user_data(*alias_user_id),
@@ -869,6 +869,9 @@ async fn delete_private_user_data(user_id: i64, self_id: i64, bot: &RuntimeBot) 
             Err(error) => failures.push(format!("agent-runs[{alias_user_id}]: {error}")),
         }
     }
+    // Core deletion acquires the cross-process memory barrier. The second
+    // legacy pass closes the small window where a writer completed before that
+    // barrier but after the first compatibility cleanup.
     let yunxi_rows = match crate::yunxi::delete_qq_person_domain_data(self_id, user_id).await {
         Ok(rows) => rows,
         Err(error) => {
@@ -876,6 +879,26 @@ async fn delete_private_user_data(user_id: i64, self_id: i64, bot: &RuntimeBot) 
             0
         }
     };
+    // Direct-chat compatibility rows use a canonical conversation context and
+    // intentionally have no numeric subject_id. Purge them by the exact IDs
+    // captured before Core deletion, then clear the manager cache after commit.
+    let direct_memory_ids = direct_conversation_ids
+        .iter()
+        .map(|conversation| conversation.into_uuid())
+        .collect::<Vec<_>>();
+    match MEMORY_MANAGER
+        .delete_direct_conversation_data(&direct_memory_ids)
+        .await
+    {
+        Ok(rows) => memory_rows = memory_rows.saturating_add(rows),
+        Err(error) => failures.push(format!("memory-direct: {error}")),
+    }
+    for alias_user_id in &qq_user_ids {
+        match MEMORY_MANAGER.delete_user_data(*alias_user_id).await {
+            Ok(rows) => memory_rows = memory_rows.saturating_add(rows),
+            Err(error) => failures.push(format!("memory[{alias_user_id}]: {error}")),
+        }
+    }
     if failures.is_empty() {
         match erasure.finish().await {
             Ok(()) => {

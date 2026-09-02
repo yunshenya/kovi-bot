@@ -47,6 +47,33 @@ impl CoreModelBackend for TwoMessageModel {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct SilentAutonomousModel;
+
+impl CoreModelBackend for SilentAutonomousModel {
+    fn plan<'a>(&'a self, input: &'a PlannerInput) -> yunxi_core::ModelBackendFuture<'a> {
+        Box::pin(async move {
+            if matches!(
+                input.event.kind(),
+                WorldEventKind::AutonomousConversationTick(_)
+            ) {
+                return Ok(DecisionPlan::silent());
+            }
+            let WorldEventKind::MessageReceived(message) = input.event.kind() else {
+                return Ok(DecisionPlan::silent());
+            };
+            Ok(DecisionPlan {
+                disposition: DecisionDisposition::Reply,
+                intents: vec![yunxi_core::CognitiveIntent::send_message(
+                    message.conversation_id,
+                    MessageContent::text("初始回复"),
+                )],
+                state_updates: Vec::new(),
+            })
+        })
+    }
+}
+
 #[test]
 fn fake_model_and_environment_complete_a_core_action() {
     let environment = FakeEnvironment::default();
@@ -176,6 +203,41 @@ fn autonomous_ticks_continue_a_direct_conversation_after_idle() {
     assert!(
         host.process_autonomous_tick_at(start + Duration::hours(1))
             .expect("tick after autonomous end")
+            .is_none()
+    );
+}
+
+#[test]
+fn a_silent_autonomous_turn_pauses_instead_of_hot_looping() {
+    let start = Utc::now();
+    let policy = AutonomyPolicy {
+        direct_idle: Duration::seconds(1),
+        direct_cooldown: Duration::seconds(1),
+        ..AutonomyPolicy::default()
+    };
+    let host = CliHost::new(
+        SilentAutonomousModel,
+        FakeEnvironment::default(),
+        ConversationId::new(),
+    )
+    .try_with_autonomy_policy(policy)
+    .expect("test policy should be valid");
+    assert!(matches!(
+        host.process_line_at("hello", start).expect("initial reply"),
+        HostResponse::Delivered { .. }
+    ));
+    assert!(matches!(
+        host.process_autonomous_tick_at(start + Duration::seconds(2))
+            .expect("silent autonomous tick"),
+        Some(HostResponse::Noop)
+    ));
+    assert_eq!(
+        host.lifecycle().expect("lifecycle snapshot").directive(),
+        ConversationTurnDirective::Wait
+    );
+    assert!(
+        host.process_autonomous_tick_at(start + Duration::hours(1))
+            .expect("tick after pause")
             .is_none()
     );
 }

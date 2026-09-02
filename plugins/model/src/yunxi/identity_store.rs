@@ -57,6 +57,26 @@ const MAX_PORTABLE_EXTERNAL_IDENTITIES: usize = 256;
 const MAX_PORTABLE_MEMORIES: usize = 512;
 const MAX_PORTABLE_OPEN_LOOPS: usize = 512;
 const MAX_PORTABLE_GOALS: usize = 512;
+const DIRECT_MEMORY_CONTEXT_PREFIX: &str = "yunxi_direct_chat:";
+const FACT_MEMORY_CONTEXT_SUFFIX: &str = "|yunxi_kind=fact";
+
+/// Return a positive numeric QQ id when an external identity can own rows in
+/// the legacy per-user memory table.  Other QQ-shaped identifiers are kept out
+/// of this cleanup path deliberately; deleting by a non-canonical string
+/// would make an unlink operation broader than the identity it removes.
+fn qq_numeric_user_id(external: &ExternalIdentity) -> Option<i64> {
+    if external.platform().as_str() != "qq"
+        || external.external_id().is_empty()
+        || !external
+            .external_id()
+            .bytes()
+            .all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    let user_id = external.external_id().parse::<i64>().ok()?;
+    (user_id > 0 && user_id.to_string() == external.external_id()).then_some(user_id)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct PortableExternalIdentity {
@@ -144,16 +164,190 @@ impl PostgresIdentityStore {
         &self,
         external: &ExternalIdentity,
     ) -> Result<bool, IdentityStoreError> {
-        query(
+        // Keep identity unlink ordered with every Core/legacy memory writer.
+        // The mapping is re-read after the Person owner lock so a concurrent
+        // delete/re-link cannot make us purge a different user's projection.
+        let _legacy_save_guard = crate::memory::MEMORY_MANAGER.acquire_save_lock().await;
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(IdentityStoreError::storage)?;
+        owner_lock::lock_memory_maintenance(&mut transaction)
+            .await
+            .map_err(IdentityStoreError::storage)?;
+
+        let mapped_person = query_scalar::<Postgres, Uuid>(
+            "SELECT person_id FROM yunxi_external_identities
+             WHERE platform = $1 AND external_id = $2",
+        )
+        .bind(external.platform().as_str())
+        .bind(external.external_id())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(IdentityStoreError::storage)?;
+        if let Some(person_id) = mapped_person {
+            if !owner_lock::lock_and_owner_exists(&mut transaction, DurableOwner::Person(person_id))
+                .await
+                .map_err(IdentityStoreError::storage)?
+            {
+                return Err(IdentityStoreError::storage(std::io::Error::other(
+                    "external identity points to a missing canonical person",
+                )));
+            }
+            let locked_person = query_scalar::<Postgres, Uuid>(
+                "SELECT person_id FROM yunxi_external_identities
+                 WHERE platform = $1 AND external_id = $2
+                 FOR UPDATE",
+            )
+            .bind(external.platform().as_str())
+            .bind(external.external_id())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(IdentityStoreError::storage)?;
+            if locked_person != Some(person_id) {
+                return Err(IdentityStoreError::storage(std::io::Error::other(
+                    "external identity changed while unlink was acquiring its owner lock",
+                )));
+            }
+        }
+
+        // A numeric QQ id is also the subject key used by the compatibility
+        // memory table. Purge every private-shaped row, plus exact direct-chat
+        // contexts owned by this canonical person, in the same transaction as
+        // the unlink. This prevents a later identity reuse from recalling
+        // plaintext that belongs to the previous person.
+        let numeric_user_id = qq_numeric_user_id(external);
+        let mut purged_legacy_ids = if mapped_person.is_some() {
+            if let Some(user_id) = numeric_user_id {
+                Self::purge_qq_private_legacy_rows(&mut transaction, user_id).await?
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+        if mapped_person.is_some()
+            && let Some(user_id) = numeric_user_id
+        {
+            let mut direct_ids = query_scalar::<Postgres, Uuid>(
+                "SELECT DISTINCT external.conversation_id
+                 FROM yunxi_external_conversations AS external
+                 JOIN yunxi_conversations AS conversation
+                   ON conversation.id = external.conversation_id
+                 WHERE external.platform = 'qq'
+                   AND conversation.kind = 'direct'
+                   AND external.external_id ~ '^direct:[1-9][0-9]*:[1-9][0-9]*$'
+                   AND split_part(external.external_id, ':', 3) = $1
+                 ORDER BY external.conversation_id LIMIT $2",
+            )
+            .bind(user_id.to_string())
+            .bind(i64::try_from(MAX_PERSON_DIRECT_CONVERSATIONS + 1).unwrap_or(i64::MAX))
+            .fetch_all(&mut *transaction)
+            .await
+            .map_err(IdentityStoreError::storage)?;
+            direct_ids.sort_unstable();
+            direct_ids.dedup();
+            if direct_ids.len() > MAX_PERSON_DIRECT_CONVERSATIONS {
+                return Err(IdentityStoreError::storage(std::io::Error::other(
+                    "identity has too many direct conversations to purge safely on unlink",
+                )));
+            }
+            purged_legacy_ids
+                .extend(Self::purge_direct_legacy_rows(&mut transaction, &direct_ids).await?);
+        }
+        let unlinked = query(
             "DELETE FROM yunxi_external_identities
              WHERE platform = $1 AND external_id = $2",
         )
         .bind(external.platform().as_str())
         .bind(external.external_id())
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await
-        .map(|result| result.rows_affected() != 0)
-        .map_err(IdentityStoreError::storage)
+        .map_err(IdentityStoreError::storage)?
+        .rows_affected()
+            != 0;
+        transaction
+            .commit()
+            .await
+            .map_err(IdentityStoreError::storage)?;
+
+        // SQL was authoritative; remove only the rows deleted above from the
+        // process cache. Calling the narrow invalidator avoids deleting new
+        // rows if another process reuses the QQ id immediately after commit.
+        for id in purged_legacy_ids {
+            crate::memory::MEMORY_MANAGER
+                .remove_cached_memory(&id)
+                .await;
+        }
+        Ok(unlinked)
+    }
+
+    async fn purge_qq_private_legacy_rows(
+        transaction: &mut Transaction<'_, Postgres>,
+        user_id: i64,
+    ) -> Result<Vec<String>, IdentityStoreError> {
+        let rows = query(
+            r#"
+            DELETE FROM kovi_bot_memories
+            WHERE subject_id = $1
+              AND (
+                    scope_type = 'private'
+                    OR context = 'private'
+                    OR context LIKE 'private\_%' ESCAPE '\'
+                    OR context LIKE 'proactive\_private\_%' ESCAPE '\'
+                    OR context = 'proactive_main_admin_decision'
+                  )
+            RETURNING id
+            "#,
+        )
+        .bind(user_id)
+        .fetch_all(&mut **transaction)
+        .await
+        .map_err(IdentityStoreError::storage)?;
+        rows.into_iter()
+            .map(|row| {
+                row.try_get::<String, _>("id")
+                    .map_err(IdentityStoreError::storage)
+            })
+            .collect()
+    }
+
+    async fn purge_direct_legacy_rows(
+        transaction: &mut Transaction<'_, Postgres>,
+        conversation_ids: &[Uuid],
+    ) -> Result<Vec<String>, IdentityStoreError> {
+        if conversation_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let prefixes = conversation_ids
+            .iter()
+            .map(|id| format!("{DIRECT_MEMORY_CONTEXT_PREFIX}{id}"))
+            .collect::<Vec<_>>();
+        let rows = query(
+            r#"
+            DELETE FROM kovi_bot_memories
+            WHERE subject_id IS NULL
+              AND EXISTS (
+                  SELECT 1
+                  FROM UNNEST($1::TEXT[]) AS prefix(value)
+                  WHERE context = prefix.value
+                     OR context = prefix.value || $2
+              )
+            RETURNING id
+            "#,
+        )
+        .bind(&prefixes)
+        .bind(FACT_MEMORY_CONTEXT_SUFFIX)
+        .fetch_all(&mut **transaction)
+        .await
+        .map_err(IdentityStoreError::storage)?;
+        rows.into_iter()
+            .map(|row| {
+                row.try_get::<String, _>("id")
+                    .map_err(IdentityStoreError::storage)
+            })
+            .collect()
     }
 
     pub(crate) async fn export_person(
@@ -318,6 +512,9 @@ impl PostgresIdentityStore {
         let mut transaction = self
             .pool
             .begin()
+            .await
+            .map_err(IdentityStoreError::storage)?;
+        owner_lock::lock_memory_maintenance(&mut transaction)
             .await
             .map_err(IdentityStoreError::storage)?;
         owner_lock::lock_owner(
@@ -623,9 +820,19 @@ impl PostgresIdentityStore {
             });
         }
 
+        // Match the lock order used by Core memory writes and cleanup. Holding
+        // the legacy manager guard before opening the transaction prevents a
+        // writer from publishing a compatibility row after this owner purge
+        // has taken its snapshot but before the host's final cache pass.
+        let _legacy_save_guard = crate::memory::MEMORY_MANAGER.acquire_save_lock().await;
         let mut transaction = self
             .pool
             .begin()
+            .await
+            .map_err(IdentityStoreError::storage)?;
+        // Memory writers and retention use the same lock so domain erasure
+        // cannot delete Core data between a dual-write's two projections.
+        owner_lock::lock_memory_maintenance(&mut transaction)
             .await
             .map_err(IdentityStoreError::storage)?;
         let person_id = query_scalar::<Postgres, Uuid>(
@@ -1008,9 +1215,16 @@ impl PostgresIdentityStore {
                 "QQ group id must be positive",
             )));
         }
+        // Keep the compatibility table mutation order identical to the Core
+        // memory writer/cleanup path while the canonical group owner is
+        // removed.
+        let _legacy_save_guard = crate::memory::MEMORY_MANAGER.acquire_save_lock().await;
         let mut transaction = self
             .pool
             .begin()
+            .await
+            .map_err(IdentityStoreError::storage)?;
+        owner_lock::lock_memory_maintenance(&mut transaction)
             .await
             .map_err(IdentityStoreError::storage)?;
         let conversation_id = query_scalar::<Postgres, Uuid>(
@@ -1106,6 +1320,9 @@ impl PostgresIdentityStore {
         let mut transaction = self
             .pool
             .begin()
+            .await
+            .map_err(IdentityStoreError::storage)?;
+        owner_lock::lock_memory_maintenance(&mut transaction)
             .await
             .map_err(IdentityStoreError::storage)?;
         if !owner_lock::lock_and_owner_exists(
@@ -1713,28 +1930,62 @@ impl PostgresIdentityStore {
         &self,
         external: &ExternalIdentity,
     ) -> Result<PersonId, IdentityStoreError> {
-        if let Some(existing) = query_scalar::<Postgres, Uuid>(
-            r#"
-            SELECT person_id
-            FROM yunxi_external_identities
-            WHERE platform = $1 AND external_id = $2
-            "#,
-        )
-        .bind(external.platform().as_str())
-        .bind(external.external_id())
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(IdentityStoreError::storage)?
-        {
-            return Ok(PersonId::from_uuid(existing));
-        }
-
         let candidate = PersonId::new();
         let mut transaction = self
             .pool
             .begin()
             .await
             .map_err(IdentityStoreError::storage)?;
+        // Identity resolution can create the subject key used by legacy
+        // memory projections.  Serialize it with memory maintenance first,
+        // then use the canonical Person lock, matching unlink/erasure order.
+        owner_lock::lock_memory_maintenance(&mut transaction)
+            .await
+            .map_err(IdentityStoreError::storage)?;
+
+        // Do not hold a mapping row lock while acquiring the owner lock.  The
+        // deletion path follows this same read -> owner lock -> FOR UPDATE
+        // sequence, so unlink and resolve cannot deadlock each other.
+        if let Some(existing) = query_scalar::<Postgres, Uuid>(
+            "SELECT person_id FROM yunxi_external_identities
+             WHERE platform = $1 AND external_id = $2",
+        )
+        .bind(external.platform().as_str())
+        .bind(external.external_id())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(IdentityStoreError::storage)?
+        {
+            if !owner_lock::lock_and_owner_exists(&mut transaction, DurableOwner::Person(existing))
+                .await
+                .map_err(IdentityStoreError::storage)?
+            {
+                return Err(IdentityStoreError::storage(std::io::Error::other(
+                    "external identity points to a missing canonical person",
+                )));
+            }
+            let locked_person = query_scalar::<Postgres, Uuid>(
+                "SELECT person_id FROM yunxi_external_identities
+                 WHERE platform = $1 AND external_id = $2
+                 FOR UPDATE",
+            )
+            .bind(external.platform().as_str())
+            .bind(external.external_id())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(IdentityStoreError::storage)?;
+            if locked_person != Some(existing) {
+                return Err(IdentityStoreError::storage(std::io::Error::other(
+                    "external identity changed while resolution was acquiring its owner lock",
+                )));
+            }
+            transaction
+                .commit()
+                .await
+                .map_err(IdentityStoreError::storage)?;
+            return Ok(PersonId::from_uuid(existing));
+        }
+
         query("INSERT INTO yunxi_persons (id) VALUES ($1)")
             .bind(candidate.into_uuid())
             .execute(&mut *transaction)
@@ -1762,6 +2013,14 @@ impl PostgresIdentityStore {
                 .execute(&mut *transaction)
                 .await
                 .map_err(IdentityStoreError::storage)?;
+        }
+        if !owner_lock::lock_and_owner_exists(&mut transaction, DurableOwner::Person(winner))
+            .await
+            .map_err(IdentityStoreError::storage)?
+        {
+            return Err(IdentityStoreError::storage(std::io::Error::other(
+                "resolved external identity points to a missing canonical person",
+            )));
         }
         transaction
             .commit()
@@ -1876,6 +2135,9 @@ impl PostgresIdentityStore {
             .begin()
             .await
             .map_err(IdentityStoreError::storage)?;
+        owner_lock::lock_memory_maintenance(&mut transaction)
+            .await
+            .map_err(IdentityStoreError::storage)?;
         if !owner_lock::lock_and_owner_exists(
             &mut transaction,
             DurableOwner::Person(person_id.into_uuid()),
@@ -1937,6 +2199,9 @@ impl PostgresIdentityStore {
         let mut transaction = self
             .pool
             .begin()
+            .await
+            .map_err(IdentityStoreError::storage)?;
+        owner_lock::lock_memory_maintenance(&mut transaction)
             .await
             .map_err(IdentityStoreError::storage)?;
         let conversation_id =
@@ -4170,6 +4435,215 @@ mod tests {
                     .execute(&pool)
                     .await
                     .expect("应清理 round-trip person");
+            });
+    }
+
+    #[test]
+    #[ignore = "requires PostgreSQL via DATABASE_URL"]
+    fn postgres_qq_unlink_purges_private_legacy_rows_before_identity_reuse() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let database_url = std::env::var("DATABASE_URL").expect("需要 DATABASE_URL");
+                let pool = PgPoolOptions::new()
+                    .max_connections(8)
+                    .connect(&database_url)
+                    .await
+                    .expect("应连接 PostgreSQL");
+                let store = initialize_portable_schema(&pool).await;
+
+                let suffix = (Uuid::new_v4().as_u128() % 900_000_000) as i64;
+                let user_id = 8_400_000_000_000_i64 + suffix;
+                let other_user_id = user_id + 1;
+                let identity = qq::person(user_id).expect("valid QQ identity");
+                let person_id = store
+                    .resolve_identity(&identity)
+                    .await
+                    .expect("identity should resolve");
+                let direct_conversation_id = Uuid::new_v4();
+                let direct_bot_id = user_id + 10;
+                query("INSERT INTO yunxi_conversations (id, kind) VALUES ($1, 'direct')")
+                    .bind(direct_conversation_id)
+                    .execute(&pool)
+                    .await
+                    .expect("应创建直聊会话 fixture");
+                query(
+                    "INSERT INTO yunxi_conversation_members (conversation_id, person_id)
+                     VALUES ($1, $2)",
+                )
+                .bind(direct_conversation_id)
+                .bind(person_id.into_uuid())
+                .execute(&pool)
+                .await
+                .expect("应创建直聊成员 fixture");
+                query(
+                    "INSERT INTO yunxi_external_conversations
+                        (platform, external_id, conversation_id)
+                     VALUES ('qq', $1, $2)",
+                )
+                .bind(format!("direct:{direct_bot_id}:{user_id}"))
+                .bind(direct_conversation_id)
+                .execute(&pool)
+                .await
+                .expect("应创建直聊外部映射 fixture");
+                let private_ids = vec![
+                    format!("unlink-private-{suffix}"),
+                    format!("unlink-private-batch-{suffix}"),
+                    format!("unlink-proactive-private-{suffix}"),
+                    format!("unlink-main-admin-{suffix}"),
+                ];
+                let group_id = format!("unlink-group-{suffix}");
+                let other_id = format!("unlink-other-{suffix}");
+                let direct_legacy_id = format!("unlink-direct-{suffix}");
+                for (id, scope_type, context, subject_id) in [
+                    (
+                        private_ids[0].as_str(),
+                        Some("private"),
+                        "private_chat",
+                        Some(user_id),
+                    ),
+                    (
+                        private_ids[1].as_str(),
+                        None,
+                        "private_chat_batch",
+                        Some(user_id),
+                    ),
+                    (
+                        private_ids[2].as_str(),
+                        None,
+                        "proactive_private_chat",
+                        Some(user_id),
+                    ),
+                    (
+                        private_ids[3].as_str(),
+                        None,
+                        "proactive_main_admin_decision",
+                        Some(user_id),
+                    ),
+                    (
+                        group_id.as_str(),
+                        Some("group"),
+                        "group_chat",
+                        Some(user_id),
+                    ),
+                    (
+                        other_id.as_str(),
+                        Some("private"),
+                        "private_chat",
+                        Some(other_user_id),
+                    ),
+                ] {
+                    query(
+                        "INSERT INTO kovi_bot_memories
+                            (id, subject_id, scope_type, context, occurred_at, importance, payload)
+                         VALUES ($1, $2, $3, $4, NOW(), 50, $5)",
+                    )
+                    .bind(id)
+                    .bind(subject_id)
+                    .bind(scope_type)
+                    .bind(context)
+                    .bind(serde_json::json!({"id": id, "content": "unlink fixture"}))
+                    .execute(&pool)
+                    .await
+                    .expect("应创建 legacy unlink fixture");
+                }
+                query(
+                    "INSERT INTO kovi_bot_memories
+                        (id, subject_id, context, occurred_at, importance, payload)
+                     VALUES ($1, NULL, $2, NOW(), 50, $3)",
+                )
+                .bind(&direct_legacy_id)
+                .bind(format!("yunxi_direct_chat:{direct_conversation_id}"))
+                .bind(serde_json::json!({
+                    "id": direct_legacy_id,
+                    "content": "unlink direct fixture"
+                }))
+                .execute(&pool)
+                .await
+                .expect("应创建直聊 legacy fixture");
+
+                assert!(
+                    store
+                        .unlink_external_identity(&identity)
+                        .await
+                        .expect("QQ identity unlink should succeed")
+                );
+                assert_eq!(
+                    query_scalar::<Postgres, i64>(
+                        "SELECT COUNT(*) FROM yunxi_external_identities
+                         WHERE platform = 'qq' AND external_id = $1",
+                    )
+                    .bind(identity.external_id())
+                    .fetch_one(&pool)
+                    .await
+                    .expect("应检查 QQ mapping"),
+                    0
+                );
+                assert_eq!(
+                    query_scalar::<Postgres, i64>(
+                        "SELECT COUNT(*) FROM kovi_bot_memories WHERE id = ANY($1)",
+                    )
+                    .bind(&private_ids)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("应检查私聊 legacy rows"),
+                    0,
+                    "解绑必须清理所有私聊形态的兼容记忆"
+                );
+                assert_eq!(
+                    query_scalar::<Postgres, i64>(
+                        "SELECT COUNT(*) FROM kovi_bot_memories WHERE id = ANY($1)",
+                    )
+                    .bind(vec![group_id.clone(), other_id.clone()])
+                    .fetch_one(&pool)
+                    .await
+                    .expect("应检查不相关 legacy rows"),
+                    2,
+                    "解绑不能误删群记忆或其他 QQ 用户记忆"
+                );
+                assert_eq!(
+                    query_scalar::<Postgres, i64>(
+                        "SELECT COUNT(*) FROM kovi_bot_memories WHERE id = $1",
+                    )
+                    .bind(&direct_legacy_id)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("应检查直聊 legacy row"),
+                    0,
+                    "解绑必须清理旧直聊上下文投影"
+                );
+
+                let reused_person = store
+                    .resolve_identity(&identity)
+                    .await
+                    .expect("解绑后的 QQ identity 应可重新绑定");
+                assert_ne!(reused_person, person_id);
+
+                query("DELETE FROM kovi_bot_memories WHERE id = ANY($1)")
+                    .bind(vec![group_id, other_id])
+                    .execute(&pool)
+                    .await
+                    .expect("应清理 legacy fixtures");
+                query("DELETE FROM yunxi_external_conversations WHERE conversation_id = $1")
+                    .bind(direct_conversation_id)
+                    .execute(&pool)
+                    .await
+                    .expect("应清理直聊外部映射 fixture");
+                query("DELETE FROM yunxi_conversation_members WHERE conversation_id = $1")
+                    .bind(direct_conversation_id)
+                    .execute(&pool)
+                    .await
+                    .expect("应清理直聊成员 fixture");
+                query("DELETE FROM yunxi_conversations WHERE id = $1")
+                    .bind(direct_conversation_id)
+                    .execute(&pool)
+                    .await
+                    .expect("应清理直聊会话 fixture");
+                query("DELETE FROM yunxi_persons WHERE id = ANY($1)")
+                    .bind(vec![person_id.into_uuid(), reused_person.into_uuid()])
+                    .execute(&pool)
+                    .await
+                    .expect("应清理 identity reuse fixtures");
             });
     }
 

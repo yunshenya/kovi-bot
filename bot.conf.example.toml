@@ -79,6 +79,9 @@ sticker_reaction_rate_limit = 3
 [memory]
 max_entries = 1000
 retention_days = 30
+episode_retention_days = 365
+episode_max_per_scope = 128
+episode_protected_salience = 0.7
 profile_ttl_days = 90
 summary_ttl_days = 30
 sticker_ttl_days = 90

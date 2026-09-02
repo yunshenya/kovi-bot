@@ -10,7 +10,7 @@
 
 use anyhow::Result;
 use chrono::{DateTime, Duration as ChronoDuration, Local, Utc};
-use kovi::tokio::sync::Mutex;
+use kovi::tokio::sync::{Mutex, OwnedMutexGuard};
 use serde::{Deserialize, Serialize};
 use sqlx_core::query::query;
 use sqlx_core::query_scalar::query_scalar;
@@ -31,6 +31,16 @@ use uuid::Uuid;
 static MEMORY_ID_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const MAX_USER_PROFILES: usize = 10_000;
 const MAX_GROUP_PROFILES: usize = 2_000;
+
+/// Serialize legacy memory-table mutations with the Yunxi Core adapter.
+/// PostgreSQL transaction-scoped advisory locks make this effective across
+/// bot processes while remaining a no-op for the file-backed test backend.
+async fn lock_memory_maintenance(transaction: &mut Transaction<'_, Postgres>) -> Result<()> {
+    query("SELECT pg_advisory_xact_lock(hashtext('kovi-bot'), hashtext('yunxi-memory-maintenance-v1'))")
+        .execute(&mut **transaction)
+        .await?;
+    Ok(())
+}
 
 /// 全局记忆管理器实例
 ///
@@ -487,6 +497,188 @@ impl MemoryManager {
         self.database_pool.get()
     }
 
+    /// Serialize an external canonical-memory transaction with legacy writes
+    /// and compaction. The Yunxi adapter uses this while deleting both copies
+    /// in one PostgreSQL transaction.
+    pub(crate) async fn acquire_save_lock(&self) -> OwnedMutexGuard<()> {
+        Arc::clone(&self.save_lock).lock_owned().await
+    }
+
+    /// Persist a legacy projection inside a transaction owned by another
+    /// store. The cache is deliberately untouched until the caller commits;
+    /// this lets the Core adapter commit both storage layers atomically.
+    pub(crate) async fn upsert_memory_in_transaction(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+        memory: &MemoryEntry,
+    ) -> Result<Option<String>> {
+        let duplicate_id = self.find_duplicate_memory_id(memory).await;
+        Self::upsert_memory(transaction, memory).await?;
+        if let Some(duplicate_id) = &duplicate_id
+            && *duplicate_id != memory.id
+        {
+            query("DELETE FROM kovi_bot_memories WHERE id = $1")
+                .bind(duplicate_id)
+                .execute(&mut **transaction)
+                .await?;
+        }
+        Ok(duplicate_id)
+    }
+
+    /// Publish a legacy projection after its external transaction commits.
+    /// Keeping this separate from SQL writes prevents a failed transaction
+    /// from making the in-process cache disagree with PostgreSQL.
+    pub(crate) async fn publish_memory_after_transaction(
+        &self,
+        memory: MemoryEntry,
+        duplicate_id: Option<String>,
+    ) {
+        let mut memories = self.memories.lock().await;
+        if let Some(duplicate_id) = duplicate_id
+            && duplicate_id != memory.id
+        {
+            memories.remove(&duplicate_id);
+        }
+        memories.insert(memory.id.clone(), memory);
+    }
+
+    async fn find_duplicate_memory_id(&self, memory: &MemoryEntry) -> Option<String> {
+        let memories = self.memories.lock().await;
+        let normalized_content = normalize_memory_content(&memory.content);
+        memories
+            .values()
+            .find(|existing| {
+                existing.subject_id == memory.subject_id
+                    && existing.context == memory.context
+                    && normalize_memory_content(&existing.content) == normalized_content
+            })
+            .map(|existing| existing.id.clone())
+    }
+
+    /// Delete a legacy row using a caller-owned transaction. The in-memory
+    /// cache is updated only after that transaction commits.
+    pub(crate) async fn delete_memory_for_domain_scope_in_transaction(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+        id: &str,
+        subject_id: Option<i64>,
+        context_prefix: &str,
+    ) -> Result<Option<String>> {
+        let actual_id = self
+            .memories
+            .lock()
+            .await
+            .iter()
+            .find_map(|(actual_id, memory)| {
+                let in_scope =
+                    memory.subject_id == subject_id && memory.context.starts_with(context_prefix);
+                (in_scope
+                    && (actual_id == id
+                        || Uuid::parse_str(id)
+                            .ok()
+                            .is_some_and(|requested| stable_memory_uuid(actual_id) == requested)))
+                .then_some(actual_id.clone())
+            });
+        let candidate_id = actual_id.as_deref().unwrap_or(id);
+        let deleted = query(
+            r#"
+            DELETE FROM kovi_bot_memories
+            WHERE id = $1
+              AND subject_id IS NOT DISTINCT FROM $2
+              AND STRPOS(context, $3) = 1
+            "#,
+        )
+        .bind(candidate_id)
+        .bind(subject_id)
+        .bind(context_prefix)
+        .execute(&mut **transaction)
+        .await?
+        .rows_affected();
+        Ok((deleted > 0).then_some(candidate_id.to_owned()))
+    }
+
+    /// Delete a canonical projection by its exact ID. Callers may use this
+    /// only after proving the corresponding Core row belongs to their scope;
+    /// unlike the old global fast path, the proof lives at the call site and
+    /// prevents a wrong-scope `forget` from touching another domain.
+    pub(crate) async fn delete_memory_by_id_in_transaction(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+        id: &str,
+    ) -> Result<Option<String>> {
+        let deleted = query("DELETE FROM kovi_bot_memories WHERE id = $1 RETURNING id")
+            .bind(id)
+            .fetch_optional(&mut **transaction)
+            .await?;
+        Ok(deleted.map(|row| row.get::<String, _>("id")))
+    }
+
+    pub(crate) async fn remove_cached_memory(&self, id: &str) {
+        self.memories.lock().await.remove(id);
+    }
+
+    /// Remove compatibility projections for direct conversations after their
+    /// canonical conversation IDs have been erased. Direct rows intentionally
+    /// have no numeric `subject_id`, so the exact conversation context is the
+    /// only safe ownership predicate. The cache is changed only after commit.
+    pub(crate) async fn delete_direct_conversation_data(
+        &self,
+        conversation_ids: &[Uuid],
+    ) -> Result<u64> {
+        let mut prefixes = conversation_ids
+            .iter()
+            .map(|id| format!("yunxi_direct_chat:{id}"))
+            .collect::<Vec<_>>();
+        prefixes.sort_unstable();
+        prefixes.dedup();
+        if prefixes.is_empty() {
+            return Ok(0);
+        }
+
+        let _save_guard = self.save_lock.lock().await;
+        if let Some(pool) = self.database_pool.get() {
+            let mut transaction = pool.begin().await?;
+            lock_memory_maintenance(&mut transaction).await?;
+            let rows = query(
+                r#"
+                DELETE FROM kovi_bot_memories
+                WHERE subject_id IS NULL
+                  AND EXISTS (
+                      SELECT 1
+                      FROM UNNEST($1::TEXT[]) AS prefix(value)
+                      WHERE context = prefix.value
+                         OR context = prefix.value || '|yunxi_kind=fact'
+                  )
+                RETURNING id
+                "#,
+            )
+            .bind(&prefixes)
+            .fetch_all(&mut *transaction)
+            .await?;
+            let deleted_ids = rows
+                .iter()
+                .map(|row| row.get::<String, _>("id"))
+                .collect::<Vec<_>>();
+            transaction.commit().await?;
+            let deleted = deleted_ids.len() as u64;
+            let mut memories = self.memories.lock().await;
+            for id in deleted_ids {
+                memories.remove(&id);
+            }
+            return Ok(deleted);
+        }
+
+        let mut data = self.snapshot().await;
+        let before = data.memories.len();
+        data.memories.retain(|_, memory| {
+            !(memory.subject_id.is_none() && direct_context_matches(&memory.context, &prefixes))
+        });
+        let deleted = (before - data.memories.len()) as u64;
+        self.persist_file_snapshot_locked(&data).await?;
+        *self.memories.lock().await = data.memories;
+        Ok(deleted)
+    }
+
     /// 获取主动消息的独立限频状态。
     pub(crate) async fn get_proactive_state(&self, state_key: &str) -> Option<ProactiveState> {
         if let Some(pool) = self.database_pool.get() {
@@ -799,14 +991,63 @@ impl MemoryManager {
         .map_err(Into::into)
     }
 
+    /// Decode a compatibility payload while taking the normalized columns as
+    /// authoritative for identity, scope, and timestamp. Older snapshots may
+    /// omit `subject_id` or contain a hand-edited/non-array `tags` value; those
+    /// fields are repaired locally so one stale row cannot poison startup or a
+    /// scoped recall.
+    fn decode_legacy_memory_payload(
+        mut payload: serde_json::Value,
+        id: &str,
+        subject_id: Option<i64>,
+        context: &str,
+        occurred_at: DateTime<Utc>,
+    ) -> Result<MemoryEntry> {
+        let object = payload
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("legacy memory payload is not an object"))?;
+        object.insert("id".to_owned(), serde_json::json!(id));
+        object.insert("subject_id".to_owned(), serde_json::json!(subject_id));
+        object.insert("context".to_owned(), serde_json::json!(context));
+        object.insert(
+            "timestamp".to_owned(),
+            serde_json::to_value(occurred_at.with_timezone(&Local))?,
+        );
+        let tags = object
+            .entry("tags".to_owned())
+            .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+        if let serde_json::Value::Array(values) = tags {
+            values.retain(serde_json::Value::is_string);
+        } else {
+            *tags = serde_json::Value::Array(Vec::new());
+        }
+        Ok(serde_json::from_value(payload)?)
+    }
+
     async fn load_normalized_data(pool: &PgPool) -> Result<MemoryData> {
         let mut data = MemoryData::default();
-        for row in query("SELECT payload FROM kovi_bot_memories")
-            .fetch_all(pool)
-            .await?
+        for row in
+            query("SELECT id, subject_id, context, occurred_at, payload FROM kovi_bot_memories")
+                .fetch_all(pool)
+                .await?
         {
-            let memory: MemoryEntry = serde_json::from_value(row.get("payload"))?;
-            data.memories.insert(memory.id.clone(), memory);
+            let id = row.get::<String, _>("id");
+            let subject_id = row.get::<Option<i64>, _>("subject_id");
+            let context = row.get::<String, _>("context");
+            let occurred_at = row.get::<DateTime<Utc>, _>("occurred_at");
+            let Ok(memory) = Self::decode_legacy_memory_payload(
+                row.get("payload"),
+                &id,
+                subject_id,
+                &context,
+                occurred_at,
+            ) else {
+                // A single malformed compatibility row must not prevent the
+                // bot from starting; the durable row remains available for a
+                // later repair/migration pass.
+                continue;
+            };
+            data.memories.insert(id, memory);
         }
         for row in query("SELECT user_id, payload FROM kovi_bot_user_profiles")
             .fetch_all(pool)
@@ -1067,6 +1308,7 @@ impl MemoryManager {
             // 新记忆写入与旧重复项删除属于同一个事务。提交成功后才发布到内存，
             // 避免数据库失败时进程内看见一个重启后会消失的状态。
             let mut transaction = pool.begin().await?;
+            lock_memory_maintenance(&mut transaction).await?;
             Self::upsert_memory(&mut transaction, &memory).await?;
             if let Some(duplicate_id) = &duplicate_id
                 && *duplicate_id != memory.id
@@ -1153,7 +1395,7 @@ impl MemoryManager {
             };
             let fetch = query(
                 r#"
-                SELECT payload
+                SELECT id, subject_id, context, occurred_at, payload
                 FROM kovi_bot_memories
                 WHERE subject_id = $1
                   AND ($2::TEXT IS NULL OR STRPOS(context, $2) = 1)
@@ -1168,16 +1410,24 @@ impl MemoryManager {
             .await;
             match fetch {
                 Ok(rows) => {
-                    let parsed = rows
+                    let memories = rows
                         .into_iter()
-                        .map(|row| serde_json::from_value(row.get("payload")))
-                        .collect::<std::result::Result<Vec<MemoryEntry>, _>>();
-                    match parsed {
-                        Ok(memories) => return memories,
-                        Err(error) => {
-                            eprintln!("[WARN] 解析范围记忆失败，回退内存缓存: {}", error);
-                        }
-                    }
+                        .filter_map(|row| {
+                            let id = row.get::<String, _>("id");
+                            let subject_id = row.get::<Option<i64>, _>("subject_id");
+                            let context = row.get::<String, _>("context");
+                            let occurred_at = row.get::<DateTime<Utc>, _>("occurred_at");
+                            Self::decode_legacy_memory_payload(
+                                row.get("payload"),
+                                &id,
+                                subject_id,
+                                &context,
+                                occurred_at,
+                            )
+                            .ok()
+                        })
+                        .collect::<Vec<_>>();
+                    return memories;
                 }
                 Err(error) => {
                     eprintln!("[WARN] 查询范围记忆失败，回退内存缓存: {}", error);
@@ -1202,6 +1452,7 @@ impl MemoryManager {
     /// Bounded domain-scope lookup used by the Yunxi MemoryStore adapter.
     /// `subject_id` stays an infrastructure detail; Core callers provide only
     /// a validated Person/Conversation/Global scope.
+    #[allow(dead_code)]
     pub(crate) async fn get_recent_memories_for_domain_scope(
         &self,
         subject_id: Option<i64>,
@@ -1212,7 +1463,7 @@ impl MemoryManager {
         if let Some(pool) = self.database_pool.get() {
             let fetch = query(
                 r#"
-                SELECT payload
+                SELECT id, subject_id, context, occurred_at, payload
                 FROM kovi_bot_memories
                 WHERE subject_id IS NOT DISTINCT FROM $1
                   AND STRPOS(context, $2) = 1
@@ -1225,12 +1476,24 @@ impl MemoryManager {
             .bind(i64::try_from(limit).unwrap_or(128))
             .fetch_all(pool)
             .await;
-            if let Ok(rows) = fetch
-                && let Ok(memories) = rows
+            if let Ok(rows) = fetch {
+                let memories = rows
                     .into_iter()
-                    .map(|row| serde_json::from_value(row.get("payload")))
-                    .collect::<std::result::Result<Vec<MemoryEntry>, _>>()
-            {
+                    .filter_map(|row| {
+                        let id = row.get::<String, _>("id");
+                        let subject_id = row.get::<Option<i64>, _>("subject_id");
+                        let context = row.get::<String, _>("context");
+                        let occurred_at = row.get::<DateTime<Utc>, _>("occurred_at");
+                        Self::decode_legacy_memory_payload(
+                            row.get("payload"),
+                            &id,
+                            subject_id,
+                            &context,
+                            occurred_at,
+                        )
+                        .ok()
+                    })
+                    .collect::<Vec<_>>();
                 return memories;
             }
         }
@@ -1249,6 +1512,58 @@ impl MemoryManager {
         memories
     }
 
+    /// Transaction-bound variant used while the Yunxi adapter holds the
+    /// cross-process memory-maintenance advisory lock. Keeping the query on
+    /// the caller's connection prevents an identity unlink/reassignment from
+    /// changing the scope between mapping resolution and legacy reads.
+    pub(crate) async fn get_recent_memories_for_domain_scope_in_transaction(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+        subject_id: Option<i64>,
+        context_prefix: &str,
+        limit: usize,
+    ) -> std::result::Result<Vec<MemoryEntry>, sqlx_core::error::Error> {
+        let limit = limit.clamp(1, 128);
+        let rows = query(
+            r#"
+            SELECT id, subject_id, context, occurred_at, payload
+            FROM kovi_bot_memories
+            WHERE subject_id IS NOT DISTINCT FROM $1
+              AND STRPOS(context, $2) = 1
+            ORDER BY occurred_at DESC, id DESC
+            LIMIT $3
+            "#,
+        )
+        .bind(subject_id)
+        .bind(context_prefix)
+        .bind(i64::try_from(limit).unwrap_or(128))
+        .fetch_all(&mut **transaction)
+        .await?;
+        let mut memories = Vec::with_capacity(rows.len());
+        for row in rows {
+            let id = row.get::<String, _>("id");
+            let subject_id = row.get::<Option<i64>, _>("subject_id");
+            let context = row.get::<String, _>("context");
+            let occurred_at = row.get::<DateTime<Utc>, _>("occurred_at");
+            let Ok(memory) = Self::decode_legacy_memory_payload(
+                row.get("payload"),
+                &id,
+                subject_id,
+                &context,
+                occurred_at,
+            ) else {
+                continue;
+            };
+            // The SQL subject/context predicates are authoritative. Older
+            // payloads may omit `subject_id` even though the normalized
+            // columns contain it; filtering on the JSON would hide those
+            // memories after migration.
+            memories.push(memory);
+        }
+        Ok(memories)
+    }
+
+    #[allow(dead_code)]
     pub(crate) async fn delete_memory_for_domain_scope(
         &self,
         id: &str,
@@ -1276,6 +1591,8 @@ impl MemoryManager {
         };
 
         if let Some(pool) = self.database_pool.get() {
+            let mut transaction = pool.begin().await?;
+            lock_memory_maintenance(&mut transaction).await?;
             let deleted = query(
                 r#"
                 DELETE FROM kovi_bot_memories
@@ -1287,9 +1604,10 @@ impl MemoryManager {
             .bind(&actual_id)
             .bind(subject_id)
             .bind(context_prefix)
-            .execute(pool)
+            .execute(&mut *transaction)
             .await?
             .rows_affected();
+            transaction.commit().await?;
             if deleted > 0 {
                 self.memories.lock().await.remove(&actual_id);
                 return Ok(true);
@@ -1947,18 +2265,40 @@ impl MemoryManager {
 
         if let Some(pool) = self.database_pool.get() {
             let mut transaction = pool.begin().await?;
-            let memories = match scope {
+            lock_memory_maintenance(&mut transaction).await?;
+            let deleted_memory_rows = match scope {
                 ConversationScope::Private => query(
-                    "DELETE FROM kovi_bot_memories WHERE subject_id = $1 AND (scope_type = 'private' OR context = 'proactive_main_admin_decision')",
+                    r#"DELETE FROM kovi_bot_memories
+                       WHERE subject_id = $1
+                         AND (
+                               scope_type = 'private'
+                               OR context = 'private'
+                               OR context LIKE 'private\_%' ESCAPE '\'
+                               OR context LIKE 'proactive\_private\_%' ESCAPE '\'
+                               OR context = 'proactive_main_admin_decision'
+                         )
+                       RETURNING id"#,
                 ),
                 ConversationScope::Group => query(
-                    "DELETE FROM kovi_bot_memories WHERE subject_id = $1 AND scope_type = 'group'",
+                    r#"DELETE FROM kovi_bot_memories
+                       WHERE subject_id = $1
+                         AND (
+                               scope_type = 'group'
+                               OR context = 'group'
+                               OR context LIKE 'group\_%' ESCAPE '\'
+                               OR context LIKE 'proactive\_group\_%' ESCAPE '\'
+                         )
+                       RETURNING id"#,
                 ),
             }
             .bind(subject_id)
-            .execute(&mut *transaction)
-            .await?
-            .rows_affected();
+            .fetch_all(&mut *transaction)
+            .await?;
+            let deleted_memory_ids = deleted_memory_rows
+                .iter()
+                .map(|row| row.get::<String, _>("id"))
+                .collect::<Vec<_>>();
+            let memories = deleted_memory_ids.len() as u64;
             let profile = match scope {
                 ConversationScope::Private => {
                     query("DELETE FROM kovi_bot_user_profiles WHERE user_id = $1")
@@ -1979,6 +2319,14 @@ impl MemoryManager {
                     .rows_affected();
             transaction.commit().await?;
 
+            // The normalized SQL columns remain authoritative for migrated
+            // rows whose JSON payload predates `subject_id`.
+            {
+                let mut cached_memories = self.memories.lock().await;
+                for id in deleted_memory_ids {
+                    cached_memories.remove(&id);
+                }
+            }
             self.publish_subject_deletion(subject_id, scope, &summary_key)
                 .await;
             return Ok(memories + profile + summary);
@@ -2087,6 +2435,7 @@ impl MemoryManager {
 
         if let Some(pool) = self.database_pool.get() {
             let mut transaction = pool.begin().await?;
+            lock_memory_maintenance(&mut transaction).await?;
             Self::upsert_personality(&mut transaction, &next).await?;
             Self::upsert_memory(&mut transaction, &memory).await?;
             if let Some(duplicate_id) = &duplicate_id
@@ -2193,6 +2542,7 @@ impl MemoryManager {
         }
         if let Some(pool) = self.database_pool.get() {
             let mut transaction = pool.begin().await?;
+            lock_memory_maintenance(&mut transaction).await?;
             if !removed_ids.is_empty() {
                 query("DELETE FROM kovi_bot_memories WHERE id = ANY($1::TEXT[])")
                     .bind(&removed_ids)
@@ -2660,6 +3010,12 @@ fn stable_memory_uuid(legacy_id: &str) -> Uuid {
         .unwrap_or_else(|_| Uuid::new_v5(&Uuid::NAMESPACE_URL, legacy_id.as_bytes()))
 }
 
+fn direct_context_matches(context: &str, prefixes: &[String]) -> bool {
+    prefixes
+        .iter()
+        .any(|prefix| context == prefix || context == format!("{prefix}|yunxi_kind=fact"))
+}
+
 fn conversation_summary_key(context: &str, subject_id: i64) -> String {
     format!(
         "{}:{}",
@@ -2711,6 +3067,7 @@ mod tests {
         conversation_summary_key,
     };
     use chrono::{Duration as ChronoDuration, Local};
+    use sqlx_core::query::query;
     use std::sync::Arc;
     use uuid::Uuid;
 
@@ -2965,6 +3322,63 @@ mod tests {
                         .expect("旧记忆应可按稳定 ID 删除")
                 );
                 assert!(manager.get_recent_memories(0).await.is_empty());
+                std::fs::remove_file(path).expect("应清理测试记忆文件");
+            });
+    }
+
+    #[test]
+    fn direct_conversation_delete_uses_exact_context_and_keeps_other_scopes() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let path = temporary_memory_path("direct-conversation-delete");
+                let manager = MemoryManager::new(path.to_str().expect("临时路径应为 UTF-8"));
+                let first = Uuid::new_v4();
+                let second = Uuid::new_v4();
+                for (id, context, subject_id) in [
+                    ("direct-a", format!("yunxi_direct_chat:{first}"), None),
+                    (
+                        "direct-a-fact",
+                        format!("yunxi_direct_chat:{first}|yunxi_kind=fact"),
+                        None,
+                    ),
+                    ("direct-b", format!("yunxi_direct_chat:{second}"), None),
+                    ("numeric-private", "private_chat".to_owned(), Some(42)),
+                ] {
+                    manager
+                        .add_memory(MemoryEntry {
+                            id: id.to_owned(),
+                            content: id.to_owned(),
+                            timestamp: Local::now(),
+                            memory_type: MemoryType::Event,
+                            importance: 5,
+                            tags: Vec::new(),
+                            context,
+                            subject_id,
+                        })
+                        .await
+                        .expect("应写入直接会话测试记忆");
+                }
+
+                assert_eq!(
+                    manager
+                        .delete_direct_conversation_data(&[first])
+                        .await
+                        .expect("应删除指定直接会话记忆"),
+                    2
+                );
+                let remaining = manager.get_recent_memories(0).await;
+                assert!(
+                    remaining
+                        .iter()
+                        .all(|memory| { memory.id != "direct-a" && memory.id != "direct-a-fact" })
+                );
+                assert!(remaining.iter().any(|memory| memory.id == "direct-b"));
+                assert!(
+                    remaining
+                        .iter()
+                        .any(|memory| memory.id == "numeric-private")
+                );
                 std::fs::remove_file(path).expect("应清理测试记忆文件");
             });
     }
@@ -3357,6 +3771,66 @@ mod tests {
                         .iter()
                         .any(|memory| memory.content == content)
                 );
+            });
+    }
+
+    #[test]
+    #[ignore = "requires PostgreSQL via DATABASE_URL"]
+    fn postgres_direct_conversation_delete_removes_only_exact_contexts() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let suffix = Uuid::new_v4();
+                let path = temporary_memory_path("postgres-direct-delete");
+                let manager = MemoryManager::new(path.to_str().expect("临时路径应为 UTF-8"));
+                manager
+                    .initialize_database()
+                    .await
+                    .expect("应初始化 PostgreSQL 分表");
+                let first_context = format!("yunxi_direct_chat:{suffix}");
+                let other_context = format!("yunxi_direct_chat:{}", Uuid::new_v4());
+                let first_id = format!("direct-db-base-{suffix}");
+                let fact_id = format!("direct-db-fact-{suffix}");
+                let other_id = format!("direct-db-other-{suffix}");
+                for (id, context) in [
+                    (first_id.clone(), first_context.clone()),
+                    (fact_id.clone(), format!("{first_context}|yunxi_kind=fact")),
+                    (other_id.clone(), other_context),
+                ] {
+                    manager
+                        .add_memory(MemoryEntry {
+                            id,
+                            content: "direct postgres fixture".to_owned(),
+                            timestamp: Local::now(),
+                            memory_type: MemoryType::Event,
+                            importance: 5,
+                            tags: Vec::new(),
+                            context,
+                            subject_id: None,
+                        })
+                        .await
+                        .expect("应写入 PostgreSQL 直聊 fixture");
+                }
+                assert_eq!(
+                    manager
+                        .delete_direct_conversation_data(&[suffix])
+                        .await
+                        .expect("应删除 PostgreSQL 直聊 fixture"),
+                    2
+                );
+                let remaining = manager.get_recent_memories(0).await;
+                assert!(
+                    remaining
+                        .iter()
+                        .all(|memory| { memory.id != first_id && memory.id != fact_id })
+                );
+                assert!(remaining.iter().any(|memory| memory.id == other_id));
+                query("DELETE FROM kovi_bot_memories WHERE context LIKE $1")
+                    .bind(format!("%{suffix}%"))
+                    .execute(manager.database_pool().expect("数据库连接池应存在"))
+                    .await
+                    .expect("应清理 PostgreSQL fixture");
+                let _ = std::fs::remove_file(path);
             });
     }
 }

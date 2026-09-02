@@ -39,6 +39,30 @@ pub(crate) async fn lock_owner(
     Ok(())
 }
 
+/// Serialize operations that touch both the canonical memory table and its
+/// legacy compatibility projection. This lock is deliberately independent of
+/// an owner lock because retention and migration may span many owners.
+pub(crate) async fn lock_memory_maintenance(
+    transaction: &mut Transaction<'_, Postgres>,
+) -> Result<(), sqlx_core::error::Error> {
+    query("SELECT pg_advisory_xact_lock(hashtext('kovi-bot'), hashtext('yunxi-memory-maintenance-v1'))")
+        .execute(&mut **transaction)
+        .await?;
+    Ok(())
+}
+
+/// Take a shared snapshot barrier for memory reads. Multiple recalls may run
+/// concurrently, while an exclusive maintenance lock still prevents a read
+/// from mixing Core rows with a half-completed compatibility/identity update.
+pub(crate) async fn lock_memory_read(
+    transaction: &mut Transaction<'_, Postgres>,
+) -> Result<(), sqlx_core::error::Error> {
+    query("SELECT pg_advisory_xact_lock_shared(hashtext('kovi-bot'), hashtext('yunxi-memory-maintenance-v1'))")
+        .execute(&mut **transaction)
+        .await?;
+    Ok(())
+}
+
 pub(crate) async fn lock_and_owner_exists(
     transaction: &mut Transaction<'_, Postgres>,
     owner: DurableOwner,

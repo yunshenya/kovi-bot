@@ -195,6 +195,9 @@ direct_rate_limit = 4
 [memory]
 max_entries = 1000
 retention_days = 30
+episode_retention_days = 365
+episode_max_per_scope = 128
+episode_protected_salience = 0.7
 max_conversation_messages = 25
 max_conversation_tokens = 6000
 contextual_memory_limit = 5
@@ -285,7 +288,7 @@ natural_drift_check_secs = 1800
 recent_topic_cooldown_secs = 604800
 ```
 
-机器人会从最近活跃的群组和真正私聊过的用户中随机选择接收方，再结合情绪、能量、时间、群组话题和用户兴趣选择内容。冷却时间、空闲阈值、发送概率、目标冷却和每日上限共同避免刷屏。主动消息的决策时间、最后发送时间和每日计数单独写入 PostgreSQL 的 `kovi_bot_proactive_state`，不受普通记忆容量清理影响；服务重启后也不会重新触发一轮主动消息。长期记忆、用户档案、群组档案、滚动摘要和人格分别写入 PostgreSQL 分表，不再为每次变化重写整份 JSONB；默认最多保留 1000 条长期记忆明细，后台任务会定期去重并清理 30 天前的低重要性记录。超过保留期未活跃的用户/群档案及其摘要也会清理；高重要性记忆不按年龄清理，但仍受总量上限约束，人格和表情标签则需显式删除。完整的数据范围、外部传输和删除边界见[数据与隐私说明](docs/privacy.md)。首次升级时会自动从旧 `kovi_bot_memory` JSONB 快照（或运行目录的 `bot_memory.json`）迁移，原数据保留作为兼容备份。
+机器人会从最近活跃的群组和真正私聊过的用户中随机选择接收方，再结合情绪、能量、时间、群组话题和用户兴趣选择内容。冷却时间、空闲阈值、发送概率、目标冷却和每日上限共同避免刷屏。主动消息的决策时间、最后发送时间和每日计数单独写入 PostgreSQL 的 `kovi_bot_proactive_state`，不受普通记忆容量清理影响；服务重启后也不会重新触发一轮主动消息。长期记忆、用户档案、群组档案、滚动摘要和人格分别写入 PostgreSQL 分表，不再为每次变化重写整份 JSONB；默认最多保留 1000 条长期记忆明细，后台任务会定期去重并清理 30 天前的低重要性记录。Mind Episode 情节记忆使用独立策略：默认保留 365 天、每个作用域最多 128 条已知状态记录，保护项按优先级保留；当已知状态仍超过上限时，会从价值最低的记录开始淘汰（必要时也包括保护项）。未知状态不参与淘汰并始终保留。超过保留期未活跃的用户/群档案及其摘要也会清理；高重要性记忆不按年龄清理，但仍受各自容量策略约束，人格和表情标签则需显式删除。完整的数据范围、外部传输和删除边界见[数据与隐私说明](docs/privacy.md)。首次升级时会自动从旧 `kovi_bot_memory` JSONB 快照（或运行目录的 `bot_memory.json`）迁移，原数据保留作为兼容备份。
 
 配置 canonical owner 后，该用户的关系等级会自动保持为最高。她会使用独立的主动私聊策略：模型最多每隔 `main_admin_decision_interval_secs`（默认 3 小时）评估一次，但实际发送还必须满足 `main_admin_cooldown_secs`（默认 6 小时）、`main_admin_daily_limit`（默认每天 2 条）和全局 `daily_limit`（默认每天 4 条）；同一目标的主动消息默认至少间隔 `target_cooldown_secs`（默认 6 小时）。用户或群组刚刚主动互动后，`recent_interaction_cooldown_secs`（默认 2 小时）内不会追加主动开场。上述状态独立持久化，服务重启和普通记忆清理都不会绕过限频。未配置 canonical owner 时，这段兼容策略才使用 `main_admin` QQ 号。
 

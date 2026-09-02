@@ -107,6 +107,14 @@ pub(crate) struct TaskReservationRequest<'a> {
 /// 初始化跨群问答任务和事件表。
 pub(crate) async fn initialize_database() -> Result<()> {
     let pool = database_pool()?;
+    // Startup tasks and tests may initialize this schema concurrently. Keep
+    // the migration sequence transactional and serialized so a drop/add
+    // constraint pair cannot race.
+    let mut transaction = pool.begin().await.context("开启跨群问答模式迁移事务")?;
+    query("SELECT pg_advisory_xact_lock(hashtextextended('agent-tasks:schema', 0))")
+        .execute(&mut *transaction)
+        .await
+        .context("锁定跨群问答模式迁移")?;
     query(
         r#"
         CREATE TABLE IF NOT EXISTS kovi_bot_agent_tasks (
@@ -142,7 +150,7 @@ pub(crate) async fn initialize_database() -> Result<()> {
         )
         "#,
     )
-    .execute(pool)
+    .execute(&mut *transaction)
     .await
     .context("创建跨群问答任务表")?;
     query(
@@ -165,7 +173,7 @@ pub(crate) async fn initialize_database() -> Result<()> {
         )
         "#,
     )
-    .execute(pool)
+    .execute(&mut *transaction)
     .await
     .context("创建跨群问答事件表")?;
     // 第二轮已经创建过的表需要通过显式迁移补齐第三轮字段。默认值让旧事件
@@ -180,20 +188,20 @@ pub(crate) async fn initialize_database() -> Result<()> {
         "ALTER TABLE kovi_bot_agent_task_events ADD COLUMN IF NOT EXISTS match_kind TEXT NOT NULL DEFAULT 'legacy'",
     ] {
         query(statement)
-            .execute(pool)
+            .execute(&mut *transaction)
             .await
             .context("迁移跨群问答质量字段")?;
     }
     query(
         "ALTER TABLE kovi_bot_agent_task_events DROP CONSTRAINT IF EXISTS kovi_bot_agent_task_events_relevance_score_check",
     )
-    .execute(pool)
+    .execute(&mut *transaction)
     .await
     .context("更新跨群问答相关性约束")?;
     query(
         "ALTER TABLE kovi_bot_agent_task_events ADD CONSTRAINT kovi_bot_agent_task_events_relevance_score_check CHECK (relevance_score >= 1 AND relevance_score <= 3)",
     )
-    .execute(pool)
+    .execute(&mut *transaction)
     .await
     .context("创建跨群问答相关性约束")?;
     query(
@@ -210,73 +218,78 @@ pub(crate) async fn initialize_database() -> Result<()> {
           AND tasks.last_relevant_event_at IS NULL
         "#,
     )
-    .execute(pool)
+    .execute(&mut *transaction)
     .await
     .context("回填跨群问答最近回复时间")?;
     query("ALTER TABLE kovi_bot_agent_tasks DROP CONSTRAINT IF EXISTS kovi_bot_agent_tasks_status_check")
-        .execute(pool)
+        .execute(&mut *transaction)
         .await
         .context("更新跨群问答状态约束")?;
     query(
         "ALTER TABLE kovi_bot_agent_tasks ADD CONSTRAINT kovi_bot_agent_tasks_status_check CHECK (status IN ('pending_send', 'question_sending', 'collecting', 'reporting', 'report_sending', 'completed', 'failed', 'cancelled'))",
     )
-    .execute(pool)
+    .execute(&mut *transaction)
     .await
     .context("创建跨群问答状态约束")?;
     query(
         "CREATE UNIQUE INDEX IF NOT EXISTS kovi_bot_agent_tasks_active_group_v3_idx ON kovi_bot_agent_tasks (target_group_id) WHERE status IN ('pending_send', 'question_sending', 'collecting', 'reporting', 'report_sending')",
     )
-    .execute(pool)
+    .execute(&mut *transaction)
     .await
     .context("创建跨群问答目标群唯一索引")?;
     query("DROP INDEX IF EXISTS kovi_bot_agent_tasks_active_group_idx")
-        .execute(pool)
+        .execute(&mut *transaction)
         .await
         .context("替换旧跨群问答目标群索引")?;
     query(
         "CREATE INDEX IF NOT EXISTS kovi_bot_agent_tasks_due_idx ON kovi_bot_agent_tasks (status, collect_until, last_relevant_event_at, lease_until, id)",
     )
-    .execute(pool)
+    .execute(&mut *transaction)
     .await
     .context("创建跨群问答到期索引")?;
     query(
         "CREATE INDEX IF NOT EXISTS kovi_bot_agent_tasks_quiet_idx ON kovi_bot_agent_tasks (last_relevant_event_at, collect_until, id) WHERE status = 'collecting'",
     )
-    .execute(pool)
+    .execute(&mut *transaction)
     .await
     .context("创建跨群问答安静窗口索引")?;
     query(
         "CREATE INDEX IF NOT EXISTS kovi_bot_agent_tasks_actor_idx ON kovi_bot_agent_tasks (actor_user_id, status, created_at DESC)",
     )
-    .execute(pool)
+    .execute(&mut *transaction)
     .await
     .context("创建跨群问答操作者索引")?;
     query(
         "CREATE INDEX IF NOT EXISTS kovi_bot_agent_task_events_task_idx ON kovi_bot_agent_task_events (task_id, received_at, id)",
     )
-    .execute(pool)
+    .execute(&mut *transaction)
     .await
     .context("创建跨群问答事件索引")?;
     query(
         "CREATE INDEX IF NOT EXISTS kovi_bot_agent_task_events_relevance_idx ON kovi_bot_agent_task_events (task_id, relevance_score, received_at, id)",
     )
-    .execute(pool)
+    .execute(&mut *transaction)
     .await
     .context("创建跨群问答质量索引")?;
     query(
         "CREATE UNIQUE INDEX IF NOT EXISTS kovi_bot_agent_tasks_question_delivery_key_idx ON kovi_bot_agent_tasks (question_delivery_key) WHERE question_delivery_key IS NOT NULL",
     )
-    .execute(pool)
+    .execute(&mut *transaction)
     .await
     .context("创建跨群问题投递幂等索引")?;
     query(
         "CREATE UNIQUE INDEX IF NOT EXISTS kovi_bot_agent_tasks_report_delivery_key_idx ON kovi_bot_agent_tasks (report_delivery_key) WHERE report_delivery_key IS NOT NULL",
     )
-    .execute(pool)
+    .execute(&mut *transaction)
     .await
     .context("创建跨群汇报投递幂等索引")?;
 
-    settle_uncertain_tasks(pool).await
+    settle_uncertain_tasks_in_transaction(&mut transaction).await?;
+    transaction
+        .commit()
+        .await
+        .context("提交跨群问答模式迁移事务")?;
+    Ok(())
 }
 
 /// 创建一条尚未发送的收集任务。调用者必须先预留同一来源消息对应的角色目标。
@@ -1009,19 +1022,30 @@ async fn fail_task(task: &ClaimedTask, error: &str) {
 }
 
 async fn settle_uncertain_tasks(pool: &PgPool) -> Result<()> {
+    let mut transaction = pool.begin().await.context("开启跨群问答状态收敛事务")?;
+    settle_uncertain_tasks_in_transaction(&mut transaction).await?;
+    transaction
+        .commit()
+        .await
+        .context("提交跨群问答状态收敛事务")
+}
+
+async fn settle_uncertain_tasks_in_transaction(
+    transaction: &mut sqlx_core::transaction::Transaction<'_, Postgres>,
+) -> Result<()> {
     // question_sending 可能已经完成外部发送但还没写回消息号；不能冒险重发。
     // pending_send 在旧版本中也覆盖过这个窗口，升级后仍按保守策略收敛。
     query(
         "UPDATE kovi_bot_agent_tasks SET status = 'failed', last_error = '问题发送状态不确定；为避免重复提问，未自动重试', updated_at = NOW(), completed_at = NOW(), lease_token = NULL, lease_until = NULL WHERE status IN ('pending_send', 'question_sending') AND updated_at < NOW() - INTERVAL '10 minutes'",
     )
-    .execute(pool)
+    .execute(&mut **transaction)
     .await
     .context("收敛未完成的跨群问答发送")?;
     // report_sending 表示外部私聊发送已经开始。租约过期后只结束任务，不重发报告。
     query(
         "UPDATE kovi_bot_agent_tasks SET status = 'failed', last_error = '私聊汇报发送状态不确定；为避免重复汇报，未自动重试', updated_at = NOW(), completed_at = NOW(), lease_token = NULL, lease_until = NULL WHERE status = 'report_sending' AND (lease_until IS NULL OR lease_until <= NOW())",
     )
-    .execute(pool)
+    .execute(&mut **transaction)
     .await
     .context("收敛不确定的跨群问答汇报")?;
     Ok(())
@@ -1618,6 +1642,24 @@ mod tests {
         assert_eq!(reply_message_id(&message), Some(321));
         assert!(message_at_self(&message, 123456));
         assert!(!message_at_self(&message, 654321));
+    }
+
+    #[test]
+    #[ignore = "requires PostgreSQL via DATABASE_URL"]
+    fn postgres_initialize_database_is_idempotent_under_concurrency() {
+        crate::database_test_support::block_on(async {
+            crate::memory::MEMORY_MANAGER
+                .initialize_database()
+                .await
+                .expect("应初始化 PostgreSQL 记忆连接池");
+            crate::agent_runtime::initialize_database()
+                .await
+                .expect("应初始化角色目标表");
+            let (first, second) =
+                kovi::tokio::join!(super::initialize_database(), super::initialize_database(),);
+            first.expect("并发迁移的第一个调用应成功");
+            second.expect("并发迁移的第二个调用应成功");
+        });
     }
 
     #[test]

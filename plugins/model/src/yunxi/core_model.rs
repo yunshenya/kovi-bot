@@ -3881,7 +3881,11 @@ fn default_autonomous_directive(
         Some(ConversationKind::Direct) if has_visible_content => {
             ConversationTurnDirective::Continue
         }
-        Some(ConversationKind::Group) if has_visible_content => ConversationTurnDirective::Wait,
+        // Keep group autonomy open-ended as well. A visible turn schedules
+        // another semantic check; the next tick can return an empty plan when
+        // the topic has cooled or no public-value thought remains. Ambient
+        // group activity still cancels pending work at ingress.
+        Some(ConversationKind::Group) if has_visible_content => ConversationTurnDirective::Continue,
         _ => ConversationTurnDirective::End,
     }
 }
@@ -8051,7 +8055,11 @@ mod tests {
         assert!(autonomous_conversation_prompt(&input).contains("对整个群都自然且有公共价值"));
         assert_eq!(
             default_autonomous_directive(&input, true),
-            ConversationTurnDirective::Wait
+            ConversationTurnDirective::Continue
+        );
+        assert_eq!(
+            default_autonomous_directive(&input, false),
+            ConversationTurnDirective::End
         );
 
         let WorldEventKind::MessageReceived(current_message) = input.event.kind() else {

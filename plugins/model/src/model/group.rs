@@ -1127,13 +1127,18 @@ async fn delete_group_data(group_id: i64, bot: &RuntimeBot) {
     let sticker_result = sticker_memory::delete_group_data(group_id).await;
     let reminder_result = reminders::delete_group_data(group_id).await;
     let agent_goal_result = crate::agent_runtime::delete_group_data(group_id).await;
+    // Core deletion acquires the cross-process memory barrier. Run a second
+    // idempotent legacy pass after it to remove any projection that completed
+    // in the gap between the first cleanup and the owner purge.
     let core_result = crate::yunxi::delete_qq_group_domain_data(group_id).await;
+    let final_memory_result = MEMORY_MANAGER.delete_group_data(group_id).await;
     match (
         memory_result,
         sticker_result,
         reminder_result,
         agent_goal_result,
         core_result,
+        final_memory_result,
     ) {
         (
             Ok(memory_rows),
@@ -1141,6 +1146,7 @@ async fn delete_group_data(group_id: i64, bot: &RuntimeBot) {
             Ok(reminder_rows),
             Ok(agent_goal_rows),
             Ok(core_rows),
+            Ok(final_memory_rows),
         ) => match core_erasure.finish().await {
             Ok(()) => {
                 if let Some(mind_erasure) = mind_erasure {
@@ -1150,7 +1156,8 @@ async fn delete_group_data(group_id: i64, bot: &RuntimeBot) {
                         bot,
                         group_id,
                         format!(
-                            "本群可归属数据已删除（记忆/档案/摘要 {memory_rows} 项，表情记忆 {sticker_rows} 项，提醒 {reminder_rows} 项，角色目标 {agent_goal_rows} 项，Core 数据 {core_rows} 项）。"
+                            "本群可归属数据已删除（记忆/档案/摘要 {} 项，表情记忆 {sticker_rows} 项，提醒 {reminder_rows} 项，角色目标 {agent_goal_rows} 项，Core 数据 {core_rows} 项）。",
+                            memory_rows.saturating_add(final_memory_rows)
                         ),
                     )
                     .await;
@@ -1168,10 +1175,10 @@ async fn delete_group_data(group_id: i64, bot: &RuntimeBot) {
                     .await;
             }
         },
-        (memory, stickers, reminders, agent_goals, core) => {
+        (memory, stickers, reminders, agent_goals, core, final_memory) => {
             eprintln!(
-                "[ERROR] 群数据删除未完全成功，保留安全屏障 (群组: {}, 记忆: {:?}, 表情: {:?}, 提醒: {:?}, 角色目标: {:?}, Core: {:?})",
-                group_id, memory, stickers, reminders, agent_goals, core
+                "[ERROR] 群数据删除未完全成功，保留安全屏障 (群组: {}, 记忆: {:?}, 表情: {:?}, 提醒: {:?}, 角色目标: {:?}, Core: {:?}, 记忆二次清理: {:?})",
+                group_id, memory, stickers, reminders, agent_goals, core, final_memory
             );
             send_group_erasure_receipt(
                 bot,

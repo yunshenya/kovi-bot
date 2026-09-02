@@ -262,6 +262,17 @@ impl PostgresMindStore {
     pub(crate) async fn cleanup(&self, now: DateTime<Utc>) -> Result<u64, MindStoreError> {
         let mut transaction = self.pool.begin().await.map_err(MindStoreError::storage)?;
         lock_meta(&mut transaction).await?;
+        let model_config = crate::config::get();
+        let memory_config = model_config.memory();
+        let episode_retention_days = memory_config.episode_retention_days();
+        let episode_cutoff = now - chrono::Duration::days(episode_retention_days);
+        let episode_protected_salience = f64::from(memory_config.episode_protected_salience());
+        let episode_max_per_scope =
+            i64::try_from(memory_config.episode_max_per_scope()).map_err(|_| {
+                MindStoreError::InvalidRequest {
+                    reason: "episode scope capacity exceeds PostgreSQL BIGINT",
+                }
+            })?;
         let orphaned_agenda = query(
             r#"
             DELETE FROM yunxi_agenda_items AS agenda
@@ -311,14 +322,79 @@ impl PostgresMindStore {
         .await
         .map_err(MindStoreError::storage)?
         .rows_affected();
-        if orphaned_agenda + curiosities + agenda > 0 {
+        // Episodes are intentionally retained longer than the V1 memory cache,
+        // but known statuses still need a deterministic per-scope bound. Age
+        // cleanup only removes resolved, low-value rows. Capacity cleanup
+        // ranks known rows by protection priority; unknown statuses are
+        // deliberately excluded so a future status can never be deleted by
+        // an older binary (fail closed).
+        let expired_episodes = query(
+            r#"
+            DELETE FROM yunxi_episodes
+            WHERE occurred_at < $1
+              AND status = 'resolved'
+              AND primary_score < $2
+              AND secondary_score < $2
+            "#,
+        )
+        .bind(episode_cutoff)
+        .bind(episode_protected_salience)
+        .execute(&mut *transaction)
+        .await
+        .map_err(MindStoreError::storage)?
+        .rows_affected();
+        let capped_episodes = query(
+            r#"
+            WITH ranked AS (
+                SELECT
+                    id,
+                    primary_score,
+                    secondary_score,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY scope_kind, scope_id
+                        ORDER BY
+                            CASE
+                                WHEN status = 'unresolved' THEN 2
+                                WHEN primary_score >= $2
+                                  OR secondary_score >= $2 THEN 1
+                                ELSE 0
+                            END DESC,
+                            primary_score DESC,
+                            secondary_score DESC,
+                            occurred_at DESC,
+                            id
+                    ) AS retention_rank
+                FROM yunxi_episodes
+                WHERE status IN ('resolved', 'unresolved')
+            ), evictable AS (
+                SELECT id
+                FROM ranked
+                WHERE retention_rank > $1
+            )
+            DELETE FROM yunxi_episodes AS episode
+            USING evictable
+            WHERE episode.id = evictable.id
+            "#,
+        )
+        .bind(episode_max_per_scope)
+        .bind(episode_protected_salience)
+        .execute(&mut *transaction)
+        .await
+        .map_err(MindStoreError::storage)?
+        .rows_affected();
+        let removed = orphaned_agenda
+            .saturating_add(curiosities)
+            .saturating_add(agenda)
+            .saturating_add(expired_episodes)
+            .saturating_add(capped_episodes);
+        if removed > 0 {
             bump_meta(&mut transaction).await?;
         }
         transaction
             .commit()
             .await
             .map_err(MindStoreError::storage)?;
-        Ok(orphaned_agenda + curiosities + agenda)
+        Ok(removed)
     }
 }
 
@@ -402,6 +478,20 @@ async fn payload_by_id<T: DeserializeOwned>(
     let row = query(&statement)
         .bind(id)
         .fetch_optional(pool)
+        .await
+        .map_err(MindStoreError::storage)?;
+    row.map(|row| decode_row(&row)).transpose()
+}
+
+async fn payload_by_id_tx<T: DeserializeOwned>(
+    transaction: &mut Transaction<'_, Postgres>,
+    table: RecordTable,
+    id: Uuid,
+) -> Result<Option<T>, MindStoreError> {
+    let statement = format!("SELECT payload FROM {} WHERE id = $1", table.name());
+    let row = query(&statement)
+        .bind(id)
+        .fetch_optional(&mut **transaction)
         .await
         .map_err(MindStoreError::storage)?;
     row.map(|row| decode_row(&row)).transpose()
@@ -1432,8 +1522,13 @@ impl EpisodeStore for PostgresMindStore {
     fn put<'a>(&'a self, episode: &'a Episode) -> MindStoreFuture<'a, Episode> {
         Box::pin(async move {
             episode.validate()?;
-            if let Some(existing) = payload_by_id::<Episode>(
-                &self.pool,
+            // The read, idempotence check, and insert must share the same
+            // metadata row lock. Otherwise cleanup/erasure can delete a row
+            // after the preflight read and the stale writer can resurrect it.
+            let mut transaction = self.pool.begin().await.map_err(MindStoreError::storage)?;
+            lock_meta(&mut transaction).await?;
+            if let Some(existing) = payload_by_id_tx::<Episode>(
+                &mut transaction,
                 RecordTable::Episodes,
                 episode.id().into_uuid(),
             )
@@ -1441,6 +1536,10 @@ impl EpisodeStore for PostgresMindStore {
             {
                 existing.validate()?;
                 if existing == *episode {
+                    transaction
+                        .commit()
+                        .await
+                        .map_err(MindStoreError::storage)?;
                     return Ok(existing);
                 }
                 return Err(MindStoreError::VersionConflict {
@@ -1450,13 +1549,18 @@ impl EpisodeStore for PostgresMindStore {
                     actual: existing.version(),
                 });
             }
-            let payload = put_record(
-                &self.pool,
+            let payload = put_record_tx(
+                &mut transaction,
                 RecordTable::Episodes,
                 episode_record(episode),
                 None,
             )
             .await?;
+            bump_meta(&mut transaction).await?;
+            transaction
+                .commit()
+                .await
+                .map_err(MindStoreError::storage)?;
             decode_and_validate(payload, Episode::validate)
         })
     }
@@ -1686,17 +1790,20 @@ fn mind_erasure_store_error(error: MindStoreError) -> MindDataErasureError {
 
 #[cfg(test)]
 mod tests {
-    use super::PostgresMindStore;
+    use super::{
+        PostgresMindStore, RecordTable, bump_meta, episode_record, lock_meta, put_record_tx,
+    };
     use chrono::{Duration, Utc};
     use sqlx_core::query::query;
+    use sqlx_core::row::Row;
     use sqlx_postgres::PgPoolOptions;
     use uuid::Uuid;
     use yunxi_core::{
         AgendaItem, AgendaItemId, AgendaSource, AgendaStore, AgendaSubject, Belief, BeliefId,
         BeliefSource, BeliefStore, ConsolidationConfig, ConsolidationPlan, ConversationId,
-        CuriosityId, CuriosityItem, CuriosityStore, EventId, Interest, InterestId, InterestStore,
-        MindConsolidationStore, MindDataErasure, MindScope, MindSource, MindStoreError, MindUpsert,
-        PersonId, TraceContext,
+        CuriosityId, CuriosityItem, CuriosityStore, Episode, EpisodeId, EpisodeStore, EventId,
+        Interest, InterestId, InterestStore, MindConsolidationStore, MindDataErasure, MindScope,
+        MindSource, MindStoreError, MindUpsert, PersonId, TraceContext,
     };
 
     fn belief(
@@ -1717,6 +1824,31 @@ mod tests {
             now,
         )
         .expect("test belief should be valid")
+    }
+
+    fn episode(
+        id: EpisodeId,
+        scope: MindScope,
+        summary: String,
+        salience: f32,
+        emotional_weight: f32,
+        unresolved: bool,
+        occurred_at: chrono::DateTime<Utc>,
+    ) -> Episode {
+        Episode::new(
+            id,
+            scope,
+            Vec::new(),
+            Vec::new(),
+            summary,
+            salience,
+            emotional_weight,
+            unresolved,
+            MindSource::Reflection,
+            occurred_at,
+            occurred_at,
+        )
+        .expect("test episode should be valid")
     }
 
     async fn delete_test_rows(pool: &sqlx_postgres::PgPool, ids: &[Uuid]) {
@@ -1964,6 +2096,229 @@ mod tests {
                     .is_none()
             );
 
+            let config = crate::config::get();
+            let episode_memory = config.memory();
+            let episode_cutoff = now - Duration::days(episode_memory.episode_retention_days());
+            let expired_low = episode(
+                EpisodeId::new(),
+                MindScope::Global,
+                format!("expired low episode {marker}"),
+                0.1,
+                0.1,
+                false,
+                episode_cutoff - Duration::hours(1),
+            );
+            let expired_high = episode(
+                EpisodeId::new(),
+                MindScope::Global,
+                format!("expired high episode {marker}"),
+                0.9,
+                0.1,
+                false,
+                episode_cutoff - Duration::hours(1),
+            );
+            let expired_unresolved = episode(
+                EpisodeId::new(),
+                MindScope::Global,
+                format!("expired unresolved episode {marker}"),
+                0.1,
+                0.1,
+                true,
+                episode_cutoff - Duration::hours(1),
+            );
+            let expired_unknown_status = episode(
+                EpisodeId::new(),
+                MindScope::Global,
+                format!("expired unknown-status episode {marker}"),
+                0.1,
+                0.1,
+                false,
+                episode_cutoff - Duration::hours(1),
+            );
+            cleanup_ids.extend([
+                expired_low.id().into_uuid(),
+                expired_high.id().into_uuid(),
+                expired_unresolved.id().into_uuid(),
+                expired_unknown_status.id().into_uuid(),
+            ]);
+            for value in [
+                &expired_low,
+                &expired_high,
+                &expired_unresolved,
+                &expired_unknown_status,
+            ] {
+                EpisodeStore::put(&store, value)
+                    .await
+                    .expect("episode should persist before cleanup");
+            }
+            query("UPDATE yunxi_episodes SET status = 'future_state' WHERE id = $1")
+                .bind(expired_unknown_status.id().into_uuid())
+                .execute(&pool)
+                .await
+                .expect("unknown episode status should be writable for the fail-closed test");
+
+            let capped_scope_id = ConversationId::new();
+            let capped_scope = MindScope::Conversation {
+                conversation_id: capped_scope_id,
+            };
+            let cap = episode_memory.episode_max_per_scope();
+            for index in 0..cap.saturating_add(2) {
+                let value = episode(
+                    EpisodeId::new(),
+                    capped_scope,
+                    format!("capacity episode {marker} {index}"),
+                    0.1,
+                    0.1,
+                    false,
+                    now - Duration::minutes(index as i64),
+                );
+                cleanup_ids.push(value.id().into_uuid());
+                EpisodeStore::put(&store, &value)
+                    .await
+                    .expect("capacity episode should persist before cleanup");
+            }
+            let removed = store
+                .cleanup(now)
+                .await
+                .expect("episode cleanup should run");
+            assert!(removed >= 1, "the expired low episode should be removed");
+            let protected_count_row =
+                query("SELECT COUNT(*) AS count FROM yunxi_episodes WHERE id = ANY($1)")
+                    .bind(vec![
+                        expired_high.id().into_uuid(),
+                        expired_unresolved.id().into_uuid(),
+                        expired_unknown_status.id().into_uuid(),
+                    ])
+                    .fetch_one(&pool)
+                    .await
+                    .expect("protected episode count should be queryable");
+            let protected_count: i64 = protected_count_row
+                .try_get("count")
+                .expect("protected episode count should decode");
+            assert_eq!(
+                protected_count, 3,
+                "high-salience, unresolved, and unknown-status episodes must survive cleanup"
+            );
+            let expired_low_row =
+                query("SELECT COUNT(*) AS count FROM yunxi_episodes WHERE id = $1")
+                    .bind(expired_low.id().into_uuid())
+                    .fetch_one(&pool)
+                    .await
+                    .expect("expired episode count should be queryable");
+            let expired_low_count: i64 = expired_low_row
+                .try_get("count")
+                .expect("expired episode count should decode");
+            assert_eq!(
+                expired_low_count, 0,
+                "low-value old episodes should be removed"
+            );
+            let count_row =
+                query("SELECT COUNT(*) AS count FROM yunxi_episodes WHERE scope_key = $1")
+                    .bind(format!("conversation:{capped_scope_id}"))
+                    .fetch_one(&pool)
+                    .await
+                    .expect("capped episode count should be queryable");
+            let count: i64 = count_row
+                .try_get("count")
+                .expect("capped episode count should decode");
+            assert!(
+                count <= cap as i64,
+                "low-value episode count should stay within the per-scope cap"
+            );
+
+            // The cap is hard for known statuses even when every row is
+            // protected. The least valuable protected row (the oldest tie)
+            // must be evicted, while an unknown status remains untouched.
+            let protected_scope_id = ConversationId::new();
+            let protected_scope = MindScope::Conversation {
+                conversation_id: protected_scope_id,
+            };
+            let mut protected_ids = Vec::with_capacity(cap.saturating_add(1));
+            for index in 0..cap.saturating_add(1) {
+                let value = episode(
+                    EpisodeId::new(),
+                    protected_scope,
+                    format!("protected capacity episode {marker} {index}"),
+                    0.1,
+                    0.1,
+                    true,
+                    now - Duration::minutes(index as i64),
+                );
+                cleanup_ids.push(value.id().into_uuid());
+                protected_ids.push(value.id().into_uuid());
+                EpisodeStore::put(&store, &value)
+                    .await
+                    .expect("protected episode should persist before cleanup");
+            }
+            let unknown_protected = episode(
+                EpisodeId::new(),
+                protected_scope,
+                format!("unknown protected capacity episode {marker}"),
+                0.0,
+                0.0,
+                false,
+                now - Duration::days(30),
+            );
+            cleanup_ids.push(unknown_protected.id().into_uuid());
+            EpisodeStore::put(&store, &unknown_protected)
+                .await
+                .expect("unknown-status episode should persist before cleanup");
+            query("UPDATE yunxi_episodes SET status = 'future_state' WHERE id = $1")
+                .bind(unknown_protected.id().into_uuid())
+                .execute(&pool)
+                .await
+                .expect("unknown protected episode status should be writable");
+
+            store
+                .cleanup(now)
+                .await
+                .expect("protected episode cap cleanup should run");
+            let known_count_row = query(
+                "SELECT COUNT(*) AS count FROM yunxi_episodes WHERE scope_key = $1 AND status IN ('resolved', 'unresolved')",
+            )
+            .bind(format!("conversation:{protected_scope_id}"))
+            .fetch_one(&pool)
+            .await
+            .expect("known protected episode count should be queryable");
+            let known_count: i64 = known_count_row
+                .try_get("count")
+                .expect("known protected episode count should decode");
+            assert_eq!(
+                known_count, cap as i64,
+                "known episode statuses must obey the hard per-scope cap"
+            );
+            let oldest_protected_count_row =
+                query("SELECT COUNT(*) AS count FROM yunxi_episodes WHERE id = $1")
+                    .bind(
+                        *protected_ids
+                            .last()
+                            .expect("protected ids should be nonempty"),
+                    )
+                    .fetch_one(&pool)
+                    .await
+                    .expect("oldest protected episode count should be queryable");
+            let oldest_protected_count: i64 = oldest_protected_count_row
+                .try_get("count")
+                .expect("oldest protected episode count should decode");
+            assert_eq!(
+                oldest_protected_count, 0,
+                "the lowest-value protected known row should be evicted when necessary"
+            );
+            let unknown_count_row = query(
+                "SELECT COUNT(*) AS count FROM yunxi_episodes WHERE id = $1 AND status = 'future_state'",
+            )
+            .bind(unknown_protected.id().into_uuid())
+            .fetch_one(&pool)
+            .await
+            .expect("unknown episode count should be queryable");
+            let unknown_count: i64 = unknown_count_row
+                .try_get("count")
+                .expect("unknown episode count should decode");
+            assert_eq!(
+                unknown_count, 1,
+                "unknown episode statuses must be retained fail-closed"
+            );
+
             let person_belief = belief(
                 BeliefId::new(),
                 MindScope::Person { person_id },
@@ -2040,6 +2395,121 @@ mod tests {
                     max_updates_per_reflection: 128,
                 })
                 .expect("successful plan should remain structurally valid");
+        });
+    }
+
+    #[test]
+    #[ignore = "requires PostgreSQL via DATABASE_URL"]
+    fn postgres_episode_put_compares_under_meta_lock_after_delete_replace() {
+        crate::database_test_support::block_on(async {
+            let database_url = std::env::var("DATABASE_URL").expect("requires DATABASE_URL");
+            let pool = PgPoolOptions::new()
+                .max_connections(4)
+                .connect(&database_url)
+                .await
+                .expect("should connect to PostgreSQL");
+            let store = PostgresMindStore::new(pool.clone());
+            store
+                .initialize_schema()
+                .await
+                .expect("episode schema should initialize");
+
+            let marker = Uuid::new_v4();
+            let person_id = PersonId::new();
+            let scope = MindScope::Person { person_id };
+            let now = Utc::now();
+            let id = EpisodeId::new();
+            let original = episode(
+                id,
+                scope,
+                format!("episode before erase {marker}"),
+                0.4,
+                0.1,
+                false,
+                now,
+            );
+            let replacement = episode(
+                id,
+                scope,
+                format!("episode after erase {marker}"),
+                0.8,
+                0.3,
+                true,
+                now,
+            );
+            EpisodeStore::put(&store, &original)
+                .await
+                .expect("original episode should persist");
+
+            // Hold the same row lock used by erasure, remove the old row, and
+            // install a changed same-ID version before releasing the lock.
+            // The writer below must not observe the pre-delete payload.
+            let mut erasure = pool
+                .begin()
+                .await
+                .expect("should begin erasure transaction");
+            lock_meta(&mut erasure)
+                .await
+                .expect("erasure should acquire the mind metadata lock");
+            query("DELETE FROM yunxi_episodes WHERE id = $1")
+                .bind(id.into_uuid())
+                .execute(&mut *erasure)
+                .await
+                .expect("erasure should remove the old episode");
+            put_record_tx(
+                &mut erasure,
+                RecordTable::Episodes,
+                episode_record(&replacement),
+                None,
+            )
+            .await
+            .expect("replacement episode should be staged in the same transaction");
+            bump_meta(&mut erasure)
+                .await
+                .expect("replacement should advance the mind version");
+
+            let writer_store = store.clone();
+            let writer_episode = original.clone();
+            let writer = kovi::tokio::spawn(async move {
+                EpisodeStore::put(&writer_store, &writer_episode).await
+            });
+            kovi::tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            assert!(
+                !writer.is_finished(),
+                "episode put must wait for the metadata lock before comparing payloads"
+            );
+
+            erasure
+                .commit()
+                .await
+                .expect("delete-and-replace transaction should commit");
+            let result = writer
+                .await
+                .expect("episode writer task should join")
+                .expect_err("stale pre-delete payload must not be accepted as idempotent");
+            assert!(
+                matches!(
+                    result,
+                    MindStoreError::VersionConflict {
+                        kind: "episode",
+                        actual: 1,
+                        ..
+                    }
+                ),
+                "writer should compare against the post-delete replacement: {result:?}"
+            );
+            assert_eq!(
+                EpisodeStore::list_recent(&store, &[scope], now, 4)
+                    .await
+                    .expect("replacement episode should remain readable"),
+                vec![replacement]
+            );
+
+            query("DELETE FROM yunxi_episodes WHERE id = $1")
+                .bind(id.into_uuid())
+                .execute(&pool)
+                .await
+                .expect("test episode should be removable");
         });
     }
 }

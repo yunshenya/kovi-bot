@@ -585,8 +585,17 @@ where
         let host_result = match result {
             Ok((plan, response)) => {
                 let delivered = response_is_delivered(&response);
-                let directive = plan_directive(&plan, self.conversation_id)
-                    .unwrap_or(ConversationTurnDirective::Continue);
+                // A silent autonomous turn is a valid decision to pause. Do
+                // not turn a missing directive into an implicit Continue,
+                // otherwise a model that returns an empty plan is polled in
+                // a tight loop forever. A visible delivery may continue by
+                // default; an explicit model directive still wins.
+                let directive =
+                    plan_directive(&plan, self.conversation_id).unwrap_or(if delivered {
+                        ConversationTurnDirective::Continue
+                    } else {
+                        ConversationTurnDirective::Wait
+                    });
                 self.finish_autonomous_claim(occurred_at, delivered, directive)?;
                 *self.autonomy_retry_after.lock().map_err(|_| {
                     CliError::Runtime("CLI autonomy retry lock poisoned".to_owned())

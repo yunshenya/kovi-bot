@@ -121,6 +121,10 @@ jobs:
             yunxi::relation_store::tests::postgres_relation_store_reads_optional_state \
             yunxi::goal_store::tests::postgres_goal_store_round_trips_crud \
             yunxi::memory_store::tests::postgres_memory_v2_round_trips_person_and_conversation_scopes \
+            yunxi::memory_store::tests::postgres_cleanup_uses_migration_proof_when_identity_mapping_is_gone \
+            memory::tests::postgres_direct_conversation_delete_removes_only_exact_contexts \
+            yunxi::mind_store::tests::postgres_mind_store_contracts_are_durable_bounded_and_atomic \
+            yunxi::mind_store::tests::postgres_episode_put_compares_under_meta_lock_after_delete_replace \
             yunxi::open_loop_store::tests::postgres_global_due_defer_removes_the_schedule \
             yunxi::identity_store::tests::postgres_person_domain_deletion_removes_core_data_transactionally \
             yunxi::identity_store::tests::postgres_missing_person_deletion_rejects_another_person_direct_member \
@@ -130,6 +134,7 @@ jobs:
             yunxi::identity_store::tests::postgres_person_domain_deletion_serializes_concurrent_owner_writes \
             yunxi::identity_store::tests::postgres_group_domain_deletion_removes_canonical_and_delivery_rows \
             yunxi::identity_store::tests::postgres_person_export_import_and_unlink_round_trip \
+            yunxi::identity_store::tests::postgres_qq_unlink_purges_private_legacy_rows_before_identity_reuse \
             yunxi::identity_store::tests::postgres_person_import_rejects_identity_and_memory_conflicts_transactionally \
             yunxi::identity_store::tests::postgres_person_export_fails_closed_above_collection_limits \
             yunxi::delivery_ledger::tests::postgres_restart_blocks_a_committed_delivery \
