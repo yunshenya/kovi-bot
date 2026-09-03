@@ -472,6 +472,65 @@ pub(crate) fn status_summary() -> Option<String> {
     ))
 }
 
+/// Deterministic private-message situation derivation (R2 extension):
+/// explicit future-event keywords + a conversational time cue produce a
+/// bounded `FutureEvent / Planned` situation (v4 §22, §180). No psychology,
+/// no calendar claim (v4 §198): the world model only knows "a thing is
+/// scheduled-ish", never that it will happen.
+fn derive_future_event_situation(
+    world: &mut WorldModel,
+    conversation_id: yunxi_core::ConversationId,
+    person_id: PersonId,
+    text: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(), yunxi_core::world_model::WorldValidationError> {
+    use yunxi_core::world_model::{SituationKind, SituationState, SituationStatus};
+    const EVENT_KEYWORDS: &[(&str, &str)] = &[
+        ("面试", "面试安排"),
+        ("考试", "考试安排"),
+        ("体检", "体检安排"),
+        ("开会", "会议安排"),
+        ("出差", "出差安排"),
+        ("复查", "复查安排"),
+    ];
+    let has_time_cue = ["明天", "后天", "下周", "下个月", "今晚", "上午", "下午", "晚上", "周末"]
+        .iter()
+        .any(|cue| text.contains(cue));
+    let matched = EVENT_KEYWORDS
+        .iter()
+        .find(|(keyword, _)| text.contains(keyword));
+    let already = world.situations().iter().any(|situation| {
+        situation.kind() == SituationKind::FutureEvent
+            && situation.conversation_id() == Some(conversation_id)
+            && situation.status() == SituationStatus::Active
+    });
+    if let Some((_keyword, label)) = matched
+        && has_time_cue && !already && world.situations().len() < 8 {
+            let situation = yunxi_core::Situation::new(
+                yunxi_core::SituationId::new(),
+                SituationKind::FutureEvent,
+                SituationState::Planned,
+                Some((*label).to_owned()),
+                vec![],
+                vec![person_id],
+                Some(conversation_id),
+                vec![],
+                vec![],
+                0.55,
+                now,
+            )?;
+            world.add_situation(situation)?;
+        }
+    // Maintenance: planned future events older than 24h expire instead of
+    // lingering forever (v4 §92) — validated transition inside the core.
+    let _ = world.expire_stale_situations(
+        SituationKind::FutureEvent,
+        chrono::Duration::hours(24),
+        now,
+    );
+    Ok(())
+}
+
 /// Record an inbound private message as a structured observation (v4 §10:
 /// what the user actually said, not an inference). TTL 24h by default;
 /// content truncated; gated by `[world_model].enabled`.
@@ -488,6 +547,18 @@ pub(crate) fn record_private_message(
         None,
     );
     derive_and_maintain_scene(conversation_id);
+    // R2 extension: explicit future-event keywords + time cue → situation.
+    with_world(|world, _max_scenes| {
+        if let Err(error) = derive_future_event_situation(
+            world,
+            conversation_id,
+            person_id,
+            content,
+            chrono::Utc::now(),
+        ) {
+            kovi::log::debug!("{WORLD_LOG_PREFIX} future-event derivation skipped: {error}");
+        }
+    });
 }
 
 /// Deterministic situation derivation + maintenance for one conversation
@@ -1236,12 +1307,7 @@ mod tests {
         assert_eq!(count_tool_failure("web_fetch"), 2);
         assert_eq!(count_tool_failure("web_fetch"), 3);
         assert_eq!(count_tool_failure("other"), 1);
-        for name in ["web_fetch", "other"] {
-            TOOL_FAILURE_COUNTS
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .remove(name);
-        }
+        reset_tool_failure_counts();
     }
 
     #[test]
@@ -1305,13 +1371,6 @@ mod tests {
     }
 
     #[test]
-    fn tool_failure_counter_increments_and_resets() {
-        reset_tool_failure_counts();
-        assert!(count_tool_failure("web_fetch") >= 1);
-        reset_tool_failure_counts();
-    }
-
-    #[test]
     fn render_world_context_is_objective_and_bounded() {
         use yunxi_core::{SocialSceneKind, SocialSceneUpdate};
         use yunxi_core::WorldSnapshotContext;
@@ -1346,6 +1405,37 @@ mod tests {
             .snapshot_for(&WorldSnapshotContext::new(chrono::Utc::now()))
             .expect("snapshot");
         assert!(render_world_context(&empty).is_empty());
+    }
+
+    #[test]
+    fn future_event_situation_derives_only_with_time_cue() {
+        use yunxi_core::world_model::{SituationKind, SituationState};
+        let conversation_id = yunxi_core::ConversationId::new();
+        let person_id = PersonId::new();
+        let now = chrono::Utc::now();
+        let mut world = WorldModel::new();
+        // Keyword without time cue → nothing (v4 §198: 不做日历事实).
+        derive_future_event_situation(&mut world, conversation_id, person_id, "我面试过了", now)
+            .expect("ok");
+        assert!(world.situations().is_empty());
+        // Keyword + time cue → Planned FutureEvent (Scenario A/E shape).
+        derive_future_event_situation(&mut world, conversation_id, person_id, "我明天上午去面试", now)
+            .expect("ok");
+        assert_eq!(world.situations().len(), 1);
+        assert_eq!(world.situations()[0].kind(), SituationKind::FutureEvent);
+        assert_eq!(world.situations()[0].state(), SituationState::Planned);
+        // Dedupe: another interview mention does not multiply.
+        derive_future_event_situation(&mut world, conversation_id, person_id, "后天还有复试", now)
+            .expect("ok");
+        assert_eq!(world.situations().len(), 1);
+        // 24h+ stale planned event expires (v4 §92), not linger forever.
+        let later = now + chrono::Duration::hours(25);
+        derive_future_event_situation(&mut world, conversation_id, person_id, "明天体检", later)
+            .expect("ok");
+        assert_eq!(
+            world.situations()[0].state(),
+            SituationState::Expired
+        );
     }
 
     #[test]

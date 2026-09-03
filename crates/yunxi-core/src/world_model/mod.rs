@@ -816,6 +816,47 @@ impl WorldModel {
         snapshot::build_snapshot(self, context)
     }
 
+    /// Deterministic staleness maintenance (v4 §92): expire `Planned` /
+    /// `Unknown` situations of `kind` that were not updated within `max_age`.
+    /// Transitions stay inside the validated state machine. Returns how many
+    /// situations expired.
+    pub fn expire_stale_situations(
+        &mut self,
+        kind: situation::SituationKind,
+        max_age: chrono::Duration,
+        now: DateTime<Utc>,
+    ) -> usize {
+        if max_age <= chrono::Duration::zero() {
+            return 0;
+        }
+        let stale: Vec<_> = self
+            .situations
+            .iter()
+            .filter(|situation| {
+                situation.kind() == kind
+                    && situation.is_active()
+                    && matches!(
+                        situation.state(),
+                        situation::SituationState::Planned | situation::SituationState::Unknown
+                    )
+                    && now - situation.updated_at() > max_age
+            })
+            .map(|situation| situation.id())
+            .collect();
+        let mut expired = 0;
+        for id in stale {
+            if let Some(situation) = self.situations.iter_mut().find(|s| s.id() == id)
+                && situation.expire(now).is_ok()
+            {
+                expired += 1;
+            }
+        }
+        if expired > 0 {
+            self.version = self.version.saturating_add(1);
+        }
+        expired
+    }
+
     /// TTL maintenance (v4 §131): drop expired observations and hypotheses.
     /// Idempotent; returns how many records were removed.
     pub fn prune_expired(&mut self, now: DateTime<Utc>) -> usize {
