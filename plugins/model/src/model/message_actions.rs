@@ -21,6 +21,66 @@ use rand::Rng;
 /// 仅用于兼容旧模型输出；新回复必须通过回复协议的 `messages` 字段分段。
 pub(crate) const LEGACY_FOLLOW_UP_MARKER: &str = "[[NEXT_MESSAGE]]";
 
+/// Rough "same idea" measure between two texts using character-bigram Jaccard
+/// overlap. Used only to collapse a reply's redundant bubbles (复读), never to
+/// decide which distinct ideas to keep.
+fn text_overlap(left: &str, right: &str) -> f64 {
+    let bigrams = |text: &str| -> std::collections::HashSet<(char, char)> {
+        text.chars()
+            .filter(|character| !is_ignorable_punct(*character))
+            .collect::<Vec<_>>()
+            .windows(2)
+            .map(|window| (window[0], window[1]))
+            .collect()
+    };
+    let left = bigrams(left);
+    let right = bigrams(right);
+    if left.is_empty() || right.is_empty() {
+        return 0.0;
+    }
+    let intersection = left.intersection(&right).count();
+    let union = left.union(&right).count();
+    intersection as f64 / union.max(1) as f64
+}
+
+fn is_ignorable_punct(character: char) -> bool {
+    character.is_whitespace()
+        || character.is_ascii_punctuation()
+        || matches!(
+            character,
+            '。' | '，' | '、' | '；' | '：' | '！' | '？' | '…' | '—' | '～' | '·' | '“'
+                | '”' | '‘' | '’' | '（' | '）' | '《' | '》' | '「' | '」' | '『' | '』'
+        )
+}
+
+/// Merge adjacent bubbles that re-state the idea of the bubble right before
+/// them, so a single reply does not send back-to-back near-identical messages
+/// (复读). Distinct bubbles (e.g. an explicit "send these two different notes")
+/// are preserved.
+fn merge_near_duplicate_bubbles(bubbles: Vec<String>) -> Vec<String> {
+    const THRESHOLD: f64 = 0.60;
+    let mut merged: Vec<String> = Vec::new();
+    for bubble in bubbles {
+        let trimmed = bubble.trim();
+        if trimmed.is_empty() {
+            merged.push(bubble);
+            continue;
+        }
+        if let Some(previous) = merged.last_mut() {
+            if !previous.trim().is_empty() && text_overlap(previous, trimmed) >= THRESHOLD {
+                // Keep the more informative of the two near-identical ideas.
+                if trimmed.chars().count() > previous.trim().chars().count() {
+                    *previous = trimmed.to_string();
+                }
+                continue;
+            }
+        }
+        merged.push(bubble);
+    }
+    merged
+}
+
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MessageDestination {
     Group(i64),
@@ -132,6 +192,11 @@ impl ReplyPlan {
         if parsed.disposition.is_silent() || bubbles.is_empty() {
             action.quote_message_id = None;
             action.at_user_ids.clear();
+        }
+        // Collapse adjacent bubbles that merely re-state the same idea, so a
+        // single reply does not read as 复读 (back-to-back near-identical texts).
+        if !parsed.disposition.is_silent() {
+            bubbles = merge_near_duplicate_bubbles(bubbles);
         }
         let visible_content = if parsed.disposition.is_silent() || bubbles.is_empty() {
             String::new()
@@ -527,6 +592,29 @@ mod tests {
             bubbles: vec!["你好".to_string()],
             requests_image: false,
         };
+    }
+
+    #[test]
+    fn collapses_near_duplicate_bubbles_but_keeps_distinct() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                // Distinct notes remain two separate bubbles.
+                let distinct = ReplyPlan::from_model_output(
+                    ReplyScope::Private(9_100_020),
+                    "[[REPLY_ACTION]]{\"messages\":[\"第一条\",\"第二条\"]}[[/REPLY_ACTION]]",
+                )
+                .await;
+                assert_eq!(distinct.bubbles, vec!["第一条", "第二条"]);
+
+                // Near-identical re-statements collapse into one bubble (复读 guard).
+                let repeated = ReplyPlan::from_model_output(
+                    ReplyScope::Private(9_100_021),
+                    "[[REPLY_ACTION]]{\"messages\":[\"哈哈，姜冷笑话管够，素材库都快告急了。\",\"哈哈，姜冷笑话管够，素材库快告急啦～\"]}[[/REPLY_ACTION]]",
+                )
+                .await;
+                assert_eq!(repeated.bubbles.len(), 1);
+            });
     }
 
     #[test]
