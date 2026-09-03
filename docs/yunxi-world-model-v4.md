@@ -10,6 +10,64 @@
 
 ---
 
+# 0. 文档导览与实现状态
+
+> **定位**：本文档是 Yunxi World Model v4 的**权威设计蓝图**（266+ 小节，含 Phase 0–16 建设计划、分组目录与行为场景）。**它描述的是目标状态**——当前代码只实现了其中最小的一层（见 §0.1），其余实现路径按 §175 的 Phase 顺序推进。阅读时请先看本节，避免把“设计”误读为“已上线”。
+
+## 0.1 实现状态对照（截至当前代码）
+
+| 设计块 | 状态 | 对应代码 |
+|---|---|---|
+| **世界“事实”最小闭环**（Observation 的极简近似：scope/summary/importance → `Fact` 记忆 + watch 开环 + 可选 Mind interest） | ✅ 已实现 | `crates/yunxi-core/src/memory.rs::world_fact_draft`、`MemoryKind::Fact`；`plugins/model/src/yunxi/mod.rs::observe_world_fact`、`world_loop_draft` |
+| **世界采样/传感器**（`url_status`、`command` 两种 kind，状态变化才回喂核心） | ✅ 已实现 | `plugins/model/src/world_sensors.rs`、`config/world_sensors.rs`；`agent_runs.rs` 完成时回喂 |
+| **Observation 结构化**（§10–14：ObservationSource / Reliability / TTL / 数据结构） | 🔶 部分（仅以 Fact 记忆近似；无结构化字段、可靠性、TTL） | 未实现结构化 Observation |
+| **Entity Model**（§15–20） | ⬜ 仅设计，未实现 | — |
+| **Situation Model**（§21–26） | ⬜ 仅设计，未实现 | — |
+| **Hypothesis**（§27–33） | ⬜ 仅设计，未实现 | — |
+| **Temporal / Causal / Prediction**（§34–52） | ⬜ 仅设计，未实现 | — |
+| **Simulation / Counterfactual / Snapshot**（§53–67） | ⬜ 仅设计，未实现 | — |
+| **SocialScene / Environment / Uncertainty**（§68–83） | ⬜ 仅设计，未实现 | — |
+| **Update Pipeline / Merge / Extraction**（§84–92） | ⬜ 仅设计，未实现 | — |
+| **WorldModel Store Ports / Persistence / 表结构**（§125–131，含 `yunxi_world_observations`） | ⬜ 设计表**尚未创建**（代码中无该表） | 现有持久化为 Memory/OpenLoop/Mind store（`plugins/model/src/yunxi/schema.rs`） |
+| 与 OpenLoop/Mind 的接入 | 🔶 部分（watch 开环已接；§93–95、§112 其余未接） | `observe_world_fact` 的 `world_loop_draft` 分支 |
+| **Phase 0–16 建设计划**（§175–193） | ⬜ 尚未按 Phase 推进（当前处于“世界事实近似层”） | — |
+
+> **一句话现状**：v4 目前只落地了「世界事实最小闭环」（传感器/事件 → `observe_world_fact` → Fact 记忆 + 开环 + 兴趣），其余均为设计蓝图；下文设计节引用的表（如 `yunxi_world_observations`）都是**目标 schema，尚未建表**。
+
+## 0.2 分组目录
+
+| 主题 | 章节 |
+|---|---|
+| 定位 / 原则 / 四层架构 / 职责边界 | §1–5 |
+| 实现约束 / 平台无关 / 模块建议 | §6–8 |
+| WorldModel 总结构 | §9 |
+| Observation | §10–14 |
+| Entity Model | §15–20 |
+| Situation Model | §21–26 |
+| Hypothesis | §27–33 |
+| Temporal Model | §34–38 |
+| Causal Model | §39–45 |
+| Prediction | §46–52 |
+| Simulation / Counterfactual / Snapshot | §53–67 |
+| SocialScene / Environment | §68–79 |
+| Uncertainty / 更新流水线 | §80–92 |
+| 与 Mind / OpenLoop / Goal / Executive 集成 | §93–95、§112–115 |
+| 示例场景 | §96–106 |
+| 隐私 / 边界 / 存储接口 | §107–127 |
+| 容量 / 预算 / 冲突 / 观测扩源 | §128–152 |
+| 指标 / 可解释 / 安全 / 降级 | §153–165、§246–256 |
+| 宿主与未来（CLI / 桌面 / 移动 / 视觉 / 语音 / 游戏） | §166–171 |
+| 定位边界（≠知识库 / 人格 / 全能） | §172–174、§227–230 |
+| 建设阶段与验收 | §175–193 |
+| 行为场景（A–J） | §194–206 |
+| 测试 / 索引 / 特性开关 / 灰度 | §204–222 |
+| 校准 / 成功与失败指标 | §223–226、§260–261 |
+| Neuro-like Agent / 边界红线 | §235–239、§257–258 |
+| 删数据 / 管理命令 / 安全 | §241–245 |
+| 最终架构 / DoD / 行为验收 / 后续原则 | §262–266 |
+
+---
+
 # 1. 文档目标
 
 Yunxi Core v1 解决：
@@ -349,6 +407,8 @@ pub struct WorldModel {
 
 # 10. Observation
 
+> 📌 **实现状态：** 🔶 部分——目前以“世界事实记忆”近似（`world_fact_draft`/`observe_world_fact`），无结构化字段、Reliability 与 TTL。
+
 ## 10.1 目标
 
 Observation 表示：
@@ -449,6 +509,8 @@ User active recently
 ---
 
 # 15. Entity Model
+
+> 📌 **实现状态：** ⬜ 仅设计，未实现。
 
 ## 15.1 目标
 
@@ -560,6 +622,8 @@ EntityState 不能演化成：
 
 # 21. Situation Model
 
+> 📌 **实现状态：** ⬜ 仅设计，未实现。
+
 ## 21.1 目标
 
 将多个 Observation / EntityState 组织成：
@@ -667,6 +731,8 @@ Rust 验证：
 ---
 
 # 27. Hypothesis
+
+> 📌 **实现状态：** ⬜ 仅设计，未实现。
 
 ## 27.1 目标
 
@@ -788,6 +854,8 @@ low-quality hypothesis spam
 
 # 34. Temporal Model
 
+> 📌 **实现状态：** ⬜ 仅设计，未实现。
+
 ## 34.1 目标
 
 时间不仅是 timestamp。
@@ -884,6 +952,8 @@ time range
 ---
 
 # 39. Causal Model
+
+> 📌 **实现状态：** ⬜ 仅设计，未实现。
 
 ## 39.1 目标
 
@@ -993,6 +1063,8 @@ Host offline
 ---
 
 # 46. Prediction
+
+> 📌 **实现状态：** ⬜ 仅设计，未实现。
 
 ## 46.1 目标
 
@@ -1115,6 +1187,8 @@ PredictionError
 ---
 
 # 53. Counterfactual Simulation
+
+> 📌 **实现状态：** ⬜ 仅设计，未实现。
 
 ## 53.1 目标
 
@@ -2397,6 +2471,8 @@ confidence calibration
 
 # 125. WorldModel Store Ports
 
+> 📌 **实现状态：** ⬜ 设计——下列 Store Ports 与 `yunxi_world_observations` 等表**尚未实现/建表**；当前世界事实走 Memory/OpenLoop store。
+
 建议：
 
 ```text
@@ -3146,6 +3222,8 @@ WorldModel 只维护：
 ---
 
 # 175. Phase 顺序
+
+> 📌 **实现状态：** ⬜ 尚未按 Phase 推进——当前代码仅处于“世界事实近似层”（对应 Phase 1 的极简子集）。
 
 建议：
 
