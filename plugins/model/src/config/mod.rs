@@ -27,6 +27,7 @@ mod agent_runs;
 mod agent_tasks;
 mod cognitive_model;
 mod executive;
+mod gag_ledger;
 mod group_interjection;
 mod identity;
 mod memory;
@@ -50,6 +51,7 @@ pub use executive::{
     ExecutiveAttentionBudgetConfig, ExecutiveConfidenceConfig, ExecutiveConfig,
     ExecutiveDecisionRecordConfig, ExecutiveExpectationConfig, ExecutivePlanConfig,
 };
+pub use gag_ledger::GagLedgerConfig;
 pub use identity::IdentityConfig;
 pub use mind::MindConfig;
 pub use reminders::ReminderConfig;
@@ -105,6 +107,8 @@ pub struct ModelConfig {
     agent_runs: AgentRunConfig,
     /// 世界传感器框架配置（默认关闭，增量化）。
     world_sensors: WorldSensorsConfig,
+    /// 梗账本配置（许诺/常驻梗/记仇的结构化有界状态）。
+    gag_ledger: GagLedgerConfig,
     /// 图片理解 Provider 路由配置。
     vision: VisionConfig,
     /// Executive v3 deterministic control configuration.
@@ -157,6 +161,7 @@ impl ModelConfig {
         self.agent_tasks.validate()?;
         self.agent_runs.validate()?;
         self.world_sensors.validate()?;
+        self.gag_ledger.validate()?;
         self.vision.validate()?;
         self.executive.validate()?;
         self.model.validate()?;
@@ -243,6 +248,10 @@ impl ModelConfig {
 
     pub fn world_sensors(&self) -> &WorldSensorsConfig {
         &self.world_sensors
+    }
+
+    pub fn gag_ledger(&self) -> &GagLedgerConfig {
+        &self.gag_ledger
     }
 
     pub fn vision(&self) -> &VisionConfig {

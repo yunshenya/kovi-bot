@@ -265,3 +265,12 @@ cooldown_secs = 600
 # timeout_secs = 10
 # watch = true
 # importance = 70
+
+# 梗账本：许诺/常驻梗/记仇的结构化有界状态。主人可在私聊用
+# #记下 <内容> / #账本 / #还账 <短id> / #清账本 管理；回复时会把未兑现条目
+# 作为角色账本注入上下文，让她"记得欠你的"。
+[gag_ledger]
+enabled = true
+max_entries_per_scope = 32
+max_global_entries = 128
+entry_ttl_days = 180

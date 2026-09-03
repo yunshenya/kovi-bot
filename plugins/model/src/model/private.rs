@@ -138,6 +138,18 @@ pub(crate) async fn private_message_event_after_ingress(
         }
         return;
     }
+    if crate::model::gag_commands::parse_gag_command(message).is_some() {
+        if !is_main_admin(&bot, user_id) {
+            println!("[INFO] 私聊账本命令未授权 (用户: {})", user_id);
+            return;
+        }
+        if let Some(reply) =
+            crate::model::gag_commands::handle_gag_command(user_id.to_string(), message).await
+        {
+            send_private_direct_response(&bot, user_id, initial_admission, &reply).await;
+        }
+        return;
+    }
     if message.trim() == "#系统信息" && sender_is_admin {
         if ConversationCoordinator::resolve_active_reply_for_direct_response(initial_admission)
             .await
@@ -603,6 +615,16 @@ pub(crate) async fn private_message_event_after_ingress(
         || social_vision_requested
     {
         with_social_image_context(&model_message)
+    } else {
+        model_message
+    };
+    // Gag-ledger injection: remind the model of open promises/gags/grudges in
+    // the reply context (bounded, host-side, never replaces user content).
+    let model_message = if let Some(ledger) =
+        crate::model::gag_commands::ledger_context_for(&user_id.to_string()).await
+        && !model_message.trim().is_empty()
+    {
+        format!("{model_message}\n\n{ledger}")
     } else {
         model_message
     };

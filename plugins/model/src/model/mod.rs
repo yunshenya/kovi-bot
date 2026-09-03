@@ -1,6 +1,7 @@
 mod coalesce;
 mod conversation_coordinator;
 mod conversation_state;
+mod gag_commands;
 mod group;
 mod interrupt;
 mod memory_query;

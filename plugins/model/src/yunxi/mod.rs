@@ -6,6 +6,7 @@ pub(crate) mod delivery;
 mod delivery_ledger;
 pub(crate) mod events;
 mod executive_store;
+pub(crate) mod gag_store;
 mod goal_store;
 mod identity_store;
 pub(crate) mod intrinsic_runtime;
@@ -25,6 +26,7 @@ use affect_store::PostgresAffectStore;
 use anyhow::{Context, Result};
 use delivery_ledger::PostgresDeliveryLedger;
 use executive_store::PostgresExecutiveStore;
+use gag_store::PostgresGagStore;
 use goal_store::PostgresGoalStore;
 use identity_store::PostgresIdentityStore;
 use kovi::tokio::sync::{Mutex as AsyncMutex, Notify, RwLock as AsyncRwLock, RwLockReadGuard};
@@ -60,6 +62,7 @@ static MEMORY_STORE: OnceLock<Arc<PostgresMemoryStore>> = OnceLock::new();
 static AFFECT_STORE: OnceLock<Arc<PostgresAffectStore>> = OnceLock::new();
 static RELATION_STORE: OnceLock<Arc<PostgresRelationStore>> = OnceLock::new();
 static GOAL_STORE: OnceLock<Arc<PostgresGoalStore>> = OnceLock::new();
+static GAG_STORE: OnceLock<Arc<PostgresGagStore>> = OnceLock::new();
 static DELIVERY_LEDGER: OnceLock<Arc<PostgresDeliveryLedger>> = OnceLock::new();
 static MIND_STORE: OnceLock<Arc<PostgresMindStore>> = OnceLock::new();
 static MIND_RUNTIME: OnceLock<Arc<MindRuntime>> = OnceLock::new();
@@ -144,6 +147,14 @@ pub(crate) async fn initialize_database() -> Result<()> {
         let store = Arc::new(PostgresOpenLoopStore::new(pool.clone()));
         store.initialize_schema().await?;
         let _ = OPEN_LOOP_STORE.set(store);
+    }
+    if GAG_STORE.get().is_none() {
+        let store = Arc::new(PostgresGagStore::new(
+            pool.clone(),
+            crate::config::get().gag_ledger().clone(),
+        ));
+        store.initialize_schema().await?;
+        let _ = GAG_STORE.set(store);
     }
     if MEMORY_STORE.get().is_none() {
         let identities = IDENTITY_STORE
@@ -350,6 +361,10 @@ pub(crate) fn identity_store() -> Option<Arc<PostgresIdentityStore>> {
 #[allow(dead_code)]
 pub(crate) fn open_loop_store() -> Option<Arc<PostgresOpenLoopStore>> {
     OPEN_LOOP_STORE.get().cloned()
+}
+
+pub(crate) fn gag_store() -> Option<Arc<PostgresGagStore>> {
+    GAG_STORE.get().cloned()
 }
 
 #[allow(dead_code)]
