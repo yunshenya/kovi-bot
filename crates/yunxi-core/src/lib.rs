@@ -24,6 +24,9 @@ pub mod ports;
 pub mod proactive;
 pub mod runtime;
 pub mod working_state;
+pub mod world_model;
+
+pub use world_model::*;
 
 pub use action::{
     ActionId, ActionMetadata, ActionScope, ActionValidationError, CancelGoalAction,
