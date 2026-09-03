@@ -1459,6 +1459,18 @@ pub(crate) async fn send_reach_out(
     intent: &ReachOutIntent,
     expected_user_id: i64,
 ) -> ReachOutDeliveryOutcome {
+    // Shadow-mode World Model: simulate "send now / defer" for the host
+    // before a high-value proactive send (v4 appendix §8). Pure values +
+    // Simulated outcomes only; never affects the send itself.
+    if crate::config::get().world_model().enabled()
+        && let Ok(host) = yunxi_core::HostId::new("qq")
+        && let Some(batch) = crate::yunxi::world_model::simulate_delivery(&host)
+    {
+        kovi::log::debug!(
+            "[YUNXI_WORLD] delivery_simulate results={}",
+            batch.results().len()
+        );
+    }
     let person_id = intent.person_id();
     let content: &MessageContent = intent.message();
     let delivery_key = compatibility_reach_out_key(intent);

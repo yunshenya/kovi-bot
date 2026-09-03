@@ -981,6 +981,117 @@ pub(crate) fn interruption_guard(
         .unwrap_or(0.0)
 }
 
+/// Delivery candidates for one host (v4 §101–§102 / Appendix §8: high-value
+/// proactive message before commit).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeliveryCandidate {
+    SendNow,
+    Defer,
+}
+
+impl DeliveryCandidate {
+    pub(crate) fn id(self) -> &'static str {
+        match self {
+            Self::SendNow => "delivery:send_now",
+            Self::Defer => "delivery:defer",
+        }
+    }
+}
+
+/// Deterministic outcome estimate for one delivery candidate given host
+/// health. Availability is environment knowledge, not psychology (v4 §45).
+pub(crate) fn delivery_outcome(
+    health: yunxi_core::ServiceHealth,
+    candidate: DeliveryCandidate,
+) -> yunxi_core::PredictedOutcome {
+    use yunxi_core::{OutcomeKind, ServiceHealth};
+    use DeliveryCandidate::*;
+    let probability = match (health, candidate) {
+        (ServiceHealth::Unavailable, SendNow) => 0.05,
+        (ServiceHealth::Unavailable, Defer) => 0.60,
+        (ServiceHealth::Degraded, SendNow) => 0.40,
+        (ServiceHealth::Degraded, Defer) => 0.60,
+        (ServiceHealth::Healthy, SendNow) => 0.90,
+        (ServiceHealth::Healthy, Defer) => 0.70,
+        (ServiceHealth::Unknown, SendNow) => 0.30,
+        (ServiceHealth::Unknown, Defer) => 0.40,
+    };
+    let success = probability >= 0.5;
+    yunxi_core::PredictedOutcome::new(
+        if success {
+            OutcomeKind::Success
+        } else {
+            OutcomeKind::Failure
+        },
+        probability,
+        if success { 0.4 } else { -0.3 },
+        0.10,
+        1.0 - probability,
+        if success { 0.4 } else { 0.0 },
+    )
+    .expect("bounded outcome")
+}
+
+/// Execution-side delivery simulation: hosts + candidates → bounded batch.
+/// `send_now` + `defer` (≤2 results/trace); read-only, Simulated mode only.
+pub(crate) fn simulate_delivery(
+    host: &yunxi_core::HostId,
+) -> Option<yunxi_core::SimulationBatch> {
+    let guard = WORLD_RUNTIME
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let world = &guard.as_ref()?.world;
+    simulate_delivery_internal(world, host, chrono::Utc::now())
+}
+
+fn simulate_delivery_internal(
+    world: &WorldModel,
+    host: &yunxi_core::HostId,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<yunxi_core::SimulationBatch> {
+    use yunxi_core::{
+        ExecutionMode, SimulationCandidate, SimulationInput, SimulationResult,
+        WorldSnapshotContext,
+    };
+    let snapshot = world
+        .snapshot_for(&WorldSnapshotContext::new(now))
+        .ok()?;
+    let health = world.environment().host_health_at(host, now);
+    let mut results = Vec::new();
+    for candidate in [DeliveryCandidate::SendNow, DeliveryCandidate::Defer] {
+        let outcome = delivery_outcome(health, candidate);
+        let result = SimulationResult::new(
+            format!("{}:{}", host.as_str(), candidate.id()),
+            vec![outcome],
+            match health {
+                yunxi_core::ServiceHealth::Healthy => 0.10,
+                _ => 0.35,
+            },
+            world.version(),
+            ExecutionMode::Simulated,
+        )
+        .ok()?;
+        results.push(result);
+    }
+    let batch = yunxi_core::SimulationBatch::new(yunxi_core::EventId::new(), results).ok()?;
+    let input = SimulationInput::new(
+        yunxi_core::EventId::new(),
+        SimulationCandidate::new(
+            format!("{}:delivery", host.as_str()),
+            "送达候选（现在发 / 延后）",
+        )
+        .ok()?,
+        yunxi_core::PredictionHorizon::Immediate,
+        snapshot,
+        now,
+    )
+    .ok()?;
+    if input.world().version() != batch.results()[0].world_version() {
+        return None;
+    }
+    Some(batch)
+}
+
 /// Deterministic execution-side simulator for a degraded tool (v4 §54–§55,
 /// §101–§102): snapshots are pure values, results are `Simulated` only, the
 /// batch respects max-per-root-trace = 2 (RetryNow + UseFallback; "wait" is
@@ -1312,6 +1423,59 @@ mod tests {
         let _guard = serial();
         assert_eq!(truncate_chars("abc", 2), "ab");
         assert_eq!(truncate_chars("你好呀", 2), "你好");
+    }
+
+    #[test]
+    fn delivery_outcome_is_deterministic_and_banded() {
+        use yunxi_core::{OutcomeKind, ServiceHealth};
+        // Host unavailable → send-now likely fails; defer is a medium bet.
+        let now = delivery_outcome(ServiceHealth::Unavailable, DeliveryCandidate::SendNow);
+        assert_eq!(now.description(), OutcomeKind::Failure);
+        assert_eq!(now.band(), yunxi_core::ProbabilityBand::Low);
+        let defer = delivery_outcome(ServiceHealth::Unavailable, DeliveryCandidate::Defer);
+        assert_eq!(defer.description(), OutcomeKind::Success);
+        assert!((defer.band() == yunxi_core::ProbabilityBand::Medium));
+        // Healthy host → send-now high confidence.
+        let healthy = delivery_outcome(ServiceHealth::Healthy, DeliveryCandidate::SendNow);
+        assert_eq!(healthy.description(), OutcomeKind::Success);
+        assert_eq!(healthy.band(), yunxi_core::ProbabilityBand::High);
+        now.validate().expect("valid");
+        defer.validate().expect("valid");
+        healthy.validate().expect("valid");
+    }
+
+    #[test]
+    fn delivery_simulator_produces_bounded_simulated_batch() {
+        use yunxi_core::{EnvironmentUpdate, ExecutionMode, HostId, RuntimeLoad, ServiceHealth, HostState};
+        let now = chrono::Utc::now();
+        let host = HostId::new("qq").expect("host");
+        let mut world = WorldModel::new();
+        world
+            .update_environment(
+                EnvironmentUpdate::new(
+                    vec![HostState::new(
+                        host.clone(),
+                        ServiceHealth::Unavailable,
+                        now,
+                        chrono::Duration::minutes(5),
+                    )
+                    .expect("host state")],
+                    vec![],
+                    ServiceHealth::Healthy,
+                    RuntimeLoad::new(0, None, 0, 1, now).expect("load"),
+                )
+                .expect("env"),
+            )
+            .expect("env");
+        let batch = simulate_delivery_internal(&world, &host, now).expect("batch");
+        assert_eq!(batch.results().len(), 2);
+        assert!(batch
+            .results()
+            .iter()
+            .all(|result| result.mode() == ExecutionMode::Simulated));
+        batch.validate().expect("batch validates");
+        // Read-only: simulation never mutates the world.
+        assert_eq!(world.version(), 2);
     }
 
     #[test]
