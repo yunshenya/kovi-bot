@@ -42,11 +42,10 @@ fn default_sensors() -> Vec<WorldSensorConfig> {
 pub struct WorldSensorConfig {
     /// Stable name, e.g. "ci:main" — used in the world fact and as a dedupe key.
     name: String,
-    /// Sensor kind: `url_status` (fetch a URL and compare status) or `command`
-    /// (run a bounded shell command; ok = exit code matches and, when set, the
-    /// output contains `expected_output`).
+    /// Sensor kind: `url_status` (fetch a URL and compare status), `command`
+    /// (run a bounded shell command), or `file_state` (check a file path).
     kind: String,
-    /// Target, e.g. a URL (for url_status). Ignored by `command`.
+    /// Target: a URL (url_status) or a file path (file_state).
     target: String,
     /// For url_status: the expected HTTP status code that counts as "success".
     expected_status: u16,
@@ -189,9 +188,19 @@ impl WorldSensorConfig {
                     "world_sensors.sensor.expected_output 必须 ≤512 字符"
                 );
             }
+            "file_state" => {
+                anyhow::ensure!(
+                    !self.target.trim().is_empty() && self.target.chars().count() <= 512,
+                    "world_sensors.sensor.target（文件路径）必须非空且 ≤512 字符"
+                );
+                anyhow::ensure!(
+                    self.expected_output.is_empty(),
+                    "world_sensors.sensor.file_state 不支持 expected_output"
+                );
+            }
             _ => {
                 anyhow::bail!(
-                    "world_sensors.sensor.kind 仅支持 url_status 或 command（当前: {}）",
+                    "world_sensors.sensor.kind 仅支持 url_status、command 或 file_state（当前: {}）",
                     self.kind
                 )
             }

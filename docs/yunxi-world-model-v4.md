@@ -21,20 +21,20 @@
 | 设计块 | 状态 | 对应代码 |
 |---|---|---|
 | **世界“事实”最小闭环**（Observation 的极简近似：scope/summary/importance → `Fact` 记忆 + watch 开环 + 可选 Mind interest） | ✅ 已实现 | `crates/yunxi-core/src/memory.rs::world_fact_draft`、`MemoryKind::Fact`；`plugins/model/src/yunxi/mod.rs::observe_world_fact`、`world_loop_draft` |
-| **世界采样/传感器**（`url_status`、`command` 两种 kind，状态变化才回喂核心） | ✅ 已实现 | `plugins/model/src/world_sensors.rs`、`config/world_sensors.rs`；`agent_runs.rs` 完成时回喂 |
-| **Observation 结构化**（§10–14：ObservationSource / Reliability / TTL / 数据结构） | 🔶 部分（仅以 Fact 记忆近似；无结构化字段、可靠性、TTL） | 未实现结构化 Observation |
-| **Entity Model**（§15–20） | ⬜ 仅设计，未实现 | — |
-| **Situation Model**（§21–26） | ⬜ 仅设计，未实现 | — |
-| **Hypothesis**（§27–33） | ⬜ 仅设计，未实现 | — |
-| **Temporal / Causal / Prediction**（§34–52） | ⬜ 仅设计，未实现 | — |
-| **Simulation / Counterfactual / Snapshot**（§53–67） | ⬜ 仅设计，未实现 | — |
-| **SocialScene / Environment / Uncertainty**（§68–83） | ⬜ 仅设计，未实现 | — |
-| **Update Pipeline / Merge / Extraction**（§84–92） | ⬜ 仅设计，未实现 | — |
-| **WorldModel Store Ports / Persistence / 表结构**（§125–131，含 `yunxi_world_observations`） | ⬜ 设计表**尚未创建**（代码中无该表） | 现有持久化为 Memory/OpenLoop/Mind store（`plugins/model/src/yunxi/schema.rs`） |
+| **世界采样/传感器**（`url_status`、`command`、`file_state` 三种 kind，状态变化才回喂核心） | ✅ 已实现（v4 期间新增 `file_state`） | `plugins/model/src/world_sensors.rs`、`config/world_sensors.rs`；`agent_runs.rs` 完成时回喂 |
+| **Observation 结构化**（§10–14：ObservationSource / Reliability / TTL / 数据结构） | ✅ 领域模型已实现；插件影子模式已接入（事实/传感器 → Observation） | `crates/yunxi-core/src/world_model/{observation.rs,common.rs}`；`plugins/model/src/yunxi/world_model.rs::record_observation` |
+| **Entity Model**（§15–20） | ✅ 领域模型已实现（Person/Conversation/Host/Tool 等 + StateProperty 有效窗口）；插件仅传感器 → Resource 属性影子记录，未接入完整推导 | `crates/yunxi-core/src/world_model/entity.rs` |
+| **Situation Model**（§21–26） | ✅ 领域模型已实现（确定性状态迁移表 / 生命周期 / 版本冲突拒绝 / contradiction 拒绝）；未接入插件推导 | `crates/yunxi-core/src/world_model/situation.rs` |
+| **Hypothesis**（§27–33） | ✅ 领域模型已实现（命题归一化去重 / 证据合并 / 反对共存 / 创建阈值 0.20）；未接入插件 | `crates/yunxi-core/src/world_model/hypothesis.rs` |
+| **Temporal**（§34–38） | ✅ 领域模型已实现（TimeInterval 区间+精度 / Freshness：Fresh/Stale/Expired/Unknown / timeline）；时间表达解析属插件层，未实现 | `crates/yunxi-core/src/world_model/temporal.rs` |
+| **Causal / Prediction / Simulation**（§39–52、§53–67） | ⬜ 未实现（按 rollout R5–R7 后置） | — |
+| **SocialScene / Environment**（§68–79） | ✅ 领域模型已实现；插件影子模式已接入群聊/私聊场景喂入与确定性 interruption cost、传感器状态 | `crates/yunxi-core/src/world_model/{social_scene.rs,environment.rs}`；`plugins/model/src/yunxi/world_model.rs::{record_group_scene,record_direct_scene,record_entity_property}` |
+| **WorldModel 聚合 + Snapshot**（§63–67、§84–92） | ✅ 已实现（bounds 16/8/8/12/8、相关检索、version 计数、批式提案 apply、erase_person/erase_conversation） | `crates/yunxi-core/src/world_model/{mod.rs,snapshot.rs,update.rs}` |
+| **WorldModel Store Ports / Persistence / 表结构**（§125–131，含 `yunxi_world_observations`） | ⬜ 设计表**尚未创建**（v4 持久化属 Phase 15；当前仅进程内） | — |
 | 与 OpenLoop/Mind 的接入 | 🔶 部分（watch 开环已接；§93–95、§112 其余未接） | `observe_world_fact` 的 `world_loop_draft` 分支 |
-| **Phase 0–16 建设计划**（§175–193） | ⬜ 尚未按 Phase 推进（当前处于“世界事实近似层”） | — |
+| **Phase 0–16 建设计划**（§175–193） | 🔶 Phase 0–8 领域层已完成（`cargo test -p yunxi-core` 全绿，零平台耦合，无行为变更）；R1 传感器泛化（file_state）与影子模式运行时已接入；R2–R4 插件侧推导/Executive 软信号未接入 | `crates/yunxi-core/src/world_model/`；`plugins/model/src/{config/world_model.rs,yunxi/world_model.rs}` |
 
-> **一句话现状**：v4 目前只落地了「世界事实最小闭环」（传感器/事件 → `observe_world_fact` → Fact 记忆 + 开环 + 兴趣），其余均为设计蓝图；下文设计节引用的表（如 `yunxi_world_observations`）都是**目标 schema，尚未建表**。
+> **一句话现状**：v4 的**平台无关领域层（Phase 0–8）已全部落地**（有界、构造即校验、278+ 单元测试），插件侧已有**影子模式运行时**（观察/场景喂入，`[world_model] enabled=false` 默认关闭，绝不阻塞聊天）；**持久化、预测/模拟、Executive 软信号与完整推导流水线仍在 rollout 路线图中**。下文设计节引用的表（如 `yunxi_world_observations`）都是**目标 schema，尚未建表**。
 
 ## 0.2 分组目录
 

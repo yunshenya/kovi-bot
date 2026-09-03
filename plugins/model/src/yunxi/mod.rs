@@ -21,6 +21,7 @@ pub(crate) mod proactive;
 pub(crate) mod qq;
 mod relation_store;
 mod schema;
+pub(crate) mod world_model; // World Model v4 host-side runtime (shadow)
 
 use affect_store::PostgresAffectStore;
 use anyhow::{Context, Result};
@@ -419,6 +420,24 @@ pub(crate) async fn observe_world_fact(
     if let Some(topic) = interest_topic {
         seed_world_interest(topic).await?;
     }
+    // Shadow-mode World Model: record the same fact as a structured
+    // observation so the v4 runtime can learn (v4 §85–86). No-op when the
+    // feature is disabled; never blocks the caller.
+    world_model::record_observation(
+        match scope {
+            yunxi_core::MemoryScope::Global => yunxi_core::WorldScope::Global,
+            yunxi_core::MemoryScope::Person(person_id) => {
+                yunxi_core::WorldScope::Person { person_id }
+            }
+            yunxi_core::MemoryScope::Conversation(conversation_id) => {
+                yunxi_core::WorldScope::Conversation { conversation_id }
+            }
+        },
+        yunxi_core::world_model::ObservationKind::SystemState,
+        yunxi_core::world_model::ObservationSource::SystemState,
+        summary,
+        None,
+    );
     Ok(memory.id())
 }
 

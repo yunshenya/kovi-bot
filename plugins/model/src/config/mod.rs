@@ -42,6 +42,7 @@ mod tools;
 mod topic;
 mod traffic;
 mod vision;
+mod world_model;
 mod world_sensors;
 
 pub use agent_runs::AgentRunConfig;
@@ -57,6 +58,7 @@ pub use mind::MindConfig;
 pub use reminders::ReminderConfig;
 pub use tools::{McpServerConfig, ToolsConfig};
 pub use vision::VisionConfig;
+pub use world_model::WorldModelConfig;
 pub use world_sensors::{WorldSensorConfig, WorldSensorsConfig};
 
 /// 全局配置实例
@@ -107,6 +109,8 @@ pub struct ModelConfig {
     agent_runs: AgentRunConfig,
     /// 世界传感器框架配置（默认关闭，增量化）。
     world_sensors: WorldSensorsConfig,
+    /// World Model v4 运行时配置（shadow 模式，默认关闭）。
+    world_model: WorldModelConfig,
     /// 梗账本配置（许诺/常驻梗/记仇的结构化有界状态）。
     gag_ledger: GagLedgerConfig,
     /// 图片理解 Provider 路由配置。
@@ -161,6 +165,7 @@ impl ModelConfig {
         self.agent_tasks.validate()?;
         self.agent_runs.validate()?;
         self.world_sensors.validate()?;
+        self.world_model.validate()?;
         self.gag_ledger.validate()?;
         self.vision.validate()?;
         self.executive.validate()?;
@@ -248,6 +253,10 @@ impl ModelConfig {
 
     pub fn world_sensors(&self) -> &WorldSensorsConfig {
         &self.world_sensors
+    }
+
+    pub fn world_model(&self) -> &WorldModelConfig {
+        &self.world_model
     }
 
     pub fn gag_ledger(&self) -> &GagLedgerConfig {

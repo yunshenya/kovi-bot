@@ -423,6 +423,14 @@ pub(crate) async fn group_message_event_after_ingress(
     }
     let structured_at_self = message_at_self(&event.message, event.self_id);
     let locally_addressed = structured_at_self || text_mentions_bot(message);
+    // Shadow-mode World Model social scene feed: deterministic, no model
+    // call, no reply influence (v4 §145–146). No-op when disabled.
+    crate::yunxi::world_model::record_group_scene(
+        crate::yunxi::world_model::scene_group_conversation_id(group_id),
+        crate::yunxi::world_model::scene_person_id(event.user_id),
+        vec![crate::yunxi::world_model::scene_person_id(event.user_id)],
+        locally_addressed,
+    );
     if locally_addressed
         && !sender_is_admin
         && should_suppress_direct_trigger(group_id, event.user_id).await

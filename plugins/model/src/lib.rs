@@ -665,6 +665,21 @@ async fn main() {
             world_sensors::start_scheduler(world_sensor_bot).await;
         });
 
+        // Shadow-mode World Model runtime status (observability only; the
+        // runtime itself is fed from inbound events and world facts).
+        {
+            let world_model = config::get().world_model().clone();
+            println!(
+                "[INFO] World Model v4 {}（shadow_mode={}）",
+                if world_model.enabled() {
+                    "已启用"
+                } else {
+                    "关闭"
+                },
+                world_model.shadow_mode()
+            );
+        }
+
         let agent_task_bot = Arc::clone(&proactive_bot);
         kovi::tokio::spawn(async move {
             agent_tasks::start_scheduler(agent_task_bot).await;

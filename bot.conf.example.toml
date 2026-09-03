@@ -263,6 +263,25 @@ cooldown_secs = 600
 # command = "systemctl is-active kovi-bot"
 # expected_exit = 0
 # expected_output = "active"   # 可选：输出需包含该文本，缺省不检查
+
+# 文件状态传感器（存在/变更，mtime 变化也会回喂）：
+# [[world_sensors.sensors]]
+# name = "file:build-artifact"
+# kind = "file_state"
+# target = "/var/lib/kovi-bot/artifact.ready"
+# timeout_secs = 10
+# watch = true
+# importance = 60
+
+# World Model v4 运行时（影子模式；默认关闭，开启后也只记录状态，
+# 绝不阻塞/改变回复）：可作为观察与社交场景的进程内状态源，
+# 供后续 R2/R3 阶段接入 Executive 软信号与持久化。
+[world_model]
+enabled = false
+shadow_mode = true
+observation_ttl_secs = 86400
+max_social_scenes = 256
+activity_window_secs = 60
 # timeout_secs = 10
 # watch = true
 # importance = 70

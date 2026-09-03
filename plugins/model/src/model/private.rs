@@ -90,6 +90,13 @@ pub(crate) async fn private_message_event_after_ingress(
     let bounded_message = bounded_input(event.borrow_text().unwrap_or_default());
     let message = bounded_message.as_str();
     let sender_is_admin = is_bot_admin(&bot, user_id);
+    // Shadow-mode World Model direct-conversation scene feed (no-op when
+    // disabled; deterministic; never influences the reply itself).
+    crate::yunxi::world_model::record_direct_scene(
+        crate::yunxi::world_model::scene_direct_conversation_id(user_id),
+        crate::yunxi::world_model::scene_person_id(user_id),
+        true,
+    );
     if is_restricted_command(message) && !sender_is_admin {
         println!("[INFO] 私聊未授权命令已静默 (用户: {})", user_id);
         return;

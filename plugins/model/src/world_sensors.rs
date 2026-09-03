@@ -18,6 +18,7 @@ use std::time::Duration;
 struct SensorState {
     last_ok: Option<bool>,
     last_change: Option<std::time::SystemTime>,
+    last_mtime: Option<std::time::SystemTime>,
 }
 
 static SENSOR_STATES: LazyLock<Mutex<HashMap<String, SensorState>>> =
@@ -157,8 +158,9 @@ async fn ok_or_skip(sensor: &config::WorldSensorConfig, cooldown: Duration) -> a
     {
         return Ok(());
     }
-    let ok = match sensor.kind() {
-        "command" => command_sensor_ok(sensor).await,
+    let (ok, mtime) = match sensor.kind() {
+        "command" => (command_sensor_ok(sensor).await, None),
+        "file_state" => file_state_ok(sensor),
         _ => {
             // url_status: fetch and compare status against the expected value.
             let response = fetch_public_http_response(
@@ -167,11 +169,15 @@ async fn ok_or_skip(sensor: &config::WorldSensorConfig, cooldown: Duration) -> a
                 Duration::from_secs(sensor.timeout_secs()),
             )
             .await;
-            matches!(&response, Ok(r) if r.status == sensor.expected_status())
+            (matches!(&response, Ok(r) if r.status == sensor.expected_status()), None)
         }
     };
+    // A file_state sensor also fires when the file's mtime changes while it
+    // remains in the expected state ("文件变更").
+    let file_changed =
+        sensor.kind() == "file_state" && state.last_mtime != mtime && mtime.is_some();
     // Only feed the core on a state transition, not every poll.
-    if state.last_ok != Some(ok) {
+    if state.last_ok != Some(ok) || (file_changed && ok) {
         let summary = format!(
             "{} 现在{}",
             sensor.name(),
@@ -201,11 +207,32 @@ async fn ok_or_skip(sensor: &config::WorldSensorConfig, cooldown: Duration) -> a
                 SensorState {
                     last_ok: Some(ok),
                     last_change: Some(std::time::SystemTime::now()),
+                    last_mtime: mtime,
                 },
+            );
+            // Shadow-mode World Model: also record a structured entity
+            // property so the v4 runtime can track this sensor's state.
+            crate::yunxi::world_model::record_entity_property(
+                yunxi_core::world_model::EntityKind::Resource,
+                None,
+                None,
+                format!("sensor:{}", sensor.name()).as_str(),
+                if ok { "ok" } else { "not_ok" },
+                (sensor.importance() as f32 / 100.0).clamp(0.2, 1.0),
             );
         }
     }
     Ok(())
+}
+
+/// Check a `file_state` sensor: ok when the path exists and is a regular
+/// file; the modification time is returned for change detection.
+fn file_state_ok(sensor: &config::WorldSensorConfig) -> (bool, Option<std::time::SystemTime>) {
+    match std::fs::metadata(sensor.target()) {
+        Ok(metadata) if metadata.is_file() => (true, metadata.modified().ok()),
+        Ok(_) => (false, None),
+        Err(_) => (false, None),
+    }
 }
 
 #[cfg(test)]
@@ -279,12 +306,63 @@ mod tests {
             SensorState {
                 last_ok: Some(true),
                 last_change: Some(std::time::SystemTime::now()),
+                last_mtime: None,
             },
         );
         assert_eq!(
             sensor_state("t").map(|state| state.last_ok),
             Some(Some(true))
         );
+    }
+
+    #[test]
+    fn file_state_sensor_detects_existence_and_mtime() {
+        let dir = std::env::temp_dir().join(format!("yunxi-wm-sensor-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let file = dir.join("artifact.txt");
+        let sensor: WorldSensorsConfig = kovi::toml::from_str(
+            &format!(
+                r#"
+                enabled = true
+                check_interval_secs = 300
+                max_sensors = 16
+                max_result_chars = 500
+                cooldown_secs = 600
+                sensors = [
+                    {{ name = "file:artifact", kind = "file_state", target = "{}", timeout_secs = 10, watch = true, importance = 60 }},
+                ]
+                "#,
+                file.display()
+            ),
+        )
+        .expect("deserializes file_state sensor");
+        assert!(sensor.validate().is_ok());
+        let config = &sensor.sensors()[0];
+        // Not yet created → not ok.
+        assert_eq!(file_state_ok(config), (false, None));
+        std::fs::write(&file, "v1").expect("write");
+        let (ok, mtime) = file_state_ok(config);
+        assert!(ok);
+        assert!(mtime.is_some());
+        // A directory target is treated as not-ok (it is not a "file").
+        let dir_sensor: WorldSensorsConfig = kovi::toml::from_str(
+            &format!(
+                r#"
+                enabled = true
+                check_interval_secs = 300
+                max_sensors = 16
+                max_result_chars = 500
+                cooldown_secs = 600
+                sensors = [
+                    {{ name = "file:dir", kind = "file_state", target = "{}", timeout_secs = 10, watch = true, importance = 60 }},
+                ]
+                "#,
+                dir.display()
+            ),
+        )
+        .expect("deserializes");
+        assert_eq!(file_state_ok(&dir_sensor.sensors()[0]), (false, None));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
