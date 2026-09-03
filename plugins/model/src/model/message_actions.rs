@@ -86,14 +86,15 @@ fn merge_near_duplicate_bubbles(bubbles: Vec<String>) -> Vec<String> {
             merged.push(bubble);
             continue;
         }
-        if let Some(previous) = merged.last_mut() {
-            if !previous.trim().is_empty() && text_overlap(previous, trimmed) >= THRESHOLD {
-                // Keep the more informative of the two near-identical ideas.
-                if trimmed.chars().count() > previous.trim().chars().count() {
-                    *previous = trimmed.to_string();
-                }
-                continue;
+        if let Some(previous) = merged.last_mut()
+            && !previous.trim().is_empty()
+            && text_overlap(previous, trimmed) >= THRESHOLD
+        {
+            // Keep the more informative of the two near-identical ideas.
+            if trimmed.chars().count() > previous.trim().chars().count() {
+                *previous = trimmed.to_string();
             }
+            continue;
         }
         merged.push(bubble);
     }
