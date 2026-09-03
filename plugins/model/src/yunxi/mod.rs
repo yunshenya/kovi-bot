@@ -43,8 +43,8 @@ use std::sync::{
 };
 use std::time::Duration;
 use yunxi_core::{
-    AffectState, ConversationId, IdentityStore, MemoryStore, MindDataErasure, OpenLoopStore,
-    PersonId, RelationState,
+    AffectState, ConversationId, IdentityStore, InterestId, InterestStore, MemoryStore,
+    MindDataErasure, MindSource, OpenLoopStore, PersonId, RelationState,
 };
 
 const MIND_ERASURE_MAX_ATTEMPTS: usize = 3;
@@ -361,14 +361,19 @@ pub(crate) fn memory_store() -> Option<Arc<PostgresMemoryStore>> {
 /// task, a build state, a recurring thing) as a retrievable memory, so the core
 /// learns about your life the same way it learns from chat. When `watch` is
 /// true it also creates a bounded, low-salience follow-up open loop so the
-/// proactive system may later surface it ("your build recovered"). The summary
-/// is bounded and importance is clamped. Returns the new memory id.
+/// proactive system may later surface it ("your build recovered"). When
+/// `interest_topic` is provided it additionally seeds/boosts a bounded Mind
+/// interest about that subject, so she genuinely "cares" about it and it can
+/// influence her interests/topic/proactive behaviour — not just sit as passive
+/// memory. The summary is bounded and importance is clamped. Returns the new
+/// memory id.
 #[allow(dead_code)]
 pub(crate) async fn observe_world_fact(
     scope: yunxi_core::MemoryScope,
     summary: &str,
     importance: u8,
     watch: bool,
+    interest_topic: Option<&str>,
 ) -> anyhow::Result<yunxi_core::MemoryId> {
     let Some(store) = memory_store() else {
         anyhow::bail!("memory store is unavailable");
@@ -396,7 +401,42 @@ pub(crate) async fn observe_world_fact(
         .with_expires_at(Some(now + chrono::Duration::days(1)));
         open_loops.create(&open_loop).await?;
     }
+    if let Some(topic) = interest_topic {
+        seed_world_interest(topic).await?;
+    }
     Ok(memory.id())
+}
+
+/// Upper bound on distinct world interests the core will hold, so a long series
+/// of world facts cannot grow the interest set without a cap.
+const MAX_WORLD_INTERESTS: usize = 32;
+
+/// Seed or boost a bounded Mind interest for a watched world subject. Existing
+/// interest (by normalized topic key) is nudged up; otherwise a new bounded
+/// interest is created only while under the capacity cap. Best-effort: a store
+/// or validation failure never fails the outer world-fact recording.
+async fn seed_world_interest(topic: &str) -> anyhow::Result<()> {
+    let Some(store) = mind_store() else {
+        return Ok(());
+    };
+    let now = chrono::Utc::now();
+    let draft = yunxi_core::Interest::new(
+        InterestId::new(),
+        topic,
+        0.25,
+        0.05,
+        0.6,
+        MindSource::ToolResult,
+        now,
+    )?;
+    let topic_key = draft.topic_key().to_owned();
+    if let Some(existing) = store.find_by_key(&topic_key).await? {
+        let activated = existing.activate(0.15, 0.05, 0.6, now)?;
+        store.put(&activated, Some(existing.version())).await?;
+    } else if store.relevant("", MAX_WORLD_INTERESTS).await?.len() < MAX_WORLD_INTERESTS {
+        store.put(&draft, None).await?;
+    }
+    Ok(())
 }
 
 #[allow(dead_code)]

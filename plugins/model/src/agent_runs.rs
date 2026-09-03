@@ -498,7 +498,8 @@ async fn begin_notification(
     // existing world-monitoring watcher into a source of durable core world
     // awareness.
     if let Err(error) =
-        crate::yunxi::observe_world_fact(yunxi_core::MemoryScope::Global, &content, 60, false).await
+        crate::yunxi::observe_world_fact(yunxi_core::MemoryScope::Global, &content, 60, false, None)
+            .await
     {
         kovi::log::warn!("Agent Run world fact feed failed: {error}");
     }

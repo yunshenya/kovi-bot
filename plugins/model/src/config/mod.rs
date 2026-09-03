@@ -41,6 +41,7 @@ mod tools;
 mod topic;
 mod traffic;
 mod vision;
+mod world_sensors;
 
 pub use agent_runs::AgentRunConfig;
 pub use agent_tasks::AgentTaskConfig;
@@ -54,6 +55,7 @@ pub use mind::MindConfig;
 pub use reminders::ReminderConfig;
 pub use tools::{McpServerConfig, ToolsConfig};
 pub use vision::VisionConfig;
+pub use world_sensors::{WorldSensorConfig, WorldSensorsConfig};
 
 /// 全局配置实例
 ///
@@ -101,6 +103,8 @@ pub struct ModelConfig {
     agent_tasks: AgentTaskConfig,
     /// 通用持久化 Agent Run 配置。
     agent_runs: AgentRunConfig,
+    /// 世界传感器框架配置（默认关闭，增量化）。
+    world_sensors: WorldSensorsConfig,
     /// 图片理解 Provider 路由配置。
     vision: VisionConfig,
     /// Executive v3 deterministic control configuration.
@@ -152,6 +156,7 @@ impl ModelConfig {
         self.reminders.validate()?;
         self.agent_tasks.validate()?;
         self.agent_runs.validate()?;
+        self.world_sensors.validate()?;
         self.vision.validate()?;
         self.executive.validate()?;
         self.model.validate()?;
@@ -234,6 +239,10 @@ impl ModelConfig {
 
     pub fn agent_runs(&self) -> &AgentRunConfig {
         &self.agent_runs
+    }
+
+    pub fn world_sensors(&self) -> &WorldSensorsConfig {
+        &self.world_sensors
     }
 
     pub fn vision(&self) -> &VisionConfig {

@@ -235,3 +235,23 @@ provider = "auto"
 mcp_server = ""
 mcp_tool = "analyze_image"
 timeout_secs = 60
+
+# 世界传感器：让核心了解你真实世界的持久事实（默认开启；空传感器列表是无害的空转调度器）。
+# 后台调度器按间隔轮询下列传感器，状态变化时喂给核心一条世界事实记忆；
+# watch=true 时会同时建一条低显著度开环，让她可能在合适时机主动提起。
+[world_sensors]
+enabled = true
+check_interval_secs = 300
+max_sensors = 16
+max_result_chars = 500
+cooldown_secs = 600
+
+# 需要盯真实目标时，取消注释并按需填写（一个或多个）：
+# [[world_sensors.sensors]]
+# name = "ci:main"
+# kind = "url_status"
+# target = "https://example.com/health"
+# expected_status = 200
+# timeout_secs = 10
+# watch = true
+# importance = 60

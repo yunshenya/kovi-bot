@@ -53,6 +53,7 @@ mod redis_store;
 pub(crate) mod reminders;
 mod vision;
 mod vision_router;
+mod world_sensors;
 pub(crate) mod yunxi;
 
 /// Entry point for the explicit offline Memory v2 migration binary.
@@ -657,6 +658,11 @@ async fn main() {
         let reminder_bot = Arc::clone(&proactive_bot);
         kovi::tokio::spawn(async move {
             reminders::start_scheduler(reminder_bot).await;
+        });
+
+        let world_sensor_bot = Arc::clone(&proactive_bot);
+        kovi::tokio::spawn(async move {
+            world_sensors::start_scheduler(world_sensor_bot).await;
         });
 
         let agent_task_bot = Arc::clone(&proactive_bot);
