@@ -21,14 +21,22 @@ pub struct WorldSensorsConfig {
 pub struct WorldSensorConfig {
     /// Stable name, e.g. "ci:main" — used in the world fact and as a dedupe key.
     name: String,
-    /// Sensor kind; only `url_status` is built in for now.
+    /// Sensor kind: `url_status` (fetch a URL and compare status) or `command`
+    /// (run a bounded shell command; ok = exit code matches and, when set, the
+    /// output contains `expected_output`).
     kind: String,
-    /// Target, e.g. a URL (for url_status).
+    /// Target, e.g. a URL (for url_status). Ignored by `command`.
     target: String,
     /// For url_status: the expected HTTP status code that counts as "success".
     expected_status: u16,
-    /// For url_status: run the fetch with this many seconds timeout.
+    /// Bounded runtime in seconds for a url fetch or a command execution.
     timeout_secs: u64,
+    /// For `command`: the shell command to run (under `sh -c`).
+    command: String,
+    /// For `command`: the exit code that counts as success (default 0).
+    expected_exit: i32,
+    /// For `command`: if non-empty, the command output must contain this text.
+    expected_output: String,
     /// Should the core be able to surface this proactively (watched open loop)?
     watch: bool,
     /// Importance fed into the world-fact memory.
@@ -58,6 +66,9 @@ impl Default for WorldSensorConfig {
             target: String::new(),
             expected_status: 200,
             timeout_secs: 10,
+            command: String::new(),
+            expected_exit: 0,
+            expected_output: String::new(),
             watch: true,
             importance: 60,
         }
@@ -124,25 +135,45 @@ impl WorldSensorConfig {
             "world_sensors.sensor.name 必须非空且 ≤64 字符"
         );
         anyhow::ensure!(
-            self.kind == "url_status",
-            "world_sensors.sensor.kind 目前仅支持 url_status"
-        );
-        anyhow::ensure!(
-            !self.target.trim().is_empty() && self.target.chars().count() <= 512,
-            "world_sensors.sensor.target 必须非空且 ≤512 字符"
-        );
-        anyhow::ensure!(
-            (100..=599).contains(&self.expected_status),
-            "world_sensors.sensor.expected_status 必须在 100..=599"
+            (0..=100).contains(&self.importance),
+            "world_sensors.sensor.importance 必须在 0..=100"
         );
         anyhow::ensure!(
             (1..=60).contains(&self.timeout_secs),
             "world_sensors.sensor.timeout_secs 必须在 1..=60"
         );
-        anyhow::ensure!(
-            (0..=100).contains(&self.importance),
-            "world_sensors.sensor.importance 必须在 0..=100"
-        );
+        match self.kind.as_str() {
+            "url_status" => {
+                anyhow::ensure!(
+                    !self.target.trim().is_empty() && self.target.chars().count() <= 512,
+                    "world_sensors.sensor.target 必须非空且 ≤512 字符"
+                );
+                anyhow::ensure!(
+                    (100..=599).contains(&self.expected_status),
+                    "world_sensors.sensor.expected_status 必须在 100..=599"
+                );
+            }
+            "command" => {
+                anyhow::ensure!(
+                    !self.command.trim().is_empty() && self.command.chars().count() <= 2048,
+                    "world_sensors.sensor.command 必须非空且 ≤2048 字符"
+                );
+                anyhow::ensure!(
+                    (0..=255).contains(&self.expected_exit),
+                    "world_sensors.sensor.expected_exit 必须在 0..=255"
+                );
+                anyhow::ensure!(
+                    self.expected_output.chars().count() <= 512,
+                    "world_sensors.sensor.expected_output 必须 ≤512 字符"
+                );
+            }
+            _ => {
+                anyhow::bail!(
+                    "world_sensors.sensor.kind 仅支持 url_status 或 command（当前: {}）",
+                    self.kind
+                )
+            }
+        }
         Ok(())
     }
 
@@ -164,6 +195,18 @@ impl WorldSensorConfig {
 
     pub fn timeout_secs(&self) -> u64 {
         self.timeout_secs
+    }
+
+    pub fn command(&self) -> &str {
+        &self.command
+    }
+
+    pub fn expected_exit(&self) -> i32 {
+        self.expected_exit
+    }
+
+    pub fn expected_output(&self) -> &str {
+        &self.expected_output
     }
 
     pub fn watch(&self) -> bool {

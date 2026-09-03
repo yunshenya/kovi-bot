@@ -47,7 +47,7 @@ async fn poll_all() -> anyhow::Result<()> {
     let config = config::get().world_sensors().clone();
     let cooldown = Duration::from_secs(config.cooldown_secs());
     for sensor in config.sensors() {
-        // url_status is the only built-in kind.
+        // Built-in kinds: url_status (fetch a URL) or command (bounded shell check).
         ok_or_skip(sensor, cooldown).await?;
     }
     Ok(())
@@ -72,6 +72,83 @@ fn set_sensor_state(name: &str, state: SensorState) {
     states.insert(name.to_owned(), state);
 }
 
+/// Run one bounded command sensor check. The command runs under `sh -c`, is
+/// killed after `timeout_secs`, and is considered ok when its exit code matches
+/// `expected_exit` and (when configured) its output contains `expected_output`.
+async fn command_sensor_ok(sensor: &config::WorldSensorConfig) -> bool {
+    let timeout = Duration::from_secs(sensor.timeout_secs().max(1));
+    match run_bounded_command(sensor.command(), timeout).await {
+        Ok((exit, output)) => {
+            let exit_ok = exit == sensor.expected_exit();
+            let output_ok =
+                sensor.expected_output().is_empty() || output.contains(sensor.expected_output());
+            if !exit_ok || !output_ok {
+                eprintln!(
+                    "[WARN] World 命令传感器未达预期 ({}): exit={} output={}",
+                    sensor.name(),
+                    exit,
+                    truncate_for_log(&output, 160)
+                );
+            }
+            exit_ok && output_ok
+        }
+        Err(error) => {
+            eprintln!(
+                "[WARN] World 命令传感器执行失败 ({}): {error}",
+                sensor.name()
+            );
+            false
+        }
+    }
+}
+
+/// Spawn `sh -c <command>`, capture stdout+stderr, and kill it once `timeout`
+/// elapses so a stuck check cannot wedge the scheduler.
+async fn run_bounded_command(command: &str, timeout: Duration) -> anyhow::Result<(i32, String)> {
+    let command = command.to_owned();
+    kovi::tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        use std::process::{Command, Stdio};
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(&command)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| anyhow::anyhow!("无法启动命令: {error}"))?;
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if let Some(status) = child
+                .try_wait()
+                .map_err(|error| anyhow::anyhow!("等待命令进程失败: {error}"))?
+            {
+                let mut output = String::new();
+                if let Some(mut stdout) = child.stdout.take() {
+                    let _ = stdout.read_to_string(&mut output);
+                }
+                if let Some(mut stderr) = child.stderr.take() {
+                    let _ = stderr.read_to_string(&mut output);
+                }
+                return Ok((status.code().unwrap_or(-1), output));
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(anyhow::anyhow!("命令超时（>{}s）", timeout.as_secs()));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("命令执行任务失败: {error}"))?
+}
+
+fn truncate_for_log(text: &str, maximum: usize) -> String {
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    text.chars().take(maximum).collect()
+}
+
 async fn ok_or_skip(sensor: &config::WorldSensorConfig, cooldown: Duration) -> anyhow::Result<()> {
     let state = sensor_state(sensor.name()).unwrap_or_default();
     // Cooldown gates re-fires after a state change.
@@ -80,14 +157,19 @@ async fn ok_or_skip(sensor: &config::WorldSensorConfig, cooldown: Duration) -> a
     {
         return Ok(());
     }
-    // url_status: fetch and compare status against the expected value.
-    let response = fetch_public_http_response(
-        sensor.target(),
-        config::get().world_sensors().max_result_chars(),
-        Duration::from_secs(sensor.timeout_secs()),
-    )
-    .await;
-    let ok = matches!(&response, Ok(r) if r.status == sensor.expected_status());
+    let ok = match sensor.kind() {
+        "command" => command_sensor_ok(sensor).await,
+        _ => {
+            // url_status: fetch and compare status against the expected value.
+            let response = fetch_public_http_response(
+                sensor.target(),
+                config::get().world_sensors().max_result_chars(),
+                Duration::from_secs(sensor.timeout_secs()),
+            )
+            .await;
+            matches!(&response, Ok(r) if r.status == sensor.expected_status())
+        }
+    };
     // Only feed the core on a state transition, not every poll.
     if state.last_ok != Some(ok) {
         let summary = format!(
@@ -183,5 +265,63 @@ mod tests {
             sensor_state("t").map(|state| state.last_ok),
             Some(Some(true))
         );
+    }
+
+    #[test]
+    fn command_sensor_config_validates() {
+        let ok: WorldSensorsConfig = kovi::toml::from_str(
+            r#"
+            enabled = true
+            check_interval_secs = 300
+            max_sensors = 16
+            max_result_chars = 500
+            cooldown_secs = 600
+            sensors = [
+                { name = "bot:service", kind = "command", command = "systemctl is-active kovi-bot", expected_exit = 0, timeout_secs = 10, watch = true, importance = 70 },
+            ]
+            "#,
+        )
+        .expect("deserializes command sensor");
+        assert!(ok.validate().is_ok());
+        assert_eq!(ok.sensors()[0].kind(), "command");
+        assert_eq!(ok.sensors()[0].expected_exit(), 0);
+        assert!(ok.sensors()[0].command().contains("is-active"));
+
+        // An empty command is rejected.
+        let bad: WorldSensorsConfig = kovi::toml::from_str(
+            r#"
+            enabled = true
+            check_interval_secs = 300
+            max_sensors = 16
+            max_result_chars = 500
+            cooldown_secs = 600
+            sensors = [
+                { name = "bad", kind = "command", command = "", timeout_secs = 10, watch = true, importance = 70 },
+            ]
+            "#,
+        )
+        .expect("deserializes");
+        assert!(bad.validate().is_err());
+    }
+
+    #[test]
+    fn bounded_command_runner_captures_exit_and_output() {
+        let runtime = kovi::tokio::runtime::Runtime::new().expect("test runtime");
+        runtime.block_on(async {
+            let (exit, output) = run_bounded_command("printf 'hi'", Duration::from_secs(10))
+                .await
+                .expect("ok");
+            assert_eq!(exit, 0);
+            assert!(output.contains("hi"));
+
+            let (exit, _) = run_bounded_command("exit 3", Duration::from_secs(10))
+                .await
+                .expect("ok");
+            assert_eq!(exit, 3);
+
+            // A stuck command must be killed on the timeout path.
+            let err = run_bounded_command("sleep 5", Duration::from_millis(300)).await;
+            assert!(err.is_err());
+        });
     }
 }

@@ -253,3 +253,15 @@ cooldown_secs = 600
 # timeout_secs = 10
 # watch = true
 # importance = 60
+
+# 也可以用 command 传感器检查项目/进程/CI 状态（在 `sh -c` 下有界执行；
+# 退出码匹配 expected_exit 且（若配置）输出包含 expected_output 才算"达到预期"）：
+# [[world_sensors.sensors]]
+# name = "bot:service"
+# kind = "command"
+# command = "systemctl is-active kovi-bot"
+# expected_exit = 0
+# expected_output = "active"   # 可选：输出需包含该文本，缺省不检查
+# timeout_secs = 10
+# watch = true
+# importance = 70
