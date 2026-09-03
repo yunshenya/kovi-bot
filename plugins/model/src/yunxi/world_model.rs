@@ -1262,8 +1262,19 @@ pub(crate) fn world_status_text() -> String {
 mod tests {
     use super::*;
 
+    /// Tests share static runtime/counter state; serialize them so parallel
+    /// execution cannot interleave resets with count assertions.
+    static TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     #[test]
     fn disabled_config_is_a_noop() {
+        let _guard = serial();
         reset_for_tests();
         // Config default: enabled=false → nothing stored.
         record_observation(
@@ -1278,6 +1289,7 @@ mod tests {
 
     #[test]
     fn scene_person_id_is_stable_and_distinct() {
+        let _guard = serial();
         let a = scene_person_id(10001);
         let b = scene_person_id(10001);
         let c = scene_person_id(10002);
@@ -1288,6 +1300,7 @@ mod tests {
 
     #[test]
     fn activity_is_bounded() {
+        let _guard = serial();
         let conversation_id = yunxi_core::ConversationId::new();
         push_and_activity(conversation_id);
         assert!(push_and_activity(conversation_id) > 0.0);
@@ -1296,12 +1309,14 @@ mod tests {
 
     #[test]
     fn truncate_respects_char_boundaries() {
+        let _guard = serial();
         assert_eq!(truncate_chars("abc", 2), "ab");
         assert_eq!(truncate_chars("你好呀", 2), "你好");
     }
 
     #[test]
     fn tool_failure_counter_increments_and_bounded() {
+        let _guard = serial();
         reset_tool_failure_counts();
         assert_eq!(count_tool_failure("web_fetch"), 1);
         assert_eq!(count_tool_failure("web_fetch"), 2);
@@ -1312,6 +1327,7 @@ mod tests {
 
     #[test]
     fn causal_promotes_after_repeated_tool_failures() {
+        let _guard = serial();
         let mut world = WorldModel::new();
         // Under the threshold → nothing.
         if false {
@@ -1332,6 +1348,7 @@ mod tests {
 
     #[test]
     fn simulator_produces_bounded_simulated_batch() {
+        let _guard = serial();
         use yunxi_core::{EnvironmentUpdate, ExecutionMode, RuntimeLoad, ServiceHealth, ToolHealth};
         let now = chrono::Utc::now();
         let mut world = WorldModel::new();
@@ -1366,12 +1383,14 @@ mod tests {
 
     #[test]
     fn interruption_guard_is_zero_when_disabled() {
+        let _guard = serial();
         // Default config: enabled=false → guard is inert.
         assert_eq!(interruption_guard(yunxi_core::ConversationId::new()), 0.0);
     }
 
     #[test]
     fn render_world_context_is_objective_and_bounded() {
+        let _guard = serial();
         use yunxi_core::{SocialSceneKind, SocialSceneUpdate};
         use yunxi_core::WorldSnapshotContext;
         let conversation_id = yunxi_core::ConversationId::new();
@@ -1409,6 +1428,7 @@ mod tests {
 
     #[test]
     fn future_event_situation_derives_only_with_time_cue() {
+        let _guard = serial();
         use yunxi_core::world_model::{SituationKind, SituationState};
         let conversation_id = yunxi_core::ConversationId::new();
         let person_id = PersonId::new();
@@ -1440,6 +1460,7 @@ mod tests {
 
     #[test]
     fn tool_recovery_outcome_is_deterministic_and_banded() {
+        let _guard = serial();
         use yunxi_core::{OutcomeKind, ServiceHealth};
         // Degraded + retry-now → likely fail (Low band).
         let retry = tool_recovery_outcome("web_fetch", ServiceHealth::Degraded, ToolRecoveryCandidate::RetryNow);
@@ -1461,6 +1482,7 @@ mod tests {
 
     #[test]
     fn scene_derivation_creates_dedupes_and_expires_situation() {
+        let _guard = serial();
         use yunxi_core::world_model::{
             SituationState, SocialSceneKind, SocialSceneUpdate,
         };
