@@ -48,8 +48,28 @@ fn is_ignorable_punct(character: char) -> bool {
         || character.is_ascii_punctuation()
         || matches!(
             character,
-            '。' | '，' | '、' | '；' | '：' | '！' | '？' | '…' | '—' | '～' | '·' | '“'
-                | '”' | '‘' | '’' | '（' | '）' | '《' | '》' | '「' | '」' | '『' | '』'
+            '。' | '，'
+                | '、'
+                | '；'
+                | '：'
+                | '！'
+                | '？'
+                | '…'
+                | '—'
+                | '～'
+                | '·'
+                | '“'
+                | '”'
+                | '‘'
+                | '’'
+                | '（'
+                | '）'
+                | '《'
+                | '》'
+                | '「'
+                | '」'
+                | '『'
+                | '』'
         )
 }
 
@@ -79,7 +99,6 @@ fn merge_near_duplicate_bubbles(bubbles: Vec<String>) -> Vec<String> {
     }
     merged
 }
-
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MessageDestination {

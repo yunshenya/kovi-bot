@@ -4037,9 +4037,7 @@ fn default_autonomous_directive(
         // autonomously generating another follow-up. This stops 自问自答/自言自语
         // in both private and group chats. An explicit model `continue` cue
         // still schedules the next turn.
-        Some(ConversationKind::Direct) if has_visible_content => {
-            ConversationTurnDirective::Wait
-        }
+        Some(ConversationKind::Direct) if has_visible_content => ConversationTurnDirective::Wait,
         // Group autonomy is equally guarded: a visible turn pauses for human
         // activity (ambient group messages reset pending work on ingress)
         // rather than endlessly continuing on its own.
