@@ -441,6 +441,25 @@ pub(crate) async fn group_message_event_after_ingress(
     {
         kovi::log::debug!("[YUNXI_WORLD] soft_signal {}", summary.render());
     }
+    // Behavioral gate (v4 §103/§197): when influence_mode=active and the
+    // world says this is a rapid unaddressed discussion with the floor held
+    // by others, stay silent instead of interjecting. Default disabled → no
+    // behavioral change; admin messages never get suppressed.
+    if !locally_addressed
+        && !sender_is_admin
+        && crate::yunxi::world_model::interruption_guard(
+            crate::yunxi::world_model::scene_group_conversation_id(group_id),
+        ) > 0.7
+    {
+        println!(
+            "[INFO] 世界模型场合抑制插话 (群组: {}, 用户: {})",
+            group_id, event.user_id
+        );
+        kovi::log::debug!(
+            "[YUNXI_WORLD] influence_interrupt_suppressed 请核对影子指标后再评估是否保留"
+        );
+        return;
+    }
     if locally_addressed
         && !sender_is_admin
         && should_suppress_direct_trigger(group_id, event.user_id).await

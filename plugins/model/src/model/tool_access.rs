@@ -1157,6 +1157,10 @@ impl ToolRegistry {
         if result.is_err() {
             let error_text = format!("{result:?}");
             crate::yunxi::world_model::record_tool_failure(name, "execution_failed", &error_text);
+        } else {
+            // Compare the observed outcome with the stored recovery
+            // prediction (calibration signal, v4 §51–§52, §232).
+            crate::yunxi::world_model::record_tool_retry_outcome(name, true);
         }
         if project_legacy_result {
             kovi::tokio::spawn(crate::yunxi::events::project_destination(

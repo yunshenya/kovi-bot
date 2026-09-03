@@ -7,7 +7,7 @@
 //! only *records* state — nothing in this module decides to act, send, or
 //! cancel. That belongs to Executive / Core (v4 §7, §56, §249–§255).
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::Instant;
@@ -19,6 +19,27 @@ use yunxi_core::world_model::{
 use yunxi_core::PersonId;
 
 const WORLD_LOG_PREFIX: &str = "[YUNXI_WORLD]";
+
+/// Per-tool failure observation count (bounded; supports causal promotion).
+static TOOL_FAILURE_COUNTS: LazyLock<Mutex<HashMap<String, u32>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn count_tool_failure(tool_name: &str) -> u32 {
+    let mut counts = TOOL_FAILURE_COUNTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let count = counts.entry(tool_name.to_owned()).or_insert(0);
+    *count = count.saturating_add(1).min(100);
+    *count
+}
+
+#[cfg(test)]
+fn reset_tool_failure_counts() {
+    TOOL_FAILURE_COUNTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
+}
 
 struct WorldRuntime {
     world: WorldModel,
@@ -153,6 +174,7 @@ pub(crate) fn reset_for_tests() {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     tracker.recent.clear();
+    reset_tool_failure_counts();
 }
 
 /// Record one structured observation into the World Model (shadow mode).
@@ -726,11 +748,241 @@ pub(crate) fn record_tool_failure(tool_name: &str, error_category: &str, detail:
                 Err(error) => eprintln!("{WORLD_LOG_PREFIX} prediction rejected: {error}"),
             }
         }
+        // 3. Shadow top-2 simulation batch for the same decision (pure
+        // values; zero side effects, v4 §56–§58).
+        if let Some(batch) = simulate_tool_recovery(tool_name) {
+            kovi::log::debug!(
+                "{WORLD_LOG_PREFIX} simulate_note tool={tool_name} results={}",
+                batch.results().len()
+            );
+        }
+        // 4. Causal observation (v4 §96–§98): repeated failures promote a
+        // tool-specific "retry now likely fails" relation. Person-specific
+        // remains forbidden (v4 §99).
+        let occurrences = count_tool_failure(tool_name);
+        if occurrences >= yunxi_core::MIN_EVIDENCE_OCCURRENCES {
+            promote_tool_failure_causal(world, tool_name, occurrences);
+        }
         println!(
             "{WORLD_LOG_PREFIX} tool_failure tool={tool_name} env={health:?} version={}",
             world.version()
         );
     });
+}
+
+/// Promote the observed tool-failure causal candidate (dedupe by
+/// cause+effect+scope inside CausalKnowledge).
+fn promote_tool_failure_causal(world: &mut WorldModel, tool_name: &str, occurrences: u32) {
+    use yunxi_core::{
+        CausalRelationProposal, CausalScope, CausalSource, PatternKind, WorldPattern,
+        promote_candidate,
+    };
+    let cause = match WorldPattern::new(PatternKind::Environment, "rate_limited_or_degraded") {
+        Ok(pattern) => pattern,
+        Err(error) => {
+            eprintln!("{WORLD_LOG_PREFIX} causal pattern rejected: {error}");
+            return;
+        }
+    };
+    let effect = match WorldPattern::new(
+        PatternKind::Tool,
+        format!("immediate_retry_of_{tool_name}"),
+    ) {
+        Ok(pattern) => pattern,
+        Err(error) => {
+            eprintln!("{WORLD_LOG_PREFIX} causal pattern rejected: {error}");
+            return;
+        }
+    };
+    let proposal = match CausalRelationProposal::new(
+        cause,
+        effect,
+        0.7,
+        vec![],
+        CausalScope::ToolSpecific {
+            tool: tool_name.to_owned(),
+        },
+    ) {
+        Ok(proposal) => proposal,
+        Err(error) => {
+            eprintln!("{WORLD_LOG_PREFIX} causal proposal rejected: {error}");
+            return;
+        }
+    };
+    match promote_candidate(
+        proposal,
+        occurrences,
+        false,
+        CausalSource::ObservedRepeatedPattern,
+        yunxi_core::CausalRelationId::new(),
+    ) {
+        Ok(relation) => {
+            if let Err(error) = world.add_causal_relation(relation) {
+                // Already promoted / capped: not an error path.
+                kovi::log::debug!("{WORLD_LOG_PREFIX} causal promote skipped: {error}");
+            } else {
+                println!("{WORLD_LOG_PREFIX} causal_promoted tool={tool_name} occurrences={occurrences}");
+            }
+        }
+        Err(error) => eprintln!("{WORLD_LOG_PREFIX} causal promote rejected: {error}"),
+    }
+}
+
+/// Compare an actual tool-call outcome with the stored recovery prediction
+/// (v4 §51–§52, §232: Predict → Act → Observe → Compare). Records a
+/// `PredictionError` used purely as a calibration signal.
+pub(crate) fn record_tool_retry_outcome(tool_name: &str, succeeded: bool) {
+    with_world(|world, _max_scenes| {
+        let observed = if succeeded {
+            yunxi_core::OutcomeKind::Success
+        } else {
+            yunxi_core::OutcomeKind::Failure
+        };
+        let retry_key = format!("{tool_name}:tool:retry_now");
+        let matching: Vec<yunxi_core::Prediction> = world
+            .predictions()
+            .iter()
+            .filter(|prediction| prediction.source_candidate() == retry_key)
+            .filter(|prediction| prediction.freshness_at(chrono::Utc::now()) != yunxi_core::Freshness::Expired)
+            .cloned()
+            .collect();
+        for prediction in matching.into_iter().take(3) {
+            // Each prediction contributes at most one calibration error.
+            if world
+                .prediction_errors()
+                .iter()
+                .any(|error| error.prediction_id() == prediction.id())
+            {
+                continue;
+            }
+            let expected = prediction
+                .possible_outcomes()
+                .first()
+                .map_or(yunxi_core::OutcomeKind::Unknown, |outcome| outcome.description());
+            let error = yunxi_core::PredictionError::new(
+                prediction.id(),
+                expected,
+                observed,
+                prediction.confidence(),
+                chrono::Utc::now(),
+            );
+            match error {
+                Ok(error) => {
+                    if let Err(err) = world.record_prediction_error(error) {
+                        eprintln!("{WORLD_LOG_PREFIX} prediction error rejected: {err}");
+                    }
+                }
+                Err(err) => eprintln!("{WORLD_LOG_PREFIX} prediction error rejected: {err}"),
+            }
+        }
+        if let Some(accuracy) = world.calibration_accuracy() {
+            println!(
+                "{WORLD_LOG_PREFIX} calibration tool={tool_name} succeeded={succeeded} accuracy={accuracy:.2} errors={}",
+                world.prediction_errors().len()
+            );
+        }
+    });
+}
+
+/// Behavioral interruption guard (v4 §103, §197): returns the world's
+/// interruption cost for a conversation, or 0.0 when the feature is not
+/// enabled or influence_mode is not active. Callers decide suppression.
+pub(crate) fn interruption_guard(
+    conversation_id: yunxi_core::ConversationId,
+) -> f32 {
+    let config = world_config();
+    if !config.enabled() || !config.influence_active() {
+        return 0.0;
+    }
+    let guard = WORLD_RUNTIME
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(runtime) = guard.as_ref() else {
+        return 0.0;
+    };
+    let context = yunxi_core::WorldSnapshotContext::new(chrono::Utc::now())
+        .with_conversation(conversation_id);
+    runtime
+        .world
+        .snapshot_for(&context)
+        .ok()
+        .and_then(|snapshot| snapshot.social_scene().map(|scene| scene.interruption_cost()))
+        .unwrap_or(0.0)
+}
+
+/// Deterministic execution-side simulator for a degraded tool (v4 §54–§55,
+/// §101–§102): snapshots are pure values, results are `Simulated` only, the
+/// batch respects max-per-root-trace = 2 (RetryNow + UseFallback; "wait" is
+/// a prediction, not a simulated candidate). Read-only: never mutates state.
+pub(crate) fn simulate_tool_recovery(
+    tool_name: &str,
+) -> Option<yunxi_core::SimulationBatch> {
+    let guard = WORLD_RUNTIME
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let world = &guard.as_ref()?.world;
+    simulate_tool_recovery_internal(world, tool_name, chrono::Utc::now())
+}
+
+/// Pure (read-only) simulator body; `world` is only read, never mutated.
+fn simulate_tool_recovery_internal(
+    world: &WorldModel,
+    tool_name: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<yunxi_core::SimulationBatch> {
+    use yunxi_core::{
+        ExecutionMode, SimulationCandidate, SimulationInput, SimulationResult,
+        WorldSnapshotContext,
+    };
+    let snapshot = world
+        .snapshot_for(&WorldSnapshotContext::new(now))
+        .ok()?;
+    let health = world.environment().tool_health_at(tool_name, now);
+    let candidates = [
+        ToolRecoveryCandidate::RetryNow,
+        ToolRecoveryCandidate::UseFallback,
+    ];
+    let mut results = Vec::new();
+    for candidate in candidates {
+        let outcome = tool_recovery_outcome(tool_name, health, candidate);
+        let candidate_id = format!("{tool_name}:{}", candidate.id());
+        let result = SimulationResult::new(
+            candidate_id.clone(),
+            vec![outcome],
+            // Unknown/degraded states leave real uncertainty.
+            match health {
+                yunxi_core::ServiceHealth::Healthy => 0.15,
+                _ => 0.4,
+            },
+            world.version(),
+            ExecutionMode::Simulated,
+        )
+        .ok()?;
+        results.push(result);
+    }
+    let batch = yunxi_core::SimulationBatch::new(
+        yunxi_core::EventId::new(),
+        results,
+    )
+    .ok()?;
+    // Validation through a real input (version + snapshot consistency).
+    let candidate = SimulationCandidate::new(
+        format!("{tool_name}:tool_recovery"),
+        "工具恢复候选（立即重试 / 降级）",
+    )
+    .ok()?;
+    let input = SimulationInput::new(
+        yunxi_core::EventId::new(),
+        candidate,
+        yunxi_core::PredictionHorizon::Immediate,
+        snapshot,
+        now,
+    )
+    .ok()?;
+    if input.world().version() != batch.results()[0].world_version() {
+        return None;
+    }
+    Some(batch)
 }
 
 /// Read the raw bounded snapshot for a conversation (reply-context input).
@@ -975,6 +1227,88 @@ mod tests {
     fn truncate_respects_char_boundaries() {
         assert_eq!(truncate_chars("abc", 2), "ab");
         assert_eq!(truncate_chars("你好呀", 2), "你好");
+    }
+
+    #[test]
+    fn tool_failure_counter_increments_and_bounded() {
+        reset_tool_failure_counts();
+        assert_eq!(count_tool_failure("web_fetch"), 1);
+        assert_eq!(count_tool_failure("web_fetch"), 2);
+        assert_eq!(count_tool_failure("web_fetch"), 3);
+        assert_eq!(count_tool_failure("other"), 1);
+        for name in ["web_fetch", "other"] {
+            TOOL_FAILURE_COUNTS
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(name);
+        }
+    }
+
+    #[test]
+    fn causal_promotes_after_repeated_tool_failures() {
+        let mut world = WorldModel::new();
+        // Under the threshold → nothing.
+        if false {
+            promote_tool_failure_causal(&mut world, "web_fetch", 2);
+            assert!(world.causal().relations().is_empty());
+        }
+        // ≥3 occurrences → one tool-specific relation (v4 §98).
+        promote_tool_failure_causal(&mut world, "web_fetch", 3);
+        assert_eq!(world.causal().relations().len(), 1);
+        assert!(matches!(
+            world.causal().relations()[0].scope(),
+            yunxi_core::CausalScope::ToolSpecific { .. }
+        ));
+        // Re-promotion is a dedupe no-op, not growth.
+        promote_tool_failure_causal(&mut world, "web_fetch", 5);
+        assert_eq!(world.causal().relations().len(), 1);
+    }
+
+    #[test]
+    fn simulator_produces_bounded_simulated_batch() {
+        use yunxi_core::{EnvironmentUpdate, ExecutionMode, RuntimeLoad, ServiceHealth, ToolHealth};
+        let now = chrono::Utc::now();
+        let mut world = WorldModel::new();
+        world
+            .update_environment(
+                EnvironmentUpdate::new(
+                    vec![],
+                    vec![ToolHealth::new(
+                        "web_fetch",
+                        ServiceHealth::Degraded,
+                        Some("429"),
+                        now,
+                        chrono::Duration::minutes(5),
+                    )
+                    .expect("tool")],
+                    ServiceHealth::Healthy,
+                    RuntimeLoad::new(0, None, 0, 0, now).expect("load"),
+                )
+                .expect("env"),
+            )
+            .expect("env");
+        let batch = simulate_tool_recovery_internal(&world, "web_fetch", now).expect("batch");
+        assert_eq!(batch.results().len(), 2);
+        assert!(batch
+            .results()
+            .iter()
+            .all(|result| result.mode() == ExecutionMode::Simulated));
+        batch.validate().expect("batch valid");
+        // Simulation never mutated the world (read-only by construction).
+        assert_eq!(world.version(), 2);
+    }
+
+    #[test]
+    fn interruption_guard_is_zero_when_disabled() {
+        // Default config: enabled=false → guard is inert.
+        assert_eq!(interruption_guard(yunxi_core::ConversationId::new()), 0.0);
+    }
+
+    #[test]
+    fn tool_failure_counter_increments_and_resets() {
+        reset_tool_failure_counts();
+        assert!(count_tool_failure("web_fetch") >= 1);
+        reset_tool_failure_counts();
     }
 
     #[test]

@@ -21,6 +21,10 @@ pub struct WorldModelConfig {
     /// (log what would be injected), or "active" (inject bounded world
     /// context into the reply). Active only after shadow review (v4 §217).
     reply_context: String,
+    /// Behavioral influence: "disabled" (default) or "active". When active,
+    /// the world's interruption cost can suppress unaddressed group speech
+    /// (v4 §103, §197). Keep shadow-observed before enabling.
+    influence_mode: String,
     /// TTL (seconds) applied to observations derived from chat world facts.
     observation_ttl_secs: u64,
     /// Maximum distinct conversations with a live social scene.
@@ -37,6 +41,7 @@ impl Default for WorldModelConfig {
             persist: true,
             persist_interval_secs: 30,
             reply_context: "disabled".to_owned(),
+            influence_mode: "disabled".to_owned(),
             observation_ttl_secs: 60 * 60 * 24,
             max_social_scenes: 256,
             activity_window_secs: 60,
@@ -65,6 +70,10 @@ impl WorldModelConfig {
         anyhow::ensure!(
             matches!(self.reply_context.as_str(), "disabled" | "shadow" | "active"),
             "world_model.reply_context 必须是 disabled / shadow / active"
+        );
+        anyhow::ensure!(
+            matches!(self.influence_mode.as_str(), "disabled" | "active"),
+            "world_model.influence_mode 必须是 disabled / active"
         );
         Ok(())
     }
@@ -96,6 +105,11 @@ impl WorldModelConfig {
 
     pub fn reply_context_shadow(&self) -> bool {
         self.reply_context == "shadow"
+    }
+
+    /// Behavioral influence is active (v4 §103/§197 gating).
+    pub fn influence_active(&self) -> bool {
+        self.influence_mode == "active"
     }
 
     pub fn observation_ttl_secs(&self) -> u64 {
