@@ -227,6 +227,26 @@ fn scenario_b_reliable_counter_evidence_can_reduce_belief_confidence() {
 }
 
 #[test]
+fn self_model_consolidation_advances_version_and_settles_without_unbundling() {
+    let now = Utc::now();
+    let base = SelfModel::seed_yunxi(now);
+    let consolidated = base
+        .with_consolidated(now + chrono::Duration::days(30), 1.0)
+        .expect("consolidated self model stays valid");
+    assert_eq!(consolidated.version(), base.version() + 1);
+    // Trait stability settles upward (persona becomes more settled), strength
+    // stays anchored, and the count/set of traits is preserved.
+    assert_eq!(consolidated.traits().len(), base.traits().len());
+    for (before, after) in base.traits().iter().zip(consolidated.traits()) {
+        assert_eq!(before.strength(), after.strength());
+        assert!(after.stability() >= before.stability());
+    }
+    // Values crystallise slightly but stay within bounds.
+    assert!(consolidated.values().honesty() >= base.values().honesty());
+    assert!(consolidated.values().honesty() <= 1.0);
+}
+
+#[test]
 fn scenario_c_self_model_without_belief_or_preference_does_not_invent_an_opinion() {
     let snapshot = active_snapshot(&[], &[], &[], &[], &[]);
     let projection = projected(

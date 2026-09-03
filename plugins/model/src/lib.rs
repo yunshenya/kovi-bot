@@ -468,10 +468,23 @@ async fn main() {
             }
             let group_decision = bridge.classify_group(&event);
             if group_decision.handling == yunxi::bridge::GroupCoreHandling::Observe {
+                // Un-addressed group text is observed AND may occasionally be
+                // answered by the host's group_interjection sampler. Routing it
+                // through the host handler (rather than only the Core
+                // observe-only channel) is what lets the low-frequency
+                // interjection path run — previously that path was skipped, so
+                // she never replied unless @-ed.
+                let admission = ConversationCoordinator::begin_incoming(
+                    crate::model::ReplyScope::Group(group_id),
+                )
+                .await;
                 if !bridge.is_user_blocked(event.user_id) {
-                    // No reply admission exists for this background turn.
+                    // Preserve the Host-era observation contract (used by agent
+                    // tasks) and let the interjection sampler run.
                     let _ = bridge.enqueue_group_observation(&ingress_event);
+                    group_message_event_after_ingress(event, bot, admission).await;
                 }
+                ConversationCoordinator::abandon_incoming(admission).await;
                 return;
             }
             let core_supports_event =

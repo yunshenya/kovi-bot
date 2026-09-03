@@ -92,14 +92,14 @@ pub use intent::{CognitiveIntent, IntentValidationError, ToolNotificationPolicy}
 pub use memory::{
     MAX_MEMORY_CONTENT_BYTES, MAX_MEMORY_CONTENT_CHARS, MAX_MEMORY_QUERY_BYTES,
     MAX_MEMORY_TAG_BYTES, MAX_MEMORY_TAGS, Memory, MemoryDraft, MemoryKind, MemoryQuery,
-    MemoryScope, MemoryValidationError,
+    MemoryScope, MemoryValidationError, world_fact_draft,
 };
 pub use mind::*;
 pub use model::*;
 pub use open_loop::{
     MAX_OPEN_LOOP_DEDUPE_KEY_BYTES, MAX_OPEN_LOOP_SALIENCE, MAX_OPEN_LOOP_SUMMARY_BYTES,
     MAX_OPEN_LOOP_SUMMARY_CHARS, OpenLoop, OpenLoopDraft, OpenLoopKind, OpenLoopOwner,
-    OpenLoopStatus, OpenLoopValidationError,
+    OpenLoopStatus, OpenLoopValidationError, world_loop_draft,
 };
 pub use planner::{
     AffectState, ConversationTurnDirective, DecisionDisposition, DecisionPlan,

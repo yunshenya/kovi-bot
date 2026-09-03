@@ -465,6 +465,22 @@ where
     Ok(result)
 }
 
+/// Build a bounded, durable "world fact" memory draft. This is the
+/// platform-neutral way for any host (QQ, desktop, CLI) to teach the core a
+/// durable, retrievable fact about the owner's world (a project, a task, a
+/// build state, a recurring thing) that the core recalls and injects like any
+/// other memory, rather than only being derived from chat. Content is bounded
+/// and importance is clamped.
+pub fn world_fact_draft(
+    scope: MemoryScope,
+    summary: &str,
+    importance: u8,
+    occurred_at: DateTime<Utc>,
+) -> Result<MemoryDraft, MemoryValidationError> {
+    let draft = MemoryDraft::new(scope, MemoryKind::Fact, summary, occurred_at)?;
+    draft.with_importance(importance.clamp(0, 100))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -494,5 +510,22 @@ mod tests {
             Utc::now().to_rfc3339()
         );
         assert!(serde_json::from_str::<MemoryDraft>(&encoded).is_err());
+    }
+
+    #[test]
+    fn world_fact_draft_is_bounded_and_clamps_importance() {
+        let draft = world_fact_draft(
+            MemoryScope::Global,
+            "kovi-bot 构建在 main 上通过",
+            200,
+            Utc::now(),
+        )
+        .expect("world fact draft is valid");
+        assert_eq!(draft.kind(), MemoryKind::Fact);
+        assert_eq!(draft.importance(), 100);
+        assert_eq!(draft.scope(), MemoryScope::Global);
+        // An over-long summary is rejected at the boundary.
+        let too_long = "x".repeat(MAX_MEMORY_CONTENT_CHARS + 1);
+        assert!(world_fact_draft(MemoryScope::Global, &too_long, 80, Utc::now()).is_err());
     }
 }

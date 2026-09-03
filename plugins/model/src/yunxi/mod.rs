@@ -43,7 +43,8 @@ use std::sync::{
 };
 use std::time::Duration;
 use yunxi_core::{
-    AffectState, ConversationId, IdentityStore, MindDataErasure, PersonId, RelationState,
+    AffectState, ConversationId, IdentityStore, MemoryStore, MindDataErasure, OpenLoopStore,
+    PersonId, RelationState,
 };
 
 const MIND_ERASURE_MAX_ATTEMPTS: usize = 3;
@@ -354,6 +355,48 @@ pub(crate) fn open_loop_store() -> Option<Arc<PostgresOpenLoopStore>> {
 #[allow(dead_code)]
 pub(crate) fn memory_store() -> Option<Arc<PostgresMemoryStore>> {
     MEMORY_STORE.get().cloned()
+}
+
+/// Record a bounded, durable "world fact" about the owner-world (a project, a
+/// task, a build state, a recurring thing) as a retrievable memory, so the core
+/// learns about your life the same way it learns from chat. When `watch` is
+/// true it also creates a bounded, low-salience follow-up open loop so the
+/// proactive system may later surface it ("your build recovered"). The summary
+/// is bounded and importance is clamped. Returns the new memory id.
+#[allow(dead_code)]
+pub(crate) async fn observe_world_fact(
+    scope: yunxi_core::MemoryScope,
+    summary: &str,
+    importance: u8,
+    watch: bool,
+) -> anyhow::Result<yunxi_core::MemoryId> {
+    let Some(store) = memory_store() else {
+        anyhow::bail!("memory store is unavailable");
+    };
+    let draft = yunxi_core::world_fact_draft(scope, summary, importance, chrono::Utc::now())?;
+    let memory = store.remember(&draft).await?;
+    if watch && let Some(open_loops) = open_loop_store() {
+        let owner = match scope {
+            yunxi_core::MemoryScope::Person(person_id) => {
+                yunxi_core::OpenLoopOwner::Person(person_id)
+            }
+            yunxi_core::MemoryScope::Conversation(conversation_id) => {
+                yunxi_core::OpenLoopOwner::Conversation(conversation_id)
+            }
+            yunxi_core::MemoryScope::Global => yunxi_core::OpenLoopOwner::Global,
+        };
+        let now = chrono::Utc::now();
+        let open_loop = yunxi_core::world_loop_draft(
+            owner,
+            summary,
+            40,
+            Some(now),
+            &format!("world:{}", memory.id()),
+        )?
+        .with_expires_at(Some(now + chrono::Duration::days(1)));
+        open_loops.create(&open_loop).await?;
+    }
+    Ok(memory.id())
 }
 
 #[allow(dead_code)]

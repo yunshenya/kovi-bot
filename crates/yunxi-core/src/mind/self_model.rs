@@ -290,6 +290,53 @@ impl SelfModel {
         .expect("the built-in Yunxi self model is valid")
     }
 
+    /// Produce a bounded, versioned consolidation of the self model after a
+    /// batch of accumulated experience. Trait stability drifts slowly upward
+    /// (the persona "settles" like a real self), value convictions crystallise a
+    /// little, and the version advances. The deltas are small, clamped, and
+    /// never destabilise the anchored trait strength, so the persona stays
+    /// coherent while no longer being frozen.
+    pub fn with_consolidated(
+        &self,
+        now: DateTime<Utc>,
+        consolidation_weight: f32,
+    ) -> Result<SelfModel, MindValidationError> {
+        let weight = consolidation_weight.clamp(0.0, 1.0);
+        let traits = self
+            .traits
+            .iter()
+            .map(|trait_item| {
+                SelfTrait::new(
+                    trait_item.name,
+                    trait_item.strength,
+                    (trait_item.stability + 0.012 * weight).clamp(0.0, 1.0),
+                )
+                .expect("consolidated trait stays bounded")
+            })
+            .collect::<Vec<_>>();
+        let values = ValueProfile::new(
+            (self.values.honesty() + 0.004 * weight).clamp(0.0, 1.0),
+            (self.values.curiosity() + 0.004 * weight).clamp(0.0, 1.0),
+            (self.values.kindness() + 0.004 * weight).clamp(0.0, 1.0),
+            self.values.independence(),
+            self.values.playfulness(),
+        )?;
+        Self::new(
+            self.identity.clone(),
+            traits,
+            values,
+            self.limitations.clone(),
+            self.long_term_goals.clone(),
+            self.source,
+            now,
+            self.version
+                .checked_add(1)
+                .ok_or(MindValidationError::InvalidProposal {
+                    reason: "self model version exhausted",
+                })?,
+        )
+    }
+
     pub fn validate(&self) -> Result<(), MindValidationError> {
         self.identity.validate()?;
         self.values.validate()?;

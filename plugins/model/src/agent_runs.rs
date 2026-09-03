@@ -492,6 +492,16 @@ async fn begin_notification(
     final_result: Value,
 ) -> Result<()> {
     let content = terminal_notification_content(run, outcome);
+    // Feed the core a durable world fact so it remembers this monitored
+    // outcome (the URL/condition the owner set up), even though the QQ
+    // notification below is the immediate user-facing alert. This turns an
+    // existing world-monitoring watcher into a source of durable core world
+    // awareness.
+    if let Err(error) =
+        crate::yunxi::observe_world_fact(yunxi_core::MemoryScope::Global, &content, 60, false).await
+    {
+        kovi::log::warn!("Agent Run world fact feed failed: {error}");
+    }
     let delivery_key = notification_delivery_key(run.id);
     let notification_action = Arc::new(kovi::tokio::sync::Mutex::new(None));
     let action_slot = Arc::clone(&notification_action);

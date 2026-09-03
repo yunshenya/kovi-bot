@@ -2063,6 +2063,11 @@ impl MindRuntime {
                     .await?;
             }
         }
+        // After a real batch of experience, let the self model consolidate
+        // (settle) so it is no longer a frozen, never-updated biography.
+        if should_create_episode {
+            self.consolidate_self_model(&input).await?;
+        }
         self.metrics.reflections.fetch_add(1, Ordering::Relaxed);
         self.metrics
             .last_reflection_unix_ms
@@ -2083,6 +2088,37 @@ impl MindRuntime {
             input.goal_summaries.len(),
             proposal.episodes.len(),
         );
+        Ok(())
+    }
+
+    /// Advance the (global) self model after a real batch of observed
+    /// experience, applying a small bounded, versioned consolidation. This keeps
+    /// the persona anchored but no longer frozen: it settles a little each time
+    /// reflection sees meaningful events.
+    async fn consolidate_self_model(&self, input: &ReflectionInput) -> anyhow::Result<()> {
+        let Some(current) = self.services.self_model.get().await? else {
+            return Ok(());
+        };
+        let weight = (input.recent_events.len() as f32 / 8.0).clamp(0.0, 1.0);
+        let consolidated = current.with_consolidated(input.requested_at, weight)?;
+        match self
+            .services
+            .self_model
+            .put(&consolidated, Some(current.version()))
+            .await
+        {
+            Ok(_) => kovi::log::info!(
+                "Yunxi Mind self model consolidated: events={} version={}->{}",
+                input.recent_events.len(),
+                current.version(),
+                consolidated.version(),
+            ),
+            Err(error) => {
+                // Optimistic concurrency: another reflection advanced the self
+                // model first; a later reflection consolidates again.
+                kovi::log::debug!("Yunxi Mind self model consolidation skipped: {error}");
+            }
+        }
         Ok(())
     }
 

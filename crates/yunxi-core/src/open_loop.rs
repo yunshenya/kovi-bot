@@ -682,11 +682,53 @@ fn validate_dedupe_key(value: String) -> Result<String, OpenLoopValidationError>
     Ok(value)
 }
 
+/// Build a bounded, low-salience "world follow-up" open loop. Hosts use this
+/// so a durable fact about the owner-world (a project, a task, a build state)
+/// can later surface as a proactive reach-out — the scheduler picks up due
+/// follow-ups and turns them into an opportunity to say something useful. The
+/// summary is bounded, salience is clamped, and a dedupe key keeps repeats from
+/// piling up the same loop.
+pub fn world_loop_draft(
+    owner: OpenLoopOwner,
+    summary: &str,
+    salience: u8,
+    due_at: Option<DateTime<Utc>>,
+    dedupe_key: &str,
+) -> Result<OpenLoopDraft, OpenLoopValidationError> {
+    OpenLoopDraft::new(owner, OpenLoopKind::FollowUp, summary)?
+        .with_salience(salience.clamp(1, MAX_OPEN_LOOP_SALIENCE))?
+        .with_due_at(due_at)
+        .with_dedupe_key(Some(dedupe_key.to_owned()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{ConversationId, PersonId};
     use chrono::{Duration, Utc};
+
+    #[test]
+    fn world_loop_draft_is_bounded_dedupable_and_low_salience() {
+        let now = Utc::now();
+        let loop_draft = world_loop_draft(
+            OpenLoopOwner::Person(PersonId::new()),
+            "kovi-bot 构建在 main 上通过",
+            200,
+            Some(now + Duration::hours(1)),
+            "world:build:kovi-bot:main",
+        )
+        .expect("world loop draft is valid");
+        assert_eq!(loop_draft.kind(), OpenLoopKind::FollowUp);
+        // Salience is clamped into the valid range.
+        assert_eq!(loop_draft.salience(), MAX_OPEN_LOOP_SALIENCE);
+        assert_eq!(loop_draft.dedupe_key(), Some("world:build:kovi-bot:main"));
+        // An over-long summary is rejected.
+        let too_long = "x".repeat(MAX_OPEN_LOOP_SUMMARY_CHARS + 1);
+        assert!(
+            world_loop_draft(OpenLoopOwner::Global, &too_long, 50, None, "world:too-long",)
+                .is_err()
+        );
+    }
 
     #[test]
     fn draft_bounds_and_expiry_are_validated() {

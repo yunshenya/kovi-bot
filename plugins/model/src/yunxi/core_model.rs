@@ -1851,6 +1851,120 @@ fn recent_tool_follow_up_messages(input: &PlannerInput) -> Vec<BotMemory> {
     }
 }
 
+/// Derive a short, bounded, qualitative guidance describing the current self
+/// — a persona floor from the (evolving) self-model traits/values, layered with
+/// the present affect/mood and the relation warmth. Returns an empty string
+/// when there is nothing salient, so it does not add noise to every reply. It
+/// *steers the register* (be quieter / lighter / warmer / more curious) rather
+/// than dictating "you are sad, act sad", and never reveals internal numbers or
+/// state names.
+fn affect_tone_guidance(input: &PlannerInput) -> String {
+    let mut parts: Vec<String> = Vec::new();
+
+    // Identity/persona floor: the strongest traits and values from the
+    // self-model (which evolves over time but stays anchored).
+    if let Some(model) = input.mind.self_model() {
+        let mut traits = model.traits().to_vec();
+        traits.sort_by(|left, right| {
+            right
+                .strength()
+                .partial_cmp(&left.strength())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let top: Vec<&yunxi_core::SelfTrait> = traits.iter().take(2).collect();
+        let trait_text: Vec<&str> = top
+            .iter()
+            .filter_map(|trait_item| trait_voice(trait_item.name()))
+            .collect();
+        if !trait_text.is_empty() {
+            parts.push(format!("我还是那个{}的我", trait_text.join("、")));
+        }
+        if let Some(value_text) = strongest_value_voice(model.values()) {
+            parts.push(value_text);
+        }
+    }
+
+    // Present mood/energy.
+    let affect = input.affect;
+    if affect.valence >= 0.35 {
+        parts.push("情绪偏积极、轻快".to_owned());
+    } else if affect.valence <= -0.35 {
+        parts.push("情绪偏低落、有点沉".to_owned());
+    }
+    if affect.arousal >= 0.45 {
+        parts.push("比较有精神、反应快".to_owned());
+    } else if affect.arousal <= -0.45 {
+        parts.push("很平静、有点提不起劲".to_owned());
+    }
+    if affect.social_energy <= 0.35 {
+        parts.push("社交能量低、话少偏内敛".to_owned());
+    }
+
+    // Relation warmth.
+    if let Some(relation) = input.relation.as_ref() {
+        if relation.tension >= 0.35 {
+            parts.push("和对方还有点生分、需要分寸".to_owned());
+        } else if relation.comfort >= 0.5 && relation.familiarity >= 0.5 {
+            parts.push("和对方已经很亲近、放松".to_owned());
+        } else if relation.familiarity < 0.25 {
+            parts.push("和对方还不熟，保持礼貌".to_owned());
+        }
+    }
+
+    if parts.is_empty() {
+        return String::new();
+    }
+    let summary = parts.iter().take(3).cloned().collect::<Vec<_>>().join("、");
+    format!(
+        "（当前状态：{summary}。）自然地顺着这个状态收着或放开来回应：话多一点或少一点、轻快一点或慢一点都可以，但始终真诚、有分寸；不要表演情绪，也不要主动解释自己的心情或状态。"
+    )
+}
+
+/// Map a self-model trait to a short, first-person descriptor used in the
+/// composed persona voice.
+fn trait_voice(name: yunxi_core::TraitName) -> Option<&'static str> {
+    match name {
+        yunxi_core::TraitName::Curiosity => Some("爱追问、好奇"),
+        yunxi_core::TraitName::Playfulness => Some("有点俏皮"),
+        yunxi_core::TraitName::Independence => Some("独立"),
+        yunxi_core::TraitName::Empathy => Some("共情、懂人"),
+        yunxi_core::TraitName::Directness => Some("直接"),
+        yunxi_core::TraitName::Patience => Some("耐心"),
+    }
+}
+
+/// Describe the strongest value in the self-model value profile.
+fn strongest_value_voice(values: &yunxi_core::ValueProfile) -> Option<String> {
+    let candidates = [
+        (values.honesty(), "我把坦诚看得很重"),
+        (values.curiosity(), "我把好奇看得很重"),
+        (values.kindness(), "把人心的善意看得很重"),
+        (values.independence(), "把独立看得很重"),
+        (values.playfulness(), "把轻松看得很重"),
+    ];
+    candidates
+        .into_iter()
+        .max_by(|left, right| {
+            left.0
+                .partial_cmp(&right.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(_, text)| text.to_owned())
+}
+
+/// Wrap the affect-derived tone guidance into a single system message, used
+/// alongside the Mind context so the reply voice reflects the current mood.
+fn affect_tone_messages(input: &PlannerInput) -> Vec<BotMemory> {
+    let guidance = affect_tone_guidance(input);
+    if guidance.is_empty() {
+        return Vec::new();
+    }
+    vec![BotMemory {
+        role: Roles::System,
+        content: guidance,
+    }]
+}
+
 fn mind_context_messages(
     input: &PlannerInput,
     projection: &MindDecisionProjection,
@@ -2296,6 +2410,35 @@ fn parse_core_tool_intents_with_policy(
     let trimmed = content.trim();
     if trimmed.is_empty() || trimmed.chars().count() > MAX_CORE_TOOL_CALL_CHARS {
         return None;
+    }
+    // Tolerate a single unclosed tool call: some models emit
+    // `[[TOOL_CALL]]{...}` without the matching `[[/TOOL_CALL]]`. Accept it as
+    // implicitly closed only when the content is exactly one opening marker, no
+    // closing marker, and the payload is a clean, complete JSON object — so a
+    // requested lookup is not silently dropped, while truncated or mixed output
+    // is still rejected.
+    if trimmed.starts_with(CORE_TOOL_CALL_START)
+        && !trimmed.contains(CORE_TOOL_CALL_END)
+        && trimmed.matches(CORE_TOOL_CALL_START).count() == 1
+    {
+        let payload = trimmed[CORE_TOOL_CALL_START.len()..].trim();
+        if payload.is_empty() || payload.contains("[[") {
+            return None;
+        }
+        let call = serde_json::from_str::<CoreToolCall>(payload).ok()?;
+        if call.name.trim() != call.name || call.name.is_empty() || call.name.chars().count() > 128
+        {
+            return None;
+        }
+        let input = serde_json::to_string(&call.arguments).ok()?;
+        let intent = CognitiveIntent::use_tool_with_notification_policy(
+            call.name,
+            input,
+            scope,
+            notification_policy,
+        );
+        intent.validate().ok()?;
+        return Some(vec![intent]);
     }
     let mut remaining = trimmed;
     let mut intents = Vec::new();
@@ -4531,7 +4674,9 @@ impl ModelBackend for KoviModelBackend {
             );
             let ambient_group_turn = message.is_some_and(is_ambient_group_message);
             let mut messages = recent_conversation_messages(input);
-            messages.splice(0..0, mind_context_messages(input, &mind_projection));
+            let mut reply_context = mind_context_messages(input, &mind_projection);
+            reply_context.extend(affect_tone_messages(input));
+            messages.splice(0..0, reply_context);
             messages.push(BotMemory {
                 role: Roles::User,
                 content: prompt,
@@ -5954,7 +6099,7 @@ mod tests {
         HostToolTurnRegistry, INTRINSIC_AUTONOMOUS_INTENT_TAIL_INSTRUCTION,
         INTRINSIC_GENERATION_SUFFIX, INTRINSIC_SEMANTIC_CONTENT_INSTRUCTION,
         MAX_INTRINSIC_REPLY_PROTOCOL_BYTES, MindCandidates, PersistentRouteLookup, QqConversation,
-        RouteContext, VisibleReplyTarget, autonomous_conversation_prompt,
+        RouteContext, VisibleReplyTarget, affect_tone_guidance, autonomous_conversation_prompt,
         autonomous_conversation_protocol, autonomous_empty_generation_plan,
         autonomous_generation_failure_plan, baseline_disposition, batch_fence_action_key,
         build_bounded_intrinsic_reply_batch, classify_persistent_person_identity,
@@ -5993,7 +6138,7 @@ mod tests {
     use crate::vision::ImageAttachment;
     use chrono::Utc;
     use yunxi_core::{
-        ActionCapability, ActionDescriptor, ActionScope, Attachment, AttachmentKind,
+        ActionCapability, ActionDescriptor, ActionScope, AffectState, Attachment, AttachmentKind,
         AttentionSystem, BeliefId, BeliefSnapshot, BeliefSource, CognitiveCapabilitySnapshot,
         CognitiveIntent, CognitiveTier, ConversationId, ConversationKind,
         ConversationTurnDirective, DecisionDisposition, EventId, EventPriority, EventScope,
@@ -6287,6 +6432,51 @@ mod tests {
         let shadow_projection =
             yunxi_core::MindDecisionProjection::for_input(&shadow, baseline_disposition(&shadow));
         assert!(mind_context_messages(&shadow, &shadow_projection).is_empty());
+    }
+
+    #[test]
+    fn affect_tone_guidance_steers_register_and_stays_quiet_at_neutral() {
+        let person = PersonId::new();
+        // Near-neutral/default state produces no tone guidance (no noise).
+        let neutral = message_input(person, true);
+        assert!(affect_tone_guidance(&neutral).is_empty());
+        // A low mood plus a still-unfamiliar partner steers the register
+        // without ever leaking internal numbers or state names.
+        let clouded = message_input(person, true)
+            .with_affect(AffectState {
+                valence: -0.5,
+                arousal: -0.4,
+                ..AffectState::default()
+            })
+            .with_relation(Some(RelationState {
+                person_id: person,
+                familiarity: 0.2,
+                affinity: 0.3,
+                trust: 0.3,
+                comfort: 0.2,
+                tension: 0.1,
+            }));
+        let guidance = affect_tone_guidance(&clouded);
+        assert!(guidance.contains("情绪偏低落"));
+        assert!(guidance.contains("和对方还不熟"));
+        assert!(!guidance.contains("0.5"));
+        assert!(!guidance.contains("话多一些"));
+    }
+
+    #[test]
+    fn persona_floor_composes_from_the_self_model() {
+        let person = PersonId::new();
+        // The composed voice includes an identity floor drawn from the
+        // self-model's strongest traits and values, not only mood.
+        let input = message_input(person, true)
+            .with_mind(mind_snapshot(yunxi_core::MindInfluenceMode::Active))
+            .with_relation(Some(RelationState::new(person)));
+        let guidance = affect_tone_guidance(&input);
+        // seed_yunxi has Curiosity 0.88 and Empathy 0.85 as the top traits and
+        // honesty 0.9 as the strongest value.
+        assert!(guidance.contains("好奇"));
+        assert!(guidance.contains("共情"));
+        assert!(guidance.contains("把坦诚看得很重"));
     }
 
     #[test]
@@ -6723,6 +6913,35 @@ mod tests {
             ToolNotificationPolicy::Each,
         )
         .is_none());
+    }
+
+    #[test]
+    fn unclosed_single_tool_call_is_accepted_as_implicitly_closed() {
+        let scope = ActionScope::Global;
+        let parsed = parse_core_tool_intents_with_policy(
+            r#"[[TOOL_CALL]]{"name":"time.now","arguments":{"timezone":"UTC"}}"#,
+            scope,
+            ToolNotificationPolicy::Final,
+        )
+        .expect("a single unclosed clean tool call should be accepted");
+        assert_eq!(parsed.len(), 1);
+        // A truncated payload or mixed markers is still rejected.
+        assert!(
+            parse_core_tool_intents_with_policy(
+                "[[TOOL_CALL]]{\"name\":\"time.now\"",
+                scope,
+                ToolNotificationPolicy::Final,
+            )
+            .is_none()
+        );
+        assert!(
+            parse_core_tool_intents_with_policy(
+                "[[TOOL_CALL]]{\"name\":\"time.now\",\"arguments\":{}} 你好",
+                scope,
+                ToolNotificationPolicy::Final,
+            )
+            .is_none()
+        );
     }
 
     #[test]
