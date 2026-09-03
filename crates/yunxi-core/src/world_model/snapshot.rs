@@ -22,6 +22,7 @@ pub struct WorldSnapshotLimits {
     entities: usize,
     situations: usize,
     hypotheses: usize,
+    causal: usize,
     temporal: usize,
     uncertainties: usize,
 }
@@ -32,6 +33,7 @@ impl Default for WorldSnapshotLimits {
             entities: limits::MAX_ENTITIES_PER_SNAPSHOT,
             situations: limits::MAX_SITUATIONS_PER_SNAPSHOT,
             hypotheses: limits::MAX_HYPOTHESES_PER_SNAPSHOT,
+            causal: limits::MAX_CAUSAL_PER_SNAPSHOT,
             temporal: limits::MAX_TEMPORAL_PER_SNAPSHOT,
             uncertainties: limits::MAX_UNCERTAINTIES_PER_SNAPSHOT,
         }
@@ -43,6 +45,7 @@ impl WorldSnapshotLimits {
         entities: usize,
         situations: usize,
         hypotheses: usize,
+        causal: usize,
         temporal: usize,
         uncertainties: usize,
     ) -> Result<Self, WorldValidationError> {
@@ -50,6 +53,7 @@ impl WorldSnapshotLimits {
             entities,
             situations,
             hypotheses,
+            causal,
             temporal,
             uncertainties,
         };
@@ -70,6 +74,7 @@ impl WorldSnapshotLimits {
                 self.hypotheses,
                 limits::MAX_HYPOTHESES_PER_SNAPSHOT,
             ),
+            ("snapshot causal", self.causal, limits::MAX_CAUSAL_PER_SNAPSHOT),
             ("snapshot temporal", self.temporal, limits::MAX_TEMPORAL_PER_SNAPSHOT),
             (
                 "snapshot uncertainties",
@@ -101,6 +106,11 @@ impl WorldSnapshotLimits {
     #[must_use]
     pub const fn hypotheses(&self) -> usize {
         self.hypotheses
+    }
+
+    #[must_use]
+    pub const fn causal(&self) -> usize {
+        self.causal
     }
 
     #[must_use]
@@ -857,12 +867,87 @@ impl WorldUncertaintySnapshot {
     }
 }
 
+/// Bounded causal relation view for a decision (v4 §64–§65).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CausalRelationSnapshot {
+    id: super::CausalRelationId,
+    cause_kind: super::causal::PatternKind,
+    cause_label: String,
+    effect_kind: super::causal::PatternKind,
+    effect_label: String,
+    strength: f32,
+    confidence: f32,
+    scope: super::causal::CausalScope,
+}
+
+impl CausalRelationSnapshot {
+    fn from_relation(relation: &super::causal::CausalRelation) -> Self {
+        Self {
+            id: relation.id(),
+            cause_kind: relation.cause().kind(),
+            cause_label: relation.cause().label().to_owned(),
+            effect_kind: relation.effect().kind(),
+            effect_label: relation.effect().label().to_owned(),
+            strength: relation.strength(),
+            confidence: relation.confidence(),
+            scope: relation.scope(),
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), WorldValidationError> {
+        super::common::validate_unit(self.strength, "snapshot causal strength")?;
+        super::common::validate_unit(self.confidence, "snapshot causal confidence")?;
+        Ok(())
+    }
+
+    #[must_use]
+    pub const fn id(&self) -> super::CausalRelationId {
+        self.id
+    }
+
+    #[must_use]
+    pub const fn cause_kind(&self) -> super::causal::PatternKind {
+        self.cause_kind
+    }
+
+    #[must_use]
+    pub fn cause_label(&self) -> &str {
+        &self.cause_label
+    }
+
+    #[must_use]
+    pub const fn effect_kind(&self) -> super::causal::PatternKind {
+        self.effect_kind
+    }
+
+    #[must_use]
+    pub fn effect_label(&self) -> &str {
+        &self.effect_label
+    }
+
+    #[must_use]
+    pub const fn strength(&self) -> f32 {
+        self.strength
+    }
+
+    #[must_use]
+    pub const fn confidence(&self) -> f32 {
+        self.confidence
+    }
+
+    #[must_use]
+    pub fn scope(&self) -> super::causal::CausalScope {
+        self.scope.clone()
+    }
+}
+
 /// The bounded relevance-filtered view handed to the planner/executive.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorldModelSnapshot {
     entities: Vec<EntityStateSnapshot>,
     situations: Vec<SituationSnapshot>,
     hypotheses: Vec<HypothesisSnapshot>,
+    causal: Vec<CausalRelationSnapshot>,
     social_scene: Option<SocialSceneSnapshot>,
     environment: EnvironmentSnapshot,
     temporal: Vec<TemporalSnapshotEntry>,
@@ -894,6 +979,13 @@ impl WorldModelSnapshot {
                 maximum: limits.hypotheses(),
             });
         }
+        if self.causal.len() > limits.causal() {
+            return Err(WorldValidationError::TooManyItems {
+                field: "snapshot causal",
+                length: self.causal.len(),
+                maximum: limits.causal(),
+            });
+        }
         if self.temporal.len() > limits.temporal() {
             return Err(WorldValidationError::TooManyItems {
                 field: "snapshot temporal",
@@ -916,6 +1008,9 @@ impl WorldModelSnapshot {
         }
         for hypothesis in &self.hypotheses {
             hypothesis.validate()?;
+        }
+        for causal in &self.causal {
+            causal.validate()?;
         }
         if let Some(scene) = &self.social_scene {
             scene.validate()?;
@@ -940,6 +1035,11 @@ impl WorldModelSnapshot {
     #[must_use]
     pub fn hypotheses(&self) -> &[HypothesisSnapshot] {
         &self.hypotheses
+    }
+
+    #[must_use]
+    pub fn causal(&self) -> &[CausalRelationSnapshot] {
+        &self.causal
     }
 
     #[must_use]
@@ -1121,10 +1221,21 @@ pub(super) fn build_snapshot(
         .map(|uncertainty| WorldUncertaintySnapshot::from_uncertainty(uncertainty, now))
         .collect();
 
+    // Relevant causal knowledge: high-confidence relations matching scope,
+    // confidence-descending (v4 §64, §136).
+    let person_id = context.person_ids().first().copied();
+    let causal = world
+        .causal()
+        .relevant(person_id, context.conversation_id(), limits.causal())
+        .into_iter()
+        .map(CausalRelationSnapshot::from_relation)
+        .collect();
+
     let snapshot = WorldModelSnapshot {
         entities: entity_snapshots,
         situations: situation_snapshots,
         hypotheses: hypothesis_snapshots,
+        causal,
         social_scene,
         environment,
         temporal: temporal_snapshots,

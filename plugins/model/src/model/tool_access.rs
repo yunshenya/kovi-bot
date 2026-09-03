@@ -1151,6 +1151,13 @@ impl ToolRegistry {
                 }),
             ),
         };
+        // Shadow-mode World Model: mark the tool degraded (TTL 5min), record
+        // the failure observation and deterministic recovery predictions.
+        // Never blocks the tool path (v4 §248).
+        if result.is_err() {
+            let error_text = format!("{result:?}");
+            crate::yunxi::world_model::record_tool_failure(name, "execution_failed", &error_text);
+        }
         if project_legacy_result {
             kovi::tokio::spawn(crate::yunxi::events::project_destination(
                 destination,

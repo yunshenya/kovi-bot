@@ -590,6 +590,149 @@ pub(crate) fn record_collision(conversation_id: yunxi_core::ConversationId) {
     });
 }
 
+/// Tool-recovery candidates for a degraded tool (v4 §102, §196).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToolRecoveryCandidate {
+    RetryNow,
+    Wait,
+    UseFallback,
+}
+
+impl ToolRecoveryCandidate {
+    pub(crate) fn id(self) -> &'static str {
+        match self {
+            Self::RetryNow => "tool:retry_now",
+            Self::Wait => "tool:wait",
+            Self::UseFallback => "tool:fallback",
+        }
+    }
+}
+
+/// Deterministic outcome estimate for one tool-recovery candidate given the
+/// tool's current health (v4 §44, §101–§102). This is domain knowledge, not
+/// psychology; the executive still makes the final call.
+pub(crate) fn tool_recovery_outcome(
+    _tool_name: &str,
+    health: yunxi_core::ServiceHealth,
+    candidate: ToolRecoveryCandidate,
+) -> yunxi_core::PredictedOutcome {
+    use yunxi_core::{OutcomeKind, ServiceHealth};
+    use ToolRecoveryCandidate::*;
+    let probability = match (health, candidate) {
+        // 429 / degraded → immediate retry likely fails again.
+        (ServiceHealth::Degraded, RetryNow) => 0.15,
+        (ServiceHealth::Degraded, Wait) => 0.60,
+        (ServiceHealth::Degraded, UseFallback) => 0.50,
+        (ServiceHealth::Unavailable, RetryNow) => 0.05,
+        (ServiceHealth::Unavailable, Wait) => 0.40,
+        (ServiceHealth::Unavailable, UseFallback) => 0.45,
+        (ServiceHealth::Healthy, RetryNow) => 0.85,
+        (ServiceHealth::Healthy, Wait) => 0.70,
+        (ServiceHealth::Healthy, UseFallback) => 0.70,
+        (ServiceHealth::Unknown, RetryNow) => 0.30,
+        (ServiceHealth::Unknown, Wait) => 0.40,
+        (ServiceHealth::Unknown, UseFallback) => 0.35,
+    };
+    let success = probability >= 0.5;
+    yunxi_core::PredictedOutcome::new(
+        if success { OutcomeKind::Success } else { OutcomeKind::Failure },
+        probability,
+        if success { 0.6 } else { -0.4 },
+        0.05,
+        1.0 - probability,
+        if success { 0.5 } else { 0.0 },
+    )
+    .expect("bounded outcome")
+}
+
+/// Tool failure → world update (v4 §141–§144, §196): mark the tool degraded
+/// with a short TTL, record the failure observation, and record deterministic
+/// shadow predictions for the recovery candidates (what an executive would
+/// compare). Gated by `[world_model].enabled`; never blocks the caller.
+pub(crate) fn record_tool_failure(tool_name: &str, error_category: &str, detail: &str) {
+    record_observation(
+        WorldScope::Global,
+        ObservationKind::ToolResult,
+        ObservationSource::ToolResult,
+        &format!("工具 {tool_name} 调用失败（{error_category}）"),
+        Some(300),
+    );
+    with_world(|world, _max_scenes| {
+        let now = chrono::Utc::now();
+        // 1. Environment: tool degraded for 5 minutes (TTL-aware).
+        let health = match world
+            .environment()
+            .tool_health_at(tool_name, now)
+        {
+            yunxi_core::ServiceHealth::Unavailable => yunxi_core::ServiceHealth::Unavailable,
+            _ => yunxi_core::ServiceHealth::Degraded,
+        };
+        let tool = match yunxi_core::ToolHealth::new(
+            tool_name.to_owned(),
+            health,
+            Some(truncate_chars(detail, 128)),
+            now,
+            chrono::Duration::minutes(5),
+        ) {
+            Ok(tool) => tool,
+            Err(error) => {
+                eprintln!("{WORLD_LOG_PREFIX} tool health rejected: {error}");
+                return;
+            }
+        };
+        let update = match yunxi_core::EnvironmentUpdate::new(
+            vec![],
+            vec![tool],
+            yunxi_core::ServiceHealth::Healthy,
+            world.environment().load(),
+        ) {
+            Ok(update) => update,
+            Err(error) => {
+                eprintln!("{WORLD_LOG_PREFIX} environment update rejected: {error}");
+                return;
+            }
+        };
+        if let Err(error) = world.update_environment(update) {
+            eprintln!("{WORLD_LOG_PREFIX} environment update failed: {error}");
+            return;
+        }
+        // 2. Deterministic shadow predictions for the recovery candidates
+        // (v4 §102: A retry now / B wait / C fallback).
+        for candidate in [
+            ToolRecoveryCandidate::RetryNow,
+            ToolRecoveryCandidate::Wait,
+            ToolRecoveryCandidate::UseFallback,
+        ] {
+            let outcome =
+                tool_recovery_outcome(tool_name, health, candidate);
+            let horizon = yunxi_core::PredictionHorizon::Immediate;
+            let prediction = yunxi_core::Prediction::new(
+                yunxi_core::PredictionId::new(),
+                format!("{tool_name}:{}", candidate.id()),
+                WorldScope::Global,
+                horizon,
+                vec![outcome],
+                0.7,
+                0.7,
+                now,
+                Some(now + chrono::Duration::minutes(5)),
+            );
+            match prediction {
+                Ok(prediction) => {
+                    if let Err(error) = world.record_prediction(prediction) {
+                        eprintln!("{WORLD_LOG_PREFIX} prediction rejected: {error}");
+                    }
+                }
+                Err(error) => eprintln!("{WORLD_LOG_PREFIX} prediction rejected: {error}"),
+            }
+        }
+        println!(
+            "{WORLD_LOG_PREFIX} tool_failure tool={tool_name} env={health:?} version={}",
+            world.version()
+        );
+    });
+}
+
 /// Bounded "what does the world look like right now for this conversation"
 /// soft signal (v4 §231 decision formula input; R4 shadow source).
 #[derive(Debug, Clone, PartialEq)]
@@ -753,6 +896,27 @@ mod tests {
     fn truncate_respects_char_boundaries() {
         assert_eq!(truncate_chars("abc", 2), "ab");
         assert_eq!(truncate_chars("你好呀", 2), "你好");
+    }
+
+    #[test]
+    fn tool_recovery_outcome_is_deterministic_and_banded() {
+        use yunxi_core::{OutcomeKind, ServiceHealth};
+        // Degraded + retry-now → likely fail (Low band).
+        let retry = tool_recovery_outcome("web_fetch", ServiceHealth::Degraded, ToolRecoveryCandidate::RetryNow);
+        assert_eq!(retry.description(), OutcomeKind::Failure);
+        assert_eq!(retry.band(), yunxi_core::ProbabilityBand::Low);
+        // Degraded + fallback → medium success (Medium band).
+        let fallback = tool_recovery_outcome("web_fetch", ServiceHealth::Degraded, ToolRecoveryCandidate::UseFallback);
+        assert_eq!(fallback.description(), OutcomeKind::Success);
+        assert_eq!(fallback.band(), yunxi_core::ProbabilityBand::Medium);
+        // Healthy + retry-now → high success.
+        let healthy = tool_recovery_outcome("web_fetch", ServiceHealth::Healthy, ToolRecoveryCandidate::RetryNow);
+        assert_eq!(healthy.description(), OutcomeKind::Success);
+        assert_eq!(healthy.band(), yunxi_core::ProbabilityBand::High);
+        // Every outcome validates (quantized + band consistent).
+        retry.validate().expect("retry validates");
+        fallback.validate().expect("fallback validates");
+        healthy.validate().expect("healthy validates");
     }
 
     #[test]

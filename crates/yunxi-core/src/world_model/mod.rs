@@ -87,6 +87,7 @@ macro_rules! world_id {
     };
 }
 
+mod causal;
 mod common;
 mod entity;
 mod environment;
@@ -94,12 +95,18 @@ mod hypothesis;
 mod ids;
 mod observation;
 mod prediction;
+mod simulation;
 mod situation;
 mod snapshot;
 mod social_scene;
 mod temporal;
 mod update;
 
+pub use causal::{
+    CausalKnowledge, CausalRelation, CausalRelationProposal, CausalScope, CausalSource,
+    MAX_CAUSAL_CANDIDATES, MAX_CAUSAL_RELATIONS, MIN_EVIDENCE_OCCURRENCES, PatternKind,
+    WorldPattern, occurrences_qualify, promote_candidate,
+};
 pub use common::{
     MAX_EVIDENCE_REFS, MAX_RELATED_IDS, MAX_WORLD_TEXT_BYTES, MAX_WORLD_TEXT_CHARS,
     MAX_WORLD_VALUE_BYTES, MAX_WORLD_VALUE_CHARS, WorldValidationError,
@@ -143,6 +150,12 @@ pub use social_scene::{
     MAX_SCENES_PER_WORLD, SocialSceneKind, SocialSceneState, SocialSceneUpdate,
     floor_interruption_cost,
 };
+pub use simulation::{
+    ExecutionMode, MAX_SIMULATION_CACHE_ENTRIES, MAX_SIMULATION_CANDIDATES,
+    MAX_SIMULATIONS_PER_ROOT_TRACE, SIMULATION_CACHE_TTL_SECS, SimulationBatch,
+    SimulationBudget, SimulationCache, SimulationCacheEntry, SimulationCandidate,
+    SimulationInput, SimulationResult,
+};
 pub use temporal::{
     Freshness, TemporalRelation, TimeInterval, TimelineEntry, TimelineState, WorldRef,
     freshness_at, relation_between,
@@ -152,9 +165,9 @@ pub use update::{
     WorldUpdateProposal, WorldUpdateState,
 };
 pub use snapshot::{
-    EntityStateSnapshot, EnvironmentSnapshot, HypothesisSnapshot, SituationSnapshot,
-    SocialSceneSnapshot, TemporalSnapshotEntry, WorldModelSnapshot, WorldSnapshotContext,
-    WorldSnapshotLimits, WorldUncertaintySnapshot,
+    CausalRelationSnapshot, EntityStateSnapshot, EnvironmentSnapshot, HypothesisSnapshot,
+    SituationSnapshot, SocialSceneSnapshot, TemporalSnapshotEntry, WorldModelSnapshot,
+    WorldSnapshotContext, WorldSnapshotLimits, WorldUncertaintySnapshot,
 };
 
 use crate::{ConversationId, PersonId};
@@ -325,6 +338,8 @@ pub mod limits {
     pub const MAX_SITUATIONS_PER_SNAPSHOT: usize = 8;
     /// Maximum hypotheses surfaced in one snapshot (v4 §65).
     pub const MAX_HYPOTHESES_PER_SNAPSHOT: usize = 8;
+    /// Maximum causal relations surfaced in one snapshot (v4 §65).
+    pub const MAX_CAUSAL_PER_SNAPSHOT: usize = 8;
     /// Maximum timeline entries surfaced in one snapshot (v4 §65).
     pub const MAX_TEMPORAL_PER_SNAPSHOT: usize = 12;
     /// Maximum uncertainties surfaced in one snapshot.
@@ -345,6 +360,7 @@ pub struct WorldModel {
     environment: EnvironmentState,
     timeline: TimelineState,
     uncertainties: Vec<WorldUncertainty>,
+    causal: CausalKnowledge,
     predictions: Vec<Prediction>,
     prediction_errors: Vec<PredictionError>,
     version: u64,
@@ -368,6 +384,7 @@ impl WorldModel {
             environment: EnvironmentState::default(),
             timeline: TimelineState::default(),
             uncertainties: Vec::new(),
+            causal: CausalKnowledge::default(),
             predictions: Vec::new(),
             prediction_errors: Vec::new(),
             version: 1,
@@ -397,6 +414,7 @@ impl WorldModel {
             environment,
             timeline: TimelineState::from_entries(timeline_entries)?,
             uncertainties,
+            causal: CausalKnowledge::default(),
             predictions: Vec::new(),
             prediction_errors: Vec::new(),
             version: if version == 0 { 1 } else { version },
@@ -430,6 +448,7 @@ impl WorldModel {
         for prediction_error in &self.prediction_errors {
             prediction_error.validate()?;
         }
+        self.causal.validate()?;
         if self.version == 0 {
             return Err(WorldValidationError::ZeroVersion);
         }
@@ -484,6 +503,31 @@ impl WorldModel {
     #[must_use]
     pub fn predictions(&self) -> &[Prediction] {
         &self.predictions
+    }
+
+    #[must_use]
+    pub fn causal(&self) -> &CausalKnowledge {
+        &self.causal
+    }
+
+    /// Add a causal candidate (dedupe + bounded, v4 §97–§98).
+    pub fn add_causal_proposal(
+        &mut self,
+        proposal: CausalRelationProposal,
+    ) -> Result<(), WorldValidationError> {
+        self.causal.add_proposal(proposal)?;
+        self.version = self.version.saturating_add(1);
+        Ok(())
+    }
+
+    /// Promote a validated causal relation (repeated evidence / domain rule).
+    pub fn add_causal_relation(
+        &mut self,
+        relation: CausalRelation,
+    ) -> Result<(), WorldValidationError> {
+        self.causal.promote(relation, None)?;
+        self.version = self.version.saturating_add(1);
+        Ok(())
     }
 
     #[must_use]
