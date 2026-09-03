@@ -13,7 +13,28 @@ pub struct WorldSensorsConfig {
     max_sensors: usize,
     max_result_chars: usize,
     cooldown_secs: u64,
+    /// Explicitly configured sensors; when omitted, the built-in
+    /// `bot:service` command sensor applies (see `default_sensors`).
+    #[serde(default = "default_sensors")]
     sensors: Vec<WorldSensorConfig>,
+}
+
+/// The built-in default sensor: checks that this bot's own systemd unit is
+/// active. When a deployer configures `[[world_sensors.sensors]]` explicitly,
+/// that list replaces this default.
+fn default_sensors() -> Vec<WorldSensorConfig> {
+    vec![WorldSensorConfig {
+        name: "bot:service".to_owned(),
+        kind: "command".to_owned(),
+        target: String::new(),
+        expected_status: 200,
+        timeout_secs: 10,
+        command: "systemctl is-active kovi-bot".to_owned(),
+        expected_exit: 0,
+        expected_output: String::new(),
+        watch: true,
+        importance: 70,
+    }]
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
@@ -46,14 +67,15 @@ pub struct WorldSensorConfig {
 impl Default for WorldSensorsConfig {
     fn default() -> Self {
         Self {
-            // On by default so a fresh deploy gets world awareness at no cost:
-            // an empty sensor list is a harmless no-op scheduler.
+            // On by default so a fresh deploy gets world awareness at no cost.
+            // The default sensor checks this bot's own service health; an
+            // explicitly configured sensor list replaces it.
             enabled: true,
             check_interval_secs: 300,
             max_sensors: 16,
             max_result_chars: 500,
             cooldown_secs: 600,
-            sensors: Vec::new(),
+            sensors: default_sensors(),
         }
     }
 }

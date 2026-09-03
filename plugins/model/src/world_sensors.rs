@@ -214,6 +214,26 @@ mod tests {
     use crate::config::WorldSensorsConfig;
 
     #[test]
+    fn default_sensors_include_builtin_service_check() {
+        let default = WorldSensorsConfig::default();
+        assert_eq!(default.sensors().len(), 1);
+        assert_eq!(default.sensors()[0].name(), "bot:service");
+        assert_eq!(default.sensors()[0].kind(), "command");
+
+        // A `[world_sensors]` table WITHOUT a `sensors` key still gets the
+        // built-in default sensor.
+        let parsed: WorldSensorsConfig =
+            kovi::toml::from_str("max_sensors = 16\n").expect("deserializes");
+        assert_eq!(parsed.sensors().len(), 1);
+        assert_eq!(parsed.sensors()[0].name(), "bot:service");
+
+        // An explicit empty list disables the built-in default.
+        let none: WorldSensorsConfig =
+            kovi::toml::from_str("sensors = []\n").expect("deserializes");
+        assert!(none.sensors().is_empty());
+    }
+
+    #[test]
     fn sensor_config_is_bounded_and_validated() {
         let ok_config: WorldSensorsConfig = kovi::toml::from_str(
             r#"

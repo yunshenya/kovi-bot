@@ -237,7 +237,8 @@ mcp_tool = "analyze_image"
 timeout_secs = 60
 
 # 世界传感器：让核心了解你真实世界的持久事实。默认开启（代码默认值）；
-# 这里无需写 enabled；只按需填写要盯的真实目标即可。
+# 未配置 [[world_sensors.sensors]] 时，默认内置一个检查本服务健康度的
+# bot:service 传感器；显式配置 sensors（或 sensors = []）会覆盖内置默认。
 [world_sensors]
 check_interval_secs = 300
 max_sensors = 16
