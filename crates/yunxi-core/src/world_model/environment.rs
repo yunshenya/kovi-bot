@@ -484,7 +484,9 @@ impl EnvironmentState {
         self.hosts
             .iter()
             .find(|state| state.host() == host)
-            .map_or(ServiceHealth::Unknown, |state| state.effective_health_at(now))
+            .map_or(ServiceHealth::Unknown, |state| {
+                state.effective_health_at(now)
+            })
     }
 
     /// Effective health of one tool right now (TTL-aware).
@@ -493,7 +495,9 @@ impl EnvironmentState {
         self.tools
             .iter()
             .find(|health| health.tool_name() == tool_name)
-            .map_or(ServiceHealth::Unknown, |health| health.effective_health_at(now))
+            .map_or(ServiceHealth::Unknown, |health| {
+                health.effective_health_at(now)
+            })
     }
 
     /// Merge a validated update: refresh hosts/tools/model/load (v4 §141).
@@ -549,7 +553,10 @@ mod tests {
     fn host_ttl_expires_to_unknown() {
         let now = Utc::now();
         let state = host("qq", ServiceHealth::Healthy, now);
-        assert_eq!(state.effective_health_at(now + Duration::minutes(5)), ServiceHealth::Healthy);
+        assert_eq!(
+            state.effective_health_at(now + Duration::minutes(5)),
+            ServiceHealth::Healthy
+        );
         // TTL (10 min) lapsed → Unknown, not still "online" (v4 §200).
         assert_eq!(
             state.effective_health_at(now + Duration::minutes(11)),
@@ -562,15 +569,20 @@ mod tests {
         let now = Utc::now();
         let mut environment = EnvironmentState::default();
         let update = EnvironmentUpdate::new(
-            vec![host("qq", ServiceHealth::Healthy, now), host("cli", ServiceHealth::Unavailable, now)],
-            vec![ToolHealth::new(
-                "web_fetch",
-                ServiceHealth::Degraded,
-                Some("429 rate limited"),
-                now,
-                Duration::minutes(5),
-            )
-            .expect("tool")],
+            vec![
+                host("qq", ServiceHealth::Healthy, now),
+                host("cli", ServiceHealth::Unavailable, now),
+            ],
+            vec![
+                ToolHealth::new(
+                    "web_fetch",
+                    ServiceHealth::Degraded,
+                    Some("429 rate limited"),
+                    now,
+                    Duration::minutes(5),
+                )
+                .expect("tool"),
+            ],
             ServiceHealth::Healthy,
             RuntimeLoad::new(3, Some(120), 1, 2, now).expect("load"),
         )
@@ -581,8 +593,14 @@ mod tests {
             environment.tool_health_at("web_fetch", now + Duration::seconds(1)),
             ServiceHealth::Degraded
         );
-        assert_eq!(environment.tool_health_at("web_fetch", now + Duration::minutes(6)), ServiceHealth::Unknown);
-        assert_eq!(environment.host_health_at(&HostId::new("qq").expect("id"), now), ServiceHealth::Healthy);
+        assert_eq!(
+            environment.tool_health_at("web_fetch", now + Duration::minutes(6)),
+            ServiceHealth::Unknown
+        );
+        assert_eq!(
+            environment.host_health_at(&HostId::new("qq").expect("id"), now),
+            ServiceHealth::Healthy
+        );
         assert_eq!(environment.load().availability_fraction(), 0.5);
         assert_eq!(environment.version(), 2);
     }
@@ -599,8 +617,14 @@ mod tests {
     #[test]
     fn invalid_environment_state_is_rejected() {
         let now = Utc::now();
-        let mut tool = ToolHealth::new("tool", ServiceHealth::Healthy, None::<&str>, now, Duration::minutes(1))
-            .expect("tool");
+        let mut tool = ToolHealth::new(
+            "tool",
+            ServiceHealth::Healthy,
+            None::<&str>,
+            now,
+            Duration::minutes(1),
+        )
+        .expect("tool");
         tool.tool_name = "t".repeat(MAX_TOOL_NAME_BYTES + 1);
         let result = EnvironmentUpdate::new(
             vec![],

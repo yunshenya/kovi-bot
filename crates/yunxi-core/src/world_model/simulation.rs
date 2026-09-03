@@ -276,8 +276,7 @@ impl SimulationBudget {
                 maximum: MAX_SIMULATION_CANDIDATES as f32,
             });
         }
-        if self.max_per_root_trace == 0
-            || self.max_per_root_trace > MAX_SIMULATIONS_PER_ROOT_TRACE
+        if self.max_per_root_trace == 0 || self.max_per_root_trace > MAX_SIMULATIONS_PER_ROOT_TRACE
         {
             return Err(WorldValidationError::OutOfRange {
                 field: "max_per_root_trace",
@@ -341,13 +340,21 @@ impl SimulationCache {
 
     /// Look up a fresh cache hit; expired entries are ignored.
     #[must_use]
-    pub fn get(&self, candidate_id: &str, world_version: u64, now: DateTime<Utc>) -> Option<&SimulationResult> {
+    pub fn get(
+        &self,
+        candidate_id: &str,
+        world_version: u64,
+        now: DateTime<Utc>,
+    ) -> Option<&SimulationResult> {
         let ttl = chrono::Duration::seconds(SIMULATION_CACHE_TTL_SECS as i64);
-        self.entries.iter().find(|entry| {
-            entry.candidate_id == candidate_id
-                && entry.world_version == world_version
-                && now <= entry.created_at + ttl
-        }).map(|entry| &entry.result)
+        self.entries
+            .iter()
+            .find(|entry| {
+                entry.candidate_id == candidate_id
+                    && entry.world_version == world_version
+                    && now <= entry.created_at + ttl
+            })
+            .map(|entry| &entry.result)
     }
 
     /// Insert with eviction of the oldest entry at capacity.
@@ -360,7 +367,9 @@ impl SimulationCache {
     ) -> Result<(), WorldValidationError> {
         result.validate()?;
         let candidate_id = candidate_id.into();
-        self.entries.retain(|entry| entry.candidate_id != candidate_id || entry.world_version != world_version);
+        self.entries.retain(|entry| {
+            entry.candidate_id != candidate_id || entry.world_version != world_version
+        });
         if self.entries.len() >= MAX_SIMULATION_CACHE_ENTRIES {
             self.entries.remove(0);
         }
@@ -437,15 +446,17 @@ mod tests {
     fn sample_result(candidate: &str, version: u64) -> SimulationResult {
         SimulationResult::new(
             candidate,
-            vec![PredictedOutcome::new(
-                crate::world_model::OutcomeKind::Success,
-                0.8,
-                0.5,
-                0.1,
-                0.1,
-                0.7,
-            )
-            .expect("outcome")],
+            vec![
+                PredictedOutcome::new(
+                    crate::world_model::OutcomeKind::Success,
+                    0.8,
+                    0.5,
+                    0.1,
+                    0.1,
+                    0.7,
+                )
+                .expect("outcome"),
+            ],
             0.3,
             version,
             ExecutionMode::Simulated,
@@ -455,22 +466,26 @@ mod tests {
 
     #[test]
     fn simulated_mode_is_enforced_by_construction() {
-        assert!(SimulationResult::new(
-            "a",
-            vec![PredictedOutcome::new(
-                crate::world_model::OutcomeKind::Success,
-                0.7,
-                0.5,
-                0.1,
-                0.1,
-                0.7,
+        assert!(
+            SimulationResult::new(
+                "a",
+                vec![
+                    PredictedOutcome::new(
+                        crate::world_model::OutcomeKind::Success,
+                        0.7,
+                        0.5,
+                        0.1,
+                        0.1,
+                        0.7,
+                    )
+                    .expect("outcome")
+                ],
+                0.2,
+                1,
+                ExecutionMode::Real,
             )
-            .expect("outcome")],
-            0.2,
-            1,
-            ExecutionMode::Real,
-        )
-        .is_err());
+            .is_err()
+        );
     }
 
     #[test]
@@ -512,7 +527,16 @@ mod tests {
         let now = Utc::now();
         let snapshot = empty_snapshot();
         let candidate = SimulationCandidate::new("a", "ask now").expect("candidate");
-        assert!(SimulationInput::new(EventId::new(), candidate, PredictionHorizon::Immediate, snapshot, now).is_ok());
+        assert!(
+            SimulationInput::new(
+                EventId::new(),
+                candidate,
+                PredictionHorizon::Immediate,
+                snapshot,
+                now
+            )
+            .is_ok()
+        );
     }
 
     #[test]

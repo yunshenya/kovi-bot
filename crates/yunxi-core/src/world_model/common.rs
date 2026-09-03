@@ -54,7 +54,10 @@ pub enum WorldValidationError {
     #[error("timestamps are inconsistent: {reason}")]
     InvalidTimestamp { reason: &'static str },
     #[error("invalid transition from {from} to {to}")]
-    InvalidTransition { from: &'static str, to: &'static str },
+    InvalidTransition {
+        from: &'static str,
+        to: &'static str,
+    },
     #[error("state is invalid: {reason}")]
     InvalidState { reason: &'static str },
     #[error("version must be non-zero")]
@@ -112,10 +115,7 @@ fn validate_text_with_limits(
 }
 
 /// Validate a probability/confidence/score in [0, 1].
-pub(crate) fn validate_unit(
-    value: f32,
-    field: &'static str,
-) -> Result<f32, WorldValidationError> {
+pub(crate) fn validate_unit(value: f32, field: &'static str) -> Result<f32, WorldValidationError> {
     if !value.is_finite() {
         return Err(WorldValidationError::NonFinite { field });
     }
@@ -190,6 +190,9 @@ mod tests {
     #[test]
     fn dedupe_forbids_and_allows() {
         assert!(dedupe(vec![1, 1], "x", false).is_err());
-        assert_eq!(dedupe(vec![1, 1, 2], "x", true).expect("allowed"), vec![1, 2]);
+        assert_eq!(
+            dedupe(vec![1, 1, 2], "x", true).expect("allowed"),
+            vec![1, 2]
+        );
     }
 }

@@ -11,12 +11,12 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::Instant;
+use yunxi_core::PersonId;
 use yunxi_core::world_model::{
     EntityKind, EntityUpdateAction, EntityUpdateProposal, ObservationDraft, ObservationId,
     ObservationKind, ObservationPayload, ObservationSource, SocialSceneKind, SocialSceneUpdate,
     StateProperty, WorldModel, WorldScope,
 };
-use yunxi_core::PersonId;
 
 const WORLD_LOG_PREFIX: &str = "[YUNXI_WORLD]";
 
@@ -45,8 +45,7 @@ struct WorldRuntime {
     world: WorldModel,
 }
 
-static WORLD_RUNTIME: LazyLock<Mutex<Option<WorldRuntime>>> =
-    LazyLock::new(|| Mutex::new(None));
+static WORLD_RUNTIME: LazyLock<Mutex<Option<WorldRuntime>>> = LazyLock::new(|| Mutex::new(None));
 
 /// Set whenever in-memory world state changed; cleared after a successful
 /// save. Persistence is best-effort and never blocks chat (v4 §248, §252).
@@ -112,8 +111,7 @@ pub(crate) async fn persistence_loop() {
     if !world_config().enabled() || !world_config().persist() {
         return;
     }
-    let interval =
-        std::time::Duration::from_secs(world_config().persist_interval_secs().max(10));
+    let interval = std::time::Duration::from_secs(world_config().persist_interval_secs().max(10));
     loop {
         kovi::tokio::time::sleep(interval).await;
         if !WORLD_DIRTY.load(Ordering::Relaxed) {
@@ -156,9 +154,7 @@ pub(crate) async fn persist_if_dirty() {
                 snapshot.situations().len()
             );
         }
-        Err(error) => eprintln!(
-            "{WORLD_LOG_PREFIX} 持久化失败（保留脏标记，稍后重试）: {error}"
-        ),
+        Err(error) => eprintln!("{WORLD_LOG_PREFIX} 持久化失败（保留脏标记，稍后重试）: {error}"),
     }
 }
 
@@ -190,7 +186,10 @@ pub(crate) fn record_observation(
     ttl_secs: Option<u64>,
 ) {
     with_world(|world, _max_scenes| {
-        let content = truncate_chars(content, yunxi_core::world_model::MAX_OBSERVATION_PAYLOAD_CHARS);
+        let content = truncate_chars(
+            content,
+            yunxi_core::world_model::MAX_OBSERVATION_PAYLOAD_CHARS,
+        );
         let payload = match ObservationPayload::new(content, None::<&str>) {
             Ok(payload) => payload,
             Err(error) => {
@@ -206,8 +205,11 @@ pub(crate) fn record_observation(
                 return;
             }
         };
-        let observation = match draft.build(ObservationId::new(), yunxi_core::EventId::new(), chrono::Utc::now())
-        {
+        let observation = match draft.build(
+            ObservationId::new(),
+            yunxi_core::EventId::new(),
+            chrono::Utc::now(),
+        ) {
             Ok(observation) => observation,
             Err(error) => {
                 eprintln!("{WORLD_LOG_PREFIX} observation build failed: {error}");
@@ -351,7 +353,11 @@ pub(crate) fn record_direct_scene(
             conversation_id,
             now,
             vec![participant],
-            if bot_addressed { vec![participant] } else { vec![] },
+            if bot_addressed {
+                vec![participant]
+            } else {
+                vec![]
+            },
             vec![participant],
             bot_addressed,
             0.4,
@@ -395,8 +401,7 @@ pub(crate) fn scene_direct_conversation_id(user_id: i64) -> yunxi_core::Conversa
 }
 
 fn scene_namespace_uuid(seed: &str) -> uuid::Uuid {
-    const NAMESPACE: uuid::Uuid =
-        uuid::Uuid::from_u128(0x9e2c_6f6a_4c3b_4f7e_9a10_0d5c_2b8e_4a19);
+    const NAMESPACE: uuid::Uuid = uuid::Uuid::from_u128(0x9e2c_6f6a_4c3b_4f7e_9a10_0d5c_2b8e_4a19);
     uuid::Uuid::new_v5(&NAMESPACE, seed.as_bytes())
 }
 
@@ -413,9 +418,10 @@ fn push_and_activity(conversation_id: yunxi_core::ConversationId) -> f32 {
     // Bound total stored history: at most max_scenes distinct conversations.
     let conv_key = conversation_id.into_uuid();
     if (tracker.recent.is_empty() || !tracker.recent.iter().any(|(key, _)| *key == conv_key))
-        && tracker.recent.len() >= max_scenes {
-            tracker.recent.clear();
-        }
+        && tracker.recent.len() >= max_scenes
+    {
+        tracker.recent.clear();
+    }
     tracker.recent.push_back((conv_key, now));
     while tracker
         .recent
@@ -493,9 +499,19 @@ fn derive_future_event_situation(
         ("出差", "出差安排"),
         ("复查", "复查安排"),
     ];
-    let has_time_cue = ["明天", "后天", "下周", "下个月", "今晚", "上午", "下午", "晚上", "周末"]
-        .iter()
-        .any(|cue| text.contains(cue));
+    let has_time_cue = [
+        "明天",
+        "后天",
+        "下周",
+        "下个月",
+        "今晚",
+        "上午",
+        "下午",
+        "晚上",
+        "周末",
+    ]
+    .iter()
+    .any(|cue| text.contains(cue));
     let matched = EVENT_KEYWORDS
         .iter()
         .find(|(keyword, _)| text.contains(keyword));
@@ -505,29 +521,29 @@ fn derive_future_event_situation(
             && situation.status() == SituationStatus::Active
     });
     if let Some((_keyword, label)) = matched
-        && has_time_cue && !already && world.situations().len() < 8 {
-            let situation = yunxi_core::Situation::new(
-                yunxi_core::SituationId::new(),
-                SituationKind::FutureEvent,
-                SituationState::Planned,
-                Some((*label).to_owned()),
-                vec![],
-                vec![person_id],
-                Some(conversation_id),
-                vec![],
-                vec![],
-                0.55,
-                now,
-            )?;
-            world.add_situation(situation)?;
-        }
+        && has_time_cue
+        && !already
+        && world.situations().len() < 8
+    {
+        let situation = yunxi_core::Situation::new(
+            yunxi_core::SituationId::new(),
+            SituationKind::FutureEvent,
+            SituationState::Planned,
+            Some((*label).to_owned()),
+            vec![],
+            vec![person_id],
+            Some(conversation_id),
+            vec![],
+            vec![],
+            0.55,
+            now,
+        )?;
+        world.add_situation(situation)?;
+    }
     // Maintenance: planned future events older than 24h expire instead of
     // lingering forever (v4 §92) — validated transition inside the core.
-    let _ = world.expire_stale_situations(
-        SituationKind::FutureEvent,
-        chrono::Duration::hours(24),
-        now,
-    );
+    let _ =
+        world.expire_stale_situations(SituationKind::FutureEvent, chrono::Duration::hours(24), now);
     Ok(())
 }
 
@@ -676,9 +692,9 @@ pub(crate) fn record_collision(conversation_id: yunxi_core::ConversationId) {
                 "{WORLD_LOG_PREFIX} collision scene_touch conversation_id={conversation_id} version={}",
                 world.version()
             ),
-            Err(error) => kovi::log::debug!(
-                "{WORLD_LOG_PREFIX} collision scene touch skipped: {error}"
-            ),
+            Err(error) => {
+                kovi::log::debug!("{WORLD_LOG_PREFIX} collision scene touch skipped: {error}")
+            }
         }
     });
 }
@@ -709,8 +725,8 @@ pub(crate) fn tool_recovery_outcome(
     health: yunxi_core::ServiceHealth,
     candidate: ToolRecoveryCandidate,
 ) -> yunxi_core::PredictedOutcome {
-    use yunxi_core::{OutcomeKind, ServiceHealth};
     use ToolRecoveryCandidate::*;
+    use yunxi_core::{OutcomeKind, ServiceHealth};
     let probability = match (health, candidate) {
         // 429 / degraded → immediate retry likely fails again.
         (ServiceHealth::Degraded, RetryNow) => 0.15,
@@ -728,7 +744,11 @@ pub(crate) fn tool_recovery_outcome(
     };
     let success = probability >= 0.5;
     yunxi_core::PredictedOutcome::new(
-        if success { OutcomeKind::Success } else { OutcomeKind::Failure },
+        if success {
+            OutcomeKind::Success
+        } else {
+            OutcomeKind::Failure
+        },
         probability,
         if success { 0.6 } else { -0.4 },
         0.05,
@@ -753,10 +773,7 @@ pub(crate) fn record_tool_failure(tool_name: &str, error_category: &str, detail:
     with_world(|world, _max_scenes| {
         let now = chrono::Utc::now();
         // 1. Environment: tool degraded for 5 minutes (TTL-aware).
-        let health = match world
-            .environment()
-            .tool_health_at(tool_name, now)
-        {
+        let health = match world.environment().tool_health_at(tool_name, now) {
             yunxi_core::ServiceHealth::Unavailable => yunxi_core::ServiceHealth::Unavailable,
             _ => yunxi_core::ServiceHealth::Degraded,
         };
@@ -796,8 +813,7 @@ pub(crate) fn record_tool_failure(tool_name: &str, error_category: &str, detail:
             ToolRecoveryCandidate::Wait,
             ToolRecoveryCandidate::UseFallback,
         ] {
-            let outcome =
-                tool_recovery_outcome(tool_name, health, candidate);
+            let outcome = tool_recovery_outcome(tool_name, health, candidate);
             let horizon = yunxi_core::PredictionHorizon::Immediate;
             let prediction = yunxi_core::Prediction::new(
                 yunxi_core::PredictionId::new(),
@@ -855,16 +871,14 @@ fn promote_tool_failure_causal(world: &mut WorldModel, tool_name: &str, occurren
             return;
         }
     };
-    let effect = match WorldPattern::new(
-        PatternKind::Tool,
-        format!("immediate_retry_of_{tool_name}"),
-    ) {
-        Ok(pattern) => pattern,
-        Err(error) => {
-            eprintln!("{WORLD_LOG_PREFIX} causal pattern rejected: {error}");
-            return;
-        }
-    };
+    let effect =
+        match WorldPattern::new(PatternKind::Tool, format!("immediate_retry_of_{tool_name}")) {
+            Ok(pattern) => pattern,
+            Err(error) => {
+                eprintln!("{WORLD_LOG_PREFIX} causal pattern rejected: {error}");
+                return;
+            }
+        };
     let proposal = match CausalRelationProposal::new(
         cause,
         effect,
@@ -892,7 +906,9 @@ fn promote_tool_failure_causal(world: &mut WorldModel, tool_name: &str, occurren
                 // Already promoted / capped: not an error path.
                 kovi::log::debug!("{WORLD_LOG_PREFIX} causal promote skipped: {error}");
             } else {
-                println!("{WORLD_LOG_PREFIX} causal_promoted tool={tool_name} occurrences={occurrences}");
+                println!(
+                    "{WORLD_LOG_PREFIX} causal_promoted tool={tool_name} occurrences={occurrences}"
+                );
             }
         }
         Err(error) => eprintln!("{WORLD_LOG_PREFIX} causal promote rejected: {error}"),
@@ -914,7 +930,9 @@ pub(crate) fn record_tool_retry_outcome(tool_name: &str, succeeded: bool) {
             .predictions()
             .iter()
             .filter(|prediction| prediction.source_candidate() == retry_key)
-            .filter(|prediction| prediction.freshness_at(chrono::Utc::now()) != yunxi_core::Freshness::Expired)
+            .filter(|prediction| {
+                prediction.freshness_at(chrono::Utc::now()) != yunxi_core::Freshness::Expired
+            })
             .cloned()
             .collect();
         for prediction in matching.into_iter().take(3) {
@@ -929,7 +947,9 @@ pub(crate) fn record_tool_retry_outcome(tool_name: &str, succeeded: bool) {
             let expected = prediction
                 .possible_outcomes()
                 .first()
-                .map_or(yunxi_core::OutcomeKind::Unknown, |outcome| outcome.description());
+                .map_or(yunxi_core::OutcomeKind::Unknown, |outcome| {
+                    outcome.description()
+                });
             let error = yunxi_core::PredictionError::new(
                 prediction.id(),
                 expected,
@@ -958,9 +978,7 @@ pub(crate) fn record_tool_retry_outcome(tool_name: &str, succeeded: bool) {
 /// Behavioral interruption guard (v4 §103, §197): returns the world's
 /// interruption cost for a conversation, or 0.0 when the feature is not
 /// enabled or influence_mode is not active. Callers decide suppression.
-pub(crate) fn interruption_guard(
-    conversation_id: yunxi_core::ConversationId,
-) -> f32 {
+pub(crate) fn interruption_guard(conversation_id: yunxi_core::ConversationId) -> f32 {
     let config = world_config();
     if !config.enabled() || !config.influence_active() {
         return 0.0;
@@ -977,7 +995,11 @@ pub(crate) fn interruption_guard(
         .world
         .snapshot_for(&context)
         .ok()
-        .and_then(|snapshot| snapshot.social_scene().map(|scene| scene.interruption_cost()))
+        .and_then(|snapshot| {
+            snapshot
+                .social_scene()
+                .map(|scene| scene.interruption_cost())
+        })
         .unwrap_or(0.0)
 }
 
@@ -1004,8 +1026,8 @@ pub(crate) fn delivery_outcome(
     health: yunxi_core::ServiceHealth,
     candidate: DeliveryCandidate,
 ) -> yunxi_core::PredictedOutcome {
-    use yunxi_core::{OutcomeKind, ServiceHealth};
     use DeliveryCandidate::*;
+    use yunxi_core::{OutcomeKind, ServiceHealth};
     let probability = match (health, candidate) {
         (ServiceHealth::Unavailable, SendNow) => 0.05,
         (ServiceHealth::Unavailable, Defer) => 0.60,
@@ -1034,9 +1056,7 @@ pub(crate) fn delivery_outcome(
 
 /// Execution-side delivery simulation: hosts + candidates → bounded batch.
 /// `send_now` + `defer` (≤2 results/trace); read-only, Simulated mode only.
-pub(crate) fn simulate_delivery(
-    host: &yunxi_core::HostId,
-) -> Option<yunxi_core::SimulationBatch> {
+pub(crate) fn simulate_delivery(host: &yunxi_core::HostId) -> Option<yunxi_core::SimulationBatch> {
     let guard = WORLD_RUNTIME
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1050,12 +1070,9 @@ fn simulate_delivery_internal(
     now: chrono::DateTime<chrono::Utc>,
 ) -> Option<yunxi_core::SimulationBatch> {
     use yunxi_core::{
-        ExecutionMode, SimulationCandidate, SimulationInput, SimulationResult,
-        WorldSnapshotContext,
+        ExecutionMode, SimulationCandidate, SimulationInput, SimulationResult, WorldSnapshotContext,
     };
-    let snapshot = world
-        .snapshot_for(&WorldSnapshotContext::new(now))
-        .ok()?;
+    let snapshot = world.snapshot_for(&WorldSnapshotContext::new(now)).ok()?;
     let health = world.environment().host_health_at(host, now);
     let mut results = Vec::new();
     for candidate in [DeliveryCandidate::SendNow, DeliveryCandidate::Defer] {
@@ -1096,9 +1113,7 @@ fn simulate_delivery_internal(
 /// §101–§102): snapshots are pure values, results are `Simulated` only, the
 /// batch respects max-per-root-trace = 2 (RetryNow + UseFallback; "wait" is
 /// a prediction, not a simulated candidate). Read-only: never mutates state.
-pub(crate) fn simulate_tool_recovery(
-    tool_name: &str,
-) -> Option<yunxi_core::SimulationBatch> {
+pub(crate) fn simulate_tool_recovery(tool_name: &str) -> Option<yunxi_core::SimulationBatch> {
     let guard = WORLD_RUNTIME
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1113,12 +1128,9 @@ fn simulate_tool_recovery_internal(
     now: chrono::DateTime<chrono::Utc>,
 ) -> Option<yunxi_core::SimulationBatch> {
     use yunxi_core::{
-        ExecutionMode, SimulationCandidate, SimulationInput, SimulationResult,
-        WorldSnapshotContext,
+        ExecutionMode, SimulationCandidate, SimulationInput, SimulationResult, WorldSnapshotContext,
     };
-    let snapshot = world
-        .snapshot_for(&WorldSnapshotContext::new(now))
-        .ok()?;
+    let snapshot = world.snapshot_for(&WorldSnapshotContext::new(now)).ok()?;
     let health = world.environment().tool_health_at(tool_name, now);
     let candidates = [
         ToolRecoveryCandidate::RetryNow,
@@ -1142,11 +1154,7 @@ fn simulate_tool_recovery_internal(
         .ok()?;
         results.push(result);
     }
-    let batch = yunxi_core::SimulationBatch::new(
-        yunxi_core::EventId::new(),
-        results,
-    )
-    .ok()?;
+    let batch = yunxi_core::SimulationBatch::new(yunxi_core::EventId::new(), results).ok()?;
     // Validation through a real input (version + snapshot consistency).
     let candidate = SimulationCandidate::new(
         format!("{tool_name}:tool_recovery"),
@@ -1232,9 +1240,11 @@ pub(crate) fn render_world_context(snapshot: &yunxi_core::WorldModelSnapshot) ->
         }
     }
     if !snapshot.environment().hosts().is_empty()
-        && snapshot.environment().hosts().iter().all(|host| {
-            host.health() == yunxi_core::ServiceHealth::Unavailable
-        })
+        && snapshot
+            .environment()
+            .hosts()
+            .iter()
+            .all(|host| host.health() == yunxi_core::ServiceHealth::Unavailable)
     {
         parts.push("发消息的主机都不可用".to_owned());
     }
@@ -1446,20 +1456,24 @@ mod tests {
 
     #[test]
     fn delivery_simulator_produces_bounded_simulated_batch() {
-        use yunxi_core::{EnvironmentUpdate, ExecutionMode, HostId, RuntimeLoad, ServiceHealth, HostState};
+        use yunxi_core::{
+            EnvironmentUpdate, ExecutionMode, HostId, HostState, RuntimeLoad, ServiceHealth,
+        };
         let now = chrono::Utc::now();
         let host = HostId::new("qq").expect("host");
         let mut world = WorldModel::new();
         world
             .update_environment(
                 EnvironmentUpdate::new(
-                    vec![HostState::new(
-                        host.clone(),
-                        ServiceHealth::Unavailable,
-                        now,
-                        chrono::Duration::minutes(5),
-                    )
-                    .expect("host state")],
+                    vec![
+                        HostState::new(
+                            host.clone(),
+                            ServiceHealth::Unavailable,
+                            now,
+                            chrono::Duration::minutes(5),
+                        )
+                        .expect("host state"),
+                    ],
                     vec![],
                     ServiceHealth::Healthy,
                     RuntimeLoad::new(0, None, 0, 1, now).expect("load"),
@@ -1469,10 +1483,12 @@ mod tests {
             .expect("env");
         let batch = simulate_delivery_internal(&world, &host, now).expect("batch");
         assert_eq!(batch.results().len(), 2);
-        assert!(batch
-            .results()
-            .iter()
-            .all(|result| result.mode() == ExecutionMode::Simulated));
+        assert!(
+            batch
+                .results()
+                .iter()
+                .all(|result| result.mode() == ExecutionMode::Simulated)
+        );
         batch.validate().expect("batch validates");
         // Read-only: simulation never mutates the world.
         assert_eq!(world.version(), 2);
@@ -1513,21 +1529,25 @@ mod tests {
     #[test]
     fn simulator_produces_bounded_simulated_batch() {
         let _guard = serial();
-        use yunxi_core::{EnvironmentUpdate, ExecutionMode, RuntimeLoad, ServiceHealth, ToolHealth};
+        use yunxi_core::{
+            EnvironmentUpdate, ExecutionMode, RuntimeLoad, ServiceHealth, ToolHealth,
+        };
         let now = chrono::Utc::now();
         let mut world = WorldModel::new();
         world
             .update_environment(
                 EnvironmentUpdate::new(
                     vec![],
-                    vec![ToolHealth::new(
-                        "web_fetch",
-                        ServiceHealth::Degraded,
-                        Some("429"),
-                        now,
-                        chrono::Duration::minutes(5),
-                    )
-                    .expect("tool")],
+                    vec![
+                        ToolHealth::new(
+                            "web_fetch",
+                            ServiceHealth::Degraded,
+                            Some("429"),
+                            now,
+                            chrono::Duration::minutes(5),
+                        )
+                        .expect("tool"),
+                    ],
                     ServiceHealth::Healthy,
                     RuntimeLoad::new(0, None, 0, 0, now).expect("load"),
                 )
@@ -1536,10 +1556,12 @@ mod tests {
             .expect("env");
         let batch = simulate_tool_recovery_internal(&world, "web_fetch", now).expect("batch");
         assert_eq!(batch.results().len(), 2);
-        assert!(batch
-            .results()
-            .iter()
-            .all(|result| result.mode() == ExecutionMode::Simulated));
+        assert!(
+            batch
+                .results()
+                .iter()
+                .all(|result| result.mode() == ExecutionMode::Simulated)
+        );
         batch.validate().expect("batch valid");
         // Simulation never mutated the world (read-only by construction).
         assert_eq!(world.version(), 2);
@@ -1555,8 +1577,8 @@ mod tests {
     #[test]
     fn render_world_context_is_objective_and_bounded() {
         let _guard = serial();
-        use yunxi_core::{SocialSceneKind, SocialSceneUpdate};
         use yunxi_core::WorldSnapshotContext;
+        use yunxi_core::{SocialSceneKind, SocialSceneUpdate};
         let conversation_id = yunxi_core::ConversationId::new();
         let person_id = PersonId::new();
         let mut world = WorldModel::new();
@@ -1576,7 +1598,9 @@ mod tests {
             )
             .expect("scene");
         let snapshot = world
-            .snapshot_for(&WorldSnapshotContext::new(chrono::Utc::now()).with_conversation(conversation_id))
+            .snapshot_for(
+                &WorldSnapshotContext::new(chrono::Utc::now()).with_conversation(conversation_id),
+            )
             .expect("snapshot");
         let text = render_world_context(&snapshot);
         // Objective scene nouns only — no psychology, no ids, no numbers.
@@ -1603,8 +1627,14 @@ mod tests {
             .expect("ok");
         assert!(world.situations().is_empty());
         // Keyword + time cue → Planned FutureEvent (Scenario A/E shape).
-        derive_future_event_situation(&mut world, conversation_id, person_id, "我明天上午去面试", now)
-            .expect("ok");
+        derive_future_event_situation(
+            &mut world,
+            conversation_id,
+            person_id,
+            "我明天上午去面试",
+            now,
+        )
+        .expect("ok");
         assert_eq!(world.situations().len(), 1);
         assert_eq!(world.situations()[0].kind(), SituationKind::FutureEvent);
         assert_eq!(world.situations()[0].state(), SituationState::Planned);
@@ -1616,10 +1646,7 @@ mod tests {
         let later = now + chrono::Duration::hours(25);
         derive_future_event_situation(&mut world, conversation_id, person_id, "明天体检", later)
             .expect("ok");
-        assert_eq!(
-            world.situations()[0].state(),
-            SituationState::Expired
-        );
+        assert_eq!(world.situations()[0].state(), SituationState::Expired);
     }
 
     #[test]
@@ -1627,15 +1654,27 @@ mod tests {
         let _guard = serial();
         use yunxi_core::{OutcomeKind, ServiceHealth};
         // Degraded + retry-now → likely fail (Low band).
-        let retry = tool_recovery_outcome("web_fetch", ServiceHealth::Degraded, ToolRecoveryCandidate::RetryNow);
+        let retry = tool_recovery_outcome(
+            "web_fetch",
+            ServiceHealth::Degraded,
+            ToolRecoveryCandidate::RetryNow,
+        );
         assert_eq!(retry.description(), OutcomeKind::Failure);
         assert_eq!(retry.band(), yunxi_core::ProbabilityBand::Low);
         // Degraded + fallback → medium success (Medium band).
-        let fallback = tool_recovery_outcome("web_fetch", ServiceHealth::Degraded, ToolRecoveryCandidate::UseFallback);
+        let fallback = tool_recovery_outcome(
+            "web_fetch",
+            ServiceHealth::Degraded,
+            ToolRecoveryCandidate::UseFallback,
+        );
         assert_eq!(fallback.description(), OutcomeKind::Success);
         assert_eq!(fallback.band(), yunxi_core::ProbabilityBand::Medium);
         // Healthy + retry-now → high success.
-        let healthy = tool_recovery_outcome("web_fetch", ServiceHealth::Healthy, ToolRecoveryCandidate::RetryNow);
+        let healthy = tool_recovery_outcome(
+            "web_fetch",
+            ServiceHealth::Healthy,
+            ToolRecoveryCandidate::RetryNow,
+        );
         assert_eq!(healthy.description(), OutcomeKind::Success);
         assert_eq!(healthy.band(), yunxi_core::ProbabilityBand::High);
         // Every outcome validates (quantized + band consistent).
@@ -1647,9 +1686,7 @@ mod tests {
     #[test]
     fn scene_derivation_creates_dedupes_and_expires_situation() {
         let _guard = serial();
-        use yunxi_core::world_model::{
-            SituationState, SocialSceneKind, SocialSceneUpdate,
-        };
+        use yunxi_core::world_model::{SituationState, SocialSceneKind, SocialSceneUpdate};
         let conversation_id = yunxi_core::ConversationId::new();
         let mut world = WorldModel::new();
         let now = chrono::Utc::now();
@@ -1681,7 +1718,10 @@ mod tests {
         // Idle > 10 min → OutcomeUnknown (never stays "in progress").
         let later = now + chrono::Duration::minutes(11);
         apply_scene_derivation(&mut world, conversation_id, later).expect("maintain");
-        assert_eq!(world.situations()[0].state(), SituationState::OutcomeUnknown);
+        assert_eq!(
+            world.situations()[0].state(),
+            SituationState::OutcomeUnknown
+        );
         assert!(world.situations()[0].is_active());
     }
 }

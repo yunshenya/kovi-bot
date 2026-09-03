@@ -390,7 +390,12 @@ impl Observation {
     /// same observation even with a different id.
     #[must_use]
     pub fn fingerprint(&self) -> String {
-        observation_fingerprint(self.scope, self.kind, self.payload.facet(), self.payload.content())
+        observation_fingerprint(
+            self.scope,
+            self.kind,
+            self.payload.facet(),
+            self.payload.content(),
+        )
     }
 
     /// Replace this observation with a newer one of the same fingerprint,
@@ -545,27 +550,31 @@ mod tests {
     fn invalid_ttl_and_inverted_expiry_are_rejected() {
         let now = Utc::now();
         let payload = ObservationPayload::new("x", None::<&str>).expect("payload");
-        assert!(ObservationDraft::new(
-            WorldScope::Global,
-            ObservationKind::SystemState,
-            ObservationSource::SystemState,
-            payload.clone(),
-            0.5,
-            Some(MAX_OBSERVATION_TTL_SECONDS + 1),
-        )
-        .is_err());
-        assert!(Observation::new(
-            super::super::ObservationId::new(),
-            EventId::new(),
-            WorldScope::Global,
-            ObservationKind::SystemState,
-            ObservationSource::SystemState,
-            payload,
-            0.5,
-            now,
-            Some(now - Duration::seconds(1)),
-        )
-        .is_err());
+        assert!(
+            ObservationDraft::new(
+                WorldScope::Global,
+                ObservationKind::SystemState,
+                ObservationSource::SystemState,
+                payload.clone(),
+                0.5,
+                Some(MAX_OBSERVATION_TTL_SECONDS + 1),
+            )
+            .is_err()
+        );
+        assert!(
+            Observation::new(
+                super::super::ObservationId::new(),
+                EventId::new(),
+                WorldScope::Global,
+                ObservationKind::SystemState,
+                ObservationSource::SystemState,
+                payload,
+                0.5,
+                now,
+                Some(now - Duration::seconds(1)),
+            )
+            .is_err()
+        );
     }
 
     #[test]

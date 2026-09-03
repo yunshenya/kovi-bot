@@ -1979,8 +1979,7 @@ fn world_context_messages(conversation_id: Option<yunxi_core::ConversationId>) -
     let Some(conversation_id) = conversation_id else {
         return Vec::new();
     };
-    let Some(snapshot) =
-        crate::yunxi::world_model::conversation_world_snapshot(conversation_id)
+    let Some(snapshot) = crate::yunxi::world_model::conversation_world_snapshot(conversation_id)
     else {
         return Vec::new();
     };
@@ -4719,7 +4718,9 @@ impl ModelBackend for KoviModelBackend {
             let mut messages = recent_conversation_messages(input);
             let mut reply_context = mind_context_messages(input, &mind_projection);
             reply_context.extend(affect_tone_messages(input));
-            reply_context.extend(world_context_messages(input.event.scope().conversation_id()));
+            reply_context.extend(world_context_messages(
+                input.event.scope().conversation_id(),
+            ));
             messages.splice(0..0, reply_context);
             messages.push(BotMemory {
                 role: Roles::User,

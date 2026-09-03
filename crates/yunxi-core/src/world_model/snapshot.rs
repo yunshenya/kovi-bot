@@ -1,8 +1,8 @@
 //! Snapshot: bounded, relevant view of the World Model for one decision
 //! (v4 §63–67, §214). Never hand the planner the whole store.
 
-use super::environment::{ServiceHealth, ToolHealth};
 use super::entity::{EntityKind, EntityState, StateProperty};
+use super::environment::{ServiceHealth, ToolHealth};
 use super::hypothesis::{Hypothesis, HypothesisStatus};
 use super::situation::Situation;
 use super::social_scene::SocialSceneState;
@@ -63,7 +63,11 @@ impl WorldSnapshotLimits {
 
     pub fn validate(&self) -> Result<(), WorldValidationError> {
         for (field, value, maximum) in [
-            ("snapshot entities", self.entities, limits::MAX_ENTITIES_PER_SNAPSHOT),
+            (
+                "snapshot entities",
+                self.entities,
+                limits::MAX_ENTITIES_PER_SNAPSHOT,
+            ),
             (
                 "snapshot situations",
                 self.situations,
@@ -74,8 +78,16 @@ impl WorldSnapshotLimits {
                 self.hypotheses,
                 limits::MAX_HYPOTHESES_PER_SNAPSHOT,
             ),
-            ("snapshot causal", self.causal, limits::MAX_CAUSAL_PER_SNAPSHOT),
-            ("snapshot temporal", self.temporal, limits::MAX_TEMPORAL_PER_SNAPSHOT),
+            (
+                "snapshot causal",
+                self.causal,
+                limits::MAX_CAUSAL_PER_SNAPSHOT,
+            ),
+            (
+                "snapshot temporal",
+                self.temporal,
+                limits::MAX_TEMPORAL_PER_SNAPSHOT,
+            ),
             (
                 "snapshot uncertainties",
                 self.uncertainties,
@@ -1096,11 +1108,9 @@ pub(super) fn build_snapshot(
         .entities()
         .iter()
         .filter(|entity| {
-            let is_environment_kind =
-                matches!(entity.kind(), EntityKind::Host | EntityKind::Tool);
+            let is_environment_kind = matches!(entity.kind(), EntityKind::Host | EntityKind::Tool);
             context.matches_scope(entity.scope())
-                && !(is_environment_kind
-                    && matches!(entity.scope(), WorldScope::Global))
+                && !(is_environment_kind && matches!(entity.scope(), WorldScope::Global))
         })
         .collect();
     entities.sort_by_key(|entity| std::cmp::Reverse(entity.last_observed_at()));
@@ -1123,11 +1133,11 @@ pub(super) fn build_snapshot(
             if !situation.is_active() {
                 return false;
             }
-            let matched_conversation = match (situation.conversation_id(), context.conversation_id())
-            {
-                (Some(a), Some(b)) => a == b,
-                _ => false,
-            };
+            let matched_conversation =
+                match (situation.conversation_id(), context.conversation_id()) {
+                    (Some(a), Some(b)) => a == b,
+                    _ => false,
+                };
             matched_conversation
                 || situation
                     .persons()
@@ -1160,8 +1170,10 @@ pub(super) fn build_snapshot(
         .hypotheses()
         .iter()
         .filter(|hypothesis| {
-            matches!(hypothesis.status(), HypothesisStatus::Active | HypothesisStatus::Supported)
-                && hypothesis.freshness_at(now) != Freshness::Expired
+            matches!(
+                hypothesis.status(),
+                HypothesisStatus::Active | HypothesisStatus::Supported
+            ) && hypothesis.freshness_at(now) != Freshness::Expired
                 && context.matches_scope(hypothesis.scope())
         })
         .collect();
@@ -1196,12 +1208,7 @@ pub(super) fn build_snapshot(
         })
         .collect();
     temporal.sort_by_key(|entry| {
-        std::cmp::Reverse(
-            entry
-                .interval()
-                .start()
-                .unwrap_or(DateTime::<Utc>::MIN_UTC),
-        )
+        std::cmp::Reverse(entry.interval().start().unwrap_or(DateTime::<Utc>::MIN_UTC))
     });
     let temporal_snapshots = temporal
         .into_iter()
@@ -1210,10 +1217,14 @@ pub(super) fn build_snapshot(
         .collect();
 
     // Uncertainties (not expired) matching scope.
-    let mut uncertainties: Vec<_> = world.uncertainties().iter().filter(|uncertainty| {
-        uncertainty.freshness_at(now) != Freshness::Expired
-            && context.matches_scope(uncertainty.scope())
-    }).collect();
+    let mut uncertainties: Vec<_> = world
+        .uncertainties()
+        .iter()
+        .filter(|uncertainty| {
+            uncertainty.freshness_at(now) != Freshness::Expired
+                && context.matches_scope(uncertainty.scope())
+        })
+        .collect();
     uncertainties.sort_by_key(|uncertainty| std::cmp::Reverse(uncertainty.observed_at()));
     let uncertainty_snapshots = uncertainties
         .into_iter()

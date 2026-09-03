@@ -186,13 +186,21 @@ impl CausalRelation {
 
     /// Does this relation match a scope (for retrieval)?
     #[must_use]
-    pub fn matches_scope(&self, person_id: Option<PersonId>, conversation_id: Option<ConversationId>) -> bool {
+    pub fn matches_scope(
+        &self,
+        person_id: Option<PersonId>,
+        conversation_id: Option<ConversationId>,
+    ) -> bool {
         match self.scope {
-            CausalScope::Global | CausalScope::ToolSpecific { .. } | CausalScope::HostSpecific { .. } => true,
-            CausalScope::PersonSpecific { person_id: scope_person } => Some(scope_person) == person_id,
-            CausalScope::ConversationSpecific { conversation_id: scope_conversation } => {
-                Some(scope_conversation) == conversation_id
-            }
+            CausalScope::Global
+            | CausalScope::ToolSpecific { .. }
+            | CausalScope::HostSpecific { .. } => true,
+            CausalScope::PersonSpecific {
+                person_id: scope_person,
+            } => Some(scope_person) == person_id,
+            CausalScope::ConversationSpecific {
+                conversation_id: scope_conversation,
+            } => Some(scope_conversation) == conversation_id,
         }
     }
 }
@@ -284,9 +292,7 @@ impl CausalRelationProposal {
     pub fn fingerprint(&self) -> String {
         format!(
             "{:?}|{:?}|{:?}",
-            self.cause,
-            self.effect,
-            self.proposed_scope
+            self.cause, self.effect, self.proposed_scope
         )
     }
 }
@@ -308,11 +314,13 @@ pub fn promote_candidate(
         });
     }
     if let CausalScope::PersonSpecific { .. } = proposal.proposed_scope()
-        && !domain_rule && !authenticated {
-            return Err(WorldValidationError::InvalidState {
-                reason: "person-specific causal relations require an explicit domain rule",
-            });
-        }
+        && !domain_rule
+        && !authenticated
+    {
+        return Err(WorldValidationError::InvalidState {
+            reason: "person-specific causal relations require an explicit domain rule",
+        });
+    }
     CausalRelation::new(
         id,
         proposal.cause().clone(),
@@ -442,7 +450,8 @@ impl CausalKnowledge {
             });
         }
         if let Some(fingerprint) = proposal_fingerprint {
-            self.candidates.retain(|candidate| candidate.fingerprint() != fingerprint);
+            self.candidates
+                .retain(|candidate| candidate.fingerprint() != fingerprint);
         }
         self.relations.push(relation);
         Ok(())
@@ -494,14 +503,16 @@ mod tests {
     #[test]
     fn promotion_requires_repeated_evidence_or_domain_rule() {
         // 2 occurrences, no rule → rejected (v4 §98).
-        assert!(promote_candidate(
-            proposal(CausalScope::Global),
-            2,
-            false,
-            CausalSource::ObservedRepeatedPattern,
-            super::super::CausalRelationId::new(),
-        )
-        .is_err());
+        assert!(
+            promote_candidate(
+                proposal(CausalScope::Global),
+                2,
+                false,
+                CausalSource::ObservedRepeatedPattern,
+                super::super::CausalRelationId::new(),
+            )
+            .is_err()
+        );
         // 3 occurrences → promoted.
         let relation = promote_candidate(
             proposal(CausalScope::Global),
@@ -513,14 +524,16 @@ mod tests {
         .expect("promoted");
         assert_eq!(relation.evidence_occurrences(), 3);
         // Domain rule promotes without repeated evidence.
-        assert!(promote_candidate(
-            proposal(CausalScope::Global),
-            0,
-            true,
-            CausalSource::DomainRule,
-            super::super::CausalRelationId::new(),
-        )
-        .is_ok());
+        assert!(
+            promote_candidate(
+                proposal(CausalScope::Global),
+                0,
+                true,
+                CausalSource::DomainRule,
+                super::super::CausalRelationId::new(),
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -547,22 +560,26 @@ mod tests {
                 person_id: PersonId::new(),
             },
         };
-        assert!(promote_candidate(
-            direct.clone(),
-            3,
-            false,
-            CausalSource::ObservedRepeatedPattern,
-            super::super::CausalRelationId::new(),
-        )
-        .is_err());
-        assert!(promote_candidate(
-            direct,
-            1,
-            true,
-            CausalSource::DomainRule,
-            super::super::CausalRelationId::new(),
-        )
-        .is_ok());
+        assert!(
+            promote_candidate(
+                direct.clone(),
+                3,
+                false,
+                CausalSource::ObservedRepeatedPattern,
+                super::super::CausalRelationId::new(),
+            )
+            .is_err()
+        );
+        assert!(
+            promote_candidate(
+                direct,
+                1,
+                true,
+                CausalSource::DomainRule,
+                super::super::CausalRelationId::new(),
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -625,6 +642,10 @@ mod tests {
         assert_eq!(relevant.len(), 2);
         assert!(relevant.iter().all(|r| r.confidence() >= 0.6));
         // Another person sees nothing.
-        assert!(knowledge.relevant(Some(PersonId::new()), None, 4).is_empty());
+        assert!(
+            knowledge
+                .relevant(Some(PersonId::new()), None, 4)
+                .is_empty()
+        );
     }
 }

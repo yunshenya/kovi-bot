@@ -421,9 +421,7 @@ impl EntityStateIndex {
         let mut ids = Vec::new();
         for entity in &self.entities {
             if ids.contains(&entity.id()) {
-                return Err(WorldValidationError::DuplicateItem {
-                    field: "entity id",
-                });
+                return Err(WorldValidationError::DuplicateItem { field: "entity id" });
             }
             ids.push(entity.id());
         }
@@ -521,8 +519,7 @@ impl EntityStateIndex {
                         (proposal.linked_person().is_some()
                             && entity.linked_person() == proposal.linked_person())
                             || (proposal.linked_conversation().is_some()
-                                && entity.linked_conversation()
-                                    == proposal.linked_conversation())
+                                && entity.linked_conversation() == proposal.linked_conversation())
                     })
                     .count();
                 if per_scope >= MAX_ENTITIES_PER_SCOPE {
@@ -606,12 +603,23 @@ mod tests {
         .expect("entity");
         assert_eq!(entity.version(), 1);
         entity
-            .apply(&EntityUpdateAction::Set(property("employment", "interviewing", 0.8, now)), now)
+            .apply(
+                &EntityUpdateAction::Set(property("employment", "interviewing", 0.8, now)),
+                now,
+            )
             .expect("set");
         assert_eq!(entity.version(), 2);
-        assert_eq!(entity.property("employment").expect("prop").value(), "interviewing");
+        assert_eq!(
+            entity.property("employment").expect("prop").value(),
+            "interviewing"
+        );
         entity
-            .apply(&EntityUpdateAction::Clear { key: "employment".into() }, now)
+            .apply(
+                &EntityUpdateAction::Clear {
+                    key: "employment".into(),
+                },
+                now,
+            )
             .expect("clear");
         assert!(entity.property("employment").is_none());
         assert_eq!(entity.version(), 3);
@@ -620,9 +628,19 @@ mod tests {
     #[test]
     fn property_ttl_marks_stale() {
         let now = Utc::now();
-        let mut property =
-            StateProperty::new("host", "online", 0.9, ObservationSource::SystemState, now, Some(now + Duration::seconds(100))).expect("property");
-        assert_eq!(property.freshness_at(now + Duration::seconds(10)), super::super::Freshness::Fresh);
+        let mut property = StateProperty::new(
+            "host",
+            "online",
+            0.9,
+            ObservationSource::SystemState,
+            now,
+            Some(now + Duration::seconds(100)),
+        )
+        .expect("property");
+        assert_eq!(
+            property.freshness_at(now + Duration::seconds(10)),
+            super::super::Freshness::Fresh
+        );
         property = StateProperty::new(
             "host",
             "online",
@@ -657,7 +675,12 @@ mod tests {
                 Some(person_id),
                 None,
                 0.5,
-                vec![EntityUpdateAction::Set(property("tool", &format!("t{i}"), 0.5, now))],
+                vec![EntityUpdateAction::Set(property(
+                    "tool",
+                    &format!("t{i}"),
+                    0.5,
+                    now,
+                ))],
                 now,
             )
             .expect("proposal");
@@ -734,11 +757,15 @@ mod tests {
         }
         index.erase_person(person_a);
         assert_eq!(index.len(), 1);
-        assert!(index
-            .find(EntityKind::Person, Some(person_a), None)
-            .is_none());
-        assert!(index
-            .find(EntityKind::Person, Some(person_b), None)
-            .is_some());
+        assert!(
+            index
+                .find(EntityKind::Person, Some(person_a), None)
+                .is_none()
+        );
+        assert!(
+            index
+                .find(EntityKind::Person, Some(person_b), None)
+                .is_some()
+        );
     }
 }

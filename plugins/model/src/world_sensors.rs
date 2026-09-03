@@ -169,7 +169,10 @@ async fn ok_or_skip(sensor: &config::WorldSensorConfig, cooldown: Duration) -> a
                 Duration::from_secs(sensor.timeout_secs()),
             )
             .await;
-            (matches!(&response, Ok(r) if r.status == sensor.expected_status()), None)
+            (
+                matches!(&response, Ok(r) if r.status == sensor.expected_status()),
+                None,
+            )
         }
     };
     // A file_state sensor also fires when the file's mtime changes while it

@@ -113,13 +113,13 @@ pub use common::{
 };
 pub use entity::{
     EntityKind, EntityState, EntityStateIndex, EntityUpdate, EntityUpdateAction,
-    EntityUpdateProposal, MAX_ACTIVE_ENTITIES, MAX_ENTITIES_PER_SCOPE,
-    MAX_PROPERTIES_PER_ENTITY, StateProperty,
+    EntityUpdateProposal, MAX_ACTIVE_ENTITIES, MAX_ENTITIES_PER_SCOPE, MAX_PROPERTIES_PER_ENTITY,
+    StateProperty,
 };
 pub use environment::{
-    EnvironmentState, EnvironmentUpdate, HostId, HostState, RuntimeLoad, ServiceHealth,
-    ToolHealth, MAX_ENVIRONMENT_HOSTS, MAX_ENVIRONMENT_TOOLS, MAX_HOST_ID_BYTES,
-    MAX_HOST_ID_CHARS, MAX_TOOL_NAME_BYTES, MAX_TOOL_NAME_CHARS,
+    EnvironmentState, EnvironmentUpdate, HostId, HostState, MAX_ENVIRONMENT_HOSTS,
+    MAX_ENVIRONMENT_TOOLS, MAX_HOST_ID_BYTES, MAX_HOST_ID_CHARS, MAX_TOOL_NAME_BYTES,
+    MAX_TOOL_NAME_CHARS, RuntimeLoad, ServiceHealth, ToolHealth,
 };
 pub use hypothesis::{
     Hypothesis, HypothesisStatus, MAX_ACTIVE_HYPOTHESES_PER_CONVERSATION,
@@ -131,30 +131,34 @@ pub use ids::{
     UncertaintyId,
 };
 pub use observation::{
+    MAX_OBSERVATION_PAYLOAD_BYTES, MAX_OBSERVATION_PAYLOAD_CHARS, MAX_OBSERVATIONS_PER_EVENT,
     Observation, ObservationDraft, ObservationKind, ObservationPayload, ObservationSource,
-    ObservationSourceReliability, MAX_OBSERVATIONS_PER_EVENT,
-    MAX_OBSERVATION_PAYLOAD_BYTES, MAX_OBSERVATION_PAYLOAD_CHARS, observation_fingerprint,
+    ObservationSourceReliability, observation_fingerprint,
 };
 pub use prediction::{
     MAX_PREDICTED_OUTCOMES, MAX_RUNTIME_PREDICTION_ERRORS, MAX_RUNTIME_PREDICTIONS, OutcomeKind,
-    Prediction, PredictionCalibration, PredictionError, PredictionHorizon, ProbabilityBand,
-    PredictedOutcome, quantize_probability,
+    PredictedOutcome, Prediction, PredictionCalibration, PredictionError, PredictionHorizon,
+    ProbabilityBand, quantize_probability,
+};
+pub use simulation::{
+    ExecutionMode, MAX_SIMULATION_CACHE_ENTRIES, MAX_SIMULATION_CANDIDATES,
+    MAX_SIMULATIONS_PER_ROOT_TRACE, SIMULATION_CACHE_TTL_SECS, SimulationBatch, SimulationBudget,
+    SimulationCache, SimulationCacheEntry, SimulationCandidate, SimulationInput, SimulationResult,
 };
 pub use situation::{
-    Situation, SituationKind, SituationState, SituationStatus, SituationTransitionProposal,
     MAX_ACTIVE_SITUATIONS_PER_SCOPE, MAX_SITUATION_DETAIL_BYTES, MAX_SITUATION_DETAIL_CHARS,
-    MAX_SITUATION_PARTICIPANTS, can_transition,
+    MAX_SITUATION_PARTICIPANTS, Situation, SituationKind, SituationState, SituationStatus,
+    SituationTransitionProposal, can_transition,
+};
+pub use snapshot::{
+    CausalRelationSnapshot, EntityStateSnapshot, EnvironmentSnapshot, HypothesisSnapshot,
+    SituationSnapshot, SocialSceneSnapshot, TemporalSnapshotEntry, WorldModelSnapshot,
+    WorldSnapshotContext, WorldSnapshotLimits, WorldUncertaintySnapshot,
 };
 pub use social_scene::{
     MAX_SCENE_ACTIVITY_PARTICIPANTS, MAX_SCENE_CURRENT_FLOOR, MAX_SCENE_RECENT_SPEAKERS,
     MAX_SCENES_PER_WORLD, SocialSceneKind, SocialSceneState, SocialSceneUpdate,
     floor_interruption_cost,
-};
-pub use simulation::{
-    ExecutionMode, MAX_SIMULATION_CACHE_ENTRIES, MAX_SIMULATION_CANDIDATES,
-    MAX_SIMULATIONS_PER_ROOT_TRACE, SIMULATION_CACHE_TTL_SECS, SimulationBatch,
-    SimulationBudget, SimulationCache, SimulationCacheEntry, SimulationCandidate,
-    SimulationInput, SimulationResult,
 };
 pub use temporal::{
     Freshness, TemporalRelation, TimeInterval, TimelineEntry, TimelineState, WorldRef,
@@ -163,11 +167,6 @@ pub use temporal::{
 pub use update::{
     MAX_REASON_TAGS_PER_BATCH, MAX_UPDATES_PER_BATCH, WorldReasonTag, WorldUpdate,
     WorldUpdateProposal, WorldUpdateState,
-};
-pub use snapshot::{
-    CausalRelationSnapshot, EntityStateSnapshot, EnvironmentSnapshot, HypothesisSnapshot,
-    SituationSnapshot, SocialSceneSnapshot, TemporalSnapshotEntry, WorldModelSnapshot,
-    WorldSnapshotContext, WorldSnapshotLimits, WorldUncertaintySnapshot,
 };
 
 use crate::{ConversationId, PersonId};
@@ -861,18 +860,14 @@ impl WorldModel {
     /// Idempotent; returns how many records were removed.
     pub fn prune_expired(&mut self, now: DateTime<Utc>) -> usize {
         let before = self.observations.len() + self.hypotheses.len();
-        self.observations.retain(|observation| {
-            observation.freshness_at(now) != Freshness::Expired
-        });
-        self.hypotheses.retain(|hypothesis| {
-            hypothesis.freshness_at(now) != Freshness::Expired
-        });
-        self.uncertainties.retain(|uncertainty| {
-            uncertainty.freshness_at(now) != Freshness::Expired
-        });
-        self.predictions.retain(|prediction| {
-            prediction.freshness_at(now) != Freshness::Expired
-        });
+        self.observations
+            .retain(|observation| observation.freshness_at(now) != Freshness::Expired);
+        self.hypotheses
+            .retain(|hypothesis| hypothesis.freshness_at(now) != Freshness::Expired);
+        self.uncertainties
+            .retain(|uncertainty| uncertainty.freshness_at(now) != Freshness::Expired);
+        self.predictions
+            .retain(|prediction| prediction.freshness_at(now) != Freshness::Expired);
         let removed = before - (self.observations.len() + self.hypotheses.len());
         if removed > 0 {
             self.version = self.version.saturating_add(1);
@@ -945,9 +940,13 @@ mod tests {
     fn observe_dedupes_by_fingerprint_and_bumps_version() {
         let now = Utc::now();
         let mut world = WorldModel::new();
-        world.observe(observation(WorldScope::Global, "build main passed", now)).expect("obs");
+        world
+            .observe(observation(WorldScope::Global, "build main passed", now))
+            .expect("obs");
         let v1 = world.version();
-        world.observe(observation(WorldScope::Global, "build main passed", now)).expect("obs");
+        world
+            .observe(observation(WorldScope::Global, "build main passed", now))
+            .expect("obs");
         assert_eq!(world.observations().len(), 1);
         assert_eq!(world.version(), v1 + 1);
         world.validate().expect("world valid");
@@ -985,7 +984,9 @@ mod tests {
             now,
         )
         .expect("proposal");
-        world.apply_situation_transition(proposal).expect("transition");
+        world
+            .apply_situation_transition(proposal)
+            .expect("transition");
         // Stale version is rejected.
         let stale = SituationTransitionProposal::new(
             situation.id(),
@@ -1008,26 +1009,30 @@ mod tests {
         let mut world = WorldModel::new();
         let proposition = WorldProposition::new("tool A 可能恢复").expect("proposition");
         world
-            .upsert_hypothesis(Hypothesis::new(
-                super::HypothesisId::new(),
-                proposition.clone(),
-                WorldScope::Global,
-                0.3,
-                now,
-                None,
+            .upsert_hypothesis(
+                Hypothesis::new(
+                    super::HypothesisId::new(),
+                    proposition.clone(),
+                    WorldScope::Global,
+                    0.3,
+                    now,
+                    None,
+                )
+                .expect("hypothesis"),
             )
-            .expect("hypothesis"))
             .expect("upsert");
         world
-            .upsert_hypothesis(Hypothesis::new(
-                super::HypothesisId::new(),
-                proposition,
-                WorldScope::Global,
-                0.6,
-                now,
-                None,
+            .upsert_hypothesis(
+                Hypothesis::new(
+                    super::HypothesisId::new(),
+                    proposition,
+                    WorldScope::Global,
+                    0.6,
+                    now,
+                    None,
+                )
+                .expect("hypothesis"),
             )
-            .expect("hypothesis"))
             .expect("upsert");
         assert_eq!(world.hypotheses().len(), 1);
         assert_eq!(world.hypotheses()[0].confidence(), 0.6);
@@ -1095,15 +1100,17 @@ mod tests {
             ))
             .expect("obs");
         world
-            .upsert_hypothesis(Hypothesis::new(
-                super::HypothesisId::new(),
-                WorldProposition::new("user 可能忙").expect("proposition"),
-                WorldScope::Person { person_id },
-                0.3,
-                now,
-                None,
+            .upsert_hypothesis(
+                Hypothesis::new(
+                    super::HypothesisId::new(),
+                    WorldProposition::new("user 可能忙").expect("proposition"),
+                    WorldScope::Person { person_id },
+                    0.3,
+                    now,
+                    None,
+                )
+                .expect("hypothesis"),
             )
-            .expect("hypothesis"))
             .expect("hyp");
         world
             .update_social_scene(
@@ -1121,10 +1128,11 @@ mod tests {
             )
             .expect("scene");
         world.erase_person(person_id);
-        assert!(world
-            .hypotheses()
-            .iter()
-            .all(|h| !matches!(h.scope(), WorldScope::Person { person_id: p } if p == person_id)));
+        assert!(
+            world.hypotheses().iter().all(
+                |h| !matches!(h.scope(), WorldScope::Person { person_id: p } if p == person_id)
+            )
+        );
         world.erase_conversation(conversation_id);
         assert!(world.social_scenes().is_empty());
         world.validate().expect("valid");
@@ -1151,13 +1159,20 @@ mod tests {
             )
             .expect("scene");
         let before = world.social_scenes()[0].conversation_version();
-        world.touch_social_scene(conversation_id, now).expect("touch");
+        world
+            .touch_social_scene(conversation_id, now)
+            .expect("touch");
         assert_eq!(world.social_scenes()[0].conversation_version(), before + 1);
-        assert_eq!(world.social_scenes()[0].interruption_cost(), world.social_scenes()[0].interruption_cost());
+        assert_eq!(
+            world.social_scenes()[0].interruption_cost(),
+            world.social_scenes()[0].interruption_cost()
+        );
         // No scene → error (caller decides; nothing invented).
-        assert!(world
-            .touch_social_scene(ConversationId::new(), now)
-            .is_err());
+        assert!(
+            world
+                .touch_social_scene(ConversationId::new(), now)
+                .is_err()
+        );
     }
 
     #[test]
@@ -1208,7 +1223,15 @@ mod tests {
                         None,
                         0.5,
                         vec![EntityUpdateAction::Set(
-                            StateProperty::new("n", i.to_string(), 0.5, ObservationSource::SystemState, now, None).expect("prop"),
+                            StateProperty::new(
+                                "n",
+                                i.to_string(),
+                                0.5,
+                                ObservationSource::SystemState,
+                                now,
+                                None,
+                            )
+                            .expect("prop"),
                         )],
                         now,
                     )
@@ -1225,7 +1248,15 @@ mod tests {
                     None,
                     0.8,
                     vec![EntityUpdateAction::Set(
-                        StateProperty::new("state", "busy", 0.9, ObservationSource::DirectUserStatement, now, None).expect("prop"),
+                        StateProperty::new(
+                            "state",
+                            "busy",
+                            0.9,
+                            ObservationSource::DirectUserStatement,
+                            now,
+                            None,
+                        )
+                        .expect("prop"),
                     )],
                     now,
                 )
@@ -1280,8 +1311,13 @@ mod tests {
             .update_environment(
                 EnvironmentUpdate::new(
                     vec![
-                        HostState::new(host.clone(), ServiceHealth::Healthy, now, Duration::minutes(5))
-                            .expect("host"),
+                        HostState::new(
+                            host.clone(),
+                            ServiceHealth::Healthy,
+                            now,
+                            Duration::minutes(5),
+                        )
+                        .expect("host"),
                     ],
                     vec![],
                     ServiceHealth::Healthy,

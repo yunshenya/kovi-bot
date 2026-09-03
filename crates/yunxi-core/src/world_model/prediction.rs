@@ -457,51 +457,57 @@ mod tests {
         let now = Utc::now();
         let outcome = PredictedOutcome::new(OutcomeKind::Failure, 0.4, -0.3, 0.0, 0.0, -0.2)
             .expect("outcome");
-        assert!(Prediction::new(
-            super::super::PredictionId::new(),
-            "reach_out:a",
-            WorldScope::Global,
-            PredictionHorizon::Immediate,
-            vec![outcome],
-            0.95,
-            0.4,
-            now,
-            None,
-        )
-        .is_err());
-        assert!(Prediction::new(
-            super::super::PredictionId::new(),
-            "reach_out:a",
-            WorldScope::Global,
-            PredictionHorizon::Immediate,
-            vec![outcome],
-            0.4,
-            0.8,
-            now,
-            None,
-        )
-        .is_ok());
+        assert!(
+            Prediction::new(
+                super::super::PredictionId::new(),
+                "reach_out:a",
+                WorldScope::Global,
+                PredictionHorizon::Immediate,
+                vec![outcome],
+                0.95,
+                0.4,
+                now,
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            Prediction::new(
+                super::super::PredictionId::new(),
+                "reach_out:a",
+                WorldScope::Global,
+                PredictionHorizon::Immediate,
+                vec![outcome],
+                0.4,
+                0.8,
+                now,
+                None,
+            )
+            .is_ok()
+        );
     }
 
     #[test]
     fn outcome_probability_sum_is_bounded() {
         let now = Utc::now();
-        let success = PredictedOutcome::new(OutcomeKind::Success, 0.8, 0.8, 0.1, 0.1, 0.9)
-            .expect("success");
+        let success =
+            PredictedOutcome::new(OutcomeKind::Success, 0.8, 0.8, 0.1, 0.1, 0.9).expect("success");
         let failure = PredictedOutcome::new(OutcomeKind::Failure, 0.8, -0.8, 0.1, 0.1, -0.9)
             .expect("failure");
-        assert!(Prediction::new(
-            super::super::PredictionId::new(),
-            "x",
-            WorldScope::Global,
-            PredictionHorizon::Immediate,
-            vec![success, failure],
-            0.4,
-            0.8,
-            now,
-            None,
-        )
-        .is_err());
+        assert!(
+            Prediction::new(
+                super::super::PredictionId::new(),
+                "x",
+                WorldScope::Global,
+                PredictionHorizon::Immediate,
+                vec![success, failure],
+                0.4,
+                0.8,
+                now,
+                None,
+            )
+            .is_err()
+        );
     }
 
     #[test]

@@ -395,7 +395,8 @@ mod tests {
         assert!(addressed < distracted);
         assert!(idle < distracted);
         // Direct conversation is cheaper than rapid group chat when unaddressed…
-        let direct = floor_interruption_cost(false, 0.5, false, SocialSceneKind::DirectConversation);
+        let direct =
+            floor_interruption_cost(false, 0.5, false, SocialSceneKind::DirectConversation);
         let group = floor_interruption_cost(false, 0.5, false, SocialSceneKind::GroupDiscussion);
         assert!(direct <= group);
     }

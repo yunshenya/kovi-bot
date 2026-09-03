@@ -1073,9 +1073,13 @@ impl PostgresIdentityStore {
                 .map_err(IdentityStoreError::storage)?;
         // World Model v4 data follows the same erasure boundary (v4 §242);
         // best-effort: a world-store failure must not abort the erasure.
-        if let Ok(rows) = super::world_model_store::PostgresWorldModelStore::
-            delete_person_domain_rows(&mut transaction, person_id, &conversation_ids)
-                .await
+        if let Ok(rows) =
+            super::world_model_store::PostgresWorldModelStore::delete_person_domain_rows(
+                &mut transaction,
+                person_id,
+                &conversation_ids,
+            )
+            .await
         {
             deleted.world_model = rows;
         }
@@ -1263,9 +1267,12 @@ impl PostgresIdentityStore {
         // World Model v4 conversation rows follow the same group erasure
         // boundary (v4 §242); best-effort.
         if let Some(conversation_id) = conversation_id
-            && let Ok(rows) = super::world_model_store::PostgresWorldModelStore::
-                delete_conversation_domain_rows(&mut transaction, conversation_id)
-                    .await
+            && let Ok(rows) =
+                super::world_model_store::PostgresWorldModelStore::delete_conversation_domain_rows(
+                    &mut transaction,
+                    conversation_id,
+                )
+                .await
         {
             deleted += rows;
         }

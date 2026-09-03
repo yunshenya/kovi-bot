@@ -177,7 +177,9 @@ pub(crate) async fn initialize_database() -> Result<()> {
     // World Model v4 persistence: additive tables, only when the feature is
     // enabled (shadow/disabled deployments never touch these tables).
     if crate::config::get().world_model().enabled() && WORLD_MODEL_STORE.get().is_none() {
-        let store = Arc::new(world_model_store::PostgresWorldModelStore::new(pool.clone()));
+        let store = Arc::new(world_model_store::PostgresWorldModelStore::new(
+            pool.clone(),
+        ));
         store.initialize_schema().await?;
         let _ = WORLD_MODEL_STORE.set(store);
         world_model::restore_from_store().await;
@@ -380,8 +382,7 @@ pub(crate) fn gag_store() -> Option<Arc<PostgresGagStore>> {
     GAG_STORE.get().cloned()
 }
 
-pub(crate) fn world_model_store(
-) -> Option<Arc<world_model_store::PostgresWorldModelStore>> {
+pub(crate) fn world_model_store() -> Option<Arc<world_model_store::PostgresWorldModelStore>> {
     WORLD_MODEL_STORE.get().cloned()
 }
 

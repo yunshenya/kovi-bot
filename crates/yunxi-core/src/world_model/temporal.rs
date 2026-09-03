@@ -3,10 +3,7 @@
 //! Times can be instants or ranges, carry a precision, and every dynamic
 //! state can be classified Fresh / Stale / Expired / Unknown.
 
-use super::{
-    WorldValidationError,
-    common::validate_unit,
-};
+use super::{WorldValidationError, common::validate_unit};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -125,8 +122,7 @@ impl TimeInterval {
     /// Does `now` fall inside the interval (both sides inclusive when set)?
     #[must_use]
     pub fn contains(&self, now: DateTime<Utc>) -> bool {
-        self.start.is_none_or(|start| now >= start)
-            && self.end.is_none_or(|end| now <= end)
+        self.start.is_none_or(|start| now >= start) && self.end.is_none_or(|end| now <= end)
     }
 
     /// Does this interval overlap `other`?
@@ -186,11 +182,7 @@ pub fn relation_between(a: &TimeInterval, b: &TimeInterval) -> TemporalRelation 
                     During
                 }
             } else if b_start <= a_start && a_end <= b_end {
-                if a_start == b_start {
-                    Starts
-                } else {
-                    During
-                }
+                if a_start == b_start { Starts } else { During }
             } else {
                 Overlaps
             }
@@ -313,13 +305,11 @@ impl TimelineState {
     /// Push a new entry (dedupe: identical subject+interval replaces).
     pub fn push(&mut self, entry: TimelineEntry) -> Result<(), WorldValidationError> {
         entry.validate()?;
-        if let Some(existing) = self
-            .entries
-            .iter_mut()
-            .find(|existing| existing.subject() == entry.subject()
+        if let Some(existing) = self.entries.iter_mut().find(|existing| {
+            existing.subject() == entry.subject()
                 && existing.interval().start() == entry.interval().start()
-                && existing.interval().end() == entry.interval().end())
-        {
+                && existing.interval().end() == entry.interval().end()
+        }) {
             *existing = entry;
         } else if self.entries.len() >= MAX_TIMELINE_ENTRIES {
             return Err(WorldValidationError::TooManyItems {
@@ -344,30 +334,54 @@ mod tests {
     }
 
     fn range(start: DateTime<Utc>, end: DateTime<Utc>) -> TimeInterval {
-        TimeInterval::new(Some(start), Some(end), TimePrecision::Approximate, 0.8)
-            .expect("range")
+        TimeInterval::new(Some(start), Some(end), TimePrecision::Approximate, 0.8).expect("range")
     }
 
     #[test]
     fn freshness_stages() {
         let now = Utc::now();
-        assert_eq!(freshness_at(now, Some(now + Duration::minutes(60)), now), Freshness::Fresh);
         assert_eq!(
-            freshness_at(now, Some(now + Duration::minutes(60)), now + Duration::minutes(40)),
+            freshness_at(now, Some(now + Duration::minutes(60)), now),
+            Freshness::Fresh
+        );
+        assert_eq!(
+            freshness_at(
+                now,
+                Some(now + Duration::minutes(60)),
+                now + Duration::minutes(40)
+            ),
             Freshness::Fresh
         );
         // Stale window = last 20% = 12 minutes.
         assert_eq!(
-            freshness_at(now, Some(now + Duration::minutes(60)), now + Duration::minutes(50)),
+            freshness_at(
+                now,
+                Some(now + Duration::minutes(60)),
+                now + Duration::minutes(50)
+            ),
             Freshness::Stale
         );
         assert_eq!(
-            freshness_at(now, Some(now + Duration::minutes(60)), now + Duration::minutes(61)),
+            freshness_at(
+                now,
+                Some(now + Duration::minutes(60)),
+                now + Duration::minutes(61)
+            ),
             Freshness::Expired
         );
-        assert_eq!(freshness_at(now, Some(now + Duration::minutes(60)), now - Duration::minutes(1)), Freshness::Unknown);
+        assert_eq!(
+            freshness_at(
+                now,
+                Some(now + Duration::minutes(60)),
+                now - Duration::minutes(1)
+            ),
+            Freshness::Unknown
+        );
         // Without an expiry, state stays fresh… until clock skew.
-        assert_eq!(freshness_at(now, None, now + Duration::days(365)), Freshness::Fresh);
+        assert_eq!(
+            freshness_at(now, None, now + Duration::days(365)),
+            Freshness::Fresh
+        );
     }
 
     #[test]
@@ -379,7 +393,15 @@ mod tests {
         assert!(!afternoon.is_instant());
         assert!(instant(now).is_instant());
 
-        assert!(TimeInterval::new(Some(now), Some(now - Duration::minutes(1)), TimePrecision::Exact, 1.0).is_err());
+        assert!(
+            TimeInterval::new(
+                Some(now),
+                Some(now - Duration::minutes(1)),
+                TimePrecision::Exact,
+                1.0
+            )
+            .is_err()
+        );
         assert!(TimeInterval::new(Some(now), None, TimePrecision::Approximate, 1.5).is_err());
     }
 
@@ -396,7 +418,10 @@ mod tests {
         assert_eq!(relation_between(&a, &c), TemporalRelation::During);
         assert_eq!(relation_between(&a, &d), TemporalRelation::During);
         assert_eq!(relation_between(&a, &e), TemporalRelation::Starts);
-        assert_eq!(relation_between(&instant(now + Duration::hours(1)), &a), TemporalRelation::ExpectedAt);
+        assert_eq!(
+            relation_between(&instant(now + Duration::hours(1)), &a),
+            TemporalRelation::ExpectedAt
+        );
     }
 
     #[test]
@@ -405,10 +430,16 @@ mod tests {
         let subject = WorldRef::Entity(super::super::EntityId::new());
         let mut state = TimelineState::default();
         state
-            .push(TimelineEntry::new(subject, range(now, now + Duration::hours(1)), now).expect("entry"))
+            .push(
+                TimelineEntry::new(subject, range(now, now + Duration::hours(1)), now)
+                    .expect("entry"),
+            )
             .expect("pushed");
         state
-            .push(TimelineEntry::new(subject, range(now, now + Duration::hours(1)), now).expect("entry"))
+            .push(
+                TimelineEntry::new(subject, range(now, now + Duration::hours(1)), now)
+                    .expect("entry"),
+            )
             .expect("deduped");
         assert_eq!(state.len(), 1);
         state

@@ -68,7 +68,10 @@ impl WorldModelConfig {
             "world_model.persist_interval_secs 必须在 10..=3600"
         );
         anyhow::ensure!(
-            matches!(self.reply_context.as_str(), "disabled" | "shadow" | "active"),
+            matches!(
+                self.reply_context.as_str(),
+                "disabled" | "shadow" | "active"
+            ),
             "world_model.reply_context 必须是 disabled / shadow / active"
         );
         anyhow::ensure!(

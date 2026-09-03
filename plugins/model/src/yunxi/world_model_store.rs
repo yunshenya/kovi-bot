@@ -13,8 +13,8 @@ use sqlx_postgres::{PgPool, Postgres};
 use yunxi_core::WorldModel;
 use yunxi_core::world_model::{
     EntityKind, EntityState, Hypothesis, HypothesisStatus, Observation, ObservationKind,
-    ObservationSource, Situation, SituationKind, SituationState, SocialSceneKind,
-    SocialSceneState, StateProperty, WorldScope, WorldUncertainty, UncertaintyType,
+    ObservationSource, Situation, SituationKind, SituationState, SocialSceneKind, SocialSceneState,
+    StateProperty, UncertaintyType, WorldScope, WorldUncertainty,
 };
 use yunxi_core::{ConversationId, PersonId};
 
@@ -206,9 +206,9 @@ impl PostgresWorldModelStore {
     /// Persist the whole bounded world state (snapshot upsert, v4 §128:
     /// long-lived state in tables, transient state stays runtime-only).
     pub(crate) async fn save_world(&self, world: &WorldModel) -> anyhow::Result<()> {
-        world.validate().map_err(|error| {
-            anyhow::anyhow!("World Model 校验失败，拒绝持久化: {error}")
-        })?;
+        world
+            .validate()
+            .map_err(|error| anyhow::anyhow!("World Model 校验失败，拒绝持久化: {error}"))?;
         let mut transaction = self.pool.begin().await?;
         super::schema::lock(&mut transaction).await?;
         for table in [
@@ -408,7 +408,8 @@ impl PostgresWorldModelStore {
                 decode_observation_source(row.try_get::<String, _>("source")?),
                 yunxi_core::world_model::ObservationPayload::new(
                     row.try_get::<String, _>("content")?,
-                    row.try_get::<Option<String>, _>("facet")?.map(|f| f as String),
+                    row.try_get::<Option<String>, _>("facet")?
+                        .map(|f| f as String),
                 )?,
                 row.try_get::<f32, _>("confidence")?,
                 row.try_get("observed_at")?,
@@ -511,8 +512,7 @@ impl PostgresWorldModelStore {
                 ConversationId::from_uuid(row.try_get("conversation_id")?),
                 serde_json::from_value(row.try_get("participants")?)
                     .map_err(json_error("scene participants"))?,
-                serde_json::from_value(row.try_get("floor")?)
-                    .map_err(json_error("scene floor"))?,
+                serde_json::from_value(row.try_get("floor")?).map_err(json_error("scene floor"))?,
                 serde_json::from_value(row.try_get("recent_speakers")?)
                     .map_err(json_error("scene recent_speakers"))?,
                 row.try_get("bot_addressed")?,
@@ -1026,9 +1026,7 @@ mod tests {
             yunxi_core::CausalScope::ToolSpecific {
                 tool: "web_fetch".to_owned(),
             },
-            yunxi_core::CausalScope::PersonSpecific {
-                person_id: person,
-            },
+            yunxi_core::CausalScope::PersonSpecific { person_id: person },
             yunxi_core::CausalScope::ConversationSpecific {
                 conversation_id: conversation,
             },
@@ -1080,7 +1078,10 @@ mod tests {
             SituationState::Expired,
             SituationState::Unknown,
         ] {
-            assert_eq!(decode_situation_state(situation_state_label(state).to_owned()), state);
+            assert_eq!(
+                decode_situation_state(situation_state_label(state).to_owned()),
+                state
+            );
         }
         for scene in [
             SocialSceneKind::DirectConversation,

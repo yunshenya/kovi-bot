@@ -3,8 +3,8 @@
 //! Models never write the World Model directly. Every mutation flows through
 //! a [`WorldUpdateProposal`] that Rust validates as a whole before applying.
 
-use super::environment::EnvironmentUpdate;
 use super::entity::EntityUpdateProposal;
+use super::environment::EnvironmentUpdate;
 use super::hypothesis::Hypothesis;
 use super::observation::Observation;
 use super::situation::{Situation, SituationTransitionProposal};

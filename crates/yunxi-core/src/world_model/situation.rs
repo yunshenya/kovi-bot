@@ -382,7 +382,10 @@ impl Situation {
     /// Expire in place (Planned/Unknown → Expired), e.g. after the event
     /// window ended; terminal states are untouched.
     pub fn expire(&mut self, now: DateTime<Utc>) -> Result<(), WorldValidationError> {
-        if !matches!(self.state, SituationState::Planned | SituationState::Unknown) {
+        if !matches!(
+            self.state,
+            SituationState::Planned | SituationState::Unknown
+        ) {
             return Err(WorldValidationError::InvalidTransition {
                 from: self.state_label(),
                 to: SituationState::Expired.serde_label(),
@@ -555,14 +558,38 @@ mod tests {
 
     #[test]
     fn transition_table_is_deterministic() {
-        assert!(can_transition(SituationState::Planned, SituationState::InProgress));
-        assert!(can_transition(SituationState::InProgress, SituationState::OutcomeUnknown));
-        assert!(can_transition(SituationState::OutcomeUnknown, SituationState::Completed));
-        assert!(can_transition(SituationState::OutcomeUnknown, SituationState::Failed));
-        assert!(can_transition(SituationState::Planned, SituationState::Expired));
-        assert!(!can_transition(SituationState::Completed, SituationState::InProgress));
-        assert!(!can_transition(SituationState::Failed, SituationState::Completed));
-        assert!(!can_transition(SituationState::Planned, SituationState::Completed));
+        assert!(can_transition(
+            SituationState::Planned,
+            SituationState::InProgress
+        ));
+        assert!(can_transition(
+            SituationState::InProgress,
+            SituationState::OutcomeUnknown
+        ));
+        assert!(can_transition(
+            SituationState::OutcomeUnknown,
+            SituationState::Completed
+        ));
+        assert!(can_transition(
+            SituationState::OutcomeUnknown,
+            SituationState::Failed
+        ));
+        assert!(can_transition(
+            SituationState::Planned,
+            SituationState::Expired
+        ));
+        assert!(!can_transition(
+            SituationState::Completed,
+            SituationState::InProgress
+        ));
+        assert!(!can_transition(
+            SituationState::Failed,
+            SituationState::Completed
+        ));
+        assert!(!can_transition(
+            SituationState::Planned,
+            SituationState::Completed
+        ));
     }
 
     #[test]
@@ -570,30 +597,34 @@ mod tests {
         let now = Utc::now();
         let situation = sample_situation(now);
         // Planned → Completed is not in the table, so the proposal fails.
-        assert!(SituationTransitionProposal::new(
-            situation.id(),
-            situation.version(),
-            SituationState::Planned,
-            SituationState::Completed,
-            0.8,
-            ObservationSource::DirectUserStatement,
-            false,
-            None,
-            now,
-        )
-        .is_err());
-        assert!(SituationTransitionProposal::new(
-            situation.id(),
-            situation.version(),
-            SituationState::Planned,
-            SituationState::Failed,
-            0.8,
-            ObservationSource::DirectUserStatement,
-            false,
-            None,
-            now,
-        )
-        .is_ok());
+        assert!(
+            SituationTransitionProposal::new(
+                situation.id(),
+                situation.version(),
+                SituationState::Planned,
+                SituationState::Completed,
+                0.8,
+                ObservationSource::DirectUserStatement,
+                false,
+                None,
+                now,
+            )
+            .is_err()
+        );
+        assert!(
+            SituationTransitionProposal::new(
+                situation.id(),
+                situation.version(),
+                SituationState::Planned,
+                SituationState::Failed,
+                0.8,
+                ObservationSource::DirectUserStatement,
+                false,
+                None,
+                now,
+            )
+            .is_ok()
+        );
     }
 
     #[test]

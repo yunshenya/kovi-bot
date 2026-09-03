@@ -8,7 +8,9 @@
 use super::ObservationId;
 use super::{
     WorldScope, WorldValidationError,
-    common::{MAX_EVIDENCE_REFS, MAX_WORLD_VALUE_CHARS, clamp_unit, dedupe, validate_text, validate_unit},
+    common::{
+        MAX_EVIDENCE_REFS, MAX_WORLD_VALUE_CHARS, clamp_unit, dedupe, validate_text, validate_unit,
+    },
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -35,7 +37,10 @@ pub enum HypothesisStatus {
 impl HypothesisStatus {
     #[must_use]
     pub const fn is_resolved(self) -> bool {
-        matches!(self, Self::Supported | Self::Rejected | Self::Superseded | Self::Expired)
+        matches!(
+            self,
+            Self::Supported | Self::Rejected | Self::Superseded | Self::Expired
+        )
     }
 }
 
@@ -408,24 +413,28 @@ mod tests {
     #[test]
     fn creation_threshold_prevents_low_quality_hypotheses() {
         let now = Utc::now();
-        assert!(Hypothesis::new(
-            super::super::HypothesisId::new(),
-            WorldProposition::new("可能忙").expect("proposition"),
-            WorldScope::Global,
-            0.1,
-            now,
-            None,
-        )
-        .is_err());
-        assert!(Hypothesis::new(
-            super::super::HypothesisId::new(),
-            WorldProposition::new("可能忙").expect("proposition"),
-            WorldScope::Global,
-            MIN_HYPOTHESIS_CREATE_CONFIDENCE,
-            now,
-            None,
-        )
-        .is_ok());
+        assert!(
+            Hypothesis::new(
+                super::super::HypothesisId::new(),
+                WorldProposition::new("可能忙").expect("proposition"),
+                WorldScope::Global,
+                0.1,
+                now,
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            Hypothesis::new(
+                super::super::HypothesisId::new(),
+                WorldProposition::new("可能忙").expect("proposition"),
+                WorldScope::Global,
+                MIN_HYPOTHESIS_CREATE_CONFIDENCE,
+                now,
+                None,
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -476,7 +485,8 @@ mod tests {
         assert_eq!(h.evidence_for(), &[obs_a]);
         assert_eq!(h.evidence_against(), &[obs_b]);
 
-        h.resolve(HypothesisStatus::Supported, now).expect("supported");
+        h.resolve(HypothesisStatus::Supported, now)
+            .expect("supported");
         assert_eq!(h.status(), HypothesisStatus::Supported);
         // Resolved hypotheses cannot resolve again.
         assert!(h.resolve(HypothesisStatus::Rejected, now).is_err());
