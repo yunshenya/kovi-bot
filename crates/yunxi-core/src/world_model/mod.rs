@@ -93,6 +93,7 @@ mod environment;
 mod hypothesis;
 mod ids;
 mod observation;
+mod prediction;
 mod situation;
 mod snapshot;
 mod social_scene;
@@ -126,6 +127,11 @@ pub use observation::{
     Observation, ObservationDraft, ObservationKind, ObservationPayload, ObservationSource,
     ObservationSourceReliability, MAX_OBSERVATIONS_PER_EVENT,
     MAX_OBSERVATION_PAYLOAD_BYTES, MAX_OBSERVATION_PAYLOAD_CHARS, observation_fingerprint,
+};
+pub use prediction::{
+    MAX_PREDICTED_OUTCOMES, MAX_RUNTIME_PREDICTION_ERRORS, MAX_RUNTIME_PREDICTIONS, OutcomeKind,
+    Prediction, PredictionCalibration, PredictionError, PredictionHorizon, ProbabilityBand,
+    PredictedOutcome, quantize_probability,
 };
 pub use situation::{
     Situation, SituationKind, SituationState, SituationStatus, SituationTransitionProposal,
@@ -339,6 +345,8 @@ pub struct WorldModel {
     environment: EnvironmentState,
     timeline: TimelineState,
     uncertainties: Vec<WorldUncertainty>,
+    predictions: Vec<Prediction>,
+    prediction_errors: Vec<PredictionError>,
     version: u64,
 }
 
@@ -360,6 +368,8 @@ impl WorldModel {
             environment: EnvironmentState::default(),
             timeline: TimelineState::default(),
             uncertainties: Vec::new(),
+            predictions: Vec::new(),
+            prediction_errors: Vec::new(),
             version: 1,
         }
     }
@@ -387,6 +397,8 @@ impl WorldModel {
             environment,
             timeline: TimelineState::from_entries(timeline_entries)?,
             uncertainties,
+            predictions: Vec::new(),
+            prediction_errors: Vec::new(),
             version: if version == 0 { 1 } else { version },
         };
         world.validate()?;
@@ -411,6 +423,12 @@ impl WorldModel {
         self.timeline.validate()?;
         for uncertainty in &self.uncertainties {
             uncertainty.validate()?;
+        }
+        for prediction in &self.predictions {
+            prediction.validate()?;
+        }
+        for prediction_error in &self.prediction_errors {
+            prediction_error.validate()?;
         }
         if self.version == 0 {
             return Err(WorldValidationError::ZeroVersion);
@@ -461,6 +479,58 @@ impl WorldModel {
     #[must_use]
     pub fn uncertainties(&self) -> &[WorldUncertainty] {
         &self.uncertainties
+    }
+
+    #[must_use]
+    pub fn predictions(&self) -> &[Prediction] {
+        &self.predictions
+    }
+
+    #[must_use]
+    pub fn prediction_errors(&self) -> &[PredictionError] {
+        &self.prediction_errors
+    }
+
+    /// Record a validated prediction (bounded; newest wins on capacity).
+    pub fn record_prediction(
+        &mut self,
+        prediction: Prediction,
+    ) -> Result<(), WorldValidationError> {
+        prediction.validate()?;
+        if self.predictions.len() >= prediction::MAX_RUNTIME_PREDICTIONS {
+            self.predictions.remove(0);
+        }
+        self.predictions.push(prediction);
+        self.version = self.version.saturating_add(1);
+        Ok(())
+    }
+
+    /// Record a prediction error (bounded calibration signal, v4 §123).
+    pub fn record_prediction_error(
+        &mut self,
+        error: PredictionError,
+    ) -> Result<(), WorldValidationError> {
+        error.validate()?;
+        if self.prediction_errors.len() >= prediction::MAX_RUNTIME_PREDICTION_ERRORS {
+            self.prediction_errors.remove(0);
+        }
+        self.prediction_errors.push(error);
+        self.version = self.version.saturating_add(1);
+        Ok(())
+    }
+
+    /// Rolling calibration accuracy for all recorded errors (v4 §123).
+    #[must_use]
+    pub fn calibration_accuracy(&self) -> Option<f32> {
+        if self.prediction_errors.is_empty() {
+            return None;
+        }
+        let correct = self
+            .prediction_errors
+            .iter()
+            .filter(|error| error.is_correct())
+            .count();
+        Some(correct as f32 / self.prediction_errors.len() as f32)
     }
 
     /// Record one observation (dedupe by fingerprint, TTL-aware).
@@ -714,6 +784,9 @@ impl WorldModel {
         });
         self.uncertainties.retain(|uncertainty| {
             uncertainty.freshness_at(now) != Freshness::Expired
+        });
+        self.predictions.retain(|prediction| {
+            prediction.freshness_at(now) != Freshness::Expired
         });
         let removed = before - (self.observations.len() + self.hypotheses.len());
         if removed > 0 {
