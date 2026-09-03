@@ -39,6 +39,7 @@ pub(crate) struct PersonDomainDeletion {
     pub(crate) affect_states: u64,
     pub(crate) relations: u64,
     pub(crate) goals: u64,
+    pub(crate) world_model: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1070,6 +1071,14 @@ impl PostgresIdentityStore {
             delete_person_domain_rows(&mut transaction, person_id, &conversation_ids, &qq_user_ids)
                 .await
                 .map_err(IdentityStoreError::storage)?;
+        // World Model v4 data follows the same erasure boundary (v4 §242);
+        // best-effort: a world-store failure must not abort the erasure.
+        if let Ok(rows) = super::world_model_store::PostgresWorldModelStore::
+            delete_person_domain_rows(&mut transaction, person_id, &conversation_ids)
+                .await
+        {
+            deleted.world_model = rows;
+        }
         if let Some(person_id) = person_id {
             deleted.memories +=
                 query("DELETE FROM yunxi_memories WHERE scope_kind = 'person' AND scope_id = $1")
@@ -1251,6 +1260,15 @@ impl PostgresIdentityStore {
         let mut deleted = delete_group_domain_rows(&mut transaction, conversation_id, group_id)
             .await
             .map_err(IdentityStoreError::storage)?;
+        // World Model v4 conversation rows follow the same group erasure
+        // boundary (v4 §242); best-effort.
+        if let Some(conversation_id) = conversation_id
+            && let Ok(rows) = super::world_model_store::PostgresWorldModelStore::
+                delete_conversation_domain_rows(&mut transaction, conversation_id)
+                    .await
+        {
+            deleted += rows;
+        }
         if let Some(conversation_id) = conversation_id {
             deleted += query(
                 "DELETE FROM yunxi_memories

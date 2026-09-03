@@ -665,6 +665,12 @@ async fn main() {
             world_sensors::start_scheduler(world_sensor_bot).await;
         });
 
+        // World Model v4 persistence loop (gated internally by
+        // `world_model.enabled` + `persist`; never blocks chat).
+        kovi::tokio::spawn(async move {
+            yunxi::world_model::persistence_loop().await;
+        });
+
         // Shadow-mode World Model runtime status (observability only; the
         // runtime itself is fed from inbound events and world facts).
         {

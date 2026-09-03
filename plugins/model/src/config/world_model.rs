@@ -12,6 +12,11 @@ use serde::{Deserialize, Serialize};
 pub struct WorldModelConfig {
     enabled: bool,
     shadow_mode: bool,
+    /// Persist the in-memory World Model to Postgres (restart recovery,
+    /// v4 §130). Requires a configured database; ignored when `enabled=false`.
+    persist: bool,
+    /// Persistence write interval (seconds).
+    persist_interval_secs: u64,
     /// TTL (seconds) applied to observations derived from chat world facts.
     observation_ttl_secs: u64,
     /// Maximum distinct conversations with a live social scene.
@@ -25,6 +30,8 @@ impl Default for WorldModelConfig {
         Self {
             enabled: false,
             shadow_mode: true,
+            persist: true,
+            persist_interval_secs: 30,
             observation_ttl_secs: 60 * 60 * 24,
             max_social_scenes: 256,
             activity_window_secs: 60,
@@ -46,6 +53,10 @@ impl WorldModelConfig {
             self.activity_window_secs >= 10 && self.activity_window_secs <= 600,
             "world_model.activity_window_secs 必须在 10..=600"
         );
+        anyhow::ensure!(
+            self.persist_interval_secs >= 10 && self.persist_interval_secs <= 3600,
+            "world_model.persist_interval_secs 必须在 10..=3600"
+        );
         Ok(())
     }
 
@@ -55,6 +66,14 @@ impl WorldModelConfig {
 
     pub fn shadow_mode(&self) -> bool {
         self.shadow_mode
+    }
+
+    pub fn persist(&self) -> bool {
+        self.persist
+    }
+
+    pub fn persist_interval_secs(&self) -> u64 {
+        self.persist_interval_secs
     }
 
     pub fn observation_ttl_secs(&self) -> u64 {

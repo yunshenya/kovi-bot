@@ -153,6 +153,45 @@ impl Situation {
         Ok(situation)
     }
 
+    /// Restore a persisted situation (adapter use): validates the whole
+    /// record including terminal-state consistency.
+    #[allow(clippy::too_many_arguments)]
+    pub fn restore(
+        id: super::SituationId,
+        kind: SituationKind,
+        state: SituationState,
+        detail: Option<String>,
+        participants: Vec<EntityId>,
+        persons: Vec<PersonId>,
+        conversation_id: Option<ConversationId>,
+        related_goals: Vec<GoalId>,
+        related_open_loops: Vec<OpenLoopId>,
+        confidence: f32,
+        started_at: DateTime<Utc>,
+        updated_at: DateTime<Utc>,
+        ended_at: Option<DateTime<Utc>>,
+        version: u64,
+    ) -> Result<Self, WorldValidationError> {
+        let mut situation = Self::new(
+            id,
+            kind,
+            state,
+            detail,
+            participants,
+            persons,
+            conversation_id,
+            related_goals,
+            related_open_loops,
+            confidence,
+            started_at,
+        )?;
+        situation.updated_at = updated_at;
+        situation.ended_at = ended_at;
+        situation.version = version;
+        situation.validate()?;
+        Ok(situation)
+    }
+
     pub fn validate(&self) -> Result<(), WorldValidationError> {
         validate_unit(self.confidence, "situation confidence")?;
         if self.version == 0 {

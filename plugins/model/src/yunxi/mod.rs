@@ -22,6 +22,7 @@ pub(crate) mod qq;
 mod relation_store;
 mod schema;
 pub(crate) mod world_model; // World Model v4 host-side runtime (shadow)
+mod world_model_store; // World Model v4 persistence (infrastructure)
 
 use affect_store::PostgresAffectStore;
 use anyhow::{Context, Result};
@@ -64,6 +65,9 @@ static AFFECT_STORE: OnceLock<Arc<PostgresAffectStore>> = OnceLock::new();
 static RELATION_STORE: OnceLock<Arc<PostgresRelationStore>> = OnceLock::new();
 static GOAL_STORE: OnceLock<Arc<PostgresGoalStore>> = OnceLock::new();
 static GAG_STORE: OnceLock<Arc<PostgresGagStore>> = OnceLock::new();
+/// World Model v4 persistence store (None until `world_model.enabled`).
+static WORLD_MODEL_STORE: OnceLock<Arc<world_model_store::PostgresWorldModelStore>> =
+    OnceLock::new();
 static DELIVERY_LEDGER: OnceLock<Arc<PostgresDeliveryLedger>> = OnceLock::new();
 static MIND_STORE: OnceLock<Arc<PostgresMindStore>> = OnceLock::new();
 static MIND_RUNTIME: OnceLock<Arc<MindRuntime>> = OnceLock::new();
@@ -169,6 +173,14 @@ pub(crate) async fn initialize_database() -> Result<()> {
         ));
         store.initialize_schema().await?;
         let _ = MEMORY_STORE.set(store);
+    }
+    // World Model v4 persistence: additive tables, only when the feature is
+    // enabled (shadow/disabled deployments never touch these tables).
+    if crate::config::get().world_model().enabled() && WORLD_MODEL_STORE.get().is_none() {
+        let store = Arc::new(world_model_store::PostgresWorldModelStore::new(pool.clone()));
+        store.initialize_schema().await?;
+        let _ = WORLD_MODEL_STORE.set(store);
+        world_model::restore_from_store().await;
     }
     if AFFECT_STORE.get().is_none() {
         let store = Arc::new(PostgresAffectStore::new(pool.clone()));
@@ -366,6 +378,11 @@ pub(crate) fn open_loop_store() -> Option<Arc<PostgresOpenLoopStore>> {
 
 pub(crate) fn gag_store() -> Option<Arc<PostgresGagStore>> {
     GAG_STORE.get().cloned()
+}
+
+pub(crate) fn world_model_store(
+) -> Option<Arc<world_model_store::PostgresWorldModelStore>> {
+    WORLD_MODEL_STORE.get().cloned()
 }
 
 #[allow(dead_code)]

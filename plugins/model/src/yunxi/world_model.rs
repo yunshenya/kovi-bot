@@ -8,6 +8,7 @@
 //! cancel. That belongs to Executive / Core (v4 §7, §56, §249–§255).
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::Instant;
 use yunxi_core::world_model::{
@@ -25,6 +26,10 @@ struct WorldRuntime {
 
 static WORLD_RUNTIME: LazyLock<Mutex<Option<WorldRuntime>>> =
     LazyLock::new(|| Mutex::new(None));
+
+/// Set whenever in-memory world state changed; cleared after a successful
+/// save. Persistence is best-effort and never blocks chat (v4 §248, §252).
+static WORLD_DIRTY: AtomicBool = AtomicBool::new(false);
 
 /// Per-conversation recent message timestamps, bounded by
 /// `world_model.max_social_scenes` and the activity window (60s). Deriving
@@ -53,6 +58,87 @@ fn with_world<F: FnOnce(&mut WorldModel, usize /*max scenes*/)>(f: F) {
         world: WorldModel::new(),
     });
     f(&mut runtime.world, config.max_social_scenes());
+    WORLD_DIRTY.store(true, Ordering::Relaxed);
+}
+
+/// Restore a previously persisted world into the runtime (v4 §130).
+/// Fail-soft: any load error logs and starts from an empty world.
+pub(crate) async fn restore_from_store() {
+    let Some(store) = super::world_model_store() else {
+        return;
+    };
+    if !world_config().enabled() {
+        return;
+    }
+    match store.load_world().await {
+        Ok(Some(world)) => {
+            let mut guard = WORLD_RUNTIME
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *guard = Some(WorldRuntime { world });
+            println!(
+                "{WORLD_LOG_PREFIX} restore 完成: version={}",
+                guard.as_ref().map(|r| r.world.version()).unwrap_or(1)
+            );
+        }
+        Ok(None) => println!("{WORLD_LOG_PREFIX} 无持久化状态，从空开始"),
+        Err(error) => eprintln!("{WORLD_LOG_PREFIX} 恢复失败（fail-soft，从空开始）: {error}"),
+    }
+}
+
+/// Periodic persistence loop: snapshot-dirty → save, bounded interval.
+pub(crate) async fn persistence_loop() {
+    if !world_config().enabled() || !world_config().persist() {
+        return;
+    }
+    let interval =
+        std::time::Duration::from_secs(world_config().persist_interval_secs().max(10));
+    loop {
+        kovi::tokio::time::sleep(interval).await;
+        if !WORLD_DIRTY.load(Ordering::Relaxed) {
+            continue;
+        }
+        persist_if_dirty().await;
+    }
+}
+
+/// Save the world state when dirty (best-effort; keeps dirty on failure).
+pub(crate) async fn persist_if_dirty() {
+    let Some(store) = super::world_model_store() else {
+        return;
+    };
+    if !WORLD_DIRTY.load(Ordering::Relaxed) {
+        return;
+    }
+    let snapshot = {
+        let mut guard = WORLD_RUNTIME
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(runtime) = guard.as_mut() else {
+            return;
+        };
+        // TTL maintenance before persisting (v4 §131): expired observations
+        // and hypotheses must not survive a save/restore cycle.
+        runtime.world.prune_expired(chrono::Utc::now());
+        Some(runtime.world.clone())
+    };
+    let Some(snapshot) = snapshot else {
+        return;
+    };
+    match store.save_world(&snapshot).await {
+        Ok(()) => {
+            WORLD_DIRTY.store(false, Ordering::Relaxed);
+            kovi::log::debug!(
+                "{WORLD_LOG_PREFIX} persisted version={} observations={} situations={}",
+                snapshot.version(),
+                snapshot.observations().len(),
+                snapshot.situations().len()
+            );
+        }
+        Err(error) => eprintln!(
+            "{WORLD_LOG_PREFIX} 持久化失败（保留脏标记，稍后重试）: {error}"
+        ),
+    }
 }
 
 /// Reset the in-memory runtime (used by tests). No-op production effect.
@@ -62,6 +148,7 @@ pub(crate) fn reset_for_tests() {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     *guard = None;
+    WORLD_DIRTY.store(false, Ordering::Relaxed);
     let mut tracker = ACTIVITY_TRACKER
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());

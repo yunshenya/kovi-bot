@@ -299,6 +299,13 @@ impl TimelineState {
         self.entries.is_empty()
     }
 
+    /// Rebuild from persisted entries (validated, bounded).
+    pub fn from_entries(entries: Vec<TimelineEntry>) -> Result<Self, WorldValidationError> {
+        let state = Self { entries };
+        state.validate()?;
+        Ok(state)
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = &TimelineEntry> {
         self.entries.iter()
     }

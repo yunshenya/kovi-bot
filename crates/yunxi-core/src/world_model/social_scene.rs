@@ -248,6 +248,36 @@ impl SocialSceneState {
         Ok(())
     }
 
+    /// Restore a persisted scene (adapter use): re-validates everything.
+    #[allow(clippy::too_many_arguments)]
+    pub fn restore(
+        conversation_id: ConversationId,
+        active_participants: Vec<PersonId>,
+        current_floor: Vec<PersonId>,
+        recent_speaking_order: Vec<PersonId>,
+        bot_addressed: bool,
+        activity_level: f32,
+        interruption_cost: f32,
+        scene_kind: SocialSceneKind,
+        conversation_version: u64,
+        updated_at: DateTime<Utc>,
+    ) -> Result<Self, WorldValidationError> {
+        let scene = Self {
+            conversation_id,
+            active_participants: dedupe(active_participants, "scene participants", true)?,
+            current_floor: dedupe(current_floor, "scene floor", true)?,
+            recent_speaking_order: dedupe(recent_speaking_order, "scene speakers", true)?,
+            bot_addressed,
+            activity_level: clamp_unit(activity_level),
+            interruption_cost: clamp_unit(interruption_cost),
+            scene_kind,
+            conversation_version,
+            updated_at,
+        };
+        scene.validate()?;
+        Ok(scene)
+    }
+
     #[must_use]
     pub const fn conversation_id(&self) -> ConversationId {
         self.conversation_id

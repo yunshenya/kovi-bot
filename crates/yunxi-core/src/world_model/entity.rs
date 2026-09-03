@@ -566,6 +566,13 @@ impl EntityStateIndex {
         self.entities
             .retain(|entity| entity.linked_conversation() != Some(conversation_id));
     }
+
+    /// Rebuild an index from persisted entities (validated, bounded).
+    pub fn from_entities(entities: Vec<EntityState>) -> Result<Self, WorldValidationError> {
+        let index = Self { entities };
+        index.validate()?;
+        Ok(index)
+    }
 }
 
 #[cfg(test)]

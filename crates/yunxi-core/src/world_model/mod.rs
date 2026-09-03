@@ -364,6 +364,35 @@ impl WorldModel {
         }
     }
 
+    /// Restore a persisted world state (adapter use): validates every part
+    /// and rebuilds a consistent model; version floored at 1.
+    #[allow(clippy::too_many_arguments)]
+    pub fn restore_from_parts(
+        observations: Vec<Observation>,
+        entities: Vec<EntityState>,
+        situations: Vec<Situation>,
+        hypotheses: Vec<Hypothesis>,
+        social_scene: Vec<SocialSceneState>,
+        environment: EnvironmentState,
+        timeline_entries: Vec<TimelineEntry>,
+        uncertainties: Vec<WorldUncertainty>,
+        version: u64,
+    ) -> Result<Self, WorldValidationError> {
+        let world = Self {
+            observations,
+            entities: EntityStateIndex::from_entities(entities)?,
+            situations,
+            hypotheses,
+            social_scene,
+            environment,
+            timeline: TimelineState::from_entries(timeline_entries)?,
+            uncertainties,
+            version: if version == 0 { 1 } else { version },
+        };
+        world.validate()?;
+        Ok(world)
+    }
+
     pub fn validate(&self) -> Result<(), WorldValidationError> {
         for observation in &self.observations {
             observation.validate()?;
@@ -673,6 +702,26 @@ impl WorldModel {
         snapshot::build_snapshot(self, context)
     }
 
+    /// TTL maintenance (v4 §131): drop expired observations and hypotheses.
+    /// Idempotent; returns how many records were removed.
+    pub fn prune_expired(&mut self, now: DateTime<Utc>) -> usize {
+        let before = self.observations.len() + self.hypotheses.len();
+        self.observations.retain(|observation| {
+            observation.freshness_at(now) != Freshness::Expired
+        });
+        self.hypotheses.retain(|hypothesis| {
+            hypothesis.freshness_at(now) != Freshness::Expired
+        });
+        self.uncertainties.retain(|uncertainty| {
+            uncertainty.freshness_at(now) != Freshness::Expired
+        });
+        let removed = before - (self.observations.len() + self.hypotheses.len());
+        if removed > 0 {
+            self.version = self.version.saturating_add(1);
+        }
+        removed
+    }
+
     /// Erase every world-model record linked to the person. Used by data
     /// deletion flows (v4 §242).
     pub fn erase_person(&mut self, person_id: PersonId) {
@@ -951,6 +1000,37 @@ mod tests {
         assert!(world
             .touch_social_scene(ConversationId::new(), now)
             .is_err());
+    }
+
+    #[test]
+    fn prune_expired_removes_expired_records_only() {
+        let now = Utc::now();
+        let mut world = WorldModel::new();
+        let ttl_observation = observation(
+            WorldScope::Global,
+            "short-lived state",
+            now - Duration::hours(2),
+        );
+        // The observation helper uses a 1h TTL from its observed_at, so it is
+        // already expired now.
+        world.observe(ttl_observation).expect("obs");
+        world
+            .upsert_hypothesis(
+                Hypothesis::new(
+                    super::HypothesisId::new(),
+                    WorldProposition::new("可能忙").expect("proposition"),
+                    WorldScope::Global,
+                    0.3,
+                    now - Duration::hours(2),
+                    Some(now - Duration::hours(1)),
+                )
+                .expect("hypothesis"),
+            )
+            .expect("hyp");
+        let removed = world.prune_expired(now);
+        assert_eq!(removed, 2);
+        assert!(world.observations().is_empty());
+        assert!(world.hypotheses().is_empty());
     }
 
     #[test]

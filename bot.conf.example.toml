@@ -274,11 +274,14 @@ cooldown_secs = 600
 # importance = 60
 
 # World Model v4 运行时（影子模式；默认关闭，开启后也只记录状态，
-# 绝不阻塞/改变回复）：可作为观察与社交场景的进程内状态源，
-# 供后续 R2/R3 阶段接入 Executive 软信号与持久化。
+# 绝不阻塞/改变回复）：观察/情境/场景的进程内状态 + 可选的 Postgres
+# 持久化（重启恢复、数据删除联动）。持久化表按需创建（additive），
+# 其余组件不受影响。
 [world_model]
 enabled = false
 shadow_mode = true
+persist = true
+persist_interval_secs = 30
 observation_ttl_secs = 86400
 max_social_scenes = 256
 activity_window_secs = 60
