@@ -97,6 +97,13 @@ pub(crate) async fn private_message_event_after_ingress(
         crate::yunxi::world_model::scene_person_id(user_id),
         true,
     );
+    // Shadow-mode World Model: the user's own words, not an inference
+    // (v4 §10), plus deterministic situation derivation.
+    crate::yunxi::world_model::record_private_message(
+        crate::yunxi::world_model::scene_direct_conversation_id(user_id),
+        crate::yunxi::world_model::scene_person_id(user_id),
+        message,
+    );
     if is_restricted_command(message) && !sender_is_admin {
         println!("[INFO] 私聊未授权命令已静默 (用户: {})", user_id);
         return;

@@ -223,6 +223,10 @@ pub(crate) fn record_group_scene(
                 }
             }
         }
+        // R2: derive/maintain the conversation situation with the same lock.
+        if let Err(error) = apply_scene_derivation(world, conversation_id, now) {
+            kovi::log::debug!("{WORLD_LOG_PREFIX} scene derivation skipped: {error}");
+        }
     });
 }
 
@@ -256,6 +260,9 @@ pub(crate) fn record_direct_scene(
                 world.version()
             ),
             Err(error) => eprintln!("{WORLD_LOG_PREFIX} direct scene update failed: {error}"),
+        }
+        if let Err(error) = apply_scene_derivation(world, conversation_id, now) {
+            kovi::log::debug!("{WORLD_LOG_PREFIX} scene derivation skipped: {error}");
         }
     });
 }
@@ -354,6 +361,120 @@ pub(crate) fn status_summary() -> Option<String> {
             ""
         }
     ))
+}
+
+/// Record an inbound private message as a structured observation (v4 §10:
+/// what the user actually said, not an inference). TTL 24h by default;
+/// content truncated; gated by `[world_model].enabled`.
+pub(crate) fn record_private_message(
+    conversation_id: yunxi_core::ConversationId,
+    person_id: PersonId,
+    content: &str,
+) {
+    record_observation(
+        WorldScope::Person { person_id },
+        ObservationKind::MessageReceived,
+        ObservationSource::DirectUserStatement,
+        content,
+        None,
+    );
+    derive_and_maintain_scene(conversation_id);
+}
+
+/// Deterministic situation derivation + maintenance for one conversation
+/// (R2, 0 模型调用): group discussion / direct chat situations from the
+/// social scene, and staleness marking (v4 §25, §90–92).
+///
+/// - GroupDiscussion/RapidGroupChat with activity ≥ 0.5 → situation
+///   `ConversationState / InProgress / 群讨论中`.
+/// - DirectConversation → `ConversationState / InProgress / 私聊进行中`.
+/// - `ConversationState` situations idle > 10 minutes move to
+///   `OutcomeUnknown` (never silently stays "in progress", v4 §92).
+fn derive_and_maintain_scene(conversation_id: yunxi_core::ConversationId) {
+    with_world(|world, _max_scenes| {
+        let now = chrono::Utc::now();
+        if let Err(error) = apply_scene_derivation(world, conversation_id, now) {
+            kovi::log::debug!("{WORLD_LOG_PREFIX} scene derivation skipped: {error}");
+        }
+    });
+}
+
+/// Pure derivation rules (unit-testable without the config-gated runtime).
+fn apply_scene_derivation(
+    world: &mut WorldModel,
+    conversation_id: yunxi_core::ConversationId,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(), yunxi_core::world_model::WorldValidationError> {
+    use yunxi_core::world_model::{
+        SituationKind, SituationState, SituationStatus, SituationTransitionProposal,
+    };
+    // 1. Derive an active scene situation from the live scene, deduped by
+    // (kind, conversation).
+    let scene = world
+        .social_scenes()
+        .iter()
+        .find(|scene| scene.conversation_id() == conversation_id)
+        .cloned();
+    if let Some(scene) = scene {
+        let active_scene = scene.activity_level() >= 0.5
+            && scene.scene_kind() != yunxi_core::SocialSceneKind::Unknown;
+        let already = world.situations().iter().any(|situation| {
+            situation.kind() == SituationKind::ConversationState
+                && situation.conversation_id() == Some(conversation_id)
+                && situation.status() == SituationStatus::Active
+        });
+        if active_scene && !already && world.situations().len() < 8 {
+            let detail = match scene.scene_kind() {
+                yunxi_core::SocialSceneKind::DirectConversation => "私聊进行中".to_owned(),
+                _ => "群讨论中".to_owned(),
+            };
+            let situation = yunxi_core::Situation::new(
+                yunxi_core::SituationId::new(),
+                SituationKind::ConversationState,
+                SituationState::InProgress,
+                Some(detail),
+                vec![],
+                scene.active_participants().to_vec(),
+                Some(conversation_id),
+                vec![],
+                vec![],
+                0.6,
+                now,
+            )?;
+            world.add_situation(situation)?;
+        }
+    }
+    // 2. Maintain: conversation situations idle > 10 min move to
+    // OutcomeUnknown via a validated transition (only InProgress is allowed
+    // to move there, so nothing else is touched).
+    let idle = chrono::Duration::minutes(10);
+    let stale: Vec<_> = world
+        .situations()
+        .iter()
+        .filter(|situation| {
+            situation.kind() == SituationKind::ConversationState
+                && situation.conversation_id() == Some(conversation_id)
+                && situation.status() == SituationStatus::Active
+                && situation.state() == SituationState::InProgress
+                && now - situation.updated_at() > idle
+        })
+        .map(|situation| (situation.id(), situation.version()))
+        .collect();
+    for (situation_id, version) in stale {
+        let proposal = SituationTransitionProposal::new(
+            situation_id,
+            version,
+            SituationState::InProgress,
+            SituationState::OutcomeUnknown,
+            0.4,
+            yunxi_core::ObservationSource::SystemState,
+            false,
+            None,
+            now,
+        )?;
+        world.apply_situation_transition(proposal)?;
+    }
+    Ok(())
 }
 
 /// Record a message collision (committed outgoing + near-simultaneous
@@ -545,5 +666,45 @@ mod tests {
     fn truncate_respects_char_boundaries() {
         assert_eq!(truncate_chars("abc", 2), "ab");
         assert_eq!(truncate_chars("你好呀", 2), "你好");
+    }
+
+    #[test]
+    fn scene_derivation_creates_dedupes_and_expires_situation() {
+        use yunxi_core::world_model::{
+            SituationState, SocialSceneKind, SocialSceneUpdate,
+        };
+        let conversation_id = yunxi_core::ConversationId::new();
+        let mut world = WorldModel::new();
+        let now = chrono::Utc::now();
+        // No scene → nothing is invented.
+        apply_scene_derivation(&mut world, conversation_id, now).expect("ok");
+        assert!(world.situations().is_empty());
+        // Active group scene → situation derived.
+        world
+            .update_social_scene(
+                SocialSceneUpdate::new(
+                    conversation_id,
+                    now,
+                    vec![PersonId::new()],
+                    vec![],
+                    vec![],
+                    false,
+                    0.8,
+                    SocialSceneKind::GroupDiscussion,
+                )
+                .expect("scene update"),
+            )
+            .expect("scene");
+        apply_scene_derivation(&mut world, conversation_id, now).expect("derive");
+        assert_eq!(world.situations().len(), 1);
+        assert_eq!(world.situations()[0].state(), SituationState::InProgress);
+        // Dedupe: a second derivation does not multiply.
+        apply_scene_derivation(&mut world, conversation_id, now).expect("derive again");
+        assert_eq!(world.situations().len(), 1);
+        // Idle > 10 min → OutcomeUnknown (never stays "in progress").
+        let later = now + chrono::Duration::minutes(11);
+        apply_scene_derivation(&mut world, conversation_id, later).expect("maintain");
+        assert_eq!(world.situations()[0].state(), SituationState::OutcomeUnknown);
+        assert!(world.situations()[0].is_active());
     }
 }
