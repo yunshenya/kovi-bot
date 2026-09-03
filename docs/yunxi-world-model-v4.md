@@ -28,13 +28,13 @@
 | **Hypothesis**（§27–33） | ✅ 领域模型已实现（命题归一化去重 / 证据合并 / 反对共存 / 创建阈值 0.20）；未接入插件 | `crates/yunxi-core/src/world_model/hypothesis.rs` |
 | **Temporal**（§34–38） | ✅ 领域模型已实现（TimeInterval 区间+精度 / Freshness：Fresh/Stale/Expired/Unknown / timeline）；时间表达解析属插件层，未实现 | `crates/yunxi-core/src/world_model/temporal.rs` |
 | **Causal / Prediction / Simulation**（§39–52、§53–67） | ⬜ 未实现（按 rollout R5–R7 后置） | — |
-| **SocialScene / Environment**（§68–79） | ✅ 领域模型已实现；插件影子模式已接入群聊/私聊场景喂入与确定性 interruption cost、传感器状态 | `crates/yunxi-core/src/world_model/{social_scene.rs,environment.rs}`；`plugins/model/src/yunxi/world_model.rs::{record_group_scene,record_direct_scene,record_entity_property}` |
-| **WorldModel 聚合 + Snapshot**（§63–67、§84–92） | ✅ 已实现（bounds 16/8/8/12/8、相关检索、version 计数、批式提案 apply、erase_person/erase_conversation） | `crates/yunxi-core/src/world_model/{mod.rs,snapshot.rs,update.rs}` |
+| **SocialScene / Environment**（§68–79） | ✅ 领域模型已实现；插件影子模式已接入群聊/私聊场景喂入与确定性 interruption cost；**消息碰撞 → ConversationEvent 观察 + 场景版本 touch**（附录 §2–§4，零心理推断）；传感器状态 → 实体属性 | `crates/yunxi-core/src/world_model/{social_scene.rs,environment.rs}`；`plugins/model/src/yunxi/world_model.rs::{record_group_scene,record_direct_scene,record_collision,record_entity_property}`；`plugins/model/src/yunxi/bridge.rs::submit_message_collisions` |
+| **WorldModel 聚合 + Snapshot**（§63–67、§84–92） | ✅ 已实现（bounds 16/8/8/12/8、相关检索、version 计数、批式提案 apply、erase_person/erase_conversation、scene touch） | `crates/yunxi-core/src/world_model/{mod.rs,snapshot.rs,update.rs}` |
 | **WorldModel Store Ports / Persistence / 表结构**（§125–131，含 `yunxi_world_observations`） | ⬜ 设计表**尚未创建**（v4 持久化属 Phase 15；当前仅进程内） | — |
 | 与 OpenLoop/Mind 的接入 | 🔶 部分（watch 开环已接；§93–95、§112 其余未接） | `observe_world_fact` 的 `world_loop_draft` 分支 |
-| **Phase 0–16 建设计划**（§175–193） | 🔶 Phase 0–8 领域层已完成（`cargo test -p yunxi-core` 全绿，零平台耦合，无行为变更）；R1 传感器泛化（file_state）与影子模式运行时已接入；R2–R4 插件侧推导/Executive 软信号未接入 | `crates/yunxi-core/src/world_model/`；`plugins/model/src/{config/world_model.rs,yunxi/world_model.rs}` |
+| **Phase 0–16 建设计划**（§175–193） | 🔶 Phase 0–8 领域层已完成（`cargo test -p yunxi-core` 全绿，零平台耦合，无行为变更）；R1 传感器泛化（file_state）已接入；R2 观测面 `#情境/#world-status` 已可查当前局面；R3 场景喂入+碰撞已接；**R4 软信号以 debug 日志影子输出，尚未影响行为决策**；R5–R8 未实施 | `crates/yunxi-core/src/world_model/`；`plugins/model/src/{config/world_model.rs,yunxi/world_model.rs,model/world_commands.rs}` |
 
-> **一句话现状**：v4 的**平台无关领域层（Phase 0–8）已全部落地**（有界、构造即校验、278+ 单元测试），插件侧已有**影子模式运行时**（观察/场景喂入，`[world_model] enabled=false` 默认关闭，绝不阻塞聊天）；**持久化、预测/模拟、Executive 软信号与完整推导流水线仍在 rollout 路线图中**。下文设计节引用的表（如 `yunxi_world_observations`）都是**目标 schema，尚未建表**。
+> **一句话现状**：v4 的**平台无关领域层（Phase 0–8）已全部落地**（有界、构造即校验、279+ 单元测试），插件侧已有**影子模式运行时**（观察/场景/消息碰撞喂入 + `#情境` 观测命令，`[world_model] enabled=false` 默认关闭，绝不阻塞聊天）；**R4 Executive 行为级软信号仍为日志影子状态**，持久化、预测/模拟与完整推导流水线仍在 rollout 路线图中。下文设计节引用的表（如 `yunxi_world_observations`）都是**目标 schema，尚未建表**。
 
 ## 0.2 分组目录
 

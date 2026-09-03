@@ -19,6 +19,7 @@ pub(crate) mod tool_access;
 mod tracked_send;
 mod traffic;
 pub(crate) mod utils;
+mod world_commands;
 
 #[cfg(feature = "integration-tests")]
 pub(crate) use interrupt::is_active;

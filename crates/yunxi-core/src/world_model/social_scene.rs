@@ -333,6 +333,20 @@ impl SocialSceneState {
     pub fn person_has_floor(&self, person_id: PersonId) -> bool {
         self.current_floor.contains(&person_id)
     }
+
+    /// Mark that a conversation-level event happened (e.g. a message
+    /// collision): bump `conversation_version` and `updated_at` only. Single
+    /// fact, no psychology (v4 appendix §4–§5).
+    pub fn touch(&mut self, now: DateTime<Utc>) -> Result<(), WorldValidationError> {
+        if now < self.updated_at {
+            return Err(WorldValidationError::InvalidTimestamp {
+                reason: "scene touch predates stored state",
+            });
+        }
+        self.conversation_version = self.conversation_version.saturating_add(1);
+        self.updated_at = now;
+        self.validate()
+    }
 }
 
 #[cfg(test)]

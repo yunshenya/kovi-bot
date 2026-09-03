@@ -431,6 +431,16 @@ pub(crate) async fn group_message_event_after_ingress(
         vec![crate::yunxi::world_model::scene_person_id(event.user_id)],
         locally_addressed,
     );
+    // R4 shadow soft signal: read the world back and log what an Executive
+    // would see. Log only — the behavioral wiring stays disabled until the
+    // shadow metrics are reviewed (v4 §217).
+    if crate::config::get().world_model().enabled()
+        && let Some(summary) = crate::yunxi::world_model::conversation_world_summary(
+            crate::yunxi::world_model::scene_group_conversation_id(group_id),
+        )
+    {
+        kovi::log::debug!("[YUNXI_WORLD] soft_signal {}", summary.render());
+    }
     if locally_addressed
         && !sender_is_admin
         && should_suppress_direct_trigger(group_id, event.user_id).await

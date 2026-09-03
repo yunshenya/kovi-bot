@@ -3665,6 +3665,11 @@ async fn submit_message_collisions(
                 fingerprint: collision.fingerprint,
             }),
         );
+        // Shadow-mode World Model: record "both sides spoke almost at once"
+        // as a ConversationEvent observation + scene version touch. It is a
+        // normal world state change, never an apology/retract signal, and it
+        // cannot influence delivery here (v4 appendix §3, §7).
+        super::world_model::record_collision(conversation_id);
         if let Some(mind) = super::mind_runtime() {
             let timeout = std::time::Duration::from_millis(mind.config().event_update_timeout_ms());
             match kovi::tokio::time::timeout(timeout, mind.observe_event(&collision_event)).await {

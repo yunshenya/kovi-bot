@@ -565,6 +565,26 @@ impl WorldModel {
         Ok(())
     }
 
+    /// Conversation-level event (message collision, floor change): bump the
+    /// scene's version and timestamp without inferring anything (v4 appendix
+    /// §4–§5). Errors when no scene exists yet.
+    pub fn touch_social_scene(
+        &mut self,
+        conversation_id: ConversationId,
+        now: DateTime<Utc>,
+    ) -> Result<(), WorldValidationError> {
+        let scene = self
+            .social_scene
+            .iter_mut()
+            .find(|scene| scene.conversation_id() == conversation_id)
+            .ok_or(WorldValidationError::InvalidState {
+                reason: "no social scene for conversation",
+            })?;
+        scene.touch(now)?;
+        self.version = self.version.saturating_add(1);
+        Ok(())
+    }
+
     pub fn update_environment(
         &mut self,
         update: EnvironmentUpdate,
@@ -901,6 +921,36 @@ mod tests {
         world.erase_conversation(conversation_id);
         assert!(world.social_scenes().is_empty());
         world.validate().expect("valid");
+    }
+
+    #[test]
+    fn collision_touch_bumps_scene_version_without_inference() {
+        let now = Utc::now();
+        let conversation_id = ConversationId::new();
+        let mut world = WorldModel::new();
+        world
+            .update_social_scene(
+                SocialSceneUpdate::new(
+                    conversation_id,
+                    now,
+                    vec![PersonId::new()],
+                    vec![],
+                    vec![],
+                    false,
+                    0.3,
+                    SocialSceneKind::GroupDiscussion,
+                )
+                .expect("scene update"),
+            )
+            .expect("scene");
+        let before = world.social_scenes()[0].conversation_version();
+        world.touch_social_scene(conversation_id, now).expect("touch");
+        assert_eq!(world.social_scenes()[0].conversation_version(), before + 1);
+        assert_eq!(world.social_scenes()[0].interruption_cost(), world.social_scenes()[0].interruption_cost());
+        // No scene → error (caller decides; nothing invented).
+        assert!(world
+            .touch_social_scene(ConversationId::new(), now)
+            .is_err());
     }
 
     #[test]

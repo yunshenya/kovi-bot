@@ -356,6 +356,155 @@ pub(crate) fn status_summary() -> Option<String> {
     ))
 }
 
+/// Record a message collision (committed outgoing + near-simultaneous
+/// incoming) into the World Model: a bounded ConversationEvent observation
+/// plus a scene version touch. **No psychology** — it is explicitly only the
+/// external fact that both sides spoke almost at once (v4 appendix §2–§5).
+pub(crate) fn record_collision(conversation_id: yunxi_core::ConversationId) {
+    record_observation(
+        WorldScope::Conversation { conversation_id },
+        ObservationKind::ConversationEvent,
+        ObservationSource::PlatformEvent,
+        "消息碰撞：我方消息与对方新消息几乎同时到达",
+        Some(300),
+    );
+    with_world(|world, _max_scenes| {
+        let now = chrono::Utc::now();
+        match world.touch_social_scene(conversation_id, now) {
+            Ok(()) => println!(
+                "{WORLD_LOG_PREFIX} collision scene_touch conversation_id={conversation_id} version={}",
+                world.version()
+            ),
+            Err(error) => kovi::log::debug!(
+                "{WORLD_LOG_PREFIX} collision scene touch skipped: {error}"
+            ),
+        }
+    });
+}
+
+/// Bounded "what does the world look like right now for this conversation"
+/// soft signal (v4 §231 decision formula input; R4 shadow source).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ConversationWorldSummary {
+    pub scene_kind: Option<SocialSceneKind>,
+    pub activity_level: f32,
+    pub interruption_cost: f32,
+    pub bot_addressed: bool,
+    pub active_situations: Vec<String>,
+    pub active_hypotheses: usize,
+    pub degraded_tools: usize,
+    pub unavailable_hosts: usize,
+}
+
+impl ConversationWorldSummary {
+    /// Single-line, bounded rendering for logs/admin.
+    pub fn render(&self) -> String {
+        let scene = match self.scene_kind {
+            Some(kind) => format!("{kind:?}"),
+            None => "none".to_owned(),
+        };
+        format!(
+            "scene={scene} activity={:.2} interrupt={:.2} addressed={} situations={} hypotheses={} tools_degraded={} hosts_unavailable={}",
+            self.activity_level,
+            self.interruption_cost,
+            self.bot_addressed,
+            self.active_situations.len(),
+            self.active_hypotheses,
+            self.degraded_tools,
+            self.unavailable_hosts,
+        )
+    }
+}
+
+/// Compute the soft signal for a decision about `conversation_id`. Returns
+/// `None` when the World Model is disabled or unavailable (fail-soft: the
+/// caller then uses its v3 path, v4 §249).
+pub(crate) fn conversation_world_summary(
+    conversation_id: yunxi_core::ConversationId,
+) -> Option<ConversationWorldSummary> {
+    let guard = WORLD_RUNTIME
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let world = &guard.as_ref()?.world;
+    let now = chrono::Utc::now();
+    let context = yunxi_core::WorldSnapshotContext::new(now).with_conversation(conversation_id);
+    let snapshot = world.snapshot_for(&context).ok()?;
+    let scene = snapshot.social_scene();
+    let environment = snapshot.environment();
+    let active_situations = snapshot
+        .situations()
+        .iter()
+        .filter(|situation| situation.status() == yunxi_core::SituationStatus::Active)
+        .map(|situation| {
+            situation
+                .detail()
+                .map_or_else(|| format!("{:?}", situation.kind()), str::to_owned)
+        })
+        .collect();
+    Some(ConversationWorldSummary {
+        scene_kind: scene.map(|scene| scene.scene_kind()),
+        activity_level: scene.map_or(0.0, |scene| scene.activity_level()),
+        interruption_cost: scene.map_or(0.0, |scene| scene.interruption_cost()),
+        bot_addressed: scene.is_some_and(|scene| scene.bot_addressed()),
+        active_situations,
+        active_hypotheses: snapshot.hypotheses().len(),
+        degraded_tools: environment
+            .tools()
+            .iter()
+            .filter(|tool| tool.health() == yunxi_core::ServiceHealth::Degraded)
+            .count(),
+        unavailable_hosts: environment
+            .hosts()
+            .iter()
+            .filter(|host| host.health() == yunxi_core::ServiceHealth::Unavailable)
+            .count(),
+    })
+}
+
+/// Human-readable bounded world status for `#world-status` / `#情境`
+/// (admin only, v4 §155/§244). Never includes message content.
+pub(crate) fn world_status_text() -> String {
+    let summary = status_summary().unwrap_or_else(|| "World Model 未启用".to_owned());
+    let mut text = format!("World Model v4 状态\n{summary}\n");
+    if let Some(runtime) = WORLD_RUNTIME
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+    {
+        let world = &runtime.world;
+        let now = chrono::Utc::now();
+        let context = yunxi_core::WorldSnapshotContext::new(now);
+        if let Ok(snapshot) = world.snapshot_for(&context) {
+            if snapshot.situations().is_empty() {
+                text.push_str("活跃情境：无\n");
+            } else {
+                text.push_str("活跃情境：\n");
+                for situation in snapshot
+                    .situations()
+                    .iter()
+                    .filter(|s| s.status() == yunxi_core::SituationStatus::Active)
+                    .take(8)
+                {
+                    text.push_str(&format!(
+                        "- {:?} / {:?} / {:?}\n",
+                        situation.kind(),
+                        situation.state(),
+                        situation.detail().unwrap_or(""),
+                    ));
+                }
+            }
+            text.push_str(&format!(
+                "环境：模型健康 {:?}，主机 {} 个（可用率 {:.0}%），工具健康报告 {} 条\n",
+                snapshot.environment().model_health(),
+                snapshot.environment().hosts().len(),
+                snapshot.environment().availability_fraction() * 100.0,
+                snapshot.environment().tools().len(),
+            ));
+        }
+    }
+    truncate_chars(&text, 1200)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

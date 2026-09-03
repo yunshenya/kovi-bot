@@ -176,6 +176,18 @@ pub(crate) async fn private_message_event_after_ingress(
         send_private_direct_response(&bot, user_id, initial_admission, report).await;
         return;
     }
+    if crate::model::world_commands::parse_world_command(message).is_some() {
+        // Read-only World Model v4 observability: admin-only, counts/summary
+        // only, never message content (v4 §155, §245).
+        if !sender_is_admin {
+            println!("[INFO] 私聊世界模型命令未授权 (用户: {})", user_id);
+            return;
+        }
+        if let Some(reply) = crate::model::world_commands::handle_world_command(message) {
+            send_private_direct_response(&bot, user_id, initial_admission, &reply).await;
+        }
+        return;
+    }
     if message.trim() == "#intrinsic-status" && sender_is_admin {
         let report = crate::yunxi::intrinsic_status_report();
         send_private_direct_response(&bot, user_id, initial_admission, report).await;
