@@ -236,12 +236,11 @@ pub(crate) fn record_outbound(conversation_id: ConversationId, occurred_at: Date
 
 /// Record a normal reply and its model-selected conversation directive.
 ///
-/// A delivered direct-chat reply enters a short continuation cooldown even
-/// when its normal-turn directive is `wait`, `end`, or missing. Those values
-/// describe the current answer, not an explicit request to close the private
-/// conversation; the next autonomous turn still asks the model whether there
-/// is a real next thought worth sending. This is based on conversation kind,
-/// never message text. Group directives retain their terminal semantics.
+/// The model's directive is respected in every conversation. Previously a
+/// delivered direct-chat reply was forced to `Continue`, so a private chat
+/// kept generating follow-up turns (自问自答/自言自语) until the `max_turns`
+/// ceiling. Now a `wait`/`end`/missing directive pauses the conversation until
+/// the human speaks again; only an explicit `continue` schedules another turn.
 pub(crate) fn record_outbound_with_directive(
     conversation_id: ConversationId,
     occurred_at: DateTime<Utc>,
@@ -253,12 +252,7 @@ pub(crate) fn record_outbound_with_directive(
     };
     let entry = registry.entries.get_mut(&conversation_id)?;
     let policy = config.map(autonomy_policy).unwrap_or_default();
-    let direct_conversation = entry.lifecycle.kind() == ConversationKind::Direct;
-    let effective_directive = if direct_conversation {
-        Some(ConversationTurnDirective::Continue)
-    } else {
-        directive
-    };
+    let effective_directive = directive;
     entry
         .lifecycle
         .record_outbound(occurred_at, effective_directive, policy)
@@ -723,7 +717,7 @@ mod tests {
     }
 
     #[test]
-    fn omitted_directive_defaults_to_direct_continuation() {
+    fn omitted_directive_pauses_direct_conversation() {
         let _guard = TEST_LOCK.lock().expect("test lock");
         clear();
         let id = ConversationId::new();
@@ -731,18 +725,20 @@ mod tests {
         let config = ProactiveConfig::default();
         observe_inbound(id, ConversationKind::Direct, now, true);
         record_outbound_with_directive(id, now, None, Some(&config));
-        assert_eq!(
+        // An omitted directive no longer forces a private conversation to keep
+        // going; the bot pauses instead of 自问自答 until a new inbound turn.
+        assert!(
             claim_due(
                 &config,
                 now + Duration::seconds(config.autonomous_conversation_cooldown_secs() as i64)
-            ),
-            Some(id)
+            )
+            .is_none()
         );
         clear();
     }
 
     #[test]
-    fn direct_end_is_rechecked_before_terminal() {
+    fn direct_end_pauses_until_a_new_inbound_turn() {
         let _guard = TEST_LOCK.lock().expect("test lock");
         clear();
         let id = ConversationId::new();
@@ -755,18 +751,20 @@ mod tests {
             Some(ConversationTurnDirective::End),
             Some(&config),
         );
-        assert_eq!(
+        // The model's `end` is respected: the private conversation pauses
+        // instead of continuously re-checking (no more 自言自语).
+        assert!(
             claim_due(
                 &config,
                 now + Duration::seconds(config.autonomous_conversation_cooldown_secs() as i64)
-            ),
-            Some(id)
+            )
+            .is_none()
         );
         clear();
     }
 
     #[test]
-    fn direct_wait_is_rechecked_before_terminal() {
+    fn direct_wait_pauses_until_a_new_inbound_turn() {
         let _guard = TEST_LOCK.lock().expect("test lock");
         clear();
         let id = ConversationId::new();
@@ -779,12 +777,14 @@ mod tests {
             Some(ConversationTurnDirective::Wait),
             Some(&config),
         );
-        assert_eq!(
+        // Respecting the model's `wait` pauses the private conversation; no
+        // self-initiated follow-up is scheduled until a new inbound turn.
+        assert!(
             claim_due(
                 &config,
                 now + Duration::seconds(config.autonomous_conversation_cooldown_secs() as i64)
-            ),
-            Some(id)
+            )
+            .is_none()
         );
         clear();
     }
@@ -827,7 +827,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_wait_is_rechecked_instead_of_suppressing_autonomy() {
+    fn direct_wait_is_respected_instead_of_retriggering_autonomy() {
         let _guard = TEST_LOCK.lock().expect("test lock");
         clear();
         let id = ConversationId::new();
@@ -840,12 +840,14 @@ mod tests {
             Some(ConversationTurnDirective::Wait),
             Some(&config),
         );
-        assert_eq!(
+        // The model's `wait` stops the private autonomous loop instead of
+        // re-triggering another self-generated turn.
+        assert!(
             claim_due(
                 &config,
                 now + Duration::seconds(config.autonomous_conversation_cooldown_secs() as i64)
-            ),
-            Some(id)
+            )
+            .is_none()
         );
         clear();
     }

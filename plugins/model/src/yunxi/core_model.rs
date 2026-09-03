@@ -4033,14 +4033,17 @@ fn default_autonomous_directive(
     has_visible_content: bool,
 ) -> ConversationTurnDirective {
     match autonomous_conversation_kind(input) {
+        // After a visible reply, default to waiting for the human instead of
+        // autonomously generating another follow-up. This stops 自问自答/自言自语
+        // in both private and group chats. An explicit model `continue` cue
+        // still schedules the next turn.
         Some(ConversationKind::Direct) if has_visible_content => {
-            ConversationTurnDirective::Continue
+            ConversationTurnDirective::Wait
         }
-        // Keep group autonomy open-ended as well. A visible turn schedules
-        // another semantic check; the next tick can return an empty plan when
-        // the topic has cooled or no public-value thought remains. Ambient
-        // group activity still cancels pending work at ingress.
-        Some(ConversationKind::Group) if has_visible_content => ConversationTurnDirective::Continue,
+        // Group autonomy is equally guarded: a visible turn pauses for human
+        // activity (ambient group messages reset pending work on ingress)
+        // rather than endlessly continuing on its own.
+        Some(ConversationKind::Group) if has_visible_content => ConversationTurnDirective::Wait,
         _ => ConversationTurnDirective::End,
     }
 }
@@ -8231,9 +8234,11 @@ mod tests {
         assert!(context[1].content.contains("刚才那个话题还没聊完"));
         assert!(context[1].content.contains("那我们接着说"));
         assert!(autonomous_conversation_prompt(&input).contains("值得单独发送"));
+        // A visible autonomous turn defaults to pausing (Wait) after the reply,
+        // so the bot does not 自问自答/自言自语 in a direct conversation.
         assert_eq!(
             default_autonomous_directive(&input, true),
-            ConversationTurnDirective::Continue
+            ConversationTurnDirective::Wait
         );
 
         assert!(autonomous_conversation_protocol().contains("自主会话正文"));
@@ -8350,9 +8355,11 @@ mod tests {
         );
         assert_eq!(payload["messages"].as_array().map(Vec::len), Some(2));
         assert!(autonomous_conversation_prompt(&input).contains("对整个群都自然且有公共价值"));
+        // A visible group turn also defaults to pausing (Wait) after the reply,
+        // so the bot stops endlessly continuing on its own.
         assert_eq!(
             default_autonomous_directive(&input, true),
-            ConversationTurnDirective::Continue
+            ConversationTurnDirective::Wait
         );
         assert_eq!(
             default_autonomous_directive(&input, false),
