@@ -5,17 +5,13 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub const DEFAULT_MAX_PLAN_REVISIONS: u8 = 3;
-pub const DEFAULT_MAX_CANDIDATE_COUNT: usize = 4;
 pub const DEFAULT_MAX_ACTIVE_CONFLICTS: usize = 16;
-pub const DEFAULT_DEEP_REFLECTION_BUDGET: u32 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct ExecutivePolicy {
     pub max_plan_revisions: u8,
-    pub max_candidate_count: usize,
     pub conflict_threshold: f32,
     pub max_active_conflicts: usize,
-    pub deep_reflection_budget: u32,
     pub attention_budget_capacity: f32,
     pub critical_attention_reserve: f32,
     pub confidence_max_normal_delta: f32,
@@ -27,10 +23,8 @@ impl Default for ExecutivePolicy {
     fn default() -> Self {
         Self {
             max_plan_revisions: DEFAULT_MAX_PLAN_REVISIONS,
-            max_candidate_count: DEFAULT_MAX_CANDIDATE_COUNT,
             conflict_threshold: 0.60,
             max_active_conflicts: DEFAULT_MAX_ACTIVE_CONFLICTS,
-            deep_reflection_budget: DEFAULT_DEEP_REFLECTION_BUDGET,
             attention_budget_capacity: 20.0,
             critical_attention_reserve: 6.0,
             confidence_max_normal_delta: 0.20,
@@ -45,11 +39,6 @@ impl ExecutivePolicy {
         if self.max_plan_revisions == 0 || self.max_plan_revisions > 16 {
             return Err(ExecutivePolicyError::InvalidBound {
                 field: "max_plan_revisions",
-            });
-        }
-        if !(2..=4).contains(&self.max_candidate_count) {
-            return Err(ExecutivePolicyError::InvalidBound {
-                field: "max_candidate_count",
             });
         }
         for (field, value) in [

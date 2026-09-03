@@ -137,6 +137,7 @@ fn autonomy_policy_from_env() -> AutonomyPolicy {
         group_idle: idle,
         direct_cooldown: cooldown,
         group_cooldown: cooldown,
+        ..AutonomyPolicy::default()
     }
 }
 

@@ -382,11 +382,54 @@ impl PostgresMindStore {
         .await
         .map_err(MindStoreError::storage)?
         .rows_affected();
+        // Beliefs / preferences / interests / open questions are dedupe-keyed
+        // (a re-encountered proposition updates the existing row), so growth is
+        // only from genuinely new distinct records. Still cap each scope so a
+        // long-running deployment cannot accumulate unbounded knowledge state.
+        // We keep the most recently updated records and only evict the oldest
+        // once a scope exceeds the cap, mirroring the episode bound.
+        let repository_scope_cap: i64 = 256;
+        let mut capped_repository = 0_u64;
+        for table in [
+            RecordTable::Beliefs,
+            RecordTable::Preferences,
+            RecordTable::Interests,
+            RecordTable::OpenQuestions,
+        ] {
+            let table_name = table.name();
+            let statement = format!(
+                r#"
+                WITH ranked AS (
+                    SELECT id,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY scope_key
+                               ORDER BY updated_at DESC, id
+                           ) AS retention_rank
+                    FROM {table_name}
+                ), evictable AS (
+                    SELECT id
+                    FROM ranked
+                    WHERE retention_rank > $1
+                )
+                DELETE FROM {table_name} AS record
+                USING evictable
+                WHERE record.id = evictable.id
+                "#
+            );
+            let deleted = query(&statement)
+                .bind(repository_scope_cap)
+                .execute(&mut *transaction)
+                .await
+                .map_err(MindStoreError::storage)?
+                .rows_affected();
+            capped_repository = capped_repository.saturating_add(deleted);
+        }
         let removed = orphaned_agenda
             .saturating_add(curiosities)
             .saturating_add(agenda)
             .saturating_add(expired_episodes)
-            .saturating_add(capped_episodes);
+            .saturating_add(capped_episodes)
+            .saturating_add(capped_repository);
         if removed > 0 {
             bump_meta(&mut transaction).await?;
         }

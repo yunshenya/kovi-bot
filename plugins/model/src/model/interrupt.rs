@@ -9,6 +9,11 @@ use std::time::{Duration, Instant};
 
 const MAX_PENDING_OUTGOING_PER_SCOPE: usize = 8;
 const MAX_COLLISIONS_PER_SCOPE: usize = 16;
+/// Bound for inbound reservations waiting on an active reply. A message flood
+/// into one scope while a reply is generating must not grow the set without
+/// bound; at capacity the newest message falls through to the ordinary
+/// admission path instead of piling one reservation per message.
+const MAX_ACTIVE_INCOMING_PER_SCOPE: usize = 32;
 const OUTGOING_TERMINAL_RETENTION: Duration = Duration::from_secs(60);
 const OUTGOING_UNKNOWN_RETENTION: Duration = Duration::from_secs(60 * 60);
 const MESSAGE_COLLISION_WINDOW: Duration = Duration::from_secs(3);
@@ -372,6 +377,9 @@ pub(crate) async fn reserve_active_incoming_locked(ticket: ReplyTicket) -> Optio
     let now = Instant::now();
     expire_coordination(ticket.scope, state, now);
     if !ticket_matches(state, ticket) {
+        return None;
+    }
+    if state.active_incoming.len() >= MAX_ACTIVE_INCOMING_PER_SCOPE {
         return None;
     }
     state.incoming_sequence = state.incoming_sequence.wrapping_add(1).max(1);
@@ -1827,18 +1835,18 @@ pub(crate) async fn test_outgoing_state(token: OutgoingToken) -> Option<Outgoing
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_PENDING_OUTGOING_PER_SCOPE, OutgoingCommitRejection, OutgoingSource, OutgoingState,
-        OutgoingToken, REPLY_STATES, ReplyScope, action_outgoing_fingerprint, cancel_locked,
-        cancel_prepared_proactive_locked, claim_follow_up, clear_reply_state_locked,
-        commit_outgoing, commit_outgoing_guard, commit_outgoing_guard_with_context,
-        contextual_outgoing_fingerprint, find_prepared_outgoing,
-        find_prepared_outgoing_by_fingerprint, finish, interrupt, interrupt_if_current, is_active,
-        is_current, mark_active, mark_outgoing_failed, mark_outgoing_sent, outgoing_fingerprint,
-        prepare_outgoing, prepare_outgoing_batch_with_semantic_preview,
-        prepare_proactive_outgoing_if_idle, prepared_outgoing_source_locked,
-        release_active_incoming, release_incoming_locked, reserve_active_incoming_locked,
-        scope_mutex, take_message_collisions, try_freeze_prepared_for_incoming_locked,
-        wait_for_pending_incoming,
+        MAX_ACTIVE_INCOMING_PER_SCOPE, MAX_PENDING_OUTGOING_PER_SCOPE, OutgoingCommitRejection,
+        OutgoingSource, OutgoingState, OutgoingToken, REPLY_STATES, ReplyScope,
+        action_outgoing_fingerprint, cancel_locked, cancel_prepared_proactive_locked,
+        claim_follow_up, clear_reply_state_locked, commit_outgoing, commit_outgoing_guard,
+        commit_outgoing_guard_with_context, contextual_outgoing_fingerprint,
+        find_prepared_outgoing, find_prepared_outgoing_by_fingerprint, finish, interrupt,
+        interrupt_if_current, is_active, is_current, mark_active, mark_outgoing_failed,
+        mark_outgoing_sent, outgoing_fingerprint, prepare_outgoing,
+        prepare_outgoing_batch_with_semantic_preview, prepare_proactive_outgoing_if_idle,
+        prepared_outgoing_source_locked, release_active_incoming, release_incoming_locked,
+        reserve_active_incoming_locked, scope_mutex, take_message_collisions,
+        try_freeze_prepared_for_incoming_locked, wait_for_pending_incoming,
     };
 
     async fn outgoing_state(token: OutgoingToken) -> Option<OutgoingState> {
@@ -2394,6 +2402,35 @@ mod tests {
                     .await
                     .expect("所有语义入站完成后应能领取排队回复");
                 finish(follow_up).await;
+            });
+    }
+
+    #[test]
+    fn active_incoming_is_bounded_per_scope() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let scope = ReplyScope::Group(9_000_014);
+                let completed = interrupt(scope).await;
+                assert!(mark_active(completed).await);
+                for _ in 0..MAX_ACTIVE_INCOMING_PER_SCOPE {
+                    let lock = scope_mutex(scope);
+                    let _guard = lock.lock().await;
+                    assert!(
+                        reserve_active_incoming_locked(completed).await.is_some(),
+                        "每一条活动入站都应能保留，直到达到上限"
+                    );
+                }
+                let overflow = {
+                    let lock = scope_mutex(scope);
+                    let _guard = lock.lock().await;
+                    reserve_active_incoming_locked(completed).await
+                };
+                assert!(
+                    overflow.is_none(),
+                    "达到上限后不得再增长 (active_incoming 必须是有界集合)"
+                );
+                finish(completed).await;
             });
     }
 

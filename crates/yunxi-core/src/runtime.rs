@@ -534,6 +534,16 @@ impl DataErasureState {
     }
 
     fn blocks(&self, event: &WorldEvent) -> bool {
+        // A derived event may carry trusted actor provenance (e.g. a tool
+        // completion or action result for a specific person) even when its
+        // scope is Global or a non-blocked target. Treat an erased actor as a
+        // blocking key so that person's causal chain cannot re-enter working
+        // state during the erasure window.
+        if let Some(actor) = event.actor()
+            && self.conversations_by_person.contains_key(&actor)
+        {
+            return true;
+        }
         match event.scope() {
             EventScope::Person { person_id }
                 if self.conversations_by_person.contains_key(&person_id) =>
@@ -738,9 +748,19 @@ impl CognitiveRuntime {
     ) {
         if self.pending_tool_follow_ups.len() < MAX_PENDING_TOOL_FOLLOW_UPS {
             self.pending_tool_follow_ups.push_back(event);
-        } else if let ProcessingOutcome::Observed(feedback_observation) = self.process_event(event)
-        {
-            feedback.push(feedback_observation);
+        } else {
+            // Bounded backpressure: the pending queue is full. Previously this
+            // silently observed the newest tool result without ever running its
+            // planner turn, so a user-requested reply was lost. Drop the oldest
+            // (longest-stale) pending follow-up — observing it so its context is
+            // still fed to working state — and keep the newest so its required
+            // model turn still runs.
+            if let Some(stale) = self.pending_tool_follow_ups.pop_front()
+                && let ProcessingOutcome::Observed(observation) = self.process_event(stale)
+            {
+                feedback.push(observation);
+            }
+            self.pending_tool_follow_ups.push_back(event);
         }
     }
 
@@ -2050,10 +2070,22 @@ fn due_open_loop_id(event: &WorldEvent) -> Option<crate::OpenLoopId> {
 /// runtime's final `ProposedAction`.
 #[must_use]
 pub fn planned_action_idempotency_key(event: &WorldEvent, intent_index: usize) -> String {
-    due_open_loop_id(event).map_or_else(
-        || crate::event_action_idempotency_key(event.id(), intent_index),
-        |open_loop_id| format!("open-loop:{open_loop_id}:delivery:{intent_index}"),
-    )
+    if let Some(open_loop_id) = due_open_loop_id(event) {
+        return format!("open-loop:{open_loop_id}:delivery:{intent_index}");
+    }
+    // Bind only the ROOT message event to the stable message identity. A
+    // re-minted / re-submitted root message mints a fresh EventId, so keying
+    // on EventId would admit the same logical message twice and send a
+    // duplicate reply. Derived events (tool follow-ups etc.) inherit the root's
+    // source message id, so keying them on it too would collide with the root's
+    // own intents; they keep their own event id, and their dedup is already
+    // guarded by the root's stable key.
+    if event.trace().depth() == 0
+        && let Some(message_id) = event.source_message_id()
+    {
+        return format!("message:{message_id}:intent:{intent_index}");
+    }
+    crate::event_action_idempotency_key(event.id(), intent_index)
 }
 
 fn apply_action_idempotency_key(
@@ -4430,6 +4462,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tool_follow_up_overflow_drops_oldest_and_keeps_newest() {
+        let (_handle, mut runtime) = CognitiveRuntime::new_with_services(
+            RuntimeConfig::default(),
+            CoreServices::with_model(CountingModel {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+        )
+        .expect("valid runtime");
+        let mut feedback = Vec::new();
+        let first = event(EventPriority::Normal);
+        let first_id = first.id();
+        runtime.pending_tool_follow_ups.push_back(first);
+        while runtime.pending_tool_follow_ups.len() < super::MAX_PENDING_TOOL_FOLLOW_UPS {
+            runtime
+                .pending_tool_follow_ups
+                .push_back(event(EventPriority::Normal));
+        }
+        assert_eq!(
+            runtime.pending_tool_follow_ups.len(),
+            super::MAX_PENDING_TOOL_FOLLOW_UPS
+        );
+        // Overflow: the newest must be kept, the oldest observed then dropped,
+        // so the newest tool result still gets its required planner turn.
+        let newest = event(EventPriority::Normal);
+        let newest_id = newest.id();
+        runtime.enqueue_tool_follow_up(newest, &mut feedback);
+        assert_eq!(
+            runtime.pending_tool_follow_ups.len(),
+            super::MAX_PENDING_TOOL_FOLLOW_UPS
+        );
+        assert_ne!(
+            runtime.pending_tool_follow_ups.front().unwrap().id(),
+            first_id
+        );
+        assert_eq!(
+            runtime.pending_tool_follow_ups.back().unwrap().id(),
+            newest_id
+        );
+    }
+
+    #[tokio::test]
     async fn tool_notification_policy_controls_follow_up_message_cadence() {
         for (policy, expected_operations) in [
             (
@@ -4882,7 +4955,7 @@ mod tests {
         let conversation_id = ConversationId::new();
         let sender = PersonId::new();
         let event = direct_message(conversation_id, sender);
-        let expected_key = crate::event_action_idempotency_key(event.id(), 0);
+        let expected_key = crate::planned_action_idempotency_key(&event, 0);
         let (_handle, mut runtime) = CognitiveRuntime::new_with_services(
             RuntimeConfig::default(),
             CoreServices::with_model(ToolWithInvalidStateModel {
@@ -4928,7 +5001,7 @@ mod tests {
         let conversation_id = ConversationId::new();
         let sender = PersonId::new();
         let event = direct_message(conversation_id, sender);
-        let expected_key = crate::event_action_idempotency_key(event.id(), 0);
+        let expected_key = crate::planned_action_idempotency_key(&event, 0);
         let (_handle, mut runtime) = CognitiveRuntime::new_with_services(
             RuntimeConfig::default(),
             CoreServices::with_model(DueActionWithoutResolutionModel { conversation_id }),
@@ -4966,7 +5039,7 @@ mod tests {
         let conversation_id = ConversationId::new();
         let sender = PersonId::new();
         let event = direct_message(conversation_id, sender);
-        let expected_key = crate::event_action_idempotency_key(event.id(), 0);
+        let expected_key = crate::planned_action_idempotency_key(&event, 0);
         let (_handle, mut runtime) = CognitiveRuntime::new_with_services(
             RuntimeConfig::default(),
             CoreServices::with_model(DueActionWithoutResolutionModel { conversation_id }),
@@ -7015,6 +7088,48 @@ mod tests {
             .conversation(shared_conversation)
             .expect("shared state should remain");
         assert_eq!(shared.active_people, vec![other_person]);
+    }
+
+    #[test]
+    fn erasure_barrier_blocks_derived_events_by_trusted_actor() {
+        let person_id = PersonId::new();
+        let other_person = PersonId::new();
+        let conversation_id = ConversationId::new();
+        let erasure = super::DataErasureState {
+            conversations_by_person: std::collections::HashMap::from([(
+                person_id,
+                vec![conversation_id],
+            )]),
+            standalone_conversations: std::collections::HashSet::new(),
+            blocked_conversations: std::collections::HashSet::from([conversation_id]),
+        };
+        // A derived, Global-scoped event carrying the erased actor must be
+        // blocked even though its scope alone would not match the barrier.
+        let derived = WorldEvent::new(
+            Utc::now(),
+            EventScope::Global,
+            EventPriority::Low,
+            WorldEventKind::IdleTick,
+        )
+        .with_actor(person_id);
+        assert!(erasure.blocks(&derived));
+        // A Global event whose actor is a different (non-erased) person, or has
+        // no actor at all, is not blocked by the actor rule.
+        let unrelated = WorldEvent::new(
+            Utc::now(),
+            EventScope::Global,
+            EventPriority::Low,
+            WorldEventKind::IdleTick,
+        )
+        .with_actor(other_person);
+        assert!(!erasure.blocks(&unrelated));
+        let bare = WorldEvent::new(
+            Utc::now(),
+            EventScope::Global,
+            EventPriority::Low,
+            WorldEventKind::IdleTick,
+        );
+        assert!(!erasure.blocks(&bare));
     }
 
     #[tokio::test]

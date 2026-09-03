@@ -506,6 +506,7 @@ fn autonomy_policy(config: &ProactiveConfig) -> AutonomyPolicy {
         group_cooldown: chrono::Duration::seconds(
             config.autonomous_conversation_group_cooldown_secs().max(1) as i64,
         ),
+        max_autonomous_turns: config.autonomous_conversation_max_turns().max(1),
     }
 }
 
@@ -789,12 +790,15 @@ mod tests {
     }
 
     #[test]
-    fn direct_autonomous_turn_is_open_ended() {
+    fn direct_autonomous_turn_continues_until_directive_or_ceiling() {
         let _guard = TEST_LOCK.lock().expect("test lock");
         clear();
         let id = ConversationId::new();
         let now = Utc::now();
-        let config = ProactiveConfig::default();
+        // A higher ceiling keeps this test focused on "a Continue directive
+        // keeps scheduling the next turn" rather than tripping the global cap;
+        // the bounded ceiling is asserted separately.
+        let config = ProactiveConfig::default().with_autonomous_conversation_max_turns(16);
         observe_inbound(id, ConversationKind::Direct, now, true);
         record_outbound_with_directive(
             id,

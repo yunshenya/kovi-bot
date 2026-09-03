@@ -729,6 +729,19 @@ async fn main() {
                         Err(error) => eprintln!("[ERROR] Yunxi Mind 定期清理失败: {}", error),
                     }
                 }
+                if let Some(store) = yunxi::identity_store() {
+                    let retention = config::get().memory().retention_days().max(7);
+                    match store
+                        .cleanup_expired_message_mappings(chrono::Utc::now(), retention)
+                        .await
+                    {
+                        Ok(removed) if removed > 0 => {
+                            println!("[INFO] Yunxi 消息映射清理完成，移除 {} 条", removed);
+                        }
+                        Ok(_) => {}
+                        Err(error) => eprintln!("[ERROR] Yunxi 消息映射清理失败: {}", error),
+                    }
+                }
                 yunxi::observe_mind_maintenance_tick();
                 let interval = config::get().memory().maintenance_interval_secs();
                 kovi::tokio::time::sleep(kovi::tokio::time::Duration::from_secs(interval)).await;

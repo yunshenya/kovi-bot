@@ -20,6 +20,19 @@ pub const MAX_TRACKED_ACTION_KEYS: usize = 4_096;
 pub const MAX_TRACKED_ACTION_SCOPES: usize = 4_096;
 pub const MAX_RATE_LIMIT_WINDOW_ENTRIES: usize = 4_096;
 
+/// Acquire the shared arbiter state lock, recovering the inner value if a
+/// previous holder panicked. The arbiter is shared across every conversation,
+/// so a single poisoned lock currently cascades into a panic on every later
+/// admission and takes the whole loop down. Recovering the guard keeps
+/// following admissions fail-closed instead of crashing; the recovered state is
+/// still internally consistent because arbitration never holds the lock across
+/// an `await` and only panics on genuinely impossible branch conditions.
+fn lock_arbiter_state(state: &Mutex<ArbiterState>) -> std::sync::MutexGuard<'_, ArbiterState> {
+    state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Capabilities exposed by a host adapter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -889,10 +902,7 @@ impl ActionArbiter {
         };
         let action_id = action.action_id();
         let scope = action.scope();
-        let mut state = self
-            .state
-            .lock()
-            .expect("action arbiter state lock poisoned");
+        let mut state = lock_arbiter_state(&self.state);
 
         if let Some(original) = state.admitted_keys.get(key).copied() {
             return Err(ActionRejection::Duplicate {
@@ -1008,10 +1018,7 @@ impl ActionArbiter {
         let (Some(key), Some(action_id)) = (&receipt.idempotency_key, receipt.action_id) else {
             return;
         };
-        let mut state = self
-            .state
-            .lock()
-            .expect("action arbiter state lock poisoned");
+        let mut state = lock_arbiter_state(&self.state);
         if let Some(admitted) = state.admitted_keys.get_mut(key)
             && admitted.action_id == action_id
         {
@@ -1023,10 +1030,7 @@ impl ActionArbiter {
         let (Some(key), Some(action_id)) = (&receipt.idempotency_key, receipt.action_id) else {
             return;
         };
-        let mut state = self
-            .state
-            .lock()
-            .expect("action arbiter state lock poisoned");
+        let mut state = lock_arbiter_state(&self.state);
         if state
             .admitted_keys
             .get(key)
@@ -1044,9 +1048,7 @@ impl ActionArbiter {
         idempotency_key: &str,
         original_action_id: ActionId,
     ) -> Option<AdmittedTerminal> {
-        self.state
-            .lock()
-            .expect("action arbiter state lock poisoned")
+        lock_arbiter_state(&self.state)
             .admitted_keys
             .get(idempotency_key)
             .filter(|admitted| admitted.action_id == original_action_id)

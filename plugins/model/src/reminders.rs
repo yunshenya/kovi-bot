@@ -616,11 +616,11 @@ pub(crate) async fn list_from_tool(
 ) -> Result<String> {
     reject_unknown_arguments(arguments, &[])
         .map_err(|error| reminder_tool_error(ReminderToolFailureKind::Validation, error))?;
-    let items = list(destination)
+    let items = list(destination, actor_user_id)
         .await
         .map_err(|error| reminder_tool_error(ReminderToolFailureKind::Database, error))?;
     if items.is_empty() {
-        return Ok("当前会话没有未完成的提醒。".to_string());
+        return Ok("当前会话没有你的未完成提醒。".to_string());
     }
     let mut output = String::from("当前会话的提醒：");
     for item in items {
@@ -960,7 +960,10 @@ async fn create(
     Ok(id)
 }
 
-async fn list(destination: MessageDestination) -> Result<Vec<ReminderListItem>> {
+async fn list(
+    destination: MessageDestination,
+    creator_user_id: i64,
+) -> Result<Vec<ReminderListItem>> {
     let pool = database_pool()?;
     let (scope_type, scope_id) = destination_values(destination);
     let rows = query(
@@ -968,13 +971,15 @@ async fn list(destination: MessageDestination) -> Result<Vec<ReminderListItem>> 
         SELECT id, scope_type, scope_id, creator_user_id, kind, message, payload,
                due_at, timezone, repeat_kind, status
         FROM kovi_bot_reminders
-        WHERE scope_type = $1 AND scope_id = $2 AND status IN ('pending', 'delivering', 'sending')
+        WHERE scope_type = $1 AND scope_id = $2 AND creator_user_id = $3
+          AND status IN ('pending', 'delivering', 'sending')
         ORDER BY due_at ASC, id ASC
-        LIMIT $3
+        LIMIT $4
         "#,
     )
     .bind(scope_type)
     .bind(scope_id)
+    .bind(creator_user_id)
     .bind(MAX_LIST_ITEMS)
     .fetch_all(pool)
     .await?;

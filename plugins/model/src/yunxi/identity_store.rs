@@ -1569,6 +1569,27 @@ impl PostgresIdentityStore {
         .map_err(IdentityStoreError::storage)
     }
 
+    /// Prune message id mappings older than the given retention. These rows are
+    /// only needed to cross-reference recently sent/received OneBot message IDs
+    /// back to Core identifiers (recall, quoting, dedupe). Without a retention
+    /// the table grows by one row per message forever on a long-running deploy;
+    /// a rolling window keeps it bounded while never dropping a mapping that is
+    /// still within the recall horizon.
+    pub(crate) async fn cleanup_expired_message_mappings(
+        &self,
+        now: DateTime<Utc>,
+        retention_days: i64,
+    ) -> Result<u64, IdentityStoreError> {
+        let cutoff = now - chrono::Duration::days(retention_days);
+        let deleted = query("DELETE FROM yunxi_message_mappings WHERE created_at < $1")
+            .bind(cutoff)
+            .execute(&self.pool)
+            .await
+            .map_err(IdentityStoreError::storage)?
+            .rows_affected();
+        Ok(deleted)
+    }
+
     pub(crate) async fn initialize_schema(&self) -> anyhow::Result<()> {
         let mut transaction = self.pool.begin().await?;
         super::schema::lock(&mut transaction).await?;

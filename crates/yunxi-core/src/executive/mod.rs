@@ -71,11 +71,9 @@ executive_id!(ConflictId);
 executive_id!(PlanId);
 executive_id!(PlanStepId);
 executive_id!(ExpectationId);
-executive_id!(CandidateId);
 executive_id!(DecisionRecordId);
 
 mod attention_budget;
-mod candidate;
 mod confidence;
 mod conflict;
 mod consistency;
@@ -86,7 +84,6 @@ mod persistence;
 mod plan;
 mod policy;
 mod priority;
-mod reflection_controller;
 mod snapshot;
 
 use chrono::Utc;
@@ -97,10 +94,6 @@ pub use attention_budget::{
     AttentionBudget, AttentionBudgetSnapshot, AttentionCost, BudgetError, BudgetGrant,
     CognitiveBudget,
 };
-pub use candidate::{
-    Candidate, CandidateEvaluation, CandidateEvaluator, CandidateKind, CandidateScore,
-    MAX_CANDIDATES, MIN_CANDIDATES,
-};
 pub use confidence::{
     ConfidenceCalibration, ConfidenceLevel, ConfidenceUpdate, EvidencePolarity, EvidenceSource,
     EvidenceWeight, HypothesisState, confidence_level, hypothesis_state, update_confidence,
@@ -109,10 +102,7 @@ pub use conflict::{
     ConflictKind, ConflictMonitor, ConflictMonitorConfig, ConflictRef, ConflictStatus,
     ConflictValidationError, ExecutiveConflict, MAX_CONFLICT_PARTICIPANTS,
 };
-pub use consistency::{
-    ConsistencyAssessment, ConsistencyDecision, ConsistencyKind, ConsistencySeverity,
-    SelfConsistencyConflict, SelfConsistencyMonitor,
-};
+pub use consistency::{ConsistencyKind, ConsistencySeverity, SelfConsistencyConflict};
 pub use decision_record::{
     DecisionActionKind, DecisionRecord, DecisionRecordRetention, DecisionRecordSnapshot,
     DecisionRecordStore, ExecutiveReasonTag, MAX_REASON_TAGS,
@@ -121,11 +111,7 @@ pub use expectation::{
     Expectation, ExpectationObservation, ExpectationSnapshot, ExpectationStatus,
     ExpectationTracker, ExpectationTrackerConfig, ExpectedEventPattern,
 };
-pub use outgoing::{
-    DeferUntil, IncomingOutgoingChange, MergeRequest, OutgoingRevalidation,
-    OutgoingRevalidationContext, OutgoingRevalidator, OutgoingSource, PendingOutgoing,
-    RewriteRequest,
-};
+pub use outgoing::{OutgoingSource, PendingOutgoing};
 pub use persistence::{
     DecisionRecordPersistence, ExecutivePersistenceError, ExecutiveScope, ExecutiveStore,
     ExecutiveStoreFuture, ExpectationStore, PlanStore,
@@ -136,11 +122,7 @@ pub use plan::{
     RetryPolicy,
 };
 pub use policy::{ExecutivePolicy, ExecutivePolicyError, ExecutiveTierDecision, HardPriority};
-pub use priority::{
-    GoalArbitration, GoalArbitrator, GoalArbitratorConfig, GoalPriority, GoalPrioritySnapshot,
-    PrioritizedGoal, SocialCost,
-};
-pub use reflection_controller::{ReflectionController, ReflectionDecision, ReflectionGateContext};
+pub use priority::GoalPrioritySnapshot;
 pub use snapshot::{
     ConflictSnapshot, ExecutiveSnapshot, ExpectationSnapshot as SnapshotExpectation,
     MAX_SNAPSHOT_ITEMS, PlanSnapshot as SnapshotPlan,

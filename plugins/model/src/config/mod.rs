@@ -46,10 +46,8 @@ pub use agent_runs::AgentRunConfig;
 pub use agent_tasks::AgentTaskConfig;
 pub use cognitive_model::{CognitiveModelConfig, IntrinsicConfig, ModelFallbackConfig};
 pub use executive::{
-    ExecutiveAttentionBudgetConfig, ExecutiveCandidateConfig, ExecutiveConfidenceConfig,
-    ExecutiveConfig, ExecutiveConsistencyConfig, ExecutiveDecisionRecordConfig,
-    ExecutiveExpectationConfig, ExecutivePlanConfig, ExecutivePriorityConfig,
-    ExecutiveReflectionConfig,
+    ExecutiveAttentionBudgetConfig, ExecutiveConfidenceConfig, ExecutiveConfig,
+    ExecutiveDecisionRecordConfig, ExecutiveExpectationConfig, ExecutivePlanConfig,
 };
 pub use identity::IdentityConfig;
 pub use mind::MindConfig;
@@ -300,6 +298,7 @@ pub fn get() -> ModelConfig {
 #[cfg(test)]
 mod tests {
     use super::ModelConfig;
+    use config::{Config, FileFormat};
 
     #[test]
     fn complete_default_configuration_is_valid() {
@@ -321,5 +320,33 @@ mod tests {
         assert!(!config.prompt().private_prompt().contains("silent 决策"));
         assert!(!config.prompt().system_prompt().contains("REPLY_ACTION"));
         assert!(!config.prompt().private_prompt().contains("REPLY_ACTION"));
+    }
+
+    #[test]
+    fn legacy_executive_sections_are_tolerated() {
+        // Existing deployments still carry the now-removed Executive sections
+        // (their consumers, the CandidateEvaluator, ReflectionController,
+        // GoalArbitrator and SelfConsistencyMonitor, were removed). serde
+        // without deny_unknown_fields must ignore those keys so a live
+        // bot.conf.toml keeps loading.
+        let source = r#"
+            [executive]
+            enabled = true
+            [executive.priority]
+            aging_enabled = true
+            [executive.consistency]
+            severe_threshold = 0.70
+            blocking_threshold = 0.92
+            [executive.candidate]
+            max_candidates = 4
+            [executive.reflection]
+            deep_budget_per_day = 4
+        "#;
+        let config = Config::builder()
+            .add_source(config::File::from_str(source, FileFormat::Toml))
+            .build()
+            .and_then(|config| config.try_deserialize::<ModelConfig>())
+            .expect("legacy executive sections must be tolerated");
+        assert!(config.executive().validate().is_ok());
     }
 }

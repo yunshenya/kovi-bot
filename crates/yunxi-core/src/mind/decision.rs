@@ -28,6 +28,11 @@ pub struct MindDecisionProjection {
     reason_tags: Vec<MindReasonTag>,
     reference: Option<MindDecisionReference>,
     would_disagree: bool,
+    /// Propositions of the high-confidence, stable beliefs that the current
+    /// inbound message explicitly opposes (bounded). Surfaced to the host so
+    /// the reply can genuinely acknowledge the disagreement instead of the
+    /// detection being recorded and then ignored.
+    belief_conflicts: Vec<String>,
 }
 
 impl MindDecisionProjection {
@@ -39,11 +44,12 @@ impl MindDecisionProjection {
             reason_tags: Vec::new(),
             reference: None,
             would_disagree: false,
+            belief_conflicts: Vec::new(),
         };
         if input.mind.is_empty() || input.mind.influence_mode() == MindInfluenceMode::Disabled {
             return projection;
         }
-        projection.would_disagree = match input.event.kind() {
+        let conflicting_beliefs: Vec<String> = match input.event.kind() {
             WorldEventKind::MessageReceived(message)
                 if !message.stop_requested && message.visible_reply_allowed =>
             {
@@ -52,15 +58,20 @@ impl MindDecisionProjection {
                     .beliefs()
                     .iter()
                     .filter(|belief| belief.confidence >= 0.7 && belief.stability >= 0.5)
-                    .any(|belief| {
+                    .filter(|belief| {
                         super::relevance::explicitly_opposes(
                             &belief.proposition,
                             message.content.as_text(),
                         )
                     })
+                    .take(3)
+                    .map(|belief| belief.proposition.clone())
+                    .collect()
             }
-            _ => false,
+            _ => Vec::new(),
         };
+        projection.belief_conflicts = conflicting_beliefs;
+        projection.would_disagree = !projection.belief_conflicts.is_empty();
         if projection.would_disagree {
             projection.push_reason(MindReasonTag::BeliefConflict);
         }
@@ -213,6 +224,13 @@ impl MindDecisionProjection {
     #[must_use]
     pub const fn would_disagree(&self) -> bool {
         self.would_disagree
+    }
+
+    /// Propositions of the high-confidence, stable beliefs the current inbound
+    /// message explicitly opposes (bounded). Empty unless `would_disagree`.
+    #[must_use]
+    pub fn belief_conflicts(&self) -> &[String] {
+        &self.belief_conflicts
     }
 
     #[must_use]

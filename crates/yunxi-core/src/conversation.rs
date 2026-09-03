@@ -28,6 +28,11 @@ pub struct AutonomyPolicy {
     pub group_idle: Duration,
     pub direct_cooldown: Duration,
     pub group_cooldown: Duration,
+    /// Hard ceiling on consecutive autonomous continuation turns after one
+    /// inbound turn. A new inbound resets the counter, so this bounds a single
+    /// "alive" burst without disabling future initiative after the user talks
+    /// again. Prevents a model tuned to feel alive from spinning indefinitely.
+    pub max_autonomous_turns: u64,
 }
 
 impl Default for AutonomyPolicy {
@@ -39,6 +44,9 @@ impl Default for AutonomyPolicy {
             group_idle: Duration::seconds(45),
             direct_cooldown: Duration::seconds(3),
             group_cooldown: Duration::seconds(15),
+            // A single inbound may inspire at most this many follow-up turns
+            // before the conversation rests until the user speaks again.
+            max_autonomous_turns: 6,
         }
     }
 }
@@ -54,6 +62,9 @@ impl AutonomyPolicy {
         .iter()
         .any(|duration| *duration <= Duration::zero())
         {
+            return Err(ConversationLifecycleError::InvalidPolicy);
+        }
+        if self.max_autonomous_turns == 0 {
             return Err(ConversationLifecycleError::InvalidPolicy);
         }
         Ok(self)
@@ -231,6 +242,7 @@ impl ConversationLifecycle {
         self.continuation_decided = false;
         self.next_wake_at = None;
         self.in_flight = false;
+        self.autonomous_turns = 0;
         self.bump_version()
     }
 
@@ -254,6 +266,7 @@ impl ConversationLifecycle {
         self.continuation_decided = false;
         self.next_wake_at = None;
         self.in_flight = false;
+        self.autonomous_turns = 0;
         self.bump_version()
     }
 
@@ -275,6 +288,7 @@ impl ConversationLifecycle {
         self.continuation_decided = false;
         self.next_wake_at = None;
         self.in_flight = false;
+        self.autonomous_turns = 0;
         self.bump_version()
     }
 
@@ -337,6 +351,11 @@ impl ConversationLifecycle {
             return Ok(false);
         };
         if last_outbound < last_inbound {
+            return Ok(false);
+        }
+        if self.autonomous_turns >= policy.max_autonomous_turns {
+            // The burst ceiling is reached; rest until a fresh inbound resets
+            // the chain counter instead of letting one message spin forever.
             return Ok(false);
         }
         Ok(if self.continuation_decided {
@@ -429,13 +448,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn continuation_is_semantic_and_has_no_turn_budget() {
+    fn continuation_is_bounded_by_the_chain_cap_and_resets_on_inbound() {
         let id = ConversationId::new();
         let person = PersonId::new();
         let mut lifecycle = ConversationLifecycle::new(id, ConversationKind::Direct).unwrap();
         let policy = AutonomyPolicy {
             direct_idle: Duration::seconds(1),
             direct_cooldown: Duration::seconds(1),
+            max_autonomous_turns: 4,
             ..AutonomyPolicy::default()
         };
         let start = Utc::now();
@@ -445,20 +465,42 @@ mod tests {
         lifecycle
             .record_outbound(start, Some(ConversationTurnDirective::Continue), policy)
             .unwrap();
-        for index in 0..100u64 {
+        // Exactly the cap may run; beyond it the chain rests until a new inbound.
+        for index in 0..4u64 {
             let at = start + Duration::seconds(2 + (index as i64) * 2);
             assert!(lifecycle.claim_autonomous(at, policy).unwrap());
             lifecycle
                 .finish_autonomous_claim(at, true, ConversationTurnDirective::Continue, policy)
                 .unwrap();
         }
-        assert_eq!(lifecycle.autonomous_turns(), 100);
-        assert_eq!(lifecycle.directive(), ConversationTurnDirective::Continue);
-        assert_eq!(
-            lifecycle.last_autonomous_at(),
-            Some(start + Duration::seconds(200))
+        assert_eq!(lifecycle.autonomous_turns(), 4);
+        assert!(
+            !lifecycle
+                .claim_autonomous(start + Duration::seconds(20), policy)
+                .unwrap(),
+            "the chain cap must stop further autonomous turns until a fresh inbound resets it"
         );
-        assert!(!lifecycle.is_in_flight());
+        // A fresh inbound both cancels the pending continuation and resets the chain.
+        lifecycle
+            .observe_inbound(
+                ConversationKind::Direct,
+                person,
+                start + Duration::seconds(30),
+            )
+            .unwrap();
+        lifecycle
+            .record_outbound(
+                start + Duration::seconds(31),
+                Some(ConversationTurnDirective::Continue),
+                policy,
+            )
+            .unwrap();
+        assert!(
+            lifecycle
+                .claim_autonomous(start + Duration::seconds(33), policy)
+                .unwrap(),
+            "a fresh inbound resets the chain cap"
+        );
     }
 
     #[test]

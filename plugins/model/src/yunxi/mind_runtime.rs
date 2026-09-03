@@ -285,6 +285,10 @@ struct V1MindContext {
     memories: Vec<Memory>,
     open_loops: Vec<OpenLoop>,
     goals: Vec<Goal>,
+    /// True when any backing store failed to read. A degraded context carries
+    /// no authoritative "empty" meaning and must not be used to refresh or
+    /// narrate internal state, so callers skip instead of acting on a torn read.
+    degraded: bool,
 }
 
 #[derive(Debug, Default)]
@@ -876,6 +880,7 @@ impl MindRuntime {
                 GoalOwner::Conversation(conversation_id),
             ),
         };
+        let mut degraded = false;
         let memories = match MemoryQuery::new(memory_scope, query, 16) {
             Ok(memory_query) => {
                 services
@@ -884,11 +889,13 @@ impl MindRuntime {
                     .await
                     .unwrap_or_else(|error| {
                         kovi::log::warn!("Yunxi Mind V1 memory context failed soft: {error}");
+                        degraded = true;
                         Vec::new()
                     })
             }
             Err(error) => {
                 kovi::log::warn!("Yunxi Mind V1 memory query rejected: {error}");
+                degraded = true;
                 Vec::new()
             }
         };
@@ -898,6 +905,7 @@ impl MindRuntime {
             .await
             .unwrap_or_else(|error| {
                 kovi::log::warn!("Yunxi Mind V1 open-loop context failed soft: {error}");
+                degraded = true;
                 Vec::new()
             });
         let goals = services
@@ -906,12 +914,14 @@ impl MindRuntime {
             .await
             .unwrap_or_else(|error| {
                 kovi::log::warn!("Yunxi Mind V1 goal context failed soft: {error}");
+                degraded = true;
                 Vec::new()
             });
         V1MindContext {
             memories,
             open_loops,
             goals,
+            degraded,
         }
     }
 
@@ -927,6 +937,14 @@ impl MindRuntime {
         }
         for scope in scopes.iter().copied() {
             let context = self.load_v1_context(scope, query).await;
+            if context.degraded {
+                // A torn/partial read must not drive agenda synthesis; wait for
+                // stores to recover rather than pretending the scope is empty.
+                kovi::log::warn!(
+                    "Yunxi Mind V1 context degraded for scope, skipping agenda refresh"
+                );
+                continue;
+            }
             for open_loop in context
                 .open_loops
                 .into_iter()

@@ -931,7 +931,7 @@ pub(crate) fn executive_status_report() -> String {
         },
     );
     bound_status_report(format!(
-        "Yunxi Executive 状态\n版本：{}\n当前/偏好 tier：{}/{}\nIntrinsic：health={:?} text={} vision={} version={} adapter={} manifest={}\nStrong：{}\n预算：available={:.2}/{:.2} reserve={:.2} replenishment={:.2}\n队列/指标：{}；text={} vision={} failures={} fallbacks={}\n冲突({})：{}\n目标({})：{}\n计划：{}\n期待({})：pending-only metadata\n最近决策({}) tags：{}\n反思：{}\n策略：max_plan_revisions={} candidates={} conflict_threshold={:.2} deep_reflection_budget={}",
+        "Yunxi Executive 状态\n版本：{}\n当前/偏好 tier：{}/{}\nIntrinsic：health={:?} text={} vision={} version={} adapter={} manifest={}\nStrong：{}\n预算：available={:.2}/{:.2} reserve={:.2} replenishment={:.2}\n队列/指标：{}；text={} vision={} failures={} fallbacks={}\n冲突({})：{}\n目标({})：{}\n计划：{}\n期待({})：pending-only metadata\n最近决策({}) tags：{}\n反思：{}\n策略：max_plan_revisions={} conflict_threshold={:.2}",
         snapshot.version,
         capability.current_tier,
         capability.preferred_tier,
@@ -973,9 +973,7 @@ pub(crate) fn executive_status_report() -> String {
         decision_tags,
         reflection,
         policy.max_plan_revisions,
-        policy.max_candidate_count,
         policy.conflict_threshold,
-        policy.deep_reflection_budget,
     ))
 }
 

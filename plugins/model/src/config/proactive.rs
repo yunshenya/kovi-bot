@@ -44,8 +44,14 @@ pub struct ProactiveConfig {
     autonomous_conversation_group_idle_secs: u64,
     /// 群聊自主续聊选择继续时，两次模型回合之间的最短间隔（秒）。
     autonomous_conversation_group_cooldown_secs: u64,
+    /// 单条入站消息之后，最多允许连续多少次自主续聊会话。新的入站会把计数
+    /// 归零，因此它约束的是"一次想接话的高潮"，不会在用户再次说话后禁用主动。
+    /// 默认 6；设为 0 会被校验拒绝。旧版 `autonomous_conversation_group_max_turns`
+    /// 已不再被读取，本字段取代它并同时作用于私聊与群聊。
+    autonomous_conversation_max_turns: u64,
     /// 旧版群聊自主续聊上限。保留用于配置反序列化兼容，当前自主会话
-    /// 不再读取这个字段，是否继续完全由模型语义决定。
+    /// 不再读取这个字段，是否继续完全由模型语义与 `autonomous_conversation_max_turns`
+    /// 共同决定。
     autonomous_conversation_group_max_turns: u8,
 }
 
@@ -126,6 +132,18 @@ impl ProactiveConfig {
         self.autonomous_conversation_group_cooldown_secs
     }
 
+    pub fn autonomous_conversation_max_turns(&self) -> u64 {
+        self.autonomous_conversation_max_turns
+    }
+
+    /// Builder override used by tests and embedded hosts that need a specific
+    /// autonomous-continuation ceiling without re-serialising config.
+    #[must_use]
+    pub fn with_autonomous_conversation_max_turns(mut self, value: u64) -> Self {
+        self.autonomous_conversation_max_turns = value;
+        self
+    }
+
     pub fn autonomous_conversation_group_max_turns(&self) -> u8 {
         self.autonomous_conversation_group_max_turns
     }
@@ -181,6 +199,9 @@ impl ProactiveConfig {
         if self.autonomous_conversation_group_cooldown_secs == 0 {
             return Err(anyhow::anyhow!("群聊自主会话冷却时间必须大于0秒"));
         }
+        if self.autonomous_conversation_max_turns == 0 {
+            return Err(anyhow::anyhow!("自主会话连续续聊上限必须大于0"));
+        }
         Ok(())
     }
 }
@@ -207,6 +228,7 @@ impl Default for ProactiveConfig {
             autonomous_conversation_cooldown_secs: 3,
             autonomous_conversation_group_idle_secs: 45,
             autonomous_conversation_group_cooldown_secs: 15,
+            autonomous_conversation_max_turns: 6,
             autonomous_conversation_group_max_turns: 1,
         }
     }

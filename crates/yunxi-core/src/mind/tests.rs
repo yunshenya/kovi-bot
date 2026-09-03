@@ -133,6 +133,10 @@ fn scenario_a_belief_conflict_shapes_but_does_not_override_explicit_reply() {
 
     assert_eq!(projection.disposition(), DecisionDisposition::Reply);
     assert!(projection.would_disagree());
+    assert_eq!(
+        projection.belief_conflicts(),
+        &["Rust 的严格类型系统总体有价值".to_owned()],
+    );
     assert!(
         projection
             .reason_tags()

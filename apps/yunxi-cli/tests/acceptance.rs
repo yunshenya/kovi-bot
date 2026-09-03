@@ -149,6 +149,7 @@ fn autonomous_ticks_continue_a_direct_conversation_after_idle() {
         direct_cooldown: Duration::seconds(1),
         group_idle: Duration::seconds(1),
         group_cooldown: Duration::seconds(1),
+        ..AutonomyPolicy::default()
     };
     let host = CliHost::new(FakeModel, FakeEnvironment::default(), ConversationId::new())
         .try_with_autonomy_policy(policy)
@@ -268,11 +269,13 @@ fn a_new_inbound_turn_resets_autonomous_due_state() {
             .expect("tick after inbound")
             .is_none()
     );
+    // A fresh inbound starts a new autonomous chain, so the previous burst
+    // counter is reset rather than accumulated.
     assert_eq!(
         host.lifecycle()
             .expect("lifecycle snapshot")
             .autonomous_turns(),
-        1
+        0
     );
 }
 

@@ -166,8 +166,11 @@ autonomous_conversation_idle_secs = 5
 autonomous_conversation_cooldown_secs = 3
 autonomous_conversation_group_idle_secs = 45
 autonomous_conversation_group_cooldown_secs = 15
-# Legacy compatibility field; autonomous continuation is decided by the host state machine.
+# Legacy compatibility field; retained for config compatibility, not read by the loop.
 autonomous_conversation_group_max_turns = 1
+# 单条入站消息之后最多连续多少次自主续聊（新入站归零计数，私聊与群聊通用）。
+# 这是有界"想接话"的硬上限，防止把一次聊天刷成无上限的高潮并烧掉大量 token。
+autonomous_conversation_max_turns = 6
 # 私聊连续回合由宿主根据对话状态处理；模型只生成当前回合的自然正文。
 
 [traffic]

@@ -42,8 +42,11 @@ autonomous_conversation_cooldown_secs = 3
 # 群聊自主续聊更克制：等待更久，由宿主状态机根据公共语境决定是否继续。
 autonomous_conversation_group_idle_secs = 45
 autonomous_conversation_group_cooldown_secs = 15
-# Legacy compatibility field; retained for config compatibility, not used as a model output contract.
+# Legacy compatibility field; retained for config compatibility, not read by the loop.
 autonomous_conversation_group_max_turns = 1
+# 单条入站消息之后最多连续多少次自主续聊（新入站会归零计数，私聊与群聊通用）。
+# 这是防止"一直想说话"的模型把一次聊天刷成无上限的高潮并烧掉大量 token 的硬上限。
+autonomous_conversation_max_turns = 6
 # 私聊连续回合由宿主根据对话状态处理；模型只生成当前回合的自然正文。
 
 [traffic]
@@ -142,9 +145,6 @@ max_active = 16
 [executive.confidence]
 max_normal_delta = 0.20
 
-[executive.priority]
-aging_enabled = true
-
 [executive.attention_budget]
 capacity = 20.0
 critical_reserve = 6.0
@@ -154,16 +154,6 @@ max_revisions = 3
 
 [executive.expectation]
 max_pending_per_scope = 8
-
-[executive.candidate]
-max_candidates = 4
-
-[executive.reflection]
-deep_budget_per_day = 4
-
-[executive.consistency]
-severe_threshold = 0.70
-blocking_threshold = 0.92
 
 [executive.decision_record]
 recent_limit = 32

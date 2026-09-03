@@ -9,13 +9,9 @@ pub struct ExecutiveConfig {
     shadow_mode: bool,
     conflict: ExecutiveConflictConfig,
     confidence: ExecutiveConfidenceConfig,
-    priority: ExecutivePriorityConfig,
     attention_budget: ExecutiveAttentionBudgetConfig,
     plan: ExecutivePlanConfig,
     expectation: ExecutiveExpectationConfig,
-    candidate: ExecutiveCandidateConfig,
-    reflection: ExecutiveReflectionConfig,
-    consistency: ExecutiveConsistencyConfig,
     decision_record: ExecutiveDecisionRecordConfig,
 }
 
@@ -30,12 +26,6 @@ pub struct ExecutiveConflictConfig {
 #[serde(default)]
 pub struct ExecutiveConfidenceConfig {
     max_normal_delta: f32,
-}
-
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
-#[serde(default)]
-pub struct ExecutivePriorityConfig {
-    aging_enabled: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
@@ -59,25 +49,6 @@ pub struct ExecutiveExpectationConfig {
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 #[serde(default)]
-pub struct ExecutiveCandidateConfig {
-    max_candidates: usize,
-}
-
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
-#[serde(default)]
-pub struct ExecutiveReflectionConfig {
-    deep_budget_per_day: u32,
-}
-
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
-#[serde(default)]
-pub struct ExecutiveConsistencyConfig {
-    severe_threshold: f32,
-    blocking_threshold: f32,
-}
-
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
-#[serde(default)]
 pub struct ExecutiveDecisionRecordConfig {
     recent_limit: usize,
 }
@@ -89,13 +60,9 @@ impl Default for ExecutiveConfig {
             shadow_mode: true,
             conflict: ExecutiveConflictConfig::default(),
             confidence: ExecutiveConfidenceConfig::default(),
-            priority: ExecutivePriorityConfig::default(),
             attention_budget: ExecutiveAttentionBudgetConfig::default(),
             plan: ExecutivePlanConfig::default(),
             expectation: ExecutiveExpectationConfig::default(),
-            candidate: ExecutiveCandidateConfig::default(),
-            reflection: ExecutiveReflectionConfig::default(),
-            consistency: ExecutiveConsistencyConfig::default(),
             decision_record: ExecutiveDecisionRecordConfig::default(),
         }
     }
@@ -114,14 +81,6 @@ impl Default for ExecutiveConfidenceConfig {
     fn default() -> Self {
         Self {
             max_normal_delta: 0.20,
-        }
-    }
-}
-
-impl Default for ExecutivePriorityConfig {
-    fn default() -> Self {
-        Self {
-            aging_enabled: true,
         }
     }
 }
@@ -145,29 +104,6 @@ impl Default for ExecutiveExpectationConfig {
     fn default() -> Self {
         Self {
             max_pending_per_scope: 8,
-        }
-    }
-}
-
-impl Default for ExecutiveCandidateConfig {
-    fn default() -> Self {
-        Self { max_candidates: 4 }
-    }
-}
-
-impl Default for ExecutiveReflectionConfig {
-    fn default() -> Self {
-        Self {
-            deep_budget_per_day: 4,
-        }
-    }
-}
-
-impl Default for ExecutiveConsistencyConfig {
-    fn default() -> Self {
-        Self {
-            severe_threshold: 0.70,
-            blocking_threshold: 0.92,
         }
     }
 }
@@ -210,22 +146,6 @@ impl ExecutiveConfig {
             "executive.expectation.max_pending_per_scope 必须在 1..=64"
         );
         ensure!(
-            (2..=4).contains(&self.candidate.max_candidates),
-            "executive.candidate.max_candidates 必须在 2..=4"
-        );
-        ensure!(
-            self.reflection.deep_budget_per_day <= 10_000,
-            "executive.reflection.deep_budget_per_day 过大"
-        );
-        ensure!(
-            self.consistency.severe_threshold.is_finite()
-                && self.consistency.blocking_threshold.is_finite()
-                && (0.0..=1.0).contains(&self.consistency.severe_threshold)
-                && (0.0..=1.0).contains(&self.consistency.blocking_threshold)
-                && self.consistency.blocking_threshold >= self.consistency.severe_threshold,
-            "executive.consistency 阈值无效"
-        );
-        ensure!(
             (1..=256).contains(&self.decision_record.recent_limit),
             "executive.decision_record.recent_limit 必须在 1..=256"
         );
@@ -243,26 +163,11 @@ impl ExecutiveConfig {
     }
 
     #[must_use]
-    pub const fn priority_aging_enabled(&self) -> bool {
-        self.priority.aging_enabled
-    }
-
-    #[must_use]
-    pub const fn consistency_thresholds(&self) -> (f32, f32) {
-        (
-            self.consistency.severe_threshold,
-            self.consistency.blocking_threshold,
-        )
-    }
-
-    #[must_use]
     pub const fn policy(&self) -> ExecutivePolicy {
         ExecutivePolicy {
             max_plan_revisions: self.plan.max_revisions,
-            max_candidate_count: self.candidate.max_candidates,
             conflict_threshold: self.conflict.threshold,
             max_active_conflicts: self.conflict.max_active,
-            deep_reflection_budget: self.reflection.deep_budget_per_day,
             attention_budget_capacity: self.attention_budget.capacity,
             critical_attention_reserve: self.attention_budget.critical_reserve,
             confidence_max_normal_delta: self.confidence.max_normal_delta,
