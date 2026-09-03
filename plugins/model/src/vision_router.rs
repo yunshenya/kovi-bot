@@ -14,6 +14,44 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+/// Fall back to the local Intrinsic vision model when the hosted built-in
+/// provider is unavailable or fails. This keeps image understanding working
+/// even when the configured vision endpoint (e.g. an external proxy) is down
+/// or out of balance. Returns `None` when the Intrinsic model is unavailable
+/// or does not support vision, so the caller can continue to the next
+/// provider instead of forcing a local inference.
+async fn analyze_images_with_intrinsic(images: &[VisionImage], question: &str) -> Option<String> {
+    let runtime = crate::yunxi::intrinsic_runtime::get()?;
+    if !runtime.supports_vision() {
+        return None;
+    }
+    // The Intrinsic vision engine resolves a single image per turn.
+    if images.len() != 1 {
+        return None;
+    }
+    let config = runtime.runtime().config();
+    let image = crate::yunxi::intrinsic_runtime::resolved_image_from_data_url(
+        &images[0].url,
+        config.media.max_bytes,
+    )
+    .ok()?;
+    let prompt = if question.trim().is_empty() {
+        default_vision_prompt().to_string()
+    } else {
+        question.trim().to_string()
+    };
+    let output = runtime
+        .infer_vision(yunxi_core::VisionInferenceRequest {
+            prompt,
+            image,
+            max_context_tokens: config.max_context_tokens,
+            max_new_tokens: config.max_new_tokens,
+        })
+        .await
+        .ok()?;
+    Some(output.text)
+}
+
 const MAX_VISION_QUESTION_CHARS: usize = 4_000;
 const MAX_ROUTED_VISION_IMAGES: usize = 4;
 const MAX_VISION_IMAGE_BYTES: usize = 10 * 1024 * 1024;
@@ -63,7 +101,19 @@ impl VisionRouter {
         reply_ticket: Option<ReplyTicket>,
     ) -> Result<String> {
         match self.config.provider() {
-            "builtin" => analyze_images_with_builtin(images, question).await,
+            "builtin" => match analyze_images_with_builtin(images, question).await {
+                Ok(result) => Ok(result),
+                Err(error) => {
+                    eprintln!("[WARN] 内置视觉 Provider 失败: {}", error);
+                    // Fall back to the local Intrinsic model so image understanding
+                    // keeps working when the hosted provider is unavailable.
+                    if let Some(out) = analyze_images_with_intrinsic(images, question).await {
+                        Ok(out)
+                    } else {
+                        Err(error)
+                    }
+                }
+            },
             "mcp" => self.analyze_with_mcp(images, question, reply_ticket).await,
             _ => self.analyze_auto(images, question, reply_ticket).await,
         }
@@ -92,6 +142,11 @@ impl VisionRouter {
                     builtin_error = Some(error);
                 }
             }
+        }
+        // Local Intrinsic fallback keeps image understanding working even when
+        // the hosted vision endpoint is unavailable or out of balance.
+        if let Some(out) = analyze_images_with_intrinsic(images, question).await {
+            return Ok(out);
         }
         if mcp_configured {
             return self.analyze_with_mcp(images, question, reply_ticket).await;

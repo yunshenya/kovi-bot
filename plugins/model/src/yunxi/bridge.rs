@@ -3138,7 +3138,7 @@ async fn run_runtime(
                         }
                     }
                     let has_action_failure = actions.iter().any(|action| !action.is_success());
-                    if actions.is_empty() || has_action_failure {
+                    if has_action_failure {
                         kovi::log::warn!(
                             "Yunxi Core turn outcome: event_id={} type={:?} scope={:?} attention={:?} disposition={:?} intents={} actions={:?}",
                             observation.event_id,
@@ -3150,11 +3150,15 @@ async fn run_runtime(
                             actions,
                         );
                     } else {
+                        // Most turns are routine ObserveOnly/Silent observations with no
+                        // action. Keep them out of the warned journal so real failures
+                        // stay visible; under RUST_LOG=info debug! is suppressed.
                         kovi::log::debug!(
-                            "Yunxi Core turn completed: event_id={} type={:?} scope={:?} disposition={:?} intents={} actions={}",
+                            "Yunxi Core turn outcome: event_id={} type={:?} scope={:?} attention={:?} disposition={:?} intents={} actions={}",
                             observation.event_id,
                             observation.event_type,
                             observation.scope,
+                            observation.attention,
                             plan.disposition,
                             plan.intents.len(),
                             actions.len(),
