@@ -282,6 +282,9 @@ enabled = false
 shadow_mode = true
 persist = true
 persist_interval_secs = 30
+# 回复上下文注入：disabled（默认，无效果）/ shadow（记录将注入的内容）/
+# active（注入有界客观摘要，影响节奏与分寸；建议 shadow 观察后再开）
+reply_context = "disabled"
 observation_ttl_secs = 86400
 max_social_scenes = 256
 activity_window_secs = 60

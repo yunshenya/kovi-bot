@@ -1965,6 +1965,48 @@ fn affect_tone_messages(input: &PlannerInput) -> Vec<BotMemory> {
     }]
 }
 
+/// Bounded World Model v4 reply-context messages (v4 §116, §64).
+///
+/// Gated by `[world_model].reply_context`: disabled → nothing (default),
+/// shadow → log what would be injected, active → inject a short objective
+/// "external world" note so the reply's pacing/register can follow the
+/// room without ever imitating internal state. Always fail-soft.
+fn world_context_messages(conversation_id: Option<yunxi_core::ConversationId>) -> Vec<BotMemory> {
+    let config = crate::config::get().world_model().clone();
+    if !config.enabled() {
+        return Vec::new();
+    }
+    let Some(conversation_id) = conversation_id else {
+        return Vec::new();
+    };
+    let Some(snapshot) =
+        crate::yunxi::world_model::conversation_world_snapshot(conversation_id)
+    else {
+        return Vec::new();
+    };
+    let text = crate::yunxi::world_model::render_world_context(&snapshot);
+    if text.is_empty() {
+        return Vec::new();
+    }
+    if config.reply_context_shadow() {
+        kovi::log::debug!("[YUNXI_WORLD] reply_context_shadow: {text}");
+        return Vec::new();
+    }
+    if !config.reply_context_active() {
+        return Vec::new();
+    }
+    vec![
+        BotMemory {
+            role: Roles::System,
+            content: "以下是当下外部世界的客观摘要（可能不完全准确，仅供你自然地调整回应节奏与分寸；不要复述、不要解释、也不要模仿其中的措辞）。".to_owned(),
+        },
+        BotMemory {
+            role: Roles::Data,
+            content: format!("{{world-context}}{text}"),
+        },
+    ]
+}
+
 fn mind_context_messages(
     input: &PlannerInput,
     projection: &MindDecisionProjection,
@@ -4677,6 +4719,7 @@ impl ModelBackend for KoviModelBackend {
             let mut messages = recent_conversation_messages(input);
             let mut reply_context = mind_context_messages(input, &mind_projection);
             reply_context.extend(affect_tone_messages(input));
+            reply_context.extend(world_context_messages(input.event.scope().conversation_id()));
             messages.splice(0..0, reply_context);
             messages.push(BotMemory {
                 role: Roles::User,

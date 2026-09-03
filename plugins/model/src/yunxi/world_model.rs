@@ -733,6 +733,85 @@ pub(crate) fn record_tool_failure(tool_name: &str, error_category: &str, detail:
     });
 }
 
+/// Read the raw bounded snapshot for a conversation (reply-context input).
+/// `None` when disabled/unavailable (fail-soft, v4 §249).
+pub(crate) fn conversation_world_snapshot(
+    conversation_id: yunxi_core::ConversationId,
+) -> Option<yunxi_core::WorldModelSnapshot> {
+    let guard = WORLD_RUNTIME
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let world = &guard.as_ref()?.world;
+    let context = yunxi_core::WorldSnapshotContext::new(chrono::Utc::now())
+        .with_conversation(conversation_id);
+    world.snapshot_for(&context).ok()
+}
+
+/// Render a bounded "external world right now" context for the reply prompt
+/// (v4 §64, §116). Objective nouns only: scene kind, activity, floor,
+/// situations; never psychology, never message content, never internal ids
+/// or numbers that invite imitation. Empty string when nothing salient.
+pub(crate) fn render_world_context(snapshot: &yunxi_core::WorldModelSnapshot) -> String {
+    use yunxi_core::{SituationStatus, SocialSceneKind};
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(scene) = snapshot.social_scene() {
+        let scene_part: Option<&str> = match scene.scene_kind() {
+            SocialSceneKind::RapidGroupChat => Some("群里说得很快"),
+            SocialSceneKind::GroupDiscussion => {
+                if !scene.bot_addressed() {
+                    Some("大家在讨论，暂时没叫我")
+                } else {
+                    Some("群里在讨论，叫我回应")
+                }
+            }
+            SocialSceneKind::IdleGroup => Some("群里安静下来了"),
+            SocialSceneKind::DirectConversation => Some("对方在跟我说话"),
+            SocialSceneKind::TaskConversation => Some("正在处理一件具体的事"),
+            SocialSceneKind::Unknown => None,
+        };
+        if let Some(part) = scene_part {
+            parts.push(part.to_owned());
+        }
+        if !scene.current_floor().is_empty()
+            && SocialSceneKind::DirectConversation != scene.scene_kind()
+        {
+            parts.push("别人正拿着话头".to_owned());
+        }
+        // Only interrupt cost matters as a feel, never as a number.
+        if scene.interruption_cost() > 0.7 {
+            parts.push("现在插话不太合适".to_owned());
+        }
+    }
+    for situation in snapshot
+        .situations()
+        .iter()
+        .filter(|situation| situation.status() == SituationStatus::Active)
+        .take(2)
+    {
+        if let Some(detail) = situation.detail() {
+            let label = match detail {
+                "群讨论中" => "当前是有来有回的群讨论",
+                "私聊进行中" => "单聊正好聊着",
+                other => other,
+            };
+            parts.push(truncate_chars(label, 30));
+        }
+    }
+    if !snapshot.environment().hosts().is_empty()
+        && snapshot.environment().hosts().iter().all(|host| {
+            host.health() == yunxi_core::ServiceHealth::Unavailable
+        })
+    {
+        parts.push("发消息的主机都不可用".to_owned());
+    }
+    if parts.is_empty() {
+        return String::new();
+    }
+    let mut text = parts.join("；");
+    text.push('。');
+    truncate_chars(&text, 600)
+}
+
 /// Bounded "what does the world look like right now for this conversation"
 /// soft signal (v4 §231 decision formula input; R4 shadow source).
 #[derive(Debug, Clone, PartialEq)]
@@ -896,6 +975,43 @@ mod tests {
     fn truncate_respects_char_boundaries() {
         assert_eq!(truncate_chars("abc", 2), "ab");
         assert_eq!(truncate_chars("你好呀", 2), "你好");
+    }
+
+    #[test]
+    fn render_world_context_is_objective_and_bounded() {
+        use yunxi_core::{SocialSceneKind, SocialSceneUpdate};
+        use yunxi_core::WorldSnapshotContext;
+        let conversation_id = yunxi_core::ConversationId::new();
+        let person_id = PersonId::new();
+        let mut world = WorldModel::new();
+        world
+            .update_social_scene(
+                SocialSceneUpdate::new(
+                    conversation_id,
+                    chrono::Utc::now(),
+                    vec![person_id],
+                    vec![person_id],
+                    vec![person_id],
+                    false,
+                    0.9,
+                    SocialSceneKind::RapidGroupChat,
+                )
+                .expect("scene"),
+            )
+            .expect("scene");
+        let snapshot = world
+            .snapshot_for(&WorldSnapshotContext::new(chrono::Utc::now()).with_conversation(conversation_id))
+            .expect("snapshot");
+        let text = render_world_context(&snapshot);
+        // Objective scene nouns only — no psychology, no ids, no numbers.
+        assert!(text.contains("群里说得很快"));
+        assert!(!text.contains("version"));
+        assert!(text.chars().count() <= 600);
+        // An empty world renders nothing.
+        let empty = WorldModel::new()
+            .snapshot_for(&WorldSnapshotContext::new(chrono::Utc::now()))
+            .expect("snapshot");
+        assert!(render_world_context(&empty).is_empty());
     }
 
     #[test]

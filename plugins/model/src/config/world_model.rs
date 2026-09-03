@@ -17,6 +17,10 @@ pub struct WorldModelConfig {
     persist: bool,
     /// Persistence write interval (seconds).
     persist_interval_secs: u64,
+    /// Reply-context injection: "disabled" (default, no effect), "shadow"
+    /// (log what would be injected), or "active" (inject bounded world
+    /// context into the reply). Active only after shadow review (v4 §217).
+    reply_context: String,
     /// TTL (seconds) applied to observations derived from chat world facts.
     observation_ttl_secs: u64,
     /// Maximum distinct conversations with a live social scene.
@@ -32,6 +36,7 @@ impl Default for WorldModelConfig {
             shadow_mode: true,
             persist: true,
             persist_interval_secs: 30,
+            reply_context: "disabled".to_owned(),
             observation_ttl_secs: 60 * 60 * 24,
             max_social_scenes: 256,
             activity_window_secs: 60,
@@ -57,6 +62,10 @@ impl WorldModelConfig {
             self.persist_interval_secs >= 10 && self.persist_interval_secs <= 3600,
             "world_model.persist_interval_secs 必须在 10..=3600"
         );
+        anyhow::ensure!(
+            matches!(self.reply_context.as_str(), "disabled" | "shadow" | "active"),
+            "world_model.reply_context 必须是 disabled / shadow / active"
+        );
         Ok(())
     }
 
@@ -74,6 +83,19 @@ impl WorldModelConfig {
 
     pub fn persist_interval_secs(&self) -> u64 {
         self.persist_interval_secs
+    }
+
+    /// disabled / shadow / active.
+    pub fn reply_context(&self) -> &str {
+        &self.reply_context
+    }
+
+    pub fn reply_context_active(&self) -> bool {
+        self.reply_context == "active"
+    }
+
+    pub fn reply_context_shadow(&self) -> bool {
+        self.reply_context == "shadow"
     }
 
     pub fn observation_ttl_secs(&self) -> u64 {
