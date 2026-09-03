@@ -168,6 +168,30 @@ impl PostgresWorldModelStore {
         .execute(&mut *transaction)
         .await?;
         query(
+            r#"CREATE TABLE IF NOT EXISTS yunxi_world_causal (
+                id UUID PRIMARY KEY,
+                cause_kind TEXT NOT NULL,
+                cause_label TEXT NOT NULL,
+                effect_kind TEXT NOT NULL,
+                effect_label TEXT NOT NULL,
+                strength REAL NOT NULL,
+                confidence REAL NOT NULL,
+                source TEXT NOT NULL,
+                scope_kind TEXT NOT NULL CHECK (scope_kind IN ('global', 'tool_specific', 'person_specific', 'conversation_specific', 'host_specific')),
+                scope_id TEXT,
+                evidence_occurrences BIGINT NOT NULL,
+                version BIGINT NOT NULL
+            )"#,
+        )
+        .execute(&mut *transaction)
+        .await?;
+        query(
+            "CREATE INDEX IF NOT EXISTS yunxi_world_causal_scope_idx
+             ON yunxi_world_causal (scope_kind, scope_id)",
+        )
+        .execute(&mut *transaction)
+        .await?;
+        query(
             "CREATE TABLE IF NOT EXISTS yunxi_world_meta (
                 key TEXT PRIMARY KEY,
                 value JSONB NOT NULL
@@ -194,6 +218,7 @@ impl PostgresWorldModelStore {
             "yunxi_world_hypotheses",
             "yunxi_world_scenes",
             "yunxi_world_uncertainties",
+            "yunxi_world_causal",
         ] {
             query(&format!("DELETE FROM {table}"))
                 .execute(&mut *transaction)
@@ -337,6 +362,29 @@ impl PostgresWorldModelStore {
         .bind(serde_json::json!({ "version": world.version() }))
         .execute(&mut *transaction)
         .await?;
+        for relation in world.causal().relations() {
+            let (scope_kind, scope_id) = encode_causal_scope(relation.scope());
+            query(
+                r#"INSERT INTO yunxi_world_causal
+                   (id, cause_kind, cause_label, effect_kind, effect_label, strength,
+                    confidence, source, scope_kind, scope_id, evidence_occurrences, version)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)"#,
+            )
+            .bind(relation.id().into_uuid())
+            .bind(pattern_kind_label(relation.cause().kind()))
+            .bind(relation.cause().label())
+            .bind(pattern_kind_label(relation.effect().kind()))
+            .bind(relation.effect().label())
+            .bind(relation.strength())
+            .bind(relation.confidence())
+            .bind(causal_source_label(relation.source()))
+            .bind(scope_kind)
+            .bind(scope_id)
+            .bind(relation.evidence_occurrences() as i64)
+            .bind(relation.version() as i64)
+            .execute(&mut *transaction)
+            .await?;
+        }
         transaction.commit().await?;
         Ok(())
     }
@@ -504,16 +552,43 @@ impl PostgresWorldModelStore {
                     .unwrap_or(1)
             })
             .unwrap_or(1);
+        let mut causal = Vec::new();
+        let rows = query("SELECT * FROM yunxi_world_causal")
+            .fetch_all(&self.pool)
+            .await?;
+        for row in rows {
+            let relation = yunxi_core::CausalRelation::new(
+                yunxi_core::CausalRelationId::from_uuid(row.try_get("id")?),
+                yunxi_core::WorldPattern::new(
+                    decode_pattern_kind(row.try_get::<String, _>("cause_kind")?),
+                    row.try_get::<String, _>("cause_label")?,
+                )?,
+                yunxi_core::WorldPattern::new(
+                    decode_pattern_kind(row.try_get::<String, _>("effect_kind")?),
+                    row.try_get::<String, _>("effect_label")?,
+                )?,
+                row.try_get::<f32, _>("strength")?,
+                row.try_get::<f32, _>("confidence")?,
+                decode_causal_source(row.try_get::<String, _>("source")?),
+                decode_causal_scope(
+                    row.try_get::<String, _>("scope_kind")?,
+                    row.try_get::<Option<String>, _>("scope_id")?,
+                )?,
+                row.try_get::<i64, _>("evidence_occurrences")? as u32,
+            )?;
+            causal.push(relation);
+        }
         if observations.is_empty()
             && entities.is_empty()
             && situations.is_empty()
             && hypotheses.is_empty()
             && scenes.is_empty()
             && uncertainties.is_empty()
+            && causal.is_empty()
         {
             return Ok(None);
         }
-        let world = WorldModel::restore_from_parts(
+        let mut world = WorldModel::restore_from_parts(
             observations,
             entities,
             situations,
@@ -524,6 +599,13 @@ impl PostgresWorldModelStore {
             uncertainties,
             version,
         )?;
+        for relation in causal {
+            // Duplicates are impossible after a snapshot restore; errors here
+            // mean corrupted rows → fail-soft by skipping that relation.
+            if let Err(error) = world.add_causal_relation(relation) {
+                eprintln!("[YUNXI_WORLD] causal restore skipped: {error}");
+            }
+        }
         Ok(Some(world))
     }
 
@@ -592,6 +674,21 @@ impl PostgresWorldModelStore {
             .execute(&mut **transaction)
             .await?
             .rows_affected();
+            deleted += query(
+                "DELETE FROM yunxi_world_causal
+                 WHERE (scope_kind = 'person_specific' AND scope_id = $1::text)
+                    OR (scope_kind = 'conversation_specific' AND scope_id = ANY($2::text[]))",
+            )
+            .bind(person_id.to_string())
+            .bind(
+                direct_conversation_ids
+                    .iter()
+                    .map(|id| id.to_string())
+                    .collect::<Vec<_>>(),
+            )
+            .execute(&mut **transaction)
+            .await?
+            .rows_affected();
         }
         Ok(deleted)
     }
@@ -602,24 +699,28 @@ impl PostgresWorldModelStore {
         conversation_id: uuid::Uuid,
     ) -> anyhow::Result<u64> {
         let mut deleted = 0;
-        for (table, column, label) in [
-            ("yunxi_world_observations", "scope_id", "observations"),
-            ("yunxi_world_hypotheses", "scope_id", "hypotheses"),
-            ("yunxi_world_entities", "linked_conversation", "entities"),
-            ("yunxi_world_situations", "conversation_id", "situations"),
-            ("yunxi_world_scenes", "conversation_id", "scenes"),
-            ("yunxi_world_uncertainties", "scope_id", "uncertainties"),
+        for query_sql in [
+            "DELETE FROM yunxi_world_observations WHERE scope_kind = 'conversation' AND scope_id = $1",
+            "DELETE FROM yunxi_world_hypotheses WHERE scope_kind = 'conversation' AND scope_id = $1",
+            "DELETE FROM yunxi_world_entities WHERE linked_conversation = $1",
+            "DELETE FROM yunxi_world_situations WHERE conversation_id = $1",
+            "DELETE FROM yunxi_world_scenes WHERE conversation_id = $1",
+            "DELETE FROM yunxi_world_uncertainties WHERE scope_kind = 'conversation' AND scope_id = $1",
         ] {
-            let sql = format!(
-                "DELETE FROM {table} WHERE {column} = $1 OR scope_id = $1"
-            );
-            let _ = label;
-            let rows = query(&sql)
+            let rows = query(query_sql)
                 .bind(conversation_id)
                 .execute(&mut **transaction)
                 .await?;
             deleted += rows.rows_affected();
         }
+        deleted += query(
+            "DELETE FROM yunxi_world_causal
+             WHERE scope_kind = 'conversation_specific' AND scope_id = $1::text",
+        )
+        .bind(conversation_id.to_string())
+        .execute(&mut **transaction)
+        .await?
+        .rows_affected();
         Ok(deleted)
     }
 }
@@ -797,6 +898,88 @@ fn uncertainty_type_label(kind: UncertaintyType) -> &'static str {
     }
 }
 
+fn pattern_kind_label(kind: yunxi_core::PatternKind) -> &'static str {
+    match kind {
+        yunxi_core::PatternKind::Tool => "tool",
+        yunxi_core::PatternKind::Host => "host",
+        yunxi_core::PatternKind::Environment => "environment",
+        yunxi_core::PatternKind::User => "user",
+        yunxi_core::PatternKind::Situation => "situation",
+        yunxi_core::PatternKind::Unknown => "unknown",
+    }
+}
+
+fn decode_pattern_kind(label: String) -> yunxi_core::PatternKind {
+    match label.as_str() {
+        "tool" => yunxi_core::PatternKind::Tool,
+        "host" => yunxi_core::PatternKind::Host,
+        "environment" => yunxi_core::PatternKind::Environment,
+        "user" => yunxi_core::PatternKind::User,
+        "situation" => yunxi_core::PatternKind::Situation,
+        _ => yunxi_core::PatternKind::Unknown,
+    }
+}
+
+fn causal_source_label(source: yunxi_core::CausalSource) -> &'static str {
+    match source {
+        yunxi_core::CausalSource::Seed => "seed",
+        yunxi_core::CausalSource::ObservedRepeatedPattern => "observed_repeated_pattern",
+        yunxi_core::CausalSource::ToolBehavior => "tool_behavior",
+        yunxi_core::CausalSource::Reflection => "reflection",
+        yunxi_core::CausalSource::DomainRule => "domain_rule",
+    }
+}
+
+fn decode_causal_source(label: String) -> yunxi_core::CausalSource {
+    match label.as_str() {
+        "seed" => yunxi_core::CausalSource::Seed,
+        "observed_repeated_pattern" => yunxi_core::CausalSource::ObservedRepeatedPattern,
+        "tool_behavior" => yunxi_core::CausalSource::ToolBehavior,
+        "reflection" => yunxi_core::CausalSource::Reflection,
+        "domain_rule" => yunxi_core::CausalSource::DomainRule,
+        _ => yunxi_core::CausalSource::ObservedRepeatedPattern,
+    }
+}
+
+fn encode_causal_scope(scope: yunxi_core::CausalScope) -> (&'static str, Option<String>) {
+    use yunxi_core::CausalScope;
+    match scope {
+        CausalScope::Global => ("global", None),
+        CausalScope::ToolSpecific { tool } => ("tool_specific", Some(tool)),
+        CausalScope::PersonSpecific { person_id } => {
+            ("person_specific", Some(person_id.into_uuid().to_string()))
+        }
+        CausalScope::ConversationSpecific { conversation_id } => (
+            "conversation_specific",
+            Some(conversation_id.into_uuid().to_string()),
+        ),
+        CausalScope::HostSpecific { host } => ("host_specific", Some(host.as_str().to_owned())),
+    }
+}
+
+fn decode_causal_scope(
+    kind: String,
+    scope_id: Option<String>,
+) -> anyhow::Result<yunxi_core::CausalScope> {
+    use yunxi_core::CausalScope;
+    match (kind.as_str(), scope_id.as_deref()) {
+        ("global", None) => Ok(CausalScope::Global),
+        ("tool_specific", Some(tool)) => Ok(CausalScope::ToolSpecific {
+            tool: tool.to_owned(),
+        }),
+        ("person_specific", Some(id)) => Ok(CausalScope::PersonSpecific {
+            person_id: PersonId::from_uuid(uuid::Uuid::parse_str(id)?),
+        }),
+        ("conversation_specific", Some(id)) => Ok(CausalScope::ConversationSpecific {
+            conversation_id: ConversationId::from_uuid(uuid::Uuid::parse_str(id)?),
+        }),
+        ("host_specific", Some(host)) => Ok(CausalScope::HostSpecific {
+            host: yunxi_core::HostId::new(host.to_owned())?,
+        }),
+        _ => anyhow::bail!("无法解码 causal scope: {kind:?} {scope_id:?}"),
+    }
+}
+
 fn decode_uncertainty_type(label: String) -> UncertaintyType {
     match label.as_str() {
         "state_unknown" => UncertaintyType::StateUnknown,
@@ -832,6 +1015,34 @@ mod tests {
             assert_eq!(decode_scope(kind, id).expect("decodes"), scope);
         }
         assert!(decode_scope("bogus", None).is_err());
+    }
+
+    #[test]
+    fn causal_scope_encoding_roundtrips() {
+        let person = PersonId::new();
+        let conversation = ConversationId::new();
+        for scope in [
+            yunxi_core::CausalScope::Global,
+            yunxi_core::CausalScope::ToolSpecific {
+                tool: "web_fetch".to_owned(),
+            },
+            yunxi_core::CausalScope::PersonSpecific {
+                person_id: person,
+            },
+            yunxi_core::CausalScope::ConversationSpecific {
+                conversation_id: conversation,
+            },
+            yunxi_core::CausalScope::HostSpecific {
+                host: yunxi_core::HostId::new("qq").expect("host"),
+            },
+        ] {
+            let (kind, id) = encode_causal_scope(scope.clone());
+            assert_eq!(
+                decode_causal_scope(kind.to_owned(), id).expect("decodes"),
+                scope
+            );
+        }
+        assert!(decode_causal_scope("bogus".to_owned(), None).is_err());
     }
 
     #[test]
