@@ -1071,15 +1071,18 @@ impl PostgresIdentityStore {
             delete_person_domain_rows(&mut transaction, person_id, &conversation_ids, &qq_user_ids)
                 .await
                 .map_err(IdentityStoreError::storage)?;
-        // World Model v4 data follows the same erasure boundary (v4 §242);
-        // best-effort: a world-store failure must not abort the erasure.
-        if let Ok(rows) =
-            super::world_model_store::PostgresWorldModelStore::delete_person_domain_rows(
-                &mut transaction,
-                person_id,
-                &conversation_ids,
-            )
-            .await
+        // World Model v4 data follows the same erasure boundary (v4 §242).
+        // Only run when the world store has been initialized (its tables
+        // exist); otherwise the SQL would abort the caller's transaction.
+        // Best-effort: a world-store failure must not abort the erasure.
+        if super::world_model_store().is_some()
+            && let Ok(rows) =
+                super::world_model_store::PostgresWorldModelStore::delete_person_domain_rows(
+                    &mut transaction,
+                    person_id,
+                    &conversation_ids,
+                )
+                .await
         {
             deleted.world_model = rows;
         }
@@ -1265,8 +1268,10 @@ impl PostgresIdentityStore {
             .await
             .map_err(IdentityStoreError::storage)?;
         // World Model v4 conversation rows follow the same group erasure
-        // boundary (v4 §242); best-effort.
-        if let Some(conversation_id) = conversation_id
+        // boundary (v4 §242); only run when the world store tables exist,
+        // otherwise the SQL would abort the caller's transaction.
+        if super::world_model_store().is_some()
+            && let Some(conversation_id) = conversation_id
             && let Ok(rows) =
                 super::world_model_store::PostgresWorldModelStore::delete_conversation_domain_rows(
                     &mut transaction,
