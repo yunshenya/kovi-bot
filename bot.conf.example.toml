@@ -278,14 +278,15 @@ cooldown_secs = 600
 # 持久化（重启恢复、数据删除联动）。持久化表按需创建（additive），
 # 其余组件不受影响。
 [world_model]
-enabled = false
+# 生产默认影子观察模式（只记录不改变行为）；本地/测试不需要时可关闭
+enabled = true
 shadow_mode = true
 persist = true
 persist_interval_secs = 30
-# 回复上下文注入：disabled（默认，无效果）/ shadow（记录将注入的内容）/
+# 回复上下文注入：disabled（无效果）/ shadow（记录将注入的内容）/
 # active（注入有界客观摘要，影响节奏与分寸；建议 shadow 观察后再开）
-reply_context = "disabled"
-# 行为级开关：disabled（默认，行为零影响）/ active（世界 interruption
+reply_context = "shadow"
+# 行为级开关：disabled（行为零影响）/ active（世界 interruption
 # cost >0.7 时抑制未点名群聊插话；请先观察 shadow 指标再开启）
 influence_mode = "disabled"
 observation_ttl_secs = 86400
