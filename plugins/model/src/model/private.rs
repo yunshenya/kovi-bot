@@ -191,7 +191,14 @@ pub(crate) async fn private_message_event_after_ingress(
             return;
         }
         if let Some(reply) = crate::model::world_commands::handle_world_command(message) {
-            send_private_direct_response(&bot, user_id, initial_admission, &reply).await;
+            // The same control-reply semantics as agent-task cancel: the
+            // message's own pending admission counts as an "active reply" to
+            // the tracked sender, so cancel it first, then send (v4 §155).
+            let stopped = stop_private_reply(user_id, initial_admission.ticket).await;
+            send_tracked_private_message(&bot, user_id, reply).await;
+            if stopped {
+                drain_pending_private_messages_from_current(user_id, &bot).await;
+            }
         }
         return;
     }
