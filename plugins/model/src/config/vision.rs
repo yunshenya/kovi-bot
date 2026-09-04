@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 #[serde(default)]
 pub struct VisionConfig {
-    /// 视觉 Provider：auto、builtin 或 mcp。
+    /// 视觉 Provider：auto、intrinsic、builtin 或 mcp。
     provider: String,
     /// MCP 服务名；必须对应 tools.mcp_servers 中的服务。
     mcp_server: String,
@@ -31,9 +31,12 @@ impl VisionConfig {
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
-        if !matches!(self.provider.as_str(), "auto" | "builtin" | "mcp") {
+        if !matches!(
+            self.provider.as_str(),
+            "auto" | "intrinsic" | "builtin" | "mcp"
+        ) {
             return Err(anyhow::anyhow!(
-                "vision.provider 必须是 auto、builtin 或 mcp"
+                "vision.provider 必须是 auto、intrinsic、builtin 或 mcp"
             ));
         }
         if self.timeout_secs == 0 || self.timeout_secs > 120 {
@@ -95,5 +98,15 @@ mod tests {
             ..VisionConfig::default()
         };
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn intrinsic_provider_is_valid_without_external_config() {
+        let config = VisionConfig {
+            provider: "intrinsic".to_string(),
+            ..VisionConfig::default()
+        };
+        assert_eq!(config.provider(), "intrinsic");
+        assert!(config.validate().is_ok());
     }
 }

@@ -221,7 +221,7 @@ max_report_chars = 3000
 lease_secs = 180
 
 [vision]
-provider = "auto"
+provider = "intrinsic"
 mcp_server = ""
 mcp_tool = "analyze_image"
-timeout_secs = 60
+timeout_secs = 120

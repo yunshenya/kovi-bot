@@ -231,10 +231,12 @@ max_task_instruction_chars = 2000
 max_task_output_chars = 4000
 
 [vision]
-provider = "auto"
+# 视觉优先使用本地 Intrinsic 模型（不依赖外部端点）；external 端点不可用时
+# 可切回 auto 让内置 Provider 与本地模型自动回退。本地推理较慢，超时给足。
+provider = "intrinsic"
 mcp_server = ""
 mcp_tool = "analyze_image"
-timeout_secs = 60
+timeout_secs = 120
 
 # 世界传感器：让核心了解你真实世界的持久事实。默认开启（代码默认值）；
 # 未配置 [[world_sensors.sensors]] 时，默认内置一个检查本服务健康度的

@@ -23,24 +23,37 @@ use std::time::Duration;
 async fn analyze_images_with_intrinsic(images: &[VisionImage], question: &str) -> Option<String> {
     let runtime = crate::yunxi::intrinsic_runtime::get()?;
     if !runtime.supports_vision() {
+        eprintln!(
+            "[WARN] Intrinsic 视觉模型不可用（supports_vision=false，health={:?}）",
+            runtime.health()
+        );
         return None;
     }
     // The Intrinsic vision engine resolves a single image per turn.
     if images.len() != 1 {
+        eprintln!(
+            "[WARN] Intrinsic 视觉模型仅支持单图分析，收到 {} 张",
+            images.len()
+        );
         return None;
     }
     let config = runtime.runtime().config();
-    let image = crate::yunxi::intrinsic_runtime::resolved_image_from_data_url(
+    let image = match crate::yunxi::intrinsic_runtime::resolved_image_from_data_url(
         &images[0].url,
         config.media.max_bytes,
-    )
-    .ok()?;
+    ) {
+        Ok(image) => image,
+        Err(error) => {
+            eprintln!("[WARN] Intrinsic 视觉图片解析失败: {error}");
+            return None;
+        }
+    };
     let prompt = if question.trim().is_empty() {
         default_vision_prompt().to_string()
     } else {
         question.trim().to_string()
     };
-    let output = runtime
+    match runtime
         .infer_vision(yunxi_core::VisionInferenceRequest {
             prompt,
             image,
@@ -48,8 +61,13 @@ async fn analyze_images_with_intrinsic(images: &[VisionImage], question: &str) -
             max_new_tokens: config.max_new_tokens,
         })
         .await
-        .ok()?;
-    Some(output.text)
+    {
+        Ok(output) => Some(output.text),
+        Err(error) => {
+            eprintln!("[WARN] Intrinsic 视觉推理失败: {error}");
+            None
+        }
+    }
 }
 
 const MAX_VISION_QUESTION_CHARS: usize = 4_000;
@@ -101,6 +119,13 @@ impl VisionRouter {
         reply_ticket: Option<ReplyTicket>,
     ) -> Result<String> {
         match self.config.provider() {
+            // 本地 Intrinsic 视觉模型：不依赖外部端点，图片完全在本机推理。
+            "intrinsic" => match analyze_images_with_intrinsic(images, question).await {
+                Some(result) => Ok(result),
+                None => Err(anyhow!(
+                    "本地 Intrinsic 视觉模型不可用（需要单一图片且模型支持 vision）"
+                )),
+            },
             "builtin" => match analyze_images_with_builtin(images, question).await {
                 Ok(result) => Ok(result),
                 Err(error) => {
