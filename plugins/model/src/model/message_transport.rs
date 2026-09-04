@@ -138,13 +138,20 @@ impl<'a> MessageTransport<'a> {
 
         let response =
             request_api_response(&self.bot.api_tx, SendApi::new("send_msg", params)).await?;
-        response
+        let message_id = response
             .data
             .get("message_id")
             .and_then(|message_id| message_id.as_i64())
             .and_then(|message_id| i32::try_from(message_id).ok())
             .filter(|message_id| *message_id > 0)
-            .ok_or(MessageTransportError::Indeterminate(response))
+            .ok_or(MessageTransportError::Indeterminate(response))?;
+        if let MessageDestination::Group(group_id) = destination {
+            // 无论 Host 还是 Core 的发送路径，一次可见的群聊消息都会开启
+            // “接续对话”窗口，让随后未点名的消息按连续会话语义处理，
+            // 而不是只能靠低概率插话抽样。
+            crate::model::group::mark_group_reply_sent(group_id).await;
+        }
+        Ok(message_id)
     }
 }
 

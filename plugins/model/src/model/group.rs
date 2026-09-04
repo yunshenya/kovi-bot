@@ -47,6 +47,12 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
+/// 芸汐上一次在本群发出可见消息后，连续会话上下文保持激活的时长。
+/// 窗口内到达的未点名消息走“接续对话”语义（由模型判定相关性），而不是
+/// 只能靠低概率插话抽样；窗口外回到纯抽样。这保证她刚开口说过话时，
+/// 对方接着说的内容是“能看到”的。
+const GROUP_CONTINUATION_WINDOW_SECS: u64 = 10 * 60;
+
 #[derive(Default)]
 struct GroupInterjectionState {
     eligible_messages_since_sample: u32,
@@ -56,6 +62,8 @@ struct GroupInterjectionState {
     conversation: GroupConversationState,
     sticker_reaction_attempts: VecDeque<Instant>,
     sticker_reaction_last_by_user: HashMap<i64, Instant>,
+    /// 无论哪条发送路径（Host 或 Core）在本群发出可见消息的时间。
+    last_bot_reply: Option<Instant>,
 }
 
 /// 未点名接话只维护本地计数和冷却状态；不会为每一条群消息调用模型。
@@ -599,6 +607,20 @@ pub(crate) async fn group_message_event_after_ingress(
         };
     let sticker_reaction = recent_sticker_reaction.is_some()
         && reserve_sticker_reaction(group_id, event.user_id).await;
+    // 消息通过 at/reply 段明确指向其他成员（而非芸汐）时，只观察不插话，
+    // 也不触发接续对话：点名谁就由谁接话，避免“只要有 @ 就回复”的错觉。
+    if !addressed_to_bot
+        && !sticker_reaction
+        && !vision_command
+        && !pending_image_request
+        && directed_at_others(&event.message)
+    {
+        println!(
+            "[INFO] 群聊消息指向其他成员，仅观察不回复 (群组: {}, 用户: {})",
+            group_id, event.user_id
+        );
+        return;
+    }
     if message.trim().is_empty()
         && (!images.is_empty() || !stickers.is_empty())
         && !vision_command
@@ -1341,7 +1363,29 @@ async fn group_conversation_snapshot(group_id: i64) -> (bool, String) {
     prune_interjection_states(&mut states);
     let state = states.entry(group_id).or_default();
     state.conversation.prune();
-    (state.conversation.is_active(), state.conversation.context())
+    (
+        conversation_active_for_observation(state, Instant::now()),
+        state.conversation.context(),
+    )
+}
+
+/// 会话是否处于“接续对话”激活状态：语义会话未关闭，或芸汐刚在本群发过
+/// 可见消息（还在连续会话窗口内）。
+fn conversation_active_for_observation(state: &GroupInterjectionState, now: Instant) -> bool {
+    state.conversation.is_active()
+        || state.last_bot_reply.is_some_and(|last| {
+            now.saturating_duration_since(last)
+                < Duration::from_secs(GROUP_CONTINUATION_WINDOW_SECS)
+        })
+}
+
+/// 标记芸汐在本群发出了一条可见消息。Host 回复与 Core 回复都经过
+/// MessageTransport 发送，因此这里能统一刷新连续会话窗口。
+pub(crate) async fn mark_group_reply_sent(group_id: i64) {
+    let mut states = GROUP_INTERJECTION_STATE.lock().await;
+    prune_interjection_states(&mut states);
+    let state = states.entry(group_id).or_default();
+    state.last_bot_reply = Some(Instant::now());
 }
 
 async fn observe_group_conversation(
@@ -1805,6 +1849,15 @@ fn message_at_self(message: &Message, self_id: i64) -> bool {
     })
 }
 
+/// 消息是否携带 at/reply 定向段。调用方必须先排除“指向芸汐本人”的情况
+/// （结构化 at 自己或引用自己），因此这里只需判断是否存在定向段：
+/// 点名或引用其他成员的消息是定向消息，不应触发插话或接续对话。
+fn directed_at_others(message: &Message) -> bool {
+    message
+        .iter()
+        .any(|segment| matches!(segment.type_.as_str(), "at" | "reply"))
+}
+
 fn text_mentions_bot(message: &str) -> bool {
     ["芸汐", "云汐"].iter().any(|name| message.contains(name))
 }
@@ -1873,13 +1926,14 @@ async fn update_group_profile(group_id: i64, user_id: i64, understanding: &Messa
 #[cfg(test)]
 mod tests {
     use super::{
-        Addressing, DirectTriggerState, GroupInterjectionState, GroupSenderIdentity,
-        PENDING_WINDOW_MESSAGES, admit_understood_group_turn,
+        Addressing, DirectTriggerState, GROUP_CONTINUATION_WINDOW_SECS, GroupInterjectionState,
+        GroupSenderIdentity, PENDING_WINDOW_MESSAGES, admit_understood_group_turn,
         clear_group_erasure_reply_state_locked, complete_interjection_attempt,
-        decision_budget_available, group_erasure_receipt_destination, message_at_self,
-        normalized_sender_name, prune_decision_attempts, queue_pending_window_message,
-        should_queue_after_executive, sticker_reaction_budget_available, suppress_direct_trigger,
-        take_pending_window_turn, text_mentions_bot, with_structured_bot_mention_context,
+        conversation_active_for_observation, decision_budget_available, directed_at_others,
+        group_erasure_receipt_destination, message_at_self, normalized_sender_name,
+        prune_decision_attempts, queue_pending_window_message, should_queue_after_executive,
+        sticker_reaction_budget_available, suppress_direct_trigger, take_pending_window_turn,
+        text_mentions_bot, with_structured_bot_mention_context,
     };
     use crate::model::MessageDestination;
     use crate::model::conversation_coordinator::{
@@ -1942,6 +1996,44 @@ mod tests {
         assert!(!message_at_self(&everyone, self_id));
         assert!(!message_at_self(&no_at, self_id));
         assert!(message_at_self(&multiple_targets, self_id));
+    }
+
+    #[test]
+    fn directed_at_others_only_matches_at_and_reply_segments() {
+        let plain = Message::from("今天群里有点安静");
+        assert!(!directed_at_others(&plain));
+
+        let at_other = Message::from(vec![
+            Segment::new("at", json!({"qq": "654321"})),
+            Segment::new("text", json!({"text": "快回来直播"})),
+        ]);
+        assert!(directed_at_others(&at_other));
+
+        let at_all = Message::from(vec![Segment::new("at", json!({"qq": "all"}))]);
+        assert!(directed_at_others(&at_all));
+
+        let reply_other = Message::from(vec![
+            Segment::new("reply", json!({"id": 42})),
+            Segment::new("text", json!({"text": "我说完了"})),
+        ]);
+        assert!(directed_at_others(&reply_other));
+
+        let at_self = Message::from(vec![Segment::new("at", json!({"qq": "123456"}))]);
+        // 调用方在进入本函数前已排除“指向芸汐本人”，本例只验证段类型判定本身。
+        assert!(directed_at_others(&at_self));
+    }
+
+    #[test]
+    fn fresh_bot_reply_opens_continuation_window_then_expires() {
+        let now = Instant::now();
+        let mut state = GroupInterjectionState::default();
+        assert!(!conversation_active_for_observation(&state, now));
+
+        state.last_bot_reply = Some(now - Duration::from_secs(60));
+        assert!(conversation_active_for_observation(&state, now));
+
+        state.last_bot_reply = Some(now - Duration::from_secs(GROUP_CONTINUATION_WINDOW_SECS + 1));
+        assert!(!conversation_active_for_observation(&state, now));
     }
 
     #[test]
