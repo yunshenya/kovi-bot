@@ -2,6 +2,7 @@
 
 use anyhow::{Result, anyhow};
 use base64::Engine;
+use image::ImageFormat;
 use kovi::tokio::sync::Semaphore;
 use reqwest::Client;
 use std::collections::HashSet;
@@ -122,8 +123,16 @@ pub(crate) async fn materialize_image_url(
 
     kovi::tokio::task::spawn_blocking(move || {
         validate_image_signature(&content_type, &bytes)?;
+        // QQ 表情/动态图常见 GIF。视觉 Provider 可能不支持 GIF 或直接拒绝
+        // 动态格式，统一转为 PNG（只取第一帧）再交给下游，避免整张图片
+        // 因“格式不支持”被静默丢弃。
+        let (mime_type, bytes) = if content_type == "image/gif" {
+            transcode_gif_to_png(&bytes, max_bytes)?
+        } else {
+            (content_type, bytes)
+        };
         Ok(MaterializedImage {
-            data_url: encode_image_data_url(&content_type, &bytes),
+            data_url: encode_image_data_url(&mime_type, &bytes),
             byte_len: bytes.len(),
         })
     })
@@ -302,7 +311,7 @@ fn ipv6_prefix_matches(address: Ipv6Addr, network: Ipv6Addr, prefix: u8) -> bool
 fn parse_image_content_type(content_type: &str) -> Option<String> {
     let mime_type = content_type.split(';').next()?.trim().to_ascii_lowercase();
     match mime_type.as_str() {
-        "image/png" | "image/jpeg" | "image/webp" => Some(mime_type),
+        "image/png" | "image/jpeg" | "image/webp" | "image/gif" => Some(mime_type),
         "image/jpg" => Some("image/jpeg".to_string()),
         _ => None,
     }
@@ -352,7 +361,31 @@ pub(crate) fn decode_validated_image_data_url(
         return Err(image_size_error(max_bytes));
     }
     validate_image_signature(&mime_type, &bytes)?;
-    Ok((mime_type, bytes))
+    // 与远程下载路径一致：GIF 统一转 PNG（取第一帧），保证下游只见到
+    // PNG/JPEG/WebP。
+    if mime_type == "image/gif" {
+        transcode_gif_to_png(&bytes, max_bytes)
+    } else {
+        Ok((mime_type, bytes))
+    }
+}
+
+/// 把 GIF 解码为 PNG（只取第一帧）。QQ 表情/动态图常是 GIF，若不转码，
+/// 视觉 Provider 可能因格式不支持而拒绝，导致图片消息被静默丢弃。
+fn transcode_gif_to_png(bytes: &[u8], max_bytes: usize) -> Result<(String, Vec<u8>)> {
+    let decoded = image::load_from_memory_with_format(bytes, ImageFormat::Gif)
+        .map_err(|error| anyhow!("GIF 图片解码失败: {error}"))?;
+    let mut png = Vec::new();
+    {
+        let mut cursor = std::io::Cursor::new(&mut png);
+        decoded
+            .write_to(&mut cursor, ImageFormat::Png)
+            .map_err(|error| anyhow!("GIF 转 PNG 失败: {error}"))?;
+    }
+    if png.len() > max_bytes {
+        return Err(image_size_error(max_bytes));
+    }
+    Ok(("image/png".to_string(), png))
 }
 
 fn validate_image_signature(mime_type: &str, bytes: &[u8]) -> Result<()> {
@@ -371,6 +404,8 @@ fn image_content_type_from_signature(bytes: &[u8]) -> Option<&'static str> {
         Some("image/jpeg")
     } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
         Some("image/webp")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
     } else {
         None
     }
@@ -386,11 +421,27 @@ fn encode_image_data_url(mime_type: &str, bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_validated_image_data_url, is_public_image_ip, is_safe_onebot_image_file,
-        parse_image_content_type, resolve_image_content_type, validate_remote_image_url,
+        decode_validated_image_data_url, image_content_type_from_signature, is_public_image_ip,
+        is_safe_onebot_image_file, parse_image_content_type, resolve_image_content_type,
+        transcode_gif_to_png, validate_image_signature, validate_remote_image_url,
     };
     use base64::Engine;
     use std::net::IpAddr;
+
+    /// 最小合法 1x1 GIF89a（透明像素）。
+    fn gif_bytes_1x1() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"GIF89a");
+        bytes.extend_from_slice(&[
+            1, 0, // width = 1
+            1, 0, // height = 1
+            0x80, 0, 0, 0, 0, 0, 0xff, 0xff, 0xff, // global color table
+            0x21, 0xf9, 0x04, 0x01, 0, 0, 0, 0, // graphic control extension
+            0x2c, 0, 0, 0, 0, 1, 0, 1, 0, 0, 2, 2, 0x44, 1, 0,    // image data
+            0x3b, // trailer
+        ]);
+        bytes
+    }
 
     #[test]
     fn rejects_non_public_or_ambiguous_image_urls() {
@@ -477,6 +528,10 @@ mod tests {
             parse_image_content_type("Image/JPEG; charset=binary").as_deref(),
             Some("image/jpeg")
         );
+        assert_eq!(
+            parse_image_content_type("image/gif").as_deref(),
+            Some("image/gif")
+        );
         assert!(parse_image_content_type("application/octet-stream").is_none());
         assert!(parse_image_content_type("image/svg+xml").is_none());
     }
@@ -494,5 +549,29 @@ mod tests {
             "image/png"
         );
         assert!(resolve_image_content_type(None, b"not an image").is_err());
+    }
+
+    #[test]
+    fn gif_is_detected_and_transcoded_to_png_first_frame() {
+        let gif = gif_bytes_1x1();
+        assert_eq!(image_content_type_from_signature(&gif), Some("image/gif"));
+        assert_eq!(resolve_image_content_type(None, &gif).unwrap(), "image/gif");
+        validate_image_signature("image/gif", &gif).expect("GIF 签名应匹配");
+
+        let (mime_type, png) = transcode_gif_to_png(&gif, 1024 * 1024).expect("GIF 应能转 PNG");
+        assert_eq!(mime_type, "image/png");
+        assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
+        assert_eq!(image_content_type_from_signature(&png), Some("image/png"));
+    }
+
+    #[test]
+    fn gif_data_url_is_decoded_and_transcoded_to_png() {
+        let gif = gif_bytes_1x1();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&gif);
+        let url = format!("data:image/gif;base64,{encoded}");
+        let (mime_type, bytes) = decode_validated_image_data_url(&url, 1024 * 1024)
+            .expect("GIF data URL 应解码并转码为 PNG");
+        assert_eq!(mime_type, "image/png");
+        assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
     }
 }

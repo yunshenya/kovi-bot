@@ -3875,12 +3875,12 @@ fn core_chat_payload_is_supported(message: &Message, text: Option<&str>, group: 
 
 fn message_at_self(message: &Message, self_id: i64) -> bool {
     message.iter().any(|segment| {
+        // @所有人 同样包含芸汐，按点名处理。
         segment.type_ == "at"
             && segment
                 .data
                 .get("qq")
-                .and_then(value_as_i64)
-                .is_some_and(|value| value == self_id)
+                .is_some_and(|qq| qq.as_str() == Some("all") || value_as_i64(qq) == Some(self_id))
     })
 }
 
@@ -4341,6 +4341,8 @@ mod tests {
         let at = Message::from(vec![Segment::new("at", json!({"qq": "123"}))]);
         assert!(message_at_self(&at, 123));
         assert!(!message_at_self(&at, 456));
+        let at_all = Message::from(vec![Segment::new("at", json!({"qq": "all"}))]);
+        assert!(message_at_self(&at_all, 123));
         assert!(!ambient_group_payload_can_be_sampled(&at));
         let reply = Message::from(vec![Segment::new("reply", json!({"id": "456"}))]);
         assert!(!ambient_group_payload_can_be_sampled(&reply));

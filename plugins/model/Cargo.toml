@@ -20,6 +20,7 @@ redis.workspace = true
 anyhow = {version = "1.0.98"}
 base64 = "0.22"
 config = "0.15.15"
+image.workspace = true
 rand = "0.9"
 rmcp.workspace = true
 scraper.workspace = true

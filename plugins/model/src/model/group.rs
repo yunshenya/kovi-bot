@@ -1842,10 +1842,15 @@ fn message_at_self(message: &Message, self_id: i64) -> bool {
             return false;
         }
 
-        segment.data.get("qq").is_some_and(|qq| {
-            qq.as_i64() == Some(self_id)
-                || qq.as_str().and_then(|value| value.parse::<i64>().ok()) == Some(self_id)
-        })
+        match segment.data.get("qq") {
+            // @所有人 同样包含芸汐，按点名处理，避免“必须逐次 @她”才能被看见。
+            Some(qq) if qq.as_str() == Some("all") => true,
+            Some(qq) => {
+                qq.as_i64() == Some(self_id)
+                    || qq.as_str().and_then(|value| value.parse::<i64>().ok()) == Some(self_id)
+            }
+            None => false,
+        }
     })
 }
 
@@ -1993,7 +1998,7 @@ mod tests {
         assert!(message_at_self(&string_id, self_id));
         assert!(message_at_self(&numeric_id, self_id));
         assert!(!message_at_self(&another_user, self_id));
-        assert!(!message_at_self(&everyone, self_id));
+        assert!(message_at_self(&everyone, self_id));
         assert!(!message_at_self(&no_at, self_id));
         assert!(message_at_self(&multiple_targets, self_id));
     }

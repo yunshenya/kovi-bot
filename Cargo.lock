@@ -1926,6 +1926,7 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "config",
+ "image",
  "kovi",
  "rand 0.9.5",
  "redis",
