@@ -758,6 +758,35 @@ pub(crate) fn tool_recovery_outcome(
     .expect("bounded outcome")
 }
 
+/// Model-gateway outcome → environment `model_health` (v4 §74, §141).
+///
+/// The environment starts at `Unknown` because the runtime has no other model
+/// health source; this gives `#情境` a truthful `Healthy`/`Unavailable`
+/// reading from the actual completion path instead of a permanent
+/// `Unknown`. Debounced: a repeated value does not bump the world version.
+/// Gated by `[world_model].enabled`; never blocks the caller.
+pub(crate) fn record_model_health(health: yunxi_core::ServiceHealth) {
+    with_world(|world, _max_scenes| {
+        if let Err(error) = apply_model_health(world, health) {
+            eprintln!("{WORLD_LOG_PREFIX} environment update failed: {error}");
+        }
+    });
+}
+
+/// Apply a model-health update to the world (pure, testable). Debounced: the
+/// environment version only advances when the value actually changes.
+fn apply_model_health(
+    world: &mut WorldModel,
+    health: yunxi_core::ServiceHealth,
+) -> Result<(), yunxi_core::world_model::WorldValidationError> {
+    if world.environment().model_health() == health {
+        return Ok(());
+    }
+    let update =
+        yunxi_core::EnvironmentUpdate::new(vec![], vec![], health, world.environment().load())?;
+    world.update_environment(update)
+}
+
 /// Tool failure → world update (v4 §141–§144, §196): mark the tool degraded
 /// with a short TTL, record the failure observation, and record deterministic
 /// shadow predictions for the recovery candidates (what an executive would
@@ -1737,6 +1766,34 @@ mod tests {
         // No message content, bounded.
         assert!(!text.contains("#情境"));
         assert!(text.chars().count() <= 1500);
+    }
+
+    #[test]
+    fn model_health_starts_unknown_and_updates_with_debounce() {
+        let _guard = serial();
+        use yunxi_core::ServiceHealth;
+        let mut world = WorldModel::new();
+        // Fresh runtime must never claim a health it has not observed.
+        assert_eq!(world.environment().model_health(), ServiceHealth::Unknown);
+        assert_eq!(world.version(), 1);
+        apply_model_health(&mut world, ServiceHealth::Healthy).expect("apply");
+        assert_eq!(world.environment().model_health(), ServiceHealth::Healthy);
+        let version_after_healthy = world.version();
+        assert_eq!(version_after_healthy, 2);
+        // Debounce: repeating the same value must not bump the version.
+        apply_model_health(&mut world, ServiceHealth::Healthy).expect("apply");
+        assert_eq!(world.version(), version_after_healthy);
+        // Failure flips the signal, and recovery flips it back.
+        apply_model_health(&mut world, ServiceHealth::Unavailable).expect("apply");
+        assert_eq!(
+            world.environment().model_health(),
+            ServiceHealth::Unavailable
+        );
+        apply_model_health(&mut world, ServiceHealth::Healthy).expect("apply");
+        assert_eq!(world.environment().model_health(), ServiceHealth::Healthy);
+        // Renderer exposes the live model-health line (v4 §74).
+        let text = render_world_status(&world, chrono::Utc::now());
+        assert!(text.contains("模型健康 Healthy"));
     }
 
     #[test]

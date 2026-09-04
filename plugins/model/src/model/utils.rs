@@ -2017,7 +2017,36 @@ enum ModelPromptMode {
     None,
 }
 
+/// Completes a model request, then mirrors the outcome into the World Model
+/// environment (`model_health`, v4 §74/§141): `Healthy` on success,
+/// `Unavailable` on the model-error envelope. Shadow-observed; never blocks
+/// the reply.
 async fn params_model_with_token_limit_and_progress_for_reply_mode(
+    messages: &mut [BotMemory],
+    max_tokens: Option<u32>,
+    vision_images: &[VisionImage],
+    progress: Option<Arc<ThinkingReporter>>,
+    reply_ticket: Option<ReplyTicket>,
+    prompt_mode: ModelPromptMode,
+) -> BotMemory {
+    let response = params_model_with_token_limit_and_progress_for_reply_mode_inner(
+        messages,
+        max_tokens,
+        vision_images,
+        progress,
+        reply_ticket,
+        prompt_mode,
+    )
+    .await;
+    crate::yunxi::world_model::record_model_health(if is_model_error_response(&response.content) {
+        yunxi_core::ServiceHealth::Unavailable
+    } else {
+        yunxi_core::ServiceHealth::Healthy
+    });
+    response
+}
+
+async fn params_model_with_token_limit_and_progress_for_reply_mode_inner(
     messages: &mut [BotMemory],
     max_tokens: Option<u32>,
     vision_images: &[VisionImage],

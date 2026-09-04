@@ -602,6 +602,7 @@ mod tests {
             ServiceHealth::Healthy
         );
         assert_eq!(environment.load().availability_fraction(), 0.5);
+        assert_eq!(environment.model_health(), ServiceHealth::Healthy);
         assert_eq!(environment.version(), 2);
     }
 
