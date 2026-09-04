@@ -306,14 +306,15 @@ impl ConversationLifecycle {
                 .map_or(occurred_at, |current| current.max(occurred_at)),
         );
         self.in_flight = false;
-        if let Some(directive) = directive {
-            self.apply_directive(occurred_at, directive, policy)?;
-        } else {
-            self.phase = ConversationPhase::Waiting;
-            self.continuation_decided = false;
-            self.next_wake_at = None;
-            self.bump_version()?;
-        }
+        // A missing directive is a decision, not an undecided state: the model
+        // answered without asking to continue, so the session waits for the
+        // human instead of re-firing after the idle window. Only an explicit
+        // `Continue` may schedule another autonomous turn.
+        self.apply_directive(
+            occurred_at,
+            directive.unwrap_or(ConversationTurnDirective::Wait),
+            policy,
+        )?;
         Ok(())
     }
 
@@ -500,6 +501,51 @@ mod tests {
                 .claim_autonomous(start + Duration::seconds(33), policy)
                 .unwrap(),
             "a fresh inbound resets the chain cap"
+        );
+    }
+
+    #[test]
+    fn missing_outbound_directive_pauses_group_until_human_speaks() {
+        let id = ConversationId::new();
+        let person = PersonId::new();
+        let mut lifecycle = ConversationLifecycle::new(id, ConversationKind::Group).unwrap();
+        let policy = AutonomyPolicy {
+            group_idle: Duration::seconds(5),
+            group_cooldown: Duration::seconds(5),
+            ..AutonomyPolicy::default()
+        };
+        let start = Utc::now();
+        lifecycle
+            .observe_inbound(ConversationKind::Group, person, start)
+            .unwrap();
+        lifecycle.record_outbound(start, None, policy).unwrap();
+        // A normal reply without an explicit Continue must not re-fire after
+        // the idle window: the model already answered, a duplicate follow-up
+        // would repeat the same message with different wording.
+        assert!(
+            !lifecycle
+                .claim_autonomous(start + Duration::seconds(60), policy)
+                .unwrap()
+        );
+        // An explicit Continue still schedules the next turn after cooldown.
+        lifecycle
+            .observe_inbound(
+                ConversationKind::Group,
+                person,
+                start + Duration::seconds(61),
+            )
+            .unwrap();
+        lifecycle
+            .record_outbound(
+                start + Duration::seconds(62),
+                Some(ConversationTurnDirective::Continue),
+                policy,
+            )
+            .unwrap();
+        assert!(
+            lifecycle
+                .claim_autonomous(start + Duration::seconds(68), policy)
+                .unwrap()
         );
     }
 

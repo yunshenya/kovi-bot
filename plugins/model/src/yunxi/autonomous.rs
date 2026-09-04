@@ -226,14 +226,6 @@ pub(crate) fn observe_group_activity(conversation_id: ConversationId, occurred_a
     entry.suspended = false;
 }
 
-/// Record a successfully delivered Core message for a tracked conversation.
-/// This is separate from `observe_inbound` so a normal reply can establish the
-/// "agent answered, now wait before continuing" boundary.
-#[cfg(test)]
-pub(crate) fn record_outbound(conversation_id: ConversationId, occurred_at: DateTime<Utc>) {
-    let _ = record_outbound_with_directive(conversation_id, occurred_at, None, None);
-}
-
 /// Record a normal reply and its model-selected conversation directive.
 ///
 /// The model's directive is respected in every conversation. Previously a
@@ -545,8 +537,8 @@ mod tests {
         autonomous_in_flight_timeout_for, autonomous_model_phase_budget, claim_due,
         claim_due_with_context, claim_is_current, finish_claim, finish_claim_token,
         model_retry_backoff, observe_group_activity, observe_inbound, observe_inbound_from_person,
-        record_outbound, record_outbound_with_directive, release_claim, release_claim_token,
-        retry_claim, retry_claim_token,
+        record_outbound_with_directive, release_claim, release_claim_token, retry_claim,
+        retry_claim_token,
     };
     use crate::config::ProactiveConfig;
     use chrono::{Duration, Utc};
@@ -594,7 +586,12 @@ mod tests {
         );
         let config = ProactiveConfig::default();
         assert!(claim_due(&config, now).is_none());
-        record_outbound(id, now - Duration::minutes(4));
+        record_outbound_with_directive(
+            id,
+            now - Duration::minutes(4),
+            Some(ConversationTurnDirective::Continue),
+            Some(&config),
+        );
         assert_eq!(claim_due(&config, now), Some(id));
         finish_claim(id, now, true, ConversationTurnDirective::Wait, &config);
         assert!(claim_due(&config, now + Duration::seconds(30)).is_none());
@@ -614,11 +611,21 @@ mod tests {
             now - Duration::minutes(4),
             true,
         );
-        record_outbound(id, now - Duration::minutes(4));
+        record_outbound_with_directive(
+            id,
+            now - Duration::minutes(4),
+            Some(ConversationTurnDirective::Continue),
+            Some(&config),
+        );
         assert_eq!(claim_due(&config, now), Some(id));
         observe_inbound(id, ConversationKind::Group, now, true);
         finish_claim(id, now, true, ConversationTurnDirective::Continue, &config);
-        record_outbound(id, now);
+        record_outbound_with_directive(
+            id,
+            now,
+            Some(ConversationTurnDirective::Continue),
+            Some(&config),
+        );
         assert_eq!(claim_due(&config, now + Duration::minutes(4)), Some(id));
         clear();
     }
@@ -636,12 +643,22 @@ mod tests {
             now - Duration::minutes(2),
             true,
         );
-        record_outbound(id, now - Duration::minutes(2));
+        record_outbound_with_directive(
+            id,
+            now - Duration::minutes(2),
+            Some(ConversationTurnDirective::Continue),
+            Some(&config),
+        );
         assert_eq!(claim_due(&config, now), Some(id));
         finish_claim(id, now, true, ConversationTurnDirective::End, &config);
         assert!(claim_due(&config, now + Duration::hours(2)).is_none());
         observe_inbound(id, ConversationKind::Direct, now + Duration::hours(2), true);
-        record_outbound(id, now + Duration::hours(2));
+        record_outbound_with_directive(
+            id,
+            now + Duration::hours(2),
+            Some(ConversationTurnDirective::Continue),
+            Some(&config),
+        );
         assert_eq!(
             claim_due(&config, now + Duration::hours(2) + Duration::minutes(2)),
             Some(id)
@@ -662,7 +679,12 @@ mod tests {
             now - Duration::minutes(4),
             true,
         );
-        record_outbound(id, now - Duration::minutes(4));
+        record_outbound_with_directive(
+            id,
+            now - Duration::minutes(4),
+            Some(ConversationTurnDirective::Continue),
+            Some(&config),
+        );
         assert_eq!(claim_due(&config, now), Some(id));
         finish_claim(id, now, true, ConversationTurnDirective::Continue, &config);
         let next = now + Duration::minutes(5);
@@ -685,7 +707,12 @@ mod tests {
             now - Duration::minutes(5),
             true,
         );
-        record_outbound(id, now - Duration::minutes(4));
+        record_outbound_with_directive(
+            id,
+            now - Duration::minutes(4),
+            Some(ConversationTurnDirective::Continue),
+            Some(&config),
+        );
         assert_eq!(claim_due(&config, now), Some(id));
         observe_group_activity(id, now);
         finish_claim(id, now, true, ConversationTurnDirective::Continue, &config);
@@ -727,13 +754,19 @@ mod tests {
         record_outbound_with_directive(id, now, None, Some(&config));
         // An omitted directive no longer forces a private conversation to keep
         // going; the bot pauses instead of 自问自答 until a new inbound turn.
-        assert!(
-            claim_due(
-                &config,
-                now + Duration::seconds(config.autonomous_conversation_cooldown_secs() as i64)
-            )
-            .is_none()
-        );
+        // Check both the cooldown boundary and well past the idle window so a
+        // duplicate follow-up can never re-fire from the same inbound turn.
+        for seconds in [
+            config.autonomous_conversation_cooldown_secs(),
+            config
+                .autonomous_conversation_idle_secs()
+                .saturating_add(120),
+        ] {
+            assert!(
+                claim_due(&config, now + Duration::seconds(seconds as i64)).is_none(),
+                "omitted directive must pause at {seconds}s"
+            );
+        }
         clear();
     }
 
@@ -940,7 +973,12 @@ mod tests {
             true,
             person,
         );
-        record_outbound(id, now - Duration::minutes(4));
+        record_outbound_with_directive(
+            id,
+            now - Duration::minutes(4),
+            Some(ConversationTurnDirective::Continue),
+            Some(&config),
+        );
         let claim = claim_due_with_context(&config, now).expect("conversation should be due");
         assert_eq!(claim.conversation_id, id);
         assert_eq!(claim.conversation_kind, ConversationKind::Direct);
@@ -1003,7 +1041,12 @@ mod tests {
             now - Duration::minutes(5),
             true,
         );
-        record_outbound(id, now - Duration::minutes(4));
+        record_outbound_with_directive(
+            id,
+            now - Duration::minutes(4),
+            Some(ConversationTurnDirective::Continue),
+            Some(&config),
+        );
         assert_eq!(claim_due(&config, now), Some(id));
         retry_claim(id);
         assert!(claim_due(&config, now).is_none());
@@ -1029,7 +1072,12 @@ mod tests {
             now - Duration::minutes(5),
             true,
         );
-        record_outbound(id, now - Duration::minutes(4));
+        record_outbound_with_directive(
+            id,
+            now - Duration::minutes(4),
+            Some(ConversationTurnDirective::Continue),
+            Some(&config),
+        );
         assert_eq!(claim_due(&config, now), Some(id));
 
         for attempt in 1..=MAX_TRANSIENT_FAILURE_RETRIES {
@@ -1084,12 +1132,22 @@ mod tests {
             now - Duration::minutes(5),
             true,
         );
-        record_outbound(id, now - Duration::minutes(4));
+        record_outbound_with_directive(
+            id,
+            now - Duration::minutes(4),
+            Some(ConversationTurnDirective::Continue),
+            Some(&config),
+        );
         let first = claim_due_with_context(&config, now).expect("first claim");
         // A new inbound invalidates the first queued tick and opens a fresh
         // lifecycle; after the reply, the scheduler may claim it again.
         observe_inbound(id, ConversationKind::Direct, now, true);
-        record_outbound(id, now);
+        record_outbound_with_directive(
+            id,
+            now,
+            Some(ConversationTurnDirective::Continue),
+            Some(&config),
+        );
         let second =
             claim_due_with_context(&config, now + Duration::minutes(2)).expect("second claim");
         assert_ne!(first.token, second.token);
