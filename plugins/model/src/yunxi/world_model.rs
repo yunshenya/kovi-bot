@@ -1336,47 +1336,136 @@ pub(crate) fn conversation_world_summary(
 }
 
 /// Human-readable bounded world status for `#world-status` / `#情境`
-/// (admin only, v4 §155/§244). Never includes message content.
+/// (admin only, v4 §155/§244). Never includes message content. Reads the
+/// full live state (all scenes / hosts / situations), not merely an
+/// empty-context snapshot.
 pub(crate) fn world_status_text() -> String {
-    let summary = status_summary().unwrap_or_else(|| "World Model 未启用".to_owned());
-    let mut text = format!("World Model v4 状态\n{summary}\n");
-    if let Some(runtime) = WORLD_RUNTIME
+    let guard = WORLD_RUNTIME
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .as_ref()
-    {
-        let world = &runtime.world;
-        let now = chrono::Utc::now();
-        let context = yunxi_core::WorldSnapshotContext::new(now);
-        if let Ok(snapshot) = world.snapshot_for(&context) {
-            if snapshot.situations().is_empty() {
-                text.push_str("活跃情境：无\n");
-            } else {
-                text.push_str("活跃情境：\n");
-                for situation in snapshot
-                    .situations()
-                    .iter()
-                    .filter(|s| s.status() == yunxi_core::SituationStatus::Active)
-                    .take(8)
-                {
-                    text.push_str(&format!(
-                        "- {:?} / {:?} / {:?}\n",
-                        situation.kind(),
-                        situation.state(),
-                        situation.detail().unwrap_or(""),
-                    ));
-                }
-            }
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(runtime) = guard.as_ref() else {
+        return "World Model v4 状态\nWorld Model 未启用".to_owned();
+    };
+    render_world_status(&runtime.world, chrono::Utc::now())
+}
+
+/// Pure renderer (unit-testable without the config-gated runtime).
+fn render_world_status(world: &WorldModel, now: chrono::DateTime<chrono::Utc>) -> String {
+    use yunxi_core::{HypothesisStatus, SituationStatus};
+    let shadow = if world_config().shadow_mode() {
+        " shadow=true"
+    } else {
+        ""
+    };
+    let active_situations = world.situations().iter().filter(|s| s.is_active()).count();
+    let active_hypotheses = world
+        .hypotheses()
+        .iter()
+        .filter(|h| h.status() == HypothesisStatus::Active)
+        .count();
+    let environment = world.environment();
+    let mut text = format!(
+        "World Model v4 状态\nversion={} entities={} situations={} live={} hypotheses={} active_hyp={} scenes={} hosts={} tools={} predictions={} causal={} uncertainties={}{}\n",
+        world.version(),
+        world.entities().len(),
+        world.situations().len(),
+        active_situations,
+        world.hypotheses().len(),
+        active_hypotheses,
+        world.social_scenes().len(),
+        environment.hosts().len(),
+        environment.tools().len(),
+        world.predictions().len(),
+        world.causal().relations().len(),
+        world.uncertainties().len(),
+        shadow,
+    );
+    // Active situations: per-conversation lines (no message content).
+    let active: Vec<_> = world
+        .situations()
+        .iter()
+        .filter(|s| s.status() == SituationStatus::Active)
+        .take(8)
+        .collect();
+    if active.is_empty() {
+        text.push_str("活跃情境：无\n");
+    } else {
+        text.push_str(&format!("活跃情境（{}）：\n", active.len()));
+        for situation in active {
+            let convo = situation
+                .conversation_id()
+                .map(|id| short_uuid(&id.into_uuid().to_string()))
+                .unwrap_or_else(|| "-".to_owned());
             text.push_str(&format!(
-                "环境：模型健康 {:?}，主机 {} 个（可用率 {:.0}%），工具健康报告 {} 条\n",
-                snapshot.environment().model_health(),
-                snapshot.environment().hosts().len(),
-                snapshot.environment().availability_fraction() * 100.0,
-                snapshot.environment().tools().len(),
+                "- {:?} / {:?} / {}{}（会话 {convo}）\n",
+                situation.kind(),
+                situation.state(),
+                situation.detail().unwrap_or(""),
+                "",
             ));
         }
     }
-    truncate_chars(&text, 1200)
+    // Live social scenes (up to 6).
+    if world.social_scenes().is_empty() {
+        text.push_str("社交场景：无\n");
+    } else {
+        text.push_str(&format!("社交场景（{}）：\n", world.social_scenes().len()));
+        for scene in world.social_scenes().iter().take(6) {
+            text.push_str(&format!(
+                "- 会话 {} kind={:?} activity={:.2} addressed={} interrupt={:.2}\n",
+                short_uuid(&scene.conversation_id().into_uuid().to_string()),
+                scene.scene_kind(),
+                scene.activity_level(),
+                scene.bot_addressed(),
+                scene.interruption_cost(),
+            ));
+        }
+    }
+    // Environment: live host health (TTL-aware).
+    let host_list: Vec<String> = environment
+        .hosts()
+        .iter()
+        .take(6)
+        .map(|host| format!("{}={:?}", host.host(), host.effective_health_at(now)))
+        .collect();
+    let degraded_tools: Vec<String> = environment
+        .tools()
+        .iter()
+        .filter(|tool| tool.effective_health_at(now) != yunxi_core::ServiceHealth::Healthy)
+        .take(4)
+        .map(|tool| tool.tool_name().to_owned())
+        .collect();
+    text.push_str(&format!(
+        "环境：模型健康 {:?}，主机 {} 个{}，工具 {} 个{}{}，可用率 {:.0}%\n",
+        environment.model_health(),
+        environment.hosts().len(),
+        if host_list.is_empty() {
+            String::new()
+        } else {
+            format!("（{}）", host_list.join(", "))
+        },
+        environment.tools().len(),
+        if degraded_tools.is_empty() {
+            String::new()
+        } else {
+            format!("（降级：{}）", degraded_tools.join(", "))
+        },
+        "",
+        environment.load().availability_fraction() * 100.0,
+    ));
+    // Calibration summary (v4 §123).
+    if let Some(accuracy) = world.calibration_accuracy() {
+        text.push_str(&format!(
+            "校准：误差 {} 条，准确率 {:.0}%\n",
+            world.prediction_errors().len(),
+            accuracy * 100.0,
+        ));
+    }
+    truncate_chars(&text, 1500)
+}
+
+fn short_uuid(uuid: &str) -> String {
+    uuid.chars().take(8).collect()
 }
 
 #[cfg(test)]
@@ -1572,6 +1661,82 @@ mod tests {
         let _guard = serial();
         // Default config: enabled=false → guard is inert.
         assert_eq!(interruption_guard(yunxi_core::ConversationId::new()), 0.0);
+    }
+
+    #[test]
+    fn render_world_status_shows_full_live_state() {
+        let _guard = serial();
+        use yunxi_core::{
+            EnvironmentUpdate, HostId, HostState, RuntimeLoad, ServiceHealth, SituationKind,
+            SituationState, SocialSceneKind, SocialSceneUpdate,
+        };
+        let now = chrono::Utc::now();
+        let conversation_id = yunxi_core::ConversationId::new();
+        let person_id = PersonId::new();
+        let mut world = WorldModel::new();
+        world
+            .add_situation(
+                yunxi_core::Situation::new(
+                    yunxi_core::SituationId::new(),
+                    SituationKind::FutureEvent,
+                    SituationState::Planned,
+                    Some("面试安排".to_owned()),
+                    vec![],
+                    vec![person_id],
+                    Some(conversation_id),
+                    vec![],
+                    vec![],
+                    0.6,
+                    now,
+                )
+                .expect("situation"),
+            )
+            .expect("added");
+        world
+            .update_social_scene(
+                SocialSceneUpdate::new(
+                    conversation_id,
+                    now,
+                    vec![person_id],
+                    vec![person_id],
+                    vec![person_id],
+                    false,
+                    0.7,
+                    SocialSceneKind::GroupDiscussion,
+                )
+                .expect("scene"),
+            )
+            .expect("scene");
+        world
+            .update_environment(
+                EnvironmentUpdate::new(
+                    vec![
+                        HostState::new(
+                            HostId::new("qq").expect("host"),
+                            ServiceHealth::Healthy,
+                            now,
+                            chrono::Duration::minutes(5),
+                        )
+                        .expect("host"),
+                    ],
+                    vec![],
+                    ServiceHealth::Healthy,
+                    RuntimeLoad::new(0, None, 1, 1, now).expect("load"),
+                )
+                .expect("env"),
+            )
+            .expect("env");
+        let text = render_world_status(&world, now);
+        assert!(text.contains("situations=1"));
+        assert!(text.contains("live=1"));
+        assert!(text.contains("scenes=1"));
+        assert!(text.contains("hosts=1"));
+        assert!(text.contains("活跃情境（1）"));
+        assert!(text.contains("社交场景（1）"));
+        assert!(text.contains("qq=Healthy"));
+        // No message content, bounded.
+        assert!(!text.contains("#情境"));
+        assert!(text.chars().count() <= 1500);
     }
 
     #[test]
