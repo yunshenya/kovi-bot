@@ -12,7 +12,7 @@ use crate::model::interrupt::{
 };
 use crate::model::recall::{
     clear_reply_scope_locked, has_recalled_messages, is_recent_bot_message,
-    recent_bot_message_for_reaction, send_tracked_group_message,
+    send_tracked_group_message,
 };
 use crate::model::reply::{clear_reply_targets, record_reply_target};
 use crate::model::semantic::{MessageUnderstanding, UnderstandingRequest, understand};
@@ -29,8 +29,7 @@ use crate::sticker_memory::{
     StickerCandidateCommand, StickerScope, confirm_candidate, dismiss_candidate, extract_stickers,
     format_candidate_list, has_reply, has_usage, known_labels, parse_candidate_command,
     pending_candidates, quoted_message_context, stickers_for_teaching, teach, teaching_label,
-    with_quoted_context, with_sticker_context, with_sticker_reaction_context,
-    with_unknown_sticker_context,
+    with_quoted_context, with_sticker_context, with_unknown_sticker_context,
 };
 use crate::vision::{
     ImageRequestScope, VisionImage, clear_group_pending_image_requests,
@@ -60,8 +59,6 @@ struct GroupInterjectionState {
     interjection_in_flight: bool,
     decision_attempts: VecDeque<Instant>,
     conversation: GroupConversationState,
-    sticker_reaction_attempts: VecDeque<Instant>,
-    sticker_reaction_last_by_user: HashMap<i64, Instant>,
     /// 无论哪条发送路径（Host 或 Core）在本群发出可见消息的时间。
     last_bot_reply: Option<Instant>,
 }
@@ -591,26 +588,9 @@ pub(crate) async fn group_message_event_after_ingress(
         !images.is_empty(),
     )
     .await;
-    let recent_sticker_reaction =
-        if !stickers.is_empty() && !vision_command && !pending_image_request {
-            recent_bot_message_for_reaction(
-                reply_scope,
-                Duration::from_secs(
-                    config::get()
-                        .group_interjection()
-                        .sticker_reaction_window_secs(),
-                ),
-            )
-            .await
-        } else {
-            None
-        };
-    let sticker_reaction = recent_sticker_reaction.is_some()
-        && reserve_sticker_reaction(group_id, event.user_id).await;
     // 消息通过 at/reply 段明确指向其他成员（而非芸汐）时，只观察不插话，
     // 也不触发接续对话：点名谁就由谁接话，避免“只要有 @ 就回复”的错觉。
     if !addressed_to_bot
-        && !sticker_reaction
         && !vision_command
         && !pending_image_request
         && directed_at_others(&event.message)
@@ -626,7 +606,6 @@ pub(crate) async fn group_message_event_after_ingress(
         && !vision_command
         && !pending_image_request
         && !addressed_to_bot
-        && !sticker_reaction
     {
         println!("[INFO] 收到群聊纯图片状态，保持静默 (群组: {})", group_id);
         return;
@@ -676,15 +655,6 @@ pub(crate) async fn group_message_event_after_ingress(
     } else {
         with_sticker_context(&text_message, &labels)
     };
-    let current_message = if sticker_reaction {
-        recent_sticker_reaction
-            .as_ref()
-            .map_or(current_message.clone(), |bot_message| {
-                with_sticker_reaction_context(&current_message, &bot_message.content)
-            })
-    } else {
-        current_message
-    };
     let model_message = quoted.as_ref().map_or(current_message.clone(), |quoted| {
         with_quoted_context(&current_message, quoted)
     });
@@ -699,7 +669,6 @@ pub(crate) async fn group_message_event_after_ingress(
         plain_text,
         intent_text,
         batch_vision_requested,
-        batch_sticker_reaction,
         images,
         source_message_ids,
     ) = if !message.trim_start().starts_with('#') {
@@ -717,7 +686,7 @@ pub(crate) async fn group_message_event_after_ingress(
                     addressed: addressed_to_bot,
                     plain_text: stickers.is_empty() && quoted.is_none(),
                     vision_requested,
-                    sticker_reaction,
+                    sticker_reaction: false,
                     images,
                     message_ids: vec![event.message_id],
                 },
@@ -733,7 +702,6 @@ pub(crate) async fn group_message_event_after_ingress(
             combined.plain_text,
             combined.intent_text,
             combined.vision_requested,
-            combined.sticker_reaction,
             combined.images,
             combined.message_ids,
         )
@@ -744,7 +712,6 @@ pub(crate) async fn group_message_event_after_ingress(
             false,
             message.to_string(),
             vision_requested,
-            sticker_reaction,
             images,
             vec![event.message_id],
         )
@@ -768,11 +735,10 @@ pub(crate) async fn group_message_event_after_ingress(
         addressed_to_bot,
         conversation_active: active_reply || conversation_active,
         conversation_context,
-        sticker_reaction: batch_sticker_reaction,
+        sticker_reaction: false,
     };
     let semantic_required = addressed_to_bot
         || batch_vision_requested
-        || batch_sticker_reaction
         || !images.is_empty()
         || active_reply
         || conversation_active;
@@ -856,7 +822,6 @@ pub(crate) async fn group_message_event_after_ingress(
         sender_is_admin && sticker_teaching_message.is_some() && !message.trim().is_empty();
     let primary_reply_expected = addressed_to_bot
         || vision_requested
-        || batch_sticker_reaction
         || explicit_sticker_teaching
         || matches!(message.trim(), "#禁言" | "#结束禁言")
         || (group_paused && sender_is_admin);
@@ -887,10 +852,7 @@ pub(crate) async fn group_message_event_after_ingress(
                 sticker_scope,
                 event.message_id,
                 &text_message,
-                recent_sticker_reaction
-                    .as_ref()
-                    .map(|message| message.content.as_str())
-                    .unwrap_or_default(),
+                "",
                 Arc::clone(&bot),
             )
             .await
@@ -915,11 +877,6 @@ pub(crate) async fn group_message_event_after_ingress(
             return;
         };
         let turn_marker = begin_conversation_turn(group_id, event.user_id, &understanding).await;
-        let max_output_tokens = batch_sticker_reaction.then(|| {
-            config::get()
-                .group_interjection()
-                .interjection_max_output_tokens()
-        });
         let replied = process_group_reply_claimed(
             group_id,
             event.user_id,
@@ -927,7 +884,7 @@ pub(crate) async fn group_message_event_after_ingress(
             Arc::clone(&bot),
             sender,
             ticket,
-            max_output_tokens,
+            None,
             vision_images.clone(),
             source_message_ids.clone(),
             sticker_teaching_message.clone(),
@@ -945,10 +902,7 @@ pub(crate) async fn group_message_event_after_ingress(
                 sticker_scope,
                 event.message_id,
                 &text_message,
-                recent_sticker_reaction
-                    .as_ref()
-                    .map(|message| message.content.as_str())
-                    .unwrap_or_default(),
+                "",
                 Arc::clone(&bot),
             )
             .await
@@ -998,10 +952,7 @@ pub(crate) async fn group_message_event_after_ingress(
                 sticker_scope,
                 event.message_id,
                 &text_message,
-                recent_sticker_reaction
-                    .as_ref()
-                    .map(|message| message.content.as_str())
-                    .unwrap_or_default(),
+                "",
                 Arc::clone(&bot),
             )
             .await
@@ -1694,67 +1645,8 @@ async fn reserve_interjection_decision(group_id: i64, message: &str) -> bool {
     true
 }
 
-/// 表情回应只在芸汐刚发言后的短窗口内进入模型，并单独限制同一成员和同一群的频率。
-async fn reserve_sticker_reaction(group_id: i64, user_id: i64) -> bool {
-    let limits = config::get().group_interjection().clone();
-    if !limits.enabled() {
-        return false;
-    }
-
-    let now = Instant::now();
-    let mut states = GROUP_INTERJECTION_STATE.lock().await;
-    prune_interjection_states(&mut states);
-    let state = states.entry(group_id).or_default();
-    sticker_reaction_budget_available(
-        state,
-        user_id,
-        now,
-        Duration::from_secs(limits.sticker_reaction_cooldown_secs()),
-        Duration::from_secs(limits.sticker_reaction_rate_window_secs()),
-        limits.sticker_reaction_rate_limit(),
-    )
-}
-
-fn sticker_reaction_budget_available(
-    state: &mut GroupInterjectionState,
-    user_id: i64,
-    now: Instant,
-    cooldown: Duration,
-    rate_window: Duration,
-    rate_limit: usize,
-) -> bool {
-    prune_sticker_reaction_attempts(state, now, rate_window);
-    if state
-        .sticker_reaction_last_by_user
-        .get(&user_id)
-        .is_some_and(|last| now.duration_since(*last) < cooldown)
-        || state.sticker_reaction_attempts.len() >= rate_limit
-    {
-        return false;
-    }
-
-    state.sticker_reaction_attempts.push_back(now);
-    state.sticker_reaction_last_by_user.insert(user_id, now);
-    true
-}
-
-fn prune_sticker_reaction_attempts(
-    state: &mut GroupInterjectionState,
-    now: Instant,
-    rate_window: Duration,
-) {
-    while state
-        .sticker_reaction_attempts
-        .front()
-        .is_some_and(|attempt| now.duration_since(*attempt) >= rate_window)
-    {
-        state.sticker_reaction_attempts.pop_front();
-    }
-    state
-        .sticker_reaction_last_by_user
-        .retain(|_, last| now.duration_since(*last) < rate_window);
-}
-
+/// 表情回应只针对指向芸汐的已点名消息（在 addressing 判定后的主回复路径中
+/// 处理）；未点名的纯表情包与普通图片一样只观察，不再自动回复。
 fn has_interjection_candidate(message: &str, min_message_chars: usize) -> bool {
     let text = message.trim();
     !text.starts_with('#') && text.chars().count() >= min_message_chars
@@ -1811,15 +1703,9 @@ fn prune_interjection_states(states: &mut HashMap<i64, GroupInterjectionState>) 
     let interjection_config = config::get().group_interjection().clone();
     let cooldown = Duration::from_secs(interjection_config.cooldown_secs());
     let decision_window = Duration::from_secs(interjection_config.decision_rate_window_secs());
-    let sticker_window = Duration::from_secs(
-        interjection_config
-            .sticker_reaction_rate_window_secs()
-            .max(interjection_config.sticker_reaction_cooldown_secs()),
-    );
     for state in states.values_mut() {
         state.conversation.prune();
         prune_decision_attempts(state, now, decision_window);
-        prune_sticker_reaction_attempts(state, now, sticker_window);
     }
     if states.len() <= 1_024 {
         return;
@@ -1828,8 +1714,6 @@ fn prune_interjection_states(states: &mut HashMap<i64, GroupInterjectionState>) 
         state.interjection_in_flight
             || state.conversation.is_active()
             || !state.decision_attempts.is_empty()
-            || !state.sticker_reaction_attempts.is_empty()
-            || !state.sticker_reaction_last_by_user.is_empty()
             || state
                 .last_interjection
                 .is_some_and(|last| now.duration_since(last) < cooldown)
@@ -1937,8 +1821,8 @@ mod tests {
         conversation_active_for_observation, decision_budget_available, directed_at_others,
         group_erasure_receipt_destination, message_at_self, normalized_sender_name,
         prune_decision_attempts, queue_pending_window_message, should_queue_after_executive,
-        sticker_reaction_budget_available, suppress_direct_trigger, take_pending_window_turn,
-        text_mentions_bot, with_structured_bot_mention_context,
+        suppress_direct_trigger, take_pending_window_turn, text_mentions_bot,
+        with_structured_bot_mention_context,
     };
     use crate::model::MessageDestination;
     use crate::model::conversation_coordinator::{
@@ -2282,63 +2166,6 @@ mod tests {
         complete_interjection_attempt(&mut state, true, now);
         assert!(!state.interjection_in_flight);
         assert_eq!(state.last_interjection, Some(now));
-    }
-
-    #[test]
-    fn sticker_reaction_budget_separates_user_cooldown_and_group_rate_limit() {
-        let now = Instant::now();
-        let mut state = GroupInterjectionState::default();
-        let cooldown = Duration::from_secs(30);
-        let rate_window = Duration::from_secs(300);
-
-        assert!(sticker_reaction_budget_available(
-            &mut state,
-            42,
-            now,
-            cooldown,
-            rate_window,
-            3,
-        ));
-        assert!(!sticker_reaction_budget_available(
-            &mut state,
-            42,
-            now + Duration::from_secs(1),
-            cooldown,
-            rate_window,
-            3,
-        ));
-        assert!(sticker_reaction_budget_available(
-            &mut state,
-            43,
-            now + Duration::from_secs(31),
-            cooldown,
-            rate_window,
-            3,
-        ));
-        assert!(sticker_reaction_budget_available(
-            &mut state,
-            44,
-            now + Duration::from_secs(32),
-            cooldown,
-            rate_window,
-            3,
-        ));
-        assert!(!sticker_reaction_budget_available(
-            &mut state,
-            45,
-            now + Duration::from_secs(33),
-            cooldown,
-            rate_window,
-            3,
-        ));
-        assert!(sticker_reaction_budget_available(
-            &mut state,
-            45,
-            now + Duration::from_secs(301),
-            cooldown,
-            rate_window,
-            3,
-        ));
     }
 
     #[test]
