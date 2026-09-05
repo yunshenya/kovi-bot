@@ -181,12 +181,16 @@ impl AmbientAttentionRegistry {
         // 无论本轮是否采样,都把消息文本纳入本群近因窗口(有界),为后续
         // 的软注意力相关度提供"本群近况"。
         gate.remember(text);
-        gate.eligible_messages_since_sample = gate.eligible_messages_since_sample.saturating_add(1);
-        if gate.eligible_messages_since_sample < policy.min_eligible_messages {
-            return false;
+        // 接续窗口内的消息天然承接 bot 刚说的话,不等待消息地板;
+        // 窗口外仍要求足够多的群聊消息后再采样,避免高频插话。
+        if !continuation_active {
+            gate.eligible_messages_since_sample =
+                gate.eligible_messages_since_sample.saturating_add(1);
+            if gate.eligible_messages_since_sample < policy.min_eligible_messages {
+                return false;
+            }
+            gate.eligible_messages_since_sample = 0;
         }
-        gate.eligible_messages_since_sample = 0;
-
         if gate.last_candidate.is_some_and(|last| {
             now.duration_since(last) < Duration::from_secs(policy.candidate_cooldown_secs)
         }) {
@@ -204,6 +208,16 @@ impl AmbientAttentionRegistry {
             return false;
         }
 
+        // 接续对话窗口内(芸汐刚在本群发过可见消息):**确定性**放行到
+        // 语义评估——"她说完了我就接"这类天然衔接不该被随机采样漏掉,
+        // 是否真的回复由评估模型(interjection_worthy)与 Core 判定把关;
+        // 窗口外回到软注意力调制的随机采样。
+        if continuation_active {
+            gate.last_candidate = Some(now);
+            gate.decision_attempts.push_back(now);
+            return true;
+        }
+
         // 软注意力:与"本群近况"的相关性调制采样概率。同等条件下,还在
         // 延续的话题更可能获得一次语义评估;完全无关的消息保留低基数
         // 概率,避免漏掉话题突变但值得接的发言。
@@ -211,14 +225,7 @@ impl AmbientAttentionRegistry {
             text,
             gate.recent_messages.iter().map(String::as_str),
         );
-        // 接续对话窗口内(芸汐刚在本群发过可见消息):即使相关性低
-        // (如用户只回了一个字),也保留较高采样概率,让"她说完了我就
-        // 接"这类天然衔接有机会进入语义评估;窗口外回到严格调制。
-        let boost = if continuation_active {
-            (0.8 + 0.4 * relevance).clamp(0.8, 1.0)
-        } else {
-            (0.5 + 1.6 * relevance).clamp(0.5, 1.0)
-        };
+        let boost = (0.5 + 1.6 * relevance).clamp(0.5, 1.0);
         let boosted_percent = f32::from(policy.response_probability_percent) * boost;
         let mut hasher = DefaultHasher::new();
         group_id.hash(&mut hasher);
