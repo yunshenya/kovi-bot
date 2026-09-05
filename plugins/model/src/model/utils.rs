@@ -1173,6 +1173,7 @@ pub(crate) fn likely_requires_tool_protocol(content: &str) -> bool {
         "接口",
         "最新",
         "当前时间",
+        "现在时间",
         "现在几点",
         "几点",
         "几点了",
@@ -1216,20 +1217,9 @@ pub(crate) fn likely_requires_tool_protocol(content: &str) -> bool {
     if lookup_target && question_shape {
         return true;
     }
-    matches!(
-        text.as_str(),
-        "天气"
-            | "天气预报"
-            | "现在几点"
-            | "现在几点了"
-            | "现在几点钟"
-            | "几点了"
-            | "几点钟了"
-            | "什么时候了"
-            | "现在时间"
-            | "查天气"
-            | "搜新闻"
-    )
+    // 精确表只保留"无疑问词、无动词"的名词句;其余时间/日期表达一律
+    // 由 question_shape + TOOL_TARGETS 泛化匹配,避免逐字表越堆越长。
+    matches!(text.as_str(), "天气" | "天气预报" | "现在时间")
 }
 
 /// Catch a negation followed by a short politeness filler (for example
