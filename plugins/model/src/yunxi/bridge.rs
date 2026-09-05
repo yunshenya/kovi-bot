@@ -102,6 +102,18 @@ impl AmbientAttentionGate {
     }
 }
 
+/// 未点名消息能否进入采样:长度门槛在"接续对话"窗口内放宽到 2 字
+/// (芸汐刚在本群回复过时,对方一句短话也可能值得接);窗口外保持
+/// 严格阈值,纯图片不受限。
+fn message_length_passable(
+    text_chars: usize,
+    has_image: bool,
+    min_message_chars: usize,
+    continuation_active: bool,
+) -> bool {
+    has_image || text_chars >= min_message_chars || (continuation_active && text_chars >= 2)
+}
+
 const AMBIENT_PRIOR_MESSAGES: usize = 12;
 
 #[derive(Debug, Clone, Copy)]
@@ -151,9 +163,17 @@ impl AmbientAttentionRegistry {
         message_id: i32,
         text: &str,
         has_image: bool,
+        continuation_active: bool,
         policy: AmbientAttentionPolicy,
     ) -> bool {
-        if !policy.enabled || (!has_image && text.chars().count() < policy.min_message_chars) {
+        if !policy.enabled
+            || !message_length_passable(
+                text.chars().count(),
+                has_image,
+                policy.min_message_chars,
+                continuation_active,
+            )
+        {
             return false;
         }
         let now = Instant::now();
@@ -191,9 +211,14 @@ impl AmbientAttentionRegistry {
             text,
             gate.recent_messages.iter().map(String::as_str),
         );
-        // 词法相关分数量级偏低(0..~0.4),放大约 1.6 倍后再钳制幅度,
-        // 使高相关消息的采样概率接近基线,低相关消息约基线的 0.5 倍。
-        let boost = (0.5 + 1.6 * relevance).clamp(0.5, 1.0);
+        // 接续对话窗口内(芸汐刚在本群发过可见消息):即使相关性低
+        // (如用户只回了一个字),也保留较高采样概率,让"她说完了我就
+        // 接"这类天然衔接有机会进入语义评估;窗口外回到严格调制。
+        let boost = if continuation_active {
+            (0.8 + 0.4 * relevance).clamp(0.8, 1.0)
+        } else {
+            (0.5 + 1.6 * relevance).clamp(0.5, 1.0)
+        };
         let boosted_percent = f32::from(policy.response_probability_percent) * boost;
         let mut hasher = DefaultHasher::new();
         group_id.hash(&mut hasher);
@@ -1378,6 +1403,10 @@ impl CoreBridge {
         }
         let text = event.borrow_text().unwrap_or_default().trim();
         let has_image = event.message.iter().any(|segment| segment.type_ == "image");
+        // 接续对话窗口:芸汐最近是否在本群发过可见消息(由 MessageTransport
+        // 统一标记)。窗口内短消息也有机会进入语义评估,窗口外保持严格。
+        let continuation_active =
+            crate::model::conversation_continuation_active_now(event.group_id);
         let model_config = crate::config::get();
         let config = model_config.group_interjection();
         let policy = AmbientAttentionPolicy {
@@ -1393,7 +1422,14 @@ impl CoreBridge {
             .lock()
             .ok()
             .is_some_and(|mut registry| {
-                registry.should_request(event.group_id, event.message_id, text, has_image, policy)
+                registry.should_request(
+                    event.group_id,
+                    event.message_id,
+                    text,
+                    has_image,
+                    continuation_active,
+                    policy,
+                )
             })
     }
 
@@ -3974,10 +4010,10 @@ mod tests {
         core_group_payload_is_supported, core_private_payload_is_supported,
         dispatch_action_with_timeout, effective_visible_reply_allowed,
         group_message_requests_explicit_batch, idle_tick_event, merge_data_erasure_targets,
-        message_at_self, normalize_attachments, reply_message_id, resolve_and_submit, run_ingress,
-        run_runtime, send_action_ingress_command_with_ack, send_ingress_command_with_ack,
-        send_ingress_command_with_ack_timeouts, submit_message_collisions,
-        submit_runtime_with_timeout, text_mentions_agent, unblock_users,
+        message_at_self, message_length_passable, normalize_attachments, reply_message_id,
+        resolve_and_submit, run_ingress, run_runtime, send_action_ingress_command_with_ack,
+        send_ingress_command_with_ack, send_ingress_command_with_ack_timeouts,
+        submit_message_collisions, submit_runtime_with_timeout, text_mentions_agent, unblock_users,
     };
     use crate::model::{
         OutgoingSource, ReplyScope, commit_outgoing, interrupt, mark_active, mark_outgoing_sent,
@@ -4516,12 +4552,21 @@ mod tests {
             decision_rate_limit: 3,
         };
         let sample = |registry: &mut super::AmbientAttentionRegistry, message_id| {
-            registry.should_request(123, message_id, "讲个笑话吧", false, policy)
+            registry.should_request(123, message_id, "讲个笑话吧", false, false, policy)
         };
 
         assert!(!sample(&mut registry, 1));
         assert!(sample(&mut registry, 2));
         assert!(!sample(&mut registry, 3));
+    }
+
+    #[test]
+    fn continuation_window_allows_short_messages_but_not_single_char() {
+        assert!(!message_length_passable(1, false, 5, true));
+        assert!(message_length_passable(2, false, 5, true));
+        assert!(message_length_passable(5, false, 5, true));
+        assert!(!message_length_passable(3, false, 5, false));
+        assert!(message_length_passable(0, true, 5, false));
     }
 
     #[test]

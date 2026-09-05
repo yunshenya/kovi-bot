@@ -1339,6 +1339,19 @@ pub(crate) async fn mark_group_reply_sent(group_id: i64) {
     state.last_bot_reply = Some(Instant::now());
 }
 
+/// 同步查询"接续对话"窗口（同步调用路径上的 bridge 采样门使用）。
+/// 与写锁竞争时保持严格语义（按窗口外处理），宁可少采样也不误放行。
+pub(crate) fn conversation_continuation_active_now(group_id: i64) -> bool {
+    match GROUP_INTERJECTION_STATE.try_lock() {
+        Ok(states) => states.get(&group_id).is_some_and(|state| {
+            state.last_bot_reply.is_some_and(|last| {
+                last.elapsed() < Duration::from_secs(GROUP_CONTINUATION_WINDOW_SECS)
+            })
+        }),
+        Err(_) => false,
+    }
+}
+
 async fn observe_group_conversation(
     group_id: i64,
     user_id: i64,
