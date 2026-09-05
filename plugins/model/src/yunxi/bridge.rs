@@ -85,7 +85,24 @@ struct AmbientAttentionGate {
     eligible_messages_since_sample: u32,
     last_candidate: Option<Instant>,
     decision_attempts: VecDeque<Instant>,
+    /// 本群近因窗口(最近若干条未点名消息文本),用于软注意力相关度。
+    recent_messages: VecDeque<String>,
 }
+
+impl AmbientAttentionGate {
+    fn remember(&mut self, text: &str) {
+        let tracked = crate::model::relevance::tracked_message(text);
+        if tracked.is_empty() {
+            return;
+        }
+        self.recent_messages.push_back(tracked);
+        while self.recent_messages.len() > AMBIENT_PRIOR_MESSAGES {
+            self.recent_messages.pop_front();
+        }
+    }
+}
+
+const AMBIENT_PRIOR_MESSAGES: usize = 12;
 
 #[derive(Debug, Clone, Copy)]
 struct AmbientAttentionPolicy {
@@ -132,15 +149,18 @@ impl AmbientAttentionRegistry {
         &mut self,
         group_id: i64,
         message_id: i32,
-        text_chars: usize,
+        text: &str,
         has_image: bool,
         policy: AmbientAttentionPolicy,
     ) -> bool {
-        if !policy.enabled || (!has_image && text_chars < policy.min_message_chars) {
+        if !policy.enabled || (!has_image && text.chars().count() < policy.min_message_chars) {
             return false;
         }
         let now = Instant::now();
         let gate = self.gate_mut(group_id);
+        // 无论本轮是否采样,都把消息文本纳入本群近因窗口(有界),为后续
+        // 的软注意力相关度提供"本群近况"。
+        gate.remember(text);
         gate.eligible_messages_since_sample = gate.eligible_messages_since_sample.saturating_add(1);
         if gate.eligible_messages_since_sample < policy.min_eligible_messages {
             return false;
@@ -164,11 +184,22 @@ impl AmbientAttentionRegistry {
             return false;
         }
 
+        // 软注意力:与"本群近况"的相关性调制采样概率。同等条件下,还在
+        // 延续的话题更可能获得一次语义评估;完全无关的消息保留低基数
+        // 概率,避免漏掉话题突变但值得接的发言。
+        let relevance = crate::model::relevance::message_context_relevance(
+            text,
+            gate.recent_messages.iter().map(String::as_str),
+        );
+        // 词法相关分数量级偏低(0..~0.4),放大约 1.6 倍后再钳制幅度,
+        // 使高相关消息的采样概率接近基线,低相关消息约基线的 0.5 倍。
+        let boost = (0.5 + 1.6 * relevance).clamp(0.5, 1.0);
+        let boosted_percent = f32::from(policy.response_probability_percent) * boost;
         let mut hasher = DefaultHasher::new();
         group_id.hash(&mut hasher);
         message_id.hash(&mut hasher);
-        let sample = hasher.finish() % 100;
-        if sample >= u64::from(policy.response_probability_percent) {
+        let sample = hasher.finish() % 1000;
+        if sample as f32 >= boosted_percent * 10.0 {
             return false;
         }
 
@@ -1362,13 +1393,7 @@ impl CoreBridge {
             .lock()
             .ok()
             .is_some_and(|mut registry| {
-                registry.should_request(
-                    event.group_id,
-                    event.message_id,
-                    text.chars().count(),
-                    has_image,
-                    policy,
-                )
+                registry.should_request(event.group_id, event.message_id, text, has_image, policy)
             })
     }
 
@@ -4491,7 +4516,7 @@ mod tests {
             decision_rate_limit: 3,
         };
         let sample = |registry: &mut super::AmbientAttentionRegistry, message_id| {
-            registry.should_request(123, message_id, 8, false, policy)
+            registry.should_request(123, message_id, "讲个笑话吧", false, policy)
         };
 
         assert!(!sample(&mut registry, 1));
