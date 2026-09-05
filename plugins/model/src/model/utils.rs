@@ -41,8 +41,8 @@ use kovi::serde_json::Value;
 use kovi::tokio::sync::{Mutex, Semaphore};
 use kovi::{Message, RuntimeBot};
 use reqwest::Client;
-use serde::Serialize;
-use serde_json::json;
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, json};
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
@@ -323,6 +323,101 @@ pub struct BotMemory {
     pub(crate) content: String,
 }
 
+/// 一次由 API 原生 function-calling 返回的工具调用。
+///
+/// 与历史文本协议（[[TOOL_CALL]] 标记）不同，这是 provider 在 `tool_calls`
+/// 字段中直接给出的结构化调用：名称和参数解析都由 API 层保证，模型
+/// 不需要（也不允许）在正文里拼装协议文本。
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub(crate) struct NativeToolCall {
+    /// Provider 分配的调用 id，用于把工具结果回灌为 `role: "tool"` 消息。
+    pub(crate) id: String,
+    /// 工具名。
+    pub(crate) name: String,
+    /// 解析后的参数对象；解析失败时为空对象，原始串在 `raw_arguments`。
+    pub(crate) arguments: Map<String, Value>,
+    /// 未解析成功的原始参数 JSON 串（用于日志与诊断）。
+    pub(crate) raw_arguments: String,
+}
+
+/// 一次模型请求的完整结构化结果。
+pub(crate) struct ModelPayload {
+    /// 助手正文（工具轮次通常为空串）。
+    pub(crate) content: String,
+    /// 模型发起的原生工具调用（按 API 顺序）。
+    pub(crate) tool_calls: Vec<NativeToolCall>,
+    /// 流式结束原因（finish_reason）。
+    pub(crate) finish_reason: Option<String>,
+}
+
+impl ModelPayload {
+    /// 上游失败时的统一结构化错误载荷，内容沿用现有 model-error 标记，
+    /// 调用方按现有 `is_model_error_response` 规则识别为静默/可重试失败。
+    pub(crate) fn failure(error: &str) -> Self {
+        Self {
+            content: model_error(error).content,
+            tool_calls: Vec::new(),
+            finish_reason: None,
+        }
+    }
+
+    /// 把正文转换为历史文本消息（工具调用被剥离后仍可作为 assistant 正文）。
+    pub(crate) fn as_bot_memory(&self) -> BotMemory {
+        BotMemory {
+            role: Roles::Assistant,
+            content: self.content.clone(),
+        }
+    }
+}
+
+/// 把一次 assistant 原生工具调用结果序列化为 wire 消息
+/// （`role: "assistant"` + `tool_calls` 数组）。
+pub(crate) fn assistant_tool_calls_wire(content: &str, calls: &[NativeToolCall]) -> Value {
+    let tool_calls = calls
+        .iter()
+        .map(|call| {
+            json!({
+                "id": call.id,
+                "type": "function",
+                "function": {
+                    "name": call.name,
+                    "arguments": call.raw_arguments,
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "role": "assistant",
+        "content": if content.is_empty() { Value::Null } else { Value::String(content.to_string()) },
+        "tool_calls": tool_calls,
+    })
+}
+
+/// 把一次工具执行结果序列化为 wire 消息（`role: "tool"`）。
+pub(crate) fn tool_result_wire(tool_call_id: &str, content: &str) -> Value {
+    json!({
+        "role": "tool",
+        "tool_call_id": tool_call_id,
+        "content": content,
+    })
+}
+
+/// 普通 assistant 文本消息的 wire 形式（工具轮次历史里与 tool_calls 消息
+/// 顺序一致地出现）。
+pub(crate) fn plain_assistant_wire(content: &str) -> Value {
+    json!({"role": "assistant", "content": content})
+}
+
+/// system 消息的 wire 形式。
+pub(crate) fn system_wire(content: &str) -> Value {
+    json!({"role": "system", "content": content})
+}
+
+/// user/资料消息的 wire 形式（不可信工具资料沿用 user 角色发送）。
+pub(crate) fn user_wire(content: &str) -> Value {
+    json!({"role": "user", "content": content})
+}
+
 /// Complete a JSON object that was cut off only at one or more closing
 /// delimiters. The caller must still parse the returned text with its strict
 /// schema; this helper only handles the unambiguous end-of-stream case.
@@ -390,6 +485,12 @@ struct ModelConf<'a> {
     temperature: f32,
     /// 限制异常长回复，保护费用和上下文窗口。
     max_tokens: u32,
+    /// 原生 function-calling 工具清单（OpenAI 兼容 tools 参数）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<&'a [Value]>,
+    /// 原生工具选择策略（默认 "auto"）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<&'a str>,
 }
 
 /// 群聊消息处理主函数
@@ -2009,6 +2110,130 @@ pub(crate) async fn params_model_without_reply_guidance(
     .await
 }
 
+/// 原生 function-calling 请求：把工具声明透传给 OpenAI 兼容的 chat
+/// completions API，并返回结构化载荷（正文 + provider 出的 tool_calls）。
+///
+/// `extra_wire` 是宿主工具循环累积的已序列化消息（带 `tool_calls` 的
+/// assistant 消息与 `role: "tool"` 的结果消息），它们必须按顺序接在
+/// `messages` 之后发送；工具名与参数校验不再经过任何文本协议。
+pub(crate) async fn params_model_with_native_tools(
+    messages: &mut [BotMemory],
+    extra_wire: &[Value],
+    tool_specs: &[Value],
+    max_tokens: Option<u32>,
+    vision_images: &[VisionImage],
+    progress: Option<Arc<ThinkingReporter>>,
+    reply_ticket: Option<ReplyTicket>,
+) -> ModelPayload {
+    let config = config::get();
+    let server_config = config.server_config();
+    if !server_config.enabled() {
+        return ModelPayload::failure("外部对话模型已禁用");
+    }
+    if server_config.wire_api() != "chat_completions" {
+        return ModelPayload::failure("当前部署的 API 协议不支持原生工具调用");
+    }
+
+    let mut request_messages = messages.to_owned();
+    if progress.is_some() {
+        request_messages.push(BotMemory {
+            role: Roles::System,
+            content: ThinkingReporter::protocol().to_string(),
+        });
+    }
+
+    let force_external_vision = !vision_images.is_empty()
+        && !matches!(config.vision().provider(), "auto")
+        && server_config.supports_vision();
+    let model_vision_images = if server_config.supports_vision() && !force_external_vision {
+        vision_images
+    } else {
+        &[]
+    };
+    if (!server_config.supports_vision() || force_external_vision) && !vision_images.is_empty() {
+        let question = request_messages
+            .iter()
+            .rev()
+            .find(|message| message.role == Roles::User)
+            .map(|message| message.content.as_str())
+            .unwrap_or_default();
+        let analysis = match analyze_images(vision_images, question, reply_ticket).await {
+            Ok(analysis) => analysis,
+            Err(error) => return ModelPayload::failure(&format!("截图分析失败: {error}")),
+        };
+        append_vision_analysis(&mut request_messages, &analysis);
+    }
+
+    let max_output_tokens = max_tokens
+        .unwrap_or_else(|| server_config.max_output_tokens())
+        .min(server_config.max_output_tokens());
+    let mut wire_messages = build_model_messages(&request_messages, model_vision_images);
+    wire_messages.extend_from_slice(extra_wire);
+    let bot_conf = ModelConf {
+        model: server_config.model_name(),
+        messages: &wire_messages,
+        stream: true,
+        temperature: 0.7,
+        max_tokens: max_output_tokens,
+        tools: Some(tool_specs),
+        tool_choice: Some("auto"),
+    };
+    let mut request_body = serde_json::to_value(bot_conf).expect("模型请求配置应可序列化");
+    apply_thinking_mode(
+        &mut request_body,
+        server_config.wire_api(),
+        server_config.thinking_mode(),
+    );
+    let token = if server_config.requires_auth() {
+        std::env::var(server_config.api_key_env())
+            .ok()
+            .filter(|token| !token.trim().is_empty())
+    } else {
+        None
+    };
+    if server_config.requires_auth() && token.is_none() {
+        return ModelPayload::failure(&format!(
+            "未设置 {}，暂时无法调用对话模型",
+            server_config.api_key_env()
+        ));
+    }
+    let queue_depth = MODEL_QUEUE_DEPTH.fetch_add(1, Ordering::AcqRel) + 1;
+    if queue_depth > config.traffic().max_model_queue() {
+        MODEL_QUEUE_DEPTH.fetch_sub(1, Ordering::AcqRel);
+        return ModelPayload::failure("模型请求队列已满，请稍后再试");
+    }
+    let queue_guard = ModelQueueGuard;
+    let queue_started = Instant::now();
+    let permit = kovi::tokio::time::timeout(
+        Duration::from_secs(config.traffic().model_queue_timeout_secs()),
+        MODEL_REQUEST_LIMIT.acquire(),
+    )
+    .await;
+    drop(queue_guard);
+    let _permit = match permit {
+        Ok(Ok(permit)) => permit,
+        Ok(Err(error)) => return ModelPayload::failure(&format!("模型请求队列已关闭: {error}")),
+        Err(_) => return ModelPayload::failure("等待模型请求配额超时，请稍后再试"),
+    };
+    let queue_wait_ms = queue_started.elapsed().as_millis();
+    match round_trip_model_request(
+        &request_body,
+        &server_config.endpoint(),
+        token.as_deref(),
+        server_config.actor_authorization(),
+        server_config.request_timeout_secs(),
+        server_config.max_retries(),
+        config.traffic().max_model_response_bytes(),
+        progress.as_deref(),
+        queue_wait_ms,
+    )
+    .await
+    {
+        Ok(payload) => payload,
+        Err(error) => ModelPayload::failure(&error),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ModelPromptMode {
     LegacyReplyGuidance,
@@ -2134,6 +2359,8 @@ async fn params_model_with_token_limit_and_progress_for_reply_mode_inner(
             stream: true,
             temperature: 0.7,
             max_tokens: max_output_tokens,
+            tools: None,
+            tool_choice: None,
         };
         serde_json::to_value(bot_conf).expect("模型请求配置应可序列化")
     };
@@ -2175,47 +2402,87 @@ async fn params_model_with_token_limit_and_progress_for_reply_mode_inner(
         Err(_) => return model_error("等待模型请求配额超时，请稍后再试"),
     };
     let queue_wait_ms = queue_started.elapsed().as_millis();
+    let payload = round_trip_model_request(
+        &request_body,
+        &server_config.endpoint(),
+        token.as_deref(),
+        server_config.actor_authorization(),
+        server_config.request_timeout_secs(),
+        server_config.max_retries(),
+        config.traffic().max_model_response_bytes(),
+        progress.as_deref(),
+        queue_wait_ms,
+    )
+    .await;
+    let payload = match payload {
+        Ok(payload) => payload,
+        Err(error) => return model_error(&error),
+    };
+    let bot_content = payload.content.replace("芸汐：", "");
+    if bot_content.trim().is_empty() {
+        if matches!(prompt_mode, ModelPromptMode::PlainStyleContextAllowEmpty) {
+            return BotMemory {
+                role: Roles::Assistant,
+                content: String::new(),
+            };
+        }
+        return model_error("模型响应中缺少可读内容");
+    }
+    BotMemory {
+        role: Roles::Assistant,
+        content: bot_content,
+    }
+}
+
+/// 发送一次模型请求并读取结构化响应（正文 + 原生工具调用），按重试
+/// 策略与日志约定处理失败。所有走网关的模型调用（普通对话与原生
+/// tool-calling 轮次）共用这条管线，保证超时、计费与审计口径一致。
+#[allow(clippy::too_many_arguments)]
+async fn round_trip_model_request(
+    request_body: &Value,
+    endpoint: &str,
+    token: Option<&str>,
+    actor_authorization: &str,
+    request_timeout_secs: u64,
+    configured_retries: u8,
+    max_response_bytes: usize,
+    progress: Option<&ThinkingReporter>,
+    queue_wait_ms: u128,
+) -> Result<ModelPayload, String> {
     let mut last_error = String::new();
-    let mut response_content = None;
-    let max_attempts = model_attempt_count(server_config.max_retries());
+    let mut payload_response = None;
+    let max_attempts = model_attempt_count(configured_retries);
     for attempt in 0..max_attempts {
         let attempt_started = Instant::now();
         let mut request = MODEL_CLIENT
-            .post(server_config.endpoint())
-            .timeout(Duration::from_secs(server_config.request_timeout_secs()))
-            .json(&request_body);
-        if let Some(token) = token.as_deref() {
+            .post(endpoint)
+            .timeout(Duration::from_secs(request_timeout_secs))
+            .json(request_body);
+        if let Some(token) = token {
             request = request.bearer_auth(token);
         }
-        if !server_config.actor_authorization().trim().is_empty() {
-            request = request.header(
-                "x-openai-actor-authorization",
-                server_config.actor_authorization(),
-            );
+        if !actor_authorization.trim().is_empty() {
+            request = request.header("x-openai-actor-authorization", actor_authorization);
         }
         let result = request.send().await;
 
         match result {
             Ok(response) if response.status().is_success() => {
                 let status = response.status();
-                match read_model_content(
-                    response,
-                    progress.as_deref(),
-                    config.traffic().max_model_response_bytes(),
-                )
-                .await
-                {
-                    Ok(content) => {
+                match read_model_payload(response, progress, max_response_bytes).await {
+                    Ok(payload) => {
                         kovi::log::info!(
-                            "Model gateway attempt: attempt={}/{} queue_wait_ms={} elapsed_ms={} status={} terminal=success response_chars={}",
+                            "Model gateway attempt: attempt={}/{} queue_wait_ms={} elapsed_ms={} status={} terminal=success response_chars={} tool_calls={} finish_reason={}",
                             attempt + 1,
                             max_attempts,
                             queue_wait_ms,
                             attempt_started.elapsed().as_millis(),
                             status.as_u16(),
-                            content.chars().count(),
+                            payload.content.chars().count(),
+                            payload.tool_calls.len(),
+                            payload.finish_reason.as_deref().unwrap_or("none"),
                         );
-                        response_content = Some(content);
+                        payload_response = Some(payload);
                         break;
                     }
                     Err(error) => {
@@ -2300,23 +2567,7 @@ async fn params_model_with_token_limit_and_progress_for_reply_mode_inner(
             kovi::tokio::time::sleep(Duration::from_millis(delay_ms)).await;
         }
     }
-    let Some(text) = response_content else {
-        return model_error(&last_error);
-    };
-    let bot_content = strip_thinking_notices(&text).replace("芸汐：", "");
-    if bot_content.trim().is_empty() {
-        if matches!(prompt_mode, ModelPromptMode::PlainStyleContextAllowEmpty) {
-            return BotMemory {
-                role: Roles::Assistant,
-                content: String::new(),
-            };
-        }
-        return model_error("模型响应中缺少可读内容");
-    }
-    BotMemory {
-        role: Roles::Assistant,
-        content: bot_content,
-    }
+    payload_response.ok_or(last_error)
 }
 
 fn model_attempt_count(configured_retries: u8) -> usize {
@@ -2376,11 +2627,62 @@ async fn model_error_response_detail(mut response: reqwest::Response) -> Option<
     }
 }
 
-async fn read_model_content(
+/// 流式 tool_calls 分片聚合器：按 API 分配的 index 归并同一个调用的
+/// id/name/arguments 增量。
+#[derive(Default, Clone)]
+struct NativeToolCallDelta {
+    index: usize,
+    id: String,
+    name: String,
+    arguments: String,
+    saw_delta: bool,
+}
+
+const MAX_NATIVE_TOOL_ARGUMENTS_BYTES: usize = 64 * 1024;
+
+fn finalize_native_tool_calls(deltas: &[NativeToolCallDelta]) -> Vec<NativeToolCall> {
+    let mut present = deltas
+        .iter()
+        .filter(|delta| delta.saw_delta)
+        .collect::<Vec<_>>();
+    present.sort_by_key(|delta| delta.index);
+    present
+        .into_iter()
+        .map(|delta| {
+            let mut raw = delta.arguments.trim().to_string();
+            if raw.len() > MAX_NATIVE_TOOL_ARGUMENTS_BYTES {
+                raw.truncate(MAX_NATIVE_TOOL_ARGUMENTS_BYTES);
+            }
+            let mut arguments = Map::new();
+            if !raw.is_empty() {
+                if let Ok(value) = serde_json::from_str::<Map<String, Value>>(&raw) {
+                    arguments = value;
+                }
+                // A stream cut off at a closing delimiter is unambiguous for
+                // object-shaped schemas; reuse the existing repair for the
+                // common unterminated case instead of silently dropping a call.
+                else if let Some(completed) =
+                    complete_truncated_json_object(&raw, MAX_NATIVE_TOOL_ARGUMENTS_BYTES)
+                    && let Ok(value) = serde_json::from_str::<Map<String, Value>>(&completed)
+                {
+                    arguments = value;
+                }
+            }
+            NativeToolCall {
+                id: delta.id.clone(),
+                name: delta.name.clone(),
+                arguments,
+                raw_arguments: raw,
+            }
+        })
+        .collect()
+}
+
+async fn read_model_payload(
     mut response: reqwest::Response,
     reporter: Option<&ThinkingReporter>,
     max_response_bytes: usize,
-) -> Result<String, String> {
+) -> Result<ModelPayload, String> {
     let is_event_stream = response
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
@@ -2407,6 +2709,8 @@ async fn read_model_content(
     let mut raw_body = Vec::new();
     let mut pending = Vec::new();
     let mut streamed_content = String::new();
+    let mut tool_deltas: Vec<NativeToolCallDelta> = Vec::new();
+    let mut finish_reason: Option<String> = None;
     let mut stream_completed = false;
 
     'stream: while let Some(chunk) = response
@@ -2421,24 +2725,47 @@ async fn read_model_content(
         pending.extend_from_slice(&chunk);
         while let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
             let line = pending.drain(..=newline).collect::<Vec<_>>();
-            if observe_stream_line(&line, &mut streamed_content, reporter).await? {
+            if observe_stream_line(
+                &line,
+                &mut streamed_content,
+                &mut tool_deltas,
+                &mut finish_reason,
+                reporter,
+            )
+            .await?
+            {
                 stream_completed = true;
                 break 'stream;
             }
         }
     }
     if !stream_completed && !pending.is_empty() {
-        stream_completed = observe_stream_line(&pending, &mut streamed_content, reporter).await?;
+        stream_completed = observe_stream_line(
+            &pending,
+            &mut streamed_content,
+            &mut tool_deltas,
+            &mut finish_reason,
+            reporter,
+        )
+        .await?;
     }
 
-    if !streamed_content.trim().is_empty() {
+    if !streamed_content.trim().is_empty() || tool_deltas.iter().any(|delta| delta.saw_delta) {
         if streamed_content.len() > max_response_bytes {
             return Err(format!("模型正文超过 {} 字节上限", max_response_bytes));
         }
         if is_event_stream && !stream_completed {
             eprintln!("[WARN] 模型流式响应在终态事件前结束，使用已接收的完整正文");
         }
-        return Ok(strip_thinking_notices(&streamed_content));
+        let payload = ModelPayload {
+            content: strip_thinking_notices(&streamed_content),
+            tool_calls: finalize_native_tool_calls(&tool_deltas),
+            finish_reason,
+        };
+        if let Some(reporter) = reporter {
+            reporter.observe_model_output(&payload.content).await;
+        }
+        return Ok(payload);
     }
 
     if is_event_stream {
@@ -2449,21 +2776,78 @@ async fn read_model_content(
         String::from_utf8(raw_body).map_err(|error| format!("模型响应不是有效 UTF-8: {error}"))?;
     let value: Value =
         serde_json::from_str(&body).map_err(|error| format!("模型响应解析失败: {error}"))?;
-    let content =
-        extract_response_content(&value).ok_or_else(|| "模型响应中缺少可读内容".to_string())?;
+    let content = extract_response_content(&value).unwrap_or_default();
+    let tool_calls = extract_message_tool_calls(&value);
+    if content.trim().is_empty() && tool_calls.is_empty() {
+        return Err("模型响应中缺少可读内容".to_string());
+    }
+    let finish_reason = value
+        .pointer("/choices/0/finish_reason")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     if let Some(reporter) = reporter {
         reporter.observe_model_output(&content).await;
     }
-    Ok(strip_thinking_notices(&content))
+    Ok(ModelPayload {
+        content: strip_thinking_notices(&content),
+        tool_calls,
+        finish_reason,
+    })
+}
+
+/// Extract the `tool_calls` array from a non-streamed chat completion
+/// response (`choices[0].message.tool_calls`).
+fn extract_message_tool_calls(value: &Value) -> Vec<NativeToolCall> {
+    let Some(calls) = value
+        .pointer("/choices/0/message/tool_calls")
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+    calls
+        .iter()
+        .filter_map(|call| {
+            let name = call
+                .pointer("/function/name")
+                .and_then(Value::as_str)
+                .map(str::to_string)?;
+            if name.is_empty() {
+                return None;
+            }
+            let raw_arguments = call
+                .pointer("/function/arguments")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let mut arguments = Map::new();
+            if !raw_arguments.is_empty()
+                && let Ok(value) = serde_json::from_str::<Map<String, Value>>(&raw_arguments)
+            {
+                arguments = value;
+            }
+            Some(NativeToolCall {
+                id: call
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                name,
+                arguments,
+                raw_arguments,
+            })
+        })
+        .collect()
 }
 
 async fn observe_stream_line(
     line: &[u8],
     streamed_content: &mut String,
+    tool_deltas: &mut Vec<NativeToolCallDelta>,
+    finish_reason: &mut Option<String>,
     reporter: Option<&ThinkingReporter>,
 ) -> Result<bool, String> {
     let previous_len = streamed_content.len();
-    let completed = parse_stream_line(line, streamed_content)?;
+    let completed = parse_stream_line(line, streamed_content, tool_deltas, finish_reason)?;
     if streamed_content.len() != previous_len
         && let Some(reporter) = reporter
     {
@@ -2472,7 +2856,12 @@ async fn observe_stream_line(
     Ok(completed)
 }
 
-fn parse_stream_line(line: &[u8], streamed_content: &mut String) -> Result<bool, String> {
+fn parse_stream_line(
+    line: &[u8],
+    streamed_content: &mut String,
+    tool_deltas: &mut Vec<NativeToolCallDelta>,
+    finish_reason: &mut Option<String>,
+) -> Result<bool, String> {
     let line = String::from_utf8_lossy(line);
     let line = line.trim().trim_end_matches('\r');
     let Some(data) = line.strip_prefix("data:").map(str::trim) else {
@@ -2487,6 +2876,17 @@ fn parse_stream_line(line: &[u8], streamed_content: &mut String) -> Result<bool,
     let Ok(value) = serde_json::from_str::<Value>(data) else {
         return Ok(false);
     };
+
+    // Native tool-call deltas are emitted independently of content. Capture
+    // them for both Chat Completions (`delta.tool_calls`) and Responses
+    // (`response.output_item.added` + `response.function_call_arguments.delta`).
+    accumulate_stream_tool_calls(&value, tool_deltas);
+    if let Some(reason) = value
+        .pointer("/choices/0/finish_reason")
+        .and_then(Value::as_str)
+    {
+        *finish_reason = Some(reason.to_string());
+    }
 
     match value.get("type").and_then(Value::as_str) {
         Some("response.output_text.done") => {
@@ -2515,6 +2915,85 @@ fn parse_stream_line(line: &[u8], streamed_content: &mut String) -> Result<bool,
         }
     }
     Ok(false)
+}
+
+/// Accumulate provider-native tool-call deltas from a streamed event.
+fn accumulate_stream_tool_calls(value: &Value, tool_deltas: &mut Vec<NativeToolCallDelta>) {
+    // Chat Completions format: choices[0].delta.tool_calls[index].
+    if let Some(calls) = value
+        .pointer("/choices/0/delta/tool_calls")
+        .and_then(Value::as_array)
+    {
+        for call in calls {
+            let index = call
+                .get("index")
+                .and_then(Value::as_u64)
+                .unwrap_or(calls.len() as u64 - 1) as usize;
+            if !tool_deltas.iter().any(|delta| delta.index == index) {
+                tool_deltas.push(NativeToolCallDelta {
+                    index,
+                    ..Default::default()
+                });
+            }
+            let Some(delta) = tool_deltas.iter_mut().find(|delta| delta.index == index) else {
+                continue;
+            };
+            delta.saw_delta = true;
+            if delta.id.is_empty()
+                && let Some(id) = call.get("id").and_then(Value::as_str)
+            {
+                delta.id = id.to_string();
+            }
+            if delta.name.is_empty()
+                && let Some(name) = call.pointer("/function/name").and_then(Value::as_str)
+            {
+                delta.name = name.to_string();
+            }
+            if let Some(arguments) = call.pointer("/function/arguments").and_then(Value::as_str) {
+                append_stream_delta(&mut delta.arguments, arguments);
+            }
+        }
+    }
+    // Responses format: a function_call output item followed by argument deltas.
+    if let Some(item) = value.get("item").and_then(Value::as_object)
+        && item.get("type").and_then(Value::as_str) == Some("function_call")
+    {
+        let index = tool_deltas.len();
+        tool_deltas.push(NativeToolCallDelta {
+            index,
+            ..Default::default()
+        });
+        let delta = tool_deltas.last_mut().expect("just pushed");
+        delta.saw_delta = true;
+        if let Some(id) = item.get("call_id").and_then(Value::as_str) {
+            delta.id = id.to_string();
+        }
+        if let Some(name) = item.get("name").and_then(Value::as_str) {
+            delta.name = name.to_string();
+        }
+    }
+    if let Some(arguments) = value.pointer("/delta").and_then(Value::as_str).filter(|_| {
+        value.get("type").and_then(Value::as_str) == Some("response.function_call_arguments.delta")
+    }) && let Some(id) = value.get("item_id").and_then(Value::as_str)
+    {
+        if !tool_deltas
+            .iter()
+            .any(|delta| delta.id == id || delta.id.is_empty())
+        {
+            tool_deltas.push(NativeToolCallDelta {
+                index: tool_deltas.len(),
+                id: id.to_string(),
+                ..Default::default()
+            });
+        }
+        let delta = tool_deltas
+            .iter_mut()
+            .find(|delta| delta.id == id || delta.id.is_empty())
+            .expect("matched above");
+        delta.saw_delta = true;
+        delta.id = id.to_string();
+        append_stream_delta(&mut delta.arguments, arguments);
+    }
 }
 
 fn stream_terminal_error(value: &Value) -> String {
@@ -3707,20 +4186,23 @@ pub fn get_file_modified_time_formatted() -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BotMemory, EMPTY_REPLY_REPAIR_PROMPT, MessageUnderstanding, Roles, VisionImage,
-        append_stream_delta, apply_thinking_mode, build_model_messages, build_responses_input,
-        build_responses_request_body, compression_cutoff, extract_stream_delta,
-        format_plain_style_context, group_system_prompt, is_group_admin_command, is_help_command,
-        is_restricted_command, likely_requires_tool_protocol, limit_memory_size,
-        model_attempt_count, neutralize_protocol_markers, parse_stream_line, plain_reply_plan,
+        BotMemory, EMPTY_REPLY_REPAIR_PROMPT, MessageUnderstanding, NativeToolCall,
+        NativeToolCallDelta, Roles, VisionImage, append_stream_delta, apply_thinking_mode,
+        assistant_tool_calls_wire, build_model_messages, build_responses_input,
+        build_responses_request_body, compression_cutoff, extract_message_tool_calls,
+        extract_stream_delta, finalize_native_tool_calls, format_plain_style_context,
+        group_system_prompt, is_group_admin_command, is_help_command, is_restricted_command,
+        likely_requires_tool_protocol, limit_memory_size, model_attempt_count,
+        neutralize_protocol_markers, parse_stream_line, plain_reply_plan,
         reply_action_protocol_requested, sanitize_scheduled_output, should_repair_empty_reply,
-        with_reference_context,
+        tool_result_wire, with_reference_context,
     };
     use crate::memory::{BotPersonality, UserProfile};
     use crate::model::message_actions::{ReplyPlan, follow_up_delay_millis, split_reply};
     use crate::model::reply_disposition::ReplyDisposition;
     use chrono::Local;
     use kovi::serde_json::json;
+    use serde_json::Map;
 
     #[test]
     fn neutralize_protocol_markers_breaks_every_marker_form_but_keeps_readability() {
@@ -3828,18 +4310,135 @@ mod tests {
             }]
         });
         assert!(
-            !parse_stream_line(format!("data: {reasoning}").as_bytes(), &mut content)
-                .expect("reasoning chunk should parse")
+            !parse_stream_line(
+                format!("data: {reasoning}").as_bytes(),
+                &mut content,
+                &mut Vec::new(),
+                &mut None
+            )
+            .expect("reasoning chunk should parse")
         );
         assert!(content.is_empty());
 
         let visible = json!({"choices": [{"delta": {"content": "可见答案"}}]});
         assert!(
-            !parse_stream_line(format!("data: {visible}").as_bytes(), &mut content)
-                .expect("content chunk should parse")
+            !parse_stream_line(
+                format!("data: {visible}").as_bytes(),
+                &mut content,
+                &mut Vec::new(),
+                &mut None
+            )
+            .expect("content chunk should parse")
         );
         assert_eq!(content, "可见答案");
-        assert!(parse_stream_line(b"data: [DONE]", &mut content).expect("done marker"));
+        assert!(
+            parse_stream_line(b"data: [DONE]", &mut content, &mut Vec::new(), &mut None)
+                .expect("done marker")
+        );
+    }
+
+    #[test]
+    fn streamed_native_tool_calls_are_assembled_in_index_order() {
+        let mut content = String::new();
+        let mut deltas: Vec<NativeToolCallDelta> = Vec::new();
+        let mut finish = None;
+        let first = json!({
+            "choices": [{
+                "delta": {"tool_calls": [{"index": 0, "id": "call_1", "type": "function",
+                    "function": {"name": "time_now", "arguments": ""}}]}
+            }]
+        });
+        let second = json!({
+            "choices": [{
+                "delta": {"tool_calls": [{"index": 1, "id": "call_2", "type": "function",
+                    "function": {"name": "web_search", "arguments": "{\"query\":\""}}]},
+                "finish_reason": null
+            }]
+        });
+        let third = json!({
+            "choices": [{
+                "delta": {"tool_calls": [
+                    {"index": 0, "function": {"arguments": "{}"}},
+                    {"index": 1, "function": {"arguments": "月球天气\"}"}}
+                ]},
+                "finish_reason": null
+            }]
+        });
+        let done = json!({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]});
+        for event in [first, second, third, done] {
+            assert!(
+                !parse_stream_line(
+                    format!("data: {event}").as_bytes(),
+                    &mut content,
+                    &mut deltas,
+                    &mut finish,
+                )
+                .expect("tool chunk should parse")
+            );
+        }
+        let calls = finalize_native_tool_calls(&deltas);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].id, "call_1");
+        assert_eq!(calls[0].name, "time_now");
+        assert_eq!(calls[0].arguments, Map::new());
+        assert_eq!(calls[1].name, "web_search");
+        assert_eq!(calls[1].arguments["query"], "月球天气");
+        assert_eq!(finish.as_deref(), Some("tool_calls"));
+        assert!(content.is_empty());
+    }
+
+    #[test]
+    fn native_tool_call_arguments_tolerate_truncated_object() {
+        let deltas = vec![NativeToolCallDelta {
+            index: 0,
+            id: "call_x".to_string(),
+            name: "reminder_create".to_string(),
+            arguments: "{\"mode\":\"once\",\"time\":\"明天 9 点\"".to_string(),
+            saw_delta: true,
+        }];
+        let calls = finalize_native_tool_calls(&deltas);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments["mode"], "once");
+        assert_eq!(calls[0].arguments["time"], "明天 9 点");
+    }
+
+    #[test]
+    fn wire_tool_messages_roundtrip_native_call_shape() {
+        let call = NativeToolCall {
+            id: "call_9".to_string(),
+            name: "time_now".to_string(),
+            arguments: Map::new(),
+            raw_arguments: "{}".to_string(),
+        };
+        let assistant = assistant_tool_calls_wire("", std::slice::from_ref(&call));
+        assert_eq!(assistant["role"], "assistant");
+        assert_eq!(assistant["tool_calls"][0]["id"], "call_9");
+        assert_eq!(assistant["tool_calls"][0]["function"]["name"], "time_now");
+        let tool = tool_result_wire("call_9", "2026-09-05 23:59 CST");
+        assert_eq!(tool["role"], "tool");
+        assert_eq!(tool["tool_call_id"], "call_9");
+    }
+
+    #[test]
+    fn non_streamed_tool_calls_are_extracted_from_message() {
+        let value = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "call_a",
+                        "type": "function",
+                        "function": {"name": "weather_current",
+                            "arguments": "{\"city\":\"北京\"}"}
+                    }]
+                }
+            }]
+        });
+        let calls = extract_message_tool_calls(&value);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "weather_current");
+        assert_eq!(calls[0].arguments["city"], "北京");
     }
 
     #[test]
@@ -4267,8 +4866,13 @@ mod tests {
             "delta": "先"
         });
         assert!(
-            !parse_stream_line(format!("data: {delta}").as_bytes(), &mut content,)
-                .expect("delta should parse")
+            !parse_stream_line(
+                format!("data: {delta}").as_bytes(),
+                &mut content,
+                &mut Vec::new(),
+                &mut None
+            )
+            .expect("delta should parse")
         );
         let completed = serde_json::json!({
             "type": "response.completed",
@@ -4279,8 +4883,13 @@ mod tests {
             }
         });
         assert!(
-            parse_stream_line(format!("data: {completed}").as_bytes(), &mut content,)
-                .expect("completed event should parse")
+            parse_stream_line(
+                format!("data: {completed}").as_bytes(),
+                &mut content,
+                &mut Vec::new(),
+                &mut None
+            )
+            .expect("completed event should parse")
         );
         assert_eq!(content, "先完成");
     }
@@ -4307,8 +4916,13 @@ mod tests {
             }),
         ] {
             assert!(
-                !parse_stream_line(format!("data: {event}").as_bytes(), &mut content)
-                    .expect("multipart event should parse")
+                !parse_stream_line(
+                    format!("data: {event}").as_bytes(),
+                    &mut content,
+                    &mut Vec::new(),
+                    &mut None
+                )
+                .expect("multipart event should parse")
             );
         }
         let completed = serde_json::json!({
@@ -4323,8 +4937,13 @@ mod tests {
             }
         });
         assert!(
-            parse_stream_line(format!("data: {completed}").as_bytes(), &mut content)
-                .expect("completed event should parse")
+            parse_stream_line(
+                format!("data: {completed}").as_bytes(),
+                &mut content,
+                &mut Vec::new(),
+                &mut None
+            )
+            .expect("completed event should parse")
         );
         assert_eq!(content, "第一段\n第二段");
     }
@@ -4337,11 +4956,19 @@ mod tests {
             "text": "完整回复"
         });
         assert!(
-            !parse_stream_line(format!("data: {done}").as_bytes(), &mut content,)
-                .expect("done event should parse")
+            !parse_stream_line(
+                format!("data: {done}").as_bytes(),
+                &mut content,
+                &mut Vec::new(),
+                &mut None
+            )
+            .expect("done event should parse")
         );
         assert_eq!(content, "完整回复");
-        assert!(parse_stream_line(b"data: [DONE]", &mut content).expect("done marker"));
+        assert!(
+            parse_stream_line(b"data: [DONE]", &mut content, &mut Vec::new(), &mut None)
+                .expect("done marker")
+        );
     }
 
     #[test]
@@ -4351,8 +4978,13 @@ mod tests {
             "type": "response.failed",
             "response": {"error": {"message": "上游失败"}}
         });
-        let error = parse_stream_line(format!("data: {failed}").as_bytes(), &mut content)
-            .expect_err("failed event should stop the stream");
+        let error = parse_stream_line(
+            format!("data: {failed}").as_bytes(),
+            &mut content,
+            &mut Vec::new(),
+            &mut None,
+        )
+        .expect_err("failed event should stop the stream");
         assert!(error.contains("response.failed"));
         assert!(error.contains("上游失败"));
     }

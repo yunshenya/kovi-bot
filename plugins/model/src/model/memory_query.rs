@@ -5,16 +5,17 @@ use super::reply_disposition::SILENT_REPLY_OUTPUT;
 use super::thinking::ThinkingReporter;
 use super::tool_access::{ToolExecutionContext, ToolExecutionResult, tool_registry};
 use super::utils::{
-    BotMemory, Roles, complete_truncated_json_object, is_model_error_response,
-    likely_requires_tool_protocol, model_error, params_model_with_plain_style_context,
+    BotMemory, ModelPayload, Roles, assistant_tool_calls_wire, complete_truncated_json_object,
+    is_model_error_response, likely_requires_tool_protocol, model_error,
+    params_model_with_native_tools, params_model_with_plain_style_context,
     params_model_with_plain_style_context_allow_empty,
     params_model_with_token_limit_and_progress_for_reply, params_model_without_reply_guidance,
-    vision_failure_detail,
+    plain_assistant_wire, system_wire, tool_result_wire, user_wire, vision_failure_detail,
 };
 use crate::config;
 use crate::vision::VisionImage;
 use serde::Deserialize;
-use serde_json::Map;
+use serde_json::{Map, Value};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -224,7 +225,7 @@ pub(crate) async fn params_model_with_tool_access(
     let mut request = messages.to_vec();
     request.push(BotMemory {
         role: Roles::System,
-        content: registry.instruction_for(&tool_context),
+        content: registry.instruction_for_native(&tool_context, false),
     });
     if tool_context.requires_reminder_create {
         request.push(BotMemory {
@@ -262,12 +263,18 @@ pub(crate) async fn params_model_with_tool_access(
     let mut group_message_send_attempted = false;
     let mut group_message_send_succeeded = false;
     let mut group_followup_succeeded = false;
+    // 原生 function-calling 清单：只包含本轮上下文可用的工具。
+    let tool_specs = registry.native_tool_specs(&tool_context, false);
+    // 工具循环的历史增量（assistant tool_calls / assistant 文本 / tool 结果 /
+    // 修复 system 提示）统一以 wire 形式维护，保证与 API 历史严格同序：
+    // 模型永远通过 provider 的 tool_calls 通道发起调用，不再依赖文本协议。
+    let mut extra_wire: Vec<Value> = Vec::new();
 
     for round in 0..max_tool_rounds {
-        let Some(response) = interruptible_model_call_for_context(
+        let Some(payload) = interruptible_model_call_with_native_tools(
             &mut request,
-            &tool_context,
-            true,
+            &extra_wire,
+            &tool_specs,
             reply_ticket,
             max_output_tokens,
             vision_images,
@@ -277,19 +284,141 @@ pub(crate) async fn params_model_with_tool_access(
         else {
             return interrupted_response();
         };
-        if vision_failure_detail(&response.content).is_some() {
+        if vision_failure_detail(&payload.content).is_some() {
             if group_message_send_succeeded {
                 return completed_group_message_response();
             }
             if agent_run_create_succeeded {
                 return completed_agent_run_response();
             }
-            return response;
+            return payload.as_bot_memory();
         }
-        // Providers sometimes add a short preamble or Markdown around a tool
-        // call. Keep the same tolerant-but-structured parser for every retry
-        // round; switching back to strict mode on round two turns recoverable
-        // protocol noise into a false task failure.
+        if !payload.tool_calls.is_empty() {
+            // ===== 原生 function-calling 轮：执行全部调用，结果回灌后让
+            // 模型继续推理（ReAct），直到它认为资料足够并输出最终正文。 =====
+            println!(
+                "[INFO] 模型原生工具调用请求: 数量={}, 范围={}:{}, 轮次={}",
+                payload.tool_calls.len(),
+                tool_context.context,
+                tool_context.subject_id,
+                round + 1
+            );
+            let mut executed: Vec<(String, ToolExecutionResult)> =
+                Vec::with_capacity(payload.tool_calls.len());
+            for call in &payload.tool_calls {
+                // Provider 返回的 wire 名（点号已转下划线）先反查回注册名；
+                // 未知名字原样交给执行层，让它以“未知工具”失败反馈给模型。
+                let tool_name = registry.resolve_wire_tool_name(&call.name);
+                let result = if tool_name == "memory.search" && memory_rounds >= max_memory_rounds {
+                    ToolExecutionResult {
+                        succeeded: false,
+                        content: "本轮长期记忆查询次数已用完，请使用已有资料回答。".to_string(),
+                        reminder_failure_kind: None,
+                    }
+                } else {
+                    if tool_name == "memory.search" {
+                        memory_rounds += 1;
+                    }
+                    registry
+                        .execute(
+                            &tool_name,
+                            call.arguments.clone(),
+                            tool_context.clone(),
+                            reply_ticket,
+                        )
+                        .await
+                };
+                if result.succeeded && is_external_tool_name(&tool_name) {
+                    external_tool_succeeded = true;
+                }
+                if result.succeeded && matches!(tool_name.as_str(), "group.pause" | "group.resume")
+                {
+                    tool_context.group_paused = false;
+                }
+                if tool_name == "reminder.create" {
+                    reminder_tool_succeeded = result.succeeded;
+                    if reminder_tool_succeeded {
+                        reminder_failure_detail = None;
+                        println!(
+                            "[INFO] reminder.create 执行成功 (范围: {}:{}, 轮次: {})",
+                            tool_context.context,
+                            tool_context.subject_id,
+                            round + 1
+                        );
+                    } else {
+                        reminder_failure = match result.reminder_failure_kind {
+                            Some(crate::reminders::ReminderToolFailureKind::Validation) => {
+                                ReminderCreateFailure::InvalidArguments
+                            }
+                            Some(crate::reminders::ReminderToolFailureKind::Rejected) => {
+                                ReminderCreateFailure::Rejected
+                            }
+                            Some(crate::reminders::ReminderToolFailureKind::Database) => {
+                                ReminderCreateFailure::Database
+                            }
+                            None => ReminderCreateFailure::Execution,
+                        };
+                        reminder_failure_detail = Some(result.content.clone());
+                        eprintln!(
+                            "{} {} (范围: {}:{}, 轮次: {}, 详情: {})",
+                            reminder_failure.log_prefix(),
+                            reminder_failure.label(),
+                            tool_context.context,
+                            tool_context.subject_id,
+                            round + 1,
+                            compact_log_text(&result.content)
+                        );
+                    }
+                }
+                if tool_name == "agent.run.create" {
+                    agent_run_create_attempted = true;
+                    if result.succeeded {
+                        agent_run_create_succeeded = true;
+                        println!(
+                            "[INFO] agent.run.create 执行成功 (范围: {}:{}, 轮次: {})",
+                            tool_context.context,
+                            tool_context.subject_id,
+                            round + 1
+                        );
+                    }
+                }
+                if tool_name == "group.message.targets" && result.succeeded {
+                    group_target_lookup_succeeded = true;
+                }
+                if tool_name == "group.message.send" {
+                    group_message_send_attempted = true;
+                    merge_group_send_result(
+                        &result,
+                        &mut group_message_send_succeeded,
+                        &mut group_followup_succeeded,
+                    );
+                }
+                println!(
+                    "[INFO] 模型原生工具调用完成 (工具: {}, 范围: {}:{}, 轮次: {})",
+                    tool_name,
+                    tool_context.context,
+                    tool_context.subject_id,
+                    round + 1
+                );
+                executed.push((tool_name, result));
+            }
+            extra_wire.push(assistant_tool_calls_wire(
+                &payload.content,
+                &payload.tool_calls,
+            ));
+            for (index, result) in executed.iter().enumerate() {
+                let call_id = payload
+                    .tool_calls
+                    .get(index)
+                    .map(|call| call.id.clone())
+                    .unwrap_or_default();
+                extra_wire.push(tool_result_wire(&call_id, &result.1.content));
+            }
+            continue;
+        }
+        // Provider 未返回工具调用：把本轮正文当作普通助手响应，沿用既有
+        // required 工具约束与文本协议兜底（旧模型/网关混用期兼容）。
+        let response = payload.as_bot_memory();
         match parse_tool_call_with_wrapping(&response.content, true) {
             ParsedToolCall::None => {
                 if tool_context.group_paused {
@@ -327,14 +456,10 @@ pub(crate) async fn params_model_with_tool_access(
                         tool_context.subject_id,
                         round + 1
                     );
-                    request.push(BotMemory {
-                        role: Roles::Assistant,
-                        content: "外部查询尚未执行。".to_string(),
-                    });
-                    request.push(BotMemory {
-                        role: Roles::System,
-                        content: "这个定时任务依赖最新外部资料。请不要直接回答；下一条只输出一个完整且唯一的 web.search 工具调用，不要代码块、解释文字或重复标记。".to_string(),
-                    });
+                    extra_wire.push(plain_assistant_wire("外部查询尚未执行。"));
+                    extra_wire.push(system_wire(
+                        "这个定时任务依赖最新外部资料。请不要直接回答；直接通过系统工具接口再次调用 web.search（function-calling），不要输出代码块、解释文字或重复标记。",
+                    ));
                     continue;
                 }
                 if should_retry_reminder_create(
@@ -342,11 +467,10 @@ pub(crate) async fn params_model_with_tool_access(
                     reminder_tool_succeeded,
                     &response.content,
                 ) {
-                    request.push(response);
-                    request.push(BotMemory {
-                        role: Roles::System,
-                        content: "你刚才只输出了确认文本，但 reminder.create 尚未执行。不要把确认当成成功；如果绝对日期需要校准，可以先调用 time.now，随后必须调用 reminder.create。参数要完整包含 mode、时间和用户要求的动作；只有工具成功后才能生成最终回复。".to_string(),
-                    });
+                    extra_wire.push(plain_assistant_wire(&response.content));
+                    extra_wire.push(system_wire(
+                        "你刚才只输出了确认文本，但 reminder.create 尚未执行。不要把确认当成成功；通过系统工具接口调用 time.now（如需要）并调用 reminder.create。参数要完整包含 mode、时间和用户要求的动作；只有工具成功后才能生成最终回复。",
+                    ));
                     println!(
                         "[WARN] 定时任务模型返回普通确认，要求补充 reminder.create (范围: {}:{})",
                         tool_context.context, tool_context.subject_id
@@ -358,11 +482,10 @@ pub(crate) async fn params_model_with_tool_access(
                         && !is_model_error_response(&response.content)
                         && round + 1 < max_tool_rounds
                     {
-                        request.push(response);
-                        request.push(BotMemory {
-                            role: Roles::System,
-                            content: "你刚才只输出了文字，但持续任务尚未创建。下一条只能调用 agent.run.create；不要用确认话术或 reminder.create 代替。".to_string(),
-                        });
+                        extra_wire.push(plain_assistant_wire(&response.content));
+                        extra_wire.push(system_wire(
+                            "你刚才只输出了文字，但持续任务尚未创建。下一条直接通过系统工具接口调用 agent.run.create；不要用确认话术或 reminder.create 代替。",
+                        ));
                         println!(
                             "[WARN] 持续任务模型返回普通文本，要求补充 agent.run.create (范围: {}:{})",
                             tool_context.context, tool_context.subject_id
@@ -377,11 +500,10 @@ pub(crate) async fn params_model_with_tool_access(
                         && !is_model_error_response(&response.content)
                         && round + 1 < max_tool_rounds
                     {
-                        request.push(response);
-                        request.push(BotMemory {
-                            role: Roles::System,
-                            content: "你刚才只输出了文字，但跨群消息尚未发送。下一条只能调用 group.message.send；如果目标是群名，先调用 group.message.targets。不要用确认话术代替工具执行。".to_string(),
-                        });
+                        extra_wire.push(plain_assistant_wire(&response.content));
+                        extra_wire.push(system_wire(
+                            "你刚才只输出了文字，但跨群消息尚未发送。下一条直接通过系统工具接口调用 group.message.send；如果目标是群名，先调用 group.message.targets。不要用确认话术代替工具执行。",
+                        ));
                         println!(
                             "[WARN] 跨群发送模型返回普通文本，要求补充真实动作 (范围: {}:{})",
                             tool_context.context, tool_context.subject_id
@@ -438,21 +560,15 @@ pub(crate) async fn params_model_with_tool_access(
                     response.content.matches(TOOL_CALL_END).count(),
                     compact_log_text(&response.content)
                 );
-                request.push(BotMemory {
-                    role: Roles::Assistant,
-                    content: "工具调用未执行。".to_string(),
-                });
-                request.push(BotMemory {
-                    role: Roles::System,
-                    content: format!(
-                        "上一轮工具调用格式无效（{}）。请重新输出一条完整且唯一的工具调用；不要输出代码块、前后解释或重复标记。",
-                        reason,
-                    ),
-                });
+                extra_wire.push(plain_assistant_wire("工具调用未执行。"));
+                extra_wire.push(system_wire(&format!(
+                    "上一轮工具调用格式无效（{}）。请直接通过系统工具接口重新发起唯一的函数调用；不要输出代码块、前后解释或重复标记。",
+                    reason,
+                )));
             }
             ParsedToolCall::Call(call) => {
                 let tool_name = call.name.clone();
-                request.push(response);
+                extra_wire.push(plain_assistant_wire(&response.content));
                 let result = if call.name == "memory.search" && memory_rounds >= max_memory_rounds {
                     ToolExecutionResult {
                         succeeded: false,
@@ -544,10 +660,7 @@ pub(crate) async fn params_model_with_tool_access(
                     tool_context.subject_id,
                     round + 1
                 );
-                request.push(BotMemory {
-                    role: Roles::Data,
-                    content: format_tool_result(&tool_name, &result.content),
-                });
+                extra_wire.push(user_wire(&format_tool_result(&tool_name, &result.content)));
             }
         }
     }
@@ -601,22 +714,20 @@ pub(crate) async fn params_model_with_tool_access(
         );
     }
 
-    request.push(BotMemory {
-        role: Roles::System,
-        content: "本轮工具调用次数已用完。请使用已有结果直接回答，不要再输出工具调用标记。"
-            .to_string(),
-    });
-    let Some(response) = interruptible_model_call_for_context(
+    extra_wire.push(system_wire(
+        "本轮工具调用次数已用完。请使用已有结果直接回答，不要再发起工具调用。",
+    ));
+    let Some(response) = interruptible_model_call_with_native_tools(
         &mut request,
-        &tool_context,
-        true,
+        &extra_wire,
+        &tool_specs,
         reply_ticket,
         max_output_tokens,
         vision_images,
         progress,
     )
     .await
-    else {
+    .map(|payload| payload.as_bot_memory()) else {
         return interrupted_response();
     };
     if matches!(
@@ -934,6 +1045,37 @@ pub(crate) async fn interruptible_model_call_without_reply_guidance(
         ModelPromptMode::None,
     )
     .await
+}
+
+/// 带原生 function-calling 的模型调用：请求带有工具声明，返回结构化载荷
+/// （正文 + provider 工具调用）。中断语义与其它可中断模型调用一致。
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn interruptible_model_call_with_native_tools(
+    messages: &mut [BotMemory],
+    extra_wire: &[Value],
+    tool_specs: &[Value],
+    reply_ticket: ReplyTicket,
+    max_output_tokens: Option<u32>,
+    vision_images: &[VisionImage],
+    progress: Option<Arc<ThinkingReporter>>,
+) -> Option<ModelPayload> {
+    if !is_current(reply_ticket).await {
+        return None;
+    }
+    kovi::tokio::select! {
+        response = params_model_with_native_tools(
+            messages,
+            extra_wire,
+            tool_specs,
+            max_output_tokens,
+            vision_images,
+            progress,
+            Some(reply_ticket),
+        ) => {
+            is_current(reply_ticket).await.then_some(response)
+        }
+        () = wait_until_interrupted(reply_ticket) => None,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
