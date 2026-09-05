@@ -1174,7 +1174,12 @@ pub(crate) fn likely_requires_tool_protocol(content: &str) -> bool {
         "最新",
         "当前时间",
         "现在几点",
+        "几点",
         "几点了",
+        "几点钟",
+        "什么时候",
+        "几号",
+        "几月",
         "计算",
         "算一下",
         "换算",
@@ -1202,14 +1207,28 @@ pub(crate) fn likely_requires_tool_protocol(content: &str) -> bool {
         || text.contains("多少")
         || text.contains("几度")
         || text.contains("哪天")
-        || text.contains("哪一");
+        || text.contains("哪一")
+        || text.contains("几点")
+        || text.contains("几号")
+        || text.contains("几月")
+        || text.contains("什么时候");
     let lookup_target = TOOL_TARGETS.iter().any(|marker| text.contains(marker));
     if lookup_target && question_shape {
         return true;
     }
     matches!(
         text.as_str(),
-        "天气" | "天气预报" | "现在几点" | "几点了" | "查天气" | "搜新闻"
+        "天气"
+            | "天气预报"
+            | "现在几点"
+            | "现在几点了"
+            | "现在几点钟"
+            | "几点了"
+            | "几点钟了"
+            | "什么时候了"
+            | "现在时间"
+            | "查天气"
+            | "搜新闻"
     )
 }
 
@@ -4510,6 +4529,10 @@ mod tests {
             "检查这个接口是否正常吗？",
             "天气怎么样？",
             "不要只回答，帮我查一下成都天气",
+            "现在几点了",
+            "我这边看一下现在几点",
+            "什么时候了",
+            "今天是几号",
         ] {
             assert!(
                 likely_requires_tool_protocol(request),
