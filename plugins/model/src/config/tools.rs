@@ -109,8 +109,8 @@ impl ToolsConfig {
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
-        if self.max_rounds == 0 || self.max_rounds > 3 {
-            return Err(anyhow::anyhow!("tools.max_rounds 必须在 1 到 3 之间"));
+        if self.max_rounds == 0 || self.max_rounds > 20 {
+            return Err(anyhow::anyhow!("tools.max_rounds 必须在 1 到 20 之间"));
         }
         if self.timeout_secs == 0 || self.timeout_secs > 120 {
             return Err(anyhow::anyhow!("tools.timeout_secs 必须在 1 到 120 秒之间"));
@@ -240,7 +240,7 @@ impl Default for ToolsConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            max_rounds: 2,
+            max_rounds: 10,
             timeout_secs: 15,
             max_result_chars: 12_000,
             web_search_enabled: true,

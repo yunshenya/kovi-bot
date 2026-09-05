@@ -413,11 +413,6 @@ pub(crate) fn system_wire(content: &str) -> Value {
     json!({"role": "system", "content": content})
 }
 
-/// user/资料消息的 wire 形式（不可信工具资料沿用 user 角色发送）。
-pub(crate) fn user_wire(content: &str) -> Value {
-    json!({"role": "user", "content": content})
-}
-
 /// Complete a JSON object that was cut off only at one or more closing
 /// delimiters. The caller must still parse the returned text with its strict
 /// schema; this helper only handles the unambiguous end-of-stream case.

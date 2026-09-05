@@ -195,7 +195,7 @@ recent_topic_cooldown_secs = 604800
 
 [tools]
 enabled = true
-max_rounds = 2
+max_rounds = 10
 timeout_secs = 15
 max_result_chars = 12000
 web_search_enabled = true

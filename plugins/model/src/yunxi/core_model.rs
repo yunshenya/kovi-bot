@@ -29,7 +29,6 @@ use kovi::tokio::sync::Mutex;
 use serde::Deserialize;
 #[cfg(test)]
 use serde::Serialize;
-use serde_json::Map;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 use std::hash::Hash;
@@ -50,7 +49,6 @@ const HOST_MESSAGE_CONTEXT_CAPACITY: usize = 512;
 const HOST_TOOL_TURN_CAPACITY: usize = 512;
 const CORE_TOOL_CALL_START: &str = "[[TOOL_CALL]]";
 const CORE_TOOL_CALL_END: &str = "[[/TOOL_CALL]]";
-const MAX_CORE_TOOL_CALL_CHARS: usize = 4_096;
 // Keep a single model completion bounded while allowing independent tool
 // operations to be planned together. This matches Core's planner intent cap.
 const MAX_CORE_TOOL_CALLS: usize = yunxi_core::MAX_PLANNER_INTENTS;
@@ -987,14 +985,6 @@ fn is_autonomous_intrinsic_turn(messages: &[BotMemory]) -> bool {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct CoreToolCall {
-    name: String,
-    #[serde(default)]
-    arguments: Map<String, serde_json::Value>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct CoreInteractionCues {
     #[serde(default)]
     incoming_impact: Option<CoreIncomingImpact>,
@@ -1085,7 +1075,6 @@ struct ParsedCoreResponse {
 
 enum CoreDirectRepair {
     Reply(ReplyPlan),
-    Tool(Vec<CognitiveIntent>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1319,8 +1308,6 @@ async fn repair_direct_reply(
     reply_ticket: ReplyTicket,
     scope: ReplyScope,
     allow_tool_call: bool,
-    action_scope: Option<ActionScope>,
-    notification_policy: ToolNotificationPolicy,
     vision_images: &[crate::vision::VisionImage],
 ) -> Result<CoreDirectRepair, CoreDirectRepairFailure> {
     // A visible-text repair gets the same host-owned plain prompt as a normal
@@ -1369,14 +1356,7 @@ async fn repair_direct_reply(
     if crate::model::utils::is_model_error_response(&response.content) {
         return Err(CoreDirectRepairFailure::ModelErrorResponse);
     }
-    let result = parse_direct_repair_output_with_policy(
-        &response.content,
-        scope,
-        allow_tool_call,
-        action_scope,
-        notification_policy,
-    )
-    .await;
+    let result = parse_direct_repair_output_with_policy(&response.content, scope).await;
     match result {
         Ok(repaired) => Ok(repaired),
         Err(failure) => {
@@ -2271,25 +2251,13 @@ fn is_tool_registry_instruction(content: &str) -> bool {
 async fn parse_direct_repair_output(
     content: &str,
     scope: ReplyScope,
-    allow_tool_call: bool,
-    action_scope: Option<ActionScope>,
 ) -> Result<CoreDirectRepair, CoreDirectRepairFailure> {
-    parse_direct_repair_output_with_policy(
-        content,
-        scope,
-        allow_tool_call,
-        action_scope,
-        ToolNotificationPolicy::Final,
-    )
-    .await
+    parse_direct_repair_output_with_policy(content, scope).await
 }
 
 async fn parse_direct_repair_output_with_policy(
     content: &str,
     scope: ReplyScope,
-    allow_tool_call: bool,
-    action_scope: Option<ActionScope>,
-    notification_policy: ToolNotificationPolicy,
 ) -> Result<CoreDirectRepair, CoreDirectRepairFailure> {
     let content = content.trim();
     if content.is_empty() {
@@ -2309,13 +2277,9 @@ async fn parse_direct_repair_output_with_policy(
     {
         return Err(CoreDirectRepairFailure::InvalidProtocol);
     }
-    if allow_tool_call
-        && let Some(action_scope) = action_scope
-        && let Some(intents) =
-            parse_core_tool_intents_with_policy(content, action_scope, notification_policy)
-    {
-        return Ok(CoreDirectRepair::Tool(intents));
-    }
+    // Repair turns never accept legacy tool markers: tool requests are
+    // provider-native function calls only, and this path is a plain-text
+    // recovery channel.
     if content.contains(CORE_TOOL_CALL_START) || content.contains(CORE_TOOL_CALL_END) {
         return Err(CoreDirectRepairFailure::InvalidProtocol);
     }
@@ -2326,6 +2290,48 @@ async fn parse_direct_repair_output_with_policy(
         return Err(CoreDirectRepairFailure::SilentOrInvisibleReply);
     };
     Ok(CoreDirectRepair::Reply(plan))
+}
+
+pub(crate) fn core_tool_protocol_diagnostic(content: &str) -> String {
+    format!(
+        "chars={} starts={} ends={} cues={} reply_action={}",
+        content.chars().count(),
+        content.matches(CORE_TOOL_CALL_START).count(),
+        content.matches(CORE_TOOL_CALL_END).count(),
+        content.contains(CORE_INTERACTION_CUES_START),
+        content.contains("[[REPLY_ACTION]]"),
+    )
+}
+
+fn native_calls_to_core_intents(
+    calls: &[NativeToolCall],
+    scope: ActionScope,
+    notification_policy: ToolNotificationPolicy,
+    registry: &ToolRegistry,
+) -> Vec<CognitiveIntent> {
+    let mut intents = Vec::new();
+    for call in calls {
+        if intents.len() >= MAX_CORE_TOOL_CALLS {
+            break;
+        }
+        let name = registry.resolve_wire_tool_name(&call.name);
+        if name.trim() != name || name.is_empty() || name.chars().count() > 128 {
+            continue;
+        }
+        let Ok(input) = serde_json::to_string(&call.arguments) else {
+            continue;
+        };
+        let intent = CognitiveIntent::use_tool_with_notification_policy(
+            name,
+            input,
+            scope,
+            notification_policy,
+        );
+        if intent.validate().is_ok() {
+            intents.push(intent);
+        }
+    }
+    intents
 }
 
 async fn register_core_tool_intents(
@@ -2435,199 +2441,6 @@ fn strip_core_interaction_cues(content: &str) -> String {
         remaining = &after_start[end + CORE_INTERACTION_CUES_END.len()..];
     }
     cleaned.trim().to_owned()
-}
-
-/// Convert one or more model-produced declarative tool markers into Core
-/// intents. The sequence is intentionally strict: markers must be complete,
-/// adjacent (apart from whitespace), and contain no visible text. Each JSON
-/// object is independently validated before it reaches an adapter.
-fn parse_core_tool_intents(content: &str, scope: ActionScope) -> Option<Vec<CognitiveIntent>> {
-    parse_core_tool_intents_with_policy(content, scope, ToolNotificationPolicy::Final)
-}
-
-/// Convert provider-native function calls into Core tool intents. Each call
-/// is independently validated (name shape, argument object round-trip) before
-/// it reaches an adapter; invalid calls are dropped rather than rejected as a
-/// whole, matching the per-intent validation of the legacy parser. Wire tool
-/// names are reverse-mapped through the registry before validation.
-fn native_calls_to_core_intents(
-    calls: &[NativeToolCall],
-    scope: ActionScope,
-    notification_policy: ToolNotificationPolicy,
-    registry: &ToolRegistry,
-) -> Vec<CognitiveIntent> {
-    let mut intents = Vec::new();
-    for call in calls {
-        if intents.len() >= MAX_CORE_TOOL_CALLS {
-            break;
-        }
-        let name = registry.resolve_wire_tool_name(&call.name);
-        if name.trim() != name || name.is_empty() || name.chars().count() > 128 {
-            continue;
-        }
-        let Ok(input) = serde_json::to_string(&call.arguments) else {
-            continue;
-        };
-        let intent = CognitiveIntent::use_tool_with_notification_policy(
-            name,
-            input,
-            scope,
-            notification_policy,
-        );
-        if intent.validate().is_ok() {
-            intents.push(intent);
-        }
-    }
-    intents
-}
-
-fn parse_core_tool_intents_with_policy(
-    content: &str,
-    scope: ActionScope,
-    notification_policy: ToolNotificationPolicy,
-) -> Option<Vec<CognitiveIntent>> {
-    let trimmed = content.trim();
-    if trimmed.is_empty() || trimmed.chars().count() > MAX_CORE_TOOL_CALL_CHARS {
-        return None;
-    }
-    // Tolerate a single unclosed tool call: some models emit
-    // `[[TOOL_CALL]]{...}` without the matching `[[/TOOL_CALL]]`. Accept it as
-    // implicitly closed only when the content is exactly one opening marker, no
-    // closing marker, and the payload is a clean, complete JSON object — so a
-    // requested lookup is not silently dropped, while truncated or mixed output
-    // is still rejected.
-    if trimmed.starts_with(CORE_TOOL_CALL_START)
-        && !trimmed.contains(CORE_TOOL_CALL_END)
-        && trimmed.matches(CORE_TOOL_CALL_START).count() == 1
-    {
-        let payload = trimmed[CORE_TOOL_CALL_START.len()..].trim();
-        if payload.is_empty() || payload.contains("[[") {
-            return None;
-        }
-        let call = serde_json::from_str::<CoreToolCall>(payload).ok()?;
-        if call.name.trim() != call.name || call.name.is_empty() || call.name.chars().count() > 128
-        {
-            return None;
-        }
-        let input = serde_json::to_string(&call.arguments).ok()?;
-        let intent = CognitiveIntent::use_tool_with_notification_policy(
-            call.name,
-            input,
-            scope,
-            notification_policy,
-        );
-        intent.validate().ok()?;
-        return Some(vec![intent]);
-    }
-    let mut remaining = trimmed;
-    let mut intents = Vec::new();
-    loop {
-        let payload = remaining.strip_prefix(CORE_TOOL_CALL_START)?;
-        let end = payload.find(CORE_TOOL_CALL_END)?;
-        let payload_json = payload[..end].trim();
-        let call = serde_json::from_str::<CoreToolCall>(payload_json).ok()?;
-        if call.name.trim() != call.name || call.name.is_empty() || call.name.chars().count() > 128
-        {
-            return None;
-        }
-        let input = serde_json::to_string(&call.arguments).ok()?;
-        let intent = CognitiveIntent::use_tool_with_notification_policy(
-            call.name,
-            input,
-            scope,
-            notification_policy,
-        );
-        intent.validate().ok()?;
-        intents.push(intent);
-        if intents.len() > MAX_CORE_TOOL_CALLS {
-            return None;
-        }
-        remaining = payload[end + CORE_TOOL_CALL_END.len()..].trim_start();
-        if remaining.is_empty() {
-            break;
-        }
-    }
-    (!intents.is_empty()).then_some(intents)
-}
-
-/// Accept the narrow mixed shape that can occur on a tool-result follow-up:
-/// one or more validated tool markers followed by the visible result for the
-/// completed operation. This is deliberately separate from the strict parser;
-/// callers must opt in only when a tool result is already being processed.
-fn parse_core_tool_intents_with_visible_suffix(
-    content: &str,
-    scope: ActionScope,
-    notification_policy: ToolNotificationPolicy,
-) -> Option<(Vec<CognitiveIntent>, String)> {
-    let trimmed = content.trim();
-    if trimmed.is_empty() || trimmed.chars().count() > MAX_CORE_TOOL_CALL_CHARS {
-        return None;
-    }
-    let mut remaining = trimmed;
-    let mut intents = Vec::new();
-    loop {
-        let payload = remaining.strip_prefix(CORE_TOOL_CALL_START)?;
-        let end = payload.find(CORE_TOOL_CALL_END)?;
-        let payload_json = payload[..end].trim();
-        let call = serde_json::from_str::<CoreToolCall>(payload_json).ok()?;
-        if call.name.trim() != call.name || call.name.is_empty() || call.name.chars().count() > 128
-        {
-            return None;
-        }
-        let input = serde_json::to_string(&call.arguments).ok()?;
-        let intent = CognitiveIntent::use_tool_with_notification_policy(
-            call.name,
-            input,
-            scope,
-            notification_policy,
-        );
-        intent.validate().ok()?;
-        intents.push(intent);
-        if intents.len() >= MAX_CORE_TOOL_CALLS {
-            return None;
-        }
-        remaining = payload[end + CORE_TOOL_CALL_END.len()..].trim_start();
-        if remaining.is_empty() {
-            return None;
-        }
-        if !remaining.starts_with(CORE_TOOL_CALL_START) {
-            break;
-        }
-    }
-
-    let suffix = remaining.trim();
-    if suffix.is_empty()
-        || suffix.chars().count() > MAX_CORE_TOOL_CALL_CHARS
-        || suffix.contains(CORE_TOOL_CALL_START)
-        || suffix.contains(CORE_TOOL_CALL_END)
-        || suffix.contains(CORE_INTERACTION_CUES_START)
-        || suffix.contains(CORE_INTERACTION_CUES_END)
-        || suffix.contains("[[REPLY_ACTION]]")
-        || suffix.contains("[[/REPLY_ACTION]]")
-        || suffix.contains("[[NEXT_MESSAGE]]")
-    {
-        return None;
-    }
-    Some((intents, suffix.to_owned()))
-}
-
-fn core_tool_protocol_diagnostic(content: &str) -> String {
-    format!(
-        "chars={} starts={} ends={} cues={} reply_action={}",
-        content.chars().count(),
-        content.matches(CORE_TOOL_CALL_START).count(),
-        content.matches(CORE_TOOL_CALL_END).count(),
-        content.contains(CORE_INTERACTION_CUES_START),
-        content.contains("[[REPLY_ACTION]]"),
-    )
-}
-
-/// Backwards-compatible singular parser for callers that specifically need to
-/// distinguish one call. Multi-call responses are intentionally not collapsed.
-#[cfg_attr(not(test), allow(dead_code))]
-fn parse_core_tool_intent(content: &str, scope: ActionScope) -> Option<CognitiveIntent> {
-    let mut intents = parse_core_tool_intents(content, scope)?;
-    (intents.len() == 1).then(|| intents.remove(0))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3825,6 +3638,7 @@ fn classify_persistent_person_identity(
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn visible_reply_intent(target: VisibleReplyTarget, content: String) -> Option<CognitiveIntent> {
     visible_reply_intents(target, &[content])?
         .into_iter()
@@ -4142,6 +3956,7 @@ fn reply_recovery_required(input: &PlannerInput, tool_follow_up: bool) -> bool {
     reply_expected_for_incoming(input) || tool_follow_up
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn strong_reply_repair_needed(
     has_visible_reply: bool,
     recovery_required: bool,
@@ -5482,97 +5297,45 @@ impl ModelBackend for KoviModelBackend {
                 ));
             }
             if tool_protocol_authorized && let Some(action_scope) = action_scope {
-                // 原生 function-calling 优先：provider 给出的工具调用直接
-                // 转为 Core 意图；仅有旧文本标记时走兼容解析（过渡期兜底）。
-                let core_tool_intents = if !native_tool_calls.is_empty() {
-                    core_tool_registry.as_ref().map(|registry| {
+                // 原生 function-calling：provider 给出的工具调用直接转为
+                // Core 意图并交给宿主执行；模型不再书写文本协议。
+                if !native_tool_calls.is_empty() {
+                    let core_tool_intents = core_tool_registry.as_ref().map(|registry| {
                         native_calls_to_core_intents(
                             &native_tool_calls,
                             action_scope,
                             tool_notification_policy,
                             registry,
                         )
-                    })
-                } else {
-                    parse_core_tool_intents_with_policy(
-                        &parsed_response.content,
-                        action_scope,
-                        tool_notification_policy,
-                    )
-                };
-                if let Some(intents) = core_tool_intents {
-                    let Some(tool_plan) = register_core_tool_intents(
-                        &self.tool_turns,
-                        input,
-                        &mind_projection,
-                        intents,
-                        ticket,
-                        parsed_response.interaction_cues,
-                        source_message_id,
-                    )
-                    .await
-                    else {
-                        crate::model::finish(ticket).await;
-                        return Ok(silent_with_interaction_cues(
+                    });
+                    if let Some(intents) = core_tool_intents {
+                        let Some(tool_plan) = register_core_tool_intents(
+                            &self.tool_turns,
                             input,
+                            &mind_projection,
+                            intents,
+                            ticket,
                             parsed_response.interaction_cues,
-                        ));
-                    };
-                    crate::model::finish(ticket).await;
-                    return Ok(tool_plan);
-                }
-            }
-            if tool_follow_up
-                && tool_protocol_authorized
-                && let Some(action_scope) = action_scope
-                && let Some((intents, visible_suffix)) = parse_core_tool_intents_with_visible_suffix(
-                    &parsed_response.content,
-                    action_scope,
-                    tool_notification_policy,
-                )
-            {
-                let visible_plan =
-                    ReplyPlan::from_model_output(conversation.scope(), &visible_suffix).await;
-                if core_plan_has_visible_text(&visible_plan)
-                    && let Some(reply_intent) =
-                        visible_reply_intent(reply_target, visible_plan.content)
-                    && let Some(mut tool_plan) = register_core_tool_intents(
-                        &self.tool_turns,
-                        input,
-                        &mind_projection,
-                        intents,
-                        ticket,
-                        parsed_response.interaction_cues,
-                        source_message_id,
-                    )
-                    .await
-                {
-                    tool_plan.intents.push(reply_intent);
-                    crate::model::finish(ticket).await;
-                    kovi::log::warn!(
-                        "Yunxi Core mixed tool/reply protocol recovered: event_id={} message_id={} conversation_id={} tool_follow_up=true",
-                        input.event.id(),
-                        message_id_for_log(input),
-                        conversation_id_for_log(input),
-                    );
-                    return Ok(tool_plan);
-                }
-            }
-            let invalid_tool_output = if parsed_response.content.contains(CORE_TOOL_CALL_START)
-                || parsed_response.content.contains(CORE_TOOL_CALL_END)
-            {
-                !tool_protocol_authorized
-                    || action_scope.is_none_or(|scope| {
-                        parse_core_tool_intents_with_policy(
-                            &parsed_response.content,
-                            scope,
-                            tool_notification_policy,
+                            source_message_id,
                         )
-                        .is_none()
-                    })
-            } else {
-                false
-            };
+                        .await
+                        else {
+                            crate::model::finish(ticket).await;
+                            return Ok(silent_with_interaction_cues(
+                                input,
+                                parsed_response.interaction_cues,
+                            ));
+                        };
+                        crate::model::finish(ticket).await;
+                        return Ok(tool_plan);
+                    }
+                }
+            }
+            // Legacy `[[TOOL_CALL]]` markers in visible output are never valid:
+            // tool requests are provider-native calls only, so such text is
+            // treated as invalid protocol and kept out of user-facing content.
+            let invalid_tool_output = parsed_response.content.contains(CORE_TOOL_CALL_START)
+                || parsed_response.content.contains(CORE_TOOL_CALL_END);
             let mut mind_output_eligible =
                 !fallback_response && !intrinsic_response && !invalid_tool_output;
             let mut mind_candidates = eligible_mind_candidates(
@@ -5632,7 +5395,6 @@ impl ModelBackend for KoviModelBackend {
             } else {
                 ReplyPlan::from_model_output(conversation.scope(), "").await
             };
-            let mut repair_attempted = false;
             if invalid_tool_output
                 && reply_recovery_required(input, tool_follow_up)
                 && is_current(ticket).await
@@ -5640,7 +5402,6 @@ impl ModelBackend for KoviModelBackend {
                 && !intrinsic_response
                 && (explicit_message_count.is_none() || tool_intent)
             {
-                repair_attempted = true;
                 mind_candidates = MindCandidates::default();
                 kovi::log::warn!(
                     "Yunxi Core reply repair: event_id={} message_id={} conversation_id={} reason=invalid_tool_protocol",
@@ -5653,8 +5414,6 @@ impl ModelBackend for KoviModelBackend {
                     ticket,
                     conversation.scope(),
                     tool_protocol_authorized,
-                    action_scope,
-                    tool_notification_policy,
                     &vision_images,
                 )
                 .await
@@ -5669,118 +5428,7 @@ impl ModelBackend for KoviModelBackend {
                             conversation_id_for_log(input),
                         );
                     }
-                    Ok(CoreDirectRepair::Tool(intents)) => {
-                        mind_output_eligible = false;
-                        if let Some(tool_plan) = register_core_tool_intents(
-                            &self.tool_turns,
-                            input,
-                            &mind_projection,
-                            intents,
-                            ticket,
-                            parsed_response.interaction_cues,
-                            source_message_id,
-                        )
-                        .await
-                        {
-                            crate::model::finish(ticket).await;
-                            kovi::log::info!(
-                                "Yunxi Core reply repair produced tool action: event_id={} message_id={} conversation_id={} reason=invalid_tool_protocol",
-                                input.event.id(),
-                                message_id_for_log(input),
-                                conversation_id_for_log(input),
-                            );
-                            return Ok(tool_plan);
-                        }
-                        kovi::log::warn!(
-                            "Yunxi Core required reply unresolved: event_id={} message_id={} conversation_id={} reason=repair_tool_registration_failed",
-                            input.event.id(),
-                            message_id_for_log(input),
-                            conversation_id_for_log(input),
-                        );
-                        plan = ReplyPlan::from_model_output(conversation.scope(), "").await;
-                    }
-                    Err(failure) => {
-                        mind_output_eligible = false;
-                        kovi::log::warn!(
-                            "Yunxi Core required reply unresolved: event_id={} message_id={} conversation_id={} reason=invalid_tool_protocol_repair_{}",
-                            input.event.id(),
-                            message_id_for_log(input),
-                            conversation_id_for_log(input),
-                            failure.as_log_reason(),
-                        );
-                        plan = ReplyPlan::from_model_output(conversation.scope(), "").await;
-                    }
-                }
-            }
-            if strong_reply_repair_needed(
-                core_plan_has_visible_text(&plan),
-                reply_recovery_required(input, tool_follow_up),
-                fallback_response,
-                intrinsic_response,
-                explicit_message_count,
-                repair_attempted,
-            ) && is_current(ticket).await
-            {
-                mind_candidates = MindCandidates::default();
-                kovi::log::warn!(
-                    "Yunxi Core reply repair: event_id={} message_id={} conversation_id={} reason=empty_or_nonsemantic_plan disposition={:?} tool_intent={}",
-                    input.event.id(),
-                    message_id_for_log(input),
-                    conversation_id_for_log(input),
-                    plan.disposition,
-                    tool_intent,
-                );
-                match repair_direct_reply(
-                    &messages,
-                    ticket,
-                    conversation.scope(),
-                    tool_protocol_authorized,
-                    action_scope,
-                    tool_notification_policy,
-                    &vision_images,
-                )
-                .await
-                {
-                    Ok(CoreDirectRepair::Reply(repaired)) => {
-                        mind_output_eligible = false;
-                        plan = repaired;
-                        kovi::log::info!(
-                            "Yunxi Core reply repair succeeded: event_id={} message_id={} conversation_id={}",
-                            input.event.id(),
-                            message_id_for_log(input),
-                            conversation_id_for_log(input),
-                        );
-                    }
-                    Ok(CoreDirectRepair::Tool(intents)) => {
-                        mind_output_eligible = false;
-                        if let Some(tool_plan) = register_core_tool_intents(
-                            &self.tool_turns,
-                            input,
-                            &mind_projection,
-                            intents,
-                            ticket,
-                            parsed_response.interaction_cues,
-                            source_message_id,
-                        )
-                        .await
-                        {
-                            crate::model::finish(ticket).await;
-                            kovi::log::info!(
-                                "Yunxi Core reply repair produced tool action: event_id={} message_id={} conversation_id={}",
-                                input.event.id(),
-                                message_id_for_log(input),
-                                conversation_id_for_log(input),
-                            );
-                            return Ok(tool_plan);
-                        }
-                        kovi::log::warn!(
-                            "Yunxi Core required reply unresolved: event_id={} message_id={} conversation_id={} reason=repair_tool_registration_failed",
-                            input.event.id(),
-                            message_id_for_log(input),
-                            conversation_id_for_log(input),
-                        );
-                        plan = ReplyPlan::from_model_output(conversation.scope(), "").await;
-                    }
+
                     Err(failure) => {
                         mind_output_eligible = false;
                         kovi::log::warn!(
@@ -6251,9 +5899,7 @@ mod tests {
         intrinsic_output_is_unsafe, intrinsic_prompt, is_plain_text_batch_data_context,
         keeps_existing_prepared_plan, message_id_for_log, mind_context_messages,
         mind_outgoing_fence_required, parse_autonomous_intent_response, parse_core_response,
-        parse_core_tool_intent, parse_core_tool_intents, parse_core_tool_intents_with_policy,
-        parse_core_tool_intents_with_visible_suffix, parse_direct_repair_output,
-        parse_direct_repair_output_with_policy, parse_intrinsic_autonomous_directive,
+        parse_direct_repair_output, parse_intrinsic_autonomous_directive,
         parse_plain_core_response, parse_qq_conversation, plain_text_batch_message_prompt,
         plain_text_batch_repair_context, pre_model_plan, prepared_outgoing_semantic_context,
         purge_group_routes_from_cache, recent_conversation_messages,
@@ -6982,36 +6628,6 @@ mod tests {
     }
 
     #[test]
-    fn core_response_notification_policy_is_explicit_and_propagates_to_tools() {
-        let conversation_id = ConversationId::new();
-        let parsed = parse_core_response(
-            r#"[[INTERACTION_CUES]]{"tool_notification_policy":"each_and_final"}[[/INTERACTION_CUES]][[TOOL_CALL]]{"name":"time.now","arguments":{}}[[/TOOL_CALL]][[TOOL_CALL]]{"name":"web.search","arguments":{"query":"猫眼星云"}}[[/TOOL_CALL]]"#,
-        );
-        assert_eq!(
-            parsed.tool_notification_policy,
-            ToolNotificationPolicy::EachAndFinal
-        );
-        let intents = parse_core_tool_intents_with_policy(
-            &parsed.content,
-            ActionScope::Conversation(conversation_id),
-            parsed.tool_notification_policy,
-        )
-        .expect("valid tool sequence");
-        assert_eq!(intents.len(), 2);
-        assert!(intents.iter().all(|intent| {
-            intent.tool_notification_policy() == Some(ToolNotificationPolicy::EachAndFinal)
-        }));
-
-        let invalid = parse_core_response(
-            r#"[[INTERACTION_CUES]]{"tool_notification_policy":"sometimes"}[[/INTERACTION_CUES]]reply"#,
-        );
-        assert_eq!(
-            invalid.tool_notification_policy,
-            ToolNotificationPolicy::Final
-        );
-    }
-
-    #[test]
     fn core_tool_protocol_diagnostic_is_bounded_and_structured() {
         let content = format!(
             "[[TOOL_CALL]]{{\"name\":\"weather.current\",\"arguments\":{{}}}}[[/TOOL_CALL]] 说明 {} [[TOOL_CALL]]",
@@ -7027,59 +6643,6 @@ mod tests {
         assert!(!diagnostic.contains("private-model-output"));
         assert!(!diagnostic.contains("weather.current"));
         assert!(diagnostic.len() < 128);
-    }
-
-    #[test]
-    fn mixed_tool_result_output_recovers_valid_calls_and_visible_suffix() {
-        let scope = ActionScope::Conversation(ConversationId::new());
-        let parsed = parse_core_tool_intents_with_visible_suffix(
-            "[[TOOL_CALL]]{\"name\":\"web.search\",\"arguments\":{\"query\":\"猫眼星云\"}}[[/TOOL_CALL]] 成都今天晴间多云。",
-            scope,
-            ToolNotificationPolicy::Each,
-        )
-        .expect("leading tool call and visible suffix should be recoverable");
-        assert_eq!(parsed.0.len(), 1);
-        assert_eq!(parsed.1, "成都今天晴间多云。");
-        assert_eq!(
-            parsed.0[0].tool_notification_policy(),
-            Some(ToolNotificationPolicy::Each)
-        );
-
-        assert!(parse_core_tool_intents_with_visible_suffix(
-            "[[TOOL_CALL]]{\"name\":\"web.search\",\"arguments\":{}}[[/TOOL_CALL]] 文本 [[TOOL_CALL]]",
-            scope,
-            ToolNotificationPolicy::Each,
-        )
-        .is_none());
-    }
-
-    #[test]
-    fn unclosed_single_tool_call_is_accepted_as_implicitly_closed() {
-        let scope = ActionScope::Global;
-        let parsed = parse_core_tool_intents_with_policy(
-            r#"[[TOOL_CALL]]{"name":"time.now","arguments":{"timezone":"UTC"}}"#,
-            scope,
-            ToolNotificationPolicy::Final,
-        )
-        .expect("a single unclosed clean tool call should be accepted");
-        assert_eq!(parsed.len(), 1);
-        // A truncated payload or mixed markers is still rejected.
-        assert!(
-            parse_core_tool_intents_with_policy(
-                "[[TOOL_CALL]]{\"name\":\"time.now\"",
-                scope,
-                ToolNotificationPolicy::Final,
-            )
-            .is_none()
-        );
-        assert!(
-            parse_core_tool_intents_with_policy(
-                "[[TOOL_CALL]]{\"name\":\"time.now\",\"arguments\":{}} 你好",
-                scope,
-                ToolNotificationPolicy::Final,
-            )
-            .is_none()
-        );
     }
 
     #[test]
@@ -8514,7 +8077,6 @@ mod tests {
         let runtime = kovi::tokio::runtime::Runtime::new().expect("test runtime");
         runtime.block_on(async {
             let scope = ReplyScope::Private(9_370_100);
-            let action_scope = ActionScope::Conversation(ConversationId::new());
             for candidate in [
                 "",
                 "-",
@@ -8528,7 +8090,7 @@ mod tests {
                 "  抱歉，模型服务暂时不可用（上游超时）。",
             ] {
                 assert!(
-                    parse_direct_repair_output(candidate, scope, true, Some(action_scope))
+                    parse_direct_repair_output(candidate, scope)
                         .await
                         .is_err(),
                     "repair candidate must be rejected: {candidate:?}"
@@ -8536,52 +8098,27 @@ mod tests {
             }
 
             let valid =
-                parse_direct_repair_output("可以，我来处理。", scope, true, Some(action_scope))
+                parse_direct_repair_output("可以，我来处理。", scope)
                     .await
                     .expect("ordinary repair text should be accepted");
-            let CoreDirectRepair::Reply(plan) = valid else {
-                panic!("ordinary repair text must become a visible reply");
-            };
+            let CoreDirectRepair::Reply(plan) = valid;
             assert!(plan.has_visible_reply());
             assert!(!plan.is_silent());
 
-            let ordinary_json =
-                parse_direct_repair_output("{\"answer\":\"你好\"}", scope, true, Some(action_scope))
-                    .await
-                    .expect("ordinary JSON-shaped prose is not a transport protocol");
-            let CoreDirectRepair::Reply(plan) = ordinary_json else {
-                panic!("ordinary JSON-shaped prose must remain visible text");
-            };
+            let ordinary_json = parse_direct_repair_output("{\"answer\":\"你好\"}", scope)
+                .await
+                .expect("ordinary JSON-shaped prose is not a transport protocol");
+            let CoreDirectRepair::Reply(plan) = ordinary_json;
             assert_eq!(plan.content, "{\"answer\":\"你好\"}");
 
-            let tool = parse_direct_repair_output(
-                "[[TOOL_CALL]]{\"name\":\"time.now\",\"arguments\":{}}[[/TOOL_CALL]]\n[[TOOL_CALL]]{\"name\":\"web.search\",\"arguments\":{\"query\":\"猫眼星云\"}}[[/TOOL_CALL]]",
-                scope,
-                true,
-                Some(action_scope),
-            )
-            .await
-            .expect("valid repair tool call should be accepted");
-            let CoreDirectRepair::Tool(intents) = tool else {
-                panic!("valid repair tool calls must become tool intents");
-            };
-            assert_eq!(intents.len(), 2);
-
-            let tool = parse_direct_repair_output_with_policy(
-                "[[TOOL_CALL]]{\"name\":\"time.now\",\"arguments\":{}}[[/TOOL_CALL]]",
-                scope,
-                true,
-                Some(action_scope),
-                ToolNotificationPolicy::Each,
-            )
-            .await
-            .expect("repair should preserve the original request policy");
-            let CoreDirectRepair::Tool(intents) = tool else {
-                panic!("valid repair tool call must become a tool intent");
-            };
-            assert_eq!(
-                intents[0].tool_notification_policy(),
-                Some(ToolNotificationPolicy::Each)
+            assert!(
+                parse_direct_repair_output(
+                    "[[TOOL_CALL]]{\"name\":\"time.now\",\"arguments\":{}}[[/TOOL_CALL]]\n[[TOOL_CALL]]{\"name\":\"web.search\",\"arguments\":{\"query\":\"猫眼星云\"}}[[/TOOL_CALL]]",
+                    scope,
+                )
+                .await
+                .is_err(),
+                "repair never accepts legacy tool markers"
             );
         });
     }
@@ -8592,7 +8129,7 @@ mod tests {
         runtime.block_on(async {
             let scope = ReplyScope::Private(9_370_101);
             assert!(matches!(
-                parse_direct_repair_output("[sp]", scope, false, None).await,
+                parse_direct_repair_output("[sp]", scope).await,
                 Err(super::CoreDirectRepairFailure::SilentOrInvisibleReply)
             ));
             let empty = ReplyPlan::from_model_output(scope, "").await;
@@ -8679,20 +8216,6 @@ mod tests {
     }
 
     #[test]
-    fn core_response_cue_prefix_is_removed_before_tool_parsing() {
-        let conversation_id = ConversationId::new();
-        let parsed = parse_core_response(
-            r#"[[INTERACTION_CUES]]{"sentiment_valence_milli":0,"sentiment_arousal_milli":200,"gratitude_milli":0}[[/INTERACTION_CUES]][[TOOL_CALL]]{"name":"time.now","arguments":{"timezone":"UTC"}}[[/TOOL_CALL]]"#,
-        );
-
-        assert!(
-            parse_core_tool_intent(&parsed.content, ActionScope::Conversation(conversation_id),)
-                .is_some()
-        );
-        assert!(!parsed.content.contains("INTERACTION_CUES"));
-    }
-
-    #[test]
     fn same_completion_keep_suppresses_its_new_tool_plan() {
         let runtime = kovi::tokio::runtime::Runtime::new().expect("test runtime");
         runtime.block_on(async {
@@ -8722,14 +8245,6 @@ mod tests {
             assert_eq!(refined.ticket, initial.ticket);
             assert!(refined.preserved_prepared);
             assert!(keeps_existing_prepared_plan(Some(refined)));
-            assert!(
-                parse_core_tool_intent(
-                    &parsed.content,
-                    ActionScope::Conversation(ConversationId::new()),
-                )
-                .is_some(),
-                "the candidate really is a tool plan; Keep must suppress it before parsing"
-            );
             assert!(commit_outgoing(prepared).await);
             mark_outgoing_failed(prepared).await;
             crate::model::finish(initial.ticket).await;
@@ -8925,52 +8440,6 @@ mod tests {
             .expect("cue events are handled locally");
         assert!(cue_plan.intents.is_empty());
         assert_eq!(cue_plan.state_updates.len(), 2);
-    }
-
-    #[test]
-    fn core_tool_protocol_is_strict_and_scope_bound() {
-        let conversation_id = ConversationId::new();
-        let intent = parse_core_tool_intent(
-            r#"[[TOOL_CALL]]{"name":"time.now","arguments":{"timezone":"UTC"}}[[/TOOL_CALL]]"#,
-            ActionScope::Conversation(conversation_id),
-        )
-        .expect("valid Core tool call should parse");
-        assert!(matches!(
-            intent,
-            CognitiveIntent::UseTool {
-                scope: ActionScope::Conversation(scope),
-                ..
-            } if scope == conversation_id
-        ));
-        assert!(
-            parse_core_tool_intent(
-                r#"请查一下 [[TOOL_CALL]]{"name":"time.now","arguments":{}}[[/TOOL_CALL]]"#,
-                ActionScope::Conversation(conversation_id),
-            )
-            .is_none()
-        );
-        let multiple = parse_core_tool_intents(
-            r#"[[TOOL_CALL]]{"name":"time.now","arguments":{}}[[/TOOL_CALL]][[TOOL_CALL]]{"name":"web.search","arguments":{"query":"猫眼星云"}}[[/TOOL_CALL]]"#,
-            ActionScope::Conversation(conversation_id),
-        )
-        .expect("a sequence of complete tool calls should parse");
-        assert_eq!(multiple.len(), 2);
-        assert!(parse_core_tool_intent(
-            r#"[[TOOL_CALL]]{"name":"time.now","arguments":{}}[[/TOOL_CALL]][[TOOL_CALL]]{"name":"web.search","arguments":{"query":"猫眼星云"}}[[/TOOL_CALL]]"#,
-            ActionScope::Conversation(conversation_id),
-        )
-        .is_none(), "the singular compatibility parser must not collapse calls");
-        for malformed in [
-            r#"[[TOOL_CALL]]{"name":"time.now","arguments":{}}[[/TOOL_CALL]]说明文字"#,
-            r#"说明文字[[TOOL_CALL]]{"name":"time.now","arguments":{}}[[/TOOL_CALL]]"#,
-            r#"[[TOOL_CALL]]坏的[[/TOOL_CALL]][[TOOL_CALL]]{"name":"time.now","arguments":{}}[[/TOOL_CALL]]"#,
-        ] {
-            assert!(
-                parse_core_tool_intents(malformed, ActionScope::Conversation(conversation_id))
-                    .is_none(),
-                "mixed or malformed tool output must be rejected: {malformed}"
-            );
-        }
     }
 
     #[test]
