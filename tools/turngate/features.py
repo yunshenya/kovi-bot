@@ -36,6 +36,12 @@ MAX_PENDING_FRAGMENTS = 4
 MAX_RECENT_TURNS = 4
 MAX_QUESTION_CHARS = 160
 
+# 与 crates/yunxi-core 的 TURN_GATE_FEATURE_VERSION 一致。
+TURN_GATE_FEATURE_VERSION = "char-2-5-v2/ctx-v0"
+
+# 结构化特征槽位总数 (与 crates/yunxi-core TURN_GATE_CONTEXT_FEATURES 一致)。
+CONTEXT_FEATURE_SLOTS = 24
+
 FIELD_MARKERS = {
     "current": "\u0001",
     "question": "\u0002",
@@ -67,6 +73,7 @@ CONTEXT_INDEX = [
     "policy_stop",
     "policy_erase",
 ]
+assert len(CONTEXT_INDEX) <= CONTEXT_FEATURE_SLOTS
 
 
 def fnv1a_32(data: bytes) -> int:

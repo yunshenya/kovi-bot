@@ -43,10 +43,11 @@ pub use turn_gate::{
     TURN_GATE_MAX_CURRENT_BYTES, TURN_GATE_MAX_CURRENT_CHARS, TURN_GATE_MAX_FRAGMENT_CHARS,
     TURN_GATE_MAX_PENDING_FRAGMENTS, TURN_GATE_MAX_QUESTION_CHARS, TURN_GATE_MAX_RECENT_TURNS,
     TURN_GATE_MAX_TEXT_FEATURE_COUNT, TURN_GATE_MAX_TEXT_FEATURES, TURN_GATE_NGRAM_MAX,
-    TURN_GATE_NGRAM_MIN, TextFeature, TurnCompletion, TurnGateEngine, TurnGateFeatures,
-    TurnGateInput, TurnGateManifest, TurnGateManifestAsset, TurnGateManifestError, TurnGateMetrics,
-    TurnGateMetricsSnapshot, TurnGateOutput, TurnPolicyOverride, TurnResponseDecision, TurnScope,
-    context_feature_index, extract_features, fnv1a_32, normalize_text,
+    TURN_GATE_NGRAM_MIN, TURN_GATE_WEIGHT_ABS_MAX, TextFeature, TurnCompletion, TurnGateEngine,
+    TurnGateFeatures, TurnGateInput, TurnGateLoadError, TurnGateManifest, TurnGateManifestAsset,
+    TurnGateManifestError, TurnGateMetrics, TurnGateMetricsSnapshot, TurnGateOutput,
+    TurnGateThresholds, TurnPolicyOverride, TurnResponseDecision, TurnScope, context_feature_index,
+    extract_features, fnv1a_32, normalize_text, serialize_weights,
 };
 
 /// Version identity is independent of a Rust process or a host provider.

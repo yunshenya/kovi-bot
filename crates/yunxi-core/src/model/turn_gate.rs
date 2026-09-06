@@ -13,6 +13,7 @@
 //! - 结构化特征: 固定位置布尔位 [`TURN_GATE_CONTEXT_FEATURES`]。
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
 
@@ -39,6 +40,8 @@ pub const TURN_GATE_MAX_TEXT_FEATURES: usize = 512;
 pub const TURN_GATE_MAX_TEXT_FEATURE_COUNT: u32 = 2;
 /// 结构化特征位置总数 (固定 ≤64,doc §5.2)。
 pub const TURN_GATE_CONTEXT_FEATURES: usize = 24;
+/// 权重的绝对值上限:超出视为损坏 (有限值校验,doc §6)。
+pub const TURN_GATE_WEIGHT_ABS_MAX: f32 = 1.0e6;
 /// 特征协议版本 (manifest 校验 + 训练器共享)。
 pub const TURN_GATE_FEATURE_VERSION: &str = "char-2-5-v2/ctx-v0";
 /// manifest 协议版本 (doc §6)。
@@ -427,51 +430,431 @@ fn merge_feature(target: &mut Vec<TextFeature>, feature: TextFeature) {
     target.push(feature);
 }
 
-/// 无权重时的引擎 (Phase 0):一律 abstain;Phase 1 加载校验后的权重后
-/// 提供真实分类。可用性由调用方检查,缺失时必须走现有回退路径。
-#[derive(Debug, Clone, Default)]
+/// 线性 TurnGate 引擎 (Phase 1):加载 manifest 校验后的权重做 softmax
+/// 分类,按校准阈值 + top-margin 输出 abstain(abstain 是运行时校准结果,
+/// 不是伪类别)。无权重时 [`TurnGateEngine::unavailable`] 一律 abstain,
+/// 调用方按 scope fallback (doc §5.3/§6)。
+#[derive(Debug, Clone)]
 pub struct TurnGateEngine {
-    model_version: &'static str,
+    model_version: String,
+    feature_version: String,
+    completion_weights: Vec<f32>,
+    completion_bias: Vec<f32>,
+    response_weights: Vec<f32>,
+    response_bias: Vec<f32>,
+    completion_labels: Vec<TurnCompletion>,
+    response_labels: Vec<TurnResponseDecision>,
+    thresholds: TurnGateThresholds,
+}
+
+/// 每标签/整体 abstain 阈值 (doc §5.3):阈值必须随 bundle 走,不能散落
+/// 在回复处理代码里。所有值都在 0..=1。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TurnGateThresholds {
+    /// completion head:top-1 概率达到该值才采用分类。
+    pub completion_confidence: f32,
+    /// completion head:top-1 与 top-2 概率差达到该值才采用。
+    pub completion_margin: f32,
+    pub response_answer: f32,
+    pub response_continue: f32,
+    pub response_ack: f32,
+    pub response_ignore: f32,
+    pub response_wait: f32,
+    /// response head:top-1 与 top-2 概率差达到该值才采用。
+    pub response_margin: f32,
+}
+
+impl Default for TurnGateThresholds {
+    fn default() -> Self {
+        Self {
+            completion_confidence: 0.60,
+            completion_margin: 0.15,
+            response_answer: 0.65,
+            response_continue: 0.60,
+            response_ack: 0.55,
+            response_ignore: 0.60,
+            response_wait: 0.50,
+            response_margin: 0.10,
+        }
+    }
+}
+
+impl TurnGateThresholds {
+    pub fn validate(&self) -> Result<(), TurnGateManifestError> {
+        let values = [
+            self.completion_confidence,
+            self.completion_margin,
+            self.response_answer,
+            self.response_continue,
+            self.response_ack,
+            self.response_ignore,
+            self.response_wait,
+            self.response_margin,
+        ];
+        if values
+            .iter()
+            .any(|value| !value.is_finite() || !(0.0..=1.0).contains(value))
+        {
+            return Err(TurnGateManifestError::Thresholds);
+        }
+        Ok(())
+    }
 }
 
 impl TurnGateEngine {
     pub const fn unavailable() -> Self {
         Self {
-            model_version: "none",
+            model_version: String::new(),
+            feature_version: String::new(),
+            completion_weights: Vec::new(),
+            completion_bias: Vec::new(),
+            response_weights: Vec::new(),
+            response_bias: Vec::new(),
+            completion_labels: Vec::new(),
+            response_labels: Vec::new(),
+            thresholds: TurnGateThresholds {
+                completion_confidence: 0.0,
+                completion_margin: 0.0,
+                response_answer: 0.0,
+                response_continue: 0.0,
+                response_ack: 0.0,
+                response_ignore: 0.0,
+                response_wait: 0.0,
+                response_margin: 0.0,
+            },
         }
     }
 
-    /// 当前实现固定不可用(无 bundle);返回 false 时调用方必须走
-    /// lexical/MinMind 或现有回复链的 fallback (doc §6 加载顺序)。
+    /// 无 bundle 时调用方必须走 lexical/MinMind 或现有回复链的 fallback。
     pub fn available(&self) -> bool {
-        false
+        !self.completion_weights.is_empty()
     }
 
-    pub fn feature_signature(&self) -> &'static str {
-        TURN_GATE_FEATURE_VERSION
+    pub fn feature_signature(&self) -> &str {
+        &self.feature_version
     }
 
-    pub fn model_version(&self) -> &'static str {
-        self.model_version
+    pub fn model_version(&self) -> &str {
+        &self.model_version
     }
 
-    pub fn classify_completion(&self, _input: &TurnGateInput) -> CompletionOutput {
+    pub fn thresholds(&self) -> TurnGateThresholds {
+        self.thresholds
+    }
+
+    /// 从权重构造 (训练器产物/测试);权重布局与 [`serialize_weights`]
+    /// 一致:completion_weights (buckets*C) + completion_bias (C) +
+    /// response_weights (buckets*R) + response_bias (R),全部 LE f32。
+    pub fn from_parts(
+        model_version: impl Into<String>,
+        feature_version: impl Into<String>,
+        weights: &[f32],
+        completion_labels: &[TurnCompletion],
+        response_labels: &[TurnResponseDecision],
+        thresholds: TurnGateThresholds,
+    ) -> Result<Self, TurnGateLoadError> {
+        let completion = completion_labels.len();
+        let response = response_labels.len();
+        if completion < 2 || response < 2 {
+            return Err(TurnGateLoadError::LabelCount);
+        }
+        if completion_labels.contains(&TurnCompletion::Abstain)
+            || response_labels.contains(&TurnResponseDecision::Abstain)
+        {
+            return Err(TurnGateLoadError::LabelCount);
+        }
+        let feature_dim = TURN_GATE_HASH_BUCKETS as usize + TURN_GATE_CONTEXT_FEATURES;
+        let expected = (feature_dim + 1) * completion + (feature_dim + 1) * response;
+        if weights.len() != expected {
+            return Err(TurnGateLoadError::WeightCount {
+                expected,
+                actual: weights.len(),
+            });
+        }
+        if weights
+            .iter()
+            .any(|weight| !weight.is_finite() || weight.abs() > TURN_GATE_WEIGHT_ABS_MAX)
+        {
+            return Err(TurnGateLoadError::NonFiniteWeights);
+        }
+        let completion_count = feature_dim * completion;
+        let response_start = completion_count + completion;
+        let response_count = feature_dim * response;
+        Ok(Self {
+            model_version: model_version.into(),
+            feature_version: feature_version.into(),
+            completion_weights: weights[..completion_count].to_vec(),
+            completion_bias: weights[completion_count..response_start].to_vec(),
+            response_weights: weights[response_start..response_start + response_count].to_vec(),
+            response_bias: weights[response_start + response_count..].to_vec(),
+            completion_labels: completion_labels.to_vec(),
+            response_labels: response_labels.to_vec(),
+            thresholds,
+        })
+    }
+
+    /// 从 `models/yunxi-turngate` 目录加载 bundle (doc §6 加载顺序):
+    /// manifest → 校验边界/特征版本 → 定位资产 → SHA-256+大小校验 →
+    /// 维度/有限值校验。任何失败都返回错误,调用方不得启动失败。
+    pub fn load_from_path(path: &std::path::Path) -> Result<Self, TurnGateLoadError> {
+        let manifest_path = path.join("manifest.toml");
+        let manifest_text = std::fs::read_to_string(&manifest_path).map_err(|error| {
+            TurnGateLoadError::ManifestRead {
+                path: manifest_path.clone(),
+                source: error,
+            }
+        })?;
+        let manifest: TurnGateManifest = toml::from_str(&manifest_text)
+            .map_err(|error| TurnGateLoadError::ManifestParse { error })?;
+        manifest.validate().map_err(TurnGateLoadError::Manifest)?;
+        let asset = manifest
+            .assets
+            .first()
+            .ok_or(TurnGateLoadError::AssetNotFound)?;
+        let asset_path = path.join(&asset.path);
+        let bytes = std::fs::read(&asset_path).map_err(|error| TurnGateLoadError::AssetRead {
+            path: asset_path.clone(),
+            source: error,
+        })?;
+        if let Some(expected_size) = asset.size_bytes
+            && expected_size != bytes.len() as u64
+        {
+            return Err(TurnGateLoadError::AssetSizeMismatch {
+                expected: expected_size,
+                actual: bytes.len() as u64,
+            });
+        }
+        let digest = hex_sha256(&bytes);
+        if digest != asset.sha256 {
+            return Err(TurnGateLoadError::AssetShaMismatch {
+                expected: asset.sha256.clone(),
+                actual: digest,
+            });
+        }
+        let weights = parse_weights_le(&bytes)?;
+        let mut completion_labels = Vec::with_capacity(manifest.completion_labels.len());
+        for label in &manifest.completion_labels {
+            match label.as_str() {
+                "flush_now" => completion_labels.push(TurnCompletion::FlushNow),
+                "hold_for_more" => completion_labels.push(TurnCompletion::HoldForMore),
+                _ => return Err(TurnGateLoadError::LabelCount),
+            }
+        }
+        let mut response_labels = Vec::with_capacity(manifest.response_labels.len());
+        for label in &manifest.response_labels {
+            match label.as_str() {
+                "answer" => response_labels.push(TurnResponseDecision::Answer),
+                "continue" => response_labels.push(TurnResponseDecision::Continue),
+                "ack" => response_labels.push(TurnResponseDecision::Ack),
+                "ignore" => response_labels.push(TurnResponseDecision::Ignore),
+                "wait" => response_labels.push(TurnResponseDecision::Wait),
+                _ => return Err(TurnGateLoadError::LabelCount),
+            }
+        }
+        Self::from_parts(
+            manifest.model_version.clone(),
+            manifest.feature_version.clone(),
+            &weights,
+            &completion_labels,
+            &response_labels,
+            manifest.thresholds,
+        )
+    }
+
+    /// 一次推理:特征 → 每标签 logit → softmax → 阈值+margin 校准。
+    /// 输入只作为数据;输出永远不携带可执行协议 (doc §4)。
+    pub fn classify_completion(&self, input: &TurnGateInput) -> CompletionOutput {
+        if !self.available() {
+            return CompletionOutput {
+                decision: TurnCompletion::Abstain,
+                confidence: 0.0,
+            };
+        }
+        let features = extract_features(input);
+        let logits = self.logits(&features, true);
+        let probabilities = softmax(&logits);
+        let (top, second) = top_two(&probabilities);
+        let decision = if probabilities[top] >= self.thresholds.completion_confidence
+            && probabilities[top] - second >= self.thresholds.completion_margin
+        {
+            self.completion_labels[top]
+        } else {
+            TurnCompletion::Abstain
+        };
         CompletionOutput {
-            decision: TurnCompletion::Abstain,
-            confidence: 0.0,
+            decision,
+            confidence: probabilities[top],
         }
     }
 
-    pub fn classify_response(&self, _input: &TurnGateInput) -> ResponseOutput {
-        ResponseOutput {
-            decision: TurnResponseDecision::Abstain,
-            confidence: 0.0,
+    pub fn classify_response(&self, input: &TurnGateInput) -> ResponseOutput {
+        if !self.available() {
+            return ResponseOutput {
+                decision: TurnResponseDecision::Abstain,
+                confidence: 0.0,
+            };
         }
+        let features = extract_features(input);
+        let logits = self.logits(&features, false);
+        let probabilities = softmax(&logits);
+        let (top, second) = top_two(&probabilities);
+        let threshold = match self.response_labels[top] {
+            TurnResponseDecision::Answer => self.thresholds.response_answer,
+            TurnResponseDecision::Continue => self.thresholds.response_continue,
+            TurnResponseDecision::Ack => self.thresholds.response_ack,
+            TurnResponseDecision::Ignore => self.thresholds.response_ignore,
+            TurnResponseDecision::Wait => self.thresholds.response_wait,
+            TurnResponseDecision::Abstain => 0.0,
+        };
+        let decision = if probabilities[top] >= threshold
+            && probabilities[top] - second >= self.thresholds.response_margin
+        {
+            self.response_labels[top]
+        } else {
+            TurnResponseDecision::Abstain
+        };
+        ResponseOutput {
+            decision,
+            confidence: probabilities[top],
+        }
+    }
+
+    fn logits(&self, features: &TurnGateFeatures, completion: bool) -> Vec<f32> {
+        let (weights, bias, labels) = if completion {
+            (
+                &self.completion_weights,
+                &self.completion_bias,
+                self.completion_labels.len(),
+            )
+        } else {
+            (
+                &self.response_weights,
+                &self.response_bias,
+                self.response_labels.len(),
+            )
+        };
+        let mut logits = bias.clone();
+        for feature in &features.text_features {
+            let row = feature.index as usize * labels;
+            for (label, logit) in logits.iter_mut().enumerate() {
+                *logit += weights[row + label] * feature.count as f32;
+            }
+        }
+        for position in &features.context_indices {
+            let row = (TURN_GATE_HASH_BUCKETS as usize + usize::from(*position)) * labels;
+            for (label, logit) in logits.iter_mut().enumerate() {
+                *logit += weights[row + label];
+            }
+        }
+        logits
     }
 }
 
+/// bundle 加载错误:任何失败都不得让 Core 启动失败 (doc §6),调用方
+/// 按现有路径 fallback。
+#[derive(Debug, Error)]
+pub enum TurnGateLoadError {
+    #[error("turn gate manifest read failed: {path}: {source}")]
+    ManifestRead {
+        path: std::path::PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("turn gate manifest parse failed: {error}")]
+    ManifestParse { error: toml::de::Error },
+    #[error("turn gate manifest invalid: {0}")]
+    Manifest(#[from] TurnGateManifestError),
+    #[error("turn gate bundle has no assets")]
+    AssetNotFound,
+    #[error("turn gate asset read failed: {path}: {source}")]
+    AssetRead {
+        path: std::path::PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("turn gate asset size mismatch: expected {expected}, actual {actual}")]
+    AssetSizeMismatch { expected: u64, actual: u64 },
+    #[error("turn gate asset sha256 mismatch: expected {expected}, actual {actual}")]
+    AssetShaMismatch { expected: String, actual: String },
+    #[error("turn gate weights must be f32 aligned")]
+    WeightParsing,
+    #[error("turn gate weight count mismatch: expected {expected}, actual {actual}")]
+    WeightCount { expected: usize, actual: usize },
+    #[error("turn gate weights contain non-finite or out-of-range values")]
+    NonFiniteWeights,
+    #[error("turn gate label sets must not contain abstain and must have >= 2 classes")]
+    LabelCount,
+}
+
+fn hex_sha256(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut hex = String::with_capacity(64);
+    for byte in digest {
+        hex.push_str(&format!("{byte:02x}"));
+    }
+    hex
+}
+
+/// 权重序列化 (仅训练器/测试使用;生产只读):与 [`TurnGateEngine::from_parts`]
+/// 的布局一一对应 (doc §6 二进制格式)。
+pub fn serialize_weights(
+    weights: &[f32],
+    completion_labels: usize,
+    response_labels: usize,
+) -> Vec<u8> {
+    let feature_dim = TURN_GATE_HASH_BUCKETS as usize + TURN_GATE_CONTEXT_FEATURES;
+    debug_assert_eq!(
+        weights.len(),
+        (feature_dim + 1) * (completion_labels + response_labels)
+    );
+    let mut bytes = Vec::with_capacity(weights.len() * 4);
+    for weight in weights {
+        bytes.extend_from_slice(&weight.to_le_bytes());
+    }
+    bytes
+}
+
+fn parse_weights_le(bytes: &[u8]) -> Result<Vec<f32>, TurnGateLoadError> {
+    if !bytes.len().is_multiple_of(4) {
+        return Err(TurnGateLoadError::WeightParsing);
+    }
+    let mut weights = Vec::with_capacity(bytes.len() / 4);
+    for chunk in bytes.chunks_exact(4) {
+        let value = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        if !value.is_finite() || value.abs() > TURN_GATE_WEIGHT_ABS_MAX {
+            return Err(TurnGateLoadError::NonFiniteWeights);
+        }
+        weights.push(value);
+    }
+    Ok(weights)
+}
+
+fn softmax(logits: &[f32]) -> Vec<f32> {
+    let max = logits.iter().cloned().fold(f32::MIN, f32::max);
+    let exp: Vec<f32> = logits.iter().map(|value| (value - max).exp()).collect();
+    let sum: f32 = exp.iter().sum();
+    exp.into_iter().map(|value| value / sum).collect()
+}
+
+fn top_two(probabilities: &[f32]) -> (usize, f32) {
+    let mut top = 0usize;
+    for index in 1..probabilities.len() {
+        if probabilities[index] > probabilities[top] {
+            top = index;
+        }
+    }
+    let second = probabilities
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| *index != top)
+        .map(|(_, value)| *value)
+        .fold(0.0f32, f32::max);
+    (top, second)
+}
+
 /// 训练器共享的 manifest 契约 (doc §6)。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TurnGateManifest {
     pub manifest_version: u16,
@@ -490,9 +873,19 @@ pub struct TurnGateManifest {
     pub completion_labels: Vec<String>,
     #[serde(default)]
     pub response_labels: Vec<String>,
+    /// abstain 校准策略 (doc §5.3);当前协议固定 "calibrated_threshold"。
+    #[serde(default = "default_abstain_policy")]
+    pub abstain: String,
+    /// 阈值必须随 bundle 走 (doc §5.3/§6)。
+    #[serde(default)]
+    pub thresholds: TurnGateThresholds,
     pub training_data_version: String,
     #[serde(default)]
     pub assets: Vec<TurnGateManifestAsset>,
+}
+
+fn default_abstain_policy() -> String {
+    "calibrated_threshold".to_owned()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -531,6 +924,10 @@ pub enum TurnGateManifestError {
     MaxQuestionChars { actual: usize },
     #[error("turn gate asset sha256 must be 64 lowercase hex chars")]
     AssetSha256,
+    #[error("turn gate thresholds must be finite and within 0..=1")]
+    Thresholds,
+    #[error("turn gate label sets or abstain policy must match the feature protocol")]
+    Labels,
 }
 
 impl TurnGateManifest {
@@ -594,6 +991,23 @@ impl TurnGateManifest {
         }) {
             return Err(TurnGateManifestError::AssetSha256);
         }
+        let expected_completion = ["flush_now", "hold_for_more"];
+        let expected_response = ["answer", "continue", "ack", "ignore", "wait"];
+        let completion_ok = self.completion_labels.len() == expected_completion.len()
+            && expected_completion
+                .iter()
+                .all(|label| self.completion_labels.contains(&label.to_string()));
+        let response_ok = self.response_labels.len() == expected_response.len()
+            && expected_response
+                .iter()
+                .all(|label| self.response_labels.contains(&label.to_string()));
+        if !completion_ok || !response_ok {
+            return Err(TurnGateManifestError::Labels);
+        }
+        if self.abstain != "calibrated_threshold" {
+            return Err(TurnGateManifestError::Labels);
+        }
+        self.thresholds.validate()?;
         Ok(())
     }
 }
@@ -672,6 +1086,7 @@ impl TurnGateMetrics {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn fnv1a_golden_vectors() {
@@ -1022,6 +1437,224 @@ mod tests {
     }
 
     #[test]
+    fn loaded_engine_classifies_and_abstains_by_calibration() {
+        let completion_labels = [TurnCompletion::FlushNow, TurnCompletion::HoldForMore];
+        let response_labels = [
+            TurnResponseDecision::Answer,
+            TurnResponseDecision::Continue,
+            TurnResponseDecision::Ack,
+            TurnResponseDecision::Ignore,
+            TurnResponseDecision::Wait,
+        ];
+        let feature_dim = TURN_GATE_HASH_BUCKETS as usize + TURN_GATE_CONTEXT_FEATURES;
+        let label_count = completion_labels.len() + response_labels.len();
+        let mut weights = vec![0.0f32; (feature_dim + 1) * label_count];
+        // 黄金样例 "我想问你一件事" 的第一个特征桶是 10123(见 golden 测试)。
+        let bucket: usize = 10123;
+        weights[bucket * 2] = 1.0; // completion: flush_now 正权重
+        // response 权重区起点 = feature_dim*2 (完成度权重) + 2 (完成度偏置)
+        let response_start = feature_dim * 2 + 2;
+        // 5 类 softmax 下 logit=3.0 → 置信度 ≈0.83 ≥ answer 阈值 0.65
+        weights[response_start + bucket * 5] = 3.0;
+
+        let engine = TurnGateEngine::from_parts(
+            "fixture-v0",
+            TURN_GATE_FEATURE_VERSION,
+            &weights,
+            &completion_labels,
+            &response_labels,
+            TurnGateThresholds::default(),
+        )
+        .expect("fixture weights must load");
+        assert!(engine.available());
+        let input = TurnGateInput {
+            current_text: "我想问你一件事".to_owned(),
+            recent_turns: vec![
+                RecentTurn::new(RecentTurnRole::User, "最近准备去哪里玩"),
+                RecentTurn::new(RecentTurnRole::Assistant, "还没有决定"),
+            ],
+            scope: TurnScope::Private,
+            conversation_active: true,
+            ..TurnGateInput::default()
+        };
+        let completion = engine.classify_completion(&input);
+        assert_eq!(completion.decision, TurnCompletion::FlushNow);
+        assert!(completion.confidence > 0.6);
+        let response = engine.classify_response(&input);
+        assert_eq!(response.decision, TurnResponseDecision::Answer);
+        assert!(response.confidence > 0.8);
+
+        // 弱权重:低于 confidence 阈值 → 校准 abstain,不得硬给决策。
+        let mut weak = vec![0.0f32; (feature_dim + 1) * label_count];
+        weak[bucket * 2] = 0.2;
+        let weak_engine = TurnGateEngine::from_parts(
+            "fixture-weak",
+            TURN_GATE_FEATURE_VERSION,
+            &weak,
+            &completion_labels,
+            &response_labels,
+            TurnGateThresholds::default(),
+        )
+        .expect("weak fixture must load");
+        assert_eq!(
+            weak_engine.classify_completion(&input).decision,
+            TurnCompletion::Abstain
+        );
+    }
+
+    #[test]
+    fn load_from_path_roundtrip_and_integrity_checks() {
+        let completion_labels = [TurnCompletion::FlushNow, TurnCompletion::HoldForMore];
+        let response_labels = [
+            TurnResponseDecision::Answer,
+            TurnResponseDecision::Continue,
+            TurnResponseDecision::Ack,
+            TurnResponseDecision::Ignore,
+            TurnResponseDecision::Wait,
+        ];
+        let feature_dim = TURN_GATE_HASH_BUCKETS as usize + TURN_GATE_CONTEXT_FEATURES;
+        let label_count = completion_labels.len() + response_labels.len();
+        let mut weights = vec![0.0f32; (feature_dim + 1) * label_count];
+        let bucket: usize = 10123;
+        weights[bucket * 2] = 1.0;
+        let bytes = serialize_weights(&weights, 2, 5);
+
+        let dir = std::env::temp_dir().join(format!("turgate-fixture-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let manifest = TurnGateManifest {
+            manifest_version: TURN_GATE_MANIFEST_VERSION,
+            model_id: "yunxi-turngate".to_owned(),
+            model_version: "fixture-v0".to_owned(),
+            algorithm: "hashed-char-ngram-logistic".to_owned(),
+            feature_version: TURN_GATE_FEATURE_VERSION.to_owned(),
+            hash_buckets: TURN_GATE_HASH_BUCKETS,
+            max_text_chars: TURN_GATE_MAX_CURRENT_CHARS,
+            max_pending_fragments: TURN_GATE_MAX_PENDING_FRAGMENTS,
+            max_pending_fragment_chars: TURN_GATE_MAX_FRAGMENT_CHARS,
+            max_recent_turns: TURN_GATE_MAX_RECENT_TURNS,
+            max_recent_turn_chars: TURN_GATE_MAX_FRAGMENT_CHARS,
+            max_question_chars: TURN_GATE_MAX_QUESTION_CHARS,
+            completion_labels: vec!["flush_now".to_owned(), "hold_for_more".to_owned()],
+            response_labels: vec![
+                "answer".to_owned(),
+                "continue".to_owned(),
+                "ack".to_owned(),
+                "ignore".to_owned(),
+                "wait".to_owned(),
+            ],
+            abstain: "calibrated_threshold".to_owned(),
+            thresholds: TurnGateThresholds::default(),
+            training_data_version: "fixture".to_owned(),
+            assets: vec![TurnGateManifestAsset {
+                path: "turn_gate.bin".to_owned(),
+                sha256: hex_sha256(&bytes),
+                size_bytes: Some(bytes.len() as u64),
+            }],
+        };
+        let manifest_text = toml::to_string(&manifest).expect("manifest toml");
+        std::fs::write(dir.join("manifest.toml"), manifest_text).expect("write manifest");
+        std::fs::write(dir.join("turn_gate.bin"), &bytes).expect("write weights");
+
+        let engine = TurnGateEngine::load_from_path(&dir).expect("bundle must load");
+        assert!(engine.available());
+        assert_eq!(engine.model_version(), "fixture-v0");
+
+        // 损坏:篡改一个字节 → SHA-256 不匹配。
+        let mut corrupted = bytes.clone();
+        corrupted[0] ^= 0xFF;
+        std::fs::write(dir.join("turn_gate.bin"), corrupted).expect("write corrupted");
+        assert!(matches!(
+            TurnGateEngine::load_from_path(&dir),
+            Err(TurnGateLoadError::AssetShaMismatch { .. })
+        ));
+
+        // 截断 → 大小不匹配。
+        std::fs::write(dir.join("turn_gate.bin"), &bytes[..bytes.len() - 16])
+            .expect("write truncated");
+        assert!(matches!(
+            TurnGateEngine::load_from_path(&dir),
+            Err(TurnGateLoadError::AssetSizeMismatch { .. })
+        ));
+
+        // 无 manifest → fail-soft 错误,调用方回退。
+        let empty = dir.join("empty");
+        std::fs::create_dir_all(&empty).expect("empty dir");
+        assert!(TurnGateEngine::load_from_path(&empty).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn inference_stays_within_loose_budget() {
+        let completion_labels = [TurnCompletion::FlushNow, TurnCompletion::HoldForMore];
+        let response_labels = [
+            TurnResponseDecision::Answer,
+            TurnResponseDecision::Continue,
+            TurnResponseDecision::Ack,
+            TurnResponseDecision::Ignore,
+            TurnResponseDecision::Wait,
+        ];
+        let feature_dim = TURN_GATE_HASH_BUCKETS as usize + TURN_GATE_CONTEXT_FEATURES;
+        let weights = vec![0.1f32; (feature_dim + 1) * 7];
+        let engine = TurnGateEngine::from_parts(
+            "bench",
+            TURN_GATE_FEATURE_VERSION,
+            &weights,
+            &completion_labels,
+            &response_labels,
+            TurnGateThresholds::default(),
+        )
+        .expect("bench weights");
+        let input = TurnGateInput {
+            current_text: "我想问你一件事".to_owned(),
+            recent_turns: vec![
+                RecentTurn::new(RecentTurnRole::User, "最近准备去哪里玩"),
+                RecentTurn::new(RecentTurnRole::Assistant, "还没有决定"),
+            ],
+            scope: TurnScope::Group,
+            ..TurnGateInput::default()
+        };
+        let mut samples = Vec::with_capacity(2_000);
+        let started = Instant::now();
+        for _ in 0..2_000 {
+            let _ = engine.classify_completion(&input);
+            let _ = engine.classify_response(&input);
+            samples.push(started.elapsed());
+        }
+        let total = started.elapsed();
+        assert!(
+            total < Duration::from_secs(5),
+            "inference too slow: {total:?}"
+        );
+        let mut sorted = samples.clone();
+        sorted.sort();
+        let p50 = sorted[1_000];
+        let p95 = sorted[1_900];
+        // 宽松下限说明:phase 1 验收目标是 2 核 P95 < 5ms,开发机只做
+        // 数量级检查,真实基准在 2 核机上跑。
+        println!("TurnGate bench: total={total:?} p50={p50:?} p95={p95:?}");
+        assert!(p95 < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn loads_trainer_produced_bundle_when_fixture_dir_present() {
+        // 端到端:tools/turngate/train.py 产出的 bundle 必须能被引擎加载并
+        // 分类。没有 fixture 目录时跳过(CI 不生成权重)。
+        let Ok(dir) = std::env::var("TURNGATE_FIXTURE_DIR") else {
+            return;
+        };
+        let engine = TurnGateEngine::load_from_path(std::path::Path::new(&dir))
+            .expect("trainer bundle must load");
+        assert!(engine.available());
+        let input = TurnGateInput {
+            current_text: "我想问你一件事".to_owned(),
+            ..TurnGateInput::default()
+        };
+        let _ = engine.classify_completion(&input);
+        let _ = engine.classify_response(&input);
+    }
+
+    #[test]
     fn metrics_count_redirects() {
         let metrics = TurnGateMetrics::default();
         metrics.record_request();
@@ -1063,6 +1696,8 @@ mod tests {
                 "wait".to_owned(),
             ],
             training_data_version: "local-dataset-v0".to_owned(),
+            abstain: "calibrated_threshold".to_owned(),
+            thresholds: TurnGateThresholds::default(),
             assets: vec![TurnGateManifestAsset {
                 path: "turn_gate.bin".to_owned(),
                 sha256: "a".repeat(64),
