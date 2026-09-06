@@ -75,5 +75,10 @@ label_provenance 人工复核、授权/可擦除/不自我闭环）。
   response head 并配对真实走向（OutcomeGuard），只记账
   （FP 误接/ FN 漏接/一致），`[model.turn_gate].response_mode`
   默认 shadow，**不改变任何路由**；bundle 缺失时整个影子零运行。
-- 待接线（Phase 4）：response head active（先私聊灰度）、
-  ConversationState 联动、群聊未点名 answer 走高精度阈值 + 预算。
+- Phase 4（已接线、默认休眠）：`response_mode="active"` 且 bundle 就绪
+  时,response head 的 Ignore/Wait 在群(未点名)与私聊入口抑制可见回复
+  (Abstain 不写入字段走原管线;被点名/视觉/教学/命令不受影响,
+  continue 仍走 ConversationState)。生产默认 shadow,未放置 bundle 时
+  门控零运行。
+- Phase 5(待办):真实数据校准 → 先私聊灰度 active,再群聊未点名
+  answer 高精度阈值 + 预算;新模型版本绑定 manifest 与评估。

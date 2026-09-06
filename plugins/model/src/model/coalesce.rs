@@ -30,6 +30,9 @@ pub(crate) struct TextBatch {
     pub(crate) sticker_reaction: bool,
     pub(crate) images: Vec<ImageAttachment>,
     pub(crate) message_ids: Vec<i32>,
+    /// Phase 4 门控:bundle 加载且 response_mode=active 时,response head
+    /// 对该批次的最终决策(仅高置信度,Abstain 不落入此字段)。
+    pub(crate) turn_gate_response: Option<yunxi_core::TurnResponseDecision>,
 }
 
 pub(crate) struct MessagePart {
@@ -180,11 +183,11 @@ where
         } else {
             legacy().await
         };
-        let batch = self
+        let mut batch = self
             .push_with_completion_policy(key, part, completion, BatchPolicy::from_config())
             .await?;
-        // Phase 3 影子:批次成型后用同一份(空白 pending)输入跑 response
-        // head,只记账不改变路由;真实走向由 handler 的 OutcomeGuard 配对。
+        // Phase 3/4:批次成型后用同一份(空白 pending)输入跑 response
+        // head——shadow 只记账;active 时连同决策写入 TextBatch 供门控。
         if let Some(runtime) = crate::yunxi::turn_gate_runtime::get() {
             let response_input = TurnGateInput {
                 current_text: batch.intent_text.clone(),
@@ -207,6 +210,9 @@ where
             };
             if let Some(output) = runtime.classify_response_shadow(&response_input) {
                 crate::yunxi::turn_gate_shadow::record_batch(context.scope, &output);
+                if runtime.response_gate_active() {
+                    batch.turn_gate_response = Some(output.decision);
+                }
             }
         }
         Some(batch)
@@ -276,6 +282,7 @@ where
                 sticker_reaction: part.sticker_reaction,
                 images: part.images,
                 message_ids: part.message_ids,
+                turn_gate_response: None,
             });
         }
 
@@ -362,6 +369,7 @@ where
             sticker_reaction: batch.sticker_reaction,
             images: batch.images,
             message_ids: batch.message_ids,
+            turn_gate_response: None,
         })
     }
 }
@@ -545,6 +553,7 @@ mod tests {
                         sticker_reaction: true,
                         images: Vec::new(),
                         message_ids: vec![101, 102],
+                        turn_gate_response: None,
                     })
                 );
             });

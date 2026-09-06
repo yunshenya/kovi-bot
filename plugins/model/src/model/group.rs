@@ -666,6 +666,7 @@ pub(crate) async fn group_message_event_after_ingress(
     } else {
         model_message
     };
+    let mut turn_gate_response = None;
     let (
         model_message,
         addressed_to_bot,
@@ -709,6 +710,7 @@ pub(crate) async fn group_message_event_after_ingress(
         else {
             return;
         };
+        turn_gate_response = combined.turn_gate_response;
         (
             combined.text,
             combined.addressed,
@@ -858,6 +860,22 @@ pub(crate) async fn group_message_event_after_ingress(
         );
         return;
     };
+    // Phase 4 门控(仅 response_mode=active 且 bundle 就绪):未点名的
+    // 批次被 response head 判 Ignore/Wait 时保持沉默;被点名/视觉/教学/
+    // 命令(primary_reply_expected)不受影响;Abstain 不写入字段按原路径。
+    if !primary_reply_expected
+        && crate::yunxi::turn_gate_runtime::response_gate_active_global()
+        && matches!(
+            turn_gate_response,
+            Some(yunxi_core::TurnResponseDecision::Ignore | yunxi_core::TurnResponseDecision::Wait)
+        )
+    {
+        println!(
+            "[INFO] TurnGate 门控：群聊批次保持沉默 (群组: {})",
+            group_id
+        );
+        return;
+    }
     if primary_reply_expected {
         if !stickers.is_empty()
             && let Err(error) = sticker_memory::record_usage(

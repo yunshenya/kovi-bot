@@ -15,7 +15,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use yunxi_core::{
-    InputCompletion, ResponseOutput, TurnCompletion, TurnGateEngine, TurnGateInput, TurnGateMetrics,
+    InputCompletion, ResponseOutput, TurnCompletion, TurnGateEngine, TurnGateInput,
+    TurnGateMetrics, TurnScope,
 };
 
 static HOST_RUNTIME: OnceLock<Arc<TurnGateHostRuntime>> = OnceLock::new();
@@ -152,6 +153,12 @@ impl TurnGateHostRuntime {
         completion
     }
 
+    /// Phase 4 门控:response_mode=active 且引擎可用时才把 response head
+    /// 的 Ignore/Wait 当作"不该发"约束(Abstain/无 bundle 走现有管线)。
+    pub(crate) fn response_gate_active(&self) -> bool {
+        config::get().model().turn_gate().response_mode() == "active" && self.engine_available()
+    }
+
     /// Phase 3 影子:取 response head 决策,不改变路由。bundle 不可用或
     /// `[model.turn_gate].response_mode=disabled` 时返回 None。
     pub(crate) fn classify_response_shadow(&self, input: &TurnGateInput) -> Option<ResponseOutput> {
@@ -188,8 +195,65 @@ pub(crate) fn install() -> Arc<TurnGateHostRuntime> {
     TurnGateHostRuntime::install()
 }
 
+/// `#turn-gate-status` 报告:引擎/模式/指标 + response head 影子分歧。
+pub(crate) fn turn_gate_status_report() -> String {
+    let Some(runtime) = get() else {
+        return "[TURNGATE] 运行时未安装".to_owned();
+    };
+    let turn_gate_cfg = config::get().model().turn_gate().clone();
+    let (completion, response) = (turn_gate_cfg.mode(), turn_gate_cfg.response_mode());
+    let engine = runtime
+        .engine
+        .lock()
+        .expect("turn gate engine lock")
+        .clone();
+    let mut lines = vec![
+        format!("[TURNGATE] completion={completion} response={response}"),
+        format!(
+            "engine_available={} bundle_dir={:?}",
+            runtime.engine_available(),
+            runtime.asset_dir,
+        ),
+    ];
+    if let Some(engine) = engine {
+        lines.push(format!(
+            "model_version={} feature_version={}",
+            engine.model_version(),
+            engine.feature_signature(),
+        ));
+    }
+    let metrics = runtime.metrics.snapshot();
+    lines.push(format!(
+        "completion_metrics: requests={} flush={} hold={} abstain={}",
+        metrics.requests,
+        metrics.completion_flush,
+        metrics.completion_hold,
+        metrics.completion_abstain,
+    ));
+    for (label, scope) in [("private", TurnScope::Private), ("group", TurnScope::Group)] {
+        let s = super::turn_gate_shadow::summary(scope);
+        lines.push(format!(
+            "shadow[{label}]: gate_reply={} gate_silent={} gate_abstain={} actual_replied={} actual_silent={} fp_would_reply_but_silent={} fn_would_silent_but_replied={} agreed={}",
+            s.gate_reply,
+            s.gate_silent,
+            s.gate_abstain,
+            s.actual_replied,
+            s.actual_silent,
+            s.would_reply_but_silent,
+            s.would_silent_but_replied,
+            s.agreed,
+        ));
+    }
+    lines.join("\n")
+}
+
 pub(crate) fn get() -> Option<Arc<TurnGateHostRuntime>> {
     HOST_RUNTIME.get().cloned()
+}
+
+/// 全局查询(handler 内无 runtime 句柄时使用)。
+pub(crate) fn response_gate_active_global() -> bool {
+    get().is_some_and(|runtime| runtime.response_gate_active())
 }
 
 #[cfg(test)]

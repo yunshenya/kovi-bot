@@ -212,6 +212,11 @@ pub(crate) async fn private_message_event_after_ingress(
         send_private_direct_response(&bot, user_id, initial_admission, report).await;
         return;
     }
+    if message.trim() == "#turn-gate-status" && sender_is_admin {
+        let report = crate::yunxi::turn_gate_runtime::turn_gate_status_report();
+        send_private_direct_response(&bot, user_id, initial_admission, report).await;
+        return;
+    }
     if is_group_admin_command(message) {
         println!(
             "[INFO] 私聊群聊专用命令已忽略 (用户: {}, 命令: {})",
@@ -515,6 +520,7 @@ pub(crate) async fn private_message_event_after_ingress(
             initial_recent_reference,
         );
     }
+    let mut turn_gate_response = None;
     let (
         model_message,
         plain_text,
@@ -561,6 +567,7 @@ pub(crate) async fn private_message_event_after_ingress(
         else {
             return;
         };
+        turn_gate_response = combined.turn_gate_response;
         (
             combined.text,
             combined.plain_text,
@@ -619,6 +626,18 @@ pub(crate) async fn private_message_event_after_ingress(
             "[INFO] 合并后的私聊消息请求停止当前回复 (用户: {})",
             user_id
         );
+        return;
+    }
+    // Phase 4 门控(仅 response_mode=active 且 bundle 就绪):私聊批次被判
+    // Ignore/Wait 时保持沉默;Abstain 不写入字段按原路径;命令类不经过此
+    // 分支(见上文 # 前缀直通)。
+    if crate::yunxi::turn_gate_runtime::response_gate_active_global()
+        && matches!(
+            turn_gate_response,
+            Some(yunxi_core::TurnResponseDecision::Ignore | yunxi_core::TurnResponseDecision::Wait)
+        )
+    {
+        println!("[INFO] TurnGate 门控：私聊批次保持沉默 (用户: {})", user_id);
         return;
     }
     let selected_recent_images = if images.is_empty() {
