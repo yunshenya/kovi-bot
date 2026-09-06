@@ -15,6 +15,7 @@ pub(crate) mod relevance;
 mod reply;
 mod reply_disposition;
 pub(crate) mod semantic;
+pub(crate) mod send_guard;
 mod thinking;
 pub(crate) mod tool_access;
 mod tracked_send;
@@ -38,7 +39,7 @@ pub(crate) use interrupt::{
     OutgoingState, commit_outgoing, mark_outgoing_sent, prepare_outgoing, test_outgoing_state,
 };
 pub(crate) use message_actions::{MessageDestination, ReplyPlan, normalize_legacy_message_text};
-pub(crate) use message_transport::MessageTransport;
+pub(crate) use message_transport::{MessageTransport, MessageTransportError};
 pub(crate) use model_gateway::ModelGateway;
 pub(crate) use recall::record_standalone_bot_message;
 pub(crate) use thinking::strip_thinking_notices;

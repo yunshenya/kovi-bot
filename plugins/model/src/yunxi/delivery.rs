@@ -39,6 +39,15 @@ use yunxi_core::{
     MAX_TOOL_RESULT_CHARS, MessageContent, MessageId, OpenLoopStore, PlatformId, ProposedAction,
     ReachOutIntent, ToolAction,
 };
+/// 判断一次发送失败是否像"群被禁言/被平台拒绝"(QQ sendMsg 的
+/// status=failed retcode=1200 / EventChecker Failed 一类)。只有确定拒绝
+/// (非 indeterminate)才进入退避,网络/超时类保持原重试语义。
+fn qq_rejection_looks_muted(error: &crate::model::MessageTransportError) -> bool {
+    let text = error.to_string();
+    text.contains("retcode=1200")
+        || text.contains("EventChecker Failed")
+        || (text.contains("sendMsg") && text.contains("status=failed"))
+}
 
 /// Concrete QQ destination after a canonical Core conversation has been
 /// resolved. The enum is intentionally private so platform identifiers do not
@@ -667,6 +676,24 @@ impl QqActionAdapter {
             }
             Err(error) => {
                 let indeterminate = error.is_indeterminate();
+                if !indeterminate && error.is_group_send_denied() {
+                    // 本地退避期间的跳过:发送方已记账,终态失败(不可重试)。
+                    return Err(ActionPortError::new(
+                        format!("qq_send_denied_backoff:{error}"),
+                        false,
+                    ));
+                }
+                if !indeterminate && qq_rejection_looks_muted(&error) {
+                    // QQ 侧禁言/风控:记录退避并标记不可重试,避免在禁言
+                    // 期间无限重试同一批回复。
+                    if let MessageDestination::Group(group_id) = destination.message_destination() {
+                        crate::model::send_guard::record_rejection(group_id).await;
+                    }
+                    return Err(ActionPortError::new(
+                        format!("qq_send_denied:{error}"),
+                        false,
+                    ));
+                }
                 if indeterminate {
                     if let Err(ledger_error) = durable_committed.mark_unknown().await {
                         kovi::log::warn!(

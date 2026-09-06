@@ -29,6 +29,10 @@ pub(crate) enum MessageTransportError {
     Indeterminate(ApiReturn),
     IndeterminateNoResponse,
     IndeterminateTimeout,
+    /// 该群处于发送被拒退避中(QQ 禁言/风控),发送被本地跳过。
+    GroupSendDenied {
+        group_id: i64,
+    },
 }
 
 impl MessageTransportError {
@@ -37,6 +41,12 @@ impl MessageTransportError {
             self,
             Self::Indeterminate(_) | Self::IndeterminateNoResponse | Self::IndeterminateTimeout
         )
+    }
+
+    /// 群发送被 QQ 拒绝且已记录退避(除 GroupSendDenied 这类本地跳过外,
+    /// 真实拒绝在调用方完成记账)。
+    pub(crate) const fn is_group_send_denied(&self) -> bool {
+        matches!(self, Self::GroupSendDenied { .. })
     }
 }
 
@@ -50,6 +60,9 @@ impl std::fmt::Display for MessageTransportError {
             Self::IndeterminateTimeout => formatter.write_str(
                 "Kovi API response timed out after request enqueue; delivery outcome is indeterminate",
             ),
+            Self::GroupSendDenied { group_id } => {
+                write!(formatter, "group {group_id} is in send-denied backoff")
+            }
             Self::Rejected(response) | Self::Indeterminate(response) => write!(
                 formatter,
                 "status={} retcode={} data={} echo={}",
@@ -121,6 +134,17 @@ impl<'a> MessageTransport<'a> {
         message: Message,
         include_payload: bool,
     ) -> Result<i32, MessageTransportError> {
+        // QQ 禁言/风控退避:到期前直接跳过群发送,不做无意义重试。
+        if let MessageDestination::Group(group_id) = destination
+            && crate::model::send_guard::is_send_rejected(group_id).await
+        {
+            kovi::log::info!(
+                "[MUTE] 群 {} 发送处于被拒退避,跳过可见消息: {:?}",
+                group_id,
+                message.to_human_string()
+            );
+            return Err(MessageTransportError::GroupSendDenied { group_id });
+        }
         if include_payload {
             let human_text = message.to_human_string();
             match destination {
@@ -138,6 +162,20 @@ impl<'a> MessageTransport<'a> {
 
         let response =
             request_api_response(&self.bot.api_tx, SendApi::new("send_msg", params)).await?;
+        // 记账:真实拒绝(status != ok) → 退避;成功 → 清除退避。
+        if let MessageDestination::Group(group_id) = destination {
+            if response.status != "ok" {
+                crate::model::send_guard::record_rejection(group_id).await;
+                kovi::log::warn!(
+                    "[MUTE] 群 {} 发送被拒 (status={} retcode={})，进入发送退避",
+                    group_id,
+                    response.status,
+                    response.retcode,
+                );
+            } else {
+                crate::model::send_guard::record_success(group_id).await;
+            }
+        }
         let message_id = response
             .data
             .get("message_id")

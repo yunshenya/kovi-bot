@@ -3290,6 +3290,9 @@ pub(crate) async fn is_group_paused(group_id: i64) -> bool {
         .await
         .get(&group_id)
         .unwrap_or(&false)
+        // 显式暂停(#禁言) 与发送被拒退避(QQ 禁言/风控)合并:任一生效都让
+        // 非管理员回复与 Core 发送安静下来;管理员命令不受影响。
+        || crate::model::send_guard::is_send_rejected(group_id).await
 }
 
 pub(crate) async fn set_group_paused(group_id: i64, paused: bool) {

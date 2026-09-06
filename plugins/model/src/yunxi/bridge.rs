@@ -34,6 +34,12 @@ use yunxi_core::{
     RelationStore, RuntimeConfig, RuntimeHandle, WorldEvent, WorldEventKind,
 };
 
+/// 控制面命令判断:以 # 开头的文本(禁言/授权/删除数据/状态命令等)永远
+/// 属于 Host 控制面,Core 只观察不决策(即使被接续通道宽松采样)。
+fn is_host_command_text(text: &str) -> bool {
+    text.trim_start().starts_with('#')
+}
+
 pub(crate) const CORE_INGRESS_CAPACITY: usize = 256;
 pub(crate) const MESSAGE_REFERENCE_CAPACITY: usize = 4_096;
 /// Upper bound for a visible host callback waiting for Core ingress space.
@@ -1423,6 +1429,10 @@ impl CoreBridge {
     /// path. Ordinary images are supported; control commands and other media
     /// stay on the Host handler so their specialized behavior remains.
     pub(crate) fn handles_private(&self, event: &PrivateMsgEvent) -> bool {
+        if event.borrow_text().is_some_and(is_host_command_text) {
+            // 私聊命令(#系统信息/#删除我的数据/#mind-status 等)留给 Host。
+            return false;
+        }
         core_cutover_enabled("YUNXI_CORE_PRIVATE_CUTOVER", true)
             && self.action_arbiter.is_some()
             && self.action_port.is_some()
@@ -1445,6 +1455,16 @@ impl CoreBridge {
         if !self.supports_group(event) {
             return GroupHandlingDecision {
                 handling: GroupCoreHandling::Unsupported,
+                planner_attention_requested: false,
+                explicit_batch_request: false,
+            };
+        }
+        // 控制面命令(#禁言/#授权群/#删除本群数据 等)始终留给 Host 处理。
+        // 它们通常很短(3-6 字),接续窗口/熟人放行的宽松通道会把它们误采样
+        // 进 Core,导致命令被当成聊天而失效。
+        if event.borrow_text().is_some_and(is_host_command_text) {
+            return GroupHandlingDecision {
+                handling: GroupCoreHandling::Observe,
                 planner_attention_requested: false,
                 explicit_batch_request: false,
             };
@@ -4696,6 +4716,16 @@ mod tests {
         assert!(!sample(&mut registry, 1));
         assert!(sample(&mut registry, 2));
         assert!(!sample(&mut registry, 3));
+    }
+
+    #[test]
+    fn hash_prefixed_messages_are_always_host_commands() {
+        assert!(super::is_host_command_text("#禁言"));
+        assert!(super::is_host_command_text("  #结束禁言"));
+        assert!(super::is_host_command_text("#删除本群数据"));
+        assert!(!super::is_host_command_text("你好"));
+        // 以 # 开头即视为命令文本(即使短);普通文本不受影响。
+        assert!(super::is_host_command_text("#不是命令"));
     }
 
     #[test]
