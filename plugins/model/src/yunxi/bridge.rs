@@ -181,16 +181,25 @@ impl AmbientAttentionRegistry {
         // 无论本轮是否采样,都把消息文本纳入本群近因窗口(有界),为后续
         // 的软注意力相关度提供"本群近况"。
         gate.remember(text);
-        // 接续窗口内的消息天然承接 bot 刚说的话,不等待消息地板;
-        // 窗口外仍要求足够多的群聊消息后再采样,避免高频插话。
-        if !continuation_active {
-            gate.eligible_messages_since_sample =
-                gate.eligible_messages_since_sample.saturating_add(1);
-            if gate.eligible_messages_since_sample < policy.min_eligible_messages {
-                return false;
-            }
-            gate.eligible_messages_since_sample = 0;
+        // 接续对话窗口内(芸汐刚在本群发过可见消息):**确定性**放行到
+        // 语义评估——"她说完了我就接"这类天然衔接不该被随机采样漏掉,
+        // 是否真的回复由评估模型(interjection_worthy)与 Core 判定把关。
+        // 该分支必须先于候选冷却与采样频率限制:触发 bot 回复的那次
+        // 采样几乎就发生在这几秒之前,而真实接续消息恰恰紧随其后,
+        // 若冷却(180s)与频率上限(3 次/600s)在前,窗口内的大多数
+        // 接续会被静默挡下,看起来就像 bot 刚作答就"装聋"。
+        // 窗口内不消费采样频率预算,避免连续接话提前耗光后续环境的
+        // 采样机会;只更新候选锚点,保持窗口外的节奏语义不变。
+        if continuation_active {
+            gate.last_candidate = Some(now);
+            return true;
         }
+        // 窗口外:仍要求足够多的群聊消息后再采样,避免高频插话。
+        gate.eligible_messages_since_sample = gate.eligible_messages_since_sample.saturating_add(1);
+        if gate.eligible_messages_since_sample < policy.min_eligible_messages {
+            return false;
+        }
+        gate.eligible_messages_since_sample = 0;
         if gate.last_candidate.is_some_and(|last| {
             now.duration_since(last) < Duration::from_secs(policy.candidate_cooldown_secs)
         }) {
@@ -206,16 +215,6 @@ impl AmbientAttentionRegistry {
         }
         if gate.decision_attempts.len() >= policy.decision_rate_limit {
             return false;
-        }
-
-        // 接续对话窗口内(芸汐刚在本群发过可见消息):**确定性**放行到
-        // 语义评估——"她说完了我就接"这类天然衔接不该被随机采样漏掉,
-        // 是否真的回复由评估模型(interjection_worthy)与 Core 判定把关;
-        // 窗口外回到软注意力调制的随机采样。
-        if continuation_active {
-            gate.last_candidate = Some(now);
-            gate.decision_attempts.push_back(now);
-            return true;
         }
 
         // 软注意力:与"本群近况"的相关性调制采样概率。同等条件下,还在
@@ -4574,6 +4573,52 @@ mod tests {
         assert!(message_length_passable(5, false, 5, true));
         assert!(!message_length_passable(3, false, 5, false));
         assert!(message_length_passable(0, true, 5, false));
+    }
+
+    #[test]
+    fn continuation_window_admits_followups_that_just_triggered_the_reply() {
+        // 真实场景:未点名消息"我有点疑问"被采样(bot 随即回复并开启接续
+        // 窗口),几秒后同一个人追问"如果/所有人都想错了…"。若候选冷却
+        // (180s)在前,这些瞬间到达的接续会被静默挡下,窗口内必须确定性放行。
+        let mut registry = super::AmbientAttentionRegistry::new();
+        let policy = super::AmbientAttentionPolicy {
+            enabled: true,
+            min_eligible_messages: 1,
+            candidate_cooldown_secs: 180,
+            response_probability_percent: 100,
+            min_message_chars: 4,
+            decision_rate_window_secs: 600,
+            decision_rate_limit: 3,
+        };
+        // 触发 bot 回复的那次采样,把 last_candidate 更新到"刚刚"。
+        assert!(registry.should_request(123, 1, "我有点疑问", false, false, policy));
+        // 几秒后紧跟的接续:窗口内,2 字短句也必须放行。
+        assert!(registry.should_request(123, 2, "如果", false, true, policy));
+        assert!(registry.should_request(123, 3, "所有人都想错了", false, true, policy));
+        assert!(registry.should_request(123, 4, "ai并不是未来呢", false, true, policy));
+    }
+
+    #[test]
+    fn continuation_window_admits_despite_exhausted_ambient_rate_budget() {
+        let mut registry = super::AmbientAttentionRegistry::new();
+        let policy = super::AmbientAttentionPolicy {
+            enabled: true,
+            min_eligible_messages: 1,
+            // 单独验证频率上限:把冷却设为 0,让连续采样只被 rate limit 挡住。
+            candidate_cooldown_secs: 0,
+            response_probability_percent: 100,
+            min_message_chars: 4,
+            decision_rate_window_secs: 600,
+            decision_rate_limit: 3,
+        };
+        // 先用完窗口外的采样频率预算(3 次/600s)。
+        assert!(registry.should_request(123, 1, "第一条消息", false, false, policy));
+        assert!(registry.should_request(123, 2, "第二条消息", false, false, policy));
+        assert!(registry.should_request(123, 3, "第三条消息", false, false, policy));
+        // 预算耗尽后,窗口内的接续仍确定性放行(不消费窗口外预算)。
+        assert!(registry.should_request(123, 4, "如果", false, true, policy));
+        // 窗口外行为不变:冷却/频率限制仍然生效。
+        assert!(!registry.should_request(123, 5, "第四条消息", false, false, policy));
     }
 
     #[test]
