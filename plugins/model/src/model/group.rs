@@ -282,6 +282,9 @@ pub(crate) async fn group_message_event_after_ingress(
         && (!stickers.is_empty() || has_reply(&event.message)))
     .then(|| event.message.clone());
     let reply_scope = ReplyScope::Group(group_id);
+    // Phase 3 影子:批次真实走向(回复/沉默)配对,不改变路由。
+    let mut shadow_guard =
+        crate::yunxi::turn_gate_shadow::OutcomeGuard::new(yunxi_core::TurnScope::Group);
     if event.user_id == event.self_id {
         println!(
             "[INFO] 忽略群聊自发消息回流 (群组: {}, 消息: {})",
@@ -902,6 +905,7 @@ pub(crate) async fn group_message_event_after_ingress(
             true,
         )
         .await;
+        shadow_guard.mark_replied(replied);
         finish_conversation_turn(group_id, event.user_id, turn_marker, replied).await;
         drain_pending_window_messages(group_id, Arc::clone(&bot), ticket).await;
     } else if continue_conversation {
@@ -952,6 +956,7 @@ pub(crate) async fn group_message_event_after_ingress(
             true,
         )
         .await;
+        shadow_guard.mark_replied(replied);
         finish_conversation_turn(group_id, event.user_id, turn_marker, replied).await;
         drain_pending_window_messages(group_id, Arc::clone(&bot), ticket).await;
     } else if sampled_for_interjection && understanding.interjection_worthy {
@@ -1006,6 +1011,7 @@ pub(crate) async fn group_message_event_after_ingress(
         )
         .await;
         finish_interjection_attempt(group_id, replied).await;
+        shadow_guard.mark_replied(replied);
         finish_conversation_turn(group_id, event.user_id, turn_marker, replied).await;
         drain_pending_window_messages(group_id, Arc::clone(&bot), ticket).await;
     } else if let Err(error) = MEMORY_MANAGER

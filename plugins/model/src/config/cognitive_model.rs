@@ -23,6 +23,9 @@ pub struct TurnGateConfig {
     mode: String,
     /// bundle 目录 (manifest.toml + turn_gate.bin),相对 WorkingDirectory。
     asset_dir: String,
+    /// response head (doc §8.2/§9 Phase 3-4):"shadow" 只记录不改变发送
+    /// (现默认);"active" 才允许 answer/continue/ack 参与路由(先私聊灰度)。
+    response_mode: String,
 }
 
 impl Default for TurnGateConfig {
@@ -31,6 +34,7 @@ impl Default for TurnGateConfig {
             enabled: true,
             mode: "active".to_owned(),
             asset_dir: "models/yunxi-turngate".to_owned(),
+            response_mode: "shadow".to_owned(),
         }
     }
 }
@@ -48,6 +52,10 @@ impl TurnGateConfig {
         self.asset_dir.as_str()
     }
 
+    pub fn response_mode(&self) -> &str {
+        self.response_mode.as_str()
+    }
+
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
             matches!(self.mode.as_str(), "disabled" | "shadow" | "active"),
@@ -56,6 +64,13 @@ impl TurnGateConfig {
         anyhow::ensure!(
             !self.asset_dir.trim().is_empty(),
             "model.turn_gate.asset_dir 不能为空"
+        );
+        anyhow::ensure!(
+            matches!(
+                self.response_mode.as_str(),
+                "disabled" | "shadow" | "active"
+            ),
+            "model.turn_gate.response_mode 必须是 disabled / shadow / active"
         );
         Ok(())
     }
@@ -215,6 +230,15 @@ mod tests {
     #[test]
     fn turn_gate_defaults_are_valid() {
         assert!(TurnGateConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn unknown_turn_gate_response_mode_is_rejected() {
+        let config = TurnGateConfig {
+            response_mode: "loud".to_owned(),
+            ..TurnGateConfig::default()
+        };
+        assert!(config.validate().is_err());
     }
 
     #[test]

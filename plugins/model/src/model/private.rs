@@ -588,6 +588,9 @@ pub(crate) async fn private_message_event_after_ingress(
         );
         return;
     }
+    // Phase 3 影子:私聊批次真实走向与 response head 配对。
+    let mut shadow_guard =
+        crate::yunxi::turn_gate_shadow::OutcomeGuard::new(yunxi_core::TurnScope::Private);
     let batch_recent_images = recent_private_images(user_id, &source_message_ids).await;
     let batch_request = UnderstandingRequest {
         message: intent_text.clone(),
@@ -752,6 +755,7 @@ pub(crate) async fn private_message_event_after_ingress(
         understanding,
     )
     .await;
+    shadow_guard.mark_replied(true);
     drain_pending_private_messages(user_id, Arc::clone(&bot), reply_ticket).await;
 }
 

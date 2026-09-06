@@ -71,5 +71,9 @@ label_provenance 人工复核、授权/可擦除/不自我闭环）。
   高置信度决策时直接决定 flush/hold（MiniMind 不再被调用），abstain 或
   无 bundle 时惰性回退现有 lexical + MiniMind 路径（**生产零影响直到
   放入第一个 bundle**），shadow 模式记录与现有路径的分歧。
-- 待接线（Phase 3/4）：response head shadow → active、ConversationState
-  联动、私聊/群聊统一走 response 决策。
+- Phase 3（已完成接线）：response head 进入 shadow——批次成型时跑
+  response head 并配对真实走向（OutcomeGuard），只记账
+  （FP 误接/ FN 漏接/一致），`[model.turn_gate].response_mode`
+  默认 shadow，**不改变任何路由**；bundle 缺失时整个影子零运行。
+- 待接线（Phase 4）：response head active（先私聊灰度）、
+  ConversationState 联动、群聊未点名 answer 走高精度阈值 + 预算。

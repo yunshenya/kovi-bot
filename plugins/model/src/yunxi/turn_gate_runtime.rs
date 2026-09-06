@@ -14,7 +14,9 @@ use crate::config;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
-use yunxi_core::{InputCompletion, TurnCompletion, TurnGateEngine, TurnGateInput, TurnGateMetrics};
+use yunxi_core::{
+    InputCompletion, ResponseOutput, TurnCompletion, TurnGateEngine, TurnGateInput, TurnGateMetrics,
+};
 
 static HOST_RUNTIME: OnceLock<Arc<TurnGateHostRuntime>> = OnceLock::new();
 
@@ -148,6 +150,19 @@ impl TurnGateHostRuntime {
             output.confidence,
         );
         completion
+    }
+
+    /// Phase 3 影子:取 response head 决策,不改变路由。bundle 不可用或
+    /// `[model.turn_gate].response_mode=disabled` 时返回 None。
+    pub(crate) fn classify_response_shadow(&self, input: &TurnGateInput) -> Option<ResponseOutput> {
+        if config::get().model().turn_gate().response_mode() == "disabled" {
+            return None;
+        }
+        let engine = self.engine.lock().expect("turn gate engine lock").clone()?;
+        if !engine.available() {
+            return None;
+        }
+        Some(engine.classify_response(input))
     }
 
     fn record_legacy(&self, completion: &InputCompletion) {

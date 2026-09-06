@@ -180,8 +180,36 @@ where
         } else {
             legacy().await
         };
-        self.push_with_completion_policy(key, part, completion, BatchPolicy::from_config())
-            .await
+        let batch = self
+            .push_with_completion_policy(key, part, completion, BatchPolicy::from_config())
+            .await?;
+        // Phase 3 影子:批次成型后用同一份(空白 pending)输入跑 response
+        // head,只记账不改变路由;真实走向由 handler 的 OutcomeGuard 配对。
+        if let Some(runtime) = crate::yunxi::turn_gate_runtime::get() {
+            let response_input = TurnGateInput {
+                current_text: batch.intent_text.clone(),
+                pending_user_fragments: Vec::new(),
+                recent_turns: Vec::new(),
+                scope: context.scope,
+                conversation_active: context.conversation_active,
+                bot_last_asked_question: None,
+                pending_outgoing: context.pending_outgoing,
+                pending_task: context.pending_task,
+                addressed_to_agent: batch.addressed,
+                replies_to_agent: context.replies_to_agent,
+                has_image: !batch.images.is_empty(),
+                has_sticker: batch.sticker_reaction,
+                policy_override: if batch.addressed || context.replies_to_agent {
+                    TurnPolicyOverride::MustReply
+                } else {
+                    TurnPolicyOverride::None
+                },
+            };
+            if let Some(output) = runtime.classify_response_shadow(&response_input) {
+                crate::yunxi::turn_gate_shadow::record_batch(context.scope, &output);
+            }
+        }
+        Some(batch)
     }
 
     #[cfg(test)]

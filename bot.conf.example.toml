@@ -192,6 +192,9 @@ max_model_attempts = 2
 enabled = true
 mode = "active"
 asset_dir = "models/yunxi-turngate"
+# response head 影子 (Phase 3):只记录"会怎么选"与真实走向的分歧,不改变
+# 发送;Phase 4 才会允许 answer/continue/ack 参与路由(先私聊灰度)。
+response_mode = "shadow"
 
 [message_batch]
 

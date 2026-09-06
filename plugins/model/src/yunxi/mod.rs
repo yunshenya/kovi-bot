@@ -22,6 +22,7 @@ pub(crate) mod qq;
 mod relation_store;
 mod schema;
 pub(crate) mod turn_gate_runtime; // TurnGate completion host runtime (Phase 2)
+pub(crate) mod turn_gate_shadow; // TurnGate response head shadow ledger (Phase 3)
 pub(crate) mod world_model; // World Model v4 host-side runtime (shadow)
 mod world_model_store; // World Model v4 persistence (infrastructure)
 
