@@ -43,6 +43,35 @@ Bundle 布局（`models/yunxi-turngate/`，生产由部署方放到稳定目录�
   feature_dim = 65536 + 24；维度与 manifest 相互校验，加载失败 fail-soft。
 - `THIRD_PARTY_NOTICES`：仅本地训练产物，无第三方模型依赖。
 
+## 线上采集与人工复核闭环 (doc §7.4)
+
+```bash
+# 1) 导出日志并采集候选(在服务器上运行,数据不出机器)
+journalctl -u kovi-bot.service --since "2026-09-07 00:00:00" \
+    | grep -E "\[group|\[send\]" > /tmp/tg-journal.txt
+python3 tools/turngate/collector.py --journal /tmp/tg-journal.txt \
+    --out datasets/review-batch-$(date +%Y%m%d).jsonl
+# 输出: pending 候选(schema v2), 弱标签 source=pseudo_lexical_v0,
+#       脱敏(URL/长数字), 不透明 source_key(删除屏障用)
+
+# 2) 人工复核(≥500 条/周 达成后产出第一版 v0.1 训练集)
+python3 tools/turngate/review.py --batch review-batch-*.jsonl --status
+python3 tools/turngate/review.py --batch review-batch-*.jsonl --mark 3 completion=flush_now response=answer
+python3 tools/turngate/review.py --batch review-batch-*.jsonl --export train_turngate-v0.1.jsonl --min-agreement 0.9
+
+# 3) 训练(默认仅人工复核/种子集; --include-pseudo 只做候选对比)
+python3 tools/turngate/train.py --data train_turngate-v0.1.jsonl \
+    --out models/yunxi-turngate --training-data-version local-dataset-v2
+# → 校验: TURNGATE_FIXTURE_DIR=... cargo test -p yunxi-core --lib loads_trainer_produced_bundle
+
+# 4) 部署 bundle(稳定目录,校验 manifest)+ shadow 观察 Phase 3 指标
+#    (私有 #turn-gate-status 查看 FP/FN),再切 completion active。
+```
+
+采集纪律 (doc §7.4 D): 默认不采集;原文只存待标注区;训练集不含
+QQ 号/昵称/URL;删除请求按 source_key 从未训练样本移除;模型更新=新版本+
+重新评估。
+
 ## 修改约定
 
 任一特征协议改动（归一化、n-gram、边界标记、桶数、结构化槽位）必须：

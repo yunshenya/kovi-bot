@@ -70,7 +70,13 @@ def softmax(logits: np.ndarray) -> np.ndarray:
     return exp / exp.sum(axis=1, keepdims=True)
 
 
-def load_dataset(path: Path):
+REVIEWED_SOURCES = {"human_consensus", "skeleton"}
+
+
+def load_dataset(path: Path, include_pseudo: bool = False):
+    """按来源过滤:默认只收人工复核/种子集;`--include-pseudo` 才收弱标签
+    候选 (doc §7.4 C:伪标签不得直接作为真值)。completion/response 为
+    null 的样本只用于人工复核,不进训练。"""
     samples = []
     for line in path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
@@ -78,13 +84,18 @@ def load_dataset(path: Path):
             continue
         sample = json.loads(line)
         assert sample.get("schema_version") == 2, "dataset schema_version must be 2"
+        source = sample.get("label_provenance", {}).get("source")
+        if source not in REVIEWED_SOURCES and not include_pseudo:
+            continue
         labels = sample["labels"]
+        if labels.get("completion") is None and labels.get("response") is None:
+            continue
         samples.append(
             (
                 sample["current_text"],
                 sample["context"],
-                labels["completion"],
-                labels["response"],
+                labels.get("completion"),
+                labels.get("response"),
             )
         )
     return samples
@@ -218,9 +229,11 @@ def main() -> int:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--val-frac", type=float, default=0.2)
     parser.add_argument("--training-data-version", default="local-dataset-v0")
+    parser.add_argument("--include-pseudo", action="store_true",
+                        help="把 pseudo_lexical_v0 弱标签一并纳入(仅候选,不建议直接训练)")
     args = parser.parse_args()
 
-    samples = load_dataset(args.data)
+    samples = load_dataset(args.data, args.include_pseudo)
     if len(samples) < 4:
         print(f"data too small: {len(samples)} samples", file=sys.stderr)
         return 1
@@ -228,20 +241,68 @@ def main() -> int:
     rng = np.random.default_rng(args.seed)
     contexts = [{"current_text": text, **ctx} for text, ctx, _, _ in samples]
     X = np.stack([feature_vector(ctx) for ctx in contexts])
-    y_c = np.array([COMPLETION_LABELS.index(c) for _, _, c, _ in samples], dtype=np.int64)
-    y_r = np.array([RESPONSE_LABELS.index(r) for _, _, _, r in samples], dtype=np.int64)
+    comp_idx = [i for i, (_, _, c, _) in enumerate(samples) if c is not None]
+    resp_idx = [i for i, (_, _, _, r) in enumerate(samples) if r is not None]
 
     n_val = max(1, int(len(samples) * args.val_frac))
     perm = rng.permutation(len(samples))
-    val_idx, train_idx = perm[:n_val], perm[n_val:]
-    X_train, X_val = X[train_idx], X[val_idx]
+    val_all, train_all = perm[n_val:], perm[:n_val]
+    train_positions = {i: j for j, i in enumerate(train_all)}
+    val_positions = {i: j for j, i in enumerate(val_all)}
+    X_train = X[train_all]
+    X_val = X[val_all]
 
-    W_c = train_head(X_train, _onehot(y_c[train_idx], len(COMPLETION_LABELS)), args.epochs, args.lr, rng=rng)
-    W_r = train_head(X_train, _onehot(y_r[train_idx], len(RESPONSE_LABELS)), args.epochs, args.lr, rng=rng)
+    comp_train_global = [i for i in comp_idx if i in train_positions]
+    comp_val_global = [i for i in comp_idx if i in val_positions]
+    resp_train_global = [i for i in resp_idx if i in train_positions]
+    resp_val_global = [i for i in resp_idx if i in val_positions]
+
+    if comp_train_global:
+        W_c = train_head(
+            X[[train_positions[i] for i in comp_train_global]],
+            _onehot(
+                np.array([COMPLETION_LABELS.index(samples[i][2]) for i in comp_train_global]),
+                len(COMPLETION_LABELS),
+            ),
+            args.epochs, args.lr, rng=rng,
+        )
+        cal_c = calibrate_thresholds(
+            W_c,
+            X[[val_positions[i] for i in comp_val_global]] if comp_val_global else X_val,
+            np.array([COMPLETION_LABELS.index(samples[i][2]) for i in comp_val_global])
+            if comp_val_global
+            else np.zeros(len(X_val), dtype=np.int64),
+            COMPLETION_LABELS,
+        )
+    else:
+        W_c = None
+        cal_c = {}
+
+    if resp_train_global:
+        W_r = train_head(
+            X[[train_positions[i] for i in resp_train_global]],
+            _onehot(
+                np.array([RESPONSE_LABELS.index(samples[i][3]) for i in resp_train_global]),
+                len(RESPONSE_LABELS),
+            ),
+            args.epochs, args.lr, rng=rng,
+        )
+        cal_r = calibrate_thresholds(
+            W_r,
+            X[[val_positions[i] for i in resp_val_global]] if resp_val_global else X_val,
+            np.array([RESPONSE_LABELS.index(samples[i][3]) for i in resp_val_global])
+            if resp_val_global
+            else np.zeros(len(X_val), dtype=np.int64),
+            RESPONSE_LABELS,
+        )
+    else:
+        W_r = None
+        cal_r = {}
 
     thresholds = dict(DEFAULT_THRESHOLDS)
-    cal_c = calibrate_thresholds(W_c, X_val, y_c[val_idx], COMPLETION_LABELS)
-    cal_r = calibrate_thresholds(W_r, X_val, y_r[val_idx], RESPONSE_LABELS)
+    if W_c is None and W_r is None:
+        print("no trainable labels (human-reviewed) found; use --include-pseudo? ", file=sys.stderr)
+        return 1
     thresholds["completion_confidence"] = cal_c.get(
         "flush_now", DEFAULT_THRESHOLDS["completion_confidence"]
     )
@@ -253,6 +314,8 @@ def main() -> int:
     thresholds["response_ignore"] = cal_r.get("ignore", DEFAULT_THRESHOLDS["response_ignore"])
     thresholds["response_wait"] = cal_r.get("wait", DEFAULT_THRESHOLDS["response_wait"])
 
+    W_c = W_c if W_c is not None else np.zeros((len(COMPLETION_LABELS), FEATURE_DIM + 1), dtype=np.float32)
+    W_r = W_r if W_r is not None else np.zeros((len(RESPONSE_LABELS), FEATURE_DIM + 1), dtype=np.float32)
     manifest = export_bundle(
         W_c,
         COMPLETION_LABELS,
@@ -263,7 +326,7 @@ def main() -> int:
         feats.TURN_GATE_FEATURE_VERSION,
         args.training_data_version,
     )
-    print(f"bundle written: {args.out} ({len(samples)} samples, {len(train_idx)} train / {n_val} val)")
+    print(f"bundle written: {args.out} ({len(samples)} samples, {len(train_all)} train / {n_val} val)")
     print(f"thresholds: {thresholds}")
     print(f"manifest sha: {manifest['assets'][0]['sha256'][:16]}…")
     return 0
