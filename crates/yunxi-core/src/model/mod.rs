@@ -7,6 +7,7 @@ pub mod intrinsic;
 mod manifest;
 mod media;
 mod tier;
+mod turn_gate;
 
 use serde::{Deserialize, Serialize};
 
@@ -36,6 +37,17 @@ pub use media::{
     validate_resolved_image,
 };
 pub use tier::CognitiveTier;
+pub use turn_gate::{
+    CompletionOutput, RecentTurn, RecentTurnRole, ResponseOutput, TURN_GATE_CONTEXT_FEATURES,
+    TURN_GATE_FEATURE_VERSION, TURN_GATE_HASH_BUCKETS, TURN_GATE_MANIFEST_VERSION,
+    TURN_GATE_MAX_CURRENT_BYTES, TURN_GATE_MAX_CURRENT_CHARS, TURN_GATE_MAX_FRAGMENT_CHARS,
+    TURN_GATE_MAX_PENDING_FRAGMENTS, TURN_GATE_MAX_QUESTION_CHARS, TURN_GATE_MAX_RECENT_TURNS,
+    TURN_GATE_MAX_TEXT_FEATURE_COUNT, TURN_GATE_MAX_TEXT_FEATURES, TURN_GATE_NGRAM_MAX,
+    TURN_GATE_NGRAM_MIN, TextFeature, TurnCompletion, TurnGateEngine, TurnGateFeatures,
+    TurnGateInput, TurnGateManifest, TurnGateManifestAsset, TurnGateManifestError, TurnGateMetrics,
+    TurnGateMetricsSnapshot, TurnGateOutput, TurnPolicyOverride, TurnResponseDecision, TurnScope,
+    context_feature_index, extract_features, fnv1a_32, normalize_text,
+};
 
 /// Version identity is independent of a Rust process or a host provider.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
