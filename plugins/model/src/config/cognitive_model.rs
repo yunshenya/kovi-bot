@@ -7,6 +7,58 @@ use yunxi_core::{IntrinsicRuntimeConfig, ModelFallbackPolicy, ModelMediaLimits};
 pub struct CognitiveModelConfig {
     intrinsic: IntrinsicConfig,
     fallback: ModelFallbackConfig,
+    turn_gate: TurnGateConfig,
+}
+
+/// TurnGate 完成度分类器 (Phase 2 接线, doc §8.2/§9):
+/// - mode = "active":TurnGate 优先决定 flush/hold; abstain 或无 bundle 时
+///   回退现有 lexical + MiniMind 路径;
+/// - mode = "shadow":仅记录 TurnGate 会怎么说与现有路径的分歧,不改变路由;
+/// - mode = "disabled":完全不参与。
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+#[serde(default)]
+pub struct TurnGateConfig {
+    enabled: bool,
+    /// "disabled" | "shadow" | "active"。
+    mode: String,
+    /// bundle 目录 (manifest.toml + turn_gate.bin),相对 WorkingDirectory。
+    asset_dir: String,
+}
+
+impl Default for TurnGateConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            mode: "active".to_owned(),
+            asset_dir: "models/yunxi-turngate".to_owned(),
+        }
+    }
+}
+
+impl TurnGateConfig {
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    pub fn mode(&self) -> &str {
+        self.mode.as_str()
+    }
+
+    pub fn asset_dir(&self) -> &str {
+        self.asset_dir.as_str()
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            matches!(self.mode.as_str(), "disabled" | "shadow" | "active"),
+            "model.turn_gate.mode 必须是 disabled / shadow / active"
+        );
+        anyhow::ensure!(
+            !self.asset_dir.trim().is_empty(),
+            "model.turn_gate.asset_dir 不能为空"
+        );
+        Ok(())
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
@@ -63,7 +115,13 @@ impl CognitiveModelConfig {
     pub fn validate(&self) -> Result<()> {
         self.intrinsic.validate()?;
         self.fallback.validate()?;
+        self.turn_gate.validate()?;
         Ok(())
+    }
+
+    #[must_use]
+    pub const fn turn_gate(&self) -> &TurnGateConfig {
+        &self.turn_gate
     }
 
     #[must_use]
@@ -147,5 +205,24 @@ impl ModelFallbackConfig {
     #[must_use]
     pub const fn strong_to_intrinsic(&self) -> bool {
         self.strong_to_intrinsic
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TurnGateConfig;
+
+    #[test]
+    fn turn_gate_defaults_are_valid() {
+        assert!(TurnGateConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn unknown_turn_gate_mode_is_rejected() {
+        let config = TurnGateConfig {
+            mode: "chaotic".to_owned(),
+            ..TurnGateConfig::default()
+        };
+        assert!(config.validate().is_err());
     }
 }

@@ -66,6 +66,10 @@ label_provenance 人工复核、授权/可擦除/不自我闭环）。
   Rust 逐项一致、大小/SHA/有限值校验、失败不阻断。
 - 待数据增强：真实标注数据（详见 doc §7.4 采集闭环 + 人工复核）、
   分层采样、Platt/温度校准、提前停止、伪标签仅作待复核来源。
-- 待接线（Phase 2+，严格按 doc §8/§9）：coalesce 完成度优先、response
-  shadow → active、ConversationState 联动；本目录与 yunxi-core 目前
-  **不改变生产路由**（无 bundle 时 engine 一律 abstain）。
+- Phase 2（已完成接线）：`[model.turn_gate]` active/shadow/disabled；
+  group/private 的 coalesce 入口走 `push_with_turn_gate`——TurnGate
+  高置信度决策时直接决定 flush/hold（MiniMind 不再被调用），abstain 或
+  无 bundle 时惰性回退现有 lexical + MiniMind 路径（**生产零影响直到
+  放入第一个 bundle**），shadow 模式记录与现有路径的分歧。
+- 待接线（Phase 3/4）：response head shadow → active、ConversationState
+  联动、私聊/群聊统一走 response 决策。

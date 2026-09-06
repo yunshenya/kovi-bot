@@ -950,6 +950,9 @@ impl CoreBridge {
         bot: Arc<RuntimeBot>,
     ) -> Arc<Self> {
         let intrinsic = super::intrinsic_runtime::install();
+        // TurnGate completion classifier (Phase 2): load missing/failed is
+        // fail-soft; engine availability decides whether routing changes.
+        let _ = super::turn_gate_runtime::install();
         let model = super::core_model::KoviModelBackend::new_with_intrinsic(
             Arc::clone(&bot),
             Arc::clone(&store),

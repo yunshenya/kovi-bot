@@ -6,7 +6,19 @@ use std::collections::HashMap;
 use std::hash::Hash;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use yunxi_core::InputCompletion;
+use yunxi_core::{InputCompletion, TurnGateInput, TurnPolicyOverride, TurnScope};
+
+/// TurnGateInput 的非文本上下文 (Phase 2, doc §8.2:private/group 在进入
+/// coalescer 时构造同一份输入;pending 片段由 coalescer 自己补全)。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TurnGateBatchContext {
+    pub(crate) scope: TurnScope,
+    pub(crate) conversation_active: bool,
+    pub(crate) addressed_to_agent: bool,
+    pub(crate) replies_to_agent: bool,
+    pub(crate) pending_task: bool,
+    pub(crate) pending_outgoing: bool,
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct TextBatch {
@@ -129,15 +141,45 @@ impl<K> MessageCoalescer<K>
 where
     K: Copy + Eq + Hash,
 {
-    /// Use the model-backed completion result at production ingress. Complete
-    /// turns flush immediately; incomplete turns wait for another message and
-    /// use only `max_wait` as a liveness watchdog.
-    pub(crate) async fn push_with_completion(
+    /// Phase 2 completion gate (doc §8.2):TurnGate 优先决定 flush/hold;
+    /// abstain 或引擎不可用时调用 `legacy` (现有 lexical + MiniMind 路径)。
+    /// `legacy` 是惰性的——TurnGate 高置信度决策时不会被调用。
+    pub(crate) async fn push_with_turn_gate<F, Fut>(
         &self,
         key: K,
         part: MessagePart,
-        completion: InputCompletion,
-    ) -> Option<TextBatch> {
+        context: TurnGateBatchContext,
+        legacy: F,
+    ) -> Option<TextBatch>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = InputCompletion>,
+    {
+        let completion = if let Some(runtime) = crate::yunxi::turn_gate_runtime::get() {
+            let pending_fragments = {
+                let pending = self.pending.lock().await;
+                pending
+                    .get(&key)
+                    .map(|batch| {
+                        batch
+                            .intent_parts
+                            .iter()
+                            .take(yunxi_core::TURN_GATE_MAX_PENDING_FRAGMENTS)
+                            .map(|fragment| {
+                                fragment
+                                    .chars()
+                                    .take(yunxi_core::TURN_GATE_MAX_FRAGMENT_CHARS)
+                                    .collect()
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            let input = turn_gate_input(&part, context, pending_fragments);
+            runtime.classify_completion(&input, legacy).await
+        } else {
+            legacy().await
+        };
         self.push_with_completion_policy(key, part, completion, BatchPolicy::from_config())
             .await
     }
@@ -301,6 +343,35 @@ struct BatchPushHook {
     release: Notify,
 }
 
+/// 用 pending 片段 + 新 part 构造 (有界) TurnGateInput。pending 片段即
+/// "尚未提交的用户片段" (doc §7.1);recent_turns 留给 Phase 3 接入会话
+/// 历史;文本截断由特征层完成。
+fn turn_gate_input(
+    part: &MessagePart,
+    context: TurnGateBatchContext,
+    pending_user_fragments: Vec<String>,
+) -> TurnGateInput {
+    TurnGateInput {
+        current_text: part.intent_text.clone(),
+        pending_user_fragments,
+        recent_turns: Vec::new(),
+        scope: context.scope,
+        conversation_active: context.conversation_active,
+        bot_last_asked_question: None,
+        pending_outgoing: context.pending_outgoing,
+        pending_task: context.pending_task,
+        addressed_to_agent: context.addressed_to_agent,
+        replies_to_agent: context.replies_to_agent,
+        has_image: !part.images.is_empty(),
+        has_sticker: part.sticker_reaction,
+        policy_override: if context.addressed_to_agent || context.replies_to_agent {
+            TurnPolicyOverride::MustReply
+        } else {
+            TurnPolicyOverride::None
+        },
+    }
+}
+
 fn adaptive_delay(message: &str, policy: BatchPolicy) -> Duration {
     let text = message.trim();
     if looks_incomplete(text) {
@@ -338,12 +409,56 @@ fn ends_complete_sentence(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        BatchPolicy, BatchPushHook, MessageCoalescer, MessagePart, TextBatch, adaptive_delay,
+        BatchPolicy, BatchPushHook, MessageCoalescer, MessagePart, TextBatch, TurnGateBatchContext,
+        adaptive_delay,
     };
     use crate::vision::ImageAttachment;
     use kovi::tokio::sync::Notify;
     use std::sync::Arc;
     use std::time::Duration;
+
+    #[test]
+    fn turn_gate_path_without_runtime_falls_back_to_legacy_completion() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let coalescer = MessageCoalescer::default();
+                let context = TurnGateBatchContext {
+                    scope: yunxi_core::TurnScope::Group,
+                    conversation_active: false,
+                    addressed_to_agent: false,
+                    replies_to_agent: false,
+                    pending_task: false,
+                    pending_outgoing: false,
+                };
+                // 环境没有 TurnGate runtime:push_with_turn_gate 必须调用
+                // legacy 闭包并按完整度语义返回批次(行为与 Phase 1 一致)。
+                let legacy_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let legacy_called_2 = Arc::clone(&legacy_called);
+                let batch = coalescer
+                    .push_with_turn_gate(
+                        42,
+                        MessagePart {
+                            text: "完整的一句话。".to_owned(),
+                            intent_text: "完整的一句话。".to_owned(),
+                            addressed: false,
+                            plain_text: true,
+                            vision_requested: false,
+                            sticker_reaction: false,
+                            images: Vec::new(),
+                            message_ids: vec![1],
+                        },
+                        context,
+                        || async {
+                            legacy_called_2.store(true, std::sync::atomic::Ordering::Relaxed);
+                            yunxi_core::InputCompletion::Complete
+                        },
+                    )
+                    .await;
+                assert!(batch.is_some());
+                assert!(legacy_called.load(std::sync::atomic::Ordering::Relaxed));
+            })
+    }
 
     #[test]
     fn rapid_messages_are_returned_as_one_batch() {

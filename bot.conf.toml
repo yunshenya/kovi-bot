@@ -127,7 +127,18 @@ startup_self_test = true
 strong_to_intrinsic = true
 max_model_attempts = 2
 
+# TurnGate 完成度分类器（Phase 2 接线）：active 时优先决定批次何时 flush；
+# 没有 bundle / 加载失败时自动回退现有 lexical + MiniMind 路径（fail-soft，
+# 不会改变生产行为）。训练与导出见 tools/turngate/train.py；bundle 放稳定
+# 目录 models/yunxi-turngate/（manifest.toml + turn_gate.bin）。
+# mode: disabled / shadow（记录分歧不改变路由）/ active
+[model.turn_gate]
+enabled = true
+mode = "active"
+asset_dir = "models/yunxi-turngate"
+
 [message_batch]
+
 enabled = true
 complete_delay_ms = 900
 normal_delay_ms = 1600

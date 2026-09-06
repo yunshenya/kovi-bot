@@ -672,13 +672,16 @@ pub(crate) async fn group_message_event_after_ingress(
         images,
         source_message_ids,
     ) = if !message.trim_start().starts_with('#') {
-        let completion = if let Some(runtime) = crate::yunxi::intrinsic_runtime::get() {
-            runtime.classify_input_completion(message).await
-        } else {
-            yunxi_core::InputCompletion::Incomplete
+        let turn_gate_context = crate::model::coalesce::TurnGateBatchContext {
+            scope: yunxi_core::TurnScope::Group,
+            conversation_active: crate::model::conversation_continuation_active_now(group_id),
+            addressed_to_agent: addressed_to_bot,
+            replies_to_agent: has_reply(&event.message),
+            pending_task: false,
+            pending_outgoing: false,
         };
         let Some(combined) = GROUP_MESSAGE_BATCHES
-            .push_with_completion(
+            .push_with_turn_gate(
                 (group_id, event.user_id),
                 MessagePart {
                     text: model_message,
@@ -690,7 +693,14 @@ pub(crate) async fn group_message_event_after_ingress(
                     images,
                     message_ids: vec![event.message_id],
                 },
-                completion,
+                turn_gate_context,
+                || async {
+                    if let Some(runtime) = crate::yunxi::intrinsic_runtime::get() {
+                        runtime.classify_input_completion(message).await
+                    } else {
+                        yunxi_core::InputCompletion::Incomplete
+                    }
+                },
             )
             .await
         else {
