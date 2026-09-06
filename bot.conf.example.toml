@@ -78,6 +78,14 @@ sticker_reaction_window_secs = 90
 sticker_reaction_cooldown_secs = 30
 sticker_reaction_rate_window_secs = 300
 sticker_reaction_rate_limit = 3
+# 熟人放行：熟悉度 ≥ familiarity_threshold 的成员，其未点名消息确定性进入
+# 语义评估（是否真的回复仍由评估模型与 Core 决定），不再只靠概率采样；
+# 这是"群里有熟人在说话，她会有自然反应"的通道。familiar_rate_limit
+# 是每群每窗口内进入语义评估的条数上限（模型成本护栏）。
+familiar_admit_enabled = true
+familiarity_threshold = 0.5
+familiar_rate_window_secs = 600
+familiar_rate_limit = 6
 
 [memory]
 max_entries = 1000

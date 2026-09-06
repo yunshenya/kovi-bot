@@ -31,7 +31,7 @@ use yunxi_core::{
     EventPriority, EventScope, EventType, ExternalConversation, IdentityStore,
     MessageCollisionDetectedEvent, MessageContent, MessageId, MessageReceivedEvent, ModelBackend,
     OpenLoopStore, PersonId, PlannedProcessingOutcome, ProcessingOutcome, ProposedAction,
-    RuntimeConfig, RuntimeHandle, WorldEvent, WorldEventKind,
+    RelationStore, RuntimeConfig, RuntimeHandle, WorldEvent, WorldEventKind,
 };
 
 pub(crate) const CORE_INGRESS_CAPACITY: usize = 256;
@@ -79,12 +79,21 @@ const MAX_PRIVATE_HANDLER_GATES: usize = 1_024;
 const MAX_MESSAGE_CHARS: usize = 8_192;
 const MAX_MESSAGE_BYTES: usize = 32 * 1_024;
 const MAX_AMBIENT_ATTENTION_GATES: usize = 256;
+/// 群成员熟悉度缓存的单条记录过期时间（秒）。由 ingress worker 在解析
+/// 身份后异步刷新，同步的 classify 门只读缓存，避免每消息查库。
+const FAMILIARITY_CACHE_TTL: Duration = Duration::from_secs(3600);
+/// 群成员熟悉度缓存最大条目数。
+const MAX_FAMILIARITY_ENTRIES: usize = 256;
+/// 一次熟悉度刷新的最长等待；超时按无缓存处理（fail-soft）。
+const FAMILIARITY_REFRESH_TIMEOUT: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Default)]
 struct AmbientAttentionGate {
     eligible_messages_since_sample: u32,
     last_candidate: Option<Instant>,
     decision_attempts: VecDeque<Instant>,
+    /// 熟人确定性放行的限流记录（有界窗口）。
+    familiar_attempts: VecDeque<Instant>,
     /// 本群近因窗口(最近若干条未点名消息文本),用于软注意力相关度。
     recent_messages: VecDeque<String>,
 }
@@ -102,16 +111,16 @@ impl AmbientAttentionGate {
     }
 }
 
-/// 未点名消息能否进入采样:长度门槛在"接续对话"窗口内放宽到 2 字
-/// (芸汐刚在本群回复过时,对方一句短话也可能值得接);窗口外保持
-/// 严格阈值,纯图片不受限。
+/// 未点名消息能否进入采样:长度门槛在"接续对话"窗口或"熟人放行"内
+/// 放宽到 2 字(芸汐刚在本群回复过、或说话人是熟人时,对方一句短话也
+/// 可能值得接);窗口外保持严格阈值,纯图片不受限。
 fn message_length_passable(
     text_chars: usize,
     has_image: bool,
     min_message_chars: usize,
-    continuation_active: bool,
+    lenient_active: bool,
 ) -> bool {
-    has_image || text_chars >= min_message_chars || (continuation_active && text_chars >= 2)
+    has_image || text_chars >= min_message_chars || (lenient_active && text_chars >= 2)
 }
 
 const AMBIENT_PRIOR_MESSAGES: usize = 12;
@@ -125,6 +134,9 @@ struct AmbientAttentionPolicy {
     min_message_chars: usize,
     decision_rate_window_secs: u64,
     decision_rate_limit: usize,
+    familiar_enabled: bool,
+    familiar_rate_window_secs: u64,
+    familiar_rate_limit: usize,
 }
 
 #[derive(Debug)]
@@ -157,6 +169,7 @@ impl AmbientAttentionRegistry {
             .expect("ambient attention gate was inserted above")
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn should_request(
         &mut self,
         group_id: i64,
@@ -164,14 +177,16 @@ impl AmbientAttentionRegistry {
         text: &str,
         has_image: bool,
         continuation_active: bool,
+        familiar_active: bool,
         policy: AmbientAttentionPolicy,
     ) -> bool {
+        let lenient_active = continuation_active || familiar_active;
         if !policy.enabled
             || !message_length_passable(
                 text.chars().count(),
                 has_image,
                 policy.min_message_chars,
-                continuation_active,
+                lenient_active,
             )
         {
             return false;
@@ -191,6 +206,25 @@ impl AmbientAttentionRegistry {
         // 窗口内不消费采样频率预算,避免连续接话提前耗光后续环境的
         // 采样机会;只更新候选锚点,保持窗口外的节奏语义不变。
         if continuation_active {
+            gate.last_candidate = Some(now);
+            return true;
+        }
+        // 熟人（熟悉度已到阈值、且开启熟人放行）的未点名消息同样确定性
+        // 进入语义评估：人对熟人的话更容易接住。这里用独立的限流窗口
+        // 保护模型成本，不消耗窗口外的采样频率预算。
+        if policy.familiar_enabled && familiar_active {
+            let familiar_rate_window = Duration::from_secs(policy.familiar_rate_window_secs);
+            while gate
+                .familiar_attempts
+                .front()
+                .is_some_and(|attempt| now.duration_since(*attempt) >= familiar_rate_window)
+            {
+                gate.familiar_attempts.pop_front();
+            }
+            if gate.familiar_attempts.len() >= policy.familiar_rate_limit {
+                return false;
+            }
+            gate.familiar_attempts.push_back(now);
             gate.last_candidate = Some(now);
             return true;
         }
@@ -249,6 +283,47 @@ impl Default for AmbientAttentionRegistry {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// 群成员熟悉度（familiarity, 0..=1）的有界缓存。
+///
+/// 同步的 `classify_group` 无法安全查库，因此由 ingress worker 在解析
+/// 身份后按 TTL 异步刷新；读不到时按"不熟悉"处理（fail-soft）。
+#[derive(Debug, Default)]
+struct FamiliarityCache {
+    entries: HashMap<i64, (f32, Instant)>,
+    order: VecDeque<i64>,
+}
+
+impl FamiliarityCache {
+    fn should_refresh(&self, user_id: i64) -> bool {
+        self.entries
+            .get(&user_id)
+            .is_none_or(|(_, recorded_at)| recorded_at.elapsed() >= FAMILIARITY_CACHE_TTL)
+    }
+
+    fn record(&mut self, user_id: i64, familiarity: f32) {
+        if !self.entries.contains_key(&user_id) {
+            if self.entries.len() >= MAX_FAMILIARITY_ENTRIES
+                && let Some(evicted) = self.order.pop_front()
+            {
+                self.entries.remove(&evicted);
+            }
+            self.order.push_back(user_id);
+        }
+        self.entries.insert(user_id, (familiarity, Instant::now()));
+    }
+
+    fn familiarity(&self, user_id: i64) -> Option<f32> {
+        self.entries.get(&user_id).map(|(value, _)| *value)
+    }
+}
+
+/// 携带熟悉度缓存与其数据源的手柄，供 ingress worker 刷新使用。
+#[derive(Clone)]
+struct FamiliarityRefresh {
+    cache: Arc<StdMutex<FamiliarityCache>>,
+    relations: Arc<super::relation_store::PostgresRelationStore>,
 }
 
 /// The result of the synchronous, non-blocking ingress operation.
@@ -822,6 +897,7 @@ pub(crate) struct CoreBridge {
     private_handler_gates: Arc<PrivateHandlerGateRegistry>,
     group_handler_gates: Arc<PrivateHandlerGateRegistry>,
     ambient_attention: Arc<StdMutex<AmbientAttentionRegistry>>,
+    familiarity: Arc<StdMutex<FamiliarityCache>>,
 }
 
 impl fmt::Debug for CoreBridge {
@@ -940,6 +1016,11 @@ impl CoreBridge {
         let group_handler_gates =
             Arc::new(PrivateHandlerGateRegistry::new(MAX_PRIVATE_HANDLER_GATES));
         let ambient_attention = Arc::new(StdMutex::new(AmbientAttentionRegistry::new()));
+        let familiarity = Arc::new(StdMutex::new(FamiliarityCache::default()));
+        let familiarity_refresh = super::relation_store().map(|relations| FamiliarityRefresh {
+            cache: Arc::clone(&familiarity),
+            relations,
+        });
         let (runtime_handle, mut runtime) = services.map_or_else(
             || {
                 CognitiveRuntime::new(RuntimeConfig::default())
@@ -1023,6 +1104,7 @@ impl CoreBridge {
             action_arbiter.clone(),
             action_port.clone(),
             Arc::clone(&private_handler_gates),
+            familiarity_refresh,
         ));
         kovi::tokio::spawn(run_runtime(
             runtime,
@@ -1043,6 +1125,7 @@ impl CoreBridge {
             private_handler_gates,
             group_handler_gates,
             ambient_attention,
+            familiarity,
         })
     }
 
@@ -1423,7 +1506,22 @@ impl CoreBridge {
             min_message_chars: config.min_message_chars(),
             decision_rate_window_secs: config.decision_rate_window_secs(),
             decision_rate_limit: config.decision_rate_limit(),
+            familiar_enabled: config.familiar_admit_enabled(),
+            familiar_rate_window_secs: config.familiar_rate_window_secs(),
+            familiar_rate_limit: config.familiar_rate_limit(),
         };
+        // 熟人放行：说话人的熟悉度达到阈值时，未点名消息确定性进入语义
+        // 评估（是否回复仍由评估模型与 Core 决定）。缓存由 ingress worker
+        // 异步刷新，读不到按不熟悉处理。
+        let familiar_active = policy.familiar_enabled
+            && self
+                .familiarity
+                .lock()
+                .ok()
+                .and_then(|cache| cache.familiarity(event.user_id))
+                .is_some_and(|familiarity| {
+                    f64::from(familiarity) >= config.familiarity_threshold()
+                });
         self.ambient_attention
             .lock()
             .ok()
@@ -1434,6 +1532,7 @@ impl CoreBridge {
                     text,
                     has_image,
                     continuation_active,
+                    familiar_active,
                     policy,
                 )
             })
@@ -2145,6 +2244,7 @@ async fn run_ingress(
     action_arbiter: Option<Arc<ActionArbiter>>,
     action_port: Option<Arc<dyn ActionPort>>,
     private_handler_gates: Arc<PrivateHandlerGateRegistry>,
+    familiarity_refresh: Option<FamiliarityRefresh>,
 ) {
     let mut references = MessageReferenceCache::new(MESSAGE_REFERENCE_CAPACITY);
     let mut routes =
@@ -2178,6 +2278,7 @@ async fn run_ingress(
                         model_backend.clone(),
                         message_store.as_deref(),
                         Some(&mut routes),
+                        familiarity_refresh.clone(),
                     ),
                 )
                 .await;
@@ -3311,7 +3412,7 @@ async fn resolve_and_submit(
     runtime: &RuntimeHandle,
     references: &mut MessageReferenceCache,
 ) -> anyhow::Result<()> {
-    resolve_and_submit_inner(message, store, runtime, references, None, None, None).await
+    resolve_and_submit_inner(message, store, runtime, references, None, None, None, None).await
 }
 
 /// Submit an event while bounding the wait imposed by High/Critical runtime
@@ -3391,6 +3492,7 @@ async fn resolve_and_submit_inner(
     model_backend: Option<Arc<super::core_model::KoviModelBackend>>,
     message_store: Option<&super::identity_store::PostgresIdentityStore>,
     route_tracker: Option<&mut IngressRouteTracker>,
+    familiarity_refresh: Option<FamiliarityRefresh>,
 ) -> anyhow::Result<()> {
     let message_id = MessageId::new();
     let mut admission_guard = message
@@ -3431,6 +3533,28 @@ async fn resolve_and_submit_inner(
         let member = yunxi_core::ConversationMember::new(conversation_id, person_id);
         if let Err(error) = member_store.upsert(&member).await {
             kovi::log::warn!("Yunxi conversation-member upsert failed: {error}");
+        }
+    }
+
+    // 群聊消息:按 TTL 刷新说话人熟悉度缓存(有界超时,fail-soft)。
+    // 同步的 classify_group 用不到异步查库,只能读这份缓存。
+    if let Some(refresh) = familiarity_refresh.as_ref()
+        && matches!(message.address, ConversationAddress::Group { .. })
+        && refresh
+            .cache
+            .lock()
+            .ok()
+            .is_some_and(|cache| cache.should_refresh(message.sender_user_id))
+    {
+        let refreshed = kovi::tokio::time::timeout(
+            FAMILIARITY_REFRESH_TIMEOUT,
+            refresh.relations.get(person_id),
+        )
+        .await;
+        if let Ok(Ok(Some(state))) = refreshed
+            && let Ok(mut cache) = refresh.cache.lock()
+        {
+            cache.record(message.sender_user_id, state.familiarity);
         }
     }
 
@@ -4157,6 +4281,7 @@ mod tests {
                 Some(arbiter),
                 Some(action_port),
                 Arc::new(super::PrivateHandlerGateRegistry::new(4)),
+                None,
             ));
             drop(ingress);
             kovi::tokio::time::timeout(StdDuration::from_secs(1), ingress_task)
@@ -4204,6 +4329,7 @@ mod tests {
                 Some(arbiter),
                 Some(action_port),
                 Arc::new(super::PrivateHandlerGateRegistry::new(4)),
+                None,
             ));
             let control = Arc::new(ActionCommandControl::new());
             let action = ProposedAction::send_message(
@@ -4556,9 +4682,12 @@ mod tests {
             min_message_chars: 4,
             decision_rate_window_secs: 600,
             decision_rate_limit: 3,
+            familiar_enabled: false,
+            familiar_rate_window_secs: 600,
+            familiar_rate_limit: 6,
         };
         let sample = |registry: &mut super::AmbientAttentionRegistry, message_id| {
-            registry.should_request(123, message_id, "讲个笑话吧", false, false, policy)
+            registry.should_request(123, message_id, "讲个笑话吧", false, false, false, policy)
         };
 
         assert!(!sample(&mut registry, 1));
@@ -4589,13 +4718,16 @@ mod tests {
             min_message_chars: 4,
             decision_rate_window_secs: 600,
             decision_rate_limit: 3,
+            familiar_enabled: false,
+            familiar_rate_window_secs: 600,
+            familiar_rate_limit: 6,
         };
         // 触发 bot 回复的那次采样,把 last_candidate 更新到"刚刚"。
-        assert!(registry.should_request(123, 1, "我有点疑问", false, false, policy));
+        assert!(registry.should_request(123, 1, "我有点疑问", false, false, false, policy));
         // 几秒后紧跟的接续:窗口内,2 字短句也必须放行。
-        assert!(registry.should_request(123, 2, "如果", false, true, policy));
-        assert!(registry.should_request(123, 3, "所有人都想错了", false, true, policy));
-        assert!(registry.should_request(123, 4, "ai并不是未来呢", false, true, policy));
+        assert!(registry.should_request(123, 2, "如果", false, true, false, policy));
+        assert!(registry.should_request(123, 3, "所有人都想错了", false, true, false, policy));
+        assert!(registry.should_request(123, 4, "ai并不是未来呢", false, true, false, policy));
     }
 
     #[test]
@@ -4610,15 +4742,64 @@ mod tests {
             min_message_chars: 4,
             decision_rate_window_secs: 600,
             decision_rate_limit: 3,
+            familiar_enabled: false,
+            familiar_rate_window_secs: 600,
+            familiar_rate_limit: 6,
         };
         // 先用完窗口外的采样频率预算(3 次/600s)。
-        assert!(registry.should_request(123, 1, "第一条消息", false, false, policy));
-        assert!(registry.should_request(123, 2, "第二条消息", false, false, policy));
-        assert!(registry.should_request(123, 3, "第三条消息", false, false, policy));
+        assert!(registry.should_request(123, 1, "第一条消息", false, false, false, policy));
+        assert!(registry.should_request(123, 2, "第二条消息", false, false, false, policy));
+        assert!(registry.should_request(123, 3, "第三条消息", false, false, false, policy));
         // 预算耗尽后,窗口内的接续仍确定性放行(不消费窗口外预算)。
-        assert!(registry.should_request(123, 4, "如果", false, true, policy));
+        assert!(registry.should_request(123, 4, "如果", false, true, false, policy));
         // 窗口外行为不变:冷却/频率限制仍然生效。
-        assert!(!registry.should_request(123, 5, "第四条消息", false, false, policy));
+        assert!(!registry.should_request(123, 5, "第四条消息", false, false, false, policy));
+    }
+
+    #[test]
+    fn familiar_speaker_admits_despite_cooldown_and_respects_rate_cap() {
+        let mut registry = super::AmbientAttentionRegistry::new();
+        let policy = super::AmbientAttentionPolicy {
+            enabled: true,
+            min_eligible_messages: 1,
+            candidate_cooldown_secs: 180,
+            response_probability_percent: 100,
+            min_message_chars: 4,
+            decision_rate_window_secs: 600,
+            decision_rate_limit: 3,
+            familiar_enabled: true,
+            familiar_rate_window_secs: 600,
+            familiar_rate_limit: 2,
+        };
+        // 触发 bot 回复的那次采样(刚从冷却中放行,last_candidate=刚刚)。
+        assert!(registry.should_request(123, 1, "我有点疑问", false, false, false, policy));
+        // 熟人的未点名消息:虽然还在 180s 候选冷却内,也确定性放行。
+        assert!(registry.should_request(123, 2, "如果", false, false, true, policy));
+        assert!(registry.should_request(123, 3, "所有人都想错了", false, false, true, policy));
+        // 熟人放行有独立限流:第 3 条被挡。
+        assert!(!registry.should_request(123, 4, "ai并不是未来呢", false, false, true, policy));
+        // 陌生/不熟的人依然只走原采样路径(冷却内,不放行)。
+        assert!(!registry.should_request(123, 5, "陌生人说了一句话", false, false, false, policy));
+    }
+
+    #[test]
+    fn familiarity_cache_records_and_evicts_without_panic() {
+        let mut cache = super::FamiliarityCache::default();
+        assert!(cache.should_refresh(1));
+        cache.record(1, 0.97);
+        assert!(!cache.should_refresh(1));
+        assert_eq!(cache.familiarity(1), Some(0.97));
+        assert_eq!(cache.familiarity(2), None);
+        for user_id in 1..=(super::MAX_FAMILIARITY_ENTRIES as i64 + 8) {
+            cache.record(user_id, 0.5);
+        }
+        // 有界淘汰:最早的条目被挤出,容量不失控。
+        assert!(cache.familiarity(1).is_none());
+        assert!(
+            cache
+                .familiarity(super::MAX_FAMILIARITY_ENTRIES as i64)
+                .is_some()
+        );
     }
 
     #[test]
@@ -4692,6 +4873,7 @@ mod tests {
             private_handler_gates: Arc::new(super::PrivateHandlerGateRegistry::new(4)),
             group_handler_gates: Arc::new(super::PrivateHandlerGateRegistry::new(4)),
             ambient_attention: Arc::new(StdMutex::new(super::AmbientAttentionRegistry::new())),
+            familiarity: Arc::new(StdMutex::new(super::FamiliarityCache::default())),
         };
         let message = inbound(ConversationAddress::Group { group_id: 123 }, false);
 
@@ -4722,6 +4904,7 @@ mod tests {
                 private_handler_gates: Arc::new(super::PrivateHandlerGateRegistry::new(4)),
                 group_handler_gates: Arc::new(super::PrivateHandlerGateRegistry::new(4)),
                 ambient_attention: Arc::new(StdMutex::new(super::AmbientAttentionRegistry::new())),
+                familiarity: Arc::new(StdMutex::new(super::FamiliarityCache::default())),
             });
             assert_eq!(
                 bridge.try_enqueue(inbound(ConversationAddress::Group { group_id: 123 }, true)),
@@ -4772,6 +4955,7 @@ mod tests {
                 private_handler_gates: Arc::new(super::PrivateHandlerGateRegistry::new(4)),
                 group_handler_gates: Arc::new(super::PrivateHandlerGateRegistry::new(4)),
                 ambient_attention: Arc::new(StdMutex::new(super::AmbientAttentionRegistry::new())),
+                familiarity: Arc::new(StdMutex::new(super::FamiliarityCache::default())),
             };
             assert_eq!(
                 bridge.try_enqueue(inbound(ConversationAddress::Group { group_id: 123 }, true)),
@@ -4892,6 +5076,7 @@ mod tests {
             private_handler_gates: Arc::new(super::PrivateHandlerGateRegistry::new(4)),
             group_handler_gates: Arc::new(super::PrivateHandlerGateRegistry::new(4)),
             ambient_attention: Arc::new(StdMutex::new(super::AmbientAttentionRegistry::new())),
+            familiarity: Arc::new(StdMutex::new(super::FamiliarityCache::default())),
         };
 
         assert!(bridge.is_group_blocked(123));
@@ -4949,6 +5134,7 @@ mod tests {
                 private_handler_gates: Arc::new(super::PrivateHandlerGateRegistry::new(4)),
                 group_handler_gates: Arc::new(super::PrivateHandlerGateRegistry::new(4)),
                 ambient_attention: Arc::new(StdMutex::new(super::AmbientAttentionRegistry::new())),
+                familiarity: Arc::new(StdMutex::new(super::FamiliarityCache::default())),
             });
             let mut queued = inbound(
                 ConversationAddress::Direct {
@@ -5002,6 +5188,7 @@ mod tests {
                 None,
                 None,
                 Arc::new(super::PrivateHandlerGateRegistry::new(4)),
+                None,
             ));
             assert_eq!(
                 flush
@@ -5084,6 +5271,7 @@ mod tests {
                 private_handler_gates: Arc::new(super::PrivateHandlerGateRegistry::new(4)),
                 group_handler_gates: Arc::new(super::PrivateHandlerGateRegistry::new(4)),
                 ambient_attention: Arc::new(StdMutex::new(super::AmbientAttentionRegistry::new())),
+                familiarity: Arc::new(StdMutex::new(super::FamiliarityCache::default())),
             });
             kovi::tokio::spawn(async move {
                 let Some(super::IngressCommand::BeginDataErasure { acknowledge, .. }) =
@@ -5119,6 +5307,7 @@ mod tests {
                 private_handler_gates: Arc::new(super::PrivateHandlerGateRegistry::new(4)),
                 group_handler_gates: Arc::new(super::PrivateHandlerGateRegistry::new(4)),
                 ambient_attention: Arc::new(StdMutex::new(super::AmbientAttentionRegistry::new())),
+                familiarity: Arc::new(StdMutex::new(super::FamiliarityCache::default())),
             });
             kovi::tokio::spawn(async move {
                 let Some(super::IngressCommand::BeginGroupDataErasure { acknowledge, .. }) =
@@ -5188,6 +5377,7 @@ mod tests {
                 None,
                 None,
                 Arc::new(super::PrivateHandlerGateRegistry::new(4)),
+                None,
             ));
             let driver = kovi::tokio::spawn(async move {
                 while core_runtime.process_next().await.is_some() {}
@@ -5203,6 +5393,7 @@ mod tests {
                 private_handler_gates: Arc::new(super::PrivateHandlerGateRegistry::new(4)),
                 group_handler_gates: Arc::new(super::PrivateHandlerGateRegistry::new(4)),
                 ambient_attention: Arc::new(StdMutex::new(super::AmbientAttentionRegistry::new())),
+                familiarity: Arc::new(StdMutex::new(super::FamiliarityCache::default())),
             });
             let mut message = inbound(ConversationAddress::Group { group_id }, true);
             message.sender_user_id = user_id;
@@ -5559,6 +5750,7 @@ mod tests {
                 Some(Arc::clone(&arbiter)),
                 Some(Arc::clone(&action_port)),
                 Arc::new(super::PrivateHandlerGateRegistry::new(4)),
+                None,
             ));
             kovi::tokio::spawn(run_runtime(core_runtime, None, None, None));
             let bridge = Arc::new(CoreBridge {
@@ -5571,6 +5763,7 @@ mod tests {
                 private_handler_gates: Arc::new(super::PrivateHandlerGateRegistry::new(4)),
                 group_handler_gates: Arc::new(super::PrivateHandlerGateRegistry::new(4)),
                 ambient_attention: Arc::new(StdMutex::new(super::AmbientAttentionRegistry::new())),
+                familiarity: Arc::new(StdMutex::new(super::FamiliarityCache::default())),
             });
             let action = ProposedAction::send_message(
                 conversation_id,

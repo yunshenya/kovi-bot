@@ -38,6 +38,15 @@ pub struct GroupInterjectionConfig {
     sticker_reaction_rate_window_secs: u64,
     /// 限流窗口内同一群最多回应多少次表情包。
     sticker_reaction_rate_limit: usize,
+    /// 熟人（熟悉度 ≥ familiarity_threshold）的未点名消息直接进入语义
+    /// 评估，不等待抽样；是否真的回复仍由评估模型与 Core 决定。
+    familiar_admit_enabled: bool,
+    /// 视为"熟人"的熟悉度阈值（0..=1）。
+    familiarity_threshold: f64,
+    /// 熟人确定性放行的限流统计窗口（秒）。
+    familiar_rate_window_secs: u64,
+    /// 限流窗口内同一群最多放行多少条熟人消息进入语义评估。
+    familiar_rate_limit: usize,
 }
 
 impl GroupInterjectionConfig {
@@ -105,6 +114,22 @@ impl GroupInterjectionConfig {
         self.sticker_reaction_rate_limit
     }
 
+    pub fn familiar_admit_enabled(&self) -> bool {
+        self.familiar_admit_enabled
+    }
+
+    pub fn familiarity_threshold(&self) -> f64 {
+        self.familiarity_threshold
+    }
+
+    pub fn familiar_rate_window_secs(&self) -> u64 {
+        self.familiar_rate_window_secs
+    }
+
+    pub fn familiar_rate_limit(&self) -> usize {
+        self.familiar_rate_limit
+    }
+
     pub fn validate(&self) -> anyhow::Result<()> {
         if self.min_eligible_messages == 0 {
             return Err(anyhow::anyhow!("群聊接话消息间隔必须大于0"));
@@ -138,6 +163,12 @@ impl GroupInterjectionConfig {
         {
             return Err(anyhow::anyhow!("群聊表情回应限流配置必须大于0"));
         }
+        if self.familiarity_threshold < 0.0 || self.familiarity_threshold > 1.0 {
+            return Err(anyhow::anyhow!("熟人熟悉度阈值必须在0到1之间"));
+        }
+        if self.familiar_rate_window_secs == 0 || self.familiar_rate_limit == 0 {
+            return Err(anyhow::anyhow!("熟人放行限流配置必须大于0"));
+        }
         Ok(())
     }
 }
@@ -161,6 +192,10 @@ impl Default for GroupInterjectionConfig {
             sticker_reaction_cooldown_secs: 30,
             sticker_reaction_rate_window_secs: 300,
             sticker_reaction_rate_limit: 3,
+            familiar_admit_enabled: false,
+            familiarity_threshold: 0.5,
+            familiar_rate_window_secs: 600,
+            familiar_rate_limit: 6,
         }
     }
 }
