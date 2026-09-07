@@ -21,7 +21,7 @@ use anyhow::Result;
 use chrono::Local;
 use kovi::tokio::time::sleep;
 use kovi::{Message, RuntimeBot};
-use rand::Rng;
+use rand::RngExt;
 use rand::prelude::IndexedRandom;
 use std::sync::Arc;
 use std::time::Duration;

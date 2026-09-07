@@ -16,7 +16,7 @@ use super::reply_disposition::ReplyDisposition;
 use crate::group_access;
 use crate::memory::BotPersonality;
 use kovi::{Message, RuntimeBot};
-use rand::Rng;
+use rand::RngExt;
 
 /// 仅用于兼容旧模型输出；新回复必须通过回复协议的 `messages` 字段分段。
 pub(crate) const LEGACY_FOLLOW_UP_MARKER: &str = "[[NEXT_MESSAGE]]";
