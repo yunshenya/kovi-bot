@@ -1530,11 +1530,16 @@ fn compatibility_reach_out_key(intent: &ReachOutIntent) -> String {
         Ok(encoded) => hasher.update(encoded),
         Err(_) => hasher.update(intent.message().as_text().as_bytes()),
     }
+    let digest = hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
     format!(
-        "legacy-reach-out:{}:{}:{:x}",
+        "legacy-reach-out:{}:{}:{}",
         intent.person_id(),
         chrono::Utc::now().format("%Y%m%d"),
-        hasher.finalize()
+        digest
     )
 }
 

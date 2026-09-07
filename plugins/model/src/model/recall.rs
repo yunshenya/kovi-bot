@@ -7,7 +7,6 @@ use super::interrupt::{
 use crate::private_image_memory::forget_private_message_images;
 use crate::redis_store;
 use kovi::RuntimeBot;
-use kovi::bot::runtimebot::CanSendApi;
 use kovi::event::NoticeEvent;
 use kovi::tokio::sync::Mutex;
 use serde_json::{Value, json};

@@ -306,7 +306,7 @@ pub(crate) fn extract_stickers(message: &Message) -> Vec<StickerImage> {
     message
         .iter()
         .filter_map(|segment| {
-            let kind = segment.type_.as_str();
+            let kind = segment.kind.as_str();
             if !matches!(kind, "image" | "mface" | "face") {
                 return None;
             }
@@ -331,7 +331,7 @@ pub(crate) fn extract_stickers(message: &Message) -> Vec<StickerImage> {
 /// 从引用消息段中读取原消息 ID。
 fn reply_message_id(message: &Message) -> Option<i32> {
     message.iter().find_map(|segment| {
-        if segment.type_ != "reply" {
+        if segment.kind != "reply" {
             return None;
         }
 
@@ -542,7 +542,7 @@ fn quoted_sender_label(value: &Value) -> Option<String> {
 fn extract_text(message: &Message) -> String {
     message
         .iter()
-        .filter(|segment| segment.type_ == "text")
+        .filter(|segment| segment.kind == "text")
         .filter_map(|segment| segment.data.get("text").and_then(Value::as_str))
         .collect::<Vec<_>>()
         .join("")

@@ -813,7 +813,11 @@ fn target_hash(target: &TargetMemory) -> String {
 fn hash_text(value: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(value.as_bytes());
-    format!("{:x}", hasher.finalize())
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn aggregate_hash(parts: &[String]) -> String {
