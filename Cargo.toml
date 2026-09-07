@@ -12,23 +12,23 @@ model = { version = "0.1.0", path = "plugins/model" }
 members = ["apps/yunxi-cli", "crates/yunxi-core", "plugins/model"]
 
 [workspace.dependencies]
-kovi = { version = "0.12.3", default-features = false, features = ["logger", "plugin-access-control"] }
+kovi = { version = "0.13.5", default-features = false, features = ["logger", "plugin-access-control"] }
 reqwest = { version = "0.12.15", features = ["json", "rustls-tls"], default-features = false }
 chrono = { version = "0.4.41", features = ["serde"] }
 chrono-tz = "0.10.4"
 candle-core = { version = "0.11.0", default-features = false }
 image = { version = "0.25.8", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
 redis = { version = "1.6", default-features = false, features = ["tokio-comp", "connection-manager", "script"] }
-sqlx-core = { version = "=0.8.6", default-features = false, features = ["_rt-tokio", "_tls-rustls-ring-webpki", "json", "chrono"] }
-sqlx-postgres = { version = "=0.8.6", default-features = false, features = ["json", "chrono", "uuid"] }
+sqlx-core = { version = "=0.9.0", default-features = false, features = ["_rt-tokio", "_tls-rustls-ring-webpki", "json", "chrono"] }
+sqlx-postgres = { version = "=0.9.0", default-features = false, features = ["json", "chrono", "uuid"] }
 rmcp = { version = "3.1.4", default-features = false, features = ["client", "transport-child-process"] }
 scraper = "0.27.0"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0"
-sha2 = "0.10"
+sha2 = "0.11"
 thiserror = "2.0"
 tokenizers = { version = "0.23.1", default-features = false, features = ["fancy-regex"] }
-toml = "0.8.23"
+toml = "1.1.4"
 tokio = { version = "1.53.1", default-features = false, features = ["macros", "rt", "sync", "time"] }
 url = "2.5.8"
 uuid = { version = "1.18", features = ["serde", "v4", "v5"] }
