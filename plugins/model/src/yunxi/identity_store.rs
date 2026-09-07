@@ -2921,7 +2921,6 @@ mod tests {
     use sqlx_core::query::query;
     use sqlx_core::query_scalar::query_scalar;
     use sqlx_core::row::Row;
-    use sqlx_core::sql_str::AssertSqlSafe;
     use sqlx_postgres::{PgPool, PgPoolOptions, Postgres};
     use std::sync::Arc;
     use std::time::Duration;
@@ -3506,9 +3505,9 @@ mod tests {
                     ("yunxi_conversations", "id", alias_conversation_uuid),
                     ("yunxi_conversations", "id", matrix_conversation_uuid),
                 ] {
-                    let remaining = query_scalar::<Postgres, i64>(AssertSqlSafe(format!(
+                    let remaining = query_scalar::<Postgres, i64>(&format!(
                         "SELECT COUNT(*) FROM {table} WHERE {column} = $1"
-                    )))
+                    ))
                     .bind(id)
                     .fetch_one(&pool)
                     .await
@@ -3533,9 +3532,9 @@ mod tests {
                     ("yunxi_message_mappings", "conversation_id"),
                     ("yunxi_external_conversations", "conversation_id"),
                 ] {
-                    let remaining = query_scalar::<Postgres, i64>(AssertSqlSafe(format!(
+                    let remaining = query_scalar::<Postgres, i64>(&format!(
                         "SELECT COUNT(*) FROM {table} WHERE {owner_column} = $1"
-                    )))
+                    ))
                     .bind(group_conversation_uuid)
                     .fetch_one(&pool)
                     .await
@@ -3550,13 +3549,11 @@ mod tests {
                     ("yunxi_message_mappings", "conversation_id"),
                     ("yunxi_external_conversations", "conversation_id"),
                 ] {
-                    query(AssertSqlSafe(format!(
-                        "DELETE FROM {table} WHERE {owner_column} = $1"
-                    )))
-                    .bind(group_conversation_uuid)
-                    .execute(&pool)
-                    .await
-                    .expect("应清理群聊测试数据");
+                    query(&format!("DELETE FROM {table} WHERE {owner_column} = $1"))
+                        .bind(group_conversation_uuid)
+                        .execute(&pool)
+                        .await
+                        .expect("应清理群聊测试数据");
                 }
                 query("DELETE FROM yunxi_conversations WHERE id = $1")
                     .bind(group_conversation_uuid)
@@ -4267,9 +4264,9 @@ mod tests {
                     ("yunxi_goals", "owner_id", person_id.into_uuid()),
                     ("yunxi_goals", "owner_id", conversation_id.into_uuid()),
                 ] {
-                    let remaining = query_scalar::<Postgres, i64>(AssertSqlSafe(format!(
+                    let remaining = query_scalar::<Postgres, i64>(&format!(
                         "SELECT COUNT(*) FROM {table} WHERE {owner_column} = $1"
-                    )))
+                    ))
                     .bind(owner_id)
                     .fetch_one(&pool)
                     .await

@@ -629,7 +629,6 @@ mod tests {
     use crate::yunxi::owner_lock::{self, DurableOwner};
     use sqlx_core::query::query;
     use sqlx_core::query_scalar::query_scalar;
-    use sqlx_core::sql_str::AssertSqlSafe;
     use sqlx_postgres::{PgPool, PgPoolOptions, Postgres};
     use std::sync::Arc;
     use std::time::Duration;
@@ -913,9 +912,9 @@ mod tests {
                 panic!("identical failed attempt should be acquired")
             };
             assert_eq!(
-                query_scalar::<Postgres, i32>(AssertSqlSafe(format!(
+                query_scalar::<Postgres, i32>(&format!(
                     "SELECT attempt_count FROM {DELIVERY_LEDGER_TABLE} WHERE delivery_key = $1"
-                )))
+                ))
                 .bind(&key)
                 .fetch_one(&pool)
                 .await
@@ -1105,9 +1104,9 @@ mod tests {
             };
             assert_eq!(owner_kind, "person");
             assert_eq!(
-                query_scalar::<Postgres, i64>(AssertSqlSafe(format!(
+                query_scalar::<Postgres, i64>(&format!(
                     "SELECT COUNT(*) FROM {DELIVERY_LEDGER_TABLE} WHERE delivery_key = $1"
-                )))
+                ))
                 .bind(&key)
                 .fetch_one(&pool)
                 .await
@@ -1166,9 +1165,9 @@ mod tests {
             };
             assert_eq!(owner_kind, "conversation");
             assert_eq!(
-                query_scalar::<Postgres, i64>(AssertSqlSafe(format!(
+                query_scalar::<Postgres, i64>(&format!(
                     "SELECT COUNT(*) FROM {DELIVERY_LEDGER_TABLE} WHERE delivery_key = $1"
-                )))
+                ))
                 .bind(&key)
                 .fetch_one(&pool)
                 .await

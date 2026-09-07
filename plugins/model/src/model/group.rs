@@ -41,7 +41,7 @@ use kovi::event::GroupMsgEvent;
 use kovi::serde_json::json;
 use kovi::tokio::sync::Mutex;
 use kovi::{Message, RuntimeBot};
-use rand::Rng;
+use rand::RngExt;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
