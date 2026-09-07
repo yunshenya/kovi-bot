@@ -4,7 +4,6 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use sqlx_core::query::query;
 use sqlx_core::row::Row;
-use sqlx_core::sql_str::AssertSqlSafe;
 use sqlx_core::transaction::Transaction;
 use sqlx_postgres::{PgPool, Postgres};
 use uuid::Uuid;
@@ -1771,7 +1770,7 @@ impl MindDataErasure for PostgresMindStore {
                     "DELETE FROM {} WHERE person_id = $1 OR $1 = ANY(participant_ids)",
                     table.name()
                 );
-                query(AssertSqlSafe(statement))
+                query(&statement)
                     .bind(person_id)
                     .execute(&mut *transaction)
                     .await
@@ -1810,7 +1809,7 @@ impl MindDataErasure for PostgresMindStore {
                 RecordTable::Episodes,
             ] {
                 let statement = format!("DELETE FROM {} WHERE conversation_id = $1", table.name());
-                query(AssertSqlSafe(statement))
+                query(&statement)
                     .bind(conversation_id)
                     .execute(&mut *transaction)
                     .await
