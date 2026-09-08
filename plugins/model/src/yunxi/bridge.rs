@@ -202,6 +202,12 @@ impl AmbientAttentionRegistry {
         // 无论本轮是否采样,都把消息文本纳入本群近因窗口(有界),为后续
         // 的软注意力相关度提供"本群近况"。
         gate.remember(text);
+        // 群聊可见回复预算耗尽时不进入模型决策:保持纯观察,避免刷新
+        // 接续窗口、"每句话都回"。这是查询(不消耗名额),与 Host/Core
+        // 生成路径在 `reserve_group_chat_reply` 的原子预留保持一致。
+        if !crate::model::group_reply_budget_available_now(group_id) {
+            return false;
+        }
         // 接续对话窗口内(芸汐刚在本群发过可见消息):**确定性**放行到
         // 语义评估——"她说完了我就接"这类天然衔接不该被随机采样漏掉,
         // 是否真的回复由评估模型(interjection_worthy)与 Core 判定把关。

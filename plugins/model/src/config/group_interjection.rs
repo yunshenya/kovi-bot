@@ -47,6 +47,18 @@ pub struct GroupInterjectionConfig {
     familiar_rate_window_secs: u64,
     /// 限流窗口内同一群最多放行多少条熟人消息进入语义评估。
     familiar_rate_limit: usize,
+    /// 接续对话窗口：芸汐最近一次在本群发出可见消息后，未点名消息在
+    /// 这个时长内走"接续对话"语义评估（由相关性判定是否回复），窗口外
+    /// 回到低频插话抽样。窗口越长，群内每条消息请求模型的概率越高。
+    continuation_window_secs: u64,
+    /// 同群两次群聊可见回复（点名或未点名）之间的最短间隔（秒）。
+    /// 对"每句话都回"的刷屏波次做硬性控制；管理员豁免。
+    reply_gap_secs: u64,
+    /// 群聊可见回复频率统计窗口（秒）。
+    reply_rate_window_secs: u64,
+    /// 统计窗口内同一群最多输出多少条可见回复（Admin/命令/识图等显式
+    /// 请求不受限）。
+    reply_rate_limit: usize,
 }
 
 impl GroupInterjectionConfig {
@@ -130,6 +142,22 @@ impl GroupInterjectionConfig {
         self.familiar_rate_limit
     }
 
+    pub fn continuation_window_secs(&self) -> u64 {
+        self.continuation_window_secs
+    }
+
+    pub fn reply_gap_secs(&self) -> u64 {
+        self.reply_gap_secs
+    }
+
+    pub fn reply_rate_window_secs(&self) -> u64 {
+        self.reply_rate_window_secs
+    }
+
+    pub fn reply_rate_limit(&self) -> usize {
+        self.reply_rate_limit
+    }
+
     pub fn validate(&self) -> anyhow::Result<()> {
         if self.min_eligible_messages == 0 {
             return Err(anyhow::anyhow!("群聊接话消息间隔必须大于0"));
@@ -169,6 +197,15 @@ impl GroupInterjectionConfig {
         if self.familiar_rate_window_secs == 0 || self.familiar_rate_limit == 0 {
             return Err(anyhow::anyhow!("熟人放行限流配置必须大于0"));
         }
+        if self.continuation_window_secs == 0 {
+            return Err(anyhow::anyhow!("接续对话窗口必须大于0秒"));
+        }
+        if self.reply_gap_secs == 0
+            || self.reply_rate_window_secs == 0
+            || self.reply_rate_limit == 0
+        {
+            return Err(anyhow::anyhow!("群聊回复节奏配置必须大于0"));
+        }
         Ok(())
     }
 }
@@ -196,6 +233,10 @@ impl Default for GroupInterjectionConfig {
             familiarity_threshold: 0.5,
             familiar_rate_window_secs: 600,
             familiar_rate_limit: 6,
+            continuation_window_secs: 180,
+            reply_gap_secs: 90,
+            reply_rate_window_secs: 600,
+            reply_rate_limit: 4,
         }
     }
 }

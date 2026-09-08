@@ -46,6 +46,11 @@ impl GroupConversationState {
         self.active || !self.pending.is_empty()
     }
 
+    /// 是否有正在处理中的回复回合（pending 非空）。
+    pub(crate) fn has_pending_turn(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
     pub(crate) fn context(&self) -> String {
         if self.topics.is_empty() {
             "（当前没有已确认的群聊主题）".to_owned()

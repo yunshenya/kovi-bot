@@ -46,11 +46,12 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
-/// 芸汐上一次在本群发出可见消息后，连续会话上下文保持激活的时长。
-/// 窗口内到达的未点名消息走“接续对话”语义（由模型判定相关性），而不是
-/// 只能靠低概率插话抽样；窗口外回到纯抽样。这保证她刚开口说过话时，
-/// 对方接着说的内容是“能看到”的。
-const GROUP_CONTINUATION_WINDOW_SECS: u64 = 10 * 60;
+/// 当前配置的接续对话窗口（秒）。
+fn continuation_window_secs() -> u64 {
+    config::get()
+        .group_interjection()
+        .continuation_window_secs()
+}
 
 #[derive(Default)]
 struct GroupInterjectionState {
@@ -61,6 +62,8 @@ struct GroupInterjectionState {
     conversation: GroupConversationState,
     /// 无论哪条发送路径（Host 或 Core）在本群发出可见消息的时间。
     last_bot_reply: Option<Instant>,
+    /// 本群可见聊天回复的时间记录（有界），用于群级回复节奏硬限制。
+    visible_replies: VecDeque<Instant>,
 }
 
 /// 未点名接话只维护本地计数和冷却状态；不会为每一条群消息调用模型。
@@ -848,9 +851,24 @@ pub(crate) async fn group_message_event_after_ingress(
     )
     .await;
     let continue_conversation = !primary_reply_expected && conversation_decision.continue_reply;
-    let direct_reply_expected = primary_reply_expected
+    // 群聊可见回复节奏硬限制（同群所有普通聊天回复共享额度）。管理员、
+    // 显式识图请求、表情教学与禁言命令不受限；额度被拒时本条仅作观察，
+    // 不生成可见回复——这是"每句话都回/扑上来接话"的确定性兜底。
+    let reply_budget_ok = !(primary_reply_expected
         || continue_conversation
-        || (sampled_for_interjection && understanding.interjection_worthy);
+        || (sampled_for_interjection && understanding.interjection_worthy))
+        || sender_is_admin
+        || vision_requested
+        || explicit_sticker_teaching
+        || matches!(message.trim(), "#禁言" | "#结束禁言")
+        || reserve_group_chat_reply(group_id).await;
+    if !reply_budget_ok && sampled_for_interjection {
+        finish_interjection_attempt(group_id, false).await;
+    }
+    let direct_reply_expected = reply_budget_ok
+        && (primary_reply_expected
+            || continue_conversation
+            || (sampled_for_interjection && understanding.interjection_worthy));
     let Some(admission) =
         admit_understood_group_turn(initial_admission, &understanding, direct_reply_expected).await
     else {
@@ -876,7 +894,7 @@ pub(crate) async fn group_message_event_after_ingress(
         );
         return;
     }
-    if primary_reply_expected {
+    if primary_reply_expected && reply_budget_ok {
         if !stickers.is_empty()
             && let Err(error) = sticker_memory::record_usage(
                 &stickers,
@@ -926,7 +944,7 @@ pub(crate) async fn group_message_event_after_ingress(
         shadow_guard.mark_replied(replied);
         finish_conversation_turn(group_id, event.user_id, turn_marker, replied).await;
         drain_pending_window_messages(group_id, Arc::clone(&bot), ticket).await;
-    } else if continue_conversation {
+    } else if continue_conversation && reply_budget_ok {
         println!("[INFO] 群聊接续对话 (群组: {})", group_id);
         if !stickers.is_empty()
             && let Err(error) = sticker_memory::record_usage(
@@ -977,7 +995,7 @@ pub(crate) async fn group_message_event_after_ingress(
         shadow_guard.mark_replied(replied);
         finish_conversation_turn(group_id, event.user_id, turn_marker, replied).await;
         drain_pending_window_messages(group_id, Arc::clone(&bot), ticket).await;
-    } else if sampled_for_interjection && understanding.interjection_worthy {
+    } else if sampled_for_interjection && understanding.interjection_worthy && reply_budget_ok {
         println!("[INFO] 群聊未点名接话 (群组: {})", group_id);
         if !stickers.is_empty()
             && let Err(error) = sticker_memory::record_usage(
@@ -1354,14 +1372,41 @@ async fn group_conversation_snapshot(group_id: i64) -> (bool, String) {
     )
 }
 
-/// 会话是否处于“接续对话”激活状态：语义会话未关闭，或芸汐刚在本群发过
-/// 可见消息（还在连续会话窗口内）。
+/// 会话是否处于“接续对话”激活状态：有正在处理的回复回合，或芸汐刚在本群
+/// 发过可见消息（还在接续窗口内）。语义会话状态本身不随回复衰减，因此
+/// 这里必须由“最近一次可见回复”的时间窗口来限定：窗口一过期，未点名消息
+/// 回到低频抽样，避免“每句话都接”的永久高敏感模式。
 fn conversation_active_for_observation(state: &GroupInterjectionState, now: Instant) -> bool {
-    state.conversation.is_active()
+    state.conversation.has_pending_turn()
         || state.last_bot_reply.is_some_and(|last| {
-            now.saturating_duration_since(last)
-                < Duration::from_secs(GROUP_CONTINUATION_WINDOW_SECS)
+            now.saturating_duration_since(last) < Duration::from_secs(continuation_window_secs())
         })
+}
+
+/// 同步查询"群聊可见回复预算":当前是否还有名额（供 bridge 采样门在
+/// 入队前快速判断）。这只是咨询,不消耗名额;正在处理中的并发写由
+/// `reserve_group_chat_reply` 原子预留。与写锁竞争时按"还有名额"处理,
+/// 避免把已入队的有效对话误杀。
+pub(crate) fn group_reply_budget_available_now(group_id: i64) -> bool {
+    let config = config::get().group_interjection().clone();
+    match GROUP_INTERJECTION_STATE.try_lock() {
+        Ok(states) => states.get(&group_id).is_none_or(|state| {
+            let now = Instant::now();
+            let rate_window = Duration::from_secs(config.reply_rate_window_secs());
+            let within_window = state
+                .visible_replies
+                .iter()
+                .filter(|seen_at| now.saturating_duration_since(**seen_at) < rate_window)
+                .count();
+            if within_window >= config.reply_rate_limit() {
+                return false;
+            }
+            state.visible_replies.back().is_none_or(|last| {
+                now.saturating_duration_since(*last) >= Duration::from_secs(config.reply_gap_secs())
+            })
+        }),
+        Err(_) => true,
+    }
 }
 
 /// 标记芸汐在本群发出了一条可见消息。Host 回复与 Core 回复都经过
@@ -1379,11 +1424,60 @@ pub(crate) fn conversation_continuation_active_now(group_id: i64) -> bool {
     match GROUP_INTERJECTION_STATE.try_lock() {
         Ok(states) => states.get(&group_id).is_some_and(|state| {
             state.last_bot_reply.is_some_and(|last| {
-                last.elapsed() < Duration::from_secs(GROUP_CONTINUATION_WINDOW_SECS)
+                last.elapsed() < Duration::from_secs(continuation_window_secs())
             })
         }),
         Err(_) => false,
     }
+}
+
+/// 为本群预留一次"群聊可见回复"的名额（硬节奏控制，点名/未点名共用）。
+///
+/// 接续对话有语义入口但没有冷却，模型在窗口内几乎"每句都接"，是刷屏的
+/// 主通道；插话路径虽有抽样冷却，这里统一按群施加确定性的回复
+/// 间隔 + 频率上限：预留成功才允许生成可见回复，被拒时本条只作观察。
+/// 预留是乐观的（模型可能最终沉默），方向只保守不激进。
+pub(crate) async fn reserve_group_chat_reply(group_id: i64) -> bool {
+    let config = config::get().group_interjection().clone();
+    let mut states = GROUP_INTERJECTION_STATE.lock().await;
+    prune_interjection_states(&mut states);
+    let state = states.entry(group_id).or_default();
+    reserve_visible_reply_slot(
+        state,
+        Instant::now(),
+        Duration::from_secs(config.reply_gap_secs()),
+        Duration::from_secs(config.reply_rate_window_secs()),
+        config.reply_rate_limit(),
+    )
+}
+
+/// 纯函数：在单群状态上执行"可见回复"名额预留。
+fn reserve_visible_reply_slot(
+    state: &mut GroupInterjectionState,
+    now: Instant,
+    gap: Duration,
+    rate_window: Duration,
+    rate_limit: usize,
+) -> bool {
+    while state
+        .visible_replies
+        .front()
+        .is_some_and(|seen_at| now.saturating_duration_since(*seen_at) >= rate_window)
+    {
+        state.visible_replies.pop_front();
+    }
+    if state.visible_replies.len() >= rate_limit {
+        return false;
+    }
+    if state
+        .visible_replies
+        .back()
+        .is_some_and(|last| now.saturating_duration_since(*last) < gap)
+    {
+        return false;
+    }
+    state.visible_replies.push_back(now);
+    true
 }
 
 async fn observe_group_conversation(
@@ -1750,9 +1844,17 @@ fn prune_interjection_states(states: &mut HashMap<i64, GroupInterjectionState>) 
     let interjection_config = config::get().group_interjection().clone();
     let cooldown = Duration::from_secs(interjection_config.cooldown_secs());
     let decision_window = Duration::from_secs(interjection_config.decision_rate_window_secs());
+    let reply_rate_window = Duration::from_secs(interjection_config.reply_rate_window_secs());
     for state in states.values_mut() {
         state.conversation.prune();
         prune_decision_attempts(state, now, decision_window);
+        while state
+            .visible_replies
+            .front()
+            .is_some_and(|seen_at| now.saturating_duration_since(*seen_at) >= reply_rate_window)
+        {
+            state.visible_replies.pop_front();
+        }
     }
     if states.len() <= 1_024 {
         return;
@@ -1761,6 +1863,7 @@ fn prune_interjection_states(states: &mut HashMap<i64, GroupInterjectionState>) 
         state.interjection_in_flight
             || state.conversation.is_active()
             || !state.decision_attempts.is_empty()
+            || !state.visible_replies.is_empty()
             || state
                 .last_interjection
                 .is_some_and(|last| now.duration_since(last) < cooldown)
@@ -1862,19 +1965,20 @@ async fn update_group_profile(group_id: i64, user_id: i64, understanding: &Messa
 #[cfg(test)]
 mod tests {
     use super::{
-        Addressing, DirectTriggerState, GROUP_CONTINUATION_WINDOW_SECS, GroupInterjectionState,
-        GroupSenderIdentity, PENDING_WINDOW_MESSAGES, admit_understood_group_turn,
+        Addressing, DirectTriggerState, GroupInterjectionState, GroupSenderIdentity,
+        PENDING_WINDOW_MESSAGES, admit_understood_group_turn,
         clear_group_erasure_reply_state_locked, complete_interjection_attempt,
-        conversation_active_for_observation, decision_budget_available, directed_at_others,
-        group_erasure_receipt_destination, message_at_self, normalized_sender_name,
-        prune_decision_attempts, queue_pending_window_message, should_queue_after_executive,
-        suppress_direct_trigger, take_pending_window_turn, text_mentions_bot,
-        with_structured_bot_mention_context,
+        continuation_window_secs, conversation_active_for_observation, decision_budget_available,
+        directed_at_others, group_erasure_receipt_destination, message_at_self,
+        normalized_sender_name, prune_decision_attempts, queue_pending_window_message,
+        reserve_visible_reply_slot, should_queue_after_executive, suppress_direct_trigger,
+        take_pending_window_turn, text_mentions_bot, with_structured_bot_mention_context,
     };
     use crate::model::MessageDestination;
     use crate::model::conversation_coordinator::{
         ConversationCoordinator, OutgoingExecutiveDecision,
     };
+    use crate::model::conversation_state::ConversationTurnOptions;
     use crate::model::interrupt::{
         OutgoingSource, OutgoingState, ReplyScope, commit_outgoing, interrupt, interrupt_locked,
         is_current, is_scope_epoch_current, mark_active, mark_outgoing_failed,
@@ -1961,6 +2065,7 @@ mod tests {
 
     #[test]
     fn fresh_bot_reply_opens_continuation_window_then_expires() {
+        let window = continuation_window_secs();
         let now = Instant::now();
         let mut state = GroupInterjectionState::default();
         assert!(!conversation_active_for_observation(&state, now));
@@ -1968,8 +2073,33 @@ mod tests {
         state.last_bot_reply = Some(now - Duration::from_secs(60));
         assert!(conversation_active_for_observation(&state, now));
 
-        state.last_bot_reply = Some(now - Duration::from_secs(GROUP_CONTINUATION_WINDOW_SECS + 1));
+        state.last_bot_reply = Some(now - Duration::from_secs(window + 1));
         assert!(!conversation_active_for_observation(&state, now));
+    }
+
+    #[test]
+    fn continuation_window_requires_fresh_reply_even_semantically_active() {
+        // 语义会话状态本身不随回复衰减：即使 `conversation.active` 仍为真，
+        // 只要最近一次可见回复已过期，观察门就必须关闭，避免"每句话都回"。
+        let window = continuation_window_secs();
+        let now = Instant::now();
+        let mut state = GroupInterjectionState::default();
+        let marker = state.conversation.begin_turn(
+            42,
+            ConversationTurnOptions {
+                reset_context: true,
+                close_after_reply: false,
+            },
+            &["面试".to_owned()],
+        );
+        state.conversation.finish_turn(42, marker, true);
+        assert!(state.conversation.is_active());
+
+        state.last_bot_reply = Some(now - Duration::from_secs(window + 1));
+        assert!(!conversation_active_for_observation(&state, now));
+
+        state.last_bot_reply = Some(now - Duration::from_secs(10));
+        assert!(conversation_active_for_observation(&state, now));
     }
 
     #[test]
@@ -2213,6 +2343,57 @@ mod tests {
         complete_interjection_attempt(&mut state, true, now);
         assert!(!state.interjection_in_flight);
         assert_eq!(state.last_interjection, Some(now));
+    }
+
+    #[test]
+    fn group_visible_reply_budget_enforces_gap_then_rate_window() {
+        let mut state = GroupInterjectionState::default();
+        let started = Instant::now();
+        let gap = Duration::from_secs(90);
+        let rate_window = Duration::from_secs(600);
+        let rate_limit = 4;
+
+        // 首次预留成功。
+        assert!(reserve_visible_reply_slot(
+            &mut state,
+            started,
+            gap,
+            rate_window,
+            rate_limit
+        ));
+        // 冷却内（90 秒前）拒绝。
+        assert!(!reserve_visible_reply_slot(
+            &mut state,
+            started + Duration::from_secs(45),
+            gap,
+            rate_window,
+            rate_limit
+        ));
+        // 冷却期满后放行，直到窗口内额度用尽。
+        for offset in [90, 180, 270] {
+            assert!(reserve_visible_reply_slot(
+                &mut state,
+                started + Duration::from_secs(offset),
+                gap,
+                rate_window,
+                rate_limit
+            ));
+        }
+        assert!(!reserve_visible_reply_slot(
+            &mut state,
+            started + Duration::from_secs(300),
+            gap,
+            rate_window,
+            rate_limit
+        ));
+        // 窗口滑过 600 秒后最早的记录失效，重新释放名额。
+        assert!(reserve_visible_reply_slot(
+            &mut state,
+            started + Duration::from_secs(601),
+            gap,
+            rate_window,
+            rate_limit
+        ));
     }
 
     #[test]
