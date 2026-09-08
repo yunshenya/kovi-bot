@@ -4712,13 +4712,15 @@ impl ModelBackend for KoviModelBackend {
             if !mark_active(ticket).await {
                 return Ok(silent_with_interaction_state(input));
             }
-            let expects_vision = message.is_some_and(|message| {
-                message
-                    .content
-                    .attachments()
-                    .iter()
-                    .any(|attachment| attachment.kind() == AttachmentKind::Image)
-            });
+            let vision_disabled = config::get().vision().disabled();
+            let expects_vision = !vision_disabled
+                && message.is_some_and(|message| {
+                    message
+                        .content
+                        .attachments()
+                        .iter()
+                        .any(|attachment| attachment.kind() == AttachmentKind::Image)
+                });
             let (vision_images, vision_resolution_error) = if expects_vision {
                 match crate::vision::resolve_image_urls(&vision_attachments, &self.bot).await {
                     Ok(images) if !images.is_empty() => (images, None),

@@ -2146,7 +2146,9 @@ pub(crate) async fn params_model_with_native_tools(
         });
     }
 
-    let force_external_vision = !vision_images.is_empty()
+    let vision_disabled = config.vision().disabled();
+    let force_external_vision = !vision_disabled
+        && !vision_images.is_empty()
         && !matches!(config.vision().provider(), "auto")
         && server_config.supports_vision();
     let model_vision_images = if server_config.supports_vision() && !force_external_vision {
@@ -2154,7 +2156,12 @@ pub(crate) async fn params_model_with_native_tools(
     } else {
         &[]
     };
-    if (!server_config.supports_vision() || force_external_vision) && !vision_images.is_empty() {
+    // 视觉 Provider 显式禁用时跳过图片分析：正文留空，主模型看不到图片，
+    // 也不会进入"截图分析失败"错误路径。
+    if !vision_disabled
+        && (!server_config.supports_vision() || force_external_vision)
+        && !vision_images.is_empty()
+    {
         let question = request_messages
             .iter()
             .rev()
@@ -2323,7 +2330,9 @@ async fn params_model_with_token_limit_and_progress_for_reply_mode_inner(
         });
     }
 
-    let force_external_vision = !vision_images.is_empty()
+    let vision_disabled = config.vision().disabled();
+    let force_external_vision = !vision_disabled
+        && !vision_images.is_empty()
         && !matches!(config.vision().provider(), "auto")
         && server_config.supports_vision();
     let model_vision_images = if server_config.supports_vision() && !force_external_vision {
@@ -2331,7 +2340,10 @@ async fn params_model_with_token_limit_and_progress_for_reply_mode_inner(
     } else {
         &[]
     };
-    if (!server_config.supports_vision() || force_external_vision) && !vision_images.is_empty() {
+    if !vision_disabled
+        && (!server_config.supports_vision() || force_external_vision)
+        && !vision_images.is_empty()
+    {
         let question = request_messages
             .iter()
             .rev()

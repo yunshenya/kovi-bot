@@ -786,8 +786,8 @@ pub(crate) async fn group_message_event_after_ingress(
     if sampled_for_interjection && !understanding.interjection_worthy {
         finish_interjection_attempt(group_id, false).await;
     }
-    vision_requested =
-        batch_vision_requested || understanding.should_understand_image(&batch_request);
+    vision_requested = !config::get().vision().disabled()
+        && (batch_vision_requested || understanding.should_understand_image(&batch_request));
     if intent_text.trim().is_empty()
         && !vision_requested
         && model_message.trim().is_empty()

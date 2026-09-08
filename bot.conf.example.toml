@@ -264,9 +264,10 @@ max_task_instruction_chars = 2000
 max_task_output_chars = 4000
 
 [vision]
-# 视觉优先使用本地 Intrinsic 模型（不依赖外部端点）；external 端点不可用时
-# 可切回 auto 让内置 Provider 与本地模型自动回退。本地推理较慢，超时给足。
-provider = "intrinsic"
+# 当前生产环境本地 Intrinsic 模型不支持视觉，直接禁用图片分析：
+# 消息中的图片不会解析、不会走 Provider，也不会报"截图分析失败"，
+# 主模型按纯文本上下文处理。恢复视觉时改回 intrinsic/auto/builtin/mcp。
+provider = "disabled"
 mcp_server = ""
 mcp_tool = "analyze_image"
 timeout_secs = 120

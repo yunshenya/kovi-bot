@@ -18,6 +18,12 @@ impl VisionConfig {
         &self.provider
     }
 
+    /// 视觉功能是否显式关闭。关闭时宿主跳过图片分析:不解析、不调用
+    /// Provider、不构造"截图分析失败"错误,主模型按纯文本上下文处理。
+    pub fn disabled(&self) -> bool {
+        self.provider == "disabled"
+    }
+
     pub fn mcp_server(&self) -> &str {
         &self.mcp_server
     }
@@ -33,10 +39,10 @@ impl VisionConfig {
     pub fn validate(&self) -> anyhow::Result<()> {
         if !matches!(
             self.provider.as_str(),
-            "auto" | "intrinsic" | "builtin" | "mcp"
+            "auto" | "intrinsic" | "builtin" | "mcp" | "disabled"
         ) {
             return Err(anyhow::anyhow!(
-                "vision.provider 必须是 auto、intrinsic、builtin 或 mcp"
+                "vision.provider 必须是 auto、intrinsic、builtin、mcp 或 disabled"
             ));
         }
         if self.timeout_secs == 0 || self.timeout_secs > 120 {

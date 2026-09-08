@@ -244,7 +244,9 @@ max_report_chars = 3000
 lease_secs = 180
 
 [vision]
-provider = "intrinsic"
+# 本地 Intrinsic 模型不支持视觉，禁用图片分析（不报"截图分析失败"）。
+# 恢复视觉时改回 intrinsic/auto/builtin/mcp。
+provider = "disabled"
 mcp_server = ""
 mcp_tool = "analyze_image"
 timeout_secs = 120

@@ -654,9 +654,10 @@ pub(crate) async fn private_message_event_after_ingress(
                 .collect::<Vec<_>>(),
         );
     }
-    vision_requested = batch_vision_requested
-        || understanding.should_understand_image(&batch_request)
-        || !selected_recent_images.is_empty();
+    vision_requested = !config::get().vision().disabled()
+        && (batch_vision_requested
+            || understanding.should_understand_image(&batch_request)
+            || !selected_recent_images.is_empty());
     let social_vision_requested = vision_requested
         && batch_vision_requested
         && !vision_command
