@@ -120,6 +120,12 @@ pub(crate) async fn clear_group_runtime_data(group_id: i64) {
     MEMORY.lock().await.remove(&group_id);
     GROUP_HISTORY_ACCESS.lock().await.remove(&group_id);
     IS_BANNED.lock().await.remove(&group_id);
+    if let Err(error) = persist_group_pause(group_id, false).await {
+        eprintln!(
+            "[WARN] 清理群禁言持久状态失败 (群组: {}): {}",
+            group_id, error
+        );
+    }
 }
 
 /// 复用连接池，并限制并发模型请求，避免高峰时把上游 API 和本机连接耗尽。
@@ -687,7 +693,7 @@ pub async fn control_model(
     let mut plan = if allow_reply_actions {
         ReplyPlan::from_model_output_for_sender(reply_scope, &response.content, Some(user_id)).await
     } else {
-        plain_reply_plan(reply_scope, &response.content).unwrap_or_else(ReplyPlan::empty_reply)
+        plain_reply_plan_for_host(reply_scope, &response.content)
     };
     if !is_current(reply_ticket).await {
         limit_memory_size(&mut messages);
@@ -1346,6 +1352,22 @@ fn plain_reply_plan(scope: super::interrupt::ReplyScope, content: &str) -> Optio
         return None;
     }
     ReplyPlan::from_plain_bubbles(scope, vec![text.to_owned()])
+}
+
+/// Host 普通文本路径也要尊重模型输出的结构化静默判定。
+///
+/// 群被 `#禁言` 时,工具链路会确定性地返回 `[[REPLY_ACTION]]{"disposition":"silent"}[[/REPLY_ACTION]]`;
+/// 若这里仍按"包含传输协议"拒绝并进入空回复修复,静默意图会被强制改写成
+/// 可见正文,导致禁言在一轮之后失效(模型明明选择沉默,修复却替它发出了话)。
+fn plain_reply_plan_for_host(scope: super::interrupt::ReplyScope, content: &str) -> ReplyPlan {
+    if super::reply::parse_reply_output(content)
+        .disposition
+        .is_silent()
+    {
+        ReplyPlan::silent()
+    } else {
+        plain_reply_plan(scope, content).unwrap_or_else(ReplyPlan::empty_reply)
+    }
 }
 
 /// Reject only output that is recognizably an internal transport envelope.
@@ -3307,8 +3329,56 @@ pub(crate) async fn is_group_paused(group_id: i64) -> bool {
         || crate::model::send_guard::is_send_rejected(group_id).await
 }
 
+/// 群禁言状态在 Redis 中的持久层 key(哈希: field=群号, value="1" 表示禁言)。
+/// Redis 不可用时保持纯内存语义,不阻断禁言/解除。
+const GROUP_PAUSE_REDIS_KEY: &str = "group_paused";
+
 pub(crate) async fn set_group_paused(group_id: i64, paused: bool) {
     instance_is_ban().lock().await.insert(group_id, paused);
+    if let Err(error) = persist_group_pause(group_id, paused).await {
+        eprintln!(
+            "[WARN] 群禁言状态持久化失败 (群组: {}): {}",
+            group_id, error
+        );
+    }
+}
+
+/// 把显式暂停状态写入 Redis(对等进程/重启后可恢复)。Redis 未配置或操作
+/// 失败时仅告警,进程内状态仍生效。
+async fn persist_group_pause(group_id: i64, paused: bool) -> anyhow::Result<()> {
+    let Some(store) = crate::redis_store::get().await else {
+        return Ok(());
+    };
+    if paused {
+        store
+            .hash_set(GROUP_PAUSE_REDIS_KEY, &group_id.to_string(), "1")
+            .await
+    } else {
+        store
+            .hash_del(GROUP_PAUSE_REDIS_KEY, &group_id.to_string())
+            .await
+    }
+}
+
+/// 启动时从 Redis 恢复群禁言状态,避免服务重启后 #禁言 静默失效。
+pub(crate) async fn restore_group_pause_state() {
+    let Some(store) = crate::redis_store::get().await else {
+        return;
+    };
+    match store.hash_get_all(GROUP_PAUSE_REDIS_KEY).await {
+        Ok(entries) => {
+            let mut banned = instance_is_ban().lock().await;
+            for (field, value) in entries {
+                if value == "1"
+                    && let Ok(group_id) = field.parse::<i64>()
+                {
+                    banned.insert(group_id, true);
+                }
+            }
+            println!("[INFO] 已恢复群禁言状态 (群组数: {})", banned.len());
+        }
+        Err(error) => eprintln!("[WARN] 群禁言状态恢复失败: {error}"),
+    }
 }
 
 async fn group_history(group_id: i64) -> ConversationHistory {
@@ -3895,7 +3965,7 @@ async fn private_chat_inner(
     let mut plan = if allow_reply_actions {
         ReplyPlan::from_model_output(reply_scope, &bot_content.content).await
     } else {
-        plain_reply_plan(reply_scope, &bot_content.content).unwrap_or_else(ReplyPlan::empty_reply)
+        plain_reply_plan_for_host(reply_scope, &bot_content.content)
     };
     if !is_current(reply_ticket).await {
         limit_memory_size(&mut history);
@@ -4213,8 +4283,8 @@ mod tests {
         group_system_prompt, is_group_admin_command, is_help_command, is_restricted_command,
         likely_requires_tool_protocol, limit_memory_size, model_attempt_count,
         neutralize_protocol_markers, parse_stream_line, plain_reply_plan,
-        reply_action_protocol_requested, sanitize_scheduled_output, should_repair_empty_reply,
-        tool_result_wire, with_reference_context,
+        plain_reply_plan_for_host, reply_action_protocol_requested, sanitize_scheduled_output,
+        should_repair_empty_reply, tool_result_wire, with_reference_context,
     };
     use crate::memory::{BotPersonality, UserProfile};
     use crate::model::message_actions::{ReplyPlan, follow_up_delay_millis, split_reply};
@@ -4269,6 +4339,33 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn plain_host_plan_honors_explicit_silence_instead_of_repairing_it() {
+        let scope = crate::model::interrupt::ReplyScope::Group(9_100_001);
+        let silent = crate::model::reply_disposition::SILENT_REPLY_OUTPUT;
+        let plan = plain_reply_plan_for_host(scope, silent);
+        assert!(
+            plan.is_silent(),
+            "静默协议必须被识别为静默计划,而不是走空回复修复"
+        );
+        assert!(!plan.has_visible_reply());
+        // 修复判定也必须跳过:静默不是空回复。
+        let understanding = MessageUnderstanding::default();
+        assert!(
+            !should_repair_empty_reply(&plan, true, &understanding),
+            "显式静默计划不应触发空回复修复"
+        );
+        // 普通正文仍走原 plain 路径。
+        let normal = plain_reply_plan_for_host(scope, "今天过得怎么样?");
+        assert!(!normal.is_silent());
+        assert!(normal.has_visible_reply());
+        // 非静默但包含协议的对象仍按旧行为拒绝(交由修复)。
+        let protocol_without_silence = "[[REPLY_ACTION]]{\"at_user_ids\":[1]}[[/REPLY_ACTION]]";
+        let rejected = plain_reply_plan_for_host(scope, protocol_without_silence);
+        assert!(!rejected.is_silent());
+        assert!(!rejected.has_visible_reply());
     }
 
     #[test]

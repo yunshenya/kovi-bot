@@ -26,9 +26,25 @@ use rand::prelude::IndexedRandom;
 use std::sync::Arc;
 use std::time::Duration;
 use yunxi_core::{
-    ActionPortOutcome, ActionResult, MessageContent, ProactiveOpportunity, ProposedAction,
-    ReachOutAction, ReachOutIntent,
+    ActionPortOutcome, ActionResult, ConversationId, ConversationKind, ConversationTurnDirective,
+    MessageContent, ProactiveOpportunity, ProposedAction, ReachOutAction, ReachOutIntent,
 };
+
+/// 解析群会话对应的 QQ 群号；身份映射缺失/数据库失败时返回 None（调用方
+/// 必须按“未知”处理，而不是当作未禁言）。
+async fn proactive_group_id(conversation_id: ConversationId) -> Option<i64> {
+    let store = crate::yunxi::identity_store()?;
+    store
+        .qq_external_conversations_for_id(conversation_id)
+        .await
+        .ok()?
+        .into_iter()
+        .find_map(|(external_id, kind)| {
+            (kind == ConversationKind::Group)
+                .then(|| external_id.parse::<i64>().ok())
+                .flatten()
+        })
+}
 
 pub mod startup;
 
@@ -171,6 +187,25 @@ impl ProactiveChatManager {
         else {
             return;
         };
+        // 群被 #禁言 时主动心跳同样保持静默；解析不出群号时按原路径提交
+        // (fail-open,不改变既有行为)。
+        if claim.conversation_kind == ConversationKind::Group
+            && let Some(group_id) = proactive_group_id(claim.conversation_id).await
+            && crate::model::utils::is_group_paused(group_id).await
+        {
+            kovi::log::info!(
+                "Yunxi autonomous conversation tick skipped: group {group_id} is paused"
+            );
+            yunxi::autonomous::finish_claim_token(
+                claim.conversation_id,
+                claim.token,
+                chrono::Utc::now(),
+                false,
+                ConversationTurnDirective::Wait,
+                proactive_config,
+            );
+            return;
+        }
         match bridge
             .submit_autonomous_conversation_tick(
                 claim.conversation_id,

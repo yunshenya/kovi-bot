@@ -579,6 +579,14 @@ pub(crate) async fn params_model_with_tool_access(
         }
     } else if agent_run_create_succeeded && is_model_error_response(&response.content) {
         completed_agent_run_response()
+    } else if tool_context.group_paused {
+        // 与 383 行的确定性静默一致：暂停状态在轮次耗尽后依然生效，模型
+        // 输出的可见正文不能绕过“禁言期间不说话”的约束；只有本轮成功
+        // 执行了 group.resume（此处 group_paused 已被清掉）才允许可见回复。
+        BotMemory {
+            role: Roles::Assistant,
+            content: SILENT_REPLY_OUTPUT.to_string(),
+        }
     } else {
         response
     }

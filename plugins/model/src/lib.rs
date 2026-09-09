@@ -377,6 +377,9 @@ async fn main() {
     // Redis 只承载可丢失的运行态；连接失败时各模块会继续使用本地兜底。
     redis_store::initialize().await;
 
+    // 群禁言状态已接入 Redis 持久层：重启后恢复，避免 #禁言 静默失效。
+    model::utils::restore_group_pause_state().await;
+
     if let Err(error) = model::tool_access::initialize().await {
         eprintln!(
             "[ERROR] 模型工具初始化失败，工具调用功能暂不可用: {}",
@@ -467,7 +470,8 @@ async fn main() {
                 );
                 return;
             }
-            let group_decision = bridge.classify_group(&event);
+            let group_paused = crate::model::utils::is_group_paused(group_id).await;
+            let group_decision = bridge.classify_group(&event, group_paused);
             if group_decision.handling == yunxi::bridge::GroupCoreHandling::Observe {
                 // Un-addressed group text is observed AND may occasionally be
                 // answered by the host's group_interjection sampler. Routing it

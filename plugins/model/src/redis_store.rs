@@ -290,6 +290,56 @@ impl RedisStore {
         Ok(())
     }
 
+    /// 写入一个无 TTL 的哈希字段（用于跨重启保留的小状态，如群禁言）。
+    pub(crate) async fn hash_set(&self, suffix: &str, field: &str, value: &str) -> Result<()> {
+        let mut connection = self.connection.clone();
+        let _: i64 = kovi::tokio::time::timeout(
+            REDIS_COMMAND_TIMEOUT,
+            redis::cmd("HSET")
+                .arg(self.key(suffix))
+                .arg(field)
+                .arg(value)
+                .query_async(&mut connection),
+        )
+        .await
+        .map_err(|_| anyhow!("Redis 写入哈希超时"))?
+        .context("Redis 写入哈希失败")?;
+        Ok(())
+    }
+
+    /// 删除一个哈希字段。
+    pub(crate) async fn hash_del(&self, suffix: &str, field: &str) -> Result<()> {
+        let mut connection = self.connection.clone();
+        let _: i64 = kovi::tokio::time::timeout(
+            REDIS_COMMAND_TIMEOUT,
+            redis::cmd("HDEL")
+                .arg(self.key(suffix))
+                .arg(field)
+                .query_async(&mut connection),
+        )
+        .await
+        .map_err(|_| anyhow!("Redis 删除哈希字段超时"))?
+        .context("Redis 删除哈希字段失败")?;
+        Ok(())
+    }
+
+    /// 读取整个哈希（field -> value）。
+    pub(crate) async fn hash_get_all(
+        &self,
+        suffix: &str,
+    ) -> Result<std::collections::HashMap<String, String>> {
+        let mut connection = self.connection.clone();
+        kovi::tokio::time::timeout(
+            REDIS_COMMAND_TIMEOUT,
+            redis::cmd("HGETALL")
+                .arg(self.key(suffix))
+                .query_async(&mut connection),
+        )
+        .await
+        .map_err(|_| anyhow!("Redis 读取哈希超时"))?
+        .context("Redis 读取哈希失败")
+    }
+
     /// 在时间窗口内原子递增计数；返回窗口内当前次数。
     pub(crate) async fn increment_expiring(&self, suffix: &str, window: Duration) -> Result<i64> {
         let mut connection = self.connection.clone();

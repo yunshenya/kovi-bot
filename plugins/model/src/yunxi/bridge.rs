@@ -1457,7 +1457,11 @@ impl CoreBridge {
             && InboundMessage::from_group(event, false).is_some()
     }
 
-    pub(crate) fn classify_group(&self, event: &GroupMsgEvent) -> GroupHandlingDecision {
+    pub(crate) fn classify_group(
+        &self,
+        event: &GroupMsgEvent,
+        group_paused: bool,
+    ) -> GroupHandlingDecision {
         if !self.supports_group(event) {
             return GroupHandlingDecision {
                 handling: GroupCoreHandling::Unsupported,
@@ -1469,6 +1473,17 @@ impl CoreBridge {
         // 它们通常很短(3-6 字),接续窗口/熟人放行的宽松通道会把它们误采样
         // 进 Core,导致命令被当成聊天而失效。
         if event.borrow_text().is_some_and(is_host_command_text) {
+            return GroupHandlingDecision {
+                handling: GroupCoreHandling::Observe,
+                planner_attention_requested: false,
+                explicit_batch_request: false,
+            };
+        }
+        // 群处于显式暂停(#禁言)或发送被拒退避时，即使被点名、被引用或处于
+        // 接续/熟人放行窗口，也不进入 Core 决策，统一交给 Host 链路裁决。
+        // Core 的规划器不知道这个暂停状态，放行会让它在禁言期间继续生成
+        // 可见回复；Host 链路对非管理员静默、对管理员仍保留恢复通道。
+        if group_paused {
             return GroupHandlingDecision {
                 handling: GroupCoreHandling::Observe,
                 planner_attention_requested: false,
@@ -4162,17 +4177,18 @@ fn ambient_group_payload_can_be_sampled(message: &Message) -> bool {
 mod tests {
     use super::{
         ActionCommandControl, ActionCommandState, ConversationAddress, CoreBridge, EnqueueOutcome,
-        InboundMessage, IncomingAdmissionReleaseFuture, IncomingAdmissionReleaser,
-        IngressRouteTracker, MessageReference, MessageReferenceCache, MessageReferenceKey,
-        acquire_alias_handler_barriers, action_result_event, ambient_group_payload_can_be_sampled,
-        block_user_aliases, bounded_text, core_cutover_enabled_from_value,
-        core_group_payload_is_supported, core_private_payload_is_supported,
-        dispatch_action_with_timeout, effective_visible_reply_allowed,
-        group_message_requests_explicit_batch, idle_tick_event, merge_data_erasure_targets,
-        message_at_self, message_length_passable, normalize_attachments, reply_message_id,
-        resolve_and_submit, run_ingress, run_runtime, send_action_ingress_command_with_ack,
-        send_ingress_command_with_ack, send_ingress_command_with_ack_timeouts,
-        submit_message_collisions, submit_runtime_with_timeout, text_mentions_agent, unblock_users,
+        GroupCoreHandling, InboundMessage, IncomingAdmissionReleaseFuture,
+        IncomingAdmissionReleaser, IngressRouteTracker, MessageReference, MessageReferenceCache,
+        MessageReferenceKey, acquire_alias_handler_barriers, action_result_event,
+        ambient_group_payload_can_be_sampled, block_user_aliases, bounded_text,
+        core_cutover_enabled_from_value, core_group_payload_is_supported,
+        core_private_payload_is_supported, dispatch_action_with_timeout,
+        effective_visible_reply_allowed, group_message_requests_explicit_batch, idle_tick_event,
+        merge_data_erasure_targets, message_at_self, message_length_passable,
+        normalize_attachments, reply_message_id, resolve_and_submit, run_ingress, run_runtime,
+        send_action_ingress_command_with_ack, send_ingress_command_with_ack,
+        send_ingress_command_with_ack_timeouts, submit_message_collisions,
+        submit_runtime_with_timeout, text_mentions_agent, unblock_users,
     };
     use crate::model::{
         OutgoingSource, ReplyScope, commit_outgoing, interrupt, mark_active, mark_outgoing_sent,
@@ -4622,6 +4638,83 @@ mod tests {
         }
         assert!(core_cutover_enabled_from_value(None, true));
         assert!(!core_cutover_enabled_from_value(Some("unexpected"), false));
+    }
+
+    #[test]
+    fn paused_group_messages_stay_observed_by_core_even_when_addressed() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let (runtime_handle, _core_runtime) =
+                    yunxi_core::CognitiveRuntime::new(RuntimeConfig::default())
+                        .expect("valid runtime");
+                let (ingress, _receiver) = mpsc::channel(8);
+                let (api_tx, _api_rx) = mpsc::channel::<kovi::types::ApiAndOneshot>(1);
+                let arbiter = Arc::new(ActionArbiter::new(
+                    ActionArbiterConfig::default()
+                        .with_capabilities(EnvironmentCapabilities::all()),
+                ));
+                let port = Arc::new(BlockingActionPort {
+                    conversation_id: ConversationId::new(),
+                    calls: AtomicUsize::new(0),
+                    entered: Notify::new(),
+                    release: Notify::new(),
+                });
+                let bridge = CoreBridge {
+                    ingress,
+                    runtime: runtime_handle,
+                    action_arbiter: Some(arbiter),
+                    action_port: Some(port as Arc<dyn ActionPort>),
+                    blocked_users: Arc::new(StdMutex::new(HashSet::new())),
+                    blocked_groups: Arc::new(StdMutex::new(HashSet::new())),
+                    private_handler_gates: Arc::new(super::PrivateHandlerGateRegistry::new(4)),
+                    group_handler_gates: Arc::new(super::PrivateHandlerGateRegistry::new(4)),
+                    ambient_attention: Arc::new(StdMutex::new(
+                        super::AmbientAttentionRegistry::new(),
+                    )),
+                    familiarity: Arc::new(StdMutex::new(super::FamiliarityCache::default())),
+                };
+                let event = kovi::event::GroupMsgEvent {
+                    time: 0,
+                    self_id: 1_000,
+                    post_type: kovi::event::PostType::Message,
+                    message_type: "group".to_string(),
+                    sub_type: "normal".to_string(),
+                    message: Message::from("芸汐，看看这个"),
+                    message_id: 1,
+                    group_id: 123,
+                    user_id: 456,
+                    anonymous: None,
+                    raw_message: "芸汐，看看这个".to_string(),
+                    font: 0,
+                    sender: kovi::event::Sender {
+                        user_id: 456,
+                        nickname: Some("测试用户".to_string()),
+                        card: None,
+                        sex: None,
+                        age: None,
+                        area: None,
+                        level: None,
+                        role: None,
+                        title: None,
+                    },
+                    text: Some("芸汐，看看这个".to_string()),
+                    human_text: "芸汐，看看这个".to_string(),
+                    original_json: json!({}),
+                    api_tx,
+                };
+                // 未禁言：点名消息有权进入 Core 决策。
+                assert_eq!(
+                    bridge.classify_group(&event, false).handling,
+                    GroupCoreHandling::Decide
+                );
+                // 禁言中：即使被点名也必须退回 Host 观察,由 Host 保持静默
+                // 或按“明确恢复请求”重新放行。
+                let paused = bridge.classify_group(&event, true);
+                assert_eq!(paused.handling, GroupCoreHandling::Observe);
+                assert!(!paused.planner_attention_requested);
+                assert!(!paused.explicit_batch_request);
+            });
     }
 
     #[test]
