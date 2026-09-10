@@ -19,11 +19,15 @@ use std::sync::LazyLock;
 const MAX_AUTHORIZED_GROUPS: usize = 4096;
 const MAX_AUTHORIZED_ADMINS: usize = 256;
 const MAX_AUTHORIZED_CALLERS: usize = 256;
+const MAX_AUTHORIZED_FRIENDS: usize = 256;
 
 static STATE: LazyLock<Mutex<Option<GroupAccessState>>> = LazyLock::new(|| Mutex::new(None));
 
 struct GroupAccessState {
     plugin_name: String,
+    /// Kovi 插件访问控制表里的静态好友名单；每次改动数据库授权后都要并回来，
+    /// 因为白名单是整体覆盖写的。
+    configured_friends: BTreeSet<i64>,
     friends: BTreeSet<i64>,
     configured_admins: BTreeSet<i64>,
     groups: BTreeSet<i64>,
@@ -61,6 +65,10 @@ enum AuthorizationCommand {
     RemoveCaller(i64),
     ListCallers,
     CallerHelp,
+    AddFriend(i64),
+    RemoveFriend(i64),
+    ListFriends,
+    FriendHelp,
 }
 
 /// Create the table, seed it once from the static Kovi list, then apply the
@@ -68,7 +76,7 @@ enum AuthorizationCommand {
 pub async fn initialize(bot: &RuntimeBot) -> Result<()> {
     let plugin_name = PluginBuilder::get_plugin_name();
     let configured_groups = configured_groups(bot, &plugin_name);
-    let mut friends = configured_friends(bot, &plugin_name);
+    let configured_friends = configured_friends(bot, &plugin_name);
     // Use the canonical PersonId owner route whenever configured. The Kovi
     // host administrator remains a compatibility source only for deployments
     // that have not migrated `[identity].owner_person_id` yet.
@@ -81,7 +89,6 @@ pub async fn initialize(bot: &RuntimeBot) -> Result<()> {
         }
         None => bot.get_main_admin().context("读取 Kovi 主管理员")?,
     };
-    friends.insert(main_admin);
     let configured_admins = bot
         .get_deputy_admins()
         .map_err(|error| anyhow!("读取 Kovi 副管理员失败: {}", error))?
@@ -96,6 +103,7 @@ pub async fn initialize(bot: &RuntimeBot) -> Result<()> {
         &configured_groups,
         &configured_admins,
         &configured_callers,
+        &configured_friends,
         main_admin,
     )
     .await?;
@@ -106,6 +114,11 @@ pub async fn initialize(bot: &RuntimeBot) -> Result<()> {
     let mut callers = load_callers(pool).await?;
     callers.extend(configured_callers.iter().copied());
     let callers = normalize_callers(callers.into_iter().collect())?;
+    // 私聊白名单 = 静态 Kovi 配置 ∪ 数据库授权 ∪ 主管理员（副管理员在应用时并入）。
+    let mut friends = configured_friends.clone();
+    friends.extend(load_friends(pool).await?);
+    friends.insert(main_admin);
+    let friends = normalize_friends(friends.into_iter().collect())?;
     apply_groups(bot, &plugin_name, &groups)?;
     apply_admins(bot, &plugin_name, &friends, &admins)?;
 
@@ -121,9 +134,14 @@ pub async fn initialize(bot: &RuntimeBot) -> Result<()> {
         "[INFO] PostgreSQL 通话授权名单已加载 (表: kovi_bot_authorized_callers, 数量: {}，另加主/副管理员)",
         callers.len()
     );
+    println!(
+        "[INFO] PostgreSQL 私聊授权名单已加载 (表: kovi_bot_authorized_friends, 数量: {}，另加主/副管理员)",
+        friends.len()
+    );
     let mut state = STATE.lock().await;
     *state = Some(GroupAccessState {
         plugin_name,
+        configured_friends,
         friends,
         configured_admins,
         groups,
@@ -168,6 +186,15 @@ pub(crate) fn is_authorization_command(message: &str) -> bool {
         || has_argument_prefix(text, "#授权通话")
         || has_argument_prefix(text, "#取消授权通话")
         || has_argument_prefix(text, "#移除授权通话")
+        || text == "#好友名单"
+        || text == "#授权好友列表"
+        || text == "#好友帮助"
+        || text == "#授权好友帮助"
+        || text == "#取消授权好友"
+        || text == "#移除授权好友"
+        || has_argument_prefix(text, "#授权好友")
+        || has_argument_prefix(text, "#取消授权好友")
+        || has_argument_prefix(text, "#移除授权好友")
 }
 
 pub(crate) async fn is_authorized_group(group_id: i64) -> Result<bool> {
@@ -235,6 +262,10 @@ pub(crate) async fn handle_command(
         AuthorizationCommand::RemoveCaller(user_id) => update_caller(user_id, false).await,
         AuthorizationCommand::ListCallers => list_callers().await,
         AuthorizationCommand::CallerHelp => Ok(caller_command_help().to_string()),
+        AuthorizationCommand::AddFriend(user_id) => update_friend(bot, user_id, true).await,
+        AuthorizationCommand::RemoveFriend(user_id) => update_friend(bot, user_id, false).await,
+        AuthorizationCommand::ListFriends => list_friends().await,
+        AuthorizationCommand::FriendHelp => Ok(friend_command_help().to_string()),
     };
     Some(response.unwrap_or_else(|error| {
         eprintln!("[ERROR] 授权命令执行失败: {}", error);
@@ -283,6 +314,23 @@ fn parse_command(message: &str) -> Option<AuthorizationCommand> {
     }
     if text == "#取消授权通话" || text == "#移除授权通话" {
         return Some(AuthorizationCommand::CallerHelp);
+    }
+    if text == "#好友名单" || text == "#授权好友列表" {
+        return Some(AuthorizationCommand::ListFriends);
+    }
+    if text == "#好友帮助" || text == "#授权好友帮助" {
+        return Some(AuthorizationCommand::FriendHelp);
+    }
+    if let Some(user_id) = parse_user_id_argument(text, "#授权好友") {
+        return Some(AuthorizationCommand::AddFriend(user_id));
+    }
+    if let Some(user_id) = parse_user_id_argument(text, "#取消授权好友")
+        .or_else(|| parse_user_id_argument(text, "#移除授权好友"))
+    {
+        return Some(AuthorizationCommand::RemoveFriend(user_id));
+    }
+    if text == "#取消授权好友" || text == "#移除授权好友" {
+        return Some(AuthorizationCommand::FriendHelp);
     }
     if text == "#授权群列表" || text == "#授权列表" {
         return Some(AuthorizationCommand::List);
@@ -560,6 +608,113 @@ pub(crate) fn caller_command_help() -> &'static str {
     "用法：#授权通话 QQ号、#取消授权通话 QQ号、#通话名单。主管理员与副管理员本来就可以通话，其他人需要显式授权；未授权的人打进来只会听到一句婉拒。仅机器人管理员可执行。"
 }
 
+/// 增删「允许私聊芸汐」的 QQ 号。
+///
+/// 私聊等于进入芸汐的私人对话（她会带着长期记忆说话），比群准入敏感，因此
+/// 这三个命令限定主管理员执行——与 `#授权管理员` 同级，而不是 `#授权群` 同级。
+async fn update_friend(bot: &RuntimeBot, user_id: i64, add: bool) -> Result<String> {
+    if user_id <= 0 {
+        return Err(anyhow!("好友授权 QQ 号必须是正整数"));
+    }
+    let mut state_guard = STATE.lock().await;
+    let state = state_guard
+        .as_mut()
+        .ok_or_else(|| anyhow!("授权状态尚未初始化"))?;
+    if user_id == state.main_admin {
+        return Ok(format!("{} 是主管理员，本来就能私聊。", user_id));
+    }
+    if state.admins.contains(&user_id) {
+        return Ok(format!("{} 是副管理员，本来就能私聊。", user_id));
+    }
+    if add && state.friends.len() >= MAX_AUTHORIZED_FRIENDS {
+        return Err(anyhow!(
+            "私聊授权名单最多支持 {} 人",
+            MAX_AUTHORIZED_FRIENDS
+        ));
+    }
+
+    // 应用白名单需要这几个字段，先取出来，避免与 state.friends 的可变借用冲突。
+    let plugin_name = state.plugin_name.clone();
+    let admins = state.admins.clone();
+    let configured_friends = state.configured_friends.clone();
+    let main_admin = state.main_admin;
+    let old_friends = state.friends.clone();
+
+    let pool = database_pool()?;
+    let mut transaction = pool.begin().await.context("开启好友授权事务")?;
+    let result = if add {
+        query(
+            "INSERT INTO kovi_bot_authorized_friends (user_id) VALUES ($1)
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(user_id)
+        .execute(&mut *transaction)
+        .await
+        .context("写入好友授权名单")?
+    } else {
+        query("DELETE FROM kovi_bot_authorized_friends WHERE user_id = $1")
+            .bind(user_id)
+            .execute(&mut *transaction)
+            .await
+            .context("删除好友授权名单")?
+    };
+
+    if result.rows_affected() == 0 {
+        transaction.rollback().await.ok();
+        return Ok(if add {
+            format!("{} 已在私聊授权名单中。", user_id)
+        } else {
+            format!("{} 不在私聊授权名单中。", user_id)
+        });
+    }
+
+    let mut new_friends = load_friends_from_transaction(&mut transaction).await?;
+    new_friends.extend(configured_friends);
+    new_friends.insert(main_admin);
+    if let Err(error) = apply_admins(bot, &plugin_name, &new_friends, &admins) {
+        transaction.rollback().await.ok();
+        return Err(error);
+    }
+    if let Err(error) = transaction.commit().await {
+        let _ = apply_admins(bot, &plugin_name, &old_friends, &admins);
+        return Err(error).context("提交好友授权事务");
+    }
+
+    state.friends = new_friends;
+    println!(
+        "[INFO] 私聊授权名单已更新 (操作: {}, QQ: {}, 数量: {})",
+        if add { "添加" } else { "移除" },
+        user_id,
+        state.friends.len()
+    );
+    Ok(if add {
+        format!("已授权 {} 私聊芸汐。", user_id)
+    } else {
+        format!("已取消 {} 的私聊授权。", user_id)
+    })
+}
+
+async fn list_friends() -> Result<String> {
+    let state = STATE.lock().await;
+    let state = state
+        .as_ref()
+        .ok_or_else(|| anyhow!("授权状态尚未初始化"))?;
+    let mut entries = vec![format!("{}（主管理员）", state.main_admin)];
+    entries.extend(state.admins.iter().map(|id| format!("{id}（副管理员）")));
+    entries.extend(
+        state
+            .friends
+            .iter()
+            .filter(|id| **id != state.main_admin && !state.admins.contains(id))
+            .map(ToString::to_string),
+    );
+    Ok(format!("当前可以私聊芸汐的 QQ：{}", entries.join("、")))
+}
+
+pub(crate) fn friend_command_help() -> &'static str {
+    "用法：#授权好友 QQ号、#取消授权好友 QQ号、#好友名单。授权后对方可以私聊芸汐（她会带着长期记忆说话）。主管理员与副管理员默认即可私聊。仅主管理员可执行。"
+}
+
 /// 该 QQ 号是否允许和芸汐通话。
 ///
 /// 主管理员、副管理员、显式授权的名单都放行。授权状态尚未初始化时返回 false，
@@ -589,6 +744,11 @@ fn command_requires_main_admin(command: AuthorizationCommand) -> bool {
             | AuthorizationCommand::RemoveAdmin(_)
             | AuthorizationCommand::ListAdmins
             | AuthorizationCommand::AdminHelp
+            // 私聊等于进入芸汐的私人对话，授权门槛与管理员同级。
+            | AuthorizationCommand::AddFriend(_)
+            | AuthorizationCommand::RemoveFriend(_)
+            | AuthorizationCommand::ListFriends
+            | AuthorizationCommand::FriendHelp
     )
 }
 
@@ -638,6 +798,7 @@ async fn initialize_schema(
     configured_groups: &BTreeSet<i64>,
     configured_admins: &BTreeSet<i64>,
     configured_callers: &BTreeSet<i64>,
+    configured_friends: &BTreeSet<i64>,
     main_admin: i64,
 ) -> Result<()> {
     let mut transaction = pool.begin().await.context("开启群聊白名单初始化事务")?;
@@ -762,6 +923,49 @@ async fn initialize_schema(
             .context("迁移静态通话授权名单")?;
         }
     }
+    query(
+        "CREATE TABLE IF NOT EXISTS kovi_bot_authorized_friends (
+            user_id BIGINT PRIMARY KEY CHECK (user_id > 0),
+            authorized_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )",
+    )
+    .execute(&mut *transaction)
+    .await
+    .context("创建好友授权表")?;
+    query(
+        "CREATE TABLE IF NOT EXISTS kovi_bot_authorized_friends_meta (
+            id SMALLINT PRIMARY KEY CHECK (id = 1),
+            initialized_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )",
+    )
+    .execute(&mut *transaction)
+    .await
+    .context("创建好友授权元数据表")?;
+    let first_friend_initialization = query(
+        "INSERT INTO kovi_bot_authorized_friends_meta (id) VALUES (1)
+         ON CONFLICT DO NOTHING RETURNING id",
+    )
+    .fetch_optional(&mut *transaction)
+    .await
+    .context("初始化好友授权元数据")?
+    .is_some();
+    if first_friend_initialization {
+        // 静态 KOVI_ALLOWED_FRIENDS 同样只在首次迁移一次；Kovi 访问控制表每次
+        // 应用白名单时都会被覆盖，所以数据库才是持久的那一份。
+        for user_id in configured_friends {
+            if *user_id == main_admin {
+                continue;
+            }
+            query(
+                "INSERT INTO kovi_bot_authorized_friends (user_id) VALUES ($1)
+                 ON CONFLICT DO NOTHING",
+            )
+            .bind(user_id)
+            .execute(&mut *transaction)
+            .await
+            .context("迁移静态好友白名单")?;
+        }
+    }
     transaction
         .commit()
         .await
@@ -850,6 +1054,47 @@ async fn load_callers_from_transaction(
     )
 }
 
+/// 读取允许私聊的 QQ 名单（数据库部分；调用方再并上静态配置）。
+async fn load_friends_from_transaction(
+    transaction: &mut sqlx_core::transaction::Transaction<'_, sqlx_postgres::Postgres>,
+) -> Result<BTreeSet<i64>> {
+    let rows = query("SELECT user_id FROM kovi_bot_authorized_friends ORDER BY user_id")
+        .fetch_all(&mut **transaction)
+        .await
+        .context("读取事务中的好友授权名单")?;
+    normalize_friends(
+        rows.into_iter()
+            .map(|row| row.try_get::<i64, _>("user_id"))
+            .collect::<std::result::Result<Vec<_>, _>>()?,
+    )
+}
+
+async fn load_friends(pool: &PgPool) -> Result<BTreeSet<i64>> {
+    let rows = query("SELECT user_id FROM kovi_bot_authorized_friends ORDER BY user_id")
+        .fetch_all(pool)
+        .await
+        .context("读取好友授权名单")?;
+    normalize_friends(
+        rows.into_iter()
+            .map(|row| row.try_get::<i64, _>("user_id"))
+            .collect::<std::result::Result<Vec<_>, _>>()?,
+    )
+}
+
+fn normalize_friends(friends: Vec<i64>) -> Result<BTreeSet<i64>> {
+    if friends.len() > MAX_AUTHORIZED_FRIENDS {
+        return Err(anyhow!(
+            "私聊授权名单最多支持 {} 人",
+            MAX_AUTHORIZED_FRIENDS
+        ));
+    }
+    let friends = friends.into_iter().collect::<BTreeSet<_>>();
+    if friends.iter().any(|user_id| *user_id <= 0) {
+        return Err(anyhow!("好友授权 QQ 号必须是正整数"));
+    }
+    Ok(friends)
+}
+
 fn normalize_callers(callers: Vec<i64>) -> Result<BTreeSet<i64>> {
     if callers.len() > MAX_AUTHORIZED_CALLERS {
         return Err(anyhow!(
@@ -921,7 +1166,7 @@ mod tests {
     use super::{
         AuthorizationCommand, GroupAccessState, STATE, authorize_group_send, caller_is_authorized,
         command_requires_main_admin, is_authorization_command, normalize_admins, normalize_callers,
-        normalize_groups, parse_command,
+        normalize_friends, normalize_groups, parse_command,
     };
     use std::collections::BTreeSet;
     use std::sync::Arc;
@@ -1054,6 +1299,7 @@ mod tests {
         let stranger = 9_130_004;
         let state = GroupAccessState {
             plugin_name: "test".to_string(),
+            configured_friends: BTreeSet::new(),
             friends: BTreeSet::new(),
             configured_admins: BTreeSet::new(),
             groups: BTreeSet::new(),
@@ -1069,6 +1315,67 @@ mod tests {
             !caller_is_authorized(&state, stranger),
             "未授权者不应可通话"
         );
+    }
+
+    #[test]
+    fn parses_friend_authorization_commands() {
+        assert_eq!(
+            parse_command("#授权好友 900000001"),
+            Some(AuthorizationCommand::AddFriend(900000001))
+        );
+        assert_eq!(
+            parse_command("#取消授权好友 900000001"),
+            Some(AuthorizationCommand::RemoveFriend(900000001))
+        );
+        assert_eq!(
+            parse_command("#移除授权好友 900000001"),
+            Some(AuthorizationCommand::RemoveFriend(900000001))
+        );
+        assert_eq!(
+            parse_command("#好友名单"),
+            Some(AuthorizationCommand::ListFriends)
+        );
+        assert_eq!(
+            parse_command("#授权好友列表"),
+            Some(AuthorizationCommand::ListFriends)
+        );
+        assert_eq!(
+            parse_command("#好友帮助"),
+            Some(AuthorizationCommand::FriendHelp)
+        );
+        assert_eq!(
+            parse_command("#取消授权好友"),
+            Some(AuthorizationCommand::FriendHelp)
+        );
+        // 私聊授权等于进入芸汐的私人对话，门槛与管理员同级：仅主管理员。
+        assert!(command_requires_main_admin(
+            AuthorizationCommand::AddFriend(1)
+        ));
+        assert!(command_requires_main_admin(
+            AuthorizationCommand::RemoveFriend(1)
+        ));
+        assert!(command_requires_main_admin(
+            AuthorizationCommand::ListFriends
+        ));
+        assert!(command_requires_main_admin(
+            AuthorizationCommand::FriendHelp
+        ));
+        // 参数校验与其它授权命令一致。
+        assert_eq!(parse_command("#授权好友 900000001 extra"), None);
+        assert_eq!(parse_command("#授权好友 -1"), None);
+        assert_eq!(parse_command("#授权好友 0"), None);
+        assert_eq!(parse_command("#授权好友 abc"), None);
+        assert!(is_authorization_command("#授权好友 invalid"));
+        assert!(is_authorization_command("#好友名单"));
+        assert!(!is_authorization_command("#好友abc"));
+    }
+
+    #[test]
+    fn normalizes_and_validates_friend_ids() {
+        let friends = normalize_friends(vec![7, 3, 7]).expect("重复 QQ 号应去重");
+        assert_eq!(friends.into_iter().collect::<Vec<_>>(), vec![3, 7]);
+        assert!(normalize_friends(vec![0]).is_err());
+        assert!(normalize_friends(vec![-1]).is_err());
     }
 
     #[test]
@@ -1105,6 +1412,7 @@ mod tests {
                 let groups = BTreeSet::from([group_id]);
                 *STATE.lock().await = Some(GroupAccessState {
                     plugin_name: "test".to_string(),
+                    configured_friends: BTreeSet::new(),
                     friends: BTreeSet::new(),
                     configured_admins: BTreeSet::new(),
                     groups,
