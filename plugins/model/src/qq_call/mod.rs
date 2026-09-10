@@ -19,7 +19,6 @@
 mod audio;
 mod bridge;
 mod session;
-mod speech;
 mod vad;
 
 use crate::config;

@@ -37,6 +37,7 @@ mod mood;
 mod proactive;
 mod prompt;
 mod qq_call;
+mod qq_voice;
 mod reminders;
 mod server;
 mod tools;
@@ -57,6 +58,7 @@ pub use gag_ledger::GagLedgerConfig;
 pub use identity::IdentityConfig;
 pub use mind::MindConfig;
 pub use qq_call::QqCallConfig;
+pub use qq_voice::QqVoiceConfig;
 pub use reminders::ReminderConfig;
 pub use tools::{McpServerConfig, ToolsConfig};
 pub use vision::VisionConfig;
@@ -119,6 +121,8 @@ pub struct ModelConfig {
     vision: VisionConfig,
     /// QQ 实时语音通话配置（默认关闭）。
     qq_call: QqCallConfig,
+    /// 芸汐主动发语音消息的配置（默认关闭）。
+    qq_voice: QqVoiceConfig,
     /// Executive v3 deterministic control configuration.
     executive: ExecutiveConfig,
     /// Intrinsic model and bounded fallback configuration.
@@ -173,6 +177,7 @@ impl ModelConfig {
         self.gag_ledger.validate()?;
         self.vision.validate()?;
         self.qq_call.validate()?;
+        self.qq_voice.validate()?;
         self.executive.validate()?;
         self.model.validate()?;
         if !self.vision.mcp_server().is_empty() && !self.tools.enabled() {
@@ -274,6 +279,10 @@ impl ModelConfig {
 
     pub fn qq_call(&self) -> &QqCallConfig {
         &self.qq_call
+    }
+
+    pub fn qq_voice(&self) -> &QqVoiceConfig {
+        &self.qq_voice
     }
 
     pub fn executive(&self) -> &ExecutiveConfig {

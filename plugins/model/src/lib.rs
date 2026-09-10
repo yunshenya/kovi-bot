@@ -52,9 +52,13 @@ mod private_image_memory;
 // QQ 实时语音通话（默认关闭，启用后轮询 NapCat AV 桥）
 mod qq_call;
 mod redis_store;
+// 本机语音服务客户端（通话与发语音消息共用）
 pub(crate) mod reminders;
+mod speech;
 mod vision;
 mod vision_router;
+// 芸汐主动发语音消息（复用本机 TTS）
+mod voice_reply;
 mod world_sensors;
 pub(crate) mod yunxi;
 

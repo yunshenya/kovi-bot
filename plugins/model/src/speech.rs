@@ -1,5 +1,8 @@
 //! 本机语音服务客户端（ASR + TTS）。
 //!
+//! 通话链路与"发语音消息"共用这一份客户端：两者都只依赖同一个只监听回环的
+//! 本机语音服务。
+//!
 //! 识别与合成都在服务器上的一个常驻本地服务里完成，机器人只按 HTTP 调用它。
 //! 这样做的原因：中文流式 ASR/TTS 的实际实现是 ONNX 运行时加模型文件，
 //! 把它们链接进机器人二进制会让 CI 构建多出一整套原生依赖；而独立服务可以
@@ -31,6 +34,28 @@ pub struct SpeechClient {
 }
 
 impl SpeechClient {
+    /// 只用于合成（发语音消息）的客户端。
+    ///
+    /// 与通话链路使用同一个本机语音服务；这里不配置 ASR，因为发语音不需要识别。
+    pub(crate) fn for_tts_only(
+        tts_url: &str,
+        tts_timeout_secs: u64,
+        tts_sample_rate: u32,
+    ) -> anyhow::Result<Self> {
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(tts_timeout_secs.max(1)))
+            .build()
+            .map_err(|error| anyhow::anyhow!("无法创建语音服务 HTTP 客户端: {error}"))?;
+        Ok(Self {
+            http,
+            asr_url: String::new(),
+            tts_url: tts_url.to_owned(),
+            tts_sample_rate,
+            asr_timeout: Duration::from_secs(tts_timeout_secs.max(1)),
+            tts_timeout: Duration::from_secs(tts_timeout_secs.max(1)),
+        })
+    }
+
     pub fn new(config: &QqCallConfig) -> anyhow::Result<Self> {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(config.tts_timeout_secs().max(1)))

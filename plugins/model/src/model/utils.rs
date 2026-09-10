@@ -4726,6 +4726,7 @@ mod tests {
             action: Default::default(),
             bubbles: Vec::new(),
             requests_image: false,
+            voice: false,
         };
         let wants_no_reply = MessageUnderstanding {
             wants_no_reply: true,
@@ -5346,6 +5347,7 @@ mod tests {
             action: Default::default(),
             bubbles: Vec::new(),
             requests_image: false,
+            voice: false,
         };
         let action_only = ReplyPlan {
             content: String::new(),
@@ -5356,6 +5358,7 @@ mod tests {
             },
             bubbles: Vec::new(),
             requests_image: false,
+            voice: false,
         };
         assert!(silent.is_silent());
         assert!(!silent.has_visible_reply());

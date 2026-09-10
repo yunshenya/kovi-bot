@@ -11,12 +11,12 @@
 
 use super::audio::{Capture, Playback};
 use super::bridge::{BridgeClient, CallPhase, CallState};
-use super::speech::SpeechClient;
 use super::vad::Segmenter;
 use crate::config::QqCallConfig;
 use crate::memory::{MEMORY_MANAGER, MemoryEntry, MemoryType};
 use crate::model::utils::{is_model_error_response, params_model_with_plain_style_context};
 use crate::model::{BotMemory, Roles};
+use crate::speech::SpeechClient;
 use kovi::tokio::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};

@@ -123,6 +123,8 @@ pub(crate) struct ReplyPlan {
     pub(crate) action: ReplyAction,
     pub(crate) bubbles: Vec<String>,
     pub(crate) requests_image: bool,
+    /// 这一轮的正文用语音发出，而不是文字。
+    pub(crate) voice: bool,
 }
 
 impl ReplyPlan {
@@ -137,6 +139,7 @@ impl ReplyPlan {
             action: ReplyAction::default(),
             bubbles: Vec::new(),
             requests_image: false,
+            voice: false,
         }
     }
 
@@ -149,6 +152,7 @@ impl ReplyPlan {
             action: ReplyAction::default(),
             bubbles: Vec::new(),
             requests_image: false,
+            voice: false,
         }
     }
 
@@ -176,6 +180,7 @@ impl ReplyPlan {
             action: ReplyAction::default(),
             bubbles,
             requests_image: false,
+            voice: false,
         })
     }
 
@@ -226,12 +231,15 @@ impl ReplyPlan {
             parsed.content
         };
         let requests_image = parsed.requests_image && !visible_content.is_empty();
+        // 语音只对真实存在正文的轮次生效；空回复没有可读的内容。
+        let voice = parsed.voice && !visible_content.is_empty() && !bubbles.is_empty();
         Self {
             content: visible_content,
             disposition: parsed.disposition,
             action,
             bubbles,
             requests_image,
+            voice,
         }
     }
 
@@ -311,6 +319,7 @@ pub(crate) async fn execute_reply_plan(
         return execution;
     }
 
+    let voice_config = crate::config::get().qq_voice().clone();
     for (index, bubble) in plan.bubbles.iter().enumerate() {
         if !is_current(reply_ticket).await {
             break;
@@ -323,7 +332,16 @@ pub(crate) async fn execute_reply_plan(
         }
 
         let first_message = index == 0;
-        let message = build_outbound_message(bubble, &plan.action, first_message);
+        // 模型把这一轮标记成语音时改用 record 段；合成失败会回退成文字，
+        // 语音只是表达方式，不该因为 TTS 抖动把回复弄丢。
+        let message = if plan.voice {
+            match crate::voice_reply::build_voice_message(&voice_config, bubble).await {
+                Some(voice) => voice,
+                None => build_outbound_message(bubble, &plan.action, first_message),
+            }
+        } else {
+            build_outbound_message(bubble, &plan.action, first_message)
+        };
         let reply_to = first_message
             .then_some(plan.action.quote_message_id)
             .flatten()
@@ -611,6 +629,7 @@ mod tests {
             action: Default::default(),
             bubbles: vec!["你好".to_string()],
             requests_image: false,
+            voice: false,
         };
     }
 

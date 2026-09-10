@@ -404,3 +404,24 @@ system_prompt = ""
 allowed_callers = []
 # 挂断后把通话记录写回来电者的私聊记忆。
 archive_to_memory = true
+
+# 芸汐主动发语音消息：她在回复里标记 voice 时，用本机 TTS 把这句话合成出来，
+# 再以 QQ 语音消息发出。默认关闭。
+#
+# 音频要写到 NapCat 能打开的路径上：NapCat 常常与机器人不在同一个文件系统
+# 命名空间里（本部署里 NapCat 跑在容器内），所以下面填的是同一个共享目录的
+# 两个视角。非容器部署时两个路径填成一样即可。
+[qq_voice]
+enabled = true
+# 复用通话功能那套本机语音服务，只监听回环。
+tts_url = "http://127.0.0.1:6120/v1/tts"
+tts_timeout_secs = 20
+sample_rate = 16000
+# 单条语音最大字数，超出会在句末标点处截断。
+max_chars = 80
+# 机器人写入音频的目录（宿主机路径）。
+staging_dir = "/home/ubuntu/napcat-qq-call/voice"
+# 同一目录在 NapCat 侧看到的路径（容器内路径）。
+napcat_staging_dir = "/app/qq-call/voice"
+# 暂存文件保留数量上限。
+keep_files = 32
