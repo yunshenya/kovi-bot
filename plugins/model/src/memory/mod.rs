@@ -360,7 +360,7 @@ impl MemoryManager {
     /// - 能量水平：7/10
     /// - 社交信心：6/10
     /// - 好奇心：8/10
-    /// - 性格特征：好奇、顽皮、有同理心、轻微傲娇
+    /// - 性格特征：好奇、顽皮、有同理心、温柔体贴
     pub fn new(memory_file: &str) -> Self {
         harden_memory_file_permissions(memory_file);
         // 构造阶段同步读取，保证第一条消息不会和后台加载任务竞态并覆盖旧数据。
@@ -3053,7 +3053,7 @@ impl Default for BotPersonality {
                 "curious".to_string(),
                 "playful".to_string(),
                 "empathetic".to_string(),
-                "slightly_tsundere".to_string(),
+                "gentle".to_string(),
             ],
         }
     }
@@ -3062,14 +3062,27 @@ impl Default for BotPersonality {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConversationScope, GroupProfile, MemoryEntry, MemoryLookup, MemoryLookupType,
-        MemoryManager, MemoryType, MoodEntry, ProactiveState, UserProfile,
+        BotPersonality, ConversationScope, GroupProfile, MemoryEntry, MemoryLookup,
+        MemoryLookupType, MemoryManager, MemoryType, MoodEntry, ProactiveState, UserProfile,
         conversation_summary_key,
     };
     use chrono::{Duration as ChronoDuration, Local};
     use sqlx_core::query::query;
     use std::sync::Arc;
     use uuid::Uuid;
+
+    /// 默认人格走温柔版本：不再带傲娇/嘴硬一类的默认特征。
+    #[test]
+    fn default_personality_stays_gentle() {
+        let traits = BotPersonality::default().personality_traits;
+        assert!(traits.iter().any(|trait_name| trait_name == "gentle"));
+        assert!(
+            !traits
+                .iter()
+                .any(|trait_name| trait_name.contains("tsundere")),
+            "默认人格不应再包含傲娇特征：{traits:?}"
+        );
+    }
 
     fn temporary_memory_path(test_name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
