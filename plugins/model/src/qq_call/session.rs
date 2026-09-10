@@ -73,9 +73,17 @@ pub(super) async fn run(
         .map(str::trim)
         .filter(|name| !name.is_empty());
     let main_admin = bot.get_main_admin().ok();
-    let allowed = caller
-        .map(|caller| config.caller_allowed(caller, main_admin))
-        .unwrap_or(false);
+    // 授权来源有两处，任一命中即放行：
+    //   1. 数据库里的通话授权名单（含主管理员与副管理员，可用 #授权通话 维护）；
+    //   2. 静态配置 qq_call.allowed_callers（首次初始化会迁移进数据库，保留是为了
+    //      授权体系尚未初始化时仍能工作）。
+    let allowed = match caller {
+        Some(caller) => {
+            crate::group_access::is_authorized_caller(caller).await
+                || config.caller_allowed(caller, main_admin)
+        }
+        None => false,
+    };
 
     match (caller, caller_name) {
         (Some(caller), Some(name)) => println!("[INFO] QQ 语音通话已接通: {name}({caller})"),

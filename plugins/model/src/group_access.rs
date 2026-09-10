@@ -18,6 +18,7 @@ use std::sync::LazyLock;
 
 const MAX_AUTHORIZED_GROUPS: usize = 4096;
 const MAX_AUTHORIZED_ADMINS: usize = 256;
+const MAX_AUTHORIZED_CALLERS: usize = 256;
 
 static STATE: LazyLock<Mutex<Option<GroupAccessState>>> = LazyLock::new(|| Mutex::new(None));
 
@@ -27,6 +28,11 @@ struct GroupAccessState {
     configured_admins: BTreeSet<i64>,
     groups: BTreeSet<i64>,
     admins: BTreeSet<i64>,
+    /// 被显式授权可以给芸汐打语音电话的 QQ 号。
+    ///
+    /// 与群白名单分开维护：群白名单决定"在哪里说话"，通话名单决定"谁能打电话
+    /// 进来"——后者是私人通道，默认只有主管理员，其余人必须显式授权。
+    callers: BTreeSet<i64>,
     main_admin: i64,
 }
 
@@ -51,6 +57,10 @@ enum AuthorizationCommand {
     RemoveAdmin(i64),
     ListAdmins,
     AdminHelp,
+    AddCaller(i64),
+    RemoveCaller(i64),
+    ListCallers,
+    CallerHelp,
 }
 
 /// Create the table, seed it once from the static Kovi list, then apply the
@@ -78,12 +88,24 @@ pub async fn initialize(bot: &RuntimeBot) -> Result<()> {
         .into_iter()
         .collect::<Vec<_>>();
     let configured_admins = normalize_admins(configured_admins, main_admin)?;
+    let configured_callers =
+        normalize_callers(crate::config::get().qq_call().allowed_callers().to_vec())?;
     let pool = database_pool()?;
-    initialize_schema(pool, &configured_groups, &configured_admins, main_admin).await?;
+    initialize_schema(
+        pool,
+        &configured_groups,
+        &configured_admins,
+        &configured_callers,
+        main_admin,
+    )
+    .await?;
     let groups = load_groups(pool).await?;
     let mut admins = load_admins(pool, main_admin).await?;
     admins.extend(configured_admins.iter().copied());
     let admins = normalize_admins(admins.into_iter().collect(), main_admin)?;
+    let mut callers = load_callers(pool).await?;
+    callers.extend(configured_callers.iter().copied());
+    let callers = normalize_callers(callers.into_iter().collect())?;
     apply_groups(bot, &plugin_name, &groups)?;
     apply_admins(bot, &plugin_name, &friends, &admins)?;
 
@@ -95,6 +117,10 @@ pub async fn initialize(bot: &RuntimeBot) -> Result<()> {
         "[INFO] PostgreSQL 管理员名单已加载 (表: kovi_bot_authorized_admins, 数量: {})",
         admins.len() + 1
     );
+    println!(
+        "[INFO] PostgreSQL 通话授权名单已加载 (表: kovi_bot_authorized_callers, 数量: {}，另加主/副管理员)",
+        callers.len()
+    );
     let mut state = STATE.lock().await;
     *state = Some(GroupAccessState {
         plugin_name,
@@ -102,6 +128,7 @@ pub async fn initialize(bot: &RuntimeBot) -> Result<()> {
         configured_admins,
         groups,
         admins,
+        callers,
         main_admin,
     });
     Ok(())
@@ -132,6 +159,15 @@ pub(crate) fn is_authorization_command(message: &str) -> bool {
         || has_argument_prefix(text, "#管理员授权")
         || has_argument_prefix(text, "#取消授权管理员")
         || has_argument_prefix(text, "#移除授权管理员")
+        || text == "#通话名单"
+        || text == "#授权通话列表"
+        || text == "#通话帮助"
+        || text == "#授权通话帮助"
+        || text == "#取消授权通话"
+        || text == "#移除授权通话"
+        || has_argument_prefix(text, "#授权通话")
+        || has_argument_prefix(text, "#取消授权通话")
+        || has_argument_prefix(text, "#移除授权通话")
 }
 
 pub(crate) async fn is_authorized_group(group_id: i64) -> Result<bool> {
@@ -195,6 +231,10 @@ pub(crate) async fn handle_command(
         AuthorizationCommand::RemoveAdmin(user_id) => update_admin(bot, user_id, false).await,
         AuthorizationCommand::ListAdmins => list_admins().await,
         AuthorizationCommand::AdminHelp => Ok(admin_command_help().to_string()),
+        AuthorizationCommand::AddCaller(user_id) => update_caller(user_id, true).await,
+        AuthorizationCommand::RemoveCaller(user_id) => update_caller(user_id, false).await,
+        AuthorizationCommand::ListCallers => list_callers().await,
+        AuthorizationCommand::CallerHelp => Ok(caller_command_help().to_string()),
     };
     Some(response.unwrap_or_else(|error| {
         eprintln!("[ERROR] 授权命令执行失败: {}", error);
@@ -226,6 +266,23 @@ fn parse_command(message: &str) -> Option<AuthorizationCommand> {
     }
     if text == "#取消授权管理员" || text == "#移除授权管理员" {
         return Some(AuthorizationCommand::AdminHelp);
+    }
+    if text == "#通话名单" || text == "#授权通话列表" {
+        return Some(AuthorizationCommand::ListCallers);
+    }
+    if text == "#通话帮助" || text == "#授权通话帮助" {
+        return Some(AuthorizationCommand::CallerHelp);
+    }
+    if let Some(user_id) = parse_user_id_argument(text, "#授权通话") {
+        return Some(AuthorizationCommand::AddCaller(user_id));
+    }
+    if let Some(user_id) = parse_user_id_argument(text, "#取消授权通话")
+        .or_else(|| parse_user_id_argument(text, "#移除授权通话"))
+    {
+        return Some(AuthorizationCommand::RemoveCaller(user_id));
+    }
+    if text == "#取消授权通话" || text == "#移除授权通话" {
+        return Some(AuthorizationCommand::CallerHelp);
     }
     if text == "#授权群列表" || text == "#授权列表" {
         return Some(AuthorizationCommand::List);
@@ -417,6 +474,110 @@ pub(crate) fn command_help() -> &'static str {
     "用法：#授权群 群号、#取消授权群 群号、#授权群列表。仅机器人管理员可执行。"
 }
 
+/// 增删「允许给芸汐打电话」的 QQ 号。
+///
+/// 与群白名单分开存：群白名单决定芸汐在哪里说话，通话名单决定谁能打进她的私人
+/// 语音通道。主管理员与副管理员天然允许，其余人必须显式授权。
+async fn update_caller(user_id: i64, add: bool) -> Result<String> {
+    if user_id <= 0 {
+        return Err(anyhow!("通话授权 QQ 号必须是正整数"));
+    }
+    let mut state_guard = STATE.lock().await;
+    let state = state_guard
+        .as_mut()
+        .ok_or_else(|| anyhow!("授权状态尚未初始化"))?;
+    if user_id == state.main_admin {
+        return Ok(format!("{} 是主管理员，本来就可以打。", user_id));
+    }
+    if state.admins.contains(&user_id) {
+        return Ok(format!("{} 是副管理员，本来就可以打。", user_id));
+    }
+    if add && state.callers.len() >= MAX_AUTHORIZED_CALLERS {
+        return Err(anyhow!(
+            "通话授权名单最多支持 {} 人",
+            MAX_AUTHORIZED_CALLERS
+        ));
+    }
+
+    let pool = database_pool()?;
+    let mut transaction = pool.begin().await.context("开启通话授权事务")?;
+    let result = if add {
+        query(
+            "INSERT INTO kovi_bot_authorized_callers (user_id) VALUES ($1)
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(user_id)
+        .execute(&mut *transaction)
+        .await
+        .context("写入通话授权名单")?
+    } else {
+        query("DELETE FROM kovi_bot_authorized_callers WHERE user_id = $1")
+            .bind(user_id)
+            .execute(&mut *transaction)
+            .await
+            .context("删除通话授权名单")?
+    };
+
+    if result.rows_affected() == 0 {
+        transaction.rollback().await.ok();
+        return Ok(if add {
+            format!("{} 已在通话授权名单中。", user_id)
+        } else {
+            format!("{} 不在通话授权名单中。", user_id)
+        });
+    }
+
+    let new_callers = load_callers_from_transaction(&mut transaction).await?;
+    if let Err(error) = transaction.commit().await {
+        return Err(error).context("提交通话授权事务");
+    }
+    state.callers = new_callers;
+    println!(
+        "[INFO] 通话授权名单已更新 (操作: {}, QQ: {}, 数量: {})",
+        if add { "添加" } else { "移除" },
+        user_id,
+        state.callers.len()
+    );
+    Ok(if add {
+        format!("已授权 {} 给芸汐打电话。", user_id)
+    } else {
+        format!("已取消 {} 的通话授权。", user_id)
+    })
+}
+
+async fn list_callers() -> Result<String> {
+    let state = STATE.lock().await;
+    let state = state
+        .as_ref()
+        .ok_or_else(|| anyhow!("授权状态尚未初始化"))?;
+    let mut entries = vec![format!("{}（主管理员）", state.main_admin)];
+    entries.extend(state.admins.iter().map(|id| format!("{id}（副管理员）")));
+    entries.extend(state.callers.iter().map(ToString::to_string));
+    Ok(format!("当前可以和芸汐打电话的 QQ：{}", entries.join("、")))
+}
+
+pub(crate) fn caller_command_help() -> &'static str {
+    "用法：#授权通话 QQ号、#取消授权通话 QQ号、#通话名单。主管理员与副管理员本来就可以通话，其他人需要显式授权；未授权的人打进来只会听到一句婉拒。仅机器人管理员可执行。"
+}
+
+/// 该 QQ 号是否允许和芸汐通话。
+///
+/// 主管理员、副管理员、显式授权的名单都放行。授权状态尚未初始化时返回 false，
+/// 由调用方回退到静态配置判断，避免初始化失败导致所有人都打不进来。
+pub(crate) async fn is_authorized_caller(user_id: i64) -> bool {
+    let state = STATE.lock().await;
+    state
+        .as_ref()
+        .is_some_and(|state| caller_is_authorized(state, user_id))
+}
+
+/// 判定部分独立成纯函数：不依赖全局状态，测试之间不会互相踩。
+fn caller_is_authorized(state: &GroupAccessState, user_id: i64) -> bool {
+    user_id == state.main_admin
+        || state.admins.contains(&user_id)
+        || state.callers.contains(&user_id)
+}
+
 pub(crate) fn admin_command_help() -> &'static str {
     "用法：#授权管理员 QQ号、#取消授权管理员 QQ号、#授权管理员列表。仅主管理员可执行。"
 }
@@ -476,6 +637,7 @@ async fn initialize_schema(
     pool: &PgPool,
     configured_groups: &BTreeSet<i64>,
     configured_admins: &BTreeSet<i64>,
+    configured_callers: &BTreeSet<i64>,
     main_admin: i64,
 ) -> Result<()> {
     let mut transaction = pool.begin().await.context("开启群聊白名单初始化事务")?;
@@ -558,6 +720,48 @@ async fn initialize_schema(
             .context("迁移静态授权管理员")?;
         }
     }
+    query(
+        "CREATE TABLE IF NOT EXISTS kovi_bot_authorized_callers (
+            user_id BIGINT PRIMARY KEY CHECK (user_id > 0),
+            authorized_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )",
+    )
+    .execute(&mut *transaction)
+    .await
+    .context("创建通话授权表")?;
+    query(
+        "CREATE TABLE IF NOT EXISTS kovi_bot_authorized_callers_meta (
+            id SMALLINT PRIMARY KEY CHECK (id = 1),
+            initialized_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )",
+    )
+    .execute(&mut *transaction)
+    .await
+    .context("创建通话授权元数据表")?;
+    let first_caller_initialization = query(
+        "INSERT INTO kovi_bot_authorized_callers_meta (id) VALUES (1)
+         ON CONFLICT DO NOTHING RETURNING id",
+    )
+    .fetch_optional(&mut *transaction)
+    .await
+    .context("初始化通话授权元数据")?
+    .is_some();
+    if first_caller_initialization {
+        // 静态配置里的 allowed_callers 只在首次初始化时迁移一次，之后以数据库为准。
+        for user_id in configured_callers {
+            if *user_id == main_admin {
+                continue;
+            }
+            query(
+                "INSERT INTO kovi_bot_authorized_callers (user_id) VALUES ($1)
+                 ON CONFLICT DO NOTHING",
+            )
+            .bind(user_id)
+            .execute(&mut *transaction)
+            .await
+            .context("迁移静态通话授权名单")?;
+        }
+    }
     transaction
         .commit()
         .await
@@ -589,6 +793,18 @@ async fn load_admins(pool: &PgPool, main_admin: i64) -> Result<BTreeSet<i64>> {
     )
 }
 
+async fn load_callers(pool: &PgPool) -> Result<BTreeSet<i64>> {
+    let rows = query("SELECT user_id FROM kovi_bot_authorized_callers ORDER BY user_id")
+        .fetch_all(pool)
+        .await
+        .context("读取通话授权名单")?;
+    normalize_callers(
+        rows.into_iter()
+            .map(|row| row.try_get::<i64, _>("user_id"))
+            .collect::<std::result::Result<Vec<_>, _>>()?,
+    )
+}
+
 async fn load_groups_from_transaction(
     transaction: &mut sqlx_core::transaction::Transaction<'_, sqlx_postgres::Postgres>,
 ) -> Result<BTreeSet<i64>> {
@@ -617,6 +833,35 @@ async fn load_admins_from_transaction(
             .collect::<std::result::Result<Vec<_>, _>>()?,
         main_admin,
     )
+}
+
+/// 读取允许通话的 QQ 名单；不做管理员去重，调用方按"并集"判断。
+async fn load_callers_from_transaction(
+    transaction: &mut sqlx_core::transaction::Transaction<'_, sqlx_postgres::Postgres>,
+) -> Result<BTreeSet<i64>> {
+    let rows = query("SELECT user_id FROM kovi_bot_authorized_callers ORDER BY user_id")
+        .fetch_all(&mut **transaction)
+        .await
+        .context("读取事务中的通话授权名单")?;
+    normalize_callers(
+        rows.into_iter()
+            .map(|row| row.try_get::<i64, _>("user_id"))
+            .collect::<std::result::Result<Vec<_>, _>>()?,
+    )
+}
+
+fn normalize_callers(callers: Vec<i64>) -> Result<BTreeSet<i64>> {
+    if callers.len() > MAX_AUTHORIZED_CALLERS {
+        return Err(anyhow!(
+            "通话授权名单最多支持 {} 人",
+            MAX_AUTHORIZED_CALLERS
+        ));
+    }
+    let callers = callers.into_iter().collect::<BTreeSet<_>>();
+    if callers.iter().any(|user_id| *user_id <= 0) {
+        return Err(anyhow!("通话授权 QQ 号必须是正整数"));
+    }
+    Ok(callers)
 }
 
 fn normalize_groups(groups: Vec<i64>) -> Result<BTreeSet<i64>> {
@@ -674,9 +919,9 @@ fn apply_admins(
 #[cfg(test)]
 mod tests {
     use super::{
-        AuthorizationCommand, GroupAccessState, STATE, authorize_group_send,
-        command_requires_main_admin, is_authorization_command, normalize_admins, normalize_groups,
-        parse_command,
+        AuthorizationCommand, GroupAccessState, STATE, authorize_group_send, caller_is_authorized,
+        command_requires_main_admin, is_authorization_command, normalize_admins, normalize_callers,
+        normalize_groups, parse_command,
     };
     use std::collections::BTreeSet;
     use std::sync::Arc;
@@ -750,6 +995,91 @@ mod tests {
     }
 
     #[test]
+    fn parses_call_authorization_commands() {
+        assert_eq!(
+            parse_command("#授权通话 900000001"),
+            Some(AuthorizationCommand::AddCaller(900000001))
+        );
+        assert_eq!(
+            parse_command("#取消授权通话 900000001"),
+            Some(AuthorizationCommand::RemoveCaller(900000001))
+        );
+        assert_eq!(
+            parse_command("#移除授权通话 900000001"),
+            Some(AuthorizationCommand::RemoveCaller(900000001))
+        );
+        assert_eq!(
+            parse_command("#通话名单"),
+            Some(AuthorizationCommand::ListCallers)
+        );
+        assert_eq!(
+            parse_command("#授权通话列表"),
+            Some(AuthorizationCommand::ListCallers)
+        );
+        assert_eq!(
+            parse_command("#通话帮助"),
+            Some(AuthorizationCommand::CallerHelp)
+        );
+        // 缺参数的取消命令退化成帮助，而不是静默失败。
+        assert_eq!(
+            parse_command("#取消授权通话"),
+            Some(AuthorizationCommand::CallerHelp)
+        );
+        // 通话授权不是特权变更，普通管理员即可执行。
+        assert!(!command_requires_main_admin(
+            AuthorizationCommand::AddCaller(1)
+        ));
+        assert!(!command_requires_main_admin(
+            AuthorizationCommand::RemoveCaller(1)
+        ));
+        assert!(!command_requires_main_admin(
+            AuthorizationCommand::ListCallers
+        ));
+        // 参数校验与其它授权命令一致。
+        assert_eq!(parse_command("#授权通话 900000001 extra"), None);
+        assert_eq!(parse_command("#授权通话 -1"), None);
+        assert_eq!(parse_command("#授权通话 0"), None);
+        assert_eq!(parse_command("#授权通话 abc"), None);
+        assert!(is_authorization_command("#授权通话 invalid"));
+        assert!(is_authorization_command("#通话名单"));
+        assert!(is_authorization_command("#取消授权通话"));
+        assert!(!is_authorization_command("#通话abc"));
+    }
+
+    #[test]
+    fn call_authorization_covers_admins_and_explicit_callers() {
+        let main_admin = 9_130_001;
+        let deputy = 9_130_002;
+        let granted = 9_130_003;
+        let stranger = 9_130_004;
+        let state = GroupAccessState {
+            plugin_name: "test".to_string(),
+            friends: BTreeSet::new(),
+            configured_admins: BTreeSet::new(),
+            groups: BTreeSet::new(),
+            admins: BTreeSet::from([deputy]),
+            callers: BTreeSet::from([granted]),
+            main_admin,
+        };
+
+        assert!(caller_is_authorized(&state, main_admin), "主管理员应可通话");
+        assert!(caller_is_authorized(&state, deputy), "副管理员应可通话");
+        assert!(caller_is_authorized(&state, granted), "显式授权者应可通话");
+        assert!(
+            !caller_is_authorized(&state, stranger),
+            "未授权者不应可通话"
+        );
+    }
+
+    #[test]
+    fn normalizes_and_validates_caller_ids() {
+        let callers = normalize_callers(vec![7, 3, 7]).expect("重复 QQ 号应去重");
+        assert_eq!(callers.into_iter().collect::<Vec<_>>(), vec![3, 7]);
+        assert!(normalize_callers(vec![0]).is_err());
+        assert!(normalize_callers(vec![-1]).is_err());
+    }
+
+    #[test]
     fn normalizes_and_validates_group_ids() {
         let groups = normalize_groups(vec![3, 1, 3]).expect("重复群号应去重");
         assert_eq!(groups.into_iter().collect::<Vec<_>>(), vec![1, 3]);
@@ -779,6 +1109,7 @@ mod tests {
                     configured_admins: BTreeSet::new(),
                     groups,
                     admins: BTreeSet::new(),
+                    callers: BTreeSet::new(),
                     main_admin: 9_120_002,
                 });
 
