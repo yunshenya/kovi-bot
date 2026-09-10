@@ -295,3 +295,50 @@ sudo systemctl restart kovi-bot
 
 回滚点：`/root/napcat-rollback/`（容器 inspect 快照 + `napcat-data-*.tar.gz` 数据备份），
 以及旧容器 `napcat-bridge-v1`。
+
+## 当前状态：接听环节被阻塞（2026-09-11）
+
+**机器人侧的实现是完整的、经过验证的；阻塞点在 QQ 闭源 AVSDK。**
+
+已经实测打通并验证的：
+
+- 来电检测——采到 `OnInviteActionToAVSDK`（`invite_type: 1`）；
+- 内核动作转发——`cmd 55` 确实送达 AV Host（AV Host 的 `lastInvocationCommand: 55`）；
+- 音频通路——宿主机 `pacat` 写入 `maibot_qq_mic`、`parec` 从 monitor 读回，峰值与播放振幅一致；
+- 本机语音服务——合成 → 识别往返测试通过（合成 2.42 秒音频耗时 1.33 秒，识别 0.17 秒）；
+- Rust 侧全部逻辑——VAD 切段、双链路编排、插话打断、挂断归档，均有单元测试。
+
+**卡住的一步**：AV Host 把 `cmd 55` 转给 QQ 的 `libAVSDKPlugin.so` 之后，AVSDK
+**一条消息都不回传**，因此 `20006`（接听回调）永远不会出现，桥的自动接听逻辑不触发，
+`GET /v1/calls/current` 会一直停在 `ringing`，对方听到的是无人接听。
+
+更早暴露出来的现象是：AVSDK 对**每一次**登录都回 `20050`，插件的重登逻辑因此循环
+521 次（`16594 / 521 ≈ 31.9`，即每次登录回约 32 条消息、末条恒为 `20050`），
+`networkOutputCount` 始终为 0——AVSDK 从未建立过媒体会话。
+
+### 已排除的原因
+
+| 假设 | 验证方式 | 结论 |
+|---|---|---|
+| AVSDK 缺动态库 | 逐个补齐 `libpulse-mainloop-glib.so.0`、`libEGL.so.1`、`libOpenGL.so.0`、`libGLESv2`、`libGLX`、`libGLdispatch` | 补齐后 Pepper 模块加载成功，`20050` 不变 |
+| 容器 `/dev/shm` 过小（Docker 默认 64 MB） | `--shm-size=1g` | 无效 |
+| 容器沙箱限制 | `--privileged --security-opt seccomp=unconfined` | **完全无变化，容器被排除** |
+| 容器网络 | `--network host`（回环服务才能被宿主机访问） | 桥/AV Host 均可达，`20050` 不变 |
+| NapCat / QQ 版本漂移 | 桥写于 2026-08-03，当时 NapCat 为 4.18.12–4.18.14、QQ 与我们同期；我们是 NapCat 4.18.19 + QQ 9.9.22-40990 | 仅差几个小版本，认为不是变量 |
+| 音频设备 | AVSDK 正确枚举 `MaiBot_QQ_Speaker` / `Maibot_QQ_Microphone` | 正常 |
+| 桥自身 | `doctor.sh` → `all bridge checks passed` | 正常 |
+
+### 顺带修复的两个真实缺陷（已做成自愈补丁）
+
+1. **`accountPath` 解析**——NapCat 4.18.x 已不再提供 `session.getAccountPath()`
+   （`napcat.mjs` 里 grep 命中 0 次），插件回退到 `ctx.core.dataPath` 拿到的是 QQ 数据
+   **根目录**而不是账号目录。修正为重登次数从无上限收敛到 521 次。
+   补丁：`patch-plugin-account-path.py`。
+2. **启动顺序**——按上游 `run-napcat.sh` 的语义，改为先启动 AV Host 并等 `/healthz`
+   就绪，再启动主 QQ。
+
+完整的诊断报告（含全部证据与已排除项）见
+[`upstream-issue-qq-call-avsdk-20050.md`](upstream-issue-qq-call-avsdk-20050.md)，
+已提交给上游作者。**在作者回复验证过的 QQ/NapCat 组合之前，通话功能不要指望能用。**
+
+`qq_call.enabled = false` 可以关掉它；开启时它也只在通话链路内工作，不影响任何其它功能。

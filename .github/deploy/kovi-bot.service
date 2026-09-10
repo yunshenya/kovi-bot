@@ -2,6 +2,9 @@
 Description=Kovi QQ Bot
 Wants=network-online.target postgresql.service redis-server.service
 After=network-online.target postgresql.service redis-server.service
+# 不设重启速率上限：NapCat 容器升级/重启期间 OneBot 会长时间不可用，机器人应当
+# 一直重试到它回来，而不是在几分钟后放弃并停在 failed 状态。
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -14,8 +17,12 @@ EnvironmentFile=/home/ubuntu/kovi-bot/current/.env
 Environment=RUST_LOG=info,sqlx::postgres::notice=warn
 ExecStartPre=/usr/bin/rm -f /home/ubuntu/kovi-bot/runtime/ready
 ExecStart=/home/ubuntu/kovi-bot/current/kovi-bot
-Restart=on-failure
-RestartSec=5
+# 必须是 always，不能是 on-failure：OneBot WebSocket 断开时机器人是**正常退出**
+# （退出码 0，systemd 记为 Deactivated successfully），on-failure 不会触发重启，
+# 于是 NapCat 一抖动机器人就一直离线，必须人工 systemctl restart。
+Restart=always
+# 20 秒：既能在 NapCat 回来后很快恢复，又不会在对方长时间离线时高频空转。
+RestartSec=20
 TimeoutStartSec=120
 UMask=0027
 
