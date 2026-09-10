@@ -296,49 +296,94 @@ sudo systemctl restart kovi-bot
 回滚点：`/root/napcat-rollback/`（容器 inspect 快照 + `napcat-data-*.tar.gz` 数据备份），
 以及旧容器 `napcat-bridge-v1`。
 
-## 当前状态：接听环节被阻塞（2026-09-11）
+## 实测验证与根因（2026-09-11）
 
-**机器人侧的实现是完整的、经过验证的；阻塞点在 QQ 闭源 AVSDK。**
+**2026-09-11 01:50 完成首次真实来电验证，全链路打通。** 实测记录：
 
-已经实测打通并验证的：
+```
+01:50:18  QQ 语音通话已接通: 小猫ᓚᘏᗢ(3052405886)
+01:50:28  QQ 通话已收到对端语音，采集链路正常
+01:50:30  QQ 通话识别: 你好你好。
+01:50:30  QQ 通话回复: 嗯，你好呀，听起来你今天心情不错？
+01:50:42  QQ 通话识别: 嗯，OO采了采了。
+01:50:43  QQ 通话回复: 采了了？是说你那边忙完了，还是刚才信号有点飘呀？
+01:50:58  QQ 通话识别: 操，没事没事。
+01:50:58  QQ 通话回复: 好，那我不追问了。你现在是想随便聊聊，还是有什么事想和我说？
+01:51:09  QQ 语音通话结束（对方挂断，时长 51 秒）
+```
 
-- 来电检测——采到 `OnInviteActionToAVSDK`（`invite_type: 1`）；
-- 内核动作转发——`cmd 55` 确实送达 AV Host（AV Host 的 `lastInvocationCommand: 55`）；
-- 音频通路——宿主机 `pacat` 写入 `maibot_qq_mic`、`parec` 从 monitor 读回，峰值与播放振幅一致；
-- 本机语音服务——合成 → 识别往返测试通过（合成 2.42 秒音频耗时 1.33 秒，识别 0.17 秒）；
-- Rust 侧全部逻辑——VAD 切段、双链路编排、插话打断、挂断归档，均有单元测试。
+挂断后私聊记忆里写入了一条 `context = private`、`tags = ["qq_call"]` 的记录：
 
-**卡住的一步**：AV Host 把 `cmd 55` 转给 QQ 的 `libAVSDKPlugin.so` 之后，AVSDK
-**一条消息都不回传**，因此 `20006`（接听回调）永远不会出现，桥的自动接听逻辑不触发，
-`GET /v1/calls/current` 会一直停在 `ringing`，对方听到的是无人接听。
+```
+[QQ语音通话记录] 结束原因：对方挂断
+芸汐：喂，我在的，怎么啦？
+小猫ᓚᘏᗢ：你好你好。
+芸汐：嗯，你好呀，听起来你今天心情不错？
+...
+```
 
-更早暴露出来的现象是：AVSDK 对**每一次**登录都回 `20050`，插件的重登逻辑因此循环
-521 次（`16594 / 521 ≈ 31.9`，即每次登录回约 32 条消息、末条恒为 `20050`），
-`networkOutputCount` 始终为 0——AVSDK 从未建立过媒体会话。
+端到端时延（句尾到开口）约 2–3 秒。
 
-### 已排除的原因
+### 根因：上游插件误判了 AVSDK 的 `20050`
+
+问题**从来不在环境或版本**，而在插件对一条命令的语义误判。给插件加上命令直方图后，
+AVSDK 回传的全部命令第一次变得可见：
+
+| 命令 | 真实含义 | 上游的理解 |
+|---|---|---|
+| `cmd 1` → `[0, ""]` | 登录**成功**（0 = 成功） | — |
+| `cmd 103` → `[1, ""]` | 状态通知 | — |
+| `cmd 20061` | 音频设备变更上报（内容里就是我们桥的虚拟声卡） | — |
+| `cmd 20050` | **周期性通知，与登录成败无关** | **误判为「掉线需重登」** |
+| `cmd 20006` | 来电回调 | 等它，但之前永远等不到 |
+
+上游在收到 `20050` 后每 100ms 重登一次，于是**亲手把自己刚刚建立的健康会话反复踢掉**
+（实测累计 521 次，`16594 / 521 ≈ 31.9`）。会话永远无法稳定，`cmd 55`（内核转发的来电
+动作）因此永远得不到处理，来电就一直停在 `ringing`。
+
+修复只需一行语义修正：**`20050`/`120043` 不再触发重登**。效果：
+
+| | 修复前 | 修复后 |
+|---|---|---|
+| 登录次数 | 521 次（循环） | **1 次** |
+| `cmd 20006` 来电回调 | 从未出现 | **出现** |
+| 自动接听 | 不触发 | **200ms 内完成** |
+| `20004` 进房 | 从未出现 | **20004 出现** |
+| 网络媒体输出 | 0 | **出现** |
+| 通话阶段 | 永远 `ringing` | **`connected`** |
+
+### 为了走到这一步，先排除掉的原因
+
+这些排查虽然没有定位到根因，但把范围逼到了插件逻辑上，值得记录以免重复：
 
 | 假设 | 验证方式 | 结论 |
 |---|---|---|
-| AVSDK 缺动态库 | 逐个补齐 `libpulse-mainloop-glib.so.0`、`libEGL.so.1`、`libOpenGL.so.0`、`libGLESv2`、`libGLX`、`libGLdispatch` | 补齐后 Pepper 模块加载成功，`20050` 不变 |
-| 容器 `/dev/shm` 过小（Docker 默认 64 MB） | `--shm-size=1g` | 无效 |
-| 容器沙箱限制 | `--privileged --security-opt seccomp=unconfined` | **完全无变化，容器被排除** |
-| 容器网络 | `--network host`（回环服务才能被宿主机访问） | 桥/AV Host 均可达，`20050` 不变 |
-| NapCat / QQ 版本漂移 | 桥写于 2026-08-03，当时 NapCat 为 4.18.12–4.18.14、QQ 与我们同期；我们是 NapCat 4.18.19 + QQ 9.9.22-40990 | 仅差几个小版本，认为不是变量 |
-| 音频设备 | AVSDK 正确枚举 `MaiBot_QQ_Speaker` / `Maibot_QQ_Microphone` | 正常 |
-| 桥自身 | `doctor.sh` → `all bridge checks passed` | 正常 |
+| AVSDK 缺动态库 | 补齐 `libpulse-mainloop-glib.so.0`、`libEGL.so.1`、`libOpenGL.so.0`、`libGLESv2`、`libGLX`、`libGLdispatch` | 补齐后 Pepper 模块加载成功，问题不变（**但这是必需的**，缺了 AVSDK 根本加载不了） |
+| 容器 `/dev/shm` 过小（Docker 默认 64 MB） | `--shm-size=1g` | 无效（**但保留**，Electron 需要） |
+| 容器沙箱限制 | `--privileged --security-opt seccomp=unconfined` | 完全无变化，容器被排除 |
+| 容器网络 | `--network host`（回环服务才能被宿主机访问） | 必需项，但非根因 |
+| NapCat / QQ 版本漂移 | 桥写于 2026-08-03，当时 NapCat 为 4.18.12–4.18.14；我们是 4.18.19 | 仅差几个小版本，不是变量 |
+| 音频设备 | AVSDK 正确枚举 `MaiBot_QQ_Speaker` / `MaiBot_QQ_Microphone` | 正常 |
 
-### 顺带修复的两个真实缺陷（已做成自愈补丁）
+### 三处已固化为自愈的补丁
 
-1. **`accountPath` 解析**——NapCat 4.18.x 已不再提供 `session.getAccountPath()`
-   （`napcat.mjs` 里 grep 命中 0 次），插件回退到 `ctx.core.dataPath` 拿到的是 QQ 数据
-   **根目录**而不是账号目录。修正为重登次数从无上限收敛到 521 次。
-   补丁：`patch-plugin-account-path.py`。
-2. **启动顺序**——按上游 `run-napcat.sh` 的语义，改为先启动 AV Host 并等 `/healthz`
-   就绪，再启动主 QQ。
+容器入口包装 `bridge-entry.sh` 每次启动都会幂等地重打这三个补丁，因此**重建容器、
+重装桥之后都会自动恢复**，不需要人工介入：
 
-完整的诊断报告（含全部证据与已排除项）见
-[`upstream-issue-qq-call-avsdk-20050.md`](upstream-issue-qq-call-avsdk-20050.md)，
-已提交给上游作者。**在作者回复验证过的 QQ/NapCat 组合之前，通话功能不要指望能用。**
+| 补丁 | 作用 |
+|---|---|
+| `patch-plugin-account-path.py` | NapCat 4.18.x 已删除 `session.getAccountPath()`，插件的回退值 `ctx.core.dataPath` 是 QQ 数据**根目录**而非账号目录（`nt_qq_<hash>`），需要自行解析 |
+| `patch-20050-backoff.py` | 加入命令直方图（暴露在 `/v1/status` 的 `avHost.commandHistogram`） |
+| `patch-ignore-20050.py` | **根因修复**：`20050`/`120043` 不再触发重登 |
 
-`qq_call.enabled = false` 可以关掉它；开启时它也只在通话链路内工作，不影响任何其它功能。
+已验证的插件整份备份在
+`/root/napcat/plugins/napcat-plugin-maibot-qq-voice-call/index.mjs.kovi-verified`。
+
+### 仍然需要你知道的运维约束
+
+- 重启 NapCat **必须**用 `sudo docker restart -t 60 napcat`。默认 10 秒就 SIGKILL，
+  QQ 来不及落盘会话，会导致登录态失效、需要重新扫码。
+- `kovi-bot.service` 已配置 `Restart=always`（kovi 断连是**正常退出**，退出码 0，
+  所以 `on-failure` 不会触发），NapCat 抖动后机器人会自己回来。
+- 完整诊断报告（含全部证据）见
+  [`upstream-issue-qq-call-avsdk-20050.md`](upstream-issue-qq-call-avsdk-20050.md)。
