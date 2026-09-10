@@ -417,6 +417,14 @@ impl ConversationCoordinator {
         admission: IncomingAdmission,
     ) -> bool {
         if !admission.active_reply_preserved {
+            // 这条命令自己那次入站也占着一个预留，而 `active_ticket_locked`
+            // 把 `pending_incoming`（未冻结预留）同样算作"在途回复"。不提前
+            // 交还，`prepare_tracked_message` 必然拿到 ConversationBusy：
+            // 管理员在空闲会话里发 #禁言 / #通话帮助 就永远收不到回执，
+            // 重试再多次也没用，因为挡住它的正是命令自己。直发会立刻用
+            // 自己的代替代它，这里先释放；调用方随后还会再 abandon 一次
+            // （幂等）。
+            Self::abandon_incoming(admission).await;
             return true;
         }
         let scope = admission.ticket.scope();

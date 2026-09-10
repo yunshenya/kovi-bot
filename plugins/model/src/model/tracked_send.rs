@@ -507,6 +507,38 @@ mod tests {
     }
 
     #[test]
+    fn direct_control_response_survives_its_own_ingress_reservation() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let scope = ReplyScope::Group(9_110_006);
+                let admission = ConversationCoordinator::begin_incoming(scope).await;
+                assert!(
+                    ConversationCoordinator::resolve_active_reply_for_direct_response(admission)
+                        .await,
+                    "空闲会话里的控制命令必须判定为可以直发"
+                );
+
+                let result = prepare_tracked_message(
+                    MessageDestination::Group(9_110_006),
+                    Message::from("禁言成功"),
+                    OutgoingSource::Reply,
+                    None,
+                )
+                .await;
+
+                assert!(
+                    result.is_ok(),
+                    "控制回执不能被命令自己那次入站预留挡住: {:?}",
+                    result.err()
+                );
+                result.expect("已断言成功").cancel().await;
+                // 预留已经在直发前交还；调用方随后的第二次 abandon 是幂等的空操作。
+                assert!(!ConversationCoordinator::abandon_incoming(admission).await);
+            });
+    }
+
+    #[test]
     fn host_side_send_never_borrows_an_unrelated_active_ticket() {
         kovi::tokio::runtime::Runtime::new()
             .expect("应创建测试运行时")
