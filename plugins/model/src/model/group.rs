@@ -213,6 +213,9 @@ fn group_pause_acknowledgement(paused: bool) -> &'static str {
 }
 
 /// Apply the same bounded traffic and direct-address limits used by the Host
+/// 群聊控制命令回执在会话占线时的重试等待（毫秒）：首次立即尝试，之后按这些间隔各重试一次。
+const GROUP_DIRECT_RESPONSE_RETRY_DELAYS_MS: [u64; 3] = [200, 500, 1000];
+
 /// before a Core-owned group message can consume ingress or model capacity.
 pub(crate) async fn should_suppress_core_group_message(
     event: &GroupMsgEvent,
@@ -1118,13 +1121,26 @@ async fn send_group_direct_response(
     admission: IncomingAdmission,
     content: impl Into<String>,
 ) -> bool {
+    let content = content.into();
     let resolved =
         ConversationCoordinator::resolve_active_reply_for_direct_response(admission).await;
-    let sent = if resolved {
-        send_tracked_group_message(bot, group_id, content).await
-    } else {
-        false
-    };
+    let mut sent = false;
+    if resolved {
+        // 同私聊：群里有普通回合在收尾时直发会直接返回 ConversationBusy。
+        // #禁言 / #结束禁言 是控制命令，必须拿到回执，所以短暂重试。
+        for (attempt, delay_ms) in std::iter::once(0_u64)
+            .chain(GROUP_DIRECT_RESPONSE_RETRY_DELAYS_MS.iter().copied())
+            .enumerate()
+        {
+            if attempt > 0 {
+                kovi::tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            }
+            sent = send_tracked_group_message(bot, group_id, content.clone()).await;
+            if sent {
+                break;
+            }
+        }
+    }
     // A direct response may have advanced the generation after replacing an
     // active model turn. Always kick the scope drainer, including failed
     // sends, so a queue cannot be left behind when the transport rejects the

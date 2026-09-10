@@ -53,6 +53,16 @@ static PRIVATE_MESSAGE_BATCHES: LazyLock<MessageCoalescer<i64>> = LazyLock::new(
 
 type PendingPrivateMessage = PendingTurn;
 
+/// 控制命令回执在会话占线时的重试间隔（毫秒）。
+///
+/// 撞上在途回复时直发会立刻失败而不是等待；控制命令是确定性操作，短暂重试
+/// 能让管理员的 #授权群 / #通话帮助 之类命令稳定拿到回执。
+/// 控制命令回执在会话占线时的重试等待（毫秒）：首次立即尝试，之后按这些间隔各重试一次。
+///
+/// 撞上在途回复时直发会立刻失败而不是等待。控制命令是确定性操作，短暂重试能让
+/// 管理员的 #授权群 / #通话帮助 之类命令稳定拿到回执。
+const DIRECT_RESPONSE_RETRY_DELAYS_MS: [u64; 3] = [200, 500, 1000];
+
 /// 当前私聊回复期间保存有界 FIFO，完整保留每个 turn 的正文、附件和消息 ID。
 static PENDING_PRIVATE_MESSAGES: LazyLock<Mutex<HashMap<i64, VecDeque<PendingPrivateMessage>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -1254,13 +1264,29 @@ async fn send_private_direct_response(
     admission: IncomingAdmission,
     content: impl Into<String>,
 ) -> bool {
+    let content = content.into();
     let resolved =
         ConversationCoordinator::resolve_active_reply_for_direct_response(admission).await;
-    let sent = if resolved {
-        send_tracked_private_message(bot, user_id, content).await
-    } else {
-        false
-    };
+    let mut sent = false;
+    if resolved {
+        // 控制命令必须拿到回执，但同会话里可能正有普通聊天回合在收尾——它的
+        // 结束时间不确定，而直发在检测到在途回复时会直接返回 ConversationBusy
+        // 而不是等待。管理员发 #授权群 / #通话帮助 这类命令却收不到回执，就是
+        // 撞上了这个窗口。这里按递增间隔重试有限次，让控制面赢下这一轮。
+        // 先立即尝试一次，失败后按递增间隔各重试一次；最后一次不再空等。
+        for (attempt, delay_ms) in std::iter::once(0_u64)
+            .chain(DIRECT_RESPONSE_RETRY_DELAYS_MS.iter().copied())
+            .enumerate()
+        {
+            if attempt > 0 {
+                kovi::tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            }
+            sent = send_tracked_private_message(bot, user_id, content.clone()).await;
+            if sent {
+                break;
+            }
+        }
+    }
     // Direct control responses may replace an active model turn. Always kick
     // the same-scope FIFO after the send attempt so queued turns cannot stall.
     drain_pending_private_messages_from_current(user_id, bot).await;
