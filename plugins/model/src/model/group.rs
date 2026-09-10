@@ -455,9 +455,8 @@ pub(crate) async fn group_message_event_after_ingress(
     // Behavioral gate (v4 §103/§197): when influence_mode=active and the
     // world says this is a rapid unaddressed discussion with the floor held
     // by others, stay silent instead of interjecting. Default disabled → no
-    // behavioral change; admin messages never get suppressed.
+    // behavioral change. 与普通成员一致：管理员也不越过这条场合判断。
     if !locally_addressed
-        && !sender_is_admin
         && crate::yunxi::world_model::interruption_guard(
             crate::yunxi::world_model::scene_group_conversation_id(group_id),
         ) > 0.7
@@ -471,10 +470,7 @@ pub(crate) async fn group_message_event_after_ingress(
         );
         return;
     }
-    if locally_addressed
-        && !sender_is_admin
-        && should_suppress_direct_trigger(group_id, event.user_id).await
-    {
+    if locally_addressed && should_suppress_direct_trigger(group_id, event.user_id).await {
         println!(
             "[INFO] 群聊重复或高频点名已静默 (群组: {}, 用户: {})",
             group_id, event.user_id
@@ -577,7 +573,6 @@ pub(crate) async fn group_message_event_after_ingress(
     let addressed_to_bot = addressing.directly_addressed();
     if addressed_to_bot
         && !locally_addressed
-        && !sender_is_admin
         && should_suppress_direct_trigger(group_id, event.user_id).await
     {
         println!(
@@ -851,13 +846,13 @@ pub(crate) async fn group_message_event_after_ingress(
     )
     .await;
     let continue_conversation = !primary_reply_expected && conversation_decision.continue_reply;
-    // 群聊可见回复节奏硬限制（同群所有普通聊天回复共享额度）。管理员、
-    // 显式识图请求、表情教学与禁言命令不受限；额度被拒时本条仅作观察，
-    // 不生成可见回复——这是"每句话都回/扑上来接话"的确定性兜底。
+    // 群聊可见回复节奏硬限制（同群所有普通聊天回复共享额度）。显式识图
+    // 请求、表情教学与禁言命令不受限；额度被拒时本条仅作观察，不生成可见
+    // 回复——这是"每句话都回/扑上来接话"的确定性兜底。管理员与普通成员
+    // 完全一致：不再绕过节奏限制，避免"管理员句句都回"。
     let reply_budget_ok = !(primary_reply_expected
         || continue_conversation
         || (sampled_for_interjection && understanding.interjection_worthy))
-        || sender_is_admin
         || vision_requested
         || explicit_sticker_teaching
         || matches!(message.trim(), "#禁言" | "#结束禁言")

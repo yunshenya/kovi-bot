@@ -4739,10 +4739,10 @@ impl ModelBackend for KoviModelBackend {
                 return Ok(silent_with_interaction_state(input));
             }
             // 群聊可见回复节奏：同群普通聊天回复（点名或未点名）共享与
-            // Host 相同的确定性预算。预算被拒时保持观察（状态更新照常），
-            // 但不生成可见回复——这是"几乎每句话都回"的兜底。显式多消息
-            // 请求（explicit_message_count）、识图与受控工具调用是用户的
-            // 明确请求，不受此限。
+            // Host 相同的确定性预算，管理员与普通成员同等受限。预算被拒时
+            // 保持观察（状态更新照常），但不生成可见回复——这是"几乎每句话
+            // 都回"的兜底。显式多消息请求（explicit_message_count）、识图与
+            // 受控工具调用是用户的明确请求，不受此限。
             if let Some(group_message) = message
                 && let QqConversation::Group { group_id } = conversation
                 && group_message.conversation_kind == ConversationKind::Group

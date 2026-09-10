@@ -90,10 +90,11 @@ familiar_rate_limit = 2
 # "接续对话"语义评估（由相关性判定是否回复）；窗口外回到低频插话抽样。
 # 窗口越长，群内每条消息请求模型的概率越高；推荐维持 3 分钟。
 continuation_window_secs = 180
-# 群聊可见回复节奏的确定性硬限制（点名/未点名共用；管理员、显式识图/
-# 教学/命令不受限）：同群两次可见聊天回复至少间隔 reply_gap_secs，
-# 每 reply_rate_window_secs 内最多 reply_rate_limit 条。这是"几乎每句
-# 话她都回复"的最终兜底——无论模型想接多少，同群可见回复频率都被压住。
+# 群聊可见回复节奏的确定性硬限制（点名/未点名共用；显式识图/教学/命令
+# 不受限，管理员与普通成员同等受限）：同群两次可见聊天回复至少间隔
+# reply_gap_secs，每 reply_rate_window_secs 内最多 reply_rate_limit 条。
+# 这是"几乎每句话她都回复"的最终兜底——无论模型想接多少，同群可见回复
+# 频率都被压住，管理员也不例外。
 reply_gap_secs = 90
 reply_rate_window_secs = 600
 reply_rate_limit = 4
