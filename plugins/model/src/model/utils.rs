@@ -3576,6 +3576,9 @@ async fn process_group_reply_inner(
     }
 
     // 读取状态后立即释放锁，避免一次模型网络请求阻塞其他群的状态操作。
+    // 禁言(显式 #禁言 或 QQ 发送退避)期间只有管理员回合会继续走到模型：
+    // 工具链在 group_paused 下确定性返回静默，唯一的可见出口是管理员明确
+    // 要求恢复时调用 group.resume（这也是「恢复本群回复」的自然语言通道）。
     let is_banned = is_group_paused(group_id).await;
     if !is_banned || is_bot_admin(&bot, user_id) {
         let current_message_id = source_message_ids.last().copied();
@@ -4288,12 +4291,32 @@ mod tests {
         plain_reply_plan_for_host, reply_action_protocol_requested, sanitize_scheduled_output,
         should_repair_empty_reply, tool_result_wire, with_reference_context,
     };
+    use super::{is_group_paused, set_group_paused};
     use crate::memory::{BotPersonality, UserProfile};
     use crate::model::message_actions::{ReplyPlan, follow_up_delay_millis, split_reply};
     use crate::model::reply_disposition::ReplyDisposition;
     use chrono::Local;
     use kovi::serde_json::json;
     use serde_json::Map;
+
+    #[test]
+    fn group_pause_state_round_trips_and_is_isolated_per_group() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let group_id = 9_120_777;
+                // 未配置 Redis 时持久层是 no-op，进程内状态仍必须立即生效。
+                assert!(!is_group_paused(group_id).await);
+
+                set_group_paused(group_id, true).await;
+                assert!(is_group_paused(group_id).await);
+                // 暂停状态按群隔离，不影响其它群。
+                assert!(!is_group_paused(group_id + 1).await);
+
+                set_group_paused(group_id, false).await;
+                assert!(!is_group_paused(group_id).await);
+            });
+    }
 
     #[test]
     fn neutralize_protocol_markers_breaks_every_marker_form_but_keeps_readability() {

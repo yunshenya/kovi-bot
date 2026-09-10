@@ -20,7 +20,7 @@ use crate::model::traffic::{InboundScope, bounded_input, should_suppress};
 use crate::model::utils::{
     clear_group_runtime_data, command_help, is_agent_task_command, is_bot_admin, is_group_paused,
     is_help_command, is_restricted_command, learn_user_profile_from_message,
-    process_group_reply_claimed, report_vision_failure, send_sys_info,
+    process_group_reply_claimed, report_vision_failure, send_sys_info, set_group_paused,
 };
 use crate::redis_store;
 use crate::reminders;
@@ -192,6 +192,26 @@ pub(crate) async fn record_group_message_observation(event: &GroupMsgEvent) {
     }
 }
 
+/// 群聊暂停控制命令的确定性解析：`Some(true)` = 禁言，`Some(false)` = 结束禁言。
+///
+/// 只有这两个字面命令会命中；其余 `#` 命令走各自的控制面分支。
+fn group_pause_command(message: &str) -> Option<bool> {
+    match message.trim() {
+        "#禁言" => Some(true),
+        "#结束禁言" => Some(false),
+        _ => None,
+    }
+}
+
+/// 暂停控制命令的用户可见回执。
+fn group_pause_acknowledgement(paused: bool) -> &'static str {
+    if paused {
+        "禁言成功"
+    } else {
+        "结束成功"
+    }
+}
+
 /// Apply the same bounded traffic and direct-address limits used by the Host
 /// before a Core-owned group message can consume ingress or model capacity.
 pub(crate) async fn should_suppress_core_group_message(
@@ -247,6 +267,28 @@ pub(crate) async fn group_message_event_after_ingress(
             "[INFO] 群聊未授权命令已静默 (群组: {}, 用户: {})",
             group_id, event.user_id
         );
+        return;
+    }
+    // #禁言 / #结束禁言 是确定性控制面：在任何批次合并、窗口排队或模型调用
+    // 之前直接落状态并回执。此前它们和普通消息走同一条链路，只要本群还有
+    // 回复在途就会整条命令进 PENDING_WINDOW_MESSAGES，而队列只在"回复完成"
+    // 路径里被 drain，禁言状态根本没写进去——管理员看到的现象就是
+    // "发 #禁言 没有效果"。控制命令永远不该被排队或合并。
+    if let Some(paused) = group_pause_command(message) {
+        set_group_paused(group_id, paused).await;
+        println!(
+            "[INFO] 群聊禁言状态已更新 (群组: {}, 用户: {}, 禁言: {})",
+            group_id, event.user_id, paused
+        );
+        // 直接回执会顶掉本群在途/排队的回复，让禁言立即生效而不是"这一轮说完
+        // 再说"；drain 由该路径统一负责，不会留下悬空队列。
+        send_group_direct_response(
+            &bot,
+            group_id,
+            initial_admission,
+            group_pause_acknowledgement(paused),
+        )
+        .await;
         return;
     }
     if is_help_command(message) {
@@ -532,6 +574,12 @@ pub(crate) async fn group_message_event_after_ingress(
         }
         return;
     }
+
+    // 暂停期间的静默不在这里提前 return：#禁言 生效后非管理员回合会在
+    // `process_group_reply_inner` 里被确定性挡下，管理员回合仍要走到模型，
+    // 因为工具链在 group_paused 下只允许 read-only 与 group.resume，并确定性
+    // 返回静默——这是「恢复本群回复」的自然语言恢复通道，提前 return 会把它
+    // 掐断，只剩 #结束禁言 一条路。
 
     let labels = match known_labels(&stickers, sticker_scope).await {
         Ok(labels) => labels,
@@ -833,6 +881,8 @@ pub(crate) async fn group_message_event_after_ingress(
     let group_paused = is_group_paused(group_id).await;
     let explicit_sticker_teaching =
         sender_is_admin && sticker_teaching_message.is_some() && !message.trim().is_empty();
+    // 暂停期间管理员仍然保留一次模型回合：工具链在 group_paused 下只会静默
+    // 或执行 group.resume，因此这里不会让禁言期间出现闲聊回复。
     let primary_reply_expected = addressed_to_bot
         || vision_requested
         || explicit_sticker_teaching
@@ -1964,10 +2014,11 @@ mod tests {
         PENDING_WINDOW_MESSAGES, admit_understood_group_turn,
         clear_group_erasure_reply_state_locked, complete_interjection_attempt,
         continuation_window_secs, conversation_active_for_observation, decision_budget_available,
-        directed_at_others, group_erasure_receipt_destination, message_at_self,
-        normalized_sender_name, prune_decision_attempts, queue_pending_window_message,
-        reserve_visible_reply_slot, should_queue_after_executive, suppress_direct_trigger,
-        take_pending_window_turn, text_mentions_bot, with_structured_bot_mention_context,
+        directed_at_others, group_erasure_receipt_destination, group_pause_acknowledgement,
+        group_pause_command, message_at_self, normalized_sender_name, prune_decision_attempts,
+        queue_pending_window_message, reserve_visible_reply_slot, should_queue_after_executive,
+        suppress_direct_trigger, take_pending_window_turn, text_mentions_bot,
+        with_structured_bot_mention_context,
     };
     use crate::model::MessageDestination;
     use crate::model::conversation_coordinator::{
@@ -1986,6 +2037,23 @@ mod tests {
     use kovi::bot::message::Segment;
     use kovi::serde_json::json;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn group_pause_commands_are_recognized_deterministically() {
+        // 只有字面命令命中；空白不影响判断。
+        assert_eq!(group_pause_command("#禁言"), Some(true));
+        assert_eq!(group_pause_command("  #结束禁言 "), Some(false));
+        assert_eq!(group_pause_command(" #禁言\n"), Some(true));
+        // 其余 # 命令和普通聊天都不属于暂停控制面。
+        assert_eq!(group_pause_command("#结束禁言 一下"), None);
+        assert_eq!(group_pause_command("#取消禁言"), None);
+        assert_eq!(group_pause_command("#系统信息"), None);
+        assert_eq!(group_pause_command("禁言"), None);
+        assert_eq!(group_pause_command(""), None);
+        // 回执与状态一致：禁言/恢复各自一句确定性文本。
+        assert_eq!(group_pause_acknowledgement(true), "禁言成功");
+        assert_eq!(group_pause_acknowledgement(false), "结束成功");
+    }
 
     #[test]
     fn group_erasure_rotates_scope_epoch_and_uses_an_unrecorded_group_receipt() {

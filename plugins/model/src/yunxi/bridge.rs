@@ -1507,6 +1507,22 @@ impl CoreBridge {
         // before any Redis/PostgreSQL lookup. The single ingress worker resolves
         // whether it actually targets Yunxi once the conversation is canonical.
         let reply_target_candidate = reply_message_id(&event.message).is_some();
+        // 未点名的纯图片（没有任何文字）只观察，永远不进入 Core 决策：
+        // Host 链路对同样的消息一直是"收到群聊纯图片状态，保持静默"，而
+        // Core 的注意力采样把"带图片"当成必然够长的候选，于是群友随手发图
+        // 会被确定性采样进模型，看起来就是"只要发图片她必回复"。被 @ 或被
+        // 引用的图片不受影响：那是明确指向芸汐的识图请求。
+        if pure_group_image(event)
+            && !addressed
+            && !reply_target_candidate
+            && !explicit_batch_request
+        {
+            return GroupHandlingDecision {
+                handling: GroupCoreHandling::Observe,
+                planner_attention_requested: false,
+                explicit_batch_request: false,
+            };
+        }
         let planner_attention_requested = !addressed
             && !reply_target_candidate
             && !explicit_batch_request
@@ -1536,6 +1552,13 @@ impl CoreBridge {
         }
         let text = event.borrow_text().unwrap_or_default().trim();
         let has_image = event.message.iter().any(|segment| segment.type_ == "image");
+        // 未点名的纯图片不参与采样，也不消耗"够长消息"的计数：`has_image`
+        // 在 `message_length_passable` 里等于无条件放行，会让群友随手发的
+        // 图片每次都进入语义评估（接续窗口内更是确定性放行），表现为
+        // "只要发图片她必回复"。图片要和文字一起出现才算一条可接的群聊消息。
+        if has_image && text.is_empty() {
+            return false;
+        }
         // 接续对话窗口:芸汐最近是否在本群发过可见消息(由 MessageTransport
         // 统一标记)。窗口内短消息也有机会进入语义评估,窗口外保持严格。
         let continuation_active =
@@ -4167,6 +4190,15 @@ fn core_cutover_enabled_from_value(value: Option<&str>, default: bool) -> bool {
     }
 }
 
+/// 未点名的纯图片消息：带 image 段且没有任何文字。
+///
+/// 这类消息在 Host 链路里只会被记录成"收到群聊纯图片状态，保持静默"；
+/// Core 侧也必须一致，否则图片会绕过 `min_message_chars` 进入注意力采样。
+fn pure_group_image(event: &GroupMsgEvent) -> bool {
+    event.message.iter().any(|segment| segment.type_ == "image")
+        && event.borrow_text().unwrap_or_default().trim().is_empty()
+}
+
 fn ambient_group_payload_can_be_sampled(message: &Message) -> bool {
     !message
         .iter()
@@ -4185,8 +4217,8 @@ mod tests {
         core_private_payload_is_supported, dispatch_action_with_timeout,
         effective_visible_reply_allowed, group_message_requests_explicit_batch, idle_tick_event,
         merge_data_erasure_targets, message_at_self, message_length_passable,
-        normalize_attachments, reply_message_id, resolve_and_submit, run_ingress, run_runtime,
-        send_action_ingress_command_with_ack, send_ingress_command_with_ack,
+        normalize_attachments, pure_group_image, reply_message_id, resolve_and_submit, run_ingress,
+        run_runtime, send_action_ingress_command_with_ack, send_ingress_command_with_ack,
         send_ingress_command_with_ack_timeouts, submit_message_collisions,
         submit_runtime_with_timeout, text_mentions_agent, unblock_users,
     };
@@ -4791,6 +4823,69 @@ mod tests {
         let reply_only = Message::from(vec![Segment::new("reply", json!({"id": "12345"}))]);
         assert!(core_group_payload_is_supported(&reply_only, None));
         assert!(core_private_payload_is_supported(&reply_only, None));
+    }
+
+    #[test]
+    fn pure_group_images_are_never_ambient_candidates() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let (api_tx, _api_rx) = mpsc::channel(1);
+                let event_with =
+                    |text: Option<&str>, message: Message| kovi::event::GroupMsgEvent {
+                        time: 0,
+                        self_id: 1_000,
+                        post_type: kovi::event::PostType::Message,
+                        message_type: "group".to_string(),
+                        sub_type: "normal".to_string(),
+                        message,
+                        message_id: 7,
+                        group_id: 123,
+                        user_id: 456,
+                        anonymous: None,
+                        raw_message: String::new(),
+                        font: 0,
+                        sender: kovi::event::Sender {
+                            user_id: 456,
+                            nickname: Some("测试用户".to_string()),
+                            card: None,
+                            sex: None,
+                            age: None,
+                            area: None,
+                            level: None,
+                            role: None,
+                            title: None,
+                        },
+                        text: text.map(str::to_owned),
+                        human_text: text.unwrap_or_default().to_owned(),
+                        original_json: json!({}),
+                        api_tx: api_tx.clone(),
+                    };
+
+                let image_segment = || {
+                    Segment::new(
+                        "image",
+                        json!({"file_unique": "image-hash", "file": "a.png"}),
+                    )
+                };
+                // 只有图片、没有文字：Host 链路保持静默，Core 采样也必须拒绝。
+                let pure_image = event_with(None, Message::from(vec![image_segment()]));
+                assert!(pure_group_image(&pure_image));
+
+                // 图片加文字仍然是一条可以自然接话的群聊消息。
+                let image_with_text = event_with(
+                    Some("看这个"),
+                    Message::from(vec![
+                        image_segment(),
+                        Segment::new("text", json!({"text": "看这个"})),
+                    ]),
+                );
+                assert!(!pure_group_image(&image_with_text));
+
+                // 纯文字不受影响。
+                let text_only = event_with(Some("看这个"), Message::from("看这个"));
+                assert!(!pure_group_image(&text_only));
+            });
     }
 
     #[test]
