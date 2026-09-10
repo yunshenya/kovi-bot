@@ -1,0 +1,7 @@
+# 本机语音服务的 Python 依赖。
+#
+# sherpa-onnx 的 wheel 自带预编译的 ONNX Runtime，服务器上不需要额外装
+# libonnxruntime 或编译任何 C++。这就是把语音放在独立进程里的主要理由：
+# 机器人二进制的 CI 构建完全不受影响。
+sherpa-onnx==1.13.7
+numpy>=1.26,<3

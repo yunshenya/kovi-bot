@@ -36,6 +36,7 @@ mod mind;
 mod mood;
 mod proactive;
 mod prompt;
+mod qq_call;
 mod reminders;
 mod server;
 mod tools;
@@ -55,6 +56,7 @@ pub use executive::{
 pub use gag_ledger::GagLedgerConfig;
 pub use identity::IdentityConfig;
 pub use mind::MindConfig;
+pub use qq_call::QqCallConfig;
 pub use reminders::ReminderConfig;
 pub use tools::{McpServerConfig, ToolsConfig};
 pub use vision::VisionConfig;
@@ -115,6 +117,8 @@ pub struct ModelConfig {
     gag_ledger: GagLedgerConfig,
     /// 图片理解 Provider 路由配置。
     vision: VisionConfig,
+    /// QQ 实时语音通话配置（默认关闭）。
+    qq_call: QqCallConfig,
     /// Executive v3 deterministic control configuration.
     executive: ExecutiveConfig,
     /// Intrinsic model and bounded fallback configuration.
@@ -168,6 +172,7 @@ impl ModelConfig {
         self.world_model.validate()?;
         self.gag_ledger.validate()?;
         self.vision.validate()?;
+        self.qq_call.validate()?;
         self.executive.validate()?;
         self.model.validate()?;
         if !self.vision.mcp_server().is_empty() && !self.tools.enabled() {
@@ -267,6 +272,10 @@ impl ModelConfig {
         &self.vision
     }
 
+    pub fn qq_call(&self) -> &QqCallConfig {
+        &self.qq_call
+    }
+
     pub fn executive(&self) -> &ExecutiveConfig {
         &self.executive
     }
@@ -347,6 +356,28 @@ mod tests {
         assert!(!config.prompt().private_prompt().contains("silent 决策"));
         assert!(!config.prompt().system_prompt().contains("REPLY_ACTION"));
         assert!(!config.prompt().private_prompt().contains("REPLY_ACTION"));
+    }
+
+    #[test]
+    fn shipped_example_configuration_deserializes() {
+        // bot.conf.example.toml 是发布流程实际使用的生产模板（部署工作流会把它
+        // 拷成 bot.conf.toml 再按 Secrets 打补丁）。它里面的地址是故意不可用的
+        // 占位值，所以这里只校验语法与字段类型，不跑 validate()。
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bot.conf.example.toml");
+        let source = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("无法读取 {}: {error}", path.display()));
+        let config = Config::builder()
+            .add_source(config::File::from_str(&source, FileFormat::Toml))
+            .build()
+            .and_then(|config| config.try_deserialize::<ModelConfig>())
+            .expect("仓库示例配置应可反序列化");
+        // 通话段已随部署启用，这里确认它填的是真实可用的地址形态（回环 + 完整路径），
+        // 避免把占位值带进生产。
+        assert!(
+            config.qq_call().validate().is_ok(),
+            "示例配置里的通话配置必须通过校验"
+        );
     }
 
     #[test]

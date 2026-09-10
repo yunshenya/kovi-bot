@@ -49,6 +49,8 @@ mod group_access;
 mod image_security;
 mod model;
 mod private_image_memory;
+// QQ 实时语音通话（默认关闭，启用后轮询 NapCat AV 桥）
+mod qq_call;
 mod redis_store;
 pub(crate) mod reminders;
 mod vision;
@@ -698,6 +700,12 @@ async fn main() {
         let agent_run_bot = Arc::clone(&proactive_bot);
         kovi::tokio::spawn(async move {
             agent_runs::start_scheduler(agent_run_bot).await;
+        });
+
+        // QQ 语音通话调度器（配置门控；关闭时不创建桥客户端）。
+        let qq_call_bot = Arc::clone(&proactive_bot);
+        kovi::tokio::spawn(async move {
+            qq_call::start_scheduler(qq_call_bot).await;
         });
 
         // 在后台异步任务中执行定期任务

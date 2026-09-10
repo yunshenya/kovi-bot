@@ -119,6 +119,27 @@ WebSocket 服务端。NapCat 和机器人同机时，两端都应只监听 `127.
 跨主机部署时优先使用受控私网、VPN 或 WSS，并通过防火墙限制来源。不要把无 Token 的
 OneBot 端口暴露到公网。
 
+## QQ 语音通话
+
+对方给机器人 QQ 打语音电话时，芸汐可以自动接听并用她自己的私聊人设、记忆和同一个
+模型说话，挂断后把通话记录写回对方的私聊记忆。默认关闭。
+
+QQ 通话不在 OneBot 11 协议里，NapCat 也没有对应接口，因此需要在部署服务器上额外安装
+一个独立的上游 NapCat AV 桥（GPL-3.0，以独立进程运行，本仓库不分发也不修改它）来接管
+通话信令与音频设备，并部署一个只监听回环的本机语音服务负责中文识别与合成。
+
+- 完整说明、数据流、权限边界与调参：[`docs/qq-call.md`](docs/qq-call.md)
+- 服务器预检与桥安装：[`scripts/install-qq-call.sh`](scripts/install-qq-call.sh)
+- 本机语音服务（ASR + TTS）：[`tools/speech-service/README.md`](tools/speech-service/README.md)
+
+```bash
+scripts/install-qq-call.sh          # 只预检服务器条件
+scripts/install-qq-call.sh --apply  # 预检通过后安装依赖与桥
+```
+
+然后在 `bot.conf.toml` 的 `[qq_call]` 里填好路径与白名单，把 `enabled` 改成 `true`
+并重启机器人。
+
 ## GitHub Actions
 
 [`CI`](.github/workflows/ci.yml) 会在 PR 与 `main` 推送时执行格式、Clippy、PostgreSQL

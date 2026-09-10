@@ -1,0 +1,38 @@
+[Unit]
+Description=Yunxi local speech service (Chinese ASR + TTS for QQ voice calls)
+Documentation=https://github.com/yunshenya/kovi-bot/blob/main/tools/speech-service/README.md
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/yunxi-speech
+Environment=PYTHONUNBUFFERED=1
+
+# 只监听回环：这个服务只给同一台机器上的 kovi-bot 用。
+# --threads 2：4 核机器上给 QQ（第二个 Electron 进程）和系统留出余量。
+ExecStart=/home/ubuntu/yunxi-speech/.venv/bin/python /home/ubuntu/yunxi-speech/service.py \
+    --host 127.0.0.1 \
+    --port 6120 \
+    --threads 2 \
+    --asr-dir /home/ubuntu/.local/share/yunxi-speech/models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17 \
+    --tts-dir /home/ubuntu/.local/share/yunxi-speech/models/sherpa-onnx-vits-zh-ll \
+    --tts-speaker 0
+
+# 模型加载要几十秒；失败时不要在重启里空转，先把原因留在日志里。
+Restart=on-failure
+RestartSec=10s
+TimeoutStartSec=180
+
+# 语音服务不需要任何额外权限，收窄攻击面。
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target
