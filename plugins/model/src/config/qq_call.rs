@@ -101,11 +101,13 @@ pub struct QqCallConfig {
     /// `Quit(uint roomId, int reason)`；桥现在把它透出成
     /// `POST /v1/calls/hangup`。打开后，机器人结束会话时会主动挂断。
     hangup_enabled: bool,
-    /// 用哪个 AVSDK 控制方法挂断（`close`/`quit`/`reject`/`clearRoom`）。
+    /// 用哪个 AVSDK 控制方法挂断。**目前只支持 `close`。**
     ///
-    /// 实测（2026-09-12，真机通话中）：只发 `quit` 本端会离开房间但服务器不销毁，
-    /// 紧接着的 `close` 才真的结束这通电话（桥立刻 `ended`、`endReason=4`、
-    /// AVSDK 事件计数停止增长）。因此默认 `close`。
+    /// 实测（2026-09-12，真机通话中）：只发 `quit`（cmd 8）本端会离开房间但服务器
+    /// 不销毁，而且对方 QQ 会弹出"邀请加入多人通话"；`close`（cmd 10）才真的结束
+    /// 这通电话（桥立刻 `ended`、`endReason=4`、AVSDK 事件计数停止增长）。
+    /// 桥侧已把 cmd 8/9/11 从白名单里去掉，且只接受 `close`，所以这里填别的值会在
+    /// 挂断时报错——保留字段只是为了以后发现更合适的方法时不用改代码。
     hangup_method: String,
     /// 传给 AVSDK 控制方法的原因码；默认 1。
     hangup_reason: i64,
@@ -423,9 +425,9 @@ impl QqCallConfig {
         {
             return Err(anyhow::anyhow!("qq_call.hangup_keywords 不能有空字符串"));
         }
-        if self.hangup_method.trim().is_empty() || self.hangup_method.trim().len() > 32 {
+        if self.hangup_method.trim() != "close" {
             return Err(anyhow::anyhow!(
-                "qq_call.hangup_method 必须是 1 到 32 个字符（close/quit/reject/clearRoom）"
+                "qq_call.hangup_method 目前只支持 close（cmd 8 Quit 会邀请对方进入多人通话且挂不断）"
             ));
         }
         if self.hangup_reason < 0 || self.hangup_reason > 1_000 {

@@ -281,16 +281,17 @@ MAIBOT_QQ_CALL_BOT_UIN="<机器人QQ号>" \
 |---|---|---|
 | 1 | `Login(id, uid, uin, uin, accountPath, "")` | 上游桥在用 |
 | 5 | `Accept(id, uinType, uid, uids[], …)` | 上游桥在用（自动接听） |
-| 8 | `Quit(id, uint roomId, int reason)` | 离开房间；**单独发它不够**（见下） |
-| 9 | `Reject(id, uint roomId, uid, int reason)` | 拒接 |
+| 8 | `Quit(id, uint roomId, int reason)` | 方法表里叫 Quit，但实测**不能挂断**，还会让对方 QQ 弹出"邀请加入多人通话"——**已从桥的白名单里去掉** |
+| 9 | `Reject(id, uint roomId, uid, int reason)` | 拒接（未验证，同样不在白名单里） |
 | **10** | **`Close(id, uint roomId, uid, int reason)`** | **真正结束通话**（实测有效，见下） |
-| 11 | `ClearRoom(id, uint roomId, uid)` | 清房间 |
+| 11 | `ClearRoom(id, uint roomId, uid)` | 清房间（未验证，同样不在白名单里） |
 | 55 | `OnPenetrateEvent(id, type, payload)` | 上游桥的 kernel-forward |
 
-- 本仓库的服务端补丁 `patch-plugin-hangup.py` 把 8/9/10/11 加进 AV Host 白名单，并新增
-  `POST /v1/calls/hangup`（`{"method":"close","roomId":…,"reason":…}`，参数省略时用
-  来电元组里的房间号）；机器人侧对应
-  `qq_call.hangup_enabled`/`hangup_method`（默认 `close`）/`hangup_reason`。
+- 本仓库的服务端补丁 `patch-plugin-hangup.py` 只把 **10** 加进 AV Host 白名单
+  （`{1, 5, 10, 55}`），并新增 `POST /v1/calls/hangup`
+  （`{"method":"close","roomId":0,"reason":1}`）；机器人侧对应
+  `qq_call.hangup_enabled`/`hangup_method`（只接受 `close`）/`hangup_reason`。
+  8/9/11 已从白名单移除：8 实测会邀请对方进多人通话，另外两个没验证过。
 - **2026-09-12 03:20 真机实测**（对方手机打进来、通话中逐个候选试）：单发 `quit`
   （roomId 取 0 / 1 / 来电元组里的数 / reason 0/1/2/3）全部"受理但无效"——桥的 AVSDK
   事件计数照涨、`endReason` 始终为空，说明本端没被移出房间；紧接着发 `close` 后
