@@ -182,7 +182,9 @@ impl BridgeClient {
                 reqwest::header::AUTHORIZATION,
                 format!("Bearer {}", self.token),
             )
-            .json(&serde_json::json!({ "method": method, "reason": reason }))
+            // `roomId` 固定 0：真机实测成功的那次就是 close + roomId=0 +
+            // 来电者 uid + reason=1（桥会落到当前会话上）。
+            .json(&serde_json::json!({ "method": method, "roomId": 0, "reason": reason }))
             .timeout(self.timeout)
             .send()
             .await

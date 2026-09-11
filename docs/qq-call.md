@@ -295,7 +295,8 @@ MAIBOT_QQ_CALL_BOT_UIN="<机器人QQ号>" \
   （roomId 取 0 / 1 / 来电元组里的数 / reason 0/1/2/3）全部"受理但无效"——桥的 AVSDK
   事件计数照涨、`endReason` 始终为空，说明本端没被移出房间；紧接着发 `close` 后
   桥立刻变成 `ended` + `endReason=4`，事件计数停止增长，对方手机上的通话结束。
-  因此默认方法选 `close`（`quit` 仍可用 `method` 显式指定）。
+  因此默认方法选 `close`（`quit` 仍可用 `method` 显式指定），参数固定为
+  `close + roomId=0 + 来电者 uid + reason=1`——就是实测成功的那一组。
 - 结论修正：**挂断 API 一直都在**，只是既不在 OneBot、也不在内核 AVSDK 服务里，
   而在 AV Host 的 PPAPI 插件方法表里。
 
