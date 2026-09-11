@@ -366,8 +366,7 @@ async fn respond(
                 println!("[INFO] QQ 通话识别: {peer_text}");
 
                 if config.is_hangup_request(&peer_text) {
-                    // 对方说"挂了吧/先挂"：她回一句道别，然后结束本次通话会话。
-                    // QQ 的 1v1 通话无法由客户端挂断，实际断线要等对方操作。
+                    // 对方说"挂了吧/先挂"：她回一句道别，然后结束会话并挂断电话。
                     println!("[INFO] QQ 通话对方要求挂断，播报道别后收尾");
                     push_turn(
                         &transcript,
@@ -405,19 +404,25 @@ async fn respond(
                 let Some(reply) = generate_reply(&config, &context, &transcript).await else {
                     continue;
                 };
-                println!("[INFO] QQ 通话回复: {reply}");
-                match speak(&speech, &config, &reply, &mut interrupts).await {
+                println!("[INFO] QQ 通话回复: {}", reply.text);
+                match speak(&speech, &config, &reply.text, &mut interrupts).await {
                     Ok(SpeakOutcome::Completed) => push_turn(
                         &transcript,
                         Turn {
                             from_peer: false,
-                            text: reply,
+                            text: reply.text,
                         },
                     ),
                     Ok(SpeakOutcome::Interrupted) => {
                         println!("[INFO] QQ 通话回复被插话打断，不计入电话上下文");
                     }
                     Err(error) => eprintln!("[ERROR] QQ 通话播报失败: {error}"),
+                }
+                if reply.wants_hangup {
+                    // 模型判断对方要结束通话了（识别文本可能"挂了吧"听成"过了吧"，
+                    // 关键词匹配不到，所以由她自己决定）：道别已经说完，收尾挂断。
+                    println!("[INFO] QQ 通话模型判断该结束了，播报道别后收尾");
+                    hangup_requested.store(true, Ordering::Relaxed);
                 }
             }
         }
@@ -467,12 +472,18 @@ async fn speak(
     Ok(SpeakOutcome::Completed)
 }
 
+/// 模型给出的一句电话回复，以及她是否认为这通电话该结束了。
+struct PhoneReply {
+    text: String,
+    wants_hangup: bool,
+}
+
 /// 用芸汐的私聊人设和模型生成一句电话回复。
 async fn generate_reply(
     config: &QqCallConfig,
     context: &str,
     transcript: &Arc<Mutex<Vec<Turn>>>,
-) -> Option<String> {
+) -> Option<PhoneReply> {
     let turns = transcript
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -490,13 +501,23 @@ async fn generate_reply(
         eprintln!("[ERROR] QQ 通话模型调用失败，本轮不回复");
         return None;
     }
+    let wants_hangup = wants_hangup(&response.content);
     match sanitize_reply(&response.content, config.max_reply_chars()) {
-        Some(reply) => Some(reply),
+        Some(text) => Some(PhoneReply { text, wants_hangup }),
         None => {
             eprintln!("[WARN] QQ 通话模型返回了空回复或不可播报内容，本轮不回复");
             None
         }
     }
+}
+
+/// 模型是否在回复里带了"该挂断了"的标记。
+///
+/// 只用关键词判断太脆：实测对方说"挂了吧"被识别成"过了吧"，关键词没命中，
+/// 电话就一直挂着。所以由模型自己判断，约定用 `[[挂断]]`（英文 `[[HANGUP]]`
+/// 也认）——它会随协议标记一起从要朗读的文本里去掉。
+fn wants_hangup(raw: &str) -> bool {
+    raw.contains("[[挂断]]") || raw.to_ascii_uppercase().contains("[[HANGUP]]")
 }
 
 /// 电话请求的消息序列：人设 + 背景资料 + 通话内上下文。
@@ -540,7 +561,10 @@ fn phone_system_prompt(config: &QqCallConfig) -> String {
     format!(
         "{persona}\n\n【当前场景：你们正在打 QQ 语音电话】\n{phone}\n\
          注意：上面所有关于发消息、气泡条数、表情包和排版的要求，在你说话时都不适用——\
-         你正在打电话，不是在打字。",
+         你正在打电话，不是在打字。\n\
+         【挂断约定】对方表示要结束通话时（说再见、说“挂了吧/先挂/不聊了”，\
+         或明显在收尾），你先回一句自然的道别，并在整条回复的最后加上 [[挂断]]；\
+         这会让电话真的挂掉。其它任何时候都不要带这个标记。",
         phone = config.system_prompt(),
     )
 }
@@ -693,8 +717,28 @@ async fn archive_call(
 mod tests {
     use super::{
         Turn, build_messages, phone_system_prompt, sanitize_reply, strip_protocol_markers,
+        wants_hangup,
     };
     use crate::config::QqCallConfig;
+
+    #[test]
+    fn phone_prompt_teaches_the_hangup_marker() {
+        let config = crate::config::QqCallConfig::default();
+        let prompt = phone_system_prompt(&config);
+        assert!(prompt.contains("[[挂断]]"), "电话提示里必须约定挂断标记");
+    }
+
+    #[test]
+    fn hangup_marker_drives_the_hangup() {
+        assert!(wants_hangup("好的，拜拜～[[挂断]]"));
+        assert!(wants_hangup("bye [[HANGUP]]"));
+        assert!(!wants_hangup("我们接着聊"));
+        // 标记本身不会被朗读出来。
+        assert_eq!(
+            sanitize_reply("那我先挂啦，拜拜～[[挂断]]", 40).as_deref(),
+            Some("那我先挂啦，拜拜～")
+        );
+    }
 
     #[test]
     fn protocol_markers_are_removed() {
