@@ -32,7 +32,9 @@ PrivateDevices=true
 ProtectSystem=strict
 ProtectHome=read-only
 ReadOnlyPaths=/home/ubuntu/kovi-bot/current /home/ubuntu/kovi-bot/releases
-ReadWritePaths=/home/ubuntu/kovi-bot/runtime
+# runtime 是机器人自己的工作目录；桥的 runtime 目录用来写"接听授权名单"
+# （qq_call.caller_allowlist_file），NapCat 容器通过 bind mount 读同一份文件。
+ReadWritePaths=/home/ubuntu/kovi-bot/runtime /home/ubuntu/napcat-qq-call/bridge/runtime
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectKernelLogs=true

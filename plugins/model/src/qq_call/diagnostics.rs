@@ -192,9 +192,8 @@ pub(crate) async fn status_report(bot: &kovi::RuntimeBot, config: &QqCallConfig)
         }
     ));
     lines.push(
-        "提醒：名单外来电由桥直接不接（名单文件不可用时才回退成接通后婉拒）；\
-         QQ 的 1v1 通话没有对插件开放“离开房间”，所以机器人无法主动挂断，\
-         需要对方挂断（或等服务器超时）。"
+        "提醒：QQ 的 1v1 通话没有对插件开放“离开房间”，机器人无法主动挂断，\
+         需要对方挂断（或等服务器超时）；对方说“挂了吧”时她只会道别并结束本次会话。"
             .to_string(),
     );
     lines.join("\n")
@@ -202,6 +201,11 @@ pub(crate) async fn status_report(bot: &kovi::RuntimeBot, config: &QqCallConfig)
 
 /// 机器人写给桥的接听授权名单概况。
 fn allowlist_summary(config: &QqCallConfig) -> String {
+    if !config.caller_allowlist_enabled() {
+        return "未启用（名单外来电仍会被接通并听到婉拒；想改成「名单外不接」\
+                就打开 [qq_call] caller_allowlist_enabled）"
+            .to_string();
+    }
     let path = config.caller_allowlist_file();
     if path.is_empty() {
         return "已关闭（桥会接听任何来电）".to_string();

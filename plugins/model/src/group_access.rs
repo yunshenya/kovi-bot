@@ -178,7 +178,10 @@ pub(crate) async fn publish_caller_allowlist() {
         all.insert(state.main_admin);
         all.into_iter().collect::<Vec<_>>()
     };
+    // enabled=false 时桥会保持上游行为（接听任何来电、名单外播报婉拒），
+    // 只有部署者显式打开才在接听前拦截。
     let payload = serde_json::json!({
+        "enabled": crate::config::get().qq_call().caller_allowlist_enabled(),
         "callers": callers,
         "updatedAt": chrono::Local::now().to_rfc3339(),
     });

@@ -419,6 +419,10 @@ archive_to_memory = true
 # 只能静音，通话会一直留在 connected（2026-09-11 晚上这样卡了一整夜）。文件读不到
 # 时桥会回退成接听任何来电，避免机器人没起来时谁都打不进来。
 caller_allowlist_file = "/home/ubuntu/napcat-qq-call/bridge/runtime/allowed-callers.json"
+# 是否在接听前按名单拦截。默认 false＝保持上游行为：谁打进来都接通，名单外播报
+# refuse_message 后静音（注意：接通后机器人无法挂断，这通电话会一直连着，直到
+# 对方挂断）。改成 true 则名单外直接不接，来电自然结束（对方听到"无人接听"）。
+caller_allowlist_enabled = false
 # 通话中对方说了这些词就当作"要求挂断"：她说一句 farewell 后结束本次通话会话。
 # 注意 QQ 侧那通电话只能由对方挂断——客户端没有挂断接口（已穷举验证）。
 hangup_keywords = ["挂断", "挂了吧", "先挂", "挂电话", "挂了", "不聊了"]

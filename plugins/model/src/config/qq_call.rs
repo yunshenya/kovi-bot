@@ -76,9 +76,14 @@ pub struct QqCallConfig {
     allowed_callers: Vec<i64>,
     /// 来电者不在白名单时播报的一句婉拒；留空表示直接静音不回应。
     ///
-    /// 接听授权由 `caller_allowlist_file` 决定：名单外**根本不会被接通**。
-    /// 这句婉拒只在名单文件缺失、桥按旧行为接通时才会用到。
+    /// 这句婉拒在来电者不在有效授权名单里时播报（默认行为：接通后婉拒）。
     refuse_message: String,
+    /// 是否让桥在接听前按名单拦截（默认关闭＝保持"接通后婉拒"的原有行为）。
+    ///
+    /// 打开后：名单外的来电**根本不会被接通**，让铃声自然结束。这是为了绕开
+    /// "客户端无法挂断、接通后通话一直留在 connected"的问题，但会改变来电者
+    /// 听到的结果（从一句婉拒变成无人接听），所以默认关闭，由部署者决定。
+    caller_allowlist_enabled: bool,
     /// 机器人写给桥的"有效通话授权"名单文件（宿主路径）。
     ///
     /// 内容是 `{"callers": [...], "updatedAt": "..."}`，由机器人把授权名单、
@@ -223,6 +228,10 @@ impl QqCallConfig {
 
     pub fn caller_allowlist_file(&self) -> &str {
         self.caller_allowlist_file.trim()
+    }
+
+    pub fn caller_allowlist_enabled(&self) -> bool {
+        self.caller_allowlist_enabled
     }
 
     pub fn hangup_keywords(&self) -> &[String] {
@@ -435,6 +444,7 @@ impl Default for QqCallConfig {
             refuse_message: "不好意思，我现在不方便接电话，晚点我打给你呀。".to_string(),
             caller_allowlist_file:
                 "/home/ubuntu/napcat-qq-call/bridge/runtime/allowed-callers.json".to_string(),
+            caller_allowlist_enabled: false,
             hangup_keywords: vec![
                 "挂断".to_string(),
                 "挂了吧".to_string(),
