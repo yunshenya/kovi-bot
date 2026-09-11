@@ -33,13 +33,21 @@ main_admin_cooldown_secs = 21600
 daily_limit = 4
 main_admin_daily_limit = 2
 target_cooldown_secs = 21600
+# 私聊：对方最近主动互动过就先不追加主动消息。
 recent_interaction_cooldown_secs = 7200
+# 群聊的"在场"要求：窗口内（秒）确实有人说过话、且真人消息不少于
+# group_activity_min_messages 条时，芸汐才会在群里开口——随机主动消息与
+# 自主续聊共用这一条判定，冷清的群不会被冷不丁打扰。她自己的主动消息
+# 不计入条数。
+group_activity_window_secs = 300
+group_activity_min_messages = 2
 # Neuro-sama 风格自主会话：宿主状态机根据已发送结果和语境决定是否继续，模型只写候选正文。
 autonomous_conversation_enabled = true
 autonomous_conversation_check_interval_secs = 3
 autonomous_conversation_idle_secs = 5
 autonomous_conversation_cooldown_secs = 3
-# 群聊自主续聊更克制：等待更久，由宿主状态机根据公共语境决定是否继续。
+# 群聊自主续聊更克制：等待更久，由宿主状态机根据公共语境决定是否继续；
+# 群里没人说话时直接停在 Wait，不再自己把话接下去。
 autonomous_conversation_group_idle_secs = 45
 autonomous_conversation_group_cooldown_secs = 15
 # Legacy compatibility field; retained for config compatibility, not read by the loop.

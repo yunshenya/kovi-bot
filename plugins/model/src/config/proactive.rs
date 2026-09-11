@@ -28,8 +28,14 @@ pub struct ProactiveConfig {
     main_admin_daily_limit: u8,
     /// 同一个群组或用户再次收到主动消息前的最短间隔。
     target_cooldown_secs: u64,
-    /// 用户或群组最近主动互动后，暂不追加主动消息的时间。
+    /// 用户最近主动互动后，暂不追加主动私聊的时间。
     recent_interaction_cooldown_secs: u64,
+    /// 群聊随机主动消息的“在场”窗口（秒）。只有在这个窗口内确实有人
+    /// 说过话时，芸汐才会挑一个话题插进去；冷清的群不会被冷不丁打扰。
+    group_activity_window_secs: u64,
+    /// 上述窗口内至少要有多少条真人消息，才算“群里现在有人在聊”。
+    /// 芸汐自己的主动消息以 `proactive_` 开头，永远不计入这个数字。
+    group_activity_min_messages: u32,
     /// 主动消息进入 Prepared 后的短竞争窗口；0 关闭，否则限 300-1000ms。
     prepared_grace_ms: u64,
     /// 是否启用 Neuro-sama 风格的自主会话续聊。
@@ -102,6 +108,14 @@ impl ProactiveConfig {
 
     pub fn recent_interaction_cooldown_secs(&self) -> u64 {
         self.recent_interaction_cooldown_secs
+    }
+
+    pub fn group_activity_window_secs(&self) -> u64 {
+        self.group_activity_window_secs
+    }
+
+    pub fn group_activity_min_messages(&self) -> u32 {
+        self.group_activity_min_messages
     }
 
     pub fn prepared_grace_ms(&self) -> u64 {
@@ -179,6 +193,12 @@ impl ProactiveConfig {
         if self.recent_interaction_cooldown_secs == 0 {
             return Err(anyhow::anyhow!("主动消息互动抑制时间必须大于0秒"));
         }
+        if self.group_activity_window_secs == 0 {
+            return Err(anyhow::anyhow!("群聊主动消息在场窗口必须大于0秒"));
+        }
+        if self.group_activity_min_messages == 0 || self.group_activity_min_messages > 50 {
+            return Err(anyhow::anyhow!("群聊主动消息最少消息数必须在1到50之间"));
+        }
         if self.prepared_grace_ms != 0 && !(300..=1_000).contains(&self.prepared_grace_ms) {
             return Err(anyhow::anyhow!(
                 "主动消息 Prepared 竞争窗口必须为0或300到1000毫秒"
@@ -221,6 +241,8 @@ impl Default for ProactiveConfig {
             main_admin_daily_limit: 2,
             target_cooldown_secs: 21_600,
             recent_interaction_cooldown_secs: 7_200,
+            group_activity_window_secs: 300,
+            group_activity_min_messages: 2,
             prepared_grace_ms: 500,
             autonomous_conversation_enabled: true,
             autonomous_conversation_check_interval_secs: 3,
@@ -270,12 +292,33 @@ mod tests {
         assert_eq!(config.main_admin_daily_limit(), 2);
         assert_eq!(config.target_cooldown_secs(), 21_600);
         assert_eq!(config.prepared_grace_ms(), 500);
+        assert_eq!(config.group_activity_window_secs(), 300);
+        assert_eq!(config.group_activity_min_messages(), 2);
         assert_eq!(config.autonomous_conversation_check_interval_secs(), 3);
         assert_eq!(config.autonomous_conversation_idle_secs(), 5);
         assert_eq!(config.autonomous_conversation_cooldown_secs(), 3);
         assert_eq!(config.autonomous_conversation_group_idle_secs(), 45);
         assert_eq!(config.autonomous_conversation_group_cooldown_secs(), 15);
         assert_eq!(config.autonomous_conversation_group_max_turns(), 1);
+    }
+
+    #[test]
+    fn group_activity_gate_requires_a_positive_window_and_threshold() {
+        let no_window = ProactiveConfig {
+            group_activity_window_secs: 0,
+            ..ProactiveConfig::default()
+        };
+        assert!(no_window.validate().is_err());
+        let no_messages = ProactiveConfig {
+            group_activity_min_messages: 0,
+            ..ProactiveConfig::default()
+        };
+        assert!(no_messages.validate().is_err());
+        let absurd = ProactiveConfig {
+            group_activity_min_messages: 51,
+            ..ProactiveConfig::default()
+        };
+        assert!(absurd.validate().is_err());
     }
 
     #[test]

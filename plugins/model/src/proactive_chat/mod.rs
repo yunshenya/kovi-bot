@@ -70,6 +70,27 @@ fn target_state_key(scope: &str, subject_id: i64) -> String {
     format!("proactive:{scope}:{subject_id}")
 }
 
+/// 判定一个群"现在是否有人在聊天"：在场窗口内至少有配置要求的真人消息条数。
+///
+/// 口径由 `[proactive] group_activity_window_secs / group_activity_min_messages`
+/// 决定；主动模块与话题生成器共用这一个函数，避免两处判定漂移。
+pub(crate) async fn group_has_live_conversation(
+    memory_manager: &MemoryManager,
+    group_id: i64,
+) -> bool {
+    let proactive_config = crate::config::get().proactive().clone();
+    let since = Local::now()
+        - chrono::Duration::seconds(proactive_config.group_activity_window_secs() as i64);
+    memory_manager
+        .groups_with_recent_activity(
+            &[group_id],
+            since,
+            proactive_config.group_activity_min_messages() as usize,
+        )
+        .await
+        .contains(&group_id)
+}
+
 fn main_admin_state_key(subject_id: i64) -> String {
     target_state_key("main_admin", subject_id)
 }
@@ -187,24 +208,33 @@ impl ProactiveChatManager {
         else {
             return;
         };
-        // 群被 #禁言 时主动心跳同样保持静默；解析不出群号时按原路径提交
-        // (fail-open,不改变既有行为)。
+        // 群聊自主续聊与随机主动消息共用同一条"在场"要求：群里确实有人在聊天
+        // 才接话。她回复后没人接话时停在 Wait 等新的入站，而不是自己把话接下去。
+        // 群被 #禁言、或解析不出群号（fail-open，不改变既有行为）时的处理见下。
         if claim.conversation_kind == ConversationKind::Group
             && let Some(group_id) = proactive_group_id(claim.conversation_id).await
-            && crate::model::utils::is_group_paused(group_id).await
         {
-            kovi::log::info!(
-                "Yunxi autonomous conversation tick skipped: group {group_id} is paused"
-            );
-            yunxi::autonomous::finish_claim_token(
-                claim.conversation_id,
-                claim.token,
-                chrono::Utc::now(),
-                false,
-                ConversationTurnDirective::Wait,
-                proactive_config,
-            );
-            return;
+            let paused = crate::model::utils::is_group_paused(group_id).await;
+            let live_conversation = if paused {
+                false
+            } else {
+                group_has_live_conversation(&self.memory_manager, group_id).await
+            };
+            if !live_conversation {
+                kovi::log::info!(
+                    "Yunxi autonomous conversation tick skipped: conversation_id={} group={group_id} paused={paused} live_conversation={live_conversation}",
+                    claim.conversation_id,
+                );
+                yunxi::autonomous::finish_claim_token(
+                    claim.conversation_id,
+                    claim.token,
+                    chrono::Utc::now(),
+                    false,
+                    ConversationTurnDirective::Wait,
+                    proactive_config,
+                );
+                return;
+            }
         }
         match bridge
             .submit_autonomous_conversation_tick(
@@ -244,14 +274,17 @@ impl ProactiveChatManager {
     }
 
     async fn should_initiate_chat(&self) -> bool {
-        if !self.can_send_regular_chat().await {
+        if !self.can_send_within_budget().await {
             return false;
         }
         let probability = crate::config::get().proactive().push_probability_percent() as u32;
         probability > 0 && rand::rng().random_ratio(probability, 100)
     }
 
-    async fn can_send_regular_chat(&self) -> bool {
+    /// 全局预算：人设能量、全局冷却与每日上限。它与"群里是不是有人在聊天"
+    /// 这类目标相关的时机判断分开，否则群聊的"在场才插话"要求会被"整体最近
+    /// 很热闹就别说话"的私聊条件抵消掉。
+    async fn can_send_within_budget(&self) -> bool {
         let personality = self.memory_manager.get_bot_personality().await;
 
         // 检查基本条件
@@ -261,8 +294,6 @@ impl ProactiveChatManager {
 
         let proactive_config = crate::config::get().proactive().clone();
         let now = Local::now();
-        let inactivity_boundary =
-            now - chrono::Duration::seconds(proactive_config.inactivity_threshold_secs() as i64);
         let cooldown_boundary =
             now - chrono::Duration::seconds(proactive_config.cooldown_secs() as i64);
         let today = now.format("%Y-%m-%d").to_string();
@@ -292,16 +323,34 @@ impl ProactiveChatManager {
             return false;
         }
 
-        let recent_activity_count = self
-            .memory_manager
-            .count_non_proactive_memories_since(inactivity_boundary, 3)
-            .await;
-
-        if recent_activity_count >= 3 {
-            return false;
-        }
-
         true
+    }
+
+    /// 私聊的"全局空闲"要求：最近整体互动不多时才主动找人说话。群聊不使用
+    /// 这条规则——用户要的是"有人聊天时她才接话"，而不是"越安静越要找人说
+    /// 话"，所以群聊改由 [`Self::group_has_live_conversation`] 判定。
+    async fn global_chat_is_quiet(&self) -> bool {
+        let inactivity_boundary = Local::now()
+            - chrono::Duration::seconds(
+                crate::config::get().proactive().inactivity_threshold_secs() as i64,
+            );
+        self.memory_manager
+            .count_non_proactive_memories_since(inactivity_boundary, 3)
+            .await
+            < 3
+    }
+
+    async fn can_send_regular_chat(&self) -> bool {
+        self.can_send_within_budget().await && self.global_chat_is_quiet().await
+    }
+
+    /// 群聊主动消息的"在场"要求：窗口内至少要有这么多条真人消息。
+    ///
+    /// 芸汐不在冷清的群里冷不丁发消息，只在别人正在聊天时插一句。窗口与
+    /// 条数由 `[proactive] group_activity_window_secs / group_activity_min_messages`
+    /// 控制。
+    async fn group_has_live_conversation(&self, group_id: i64) -> bool {
+        group_has_live_conversation(&self.memory_manager, group_id).await
     }
 
     async fn try_initiate_chat(&self) -> Result<()> {
@@ -600,6 +649,23 @@ impl ProactiveChatManager {
                 authorized.push(profile.group_id);
             }
         }
+        if authorized.is_empty() {
+            return authorized;
+        }
+        // 只在"现在真的有人在聊"的群里选目标；冷清的群不进候选，避免随机
+        // 选中之后才在发送前被否掉、白白浪费一次主动时机。
+        let proactive_config = crate::config::get().proactive().clone();
+        let since =
+            now - chrono::Duration::seconds(proactive_config.group_activity_window_secs() as i64);
+        let live = self
+            .memory_manager
+            .groups_with_recent_activity(
+                &authorized,
+                since,
+                proactive_config.group_activity_min_messages() as usize,
+            )
+            .await;
+        authorized.retain(|group_id| live.contains(group_id));
         authorized
     }
 
@@ -640,6 +706,17 @@ impl ProactiveChatManager {
         {
             return Ok(());
         }
+        if !self.can_send_within_budget().await {
+            return Ok(());
+        }
+        // 冷清的群不打扰：只有窗口内确实有人聊天时才考虑插话。放在生成话题
+        // 之前，避免为一次注定不会发送的消息消耗模型调用。
+        if !self.group_has_live_conversation(group_id).await {
+            kovi::log::debug!(
+                "Yunxi proactive group chat skipped: group {group_id} has no live conversation"
+            );
+            return Ok(());
+        }
         if !self.can_send_to_target("group", group_id).await {
             return Ok(());
         }
@@ -664,7 +741,8 @@ impl ProactiveChatManager {
             if !group_access::is_authorized_group(group_id)
                 .await
                 .unwrap_or(false)
-                || !self.can_send_regular_chat().await
+                || !self.can_send_within_budget().await
+                || !self.group_has_live_conversation(group_id).await
                 || !self.can_send_to_target("group", group_id).await
             {
                 return Ok(());
@@ -681,7 +759,8 @@ impl ProactiveChatManager {
                     if !grace.is_zero() {
                         sleep(grace).await;
                     }
-                    self.can_send_regular_chat().await
+                    self.can_send_within_budget().await
+                        && self.group_has_live_conversation(group_id).await
                         && self.can_send_to_target("group", group_id).await
                 },
             )
@@ -826,15 +905,9 @@ impl ProactiveChatManager {
         {
             return false;
         }
-        if scope == "group"
-            && self
-                .memory_manager
-                .get_group_profile(subject_id)
-                .await
-                .is_some_and(|profile| profile.last_activity > interaction_boundary)
-        {
-            return false;
-        }
+        // 群聊不再用"最近有过互动"来抑制主动消息：现在的要求正好相反——只有
+        // 群里刚刚有人在聊天时才会插话，是否够"热"由
+        // `group_has_live_conversation` 判断，这里只保留目标冷却。
         true
     }
 

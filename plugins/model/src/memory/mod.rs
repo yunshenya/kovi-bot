@@ -1648,6 +1648,78 @@ impl MemoryManager {
             .count()
     }
 
+    /// 返回窗口内真人消息达到 `min_messages` 的群号集合，也就是“现在真的有人
+    /// 在聊”的群。
+    ///
+    /// 只统计 `group` 开头的上下文（成员发言与群聊观察）；芸汐自己发出去的
+    /// 主动消息以 `proactive_` 开头，不会被算成有人在聊天。数据库不可用时
+    /// 退回内存缓存，判定口径保持一致。
+    pub(crate) async fn groups_with_recent_activity(
+        &self,
+        group_ids: &[i64],
+        since: DateTime<Local>,
+        min_messages: usize,
+    ) -> HashSet<i64> {
+        if group_ids.is_empty() || min_messages == 0 {
+            return HashSet::new();
+        }
+        if let Some(pool) = self.database_pool.get() {
+            let ids = group_ids.to_vec();
+            let threshold = i64::try_from(min_messages).unwrap_or(i64::MAX);
+            let rows = query(
+                r#"
+                SELECT subject_id, COUNT(*) AS messages
+                FROM kovi_bot_memories
+                WHERE subject_id = ANY($1::BIGINT[])
+                  AND occurred_at > $2
+                  AND STRPOS(context, 'proactive_') <> 1
+                  AND (
+                        scope_type = 'group'
+                        OR (scope_type IS NULL AND STRPOS(context, 'group') = 1)
+                      )
+                GROUP BY subject_id
+                HAVING COUNT(*) >= $3
+                "#,
+            )
+            .bind(&ids)
+            .bind(since)
+            .bind(threshold)
+            .fetch_all(pool)
+            .await;
+            match rows {
+                Ok(rows) => {
+                    return rows
+                        .into_iter()
+                        .filter_map(|row| row.get::<Option<i64>, _>("subject_id"))
+                        .collect();
+                }
+                Err(error) => {
+                    eprintln!("[WARN] 查询群聊活跃度失败，回退内存缓存: {error}");
+                }
+            }
+        }
+
+        let candidates = group_ids.iter().copied().collect::<HashSet<_>>();
+        let mut counts: HashMap<i64, usize> = HashMap::new();
+        for memory in self.memories.lock().await.values() {
+            let Some(subject_id) = memory.subject_id else {
+                continue;
+            };
+            if memory.timestamp <= since
+                || !memory.context.starts_with("group")
+                || !candidates.contains(&subject_id)
+            {
+                continue;
+            }
+            *counts.entry(subject_id).or_default() += 1;
+        }
+        counts
+            .into_iter()
+            .filter(|(_, count)| *count >= min_messages)
+            .map(|(subject_id, _)| subject_id)
+            .collect()
+    }
+
     /// 获取重要性达到指定阈值的记忆条目
     ///
     /// # 参数
@@ -3302,6 +3374,70 @@ mod tests {
                 assert_eq!(private_context.len(), 1);
                 assert!(!private_context[0].content.contains("群聊"));
 
+                std::fs::remove_file(path).expect("应清理测试记忆文件");
+            });
+    }
+
+    #[test]
+    fn group_activity_counts_human_messages_inside_the_window_only() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let path = temporary_memory_path("group-activity");
+                let manager = MemoryManager::new(path.to_str().expect("临时路径应为 UTF-8"));
+                let now = Local::now();
+                let window = now - ChronoDuration::minutes(5);
+
+                // 群 100：两条真人消息，达到阈值。
+                manager
+                    .add_conversation_memory(100, "甲: 在吗", "group_chat")
+                    .await
+                    .expect("应写入群消息");
+                manager
+                    .add_conversation_memory(100, "乙: 在的", "group_observation")
+                    .await
+                    .expect("应写入群观察");
+                // 芸汐自己的主动消息不算“有人在聊天”。
+                manager
+                    .add_conversation_memory(100, "主动发起话题: 大家好", "proactive_group_chat")
+                    .await
+                    .expect("应写入主动消息");
+                // 与群 100 同号的私聊记忆同样不算。
+                manager
+                    .add_conversation_memory(100, "私聊内容", "private_chat")
+                    .await
+                    .expect("应写入私聊记忆");
+                // 群 200：只有一条消息，未达阈值。
+                manager
+                    .add_conversation_memory(200, "丙: 冒个泡", "group_chat")
+                    .await
+                    .expect("应写入群消息");
+                // 群 300：消息在窗口之外。
+                manager
+                    .add_memory(MemoryEntry {
+                        id: "stale-group-300".to_string(),
+                        content: "丁: 两小时前说的话".to_string(),
+                        timestamp: now - ChronoDuration::hours(2),
+                        memory_type: MemoryType::Event,
+                        importance: 5,
+                        tags: Vec::new(),
+                        context: "group_chat".to_string(),
+                        subject_id: Some(300),
+                    })
+                    .await
+                    .expect("应写入旧群消息");
+
+                let active = manager
+                    .groups_with_recent_activity(&[100, 200, 300], window, 2)
+                    .await;
+                assert_eq!(active, std::collections::HashSet::from([100]));
+                assert!(
+                    manager
+                        .groups_with_recent_activity(&[100], window, 0)
+                        .await
+                        .is_empty(),
+                    "阈值为 0 时不应判定为有人在聊天"
+                );
                 std::fs::remove_file(path).expect("应清理测试记忆文件");
             });
     }

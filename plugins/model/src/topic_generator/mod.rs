@@ -547,6 +547,16 @@ impl TopicGenerator {
             return false;
         }
 
+        // 群聊：主动模块已经确认"群里现在有人在聊天"，此时不再套用"最近有
+        // 活动就降低概率 / 越安静越主动"的旧启发式——那两条会把"有人聊天时
+        // 才插话"直接抵消掉。这里只让情绪决定要不要接这句话。
+        if let Some(group_id) = group_id
+            && crate::proactive_chat::group_has_live_conversation(&self.memory_manager, group_id)
+                .await
+        {
+            return mood_allows_proactive_chat(&bot_personality);
+        }
+
         // 检查最近是否有互动
         let now = Local::now();
         let one_hour_ago = now - chrono::Duration::hours(1);
@@ -598,12 +608,17 @@ impl TopicGenerator {
         }
 
         // 根据情绪决定是否主动发起对话
-        match bot_personality.current_mood.as_str() {
-            "happy" | "curious" | "playful" => true,
-            "neutral" => bot_personality.curiosity_level > 6,
-            "lonely" => bot_personality.social_confidence > 5, // 孤独时更容易主动聊天
-            _ => false,
-        }
+        mood_allows_proactive_chat(&bot_personality)
+    }
+}
+
+/// 情绪是否允许芸汐主动开口。群聊与私聊共用同一套情绪门槛。
+fn mood_allows_proactive_chat(personality: &crate::memory::BotPersonality) -> bool {
+    match personality.current_mood.as_str() {
+        "happy" | "curious" | "playful" => true,
+        "neutral" => personality.curiosity_level > 6,
+        "lonely" => personality.social_confidence > 5, // 孤独时更容易主动聊天
+        _ => false,
     }
 }
 

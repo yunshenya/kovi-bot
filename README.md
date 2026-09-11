@@ -180,6 +180,10 @@ cooldown_secs = 7200
 push_probability_percent = 35
 # main_admin 可选，只应写在未跟踪的运行时配置中
 main_admin_decision_interval_secs = 10800
+# 群聊的"在场"要求：窗口内有人说话、且真人消息不少于这个条数时才开口
+# （随机主动消息与自主续聊共用；不含她自己发的）
+group_activity_window_secs = 300
+group_activity_min_messages = 2
 # Neuro-sama 风格自主会话（宿主状态机结合语境和已发送结果决定是否继续，模型只生成候选正文）
 autonomous_conversation_enabled = true
 autonomous_conversation_check_interval_secs = 3
@@ -314,7 +318,9 @@ recent_topic_cooldown_secs = 604800
 
 机器人会从最近活跃的群组和真正私聊过的用户中随机选择接收方，再结合情绪、能量、时间、群组话题和用户兴趣选择内容。冷却时间、空闲阈值、发送概率、目标冷却和每日上限共同避免刷屏。主动消息的决策时间、最后发送时间和每日计数单独写入 PostgreSQL 的 `kovi_bot_proactive_state`，不受普通记忆容量清理影响；服务重启后也不会重新触发一轮主动消息。长期记忆、用户档案、群组档案、滚动摘要和人格分别写入 PostgreSQL 分表，不再为每次变化重写整份 JSONB；默认最多保留 1000 条长期记忆明细，后台任务会定期去重并清理 30 天前的低重要性记录。Mind Episode 情节记忆使用独立策略：默认保留 365 天、每个作用域最多 128 条已知状态记录，保护项按优先级保留；当已知状态仍超过上限时，会从价值最低的记录开始淘汰（必要时也包括保护项）。未知状态不参与淘汰并始终保留。超过保留期未活跃的用户/群档案及其摘要也会清理；高重要性记忆不按年龄清理，但仍受各自容量策略约束，人格和表情标签则需显式删除。完整的数据范围、外部传输和删除边界见[数据与隐私说明](docs/privacy.md)。首次升级时会自动从旧 `kovi_bot_memory` JSONB 快照（或运行目录的 `bot_memory.json`）迁移，原数据保留作为兼容备份。
 
-配置 canonical owner 后，该用户的关系等级会自动保持为最高。她会使用独立的主动私聊策略：模型最多每隔 `main_admin_decision_interval_secs`（默认 3 小时）评估一次，但实际发送还必须满足 `main_admin_cooldown_secs`（默认 6 小时）、`main_admin_daily_limit`（默认每天 2 条）和全局 `daily_limit`（默认每天 4 条）；同一目标的主动消息默认至少间隔 `target_cooldown_secs`（默认 6 小时）。用户或群组刚刚主动互动后，`recent_interaction_cooldown_secs`（默认 2 小时）内不会追加主动开场。上述状态独立持久化，服务重启和普通记忆清理都不会绕过限频。未配置 canonical owner 时，这段兼容策略才使用 `main_admin` QQ 号。
+配置 canonical owner 后，该用户的关系等级会自动保持为最高。她会使用独立的主动私聊策略：模型最多每隔 `main_admin_decision_interval_secs`（默认 3 小时）评估一次，但实际发送还必须满足 `main_admin_cooldown_secs`（默认 6 小时）、`main_admin_daily_limit`（默认每天 2 条）和全局 `daily_limit`（默认每天 4 条）；同一目标的主动消息默认至少间隔 `target_cooldown_secs`（默认 6 小时）。对方刚刚主动私聊过后，`recent_interaction_cooldown_secs`（默认 2 小时）内不会追加主动开场。上述状态独立持久化，服务重启和普通记忆清理都不会绕过限频。未配置 canonical owner 时，这段兼容策略才使用 `main_admin` QQ 号。
+
+群聊的"在场"要求：只有 `group_activity_window_secs`（默认 300 秒）内确实有人说过话、且真人消息不少于 `group_activity_min_messages`（默认 2 条）时，她才会在群里开口——随机主动消息和群聊自主续聊共用同一条判定，冷清的群不会被冷不丁打扰；她自己发的主动消息不计入条数。群聊里旧的两条规则（"整体最近很热闹就先不说话"、"群越安静越要主动"）不再生效，私聊的主动时机保持不变。
 
 每段群聊和私聊还会维护一份可持久化的滚动摘要。短期记录超过 `max_conversation_messages`（默认 25 条）或估算超过 `max_conversation_tokens`（默认 6000 token）时，模型会将较早消息连同旧摘要压缩为不超过 `summary_max_chars`（默认 1500 字）的新摘要，并尽量保留最近 `summary_keep_recent_messages`（默认 15 条）原文继续聊天。模型暂时不可用时，会使用截断后的本地片段作为降级摘要，避免直接遗失上下文。
 

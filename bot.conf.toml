@@ -27,7 +27,13 @@ main_admin_cooldown_secs = 21600
 daily_limit = 4
 main_admin_daily_limit = 2
 target_cooldown_secs = 21600
+# 私聊：对方最近主动互动过就先不追加主动消息。
 recent_interaction_cooldown_secs = 7200
+# 群聊的"在场"要求：窗口内（秒）确实有人说过话、且真人消息不少于
+# group_activity_min_messages 条时才在群里开口（随机主动消息与自主续聊
+# 共用；不含她自己发的）。
+group_activity_window_secs = 300
+group_activity_min_messages = 2
 
 [group_interjection]
 enabled = true
