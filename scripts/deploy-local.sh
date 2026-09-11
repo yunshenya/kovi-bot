@@ -308,6 +308,13 @@ install -m 0755 "$binary" "$staging_dir/kovi-bot"
 printf '%s\n' "$revision" >"$staging_dir/REVISION"
 # 模板只是给服务端做“继承来的配置缺不缺新键”的提示用，解包后即删除（仓库公开文件，不含密钥）。
 install -m 0644 bot.conf.example.toml "$staging_dir/bot.conf.example.toml"
+# macOS 的 install/cp 会把 com.apple.provenance 之类的 xattr 一起带过去，Linux 端解包时
+# 会打印 "Ignoring unknown extended header keyword"；发布包里不需要本机元数据。
+if command -v xattr >/dev/null 2>&1; then
+  for staged in "$staging_dir/kovi-bot" "$staging_dir/REVISION" "$staging_dir/bot.conf.example.toml"; do
+    xattr -c "$staged" 2>/dev/null || true
+  done
+fi
 tar -C "$staging_dir" -czf "$archive" .
 rm -rf "$staging_dir"
 
