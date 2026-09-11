@@ -540,9 +540,9 @@ AVSDK 回传的全部命令第一次变得可见：
 | NapCat / QQ 版本漂移 | 桥写于 2026-08-03，当时 NapCat 为 4.18.12–4.18.14；我们是 4.18.19 | 仅差几个小版本，不是变量 |
 | 音频设备 | AVSDK 正确枚举 `MaiBot_QQ_Speaker` / `MaiBot_QQ_Microphone` | 正常 |
 
-### 四处已固化为自愈的补丁
+### 六处已固化为自愈的补丁
 
-容器入口包装 `bridge-entry.sh` 每次启动都会幂等地重打这四个补丁，因此**重建容器、
+容器入口包装 `bridge-entry.sh` 每次启动都会幂等地重打这些补丁，因此**重建容器、
 重装桥之后都会自动恢复**，不需要人工介入：
 
 | 补丁 | 作用 |
@@ -551,6 +551,8 @@ AVSDK 回传的全部命令第一次变得可见：
 | `patch-20050-backoff.py` | 加入命令直方图（暴露在 `/v1/status` 的 `avHost.commandHistogram`） |
 | `patch-ignore-20050.py` | **根因修复**：`20050`/`120043` 不再触发重登 |
 | `patch-plugin-login-refresh.py` | **登录自愈**：AV Host 进程重启后拿不到登录参数（上游只在插件启动时投一次），插件空闲时每 60 秒补投一次，结果见 `/v1/status` 的 `avHost.loginRefreshCount` |
+| `patch-plugin-caller-allowlist.py` | **接听授权**：接听前读 `runtime/allowed-callers.json`（`enabled != true` 时保持上游"谁打进来都接"），并把来电者写进状态 |
+| `patch-plugin-hangup.py` | **主动挂断**：AV Host 的 cmd 白名单加入 8/9/10/11（`Quit`/`Reject`/`Close`/`ClearRoom`），`invokeAVHost` 返回响应体，并新增 `POST /v1/calls/hangup`；见上面的"主动挂断"一节 |
 
 已验证的插件整份备份在
 `/root/napcat/plugins/napcat-plugin-maibot-qq-voice-call/index.mjs.kovi-verified`。

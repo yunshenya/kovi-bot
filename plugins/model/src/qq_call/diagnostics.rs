@@ -45,6 +45,7 @@ pub(super) fn phase_description(phase: CallPhase) -> &'static str {
         CallPhase::Accepting => "正在接听",
         CallPhase::Accepted => "已接听、等待进房",
         CallPhase::Connected => "已进房（音频可收发）",
+        CallPhase::Ending => "正在挂断（桥已受理挂断请求）",
         CallPhase::Ended => "已挂断",
         CallPhase::Error => "桥内部错误",
         CallPhase::Unknown => "未知阶段",

@@ -158,6 +158,9 @@ async fn report_phase_change(
             diagnostics::mark_connected();
             println!("[INFO] QQ 语音通话已进房: {label}（桥已接好音频设备）");
         }
+        CallPhase::Ending => {
+            println!("[INFO] QQ 语音通话正在挂断: {label}（桥已受理挂断请求，等待房间销毁）")
+        }
         CallPhase::Ended => {
             println!("[INFO] QQ 语音通话桥报告已挂断: {label}");
             diagnostics::note_call_ended("桥报告已挂断");

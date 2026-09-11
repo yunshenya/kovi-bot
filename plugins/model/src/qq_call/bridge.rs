@@ -23,6 +23,8 @@ pub enum CallPhase {
     Accepted,
     /// 已进房，音频可收发。
     Connected,
+    /// 正在结束（桥已经受理了挂断请求，房间还没销毁）。
+    Ending,
     /// 已挂断。
     Ended,
     /// 桥内部错误。
@@ -39,6 +41,7 @@ impl CallPhase {
             "accepting" => Self::Accepting,
             "accepted" => Self::Accepted,
             "connected" => Self::Connected,
+            "ending" => Self::Ending,
             "ended" => Self::Ended,
             "error" => Self::Error,
             _ => Self::Unknown,
@@ -52,13 +55,15 @@ impl CallPhase {
             Self::Accepting => "accepting",
             Self::Accepted => "accepted",
             Self::Connected => "connected",
+            Self::Ending => "ending",
             Self::Ended => "ended",
             Self::Error => "error",
             Self::Unknown => "unknown",
         }
     }
 
-    /// 通话是否仍在进行（可能尚未进房）。
+    /// 通话是否仍在进行（可能尚未进房）。`Ending` 表示桥已经受理挂断、
+    /// 房间正在销毁，不再可用。
     pub fn is_live(self) -> bool {
         matches!(
             self,
