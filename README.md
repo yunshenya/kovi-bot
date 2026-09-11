@@ -145,12 +145,17 @@ scripts/install-qq-call.sh --apply  # 预检通过后安装依赖与桥
 [`CI`](.github/workflows/ci.yml) 会在 PR 与 `main` 推送时执行格式、Clippy、PostgreSQL
 集成测试、release 构建、RustSec 审计、许可证/来源策略和密钥扫描。只有仓库自身 `main`
 分支的 push 通过 CI 后，受保护的 [`Deploy production`](.github/workflows/deploy.yml) 才会
-使用 SSH Key 发布；PR 代码不能读取生产 Secrets。
+使用受保护的部署账号密码发布；PR 代码不能读取生产 Secrets。
 
 生产发布使用专用应用账号、最小权限数据库角色、固定 SSH 主机公钥、版本化 release 和
 readiness 文件。二进制、配置与环境变量会作为一个整体原子切换，失败时整体回滚。服务器
 初始化及 GitHub Environment 变量/Secrets 清单见
 [部署手册](.github/deploy/README.md)。
+
+排障用 [`Diagnose production`](.github/workflows/diagnose-production.yml)：手动触发，只读地
+收集服务状态、通话日志标记、桥的 `/v1/calls/current` 与 `/v1/status`、容器与插件、
+`doctor.sh`、语音服务 `/healthz`。仓库是公开的，因此它的输出已脱敏（QQ 号/群号掩码，
+昵称与群名不打印）；需要日志原文请登录服务器 `journalctl -u kovi-bot`。
 
 模型与随机推送的配置示例：
 

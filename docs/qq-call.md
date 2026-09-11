@@ -248,6 +248,14 @@ QQ 语音通话：已启用（桥 http://127.0.0.1:6110，轮询 250 毫秒）
 语音服务：http://127.0.0.1:6120/v1/tts 正常
 ```
 
+需要服务器视角时，手动触发 GitHub Actions 里的
+[`Diagnose production`](../.github/workflows/diagnose-production.yml)（Actions →
+选择该工作流 → Run workflow）。它**只读**：服务状态、最近 500 行日志里各类通话标记的
+次数与最后时间、桥的 `/v1/calls/current` 与 `/v1/status`（含 `avHost.commandHistogram`）、
+容器与插件目录、`doctor.sh`、语音服务 `/healthz`、隔离 PulseAudio。因为仓库是公开的、
+Actions 日志谁都能看，它的输出已经脱敏：QQ 号/群号掩码成 `<num>`，昵称与群名不打印，
+桥的 JSON 只保留白名单字段。要看原文请登录服务器 `journalctl -u kovi-bot -f`。
+
 三种典型结论：
 
 | 报告里看到 | 说明 | 下一步 |

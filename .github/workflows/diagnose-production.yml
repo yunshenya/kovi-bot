@@ -1,0 +1,187 @@
+name: Diagnose production
+
+# 只读的生产诊断：手动触发后从服务器收集 QQ 通话链路的状态，不重启、不修改任何东西。
+#
+# 仓库是公开的，Actions 日志任何人都能看，因此这里只打印"结论"而不是原文：
+# QQ 号/群号一律掩码，昵称与群名不打印（只统计日志里出现了哪些标记），
+# 桥的 JSON 只保留白名单字段。需要原文时请登录服务器看 journalctl。
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kovi-bot-diagnose
+  cancel-in-progress: false
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+      DEPLOY_USER: ${{ secrets.DEPLOY_USER || vars.DEPLOY_USER || 'ubuntu' }}
+      DEPLOY_SSH_PORT: ${{ secrets.DEPLOY_SSH_PORT || vars.DEPLOY_SSH_PORT || '22' }}
+    steps:
+      - name: Validate settings
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$DEPLOY_HOST" || { echo "Missing repository secret DEPLOY_HOST"; exit 1; }
+          [[ "$DEPLOY_HOST" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "Invalid DEPLOY_HOST"; exit 1; }
+          [[ "$DEPLOY_USER" == "ubuntu" ]] || { echo "DEPLOY_USER must be ubuntu"; exit 1; }
+          [[ "$DEPLOY_SSH_PORT" =~ ^[0-9]+$ ]] || { echo "Invalid DEPLOY_SSH_PORT"; exit 1; }
+          test -n "${{ secrets.DEPLOY_PASSWORD }}" || { echo "Missing repository secret DEPLOY_PASSWORD"; exit 1; }
+
+      - name: Install sshpass
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends sshpass
+
+      - name: Collect read-only diagnostics
+        env:
+          SSHPASS: ${{ secrets.DEPLOY_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            printf '%s\n' "$SSHPASS"
+            cat <<'REMOTE'
+          set -uo pipefail
+
+          # 统一掩码：5 位以上的连续数字（QQ 号、群号、uin）不写进公开日志。
+          mask() { sed -E 's/[0-9]{5,}/<num>/g'; }
+
+          echo "=== kovi-bot 服务 ==="
+          systemctl is-active kovi-bot.service || true
+          printf 'revision: '
+          cat /home/ubuntu/kovi-bot/current/REVISION 2>/dev/null || echo "(未知)"
+          systemctl --no-pager --full -n 0 status kovi-bot.service 2>/dev/null | sed -n '1,10p' || true
+
+          echo
+          echo "=== 通话日志标记（最近 500 行，只统计次数与最后时间） ==="
+          log_file=$(mktemp)
+          journalctl -u kovi-bot.service -n 500 --no-pager -o short-iso 2>/dev/null > "$log_file" || true
+          for marker in \
+            "QQ 语音通话已启用" \
+            "QQ 语音通话已关闭" \
+            "来电振铃" \
+            "桥正在接听" \
+            "已进房" \
+            "已接通" \
+            "桥报告已挂断" \
+            "从未进房" \
+            "无法读取桥状态"; do
+            count=$(grep -cF -- "$marker" "$log_file" 2>/dev/null || true)
+            last=$(grep -F -- "$marker" "$log_file" 2>/dev/null | tail -n 1 | cut -d' ' -f1 || true)
+            printf '%-22s %3s 次   最后: %s\n' "$marker" "${count:-0}" "${last:-—}"
+          done
+          echo "桥错误原文（去重、掩码、最多 3 条）:"
+          grep -F -- "无法读取桥状态" "$log_file" 2>/dev/null \
+            | sed -E 's/^.*无法读取桥状态: *//' | sort -u | head -n 3 | mask || true
+          rm -f "$log_file"
+
+          echo
+          echo "=== 桥控制接口（脱敏） ==="
+          token_file=/home/ubuntu/napcat-qq-call/bridge/runtime/control.token
+          token=""
+          if [ -r "$token_file" ]; then
+            token=$(cat "$token_file")
+          else
+            echo "读不到 token 文件: $token_file"
+          fi
+          if [ -n "$token" ]; then
+            curl -s -m 5 -H "Authorization: Bearer $token" http://127.0.0.1:6110/v1/calls/current \
+              | python3 -c '
+          import json, sys
+          try:
+              payload = json.load(sys.stdin)
+          except Exception as error:
+              print("响应不是 JSON:", error)
+              raise SystemExit
+          data = payload.get("data", payload) or {}
+          for key in ("phase", "inviteAt", "endReason"):
+              if key in data:
+                  print(f"{key} = {data[key]}")
+          print("callerUin  =", "已提供" if data.get("callerUin") else "未提供")
+          print("callerName =", "已提供" if data.get("callerName") else "未提供")
+          ' 2>&1 || echo "(calls/current 解析失败)"
+            echo
+            curl -s -m 5 -H "Authorization: Bearer $token" http://127.0.0.1:6110/v1/status \
+              | python3 -c '
+          import json, sys
+
+          SENSITIVE = ("uin", "qq", "name", "nick", "token", "secret", "cookie",
+                       "password", "account", "avatar", "phone", "path", "dir")
+
+          def scrub(value, depth=0):
+              if depth > 6:
+                  return "<deep>"
+              if isinstance(value, dict):
+                  result = {}
+                  for key, item in value.items():
+                      lowered = str(key).lower()
+                      if any(word in lowered for word in SENSITIVE):
+                          result[key] = "<redacted>"
+                      else:
+                          result[key] = scrub(item, depth + 1)
+                  return result
+              if isinstance(value, list):
+                  return [scrub(item, depth + 1) for item in value[:20]]
+              if isinstance(value, str):
+                  # 含非 ASCII（昵称/群名）或过长的字符串一律不打印
+                  if len(value) > 120 or any(ord(ch) > 127 for ch in value):
+                      return "<redacted>"
+                  return value
+              return value
+
+          try:
+              payload = json.load(sys.stdin)
+          except Exception as error:
+              print("/v1/status 响应不是 JSON:", error)
+              raise SystemExit
+          body = payload.get("data", payload) or {}
+          print(json.dumps(scrub(body), ensure_ascii=True, indent=2)[:4000])
+          ' 2>&1 || echo "(/v1/status 不可用)"
+          fi
+
+          echo
+          echo "=== NapCat 容器 ==="
+          docker ps --format '{{.Names}} | {{.Status}} | {{.Image}}' 2>/dev/null || echo "(docker 不可用)"
+          echo "容器内插件目录:"
+          docker exec napcat sh -lc 'ls /root/napcat/plugins 2>/dev/null' 2>/dev/null | tail -n 10 \
+            || echo "(读不到容器内插件目录)"
+          echo "容器日志里的插件/加载器关键行（掩码、最多 15 条）:"
+          docker logs --tail 300 napcat 2>&1 \
+            | grep -iE "plugin|whitelist|avsdk|pepper|loader|hook" | tail -n 15 | mask || true
+
+          echo
+          echo "=== 桥自检 ==="
+          for candidate in \
+            /home/ubuntu/napcat-qq-call/bridge/scripts/doctor.sh \
+            /app/qq-call/bridge/scripts/doctor.sh; do
+            if [ -x "$candidate" ]; then
+              echo "(宿主路径: $candidate)"
+              "$candidate" 2>&1 | tail -n 30 | mask
+              break
+            fi
+          done
+          docker exec napcat sh -lc \
+            'test -x /app/qq-call/bridge/scripts/doctor.sh && /app/qq-call/bridge/scripts/doctor.sh' \
+            2>&1 | tail -n 30 | mask || true
+
+          echo
+          echo "=== 本机语音服务 ==="
+          curl -s -m 5 http://127.0.0.1:6120/healthz | head -c 500 || echo "(语音服务不可达)"
+
+          echo
+          echo "=== 隔离 PulseAudio ==="
+          PULSE_SERVER=unix:/home/ubuntu/napcat-qq-call/bridge/runtime/pulse/native \
+          PULSE_COOKIE=/home/ubuntu/napcat-qq-call/bridge/runtime/pulse-cookie \
+            pactl info 2>&1 | sed -n '1,10p' || echo "(宿主上没有 pactl，可忽略；音频由 doctor.sh 检查)"
+          REMOTE
+          } | sshpass -e ssh -p "$DEPLOY_SSH_PORT" -o StrictHostKeyChecking=accept-new \
+              "$DEPLOY_USER@$DEPLOY_HOST" "sudo -S -p '' bash -s"

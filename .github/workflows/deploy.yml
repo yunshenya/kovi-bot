@@ -490,6 +490,10 @@ jobs:
           done
           REMOTE
 
+      # 这个仓库是公开的，Actions 日志任何人都能看。systemd 的默认输出会带上最近
+      # 若干条 journal（里面可能有来电昵称、群名等用户数据），因此这里只打印单元
+      # 状态本身，另外给出 WARN/ERROR 的条数作为"有没有出事"的信号；需要原文请登
+      # 录服务器看 journalctl，或用 Diagnose production 工作流。
       - name: Show service status
         if: always()
         env:
@@ -498,4 +502,7 @@ jobs:
         run: |
           sshpass -e ssh -p "$DEPLOY_SSH_PORT" -o StrictHostKeyChecking=accept-new \
             "$DEPLOY_USER@$DEPLOY_HOST" \
-            "systemctl --no-pager --full status kovi-bot.service" || true
+            "systemctl --no-pager --full -n 0 status kovi-bot.service; \
+             printf '\n[diag] 最近 200 行日志中的 WARN/ERROR 条数: '; \
+             journalctl -u kovi-bot.service -n 200 --no-pager -o cat 2>/dev/null \
+               | grep -cE '^\[(WARN|ERROR)\]' || true" || true
