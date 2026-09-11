@@ -108,6 +108,25 @@ jobs:
           echo "最近 5 条 ERROR/WARN 的标签（只保留标记本身，掩码、去内容）:"
           grep -E '^[^ ]+ \[(ERROR|WARN)\]' "$log_file" 2>/dev/null | tail -n 5 \
             | sed -E 's/^[^ ]+ //' | sed -E 's/:.*$//' | mask || true
+
+          echo
+          echo "=== 日志标签直方图（最近 500 行，只保留代码里的静态标记） ==="
+          printf '窗口时间跨度: %s → %s\n' \
+            "$(head -n 1 "$log_file" | cut -d' ' -f1)" \
+            "$(tail -n 1 "$log_file" | cut -d' ' -f1)"
+          sed -E 's/^[^ ]+ [^ ]+ [^:]*: //' "$log_file" 2>/dev/null \
+            | awk '{print $1}' | sort | uniq -c | sort -rn | head -n 18 || true
+
+          echo
+          echo "=== 消息是否真的到达机器人（世界模型 observation 计数） ==="
+          for marker in \
+            "observation kind=MessageReceived" \
+            "observation kind=ConversationEvent" \
+            "observation kind=SystemState"; do
+            count=$(grep -cF -- "$marker" "$log_file" 2>/dev/null || true)
+            last=$(grep -F -- "$marker" "$log_file" 2>/dev/null | tail -n 1 | cut -d' ' -f1 || true)
+            printf '%-38s %3s 次   最后: %s\n' "$marker" "${count:-0}" "${last:-—}"
+          done
           rm -f "$log_file"
 
           echo
@@ -191,6 +210,10 @@ jobs:
           echo "容器日志里的插件/加载器关键行（掩码、最多 15 条）:"
           docker logs --tail 300 napcat 2>&1 \
             | grep -iE "plugin|whitelist|avsdk|pepper|loader|hook" | tail -n 15 | mask || true
+          echo "容器日志里的登录/连接关键行（掩码、最多 15 条）:"
+          docker logs --tail 600 napcat 2>&1 \
+            | grep -iE "login|logon|online|offline|kick|websocket|ws |connect|reconnect|断开|重连|下线|上线" \
+            | tail -n 15 | mask || true
 
           echo
           echo "=== 桥自检（必须在容器内跑；宿主路径上必然缺 QQ 文件，不作为结论） ==="
