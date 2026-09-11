@@ -149,7 +149,58 @@ pub async fn initialize(bot: &RuntimeBot) -> Result<()> {
         callers,
         main_admin,
     });
+    drop(state);
+    publish_caller_allowlist().await;
     Ok(())
+}
+
+/// 把"有效通话授权"（授权名单 ∪ 副管理员 ∪ 主管理员）写成桥可读的 JSON 文件。
+///
+/// 桥在每个来电接听前读它，**名单外不接听**：QQ 的 1v1 通话没有对插件开放
+/// "离开房间"，接通后只能静音，通话会一直留在 `connected`（2026-09-11 晚上就
+/// 这样卡了一整夜），所以未授权来电必须在接通前拦掉。写失败只告警，不影响
+/// 授权命令本身；文件用临时文件 + rename 原子替换，避免桥读到半个 JSON。
+pub(crate) async fn publish_caller_allowlist() {
+    let path = crate::config::get()
+        .qq_call()
+        .caller_allowlist_file()
+        .to_owned();
+    if path.is_empty() {
+        return;
+    }
+    let callers = {
+        let state = STATE.lock().await;
+        let Some(state) = state.as_ref() else {
+            return;
+        };
+        let mut all = state.callers.clone();
+        all.extend(state.admins.iter().copied());
+        all.insert(state.main_admin);
+        all.into_iter().collect::<Vec<_>>()
+    };
+    let payload = serde_json::json!({
+        "callers": callers,
+        "updatedAt": chrono::Local::now().to_rfc3339(),
+    });
+    let body = match serde_json::to_vec(&payload) {
+        Ok(body) => body,
+        Err(error) => {
+            eprintln!("[WARN] 通话授权名单序列化失败: {error}");
+            return;
+        }
+    };
+    let target = std::path::PathBuf::from(&path);
+    let temporary = target.with_extension("json.tmp");
+    let result =
+        std::fs::write(&temporary, &body).and_then(|()| std::fs::rename(&temporary, &target));
+    match result {
+        Ok(()) => println!(
+            "[INFO] 通话授权名单已同步给桥 ({} 人, 文件: {})",
+            callers.len(),
+            path
+        ),
+        Err(error) => eprintln!("[WARN] 通话授权名单写入桥失败 ({path}): {error}"),
+    }
 }
 
 /// Whether a message is one of the allowlist management commands.
@@ -501,6 +552,8 @@ async fn update_admin(bot: &RuntimeBot, user_id: i64, add: bool) -> Result<Strin
         return Err(error).context("提交授权管理员事务");
     }
     state.admins = new_admins;
+    drop(state_guard);
+    publish_caller_allowlist().await;
     Ok(if add {
         format!("已授权 {} 为副管理员。", user_id)
     } else {
@@ -580,11 +633,14 @@ async fn update_caller(user_id: i64, add: bool) -> Result<String> {
         return Err(error).context("提交通话授权事务");
     }
     state.callers = new_callers;
+    let caller_count = state.callers.len();
+    drop(state_guard);
+    publish_caller_allowlist().await;
     println!(
         "[INFO] 通话授权名单已更新 (操作: {}, QQ: {}, 数量: {})",
         if add { "添加" } else { "移除" },
         user_id,
-        state.callers.len()
+        caller_count
     );
     Ok(if add {
         format!("已授权 {} 给芸汐打电话。", user_id)

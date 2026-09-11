@@ -76,9 +76,22 @@ pub struct QqCallConfig {
     allowed_callers: Vec<i64>,
     /// 来电者不在白名单时播报的一句婉拒；留空表示直接静音不回应。
     ///
-    /// 注意：桥会在来电后自动接听，插件无法阻止接通，只能在接通后决定
-    /// 是否说话，因此这里提供一句自然的婉拒而不是静默挂断。
+    /// 接听授权由 `caller_allowlist_file` 决定：名单外**根本不会被接通**。
+    /// 这句婉拒只在名单文件缺失、桥按旧行为接通时才会用到。
     refuse_message: String,
+    /// 机器人写给桥的"有效通话授权"名单文件（宿主路径）。
+    ///
+    /// 内容是 `{"callers": [...], "updatedAt": "..."}`，由机器人把授权名单、
+    /// 副管理员与主管理员取并集后写入；桥在接听前读它，名单外不接听。留空关闭
+    /// 这个能力（回到"接通后婉拒"）。
+    caller_allowlist_file: String,
+    /// 通话中对方说了这些词就当作"要求挂断"：说一句道别后结束本次通话会话。
+    ///
+    /// QQ 的 1v1 通话没有对插件开放"离开房间"，机器人无法真正挂断，只能停止
+    /// 参与，等对方挂断。
+    hangup_keywords: Vec<String>,
+    /// 对方要求挂断（或到达通话时长上限）时说的最后一句道别。
+    farewell: String,
     /// 挂断后是否把通话记录写回来电者的私聊记忆。
     archive_to_memory: bool,
 }
@@ -206,6 +219,31 @@ impl QqCallConfig {
 
     pub fn refuse_message(&self) -> &str {
         &self.refuse_message
+    }
+
+    pub fn caller_allowlist_file(&self) -> &str {
+        self.caller_allowlist_file.trim()
+    }
+
+    pub fn hangup_keywords(&self) -> &[String] {
+        &self.hangup_keywords
+    }
+
+    pub fn farewell(&self) -> &str {
+        self.farewell.trim()
+    }
+
+    /// 通话中对方这句话是不是"要求挂断"。
+    pub fn is_hangup_request(&self, utterance: &str) -> bool {
+        let text = utterance.trim();
+        if text.is_empty() {
+            return false;
+        }
+        self.hangup_keywords
+            .iter()
+            .map(|keyword| keyword.trim())
+            .filter(|keyword| !keyword.is_empty())
+            .any(|keyword| text.contains(keyword))
     }
 
     pub fn archive_to_memory(&self) -> bool {
@@ -337,6 +375,21 @@ impl QqCallConfig {
                 "qq_call.allowed_callers 必须是正整数 QQ 号"
             ));
         }
+        if self.caller_allowlist_file.trim().is_empty() {
+            return Err(anyhow::anyhow!(
+                "qq_call.caller_allowlist_file 不能为空（留空即关闭接听授权）"
+            ));
+        }
+        if self
+            .hangup_keywords
+            .iter()
+            .any(|keyword| keyword.trim().is_empty())
+        {
+            return Err(anyhow::anyhow!("qq_call.hangup_keywords 不能有空字符串"));
+        }
+        if self.farewell.chars().count() > 200 {
+            return Err(anyhow::anyhow!("qq_call.farewell 不能超过 200 字"));
+        }
         Ok(())
     }
 }
@@ -380,6 +433,17 @@ impl Default for QqCallConfig {
             system_prompt: String::new(),
             allowed_callers: Vec::new(),
             refuse_message: "不好意思，我现在不方便接电话，晚点我打给你呀。".to_string(),
+            caller_allowlist_file:
+                "/home/ubuntu/napcat-qq-call/bridge/runtime/allowed-callers.json".to_string(),
+            hangup_keywords: vec![
+                "挂断".to_string(),
+                "挂了吧".to_string(),
+                "先挂".to_string(),
+                "挂电话".to_string(),
+                "挂了".to_string(),
+                "不聊了".to_string(),
+            ],
+            farewell: "好，那我先挂啦，拜拜～".to_string(),
             archive_to_memory: true,
         }
     }
@@ -413,6 +477,51 @@ mod tests {
         assert!(!config.enabled());
         assert!(config.validate().is_ok());
         assert_eq!(config.frame_bytes(), 960);
+        assert!(
+            config
+                .caller_allowlist_file()
+                .ends_with("allowed-callers.json")
+        );
+        assert!(config.is_hangup_request("那我先挂了吧"));
+        assert!(!config.is_hangup_request("今天天气不错"));
+    }
+
+    #[test]
+    fn hangup_requests_are_matched_inside_normal_speech() {
+        let config = QqCallConfig::default();
+        assert!(config.is_hangup_request("好，挂了吧，拜拜"));
+        assert!(config.is_hangup_request("你先挂电话吧"));
+        assert!(config.is_hangup_request("不聊了，我去吃饭"));
+        assert!(!config.is_hangup_request(""));
+        assert!(!config.is_hangup_request("   "));
+        assert!(!config.is_hangup_request("我挂念你"));
+    }
+
+    #[test]
+    fn allowlist_file_and_farewell_are_validated() {
+        // 关闭状态下 validate 会直接放行，所以这里用"已启用"的最小配置。
+        let enabled = || QqCallConfig {
+            enabled: true,
+            bridge_token_file: "/tmp/kovi-test-token".to_string(),
+            pulse_server: "unix:/tmp/kovi-test-pulse".to_string(),
+            ..QqCallConfig::default()
+        };
+        assert!(enabled().validate().is_ok());
+        let no_file = QqCallConfig {
+            caller_allowlist_file: "   ".to_string(),
+            ..enabled()
+        };
+        assert!(no_file.validate().is_err());
+        let empty_keyword = QqCallConfig {
+            hangup_keywords: vec!["挂断".to_string(), "  ".to_string()],
+            ..enabled()
+        };
+        assert!(empty_keyword.validate().is_err());
+        let long_farewell = QqCallConfig {
+            farewell: "啊".repeat(201),
+            ..enabled()
+        };
+        assert!(long_farewell.validate().is_err());
     }
 
     #[test]

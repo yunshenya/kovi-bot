@@ -18,6 +18,7 @@ use crate::model::utils::{is_model_error_response, params_model_with_plain_style
 use crate::model::{BotMemory, Roles};
 use crate::speech::SpeechClient;
 use kovi::tokio::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -97,7 +98,7 @@ pub(super) async fn run(
         (None, _) => eprintln!("[WARN] QQ 来电未能解析出来电者 QQ 号，按不在白名单处理"),
     }
     if !allowed {
-        println!("[INFO] 来电者不在 qq_call.allowed_callers 白名单，只播报婉拒后保持静音");
+        println!("[INFO] 来电者不在通话授权名单，播报婉拒后结束本次通话会话");
     }
 
     let speech = Arc::new(SpeechClient::new(config)?);
@@ -106,6 +107,9 @@ pub(super) async fn run(
     // 打断通道的发送端必须活到回复链结束，否则 `recv()` 会立刻返回 `None`。
     let (interrupt_tx, interrupt_rx) = mpsc::channel::<()>(JOB_QUEUE);
 
+    // 对方要求挂断 / 通话到点收尾 / 名单外婉拒后，用它让采集链优雅收尾。
+    // QQ 的 1v1 通话没有对插件开放"离开房间"，机器人无法真正挂断，只能停止参与。
+    let hangup_requested = Arc::new(AtomicBool::new(false));
     let responder = kovi::tokio::spawn(respond(
         config.clone(),
         caller,
@@ -113,6 +117,7 @@ pub(super) async fn run(
         Arc::clone(&transcript),
         job_rx,
         interrupt_rx,
+        Arc::clone(&hangup_requested),
     ));
 
     let opening = if allowed {
@@ -124,6 +129,10 @@ pub(super) async fn run(
         && let Err(error) = job_tx.send(Job::Speak(opening)).await
     {
         eprintln!("[ERROR] QQ 通话开场播报入队失败: {error}");
+    }
+    if !allowed {
+        // 婉拒已经排在回复链里，采集链立即收尾；回复链会把这句话播完再退出。
+        hangup_requested.store(true, Ordering::Relaxed);
     }
 
     let started = Instant::now();
@@ -163,6 +172,10 @@ pub(super) async fn run(
         };
 
         frame_index += 1;
+        if hangup_requested.load(Ordering::Relaxed) {
+            end_reason = "对方要求挂断（QQ 侧通话需对方挂断）";
+            break;
+        }
         if frame_index.is_multiple_of(frames_per_poll) {
             match client.current_call().await {
                 Ok(current) => {
@@ -190,6 +203,11 @@ pub(super) async fn run(
         }
         if frame_index >= max_frames {
             end_reason = "达到通话时长上限";
+            let farewell = config.farewell().trim().to_owned();
+            if !farewell.is_empty() {
+                // 到点先说一句道别，再结束会话；QQ 侧那通电话只能等对方挂断。
+                let _ = job_tx.try_send(Job::Speak(farewell));
+            }
             break;
         }
 
@@ -252,6 +270,7 @@ async fn respond(
     transcript: Arc<Mutex<Vec<Turn>>>,
     mut jobs: mpsc::Receiver<Job>,
     mut interrupts: mpsc::Receiver<()>,
+    hangup_requested: Arc<AtomicBool>,
 ) {
     let context = match caller {
         Some(caller) => load_caller_context(caller).await,
@@ -280,6 +299,10 @@ async fn respond(
                 }
             }
             Job::Utterance(pcm) => {
+                if hangup_requested.load(Ordering::Relaxed) {
+                    // 已经道别过了，剩下的尾音不再处理。
+                    continue;
+                }
                 let peer_text = match speech.transcribe(&pcm, config.capture_sample_rate()).await {
                     Ok(text) if !text.trim().is_empty() => text.trim().to_owned(),
                     Ok(_) => continue,
@@ -289,6 +312,36 @@ async fn respond(
                     }
                 };
                 println!("[INFO] QQ 通话识别: {peer_text}");
+
+                if config.is_hangup_request(&peer_text) {
+                    // 对方说"挂了吧/先挂"：她回一句道别，然后结束本次通话会话。
+                    // QQ 的 1v1 通话无法由客户端挂断，实际断线要等对方操作。
+                    println!("[INFO] QQ 通话对方要求挂断，播报道别后收尾");
+                    push_turn(
+                        &transcript,
+                        Turn {
+                            from_peer: true,
+                            text: peer_text,
+                        },
+                    );
+                    let farewell = config.farewell().trim().to_owned();
+                    if !farewell.is_empty() {
+                        match speak(&speech, &config, &farewell, &mut interrupts).await {
+                            Ok(SpeakOutcome::Completed) => push_turn(
+                                &transcript,
+                                Turn {
+                                    from_peer: false,
+                                    text: farewell,
+                                },
+                            ),
+                            Ok(SpeakOutcome::Interrupted) => {}
+                            Err(error) => eprintln!("[ERROR] QQ 通话道别播报失败: {error}"),
+                        }
+                    }
+                    hangup_requested.store(true, Ordering::Relaxed);
+                    continue;
+                }
+
                 push_turn(
                     &transcript,
                     Turn {

@@ -180,6 +180,7 @@ pub(crate) async fn status_report(bot: &kovi::RuntimeBot, config: &QqCallConfig)
         with_last_call(|slot| slot.as_ref().map(render_last_call))
             .unwrap_or_else(|| "桥还没有上报过任何来电".to_string())
     ));
+    lines.push(format!("接听授权名单：{}", allowlist_summary(config)));
     lines.push(format!(
         "语音服务：{}",
         match SpeechClient::new(config) {
@@ -190,8 +191,39 @@ pub(crate) async fn status_report(bot: &kovi::RuntimeBot, config: &QqCallConfig)
             Err(error) => format!("客户端创建失败 —— {error}"),
         }
     ));
-    lines.push("提醒：接听与否由桥决定，机器人拦不住接通；名单外只会播报一句婉拒。".to_string());
+    lines.push(
+        "提醒：名单外来电由桥直接不接（名单文件不可用时才回退成接通后婉拒）；\
+         QQ 的 1v1 通话没有对插件开放“离开房间”，所以机器人无法主动挂断，\
+         需要对方挂断（或等服务器超时）。"
+            .to_string(),
+    );
     lines.join("\n")
+}
+
+/// 机器人写给桥的接听授权名单概况。
+fn allowlist_summary(config: &QqCallConfig) -> String {
+    let path = config.caller_allowlist_file();
+    if path.is_empty() {
+        return "已关闭（桥会接听任何来电）".to_string();
+    }
+    match std::fs::read_to_string(path) {
+        Ok(raw) => match serde_json::from_str::<serde_json::Value>(&raw) {
+            Ok(value) => {
+                let count = value
+                    .get("callers")
+                    .and_then(|callers| callers.as_array())
+                    .map(Vec::len)
+                    .unwrap_or(0);
+                let updated = value
+                    .get("updatedAt")
+                    .and_then(|updated| updated.as_str())
+                    .unwrap_or("未知时间");
+                format!("{count} 人（机器人同步于 {updated}）")
+            }
+            Err(error) => format!("读取失败 —— {error}"),
+        },
+        Err(error) => format!("未找到（{error}）—— 桥会按旧行为接听任何来电"),
+    }
 }
 
 async fn describe_current(
