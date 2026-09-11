@@ -231,10 +231,36 @@ MAIBOT_QQ_CALL_BOT_UIN="<机器人QQ号>" \
 - **只支持 Linux。** 桥依赖 Linux QQ 自带的 `libAVSDKPlugin.so` 与 PulseAudio。
 - **QQ 或 NapCat 升级会覆盖 Loader。** 升级后必须重新运行
   `scripts/install-qq-call.sh --apply` 与 `doctor.sh`，并用测试账号复验一次来电。
-- **不能主动打电话**，也不能挂断对方的电话；桥只暴露了读状态的能力。
+- **不能主动打电话**，也不能挂断对方的电话。**2026-09-12 凌晨把客户端侧所有可用入口都试穿了**（见下），结论是
+  QQ 的 1v1 语音通话没有对插件开放"离开房间/挂断"的动作，只能等对方挂断；未授权来电因此
+  会一直停在接通状态（我们这侧静音），直到对方自己挂掉。
 - **通话没有接入 World Model / Mind 的实时状态**，只复用私聊人设、记忆和模型。
   电话里的情绪与情境暂时不会回流到核心的其它子系统。
 - 白名单外只能"接通后婉拒"，原因见上面的安全一节。
+
+### "主动挂断"排查记录（2026-09-12）
+
+背景：2026-09-11 晚上一通未授权来电接通后卡在 `connected` 一整夜，机器人每次重启都
+重新起一次幽灵会话，直到重启容器才清掉。为了给芸汐加上"主动挂断"，把客户端侧能碰到的
+入口逐个试过：
+
+| 入口 | 试了什么 | 结果 |
+|---|---|---|
+| AVSDK 消息通道 `postMessage({cmd})` | 命令号 2/3/4/6/7/8/9/10/11/12/13/14/15/20/21/30/40 | 全部静默接受，通话不受影响 |
+| `NodeIKernelAVSDKService.startGroupVideoCmdRequestFromAVSDK(a, b)` | 数字 1..40/55/100（空载荷与会话参数）、字符串命令名 `hangup`/`endCall`/`closeRoom`/`leaveRoom`/`quit`/`reject`/`cancel` 等 24 个 × 两种载荷 | 无效果（该接口确实要求 2 个参数） |
+| `NodeIKernelAVSDKService.setActionFromAVSDK(type, payload)` | 数字 1..25/30/40/55/100 + 会话参数 | 无效果 |
+| `NodeIKernelAVSDKService.sendGroupVideoJsonBuffer(a, b)` | 数字 1..30/40/55/100/20001/20004/20006 + 会话参数 | 无效果 |
+| 枚举 AVSDK 服务全部方法 | `getOwnPropertyNames` 沿原型链 | 只有 7 个方法 + `constructor`，没有隐藏的 hangup/closeRoom |
+| 枚举会话服务 | 86 个 session 方法 | 没有独立的 1v1 通话服务，只有 `getAVSDKService` |
+| 杀掉 AV Host 进程 | 通话中断后由守护脚本拉起 | **对方通话不会结束**：房间由服务器保留，必须由客户端显式"离开房间" |
+| 上游仓库 `ClaudiaGardner/maibot-qq-voice-call` | 全仓库搜索 + commits + issues | 没有任何挂断实现或说明；我们固定的 `22f30c0` 就是上游 HEAD |
+
+**仍然值得一试的下一步**：AV Host 是一个完整的 Linux QQ 客户端（跑在 Xvfb 上），通话中它
+自己可能有通话窗口与"挂断"按钮。可以在通话中截它的 X 显示（`DISPLAY=:10x`）确认 UI 是否
+渲染，再用 `xdotool` 点击挂断——这是唯一还没排除的客户端入口。
+
+**在那之前的缓解措施**：未授权来电的建议做法是"**不接**"（让铃声自然结束），而不是"接通后
+婉拒"——婉拒会把通话留在 `connected`，正是上面那次事故的成因。
 
 ## 排错
 
@@ -466,9 +492,9 @@ AVSDK 回传的全部命令第一次变得可见：
 | NapCat / QQ 版本漂移 | 桥写于 2026-08-03，当时 NapCat 为 4.18.12–4.18.14；我们是 4.18.19 | 仅差几个小版本，不是变量 |
 | 音频设备 | AVSDK 正确枚举 `MaiBot_QQ_Speaker` / `MaiBot_QQ_Microphone` | 正常 |
 
-### 三处已固化为自愈的补丁
+### 四处已固化为自愈的补丁
 
-容器入口包装 `bridge-entry.sh` 每次启动都会幂等地重打这三个补丁，因此**重建容器、
+容器入口包装 `bridge-entry.sh` 每次启动都会幂等地重打这四个补丁，因此**重建容器、
 重装桥之后都会自动恢复**，不需要人工介入：
 
 | 补丁 | 作用 |
@@ -476,6 +502,7 @@ AVSDK 回传的全部命令第一次变得可见：
 | `patch-plugin-account-path.py` | NapCat 4.18.x 已删除 `session.getAccountPath()`，插件的回退值 `ctx.core.dataPath` 是 QQ 数据**根目录**而非账号目录（`nt_qq_<hash>`），需要自行解析 |
 | `patch-20050-backoff.py` | 加入命令直方图（暴露在 `/v1/status` 的 `avHost.commandHistogram`） |
 | `patch-ignore-20050.py` | **根因修复**：`20050`/`120043` 不再触发重登 |
+| `patch-plugin-login-refresh.py` | **登录自愈**：AV Host 进程重启后拿不到登录参数（上游只在插件启动时投一次），插件空闲时每 60 秒补投一次，结果见 `/v1/status` 的 `avHost.loginRefreshCount` |
 
 已验证的插件整份备份在
 `/root/napcat/plugins/napcat-plugin-maibot-qq-voice-call/index.mjs.kovi-verified`。
