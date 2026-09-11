@@ -281,7 +281,7 @@ MAIBOT_QQ_CALL_BOT_UIN="<机器人QQ号>" \
 |---|---|---|
 | 1 | `Login(id, uid, uin, uin, accountPath, "")` | 上游桥在用 |
 | 5 | `Accept(id, uinType, uid, uids[], …)` | 上游桥在用（自动接听） |
-| 8 | `Quit(id, uint roomId, int reason)` | 方法表里叫 Quit，但实测**不能挂断**，还会让对方 QQ 弹出"邀请加入多人通话"——**已从桥的白名单里去掉** |
+| 8 | `Quit(id, uint roomId, int reason)` | 方法表里叫 Quit，但实测**不能挂断**（桥的事件计数照涨、`endReason` 一直为空）——**已从桥的白名单里去掉** |
 | 9 | `Reject(id, uint roomId, uid, int reason)` | 拒接（未验证，同样不在白名单里） |
 | **10** | **`Close(id, uint roomId, uid, int reason)`** | **真正结束通话**（实测有效，见下） |
 | 11 | `ClearRoom(id, uint roomId, uid)` | 清房间（未验证，同样不在白名单里） |
@@ -291,7 +291,13 @@ MAIBOT_QQ_CALL_BOT_UIN="<机器人QQ号>" \
   （`{1, 5, 10, 55}`），并新增 `POST /v1/calls/hangup`
   （`{"method":"close","roomId":0,"reason":1}`）；机器人侧对应
   `qq_call.hangup_enabled`/`hangup_method`（只接受 `close`）/`hangup_reason`。
-  8/9/11 已从白名单移除：8 实测会邀请对方进多人通话，另外两个没验证过。
+  8/9/11 已从白名单移除：8 实测挂不断，另外两个没验证过。
+
+  关于"对方界面显示要请多人通话"：**与 cmd 8 无关**。2026-09-12 早上重启容器后
+  （白名单只放行 10）再测一通，对方界面仍然出现这个提示，而命令直方图显示这一通
+  只发过 `10`。来电事件本身就叫 `OnInviteActionToAVSDK`（`inviteType=1`，还带
+  `relation_id`），所以这更像是 QQ 把 1v1 通话实现成"两人群视频房间"的固有表现；
+  该提示不影响通话正常建立与结束（`endReason=4`）。
 - **2026-09-12 03:20 真机实测**（对方手机打进来、通话中逐个候选试）：单发 `quit`
   （roomId 取 0 / 1 / 来电元组里的数 / reason 0/1/2/3）全部"受理但无效"——桥的 AVSDK
   事件计数照涨、`endReason` 始终为空，说明本端没被移出房间；紧接着发 `close` 后

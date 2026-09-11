@@ -104,8 +104,8 @@ pub struct QqCallConfig {
     /// 用哪个 AVSDK 控制方法挂断。**目前只支持 `close`。**
     ///
     /// 实测（2026-09-12，真机通话中）：只发 `quit`（cmd 8）本端会离开房间但服务器
-    /// 不销毁，而且对方 QQ 会弹出"邀请加入多人通话"；`close`（cmd 10）才真的结束
-    /// 这通电话（桥立刻 `ended`、`endReason=4`、AVSDK 事件计数停止增长）。
+    /// 不销毁；`close`（cmd 10）才真的结束这通电话（桥立刻 `ended`、`endReason=4`、
+    /// AVSDK 事件计数停止增长）。
     /// 桥侧已把 cmd 8/9/11 从白名单里去掉，且只接受 `close`，所以这里填别的值会在
     /// 挂断时报错——保留字段只是为了以后发现更合适的方法时不用改代码。
     hangup_method: String,
@@ -427,7 +427,7 @@ impl QqCallConfig {
         }
         if self.hangup_method.trim() != "close" {
             return Err(anyhow::anyhow!(
-                "qq_call.hangup_method 目前只支持 close（cmd 8 Quit 会邀请对方进入多人通话且挂不断）"
+                "qq_call.hangup_method 目前只支持 close（cmd 8 Quit 挂不断，其余方法未验证）"
             ));
         }
         if self.hangup_reason < 0 || self.hangup_reason > 1_000 {
