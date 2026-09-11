@@ -227,6 +227,12 @@ pub(crate) async fn private_message_event_after_ingress(
         send_private_direct_response(&bot, user_id, initial_admission, report).await;
         return;
     }
+    if matches!(message.trim(), "#通话状态" | "#通话诊断") && sender_is_admin {
+        let config = crate::config::get().qq_call().clone();
+        let report = crate::qq_call::diagnostics::status_report(&bot, &config).await;
+        send_private_direct_response(&bot, user_id, initial_admission, report).await;
+        return;
+    }
     if is_group_admin_command(message) {
         println!(
             "[INFO] 私聊群聊专用命令已忽略 (用户: {}, 命令: {})",

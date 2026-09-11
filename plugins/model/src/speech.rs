@@ -71,6 +71,27 @@ impl SpeechClient {
         })
     }
 
+    /// 服务健康检查（`GET /healthz`），只用于 `#通话状态` 这类诊断。
+    ///
+    /// 服务在模型没加载起来时返回 503，这里如实地把它当成失败上报。
+    pub async fn health(&self) -> anyhow::Result<()> {
+        let Some(url) = health_url(&self.asr_url).or_else(|| health_url(&self.tts_url)) else {
+            return Err(anyhow::anyhow!("语音服务地址不是合法的 http 地址"));
+        };
+        let response = self
+            .http
+            .get(&url)
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            .map_err(|error| anyhow::anyhow!("请求 {url} 失败: {error}"))?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(anyhow::anyhow!("{url} 返回 HTTP {}", status.as_u16()));
+        }
+        Ok(())
+    }
+
     /// 识别一段完整语音。`pcm` 是单声道 S16LE 裸 PCM。
     pub async fn transcribe(&self, pcm: &[u8], sample_rate: u32) -> anyhow::Result<String> {
         if pcm.is_empty() {
@@ -161,6 +182,13 @@ struct AsrResponse {
     text: String,
 }
 
+/// 从语音服务的端点推导 `/healthz` 地址：只保留 scheme 与 authority。
+fn health_url(endpoint: &str) -> Option<String> {
+    let (scheme, rest) = endpoint.trim().split_once("://")?;
+    let authority = rest.split('/').next()?;
+    (!scheme.is_empty() && !authority.is_empty()).then(|| format!("{scheme}://{authority}/healthz"))
+}
+
 /// 给裸 PCM 套一个最小 WAV 头（单声道、16 位）。
 pub fn pcm_to_wav(pcm: &[u8], sample_rate: u32) -> Vec<u8> {
     let data_len = pcm.len() as u32;
@@ -184,7 +212,25 @@ pub fn pcm_to_wav(pcm: &[u8], sample_rate: u32) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::pcm_to_wav;
+    use super::{health_url, pcm_to_wav};
+
+    #[test]
+    fn health_url_keeps_only_scheme_and_authority() {
+        assert_eq!(
+            health_url("http://127.0.0.1:6120/v1/asr").as_deref(),
+            Some("http://127.0.0.1:6120/healthz")
+        );
+        assert_eq!(
+            health_url(" http://127.0.0.1:6120/v1/tts ").as_deref(),
+            Some("http://127.0.0.1:6120/healthz")
+        );
+        assert_eq!(
+            health_url("http://127.0.0.1:6120").as_deref(),
+            Some("http://127.0.0.1:6120/healthz")
+        );
+        assert_eq!(health_url(""), None);
+        assert_eq!(health_url("127.0.0.1:6120/v1/asr"), None);
+    }
 
     #[test]
     fn wav_header_describes_mono_s16_pcm() {
