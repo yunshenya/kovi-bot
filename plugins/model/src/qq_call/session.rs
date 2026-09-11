@@ -177,7 +177,11 @@ pub(super) async fn run(
 
         frame_index += 1;
         if hangup_requested.load(Ordering::Relaxed) {
-            end_reason = "对方要求挂断";
+            end_reason = if allowed {
+                "对方要求挂断"
+            } else {
+                "名单外婉拒"
+            };
             break;
         }
         if frame_index.is_multiple_of(frames_per_poll) {
