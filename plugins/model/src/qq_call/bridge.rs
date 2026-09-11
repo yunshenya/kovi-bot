@@ -167,11 +167,14 @@ impl BridgeClient {
         Ok(envelope.data)
     }
 
-    /// 请桥主动挂断当前通话（AVSDK cmd 8 = `Quit`）。
+    /// 请桥主动挂断当前通话。
     ///
-    /// 桥侧把它记为 `state.call.hangup*`；调用成功只代表 AVSDK 接受了这次
-    /// 挂断请求，通话真正结束仍以随后轮询到的阶段为准。
-    pub async fn hangup(&self, reason: i64) -> anyhow::Result<()> {
+    /// `method` 是 AVSDK 控制方法名（cmd 8 = `quit`、9 = `reject`、10 = `close`、
+    /// 11 = `clearRoom`）。实测只发 `quit` 只会让本端离开房间、服务器不销毁，
+    /// `close` 才会真的结束通话，所以默认用 `close`。桥侧把它记为
+    /// `state.call.hangup*`；调用成功只代表 AVSDK 接受了请求，通话是否真的结束
+    /// 以随后轮询到的阶段（`ended` + `endReason`）为准。
+    pub async fn hangup(&self, method: &str, reason: i64) -> anyhow::Result<()> {
         let response = self
             .http
             .post(&self.hangup_endpoint)
@@ -179,7 +182,7 @@ impl BridgeClient {
                 reqwest::header::AUTHORIZATION,
                 format!("Bearer {}", self.token),
             )
-            .json(&serde_json::json!({ "method": "quit", "reason": reason }))
+            .json(&serde_json::json!({ "method": method, "reason": reason }))
             .timeout(self.timeout)
             .send()
             .await

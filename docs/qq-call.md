@@ -281,15 +281,21 @@ MAIBOT_QQ_CALL_BOT_UIN="<机器人QQ号>" \
 |---|---|---|
 | 1 | `Login(id, uid, uin, uin, accountPath, "")` | 上游桥在用 |
 | 5 | `Accept(id, uinType, uid, uids[], …)` | 上游桥在用（自动接听） |
-| **8** | **`Quit(id, uint roomId, int reason)`** | **挂断**（底层 `MAVEngineImpl::QuitRoom(emQUITREASON)`） |
+| 8 | `Quit(id, uint roomId, int reason)` | 离开房间；**单独发它不够**（见下） |
 | 9 | `Reject(id, uint roomId, uid, int reason)` | 拒接 |
-| 10 | `Close(id, uint roomId, uid, int reason)` | 关闭会话 |
+| **10** | **`Close(id, uint roomId, uid, int reason)`** | **真正结束通话**（实测有效，见下） |
 | 11 | `ClearRoom(id, uint roomId, uid)` | 清房间 |
 | 55 | `OnPenetrateEvent(id, type, payload)` | 上游桥的 kernel-forward |
 
 - 本仓库的服务端补丁 `patch-plugin-hangup.py` 把 8/9/10/11 加进 AV Host 白名单，并新增
-  `POST /v1/calls/hangup`（`{"method":"quit","roomId":…,"reason":…}`，参数省略时用
-  来电元组里的房间号）；机器人侧对应 `qq_call.hangup_enabled`/`hangup_reason`。
+  `POST /v1/calls/hangup`（`{"method":"close","roomId":…,"reason":…}`，参数省略时用
+  来电元组里的房间号）；机器人侧对应
+  `qq_call.hangup_enabled`/`hangup_method`（默认 `close`）/`hangup_reason`。
+- **2026-09-12 03:20 真机实测**（对方手机打进来、通话中逐个候选试）：单发 `quit`
+  （roomId 取 0 / 1 / 来电元组里的数 / reason 0/1/2/3）全部"受理但无效"——桥的 AVSDK
+  事件计数照涨、`endReason` 始终为空，说明本端没被移出房间；紧接着发 `close` 后
+  桥立刻变成 `ended` + `endReason=4`，事件计数停止增长，对方手机上的通话结束。
+  因此默认方法选 `close`（`quit` 仍可用 `method` 显式指定）。
 - 结论修正：**挂断 API 一直都在**，只是既不在 OneBot、也不在内核 AVSDK 服务里，
   而在 AV Host 的 PPAPI 插件方法表里。
 
@@ -297,8 +303,8 @@ MAIBOT_QQ_CALL_BOT_UIN="<机器人QQ号>" \
 
 1. **主动挂断（默认开启）**：`qq_call.hangup_enabled = true` 时，机器人结束会话
    （对方要求挂断 / 名单外婉拒 / 到 `max_call_seconds` / 采集链路中断）后会调用
-   `POST /v1/calls/hangup`，请 AVSDK 发 `Quit`。关掉即回到旧行为："只能停止参与，
-   等对方挂断"。
+   `POST /v1/calls/hangup`，请 AVSDK 执行 `Close`（cmd 10）。关掉即回到旧行为：
+   "只能停止参与，等对方挂断"。
 2. **可选的"未授权来电不接"**：`qq_call.caller_allowlist_enabled = true` 时，机器人把
    「授权名单 ∪ 副管理员 ∪ 主管理员」写进 `qq_call.caller_allowlist_file`（默认
    `/home/ubuntu/napcat-qq-call/bridge/runtime/allowed-callers.json`），桥在接听前读它，

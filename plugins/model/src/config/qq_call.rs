@@ -101,7 +101,13 @@ pub struct QqCallConfig {
     /// `Quit(uint roomId, int reason)`；桥现在把它透出成
     /// `POST /v1/calls/hangup`。打开后，机器人结束会话时会主动挂断。
     hangup_enabled: bool,
-    /// 传给 AVSDK `Quit` 的原因码；未验证前保持默认 1。
+    /// 用哪个 AVSDK 控制方法挂断（`close`/`quit`/`reject`/`clearRoom`）。
+    ///
+    /// 实测（2026-09-12，真机通话中）：只发 `quit` 本端会离开房间但服务器不销毁，
+    /// 紧接着的 `close` 才真的结束这通电话（桥立刻 `ended`、`endReason=4`、
+    /// AVSDK 事件计数停止增长）。因此默认 `close`。
+    hangup_method: String,
+    /// 传给 AVSDK 控制方法的原因码；默认 1。
     hangup_reason: i64,
     /// 挂断后是否把通话记录写回来电者的私聊记忆。
     archive_to_memory: bool,
@@ -270,7 +276,12 @@ impl QqCallConfig {
         self.hangup_enabled
     }
 
-    /// 传给 AVSDK `Quit` 的原因码。
+    /// 用哪个 AVSDK 控制方法挂断。
+    pub fn hangup_method(&self) -> &str {
+        self.hangup_method.trim()
+    }
+
+    /// 传给 AVSDK 控制方法的原因码。
     pub fn hangup_reason(&self) -> i64 {
         self.hangup_reason
     }
@@ -412,6 +423,11 @@ impl QqCallConfig {
         {
             return Err(anyhow::anyhow!("qq_call.hangup_keywords 不能有空字符串"));
         }
+        if self.hangup_method.trim().is_empty() || self.hangup_method.trim().len() > 32 {
+            return Err(anyhow::anyhow!(
+                "qq_call.hangup_method 必须是 1 到 32 个字符（close/quit/reject/clearRoom）"
+            ));
+        }
         if self.hangup_reason < 0 || self.hangup_reason > 1_000 {
             return Err(anyhow::anyhow!(
                 "qq_call.hangup_reason 必须在 0 到 1000 之间（AVSDK 挂断原因码）"
@@ -476,6 +492,7 @@ impl Default for QqCallConfig {
             ],
             farewell: "好，那我先挂啦，拜拜～".to_string(),
             hangup_enabled: true,
+            hangup_method: "close".to_string(),
             hangup_reason: 1,
             archive_to_memory: true,
         }
@@ -560,12 +577,19 @@ mod tests {
             ..enabled()
         };
         assert!(bad_reason.validate().is_err());
+        let bad_method = QqCallConfig {
+            hangup_method: "  ".to_string(),
+            ..enabled()
+        };
+        assert!(bad_method.validate().is_err());
     }
 
     #[test]
     fn hangup_is_enabled_by_default() {
         let config = QqCallConfig::default();
         assert!(config.hangup_enabled());
+        // 实测只有 close 能让服务器真的销毁房间。
+        assert_eq!(config.hangup_method(), "close");
         assert_eq!(config.hangup_reason(), 1);
     }
 

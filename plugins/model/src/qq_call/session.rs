@@ -109,7 +109,7 @@ pub(super) async fn run(
 
     // 对方要求挂断 / 通话到点收尾 / 名单外婉拒后，用它让采集链优雅收尾。
     // 会话收尾时如果电话还通着，再用桥的 `POST /v1/calls/hangup`
-    // （AVSDK cmd 8 = `Quit`）真的挂断，不再只能等对方挂断。
+    // （AVSDK 控制方法，默认 cmd 10 = `Close`）真的挂断，不再只能等对方挂断。
     let hangup_requested = Arc::new(AtomicBool::new(false));
     let responder = kovi::tokio::spawn(respond(
         config.clone(),
@@ -258,8 +258,14 @@ pub(super) async fn run(
 
     // 会话已经收尾（道别/婉拒也已经播完）：如果电话还通着，就让桥真的挂断。
     if bridge_live && config.hangup_enabled() {
-        match client.hangup(config.hangup_reason()).await {
-            Ok(()) => println!("[INFO] 已请通话桥挂断这通电话（AVSDK Quit）"),
+        match client
+            .hangup(config.hangup_method(), config.hangup_reason())
+            .await
+        {
+            Ok(()) => println!(
+                "[INFO] 已请通话桥挂断这通电话（AVSDK {}）",
+                config.hangup_method()
+            ),
             Err(error) => eprintln!("[WARN] 请通话桥挂断失败: {error}"),
         }
     }

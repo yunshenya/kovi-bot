@@ -435,7 +435,12 @@ farewell = "好，那我先挂啦，拜拜～"
 # `POST /v1/calls/hangup`，机器人结束会话（对方要求挂断、名单外婉拒、通话到点、
 # 采集中断）时会调用它。关掉即回到旧行为：只能停止参与，等对方挂断。
 hangup_enabled = true
-# 传给 AVSDK `Quit` 的原因码，默认 1。
+# 用哪个 AVSDK 控制方法挂断：close(10) / quit(8) / reject(9) / clearRoom(11)。
+# 2026-09-12 真机实测：单发 quit 只会让本端离开房间、服务器不销毁（桥的事件计数
+# 照涨、endReason 一直为空），紧接着的 close 才真的结束通话（桥立刻 ended、
+# endReason=4）。所以默认 close。
+hangup_method = "close"
+# 传给该控制方法的原因码，默认 1。
 hangup_reason = 1
 
 # 芸汐主动发语音消息：她在回复里标记 voice 时，用本机 TTS 把这句话合成出来，
