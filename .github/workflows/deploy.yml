@@ -1,9 +1,10 @@
 name: Deploy production
 
+# 日常发布走本地快速通道 scripts/deploy-local.sh：GitHub Runner 在境外，把 release 包
+# scp 到国内服务器是跨境传输，慢且不稳定。这里只保留手动 dispatch 作为兜底：本机不可用，
+# 或需要按仓库 Secrets 重新生成生产配置时使用。发布流程本身与本地通道共用同一套服务端
+# 原子切换与回滚逻辑。
 on:
-  workflow_run:
-    workflows: ["CI"]
-    types: [completed]
   workflow_dispatch:
 
 permissions:
@@ -31,16 +32,11 @@ env:
   MODEL_REQUIRES_AUTH: ${{ vars.MODEL_REQUIRES_AUTH || 'true' }}
   MODEL_ACTOR_AUTHORIZATION: ${{ vars.MODEL_ACTOR_AUTHORIZATION || '' }}
   MODEL_THINKING_MODE: ${{ vars.MODEL_THINKING_MODE || 'disabled' }}
-  DEPLOY_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+  DEPLOY_SHA: ${{ github.sha }}
 
 jobs:
   deploy:
-    if: >-
-      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
-      (github.event.workflow_run.conclusion == 'success' &&
-       github.event.workflow_run.event == 'push' &&
-       github.event.workflow_run.head_repository.full_name == github.repository &&
-       github.event.workflow_run.head_branch == 'main')
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     environment:

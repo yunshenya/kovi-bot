@@ -140,12 +140,31 @@ scripts/install-qq-call.sh --apply  # 预检通过后安装依赖与桥
 然后在 `bot.conf.toml` 的 `[qq_call]` 里填好路径与白名单，把 `enabled` 改成 `true`
 并重启机器人。
 
+## 部署
+
+日常发布走本地快速通道 [`scripts/deploy-local.sh`](scripts/deploy-local.sh)：在开发机上交叉
+编译 Linux 二进制，直连服务器上传，复用服务端既有的原子切换、readiness 校验与失败回滚。
+GitHub Runner 在境外，跨境 scp 一个 release 包要等很久，所以 Actions 不再自动发布。
+
+```bash
+ssh-copy-id -p 22 ubuntu@<服务器>   # 首次：装本机公钥，之后免密
+./scripts/deploy-local.sh           # 编译 → 打包 → 上传 → 原子切换 → 等 readiness
+./scripts/deploy-local.sh --help    # --no-build / --password-auth / --require-clean / --install-service 等
+```
+
+发布包只带二进制与 `REVISION`，`.env` 与 `*.toml` 由服务端从上一版 release 继承，因此开发机
+不保存生产密钥，也不会应用 GitHub Secrets 的变化（改配置要用 Actions 手动发布一次）。工作区
+有未提交改动时 revision 记为 `<sha>-dirty.<时间戳>`，改动会进二进制；要严格对齐提交加
+`--require-clean`。
+
 ## GitHub Actions
 
 [`CI`](.github/workflows/ci.yml) 会在 PR 与 `main` 推送时执行格式、Clippy、PostgreSQL
-集成测试、release 构建、RustSec 审计、许可证/来源策略和密钥扫描。只有仓库自身 `main`
-分支的 push 通过 CI 后，受保护的 [`Deploy production`](.github/workflows/deploy.yml) 才会
-使用受保护的部署账号密码发布；PR 代码不能读取生产 Secrets。
+集成测试、release 构建、RustSec 审计、许可证/来源策略和密钥扫描。
+
+[`Deploy production`](.github/workflows/deploy.yml) 不再随 CI 自动触发，只保留手动 dispatch
+作为兜底（本机不可用、或需要按 GitHub Secrets 重新生成生产配置时）。它仍然使用受保护的
+部署账号密码发布，PR 代码不能读取生产 Secrets。
 
 生产发布使用专用应用账号、最小权限数据库角色、固定 SSH 主机公钥、版本化 release 和
 readiness 文件。二进制、配置与环境变量会作为一个整体原子切换，失败时整体回滚。服务器
