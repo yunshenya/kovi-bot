@@ -112,6 +112,7 @@ struct Envelope {
 pub struct BridgeClient {
     http: reqwest::Client,
     endpoint: String,
+    hangup_endpoint: String,
     token: String,
     timeout: Duration,
 }
@@ -123,13 +124,13 @@ impl BridgeClient {
             .timeout(Duration::from_secs(config.request_timeout_secs()))
             .build()
             .map_err(|error| anyhow::anyhow!("无法创建通话桥 HTTP 客户端: {error}"))?;
-        let endpoint = format!(
-            "{}/v1/calls/current",
-            config.bridge_url().trim_end_matches('/')
-        );
+        let base = config.bridge_url().trim_end_matches('/').to_owned();
+        let endpoint = format!("{base}/v1/calls/current");
+        let hangup_endpoint = format!("{base}/v1/calls/hangup");
         Ok(Self {
             http,
             endpoint,
+            hangup_endpoint,
             token,
             timeout: Duration::from_secs(config.request_timeout_secs()),
         })
@@ -159,6 +160,30 @@ impl BridgeClient {
             .await
             .map_err(|error| anyhow::anyhow!("通话桥返回了非法 JSON: {error}"))?;
         Ok(envelope.data)
+    }
+
+    /// 请桥主动挂断当前通话（AVSDK cmd 8 = `Quit`）。
+    ///
+    /// 桥侧把它记为 `state.call.hangup*`；调用成功只代表 AVSDK 接受了这次
+    /// 挂断请求，通话真正结束仍以随后轮询到的阶段为准。
+    pub async fn hangup(&self, reason: i64) -> anyhow::Result<()> {
+        let response = self
+            .http
+            .post(&self.hangup_endpoint)
+            .header(
+                reqwest::header::AUTHORIZATION,
+                format!("Bearer {}", self.token),
+            )
+            .json(&serde_json::json!({ "method": "quit", "reason": reason }))
+            .timeout(self.timeout)
+            .send()
+            .await
+            .map_err(|error| anyhow::anyhow!("通话桥挂断请求失败: {error}"))?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(anyhow::anyhow!("通话桥挂断返回 HTTP {}", status.as_u16()));
+        }
+        Ok(())
     }
 }
 

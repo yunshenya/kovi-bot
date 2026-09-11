@@ -237,27 +237,27 @@ MAIBOT_QQ_CALL_BOT_UIN="<机器人QQ号>" \
 - **只支持 Linux。** 桥依赖 Linux QQ 自带的 `libAVSDKPlugin.so` 与 PulseAudio。
 - **QQ 或 NapCat 升级会覆盖 Loader。** 升级后必须重新运行
   `scripts/install-qq-call.sh --apply` 与 `doctor.sh`，并用测试账号复验一次来电。
-- **不能主动打电话**，也不能挂断对方的电话。**2026-09-12 凌晨把客户端侧所有可用入口都试穿了**（见下），结论是
-  QQ 的 1v1 语音通话没有对插件开放"离开房间/挂断"的动作，只能等对方挂断；未授权来电因此
-  会一直停在接通状态（我们这侧静音），直到对方自己挂掉。
+- **不能主动打电话**（`StartCall` 有 cmd 4，但没有可用参数），**可以主动挂断**
+  （cmd 8 = `Quit`，见下）：对方要求挂断、名单外婉拒、通话到点、采集中断时，
+  机器人会请桥真的挂断这通电话。
 - **通话没有接入 World Model / Mind 的实时状态**，只复用私聊人设、记忆和模型。
   电话里的情绪与情境暂时不会回流到核心的其它子系统。
-- 白名单外只能"接通后婉拒"，原因见上面的安全一节。
+- 白名单外默认仍是"接通后婉拒"（可选改成"不接"，见上面的安全一节）。
 
-### "主动挂断"排查记录（2026-09-12）
+### "主动挂断"排查记录（2026-09-12，已解决）
 
 背景：2026-09-11 晚上一通未授权来电接通后卡在 `connected` 一整夜，机器人每次重启都
-重新起一次幽灵会话，直到重启容器才清掉。为了给芸汐加上"主动挂断"，把客户端侧能碰到的
-入口逐个试过：
+重新起一次幽灵会话，直到重启容器才清掉。为了给芸汐加上"主动挂断"，先把客户端侧所有
+"看起来像"的入口试穿（下表）；**真正的入口一直是桥控制接口的 cmd 8，只是白名单只放行了
+1/5/55。**
 
 | 入口 | 试了什么 | 结果 |
 |---|---|---|
-| AVSDK 消息通道 `postMessage({cmd})` | 命令号 2/3/4/6/7/8/9/10/11/12/13/14/15/20/21/30/40 | 全部静默接受，通话不受影响 |
-| `NodeIKernelAVSDKService.startGroupVideoCmdRequestFromAVSDK(a, b)` | 数字 1..40/55/100（空载荷与会话参数）、字符串命令名 `hangup`/`endCall`/`closeRoom`/`leaveRoom`/`quit`/`reject`/`cancel` 等 24 个 × 两种载荷 | 无效果（该接口确实要求 2 个参数） |
-| `NodeIKernelAVSDKService.setActionFromAVSDK(type, payload)` | 数字 1..25/30/40/55/100 + 会话参数 | 无效果 |
-| `NodeIKernelAVSDKService.sendGroupVideoJsonBuffer(a, b)` | 数字 1..30/40/55/100/20001/20004/20006 + 会话参数 | 无效果 |
-| 枚举 AVSDK 服务全部方法 | `getOwnPropertyNames` 沿原型链 | 只有 7 个方法 + `constructor`，没有隐藏的 hangup/closeRoom |
-| 枚举会话服务 | 86 个 session 方法 | 没有独立的 1v1 通话服务，只有 `getAVSDKService` |
+| AVSDK 消息通道 `postMessage({cmd})` | 命令号 2/3/4/6/7/8/9/10/11/12/13/14/15/20/21/30/40 | 当时全部"无效果"——因为**桥的白名单把它们拦在 AV Host 之外**（`ALLOWED_COMMANDS = {1,5,55}`） |
+| `NodeIKernelAVSDKService.startGroupVideoCmdRequestFromAVSDK(a, b)` | 数字 1..40/55/100（空载荷与会话参数）、字符串命令名 `hangup`/`endCall`/`closeRoom`/`leaveRoom`/`quit`/`reject`/`cancel` 等 24 个 × 两种载荷 | 无效果（这条确实不是 1v1 通话的路径） |
+| `NodeIKernelAVSDKService.setActionFromAVSDK(type, payload)` | 数字 1..25/30/40/55/100 + 会话参数 | 无效果（它属于主 QQ 的 AVSDK 服务，不是 AV Host 里那通电话） |
+| `NodeIKernelAVSDKService.sendGroupVideoJsonBuffer(a, b)` | 数字 1..30/40/55/100/20001/20004/20006 + 会话参数 | 无效果（同上，群视频通道） |
+| 枚举 AVSDK 服务全部方法 | `getOwnPropertyNames` 沿原型链 | 只有 7 个方法；真正的通话控制在 AV Host 的 **PPAPI 插件**里，不在这套内核 API 里 |
 | 杀掉 AV Host 进程 | 通话中断后由守护脚本拉起 | **对方通话不会结束**：房间由服务器保留，必须由客户端显式"离开房间" |
 | 上游仓库 `ClaudiaGardner/maibot-qq-voice-call` | 全仓库搜索 + commits + issues | 没有任何挂断实现或说明；我们固定的 `22f30c0` 就是上游 HEAD |
 
@@ -265,30 +265,50 @@ MAIBOT_QQ_CALL_BOT_UIN="<机器人QQ号>" \
 
 | 尝试 | 结果 |
 |---|---|
-| 内核接口类型码 291 / 344（线协议里的控制/音频类型） | 无效果 |
+| 内核接口类型码 291 / 344 | 无效果（这两个数其实是**帧长**的误读，见下） |
 | AV Host 的 X 显示截图（通话中） | 全黑：headless 下它根本不渲染通话窗口，`xdotool` 无从点击 |
-| 线协议抓包（Mac ↔ 服务器 P2P 通话） | 报文格式 `5b 00 | 类型(LE16) | …`；**344 = 音频、291 = 控制**。挂断 = 对端发两个 291 包（`00000003` = 我要离开），本端回一个 291（`00000002` = 确认）。房间随后由服务器销毁（`onS2CActionToAVSDK {destroyReason:1}`） |
-| 手机 ↔ 服务器（中继模式） | 媒体经腾讯中转（`…:8000`），中继协议是 **protobuf**（`0a 05 08 …`），与 P2P 的 291/344 不是同一套 |
+| 线协议抓包 | 帧头是 `5b 00 | 0x01 | 总长(u8)`，之后才是消息体；对端挂断时本端先收到一个 35 字节控制帧，回一帧确认，随后服务器销毁房间（`onS2CActionToAVSDK {destroyReason:1}`）。**之前记的"类型 291/344"是误读**：0x0123 = 291 恰好是 35 字节帧的总长 |
+| 手机 ↔ 服务器（中继模式） | 媒体经腾讯中转（`…:8000`），走 protobuf；与"挂断 API"无关，挂断不经过这里 |
 
-结论：**挂断在客户端侧是"媒体面控制包 + 信令面通知"两段**，AVSDK 会发 291（它在
-收到对端挂断时确实回了 291），但没有暴露任何"由本端发起离开"的 API。剩下的路只有伪造/
-注入 291 包（P2P 通话可行但脆弱，中继通话要先逆向 protobuf），投入产出不成正比，因此
-**暂不继续**；上面两条缓解措施（名单外不接的可选开关 + 对方要求挂断时道别收尾）才是
-当前的正解。
+**真正的入口**（03:00 逆向 `libAVSDKPlugin.so` 得到）：
 
-**已落地的缓解措施**（2026-09-12 凌晨）：
+- `libAVSDKPlugin.so` 是 PPAPI 插件，`host.html` 用 `plugin.postMessage({cmd, id, param})` 调它；
+  `PPP_InitializeModule` 把消息回调注册成 **`CallCpp(cmd, id, param)`**。
+- `CallCpp` 里 **`cmd` 就是 `QRTCServiceInterfaceWrapper` 的方法表下标**（`g_api_funcs`，
+  `cmd > 111` 走群视频的 `od_api_funcs`，即 cmd 100000+）：
 
-1. **可选的"未授权来电不接"**：`qq_call.caller_allowlist_enabled = true` 时，机器人把
+| cmd | 方法签名 | 说明 |
+|---|---|---|
+| 1 | `Login(id, uid, uin, uin, accountPath, "")` | 上游桥在用 |
+| 5 | `Accept(id, uinType, uid, uids[], …)` | 上游桥在用（自动接听） |
+| **8** | **`Quit(id, uint roomId, int reason)`** | **挂断**（底层 `MAVEngineImpl::QuitRoom(emQUITREASON)`） |
+| 9 | `Reject(id, uint roomId, uid, int reason)` | 拒接 |
+| 10 | `Close(id, uint roomId, uid, int reason)` | 关闭会话 |
+| 11 | `ClearRoom(id, uint roomId, uid)` | 清房间 |
+| 55 | `OnPenetrateEvent(id, type, payload)` | 上游桥的 kernel-forward |
+
+- 本仓库的服务端补丁 `patch-plugin-hangup.py` 把 8/9/10/11 加进 AV Host 白名单，并新增
+  `POST /v1/calls/hangup`（`{"method":"quit","roomId":…,"reason":…}`，参数省略时用
+  来电元组里的房间号）；机器人侧对应 `qq_call.hangup_enabled`/`hangup_reason`。
+- 结论修正：**挂断 API 一直都在**，只是既不在 OneBot、也不在内核 AVSDK 服务里，
+  而在 AV Host 的 PPAPI 插件方法表里。
+
+**已落地的机制**（2026-09-12 凌晨）：
+
+1. **主动挂断（默认开启）**：`qq_call.hangup_enabled = true` 时，机器人结束会话
+   （对方要求挂断 / 名单外婉拒 / 到 `max_call_seconds` / 采集链路中断）后会调用
+   `POST /v1/calls/hangup`，请 AVSDK 发 `Quit`。关掉即回到旧行为："只能停止参与，
+   等对方挂断"。
+2. **可选的"未授权来电不接"**：`qq_call.caller_allowlist_enabled = true` 时，机器人把
    「授权名单 ∪ 副管理员 ∪ 主管理员」写进 `qq_call.caller_allowlist_file`（默认
    `/home/ubuntu/napcat-qq-call/bridge/runtime/allowed-callers.json`），桥在接听前读它，
-   名单外直接不接听——上面那次事故的成因从根上消失。**默认关闭**（保持上游的
-   "接通后婉拒"），因为这会改变来电者听到的结果。
-2. **对方说"挂了吧/先挂/挂电话"**：机器人识别到就播一句 `farewell` 并结束本次通话
-   会话（不再走模型、不再继续听），日志里记为"对方要求挂断（QQ 侧通话需对方挂断）"。
-3. **到 `max_call_seconds`**：同样先道别再结束会话。
-4. **名单外婉拒（回退路径）**：播完婉拒即结束会话，不再无限静音挂着。
-5. `#通话状态` 增加一行"接听授权名单：N 人（机器人同步于 …）"，并在结尾注明机器人
-   无法主动挂断。
+   名单外直接不接听。**默认关闭**（保持上游的"接通后婉拒"），因为这会改变来电者
+   听到的结果。
+3. **对方说"挂了吧/先挂/挂电话"**：机器人识别到就播一句 `farewell`，然后真的挂断。
+4. **到 `max_call_seconds`**：同样先道别，再挂断。
+5. **名单外婉拒（回退路径）**：播完婉拒即挂断，不再无限静音挂着。
+6. `#通话状态` 增加一行"接听授权名单：N 人（机器人同步于 …）"。
+
 
 ## 排错
 

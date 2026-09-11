@@ -108,7 +108,8 @@ pub(super) async fn run(
     let (interrupt_tx, interrupt_rx) = mpsc::channel::<()>(JOB_QUEUE);
 
     // 对方要求挂断 / 通话到点收尾 / 名单外婉拒后，用它让采集链优雅收尾。
-    // QQ 的 1v1 通话没有对插件开放"离开房间"，机器人无法真正挂断，只能停止参与。
+    // 会话收尾时如果电话还通着，再用桥的 `POST /v1/calls/hangup`
+    // （AVSDK cmd 8 = `Quit`）真的挂断，不再只能等对方挂断。
     let hangup_requested = Arc::new(AtomicBool::new(false));
     let responder = kovi::tokio::spawn(respond(
         config.clone(),
@@ -160,6 +161,9 @@ pub(super) async fn run(
     let mut end_reason = "通话已结束";
     let mut bridge_failures: u32 = 0;
     let mut first_speech_seen = false;
+    // 电话是否还通着：只有桥报告阶段离开 connected，或者桥自己不可用了，
+    // 才不需要再挂断。
+    let mut bridge_live = true;
 
     loop {
         let frame = match capture.next_frame().await {
@@ -173,7 +177,7 @@ pub(super) async fn run(
 
         frame_index += 1;
         if hangup_requested.load(Ordering::Relaxed) {
-            end_reason = "对方要求挂断（QQ 侧通话需对方挂断）";
+            end_reason = "对方要求挂断";
             break;
         }
         if frame_index.is_multiple_of(frames_per_poll) {
@@ -186,6 +190,7 @@ pub(super) async fn run(
                             CallPhase::Ended => "对方挂断",
                             _ => "通话阶段已结束",
                         };
+                        bridge_live = false;
                         println!("[INFO] QQ 通话桥阶段变为 {}", current.phase().as_str());
                         break;
                     }
@@ -195,6 +200,7 @@ pub(super) async fn run(
                     // 单次抖动不足以结束通话；连续失败说明桥已经不在了。
                     if bridge_failures >= BRIDGE_FAILURE_LIMIT {
                         end_reason = "通话桥不可用";
+                        bridge_live = false;
                         eprintln!("[ERROR] QQ 通话桥连续不可用: {error}");
                         break;
                     }
@@ -205,7 +211,7 @@ pub(super) async fn run(
             end_reason = "达到通话时长上限";
             let farewell = config.farewell().trim().to_owned();
             if !farewell.is_empty() {
-                // 到点先说一句道别，再结束会话；QQ 侧那通电话只能等对方挂断。
+                // 到点先说一句道别，再结束会话并挂断这通电话。
                 let _ = job_tx.try_send(Job::Speak(farewell));
             }
             break;
@@ -245,6 +251,14 @@ pub(super) async fn run(
     // 采集链结束后不再需要打断信号，回复链也已经停止。
     drop(interrupt_tx);
     segmenter.reset();
+
+    // 会话已经收尾（道别/婉拒也已经播完）：如果电话还通着，就让桥真的挂断。
+    if bridge_live && config.hangup_enabled() {
+        match client.hangup(config.hangup_reason()).await {
+            Ok(()) => println!("[INFO] 已请通话桥挂断这通电话（AVSDK Quit）"),
+            Err(error) => eprintln!("[WARN] 请通话桥挂断失败: {error}"),
+        }
+    }
 
     println!(
         "[INFO] QQ 语音通话结束（{end_reason}，时长 {} 秒）",

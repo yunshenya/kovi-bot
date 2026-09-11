@@ -423,10 +423,20 @@ caller_allowlist_file = "/home/ubuntu/napcat-qq-call/bridge/runtime/allowed-call
 # refuse_message 后静音（注意：接通后机器人无法挂断，这通电话会一直连着，直到
 # 对方挂断）。改成 true 则名单外直接不接，来电自然结束（对方听到"无人接听"）。
 caller_allowlist_enabled = false
-# 通话中对方说了这些词就当作"要求挂断"：她说一句 farewell 后结束本次通话会话。
-# 注意 QQ 侧那通电话只能由对方挂断——客户端没有挂断接口（已穷举验证）。
+# 通话中对方说了这些词就当作"要求挂断"：她说一句 farewell 后真的挂断电话。
 hangup_keywords = ["挂断", "挂了吧", "先挂", "挂电话", "挂了", "不聊了"]
 farewell = "好，那我先挂啦，拜拜～"
+# 会话收尾时是否让桥真的挂断这通电话（默认 true）。
+#
+# QQ 的 1v1 通话没有对插件开放"离开房间"，但 AVSDK 插件自身一直有
+# `Quit(roomId, reason)`：桥的控制接口 cmd 8（页面 postMessage 的 cmd 就是
+# `QRTCServiceInterfaceWrapper` 的方法表下标：1=Login、5=Accept、8=Quit、
+# 9=Reject、10=Close、11=ClearRoom、55=OnPenetrateEvent）。桥现在把它透出成
+# `POST /v1/calls/hangup`，机器人结束会话（对方要求挂断、名单外婉拒、通话到点、
+# 采集中断）时会调用它。关掉即回到旧行为：只能停止参与，等对方挂断。
+hangup_enabled = true
+# 传给 AVSDK `Quit` 的原因码，默认 1。
+hangup_reason = 1
 
 # 芸汐主动发语音消息：她在回复里标记 voice 时，用本机 TTS 把这句话合成出来，
 # 再以 QQ 语音消息发出。默认关闭。

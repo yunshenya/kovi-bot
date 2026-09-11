@@ -90,13 +90,19 @@ pub struct QqCallConfig {
     /// 副管理员与主管理员取并集后写入；桥在接听前读它，名单外不接听。留空关闭
     /// 这个能力（回到"接通后婉拒"）。
     caller_allowlist_file: String,
-    /// 通话中对方说了这些词就当作"要求挂断"：说一句道别后结束本次通话会话。
-    ///
-    /// QQ 的 1v1 通话没有对插件开放"离开房间"，机器人无法真正挂断，只能停止
-    /// 参与，等对方挂断。
+    /// 通话中对方说了这些词就当作"要求挂断"：说一句道别后真的挂断电话。
     hangup_keywords: Vec<String>,
     /// 对方要求挂断（或到达通话时长上限）时说的最后一句道别。
     farewell: String,
+    /// 会话结束时是否让桥真的挂断电话（AVSDK cmd 8 = `Quit`）。
+    ///
+    /// 上游桥的控制接口白名单原本只有 `login(1)/accept(5)/kernel-forward(55)`，
+    /// 所以机器人只能"停止参与"、等对方挂断。AVSDK 插件本身一直有
+    /// `Quit(uint roomId, int reason)`；桥现在把它透出成
+    /// `POST /v1/calls/hangup`。打开后，机器人结束会话时会主动挂断。
+    hangup_enabled: bool,
+    /// 传给 AVSDK `Quit` 的原因码；未验证前保持默认 1。
+    hangup_reason: i64,
     /// 挂断后是否把通话记录写回来电者的私聊记忆。
     archive_to_memory: bool,
 }
@@ -259,6 +265,16 @@ impl QqCallConfig {
         self.archive_to_memory
     }
 
+    /// 会话结束时是否让桥真的挂断电话。
+    pub fn hangup_enabled(&self) -> bool {
+        self.hangup_enabled
+    }
+
+    /// 传给 AVSDK `Quit` 的原因码。
+    pub fn hangup_reason(&self) -> i64 {
+        self.hangup_reason
+    }
+
     /// 该 QQ 号是否允许来电。白名单为空时只允许主管理员。
     pub fn caller_allowed(&self, caller: i64, main_admin: Option<i64>) -> bool {
         if self.allowed_callers.contains(&caller) {
@@ -396,6 +412,11 @@ impl QqCallConfig {
         {
             return Err(anyhow::anyhow!("qq_call.hangup_keywords 不能有空字符串"));
         }
+        if self.hangup_reason < 0 || self.hangup_reason > 1_000 {
+            return Err(anyhow::anyhow!(
+                "qq_call.hangup_reason 必须在 0 到 1000 之间（AVSDK 挂断原因码）"
+            ));
+        }
         if self.farewell.chars().count() > 200 {
             return Err(anyhow::anyhow!("qq_call.farewell 不能超过 200 字"));
         }
@@ -454,6 +475,8 @@ impl Default for QqCallConfig {
                 "不聊了".to_string(),
             ],
             farewell: "好，那我先挂啦，拜拜～".to_string(),
+            hangup_enabled: true,
+            hangup_reason: 1,
             archive_to_memory: true,
         }
     }
@@ -532,6 +555,18 @@ mod tests {
             ..enabled()
         };
         assert!(long_farewell.validate().is_err());
+        let bad_reason = QqCallConfig {
+            hangup_reason: -1,
+            ..enabled()
+        };
+        assert!(bad_reason.validate().is_err());
+    }
+
+    #[test]
+    fn hangup_is_enabled_by_default() {
+        let config = QqCallConfig::default();
+        assert!(config.hangup_enabled());
+        assert_eq!(config.hangup_reason(), 1);
     }
 
     #[test]

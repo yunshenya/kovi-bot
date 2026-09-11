@@ -191,11 +191,15 @@ pub(crate) async fn status_report(bot: &kovi::RuntimeBot, config: &QqCallConfig)
             Err(error) => format!("客户端创建失败 —— {error}"),
         }
     ));
-    lines.push(
-        "提醒：QQ 的 1v1 通话没有对插件开放“离开房间”，机器人无法主动挂断，\
-         需要对方挂断（或等服务器超时）；对方说“挂了吧”时她只会道别并结束本次会话。"
-            .to_string(),
-    );
+    lines.push(if config.hangup_enabled() {
+        "提醒：收尾时机器人会请桥挂断这通电话（AVSDK Quit，cmd 8）；\
+         关掉 qq_call.hangup_enabled 就只能停止参与、等对方挂断。"
+            .to_string()
+    } else {
+        "提醒：qq_call.hangup_enabled = false，机器人结束会话后不会挂断电话，\
+         这通电话要等对方挂断（或服务器超时）。"
+            .to_string()
+    });
     lines.join("\n")
 }
 
