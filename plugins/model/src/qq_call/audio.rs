@@ -13,19 +13,29 @@
 
 use crate::config::QqCallConfig;
 use kovi::tokio::io::{AsyncReadExt, AsyncWriteExt};
-use kovi::tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use kovi::tokio::process::{Child, ChildStdin, Command};
+use kovi::tokio::sync::mpsc;
+use kovi::tokio::task::JoinHandle;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 
 /// 保留的 stderr 尾部长度，用于诊断子进程为什么退出。
 const STDERR_TAIL_BYTES: usize = 512;
 
+/// 采集队列长度（帧）。实时音频宁可丢帧也不积压。
+const CAPTURE_QUEUE_FRAMES: usize = 32;
+
 /// 采集流：从 `maibot_qq_speaker.monitor` 读取定长 PCM 帧。
+///
+/// 读取放在独立任务里、帧经有界队列交给会话循环：`read_exact` 一旦阻塞
+/// （`parec` 不再吐数据）就再也回不来，会话循环会连桥的阶段变化都看不到——
+/// 这正是 2026-09-11 那类"对方早挂了、会话还卡着"的僵尸通话。
 pub struct Capture {
     child: Child,
-    stdout: ChildStdout,
     stderr_tail: Arc<Mutex<String>>,
-    frame: Vec<u8>,
+    frames: mpsc::Receiver<Vec<u8>>,
+    reader: JoinHandle<()>,
+    last: Vec<u8>,
 }
 
 impl Capture {
@@ -51,11 +61,27 @@ impl Capture {
             .take()
             .ok_or_else(|| anyhow::anyhow!("parec 没有可用的标准输出"))?;
         let stderr_tail = drain_stderr(child.stderr.take());
+        let frame_bytes = config.frame_bytes();
+        let (sender, frames) = mpsc::channel::<Vec<u8>>(CAPTURE_QUEUE_FRAMES);
+        let mut stdout = stdout;
+        let reader = kovi::tokio::spawn(async move {
+            let mut frame = vec![0_u8; frame_bytes];
+            // parec 退出或读到半帧就结束任务，让接收端看到通道关闭。
+            while stdout.read_exact(&mut frame).await.is_ok() {
+                match sender.try_send(frame.clone()) {
+                    Ok(()) => {}
+                    // 消费端来不及处理时丢最旧的一帧，保证实时性。
+                    Err(mpsc::error::TrySendError::Full(_)) => {}
+                    Err(mpsc::error::TrySendError::Closed(_)) => break,
+                }
+            }
+        });
         Ok(Self {
             child,
-            stdout,
             stderr_tail,
-            frame: vec![0_u8; config.frame_bytes()],
+            frames,
+            reader,
+            last: Vec::new(),
         })
     }
 
@@ -64,12 +90,12 @@ impl Capture {
     /// `parec` 退出（设备消失、PulseAudio 重启）时返回错误，调用方应结束
     /// 本次通话而不是空转重试。
     pub async fn next_frame(&mut self) -> anyhow::Result<&[u8]> {
-        match self.stdout.read_exact(&mut self.frame).await {
-            Ok(_) => Ok(&self.frame),
-            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
-                Err(anyhow::anyhow!("parec 已退出（{}）", self.stderr_summary()))
+        match self.frames.recv().await {
+            Some(frame) => {
+                self.last = frame;
+                Ok(&self.last)
             }
-            Err(error) => Err(anyhow::anyhow!("读取通话音频失败: {error}")),
+            None => Err(anyhow::anyhow!("parec 已退出（{}）", self.stderr_summary())),
         }
     }
 
@@ -89,6 +115,7 @@ impl Capture {
 
     /// 结束采集进程。
     pub async fn shutdown(&mut self) {
+        self.reader.abort();
         terminate(&mut self.child).await;
     }
 }

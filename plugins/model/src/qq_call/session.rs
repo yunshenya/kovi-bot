@@ -28,6 +28,13 @@ const JOB_QUEUE: usize = 8;
 const PHONE_MAX_TOKENS: u32 = 256;
 /// 通话内保留的转写轮数上限。
 const MAX_TRANSCRIPT_TURNS: usize = 64;
+/// 单次采集读取的超时：定长帧只有几十毫秒，等一秒还没有整帧就说明这一轮
+/// 没有数据，先回去看桥的状态。
+const CAPTURE_IDLE_TIMEOUT: Duration = Duration::from_millis(1_000);
+
+/// 连续多少次读不到整帧就认为采集链路已死（配合上面的超时即秒数）。
+const CAPTURE_STALL_LIMIT: u32 = 30;
+
 /// 挂断后等待回复链收尾的时间。
 const RESPONDER_DRAIN: Duration = Duration::from_secs(15);
 /// 取用的过往私聊记忆条数。
@@ -154,10 +161,6 @@ pub(super) async fn run(
         config.min_utterance_ms(),
         config.min_speech_ms(),
     );
-    // 每读若干帧检查一次桥状态，使挂断检测不依赖音频回调的时序。
-    let frames_per_poll = (config.poll_interval_ms() / u64::from(config.frame_ms())).max(1);
-    let max_frames = config.max_call_seconds() * 1_000 / u64::from(config.frame_ms());
-    let mut frame_index: u64 = 0;
     let mut end_reason = "通话已结束";
     let mut bridge_failures: u32 = 0;
     let mut first_speech_seen = false;
@@ -165,26 +168,34 @@ pub(super) async fn run(
     // 才不需要再挂断。
     let mut bridge_live = true;
 
+    let poll_every = Duration::from_millis(config.poll_interval_ms().max(50));
+    let call_budget = Duration::from_secs(config.max_call_seconds());
+    let mut last_poll = Instant::now();
+    // 连续多少次读不到整帧。采集卡住时靠它收尾，避免会话永远挂着。
+    let mut stalled_polls: u32 = 0;
+
     loop {
-        let frame = match capture.next_frame().await {
-            Ok(frame) => frame.to_vec(),
-            Err(error) => {
-                end_reason = "通话音频中断";
-                eprintln!("[ERROR] QQ 通话采集结束: {error}");
+        // 与音频无关的检查（挂断请求、时长上限、桥阶段）一律按时间走：
+        // 采集一旦不吐数据，按"帧数"计算的检查就再也跑不到了。
+        if last_poll.elapsed() >= poll_every {
+            last_poll = Instant::now();
+            if hangup_requested.load(Ordering::Relaxed) {
+                end_reason = if allowed {
+                    "对方要求挂断"
+                } else {
+                    "名单外婉拒"
+                };
                 break;
             }
-        };
-
-        frame_index += 1;
-        if hangup_requested.load(Ordering::Relaxed) {
-            end_reason = if allowed {
-                "对方要求挂断"
-            } else {
-                "名单外婉拒"
-            };
-            break;
-        }
-        if frame_index.is_multiple_of(frames_per_poll) {
+            if started.elapsed() >= call_budget {
+                end_reason = "达到通话时长上限";
+                let farewell = config.farewell().trim().to_owned();
+                if !farewell.is_empty() {
+                    // 到点先说一句道别，再结束会话并挂断这通电话。
+                    let _ = job_tx.try_send(Job::Speak(farewell));
+                }
+                break;
+            }
             match client.current_call().await {
                 Ok(current) => {
                     bridge_failures = 0;
@@ -211,15 +222,32 @@ pub(super) async fn run(
                 }
             }
         }
-        if frame_index >= max_frames {
-            end_reason = "达到通话时长上限";
-            let farewell = config.farewell().trim().to_owned();
-            if !farewell.is_empty() {
-                // 到点先说一句道别，再结束会话并挂断这通电话。
-                let _ = job_tx.try_send(Job::Speak(farewell));
-            }
-            break;
-        }
+
+        let frame =
+            match kovi::tokio::time::timeout(CAPTURE_IDLE_TIMEOUT, capture.next_frame()).await {
+                Ok(Ok(frame)) => {
+                    stalled_polls = 0;
+                    frame.to_vec()
+                }
+                Ok(Err(error)) => {
+                    end_reason = "通话音频中断";
+                    eprintln!("[ERROR] QQ 通话采集结束: {error}");
+                    break;
+                }
+                Err(_) => {
+                    // 只是这一小段时间没有整帧：不阻塞，回到循环顶部继续看桥。
+                    stalled_polls += 1;
+                    if stalled_polls >= CAPTURE_STALL_LIMIT {
+                        end_reason = "通话音频长时间无数据";
+                        eprintln!(
+                            "[WARN] QQ 通话采集连续 {} 次读不到数据，结束本次会话",
+                            stalled_polls
+                        );
+                        break;
+                    }
+                    continue;
+                }
+            };
 
         let outcome = segmenter.push(&frame);
         // 第一次收到对端语音说明整条采集链路是通的；只报一次，避免刷日志。
