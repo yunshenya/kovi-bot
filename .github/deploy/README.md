@@ -1,7 +1,14 @@
 # Production deployment bootstrap
 
-发布工作流通过 GitHub Secret 中的部署密码登录服务器，并会在发布前同步 systemd 服务和
-sudo 规则。服务器只需准备好 `ubuntu` 账号的 sudo 权限，之后 GitHub 负责构建、上传、切换
+生产发布有两条通道，服务端的解包、原子切换、readiness 校验和失败回滚是同一套逻辑：
+
+- **本地快速发布（日常）**：[`scripts/deploy-local.sh`](../../scripts/deploy-local.sh)，在开发机
+  上交叉编译后直连服务器上传。跨境的 GitHub Runner 上传太慢，因此这是默认通道。
+- **GitHub Actions（兜底）**：`Deploy production` 只支持手动 dispatch，用于本机不可用或需要
+  按仓库 Secrets 重新生成生产配置时。
+
+工作流通过 GitHub Secret 中的部署密码登录服务器，并会在发布前同步 systemd 服务和
+sudo 规则。服务器只需准备好 `ubuntu` 账号的 sudo 权限，之后发布通道负责构建、上传、切换
 版本和重启服务。
 
 ## 1. 创建专用应用账号
@@ -103,12 +110,53 @@ URL 复制。发布工作流会在每个 release 下创建 `models` 到稳定目
 # 或：./scripts/download-model.sh --variant full
 ```
 
-## 5. 发布与回滚
+## 5. 本地快速发布（日常通道）
 
-PR 和 `main` 推送先运行 `CI`。只有仓库自身 `main` 分支的 push 通过全部检查后才会触发
-生产发布；也可在受保护 Environment 下手动运行。
+GitHub Runner 在境外，把 12~15 MB 的 release 包 scp 到国内服务器是跨境传输，慢且不稳定。
+日常发布改走 [`scripts/deploy-local.sh`](../../scripts/deploy-local.sh)：在开发机上交叉编译
+Linux 二进制，直连服务器上传，服务端的切换与回滚逻辑和 Actions 完全一致。
+
+首次准备（各一次）：
+
+```bash
+ssh-copy-id -p 22 ubuntu@<DEPLOY_HOST>      # 安装开发机公钥，之后免密
+cat > server-login <<'EOF'                  # 仓库根目录，已被 .gitignore 忽略
+DEPLOY_HOST=ubuntu@<DEPLOY_HOST>
+DEPLOY_PORT=22
+EOF
+```
+
+工具链需要 `cargo-zigbuild`、`zig` 与 `x86_64-unknown-linux-gnu` 目标（`rustup target add
+x86_64-unknown-linux-gnu`）。注意本地交叉编译产出的二进制要满足服务端的架构断言
+（`ELF 64-bit LSB pie executable, x86-64`），脚本会在上传前先校验。
+
+```bash
+./scripts/deploy-local.sh                     # 编译 → 打包 → 上传 → 切换 → 等 readiness
+./scripts/deploy-local.sh --dry-run           # 只编译打包，不上传
+./scripts/deploy-local.sh --no-build          # 复用已有产物，最快
+./scripts/deploy-local.sh --password-auth     # 不装公钥，改为输一次服务器密码（连接复用）
+./scripts/deploy-local.sh --require-clean     # 工作区有未提交改动就拒绝发布
+./scripts/deploy-local.sh --install-service   # 单元/sudo 规则漂移时同步（要交互输入 sudo 密码）
+```
+
+约定与边界：
+
+- 发布包只有 `kovi-bot` 与 `REVISION`；`.env`、`bot.conf.toml`、`kovi.conf.toml`、
+  `kovi.plugin.toml` 由服务端从上一版 release 继承，并就地改写 `KOVI_DEPLOY_REVISION`，
+  所以开发机不需要保存任何生产密钥。
+- 因此本地发布**不会**应用 GitHub Secrets 的变化。改模型地址、白名单、Token 等配置时，
+  仍要用 Actions 手动发布一次，或直接改服务器上 `current` 里的配置。
+- 工作区有未提交改动时 revision 记为 `<sha>-dirty.<时间戳>`，这些改动会进二进制；要严格
+  对齐提交请先 commit 或加 `--require-clean`。
+- 继承来的配置缺少模板新增键时只打印提示，不会自动补，也不会覆盖服务器上已有的值。
+- systemd 单元或 sudo 规则与仓库不一致时只提示；加 `--install-service` 才会同步。
+
+## 6. 发布与回滚（GitHub Actions 兜底）
+
+PR 和 `main` 推送先运行 `CI`。`Deploy production` 不再随 CI 自动触发，只能在受保护
+Environment 下手动 dispatch，用于本机不可用时兜底，或需要按仓库 Secrets 重新生成生产配置。
 
 每次发布都会创建 `releases/<commit-sha>`，再原子切换 `current` 软链接。进程完成数据库
-初始化和事件注册后会将当前 SHA 写入 readiness 文件；工作流只有同时看到 systemd active
+初始化和事件注册后会将当前 SHA 写入 readiness 文件；发布通道只有同时看到 systemd active
 和匹配的 SHA 才判定成功。失败时会把二进制、配置和环境变量整体切回上一版。上传临时包
 总会清理，成功后最多保留最近五个 release（当前版与回滚目标不会被误删）。

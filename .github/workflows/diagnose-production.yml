@@ -74,7 +74,12 @@ jobs:
             "已接通" \
             "桥报告已挂断" \
             "从未进房" \
-            "无法读取桥状态"; do
+            "无法读取桥状态" \
+            "QQ 通话识别" \
+            "QQ 通话回复" \
+            "QQ 通话播报失败" \
+            "QQ 通话语音识别失败" \
+            "QQ 通话模型调用失败"; do
             count=$(grep -cF -- "$marker" "$log_file" 2>/dev/null || true)
             last=$(grep -F -- "$marker" "$log_file" 2>/dev/null | tail -n 1 | cut -d' ' -f1 || true)
             printf '%-22s %3s 次   最后: %s\n' "$marker" "${count:-0}" "${last:-—}"
@@ -82,7 +87,36 @@ jobs:
           echo "桥错误原文（去重、掩码、最多 3 条）:"
           grep -F -- "无法读取桥状态" "$log_file" 2>/dev/null \
             | sed -E 's/^.*无法读取桥状态: *//' | sort -u | head -n 3 | mask || true
+
+          echo
+          echo "=== 消息链路标记（最近 500 行，只统计次数与最后时间） ==="
+          for marker in \
+            "[HEALTH]" \
+            "[ERROR]" \
+            "[WARN]" \
+            "私聊入站流量已抑制" \
+            "TurnGate 门控" \
+            "Yunxi Core ingress" \
+            "私聊开始处理排队消息" \
+            "忽略私聊自发消息回流" \
+            "群聊未授权命令已静默" \
+            "私聊未授权命令已静默"; do
+            count=$(grep -cF -- "$marker" "$log_file" 2>/dev/null || true)
+            last=$(grep -F -- "$marker" "$log_file" 2>/dev/null | tail -n 1 | cut -d' ' -f1 || true)
+            printf '%-24s %3s 次   最后: %s\n' "$marker" "${count:-0}" "${last:-—}"
+          done
+          echo "最近 5 条 ERROR/WARN 的标签（只保留标记本身，掩码、去内容）:"
+          grep -E '^[^ ]+ \[(ERROR|WARN)\]' "$log_file" 2>/dev/null | tail -n 5 \
+            | sed -E 's/^[^ ]+ //' | sed -E 's/:.*$//' | mask || true
           rm -f "$log_file"
+
+          echo
+          echo "=== 通话会话进程（有 parec/pacat 说明机器人认为通话仍在进行） ==="
+          pgrep -af "parec|pacat" | sed -E 's/--client-name=([a-z-]+).*/--client-name=\1/' | mask || echo "(没有采集/播放进程)"
+          printf 'kovi-bot 重启次数(NRestarts): '
+          systemctl show kovi-bot.service -p NRestarts --value 2>/dev/null || echo "(未知)"
+          printf 'ready 文件: '
+          cat /home/ubuntu/kovi-bot/runtime/ready 2>/dev/null | mask || echo "(不存在)"
 
           echo
           echo "=== 桥控制接口（脱敏） ==="
@@ -159,19 +193,14 @@ jobs:
             | grep -iE "plugin|whitelist|avsdk|pepper|loader|hook" | tail -n 15 | mask || true
 
           echo
-          echo "=== 桥自检 ==="
-          for candidate in \
-            /home/ubuntu/napcat-qq-call/bridge/scripts/doctor.sh \
-            /app/qq-call/bridge/scripts/doctor.sh; do
-            if [ -x "$candidate" ]; then
-              echo "(宿主路径: $candidate)"
-              "$candidate" 2>&1 | tail -n 30 | mask
-              break
-            fi
-          done
-          docker exec napcat sh -lc \
-            'test -x /app/qq-call/bridge/scripts/doctor.sh && /app/qq-call/bridge/scripts/doctor.sh' \
-            2>&1 | tail -n 30 | mask || true
+          echo "=== 桥自检（必须在容器内跑；宿主路径上必然缺 QQ 文件，不作为结论） ==="
+          if docker exec napcat sh -lc 'test -x /app/qq-call/bridge/scripts/doctor.sh'; then
+            docker exec napcat sh -lc '/app/qq-call/bridge/scripts/doctor.sh' 2>&1 | tail -n 30 | mask || true
+          elif [ -x /app/qq-call/bridge/scripts/doctor.sh ]; then
+            /app/qq-call/bridge/scripts/doctor.sh 2>&1 | tail -n 30 | mask || true
+          else
+            echo "(容器内找不到 doctor.sh)"
+          fi
 
           echo
           echo "=== 本机语音服务 ==="
