@@ -96,6 +96,15 @@ pub struct CallState {
     /// 当成未知来电，按不在名单处理并婉拒（等于自己打给自己又拒接）。
     #[serde(rename = "dialedUin")]
     pub dialed_uin: Option<i64>,
+    /// 外呼前 AVSDK 回报"对方是否在线"的时间戳（有值＝外呼真的走出去了）。
+    ///
+    /// 真机验证：收到这个回执之后手机就会响；而且**呼出的通话不会让桥进入
+    /// ringing/connected**，所以判断外呼成败必须看它，不能看阶段。
+    #[serde(rename = "dialReachedAt")]
+    pub dial_reached_at: Option<String>,
+    /// 上面那次回执里对方的在线状态。
+    #[serde(rename = "dialPeerOnline")]
+    pub dial_peer_online: Option<bool>,
 }
 
 impl CallState {
@@ -298,6 +307,17 @@ mod tests {
 
         state.caller_uin = Some("not-a-number".to_string());
         assert_eq!(state.caller(), None);
+    }
+
+    #[test]
+    fn call_state_reads_dial_receipt() {
+        let state: CallState = serde_json::from_str(
+            r#"{"dialedUin":3052405886,"dialReachedAt":"2026-09-12T03:01:40Z","dialPeerOnline":true}"#,
+        )
+        .expect("dial receipt");
+        assert_eq!(state.dialed_uin, Some(3052405886));
+        assert!(state.dial_reached_at.is_some());
+        assert_eq!(state.dial_peer_online, Some(true));
     }
 
     #[test]

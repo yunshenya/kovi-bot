@@ -34,11 +34,15 @@ PLUGIN_CANDIDATES = [
 ]
 
 MARKERS = {
-    "idle": "kovi-dial-idle-v4",
-    "funcs": "kovi-dial-funcs-v4",
-    "route": "kovi-dial-route-v4",
+    "idle": "kovi-dial-idle-v5",
+    "funcs": "kovi-dial-funcs-v5",
+    "route": "kovi-dial-route-v5",
+    "case": "kovi-dial-20021-v5",
 }
 LEGACY = (
+    "kovi-dial-idle-v4",
+    "kovi-dial-funcs-v4",
+    "kovi-dial-route-v4",
     "kovi-dial-v2",
     "kovi-dial-idle-v2",
     "kovi-dial-funcs-v2",
@@ -51,13 +55,13 @@ LEGACY = (
 IDLE_ANCHOR = '''  return {
     phase: "idle",
 '''
-IDLE_ADD = '''    // kovi-dial-idle-v4
+IDLE_ADD = '''    // kovi-dial-idle-v5
     dialTarget: null,
     dialedUin: null,
     dialedAt: null,
 '''
 
-DIAL_FUNCS = '''// kovi-dial-funcs-v4
+DIAL_FUNCS = '''// kovi-dial-funcs-v5
 /// 把 QQ 号解析成 AVSDK 的 uid（外呼要的是 uid，不是 QQ 号）。
 async function resolveUidFromUin(uin) {
   const service = kernelSession?.getUixConvertService?.();
@@ -101,9 +105,28 @@ async function dialCall(body) {
   if (body?.startEngine === true) {
     await invokeAVHost(20, []);
   }
-  const mode = typeof body?.mode === "string" && body.mode ? body.mode : "uid";
+  const mode = typeof body?.mode === "string" && body.mode ? body.mode : "json";
   let params;
-  if (mode === "uin") params = [String(uin)];
+  if (mode === "json") {
+    // 定标结果（2026-09-12 真机响铃验证）：StartCall 的参数必须是 JSON，字段名取自
+    // QQ 自己的 JS↔原生绑定属性表；invite_uids 必须非空，否则 .so 里直接
+    // "GetRoomId skip: invite_uids empty" 跳过、不拨号。传裸 uid 会被回
+    // [3,"json parse error"]。
+    const payload = {
+      scene: 1,
+      relation_id: uin,
+      business_type: 1,
+      sub_business_type: 1,
+      invite_count: 1,
+      invite_uids: [uid],
+      invite_reason: 0,
+      invite_original: 0,
+      audio_scene: 1,
+      use_ntrtc_dsp: false,
+      self_uid: String(pluginContext?.core?.selfInfo?.uid ?? ""),
+    };
+    params = [JSON.stringify(payload)];
+  } else if (mode === "uin") params = [String(uin)];
   else if (mode === "uinTypeUid") params = [uinType, uid];
   else if (mode === "uinTypeUin") params = [uinType, String(uin)];
   else params = [uid];
@@ -123,8 +146,23 @@ async function dialCall(body) {
 
 '''
 
+CASE_ANCHOR = "  } else if (command === 5) {\n"
+CASE_ADD = """  } else if (command === 20021) {
+    // kovi-dial-20021-v5：外呼前的"对方是否在线"回执。真机验证：收到它之后手机就会
+    // 响，所以记进状态供机器人确认——呼出的通话不会让桥进入 ringing/connected，
+    // 光看阶段会把成功误判成失败。
+    try {
+      const raw = Array.isArray(value) ? value[0] : value;
+      const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
+      state.call.dialPeerOnline = parsed?.is_peer_online === true;
+      state.call.dialReachedAt = new Date().toISOString();
+    } catch {
+      state.call.dialPeerOnline = null;
+    }
+"""
+
 ROUTE_ANCHOR = '    if (req.method === "POST" && url.pathname === "/v1/avsdk/output") {\n'
-ROUTE_ADD = '''    // kovi-dial-route-v4
+ROUTE_ADD = '''    // kovi-dial-route-v5
     if (req.method === "POST" && url.pathname === "/v1/calls/dial") {
       try {
         const data = await dialCall(await readJsonBody(req));
@@ -144,6 +182,7 @@ EXPECTED_ONCE = (
     "async function dialCall(",
     "async function resolveUidFromUin(",
     'url.pathname === "/v1/calls/dial"',
+    "command === 20021",
 )
 # 其它补丁的片段：只允许"没有或一次"（离线单测时本来就可能还没打别的补丁），
 # 但只要出现两次就说明有补丁互相踩了，必须拦下。
@@ -188,7 +227,10 @@ def main() -> int:
         text, "async function startControlServer() {", DIAL_FUNCS, "uin→uid 解析与外呼实现", MARKERS["funcs"], True
     )
     text, changed_route = insert(text, ROUTE_ANCHOR, ROUTE_ADD, "dial route", MARKERS["route"], True)
-    if not (changed_idle or changed_funcs or changed_route):
+    text, changed_case = insert(
+        text, CASE_ANCHOR, CASE_ADD, "20021 回执处理", MARKERS["case"], True
+    )
+    if not (changed_idle or changed_funcs or changed_route or changed_case):
         print("[skip] 外呼补丁已是最新")
         return 0
 

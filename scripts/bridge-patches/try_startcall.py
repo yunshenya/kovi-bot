@@ -34,15 +34,31 @@ PEER_UID = "u_unYSNENqearg-TQ0pxSDPg"   # 小猫 3052405886
 PEER_UIN = 3052405886
 
 CANDIDATES = [
-    {"relation_id": PEER_UIN, "self_uid": SELF_UID, "invite_count": 1,
-     "invite_uids": [PEER_UID], "sub_business_type": 1, "invite_reason": 0,
-     "invite_original": 0, "use_ntrtc_dsp": False},
-    {"relation_id": 0, "self_uid": SELF_UID, "invite_count": 1,
-     "invite_uids": [PEER_UID], "sub_business_type": 1, "invite_reason": 0,
-     "invite_original": 0, "audio_scene": 1, "use_ntrtc_dsp": False},
-    {"relation_id": PEER_UIN, "self_uid": SELF_UID, "invite_count": 1,
-     "invite_uids": PEER_UID, "sub_business_type": 1, "invite_reason": 1,
-     "invite_original": 1, "audio_scene": 1},
+    # 1) 全套字段（JS 绑定里的名字），invite_uids 用数组
+    {"scene": 1, "relation_id": PEER_UIN, "sub_business_type": 1, "invite_count": 1,
+     "invite_uids": [PEER_UID], "invite_reason": 0, "invite_original": 0,
+     "audio_scene": 1, "use_ntrtc_dsp": False, "self_uid": SELF_UID},
+    # 2) invite_uids 用逗号串（.so 里的日志是按串打印的）
+    {"scene": 1, "relation_id": PEER_UIN, "sub_business_type": 1, "invite_count": 1,
+     "invite_uids": PEER_UID, "invite_reason": 0, "invite_original": 0,
+     "audio_scene": 1, "use_ntrtc_dsp": False, "self_uid": SELF_UID},
+    # 3) relation_id 置 0（也许由 invite_uids 决定关系）
+    {"scene": 1, "relation_id": 0, "sub_business_type": 1, "invite_count": 1,
+     "invite_uids": [PEER_UID], "invite_reason": 0, "invite_original": 0,
+     "audio_scene": 1, "use_ntrtc_dsp": False, "self_uid": SELF_UID},
+    # 4) wrapper 日志里叫 business_type，两种都带上
+    {"scene": 1, "relation_id": PEER_UIN, "business_type": 1, "sub_business_type": 1,
+     "invite_count": 1, "invite_uids": [PEER_UID], "invite_reason": 0,
+     "invite_original": 0, "audio_scene": 1, "use_ntrtc_dsp": False, "self_uid": SELF_UID},
+    # 5) 补上两个扩展参数（空对象）
+    {"scene": 1, "relation_id": PEER_UIN, "sub_business_type": 1, "invite_count": 1,
+     "invite_uids": [PEER_UID], "invite_reason": 0, "invite_original": 0,
+     "audio_scene": 1, "use_ntrtc_dsp": False, "self_uid": SELF_UID,
+     "c2c_extend_params": {}, "opensdk_enter_room_params": {}},
+    # 6) scene/audio_scene 取 0
+    {"scene": 0, "relation_id": PEER_UIN, "sub_business_type": 1, "invite_count": 1,
+     "invite_uids": [PEER_UID], "invite_reason": 0, "invite_original": 0,
+     "audio_scene": 0, "use_ntrtc_dsp": False, "self_uid": SELF_UID},
 ]
 
 

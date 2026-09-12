@@ -67,17 +67,18 @@ pub(crate) async fn request_outgoing_call(bot: &kovi::RuntimeBot, requester: i64
     if let Err(error) = client.dial(requester).await {
         return format!("打不出去：{error}");
     }
-    // 确认电话真的响起来了：桥受理 ≠ AVSDK 真的拨号。给它几秒钟。
+    // 确认电话真的拨出去了：桥受理 ≠ AVSDK 真的拨号。判据是插件记下的外呼回执
+    // （AVSDK 回报"对方是否在线"），因为呼出的通话不会让桥进入 ringing/connected。
     let deadline = std::time::Instant::now() + DIAL_CONFIRM_WINDOW;
     while std::time::Instant::now() < deadline {
         kovi::tokio::time::sleep(Duration::from_millis(400)).await;
         if let Ok(state) = client.current_call().await
-            && state.phase().is_live()
+            && (state.phase().is_live() || state.dial_reached_at.is_some())
         {
             return "好，我打给你啦，接一下～".to_string();
         }
     }
-    "我让桥拨了，但它没能拨出去（AVSDK 把外呼命令丢了），这个我还在查。".to_string()
+    "我让桥拨了，但没等到 AVSDK 的回执，多半是没拨出去——这个我还在查。".to_string()
 }
 
 /// 启动 QQ 语音通话调度器。默认关闭，未启用时立即返回。
