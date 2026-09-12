@@ -12,6 +12,8 @@ Environment=PYTHONUNBUFFERED=1
 ExecStart=/home/ubuntu/yunxi-embed/.venv/bin/python /home/ubuntu/yunxi-embed/service.py \
     --model /home/ubuntu/yunxi-embed/models/onnx/model_quantized.onnx \
     --tokenizer /home/ubuntu/yunxi-embed/models/tokenizer.json \
+    --reranker-model /home/ubuntu/yunxi-embed/models-reranker/onnx/model_quantized.onnx \
+    --reranker-tokenizer /home/ubuntu/yunxi-embed/models-reranker/tokenizer.json \
     --host 127.0.0.1 \
     --port 6112
 

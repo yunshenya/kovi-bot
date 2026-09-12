@@ -2692,7 +2692,46 @@ impl MemoryManager {
             }
         }
         ordered.extend(by_id.into_values());
-        ordered
+        self.rerank_if_enabled(&client, &query_text, ordered).await
+    }
+
+    /// 用交叉编码器对融合后的候选重排；关掉配置或重排失败就保持融合顺序。
+    ///
+    /// 只重排前 `embedding_rerank_top_n` 条：重排是两段文本一起过模型，成本随候选数
+    /// 线性涨，而它要解决的只是"头部这几条谁更相关"。排在后面的候选不动。
+    async fn rerank_if_enabled(
+        &self,
+        client: &EmbeddingClient,
+        query_text: &str,
+        ordered: Vec<MemoryEntry>,
+    ) -> Vec<MemoryEntry> {
+        let config = crate::config::get().memory().clone();
+        if !config.embedding_rerank_enabled() || ordered.len() < 2 || query_text.trim().is_empty() {
+            return ordered;
+        }
+        let top_n = config.embedding_rerank_top_n().min(ordered.len());
+        let documents: Vec<String> = ordered[..top_n]
+            .iter()
+            .map(|entry| entry.content.clone())
+            .collect();
+        let ranked = match client.rerank(query_text, &documents).await {
+            Ok(ranked) => ranked,
+            Err(error) => {
+                // 重排是加分项，不是必需项：失败就保持融合顺序，绝不因此让检索失败。
+                eprintln!("[WARN] 记忆重排不可用，保持融合顺序: {error}");
+                return ordered;
+            }
+        };
+        let mut entries: Vec<Option<MemoryEntry>> = ordered.into_iter().map(Some).collect();
+        let mut reranked = Vec::with_capacity(entries.len());
+        for index in ranked {
+            if let Some(entry) = entries.get_mut(index).and_then(Option::take) {
+                reranked.push(entry);
+            }
+        }
+        // 没被重排的尾部按原顺序接上。
+        reranked.extend(entries.into_iter().flatten());
+        reranked
     }
 
     /// 回填缺失的记忆向量。后台维护调用，一次最多 `embedding_backfill_batch` 条，

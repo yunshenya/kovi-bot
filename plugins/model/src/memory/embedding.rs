@@ -117,6 +117,62 @@ impl EmbeddingClient {
     }
 }
 
+impl EmbeddingClient {
+    /// 交叉编码重排：把 (查询, 文档) 成对送进模型打分，返回**按分数降序的原始下标**。
+    ///
+    /// 与嵌入的区别：嵌入是各编各的再算距离，重排是两段文本一起过模型，所以更准也更慢。
+    /// 实测它纠正过嵌入的真实错误：查询"我喜欢安静的地方"时，嵌入把"她喜欢看书"排在
+    /// 真正相关的"他讨厌吵闹的环境"前面——因为共用了一个"喜欢"。重排的分数也分得开
+    /// 得多（0.276 / 0.041 / 0.0002，而余弦挤在 0.36–0.52）。
+    pub(crate) async fn rerank(&self, query: &str, documents: &[String]) -> Result<Vec<usize>> {
+        if documents.is_empty() {
+            return Ok(Vec::new());
+        }
+        let prepared: Vec<String> = documents
+            .iter()
+            .map(|text| text.chars().take(MAX_CHARS).collect())
+            .collect();
+        let body = json!({"query": query, "documents": prepared});
+        let response = EMBED_CLIENT
+            .post(format!("{}/v1/rerank", self.endpoint))
+            .timeout(self.timeout)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|error| anyhow!("重排服务请求失败: {error}"))?;
+        if !response.status().is_success() {
+            return Err(anyhow!("重排服务返回 {}", response.status()));
+        }
+        let payload: Value = response
+            .json()
+            .await
+            .map_err(|error| anyhow!("重排响应无法解析: {error}"))?;
+        let results = payload
+            .get("results")
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow!("重排响应缺少 results"))?;
+        let mut ranked = Vec::with_capacity(results.len());
+        for item in results {
+            let index = item
+                .get("index")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| anyhow!("重排结果缺少 index"))? as usize;
+            if index < documents.len() {
+                ranked.push(index);
+            }
+        }
+        if ranked.len() != documents.len() {
+            // 少一条就意味着有文档没被打分——宁可整批不信，也不要按半份结果重排。
+            return Err(anyhow!(
+                "重排只返回了 {} 条，请求了 {} 篇",
+                ranked.len(),
+                documents.len()
+            ));
+        }
+        Ok(ranked)
+    }
+}
+
 /// 余弦相似度。服务端已做 L2 归一化，所以这里其实就是点积——但仍然做完整计算，
 /// 免得哪天换了不做归一化的模型就悄悄算错。
 pub(crate) fn cosine(left: &[f32], right: &[f32]) -> f32 {

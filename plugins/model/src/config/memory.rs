@@ -13,6 +13,10 @@ pub struct MemoryConfig {
     embedding_timeout_secs: u64,
     /// 一轮维护最多回填多少条记忆的向量（避免维护任务卡住）。
     embedding_backfill_batch: usize,
+    /// 是否用交叉编码器对融合后的候选重排（默认开）。关掉即只用融合顺序。
+    embedding_rerank_enabled: bool,
+    /// 最多重排几条候选。重排是两段文本一起过模型，只该用在已经筛出来的少量候选上。
+    embedding_rerank_top_n: usize,
     /// 语义那一路的最低相似度（千分比，默认 450 ≈ 0.45）。
     ///
     /// **这条阈值是必须的，不是调优**：语义检索总会返回 top-K，而 BGE 的分数是压缩的
@@ -81,6 +85,14 @@ impl MemoryConfig {
 
     pub fn embedding_backfill_batch(&self) -> usize {
         self.embedding_backfill_batch.max(1)
+    }
+
+    pub fn embedding_rerank_enabled(&self) -> bool {
+        self.embedding_rerank_enabled
+    }
+
+    pub fn embedding_rerank_top_n(&self) -> usize {
+        self.embedding_rerank_top_n.clamp(1, 32)
     }
 
     pub fn embedding_min_similarity(&self) -> f32 {
@@ -261,6 +273,8 @@ impl Default for MemoryConfig {
             embedding_timeout_secs: 20,
             embedding_backfill_batch: 128,
             embedding_min_similarity_millis: 450,
+            embedding_rerank_enabled: true,
+            embedding_rerank_top_n: 12,
             max_entries: 50_000,
             retention_days: 30,
             episode_retention_days: 365,
