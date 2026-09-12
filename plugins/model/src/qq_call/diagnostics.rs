@@ -62,6 +62,21 @@ pub(super) fn caller_label(caller: Option<i64>, caller_name: Option<&str>) -> St
     }
 }
 
+/// 这通通话在日志里叫什么：外呼和来电是两回事，不能共用一套措辞。
+///
+/// 外呼根本没有"来电者"，硬套 [`caller_label`] 会印出"未能解析来电者 QQ 号"。
+/// 真机排错时这句话把人往"来电侧解析失败"的方向带偏过，所以按方向分开命名。
+pub(super) fn call_label(
+    dialed_uin: Option<i64>,
+    caller: Option<i64>,
+    caller_name: Option<&str>,
+) -> String {
+    match dialed_uin {
+        Some(uin) => format!("我方外呼（被叫 {uin}）"),
+        None => caller_label(caller, caller_name),
+    }
+}
+
 /// 记录"桥上报了一次进行中的通话"。每次新来电只调用一次。
 pub(super) fn begin_call(caller: Option<i64>, caller_name: Option<&str>, allowed: bool) {
     let trace = CallTrace {
@@ -281,7 +296,7 @@ mod tests {
         assert!(!unknown.contains("3052405886"), "{unknown}");
     }
 
-    use super::{CallTrace, caller_label, phase_description, render_last_call};
+    use super::{CallTrace, call_label, caller_label, phase_description, render_last_call};
     use crate::qq_call::bridge::CallPhase;
     use chrono::Local;
     use std::time::Duration;
@@ -291,6 +306,17 @@ mod tests {
         assert_eq!(caller_label(Some(10001), Some(" 朋友 ")), "朋友(10001)");
         assert_eq!(caller_label(Some(10001), None), "10001");
         assert_eq!(caller_label(None, Some("朋友")), "未能解析来电者 QQ 号");
+    }
+
+    #[test]
+    fn an_outgoing_call_is_never_labelled_as_an_incoming_caller() {
+        assert_eq!(
+            call_label(Some(3052405886), None, None),
+            "我方外呼（被叫 3052405886）"
+        );
+        // 外呼标签不受来电字段影响；反过来没有外呼目标时仍旧走来电者文案。
+        assert_eq!(call_label(None, None, None), "未能解析来电者 QQ 号");
+        assert_eq!(call_label(None, Some(10001), Some("朋友")), "朋友(10001)");
     }
 
     #[test]

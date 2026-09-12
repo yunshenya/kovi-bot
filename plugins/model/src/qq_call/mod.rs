@@ -244,7 +244,7 @@ async fn report_phase_change(
 ) {
     let caller = state.caller();
     let caller_name = state.caller_name.as_deref();
-    let label = caller_label(caller, caller_name);
+    let label = diagnostics::call_label(state.dialed_uin, caller, caller_name);
     // 先取"这通有没有进过房"：下面 note_call_ended / begin_call 会把它清掉。
     let connected = diagnostics::last_call_connected();
 
@@ -280,8 +280,20 @@ async fn report_phase_change(
             println!("[INFO] QQ 语音通话正在挂断: {label}（桥已受理挂断请求，等待房间销毁）")
         }
         CallPhase::Ended => {
-            println!("[INFO] QQ 语音通话桥报告已挂断: {label}");
-            diagnostics::note_call_ended("桥报告已挂断");
+            match state.dialed_uin {
+                Some(_) => {
+                    // 呼出的通话不会让桥进入 ringing/connected，所以走到 ended 是正常收尾，
+                    // 不是"来电没接住"。
+                    println!(
+                        "[INFO] QQ 语音通话外呼已收尾: {label}（呼出的通话不进振铃/进房，属正常）"
+                    );
+                    diagnostics::note_call_ended("外呼收尾");
+                }
+                None => {
+                    println!("[INFO] QQ 语音通话桥报告已挂断: {label}");
+                    diagnostics::note_call_ended("桥报告已挂断");
+                }
+            }
             if is_missed_call(previous, connected) {
                 notify_missed_call(bot, config, state, previous).await;
             }

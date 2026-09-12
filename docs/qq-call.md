@@ -237,9 +237,11 @@ MAIBOT_QQ_CALL_BOT_UIN="<机器人QQ号>" \
 - **只支持 Linux。** 桥依赖 Linux QQ 自带的 `libAVSDKPlugin.so` 与 PulseAudio。
 - **QQ 或 NapCat 升级会覆盖 Loader。** 升级后必须重新运行
   `scripts/install-qq-call.sh --apply` 与 `doctor.sh`，并用测试账号复验一次来电。
-- **不能主动打电话**（`StartCall` 有 cmd 4，但没有可用参数），**可以主动挂断**
-  （cmd 8 = `Quit`，见下）：对方要求挂断、名单外婉拒、通话到点、采集中断时，
-  机器人会请桥真的挂断这通电话。
+- **可以主动挂断，也可以主动外呼**（均已于 2026-09-12 真机验证）。
+  - 主动挂断用 `Close`（cmd 10；早前试过的 `Quit`/cmd 8 挂不断）：对方要求挂断、
+    名单外婉拒、通话到点、采集中断时，机器人会请桥真的挂断这通电话；
+  - 主动外呼用 `StartCall`（cmd 4）+ JSON payload，私聊 `#打给我` 触发，
+    见「外呼（她主动打给我）」一节。
 - **通话没有接入 World Model / Mind 的实时状态**，只复用私聊人设、记忆和模型。
   电话里的情绪与情境暂时不会回流到核心的其它子系统。
 - 白名单外默认仍是"接通后婉拒"（可选改成"不接"，见上面的安全一节）。
@@ -342,13 +344,26 @@ MAIBOT_QQ_CALL_BOT_UIN="<机器人QQ号>" \
   （等来电接通 → 用指定变体挂断 → 8 秒内没结束就自动用已知可用参数兜底，不会把对方
   悬在静音通话里）。
 
-### 外呼（她主动打给我）现状 —— 2026-09-12
+### 外呼（她主动打给我）—— 已真机验证 2026-09-12
 
-机器人侧已完成并真机验证：私聊发 `#打给我` → `POST /v1/calls/dial` → 6 秒内确认"电话到底
-有没有响"，打不出去就如实回复；呼出的通话用桥的 `dialedUin` 认领对端，不会把被叫当成
-未知来电婉拒。
+私聊发 `#打给我`（别名 `#打电话给我`）→ `POST /v1/calls/dial` → 桥把 QQ 号解析成 AVSDK
+uid → cmd 4 `StartCall` 带 JSON payload。**真机结果：手机正常响铃，通话可用。**
 
-AVSDK 侧已查清到"差最后一步"：
+判定成败**只看 AVSDK 回执，不能看阶段**：
+
+- 拨出去后 AVSDK 回 `20021`，内容形如
+  `{"is_peer_online":true,"is_pc_online":false,"is_phone_online":true,...}`；
+  收到它就说明邀请真的发出去了（真机上手机随即响铃，Rust 侧 6 秒窗口内拿到，实测不到 1 秒）；
+- **呼出的通话不会让桥进入 `ringing` / `connected`**：`state.call` 会一直是
+  `idle`，然后直接跳到 `ended`，`peer` 始终是 `null`。所以"阶段没变成 ringing"
+  不等于失败，按阶段判会误报；被叫存在 `state.call.dialedUin` 里。
+- 收到回执后机器人回「好，我打给你啦，接一下～」；6 秒内没回执则回
+  「我让桥拨了，但没等到 AVSDK 的回执，多半是没拨出去——这个我还在查。」，
+  不会假装成功。
+- 呼出的通话用桥的 `dialedUin` 认领对端，不会把被叫当成未知来电婉拒；日志里也按
+  "我方外呼（被叫 N）"命名，不会印成"未能解析来电者 QQ 号"。
+
+定标过程中查清的关键事实：
 
 - `StartCall`（cmd 4）的字符串参数**必须是 JSON**：传裸 uid 会被回 `[3,"json parse error"]`；
 - JSON 字段名取自 QQ 自己的 JS↔原生绑定属性表（在 `/opt/QQ/resources/app/major.node` 里）：
@@ -359,10 +374,15 @@ AVSDK 侧已查清到"差最后一步"：
   为空就直接跳过、不拨号（之前所有尝试都命中这条）；
 - **手工 JSON 有几率把插件打成 segfault**（Bugly `signo: 11`），所以每次尝试之间要重启
   AV Host；命令回复内容读 `lastRawValuePreview`（别信那个块缓冲日志）；
-- 定标工具：`try_startcall.py`（自动重启 → 探活 → 发送 → 守卫式读回复）。
+- 定标工具：`try_startcall.py`（自动重启 → 探活 → 发送 → 守卫式读回复），
+  最终验证通过的参数组合已固化进 `patch-plugin-dial.py` v5。
+- 取证套路：AV Host 的 `/v1/status`（6111，带 token）里有 `invocationCount` /
+  `lastInvocationCommand` / `lastRawCommand` / `lastRawValuePreview`，是真·实时读数；
+  桥的 `/v1/status`（6110）里有 `eventCount` 与 `call.dialedUin`。两者定时轮询就能
+  在事后逐秒复盘一次外呼，不必依赖块缓冲日志。
 
-下一步：把 `invite_uids` / `sub_business_type` / `audio_scene` 的类型与取值试对，
-直到桥的阶段变成 `ringing`。
+下一步（可选）：外呼没有"对方拒接/无人接听"的回执分支，桥侧一律是 `ended`，
+所以暂时无法区分"没人接"和"接通后挂断"。
 
 **已落地的机制**（2026-09-12 凌晨）：
 
@@ -631,7 +651,7 @@ AVSDK 回传的全部命令第一次变得可见：
 | `patch-ignore-20050.py` | **根因修复**：`20050`/`120043` 不再触发重登 |
 | `patch-plugin-login-refresh.py` | **登录自愈**：AV Host 进程重启后拿不到登录参数（上游只在插件启动时投一次），插件空闲时每 60 秒补投一次，结果见 `/v1/status` 的 `avHost.loginRefreshCount` |
 | `patch-plugin-caller-allowlist.py` | **接听授权**：接听前读 `runtime/allowed-callers.json`（`enabled != true` 时保持上游"谁打进来都接"），并把来电者写进状态 |
-| `patch-plugin-dial.py` | **主动外呼通道**：插件新增 `POST /v1/calls/dial`（QQ 号 → AVSDK uid，再用 cmd 4 `StartCall`），并把目标记进 `state.call.dialed*`。参数形态仍在定标（`mode` 开关），AV Host 白名单里的 `4`/`20` 由 hangup 补丁统一归一化 |
+| `patch-plugin-dial.py` | **主动外呼通道（v5，已真机验证）**：插件新增 `POST /v1/calls/dial`（QQ 号 → AVSDK uid，再用 cmd 4 `StartCall` 带 JSON payload），把目标记进 `state.call.dialed*`，并把 AVSDK 的 `20021` 回执翻译成 `dialReachedAt` / `dialPeerOnline`。AV Host 白名单里的 `4`/`20` 由 hangup 补丁统一归一化 |
 | `patch-avhost-raw-preview.py` | 在 AV Host 里记录"插件最近一条原始消息"的截断预览（`lastRawCommand` / `lastRawValuePreview`，仅本地 token 可见）。AV Host 的日志是块缓冲的、看不到最新内容，这个字段是实时的——定标外呼时正是靠它读出 `[3,"json parse error"]` |
 | `patch-plugin-avsdk-trace.py` | **AVSDK 输出追踪**：把最近 20 条非心跳输出记进 `state.avHost.outputTrail`（命令号 + 类型/长度摘要），用来定位"来电时 AV Host 到底回报了什么" |
 | `patch-plugin-accept-retry.py` | **来电回调重投**：邀请 payload 转给 AV Host 的 AVSDK 后等 `20006`，按 1.5 → 3 → 6 秒退避重投（共 3 次投递，覆盖约 10 秒铃声窗口）；彻底失败时打一条带**诊断快照**的 WARN（阶段、inviteAt、callerUin、重试次数、直方图、输出轨迹、监听事件），计数见 `avHost.acceptRetryCount` / `acceptRetryGaveUp`。背景：真机对照发现 `20006` 偶尔不来，此时电话会一直响到对方放弃 |
