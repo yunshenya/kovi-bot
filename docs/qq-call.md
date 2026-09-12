@@ -606,7 +606,7 @@ AVSDK 回传的全部命令第一次变得可见：
 | `patch-ignore-20050.py` | **根因修复**：`20050`/`120043` 不再触发重登 |
 | `patch-plugin-login-refresh.py` | **登录自愈**：AV Host 进程重启后拿不到登录参数（上游只在插件启动时投一次），插件空闲时每 60 秒补投一次，结果见 `/v1/status` 的 `avHost.loginRefreshCount` |
 | `patch-plugin-caller-allowlist.py` | **接听授权**：接听前读 `runtime/allowed-callers.json`（`enabled != true` 时保持上游"谁打进来都接"），并把来电者写进状态 |
-| `patch-plugin-hangup.py` | **主动挂断**：AV Host 的 cmd 白名单加入 8/9/10/11（`Quit`/`Reject`/`Close`/`ClearRoom`），`invokeAVHost` 返回响应体，并新增 `POST /v1/calls/hangup`；见上面的"主动挂断"一节 |
+| `patch-plugin-hangup.py` | **主动挂断**：AV Host 的 cmd 白名单只加入 `10`（`Close`，唯一实测有效的方法），`invokeAVHost` 返回响应体，并新增 `POST /v1/calls/hangup`；见上面的"主动挂断"一节。写法是归一化（正则改写整行），能收敛上游原版与实验期间的各种历史状态 |
 
 已验证的插件整份备份在
 `/root/napcat/plugins/napcat-plugin-maibot-qq-voice-call/index.mjs.kovi-verified`。
