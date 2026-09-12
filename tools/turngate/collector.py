@@ -28,6 +28,7 @@ import re
 import sys
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 SCHEMA_VERSION = 2
 FRAGMENT_GAP_SECS = 3.0
@@ -55,13 +56,34 @@ def parse_ts(raw: str) -> datetime:
     # 日志自带的年份前缀 2 位数字在现代 locale 中解析有歧义,固定按主题年。
     return datetime.strptime(raw, "%m-%d %H:%M:%S").replace(year=2026)
 
-def parse_syslog_ts(line: str) -> datetime:
-    # "Sep 06 00:46:50 host kovi-bot[pid]: ..." -> 当年对应时刻。
-    month_map = {m: i for i, m in enumerate(
-        "Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split(), start=1)}
+# journalctl -o short-iso: "2026-09-06T12:46:37+08:00 host kovi-bot[pid]: ..."
+ISO_TS_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})")
+
+def parse_syslog_ts(line: str) -> Optional[datetime]:
+    """从 `[send]` 行提取时间。
+
+    `[send]` 行**没有**内层时间戳，时间只能来自 journalctl 前缀，因此导出格式
+    必须是带时间戳的那种：
+      - `-o short-iso`: "2026-09-06T12:46:37+08:00 host kovi-bot[pid]: [send] ..."
+      - `-o short`:     "Sep 06 12:46:37 host kovi-bot[pid]: [send] ..."
+
+    以前这里对两种前缀都不匹配时静默返回 `datetime.now()`，而 README 里的示例
+    命令恰好是 `-o cat`（**完全没有** syslog 前缀），于是所有 `[send]` 都被记成
+    "现在"：assistant turns 与 conversation_active 全为 0，采出来的批次缺失
+    机器人上下文却看不出任何异常。现在拿不到时间就返回 None，由调用方记账并在
+    结束时报警，而不是悄悄产出一批废样本。
+    """
+    m = ISO_TS_RE.match(line)
+    if m:
+        year, month, day, hour, minute, second = (int(g) for g in m.groups())
+        return datetime(year, month, day, hour, minute, second)
     m = re.match(r"^(\S+) (\d{2}) (\d{2}):(\d{2}):(\d{2})", line)
     if not m:
-        return datetime.now()
+        return None
+    month_map = {m: i for i, m in enumerate(
+        "Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split(), start=1)}
+    if m.group(1) not in month_map:
+        return None
     return datetime(2026, month_map[m.group(1)], int(m.group(2)),
                     int(m.group(3)), int(m.group(4)), int(m.group(5)))
 
@@ -127,6 +149,7 @@ def main() -> int:
 
     events = []  # (ts, kind, group, user, text)
     last = None
+    untimed_sends = 0
     with open(args.journal, encoding="utf-8", errors="replace") as fh:
         for raw in fh:
             line = raw.rstrip("\n")
@@ -139,6 +162,11 @@ def main() -> int:
             m = SEND_RE.search(line)
             if m:
                 ts = parse_syslog_ts(line)
+                if ts is None:
+                    # 导出格式没有时间戳（典型：journalctl -o cat）。这些行是
+                    # 机器人上下文，丢了就只剩半张样本，必须显式记账。
+                    untimed_sends += 1
+                    continue
                 events.append(("bot", int(m.group(1)), None, m.group(2), ts))
                 last = ("bot", int(m.group(1)), None, ts)
                 continue
@@ -156,6 +184,11 @@ def main() -> int:
     if not events:
         print("no parseable events", file=sys.stderr)
         return 1
+    if untimed_sends:
+        print(f"warning: {untimed_sends} 条 [send] 行没有可解析的时间戳，已跳过；"
+              f"这些是机器人上下文（assistant turns / conversation_active），"
+              f"缺了样本只有半张。请用带时间戳的格式导出："
+              f"journalctl ... -o short-iso", file=sys.stderr)
 
     # 按群分组切 unit: 同发送者间隔 ≤3s 为一次发言
     by_group: dict[int, list] = {}
@@ -267,11 +300,26 @@ def main() -> int:
         for sample in samples:
             fh.write(json.dumps(sample, ensure_ascii=False, separators=(",", ":")) + "\n")
     n_pseudo = sum(1 for s in samples if s["labels"]["completion"] is not None)
+    n_assistant = sum(
+        1 for s in samples
+        if any(t.get("role") == "assistant" for t in s["context"]["recent_turns"])
+    )
     print(
         f"wrote {args.out}: {len(samples)} samples "
         f"({n_pseudo} with lexical completion label, "
         f"{len(samples) - n_pseudo} gray-zone candidates)"
     )
+    # 机器人上下文覆盖率：0 说明 [send] 行没被解析进来（多半是导出格式的问题），
+    # 这种批次只有半张样本，不该被当成可用数据。
+    print(
+        f"context coverage: {n_assistant}/{len(samples)} samples carry an "
+        f"assistant turn"
+    )
+    if samples and n_assistant == 0:
+        print("error: 没有任何样本带 assistant turn，批次缺少机器人上下文；"
+              "请检查导出格式（需要 journalctl -o short-iso 或 -o short）",
+              file=sys.stderr)
+        return 1
     return 0
 
 

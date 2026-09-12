@@ -47,7 +47,10 @@ Bundle 布局（`models/yunxi-turngate/`，生产由部署方放到稳定目录�
 
 ```bash
 # 1) 导出日志并采集候选(在服务器上运行,数据不出机器)
-journalctl -u kovi-bot.service --since "2026-09-07 00:00:00" \
+#    必须带 syslog 时间戳：`[send]` 行本身没有时间戳，用 `-o cat` 导出会让所有
+#    机器人发言被记成"现在"，采出的批次 assistant turns 与 conversation_active
+#    全为 0（collector 现在会直接报错拦下这种批次）。
+journalctl -u kovi-bot.service -o short-iso --since "2026-09-07 00:00:00" \
     | grep -E "\[group|\[send\]" > /tmp/tg-journal.txt
 python3 tools/turngate/collector.py --journal /tmp/tg-journal.txt \
     --out datasets/review-batch-$(date +%Y%m%d).jsonl
