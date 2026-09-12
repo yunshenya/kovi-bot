@@ -626,8 +626,19 @@ struct PhoneTools {
     registry: Arc<ToolRegistry>,
     context: ToolExecutionContext,
     ticket: ReplyTicket,
-    /// 只读模式：自检用。清单只给只读工具，执行也走 [`ToolRegistry::execute_read_only`]。
-    read_only: bool,
+    mode: PhoneToolMode,
+}
+
+/// 工具通道的两种形态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PhoneToolMode {
+    /// 真通话：清单里有什么就真的执行什么。
+    Live,
+    /// 自检（试跑）：**清单和真通话完全一致**——否则验不出"她本来会不会调那个工具"。
+    /// 比如"给我发个消息"，若清单里只有只读工具，`group.message.send` 根本不在，
+    /// 就只看得出她追问，看不出她的意图。执行分两种：只读工具真跑（结果是真的），
+    /// 有副作用的只记下"本来会调用"、绝不执行。
+    Rehearsal,
 }
 
 impl PhoneTools {
@@ -646,14 +657,14 @@ impl PhoneTools {
             return None;
         };
         // 通话用它自己的代数：拿到票据后只要这通话还在进行，它就一直有效。
-        Self::build(bot, caller, ReplyScope::Call(caller), false).await
+        Self::build(bot, caller, ReplyScope::Call(caller), PhoneToolMode::Live).await
     }
 
-    /// 准备"试跑"用的通道：只读，而且用和真实通话**不同**的作用域。
+    /// 准备"试跑"用的通道：清单与真通话一致，但有副作用的动作只记录、不执行。
     ///
-    /// 作用域分开是必要的：自检会推进它那个作用域的代数，若和真实通话共用一个，
-    /// 边打电话边发自检就会把通话中正在跑的工具轮次整批打断。负数对端就是自检
-    /// 的标记（真实通话的 uin 一定是正数）。
+    /// 作用域必须和真实通话**分开**：自检会推进它那个作用域的代数，若共用，边打
+    /// 电话边发自检就会把通话中正在跑的工具轮次整批打断。负数对端就是自检的标记
+    /// （真实通话的 uin 一定是正数）。
     async fn prepare_self_test(
         bot: &Arc<kovi::RuntimeBot>,
         config: &QqCallConfig,
@@ -662,14 +673,20 @@ impl PhoneTools {
         if !config.phone_tools_enabled() {
             return None;
         }
-        Self::build(bot, caller, ReplyScope::Call(-caller), true).await
+        Self::build(
+            bot,
+            caller,
+            ReplyScope::Call(-caller),
+            PhoneToolMode::Rehearsal,
+        )
+        .await
     }
 
     async fn build(
         bot: &Arc<kovi::RuntimeBot>,
         caller: i64,
         scope: ReplyScope,
-        read_only: bool,
+        mode: PhoneToolMode,
     ) -> Option<Self> {
         let Some(registry) = tool_registry() else {
             println!(
@@ -696,16 +713,16 @@ impl PhoneTools {
             requires_external_tool: false,
             allow_reply_actions: false,
         };
-        let available = registry.native_tool_specs(&context, read_only).len();
+        let available = registry.native_tool_specs(&context, false).len();
         println!(
-            "[INFO] QQ 通话工具通道已就绪：{available} 个工具（对端 {caller}，管理员 {}，主管理员 {}，只读 {read_only}）",
+            "[INFO] QQ 通话工具通道已就绪：{available} 个工具（对端 {caller}，管理员 {}，主管理员 {}，模式 {mode:?}）",
             context.is_admin, context.is_main_admin
         );
         Some(Self {
             registry,
             context,
             ticket: interrupt(scope).await,
-            read_only,
+            mode,
         })
     }
 }
@@ -715,6 +732,8 @@ struct ToolOutcome {
     name: String,
     succeeded: bool,
     content: String,
+    /// 试跑里"本来会调用、但没有真的执行"的动作。
+    rehearsed: bool,
 }
 
 /// 一次电话回复的完整过程。
@@ -777,9 +796,7 @@ async fn generate_reply(
         turn.elapsed = started.elapsed();
         return turn;
     };
-    let specs = tools
-        .registry
-        .native_tool_specs(&tools.context, tools.read_only);
+    let specs = tools.registry.native_tool_specs(&tools.context, false);
     if specs.is_empty() {
         println!("[WARN] QQ 通话的工具清单为空（身份或场景过滤后无可用工具），本轮退回纯文本");
         let response = params_model_with_plain_style_context(
@@ -876,8 +893,9 @@ async fn generate_reply(
 ///
 /// 为什么需要它：验证"电话里能不能办事"本来必须真打一通电话——成本高，还得有人
 /// 正好有空接。这里复用同一个 [`generate_reply`]，只换两样东西：音频出口换成记录
-/// （[`PhoneVoice::Silent`]），工具换成只读（[`PhoneTools::prepare_self_test`]，
-/// 执行层硬拦副作用）。所以我们验证的是真链路，不是另写一份仿的。
+/// （[`PhoneVoice::Silent`]），执行换成试跑（[`PhoneToolMode::Rehearsal`]：只读
+/// 工具真跑，有副作用的只记录不执行）。所以我们验证的是真链路，不是另写一份仿的，
+/// 而且它**永远不可能**真的发出消息或建提醒。
 pub(super) async fn self_test(
     bot: &Arc<kovi::RuntimeBot>,
     config: &QqCallConfig,
@@ -895,9 +913,11 @@ pub(super) async fn self_test(
                 要么工具注册表没初始化（tools.enabled）。"
             .to_string();
     };
+    // 清单按真通话来取（read_only = false）：验"她本来会不会调"就必须让她看得见
+    // 那些有副作用的工具，能不能执行由 execution 那一层决定。
     let available = tools
         .registry
-        .native_tool_specs(&tools.context, tools.read_only)
+        .native_tool_specs(&tools.context, false)
         .len();
     let transcript = Arc::new(Mutex::new(vec![Turn {
         from_peer: true,
@@ -924,9 +944,10 @@ fn render_self_test(
     turn: &PhoneTurn,
     fillers: &[String],
 ) -> String {
-    let mut report = String::from("通话工具自检（只读试跑：不出声，也不会真的发消息、建提醒）\n");
+    let mut report =
+        String::from("通话工具自检（试跑：不出声；只读工具真跑，有副作用的只记录不执行）\n");
     report.push_str(&format!("你说：{question}\n"));
-    report.push_str(&format!("可用工具：{available} 个（只读）\n"));
+    report.push_str(&format!("可用工具：{available} 个\n"));
     if turn.outcomes.is_empty() {
         report.push_str("工具调用：0 次——模型直接回话，没有用工具\n");
     } else {
@@ -936,12 +957,26 @@ fn render_self_test(
             turn.elapsed.as_secs_f64()
         ));
         for outcome in &turn.outcomes {
+            let mark = if outcome.rehearsed {
+                "🟡"
+            } else if outcome.succeeded {
+                "✅"
+            } else {
+                "❌"
+            };
+            let suffix = if outcome.rehearsed {
+                "（本来会执行，自检没执行）"
+            } else {
+                ""
+            };
             report.push_str(&format!(
-                "  {} {} → {}\n",
-                if outcome.succeeded { "✅" } else { "❌" },
+                "  {mark} {} → {}{suffix}\n",
                 outcome.name,
                 preview_chars(&outcome.content, 200)
             ));
+        }
+        if turn.outcomes.iter().any(|outcome| outcome.rehearsed) {
+            report.push_str("🟡 = 换成真通话她会真的执行这个动作\n");
         }
     }
     if !fillers.is_empty() {
@@ -1050,6 +1085,7 @@ async fn execute_tool_call(tools: &PhoneTools, call: &NativeToolCall) -> ToolOut
                     name,
                     succeeded: false,
                     content: format!("工具调用失败：参数不是合法 JSON（{error}）"),
+                    rehearsed: false,
                 };
             }
         };
@@ -1057,8 +1093,24 @@ async fn execute_tool_call(tools: &PhoneTools, call: &NativeToolCall) -> ToolOut
         "[INFO] QQ 通话工具调用: {name} {}",
         summarize_tool_arguments(&arguments)
     );
-    // 试跑走只读入口：带副作用的工具在执行层就被拦下，不可能真的发出去。
-    let result = if tools.read_only {
+    // 试跑模式：只读工具真跑（结果是真的），有副作用的只记录、绝不执行。
+    // 判据用注册表自己的只读查询，而不是另维护一张表——两边不可能对不上。
+    if tools.mode == PhoneToolMode::Rehearsal
+        && !tools
+            .registry
+            .available_read_only_for_context(&name, &tools.context)
+    {
+        println!("[INFO] QQ 通话自检：{name} 有副作用，只记录不执行");
+        return ToolOutcome {
+            content: format!("（自检模式：已记录对 {name} 的调用，但没有真的执行）"),
+            name,
+            succeeded: true,
+            rehearsed: true,
+        };
+    }
+    // 试跑里连只读工具也走只读入口：前面那道"有副作用就跳过"的判断和执行层
+    // 的只读边界用的是同一个判据，两道闸都关上才算数。
+    let result = if tools.mode == PhoneToolMode::Rehearsal {
         tools
             .registry
             .execute_read_only(&name, arguments, tools.context.clone(), tools.ticket)
@@ -1078,6 +1130,7 @@ async fn execute_tool_call(tools: &PhoneTools, call: &NativeToolCall) -> ToolOut
         name,
         succeeded: result.succeeded,
         content: result.content,
+        rehearsed: false,
     }
 }
 
@@ -1493,11 +1546,13 @@ mod tests {
                     name: "time.now".to_string(),
                     succeeded: true,
                     content: "2026-09-12 11:30".to_string(),
+                    rehearsed: false,
                 },
                 ToolOutcome {
                     name: "web.search".to_string(),
                     succeeded: false,
                     content: "搜索超时".to_string(),
+                    rehearsed: false,
                 },
             ],
             fillers: vec!["嗯……我看一下。".to_string()],
@@ -1505,14 +1560,40 @@ mod tests {
         };
         let report = render_self_test("现在几点", 9, &turn, &turn.fillers);
         // 报告必须先说清这是试跑，别让人以为真发出去了什么。
-        assert!(report.contains("只读试跑"));
+        assert!(report.contains("试跑"));
+        assert!(report.contains("有副作用的只记录不执行"));
         assert!(report.contains("你说：现在几点"));
-        assert!(report.contains("可用工具：9 个（只读）"));
+        assert!(report.contains("可用工具：9 个"));
         assert!(report.contains("工具调用：2 次"));
         assert!(report.contains("✅ time.now"));
         assert!(report.contains("❌ web.search"));
         assert!(report.contains("填充语"));
         assert!(report.contains("她本来会说：现在十一点半。"));
+    }
+
+    #[test]
+    fn self_test_marks_actions_it_only_rehearsed() {
+        let turn = PhoneTurn {
+            reply: Some(PhoneReply {
+                text: "好，我这就发。".to_string(),
+                wants_hangup: false,
+            }),
+            outcomes: vec![ToolOutcome {
+                name: "group.message.send".to_string(),
+                succeeded: true,
+                content: "（自检模式：已记录对 group.message.send 的调用，但没有真的执行）"
+                    .to_string(),
+                rehearsed: true,
+            }],
+            fillers: Vec::new(),
+            elapsed: Duration::from_millis(900),
+        };
+        let report = render_self_test("给群里发个消息", 22, &turn, &turn.fillers);
+        // 有副作用的动作必须一眼看出来"本来会执行、但没执行"。
+        assert!(report.contains("🟡 group.message.send"));
+        assert!(report.contains("本来会执行，自检没执行"));
+        assert!(report.contains("🟡 = 换成真通话她会真的执行这个动作"));
+        assert!(!report.contains("✅ group.message.send"));
     }
 
     #[test]

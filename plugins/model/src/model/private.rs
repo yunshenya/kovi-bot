@@ -243,7 +243,8 @@ pub(crate) async fn private_message_event_after_ingress(
         .strip_prefix("#通话自检")
         .or_else(|| message.trim().strip_prefix("#电话自检"))
     {
-        // 不通话也能验证电话里的工具链路：同样的模型调用、同样的工具，只读试跑。
+        // 不通话也能验证电话里的工具链路：同样的模型调用、同样的工具清单；
+        // 只读工具真跑，有副作用的只记录不执行。
         let report = crate::qq_call::run_tool_self_test(&bot, user_id, question).await;
         send_private_direct_response(&bot, user_id, initial_admission, report).await;
         return;

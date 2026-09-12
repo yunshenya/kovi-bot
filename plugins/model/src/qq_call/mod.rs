@@ -41,8 +41,9 @@ const DIAL_CONFIRM_WINDOW: Duration = Duration::from_secs(6);
 
 /// 私聊指令 `#通话自检 [问题]` 的实现：不通话也能验证电话里的工具链路。
 ///
-/// 只读试跑：不出声，也不真的发消息/建提醒（执行层硬拦）。授权门槛和打电话一致——
-/// 能在电话里用工具的人，才有必要自检。
+/// 试跑：清单与真通话一致（否则验不出"她本来会不会调"），但只有只读工具真跑，
+/// 有副作用的动作只记录不执行。授权门槛和打电话一致——能在电话里用工具的人，
+/// 才有必要自检。
 pub(crate) async fn run_tool_self_test(
     bot: &std::sync::Arc<kovi::RuntimeBot>,
     requester: i64,
