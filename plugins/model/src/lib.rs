@@ -739,8 +739,13 @@ async fn main() {
         let backfill_manager = Arc::clone(&memory::MEMORY_MANAGER);
         kovi::tokio::spawn(async move {
             let mut consecutive_failures = 0_u32;
+            let mut first_tick = true;
             loop {
-                kovi::tokio::time::sleep(kovi::tokio::time::Duration::from_secs(300)).await;
+                // 首次快跑：这个循环每重启一次就重新计时，而部署会重启它——
+                // 先睡 5 分钟会让"刚部署完"这段最该回填的窗口白白空转。
+                let delay = if first_tick { 30 } else { 300 };
+                first_tick = false;
+                kovi::tokio::time::sleep(kovi::tokio::time::Duration::from_secs(delay)).await;
                 match backfill_manager.backfill_embeddings().await {
                     Ok(_) => consecutive_failures = 0,
                     Err(error) => {
