@@ -3259,13 +3259,18 @@ async fn run_runtime(
     {
         while let Some((event, outcome)) = {
             super::refresh_executive_capability();
-            runtime
-                .process_next_with_planner_and_actions_with_event_and_guard(
+            // Core 是文本聊天的**正式回复路径**，但它由这条独立循环消费事件，
+            // 所以不在私聊/群聊那些入口的标签范围内——线上的 purpose=unlabeled
+            // 就是它。打上标签，`#llm-trace` 才分得清"谁在调模型"。
+            crate::model::llm_trace::with_purpose(
+                "core_reply",
+                runtime.process_next_with_planner_and_actions_with_event_and_guard(
                     arbiter,
                     port,
                     &autonomous_claim_is_current_for_event,
-                )
-                .await
+                ),
+            )
+            .await
         } {
             match outcome {
                 Ok(PlannedProcessingOutcome::Planned {

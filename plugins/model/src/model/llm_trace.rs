@@ -99,7 +99,8 @@ static PURPOSES: LazyLock<Mutex<HashMap<&'static str, PurposeStats>>> =
 /// - 看图：`vision.rs` 有自己的 HTTP 客户端，不经 [`round_trip_model_request`]；
 /// - 会话摘要：摘要文本是外部传进 `update_conversation_summary` 的，生成点未定位。
 const EXPECTED_PURPOSES: &[(&str, &str)] = &[
-    ("private_reply", "私聊回复"),
+    ("core_reply", "Core 回复/规划（文本聊天的正式路径）"),
+    ("private_reply", "私聊回复（旧链路）"),
     ("group_reply", "群聊回复"),
     ("phone_reply", "电话回复"),
     ("stance_formation", "立场形成（反思里到期问一次）"),
