@@ -881,24 +881,18 @@ impl MindRuntime {
             ),
         };
         let mut degraded = false;
-        let memories = match MemoryQuery::new(memory_scope, query, 16) {
-            Ok(memory_query) => {
-                services
-                    .memory
-                    .recall(&memory_query)
-                    .await
-                    .unwrap_or_else(|error| {
-                        kovi::log::warn!("Yunxi Mind V1 memory context failed soft: {error}");
-                        degraded = true;
-                        Vec::new()
-                    })
-            }
-            Err(error) => {
-                kovi::log::warn!("Yunxi Mind V1 memory query rejected: {error}");
+        // 查询文本直接来自消息正文（粘贴长文、长转发都可能超过查询上限），
+        // 超长时按字符边界截断——超出部分对检索没有帮助，不该让这一轮回忆整批失败。
+        let memory_query = MemoryQuery::new_truncating(memory_scope, query, 16);
+        let memories = services
+            .memory
+            .recall(&memory_query)
+            .await
+            .unwrap_or_else(|error| {
+                kovi::log::warn!("Yunxi Mind V1 memory context failed soft: {error}");
                 degraded = true;
                 Vec::new()
-            }
-        };
+            });
         let open_loops = services
             .open_loops
             .list(&open_loop_owner, 16)

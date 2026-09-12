@@ -322,6 +322,33 @@ impl MemoryQuery {
         })
     }
 
+    /// 用任意文本构造查询：超长时按字符边界截断，而不是让整次回忆失败。
+    ///
+    /// 查询文本常常直接来自消息正文；粘贴长文、长转发很容易超过
+    /// [`MAX_MEMORY_QUERY_BYTES`]，而超出部分对检索毫无帮助。上线表现是
+    /// "memory query rejected" 加一层 "context degraded" 两级 WARN，那一轮回忆
+    /// 整批丢失。NUL 也一并剔掉（严格构造会因此报错）。
+    #[must_use]
+    pub fn new_truncating(scope: MemoryScope, text: impl Into<String>, limit: usize) -> Self {
+        let mut text = text.into();
+        if text.contains('\0') {
+            text = text.replace('\0', "");
+        }
+        if text.len() > MAX_MEMORY_QUERY_BYTES {
+            let mut end = MAX_MEMORY_QUERY_BYTES;
+            while end > 0 && !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            text.truncate(end);
+        }
+        Self {
+            scope,
+            text,
+            min_importance: None,
+            limit: limit.clamp(1, 32),
+        }
+    }
+
     #[must_use]
     pub const fn scope(&self) -> MemoryScope {
         self.scope
@@ -527,5 +554,18 @@ mod tests {
         // An over-long summary is rejected at the boundary.
         let too_long = "x".repeat(MAX_MEMORY_CONTENT_CHARS + 1);
         assert!(world_fact_draft(MemoryScope::Global, &too_long, 80, Utc::now()).is_err());
+    }
+
+    #[test]
+    fn overlong_queries_are_truncated_instead_of_rejected() {
+        let scope = MemoryScope::Global;
+        let overlong = "好".repeat(MAX_MEMORY_QUERY_BYTES); // 每个字 3 字节，远超上限
+        // 严格构造会整批拒绝，宽松构造按字符边界截断。
+        assert!(MemoryQuery::new(scope, overlong.clone(), 8).is_err());
+        let query = MemoryQuery::new_truncating(scope, overlong, 8);
+        assert!(query.text().len() <= MAX_MEMORY_QUERY_BYTES);
+        assert!(query.text().chars().all(|character| character == '好'));
+        // NUL 会剔除，而不是报错。
+        assert_eq!(MemoryQuery::new_truncating(scope, "a\0b", 4).text(), "ab");
     }
 }

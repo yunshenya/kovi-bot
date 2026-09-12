@@ -49,7 +49,7 @@ impl Default for MindConfig {
             mind_planner_enabled: true,
             influence_mode: MindInfluenceMode::Active,
             snapshot_timeout_ms: 75,
-            event_update_timeout_ms: 40,
+            event_update_timeout_ms: 150,
             max_relevant_beliefs: 8,
             max_relevant_preferences: 8,
             max_relevant_interests: 8,
