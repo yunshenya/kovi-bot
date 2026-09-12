@@ -91,6 +91,22 @@ class Embedder:
         return vectors
 
 
+def _session_options() -> ort.SessionOptions:
+    """重排会话的选项：**关掉 CPU 内存池**。
+
+    ONNX Runtime 默认用一个只增不减的内存池（arena），峰值多少就长期占多少。
+    实测重排器空闲 653MB、跑一次 64 段嵌入 + 12 篇重排后涨到 **1479MB**——
+    而机器只有 3.7GB。关掉池之后每次推理自己归还，峰值近似真实工作集，
+    代价是一点分配开销（对一个每轮只跑十几对的交叉编码器无所谓）。
+
+    只有重排器用它；嵌入模型是每轮都走的，保留池换吞吐。
+    """
+    options = ort.SessionOptions()
+    options.enable_cpu_mem_arena = False
+    options.enable_mem_pattern = False
+    return options
+
+
 class Reranker:
     """cross-encoder 重排器：把 (查询, 文档) 成对打分。
 
@@ -100,7 +116,9 @@ class Reranker:
 
     def __init__(self, model_path: Path, tokenizer_path: Path) -> None:
         self.session = ort.InferenceSession(
-            str(model_path), providers=["CPUExecutionProvider"]
+            str(model_path),
+            sess_options=_session_options(),
+            providers=["CPUExecutionProvider"],
         )
         self.tokenizer = Tokenizer.from_file(str(tokenizer_path))
         self.tokenizer.enable_truncation(max_length=512)

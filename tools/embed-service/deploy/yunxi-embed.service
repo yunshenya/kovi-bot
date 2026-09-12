@@ -12,6 +12,9 @@ Environment=PYTHONUNBUFFERED=1
 ExecStart=/home/ubuntu/yunxi-embed/.venv/bin/python /home/ubuntu/yunxi-embed/service.py \
     --model /home/ubuntu/yunxi-embed/models/onnx/model_quantized.onnx \
     --tokenizer /home/ubuntu/yunxi-embed/models/tokenizer.json \
+    --reranker-model /home/ubuntu/yunxi-embed/models-reranker/onnx/model_quantized.onnx \
+    --reranker-tokenizer /home/ubuntu/yunxi-embed/models-reranker/tokenizer.json \
+    --reranker-name bge-reranker-base \
     --host 127.0.0.1 \
     --port 6112
 
@@ -26,7 +29,9 @@ RestartSec=3
 # 对一个 CPU 密集的模型服务就是活锁——实测设 512M 后 /v1/embed 直接不再响应
 # （MemoryCurrent 卡在 554MB）。MemoryMax 是硬限，超了只杀这一个服务，
 # 既保护整机、又不干扰它正常工作。
-MemoryMax=1G
+# 实测（关掉 ONNX 内存池之后）：空闲 654MB，最坏情况（64 段长文本嵌入 +
+# 12 篇重排）1118MB。所以硬限给到 1500M 留出余量——超了只杀这一个服务。
+MemoryMax=1500M
 
 # 只服务本机：不监听公网，也不需要任何特权。
 NoNewPrivileges=yes
