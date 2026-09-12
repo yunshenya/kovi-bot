@@ -922,11 +922,18 @@ impl WorldEvent {
     /// Attaches a bounded explicit message-count contract to an ingress event.
     /// Values outside the supported compact range are ignored so callers cannot
     /// create an unbounded delivery plan through metadata alone.
+    ///
+    /// The upper bound is the host's per-turn deliverable batch
+    /// (`MAX_PENDING_OUTGOING_PER_SCOPE` in `plugins/model/src/model/interrupt.rs`
+    /// and `MAX_DELIVERABLE_BUBBLES_PER_TURN` in its `core_model.rs`). It was 8
+    /// until an explicit "连续给我发10条消息" was silently dropped here, which
+    /// made the model fall back to writing its own numbered list and get cut off
+    /// mid-list. Keep the three values in sync.
     #[must_use]
     pub fn with_requested_message_count(mut self, count: Option<usize>) -> Self {
         self.requested_message_count = count
             .and_then(|count| u8::try_from(count).ok())
-            .filter(|count| (2..=8).contains(count));
+            .filter(|count| (2..=16).contains(count));
         self
     }
 

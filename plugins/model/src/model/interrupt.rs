@@ -7,7 +7,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
-const MAX_PENDING_OUTGOING_PER_SCOPE: usize = 8;
+/// 同一会话一轮里最多能挂多少条待发送内容。
+///
+/// 它不只是内部防爆上限：Core 把"用户明确要求 N 条"映射成一轮 N 个气泡，
+/// 超过这个数的 batch 会被 `prepare_outgoing_batch_locked` 整批拒绝（一条
+/// 也发不出去），所以真正决定"芸汐最多能连发几条"的是这个值。16 足以覆盖
+/// `MAX_EXPLICIT_REPLY_MESSAGES` 这一档请求，同时仍然有界；改大它必须同时
+/// 改 `core_model.rs` 的 `MAX_DELIVERABLE_BUBBLES_PER_TURN`。
+const MAX_PENDING_OUTGOING_PER_SCOPE: usize = 16;
 const MAX_COLLISIONS_PER_SCOPE: usize = 16;
 /// Bound for inbound reservations waiting on an active reply. A message flood
 /// into one scope while a reply is generating must not grow the set without
