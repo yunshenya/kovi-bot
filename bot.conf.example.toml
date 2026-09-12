@@ -283,9 +283,18 @@ max_task_instruction_chars = 2000
 max_task_output_chars = 4000
 
 [vision]
-# 当前生产环境本地 Intrinsic 模型不支持视觉，直接禁用图片分析：
-# 消息中的图片不会解析、不会走 Provider，也不会报"截图分析失败"，
-# 主模型按纯文本上下文处理。恢复视觉时改回 intrinsic/auto/builtin/mcp。
+# 视觉 Provider：intrinsic（本机推理）/ auto（先试 VISION_API_URL 再退本机）/
+# builtin（只走 VISION_API_URL）/ mcp / disabled（完全不解析图片）。
+#
+# 本模板默认 disabled：它是给**新机器**的默认值，而新机器上
+# `models/yunxi-intrinsic` 是空的——那时开 intrinsic 每次来图都会失败并留下
+# "视觉不可用"的错误，disabled 则是安静地按纯文本处理。
+#
+# 要用视觉必须先装 full 变体（含 SigLIP2 编码器，约 400MB）：
+#   ./scripts/download-model.sh --variant full
+# 装完改成 intrinsic 即可（生产 2026-09-12 起就是 intrinsic）。
+# 别用 auto 去配一个不可用的 VISION_API_URL：实测那个中转站现在未带 key 回 401、
+# 带上 key 回 404，auto 会每次白打一遍再退回本地。
 provider = "disabled"
 mcp_server = ""
 mcp_tool = "analyze_image"

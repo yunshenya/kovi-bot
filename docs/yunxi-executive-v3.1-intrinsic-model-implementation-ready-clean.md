@@ -5211,3 +5211,54 @@ Executive v3 负责的不是：
 而是：
 
 > **“在仍有机会修改输出时，判断旧输出是否已经失去语义价值。”**
+
+---
+
+# 附：生产启用记录（2026-09-12）
+
+生产服务器上 `models/yunxi-intrinsic` 一直是**空目录**，所以下面这些能力全部
+停留在"配置已就绪但资产缺失"的降级态——启动日志只留一行
+`Yunxi Intrinsic using builtin deterministic compatibility runtime`，
+很容易被读成"模型装好了"：
+
+| 能力 | 缺资产时的实际状态 |
+|---|---|
+| Intrinsic 本机推理 | 走 builtin 确定性兼容运行时（占位实现） |
+| 本机视觉（SigLIP2 + MiniMind） | 不可用 → `[vision] provider` 只能是 `disabled` |
+| TurnGate 的 MiniMind 兜底 | 只剩 lexical 规则 |
+
+## 做了什么
+
+1. `./scripts/download-model.sh --variant full` 装到
+   `models/yunxi-intrinsic/minimind-3o`（226MB 语言 + 189MB 视觉，共 11 个资产）。
+   服务器到 huggingface.co 直连不通，走 `hf-mirror.com`：
+   `--language-base-url` / `--vision-base-url` 两个参数就是为这种情况留的。
+   **脚本按 manifest 里的 sha256 逐个校验**，装完打印 `verified full MiniMind-3o assets`。
+2. `bot.conf.toml`：`[vision] provider` 由 `disabled` 改为 `intrinsic`。
+
+## 为什么是 intrinsic 而不是 auto
+
+`.env` 里配了 `VISION_API_URL=https://codex666ai.com`（`VISION_MODEL_NAME=gpt-5.5`），
+看起来 `auto` 会先用它。实测那条路**两条都是断的**：
+
+| 请求 | 结果 |
+|---|---|
+| 不带 key（`VISION_REQUIRES_AUTH=false` 时的真实行为） | **401** `API_KEY_REQUIRED` |
+| 带 `.env` 里的 `OPENAI_API_KEY` | **404** `Model "gpt-5.5" is not supported by any configured account in this group` |
+
+`auto` 的顺序是"先 builtin 后 intrinsic"，所以配 auto 等于**每张图先白打一次
+必败请求**（1~2 秒）再退回本地，还多一条 WARN。直接指 `intrinsic`：图片不出机器，
+也不浪费那次调用。
+
+## 验收与代价
+
+- 启动日志：`Yunxi Intrinsic manifest verified: 11 assets`（不再是 builtin 占位）。
+- 视觉链路用仓库自带的 `bundled_minimind_vision_smoke_test` 验证通过——本机
+  `models/` 里那两个权重的 sha256 与线上安装的完全一致，所以这个测试跑的就是
+  同一份资产（SigLIP2 编码器 + MiniMind 推理）。
+- 内存：`kovi-bot` 常驻由 **8MB → 约 700MB**（0.1B 权重 + 视觉编码器）；
+  整机 available 约 1.2~1.9GB。这台是 3.7GB 的机器，加之前要算这笔账。
+- 单张图的推理耗时**尚未实测**（要等真实图片进来）；上限由
+  `model.intrinsic.max_new_tokens = 256` 决定，4 vCPU 上偏慢时先调它。
+- TurnGate 仍是"lexical + MiniMind"兜底：`models/yunxi-turngate` 那个 bundle 不是
+  下载来的，要用 `tools/turngate/` 在**自己的对话数据**上离线训练产出。
