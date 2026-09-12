@@ -11,6 +11,7 @@
 
 use super::audio::{Capture, Playback};
 use super::bridge::{BridgeClient, CallPhase, CallState};
+use super::diagnostics;
 use super::vad::Segmenter;
 use crate::config::QqCallConfig;
 use crate::memory::{MEMORY_MANAGER, MemoryEntry, MemoryType};
@@ -253,6 +254,9 @@ pub(super) async fn run(
     } else {
         None
     };
+    // 提示词里必须写明"电话那头是谁"：不然对方说"给我发条消息"，她连"我"是谁都不知道
+    // （真机上就是这么反问回来的）。
+    let peer = diagnostics::caller_label(caller, caller_name);
     let responder = kovi::tokio::spawn(respond(
         config.clone(),
         caller,
@@ -262,6 +266,7 @@ pub(super) async fn run(
         interrupt_rx,
         Arc::clone(&end_signal),
         phone_tools,
+        peer,
     ));
 
     let opening = if allowed {
@@ -445,6 +450,7 @@ async fn respond(
     mut interrupts: mpsc::Receiver<()>,
     end_signal: EndSignal,
     tools: Option<PhoneTools>,
+    peer: String,
 ) {
     let context = match caller {
         Some(caller) => load_caller_context(caller).await,
@@ -532,6 +538,7 @@ async fn respond(
                         speech: &speech,
                         interrupts: &mut interrupts,
                     },
+                    &peer,
                 )
                 .await;
                 let Some(reply) = turn.reply else {
@@ -770,6 +777,7 @@ async fn generate_reply(
     transcript: &Arc<Mutex<Vec<Turn>>>,
     tools: Option<&PhoneTools>,
     voice: &mut PhoneVoice<'_>,
+    peer: &str,
 ) -> PhoneTurn {
     let started = Instant::now();
     let mut turn = PhoneTurn {
@@ -782,7 +790,7 @@ async fn generate_reply(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone();
-    let mut messages = build_messages(config, context, &turns, tools.is_some());
+    let mut messages = build_messages(config, context, &turns, tools.is_some(), peer);
     let Some(tools) = tools else {
         let response = params_model_with_plain_style_context(
             &mut messages,
@@ -924,6 +932,8 @@ pub(super) async fn self_test(
         text: question.to_string(),
     }]));
     let mut spoken = Vec::new();
+    // 自检和真通话一样必须有身份，否则"给我发条消息"在这条路上同样解析不出来。
+    let peer = diagnostics::caller_label(Some(caller), None);
     let turn = generate_reply(
         config,
         "",
@@ -932,6 +942,7 @@ pub(super) async fn self_test(
         &mut PhoneVoice::Silent {
             spoken: &mut spoken,
         },
+        &peer,
     )
     .await;
     render_self_test(question, available, &turn, &spoken)
@@ -1175,10 +1186,11 @@ fn build_messages(
     context: &str,
     turns: &[Turn],
     tools_enabled: bool,
+    peer: &str,
 ) -> Vec<BotMemory> {
     let mut messages = vec![BotMemory {
         role: Roles::System,
-        content: phone_system_prompt(config, tools_enabled),
+        content: phone_system_prompt(config, tools_enabled, peer),
     }];
     if !context.trim().is_empty() {
         messages.push(BotMemory {
@@ -1210,7 +1222,7 @@ fn build_messages(
 }
 
 /// 私聊人设 + 电话模式约束。电话约束放在后面，明确覆盖打字的格式要求。
-fn phone_system_prompt(config: &QqCallConfig, tools_enabled: bool) -> String {
+fn phone_system_prompt(config: &QqCallConfig, tools_enabled: bool, peer: &str) -> String {
     let persona = crate::config::get().prompt().private_prompt().to_owned();
     let capability = if tools_enabled {
         PHONE_TOOLS_PROMPT
@@ -1221,6 +1233,8 @@ fn phone_system_prompt(config: &QqCallConfig, tools_enabled: bool) -> String {
         "{persona}\n\n【当前场景：你们正在打 QQ 语音电话】\n{phone}\n\
          注意：上面所有关于发消息、气泡条数、表情包和排版的要求，在你说话时都不适用——\
          你正在打电话，不是在打字。\n\
+         【电话那头是谁】{peer}。他就是正在和你说话的人：他说\"我\"\"给我\"指的都是他，\
+         要给他发消息时目标就是这个 QQ 号，不用再反问他是谁。\n\
          {capability}\n\
          【挂断约定】对方表示要结束通话时（说再见、说“挂了吧/先挂/不聊了”，\
          或明显在收尾），你先回一句自然的道别，并在整条回复的最后加上 [[挂断]]；\
@@ -1240,6 +1254,7 @@ const PHONE_TOOLS_PROMPT: &str = "\
 - 给人发私聊消息：对方说的是名字而不是 QQ 号时，先用 private.contacts.search 找到人；\
 只有结果是 unique 才能发，ambiguous 就把候选念给他确认，找不到就如实说。非好友发不了，\
 这是有意的限制。\n\
+- 对方说\"给我发\"\"发给我\"时，目标就是上面写的那个 QQ 号，直接用，不要再问\"发给谁\"。\n\
 - 说话要像打电话：结果用一两句口语讲出来，不要念 JSON、字段名、链接清单，也不要说\"根据工具返回\"。\n\
 - 会让外部世界真的发生变化的动作（发消息、创建或取消提醒、启动持续任务）：先把你要做什么\
 用一句话说清楚，等对方明确答应；对方没说\"好/对/可以/发吧\"之前不要调用这类工具。\n\
@@ -1459,21 +1474,32 @@ mod tests {
     #[test]
     fn phone_prompt_teaches_the_hangup_marker() {
         let config = crate::config::QqCallConfig::default();
-        let prompt = phone_system_prompt(&config, true);
+        let prompt = phone_system_prompt(&config, true, "云深不知处（QQ 3052405886）");
         assert!(prompt.contains("[[挂断]]"), "电话提示里必须约定挂断标记");
+    }
+
+    #[test]
+    fn phone_prompt_says_who_is_on_the_other_end() {
+        // 真机回归：用户说"给我发条消息"，她反问"发给谁呀"——因为提示词里从来没写过
+        // 电话那头是谁，"我"对她是个无法解析的指代。
+        let config = crate::config::QqCallConfig::default();
+        let prompt = phone_system_prompt(&config, true, "云深不知处（QQ 3052405886）");
+        assert!(prompt.contains("【电话那头是谁】"));
+        assert!(prompt.contains("3052405886"));
+        assert!(prompt.contains("不用再反问他是谁"));
     }
 
     #[test]
     fn phone_prompt_matches_whether_she_can_act() {
         let config = crate::config::QqCallConfig::default();
-        let with_tools = phone_system_prompt(&config, true);
+        let with_tools = phone_system_prompt(&config, true, "云深不知处（QQ 3052405886）");
         // 能用工具时：说明会改变外部世界的动作要先复述并等对方答应。
         assert!(with_tools.contains("等对方明确答应"));
         assert!(with_tools.contains("听错很正常"));
         assert!(!with_tools.contains("你没有工具可用"));
 
         // 不能用工具时：最要紧的是别口头答应做不到的事。
-        let without_tools = phone_system_prompt(&config, false);
+        let without_tools = phone_system_prompt(&config, false, "云深不知处（QQ 3052405886）");
         assert!(without_tools.contains("你没有工具可用"));
         assert!(without_tools.contains("不要为了顺着他而口头答应"));
         assert!(!without_tools.contains("等对方明确答应"));
@@ -1653,9 +1679,12 @@ mod tests {
                 text: "在的".to_string(),
             },
         ];
-        let messages = build_messages(&config, "", &turns, false);
+        let messages = build_messages(&config, "", &turns, false, "云深不知处（QQ 3052405886）");
         assert_eq!(messages.len(), 4);
-        assert_eq!(messages[0].content, phone_system_prompt(&config, false));
+        assert_eq!(
+            messages[0].content,
+            phone_system_prompt(&config, false, "云深不知处（QQ 3052405886）")
+        );
         assert_eq!(messages[2].content, "喂");
         assert_eq!(messages[3].content, "在的");
     }
@@ -1678,7 +1707,7 @@ mod tests {
                 text: "三".to_string(),
             },
         ];
-        let messages = build_messages(&config, "", &turns, false);
+        let messages = build_messages(&config, "", &turns, false, "云深不知处（QQ 3052405886）");
         // system + 上下文说明 + 最后两轮
         assert_eq!(messages.len(), 4);
         assert_eq!(messages[2].content, "二");
@@ -1688,7 +1717,7 @@ mod tests {
     #[test]
     fn caller_context_is_injected_as_data() {
         let config = QqCallConfig::default();
-        let messages = build_messages(&config, "- 上次说要早点睡", &[], false);
+        let messages = build_messages(&config, "- 上次说要早点睡", &[], false, "朋友（10001）");
         assert_eq!(messages.len(), 3);
         assert!(messages[1].content.contains("<参考上下文"));
         assert!(messages[1].content.contains("上次说要早点睡"));
