@@ -205,6 +205,7 @@ pub(crate) fn is_restricted_command(message: &str) -> bool {
         || text == "#mind-status"
         || text == "#intrinsic-status"
         || text == "#executive-status"
+        || text == "#turn-gate-status"
         || text == "#通话状态"
         || text == "#通话诊断"
         || text == "#打给我"
@@ -4299,6 +4300,48 @@ mod tests {
         should_repair_empty_reply, tool_result_wire, with_reference_context,
     };
     use super::{is_group_paused, set_group_paused};
+
+    #[test]
+    fn every_admin_only_private_command_is_a_restricted_command() {
+        // 规则：**带 # 的命令只由管理员下达**。这张表就是规则的执行点，所以每一条
+        // 管理员专用的私聊命令都必须在这里出现——漏一条，那条命令对非管理员就
+        // 不再被静默，而是掉进聊天链路里（`#turn-gate-status` 就这么漏了）。
+        for command in [
+            "#帮助",
+            "#系统信息",
+            "#健康检查",
+            "#禁言",
+            "#结束禁言",
+            "#mind-status",
+            "#intrinsic-status",
+            "#executive-status",
+            "#turn-gate-status",
+            "#通话状态",
+            "#通话诊断",
+            "#打给我",
+            "#打电话给我",
+            "#通话自检 现在几点",
+            "#电话自检 现在几点",
+            "#群问答",
+            "#授权群 123",
+            "#授权好友 123",
+            "#授权通话 123",
+            "#教芸汐 这个表情是无语",
+        ] {
+            assert!(
+                is_restricted_command(command),
+                "{command} 是管理员专用命令，必须在受限命令表里"
+            );
+        }
+    }
+
+    #[test]
+    fn deleting_your_own_data_is_not_an_admin_command() {
+        // 唯一的例外，而且是刻意的：删除自己的数据是用户对自己数据的权利，
+        // 不该只有管理员能用。它不在受限命令表里，任何授权好友都能发。
+        assert!(!is_restricted_command("#删除我的数据"));
+        assert!(!is_restricted_command("#删除我的数据 确认"));
+    }
     use crate::memory::{BotPersonality, UserProfile};
     use crate::model::message_actions::{ReplyPlan, follow_up_delay_millis, split_reply};
     use crate::model::reply_disposition::ReplyDisposition;
