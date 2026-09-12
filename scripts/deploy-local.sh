@@ -248,11 +248,21 @@ if [ -n "$pending" ]; then
     printf '%s\n' "$pending" >&2
     die "工作区有未提交改动，--require-clean 拒绝发布"
   fi
-  revision="$head_sha-dirty.$(date +%s)"
-  warn "工作区有未提交改动，revision 记为 $revision"
-  info "（这些改动会进二进制；要严格对齐提交请先 commit 或加 --require-clean）"
-  pending_count="$(printf '%s\n' "$pending" | wc -l | tr -d ' ')"
-  info "未提交条目: $pending_count"
+  # 只有**已跟踪文件**的改动才会进二进制；未跟踪文件（新文档、临时脚本）不会。
+  # 服务端只接受 [0-9a-f.-] 的 revision，所以 -dirty 后缀只在真的改了被编译的
+  # 文件时才加：为几个未跟踪文件带上 -dirty，发布会被服务端判成"非法 revision"，
+  # 而我们又确实不需要先提交它们。
+  tracked_pending="$(git status --porcelain --untracked-files=no)"
+  if [ -n "$tracked_pending" ]; then
+    revision="$head_sha-dirty.$(date +%s)"
+    warn "工作区有未提交改动，revision 记为 $revision"
+    info "（这些改动会进二进制；要严格对齐提交请先 commit 或加 --require-clean）"
+    pending_count="$(printf '%s\n' "$tracked_pending" | wc -l | tr -d ' ')"
+    info "未提交条目（已跟踪）: $pending_count"
+  else
+    warn "工作区有未跟踪文件（不会进二进制，revision 仍用已提交的 HEAD）:"
+    printf '%s\n' "$pending" >&2
+  fi
 else
   info "工作区干净，revision = $revision"
 fi
