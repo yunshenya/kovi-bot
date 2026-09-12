@@ -23,6 +23,13 @@ ExecStart=/home/ubuntu/kovi-bot/current/kovi-bot
 Restart=always
 # 20 秒：既能在 NapCat 回来后很快恢复，又不会在对方长时间离线时高频空转。
 RestartSec=20
+# 内存硬限：装配本机 Intrinsic（0.1B 语言模型 + SigLIP2 视觉编码器）之后，
+# 机器人常驻从 8MB 涨到约 740MB，而整机只有 3.7GB。没有围栏时，一旦它涨上去，
+# 内核是在**整机**范围里挑牺牲品——上次挑中的是嵌入服务，下次可能是 PostgreSQL
+# 或 NapCat（那两个倒了比机器人重启严重得多）。有围栏就只杀这一个服务，
+# 配合 Restart=always 20 秒后自己回来。1500M 是实测常驻的两倍余量。
+# 嵌入服务（yunxi-embed）有各自的围栏，两边互不牵连。
+MemoryMax=1500M
 TimeoutStartSec=120
 UMask=0027
 
