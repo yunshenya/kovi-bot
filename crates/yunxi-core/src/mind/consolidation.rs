@@ -465,12 +465,18 @@ impl Consolidation {
                     return Err(ConsolidationError::ScopeMismatch);
                 }
                 let expected = existing.version();
-                let value = existing.apply_delta(
+                let mut value = existing.apply_delta(
                     directed_delta,
                     stability_delta,
                     &proposal.evidence_refs,
                     now,
                 )?;
+                // 更新时也要能设有效期：立场被合并掉、或她改了主意之后，旧的那条必须
+                // 真正退休。原实现只在创建时写 valid_until，更新时直接忽略它，
+                // 于是 belief 只增不减——"容量上限"就成了永久堵死的墙。
+                if let Some(valid_until) = proposal.valid_until {
+                    value = value.retired_at(valid_until)?;
+                }
                 Ok(MindUpsert {
                     value,
                     expected_version: Some(expected),

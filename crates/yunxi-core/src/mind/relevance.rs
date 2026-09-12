@@ -105,7 +105,11 @@ pub fn lexical_relevance(value: &str, query: &str) -> f32 {
     overlap as f32 / value_terms.len().min(query_terms.len()) as f32
 }
 
-pub(crate) fn explicitly_opposes(left: &str, right: &str) -> bool {
+/// 两条命题是否**明确对立**（"我喜欢 X" vs "我不喜欢 X"）。
+///
+/// 合并/去重前必须过这一关：对立的两条共用词最多、词汇重合度最高，光看相似度
+/// 会把它们合成一条，那就把她的立场抹平了。
+pub fn explicitly_opposes(left: &str, right: &str) -> bool {
     lexical_relevance(left, right) > 0.0
         && matches!(
             (explicit_stance(left), explicit_stance(right)),

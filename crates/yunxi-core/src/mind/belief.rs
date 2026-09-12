@@ -246,6 +246,20 @@ impl Belief {
         Ok(updated)
     }
 
+    /// 让这条看法在 `at` 之后不再有效（退休）。
+    ///
+    /// 两个用途：被合并掉的重复项要让位，以及她改了主意之后旧的那条要真正退场。
+    /// belief 必须能退休——否则数量只增不减，"容量上限"会变成一堵永久堵死、
+    /// 而且（原来）完全静默的墙。退休不是删除：记录还在，`valid_until` 之后
+    /// 不再出现在 active 查询里，追溯得到"她以前是这么想的"。
+    pub fn retired_at(mut self, at: DateTime<Utc>) -> Result<Self, MindValidationError> {
+        self.valid_until = Some(at);
+        self.updated_at = self.updated_at.max(at);
+        self.version = self.version.saturating_add(1);
+        self.validate()?;
+        Ok(self)
+    }
+
     #[must_use]
     pub const fn id(&self) -> BeliefId {
         self.id

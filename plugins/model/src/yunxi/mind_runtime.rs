@@ -34,6 +34,19 @@ const MAX_STANCE_PROPOSALS: usize = 3;
 const MAX_STANCE_EVIDENCE: usize = 3;
 /// 立场形成的输出上限（一句话级别的 JSON）。
 const STANCE_MAX_TOKENS: u32 = 320;
+/// 重复判定的**预筛**门槛：词汇重合度到这个程度才值得细看。
+///
+/// 这只是预筛，不是判决——词面相似度决定不了"是不是同一个看法"。实测：
+/// "我认为慢一点更好" 与 "我觉得慢一点更好" 重合 0.57（真是同一条），
+/// 而 "慢一点更好" 与 "快一点更好" 重合 0.71（**意思相反**）。阈值稍微一动，
+/// 要么漏掉重述，要么把她的立场抹平。
+///
+/// Hindsight 的做法正是如此：相似度只用来挑候选，真正拍板的是**一次聚焦检查**
+/// （它的文档写明"因为检查读两边的全文，所以在数量、否定、专名上有差别的会被
+/// 正确分开"）。所以这里预筛放宽，判决交给 `stance_duplicate_verdict`。
+const STANCE_DUPLICATE_PREFILTER: f32 = 0.4;
+/// 一次形成里最多做几次聚焦查重（每次一个很小的模型调用）。
+const MAX_DUPLICATE_CHECKS: usize = 2;
 /// 至少攒下这么多条经历才值得让她"想想法"。
 ///
 /// 只有一两条平凡经历时问她是浪费——实测第一次触发就是 `events=1`，模型
@@ -1538,9 +1551,25 @@ impl MindRuntime {
             },
             None => None,
         };
+        // 容量是**兜底**不是控制手段：真正让立场数量保持有意义的是合并与退休
+        // （见 `form_stances` 的去重与 `Belief::retired_at`）。但这道兜底绝不能
+        // 静默——原来它拒了连一行日志都没有，线上表现为"候选提了就是没进去"。
+        let belief_allowed = match belief_candidate {
+            Some(candidate) => {
+                let allowed = self.can_upsert_belief(&candidate.proposition, now).await?;
+                if !allowed {
+                    println!(
+                        "[INFO] 立场候选被容量兜底挡下（{} 条已满，且这条与已有看法都不重复）：{}",
+                        self.config.max_learned_beliefs_per_scope(),
+                        candidate_preview(&candidate.proposition)
+                    );
+                }
+                allowed.then_some(candidate)
+            }
+            None => None,
+        };
         if self.config.belief_enabled()
-            && let Some(candidate) = belief_candidate
-            && self.can_upsert_belief(&candidate.proposition, now).await?
+            && let Some(candidate) = belief_allowed
         {
             let confidence_delta = candidate.confidence_delta.clamp(-0.2, 0.2);
             let polarity = if confidence_delta < 0.0 {
@@ -2182,6 +2211,55 @@ impl MindRuntime {
         last == 0 || now.timestamp_millis() - last >= STANCE_FORMATION_COOLDOWN_MS
     }
 
+    /// 聚焦查重：这两句是不是同一个看法？
+    ///
+    /// 词面相似度决定不了这件事（见 `STANCE_DUPLICATE_PREFILTER` 的说明），所以
+    /// 挑出候选之后**读两边的全文**再拍板——这正是 Hindsight 用一次聚焦检查而不是
+    /// 单看相似度阈值的原因。判定不确定时按"不是同一看法"处理：宁可多留一条，
+    /// 也不要把她的两条立场抹平成一条。
+    async fn stance_duplicate_verdict(
+        &self,
+        existing: &str,
+        candidate: &str,
+    ) -> anyhow::Result<bool> {
+        use crate::model::Roles;
+        let mut messages = vec![
+            crate::model::BotMemory {
+                role: Roles::System,
+                content: "判断下面两句话是不是**同一个看法**（同一个主张的两种说法）。\n\
+                         只在完全同义时回答 same；只要主张有实质差别——意思相反、程度不同、\
+                         对象不同、多了一个限定——就回答 different。只输出 same 或 different。"
+                    .to_string(),
+            },
+            crate::model::BotMemory {
+                role: Roles::User,
+                content: format!("A：{existing}\nB：{candidate}"),
+            },
+        ];
+        let response = kovi::tokio::time::timeout(
+            STANCE_MODEL_TIMEOUT,
+            crate::model::utils::params_model_with_plain_style_context(
+                &mut messages,
+                Some(8),
+                &[],
+                None,
+                None,
+            ),
+        )
+        .await;
+        let Ok(response) = response else {
+            return Ok(false);
+        };
+        if crate::model::utils::is_model_error_response(&response.content) {
+            return Ok(false);
+        }
+        Ok(response
+            .content
+            .trim()
+            .to_ascii_lowercase()
+            .starts_with("same"))
+    }
+
     /// 让她在"认真回想"时自己形成、强化或动摇看法。
     ///
     /// 这条路径存在的理由：立场原来只能靠模型在**聊天回复里顺手带一个可选字段**，
@@ -2233,17 +2311,60 @@ impl MindRuntime {
             return Ok(true);
         }
         let candidates = parse_stance_candidates(&response.content);
+        // 预筛（词面）→ 聚焦检查（读全文）→ 判决只用于 form 候选。
+        let mut duplicates: std::collections::HashMap<usize, String> =
+            std::collections::HashMap::new();
+        let mut checks = 0_usize;
+        for (index, candidate) in candidates.iter().enumerate() {
+            if candidate.kind != StanceKind::Form || checks >= MAX_DUPLICATE_CHECKS {
+                continue;
+            }
+            let Some(prefiltered) = nearest_stance(&candidate.proposition, &existing) else {
+                continue;
+            };
+            checks += 1;
+            match self
+                .stance_duplicate_verdict(prefiltered.proposition(), &candidate.proposition)
+                .await
+            {
+                Ok(true) => {
+                    duplicates.insert(index, prefiltered.proposition().to_string());
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    kovi::log::warn!("Yunxi Mind stance duplicate check failed: {error}");
+                }
+            }
+        }
         if candidates.is_empty() {
             // 模型主动说"没什么值得留下的"也要留痕：否则从日志上分不清它是
             // 放弃了，还是输出了一堆解析不了的垃圾——那正是这条管道以前的老毛病。
+            // 把她当时看到的经历也记下来：否则"模型说什么都不留"没法判断是
+            // 材料本来就不值得（发了几张图），还是提示词把她卡住了。
+            let material = input
+                .recent_events
+                .iter()
+                .rev()
+                .take(4)
+                .map(|event| candidate_preview(&event.summary))
+                .collect::<Vec<_>>()
+                .join(" / ");
             println!(
-                "[INFO] Yunxi Mind 立场形成：模型没有提出看法（回复 {} 字：{}）",
+                "[INFO] Yunxi Mind 立场形成：模型没有提出看法（回复 {} 字：{}；经历 {} 条：{}）",
                 response.content.chars().count(),
-                candidate_preview(&response.content)
+                candidate_preview(&response.content),
+                input.recent_events.len(),
+                material
             );
             return Ok(true);
         }
-        let updates = stance_updates(&candidates, &existing, &input.recent_events);
+        let updates = stance_updates(
+            &candidates,
+            &existing,
+            &input.recent_events,
+            now,
+            &duplicates,
+        );
         if updates.is_empty() {
             println!(
                 "[INFO] Yunxi Mind 立场形成：{} 条候选全部被校验丢弃",
@@ -2952,6 +3073,8 @@ fn stance_formation_messages(
 challenge 是**有人不同意**某条看法——只表示有人反对，不代表你改变看法；\
 change 是**你自己真的改主意了**（想清楚了或被论据说服）。\n\
 target 必须与上面列出的某条看法原文完全一致，否则那条作废。\n\
+如果这个看法你已经有了——哪怕措辞不一样、只是换了种说法——就用 reinforce 并填那一句的原文，\n\
+不要用 form 造一条新的：同一个想法说两遍不会让你更坚定，只会把你的立场摊薄。\n\
 铁律：看法必须是你自己的判断，不能把别人说的话当成你的看法；\
 不写关于具体人的判断（谁喜欢什么、谁是什么样的人）——那是记忆，不是看法；\
 不能凭空编造没发生过的经历；没有值得留下的就输出 []。";
@@ -3041,9 +3164,12 @@ fn stance_updates(
     candidates: &[StanceCandidate],
     existing: &[Belief],
     events: &[ReflectionEvent],
+    now: DateTime<Utc>,
+    duplicates: &std::collections::HashMap<usize, String>,
 ) -> Vec<BeliefUpdateProposal> {
+    let _ = existing;
     let mut updates = Vec::new();
-    for candidate in candidates {
+    for (index, candidate) in candidates.iter().enumerate() {
         let resolve = |target: &Option<String>| -> Option<&Belief> {
             let target = target.as_deref()?;
             let key = yunxi_core::normalized_key(target);
@@ -3060,6 +3186,21 @@ fn stance_updates(
                         "[INFO] 立场形成被安全过滤丢弃（{reason}）：{}",
                         candidate_preview(&candidate.proposition)
                     );
+                    continue;
+                }
+                // 去重：聚焦检查判定"这是同一个看法"时，折成对已有那条的强化，
+                // 而不是新占一格——靠合并控制数量，而不是靠上限（Hindsight 的做法）。
+                if let Some(duplicate) = duplicates.get(&index) {
+                    println!(
+                        "[INFO] 立场形成：查重判定为同一看法，折成强化而非新增（{}）",
+                        candidate_preview(duplicate)
+                    );
+                    updates.push(stance_update(
+                        BeliefOperation::Reinforce,
+                        duplicate.clone(),
+                        delta,
+                        stance_evidence(events, EvidencePolarity::Supports),
+                    ));
                     continue;
                 }
                 updates.push(stance_update(
@@ -3111,12 +3252,16 @@ fn stance_updates(
                 };
                 // 先收回旧看法，再立新的。改主意本身是人格的一部分，
                 // 所以新命题里通常会保留"以前我觉得……"的痕迹。
-                updates.push(stance_update(
+                let mut retired = stance_update(
                     BeliefOperation::Retract,
                     belief.proposition().to_string(),
                     delta,
                     stance_evidence(events, EvidencePolarity::Contradicts),
-                ));
+                );
+                // 改主意之后旧的那条要真正退休，否则它永远挂在 active 列表里、
+                // 白占一格（belief 原来只增不减）。
+                retired.valid_until = Some(now);
+                updates.push(retired);
                 updates.push(stance_update(
                     BeliefOperation::Upsert,
                     candidate.proposition.clone(),
@@ -3127,6 +3272,26 @@ fn stance_updates(
         }
     }
     updates
+}
+
+/// 找一条"和这句是同一个看法"的已有立场。
+///
+/// 判据是词汇重合度 + 语义相反兜底：重合度够高、且不是明确对立的两条，才算重复。
+/// 对立的判据用核里的 [`yunxi_core::explicitly_opposes`]——把它漏掉的话，
+/// "我喜欢安静" 和 "我不喜欢安静" 会因为共用词太多而被合并成一条。
+fn nearest_stance<'a>(proposition: &str, existing: &'a [Belief]) -> Option<&'a Belief> {
+    existing
+        .iter()
+        .filter(|belief| !yunxi_core::explicitly_opposes(belief.proposition(), proposition))
+        .map(|belief| {
+            (
+                belief,
+                yunxi_core::lexical_relevance(belief.proposition(), proposition),
+            )
+        })
+        .filter(|(_, relevance)| *relevance >= STANCE_DUPLICATE_PREFILTER)
+        .max_by(|left, right| left.1.total_cmp(&right.1))
+        .map(|(belief, _)| belief)
 }
 
 fn stance_update(
@@ -3415,6 +3580,8 @@ mod tests {
             ),
             &existing,
             &[],
+            Utc::now(),
+            &std::collections::HashMap::new(),
         );
         assert_eq!(updates.len(), 1);
         assert_eq!(updates[0].operation, BeliefOperation::Reinforce);
@@ -3428,6 +3595,8 @@ mod tests {
             ),
             &existing,
             &[],
+            Utc::now(),
+            &std::collections::HashMap::new(),
         );
         assert_eq!(updates[0].operation, BeliefOperation::Contradict);
     }
@@ -3439,6 +3608,8 @@ mod tests {
             &parse_stance_candidates(r#"[{"kind":"form","proposition":"用户 123 喜欢安静"}]"#),
             &[],
             &[],
+            Utc::now(),
+            &std::collections::HashMap::new(),
         );
         assert!(updates.is_empty());
         // 带数字的自我立场是合法的（原来一刀切掉数字，这类看法永远进不来）。
@@ -3448,6 +3619,8 @@ mod tests {
             ),
             &[],
             &[],
+            Utc::now(),
+            &std::collections::HashMap::new(),
         );
         assert_eq!(updates.len(), 1);
         assert_eq!(updates[0].operation, BeliefOperation::Upsert);
@@ -3462,6 +3635,8 @@ mod tests {
             ),
             &existing,
             &[],
+            Utc::now(),
+            &std::collections::HashMap::new(),
         );
         assert_eq!(updates.len(), 2);
         assert_eq!(updates[0].operation, BeliefOperation::Retract);
@@ -3514,6 +3689,8 @@ mod tests {
             &parse_stance_candidates(r#"[{"kind":"form","proposition":"我认为慢一点更好"}]"#),
             &[],
             &events,
+            Utc::now(),
+            &std::collections::HashMap::new(),
         );
         assert_eq!(updates[0].evidence_refs.len(), MAX_STANCE_EVIDENCE);
         assert!(
@@ -3528,6 +3705,8 @@ mod tests {
             &parse_stance_candidates(r#"[{"kind":"challenge","target":"诚实比迎合更重要"}]"#),
             &existing,
             &events,
+            Utc::now(),
+            &std::collections::HashMap::new(),
         );
         assert!(
             updates[0]
@@ -3535,6 +3714,71 @@ mod tests {
                 .iter()
                 .all(|evidence| evidence.polarity() == EvidencePolarity::Contradicts)
         );
+    }
+
+    #[test]
+    fn a_stance_the_focused_check_calls_duplicate_reinforces_instead_of_accumulating() {
+        // Hindsight 的做法：靠合并控制数量，而不是靠上限。判决来自一次读全文的
+        // 聚焦检查（词面相似度只做预筛），这里直接喂判决，验映射是否正确。
+        let existing = vec![test_stance("我认为慢一点更好")];
+        let candidates =
+            parse_stance_candidates(r#"[{"kind":"form","proposition":"我觉得慢一点更好"}]"#);
+        let mut duplicates = std::collections::HashMap::new();
+        duplicates.insert(0_usize, "我认为慢一点更好".to_string());
+        let updates = stance_updates(&candidates, &existing, &[], Utc::now(), &duplicates);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].operation, BeliefOperation::Reinforce);
+        assert_eq!(
+            updates[0].proposition, "我认为慢一点更好",
+            "要落在已有那条上"
+        );
+
+        // 没有判决（检查说不同，或检查没跑）时照常新增——宁可多留一条，
+        // 也不要把她的两条立场抹平成一条。
+        let updates = stance_updates(
+            &candidates,
+            &existing,
+            &[],
+            Utc::now(),
+            &std::collections::HashMap::new(),
+        );
+        assert_eq!(updates[0].operation, BeliefOperation::Upsert);
+        assert_eq!(updates[0].proposition, "我觉得慢一点更好");
+    }
+
+    #[test]
+    fn duplicate_prefilter_is_loose_but_never_crosses_opposites() {
+        // 预筛只负责挑候选，所以它必须宽；但绝不能把明确对立的两条挑进来。
+        let existing = vec![test_stance("我喜欢安静")];
+        assert!(
+            nearest_stance("我不喜欢安静", &existing).is_none(),
+            "明确对立的两条不该进入查重候选"
+        );
+        // 重述和反义都会被预筛挑中（词面都很像）——所以拍板必须靠读全文的聚焦检查，
+        // 光看相似度阈值一定会出错：0.57 是真同义，0.71 却是反义。
+        assert!(nearest_stance("我觉得慢一点更好", &[test_stance("我认为慢一点更好")]).is_some());
+        assert!(nearest_stance("我认为快一点更好", &[test_stance("我认为慢一点更好")]).is_some());
+    }
+
+    #[test]
+    fn changing_your_mind_retires_the_old_stance() {
+        // 旧的那条必须真正退休（valid_until），否则它永远挂在 active 列表里白占一格——
+        // belief 原来只增不减，容量上限迟早变成一堵堵死的墙。
+        let existing = vec![test_stance("我认为显式状态机更可靠")];
+        let now = Utc::now();
+        let updates = stance_updates(
+            &parse_stance_candidates(
+                r#"[{"kind":"change","target":"我认为显式状态机更可靠","proposition":"我认为要看团队规模"}]"#,
+            ),
+            &existing,
+            &[],
+            now,
+            &std::collections::HashMap::new(),
+        );
+        assert_eq!(updates[0].operation, BeliefOperation::Retract);
+        assert_eq!(updates[0].valid_until, Some(now), "被替下的那条要退休");
+        assert_eq!(updates[1].operation, BeliefOperation::Upsert);
+        assert_eq!(updates[1].valid_until, None, "新的那条不该带有效期");
     }
 
     #[test]

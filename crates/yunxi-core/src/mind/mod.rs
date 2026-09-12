@@ -130,7 +130,7 @@ pub use reflection::{
     ReflectionDepth, ReflectionEvent, ReflectionInput, ReflectionProposal, ReflectionQueue,
     ReflectionQueueConfig, ReflectionTrigger,
 };
-pub use relevance::{MAX_LEXICAL_TERMS, lexical_relevance, lexical_terms};
+pub use relevance::{MAX_LEXICAL_TERMS, explicitly_opposes, lexical_relevance, lexical_terms};
 pub use self_model::{SelfIdentity, SelfLimitation, SelfModel, SelfTrait, TraitName, ValueProfile};
 pub use snapshot::{
     AgendaItemSnapshot, BeliefSnapshot, InterestSnapshot, MindSnapshot, MindSnapshotFuture,
