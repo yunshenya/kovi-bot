@@ -64,7 +64,10 @@ pub struct QqCallConfig {
     tts_timeout_secs: u64,
     /// PulseAudio 播放缓冲毫秒数，过低会卡顿。
     tts_playback_latency_ms: u32,
-    /// 电话回复的最大字数，超过会截断后再送给 TTS。
+    /// 电话回复的**单段**最大字数，超过会截断后再送给 TTS。
+    ///
+    /// 默认 120（曾经是 40）：40 字只够一句，对方让她"一直说"时她讲两句就被截断，
+    /// 怎么都连不起来。日常回话仍然由提示词压在一两句，这个值只是安全上限。
     max_reply_chars: usize,
     /// 通话内保留的历史轮数。
     history_turns: usize,
@@ -156,12 +159,22 @@ pub struct QqCallConfig {
     /// 到顶就回到安静等待，避免变成不停催问；对方一开口计数归零。默认 3：足够把
     /// "喂？在吗""怎么了呀""那我先不吵你"这类探话说完，又不会显得急。
     idle_prompt_max: usize,
+    /// 对方要她"一直说、不要停"时，最多连着讲几段（0 = 不连讲）。
+    ///
+    /// 模型一次只生成一段，段与段之间如果等对方开口，就变成一问一答的停顿；这个
+    /// 上限管的是宿主替她"接下去"的次数。对方随时可以插话打断，打断即停。
+    /// 默认 30 段：按每段最长 `max_reply_chars` 算够讲十几分钟，又不至于让她在
+    /// 没人听的时候一直念下去（通话本身还有 `max_call_seconds` 兜底）。
+    monologue_max_chunks: usize,
 }
 
 /// 空承诺补跑的硬上限：每多一轮就是一次额外的模型调用，电话里是实打实的延迟。
 const MAX_CLAIM_RETRY_ROUNDS: usize = 5;
 /// 连续主动出声的硬上限：再多就成了催问，比沉默更烦人。
 const MAX_IDLE_PROMPTS: usize = 10;
+/// 一次"一直说"最多连讲几段：按每段最长 `max_reply_chars` 算，200 段足以覆盖
+/// 任何正常通话，同时保证这个旋钮不可能把一通电话变成无限循环。
+const MAX_MONOLOGUE_CHUNKS: usize = 200;
 
 impl QqCallConfig {
     pub fn enabled(&self) -> bool {
@@ -364,6 +377,11 @@ impl QqCallConfig {
         self.idle_prompt_max.min(MAX_IDLE_PROMPTS)
     }
 
+    /// 连讲最多几段；配置写大了按上限收敛，不让一通电话无限念下去。
+    pub fn monologue_max_chunks(&self) -> usize {
+        self.monologue_max_chunks.min(MAX_MONOLOGUE_CHUNKS)
+    }
+
     /// 该 QQ 号是否允许来电。白名单为空时只允许主管理员。
     pub fn caller_allowed(&self, caller: i64, main_admin: Option<i64>) -> bool {
         if self.allowed_callers.contains(&caller) {
@@ -519,13 +537,19 @@ impl QqCallConfig {
                 "qq_call.idle_prompt_max 不能超过 {MAX_IDLE_PROMPTS}"
             ));
         }
+        if self.monologue_max_chunks > MAX_MONOLOGUE_CHUNKS {
+            return Err(anyhow::anyhow!(
+                "qq_call.monologue_max_chunks 不能超过 {MAX_MONOLOGUE_CHUNKS}"
+            ));
+        }
         Ok(())
     }
 }
 
 /// 电话模式内置提示。电话是低带宽通道：必须短、必须口语、不能有格式。
 pub const DEFAULT_PHONE_PROMPT: &str = "你正在和对方打 QQ 语音电话。你只能说话，不能发文字、图片、表情或链接。\
-回复必须是自然口语，通常一到两句话，最多 40 个字，不要使用任何标记符号、括号动作描写、emoji 或列表。\
+回复必须是自然口语，通常一到两句话、不超过 40 字（对方让你多讲时除外，见说话长度约定），\
+不要使用任何标记符号、括号动作描写、emoji 或列表。\
 对方说的是语音识别结果，可能有错别字、缺字或断句错误；听不清或明显不通顺时，用一句自然的追问确认，\
 不要假装听懂。不要复述对方的话，不要解释自己是 AI。";
 
@@ -556,7 +580,7 @@ impl Default for QqCallConfig {
             tts_sample_rate: 24_000,
             tts_timeout_secs: 20,
             tts_playback_latency_ms: 80,
-            max_reply_chars: 40,
+            max_reply_chars: 120,
             history_turns: 8,
             greeting: "喂，我在的，怎么啦？".to_string(),
             system_prompt: String::new(),
@@ -584,6 +608,7 @@ impl Default for QqCallConfig {
             claim_retry_rounds: 2,
             idle_prompt_secs: 20,
             idle_prompt_max: 3,
+            monologue_max_chunks: 30,
         }
     }
 }
@@ -693,14 +718,19 @@ mod tests {
         assert_eq!(config.idle_prompt_max(), 3);
         // 空承诺默认补跑两轮：一轮可能又被模型糊弄过去，两轮足够逼出真调用。
         assert_eq!(config.claim_retry_rounds(), 2);
+        // 单段 120 字 + 最多连讲 30 段：40 字只够一句，"一直说不要停"根本连不起来。
+        assert_eq!(config.max_reply_chars(), 120);
+        assert_eq!(config.monologue_max_chunks(), 30);
         // 配置写超上限时收敛，而不是让一通电话无限重试。
         let greedy = QqCallConfig {
             claim_retry_rounds: 99,
             idle_prompt_max: 99,
+            monologue_max_chunks: 9_999,
             ..QqCallConfig::default()
         };
         assert_eq!(greedy.claim_retry_rounds(), 5);
         assert_eq!(greedy.idle_prompt_max(), 10);
+        assert_eq!(greedy.monologue_max_chunks(), 200);
     }
 
     #[test]
@@ -739,6 +769,11 @@ mod tests {
             ..enabled()
         };
         assert!(too_many.validate().is_err());
+        let endless = QqCallConfig {
+            monologue_max_chunks: 201,
+            ..enabled()
+        };
+        assert!(endless.validate().is_err());
     }
 
     #[test]

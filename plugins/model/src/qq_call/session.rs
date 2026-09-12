@@ -34,7 +34,11 @@ use std::time::{Duration, Instant};
 /// 待处理语音队列上限。回复链明显落后时丢弃最新片段而不是无限堆积。
 const JOB_QUEUE: usize = 8;
 /// 电话回复的模型输出上限。
-const PHONE_MAX_TOKENS: u32 = 256;
+///
+/// 曾经是 256：那时电话回复被钉死在一两句短话上，256 绰绰有余。但"你一直说、
+/// 不要停"要求她一次写一整段（最长到 `max_reply_chars`，默认 120 字），中文
+/// 一个字约一个多 token，256 会在她讲到一半时把输出掐掉——所以放宽到 768。
+const PHONE_MAX_TOKENS: u32 = 768;
 /// 通话内保留的转写轮数上限。
 const MAX_TRANSCRIPT_TURNS: usize = 64;
 /// 单次采集读取的超时：定长帧只有几十毫秒，等一秒还没有整帧就说明这一轮
@@ -528,6 +532,9 @@ async fn respond(
     // 环境里被 VAD 切出来、又被 ASR 判成空的一段段噪声会不停把计时器往后推，
     // 她永远等不到开口的时机，电话又退化成"你不说话她就不说话"。
     let mut last_activity = Instant::now();
+    // 对方最近一次的要求是不是"一直说、不要停"。是的话，安静的含义就是"接着说"，
+    // 主动出声那一路不该再问"你还在听吗"。每识别出一句人话就按那句话重判。
+    let mut monologue = false;
 
     loop {
         // 只有"该她主动"时才让计时器参与竞争：已经道别、或主动次数用尽之后回到
@@ -592,6 +599,8 @@ async fn respond(
                 };
                 println!("[INFO] QQ 通话识别: {peer_text}");
                 idle_since_peer = 0;
+                // 对方这句话是不是在要求"一直说、不要停"？它决定下一次安静的含义。
+                monologue = wants_monologue(&peer_text);
                 // 从"识别出一句人话"这一刻算活动：后面无论走挂断收尾还是走回复，
                 // 中间那些 `continue` 都不必再逐个补刷新。
                 last_activity = Instant::now();
@@ -656,6 +665,8 @@ async fn respond(
                 // "说了要发但一次没发"的根因，这里必须在她开口之后就写进去。
                 let facts = tool_facts(&turn.outcomes);
                 warn_on_unbacked_action_claim(&reply.text, &facts, &peer);
+                // 她自己说"还有下文"（[[继续]]）时才连讲；被打断或播报失败就不接。
+                let mut keep_talking = reply.wants_continue;
                 match speak(&speech, &config, &reply.text, &mut interrupts).await {
                     Ok(SpeakOutcome::Completed) => push_turn(
                         &transcript,
@@ -667,8 +678,12 @@ async fn respond(
                     ),
                     Ok(SpeakOutcome::Interrupted) => {
                         println!("[INFO] QQ 通话回复被插话打断，不计入电话上下文");
+                        keep_talking = false;
                     }
-                    Err(error) => eprintln!("[ERROR] QQ 通话播报失败: {error}"),
+                    Err(error) => {
+                        eprintln!("[ERROR] QQ 通话播报失败: {error}");
+                        keep_talking = false;
+                    }
                 }
                 // 安静要从"她说完"重新起算：查一轮工具 + 合成播报可能花掉十几秒，
                 // 若还从对方那句识别算起，她会刚说完就立刻又开口。
@@ -678,6 +693,22 @@ async fn respond(
                     // 关键词匹配不到，所以由她自己决定）：道别已经说完，收尾挂断。
                     println!("[INFO] QQ 通话模型判断该结束了，播报道别后收尾");
                     request_end(&end_signal, EndTrigger::ModelDecided);
+                } else if keep_talking {
+                    // "一直说不要停"：不等对方开口，宿主立刻让她接着讲下一段。
+                    continue_monologue(
+                        &config,
+                        &context,
+                        &transcript,
+                        tools.as_ref(),
+                        &speech,
+                        &mut interrupts,
+                        &end_signal,
+                        &peer,
+                        &peer_voice_at,
+                        clock,
+                    )
+                    .await;
+                    last_activity = Instant::now();
                 }
             }
             Wake::Idle => {
@@ -699,7 +730,7 @@ async fn respond(
                     "[INFO] QQ 通话对方已安静 {silent_secs} 秒，她主动出声（对方开口后第 {} 次）",
                     idle_since_peer
                 );
-                let hint = idle_prompt(silent_secs, idle_since_peer);
+                let hint = idle_prompt(silent_secs, idle_since_peer, monologue);
                 let turn = generate_reply(
                     &config,
                     &context,
@@ -730,6 +761,7 @@ async fn respond(
                 }
                 let facts = tool_facts(&turn.outcomes);
                 warn_on_unbacked_action_claim(&reply.text, &facts, &peer);
+                let mut keep_talking = reply.wants_continue;
                 match speak(&speech, &config, &reply.text, &mut interrupts).await {
                     Ok(SpeakOutcome::Completed) => push_turn(
                         &transcript,
@@ -741,8 +773,29 @@ async fn respond(
                     ),
                     Ok(SpeakOutcome::Interrupted) => {
                         println!("[INFO] QQ 通话主动出声被插话打断，不计入电话上下文");
+                        keep_talking = false;
                     }
-                    Err(error) => eprintln!("[ERROR] QQ 通话主动出声播报失败: {error}"),
+                    Err(error) => {
+                        eprintln!("[ERROR] QQ 通话主动出声播报失败: {error}");
+                        keep_talking = false;
+                    }
+                }
+                if keep_talking {
+                    // 主动出声这一路也一样：她要是说"还有下文"，就直接接着讲下去，
+                    // 而不是等着下一次 20 秒的安静再挤一句。
+                    continue_monologue(
+                        &config,
+                        &context,
+                        &transcript,
+                        tools.as_ref(),
+                        &speech,
+                        &mut interrupts,
+                        &end_signal,
+                        &peer,
+                        &peer_voice_at,
+                        clock,
+                    )
+                    .await;
                 }
             }
         }
@@ -788,7 +841,19 @@ fn peer_is_speaking_now(peer_voice_at: &PeerVoiceAt, clock: Instant) -> bool {
 /// 三条出路里最要紧的是第一条：先探一句（对方可能只是没接话）。第二条顺手把
 /// "刚才说要查却没查完"的事补上——她说"等我一下"之后就静音，是对方最难受的那种
 /// 沉默。第三条明确不许重复上一条，否则模型会把她刚说过的话再说一遍。
-fn idle_prompt(silent_secs: u64, nth: usize) -> String {
+///
+/// `monologue` = 对方刚刚要求过"一直说、不要停"：这时候沉默的含义完全不同，是
+/// "继续说"而不是"你怎么了"，再问一句"你还在听吗"只会把好不容易聊起来的连讲打断。
+fn idle_prompt(silent_secs: u64, nth: usize, monologue: bool) -> String {
+    if monologue {
+        return format!(
+            "【现在电话里的情况】对方让你一直说、不要停，你已经安静了 {silent_secs} 秒。\
+             接着上一段往下讲，不要停下来问他\"还在不在\"、也不用确认他有没有在听——\
+             他没出声就是还在听。不要重复已经讲过的内容。\n\
+             还有下文就继续写，正文之后另起一行只写 [[继续]]；讲完了就不要带这个标记。\n\
+             （这是对方要求连讲之后你第 {nth} 次接上。）"
+        );
+    }
     format!(
         "【现在电话里的情况】对方已经 {silent_secs} 秒没有出声了，上一句话是你说的，\
          他一直没有接话。现在轮到你主动开口，不要一直干等：\n\
@@ -799,6 +864,122 @@ fn idle_prompt(silent_secs: u64, nth: usize) -> String {
          - 不要重复你上一条说过的话，也不要硬找话题；一句话就够，说完就停。\n\
          这是你第 {nth} 次主动开口（对方始终没有回应）。不要带 [[挂断]] 标记。"
     )
+}
+
+/// 对方是不是在要求"一直说、不要停"。
+///
+/// 这只是**旁证**：真正让连讲跑起来的是模型自己给的 `[[继续]]` 标记。这个判据
+/// 只用来改"安静之后该说什么"——在连讲模式下她要接着讲，而不是问"你还在听吗"。
+fn wants_monologue(utterance: &str) -> bool {
+    MONOLOGUE_MARKERS
+        .iter()
+        .any(|marker| utterance.contains(marker))
+}
+
+/// 会改变"安静含义"的说法：对方在要求她别停。
+const MONOLOGUE_MARKERS: &[&str] = &[
+    "不要停",
+    "别停",
+    "一直在说",
+    "一直说",
+    "继续说",
+    "接着说",
+    "连续说",
+    "接着讲",
+    "继续讲",
+    "讲下去",
+    "说下去",
+    "多说点",
+    "多说几句",
+    "多讲点",
+    "不要断",
+    "别断",
+];
+
+/// 连讲时每一段的现场说明。
+fn continuation_prompt(chunk: usize) -> String {
+    format!(
+        "【继续讲】对方让你一直说、不要停，你正在讲第 {chunk} 段。接着**上一段的下一句**往下讲：\
+         不要重新开头、不要总结、不要问他问题、不要说\"你还在听吗\"。\n\
+         还有下文就继续写，正文之后另起一行只写 [[继续]]；这段讲完了就不要带这个标记。"
+    )
+}
+
+/// "一直说不要停"：她说完一段还带着 `[[继续]]` 时，宿主立刻让她接着讲下一段。
+///
+/// 为什么必须有宿主这一层：模型一次只能生成一段，段与段之间如果等对方开口，就变成
+/// 一问一答的停顿——而"不要停"要的恰恰是连着的。每一段都走同一条生成+播报路径，
+/// 所以对方随时可以插话：`speak()` 被打断就立刻停，下一段也不会再生成。
+///
+/// 返回 `true` 表示是因为对方开口而停的（调用方接着按正常回合处理他那句话）。
+#[allow(clippy::too_many_arguments)]
+async fn continue_monologue(
+    config: &QqCallConfig,
+    context: &str,
+    transcript: &Arc<Mutex<Vec<Turn>>>,
+    tools: Option<&PhoneTools>,
+    speech: &SpeechClient,
+    interrupts: &mut mpsc::Receiver<()>,
+    end_signal: &EndSignal,
+    peer: &str,
+    peer_voice_at: &PeerVoiceAt,
+    clock: Instant,
+) -> bool {
+    for chunk in 1..=config.monologue_max_chunks() {
+        if requested_end(end_signal).is_some() {
+            return false;
+        }
+        // 对方出声了就不再往下讲：连讲的前提是"他还在听"。
+        if peer_is_speaking_now(peer_voice_at, clock) || interrupts.try_recv().is_ok() {
+            println!("[INFO] QQ 通话连讲：对方开口了，先停下听他说");
+            return true;
+        }
+        let hint = continuation_prompt(chunk);
+        let turn = generate_reply(
+            config,
+            context,
+            transcript,
+            tools,
+            &mut PhoneVoice::Speak { speech, interrupts },
+            peer,
+            Some(&hint),
+        )
+        .await;
+        let Some(reply) = turn.reply else {
+            println!("[INFO] QQ 通话连讲：这一轮没生成出内容，连讲结束");
+            return false;
+        };
+        let keep_talking = reply.wants_continue;
+        println!("[INFO] QQ 通话连讲第 {chunk} 段: {}", reply.text);
+        let facts = tool_facts(&turn.outcomes);
+        warn_on_unbacked_action_claim(&reply.text, &facts, peer);
+        match speak(speech, config, &reply.text, interrupts).await {
+            Ok(SpeakOutcome::Completed) => push_turn(
+                transcript,
+                Turn {
+                    from_peer: false,
+                    text: reply.text,
+                    tools: facts,
+                },
+            ),
+            Ok(SpeakOutcome::Interrupted) => {
+                println!("[INFO] QQ 通话连讲被插话打断，不再接着讲");
+                return true;
+            }
+            Err(error) => {
+                eprintln!("[ERROR] QQ 通话连讲播报失败: {error}");
+                return false;
+            }
+        }
+        if !keep_talking {
+            return false;
+        }
+    }
+    println!(
+        "[INFO] QQ 通话连讲达到上限 {} 段，先停下来",
+        config.monologue_max_chunks()
+    );
+    false
 }
 
 /// 合成并播放一句话。边合成边写入，首包到达即出声。
@@ -844,10 +1025,12 @@ async fn speak(
     Ok(SpeakOutcome::Completed)
 }
 
-/// 模型给出的一句电话回复，以及她是否认为这通电话该结束了。
+/// 模型给出的一句电话回复，以及她自己对"接下来怎么办"的判断。
 struct PhoneReply {
     text: String,
     wants_hangup: bool,
+    /// 她还有下文没讲完，要宿主马上让她接着讲（见 [`continue_monologue`]）。
+    wants_continue: bool,
 }
 
 /// 一次通话的工具通道。
@@ -1448,8 +1631,13 @@ fn reply_from_response(content: &str, config: &QqCallConfig) -> Option<PhoneRepl
         return None;
     }
     let wants_hangup = wants_hangup(content);
+    let wants_continue = wants_continue(content);
     match sanitize_reply(content, config.max_reply_chars()) {
-        Some(text) => Some(PhoneReply { text, wants_hangup }),
+        Some(text) => Some(PhoneReply {
+            text,
+            wants_hangup,
+            wants_continue,
+        }),
         None => {
             eprintln!("[WARN] QQ 通话模型返回了空回复或不可播报内容，本轮不回复");
             None
@@ -1464,6 +1652,15 @@ fn reply_from_response(content: &str, config: &QqCallConfig) -> Option<PhoneRepl
 /// 也认）——它会随协议标记一起从要朗读的文本里去掉。
 fn wants_hangup(raw: &str) -> bool {
     raw.contains("[[挂断]]") || raw.to_ascii_uppercase().contains("[[HANGUP]]")
+}
+
+/// 模型是否在回复里说"我还有下文"。
+///
+/// 同 [`wants_hangup`]：由模型自己判断，用 `[[继续]]`（英文 `[[CONTINUE]]` 也认），
+/// 标记随协议标记一起去掉、不会被读出来。有了它，宿主才能在她讲完一段之后**立刻**
+/// 让她接着讲下一段——而不是等对方开口，或者等 20 秒后问一句"你还在听吗"。
+fn wants_continue(raw: &str) -> bool {
+    raw.contains("[[继续]]") || raw.to_ascii_uppercase().contains("[[CONTINUE]]")
 }
 
 /// 电话请求的消息序列：人设 + 背景资料 + 通话内上下文。
@@ -1685,10 +1882,17 @@ fn phone_system_prompt(config: &QqCallConfig, tools_enabled: bool, peer: &str) -
          【电话那头是谁】{peer}。他就是正在和你说话的人：他说\"我\"\"给我\"指的都是他，\
          要给他发消息时目标就是这个 QQ 号，不用再反问他是谁。\n\
          {capability}\n\
+         【说话长度】默认一到两句话、不超过 40 字。但对方明确让你\"一直说\"\"不要停\"\
+         \"接着讲\"\"讲个长故事\"时，就按他说的来：可以连着讲一整段（最多 {max_chars} 字），\
+         不要讲两句就停，更不要停下来问\"你还在听吗\"。还有下文没讲完时，在你这段话之后\
+         **另起一行**只写 [[继续]]，宿主会立刻接着让你讲下一段；对方随时可能开口打断你，\
+         那是正常的（说明他在听），不用道歉也不用重新开头。讲完了、或者对方岔开了话题，\
+         就不要带这个标记。\n\
          【挂断约定】对方表示要结束通话时（说再见、说“挂了吧/先挂/不聊了”，\
          或明显在收尾），你先回一句自然的道别，并在整条回复的最后加上 [[挂断]]；\
          这会让电话真的挂掉。其它任何时候都不要带这个标记。",
         phone = config.system_prompt(),
+        max_chars = config.max_reply_chars(),
     )
 }
 
@@ -1723,20 +1927,37 @@ const PHONE_NO_TOOLS_PROMPT: &str = "\
 对方让你做这类事时，如实说你正在打电话、手上做不了，请他挂了之后再跟你说或者直接发消息给你——\
 不要为了顺着他而口头答应下来。";
 
-/// 把模型输出收拾成一句可以直接读出来的话。
+/// 把模型输出收拾成可以直接读出来的一段话。
+///
+/// 以前这里**只取第一行**（理由是"电话回复就是一句口语"）。但"你一直说、不要停"
+/// 要的是连着讲一整段，而模型组织长内容时天然会分行分段——只留第一行等于把她
+/// 后面讲的全丢了。线上表现就是：让她一直讲，她讲两句就没了。
+/// 现在把各行的正文按顺序接成一段，只丢掉纯粹是舞台指示的空壳行（"[轻声]"这类）。
 fn sanitize_reply(raw: &str, max_chars: usize) -> Option<String> {
     let without_markers = strip_protocol_markers(raw);
-    let line = without_markers
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())?;
-    let line = trim_stage_direction(line)
-        .trim_matches(|character| matches!(character, '"' | '\'' | '“' | '”' | '「' | '」'))
-        .trim();
-    if line.is_empty() {
+    let mut spoken = String::new();
+    for line in without_markers.lines() {
+        let line = trim_stage_direction(line).trim();
+        let line = line
+            .trim_matches(|character| matches!(character, '"' | '\'' | '“' | '”' | '「' | '」'));
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        // 上一行没有句末标点时补一个逗号，免得两行粘成一句读不通的话。
+        if !spoken.is_empty()
+            && !spoken.ends_with([
+                '。', '！', '？', '!', '?', '…', '；', ';', '，', ',', '、', '：', ':',
+            ])
+        {
+            spoken.push('，');
+        }
+        spoken.push_str(line);
+    }
+    if spoken.is_empty() {
         return None;
     }
-    Some(truncate_spoken(line, max_chars))
+    Some(truncate_spoken(&spoken, max_chars))
 }
 
 /// 去掉模型可能漏出来的 `[[...]]` 协议标记。
@@ -1872,10 +2093,10 @@ mod tests {
     use super::{
         CallPhase, EndTrigger, NO_END, PeerVoiceAt, PhoneReply, PhoneTurn, TOOL_ARGUMENT_LOG_CHARS,
         TOOL_FACT_HISTORY_CHARS, ToolFact, ToolOutcome, Turn, build_messages, claimed_action,
-        commitment_nudge, counts_as_peer_activity, idle_delay, idle_prompt, peer_is_speaking_now,
-        phone_system_prompt, preview_chars, render_self_test, request_end, requested_end,
-        sanitize_reply, strip_protocol_markers, summarize_tool_arguments, unbacked_action_claim,
-        wants_hangup,
+        commitment_nudge, continuation_prompt, counts_as_peer_activity, idle_delay, idle_prompt,
+        peer_is_speaking_now, phone_system_prompt, preview_chars, render_self_test, request_end,
+        requested_end, sanitize_reply, strip_protocol_markers, summarize_tool_arguments,
+        unbacked_action_claim, wants_continue, wants_hangup, wants_monologue,
     };
     use crate::config::QqCallConfig;
     use serde_json::Value;
@@ -2001,9 +2222,67 @@ mod tests {
     }
 
     #[test]
-    fn replies_are_limited_to_one_spoken_line() {
-        let reply = sanitize_reply("第一句。\n第二句。", 40).expect("应取第一句");
-        assert_eq!(reply, "第一句。");
+    fn replies_are_read_as_one_continuous_passage() {
+        // 多行正文必须**接起来**读。以前只取第一行，于是"你一直说不要停"时她后面
+        // 讲的全被丢掉——线上表现就是她讲两句就没了。
+        let reply = sanitize_reply("第一句。\n第二句。", 120).expect("应读成一段");
+        assert_eq!(reply, "第一句。第二句。");
+        // 上一行没有句末标点就补个逗号，别把两句粘成一句读不通的话。
+        let joined = sanitize_reply("从前有只小猫\n住在巷子里。", 120).expect("应读成一段");
+        assert_eq!(joined, "从前有只小猫，住在巷子里。");
+        // 纯粹的舞台指示仍是空壳行，丢掉；正文照读。
+        let staged = sanitize_reply("[轻声]\n好，那我讲咯。", 120).expect("应读成一段");
+        assert_eq!(staged, "好，那我讲咯。");
+    }
+
+    /// `[[继续]]` 是她"还有下文"的标记：既要能被认出来，也不能被读出来。
+    #[test]
+    fn continuation_marker_is_detected_and_never_spoken() {
+        assert!(wants_continue("故事还没讲完。\n[[继续]]"));
+        assert!(wants_continue("[[CONTINUE]]"));
+        assert!(!wants_continue("讲完了，就这样。"));
+        assert_eq!(
+            sanitize_reply("它蹲在窗台上晒太阳。\n[[继续]]", 120).as_deref(),
+            Some("它蹲在窗台上晒太阳。")
+        );
+        // 和挂断标记同理：两个标记同时出现时以挂断为准（调用方先看 wants_hangup）。
+        let both = "那先这样啦，拜拜。\n[[继续]]\n[[挂断]]";
+        assert!(wants_continue(both) && wants_hangup(both));
+        assert_eq!(
+            sanitize_reply(both, 120).as_deref(),
+            Some("那先这样啦，拜拜。")
+        );
+    }
+
+    /// 连讲现场的说明必须点名"接着上一段"，并且不许她再问"你还在听吗"。
+    #[test]
+    fn continuation_prompt_picks_up_where_she_stopped() {
+        let hint = continuation_prompt(3);
+        assert!(hint.contains("第 3 段"));
+        assert!(hint.contains("接着"));
+        assert!(hint.contains("不要重新开头"));
+        assert!(hint.contains("你还在听吗"));
+        assert!(hint.contains("[[继续]]"));
+    }
+
+    /// 对方说"不要停"之后，安静的含义是"接着说"，不是"你怎么了"。
+    #[test]
+    fn monologue_requests_change_what_silence_means() {
+        for line in [
+            "连续说一直说不要停。",
+            "你接着讲，别停。",
+            "别停下来，继续说。",
+            "多讲点，讲下去。",
+        ] {
+            assert!(wants_monologue(line), "该判为连讲要求: {line}");
+        }
+        for line in ["嗯，讲呀。", "对对对。", "你刚才说什么？"] {
+            assert!(!wants_monologue(line), "不该判为连讲要求: {line}");
+        }
+        let hint = idle_prompt(20, 1, true);
+        assert!(hint.contains("接着上一段"));
+        assert!(!hint.contains("你还在吗"));
+        assert!(hint.contains("[[继续]]"));
     }
 
     #[test]
@@ -2028,6 +2307,7 @@ mod tests {
             reply: Some(PhoneReply {
                 text: "现在十一点半。".to_string(),
                 wants_hangup: false,
+                wants_continue: false,
             }),
             outcomes: vec![
                 ToolOutcome {
@@ -2066,6 +2346,7 @@ mod tests {
             reply: Some(PhoneReply {
                 text: "好，我这就发。".to_string(),
                 wants_hangup: false,
+                wants_continue: false,
             }),
             outcomes: vec![ToolOutcome {
                 name: "group.message.send".to_string(),
@@ -2092,6 +2373,7 @@ mod tests {
             reply: Some(PhoneReply {
                 text: "在的呀。".to_string(),
                 wants_hangup: false,
+                wants_continue: false,
             }),
             outcomes: Vec::new(),
             fillers: Vec::new(),
@@ -2314,6 +2596,17 @@ mod tests {
         assert!(prompt.contains("重新调用一次发送工具"));
     }
 
+    /// 提示词必须教会她"一直说"这条路：写长一点、别问"你还在听吗"、还有下文就带标记。
+    #[test]
+    fn phone_prompt_teaches_continuous_talking() {
+        let prompt = phone_system_prompt(&QqCallConfig::default(), true, "朋友（1）");
+        assert!(prompt.contains("一直说"));
+        assert!(prompt.contains("不要停"));
+        assert!(prompt.contains("[[继续]]"));
+        assert!(prompt.contains("最多 120 字"), "上限要跟着配置走: {prompt}");
+        assert!(prompt.contains("另起一行"));
+    }
+
     /// 2026-09-13 线上：她说"那我先看看有哪些群，等我一下"，然后整通电话再没下文。
     /// 这类**查询类**承诺以前一条判据都命中不了——告警不响、补跑也不会发生。
     #[test]
@@ -2397,7 +2690,7 @@ mod tests {
     /// 主动出声的现场说明：先问怎么了、顺手把欠着的事做完、不许重复、不许挂断。
     #[test]
     fn idle_prompt_asks_what_happened_and_forbids_hanging_up() {
-        let hint = idle_prompt(9, 1);
+        let hint = idle_prompt(9, 1, false);
         assert!(hint.contains("9 秒"));
         assert!(hint.contains("主动开口"));
         assert!(hint.contains("怎么了"));
