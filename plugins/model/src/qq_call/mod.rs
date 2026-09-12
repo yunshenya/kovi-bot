@@ -170,6 +170,15 @@ pub(crate) async fn start_scheduler(bot: Arc<kovi::RuntimeBot>) {
     }
 }
 
+/// 这次阶段变化算不算"漏接"。
+///
+/// 两个条件缺一不可：**上一阶段还在通话中**（说明这个进程亲眼见过它振铃——
+/// 光看 `!connected` 会把"启动时桥里残留的上一次结束状态"误判成漏接，2026-09-12
+/// 就这么给一通其实接通了的电话发过通知），以及**这一通从未进房**。
+fn is_missed_call(previous: CallPhase, connected: bool) -> bool {
+    previous.is_live() && !connected
+}
+
 /// 漏接来电通知：桥看到过邀请、但整通从未进房时，主动私聊告诉主管理员。
 ///
 /// 以前这种失败完全静默——你只能从"她没接"察觉；日志里也只有一行 WARN。
@@ -272,7 +281,7 @@ async fn report_phase_change(
         CallPhase::Ended => {
             println!("[INFO] QQ 语音通话桥报告已挂断: {label}");
             diagnostics::note_call_ended("桥报告已挂断");
-            if !connected {
+            if is_missed_call(previous, connected) {
                 notify_missed_call(bot, config, state, previous).await;
             }
         }
@@ -300,6 +309,18 @@ async fn report_phase_change(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn missed_call_needs_a_live_previous_phase() {
+        use super::is_missed_call;
+        // 真的漏接：亲眼见它振铃，却从未进房。
+        assert!(is_missed_call(CallPhase::Ringing, false));
+        assert!(is_missed_call(CallPhase::Accepting, false));
+        // 接通过就不算漏接。
+        assert!(!is_missed_call(CallPhase::Ringing, true));
+        // 启动时桥里残留的结束状态（上一阶段是 Idle）不算——那会误报。
+        assert!(!is_missed_call(CallPhase::Idle, false));
+    }
+
     use super::bridge::{CallPhase, CallState};
 
     #[test]
