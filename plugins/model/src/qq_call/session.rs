@@ -26,6 +26,7 @@ use crate::model::{
 };
 use crate::speech::SpeechClient;
 use kovi::tokio::sync::mpsc;
+use rand::RngExt;
 use serde_json::Value;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -63,6 +64,13 @@ const TOOL_FILLER_DELAY: Duration = Duration::from_millis(700);
 
 /// 工具参数写进日志时的截断长度。电话里说的话可能包含私事，只留够排查的片段。
 const TOOL_ARGUMENT_LOG_CHARS: usize = 160;
+
+/// 连讲模式下，她停下来多久就当她该接上下一句。
+///
+/// 对方要的是"一直说、不要停"，所以这里的沉默含义是"接着讲"而不是"你怎么了"：
+/// 等满 `idle_prompt_secs`（20 秒）才接，听起来就是故事断了。4 秒是个正常换气长度，
+/// 之后照样按倍数退避，次数仍由 `idle_prompt_max` 兜底。
+const MONOLOGUE_BREATH: Duration = Duration::from_secs(4);
 
 /// 对端最后一次出声距今多久之内，就当她还在说话。
 ///
@@ -547,7 +555,9 @@ async fn respond(
                 biased;
                 job = jobs.recv() => job.map(Wake::Job),
                 () = kovi::tokio::time::sleep_until(
-                    (last_activity + idle_delay(idle_after, idle_since_peer)).into()
+                    (last_activity
+                        + idle_delay(base_delay(idle_after, monologue), idle_since_peer))
+                    .into()
                 ) => Some(Wake::Idle),
             }
         } else {
@@ -802,6 +812,16 @@ async fn respond(
     }
 }
 
+/// 安静多久该轮到她自己开口：平时 20 秒（对方可能只是在听），
+/// 对方要求"一直说"时缩到 [`MONOLOGUE_BREATH`]——那时候沉默的含义是"接着讲"。
+fn base_delay(idle_after: Duration, monologue: bool) -> Duration {
+    if monologue {
+        MONOLOGUE_BREATH
+    } else {
+        idle_after
+    }
+}
+
 /// 主动出声的退避：第一次 base，之后每多一次翻一倍，最多到 8 倍。
 ///
 /// 不退避就成了催问（"你怎么不说话"每 6 秒问一遍）；有上限则保证真的没人应时
@@ -896,13 +916,61 @@ const MONOLOGUE_MARKERS: &[&str] = &[
     "别断",
 ];
 
+/// 连讲提示词里回贴"上一段结尾"的字数：够她认出自己讲到哪儿即可。
+const CONTINUATION_TAIL_CHARS: usize = 30;
+
 /// 连讲时每一段的现场说明。
-fn continuation_prompt(chunk: usize) -> String {
+///
+/// 两条都是从线上日志里抠出来的：她说每一段都用同一句"好，那我接着讲"开场
+/// （2026-09-13 01:26:44 与 01:26:49 一字不差），而且相邻两段是同一个句式
+/// （"小女孩每天傍晚都会…""小女孩每天晚上都会…"）。所以这里点名禁掉过渡语，
+/// 并把上一段的结尾原样贴给她——让她接在那句话后面，而不是重新起个头。
+fn continuation_prompt(chunk: usize, previous_tail: Option<&str>) -> String {
+    let tail = match previous_tail {
+        Some(tail) => format!("你上一段的结尾是「…{tail}」，这一段要从它后面接着讲。\n"),
+        None => String::new(),
+    };
     format!(
-        "【继续讲】对方让你一直说、不要停，你正在讲第 {chunk} 段。接着**上一段的下一句**往下讲：\
-         不要重新开头、不要总结、不要问他问题、不要说\"你还在听吗\"。\n\
+        "【继续讲】对方让你一直说、不要停，你正在讲第 {chunk} 段。\n{tail}\
+         开场就是**下一句内容本身**：不要用\"好，那我接着讲\"\"那我接着说\"\"话说\"这类过渡语\
+         （连讲时每段都这么开场最假，对方已经听腻了）；也不要重新开头、不要复述上一段讲过的事、\
+         不要重复上一段的句式、不要问他问题、不要说\"你还在听吗\"。\n\
          还有下文就继续写，正文之后另起一行只写 [[继续]]；这段讲完了就不要带这个标记。"
     )
+}
+
+/// 取她最后说过那句的结尾，供连讲提示词接续（只要几十个字，够定位就行）。
+fn last_spoken_tail(transcript: &Arc<Mutex<Vec<Turn>>>, max_chars: usize) -> Option<String> {
+    let turns = transcript
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let text = turns
+        .iter()
+        .rev()
+        .find(|turn| !turn.from_peer)?
+        .text
+        .trim()
+        .to_owned();
+    if text.is_empty() {
+        return None;
+    }
+    let skip = text.chars().count().saturating_sub(max_chars);
+    Some(text.chars().skip(skip).collect())
+}
+
+/// 连讲两段之间的"换气"。
+///
+/// 固定间隔听起来就是机器：真人讲故事时，句子之间大多只轻轻一顿，偶尔才停长一点
+/// 想一想。所以这里按那个分布抽：一半左右几乎不停，四成停两三百毫秒，剩下偶尔
+/// 拉到一秒上下。模型调用和 TTS 首包本身还要占 0.8–1.5 秒，这层只是给那个固定
+/// 的停顿加上人味。
+fn breath_pause() -> Duration {
+    let mut rng = rand::rng();
+    match rng.random_range(0..100) {
+        0..=49 => Duration::from_millis(rng.random_range(0..=150)),
+        50..=89 => Duration::from_millis(rng.random_range(200..=600)),
+        _ => Duration::from_millis(rng.random_range(800..=1_500)),
+    }
 }
 
 /// "一直说不要停"：她说完一段还带着 `[[继续]]` 时，宿主立刻让她接着讲下一段。
@@ -934,7 +1002,18 @@ async fn continue_monologue(
             println!("[INFO] QQ 通话连讲：对方开口了，先停下听他说");
             return true;
         }
-        let hint = continuation_prompt(chunk);
+        // 先换口气再开口：间隔是抽出来的，不是每次都一样长。
+        let pause = breath_pause();
+        if !pause.is_zero() {
+            kovi::tokio::time::sleep(pause).await;
+            // 换气期间对方开口了就让他说，别把这一段的开头压在人家话上。
+            if peer_is_speaking_now(peer_voice_at, clock) || interrupts.try_recv().is_ok() {
+                println!("[INFO] QQ 通话连讲：换气时对方开口了，先停下听他说");
+                return true;
+            }
+        }
+        let tail = last_spoken_tail(transcript, CONTINUATION_TAIL_CHARS);
+        let hint = continuation_prompt(chunk, tail.as_deref());
         let turn = generate_reply(
             config,
             context,
@@ -1888,6 +1967,9 @@ fn phone_system_prompt(config: &QqCallConfig, tools_enabled: bool, peer: &str) -
          **另起一行**只写 [[继续]]，宿主会立刻接着让你讲下一段；对方随时可能开口打断你，\
          那是正常的（说明他在听），不用道歉也不用重新开头。讲完了、或者对方岔开了话题，\
          就不要带这个标记。\n\
+         【接着讲的时候怎么开口】不管是他让你继续、还是宿主让你继续，都**不要**用\
+         \"好，那我接着讲\"\"那我接着说\"\"好的，继续\"这类过渡语开场——连着讲几段、\
+         每段都这么起头最假。直接从下一句内容讲起，也别重复上一段的句式和说法。\n\
          【挂断约定】对方表示要结束通话时（说再见、说“挂了吧/先挂/不聊了”，\
          或明显在收尾），你先回一句自然的道别，并在整条回复的最后加上 [[挂断]]；\
          这会让电话真的挂掉。其它任何时候都不要带这个标记。",
@@ -2092,11 +2174,12 @@ async fn archive_call(
 mod tests {
     use super::{
         CallPhase, EndTrigger, NO_END, PeerVoiceAt, PhoneReply, PhoneTurn, TOOL_ARGUMENT_LOG_CHARS,
-        TOOL_FACT_HISTORY_CHARS, ToolFact, ToolOutcome, Turn, build_messages, claimed_action,
-        commitment_nudge, continuation_prompt, counts_as_peer_activity, idle_delay, idle_prompt,
-        peer_is_speaking_now, phone_system_prompt, preview_chars, render_self_test, request_end,
-        requested_end, sanitize_reply, strip_protocol_markers, summarize_tool_arguments,
-        unbacked_action_claim, wants_continue, wants_hangup, wants_monologue,
+        TOOL_FACT_HISTORY_CHARS, ToolFact, ToolOutcome, Turn, base_delay, breath_pause,
+        build_messages, claimed_action, commitment_nudge, continuation_prompt,
+        counts_as_peer_activity, idle_delay, idle_prompt, peer_is_speaking_now,
+        phone_system_prompt, preview_chars, render_self_test, request_end, requested_end,
+        sanitize_reply, strip_protocol_markers, summarize_tool_arguments, unbacked_action_claim,
+        wants_continue, wants_hangup, wants_monologue,
     };
     use crate::config::QqCallConfig;
     use serde_json::Value;
@@ -2257,12 +2340,45 @@ mod tests {
     /// 连讲现场的说明必须点名"接着上一段"，并且不许她再问"你还在听吗"。
     #[test]
     fn continuation_prompt_picks_up_where_she_stopped() {
-        let hint = continuation_prompt(3);
+        let hint = continuation_prompt(3, Some("蹲在窗台上晒太阳。"));
         assert!(hint.contains("第 3 段"));
-        assert!(hint.contains("接着"));
+        assert!(hint.contains("蹲在窗台上晒太阳。"), "要把上一段结尾贴回去");
         assert!(hint.contains("不要重新开头"));
         assert!(hint.contains("你还在听吗"));
         assert!(hint.contains("[[继续]]"));
+        // 线上原话：每段都用同一句"好，那我接着讲"开场，一字不差出现两次。
+        assert!(hint.contains("好，那我接着讲"));
+        assert!(hint.contains("过渡语"));
+        // 没有上一段时也不能崩。
+        assert!(continuation_prompt(1, None).contains("第 1 段"));
+    }
+
+    /// 换气要抽出来，不能每次都一样长——固定间隔听起来就是机器。
+    #[test]
+    fn breath_pauses_vary_between_chunks() {
+        let samples: Vec<u128> = (0..400).map(|_| breath_pause().as_millis()).collect();
+        let short = samples.iter().filter(|ms| **ms <= 150).count();
+        let long = samples.iter().filter(|ms| **ms >= 800).count();
+        // 一半左右几乎不停，偶尔才停长一点。
+        assert!(short > 100, "短停顿太少: {short}");
+        assert!(long > 20, "长停顿太少: {long}");
+        assert!(
+            samples
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+                > 50,
+            "停顿长度几乎没有变化，等于固定间隔"
+        );
+    }
+
+    /// 提示词里"接着讲"那一条：直接要"接着讲"时也不许用过渡语开场。
+    #[test]
+    fn phone_prompt_bans_formulaic_openers() {
+        let prompt = phone_system_prompt(&QqCallConfig::default(), true, "朋友（1）");
+        assert!(prompt.contains("不要"));
+        assert!(prompt.contains("好，那我接着讲"));
+        assert!(prompt.contains("过渡语"));
     }
 
     /// 对方说"不要停"之后，安静的含义是"接着说"，不是"你怎么了"。
@@ -2283,6 +2399,15 @@ mod tests {
         assert!(hint.contains("接着上一段"));
         assert!(!hint.contains("你还在吗"));
         assert!(hint.contains("[[继续]]"));
+        // 连讲时沉默几秒就该接上，不是等满 20 秒把故事晾在那儿。
+        assert_eq!(
+            base_delay(Duration::from_secs(20), true),
+            Duration::from_secs(4)
+        );
+        assert_eq!(
+            base_delay(Duration::from_secs(20), false),
+            Duration::from_secs(20)
+        );
     }
 
     #[test]
