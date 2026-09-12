@@ -499,6 +499,7 @@ fn redis_scope(scope: ReplyScope) -> (&'static str, i64) {
         ReplyScope::Group(group_id) => ("group", group_id),
         ReplyScope::Private(user_id) => ("private", user_id),
         ReplyScope::Scheduled(task_id) => ("scheduled", task_id),
+        ReplyScope::Call(peer_uin) => ("call", peer_uin),
     }
 }
 

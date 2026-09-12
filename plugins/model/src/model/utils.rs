@@ -1545,6 +1545,7 @@ fn log_unusable_reply_protocol(scope: super::interrupt::ReplyScope, phase: &str,
         super::interrupt::ReplyScope::Group(group_id) => format!("群聊 {group_id}"),
         super::interrupt::ReplyScope::Private(user_id) => format!("私聊 {user_id}"),
         super::interrupt::ReplyScope::Scheduled(task_id) => format!("定时任务 {task_id}"),
+        super::interrupt::ReplyScope::Call(peer_uin) => format!("语音通话 {peer_uin}"),
     };
     let compact = content.replace(['\r', '\n'], " ");
     let preview = if compact.trim().is_empty() {

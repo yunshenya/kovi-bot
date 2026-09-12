@@ -261,7 +261,7 @@ async fn reply_action_candidates_context(
                 .find(|target| target.message_id == message_id && target.at_user_ref.is_some())
                 .cloned()
         }),
-        ReplyScope::Private(_) | ReplyScope::Scheduled(_) => None,
+        ReplyScope::Private(_) | ReplyScope::Scheduled(_) | ReplyScope::Call(_) => None,
     };
     let bot_messages = recent_bot_messages(scope).await;
     if entries.is_empty()

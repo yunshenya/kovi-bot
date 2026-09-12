@@ -107,8 +107,9 @@ pub struct QqCallConfig {
     /// 是否允许机器人主动拨打（默认开启）。
     ///
     /// 触发方式只有一种：授权名单里的人私聊发 `#打给我`——即"谁让我打，我就打给谁"，
-    /// 不接受任意号码，避免变成骚扰工具。AVSDK 侧的外呼通道（cmd 4）仍在定标，命令
-    /// 可能被丢弃，所以机器人会在几秒后确认"电话到底有没有响"，打不出去就如实回复。
+    /// 不接受任意号码，避免变成骚扰工具。AVSDK 侧的外呼通道（cmd 4 + JSON payload）
+    /// 已真机验证可用，机器人按 AVSDK 的 `20021` 回执确认"电话到底有没有响"，
+    /// 几秒内没回执就如实回复。注意呼出的通话不会让桥进入 ringing/connected。
     outgoing_enabled: bool,
     /// 漏接来电时是否私聊告诉主管理员（默认开启）。
     ///
@@ -116,6 +117,22 @@ pub struct QqCallConfig {
     /// 成因是来电被路由到主 QQ 那台设备、AV Host 的 AVSDK 没拿到邀请，接听参数无从
     /// 产生。这种失败以前完全静默——只能从"她没接"察觉，所以补一条主动通知。
     notify_missed_calls: bool,
+    /// 通话中是否允许她使用工具（默认开启）。
+    ///
+    /// 打开后，电话模型会拿到与私聊同一套受控工具（按来电者身份做管理员门控：
+    /// 主管理员才有跨群发消息、持续任务这些），所以电话里让她"帮我给群里说一声"
+    /// 或者"提醒我明天开会"会真的执行。关掉即回到旧行为：她只能说话、动不了手，
+    /// 并且会如实说自己在打电话做不了。
+    phone_tools_enabled: bool,
+    /// 她为了等工具结果而要挂起几秒时，先说的那句填充语。
+    ///
+    /// 电话里几秒没声音像掉线，所以第一次要跑工具前先说这一句。空字符串＝不说。
+    tool_filler: String,
+    /// 一次回复里最多允许几轮工具调用。
+    ///
+    /// 模型可能来回调用把电话拖住（电话是实时对话，不是异步任务），所以到上限后
+    /// 强制它用一句人话收尾。默认 3 轮足够覆盖"先查时间再算日期再建提醒"这类串联。
+    tool_max_rounds: usize,
 }
 
 impl QqCallConfig {
@@ -289,6 +306,19 @@ impl QqCallConfig {
     /// 会话结束时是否让桥真的挂断电话。
     pub fn hangup_enabled(&self) -> bool {
         self.hangup_enabled
+    }
+
+    pub fn phone_tools_enabled(&self) -> bool {
+        self.phone_tools_enabled
+    }
+
+    pub fn tool_filler(&self) -> &str {
+        &self.tool_filler
+    }
+
+    /// 至少 1 轮：0 会让工具通道形同虚设，配置写错时按 1 处理而不是静默失效。
+    pub fn tool_max_rounds(&self) -> usize {
+        self.tool_max_rounds.max(1)
     }
 
     /// 该 QQ 号是否允许来电。白名单为空时只允许主管理员。
@@ -490,6 +520,9 @@ impl Default for QqCallConfig {
             archive_to_memory: true,
             notify_missed_calls: true,
             outgoing_enabled: true,
+            phone_tools_enabled: true,
+            tool_filler: "嗯……我看一下。".to_string(),
+            tool_max_rounds: 3,
         }
     }
 }
@@ -575,6 +608,20 @@ mod tests {
         assert!(config.hangup_enabled());
         assert!(config.notify_missed_calls());
         assert!(config.outgoing_enabled());
+    }
+
+    #[test]
+    fn phone_tools_are_on_by_default_with_a_bounded_round_budget() {
+        let config = QqCallConfig::default();
+        assert!(config.phone_tools_enabled());
+        assert!(!config.tool_filler().trim().is_empty());
+        assert_eq!(config.tool_max_rounds(), 3);
+        // 配成 0 等于把工具通道悄悄关掉，按 1 处理而不是静默失效。
+        let zero = QqCallConfig {
+            tool_max_rounds: 0,
+            ..QqCallConfig::default()
+        };
+        assert_eq!(zero.tool_max_rounds(), 1);
     }
 
     #[test]
