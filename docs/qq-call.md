@@ -320,6 +320,12 @@ MAIBOT_QQ_CALL_BOT_UIN="<机器人QQ号>" \
 | `close` + **机器人自己的 uid** | ❌ 同上 | — |
 | `clearRoom`(cmd 11) + 来电者 uid | ❌ 同上 | — |
 
+**读状态时的坑**：`ending` 不是 AVSDK 报的，而是桥插件在**受理任何一次挂断请求**时自己先写的
+（`POST /v1/calls/hangup` 一进来就置位），所以 `close`/`quit`/`clearRoom`/uid 留空/uid 传自己
+全都显示 `ending`——它只说明"请求被桥收下了"，不代表电话在挂。判断是否真的挂了要看
+**`ended` + `endReason` 非空**，以及 AVSDK 事件计数是否停止增长：cmd 8 那几次 `ending` 期间
+事件计数从 601 一路涨到 721、`endReason` 始终为空，就是"没挂"的铁证。
+
 结论：
 
 - **唯一能真正结束通话的是 `close` + 来电者 uid**（`roomId` 填 0 或 1 都行；uid 不能省，
