@@ -241,6 +241,13 @@ asset_dir = "models/yunxi-turngate"
 # `response_mode == "active" && engine_available()`，而 engine_available 取决于
 # models/yunxi-turngate 那个**训练出来的** bundle。没有 bundle 时 active 等于
 # 就位待命（bundle 一装上立即生效），不会凭空改变行为。
+#
+# ⚠️ 装上第一个 bundle 之前先想清楚灰度顺序：这个字段设成 active 时，
+# **没有影子阶段**——bundle 一放进 asset_dir 重启就立刻参与路由，而且群聊和
+# 私聊一起生效。设计文档 §7.4 E 规划的放开顺序是"先 completion，再 response；
+# response 先私聊，再谨慎开群聊"。所以正式训练出第一版之后，建议先把这里拨回
+# "shadow" 跑一段，用 #turn-gate-status 看 FP(误接)/FN(漏接) 记账，再按
+# 私聊 → 群聊的顺序放开；下面 completion 的 `mode` 同理。
 response_mode = "active"
 
 [message_batch]
