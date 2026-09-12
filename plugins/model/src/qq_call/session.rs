@@ -24,7 +24,7 @@ use crate::model::{
     BotMemory, MessageDestination, ReplyScope, ReplyTicket, Roles, ToolExecutionContext, interrupt,
     tool_registry,
 };
-use crate::speech::SpeechClient;
+use crate::speech::{SpeechClient, SpeechStream};
 use kovi::tokio::sync::mpsc;
 use rand::RngExt;
 use serde_json::Value;
@@ -958,21 +958,6 @@ fn last_spoken_tail(transcript: &Arc<Mutex<Vec<Turn>>>, max_chars: usize) -> Opt
     Some(text.chars().skip(skip).collect())
 }
 
-/// 连讲两段之间的"换气"。
-///
-/// 固定间隔听起来就是机器：真人讲故事时，句子之间大多只轻轻一顿，偶尔才停长一点
-/// 想一想。所以这里按那个分布抽：一半左右几乎不停，四成停两三百毫秒，剩下偶尔
-/// 拉到一秒上下。模型调用和 TTS 首包本身还要占 0.8–1.5 秒，这层只是给那个固定
-/// 的停顿加上人味。
-fn breath_pause() -> Duration {
-    let mut rng = rand::rng();
-    match rng.random_range(0..100) {
-        0..=49 => Duration::from_millis(rng.random_range(0..=150)),
-        50..=89 => Duration::from_millis(rng.random_range(200..=600)),
-        _ => Duration::from_millis(rng.random_range(800..=1_500)),
-    }
-}
-
 /// "一直说不要停"：她说完一段还带着 `[[继续]]` 时，宿主立刻让她接着讲下一段。
 ///
 /// 为什么必须有宿主这一层：模型一次只能生成一段，段与段之间如果等对方开口，就变成
@@ -986,7 +971,7 @@ async fn continue_monologue(
     context: &str,
     transcript: &Arc<Mutex<Vec<Turn>>>,
     tools: Option<&PhoneTools>,
-    speech: &SpeechClient,
+    speech: &Arc<SpeechClient>,
     interrupts: &mut mpsc::Receiver<()>,
     end_signal: &EndSignal,
     peer: &str,
@@ -1002,8 +987,9 @@ async fn continue_monologue(
             println!("[INFO] QQ 通话连讲：对方开口了，先停下听他说");
             return true;
         }
-        // 先换口气再开口：间隔是抽出来的，不是每次都一样长。
-        let pause = breath_pause();
+        // 先换口气再开口：用的是和句间停顿同一个抽签函数，所以段界与句间听起来
+        // 是一回事，不会显得突兀。
+        let pause = speech_pause();
         if !pause.is_zero() {
             kovi::tokio::time::sleep(pause).await;
             // 换气期间对方开口了就让他说，别把这一段的开头压在人家话上。
@@ -1061,9 +1047,18 @@ async fn continue_monologue(
     false
 }
 
-/// 合成并播放一句话。边合成边写入，首包到达即出声。
+/// 合成并播放一句话：**分句播出**，句与句之间按抽签停一下。
+///
+/// 为什么要分句（2026-09-13 二次调）：以前整段文字一次合成、一次播完，句间的停顿
+/// 完全由 TTS 固定的韵律决定；而"连讲"在段与段之间必然有一段真实的等待（模型调用 +
+/// 首包），两者一比，换气就显得又长又突兀。现在把回复拆成一句一句播，中间插入
+/// **抽签长度**的静音——正常讲话本身就有长有短，连讲的换气落在同一个分布里，
+/// 听起来就是她在想下一句，而不是机器卡了一下。
+///
+/// 预取：播第 N 句时后台已经在合成第 N+1 句，所以停顿里不含 TTS 首包时间；
+/// 打段用真正的静音帧（不是干等），保证 pacat 不欠载、时长也可控。
 async fn speak(
-    speech: &SpeechClient,
+    speech: &Arc<SpeechClient>,
     config: &QqCallConfig,
     text: &str,
     interrupts: &mut mpsc::Receiver<()>,
@@ -1071,37 +1066,190 @@ async fn speak(
     // 丢掉上一轮遗留的打断信号，避免新回复刚开口就被打断。
     while interrupts.try_recv().is_ok() {}
 
-    let mut stream = speech.synthesize(text).await?;
-    let mut playback = Playback::spawn(config, stream.sample_rate())?;
-    loop {
-        kovi::tokio::select! {
-            biased;
-            signal = interrupts.recv() => {
-                playback.interrupt().await;
-                return match signal {
-                    Some(()) => Ok(SpeakOutcome::Interrupted),
-                    None => Err(anyhow::anyhow!("通话打断通道已关闭")),
-                };
-            }
-            chunk = stream.next_chunk() => {
-                match chunk {
-                    Ok(Some(pcm)) => {
-                        if let Err(error) = playback.write(&pcm).await {
+    let segments = speech_segments(text);
+    let Some(first) = segments.first() else {
+        return Err(anyhow::anyhow!("没有可播报的文本"));
+    };
+    let mut pending = Some(kovi::tokio::spawn(synthesize_segment(
+        Arc::clone(speech),
+        first.clone(),
+    )));
+    let mut playback: Option<Playback> = None;
+    let mut sample_rate = config.tts_sample_rate();
+
+    for (index, _) in segments.iter().enumerate() {
+        let handle = pending.take().expect("每一段都有对应的合成任务");
+        let mut stream = match handle.await {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(error)) => return Err(error),
+            Err(join_error) => return Err(anyhow::anyhow!("语音合成任务失败: {join_error}")),
+        };
+        // 同一套本机服务，采样率一致；以第一段为准（响应头 X-Sample-Rate）。
+        if playback.is_none() {
+            sample_rate = stream.sample_rate();
+            playback = Some(Playback::spawn(config, sample_rate)?);
+        }
+        let playback = playback.as_mut().expect("上面刚建好");
+        // 先把下一段丢进后台合成，它会在这一段播放期间跑完。
+        if let Some(next) = segments.get(index + 1) {
+            pending = Some(kovi::tokio::spawn(synthesize_segment(
+                Arc::clone(speech),
+                next.clone(),
+            )));
+        }
+
+        loop {
+            kovi::tokio::select! {
+                biased;
+                signal = interrupts.recv() => {
+                    stop_pending(&mut pending);
+                    playback.interrupt().await;
+                    return match signal {
+                        Some(()) => Ok(SpeakOutcome::Interrupted),
+                        None => Err(anyhow::anyhow!("通话打断通道已关闭")),
+                    };
+                }
+                chunk = stream.next_chunk() => {
+                    match chunk {
+                        Ok(Some(pcm)) => {
+                            if let Err(error) = playback.write(&pcm).await {
+                                stop_pending(&mut pending);
+                                playback.interrupt().await;
+                                return Err(error);
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(error) => {
+                            stop_pending(&mut pending);
                             playback.interrupt().await;
                             return Err(error);
                         }
                     }
-                    Ok(None) => break,
-                    Err(error) => {
-                        playback.interrupt().await;
-                        return Err(error);
-                    }
+                }
+            }
+        }
+
+        if segments.get(index + 1).is_some() {
+            match write_silence(playback, sample_rate, speech_pause(), interrupts).await? {
+                true => {}
+                false => {
+                    stop_pending(&mut pending);
+                    playback.interrupt().await;
+                    return Ok(SpeakOutcome::Interrupted);
                 }
             }
         }
     }
-    playback.finish().await?;
+
+    stop_pending(&mut pending);
+    if let Some(playback) = playback.as_mut() {
+        playback.finish().await?;
+    }
     Ok(SpeakOutcome::Completed)
+}
+
+/// 预取任务用完就掐掉，别让它在我们已经不需要时还占着 TTS。
+fn stop_pending(pending: &mut Option<kovi::tokio::task::JoinHandle<anyhow::Result<SpeechStream>>>) {
+    if let Some(handle) = pending.take() {
+        handle.abort();
+    }
+}
+
+/// 后台合成一段文字。分句播放靠它预取下一句。
+async fn synthesize_segment(
+    speech: Arc<SpeechClient>,
+    text: String,
+) -> anyhow::Result<SpeechStream> {
+    speech.synthesize(&text).await
+}
+
+/// 写入 `pause` 长度的静音；期间对方插话就返回 `false`。
+///
+/// 按 100 毫秒一片写，这样停顿期间也能立刻响应打断——不能为了"喘口气"让电话
+/// 变得听不见。写入受声卡实时速率限制，所以这里写多久，对方就真的听到多久的静音。
+async fn write_silence(
+    playback: &mut Playback,
+    sample_rate: u32,
+    pause: Duration,
+    interrupts: &mut mpsc::Receiver<()>,
+) -> anyhow::Result<bool> {
+    const SLICE_MS: u64 = 100;
+    let total_ms = pause.as_millis() as u64;
+    let bytes_per_ms = u64::from(sample_rate) * 2 / 1000; // s16le 单声道
+    let mut written = 0u64;
+    while written < total_ms {
+        let slice_ms = (total_ms - written).min(SLICE_MS);
+        let silence = vec![0u8; (bytes_per_ms * slice_ms) as usize];
+        kovi::tokio::select! {
+            biased;
+            signal = interrupts.recv() => {
+                return match signal {
+                    Some(()) => Ok(false),
+                    None => Err(anyhow::anyhow!("通话打断通道已关闭")),
+                };
+            }
+            result = playback.write(&silence) => result?,
+        }
+        written += slice_ms;
+    }
+    Ok(true)
+}
+
+/// 把一段话拆成"一口气能念完"的短句，标点跟着上一句走。
+///
+/// 太短的片段（"好。"这种）会并进下一句：否则一句"好"后面就插一个停顿，
+/// 听起来像在打嗝。
+fn speech_segments(text: &str) -> Vec<String> {
+    // 只有"好。""嗯……"这种一两字的语气词才并进邻句；四个字的短句（"第一句。"）
+    // 自己站得住，句后那个停顿正是说话的节奏。
+    const MIN_SEGMENT_CHARS: usize = 4;
+    let mut segments: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for character in text.chars() {
+        current.push(character);
+        if matches!(
+            character,
+            '。' | '！' | '？' | '!' | '?' | '…' | '；' | ';' | '~' | '～'
+        ) {
+            segments.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.trim().is_empty() {
+        segments.push(current);
+    }
+    // 把过短的片段并到前一段（没有前一段就留着，后面会并进下一段）。
+    let mut merged: Vec<String> = Vec::new();
+    for segment in segments {
+        match merged.last_mut() {
+            Some(previous) if previous.chars().count() < MIN_SEGMENT_CHARS => {
+                previous.push_str(&segment)
+            }
+            _ => merged.push(segment),
+        }
+    }
+    // 末段太短也要并回上一段。
+    let tail_is_short = merged
+        .last()
+        .is_some_and(|last| last.chars().count() < MIN_SEGMENT_CHARS);
+    if merged.len() > 1 && tail_is_short {
+        let tail = merged.pop().expect("刚看过还有");
+        merged.last_mut().expect("长度大于 1").push_str(&tail);
+    }
+    merged
+}
+
+/// 讲话中间那口气：长短抽签，不是每次都一样。
+///
+/// 真人说话，句子之间大多只轻轻一顿，偶尔停久一点像在想下一句。连讲的段间换气
+/// 用的是**同一个函数**——同分布才不会显得突兀，这是 2026-09-13 线上要求的效果。
+fn speech_pause() -> Duration {
+    let mut rng = rand::rng();
+    match rng.random_range(0..100) {
+        0..=49 => Duration::from_millis(rng.random_range(150..=400)),
+        50..=81 => Duration::from_millis(rng.random_range(450..=900)),
+        82..=94 => Duration::from_millis(rng.random_range(900..=1_600)),
+        _ => Duration::from_millis(rng.random_range(1_600..=2_800)),
+    }
 }
 
 /// 模型给出的一句电话回复，以及她自己对"接下来怎么办"的判断。
@@ -1254,7 +1402,9 @@ struct PhoneTurn {
 /// 工具等待期间"出声"的出口：通话里真的说出来，试跑时只记下本来会说哪句。
 enum PhoneVoice<'a> {
     Speak {
-        speech: &'a SpeechClient,
+        // 持 Arc 而不是 &：分句播放要在"播前一句"的同时把后一句合成起来（预取），
+        // 那需要一个能 move 进后台任务的句柄。
+        speech: &'a Arc<SpeechClient>,
         interrupts: &'a mut mpsc::Receiver<()>,
     },
     Silent {
@@ -2206,12 +2356,12 @@ async fn archive_call(
 mod tests {
     use super::{
         CallPhase, EndTrigger, NO_END, PeerVoiceAt, PhoneReply, PhoneTurn, TOOL_ARGUMENT_LOG_CHARS,
-        TOOL_FACT_HISTORY_CHARS, ToolFact, ToolOutcome, Turn, base_delay, breath_pause,
-        build_messages, claimed_action, commitment_nudge, continuation_prompt,
-        counts_as_peer_activity, idle_delay, idle_prompt, peer_is_speaking_now,
-        phone_system_prompt, preview_chars, render_self_test, request_end, requested_end,
-        retry_worthy_claim, sanitize_reply, strip_protocol_markers, summarize_tool_arguments,
-        unbacked_action_claim, wants_continue, wants_hangup, wants_monologue,
+        TOOL_FACT_HISTORY_CHARS, ToolFact, ToolOutcome, Turn, base_delay, build_messages,
+        claimed_action, commitment_nudge, continuation_prompt, counts_as_peer_activity, idle_delay,
+        idle_prompt, peer_is_speaking_now, phone_system_prompt, preview_chars, render_self_test,
+        request_end, requested_end, retry_worthy_claim, sanitize_reply, speech_pause,
+        speech_segments, strip_protocol_markers, summarize_tool_arguments, unbacked_action_claim,
+        wants_continue, wants_hangup, wants_monologue,
     };
     use crate::config::QqCallConfig;
     use serde_json::Value;
@@ -2385,15 +2535,17 @@ mod tests {
         assert!(continuation_prompt(1, None).contains("第 1 段"));
     }
 
-    /// 换气要抽出来，不能每次都一样长——固定间隔听起来就是机器。
+    /// 句间停顿要抽出来，不能每次都一样长——固定间隔听起来就是机器。
+    /// 连讲的段间换气用的就是这个函数，所以两者同分布、不会突兀。
     #[test]
-    fn breath_pauses_vary_between_chunks() {
-        let samples: Vec<u128> = (0..400).map(|_| breath_pause().as_millis()).collect();
-        let short = samples.iter().filter(|ms| **ms <= 150).count();
-        let long = samples.iter().filter(|ms| **ms >= 800).count();
-        // 一半左右几乎不停，偶尔才停长一点。
+    fn speech_pauses_vary_and_share_one_distribution() {
+        let samples: Vec<u128> = (0..400).map(|_| speech_pause().as_millis()).collect();
+        let short = samples.iter().filter(|ms| **ms <= 400).count();
+        let long = samples.iter().filter(|ms| **ms >= 900).count();
+        // 一半左右轻轻一顿，偶尔停久一点像在想下一句。
         assert!(short > 100, "短停顿太少: {short}");
-        assert!(long > 20, "长停顿太少: {long}");
+        assert!(long > 10, "长停顿太少: {long}");
+        assert!(samples.iter().all(|ms| *ms >= 150), "最短也不该是 0");
         assert!(
             samples
                 .iter()
@@ -2781,6 +2933,38 @@ mod tests {
         let prompt = phone_system_prompt(&QqCallConfig::default(), true, "朋友（1）");
         assert!(prompt.contains("必须在这一轮真的调用"));
         assert!(prompt.contains("重新调用一次发送工具"));
+    }
+
+    /// 分句播放：标点跟着上一句走，太短的片段并进邻句（否则一句"好"后面插个停顿像打嗝）。
+    #[test]
+    fn replies_are_split_into_breath_sized_segments() {
+        assert_eq!(
+            speech_segments("第一句。第二句！第三句？"),
+            vec!["第一句。", "第二句！", "第三句？"]
+        );
+        // "好。"只有两个字：并进下一句，不该单独成段（否则像打了个嗝）。
+        assert_eq!(speech_segments("好。那我讲咯。"), vec!["好。那我讲咯。"]);
+        // 没有标点就是一整段，不会硬切。
+        assert_eq!(
+            speech_segments("从前有只小猫住在巷子里"),
+            vec!["从前有只小猫住在巷子里"]
+        );
+        // 末尾的短残句也并回上一段，但一个字都不能丢。
+        assert_eq!(
+            speech_segments("它蹲在窗台上。晒太阳"),
+            vec!["它蹲在窗台上。晒太阳"]
+        );
+        // 省略号和分号同样算一口气的边界；不管怎么切，拼回来必须等于原文。
+        for text in [
+            "嗯……我想想；你先说清楚。",
+            "好。那我讲咯。它蹲在窗台上晒太阳，尾巴一晃一晃的。",
+            "第一句。第二句！第三句？",
+        ] {
+            let segments = speech_segments(text);
+            assert!(segments.len() >= 2, "该切成多段: {text} -> {segments:?}");
+            assert_eq!(segments.concat(), text, "切分不能丢字");
+        }
+        assert!(speech_segments("   ").is_empty());
     }
 
     /// 提示词必须教会她"一直说"这条路：写长一点、别问"你还在听吗"、还有下文就带标记。
