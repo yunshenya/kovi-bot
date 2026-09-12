@@ -167,6 +167,26 @@ def render_sample(idx: int, sample: dict) -> str:
     return "\n".join(lines)
 
 
+def render_brief(idx: int, sample: dict, last_turns: int = 3) -> str:
+    """紧凑视图：给"一次贴着标几十条"用，信息够判断但一屏能放好几条。
+
+    与 `--show` 的区别只是排版：上下文只保留最近 `last_turns` 条（本次判断
+    几乎只依赖最近几条），`--show` 仍是完整视图。
+    """
+    ctx = sample.get("context", {})
+    head = f"#{idx} [{queue_reason(sample)}]"
+    parts = [head]
+    fragments = ctx.get("pending_user_fragments") or []
+    if fragments:
+        parts.append(f"  前一句: {' | '.join(str(f) for f in fragments)}")
+    parts.append(f"  当前句: {sample.get('current_text', '')}")
+    for turn in ctx.get("recent_turns", [])[-last_turns:]:
+        role = {"assistant": "芸汐", "user": "同一人", "other_member": "他人"}.get(
+            turn.get("role"), turn.get("role"))
+        parts.append(f"    {role}: {turn.get('text')}")
+    return "\n".join(parts)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--batch", required=True, type=Path)
@@ -175,6 +195,8 @@ def main() -> int:
                         help="按标注价值排出待复核顺序（不改变任何标签）")
     parser.add_argument("--show", type=int, metavar="IDX",
                         help="打印单条样本的正文/上下文/弱标签")
+    parser.add_argument("--brief", action="store_true",
+                        help="--slice 时输出紧凑视图：正文 + 前一句 + 最近 3 条上下文")
     parser.add_argument("--limit", type=int, default=DEFAULT_QUEUE_LIMIT,
                         help=f"--queue 打印多少行，0 表示全部（默认 {DEFAULT_QUEUE_LIMIT}）")
     parser.add_argument("--slice", metavar="START:END",
@@ -231,6 +253,27 @@ def main() -> int:
             print("index out of range", file=sys.stderr)
             return 1
         print(render_sample(args.show, samples[args.show]))
+        return 0
+
+    if args.brief:
+        # `--brief` 配合 `--slice START:COUNT` 用：贴着标的时候每条 3-6 行，
+        # 一屏能看几条；不带 --slice 就取队列最前 DEFAULT_QUEUE_LIMIT 条。
+        start, count = 0, DEFAULT_QUEUE_LIMIT
+        if args.slice:
+            head, _, tail = args.slice.partition(":")
+            try:
+                start, count = int(head), int(tail)
+            except ValueError:
+                print("--brief 需要 --slice START:COUNT，例如 0:40", file=sys.stderr)
+                return 1
+            if start < 0 or count < 0:
+                print("--slice 不接受负数", file=sys.stderr)
+                return 1
+        rows = build_queue(samples, 0, args.include_reviewed)[start:start + count]
+        for idx, sample in rows:
+            print(render_brief(idx, sample))
+            print()
+        print(f"(共 {len(rows)} 条；标注: --mark <idx> completion=... response=...)")
         return 0
 
     if args.status:
