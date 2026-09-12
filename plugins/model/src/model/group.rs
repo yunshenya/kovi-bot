@@ -19,8 +19,9 @@ use crate::model::semantic::{MessageUnderstanding, UnderstandingRequest, underst
 use crate::model::traffic::{InboundScope, bounded_input, should_suppress};
 use crate::model::utils::{
     clear_group_runtime_data, command_help, is_agent_task_command, is_bot_admin, is_group_paused,
-    is_help_command, is_restricted_command, learn_user_profile_from_message,
-    process_group_reply_claimed, report_vision_failure, send_sys_info, set_group_paused,
+    is_help_command, is_private_only_command, is_restricted_command,
+    learn_user_profile_from_message, process_group_reply_claimed, report_vision_failure,
+    send_sys_info, set_group_paused,
 };
 use crate::redis_store;
 use crate::reminders;
@@ -312,13 +313,12 @@ pub(crate) async fn group_message_event_after_ingress(
         );
         return;
     }
-    if matches!(
-        message.trim(),
-        "#mind-status" | "#intrinsic-status" | "#executive-status"
-    ) {
+    if is_private_only_command(message) {
         println!(
-            "[INFO] 群聊 Yunxi 状态命令已忽略（仅限管理员私聊） (群组: {}, 用户: {})",
-            group_id, event.user_id
+            "[INFO] 群聊私聊专用命令已忽略（仅限私聊） (群组: {}, 用户: {}, 命令: {})",
+            group_id,
+            event.user_id,
+            message.trim()
         );
         return;
     }

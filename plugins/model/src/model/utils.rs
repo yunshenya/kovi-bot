@@ -196,6 +196,32 @@ pub(crate) fn command_help() -> &'static str {
     "管理员可用指令：\n聊天：直接发送消息，或 @芸汐。\n图片：#看图、#看截图、#识图。\n提醒：直接说“提醒我……”即可创建提醒。\n持续任务：主管理员可在私聊中直接要求定期监测公开 URL，并自然地查看或取消任务。\n管理员：#系统信息、#健康检查、#禁言、#结束禁言；私聊可用 #mind-status、#intrinsic-status、#executive-status、#turn-gate-status、#立场、#通话状态 查看有界运行状态；主管理员与副管理员可以发 #打给我 让芸汐主动打过来，也可以发 #通话自检 问题 先离线验一遍电话里的工具链路（通话名单管的是谁能打进来，名单里的非管理员用不了这两条命令）。\n表情：引用或附带表情后直接描述含义即可教学，也可使用 #教芸汐、#待确认表情、#确认表情 编号 含义、#驳回表情 编号、#忽略表情 编号。\n群授权：#授权群 群号、#取消授权群 群号、#授权群列表。\n通话授权：#授权通话 QQ号、#取消授权通话 QQ号、#通话名单（主管理员与副管理员默认可以和芸汐通话）。\n私聊授权：#授权好友 QQ号、#取消授权好友 QQ号、#好友名单（授权后对方可私聊芸汐，仅主管理员可执行）。\n主管理员：#授权管理员 QQ号、#取消授权管理员 QQ号、#授权管理员列表；私聊中可以直接让芸汐去已授权群发消息。\n跨群问答：#群问答、#群问答状态 任务编号、#取消群问答 任务编号。\n数据：私聊发送 #删除我的数据；群内发送 #删除本群数据。\n也可以直接说“查看系统信息”“检查健康状态”“暂停本群回复”或“恢复本群回复”。"
 }
 
+/// 只在私聊里生效的控制命令。
+///
+/// 这些命令在群里没有意义——"谁让我打给谁"、"删除我的数据"、看谁的心智状态——
+/// 群聊路径收到时必须**明确丢弃并留日志**。以前只有 `#mind-status` 那三条在群里
+/// 有归宿，其它几条会掉进群聊链路被当成普通消息（2026-09-12 真机上，主管理员在群里
+/// 发 `#立场` 就这样石沉大海）。
+pub(crate) fn is_private_only_command(message: &str) -> bool {
+    let text = message.trim();
+    matches!(
+        text,
+        "#mind-status"
+            | "#intrinsic-status"
+            | "#executive-status"
+            | "#turn-gate-status"
+            | "#立场"
+            | "#信念"
+            | "#通话状态"
+            | "#通话诊断"
+            | "#打给我"
+            | "#打电话给我"
+            | "#删除我的数据"
+            | "#删除我的数据 确认"
+    ) || text.starts_with("#通话自检")
+        || text.starts_with("#电话自检")
+}
+
 pub(crate) fn is_restricted_command(message: &str) -> bool {
     let text = message.trim();
     is_help_command(text)
@@ -4295,13 +4321,42 @@ mod tests {
         assistant_tool_calls_wire, build_model_messages, build_responses_input,
         build_responses_request_body, compression_cutoff, extract_message_tool_calls,
         extract_stream_delta, finalize_native_tool_calls, format_plain_style_context,
-        group_system_prompt, is_group_admin_command, is_help_command, is_restricted_command,
-        likely_requires_tool_protocol, limit_memory_size, model_attempt_count,
-        neutralize_protocol_markers, parse_stream_line, plain_reply_plan,
+        group_system_prompt, is_group_admin_command, is_help_command, is_private_only_command,
+        is_restricted_command, likely_requires_tool_protocol, limit_memory_size,
+        model_attempt_count, neutralize_protocol_markers, parse_stream_line, plain_reply_plan,
         plain_reply_plan_for_host, reply_action_protocol_requested, sanitize_scheduled_output,
         should_repair_empty_reply, tool_result_wire, with_reference_context,
     };
     use super::{is_group_paused, set_group_paused};
+
+    #[test]
+    fn private_only_commands_are_recognised_so_groups_can_drop_them() {
+        // 群聊路径靠这个判据把私聊专用命令挡在聊天链路之外。
+        // 2026-09-12 真机：主管理员在群里发 #立场，因为不在任何分支里，
+        // 直接掉进群聊链路，本人看到的是"发了没反应"。
+        for command in [
+            "#立场",
+            "#信念",
+            "#mind-status",
+            "#intrinsic-status",
+            "#executive-status",
+            "#turn-gate-status",
+            "#通话状态",
+            "#通话诊断",
+            "#打给我",
+            "#打电话给我",
+            "#通话自检 现在几点",
+            "#删除我的数据",
+            "#删除我的数据 确认",
+        ] {
+            assert!(is_private_only_command(command), "{command} 应在群里被丢弃");
+        }
+        // 群里本来就有的命令不能被误伤。
+        for command in ["#禁言", "#结束禁言", "#系统信息", "#帮助", "#删除本群数据"]
+        {
+            assert!(!is_private_only_command(command), "{command} 是群聊命令");
+        }
+    }
 
     #[test]
     fn every_admin_only_private_command_is_a_restricted_command() {
