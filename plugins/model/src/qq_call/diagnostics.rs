@@ -204,6 +204,17 @@ pub(crate) async fn status_report(bot: &kovi::RuntimeBot, config: &QqCallConfig)
     lines.join("\n")
 }
 
+/// "漏接来电"通知的文案：有过邀请、但整通从未进房。
+///
+/// 这种失败以前完全静默（只能从"她没接"察觉），所以文案要说清"是什么事"，
+/// 而不是只丢一个状态码；不确定的来电者信息不编造。
+pub(super) fn missed_call_notice(caller: Option<i64>, caller_name: Option<&str>) -> String {
+    format!(
+        "刚才有一通 QQ 语音来电（{}），但我没能接起来——来电可能被路由到了另一台设备。",
+        caller_label(caller, caller_name)
+    )
+}
+
 /// 机器人写给桥的接听授权名单概况。
 fn allowlist_summary(config: &QqCallConfig) -> String {
     if !config.caller_allowlist_enabled() {
@@ -260,6 +271,16 @@ async fn describe_current(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn missed_call_notice_names_the_caller_without_inventing_one() {
+        let named = super::missed_call_notice(Some(3052405886), Some("小猫"));
+        assert!(named.contains("小猫(3052405886)"), "{named}");
+        // 解析不出来电者时走 caller_label 的"未能解析"文案，不编造身份。
+        let unknown = super::missed_call_notice(None, None);
+        assert!(unknown.contains("未能解析"), "{unknown}");
+        assert!(!unknown.contains("3052405886"), "{unknown}");
+    }
+
     use super::{CallTrace, caller_label, phase_description, render_last_call};
     use crate::qq_call::bridge::CallPhase;
     use chrono::Local;

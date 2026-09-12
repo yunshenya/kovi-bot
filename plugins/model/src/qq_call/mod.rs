@@ -23,6 +23,7 @@ mod session;
 mod vad;
 
 use crate::config;
+use crate::model::{MessageDestination, OutgoingSource, send_tracked_message_with_revalidation};
 use bridge::{BridgeClient, CallPhase, CallState};
 use diagnostics::{caller_label, phase_description};
 use session::caller_is_allowed;
@@ -31,6 +32,9 @@ use std::time::Duration;
 
 /// 同一类桥错误的最短重复日志间隔，避免桥长时间离线时刷日志。
 const ERROR_LOG_INTERVAL: Duration = Duration::from_secs(300);
+
+/// 漏接来电通知的发送超时（通知失败绝不能拖住通话状态机）。
+const MISSED_NOTICE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// 启动 QQ 语音通话调度器。默认关闭，未启用时立即返回。
 pub(crate) async fn start_scheduler(bot: Arc<kovi::RuntimeBot>) {
@@ -117,6 +121,55 @@ pub(crate) async fn start_scheduler(bot: Arc<kovi::RuntimeBot>) {
 /// 把桥的阶段变化写进日志，并在"来电/进房/结束"三个关键点留下可见痕迹。
 ///
 /// 机器人无法接听电话（桥自动接听），所以用户能看到的只有这里：桥有没有上报
+/// 漏接来电通知：桥看到过邀请、但整通从未进房时，主动私聊告诉主管理员。
+///
+/// 以前这种失败完全静默——你只能从"她没接"察觉；日志里也只有一行 WARN。
+/// 通知带上来电者（解析不出来就不编造）并附一条诊断行（停在哪一阶段、endReason），
+/// 发送用带幂等键的受跟踪通道，且带超时——通知失败绝不能拖住通话状态机。
+async fn notify_missed_call(
+    bot: &kovi::RuntimeBot,
+    config: &crate::config::QqCallConfig,
+    state: &CallState,
+    previous: CallPhase,
+) {
+    if !config.notify_missed_calls() {
+        return;
+    }
+    let Ok(admin) = bot.get_main_admin() else {
+        return;
+    };
+    let caller = state.caller();
+    let caller_name = state.caller_name.as_deref();
+    eprintln!(
+        "[WARN] QQ 语音通话漏接（有过邀请但从未进房，阶段停在 {}，endReason={:?}）: {}",
+        previous.as_str(),
+        state.end_reason,
+        caller_label(caller, caller_name)
+    );
+    let idempotency = format!(
+        "qq_call:missed:{}",
+        state.invite_at.as_deref().unwrap_or("unknown")
+    );
+    let notice = diagnostics::missed_call_notice(caller, caller_name);
+    let result = kovi::tokio::time::timeout(
+        MISSED_NOTICE_TIMEOUT,
+        send_tracked_message_with_revalidation(
+            bot,
+            MessageDestination::Private(admin),
+            kovi::Message::from(notice),
+            OutgoingSource::Proactive,
+            Some(&idempotency),
+            || async { true },
+        ),
+    )
+    .await;
+    match result {
+        Ok(Ok(_)) => println!("[INFO] 漏接来电已私聊通知主管理员"),
+        Ok(Err(error)) => eprintln!("[WARN] 漏接来电通知发送失败: {error}"),
+        Err(_) => eprintln!("[WARN] 漏接来电通知发送超时"),
+    }
+}
+
 /// 来电、有没有真正进房、名单里有没有这位来电者。
 async fn report_phase_change(
     phase: CallPhase,
@@ -129,6 +182,8 @@ async fn report_phase_change(
     let caller = state.caller();
     let caller_name = state.caller_name.as_deref();
     let label = caller_label(caller, caller_name);
+    // 先取"这通有没有进过房"：下面 note_call_ended / begin_call 会把它清掉。
+    let connected = diagnostics::last_call_connected();
 
     // 这次通话的第一次可见阶段：记下来电者与授权结果，供 `#通话状态` 事后回看。
     if phase.is_live() && !traced {
@@ -164,6 +219,9 @@ async fn report_phase_change(
         CallPhase::Ended => {
             println!("[INFO] QQ 语音通话桥报告已挂断: {label}");
             diagnostics::note_call_ended("桥报告已挂断");
+            if !connected {
+                notify_missed_call(bot, config, state, previous).await;
+            }
         }
         CallPhase::Idle if previous.is_live() => {
             if diagnostics::last_call_connected() {
@@ -175,6 +233,7 @@ async fn report_phase_change(
                     previous.as_str()
                 );
                 diagnostics::note_call_ended("未进房就结束");
+                notify_missed_call(bot, config, state, previous).await;
             }
         }
         CallPhase::Error => eprintln!("[ERROR] QQ 语音通话桥报告错误阶段: {label}"),

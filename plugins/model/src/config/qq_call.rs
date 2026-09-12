@@ -104,6 +104,12 @@ pub struct QqCallConfig {
     hangup_enabled: bool,
     /// 挂断后是否把通话记录写回来电者的私聊记忆。
     archive_to_memory: bool,
+    /// 漏接来电时是否私聊告诉主管理员（默认开启）。
+    ///
+    /// "漏接"= 桥看到过邀请、但整通从未进房（对方一直响到放弃）。2026-09-12 实测的
+    /// 成因是来电被路由到主 QQ 那台设备、AV Host 的 AVSDK 没拿到邀请，接听参数无从
+    /// 产生。这种失败以前完全静默——只能从"她没接"察觉，所以补一条主动通知。
+    notify_missed_calls: bool,
 }
 
 impl QqCallConfig {
@@ -262,6 +268,11 @@ impl QqCallConfig {
 
     pub fn archive_to_memory(&self) -> bool {
         self.archive_to_memory
+    }
+
+    /// 漏接来电是否私聊通知主管理员。
+    pub fn notify_missed_calls(&self) -> bool {
+        self.notify_missed_calls
     }
 
     /// 会话结束时是否让桥真的挂断电话。
@@ -466,6 +477,7 @@ impl Default for QqCallConfig {
             farewell: "好，那我先挂啦，拜拜～".to_string(),
             hangup_enabled: true,
             archive_to_memory: true,
+            notify_missed_calls: true,
         }
     }
 }
@@ -549,6 +561,7 @@ mod tests {
     fn hangup_is_enabled_by_default() {
         let config = QqCallConfig::default();
         assert!(config.hangup_enabled());
+        assert!(config.notify_missed_calls());
     }
 
     #[test]
