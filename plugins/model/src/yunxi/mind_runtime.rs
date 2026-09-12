@@ -34,6 +34,11 @@ const MAX_STANCE_PROPOSALS: usize = 3;
 const MAX_STANCE_EVIDENCE: usize = 3;
 /// 立场形成的输出上限（一句话级别的 JSON）。
 const STANCE_MAX_TOKENS: u32 = 320;
+/// 至少攒下这么多条经历才值得让她"想想法"。
+///
+/// 只有一两条平凡经历时问她是浪费——实测第一次触发就是 `events=1`，模型
+/// 很正确地回了 `[]`，但那次模型调用和 6 小时冷却期都白花了。
+const MIN_STANCE_EVENTS: usize = 3;
 /// 两次"想自己的想法"之间的最短间隔（毫秒）。
 ///
 /// 立场形成要调模型，而反思本身很频繁（实测 6 小时 63 次）。真正该问的不是"这次
@@ -2128,7 +2133,10 @@ impl MindRuntime {
         // （见 `BarrierState::blocks_scope`），放开它是安全的。
         drop(barrier);
         let mut extra_model_calls = 0_usize;
-        if should_create_episode && self.stance_formation_due(input.requested_at) {
+        if should_create_episode
+            && input.recent_events.len() >= MIN_STANCE_EVENTS
+            && self.stance_formation_due(input.requested_at)
+        {
             match self.form_stances(&input).await {
                 Ok(called) => {
                     extra_model_calls = usize::from(called);
@@ -2224,8 +2232,23 @@ impl MindRuntime {
             kovi::log::warn!("Yunxi Mind stance formation model error");
             return Ok(true);
         }
-        let updates = stance_updates(&response.content, &existing, &input.recent_events);
+        let candidates = parse_stance_candidates(&response.content);
+        if candidates.is_empty() {
+            // 模型主动说"没什么值得留下的"也要留痕：否则从日志上分不清它是
+            // 放弃了，还是输出了一堆解析不了的垃圾——那正是这条管道以前的老毛病。
+            println!(
+                "[INFO] Yunxi Mind 立场形成：模型没有提出看法（回复 {} 字：{}）",
+                response.content.chars().count(),
+                candidate_preview(&response.content)
+            );
+            return Ok(true);
+        }
+        let updates = stance_updates(&candidates, &existing, &input.recent_events);
         if updates.is_empty() {
+            println!(
+                "[INFO] Yunxi Mind 立场形成：{} 条候选全部被校验丢弃",
+                candidates.len()
+            );
             return Ok(true);
         }
         let mut proposal = self
@@ -3015,12 +3038,12 @@ fn parse_stance_candidates(raw: &str) -> Vec<StanceCandidate> {
 /// - 命题同样要过 [`global_state_text_rejection`]（不写关于具体人的判断），
 ///   被拒的原因写进日志。
 fn stance_updates(
-    raw: &str,
+    candidates: &[StanceCandidate],
     existing: &[Belief],
     events: &[ReflectionEvent],
 ) -> Vec<BeliefUpdateProposal> {
     let mut updates = Vec::new();
-    for candidate in parse_stance_candidates(raw) {
+    for candidate in candidates {
         let resolve = |target: &Option<String>| -> Option<&Belief> {
             let target = target.as_deref()?;
             let key = yunxi_core::normalized_key(target);
@@ -3041,7 +3064,7 @@ fn stance_updates(
                 }
                 updates.push(stance_update(
                     BeliefOperation::Upsert,
-                    candidate.proposition,
+                    candidate.proposition.clone(),
                     delta,
                     stance_evidence(events, EvidencePolarity::Supports),
                 ));
@@ -3096,7 +3119,7 @@ fn stance_updates(
                 ));
                 updates.push(stance_update(
                     BeliefOperation::Upsert,
-                    candidate.proposition,
+                    candidate.proposition.clone(),
                     delta,
                     stance_evidence(events, EvidencePolarity::Supports),
                 ));
@@ -3387,7 +3410,9 @@ mod tests {
         // 目标对不上任何已有看法：整条丢弃——打在不存在的键上会让整份提案报
         // NotFound，连同一批的 episodes 一起陪葬。
         let updates = stance_updates(
-            r#"[{"kind":"challenge","target":"我从来没说过这句话"},{"kind":"reinforce","target":"诚实比迎合更重要"}]"#,
+            &parse_stance_candidates(
+                r#"[{"kind":"challenge","target":"我从来没说过这句话"},{"kind":"reinforce","target":"诚实比迎合更重要"}]"#,
+            ),
             &existing,
             &[],
         );
@@ -3398,7 +3423,9 @@ mod tests {
 
         // 有人不同意 → Contradict（核心层会只微降并抬高稳定性）。
         let updates = stance_updates(
-            r#"[{"kind":"challenge","target":"诚实比迎合更重要","confidence_milli":200}]"#,
+            &parse_stance_candidates(
+                r#"[{"kind":"challenge","target":"诚实比迎合更重要","confidence_milli":200}]"#,
+            ),
             &existing,
             &[],
         );
@@ -3409,14 +3436,16 @@ mod tests {
     fn stance_updates_never_store_judgements_about_people() {
         // 关于具体人的判断是记忆不是看法，必须被拒。
         let updates = stance_updates(
-            r#"[{"kind":"form","proposition":"用户 123 喜欢安静"}]"#,
+            &parse_stance_candidates(r#"[{"kind":"form","proposition":"用户 123 喜欢安静"}]"#),
             &[],
             &[],
         );
         assert!(updates.is_empty());
         // 带数字的自我立场是合法的（原来一刀切掉数字，这类看法永远进不来）。
         let updates = stance_updates(
-            r#"[{"kind":"form","proposition":"我认为 30 岁之前该多试错"}]"#,
+            &parse_stance_candidates(
+                r#"[{"kind":"form","proposition":"我认为 30 岁之前该多试错"}]"#,
+            ),
             &[],
             &[],
         );
@@ -3428,7 +3457,9 @@ mod tests {
     fn changing_your_mind_retracts_the_old_stance_before_forming_the_new_one() {
         let existing = vec![test_stance("我认为显式状态机比隐式标记更可靠")];
         let updates = stance_updates(
-            r#"[{"kind":"change","target":"我认为显式状态机比隐式标记更可靠","proposition":"我认为要看团队规模（以前我迷信状态机）"}]"#,
+            &parse_stance_candidates(
+                r#"[{"kind":"change","target":"我认为显式状态机比隐式标记更可靠","proposition":"我认为要看团队规模（以前我迷信状态机）"}]"#,
+            ),
             &existing,
             &[],
         );
@@ -3480,7 +3511,7 @@ mod tests {
 
         // 新形成的看法：挂上最近几段经历作为根据，最多 3 条。
         let updates = stance_updates(
-            r#"[{"kind":"form","proposition":"我认为慢一点更好"}]"#,
+            &parse_stance_candidates(r#"[{"kind":"form","proposition":"我认为慢一点更好"}]"#),
             &[],
             &events,
         );
@@ -3494,7 +3525,7 @@ mod tests {
 
         // 被挑战：证据要是"相反"的极性，contradiction_count 才记得住。
         let updates = stance_updates(
-            r#"[{"kind":"challenge","target":"诚实比迎合更重要"}]"#,
+            &parse_stance_candidates(r#"[{"kind":"challenge","target":"诚实比迎合更重要"}]"#),
             &existing,
             &events,
         );
