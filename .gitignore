@@ -21,6 +21,8 @@ bot_memory.json.corrupt.*
 # TurnGate annotation/review batches are local-only data (doc §7.4 D).
 /tools/turngate/dataset/review-*.jsonl
 /tools/turngate/dataset/train-*.jsonl
+# 待标注工作单是同一批原文的渲染结果，同样只留在本机。
+/tools/turngate/dataset/worklist-*.txt
 
 # 临时：NapCat 登录二维码（登录完成后删除）
 .qq-login/

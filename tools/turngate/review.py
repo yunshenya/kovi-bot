@@ -115,14 +115,18 @@ def queue_tier(sample: dict) -> int:
 
 
 def build_queue(samples, limit: int, include_reviewed: bool = False):
-    """按 (标注价值, 上下文越少越前, 稳定索引) 排出待复核顺序。"""
+    """排待复核顺序：先按标注价值分 tier，同 tier 内**上下文越全越靠前**。
+
+    上下文全的样本标得动、标签可信；上下文残缺的标了也是猜，排在后面（真要看
+    可以用 `--show`）。tier 本身仍按"信息量"排：lexical 给不出判断的灰区优先。
+    """
     rows = [
         (idx, s) for idx, s in enumerate(samples)
         if include_reviewed or not is_reviewed(s)
     ]
     rows.sort(key=lambda pair: (
         queue_tier(pair[1]),
-        context_richness(pair[1]),
+        -context_richness(pair[1]),
         pair[0],
     ))
     return rows[:limit] if limit > 0 else rows
@@ -173,6 +177,8 @@ def main() -> int:
                         help="打印单条样本的正文/上下文/弱标签")
     parser.add_argument("--limit", type=int, default=DEFAULT_QUEUE_LIMIT,
                         help=f"--queue 打印多少行，0 表示全部（默认 {DEFAULT_QUEUE_LIMIT}）")
+    parser.add_argument("--slice", metavar="START:END",
+                        help="跳过队列前 START 条再取 END 条（如 300:100 看第 301-400 条）")
     parser.add_argument("--include-reviewed", action="store_true",
                         help="--queue 时连已复核的也列出")
     parser.add_argument("--mark", nargs="+", metavar="IDX completion=X response=Y")
@@ -185,7 +191,21 @@ def main() -> int:
     samples = load(args.batch)
 
     if args.queue:
-        rows = build_queue(samples, args.limit, args.include_reviewed)
+        offset = 0
+        if args.slice:
+            start, _, count = args.slice.partition(":")
+            try:
+                offset = int(start)
+                args.limit = int(count)
+            except ValueError:
+                print("--slice 需要 START:END 形式，例如 300:100", file=sys.stderr)
+                return 1
+            if offset < 0 or args.limit < 0:
+                print("--slice 不接受负数", file=sys.stderr)
+                return 1
+        rows = build_queue(samples, 0, args.include_reviewed)
+        total_rows = len(rows)
+        rows = rows[offset:offset + args.limit] if args.limit > 0 else rows[offset:]
         pending = [s for s in samples if not is_reviewed(s)]
         gray = sum(1 for s in pending if human_labels(s.get("labels", {}))[0] is None)
         with_ctx = sum(1 for s in pending if s.get("context", {}).get("recent_turns"))
@@ -193,7 +213,8 @@ def main() -> int:
             1 for s in pending
             if any(t.get("role") == "assistant" for t in s.get("context", {}).get("recent_turns", []))
         )
-        print(f"pending={len(pending)} showing={len(rows)} "
+        print(f"queue={total_rows} pending={len(pending)} "
+              f"showing={offset + 1}-{offset + len(rows)} "
               f"(tier: 0/1 灰区, 2 无上下文, 3 无机器人发言, 4 其余)")
         # 上下文覆盖率是判断"标得动多少"的前提：没有上下文只能靠猜，
         # 硬标出来的标签会把噪声当监督。

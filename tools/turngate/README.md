@@ -62,6 +62,7 @@ python3 tools/turngate/collector.py --journal /tmp/tg-journal.txt \
 #    够不够、标签稀不稀有）。**不要**拿"线上实际回了没有"来排序或当标签——那等于
 #    把现有的概率/冷却/时间窗策略抄进权重（doc §7.4 E）。
 python3 tools/turngate/review.py --batch review-batch-*.jsonl --queue
+python3 tools/turngate/review.py --batch review-batch-*.jsonl --queue --slice 300:40  # 第 301-340 条
 python3 tools/turngate/review.py --batch review-batch-*.jsonl --show 1221
 python3 tools/turngate/review.py --batch review-batch-*.jsonl --status
 python3 tools/turngate/review.py --batch review-batch-*.jsonl --mark 1221 completion=flush_now response=answer
