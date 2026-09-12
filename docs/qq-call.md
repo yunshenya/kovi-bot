@@ -611,6 +611,10 @@ AVSDK 回传的全部命令第一次变得可见：
 已验证的插件整份备份在
 `/root/napcat/plugins/napcat-plugin-maibot-qq-voice-call/index.mjs.kovi-verified`。
 
+这些补丁的版本化副本在仓库的 `scripts/bridge-patches/`（连同 `bridge-entry.sh` 参考副本
+和诊断脚本 `try_close_variant.py`），线上真身在部署机的 `/home/ubuntu/napcat-qq-call/`；
+改完看那个目录的 `README.md` 里的同步命令。
+
 ### 仍然需要你知道的运维约束
 
 - 重启 NapCat **必须**用 `sudo docker restart -t 60 napcat`。默认 10 秒就 SIGKILL，
