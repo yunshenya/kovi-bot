@@ -13,6 +13,12 @@
 
 可观测：`/v1/status` 里 `avHost.acceptRetryCount`（重投次数）、`acceptRetryGaveUp`
 （重投后仍失败次数）。
+
+v2 两处收紧：
+1. 重投间隔改成 1.5 → 3 → 6 秒退避（原来是固定 1.5 秒、三次都挤在 4.5 秒内）；
+2. **彻底失败时把诊断快照打进日志**：阶段的当前值、inviteAt、重试次数、命令直方图、
+   最近的输出轨迹与监听事件。这些原本只在内存里，重启就没了——失败当场落盘，
+   事后不必再复现。
 """
 from __future__ import annotations
 
@@ -25,18 +31,27 @@ PLUGIN_CANDIDATES = [
 ]
 
 MARKERS = {
-    "funcs": "kovi-accept-retry-funcs-v1",
-    "hook": "kovi-accept-retry-hook-v1",
-    "clear": "kovi-accept-retry-clear-v1",
+    "funcs": "kovi-accept-retry-funcs-v2",
+    "hook": "kovi-accept-retry-hook-v2",
+    "clear": "kovi-accept-retry-clear-v2",
 }
-LEGACY = ("kovi-accept-retry-v0",)
+LEGACY = (
+    "kovi-accept-retry-v0",
+    "kovi-accept-retry-funcs-v1",
+    "kovi-accept-retry-hook-v1",
+    "kovi-accept-retry-clear-v1",
+)
 
 FUNCS_ANCHOR = "function forwardKernelAction(name, args) {"
-FUNCS = '''// kovi-accept-retry-funcs-v1
+FUNCS = '''// kovi-accept-retry-funcs-v2
 /// 来电重投看门狗：邀请 payload 转给 AV Host 的 AVSDK 后，正常情况下它会回报 20006
 /// （解析后的接听元组），接听才有参数可用；实测它偶尔不来（来电被路由到另一台设备
-/// 时），此时电话会一直响到对方放弃。这里做有限重投，并在彻底失败时留下明确日志。
+/// 时），此时电话会一直响到对方放弃。
+///
+/// 重投间隔按 1.5 → 3 → 6 秒退避（共 2 次重投、3 次投递），彻底失败时把诊断快照写进
+/// 日志——那些数据只在内存里，重启就没了。
 const ACCEPT_RETRY_DELAY_MS = 1500;
+const ACCEPT_RETRY_MAX_DELAY_MS = 6000;
 const MAX_ACCEPT_RETRIES = 2;
 let acceptWatchdogTimer = null;
 let acceptWatchdogAttempt = 0;
@@ -51,14 +66,25 @@ function clearAcceptWatchdog() {
 function watchAcceptCallback(actionType, payload) {
   clearAcceptWatchdog();
   const generation = acceptCallbackGeneration;
-  const schedule = (delayMs) => {
+  let delayMs = ACCEPT_RETRY_DELAY_MS;
+  const schedule = () => {
     acceptWatchdogTimer = setTimeout(() => {
       acceptWatchdogTimer = null;
       if (acceptCallbackGeneration !== generation) return; // 20006 已经来了
       if (acceptWatchdogAttempt >= MAX_ACCEPT_RETRIES) {
         state.avHost.acceptRetryGaveUp = (state.avHost.acceptRetryGaveUp || 0) + 1;
         logger?.warn(
-          "[MaiBotQQCall] 来电回调 20006 未到，重投后仍无法接听（来电可能被路由到另一台设备）",
+          "[MaiBotQQCall] 来电回调 20006 未到，重投后仍无法接听（来电可能被路由到另一台设备）；诊断快照 " +
+            JSON.stringify({
+              at: new Date().toISOString(),
+              phase: state.call?.phase ?? null,
+              inviteAt: state.call?.inviteAt ?? null,
+              callerUin: state.call?.callerUin ?? null,
+              retries: acceptWatchdogAttempt,
+              histogram: state.avHost.commandHistogram ?? null,
+              trail: state.avHost.outputTrail ?? [],
+              events: (state.events ?? []).slice(-6),
+            }),
         );
         return;
       }
@@ -67,17 +93,18 @@ function watchAcceptCallback(actionType, payload) {
       void invokeAVHost(55, [actionType, payload]).catch((error) => {
         state.avHost.lastError = `accept retry forward failed: ${error?.message ?? String(error)}`;
       });
-      schedule(ACCEPT_RETRY_DELAY_MS);
+      delayMs = Math.min(delayMs * 2, ACCEPT_RETRY_MAX_DELAY_MS);
+      schedule();
     }, delayMs);
     acceptWatchdogTimer.unref?.();
   };
-  schedule(ACCEPT_RETRY_DELAY_MS);
+  schedule();
 }
 
 '''
 
 HOOK_ANCHOR = '      if (name.toLowerCase() === "onactiontoavsdk" && activeSDKInvite) scheduleAccept(75);\n'
-HOOK = """      // kovi-accept-retry-hook-v1：邀请已转给 AV Host 的 AVSDK，等它回报 20006；
+HOOK = """      // kovi-accept-retry-hook-v2：邀请已转给 AV Host 的 AVSDK，等它回报 20006；
       // 没等到就有限重投（见 watchAcceptCallback）。
       if (name.toLowerCase() === "oninviteactiontoavsdk") {
         watchAcceptCallback(actionType, payload);
@@ -85,7 +112,7 @@ HOOK = """      // kovi-accept-retry-hook-v1：邀请已转给 AV Host 的 AVSDK
 """
 
 CLEAR_ANCHOR = "    state.avHost.inviteCallbackSeen = true;\n"
-CLEAR = """    // kovi-accept-retry-clear-v1：回调到了，撤销重投看门狗。
+CLEAR = """    // kovi-accept-retry-clear-v2：回调到了，撤销重投看门狗。
     acceptCallbackGeneration += 1;
     clearAcceptWatchdog();
 """
