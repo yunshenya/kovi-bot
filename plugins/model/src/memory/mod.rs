@@ -2773,8 +2773,15 @@ fn cleanup_old_memories(memories: &mut HashMap<String, MemoryEntry>) -> Vec<Stri
         ))
     });
 
-    // 超出容量时综合重要性与时间保留价值最高的记忆。
+    // 容量只作**失控保护**：正常情况下去留由保留期与去重决定（见 MemoryConfig::max_entries）。
+    // 真触发时要说清楚，否则又变成"按一个数字静默遗忘"。
     if entries.len() > memory_config.max_entries() {
+        println!(
+            "[WARN] 记忆条数 {} 超过失控保护阈值 {}，按重要性淘汰到阈值内——\
+             正常情况不该走到这里，请检查写入速率",
+            entries.len(),
+            memory_config.max_entries()
+        );
         entries.sort_by(|left, right| {
             right
                 .1

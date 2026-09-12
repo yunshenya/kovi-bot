@@ -108,7 +108,17 @@ reply_rate_window_secs = 600
 reply_rate_limit = 4
 
 [memory]
-max_entries = 1000
+# 失控保护，不是管理手段。
+#
+# 以前这里是 1000，于是"她记不记得住"由"数到第 1000 条"决定：两张记忆表都按
+# `ROW_NUMBER() > 1000` 直接 DELETE，等于按一个数字遗忘（真机上那句
+# "记忆清理完成，移除 1 条，当前保留 1000 条"就是它）。
+#
+# 现在按 Hindsight 的思路：原始记忆是事实来源，让它**自然老去**——由
+# retention_days（保留期，且高重要性记忆受保护）和去重决定去留；真正该收紧的是
+# **检索层**（每次带进上下文的条数），不是存储层。这个值只在病态增长时兜底，
+# 触发时会打 WARN 说明。
+max_entries = 50000
 retention_days = 30
 episode_retention_days = 365
 episode_max_per_scope = 128

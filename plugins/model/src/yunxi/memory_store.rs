@@ -113,10 +113,13 @@ impl PostgresMemoryStore {
         Ok(())
     }
 
-    /// Apply the same retention and capacity policy to the canonical Core
-    /// table that the legacy MemoryManager already applies to its cache.
-    /// Cleanup is quiet when nothing changed; the maintenance loop reports
-    /// only actual removals.
+    /// Apply the same retention (and runaway-guard) policy to the canonical
+    /// Core table that the legacy MemoryManager already applies to its cache.
+    ///
+    /// 去留由保留期决定：原始记忆是事实来源，让它自然老去，而不是数到第 N 条就删
+    /// （那是"按一个数字遗忘"）。`max_entries` 退化为失控保护——正常永远不该触发，
+    /// 触发了就打日志。Cleanup is quiet when nothing changed; the maintenance loop
+    /// reports only actual removals.
     pub(crate) async fn cleanup(&self, now: DateTime<Utc>) -> Result<u64, MemoryStoreError> {
         let _reconciliation_guard = MEMORY_RECONCILIATION_LOCK.lock().await;
         let config = crate::config::get().memory().clone();
@@ -179,7 +182,15 @@ impl PostgresMemoryStore {
         .await
         .map_err(MemoryStoreError::storage)?;
         let mut deleted = decode_deleted_memories(expired_rows)?;
-        deleted.extend(decode_deleted_memories(capped_rows)?);
+        let guard_rows = decode_deleted_memories(capped_rows)?;
+        if !guard_rows.is_empty() {
+            println!(
+                "[WARN] Yunxi Core 记忆条数超过失控保护阈值 {max_entries}，按重要性淘汰 {} 条——\
+                 正常情况不该走到这里，请检查写入速率",
+                guard_rows.len()
+            );
+        }
+        deleted.extend(guard_rows);
         // Remove the compatibility copy through the same transaction. The
         // cache is updated only after commit, so a failed delete rolls back
         // both database tables together.

@@ -3,6 +3,15 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 #[serde(default)]
 pub struct MemoryConfig {
+    /// **失控保护，不是管理手段。**
+    ///
+    /// 以前它是 1000，于是"记不记得住"由"数到第 1000 条"决定：两张记忆表都按
+    /// `ROW_NUMBER() > 1000` 直接 DELETE，等于按一个数字遗忘。
+    ///
+    /// 现在按 Hindsight 的思路：原始记忆是事实来源，让它自然老去——由
+    /// [`Self::retention_days`]（保留期，且高重要性记忆受保护）与去重决定去留，
+    /// 真正该紧的是**检索层**（每次带进上下文的条数），不是存储层。这个值只在
+    /// 出现病态增长（例如某个 bug 每秒写几千条）时兜底，届时会打日志说明。
     max_entries: usize,
     retention_days: i64,
     /// Episode records have a longer, independent retention window than the
@@ -205,7 +214,7 @@ impl MemoryConfig {
 impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
-            max_entries: 1000,
+            max_entries: 50_000,
             retention_days: 30,
             episode_retention_days: 365,
             episode_max_per_scope: 128,
@@ -266,7 +275,7 @@ mod tests {
     #[test]
     fn older_memory_configuration_uses_episode_defaults() {
         let config: MemoryConfig = kovi::toml::from_str(
-            "max_entries = 1000\nretention_days = 30\nprofile_ttl_days = 90\nsummary_ttl_days = 30\nsticker_ttl_days = 90\nruntime_history_ttl_secs = 3600\nmax_conversation_messages = 25\nmax_conversation_tokens = 6000\ncontextual_memory_limit = 5\nmaintenance_interval_secs = 86400\nsummary_keep_recent_messages = 15\nsummary_max_chars = 1500\nautonomous_query_enabled = true\nautonomous_query_max_rounds = 2\nautonomous_query_max_results = 8\nautonomous_query_max_days = 3650\n",
+            "max_entries = 50000\nretention_days = 30\nprofile_ttl_days = 90\nsummary_ttl_days = 30\nsticker_ttl_days = 90\nruntime_history_ttl_secs = 3600\nmax_conversation_messages = 25\nmax_conversation_tokens = 6000\ncontextual_memory_limit = 5\nmaintenance_interval_secs = 86400\nsummary_keep_recent_messages = 15\nsummary_max_chars = 1500\nautonomous_query_enabled = true\nautonomous_query_max_rounds = 2\nautonomous_query_max_results = 8\nautonomous_query_max_days = 3650\n",
         )
         .expect("older memory configuration should remain compatible");
         assert_eq!(config.episode_retention_days(), 365);
