@@ -3526,8 +3526,8 @@ impl Default for BotPersonality {
 mod tests {
     use super::{
         BotPersonality, ConversationScope, GroupProfile, MemoryEntry, MemoryLookup,
-        MemoryLookupType, MemoryManager, MemoryType, MoodEntry, ProactiveState, UserProfile,
-        SIDECAR_WARN_WINDOW, conversation_summary_key, sidecar_warn_decision,
+        MemoryLookupType, MemoryManager, MemoryType, MoodEntry, ProactiveState,
+        SIDECAR_WARN_WINDOW, UserProfile, conversation_summary_key, sidecar_warn_decision,
     };
     use chrono::{Duration as ChronoDuration, Local};
     use sqlx_core::query::query;
@@ -3547,10 +3547,7 @@ mod tests {
         );
         for offset in [1, 30, 59] {
             assert_eq!(
-                sidecar_warn_decision(
-                    "unit_test_throttle",
-                    start + Duration::from_secs(offset)
-                ),
+                sidecar_warn_decision("unit_test_throttle", start + Duration::from_secs(offset)),
                 None,
                 "窗口内的重复应当被抑制（否则每轮回复刷一条）"
             );
@@ -3576,13 +3573,13 @@ mod tests {
     #[test]
     fn sidecar_warning_still_fires_under_low_traffic() {
         let start = Instant::now();
-        assert_eq!(sidecar_warn_decision("unit_test_low_traffic", start), Some(0));
+        assert_eq!(
+            sidecar_warn_decision("unit_test_low_traffic", start),
+            Some(0)
+        );
         // 中间一条都没有（没人聊天），第二次故障已经是 10 分钟后
         assert_eq!(
-            sidecar_warn_decision(
-                "unit_test_low_traffic",
-                start + Duration::from_secs(600)
-            ),
+            sidecar_warn_decision("unit_test_low_traffic", start + Duration::from_secs(600)),
             Some(0),
             "只有两次故障也要报第二次"
         );
