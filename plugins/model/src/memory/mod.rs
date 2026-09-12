@@ -2771,9 +2771,14 @@ impl MemoryManager {
         .fetch_all(pool)
         .await
         .map_err(|error| anyhow::anyhow!("查询待回填记忆失败: {error}"))?;
+        // 每轮报一次候选数：这个数字"该有却没有"时，一眼就能看出来。
+        // 排查"回填停在 764"时，正是因为这条路径完全静默，我只能反复猜。
+        println!(
+            "[INFO] 记忆向量回填：本轮候选 {} 条（模型 {}）",
+            rows.len(),
+            model
+        );
         if rows.is_empty() {
-            // 空转是正常的（全部回填完了），所以只在真有问题时才有意义——
-            // 这里用 debug 级别的措辞，避免每 5 分钟刷一行。
             return Ok(0);
         }
         let items: Vec<(String, String)> = rows
