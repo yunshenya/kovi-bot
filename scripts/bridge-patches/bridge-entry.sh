@@ -134,7 +134,9 @@ if [ -x "$AV_HOST_SCRIPT" ]; then
     # 上游在 AV Host 未就绪时直接报错退出，这里保持同样的语义并留足时间
     # （第二个 Electron 进程冷启动约 15–30 秒）。
     av_ready=0
-    for _ in $(seq 1 240); do
+    # 实机上 Electron + QQ + AVSDK 首次启动约 5 分钟（2026-09-12 实测 09:46 → 09:51），
+    # 原来 240 秒会误判失败并强制重启一次，白等一轮还多一次停机，这里给到 600 秒。
+    for _ in $(seq 1 600); do
       if curl -fsS "http://127.0.0.1:${QQ_CALL_AV_HOST_PORT:-6111}/healthz" >/dev/null 2>&1; then
         av_ready=1
         break
@@ -144,7 +146,7 @@ if [ -x "$AV_HOST_SCRIPT" ]; then
     if [ "$av_ready" = "1" ]; then
       echo "[qq-call] AV Host 已就绪，开始启动主 QQ"
     else
-      echo "[qq-call] AV Host 未在 240 秒内就绪，重试一次" >&2
+      echo "[qq-call] AV Host 未在 600 秒内就绪，重试一次" >&2
       bash "$BRIDGE_DIR/../restart-av-host.sh" || true
       for _ in $(seq 1 60); do
         if curl -fsS "http://127.0.0.1:${QQ_CALL_AV_HOST_PORT:-6111}/healthz" >/dev/null 2>&1; then

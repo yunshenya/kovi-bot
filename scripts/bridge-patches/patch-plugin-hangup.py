@@ -16,8 +16,9 @@
 
 本补丁只做"把文件归一化成目标状态"这一件事，不保留历史迁移规则：
 
-1. AV Host 的 cmd 白名单 → `{1, 5, 10, 55}`。不管是上游原版 `{1,5,55}`，还是实验
-   期间留下的 `{1,5,8,9,10,11,55}`、`{1,5,10,11,55}`，都统一改写；
+1. AV Host 的 cmd 白名单 → `{1, 4, 5, 10, 20, 55}`（4 = 主动外呼，见 patch-plugin-dial.py）。
+   不管是上游原版 `{1,5,55}`，还是实验期间留下的 `{1,5,8,9,10,11,55}`、
+   `{1,5,10,11,55}`，都统一改写；
 2. 插件 `index.mjs`：`invokeAVHost` 返回 AV Host 的响应体、`state.call` 记录挂断
    与来电元组、新增 `POST /v1/calls/hangup`（方法表只留 `close`）。
 """
@@ -32,7 +33,7 @@ PLUGIN_CANDIDATES = [Path(item) for item in ["/app/napcat/plugins/napcat-plugin-
 
 # AV Host：白名单整行归一化（认得出任何一版 Set 内容）。
 ALLOWED_LINE = re.compile(r"const ALLOWED_COMMANDS = new Set\(\[[0-9, ]*\]\);")
-ALLOWED_TARGET = "const ALLOWED_COMMANDS = new Set([1, 5, 10, 55]);"
+ALLOWED_TARGET = "const ALLOWED_COMMANDS = new Set([1, 4, 5, 10, 20, 55]);"
 # 插件：方法表整行归一化。
 METHODS_LINE = re.compile(r"const HANGUP_METHODS = \{[^}]*\};")
 METHODS_TARGET = "const HANGUP_METHODS = { close: 10 };"
@@ -54,7 +55,7 @@ def normalize_host(path: Path) -> bool:
         print(f"[skip] AV Host 白名单已是目标值: {path}")
         return False
     path.write_text(updated, encoding="utf8")
-    print(f"[ok] AV Host 白名单归一化为 {{1, 5, 10, 55}}: {path}")
+    print(f"[ok] AV Host 白名单归一化为 {{1, 4, 5, 10, 20, 55}}: {path}")
     return True
 
 
