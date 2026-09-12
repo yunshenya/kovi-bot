@@ -307,6 +307,35 @@ MAIBOT_QQ_CALL_BOT_UIN="<机器人QQ号>" \
 - 结论修正：**挂断 API 一直都在**，只是既不在 OneBot、也不在内核 AVSDK 服务里，
   而在 AV Host 的 PPAPI 插件方法表里。
 
+### 挂断参数实验（2026-09-12 早上，逐通真机测试）
+
+`Close` 的类型是从符号表读出来的（`Close(unsigned int id, unsigned int roomId, char const* uid, int reason)`），
+参数含义只能按位置推断，所以逐个组合在真机上试：
+
+| 方法 / 参数 | 能否结束通话 | 对方界面 |
+|---|---|---|
+| `close` + `roomId=0` + 来电者 uid + `reason=1`（当前默认） | ✅ `phase=ended`、`endReason=4` | 出现"对方邀请其他人加入，将转为多人电话…" |
+| `close` + `roomId=1`（来电元组 `invite[3]`）+ 来电者 uid | ✅ 同上 | 同上 |
+| `close` + uid **留空** | ❌ 受理后阶段卡在 `ending`、`endReason` 始终为空 | — |
+| `close` + **机器人自己的 uid** | ❌ 同上 | — |
+| `clearRoom`(cmd 11) + 来电者 uid | ❌ 同上 | — |
+
+结论：
+
+- **唯一能真正结束通话的是 `close` + 来电者 uid**（`roomId` 填 0 或 1 都行；uid 不能省，
+  也不能换成自己）。因此桥只放行 10、方法表只留 `close`，机器人侧 `hangup_method`
+  也只接受 `close`。
+- 对方那句"对方邀请其他人加入，将转为多人电话…"**与 cmd 8、与 roomId 都无关**：白名单
+  只放行 10 的那几通照样出现，换 roomId、换方法也消不掉。它是 QQ 收到"这通两人房间被
+  对方结束"时的固定文案（来电事件本身就叫 `OnInviteActionToAVSDK`、`inviteType=1`，
+  协议里 1v1 通话就是两人群视频房间），客户端侧改不了。通话本身是正常结束的
+  （道别 → `ended` → `endReason`），只是对方界面会闪这一句。
+- 唯一没试的变体：把来电事件里的 `relation_id` 字符串当 uid 传（需要插件多记录一个
+  字段）。这是唯一可能绕过"uid 被当成邀请对象"的思路，先记在这里备查。
+- 复现这些实验的脚本留在服务器：`/home/ubuntu/napcat-qq-call/try_close_variant.py`
+  （等来电接通 → 用指定变体挂断 → 8 秒内没结束就自动用已知可用参数兜底，不会把对方
+  悬在静音通话里）。
+
 **已落地的机制**（2026-09-12 凌晨）：
 
 1. **主动挂断（默认开启）**：`qq_call.hangup_enabled = true` 时，机器人结束会话
