@@ -746,7 +746,7 @@ async fn main() {
                     Err(error) => {
                         consecutive_failures += 1;
                         // 嵌入服务长期不可用时别刷屏：第一次报，之后每小时报一次。
-                        if consecutive_failures == 1 || consecutive_failures % 12 == 0 {
+                        if consecutive_failures == 1 || consecutive_failures.is_multiple_of(12) {
                             eprintln!(
                                 "[ERROR] 记忆向量回填失败（连续 {consecutive_failures} 次）: {error}"
                             );
