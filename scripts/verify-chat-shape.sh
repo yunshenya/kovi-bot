@@ -6,6 +6,13 @@
 # 再想到一句），不是错误率，看 WARN/ERROR 看不出来。这个脚本把判据固定
 # 成几条可重跑的命令，避免下次靠肉眼看日志猜。
 #
+# 指标口径（每一项都能从日志或账本复算）：
+#   - 提问占比   : Yunxi Core turn shape 里 asks=true / 全部可见回合
+#   - 连续气泡占比: 账本 delivery_key 以 :intent:1 结尾的行 / 全部出站行
+#   - 续聊登记率 : conversation continuation registered / directive=Continue 的回合
+#   - 续聊成功率 : autonomous conversation tick admitted / 登记数
+#   - 泄漏       : 日志里出现字面 [[BUBBLE]]（应当恒为 0）
+#
 # 用法: scripts/verify-chat-shape.sh ["3 hours ago"]
 set -euo pipefail
 
@@ -36,18 +43,31 @@ log="$(mktemp)"
 trap 'rm -f "$log"' EXIT
 journalctl -u kovi-bot.service --since "$since" --no-pager > "$log" 2>/dev/null
 
+count() { grep -c "$1" "$log" 2>/dev/null || true; }
+
 echo "窗口: $since   日志行数: $(wc -l < "$log")"
-echo "--- 对话形状信号 ---"
-printf 'Core 私聊/点名回复          : %s\n' "$(grep -c 'Core Strong result' "$log")"
-printf '登记了续聊回合 (Continue)    : %s\n' "$(grep -c 'conversation continuation registered' "$log")"
-printf '自主回合被接纳               : %s\n' "$(grep -c 'autonomous conversation tick admitted' "$log")"
-printf '自主回合被跳过               : %s\n' "$(grep -c 'autonomous conversation tick skipped' "$log")"
-printf '气泡数超限被截断             : %s\n' "$(grep -c 'bubble budget exceeded' "$log")"
-printf '[[BUBBLE]] 泄漏成可见文本    : %s\n' "$(grep -c '\[\[BUBBLE\]\]' "$log")"
-printf '队列满改为折叠               : %s\n' "$(grep -c '折进当前 turn' "$log")"
+echo
+echo "--- 对话形状（来自 Yunxi Core turn shape，2026-09-13 起有）---"
+shapes="$(grep -c 'Yunxi Core turn shape' "$log" 2>/dev/null || true)"
+asks="$(grep 'Yunxi Core turn shape' "$log" 2>/dev/null | grep -c 'asks=true' || true)"
+bubbles2="$(grep 'Yunxi Core turn shape' "$log" 2>/dev/null | grep -cE 'bubbles=[23]' || true)"
+printf '可见回合数                  : %s\n' "$shapes"
+printf '提问占比                    : %s / %s\n' "$asks" "$shapes"
+printf '一轮多气泡回合              : %s / %s\n' "$bubbles2" "$shapes"
+echo
+echo "--- 续聊链路 ---"
+printf '登记了续聊回合 (Continue)    : %s\n' "$(count 'conversation continuation registered')"
+printf '续聊被降级/未登记            : %s\n' "$(grep -cE 'continuation request was (downgraded|not registered)' "$log" 2>/dev/null || true)"
+printf '自主回合被接纳               : %s\n' "$(count 'autonomous conversation tick admitted')"
+printf '自主回合被跳过               : %s\n' "$(count 'autonomous conversation tick skipped')"
+echo
+echo "--- 健康与泄漏 ---"
+printf '气泡数超限被截断             : %s\n' "$(count 'bubble budget exceeded')"
+printf '[[BUBBLE]] 泄漏成可见文本    : %s\n' "$(count '\[\[BUBBLE\]\]')"
+printf '队列满改为折叠               : %s\n' "$(count '折进当前 turn')"
+printf 'WARN/ERROR 条数              : %s\n' "$(grep -cE '\[(WARN|ERROR)\]' "$log" 2>/dev/null || true)"
+echo
 echo "--- 出站账本（intent:1 = 一轮第二个气泡）---"
 sudo -u postgres psql -d postgres -tAc \
   "select destination_kind, count(*) filter (where delivery_key like '%:intent:1') as multi_bubble, count(*) as total from yunxi_action_delivery_ledger where created_at > now() - interval '24 hours' group by 1"
-echo "--- 告警 ---"
-printf 'WARN/ERROR 条数              : %s\n' "$(grep -cE '\[(WARN|ERROR)\]' "$log")"
 REMOTE

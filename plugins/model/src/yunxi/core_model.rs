@@ -1384,8 +1384,9 @@ fn plain_reply_repair_context(messages: &[BotMemory]) -> Vec<BotMemory> {
 
 fn strong_response_diagnostic(content: &str, parsed: &ParsedCoreResponse) -> String {
     let trimmed = content.trim_start();
+    let bubbles = content.matches(CORE_BUBBLE_MARKER).count() + 1;
     format!(
-        "chars={} cues={} reply_action={} tool={} parsed_chars={} parsed_semantic={} directive={:?}",
+        "chars={} cues={} reply_action={} tool={} parsed_chars={} parsed_semantic={} directive={:?} bubbles={} asks={}",
         content.chars().count(),
         trimmed.starts_with(CORE_INTERACTION_CUES_START),
         content.contains("[[REPLY_ACTION]]"),
@@ -1393,6 +1394,8 @@ fn strong_response_diagnostic(content: &str, parsed: &ParsedCoreResponse) -> Str
         parsed.content.chars().count(),
         reply_text_has_semantic_content(&parsed.content),
         parsed.conversation_directive,
+        bubbles.min(MAX_CORE_BUBBLES + 1),
+        reply_asks_something(&parsed.content),
     )
 }
 
@@ -4000,6 +4003,32 @@ const CORE_PRIVATE_CONTINUATION_MAX_CHARS: usize = 160;
 /// turn would be a genuine continuation rather than a nudge.
 const CORE_UNFINISHED_ENDINGS: [char; 10] = ['，', ',', '、', '：', ':', '；', ';', '…', '—', '~'];
 
+/// Whether a visible reply asks the other side something.
+///
+/// Used for the per-turn shape log and for the private continuation judgement,
+/// so both agree on what "asked a question" means: an explicit question mark
+/// anywhere, a Chinese question particle at the end, or a trailing comma /
+/// colon that leaves the thought visibly unfinished.
+fn reply_asks_something(text: &str) -> bool {
+    if text.contains(['?', '？']) {
+        return true;
+    }
+    let Some(last) = text
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+    else {
+        return false;
+    };
+    if last.ends_with(['吗', '呢', '吧']) {
+        return true;
+    }
+    last.chars()
+        .last()
+        .is_some_and(|tail| CORE_UNFINISHED_ENDINGS.contains(&tail))
+}
+
 /// Whether a visible private reply has earned one automatic follow-up turn.
 ///
 /// A 一问一答 conversation stays 一问一答 because the host never answers
@@ -4016,27 +4045,7 @@ fn private_reply_invites_continuation(bubbles: &[String]) -> bool {
     if total_chars == 0 || total_chars > CORE_PRIVATE_CONTINUATION_MAX_CHARS {
         return false;
     }
-    let joined = bubbles.join("\n");
-    let Some(last) = joined
-        .lines()
-        .rev()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-    else {
-        return false;
-    };
-    // Any question mark anywhere in the last line is a question; a Chinese
-    // question particle at the end is one too.
-    if last.contains(['?', '？']) {
-        return true;
-    }
-    if last.ends_with(['吗', '呢', '吧']) {
-        return true;
-    }
-    let Some(tail) = last.chars().last() else {
-        return false;
-    };
-    CORE_UNFINISHED_ENDINGS.contains(&tail)
+    reply_asks_something(&bubbles.join("\n"))
 }
 
 /// ConversationKind of the event a visible plan belongs to. Group turns are
@@ -5895,6 +5904,18 @@ impl ModelBackend for KoviModelBackend {
                         conversation_id,
                         directive,
                     });
+                    // 对话形状遥测：一条日志同时回答"这轮发了几个气泡""有没有
+                    // 提问""有没有登记续聊"。线上验收（同会话连续气泡占比、
+                    // 提问占比、续聊登记率）直接从这里聚合，不再只靠账本猜。
+                    kovi::log::info!(
+                        "Yunxi Core turn shape: event_id={} conversation_id={} kind={:?} bubbles={} asks={} directive={:?}",
+                        input.event.id(),
+                        conversation_id,
+                        conversation_kind_for_turn(input),
+                        plan.bubbles.len(),
+                        reply_asks_something(&visible_content),
+                        directive,
+                    );
                 }
             }
             if disposition == DecisionDisposition::ChangeTopic
@@ -6088,9 +6109,9 @@ mod tests {
         private_reply_invites_continuation, purge_group_routes_from_cache,
         recent_conversation_messages, recent_direct_conversation_messages,
         recent_group_conversation_messages, refine_core_incoming, register_core_tool_intents,
-        repair_context_messages, reply_expected_for_incoming, reply_recovery_required,
-        reply_text_has_semantic_content, requested_message_count, route_from_lookup,
-        route_lookup_with_fallback, safe_single_structured_reply_message,
+        repair_context_messages, reply_asks_something, reply_expected_for_incoming,
+        reply_recovery_required, reply_text_has_semantic_content, requested_message_count,
+        route_from_lookup, route_lookup_with_fallback, safe_single_structured_reply_message,
         safe_structured_reply_batch, sanitize_autonomous_intrinsic_output,
         sanitize_intrinsic_output, sanitize_plain_text_batch_message,
         select_host_model_route_from_capability, serialize_intrinsic_reply_batch,
@@ -7235,6 +7256,18 @@ mod tests {
         // The old blanket ban on a follow-up question must be gone: that ban
         // was the main reason a turn could never end with a real question.
         assert!(!CORE_PLAIN_TURN_INSTRUCTION.contains("不要固定追加追问"));
+    }
+
+    #[test]
+    fn reply_asks_something_covers_the_question_shapes_the_host_reacts_to() {
+        assert!(reply_asks_something("你今晚还加班吗？"));
+        assert!(reply_asks_something("那你早点睡吧"));
+        assert!(reply_asks_something("我先说一件事，"));
+        // A question anywhere counts, including a quoted one.
+        assert!(reply_asks_something("你说“真的吗”是什么意思？"));
+        assert!(!reply_asks_something("今天降温了，记得多穿点。"));
+        assert!(!reply_asks_something("好呀"));
+        assert!(!reply_asks_something("   "));
     }
 
     #[test]

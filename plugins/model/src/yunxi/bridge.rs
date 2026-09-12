@@ -3315,7 +3315,27 @@ async fn run_runtime(
                                     );
                                 if let Some(directive) = effective_directive {
                                     kovi::log::info!(
-                                        "Yunxi conversation continuation registered: conversation_id={conversation_id} model_directive={requested_directive:?} effective_directive={directive:?}"
+                                        "Yunxi conversation continuation registered: conversation_id={conversation_id} model_directive={requested_directive:?} effective_directive={directive:?} idle_secs={}",
+                                        proactive_config.autonomous_conversation_idle_secs(),
+                                    );
+                                    if requested_directive
+                                        == Some(yunxi_core::ConversationTurnDirective::Continue)
+                                        && directive
+                                            != yunxi_core::ConversationTurnDirective::Continue
+                                    {
+                                        // 宿主请求了续聊却没有登记成功：不是模型的问题，
+                                        // 是生命周期策略把它降级了（例如上一轮还没结清、
+                                        // 或已达到 max_turns）。没有这条日志就只能靠"续聊率
+                                        // 一直是 0"反推。
+                                        kovi::log::warn!(
+                                            "Yunxi continuation request was downgraded: conversation_id={conversation_id} requested={requested_directive:?} effective={directive:?}"
+                                        );
+                                    }
+                                } else if requested_directive
+                                    == Some(yunxi_core::ConversationTurnDirective::Continue)
+                                {
+                                    kovi::log::warn!(
+                                        "Yunxi continuation request was not registered: conversation_id={conversation_id} reason=no_lifecycle_entry"
                                     );
                                 }
                             }
