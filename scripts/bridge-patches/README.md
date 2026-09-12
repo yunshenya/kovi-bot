@@ -45,11 +45,24 @@ scp scripts/bridge-patches/*.py <host>:/tmp/ && \
 6. **别拿 AV Host 的日志当实时证据**：它是块缓冲的，最新几行可能几十秒后才落盘
    （当天因此误判过两次"命令没到"）。判断命令是否送达请看 AV Host 的
    `invocationCount` / `lastInvocationCommand`（`/v1/status`，端口 6111）。
+7. **改完补丁一定跑一次自检**：补丁在仓库和线上各有一份，只在服务器上改、或往仓库
+   加了新补丁却忘了加进 `bridge-entry.sh` 的 patcher 列表，都会造成"功能在仓库里、
+   线上根本没打"的静默漂移（2026-09-12 就真漏过一次：列表少了最后四个 patcher）。
+   ```bash
+   scripts/bridge-patches/verify-deployed.sh    # 仓库 vs 线上逐字节比对，exit 0 才算齐
+   ```
+   往 `bridge-entry.sh` 加新补丁时，记得连同服务器上那份一起更新，再重启容器重打全套。
 
 ## 其它文件
 
 - `bridge-entry.sh`：容器入口包装的参考副本（真正生效的是部署机上的同名文件，它负责拉起
-  PulseAudio、QQ、AV Host，并调用上面的补丁）。
+  PulseAudio、QQ、AV Host，并调用上面的补丁）。`verify-deployed.sh` 会比对这两份。
+- `verify-deployed.sh`：核对仓库与线上补丁是否逐字节一致，并检查 patcher 列表里的每个
+  文件都真实存在。防止"仓库有、线上没跑"的漂移。
 - `try_close_variant.py`：诊断脚本。等来电接通后，用指定变体（A=uid 留空、B=roomId 取
   `invite[3]`、C=uid 传机器人自己、D=`clearRoom`）调挂断接口，8 秒内没结束就自动用已知可用
   的参数兜底，不会把对方悬在静音通话里。定位"挂断到底要什么参数"时用它。
+- `try_startcall.py`：外呼定标脚本（已定标完成，留作协议万一又变了时的复测工具）。
+  自动重启 AV Host → 探活 → 依次试多组候选参数 → 守卫式读回复；手工发 JSON 有几率
+  把插件打成 segfault，所以每次尝试之间必须重启 AV Host。
+- `patch-*` / `try_*`：都是**参考副本**，真正生效的是容器里的 `/app/qq-call/`。

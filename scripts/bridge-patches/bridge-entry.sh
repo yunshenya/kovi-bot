@@ -41,7 +41,11 @@ echo "[qq-call] 音频权限看护已启动 (pid $!)"
 #   ignore-20050 : 上游把周期性通知 20050 误判为掉线并每 100ms 重登，亲手把健康的
 #                  会话反复踢掉（实测累计 521 次），cmd 55 因此永远得不到处理；
 #   histogram    : 记录 AVSDK 各 cmd 的出现次数，便于日后判断协议是否又变了。
-for patcher in patch-plugin-account-path.py patch-20050-backoff.py patch-ignore-20050.py patch-plugin-login-refresh.py patch-plugin-caller-allowlist.py patch-plugin-hangup.py; do
+# 这张列表就是开机要打的全套补丁，**少一个就等于线上少一个功能**（曾经漏过最后
+# 四个：dial 外呼、avsdk-trace、accept-retry、avhost-raw-preview）。仓库里这份
+# 必须和服务器 /home/ubuntu/napcat-qq-call/bridge-entry.sh 保持一致，
+# 用 scripts/bridge-patches/verify-deployed.sh 一条命令比对。
+for patcher in patch-plugin-account-path.py patch-20050-backoff.py patch-ignore-20050.py patch-plugin-login-refresh.py patch-plugin-caller-allowlist.py patch-plugin-hangup.py patch-plugin-dial.py patch-plugin-avsdk-trace.py patch-plugin-accept-retry.py patch-avhost-raw-preview.py; do
   patch_path="$BRIDGE_DIR/../$patcher"
   if [ -f "$patch_path" ]; then
     python3 "$patch_path" || echo "[qq-call] 补丁 $patcher 未应用" >&2
