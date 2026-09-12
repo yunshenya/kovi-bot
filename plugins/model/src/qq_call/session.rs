@@ -495,12 +495,13 @@ async fn respond(
     let idle_max = config.idle_prompt_max();
     // 对方上一次开口之后，她已经主动出声几次；对方一开口就归零。
     let mut idle_since_peer = 0usize;
+    // 上一次**确实有事发生**的时刻，安静计时从它算起。只在确认的活动中刷新
+    // （对方的话真的识别出来了、她自己开过口），不是每轮循环都刷新——否则嘈杂
+    // 环境里被 VAD 切出来、又被 ASR 判成空的一段段噪声会不停把计时器往后推，
+    // 她永远等不到开口的时机，电话又退化成"你不说话她就不说话"。
+    let mut last_activity = Instant::now();
 
     loop {
-        // 上一次"有事发生"的时刻：上一轮的工作（回复、播报）都已经跑完了，所以
-        // 安静从此刻开始算。放在循环开头而不是末尾：arm 里有多处 `continue`
-        // （空识别、识别失败、挂断收尾），逐个补一行迟早会漏。
-        let quiet_since = Instant::now();
         // 只有"该她主动"时才让计时器参与竞争：已经道别、或主动次数用尽之后回到
         // 纯等待，免得一个已经到期的计时器把循环变成忙等。
         let idle_armed = !idle_after.is_zero()
@@ -511,7 +512,7 @@ async fn respond(
                 biased;
                 job = jobs.recv() => job.map(Wake::Job),
                 () = kovi::tokio::time::sleep_until(
-                    (quiet_since + idle_delay(idle_after, idle_since_peer)).into()
+                    (last_activity + idle_delay(idle_after, idle_since_peer)).into()
                 ) => Some(Wake::Idle),
             }
         } else {
@@ -546,6 +547,7 @@ async fn respond(
                     }
                     Err(error) => eprintln!("[ERROR] QQ 通话播报失败: {error}"),
                 }
+                last_activity = Instant::now();
             }
             Wake::Job(Job::Utterance(pcm)) => {
                 if requested_end(&end_signal).is_some() {
@@ -553,7 +555,7 @@ async fn respond(
                     continue;
                 }
                 let peer_text = match speech.transcribe(&pcm, config.capture_sample_rate()).await {
-                    Ok(text) if !text.trim().is_empty() => text.trim().to_owned(),
+                    Ok(text) if counts_as_peer_activity(&text) => text.trim().to_owned(),
                     Ok(_) => continue,
                     Err(error) => {
                         eprintln!("[ERROR] QQ 通话语音识别失败: {error}");
@@ -562,6 +564,9 @@ async fn respond(
                 };
                 println!("[INFO] QQ 通话识别: {peer_text}");
                 idle_since_peer = 0;
+                // 从"识别出一句人话"这一刻算活动：后面无论走挂断收尾还是走回复，
+                // 中间那些 `continue` 都不必再逐个补刷新。
+                last_activity = Instant::now();
 
                 if config.is_hangup_request(&peer_text) {
                     // 对方说"挂了吧/先挂"：她回一句道别，然后结束会话并挂断电话。
@@ -637,6 +642,9 @@ async fn respond(
                     }
                     Err(error) => eprintln!("[ERROR] QQ 通话播报失败: {error}"),
                 }
+                // 安静要从"她说完"重新起算：查一轮工具 + 合成播报可能花掉十几秒，
+                // 若还从对方那句识别算起，她会刚说完就立刻又开口。
+                last_activity = Instant::now();
                 if reply.wants_hangup {
                     // 模型判断对方要结束通话了（识别文本可能"挂了吧"听成"过了吧"，
                     // 关键词匹配不到，所以由她自己决定）：道别已经说完，收尾挂断。
@@ -651,8 +659,11 @@ async fn respond(
                     println!("[INFO] QQ 通话主动出声：对方刚好开口，这一轮不说了");
                     continue;
                 }
-                let silent_secs = quiet_since.elapsed().as_secs();
+                let silent_secs = last_activity.elapsed().as_secs();
                 idle_since_peer += 1;
+                // 计时从这里重新起算：后面的 `continue`（抢话让位、没生成出内容）
+                // 都不该让她下一秒又立刻重试一遍。
+                last_activity = Instant::now();
                 println!(
                     "[INFO] QQ 通话对方已安静 {silent_secs} 秒，她主动出声（对方开口后第 {} 次）",
                     idle_since_peer
@@ -713,6 +724,16 @@ async fn respond(
 /// 她隔一阵还会再探一次，而不是彻底静默——那正是这次要修掉的毛病。
 fn idle_delay(base: Duration, nudges: usize) -> Duration {
     base * (1u32 << nudges.min(3))
+}
+
+/// 这一段识别结果算不算"对方真的开口了"。
+///
+/// 空结果（环境噪声被 VAD 切成一段、或听不出字）**不算活动**：安静计时不能因为
+/// 它往后推。否则对方在嘈杂环境里、或者设备一直在送底噪时，计时器会被一段段
+/// 空片段无限顶住，她永远等不到主动开口的时机——那还是"你不说话她就不说话"，
+/// 只是换了个更难发现的成因。
+fn counts_as_peer_activity(transcribed: &str) -> bool {
+    !transcribed.trim().is_empty()
 }
 
 /// 主动出声时给模型的现场说明。
@@ -1804,9 +1825,9 @@ mod tests {
     use super::{
         CallPhase, EndTrigger, NO_END, PhoneReply, PhoneTurn, TOOL_ARGUMENT_LOG_CHARS,
         TOOL_FACT_HISTORY_CHARS, ToolFact, ToolOutcome, Turn, build_messages, claimed_action,
-        commitment_nudge, idle_delay, idle_prompt, phone_system_prompt, preview_chars,
-        render_self_test, request_end, requested_end, sanitize_reply, strip_protocol_markers,
-        summarize_tool_arguments, unbacked_action_claim, wants_hangup,
+        commitment_nudge, counts_as_peer_activity, idle_delay, idle_prompt, phone_system_prompt,
+        preview_chars, render_self_test, request_end, requested_end, sanitize_reply,
+        strip_protocol_markers, summarize_tool_arguments, unbacked_action_claim, wants_hangup,
     };
     use crate::config::QqCallConfig;
     use serde_json::Value;
@@ -2296,6 +2317,15 @@ mod tests {
         assert_eq!(idle_delay(base, 2), Duration::from_secs(24));
         assert_eq!(idle_delay(base, 3), Duration::from_secs(48));
         assert_eq!(idle_delay(base, 9), Duration::from_secs(48));
+    }
+
+    /// 噪声切出来的空片段不能算"对方开口"，否则安静计时会被无限顶住，
+    /// 她又变回"你不说话她就不说话"。
+    #[test]
+    fn blank_transcripts_do_not_count_as_peer_activity() {
+        assert!(counts_as_peer_activity("你随便找一个群说一下就行了。"));
+        assert!(!counts_as_peer_activity(""));
+        assert!(!counts_as_peer_activity("   \n\t "));
     }
 
     /// 主动出声的现场说明：先问怎么了、顺手把欠着的事做完、不许重复、不许挂断。
