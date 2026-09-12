@@ -54,6 +54,8 @@ bubbles2="$(grep 'Yunxi Core turn shape' "$log" 2>/dev/null | grep -cE 'bubbles=
 printf '可见回合数                  : %s\n' "$shapes"
 printf '提问占比                    : %s / %s\n' "$asks" "$shapes"
 printf '一轮多气泡回合              : %s / %s\n' "$bubbles2" "$shapes"
+printf '未完句回合（疑似被掐断）     : %s / %s\n' \
+  "$(grep 'Yunxi Core turn shape' "$log" 2>/dev/null | grep -c 'complete=false' || true)" "$shapes"
 # 回复延迟：从收到消息到写出正文（含语义判定与限流），不是模型调用耗时。
 latencies="$(grep -o 'think_ms=[0-9]*' "$log" 2>/dev/null | cut -d= -f2 | sort -n || true)"
 if [ -n "$latencies" ]; then
