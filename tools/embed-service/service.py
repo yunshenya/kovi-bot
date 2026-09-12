@@ -44,6 +44,8 @@ QUERY_PREFIX = "为这个句子生成表示以用于检索相关文章："
 
 # 单次请求最多编码多少段，防止一个坏请求把内存吃穿。
 MAX_BATCH = 64
+# 真正送进 ONNX 的子批大小。请求可以带 64 段，但推理必须小批——见 encode 里的说明。
+INFER_BATCH = 8
 # 单段最大字符数（超长截断，bge 的窗口是 512 token）。
 MAX_CHARS = 1024
 
@@ -66,20 +68,27 @@ class Embedder:
         prepared = [
             (QUERY_PREFIX + text) if query else text for text in texts
         ]
-        encodings = self.tokenizer.encode_batch(prepared)
-        input_ids = np.array([item.ids for item in encodings], dtype=np.int64)
-        attention = np.array([item.attention_mask for item in encodings], dtype=np.int64)
-        feed = {"input_ids": input_ids, "attention_mask": attention}
-        if self.needs_token_types:
-            feed["token_type_ids"] = np.array(
-                [item.type_ids for item in encodings], dtype=np.int64
-            )
-        # bge 用 CLS 位置的池化。
-        hidden = self.session.run(None, feed)[0][:, 0, :]
-        norms = np.linalg.norm(hidden, axis=1, keepdims=True)
-        norms[norms == 0] = 1.0
-        normalized = hidden / norms
-        return normalized.astype(np.float32).tolist()
+        vectors: list[list[float]] = []
+        # **必须切片推理**：分词器按"批内最长"补齐，所以只要批里有一条长文本，
+        # 整批都会补到 512 token。128 段一起送进去就是 6.5 万 token 一次前向，
+        # 激活内存轻松过 1GB——2026-09-12 真机上就是这样每十分钟被 OOM 杀一次。
+        # 服务要自己扛得住大请求，不能指望调用方每次都给小批。
+        for start in range(0, len(prepared), INFER_BATCH):
+            batch = prepared[start : start + INFER_BATCH]
+            encodings = self.tokenizer.encode_batch(batch)
+            input_ids = np.array([item.ids for item in encodings], dtype=np.int64)
+            attention = np.array([item.attention_mask for item in encodings], dtype=np.int64)
+            feed = {"input_ids": input_ids, "attention_mask": attention}
+            if self.needs_token_types:
+                feed["token_type_ids"] = np.array(
+                    [item.type_ids for item in encodings], dtype=np.int64
+                )
+            # bge 用 CLS 位置的池化。
+            hidden = self.session.run(None, feed)[0][:, 0, :]
+            norms = np.linalg.norm(hidden, axis=1, keepdims=True)
+            norms[norms == 0] = 1.0
+            vectors.extend((hidden / norms).astype(np.float32).tolist())
+        return vectors
 
 
 class Reranker:
