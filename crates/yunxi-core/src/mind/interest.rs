@@ -164,6 +164,16 @@ impl Interest {
         self.source
     }
 
+    /// 衰减/激活该用的时间：不允许早于已存状态。
+    ///
+    /// 反思批次带的时间戳是"批内最后一个事件发生的时间"，可能早于这条兴趣上次被
+    /// 更新的时间（之后又发生过一次激活）；而 `decay`/`activate` 都要求时间不倒流，
+    /// 直接用批次时间会让整批反思因为一条兴趣而失败。
+    #[must_use]
+    pub fn operation_time(&self, now: DateTime<Utc>) -> DateTime<Utc> {
+        now.max(self.updated_at)
+    }
+
     #[must_use]
     pub const fn updated_at(&self) -> DateTime<Utc> {
         self.updated_at

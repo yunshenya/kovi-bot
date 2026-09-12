@@ -385,6 +385,13 @@ impl AgendaItem {
         self.status
     }
 
+    /// 衰减该用的时间：不允许早于已存状态（反思批次的 `requested_at` 可能早于
+    /// 这条议程项上次更新的时间，而 `decay` 要求时间不倒流）。
+    #[must_use]
+    pub fn operation_time(&self, now: DateTime<Utc>) -> DateTime<Utc> {
+        now.max(self.updated_at)
+    }
+
     #[must_use]
     pub const fn updated_at(&self) -> DateTime<Utc> {
         self.updated_at

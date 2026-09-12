@@ -2056,7 +2056,8 @@ impl MindRuntime {
                 .list_active(&[input.scope], input.requested_at, MAX_REFLECTION_DECAYS)
                 .await?
             {
-                let decayed = item.decay(input.requested_at, half_life)?;
+                // 批次时间可能早于这条议程项上次更新的时间，按"不早于已存状态"取。
+                let decayed = item.decay(item.operation_time(input.requested_at), half_life)?;
                 self.services
                     .agenda
                     .put(&decayed, Some(item.version()))

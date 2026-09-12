@@ -623,8 +623,11 @@ impl Consolidation {
                     return Err(ConsolidationError::ScopeMismatch);
                 }
                 let expected = existing.version();
+                // 批次时间可能早于这条兴趣上次更新的时间，按"不早于已存状态"取，
+                // 否则整批反思会因为这一条而失败。
+                let effective_at = existing.operation_time(now);
                 let value = match proposal.operation {
-                    InterestOperation::Decay => existing.decay(now, 6.0 * 60.0 * 60.0)?,
+                    InterestOperation::Decay => existing.decay(effective_at, 6.0 * 60.0 * 60.0)?,
                     InterestOperation::Upsert | InterestOperation::Activate => existing.activate(
                         proposal.activation_delta.clamp(-0.5, 0.5),
                         proposal.affinity_delta.clamp(
@@ -632,7 +635,7 @@ impl Consolidation {
                             self.config.max_interest_affinity_delta,
                         ),
                         proposal.novelty,
-                        now,
+                        effective_at,
                     )?,
                 };
                 Ok(MindUpsert {

@@ -1190,3 +1190,56 @@ fn reflection_queue_purges_erased_scopes_only() {
         MindScope::Global
     );
 }
+
+#[test]
+fn batch_timestamps_never_rewind_interest_or_agenda_state() {
+    // 反思批次带的是"批内最后一个事件的时间"，可能早于某条状态上次更新的时间。
+    // 两个类型都提供 operation_time()，把操作时间顶到不早于已存状态，这样整批反思
+    // 不会因为其中一条状态而失败（线上曾因此每天丢掉 39 批反思，只在日志里留一行
+    // "interest decay predates stored state"）。
+    let updated_at = now();
+    let earlier = updated_at - Duration::minutes(5);
+    let later = updated_at + Duration::minutes(1);
+
+    let interest = Interest::new(
+        InterestId::new(),
+        "时间口径测试",
+        0.8,
+        0.8,
+        0.5,
+        MindSource::Experience,
+        updated_at,
+    )
+    .expect("interest");
+    assert_eq!(interest.operation_time(earlier), updated_at);
+    assert_eq!(interest.operation_time(updated_at), updated_at);
+    assert_eq!(interest.operation_time(later), later);
+    // 直接用批次时间会失败，套上 operation_time 就没事——这正是修复前后的差别。
+    assert!(interest.decay(earlier, 6.0 * 60.0 * 60.0).is_err());
+    assert!(
+        interest
+            .decay(interest.operation_time(earlier), 6.0 * 60.0 * 60.0)
+            .is_ok()
+    );
+
+    let agenda = AgendaItem::new(
+        AgendaItemId::new(),
+        MindScope::Person {
+            person_id: PersonId::new(),
+        },
+        AgendaSubject::Curiosity(CuriosityId::new()),
+        0.5,
+        0.5,
+        0.5,
+        AgendaSource::Curiosity,
+        updated_at,
+    )
+    .expect("agenda");
+    assert_eq!(agenda.operation_time(earlier), updated_at);
+    assert!(agenda.decay(earlier, 6.0 * 60.0 * 60.0).is_err());
+    assert!(
+        agenda
+            .decay(agenda.operation_time(earlier), 6.0 * 60.0 * 60.0)
+            .is_ok()
+    );
+}

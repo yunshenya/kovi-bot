@@ -52,9 +52,17 @@ async fn run(store: Arc<dyn OpenLoopStore>, runtime: RuntimeHandle) {
                     match submit_due(&runtime, &item, now).await {
                         Ok(()) => {}
                         Err(error) => {
-                            kovi::log::warn!(
-                                "Yunxi open-loop due event could not be submitted: {error:?}"
-                            );
+                            // 全局 owner 没有可投递的宿主路由，这是设计内的正常情况：
+                            // 下面会把 due_at 清掉让它回到普通开环，不该每轮刷 WARN。
+                            if matches!(error, DueSubmitError::UnsupportedOwner) {
+                                kovi::log::debug!(
+                                    "Yunxi open-loop due event skipped: owner has no host route"
+                                );
+                            } else {
+                                kovi::log::warn!(
+                                    "Yunxi open-loop due event could not be submitted: {error:?}"
+                                );
+                            }
                             let retry_at = retry_due_at(error, now);
                             if let Err(defer_error) =
                                 store.defer(item.id(), retry_at, Utc::now()).await
