@@ -31,12 +31,63 @@ use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 static MEMORY_ID_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const MAX_USER_PROFILES: usize = 10_000;
 const MAX_GROUP_PROFILES: usize = 2_000;
+
+/// 侧车（嵌入/重排服务）出故障时的告警节流窗口。
+const SIDECAR_WARN_WINDOW: Duration = Duration::from_secs(60);
+
+struct SidecarWarnState {
+    last: Option<Instant>,
+    suppressed: u32,
+}
+
+static SIDECAR_WARN: LazyLock<std::sync::Mutex<HashMap<&'static str, SidecarWarnState>>> =
+    LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// 这条告警现在该不该打？`Some(n)` = 打，且此前有 n 条被抑制；`None` = 本次抑制。
+///
+/// 抽成纯函数是为了能**用注入的时刻测**——不用 sleep、不会 flaky。
+fn sidecar_warn_decision(key: &'static str, now: Instant) -> Option<u32> {
+    let mut guard = SIDECAR_WARN
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let entry = guard.entry(key).or_insert(SidecarWarnState {
+        last: None,
+        suppressed: 0,
+    });
+    if let Some(last) = entry.last
+        && now.duration_since(last) < SIDECAR_WARN_WINDOW
+    {
+        entry.suppressed += 1;
+        return None;
+    }
+    entry.last = Some(now);
+    Some(std::mem::take(&mut entry.suppressed))
+}
+
+/// 打印一条**按时间**节流的侧车告警。
+///
+/// 为什么不按次数（"每 N 次报一条"）：那在低流量时一次都不报（故障静默），
+/// 高流量时照样刷屏——两头都错。按时间节流两个毛病都没有。
+///
+/// 为什么被抑制的次数要写出来：只报"第一次"的话，事后看日志会以为故障
+/// 早就好了。**"很久没报"不等于"已经好了"**，这个项目已经栽过这个坑。
+fn warn_sidecar(key: &'static str, message: impl FnOnce() -> String) {
+    match sidecar_warn_decision(key, Instant::now()) {
+        None => {}
+        Some(0) => eprintln!("[WARN] {}", message()),
+        Some(suppressed) => eprintln!(
+            "[WARN] {}（过去 {} 秒内同样的故障还有 {suppressed} 次被抑制）",
+            message(),
+            SIDECAR_WARN_WINDOW.as_secs()
+        ),
+    }
+}
 
 /// Serialize legacy memory-table mutations with the Yunxi Core adapter.
 /// PostgreSQL transaction-scoped advisory locks make this effective across
@@ -2665,8 +2716,9 @@ impl MemoryManager {
         {
             Ok(ids) => ids,
             Err(error) => {
-                // 只记一条警告：检索是每轮都走的路，不能因为 sidecar 抖动刷屏。
-                eprintln!("[WARN] 语义检索不可用，退回词面: {error}");
+                // 检索是每轮都走的路：按时间节流（首次立刻报，之后 60 秒一条并
+                // 带上被抑制的次数），既不静默也不刷屏。
+                warn_sidecar("semantic", || format!("语义检索不可用，退回词面: {error}"));
                 return lexical;
             }
         };
@@ -2718,7 +2770,9 @@ impl MemoryManager {
             Ok(ranked) => ranked,
             Err(error) => {
                 // 重排是加分项，不是必需项：失败就保持融合顺序，绝不因此让检索失败。
-                eprintln!("[WARN] 记忆重排不可用，保持融合顺序: {error}");
+                warn_sidecar("rerank", || {
+                    format!("记忆重排不可用，保持融合顺序: {error}")
+                });
                 return ordered;
             }
         };
@@ -3473,12 +3527,83 @@ mod tests {
     use super::{
         BotPersonality, ConversationScope, GroupProfile, MemoryEntry, MemoryLookup,
         MemoryLookupType, MemoryManager, MemoryType, MoodEntry, ProactiveState, UserProfile,
-        conversation_summary_key,
+        SIDECAR_WARN_WINDOW, conversation_summary_key, sidecar_warn_decision,
     };
     use chrono::{Duration as ChronoDuration, Local};
     use sqlx_core::query::query;
     use std::sync::Arc;
+    use std::time::{Duration, Instant};
     use uuid::Uuid;
+
+    /// 侧车告警按**时间**节流：首次立刻报，窗口内抑制，窗口到点再报并说清
+    /// 期间压掉了多少条。用注入的时刻测，不 sleep。
+    #[test]
+    fn sidecar_warning_throttles_by_time_and_reports_what_it_swallowed() {
+        let start = Instant::now();
+        assert_eq!(
+            sidecar_warn_decision("unit_test_throttle", start),
+            Some(0),
+            "首次故障必须立刻可见"
+        );
+        for offset in [1, 30, 59] {
+            assert_eq!(
+                sidecar_warn_decision(
+                    "unit_test_throttle",
+                    start + Duration::from_secs(offset)
+                ),
+                None,
+                "窗口内的重复应当被抑制（否则每轮回复刷一条）"
+            );
+        }
+        // 窗口到点：再报一次，并且把抑制掉的 3 条一起交代——
+        // 只报"第一次"的话，事后会以为故障早就结束了。
+        assert_eq!(
+            sidecar_warn_decision("unit_test_throttle", start + SIDECAR_WARN_WINDOW),
+            Some(3)
+        );
+        assert_eq!(
+            sidecar_warn_decision(
+                "unit_test_throttle",
+                start + SIDECAR_WARN_WINDOW + Duration::from_secs(1)
+            ),
+            None,
+            "新窗口重新开始计数"
+        );
+    }
+
+    /// 这是它和"每 N 次报一条"的关键差别：流量低时也必须报。
+    /// 按次数节流在这种场景下会让故障彻底静默。
+    #[test]
+    fn sidecar_warning_still_fires_under_low_traffic() {
+        let start = Instant::now();
+        assert_eq!(sidecar_warn_decision("unit_test_low_traffic", start), Some(0));
+        // 中间一条都没有（没人聊天），第二次故障已经是 10 分钟后
+        assert_eq!(
+            sidecar_warn_decision(
+                "unit_test_low_traffic",
+                start + Duration::from_secs(600)
+            ),
+            Some(0),
+            "只有两次故障也要报第二次"
+        );
+    }
+
+    /// 两条路（语义 / 重排）各自节流，互不吞掉对方的告警：
+    /// 重排刚炸过不该让"语义检索也挂了"这条被压掉。
+    #[test]
+    fn sidecar_warning_throttles_each_path_separately() {
+        let start = Instant::now();
+        assert_eq!(sidecar_warn_decision("unit_test_path_a", start), Some(0));
+        assert_eq!(
+            sidecar_warn_decision("unit_test_path_b", start),
+            Some(0),
+            "另一条路的第一条告警不能被吞"
+        );
+        assert_eq!(
+            sidecar_warn_decision("unit_test_path_a", start + Duration::from_secs(5)),
+            None
+        );
+    }
 
     /// 默认人格走温柔版本：不再带傲娇/嘴硬一类的默认特征。
     #[test]
