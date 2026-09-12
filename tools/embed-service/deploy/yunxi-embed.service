@@ -1,0 +1,29 @@
+[Unit]
+Description=Yunxi local embedding service (BGE-small-zh ONNX for memory recall)
+Documentation=https://github.com/vectorize-io/hindsight
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/yunxi-embed
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/ubuntu/yunxi-embed/.venv/bin/python /home/ubuntu/yunxi-embed/service.py \
+    --model /home/ubuntu/yunxi-embed/models/onnx/model_quantized.onnx \
+    --tokenizer /home/ubuntu/yunxi-embed/models/tokenizer.json \
+    --host 127.0.0.1 \
+    --port 6112
+
+Restart=always
+RestartSec=3
+
+# 只服务本机：不监听公网，也不需要任何特权。
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/home/ubuntu/yunxi-embed
+
+[Install]
+WantedBy=multi-user.target

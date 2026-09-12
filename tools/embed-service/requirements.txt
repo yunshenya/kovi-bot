@@ -1,0 +1,10 @@
+# 本机嵌入服务的 Python 依赖。
+#
+# 和语音服务同一个理由：用预编译 wheel，不把 ONNX Runtime 链接进机器人二进制，
+# 机器人自己的 CI 构建完全不受影响。
+#
+# tokenizers 是 HuggingFace 的 Rust 分词器（有预编译 wheel），
+# 不需要 transformers/torch —— 我们只要分词和 ONNX 推理这两件事。
+onnxruntime>=1.30,<2
+tokenizers>=0.23,<1
+numpy>=1.26,<3
