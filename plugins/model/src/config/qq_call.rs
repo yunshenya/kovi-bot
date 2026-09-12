@@ -104,6 +104,12 @@ pub struct QqCallConfig {
     hangup_enabled: bool,
     /// 挂断后是否把通话记录写回来电者的私聊记忆。
     archive_to_memory: bool,
+    /// 是否允许机器人主动拨打（默认开启）。
+    ///
+    /// 触发方式只有一种：授权名单里的人私聊发 `#打给我`——即"谁让我打，我就打给谁"，
+    /// 不接受任意号码，避免变成骚扰工具。AVSDK 侧的外呼通道（cmd 4）仍在定标，命令
+    /// 可能被丢弃，所以机器人会在几秒后确认"电话到底有没有响"，打不出去就如实回复。
+    outgoing_enabled: bool,
     /// 漏接来电时是否私聊告诉主管理员（默认开启）。
     ///
     /// "漏接"= 桥看到过邀请、但整通从未进房（对方一直响到放弃）。2026-09-12 实测的
@@ -273,6 +279,11 @@ impl QqCallConfig {
     /// 漏接来电是否私聊通知主管理员。
     pub fn notify_missed_calls(&self) -> bool {
         self.notify_missed_calls
+    }
+
+    /// 是否允许主动外呼。
+    pub fn outgoing_enabled(&self) -> bool {
+        self.outgoing_enabled
     }
 
     /// 会话结束时是否让桥真的挂断电话。
@@ -478,6 +489,7 @@ impl Default for QqCallConfig {
             hangup_enabled: true,
             archive_to_memory: true,
             notify_missed_calls: true,
+            outgoing_enabled: true,
         }
     }
 }
@@ -562,6 +574,7 @@ mod tests {
         let config = QqCallConfig::default();
         assert!(config.hangup_enabled());
         assert!(config.notify_missed_calls());
+        assert!(config.outgoing_enabled());
     }
 
     #[test]

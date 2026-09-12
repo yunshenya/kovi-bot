@@ -233,6 +233,11 @@ pub(crate) async fn private_message_event_after_ingress(
         send_private_direct_response(&bot, user_id, initial_admission, report).await;
         return;
     }
+    if matches!(message.trim(), "#打给我" | "#打电话给我") {
+        let report = crate::qq_call::request_outgoing_call(&bot, user_id).await;
+        send_private_direct_response(&bot, user_id, initial_admission, report).await;
+        return;
+    }
     if is_group_admin_command(message) {
         println!(
             "[INFO] 私聊群聊专用命令已忽略 (用户: {}, 命令: {})",

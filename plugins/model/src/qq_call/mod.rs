@@ -36,6 +36,50 @@ const ERROR_LOG_INTERVAL: Duration = Duration::from_secs(300);
 /// 漏接来电通知的发送超时（通知失败绝不能拖住通话状态机）。
 const MISSED_NOTICE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// 主动外呼后等"电话真的响起来"的窗口。桥受理 ≠ AVSDK 真的拨号。
+const DIAL_CONFIRM_WINDOW: Duration = Duration::from_secs(6);
+
+/// 私聊指令 `#打给我` 的实现：让芸汐主动拨给发起者。
+///
+/// 只允许授权名单里的人——规则是"谁让我打，我就打给谁"，不接受任意号码，免得变成
+/// 骚扰工具。**打完必须确认电话真的响了**：AVSDK 的外呼命令目前会被直接丢弃，
+/// 桥返回成功不代表拨出去了，所以这里几秒内轮询阶段，据实回复。
+pub(crate) async fn request_outgoing_call(bot: &kovi::RuntimeBot, requester: i64) -> String {
+    let config = config::get().qq_call().clone();
+    if !config.enabled() {
+        return "QQ 语音通话没启用，打不了电话。".to_string();
+    }
+    if !config.outgoing_enabled() {
+        return "主动外呼被关掉了（qq_call.outgoing_enabled = false）。".to_string();
+    }
+    if !caller_is_allowed(&config, bot.get_main_admin().ok(), requester).await {
+        return "你不在通话授权名单里，我不能打给你。".to_string();
+    }
+    let client = match BridgeClient::new(&config) {
+        Ok(client) => client,
+        Err(error) => return format!("打不了电话：{error}"),
+    };
+    if let Ok(state) = client.current_call().await
+        && state.phase().is_live()
+    {
+        return "现在正通着话呢，等这通结束我再打给你。".to_string();
+    }
+    if let Err(error) = client.dial(requester).await {
+        return format!("打不出去：{error}");
+    }
+    // 确认电话真的响起来了：桥受理 ≠ AVSDK 真的拨号。给它几秒钟。
+    let deadline = std::time::Instant::now() + DIAL_CONFIRM_WINDOW;
+    while std::time::Instant::now() < deadline {
+        kovi::tokio::time::sleep(Duration::from_millis(400)).await;
+        if let Ok(state) = client.current_call().await
+            && state.phase().is_live()
+        {
+            return "好，我打给你啦，接一下～".to_string();
+        }
+    }
+    "我让桥拨了，但它没能拨出去（AVSDK 把外呼命令丢了），这个我还在查。".to_string()
+}
+
 /// 启动 QQ 语音通话调度器。默认关闭，未启用时立即返回。
 pub(crate) async fn start_scheduler(bot: Arc<kovi::RuntimeBot>) {
     let config = config::get().qq_call().clone();
@@ -91,8 +135,16 @@ pub(crate) async fn start_scheduler(bot: Arc<kovi::RuntimeBot>) {
                     }
                     if !handled {
                         handled = true;
+                        // 主动拨出去的通话没有"来电者"：用桥记下的被叫号当对端，
+                        // 否则会按未知来电处理并婉拒——等于自己拒接自己。
+                        let mut effective = state.clone();
+                        if let Some(dialed) = state.dialed_uin {
+                            println!("[INFO] QQ 语音通话是主动外呼（被叫 {dialed}）");
+                            effective.caller_uin = Some(dialed.to_string());
+                            effective.caller_name = None;
+                        }
                         if let Err(error) =
-                            session::run(Arc::clone(&bot), &config, &client, &state).await
+                            session::run(Arc::clone(&bot), &config, &client, &effective).await
                         {
                             eprintln!("[ERROR] QQ 语音通话异常结束: {error}");
                         }
@@ -118,9 +170,6 @@ pub(crate) async fn start_scheduler(bot: Arc<kovi::RuntimeBot>) {
     }
 }
 
-/// 把桥的阶段变化写进日志，并在"来电/进房/结束"三个关键点留下可见痕迹。
-///
-/// 机器人无法接听电话（桥自动接听），所以用户能看到的只有这里：桥有没有上报
 /// 漏接来电通知：桥看到过邀请、但整通从未进房时，主动私聊告诉主管理员。
 ///
 /// 以前这种失败完全静默——你只能从"她没接"察觉；日志里也只有一行 WARN。
@@ -170,6 +219,10 @@ async fn notify_missed_call(
     }
 }
 
+/// 来电、有没有真正进房、名单里有没有这位来电者。
+/// 把桥的阶段变化写进日志，并在"来电/进房/结束"三个关键点留下可见痕迹。
+///
+/// 机器人无法接听电话（桥自动接听），所以用户能看到的只有这里：桥有没有上报
 /// 来电、有没有真正进房、名单里有没有这位来电者。
 async fn report_phase_change(
     phase: CallPhase,

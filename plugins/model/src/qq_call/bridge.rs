@@ -90,6 +90,12 @@ pub struct CallState {
     /// 结束原因码（QQ 内部值）。
     #[serde(rename = "endReason")]
     pub end_reason: Option<i64>,
+    /// 这一通是**我们主动拨出去**时，桥记下的被叫 QQ 号。
+    ///
+    /// 呼出的通话没有"来电者"，只有拿到这个字段才知道对方是谁；否则会把被叫
+    /// 当成未知来电，按不在名单处理并婉拒（等于自己打给自己又拒接）。
+    #[serde(rename = "dialedUin")]
+    pub dialed_uin: Option<i64>,
 }
 
 impl CallState {
@@ -118,6 +124,7 @@ pub struct BridgeClient {
     http: reqwest::Client,
     endpoint: String,
     hangup_endpoint: String,
+    dial_endpoint: String,
     token: String,
     timeout: Duration,
 }
@@ -132,13 +139,40 @@ impl BridgeClient {
         let base = config.bridge_url().trim_end_matches('/').to_owned();
         let endpoint = format!("{base}/v1/calls/current");
         let hangup_endpoint = format!("{base}/v1/calls/hangup");
+        let dial_endpoint = format!("{base}/v1/calls/dial");
         Ok(Self {
             http,
             endpoint,
             hangup_endpoint,
+            dial_endpoint,
             token,
             timeout: Duration::from_secs(config.request_timeout_secs()),
         })
+    }
+
+    /// 请桥主动拨打某个 QQ 号（AVSDK cmd 4 = `StartCall`）。
+    ///
+    /// 注意：请求成功只代表桥把命令交给了 AV Host 的 AVSDK——实测它可能被 AVSDK
+    /// 直接丢弃（插件日志里连命令号都不出现），所以调用方必须随后用 `current_call`
+    /// 确认这通电话是否真的响起来了，不要凭返回值就对外宣称"已经打给你了"。
+    pub async fn dial(&self, uin: i64) -> anyhow::Result<()> {
+        let response = self
+            .http
+            .post(&self.dial_endpoint)
+            .header(
+                reqwest::header::AUTHORIZATION,
+                format!("Bearer {}", self.token),
+            )
+            .json(&serde_json::json!({ "uin": uin }))
+            .timeout(self.timeout)
+            .send()
+            .await
+            .map_err(|error| anyhow::anyhow!("通话桥外呼请求失败: {error}"))?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(anyhow::anyhow!("通话桥外呼返回 HTTP {}", status.as_u16()));
+        }
+        Ok(())
     }
 
     /// 读取当前通话状态。桥离线或鉴权失败时返回错误。
