@@ -18,12 +18,15 @@ ExecStart=/home/ubuntu/yunxi-embed/.venv/bin/python /home/ubuntu/yunxi-embed/ser
 Restart=always
 RestartSec=3
 
-# 内存围栏：这个服务加载 ONNX 模型（实测 embedding 约 250MB、再加重排器会到 984MB），
-# 而机器只有 3.7GB、还跑着 NapCat/QQ 与语音服务。2026-09-12 就是因为没围栏，
-# 它涨到 984MB 把整机拖到 load 55，最后被内核 OOM 杀掉、SSH 都连不上。
-# 有了 MemoryMax，超限只会杀这一个服务（systemd 自己动手），不动其它任何人。
-MemoryHigh=512M
-MemoryMax=700M
+# 内存围栏：这个服务加载 ONNX 模型（约 400MB 常驻），而机器只有 3.7GB、
+# 还跑着 NapCat/QQ 与语音服务。2026-09-12 它曾涨到 984MB 把整机拖到 load 55、
+# 被内核 OOM，SSH 都连不上。
+#
+# **只设 MemoryMax，不设 MemoryHigh**：MemoryHigh 是软限，超了内核会持续回收，
+# 对一个 CPU 密集的模型服务就是活锁——实测设 512M 后 /v1/embed 直接不再响应
+# （MemoryCurrent 卡在 554MB）。MemoryMax 是硬限，超了只杀这一个服务，
+# 既保护整机、又不干扰它正常工作。
+MemoryMax=1G
 
 # 只服务本机：不监听公网，也不需要任何特权。
 NoNewPrivileges=yes

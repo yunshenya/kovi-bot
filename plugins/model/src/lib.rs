@@ -746,7 +746,16 @@ async fn main() {
                 let delay = if first_tick { 30 } else { 300 };
                 first_tick = false;
                 kovi::tokio::time::sleep(kovi::tokio::time::Duration::from_secs(delay)).await;
-                match backfill_manager.backfill_embeddings().await {
+                // 看门狗：一次卡住不能让它永远不再回填。真机上就发生过——嵌入服务
+                // 活锁时那一轮请求不返回，循环就停在 await 上，之后再无任何尝试，
+                // 而且**一行日志都没有**。超时把这一轮丢掉，下一轮照常。
+                let outcome = kovi::tokio::time::timeout(
+                    kovi::tokio::time::Duration::from_secs(120),
+                    backfill_manager.backfill_embeddings(),
+                )
+                .await
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("回填超时（120 秒未返回）")));
+                match outcome {
                     Ok(_) => consecutive_failures = 0,
                     Err(error) => {
                         consecutive_failures += 1;

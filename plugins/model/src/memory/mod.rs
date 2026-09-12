@@ -2741,10 +2741,14 @@ impl MemoryManager {
     /// 不回填的话，语义那一路只能看见新记忆——那等于"回忆起的东西取决于她记下它的
     /// 时间"，是最难发现的一类静默偏差。
     pub async fn backfill_embeddings(&self) -> Result<usize> {
+        // 三条"什么也没做"的路径都要留痕。刚才真机上排查"回填为什么停在 764"时，
+        // 这三条全是静默早返回，我只能靠猜——**为了不再猜，让每条路径自己说话**。
         let Some(client) = EmbeddingClient::from_config() else {
+            eprintln!("[WARN] 记忆向量回填跳过：嵌入未启用或未配置端点");
             return Ok(0);
         };
         let Some(pool) = self.database_pool.get() else {
+            eprintln!("[WARN] 记忆向量回填跳过：数据库连接池不可用");
             return Ok(0);
         };
         let batch = crate::config::get().memory().embedding_backfill_batch() as i64;
@@ -2768,6 +2772,8 @@ impl MemoryManager {
         .await
         .map_err(|error| anyhow::anyhow!("查询待回填记忆失败: {error}"))?;
         if rows.is_empty() {
+            // 空转是正常的（全部回填完了），所以只在真有问题时才有意义——
+            // 这里用 debug 级别的措辞，避免每 5 分钟刷一行。
             return Ok(0);
         }
         let items: Vec<(String, String)> = rows
