@@ -34,6 +34,13 @@ const MAX_STANCE_PROPOSALS: usize = 3;
 const MAX_STANCE_EVIDENCE: usize = 3;
 /// 立场形成的输出上限（一句话级别的 JSON）。
 const STANCE_MAX_TOKENS: u32 = 320;
+/// 两次"想自己的想法"之间的最短间隔（毫秒）。
+///
+/// 立场形成要调模型，而反思本身很频繁（实测 6 小时 63 次）。真正该问的不是"这次
+/// 反思够不够深"，而是"距上次想这事以来，是不是又攒下了值得沉淀的经历"——线上
+/// **深度反思一次都没触发过**（6 小时 0 次，全是 Light），按深度设闸等于再修一条
+/// 永不触发的管道。
+const STANCE_FORMATION_COOLDOWN_MS: i64 = 6 * 60 * 60 * 1000;
 /// 立场形成的模型调用上限：它是后台过程，绝不能拖住别的东西。
 const STANCE_MODEL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25);
 const MAX_EPISODE_SOURCE_EVENTS: usize = 16;
@@ -450,6 +457,9 @@ pub(crate) struct MindRuntime {
     outgoing_fences: Mutex<VecDeque<PendingMindFence>>,
     recent_events: Mutex<RecentEvents>,
     last_reflections: Mutex<HashMap<MindScope, DateTime<Utc>>>,
+    /// 上次让她"想自己的想法"的时间。跨作用域共享：立场是 Global 的，
+    /// 三个会话同时反思也只该形成一次，否则就是三次模型调用换同一件事。
+    last_stance_formation_unix_ms: AtomicI64,
     reasons: Mutex<MindReasonSnapshot>,
     reflection_worker: AsyncMutex<()>,
     metrics: MindMetrics,
@@ -470,6 +480,7 @@ impl MindRuntime {
             outgoing_fences: Mutex::new(VecDeque::new()),
             recent_events: Mutex::new(RecentEvents::default()),
             last_reflections: Mutex::new(HashMap::new()),
+            last_stance_formation_unix_ms: AtomicI64::new(0),
             reasons: Mutex::new(MindReasonSnapshot::default()),
             reflection_worker: AsyncMutex::new(()),
             metrics: MindMetrics::default(),
@@ -2117,9 +2128,15 @@ impl MindRuntime {
         // （见 `BarrierState::blocks_scope`），放开它是安全的。
         drop(barrier);
         let mut extra_model_calls = 0_usize;
-        if should_create_episode && input.depth == ReflectionDepth::Deep {
+        if should_create_episode && self.stance_formation_due(input.requested_at) {
             match self.form_stances(&input).await {
-                Ok(called) => extra_model_calls = usize::from(called),
+                Ok(called) => {
+                    extra_model_calls = usize::from(called);
+                    if called {
+                        self.last_stance_formation_unix_ms
+                            .store(input.requested_at.timestamp_millis(), Ordering::Relaxed);
+                    }
+                }
                 Err(error) => kovi::log::warn!("Yunxi Mind stance formation failed: {error}"),
             }
         }
@@ -2145,6 +2162,16 @@ impl MindRuntime {
             extra_model_calls,
         );
         Ok(())
+    }
+
+    /// 现在该不该让她想想法。
+    ///
+    /// 判据是"隔了足够久"，不是"这次反思够不够深"：深度反思在线上从未触发过
+    /// （见 [`STANCE_FORMATION_COOLDOWN_MS`] 的说明），而反思本身很频繁。
+    /// 冷却期跨作用域共享——立场是 Global 的，三个会话同时反思也只该形成一次。
+    fn stance_formation_due(&self, now: DateTime<Utc>) -> bool {
+        let last = self.last_stance_formation_unix_ms.load(Ordering::Relaxed);
+        last == 0 || now.timestamp_millis() - last >= STANCE_FORMATION_COOLDOWN_MS
     }
 
     /// 让她在"认真回想"时自己形成、强化或动摇看法。
@@ -3410,6 +3437,32 @@ mod tests {
         assert_eq!(updates[0].proposition, "我认为显式状态机比隐式标记更可靠");
         assert_eq!(updates[1].operation, BeliefOperation::Upsert);
         assert!(updates[1].proposition.contains("以前我"));
+    }
+
+    #[test]
+    fn stance_formation_is_gated_by_time_not_by_reflection_depth() {
+        // 线上实测：6 小时 63 次反思**全是 Light**，深度反思一次都没触发过。
+        // 所以闸必须是"隔了足够久"，而不是"这次反思够不够深"——否则又是一条
+        // 永不触发的管道。
+        let executor = kovi::tokio::runtime::Runtime::new().expect("test runtime");
+        executor.block_on(async {
+            let (runtime, _store) = test_runtime();
+            let start = Utc::now();
+            assert!(runtime.stance_formation_due(start), "首次应当到期");
+            runtime
+                .last_stance_formation_unix_ms
+                .store(start.timestamp_millis(), Ordering::Relaxed);
+            assert!(
+                !runtime.stance_formation_due(start + Duration::minutes(30)),
+                "冷却期内不该重复调模型"
+            );
+            assert!(
+                runtime.stance_formation_due(
+                    start + Duration::milliseconds(STANCE_FORMATION_COOLDOWN_MS + 1)
+                ),
+                "冷却期过后应再次形成"
+            );
+        });
     }
 
     #[test]
