@@ -13,6 +13,13 @@ pub struct MemoryConfig {
     embedding_timeout_secs: u64,
     /// 一轮维护最多回填多少条记忆的向量（避免维护任务卡住）。
     embedding_backfill_batch: usize,
+    /// 语义那一路的最低相似度（千分比，默认 450 ≈ 0.45）。
+    ///
+    /// **这条阈值是必须的，不是调优**：语义检索总会返回 top-K，而 BGE 的分数是压缩的
+    /// ——实测真实记忆里"完全无关"约 0.36、"确实相关"约 0.52。没有阈值，融合会把无关
+    /// 记忆插到词面命中前面，**语义那一路反而让检索变差**。低于阈值就当作"没有相关的"，
+    /// 老老实实退回词面结果。
+    embedding_min_similarity_millis: u32,
     /// **失控保护，不是管理手段。**
     ///
     /// 以前它是 1000，于是"记不记得住"由"数到第 1000 条"决定：两张记忆表都按
@@ -74,6 +81,10 @@ impl MemoryConfig {
 
     pub fn embedding_backfill_batch(&self) -> usize {
         self.embedding_backfill_batch.max(1)
+    }
+
+    pub fn embedding_min_similarity(&self) -> f32 {
+        self.embedding_min_similarity_millis.min(1_000) as f32 / 1_000.0
     }
 
     pub fn max_entries(&self) -> usize {
@@ -249,6 +260,7 @@ impl Default for MemoryConfig {
             embedding_model: "bge-small-zh-v1.5".to_string(),
             embedding_timeout_secs: 20,
             embedding_backfill_batch: 128,
+            embedding_min_similarity_millis: 450,
             max_entries: 50_000,
             retention_days: 30,
             episode_retention_days: 365,

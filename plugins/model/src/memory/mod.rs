@@ -2852,13 +2852,17 @@ impl MemoryManager {
             .into_iter()
             .next()
             .ok_or_else(|| anyhow::anyhow!("嵌入服务没有返回查询向量"))?;
+        let threshold = crate::config::get().memory().embedding_min_similarity();
         let mut scored: Vec<(String, f32)> = rows
             .iter()
             .filter_map(|row| {
                 let memory_id: String = row.get("memory_id");
                 let bytes: Vec<u8> = row.get("vector");
                 let vector = vector_from_bytes(&bytes)?;
-                Some((memory_id, cosine(&query_vector, &vector)))
+                let similarity = cosine(&query_vector, &vector);
+                // 低于阈值就当"没有相关的"：语义检索总会返回 top-K，而无关记忆
+                // 插进融合结果会让检索**变差**，不如老老实实退回词面。
+                (similarity >= threshold).then_some((memory_id, similarity))
             })
             .collect();
         // 分数相同按 id 排，保证结果确定。
