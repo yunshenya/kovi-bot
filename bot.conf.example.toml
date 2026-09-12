@@ -428,22 +428,17 @@ hangup_keywords = ["挂断", "挂了吧", "先挂", "挂电话", "挂了", "不�
 farewell = "好，那我先挂啦，拜拜～"
 # 会话收尾时是否让桥真的挂断这通电话（默认 true）。
 #
-# QQ 的 1v1 通话没有对插件开放"离开房间"，但 AVSDK 插件自身一直有
-# `Quit(roomId, reason)`：桥的控制接口 cmd 8（页面 postMessage 的 cmd 就是
-# `QRTCServiceInterfaceWrapper` 的方法表下标：1=Login、5=Accept、8=Quit、
-# 9=Reject、10=Close、11=ClearRoom、55=OnPenetrateEvent）。桥现在把它透出成
+# QQ 的 1v1 通话没有对插件开放"离开房间"，但 AVSDK 插件的方法表里一直有挂断
+# （页面 postMessage 的 cmd 就是 `QRTCServiceInterfaceWrapper` 的方法表下标：
+# 1=Login、5=Accept、10=Close、55=OnPenetrateEvent）。桥把它透出成
 # `POST /v1/calls/hangup`，机器人结束会话（对方要求挂断、名单外婉拒、通话到点、
 # 采集中断）时会调用它。关掉即回到旧行为：只能停止参与，等对方挂断。
+#
+# 具体参数（Close + roomId=0 + 来电者 uid + reason=1）是逐通真机试出来的固定值，
+# 不开放成配置：Quit(8) 和 ClearRoom(11) 挂不断，uid 留空或换成机器人自己则完全
+# 无效。详见 docs/qq-call.md 的「挂断参数实验」。对方界面偶尔出现"要请多人通话"
+# 的提示是 QQ 把 1v1 通话当两人群视频房间的固有文案，不影响挂断。
 hangup_enabled = true
-# 用哪个 AVSDK 控制方法挂断。目前只支持 close(10)。
-# 2026-09-12 真机实测：quit(8) 只会让本端离开房间、服务器不销毁（桥的事件计数照涨、
-# endReason 一直为空）；close(10) 才真的结束通话（桥立刻 ended、endReason=4）。
-# 桥侧已把 8/9/11 从白名单去掉，填别的值会挂断失败。
-# 注：对方界面偶尔出现"要请多人通话"的提示与 8 无关（只发 10 时也会出现，属于 QQ
-# 把 1v1 通话当两人群视频房间的固有表现），不影响挂断。
-hangup_method = "close"
-# 传给该控制方法的原因码，默认 1。
-hangup_reason = 1
 
 # 芸汐主动发语音消息：她在回复里标记 voice 时，用本机 TTS 把这句话合成出来，
 # 再以 QQ 语音消息发出。默认关闭。
