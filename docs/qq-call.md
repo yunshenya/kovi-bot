@@ -611,7 +611,7 @@ AVSDK 回传的全部命令第一次变得可见：
 | `patch-plugin-caller-allowlist.py` | **接听授权**：接听前读 `runtime/allowed-callers.json`（`enabled != true` 时保持上游"谁打进来都接"），并把来电者写进状态 |
 | `patch-plugin-dial.py` | **主动外呼通道**：插件新增 `POST /v1/calls/dial`（QQ 号 → AVSDK uid，再用 cmd 4 `StartCall`），并把目标记进 `state.call.dialed*`。参数形态仍在定标（`mode` 开关），AV Host 白名单里的 `4`/`20` 由 hangup 补丁统一归一化 |
 | `patch-plugin-avsdk-trace.py` | **AVSDK 输出追踪**：把最近 20 条非心跳输出记进 `state.avHost.outputTrail`（命令号 + 类型/长度摘要），用来定位"来电时 AV Host 到底回报了什么" |
-| `patch-plugin-accept-retry.py` | **来电回调重投**：邀请 payload 转给 AV Host 的 AVSDK 后等 `20006`，1.5 秒没等到就重投（最多 2 次），失败留 WARN；计数见 `avHost.acceptRetryCount` / `acceptRetryGaveUp`。背景：真机对照发现 `20006` 偶尔不来，此时电话会一直响到对方放弃 |
+| `patch-plugin-accept-retry.py` | **来电回调重投**：邀请 payload 转给 AV Host 的 AVSDK 后等 `20006`，按 1.5 → 3 → 6 秒退避重投（共 3 次投递，覆盖约 10 秒铃声窗口）；彻底失败时打一条带**诊断快照**的 WARN（阶段、inviteAt、callerUin、重试次数、直方图、输出轨迹、监听事件），计数见 `avHost.acceptRetryCount` / `acceptRetryGaveUp`。背景：真机对照发现 `20006` 偶尔不来，此时电话会一直响到对方放弃 |
 | `patch-plugin-hangup.py` | **主动挂断**：AV Host 的 cmd 白名单只加入 `10`（`Close`，唯一实测有效的方法），`invokeAVHost` 返回响应体，并新增 `POST /v1/calls/hangup`；见上面的"主动挂断"一节。写法是归一化（正则改写整行），能收敛上游原版与实验期间的各种历史状态 |
 
 已验证的插件整份备份在
