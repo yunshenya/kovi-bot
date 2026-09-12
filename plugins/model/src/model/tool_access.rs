@@ -9,7 +9,7 @@ use crate::memory::{MEMORY_MANAGER, MemoryEntry, MemoryLookup};
 use crate::redis_store;
 use crate::reminders;
 use crate::sticker_memory::{self, StickerScope};
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, ensure};
 use chrono::{Duration as ChronoDuration, Local, Utc};
 use chrono_tz::Tz;
 use kovi::tokio::sync::{Mutex, OnceCell};
@@ -39,6 +39,9 @@ const MAX_CALCULATOR_EXPRESSION_CHARS: usize = 300;
 const MAX_CALCULATOR_TOKENS: usize = 128;
 const MAX_GROUP_MEMBER_QUERY_CHARS: usize = 80;
 const MAX_GROUP_MEMBER_RESULTS: usize = 8;
+const MAX_PRIVATE_CONTACT_QUERY_CHARS: usize = 80;
+/// 单条外发消息的正文上限，与群发保持一致。
+const MAX_OUTGOING_MESSAGE_CHARS: usize = 1_000;
 
 pub(crate) struct PublicHttpResponse {
     pub(crate) status: u16,
@@ -95,6 +98,8 @@ enum BuiltinTool {
     GroupMessageSend,
     GroupQuestionStatus,
     GroupQuestionCancel,
+    PrivateContactsSearch,
+    PrivateMessageSend,
     HealthCheck,
 }
 
@@ -108,6 +113,7 @@ impl BuiltinTool {
                 | Self::MemorySearch
                 | Self::ReminderList
                 | Self::AgentRunStatus
+                | Self::PrivateContactsSearch
                 | Self::WebSearch
                 | Self::WebFetch
                 | Self::NewsSearch
@@ -448,6 +454,45 @@ pub(crate) async fn initialize() -> Result<()> {
             "additionalProperties": false
         }),
         source: ToolSource::Builtin(BuiltinTool::GroupMessageSend),
+    });
+    definitions.push(ToolDefinition {
+        name: "private.contacts.search".to_string(),
+        description: "主管理员专用、仅限私聊或通话：按名字从机器人好友里找人，返回唯一匹配或候选。用户说\"给某某发条消息\"但给的是名字而不是 QQ 号时先用它；只有 status 为 unique 才能把 user_id 填进 private.message.send，ambiguous 时列出候选请用户确认，none 时如实说找不到。不要把好友列表整份倒出来。".to_string(),
+        input_schema: json!({
+            "type": "object",
+            "required": ["query"],
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "好友的昵称、备注或名字片段。"
+                }
+            },
+            "additionalProperties": false
+        }),
+        source: ToolSource::Builtin(BuiltinTool::PrivateContactsSearch),
+    });
+    definitions.push(ToolDefinition {
+        name: "private.message.send".to_string(),
+        description: "主管理员专用、仅限私聊或通话：以机器人身份给某个好友发一条私聊消息。只会发给机器人好友列表里的人，陌生号码会被拒绝——这是为了不让机器人变成给任何人发消息的工具。目标是名字时先调用 private.contacts.search，只有唯一匹配才能发。content 必须是准备让对方看到的最终正文，不要带\"告诉他说\"这类转述包装。只有工具返回成功后才能说已经发出。".to_string(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "user_id": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "目标好友的 QQ 号。"
+                },
+                "content": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 1000,
+                    "description": "将直接发送给对方的最终纯文本正文。"
+                }
+            },
+            "required": ["user_id", "content"],
+            "additionalProperties": false
+        }),
+        source: ToolSource::Builtin(BuiltinTool::PrivateMessageSend),
     });
     definitions.push(ToolDefinition {
         name: "group.question.status".to_string(),
@@ -917,6 +962,9 @@ impl ToolRegistry {
                 "\n\n跨会话动作规则：主管理员明确要求你现在去另一个群发消息时，必须执行 group.message.send，不能只口头答应。目标是明确群号时可直接调用；目标是群名、简称或描述时先调用 group.message.targets，只能采用唯一匹配，无法唯一确定就自然询问。content 必须是准备给目标群看到的最终正文。若用户要求“去群里问/征集意见/等待回复/之后告诉我结果”，这是闭环任务，必须在 group.message.send 中填写 collect_replies_minutes（不确定时使用默认时长），不能只发送普通消息；系统会在最低有效回复后安静一段时间提前汇总，或到等待上限汇总。工具返回中会给出 task_id，后续询问进度时调用 group.question.status，明确要求停止时调用 group.question.cancel；也可以告诉主管理员可用 #群问答状态 任务编号或 #取消群问答 任务编号。群问题或私聊汇报正在发送的短暂阶段不能取消，其余未完成阶段可以取消。只有工具返回 completed 或 already_completed 后才能说已经发出；工具失败时如实说明没有成功，不要自行重试或伪造结果。",
             );
             instruction.push_str(
+                "\n\n给好友发私聊消息规则：主管理员明确要求你给某个人发条消息时，必须执行 private.message.send，不能只口头答应。目标是 QQ 号就直接调用；目标是名字、昵称或备注时先调用 private.contacts.search，只有唯一匹配才能把 user_id 填进去，候选不唯一就列出候选请用户确认，找不到就如实说找不到。对方不在好友列表里时发送会被拒绝，如实说明而不是换个说法假装发了。content 必须是准备让对方看到的最终正文，不要写成“告诉他说……”这类转述。只有工具返回 completed 后才能说已经发出。",
+            );
+            instruction.push_str(
                 "\n\n持续任务规则：主管理员要求“每隔一段时间请求公开 URL，直到满足条件后告诉我”时，必须调用 agent.run.create，不能用 reminder.create 或口头承诺代替。一次性读取仍使用 web.fetch；查看和停止持续任务分别使用 agent.run.status 与 agent.run.cancel。创建时从用户原话提取间隔、条件、截止时间和通知正文；用户没有指定截止时间或最大次数时允许使用系统默认值。只有工具成功后才能说已经开始监测。",
             );
         }
@@ -1290,6 +1338,8 @@ impl ToolSource {
                     | BuiltinTool::GroupMessageSend
                     | BuiltinTool::GroupQuestionStatus
                     | BuiltinTool::GroupQuestionCancel
+                    | BuiltinTool::PrivateContactsSearch
+                    | BuiltinTool::PrivateMessageSend
                     | BuiltinTool::HealthCheck
                     | BuiltinTool::StickerMemoryTeach
             ),
@@ -1313,6 +1363,8 @@ impl ToolSource {
                     | BuiltinTool::GroupMessageSend
                     | BuiltinTool::GroupQuestionStatus
                     | BuiltinTool::GroupQuestionCancel
+                    | BuiltinTool::PrivateContactsSearch
+                    | BuiltinTool::PrivateMessageSend
                     | BuiltinTool::AgentRunCreate
                     | BuiltinTool::AgentRunStatus
                     | BuiltinTool::AgentRunCancel
@@ -1328,6 +1380,8 @@ impl ToolSource {
                     | BuiltinTool::GroupMessageSend
                     | BuiltinTool::GroupQuestionStatus
                     | BuiltinTool::GroupQuestionCancel
+                    | BuiltinTool::PrivateContactsSearch
+                    | BuiltinTool::PrivateMessageSend
                     | BuiltinTool::AgentRunCreate
                     | BuiltinTool::AgentRunStatus
                     | BuiltinTool::AgentRunCancel,
@@ -1354,6 +1408,10 @@ impl ToolSource {
                 matches!(destination, MessageDestination::Private(_))
             }
             Self::Builtin(BuiltinTool::GroupQuestionStatus | BuiltinTool::GroupQuestionCancel) => {
+                matches!(destination, MessageDestination::Private(_))
+            }
+            // 和跨群动作同理：给别人发私聊消息也只能从私聊（含"正在和他通电话"）发起。
+            Self::Builtin(BuiltinTool::PrivateContactsSearch | BuiltinTool::PrivateMessageSend) => {
                 matches!(destination, MessageDestination::Private(_))
             }
             Self::Builtin(
@@ -1624,13 +1682,34 @@ async fn execute_builtin(
                     config::get().agent_tasks().max_collect_minutes()
                 ));
             }
-            let source_message_id = tool_context
-                .source_message_id
-                .ok_or_else(|| anyhow!("跨群动作缺少来源消息编号"))?;
             let bot = tool_context
                 .runtime_bot
                 .as_deref()
                 .ok_or_else(|| anyhow!("跨群动作没有可用的机器人运行时"))?;
+            // 通话里没有"来源消息"，也就没有幂等键、更没有 goal 台账可挂——那条路
+            // 是为聊天里的消息设计的（跨群问答要按消息编号去重和追踪回复）。所以
+            // 通话里退化成一次性直发：发得出去就是发出去了，没有等待回复的能力。
+            let Some(source_message_id) = tool_context.source_message_id else {
+                ensure!(
+                    collect_replies_minutes.is_none(),
+                    "通话里没法等待群成员回复（那需要聊天里的消息编号来追踪）。\n                     请如实说明这一点：消息可以现在就发，但收集回复要等他挂断后在私聊里再说一次。"
+                );
+                revalidate_tool_effect(&tool_context, reply_ticket, revalidator).await?;
+                let message_id = super::tracked_send::send_tracked_plain_text(
+                    bot,
+                    MessageDestination::Group(group_id),
+                    normalize_outgoing_text(&content)?,
+                )
+                .await
+                .map_err(|error| anyhow!("跨群消息发送失败：{error}"))?;
+                return Ok(json!({
+                    "status": "completed",
+                    "group_id": group_id,
+                    "message_id": message_id,
+                    "collected": false,
+                })
+                .to_string());
+            };
             let tool_context =
                 revalidate_tool_effect(&tool_context, reply_ticket, revalidator).await?;
             crate::agent_runtime::execute_action(
@@ -1648,6 +1727,40 @@ async fn execute_builtin(
                 reply_ticket,
             )
             .await
+        }
+        BuiltinTool::PrivateContactsSearch => {
+            search_private_contacts(&arguments, &tool_context, max_result_chars).await
+        }
+        BuiltinTool::PrivateMessageSend => {
+            reject_unknown_arguments(&arguments, &["user_id", "content"])?;
+            let target_user_id = required_positive_i64(&arguments, "user_id")?;
+            let content = required_string(&arguments, "content", 1_000)?;
+            let bot = tool_context
+                .runtime_bot
+                .as_deref()
+                .ok_or_else(|| anyhow!("私聊动作没有可用的机器人运行时"))?;
+            // 先确认目标真的是好友：机器人不该成为"给任意 QQ 号发消息"的工具。
+            let friend = friend_by_user_id(bot, target_user_id).await?;
+            let Some(friend) = friend else {
+                return Err(anyhow!(
+                    "对方（{target_user_id}）不在我的好友列表里，发不了私聊消息。"
+                ));
+            };
+            revalidate_tool_effect(&tool_context, reply_ticket, revalidator).await?;
+            let message_id = super::tracked_send::send_tracked_plain_text(
+                bot,
+                MessageDestination::Private(target_user_id),
+                normalize_outgoing_text(&content)?,
+            )
+            .await
+            .map_err(|error| anyhow!("私聊消息发送失败：{error}"))?;
+            Ok(json!({
+                "status": "completed",
+                "user_id": target_user_id,
+                "display_name": friend,
+                "message_id": message_id,
+            })
+            .to_string())
         }
         BuiltinTool::GroupQuestionStatus => {
             reject_unknown_arguments(&arguments, &["task_id"])?;
@@ -1690,6 +1803,157 @@ struct GroupMemberCandidate {
     card: Option<String>,
     matched_name: String,
     match_kind: GroupMemberMatchKind,
+}
+
+fn json_i64(value: &Value) -> Option<i64> {
+    value
+        .as_i64()
+        .or_else(|| value.as_str()?.parse::<i64>().ok())
+        .filter(|value| *value > 0)
+}
+
+/// 一次好友列表查询的结果：(QQ 号, 显示名)。
+///
+/// 昵称和备注都可能为空，所以显示名要做兜底：备注优先（那是主管理员自己起的名字，
+/// 最可能就是他嘴上说的那个），其次是昵称，都没有就用 QQ 号。
+async fn fetch_friends(bot: &RuntimeBot) -> Result<Vec<(i64, String, String)>> {
+    let response = bot
+        .get_friend_list()
+        .await
+        .map_err(|error| anyhow!("暂时读取不到好友列表（retcode={}）", error.retcode))?;
+    ensure!(response.status == "ok", "暂时读取不到好友列表");
+    let friends = response
+        .data
+        .as_array()
+        .ok_or_else(|| anyhow!("好友列表返回格式无效"))?;
+    let mut result = Vec::new();
+    for friend in friends {
+        let Some(user_id) = friend.get("user_id").and_then(json_i64) else {
+            continue;
+        };
+        let remark = friend
+            .get("remark")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let nickname = friend
+            .get("nickname")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let display_name = if !remark.is_empty() {
+            remark.clone()
+        } else if !nickname.is_empty() {
+            nickname.clone()
+        } else {
+            format!("好友 {user_id}")
+        };
+        result.push((user_id, display_name, nickname));
+    }
+    Ok(result)
+}
+
+/// 目标 QQ 号是不是好友；是的话返回显示名。
+async fn friend_by_user_id(bot: &RuntimeBot, user_id: i64) -> Result<Option<String>> {
+    Ok(fetch_friends(bot)
+        .await?
+        .into_iter()
+        .find(|(friend_id, _, _)| *friend_id == user_id)
+        .map(|(_, display_name, _)| display_name))
+}
+
+/// 按名字找好友。语义与 `group.members.search` 对齐：unique 才能直接发，
+/// ambiguous 要列候选让用户确认，none 就如实说找不到——不猜。
+///
+/// 完全相等优先于包含匹配：对方说"小晴"时，"小晴"应该赢过"小晴的猫"。
+async fn search_private_contacts(
+    arguments: &Map<String, Value>,
+    tool_context: &ToolExecutionContext,
+    max_result_chars: usize,
+) -> Result<String> {
+    reject_unknown_arguments(arguments, &["query"])?;
+    let query = required_string(arguments, "query", MAX_PRIVATE_CONTACT_QUERY_CHARS)?;
+    let bot = tool_context
+        .runtime_bot
+        .as_deref()
+        .ok_or_else(|| anyhow!("好友搜索工具没有可用的机器人运行时"))?;
+    let needle = query.to_lowercase();
+    let mut matched: Vec<(i64, String)> = fetch_friends(bot)
+        .await?
+        .into_iter()
+        .filter(|(_, display_name, nickname)| {
+            display_name.to_lowercase().contains(&needle)
+                || nickname.to_lowercase().contains(&needle)
+        })
+        .map(|(user_id, display_name, _)| (user_id, display_name))
+        .collect();
+    matched.sort_by_key(|(user_id, _)| *user_id);
+    matched.dedup_by_key(|(user_id, _)| *user_id);
+    let exact: Vec<(i64, String)> = matched
+        .iter()
+        .filter(|(_, display_name)| display_name.to_lowercase() == needle)
+        .cloned()
+        .collect();
+    let candidates = if exact.is_empty() { matched } else { exact };
+    Ok(private_contacts_result(
+        &query,
+        &candidates,
+        max_result_chars,
+    ))
+}
+
+/// 好友搜索的结果协议：status 只有 unique / ambiguous / none 三种，
+/// 只有 unique 才允许拿着 user_id 去发消息。
+fn private_contacts_result(
+    query: &str,
+    candidates: &[(i64, String)],
+    max_result_chars: usize,
+) -> String {
+    let status = match candidates.len() {
+        0 => "none",
+        1 => "unique",
+        _ => "ambiguous",
+    };
+    let mut selected = Vec::new();
+    for (user_id, display_name) in candidates {
+        selected.push(json!({
+            "user_id": user_id,
+            "display_name": display_name,
+        }));
+        let candidate = json!({
+            "query": query,
+            "status": status,
+            "total": candidates.len(),
+            "candidates": selected,
+        })
+        .to_string();
+        if candidate.chars().count() > max_result_chars {
+            selected.pop();
+            break;
+        }
+    }
+    json!({
+        "query": query,
+        "status": status,
+        "total": candidates.len(),
+        "candidates": selected,
+        "truncated": selected.len() < candidates.len(),
+    })
+    .to_string()
+}
+
+fn normalize_outgoing_text(content: &str) -> Result<String> {
+    let normalized = content.replace("\r\n", "\n").replace('\r', "\n");
+    let normalized = normalized.trim();
+    ensure!(!normalized.is_empty(), "发送正文不能为空");
+    ensure!(!normalized.contains('\0'), "发送正文包含无效控制字符");
+    ensure!(
+        normalized.chars().count() <= MAX_OUTGOING_MESSAGE_CHARS,
+        "发送正文不能超过 {MAX_OUTGOING_MESSAGE_CHARS} 个字符"
+    );
+    Ok(normalized.to_string())
 }
 
 async fn search_group_members(
@@ -3396,11 +3660,12 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        BuiltinTool, GroupMemberMatchKind, MessageDestination, ToolDefinition,
-        ToolExecutionContext, ToolRegistry, ToolSource, calculate, current_time,
+        BuiltinTool, GroupMemberMatchKind, MAX_OUTGOING_MESSAGE_CHARS, MessageDestination,
+        ToolDefinition, ToolExecutionContext, ToolRegistry, ToolSource, calculate, current_time,
         format_bing_results, format_duckduckgo_results, mcp_tool_is_read_only_for_follow_up,
-        normalize_duckduckgo_url, search_group_member_candidates, tool_is_explicitly_read_only,
-        tool_name_looks_destructive, validate_public_url,
+        normalize_duckduckgo_url, normalize_outgoing_text, private_contacts_result,
+        search_group_member_candidates, tool_is_explicitly_read_only, tool_name_looks_destructive,
+        validate_public_url,
     };
     use crate::model::ReplyScope;
     use crate::model::interrupt::{finish, interrupt};
@@ -3658,6 +3923,54 @@ mod tests {
     }
 
     #[test]
+    fn private_contact_results_only_allow_unique_targets() {
+        let none = private_contacts_result("小晴", &[], 4_000);
+        assert!(none.contains("\"status\":\"none\""));
+
+        let unique = private_contacts_result("小晴", &[(3052405886, "小晴".to_string())], 4_000);
+        assert!(unique.contains("\"status\":\"unique\""));
+        assert!(unique.contains("3052405886"));
+
+        let ambiguous = private_contacts_result(
+            "小",
+            &[
+                (3052405886, "小晴".to_string()),
+                (2507257813, "小猫".to_string()),
+            ],
+            4_000,
+        );
+        assert!(ambiguous.contains("\"status\":\"ambiguous\""));
+        assert!(ambiguous.contains("\"total\":2"));
+
+        // 结果超长时只截断候选，status 与 total 仍按完整候选集报告——
+        // 否则模型会把"截断了"误读成"只有这些"。
+        let truncated = private_contacts_result(
+            "小",
+            &[
+                (1, "小一".to_string()),
+                (2, "小二".to_string()),
+                (3, "小三".to_string()),
+            ],
+            40,
+        );
+        assert!(truncated.contains("\"truncated\":true"));
+        assert!(truncated.contains("\"status\":\"ambiguous\""));
+        assert!(truncated.contains("\"total\":3"));
+    }
+
+    #[test]
+    fn outgoing_text_is_normalized_before_sending() {
+        assert_eq!(
+            normalize_outgoing_text("  你好\r\n世界  ").unwrap(),
+            "你好\n世界"
+        );
+        assert!(normalize_outgoing_text("   ").is_err());
+        assert!(normalize_outgoing_text("带\0空字符").is_err());
+        assert!(normalize_outgoing_text(&"长".repeat(MAX_OUTGOING_MESSAGE_CHARS + 1)).is_err());
+        assert!(normalize_outgoing_text(&"长".repeat(MAX_OUTGOING_MESSAGE_CHARS)).is_ok());
+    }
+
+    #[test]
     fn command_tools_keep_admin_and_group_boundaries() {
         assert!(ToolSource::Builtin(BuiltinTool::HelpCommands).admin_only());
         assert!(ToolSource::Builtin(BuiltinTool::SystemInfo).admin_only());
@@ -3686,8 +3999,25 @@ mod tests {
             assert!(run_tool.main_admin_only());
         }
 
+        // 给好友发私聊消息：和跨群动作同一套边界——主管理员专属、只能从私聊发起、
+        // 不允许定时任务调用，其中"找人"是只读的、"发消息"不是。
+        let contacts = ToolSource::Builtin(BuiltinTool::PrivateContactsSearch);
+        let private_send = ToolSource::Builtin(BuiltinTool::PrivateMessageSend);
+        assert!(contacts.admin_only());
+        assert!(contacts.main_admin_only());
+        assert!(contacts.read_only());
+        assert!(private_send.admin_only());
+        assert!(private_send.main_admin_only());
+        assert!(!private_send.read_only());
+        assert!(!contacts.available_for_scheduled());
+        assert!(!private_send.available_for_scheduled());
+
         let private = MessageDestination::Private(7);
         let group = MessageDestination::Group(8);
+        for tool in [&contacts, &private_send] {
+            assert!(tool.available_for_context(private, false));
+            assert!(!tool.available_for_context(group, false));
+        }
         assert!(
             !ToolSource::Builtin(BuiltinTool::GroupPause).available_for_context(private, false)
         );
