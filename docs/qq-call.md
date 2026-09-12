@@ -393,6 +393,7 @@ Actions 日志谁都能看，它的输出已经脱敏：QQ 号/群号掩码成 `
 | `从未进房`，或当前停在 `ringing` / `accepted` | 桥接听了信令，但 AVSDK 的会话没建立（就是 20050 那类问题） | 确认 `patch-ignore-20050.py` 生效，看 `/v1/status` 的命令直方图 |
 | `已授权` 且 `已进房`，但对方听不到声音 | 通话建立过，问题在音频或语音服务 | `curl http://127.0.0.1:6120/healthz`，再按下面几行排查 |
 | 收到了来电（`20006` 增长）但没有 `5`/`20004` | 桥没接或没进房 | 看插件日志里的 `native auto-accept failed`；确认 `patch-plugin-login-refresh.py` 的两个前提（`lastOutputAt` 字段与安静期常量）都在 |
+| 来电响了但一直没人接，`20006` 计数为 0 | **AV Host 的 AVSDK 没拿到来电**（信令被路由到主 QQ 那台设备），接听参数（12 元组）只有它回报的 `20006` 里才有，监听那条路给不出（只有 `relation_id`/`invite_type`/`from_uid`，后者还是空的） | `patch-plugin-accept-retry.py` 会重投 payload（最多 2 次）；看 `avHost.acceptRetryCount` / `acceptRetryGaveUp` 与 `outputTrail` 判断是路由问题还是别的问题 |
 
 阶段变化也会写进机器人日志，一次通话的完整时间线是这样的：
 
@@ -608,6 +609,9 @@ AVSDK 回传的全部命令第一次变得可见：
 | `patch-ignore-20050.py` | **根因修复**：`20050`/`120043` 不再触发重登 |
 | `patch-plugin-login-refresh.py` | **登录自愈**：AV Host 进程重启后拿不到登录参数（上游只在插件启动时投一次），插件空闲时每 60 秒补投一次，结果见 `/v1/status` 的 `avHost.loginRefreshCount` |
 | `patch-plugin-caller-allowlist.py` | **接听授权**：接听前读 `runtime/allowed-callers.json`（`enabled != true` 时保持上游"谁打进来都接"），并把来电者写进状态 |
+| `patch-plugin-dial.py` | **主动外呼通道**：插件新增 `POST /v1/calls/dial`（QQ 号 → AVSDK uid，再用 cmd 4 `StartCall`），并把目标记进 `state.call.dialed*`。参数形态仍在定标（`mode` 开关），AV Host 白名单里的 `4`/`20` 由 hangup 补丁统一归一化 |
+| `patch-plugin-avsdk-trace.py` | **AVSDK 输出追踪**：把最近 20 条非心跳输出记进 `state.avHost.outputTrail`（命令号 + 类型/长度摘要），用来定位"来电时 AV Host 到底回报了什么" |
+| `patch-plugin-accept-retry.py` | **来电回调重投**：邀请 payload 转给 AV Host 的 AVSDK 后等 `20006`，1.5 秒没等到就重投（最多 2 次），失败留 WARN；计数见 `avHost.acceptRetryCount` / `acceptRetryGaveUp`。背景：真机对照发现 `20006` 偶尔不来，此时电话会一直响到对方放弃 |
 | `patch-plugin-hangup.py` | **主动挂断**：AV Host 的 cmd 白名单只加入 `10`（`Close`，唯一实测有效的方法），`invokeAVHost` 返回响应体，并新增 `POST /v1/calls/hangup`；见上面的"主动挂断"一节。写法是归一化（正则改写整行），能收敛上游原版与实验期间的各种历史状态 |
 
 已验证的插件整份备份在
