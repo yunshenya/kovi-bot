@@ -135,7 +135,29 @@ pub struct QqCallConfig {
     /// 模型可能来回调用把电话拖住（电话是实时对话，不是异步任务），所以到上限后
     /// 强制它用一句人话收尾。默认 3 轮足够覆盖"先查时间再算日期再建提醒"这类串联。
     tool_max_rounds: usize,
+    /// 她嘴上答应了一件要动手的事却没调用任何工具时，最多补跑几轮让她真的去做。
+    ///
+    /// 2026-09-13 线上：她说"那我先看看有哪些群，等我一下"，然后整通电话再没有下文。
+    /// 那一轮 `tool_calls=0`——**根本没有东西在跑**，对方等多久都不会有结果。补跑就是把
+    /// 说出口的承诺变成真的工具调用：把系统纠正塞回上下文，让她重来一轮。0 = 只记 WARN。
+    claim_retry_rounds: usize,
+    /// 对方安静多少秒后她主动出声（0 = 关闭主动出声）。
+    ///
+    /// 电话不能是"我说一句她答一句"：对方不说话时她一直静音，听起来像掉线。到点她会
+    /// 主动说一句（"喂？你还在吗""怎么了呀，怎么不说话"），也会借这一轮把没做完的事
+    /// 做完再报结果。连续主动出声按倍数退避（6/12/24/48 秒），次数上限见 `idle_prompt_max`。
+    idle_prompt_secs: u64,
+    /// 一次通话里连续主动出声的次数上限（对方一直不回应时）。
+    ///
+    /// 到顶就回到安静等待，避免变成不停催问；对方一开口计数归零。默认 3：足够把
+    /// "喂？在吗""怎么了呀""那我先不吵你"这类探话说完，又不会显得急。
+    idle_prompt_max: usize,
 }
+
+/// 空承诺补跑的硬上限：每多一轮就是一次额外的模型调用，电话里是实打实的延迟。
+const MAX_CLAIM_RETRY_ROUNDS: usize = 5;
+/// 连续主动出声的硬上限：再多就成了催问，比沉默更烦人。
+const MAX_IDLE_PROMPTS: usize = 10;
 
 impl QqCallConfig {
     pub fn enabled(&self) -> bool {
@@ -323,6 +345,21 @@ impl QqCallConfig {
         self.tool_max_rounds.max(1)
     }
 
+    /// 空承诺补跑的轮数上限；配置写大了按上限收敛，不让一通电话无限重试。
+    pub fn claim_retry_rounds(&self) -> usize {
+        self.claim_retry_rounds.min(MAX_CLAIM_RETRY_ROUNDS)
+    }
+
+    /// 对方安静多少秒后她主动出声。
+    pub fn idle_prompt_secs(&self) -> u64 {
+        self.idle_prompt_secs
+    }
+
+    /// 连续主动出声的次数上限。
+    pub fn idle_prompt_max(&self) -> usize {
+        self.idle_prompt_max.min(MAX_IDLE_PROMPTS)
+    }
+
     /// 该 QQ 号是否允许来电。白名单为空时只允许主管理员。
     pub fn caller_allowed(&self, caller: i64, main_admin: Option<i64>) -> bool {
         if self.allowed_callers.contains(&caller) {
@@ -463,6 +500,21 @@ impl QqCallConfig {
         if self.farewell.chars().count() > 200 {
             return Err(anyhow::anyhow!("qq_call.farewell 不能超过 200 字"));
         }
+        if self.claim_retry_rounds > MAX_CLAIM_RETRY_ROUNDS {
+            return Err(anyhow::anyhow!(
+                "qq_call.claim_retry_rounds 不能超过 {MAX_CLAIM_RETRY_ROUNDS}（每轮都是一次额外的模型调用）"
+            ));
+        }
+        if self.idle_prompt_secs != 0 && !(3..=120).contains(&self.idle_prompt_secs) {
+            return Err(anyhow::anyhow!(
+                "qq_call.idle_prompt_secs 必须是 0（关闭）或 3 到 120 秒之间"
+            ));
+        }
+        if self.idle_prompt_max > MAX_IDLE_PROMPTS {
+            return Err(anyhow::anyhow!(
+                "qq_call.idle_prompt_max 不能超过 {MAX_IDLE_PROMPTS}"
+            ));
+        }
         Ok(())
     }
 }
@@ -525,6 +577,9 @@ impl Default for QqCallConfig {
             phone_tools_enabled: true,
             tool_filler: "嗯……我看一下。".to_string(),
             tool_max_rounds: 3,
+            claim_retry_rounds: 2,
+            idle_prompt_secs: 6,
+            idle_prompt_max: 3,
         }
     }
 }
@@ -624,6 +679,62 @@ mod tests {
             ..QqCallConfig::default()
         };
         assert_eq!(zero.tool_max_rounds(), 1);
+    }
+
+    #[test]
+    fn proactive_speech_and_claim_retry_defaults_are_on_and_bounded() {
+        let config = QqCallConfig::default();
+        // 默认就要能"没人说话时她先开口"，否则电话还是我说一句她答一句。
+        assert_eq!(config.idle_prompt_secs(), 6);
+        assert_eq!(config.idle_prompt_max(), 3);
+        // 空承诺默认补跑两轮：一轮可能又被模型糊弄过去，两轮足够逼出真调用。
+        assert_eq!(config.claim_retry_rounds(), 2);
+        // 配置写超上限时收敛，而不是让一通电话无限重试。
+        let greedy = QqCallConfig {
+            claim_retry_rounds: 99,
+            idle_prompt_max: 99,
+            ..QqCallConfig::default()
+        };
+        assert_eq!(greedy.claim_retry_rounds(), 5);
+        assert_eq!(greedy.idle_prompt_max(), 10);
+    }
+
+    #[test]
+    fn out_of_range_proactive_knobs_are_rejected() {
+        let enabled = || QqCallConfig {
+            enabled: true,
+            bridge_token_file: "/tmp/kovi-test-token".to_string(),
+            pulse_server: "unix:/tmp/kovi-test-pulse".to_string(),
+            ..QqCallConfig::default()
+        };
+        assert!(enabled().validate().is_ok());
+        // 0 是"关闭"，合法；1、2 秒太急，等于催问。
+        for secs in [0, 3, 120] {
+            let config = QqCallConfig {
+                idle_prompt_secs: secs,
+                ..enabled()
+            };
+            assert!(config.validate().is_ok(), "{secs} 秒应被接受");
+        }
+        for secs in [1, 2, 121] {
+            let config = QqCallConfig {
+                idle_prompt_secs: secs,
+                ..enabled()
+            };
+            assert!(config.validate().is_err(), "{secs} 秒应被拒绝");
+        }
+        for rounds in [6, 99] {
+            let config = QqCallConfig {
+                claim_retry_rounds: rounds,
+                ..enabled()
+            };
+            assert!(config.validate().is_err(), "{rounds} 轮应被拒绝");
+        }
+        let too_many = QqCallConfig {
+            idle_prompt_max: 11,
+            ..enabled()
+        };
+        assert!(too_many.validate().is_err());
     }
 
     #[test]

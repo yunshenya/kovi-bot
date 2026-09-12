@@ -462,6 +462,14 @@ pub(super) async fn run(
     Ok(())
 }
 
+/// 回复链这一次被什么唤醒。
+enum Wake {
+    /// 对端语音片段，或要直接播报的文本。
+    Job(Job),
+    /// 对方安静太久，轮到她自己开口。
+    Idle,
+}
+
 /// 回复链：识别 → 组装上下文 → 芸汐模型 → 合成 → 播放。
 /// 回复链主体：它就是这个任务的全部世界（参数都是 `run` 里现成的东西），
 /// 再包一层结构体只是把同样的字段搬个家。
@@ -481,10 +489,45 @@ async fn respond(
         Some(caller) => load_caller_context(caller).await,
         None => String::new(),
     };
+    // 主动出声：对方不出声时她先开口。没有它，电话就是"我说一句她答一句"——
+    // 对方一停，两边就一起静音，听起来像掉线。
+    let idle_after = Duration::from_secs(config.idle_prompt_secs());
+    let idle_max = config.idle_prompt_max();
+    // 对方上一次开口之后，她已经主动出声几次；对方一开口就归零。
+    let mut idle_since_peer = 0usize;
 
-    while let Some(job) = jobs.recv().await {
-        match job {
-            Job::Speak(text) => {
+    loop {
+        // 上一次"有事发生"的时刻：上一轮的工作（回复、播报）都已经跑完了，所以
+        // 安静从此刻开始算。放在循环开头而不是末尾：arm 里有多处 `continue`
+        // （空识别、识别失败、挂断收尾），逐个补一行迟早会漏。
+        let quiet_since = Instant::now();
+        // 只有"该她主动"时才让计时器参与竞争：已经道别、或主动次数用尽之后回到
+        // 纯等待，免得一个已经到期的计时器把循环变成忙等。
+        let idle_armed = !idle_after.is_zero()
+            && idle_since_peer < idle_max
+            && requested_end(&end_signal).is_none();
+        let wake = if idle_armed {
+            kovi::tokio::select! {
+                biased;
+                job = jobs.recv() => job.map(Wake::Job),
+                () = kovi::tokio::time::sleep_until(
+                    (quiet_since + idle_delay(idle_after, idle_since_peer)).into()
+                ) => Some(Wake::Idle),
+            }
+        } else {
+            jobs.recv().await.map(Wake::Job)
+        };
+        let Some(wake) = wake else { break };
+        // 刚好有对端语音排在队里就先处理他：她不该在对方正要开口时抢话。
+        let wake = match wake {
+            Wake::Idle => match jobs.try_recv() {
+                Ok(job) => Wake::Job(job),
+                Err(_) => Wake::Idle,
+            },
+            wake => wake,
+        };
+        match wake {
+            Wake::Job(Job::Speak(text)) => {
                 let text = text.trim().to_owned();
                 if text.is_empty() {
                     continue;
@@ -504,7 +547,7 @@ async fn respond(
                     Err(error) => eprintln!("[ERROR] QQ 通话播报失败: {error}"),
                 }
             }
-            Job::Utterance(pcm) => {
+            Wake::Job(Job::Utterance(pcm)) => {
                 if requested_end(&end_signal).is_some() {
                     // 已经道别过了，剩下的尾音不再处理。
                     continue;
@@ -518,6 +561,7 @@ async fn respond(
                     }
                 };
                 println!("[INFO] QQ 通话识别: {peer_text}");
+                idle_since_peer = 0;
 
                 if config.is_hangup_request(&peer_text) {
                     // 对方说"挂了吧/先挂"：她回一句道别，然后结束会话并挂断电话。
@@ -568,6 +612,7 @@ async fn respond(
                         interrupts: &mut interrupts,
                     },
                     &peer,
+                    None,
                 )
                 .await;
                 let Some(reply) = turn.reply else {
@@ -599,8 +644,93 @@ async fn respond(
                     request_end(&end_signal, EndTrigger::ModelDecided);
                 }
             }
+            Wake::Idle => {
+                // 采集链一发现对方起头就会发打断信号。有信号在，说明他正要说话：
+                // 这里不主动出声，把话头让给他（她抢话比沉默更糟）。
+                if interrupts.try_recv().is_ok() {
+                    println!("[INFO] QQ 通话主动出声：对方刚好开口，这一轮不说了");
+                    continue;
+                }
+                let silent_secs = quiet_since.elapsed().as_secs();
+                idle_since_peer += 1;
+                println!(
+                    "[INFO] QQ 通话对方已安静 {silent_secs} 秒，她主动出声（对方开口后第 {} 次）",
+                    idle_since_peer
+                );
+                let hint = idle_prompt(silent_secs, idle_since_peer);
+                let turn = generate_reply(
+                    &config,
+                    &context,
+                    &transcript,
+                    tools.as_ref(),
+                    &mut PhoneVoice::Speak {
+                        speech: &speech,
+                        interrupts: &mut interrupts,
+                    },
+                    &peer,
+                    Some(&hint),
+                )
+                .await;
+                let Some(reply) = turn.reply else {
+                    println!("[INFO] QQ 通话主动出声：这一轮没生成出可播报的内容");
+                    continue;
+                };
+                // 生成这一句要一两秒，对方完全可能在这期间开口——再确认一次。
+                if interrupts.try_recv().is_ok() {
+                    println!("[INFO] QQ 通话主动出声：生成期间对方开口了，这一句不说了");
+                    continue;
+                }
+                println!("[INFO] QQ 通话主动出声: {}", reply.text);
+                if reply.wants_hangup {
+                    // 主动出声这一路不给挂断权：对方只是没说话，不该因此被挂电话。
+                    // 挂断只由对方明说、模型在她回应时判断、或通话到点触发。
+                    println!("[INFO] QQ 通话主动出声带了挂断标记，已忽略");
+                }
+                let facts = tool_facts(&turn.outcomes);
+                warn_on_unbacked_action_claim(&reply.text, &facts, &peer);
+                match speak(&speech, &config, &reply.text, &mut interrupts).await {
+                    Ok(SpeakOutcome::Completed) => push_turn(
+                        &transcript,
+                        Turn {
+                            from_peer: false,
+                            text: reply.text,
+                            tools: facts,
+                        },
+                    ),
+                    Ok(SpeakOutcome::Interrupted) => {
+                        println!("[INFO] QQ 通话主动出声被插话打断，不计入电话上下文");
+                    }
+                    Err(error) => eprintln!("[ERROR] QQ 通话主动出声播报失败: {error}"),
+                }
+            }
         }
     }
+}
+
+/// 主动出声的退避：第一次 base，之后每多一次翻一倍，最多到 8 倍。
+///
+/// 不退避就成了催问（"你怎么不说话"每 6 秒问一遍）；有上限则保证真的没人应时
+/// 她隔一阵还会再探一次，而不是彻底静默——那正是这次要修掉的毛病。
+fn idle_delay(base: Duration, nudges: usize) -> Duration {
+    base * (1u32 << nudges.min(3))
+}
+
+/// 主动出声时给模型的现场说明。
+///
+/// 三条出路里最要紧的是第一条：先探一句（对方可能只是没接话）。第二条顺手把
+/// "刚才说要查却没查完"的事补上——她说"等我一下"之后就静音，是对方最难受的那种
+/// 沉默。第三条明确不许重复上一条，否则模型会把她刚说过的话再说一遍。
+fn idle_prompt(silent_secs: u64, nth: usize) -> String {
+    format!(
+        "【现在电话里的情况】对方已经 {silent_secs} 秒没有出声了，上一句话是你说的，\
+         他一直没有接话。现在轮到你主动开口，不要一直干等：\n\
+         - 先自然地问一句他怎么了、还在不在、是不是没听清（比如\"喂？你还在吗\"、\
+         \"怎么了呀，怎么不说话\"）；\n\
+         - 如果你刚才说过要做什么还没做完（要查、要找、要发的东西），现在立刻调用工具把它做完，\
+         再把结果告诉他；\n\
+         - 不要重复你上一条说过的话，也不要硬找话题；一句话就够，说完就停。\n\
+         这是你第 {nth} 次主动开口（对方始终没有回应）。不要带 [[挂断]] 标记。"
+    )
 }
 
 /// 合成并播放一句话。边合成边写入，首包到达即出声。
@@ -786,6 +916,8 @@ struct PhoneTurn {
     outcomes: Vec<ToolOutcome>,
     /// 本来会说的填充语（通话里是"说了"，试跑里是"会说"）。
     fillers: Vec<String>,
+    /// 空承诺补跑了几次。0 = 她一次就真的动手了；大于 0 说明她第一次只想嘴上答应。
+    claim_retries: usize,
     elapsed: Duration,
 }
 
@@ -805,6 +937,8 @@ enum PhoneVoice<'a> {
 /// 有工具通道时会走原生 function-calling：模型可以先调用工具、拿到结果再说话，
 /// 最多 [`QqCallConfig::tool_max_rounds`] 轮；到顶了还想要工具，就用已有的结果
 /// 逼它说一句人话收尾——电话是实时对话，不能无限查下去。
+///
+/// `hint` 是这一轮额外的现场说明（目前只有主动出声用），作为资料插在历史之后。
 async fn generate_reply(
     config: &QqCallConfig,
     context: &str,
@@ -812,12 +946,14 @@ async fn generate_reply(
     tools: Option<&PhoneTools>,
     voice: &mut PhoneVoice<'_>,
     peer: &str,
+    hint: Option<&str>,
 ) -> PhoneTurn {
     let started = Instant::now();
     let mut turn = PhoneTurn {
         reply: None,
         outcomes: Vec::new(),
         fillers: Vec::new(),
+        claim_retries: 0,
         elapsed: Duration::ZERO,
     };
     let turns = transcript
@@ -825,6 +961,12 @@ async fn generate_reply(
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone();
     let mut messages = build_messages(config, context, &turns, tools.is_some(), peer);
+    if let Some(hint) = hint {
+        messages.push(BotMemory {
+            role: Roles::Data,
+            content: hint.to_string(),
+        });
+    }
     let Some(tools) = tools else {
         let response = params_model_with_plain_style_context(
             &mut messages,
@@ -856,8 +998,11 @@ async fn generate_reply(
 
     // 累积的 wire 消息（assistant.tool_calls + role:"tool" 结果），逐轮接在 messages 之后。
     let mut extra_wire: Vec<Value> = Vec::new();
+    // 工具轮数与"空承诺补跑"次数各记一份：两个上限相加才是这一轮的模型调用上限，
+    // 所以无论模型怎么绕，一通电话里这一轮都是有界的。
+    let mut tool_rounds = 0usize;
 
-    for round in 0..config.tool_max_rounds() {
+    loop {
         let payload = params_model_with_native_tools(
             &mut messages,
             &extra_wire,
@@ -869,7 +1014,29 @@ async fn generate_reply(
         )
         .await;
         if payload.tool_calls.is_empty() {
-            turn.reply = reply_from_response(&payload.content, config);
+            let reply = reply_from_response(&payload.content, config);
+            // 空承诺：嘴上答应了一件要动手的事（"我去找找""等我一下""我再发一次"），
+            // 这一轮却一个工具都没调。以前这里直接结束——她说"等我一下"之后电话就
+            // 静音了，对方等多久都不会有下文，因为**根本没有东西在跑**。现在不结束：
+            // 把系统纠正塞回去，让她重来一轮，真的调用工具。
+            if turn.claim_retries < config.claim_retry_rounds()
+                && let Some(reply_text) = reply.as_ref().map(|reply| reply.text.as_str())
+                && let Some(marker) = claimed_action(reply_text)
+            {
+                turn.claim_retries += 1;
+                println!(
+                    "[INFO] QQ 通话空承诺补跑 {}/{}：回复里出现「{marker}」但本轮没有工具调用，\
+                     要求她真的执行",
+                    turn.claim_retries,
+                    config.claim_retry_rounds()
+                );
+                messages.push(BotMemory {
+                    role: Roles::Data,
+                    content: commitment_nudge(reply_text),
+                });
+                continue;
+            }
+            turn.reply = reply;
             turn.elapsed = started.elapsed();
             return turn;
         }
@@ -878,9 +1045,14 @@ async fn generate_reply(
             turn.elapsed = started.elapsed();
             return turn;
         }
+        if tool_rounds >= config.tool_max_rounds() {
+            // 轮次已经用满，模型还在要工具：跳出循环，用已有结果强制收尾。
+            break;
+        }
+        tool_rounds += 1;
         println!(
             "[INFO] QQ 通话第 {} 轮工具调用：{}",
-            round + 1,
+            tool_rounds,
             payload
                 .tool_calls
                 .iter()
@@ -895,7 +1067,7 @@ async fn generate_reply(
             voice,
             transcript,
             &mut extra_wire,
-            round == 0,
+            tool_rounds == 1,
             &mut turn.fillers,
         )
         .await;
@@ -978,6 +1150,7 @@ pub(super) async fn self_test(
             spoken: &mut spoken,
         },
         &peer,
+        None,
     )
     .await;
     render_self_test(question, available, &turn, &spoken)
@@ -1030,6 +1203,12 @@ fn render_self_test(
             "填充语：本来会说「{}」（工具超过 {:.1} 秒才出声）\n",
             fillers.join("／"),
             TOOL_FILLER_DELAY.as_secs_f64()
+        ));
+    }
+    if turn.claim_retries > 0 {
+        report.push_str(&format!(
+            "空承诺补跑：{} 次——她第一次只想嘴上答应，被系统纠正后才真的动手\n",
+            turn.claim_retries
         ));
     }
     match &turn.reply {
@@ -1314,12 +1493,20 @@ fn tool_facts(outcomes: &[ToolOutcome]) -> Vec<ToolFact> {
         .collect()
 }
 
-/// 她声称"已经做了"、但这一轮其实一个工具都没调的动作词。
+/// 她声称"我去做/已经做了"、但这一轮其实一个工具都没调的动作词。
 ///
 /// 2026-09-12 线上：对方说没收到，她连着五轮回"我再发一次"，一次 `private.message.send`
-/// 都没调用，而日志里只有她那句承诺——完全看不出"她其实什么都没做"。这条 WARN 就是
-/// 把那种静默补上，让同类问题在日志里一眼可见。
+/// 都没调用，而日志里只有她那句承诺——完全看不出"她其实什么都没做"。
+///
+/// 2026-09-13 线上又补了一批**查询类**：她说"那我先看看有哪些群，等我一下"，然后整通
+/// 电话再没有下文；`我看了下，能查到的是…` 那句更是没查就编了结果。旧的判据只认发送类，
+/// 这类"说要去看/去查"的承诺从告警到补跑全都漏掉了。
+///
+/// 判据只是**触发器**，不是判决：命中了就多跑一轮模型（见 [`commitment_nudge`]），
+/// 误报的代价是一次额外的模型调用，漏报的代价是对方永远等不到结果——所以宁可比
+/// 宽一点。真正的把关在提示词里：没有工具能做就如实说做不到。
 const ACTION_CLAIM_MARKERS: &[&str] = &[
+    // ---- 发送类：嘴上说"发了/我再发" ----
     "我再发",
     "重新发",
     "再发一次",
@@ -1337,7 +1524,33 @@ const ACTION_CLAIM_MARKERS: &[&str] = &[
     // 线上原话："我再试试，你别急，可能是我这边卡了一下。"——同样是空承诺。
     "我再试试",
     "再试一次",
+    // ---- 查询类：说要去找/去查，然后就静音了 ----
+    "我去找",
+    "我去查",
+    "我帮你查",
+    "我帮你找",
+    "让我查",
+    "让我找",
+    "我找找",
+    "我查查",
+    "我翻翻",
+    "我翻一下",
+    "我查一下",
+    "我看一下",
+    "我看下",
+    "我先看看",
+    "我看看有哪",
+    "等我一下",
+    "稍等一下",
+    "等我一会儿",
+    // ---- 谎称已完成：没有工具却宣称"我看过了/查到了" ----
+    "我看了下",
+    "查到了",
+    "找到了",
 ];
+
+/// 补跑时把她的原话截多长塞回上下文。够模型认出自己刚承诺了什么即可。
+const COMMITMENT_NUDGE_CHARS: usize = 80;
 
 /// 这一轮嘴上说"发了/我再发"但没有任何工具调用时告警。
 fn warn_on_unbacked_action_claim(reply: &str, facts: &[ToolFact], peer: &str) {
@@ -1351,15 +1564,42 @@ fn warn_on_unbacked_action_claim(reply: &str, facts: &[ToolFact], peer: &str) {
     );
 }
 
+/// 这句回复里有没有"我要去做某件事"的承诺；有就返回命中的那个词。
+///
+/// 和 [`unbacked_action_claim`] 的区别：那个是给日志用的告警判据（要求这一轮确实
+/// 没调过工具），这里只回答"这句话里有没有承诺"——补跑要覆盖的情形还包括"前几轮
+/// 调过工具，这一轮又许了一个新诺"。
+fn claimed_action(reply: &str) -> Option<&'static str> {
+    ACTION_CLAIM_MARKERS
+        .iter()
+        .find(|marker| reply.contains(**marker))
+        .copied()
+}
+
 /// 判据本体：调过工具就不算空承诺，否则看回复里有没有"我发了/我再发"这类动作词。
 fn unbacked_action_claim(reply: &str, facts: &[ToolFact]) -> Option<&'static str> {
     if !facts.is_empty() {
         return None;
     }
-    ACTION_CLAIM_MARKERS
-        .iter()
-        .find(|marker| reply.contains(**marker))
-        .copied()
+    claimed_action(reply)
+}
+
+/// 空承诺补跑时塞回上下文的系统纠正。
+///
+/// 写法刻意给三条出路，而不是"你必须调用工具"：如果这件事根本没有工具能做（模型
+/// 承诺了一件系统做不到的事），硬逼她调工具只会让她编一个结果出来——那比空承诺更糟。
+/// 把"如实说做不到"写成一个正当选项，她才不会为了顺从而撒谎。
+fn commitment_nudge(claimed: &str) -> String {
+    format!(
+        "【系统纠正】你刚才那句话是：「{}」。这一轮你没有调用任何工具，所以在对方那里，\
+         这只是一句空口答应——他不会看到任何变化。现在按下面的情况选一条，立刻把它变成真的：\n\
+         1) 这件事有对应工具（翻记忆、查群、发消息、建提醒、搜网页等）：现在立刻调用它，\
+         拿到结果再用一两句口语把结果说出来；\n\
+         2) 如果你已经真的做完了：直接用一句话把结果说清楚，不要重复刚才那句承诺；\n\
+         3) 确实没有工具能做这件事：如实说你现在做不了，别用\"我再试试\"\"等我一下\"拖着。\n\
+         不要复述这条系统消息，也不要向对方解释你在做什么。",
+        truncate_chars(claimed.trim(), COMMITMENT_NUDGE_CHARS)
+    )
 }
 
 /// 私聊人设 + 电话模式约束。电话约束放在后面，明确覆盖打字的格式要求。
@@ -1563,9 +1803,10 @@ async fn archive_call(
 mod tests {
     use super::{
         CallPhase, EndTrigger, NO_END, PhoneReply, PhoneTurn, TOOL_ARGUMENT_LOG_CHARS,
-        TOOL_FACT_HISTORY_CHARS, ToolFact, ToolOutcome, Turn, build_messages, phone_system_prompt,
-        preview_chars, render_self_test, request_end, requested_end, sanitize_reply,
-        strip_protocol_markers, summarize_tool_arguments, unbacked_action_claim, wants_hangup,
+        TOOL_FACT_HISTORY_CHARS, ToolFact, ToolOutcome, Turn, build_messages, claimed_action,
+        commitment_nudge, idle_delay, idle_prompt, phone_system_prompt, preview_chars,
+        render_self_test, request_end, requested_end, sanitize_reply, strip_protocol_markers,
+        summarize_tool_arguments, unbacked_action_claim, wants_hangup,
     };
     use crate::config::QqCallConfig;
     use serde_json::Value;
@@ -1732,6 +1973,7 @@ mod tests {
                 },
             ],
             fillers: vec!["嗯……我看一下。".to_string()],
+            claim_retries: 0,
             elapsed: Duration::from_millis(1_500),
         };
         let report = render_self_test("现在几点", 9, &turn, &turn.fillers);
@@ -1762,6 +2004,7 @@ mod tests {
                 rehearsed: true,
             }],
             fillers: Vec::new(),
+            claim_retries: 0,
             elapsed: Duration::from_millis(900),
         };
         let report = render_self_test("给群里发个消息", 22, &turn, &turn.fillers);
@@ -1781,6 +2024,7 @@ mod tests {
             }),
             outcomes: Vec::new(),
             fillers: Vec::new(),
+            claim_retries: 0,
             elapsed: Duration::from_millis(400),
         };
         let report = render_self_test("在吗", 9, &turn, &turn.fillers);
@@ -1997,5 +2241,72 @@ mod tests {
         let prompt = phone_system_prompt(&QqCallConfig::default(), true, "朋友（1）");
         assert!(prompt.contains("必须在这一轮真的调用"));
         assert!(prompt.contains("重新调用一次发送工具"));
+    }
+
+    /// 2026-09-13 线上：她说"那我先看看有哪些群，等我一下"，然后整通电话再没下文。
+    /// 这类**查询类**承诺以前一条判据都命中不了——告警不响、补跑也不会发生。
+    #[test]
+    fn lookup_promises_count_as_commitments() {
+        for line in [
+            "嗯，你是想让我翻翻我们最早聊过的东西吗？我去找找看。",
+            "那我先看看有哪些群，等我一下。",
+            "我看了下，能查到的是待过的群的一些信息。",
+            "让我查一下，稍等我一会儿。",
+            "你等我一会儿，我查查聊天记录。",
+        ] {
+            assert!(claimed_action(line).is_some(), "该判为承诺: {line}");
+            assert!(
+                unbacked_action_claim(line, &[]).is_some(),
+                "没有工具调用时该告警: {line}"
+            );
+        }
+        // 普通回话不该被当成承诺，否则每轮都白跑一次模型调用。
+        for line in [
+            "好呀，那我给你讲个短的。有只小猫总爱蹲在窗台上看雨。",
+            "我在的呀，今天过得怎么样？",
+            "嗯，就是那天凌晨，你突然问我认不认得你。",
+            "嘿嘿，你喜欢就好。还要听吗？",
+        ] {
+            assert!(claimed_action(line).is_none(), "不该判为承诺: {line}");
+        }
+    }
+
+    /// 补跑塞回去的纠正必须给三条出路：真做、说清结果、或如实说做不到。
+    /// 少了第三条，没有工具可做时模型只可能编一个结果出来。
+    #[test]
+    fn commitment_nudge_demands_a_real_call_with_an_honest_exit() {
+        let nudge = commitment_nudge("那我先看看有哪些群，等我一下。");
+        assert!(nudge.contains("那我先看看有哪些群"));
+        assert!(nudge.contains("立刻调用"));
+        assert!(
+            nudge.contains("做不了"),
+            "没有工具可做时必须允许她说做不到: {nudge}"
+        );
+        // 她那段话说得再长也不能把提示词撑爆。
+        let long = commitment_nudge(&"啊".repeat(200));
+        assert!(long.chars().count() < 400);
+    }
+
+    /// 主动出声的退避：翻倍到 8 倍封顶，既不催问也不会彻底沉默。
+    #[test]
+    fn idle_delay_backs_off_and_stops_at_eight_times() {
+        let base = Duration::from_secs(6);
+        assert_eq!(idle_delay(base, 0), Duration::from_secs(6));
+        assert_eq!(idle_delay(base, 1), Duration::from_secs(12));
+        assert_eq!(idle_delay(base, 2), Duration::from_secs(24));
+        assert_eq!(idle_delay(base, 3), Duration::from_secs(48));
+        assert_eq!(idle_delay(base, 9), Duration::from_secs(48));
+    }
+
+    /// 主动出声的现场说明：先问怎么了、顺手把欠着的事做完、不许重复、不许挂断。
+    #[test]
+    fn idle_prompt_asks_what_happened_and_forbids_hanging_up() {
+        let hint = idle_prompt(9, 1);
+        assert!(hint.contains("9 秒"));
+        assert!(hint.contains("主动开口"));
+        assert!(hint.contains("怎么了"));
+        assert!(hint.contains("还没做完"));
+        assert!(hint.contains("不要重复"));
+        assert!(hint.contains("[[挂断]]"));
     }
 }
