@@ -28,6 +28,14 @@ const PENDING_CANDIDATE_TTL_MINUTES: i64 = 10;
 const MAX_REFLECTIONS_PER_TICK: usize = 8;
 const MAX_REFLECTION_SCOPES_PER_TICK: usize = 32;
 const MAX_REFLECTION_DECAYS: usize = 8;
+/// 一次"认真回想"里最多形成几条立场。立场越少越像人格，多了就是话痨。
+const MAX_STANCE_PROPOSALS: usize = 3;
+/// 一条立场最多挂几条经历作为根据。
+const MAX_STANCE_EVIDENCE: usize = 3;
+/// 立场形成的输出上限（一句话级别的 JSON）。
+const STANCE_MAX_TOKENS: u32 = 320;
+/// 立场形成的模型调用上限：它是后台过程，绝不能拖住别的东西。
+const STANCE_MODEL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25);
 const MAX_EPISODE_SOURCE_EVENTS: usize = 16;
 const CURIOSITY_TTL_DAYS: i64 = 30;
 const MAX_OUTGOING_FENCES: usize = 512;
@@ -2101,6 +2109,20 @@ impl MindRuntime {
         if should_create_episode {
             self.consolidate_self_model(&input).await?;
         }
+        // 让她在"认真回想"时自己长立场。这是她自己的内部过程：输入是她的经历，
+        // 输出是她自己的判断——不摆到对话里，也不靠用户灌输。
+        // 失败只记日志：立场形成不该拖垮一次反思。
+        // 立场形成要调模型（上限 25 秒），绝不能攥着 barrier 的读锁——数据擦除要拿写锁，
+        // 会被我们拖住整整一次模型调用。Global 作用域本来也不在 barrier 的拦截范围内
+        // （见 `BarrierState::blocks_scope`），放开它是安全的。
+        drop(barrier);
+        let mut extra_model_calls = 0_usize;
+        if should_create_episode && input.depth == ReflectionDepth::Deep {
+            match self.form_stances(&input).await {
+                Ok(called) => extra_model_calls = usize::from(called),
+                Err(error) => kovi::log::warn!("Yunxi Mind stance formation failed: {error}"),
+            }
+        }
         self.metrics.reflections.fetch_add(1, Ordering::Relaxed);
         self.metrics
             .last_reflection_unix_ms
@@ -2111,7 +2133,7 @@ impl MindRuntime {
             .unwrap_or_else(|lock| lock.into_inner())
             .remove_through(input.scope, input.requested_at);
         kovi::log::info!(
-            "Yunxi Mind reflection: scope={:?} trigger={:?} depth={:?} events={} memories={} open_loops={} goals={} episodes={} extra_model_calls=0",
+            "Yunxi Mind reflection: scope={:?} trigger={:?} depth={:?} events={} memories={} open_loops={} goals={} episodes={} extra_model_calls={}",
             input.scope,
             input.trigger,
             input.depth,
@@ -2120,8 +2142,76 @@ impl MindRuntime {
             input.open_loop_summaries.len(),
             input.goal_summaries.len(),
             proposal.episodes.len(),
+            extra_model_calls,
         );
         Ok(())
+    }
+
+    /// 让她在"认真回想"时自己形成、强化或动摇看法。
+    ///
+    /// 这条路径存在的理由：立场原来只能靠模型在**聊天回复里顺手带一个可选字段**，
+    /// 而线上提示词里连那个协议都没写，于是 `yunxi_beliefs` 长期 0 行——那是彩票，
+    /// 不是管道。现在是"每次深度反思必然问她一次"，形成变成必然发生的事。
+    ///
+    /// 三条设计约束：
+    /// - **她自己的判断**：提示词明确禁止把别人说的话抄成她的看法，也禁止写关于
+    ///   具体人的判断（那是记忆，不是立场）。
+    /// - **一律 Global 作用域**：立场是"她怎么看世界"，与正在反思的 scope 无关。
+    /// - **fail-soft**：模型调用失败、输出解析失败、目标对不上，都只记日志跳过，
+    ///   绝不影响这次反思里其它确定性的部分。
+    async fn form_stances(&self, input: &ReflectionInput) -> anyhow::Result<bool> {
+        if !self.config.belief_enabled() || input.recent_events.is_empty() {
+            return Ok(false);
+        }
+        let now = input.requested_at;
+        let existing = self
+            .services
+            .beliefs
+            .relevant(
+                &[MindScope::Global],
+                "",
+                now,
+                self.config.max_learned_beliefs_per_scope(),
+            )
+            .await?;
+        let mut messages = stance_formation_messages(input, &existing);
+        let response = kovi::tokio::time::timeout(
+            STANCE_MODEL_TIMEOUT,
+            crate::model::utils::params_model_with_plain_style_context(
+                &mut messages,
+                Some(STANCE_MAX_TOKENS),
+                &[],
+                None,
+                None,
+            ),
+        )
+        .await;
+        let response = match response {
+            Ok(response) => response,
+            Err(_) => {
+                kovi::log::warn!("Yunxi Mind stance formation timed out");
+                return Ok(true);
+            }
+        };
+        if crate::model::utils::is_model_error_response(&response.content) {
+            kovi::log::warn!("Yunxi Mind stance formation model error");
+            return Ok(true);
+        }
+        let updates = stance_updates(&response.content, &existing, &input.recent_events);
+        if updates.is_empty() {
+            return Ok(true);
+        }
+        let mut proposal = self
+            .empty_proposal(MindScope::Global, now, input.trace)
+            .await?;
+        proposal
+            .reason_tags
+            .push(MindReasonTag::ReflectionConsolidation);
+        proposal.belief_updates = updates;
+        let applied = proposal.belief_updates.len();
+        self.consolidate_retry(proposal).await?;
+        println!("[INFO] Yunxi Mind 形成立场候选 {applied} 条（深度反思，作用域 Global）");
+        Ok(true)
     }
 
     /// Advance the (global) self model after a real batch of observed
@@ -2755,6 +2845,281 @@ fn bounded_summary(value: &str) -> String {
     summary
 }
 
+/// 模型对一条立场提案的说法。解析失败的整条丢弃，不猜。
+#[derive(Debug, Clone, PartialEq)]
+struct StanceCandidate {
+    kind: StanceKind,
+    proposition: String,
+    target: Option<String>,
+    confidence_milli: i32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StanceKind {
+    /// 这段经历让她形成了新看法。
+    Form,
+    /// 已有看法被再次印证。
+    Reinforce,
+    /// 有人不同意某条已有看法——**只是有人不同意，不代表她改变看法**。
+    Challenge,
+    /// 她自己真的改主意了。
+    Change,
+}
+
+/// 立场形成的提示词：给她的经历，让她自己下判断。
+///
+/// 刻意把 `challenge` 和 `change` 分开写：前者是"有人不同意"，后者是"我被说服了"。
+/// 混在一起就是那个经典的迎合——A 说好她说对，B 说烂她说确实。
+fn stance_formation_messages(
+    input: &ReflectionInput,
+    existing: &[Belief],
+) -> Vec<crate::model::BotMemory> {
+    use crate::model::Roles;
+    let mut experience = String::new();
+    for event in input.recent_events.iter().rev().take(8) {
+        experience.push_str(&format!("- {}\n", candidate_preview(&event.summary)));
+    }
+    let mut stances = String::new();
+    if existing.is_empty() {
+        stances.push_str("（你目前还没有形成任何看法）\n");
+    } else {
+        for belief in existing.iter().take(16) {
+            stances.push_str(&format!(
+                "- {}（置信 {:.2}，被挑战 {} 次）\n",
+                belief.proposition(),
+                belief.confidence(),
+                belief.contradiction_count()
+            ));
+        }
+    }
+    let system = "你在独处，回想刚刚发生的事。只输出一个 JSON 数组，最多 3 条，不要解释、不要代码块。\n\
+每条的形式：\n\
+{\"kind\":\"form\",\"proposition\":\"我认为……\",\"confidence_milli\":120}\n\
+{\"kind\":\"reinforce\",\"target\":\"某条已有看法的原文\",\"confidence_milli\":80}\n\
+{\"kind\":\"challenge\",\"target\":\"某条已有看法的原文\",\"confidence_milli\":100}\n\
+{\"kind\":\"change\",\"target\":\"你原来那条看法的原文\",\"proposition\":\"我认为……（以前我觉得……）\",\"confidence_milli\":150}\n\
+含义：form 是这段经历让你有了新看法；reinforce 是某条看法又被印证；\
+challenge 是**有人不同意**某条看法——只表示有人反对，不代表你改变看法；\
+change 是**你自己真的改主意了**（想清楚了或被论据说服）。\n\
+target 必须与上面列出的某条看法原文完全一致，否则那条作废。\n\
+铁律：看法必须是你自己的判断，不能把别人说的话当成你的看法；\
+不写关于具体人的判断（谁喜欢什么、谁是什么样的人）——那是记忆，不是看法；\
+不能凭空编造没发生过的经历；没有值得留下的就输出 []。";
+    let user = format!("【你最近的经历】\n{experience}\n【你目前的看法】\n{stances}");
+    vec![
+        crate::model::BotMemory {
+            role: Roles::System,
+            content: system.to_string(),
+        },
+        crate::model::BotMemory {
+            role: Roles::User,
+            content: user,
+        },
+    ]
+}
+
+/// 从模型输出里抽出提案：容错地找第一段 `[...]`，逐条解析，坏条目直接丢。
+fn parse_stance_candidates(raw: &str) -> Vec<StanceCandidate> {
+    let Some(start) = raw.find('[') else {
+        return Vec::new();
+    };
+    let Some(end) = raw.rfind(']') else {
+        return Vec::new();
+    };
+    if end <= start {
+        return Vec::new();
+    }
+    let Ok(items) = serde_json::from_str::<Vec<serde_json::Value>>(&raw[start..=end]) else {
+        return Vec::new();
+    };
+    items
+        .into_iter()
+        .filter_map(|item| {
+            let kind = match item.get("kind")?.as_str()? {
+                "form" => StanceKind::Form,
+                "reinforce" => StanceKind::Reinforce,
+                "challenge" => StanceKind::Challenge,
+                "change" => StanceKind::Change,
+                _ => return None,
+            };
+            let proposition = item
+                .get("proposition")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            let target = item
+                .get("target")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+            let confidence_milli = item
+                .get("confidence_milli")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(100)
+                .clamp(0, 200) as i32;
+            // form/change 必须给出新命题；reinforce/challenge 必须给出目标。
+            match kind {
+                StanceKind::Form | StanceKind::Change if proposition.is_empty() => return None,
+                StanceKind::Reinforce | StanceKind::Challenge if target.is_none() => return None,
+                _ => {}
+            }
+            if kind == StanceKind::Change && target.is_none() {
+                return None;
+            }
+            Some(StanceCandidate {
+                kind,
+                proposition,
+                target,
+                confidence_milli,
+            })
+        })
+        .take(MAX_STANCE_PROPOSALS)
+        .collect()
+}
+
+/// 把模型的说法翻成 belief 提案。
+///
+/// 这里是**校验闸**，不是搬运工：
+/// - `target` 必须能对上一条真实存在的看法（按归一化键比对）。对不上就丢——因为
+///   `Reinforce`/`Contradict` 打在不存在的位置上会让整份提案报 NotFound，
+///   连同一批的 episodes 一起陪葬。
+/// - 命题同样要过 [`global_state_text_rejection`]（不写关于具体人的判断），
+///   被拒的原因写进日志。
+fn stance_updates(
+    raw: &str,
+    existing: &[Belief],
+    events: &[ReflectionEvent],
+) -> Vec<BeliefUpdateProposal> {
+    let mut updates = Vec::new();
+    for candidate in parse_stance_candidates(raw) {
+        let resolve = |target: &Option<String>| -> Option<&Belief> {
+            let target = target.as_deref()?;
+            let key = yunxi_core::normalized_key(target);
+            existing.iter().find(|belief| {
+                belief.proposition_key() == key
+                    || yunxi_core::normalized_key(belief.proposition()) == key
+            })
+        };
+        let delta = candidate.confidence_milli as f32 / 1_000.0;
+        match candidate.kind {
+            StanceKind::Form => {
+                if let Some(reason) = global_state_text_rejection(&candidate.proposition) {
+                    println!(
+                        "[INFO] 立场形成被安全过滤丢弃（{reason}）：{}",
+                        candidate_preview(&candidate.proposition)
+                    );
+                    continue;
+                }
+                updates.push(stance_update(
+                    BeliefOperation::Upsert,
+                    candidate.proposition,
+                    delta,
+                    stance_evidence(events, EvidencePolarity::Supports),
+                ));
+            }
+            StanceKind::Reinforce | StanceKind::Challenge => {
+                let Some(belief) = resolve(&candidate.target) else {
+                    println!(
+                        "[INFO] 立场形成丢弃：目标对不上任何已有看法（{}）",
+                        candidate_preview(candidate.target.as_deref().unwrap_or_default())
+                    );
+                    continue;
+                };
+                let operation = if candidate.kind == StanceKind::Reinforce {
+                    BeliefOperation::Reinforce
+                } else {
+                    BeliefOperation::Contradict
+                };
+                let polarity = if candidate.kind == StanceKind::Challenge {
+                    EvidencePolarity::Contradicts
+                } else {
+                    EvidencePolarity::Supports
+                };
+                updates.push(stance_update(
+                    operation,
+                    belief.proposition().to_string(),
+                    delta,
+                    stance_evidence(events, polarity),
+                ));
+            }
+            StanceKind::Change => {
+                if let Some(reason) = global_state_text_rejection(&candidate.proposition) {
+                    println!(
+                        "[INFO] 立场形成被安全过滤丢弃（{reason}）：{}",
+                        candidate_preview(&candidate.proposition)
+                    );
+                    continue;
+                }
+                let Some(belief) = resolve(&candidate.target) else {
+                    println!(
+                        "[INFO] 立场形成丢弃：改主意的目标对不上任何已有看法（{}）",
+                        candidate_preview(candidate.target.as_deref().unwrap_or_default())
+                    );
+                    continue;
+                };
+                // 先收回旧看法，再立新的。改主意本身是人格的一部分，
+                // 所以新命题里通常会保留"以前我觉得……"的痕迹。
+                updates.push(stance_update(
+                    BeliefOperation::Retract,
+                    belief.proposition().to_string(),
+                    delta,
+                    stance_evidence(events, EvidencePolarity::Contradicts),
+                ));
+                updates.push(stance_update(
+                    BeliefOperation::Upsert,
+                    candidate.proposition,
+                    delta,
+                    stance_evidence(events, EvidencePolarity::Supports),
+                ));
+            }
+        }
+    }
+    updates
+}
+
+fn stance_update(
+    operation: BeliefOperation,
+    proposition: String,
+    confidence_delta: f32,
+    evidence_refs: Vec<EvidenceRef>,
+) -> BeliefUpdateProposal {
+    BeliefUpdateProposal {
+        operation,
+        belief_id: None,
+        expected_version: None,
+        scope: MindScope::Global,
+        proposition,
+        confidence_delta,
+        stability_delta: 0.02,
+        source: BeliefSource::Reflection,
+        evidence_refs,
+        valid_until: None,
+    }
+}
+
+/// 这条看法的"根据"：是她的哪几段经历。最多留 3 条，最近的在前面。
+///
+/// 有证据才追溯得回去——`#立场` 里的"证据 N 条"和将来的冲突检测都靠它。
+/// 没有证据的立场等于"她就是这么说"，出了问题连从哪来的都不知道。
+fn stance_evidence(events: &[ReflectionEvent], polarity: EvidencePolarity) -> Vec<EvidenceRef> {
+    events
+        .iter()
+        .rev()
+        .take(MAX_STANCE_EVIDENCE)
+        .filter_map(|event| {
+            EvidenceRef::new(
+                EvidenceKind::Event(event.event_id),
+                polarity,
+                0.55,
+                event.occurred_at,
+            )
+            .ok()
+        })
+        .collect()
+}
+
 /// 这条文本能不能沉淀成"她的立场/偏好/兴趣"（全局状态）；不能则说明原因。
 ///
 /// 拦的是**关于具体人的判断**和隐私标记：全局状态是"她怎么看世界"，不是"用户是谁"。
@@ -2941,6 +3306,187 @@ mod tests {
         OpenLoopStatus, OpenLoopStoreError, OpenLoopStoreFuture, OpenQuestionStore,
         PlannerStateSnapshot, PreferenceStore,
     };
+
+    fn test_stance(proposition: &str) -> Belief {
+        Belief::new(
+            BeliefId::new(),
+            MindScope::Global,
+            proposition,
+            0.6,
+            0.3,
+            BeliefSource::Reflection,
+            Vec::new(),
+            None,
+            Utc::now(),
+        )
+        .expect("valid stance")
+    }
+
+    #[test]
+    fn stance_candidates_parse_tolerantly_and_drop_junk() {
+        // 模型偶尔会裹着解释或代码块，抽第一段 [...] 就够。
+        let raw = "想了一下：\n```json\n[{\"kind\":\"form\",\"proposition\":\"我认为慢一点更好\",\"confidence_milli\":120}]\n```";
+        let parsed = parse_stance_candidates(raw);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].kind, StanceKind::Form);
+        assert_eq!(parsed[0].confidence_milli, 120);
+
+        // 认不出的 kind、缺必填字段、非 JSON 一律丢弃，不猜。
+        let messy = r#"[{"kind":"form"},{"kind":"??","proposition":"x"},{"kind":"challenge"},{"kind":"reinforce","target":"某条"}]"#;
+        let parsed = parse_stance_candidates(messy);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].kind, StanceKind::Reinforce);
+
+        assert!(parse_stance_candidates("我不想说").is_empty());
+        // 条数有上限：立场越少越像人格。
+        let many = format!(
+            "[{}]",
+            (0..9)
+                .map(|index| format!(r#"{{"kind":"form","proposition":"看法{index}"}}"#))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        assert_eq!(parse_stance_candidates(&many).len(), MAX_STANCE_PROPOSALS);
+        // 越界的置信增量被夹住，而不是照单全收。
+        let extreme = parse_stance_candidates(
+            r#"[{"kind":"form","proposition":"x","confidence_milli":9999}]"#,
+        );
+        assert_eq!(extreme[0].confidence_milli, 200);
+    }
+
+    #[test]
+    fn stance_updates_require_a_real_target() {
+        let existing = vec![test_stance("诚实比迎合更重要")];
+        // 目标对不上任何已有看法：整条丢弃——打在不存在的键上会让整份提案报
+        // NotFound，连同一批的 episodes 一起陪葬。
+        let updates = stance_updates(
+            r#"[{"kind":"challenge","target":"我从来没说过这句话"},{"kind":"reinforce","target":"诚实比迎合更重要"}]"#,
+            &existing,
+            &[],
+        );
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].operation, BeliefOperation::Reinforce);
+        // 用的是库里存的原文，而不是模型复述的那份。
+        assert_eq!(updates[0].proposition, "诚实比迎合更重要");
+
+        // 有人不同意 → Contradict（核心层会只微降并抬高稳定性）。
+        let updates = stance_updates(
+            r#"[{"kind":"challenge","target":"诚实比迎合更重要","confidence_milli":200}]"#,
+            &existing,
+            &[],
+        );
+        assert_eq!(updates[0].operation, BeliefOperation::Contradict);
+    }
+
+    #[test]
+    fn stance_updates_never_store_judgements_about_people() {
+        // 关于具体人的判断是记忆不是看法，必须被拒。
+        let updates = stance_updates(
+            r#"[{"kind":"form","proposition":"用户 123 喜欢安静"}]"#,
+            &[],
+            &[],
+        );
+        assert!(updates.is_empty());
+        // 带数字的自我立场是合法的（原来一刀切掉数字，这类看法永远进不来）。
+        let updates = stance_updates(
+            r#"[{"kind":"form","proposition":"我认为 30 岁之前该多试错"}]"#,
+            &[],
+            &[],
+        );
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].operation, BeliefOperation::Upsert);
+    }
+
+    #[test]
+    fn changing_your_mind_retracts_the_old_stance_before_forming_the_new_one() {
+        let existing = vec![test_stance("我认为显式状态机比隐式标记更可靠")];
+        let updates = stance_updates(
+            r#"[{"kind":"change","target":"我认为显式状态机比隐式标记更可靠","proposition":"我认为要看团队规模（以前我迷信状态机）"}]"#,
+            &existing,
+            &[],
+        );
+        assert_eq!(updates.len(), 2);
+        assert_eq!(updates[0].operation, BeliefOperation::Retract);
+        assert_eq!(updates[0].proposition, "我认为显式状态机比隐式标记更可靠");
+        assert_eq!(updates[1].operation, BeliefOperation::Upsert);
+        assert!(updates[1].proposition.contains("以前我"));
+    }
+
+    #[test]
+    fn stance_updates_carry_the_experiences_they_came_from() {
+        let events: Vec<ReflectionEvent> = (0..5)
+            .map(|index| ReflectionEvent {
+                event_id: EventId::new(),
+                scope: MindScope::Global,
+                summary: format!("经历 {index}"),
+                salience: 0.6,
+                occurred_at: Utc::now(),
+            })
+            .collect();
+        let existing = vec![test_stance("诚实比迎合更重要")];
+
+        // 新形成的看法：挂上最近几段经历作为根据，最多 3 条。
+        let updates = stance_updates(
+            r#"[{"kind":"form","proposition":"我认为慢一点更好"}]"#,
+            &[],
+            &events,
+        );
+        assert_eq!(updates[0].evidence_refs.len(), MAX_STANCE_EVIDENCE);
+        assert!(
+            updates[0]
+                .evidence_refs
+                .iter()
+                .all(|evidence| evidence.polarity() == EvidencePolarity::Supports)
+        );
+
+        // 被挑战：证据要是"相反"的极性，contradiction_count 才记得住。
+        let updates = stance_updates(
+            r#"[{"kind":"challenge","target":"诚实比迎合更重要"}]"#,
+            &existing,
+            &events,
+        );
+        assert!(
+            updates[0]
+                .evidence_refs
+                .iter()
+                .all(|evidence| evidence.polarity() == EvidencePolarity::Contradicts)
+        );
+    }
+
+    #[test]
+    fn stance_prompt_carries_her_experience_and_current_stances() {
+        let input = ReflectionInput {
+            trigger: ReflectionTrigger::DayBoundary,
+            depth: ReflectionDepth::Deep,
+            scope: MindScope::Global,
+            recent_events: vec![ReflectionEvent {
+                event_id: EventId::new(),
+                scope: MindScope::Global,
+                summary: "他今天说我的回答太敷衍".to_string(),
+                salience: 0.8,
+                occurred_at: Utc::now(),
+            }],
+            salient_memories: Vec::new(),
+            open_loop_summaries: Vec::new(),
+            goal_summaries: Vec::new(),
+            mind: MindSnapshot::empty(),
+            requested_at: Utc::now(),
+            trace: TraceContext::root(EventId::new()),
+        };
+        let messages = stance_formation_messages(&input, &[test_stance("诚实比迎合更重要")]);
+        assert_eq!(messages.len(), 2);
+        let joined = format!("{}{}", messages[0].content, messages[1].content);
+        assert!(
+            joined.contains("他今天说我的回答太敷衍"),
+            "必须带上她的经历"
+        );
+        assert!(joined.contains("诚实比迎合更重要"), "必须带上她现有的看法");
+        assert!(
+            joined.contains("不代表你改变看法"),
+            "被挑战与被说服必须分开说"
+        );
+        assert!(joined.contains("那是记忆，不是看法"));
+    }
 
     struct EmptyMemoryStore;
 

@@ -106,6 +106,7 @@ pub use belief::{
 };
 pub use common::{
     MindInfluenceMode, MindReasonTag, MindScope, MindSource, MindValidationError, SCHEMA_VERSION,
+    normalized_key,
 };
 pub use consolidation::{
     AgendaOperation, AgendaUpdateProposal, Consolidation, ConsolidationConfig, ConsolidationError,

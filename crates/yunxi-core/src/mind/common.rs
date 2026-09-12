@@ -208,7 +208,11 @@ fn validate_range(
     Ok(value)
 }
 
-pub(crate) fn normalized_key(value: &str) -> String {
+/// 命题的归一化键：去多余空白 + 转小写。
+///
+/// 外面对照已有 belief 时必须用**同一个**函数算键，自己写一套迟早会漂移
+/// （少一个空格就认不出是同一条看法），所以它是公开 API 的一部分。
+pub fn normalized_key(value: &str) -> String {
     value
         .split_whitespace()
         .collect::<Vec<_>>()
