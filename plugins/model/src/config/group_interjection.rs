@@ -33,10 +33,13 @@ pub struct GroupInterjectionConfig {
     /// 芸汐发言后，单独表情包可以被视为情绪回应的时间窗口（秒）。
     sticker_reaction_window_secs: u64,
     /// 同一成员表情回应的最短间隔（秒）。
+    ///
+    /// 仅保留解析兼容：表情回应的频次目前只由 Core 侧的会话节奏约束，
+    /// 生产代码不读这三个值。示例配置里已删除，避免它们看起来像生效的旋钮。
     sticker_reaction_cooldown_secs: u64,
-    /// 表情回应限流统计窗口（秒）。
+    /// 表情回应限流统计窗口（秒）。仅保留解析兼容，见上。
     sticker_reaction_rate_window_secs: u64,
-    /// 限流窗口内同一群最多回应多少次表情包。
+    /// 限流窗口内同一群最多回应多少次表情包。仅保留解析兼容，见上。
     sticker_reaction_rate_limit: usize,
     /// 熟人（熟悉度 ≥ familiarity_threshold）的未点名消息直接进入语义
     /// 评估，不等待抽样；是否真的回复仍由评估模型与 Core 决定。

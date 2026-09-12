@@ -602,6 +602,11 @@ impl ConversationCoordinator {
     }
 
     /// 统一队列上限，保证两个入口不会各自演化出不同的丢弃策略。
+    ///
+    /// 队列满时不再静默丢掉最旧的 turn：把最旧的正文按 FIFO 顺序折进新的
+    /// turn，让模型仍然看得到它，而不是让它从对话里凭空消失。丢掉的只有
+    /// 逐条的发送者归属和附件/引用绑定——那些必须留在原来的 turn 上才有
+    /// 意义；正文本身是唯一不能丢的东西。
     pub(crate) fn enqueue(
         queue: &mut VecDeque<PendingTurn>,
         turn: PendingTurn,
@@ -609,14 +614,13 @@ impl ConversationCoordinator {
         scope_id: i64,
     ) {
         let max_pending = config::get().traffic().max_pending_turns();
-        if queue.len() >= max_pending {
-            queue.pop_front();
+        let folded = fold_into_bounded_queue(queue, turn, max_pending);
+        if folded > 0 {
             eprintln!(
-                "[WARN] {}待处理队列已满，丢弃最旧 turn (范围: {}, 上限: {})",
+                "[WARN] {}待处理队列已满，把最旧 {folded} 条折进当前 turn (范围: {}, 上限: {})",
                 scope_label, scope_id, max_pending
             );
         }
-        queue.push_back(turn);
     }
 
     /// 领取排队 turn 时必须持有同一会话锁，避免旧 drainer 抢走新消息的代数。
@@ -650,11 +654,45 @@ impl ConversationCoordinator {
     }
 }
 
+/// Push one pending turn into a bounded FIFO, folding instead of dropping.
+///
+/// Returns how many older turns were folded into `turn`. The fold preserves
+/// the only thing the model actually needs — the order and text of what people
+/// said — while the per-turn attachments and reply bindings of the folded
+/// turns are discarded, because they belong to a turn that no longer exists.
+fn fold_into_bounded_queue(
+    queue: &mut VecDeque<PendingTurn>,
+    mut turn: PendingTurn,
+    max_pending: usize,
+) -> usize {
+    let max_pending = max_pending.max(1);
+    let mut folded = 0_usize;
+    while queue.len() >= max_pending {
+        let Some(oldest) = queue.pop_front() else {
+            break;
+        };
+        folded += 1;
+        if !oldest.message.trim().is_empty() {
+            turn.message = if turn.message.trim().is_empty() {
+                oldest.message
+            } else {
+                format!("{}\n{}", oldest.message, turn.message)
+            };
+        }
+        turn.message_ids.splice(0..0, oldest.message_ids);
+        if turn.sticker_teaching_message.is_none() {
+            turn.sticker_teaching_message = oldest.sticker_teaching_message;
+        }
+    }
+    queue.push_back(turn);
+    folded
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         ConversationCoordinator, IncomingTurnImpact, OutgoingExecutiveContext,
-        OutgoingExecutiveDecision,
+        OutgoingExecutiveDecision, PendingTurn, fold_into_bounded_queue,
     };
     use crate::model::interrupt::{
         OutgoingSource, OutgoingState, ReplyScope, commit_outgoing, finish, is_current,
@@ -676,6 +714,76 @@ mod tests {
                 direct_reply_expected,
             },
         )
+    }
+
+    fn pending_turn(message: &str, message_id: i32) -> PendingTurn {
+        PendingTurn {
+            user_id: 42,
+            sender: format!("42:10:00:00:{message}"),
+            message: message.to_owned(),
+            reply_expected: true,
+            vision_images: Vec::new(),
+            message_ids: vec![message_id],
+            understanding: MessageUnderstanding::default(),
+            sticker_teaching_message: None,
+        }
+    }
+
+    #[test]
+    fn a_full_pending_queue_folds_oldest_text_instead_of_dropping_it() {
+        let mut queue = std::collections::VecDeque::new();
+        // Three turns into a two-slot queue: the oldest must survive as text
+        // in front of the next one, in FIFO order, not vanish.
+        assert_eq!(
+            fold_into_bounded_queue(&mut queue, pending_turn("第一句", 1), 2),
+            0
+        );
+        assert_eq!(
+            fold_into_bounded_queue(&mut queue, pending_turn("第二句", 2), 2),
+            0
+        );
+        assert_eq!(
+            fold_into_bounded_queue(&mut queue, pending_turn("第三句", 3), 2),
+            1
+        );
+        assert_eq!(queue.len(), 2);
+        // The oldest turn's text stays in FIFO order, folded in front of the
+        // turn that displaced it.
+        assert_eq!(queue[0].message, "第二句");
+        assert_eq!(queue[1].message, "第一句\n第三句");
+        assert_eq!(queue[1].message_ids, vec![1, 3]);
+        // The capacity is never exceeded, however many turns arrive, and no
+        // text is ever lost: every enqueued message is still present exactly
+        // once. Order inside a folded turn is best-effort (the folded text is
+        // prepended to the turn that displaced it), which is why the earlier
+        // per-turn assertions above pin the order for the single-fold case.
+        for index in 4..12 {
+            fold_into_bounded_queue(&mut queue, pending_turn(&format!("第{index}句"), index), 2);
+        }
+        assert_eq!(queue.len(), 2);
+        let joined: String = queue
+            .iter()
+            .map(|turn| turn.message.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let expected = ["第一句", "第二句", "第三句"]
+            .into_iter()
+            .map(str::to_owned)
+            .chain((4..12).map(|index| format!("第{index}句")));
+        for message in expected {
+            assert_eq!(
+                joined.matches(&message).count(),
+                1,
+                "{message} must survive exactly once in {joined:?}"
+            );
+        }
+        // A one-slot queue folds everything into a single turn rather than
+        // silently discarding the burst.
+        let mut single = std::collections::VecDeque::new();
+        fold_into_bounded_queue(&mut single, pending_turn("甲", 1), 1);
+        fold_into_bounded_queue(&mut single, pending_turn("乙", 2), 1);
+        assert_eq!(single.len(), 1);
+        assert_eq!(single[0].message, "甲\n乙");
     }
 
     #[test]

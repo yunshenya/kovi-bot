@@ -21,20 +21,22 @@ use rand::RngExt;
 /// 仅用于兼容旧模型输出；新回复必须通过回复协议的 `messages` 字段分段。
 pub(crate) const LEGACY_FOLLOW_UP_MARKER: &str = "[[NEXT_MESSAGE]]";
 
+/// Character-bigram set of a text, ignoring punctuation and whitespace.
+fn text_bigrams(text: &str) -> std::collections::HashSet<(char, char)> {
+    text.chars()
+        .filter(|character| !is_ignorable_punct(*character))
+        .collect::<Vec<_>>()
+        .windows(2)
+        .map(|window| (window[0], window[1]))
+        .collect()
+}
+
 /// Rough "same idea" measure between two texts using character-bigram Jaccard
 /// overlap. Used only to collapse a reply's redundant bubbles (复读), never to
 /// decide which distinct ideas to keep.
 fn text_overlap(left: &str, right: &str) -> f64 {
-    let bigrams = |text: &str| -> std::collections::HashSet<(char, char)> {
-        text.chars()
-            .filter(|character| !is_ignorable_punct(*character))
-            .collect::<Vec<_>>()
-            .windows(2)
-            .map(|window| (window[0], window[1]))
-            .collect()
-    };
-    let left = bigrams(left);
-    let right = bigrams(right);
+    let left = text_bigrams(left);
+    let right = text_bigrams(right);
     if left.is_empty() || right.is_empty() {
         return 0.0;
     }
@@ -71,6 +73,25 @@ fn is_ignorable_punct(character: char) -> bool {
                 | '『'
                 | '』'
         )
+}
+
+/// Whether two bubbles of the same reply restate one idea.
+///
+/// Core's plain-turn contract accepts a model-declared second bubble; this is
+/// the host-side guard that keeps that permission from producing an immediate
+/// 复读. It measures how much of the *shorter* bubble is covered by the longer
+/// one: a restatement with a few extra characters is still a restatement,
+/// while a second bubble that mostly carries new information survives.
+pub(crate) fn bubbles_are_near_duplicates(left: &str, right: &str) -> bool {
+    const THRESHOLD: f64 = 0.6;
+    let left = text_bigrams(left);
+    let right = text_bigrams(right);
+    if left.is_empty() || right.is_empty() {
+        return false;
+    }
+    let intersection = left.intersection(&right).count() as f64;
+    let smaller = left.len().min(right.len()) as f64;
+    intersection / smaller.max(1.0) >= THRESHOLD
 }
 
 /// Merge adjacent bubbles that re-state the idea of the bubble right before
@@ -606,12 +627,32 @@ pub(crate) fn follow_up_delay_millis(
 #[cfg(test)]
 mod tests {
     use super::{
-        MessageDestination, ReplyPlan, follow_up_delay_millis, normalize_legacy_message_text,
-        split_reply,
+        MessageDestination, ReplyPlan, bubbles_are_near_duplicates, follow_up_delay_millis,
+        normalize_legacy_message_text, split_reply,
     };
     use crate::memory::BotPersonality;
     use crate::model::interrupt::ReplyScope;
     use crate::model::reply_disposition::ReplyDisposition;
+
+    #[test]
+    fn bubble_duplicate_guard_keeps_distinct_and_rejects_restatements() {
+        // A restatement with a few extra characters is still 复读.
+        assert!(bubbles_are_near_duplicates(
+            "今天降温了，记得多穿点。",
+            "今天降温了，记得要多穿点。"
+        ));
+        assert!(bubbles_are_near_duplicates("我先去吃饭啦", "我先去吃饭了"));
+        // A second bubble that mostly carries new information must survive,
+        // even when it reuses the opening words.
+        assert!(!bubbles_are_near_duplicates(
+            "今天降温了，记得多穿点。",
+            "晚上可能下雨，你带伞了吗？"
+        ));
+        assert!(!bubbles_are_near_duplicates("好", "那你早点休息"));
+        // Degenerate input never collapses a bubble on its own.
+        assert!(!bubbles_are_near_duplicates("", ""));
+        assert!(!bubbles_are_near_duplicates("？！", "。"));
+    }
 
     #[test]
     fn reply_plan_keeps_bubbles_and_destination_scope_is_stable() {

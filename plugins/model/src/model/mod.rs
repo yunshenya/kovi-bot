@@ -42,7 +42,9 @@ pub(crate) use interrupt::{
 pub(crate) use interrupt::{
     OutgoingState, commit_outgoing, mark_outgoing_sent, prepare_outgoing, test_outgoing_state,
 };
-pub(crate) use message_actions::{MessageDestination, ReplyPlan, normalize_legacy_message_text};
+pub(crate) use message_actions::{
+    MessageDestination, ReplyPlan, bubbles_are_near_duplicates, normalize_legacy_message_text,
+};
 pub(crate) use message_transport::{MessageTransport, MessageTransportError};
 pub(crate) use model_gateway::ModelGateway;
 pub(crate) use recall::record_standalone_bot_message;
