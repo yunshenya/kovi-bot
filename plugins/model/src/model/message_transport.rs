@@ -181,8 +181,18 @@ impl<'a> MessageTransport<'a> {
             .get("message_id")
             .and_then(|message_id| message_id.as_i64())
             .and_then(|message_id| i32::try_from(message_id).ok())
-            .filter(|message_id| *message_id > 0)
-            .ok_or(MessageTransportError::Indeterminate(response))?;
+            .filter(|message_id| *message_id > 0);
+        let Some(message_id) = message_id else {
+            return Err(MessageTransportError::Indeterminate(response));
+        };
+        // 记账结果：`[send]` 只证明"我们提交了一次发送"，这行才证明"平台受理了并且给了
+        // 消息号"。2026-09-12 排查"她说发了但对方没收到"时，缺的正是这条配对信息——
+        // 当时只能看到 `[send]`，分不清是没发、还是发了但平台侧没送达。
+        println!(
+            "[sent] message_id={message_id} status={} destination={}",
+            response.status,
+            destination_label(destination),
+        );
         if let MessageDestination::Group(group_id) = destination {
             // 无论 Host 还是 Core 的发送路径，一次可见的群聊消息都会开启
             // “接续对话”窗口，让随后未点名的消息按连续会话语义处理，
@@ -190,6 +200,14 @@ impl<'a> MessageTransport<'a> {
             crate::model::group::mark_group_reply_sent(group_id).await;
         }
         Ok(message_id)
+    }
+}
+
+/// `[sent]` 日志里的目标标签，避免把"私聊/群聊"混在一起看。
+fn destination_label(destination: MessageDestination) -> String {
+    match destination {
+        MessageDestination::Group(group_id) => format!("group:{group_id}"),
+        MessageDestination::Private(user_id) => format!("private:{user_id}"),
     }
 }
 

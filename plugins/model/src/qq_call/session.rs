@@ -182,12 +182,34 @@ enum Job {
     Speak(String),
 }
 
-/// 电话里已经说过的一句话。
+/// 电话里已经说过的一句话，以及说这句话那一轮**真的执行过**的工具。
+///
+/// 为什么要连工具一起存：2026-09-12 线上实测，对方说"没收到"，芸汐连着五轮回答
+/// "我再发一次"，但一次 `private.message.send` 都没调用。根因就是历史里只留了文字，
+/// 她自己那句口头承诺"发好啦"被当成了已完成的事实——工具证据必须跨轮可见，
+/// 否则"发了"和"我只是说了要发"在上下文里长得一模一样。
 #[derive(Clone)]
 struct Turn {
     from_peer: bool,
     text: String,
+    /// 这一轮实际发生的工具调用及其结果；没调工具就是空。
+    tools: Vec<ToolFact>,
 }
+
+/// 一条工具事实：名字 + 成没成 + 结果摘要。
+#[derive(Clone)]
+struct ToolFact {
+    name: String,
+    succeeded: bool,
+    detail: String,
+}
+
+/// 回放历史时每个工具结果最多保留多少字。历史里只需要"这件事真的发生过"这个证据，
+/// 不需要复现完整返回体（Web 搜索能返回几百字），截断同时保护 token 预算。
+const TOOL_FACT_HISTORY_CHARS: usize = 200;
+
+/// 一句回复里最多回放几条工具事实。一轮理论上能连调好几个工具，历史里不需要全留。
+const TOOL_FACTS_PER_TURN: usize = 6;
 
 /// 一次播报的结果。
 enum SpeakOutcome {
@@ -473,6 +495,7 @@ async fn respond(
                         Turn {
                             from_peer: false,
                             text,
+                            tools: Vec::new(),
                         },
                     ),
                     Ok(SpeakOutcome::Interrupted) => {
@@ -504,6 +527,7 @@ async fn respond(
                         Turn {
                             from_peer: true,
                             text: peer_text,
+                            tools: Vec::new(),
                         },
                     );
                     let farewell = config.farewell().trim().to_owned();
@@ -514,6 +538,7 @@ async fn respond(
                                 Turn {
                                     from_peer: false,
                                     text: farewell,
+                                    tools: Vec::new(),
                                 },
                             ),
                             Ok(SpeakOutcome::Interrupted) => {}
@@ -529,6 +554,7 @@ async fn respond(
                     Turn {
                         from_peer: true,
                         text: peer_text,
+                        tools: Vec::new(),
                     },
                 );
 
@@ -548,12 +574,17 @@ async fn respond(
                     continue;
                 };
                 println!("[INFO] QQ 通话回复: {}", reply.text);
+                // 把这一轮真正执行过的工具钉进历史。跨轮丢失工具证据就是
+                // "说了要发但一次没发"的根因，这里必须在她开口之后就写进去。
+                let facts = tool_facts(&turn.outcomes);
+                warn_on_unbacked_action_claim(&reply.text, &facts, &peer);
                 match speak(&speech, &config, &reply.text, &mut interrupts).await {
                     Ok(SpeakOutcome::Completed) => push_turn(
                         &transcript,
                         Turn {
                             from_peer: false,
                             text: reply.text,
+                            tools: facts,
                         },
                     ),
                     Ok(SpeakOutcome::Interrupted) => {
@@ -933,6 +964,7 @@ pub(super) async fn self_test(
     let transcript = Arc::new(Mutex::new(vec![Turn {
         from_peer: true,
         text: question.to_string(),
+        tools: Vec::new(),
     }]));
     let mut spoken = Vec::new();
     // 自检和真通话一样必须有身份，否则"给我发条消息"在这条路上同样解析不出来。
@@ -1061,7 +1093,11 @@ async fn run_tool_round(
                         match speak(speech, config, &filler, interrupts).await {
                             Ok(SpeakOutcome::Completed) => push_turn(
                                 transcript,
-                                Turn { from_peer: false, text: filler.clone() },
+                                Turn {
+                                    from_peer: false,
+                                    text: filler.clone(),
+                                    tools: Vec::new(),
+                                },
                             ),
                             Ok(SpeakOutcome::Interrupted) => {}
                             Err(error) => eprintln!("[ERROR] QQ 通话填充语播报失败: {error}"),
@@ -1212,6 +1248,15 @@ fn build_messages(
     let keep = config.history_turns().saturating_mul(2);
     let start = turns.len().saturating_sub(keep);
     for turn in &turns[start..] {
+        // 助手那轮调过工具时，先把"已经真的执行过的动作"作为事实喂回去，再放她那句话。
+        // 顺序很关键：她必须先看到事实，才能判断"对方说没收到"要不要重新调一次工具，
+        // 而不是顺着自己上一句口头承诺继续往下编。
+        if !turn.from_peer && !turn.tools.is_empty() {
+            messages.push(BotMemory {
+                role: Roles::Data,
+                content: render_tool_history(&turn.tools),
+            });
+        }
         messages.push(BotMemory {
             role: if turn.from_peer {
                 Roles::User
@@ -1222,6 +1267,99 @@ fn build_messages(
         });
     }
     messages
+}
+
+/// 把一轮里真实发生过的工具调用渲染成给模型看的事实。
+///
+/// 措辞刻意写死"真的执行过"，因为这个模型最容易犯的错就是把"我说了要发"当成
+/// "我发了"。失败也要写进去：对方说没收到时，失败记录正是该重试的信号。
+fn render_tool_history(facts: &[ToolFact]) -> String {
+    let mut body = String::from(
+        "【系统事实】紧随其后的那句话之前，你这一轮真的执行过下面这些动作，执行结果是：\n",
+    );
+    for fact in facts.iter().take(TOOL_FACTS_PER_TURN) {
+        let status = if fact.succeeded { "成功" } else { "失败" };
+        body.push_str(&format!(
+            "- {} → {status}：{}\n",
+            fact.name,
+            truncate_chars(fact.detail.trim(), TOOL_FACT_HISTORY_CHARS)
+        ));
+    }
+    body.push_str(
+        "这只是记录，不是让你复述。如果对方说没收到，说明上一次投递没有到他那里：\
+         要再发就必须在这一轮重新调用发送工具，光说\"我再发一次\"等于没发。",
+    );
+    body
+}
+
+/// 按字符数截断（不是字节），避免把中文截成半个字。
+fn truncate_chars(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text.to_owned();
+    }
+    let mut out: String = text.chars().take(limit).collect();
+    out.push('…');
+    out
+}
+
+/// 把这一轮的工具结果收敛成可回放的事实。
+fn tool_facts(outcomes: &[ToolOutcome]) -> Vec<ToolFact> {
+    outcomes
+        .iter()
+        .map(|outcome| ToolFact {
+            name: outcome.name.clone(),
+            succeeded: outcome.succeeded,
+            detail: outcome.content.clone(),
+        })
+        .collect()
+}
+
+/// 她声称"已经做了"、但这一轮其实一个工具都没调的动作词。
+///
+/// 2026-09-12 线上：对方说没收到，她连着五轮回"我再发一次"，一次 `private.message.send`
+/// 都没调用，而日志里只有她那句承诺——完全看不出"她其实什么都没做"。这条 WARN 就是
+/// 把那种静默补上，让同类问题在日志里一眼可见。
+const ACTION_CLAIM_MARKERS: &[&str] = &[
+    "我再发",
+    "重新发",
+    "再发一次",
+    "再发一遍",
+    "再发条",
+    "再发一条",
+    "这就发",
+    "发了呀",
+    "已经发",
+    "发好啦",
+    "发好了",
+    "给你发了",
+    "发过去了",
+    "刷新一下",
+    // 线上原话："我再试试，你别急，可能是我这边卡了一下。"——同样是空承诺。
+    "我再试试",
+    "再试一次",
+];
+
+/// 这一轮嘴上说"发了/我再发"但没有任何工具调用时告警。
+fn warn_on_unbacked_action_claim(reply: &str, facts: &[ToolFact], peer: &str) {
+    let Some(marker) = unbacked_action_claim(reply, facts) else {
+        return;
+    };
+    println!(
+        "[WARN] QQ 通话疑似只承诺未执行：本轮没有任何工具调用，但回复里出现「{marker}」\
+         （对端 {peer}，回复 {} 字）。若她本该发消息或建提醒，说明工具根本没被调用。",
+        reply.chars().count()
+    );
+}
+
+/// 判据本体：调过工具就不算空承诺，否则看回复里有没有"我发了/我再发"这类动作词。
+fn unbacked_action_claim(reply: &str, facts: &[ToolFact]) -> Option<&'static str> {
+    if !facts.is_empty() {
+        return None;
+    }
+    ACTION_CLAIM_MARKERS
+        .iter()
+        .find(|marker| reply.contains(**marker))
+        .copied()
 }
 
 /// 私聊人设 + 电话模式约束。电话约束放在后面，明确覆盖打字的格式要求。
@@ -1263,7 +1401,13 @@ const PHONE_TOOLS_PROMPT: &str = "\
 用一句话说清楚，等对方明确答应；对方没说\"好/对/可以/发吧\"之前不要调用这类工具。\n\
 - 动作做完后用一句话说明结果；没成功就如实说没成，不要编。\n\
 - 电话里听错很正常：如果对方像是要你做件事，但关键信息不确定（发给谁、发什么内容、\
-什么时候提醒），宁可追问一句，也不要自己补齐。";
+什么时候提醒），宁可追问一句，也不要自己补齐。\n\
+- 【必须真做，不能只答应】对方让你发消息、建提醒、启动任务时，你必须在这一轮真的调用\
+对应的工具，不能只回一句\"好，我这就发\"\"发了呀\"就当完成了——那样在对方那里什么都没发生。\
+说出\"发了\"\"已经发了\"之前，你这一轮必须真的拿到过工具返回的成功结果。\n\
+- 【对方说没收到就重新发】对方说没收到、没看到、让你再发一次时，上一次的投递对他而言\
+就是没成功。**重新调用一次发送工具**，不要只重复\"我再发一次\"；也不要说\"你刷新看看\"\
+或者猜是不是被删好友了——把消息真的再发一遍，再问他收到没有。";
 
 /// 电话里不能用工具时的说明。这时候最要紧的是别口头答应做不到的事。
 const PHONE_NO_TOOLS_PROMPT: &str = "\
@@ -1418,10 +1562,10 @@ async fn archive_call(
 #[cfg(test)]
 mod tests {
     use super::{
-        CallPhase, EndTrigger, NO_END, PhoneReply, PhoneTurn, TOOL_ARGUMENT_LOG_CHARS, ToolOutcome,
-        Turn, build_messages, phone_system_prompt, preview_chars, render_self_test, request_end,
-        requested_end, sanitize_reply, strip_protocol_markers, summarize_tool_arguments,
-        wants_hangup,
+        CallPhase, EndTrigger, NO_END, PhoneReply, PhoneTurn, TOOL_ARGUMENT_LOG_CHARS,
+        TOOL_FACT_HISTORY_CHARS, ToolFact, ToolOutcome, Turn, build_messages, phone_system_prompt,
+        preview_chars, render_self_test, request_end, requested_end, sanitize_reply,
+        strip_protocol_markers, summarize_tool_arguments, unbacked_action_claim, wants_hangup,
     };
     use crate::config::QqCallConfig;
     use serde_json::Value;
@@ -1676,10 +1820,12 @@ mod tests {
             Turn {
                 from_peer: true,
                 text: "喂".to_string(),
+                tools: Vec::new(),
             },
             Turn {
                 from_peer: false,
                 text: "在的".to_string(),
+                tools: Vec::new(),
             },
         ];
         let messages = build_messages(&config, "", &turns, false, "云深不知处（QQ 3052405886）");
@@ -1700,14 +1846,17 @@ mod tests {
             Turn {
                 from_peer: true,
                 text: "一".to_string(),
+                tools: Vec::new(),
             },
             Turn {
                 from_peer: false,
                 text: "二".to_string(),
+                tools: Vec::new(),
             },
             Turn {
                 from_peer: true,
                 text: "三".to_string(),
+                tools: Vec::new(),
             },
         ];
         let messages = build_messages(&config, "", &turns, false, "云深不知处（QQ 3052405886）");
@@ -1724,5 +1873,129 @@ mod tests {
         assert_eq!(messages.len(), 3);
         assert!(messages[1].content.contains("<参考上下文"));
         assert!(messages[1].content.contains("上次说要早点睡"));
+    }
+
+    /// 2026-09-12 的回归：她说过"我再发一次"却一次工具都没调，根因就是历史里
+    /// 只留了文字、丢了工具证据。修好之后助手那轮的工具事实必须出现在历史里。
+    #[test]
+    fn tool_facts_are_replayed_into_history() {
+        let config = QqCallConfig::default();
+        let turns = vec![
+            Turn {
+                from_peer: true,
+                text: "给我发条消息".to_string(),
+                tools: Vec::new(),
+            },
+            Turn {
+                from_peer: false,
+                text: "发好啦，你收到了吗？".to_string(),
+                tools: vec![ToolFact {
+                    name: "private.message.send".to_string(),
+                    succeeded: true,
+                    detail: r#"{"status":"completed","user_id":3052405886}"#.to_string(),
+                }],
+            },
+            Turn {
+                from_peer: true,
+                text: "没有啊".to_string(),
+                tools: Vec::new(),
+            },
+        ];
+        let messages = build_messages(&config, "", &turns, true, "朋友（3052405886）");
+        let facts = messages
+            .iter()
+            .find(|message| message.content.contains("【系统事实】"))
+            .expect("调过工具的那一轮必须回放工具事实");
+        assert!(facts.content.contains("private.message.send"));
+        assert!(facts.content.contains("成功"));
+        // 事实必须排在她的口头承诺之前，否则她还是会顺着自己的话往下编。
+        let reply_at = messages
+            .iter()
+            .position(|message| message.content == "发好啦，你收到了吗？")
+            .expect("助手那句回复要在历史里");
+        let facts_at = messages
+            .iter()
+            .position(|message| message.content.contains("【系统事实】"))
+            .expect("事实位置");
+        assert!(facts_at < reply_at, "工具事实必须先于口头承诺出现");
+    }
+
+    #[test]
+    fn turns_without_tools_add_no_extra_message() {
+        let config = QqCallConfig::default();
+        let turns = vec![Turn {
+            from_peer: false,
+            text: "嗯嗯".to_string(),
+            tools: Vec::new(),
+        }];
+        let messages = build_messages(&config, "", &turns, true, "朋友（1）");
+        assert_eq!(messages.len(), 3, "system + 历史说明 + 一轮历史");
+    }
+
+    #[test]
+    fn tool_fact_details_are_truncated_for_history() {
+        let long = "结".repeat(500);
+        let turns = vec![Turn {
+            from_peer: false,
+            text: "查到了".to_string(),
+            tools: vec![ToolFact {
+                name: "web.search".to_string(),
+                succeeded: true,
+                detail: long,
+            }],
+        }];
+        let messages = build_messages(&QqCallConfig::default(), "", &turns, true, "朋友（1）");
+        let facts = messages
+            .iter()
+            .find(|message| message.content.contains("【系统事实】"))
+            .expect("应有事实");
+        // 摘要字符数受限，不能把整段返回体灌进历史。
+        let body = facts.content.lines().nth(1).expect("应有一行工具事实");
+        assert!(
+            body.chars().count() <= TOOL_FACT_HISTORY_CHARS + 32,
+            "单条事实不该超长: {} 字",
+            body.chars().count()
+        );
+    }
+
+    /// 她说"我再发一次"但没调工具时必须留下日志，不能再像线上那样静默。
+    #[test]
+    fn action_claim_without_tool_is_flagged() {
+        assert_eq!(
+            unbacked_action_claim("好，那我再发一条给你。", &[]),
+            Some("我再发")
+        );
+
+        // 真的调过工具就不是空承诺，不该告警。
+        let called = vec![ToolFact {
+            name: "private.message.send".to_string(),
+            succeeded: true,
+            detail: "completed".to_string(),
+        }];
+        assert_eq!(unbacked_action_claim("发好啦", &called), None);
+
+        // 跟发消息无关的话不该命中。
+        assert_eq!(unbacked_action_claim("嗯，我在呢，你慢慢说。", &[]), None);
+
+        // 线上真实出现过的几句都必须命中。
+        for line in [
+            "发了呀，你那边刷新一下看看，有没有收到。",
+            "嗯，我这就再发一次，你等一下哦。",
+            "我再试试，你别急，可能是我这边卡了一下。",
+            "那我再发一次试试，你盯着看一下，有没有新消息跳出来。",
+        ] {
+            assert!(
+                unbacked_action_claim(line, &[]).is_some(),
+                "这句该被判为空承诺: {line}"
+            );
+        }
+    }
+
+    /// 电话提示词必须带上"必须真做"和"没收到就重发"这两条硬规则。
+    #[test]
+    fn phone_prompt_forbids_empty_promises() {
+        let prompt = phone_system_prompt(&QqCallConfig::default(), true, "朋友（1）");
+        assert!(prompt.contains("必须在这一轮真的调用"));
+        assert!(prompt.contains("重新调用一次发送工具"));
     }
 }
