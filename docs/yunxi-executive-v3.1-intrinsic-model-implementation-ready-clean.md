@@ -5262,3 +5262,79 @@ Executive v3 负责的不是：
   `model.intrinsic.max_new_tokens = 256` 决定，4 vCPU 上偏慢时先调它。
 - TurnGate 仍是"lexical + MiniMind"兜底：`models/yunxi-turngate` 那个 bundle 不是
   下载来的，要用 `tools/turngate/` 在**自己的对话数据**上离线训练产出。
+
+---
+
+# 附二：shadow → active 到底改了什么（2026-09-12）
+
+把四个影子开关都改成 active 之后，**必须先说清楚它们各自门控什么**，
+否则很容易以为"本机模型开始接管一部分回复了"——实际上并没有。
+
+| 开关 | 现在的值 | 消费点 | 今天真正的影响 |
+|---|---|---|---|
+| `[executive] shadow_mode` | `true → false` | `core_model.rs` 组装 `shadow_routing` | 与下一项取或；见下 |
+| `[model.intrinsic] shadow_routing` | `true → false` | 同上 | 见下 |
+| `[model.turn_gate] response_mode` | `"shadow" → "active"` | `response_gate_active()` | **就位待命**：还要求 `engine_available()` |
+| `[world_model] shadow_mode` | `true → false` | 启动日志 + `#world-status` 文案 | 只改两处**文案**，不门控行为 |
+
+## 一、shadow_routing 关掉之后，路由仍然不会选本机模型
+
+`core_model.rs` 里那段是：
+
+```rust
+} else if strong_available && shadow_routing {
+    // Shadow routing observes a possible Intrinsic choice but must not
+    // replace a normal Strong reply while Strong is healthy/configured.
+    HostModelRoute::Strong
+} else {
+    match would_select { ... ModelSelection::Intrinsic if intrinsic_available => Intrinsic, ... }
+}
+```
+
+看起来"关掉 shadow 就会开始用本机模型"。但 `would_select` 来自：
+
+```rust
+if capability.preferred_tier.is_strong() && capability.strong_available { Strong }
+else if capability.preferred_tier != Reflex && intrinsic_available { Intrinsic }
+```
+
+而 `preferred_tier` 在生产里**永远是 `Standard`（属于 is_strong）**：
+
+- 启动时 `intrinsic.capability_snapshot()` 在"配了强端点"时给出 `Standard`；
+- 唯一会覆盖它的地方是 `host_capability_snapshot` 从 `input.executive` 抄一份，
+  而那份就是同一个 `Standard`；
+- `ExecutiveController::state.capability` 只在 `set_capability`（启动）和
+  `restore_snapshot` 里被写过，**没有任何路径把它降到 Intrinsic**；
+- 定义里有个 `ExecutiveTierDecision { Reflex, Intrinsic, Standard, Enhanced, Defer }`，
+  但全仓除了定义与再导出，**没有任何生产代码产出或消费它**。
+
+所以两个分支给出的都是 `Strong`。**把 shadow 关掉是"把开关拨到允许"，但没有人去按它。**
+本机模型目前只在这些情况下真的说话：DeepSeek 不可用（存活路径）、
+视觉分析、TurnGate 的完成度兜底。
+
+### 想让它真的接管一部分轮次，缺的是一段代码
+
+需要一个"这一轮值不值得花强模型"的判断，并把结果写进 `preferred_tier`
+（例如：寒暄/单句确认走 Intrinsic，复杂或带工具的走 Strong），
+再把 `ExecutiveTierDecision` 接上。这是行为改动，不是配置改动。
+
+## 二、response_mode=active 只是"就位待命"
+
+```rust
+pub(crate) fn response_gate_active(&self) -> bool {
+    config::get().model().turn_gate().response_mode() == "active" && self.engine_available()
+}
+```
+
+`engine_available()` 取决于 `models/yunxi-turngate` 那个**训练出来的** bundle
+（`manifest.toml` + `turn_gate.bin`，由 `tools/turngate/` 在自己的对话数据上离线训练）。
+启动日志里此刻仍是 `engine_available=false`，所以这一项今天不改变任何行为；
+bundle 一旦装上，它会**立即**开始参与路由，不需要再改配置。
+
+## 三、世界模型的 shadow_mode 是纯文案
+
+全仓对 `world_config().shadow_mode()` 的消费只有两处，都是拼字符串：
+启动那行 `[INFO] World Model v4 已启用（shadow_mode=false）`，
+以及 `#world-status` 里的 `shadow=true` 标记。**它没有门控任何行为**——
+世界模型的写入与回复上下文注入由 `enabled` 与 `reply_context`
+（生产已是 `active`）决定。这一项改的只是报告里少一行字。

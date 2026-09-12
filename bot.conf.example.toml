@@ -174,7 +174,12 @@ reflection_max_events = 32
 
 [executive]
 enabled = true
-shadow_mode = true
+# shadow_mode 与 model.intrinsic.shadow_routing **取或**，一起决定 core_model 里
+# 那个 shadow_routing：任一为 true，路由即便算出"这轮该用本机模型"，只要 DeepSeek
+# 可用就仍然走 DeepSeek。生产 2026-09-12 起两个都为 false（见下方说明：目前
+# 还不会真的把任何一轮交给本机模型，因为没有任何代码会把 preferred_tier 降到
+# Standard 以下）。
+shadow_mode = false
 
 [executive.conflict]
 threshold = 0.60
@@ -198,7 +203,8 @@ recent_limit = 32
 
 [model.intrinsic]
 enabled = true
-shadow_routing = true
+# 见 [executive].shadow_mode：两者取或。
+shadow_routing = false
 asset_dir = "models/yunxi-intrinsic/minimind-3o"
 max_parallel = 1
 max_context_tokens = 2048
@@ -222,9 +228,13 @@ max_model_attempts = 2
 enabled = true
 mode = "active"
 asset_dir = "models/yunxi-turngate"
-# response head 影子 (Phase 3):只记录"会怎么选"与真实走向的分歧,不改变
-# 发送;Phase 4 才会允许 answer/continue/ack 参与路由(先私聊灰度)。
-response_mode = "shadow"
+# response head (Phase 3-4)：shadow 只记录不改变发送；active 才允许
+# answer/continue/ack 参与路由。
+# 注意 active 还有一道前置条件：代码判的是
+# `response_mode == "active" && engine_available()`，而 engine_available 取决于
+# models/yunxi-turngate 那个**训练出来的** bundle。没有 bundle 时 active 等于
+# 就位待命（bundle 一装上立即生效），不会凭空改变行为。
+response_mode = "active"
 
 [message_batch]
 
@@ -342,9 +352,11 @@ cooldown_secs = 600
 # 持久化（重启恢复、数据删除联动）。持久化表按需创建（additive），
 # 其余组件不受影响。
 [world_model]
-# 生产默认影子观察模式（只记录不改变行为）；本地/测试不需要时可关闭
+# 这个开关在当前代码里只影响两处**文案**：启动那行
+# "World Model v4 已启用（shadow_mode=...）" 与 #world-status 里的 "shadow=true"。
+# 它没有门控任何行为（全仓只有这两个消费点），所以 false 也不改变世界模型的行为。
 enabled = true
-shadow_mode = true
+shadow_mode = false
 persist = true
 persist_interval_secs = 30
 # 回复上下文注入：disabled（无效果）/ shadow（记录将注入的内容）/
