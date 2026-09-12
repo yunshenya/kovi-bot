@@ -97,20 +97,11 @@ pub struct QqCallConfig {
     /// 会话结束时是否让桥真的挂断电话（AVSDK cmd 8 = `Quit`）。
     ///
     /// 上游桥的控制接口白名单原本只有 `login(1)/accept(5)/kernel-forward(55)`，
-    /// 所以机器人只能"停止参与"、等对方挂断。AVSDK 插件本身一直有
-    /// `Quit(uint roomId, int reason)`；桥现在把它透出成
-    /// `POST /v1/calls/hangup`。打开后，机器人结束会话时会主动挂断。
+    /// 所以机器人只能"停止参与"、等对方挂断。AVSDK 插件的方法表里一直有挂断
+    /// （cmd 10 = `Close`）；桥现在把它透出成 `POST /v1/calls/hangup`。打开后，
+    /// 机器人结束会话时会主动挂断。具体参数是实测出来的固定值，见
+    /// `docs/qq-call.md` 的「挂断参数实验」，不开放成配置。
     hangup_enabled: bool,
-    /// 用哪个 AVSDK 控制方法挂断。**目前只支持 `close`。**
-    ///
-    /// 实测（2026-09-12，真机通话中）：只发 `quit`（cmd 8）本端会离开房间但服务器
-    /// 不销毁；`close`（cmd 10）才真的结束这通电话（桥立刻 `ended`、`endReason=4`、
-    /// AVSDK 事件计数停止增长）。
-    /// 桥侧已把 cmd 8/9/11 从白名单里去掉，且只接受 `close`，所以这里填别的值会在
-    /// 挂断时报错——保留字段只是为了以后发现更合适的方法时不用改代码。
-    hangup_method: String,
-    /// 传给 AVSDK 控制方法的原因码；默认 1。
-    hangup_reason: i64,
     /// 挂断后是否把通话记录写回来电者的私聊记忆。
     archive_to_memory: bool,
 }
@@ -278,16 +269,6 @@ impl QqCallConfig {
         self.hangup_enabled
     }
 
-    /// 用哪个 AVSDK 控制方法挂断。
-    pub fn hangup_method(&self) -> &str {
-        self.hangup_method.trim()
-    }
-
-    /// 传给 AVSDK 控制方法的原因码。
-    pub fn hangup_reason(&self) -> i64 {
-        self.hangup_reason
-    }
-
     /// 该 QQ 号是否允许来电。白名单为空时只允许主管理员。
     pub fn caller_allowed(&self, caller: i64, main_admin: Option<i64>) -> bool {
         if self.allowed_callers.contains(&caller) {
@@ -425,16 +406,6 @@ impl QqCallConfig {
         {
             return Err(anyhow::anyhow!("qq_call.hangup_keywords 不能有空字符串"));
         }
-        if self.hangup_method.trim() != "close" {
-            return Err(anyhow::anyhow!(
-                "qq_call.hangup_method 目前只支持 close（cmd 8 Quit 挂不断，其余方法未验证）"
-            ));
-        }
-        if self.hangup_reason < 0 || self.hangup_reason > 1_000 {
-            return Err(anyhow::anyhow!(
-                "qq_call.hangup_reason 必须在 0 到 1000 之间（AVSDK 挂断原因码）"
-            ));
-        }
         if self.farewell.chars().count() > 200 {
             return Err(anyhow::anyhow!("qq_call.farewell 不能超过 200 字"));
         }
@@ -494,8 +465,6 @@ impl Default for QqCallConfig {
             ],
             farewell: "好，那我先挂啦，拜拜～".to_string(),
             hangup_enabled: true,
-            hangup_method: "close".to_string(),
-            hangup_reason: 1,
             archive_to_memory: true,
         }
     }
@@ -574,25 +543,12 @@ mod tests {
             ..enabled()
         };
         assert!(long_farewell.validate().is_err());
-        let bad_reason = QqCallConfig {
-            hangup_reason: -1,
-            ..enabled()
-        };
-        assert!(bad_reason.validate().is_err());
-        let bad_method = QqCallConfig {
-            hangup_method: "  ".to_string(),
-            ..enabled()
-        };
-        assert!(bad_method.validate().is_err());
     }
 
     #[test]
     fn hangup_is_enabled_by_default() {
         let config = QqCallConfig::default();
         assert!(config.hangup_enabled());
-        // 实测只有 close 能让服务器真的销毁房间。
-        assert_eq!(config.hangup_method(), "close");
-        assert_eq!(config.hangup_reason(), 1);
     }
 
     #[test]

@@ -18,7 +18,7 @@ use crate::model::utils::{is_model_error_response, params_model_with_plain_style
 use crate::model::{BotMemory, Roles};
 use crate::speech::SpeechClient;
 use kovi::tokio::sync::mpsc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -43,6 +43,120 @@ const CONTEXT_MEMORIES: usize = 12;
 const CONTEXT_MEMORY_CHARS: usize = 120;
 /// 桥连续失败多少次后判定通话已不可继续。
 const BRIDGE_FAILURE_LIMIT: u32 = 5;
+
+/// 还没有人要求结束时的信号值。
+const NO_END: u8 = u8::MAX;
+
+/// 这次会话是怎么结束的。
+///
+/// 以前这里是散在五六个地方的字符串，再靠一个 `hangup_requested` 布尔值在回复链
+/// 和采集链之间传"该收了"——名字只覆盖"对方要求挂断"一种情况，名单外婉拒和模型
+/// 判断也共用它。现在统一成枚举：谁先要求结束谁说了算（[`request_end`] 先到先得），
+/// 收尾文案只有 [`EndTrigger::describe`] 一处，顺带由 [`EndTrigger::needs_hangup`]
+/// 决定还要不要真的去挂断电话。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EndTrigger {
+    /// 两条链路都还没人要求结束（例如回复链的通道被关掉）。
+    Unspecified,
+    /// 对方在电话里要求挂断（`hangup_keywords` 命中）。
+    PeerRequested,
+    /// 来电者不在授权名单，播完婉拒就结束。
+    Refused,
+    /// 模型判断对方要结束通话（回复里带 `[[挂断]]`）。
+    ModelDecided,
+    /// 到达 `max_call_seconds`。
+    Timeout,
+    /// 采集读取失败（parec 退出、设备消失等）。
+    CaptureFailed,
+    /// 采集长时间没有数据。
+    CaptureStalled,
+    /// 桥报告对方已挂断。
+    PeerHungUp,
+    /// 桥报告通话已空闲。
+    BridgeIdle,
+    /// 桥报告其它非通话阶段。
+    BridgePhaseChanged,
+    /// 桥连续不可用。
+    BridgeGone,
+}
+
+impl EndTrigger {
+    /// 写进日志和通话记录的结束原因。
+    fn describe(self) -> &'static str {
+        match self {
+            Self::Unspecified => "通话已结束",
+            Self::PeerRequested => "对方要求挂断",
+            Self::Refused => "名单外婉拒",
+            Self::ModelDecided => "模型判断该结束",
+            Self::Timeout => "达到通话时长上限",
+            Self::CaptureFailed => "通话音频中断",
+            Self::CaptureStalled => "通话音频长时间无数据",
+            Self::PeerHungUp => "对方挂断",
+            Self::BridgeIdle => "桥报告通话已空闲",
+            Self::BridgePhaseChanged => "通话阶段已结束",
+            Self::BridgeGone => "通话桥不可用",
+        }
+    }
+
+    /// 从桥上报的阶段反推结束原因。
+    fn from_phase(phase: CallPhase) -> Self {
+        match phase {
+            CallPhase::Idle => Self::BridgeIdle,
+            CallPhase::Ended => Self::PeerHungUp,
+            _ => Self::BridgePhaseChanged,
+        }
+    }
+
+    /// 以这个原因收尾时，电话是否还需要我们主动去挂断。
+    ///
+    /// 桥说电话已经不在（对方挂断、回到空闲、阶段变了）或者桥本身不可用时，
+    /// 都没有可挂断的对象；其余情况（对方开口要求、名单外婉拒、模型判断、
+    /// 到点、音频断了）电话多半还连着，需要真的挂掉。
+    fn needs_hangup(self) -> bool {
+        !matches!(
+            self,
+            Self::PeerHungUp | Self::BridgeIdle | Self::BridgePhaseChanged | Self::BridgeGone
+        )
+    }
+
+    fn code(self) -> u8 {
+        self as u8
+    }
+
+    fn from_code(code: u8) -> Option<Self> {
+        Some(match code {
+            0 => Self::Unspecified,
+            1 => Self::PeerRequested,
+            2 => Self::Refused,
+            3 => Self::ModelDecided,
+            4 => Self::Timeout,
+            5 => Self::CaptureFailed,
+            6 => Self::CaptureStalled,
+            7 => Self::PeerHungUp,
+            8 => Self::BridgeIdle,
+            9 => Self::BridgePhaseChanged,
+            10 => Self::BridgeGone,
+            _ => return None,
+        })
+    }
+}
+
+/// 两条链路之间传"该结束了"的信号。
+type EndSignal = Arc<AtomicU8>;
+
+/// 请求结束本次会话。先到先得：已经有人要求过了就不覆盖，免得后到的原因把真实
+/// 原因盖掉（例如模型刚判断完该结束、采集链又报了一次音频中断）。
+fn request_end(signal: &AtomicU8, trigger: EndTrigger) {
+    let _ = signal.compare_exchange(NO_END, trigger.code(), Ordering::Relaxed, Ordering::Relaxed);
+}
+
+/// 读出当前的结束请求。
+fn requested_end(signal: &AtomicU8) -> Option<EndTrigger> {
+    match signal.load(Ordering::Relaxed) {
+        NO_END => None,
+        code => EndTrigger::from_code(code),
+    }
+}
 
 /// 回复链的工作项。
 enum Job {
@@ -117,7 +231,7 @@ pub(super) async fn run(
     // 对方要求挂断 / 通话到点收尾 / 名单外婉拒后，用它让采集链优雅收尾。
     // 会话收尾时如果电话还通着，再用桥的 `POST /v1/calls/hangup`
     // （AVSDK 控制方法，默认 cmd 10 = `Close`）真的挂断，不再只能等对方挂断。
-    let hangup_requested = Arc::new(AtomicBool::new(false));
+    let end_signal: EndSignal = Arc::new(AtomicU8::new(NO_END));
     let responder = kovi::tokio::spawn(respond(
         config.clone(),
         caller,
@@ -125,7 +239,7 @@ pub(super) async fn run(
         Arc::clone(&transcript),
         job_rx,
         interrupt_rx,
-        Arc::clone(&hangup_requested),
+        Arc::clone(&end_signal),
     ));
 
     let opening = if allowed {
@@ -140,7 +254,7 @@ pub(super) async fn run(
     }
     if !allowed {
         // 婉拒已经排在回复链里，采集链立即收尾；回复链会把这句话播完再退出。
-        hangup_requested.store(true, Ordering::Relaxed);
+        request_end(&end_signal, EndTrigger::Refused);
     }
 
     let started = Instant::now();
@@ -161,12 +275,9 @@ pub(super) async fn run(
         config.min_utterance_ms(),
         config.min_speech_ms(),
     );
-    let mut end_reason = "通话已结束";
+    let mut end_reason = EndTrigger::Unspecified;
     let mut bridge_failures: u32 = 0;
     let mut first_speech_seen = false;
-    // 电话是否还通着：只有桥报告阶段离开 connected，或者桥自己不可用了，
-    // 才不需要再挂断。
-    let mut bridge_live = true;
 
     let poll_every = Duration::from_millis(config.poll_interval_ms().max(50));
     let call_budget = Duration::from_secs(config.max_call_seconds());
@@ -179,16 +290,12 @@ pub(super) async fn run(
         // 采集一旦不吐数据，按"帧数"计算的检查就再也跑不到了。
         if last_poll.elapsed() >= poll_every {
             last_poll = Instant::now();
-            if hangup_requested.load(Ordering::Relaxed) {
-                end_reason = if allowed {
-                    "对方要求挂断"
-                } else {
-                    "名单外婉拒"
-                };
+            if let Some(trigger) = requested_end(&end_signal) {
+                end_reason = trigger;
                 break;
             }
             if started.elapsed() >= call_budget {
-                end_reason = "达到通话时长上限";
+                end_reason = EndTrigger::Timeout;
                 let farewell = config.farewell().trim().to_owned();
                 if !farewell.is_empty() {
                     // 到点先说一句道别，再结束会话并挂断这通电话。
@@ -200,12 +307,7 @@ pub(super) async fn run(
                 Ok(current) => {
                     bridge_failures = 0;
                     if current.phase() != CallPhase::Connected {
-                        end_reason = match current.phase() {
-                            CallPhase::Idle => "桥报告通话已空闲",
-                            CallPhase::Ended => "对方挂断",
-                            _ => "通话阶段已结束",
-                        };
-                        bridge_live = false;
+                        end_reason = EndTrigger::from_phase(current.phase());
                         println!("[INFO] QQ 通话桥阶段变为 {}", current.phase().as_str());
                         break;
                     }
@@ -214,8 +316,7 @@ pub(super) async fn run(
                     bridge_failures += 1;
                     // 单次抖动不足以结束通话；连续失败说明桥已经不在了。
                     if bridge_failures >= BRIDGE_FAILURE_LIMIT {
-                        end_reason = "通话桥不可用";
-                        bridge_live = false;
+                        end_reason = EndTrigger::BridgeGone;
                         eprintln!("[ERROR] QQ 通话桥连续不可用: {error}");
                         break;
                     }
@@ -230,7 +331,7 @@ pub(super) async fn run(
                     frame.to_vec()
                 }
                 Ok(Err(error)) => {
-                    end_reason = "通话音频中断";
+                    end_reason = EndTrigger::CaptureFailed;
                     eprintln!("[ERROR] QQ 通话采集结束: {error}");
                     break;
                 }
@@ -238,7 +339,7 @@ pub(super) async fn run(
                     // 只是这一小段时间没有整帧：不阻塞，回到循环顶部继续看桥。
                     stalled_polls += 1;
                     if stalled_polls >= CAPTURE_STALL_LIMIT {
-                        end_reason = "通话音频长时间无数据";
+                        end_reason = EndTrigger::CaptureStalled;
                         eprintln!(
                             "[WARN] QQ 通话采集连续 {} 次读不到数据，结束本次会话",
                             stalled_polls
@@ -284,32 +385,27 @@ pub(super) async fn run(
     drop(interrupt_tx);
     segmenter.reset();
 
-    // 会话已经收尾（道别/婉拒也已经播完）：如果电话还通着，就让桥真的挂断。
-    if bridge_live && config.hangup_enabled() {
-        match client
-            .hangup(config.hangup_method(), config.hangup_reason())
-            .await
-        {
-            Ok(()) => println!(
-                "[INFO] 已请通话桥挂断这通电话（AVSDK {}）",
-                config.hangup_method()
-            ),
+    // 会话已经收尾（道别/婉拒也已经播完）：如果这通电话还在，就让桥真的挂断。
+    if end_reason.needs_hangup() && config.hangup_enabled() {
+        match client.hangup().await {
+            Ok(()) => println!("[INFO] 已请通话桥挂断这通电话（AVSDK Close）"),
             Err(error) => eprintln!("[WARN] 请通话桥挂断失败: {error}"),
         }
     }
 
     println!(
-        "[INFO] QQ 语音通话结束（{end_reason}，时长 {} 秒）",
+        "[INFO] QQ 语音通话结束（{}，时长 {} 秒）",
+        end_reason.describe(),
         started.elapsed().as_secs()
     );
     // 让 `#通话状态` 能回看这一次的结果（尤其是"接通了但没进房"与时长）。
-    super::diagnostics::finish_call(end_reason, Some(started.elapsed()));
+    super::diagnostics::finish_call(end_reason.describe(), Some(started.elapsed()));
     let turns = transcript
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone();
     if allowed {
-        archive_call(config, caller, caller_name, &turns, end_reason).await;
+        archive_call(config, caller, caller_name, &turns, end_reason.describe()).await;
     }
     Ok(())
 }
@@ -322,7 +418,7 @@ async fn respond(
     transcript: Arc<Mutex<Vec<Turn>>>,
     mut jobs: mpsc::Receiver<Job>,
     mut interrupts: mpsc::Receiver<()>,
-    hangup_requested: Arc<AtomicBool>,
+    end_signal: EndSignal,
 ) {
     let context = match caller {
         Some(caller) => load_caller_context(caller).await,
@@ -351,7 +447,7 @@ async fn respond(
                 }
             }
             Job::Utterance(pcm) => {
-                if hangup_requested.load(Ordering::Relaxed) {
+                if requested_end(&end_signal).is_some() {
                     // 已经道别过了，剩下的尾音不再处理。
                     continue;
                 }
@@ -389,7 +485,7 @@ async fn respond(
                             Err(error) => eprintln!("[ERROR] QQ 通话道别播报失败: {error}"),
                         }
                     }
-                    hangup_requested.store(true, Ordering::Relaxed);
+                    request_end(&end_signal, EndTrigger::PeerRequested);
                     continue;
                 }
 
@@ -422,7 +518,7 @@ async fn respond(
                     // 模型判断对方要结束通话了（识别文本可能"挂了吧"听成"过了吧"，
                     // 关键词匹配不到，所以由她自己决定）：道别已经说完，收尾挂断。
                     println!("[INFO] QQ 通话模型判断该结束了，播报道别后收尾");
-                    hangup_requested.store(true, Ordering::Relaxed);
+                    request_end(&end_signal, EndTrigger::ModelDecided);
                 }
             }
         }
@@ -716,10 +812,57 @@ async fn archive_call(
 #[cfg(test)]
 mod tests {
     use super::{
-        Turn, build_messages, phone_system_prompt, sanitize_reply, strip_protocol_markers,
-        wants_hangup,
+        CallPhase, EndTrigger, NO_END, Turn, build_messages, phone_system_prompt, request_end,
+        requested_end, sanitize_reply, strip_protocol_markers, wants_hangup,
     };
     use crate::config::QqCallConfig;
+
+    #[test]
+    fn end_triggers_carry_their_own_reason_and_hangup_decision() {
+        use std::sync::atomic::AtomicU8;
+
+        assert_eq!(EndTrigger::PeerRequested.describe(), "对方要求挂断");
+        assert_eq!(EndTrigger::Refused.describe(), "名单外婉拒");
+        assert_eq!(EndTrigger::ModelDecided.describe(), "模型判断该结束");
+        assert_eq!(
+            EndTrigger::CaptureStalled.describe(),
+            "通话音频长时间无数据"
+        );
+        // 桥说电话已经不在的几种情况不需要我们再挂。
+        for trigger in [
+            EndTrigger::PeerHungUp,
+            EndTrigger::BridgeIdle,
+            EndTrigger::BridgePhaseChanged,
+            EndTrigger::BridgeGone,
+        ] {
+            assert!(!trigger.needs_hangup(), "{trigger:?} 不该再挂断");
+        }
+        for trigger in [
+            EndTrigger::PeerRequested,
+            EndTrigger::Refused,
+            EndTrigger::ModelDecided,
+            EndTrigger::Timeout,
+            EndTrigger::CaptureFailed,
+            EndTrigger::CaptureStalled,
+        ] {
+            assert!(trigger.needs_hangup(), "{trigger:?} 应该挂断");
+        }
+        assert_eq!(
+            EndTrigger::from_phase(CallPhase::Ended),
+            EndTrigger::PeerHungUp
+        );
+        assert_eq!(
+            EndTrigger::from_phase(CallPhase::Idle),
+            EndTrigger::BridgeIdle
+        );
+
+        // 信号先到先得：后来的原因不会盖掉先到的。
+        let signal = AtomicU8::new(NO_END);
+        assert_eq!(requested_end(&signal), None);
+        request_end(&signal, EndTrigger::ModelDecided);
+        request_end(&signal, EndTrigger::CaptureStalled);
+        assert_eq!(requested_end(&signal), Some(EndTrigger::ModelDecided));
+    }
 
     #[test]
     fn phone_prompt_teaches_the_hangup_marker() {

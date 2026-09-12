@@ -169,12 +169,13 @@ impl BridgeClient {
 
     /// 请桥主动挂断当前通话。
     ///
-    /// `method` 是 AVSDK 控制方法名（cmd 8 = `quit`、9 = `reject`、10 = `close`、
-    /// 11 = `clearRoom`）。实测只发 `quit` 只会让本端离开房间、服务器不销毁，
-    /// `close` 才会真的结束通话，所以默认用 `close`。桥侧把它记为
-    /// `state.call.hangup*`；调用成功只代表 AVSDK 接受了请求，通话是否真的结束
-    /// 以随后轮询到的阶段（`ended` + `endReason`）为准。
-    pub async fn hangup(&self, method: &str, reason: i64) -> anyhow::Result<()> {
+    /// 方法、房间号和原因都是实测出来的固定值，不开放成配置：AVSDK 的 `Close`
+    /// （cmd 10）+ `roomId=0` + 来电者 uid（由桥填）+ `reason=1`。真机逐通试过：
+    /// `Quit`(8)/`ClearRoom`(11) 挂不断，uid 留空或换成机器人自己则完全无效，
+    /// 详见 `docs/qq-call.md` 的「挂断参数实验」。桥侧把它记为 `state.call.hangup*`；
+    /// 请求成功只代表 AVSDK 收下了，通话是否真的结束以随后轮询到的阶段
+    /// （`ended` + `endReason`）为准。
+    pub async fn hangup(&self) -> anyhow::Result<()> {
         let response = self
             .http
             .post(&self.hangup_endpoint)
@@ -182,9 +183,7 @@ impl BridgeClient {
                 reqwest::header::AUTHORIZATION,
                 format!("Bearer {}", self.token),
             )
-            // `roomId` 固定 0：真机实测成功的那次就是 close + roomId=0 +
-            // 来电者 uid + reason=1（桥会落到当前会话上）。
-            .json(&serde_json::json!({ "method": method, "roomId": 0, "reason": reason }))
+            .json(&serde_json::json!({ "method": "close", "roomId": 0, "reason": 1 }))
             .timeout(self.timeout)
             .send()
             .await
