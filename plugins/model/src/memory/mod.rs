@@ -8,6 +8,12 @@
 //! - 机器人人格状态维护
 //! - 自动记忆清理和优化
 
+mod embedding;
+mod fusion;
+
+pub(crate) use embedding::{EmbeddingClient, cosine, vector_from_bytes, vector_to_bytes};
+pub(crate) use fusion::{FusionStrategy, fuse};
+
 use anyhow::Result;
 use chrono::{DateTime, Duration as ChronoDuration, Local, Utc};
 use kovi::tokio::sync::{Mutex, OwnedMutexGuard};
@@ -871,6 +877,30 @@ impl MemoryManager {
         .execute(pool)
         .await
         .map_err(|error| anyhow::anyhow!("创建记忆明细表失败: {}", error))?;
+        // 记忆向量表：与记忆明细分表，向量换模型时可以整表重算而不动记忆本身。
+        // 不引 pgvector——线上 PG 没装它，而这点数据量（千级）暴力余弦足够；
+        // 真到了十万级再谈索引，那时也该先看召回质量值不值得。
+        query(
+            r#"
+            CREATE TABLE IF NOT EXISTS kovi_bot_memory_embeddings (
+                memory_id TEXT PRIMARY KEY REFERENCES kovi_bot_memories(id) ON DELETE CASCADE,
+                model TEXT NOT NULL,
+                dim INTEGER NOT NULL,
+                vector BYTEA NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            "#,
+        )
+        .execute(pool)
+        .await
+        .map_err(|error| anyhow::anyhow!("创建记忆向量表失败: {}", error))?;
+        query(
+            "CREATE INDEX IF NOT EXISTS kovi_bot_memory_embeddings_model_idx ON kovi_bot_memory_embeddings (model)",
+        )
+        .execute(pool)
+        .await
+        .map_err(|error| anyhow::anyhow!("创建记忆向量表索引失败: {}", error))?;
+
         // 非破坏式迁移：旧部署没有 scope_type 时补列，并按受控 context 映射回填。
         query(
             "ALTER TABLE kovi_bot_memories ADD COLUMN IF NOT EXISTS scope_type TEXT CHECK (scope_type IN ('private', 'group') OR scope_type IS NULL)",
@@ -1947,10 +1977,16 @@ impl MemoryManager {
             let rows = kovi::tokio::time::timeout(Duration::from_secs(2), fetch)
                 .await
                 .map_err(|_| anyhow::anyhow!("自主记忆查询超时"))??;
-            return rows
+            let lexical: Vec<MemoryEntry> = rows
                 .into_iter()
                 .map(|row| serde_json::from_value(row.get("payload")).map_err(Into::into))
-                .collect();
+                .collect::<Result<Vec<MemoryEntry>>>()?;
+            // 语义那一路与词面融合。三处 fail-soft：
+            // 服务没起来 / 超时 / 这条记忆还没回填向量——任一情况都退回纯词面，
+            // 也就是"嵌入服务挂了，她的检索退化到今天的水平，而不是整个失灵"。
+            return Ok(self
+                .fuse_with_semantic(subject_id, context, &lookup, lexical)
+                .await);
         }
 
         let since_local = lookup
@@ -2599,6 +2635,236 @@ impl MemoryManager {
     }
 
     /// 主动执行去重、过期清理和持久化，供后台维护任务调用。
+    /// 把语义那一路并进词面结果。
+    ///
+    /// 融合用 **interleave**（不是 RRF）：RRF 按各路倒数名次之和打分，会把"只在语义
+    /// 这一路排第一、别路都缺席"的结果平均下去——那正是我们要保住的东西（词面完全
+    /// 不重叠、但语义确实相关的记忆）。Hindsight 在 `interleave_fusion` 的 docstring
+    /// 里记下了他们踩过的同款坑：该被合并的"孪生"观测被 RRF 压到召回预算之下，
+    /// 模型根本看不到它，于是造了个重复的。
+    ///
+    /// 语义失败时原样返回词面结果：**不因为一个新依赖而让主链路退化**。
+    async fn fuse_with_semantic(
+        &self,
+        subject_id: i64,
+        context: &str,
+        lookup: &MemoryLookup,
+        lexical: Vec<MemoryEntry>,
+    ) -> Vec<MemoryEntry> {
+        let Some(client) = EmbeddingClient::from_config() else {
+            return lexical;
+        };
+        let limit = lexical.len().max(lookup.limit);
+        if limit == 0 {
+            return lexical;
+        }
+        let query_text = lookup.keywords.join(" ");
+        let semantic_ids = match self
+            .semantic_memory_ids(&client, subject_id, context, &query_text, limit)
+            .await
+        {
+            Ok(ids) => ids,
+            Err(error) => {
+                // 只记一条警告：检索是每轮都走的路，不能因为 sidecar 抖动刷屏。
+                eprintln!("[WARN] 语义检索不可用，退回词面: {error}");
+                return lexical;
+            }
+        };
+        if semantic_ids.is_empty() {
+            return lexical;
+        }
+        let lexical_ids: Vec<String> = lexical.iter().map(|entry| entry.id.clone()).collect();
+        let fused = fuse(
+            &[semantic_ids, lexical_ids],
+            FusionStrategy::Interleave,
+            limit,
+        );
+        // 语义那一路可能带出不在词面结果里的记忆；按融合顺序重排，缺的补在最后
+        // ——补不进来的（已过期、已删）就自然不在结果里。
+        let mut by_id: std::collections::HashMap<String, MemoryEntry> = lexical
+            .into_iter()
+            .map(|entry| (entry.id.clone(), entry))
+            .collect();
+        let mut ordered = Vec::with_capacity(fused.len());
+        for id in fused {
+            if let Some(entry) = by_id.remove(&id) {
+                ordered.push(entry);
+            }
+        }
+        ordered.extend(by_id.into_values());
+        ordered
+    }
+
+    /// 回填缺失的记忆向量。后台维护调用，一次最多 `embedding_backfill_batch` 条，
+    /// 免得维护任务卡在一次巨大的编码上。
+    ///
+    /// 为什么要有回填：向量是这个功能上线**之后**才有的，既有记忆一条都没有向量。
+    /// 不回填的话，语义那一路只能看见新记忆——那等于"回忆起的东西取决于她记下它的
+    /// 时间"，是最难发现的一类静默偏差。
+    pub async fn backfill_embeddings(&self) -> Result<usize> {
+        let Some(client) = EmbeddingClient::from_config() else {
+            return Ok(0);
+        };
+        let Some(pool) = self.database_pool.get() else {
+            return Ok(0);
+        };
+        let batch = crate::config::get().memory().embedding_backfill_batch() as i64;
+        let model = client.model().to_string();
+        // 只挑"这条记忆还没有当前模型的向量"的，换模型后自然重算。
+        let rows = query(
+            r#"
+            SELECT m.id, COALESCE(m.payload->>'content', '')
+            FROM kovi_bot_memories m
+            LEFT JOIN kovi_bot_memory_embeddings e
+              ON e.memory_id = m.id AND e.model = $2
+            WHERE e.memory_id IS NULL
+              AND COALESCE(m.payload->>'content', '') <> ''
+            ORDER BY m.occurred_at DESC
+            LIMIT $1
+            "#,
+        )
+        .bind(batch)
+        .bind(&model)
+        .fetch_all(pool)
+        .await
+        .map_err(|error| anyhow::anyhow!("查询待回填记忆失败: {error}"))?;
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        let items: Vec<(String, String)> = rows
+            .iter()
+            .map(|row| (row.get::<String, _>("id"), row.get::<String, _>(1)))
+            .collect();
+        let texts: Vec<String> = items.iter().map(|(_, content)| content.clone()).collect();
+        let vectors = client.embed(&texts, false).await?;
+        if vectors.len() != items.len() {
+            return Err(anyhow::anyhow!(
+                "回填：请求 {} 段却拿到 {} 条向量",
+                items.len(),
+                vectors.len()
+            ));
+        }
+        let saved = self
+            .save_memory_embeddings(&model, &items, &vectors)
+            .await?;
+        println!("[INFO] 记忆向量回填 {saved} 条（模型 {model}）");
+        Ok(saved)
+    }
+
+    /// 写入记忆向量。冲突就更新——同一条记忆换了模型重算时走这条路。
+    async fn save_memory_embeddings(
+        &self,
+        model: &str,
+        items: &[(String, String)],
+        vectors: &[Vec<f32>],
+    ) -> Result<usize> {
+        let Some(pool) = self.database_pool.get() else {
+            return Ok(0);
+        };
+        let mut transaction = pool.begin().await?;
+        let mut saved = 0_usize;
+        for ((memory_id, _), vector) in items.iter().zip(vectors.iter()) {
+            if vector.is_empty() {
+                continue;
+            }
+            let bytes = vector_to_bytes(vector);
+            query(
+                r#"
+                INSERT INTO kovi_bot_memory_embeddings (memory_id, model, dim, vector, updated_at)
+                VALUES ($1, $2, $3, $4, NOW())
+                ON CONFLICT (memory_id) DO UPDATE
+                SET model = EXCLUDED.model,
+                    dim = EXCLUDED.dim,
+                    vector = EXCLUDED.vector,
+                    updated_at = NOW()
+                "#,
+            )
+            .bind(memory_id)
+            .bind(model)
+            .bind(vector.len() as i32)
+            .bind(&bytes)
+            .execute(&mut *transaction)
+            .await?;
+            saved += 1;
+        }
+        transaction.commit().await?;
+        Ok(saved)
+    }
+
+    /// 语义那一路：把候选记忆的向量取出来算余弦，返回按相似度排序的记忆 id。
+    ///
+    /// 作用域过滤与词面那一路一致（subject + context/scope），免得语义检索越过
+    /// 用户与群的边界——那是隐私问题，不是排序问题。
+    pub(crate) async fn semantic_memory_ids(
+        &self,
+        client: &EmbeddingClient,
+        subject_id: i64,
+        context: &str,
+        query_text: &str,
+        limit: usize,
+    ) -> Result<Vec<String>> {
+        let Some(pool) = self.database_pool.get() else {
+            return Ok(Vec::new());
+        };
+        if query_text.trim().is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let requested_scope = ConversationScope::parse(context);
+        let requested_context = requested_scope
+            .map(ConversationScope::database_value)
+            .unwrap_or(context)
+            .to_string();
+        let rows = query(
+            r#"
+            SELECT e.memory_id, e.vector
+            FROM kovi_bot_memory_embeddings e
+            JOIN kovi_bot_memories m ON m.id = e.memory_id
+            WHERE m.subject_id = $1
+              AND CASE
+                    WHEN $2 IN ('private', 'group') THEN m.scope_type = $2
+                    ELSE m.context = $2
+                  END
+              AND e.model = $3
+            "#,
+        )
+        .bind(subject_id)
+        .bind(&requested_context)
+        .bind(client.model())
+        .fetch_all(pool)
+        .await
+        .map_err(|error| anyhow::anyhow!("读取记忆向量失败: {error}"))?;
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        let query_vector = client
+            .embed(std::slice::from_ref(&query_text.to_string()), true)
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("嵌入服务没有返回查询向量"))?;
+        let mut scored: Vec<(String, f32)> = rows
+            .iter()
+            .filter_map(|row| {
+                let memory_id: String = row.get("memory_id");
+                let bytes: Vec<u8> = row.get("vector");
+                let vector = vector_from_bytes(&bytes)?;
+                Some((memory_id, cosine(&query_vector, &vector)))
+            })
+            .collect();
+        // 分数相同按 id 排，保证结果确定。
+        scored.sort_by(|left, right| {
+            right
+                .1
+                .total_cmp(&left.1)
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        Ok(scored
+            .into_iter()
+            .take(limit)
+            .map(|(memory_id, _)| memory_id)
+            .collect())
+    }
+
     pub async fn compact_memories(&self) -> Result<()> {
         let _save_guard = self.save_lock.lock().await;
         let mut data = self.snapshot().await;

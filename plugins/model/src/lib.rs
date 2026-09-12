@@ -739,6 +739,12 @@ async fn main() {
                 if let Err(error) = maintenance_memory_manager.compact_memories().await {
                     eprintln!("[ERROR] 定期记忆清理失败: {}", error);
                 }
+                // 记忆向量回填：这一步是"新增了向量之后，老记忆也看得见"的保证。
+                // 不回填的话，语义那一路只认新记忆——那等于"想起什么取决于她什么时候
+                // 记下的"，是最难发现的静默偏差。
+                if let Err(error) = maintenance_memory_manager.backfill_embeddings().await {
+                    eprintln!("[ERROR] 记忆向量回填失败: {error}");
+                }
                 if let Some(store) = yunxi::memory_store() {
                     match store.cleanup(chrono::Utc::now()).await {
                         Ok(removed) if removed > 0 => {

@@ -3,6 +3,16 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 #[serde(default)]
 pub struct MemoryConfig {
+    /// 本机嵌入服务开关（默认开）。关掉或服务不可用时，记忆检索退回纯词面。
+    embedding_enabled: bool,
+    /// 嵌入服务地址（只监听回环）。
+    embedding_url: String,
+    /// 嵌入模型名，随向量一起存，换模型时据此让旧向量失效。
+    embedding_model: String,
+    /// 单次嵌入请求超时（秒）。
+    embedding_timeout_secs: u64,
+    /// 一轮维护最多回填多少条记忆的向量（避免维护任务卡住）。
+    embedding_backfill_batch: usize,
     /// **失控保护，不是管理手段。**
     ///
     /// 以前它是 1000，于是"记不记得住"由"数到第 1000 条"决定：两张记忆表都按
@@ -46,6 +56,26 @@ pub struct MemoryConfig {
 }
 
 impl MemoryConfig {
+    pub fn embedding_enabled(&self) -> bool {
+        self.embedding_enabled
+    }
+
+    pub fn embedding_url(&self) -> &str {
+        &self.embedding_url
+    }
+
+    pub fn embedding_model(&self) -> &str {
+        &self.embedding_model
+    }
+
+    pub fn embedding_timeout_secs(&self) -> u64 {
+        self.embedding_timeout_secs.max(1)
+    }
+
+    pub fn embedding_backfill_batch(&self) -> usize {
+        self.embedding_backfill_batch.max(1)
+    }
+
     pub fn max_entries(&self) -> usize {
         self.max_entries
     }
@@ -214,6 +244,11 @@ impl MemoryConfig {
 impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
+            embedding_enabled: true,
+            embedding_url: "http://127.0.0.1:6112".to_string(),
+            embedding_model: "bge-small-zh-v1.5".to_string(),
+            embedding_timeout_secs: 20,
+            embedding_backfill_batch: 128,
             max_entries: 50_000,
             retention_days: 30,
             episode_retention_days: 365,
