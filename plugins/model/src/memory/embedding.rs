@@ -57,6 +57,16 @@ impl EmbeddingClient {
         })
     }
 
+    /// 指定端点的构造，供测试用进程内假服务替掉真实 sidecar。
+    #[cfg(test)]
+    pub(crate) fn with_endpoint(endpoint: &str, model: &str) -> Self {
+        Self {
+            endpoint: endpoint.trim_end_matches('/').to_string(),
+            model: model.to_string(),
+            timeout: Duration::from_secs(5),
+        }
+    }
+
     pub(crate) fn model(&self) -> &str {
         &self.model
     }
@@ -217,6 +227,107 @@ pub(crate) fn vector_from_bytes(bytes: &[u8]) -> Option<Vec<f32>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    /// 进程内假服务：**接缝要测在边界上**。
+    ///
+    /// 今天所有真 bug 都出在接缝（协议没进提示词、深反从未触发、缺分支、闸门槛、
+    /// belief_id 漏填），而"Rust 客户端 ↔ 嵌入服务"这条 HTTP 边界同样是接缝——
+    /// 真机上它只在部署后才被踩到。这里用一个最小 HTTP 服务把它钉住：
+    /// 响应格式、分批、条数对不上、503 降级，全都不用等真机。
+    fn spawn_fake_service(responses: Vec<(u16, String)>) -> (String, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("addr");
+        let handle = std::thread::spawn(move || {
+            for (status, body) in responses {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut buffer = [0_u8; 8192];
+                let _ = stream.read(&mut buffer);
+                let response = format!(
+                    "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        (format!("http://{address}"), handle)
+    }
+
+    fn runtime() -> kovi::tokio::runtime::Runtime {
+        kovi::tokio::runtime::Runtime::new().expect("test runtime")
+    }
+
+    #[test]
+    fn embed_client_parses_a_well_formed_service_response() {
+        let (endpoint, handle) = spawn_fake_service(vec![(
+            200,
+            r#"{"vectors":[[0.1,0.2],[0.3,0.4]],"dim":2}"#.into(),
+        )]);
+        runtime().block_on(async {
+            let client = EmbeddingClient::with_endpoint(&endpoint, "fake");
+            let vectors = client
+                .embed(&["一".to_string(), "二".to_string()], false)
+                .await
+                .expect("应能解析");
+            assert_eq!(vectors.len(), 2);
+            assert!((vectors[0][0] - 0.1).abs() < 1e-6);
+        });
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn embed_client_rejects_a_short_response_instead_of_misaligning() {
+        // 返回条数少于请求条数是最危险的一种"成功"：如果照单全收，后面按位置
+        // 对齐的向量会整体错位，而没有任何报错。必须当失败处理。
+        let (endpoint, handle) =
+            spawn_fake_service(vec![(200, r#"{"vectors":[[0.1,0.2]]}"#.into())]);
+        runtime().block_on(async {
+            let client = EmbeddingClient::with_endpoint(&endpoint, "fake");
+            let error = client
+                .embed(&["一".to_string(), "二".to_string()], false)
+                .await
+                .expect_err("条数对不上应当报错");
+            assert!(error.to_string().contains("请求了 2 段"), "实际: {error}");
+        });
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn rerank_client_falls_back_when_the_service_lacks_a_reranker() {
+        // 503 = 没装重排器。调用方据此保持融合顺序，绝不能因此让检索失败。
+        let (endpoint, handle) =
+            spawn_fake_service(vec![(503, r#"{"ok":false,"error":"重排器未安装"}"#.into())]);
+        runtime().block_on(async {
+            let client = EmbeddingClient::with_endpoint(&endpoint, "fake");
+            assert!(client.rerank("查询", &["甲".to_string()]).await.is_err());
+        });
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn rerank_client_returns_the_service_order_as_indices() {
+        let (endpoint, handle) = spawn_fake_service(vec![(
+            200,
+            r#"{"results":[{"index":2,"score":0.9},{"index":0,"score":0.4},{"index":1,"score":0.1}]}"#
+                .into(),
+        )]);
+        runtime().block_on(async {
+            let client = EmbeddingClient::with_endpoint(&endpoint, "fake");
+            let ranked = client
+                .rerank(
+                    "查询",
+                    &["甲".to_string(), "乙".to_string(), "丙".to_string()],
+                )
+                .await
+                .expect("应能解析");
+            assert_eq!(ranked, vec![2, 0, 1], "必须原样返回服务给的顺序");
+        });
+        let _ = handle.join();
+    }
 
     #[test]
     fn cosine_matches_hand_computed_values() {
