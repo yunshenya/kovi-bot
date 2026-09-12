@@ -2262,7 +2262,13 @@ pub(crate) async fn params_model_with_native_tools(
     } else {
         None
     };
-    if server_config.requires_auth() && token.is_none() {
+    // 替身在场时请求不会出网，缺密钥无所谓。这样 seam 测试既能覆盖提示词组装，
+    // 又不必在测试进程里塞真密钥。
+    #[cfg(test)]
+    let tokenless_request_ok = super::llm_mock::is_installed();
+    #[cfg(not(test))]
+    let tokenless_request_ok = false;
+    if server_config.requires_auth() && token.is_none() && !tokenless_request_ok {
         return ModelPayload::failure(&format!(
             "未设置 {}，暂时无法调用对话模型",
             server_config.api_key_env()
@@ -2453,7 +2459,11 @@ async fn params_model_with_token_limit_and_progress_for_reply_mode_inner(
     } else {
         None
     };
-    if server_config.requires_auth() && token.is_none() {
+    #[cfg(test)]
+    let tokenless_request_ok = super::llm_mock::is_installed();
+    #[cfg(not(test))]
+    let tokenless_request_ok = false;
+    if server_config.requires_auth() && token.is_none() && !tokenless_request_ok {
         return model_error(&format!(
             "未设置 {}，暂时无法调用对话模型",
             server_config.api_key_env()
@@ -2525,6 +2535,17 @@ async fn round_trip_model_request(
     progress: Option<&ThinkingReporter>,
     queue_wait_ms: u128,
 ) -> Result<ModelPayload, String> {
+    // 测试替身：装了就用它，不走网络。放在最前面，连重试逻辑一起跳过——
+    // seam 测试要的是"管道跑通没有"，不是重试策略。
+    #[cfg(test)]
+    if let Some(content) = super::llm_mock::take_response(request_body) {
+        return Ok(ModelPayload {
+            content,
+            tool_calls: Vec::new(),
+            finish_reason: Some("stop".to_string()),
+        });
+    }
+
     let mut last_error = String::new();
     let mut payload_response = None;
     let attempt_started_total = Instant::now();
@@ -4356,6 +4377,35 @@ mod tests {
         should_repair_empty_reply, tool_result_wire, with_reference_context,
     };
     use super::{is_group_paused, set_group_paused};
+
+    #[test]
+    fn mock_model_replaces_the_network_call() {
+        // 替身自己也要有测试：它要是没生效，所有 seam 测试都会偷偷去打真网络——
+        // 那比没有测试更糟（不确定、还烧钱）。
+        let executor = kovi::tokio::runtime::Runtime::new().expect("test runtime");
+        executor.block_on(async {
+            let mut messages = vec![BotMemory {
+                role: Roles::User,
+                content: "你好".to_string(),
+            }];
+            let response = crate::model::llm_mock::with_mock_model(
+                "self-check",
+                |_| "替身回复".to_string(),
+                async {
+                    super::params_model_with_plain_style_context(
+                        &mut messages,
+                        Some(32),
+                        &[],
+                        None,
+                        None,
+                    )
+                    .await
+                },
+            )
+            .await;
+            assert_eq!(response.content, "替身回复", "替身必须替掉真实 HTTP 调用");
+        });
+    }
 
     #[test]
     fn private_only_commands_are_recognised_so_groups_can_drop_them() {

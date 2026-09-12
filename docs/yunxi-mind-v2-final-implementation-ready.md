@@ -1149,6 +1149,43 @@ Hindsight 把可观测性做成一等公民（`llm_trace.py` 27KB、`prompt_prev
 
 ---
 
+# 17.4 seam 黑盒测试与模型替身（2026-09-12，借鉴 Hindsight 的 MockLLM + system-tests）
+
+Hindsight 的 CLAUDE.md 里写着：**用户可见的能力必须配一条黑盒故事**，真跑一遍管道，
+因为"~500 个测试文件结构上覆盖不到的就是接缝——consolidation 把它脚下的证据擦掉、
+或者一次 transfer 丢掉了 evidence"。他们还强调大部分测试靠 **MockLLM** 才做得到确定性。
+
+芸汐补上了对应的两件：
+
+1. **模型替身**（`model/llm_mock.rs`）：`with_mock_model(label, responder, body)`，
+   进程级安装、成对装卸、用全局锁串行化（测试并行跑）。挂在
+   `round_trip_model_request` —— 也就是**最后一次 HTTP 之前**，所以 seam 测试仍然
+   覆盖提示词组装；「替身在场时不需要 API 密钥」是配套改动，否则测试进程得塞真密钥。
+   替身自身也有测试（`mock_model_replaces_the_network_call`）——它要是没生效，
+   所有 seam 测试都会偷偷去打真网络，那比没有测试更糟。
+2. **接缝测试**（`stance_formation_seam_stores_a_stance_end_to_end` 等）：
+   真跑"反思 → 模型 → consolidation → 落库 → 查得到"，不再只测纯函数。
+
+## 它立刻抓到一个真 bug
+
+`stance_dedup_seam_folds_a_restatement_instead_of_duplicating` 第一次跑就炸：
+
+```
+立场形成不该失败: proposal is invalid: belief update requires an existing belief id
+```
+
+`Reinforce`/`Contradict`/`Retract` 三种操作**必须**带 `belief_id`
+（`BeliefUpdateProposal::validate` 的第一条），而 `stance_update()` 一律填 `None`。
+也就是说：**去重、被挑战、改主意这三条路全是坏的**——一旦真的触发，整份提案会被
+校验拒掉（连同一批的 episodes 一起陪葬）。之前的单测只覆盖了纯映射，从没走到校验
+那一步，所以全部是绿的。
+
+修完并加 `updates_targeting_an_existing_stance_carry_its_id_and_version` 钉死。
+
+**这正是"接缝测试"存在的理由**：单元测试证明每段都对，接缝测试证明它们连起来也对。
+
+---
+
 # 18. PreferenceState
 
 ## 18.1 目标

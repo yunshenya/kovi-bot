@@ -5,6 +5,8 @@ mod conversation_state;
 mod gag_commands;
 mod group;
 mod interrupt;
+#[cfg(test)]
+pub(crate) mod llm_mock;
 pub(crate) mod llm_trace;
 mod memory_query;
 mod memory_repository;

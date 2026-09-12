@@ -3173,7 +3173,6 @@ fn stance_updates(
     now: DateTime<Utc>,
     duplicates: &std::collections::HashMap<usize, String>,
 ) -> Vec<BeliefUpdateProposal> {
-    let _ = existing;
     let mut updates = Vec::new();
     for (index, candidate) in candidates.iter().enumerate() {
         let resolve = |target: &Option<String>| -> Option<&Belief> {
@@ -3196,16 +3195,19 @@ fn stance_updates(
                 }
                 // 去重：聚焦检查判定"这是同一个看法"时，折成对已有那条的强化，
                 // 而不是新占一格——靠合并控制数量，而不是靠上限（Hindsight 的做法）。
-                if let Some(duplicate) = duplicates.get(&index) {
+                if let Some(duplicate) = duplicates.get(&index)
+                    && let Some(target) = find_stance(existing, duplicate)
+                {
                     println!(
                         "[INFO] 立场形成：查重判定为同一看法，折成强化而非新增（{}）",
                         candidate_preview(duplicate)
                     );
                     updates.push(stance_update(
                         BeliefOperation::Reinforce,
-                        duplicate.clone(),
+                        target.proposition().to_string(),
                         delta,
                         stance_evidence(events, EvidencePolarity::Supports),
+                        Some(target),
                     ));
                     continue;
                 }
@@ -3214,6 +3216,7 @@ fn stance_updates(
                     candidate.proposition.clone(),
                     delta,
                     stance_evidence(events, EvidencePolarity::Supports),
+                    None,
                 ));
             }
             StanceKind::Reinforce | StanceKind::Challenge => {
@@ -3239,6 +3242,7 @@ fn stance_updates(
                     belief.proposition().to_string(),
                     delta,
                     stance_evidence(events, polarity),
+                    Some(belief),
                 ));
             }
             StanceKind::Change => {
@@ -3263,6 +3267,7 @@ fn stance_updates(
                     belief.proposition().to_string(),
                     delta,
                     stance_evidence(events, EvidencePolarity::Contradicts),
+                    Some(belief),
                 );
                 // 改主意之后旧的那条要真正退休，否则它永远挂在 active 列表里、
                 // 白占一格（belief 原来只增不减）。
@@ -3273,11 +3278,20 @@ fn stance_updates(
                     candidate.proposition.clone(),
                     delta,
                     stance_evidence(events, EvidencePolarity::Supports),
+                    None,
                 ));
             }
         }
     }
     updates
+}
+
+/// 按归一化键在已有立场里找回目标（用于给提案补上 `belief_id`）。
+fn find_stance<'a>(existing: &'a [Belief], proposition: &str) -> Option<&'a Belief> {
+    let key = yunxi_core::normalized_key(proposition);
+    existing.iter().find(|belief| {
+        belief.proposition_key() == key || yunxi_core::normalized_key(belief.proposition()) == key
+    })
 }
 
 /// 找一条"和这句是同一个看法"的已有立场。
@@ -3305,11 +3319,16 @@ fn stance_update(
     proposition: String,
     confidence_delta: f32,
     evidence_refs: Vec<EvidenceRef>,
+    target: Option<&Belief>,
 ) -> BeliefUpdateProposal {
+    // 关键：`Reinforce`/`Contradict`/`Retract` **必须**带 `belief_id`
+    // （`BeliefUpdateProposal::validate` 的第一条就是它）。少了它，整份提案会被
+    // 校验拒掉——而这件事只有跑到 consolidation 那一步才会暴露，纯函数的单测
+    // 结构上测不到。`expected_version` 顺带做乐观并发。
     BeliefUpdateProposal {
         operation,
-        belief_id: None,
-        expected_version: None,
+        belief_id: target.map(Belief::id),
+        expected_version: target.map(Belief::version),
         scope: MindScope::Global,
         proposition,
         confidence_delta,
@@ -3651,6 +3670,141 @@ mod tests {
         assert!(updates[1].proposition.contains("以前我"));
     }
 
+    fn reflection_input_with_events(events: usize) -> ReflectionInput {
+        ReflectionInput {
+            trigger: ReflectionTrigger::Idle,
+            depth: ReflectionDepth::Light,
+            scope: MindScope::Global,
+            recent_events: (0..events)
+                .map(|index| ReflectionEvent {
+                    event_id: EventId::new(),
+                    scope: MindScope::Global,
+                    summary: format!("第 {index} 段经历"),
+                    salience: 0.6,
+                    occurred_at: Utc::now(),
+                })
+                .collect(),
+            salient_memories: Vec::new(),
+            open_loop_summaries: Vec::new(),
+            goal_summaries: Vec::new(),
+            mind: MindSnapshot::empty(),
+            requested_at: Utc::now(),
+            trace: TraceContext::root(EventId::new()),
+        }
+    }
+
+    /// seam 测试：反思 → 模型 → consolidation → 落库，整条走一遍。
+    ///
+    /// 为什么要它：立场层曾经"接通了"却一行都没产出，而当时的单测全是纯函数
+    /// （解析、校验、映射）——**接缝上没有任何测试**，所以整条静默了都不知道。
+    /// 这条测试覆盖的正是那段接缝。
+    #[test]
+    fn stance_formation_seam_stores_a_stance_end_to_end() {
+        let executor = kovi::tokio::runtime::Runtime::new().expect("test runtime");
+        executor.block_on(async {
+            let (runtime, store) = test_runtime();
+            let input = reflection_input_with_events(4);
+
+            let formed = crate::model::llm_mock::with_mock_model(
+                "stance-formation-seam",
+                |_| {
+                    r#"[{"kind":"form","proposition":"我认为慢一点更好","confidence_milli":150}]"#
+                        .to_string()
+                },
+                async { runtime.form_stances(&input).await },
+            )
+            .await
+            .expect("立场形成不该失败");
+            assert!(formed, "应当真的调了模型");
+
+            let beliefs = yunxi_core::BeliefStore::relevant(
+                store.as_ref(),
+                &[MindScope::Global],
+                "",
+                Utc::now(),
+                8,
+            )
+            .await
+            .expect("查询立场");
+            assert_eq!(beliefs.len(), 1, "接缝跑通就该落库一条");
+            assert_eq!(beliefs[0].proposition(), "我认为慢一点更好");
+            assert!(beliefs[0].confidence() > 0.5, "新立场置信度应当高于基线");
+            assert_eq!(
+                beliefs[0].evidence_refs().len(),
+                MAX_STANCE_EVIDENCE,
+                "经历要成为这条立场的证据"
+            );
+        });
+    }
+
+    /// seam 测试：查重接缝——模型说"这是同一个看法"时，不该多出一条。
+    ///
+    /// 这条覆盖今天踩过的另一个坑：词面相似度分不开"重述"与"反义"（0.57 同义、
+    /// 0.71 反义），所以判决必须来自读全文的聚焦检查。测试让替身按提示词内容分流，
+    /// 真正走一遍"预筛 → 聚焦检查 → 折成强化"的两轮调用。
+    #[test]
+    fn stance_dedup_seam_folds_a_restatement_instead_of_duplicating() {
+        let executor = kovi::tokio::runtime::Runtime::new().expect("test runtime");
+        executor.block_on(async {
+            let (runtime, store) = test_runtime();
+            // 先放一条已存在的立场。
+            let existing = Belief::new(
+                BeliefId::new(),
+                MindScope::Global,
+                "我认为慢一点更好",
+                0.6,
+                0.3,
+                BeliefSource::Reflection,
+                Vec::new(),
+                None,
+                Utc::now(),
+            )
+            .expect("已存在的立场");
+            yunxi_core::BeliefStore::put(store.as_ref(), &existing, None)
+                .await
+                .expect("写入已存在的立场");
+
+            let input = reflection_input_with_events(3);
+            crate::model::llm_mock::with_mock_model(
+                "stance-dedup-seam",
+                |request| {
+                    // 聚焦检查的提示词里有"同一个看法"这句；按内容分流，
+                    // 这样一次替身能覆盖两轮不同的调用。
+                    if request.to_string().contains("同一个看法") {
+                        "same".to_string()
+                    } else {
+                        r#"[{"kind":"form","proposition":"我觉得慢一点更好","confidence_milli":100}]"#
+                            .to_string()
+                    }
+                },
+                async { runtime.form_stances(&input).await },
+            )
+            .await
+            .expect("立场形成不该失败");
+
+            let beliefs = yunxi_core::BeliefStore::relevant(
+                store.as_ref(),
+                &[MindScope::Global],
+                "",
+                Utc::now(),
+                8,
+            )
+            .await
+            .expect("查询立场");
+            assert_eq!(
+                beliefs.len(),
+                1,
+                "同一条看法换个说法不该新占一格——那会把她的立场摊薄"
+            );
+            assert_eq!(beliefs[0].proposition(), "我认为慢一点更好", "落在已有那条上");
+            assert!(
+                beliefs[0].confidence() > 0.6,
+                "折成强化应当抬高置信度，实际 {}",
+                beliefs[0].confidence()
+            );
+        });
+    }
+
     #[test]
     fn stance_formation_is_gated_by_time_not_by_reflection_depth() {
         // 线上实测：6 小时 63 次反思**全是 Light**，深度反思一次都没触发过。
@@ -3750,6 +3904,37 @@ mod tests {
         );
         assert_eq!(updates[0].operation, BeliefOperation::Upsert);
         assert_eq!(updates[0].proposition, "我觉得慢一点更好");
+    }
+
+    #[test]
+    fn updates_targeting_an_existing_stance_carry_its_id_and_version() {
+        // seam 测试抓到的真 bug：Reinforce/Contradict/Retract 漏了 `belief_id`，
+        // 会被 `BeliefUpdateProposal::validate` 拒掉——而这只在跑到 consolidation
+        // 那一步才暴露，纯映射的单测结构上测不到。这条把它钉死。
+        let existing = vec![test_stance("诚实比迎合更重要")];
+        let updates = stance_updates(
+            &parse_stance_candidates(
+                r#"[{"kind":"challenge","target":"诚实比迎合更重要"},{"kind":"form","proposition":"我认为慢一点更好"}]"#,
+            ),
+            &existing,
+            &[],
+            Utc::now(),
+            &std::collections::HashMap::new(),
+        );
+        let challenge = &updates[0];
+        assert_eq!(challenge.operation, BeliefOperation::Contradict);
+        assert!(
+            challenge.belief_id.is_some(),
+            "打向已有立场必须带 belief_id"
+        );
+        assert!(
+            challenge.expected_version.is_some(),
+            "带上 version 才能做乐观并发"
+        );
+        // 新立场用 Upsert + 按命题键认领，不带 id 才对。
+        let form = &updates[1];
+        assert_eq!(form.operation, BeliefOperation::Upsert);
+        assert!(form.belief_id.is_none());
     }
 
     #[test]
