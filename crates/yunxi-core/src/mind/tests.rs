@@ -636,6 +636,76 @@ fn belief_updates_clamp_and_track_contradictions() {
     assert_eq!(updated.contradiction_count(), 1);
 }
 
+fn stance_proposal(
+    operation: BeliefOperation,
+    confidence_delta: f32,
+    stability_delta: f32,
+) -> BeliefUpdateProposal {
+    BeliefUpdateProposal {
+        operation,
+        belief_id: None,
+        expected_version: None,
+        scope: MindScope::Global,
+        proposition: "诚实比迎合更重要".to_owned(),
+        confidence_delta,
+        stability_delta,
+        source: BeliefSource::Reflection,
+        evidence_refs: Vec::new(),
+        valid_until: None,
+    }
+}
+
+#[test]
+fn being_challenged_shakes_a_stance_far_less_than_changing_your_mind() {
+    let max_delta = 0.2;
+    // 被挑战：有人不同意而已。只微降，而且更稳固——被反对过还坚持，这个看法才更像"她的"。
+    let (challenged_confidence, challenged_stability) = super::consolidation::stance_deltas(
+        &stance_proposal(BeliefOperation::Contradict, -0.2, 0.0),
+        max_delta,
+    );
+    // 改主意：她自己改了（或被论据说服），照满幅执行。
+    let (retracted_confidence, _) = super::consolidation::stance_deltas(
+        &stance_proposal(BeliefOperation::Retract, -0.2, 0.0),
+        max_delta,
+    );
+
+    assert!(
+        challenged_confidence > retracted_confidence,
+        "被挑战不该和被说服一样动摇：{challenged_confidence} vs {retracted_confidence}"
+    );
+    assert_eq!(retracted_confidence, -max_delta);
+    assert_eq!(challenged_confidence, -max_delta * 0.25);
+    assert!(
+        challenged_stability > 0.0,
+        "被挑战后稳定性必须上升，否则她的立场会随谁反对得多而漂移"
+    );
+
+    // 反过来：被反对三次就把立场打到零，是原来的行为，也是这次要修掉的行为。
+    let mut confidence = 0.5_f32;
+    for _ in 0..3 {
+        confidence = (confidence + challenged_confidence).clamp(0.0, 1.0);
+    }
+    assert!(confidence > 0.3, "被反对三次后仍有立场，实际 {confidence}");
+}
+
+#[test]
+fn reinforcing_and_upserting_stances_stay_bounded() {
+    let max_delta = 0.2;
+    let (reinforced, _) = super::consolidation::stance_deltas(
+        &stance_proposal(BeliefOperation::Reinforce, -0.5, 0.0),
+        max_delta,
+    );
+    // Reinforce 取绝对值：提案给负号也不该把"强化"变成削弱。
+    assert_eq!(reinforced, max_delta);
+
+    let (upserted, stability) = super::consolidation::stance_deltas(
+        &stance_proposal(BeliefOperation::Upsert, 0.9, -0.9),
+        max_delta,
+    );
+    assert_eq!(upserted, max_delta, "超出上限的增量必须被夹住");
+    assert_eq!(stability, -max_delta, "稳定性同样要被夹住");
+}
+
 #[test]
 fn inferred_sensitive_person_belief_is_rejected() {
     let error = Belief::new(

@@ -50,7 +50,7 @@ use std::sync::{
 use std::time::Duration;
 use yunxi_core::{
     AffectState, ConversationId, IdentityStore, InterestId, InterestStore, MemoryStore,
-    MindDataErasure, MindSource, OpenLoopStore, PersonId, RelationState,
+    MindDataErasure, MindScope, MindSource, OpenLoopStore, PersonId, RelationState,
 };
 
 const MIND_ERASURE_MAX_ATTEMPTS: usize = 3;
@@ -916,6 +916,50 @@ pub(crate) fn observe_mind_maintenance_tick() {
     if let Some(bridge) = CORE_BRIDGE.get() {
         bridge.observe_maintenance_tick();
     }
+}
+
+/// `#立场` 的内容：她目前持有哪些看法，以及每条有多稳固。
+///
+/// 存在的理由有两条：一是**验收**——立场层整条管道曾经静默产出 0 行，没有这个命令
+/// 就只能去查数据库表；二是这件事本身就值得她能"说"出来。
+pub(crate) async fn stances_report() -> Result<String> {
+    let store = MIND_STORE.get().context("Yunxi Mind store 尚未初始化")?;
+    let runtime = MIND_RUNTIME
+        .get()
+        .context("Yunxi Mind runtime 尚未初始化")?;
+    let capacity = runtime.config().max_learned_beliefs_per_scope();
+    // 全限定调用：BeliefStore 与 InterestStore 等方法同名，引 trait 会让这个文件里
+    // 所有 store 调用都变成二义。
+    let beliefs = yunxi_core::BeliefStore::relevant(
+        store.as_ref(),
+        &[MindScope::Global],
+        "",
+        chrono::Utc::now(),
+        capacity,
+    )
+    .await
+    .map_err(anyhow::Error::from)?;
+    let mut report = format!("芸汐的立场（{} 条，上限 {capacity}）", beliefs.len());
+    if beliefs.is_empty() {
+        report.push_str(
+            "\n她还没有形成任何立场。立场候选来自模型回复里带的 mind_candidates；\n\
+             如果这里长期为空，先查日志里有没有「立场候选被安全过滤丢弃」。",
+        );
+        return Ok(report);
+    }
+    for (index, belief) in beliefs.iter().enumerate() {
+        report.push_str(&format!(
+            "\n{}. {}\n   置信 {:.2} · 稳固 {:.2} · 被挑战 {} 次 · 证据 {} 条 · 更新 {}",
+            index + 1,
+            belief.proposition(),
+            belief.confidence(),
+            belief.stability(),
+            belief.contradiction_count(),
+            belief.evidence_refs().len(),
+            belief.updated_at().format("%Y-%m-%d %H:%M UTC"),
+        ));
+    }
+    Ok(report)
 }
 
 pub(crate) async fn mind_status_report() -> Result<String> {

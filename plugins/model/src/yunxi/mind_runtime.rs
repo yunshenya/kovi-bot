@@ -1499,9 +1499,23 @@ impl MindRuntime {
         let mut global = self
             .empty_proposal(MindScope::Global, now, pending.context.trace)
             .await?;
+        // 候选被安全过滤丢掉时必须留痕：这条管道曾经整条静默——线上 0 行立场，
+        // 却没有任何一处日志能说明"是没人提，还是提了被丢"。
+        let belief_candidate = match pending.candidates.belief {
+            Some(candidate) => match global_state_text_rejection(&candidate.proposition) {
+                Some(reason) => {
+                    println!(
+                        "[INFO] 立场候选被安全过滤丢弃（{reason}）：{}",
+                        candidate_preview(&candidate.proposition)
+                    );
+                    None
+                }
+                None => Some(candidate),
+            },
+            None => None,
+        };
         if self.config.belief_enabled()
-            && let Some(candidate) = pending.candidates.belief
-            && safe_global_state_text(&candidate.proposition)
+            && let Some(candidate) = belief_candidate
             && self.can_upsert_belief(&candidate.proposition, now).await?
         {
             let confidence_delta = candidate.confidence_delta.clamp(-0.2, 0.2);
@@ -1529,9 +1543,21 @@ impl MindRuntime {
                 valid_until: None,
             });
         }
+        let preference_candidate = match pending.candidates.preference {
+            Some(candidate) => match global_state_text_rejection(&candidate.subject) {
+                Some(reason) => {
+                    println!(
+                        "[INFO] 偏好候选被安全过滤丢弃（{reason}）：{}",
+                        candidate_preview(&candidate.subject)
+                    );
+                    None
+                }
+                None => Some(candidate),
+            },
+            None => None,
+        };
         if self.config.preference_enabled()
-            && let Some(candidate) = pending.candidates.preference
-            && safe_global_state_text(&candidate.subject)
+            && let Some(candidate) = preference_candidate
             && self.can_upsert_preference(&candidate.subject, now).await?
         {
             global.preference_updates.push(PreferenceUpdateProposal {
@@ -1545,9 +1571,21 @@ impl MindRuntime {
                 source: PreferenceSource::Experience,
             });
         }
+        let interest_candidate = match pending.candidates.interest {
+            Some(candidate) => match global_state_text_rejection(&candidate.topic) {
+                Some(reason) => {
+                    println!(
+                        "[INFO] 兴趣候选被安全过滤丢弃（{reason}）：{}",
+                        candidate_preview(&candidate.topic)
+                    );
+                    None
+                }
+                None => Some(candidate),
+            },
+            None => None,
+        };
         if self.config.interest_enabled()
-            && let Some(candidate) = pending.candidates.interest
-            && safe_global_state_text(&candidate.topic)
+            && let Some(candidate) = interest_candidate
             && self.can_upsert_interest(&candidate.topic, now).await?
         {
             global.interest_updates.push(InterestUpdateProposal {
@@ -2717,33 +2755,58 @@ fn bounded_summary(value: &str) -> String {
     summary
 }
 
-fn safe_global_state_text(value: &str) -> bool {
+/// 这条文本能不能沉淀成"她的立场/偏好/兴趣"（全局状态）；不能则说明原因。
+///
+/// 拦的是**关于具体人的判断**和隐私标记：全局状态是"她怎么看世界"，不是"用户是谁"。
+/// 注意**不再拦阿拉伯数字**——立场里出现数字很正常（"我觉得 30 岁之前该多试错"），
+/// 原来一刀切掉数字会让这类看法永远进不来。
+fn global_state_text_rejection(value: &str) -> Option<String> {
     let normalized = value.trim().to_lowercase();
-    !normalized.is_empty()
-        && !normalized
-            .chars()
-            .any(|character| character.is_ascii_digit())
-        && ![
-            "你",
-            "用户",
-            "他",
-            "她",
-            "qq",
-            "手机号",
-            "住址",
-            "身份证",
-            "政治",
-            "宗教",
-            "性取向",
-            "疾病",
-            "诊断",
-            "密码",
-            "token",
-            "secret",
-        ]
+    if normalized.is_empty() {
+        return Some("内容为空".to_string());
+    }
+    GLOBAL_STATE_UNSAFE_MARKERS
         .iter()
-        .any(|marker| normalized.contains(marker))
+        .find(|marker| normalized.contains(**marker))
+        .map(|marker| format!("含「{marker}」"))
 }
+
+/// 只给测试用的布尔包装；生产路径一律走 [`global_state_text_rejection`]，
+/// 因为被拒的原因必须能写进日志。
+#[cfg(test)]
+fn safe_global_state_text(value: &str) -> bool {
+    global_state_text_rejection(value).is_none()
+}
+
+/// 日志里的候选预览：压掉换行并截断，别把整段私事写进 systemd 日志。
+fn candidate_preview(value: &str) -> String {
+    let compact = value.replace(['\r', '\n'], " ");
+    let compact = compact.trim();
+    let mut preview: String = compact.chars().take(40).collect();
+    if compact.chars().count() > 40 {
+        preview.push('…');
+    }
+    preview
+}
+
+const GLOBAL_STATE_UNSAFE_MARKERS: [&str; 16] = [
+    "你",
+    "用户",
+    "他",
+    "她",
+    "qq",
+    "手机号",
+    "住址",
+    "身份证",
+    "政治",
+    "宗教",
+    "性取向",
+    "疾病",
+    "诊断",
+    "密码",
+    "token",
+    "secret",
+];
 
 fn safe_scoped_question_text(value: &str) -> bool {
     let normalized = value.trim().to_lowercase();
@@ -3234,6 +3297,18 @@ mod tests {
         assert!(safe_global_state_text("我认为诚实比迎合更重要"));
         assert!(!safe_global_state_text("用户 123 患有某种疾病"));
         assert!(!safe_global_state_text("我觉得你更喜欢安静"));
+        // 数字不再是拒绝理由：立场里带数字是正常的，原来一刀切掉会让这类看法
+        // 永远进不来（"我觉得 30 岁之前该多试错"）。
+        assert!(safe_global_state_text("我觉得 30 岁之前该多试错"));
+        assert!(safe_global_state_text("我认为 2001 太空漫游是最好的科幻片"));
+        assert!(global_state_text_rejection("我觉得你更喜欢安静").is_some());
+        assert_eq!(
+            global_state_text_rejection("   ").as_deref(),
+            Some("内容为空")
+        );
+        // 预览要截断，别把整段私事写进日志。
+        assert_eq!(candidate_preview("短"), "短");
+        assert!(candidate_preview(&"长".repeat(100)).ends_with('…'));
         assert!(safe_scoped_question_text("你今天面试结果怎么样？"));
         assert!(!safe_scoped_question_text("想问用户的政治立场"));
     }

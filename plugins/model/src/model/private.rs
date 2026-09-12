@@ -227,6 +227,16 @@ pub(crate) async fn private_message_event_after_ingress(
         send_private_direct_response(&bot, user_id, initial_admission, report).await;
         return;
     }
+    if matches!(message.trim(), "#立场" | "#信念") && sender_is_admin {
+        let report = crate::yunxi::stances_report()
+            .await
+            .unwrap_or_else(|error| {
+                eprintln!("[ERROR] 读取芸汐立场失败: {}", error);
+                "暂时读取不到她的立场，请稍后再试。".to_string()
+            });
+        send_private_direct_response(&bot, user_id, initial_admission, report).await;
+        return;
+    }
     if message.trim() == "#turn-gate-status" && sender_is_admin {
         let report = crate::yunxi::turn_gate_runtime::turn_gate_status_report();
         send_private_direct_response(&bot, user_id, initial_admission, report).await;

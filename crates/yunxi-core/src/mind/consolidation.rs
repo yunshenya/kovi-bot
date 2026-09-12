@@ -448,17 +448,8 @@ impl Consolidation {
         now: DateTime<Utc>,
     ) -> Result<MindUpsert<Belief>, ConsolidationError> {
         proposal.validate()?;
-        let directed_delta = match proposal.operation {
-            BeliefOperation::Reinforce => proposal.confidence_delta.abs(),
-            BeliefOperation::Contradict | BeliefOperation::Retract => {
-                -proposal.confidence_delta.abs().max(0.01)
-            }
-            BeliefOperation::Upsert => proposal.confidence_delta,
-        }
-        .clamp(-self.config.max_belief_delta, self.config.max_belief_delta);
-        let stability_delta = proposal
-            .stability_delta
-            .clamp(-self.config.max_belief_delta, self.config.max_belief_delta);
+        let (directed_delta, stability_delta) =
+            stance_deltas(proposal, self.config.max_belief_delta);
         match existing {
             Some(existing) => {
                 check_expected(
@@ -811,6 +802,38 @@ fn ensure_scope(expected: MindScope, actual: MindScope) -> Result<(), Consolidat
     } else {
         Err(ConsolidationError::ScopeMismatch)
     }
+}
+
+/// 被挑战时置信度只掉这么多（相对提案给出的幅度）。
+///
+/// 立场被反对一次就大幅动摇的话，它会随"最近谁跟她聊得多"漂移——那是迎合，不是立场。
+/// 原来的实现让 [`BeliefOperation::Contradict`] 按满幅下调，`confidence` 从 0.5 起步时
+/// 被反对三次就归零。
+const CHALLENGE_CONFIDENCE_DAMPING: f32 = 0.25;
+
+/// 被挑战过还坚持，这个看法才更"是她的"：稳定性上升。
+const CHALLENGE_STABILITY_GAIN: f32 = 0.05;
+
+/// 把提案折算成真正写进 belief 的两个增量。
+///
+/// 关键区别是**被挑战 ≠ 被说服**：`Contradict` 只表示"有人不同意 / 出现了相反说法"，
+/// 正确的反应是轻微动摇但更稳固；只有 `Retract`（她自己改了主意，或明确被论据说服）
+/// 才按满幅下调。改主意本身是人格的一部分，不该被当成需要纠正的错误。
+pub(super) fn stance_deltas(proposal: &BeliefUpdateProposal, max_delta: f32) -> (f32, f32) {
+    let stability = proposal.stability_delta;
+    let (confidence, stability) = match proposal.operation {
+        BeliefOperation::Reinforce => (proposal.confidence_delta.abs(), stability),
+        BeliefOperation::Contradict => (
+            -(proposal.confidence_delta.abs().max(0.01) * CHALLENGE_CONFIDENCE_DAMPING),
+            stability.max(CHALLENGE_STABILITY_GAIN),
+        ),
+        BeliefOperation::Retract => (-proposal.confidence_delta.abs().max(0.01), stability),
+        BeliefOperation::Upsert => (proposal.confidence_delta, stability),
+    };
+    (
+        confidence.clamp(-max_delta, max_delta),
+        stability.clamp(-max_delta, max_delta),
+    )
 }
 
 fn check_expected(
