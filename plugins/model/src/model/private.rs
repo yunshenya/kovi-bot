@@ -238,6 +238,16 @@ pub(crate) async fn private_message_event_after_ingress(
         send_private_direct_response(&bot, user_id, initial_admission, report).await;
         return;
     }
+    if let Some(question) = message
+        .trim()
+        .strip_prefix("#通话自检")
+        .or_else(|| message.trim().strip_prefix("#电话自检"))
+    {
+        // 不通话也能验证电话里的工具链路：同样的模型调用、同样的工具，只读试跑。
+        let report = crate::qq_call::run_tool_self_test(&bot, user_id, question).await;
+        send_private_direct_response(&bot, user_id, initial_admission, report).await;
+        return;
+    }
     if is_group_admin_command(message) {
         println!(
             "[INFO] 私聊群聊专用命令已忽略 (用户: {}, 命令: {})",

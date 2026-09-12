@@ -996,6 +996,22 @@ impl ToolRegistry {
             .await
     }
 
+    /// 只读执行：给"试跑/自检"用。
+    ///
+    /// 和 [`Self::execute`] 只差一个开关，但很关键：带副作用的工具在这里被
+    /// **执行层硬拦**（而不是靠调用方自觉不发），所以自检永远不可能真的发出消息、
+    /// 建提醒或改状态。
+    pub(crate) async fn execute_read_only(
+        &self,
+        name: &str,
+        arguments: Map<String, Value>,
+        tool_context: ToolExecutionContext,
+        reply_ticket: crate::model::interrupt::ReplyTicket,
+    ) -> ToolExecutionResult {
+        self.execute_inner(name, arguments, tool_context, reply_ticket, None, true)
+            .await
+    }
+
     pub(crate) async fn execute_with_revalidation(
         &self,
         name: &str,

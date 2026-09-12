@@ -523,16 +523,18 @@ async fn respond(
                     },
                 );
 
-                let Some(reply) = generate_reply(
+                let turn = generate_reply(
                     &config,
                     &context,
                     &transcript,
                     tools.as_ref(),
-                    &speech,
-                    &mut interrupts,
+                    &mut PhoneVoice::Speak {
+                        speech: &speech,
+                        interrupts: &mut interrupts,
+                    },
                 )
-                .await
-                else {
+                .await;
+                let Some(reply) = turn.reply else {
                     continue;
                 };
                 println!("[INFO] QQ 通话回复: {}", reply.text);
@@ -624,10 +626,12 @@ struct PhoneTools {
     registry: Arc<ToolRegistry>,
     context: ToolExecutionContext,
     ticket: ReplyTicket,
+    /// 只读模式：自检用。清单只给只读工具，执行也走 [`ToolRegistry::execute_read_only`]。
+    read_only: bool,
 }
 
 impl PhoneTools {
-    /// 准备本次通话的工具通道；关掉配置、拿不到注册表或身份不明时返回 `None`
+    /// 准备一次通话的工具通道；关掉配置、拿不到注册表或身份不明时返回 `None`
     /// （通话照常进行，只是她动不了手，并会如实说出来）。
     async fn prepare(
         bot: &Arc<kovi::RuntimeBot>,
@@ -641,9 +645,35 @@ impl PhoneTools {
             println!("[WARN] QQ 通话未能解析来电者 QQ 号，本次通话不开放工具");
             return None;
         };
+        // 通话用它自己的代数：拿到票据后只要这通话还在进行，它就一直有效。
+        Self::build(bot, caller, ReplyScope::Call(caller), false).await
+    }
+
+    /// 准备"试跑"用的通道：只读，而且用和真实通话**不同**的作用域。
+    ///
+    /// 作用域分开是必要的：自检会推进它那个作用域的代数，若和真实通话共用一个，
+    /// 边打电话边发自检就会把通话中正在跑的工具轮次整批打断。负数对端就是自检
+    /// 的标记（真实通话的 uin 一定是正数）。
+    async fn prepare_self_test(
+        bot: &Arc<kovi::RuntimeBot>,
+        config: &QqCallConfig,
+        caller: i64,
+    ) -> Option<Self> {
+        if !config.phone_tools_enabled() {
+            return None;
+        }
+        Self::build(bot, caller, ReplyScope::Call(-caller), true).await
+    }
+
+    async fn build(
+        bot: &Arc<kovi::RuntimeBot>,
+        caller: i64,
+        scope: ReplyScope,
+        read_only: bool,
+    ) -> Option<Self> {
         let Some(registry) = tool_registry() else {
             println!(
-                "[WARN] QQ 通话拿不到工具注册表（tools.enabled 或初始化失败），本次通话不开放工具"
+                "[WARN] QQ 通话拿不到工具注册表（tools.enabled 或初始化失败），本次不开放工具"
             );
             return None;
         };
@@ -666,19 +696,48 @@ impl PhoneTools {
             requires_external_tool: false,
             allow_reply_actions: false,
         };
-        let available = registry.native_tool_specs(&context, false).len();
+        let available = registry.native_tool_specs(&context, read_only).len();
         println!(
-            "[INFO] QQ 通话已开放 {available} 个工具（来电者 {caller}，管理员 {}，主管理员 {}）",
+            "[INFO] QQ 通话工具通道已就绪：{available} 个工具（对端 {caller}，管理员 {}，主管理员 {}，只读 {read_only}）",
             context.is_admin, context.is_main_admin
         );
-        // 通话有自己的代数：拿到票据后只要这通话还在进行，它就一直有效。
-        let ticket = interrupt(ReplyScope::Call(caller)).await;
         Some(Self {
             registry,
             context,
-            ticket,
+            ticket: interrupt(scope).await,
+            read_only,
         })
     }
+}
+
+/// 一次工具调用的结果。日志、试跑报告和"轮次用尽后的兜底收尾"共用它。
+struct ToolOutcome {
+    name: String,
+    succeeded: bool,
+    content: String,
+}
+
+/// 一次电话回复的完整过程。
+///
+/// [`PhoneTurn::reply`] 是要播给对方的话；其余字段是"这一轮发生了什么"，供通话日志
+/// 和 `#通话自检` 用——没有它们，工具到底有没有被调用就只能靠猜。
+struct PhoneTurn {
+    reply: Option<PhoneReply>,
+    outcomes: Vec<ToolOutcome>,
+    /// 本来会说的填充语（通话里是"说了"，试跑里是"会说"）。
+    fillers: Vec<String>,
+    elapsed: Duration,
+}
+
+/// 工具等待期间"出声"的出口：通话里真的说出来，试跑时只记下本来会说哪句。
+enum PhoneVoice<'a> {
+    Speak {
+        speech: &'a SpeechClient,
+        interrupts: &'a mut mpsc::Receiver<()>,
+    },
+    Silent {
+        spoken: &'a mut Vec<String>,
+    },
 }
 
 /// 用芸汐的私聊人设和模型生成一句电话回复。
@@ -691,9 +750,15 @@ async fn generate_reply(
     context: &str,
     transcript: &Arc<Mutex<Vec<Turn>>>,
     tools: Option<&PhoneTools>,
-    speech: &SpeechClient,
-    interrupts: &mut mpsc::Receiver<()>,
-) -> Option<PhoneReply> {
+    voice: &mut PhoneVoice<'_>,
+) -> PhoneTurn {
+    let started = Instant::now();
+    let mut turn = PhoneTurn {
+        reply: None,
+        outcomes: Vec::new(),
+        fillers: Vec::new(),
+        elapsed: Duration::ZERO,
+    };
     let turns = transcript
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -708,9 +773,13 @@ async fn generate_reply(
             None,
         )
         .await;
-        return reply_from_response(&response.content, config);
+        turn.reply = reply_from_response(&response.content, config);
+        turn.elapsed = started.elapsed();
+        return turn;
     };
-    let specs = tools.registry.native_tool_specs(&tools.context, false);
+    let specs = tools
+        .registry
+        .native_tool_specs(&tools.context, tools.read_only);
     if specs.is_empty() {
         println!("[WARN] QQ 通话的工具清单为空（身份或场景过滤后无可用工具），本轮退回纯文本");
         let response = params_model_with_plain_style_context(
@@ -721,13 +790,13 @@ async fn generate_reply(
             None,
         )
         .await;
-        return reply_from_response(&response.content, config);
+        turn.reply = reply_from_response(&response.content, config);
+        turn.elapsed = started.elapsed();
+        return turn;
     }
 
     // 累积的 wire 消息（assistant.tool_calls + role:"tool" 结果），逐轮接在 messages 之后。
     let mut extra_wire: Vec<Value> = Vec::new();
-    // 工具结果的文字版，只用于轮次用尽后的兜底收尾（那条路不带 wire 上下文）。
-    let mut tool_notes: Vec<String> = Vec::new();
 
     for round in 0..config.tool_max_rounds() {
         let payload = params_model_with_native_tools(
@@ -741,11 +810,14 @@ async fn generate_reply(
         )
         .await;
         if payload.tool_calls.is_empty() {
-            return reply_from_response(&payload.content, config);
+            turn.reply = reply_from_response(&payload.content, config);
+            turn.elapsed = started.elapsed();
+            return turn;
         }
         if is_model_error_response(&payload.content) {
             eprintln!("[ERROR] QQ 通话模型返回错误载荷却带着工具调用，本轮不执行工具");
-            return None;
+            turn.elapsed = started.elapsed();
+            return turn;
         }
         println!(
             "[INFO] QQ 通话第 {} 轮工具调用：{}",
@@ -757,21 +829,26 @@ async fn generate_reply(
                 .collect::<Vec<_>>()
                 .join("、")
         );
-        let outputs = run_tool_round(
+        let outcomes = run_tool_round(
             config,
             tools,
             &payload,
-            speech,
-            interrupts,
+            voice,
             transcript,
             &mut extra_wire,
             round == 0,
+            &mut turn.fillers,
         )
         .await;
-        tool_notes.extend(outputs);
+        turn.outcomes.extend(outcomes);
     }
 
     // 轮次用尽还在调工具：把结果折成一条资料，强制她用一句话收尾。
+    let tool_notes: Vec<String> = turn
+        .outcomes
+        .iter()
+        .map(|outcome| format!("{} → {}", outcome.name, outcome.content))
+        .collect();
     if !tool_notes.is_empty() {
         messages.push(BotMemory {
             role: Roles::Data,
@@ -790,7 +867,111 @@ async fn generate_reply(
         None,
     )
     .await;
-    reply_from_response(&response.content, config)
+    turn.reply = reply_from_response(&response.content, config);
+    turn.elapsed = started.elapsed();
+    turn
+}
+
+/// `#通话自检` 的实现：拿电话里**同一套**工具链路试跑一句话。
+///
+/// 为什么需要它：验证"电话里能不能办事"本来必须真打一通电话——成本高，还得有人
+/// 正好有空接。这里复用同一个 [`generate_reply`]，只换两样东西：音频出口换成记录
+/// （[`PhoneVoice::Silent`]），工具换成只读（[`PhoneTools::prepare_self_test`]，
+/// 执行层硬拦副作用）。所以我们验证的是真链路，不是另写一份仿的。
+pub(super) async fn self_test(
+    bot: &Arc<kovi::RuntimeBot>,
+    config: &QqCallConfig,
+    caller: i64,
+    question: &str,
+) -> String {
+    let question = question.trim();
+    let question = if question.is_empty() {
+        "现在几点了？"
+    } else {
+        question
+    };
+    let Some(tools) = PhoneTools::prepare_self_test(bot, config, caller).await else {
+        return "通话工具通道没开：要么 qq_call.phone_tools_enabled = false，\
+                要么工具注册表没初始化（tools.enabled）。"
+            .to_string();
+    };
+    let available = tools
+        .registry
+        .native_tool_specs(&tools.context, tools.read_only)
+        .len();
+    let transcript = Arc::new(Mutex::new(vec![Turn {
+        from_peer: true,
+        text: question.to_string(),
+    }]));
+    let mut spoken = Vec::new();
+    let turn = generate_reply(
+        config,
+        "",
+        &transcript,
+        Some(&tools),
+        &mut PhoneVoice::Silent {
+            spoken: &mut spoken,
+        },
+    )
+    .await;
+    render_self_test(question, available, &turn, &spoken)
+}
+
+/// 自检报告。只报观察到的事实：调了哪些工具、成功没有、她本来会说什么。
+fn render_self_test(
+    question: &str,
+    available: usize,
+    turn: &PhoneTurn,
+    fillers: &[String],
+) -> String {
+    let mut report = String::from("通话工具自检（只读试跑：不出声，也不会真的发消息、建提醒）\n");
+    report.push_str(&format!("你说：{question}\n"));
+    report.push_str(&format!("可用工具：{available} 个（只读）\n"));
+    if turn.outcomes.is_empty() {
+        report.push_str("工具调用：0 次——模型直接回话，没有用工具\n");
+    } else {
+        report.push_str(&format!(
+            "工具调用：{} 次，整轮耗时 {:.1} 秒\n",
+            turn.outcomes.len(),
+            turn.elapsed.as_secs_f64()
+        ));
+        for outcome in &turn.outcomes {
+            report.push_str(&format!(
+                "  {} {} → {}\n",
+                if outcome.succeeded { "✅" } else { "❌" },
+                outcome.name,
+                preview_chars(&outcome.content, 200)
+            ));
+        }
+    }
+    if !fillers.is_empty() {
+        report.push_str(&format!(
+            "填充语：本来会说「{}」（工具超过 {:.1} 秒才出声）\n",
+            fillers.join("／"),
+            TOOL_FILLER_DELAY.as_secs_f64()
+        ));
+    }
+    match &turn.reply {
+        Some(reply) => {
+            report.push_str(&format!("她本来会说：{}", reply.text));
+            if reply.wants_hangup {
+                report.push_str("\n（这句里带了挂断标记：换成真通话，她会说完就挂）");
+            }
+        }
+        None => report.push_str("她本来会说：（这一轮没生成出可播报的内容）"),
+    }
+    report
+}
+
+/// 报告里的内容预览：压掉换行并截断，免得一条工具结果把消息撑成一屏。
+fn preview_chars(text: &str, max_chars: usize) -> String {
+    let compact = text.replace(['\r', '\n'], " ");
+    let compact = compact.trim();
+    let mut preview: String = compact.chars().take(max_chars).collect();
+    if compact.chars().count() > max_chars {
+        preview.push('…');
+    }
+    preview
 }
 
 /// 跑一轮工具调用：并发"该出声就出声"和"执行工具"，再把结果接进 wire 上下文。
@@ -803,37 +984,44 @@ async fn run_tool_round(
     config: &QqCallConfig,
     tools: &PhoneTools,
     payload: &ModelPayload,
-    speech: &SpeechClient,
-    interrupts: &mut mpsc::Receiver<()>,
+    voice: &mut PhoneVoice<'_>,
     transcript: &Arc<Mutex<Vec<Turn>>>,
     extra_wire: &mut Vec<Value>,
     first_round: bool,
-) -> Vec<String> {
+    fillers: &mut Vec<String>,
+) -> Vec<ToolOutcome> {
     let execute = async {
-        let mut outputs = Vec::with_capacity(payload.tool_calls.len());
+        let mut outcomes = Vec::with_capacity(payload.tool_calls.len());
         for call in &payload.tool_calls {
-            outputs.push(execute_tool_call(tools, call).await);
+            outcomes.push(execute_tool_call(tools, call).await);
         }
-        outputs
+        outcomes
     };
     kovi::tokio::pin!(execute);
 
     let filler = config.tool_filler().trim().to_owned();
-    let outputs = if !first_round || filler.is_empty() {
+    let outcomes = if !first_round || filler.is_empty() {
         execute.await
     } else {
         kovi::tokio::select! {
-            outputs = &mut execute => outputs,
+            outcomes = &mut execute => outcomes,
             () = kovi::tokio::time::sleep(TOOL_FILLER_DELAY) => {
                 // 工具还没回来：先说一句垫着，工具继续在后台跑。
-                match speak(speech, config, &filler, interrupts).await {
-                    Ok(SpeakOutcome::Completed) => push_turn(
-                        transcript,
-                        Turn { from_peer: false, text: filler.clone() },
-                    ),
-                    Ok(SpeakOutcome::Interrupted) => {}
-                    Err(error) => eprintln!("[ERROR] QQ 通话填充语播报失败: {error}"),
+                match &mut *voice {
+                    PhoneVoice::Speak { speech, interrupts } => {
+                        match speak(speech, config, &filler, interrupts).await {
+                            Ok(SpeakOutcome::Completed) => push_turn(
+                                transcript,
+                                Turn { from_peer: false, text: filler.clone() },
+                            ),
+                            Ok(SpeakOutcome::Interrupted) => {}
+                            Err(error) => eprintln!("[ERROR] QQ 通话填充语播报失败: {error}"),
+                        }
+                    }
+                    // 试跑没有音频：只记下"本来会说这句"，报告里如实写出来。
+                    PhoneVoice::Silent { spoken } => spoken.push(filler.clone()),
                 }
+                fillers.push(filler.clone());
                 execute.await
             }
         }
@@ -843,40 +1031,54 @@ async fn run_tool_round(
         &payload.content,
         &payload.tool_calls,
     ));
-    let mut notes = Vec::with_capacity(outputs.len());
-    for (call, content) in payload.tool_calls.iter().zip(outputs) {
-        notes.push(format!("{} → {}", call.name, content));
-        extra_wire.push(tool_result_wire(&call.id, &content));
+    for (call, outcome) in payload.tool_calls.iter().zip(&outcomes) {
+        extra_wire.push(tool_result_wire(&call.id, &outcome.content));
     }
-    notes
+    outcomes
 }
 
 /// 执行一个工具调用，返回给模型看的结果文本。失败也返回文本——让模型据此如实说明，
 /// 而不是让整通电话崩掉。每次调用都记一条审计日志（电话里的动作同样要可追溯）。
-async fn execute_tool_call(tools: &PhoneTools, call: &NativeToolCall) -> String {
+async fn execute_tool_call(tools: &PhoneTools, call: &NativeToolCall) -> ToolOutcome {
     let name = tools.registry.resolve_wire_tool_name(&call.name);
     let arguments =
         match serde_json::from_str::<serde_json::Map<String, Value>>(&call.raw_arguments) {
             Ok(arguments) => arguments,
             Err(error) => {
                 println!("[WARN] QQ 通话工具参数不是合法 JSON（{name}）：{error}");
-                return format!("工具调用失败：参数不是合法 JSON（{error}）");
+                return ToolOutcome {
+                    name,
+                    succeeded: false,
+                    content: format!("工具调用失败：参数不是合法 JSON（{error}）"),
+                };
             }
         };
     println!(
         "[INFO] QQ 通话工具调用: {name} {}",
         summarize_tool_arguments(&arguments)
     );
-    let result = tools
-        .registry
-        .execute(&name, arguments, tools.context.clone(), tools.ticket)
-        .await;
+    // 试跑走只读入口：带副作用的工具在执行层就被拦下，不可能真的发出去。
+    let result = if tools.read_only {
+        tools
+            .registry
+            .execute_read_only(&name, arguments, tools.context.clone(), tools.ticket)
+            .await
+    } else {
+        tools
+            .registry
+            .execute(&name, arguments, tools.context.clone(), tools.ticket)
+            .await
+    };
     println!(
         "[INFO] QQ 通话工具结果: {name} {}（{} 字）",
         if result.succeeded { "成功" } else { "失败" },
         result.content.chars().count()
     );
-    result.content
+    ToolOutcome {
+        name,
+        succeeded: result.succeeded,
+        content: result.content,
+    }
 }
 
 /// 审计日志里的参数摘要：截断，避免把整段私事写进 systemd 日志。
@@ -1142,12 +1344,14 @@ async fn archive_call(
 #[cfg(test)]
 mod tests {
     use super::{
-        CallPhase, EndTrigger, NO_END, TOOL_ARGUMENT_LOG_CHARS, Turn, build_messages,
-        phone_system_prompt, request_end, requested_end, sanitize_reply, strip_protocol_markers,
-        summarize_tool_arguments, wants_hangup,
+        CallPhase, EndTrigger, NO_END, PhoneReply, PhoneTurn, TOOL_ARGUMENT_LOG_CHARS, ToolOutcome,
+        Turn, build_messages, phone_system_prompt, preview_chars, render_self_test, request_end,
+        requested_end, sanitize_reply, strip_protocol_markers, summarize_tool_arguments,
+        wants_hangup,
     };
     use crate::config::QqCallConfig;
     use serde_json::Value;
+    use std::time::Duration;
 
     #[test]
     fn end_triggers_carry_their_own_reason_and_hangup_decision() {
@@ -1275,6 +1479,64 @@ mod tests {
         let summary = summarize_tool_arguments(&short);
         assert!(summary.contains("明天天气"));
         assert!(!summary.ends_with('…'));
+    }
+
+    #[test]
+    fn self_test_report_states_what_was_called_and_what_she_would_say() {
+        let turn = PhoneTurn {
+            reply: Some(PhoneReply {
+                text: "现在十一点半。".to_string(),
+                wants_hangup: false,
+            }),
+            outcomes: vec![
+                ToolOutcome {
+                    name: "time.now".to_string(),
+                    succeeded: true,
+                    content: "2026-09-12 11:30".to_string(),
+                },
+                ToolOutcome {
+                    name: "web.search".to_string(),
+                    succeeded: false,
+                    content: "搜索超时".to_string(),
+                },
+            ],
+            fillers: vec!["嗯……我看一下。".to_string()],
+            elapsed: Duration::from_millis(1_500),
+        };
+        let report = render_self_test("现在几点", 9, &turn, &turn.fillers);
+        // 报告必须先说清这是试跑，别让人以为真发出去了什么。
+        assert!(report.contains("只读试跑"));
+        assert!(report.contains("你说：现在几点"));
+        assert!(report.contains("可用工具：9 个（只读）"));
+        assert!(report.contains("工具调用：2 次"));
+        assert!(report.contains("✅ time.now"));
+        assert!(report.contains("❌ web.search"));
+        assert!(report.contains("填充语"));
+        assert!(report.contains("她本来会说：现在十一点半。"));
+    }
+
+    #[test]
+    fn self_test_report_says_so_when_no_tool_was_used() {
+        let turn = PhoneTurn {
+            reply: Some(PhoneReply {
+                text: "在的呀。".to_string(),
+                wants_hangup: false,
+            }),
+            outcomes: Vec::new(),
+            fillers: Vec::new(),
+            elapsed: Duration::from_millis(400),
+        };
+        let report = render_self_test("在吗", 9, &turn, &turn.fillers);
+        assert!(report.contains("工具调用：0 次"));
+        assert!(!report.contains("填充语"));
+    }
+
+    #[test]
+    fn tool_result_previews_collapse_newlines_and_truncate() {
+        assert_eq!(preview_chars("第一行\n第二行", 200), "第一行 第二行");
+        let long = preview_chars(&"啊".repeat(300), 200);
+        assert_eq!(long.chars().count(), 201);
+        assert!(long.ends_with('…'));
     }
 
     #[test]

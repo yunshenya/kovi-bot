@@ -39,11 +39,35 @@ const MISSED_NOTICE_TIMEOUT: Duration = Duration::from_secs(5);
 /// 主动外呼后等"电话真的响起来"的窗口。桥受理 ≠ AVSDK 真的拨号。
 const DIAL_CONFIRM_WINDOW: Duration = Duration::from_secs(6);
 
+/// 私聊指令 `#通话自检 [问题]` 的实现：不通话也能验证电话里的工具链路。
+///
+/// 只读试跑：不出声，也不真的发消息/建提醒（执行层硬拦）。授权门槛和打电话一致——
+/// 能在电话里用工具的人，才有必要自检。
+pub(crate) async fn run_tool_self_test(
+    bot: &std::sync::Arc<kovi::RuntimeBot>,
+    requester: i64,
+    question: &str,
+) -> String {
+    let config = config::get().qq_call().clone();
+    if !config.enabled() {
+        return "QQ 语音通话没启用，谈不上电话里的工具。".to_string();
+    }
+    if !config.phone_tools_enabled() {
+        return "通话工具被关掉了（qq_call.phone_tools_enabled = false），\
+                所以电话里她只能说话。"
+            .to_string();
+    }
+    if !caller_is_allowed(&config, bot.get_main_admin().ok(), requester).await {
+        return "你不在通话授权名单里，用不上通话工具，我也就不自检了。".to_string();
+    }
+    session::self_test(bot, &config, requester, question).await
+}
+
 /// 私聊指令 `#打给我` 的实现：让芸汐主动拨给发起者。
 ///
 /// 只允许授权名单里的人——规则是"谁让我打，我就打给谁"，不接受任意号码，免得变成
-/// 骚扰工具。**打完必须确认电话真的响了**：AVSDK 的外呼命令目前会被直接丢弃，
-/// 桥返回成功不代表拨出去了，所以这里几秒内轮询阶段，据实回复。
+/// 骚扰工具。**打完必须确认电话真的响了**：AVSDK 的外呼命令可能被丢弃，
+/// 桥返回成功不代表拨出去了，所以这里几秒内轮询 AVSDK 回执，据实回复。
 pub(crate) async fn request_outgoing_call(bot: &kovi::RuntimeBot, requester: i64) -> String {
     let config = config::get().qq_call().clone();
     if !config.enabled() {
