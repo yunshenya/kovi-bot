@@ -82,6 +82,13 @@ struct PurposeStats {
     last_at: Option<DateTime<Local>>,
 }
 
+/// 本进程启动时刻。用来区分"自启动以来没调用"和"从来没有调用"——
+/// 少了它，刚重启完的报告会指着一堆"从未调用"喊管道没通电，而它们只是还没轮到。
+static STARTED: LazyLock<std::time::Instant> = LazyLock::new(std::time::Instant::now);
+
+/// 少于这个运行时长就不下"管道没通电"的结论。
+const DEAD_PIPE_MIN_UPTIME: Duration = Duration::from_secs(30 * 60);
+
 static TRACE: LazyLock<Mutex<VecDeque<LlmTraceEntry>>> =
     LazyLock::new(|| Mutex::new(VecDeque::with_capacity(TRACE_CAPACITY)));
 static PURPOSES: LazyLock<Mutex<HashMap<&'static str, PurposeStats>>> =
@@ -289,7 +296,11 @@ pub(crate) fn report(limit: usize, detail: Option<usize>) -> String {
         };
     }
 
-    let mut report = String::from("模型调用轨迹\n【管线运行情况】\n");
+    let uptime = STARTED.elapsed();
+    let mut report = format!(
+        "模型调用轨迹（本进程已运行 {} 分钟）\n【管线运行情况】\n",
+        uptime.as_secs() / 60
+    );
     let mut never: Vec<&str> = Vec::new();
     for (name, description) in EXPECTED_PURPOSES {
         match purposes.get(name) {
@@ -320,11 +331,22 @@ pub(crate) fn report(limit: usize, detail: Option<usize>) -> String {
         }
     }
     if !never.is_empty() {
-        report.push_str(&format!(
-            "\n⚠ 有 {} 条管线自启动以来一次都没调用过——管道可能没通电，\n\
-             查它的触发条件，而不是查它的实现。\n",
-            never.len()
-        ));
+        if uptime < DEAD_PIPE_MIN_UPTIME {
+            // 刚重启：计数是从零开始的，这时候喊"没通电"是误报——
+            // 真机上就是这么误报过一次（进程才起来几分钟）。
+            report.push_str(&format!(
+                "\n（有 {} 条管线还没调用过；进程才跑了 {} 分钟，先排除「还没轮到」，\n\
+                 过半小时再看这条更有意义。）\n",
+                never.len(),
+                uptime.as_secs() / 60
+            ));
+        } else {
+            report.push_str(&format!(
+                "\n⚠ 有 {} 条管线自启动以来一次都没调用过——管道可能没通电，\n\
+                 查它的触发条件，而不是查它的实现。\n",
+                never.len()
+            ));
+        }
     }
 
     report.push_str(&format!("\n【最近 {} 次调用】\n", limit.min(trace.len())));
@@ -425,7 +447,12 @@ mod tests {
         let rendered = report(5, None);
         assert!(rendered.contains("【管线运行情况】"));
         assert!(rendered.contains("从未调用"), "死管道必须以显式文案出现");
-        assert!(rendered.contains("查它的触发条件，而不是查它的实现"));
+        // 刚启动时不能喊"没通电"（那是误报），要把运行时长一起说清楚。
+        assert!(rendered.contains("本进程已运行"));
+        assert!(
+            rendered.contains("还没轮到") || rendered.contains("查它的触发条件"),
+            "要么提示刚启动、要么给出排查方向"
+        );
         // 详情视图越界时给一句人话，而不是空字符串。
         assert!(report(0, Some(9_999)).contains("没有第"));
     }
