@@ -54,6 +54,15 @@ bubbles2="$(grep 'Yunxi Core turn shape' "$log" 2>/dev/null | grep -cE 'bubbles=
 printf '可见回合数                  : %s\n' "$shapes"
 printf '提问占比                    : %s / %s\n' "$asks" "$shapes"
 printf '一轮多气泡回合              : %s / %s\n' "$bubbles2" "$shapes"
+# 回复延迟：从收到消息到写出正文（含语义判定与限流），不是模型调用耗时。
+latencies="$(grep -o 'think_ms=[0-9]*' "$log" 2>/dev/null | cut -d= -f2 | sort -n || true)"
+if [ -n "$latencies" ]; then
+  printf '回复延迟 中位/ p90 (ms)      : %s / %s\n' \
+    "$(printf '%s\n' "$latencies" | awk '{a[NR]=$1} END{print a[int((NR+1)/2)]}')" \
+    "$(printf '%s\n' "$latencies" | awk '{a[NR]=$1} END{print a[int(NR*0.9)]}')"
+else
+  printf '回复延迟 中位/ p90 (ms)      : 无样本\n'
+fi
 echo
 echo "--- 续聊链路 ---"
 printf '登记了续聊回合 (Continue)    : %s\n' "$(count 'conversation continuation registered')"

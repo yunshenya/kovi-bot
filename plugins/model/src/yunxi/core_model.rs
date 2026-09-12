@@ -4526,6 +4526,10 @@ fn keeps_existing_prepared_plan(admission: Option<IncomingAdmission>) -> bool {
 impl ModelBackend for KoviModelBackend {
     fn plan<'a>(&'a self, input: &'a PlannerInput) -> ModelBackendFuture<'a> {
         let future = async move {
+            // 本回合的处理起点：用于"回复延迟"遥测（从收到消息到写出可见
+            // 正文），它与模型调用本身的 elapsed_ms 是两件事——中间还有
+            // 语义判定、admission 和限流。
+            let turn_started = std::time::Instant::now();
             let mind_projection =
                 MindDecisionProjection::for_input(input, baseline_disposition(input));
             if input.mind.influence_mode() != MindInfluenceMode::Shadow {
@@ -5905,16 +5909,18 @@ impl ModelBackend for KoviModelBackend {
                         directive,
                     });
                     // 对话形状遥测：一条日志同时回答"这轮发了几个气泡""有没有
-                    // 提问""有没有登记续聊"。线上验收（同会话连续气泡占比、
-                    // 提问占比、续聊登记率）直接从这里聚合，不再只靠账本猜。
+                    // 提问""有没有登记续聊""想了多久"。线上验收（同会话连续气泡
+                    // 占比、提问占比、续聊登记率、回复延迟）直接从这里聚合，
+                    // 不再只靠账本猜。
                     kovi::log::info!(
-                        "Yunxi Core turn shape: event_id={} conversation_id={} kind={:?} bubbles={} asks={} directive={:?}",
+                        "Yunxi Core turn shape: event_id={} conversation_id={} kind={:?} bubbles={} asks={} directive={:?} think_ms={}",
                         input.event.id(),
                         conversation_id,
                         conversation_kind_for_turn(input),
                         plan.bubbles.len(),
                         reply_asks_something(&visible_content),
                         directive,
+                        turn_started.elapsed().as_millis(),
                     );
                 }
             }
