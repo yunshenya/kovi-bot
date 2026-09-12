@@ -1351,7 +1351,7 @@ async fn generate_reply(
             // 把系统纠正塞回去，让她重来一轮，真的调用工具。
             if turn.claim_retries < config.claim_retry_rounds()
                 && let Some(reply_text) = reply.as_ref().map(|reply| reply.text.as_str())
-                && let Some(marker) = claimed_action(reply_text)
+                && let Some(marker) = retry_worthy_claim(reply_text, !turn.outcomes.is_empty())
             {
                 turn.claim_retries += 1;
                 println!(
@@ -1849,8 +1849,13 @@ fn tool_facts(outcomes: &[ToolOutcome]) -> Vec<ToolFact> {
 /// 判据只是**触发器**，不是判决：命中了就多跑一轮模型（见 [`commitment_nudge`]），
 /// 误报的代价是一次额外的模型调用，漏报的代价是对方永远等不到结果——所以宁可比
 /// 宽一点。真正的把关在提示词里：没有工具能做就如实说做不到。
-const ACTION_CLAIM_MARKERS: &[&str] = &[
-    // ---- 发送类：嘴上说"发了/我再发" ----
+/// **承诺类**：说出来就是要动手去做，而这一轮还没做。
+///
+/// 判据只是**触发器**，不是判决：命中了就多跑一轮模型（见 [`commitment_nudge`]），
+/// 误报的代价是一次额外的模型调用，漏报的代价是对方永远等不到结果——所以宁可比
+/// 宽一点。真正的把关在提示词里：没有工具能做就如实说做不到。
+const COMMITMENT_MARKERS: &[&str] = &[
+    // 发送类：嘴上说"我再发"
     "我再发",
     "重新发",
     "再发一次",
@@ -1858,17 +1863,11 @@ const ACTION_CLAIM_MARKERS: &[&str] = &[
     "再发条",
     "再发一条",
     "这就发",
-    "发了呀",
-    "已经发",
-    "发好啦",
-    "发好了",
-    "给你发了",
-    "发过去了",
-    "刷新一下",
     // 线上原话："我再试试，你别急，可能是我这边卡了一下。"——同样是空承诺。
     "我再试试",
     "再试一次",
-    // ---- 查询类：说要去找/去查，然后就静音了 ----
+    // 查询类：说要去找/去查，然后就静音了。
+    // 2026-09-13 线上："那我先看看有哪些群，等我一下"，然后整通电话再没下文。
     "我去找",
     "我去查",
     "我帮你查",
@@ -1887,7 +1886,21 @@ const ACTION_CLAIM_MARKERS: &[&str] = &[
     "等我一下",
     "稍等一下",
     "等我一会儿",
-    // ---- 谎称已完成：没有工具却宣称"我看过了/查到了" ----
+];
+
+/// **完成类**：声称"已经做完了"。
+///
+/// 和承诺类的关键区别：这句话的真假**取决于这一轮到底有没有工具结果**。她刚真的
+/// 发完群消息，再说"发好啦"是真话；整轮一个工具都没调还说"发好啦"，就是空话。
+const COMPLETION_MARKERS: &[&str] = &[
+    "发了呀",
+    "已经发",
+    "发好啦",
+    "发好了",
+    "给你发了",
+    "发过去了",
+    "刷新一下",
+    // 谎称已完成：没有工具却宣称"我看过了/查到了"。
     "我看了下",
     "查到了",
     "找到了",
@@ -1908,19 +1921,38 @@ fn warn_on_unbacked_action_claim(reply: &str, facts: &[ToolFact], peer: &str) {
     );
 }
 
-/// 这句回复里有没有"我要去做某件事"的承诺；有就返回命中的那个词。
-///
-/// 和 [`unbacked_action_claim`] 的区别：那个是给日志用的告警判据（要求这一轮确实
-/// 没调过工具），这里只回答"这句话里有没有承诺"——补跑要覆盖的情形还包括"前几轮
-/// 调过工具，这一轮又许了一个新诺"。
+/// 这句回复里有没有"我要去做某件事"或"我已经做了"的说法。
 fn claimed_action(reply: &str) -> Option<&'static str> {
-    ACTION_CLAIM_MARKERS
+    find_claim_marker(COMMITMENT_MARKERS, reply)
+        .or_else(|| find_claim_marker(COMPLETION_MARKERS, reply))
+}
+
+fn find_claim_marker(markers: &'static [&'static str], reply: &str) -> Option<&'static str> {
+    markers
         .iter()
         .find(|marker| reply.contains(**marker))
         .copied()
 }
 
-/// 判据本体：调过工具就不算空承诺，否则看回复里有没有"我发了/我再发"这类动作词。
+/// 这一轮该不该补跑。
+///
+/// 两类说法分开判，因为"属实"的标准不一样：
+/// - **承诺类**：只要这一轮没有工具调用就补跑。哪怕前几轮真调过工具，这一轮承诺的
+///   也是**新动作**（"那我再发一条"）。
+/// - **完成类**：只有整轮都没调过工具时才是空话。2026-09-13 真机实测：她真的发完
+///   群消息（`[sent] message_id=… status=ok`）之后说"发好啦"，被旧判据误伤、
+///   白跑了两轮模型调用（日志 `空承诺补跑 1/2`、`2/2`），在电话里就是实打实的两秒。
+fn retry_worthy_claim(reply: &str, tool_ran: bool) -> Option<&'static str> {
+    if let Some(marker) = find_claim_marker(COMMITMENT_MARKERS, reply) {
+        return Some(marker);
+    }
+    if tool_ran {
+        return None;
+    }
+    find_claim_marker(COMPLETION_MARKERS, reply)
+}
+
+/// 日志判据：调过工具就不算空承诺，否则看回复里有没有"我发了/我再发"这类说法。
 fn unbacked_action_claim(reply: &str, facts: &[ToolFact]) -> Option<&'static str> {
     if !facts.is_empty() {
         return None;
@@ -2178,8 +2210,8 @@ mod tests {
         build_messages, claimed_action, commitment_nudge, continuation_prompt,
         counts_as_peer_activity, idle_delay, idle_prompt, peer_is_speaking_now,
         phone_system_prompt, preview_chars, render_self_test, request_end, requested_end,
-        sanitize_reply, strip_protocol_markers, summarize_tool_arguments, unbacked_action_claim,
-        wants_continue, wants_hangup, wants_monologue,
+        retry_worthy_claim, sanitize_reply, strip_protocol_markers, summarize_tool_arguments,
+        unbacked_action_claim, wants_continue, wants_hangup, wants_monologue,
     };
     use crate::config::QqCallConfig;
     use serde_json::Value;
@@ -2711,6 +2743,36 @@ mod tests {
                 "这句该被判为空承诺: {line}"
             );
         }
+    }
+
+    /// 真发过之后的"发好啦"是真的，不该再白跑两轮模型调用；整轮没动手就还得补跑。
+    #[test]
+    fn completion_claims_are_judged_against_this_turn_tools() {
+        let sent = vec![ToolFact {
+            name: "group.message.send".to_string(),
+            succeeded: true,
+            detail: "[sent] message_id=765823324 status=ok".to_string(),
+        }];
+        // 2026-09-13 真机：她真的发出去了（[sent] ok），旧判据还是补跑了 1/2、2/2。
+        assert_eq!(
+            retry_worthy_claim("发好啦，月屋子里已经有一句\"晚上好\"了。", true),
+            None
+        );
+        // 整轮一个工具都没调就这么说 → 必须补跑。
+        assert_eq!(
+            retry_worthy_claim("发好啦，你看看收到没。", false),
+            Some("发好啦")
+        );
+        // 承诺类不受"前几轮调过工具"影响：这一轮承诺的是新动作。
+        assert_eq!(
+            retry_worthy_claim("好，那我再发一条给你。", true),
+            Some("我再发")
+        );
+        // 补跑判据与日志判据是两件事：有工具结果时日志不告警。
+        assert_eq!(
+            unbacked_action_claim("发好啦，月屋子里已经有一句\"晚上好\"了。", &sent),
+            None
+        );
     }
 
     /// 电话提示词必须带上"必须真做"和"没收到就重发"这两条硬规则。
