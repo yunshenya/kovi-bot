@@ -27,7 +27,7 @@ use crate::model::{
 use crate::speech::SpeechClient;
 use kovi::tokio::sync::mpsc;
 use serde_json::Value;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -59,6 +59,13 @@ const TOOL_FILLER_DELAY: Duration = Duration::from_millis(700);
 
 /// 工具参数写进日志时的截断长度。电话里说的话可能包含私事，只留够排查的片段。
 const TOOL_ARGUMENT_LOG_CHARS: usize = 160;
+
+/// 对端最后一次出声距今多久之内，就当她还在说话。
+///
+/// 取值要盖住两段延迟：VAD 判"说完了"要 540 毫秒静音，识别再要 0.2–0.5 秒——
+/// 也就是说"他停止说话"到"回复链看见那句话"之间有将近一秒的窗口。这段时间里
+/// 她绝不能开口，否则就是抢在对方半句话中间问"你怎么不说话"。
+const PEER_VOICE_HOLD: Duration = Duration::from_millis(1_500);
 
 /// 还没有人要求结束时的信号值。
 const NO_END: u8 = u8::MAX;
@@ -159,6 +166,12 @@ impl EndTrigger {
 
 /// 两条链路之间传"该结束了"的信号。
 type EndSignal = Arc<AtomicU8>;
+
+/// 对端最近一次出声的时刻（相对通话起点的毫秒数），由采集链每帧刷新。
+///
+/// 采集链看得见音频，回复链看不见；而"他现在是不是正在说话"必须让回复链知道——
+/// 否则她会挑在对方刚开口、话还没说完的时候问一句"你还在吗"。
+type PeerVoiceAt = Arc<AtomicU64>;
 
 /// 请求结束本次会话。先到先得：已经有人要求过了就不覆盖，免得后到的原因把真实
 /// 原因盖掉（例如模型刚判断完该结束、采集链又报了一次音频中断）。
@@ -270,6 +283,12 @@ pub(super) async fn run(
     // 会话收尾时如果电话还通着，再用桥的 `POST /v1/calls/hangup`
     // （AVSDK 控制方法，默认 cmd 10 = `Close`）真的挂断，不再只能等对方挂断。
     let end_signal: EndSignal = Arc::new(AtomicU8::new(NO_END));
+    // 通话内的单调时钟 + "对端最近一次出声"的时间戳（毫秒，取自这个时钟）。
+    // 采集链每帧刷新后者，回复链靠它避免在对方话说到一半时插一句"你还在吗"——
+    // 2026-09-13 实测：打断信号是一次性边沿，还会被 `speak()` 的开头清空，所以
+    // "他此刻正在说话"这件事必须由看得见音频的那条链持续广播，不能靠信号猜。
+    let clock = Instant::now();
+    let peer_voice_at: PeerVoiceAt = Arc::new(AtomicU64::new(0));
     // 工具通道只对授权来电者开放（名单外连开场白都是婉拒，没有对话可谈）。
     let phone_tools = if allowed {
         PhoneTools::prepare(&bot, config, caller).await
@@ -291,6 +310,8 @@ pub(super) async fn run(
             Arc::clone(&end_signal),
             phone_tools,
             peer,
+            clock,
+            Arc::clone(&peer_voice_at),
         ),
     ));
 
@@ -403,6 +424,11 @@ pub(super) async fn run(
             };
 
         let outcome = segmenter.push(&frame);
+        // 对端此刻有声音（或在录一段话）就记一笔：通话中"他现在正在说话"要持续可见，
+        // 不能只在起始帧发一次边沿信号。
+        if outcome.speech_started || segmenter.recording() {
+            peer_voice_at.store(clock.elapsed().as_millis() as u64, Ordering::Relaxed);
+        }
         // 第一次收到对端语音说明整条采集链路是通的；只报一次，避免刷日志。
         if !first_speech_seen && segmenter.recording() {
             first_speech_seen = true;
@@ -484,6 +510,8 @@ async fn respond(
     end_signal: EndSignal,
     tools: Option<PhoneTools>,
     peer: String,
+    clock: Instant,
+    peer_voice_at: PeerVoiceAt,
 ) {
     let context = match caller {
         Some(caller) => load_caller_context(caller).await,
@@ -653,10 +681,13 @@ async fn respond(
                 }
             }
             Wake::Idle => {
-                // 采集链一发现对方起头就会发打断信号。有信号在，说明他正要说话：
-                // 这里不主动出声，把话头让给他（她抢话比沉默更糟）。
-                if interrupts.try_recv().is_ok() {
-                    println!("[INFO] QQ 通话主动出声：对方刚好开口，这一轮不说了");
+                // 对方还在说话就绝不开口。这一层不是"信号到了没到"的问题：他可能
+                // 已经说了十秒、信号早被消费掉了，只有采集链的时间戳知道他现在张着嘴。
+                if peer_is_speaking_now(&peer_voice_at, clock) || interrupts.try_recv().is_ok() {
+                    // 让位但**不消耗**主动出声次数，只把计时重新压后：他这句话说完
+                    // 会走正常识别→回复，那才是她该出声的地方。
+                    last_activity = Instant::now();
+                    println!("[INFO] QQ 通话主动出声：对方正在说话，这一轮不说了");
                     continue;
                 }
                 let silent_secs = last_activity.elapsed().as_secs();
@@ -687,7 +718,7 @@ async fn respond(
                     continue;
                 };
                 // 生成这一句要一两秒，对方完全可能在这期间开口——再确认一次。
-                if interrupts.try_recv().is_ok() {
+                if peer_is_speaking_now(&peer_voice_at, clock) || interrupts.try_recv().is_ok() {
                     println!("[INFO] QQ 通话主动出声：生成期间对方开口了，这一句不说了");
                     continue;
                 }
@@ -734,6 +765,22 @@ fn idle_delay(base: Duration, nudges: usize) -> Duration {
 /// 只是换了个更难发现的成因。
 fn counts_as_peer_activity(transcribed: &str) -> bool {
     !transcribed.trim().is_empty()
+}
+
+/// 对端现在是不是还在说话。
+///
+/// 采集链每帧把"听到声音"的时间戳写进 [`PeerVoiceAt`]（毫秒，取自通话开始的
+/// 单调时钟）；这里只看它离现在够不够近。为什么不能只靠打断信号：那是**边沿**
+/// 事件，对方说上十秒也只发一次，而且会被 `speak()` 开头清理陈旧信号时吃掉。
+/// 2026-09-13 真机就是这样：她挑在对方一句话说到一半时问"你还在听吗"，
+/// 日志里那句"对方开口后第 1 次"和对方的识别文本前脚后脚。
+fn peer_is_speaking_now(peer_voice_at: &PeerVoiceAt, clock: Instant) -> bool {
+    let last = peer_voice_at.load(Ordering::Relaxed);
+    if last == 0 {
+        return false;
+    }
+    let now_ms = clock.elapsed().as_millis() as u64;
+    now_ms.saturating_sub(last) < PEER_VOICE_HOLD.as_millis() as u64
 }
 
 /// 主动出声时给模型的现场说明。
@@ -1823,15 +1870,18 @@ async fn archive_call(
 #[cfg(test)]
 mod tests {
     use super::{
-        CallPhase, EndTrigger, NO_END, PhoneReply, PhoneTurn, TOOL_ARGUMENT_LOG_CHARS,
+        CallPhase, EndTrigger, NO_END, PeerVoiceAt, PhoneReply, PhoneTurn, TOOL_ARGUMENT_LOG_CHARS,
         TOOL_FACT_HISTORY_CHARS, ToolFact, ToolOutcome, Turn, build_messages, claimed_action,
-        commitment_nudge, counts_as_peer_activity, idle_delay, idle_prompt, phone_system_prompt,
-        preview_chars, render_self_test, request_end, requested_end, sanitize_reply,
-        strip_protocol_markers, summarize_tool_arguments, unbacked_action_claim, wants_hangup,
+        commitment_nudge, counts_as_peer_activity, idle_delay, idle_prompt, peer_is_speaking_now,
+        phone_system_prompt, preview_chars, render_self_test, request_end, requested_end,
+        sanitize_reply, strip_protocol_markers, summarize_tool_arguments, unbacked_action_claim,
+        wants_hangup,
     };
     use crate::config::QqCallConfig;
     use serde_json::Value;
-    use std::time::Duration;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
 
     #[test]
     fn end_triggers_carry_their_own_reason_and_hangup_decision() {
@@ -2326,6 +2376,22 @@ mod tests {
         assert!(counts_as_peer_activity("你随便找一个群说一下就行了。"));
         assert!(!counts_as_peer_activity(""));
         assert!(!counts_as_peer_activity("   \n\t "));
+    }
+
+    /// "对方此刻还在说话"靠采集链持续广播的时间戳判断，不靠一次性打断信号——
+    /// 2026-09-13 真机上她就是挑在对方半句话中间问"你还在听吗"。
+    #[test]
+    fn peer_voice_hold_blocks_talking_over_him() {
+        let clock = Instant::now() - Duration::from_secs(10);
+        let peer_voice_at: PeerVoiceAt = Arc::new(AtomicU64::new(0));
+        // 整通电话还没听到过他出声：不拦。
+        assert!(!peer_is_speaking_now(&peer_voice_at, clock));
+        // 最后一次出声在 9 秒前：早说完了，不拦。
+        peer_voice_at.store(1_000, Ordering::Relaxed);
+        assert!(!peer_is_speaking_now(&peer_voice_at, clock));
+        // 此刻还在出声：必须拦（他可能已经说了十秒，信号早没了）。
+        peer_voice_at.store(clock.elapsed().as_millis() as u64, Ordering::Relaxed);
+        assert!(peer_is_speaking_now(&peer_voice_at, clock));
     }
 
     /// 主动出声的现场说明：先问怎么了、顺手把欠着的事做完、不许重复、不许挂断。

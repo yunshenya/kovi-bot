@@ -144,8 +144,12 @@ pub struct QqCallConfig {
     /// 对方安静多少秒后她主动出声（0 = 关闭主动出声）。
     ///
     /// 电话不能是"我说一句她答一句"：对方不说话时她一直静音，听起来像掉线。到点她会
-    /// 主动说一句（"喂？你还在吗""怎么了呀，怎么不说话"），也会借这一轮把没做完的事
-    /// 做完再报结果。连续主动出声按倍数退避（6/12/24/48 秒），次数上限见 `idle_prompt_max`。
+    /// 主动说一句（"喂？你还在吗""怎么了呀"），也会借这一轮把没做完的事做完再报结果。
+    /// 连续主动出声按倍数退避（20/40/80/160 秒），次数上限见 `idle_prompt_max`。
+    ///
+    /// 默认 20 秒是调出来的：第一版给 6 秒，真机上她刚讲完一句、对方还在听（或者
+    /// 正等着她接着讲）就开始问"你还在听吗"——人的正常停顿被当成了掉线。计时从
+    /// **她说完那一刻**起算，所以这个值要按"她说完之后对方多久没接话"来读。
     idle_prompt_secs: u64,
     /// 一次通话里连续主动出声的次数上限（对方一直不回应时）。
     ///
@@ -578,7 +582,7 @@ impl Default for QqCallConfig {
             tool_filler: "嗯……我看一下。".to_string(),
             tool_max_rounds: 3,
             claim_retry_rounds: 2,
-            idle_prompt_secs: 6,
+            idle_prompt_secs: 20,
             idle_prompt_max: 3,
         }
     }
@@ -685,7 +689,7 @@ mod tests {
     fn proactive_speech_and_claim_retry_defaults_are_on_and_bounded() {
         let config = QqCallConfig::default();
         // 默认就要能"没人说话时她先开口"，否则电话还是我说一句她答一句。
-        assert_eq!(config.idle_prompt_secs(), 6);
+        assert_eq!(config.idle_prompt_secs(), 20);
         assert_eq!(config.idle_prompt_max(), 3);
         // 空承诺默认补跑两轮：一轮可能又被模型糊弄过去，两轮足够逼出真调用。
         assert_eq!(config.claim_retry_rounds(), 2);
