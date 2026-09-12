@@ -12,13 +12,18 @@ Environment=PYTHONUNBUFFERED=1
 ExecStart=/home/ubuntu/yunxi-embed/.venv/bin/python /home/ubuntu/yunxi-embed/service.py \
     --model /home/ubuntu/yunxi-embed/models/onnx/model_quantized.onnx \
     --tokenizer /home/ubuntu/yunxi-embed/models/tokenizer.json \
-    --reranker-model /home/ubuntu/yunxi-embed/models-reranker/onnx/model_quantized.onnx \
-    --reranker-tokenizer /home/ubuntu/yunxi-embed/models-reranker/tokenizer.json \
     --host 127.0.0.1 \
     --port 6112
 
 Restart=always
 RestartSec=3
+
+# 内存围栏：这个服务加载 ONNX 模型（实测 embedding 约 250MB、再加重排器会到 984MB），
+# 而机器只有 3.7GB、还跑着 NapCat/QQ 与语音服务。2026-09-12 就是因为没围栏，
+# 它涨到 984MB 把整机拖到 load 55，最后被内核 OOM 杀掉、SSH 都连不上。
+# 有了 MemoryMax，超限只会杀这一个服务（systemd 自己动手），不动其它任何人。
+MemoryHigh=512M
+MemoryMax=700M
 
 # 只服务本机：不监听公网，也不需要任何特权。
 NoNewPrivileges=yes
