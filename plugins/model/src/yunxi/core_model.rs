@@ -4208,6 +4208,27 @@ fn is_ambient_group_message(message: &yunxi_core::MessageReceivedEvent) -> bool 
         && !message.explicit_request
 }
 
+/// 是否被"明确点名"：结构化 `@` 她本人，或引用回复她。
+///
+/// 这条判定决定群聊回复节奏走普通间隔还是被点名间隔（见
+/// `reserve_group_chat_reply` 的 `gap_secs`）。文本里出现"芸汐"也算
+/// `addressed_to_agent`，但它同样是有指向的呼叫，因此与结构化点名同一条
+/// 通道；真正的差异只在于——未点名的接话仍然吃满 `reply_gap_secs`。
+fn explicitly_addressed_group_message(message: &yunxi_core::MessageReceivedEvent) -> bool {
+    message.conversation_kind == ConversationKind::Group
+        && (message.addressed_to_agent || message.replies_to_agent)
+}
+
+/// 被点名消息使用的回复间隔；未点名消息沿用普通间隔。
+fn group_reply_gap_secs_for(message: &yunxi_core::MessageReceivedEvent) -> u64 {
+    let config = config::get();
+    let group = config.group_interjection();
+    if explicitly_addressed_group_message(message) {
+        return group.effective_addressed_reply_gap_secs();
+    }
+    group.reply_gap_secs()
+}
+
 fn core_message_prompt(message: &yunxi_core::MessageReceivedEvent) -> String {
     let text = message.content.as_text().trim();
     let group_message = (message.conversation_kind == ConversationKind::Group).then(|| {
@@ -4747,27 +4768,46 @@ impl ModelBackend for KoviModelBackend {
                 crate::model::finish(ticket).await;
                 return Ok(silent_with_interaction_state(input));
             }
-            // 群聊可见回复节奏：同群普通聊天回复（点名或未点名）共享与
-            // Host 相同的确定性预算，管理员与普通成员同等受限。预算被拒时
-            // 保持观察（状态更新照常），但不生成可见回复——这是"几乎每句话
-            // 都回"的兜底。显式多消息请求（explicit_message_count）、识图与
-            // 受控工具调用是用户的明确请求，不受此限。
+            // 群聊可见回复节奏：同群普通聊天回复共享与 Host 相同的确定性
+            // 预算，管理员与普通成员同等受限。预算被拒时保持观察（状态更新
+            // 照常），但不生成可见回复——这是"几乎每句话都回"的兜底。
+            // 显式多消息请求（explicit_message_count）、识图与受控工具调用
+            // 是用户的明确请求，不受此限。
+            //
+            // 被明确点名的消息走更短的 `addressed_reply_gap_secs`：有人直接
+            // 问她问题时，"同群回复间隔还没到"不该让问题被静默丢掉（现场：
+            // 群里 @她提问，21 秒前刚回过别人，于是永远没有回答）。放松的
+            // 只是等待时长，`reply_rate_limit` 频率上限对两者一致。
             if let Some(group_message) = message
                 && let QqConversation::Group { group_id } = conversation
                 && group_message.conversation_kind == ConversationKind::Group
                 && explicit_message_count.is_none()
                 && !expects_vision
                 && !requested_tool_turn
-                && !crate::model::reserve_group_chat_reply(group_id).await
             {
-                kovi::log::info!(
-                    "Yunxi Core group reply paced: event_id={} message_id={} conversation_id={} action=silent",
-                    input.event.id(),
-                    message_id_for_log(input),
-                    conversation_id_for_log(input),
-                );
-                crate::model::finish(ticket).await;
-                return Ok(silent_with_interaction_state(input));
+                let addressed = explicitly_addressed_group_message(group_message);
+                let gap_secs = group_reply_gap_secs_for(group_message);
+                if !crate::model::reserve_group_chat_reply(group_id, gap_secs).await {
+                    let snapshot =
+                        crate::model::group_reply_budget_snapshot(group_id, gap_secs).await;
+                    let gap_remaining_ms = snapshot
+                        .gap_remaining_ms
+                        .map_or_else(|| "none".to_owned(), |ms| ms.to_string());
+                    kovi::log::info!(
+                        "Yunxi Core group reply paced: event_id={} message_id={} conversation_id={} group_id={} addressed={} gap_secs={} gap_remaining_ms={} replies_in_window={}/{} action=silent",
+                        input.event.id(),
+                        message_id_for_log(input),
+                        conversation_id_for_log(input),
+                        group_id,
+                        addressed,
+                        gap_secs,
+                        gap_remaining_ms,
+                        snapshot.replies_in_window,
+                        snapshot.rate_limit,
+                    );
+                    crate::model::finish(ticket).await;
+                    return Ok(silent_with_interaction_state(input));
+                }
             }
             let route_decision = select_host_model_route(
                 input,

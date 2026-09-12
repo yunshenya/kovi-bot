@@ -54,6 +54,11 @@ pub struct GroupInterjectionConfig {
     /// 同群两次群聊可见回复（点名或未点名）之间的最短间隔（秒）。
     /// 对"每句话都回"的刷屏波次做硬性控制；管理员豁免。
     reply_gap_secs: u64,
+    /// 被明确点名的消息（`@` 她本人或引用她）在两次可见回复之间的最短
+    /// 间隔（秒）。它只放松"等一等"，不放松频率上限：直接提问不该被
+    /// 静默丢掉，但预算耗尽时仍然按 `reply_rate_limit` 拒绝。
+    /// 取值必须 ≤ `reply_gap_secs`，否则退回 `reply_gap_secs`。
+    addressed_reply_gap_secs: u64,
     /// 群聊可见回复频率统计窗口（秒）。
     reply_rate_window_secs: u64,
     /// 统计窗口内同一群最多输出多少条可见回复（Admin/命令/识图等显式
@@ -150,6 +155,16 @@ impl GroupInterjectionConfig {
         self.reply_gap_secs
     }
 
+    /// 被点名消息使用的回复间隔。配置值大于普通间隔（或为 0）时视为无效，
+    /// 退回普通间隔——这条通道只允许比默认节奏更宽松的显式配置生效。
+    pub fn effective_addressed_reply_gap_secs(&self) -> u64 {
+        if self.addressed_reply_gap_secs == 0 || self.addressed_reply_gap_secs > self.reply_gap_secs
+        {
+            return self.reply_gap_secs;
+        }
+        self.addressed_reply_gap_secs
+    }
+
     pub fn reply_rate_window_secs(&self) -> u64 {
         self.reply_rate_window_secs
     }
@@ -206,6 +221,13 @@ impl GroupInterjectionConfig {
         {
             return Err(anyhow::anyhow!("群聊回复节奏配置必须大于0"));
         }
+        if self.addressed_reply_gap_secs > self.reply_gap_secs {
+            return Err(anyhow::anyhow!(
+                "被点名回复间隔不能大于普通回复间隔（{0} > {1}）",
+                self.addressed_reply_gap_secs,
+                self.reply_gap_secs
+            ));
+        }
         Ok(())
     }
 }
@@ -235,6 +257,7 @@ impl Default for GroupInterjectionConfig {
             familiar_rate_limit: 6,
             continuation_window_secs: 180,
             reply_gap_secs: 90,
+            addressed_reply_gap_secs: 20,
             reply_rate_window_secs: 600,
             reply_rate_limit: 4,
         }
@@ -257,5 +280,34 @@ mod tests {
             ..GroupInterjectionConfig::default()
         };
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn addressed_reply_gap_must_not_exceed_the_normal_gap() {
+        let config = GroupInterjectionConfig {
+            reply_gap_secs: 90,
+            addressed_reply_gap_secs: 120,
+            ..GroupInterjectionConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn invalid_addressed_reply_gap_falls_back_to_the_normal_gap() {
+        let default_gap = GroupInterjectionConfig::default().reply_gap_secs();
+        for invalid in [0, default_gap + 1] {
+            let config = GroupInterjectionConfig {
+                addressed_reply_gap_secs: invalid,
+                ..GroupInterjectionConfig::default()
+            };
+            assert_eq!(config.effective_addressed_reply_gap_secs(), default_gap);
+        }
+
+        let configured = GroupInterjectionConfig {
+            reply_gap_secs: 90,
+            addressed_reply_gap_secs: 30,
+            ..GroupInterjectionConfig::default()
+        };
+        assert_eq!(configured.effective_addressed_reply_gap_secs(), 30);
     }
 }
