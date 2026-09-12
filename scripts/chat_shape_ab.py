@@ -52,6 +52,7 @@ SCENARIOS = [
     ("低落", "我今天什么都做不好，感觉特别没用。"),
     ("日常闲聊", "今天中午吃了碗牛肉面，还挺香的。"),
     ("明确提问", "帮我看看这个报错大概是哪一类问题？"),
+    ("需要展开", "给我讲讲你为什么觉得慢一点反而更快，我想听你自己的想法。"),
 ]
 
 
@@ -104,6 +105,17 @@ def asks(text: str) -> bool:
     return last.endswith(("吗", "呢", "吧", "，", ",", "、", "：", ":", "；", ";", "…", "—", "~"))
 
 
+def looks_complete(text: str) -> bool:
+    """Same rule as the host: only sentence-final punctuation counts as done."""
+    stripped = re.sub(rf"\s*{re.escape(BUBBLE_MARKER)}\s*", "\n", text).strip()
+    lines = [line.strip() for line in stripped.splitlines() if line.strip()]
+    if not lines:
+        return False
+    return lines[-1].endswith(
+        ("。", "！", "？", "!", "?", "～", "~", "…", "”", '"', "）", ")", "】", "]", "』", "」", "吧", "吗")
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--trials", type=int, default=3, help="每个场景每种契约跑几次")
@@ -148,6 +160,7 @@ def main() -> int:
                         "raw": raw,
                         "bubbles": split + 1,
                         "asks": asks(raw),
+                        "complete": looks_complete(raw),
                         "chars": len(re.sub(rf"\s*{re.escape(BUBBLE_MARKER)}\s*", "", raw).strip()),
                     }
                 )
@@ -160,19 +173,22 @@ def main() -> int:
             "n": len(rows),
             "asks_rate": sum(row["asks"] for row in rows) / len(rows),
             "multi_bubble_rate": sum(row["bubbles"] > 1 for row in rows) / len(rows),
+            "incomplete_rate": sum(not row["complete"] for row in rows) / len(rows),
             "mean_chars": statistics.mean(row["chars"] for row in rows),
             "mean_bubbles": statistics.mean(row["bubbles"] for row in rows),
         }
 
     print(f"模型 {args.model}   每场景 {args.trials} 次   场景 {len(SCENARIOS)} 个")
-    print(f"{'契约':<10}{'样本':>5}{'提问率':>9}{'多气泡率':>10}{'均条数':>8}{'均字数':>8}")
+    print(
+        f"{'契约':<10}{'样本':>5}{'提问率':>9}{'多气泡率':>10}{'未完句率':>10}{'均条数':>8}{'均字数':>8}"
+    )
     for variant in ("legacy", "current"):
         stats = summarize(variant)
         if not stats:
             continue
         print(
             f"{variant:<10}{stats['n']:>5}{stats['asks_rate']:>8.0%}{stats['multi_bubble_rate']:>10.0%}"
-            f"{stats['mean_bubbles']:>8.2f}{stats['mean_chars']:>8.1f}"
+            f"{stats['incomplete_rate']:>10.0%}{stats['mean_bubbles']:>8.2f}{stats['mean_chars']:>8.1f}"
         )
 
     print("\n逐条（current 契约）:")
