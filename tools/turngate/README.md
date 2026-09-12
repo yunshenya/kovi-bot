@@ -58,9 +58,17 @@ python3 tools/turngate/collector.py --journal /tmp/tg-journal.txt \
 #       脱敏(URL/长数字), 不透明 source_key(删除屏障用)
 
 # 2) 人工复核(≥500 条/周 达成后产出第一版 v0.1 训练集)
+#    先排"标注价值"的队：只用不依赖策略的客观信号（弱标签有没有判断、上下文
+#    够不够、标签稀不稀有）。**不要**拿"线上实际回了没有"来排序或当标签——那等于
+#    把现有的概率/冷却/时间窗策略抄进权重（doc §7.4 E）。
+python3 tools/turngate/review.py --batch review-batch-*.jsonl --queue
+python3 tools/turngate/review.py --batch review-batch-*.jsonl --show 1221
 python3 tools/turngate/review.py --batch review-batch-*.jsonl --status
-python3 tools/turngate/review.py --batch review-batch-*.jsonl --mark 3 completion=flush_now response=answer
+python3 tools/turngate/review.py --batch review-batch-*.jsonl --mark 1221 completion=flush_now response=answer
 python3 tools/turngate/review.py --batch review-batch-*.jsonl --export train_turngate-v0.1.jsonl --min-agreement 0.9
+# 队列 tier：0/1 灰区（lexical 给不出判断，信息量最大）、2 无上下文、
+# 3 无机器人发言、4 其余；`--queue` 头部会打印上下文覆盖率，覆盖率低说明
+# 导出格式或时间窗有问题，先回去查第 1 步。
 
 # 3) 训练(默认仅人工复核/种子集; --include-pseudo 只做候选对比)
 python3 tools/turngate/train.py --data train_turngate-v0.1.jsonl \
