@@ -2768,10 +2768,14 @@ impl MemoryManager {
                 continue;
             }
             let bytes = vector_to_bytes(vector);
-            query(
+            // `WHERE EXISTS` 是必须的，不是防御性编程：SELECT 与 INSERT 之间那条记忆
+            // 可能被并发的压缩（去重/保留期）删掉——真机上就是这么炸的
+            // （外键违反）。用 EXISTS 把它变成"跳过这条"，而不是让整批回填失败。
+            let affected = query(
                 r#"
                 INSERT INTO kovi_bot_memory_embeddings (memory_id, model, dim, vector, updated_at)
-                VALUES ($1, $2, $3, $4, NOW())
+                SELECT $1, $2, $3, $4, NOW()
+                WHERE EXISTS (SELECT 1 FROM kovi_bot_memories WHERE id = $1)
                 ON CONFLICT (memory_id) DO UPDATE
                 SET model = EXCLUDED.model,
                     dim = EXCLUDED.dim,
@@ -2784,7 +2788,13 @@ impl MemoryManager {
             .bind(vector.len() as i32)
             .bind(&bytes)
             .execute(&mut *transaction)
-            .await?;
+            .await
+            .map_err(|error| anyhow::anyhow!("写入记忆向量失败（{memory_id}）: {error}"))?
+            .rows_affected();
+            if affected == 0 {
+                // 这条记忆在我们编码期间消失了，跳过即可——它已经不存在，没有向量也无所谓。
+                continue;
+            }
             saved += 1;
         }
         transaction.commit().await?;

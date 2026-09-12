@@ -733,17 +733,34 @@ async fn main() {
             health_checker.start_health_monitoring().await;
         });
 
+        // 记忆向量回填单独跑一条**快**循环：主维护是每天一次，而回填 1000 条记忆
+        // 按批 128 算要八天——那样语义检索会长期只认得新记忆，等于"想起什么取决于
+        // 她什么时候记下的"。这里每 5 分钟补一批，回填完就空转（一条带索引的查询）。
+        let backfill_manager = Arc::clone(&memory::MEMORY_MANAGER);
+        kovi::tokio::spawn(async move {
+            let mut consecutive_failures = 0_u32;
+            loop {
+                kovi::tokio::time::sleep(kovi::tokio::time::Duration::from_secs(300)).await;
+                match backfill_manager.backfill_embeddings().await {
+                    Ok(_) => consecutive_failures = 0,
+                    Err(error) => {
+                        consecutive_failures += 1;
+                        // 嵌入服务长期不可用时别刷屏：第一次报，之后每小时报一次。
+                        if consecutive_failures == 1 || consecutive_failures % 12 == 0 {
+                            eprintln!(
+                                "[ERROR] 记忆向量回填失败（连续 {consecutive_failures} 次）: {error}"
+                            );
+                        }
+                    }
+                }
+            }
+        });
+
         let maintenance_memory_manager = Arc::clone(&memory::MEMORY_MANAGER);
         kovi::tokio::spawn(async move {
             loop {
                 if let Err(error) = maintenance_memory_manager.compact_memories().await {
                     eprintln!("[ERROR] 定期记忆清理失败: {}", error);
-                }
-                // 记忆向量回填：这一步是"新增了向量之后，老记忆也看得见"的保证。
-                // 不回填的话，语义那一路只认新记忆——那等于"想起什么取决于她什么时候
-                // 记下的"，是最难发现的静默偏差。
-                if let Err(error) = maintenance_memory_manager.backfill_embeddings().await {
-                    eprintln!("[ERROR] 记忆向量回填失败: {error}");
                 }
                 if let Some(store) = yunxi::memory_store() {
                     match store.cleanup(chrono::Utc::now()).await {
