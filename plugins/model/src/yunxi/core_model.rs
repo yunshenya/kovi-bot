@@ -3331,7 +3331,16 @@ impl KoviModelBackend {
             actor_user_id,
             is_admin,
             is_main_admin,
-            context: "yunxi_core",
+            // 这里的 `context` 会一路传到记忆检索的 SQL 里当作用域判据
+            // （`query_memories_for_model` 的 `ELSE context = $2` 分支），所以它必须是
+            // **库里真实存在的取值**。原来写的是 "yunxi_core"——而库里没有任何一条
+            // 记忆的 context 是这个值（实际是 private_chat / group_chat / …），
+            // 于是 memory.search 在私聊里**永远返回空**。写成 'private' / 'group'
+            // 会走 `scope_type = $2` 分支，按作用域取，这才是想表达的意思。
+            context: match destination {
+                MessageDestination::Private(_) => "private",
+                MessageDestination::Group(_) => "group",
+            },
             destination,
             source_message_id: None,
             scheduled: false,
