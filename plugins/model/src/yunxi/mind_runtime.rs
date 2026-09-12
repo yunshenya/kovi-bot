@@ -2236,14 +2236,17 @@ impl MindRuntime {
                 content: format!("A：{existing}\nB：{candidate}"),
             },
         ];
-        let response = kovi::tokio::time::timeout(
-            STANCE_MODEL_TIMEOUT,
-            crate::model::utils::params_model_with_plain_style_context(
-                &mut messages,
-                Some(8),
-                &[],
-                None,
-                None,
+        let response = crate::model::llm_trace::with_purpose(
+            "stance_dedup",
+            kovi::tokio::time::timeout(
+                STANCE_MODEL_TIMEOUT,
+                crate::model::utils::params_model_with_plain_style_context(
+                    &mut messages,
+                    Some(8),
+                    &[],
+                    None,
+                    None,
+                ),
             ),
         )
         .await;
@@ -2288,14 +2291,17 @@ impl MindRuntime {
             )
             .await?;
         let mut messages = stance_formation_messages(input, &existing);
-        let response = kovi::tokio::time::timeout(
-            STANCE_MODEL_TIMEOUT,
-            crate::model::utils::params_model_with_plain_style_context(
-                &mut messages,
-                Some(STANCE_MAX_TOKENS),
-                &[],
-                None,
-                None,
+        let response = crate::model::llm_trace::with_purpose(
+            "stance_formation",
+            kovi::tokio::time::timeout(
+                STANCE_MODEL_TIMEOUT,
+                crate::model::utils::params_model_with_plain_style_context(
+                    &mut messages,
+                    Some(STANCE_MAX_TOKENS),
+                    &[],
+                    None,
+                    None,
+                ),
             ),
         )
         .await;

@@ -4,6 +4,7 @@ mod conversation_state;
 mod gag_commands;
 mod group;
 mod interrupt;
+pub(crate) mod llm_trace;
 mod memory_query;
 mod memory_repository;
 mod message_actions;

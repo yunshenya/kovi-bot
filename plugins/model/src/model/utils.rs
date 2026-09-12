@@ -193,7 +193,7 @@ pub(crate) fn is_help_command(message: &str) -> bool {
 }
 
 pub(crate) fn command_help() -> &'static str {
-    "管理员可用指令：\n聊天：直接发送消息，或 @芸汐。\n图片：#看图、#看截图、#识图。\n提醒：直接说“提醒我……”即可创建提醒。\n持续任务：主管理员可在私聊中直接要求定期监测公开 URL，并自然地查看或取消任务。\n管理员：#系统信息、#健康检查、#禁言、#结束禁言；私聊可用 #mind-status、#intrinsic-status、#executive-status、#turn-gate-status、#立场、#通话状态 查看有界运行状态；主管理员与副管理员可以发 #打给我 让芸汐主动打过来，也可以发 #通话自检 问题 先离线验一遍电话里的工具链路（通话名单管的是谁能打进来，名单里的非管理员用不了这两条命令）。\n表情：引用或附带表情后直接描述含义即可教学，也可使用 #教芸汐、#待确认表情、#确认表情 编号 含义、#驳回表情 编号、#忽略表情 编号。\n群授权：#授权群 群号、#取消授权群 群号、#授权群列表。\n通话授权：#授权通话 QQ号、#取消授权通话 QQ号、#通话名单（主管理员与副管理员默认可以和芸汐通话）。\n私聊授权：#授权好友 QQ号、#取消授权好友 QQ号、#好友名单（授权后对方可私聊芸汐，仅主管理员可执行）。\n主管理员：#授权管理员 QQ号、#取消授权管理员 QQ号、#授权管理员列表；私聊中可以直接让芸汐去已授权群发消息。\n跨群问答：#群问答、#群问答状态 任务编号、#取消群问答 任务编号。\n数据：私聊发送 #删除我的数据；群内发送 #删除本群数据。\n也可以直接说“查看系统信息”“检查健康状态”“暂停本群回复”或“恢复本群回复”。"
+    "管理员可用指令：\n聊天：直接发送消息，或 @芸汐。\n图片：#看图、#看截图、#识图。\n提醒：直接说“提醒我……”即可创建提醒。\n持续任务：主管理员可在私聊中直接要求定期监测公开 URL，并自然地查看或取消任务。\n管理员：#系统信息、#健康检查、#禁言、#结束禁言；私聊可用 #mind-status、#intrinsic-status、#executive-status、#turn-gate-status、#立场、#通话状态 查看有界运行状态；#llm-trace 看模型调用轨迹（哪条管线跑过、发了什么回了什么）；主管理员与副管理员可以发 #打给我 让芸汐主动打过来，也可以发 #通话自检 问题 先离线验一遍电话里的工具链路（通话名单管的是谁能打进来，名单里的非管理员用不了这两条命令）。\n表情：引用或附带表情后直接描述含义即可教学，也可使用 #教芸汐、#待确认表情、#确认表情 编号 含义、#驳回表情 编号、#忽略表情 编号。\n群授权：#授权群 群号、#取消授权群 群号、#授权群列表。\n通话授权：#授权通话 QQ号、#取消授权通话 QQ号、#通话名单（主管理员与副管理员默认可以和芸汐通话）。\n私聊授权：#授权好友 QQ号、#取消授权好友 QQ号、#好友名单（授权后对方可私聊芸汐，仅主管理员可执行）。\n主管理员：#授权管理员 QQ号、#取消授权管理员 QQ号、#授权管理员列表；私聊中可以直接让芸汐去已授权群发消息。\n跨群问答：#群问答、#群问答状态 任务编号、#取消群问答 任务编号。\n数据：私聊发送 #删除我的数据；群内发送 #删除本群数据。\n也可以直接说“查看系统信息”“检查健康状态”“暂停本群回复”或“恢复本群回复”。"
 }
 
 /// 只在私聊里生效的控制命令。
@@ -220,6 +220,7 @@ pub(crate) fn is_private_only_command(message: &str) -> bool {
             | "#删除我的数据 确认"
     ) || text.starts_with("#通话自检")
         || text.starts_with("#电话自检")
+        || text.starts_with("#llm-trace")
 }
 
 pub(crate) fn is_restricted_command(message: &str) -> bool {
@@ -234,6 +235,7 @@ pub(crate) fn is_restricted_command(message: &str) -> bool {
         || text == "#turn-gate-status"
         || text == "#立场"
         || text == "#信念"
+        || text.starts_with("#llm-trace")
         || text == "#通话状态"
         || text == "#通话诊断"
         || text == "#打给我"
@@ -2525,6 +2527,7 @@ async fn round_trip_model_request(
 ) -> Result<ModelPayload, String> {
     let mut last_error = String::new();
     let mut payload_response = None;
+    let attempt_started_total = Instant::now();
     let max_attempts = model_attempt_count(configured_retries);
     for attempt in 0..max_attempts {
         let attempt_started = Instant::now();
@@ -2545,8 +2548,16 @@ async fn round_trip_model_request(
                 let status = response.status();
                 match read_model_payload(response, progress, max_response_bytes).await {
                     Ok(payload) => {
+                        super::llm_trace::record_success(
+                            request_body,
+                            &payload,
+                            attempt_started.elapsed(),
+                            (attempt + 1) as u32,
+                            max_attempts as u32,
+                        );
                         kovi::log::info!(
-                            "Model gateway attempt: attempt={}/{} queue_wait_ms={} elapsed_ms={} status={} terminal=success response_chars={} tool_calls={} finish_reason={}",
+                            "Model gateway attempt: purpose={} attempt={}/{} queue_wait_ms={} elapsed_ms={} status={} terminal=success response_chars={} tool_calls={} finish_reason={}",
+                            super::llm_trace::current_purpose(),
                             attempt + 1,
                             max_attempts,
                             queue_wait_ms,
@@ -2561,7 +2572,8 @@ async fn round_trip_model_request(
                     }
                     Err(error) => {
                         kovi::log::warn!(
-                            "Model gateway attempt: attempt={}/{} queue_wait_ms={} elapsed_ms={} status={} terminal=parse_error",
+                            "Model gateway attempt: purpose={} attempt={}/{} queue_wait_ms={} elapsed_ms={} status={} terminal=parse_error",
+                            super::llm_trace::current_purpose(),
                             attempt + 1,
                             max_attempts,
                             queue_wait_ms,
@@ -2586,7 +2598,8 @@ async fn round_trip_model_request(
                     None => format!("模型请求返回 HTTP {status}"),
                 };
                 kovi::log::warn!(
-                    "Model gateway attempt: attempt={}/{} queue_wait_ms={} elapsed_ms={} status={} terminal=http_error retryable={}",
+                    "Model gateway attempt: purpose={} attempt={}/{} queue_wait_ms={} elapsed_ms={} status={} terminal=http_error retryable={}",
+                    super::llm_trace::current_purpose(),
                     attempt + 1,
                     max_attempts,
                     queue_wait_ms,
@@ -2615,7 +2628,8 @@ async fn round_trip_model_request(
                     "网络"
                 };
                 kovi::log::warn!(
-                    "Model gateway attempt: attempt={}/{} queue_wait_ms={} elapsed_ms={} status=none terminal=request_error category={} retryable={}",
+                    "Model gateway attempt: purpose={} attempt={}/{} queue_wait_ms={} elapsed_ms={} status=none terminal=request_error category={} retryable={}",
+                    super::llm_trace::current_purpose(),
                     attempt + 1,
                     max_attempts,
                     queue_wait_ms,
@@ -2641,7 +2655,21 @@ async fn round_trip_model_request(
             kovi::tokio::time::sleep(Duration::from_millis(delay_ms)).await;
         }
     }
-    payload_response.ok_or(last_error)
+    match payload_response {
+        Some(payload) => Ok(payload),
+        None => {
+            // 整次调用彻底失败（重试耗尽）也进轨迹：否则 `#llm-trace` 里
+            // 只看得到成功的调用，"她为什么不回话"就还是没有线索。
+            super::llm_trace::record_failure(
+                request_body,
+                attempt_started_total.elapsed(),
+                max_attempts as u32,
+                max_attempts as u32,
+                &last_error,
+            );
+            Err(last_error)
+        }
+    }
 }
 
 fn model_attempt_count(configured_retries: u8) -> usize {
@@ -4337,6 +4365,7 @@ mod tests {
         for command in [
             "#立场",
             "#信念",
+            "#llm-trace",
             "#mind-status",
             "#intrinsic-status",
             "#executive-status",
@@ -4348,6 +4377,8 @@ mod tests {
             "#通话自检 现在几点",
             "#删除我的数据",
             "#删除我的数据 确认",
+            "#llm-trace",
+            "#llm-trace 详情 1",
         ] {
             assert!(is_private_only_command(command), "{command} 应在群里被丢弃");
         }

@@ -1097,6 +1097,32 @@ merge
 
 ---
 
+# 17.2 LLM 调用可观测（2026-09-12，借鉴 Hindsight 的 llm_trace / prompt_preview）
+
+背景：这条开发会话里连续查出**四条"管道在，但静默地不干活"**的问题——belief 协议
+没进提示词、深度反思从未触发、群聊缺一整类命令分支、立场闸门槛太高。每次排查都是
+"读日志猜"，因为日志里只有 `Model gateway attempt: ... response_chars=2` 这种**匿名**
+记录：知道有人调了模型，不知道**是谁、为了什么、发了什么**。
+
+Hindsight 把可观测性做成一等公民（`llm_trace.py` 27KB、`prompt_preview.py` 25KB）。
+芸汐现在补了三件事（`model/llm_trace.rs`）：
+
+1. **用途标签**：`with_purpose("stance_formation", ...)`，用 task-local 传播，顶层入口
+   设一次，链上所有模型调用自动归到这个名字下，不必层层透传参数。
+   已接入：私聊回复、群聊回复、电话回复、立场形成、立场查重。
+2. **有界轨迹**：最近 64 次调用的提示词、回复、耗时、尝试次数、工具调用、结束原因。
+   `#llm-trace [条数]` 看列表，`#llm-trace 详情 <序号>` 看某一次的完整收发。
+3. **死管道检测**：把"本该会调的管线"和"真的调用过的"对起来，直接列出**从未调用**
+   的，并写明"查它的触发条件，而不是查它的实现"。
+4. **日志带上用途**：`Model gateway attempt: purpose=stance_formation attempt=1/3 ...`，
+   于是 `journalctl | grep purpose=stance_formation` 就能回答"它跑没跑"，不依赖命令。
+
+两条如实记下的缺口：**看图**（`vision.rs` 有自己的 HTTP 客户端，不经统一收口，轨迹
+抓不到）与**会话摘要**（摘要文本是外部传进 `update_conversation_summary` 的，生成点
+未定位）。它们不登记在"本该会调"的清单里——列了却没接会误报。
+
+---
+
 # 18. PreferenceState
 
 ## 18.1 目标

@@ -257,16 +257,19 @@ pub(super) async fn run(
     // 提示词里必须写明"电话那头是谁"：不然对方说"给我发条消息"，她连"我"是谁都不知道
     // （真机上就是这么反问回来的）。
     let peer = diagnostics::caller_label(caller, caller_name);
-    let responder = kovi::tokio::spawn(respond(
-        config.clone(),
-        caller,
-        Arc::clone(&speech),
-        Arc::clone(&transcript),
-        job_rx,
-        interrupt_rx,
-        Arc::clone(&end_signal),
-        phone_tools,
-        peer,
+    let responder = kovi::tokio::spawn(crate::model::llm_trace::with_purpose(
+        "phone_reply",
+        respond(
+            config.clone(),
+            caller,
+            Arc::clone(&speech),
+            Arc::clone(&transcript),
+            job_rx,
+            interrupt_rx,
+            Arc::clone(&end_signal),
+            phone_tools,
+            peer,
+        ),
     ));
 
     let opening = if allowed {

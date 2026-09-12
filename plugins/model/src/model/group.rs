@@ -166,7 +166,11 @@ pub async fn group_message_event(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>
     }
     let admission =
         ConversationCoordinator::begin_incoming(ReplyScope::Group(event.group_id)).await;
-    group_message_event_after_ingress(event, bot, admission).await;
+    crate::model::llm_trace::with_purpose(
+        "group_reply",
+        group_message_event_after_ingress(event, bot, admission),
+    )
+    .await;
     ConversationCoordinator::abandon_incoming(admission).await;
 }
 

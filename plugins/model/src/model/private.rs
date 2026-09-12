@@ -78,7 +78,13 @@ pub async fn private_message_event(event: Arc<PrivateMsgEvent>, bot: Arc<Runtime
     }
     let admission =
         ConversationCoordinator::begin_incoming(ReplyScope::Private(event.user_id)).await;
-    private_message_event_after_ingress(event, bot, admission).await;
+    // 打上用途标签：之后这条链上所有模型调用都归到"私聊回复"，
+    // `#llm-trace` 才分得清是谁在调模型。
+    crate::model::llm_trace::with_purpose(
+        "private_reply",
+        private_message_event_after_ingress(event, bot, admission),
+    )
+    .await;
     ConversationCoordinator::abandon_incoming(admission).await;
 }
 
@@ -224,6 +230,27 @@ pub(crate) async fn private_message_event_after_ingress(
     }
     if message.trim() == "#executive-status" && sender_is_admin {
         let report = crate::yunxi::executive_status_report();
+        send_private_direct_response(&bot, user_id, initial_admission, report).await;
+        return;
+    }
+    if let Some(args) = message.trim().strip_prefix("#llm-trace")
+        && sender_is_admin
+    {
+        // 模型调用轨迹：哪条管线跑过、哪条从未跑过，以及最近几次发了什么、回了什么。
+        let args = args.trim();
+        let report = if let Some(index) = args.strip_prefix("详情") {
+            match index.trim().parse::<usize>() {
+                Ok(index) if index > 0 => crate::model::llm_trace::report(0, Some(index)),
+                _ => "用法：#llm-trace 详情 <序号>（序号从 1 开始，1 是最近一次）".to_string(),
+            }
+        } else if args.is_empty() {
+            crate::model::llm_trace::report(10, None)
+        } else {
+            match args.parse::<usize>() {
+                Ok(limit) if limit > 0 => crate::model::llm_trace::report(limit.min(50), None),
+                _ => "用法：#llm-trace [条数] 或 #llm-trace 详情 <序号>".to_string(),
+            }
+        };
         send_private_direct_response(&bot, user_id, initial_admission, report).await;
         return;
     }
