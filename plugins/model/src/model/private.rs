@@ -115,6 +115,11 @@ pub(crate) async fn private_message_event_after_ingress(
         message,
     );
     if is_restricted_command(message) && !sender_is_admin {
+        // 注意：这里连 `#打给我` / `#通话自检` 一起按"管理员专用"拦掉了，而它们的实现
+        // 查的是通话授权名单——看着像 bug，其实是**有意的**：外呼是给管理员的动作，
+        // 通话授权名单只决定"谁能打进来"。真机上确实出现过"名单里的非管理员发
+        // #打给我、被静默、本人不知道为什么没反应"（2026-09-12），确认过保持静默。
+        // 要改这条策略请先想清楚"谁能让机器人主动打出去"这个问题。
         println!("[INFO] 私聊未授权命令已静默 (用户: {})", user_id);
         return;
     }
