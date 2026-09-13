@@ -260,6 +260,7 @@ async fn index(
         let target = match query.page.as_deref() {
             Some("config") => "/#/config",
             Some("memory") => "/#/memory",
+            Some("system") => "/#/system",
             _ => "/",
         };
         let secure = auth::is_secure_request(&headers);
