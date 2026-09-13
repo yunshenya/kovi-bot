@@ -64,7 +64,8 @@ pub(crate) use crate::model::conversation_coordinator::{
 pub(crate) use crate::model::group::{
     conversation_continuation_active_now, group_message_event_after_ingress,
     group_reply_budget_available_now, group_reply_budget_snapshot,
-    record_group_message_observation, reserve_group_chat_reply, should_suppress_core_group_message,
+    record_group_message_observation, record_group_target_experience, reserve_group_chat_reply,
+    should_suppress_core_group_message,
 };
 
 pub(crate) use crate::model::private::private_message_event_after_ingress;

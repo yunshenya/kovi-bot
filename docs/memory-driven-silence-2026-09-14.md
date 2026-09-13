@@ -90,6 +90,30 @@ tension=0.800 threshold=0.60 reason=relation_tension` 把它否决——那个�
 的证据照常累积。另外：数据修正立即生效，**代码修正要下一次发布才生效**——在那之前
 常驻的旧进程仍会给每个新建档的人种上 0.8。
 
+## 第二处修正：字面证据挂在一条走不到的路上（2026-09-14 晚）
+
+发布后回查日志发现，个人级那条**确定性字面证据一次都没记上账**：近 3 天
+`[RELATION] 相处证据已记账` **0 条**。
+
+**根因**。`record_target_experience` 只挂在 Host 群聊入口（`model/group.rs`），
+而它自己的准入门要求消息**指向她**（结构化 `@` 她本人，或正文叫她的名字）。
+这两个条件在路由上互斥：`bridge::classify_group` 把"指向她"的消息一律判给 Core，
+Host 入口根本不执行。于是形成死循环——骂她的那条必须指向她，指向她的那条又绕开
+这个函数——门控的消费者默认是开的（`silence.enabled`），证据源却永远沉默，
+只剩模型那条语义通道（`apply_interaction_cues` 的负向 valence）在兜。
+
+**修正**。入站级证据上移到两条路共同的入站点（`lib.rs` 的群聊入站闭包，与
+`record_group_message_observation` 同处），Host 那处删掉——留着会让 Host 路
+重复记账。顺带把三条静默返回（身份存储不可用 / 无 person 映射 / 无 relation 行）
+各补一行日志：在此之前"没被调用"和"调用了但没写成"在日志里长得一样，这次的
+0 条正卡在这个歧义上。
+
+**同形状的遗留**。`update_group_profile` / `learn_user_profile_from_message`
+（`model/group.rs`）也只在 Host 路执行，需要单独核对 Core 路是否另有覆盖。
+世界模型那条不算缺口：Core 侧另有 `[YUNXI_WORLD] observation kind=ConversationEvent`。
+长期记忆那条是另一处不同来源的口径问题（Core 路"投递成功才写"，被抽样后判沉默的
+回合什么都不留），另行处理。
+
 ## 已知边界与代价
 
 1. **`[silence] negative_threshold` 是预留旋钮**：门控用的是张力阈值（代码常量

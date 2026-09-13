@@ -11,7 +11,7 @@
 use crate::model::{
     ConversationCoordinator, group_message_event_after_ingress,
     private_message_event_after_ingress, recall_notice_event, record_group_message_observation,
-    should_suppress_core_group_message,
+    record_group_target_experience, should_suppress_core_group_message,
 };
 use kovi::PluginBuilder;
 use std::path::PathBuf;
@@ -473,10 +473,16 @@ async fn main() {
                 return;
             }
             let core_supported = bridge.supports_group(&event);
-            if core_supported && !bridge.is_user_blocked(event.user_id) {
-                // Preserve the Host-era Agent Task observation contract even
-                // when Core traffic is throttled or its queue is full.
-                record_group_message_observation(&event).await;
+            if !bridge.is_user_blocked(event.user_id) {
+                // 入站级副作用：与这一轮最后归 Host 还是归 Core 无关。相处证据
+                // 尤其不能挂在 Host 那条路上——"指向她"的消息正是判给 Core 的那批，
+                // 挂上去等于这条通道永远不生效（`group.rs` 的注释里有完整来龙去脉）。
+                record_group_target_experience(&event).await;
+                if core_supported {
+                    // Preserve the Host-era Agent Task observation contract even
+                    // when Core traffic is throttled or its queue is full.
+                    record_group_message_observation(&event).await;
+                }
             }
             if core_supported && should_suppress_core_group_message(&event, &bot).await {
                 println!(

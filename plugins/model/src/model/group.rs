@@ -208,6 +208,20 @@ pub(crate) async fn record_group_message_observation(event: &GroupMsgEvent) {
     }
 }
 
+/// 入站级相处证据：把这一轮里"指向她"的字面敌意/善意折进关系张力。
+///
+/// **必须由两条路都会经过的入站点调用**（`lib.rs` 的群聊入站闭包，与
+/// [`record_group_message_observation`] 同一处）。它原先挂在 Host 群聊入口，
+/// 而"指向她"的消息在 `classify_group` 里一律判给 Core，Host 根本不跑：骂她的
+/// 那条必须指向她，指向她的那条又绕开那个函数——线上近 3 天
+/// `[RELATION] 相处证据已记账` 一条都没有。模型那条语义通道（负向 valence →
+/// tension）负责阴阳怪气，这一条负责它可能看不见的直白辱骂/驱赶。
+pub(crate) async fn record_group_target_experience(event: &GroupMsgEvent) {
+    let text = bounded_input(event.borrow_text().unwrap_or_default());
+    let addressed = message_at_self(&event.message, event.self_id) || text_mentions_bot(&text);
+    record_target_experience(event.user_id, &text, addressed).await;
+}
+
 /// 群聊暂停控制命令的确定性解析：`Some(true)` = 禁言，`Some(false)` = 结束禁言。
 ///
 /// 只有这两个字面命令会命中；其余 `#` 命令走各自的控制面分支。
@@ -494,9 +508,10 @@ pub(crate) async fn group_message_event_after_ingress(
     }
     let structured_at_self = message_at_self(&event.message, event.self_id);
     let locally_addressed = structured_at_self || text_mentions_bot(message);
-    // 相处的确定性证据：只吃"指向她"的消息。模型那条语义通道负责阴阳怪气，
-    // 这一条负责它可能看不见的直白辱骂/驱赶；两者按同一刻度加到关系张力上。
-    record_target_experience(event.user_id, message, locally_addressed).await;
+    // 相处证据曾经在这里记账。它只对"指向她"的消息生效，而这批消息在
+    // `classify_group` 里判给 Core、走不到这个 Host 入口，所以已经上移到两条路
+    // 共同的入站点（`lib.rs` 的 `record_group_target_experience`）。不要在这里
+    // 加回来：那会让 Host 路重复记账，而 Core 路继续漏。
     // Shadow-mode World Model social scene feed: deterministic, no model
     // call, no reply influence (v4 §145–146). No-op when disabled.
     crate::yunxi::world_model::record_group_scene(
@@ -2200,22 +2215,28 @@ fn message_at_self(message: &Message, self_id: i64) -> bool {
 /// 这条负责字面就写着的辱骂与驱赶。两边都只是"一条证据"，加多少、上限在哪、
 /// 如何衰减由 `adjust_relation_tension` 与关系漂移统一决定，不存在两套刻度。
 async fn record_target_experience(user_id: i64, message: &str, addressed: bool) {
-    if !addressed {
-        return;
-    }
-    let Some(strength) = target_experience_strength(message) else {
+    let Some(strength) = targeted_experience_strength(message, addressed) else {
         return;
     };
     let Some(identity_store) = crate::yunxi::identity_store() else {
+        eprintln!("[WARN] 相处证据跳过：身份存储不可用 (用户: {user_id})");
         return;
     };
-    let Ok(targets) = identity_store.qq_person_domain_targets(user_id).await else {
-        return;
+    let targets = match identity_store.qq_person_domain_targets(user_id).await {
+        Ok(targets) => targets,
+        Err(error) => {
+            eprintln!("[WARN] 相处证据读取身份映射失败 (用户: {user_id}): {error}");
+            return;
+        }
     };
     let Some(person_id) = targets.person_id else {
+        println!(
+            "[RELATION] 相处证据跳过：该 QQ 还没有 person 映射 user={user_id} strength={strength:+.2}"
+        );
         return;
     };
     let Some(relations) = crate::yunxi::relation_store() else {
+        eprintln!("[WARN] 相处证据跳过：关系存储不可用 (用户: {user_id})");
         return;
     };
     match relations.nudge_tension(person_id, strength).await {
@@ -2223,9 +2244,25 @@ async fn record_target_experience(user_id: i64, message: &str, addressed: bool) 
             "[RELATION] 相处证据已记账 user={} strength={strength:+.2} tension={:.3}",
             user_id, state.tension
         ),
-        Ok(None) => {}
+        Ok(None) => println!(
+            "[RELATION] 相处证据跳过：该 person 还没有关系行 user={user_id} person={person_id} strength={strength:+.2}"
+        ),
         Err(error) => eprintln!("[WARN] 相处证据写入关系失败 (用户: {}): {}", user_id, error),
     }
+}
+
+/// 一条消息折算成相处证据：**只有指向她的消息才算**。
+///
+/// `addressed` 就是"结构化 `@` 了她本人，或正文里叫了她的名字"。指向别人的
+/// 辱骂（"@某人 你真菜"）不该记到她的关系上——那既不准确也不公平，而且
+/// `silence_signal` 那张字面表本来就是按"作为对她说的话"写的。强度的刻度沿用
+/// [`target_experience_strength`]，与模型那条语义通道共用 `adjust_relation_tension`，
+/// 两边不要各自再乘系数。
+fn targeted_experience_strength(message: &str, addressed: bool) -> Option<f32> {
+    if !addressed {
+        return None;
+    }
+    target_experience_strength(message)
 }
 
 /// 把一条指向她的消息折算成关系张力的调整量。
@@ -2330,7 +2367,7 @@ mod tests {
         interjection_sampling_vetoed, message_at_self, normalized_sender_name,
         prune_decision_attempts, queue_pending_window_message, reserve_visible_reply_slot,
         should_queue_after_executive, suppress_direct_trigger, take_pending_window_turn,
-        text_mentions_bot, with_structured_bot_mention_context,
+        targeted_experience_strength, text_mentions_bot, with_structured_bot_mention_context,
     };
     use crate::group_cooling::{
         GROUP_COOLING_SKIP_THRESHOLD, GroupCoolingVerdict, group_cooling_verdict,
@@ -2391,6 +2428,30 @@ mod tests {
                     MessageDestination::Group(group_id)
                 );
             });
+    }
+
+    #[test]
+    fn target_experience_only_counts_messages_aimed_at_her() {
+        // 这道门是"字面证据"的第一环：群友互相斗嘴不该让她把谁记成"对我不好"。
+        // 它原先挂在 Host 群聊入口，而"指向她"的消息在 `classify_group` 里判给
+        // Core、走不到那个入口——判据本身没问题，是接线让它一条都记不上。
+        // 现在调用点在两条路共同的入站点（`lib.rs`），这里钉住判据。
+        assert_eq!(
+            targeted_experience_strength("你闭嘴", false),
+            None,
+            "指向别人的辱骂不该记到她的关系上"
+        );
+        assert_eq!(targeted_experience_strength("芸汐你闭嘴", true), Some(0.15));
+    }
+
+    #[test]
+    fn target_experience_keeps_the_shared_tension_scale() {
+        // 与模型那条语义通道共用 `adjust_relation_tension` 的刻度：字面命中
+        // 0.15（约 22 条到静默阈值）、明确善意 -0.05，中性不记账。这一层不要再
+        // 乘系数——两套刻度会让"几次算持续"没法解释。
+        assert_eq!(targeted_experience_strength("谢谢芸汐", true), Some(-0.05));
+        assert_eq!(targeted_experience_strength("芸汐在吗", true), None);
+        assert_eq!(targeted_experience_strength("", true), None);
     }
 
     #[test]
