@@ -703,6 +703,8 @@ class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     tts: TtsClient
     templates: Templates
+    # 默认不加混响：试听后选定的音色是"干声"（见 docs/qq-singing.md）。
+    default_reverb: bool = False
 
     def _json(self, payload: dict, status: int = 200) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -740,7 +742,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             lyrics = str(request.get("lyrics", ""))
             breath_after: tuple[int, ...] = ()
-            reverb = bool(request.get("reverb", True))
+            reverb = bool(request.get("reverb", self.default_reverb))
             transpose = float(request.get("transpose", -5.0))
             if request.get("notes"):
                 notes = [[float(n[0]), float(n[1])] for n in request["notes"]]
@@ -785,9 +787,15 @@ def main() -> None:
     tts_url = "http://127.0.0.1:6120/v1/tts"
     templates_path = Path(__file__).with_name("templates.json")
     args = sys.argv[1:]
+    reverb_enabled = False
     while args:
         key = args.pop(0)
         value = args.pop(0) if args else ""
+        if key == "--reverb":
+            reverb_enabled = True
+            if value and not value.startswith("--"):
+                args.insert(0, value)
+            continue
         if key == "--host":
             host = value
         elif key == "--port":
@@ -805,6 +813,7 @@ def main() -> None:
     )
     Handler.tts = TtsClient(tts_url)
     Handler.templates = Templates(templates_path)
+    Handler.default_reverb = reverb_enabled
     server = ThreadingHTTPServer((host, port), Handler)
     LOG.info("芸汐歌声合成服务已启动: http://%s:%d/ （模板 %s，TTS %s）",
              host, port, templates_path.name, tts_url)
