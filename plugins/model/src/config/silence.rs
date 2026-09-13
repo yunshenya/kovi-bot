@@ -61,6 +61,15 @@ pub struct SilenceConfig {
     /// 的时候恰好没作用。要只看不动就显式写 `false`，那时只打 `[GROUP_COOLING]`
     /// 影子日志。
     group_cooling_enabled: bool,
+    /// 相处证据是不是交给模型判（默认开）。
+    ///
+    /// 关掉之后**没有任何判据在跑**：字面词表已在 2026-09-14 删除（它维护不到底，
+    /// 线上实测一句"滚吧"就漏了），这条通道只剩模型这一条来源。留着这个开关是为了
+    /// 出问题时能立刻停掉这次调用，而不是留一条备用判据。
+    ///
+    /// 判定只对**指向她**的消息发起（结构化 `@` 她 / 正文叫她的名字），
+    /// 且是后台任务：它不改变这条消息该走 Core 还是 Host、该不该回。
+    relation_evidence_model_enabled: bool,
 }
 
 impl Default for SilenceConfig {
@@ -71,6 +80,7 @@ impl Default for SilenceConfig {
             decay_days: 30,
             warm_recovery_count: 2,
             group_cooling_enabled: true,
+            relation_evidence_model_enabled: true,
         }
     }
 }
@@ -95,6 +105,11 @@ impl SilenceConfig {
     /// 群级降温是否真正生效。false 时判据照跑，只打影子日志。
     pub fn group_cooling_enabled(&self) -> bool {
         self.group_cooling_enabled
+    }
+
+    /// 相处证据是否交给模型判。false 时这条通道没有任何判据在跑（字面词表已删）。
+    pub fn relation_evidence_model_enabled(&self) -> bool {
+        self.relation_evidence_model_enabled
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {

@@ -208,18 +208,38 @@ pub(crate) async fn record_group_message_observation(event: &GroupMsgEvent) {
     }
 }
 
-/// 入站级相处证据：把这一轮里"指向她"的字面敌意/善意折进关系张力。
+/// 入站级相处证据：把这一轮里"指向她"的话交给模型判一次，折进关系张力与群气氛。
 ///
 /// **必须由两条路都会经过的入站点调用**（`lib.rs` 的群聊入站闭包，与
 /// [`record_group_message_observation`] 同一处）。它原先挂在 Host 群聊入口，
 /// 而"指向她"的消息在 `classify_group` 里一律判给 Core，Host 根本不跑：骂她的
 /// 那条必须指向她，指向她的那条又绕开那个函数——线上近 3 天
-/// `[RELATION] 相处证据已记账` 一条都没有。模型那条语义通道（负向 valence →
-/// tension）负责阴阳怪气，这一条负责它可能看不见的直白辱骂/驱赶。
-pub(crate) async fn record_group_target_experience(event: &GroupMsgEvent) {
+/// `[RELATION] 相处证据已记账` 一条都没有。
+///
+/// 定向在这里判（结构化 `@` 她 / 正文叫她的名字），情绪交给
+/// [`crate::relation_evidence`] 的模型判定，且判定是后台任务：这一轮该走 Core
+/// 还是 Host、该不该回，都不因为这个判定而等待或改变。
+pub(crate) fn record_group_target_experience(event: &GroupMsgEvent) {
+    let config = crate::config::get();
+    let enabled = config.silence().relation_evidence_model_enabled();
     let text = bounded_input(event.borrow_text().unwrap_or_default());
-    let addressed = message_at_self(&event.message, event.self_id) || text_mentions_bot(&text);
-    record_target_experience(event.user_id, &text, addressed).await;
+    let directed_to_her =
+        message_at_self(&event.message, event.self_id) || text_mentions_bot(&text);
+    if !crate::relation_evidence::should_judge(directed_to_her, enabled) {
+        return;
+    }
+    let sender_label = GroupSenderIdentity::from_event(event)
+        .display_name()
+        .to_string();
+    crate::relation_evidence::spawn_judgement(
+        event.group_id,
+        event.user_id,
+        crate::relation_evidence::EvidenceInput {
+            sender_label: &sender_label,
+            text: &text,
+            question: crate::relation_evidence::EvidenceQuestion::TowardHer,
+        },
+    );
 }
 
 /// 群聊暂停控制命令的确定性解析：`Some(true)` = 禁言，`Some(false)` = 结束禁言。
@@ -655,11 +675,18 @@ pub(crate) async fn group_message_event_after_ingress(
         quoted.as_ref().and_then(|quoted| quoted.sender_id),
     );
     let addressed_to_bot = addressing.directly_addressed();
-    // 群级降温的第二维证据：谁在把这个群变成"外人圈"、她插话后有没有人接。
-    // 与上面那条个人级 `record_target_experience` 分工见 `crate::group_cooling`：
-    // 个人级记某个人对她的张力，群级记这个群的整体气氛；后者只在未点名抽样的
-    // 入口生效，不改任何被点名/被引用的回合。
-    observe_group_cooling(group_id, event.user_id, message, addressed_to_bot).await;
+    // 群级降温的第二维证据：她插话后有没有人接。
+    // 与个人级那条相处证据（`relation_evidence`，在入站点发起）分工见
+    // `crate::group_cooling`：个人级记某个人对她的张力，群级记这个群的整体气氛；
+    // 后者只在未点名抽样的入口生效，不改任何被点名/被引用的回合。
+    observe_group_cooling(
+        group_id,
+        event.user_id,
+        sender_identity.display_name(),
+        message,
+        addressed_to_bot,
+    )
+    .await;
     if addressed_to_bot
         && !locally_addressed
         && should_suppress_direct_trigger(group_id, event.user_id).await
@@ -2047,12 +2074,40 @@ fn cooling_gate_verdict(
 /// 记账与生效是分开的：开关关闭时证据照记（影子阶段要能看到"如果打开会怎样"），
 /// 只有 `group_cooling_gate` 会真的跳过抽样。
 ///
-/// 为什么把两件事放在一起：它们是同一条消息的两种读法——"这条消息本身是不是
-/// 在赶她"和"这条消息有没有接她的话"——共用同一个 `addressed_to_bot` 判定，
-/// 拆成两个函数只会让调用点重复判断一次。
-async fn observe_group_cooling(group_id: i64, user_id: i64, message: &str, directed_to_her: bool) {
+/// 两件事放在一起是因为它们共用同一个 `directed_to_her` 判定：确定性的"她插话后
+/// 有没有人接"在这里记账，而"这条消息是不是在赶她"由模型判定（`relation_evidence`）
+/// 在别处记账——**指向她**的那份在入站点就发起了，这里只管她插过话没人接、
+/// 而这条不是对她说的那一档：那种否定只有配上这个窗口才站得住，所以上下文由这里给。
+async fn observe_group_cooling(
+    group_id: i64,
+    user_id: i64,
+    sender_label: &str,
+    message: &str,
+    directed_to_her: bool,
+) {
     let watch_step = advance_ambient_interjection_watch(group_id, directed_to_her).await;
-    let Some(signal) = group_cooling_evidence(message, directed_to_her, watch_step) else {
+    if directed_to_her {
+        // 指向她的消息由入站点的模型判定负责（个人级 + 群级共用一份结论）。
+        return;
+    }
+    if matches!(watch_step, AmbientWatchStep::Waiting)
+        && crate::config::get()
+            .silence()
+            .relation_evidence_model_enabled()
+    {
+        // 她刚插过话、还没人接：问一次"这句话是不是在否定她那次开口"。同样是
+        // 后台任务——判定不该拖慢这一轮的回复，也不改变这条消息的去向。
+        crate::relation_evidence::spawn_judgement(
+            group_id,
+            user_id,
+            crate::relation_evidence::EvidenceInput {
+                sender_label,
+                text: message,
+                question: crate::relation_evidence::EvidenceQuestion::NegatingInterjection,
+            },
+        );
+    }
+    let Some(signal) = group_cooling_evidence(watch_step) else {
         return;
     };
     let Some(store) = crate::yunxi::group_cooling_store() else {
@@ -2205,82 +2260,6 @@ fn message_at_self(message: &Message, self_id: i64) -> bool {
     })
 }
 
-/// 把一条指向她的消息记成相处经验：不友好则加张力，友好则降温。
-///
-/// 只处理**指向她**的消息（`addressed` 为真）。群友互相斗嘴不该让她把谁记成
-/// "对我不好"——那既不准确，也不公平。未指向她的消息一律不记，因此这个函数
-/// 对绝大多数群聊消息是零成本的早退。
-///
-/// 与 Core 里那条语义通道的关系：那条负责"阴阳怪气"这类字面看不见的敌意，
-/// 这条负责字面就写着的辱骂与驱赶。两边都只是"一条证据"，加多少、上限在哪、
-/// 如何衰减由 `adjust_relation_tension` 与关系漂移统一决定，不存在两套刻度。
-async fn record_target_experience(user_id: i64, message: &str, addressed: bool) {
-    let Some(strength) = targeted_experience_strength(message, addressed) else {
-        return;
-    };
-    let Some(identity_store) = crate::yunxi::identity_store() else {
-        eprintln!("[WARN] 相处证据跳过：身份存储不可用 (用户: {user_id})");
-        return;
-    };
-    let targets = match identity_store.qq_person_domain_targets(user_id).await {
-        Ok(targets) => targets,
-        Err(error) => {
-            eprintln!("[WARN] 相处证据读取身份映射失败 (用户: {user_id}): {error}");
-            return;
-        }
-    };
-    let Some(person_id) = targets.person_id else {
-        println!(
-            "[RELATION] 相处证据跳过：该 QQ 还没有 person 映射 user={user_id} strength={strength:+.2}"
-        );
-        return;
-    };
-    let Some(relations) = crate::yunxi::relation_store() else {
-        eprintln!("[WARN] 相处证据跳过：关系存储不可用 (用户: {user_id})");
-        return;
-    };
-    match relations.nudge_tension(person_id, strength).await {
-        Ok(Some(state)) => println!(
-            "[RELATION] 相处证据已记账 user={} strength={strength:+.2} tension={:.3}",
-            user_id, state.tension
-        ),
-        Ok(None) => println!(
-            "[RELATION] 相处证据跳过：该 person 还没有关系行 user={user_id} person={person_id} strength={strength:+.2}"
-        ),
-        Err(error) => eprintln!("[WARN] 相处证据写入关系失败 (用户: {}): {}", user_id, error),
-    }
-}
-
-/// 一条消息折算成相处证据：**只有指向她的消息才算**。
-///
-/// `addressed` 就是"结构化 `@` 了她本人，或正文里叫了她的名字"。指向别人的
-/// 辱骂（"@某人 你真菜"）不该记到她的关系上——那既不准确也不公平，而且
-/// `silence_signal` 那张字面表本来就是按"作为对她说的话"写的。强度的刻度沿用
-/// [`target_experience_strength`]，与模型那条语义通道共用 `adjust_relation_tension`，
-/// 两边不要各自再乘系数。
-fn targeted_experience_strength(message: &str, addressed: bool) -> Option<f32> {
-    if !addressed {
-        return None;
-    }
-    target_experience_strength(message)
-}
-
-/// 把一条指向她的消息折算成关系张力的调整量。
-///
-/// 字面证据的力度小于"模型明确判定敌意"（后者最高 0.2 的混合率）：字面命中更
-/// 容易误判（玩笑式互怼、转述别人的话），所以单次只给 0.15/0.05。
-///
-/// 0.15 这个量级是量出来的：张力每次按 `(1 - tension)` 的 0.2 倍往 1.0 拉，
-/// 0.15 需要约 22 条**指向她的**辱骂才越过静默阈值；0.08 要 57 条，等于字面
-/// 通道形同虚设——那样她就只能靠模型情绪分类兜底，而那是会看错的那条路。
-fn target_experience_strength(message: &str) -> Option<f32> {
-    match crate::silence_signal::target_experience(message) {
-        crate::silence_signal::TargetExperience::Unfriendly => Some(0.15),
-        crate::silence_signal::TargetExperience::Warm => Some(-0.05),
-        crate::silence_signal::TargetExperience::Neutral => None,
-    }
-}
-
 /// 消息是否携带 at/reply 定向段。调用方必须先排除“指向芸汐本人”的情况
 /// （结构化 at 自己或引用自己），因此这里只需判断是否存在定向段：
 /// 点名或引用其他成员的消息是定向消息，不应触发插话或接续对话。
@@ -2367,7 +2346,7 @@ mod tests {
         interjection_sampling_vetoed, message_at_self, normalized_sender_name,
         prune_decision_attempts, queue_pending_window_message, reserve_visible_reply_slot,
         should_queue_after_executive, suppress_direct_trigger, take_pending_window_turn,
-        targeted_experience_strength, text_mentions_bot, with_structured_bot_mention_context,
+        text_mentions_bot, with_structured_bot_mention_context,
     };
     use crate::group_cooling::{
         GROUP_COOLING_SKIP_THRESHOLD, GroupCoolingVerdict, group_cooling_verdict,
@@ -2431,27 +2410,21 @@ mod tests {
     }
 
     #[test]
-    fn target_experience_only_counts_messages_aimed_at_her() {
-        // 这道门是"字面证据"的第一环：群友互相斗嘴不该让她把谁记成"对我不好"。
-        // 它原先挂在 Host 群聊入口，而"指向她"的消息在 `classify_group` 里判给
-        // Core、走不到那个入口——判据本身没问题，是接线让它一条都记不上。
-        // 现在调用点在两条路共同的入站点（`lib.rs`），这里钉住判据。
-        assert_eq!(
-            targeted_experience_strength("你闭嘴", false),
-            None,
-            "指向别人的辱骂不该记到她的关系上"
+    fn evidence_is_only_collected_for_messages_that_point_at_her() {
+        // 定向由代码判、情绪交给模型；群友互相斗嘴既不该触发判定，也不该被她
+        // 记成"对我不好"。这条门原先挂在 Host 群聊入口，而"指向她"的消息在
+        // `classify_group` 里判给 Core、走不到那里——判据没问题，是接线让它
+        // 一条都记不上；现在调用点在两条路共同的入站点（`lib.rs`）。
+        assert!(
+            !crate::relation_evidence::should_judge(false, true),
+            "不指向她的消息不该问模型"
         );
-        assert_eq!(targeted_experience_strength("芸汐你闭嘴", true), Some(0.15));
-    }
-
-    #[test]
-    fn target_experience_keeps_the_shared_tension_scale() {
-        // 与模型那条语义通道共用 `adjust_relation_tension` 的刻度：字面命中
-        // 0.15（约 22 条到静默阈值）、明确善意 -0.05，中性不记账。这一层不要再
-        // 乘系数——两套刻度会让"几次算持续"没法解释。
-        assert_eq!(targeted_experience_strength("谢谢芸汐", true), Some(-0.05));
-        assert_eq!(targeted_experience_strength("芸汐在吗", true), None);
-        assert_eq!(targeted_experience_strength("", true), None);
+        assert!(crate::relation_evidence::should_judge(true, true));
+        assert!(
+            !crate::relation_evidence::should_judge(true, false),
+            "开关关掉就不问"
+        );
+        // 判据本身的强度刻度由 `relation_evidence` 的测试守着。
     }
 
     #[test]

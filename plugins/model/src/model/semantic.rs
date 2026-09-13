@@ -355,10 +355,7 @@ fn parse_understanding(content: &str, request: &UnderstandingRequest) -> Message
     // A classifier response that contains a visible/action protocol has crossed
     // prompt boundaries. Treat the whole snapshot as unavailable instead of
     // partially accepting fields from the mixed response.
-    if REPLY_OR_TOOL_PROTOCOL_MARKERS
-        .iter()
-        .any(|marker| content.contains(marker))
-    {
+    if crosses_reply_or_tool_protocol(content) {
         return MessageUnderstanding::default();
     }
     let Some(value) = extract_json(content) else {
@@ -414,6 +411,22 @@ fn extract_json(content: &str) -> Option<&str> {
     let start = content.find('{')?;
     let end = content.rfind('}')?;
     (start < end).then_some(&content[start..=end])
+}
+
+/// 这条内部判定的回包里出现了**面向用户的协议**吗？
+///
+/// 出现就说明提示词边界被越过了（模型把"回复/工具协议"混进了只该产出判断的快照），
+/// 调用方必须整条丢弃，而不是从混着两种契约的文本里挑字段——挑出来的字段属于哪一份
+/// 契约已经说不清了。相处证据那条判定复用同一道闸门。
+pub(crate) fn crosses_reply_or_tool_protocol(content: &str) -> bool {
+    REPLY_OR_TOOL_PROTOCOL_MARKERS
+        .iter()
+        .any(|marker| content.contains(marker))
+}
+
+/// 从内部判定的回包里取出第一个 JSON 对象（与语义理解共用同一套宽松提取）。
+pub(crate) fn internal_judgement_json(content: &str) -> Option<&str> {
+    extract_json(content)
 }
 
 fn normalize_mood(value: &str) -> String {

@@ -13,23 +13,25 @@
 //!   主动把它拉回来。
 //!
 //! 判据分三层，与个人级门控同构，便于影子观察：
-//! 1. [`group_cooling_evidence`] 把一条群消息（外加"她刚插过话没有"这个上下文）
-//!    分类成一条证据；驱动观察的 [`advance_ambient_watch`] 单独可测。
+//! 1. [`group_cooling_evidence`] 把"她插话之后的观察结果"折算成一条证据（`Ignored`）；
+//!    而"这条消息是不是在赶她"由 [`crate::relation_evidence`] 的模型判定给出——
+//!    两层共用同一份判定，群级只负责把它翻译成压力。驱动观察的
+//!    [`advance_ambient_watch`] 单独可测。
 //! 2. [`apply_group_cooling_pressure`] / [`drift_group_cooling_pressure`] 决定
 //!    这条证据让压力变成多少（有界、可衰减）。
 //! 3. [`group_cooling_verdict`] 把压力翻译成"这一次抽样要不要跳过"。它不碰配置
 //!    也不打日志：影子阶段由调用方拿开关决定是否真的跳过，判定照跑、行为不变。
 //!
 //! 已知误伤类别（写在这里，是为了让调参的人知道自己在调什么）：
-//! 1. 两个人拌嘴时说"你别插嘴"——只要她刚插过话且还没人搭理她，就会被记成
+//! 1. 两个人拌嘴时说"你别插嘴"——只要她刚插过话且还没人搭理她，就可能被判成
 //!    对她的排挤。窗口很短、单次权重很低，需要累积才越线。
-//! 2. 群里在挤兑另一个人（或另一个机器人）时，字面可能命中同一批判据。
+//! 2. 群里在挤兑另一个人（或另一个机器人）时，判定可能读成同一个意思。
 //! 3. 一个纯粹聊嗨了的群、没人接她的话，会被记成"无人应答"。这是设计上接受的：
 //!    她本来也不该在没人接话时越插越多。
 //!
 //! 三类都靠"阈值 + 半衰期 + 正向互动回暖"兜住，且后果只是少插几次话。
 
-use crate::silence_signal::{TargetExperience, target_experience};
+use crate::relation_evidence::RelationEvidence;
 use std::time::{Duration, Instant};
 
 /// 群级压力的上限。
@@ -75,6 +77,19 @@ pub(crate) enum GroupCoolingSignal {
 }
 
 impl GroupCoolingSignal {
+    /// 把模型给的相处判定翻译成群级证据。
+    ///
+    /// 两层共用同一份判定（`crate::relation_evidence`）：指向她的敌意对个人级是
+    /// 关系张力、对群级是"这个群在赶她"；中性则说明这个群还在正常跟她说话，
+    /// 那是回暖通道的常态。
+    pub(crate) const fn for_relation_evidence(evidence: RelationEvidence) -> Self {
+        match evidence {
+            RelationEvidence::Unfriendly => Self::DirectedPushOut,
+            RelationEvidence::Warm => Self::Warm,
+            RelationEvidence::Neutral => Self::Engaged,
+        }
+    }
+
     /// 基础权重：正 = 更冷，负 = 回暖。
     ///
     /// 数量级是量出来的，不是拍出来的：三个不同的人各说一次"闭嘴"（0.22×3
@@ -240,57 +255,19 @@ pub(crate) fn advance_ambient_watch(
     AmbientWatchStep::Waiting
 }
 
-/// 一条群消息给出的群级证据。
+/// 她插话之后的观察结果给出的群级证据。
 ///
-/// `watch_step` 是这条消息推进观察后的结果——"她刚插过话、还没人搭理她"
-/// 这个上下文只在这一刻存在。离开它，不指向她的"谁让你插嘴"就分不清是
-/// 在说她还是在说另一个插话的人，所以那种字面只在窗口内才认。
-pub(crate) fn group_cooling_evidence(
-    text: &str,
-    directed_to_her: bool,
-    watch_step: AmbientWatchStep,
-) -> Option<GroupCoolingSignal> {
-    if directed_to_her {
-        // 指向她的消息复用个人级那套已经审过的字面判据：同一条消息在两层
-        // 分别记账（个人级记张力，群级记气氛），但判据只有一份。
-        return Some(match target_experience(text) {
-            TargetExperience::Unfriendly => GroupCoolingSignal::DirectedPushOut,
-            TargetExperience::Warm => GroupCoolingSignal::Warm,
-            TargetExperience::Neutral => GroupCoolingSignal::Engaged,
-        });
-    }
+/// 只处理**确定性**的那一维：她插过话、过了足够久、又有足够多条消息没人接她
+/// （`Ignored`）。"这条消息是不是在赶她"是语言判断，由 `crate::relation_evidence`
+/// 问模型一次，不在这里用词表猜——那张字面表维护不到底，线上实测一句"滚吧"就漏了。
+///
+/// `watch_step` 是这条消息推进观察后的结果——"她刚插过话、还没人搭理她"这个上下文
+/// 只在这一刻存在；`Waiting` 分支需要的语言判断由调用方拿着这个窗口去发起。
+pub(crate) fn group_cooling_evidence(watch_step: AmbientWatchStep) -> Option<GroupCoolingSignal> {
     match watch_step {
         AmbientWatchStep::Ignored => Some(GroupCoolingSignal::Ignored),
-        AmbientWatchStep::Waiting if ambient_push_out(text) => {
-            Some(GroupCoolingSignal::AmbientPushOut)
-        }
         _ => None,
     }
-}
-
-/// 她刚插过话时，群里"不是对她说的"消息里几乎只在否定她这次开口的说法。
-///
-/// 刻意**不收**"别说话""烦不烦"这类通用驱赶词：它们不针对她时太容易是
-/// 在说别人（`silence_signal` 那份表只在消息确实指向她时才生效）。这里
-/// 只留"插嘴/插话/没人问你"这一类——它们描述的行为本身就是"有人在没被
-/// 邀请的情况下开口"，配上刚插过话的窗口才站得住。
-const AMBIENT_PUSH_OUT_MARKERS: &[&str] = &[
-    "插嘴",
-    "插话",
-    "没人问你",
-    "没问你",
-    "谁问你了",
-    "谁让你说",
-    "轮得到你",
-    "少接话",
-    "别接话",
-    "用你说话",
-];
-
-fn ambient_push_out(text: &str) -> bool {
-    AMBIENT_PUSH_OUT_MARKERS
-        .iter()
-        .any(|marker| text.contains(marker))
 }
 
 /// 把压力收进 `[0, 1]`；非有限值（数据库里的脏数据）按 0 处理。
@@ -311,6 +288,7 @@ mod tests {
         advance_ambient_watch, apply_group_cooling_pressure, drift_group_cooling_pressure,
         evidence_strength, group_cooling_evidence, group_cooling_verdict,
     };
+    use crate::relation_evidence::RelationEvidence;
     use std::time::{Duration, Instant};
 
     #[test]
@@ -400,43 +378,35 @@ mod tests {
     }
 
     #[test]
-    fn directed_messages_reuse_the_person_level_literal_judgement() {
+    fn directed_messages_map_the_model_judgement_onto_group_evidence() {
+        // 指向她的消息由模型判（`relation_evidence`），群级只负责翻译：敌意是
+        // "这个群在赶她"，善意是最强回暖，中性说明群还在正常跟她说话。
         assert_eq!(
-            group_cooling_evidence("闭嘴吧你", true, AmbientWatchStep::Idle),
-            Some(GroupCoolingSignal::DirectedPushOut)
+            GroupCoolingSignal::for_relation_evidence(RelationEvidence::Unfriendly),
+            GroupCoolingSignal::DirectedPushOut
         );
         assert_eq!(
-            group_cooling_evidence("谢谢你刚才帮我", true, AmbientWatchStep::Idle),
-            Some(GroupCoolingSignal::Warm)
+            GroupCoolingSignal::for_relation_evidence(RelationEvidence::Warm),
+            GroupCoolingSignal::Warm
         );
-        // 正常被搭话：群把她当成员，这是回暖通道的常态。
         assert_eq!(
-            group_cooling_evidence("芸汐今天几号", true, AmbientWatchStep::Idle),
-            Some(GroupCoolingSignal::Engaged)
+            GroupCoolingSignal::for_relation_evidence(RelationEvidence::Neutral),
+            GroupCoolingSignal::Engaged
         );
     }
 
     #[test]
-    fn ambient_dismissal_only_counts_right_after_she_interjected() {
-        // 她刚插过话、还没人搭理她：这句"谁让你插嘴"算群级排挤。
+    fn ambient_dismissal_is_left_to_the_model_and_only_the_window_is_deterministic() {
+        // 群级现在只做确定性那一维：她插过话、够久、够多条没人接 → Ignored。
         assert_eq!(
-            group_cooling_evidence("谁让你插嘴的", false, AmbientWatchStep::Waiting),
-            Some(GroupCoolingSignal::AmbientPushOut)
+            group_cooling_evidence(AmbientWatchStep::Ignored),
+            Some(GroupCoolingSignal::Ignored)
         );
-        // 窗口之外同样的字面不记账：它完全可能是在说另一个人。
-        assert_eq!(
-            group_cooling_evidence("谁让你插嘴的", false, AmbientWatchStep::Idle),
-            None
-        );
-        // 通用驱赶词不在群级字面表里：不针对她时太容易误伤。
-        assert_eq!(
-            group_cooling_evidence("别说话了烦不烦", false, AmbientWatchStep::Waiting),
-            None
-        );
-        assert_eq!(
-            group_cooling_evidence("今天中午吃什么", false, AmbientWatchStep::Waiting),
-            None
-        );
+        // "这句话是不是在否定她"是语言判断，交给模型，且必须带上"她刚插过话没人接"
+        // 这个窗口；窗口之外同样的字面不记账——它完全可能是在说另一个人。
+        // 这里钉住的是"窗口之外不问"：判定入口由 `model/group.rs` 的 waiting 分支守着。
+        assert_eq!(group_cooling_evidence(AmbientWatchStep::Waiting), None);
+        assert_eq!(group_cooling_evidence(AmbientWatchStep::Idle), None);
     }
 
     #[test]

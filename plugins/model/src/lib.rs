@@ -58,7 +58,7 @@ mod private_image_memory;
 // QQ 实时语音通话（默认关闭，启用后轮询 NapCat AV 桥）
 pub(crate) mod qq_call;
 mod redis_store;
-mod silence_signal;
+mod relation_evidence;
 // 本机语音服务客户端（通话与发语音消息共用）
 pub(crate) mod reminders;
 mod speech;
@@ -477,7 +477,8 @@ async fn main() {
                 // 入站级副作用：与这一轮最后归 Host 还是归 Core 无关。相处证据
                 // 尤其不能挂在 Host 那条路上——"指向她"的消息正是判给 Core 的那批，
                 // 挂上去等于这条通道永远不生效（`group.rs` 的注释里有完整来龙去脉）。
-                record_group_target_experience(&event).await;
+                // 判定是后台任务：它不改变这条消息的去向，也不占这一轮的延迟。
+                record_group_target_experience(&event);
                 if core_supported {
                     // Preserve the Host-era Agent Task observation contract even
                     // when Core traffic is throttled or its queue is full.
