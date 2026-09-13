@@ -920,6 +920,9 @@ fn reply_text_leaks_internal_reasoning(content: &str) -> bool {
     if is_stage_direction_only(text) {
         return true;
     }
+    if first_person_turn_avoidance(text) {
+        return true;
+    }
     // 只列"作为聊天正文不可能出现、作为内部判断却一定会出现"的说法。
     // 宁可少列，也不要把正常聊天里的词（如单独一个"不接话"）当成泄露。
     const INTERNAL_DECISION_PHRASES: &[&str] = &[
@@ -929,7 +932,6 @@ fn reply_text_leaks_internal_reasoning(content: &str) -> bool {
         "没有点名我",
         "不需要我补充",
         "需要我补充的信息",
-        "我插进去",
         "插进去反而",
         "顺着接一句",
         "先不接话",
@@ -943,6 +945,111 @@ fn reply_text_leaks_internal_reasoning(content: &str) -> bool {
     INTERNAL_DECISION_PHRASES
         .iter()
         .any(|phrase| text.contains(phrase))
+}
+
+/// 正文有没有在"评论这个回合本身"——第一人称宣告接不接、搭不搭这句话。
+///
+/// 为什么要单独成一条规则，而不是继续往上面那张字面清单里堆词：线上实测
+/// （2026-09-13 23:29，群 641996763）她发出一句"这句话我就不接了。刚才还在
+/// 聊电子版教材的事，怎么突然这么大脾气？"。那句话在宿主侧是一次**已经决定
+/// 要发**的回复，字面清单只收了"先不接话"，于是照发；群友看到的却是"说不接
+/// 又接了"的自相矛盾——拒绝本身就是这次发言。
+///
+/// 判据不是枚举说法，而是识别这个语域：在"我"附近出现回合动作词（"接""搭"
+/// "搭话""搭腔""搭茬""接茬""插""回应""回复"），并且带回避标记（"不""别""先"）
+/// 或疑问（"该不该""要不要""是不是"）。人设语境里的"不接"指的是真正的沉默
+/// （模型输出空），没有"用一句话宣布自己不接"这条路径，所以这层语域出现在
+/// 正文里一定是内部判断漏了。
+///
+/// 误杀边界：第三人称叙述（"他一直在群里不接话，估计是忙。"）没有"我"做施事；
+/// "接"/"搭"的常识性复合词（接孩子、接电话、搭车……）整条排除——它们与"接话"
+/// 同形，靠语境分不开，宁可漏判也不误杀，漏了还有字面清单兜着。
+///
+/// 已知残余误杀（故意留着，不做更细的判别）：这层判据是词法的，分不出宾语是
+/// "话"还是"活"——"这个班我接不了，得找人手。"会被当成元叙述拦下。代价是这类
+/// 第一人称 + 回避 + "接/搭"的自我表态被一并吞掉（群里极少见），换来的是不再
+/// 出现"说不接又接了"这种自相矛盾；真要放宽，得先有宾语层面的判据。
+fn first_person_turn_avoidance(text: &str) -> bool {
+    // 第一人称如何自指。
+    const SELF: &[&str] = &["我"];
+    // 回合动作词：能指"回应这一句"的动词。刻意不收裸的"回"——"我先不回家了"
+    // 与"不回这条"同形，语境分不开；"插"就是插话，属于同一个语域。
+    const TURN_ACTS: &[&str] = &[
+        "接", "搭话", "搭腔", "搭茬", "搭", "接茬", "插", "回应", "回复",
+    ];
+    // 回避标记。"先"也算：内部的"先不接话"漏出去过（2026-09-10~12 实测）。
+    const AVOIDANCE_GATES: &[&str] = &["不", "别", "先", "该不该", "要不要", "是不是"];
+    // "接"/"搭"的常识性复合词：出现这些就不是"接话/搭话"。这张表是漏判换误杀，
+    // 所以只收"和接话同形、又真的高频"的词，不追求收全。
+    const TURN_ACT_EXCLUSIONS: &[&str] = &[
+        "接孩子",
+        "接娃",
+        "接电话",
+        "接个电话",
+        "接机",
+        "接站",
+        "接单",
+        "接个单",
+        "接活",
+        "接个活",
+        "接送",
+        "接班",
+        "接水",
+        "接龙",
+        "接口",
+        "接地",
+        "接壤",
+        "接线",
+        "搭车",
+        "搭档",
+        "搭建",
+        "搭台",
+        "搭伙",
+        "插队",
+        "插个队",
+    ];
+    // 施事与动词之间允许的距离（字符）。比"我插进去"这类紧邻写法宽，
+    // 又不足以跨句捞到远处无关的"我"。
+    const MAX_AGENT_DISTANCE: usize = 48;
+
+    contains_first_person_turn_avoidance(
+        text,
+        SELF,
+        TURN_ACTS,
+        AVOIDANCE_GATES,
+        TURN_ACT_EXCLUSIONS,
+        MAX_AGENT_DISTANCE,
+    )
+}
+
+/// 在 `text` 里找"第一人称施事 + 回避标记 + 回合动作"三者同窗的写法。
+///
+/// 参数化只为让单元测试能钉住边界；线上只有 [`first_person_turn_avoidance`]
+/// 一组常量。索引一率走 `char_indices` 的字节下标——中文是多字节，按字符数
+/// 偏移切 `&str` 会 panic。
+fn contains_first_person_turn_avoidance(
+    text: &str,
+    self_words: &[&str],
+    acts: &[&str],
+    gates: &[&str],
+    exclusions: &[&str],
+    max_agent_distance: usize,
+) -> bool {
+    if exclusions.iter().any(|exclusion| text.contains(exclusion)) {
+        return false;
+    }
+    text.char_indices()
+        .filter(|(_, character)| self_words.contains(&character.to_string().as_str()))
+        .any(|(agent_start, character)| {
+            let after_agent = agent_start + character.len_utf8();
+            let window_end = text[after_agent..]
+                .char_indices()
+                .nth(max_agent_distance)
+                .map_or(text.len(), |(offset, _)| after_agent + offset);
+            let window = &text[after_agent..window_end];
+            acts.iter().any(|act| window.contains(act))
+                && gates.iter().any(|gate| window.contains(gate))
+        })
 }
 
 /// 整条正文只有一个括号包起来的舞台指示，例如"（图片还没看懂，先不接话）"。
@@ -6623,11 +6730,12 @@ mod tests {
         deterministic_route_fallback, due_reply_target, eligible_mind_candidates,
         explicit_message_batch_needs_repair, explicit_message_count_for_event,
         explicit_message_count_for_input, explicit_message_count_instruction,
-        interaction_state_updates_with_cues, intrinsic_autonomous_intent_prompt,
-        intrinsic_fallback_is_eligible, intrinsic_output_is_unsafe, intrinsic_prompt,
-        is_plain_text_batch_data_context, keeps_existing_prepared_plan, message_id_for_log,
-        mind_context_messages, mind_outgoing_fence_required, parse_autonomous_intent_response,
-        parse_core_response, parse_direct_repair_output, parse_intrinsic_autonomous_directive,
+        first_person_turn_avoidance, interaction_state_updates_with_cues,
+        intrinsic_autonomous_intent_prompt, intrinsic_fallback_is_eligible,
+        intrinsic_output_is_unsafe, intrinsic_prompt, is_plain_text_batch_data_context,
+        keeps_existing_prepared_plan, message_id_for_log, mind_context_messages,
+        mind_outgoing_fence_required, parse_autonomous_intent_response, parse_core_response,
+        parse_direct_repair_output, parse_intrinsic_autonomous_directive,
         parse_plain_core_response, parse_qq_conversation, plain_text_batch_message_prompt,
         plain_text_batch_repair_context, pre_model_plan, prepared_outgoing_semantic_context,
         private_reply_invites_continuation, purge_group_routes_from_cache,
@@ -8393,17 +8501,83 @@ mod tests {
             "他一直在群里不接话，估计是忙。",
             "这条是什么鱼呀，看着挺好吃的。",
             "群里聊得正热闹，我在旁边听着。",
+            "我接孩子去了，等会儿再聊。",
+            "这个问题我回应过了，你要是还有疑问就再问我。",
+            "你插一句没问题，我先不说话了。",
         ] {
             assert!(
                 reply_text_has_semantic_content(kept),
                 "正常聊天不能被过滤：{kept:?}"
             );
+            assert!(!first_person_turn_avoidance(kept), "误判元叙述：{kept:?}");
         }
         // "我插进去说两句会不会太吵？"这类句子故意一并拦掉：谈论自己要不要
-        // 插话，本身就是我们不想让群里看到的元叙述语域。
+        // 插话，本身就是我们不想让群里看到的元叙述语域（"插"现在由语域判据
+        // 接手，不再靠字面清单里的"我插进去"）。
         assert!(!reply_text_has_semantic_content(
             "我插进去说两句会不会太吵？"
         ));
+        assert!(first_person_turn_avoidance("我插进去说两句会不会太吵？"));
+    }
+
+    #[test]
+    fn first_person_turn_avoidance_is_a_register_not_a_word_list() {
+        // 线上原文（2026-09-13 23:29，群 641996763 白浅）：宿主已经决定要发，
+        // 字面清单只收了"先不接话"，于是这句"宣布不接"的元叙述照发，群友看到的
+        // 就是"说不接又接了"。判据必须认得这个语域，而不是等下一个新说法。
+        for declaration in [
+            "这句话我就不接了。刚才还在聊电子版教材的事，怎么突然这么大脾气？",
+            "这句我不接，换个话题吧。",
+            "这条我就不接了。",
+            "这话我就不搭了。",
+            "这条我还是别接了。",
+            "我在想要不要接这句，感觉有点尴尬。",
+            "这句我该不该接呀？",
+            "我先不接这条了。",
+            "我自己不接这句了。",
+        ] {
+            assert!(
+                first_person_turn_avoidance(declaration),
+                "第一人称回避本回合必须被认出：{declaration:?}"
+            );
+            assert!(
+                !reply_text_has_semantic_content(declaration),
+                "这类元叙述不能作为可见正文：{declaration:?}"
+            );
+            assert!(sanitize_plain_text_batch_message(declaration).is_none());
+        }
+
+        // 只有把三种成分都凑齐才算，少一样都不拦。
+        for allowed in [
+            // 缺第一人称施事：第三人称叙述。
+            "他一直在群里不接话，估计是忙。",
+            // 缺回避标记：真的接了并说出来。
+            "我接这条吧，看着挺有意思的。",
+            // 缺回合动作：别的宾语/别的意思。
+            "我接孩子去了，等会儿再聊。",
+            "我搭了半小时地铁才到。",
+            "我先接个电话，等我一下。",
+            "我先不回家了，你们先吃。",
+            "我搭车去学校，路上再跟你说。",
+            "我先插个队，马上回来。",
+            // 否定落在别人身上。
+            "他不想搭话，我就没再问。",
+            "你先接电话吧，我自己来。",
+        ] {
+            assert!(
+                !first_person_turn_avoidance(allowed),
+                "不能把正常聊天当元叙述：{allowed:?}"
+            );
+            assert!(
+                reply_text_has_semantic_content(allowed),
+                "正常聊天不能被过滤：{allowed:?}"
+            );
+        }
+
+        // 已知残余误杀：词法判据分不出宾语是"话"还是"活"。这类自我表态会被
+        // 当成元叙述吞掉（群里极少见），换的是不再出现"说不接又接了"。
+        // 钉在这里，是为了让将来放宽判据的人知道自己动了什么。
+        assert!(first_person_turn_avoidance("这个班我接不了，得找人手。"));
     }
 
     #[test]
