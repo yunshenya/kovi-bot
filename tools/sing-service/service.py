@@ -456,14 +456,27 @@ def split_syllables(lyrics: str) -> list[str]:
 
 
 def fit_notes(notes: list[list[float]], syllable_count: int) -> list[tuple[float, float]]:
-    """把旋律对齐到歌词：多出的音符并进最后一个字，多出的歌词丢掉。"""
+    """把旋律铺到歌词上，返回**恰好** ``syllable_count`` 个 (音级, 拍数)。
+
+    三种情况都要能唱，而不是抛异常（线上就是"歌词 28 字 vs 模板 14 音"直接把
+    整个请求打成 502，然后回退成念白）：
+
+    - 一样长：原样；
+    - 歌词更长：旋律重复（一首歌写满四句，就把两句的曲再唱一遍——人也是这么唱的）；
+    - 歌词更短：多出来的音符时值并进最后一个字，乐句仍然落在终止音上。
+    """
     if syllable_count <= 0 or not notes:
         return []
-    if syllable_count >= len(notes):
-        return [(degree, beats) for degree, beats in notes]
-    head = [(degree, beats) for degree, beats in notes[: syllable_count - 1]]
+    if syllable_count == len(notes):
+        return [(float(degree), float(beats)) for degree, beats in notes]
+    if syllable_count > len(notes):
+        tiled: list[tuple[float, float]] = []
+        while len(tiled) < syllable_count:
+            tiled.extend((float(degree), float(beats)) for degree, beats in notes)
+        return tiled[:syllable_count]
+    head = [(float(degree), float(beats)) for degree, beats in notes[: syllable_count - 1]]
     tail_beats = sum(beats for _, beats in notes[syllable_count - 1 :])
-    head.append((notes[syllable_count - 1][0], tail_beats))
+    head.append((float(notes[syllable_count - 1][0]), tail_beats))
     return head
 
 
