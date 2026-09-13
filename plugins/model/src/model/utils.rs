@@ -2779,7 +2779,11 @@ fn finalize_native_tool_calls(deltas: &[NativeToolCallDelta]) -> Vec<NativeToolC
         .map(|delta| {
             let mut raw = delta.arguments.trim().to_string();
             if raw.len() > MAX_NATIVE_TOOL_ARGUMENTS_BYTES {
-                raw.truncate(MAX_NATIVE_TOOL_ARGUMENTS_BYTES);
+                // 按字节封顶，但要落在字符边界上：`String::truncate` 在非边界处直接
+                // panic，而这里的入参是模型逐块吐出来的 JSON 片段，中文参数完全正常
+                // （64 KiB 处正好切在一个三字节汉字中间就够触发）。切到边界以内只是
+                // 少几个字节，后面的 `complete_truncated_json_object` 仍能修复残断对象。
+                raw.truncate(raw.floor_char_boundary(MAX_NATIVE_TOOL_ARGUMENTS_BYTES));
             }
             let mut arguments = Map::new();
             if !raw.is_empty() {
@@ -4379,16 +4383,17 @@ pub fn get_file_modified_time_formatted() -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BotMemory, EMPTY_REPLY_REPAIR_PROMPT, MessageUnderstanding, NativeToolCall,
-        NativeToolCallDelta, Roles, VisionImage, append_stream_delta, apply_thinking_mode,
-        assistant_tool_calls_wire, build_model_messages, build_responses_input,
-        build_responses_request_body, compression_cutoff, extract_message_tool_calls,
-        extract_stream_delta, finalize_native_tool_calls, format_plain_style_context,
-        group_system_prompt, is_group_admin_command, is_help_command, is_private_only_command,
-        is_restricted_command, likely_requires_tool_protocol, limit_memory_size,
-        model_attempt_count, neutralize_protocol_markers, parse_stream_line, plain_reply_plan,
-        plain_reply_plan_for_host, reply_action_protocol_requested, sanitize_scheduled_output,
-        should_repair_empty_reply, tool_result_wire, with_reference_context,
+        BotMemory, EMPTY_REPLY_REPAIR_PROMPT, MAX_NATIVE_TOOL_ARGUMENTS_BYTES,
+        MessageUnderstanding, NativeToolCall, NativeToolCallDelta, Roles, VisionImage,
+        append_stream_delta, apply_thinking_mode, assistant_tool_calls_wire, build_model_messages,
+        build_responses_input, build_responses_request_body, compression_cutoff,
+        extract_message_tool_calls, extract_stream_delta, finalize_native_tool_calls,
+        format_plain_style_context, group_system_prompt, is_group_admin_command, is_help_command,
+        is_private_only_command, is_restricted_command, likely_requires_tool_protocol,
+        limit_memory_size, model_attempt_count, neutralize_protocol_markers, parse_stream_line,
+        plain_reply_plan, plain_reply_plan_for_host, reply_action_protocol_requested,
+        sanitize_scheduled_output, should_repair_empty_reply, tool_result_wire,
+        with_reference_context,
     };
     use super::{is_group_paused, set_group_paused};
 
@@ -4730,6 +4735,28 @@ mod tests {
         assert_eq!(calls[1].arguments["query"], "月球天气");
         assert_eq!(finish.as_deref(), Some("tool_calls"));
         assert!(content.is_empty());
+    }
+
+    #[test]
+    fn oversized_tool_arguments_truncate_on_a_char_boundary_instead_of_panicking() {
+        // 参数是模型逐块吐出来的，中文完全正常；64 KiB 的切点很容易落在三字节汉字
+        // 中间——`String::truncate` 在那里会 panic，把整个回复任务打断。
+        let filler = "汉".repeat(MAX_NATIVE_TOOL_ARGUMENTS_BYTES / 3 + 10);
+        assert!(
+            !filler.is_char_boundary(MAX_NATIVE_TOOL_ARGUMENTS_BYTES),
+            "前提：这一段的 64 KiB 处必须正好不是字符边界"
+        );
+        let deltas = vec![NativeToolCallDelta {
+            index: 0,
+            id: "call_trunc".to_string(),
+            name: "web_fetch".to_string(),
+            arguments: format!("{{\"url\":\"{filler}\"}}"),
+            saw_delta: true,
+        }];
+        // 修前这里 panic；修后只是切短，不产生参数。
+        let calls = finalize_native_tool_calls(&deltas);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "web_fetch");
     }
 
     #[test]
