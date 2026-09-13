@@ -120,7 +120,13 @@
           1,
           2
         ]
-      ]
+      ],
+      "breath_after": [
+        7,
+        14,
+        21
+      ],
+      "transpose": -5
     },
     {
       "id": "liangzhilaohu",
@@ -185,7 +191,13 @@
           5,
           2
         ]
-      ]
+      ],
+      "breath_after": [
+        4,
+        8,
+        12
+      ],
+      "transpose": -5
     },
     {
       "id": "molihua",
@@ -238,7 +250,11 @@
           5,
           2
         ]
-      ]
+      ],
+      "breath_after": [
+        7
+      ],
+      "transpose": -5
     },
     {
       "id": "zichang-qingkuai",
@@ -279,7 +295,11 @@
           1,
           2
         ]
-      ]
+      ],
+      "breath_after": [
+        4
+      ],
+      "transpose": -5
     },
     {
       "id": "zichang-manban",
@@ -320,7 +340,11 @@
           1,
           2
         ]
-      ]
+      ],
+      "breath_after": [
+        4
+      ],
+      "transpose": -5
     }
   ]
 }

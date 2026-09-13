@@ -60,7 +60,8 @@ def main() -> int:
     with open("templates.json", encoding="utf-8") as handle:
         full = {item["id"]: item for item in json.load(handle)["templates"]}[args.template]
     notes = [(int(degree), float(beats)) for degree, beats in full["notes"]]
-    octave = int(full.get("octave", 5))
+    octave = int(full.get("octave", 4))
+    transpose = float(full.get("transpose", 0.0))
     beat = 60.0 / float(full.get("bpm", 100))
 
     syllables = [char for char in args.lyrics if "\u4e00" <= char <= "\u9fff"]
@@ -72,6 +73,9 @@ def main() -> int:
     else:
         notes = notes[: len(syllables)]
 
+    breath_after = tuple(int(value) for value in full.get("breath_after", ()))
+    breath_seconds = 0.22  # 与 service.py 的 BREATH_SECONDS 保持一致
+
     sound = parselmouth.Sound(args.output)
     pitch = call(sound, "To Pitch", 0.01, 75, 1400)
     print(f"{args.template}: 渲染 {sound.duration:.2f}s，{len(notes)} 个音（{args.output}）")
@@ -79,7 +83,7 @@ def main() -> int:
     elapsed = 0.0
     for index, ((degree, beats), syllable) in enumerate(zip(notes, syllables, strict=True)):
         span = beats * beat
-        target = note_hz(degree, octave)
+        target = note_hz(degree, octave) * (2 ** (transpose / 12))
         at = min(elapsed + span * 0.5, max(0.02, sound.duration - 0.02))
         measured = call(pitch, "Get value at time", float(at), "Hertz", "linear")
         ratio = measured / target if measured == measured and measured > 0 else 0.0
@@ -97,6 +101,8 @@ def main() -> int:
             f"实测{measured:7.1f}Hz [{span:.2f}s @{elapsed:5.2f}s] {mark}"
         )
         elapsed += span
+        if index + 1 in breath_after:
+            elapsed += breath_seconds
     print(f"命中 {hits}/{len(notes)}；计划总时长 {elapsed:.2f}s / 实际 {sound.duration:.2f}s")
     return 0 if hits == len(notes) else 1
 

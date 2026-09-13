@@ -128,22 +128,69 @@
     return api('/api/login', { method: 'POST', body: { token } });
   }
 
+  /** 按时间来一句问候——门口站的是她本人，不是一块表单。 */
+  function greetByHour() {
+    const hour = new Date().getHours();
+    if (hour < 5) return '这么晚还没睡呀';
+    if (hour < 11) return '早上好';
+    if (hour < 14) return '中午好';
+    if (hour < 18) return '下午好';
+    if (hour < 23) return '晚上好';
+    return '夜深了';
+  }
+
+  function showLoginError(message) {
+    const card = $('#login-form');
+    const error = $('#login-error');
+    error.textContent = message;
+    error.hidden = false;
+    // 重放抖动动画：先摘掉类、强制一次重排再挂回去。
+    card.classList.remove('shake');
+    void card.offsetWidth;
+    card.classList.add('shake');
+  }
+
+  (() => {
+    const greeting = $('#login-greeting');
+    if (greeting) greeting.textContent = greetByHour();
+
+    const reveal = $('#login-reveal');
+    const tokenInput = $('#login-token');
+    if (reveal && tokenInput) {
+      reveal.addEventListener('click', () => {
+        const shown = tokenInput.type === 'text';
+        tokenInput.type = shown ? 'password' : 'text';
+        reveal.textContent = shown ? '👁' : '🙈';
+        tokenInput.focus();
+      });
+    }
+
+    const themeButton = $('#login-theme');
+    if (themeButton) {
+      themeButton.addEventListener('click', () => {
+        applyTheme(document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark');
+      });
+    }
+  })();
+
   $('#login-form').addEventListener('submit', async (event) => {
     event.preventDefault();
     const error = $('#login-error');
     error.hidden = true;
-    const button = event.target.querySelector('button');
+    const button = $('#login-submit');
+    const spinner = button ? button.querySelector('.login-spinner') : null;
     button.disabled = true;
+    if (spinner) spinner.hidden = false;
     try {
       await submitToken($('#login-token').value);
       $('#login-token').value = '';
       showApp();
       await refreshAll();
     } catch (problem) {
-      error.textContent = problem.message;
-      error.hidden = false;
+      showLoginError(problem.message);
     } finally {
       button.disabled = false;
+      if (spinner) spinner.hidden = true;
     }
   });
 
@@ -157,8 +204,13 @@
 
   function applyTheme(theme) {
     document.documentElement.dataset.theme = theme;
-    localStorage.setItem('yunxi-admin-theme', theme);
-    $('#theme-label').textContent = theme === 'dark' ? '浅色' : '深色';
+    try {
+      localStorage.setItem('yunxi-admin-theme', theme);
+    } catch (_) {
+      /* 隐私模式下写不了，忽略 */
+    }
+    const label = $('#theme-label');
+    if (label) label.textContent = theme === 'dark' ? '浅色' : '深色';
   }
 
   $('#theme-toggle').addEventListener('click', () => {
@@ -2312,16 +2364,15 @@
 
   // ───────────────────────────── 启动 ─────────────────────────────
 
-  applyTheme(localStorage.getItem('yunxi-admin-theme') || 'dark');
+  // 主题由 index.html 的头部脚本先定好（避免闪白），这里只同步标签，不重新决定。
+  applyTheme(document.documentElement.dataset.theme || 'dark');
 
   (async () => {
     // `?token=` 入口失败后会带着 error 回到这里；地址栏当场清干净。
     const params = new URLSearchParams(location.search);
     if (params.get('error') === 'token') {
       history.replaceState(null, '', location.pathname);
-      const error = $('#login-error');
-      error.textContent = '链接里的 Token 不正确或已失效，请重新输入。';
-      error.hidden = false;
+      showLoginError('链接里的 Token 不正确或已失效，请重新输入。');
     }
     try {
       await api('/api/session');

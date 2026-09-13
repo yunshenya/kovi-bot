@@ -79,62 +79,155 @@ code, .mono { font-family: var(--mono); font-size: 0.92em; }
 
 button, input, select, textarea { font: inherit; color: inherit; }
 
-/* ───────────────────────────── 登录页 ───────────────────────────── */
+/* ───────────────────────────── 登录页 ─────────────────────────────
+ *
+ * 这是别人见到芸汐的第一眼，所以背景是有层次的（极光 + 网格），卡片有厚度，
+ * 文案像她本人在打招呼，而不是一块"请输入凭据"的表单。
+ */
 
 .login-wrap {
+  position: relative;
   min-height: 100vh;
   display: grid;
   place-items: center;
-  padding: 24px;
-  background:
-    radial-gradient(900px 460px at 50% -10%, var(--accent-soft), transparent 70%),
-    var(--bg);
+  align-content: center;
+  gap: 18px;
+  padding: 32px 20px;
+  overflow: hidden;
+  background: var(--bg);
+  isolation: isolate;
 }
+
+/* 极光：三团缓慢漂移的色斑 */
+.login-aurora { position: absolute; inset: -20%; z-index: -2; filter: blur(70px); opacity: .75; }
+.login-aurora .blob {
+  position: absolute; display: block; border-radius: 50%;
+  animation: aurora-drift 26s ease-in-out infinite alternate;
+}
+.login-aurora .b1 { width: 46vmax; height: 46vmax; left: 6%;  top: 2%;  background: color-mix(in srgb, var(--accent) 55%, transparent); }
+.login-aurora .b2 { width: 38vmax; height: 38vmax; right: 4%; top: 14%; background: color-mix(in srgb, #8f6bff 50%, transparent); animation-delay: -8s; }
+.login-aurora .b3 { width: 34vmax; height: 34vmax; left: 32%; bottom: -6%; background: color-mix(in srgb, #3ecf8e 32%, transparent); animation-delay: -16s; }
+@keyframes aurora-drift {
+  from { transform: translate3d(0, 0, 0) scale(1); }
+  to   { transform: translate3d(4%, -6%, 0) scale(1.15); }
+}
+
+/* 细网格：让极光不至于糊成一片 */
+.login-grid {
+  position: absolute; inset: 0; z-index: -1; pointer-events: none;
+  background-image:
+    linear-gradient(to right, color-mix(in srgb, var(--text) 6%, transparent) 1px, transparent 1px),
+    linear-gradient(to bottom, color-mix(in srgb, var(--text) 6%, transparent) 1px, transparent 1px);
+  background-size: 42px 42px;
+  mask-image: radial-gradient(ellipse at center, #000 20%, transparent 72%);
+  -webkit-mask-image: radial-gradient(ellipse at center, #000 20%, transparent 72%);
+}
+
+.login-theme {
+  position: absolute; top: 20px; right: 22px;
+  width: 36px; height: 36px; border-radius: 50%;
+  border: 1px solid var(--border-strong); background: var(--bg-elev); color: var(--text-dim);
+  cursor: pointer; font-size: 15px; line-height: 1;
+  transition: color .15s, border-color .15s, transform .15s;
+}
+.login-theme:hover { color: var(--accent); border-color: var(--accent); transform: rotate(-20deg); }
 
 .login-card {
-  width: min(420px, 100%);
-  background: var(--bg-elev);
+  position: relative;
+  width: min(430px, 100%);
+  padding: 34px 30px 26px;
+  border-radius: 20px;
+  background: color-mix(in srgb, var(--bg-elev) 88%, transparent);
   border: 1px solid var(--border);
-  border-radius: 16px;
-  padding: 32px 28px;
-  box-shadow: var(--shadow);
+  box-shadow: var(--shadow), inset 0 1px 0 color-mix(in srgb, #fff 6%, transparent);
+  backdrop-filter: blur(18px) saturate(1.2);
   text-align: center;
+  animation: card-in .5s cubic-bezier(.2, .8, .2, 1) both;
+}
+/* 顶部一道渐变hairline，让卡片有"被光照到"的感觉 */
+.login-card::before {
+  content: ""; position: absolute; inset: 0 0 auto; height: 1px; border-radius: 20px 20px 0 0;
+  background: linear-gradient(90deg, transparent, color-mix(in srgb, var(--accent) 70%, transparent), transparent);
+}
+@keyframes card-in { from { opacity: 0; transform: translateY(14px) scale(.98); } to { opacity: 1; transform: none; } }
+.login-card.shake { animation: card-shake .4s cubic-bezier(.36, .07, .19, .97) both; }
+@keyframes card-shake {
+  10%, 90% { transform: translateX(-2px); }
+  20%, 80% { transform: translateX(4px); }
+  30%, 50%, 70% { transform: translateX(-7px); }
+  40%, 60% { transform: translateX(7px); }
 }
 
-.login-mark, .brand-mark {
-  display: grid;
-  place-items: center;
-  width: 52px;
-  height: 52px;
-  margin: 0 auto 14px;
-  border-radius: 15px;
+.login-mark { position: relative; width: 64px; height: 64px; margin: 0 auto 16px; }
+.login-mark-glyph {
+  position: relative; z-index: 1;
+  display: grid; place-items: center; width: 64px; height: 64px;
+  border-radius: 19px; color: #fff; font-size: 27px; font-weight: 600; letter-spacing: 1px;
   background: linear-gradient(140deg, var(--accent), #8f6bff);
-  color: #fff;
-  font-size: 22px;
-  font-weight: 600;
-  letter-spacing: 1px;
+  box-shadow: 0 10px 26px color-mix(in srgb, var(--accent) 40%, transparent);
+}
+.login-mark-ring {
+  position: absolute; inset: -7px; border-radius: 24px;
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
+  animation: mark-breathe 3.6s ease-in-out infinite;
+}
+@keyframes mark-breathe {
+  0%, 100% { transform: scale(1); opacity: .55; }
+  50% { transform: scale(1.06); opacity: .95; }
 }
 
-.login-card h1 { margin: 0 0 6px; font-size: 19px; font-weight: 600; }
-.login-sub { margin: 0 0 22px; color: var(--text-dim); font-size: 13px; }
+.login-card h1 { margin: 0 0 6px; font-size: 21px; font-weight: 600; letter-spacing: .5px; }
+.login-sub { margin: 0 0 24px; color: var(--text-dim); font-size: 13px; }
+.login-sub #login-greeting { color: var(--accent); }
+
+.login-field { display: block; text-align: left; margin-bottom: 14px; }
+.login-label { display: block; margin-bottom: 7px; color: var(--text-faint); font-size: 12px; }
+.login-input-wrap { position: relative; display: block; }
+.login-input-wrap .input {
+  padding: 12px 42px 12px 13px;
+  font-size: 14px;
+  letter-spacing: .5px;
+}
+.login-reveal {
+  position: absolute; right: 6px; top: 50%; transform: translateY(-50%);
+  width: 30px; height: 30px; border: 0; border-radius: 8px;
+  background: transparent; color: var(--text-faint); cursor: pointer; font-size: 14px;
+  transition: color .15s, background .15s;
+}
+.login-reveal:hover { color: var(--accent); background: var(--accent-soft); }
+
+.login-submit { position: relative; padding: 12px; font-size: 15px; letter-spacing: 3px; }
+.login-submit:disabled { opacity: .75; }
+.login-spinner {
+  position: absolute; right: 16px; top: 50%; width: 14px; height: 14px; margin-top: -7px;
+  border: 2px solid color-mix(in srgb, #fff 35%, transparent);
+  border-top-color: #fff; border-radius: 50%;
+  animation: spin .7s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
 .login-error {
-  margin: 14px 0 0;
-  color: var(--danger);
-  font-size: 13px;
-  background: var(--danger-soft);
-  border-radius: var(--radius-sm);
-  padding: 8px 10px;
+  margin: 14px 0 0; padding: 9px 12px; border-radius: var(--radius-sm);
+  background: var(--danger-soft); color: var(--danger); font-size: 12.5px; text-align: left;
+  animation: card-in .2s ease-out both;
 }
-.login-hint {
-  margin: 20px 0 0;
-  color: var(--text-faint);
-  font-size: 12px;
-  line-height: 1.7;
-  text-align: left;
-  border-top: 1px solid var(--border);
-  padding-top: 14px;
+
+.login-help { margin-top: 18px; text-align: left; font-size: 12.5px; }
+.login-help summary {
+  cursor: pointer; color: var(--text-faint); list-style: none;
+  padding: 6px 0; transition: color .15s;
 }
-.login-hint code { color: var(--text-dim); background: var(--bg-elev-2); padding: 1px 5px; border-radius: 4px; }
+.login-help summary::-webkit-details-marker { display: none; }
+.login-help summary::before { content: "▸ "; color: var(--accent); }
+.login-help[open] summary::before { content: "▾ "; }
+.login-help summary:hover { color: var(--accent); }
+.login-help ul { margin: 4px 0 0; padding-left: 18px; color: var(--text-dim); line-height: 1.85; }
+.login-help code {
+  background: var(--bg-elev-2); border-radius: 4px; padding: 1px 5px;
+  color: var(--text); font-size: 11.5px; word-break: break-all;
+}
+
+.login-foot { margin: 0; color: var(--text-faint); font-size: 11.5px; text-align: center; }
 
 /* ───────────────────────────── 骨架 ───────────────────────────── */
 

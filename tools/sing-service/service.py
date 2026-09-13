@@ -45,12 +45,20 @@ TTS_TIMEOUT_SECS = 20
 # 一个汉字的合成结果可以复用：同一首歌里重复字很多。
 TTS_CACHE_LIMIT = 512
 SAMPLE_RATE = 16_000
+BREATH_SECONDS = 0.22
 
 # 简谱级数 -> 相对主音的半音数（C 大调）
 DEGREE_SEMITONES = {1: 0, 2: 2, 3: 4, 4: 5, 5: 7, 6: 9, 7: 11}
 A4_HZ = 440.0
 MIN_DEGREE = 1
 MAX_DEGREE = 14  # 8-14 是 1-7 的高八度，方便写《茉莉花》这种跨八度的句子
+
+
+def _transposed(hz: float, semitones: float) -> float:
+    """整体移调。旋律的中心音应当落在她说话的基频附近（实测 248Hz 左右最像她自己）。"""
+    if not semitones:
+        return hz
+    return hz * (2 ** (semitones / 12))
 
 
 def _hz(degree: int, octave: int) -> float:
@@ -134,18 +142,26 @@ def trim_silence(samples: np.ndarray, rate: int, threshold: float = 0.006) -> np
 
 
 def _pitch_tier(manipulation, duration: float, freq: float, previous: float | None):
-    """把整段的基频换成 freq（带颤音与来自上一个音的短滑音）。"""
+    """把整段的基频换成 freq（带颤音、jitter 与来自上一个音的短滑音）。"""
     tier = call(manipulation, "Create PitchTier", "empty", 0.0, duration)
     step = 0.02
+    rng = np.random.default_rng(int(freq) % 9973)
+    # 一个预先抽好的随机游走序列：每个点取一段，够整首歌用
+    jitter_values = np.cumsum(rng.normal(0.0, 0.35, 4096))
+    jitter_values = jitter_values - jitter_values.mean()
+    jitter_values = np.clip(jitter_values, -3.0, 3.0)
+    vibrato_hz = float(rng.uniform(4.6, 5.6))
     for index, time in enumerate(np.arange(0.0, duration + step, step)):
         at = min(float(time), duration)
         if index == 0 and previous is not None:
             glide = min(1.0, step / 0.04)
             value = previous + (freq - previous) * glide
         else:
-            # 颤音轻一点、起音处渐入：1.2%/5.5Hz 在整首歌里听着像老式恐怖片配乐
-            depth = 0.008 * min(1.0, at / 0.12)
-            value = freq * (1.0 + depth * np.sin(2 * np.pi * 5.0 * at))
+            # 颤音轻、延迟起振（先直后颤才是人唱的），再叠一点点随机游走当 jitter：
+            # 完全规则的周期会让音色听起来像合成器。
+            depth = 0.007 * min(1.0, max(0.0, (at - 0.25 * duration) / max(0.12, 0.3 * duration)))
+            jitter = 1.0 + 0.0035 * jitter_values[index % len(jitter_values)]
+            value = freq * jitter * (1.0 + depth * np.sin(2 * np.pi * vibrato_hz * at))
         call(tier, "Add point", at, value)
     call([manipulation, tier], "Replace pitch tier")
 
@@ -219,6 +235,61 @@ def synthesize_syllable(tts: "TtsClient", syllable: str, speed: float) -> tuple[
         LOG.debug("单字 %s 合成近乎无声，退回整段载体", syllable)
         return carried, rate
     return audio, rate
+
+
+def _voice_eq(samples: np.ndarray, rate: int) -> np.ndarray:
+    """把合成的音色往"人声"掰一点。
+
+    实测对比她本人说话：唱歌的 0–300Hz（胸腔）只有 20%（说话 35%），1–4kHz（硬度）
+    却有 31%（说话 20%）——又薄又尖正是"听着怪"的主要来源。这里三段一起修：
+    200Hz 低架 +3dB 补胸腔、3kHz 附近 -3.5dB 去硬度、6.5kHz 以上 -4dB 收毛刺。
+    """
+    if len(samples) < 64:
+        return samples
+    spectrum = np.fft.rfft(samples)
+    freqs = np.fft.rfftfreq(len(samples), 1 / rate)
+    safe = np.maximum(freqs, 1.0)
+    shelf_low = 1 + (10 ** (4.0 / 20) - 1) / (1 + (safe / 250.0) ** 2)
+    harsh = 1 - 0.50 * np.exp(-0.5 * (np.log(safe / 3000.0) / 0.50) ** 2)
+    fizz = 1 - 0.50 / (1 + (7000.0 / safe) ** 4)
+    return np.fft.irfft(spectrum * shelf_low * harsh * fizz, n=len(samples))
+
+
+def _add_shimmer(piece: np.ndarray, rate: int, seed: int) -> np.ndarray:
+    """给长音加一点点幅度与音高的自然起伏。
+
+    循环出来的长音是"逐样本重复"的：谐噪比高、抖动接近零，耳朵一听就知道是机器。
+    真人唱歌有 3–6Hz 的微颤与几个百分点的幅度起伏，加回去立刻就"活"了。
+    """
+    if len(piece) < int(0.12 * rate):
+        return piece
+    rng = np.random.default_rng(seed)
+    time = np.arange(len(piece)) / rate
+    tremor_hz = float(rng.uniform(3.2, 5.8))
+    phase = float(rng.uniform(0, 2 * np.pi))
+    depth = float(rng.uniform(0.03, 0.06))
+    envelope = 1.0 + depth * np.sin(2 * np.pi * tremor_hz * time + phase)
+    # 起音处不要抖，否则像坏了的磁带
+    attack = np.clip(time / 0.15, 0.0, 1.0)
+    return piece * (1.0 + (envelope - 1.0) * attack)
+
+
+def _room_reverb(samples: np.ndarray, rate: int, wet: float = 0.16, rt60: float = 0.55) -> np.ndarray:
+    """一点短混响：干声听起来像"贴着麦克风念"，加个房间反而更像在唱。"""
+    if len(samples) < rate // 4:
+        return samples
+    rng = np.random.default_rng(7)
+    length = int(rt60 * 1.2 * rate)
+    time = np.arange(length) / rate
+    impulse = rng.standard_normal(length) * np.exp(-6.9 * time / rt60)
+    # 冲激必须低通：白噪声尾巴会往 1–8kHz 补一层毛刺，把 EQ 压下去的硬度又加回来
+    # （实测 EQ 前后 1–4kHz 占比纹丝不动就是这个原因）。一阶低通足够。
+    smooth = max(2, int(0.0004 * rate))
+    impulse = np.convolve(impulse, np.ones(smooth) / smooth, mode="same")
+    impulse[: int(0.008 * rate)] = 0.0  # 预延迟
+    impulse *= np.hanning(length)
+    wet_signal = np.convolve(samples, impulse / (np.abs(impulse).sum() + 1e-9), mode="full")[: len(samples)]
+    return (1.0 - wet) * samples + wet * wet_signal * 3.0
 
 
 def _crossfade_join(left: np.ndarray, right: np.ndarray, overlap: int) -> np.ndarray:
@@ -405,7 +476,9 @@ def _loop_nucleus(
         return None
     head = samples[:start]
     tail = samples[end:]
-    fade = max(1, int(0.004 * rate))
+    # 接缝 12ms：4ms 时实测 30–100Hz 包络抖动占比 28%（她说话只有 17%），
+    # 听感就是一层"颗粒/嗡"；循环单元是整数个周期，加长淡化不会梳状滤波。
+    fade = max(1, int(0.012 * rate))
     ramp = np.linspace(0.0, 1.0, fade)
     pieces = [head, unit.copy()]
     filled = len(head) + len(unit)
@@ -497,7 +570,8 @@ def fit_notes(notes: list[list[float]], syllable_count: int) -> list[tuple[float
 
 
 def render_song(tts: TtsClient, notes: list[list[float]], lyrics: str, octave: int,
-                tempo: float) -> tuple[bytes, int, int]:
+                tempo: float, breath_after: tuple[int, ...] = (),
+                reverb: bool = True, transpose: float = 0.0) -> tuple[bytes, int, int]:
     syllables = split_syllables(lyrics)
     if not syllables:
         raise SingRequestError("歌词里没有可唱的字")
@@ -519,7 +593,7 @@ def render_song(tts: TtsClient, notes: list[list[float]], lyrics: str, octave: i
         duration = max(0.12, float(beats) * beat_seconds)
         if elapsed + duration > MAX_SECONDS:
             break
-        freq = _hz(degree, octave)
+        freq = _transposed(_hz(degree, octave), transpose)
         # 每个音多合成 15 毫秒，专门留给与下一个音的交叠；总时值因此保持不变。
         held = duration + (overlap / rate if index != last_index else 0.0)
         piece, rate = sing_note(tts, syllable, freq, held, previous)
@@ -534,6 +608,9 @@ def render_song(tts: TtsClient, notes: list[list[float]], lyrics: str, octave: i
             _dominant_hz(piece, rate, 120, 1200),
         )
         pieces.append(piece)
+        if (index + 1) in breath_after:
+            # 句尾换气：没有呼吸的连续音墙是"念经/机械"感的来源之一。
+            pieces.append(np.zeros(int(BREATH_SECONDS * rate)))
         previous = freq
         elapsed += duration
     if not pieces:
@@ -555,8 +632,15 @@ def render_song(tts: TtsClient, notes: list[list[float]], lyrics: str, octave: i
     # 音与音之间用 15 毫秒交叠连起来（legato）：逐音淡到零再淡起来会变成一顿一顿的
     # 念白感，硬拼又会咔哒——交叠是这两者之间唯一像"唱"的接法。
     audio = pieces[0]
+    piece_index = 0
     for piece in pieces[1:]:
+        piece_index += 1
+        if len(piece) > 0:
+            piece = _add_shimmer(piece, rate, seed=1000 + piece_index)
         audio = _crossfade_join(audio, piece, overlap)
+    audio = _voice_eq(audio, rate)
+    if reverb:
+        audio = _room_reverb(audio, rate)
     fade = min(int(0.01 * rate), len(audio) // 2)
     if fade > 0:
         ramp = np.linspace(0.0, 1.0, fade)
@@ -655,6 +739,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             lyrics = str(request.get("lyrics", ""))
+            breath_after: tuple[int, ...] = ()
+            reverb = bool(request.get("reverb", True))
+            transpose = float(request.get("transpose", -5.0))
             if request.get("notes"):
                 notes = [[float(n[0]), float(n[1])] for n in request["notes"]]
                 octave = int(request.get("octave", 5))
@@ -663,10 +750,14 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 template = self.templates.get(str(request.get("template", "")))
                 notes = [[float(n[0]), float(n[1])] for n in template["notes"]]
-                octave = int(request.get("octave", template.get("octave", 5)))
+                octave = int(request.get("octave", template.get("octave", 4)))
                 tempo = float(request.get("tempo", template.get("bpm", 100)))
                 template_id = template["id"]
-            wav, rate, sung = render_song(self.tts, notes, lyrics, octave, tempo)
+                breath_after = tuple(int(value) for value in template.get("breath_after", ()))
+                transpose = float(request.get("transpose", template.get("transpose", -5.0)))
+            wav, rate, sung = render_song(
+                self.tts, notes, lyrics, octave, tempo, breath_after, reverb, transpose
+            )
         except SingRequestError as error:
             LOG.warning("拒绝合成: %s", error)
             self._json({"error": str(error)}, status=400)

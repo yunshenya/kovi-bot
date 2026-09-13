@@ -5,25 +5,62 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow">
 <title>芸汐 · 管理后台</title>
+<!-- 先落主题再渲染，避免选了浅色主题的人看到一下深色的闪白。 -->
+<script>
+  try {
+    document.documentElement.dataset.theme = 'light'; // 临时：截图用
+  } catch (_) {
+    document.documentElement.dataset.theme = 'dark';
+  }
+</script>
 <link rel="stylesheet" href="/assets/app.css">
 </head>
 <body>
 
 <!-- ───────────────────────────── 登录 ───────────────────────────── -->
 <div id="login-view" class="login-wrap" hidden>
+  <div class="login-aurora" aria-hidden="true">
+    <span class="blob b1"></span><span class="blob b2"></span><span class="blob b3"></span>
+  </div>
+  <div class="login-grid" aria-hidden="true"></div>
+  <button id="login-theme" class="login-theme" type="button" title="切换深浅色">◐</button>
+
   <form id="login-form" class="login-card" autocomplete="off">
-    <div class="login-mark">汐</div>
-    <h1>芸汐管理后台</h1>
-    <p class="login-sub">请输入访问 Token。Token 由服务端生成或通过环境变量配置。</p>
-    <input id="login-token" class="input" type="password" placeholder="访问 Token" autocomplete="current-password" required>
-    <button type="submit" class="btn primary block">登 录</button>
+    <div class="login-mark">
+      <span class="login-mark-glyph">汐</span>
+      <span class="login-mark-ring"></span>
+    </div>
+    <h1>欢迎回来</h1>
+    <p class="login-sub"><span id="login-greeting">我是芸汐</span>，先证明是你本人。</p>
+
+    <label class="login-field">
+      <span class="login-label">访问 Token</span>
+      <span class="login-input-wrap">
+        <input id="login-token" class="input" type="password" placeholder="粘贴启动日志里的那串字符"
+               autocomplete="off" name="yunxi-admin-token" spellcheck="false" required>
+        <button id="login-reveal" class="login-reveal" type="button" title="显示 / 隐藏">👁</button>
+      </span>
+    </label>
+
+    <button id="login-submit" type="submit" class="btn primary block login-submit">
+      <span class="login-submit-text">登 录</span>
+      <span class="login-spinner" hidden></span>
+    </button>
+
     <p id="login-error" class="login-error" hidden></p>
-    <p class="login-hint">
-      找不到 Token？见服务端启动日志，或运行时目录的 <code>.yunxi-admin-token</code>
-      （在本机跑就是工作目录）；也可以在 <code>bot.conf.toml</code> 的 <code>[admin]</code> 里
-      配置 <code>token_env</code> 指向的环境变量。
-    </p>
+
+    <details class="login-help">
+      <summary>找不到 Token？</summary>
+      <ul>
+        <li>看服务端启动日志：<code>journalctl -u kovi-bot | grep Token</code></li>
+        <li>或读运行时目录的 <code>.yunxi-admin-token</code>（本机跑就是工作目录）</li>
+        <li>也可以固定下来：在 <code>bot.conf.toml</code> 的 <code>[admin]</code> 里把
+            <code>token_env</code> 指向一个环境变量</li>
+      </ul>
+    </details>
   </form>
+
+  <p class="login-foot">只监听回环地址 · 登录状态存在会话 Cookie 里</p>
 </div>
 
 <!-- ───────────────────────────── 主界面 ───────────────────────────── -->
