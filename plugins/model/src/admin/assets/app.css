@@ -975,7 +975,10 @@ a.stat:hover, .stat.link:hover { border-color: var(--accent); transform: transla
   position: relative; border: 1px solid var(--border); border-radius: var(--radius);
   overflow: hidden; box-shadow: var(--shadow-sm);
 }
-#memory-graph { width: 100%; height: 540px; display: block; background: var(--bg-sunken); cursor: grab; }
+/* `touch-action: pan-y`：手指竖着划仍然滚页面（手机上最常用的手势），横着划与
+   双指交给画布（拖动平移 / 缩放），浏览器也不会把双指当成页面缩放。不设它的话，
+   手指按在画布上会被判成"滚页面"，点节点时连 click 都不会派发。 */
+#memory-graph { width: 100%; height: 540px; display: block; background: var(--bg-sunken); cursor: grab; touch-action: pan-y; }
 .graph-hint {
   position: absolute; top: 10px; left: 12px;
   font-size: 11.5px; color: var(--text-faint); pointer-events: none;

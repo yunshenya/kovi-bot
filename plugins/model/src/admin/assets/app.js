@@ -1686,7 +1686,8 @@
     const tooltip = h('div', { class: 'graph-tooltip', id: 'graph-tooltip', hidden: true });
     const canvasBox = h('div', { class: 'graph-canvas-box' },
       canvas,
-      h('div', { class: 'graph-hint', text: '滚动缩放 · 拖动平移 · 悬停探索 · 点击查看详情' }),
+      // 提示两种设备都照顾到：手机上是双指缩放、点节点看详情，没有悬停。
+      h('div', { class: 'graph-hint', text: '滚轮/双指缩放 · 拖动平移 · 点节点看详情' }),
       h('div', { class: 'graph-heat' },
         heatLabel,
         h('div', { class: 'graph-heat-bar' }),
@@ -1959,12 +1960,12 @@
       context.globalAlpha = 1;
     };
 
-    const nodeAt = (event) => {
+    const nodeAt = (event, radius = 16) => {
       const rect = canvas.getBoundingClientRect();
       const x = event.clientX - rect.left;
       const y = event.clientY - rect.top;
       let best = null;
-      let bestDistance = 16;
+      let bestDistance = radius;
       for (const node of nodes) {
         const point = toScreen(node);
         const distance = Math.hypot(point.x - x, point.y - y);
@@ -1983,63 +1984,160 @@
       canvas.__graphListenersAttached = true;
       const runtime = () => canvas.__graphRuntime;
 
-      canvas.addEventListener('mousemove', (event) => {
+      // 全部走指针事件（鼠标 / 触屏 / 触控笔一套代码）。
+      //
+      // 为什么不能在触屏上靠 click：手指按在画布上时，浏览器默认把这次触摸当成
+      // "滚动页面"，一旦判定成滚动就不再生成本次点击的 click——所以点节点没反应。
+      // 现在点击判定自己算（pointerup 且几乎没位移），并且 CSS 上给画布
+      // `touch-action: pan-y`：竖划仍然滚页面（手机上最常用的手势），横划与双指
+      // 交给画布，浏览器也不会自己缩放页面。
+      //
+      // 另外 movementX/movementY 在触屏指针上是 0，位移必须自己用 clientX/Y 算。
+      const pointers = new Map(); // pointerId -> 最新位置
+      const TAP_SLOP = 6; // 位移超过它就算拖动，不再当点击
+      let panStart = null; // 单指/鼠标的按下点
+      let pinchStart = null; // 双指缩放起点 { distance, zoom }
+
+      const endGesture = () => {
+        panStart = null;
+        pinchStart = null;
+        pointers.clear();
+      };
+
+      canvas.addEventListener('pointerdown', (event) => {
         const current = runtime();
         if (!current) return;
-        const { view: currentView, nodeAt: pick, paint: repaint } = current;
-        if (currentView.dragging) {
-          currentView.panX += event.movementX / currentView.zoom;
-          currentView.panY += event.movementY / currentView.zoom;
-          currentView.moved = true;
-          repaint();
+        if (event.pointerType === 'mouse' && event.button !== 0) return;
+        if (canvas.setPointerCapture) {
+          // 指针捕获：拖到画布外面也能继续跟手（否则会停在原地，还得等下一次
+          // 按下才恢复）。拿不到就跳过——某些浏览器在指针已失效时会抛
+          // NotFoundError，而那不影响拖动与点击本身。
+          try {
+            canvas.setPointerCapture(event.pointerId);
+          } catch (_) {
+            // 忽略：捕获只是体验优化，不是这次交互的前提。
+          }
+        }
+        pointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
+
+        if (pointers.size === 2) {
+          const [a, b] = [...pointers.values()];
+          pinchStart = {
+            distance: Math.hypot(a.x - b.x, a.y - b.y),
+            zoom: current.view.zoom,
+          };
+          panStart = null;
+          current.view.moved = true; // 双指手势不可能是"点一下"
+        } else if (pointers.size === 1) {
+          panStart = { x: event.clientX, y: event.clientY };
+          current.view.dragging = true;
+          current.view.moved = false;
+          canvas.style.cursor = 'grabbing';
+        }
+      });
+
+      canvas.addEventListener('pointermove', (event) => {
+        const current = runtime();
+        if (!current) return;
+        const previous = pointers.get(event.pointerId);
+        if (previous) pointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
+
+        if (pinchStart && pointers.size === 2) {
+          const [a, b] = [...pointers.values()];
+          const distance = Math.hypot(a.x - b.x, a.y - b.y);
+          if (pinchStart.distance > 0) {
+            current.view.zoom = Math.min(
+              4,
+              Math.max(0.15, pinchStart.zoom * (distance / pinchStart.distance)),
+            );
+            current.paint();
+          }
           return;
         }
+
+        if (current.view.dragging && panStart && previous) {
+          if (
+            Math.abs(event.clientX - panStart.x) > TAP_SLOP
+            || Math.abs(event.clientY - panStart.y) > TAP_SLOP
+          ) {
+            current.view.moved = true;
+          }
+          // 屏幕位移换算回图坐标：屏幕 = 中心 + (世界 + pan) * zoom。
+          current.view.panX += (event.clientX - previous.x) / current.view.zoom;
+          current.view.panY += (event.clientY - previous.y) / current.view.zoom;
+          current.paint();
+          return;
+        }
+
+        // 悬停只有鼠标有：触屏上让 tooltip 跟着手指闪没有意义，点下去就是详情。
+        if (event.pointerType !== 'mouse') return;
+        const { nodeAt: pick } = current;
         const node = pick(event);
-        if (node !== currentView.hovered) {
-          currentView.hovered = node;
+        if (node !== current.view.hovered) {
+          current.view.hovered = node;
           canvas.style.cursor = node ? 'pointer' : 'grab';
-          repaint();
+          current.paint();
         }
         if (node && tip) {
           const rect = canvas.getBoundingClientRect();
           tip.hidden = false;
-          tip.style.left = `${event.clientX - rect.left + 14}px`;
-          tip.style.top = `${event.clientY - rect.top + 10}px`;
           clear(tip);
           tip.append(
             h('div', { class: 'tip-kind', text: node.label || node.kind }),
             h('div', { class: 'tip-title', text: node.title || '' }),
             h('div', { class: 'tip-meta', text: `${node.scope_label || '全局'} · ${shortDate(mentionedOf(node))}` }));
+          // 画布是 `overflow: hidden` 的：贴着右/下边缘的节点会把 tooltip 顶出去
+          // 裁掉一截。先摆出来量一下实际尺寸，再收进画布内。
+          const left = Math.min(event.clientX - rect.left + 14, rect.width - tip.offsetWidth - 8);
+          const top = Math.min(event.clientY - rect.top + 10, rect.height - tip.offsetHeight - 8);
+          tip.style.left = `${Math.max(8, left)}px`;
+          tip.style.top = `${Math.max(8, top)}px`;
         } else if (tip) {
           tip.hidden = true;
         }
       });
-      canvas.addEventListener('mouseleave', () => {
+
+      const finishPointer = (event) => {
+        const current = runtime();
+        const wasTap = Boolean(
+          current && pointers.has(event.pointerId) && !current.view.moved && pointers.size === 1,
+        );
+        pointers.delete(event.pointerId);
+        if (canvas.hasPointerCapture && canvas.hasPointerCapture(event.pointerId)) {
+          canvas.releasePointerCapture(event.pointerId);
+        }
+        if (pointers.size < 2) pinchStart = null;
+        if (pointers.size === 0 && current) {
+          panStart = null;
+          current.view.dragging = false;
+          canvas.style.cursor = current.view.hovered ? 'pointer' : 'grab';
+        }
+        if (!wasTap) return;
+        // 触屏上手指按不准：命中半径给大一点，否则要点好几次才中。
+        const node = current.nodeAt(event, event.pointerType === 'mouse' ? 16 : 26);
+        if (node) openRecord(node);
+      };
+      canvas.addEventListener('pointerup', finishPointer);
+      canvas.addEventListener('pointercancel', (event) => {
+        endGesture();
+        const current = runtime();
+        if (current) {
+          current.view.dragging = false;
+          current.paint();
+        }
+        if (canvas.hasPointerCapture && canvas.hasPointerCapture(event.pointerId)) {
+          canvas.releasePointerCapture(event.pointerId);
+        }
+      });
+
+      canvas.addEventListener('pointerleave', () => {
         const current = runtime();
         if (!current) return;
         current.view.hovered = null;
         if (tip) tip.hidden = true;
         current.paint();
       });
-      canvas.addEventListener('mousedown', () => {
-        const current = runtime();
-        if (!current) return;
-        current.view.dragging = true;
-        current.view.moved = false;
-        canvas.style.cursor = 'grabbing';
-      });
-      window.addEventListener('mouseup', () => {
-        const current = runtime();
-        if (!current) return;
-        current.view.dragging = false;
-        canvas.style.cursor = current.view.hovered ? 'pointer' : 'grab';
-      });
-      canvas.addEventListener('click', (event) => {
-        const current = runtime();
-        if (!current || current.view.moved) return;
-        const node = current.nodeAt(event);
-        if (node) openRecord(node);
-      });
+
       canvas.addEventListener('wheel', (event) => {
         const current = runtime();
         if (!current) return;
