@@ -197,10 +197,12 @@ ssh -L 6098:127.0.0.1:6098 -p 22 ubuntu@<服务器>   # 服务器上跑时先做
     Hindsight 一致：31 进制哈希取模五色调色板），每页 100 条带页码导航。
   - **时间线**：按年/月/周/日分组缩放 + 分组跳转，左侧日期轴 + 右侧卡片。
 
-  另有**人物页**（QQ 身份 + 关系五维 + 情绪 + 相关记录）。卡片上的记忆条数是"她真正记得这个
-  人多少条"，因此同时数 Memory v2 的 person 作用域与旧版 `kovi_bot_memories` 里
+  另有**人物页**（QQ 身份 + 关系五维 + 情绪 + 相关记录）。卡片上的记忆条数是"库里关于这个
+  人有多少条私有记忆"，因此同时数 Memory v2 的 person 作用域与旧版 `kovi_bot_memories` 里
   `scope_type = 'private'` 的行（按这个人的 QQ 身份归属）：聊天的记忆写入目前仍在旧表，
   只数 v2 会让这个数字恒为 0。群记忆不属于任何个人（它的 subject 是群号），不计入。
+  这一列说的是"记了多少"，不是"能召回多少"——Core 的召回按 context 前缀取
+  （`private_chat`），旧格式 `private` 的记忆不会被带进上下文，但仍计入这里。
   视图可深链接：`#/memory/table`、`#/memory/timeline`、`#/memory/constellation`、
   `#/memory/people`。
 

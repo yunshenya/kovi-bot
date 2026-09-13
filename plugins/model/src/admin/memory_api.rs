@@ -642,8 +642,8 @@ pub(crate) async fn people(Query(params): Query<PeopleQuery>) -> Result<Json<Val
     })))
 }
 
-/// 人物列表的 SQL。计数列不是"好看的数字"，而是**她真正记得这个人多少条**，
-/// 因此必须跨两张表数：
+/// 人物列表的 SQL。计数列不是"好看的数字"，而是**库里关于这个人有多少条私有
+/// 记忆**，因此必须跨两张表数：
 ///
 /// - `yunxi_memories` 的 person 作用域（Memory v2）；
 /// - `kovi_bot_memories` 里 `scope_type = 'private'` 的行，按这个人的 QQ 身份归属
@@ -654,9 +654,13 @@ pub(crate) async fn people(Query(params): Query<PeopleQuery>) -> Result<Json<Val
 /// v2 里不会有 person 行）。群记忆不属于任何个人——它的 subject 是群号，会被
 /// `scope_type = 'private'` 挡掉，这也是刻意的口径：卡片说的是"关于他"的记忆。
 ///
+/// **这个数字回答"记了多少"，不回答"想得起来多少"。** 召回是另一回事：Core 的
+/// 召回按 context 前缀取（`private_chat`），所以旧格式 `private` 那些行不会被带进
+/// 上下文，但它们是真实存在的私有记忆，这里照样计入（线上确实有这种账号：
+/// 卡片 3 条、Core 能召回的 0 条）。别把这一列当成召回能力的度量。
+///
 /// 两个来源是同一份内容的两个投影，所以还要排掉"旧表这一行在 v2 里已有副本"的
-/// 情况（运行时双写按 Core UUID 对齐主键，离线 backfill 走 ledger），否则等
-/// backfill 真跑起来，同一个人的数字会凭空翻倍。
+/// 情况，见 [`core_twin_predicate`]：不同步排除的话，backfill 一跑数字就翻倍。
 fn people_sql(existing: &BTreeSet<String>) -> String {
     format!(
         r#"
@@ -701,11 +705,6 @@ fn people_sql(existing: &BTreeSet<String>) -> String {
         legacy = if existing.contains("kovi_bot_memories") {
             // 按 person 聚合而不是按身份行 join：一个人挂多个 QQ 身份时，直接 join
             // 会让列表出现重复卡片、计数也会被乘开。
-            //
-            // 两处 NOT EXISTS 防的是"同一条记忆被数两次"。Core 与旧表是同一份内容的
-            // 两个投影，来源有两条：运行时双写会沿用 Core 的 UUID 当旧表主键；
-            // 离线 backfill 用 ledger 记录 legacy_id → target_id。任一条成立就说明
-            // 这条旧记忆在 v2 里已经有对应行，不能再计一次。
             format!(
                 "(SELECT identity.person_id, count(*) AS count \
                  FROM yunxi_external_identities identity \
@@ -713,21 +712,40 @@ fn people_sql(existing: &BTreeSet<String>) -> String {
                    ON memory.subject_id::text = identity.external_id \
                   AND memory.scope_type = 'private' \
                  WHERE identity.platform = 'qq' \
-                   AND NOT EXISTS (SELECT 1 FROM yunxi_memories core WHERE core.id::text = memory.id) \
-                   {ledger} \
+                   AND {twin} \
                  GROUP BY identity.person_id) ",
-                ledger = if existing.contains(MIGRATION_LEDGER_TABLE) {
-                    "AND NOT EXISTS (SELECT 1 FROM yunxi_memory_migration_items item \
-                      JOIN yunxi_memories target ON target.id = item.target_id \
-                      WHERE item.legacy_id = memory.id)"
-                } else {
-                    ""
-                },
+                twin = core_twin_predicate(existing, "memory.id"),
             )
         } else {
             "(SELECT NULL::uuid AS person_id, NULL::bigint AS count WHERE FALSE) ".to_string()
         },
     )
+}
+
+/// "这行旧版记忆在 v2 里已经有副本"的判据——计数与人物详情共用这一份。
+///
+/// Core 与旧表是同一份内容的两个投影，副本有两条来路：运行时双写会沿用 Core 的
+/// UUID 当旧表主键；离线 backfill 用 ledger 记录 `legacy_id → target_id`。任一条
+/// 成立就说明这一行不该再数一次、也不该在人物弹窗里跟 v2 那张卡重复出现。
+///
+/// ledger 那半边要求目标行**现在还活着**（`JOIN yunxi_memories`），否则批次被
+/// rollback 之后，这条旧记忆会既不算在 v2（已被删）也不算在旧表（被误判成有副本），
+/// 直接从统计里消失。
+///
+/// `legacy_id_expr` 是旧表主键在当前查询里的写法（列表里是 `memory.id`，
+/// 人物详情里是投影后的 `t.id`）。
+fn core_twin_predicate(existing: &BTreeSet<String>, legacy_id_expr: &str) -> String {
+    let mut sql = format!(
+        "NOT EXISTS (SELECT 1 FROM yunxi_memories core WHERE core.id::text = {legacy_id_expr})"
+    );
+    if existing.contains(MIGRATION_LEDGER_TABLE) {
+        sql.push_str(&format!(
+            " AND NOT EXISTS (SELECT 1 FROM {MIGRATION_LEDGER_TABLE} item \
+             JOIN yunxi_memories target ON target.id = item.target_id \
+             WHERE item.legacy_id = {legacy_id_expr})"
+        ));
+    }
+    sql
 }
 
 fn person_card(row: &PgRow) -> Value {
@@ -809,11 +827,15 @@ pub(crate) async fn person(UrlPath(id): UrlPath<String>) -> Result<Json<Value>, 
     .await;
 
     let mut records = Vec::new();
+    let existing = existing_tables(pool).await?;
     for kind in KINDS {
+        if !existing.contains(kind.table) {
+            continue;
+        }
         let sql = format!(
             "SELECT * FROM ({}) t WHERE {} LIMIT 200",
             kind_select(kind),
-            person_record_filter(kind)
+            person_record_filter(kind, &existing)
         );
         let rows = if kind.key == LEGACY_MEMORY_KEY {
             // 旧版私有记忆在库里是 QQ 作用域（`scope_type='private'` 投影成 'qq'），
@@ -833,7 +855,16 @@ pub(crate) async fn person(UrlPath(id): UrlPath<String>) -> Result<Json<Value>, 
                 let mut cards: Vec<Value> = rows.iter().map(|row| row_to_card(row, kind)).collect();
                 records.append(&mut cards);
             }
-            Err(_) => continue,
+            Err(error) => {
+                // 这里曾经是 `Err(_) => continue`：任何 SQL/类型错误都表现成"这类没有
+                // 记录"，人物弹窗静默变空——正是这个页面刚出过的那类故障。表不存在
+                // 已经在上面跳过，能走到这里的都是真问题，必须留痕。
+                eprintln!(
+                    "[WARN] 人物详情读取 {} 失败 (person {}): {error}",
+                    kind.label, person_id
+                );
+                continue;
+            }
         }
     }
     sort_items(&mut records);
@@ -882,12 +913,18 @@ pub(crate) async fn person(UrlPath(id): UrlPath<String>) -> Result<Json<Value>, 
 ///
 /// 绝大多数类型是 Core 的 person 作用域；唯独旧版记忆是 QQ 作用域——它的
 /// `scope_id` 是对方 QQ 号（可能多个身份），所以要绑一个文本数组进去。
-fn person_record_filter(kind: &RecordKind) -> &'static str {
-    if kind.key == LEGACY_MEMORY_KEY {
-        "t.scope_kind = 'qq' AND t.scope_id = ANY($1::text[])"
-    } else {
-        "t.scope_kind = 'person' AND t.scope_id = $1"
+///
+/// 旧版记忆还要排掉"在 v2 已有副本"的行，口径与人物卡片的计数**共用同一个**
+/// [`core_twin_predicate`]：两边各写一份的话，backfill 之后就会出现卡片说 84 条、
+/// 弹窗却列出 168 条的自相矛盾。
+fn person_record_filter(kind: &RecordKind, existing: &BTreeSet<String>) -> String {
+    if kind.key != LEGACY_MEMORY_KEY {
+        return "t.scope_kind = 'person' AND t.scope_id = $1".to_string();
     }
+    format!(
+        "t.scope_kind = 'qq' AND t.scope_id = ANY($1::text[]) AND {}",
+        core_twin_predicate(existing, "t.id")
+    )
 }
 
 // ---------------------------------------------------------------- 图谱
@@ -1799,19 +1836,66 @@ mod tests {
     /// 旧版记忆是 QQ 作用域：按 person UUID 匹配一条都取不到，人物弹窗会长期是空的。
     #[test]
     fn person_detail_scopes_legacy_memories_by_qq_identity() {
+        let tables = all_tables();
         let legacy = kind_meta(LEGACY_MEMORY_KEY).expect("旧版记忆类型应存在");
         assert_eq!(legacy.table, "kovi_bot_memories");
-        let filter = person_record_filter(legacy);
+        let filter = person_record_filter(legacy, &tables);
         assert!(
             filter.contains("'qq'") && filter.contains("ANY($1::text[])"),
             "{filter}"
         );
 
         let memory = kind_meta("memory").expect("长期记忆类型应存在");
-        let filter = person_record_filter(memory);
+        let filter = person_record_filter(memory, &tables);
         assert!(
             filter.contains("'person'") && filter.contains("= $1"),
             "{filter}"
+        );
+    }
+
+    /// 计数与详情必须共用同一份"v2 已有副本"判据。两边各写一份的话，backfill 之后
+    /// 就会出现卡片说 84 条、弹窗列出 168 条的自相矛盾——这正是这次 review 揪出来的。
+    #[test]
+    fn count_and_detail_share_one_core_twin_predicate() {
+        let tables = all_tables();
+        let legacy = kind_meta(LEGACY_MEMORY_KEY).expect("旧版记忆类型应存在");
+        let detail = format!(
+            "SELECT * FROM ({}) t WHERE {} LIMIT 200",
+            kind_select(legacy),
+            person_record_filter(legacy, &tables)
+        );
+        assert!(
+            detail.contains(&core_twin_predicate(&tables, "t.id")),
+            "详情侧要排孪生: {detail}"
+        );
+        assert!(
+            people_sql(&tables).contains(&core_twin_predicate(&tables, "memory.id")),
+            "计数侧要排孪生"
+        );
+
+        // 两侧用的是同一个 helper，主键写法只差别名（改 helper 会同时改到两边）。
+        assert!(
+            core_twin_predicate(&tables, "t.id").contains("core.id::text = t.id")
+                && core_twin_predicate(&tables, "memory.id").contains("core.id::text = memory.id"),
+            "主键要跟着各自的查询别名走"
+        );
+        assert_eq!(
+            core_twin_predicate(&tables, "t.id")
+                .matches("NOT EXISTS")
+                .count(),
+            core_twin_predicate(&tables, "memory.id")
+                .matches("NOT EXISTS")
+                .count(),
+            "两侧的排除条件数量必须一致"
+        );
+
+        // 账本表缺失时，两侧都要退化成只剩"按 Core 主键"这一半。
+        let mut without_ledger = all_tables();
+        without_ledger.remove(MIGRATION_LEDGER_TABLE);
+        assert!(!person_record_filter(legacy, &without_ledger).contains(MIGRATION_LEDGER_TABLE));
+        assert!(
+            person_record_filter(legacy, &without_ledger).contains("core.id::text = t.id"),
+            "没有账本也仍要排双写副本"
         );
     }
 
