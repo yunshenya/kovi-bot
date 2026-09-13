@@ -1238,22 +1238,40 @@ pub(crate) async fn project_legacy_user_state(
         }
     }
     if let Some(relation_store) = RELATION_STORE.get() {
-        let familiarity = (f64::from(interaction_count.min(100)) / 100.0) as f32;
-        let affinity = (f32::from(relationship_level) - 5.0) / 5.0;
-        let trust = (f32::from(relationship_level) - 1.0) / 9.0;
-        let comfort = affinity.max(0.0);
-        let tension = (-affinity).max(0.0);
-        let relation = RelationState {
-            person_id,
-            familiarity,
-            affinity: affinity.clamp(-1.0, 1.0),
-            trust: trust.clamp(-1.0, 1.0),
-            comfort: comfort.clamp(-1.0, 1.0),
-            tension: tension.clamp(-1.0, 1.0),
-        };
+        let relation = legacy_relation_projection(person_id, relationship_level, interaction_count);
         if let Err(error) = relation_store.seed_if_absent(relation).await {
             kovi::log::warn!("Yunxi relation bootstrap failed for QQ user {user_id}: {error}");
         }
+    }
+}
+
+/// 把 legacy 档案的两个数字投影成 Core 的关系初值。
+///
+/// 抽成纯函数是为了让"投影不许凭空造出张力"这条不变量**可测**：`tension` 的语义
+/// 是"被持续不友好对待的证据累积"，只有 `adjust_relation_tension`（字面证据与
+/// 模型语义证据）能抬升它，legacy 档案里根本没有这个信息。
+fn legacy_relation_projection(
+    person_id: PersonId,
+    relationship_level: u8,
+    interaction_count: u32,
+) -> RelationState {
+    let familiarity = (f64::from(interaction_count.min(100)) / 100.0) as f32;
+    let affinity = (f32::from(relationship_level) - 5.0) / 5.0;
+    let trust = (f32::from(relationship_level) - 1.0) / 9.0;
+    let comfort = affinity.max(0.0);
+    RelationState {
+        person_id,
+        familiarity: familiarity.clamp(-1.0, 1.0),
+        affinity: affinity.clamp(-1.0, 1.0),
+        trust: trust.clamp(-1.0, 1.0),
+        comfort: comfort.clamp(-1.0, 1.0),
+        // 恒为 0，不从 `-affinity` 反推。这里曾经写 `(-affinity).max(0.0)`，于是
+        // `relationship_level = 1`（legacy 里是"礼貌、稍微正式"，也是新用户的
+        // 默认值，线上八成档案都是它）被译成张力 0.8。在静默门控用 0.6 当阈值
+        // 之前那个值只是语气提示，无害；门控上线后它意味着"每个新认识的人一建档
+        // 就带着越线的张力，第一条 @ 她的话就被判不接"。等级低是"不熟"，不是
+        // "有仇"，这两件事不能共用一根刻度。
+        tension: 0.0,
     }
 }
 
@@ -1539,7 +1557,31 @@ pub(crate) async fn unlink_external_identity(platform: &str, external_id: &str) 
 
 #[cfg(test)]
 mod tests {
-    use super::{ExecutiveSaveState, finish_executive_erasure_state};
+    use super::{ExecutiveSaveState, finish_executive_erasure_state, legacy_relation_projection};
+    use yunxi_core::PersonId;
+
+    #[test]
+    fn legacy_projection_never_invents_relation_tension() {
+        // 每个等级都不许凭空造出张力。这条不变量是有代价的：静默门控拿 0.6 当
+        // 阈值，而等级 1 是新用户默认值——投影一旦给出张力，等于"新人第一条
+        // @ 她的话就不回"。（2026-09-14 线上事故：等级 1 → 0.8 → 被静默。）
+        for level in 1..=10u8 {
+            let relation = legacy_relation_projection(PersonId::new(), level, 20);
+            assert_eq!(relation.tension, 0.0, "等级 {level} 不该投影出张力");
+        }
+    }
+
+    #[test]
+    fn legacy_projection_still_carries_familiarity_and_warmth_dimensions() {
+        // 这次只动张力：亲密度与信任照旧按等级投影，"熟不熟"仍然进得来。
+        let stranger = legacy_relation_projection(PersonId::new(), 1, 100);
+        let intimate = legacy_relation_projection(PersonId::new(), 10, 100);
+        assert!(stranger.affinity < 0.0, "等级 1 仍然是生分的一端");
+        assert_eq!(stranger.familiarity, 1.0, "互动次数应当折算成熟悉度");
+        assert_eq!(stranger.comfort, 0.0, "生分没有舒适度可言，但也不是负的");
+        assert!(intimate.affinity > 0.0);
+        assert!(intimate.trust > stranger.trust);
+    }
 
     #[test]
     fn successful_global_erasure_keeps_post_clear_requests_dirty() {

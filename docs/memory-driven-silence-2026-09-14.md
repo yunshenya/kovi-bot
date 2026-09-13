@@ -45,14 +45,50 @@
    改变行为就是这个功能的用途，装上但不开会让它在需要时恰好没作用。写成 `false`
    即回到"只看不动"——只打 `[SILENCE] shadow=true person=… tension=… threshold=…
    reason=…`，判定照跑、可见回复一条不少。
-   开启前的存量核对：线上 `yunxi_relations` 里活跃张力最高只有 0.085，那 40 条
+   ~~开启前的存量核对：线上 `yunxi_relations` 里活跃张力最高只有 0.085，那 40 条
    `tension = 0.8` 是 8 月底的老行，经 `updated_at` 漂移后实际不足 0.1——不存在
-   "一打开就有人被静默"。
+   "一打开就有人被静默"。~~
+   **这条结论是错的，上线 3 分钟就出事故，见下一节。**它只核对了**已存在**的行，
+   没核对**还会不断造出新行**的那条写入路径（`relation_store::seed_if_absent`）。
 2. **管理员永远放行**。Core 的事件里只有平台无关的 `PersonId`、判不了管理员
    （`is_bot_admin` 要 QQ 号），所以结论由 Host 经 `HostMessageContext.sender_is_admin`
    带进来——唯一能解除紧张的人不能被自己触发的静默挡住。
 3. **不是封禁**。张力按 3 天半衰期自然消退，善意（道谢或明确友好）按 0.12 的
    混合率主动降温；没有需要人工解封的状态。私聊一律不拦。
+
+## 事故与修正：投影出来的张力把新人挡在门外（2026-09-14 02:09）
+
+**现象**。新群 `687898502` 刚授权（02:09:00），02:09:39 成员 @ 她，Mind 判的是
+`baseline=Reply projected=Reply`，紧接着 `[SILENCE] shadow=false person=…
+tension=0.800 threshold=0.60 reason=relation_tension` 把它否决——那个群里唯一得到
+回复的人是 `main_admin`（管理员放行）。
+
+**根因**。`plugins/model/src/yunxi/mod.rs` 的 legacy 投影把 `relationship_level` 反推
+成了张力：`affinity = (level - 5) / 5`、`tension = -affinity`。而 `level = 1` 是
+**新用户默认值**（线上 130 条档案里 80 条），语义是"礼貌、稍微正式"（`utils.rs` 的
+1..=4 档），不是"有仇"。于是等级 1 → 张力 0.8 ≥ 0.6；等级 2 → 0.6，正好压线。
+`seed_if_absent` 又是在**每个新认识的人**第一次出现时跑
+（`project_legacy_user_state` ← `model/utils.rs`），所以这不是存量问题，而是一条持续
+出产"越线新人"的流水线：白鸽的 person 记录 02:09:05 建档，relation 同时被种上 0.8，
+34 秒后门控读到的就是 0.800（间距小于 `MINIMUM_DRIFT_ELAPSED`，漂移恰好为 0）。
+
+这个投影是 8 月的老代码，一直无害——在门控之前 `tension` 只喂一句语气提示
+（≥0.35 → "和对方还有点生分"）。**是新的消费方让一个被误译的老字段有了否决权。**
+
+**修正**。
+
+1. 代码：投影不再写张力（恒为 0），并把它抽成纯函数 `legacy_relation_projection`
+   补上不变量测试——"投影不许凭空造出张力"从此可测。张力只能由相处证据累积。
+2. 数据：`scripts/backfill-relation-tension-seed.sql` 清掉库里由投影产生的张力
+   （80 行），修正前值留在台账表 `yunxi_relation_tension_seed_backfill`。判据是
+   `tension <= -affinity`（证据只加不减，而 tension 的漂移比 affinity 快得多，
+   所以"从未有过证据"必然满足该式），而不是拿 legacy 的**当前** level 反推——
+   level 会随互动上升，线上就有一条建档于等级 1、现在显示等级 2 的行会被漏掉。
+
+**代价与残余风险**。清零按"整行张力都在该初值以内"判定，因此**已经衰减回初值以内的
+真实证据会被一起清掉**（那些值都低于门控阈值 0.6，影响只到语气提示那一档）；此后新
+的证据照常累积。另外：数据修正立即生效，**代码修正要下一次发布才生效**——在那之前
+常驻的旧进程仍会给每个新建档的人种上 0.8。
 
 ## 已知边界与代价
 
