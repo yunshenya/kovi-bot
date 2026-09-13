@@ -106,7 +106,15 @@ NotFound」两条断言。
 在「擦除后行数=0」通过之后，下一次 `save_world` 让行数回到 1（`left: 1, right: 0`）。
 机制确认无误：`save_world` 是整表重写，而擦除只删库里的行。
 
-**并且它的开关状态和字面看起来的相反**：`bot.conf.example.toml:407-410` 写着
+**门控语义已厘清（`b18f6d1`）**：结论是**代码对、注释错**。`enabled` 是总开关，实际
+门控六处（建表+启动恢复、`with_world` 这个所有记录的入口、`restore_from_store`、两处
+soft-signal 调试日志、启动那行文案）；而那句"只影响两处文案、不门控任何行为"描述的其实
+是 `shadow_mode`——它确实只有两个消费点，且都只是往状态行拼 `shadow=true`。类型文档原先
+把安全性寄托在 `shadow_mode` 上也是错的，真正拦住行为的是 `reply_context` 与
+`influence_mode`。注释与文档已按事实重写，并加了 `world_model_gating_tests` 用行为断言
+钉住总开关（删掉门控会变红），ci.yml 里点名跑。
+
+**原记录（其开关状态与字面看起来的相反）**：`bot.conf.example.toml:407-410` 写着
 `world_model.enabled`「只影响两处**文案**……没有门控任何行为（全仓只有这两个消费点）」。
 实际上代码至少门控三处：`with_world` 的内存运行时（`yunxi/world_model.rs:69-72`）、
 `restore_from_store`（`:90-92`）、以及世界模型 store 的创建与随之而来的
