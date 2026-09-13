@@ -74,15 +74,18 @@
       </div>
     </div>
     <nav class="nav">
-      <button class="nav-item active" data-page="overview"><span class="nav-icon">◈</span>概览</button>
-      <button class="nav-item" data-page="config"><span class="nav-icon">⚙</span>配置</button>
-      <button class="nav-item" data-page="memory"><span class="nav-icon">❖</span>记忆</button>
-      <button class="nav-item" data-page="annotation"><span class="nav-icon">✎</span>标注</button>
-      <button class="nav-item" data-page="system"><span class="nav-icon">▤</span>系统</button>
+      <!-- 窄屏只留图标：文字包在 .nav-label 里才藏得掉（裸文本节点没有选择器
+           能命中，早先媒体查询写的 span:not(.nav-icon) 从来没生效过）。藏掉
+           文字后按钮的可访问名只剩图标，所以每个都补 aria-label。 -->
+      <button class="nav-item active" data-page="overview" aria-label="概览" title="概览"><span class="nav-icon">◈</span><span class="nav-label">概览</span></button>
+      <button class="nav-item" data-page="config" aria-label="配置" title="配置"><span class="nav-icon">⚙</span><span class="nav-label">配置</span></button>
+      <button class="nav-item" data-page="memory" aria-label="记忆" title="记忆"><span class="nav-icon">❖</span><span class="nav-label">记忆</span></button>
+      <button class="nav-item" data-page="annotation" aria-label="标注" title="标注"><span class="nav-icon">✎</span><span class="nav-label">标注</span></button>
+      <button class="nav-item" data-page="system" aria-label="系统" title="系统"><span class="nav-icon">▤</span><span class="nav-label">系统</span></button>
     </nav>
     <div class="sidebar-foot">
-      <button id="theme-toggle" class="nav-item subtle"><span class="nav-icon">◐</span><span id="theme-label">浅色</span></button>
-      <button id="logout" class="nav-item subtle"><span class="nav-icon">⏻</span>退出登录</button>
+      <button id="theme-toggle" class="nav-item subtle" aria-label="切换深浅色" title="切换深浅色"><span class="nav-icon">◐</span><span id="theme-label" class="nav-label">浅色</span></button>
+      <button id="logout" class="nav-item subtle" aria-label="退出登录" title="退出登录"><span class="nav-icon">⏻</span><span class="nav-label">退出登录</span></button>
       <div class="sidebar-note">仅监听回环地址，登录态保存在会话 Cookie 中。</div>
     </div>
   </aside>

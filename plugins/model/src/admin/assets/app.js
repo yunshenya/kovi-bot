@@ -36,6 +36,11 @@
 
   function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
 
+  /** 当前是不是窄屏（手机）。与 app.css 里 760px 那一档断点保持同一个数——
+   *  有些取舍（标注页把统计收起来、队列放到详情下面）靠 CSS 表达不了。 */
+  const NARROW_QUERY = '(max-width: 760px)';
+  const narrowLayout = () => window.matchMedia(NARROW_QUERY).matches;
+
   function toast(message, kind = 'ok', ms = 4200) {
     const node = h('div', { class: `toast ${kind}`, text: message });
     $('#toast-stack').append(node);
@@ -294,6 +299,12 @@
     await goto(pageFromHash());
     hashInitialized = true;
   }
+
+  // 跨越窄屏断点（转屏、拖窗口）时重画当前页：标注页的工具栏在窄屏下是折叠的、
+  // 队列也换了顺序，这些取舍在渲染时就定死了，光靠 CSS 变不回来。
+  window.matchMedia(NARROW_QUERY).addEventListener('change', () => {
+    if (currentPage === 'annotation') renderAnnotationPage();
+  });
 
   async function refreshHealth() {
     const pill = $('#health-pill');
@@ -1422,10 +1433,12 @@
           h('div', { class: 'cell-title' }, ...highlighted(row.title, memory.query)),
           h('div', { class: 'cell-context' },
             `${row.label} · ${row.scope_label || '全局'}${row.status ? ` · ${row.status}` : ''}`)),
-        h('td', {}, chipList(row.entities, entityChip)),
-        h('td', {}, chipList(row.tags, (tag) => tagChip(tag, null, false))),
-        h('td', { class: 'cell-time', text: shortDate(occurredOf(row)) }),
-        h('td', { class: 'cell-time', text: shortDate(mentionedOf(row)) })));
+        // data-label 只给"离开表头就看不懂"的列：窄屏下表格会摊成卡片，
+        // 表头没了，这几格得自己报出列名（记忆标题那格自明，不挂）。
+        h('td', { 'data-label': '实体' }, chipList(row.entities, entityChip)),
+        h('td', { 'data-label': '标签' }, chipList(row.tags, (tag) => tagChip(tag, null, false))),
+        h('td', { class: 'cell-time', 'data-label': '发生时间', text: shortDate(occurredOf(row)) }),
+        h('td', { class: 'cell-time', 'data-label': '提及时间', text: shortDate(mentionedOf(row)) })));
     }
     table.append(body);
     // 包一层可滚动容器，表头才能 sticky 住（表格自己滚动，页码留在下面）。
@@ -2414,6 +2427,16 @@
       onclick: () => renderAnnotationPage(),
     });
 
+    // 统计、覆盖率、tier 分布、过往导出：都是"想不起来才看一眼"的东西，
+    // 但加起来有一屏高。窄屏上它们会把真正要标的样本顶到首屏之外，所以先收进
+    // 一个默认折叠的 details；桌面宽度照旧摊开。
+    const secondary = [
+      h('div', { class: 'stat-grid annotate-stats', id: 'annotate-stats' }),
+      h('div', { class: 'annotate-hint', id: 'annotate-hint' }),
+      h('div', { class: 'annotate-hint', id: 'annotate-tiers' }),
+      h('div', { class: 'annotate-exports', id: 'annotate-exports' }),
+    ];
+
     return h('div', { class: 'card annotate-toolbar' },
       h('div', { class: 'annotate-bar' },
         h('span', { class: 'annotate-bar-label', text: '批次' }),
@@ -2428,10 +2451,14 @@
         h('span', { class: 'annotate-spacer' }),
         exportButton,
         refreshButton),
-      h('div', { class: 'stat-grid annotate-stats', id: 'annotate-stats' }),
-      h('div', { class: 'annotate-hint', id: 'annotate-hint' }),
-      h('div', { class: 'annotate-hint', id: 'annotate-tiers' }),
-      h('div', { class: 'annotate-exports', id: 'annotate-exports' }));
+      narrowLayout()
+        ? h('details', { class: 'annotate-folds' },
+          h('summary', {},
+            h('span', { text: '本批统计与队列分布' }),
+            // 折起来也留一句"还剩多少要标"：这是标的时候唯一需要随时看到的数。
+            h('span', { class: 'muted small', id: 'annotate-fold-note' })),
+          ...secondary)
+        : secondary);
   }
 
   function annotationTabButton(key, label) {
@@ -2476,6 +2503,11 @@
     }
     renderAnnotationTiers();
     renderAnnotationExports();
+    const foldNote = $('#annotate-fold-note');
+    if (foldNote) {
+      // 窄屏上这块是折起来的：把"还剩多少要标"留在标题行，标的时候不用展开。
+      foldNote.textContent = `待标 ${compactNumber(summary.pending || 0)} / 共 ${compactNumber(summary.total || 0)}`;
+    }
   }
 
   /** 队列的 tier 分布 + 每档含义。
@@ -2573,7 +2605,7 @@
     for (const item of annotation.items) {
       list.append(h('div', {
         class: `record${item.index === selected ? ' active' : ''}`,
-        onclick: () => openAnnotationSample(item.index),
+        onclick: () => openAnnotationSample(item.index, true),
       },
         h('div', { class: 'record-head' },
           h('span', { class: 'record-title', text: `#${item.index}` }),
@@ -2600,7 +2632,14 @@
     }
   }
 
-  async function openAnnotationSample(index) {
+  /**
+   * 打开一条样本。
+   *
+   * `scrollToDetail` 只在"人主动点了队列里的某条"时为真：窄屏上队列排在详情
+   * 下面，点完得把详情滚回视野里，否则像是没反应；而首屏自动打开第一条时不能
+   * 滚——那会一进来就跳过整块工具栏。
+   */
+  async function openAnnotationSample(index, scrollToDetail = false) {
     const host = $('#annotate-detail');
     if (!host) return;
     annotation.draft = { completion: '', response: '' };
@@ -2619,6 +2658,16 @@
     annotation.revision = data.revision;
     renderAnnotationList();
     renderAnnotationDetail();
+    if (scrollToDetail && narrowLayout()) {
+      // 让开吸顶的工具栏再滚：直接 scrollIntoView 会把卡片标题压在工具栏下面。
+      // 工具栏高度随标题换行变化，所以量一次，不用写死像素。
+      const topbar = document.querySelector('.topbar');
+      const offset = (topbar ? topbar.getBoundingClientRect().height : 0) + 10;
+      window.scrollTo({
+        top: host.getBoundingClientRect().top + window.scrollY - offset,
+        behavior: 'smooth',
+      });
+    }
   }
 
   function annotationChoice(head, value, label) {

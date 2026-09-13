@@ -766,11 +766,40 @@ a.stat:hover, .stat.link:hover { border-color: var(--accent); transform: transla
   .field { grid-template-columns: 1fr; gap: 8px; }
 }
 
+/* ─────────────────── 窄屏（手机，≤760px）· 全站骨架 ───────────────────
+ *
+ * 这一档只解决"能用"：导航收成图标、动作区换行、点击目标放大。视觉语言与
+ * 宽屏一致，平板及以上（>760px）完全不受影响。页面级的取舍（标注页把统计
+ * 收起来、记忆表格摊成卡片）各自写在对应组件旁边。
+ */
 @media (max-width: 760px) {
-  :root { --sidebar-w: 62px; }
-  .brand-text, .nav-item span:not(.nav-icon), .sidebar-note { display: none; }
-  .nav-item { justify-content: center; }
+  :root { --sidebar-w: 58px; }
+  .brand { justify-content: center; padding: 14px 6px; }
+  /* 侧栏只留图标。文字必须包在 .nav-label 里才藏得掉——裸文本节点没有选择器
+     能命中，早先这里写的 span:not(.nav-icon) 从来没生效过，标签一直竖着挤成
+     两行（"概/览"）。 */
+  .brand-text, .nav-label, .sidebar-note { display: none; }
+  .nav { padding: 10px 6px; }
+  .nav-item { justify-content: center; gap: 0; padding: 11px 0; }
+  .sidebar-foot { padding: 8px 6px; }
+
   .page, .topbar { padding-left: 14px; padding-right: 14px; }
+  .page { padding-bottom: 40px; gap: 14px; }
+
+  /* 顶栏：标题占一行、操作占一行。挤在一行时那颗状态胶囊会被压成三行，
+     顺带把标题也挤窄。 */
+  .topbar { flex-wrap: wrap; gap: 8px 12px; padding-top: 12px; padding-bottom: 12px; }
+  .topbar-actions { width: 100%; justify-content: space-between; }
+  .pill { white-space: nowrap; }
+
+  /* 触屏上手指比鼠标粗：交互元素给到接近 40px 的可点高度。 */
+  .btn { min-height: 40px; }
+  .tabs button { padding: 10px 14px; }
+  .modal { padding: 12px; }
+  .modal-body .textarea { min-height: 40vh; }
+  /* 概览/标注的统计卡：手机上两列。默认的 auto-fill minmax(168px) 在 390px
+     下只能排一列，八张卡就是一整屏。 */
+  .stat-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 
 /* ───────────────────────── 记忆页：三视图（对照 Hindsight）───────────────────────── */
@@ -851,6 +880,29 @@ a.stat:hover, .stat.link:hover { border-color: var(--accent); transform: transla
 }
 .cell-context { font-size: 11.5px; color: var(--text-faint); margin-top: 3px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .cell-time { font-size: 12px; color: var(--text-dim); font-variant-numeric: var(--tnum); }
+
+/* 窄屏把表格摊成卡片：五列挤进 390px 时，记忆标题只剩 ~100px，实体/标签两列
+   窄到只剩省略号，等于读不了。表头收掉，靠每格自己的 data-label 报列名
+   （app.js 渲染 td 时写上去），行与行之间用分隔线断开。 */
+@media (max-width: 760px) {
+  .memory-table, .memory-table tbody, .memory-table tr, .memory-table td { display: block; width: auto; }
+  .memory-table { table-layout: auto; }
+  .memory-table thead { display: none; }
+  .memory-table tbody tr {
+    padding: 12px 0; border-bottom: 1px solid var(--border);
+  }
+  .memory-table tbody tr:first-child { padding-top: 0; }
+  .memory-table tbody tr:last-child { border-bottom: 0; padding-bottom: 0; }
+  .memory-table td { padding: 0; border: 0; }
+  .memory-table td + td { margin-top: 8px; }
+  .memory-table td[data-label]::before {
+    content: attr(data-label);
+    display: block; margin-bottom: 2px;
+    color: var(--text-faint); font-size: 11px;
+  }
+  /* 卡片模式下一行装得下整句上下文，没必要再省略号截断。 */
+  .cell-context { white-space: normal; }
+}
 .table-foot {
   display: flex; align-items: center; justify-content: space-between;
   gap: 12px; padding-top: 12px; margin-top: 4px; border-top: 1px solid var(--border);
@@ -1109,6 +1161,45 @@ a.stat:hover, .stat.link:hover { border-color: var(--accent); transform: transla
   grid-template-columns: minmax(260px, 340px) minmax(0, 1fr);
 }
 @media (max-width: 1080px) { .annotate-grid { grid-template-columns: 1fr; } }
+
+/* 窄屏：统计、覆盖率、tier 分布、过往导出折进一个 details（app.js 只在窄屏
+   渲染这个壳）。它们加起来有一屏高，摊开时会把真正要标的样本顶到首屏之外，
+   而标的过程中只有"还剩多少"需要一直看见——那句留在 summary 上。 */
+.annotate-folds { display: flex; flex-direction: column; gap: 12px; }
+.annotate-folds > summary {
+  display: flex; align-items: center; gap: 8px;
+  padding: 10px 12px; border-radius: var(--radius-sm);
+  background: var(--bg-sunken); border: 1px solid var(--border);
+  color: var(--text-dim); font-size: 13px; cursor: pointer; list-style: none;
+}
+.annotate-folds > summary::-webkit-details-marker { display: none; }
+.annotate-folds > summary::before { content: "▸"; color: var(--accent); }
+.annotate-folds[open] > summary::before { content: "▾"; }
+.annotate-folds > summary .muted { margin-left: auto; font-variant-numeric: var(--tnum); }
+
+@media (max-width: 760px) {
+  /* 手机上的顺序是"先标、再挑"：队列排在上面时，几十条样本会把详情顶到几屏
+     之外，点开页面根本看不到要标的东西。队列本身已经有 max-height + 内部
+     滚动，放到下面照样挑得到。 */
+  .annotate-grid { display: flex; flex-direction: column; }
+  .annotate-grid > .detail { order: 1; }
+  .annotate-grid > .record-list { order: 2; max-height: 52vh; }
+  /* 批次名很长，宽度交给容器决定，别再用桌面的 220px 下限把它顶出去。 */
+  .annotate-bar .select { min-width: 0; width: 100%; max-width: none; }
+  /* 说话人列窄一点，正文多留 ~10px；"说话人A"四个字仍然放得下。 */
+  .annotate-role { flex: 0 0 56px; }
+  .label-choice { padding: 8px 14px; }
+  /* 标签名单独占一行：手机上胶囊能占满整行，不至于挤成两三个的碎块。 */
+  .annotate-label-head { flex: 0 0 100%; }
+  .annotate-actions .btn { flex: 1 1 auto; }
+  .annotate-actions .muted { flex: 1 1 100%; }
+}
+
+/* 触屏没有物理键盘，快捷键徽标（1/2/3、a/c/k…）只会占地方。
+   两个条件都要满足才算"纯触屏"：触屏笔记本仍以鼠标为主，徽标照常显示。 */
+@media (hover: none) and (pointer: coarse) {
+  .annotate-key { display: none; }
+}
 
 .annotate-card { display: flex; flex-direction: column; gap: 12px; }
 /* 正文框与下面的上下文排成同一列说话人，读起来就是一段聊天记录：
