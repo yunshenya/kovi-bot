@@ -158,7 +158,7 @@ affect_states / relations / external_identities / persons，但没有 gag。`gag
 约定/芥蒂原文，会注入回复上下文。建议照 relation-note 的写法在
 `delete_qq_person_domain_data` 里对主号与每个 QQ 别名各清一次。
 
-### 2.3 关系备注按显示名跨作用域删除（可能删到别人）——**待决策，我原先的修法方向是错的**
+### 2.3 关系备注按显示名跨作用域删除（可能删到别人）——**已按方案 (a) 修（`63229ab`）**
 
 `relation_note_store.rs:373` 是 `DELETE ... WHERE target_key = ANY($1)`，而
 `target_key` 只是显示名的规范化（小写 + 折叠空白），调用方（`mod.rs:1442-1464`）
@@ -184,7 +184,16 @@ affect_states / relations / external_identities / persons，但没有 gag。`gag
 
 倾向 **(a)**：一条有歧义的键不足以支撑一次删除，"永不删除可归属于他人的数据"比
 "尽量删干净"更该优先；而且群级擦除已经是正确形态（`delete_qq_group_domain_data` 按
-会话作用域删，见 `mod.rs:1546`），按人的这条是唯一的例外。这是隐私策略取舍，等你定。
+会话作用域删，见 `mod.rs:1546`），按人的这条是唯一的例外。
+
+**已按 (a) 落地**：`relation_note_targets` → `relation_note_erasure_keys`，去掉昵称参数
+（连带去掉那次 user profile 查询）。残留代价（有意接受、记录在案）：模型用显示名写下的
+结论不会被按人擦除删掉。等哪天给这张表补上 `target_person_id`，这个缺口才谈得上真正
+闭合——在那之前，"注册时把名字写进表"这种事不该靠昵称去猜。
+
+回归测试：`erasure_never_deletes_another_persons_relation_notes_by_nickname`（集成，
+实测；把昵称塞回键里会变红）与 `person_erasure_only_uses_unambiguous_relation_note_keys`
+（单元）。
 
 ### 2.4 「尽力而为」的世界模型删除其实无法 fail-soft ——**已复现，测试已落档**
 
