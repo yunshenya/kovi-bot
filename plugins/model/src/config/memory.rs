@@ -64,6 +64,16 @@ pub struct MemoryConfig {
     autonomous_query_max_results: usize,
     /// 自主查询允许回看的最长天数。
     autonomous_query_max_days: u32,
+    /// 是否把 Core 回合写进长期记忆（默认开）。
+    ///
+    /// Core 是线上回复主力，但聊天的记忆写入一直只有 V1 那条链路（`MEMORY_REPOSITORY`
+    /// 写 `kovi_bot_memories`）。Core 接管之后 V1 只剩极少数回合，长期记忆于是停止增长，
+    /// 而 Core 召回又按 context 前缀读旧表——两头都停在旧世界。打开这个开关，Core 会把
+    /// 「对方说的 + 她回的」写成 v2 记忆，并借适配器自动生成的 legacy 投影回到旧表。
+    ///
+    /// 设计与取舍见 [docs/yunxi-memory-v2-writeback.md](../../docs/yunxi-memory-v2-writeback.md)。
+    /// 关掉即立刻停写（已写入的行不受影响，按 `retention_days` 自然老去）。
+    core_writeback_enabled: bool,
 }
 
 impl MemoryConfig {
@@ -133,6 +143,10 @@ impl MemoryConfig {
 
     pub fn data_minimization(&self) -> bool {
         self.data_minimization
+    }
+
+    pub fn core_writeback_enabled(&self) -> bool {
+        self.core_writeback_enabled
     }
 
     pub fn runtime_history_ttl_secs(&self) -> u64 {
@@ -295,6 +309,7 @@ impl Default for MemoryConfig {
             autonomous_query_max_rounds: 2,
             autonomous_query_max_results: 8,
             autonomous_query_max_days: 3_650,
+            core_writeback_enabled: true,
         }
     }
 }

@@ -169,6 +169,10 @@
     "memory.autonomous_query_max_rounds": {
       "doc": "单次回复最多允许执行多少轮自主记忆查询。"
     },
+    "memory.core_writeback_enabled": {
+      "doc": "是否把 Core 回合写进长期记忆（默认开）。 Core 是线上回复主力，但聊天的记忆写入一直只有 V1 那条链路（`MEMORY_REPOSITORY` 写 `kovi_bot_memories`）。Core 接管之后 V1 只剩极少数回合，长期记忆于是停止增长， 而 Core 召回又按 context 前缀读旧表——两头都停在旧世界。打开这个开关，Core 会把 「对方说的 + 她回的」写成 v2 记忆，并借适配器自动生成的 legacy 投影回到旧表。 设计与取舍见 [docs/yunxi-memory-v2-writeback.md](../../docs/yunxi-memory-v2-writeback.md)。 关掉即立刻停写（已写入的行不受影响，按 `retention_days` 自然老去）。",
+      "hint": "把 Core 回合写进长期记忆（默认开）：Core 是线上回复主力，但聊天记忆的写入一直只有 V1 那条链路，Core 接管之后长期记忆停止增长，而召回又按旧的 context 前缀读——新对话 既不进记忆也召不回。打开后 Core 会把「对方说的 + 她回的」写成 v2 记忆，并借适配器 同步回旧表。关掉即立刻停写（已写入的行按 retention_days 自然老去）。 设计与取舍见 docs/yunxi-memory-v2-writeback.md。"
+    },
     "memory.embedding_backfill_batch": {
       "doc": "一轮维护最多回填多少条记忆的向量（避免维护任务卡住）。"
     },

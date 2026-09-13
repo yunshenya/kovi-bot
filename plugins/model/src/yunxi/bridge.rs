@@ -1052,6 +1052,8 @@ impl CoreBridge {
             Arc::new(PrivateHandlerGateRegistry::new(MAX_PRIVATE_HANDLER_GATES));
         let ambient_attention = Arc::new(StdMutex::new(AmbientAttentionRegistry::new()));
         let familiarity = Arc::new(StdMutex::new(FamiliarityCache::default()));
+        // Core 回合的长期记忆写入（入站暂存 + 投递后落库）。进程级单例，幂等安装。
+        let _ = super::memory_writeback::install();
         let familiarity_refresh = super::relation_store().map(|relations| FamiliarityRefresh {
             cache: Arc::clone(&familiarity),
             relations,
@@ -2078,6 +2080,11 @@ struct InboundMessage {
     replies_to_agent_hint: bool,
     text: String,
     attachments: Vec<Attachment>,
+    /// 说话人的显示名（群名片优先，其次昵称；私聊是 QQ 昵称）。
+    ///
+    /// 只给长期记忆的正文用：记忆里要写清"谁说的"，而 Core 事件本身不带显示名
+    /// （平台无关）。在 ingress 解析一次，避免投递侧再查一次身份。
+    sender_label: String,
     /// Host-only locators used to materialize the current turn's images. They
     /// are bound to the Core MessageId in a bounded one-shot cache and never
     /// enter the platform-neutral event or persistent state.
@@ -2141,6 +2148,13 @@ impl InboundMessage {
             text,
             attachments,
             vision_attachments,
+            sender_label: super::memory_writeback::normalized_sender_label(
+                event
+                    .sender
+                    .card
+                    .as_deref()
+                    .or(event.sender.nickname.as_deref()),
+            ),
             timestamp: event_timestamp(event.time),
         })
     }
@@ -2173,6 +2187,9 @@ impl InboundMessage {
             text,
             attachments,
             vision_attachments,
+            sender_label: super::memory_writeback::normalized_sender_label(Some(
+                &event.get_sender_nickname(),
+            )),
             timestamp: event_timestamp(event.time),
         })
     }
@@ -3327,9 +3344,13 @@ async fn run_runtime(
                         })
                     });
                     let mut autonomous_delivered = false;
+                    // 这一轮真正发出去的正文（多段气泡按顺序收集，之后拼成一条记忆）。
+                    let mut delivered_replies: Vec<String> = Vec::new();
                     for (intent, action) in plan.intents.iter().zip(actions.iter()) {
                         if let CognitiveIntent::SendMessage {
-                            conversation_id, ..
+                            conversation_id,
+                            content,
+                            ..
                         } = intent
                             && matches!(
                                 action,
@@ -3339,6 +3360,10 @@ async fn run_runtime(
                                 }
                             )
                         {
+                            let sent = content.as_text().trim();
+                            if !sent.is_empty() {
+                                delivered_replies.push(sent.to_string());
+                            }
                             if !autonomous_tick {
                                 let proactive_config = crate::config::get().proactive().clone();
                                 let effective_directive =
@@ -3378,6 +3403,19 @@ async fn run_runtime(
                                 autonomous_delivered = true;
                             }
                         }
+                    }
+                    // 长期记忆：这一轮真的发出去了，就把「对方说的 + 她回的」写进
+                    // Memory v2（适配器会同步回旧表）。主动消息没有入站行，因此这里
+                    // 是空操作——那是已知缺口，见 docs/yunxi-memory-v2-writeback.md。
+                    if !delivered_replies.is_empty()
+                        && let Some(writeback) = super::memory_writeback::writeback()
+                    {
+                        writeback
+                            .record_delivered_turn(
+                                observation.event_id,
+                                &delivered_replies.join("\n"),
+                            )
+                            .await;
                     }
                     if autonomous_tick
                         && let Some(conversation_id) = observation.scope.conversation_id()
@@ -3530,6 +3568,41 @@ async fn persist_executive_after_turn() {
         // deterministic runtime. The next turn will retry the latest state.
         kovi::log::warn!("Yunxi Executive turn persistence failed: {error}");
     }
+}
+
+/// 把这一轮的入站行挂到事件上，等投递成功时由 [`super::memory_writeback`] 落库。
+///
+/// 作用域在这里定，是因为出了 ingress 就只剩平台无关的 Core 事件——那里只有
+/// conversation，没有"这个人是私聊对象"这层信息：
+/// 群聊写 `Conversation`（legacy 投影成 `group_chat` + 群号），
+/// 私聊写 `Person`（legacy 投影成 `private_chat` + QQ，与旧语料同形，人物页也数得到）。
+fn stash_pending_memory_line(
+    message: &InboundMessage,
+    person_id: yunxi_core::PersonId,
+    conversation_id: yunxi_core::ConversationId,
+    event_id: yunxi_core::EventId,
+) {
+    if !crate::config::get().memory().core_writeback_enabled() {
+        return;
+    }
+    let Some(writeback) = super::memory_writeback::writeback() else {
+        return;
+    };
+    let (scope, line) = match message.address {
+        ConversationAddress::Group { .. } => (
+            yunxi_core::MemoryScope::Conversation(conversation_id),
+            super::memory_writeback::group_inbound_line(
+                &message.sender_label,
+                &message.text,
+                message.timestamp,
+            ),
+        ),
+        ConversationAddress::Direct { .. } => (
+            yunxi_core::MemoryScope::Person(person_id),
+            super::memory_writeback::private_inbound_line(&message.sender_label, &message.text),
+        ),
+    };
+    writeback.stash_inbound(event_id, scope, line, message.timestamp);
 }
 
 #[allow(dead_code)]
@@ -3885,6 +3958,10 @@ async fn resolve_and_submit_inner(
             event_scope,
             event_priority,
         );
+    } else {
+        // 事件真的进了 Core 才暂存入站行：投递成功时它会连同回复一起变成一条长期
+        // 记忆（见 memory_writeback）。被丢弃的事件不会有回复，暂存只会占位。
+        stash_pending_memory_line(message, person_id, conversation_id, event_id);
     }
     if registered_incoming
         && !matches!(admission, Admission::Accepted)
@@ -4652,6 +4729,7 @@ mod tests {
             text: "hello".to_string(),
             attachments: Vec::new(),
             vision_attachments: Vec::new(),
+            sender_label: "测试说话人".to_string(),
             timestamp: Utc::now(),
             addressed_to_agent,
             directed_at_other_members: false,

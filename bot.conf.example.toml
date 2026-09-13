@@ -157,6 +157,12 @@ autonomous_query_enabled = true
 autonomous_query_max_rounds = 2
 autonomous_query_max_results = 8
 autonomous_query_max_days = 3650
+# 把 Core 回合写进长期记忆（默认开）：Core 是线上回复主力，但聊天记忆的写入一直只有
+# V1 那条链路，Core 接管之后长期记忆停止增长，而召回又按旧的 context 前缀读——新对话
+# 既不进记忆也召不回。打开后 Core 会把「对方说的 + 她回的」写成 v2 记忆，并借适配器
+# 同步回旧表。关掉即立刻停写（已写入的行按 retention_days 自然老去）。
+# 设计与取舍见 docs/yunxi-memory-v2-writeback.md。
+core_writeback_enabled = true
 
 [mind]
 enabled = true

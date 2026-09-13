@@ -46,6 +46,9 @@ V1**（`model/utils.rs` 的 `MEMORY_REPOSITORY`，写 `kovi_bot_memories`）。C
 - **不写未回复的观察流**：`group_observation` 继续由 Host 那条分支写（今天的量：主群 579 条）。
   它们读不到不是本轮要解决的问题，硬塞进召回只会让上下文变吵（文档自己写着"她的记忆语料
   大多是短群聊噪音"）。
+- **主动消息（autonomous tick）本轮不写**：它没有"入站行"，语义上不是"她回的"。
+  V1 时代它写的是 `proactive_group_chat` / `proactive_private_*` 语料（全库目前只有 5 条），
+  量极小；补它要额外解析私聊会话 → person，留作下一步。
 
 ### 2. 作用域与兼容投影
 
@@ -107,10 +110,13 @@ V1**（`model/utils.rs` 的 `MEMORY_REPOSITORY`，写 `kovi_bot_memories`）。C
 
 ## 测试
 
-- 单测：内容渲染（群/私聊两种称呼）、作用域映射、暂存表的有界与去重、开关关闭时不写。
-- 集成（需要 `DATABASE_URL`，沿用 `#[ignore]` 那批的写法）：一条真回合后，`yunxi_memories`
-  多一行对应作用域、`kovi_bot_memories` 多一行对应 context，两侧正文一致。
-- 线上验证：发布后打一场对话，查两张表各新增对应行；记忆页/人物页数字跟着动。
+- 单元测试（`memory_writeback.rs::tests`）：两种正文渲染与旧语料同形、超长正文按字符截断
+  （含"全是待转义字符"的最坏情况仍落在记忆限额内）、空回复不写、暂存有界且淘汰最旧。
+- 落库那半截（`remember` → v2 + legacy 投影）由 `memory_store` 既有测试覆盖；本层没有再加
+  DB 集成测试——CI 的 `#[ignore]` 清单要手工登记，同样的证据用发布后的线上验证更直接。
+- 线上验证口径：发布后打一场对话，`yunxi_memories` 应出现对应作用域的新行，
+  `kovi_bot_memories` 应出现同正文的 `group_chat` / `private_chat` 行；记忆页与人物页的数字
+  跟着动；召回日志里的记忆条数不再是 0。
 
 ## 分步
 
@@ -119,7 +125,7 @@ V1**（`model/utils.rs` 的 `MEMORY_REPOSITORY`，写 `kovi_bot_memories`）。C
 3. **之后**：把"写什么"交给模型——Core 加 `Memory` 提案，实现 §63 真正的双写；那时再决定
    观察流要不要也进 v2、以及要不要让模型写"他喜欢爵士"这类事实记忆（现在写的只是对话流水）。
 
-## 三个默认取值（如无异议就按这个实现）
+## 已定的取值（2026-09-13 确认）
 
 1. **私聊写 `Person` 作用域**（而非 `Conversation`）：与旧语料同形、人物页可数。
 2. **重要度固定 40**（而非跟随 V1 的长度规则 2~5）：召回排序上与新语料同量级，且规则简单可解释。
