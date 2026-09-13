@@ -403,6 +403,10 @@
     data: null,
     dirty: new Map(),
     filter: '',
+    // 默认全部折叠：215 个字段铺开是一整屏都放不下的长页，
+    // 先让人看见"有哪些分区"，要点开哪块再点哪块。
+    expanded: new Set(),
+    sectionPaths: [],
   };
 
   async function renderConfigPage() {
@@ -473,7 +477,30 @@
     layout.append(main);
     page.append(layout);
 
+    config.sectionsEl = body;
+    config.sidebarEl = sidebar;
     renderConfigSections(body, sidebar);
+  }
+
+  /** 只重画「分区列表 + 左栏导航」。
+   *
+   * 搜索框的 oninput 以前直接调 `renderConfigPage()`，整页重建会把输入框本身
+   * 也换掉——焦点随之丢失，等于每敲一个字都要重新点一下搜索框。 */
+  function rerenderConfigBody() {
+    if (!config.sectionsEl || !config.sectionsEl.isConnected) {
+      renderConfigPage();
+      return;
+    }
+    clear(config.sectionsEl);
+    renderConfigSections(config.sectionsEl, config.sidebarEl);
+    syncExpandButton();
+  }
+
+  /** 「全部展开 / 全部折叠」按钮的字面要跟着状态走。 */
+  function syncExpandButton() {
+    const button = config.expandButton;
+    if (!button) return;
+    button.textContent = config.expanded.size ? '全部折叠' : '全部展开';
   }
 
   function renderConfigToolbar() {
@@ -482,11 +509,25 @@
       class: 'input', placeholder: '搜索参数名或说明…', value: config.filter,
       oninput: (event) => {
         config.filter = event.target.value.trim().toLowerCase();
-        renderConfigPage();
+        rerenderConfigBody();
       },
     });
-    return h('div', { class: 'card tight' },
+    const expandAll = (open) => {
+      config.expanded = open ? new Set(config.sectionPaths) : new Set();
+      // 按钮自己的字面也要跟着变，所以先存下引用。
+      config.expandButton = button;
+      rerenderConfigBody();
+    };
+    const button = h('button', {
+      class: 'btn ghost small',
+      text: config.expanded.size ? '全部折叠' : '全部展开',
+      title: '分区默认是折起来的：这里可以一次全开或全收',
+      onclick: () => expandAll(config.expanded.size === 0),
+    });
+    config.expandButton = button;
+    return h('div', { class: 'card tight config-toolbar' },
       h('div', { class: 'search-row' }, search,
+        button,
         h('button', { class: 'btn ghost', text: '原始 TOML', onclick: openRawEditor }),
         h('button', { class: 'btn ghost', text: `备份 (${backupCount()})`, onclick: openBackups }),
         config.data.writable ? null : h('span', { class: 'badge secret', text: '只读' }),
@@ -522,6 +563,8 @@
     const nav = h('div', { class: 'section-nav' });
     const isTyped = data.typed;
     let shown = 0;
+    // 顶层分区是稳定的，但重画时会收集一遍；这里只在第一次算。
+    config.sectionPaths = [];
 
     const sections = Object.keys(values);
 
@@ -532,7 +575,10 @@
       shown += 1;
       container.append(sectionNode);
       nav.append(h('button', {
-        onclick: () => sectionNode.scrollIntoView({ behavior: 'smooth', block: 'start' }),
+        onclick: () => {
+          sectionNode.openSection?.();
+          sectionNode.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        },
       }, h('span', { text: sectionTitle(key, isTyped) }),
         h('span', { class: 'count', text: countFields(value) })));
     }
@@ -541,13 +587,17 @@
       container.append(h('div', { class: 'empty', text: '没有匹配的参数' }));
     }
 
-    const previousNav = sidebar.querySelector('.section-nav');
-    if (previousNav) previousNav.remove();
-    if (isTyped) {
-      sidebar.append(h('div', { class: 'card-head', style: 'padding: 12px 2px 0' }, h('h3', { text: '分区' })), nav);
-    } else {
-      sidebar.append(h('div', { class: 'card-head', style: 'padding: 12px 2px 0' }, h('h3', { text: '顶层键' })), nav);
+    // 导航区整块替换：只删 nav 会把标题留下，重画几次就叠出好几行"分区"。
+    let block = sidebar.querySelector('.section-nav-block');
+    if (!block) {
+      block = h('div', { class: 'section-nav-block' });
+      sidebar.append(block);
     }
+    clear(block);
+    block.append(
+      h('div', { class: 'card-head', style: 'padding: 12px 2px 0' },
+        h('h3', { text: isTyped ? '分区' : '顶层键' })),
+      nav);
   }
 
   function sectionTitle(key) {
@@ -596,14 +646,45 @@
 
     if (!visible) return null;
     const sectionPath = path.join('.');
+    config.sectionPaths.push(sectionPath);
+    // 搜索时一律展开（否则搜到的东西藏在折叠里，等于没搜）；
+    // 平时的展开状态由 config.expanded 记着，切文件、改字段都不会丢。
+    const searching = Boolean(config.filter);
+    const isOpen = searching || config.expanded.has(sectionPath);
+    body.hidden = !isOpen;
+
+    const chevron = h('span', { class: 'section-chevron', text: isOpen ? '▾' : '▸' });
+    // 说明文字只在展开时露出：折起来时它就是白白占一行高度。
+    const docNode = doc && doc.section ? h('p', { class: 'section-doc', text: doc.section, hidden: !isOpen }) : null;
     const header = h('header', {
-      onclick: () => { body.hidden = !body.hidden; },
+      class: searching ? 'locked' : '',
+      title: searching ? '搜索中：结果已自动展开' : '点击折叠 / 展开',
+      onclick: () => {
+        if (searching) return;
+        const open = body.hidden;
+        body.hidden = !open;
+        chevron.textContent = open ? '▾' : '▸';
+        if (open) config.expanded.add(sectionPath);
+        else config.expanded.delete(sectionPath);
+        if (docNode) docNode.hidden = !open;
+      },
     },
-      h('h3', { text: sectionTitle(key) }),
-      h('span', { class: 'path', text: sectionPath }));
+      chevron,
+      h('div', { class: 'section-head-main' },
+        h('h3', { text: sectionTitle(key) }),
+        h('span', { class: 'path', text: sectionPath })),
+      h('span', { class: 'section-count', text: `${visible} 个参数` }));
+
     const card = h('section', { class: 'card section-card', id: `section-${sectionPath}` });
+    // 左栏导航要用它：先展开再滚过去，否则滚到一个折着的标题上什么也看不见。
+    card.openSection = () => {
+      body.hidden = false;
+      chevron.textContent = '▾';
+      if (docNode) docNode.hidden = false;
+      config.expanded.add(sectionPath);
+    };
     card.append(header);
-    if (doc && doc.section) card.append(h('p', { class: 'section-doc', text: doc.section }));
+    if (docNode) card.append(docNode);
     card.append(body);
     return card;
   }
