@@ -176,6 +176,18 @@ mode = "active"
 asset_dir = "models/yunxi-turngate"
 # response head 影子 (Phase 3):只记录"会怎么选"与真实走向的分歧,不改变
 # 发送;Phase 4 才会允许 answer/continue/ack 参与路由(先私聊灰度)。
+#
+# **保持 shadow，别在 bundle 出现之前改成 active。** bundle 是训练产物、不是
+# 可下载资产，现在还没有（标注闭环只走了 13/6302 条），所以启动日志里一直是
+# `bundle 不可用 (回退 lexical+MiniMind)`——这句是 fail-soft 提示，不是故障：
+# engine 不在时 `classify_completion` 必走 legacy，Phase 4 的抑制也被
+# `response_mode == "active" && engine_available()` 挡住，整体零影响。
+# 但把 response_mode 提前写成 active，等于**把灰度的决定权提前花掉**：将来
+# 某次把 bundle 放进 models/yunxi-turngate/，她会从"零运行"直接跳到全面参与
+# （群聊未点名时 Ignore/Wait 会抑制可见回复），没有中间档可退。README 的
+# Phase 5 计划是"先私聊灰度 active，再群聊"，那应当是一次显式决定。
+# 2026-09-14 线上曾把这一项写成 active（注释还写着"装上就生效，不用改配置"），
+# 已收回 shadow 并重启。
 response_mode = "shadow"
 
 [message_batch]
