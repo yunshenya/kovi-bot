@@ -47,11 +47,13 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
-/// 当前配置的接续对话窗口（秒）。
+/// 当前配置的接续对话窗口（秒）。取有效值：窗口长于群聊回复间隔时按
+/// 回复间隔收口，否则一次可见回复之后窗口会一直敞开，未点名消息会
+/// 变成"每句都进语义评估"。
 fn continuation_window_secs() -> u64 {
     config::get()
         .group_interjection()
-        .continuation_window_secs()
+        .effective_continuation_window_secs()
 }
 
 #[derive(Default)]
@@ -2219,11 +2221,13 @@ mod tests {
     #[test]
     fn fresh_bot_reply_opens_continuation_window_then_expires() {
         let window = continuation_window_secs();
+        assert!(window > 0, "接续窗口必须大于 0 秒");
         let now = Instant::now();
         let mut state = GroupInterjectionState::default();
         assert!(!conversation_active_for_observation(&state, now));
 
-        state.last_bot_reply = Some(now - Duration::from_secs(60));
+        // 断言跟着配置走：窗口只有几十秒时，写死的 60 秒会落到窗口之外。
+        state.last_bot_reply = Some(now - Duration::from_secs(window - 1));
         assert!(conversation_active_for_observation(&state, now));
 
         state.last_bot_reply = Some(now - Duration::from_secs(window + 1));

@@ -208,16 +208,22 @@ impl AmbientAttentionRegistry {
         if !crate::model::group_reply_budget_available_now(group_id) {
             return false;
         }
-        // 接续对话窗口内(芸汐刚在本群发过可见消息):**确定性**放行到
-        // 语义评估——"她说完了我就接"这类天然衔接不该被随机采样漏掉,
-        // 是否真的回复由评估模型(interjection_worthy)与 Core 判定把关。
-        // 该分支必须先于候选冷却与采样频率限制:触发 bot 回复的那次
-        // 采样几乎就发生在这几秒之前,而真实接续消息恰恰紧随其后,
-        // 若冷却(180s)与频率上限(3 次/600s)在前,窗口内的大多数
-        // 接续会被静默挡下,看起来就像 bot 刚作答就"装聋"。
-        // 窗口内不消费采样频率预算,避免连续接话提前耗光后续环境的
-        // 采样机会;只更新候选锚点,保持窗口外的节奏语义不变。
+        // 接续对话窗口内(芸汐刚在本群发过可见消息):确定性放行到语义
+        // 评估——"她说完了我就接"这类天然衔接不该被随机采样漏掉。
+        // 该分支必须先于候选冷却:触发 bot 回复的那次采样几乎就发生在
+        // 这几秒之前,而真实接续消息恰恰紧随其后,若候选冷却(180s)在前,
+        // 窗口内的大多数接续会被静默挡下,看起来就像 bot 刚作答就"装聋"。
+        //
+        // 但它**不豁免** `decision_rate_limit`:窗口本身已经不短(上限被
+        // `effective_continuation_window_secs` 收口到回复间隔),再叠加
+        // "窗口内每次都给模型看一眼",一次可见回复之后的整个窗口里每条
+        // 未点名消息都会进语义评估,限流形同虚设——线上"每句话都接"正是
+        // 这条通道。频率上限是模型成本与话痨的共同护栏,窗口内同样要排队。
         if continuation_active {
+            if !decision_allowance_available(gate, now, &policy) {
+                return false;
+            }
+            gate.decision_attempts.push_back(now);
             gate.last_candidate = Some(now);
             return true;
         }
@@ -251,15 +257,7 @@ impl AmbientAttentionRegistry {
         }) {
             return false;
         }
-        let rate_window = Duration::from_secs(policy.decision_rate_window_secs);
-        while gate
-            .decision_attempts
-            .front()
-            .is_some_and(|attempt| now.duration_since(*attempt) >= rate_window)
-        {
-            gate.decision_attempts.pop_front();
-        }
-        if gate.decision_attempts.len() >= policy.decision_rate_limit {
+        if !decision_allowance_available(gate, now, &policy) {
             return false;
         }
 
@@ -295,6 +293,28 @@ impl Default for AmbientAttentionRegistry {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// 本群"未点名消息进入语义评估"的模型成本护栏：按窗口裁剪历史记录，并
+/// 回答现在是否还有额度。
+///
+/// 只查询、不消费：真正进入语义评估的那一步才 `push_back`。采样分支必须
+/// 等到概率抽样通过之后再消费，否则一次没抽中的消息会白白吃掉额度；接续
+/// 窗口分支是确定性放行，先查后记紧挨着执行。
+fn decision_allowance_available(
+    gate: &mut AmbientAttentionGate,
+    now: Instant,
+    policy: &AmbientAttentionPolicy,
+) -> bool {
+    let rate_window = Duration::from_secs(policy.decision_rate_window_secs);
+    while gate
+        .decision_attempts
+        .front()
+        .is_some_and(|attempt| now.duration_since(*attempt) >= rate_window)
+    {
+        gate.decision_attempts.pop_front();
+    }
+    gate.decision_attempts.len() < policy.decision_rate_limit
 }
 
 /// 群成员熟悉度（familiarity, 0..=1）的有界缓存。
@@ -4969,7 +4989,7 @@ mod tests {
             response_probability_percent: 100,
             min_message_chars: 4,
             decision_rate_window_secs: 600,
-            decision_rate_limit: 3,
+            decision_rate_limit: 5,
             familiar_enabled: false,
             familiar_rate_window_secs: 600,
             familiar_rate_limit: 6,
@@ -4983,7 +5003,7 @@ mod tests {
     }
 
     #[test]
-    fn continuation_window_admits_despite_exhausted_ambient_rate_budget() {
+    fn continuation_window_shares_the_ambient_rate_budget() {
         let mut registry = super::AmbientAttentionRegistry::new();
         let policy = super::AmbientAttentionPolicy {
             enabled: true,
@@ -4998,12 +5018,14 @@ mod tests {
             familiar_rate_window_secs: 600,
             familiar_rate_limit: 6,
         };
-        // 先用完窗口外的采样频率预算(3 次/600s)。
+        // 先用完采样频率预算(3 次/600s)。
         assert!(registry.should_request(123, 1, "第一条消息", false, false, false, policy));
         assert!(registry.should_request(123, 2, "第二条消息", false, false, false, policy));
         assert!(registry.should_request(123, 3, "第三条消息", false, false, false, policy));
-        // 预算耗尽后,窗口内的接续仍确定性放行(不消费窗口外预算)。
-        assert!(registry.should_request(123, 4, "如果", false, true, false, policy));
+        // 接续窗口不豁免频率上限:预算耗尽时,窗口内的接续同样排不上队。
+        // 旧契约在这里返回 true,一次可见回复之后的整个窗口里每条未点名
+        // 消息都会进语义评估,限流形同虚设(线上"每句话都接"的主通道)。
+        assert!(!registry.should_request(123, 4, "如果", false, true, false, policy));
         // 窗口外行为不变:冷却/频率限制仍然生效。
         assert!(!registry.should_request(123, 5, "第四条消息", false, false, false, policy));
     }

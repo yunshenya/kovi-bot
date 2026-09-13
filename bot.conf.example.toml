@@ -96,10 +96,19 @@ familiar_admit_enabled = true
 familiarity_threshold = 0.8
 familiar_rate_window_secs = 600
 familiar_rate_limit = 2
+# 未点名回合的可见输出必须有 Mind 由头：Mind 判定 silent（没有要接的
+# open question / agenda / interest）时，未点名的群聊消息只观察、不生成
+# 回复。旧行为是"silent 只作为提示，模型自己决定接不接"——线上实测
+# 2026-09-10~13：Mind 判 silent 却仍发出可见回复的有 271 条，占全部群
+# 回复的 75%，是"没问她也要答"的主通道。想回到旧行为就置 false。
+ambient_requires_mind_intent = true
 # 接续对话窗口：芸汐最近一次在本群可见回复后，未点名消息在此秒数内按
 # "接续对话"语义评估（由相关性判定是否回复）；窗口外回到低频插话抽样。
-# 窗口越长，群内每条消息请求模型的概率越高；推荐维持 3 分钟。
-continuation_window_secs = 180
+# 窗口越长，群内每条消息请求模型的概率越高。
+# 取值必须 ≤ reply_gap_secs：窗口比"她下次可以发言"的等待还长时，它会
+# 变成常开状态，低频抽样与候选冷却全部作废（线上 43% 的未点名回复落在
+# 这个窗口里）。窗口内的语义评估同样占用 decision_rate_limit 额度。
+continuation_window_secs = 60
 # 群聊可见回复节奏的确定性硬限制（显式识图/教学/命令不受限，管理员与普通
 # 成员同等受限）：同群两次可见聊天回复至少间隔 reply_gap_secs，每
 # reply_rate_window_secs 内最多 reply_rate_limit 条。

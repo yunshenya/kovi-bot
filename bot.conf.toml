@@ -62,9 +62,13 @@ direct_spam_cooldown_secs = 600
 direct_rate_window_secs = 60
 direct_rate_limit = 4
 sticker_reaction_window_secs = 90
+# 未点名回合要有可见输出，必须由 Mind 提出带由头的开口；判 silent 就只
+# 观察。关掉即回到"模型自己决定接不接"的旧行为。
+ambient_requires_mind_intent = true
 # 接续对话窗口：芸汐最近一次在本群可见回复后，未点名消息在此秒数内按
 # “接续对话”语义评估；窗口外回到低频插话抽样。
-continuation_window_secs = 180
+# 必须 ≤ reply_gap_secs，否则窗口在她下次可以发言前一直敞开。
+continuation_window_secs = 60
 # 群聊可见回复节奏的确定性硬限制（显式识图/教学/命令不受限，管理员与普通
 # 成员同等受限）：同群两次可见聊天回复至少间隔 reply_gap_secs，每
 # reply_rate_window_secs 内最多 reply_rate_limit 条。防止“每句话都回”。

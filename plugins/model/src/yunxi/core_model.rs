@@ -870,6 +870,61 @@ fn intrinsic_output_is_unsafe(content: &str) -> bool {
         || crate::model::utils::contains_internal_protocol_json(content)
 }
 
+fn reply_text_leaks_internal_reasoning(content: &str) -> bool {
+    let text = content.trim();
+    if text.is_empty() {
+        return false;
+    }
+    if is_stage_direction_only(text) {
+        return true;
+    }
+    // 只列"作为聊天正文不可能出现、作为内部判断却一定会出现"的说法。
+    // 宁可少列，也不要把正常聊天里的词（如单独一个"不接话"）当成泄露。
+    const INTERNAL_DECISION_PHRASES: &[&str] = &[
+        "没有点到我",
+        "没点到我",
+        "没有直接点名",
+        "没有点名我",
+        "不需要我补充",
+        "需要我补充的信息",
+        "我插进去",
+        "插进去反而",
+        "顺着接一句",
+        "先不接话",
+        "没什么好接",
+        "安静就安静",
+        "该不该接",
+        "这条消息像是在",
+        "这条是在确认",
+        "没实际话题",
+    ];
+    INTERNAL_DECISION_PHRASES
+        .iter()
+        .any(|phrase| text.contains(phrase))
+}
+
+/// 整条正文只有一个括号包起来的舞台指示，例如"（图片还没看懂，先不接话）"。
+///
+/// 人设明令禁止在正文里写动作、心理或语气描述；这类内容一旦漏进群，群友
+/// 看到的就是她在念旁白（线上实测两次，其中一条被群友原样复读）。留空失败
+/// 关闭：宁可不发这一条，也不发一句旁白。
+fn is_stage_direction_only(text: &str) -> bool {
+    let trimmed = text.trim();
+    let inner = trimmed
+        .strip_prefix('（')
+        .and_then(|rest| rest.strip_suffix('）'))
+        .or_else(|| {
+            trimmed
+                .strip_prefix('(')
+                .and_then(|rest| rest.strip_suffix(')'))
+        });
+    let Some(inner) = inner else {
+        return false;
+    };
+    let inner = inner.trim();
+    !inner.is_empty() && !inner.contains(['（', '）', '(', ')'])
+}
+
 fn is_model_role_placeholder(content: &str) -> bool {
     let content = content.trim_start_matches(|character: char| {
         character.is_whitespace() || matches!(character, '#' | '*' | '`' | '>')
@@ -902,7 +957,11 @@ fn is_model_role_placeholder(content: &str) -> bool {
 
 fn reply_text_has_semantic_content(content: &str) -> bool {
     let content = content.trim();
-    if content.is_empty() || content.contains('\0') || intrinsic_output_is_unsafe(content) {
+    if content.is_empty()
+        || content.contains('\0')
+        || intrinsic_output_is_unsafe(content)
+        || reply_text_leaks_internal_reasoning(content)
+    {
         return false;
     }
 
@@ -2352,6 +2411,58 @@ fn active_mind_no_output_plan(
         }
         _ => None,
     }
+}
+
+/// 未点名的群聊回合只有在 Mind 真的提出了要接的话时才有可见输出。
+///
+/// 传进来的 `projection` 就是 Mind 对**本条消息**的判定：没点名、没被引用、
+/// 也没有显式请求时，它默认落在 `Silent`；只有当前消息真的接得上某个高显著度
+/// 的 open question / agenda / interest 时，才会变成 `AskQuestion` /
+/// `ChangeTopic` / `ResumeAgenda` 并带上由头。
+///
+/// 线上实测（2026-09-10~13，3575 条群消息 / 360 条可见回复）：未点名回合里
+/// Mind 判定 silent 却仍发出可见回复的有 271 条，占全部群回复的 75%。原因不
+/// 是判定失灵，而是旧契约把 silent 写成"只表示默认不插话，可以回复"，于是
+/// 判定退化成提示，模型总能替自己找到一个"自然切入点"。
+///
+/// 这条否决只作用于**未点名**的群聊消息：被 `@`、被引用、显式请求、命令、
+/// 工具轮次都不受影响（它们的 baseline 本来就是 Reply）。
+fn ambient_group_interjection_veto(
+    input: &PlannerInput,
+    projection: &MindDecisionProjection,
+) -> Option<DecisionPlan> {
+    if !config::get()
+        .group_interjection()
+        .ambient_requires_mind_intent()
+    {
+        return None;
+    }
+    let WorldEventKind::MessageReceived(message) = input.event.kind() else {
+        return None;
+    };
+    if !is_ambient_group_message(message) || !message.visible_reply_allowed {
+        return None;
+    }
+    if ambient_mind_intent_present(input, projection) {
+        return None;
+    }
+    Some(silent_with_interaction_state(input))
+}
+
+/// Mind 是否为一个未点名回合提出了带由头的开口。`reference_is_present` 要求
+/// 由头确实还在同一份有界快照里，避免拿已经过期的兴趣/议程去开话题。
+fn ambient_mind_intent_present(input: &PlannerInput, projection: &MindDecisionProjection) -> bool {
+    if input.mind.influence_mode() != MindInfluenceMode::Active {
+        // Mind 关闭或处于影子模式时没有可用的"值得开口"信号。此时按
+        // fail-closed 保持观察，而不是退回"模型自己看着办"。
+        return false;
+    }
+    matches!(
+        projection.disposition(),
+        DecisionDisposition::AskQuestion
+            | DecisionDisposition::ChangeTopic
+            | DecisionDisposition::ResumeAgenda
+    ) && projection.reference_is_present(input)
 }
 
 fn active_visible_disposition(
@@ -4507,6 +4618,24 @@ fn is_ambient_group_message(message: &yunxi_core::MessageReceivedEvent) -> bool 
         && !message.explicit_request
 }
 
+/// 群聊回合里"带着图片却看不到这张图"：视觉 Provider 被禁用，或图片地址
+/// 没能解析成可用输入。
+///
+/// 这种回合里模型只收到"这位群成员分享了图片"这句话，看不到任何画面，却
+/// 被要求像看见了一样回应；线上表现为清一色的"这张图我还没看懂想表达什么"。
+/// 群聊里宁可不说话，也不评价一张自己没看到的图（私聊不在此列：那边沉默
+/// 更容易被当成"没收到消息"，行为保持不变）。
+fn group_image_turn_without_vision(
+    conversation_kind: Option<ConversationKind>,
+    carries_images: bool,
+    vision_disabled: bool,
+    resolution_failed: bool,
+) -> bool {
+    carries_images
+        && (vision_disabled || resolution_failed)
+        && conversation_kind == Some(ConversationKind::Group)
+}
+
 /// 是否被"明确点名"：结构化 `@` 她本人，或引用回复她。
 ///
 /// 这条判定决定群聊回复节奏走普通间隔还是被点名间隔（见
@@ -4755,6 +4884,9 @@ impl ModelBackend for KoviModelBackend {
                 return Ok(plan);
             }
             if let Some(plan) = active_mind_no_output_plan(input, &mind_projection) {
+                return Ok(plan);
+            }
+            if let Some(plan) = ambient_group_interjection_veto(input, &mind_projection) {
                 return Ok(plan);
             }
             let incoming_admission = incoming_guard
@@ -5061,14 +5193,14 @@ impl ModelBackend for KoviModelBackend {
                 return Ok(silent_with_interaction_state(input));
             }
             let vision_disabled = config::get().vision().disabled();
-            let expects_vision = !vision_disabled
-                && message.is_some_and(|message| {
-                    message
-                        .content
-                        .attachments()
-                        .iter()
-                        .any(|attachment| attachment.kind() == AttachmentKind::Image)
-                });
+            let carries_images = message.is_some_and(|message| {
+                message
+                    .content
+                    .attachments()
+                    .iter()
+                    .any(|attachment| attachment.kind() == AttachmentKind::Image)
+            });
+            let expects_vision = !vision_disabled && carries_images;
             let (vision_images, vision_resolution_error) = if expects_vision {
                 match crate::vision::resolve_image_urls(&vision_attachments, &self.bot).await {
                     Ok(images) if !images.is_empty() => (images, None),
@@ -5082,7 +5214,25 @@ impl ModelBackend for KoviModelBackend {
                 crate::model::finish(ticket).await;
                 return Ok(silent_with_interaction_state(input));
             }
-            if ambient_group_turn && vision_resolution_error.is_some() {
+            // 这一轮的图片既没被视觉 Provider 处理、也没解析成可用地址时，模型
+            // 只被告知"有一条图片"却看不到内容，于是只能写出"这张图我还没看懂"
+            // 这类空话（线上 3 天 12 条，占含图回复的三分之二）。群聊里宁可不
+            // 说话，也不去评价一张自己没看到的图。
+            let blinded_by_missing_vision = group_image_turn_without_vision(
+                message.map(|message| message.conversation_kind),
+                carries_images,
+                vision_disabled,
+                vision_resolution_error.is_some(),
+            );
+            if blinded_by_missing_vision {
+                kovi::log::info!(
+                    "Yunxi Core image turn observed without vision: event_id={} message_id={} conversation_id={} vision_disabled={} resolution_failed={} action=silent",
+                    input.event.id(),
+                    message_id_for_log(input),
+                    conversation_id_for_log(input),
+                    vision_disabled,
+                    vision_resolution_error.is_some(),
+                );
                 crate::model::finish(ticket).await;
                 return Ok(silent_with_interaction_state(input));
             }
@@ -6360,21 +6510,22 @@ mod tests {
         INTRINSIC_AUTONOMOUS_INTENT_TAIL_INSTRUCTION, INTRINSIC_GENERATION_SUFFIX,
         INTRINSIC_SEMANTIC_CONTENT_INSTRUCTION, MAX_CORE_BUBBLES, MAX_DELIVERABLE_BUBBLES_PER_TURN,
         MAX_INTRINSIC_REPLY_PROTOCOL_BYTES, MindCandidates, PersistentRouteLookup, QqConversation,
-        RouteContext, VisibleReplyTarget, affect_tone_guidance, autonomous_conversation_prompt,
-        autonomous_conversation_protocol, autonomous_empty_generation_plan,
-        autonomous_generation_failure_plan, baseline_disposition, batch_fence_action_key,
-        build_bounded_intrinsic_reply_batch, classify_persistent_person_identity,
-        constrain_autonomous_tick_plan, conversation_id_for_log, core_message_prompt,
-        core_plain_turn_instruction, core_plan_has_visible_text, core_reply_bubbles_with_max,
-        core_tool_protocol_diagnostic, default_autonomous_directive, defer_unroutable_due,
-        deterministic_route_fallback, due_reply_target, eligible_mind_candidates,
-        explicit_message_batch_needs_repair, explicit_message_count_for_event,
-        explicit_message_count_for_input, explicit_message_count_instruction,
-        interaction_state_updates_with_cues, intrinsic_autonomous_intent_prompt,
-        intrinsic_fallback_is_eligible, intrinsic_output_is_unsafe, intrinsic_prompt,
-        is_plain_text_batch_data_context, keeps_existing_prepared_plan, message_id_for_log,
-        mind_context_messages, mind_outgoing_fence_required, parse_autonomous_intent_response,
-        parse_core_response, parse_direct_repair_output, parse_intrinsic_autonomous_directive,
+        RouteContext, VisibleReplyTarget, affect_tone_guidance, ambient_group_interjection_veto,
+        autonomous_conversation_prompt, autonomous_conversation_protocol,
+        autonomous_empty_generation_plan, autonomous_generation_failure_plan, baseline_disposition,
+        batch_fence_action_key, build_bounded_intrinsic_reply_batch,
+        classify_persistent_person_identity, constrain_autonomous_tick_plan,
+        conversation_id_for_log, core_message_prompt, core_plain_turn_instruction,
+        core_plan_has_visible_text, core_reply_bubbles_with_max, core_tool_protocol_diagnostic,
+        default_autonomous_directive, defer_unroutable_due, deterministic_route_fallback,
+        due_reply_target, eligible_mind_candidates, explicit_message_batch_needs_repair,
+        explicit_message_count_for_event, explicit_message_count_for_input,
+        explicit_message_count_instruction, interaction_state_updates_with_cues,
+        intrinsic_autonomous_intent_prompt, intrinsic_fallback_is_eligible,
+        intrinsic_output_is_unsafe, intrinsic_prompt, is_plain_text_batch_data_context,
+        keeps_existing_prepared_plan, message_id_for_log, mind_context_messages,
+        mind_outgoing_fence_required, parse_autonomous_intent_response, parse_core_response,
+        parse_direct_repair_output, parse_intrinsic_autonomous_directive,
         parse_plain_core_response, parse_qq_conversation, plain_text_batch_message_prompt,
         plain_text_batch_repair_context, pre_model_plan, prepared_outgoing_semantic_context,
         private_reply_invites_continuation, purge_group_routes_from_cache,
@@ -6399,17 +6550,18 @@ mod tests {
     use crate::vision::ImageAttachment;
     use chrono::Utc;
     use yunxi_core::{
-        ActionCapability, ActionDescriptor, ActionScope, AffectState, Attachment, AttachmentKind,
-        AttentionSystem, BeliefId, BeliefSnapshot, BeliefSource, CognitiveCapabilitySnapshot,
-        CognitiveIntent, CognitiveTier, ConversationId, ConversationKind,
-        ConversationTurnDirective, DecisionDisposition, EventId, EventPriority, EventScope,
-        IdentityStoreError, InteractionCues, InteractionCuesObservedEvent, MessageContent,
-        MessageId, MessageReceivedEvent, MessageSentEvent, MindDecisionProjection,
-        MindInfluenceMode, MindScope, ModelHealth, OpenLoop, OpenLoopId, OpenLoopKind,
-        OpenLoopOwner, PersonId, PlannerInput, PlannerStateSnapshot, ProactiveMotive,
-        ProspectiveMemoryEvent, RelationState, SelfModel, SelfModelSnapshot, StateUpdateProposal,
-        ToolNotificationPolicy, WorkingState, WorkingStateConfig, WorldEvent, WorldEventKind,
-        event_action_idempotency_key, evolve_interaction_state, planned_action_idempotency_key,
+        ActionCapability, ActionDescriptor, ActionScope, AffectState, AgendaItemId, AgendaItemKind,
+        AgendaItemSnapshot, Attachment, AttachmentKind, AttentionSystem, BeliefId, BeliefSnapshot,
+        BeliefSource, CognitiveCapabilitySnapshot, CognitiveIntent, CognitiveTier, ConversationId,
+        ConversationKind, ConversationTurnDirective, DecisionDisposition, EventId, EventPriority,
+        EventScope, IdentityStoreError, InteractionCues, InteractionCuesObservedEvent, InterestId,
+        InterestSnapshot, MessageContent, MessageId, MessageReceivedEvent, MessageSentEvent,
+        MindDecisionProjection, MindInfluenceMode, MindScope, MindSnapshot, ModelHealth, OpenLoop,
+        OpenLoopId, OpenLoopKind, OpenLoopOwner, PersonId, PlannerInput, PlannerStateSnapshot,
+        ProactiveMotive, ProspectiveMemoryEvent, RelationState, SelfModel, SelfModelSnapshot,
+        StateUpdateProposal, ToolNotificationPolicy, WorkingState, WorkingStateConfig, WorldEvent,
+        WorldEventKind, event_action_idempotency_key, evolve_interaction_state,
+        planned_action_idempotency_key,
     };
 
     fn message_input(person_id: PersonId, visible_reply_allowed: bool) -> PlannerInput {
@@ -8066,6 +8218,42 @@ mod tests {
     }
 
     #[test]
+    fn internal_reasoning_never_reaches_the_group_as_a_visible_message() {
+        // 线上实测把"要不要接话"的判断当正文发出去的原文（2026-09-10~12）。
+        for leak in [
+            "（图片还没看懂，先不接话）",
+            "（这个局面确实没什么好接的，安静就安静吧。）",
+            "这条是白名单通知，没实际话题，不接。",
+            "在聊角色展柜和b服的事，这条是在确认月月主号哪个服——顺着接一句就行。",
+            "这条消息像是在跟“月枣”那个话题里的某人斗嘴，前后都是群友在互相打趣，没有点到我，也没有需要我补充的信息。我插进去反而会打断他们。",
+            "（笑）",
+        ] {
+            assert!(
+                !reply_text_has_semantic_content(leak),
+                "内部判断不能作为可见正文：{leak:?}"
+            );
+            assert!(sanitize_plain_text_batch_message(leak).is_none());
+        }
+
+        // 正常聊天里出现的词不能被误杀。
+        for kept in [
+            "他一直在群里不接话，估计是忙。",
+            "这条是什么鱼呀，看着挺好吃的。",
+            "群里聊得正热闹，我在旁边听着。",
+        ] {
+            assert!(
+                reply_text_has_semantic_content(kept),
+                "正常聊天不能被过滤：{kept:?}"
+            );
+        }
+        // "我插进去说两句会不会太吵？"这类句子故意一并拦掉：谈论自己要不要
+        // 插话，本身就是我们不想让群里看到的元叙述语域。
+        assert!(!reply_text_has_semantic_content(
+            "我插进去说两句会不会太吵？"
+        ));
+    }
+
+    #[test]
     fn reply_semantic_validator_rejects_junk_without_losing_short_natural_replies() {
         for output in [
             "-",
@@ -8384,6 +8572,126 @@ mod tests {
 
         let hidden = group_message_input_with_flags(true, false, false, false, false);
         assert!(!reply_expected_for_incoming(&hidden));
+    }
+
+    #[test]
+    fn group_image_turn_is_silent_whenever_the_image_is_invisible() {
+        use yunxi_core::ConversationKind::{Direct, Group};
+        // 看不到图 → 群聊保持观察。
+        assert!(super::group_image_turn_without_vision(
+            Some(Group),
+            true,
+            true,
+            false
+        ));
+        assert!(super::group_image_turn_without_vision(
+            Some(Group),
+            true,
+            false,
+            true
+        ));
+        // 看得到图 → 正常走生成。
+        assert!(!super::group_image_turn_without_vision(
+            Some(Group),
+            true,
+            false,
+            false
+        ));
+        // 没有图片的消息不受影响。
+        assert!(!super::group_image_turn_without_vision(
+            Some(Group),
+            false,
+            true,
+            true
+        ));
+        // 私聊保持原行为：那边沉默更像"没收到消息"。
+        assert!(!super::group_image_turn_without_vision(
+            Some(Direct),
+            true,
+            true,
+            true
+        ));
+        // 非消息事件（没有会话类型）不适用。
+        assert!(!super::group_image_turn_without_vision(
+            None, true, true, true
+        ));
+    }
+
+    #[test]
+    fn ambient_group_turn_without_mind_intent_stays_observing() {
+        let input = group_message_input(false);
+        let projection = MindDecisionProjection::for_input(&input, baseline_disposition(&input));
+        assert_eq!(projection.disposition(), DecisionDisposition::Silent);
+
+        let plan = ambient_group_interjection_veto(&input, &projection)
+            .expect("Mind 没有由头时，未点名的群聊回合必须保持观察");
+        assert_eq!(plan.disposition, DecisionDisposition::Silent);
+        assert!(plan.intents.is_empty(), "否决不能携带任何可见意图");
+    }
+
+    #[test]
+    fn addressed_and_explicit_group_turns_are_never_ambient_vetoed() {
+        for (name, input) in [
+            ("被点名", group_message_input(true)),
+            (
+                "被引用",
+                group_message_input_with_flags(false, true, false, true, false),
+            ),
+            (
+                "显式请求",
+                group_message_input_with_flags(false, false, true, true, false),
+            ),
+        ] {
+            let projection =
+                MindDecisionProjection::for_input(&input, baseline_disposition(&input));
+            assert!(
+                ambient_group_interjection_veto(&input, &projection).is_none(),
+                "{name}的群聊回合不受未点名否决约束"
+            );
+        }
+    }
+
+    #[test]
+    fn ambient_group_turn_with_a_mind_intent_may_speak() {
+        // 高显著度兴趣 + 对应的 agenda 条目：Mind 真的提出了要接的话，
+        // 未点名回合才允许继续生成。
+        let interest_id = InterestId::new();
+        let mind = MindSnapshot::new(
+            None,
+            Vec::new(),
+            Vec::new(),
+            vec![InterestSnapshot {
+                id: interest_id,
+                topic: "群友在做的视频企划".to_string(),
+                activation: 0.9,
+                long_term_affinity: 0.8,
+                novelty: 0.5,
+                version: 1,
+            }],
+            Vec::new(),
+            vec![AgendaItemSnapshot {
+                id: AgendaItemId::new(),
+                scope: MindScope::Global,
+                kind: AgendaItemKind::Interest,
+                summary_key: format!("interest:{interest_id}"),
+                salience: 0.9,
+                activation: 0.9,
+                version: 1,
+            }],
+            Vec::new(),
+            MindInfluenceMode::Active,
+            1,
+            Utc::now(),
+        )
+        .expect("active mind snapshot");
+        let input = group_message_input(false).with_mind(mind);
+        let projection = MindDecisionProjection::for_input(&input, baseline_disposition(&input));
+        assert_eq!(projection.disposition(), DecisionDisposition::ChangeTopic);
+
+        assert!(
+            ambient_group_interjection_veto(&input, &projection).is_none(),
+            "Mind 提出带由头的开口时不该被否决"
+        );
     }
 
     #[test]

@@ -53,7 +53,21 @@ pub struct GroupInterjectionConfig {
     /// 接续对话窗口：芸汐最近一次在本群发出可见消息后，未点名消息在
     /// 这个时长内走"接续对话"语义评估（由相关性判定是否回复），窗口外
     /// 回到低频插话抽样。窗口越长，群内每条消息请求模型的概率越高。
+    ///
+    /// 取值必须 ≤ `reply_gap_secs`：接续窗口比"她下次可以发言"的等待还长
+    /// 时，窗口会变成常开状态——一次可见回复之后的整段时间里，群里每条
+    /// 未点名消息都确定性进入语义评估，低频抽样与候选冷却全部作废。超限
+    /// 时退回 `reply_gap_secs`（与 `effective_addressed_reply_gap_secs`
+    /// 同一约定）。
     continuation_window_secs: u64,
+    /// 未点名的群聊回合要有可见输出，必须由 Mind 提出一个带由头的开口
+    /// （open question / agenda / interest）；Mind 判定 silent 时直接保持
+    /// 观察，不再把判定交给模型"自己看着办"。
+    ///
+    /// 关闭后回到旧行为（silent 只作为提示）。线上实测（2026-09-10~13）：
+    /// 未点名回合里 Mind 判定 silent 却仍发出可见回复的有 271 条，占全部
+    /// 群回复的 75%，是"没问她也要答"的主通道。
+    ambient_requires_mind_intent: bool,
     /// 同群两次群聊可见回复（点名或未点名）之间的最短间隔（秒）。
     /// 对"每句话都回"的刷屏波次做硬性控制；管理员豁免。
     reply_gap_secs: u64,
@@ -154,6 +168,17 @@ impl GroupInterjectionConfig {
         self.continuation_window_secs
     }
 
+    /// 接续对话窗口的有效时长。窗口长于 `reply_gap_secs` 时它在她下一次
+    /// 可以发言之前仍然敞开着，"低频接话"会退化成常开语义评估，因此超限
+    /// 一律按 `reply_gap_secs` 处理。
+    pub fn effective_continuation_window_secs(&self) -> u64 {
+        self.continuation_window_secs.min(self.reply_gap_secs)
+    }
+
+    pub fn ambient_requires_mind_intent(&self) -> bool {
+        self.ambient_requires_mind_intent
+    }
+
     pub fn reply_gap_secs(&self) -> u64 {
         self.reply_gap_secs
     }
@@ -231,6 +256,13 @@ impl GroupInterjectionConfig {
                 self.reply_gap_secs
             ));
         }
+        if self.continuation_window_secs > self.reply_gap_secs {
+            return Err(anyhow::anyhow!(
+                "接续对话窗口不能大于群聊回复间隔，否则窗口在她下次可以发言前一直敞开（{0} > {1}）",
+                self.continuation_window_secs,
+                self.reply_gap_secs
+            ));
+        }
         Ok(())
     }
 }
@@ -258,7 +290,8 @@ impl Default for GroupInterjectionConfig {
             familiarity_threshold: 0.5,
             familiar_rate_window_secs: 600,
             familiar_rate_limit: 6,
-            continuation_window_secs: 180,
+            continuation_window_secs: 60,
+            ambient_requires_mind_intent: true,
             reply_gap_secs: 90,
             addressed_reply_gap_secs: 20,
             reply_rate_window_secs: 600,
@@ -312,5 +345,40 @@ mod tests {
             ..GroupInterjectionConfig::default()
         };
         assert_eq!(configured.effective_addressed_reply_gap_secs(), 30);
+    }
+
+    #[test]
+    fn continuation_window_must_not_exceed_the_reply_gap() {
+        let config = GroupInterjectionConfig {
+            reply_gap_secs: 90,
+            continuation_window_secs: 180,
+            ..GroupInterjectionConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn continuation_window_clamps_to_the_reply_gap() {
+        let config = GroupInterjectionConfig {
+            reply_gap_secs: 90,
+            continuation_window_secs: 600,
+            ..GroupInterjectionConfig::default()
+        };
+        assert_eq!(config.effective_continuation_window_secs(), 90);
+
+        let configured = GroupInterjectionConfig {
+            reply_gap_secs: 90,
+            continuation_window_secs: 60,
+            ..GroupInterjectionConfig::default()
+        };
+        assert_eq!(configured.effective_continuation_window_secs(), 60);
+    }
+
+    #[test]
+    fn ambient_mind_intent_gate_defaults_on() {
+        assert!(
+            GroupInterjectionConfig::default().ambient_requires_mind_intent(),
+            "未点名回合默认必须由 Mind 提出由头才允许可见输出"
+        );
     }
 }
