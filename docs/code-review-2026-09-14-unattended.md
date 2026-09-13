@@ -99,7 +99,29 @@ NotFound」两条断言。
 
 ## 二、需要你决定的高优先级问题（未改）
 
-### 2.1 世界模型的数据删除会在 30 秒内被写回（隐私）
+### 2.1 世界模型的数据删除会在 30 秒内被写回（隐私）——**已复现，测试已落档**
+
+**复现结论（`2aa5553`，本地 PostgreSQL 18）**：
+`yunxi::world_model_store::tests::postgres_erasure_is_not_undone_by_the_next_world_persist`
+在「擦除后行数=0」通过之后，下一次 `save_world` 让行数回到 1（`left: 1, right: 0`）。
+机制确认无误：`save_world` 是整表重写，而擦除只删库里的行。
+
+**并且它的开关状态和字面看起来的相反**：`bot.conf.example.toml:407-410` 写着
+`world_model.enabled`「只影响两处**文案**……没有门控任何行为（全仓只有这两个消费点）」。
+实际上代码至少门控三处：`with_world` 的内存运行时（`yunxi/world_model.rs:69-72`）、
+`restore_from_store`（`:90-92`）、以及世界模型 store 的创建与随之而来的
+`delete_person_domain_rows` 调用（`yunxi/mod.rs:193`）。而部署工作流是用
+`bot.conf.example.toml` 生成生产 `bot.conf.toml` 的（`deploy.yml` 的
+`install -m 0600 bot.conf.example.toml "$release_dir/bot.conf.toml"`，其后只 patch
+模型相关那几行，不碰 `[world_model]`），example 里是 `enabled = true`；仓库里这份
+`bot.conf.toml` 则根本没有 `[world_model]` 段（取代码默认 `false`）。
+
+所以本地按配置看是关的，线上很可能是开的。**一条命令即可确认**：看启动日志里那行
+"World Model v4 已启用"，或私聊发 `#world-status`——这正是那条注释所说的两个消费点。
+
+顺带这里有个需要你定的问题：`enabled` **本来该不该**门控这些行为？如果那条注释代表的
+是设计意图（这个开关只是文案），那要修的就是代码里那几处门控；如果不是，要修的是注释。
+两种修法方向相反，所以我没动。
 
 `plugins/model/src/yunxi/identity_store.rs:1078` 在删除事务里调
 `world_model_store::delete_person_domain_rows`，删掉该人/群的 `yunxi_world_*` 行。
@@ -138,7 +160,19 @@ affect_states / relations / external_identities / persons，但没有 gag。`gag
 `#删除我的数据`，会删掉**所有**会话里键为那个名字的备注，包括无关群里关于真实那位
 成员的。建议加 `AND scope_key = ANY($2)`，只在请求者自身的作用域内接受昵称匹配。
 
-### 2.4 「尽力而为」的世界模型删除其实无法 fail-soft
+### 2.4 「尽力而为」的世界模型删除其实无法 fail-soft ——**已复现，测试已落档**
+
+**复现结论（`2aa5553`，本地 PostgreSQL 18）**：
+`yunxi::erasure_tests::world_store_failure_must_not_take_the_person_erasure_down_with_it`
+注入故障（删掉 `yunxi_world_observations`）后，这个人的记忆**没有被删掉**
+（`left: 1, right: 0`），调用方拿到的是 `25P02 current transaction is aborted`——
+正是被吞掉的世界模型失败把后面每一条 DELETE 都带走了。
+
+更窄的那一形态（"什么都没删却报成功"）也验证了：已中止事务上的 `COMMIT` 只输出
+`ROLLBACK`、不报错（psql 实测 `rows_written=0`），而 sqlx 的 `commit()` 只传播
+COMMIT 语句自身的错误（`sqlx-postgres-0.8.6/src/transaction.rs:47-58`），所以只要
+世界模型之后没有别的语句（`person_id = None` 且无 direct conversation），调用方就会
+看到一次成功的零行擦除。
 
 `identity_store.rs:1079` 用 `let Ok(rows) = ...` 吞掉错误，但 PostgreSQL 里任何语句
 失败都会中止整个事务，后续语句一律 25P02，而 sqlx 的 `commit()` 只是发 `COMMIT`——
@@ -280,7 +314,11 @@ PG `max_connections=100` 与整机余量定夺）、`plugins/model/src/yunxi/mem
 ## 五、两点说明
 
 1. 上面第三、四节的条目里，标了具体行号的都经过至少一次源码复核；但除了
-   「一、已修」和 1.5 那类我亲自复现的，**我没有逐条独立复现**。动手前建议按
-   `file:line` 再看一眼上下文——行号以 `8d36cdc` 为准。
+   「一、已修」、1.5 以及 2.1/2.4（均已在本地 PostgreSQL 上复现并落成回归测试，
+   见 `2aa5553`）之外，**我没有逐条独立复现**。动手前建议按 `file:line` 再看一眼
+   上下文——行号以 `2aa5553` 为准。
+   复现环境是一次性的本地库 `kovi_review_scratch`（PostgreSQL 18），未接触任何线上
+   数据；两条测试只读 `DATABASE_URL`，跑法：
+   `DATABASE_URL=postgresql://$USER@127.0.0.1:5432/kovi_review_scratch cargo test -p model --lib -- <全路径> -- --ignored --exact`。
 2. 我刻意没有改的：2.1/2.2/2.3（数据擦除语义，需要真实 Postgres 验证）、
    `max_connections(5)`（见上，属于容量决策）、以及所有用户可见文案。
