@@ -410,8 +410,11 @@ deploy_user="$3"
 test "$app_dir" = "/home/ubuntu/kovi-bot"
 case "$revision" in
   [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*)
+    # 前 8 位必须是十六进制（防呆），其余只允许小写字母、数字、点、连字符：
+    # 本地脚本在脏工作区会拼出 `<sha>-dirty.<时间戳>`，只收 [0-9a-f.-] 会把
+    # "dirty" 里的 r/t/y/i 判成非法，脏发布这条路径直接走不通（真发生过）。
     case "$revision" in
-      *[!0-9a-f.-]*) echo "非法 revision: $revision" >&2; exit 1 ;;
+      *[!0-9a-z.-]*) echo "非法 revision: $revision" >&2; exit 1 ;;
     esac
     ;;
   *) echo "非法 revision: $revision" >&2; exit 1 ;;

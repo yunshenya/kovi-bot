@@ -491,9 +491,17 @@ a.stat:hover, .stat.link:hover { border-color: var(--accent); transform: transla
 /* ───────────────────────────── 配置页 ───────────────────────────── */
 
 .config-layout { display: grid; grid-template-columns: 272px 1fr; gap: 18px; align-items: start; }
-/* 左栏（文件 + 分区导航）跟着滚：主区再长也能随手跳分区，不用翻回顶部。 */
-.config-layout > .card:first-child { position: sticky; top: 84px; max-height: calc(100vh - 104px); display: flex; flex-direction: column; }
-.config-layout > .card:first-child .section-nav { overflow: auto; }
+/* 左栏（文件 + 分区导航）跟着滚：主区再长也能随手跳分区，不用翻回顶部。
+ *
+ * 用整栏滚动（overflow: auto 加在卡片上）而不是"只让导航滚"：后者要在
+ * flex 链上逐级 min-height: 0 才压得住，漏一级就会出现"导航文字溢出到卡片
+ * 外面"——分区列表比卡片还长，直接画在了页面背景上。整栏滚只有一层滚动条，
+ * 也不会溢出，窗口矮的时候更稳。 */
+.config-layout > .card:first-child {
+  position: sticky; top: 84px;
+  max-height: calc(100vh - 104px);
+  overflow: auto;
+}
 /* 搜索栏也吸住：长页滚到一半想换个词不用先回到顶部。 */
 .config-toolbar { position: sticky; top: 76px; z-index: 12; backdrop-filter: blur(10px); background: color-mix(in srgb, var(--bg-elev) 92%, transparent); }
 
@@ -733,9 +741,14 @@ a.stat:hover, .stat.link:hover { border-color: var(--accent); transform: transla
   border: 1px solid color-mix(in srgb, var(--warn) 22%, transparent);
 }
 
+/* 窗口不够高时不做吸顶：否则左栏被压成很小一块，得在小框里翻两遍。 */
+@media (max-height: 720px) {
+  .config-layout > .card:first-child { position: static; max-height: none; overflow: visible; }
+}
+
 @media (max-width: 1080px) {
   .config-layout { grid-template-columns: 1fr; }
-  .config-layout > .card:first-child { position: static; max-height: none; }
+  .config-layout > .card:first-child { position: static; max-height: none; overflow: visible; }
   .config-toolbar { position: static; }
   .memory-layout { grid-template-columns: 1fr; }
   .detail { position: static; }
