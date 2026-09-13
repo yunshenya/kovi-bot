@@ -908,6 +908,9 @@
     groupIndex: 0,
     colorBy: 'mentioned_at',
     linkTypes: new Set(['semantic', 'temporal', 'entity', 'causal']),
+    // 记忆里常有大量同内容的记录（例如同一个传感器每次重启写一条），
+    // 直接画就是一团毛线球。默认按标题折叠。
+    collapseDuplicates: true,
   };
 
   // 数据库里存的是枚举标识，界面上给人话名字。
@@ -1458,6 +1461,51 @@
     return `rgb(${mix(from[0], to[0])},${mix(from[1], to[1])},${mix(from[2], to[2])})`;
   }
 
+  /** 把标题相同的记录折成一个节点，并重映射连线。 */
+  function collapseDuplicateNodes(graph) {
+    const groups = new Map();
+    for (const node of graph.nodes || []) {
+      const key = (node.title || '').trim() || node.id;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(node);
+    }
+    const nodes = [];
+    const idMap = new Map();
+    for (const [key, members] of groups) {
+      const representative = { ...members[0] };
+      if (members.length > 1) {
+        representative.count = members.length;
+        representative.title = `${key} ×${members.length}`;
+        // 代表节点用最近一次提及的时间与最高权重，免得折叠后把新记录画成旧的。
+        const times = members
+          .map((member) => new Date(mentionedOf(member)).getTime())
+          .filter((time) => !Number.isNaN(time));
+        if (times.length) representative.mentioned_at = new Date(Math.max(...times)).toISOString();
+        representative.weight = Math.max(...members.map((member) => Number(member.weight) || 0));
+      }
+      nodes.push(representative);
+      for (const member of members) idMap.set(member.id, representative.id);
+    }
+
+    const seen = new Set();
+    const links = [];
+    for (const link of graph.links || []) {
+      const source = idMap.get(link.source);
+      const target = idMap.get(link.target);
+      if (!source || !target || source === target) continue;
+      const key = `${[source, target].sort().join('|')}|${link.type}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      links.push({ ...link, source, target });
+    }
+
+    const linkCounts = {};
+    for (const [key] of LINK_TYPES) linkCounts[key] = 0;
+    for (const link of links) linkCounts[link.type] = (linkCounts[link.type] || 0) + 1;
+
+    return { nodes, links, linkCounts, hidden: (graph.nodes || []).length - nodes.length };
+  }
+
   async function renderConstellation(page) {
     const params = new URLSearchParams({ limit: '200' });
     if (memory.query) params.set('q', memory.query);
@@ -1476,6 +1524,16 @@
             h('option', { value: 'weight', text: '重要度', selected: memory.colorBy === 'weight' }));
           select.addEventListener('change', () => { memory.colorBy = select.value; renderMemoryPage(); });
           return select;
+        })()),
+      h('label', { class: 'graph-control', title: '把内容完全相同的记录折成一个节点并标出条数' },
+        h('span', { text: '折叠重复' }),
+        (() => {
+          const input = h('input', { type: 'checkbox', checked: memory.collapseDuplicates });
+          input.addEventListener('change', () => {
+            memory.collapseDuplicates = input.checked;
+            renderMemoryPage();
+          });
+          return h('span', { class: 'switch small' }, input, h('span', { class: 'track' }));
         })()),
       h('div', { class: 'graph-control' },
         h('span', { text: '链接类型' }),
@@ -1503,15 +1561,26 @@
       h('div', { class: 'graph-tooltip', id: 'graph-tooltip', hidden: true }));
     layout.append(canvasBox);
 
-    const counts = graph.link_counts || {};
+    const view = memory.collapseDuplicates ? collapseDuplicateNodes(graph) : null;
+    const shown = view || {
+      nodes: graph.nodes || [],
+      links: graph.links || [],
+      linkCounts: graph.link_counts || {},
+      hidden: 0,
+    };
+    const counts = shown.linkCounts;
     layout.append(h('aside', { class: 'graph-side' },
       h('h4', { text: '星座视图' }),
       h('p', { class: 'muted small' },
         '画布渲染的记忆地图：节点是记忆，连线是它们之间真实存在的关系。滚动缩放，拖动平移，悬停探索，点击查看详情。'),
       h('div', { class: 'graph-stat' },
-        h('div', {}, h('div', { class: 'label', text: '节点' }), h('div', { class: 'value', text: String(graph.total) })),
+        h('div', {}, h('div', { class: 'label', text: '节点' }),
+          h('div', { class: 'value', text: String(shown.nodes.length) })),
         h('div', {}, h('div', { class: 'label', text: '链接' }),
           h('div', { class: 'value', text: String(Object.values(counts).reduce((a, b) => a + b, 0)) }))),
+      shown.hidden > 0
+        ? h('p', { class: 'muted small', text: `已把 ${shown.hidden} 条内容重复的记录折进节点` })
+        : null,
       h('div', { class: 'graph-legend' },
         ...LINK_TYPES.map(([key, label, color]) => h('div', { class: 'graph-legend-row' },
           h('i', { style: `background:${color}` }), label,
@@ -1519,7 +1588,7 @@
 
     const card = h('div', { class: 'card' }, controls, layout);
     page.append(card);
-    drawConstellation(graph);
+    drawConstellation({ ...graph, nodes: shown.nodes, links: shown.links, total: shown.nodes.length });
   }
 
   function toggleGraphFullscreen(box) {

@@ -729,3 +729,8 @@ mark { background: color-mix(in srgb, var(--warn) 38%, transparent); color: inhe
 @media (max-width: 1080px) {
   .sys-layout { grid-template-columns: 1fr; }
 }
+
+/* 图控制行里的小号开关 */
+.switch.small .track { width: 32px; height: 18px; }
+.switch.small .track::after { width: 12px; height: 12px; top: 3px; left: 3px; }
+.switch.small input:checked + .track::after { transform: translateX(14px); }

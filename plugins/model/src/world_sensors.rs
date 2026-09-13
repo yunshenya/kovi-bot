@@ -179,8 +179,8 @@ async fn ok_or_skip(sensor: &config::WorldSensorConfig, cooldown: Duration) -> a
     // remains in the expected state ("文件变更").
     let file_changed =
         sensor.kind() == "file_state" && state.last_mtime != mtime && mtime.is_some();
-    // Only feed the core on a state transition, not every poll.
-    if state.last_ok != Some(ok) || (file_changed && ok) {
+    let should_write = should_feed_core(state.last_ok, ok, file_changed);
+    if should_write {
         let summary = format!(
             "{} 现在{}",
             sensor.name(),
@@ -205,14 +205,6 @@ async fn ok_or_skip(sensor: &config::WorldSensorConfig, cooldown: Duration) -> a
                 sensor.name()
             );
         } else {
-            set_sensor_state(
-                sensor.name(),
-                SensorState {
-                    last_ok: Some(ok),
-                    last_change: Some(std::time::SystemTime::now()),
-                    last_mtime: mtime,
-                },
-            );
             // Shadow-mode World Model: also record a structured entity
             // property so the v4 runtime can track this sensor's state.
             crate::yunxi::world_model::record_entity_property(
@@ -225,7 +217,38 @@ async fn ok_or_skip(sensor: &config::WorldSensorConfig, cooldown: Duration) -> a
             );
         }
     }
+    // 无论这次写没写，都要把观测记下来：基线不建立，"首次观测"就会每轮重现。
+    // `last_change` 只在真的写的时候推进，保留它原本的语义（写完之后静默一个 cooldown）。
+    set_sensor_state(
+        sensor.name(),
+        SensorState {
+            last_ok: Some(ok),
+            last_change: if should_write {
+                Some(std::time::SystemTime::now())
+            } else {
+                state.last_change
+            },
+            last_mtime: mtime,
+        },
+    );
     Ok(())
+}
+
+/// 这次观测该不该写进记忆。
+///
+/// - 启动后的**第一次**观测只当基线：正常就静默（否则每次重启都留一条
+///   "一切正常"，而传感器状态是进程内的，重启风暴会把它刷成几百条重复记忆）；
+///   异常必须写出来——"刚起来就发现服务没在跑"是有用的信息。
+/// - 之后只在状态真的翻转、或 file_state 的文件在正常态下发生变化时才写。
+///
+/// 已知取舍：首次观测不看 `file_changed`。mtime 没有持久化，进程重启后第一次
+/// 读到文件时它必然"和上次不同"，照写就还是每次重启一条。代价是"机器人离线期间
+/// 文件变过"这一次不会被报出来——宁可漏一次，也不要重启风暴刷屏。
+fn should_feed_core(previous: Option<bool>, ok: bool, file_changed: bool) -> bool {
+    match previous {
+        None => !ok,
+        Some(previous) => previous != ok || (file_changed && ok),
+    }
 }
 
 /// Check a `file_state` sensor: ok when the path exists and is a regular
@@ -294,6 +317,26 @@ mod tests {
         )
         .expect("deserializes");
         assert!(bad.validate().is_err());
+    }
+
+    #[test]
+    fn first_observation_is_a_baseline_unless_it_is_bad_news() {
+        // 启动后第一次观测：正常 → 静默建基线（重启不该留下"一切正常"的重复记忆）。
+        assert!(!should_feed_core(None, true, false));
+        // 但"刚起来就发现服务没跑"必须写出来。
+        assert!(should_feed_core(None, false, false));
+        // 首次观测即使 file_changed 也不写：mtime 没持久化，重启后它必然为真。
+        assert!(!should_feed_core(None, true, true));
+    }
+
+    #[test]
+    fn later_observations_only_fire_on_a_real_transition() {
+        assert!(!should_feed_core(Some(true), true, false));
+        assert!(!should_feed_core(Some(false), false, false));
+        assert!(should_feed_core(Some(true), false, false));
+        assert!(should_feed_core(Some(false), true, false));
+        // 异常态下的文件变化不算"变化"，避免噪声。
+        assert!(!should_feed_core(Some(false), false, true));
     }
 
     #[test]
