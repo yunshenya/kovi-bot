@@ -39,8 +39,11 @@ SPEAKER_LETTERS = "ABCDEFGH"
 # 编号的显示名前缀。字段名仍叫 speaker（数据契约），界面上一律叫"群友"。
 SPEAKER_LABEL = "群友"
 
-# 老批次没有群友编号时的退路：只能按角色显示，"他人"分不出是几个人。
-ROLE_LABELS = {"assistant": "芸汐", "user": "同一人", "other_member": "他人"}
+# 老批次没有群友编号时的退路：只能按"是不是正文那个发言者"分两拨。
+# 刻意不写"同一人"：正文框也曾不带标签，于是"同一人"没有前指——标注的人会问
+# "跟谁同一人？"。改成"发言者"之后，正文、前一句、他自己更早的回合用的是同一个
+# 词，同一个人只有一个名字；别人一律"他人"。
+ROLE_LABELS = {"assistant": "芸汐", "user": "发言者", "other_member": "他人"}
 
 
 def speaker_label(turn: dict) -> str:
@@ -62,17 +65,17 @@ def speaker_label(turn: dict) -> str:
 
 
 def current_speaker_suffix(sample: dict) -> str:
-    """当前发言者的显示后缀（`[群友A]`），与网页端 `annotationCurrentLabel` 同一条规则。
+    """当前发言者的显示后缀，与网页端 `annotationCurrentLabel` 同一条规则。
 
-    编号对当前发言者本身永远成立，问题出在上下文：老批次的回合编不出号，只能写
-    "同一人/他人"，这时正文再挂一个"群友A"，同一个人就有了两个名字（正文是
-    "群友A"、他自己那条上下文是"同一人"），看着像两个人。所以只有当**上下文里的
-    编号是齐的、或者压根没有上下文**时才写。
+    新批次有群友编号，这里是 `[群友A]`（正文与他自己更早的回合共用一个字母）。
+    老批次编不出号，退回 `[发言者]`——必须和上下文里 `user` 回合用的词一模一样，
+    否则同一个人会有两个名字（正文一个、他自己那条上下文另一个），看着像两个人。
+    压根没有上下文时照写群友A：没有东西跟它打架。
     """
     turns = sample.get("context", {}).get("recent_turns") or []
-    if not turns:
+    if any(t.get("speaker") for t in turns):
         return f"[{SPEAKER_LABEL}A]"
-    return f"[{SPEAKER_LABEL}A]" if any(t.get("speaker") for t in turns) else ""
+    return f"[{ROLE_LABELS['user']}]" if turns else f"[{SPEAKER_LABEL}A]"
 
 
 def load(path: Path):

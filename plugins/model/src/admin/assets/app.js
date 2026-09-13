@@ -2285,8 +2285,14 @@
   const SPEAKER_LABEL = '群友';
   /** 其他群友的配色档数，与 CSS 的 --speaker-0..3 一一对应（多了就轮转）。 */
   const SPEAKER_TONES = 4;
-  /** 老批次没有群友编号时的退路：只能按角色显示，看不出是几个其他人。 */
-  const ROLE_LABELS = { assistant: '芸汐', user: '同一人', other_member: '他人' };
+  /**
+   * 老批次没有群友编号时的退路：只能按"是不是正文那个发言者"分两拨。
+   *
+   * 这里刻意不写"同一人"：正文框也曾不带标签，于是"同一人"没有前指——标注的人
+   * 会问"跟谁同一人？"。改成"发言者"之后，正文框、前一句、他自己更早的回合用的
+   * 是同一个词，同一个人只有一个名字；别人一律"他人"。
+   */
+  const ROLE_LABELS = { assistant: '芸汐', user: '发言者', other_member: '他人' };
   const SNIPPET_CHARS = 56;
 
   /**
@@ -2322,21 +2328,22 @@
   }
 
   /**
-   * 正文框（以及同属一次发言的"前一句"）该不该写"群友A"。
+   * 正文框（以及同属一次发言的"前一句"）该用哪个名字。
    *
-   * 编号对当前发言者本身永远成立，问题出在上下文：老批次的回合编不出号，只能写
-   * "同一人/他人"，这时正文框再挂一个"群友A"，同一个人就有了两个名字（正文框是
-   * "群友A"、他自己那条上下文是"同一人"），看着像两个人。所以只有当**上下文里的
-   * 编号是齐的、或者压根没有上下文**时才写这个标签——没有上下文就没有东西跟它打架。
+   * 新批次有群友编号，这里就是"群友A"（正文与他自己更早的回合共用一个字母）。
+   * 老批次编不出号，退回"发言者"——必须和上下文里 `user` 回合用的词一模一样，
+   * 否则同一个人会有两个名字（正文框一个、他自己那条上下文另一个），看着像两个人。
+   * 压根没有上下文时照写"群友A"：没有东西跟它打架。
    */
   function annotationCurrentLabel(sample) {
     const turns = (sample && sample.context && sample.context.recent_turns) || [];
-    if (!turns.length) return `${SPEAKER_LABEL}A`;
-    return annotationHasSpeakers(sample) ? `${SPEAKER_LABEL}A` : '';
+    if (annotationHasSpeakers(sample)) return `${SPEAKER_LABEL}A`;
+    return turns.length ? ROLE_LABELS.user : `${SPEAKER_LABEL}A`;
   }
 
   /** 老批次里"他人"的悬停说明：不是没显示，是当时根本没记。 */
-  const SPEAKER_UNRECORDED = '这批采于群友编号之前，只能标出"其他人"，看不出是几个';
+  const SPEAKER_UNRECORDED = '这批采于群友编号之前：只分得出"发言者"和"其他人"，'
+    + '看不出几条"他人"是不是同一个人';
 
   function annotationSnippet(text) {
     const flat = String(text == null ? '' : text).split(/\s+/).filter(Boolean).join(' ');
