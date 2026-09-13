@@ -201,7 +201,7 @@ pub(crate) async fn list_files() -> Result<Json<Value>, ApiError> {
                     .as_ref()
                     .and_then(|metadata| metadata.modified().ok())
                     .map(format_time),
-                "backups": backups_of(file.name).len(),
+                "backups": backups_of(&path).len(),
             })
         })
         .collect();
@@ -417,7 +417,7 @@ pub(crate) async fn reload() -> Result<Json<Value>, ApiError> {
 pub(crate) async fn list_backups() -> Result<Json<Value>, ApiError> {
     let mut all = Vec::new();
     for file in FILES {
-        for backup in backups_of(file.name) {
+        for backup in backups_of(&config_path(file.name)?) {
             all.push(json!({
                 "file": file.name,
                 "name": file_name(&backup),
@@ -830,7 +830,7 @@ fn backup(path: &Path) -> Result<Option<PathBuf>, ApiError> {
     fs::copy(path, &backup_path)
         .map_err(|error| ApiError::internal(format!("备份失败: {error}")))?;
 
-    let mut existing = backups_of(&file_name(path));
+    let mut existing = backups_of(path);
     existing.sort();
     while existing.len() > MAX_BACKUPS {
         let oldest = existing.remove(0);
@@ -840,19 +840,38 @@ fn backup(path: &Path) -> Result<Option<PathBuf>, ApiError> {
 }
 
 /// 某个文件的备份列表，按时间从旧到新。
-fn backups_of(name: &str) -> Vec<PathBuf> {
+///
+/// 备份与目标文件**同目录**（`backup()` 就是这么写的），所以必须去目标文件所在
+/// 目录里找。早先这里扫的是进程 CWD，而生产的 CWD 是只读的发布目录
+/// (`current/`)，与覆盖配置所在的运行时可写目录不是同一个——于是
+/// `bot.conf.override.toml` 的备份在后台永远看不见：列表恒为空（`backups=0`）、
+/// 还原接口够不着，连 `backup()` 里的 `MAX_BACKUPS` 清理也从没对它执行过。
+fn backups_of(path: &Path) -> Vec<PathBuf> {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return Vec::new();
+    };
     let prefix = format!("{name}.bak.");
     let mut found = Vec::new();
-    if let Ok(entries) = fs::read_dir(".") {
+    if let Ok(entries) = fs::read_dir(backup_dir(path)) {
         for entry in entries.flatten() {
-            let file_name = entry.file_name().to_string_lossy().to_string();
-            if file_name.starts_with(&prefix) {
-                found.push(PathBuf::from(file_name));
+            if entry.file_name().to_string_lossy().starts_with(&prefix) {
+                found.push(entry.path());
             }
         }
     }
     found.sort();
     found
+}
+
+/// 备份所在目录：目标文件的父目录。
+///
+/// `config_path()` 对主配置返回的是裸文件名（相对工作目录），它的
+/// `parent()` 是空串，这时按当前目录处理。
+fn backup_dir(path: &Path) -> &Path {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    }
 }
 
 fn backup_target(backup_name: &str) -> Option<String> {
@@ -865,15 +884,26 @@ fn backup_target(backup_name: &str) -> Option<String> {
 }
 
 /// 只接受形如 `bot.conf.toml.bak.1730000000` 的备份名，避免被当成任意路径读。
+///
+/// 在**目标文件所在目录**里解析：主配置在只读的发布目录、覆盖配置在运行时可写
+/// 目录，两者目录不同；按进程 CWD 解析在生产上只会指向发布目录，覆盖配置的备份
+/// 因此既列不出来、也还不了原。
 fn resolve_backup(name: &str) -> Result<PathBuf, ApiError> {
-    if backup_target(name).is_none() {
+    let target_name = backup_target(name).ok_or_else(|| ApiError::bad_request("备份名不合法"))?;
+    let target = config_path(&target_name)?;
+    resolve_backup_in(backup_dir(&target), name)
+}
+
+/// 在一个目录里定位备份文件。
+///
+/// 名字形状的校验也放在这里，而不是只放在调用方：任何新增的调用点都不会因为
+/// 忘了先校验而把它变成任意路径读取。
+fn resolve_backup_in(directory: &Path, name: &str) -> Result<PathBuf, ApiError> {
+    if name.is_empty() || name.contains('/') || name.contains('\\') || name.contains("..") {
         return Err(ApiError::bad_request("备份名不合法"));
     }
-    if name.contains('/') || name.contains('\\') || name.contains("..") {
-        return Err(ApiError::bad_request("备份名不合法"));
-    }
-    let path = PathBuf::from(name);
-    if !path.exists() {
+    let path = directory.join(name);
+    if !path.is_file() {
         return Err(ApiError::not_found("备份不存在"));
     }
     Ok(path)
@@ -902,6 +932,70 @@ pub(crate) fn write_atomically(path: &Path, text: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_bare_config_name_is_backed_up_in_the_working_directory() {
+        assert_eq!(backup_dir(Path::new("bot.conf.toml")), Path::new("."));
+        assert_eq!(
+            backup_dir(Path::new("/var/lib/kovi/runtime/bot.conf.override.toml")),
+            Path::new("/var/lib/kovi/runtime")
+        );
+    }
+
+    #[test]
+    fn backups_are_listed_from_the_target_directory_not_the_working_directory() {
+        // 生产上 CWD 是只读的发布目录，覆盖配置的备份在运行时可写目录里，
+        // 两者不是同一个目录——所以定位必须跟着目标文件走。
+        let dir = std::env::temp_dir().join(format!("kovi-config-backups-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("应能建临时目录");
+        let target = dir.join("bot.conf.override.toml");
+        fs::write(&target, "enabled = true\n").expect("应能写目标文件");
+        let older = dir.join("bot.conf.override.toml.bak.1000");
+        let newer = dir.join("bot.conf.override.toml.bak.2000");
+        fs::write(&older, "old\n").expect("应能写备份");
+        fs::write(&newer, "new\n").expect("应能写备份");
+        // 同目录里别的文件的备份不能被算进来（前缀必须连文件名一起匹配）。
+        fs::write(dir.join("bot.conf.toml.bak.3000"), "other\n").expect("应能写备份");
+
+        assert_eq!(
+            backups_of(&target),
+            vec![older, newer],
+            "应按时间从旧到新，且只列自己的备份"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn backup_names_resolve_inside_the_target_directory_and_reject_traversal() {
+        let dir = std::env::temp_dir().join(format!("kovi-config-restore-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("应能建临时目录");
+        let name = "bot.conf.override.toml.bak.1789323903611";
+        fs::write(dir.join(name), "raw\n").expect("应能写备份");
+
+        assert_eq!(
+            resolve_backup_in(&dir, name).expect("同目录的备份应当解析得到"),
+            dir.join(name)
+        );
+        for rejected in [
+            "",
+            "../bot.conf.override.toml",
+            "sub/dir.bak.1",
+            "a\\b",
+            ".",
+        ] {
+            assert!(
+                resolve_backup_in(&dir, rejected).is_err(),
+                "{rejected:?} 不该被接受"
+            );
+        }
+        assert!(
+            resolve_backup_in(&dir, "bot.conf.override.toml.bak.404").is_err(),
+            "不存在的备份应当报错"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn scalar_changes_are_applied_without_touching_comments() {
