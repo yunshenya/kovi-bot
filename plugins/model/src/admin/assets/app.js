@@ -2291,6 +2291,20 @@
     if (payload.relation) {
       body.append(h('h4', { text: '关系' }), bars(payload.relation));
     }
+    if (payload.relation_notes && payload.relation_notes.length) {
+      // 她在独处反思时写下的相处结论。只读展示：它不参与"回不回"的判定，
+      // 那个由关系张力（上面的"关系"）决定。
+      body.append(h('h4', { text: `相处结论（${payload.relation_notes.length}）` }),
+        h('div', { class: 'hint', text: '模型在反思时记下的观察，仅供参考；门控用的是关系张力。' }));
+      const notes = h('div', { class: 'record-list' });
+      for (const note of payload.relation_notes) {
+        notes.append(h('div', { class: 'record' },
+          h('div', { class: 'record-title', text: note.target || '（未具名）' }),
+          h('div', { class: 'record-body', text: note.note }),
+          h('div', { class: 'ids', text: `${note.observed_at || ''}　置信 ${(Number(note.confidence_milli || 0) / 100).toFixed(2)}` })));
+      }
+      body.append(notes);
+    }
     if (payload.affect) {
       const affect = payload.affect;
       body.append(h('h4', { text: '情绪' }),

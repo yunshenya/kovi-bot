@@ -16,6 +16,7 @@
 use super::ApiError;
 use axum::Json;
 use axum::extract::{Path as UrlPath, Query};
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use sqlx_core::query::query;
@@ -826,6 +827,37 @@ pub(crate) async fn person(UrlPath(id): UrlPath<String>) -> Result<Json<Value>, 
     )
     .await;
 
+    // 相处结论：模型在独处反思时写下的"这个人怎么对我"，与记忆一样按 person
+    // 作用域存（`yunxi_relation_notes.scope_key = person:<uuid>`）。这里是只读
+    // 展示——它**不参与**"回不回"的判定（判定用关系张力），后台看到的是她记下
+    // 的可读结论，不是门控输入。
+    let relation_notes = match query(
+        "SELECT target_label, note, confidence_milli, observed_at \
+         FROM yunxi_relation_notes WHERE scope_key = $1 \
+         ORDER BY observed_at DESC, target_key ASC LIMIT 32",
+    )
+    .bind(format!("person:{person_id}"))
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => rows
+            .iter()
+            .map(|row| {
+                json!({
+                    "target": row.try_get::<String, _>("target_label").unwrap_or_default(),
+                    "note": row.try_get::<String, _>("note").unwrap_or_default(),
+                    "confidence_milli": row.try_get::<i32, _>("confidence_milli").unwrap_or(0),
+                    "observed_at": row
+                        .try_get::<DateTime<Utc>, _>("observed_at")
+                        .map(|value| value.to_rfc3339())
+                        .unwrap_or_default(),
+                })
+            })
+            .collect(),
+        // 表还没建（老库未初始化到这一版）时不该让整个人物页失败。
+        Err(_) => Vec::new(),
+    };
+
     let mut records = Vec::new();
     let existing = existing_tables(pool).await?;
     for kind in KINDS {
@@ -902,6 +934,7 @@ pub(crate) async fn person(UrlPath(id): UrlPath<String>) -> Result<Json<Value>, 
         "id": person_id.to_string(),
         "identities": identities,
         "relation": relation,
+        "relation_notes": relation_notes,
         "affect": affect,
         "self_model": self_model,
         "records": records,
