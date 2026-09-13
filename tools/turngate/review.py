@@ -61,6 +61,20 @@ def speaker_label(turn: dict) -> str:
     return ROLE_LABELS.get(role, str(role))
 
 
+def current_speaker_suffix(sample: dict) -> str:
+    """当前发言者的显示后缀（`[群友A]`），与网页端 `annotationCurrentLabel` 同一条规则。
+
+    编号对当前发言者本身永远成立，问题出在上下文：老批次的回合编不出号，只能写
+    "同一人/他人"，这时正文再挂一个"群友A"，同一个人就有了两个名字（正文是
+    "群友A"、他自己那条上下文是"同一人"），看着像两个人。所以只有当**上下文里的
+    编号是齐的、或者压根没有上下文**时才写。
+    """
+    turns = sample.get("context", {}).get("recent_turns") or []
+    if not turns:
+        return f"[{SPEAKER_LABEL}A]"
+    return f"[{SPEAKER_LABEL}A]" if any(t.get("speaker") for t in turns) else ""
+
+
 def load(path: Path):
     with open(path, encoding="utf-8") as fh:
         return [json.loads(line) for line in fh if line.strip()]
@@ -170,12 +184,13 @@ def render_sample(idx: int, sample: dict) -> str:
     """单条样本的完整复核视图（正文 + 上下文 + 弱标签）。"""
     ctx = sample.get("context", {})
     lines = [f"#{idx}  reason={queue_reason(sample)}  scope={ctx.get('scope')}"]
-    lines.append(f"  current_text[{SPEAKER_LABEL}A]: {sample.get('current_text', '')}")
+    suffix = current_speaker_suffix(sample)
+    lines.append(f"  current_text{suffix}: {sample.get('current_text', '')}")
     fragments = ctx.get("pending_user_fragments") or []
     if fragments:
         # 片段与正文同属一次发言（collector 按"同群同发送者间隔 ≤3s"切分），
-        # 所以它们必然是同一个群友——不需要各自带编号。
-        lines.append(f"  pending_fragments({len(fragments)})[{SPEAKER_LABEL}A]: {fragments}")
+        # 所以它们必然是同一个群友——共用正文那个后缀，不必各自带编号。
+        lines.append(f"  pending_fragments({len(fragments)}){suffix}: {fragments}")
     for turn in ctx.get("recent_turns", []):
         lines.append(f"  [{speaker_label(turn)}] {turn.get('text')}")
     flags = [
@@ -205,10 +220,11 @@ def render_brief(idx: int, sample: dict, last_turns: int = 3) -> str:
     ctx = sample.get("context", {})
     head = f"#{idx} [{queue_reason(sample)}]"
     parts = [head]
+    suffix = current_speaker_suffix(sample)
     fragments = ctx.get("pending_user_fragments") or []
     if fragments:
-        parts.append(f"  前一句[{SPEAKER_LABEL}A]: {' | '.join(str(f) for f in fragments)}")
-    parts.append(f"  当前句[{SPEAKER_LABEL}A]: {sample.get('current_text', '')}")
+        parts.append(f"  前一句{suffix}: {' | '.join(str(f) for f in fragments)}")
+    parts.append(f"  当前句{suffix}: {sample.get('current_text', '')}")
     for turn in ctx.get("recent_turns", [])[-last_turns:]:
         parts.append(f"    {speaker_label(turn)}: {turn.get('text')}")
     return "\n".join(parts)

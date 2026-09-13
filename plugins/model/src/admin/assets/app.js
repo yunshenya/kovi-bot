@@ -2317,6 +2317,20 @@
       .some((turn) => turn && turn.speaker);
   }
 
+  /**
+   * 正文框（以及同属一次发言的"前一句"）该不该写"群友A"。
+   *
+   * 编号对当前发言者本身永远成立，问题出在上下文：老批次的回合编不出号，只能写
+   * "同一人/他人"，这时正文框再挂一个"群友A"，同一个人就有了两个名字（正文框是
+   * "群友A"、他自己那条上下文是"同一人"），看着像两个人。所以只有当**上下文里的
+   * 编号是齐的、或者压根没有上下文**时才写这个标签——没有上下文就没有东西跟它打架。
+   */
+  function annotationCurrentLabel(sample) {
+    const turns = (sample && sample.context && sample.context.recent_turns) || [];
+    if (!turns.length) return `${SPEAKER_LABEL}A`;
+    return annotationHasSpeakers(sample) ? `${SPEAKER_LABEL}A` : '';
+  }
+
   /** 老批次里"他人"的悬停说明：不是没显示，是当时根本没记。 */
   const SPEAKER_UNRECORDED = '这批采于群友编号之前，只能标出"其他人"，看不出是几个';
 
@@ -2701,14 +2715,17 @@
     const labels = sample.labels || {};
     const provenance = sample.label_provenance || {};
 
+    // 当前发言者的标签：老批次上下文编不出号时整条样本都不写成员名，
+    // 免得同一个人出现"群友A"和"同一人"两个名字（见 annotationCurrentLabel）。
+    const currentLabel = annotationCurrentLabel(sample);
     const body = h('div', { class: 'annotate-body' });
     for (const fragment of context.pending_user_fragments || []) {
       // 片段与正文同属一次发言（collector 按"同群同发送者间隔 ≤3s"切分），
-      // 所以它们必然是当前发言者——编号固定是 A，不必各带一个字段。
+      // 所以它们必然是当前发言者——与正文框共用一个标签，不必各自带字段。
       body.append(h('div', { class: 'annotate-turn' },
-        h('span', { class: 'annotate-role user', text: `${SPEAKER_LABEL}A` }),
+        h('span', { class: 'annotate-role user', text: currentLabel || '前一句' }),
         h('span', { class: 'annotate-text' },
-          h('span', { class: 'annotate-tag', text: '前一句' }),
+          currentLabel ? h('span', { class: 'annotate-tag', text: '前一句' }) : null,
           String(fragment))));
     }
     for (const turn of context.recent_turns || []) {
@@ -2741,7 +2758,7 @@
           '这批采于"@ 判定"修复之前：@ 别人也曾被记成在叫她。这条默认不进队列，标它等于把旧判定确认一遍。')
         : null,
       h('div', { class: 'annotate-current' },
-        h('span', { class: 'annotate-role user', text: `${SPEAKER_LABEL}A` }),
+        currentLabel ? h('span', { class: 'annotate-role user', text: currentLabel }) : null,
         h('span', {
           class: 'annotate-current-text',
           text: String(sample.current_text == null ? '' : sample.current_text),
