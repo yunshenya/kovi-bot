@@ -303,11 +303,28 @@ pub fn apply_interaction_cues(
     Ok(InteractionStateEvolution { affect, relation })
 }
 
+/// A person must be at least this negative, this confidently, before their
+/// sentiment is allowed to move a durable relationship dimension.
+///
+/// The bar is deliberate, not a tuning convenience: without it, ordinary
+/// grumbling ("今天好烦" / "累死了") accumulates. Measured against the silence
+/// threshold, medium-strength complaints reach it in 13 messages — a bad day
+/// would start gating her replies, and complaining about life is not hostility
+/// toward her.
+const NEGATIVE_VALENCE_CEILING: f32 = -0.5;
+const NEGATIVE_CONFIDENCE_FLOOR: f32 = 0.8;
+
 /// How strongly these cues read as "this person is being hostile right now",
-/// in `[0, 1]`. Confidence gates it: an unsure classifier must not move a
-/// durable relationship dimension.
+/// in `[0, 1]`.
+///
+/// Two gates, both required: the sentiment must be clearly negative and the
+/// classifier must be sure. Anything milder still moves the transient mood
+/// (which decays in hours) but never the relationship.
 fn negative_valence_strength(cues: &InteractionCues) -> f32 {
-    if cues.sentiment_valence >= 0.0 {
+    if cues.sentiment_valence >= NEGATIVE_VALENCE_CEILING {
+        return 0.0;
+    }
+    if cues.sentiment_confidence < NEGATIVE_CONFIDENCE_FLOOR {
         return 0.0;
     }
     (cues.sentiment_valence.abs() * cues.sentiment_confidence.clamp(0.0, 1.0)).clamp(0.0, 1.0)
@@ -1349,6 +1366,34 @@ mod tests {
             .relation
             .validate()
             .expect("relation stays bounded");
+    }
+
+    #[test]
+    fn ordinary_grumbling_never_reaches_the_relationship() {
+        let person_id = PersonId::new();
+        let message = interaction_message(person_id, ConversationKind::Direct, "hello");
+        let affect = AffectState::default();
+        // 真实的日常抱怨：负面但不够明确，分类器也没那么有把握。
+        let grumbling = InteractionCues {
+            sentiment_valence: -0.45,
+            sentiment_arousal: 0.3,
+            sentiment_confidence: 0.7,
+            gratitude_strength: 0.0,
+        };
+        let mut relation = RelationState::new(person_id);
+        for _ in 0..30 {
+            relation =
+                evolve_interaction_state_with_cues(&message, Some(relation), affect, grumbling)
+                    .expect("bounded cues")
+                    .relation;
+        }
+        // 抱怨生活不该动摇关系；否则"今天好烦"说十几遍就能让她闭嘴。
+        assert_eq!(
+            relation.tension, 0.0,
+            "日常抱怨不得累积成静默证据：{}",
+            relation.tension
+        );
+        relation.validate().expect("relation stays bounded");
     }
 
     #[test]

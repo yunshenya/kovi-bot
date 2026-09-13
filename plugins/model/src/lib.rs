@@ -50,6 +50,8 @@ mod agent_runs;
 mod agent_tasks;
 // 核心模型处理模块
 mod group_access;
+// 群级降温信号（只降未点名插话频率，默认影子）
+mod group_cooling;
 mod image_security;
 mod model;
 mod private_image_memory;

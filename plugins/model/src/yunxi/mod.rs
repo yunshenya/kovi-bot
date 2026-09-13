@@ -8,6 +8,7 @@ pub(crate) mod events;
 mod executive_store;
 pub(crate) mod gag_store;
 mod goal_store;
+mod group_cooling_store;
 mod identity_store;
 pub(crate) mod intrinsic_runtime;
 pub(crate) mod memory_migration;
@@ -20,6 +21,7 @@ mod open_loop_store;
 mod owner_lock;
 pub(crate) mod proactive;
 pub(crate) mod qq;
+mod relation_note_store;
 mod relation_store;
 mod schema;
 pub(crate) mod turn_gate_runtime; // TurnGate completion host runtime (Phase 2)
@@ -33,6 +35,7 @@ use delivery_ledger::PostgresDeliveryLedger;
 use executive_store::PostgresExecutiveStore;
 use gag_store::PostgresGagStore;
 use goal_store::PostgresGoalStore;
+use group_cooling_store::PostgresGroupCoolingStore;
 use identity_store::PostgresIdentityStore;
 use kovi::tokio::sync::{Mutex as AsyncMutex, Notify, RwLock as AsyncRwLock, RwLockReadGuard};
 use memory_store::PostgresMemoryStore;
@@ -43,6 +46,7 @@ use mind_runtime::{
 pub(crate) use mind_runtime::{MindProactiveReference, MindProactiveSignals};
 use mind_store::PostgresMindStore;
 use open_loop_store::PostgresOpenLoopStore;
+use relation_note_store::PostgresRelationNoteStore;
 use relation_store::PostgresRelationStore;
 use std::sync::{
     Arc, OnceLock, RwLock,
@@ -66,8 +70,13 @@ static OPEN_LOOP_STORE: OnceLock<Arc<PostgresOpenLoopStore>> = OnceLock::new();
 static MEMORY_STORE: OnceLock<Arc<PostgresMemoryStore>> = OnceLock::new();
 static AFFECT_STORE: OnceLock<Arc<PostgresAffectStore>> = OnceLock::new();
 static RELATION_STORE: OnceLock<Arc<PostgresRelationStore>> = OnceLock::new();
+/// 相处结论（"她观察到这个人怎么对她"）的存储：可读记录，**不参与门控**。
+static RELATION_NOTE_STORE: OnceLock<Arc<PostgresRelationNoteStore>> = OnceLock::new();
 static GOAL_STORE: OnceLock<Arc<PostgresGoalStore>> = OnceLock::new();
 static GAG_STORE: OnceLock<Arc<PostgresGagStore>> = OnceLock::new();
+/// 群级降温压力（"这个群还欢迎她主动开口吗"）：只降未点名插话的频率，
+/// 默认只影子观察（`silence.group_cooling_enabled = false`）。
+static GROUP_COOLING_STORE: OnceLock<Arc<PostgresGroupCoolingStore>> = OnceLock::new();
 /// World Model v4 persistence store (None until `world_model.enabled`).
 static WORLD_MODEL_STORE: OnceLock<Arc<world_model_store::PostgresWorldModelStore>> =
     OnceLock::new();
@@ -126,6 +135,8 @@ pub(crate) async fn initialize_database() -> Result<()> {
         && MEMORY_STORE.get().is_some()
         && AFFECT_STORE.get().is_some()
         && RELATION_STORE.get().is_some()
+        && RELATION_NOTE_STORE.get().is_some()
+        && GROUP_COOLING_STORE.get().is_some()
         && GOAL_STORE.get().is_some()
         && DELIVERY_LEDGER.get().is_some()
         && MIND_STORE.get().is_some()
@@ -196,6 +207,18 @@ pub(crate) async fn initialize_database() -> Result<()> {
         let store = Arc::new(PostgresRelationStore::new(pool.clone()));
         store.initialize_schema().await?;
         let _ = RELATION_STORE.set(store);
+    }
+    if RELATION_NOTE_STORE.get().is_none() {
+        let store = Arc::new(PostgresRelationNoteStore::new(pool.clone()));
+        store.initialize_schema().await?;
+        let _ = RELATION_NOTE_STORE.set(store);
+    }
+    // 群级降温：证据照常记账（影子阶段也一样），只有"要不要跳过未点名抽样"
+    // 由 `silence.group_cooling_enabled` 决定。
+    if GROUP_COOLING_STORE.get().is_none() {
+        let store = Arc::new(PostgresGroupCoolingStore::new(pool.clone()));
+        store.initialize_schema().await?;
+        let _ = GROUP_COOLING_STORE.set(store);
     }
     if GOAL_STORE.get().is_none() {
         let store = Arc::new(PostgresGoalStore::new(pool.clone()));
@@ -504,9 +527,26 @@ pub(crate) fn relation_store() -> Option<Arc<PostgresRelationStore>> {
     RELATION_STORE.get().cloned()
 }
 
+/// 相处结论的存储出口。
+///
+/// 与 `relation_store()` 同一套注册方式。没初始化时调用方按"暂时落不了库"处理就
+/// 行——写入是 fail-soft 的，只记日志，绝不拖垮反思（见
+/// `MindRuntime::persist_relation_notes`）。这些记录**不参与硬门控**。
+pub(crate) fn relation_note_store() -> Option<Arc<PostgresRelationNoteStore>> {
+    RELATION_NOTE_STORE.get().cloned()
+}
+
 #[allow(dead_code)]
 pub(crate) fn goal_store() -> Option<Arc<PostgresGoalStore>> {
     GOAL_STORE.get().cloned()
+}
+
+/// 群级降温压力的存储出口。
+///
+/// 与 `relation_store()` 同一套注册方式。没初始化时调用方按"还不知道这个群
+/// 冷不冷"处理——抽样照常放行：这是降频通道，失败方向必须是允许。
+pub(crate) fn group_cooling_store() -> Option<Arc<PostgresGroupCoolingStore>> {
+    GROUP_COOLING_STORE.get().cloned()
 }
 
 pub(crate) fn delivery_ledger() -> Option<Arc<PostgresDeliveryLedger>> {
@@ -1363,7 +1403,63 @@ pub(crate) async fn delete_qq_person_domain_data(self_id: i64, user_id: i64) -> 
         .map_err(anyhow::Error::from);
     let _ = refresh_owner_route_while_locked().await;
     let deleted = deleted?;
+    // 相处结论按"显示名/QQ 的文本"存，不在上面那套外键级联里，必须显式删。
+    // 别名与当前昵称都传进去：模型可能用 QQ 号、旧昵称或群名片写下结论。
+    delete_relation_notes_for_person(user_id, external_identity.external_id()).await;
     Ok(deleted.total())
+}
+
+/// 清掉某个 QQ 用户相关的相处结论（QQ 号原文 + 所有已知称呼）。
+///
+/// 失败只记日志、不阻断擦除主流程：擦除本身已经完成，一条附加清理失败不该
+/// 让用户看到"删除失败"——但必须留下可查的痕迹。
+async fn delete_relation_notes_for_person(user_id: i64, external_identity: &str) {
+    let Some(store) = relation_note_store() else {
+        return;
+    };
+    let nickname = crate::memory::MEMORY_MANAGER
+        .get_user_profile(user_id)
+        .await
+        .map(|profile| profile.nickname);
+    let labels = relation_note_targets(user_id, external_identity, nickname.as_deref());
+    match store.delete_targets(&labels).await {
+        Ok(deleted) if deleted > 0 => {
+            println!("[INFO] 已删除相处结论 {deleted} 条 (用户: {user_id})");
+        }
+        Ok(_) => {}
+        Err(error) => eprintln!("[WARN] 删除相处结论失败 (用户: {user_id}): {error}"),
+    }
+}
+
+/// 按人擦除时要匹配的相处结论对象键来源：QQ 号原文 + 外部身份 + 当前昵称。
+///
+/// 模型可能用其中任意一种写下结论（"2515950976" / "白浅" / 群名片），所以
+/// 三种都要传。空标签会在 store 里被归一化后丢掉，这里不重复判空。
+fn relation_note_targets(
+    user_id: i64,
+    external_identity: &str,
+    nickname: Option<&str>,
+) -> Vec<String> {
+    let mut labels = vec![user_id.to_string(), external_identity.to_string()];
+    if let Some(nickname) = nickname.map(str::trim).filter(|name| !name.is_empty()) {
+        labels.push(nickname.to_string());
+    }
+    labels
+}
+
+/// 解析某个 QQ 群在 Core 里的会话 id（相处结论与群级压力都按会话作用域存）。
+///
+/// 解析失败不算错误：群数据擦除本身已经完成，附加清理拿不到 id 时只记日志。
+async fn conversation_ids_for_group(group_id: i64) -> Option<Vec<uuid::Uuid>> {
+    let store = IDENTITY_STORE.get()?;
+    let external = qq::group(group_id).ok()?;
+    match store.resolve_conversation(&external).await {
+        Ok(conversation_id) => Some(vec![conversation_id.into_uuid()]),
+        Err(error) => {
+            eprintln!("[WARN] 解析群会话 id 失败，相处结论未清理 (群组: {group_id}): {error}");
+            None
+        }
+    }
 }
 
 /// Remove canonical Core group data while pinning in-process delivery routes;
@@ -1373,10 +1469,25 @@ pub(crate) async fn delete_qq_group_domain_data(group_id: i64) -> Result<u64> {
     let store = IDENTITY_STORE
         .get()
         .context("Yunxi identity store 尚未初始化")?;
-    store
+    let deleted = store
         .delete_qq_group_domain_data(group_id)
         .await
-        .map_err(anyhow::Error::from)
+        .map_err(anyhow::Error::from)?;
+    // 群级相处结论按会话作用域存，不在上面那套外键级联里，必须显式删：
+    // 否则同一个群被重建、或群号被复用时会继承上一个群的判断。
+    if let Some(notes) = relation_note_store()
+        && let Some(conversations) = conversation_ids_for_group(group_id).await
+        && !conversations.is_empty()
+    {
+        match notes.delete_conversations(&conversations).await {
+            Ok(deleted) if deleted > 0 => {
+                println!("[INFO] 已删除本群相处结论 {deleted} 条 (群组: {group_id})");
+            }
+            Ok(_) => {}
+            Err(error) => eprintln!("[WARN] 删除本群相处结论失败 (群组: {group_id}): {error}"),
+        }
+    }
+    Ok(deleted)
 }
 
 pub(crate) async fn export_person_json(person_id: uuid::Uuid) -> Result<String> {
@@ -1476,5 +1587,24 @@ mod tests {
         assert!(finish_executive_erasure_state(&mut state, 9, None));
         assert!(state.dirty);
         assert_eq!(state.requested_version, 9);
+    }
+}
+
+#[cfg(test)]
+mod erasure_tests {
+    use super::relation_note_targets;
+
+    #[test]
+    fn person_erasure_covers_every_name_the_model_might_have_used() {
+        let labels = relation_note_targets(2515950976, "2515950976", Some("白浅"));
+        assert!(labels.contains(&"2515950976".to_string()));
+        assert!(labels.contains(&"白浅".to_string()));
+        assert_eq!(labels.len(), 3);
+
+        // 没有昵称时不塞空标签：空串在 store 里会被归一化丢掉，这里也不该出现。
+        let without_nickname = relation_note_targets(42, "42", None);
+        assert_eq!(without_nickname, vec!["42".to_string(), "42".to_string()]);
+        let blank_nickname = relation_note_targets(42, "42", Some("   "));
+        assert_eq!(blank_nickname, vec!["42".to_string(), "42".to_string()]);
     }
 }

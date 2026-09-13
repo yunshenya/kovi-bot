@@ -11,6 +11,10 @@
 //!
 //! 静默是冷却，不是封禁：有 TTL、有衰减、有每群每日上限
 //! （防"一群人轮流测试把她变哑巴"），管理员可随时解除。
+//!
+//! 这一节还带第二个维度：`group_cooling_enabled` 控制群级降温——个人级看的是
+//! "某个人怎么对她"，群级看的是"这个群还欢迎她主动开口吗"。它只降低未点名
+//! 插话的抽样频率，被点名的回合永远不受影响；默认关闭，理由与个人级相同。
 
 use serde::{Deserialize, Serialize};
 
@@ -36,6 +40,14 @@ pub struct SilenceConfig {
     /// 而人是会变的。当前由关系张力的善意降温实现（每次善意按 0.12 的混合率
     /// 往 0 拉），这个值是那条通道的目标条数。
     warm_recovery_count: u32,
+    /// 群级降温开关：整个群长期把她当外人时，降低她在这个群**未点名**插话的
+    /// 频率（命中只放弃这一次抽样机会，不是静默，也不影响任何被点名的回合）。
+    /// 默认 false＝只记账、只打影子日志（`[GROUP_COOLING] shadow=true`）。
+    ///
+    /// 为什么与 `enabled` 分开：个人级门控改的是"不接这个人"，群级改的是
+    /// "在这个群少主动开口"。两者证据不同（关系张力 vs 群气氛）、误伤面也不同，
+    /// 必须能分别打开观察，否则一个开关会把两套判据的线上表现混在一起。
+    group_cooling_enabled: bool,
 }
 
 impl Default for SilenceConfig {
@@ -45,6 +57,7 @@ impl Default for SilenceConfig {
             negative_threshold: 3,
             decay_days: 30,
             warm_recovery_count: 2,
+            group_cooling_enabled: false,
         }
     }
 }
@@ -64,6 +77,11 @@ impl SilenceConfig {
 
     pub fn warm_recovery_count(&self) -> u32 {
         self.warm_recovery_count
+    }
+
+    /// 群级降温是否真正生效。false 时判据照跑，只打影子日志。
+    pub fn group_cooling_enabled(&self) -> bool {
+        self.group_cooling_enabled
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
@@ -89,6 +107,8 @@ mod tests {
         let config = SilenceConfig::default();
         // 默认不改变任何可见行为：这是这套机制能被安全地装上线的唯一前提。
         assert!(!config.enabled());
+        // 群级降温与个人级门控是两个独立开关：默认同样是影子观察。
+        assert!(!config.group_cooling_enabled());
         assert!(config.validate().is_ok());
         // 有界：必须有衰减窗口与回暖通道，否则静默会变成永久冷处理。
         assert!(config.decay_days() > 0);

@@ -1,5 +1,9 @@
 use crate::config;
 use crate::group_access;
+use crate::group_cooling::{
+    AmbientInterjectionWatch, AmbientWatchStep, GroupCoolingVerdict, advance_ambient_watch,
+    group_cooling_evidence, group_cooling_verdict,
+};
 use crate::health_check::HealthChecker;
 use crate::memory::{GroupProfile, MEMORY_MANAGER};
 use crate::model::coalesce::{MessageCoalescer, MessagePart};
@@ -67,6 +71,11 @@ struct GroupInterjectionState {
     last_bot_reply: Option<Instant>,
     /// 本群可见聊天回复的时间记录（有界），用于群级回复节奏硬限制。
     visible_replies: VecDeque<Instant>,
+    /// 她最近一次**未点名插话**之后的观察：群里有没有人接她的话。
+    ///
+    /// 只在她主动插话（抽样路径真的发出可见回复）之后开始，被点名回答别人
+    /// 不开始——那种"之后没人说话"多半只是对话结束了，不是被晾着。
+    ambient_watch: Option<AmbientInterjectionWatch>,
 }
 
 /// 未点名接话只维护本地计数和冷却状态；不会为每一条群消息调用模型。
@@ -631,6 +640,11 @@ pub(crate) async fn group_message_event_after_ingress(
         quoted.as_ref().and_then(|quoted| quoted.sender_id),
     );
     let addressed_to_bot = addressing.directly_addressed();
+    // 群级降温的第二维证据：谁在把这个群变成"外人圈"、她插话后有没有人接。
+    // 与上面那条个人级 `record_target_experience` 分工见 `crate::group_cooling`：
+    // 个人级记某个人对她的张力，群级记这个群的整体气氛；后者只在未点名抽样的
+    // 入口生效，不改任何被点名/被引用的回合。
+    observe_group_cooling(group_id, event.user_id, message, addressed_to_bot).await;
     if addressed_to_bot
         && !locally_addressed
         && should_suppress_direct_trigger(group_id, event.user_id).await
@@ -810,11 +824,17 @@ pub(crate) async fn group_message_event_after_ingress(
         conversation_context,
         sticker_reaction: false,
     };
-    let semantic_required = addressed_to_bot
-        || batch_vision_requested
-        || !images.is_empty()
-        || active_reply
-        || conversation_active;
+    // 未点名抽样的边界就此划定：被 @、被引用、被点名、显式识图，以及正处在
+    // 她自己回合里（`active_reply` / 接续窗口）的消息都不走这条路。群级降温
+    // 装在 `reserve_interjection_decision` 里，因此它碰不到上述任何一种回合。
+    let ambient_sampling_eligible = ambient_sampling_eligible(
+        addressed_to_bot,
+        batch_vision_requested,
+        !images.is_empty(),
+        active_reply,
+        conversation_active,
+    );
+    let semantic_required = !ambient_sampling_eligible;
     let sampled_for_interjection = if semantic_required {
         false
     } else {
@@ -1229,6 +1249,14 @@ async fn delete_group_data(group_id: i64, bot: &RuntimeBot) {
     clear_group_runtime_data(group_id).await;
     clear_reply_targets(scope).await;
     clear_group_pending_image_requests(group_id).await;
+    // 群级降温是"这个群"的派生状态，删除群数据时必须一起清掉：否则换个
+    // 用途重新开始，她还带着上一个群留下的冷场。删不掉只告警——它不该
+    // 拖住真正的数据删除。
+    if let Some(store) = crate::yunxi::group_cooling_store()
+        && let Err(error) = store.delete_group(group_id).await
+    {
+        eprintln!("[WARN] 清除群级降温压力失败 (群组: {group_id}): {error}");
+    }
 
     let core_erasure = match crate::yunxi::begin_qq_group_data_erasure(group_id).await {
         Ok(erasure) => erasure,
@@ -1876,54 +1904,182 @@ async fn take_pending_window_turn(
 }
 
 /// 只用消息长度、计数、额度和概率决定是否值得调用一次语义模型。
+///
+/// 群级降温（[`group_cooling_verdict`]）也在这里生效：未点名抽样是这条通道
+/// 唯一的行为出口，命中时**放弃这一次机会**（下一次要再等一批候选消息），
+/// 所以它降低的是她主动插话的频率，而不是给她一个"不许说话"的状态。
+///
+/// 实现上刻意分成两段：本地判据全在锁内一次做完，需要读数据库的降温判据
+/// 放在锁外——`GROUP_INTERJECTION_STATE` 是所有群路径共用的锁，不能压在
+/// 一次 PG 往返上。两段之间靠先占住 `interjection_in_flight` 保证并发消息
+/// 不会各抽一次。
 async fn reserve_interjection_decision(group_id: i64, message: &str) -> bool {
     let config = config::get().group_interjection().clone();
     if !config.enabled() || !has_interjection_candidate(message, config.min_message_chars()) {
         return false;
     }
 
-    let mut states = GROUP_INTERJECTION_STATE.lock().await;
-    prune_interjection_states(&mut states);
-    let state = states.entry(group_id).or_default();
-    let now = Instant::now();
-    prune_decision_attempts(
-        state,
-        now,
-        Duration::from_secs(config.decision_rate_window_secs()),
-    );
-    if state.interjection_in_flight {
-        return false;
-    }
-    if state
-        .last_interjection
-        .is_some_and(|last| now.duration_since(last) < Duration::from_secs(config.cooldown_secs()))
     {
-        return false;
+        let mut states = GROUP_INTERJECTION_STATE.lock().await;
+        prune_interjection_states(&mut states);
+        let state = states.entry(group_id).or_default();
+        let now = Instant::now();
+        prune_decision_attempts(
+            state,
+            now,
+            Duration::from_secs(config.decision_rate_window_secs()),
+        );
+        if state.interjection_in_flight {
+            return false;
+        }
+        if state.last_interjection.is_some_and(|last| {
+            now.duration_since(last) < Duration::from_secs(config.cooldown_secs())
+        }) {
+            return false;
+        }
+
+        state.eligible_messages_since_sample =
+            state.eligible_messages_since_sample.saturating_add(1);
+        if state.eligible_messages_since_sample < config.min_eligible_messages() {
+            return false;
+        }
+        if !decision_budget_available(
+            state,
+            now,
+            Duration::from_secs(config.decision_cooldown_secs()),
+            config.decision_rate_limit(),
+        ) {
+            // 保留已累计的候选；额度恢复后下一条有效消息即可再次抽样。
+            state.eligible_messages_since_sample = config.min_eligible_messages();
+            return false;
+        }
+        // 每积累一批候选消息才抽样一次；未抽中也重新累计，避免逐条消耗 token。
+        state.eligible_messages_since_sample = 0;
+        // 先占住这一轮尝试：下面要放开锁去读群级压力。
+        state.interjection_in_flight = true;
     }
 
-    state.eligible_messages_since_sample = state.eligible_messages_since_sample.saturating_add(1);
-    if state.eligible_messages_since_sample < config.min_eligible_messages() {
+    if interjection_sampling_vetoed(group_cooling_gate(group_id).await) {
+        finish_interjection_attempt(group_id, false).await;
         return false;
     }
-    if !decision_budget_available(
-        state,
-        now,
-        Duration::from_secs(config.decision_cooldown_secs()),
-        config.decision_rate_limit(),
-    ) {
-        // 保留已累计的候选；额度恢复后下一条有效消息即可再次抽样。
-        state.eligible_messages_since_sample = config.min_eligible_messages();
-        return false;
-    }
-    // 每积累一批候选消息才抽样一次；未抽中也重新累计，避免逐条消耗 token。
-    state.eligible_messages_since_sample = 0;
     if !rand::rng().random_ratio(config.response_probability_percent().into(), 100) {
+        finish_interjection_attempt(group_id, false).await;
         return false;
     }
 
-    state.interjection_in_flight = true;
-    state.decision_attempts.push_back(now);
+    let mut states = GROUP_INTERJECTION_STATE.lock().await;
+    let state = states.entry(group_id).or_default();
+    state.decision_attempts.push_back(Instant::now());
     true
+}
+
+/// 群降温命中时放弃这一次抽样机会——概率上本来会抽中也一样放弃。
+///
+/// 单独成函数是为了让"判定 → 处理"这条链在测试里能一眼看到：`Skip` 只可能
+/// 来自 [`group_cooling_verdict`]，而它只在开关打开且压力过线时返回 `Skip`。
+fn interjection_sampling_vetoed(cooling: GroupCoolingVerdict) -> bool {
+    matches!(cooling, GroupCoolingVerdict::Skip { .. })
+}
+
+/// 群级降温判据的入口：取配置与压力（可能读一次 PG），交给纯判据。
+///
+/// 读不到压力（存储未初始化、或数据库抖动）时往下传 `None`——这是降频通道，
+/// 失败方向必须是"照常说话"，绝不能因为一次读失败让她沉默。
+async fn group_cooling_gate(group_id: i64) -> GroupCoolingVerdict {
+    let enabled = config::get().silence().group_cooling_enabled();
+    let Some(store) = crate::yunxi::group_cooling_store() else {
+        return cooling_gate_verdict(group_id, None, enabled);
+    };
+    let pressure = match store.load(group_id).await {
+        Ok(Some(state)) => Some(state.pressure),
+        Ok(None) => Some(0.0),
+        Err(error) => {
+            eprintln!("[WARN] 读取群级降温压力失败 (群组: {group_id}): {error}");
+            None
+        }
+    };
+    cooling_gate_verdict(group_id, pressure, enabled)
+}
+
+/// 群级降温判据的判定与影子日志：返回 `Allow` 才会继续后面的概率抽样。
+///
+/// 三条边界都在这里：
+/// 1. 读不到压力（`None`）一律放行。
+/// 2. 开关关闭时只打影子日志（`shadow=true` 写明"如果打开，这一次会被跳过"），
+///    结论仍是 `Allow`，可见行为与现在完全一致。
+/// 3. 压力只在过线时打日志：低于阈值是常态，逐条打印会把日志淹掉。
+fn cooling_gate_verdict(
+    group_id: i64,
+    pressure: Option<f32>,
+    enabled: bool,
+) -> GroupCoolingVerdict {
+    let Some(pressure) = pressure else {
+        return GroupCoolingVerdict::Allow;
+    };
+    let GroupCoolingVerdict::Skip { reason } = group_cooling_verdict(pressure, enabled) else {
+        return GroupCoolingVerdict::Allow;
+    };
+    println!(
+        "[GROUP_COOLING] shadow={} group={group_id} pressure={pressure:.3} reason={reason}",
+        !enabled
+    );
+    GroupCoolingVerdict::Skip { reason }
+}
+
+/// 把一条群消息记成群级降温证据，并推进"她插话后有没有人接"的观察。
+///
+/// 记账与生效是分开的：开关关闭时证据照记（影子阶段要能看到"如果打开会怎样"），
+/// 只有 `group_cooling_gate` 会真的跳过抽样。
+///
+/// 为什么把两件事放在一起：它们是同一条消息的两种读法——"这条消息本身是不是
+/// 在赶她"和"这条消息有没有接她的话"——共用同一个 `addressed_to_bot` 判定，
+/// 拆成两个函数只会让调用点重复判断一次。
+async fn observe_group_cooling(group_id: i64, user_id: i64, message: &str, directed_to_her: bool) {
+    let watch_step = advance_ambient_interjection_watch(group_id, directed_to_her).await;
+    let Some(signal) = group_cooling_evidence(message, directed_to_her, watch_step) else {
+        return;
+    };
+    let Some(store) = crate::yunxi::group_cooling_store() else {
+        return;
+    };
+    match store.nudge(group_id, signal, Some(user_id)).await {
+        Ok(Some(state)) => println!(
+            "[GROUP_COOLING] 群级证据已记账 group={group_id} signal={} user={user_id} pressure={:.3}",
+            signal.label(),
+            state.pressure
+        ),
+        Ok(None) => {}
+        Err(error) => eprintln!("[WARN] 写入群级降温证据失败 (群组: {group_id}): {error}"),
+    }
+}
+
+/// 推进本群的"无人应答"观察（纯内存，不打日志）。
+async fn advance_ambient_interjection_watch(
+    group_id: i64,
+    directed_to_her: bool,
+) -> AmbientWatchStep {
+    let mut states = GROUP_INTERJECTION_STATE.lock().await;
+    let Some(state) = states.get_mut(&group_id) else {
+        return AmbientWatchStep::Idle;
+    };
+    advance_ambient_watch(&mut state.ambient_watch, directed_to_her, Instant::now())
+}
+
+/// 未点名回合的边界：只有这些条件全不成立时，消息才会进入"未点名抽样"。
+///
+/// 群级降温、接话抽样、插话预算都只作用在这条路上。被 `@`、被引用、被点名
+/// （`addressed_to_bot`）、显式识图，以及正处在她自己回合里的消息都在另一侧
+/// ——那是"直接问她"或"接着刚才的话说"，任何"这个群冷不冷"的信号在那里
+/// 都没有发言权。
+fn ambient_sampling_eligible(
+    addressed_to_bot: bool,
+    vision_requested: bool,
+    carries_images: bool,
+    active_reply: bool,
+    conversation_active: bool,
+) -> bool {
+    !(addressed_to_bot || vision_requested || carries_images || active_reply || conversation_active)
 }
 
 /// 表情回应只针对指向芸汐的已点名消息（在 addressing 判定后的主回复路径中
@@ -1976,6 +2132,10 @@ fn complete_interjection_attempt(
     state.interjection_in_flight = false;
     if replied {
         state.last_interjection = Some(completed_at);
+        // 真正发出了一条未点名插话：从这里开始观察"群里有没有人接她的话"。
+        // 只有抽样插话会走到这里；被点名回答别人的回合不开始观察——那种
+        // "之后没人说话"多半只是对话结束了，记成"被晾着"会冤枉整个群。
+        state.ambient_watch = Some(AmbientInterjectionWatch::started_at(completed_at));
     }
 }
 
@@ -2004,6 +2164,8 @@ fn prune_interjection_states(states: &mut HashMap<i64, GroupInterjectionState>) 
             || state.conversation.is_active()
             || !state.decision_attempts.is_empty()
             || !state.visible_replies.is_empty()
+            // 观察中的群不能被回收：丢了它，这一次"无人应答"就再也不会记账。
+            || state.ambient_watch.is_some()
             || state
                 .last_interjection
                 .is_some_and(|last| now.duration_since(last) < cooldown)
@@ -2068,11 +2230,15 @@ async fn record_target_experience(user_id: i64, message: &str, addressed: bool) 
 
 /// 把一条指向她的消息折算成关系张力的调整量。
 ///
-/// 字面证据的力度刻意小于"模型明确判定敌意"（后者最高可到 0.2 的混合率）：
-/// 字面命中更容易误判（玩笑式互怼、转述别人的话），所以单次只给 0.08/0.05。
+/// 字面证据的力度小于"模型明确判定敌意"（后者最高 0.2 的混合率）：字面命中更
+/// 容易误判（玩笑式互怼、转述别人的话），所以单次只给 0.15/0.05。
+///
+/// 0.15 这个量级是量出来的：张力每次按 `(1 - tension)` 的 0.2 倍往 1.0 拉，
+/// 0.15 需要约 22 条**指向她的**辱骂才越过静默阈值；0.08 要 57 条，等于字面
+/// 通道形同虚设——那样她就只能靠模型情绪分类兜底，而那是会看错的那条路。
 fn target_experience_strength(message: &str) -> Option<f32> {
     match crate::silence_signal::target_experience(message) {
-        crate::silence_signal::TargetExperience::Unfriendly => Some(0.08),
+        crate::silence_signal::TargetExperience::Unfriendly => Some(0.15),
         crate::silence_signal::TargetExperience::Warm => Some(-0.05),
         crate::silence_signal::TargetExperience::Neutral => None,
     }
@@ -2156,14 +2322,18 @@ async fn update_group_profile(group_id: i64, user_id: i64, understanding: &Messa
 mod tests {
     use super::{
         Addressing, DirectTriggerState, GroupInterjectionState, GroupSenderIdentity,
-        PENDING_WINDOW_MESSAGES, admit_understood_group_turn,
+        PENDING_WINDOW_MESSAGES, admit_understood_group_turn, ambient_sampling_eligible,
         clear_group_erasure_reply_state_locked, complete_interjection_attempt,
-        continuation_window_secs, conversation_active_for_observation, decision_budget_available,
-        directed_at_others, group_erasure_receipt_destination, group_pause_acknowledgement,
-        group_pause_command, message_at_self, normalized_sender_name, prune_decision_attempts,
-        queue_pending_window_message, reserve_visible_reply_slot, should_queue_after_executive,
-        suppress_direct_trigger, take_pending_window_turn, text_mentions_bot,
-        with_structured_bot_mention_context,
+        continuation_window_secs, conversation_active_for_observation, cooling_gate_verdict,
+        decision_budget_available, directed_at_others, group_cooling_gate,
+        group_erasure_receipt_destination, group_pause_acknowledgement, group_pause_command,
+        interjection_sampling_vetoed, message_at_self, normalized_sender_name,
+        prune_decision_attempts, queue_pending_window_message, reserve_visible_reply_slot,
+        should_queue_after_executive, suppress_direct_trigger, take_pending_window_turn,
+        text_mentions_bot, with_structured_bot_mention_context,
+    };
+    use crate::group_cooling::{
+        GROUP_COOLING_SKIP_THRESHOLD, GroupCoolingVerdict, group_cooling_verdict,
     };
     use crate::model::MessageDestination;
     use crate::model::conversation_coordinator::{
@@ -2549,11 +2719,97 @@ mod tests {
         complete_interjection_attempt(&mut state, false, now);
         assert!(!state.interjection_in_flight);
         assert!(state.last_interjection.is_none());
+        // 没真的发出可见回复就不算插话：不开始观察，免得把"她其实没说话"
+        // 之后的安静记成"没人搭理她"。
+        assert!(state.ambient_watch.is_none());
 
         state.interjection_in_flight = true;
         complete_interjection_attempt(&mut state, true, now);
         assert!(!state.interjection_in_flight);
         assert_eq!(state.last_interjection, Some(now));
+        // 真正发出可见插话之后才开始"有没有人接她的话"的观察。
+        assert!(state.ambient_watch.is_some());
+    }
+
+    #[test]
+    fn ambient_sampling_excludes_every_directed_turn() {
+        // 只有"完全没人点她、也没在接她的话"的消息才进未点名抽样。
+        assert!(ambient_sampling_eligible(false, false, false, false, false));
+        // 被 @、被引用、被点名：直接问她的回合，群级降温与抽样都碰不到。
+        assert!(!ambient_sampling_eligible(true, false, false, false, false));
+        // 显式识图、带图消息、正在处理的回合、以及接续窗口内的消息同理。
+        assert!(!ambient_sampling_eligible(false, true, false, false, false));
+        assert!(!ambient_sampling_eligible(false, false, true, false, false));
+        assert!(!ambient_sampling_eligible(false, false, false, true, false));
+        assert!(!ambient_sampling_eligible(false, false, false, false, true));
+    }
+
+    #[test]
+    fn group_cooling_vetoes_the_ambient_sampling_chance() {
+        let over_threshold = GROUP_COOLING_SKIP_THRESHOLD + 0.05;
+        // 开关打开 + 压力过线：这一次未点名抽样机会作废（降频，不是静默：
+        // 下一次机会只是要再等一批候选消息，压力衰减后照常）。
+        assert!(interjection_sampling_vetoed(group_cooling_verdict(
+            over_threshold,
+            true
+        )));
+        // 默认关闭：判据照跑（上面那个结论就是它算出来的），但行为与现在
+        // 完全一致——抽样机会一个不少。
+        assert!(!interjection_sampling_vetoed(group_cooling_verdict(
+            over_threshold,
+            false
+        )));
+        // 压力没到线：照常抽样。
+        assert!(!interjection_sampling_vetoed(group_cooling_verdict(
+            over_threshold - 0.2,
+            true
+        )));
+        assert_eq!(
+            group_cooling_verdict(over_threshold, true),
+            GroupCoolingVerdict::Skip {
+                reason: "group_pressure"
+            }
+        );
+    }
+
+    #[test]
+    fn group_cooling_gate_fails_open_and_stays_shadow_by_default() {
+        let over_threshold = GROUP_COOLING_SKIP_THRESHOLD + 0.05;
+        // 压力过线 + 开关打开：判据真的跳过这一次抽样。
+        assert_eq!(
+            cooling_gate_verdict(9_200_777, Some(over_threshold), true),
+            GroupCoolingVerdict::Skip {
+                reason: "group_pressure"
+            }
+        );
+        // 默认关闭：结论仍是 Allow —— 判据照跑（日志照打），行为与现在完全一致。
+        assert_eq!(
+            cooling_gate_verdict(9_200_777, Some(over_threshold), false),
+            GroupCoolingVerdict::Allow
+        );
+        // 压力没到线：照常抽样。
+        assert_eq!(
+            cooling_gate_verdict(9_200_777, Some(0.1), true),
+            GroupCoolingVerdict::Allow
+        );
+        // 读不到压力：绝不因为一次读失败让她沉默。
+        assert_eq!(
+            cooling_gate_verdict(9_200_777, None, true),
+            GroupCoolingVerdict::Allow
+        );
+    }
+
+    #[test]
+    fn group_cooling_gate_without_a_store_does_not_read_a_pressure() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                // 单元测试里没有初始化 Postgres：这条路必须按"照常抽样"处理。
+                assert_eq!(
+                    group_cooling_gate(9_200_777).await,
+                    GroupCoolingVerdict::Allow
+                );
+            });
     }
 
     #[test]

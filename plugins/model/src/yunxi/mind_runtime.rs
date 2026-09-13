@@ -1,3 +1,4 @@
+use super::relation_note_store::{RelationNoteDraft, RelationNoteSink};
 use crate::config::MindConfig;
 use chrono::{DateTime, Duration, Utc};
 use kovi::tokio::sync::{Mutex as AsyncMutex, RwLock, RwLockReadGuard};
@@ -33,7 +34,10 @@ const MAX_STANCE_PROPOSALS: usize = 3;
 /// 一条立场最多挂几条经历作为根据。
 const MAX_STANCE_EVIDENCE: usize = 3;
 /// 立场形成的输出上限（一句话级别的 JSON）。
-const STANCE_MAX_TOKENS: u32 = 320;
+///
+/// 协议里现在有两种候选（立场 + 相处结论），输出上限跟着抬：截断的数组连 `]` 都没有，
+/// 会**整批**解析失败——为省几百 token 赌上整条管道不值。
+const STANCE_MAX_TOKENS: u32 = 480;
 /// 重复判定的**预筛**门槛：词汇重合度到这个程度才值得细看。
 ///
 /// 这只是预筛，不是判决——词面相似度决定不了"是不是同一个看法"。实测：
@@ -61,6 +65,14 @@ const MIN_STANCE_EVENTS: usize = 3;
 const STANCE_FORMATION_COOLDOWN_MS: i64 = 6 * 60 * 60 * 1000;
 /// 立场形成的模型调用上限：它是后台过程，绝不能拖住别的东西。
 const STANCE_MODEL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25);
+/// 一次形成里最多几条"相处结论"。
+///
+/// 与 [`MAX_STANCE_PROPOSALS`] **分开计数**：立场与相处结论是两个出口，让 3 条立场
+/// 把名额占满就把相处结论挤没了——那正是这条管道以前"接通了却一行都没有"的老毛病。
+/// 条数少是因为它按人覆盖（见 `relation_note_store`），一次形成里两句话足够。
+const MAX_RELATION_NOTE_PROPOSALS: usize = 2;
+/// 相处结论落库的上限：它是后台记录，库慢了也不该让反思卡在模型调用的余温里。
+const RELATION_NOTE_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 const MAX_EPISODE_SOURCE_EVENTS: usize = 16;
 const CURIOSITY_TTL_DAYS: i64 = 30;
 const MAX_OUTGOING_FENCES: usize = 512;
@@ -478,6 +490,10 @@ pub(crate) struct MindRuntime {
     /// 上次让她"想自己的想法"的时间。跨作用域共享：立场是 Global 的，
     /// 三个会话同时反思也只该形成一次，否则就是三次模型调用换同一件事。
     last_stance_formation_unix_ms: AtomicI64,
+    /// 相处结论的落库出口。生产留 `None`：写之前现取进程级 store（与
+    /// `RELATION_STORE` 同一套 bootstrap）。测试注入替身，好验"落库失败不影响
+    /// 同一批立场候选"这条分支。
+    relation_note_sink: Option<Arc<dyn RelationNoteSink>>,
     reasons: Mutex<MindReasonSnapshot>,
     reflection_worker: AsyncMutex<()>,
     metrics: MindMetrics,
@@ -499,6 +515,7 @@ impl MindRuntime {
             recent_events: Mutex::new(RecentEvents::default()),
             last_reflections: Mutex::new(HashMap::new()),
             last_stance_formation_unix_ms: AtomicI64::new(0),
+            relation_note_sink: None,
             reasons: Mutex::new(MindReasonSnapshot::default()),
             reflection_worker: AsyncMutex::new(()),
             metrics: MindMetrics::default(),
@@ -508,6 +525,17 @@ impl MindRuntime {
     #[must_use]
     pub(crate) fn with_context_services(mut self, services: MindContextServices) -> Self {
         self.context_services = Some(services);
+        self
+    }
+
+    /// 只给测试用的注入点：换掉相处结论的落库出口。
+    ///
+    /// 生产路径不设它——真库由 `crate::yunxi::relation_note_store()` 提供，
+    /// 这样运行时不用在构造期绑定数据库（测试可以直接跑）。
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_relation_note_sink(mut self, sink: Arc<dyn RelationNoteSink>) -> Self {
+        self.relation_note_sink = Some(sink);
         self
     }
 
@@ -2375,6 +2403,14 @@ impl MindRuntime {
             now,
             &duplicates,
         );
+        // 相处结论与立场**同一个模型调用**产出，共用同一份冷却与超时：这里不再调模型。
+        // 先于 belief 的两个提前返回落库——"这批判立场全被丢弃"不等于"相处结论也该丢"，
+        // 两者是不同的出口。
+        let relation_notes =
+            relation_note_drafts(&candidates, input.scope, &input.recent_events, now);
+        if !relation_notes.is_empty() {
+            self.persist_relation_notes(&relation_notes).await;
+        }
         if updates.is_empty() {
             println!(
                 "[INFO] Yunxi Mind 立场形成：{} 条候选全部被校验丢弃",
@@ -2393,6 +2429,46 @@ impl MindRuntime {
         self.consolidate_retry(proposal).await?;
         println!("[INFO] Yunxi Mind 形成立场候选 {applied} 条（深度反思，作用域 Global）");
         Ok(true)
+    }
+
+    /// 相处结论的出口：测试注入替身，生产取进程级 store。
+    fn resolve_relation_note_sink(&self) -> Option<Arc<dyn RelationNoteSink>> {
+        self.relation_note_sink.clone().or_else(|| {
+            crate::yunxi::relation_note_store().map(|store| store as Arc<dyn RelationNoteSink>)
+        })
+    }
+
+    /// 把相处结论写进 `relation_note_store`；失败、超时、store 没起来都只记日志。
+    ///
+    /// 不返回错误是**故意的**：模型已经调过了，同一批立场候选还在手上，一条记录写不
+    /// 进去不该连带丢掉它们。也**绝不**把结果回灌给调用方做判断——这些结论不参与
+    /// 门控，回不回由关系张力阈值决定（见 `silence_gate_plan`）。
+    async fn persist_relation_notes(&self, notes: &[RelationNoteDraft]) {
+        let Some(sink) = self.resolve_relation_note_sink() else {
+            println!(
+                "[INFO] Yunxi Mind 相处结论未落库：store 尚未初始化（{} 条）",
+                notes.len()
+            );
+            return;
+        };
+        match kovi::tokio::time::timeout(RELATION_NOTE_WRITE_TIMEOUT, sink.upsert_notes(notes))
+            .await
+        {
+            // 只记条数、不记正文：这是私事，systemd 日志里留个计数就够追溯了
+            // （与 `candidate_preview` 的理由一致）。
+            Ok(Ok(written)) => {
+                println!(
+                    "[INFO] Yunxi Mind 记下相处结论 {written} 条（候选 {} 条）",
+                    notes.len()
+                )
+            }
+            Ok(Err(error)) => kovi::log::warn!("Yunxi Mind 相处结论落库失败：{error}"),
+            Err(_) => kovi::log::warn!(
+                "Yunxi Mind 相处结论落库超时（{:?}），本批 {} 条丢弃",
+                RELATION_NOTE_WRITE_TIMEOUT,
+                notes.len()
+            ),
+        }
     }
 
     /// Advance the (global) self model after a real batch of observed
@@ -3032,6 +3108,12 @@ struct StanceCandidate {
     kind: StanceKind,
     proposition: String,
     target: Option<String>,
+    /// 只有 `relation` 用：她观察到的"这个人怎么对她"。
+    ///
+    /// 为什么不塞进 `proposition`：相处结论**不是**她的立场（进 `yunxi_beliefs`
+    /// 会被 `global_state_text_rejection` 拒掉），它落自己的表，且明确不参与门控。
+    /// 两个出口分开，以后才不会有人顺手把两者混在一起。
+    note: Option<String>,
     confidence_milli: i32,
 }
 
@@ -3045,6 +3127,12 @@ enum StanceKind {
     Challenge,
     /// 她自己真的改主意了。
     Change,
+    /// 与某个具体的人相处下来的结论（**可读记录，不参与门控**）。
+    ///
+    /// 原来这里写的是"不写关于具体人的判断——那是记忆，不是看法"。那句话对**立场**
+    /// 依然成立（`form` 里写人就该被拒），但结论本身不该没有出口：张力只说得出
+    /// "有人对她持续不友好"，说不出"她怎么看他"。所以给它一种候选、一张自己的表。
+    Relation,
 }
 
 /// 立场形成的提示词：给她的经历，让她自己下判断。
@@ -3073,20 +3161,25 @@ fn stance_formation_messages(
             ));
         }
     }
-    let system = "你在独处，回想刚刚发生的事。只输出一个 JSON 数组，最多 3 条，不要解释、不要代码块。\n\
+    let system = "你在独处，回想刚刚发生的事。只输出一个 JSON 数组，不要解释、不要代码块；\
+立场最多 3 条，相处结论最多 2 条。\n\
 每条的形式：\n\
 {\"kind\":\"form\",\"proposition\":\"我认为……\",\"confidence_milli\":120}\n\
 {\"kind\":\"reinforce\",\"target\":\"某条已有看法的原文\",\"confidence_milli\":80}\n\
 {\"kind\":\"challenge\",\"target\":\"某条已有看法的原文\",\"confidence_milli\":100}\n\
 {\"kind\":\"change\",\"target\":\"你原来那条看法的原文\",\"proposition\":\"我认为……（以前我觉得……）\",\"confidence_milli\":150}\n\
+{\"kind\":\"relation\",\"target\":\"某个人的显示名或 QQ 号\",\"note\":\"你观察到这个人怎么对你\",\"confidence_milli\":100}\n\
 含义：form 是这段经历让你有了新看法；reinforce 是某条看法又被印证；\
 challenge 是**有人不同意**某条看法——只表示有人反对，不代表你改变看法；\
-change 是**你自己真的改主意了**（想清楚了或被论据说服）。\n\
-target 必须与上面列出的某条看法原文完全一致，否则那条作废。\n\
+change 是**你自己真的改主意了**（想清楚了或被论据说服）；\
+relation 是**你跟某个具体的人相处下来的结论**（这个人怎么对你、你们处得怎么样）。\n\
+target 必须与上面列出的某条看法原文完全一致（relation 除外：relation 的 target 是那个人的显示名或者 QQ 号），否则那条作废。\n\
 如果这个看法你已经有了——哪怕措辞不一样、只是换了种说法——就用 reinforce 并填那一句的原文，\n\
 不要用 form 造一条新的：同一个想法说两遍不会让你更坚定，只会把你的立场摊薄。\n\
 铁律：看法必须是你自己的判断，不能把别人说的话当成你的看法；\
-不写关于具体人的判断（谁喜欢什么、谁是什么样的人）——那是记忆，不是看法；\
+看法里不写关于具体人的判断（谁喜欢什么、谁是什么样的人）——对看法来说那是记忆，不是看法；\
+如果你看清的是这个人怎么对你，就用 relation 记一条相处结论；\
+relation 只写你**真的观察到的相处方式**，不写你没法知道的事（他的隐私、他的想法），也不写辱骂和人身攻击；\
 不能凭空编造没发生过的经历；没有值得留下的就输出 []。";
     let user = format!("【你最近的经历】\n{experience}\n【你目前的看法】\n{stances}");
     vec![
@@ -3102,6 +3195,10 @@ target 必须与上面列出的某条看法原文完全一致，否则那条作�
 }
 
 /// 从模型输出里抽出提案：容错地找第一段 `[...]`，逐条解析，坏条目直接丢。
+///
+/// 立场与相处结论**分开计数**：两类是不同的出口，一类把名额占满不该把另一类挤没
+/// （见 [`MAX_RELATION_NOTE_PROPOSALS`]）。坏条目不占名额——模型偶尔会写一行带
+/// `kind` 却缺内容的残条，让它吃掉配额就太亏了。
 fn parse_stance_candidates(raw: &str) -> Vec<StanceCandidate> {
     let Some(start) = raw.find('[') else {
         return Vec::new();
@@ -3115,51 +3212,80 @@ fn parse_stance_candidates(raw: &str) -> Vec<StanceCandidate> {
     let Ok(items) = serde_json::from_str::<Vec<serde_json::Value>>(&raw[start..=end]) else {
         return Vec::new();
     };
-    items
-        .into_iter()
-        .filter_map(|item| {
-            let kind = match item.get("kind")?.as_str()? {
-                "form" => StanceKind::Form,
-                "reinforce" => StanceKind::Reinforce,
-                "challenge" => StanceKind::Challenge,
-                "change" => StanceKind::Change,
-                _ => return None,
-            };
-            let proposition = item
-                .get("proposition")
-                .and_then(|value| value.as_str())
-                .unwrap_or_default()
-                .trim()
-                .to_string();
-            let target = item
-                .get("target")
-                .and_then(|value| value.as_str())
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string);
-            let confidence_milli = item
-                .get("confidence_milli")
-                .and_then(serde_json::Value::as_i64)
-                .unwrap_or(100)
-                .clamp(0, 200) as i32;
-            // form/change 必须给出新命题；reinforce/challenge 必须给出目标。
-            match kind {
-                StanceKind::Form | StanceKind::Change if proposition.is_empty() => return None,
-                StanceKind::Reinforce | StanceKind::Challenge if target.is_none() => return None,
-                _ => {}
+    let mut candidates = Vec::new();
+    let mut stances = 0_usize;
+    let mut relation_notes = 0_usize;
+    for item in items {
+        let Some(candidate) = parse_stance_candidate(&item) else {
+            continue;
+        };
+        if candidate.kind == StanceKind::Relation {
+            if relation_notes >= MAX_RELATION_NOTE_PROPOSALS {
+                continue;
             }
-            if kind == StanceKind::Change && target.is_none() {
-                return None;
+            relation_notes += 1;
+        } else {
+            if stances >= MAX_STANCE_PROPOSALS {
+                continue;
             }
-            Some(StanceCandidate {
-                kind,
-                proposition,
-                target,
-                confidence_milli,
-            })
-        })
-        .take(MAX_STANCE_PROPOSALS)
-        .collect()
+            stances += 1;
+        }
+        candidates.push(candidate);
+    }
+    candidates
+}
+
+/// 解析单条候选；认不出的 `kind`、缺必填字段一律返回 `None`，不猜。
+fn parse_stance_candidate(item: &serde_json::Value) -> Option<StanceCandidate> {
+    let kind = match item.get("kind")?.as_str()? {
+        "form" => StanceKind::Form,
+        "reinforce" => StanceKind::Reinforce,
+        "challenge" => StanceKind::Challenge,
+        "change" => StanceKind::Change,
+        "relation" => StanceKind::Relation,
+        _ => return None,
+    };
+    let proposition = item
+        .get("proposition")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let target = item
+        .get("target")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let note = item
+        .get("note")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let confidence_milli = item
+        .get("confidence_milli")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(100)
+        .clamp(0, 200) as i32;
+    // form/change 必须给出新命题；reinforce/challenge 必须给出目标；
+    // relation 必须同时给出"谁"和"她观察到了什么"——只有一半的结论没有意义。
+    match kind {
+        StanceKind::Form | StanceKind::Change if proposition.is_empty() => return None,
+        StanceKind::Reinforce | StanceKind::Challenge if target.is_none() => return None,
+        StanceKind::Relation if target.is_none() || note.is_none() => return None,
+        _ => {}
+    }
+    if kind == StanceKind::Change && target.is_none() {
+        return None;
+    }
+    Some(StanceCandidate {
+        kind,
+        proposition,
+        target,
+        note,
+        confidence_milli,
+    })
 }
 
 /// 把模型的说法翻成 belief 提案。
@@ -3285,9 +3411,60 @@ fn stance_updates(
                     None,
                 ));
             }
+            // 相处结论**不进 belief 提案**：它是关于具体人的记录，落自己的表
+            // （见 `relation_note_drafts`），也明确不参与门控。
+            StanceKind::Relation => continue,
         }
     }
     updates
+}
+
+/// 从候选里挑出"相处结论"，翻成可落库的记录。
+///
+/// 三条设计约束，改之前先读：
+/// - **不参与硬门控**。回不回由代码里的关系张力阈值决定（见 `silence_gate_plan`），
+///   这里只留一份可读记录、将来最多当语气参考。别把它接进"接不接人"的判断——
+///   模型的一句印象不稳定也不可解释，拿它当闸会把误判变成沉默。
+/// - **作用域是这次反思的作用域**（群会话或人），不是 Global：相处结论属于
+///   "在哪儿跟谁相处"。立场一律 Global，两者别混。
+/// - **只存模型给的显示名/QQ 原文**，不解析 `PersonId`：解析失败会让整条结论丢掉，
+///   而这条记录本来就不需要身份对齐。
+///
+/// 坏条目（只有对象没有正文、或只有正文没有对象）在解析阶段就被丢了；这里再兜一层
+/// 空文本与超长截断（见 `RelationNoteDraft::new`）。
+fn relation_note_drafts(
+    candidates: &[StanceCandidate],
+    scope: MindScope,
+    events: &[ReflectionEvent],
+    now: DateTime<Utc>,
+) -> Vec<RelationNoteDraft> {
+    // 来源事件：最近一条经历。相处结论要追溯得回"当时看到了什么"，与立场挂证据
+    // 是同一个理由（见 `stance_evidence`）。
+    let source_event_id = events.last().map(|event| event.event_id);
+    candidates
+        .iter()
+        .filter(|candidate| candidate.kind == StanceKind::Relation)
+        .filter_map(|candidate| {
+            let target = candidate.target.as_deref().unwrap_or_default();
+            let note = candidate.note.as_deref().unwrap_or_default();
+            let draft = RelationNoteDraft::new(
+                scope,
+                target,
+                note,
+                candidate.confidence_milli,
+                source_event_id,
+                now,
+            );
+            if draft.is_none() {
+                // 只留 40 字预览，理由同 `candidate_preview`：别把私事整段写进日志。
+                println!(
+                    "[INFO] 相处结论被校验丢弃：对象或正文为空（{}）",
+                    candidate_preview(target)
+                );
+            }
+            draft
+        })
+        .collect()
 }
 
 /// 按归一化键在已有立场里找回目标（用于给提案补上 `belief_id`）。
@@ -3540,6 +3717,7 @@ fn is_informative_chinese_term(term: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::yunxi::relation_note_store::{FailingRelationNoteSink, InMemoryRelationNoteSink};
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
     use yunxi_core::{
@@ -4009,6 +4187,274 @@ mod tests {
             "被挑战与被说服必须分开说"
         );
         assert!(joined.contains("那是记忆，不是看法"));
+        // 相处结论是同一个模型调用里的另一种候选：协议里必须有它，而且**不能**
+        // 再写"不写关于具体人的判断"就完事——那样结论还是没有出口。
+        assert!(
+            joined.contains("\"kind\":\"relation\""),
+            "协议要给出相处结论这一种候选"
+        );
+        assert!(
+            joined.contains(&format!("相处结论最多 {MAX_RELATION_NOTE_PROPOSALS} 条")),
+            "两类候选的名额要分开说清楚（提示词与常量必须同源，否则悄悄漂移）"
+        );
+    }
+
+    #[test]
+    fn relation_candidates_parse_tolerantly_without_crowding_out_stances() {
+        // 坏条目（缺 note、缺 target、认不出的 kind、根本不是对象）全部丢掉，
+        // 一条不影响另一条——沿用立场解析的容错风格。
+        let messy = r#"[
+            {"kind":"relation","target":"张三","note":"他说话很冲，但每次都讲道理","confidence_milli":130},
+            {"kind":"relation","target":"只有对象没有正文"},
+            {"kind":"relation","note":"只有正文没有对象"},
+            {"kind":"relation","target":"李四","note":""},
+            {"kind":"unknown","target":"张三","note":"x"},
+            "文本条目",
+            {"kind":"form","proposition":"我认为慢一点更好"}
+        ]"#;
+        let parsed = parse_stance_candidates(messy);
+        assert_eq!(parsed.len(), 2, "坏条目要丢干净，好的两条都要在");
+        assert_eq!(parsed[0].kind, StanceKind::Relation);
+        assert_eq!(parsed[0].target.as_deref(), Some("张三"));
+        assert_eq!(
+            parsed[0].note.as_deref(),
+            Some("他说话很冲，但每次都讲道理")
+        );
+        assert_eq!(parsed[0].confidence_milli, 130);
+        assert_eq!(parsed[1].kind, StanceKind::Form);
+        assert!(parsed[1].note.is_none(), "立场候选不该带相处结论的正文");
+
+        // 两类候选分开计数：立场占满 3 条不该把相处结论挤没（反过来也一样）。
+        let many = format!(
+            "[{}]",
+            (0..9)
+                .map(|index| format!(r#"{{"kind":"form","proposition":"看法{index}"}}"#))
+                .chain((0..9).map(|index| format!(
+                    r#"{{"kind":"relation","target":"对象{index}","note":"他今天又这样"}}"#
+                )))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let parsed = parse_stance_candidates(&many);
+        assert_eq!(
+            parsed
+                .iter()
+                .filter(|candidate| candidate.kind == StanceKind::Relation)
+                .count(),
+            MAX_RELATION_NOTE_PROPOSALS
+        );
+        assert_eq!(
+            parsed
+                .iter()
+                .filter(|candidate| candidate.kind != StanceKind::Relation)
+                .count(),
+            MAX_STANCE_PROPOSALS
+        );
+
+        // 非 JSON 一律空手而归，不猜。
+        assert!(parse_stance_candidates("我不想说").is_empty());
+    }
+
+    #[test]
+    fn relation_notes_are_bounded_and_stay_out_of_beliefs() {
+        let now = Utc::now();
+        let conversation_id = yunxi_core::ConversationId::new();
+        let scope = MindScope::Conversation { conversation_id };
+        let events: Vec<ReflectionEvent> = (0..3)
+            .map(|index| ReflectionEvent {
+                event_id: EventId::new(),
+                scope,
+                summary: format!("经历 {index}"),
+                salience: 0.6,
+                occurred_at: now,
+            })
+            .collect();
+        let long_target = "张".repeat(200);
+        let long_note = "他".repeat(500);
+        let raw = format!(
+            r#"[{{"kind":"relation","target":"{long_target}","note":"{long_note}","confidence_milli":9999}},
+                {{"kind":"relation","target":"李四","note":"   "}}]"#
+        );
+        let drafts = relation_note_drafts(&parse_stance_candidates(&raw), scope, &events, now);
+        assert_eq!(drafts.len(), 1, "空正文的那条要被丢掉，不猜");
+        assert_eq!(drafts[0].observed_at(), now, "观察时间是这次反思的时间");
+        assert!(
+            drafts[0].scope_key().starts_with("conversation:"),
+            "相处结论挂在这次反思的作用域上，不是 Global：实际 {}",
+            drafts[0].scope_key()
+        );
+        assert!(
+            drafts[0].note().chars().count()
+                <= crate::yunxi::relation_note_store::MAX_RELATION_NOTE_CHARS,
+            "正文必须有界"
+        );
+        assert!(drafts[0].note().ends_with('…'), "截断要看得出来");
+        assert!(
+            drafts[0].target_label().chars().count()
+                <= crate::yunxi::relation_note_store::MAX_RELATION_TARGET_CHARS,
+            "对象标识必须有界"
+        );
+        assert_eq!(
+            drafts[0].confidence_milli(),
+            200,
+            "置信度沿用立场候选的刻度，越界要夹住"
+        );
+
+        // 相处结论**不**进 belief 提案：它没有 belief_id 可打，也不该占立场容量。
+        let updates = stance_updates(
+            &parse_stance_candidates(
+                r#"[{"kind":"relation","target":"张三","note":"他说话很冲"}]"#,
+            ),
+            &[],
+            &events,
+            now,
+            &std::collections::HashMap::new(),
+        );
+        assert!(updates.is_empty(), "相处结论落自己的表，不能变成她的立场");
+    }
+
+    fn runtime_with_relation_note_sink(
+        sink: Arc<dyn RelationNoteSink>,
+    ) -> (Arc<MindRuntime>, Arc<InMemoryMindStore>) {
+        let store = Arc::new(InMemoryMindStore::new());
+        let services = MindServices::from_store(Arc::clone(&store));
+        let runtime = Arc::new(
+            MindRuntime::new(services, MindConfig::default())
+                .expect("valid test Mind runtime")
+                .with_relation_note_sink(sink),
+        );
+        (runtime, store)
+    }
+
+    /// seam 测试：相处结论走完"模型 → 解析 → 落库"整条接缝。
+    ///
+    /// 为什么必须有：立场层的教训是"接通了却一行都没有"，而当时的单测全是纯函数，
+    /// 接缝上没有任何测试。这条把相处结论的接缝钉住：同一个模型调用产出，作用域、
+    /// 对象、正文、来源事件都要真的落到出口上。
+    #[test]
+    fn relation_note_seam_persists_the_conclusion_with_its_scope() {
+        let executor = kovi::tokio::runtime::Runtime::new().expect("test runtime");
+        executor.block_on(async {
+            let sink = Arc::new(InMemoryRelationNoteSink::new());
+            let (runtime, _store) = runtime_with_relation_note_sink(sink.clone());
+            let conversation_id = yunxi_core::ConversationId::new();
+            let mut input = reflection_input_with_events(4);
+            input.scope = MindScope::Conversation { conversation_id };
+
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let calls_in_model = Arc::clone(&calls);
+            let formed = crate::model::llm_mock::with_mock_model(
+                "relation-note-seam",
+                move |_| {
+                    calls_in_model.fetch_add(1, Ordering::Relaxed);
+                    r#"[{"kind":"relation","target":"张三","note":"他说话很冲，但每次都讲道理","confidence_milli":130}]"#
+                        .to_string()
+                },
+                async { runtime.form_stances(&input).await },
+            )
+            .await
+            .expect("相处结论不该让形成过程失败");
+            assert!(formed, "应当真的调了模型");
+            assert_eq!(
+                calls.load(Ordering::Relaxed),
+                1,
+                "相处结论必须挂在既有管线里，一次形成只调一次模型"
+            );
+
+            let notes = sink.notes();
+            assert_eq!(notes.len(), 1, "接缝跑通就该落一条相处结论");
+            assert_eq!(notes[0].target_label(), "张三");
+            assert_eq!(notes[0].note(), "他说话很冲，但每次都讲道理");
+            assert_eq!(notes[0].confidence_milli(), 130);
+            assert_eq!(
+                notes[0].scope_key(),
+                format!("conversation:{conversation_id}")
+            );
+            assert!(
+                notes[0].observed_at() == input.requested_at,
+                "观察时间用这次反思的时间"
+            );
+        });
+    }
+
+    /// 同一个人**覆盖**而不是追加：两次形成只能留最新那条。
+    #[test]
+    fn relation_note_seam_overwrites_the_same_person() {
+        let executor = kovi::tokio::runtime::Runtime::new().expect("test runtime");
+        executor.block_on(async {
+            let sink = Arc::new(InMemoryRelationNoteSink::new());
+            let (runtime, _store) = runtime_with_relation_note_sink(sink.clone());
+            let input = reflection_input_with_events(3);
+            let turn = std::sync::atomic::AtomicUsize::new(0);
+            crate::model::llm_mock::with_mock_model(
+                "relation-note-overwrite",
+                move |_| {
+                    let index = turn.fetch_add(1, Ordering::Relaxed);
+                    if index == 0 {
+                        r#"[{"kind":"relation","target":"张三","note":"他说话很冲"}]"#.to_string()
+                    } else {
+                        r#"[{"kind":"relation","target":" 张三 ","note":"他其实只是着急，讲道理"}]"#
+                            .to_string()
+                    }
+                },
+                async {
+                    runtime.form_stances(&input).await.expect("第一次形成");
+                    runtime.form_stances(&input).await.expect("第二次形成");
+                },
+            )
+            .await;
+
+            let notes = sink.notes();
+            assert_eq!(notes.len(), 1, "同一个人只留一条，绝不追加");
+            assert_eq!(
+                notes[0].note(),
+                "他其实只是着急，讲道理",
+                "新的观察覆盖旧的"
+            );
+        });
+    }
+
+    /// 落库失败**不能**影响同一批的其它候选：立场照常落库，形成过程照常成功。
+    ///
+    /// 这条是"fail-soft"的接缝证明——出口是必失败的替身，而同一批里的 form 候选
+    /// 仍然要进 `yunxi_beliefs`。
+    #[test]
+    fn relation_note_storage_failure_leaves_other_candidates_intact() {
+        let executor = kovi::tokio::runtime::Runtime::new().expect("test runtime");
+        executor.block_on(async {
+            let sink = Arc::new(FailingRelationNoteSink);
+            let (runtime, store) = runtime_with_relation_note_sink(sink);
+            let input = reflection_input_with_events(4);
+
+            let formed = crate::model::llm_mock::with_mock_model(
+                "relation-note-failure",
+                |_| {
+                    r#"[{"kind":"relation","target":"张三","note":"他说话很冲"},
+                        {"kind":"form","proposition":"我认为慢一点更好","confidence_milli":150}]"#
+                        .to_string()
+                },
+                async { runtime.form_stances(&input).await },
+            )
+            .await
+            .expect("落库失败不该让形成过程报错");
+            assert!(formed);
+
+            let beliefs = yunxi_core::BeliefStore::relevant(
+                store.as_ref(),
+                &[MindScope::Global],
+                "",
+                Utc::now(),
+                8,
+            )
+            .await
+            .expect("查询立场");
+            assert_eq!(
+                beliefs.len(),
+                1,
+                "相处结论落库失败，同一批的立场候选必须照常落地"
+            );
+            assert_eq!(beliefs[0].proposition(), "我认为慢一点更好");
+        });
     }
 
     struct EmptyMemoryStore;
