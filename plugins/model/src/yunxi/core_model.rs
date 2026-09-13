@@ -2443,6 +2443,11 @@ fn ambient_group_interjection_veto(
     if !is_ambient_group_message(message) || !message.visible_reply_allowed {
         return None;
     }
+    // `#` 开头的控制命令有自己的静默分支（Host 侧另有确定性回执），不要被
+    // 这条聊天用的否决顺带改写计划形状。
+    if message.content.as_text().trim_start().starts_with('#') {
+        return None;
+    }
     if ambient_mind_intent_present(input, projection) {
         return None;
     }
@@ -8664,6 +8669,34 @@ mod tests {
                 "{name}的群聊回合不受未点名否决约束"
             );
         }
+    }
+
+    #[test]
+    fn control_commands_keep_their_own_silent_branch() {
+        // `#禁言` 这类命令没点名、也没被引用，判定上属于"未点名"，但它有自己
+        // 的静默分支（Host 侧另有确定性回执），不该被聊天用的否决改写计划形状。
+        let input = PlannerInput::new(
+            WorldEvent::message_received(
+                EventPriority::High,
+                MessageReceivedEvent {
+                    message_id: MessageId::new(),
+                    conversation_id: ConversationId::new(),
+                    sender: PersonId::new(),
+                    content: MessageContent::text("#禁言"),
+                    reply_to: None,
+                    timestamp: Utc::now(),
+                    conversation_kind: ConversationKind::Group,
+                    addressed_to_agent: false,
+                    replies_to_agent: false,
+                    stop_requested: false,
+                    explicit_request: false,
+                    visible_reply_allowed: true,
+                },
+            ),
+            PlannerStateSnapshot::empty(),
+        );
+        let projection = MindDecisionProjection::for_input(&input, baseline_disposition(&input));
+        assert!(ambient_group_interjection_veto(&input, &projection).is_none());
     }
 
     #[test]
