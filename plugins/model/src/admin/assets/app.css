@@ -41,7 +41,7 @@
   --warn-soft: rgba(232, 179, 74, .14);
   --danger: #f0716f;
   --danger-soft: rgba(240, 113, 111, .14);
-  /* 标注页说话人 B/C/D/E 的轮转配色。单独定 token 而不借 --warn/--danger：
+  /* 标注页群友 B/C/D/E 的轮转配色。单独定 token 而不借 --warn/--danger：
      那几个在别处是"警告/错误"的语义色，混用会让同一个颜色在两处意味不同。 */
   --speaker-0: #a78bfa;
   --speaker-1: #e8b34a;
@@ -74,7 +74,7 @@
   --warn-soft: rgba(181, 125, 16, .12);
   --danger: #d64545;
   --danger-soft: rgba(214, 69, 69, .12);
-  /* 浅色下的同一组说话人配色：压暗到能在白底上读清。 */
+  /* 浅色下的同一组群友配色：压暗到能在白底上读清。 */
   --speaker-0: #7c5cf0;
   --speaker-1: #b57d10;
   --speaker-2: #1f8fa8;
@@ -1186,7 +1186,7 @@ a.stat:hover, .stat.link:hover { border-color: var(--accent); transform: transla
   .annotate-grid > .record-list { order: 2; max-height: 52vh; }
   /* 批次名很长，宽度交给容器决定，别再用桌面的 220px 下限把它顶出去。 */
   .annotate-bar .select { min-width: 0; width: 100%; max-width: none; }
-  /* 说话人列窄一点，正文多留 ~10px；"说话人A"四个字仍然放得下。 */
+  /* 群友列窄一点，正文多留 ~10px；"群友A"三个字仍然放得下。 */
   .annotate-role { flex: 0 0 56px; }
   .label-choice { padding: 8px 14px; }
   /* 标签名单独占一行：手机上胶囊能占满整行，不至于挤成两三个的碎块。 */
@@ -1202,7 +1202,7 @@ a.stat:hover, .stat.link:hover { border-color: var(--accent); transform: transla
 }
 
 .annotate-card { display: flex; flex-direction: column; gap: 12px; }
-/* 正文框与下面的上下文排成同一列说话人，读起来就是一段聊天记录：
+/* 正文框与下面的上下文排成同一列群友，读起来就是一段聊天记录：
    标签列在左，正文在右，当前发言者的标签与上下文里那个"A"对齐。 */
 .annotate-current {
   display: flex; gap: 10px; align-items: baseline;
@@ -1216,14 +1216,14 @@ a.stat:hover, .stat.link:hover { border-color: var(--accent); transform: transla
 .annotate-role { flex: 0 0 62px; color: var(--text-faint); font-size: 11.5px; }
 .annotate-role.assistant { color: var(--accent); }
 .annotate-role.user { color: var(--ok); }
-/* 其他说话人：每人一色，看颜色就知道换人了（--speaker-N 见文件头的色板）。
+/* 其他群友：每人一色，看颜色就知道换人了（--speaker-N 见文件头的色板）。
    speaker-0..3 由前端按编号轮转分配。 */
 .annotate-role.speaker-0 { color: var(--speaker-0); }
 .annotate-role.speaker-1 { color: var(--speaker-1); }
 .annotate-role.speaker-2 { color: var(--speaker-2); }
 .annotate-role.speaker-3 { color: var(--speaker-3); }
 .annotate-text { color: var(--text-dim); word-break: break-word; }
-/* 上下文里的"前一句"标记：说话人列已经写了 A，这里只补"这是同一人的上一段"。 */
+/* 上下文里的"前一句"标记：群友列已经写了 A，这里只补"这是同一人的上一段"。 */
 .annotate-tag {
   margin-right: 6px; padding: 0 5px; border-radius: 4px;
   border: 1px solid var(--border-strong); color: var(--text-faint);

@@ -33,10 +33,13 @@ DEFAULT_QUEUE_LIMIT = 40
 # 队列行里正文/上下文的截断长度（终端摘要，不是数据）。
 SNIPPET_CHARS = 64
 
-# 说话人编号用的字母表：a=当前发言者，b/c/…=其他成员（collector 落盘）。
+# 群友编号用的字母表：a=当前发言者，b/c/…=同群的其他人（collector 落盘）。
 SPEAKER_LETTERS = "ABCDEFGH"
 
-# 老批次没有说话人编号时的退路：只能按角色显示，"他人"分不出是几个人。
+# 编号的显示名前缀。字段名仍叫 speaker（数据契约），界面上一律叫"群友"。
+SPEAKER_LABEL = "群友"
+
+# 老批次没有群友编号时的退路：只能按角色显示，"他人"分不出是几个人。
 ROLE_LABELS = {"assistant": "芸汐", "user": "同一人", "other_member": "他人"}
 
 
@@ -44,7 +47,7 @@ def speaker_label(turn: dict) -> str:
     """回合的显示名，网页端与这里口径一致。
 
     collector 从 2026-09-13 起给 recent_turns 落样本内匿名的 `speaker`
-    （a=当前发言者，b/c/… 按首次出现顺序给其他成员）。没有这个字段的批次采于
+    （a=当前发言者，b/c/… 按首次出现顺序给其他群友）。没有这个字段的批次采于
     编号之前，只能退回"同一人/他人"——那种批次本来就看不出是几个其他人。
     """
     role = turn.get("role")
@@ -54,7 +57,7 @@ def speaker_label(turn: dict) -> str:
     if isinstance(speaker, str) and len(speaker) == 1:
         index = ord(speaker.lower()) - ord("a")
         if 0 <= index < len(SPEAKER_LETTERS):
-            return f"说话人{SPEAKER_LETTERS[index]}"
+            return f"{SPEAKER_LABEL}{SPEAKER_LETTERS[index]}"
     return ROLE_LABELS.get(role, str(role))
 
 
@@ -167,12 +170,12 @@ def render_sample(idx: int, sample: dict) -> str:
     """单条样本的完整复核视图（正文 + 上下文 + 弱标签）。"""
     ctx = sample.get("context", {})
     lines = [f"#{idx}  reason={queue_reason(sample)}  scope={ctx.get('scope')}"]
-    lines.append(f"  current_text[说话人A]: {sample.get('current_text', '')}")
+    lines.append(f"  current_text[{SPEAKER_LABEL}A]: {sample.get('current_text', '')}")
     fragments = ctx.get("pending_user_fragments") or []
     if fragments:
         # 片段与正文同属一次发言（collector 按"同群同发送者间隔 ≤3s"切分），
-        # 所以它们必然是同一个说话人——不需要各自带编号。
-        lines.append(f"  pending_fragments({len(fragments)})[说话人A]: {fragments}")
+        # 所以它们必然是同一个群友——不需要各自带编号。
+        lines.append(f"  pending_fragments({len(fragments)})[{SPEAKER_LABEL}A]: {fragments}")
     for turn in ctx.get("recent_turns", []):
         lines.append(f"  [{speaker_label(turn)}] {turn.get('text')}")
     flags = [
@@ -204,8 +207,8 @@ def render_brief(idx: int, sample: dict, last_turns: int = 3) -> str:
     parts = [head]
     fragments = ctx.get("pending_user_fragments") or []
     if fragments:
-        parts.append(f"  前一句[说话人A]: {' | '.join(str(f) for f in fragments)}")
-    parts.append(f"  当前句[说话人A]: {sample.get('current_text', '')}")
+        parts.append(f"  前一句[{SPEAKER_LABEL}A]: {' | '.join(str(f) for f in fragments)}")
+    parts.append(f"  当前句[{SPEAKER_LABEL}A]: {sample.get('current_text', '')}")
     for turn in ctx.get("recent_turns", [])[-last_turns:]:
         parts.append(f"    {speaker_label(turn)}: {turn.get('text')}")
     return "\n".join(parts)

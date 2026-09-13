@@ -9,8 +9,8 @@
   pending_user_fragments,最后一条作为 current_text;
 - 机器人的 `[send]` 行构成 assistant 角色 turn,用于 recent_turns 与
   conversation_active;
-- recent_turns 每条带一个**样本内匿名**的说话人编号(`speaker`: a=当前发言者,
-  b/c/… 按出现顺序给其他成员)。`role` 只能分出"他人",分不清是几个人——编号
+- recent_turns 每条带一个**样本内匿名**的群友编号(`speaker`: a=当前发言者,
+  b/c/… 按出现顺序给同群的其他人)。`role` 只能分出"他人",分不清是几个人——编号
   补上"这几条是不是同一个人"这一维,且只落序号,不落 QQ 号/昵称;
 - **目标判定**:日志里的 `[at]`/`[reply]` 只说明"这条消息有指向",不说明指向谁
   (kovi 的 `Message::to_human_string` 对任何人的 @ 都渲染成 `[at]`,并明确写着
@@ -129,17 +129,18 @@ def label_speakers(
     senders: list[Optional[str]],
     current_sender: str,
 ) -> None:
-    """就地在 `turns` 上写 `speaker`：样本内的匿名说话人编号。
+    """就地在 `turns` 上写 `speaker`：样本内的匿名群友编号。
 
     `role` 只分得清"芸汐 / 当前发言者 / 其他人"，于是一段上下文里的几个其他人
     全被标成"他人"——标注时看不出这是"一个人在连说三条"还是"三个人在互相接话"，
-    而这恰恰是 completion/response 的关键线索（doc §7.4 B）。编号补上这一维。
+    而这恰恰是 completion/response 的关键线索（doc §7.4 B）。编号补上这一维；
+    复核界面按编号显示成"群友A/B/C…"。
 
     编号是**样本内**的，只回答"这几条是不是同一个人"，回答不了"这是谁"：
 
     - `a` 恒为当前发言者（样本正文 `current_text` 与 `pending_user_fragments`
       都属于他，所以它们不需要各自带编号）；
-    - `b`/`c`/… 按 `turns` 的时间顺序给其他成员；
+    - `b`/`c`/… 按 `turns` 的时间顺序给同群的其他人；
     - 芸汐（`assistant`）不编号。
 
     只落序号，不落 QQ 号、昵称或任何跨样本稳定的标识——脱敏承诺不变。
@@ -147,7 +148,7 @@ def label_speakers(
     letters: dict[str, str] = {}
     for turn, sender in zip(turns, senders):
         if sender is None or turn.get("role") == "assistant":
-            # 芸汐不编号：她不是"某个人"，标成说话人X只会让人以为群里多了一个成员。
+            # 芸汐不编号：她不是"某个人"，标成群友X只会让人以为群里多了一个成员。
             continue
         if sender == current_sender:
             turn["speaker"] = "a"
@@ -332,7 +333,7 @@ def main() -> int:
             clean = sanitize(cur)
             # recent turns: 之前的 ≤4 个 user/bot unit
             recent = []
-            # 与 recent 一一对应的发送者（bot 为 None）。只用来编说话人号，
+            # 与 recent 一一对应的发送者（bot 为 None）。只用来编群友号，
             # 编完即弃——样本里只留序号，不留身份。
             recent_senders: list[Optional[str]] = []
             recent_ts = ts

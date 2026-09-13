@@ -2274,11 +2274,14 @@
     w: ['response', 'wait'],
     0: ['response', 'null'],
   };
-  /** 说话人编号用的字母表（下标 = collector 落的编号：0=a，1=b…）。 */
+  /** 群友编号用的字母表（下标 = collector 落的编号：0=a，1=b…）。 */
   const SPEAKER_LETTERS = 'ABCDEFGH';
-  /** 其他说话人的配色档数，与 CSS 的 --speaker-0..3 一一对应（多了就轮转）。 */
+  /** 群友编号的显示名前缀。字段名仍叫 speaker（数据契约），界面上一律叫"群友"——
+   *  这些回合本来就是同一个群里的人，叫"说话人"既绕口又不像人话。 */
+  const SPEAKER_LABEL = '群友';
+  /** 其他群友的配色档数，与 CSS 的 --speaker-0..3 一一对应（多了就轮转）。 */
   const SPEAKER_TONES = 4;
-  /** 老批次没有说话人编号时的退路：只能按角色显示，看不出是几个其他人。 */
+  /** 老批次没有群友编号时的退路：只能按角色显示，看不出是几个其他人。 */
   const ROLE_LABELS = { assistant: '芸汐', user: '同一人', other_member: '他人' };
   const SNIPPET_CHARS = 56;
 
@@ -2286,7 +2289,7 @@
    * 上下文里一个回合的显示名与配色。
    *
    * collector 从 2026-09-13 起给 recent_turns 落样本内匿名的 `speaker`
-   * （a = 当前发言者，b/c/… 按首次出现顺序给其他成员）。没有这个字段时，几个
+   * （a = 当前发言者，b/c/… 按首次出现顺序给其他群友）。没有这个字段时，几个
    * 其他人都显示成"他人"——标注时看不出是"一个人连说三条"还是"三个人在互相
    * 接话"，而这正是判断 completion/response 的关键线索。
    *
@@ -2300,7 +2303,7 @@
     const index = id.length === 1 ? id.charCodeAt(0) - 'a'.charCodeAt(0) : -1;
     if (index >= 0 && index < SPEAKER_LETTERS.length) {
       return {
-        label: `说话人${SPEAKER_LETTERS[index]}`,
+        label: `${SPEAKER_LABEL}${SPEAKER_LETTERS[index]}`,
         // 当前发言者（A）沿用原来的绿色，其他人按 --speaker-0..3 轮转。
         tone: index === 0 ? 'user' : `speaker-${(index - 1) % SPEAKER_TONES}`,
       };
@@ -2308,14 +2311,14 @@
     return { label: ROLE_LABELS[turn && turn.role] || (turn && turn.role) || '?', tone: 'other' };
   }
 
-  /** 这条样本有没有说话人编号——没有就只能是"他人"，得让标注的人知道。 */
+  /** 这条样本有没有群友编号——没有就只能是"他人"，得让标注的人知道。 */
   function annotationHasSpeakers(sample) {
     return ((sample && sample.context && sample.context.recent_turns) || [])
       .some((turn) => turn && turn.speaker);
   }
 
   /** 老批次里"他人"的悬停说明：不是没显示，是当时根本没记。 */
-  const SPEAKER_UNRECORDED = '这批采于说话人编号之前，只能标出"其他人"，看不出是几个';
+  const SPEAKER_UNRECORDED = '这批采于群友编号之前，只能标出"其他人"，看不出是几个';
 
   function annotationSnippet(text) {
     const flat = String(text == null ? '' : text).split(/\s+/).filter(Boolean).join(' ');
@@ -2701,9 +2704,9 @@
     const body = h('div', { class: 'annotate-body' });
     for (const fragment of context.pending_user_fragments || []) {
       // 片段与正文同属一次发言（collector 按"同群同发送者间隔 ≤3s"切分），
-      // 所以它们的说话人必然是当前发言者——编号固定是 A，不必各带一个字段。
+      // 所以它们必然是当前发言者——编号固定是 A，不必各带一个字段。
       body.append(h('div', { class: 'annotate-turn' },
-        h('span', { class: 'annotate-role user', text: '说话人A' }),
+        h('span', { class: 'annotate-role user', text: `${SPEAKER_LABEL}A` }),
         h('span', { class: 'annotate-text' },
           h('span', { class: 'annotate-tag', text: '前一句' }),
           String(fragment))));
@@ -2738,7 +2741,7 @@
           '这批采于"@ 判定"修复之前：@ 别人也曾被记成在叫她。这条默认不进队列，标它等于把旧判定确认一遍。')
         : null,
       h('div', { class: 'annotate-current' },
-        h('span', { class: 'annotate-role user', text: '说话人A' }),
+        h('span', { class: 'annotate-role user', text: `${SPEAKER_LABEL}A` }),
         h('span', {
           class: 'annotate-current-text',
           text: String(sample.current_text == null ? '' : sample.current_text),
@@ -2751,7 +2754,7 @@
         // 老批次的"他人"分不出是几个人：明说，免得以为界面漏了编号。
         annotationHasSpeakers(sample) || !(context.recent_turns || []).length
           ? null
-          : h('span', { class: 'annotate-note', text: '说话人未记录（这批采于编号之前）' })),
+          : h('span', { class: 'annotate-note', text: '群友未记录（这批采于编号之前）' })),
       h('div', { class: 'annotate-labels' },
         h('span', { class: 'annotate-label-head', text: 'completion' }),
         ...COMPLETION_CHOICES.map(([value, label]) => annotationChoice('completion', value, label)),
