@@ -160,6 +160,27 @@ impl CompactEvent {
     }
 }
 
+/// Whether any retained compact still names this person as the sender.
+/// Generic over the container so it can also read a snapshot's `Vec`.
+fn retains_person<'a>(
+    events: impl IntoIterator<Item = &'a CompactEvent>,
+    person_id: PersonId,
+) -> bool {
+    events
+        .into_iter()
+        .any(|event| event.person_id == Some(person_id))
+}
+
+/// Data-erasure scrub for the retained event logs: the sender id goes, the shared
+/// text stays (see `purge_person_domain`).
+fn scrub_person(events: &mut VecDeque<CompactEvent>, person_id: PersonId) {
+    for event in events.iter_mut() {
+        if event.person_id == Some(person_id) {
+            event.person_id = None;
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct GlobalWorkingState {
     recent_events: VecDeque<CompactEvent>,
@@ -477,9 +498,10 @@ impl WorkingState {
 
     /// Removes direct-conversation snapshots and the person's identifier from
     /// retained shared-conversation snapshots at a runtime control barrier.
-    /// Shared conversation text is retained because it is shared history and
-    /// compact events do not retain sender identifiers. The global event log
-    /// contains neither message text nor person identifiers. A successful
+    /// Shared conversation text is retained because it is shared history, but
+    /// compact events **do** carry the sender id of every inbound message, so
+    /// the id is scrubbed from the retained conversations and from the global
+    /// event log alike. The global log keeps no message text. A successful
     /// mutation advances all affected versions so callers cannot mistake a
     /// pre-erasure snapshot for current runtime state.
     pub(crate) fn purge_person_domain(
@@ -502,11 +524,20 @@ impl WorkingState {
             .iter()
             .filter_map(|(conversation_id, state)| {
                 (!removed_conversations.contains(conversation_id)
-                    && state.active_people.contains(&person_id))
+                    && (state.active_people.contains(&person_id)
+                        || retains_person(&state.recent_events, person_id)))
                 .then_some((*conversation_id, state.version))
             })
             .collect();
-        if removed_conversations.is_empty() && affected_retained.is_empty() {
+        // Compact events carry the sender id for every inbound message, so the global
+        // log has to be part of the "anything to erase?" test as well — otherwise a
+        // person who only ever spoke in conversations that are no longer retained
+        // would keep their canonical id in the global log.
+        let global_retains_person = retains_person(&self.global.recent_events, person_id);
+        if removed_conversations.is_empty()
+            && affected_retained.is_empty()
+            && !global_retains_person
+        {
             return Ok(0);
         }
         let next_global_version = self
@@ -534,9 +565,11 @@ impl WorkingState {
                 state
                     .active_people
                     .retain(|candidate| *candidate != person_id);
+                scrub_person(&mut state.recent_events, person_id);
                 state.version = next_version;
             }
         }
+        scrub_person(&mut self.global.recent_events, person_id);
         self.global.version = next_global_version;
         Ok(removed_conversations.len())
     }
@@ -630,7 +663,10 @@ fn bounded_text(value: &str, max_chars: usize, max_bytes: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{WorkingState, WorkingStateConfig, WorkingStateConfigError, WorkingStateError};
+    use super::{
+        WorkingState, WorkingStateConfig, WorkingStateConfigError, WorkingStateError,
+        retains_person,
+    };
     use crate::attention::AttentionSystem;
     use crate::event::{
         AutonomousConversationTickEvent, EventPriority, EventScope, MessageContent,
@@ -933,5 +969,63 @@ mod tests {
         let snapshot = state.conversation(conversation_id).expect("conversation");
         assert_eq!(snapshot.recent_events[0].text.as_deref(), Some("芸汐ab"));
         assert_eq!(snapshot.recent_events[0].text.as_ref().unwrap().len(), 8);
+    }
+
+    /// The erasure barrier promises the person's identifier does not survive in the
+    /// retained snapshots. Compact events carry the sender id of every inbound
+    /// message — in the shared conversation logs *and* in the global log — so
+    /// clearing `active_people` alone left the canonical id behind, and the host's
+    /// prompt builder injects exactly that field as the speaker id.
+    #[test]
+    fn erasing_a_person_scrubs_the_sender_id_from_retained_and_global_logs() {
+        let mut state = WorkingState::new(limits()).expect("valid limits");
+        let direct = ConversationId::new();
+        let shared = ConversationId::new();
+        let erased = PersonId::new();
+        let kept = PersonId::new();
+        for event in [
+            event(shared, erased, "被删除的人在群里说的话"),
+            event(shared, kept, "另一个人说的话"),
+            event(direct, erased, "私聊内容"),
+        ] {
+            state
+                .observe(&event, AttentionSystem.evaluate(&event))
+                .expect("valid observation");
+        }
+        assert!(retains_person(&state.global.recent_events, erased));
+        assert!(
+            state
+                .conversation(shared)
+                .expect("shared")
+                .recent_events
+                .iter()
+                .any(|compact| compact.person_id == Some(erased))
+        );
+
+        assert_eq!(
+            state.purge_person_domain(erased, &[direct]).expect("purge"),
+            1
+        );
+
+        assert!(state.conversation(direct).is_none(), "私聊快照应被移除");
+        assert!(
+            !retains_person(&state.global.recent_events, erased),
+            "全局日志里不应再留有被删除者的标识"
+        );
+        let shared_events = &state.conversation(shared).expect("shared").recent_events;
+        assert!(
+            !retains_person(shared_events, erased),
+            "保留的群聊快照里不应再留有被删除者的标识"
+        );
+        assert!(
+            retains_person(shared_events, kept),
+            "其他人的标识不能被顺手清掉"
+        );
+        assert!(
+            shared_events
+                .iter()
+                .any(|compact| compact.text.as_deref() == Some("另一")),
+            "共享历史文本按约定保留（本用例把紧凑文本限到 8 字节，所以只剩两个汉字）"
+        );
     }
 }
