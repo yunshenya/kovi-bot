@@ -246,6 +246,11 @@ startup_self_test = true
 
 [model.fallback]
 strong_to_intrinsic = true
+# 文字回合是否回退到本地 MiniMind。默认 false：线上实测（2026-09-14 01:42）
+# 主模型输出被判不可用后，本地兜底在群里发出一个 `1`——文字兜底换来的那句
+# 通常不如不说。**视觉不受此开关影响**：看图本来就是本地模型的能力，关掉它
+# 等于让她瞎；要连视觉一起关，用上面的 strong_to_intrinsic。
+strong_to_intrinsic_text = false
 max_model_attempts = 2
 
 # TurnGate 完成度分类器（Phase 2 接线）：active 时优先决定批次何时 flush；

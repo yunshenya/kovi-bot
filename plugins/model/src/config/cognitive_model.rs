@@ -96,6 +96,14 @@ pub struct IntrinsicConfig {
 #[serde(default)]
 pub struct ModelFallbackConfig {
     strong_to_intrinsic: bool,
+    /// 文字回合是否允许回退到本地 MiniMind。
+    ///
+    /// 为什么与 `strong_to_intrinsic` 分开：那个开关一刀切，连**视觉**回退一起
+    /// 关掉——而看图本来就是本地模型的能力（线上只有它接图），关掉等于让她瞎。
+    /// 文字这条则不同：线上实测（2026-09-14 01:42）主模型输出被判不可用后，本地
+    /// 兜底在群里发出一个 `1`。文字兜底换来的"总比不说话好"抵不过这种代价，所以
+    /// 默认 false：文字回合只有主模型一次机会，不可用就安静（必要时由主模型重试）。
+    strong_to_intrinsic_text: bool,
     max_model_attempts: u8,
 }
 
@@ -121,6 +129,8 @@ impl Default for ModelFallbackConfig {
     fn default() -> Self {
         Self {
             strong_to_intrinsic: true,
+            // 文字兜底默认关：见字段文档——它换来的那一句通常不如不说。
+            strong_to_intrinsic_text: false,
             max_model_attempts: 2,
         }
     }
@@ -209,6 +219,12 @@ impl ModelFallbackConfig {
         Ok(())
     }
 
+    /// 文字回合能不能回退到本地模型（视觉回退不看这个开关）。
+    #[must_use]
+    pub const fn strong_to_intrinsic_text(&self) -> bool {
+        self.strong_to_intrinsic_text
+    }
+
     #[must_use]
     pub const fn policy(&self) -> ModelFallbackPolicy {
         ModelFallbackPolicy {
@@ -225,7 +241,17 @@ impl ModelFallbackConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::TurnGateConfig;
+    use super::{ModelFallbackConfig, TurnGateConfig};
+
+    #[test]
+    fn text_fallback_is_off_by_default_while_vision_keeps_its_path() {
+        let config = ModelFallbackConfig::default();
+        // 文字回合不回退本地模型：线上实测它换来的是一句碎片（群里发出过 `1`）。
+        assert!(!config.strong_to_intrinsic_text());
+        // 视觉回退的总开关保持原样：看图本来就是本地模型的能力，不能被顺手关掉。
+        assert!(config.strong_to_intrinsic);
+        assert!(config.validate().is_ok());
+    }
 
     #[test]
     fn turn_gate_defaults_are_valid() {

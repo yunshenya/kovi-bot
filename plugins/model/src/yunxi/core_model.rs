@@ -3871,6 +3871,12 @@ impl KoviModelBackend {
         scope: ReplyScope,
         ticket: ReplyTicket,
     ) -> Option<String> {
+        // 文字兜底单独受 `strong_to_intrinsic_text` 管（默认关），视觉不受影响：
+        // 看图本来就是本地模型的能力，把它一起关掉等于让她瞎。文字那条换来的
+        // 通常是一句碎片（线上 2026-09-14 01:42 发出过一个 `1`），不如不说。
+        if !requires_vision && !config::get().model().fallback().strong_to_intrinsic_text() {
+            return None;
+        }
         let policy = self.intrinsic.fallback_policy();
         if !policy.strong_to_intrinsic
             || policy.max_model_attempts < 2
