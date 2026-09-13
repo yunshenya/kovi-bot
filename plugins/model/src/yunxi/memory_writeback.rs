@@ -89,10 +89,13 @@ impl MemoryWriteback {
         }
     }
 
-    /// ingress 侧：把这一轮的入站行挂到事件上。
+    /// ingress 侧：把这一轮（**归 Core 的**那个副本）的入站行挂到事件上。
     ///
-    /// 事件进 Core 之前调用；只有真的投递成功了才会被取用，所以"她没回"的回合
-    /// 不会留下任何记忆。
+    /// 事件进 Core 之前调用。取用有两条互斥的收尾路径：投递成功 →
+    /// [`Self::record_delivered_turn`]（对方说的 + 她回的），什么都没发出去 →
+    /// [`Self::record_silent_turn`]（只留"她读到过"）。Host 路的观察副本不进暂存
+    /// （`bridge.rs` 按 `visible_reply_allowed` 过滤），那条消息的记忆由 Host 的
+    /// 观察流负责，两边都写会让同一句话落两份。
     pub(crate) fn stash_inbound(
         &self,
         event_id: EventId,
