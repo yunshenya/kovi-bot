@@ -8,7 +8,7 @@
 <!-- 先落主题再渲染，避免选了浅色主题的人看到一下深色的闪白。 -->
 <script>
   try {
-    document.documentElement.dataset.theme = 'light'; // 临时：截图用
+    document.documentElement.dataset.theme = localStorage.getItem('yunxi-admin-theme') || 'dark';
   } catch (_) {
     document.documentElement.dataset.theme = 'dark';
   }

@@ -124,12 +124,18 @@ button, input, select, textarea { font: inherit; color: inherit; }
 }
 
 .login-theme {
-  position: absolute; top: 20px; right: 22px;
-  width: 36px; height: 36px; border-radius: 50%;
-  border: 1px solid var(--border-strong); background: var(--bg-elev); color: var(--text-dim);
+  position: absolute; top: 20px; right: 22px; z-index: 1;
+  width: 38px; height: 38px; border-radius: 50%;
+  /* 去掉浏览器默认按钮外观，背景只用当前文字色的低透明度叠加——
+     深浅两套主题下都是"背景上的一枚淡色圆片"，不依赖具体变量。 */
+  appearance: none; -webkit-appearance: none;
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+  border: 1px solid color-mix(in srgb, var(--text) 16%, transparent);
+  color: var(--text-dim);
   cursor: pointer; font-size: 15px; line-height: 1;
-  transition: color .15s, border-color .15s, transform .15s;
+  transition: color .15s, border-color .15s, transform .15s, background .15s;
 }
+.login-theme:hover { background: color-mix(in srgb, var(--text) 14%, transparent); }
 .login-theme:hover { color: var(--accent); border-color: var(--accent); transform: rotate(-20deg); }
 
 .login-card {
