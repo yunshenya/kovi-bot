@@ -2452,7 +2452,9 @@
     const spans = tiers.map((row) => h('span', {
       class: row.tier === 0 ? 'facet-chip tag' : 'facet-chip',
       title: `tier ${row.tier}：${row.label}（越小越先标）`,
-      text: `${row.tier} ${row.label} ${compactNumber(row.count)}`,
+      // 精确条数，不套 compactNumber：这一行是"还剩多少要标"，得能跟上面的
+      // 覆盖率数字（灰区 1223）对得上，1.0K 这种约数在这里只会碍事。
+      text: `${row.tier} ${row.label} ${row.count}`,
     }));
     host.append(
       h('span', { text: '按标注价值排队，tier 越小越先标：' }),
