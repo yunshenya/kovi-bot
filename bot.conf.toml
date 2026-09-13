@@ -67,7 +67,8 @@ sticker_reaction_window_secs = 90
 ambient_requires_mind_intent = true
 # 接续对话窗口：芸汐最近一次在本群可见回复后，未点名消息在此秒数内按
 # “接续对话”语义评估；窗口外回到低频插话抽样。
-# 必须 ≤ reply_gap_secs，否则窗口在她下次可以发言前一直敞开。
+# 必须 ≤ reply_gap_secs：超限时启动会告警，并按 reply_gap_secs 收口
+#（窗口在她下次可以发言前一直敞开的话，低频抽样与冷却全部作废）。
 continuation_window_secs = 60
 # 群聊可见回复节奏的确定性硬限制（显式识图/教学/命令不受限，管理员与普通
 # 成员同等受限）：同群两次可见聊天回复至少间隔 reply_gap_secs，每

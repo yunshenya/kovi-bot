@@ -107,7 +107,8 @@ ambient_requires_mind_intent = true
 # 窗口越长，群内每条消息请求模型的概率越高。
 # 取值必须 ≤ reply_gap_secs：窗口比"她下次可以发言"的等待还长时，它会
 # 变成常开状态，低频抽样与候选冷却全部作废（线上 43% 的未点名回复落在
-# 这个窗口里）。窗口内的语义评估同样占用 decision_rate_limit 额度。
+# 这个窗口里）。超限不拒绝启动，只在启动时告警并按 reply_gap_secs 收口。
+# 窗口内的语义评估同样占用 decision_rate_limit 额度。
 continuation_window_secs = 60
 # 群聊可见回复节奏的确定性硬限制（显式识图/教学/命令不受限，管理员与普通
 # 成员同等受限）：同群两次可见聊天回复至少间隔 reply_gap_secs，每

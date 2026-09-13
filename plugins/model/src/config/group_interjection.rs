@@ -57,8 +57,8 @@ pub struct GroupInterjectionConfig {
     /// 取值必须 ≤ `reply_gap_secs`：接续窗口比"她下次可以发言"的等待还长
     /// 时，窗口会变成常开状态——一次可见回复之后的整段时间里，群里每条
     /// 未点名消息都确定性进入语义评估，低频抽样与候选冷却全部作废。超限
-    /// 时退回 `reply_gap_secs`（与 `effective_addressed_reply_gap_secs`
-    /// 同一约定）。
+    /// 时按 `reply_gap_secs` 收口并在启动时告警（与
+    /// `effective_addressed_reply_gap_secs` 同一约定，但不拒绝启动）。
     continuation_window_secs: u64,
     /// 未点名的群聊回合要有可见输出，必须由 Mind 提出一个带由头的开口
     /// （open question / agenda / interest）；Mind 判定 silent 时直接保持
@@ -257,11 +257,15 @@ impl GroupInterjectionConfig {
             ));
         }
         if self.continuation_window_secs > self.reply_gap_secs {
-            return Err(anyhow::anyhow!(
-                "接续对话窗口不能大于群聊回复间隔，否则窗口在她下次可以发言前一直敞开（{0} > {1}）",
-                self.continuation_window_secs,
-                self.reply_gap_secs
-            ));
+            // 只告警、不拒绝：读取侧一律按 `effective_continuation_window_secs`
+            // 收口到回复间隔，行为仍然正确，这条不变量有安全的降级路径。
+            // 而部署脚本会把服务端已有的 bot.conf.toml 原样带进新版本，硬失败
+            // 会把一个陈旧的数值变成"起不来"的事故。
+            eprintln!(
+                "[WARN] 接续对话窗口大于群聊回复间隔，已按回复间隔收口（{0} > {1} 秒）：\
+                 窗口比\"她下次可以发言\"的等待还长时，未点名消息会在整个窗口里逐条进入语义评估",
+                self.continuation_window_secs, self.reply_gap_secs
+            );
         }
         Ok(())
     }
@@ -348,13 +352,16 @@ mod tests {
     }
 
     #[test]
-    fn continuation_window_must_not_exceed_the_reply_gap() {
+    fn continuation_window_over_the_reply_gap_warns_instead_of_failing_startup() {
+        // 部署脚本会把服务端已有的 bot.conf.toml 原样带进新版本：陈旧数值
+        // 不该让服务起不来，读取侧的收口已经保证行为正确。
         let config = GroupInterjectionConfig {
             reply_gap_secs: 90,
             continuation_window_secs: 180,
             ..GroupInterjectionConfig::default()
         };
-        assert!(config.validate().is_err());
+        assert!(config.validate().is_ok());
+        assert_eq!(config.effective_continuation_window_secs(), 90);
     }
 
     #[test]
