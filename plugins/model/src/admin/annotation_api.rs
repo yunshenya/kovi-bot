@@ -726,8 +726,14 @@ pub(crate) struct QueueQuery {
     offset: usize,
     #[serde(default)]
     limit: Option<usize>,
+    /// 连已复核的一起列出（队列 = 待标 + 已标）。它不是"只看已标"——那层语义是
+    /// [`Self::reviewed_only`]。早先网页端的「已标注」页签把它当成了后者，于是
+    /// 那个页签列出来的是整批样本（4302 条里混着大量待标的）。
     #[serde(default)]
     include_reviewed: bool,
+    /// 只看已复核的：网页端「已标注」页签要的是这个。
+    #[serde(default)]
+    reviewed_only: bool,
     /// 默认跳过 `legacy_targeting_risk` 的样本（老批次里"@ 别人"被记成在叫她）。
     #[serde(default = "default_true")]
     skip_flagged: bool,
@@ -735,6 +741,33 @@ pub(crate) struct QueueQuery {
 
 fn default_true() -> bool {
     true
+}
+
+/// 队列该收哪些样本。
+///
+/// `include_reviewed` 与 `reviewed_only` 是两层**不同**的语义，别混：
+///
+/// - `include_reviewed`：队列里也放已复核的（待标 + 已标都列）；
+/// - `reviewed_only`：只要已复核的——网页端「已标注」页签要的是这个。
+///
+/// 早先只有前者，而「已标注」页签把它当成了后者，于是那个页签列出来的是整批样本
+/// （实测 4302 条里混着 4289 条待标的，页签名字完全对不上，用户点开一条"已标注"
+/// 看到的却是没标过的样本）。两者同时为真时取交集（只看已标），
+/// `include_reviewed=false` + `reviewed_only=true` 则是空集——那是个自相矛盾的
+/// 组合，接口不去纠正它，但行为要一眼看得出来。
+fn queue_rows(
+    samples: &[Value],
+    include_reviewed: bool,
+    reviewed_only: bool,
+    skip_flagged: bool,
+) -> Vec<(usize, &Value)> {
+    samples
+        .iter()
+        .enumerate()
+        .filter(|(_, sample)| include_reviewed || !is_reviewed(sample))
+        .filter(|(_, sample)| !reviewed_only || is_reviewed(sample))
+        .filter(|(_, sample)| !(skip_flagged && legacy_targeting_risk(sample)))
+        .collect()
 }
 
 /// `GET /api/annotation/queue`
@@ -746,17 +779,13 @@ pub(crate) async fn queue(Query(params): Query<QueueQuery>) -> Result<Json<Value
     let batch_name = params.batch.clone();
     let offset = params.offset;
     let include_reviewed = params.include_reviewed;
+    let reviewed_only = params.reviewed_only;
     let skip_flagged = params.skip_flagged;
     let body = blocking(move || {
         let path = batch_path(&batch_name)?;
         let batch = load_batch_at(&path)?;
         let samples = &batch.samples;
-        let mut rows: Vec<(usize, &Value)> = samples
-            .iter()
-            .enumerate()
-            .filter(|(_, sample)| include_reviewed || !is_reviewed(sample))
-            .filter(|(_, sample)| !(skip_flagged && legacy_targeting_risk(sample)))
-            .collect();
+        let mut rows = queue_rows(samples, include_reviewed, reviewed_only, skip_flagged);
         rows.sort_by_key(|(index, sample)| {
             (
                 queue_tier(sample),
@@ -809,6 +838,8 @@ pub(crate) async fn queue(Query(params): Query<QueueQuery>) -> Result<Json<Value
             "items": items,
             "summary": summarize(samples),
             "skipped_flagged": skip_flagged,
+            // 回显这次队列的口径：页签切到「已标注」时它应当是 true。
+            "reviewed_only": reviewed_only,
             // 队列是按标注价值排的，首屏必然全是最高价值那一档；把分布和每档的
             // 含义一并给出去，"怎么全是 tier 0" 在页面上就能自答。
             "tiers": TIER_LABELS
@@ -1089,6 +1120,39 @@ mod tests {
         assert!(parse_jsonl(wrong_version).is_err());
         assert!(parse_jsonl("not json").is_err());
         assert!(parse_jsonl("").is_err());
+    }
+
+    /// `include_reviewed`（连已标一起列）与 `reviewed_only`（只看已标）是两层
+    /// 语义。网页端的「已标注」页签曾经只发前者，于是那个页签列出的是整批样本：
+    /// 点开一条"已标注"看到的却是没标过的样本、说明行还写着"弱标签"。
+    #[test]
+    fn reviewed_filters_are_not_the_same_thing() {
+        let mut reviewed = sample("标过了", Some("flush_now"), Some("ignore"), false, 2);
+        reviewed["review_status"] = json!(STATUS_REVIEWED);
+        reviewed["label_provenance"] = json!({
+            "source": REVIEWED_SOURCE, "annotator_count": 1, "agreement": 1.0
+        });
+        let samples = [
+            sample("待标一", None, None, true, 2),
+            reviewed,
+            sample("待标二", None, None, false, 2),
+        ];
+
+        // 待标注页签：只看没标过的。
+        let pending = queue_rows(&samples, false, false, false);
+        assert_eq!(pending.len(), 2);
+        assert!(pending.iter().all(|(_, s)| !is_reviewed(s)));
+
+        // 已标注页签：只看标过的（这条就是修掉的那个 bug）。
+        let only = queue_rows(&samples, true, true, false);
+        assert_eq!(only.len(), 1);
+        assert!(is_reviewed(only[0].1));
+
+        // "连已标一起列"：全都要——4302 条那种整批口径。
+        assert_eq!(queue_rows(&samples, true, false, false).len(), 3);
+
+        // 自相矛盾的组合（不连已标、又要只看已标）结果是空集，不是"全都给"。
+        assert!(queue_rows(&samples, false, true, false).is_empty());
     }
 
     #[test]

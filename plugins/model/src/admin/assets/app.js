@@ -2449,10 +2449,15 @@
   }
 
   function annotationQuery(extra) {
+    // 「已标注」页签要看的是**只看已标**：`reviewed_only`。只发 include_reviewed
+    // 是不够的——那个参数的意思是"连已标的一起列"，队列会变成整批样本（实测
+    // 4302 条里混着 4289 条待标的，页签名字完全对不上）。
+    const reviewedTab = annotation.tab === 'reviewed';
     const params = new URLSearchParams({
       batch: annotation.batch,
       limit: String(annotation.limit),
-      include_reviewed: String(annotation.tab === 'reviewed'),
+      include_reviewed: String(reviewedTab),
+      reviewed_only: String(reviewedTab),
       skip_flagged: String(annotation.skipFlagged),
       ...extra,
     });
