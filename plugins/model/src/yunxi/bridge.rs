@@ -2148,12 +2148,9 @@ impl InboundMessage {
             text,
             attachments,
             vision_attachments,
-            sender_label: super::memory_writeback::normalized_sender_label(
-                event
-                    .sender
-                    .card
-                    .as_deref()
-                    .or(event.sender.nickname.as_deref()),
+            sender_label: super::memory_writeback::sender_label(
+                event.sender.card.as_deref(),
+                event.sender.nickname.as_deref(),
             ),
             timestamp: event_timestamp(event.time),
         })
@@ -2187,9 +2184,10 @@ impl InboundMessage {
             text,
             attachments,
             vision_attachments,
-            sender_label: super::memory_writeback::normalized_sender_label(Some(
-                &event.get_sender_nickname(),
-            )),
+            sender_label: super::memory_writeback::sender_label(
+                None,
+                Some(&event.get_sender_nickname()),
+            ),
             timestamp: event_timestamp(event.time),
         })
     }

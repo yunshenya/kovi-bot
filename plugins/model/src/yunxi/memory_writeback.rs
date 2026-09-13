@@ -203,8 +203,21 @@ fn bounded_text(value: &str) -> String {
     value.trim().chars().take(MAX_TEXT_CHARS).collect()
 }
 
-/// 说话人的显示名，口径与 V1 的两处 `normalized_*_sender_name` 一致：压掉多余空白、
-/// 最多 80 字、空值兜底成"未设置昵称"。名字进了记忆正文，所以要显式收口。
+/// 说话人的显示名：**群名片优先，空值退回昵称**，两者都没有才兜底。
+///
+/// 注意"空字符串"不是"没有"：QQ 上报的名片常常是 `Some("")`（没设群名片），
+/// 直接 `card.or(nickname)` 会挑中那个空串，最后记成"未设置昵称"——线上第一轮
+/// 写入就踩了这个坑。V1 的 `GroupSenderIdentity` 是先各自归一化再挑的。
+pub(crate) fn sender_label(card: Option<&str>, nickname: Option<&str>) -> String {
+    let picked = [card, nickname]
+        .into_iter()
+        .flatten()
+        .find(|value| !value.trim().is_empty());
+    normalized_sender_label(picked)
+}
+
+/// 收口说话人显示名：压掉多余空白、最多 80 字、空值兜底成"未设置昵称"。
+/// 名字进了记忆正文，所以要显式收口。
 pub(crate) fn normalized_sender_label(value: Option<&str>) -> String {
     let normalized = value
         .unwrap_or_default()
@@ -285,6 +298,18 @@ mod tests {
     fn reply_lines_are_prefixed_with_her_name_and_empty_stays_empty() {
         assert_eq!(reply_line(" 怎么啦，七七？ "), "芸汐: 怎么啦，七七？");
         assert!(reply_line("   ").is_empty());
+    }
+
+    /// 线上第一轮写入踩过的坑：名片是空串（没设群名片）时必须退回昵称，
+    /// 否则记忆里会记成"未设置昵称"，而那正是 V1 语料分辨说话人的字段。
+    #[test]
+    fn empty_group_card_falls_back_to_nickname() {
+        assert_eq!(sender_label(Some(""), Some("不忻")), "不忻");
+        assert_eq!(sender_label(Some("   "), Some("不忻")), "不忻");
+        assert_eq!(sender_label(Some(" 七七铺 "), Some("不忻")), "七七铺");
+        assert_eq!(sender_label(None, Some("不忻")), "不忻");
+        assert_eq!(sender_label(Some(""), Some("")), "未设置昵称");
+        assert_eq!(sender_label(None, None), "未设置昵称");
     }
 
     /// 截断只能截正文，不能把 JSON 结构切坏——切坏了这条记忆会连读都读不出来。
