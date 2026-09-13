@@ -12,9 +12,10 @@
 - **目标判定**:日志里的 `[at]`/`[reply]` 只说明"这条消息有指向",不说明指向谁
   (kovi 的 `Message::to_human_string` 对任何人的 @ 都渲染成 `[at]`,并明确写着
   不要靠它做判断)。运行时判定"指的是别人"时会打印「群聊消息指向其他成员,
-  仅观察不回复 (群组: N, 用户: M)」,采集器据此把这一类记成
-  `context.targeting = "other_member"`;带 at/reply 段却没有该标记的消息,
-  目标不可知,直接丢弃并计数——猜错会把 TurnGate 教反;
+  仅观察不回复 (群组: N, 用户: M)」,两处判定都带 `!addressed_to_bot`,所以它是
+  只在"不是叫她"时才出现的**否定信号**:命中标记记 `targeting = "other_member"`;
+  带 at/reply 段却没命中、而该群在日志里出现过标记的,反推为 `targeting = "her"`
+  (在叫她/回她);一次标记都没出现过的群仍然丢弃不猜;
 - 弱标签(pseudo_lexical_v0)来自高精度本地规则,只作候选,必须人工复核;
   lexical 无法判定的 completion 置 null;
 - 不保存 QQ 号/昵称/URL/Token;source_key 为不透明哈希,供删除屏障使用;
@@ -64,6 +65,15 @@ AT_OTHER_RE = re.compile(r"群聊消息指向其他成员，仅观察不回复 \
 AT_OTHER_WINDOW_SECS = 2.0
 # 第一行之后的续行(无 group 前缀)尽量匹配:任何不以 [ 开头的普通文本行。
 BODY_CONTINUATION_RE = re.compile(r"^[^\[\]].+$")
+# 带 syslog 前缀的行是**独立的日志记录**（`-o short-iso` 与 `-o short` 两种
+# 导出格式），绝不可能是上一条消息的续行。漏掉这条判断时，日志里每一条
+# INFO / Yunxi Mind / YUNXI_WORLD 行都会被当成续行粘进用户消息——实测
+# 2000 条样本里 94% 的正文因此被污染。真正的续行只可能是同一 journald 记录里
+# 带内嵌换行的正文，journalctl 对那种行不会再打前缀。
+SYSLOG_PREFIX_RE = re.compile(
+    r"^(?:\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:[+-]\d{2}:\d{2}|Z)"
+    r"|[A-Z][a-z]{2} [ \d]\d \d{2}:\d{2}:\d{2}) \S+ \S+: "
+)
 
 URL_RE = re.compile(r"https?://\S+", re.I)
 DIGITS_RE = re.compile(r"\d{8,}")
@@ -194,8 +204,13 @@ def main() -> int:
                 if ts is not None:
                     at_other_marks.append((ts, int(m.group(1)), int(m.group(2))))
                 continue
-            # 续行:同组同发送者的多段消息
-            if last and BODY_CONTINUATION_RE.match(line) and not line.startswith("["):
+            # 续行:同组同发送者的多段消息。必须不是独立日志记录（见
+            # SYSLOG_PREFIX_RE），否则会把别的日志行粘进消息正文。
+            if (
+                last
+                and not SYSLOG_PREFIX_RE.match(line)
+                and BODY_CONTINUATION_RE.match(line)
+            ):
                 kind, group, user, ts = last
                 if events and events[-1][4] == ts and events[-1][0] == kind:
                     events[-1] = (
@@ -219,9 +234,13 @@ def main() -> int:
     for ev in events:
         by_group.setdefault(ev[1], []).append(ev)
 
+    # 出现过"指向其他成员"标记的群：只有这些群里，"没打标记"才能反证"在叫她"。
+    marker_groups = {group for _, group, _ in at_other_marks}
+
     samples = []
     seen_keys = set()
     unresolved_targets = 0
+    inferred_her = 0
     for group_id, evs in by_group.items():
         # 完整时间线: 重建 unit 序列 (每 unit = 同一发言者的连续片段)
         units = []
@@ -248,10 +267,17 @@ def main() -> int:
             has_at_flag = has_at or "[at]" in "".join(texts)
             has_reply_flag = has_reply or "[reply]" in "".join(texts)
             # 目标判定：`[at]`/`[reply]` 只是"有指向"，日志不带目标是谁。运行时
-            # 在判定"指的是别人"时会打印一条标记行，用它把这一类还原成
-            # other_member；标记行缺席而消息带 at/reply 段的，目标不可知
-            # （可能是叫她本人，也可能是旧日志里 Core 链路静默跳过的 at-other），
-            # 这种样本一律丢弃——猜错等于把"@别人"教成"该回她"。
+            # 判定"指的是别人"时会打印一条标记行，而两处判定都带
+            # `!addressed_to_bot` / `!addressed_to_agent`（group.rs / bridge.rs），
+            # 所以这条标记是**只在"不是叫她"时才出现的否定信号**：
+            #
+            # - 命中标记 → other_member：明确指向别人；
+            # - 没命中、但该群在整份日志里出现过标记 → 标记机制在这个群是活的，
+            #   而这条消息带着 at/reply 段却没被判成"别人"，那它就是在叫她本人
+            #   （或是回她的消息）→ targeting = "her"；
+            # - 一次标记都没有的群 → unresolved，仍然丢弃：那种日志可能来自旧
+            #   版本，或者这条消息根本没走到判定点（群未授权、"等她发图"这类
+            #   早退分支），没有证据就不猜。
             at_other = any(
                 mark_group == group_id
                 and mark_user == sender
@@ -263,7 +289,7 @@ def main() -> int:
                 has_at_flag = False
                 has_reply_flag = False
             elif has_at_flag or has_reply_flag:
-                targeting = "unresolved"
+                targeting = "her" if group_id in marker_groups else "unresolved"
             else:
                 targeting = "none"
             clean = sanitize(cur)
@@ -293,11 +319,12 @@ def main() -> int:
             conversation_active = recent_bot or bot_recent
 
             if targeting == "unresolved":
-                # 目标不可知的样本不进批次。它们带着 `[at]`/`[reply]` 段，
-                # 但日志无法说明指的是谁：留下只能二选一，而两种猜法都是错的
-                # （猜"在叫她"把 @别人 教成必答；猜"没叫她"把真点名教成免打扰）。
+                # 一次标记都没出现过的群：既可能是旧版本日志，也可能是这条没走到
+                # 判定点。没有证据就不猜——猜错比少几条样本贵得多。
                 unresolved_targets += 1
                 continue
+            if targeting == "her":
+                inferred_her += 1
             context = {
                 "scope": "group",
                 "pending_user_fragments": [sanitize(t) for t in pending],
@@ -311,9 +338,10 @@ def main() -> int:
                 "has_image": has_image,
                 "has_sticker": has_face,
                 "policy_override": "must_reply" if (has_at_flag or has_reply_flag) else "none",
-                # 目标解析结果：none=消息不带 at/reply 段；other_member=运行时
-                # 判定它指向别人（只观察）。addressed_to_agent 只在这里为真时
-                # 才可能为真，绝不从"文本里有 [at]"直接推断。
+                # 目标解析结果（复核元数据，不进特征向量）：
+                # none=消息不带 at/reply 段；other_member=运行时判定它指向别人
+                # （只观察）；her=带 at/reply 段、但运行时没有判成"别人"，
+                # 而该群的标记机制是活的 → 在叫她/回她。
                 "targeting": targeting,
             }
             key = hashlib.sha256(
@@ -365,11 +393,18 @@ def main() -> int:
     )
     if unresolved_targets:
         # 不是错误，但要让人看见：这批日志里有多少条消息的"在叫谁"无从判断。
-        # 数量偏高通常意味着日志来自还没有 AT_OTHER 标记的旧版本——那时 Core
-        # 链路对 at-other 是静默跳过，采集器无法还原目标。
+        # 剩下的只可能是"标记机制从没在这些群里出现过"的情况——那时无从反证，
+        # 只能丢弃。
         print(
             f"dropped {unresolved_targets} samples with an unresolved at/reply "
-            f"target (日志需要含「群聊消息指向其他成员」标记行才能还原目标)"
+            f"target (这些群在整份日志里一次「群聊消息指向其他成员」标记都没有)"
+        )
+    if inferred_her:
+        # 反向推断出来的"在叫她"：标记只在"不是叫她"时打印，所以"带 at/reply
+        # 却没打标记"就是她在被叫。数字给出来，方便和人工复核对账。
+        print(
+            f"inferred {inferred_her} samples as addressed to her "
+            f"(带 at/reply 段且未命中「指向其他成员」标记，所在群的标记机制有效)"
         )
     # 机器人上下文覆盖率：0 说明 [send] 行没被解析进来（多半是导出格式的问题），
     # 这种批次只有半张样本，不该被当成可用数据。

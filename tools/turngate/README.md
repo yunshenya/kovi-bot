@@ -110,14 +110,34 @@ QQ 号/昵称/URL;删除请求按 source_key 从未训练样本移除;模型更�
   `[INFO] 群聊消息指向其他成员，仅观察不回复 (群组: N, 用户: M)`（Host 与
   Core 两条链路同一文案）；采集器据此记 `targeting = "other_member"`，
   `addressed_to_agent` 保持 false；
-- 带 at/reply 段却找不到该标记的消息，目标不可知 → **丢弃并计数**（批次摘要里
-  打印 `dropped N samples with an unresolved at/reply target`）。数量偏高说明
-  日志来自没有该标记的旧版本，重跑一次带标记的日志即可；
+- 这条标记是**只在"不是叫她"时才出现的否定信号**：两处判定都带
+  `!addressed_to_bot` / `!addressed_to_agent`（`group.rs` / `bridge.rs`）。
+  所以带 at/reply 段、却没命中标记、且**该群在整份日志里出现过标记**的消息，
+  反推为 `targeting = "her"`（在叫她 / 回她），`addressed_to_agent` /
+  `replies_to_agent` / `must_reply` 照实为真，摘要里打印
+  `inferred N samples as addressed to her`；
+- 一次标记都没出现过的群仍然**丢弃并计数**（`dropped N ... unresolved`）：那种
+  日志可能来自旧版本，或者这条消息根本没走到判定点（群未授权、"等她发图"这类
+  早退分支），没有证据就不猜。
 - 因此 `addressed_to_agent` / `replies_to_agent` 不再会从"文本里有 `[at]`"
-  直接推断为真。
+  直接推断为真，但也不会因为"目标分不出来"而把真正的点名样本一起扔掉——
+  早先那版"一律丢弃"会让整批样本里 `addressed_to_agent=true` 的数量变成 0，
+  而 response head 恰恰需要"被点名该回"的正样本（实测 3 天日志：263 条被
+  误丢，占候选的 ~12%）。
 
 `targeting` 只是复核用元数据，**不进特征向量**：特征协议是锁定的（见下方"修改
 约定"），要把它变成特征必须先走 Rust 与 Python 双侧的版本升级流程。
+注意 `addressed_to_agent` / `replies_to_agent` / `policy_override` **是**结构化
+特征（`features.py`），所以上面这条反推的准确度直接进权重——它靠的是"标记只否定
+不肯定"这个代码事实，改动任一侧的标记判定都要同步回来看这里。
+
+### 正文续行（导出格式的坑）
+
+`[group...]` 消息行是"当前句"的唯一来源，采集器还会把**不带 syslog 前缀**的
+后续行当成同一条消息的续行（journald 里带内嵌换行的正文，journalctl 不打前缀）。
+带前缀的行是独立日志记录，绝不能粘进正文——早先少了这条判断，`-o short-iso`
+整份导出时每一条 `INFO`/`Yunxi Mind`/`YUNXI_WORLD` 行都会被当成续行粘上去，
+实测 2000 条样本里 94% 的正文被污染，弱标签可用率也从 775 掉到 517。
 
 ## 修改约定
 
