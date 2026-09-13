@@ -77,6 +77,7 @@ enum BuiltinTool {
     TimeNow,
     TimeResolve,
     MemorySearch,
+    MemoryRemember,
     StickerMemoryTeach,
     ReminderCreate,
     ReminderList,
@@ -669,6 +670,36 @@ pub(crate) async fn initialize() -> Result<()> {
                 "additionalProperties": false
             }),
             source: ToolSource::Builtin(BuiltinTool::MemorySearch),
+        });
+    }
+
+    if config::get().memory().model_memory_enabled() {
+        definitions.push(ToolDefinition {
+            name: "memory.remember".to_string(),
+            description: "把一件**以后还会用到**的事记进当前私聊对象或当前群的长期记忆。只在这轮出现了具体、可复用的事实时调用：对方明确说出的偏好/习惯/身份细节（名字、称呼、职业、喜好、忌讳）、约定好的事、会持续影响后续互动的情况。不要记：寒暄与玩笑本身、随手可查的信息、你刚回复过的话、记忆里已经有的事——那些宿主会自动留档，重复写只会稀释检索。一条只写一件事，写清主体。".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "content": {
+                        "type": "string",
+                        "description": "要记住的这一件事，一句话写清主体与事实，例如“他养了一只叫团子的猫”“她不吃香菜”。"
+                    },
+                    "kind": {
+                        "type": "string",
+                        "enum": ["fact", "preference", "event"],
+                        "description": "fact=关于对方的事实（默认）；preference=对方的偏好或忌讳；event=带时间的具体事件。"
+                    },
+                    "importance": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 100,
+                        "description": "重要度，默认 50。≥70 的记忆不会被保留期清理，只在“永远不该忘”时才用（生日、重大忌讳），日常偏好维持默认。"
+                    }
+                },
+                "required": ["content"],
+                "additionalProperties": false
+            }),
+            source: ToolSource::Builtin(BuiltinTool::MemoryRemember),
         });
     }
 
@@ -1382,6 +1413,7 @@ impl ToolSource {
                     | BuiltinTool::PrivateContactsSearch
                     | BuiltinTool::PrivateMessageSend
                     | BuiltinTool::HealthCheck
+                    | BuiltinTool::MemoryRemember
                     | BuiltinTool::StickerMemoryTeach
             ),
             Self::Mcp {
@@ -1587,6 +1619,13 @@ async fn execute_builtin(
         BuiltinTool::TimeResolve => resolve_chinese_time(&arguments),
         BuiltinTool::MemorySearch => {
             search_memory(&arguments, tool_context.subject_id, tool_context.context).await
+        }
+        BuiltinTool::MemoryRemember => {
+            // 写操作：模型想完才调用，期间会话可能已经变了（群被禁言、票被作废），
+            // 所以和 reminder.create 一样先重新校验一次再落库。
+            let tool_context =
+                revalidate_tool_effect(&tool_context, reply_ticket, revalidator).await?;
+            remember_memory(&arguments, &tool_context).await
         }
         BuiltinTool::StickerMemoryTeach => {
             let tool_context =
@@ -2395,6 +2434,22 @@ async fn search_memory(
         )
         .await?;
     Ok(format_memory_results(&memories))
+}
+
+/// `memory.remember`：模型自己判断值得长期留存的事，落到**当前会话**的作用域。
+///
+/// 全部策略（参数校验、作用域解析、写入与回执文案）都在
+/// [`crate::yunxi::memory_writeback`] 里——记忆怎么写只有那一处实现，这里只做
+/// 参数搬运，免得两条写入路径各写一份口径。
+async fn remember_memory(
+    arguments: &Map<String, Value>,
+    tool_context: &ToolExecutionContext,
+) -> Result<String> {
+    let request = crate::yunxi::memory_writeback::parse_model_memory_request(arguments)
+        .map_err(|error| anyhow!("记忆内容不可用：{error}"))?;
+    crate::yunxi::memory_writeback::remember_model_memory(tool_context.destination, request)
+        .await
+        .map_err(|error| anyhow!("{error}"))
 }
 
 async fn search_web(arguments: &Map<String, Value>, max_result_chars: usize) -> Result<String> {

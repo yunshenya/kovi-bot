@@ -74,6 +74,12 @@ pub struct MemoryConfig {
     /// 设计与取舍见 [docs/yunxi-memory-v2-writeback.md](../../docs/yunxi-memory-v2-writeback.md)。
     /// 关掉即立刻停写（已写入的行不受影响，按 `retention_days` 自然老去）。
     core_writeback_enabled: bool,
+    /// 是否让模型自己决定记什么（`memory.remember` 工具，默认开）。
+    ///
+    /// [`Self::core_writeback_enabled`] 记的是"聊过什么"（每个投递成功的回合照抄一遍），
+    /// 这个开关记的是"她判断值得留下的东西"——用户说出的偏好、身份细节、约定。
+    /// 关掉只是不再提供这个工具，机械留档不受影响。
+    model_memory_enabled: bool,
 }
 
 impl MemoryConfig {
@@ -147,6 +153,10 @@ impl MemoryConfig {
 
     pub fn core_writeback_enabled(&self) -> bool {
         self.core_writeback_enabled
+    }
+
+    pub fn model_memory_enabled(&self) -> bool {
+        self.model_memory_enabled
     }
 
     pub fn runtime_history_ttl_secs(&self) -> u64 {
@@ -310,6 +320,7 @@ impl Default for MemoryConfig {
             autonomous_query_max_results: 8,
             autonomous_query_max_days: 3_650,
             core_writeback_enabled: true,
+            model_memory_enabled: true,
         }
     }
 }

@@ -163,6 +163,10 @@ autonomous_query_max_days = 3650
 # 同步回旧表。关掉即立刻停写（已写入的行按 retention_days 自然老去）。
 # 设计与取舍见 docs/yunxi-memory-v2-writeback.md。
 core_writeback_enabled = true
+# 让模型自己决定记什么（memory.remember 工具，默认开）。上面那个开关记的是"聊过
+# 什么"（每个回合照抄一遍），这个记的是"她判断值得留下的事"：对方的偏好、身份细节、
+# 约定。关掉只是不再提供这个工具，机械留档不受影响。
+model_memory_enabled = true
 
 [mind]
 enabled = true

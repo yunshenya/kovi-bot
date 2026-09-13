@@ -19,8 +19,8 @@ use chrono::{DateTime, Local, Utc};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 use yunxi_core::{
-    EventId, MAX_MEMORY_CONTENT_BYTES, MAX_MEMORY_CONTENT_CHARS, MemoryDraft, MemoryKind,
-    MemoryScope, MemoryStore,
+    EventId, IdentityStore, MAX_MEMORY_CONTENT_BYTES, MAX_MEMORY_CONTENT_CHARS, MemoryDraft,
+    MemoryKind, MemoryScope, MemoryStore,
 };
 
 /// 暂存多少条"已入站、还没投递"的回合。超出按入站顺序淘汰最旧的。
@@ -135,7 +135,16 @@ impl MemoryWriteback {
             lines.push((reply.as_str(), Utc::now()));
         }
         for (line, occurred_at) in lines {
-            match write_memory(store.as_ref(), turn.scope, line, occurred_at).await {
+            match write_memory(
+                store.as_ref(),
+                turn.scope,
+                line,
+                MemoryKind::Conversation,
+                WRITEBACK_IMPORTANCE,
+                occurred_at,
+            )
+            .await
+            {
                 Ok(()) => {}
                 Err(error) => kovi::log::warn!(
                     "Yunxi memory writeback failed: event_id={event_id} scope={:?} error={error}",
@@ -238,6 +247,8 @@ async fn write_memory(
     store: &dyn MemoryStore,
     scope: MemoryScope,
     content: &str,
+    kind: MemoryKind,
+    importance: u8,
     occurred_at: DateTime<Utc>,
 ) -> Result<(), yunxi_core::MemoryStoreError> {
     // 渲染后的正文（含 JSON 结构）也必须落在记忆的限额内，否则 `MemoryDraft::new`
@@ -253,13 +264,145 @@ async fn write_memory(
             ),
         });
     }
-    let draft = MemoryDraft::new(scope, MemoryKind::Conversation, content, occurred_at)
-        .and_then(|draft| draft.with_importance(WRITEBACK_IMPORTANCE))
+    let draft = MemoryDraft::new(scope, kind, content, occurred_at)
+        .and_then(|draft| draft.with_importance(importance))
         .map_err(|error| yunxi_core::MemoryStoreError::InvalidRequest {
             reason: error.to_string(),
         })?;
     store.remember(&draft).await?;
     Ok(())
+}
+
+// ───────────────────────────── 模型自记记忆（memory.remember 工具） ─────────────────────────────
+//
+// 上面那套是"机械流水"：每个投递成功的回合照抄一遍。这一套是"她自己的判断"：把
+// 值得长期留存的东西（对方的偏好、身份细节、约定）写成事实。两者都写 v2，都由适配器
+// 同步回旧表，所以召回路子完全一样。
+//
+// 为什么是工具而不是 Core 的 `StateUpdateProposal::Memory`：工具路线不改 Core 契约，
+// 白拿现成的权限闸门（写工具自动被排除在"工具结果回合只能调只读工具"之外），而且
+// 模型能收到"已记住"的回执、当场知道成没成。取舍见 docs/yunxi-memory-v2-writeback.md。
+
+/// 模型自记记忆的默认重要度。
+const MODEL_MEMORY_DEFAULT_IMPORTANCE: u8 = 50;
+
+/// 模型要求记住的一条记忆（已解析、已收口）。
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ModelMemoryRequest {
+    pub(crate) content: String,
+    pub(crate) kind: MemoryKind,
+    pub(crate) importance: u8,
+}
+
+/// 解析 `memory.remember` 的参数。
+///
+/// 模型给的值一律当作不可信输入：正文必填且收口、kind 只认白名单（不认识就报错，
+/// 而不是猜一个——猜错了会把事件记成事实，而且模型收不到纠正信号）、importance
+/// 缺省 50、越界夹到 0..=100。
+pub(crate) fn parse_model_memory_request(
+    arguments: &serde_json::Map<String, serde_json::Value>,
+) -> Result<ModelMemoryRequest, String> {
+    let content = arguments
+        .get("content")
+        .and_then(serde_json::Value::as_str)
+        .map(bounded_text)
+        .filter(|content| !content.is_empty())
+        .ok_or_else(|| "content 不能为空".to_string())?;
+    let kind = match arguments.get("kind").and_then(serde_json::Value::as_str) {
+        None => MemoryKind::Fact,
+        Some("fact") => MemoryKind::Fact,
+        Some("preference") => MemoryKind::Preference,
+        Some("event") => MemoryKind::Event,
+        Some(other) => {
+            return Err(format!(
+                "kind 只支持 fact / preference / event，收到 {other}"
+            ));
+        }
+    };
+    let importance = match arguments.get("importance") {
+        None | Some(serde_json::Value::Null) => MODEL_MEMORY_DEFAULT_IMPORTANCE,
+        Some(value) => {
+            let Some(number) = value.as_i64() else {
+                return Err("importance 必须是整数".to_string());
+            };
+            u8::try_from(number.clamp(0, 100)).unwrap_or(MODEL_MEMORY_DEFAULT_IMPORTANCE)
+        }
+    };
+    Ok(ModelMemoryRequest {
+        content,
+        kind,
+        importance,
+    })
+}
+
+/// 执行 `memory.remember`：把模型写下的内容落到**当前会话**对应的作用域。
+///
+/// 作用域只能由宿主从 `destination` 推出来，模型无法指定——否则它可以往任意私聊对象
+/// 或群里写记忆。返回值是给模型看的回执（成功或失败原因都会进对话）。
+pub(crate) async fn remember_model_memory(
+    destination: crate::model::MessageDestination,
+    request: ModelMemoryRequest,
+) -> Result<String, String> {
+    let scope = model_memory_scope(destination).await?;
+    let Some(store) = super::memory_store() else {
+        return Err("记忆存储不可用".to_string());
+    };
+    write_memory(
+        store.as_ref(),
+        scope,
+        &request.content,
+        request.kind,
+        request.importance,
+        Utc::now(),
+    )
+    .await
+    .map_err(|error| format!("写入失败: {error}"))?;
+    // 留痕：她能自己记什么、记成什么重要度，是这类"模型自主写入"最需要可审计的部分。
+    println!(
+        "[INFO] 模型自记记忆 scope={:?} kind={:?} importance={}: {}",
+        scope, request.kind, request.importance, request.content
+    );
+    Ok(format!(
+        "已记住（{}，重要度 {}）：{}",
+        model_kind_label(request.kind),
+        request.importance,
+        request.content
+    ))
+}
+
+async fn model_memory_scope(
+    destination: crate::model::MessageDestination,
+) -> Result<MemoryScope, String> {
+    let identities = super::identity_store().ok_or_else(|| "身份存储不可用".to_string())?;
+    match destination {
+        crate::model::MessageDestination::Private(user_id) => {
+            let external = super::qq::person(user_id).map_err(|error| error.to_string())?;
+            let person_id = identities
+                .resolve_external_identity(&external)
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(MemoryScope::Person(person_id))
+        }
+        crate::model::MessageDestination::Group(group_id) => {
+            let external = super::qq::group(group_id).map_err(|error| error.to_string())?;
+            let conversation_id = identities
+                .resolve_external_conversation(&external)
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(MemoryScope::Conversation(conversation_id))
+        }
+    }
+}
+
+const fn model_kind_label(kind: MemoryKind) -> &'static str {
+    match kind {
+        MemoryKind::Fact => "事实",
+        MemoryKind::Preference => "偏好",
+        MemoryKind::Event => "事件",
+        MemoryKind::Conversation => "对话",
+        MemoryKind::Profile => "档案",
+        MemoryKind::Emotion => "情绪",
+    }
 }
 
 #[cfg(test)]
@@ -365,5 +508,82 @@ mod tests {
             !pending.entries.contains_key(&oldest),
             "最早的一条应该先被淘汰"
         );
+    }
+
+    fn model_args(value: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+        value.as_object().cloned().expect("参数应是对象")
+    }
+
+    #[test]
+    fn model_memory_parses_the_documented_shape() {
+        let request = parse_model_memory_request(&model_args(serde_json::json!({
+            "content": " 她不吃香菜 ",
+            "kind": "preference",
+            "importance": 80
+        })))
+        .expect("应能解析");
+        assert_eq!(request.content, "她不吃香菜");
+        assert_eq!(request.kind, MemoryKind::Preference);
+        assert_eq!(request.importance, 80);
+
+        // 缺省：kind=fact、importance=50。
+        let request = parse_model_memory_request(&model_args(
+            serde_json::json!({"content": "他养了一只叫团子的猫"}),
+        ))
+        .expect("应能解析");
+        assert_eq!(request.kind, MemoryKind::Fact);
+        assert_eq!(request.importance, MODEL_MEMORY_DEFAULT_IMPORTANCE);
+    }
+
+    /// 模型给的值一律当不可信输入：空正文、胡编的 kind、越界或非整数的 importance
+    /// 都要给回一个明确的错误（模型看得到回执，下次才知道怎么改）。
+    #[test]
+    fn model_memory_rejects_or_clamps_untrusted_arguments() {
+        for arguments in [
+            serde_json::json!({}),
+            serde_json::json!({"content": "   "}),
+            serde_json::json!({"content": 42}),
+        ] {
+            assert!(
+                parse_model_memory_request(&model_args(arguments)).is_err(),
+                "空正文或非字符串正文必须报错"
+            );
+        }
+
+        let unknown_kind = parse_model_memory_request(&model_args(
+            serde_json::json!({"content": "x", "kind": "rumor"}),
+        ))
+        .expect_err("未知 kind 必须报错而不是猜一个");
+        assert!(
+            unknown_kind.contains("fact / preference / event"),
+            "{unknown_kind}"
+        );
+
+        let high = parse_model_memory_request(&model_args(
+            serde_json::json!({"content": "x", "importance": 250}),
+        ))
+        .expect("应能解析");
+        assert_eq!(high.importance, 100);
+        let low = parse_model_memory_request(&model_args(
+            serde_json::json!({"content": "x", "importance": -5}),
+        ))
+        .expect("应能解析");
+        assert_eq!(low.importance, 0);
+        assert!(
+            parse_model_memory_request(&model_args(
+                serde_json::json!({"content": "x", "importance": "很高"})
+            ))
+            .is_err(),
+            "非整数 importance 必须报错"
+        );
+    }
+
+    #[test]
+    fn model_memory_content_is_bounded() {
+        let long = "记".repeat(MAX_TEXT_CHARS + 100);
+        let request =
+            parse_model_memory_request(&model_args(serde_json::json!({ "content": long })))
+                .expect("应能解析");
+        assert_eq!(request.content.chars().count(), MAX_TEXT_CHARS);
     }
 }

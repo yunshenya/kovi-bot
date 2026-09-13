@@ -12,7 +12,7 @@ mod identity_store;
 pub(crate) mod intrinsic_runtime;
 pub(crate) mod memory_migration;
 mod memory_store;
-mod memory_writeback;
+pub(crate) mod memory_writeback;
 mod mind_runtime;
 mod mind_store;
 mod open_loop_scheduler;

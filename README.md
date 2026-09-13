@@ -575,6 +575,7 @@ DeepSeek 的 `thinking.type=disabled`，在 Responses 请求中发送 `reasoning
 
 - `time.now`：获取当前时间，支持 `Asia/Shanghai`、`Asia/Tokyo`、`UTC` 等 IANA 时区。
 - `memory.search`：查询当前私聊对象或当前群的长期记忆，范围由程序强制决定。
+- `memory.remember`：把她判断值得长期留存的事（对方的偏好、身份细节、约定）记进当前会话的记忆。作用域同样由程序从当前会话推出，模型无法指定写到谁的头上；`memory.model_memory_enabled` 可关。
 - `web.search`：搜索公开网页；配置 `BRAVE_SEARCH_API_KEY` 时优先使用 Brave Search，失败后依次使用 Bing、DuckDuckGo HTML 兜底。
 - `web.fetch`：读取公开网页正文，只允许 HTTP/HTTPS，拒绝本机、内网 IP、内网 DNS 解析和自动重定向。
 - `news.search`：按主题和最近天数搜索新闻，可限制来源域名；定时新闻任务优先使用它。
