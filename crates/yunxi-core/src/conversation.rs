@@ -363,7 +363,10 @@ impl ConversationLifecycle {
             self.directive == ConversationTurnDirective::Continue
                 && self.next_wake_at.is_some_and(|wake| now >= wake)
         } else {
-            now.signed_duration_since(last_inbound) >= policy.idle_for(self.kind).unwrap()
+            // `System` returned above; every other kind has an idle window.
+            policy
+                .idle_for(self.kind)
+                .is_some_and(|idle| now.signed_duration_since(last_inbound) >= idle)
         })
     }
 
@@ -418,10 +421,13 @@ impl ConversationLifecycle {
             }
             ConversationTurnDirective::End => ConversationPhase::Ended,
         };
+        // `cooldown_for` deliberately has no value for `System` (it never autonomously
+        // continues), so map instead of unwrapping: `record_outbound` is public and
+        // accepts a System lifecycle, and a panic there would poison the host registry.
         self.next_wake_at = match directive {
-            ConversationTurnDirective::Continue => {
-                Some(occurred_at + policy.cooldown_for(self.kind).unwrap())
-            }
+            ConversationTurnDirective::Continue => policy
+                .cooldown_for(self.kind)
+                .map(|cooldown| occurred_at + cooldown),
             ConversationTurnDirective::Wait | ConversationTurnDirective::End => None,
         };
         self.bump_version()
@@ -599,5 +605,26 @@ mod tests {
         assert!(encoded.get("qq").is_none());
         let decoded: ConversationLifecycle = serde_json::from_value(encoded).unwrap();
         assert_eq!(decoded.kind(), ConversationKind::Direct);
+    }
+
+    /// `System` has no cooldown/idle window by design, so both the read path
+    /// (`autonomous_due`) and the write path (`apply_directive` via the public
+    /// `record_outbound`) must treat "no window" as "no autonomous wake" rather
+    /// than unwrapping it — a panic here would poison the host's registry.
+    #[test]
+    fn system_conversations_never_autonomously_continue_and_do_not_panic() {
+        let start = Utc::now();
+        let policy = AutonomyPolicy::default();
+        let mut lifecycle =
+            ConversationLifecycle::new(ConversationId::new(), ConversationKind::System).unwrap();
+        lifecycle
+            .record_outbound(start, Some(ConversationTurnDirective::Continue), policy)
+            .expect("System 回合不应 panic");
+        assert!(lifecycle.next_wake_at().is_none());
+        assert!(
+            !lifecycle
+                .autonomous_due(start + Duration::days(7), policy)
+                .expect("System 不应报错")
+        );
     }
 }
