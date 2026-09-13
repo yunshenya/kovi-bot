@@ -2,8 +2,11 @@ target
 .idea
 server-login
 .env
-# 运行时配置可能含 QQ 号、白名单、主机和 Token；仓库只跟踪 *.example.toml。
-bot.conf.toml
+# 注意：bot.conf.toml **故意保持跟踪**，不是漏网。它是发布配置本身，并且被
+# config::tests::repository_configuration_loads_with_all_sections 当作被测对象
+# 钉住（thinking_mode / max_entries / 冷却时长 / 提示词里不许出现的协议字样）。
+# 所以它只能写不含密的部分：密钥一律走 api_key_env / token_env 的 env 间接，
+# 真实 Token 放在已忽略的 .env 里。
 # 管理后台写到运行时目录的覆盖配置与自动生成的登录 Token。
 bot.conf.override.toml
 .yunxi-admin-token
