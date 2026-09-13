@@ -3613,7 +3613,13 @@ fn stash_pending_memory_line(
             super::memory_writeback::private_inbound_line(&message.sender_label, &message.text),
         ),
     };
-    writeback.stash_inbound(event_id, scope, line, message.timestamp);
+    writeback.stash_inbound(
+        event_id,
+        scope,
+        line,
+        message.timestamp,
+        message.visible_reply_allowed,
+    );
 }
 
 #[allow(dead_code)]
@@ -3974,13 +3980,11 @@ async fn resolve_and_submit_inner(
         // 事件真的进了 Core 才暂存入站行：投递成功时它会连同回复一起变成一条长期
         // 记忆（见 memory_writeback）。被丢弃的事件不会有回复，暂存只会占位。
         //
-        // 只暂存"这一轮归 Core"的副本。`visible_reply_allowed` 就是所有权标记：
-        // `enqueue_group_observation` 把观察副本置 false，而观察副本是 Host 路为了
-        // 让 Core 也看到而注入的——那条消息的记忆由 Host 的观察流负责，两边都写会
-        // 让同一句话落两份（沉默回合落档那条路径尤其会把它放大成"每条都写两次"）。
-        if message.visible_reply_allowed {
-            stash_pending_memory_line(message, person_id, conversation_id, event_id);
-        }
+        // 观察副本（`visible_reply_allowed=false`）同样暂存：它偶尔也会真的说话
+        // （Mind 的 AgendaResume 会越过 Silent 基线），那次的回复必须留档。它什么
+        // 都没说时不能写——那条消息的记忆归 Host 的观察流，所以所有权标记随暂存
+        // 一起带上，由 `record_silent_turn` 自己跳过。
+        stash_pending_memory_line(message, person_id, conversation_id, event_id);
     }
     if registered_incoming
         && !matches!(admission, Admission::Accepted)

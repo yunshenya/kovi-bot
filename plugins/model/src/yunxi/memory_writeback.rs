@@ -66,6 +66,13 @@ struct PendingTurn {
     occurred_at: DateTime<Utc>,
     /// 入站顺序，用于容量淘汰。
     sequence: u64,
+    /// 这一轮是不是**归 Core** 的（`visible_reply_allowed`）。
+    ///
+    /// 观察副本（Host 路为了让 Core 也看到而注入的那一份）是 false：它偶尔也会
+    /// 真的说话（Mind 的 AgendaResume 会越过 Silent 基线），那次的回复必须写；
+    /// 但它什么都没说时，这条消息的记忆归 Host 的观察流，Core 再写一份就是同一句
+    /// 话落两份。所以区别只在 [`MemoryWriteback::record_silent_turn`] 里生效。
+    core_owned: bool,
 }
 
 #[derive(Default)]
@@ -89,19 +96,18 @@ impl MemoryWriteback {
         }
     }
 
-    /// ingress 侧：把这一轮（**归 Core 的**那个副本）的入站行挂到事件上。
+    /// ingress 侧：把这一轮的入站行挂到事件上。
     ///
     /// 事件进 Core 之前调用。取用有两条互斥的收尾路径：投递成功 →
     /// [`Self::record_delivered_turn`]（对方说的 + 她回的），什么都没发出去 →
-    /// [`Self::record_silent_turn`]（只留"她读到过"）。Host 路的观察副本不进暂存
-    /// （`bridge.rs` 按 `visible_reply_allowed` 过滤），那条消息的记忆由 Host 的
-    /// 观察流负责，两边都写会让同一句话落两份。
+    /// [`Self::record_silent_turn`]（只留"她读到过"，且只对 `core_owned` 的回合）。
     pub(crate) fn stash_inbound(
         &self,
         event_id: EventId,
         scope: MemoryScope,
         line: String,
         occurred_at: DateTime<Utc>,
+        core_owned: bool,
     ) {
         let Ok(mut pending) = self.pending.lock() else {
             // 锁中毒只可能是别的线程 panic 时留下的；记忆是尽力而为，不能反过来
@@ -127,6 +133,7 @@ impl MemoryWriteback {
                 line,
                 occurred_at,
                 sequence,
+                core_owned,
             },
         );
     }
@@ -177,12 +184,18 @@ impl MemoryWriteback {
     /// 过话，不能写进"她参与过的对话"）、重要度低一档（不与真实对话抢召回）、
     /// 吃每会话每小时的护栏（热闹的群不该把召回池冲淡）。没有暂存就是空操作，
     /// 所以主动消息天然不受影响。
+    ///
+    /// 观察副本（`core_owned=false`）直接跳过：那条消息 Host 的观察流已经记过，
+    /// Core 再写一份就是同一句话落两份。
     pub(crate) async fn record_silent_turn(&self, event_id: EventId) {
         // 先取再判开关：入口已经关闭时暂存里不会有新条目，而已有的条目不该
         // 因为开关被关掉就永远留在暂存里等淘汰。
         let Some(turn) = self.take_pending(event_id) else {
             return;
         };
+        if !turn.core_owned {
+            return;
+        }
         // `config::get()` 返回临时 Arc，先绑成局部变量再借用它的一节。
         let config = crate::config::get();
         let memory = config.memory();
@@ -603,13 +616,20 @@ mod tests {
     fn stash_is_bounded_and_evicts_the_oldest() {
         let writeback = MemoryWriteback::new();
         let oldest = EventId::new();
-        writeback.stash_inbound(oldest, MemoryScope::Global, "old".to_string(), Utc::now());
+        writeback.stash_inbound(
+            oldest,
+            MemoryScope::Global,
+            "old".to_string(),
+            Utc::now(),
+            true,
+        );
         for _ in 0..MAX_PENDING_TURNS {
             writeback.stash_inbound(
                 EventId::new(),
                 MemoryScope::Global,
                 "new".to_string(),
                 Utc::now(),
+                true,
             );
         }
         assert_eq!(writeback.pending_len(), MAX_PENDING_TURNS);
@@ -626,9 +646,41 @@ mod tests {
         // 路径取一次，否则同一轮会被写两遍。
         let writeback = MemoryWriteback::new();
         let event_id = EventId::new();
-        writeback.stash_inbound(event_id, MemoryScope::Global, "行".to_string(), Utc::now());
+        writeback.stash_inbound(
+            event_id,
+            MemoryScope::Global,
+            "行".to_string(),
+            Utc::now(),
+            true,
+        );
         assert!(writeback.take_pending(event_id).is_some());
         assert!(writeback.take_pending(event_id).is_none());
+    }
+
+    #[test]
+    fn observation_copies_do_not_leave_a_silent_turn_memory() {
+        // 观察副本（Host 路注入的那一份）什么都没说时不该落档：那条消息的记忆归
+        // Host 的观察流，Core 再写一份就是同一句话落两份。判据是它连"每小时名额"
+        // 都不该动——名额只服务于真的会落档的回合。
+        let writeback = MemoryWriteback::new();
+        let group = MemoryScope::Conversation(yunxi_core::ConversationId::new());
+        let event_id = EventId::new();
+        writeback.stash_inbound(event_id, group, "行".to_string(), Utc::now(), false);
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(writeback.record_silent_turn(event_id));
+        assert!(
+            !writeback
+                .silent_turns
+                .lock()
+                .expect("锁可用")
+                .contains_key(&group),
+            "观察副本不该占用沉默回合的名额"
+        );
+        assert!(
+            writeback.take_pending(event_id).is_none(),
+            "取过的暂存不该留在表里"
+        );
     }
 
     #[test]
