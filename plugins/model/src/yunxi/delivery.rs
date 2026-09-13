@@ -548,15 +548,17 @@ impl QqActionAdapter {
             QqDestination::Private(_) => None,
         };
         let text = content.as_text();
-        // Core 标记了语音就交给本机 TTS 合成一条 QQ 语音；配置、合成或落盘任何
-        // 一步不成立都退回文字——语音只是表达方式，不该把这条回复弄丢。
-        let voice_message = voice_message_for(content, crate::config::get().qq_voice()).await;
-        if content.is_voice() && voice_message.is_none() {
+        // Core 标记了语音/唱歌就交给本机合成一条 QQ 语音；配置、合成或落盘任何
+        // 一步不成立都退回文字——表达方式不该把这条回复弄丢。
+        let config = crate::config::get();
+        let speech_message = speech_message_for(content, config.qq_voice(), config.qq_sing()).await;
+        if (content.is_sing() || content.is_voice()) && speech_message.is_none() {
             kovi::log::warn!(
-                "语音消息不可用，本轮已回退成文字: conversation_id={expected_conversation_id}"
+                "语音消息不可用，本轮已回退成文字: conversation_id={expected_conversation_id} singing={}",
+                content.is_sing()
             );
         }
-        let message = outbound_message(text, external_reply_to, voice_message);
+        let message = outbound_message(text, external_reply_to, speech_message);
         let fingerprint_content =
             serde_json::to_string(content).unwrap_or_else(|_| content.as_text().to_owned());
         let fingerprint = contextual_outgoing_fingerprint(
@@ -1346,6 +1348,30 @@ async fn voice_message_for(
     crate::voice_reply::build_voice_message(voice_config, content.as_text()).await
 }
 
+/// 需要"说出来"的内容：唱歌优先（带旋律），唱不出来就退成念歌词；都失败返回
+/// `None`，调用方按文字发送。唱歌服务不可用时不会把一条该唱的消息变成哑巴。
+async fn speech_message_for(
+    content: &MessageContent,
+    voice_config: &crate::config::QqVoiceConfig,
+    sing_config: &crate::config::QqSingConfig,
+) -> Option<Message> {
+    if let Some(template) = content.sing_template() {
+        if let Some(sung) = crate::sing_reply::build_sing_message(
+            voice_config,
+            sing_config,
+            template,
+            content.as_text(),
+        )
+        .await
+        {
+            return Some(sung);
+        }
+        kovi::log::warn!("唱歌失败，本轮改用语音念出来: template={template}");
+        return crate::voice_reply::build_voice_message(voice_config, content.as_text()).await;
+    }
+    voice_message_for(content, voice_config).await
+}
+
 /// 组装要发给 QQ 的那条消息：语音优先，合成成功时整条消息只有 `record` 段
 /// （语音消息承载不了引用）；否则退回文字，引用照旧挂在第一条上。
 fn outbound_message(text: &str, reply_to: Option<i64>, voice: Option<Message>) -> Message {
@@ -1580,7 +1606,7 @@ mod tests {
         QqDestination, ReachOutDeliveryOutcome, compatibility_reach_out_outcome,
         delivery_authorization_allows, delivery_route_is_unchanged, durable_commit_error,
         outbound_message, parse_qq_destination, recorded_delivery_outcome, single_positive_qq_id,
-        voice_message_for,
+        speech_message_for, voice_message_for,
     };
     use crate::model::TrackedSendError;
     use crate::yunxi::delivery_ledger::{DeliveryCommitError, DeliveryStatus};
@@ -1651,6 +1677,65 @@ mod tests {
 
     /// 假 TTS 与调用方必须在同一个 runtime 里：runtime 一丢，后台 accept 任务
     /// 也会跟着消失。
+    /// 假的歌声合成服务：只回一段固定字节，验证的是"唱歌结果怎么变成 QQ 消息"。
+    async fn spawn_stub_sing(payload: Vec<u8>, status: u16) -> String {
+        use kovi::tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = kovi::tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stub sing");
+        let port = listener.local_addr().expect("stub sing address").port();
+        kovi::tokio::spawn(async move {
+            // 同一轮里会被问两次：先取模板清单，再发合成请求。
+            for _ in 0..4 {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buffer = [0_u8; 8192];
+                let read = socket.read(&mut buffer).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+                let (content_type, body) = if request.contains("/v1/templates") {
+                    (
+                        "application/json",
+                        r#"{"templates":[{"id":"xiaoxingxing","name":"小星星","mood":"童谣","syllables":14}]}"#
+                            .as_bytes()
+                            .to_vec(),
+                    )
+                } else {
+                    ("audio/wav", payload.clone())
+                };
+                let code = if status == 200 { 200 } else { status };
+                let head = format!(
+                    "HTTP/1.1 {code} OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = socket.write_all(head.as_bytes()).await;
+                let _ = socket.write_all(&body).await;
+                let _ = socket.flush().await;
+            }
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    /// 歌声服务与语音服务跑在同一个 runtime 里，两个 URL 一起交给被测代码。
+    fn block_on_with_stubs<F, Fut>(
+        sing_payload: Vec<u8>,
+        sing_status: u16,
+        pcm: Vec<u8>,
+        body: F,
+    ) -> Fut::Output
+    where
+        F: FnOnce(String, String) -> Fut,
+        Fut: std::future::Future,
+    {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("tokio runtime")
+            .block_on(async move {
+                let sing = spawn_stub_sing(sing_payload, sing_status).await;
+                let tts = spawn_stub_tts(pcm).await;
+                body(sing, tts).await
+            })
+    }
+
     fn block_on_with_stub_tts<F, Fut>(pcm: Vec<u8>, body: F) -> Fut::Output
     where
         F: FnOnce(String) -> Fut,
@@ -1691,6 +1776,89 @@ mod tests {
         // 没标记语音的回复连合成请求都不会发（地址是死端口，发了就会超时）。
         let typed = MessageContent::text("普通文字。");
         assert!(block_on(voice_message_for(&typed, &config)).is_none());
+    }
+
+    /// 唱歌配置：模板服务指向假服务，暂存目录用测试独占目录。
+    fn sing_config_for(base_url: &str) -> crate::config::QqSingConfig {
+        serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "base_url": base_url,
+            "timeout_secs": 5,
+            "default_template": "zichang-qingkuai",
+        }))
+        .expect("qq_sing test config")
+    }
+
+    #[test]
+    fn singing_goes_through_the_sing_channel() {
+        let dir = staging_dir("sing");
+        let staged = dir.display().to_string();
+        let wav = b"RIFF....WAVEfmt ".to_vec();
+
+        let message =
+            block_on_with_stubs(wav.clone(), 200, vec![9_u8; 640], |sing_url, tts_url| {
+                let staged = staged.clone();
+                async move {
+                    let voice = voice_config(&staged, &tts_url, true);
+                    let sing = sing_config_for(&sing_url);
+                    speech_message_for(
+                        &MessageContent::sing("一闪一闪亮晶晶", "xiaoxingxing"),
+                        &voice,
+                        &sing,
+                    )
+                    .await
+                    .expect("stub sing service should produce a voice message")
+                }
+            });
+        let segments = message.iter().collect::<Vec<_>>();
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].type_, "record");
+        let file = segments[0].data["file"].as_str().expect("record file");
+        assert!(
+            file.starts_with("file:///app/qq-call/voice/sing-") && file.ends_with(".wav"),
+            "唱歌的音频也该走同一条 NapCat 路径: {file}"
+        );
+        let written = std::fs::read_dir(&dir)
+            .expect("staging dir")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            written.iter().any(|name| name.starts_with("sing-")),
+            "expect a sing-*.wav in {written:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failing_sing_service_falls_back_to_speech() {
+        let dir = staging_dir("sing-fallback");
+        let staged = dir.display().to_string();
+        let pcm = vec![7_u8; 3_200];
+
+        let message =
+            block_on_with_stubs(b"sing exploded".to_vec(), 500, pcm, |sing_url, tts_url| {
+                let staged = staged.clone();
+                async move {
+                    let voice = voice_config(&staged, &tts_url, true);
+                    let sing = sing_config_for(&sing_url);
+                    speech_message_for(
+                        &MessageContent::sing("一闪一闪亮晶晶", "xiaoxingxing"),
+                        &voice,
+                        &sing,
+                    )
+                    .await
+                    .expect("唱不出来时要退成念歌词，而不是丢消息")
+                }
+            });
+        let segments = message.iter().collect::<Vec<_>>();
+        assert_eq!(segments[0].type_, "record");
+        let file = segments[0].data["file"].as_str().expect("record file");
+        assert!(
+            file.contains("voice-"),
+            "失败时应当退回语音合成的文件: {file}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

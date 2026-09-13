@@ -178,7 +178,12 @@ class SpeechEngine:
         else:
             model = sherpa_onnx.OfflineTtsModelConfig(
                 vits=sherpa_onnx.OfflineTtsVitsModelConfig(
-                    model=self._tts_files["model"], **common
+                    model=self._tts_files["model"],
+                    # 时长预测的随机噪声：默认 0.8 会让**同一句话每次长度都不一样**
+                    # （实测同一个字 0.29s/0.32s/0.42s 乱跳）。打电话时无所谓，但唱歌
+                    # 要按时值对齐音符，所以默认关掉它；想要一点随机感可以调大。
+                    noise_scale_w=self.args.tts_noise_scale_w,
+                    **common,
                 ),
                 num_threads=self.args.threads,
                 provider="cpu",
@@ -231,12 +236,18 @@ class SpeechEngine:
             self._asr.decode_stream(stream)
             return str(stream.result.text).strip()
 
-    def synthesize(self, text: str, target_rate: int | None):
-        """按句合成，逐句 yield ``(采样率, int16 PCM 字节)``。"""
+    def synthesize(self, text: str, target_rate: int | None, speed: float | None = None):
+        """按句合成，逐句 yield ``(采样率, int16 PCM 字节)``。
+
+        ``speed`` 是**单次请求**的语速倍率。唱歌那条链路要按音符时值把单个字拉长，
+        必须在合成时调 length_scale，而不是事后拼接拉伸——后者会把字头削掉、听感
+        发飘。缺省仍用进程启动时的 ``--tts-speed``，所以通话与语音消息的行为不变。
+        """
+        speed = speed if speed is not None else self.args.tts_speed
         for sentence in split_sentences(text):
             with self._tts_lock:
                 audio = self._tts.generate(
-                    sentence, sid=self.args.tts_speaker, speed=self.args.tts_speed
+                    sentence, sid=self.args.tts_speaker, speed=speed
                 )
             samples = np.asarray(audio.samples, dtype=np.float32)
             if samples.size == 0:
@@ -368,10 +379,19 @@ class Handler(BaseHTTPRequestHandler):
             return
         requested = payload.get("sample_rate")
         requested = int(requested) if isinstance(requested, int) and requested > 0 else None
+        # 按请求的语速：只给唱歌链路用，取值夹在 0.3~2.0，非法值忽略。
+        requested_speed = payload.get("speed")
+        requested_speed = (
+            float(requested_speed)
+            if isinstance(requested_speed, (int, float))
+            and not isinstance(requested_speed, bool)
+            and 0.3 <= float(requested_speed) <= 2.0
+            else None
+        )
 
         responded = False
         try:
-            for rate, pcm in self.engine.synthesize(text, requested):
+            for rate, pcm in self.engine.synthesize(text, requested, requested_speed):
                 if not responded:
                     # 采样率要等第一块音频才知道，所以先拿到它再发响应头。
                     self.send_response(HTTPStatus.OK)
@@ -431,6 +451,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument("--tts-speaker", type=int, default=0, help="音色编号")
     parser.add_argument("--tts-speed", type=float, default=1.0, help="语速倍率")
+    parser.add_argument(
+        "--tts-noise-scale-w",
+        type=float,
+        default=0.0,
+        help="时长预测的噪声强度；0 表示同一句话长度可复现（唱歌合成依赖这一点）",
+    )
 
     parser.add_argument("--log-level", default="INFO")
     return parser.parse_args(argv)

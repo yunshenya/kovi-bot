@@ -101,8 +101,31 @@ fn write_staged_wav(config: &QqVoiceConfig, pcm: &[u8], sample_rate: u32) -> Opt
     Some(path)
 }
 
+/// 把一段现成的音频字节（WAV）落到暂存目录，供唱歌那条链路复用。
+///
+/// 语音那条链路是自己合成 PCM 再封 WAV，唱歌服务直接回 WAV，所以这里只做
+/// "落盘 + 清理 + 路径换算"这三件两处都要做的事。
+pub(crate) fn stage_audio_bytes(
+    config: &QqVoiceConfig,
+    bytes: &[u8],
+    prefix: &str,
+) -> Option<PathBuf> {
+    let dir = PathBuf::from(config.staging_dir());
+    if let Err(error) = std::fs::create_dir_all(&dir) {
+        eprintln!("[WARN] 无法创建音频暂存目录 {}: {error}", dir.display());
+        return None;
+    }
+    let path = dir.join(format!("{prefix}-{}.wav", uuid::Uuid::new_v4()));
+    if let Err(error) = std::fs::write(&path, bytes) {
+        eprintln!("[WARN] 写入音频文件失败 {}: {error}", path.display());
+        return None;
+    }
+    prune_staged_files(&dir, config.keep_files());
+    Some(path)
+}
+
 /// 把机器人侧的暂存路径换算成 NapCat 能打开的路径。
-fn napcat_path_for(config: &QqVoiceConfig, host_path: &Path) -> Option<String> {
+pub(crate) fn napcat_path_for(config: &QqVoiceConfig, host_path: &Path) -> Option<String> {
     let host_dir = config.staging_dir().trim_end_matches('/');
     let napcat_dir = config.napcat_staging_dir().trim_end_matches('/');
     let relative = host_path.strip_prefix(host_dir).ok()?;
@@ -116,7 +139,11 @@ fn prune_staged_files(dir: &Path, keep: usize) {
     };
     let mut files = entries
         .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.file_name().to_string_lossy().starts_with("voice-"))
+        .filter(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with("voice-") || name.starts_with("sing-")
+        })
         .filter_map(|entry| {
             let modified = entry.metadata().ok()?.modified().ok()?;
             Some((modified, entry.path()))

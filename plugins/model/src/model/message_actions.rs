@@ -146,6 +146,10 @@ pub(crate) struct ReplyPlan {
     pub(crate) requests_image: bool,
     /// 这一轮的正文用语音发出，而不是文字。
     pub(crate) voice: bool,
+    /// 这一轮的正文用歌声发出（值 = 旋律模板 id）。
+    ///
+    /// 与 `voice` 互斥：歌声本身就是"说出来"，只是带旋律。
+    pub(crate) sing: Option<String>,
 }
 
 impl ReplyPlan {
@@ -161,6 +165,7 @@ impl ReplyPlan {
             bubbles: Vec::new(),
             requests_image: false,
             voice: false,
+            sing: None,
         }
     }
 
@@ -174,6 +179,7 @@ impl ReplyPlan {
             bubbles: Vec::new(),
             requests_image: false,
             voice: false,
+            sing: None,
         }
     }
 
@@ -202,6 +208,7 @@ impl ReplyPlan {
             bubbles,
             requests_image: false,
             voice: false,
+            sing: None,
         })
     }
 
@@ -261,6 +268,7 @@ impl ReplyPlan {
             bubbles,
             requests_image,
             voice,
+            sing: None,
         }
     }
 
@@ -671,6 +679,7 @@ mod tests {
             bubbles: vec!["你好".to_string()],
             requests_image: false,
             voice: false,
+            sing: None,
         };
     }
 

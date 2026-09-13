@@ -63,6 +63,8 @@ mod vision;
 mod vision_router;
 // 芸汐主动发语音消息（复用本机 TTS）
 mod voice_reply;
+// 芸汐唱歌（本机歌声合成服务：逐字 TTS + PSOLA 变调对齐音符）
+mod sing_reply;
 mod world_sensors;
 pub(crate) mod yunxi;
 

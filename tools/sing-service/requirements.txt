@@ -1,0 +1,4 @@
+# 歌声合成只用两个依赖：变调/时长用 Praat 的 PSOLA 实现（有 manylinux wheel），
+# 其余是现成的本机 TTS（HTTP 调用，不引入 sherpa-onnx 依赖）。
+numpy>=2.0
+praat-parselmouth>=0.4.4

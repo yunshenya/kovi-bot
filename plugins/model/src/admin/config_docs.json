@@ -1,26 +1,32 @@
 {
   "fields": {
     "admin.allow_non_loopback": {
-      "doc": "显式允许监听非回环地址。默认关闭，防止把控制面误暴露到公网。"
+      "doc": "显式允许监听非回环地址。默认关闭，防止把控制面误暴露到公网。",
+      "hint": "监听非回环地址必须显式打开这一项，否则配置校验直接拒绝。"
     },
     "admin.enabled": {
       "doc": "是否启用自带管理后台。关闭后不监听任何端口。"
     },
     "admin.host": {
-      "doc": "监听地址。默认仅本机；非回环地址需要同时打开 allow_non_loopback。"
+      "doc": "监听地址。默认仅本机；非回环地址需要同时打开 allow_non_loopback。",
+      "hint": "默认只监听本机：后台能改全部配置、能读全部记忆，等同于机器人自身的控制面。"
     },
     "admin.port": {
-      "doc": "监听端口。刻意避开 NapCat WebUI 的 6099。"
+      "doc": "监听端口。刻意避开 NapCat WebUI 的 6099。",
+      "hint": "刻意避开 NapCat WebUI 的 6099。"
     },
     "admin.session_ttl_secs": {
-      "doc": "登录会话有效期（秒）。默认 12 小时。"
+      "doc": "登录会话有效期（秒）。默认 12 小时。",
+      "hint": "登录会话有效期（秒），默认 12 小时。"
     },
     "admin.token": {
       "doc": "可选的登录 Token 明文。留空时用 token_env；两者都为空则自动生成并 落盘到工作目录的 .yunxi-admin-token（权限 600）后打印一次。",
+      "hint": "也可直接写在这里；留空时按 token_env → 已有 .yunxi-admin-token → 现场生成 的顺序解析。生成的 Token 会写入运行时目录并打印一次启动日志。",
       "secret": true
     },
     "admin.token_env": {
-      "doc": "登录 Token 所在的环境变量名。为空时回退到 token 字段。"
+      "doc": "登录 Token 所在的环境变量名。为空时回退到 token 字段。",
+      "hint": "登录 Token 所在的环境变量名（推荐放在 .env 里）。"
     },
     "agent_tasks.default_collect_minutes": {
       "doc": "用户没有指定时的默认等待分钟数。"
@@ -735,6 +741,7 @@
     "model.turn_gate": "TurnGate 完成度分类器 (Phase 2 接线, doc §8.2/§9): - mode = \"active\":TurnGate 优先决定 flush/hold; abstain 或无 bundle 时 回退现有 lexical + MiniMind 路径; - mode = \"shadow\":仅记录 TurnGate 会怎么说与现有路径的分歧,不改变路由; - mode = \"disabled\":完全不参与。",
     "prompt": "提示词配置结构体 包含机器人在不同场景下使用的系统提示词",
     "qq_call": "QQ 实时语音通话配置。 通话媒体链路完全由服务器上的 NapCat AV 桥负责（来电信令、自动接听、 PulseAudio 虚拟声卡）；本插件只做三件事：轮询桥的通话状态、对 PulseAudio 设备收发 PCM、调用本机语音服务做 ASR/TTS。默认关闭， 未配置时不影响任何现有链路。",
+    "qq_sing": "芸汐唱歌：用户点歌时她按模板旋律真的唱出来，而不是念歌词。 做法是\"人力VOCALOID\"：本机歌声合成服务（tools/sing-service）逐字调用上面那套 TTS，再用 Praat 的 PSOLA 把每个字的基频换成音符、时长对齐到音符时值，所以音色 还是她自己的。它复用 qq_voice 的暂存目录与 NapCat 路径，因此启用本段必须先启用 qq_voice；旋律模板由服务自己的 templates.json 维护，这里只接线。",
     "qq_voice": "芸汐主动发语音消息的配置。 复用通话功能那套本机 TTS 服务（sherpa-onnx，只监听回环），把模型决定用语音 说出来的回复合成成音频，再交给 NapCat 以 QQ 语音消息发出。默认关闭。",
     "reminders": "持久化提醒任务配置。",
     "server_config": "服务器配置结构体 包含连接AI模型服务器所需的配置信息",

@@ -97,6 +97,8 @@ const CORE_PENDING_OUTGOING_PLAIN_INSTRUCTION: &str = "Core 待发送内容上�
 const CORE_BUBBLE_MARKER: &str = "[[BUBBLE]]";
 /// Core 的语音标记：单独一行写在正文最前面，表示这一轮用声音说出来。
 const CORE_VOICE_MARKER: &str = "[[VOICE]]";
+/// Core 的唱歌标记：`[[SING 模板id]]`，单独一行写在正文最前面，正文即歌词。
+const CORE_SING_MARKER: &str = "[[SING";
 const MAX_CORE_BUBBLES: usize = 3;
 /// 一轮里宿主的门控最多能放行多少条 pending outgoing（`interrupt.rs`
 /// 的 `MAX_PENDING_OUTGOING_PER_SCOPE`）。它同时是"用户明确要求 N 条"时
@@ -108,6 +110,8 @@ const CORE_PLAIN_TURN_INSTRUCTION: &str = "Core 可见回复：默认只写一�
 const CORE_AMBIENT_TURN_INSTRUCTION: &str = "Core 群聊注意力：本轮没有直接点名芸汐，只是一次低频候选接话机会。只有确实能增加信息、接住情绪、表达真实反应或自然推进公共话题时，才直接写一条像群友接话的短消息；没有具体价值时保持空白。不要解释沉默，也不要为了证明在线而写‘嗯’‘收到’等占位话。接话时语气温柔、有分寸，不调侃别人的短处，不阴阳怪气。";
 /// 语音选项只在本机 TTS 真的可用时下发：模型不该以为自己有一个当下用不了的
 /// 出口（提示词里说能发、投递时静默退化成文字，是最难查的那种不一致）。
+/// 唱歌选项：只在歌声服务可用时下发，并把可用旋律模板一起列出来。
+const CORE_SING_INSTRUCTION: &str = "用户让你唱歌时不要只报幕——正文直接写你要唱的歌词，并在正文最前面单独一行写 [[SING 模板id]]，程序会按那个模板的旋律把你写的歌词唱出来，作为一条 QQ 语音发出。歌词要自己写，不要照抄还在版权期内的歌词；模板后面标了它有几个音节，歌词字数最好与它一致（少了会把剩下的音符并到最后一个字，多了会被丢掉）。没有合适的模板时就挑一个情绪接近的。";
 const CORE_VOICE_INSTRUCTION: &str = "如果你觉得这句话更适合用声音说出来（例如要表达语气、情绪，或者对方正在听语音），就在正文最前面单独一行写 [[VOICE]]，程序会把这一轮的气泡用你的声音合成成语音发出；标记本身不会展示给用户，也不要为了用语音而用语音。语音消息承载不了引用和 @，标记语音时不要同时要求它们。不确定时不要写这个标记，默认发文字。";
 const CORE_AUTONOMOUS_PLAIN_TURN_INSTRUCTION: &str = "自主会话正文：这是芸汐自己的后续回合。若此刻确实有一个新的、独立且值得单独发送的想法，直接写一条自然、简短的聊天正文；若没有，就保持空白。宿主负责是否继续和何时再次唤醒；不要输出 JSON、continue/wait/end、内部标记、协议、解释、工具调用或多个想法。语气温柔、真诚、有分寸：不讽刺、不挖苦、不阴阳怪气、不抬杠。";
 const CORE_TOOL_TURN_INSTRUCTION: &str = "Core 工具轮次：需要受控工具时，直接通过 system 下发的 function-calling 工具接口发起函数调用（一次可以调用多个；工具结果返回后若资料仍不足，可以继续调用下一个工具，反复推理直到问题解决）。不要在消息正文中书写任何工具调用格式、JSON、代码块或 [[TOOL_CALL]] 标记，也不要声称工具已经执行。若不需要工具，直接写一条自然聊天正文。";
@@ -1208,13 +1212,58 @@ fn parse_plain_core_response(content: &str) -> ParsedCoreResponse {
     }
 }
 
-/// 本轮可见正文的契约；语音开关打开时才把语音选项一起下发。
-fn core_plain_turn_instruction(voice_enabled: bool) -> String {
+/// 本轮可见正文的契约；语音/唱歌选项只在对应通道打开时才下发。
+///
+/// 唱歌还会把服务当前的旋律模板列给模型（`id（名字，N 个音节，情绪）`）：提示词里
+/// 说得出模板名，模型才写得出合法的 `[[SING 模板id]]`。
+fn core_plain_turn_instruction(
+    voice_enabled: bool,
+    sing_templates: &[crate::sing_reply::SingTemplate],
+) -> String {
+    let mut instruction = CORE_PLAIN_TURN_INSTRUCTION.to_owned();
     if voice_enabled {
-        format!("{CORE_PLAIN_TURN_INSTRUCTION}{CORE_VOICE_INSTRUCTION}")
-    } else {
-        CORE_PLAIN_TURN_INSTRUCTION.to_owned()
+        instruction.push_str(CORE_VOICE_INSTRUCTION);
     }
+    if !sing_templates.is_empty() {
+        instruction.push_str(CORE_SING_INSTRUCTION);
+        instruction.push_str("可用旋律模板：");
+        for (index, template) in sing_templates.iter().enumerate() {
+            if index > 0 {
+                instruction.push('；');
+            }
+            instruction.push_str(&format!(
+                "{}（{}，{} 个音节，{}）",
+                template.id, template.name, template.syllables, template.mood
+            ));
+        }
+        instruction.push('。');
+    }
+    instruction
+}
+
+/// 拆出正文最前面的唱歌标记，返回 `(模板 id, 去掉标记后的正文)`。
+///
+/// 与语音标记同样的严格口径：必须单独成行、且出现在正文最前面。`[[SING]]`（没写
+/// 模板）返回空字符串，由调用方回退到默认模板。
+fn split_core_sing_marker(content: &str) -> (Option<String>, &str) {
+    let trimmed = content.trim_start();
+    let Some(rest) = trimmed.strip_prefix(CORE_SING_MARKER) else {
+        return (None, content);
+    };
+    let Some((head, tail)) = rest.split_once("]]") else {
+        return (None, content);
+    };
+    let after = tail.trim_start_matches([' ', '\t']);
+    let Some(body) = after
+        .strip_prefix("\r\n")
+        .or_else(|| after.strip_prefix('\n'))
+    else {
+        return (None, content);
+    };
+    (
+        Some(head.trim().to_owned()),
+        body.trim_start_matches(['\r', '\n', ' ', '\t']),
+    )
 }
 
 /// 拆出正文最前面的语音标记，返回 `(是否用语音, 去掉标记后的正文)`。
@@ -3757,7 +3806,7 @@ fn classify_persistent_person_identity(
 
 #[cfg_attr(not(test), allow(dead_code))]
 fn visible_reply_intent(target: VisibleReplyTarget, content: String) -> Option<CognitiveIntent> {
-    visible_reply_intents(target, &[content], false)?
+    visible_reply_intents(target, &[content], false, None)?
         .into_iter()
         .next()
 }
@@ -3766,6 +3815,7 @@ fn visible_reply_intents(
     target: VisibleReplyTarget,
     messages: &[String],
     voice: bool,
+    sing: Option<&str>,
 ) -> Option<Vec<CognitiveIntent>> {
     if messages.is_empty()
         || messages
@@ -3776,10 +3826,10 @@ fn visible_reply_intents(
     }
     let mut intents = Vec::with_capacity(messages.len());
     for (index, message) in messages.iter().enumerate() {
-        let content = if voice {
-            MessageContent::voice(message.clone())
-        } else {
-            MessageContent::text(message.clone())
+        let content = match sing {
+            Some(template) => MessageContent::sing(message.clone(), template),
+            None if voice => MessageContent::voice(message.clone()),
+            None => MessageContent::text(message.clone()),
         };
         let intent = match target {
             VisibleReplyTarget::Response {
@@ -4866,12 +4916,26 @@ impl ModelBackend for KoviModelBackend {
             // directly visible. Tool requests and tool-result follow-ups have
             // their own, narrowly scoped tool instruction and must not receive
             // a competing "no protocol" directive.
+            // 唱歌：先取一次旋律模板（服务侧带缓存），提示词下发与后面的模板校验
+            // 共用这一份，避免同一轮问两次服务。
+            let sing_templates = if message.is_some()
+                && !requested_tool_turn
+                && !tool_follow_up
+                && crate::config::qq_sing_enabled()
+            {
+                crate::sing_reply::templates(crate::config::get().qq_sing()).await
+            } else {
+                Vec::new()
+            };
             if message.is_some() && !requested_tool_turn && !tool_follow_up {
                 messages.insert(
                     0,
                     BotMemory {
                         role: Roles::System,
-                        content: core_plain_turn_instruction(crate::config::qq_voice_enabled()),
+                        content: core_plain_turn_instruction(
+                            crate::config::qq_voice_enabled(),
+                            &sing_templates,
+                        ),
                     },
                 );
             }
@@ -5471,17 +5535,18 @@ impl ModelBackend for KoviModelBackend {
             let structured_tool_output = (response_content.contains(CORE_TOOL_CALL_START)
                 || response_content.contains(CORE_TOOL_CALL_END))
                 && tool_protocol_authorized;
-            // 语音标记只对纯文本回合生效：工具回合有自己的协议，标记在那里既
-            // 不生效，也不该被悄悄删掉。解析在正文进入 plan 之前完成，标记不
-            // 会漏进可见正文。
-            let voice_requested = if structured_tool_output {
-                false
+            // 语音/唱歌标记只对纯文本回合生效：工具回合有自己的协议，标记在那里
+            // 既不生效，也不该被悄悄删掉。解析在正文进入 plan 之前完成，标记不会
+            // 漏进可见正文。
+            let (sing_requested, voice_requested) = if structured_tool_output {
+                (None, false)
             } else {
-                let (requested, rest) = split_core_voice_marker(&response_content);
-                if requested {
-                    response_content = rest.to_owned();
+                let (sing, after_sing) = split_core_sing_marker(&response_content);
+                let (voice, after_voice) = split_core_voice_marker(after_sing);
+                if sing.is_some() || voice {
+                    response_content = after_voice.to_owned();
                 }
-                requested
+                (sing, voice)
             };
             let parsed_response = if fallback_response && message.is_some() {
                 ParsedCoreResponse {
@@ -5706,6 +5771,35 @@ impl ModelBackend for KoviModelBackend {
                 if voice_requested && message.is_some() && !requested_tool_turn && !tool_follow_up {
                     plan.voice = crate::config::qq_voice_enabled();
                 }
+                // 唱歌与语音互斥：歌声本身就是"说出来"，只是带旋律。模板只有在
+                // 服务真的列出了它时才生效，否则退回默认模板。
+                if let Some(template) = sing_requested.as_deref()
+                    && message.is_some()
+                    && !requested_tool_turn
+                    && !tool_follow_up
+                    && crate::config::qq_sing_enabled()
+                {
+                    let config = crate::config::get();
+                    let sing_config = config.qq_sing();
+                    let chosen = if template.is_empty() {
+                        sing_config.default_template().to_owned()
+                    } else {
+                        template.to_owned()
+                    };
+                    let chosen = sing_templates
+                        .iter()
+                        .find(|item| item.id == chosen)
+                        .map(|item| item.id.clone())
+                        .or_else(|| {
+                            sing_templates
+                                .iter()
+                                .find(|item| item.id == sing_config.default_template())
+                                .map(|item| item.id.clone())
+                        })
+                        .unwrap_or(chosen);
+                    plan.voice = false;
+                    plan.sing = Some(chosen);
+                }
                 plan
             } else {
                 ReplyPlan::from_model_output(conversation.scope(), "").await
@@ -5901,8 +5995,12 @@ impl ModelBackend for KoviModelBackend {
                 ));
             }
             let visible_content = plan.content.clone();
-            let Some(intents) = visible_reply_intents(reply_target, &plan.bubbles, plan.voice)
-            else {
+            let Some(intents) = visible_reply_intents(
+                reply_target,
+                &plan.bubbles,
+                plan.voice,
+                plan.sing.as_deref(),
+            ) else {
                 if reply_expected_for_incoming(input) {
                     kovi::log::warn!(
                         "Yunxi Core required reply unresolved: event_id={} message_id={} conversation_id={} reason=reply_intent_conversion_failed",
@@ -6218,28 +6316,28 @@ mod tests {
         BoundedCache, BoundedRouteCache, CORE_AUTONOMOUS_INTENT_PROTOCOL, CORE_BUBBLE_MARKER,
         CORE_EXPLICIT_BATCH_REPAIR_TIMEOUT, CORE_GROUP_HISTORY_PREFIX, CORE_MEMORY_CONTEXT_PREFIX,
         CORE_PENDING_OUTGOING_INSTRUCTION, CORE_PENDING_OUTGOING_PLAIN_INSTRUCTION,
-        CORE_PLAIN_TURN_INSTRUCTION, CORE_REPLY_REPAIR_PROMPT, CORE_VOICE_INSTRUCTION,
-        CORE_VOICE_MARKER, CoreDirectRepair, HostMessageContext, HostMessageContextCache,
-        HostModelRoute, HostModelRoutingContext, HostToolTurnRegistrationPolicy,
-        HostToolTurnRegistry, INTRINSIC_AUTONOMOUS_INTENT_TAIL_INSTRUCTION,
-        INTRINSIC_GENERATION_SUFFIX, INTRINSIC_SEMANTIC_CONTENT_INSTRUCTION, MAX_CORE_BUBBLES,
-        MAX_DELIVERABLE_BUBBLES_PER_TURN, MAX_INTRINSIC_REPLY_PROTOCOL_BYTES, MindCandidates,
-        PersistentRouteLookup, QqConversation, RouteContext, VisibleReplyTarget,
-        affect_tone_guidance, autonomous_conversation_prompt, autonomous_conversation_protocol,
-        autonomous_empty_generation_plan, autonomous_generation_failure_plan, baseline_disposition,
-        batch_fence_action_key, build_bounded_intrinsic_reply_batch,
-        classify_persistent_person_identity, constrain_autonomous_tick_plan,
-        conversation_id_for_log, core_message_prompt, core_plain_turn_instruction,
-        core_plan_has_visible_text, core_reply_bubbles_with_max, core_tool_protocol_diagnostic,
-        default_autonomous_directive, defer_unroutable_due, deterministic_route_fallback,
-        due_reply_target, eligible_mind_candidates, explicit_message_batch_needs_repair,
-        explicit_message_count_for_event, explicit_message_count_for_input,
-        explicit_message_count_instruction, interaction_state_updates_with_cues,
-        intrinsic_autonomous_intent_prompt, intrinsic_fallback_is_eligible,
-        intrinsic_output_is_unsafe, intrinsic_prompt, is_plain_text_batch_data_context,
-        keeps_existing_prepared_plan, message_id_for_log, mind_context_messages,
-        mind_outgoing_fence_required, parse_autonomous_intent_response, parse_core_response,
-        parse_direct_repair_output, parse_intrinsic_autonomous_directive,
+        CORE_PLAIN_TURN_INSTRUCTION, CORE_REPLY_REPAIR_PROMPT, CORE_SING_MARKER,
+        CORE_VOICE_INSTRUCTION, CORE_VOICE_MARKER, CoreDirectRepair, HostMessageContext,
+        HostMessageContextCache, HostModelRoute, HostModelRoutingContext,
+        HostToolTurnRegistrationPolicy, HostToolTurnRegistry,
+        INTRINSIC_AUTONOMOUS_INTENT_TAIL_INSTRUCTION, INTRINSIC_GENERATION_SUFFIX,
+        INTRINSIC_SEMANTIC_CONTENT_INSTRUCTION, MAX_CORE_BUBBLES, MAX_DELIVERABLE_BUBBLES_PER_TURN,
+        MAX_INTRINSIC_REPLY_PROTOCOL_BYTES, MindCandidates, PersistentRouteLookup, QqConversation,
+        RouteContext, VisibleReplyTarget, affect_tone_guidance, autonomous_conversation_prompt,
+        autonomous_conversation_protocol, autonomous_empty_generation_plan,
+        autonomous_generation_failure_plan, baseline_disposition, batch_fence_action_key,
+        build_bounded_intrinsic_reply_batch, classify_persistent_person_identity,
+        constrain_autonomous_tick_plan, conversation_id_for_log, core_message_prompt,
+        core_plain_turn_instruction, core_plan_has_visible_text, core_reply_bubbles_with_max,
+        core_tool_protocol_diagnostic, default_autonomous_directive, defer_unroutable_due,
+        deterministic_route_fallback, due_reply_target, eligible_mind_candidates,
+        explicit_message_batch_needs_repair, explicit_message_count_for_event,
+        explicit_message_count_for_input, explicit_message_count_instruction,
+        interaction_state_updates_with_cues, intrinsic_autonomous_intent_prompt,
+        intrinsic_fallback_is_eligible, intrinsic_output_is_unsafe, intrinsic_prompt,
+        is_plain_text_batch_data_context, keeps_existing_prepared_plan, message_id_for_log,
+        mind_context_messages, mind_outgoing_fence_required, parse_autonomous_intent_response,
+        parse_core_response, parse_direct_repair_output, parse_intrinsic_autonomous_directive,
         parse_plain_core_response, parse_qq_conversation, plain_text_batch_message_prompt,
         plain_text_batch_repair_context, pre_model_plan, prepared_outgoing_semantic_context,
         private_reply_invites_continuation, purge_group_routes_from_cache,
@@ -6252,9 +6350,9 @@ mod tests {
         sanitize_autonomous_intrinsic_output, sanitize_intrinsic_output,
         sanitize_plain_text_batch_message, select_host_model_route_from_capability,
         serialize_intrinsic_reply_batch, shadow_projection_for_completed_plan, silent_wait_plan,
-        split_core_voice_marker, strong_reply_repair_needed, tool_calls_allowed_for_turn,
-        tool_protocol_authorized_for_turn, visible_reply_intent, visible_reply_intents,
-        visible_reply_state_updates,
+        split_core_sing_marker, split_core_voice_marker, strong_reply_repair_needed,
+        tool_calls_allowed_for_turn, tool_protocol_authorized_for_turn, visible_reply_intent,
+        visible_reply_intents, visible_reply_state_updates,
     };
     use crate::model::{
         BotMemory, ConversationCoordinator, IncomingTurnImpact, OutgoingExecutiveDecision,
@@ -7450,9 +7548,77 @@ mod tests {
     }
 
     #[test]
+    fn core_sing_marker_only_counts_as_protocol_on_its_own_leading_line() {
+        assert_eq!(
+            split_core_sing_marker("[[SING xiaoxingxing]]\n一闪一闪亮晶晶"),
+            (Some("xiaoxingxing".to_owned()), "一闪一闪亮晶晶")
+        );
+        // 没写模板名：交给调用方回退到默认模板。
+        assert_eq!(
+            split_core_sing_marker("[[SING]]\n随便唱两句"),
+            (Some(String::new()), "随便唱两句")
+        );
+        assert_eq!(
+            split_core_sing_marker("\n  [[SING liangzhilaohu]]\r\n歌词在这里"),
+            (Some("liangzhilaohu".to_owned()), "歌词在这里")
+        );
+        // 没换行、或出现在正文中间，都不算协议，原样保留。
+        assert_eq!(
+            split_core_sing_marker("[[SING x]] 一闪"),
+            (None, "[[SING x]] 一闪")
+        );
+        assert_eq!(
+            split_core_sing_marker("先说一句\n[[SING x]]\n再唱"),
+            (None, "先说一句\n[[SING x]]\n再唱")
+        );
+        assert_eq!(split_core_sing_marker("普通正文。"), (None, "普通正文。"));
+    }
+
+    #[test]
+    fn singing_option_lists_the_templates_the_service_offers() {
+        let templates = vec![crate::sing_reply::SingTemplate {
+            id: "xiaoxingxing".to_owned(),
+            name: "小星星".to_owned(),
+            mood: "童谣 / 轻快".to_owned(),
+            syllables: 14,
+        }];
+        let without = core_plain_turn_instruction(false, &[]);
+        let with = core_plain_turn_instruction(false, &templates);
+
+        // 服务不可用时不该教这个标记，也不该出现模板清单。
+        assert!(!without.contains(CORE_SING_MARKER));
+        assert!(with.contains("[[SING 模板id]]"));
+        assert!(with.contains("xiaoxingxing（小星星，14 个音节，童谣 / 轻快）"));
+        // 语音与唱歌是两件独立的事：只开唱歌不该顺带把语音选项塞进去。
+        assert!(!with.contains("voice=true"));
+    }
+
+    #[test]
+    fn sung_bubbles_become_sung_intents() {
+        let conversation_id = ConversationId::new();
+        let intents = visible_reply_intents(
+            VisibleReplyTarget::Response {
+                conversation_id,
+                message_id: MessageId::new(),
+            },
+            &["一闪一闪亮晶晶".to_string()],
+            false,
+            Some("xiaoxingxing"),
+        )
+        .expect("sung bubble should become an intent");
+        assert!(matches!(
+            &intents[0],
+            CognitiveIntent::SendMessage { content, .. }
+                if content.is_sing()
+                    && !content.is_voice()
+                    && content.sing_template() == Some("xiaoxingxing")
+        ));
+    }
+
+    #[test]
     fn voice_option_is_only_offered_to_core_when_the_channel_is_enabled() {
-        let disabled = core_plain_turn_instruction(false);
-        let enabled = core_plain_turn_instruction(true);
+        let disabled = core_plain_turn_instruction(false, &[]);
+        let enabled = core_plain_turn_instruction(true, &[]);
 
         // 关掉 qq_voice 时，模型不该知道自己有一个当下用不了的出口。
         assert!(!disabled.contains(CORE_VOICE_MARKER));
@@ -7498,6 +7664,7 @@ mod tests {
             },
             &["我在的呀。".to_string(), "你还在忙吗？".to_string()],
             true,
+            None,
         )
         .expect("spoken bubbles should still become intents");
         assert_eq!(intents.len(), 2);
@@ -7527,6 +7694,7 @@ mod tests {
             },
             &["普通文字。".to_string()],
             false,
+            None,
         )
         .expect("plain text should still become an intent");
         assert!(intents.iter().all(|intent| matches!(
@@ -7798,6 +7966,7 @@ mod tests {
             },
             &["第一条".to_string(), "第二条".to_string()],
             false,
+            None,
         )
         .expect("two visible bubbles should become two intents");
         assert_eq!(intents.len(), 2);

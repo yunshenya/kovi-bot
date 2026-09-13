@@ -1,0 +1,25 @@
+[Unit]
+Description=Yunxi Singing Service (PSOLA singing over the local TTS)
+# 它逐字调用 yunxi-speech，所以必须跟在它后面起来。
+After=network.target yunxi-speech.service
+Wants=yunxi-speech.service
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/yunxi-sing
+ExecStart=/home/ubuntu/yunxi-sing/.venv/bin/python /home/ubuntu/yunxi-sing/service.py --host 127.0.0.1 --port 6121 --tts http://127.0.0.1:6120/v1/tts --templates /home/ubuntu/yunxi-sing/templates.json
+Restart=always
+RestartSec=5
+# 渲染是短时 CPU 峰值，不需要常驻大模型；内存围栏只防它泄漏。
+MemoryMax=768M
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+# 只需要读自己的目录；音频走 HTTP 回给机器人，不落盘。
+ReadOnlyPaths=/home/ubuntu/yunxi-sing
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

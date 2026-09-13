@@ -38,6 +38,7 @@ mod mood;
 mod proactive;
 mod prompt;
 mod qq_call;
+mod qq_sing;
 mod qq_voice;
 mod reminders;
 mod server;
@@ -60,6 +61,7 @@ pub use gag_ledger::GagLedgerConfig;
 pub use identity::IdentityConfig;
 pub use mind::MindConfig;
 pub use qq_call::QqCallConfig;
+pub use qq_sing::QqSingConfig;
 pub use qq_voice::QqVoiceConfig;
 pub use reminders::ReminderConfig;
 pub use tools::{McpServerConfig, ToolsConfig};
@@ -125,6 +127,8 @@ pub struct ModelConfig {
     qq_call: QqCallConfig,
     /// 芸汐主动发语音消息的配置（默认关闭）。
     qq_voice: QqVoiceConfig,
+    /// 芸汐唱歌的配置（默认关闭）。
+    qq_sing: QqSingConfig,
     /// Executive v3 deterministic control configuration.
     executive: ExecutiveConfig,
     /// Intrinsic model and bounded fallback configuration.
@@ -182,6 +186,12 @@ impl ModelConfig {
         self.vision.validate()?;
         self.qq_call.validate()?;
         self.qq_voice.validate()?;
+        self.qq_sing.validate()?;
+        if self.qq_sing.enabled() && !self.qq_voice.enabled() {
+            return Err(anyhow::anyhow!(
+                "启用 qq_sing 需要同时启用 qq_voice：唱歌复用语音消息的暂存目录与 NapCat 路径映射"
+            ));
+        }
         self.executive.validate()?;
         self.model.validate()?;
         self.admin.validate()?;
@@ -288,6 +298,10 @@ impl ModelConfig {
 
     pub fn qq_voice(&self) -> &QqVoiceConfig {
         &self.qq_voice
+    }
+
+    pub fn qq_sing(&self) -> &QqSingConfig {
+        &self.qq_sing
     }
 
     pub fn executive(&self) -> &ExecutiveConfig {
@@ -456,6 +470,14 @@ pub fn qq_voice_enabled() -> bool {
     MODEL_CONFIG
         .read()
         .map(|config| config.qq_voice().enabled())
+        .unwrap_or(false)
+}
+
+/// 同上，问「能不能唱歌」。
+pub fn qq_sing_enabled() -> bool {
+    MODEL_CONFIG
+        .read()
+        .map(|config| config.qq_sing().enabled())
         .unwrap_or(false)
 }
 

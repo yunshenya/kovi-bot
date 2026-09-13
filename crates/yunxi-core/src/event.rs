@@ -265,6 +265,13 @@ pub struct MessageContent {
     /// sends `text`, so the flag stays optional and backwards compatible.
     #[serde(default, skip_serializing_if = "is_false")]
     voice: bool,
+    /// Delivery hint: sing `text` to the named melody template.
+    ///
+    /// Only set when the host has a singing channel *and* advertised the
+    /// template; a host without one ignores the hint and speaks or types the
+    /// text instead. Singing implies spoken delivery, so `voice` stays false.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sing: Option<String>,
 }
 
 impl Default for MessageContent {
@@ -280,6 +287,7 @@ impl MessageContent {
             text: value.into(),
             attachments: Vec::new(),
             voice: false,
+            sing: None,
         }
     }
 
@@ -291,7 +299,32 @@ impl MessageContent {
             text: value.into(),
             attachments: Vec::new(),
             voice: true,
+            sing: None,
         }
+    }
+
+    /// Same as [`Self::text`], but asks the host to *sing* it to a melody
+    /// template it advertised. Hosts without a singing channel fall back to
+    /// speaking or typing the text.
+    #[must_use]
+    pub fn sing(value: impl Into<String>, template: impl Into<String>) -> Self {
+        Self {
+            text: value.into(),
+            attachments: Vec::new(),
+            voice: false,
+            sing: Some(template.into()),
+        }
+    }
+
+    /// The melody template this content should be sung to, when singing.
+    #[must_use]
+    pub fn sing_template(&self) -> Option<&str> {
+        self.sing.as_deref()
+    }
+
+    #[must_use]
+    pub fn is_sing(&self) -> bool {
+        self.sing.is_some()
     }
 
     #[must_use]
@@ -367,6 +400,8 @@ impl<'de> Deserialize<'de> for MessageContent {
             attachments: Vec<Attachment>,
             #[serde(default)]
             voice: bool,
+            #[serde(default)]
+            sing: Option<String>,
         }
 
         let wire = Wire::deserialize(deserializer)?;
@@ -374,6 +409,7 @@ impl<'de> Deserialize<'de> for MessageContent {
             .with_attachments(wire.attachments)
             .map_err(serde::de::Error::custom)?;
         content.voice = wire.voice;
+        content.sing = wire.sing;
         Ok(content)
     }
 }
@@ -1864,6 +1900,21 @@ mod tests {
             )
             .expect("deserialize spoken content"),
             spoken
+        );
+
+        let sung = MessageContent::sing("一闪一闪亮晶晶", "xiaoxingxing");
+        assert!(sung.is_sing() && !sung.is_voice());
+        assert_eq!(sung.sing_template(), Some("xiaoxingxing"));
+        assert_eq!(
+            serde_json::to_value(&sung).expect("serialize content"),
+            serde_json::json!({"text": "一闪一闪亮晶晶", "sing": "xiaoxingxing"})
+        );
+        assert_eq!(
+            serde_json::from_value::<MessageContent>(
+                serde_json::json!({"text": "一闪一闪亮晶晶", "sing": "xiaoxingxing"})
+            )
+            .expect("deserialize sung content"),
+            sung
         );
 
         // A host that predates the hint neither sends nor requires it.
