@@ -197,14 +197,18 @@ async fn judge(
         },
     ];
     // 内部判定不挂回复风格/动作引导：两种输出契约混在一起是 JSON 泄漏的常见来源。
-    let response = timeout(
-        EVIDENCE_TIMEOUT,
-        params_model_without_reply_guidance(
-            &mut messages,
-            Some(MAX_OUTPUT_TOKENS),
-            &[],
-            None,
-            None,
+    // purpose 标签让它和别的内部调用一样，能在模型网关日志里按用途对上账。
+    let response = crate::model::llm_trace::with_purpose(
+        "relation_evidence",
+        timeout(
+            EVIDENCE_TIMEOUT,
+            params_model_without_reply_guidance(
+                &mut messages,
+                Some(MAX_OUTPUT_TOKENS),
+                &[],
+                None,
+                None,
+            ),
         ),
     )
     .await;
