@@ -1035,18 +1035,17 @@ mod tests {
         .expect("应统计观察行")
     }
 
-    /// 数据删除的承诺是"这个人的世界模型数据被删掉"。但持久化循环每个
-    /// `persist_interval_secs`（默认 30s）都用**内存快照整表重写**一遍
-    /// （`save_world`：先 DELETE 全表再按快照 INSERT），而擦除只删库里的行，
-    /// 没有任何东西清 `WORLD_RUNTIME`——`yunxi_core::WorldModel::erase_person`
-    /// 在生产代码里零调用者。于是擦除之后的下一次持久化会把刚删掉的行原样写回来，
-    /// 而用户早已收到"已删除"的回执。
+    /// `save_world` 是**整表重写**（先 DELETE 全表、再按快照 INSERT），所以
+    /// "删库里的行"这件事单独做是没有意义的：只要内存快照还在，下一次持久化就会
+    /// 把删掉的行原样写回来。这条测试把该机制钉住，说明为什么擦除必须连带
+    /// `restore_from_store()` 让内存态重新对齐（见
+    /// `yunxi::erasure_tests::erasure_then_persist_does_not_resurrect_the_deleted_person`）。
     ///
-    /// 这条在存储边界上钉住不变量：擦除之后，用**同一份未清理的快照**再做一次
-    /// 持久化，不能把被删的人带回来。
+    /// 如果哪天 `save_world` 改成不再整表重写，这条会失败——那时候擦除路径也
+    /// 应当跟着重新评估，不要只改测试。
     #[test]
     #[ignore = "requires PostgreSQL via DATABASE_URL"]
-    fn postgres_erasure_is_not_undone_by_the_next_world_persist() {
+    fn postgres_save_world_is_a_full_rewrite_so_erasure_must_resync_the_runtime() {
         kovi::tokio::runtime::Runtime::new()
             .expect("应创建测试运行时")
             .block_on(async {
@@ -1090,12 +1089,13 @@ mod tests {
                     "擦除当下确实删掉了库里的行"
                 );
 
-                // 持久化循环的下一次 tick：快照来自从未被清理的运行时。
+                // 但持久化循环下一次 tick 的快照来自内存——只要那份没被清理，
+                // 整表重写就会把它带回来。这正是宿主侧必须 restore 的原因。
                 store.save_world(&world).await.expect("下一次持久化");
                 assert_eq!(
                     person_observation_rows(&pool, person_uuid).await,
-                    0,
-                    "擦除之后的下一次持久化不能把被删的人写回来"
+                    1,
+                    "整表重写会把内存快照里的行原样写回：擦除必须让内存态重新对齐"
                 );
             });
     }

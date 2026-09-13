@@ -1071,21 +1071,6 @@ impl PostgresIdentityStore {
             delete_person_domain_rows(&mut transaction, person_id, &conversation_ids, &qq_user_ids)
                 .await
                 .map_err(IdentityStoreError::storage)?;
-        // World Model v4 data follows the same erasure boundary (v4 §242).
-        // Only run when the world store has been initialized (its tables
-        // exist); otherwise the SQL would abort the caller's transaction.
-        // Best-effort: a world-store failure must not abort the erasure.
-        if super::world_model_store().is_some()
-            && let Ok(rows) =
-                super::world_model_store::PostgresWorldModelStore::delete_person_domain_rows(
-                    &mut transaction,
-                    person_id,
-                    &conversation_ids,
-                )
-                .await
-        {
-            deleted.world_model = rows;
-        }
         if let Some(person_id) = person_id {
             deleted.memories +=
                 query("DELETE FROM yunxi_memories WHERE scope_kind = 'person' AND scope_id = $1")
@@ -1135,7 +1120,8 @@ impl PostgresIdentityStore {
                 .rows_affected();
         }
 
-        for conversation_id in conversation_ids {
+        // 按引用遍历：擦除提交之后世界模型那段还要用它。
+        for conversation_id in &conversation_ids {
             deleted.memories += query(
                 "DELETE FROM yunxi_memories
                  WHERE scope_kind = 'conversation' AND scope_id = $1",
@@ -1188,7 +1174,71 @@ impl PostgresIdentityStore {
             .commit()
             .await
             .map_err(IdentityStoreError::storage)?;
+        // World Model v4 data follows the same erasure boundary (v4 §242), but it
+        // runs in its **own** transaction, after the identity erasure above has
+        // committed. See `purge_world_model_domain` for why it cannot share ours.
+        deleted.world_model =
+            Self::purge_world_model_domain(&self.pool, person_id, &conversation_ids).await;
         Ok(deleted)
+    }
+
+    /// Purge the World Model projection for an erased person/conversation set.
+    ///
+    /// 为什么必须是独立事务：PostgreSQL 里任何语句失败都会中止**整个**事务，后续
+    /// 语句一律 25P02，而 sqlx 的 `commit()` 只传播 COMMIT 语句自身的错误——已中止的
+    /// 事务会静默回滚却返回 `Ok`。所以原来那句"尽力而为"的 `let Ok(..)` 恰好做不到
+    /// 它想做的事：世界模型删失败会把整次身份擦除一起带走，要么抛一个与删除毫不相干
+    /// 的 25P02（该删的记忆一条没删），要么什么都没删却报成功。拆开之后两边的成败
+    /// 互不牵连，身份擦除该提交的都提交了。
+    ///
+    /// 失败只记 `[WARN]`、不向上抛：身份数据已经真的删掉了，不该让用户看到"删除失败"
+    /// ——与 `delete_relation_notes_for_person` 同一约定；但必须留下可查的痕迹，
+    /// 所以是一条明确写出"身份数据已删除"的告警，而不是静默。
+    ///
+    /// 成功之后要 `restore_from_store()` 让内存态重新对齐：持久化是"按内存快照整表
+    /// 重写"，不重新装载的话下一次 tick 会把刚删掉的行原样写回来（库里删干净、
+    /// 内存里还留着，等于没删）。
+    async fn purge_world_model_domain(
+        pool: &PgPool,
+        person_id: Option<Uuid>,
+        conversation_ids: &[Uuid],
+    ) -> u64 {
+        if super::world_model_store().is_none() {
+            return 0;
+        }
+        let rows = match pool.begin().await {
+            Ok(mut transaction) => {
+                match super::world_model_store::PostgresWorldModelStore::delete_person_domain_rows(
+                    &mut transaction,
+                    person_id,
+                    conversation_ids,
+                )
+                .await
+                {
+                    Ok(rows) => match transaction.commit().await {
+                        Ok(()) => rows,
+                        Err(error) => {
+                            eprintln!(
+                                "[WARN] 世界模型擦除提交失败，身份数据已删除，世界模型残留待重试: {error}"
+                            );
+                            return 0;
+                        }
+                    },
+                    Err(error) => {
+                        eprintln!(
+                            "[WARN] 世界模型数据擦除失败，身份数据已删除，世界模型残留待重试: {error}"
+                        );
+                        return 0;
+                    }
+                }
+            }
+            Err(error) => {
+                eprintln!("[WARN] 世界模型擦除无法开启事务，身份数据已删除: {error}");
+                return 0;
+            }
+        };
+        super::world_model::restore_from_store().await;
+        rows
     }
 
     /// Looks up an existing canonical QQ group without creating a replacement

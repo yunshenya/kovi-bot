@@ -83,6 +83,11 @@ fn with_world<F: FnOnce(&mut WorldModel, usize /*max scenes*/)>(f: F) {
 
 /// Restore a previously persisted world into the runtime (v4 §130).
 /// Fail-soft: any load error logs and starts from an empty world.
+///
+/// 这个函数也是**数据擦除**的收尾：库里的行删掉之后，必须让内存态重新对齐，否则
+/// 持久化（按内存快照整表重写）会把刚删掉的行原样写回来。所以三个分支都要落到
+/// "内存 == 库"：库里有就装载，库里一条都没有就**清空运行时**——只在 `Ok(None)`
+/// 时打一行日志、却留着内存里那份，正好是被删者唯一的证据还在内存里的情形。
 pub(crate) async fn restore_from_store() {
     let Some(store) = super::world_model_store() else {
         return;
@@ -101,7 +106,13 @@ pub(crate) async fn restore_from_store() {
                 guard.as_ref().map(|r| r.world.version()).unwrap_or(1)
             );
         }
-        Ok(None) => println!("{WORLD_LOG_PREFIX} 无持久化状态，从空开始"),
+        Ok(None) => {
+            let mut guard = WORLD_RUNTIME
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *guard = None;
+            println!("{WORLD_LOG_PREFIX} 无持久化状态，从空开始");
+        }
         Err(error) => eprintln!("{WORLD_LOG_PREFIX} 恢复失败（fail-soft，从空开始）: {error}"),
     }
 }

@@ -1635,6 +1635,98 @@ mod tests {
 #[cfg(test)]
 mod erasure_tests {
     use super::relation_note_targets;
+    use crate::yunxi::identity_store::PostgresIdentityStore;
+    use sqlx_postgres::PgPool;
+    use std::sync::Arc;
+
+    /// 擦除会一路删到 memories / open-loops / goals / affect / relations / 世界模型，
+    /// 测试库必须先把这些 schema 建齐。缺任何一张表都会在真正要验的那一步之前先报
+    /// 42P01，让用例以错误的理由变红（这个坑踩过一次）。
+    async fn initialize_erasure_schemas(pool: &PgPool) -> Arc<PostgresIdentityStore> {
+        let store = Arc::new(PostgresIdentityStore::new(pool.clone()));
+        store
+            .initialize_schema()
+            .await
+            .expect("应初始化身份 schema");
+        crate::yunxi::memory_store::PostgresMemoryStore::new(
+            Arc::clone(&crate::memory::MEMORY_MANAGER),
+            Arc::clone(&store),
+            pool.clone(),
+        )
+        .initialize_schema()
+        .await
+        .expect("应初始化 memory schema");
+        crate::yunxi::delivery_ledger::PostgresDeliveryLedger::new(pool.clone())
+            .initialize_schema()
+            .await
+            .expect("应初始化 delivery ledger schema");
+        crate::yunxi::open_loop_store::PostgresOpenLoopStore::new(pool.clone())
+            .initialize_schema()
+            .await
+            .expect("应初始化 open-loop schema");
+        crate::yunxi::goal_store::PostgresGoalStore::new(pool.clone())
+            .initialize_schema()
+            .await
+            .expect("应初始化 goal schema");
+        crate::yunxi::affect_store::PostgresAffectStore::new(pool.clone())
+            .initialize_schema()
+            .await
+            .expect("应初始化 affect schema");
+        crate::yunxi::relation_store::PostgresRelationStore::new(pool.clone())
+            .initialize_schema()
+            .await
+            .expect("应初始化 relation schema");
+        store
+    }
+
+    /// 造一个"有待删数据"的人：身份 + 私聊会话 + 一条属于他的记忆，并返回句柄。
+    async fn seed_person_with_memory(
+        pool: &PgPool,
+        store: &Arc<PostgresIdentityStore>,
+    ) -> (
+        yunxi_core::ExternalIdentity,
+        yunxi_core::ExternalConversation,
+        uuid::Uuid,
+    ) {
+        use sqlx_core::query::query;
+
+        let suffix = (uuid::Uuid::new_v4().as_u128() % 1_000_000_000) as i64;
+        let user_id = 1_000_000_000_000_i64 + suffix;
+        let identity = super::qq::person(user_id).expect("valid identity");
+        let direct = super::qq::direct(9_000_000_000_000_i64 + suffix, user_id)
+            .expect("valid direct conversation");
+        let person_id = store
+            .resolve_identity(&identity)
+            .await
+            .expect("identity should resolve");
+        store
+            .resolve_direct_for_person(person_id, &direct)
+            .await
+            .expect("direct conversation should resolve");
+        let person_uuid = person_id.into_uuid();
+        query(
+            "INSERT INTO yunxi_memories
+                (id, scope_kind, scope_id, kind, content, importance, tags, occurred_at)
+             VALUES ($1, 'person', $2, 'fact', 'deletion test', 50, '[]', NOW())",
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind(person_uuid)
+        .execute(pool)
+        .await
+        .expect("应创建测试记忆");
+        (identity, direct, person_uuid)
+    }
+
+    async fn person_memory_rows(pool: &PgPool, person: uuid::Uuid) -> i64 {
+        sqlx_core::query_scalar::query_scalar(
+            "SELECT COUNT(*) FROM yunxi_memories \
+             WHERE scope_kind = 'person' AND scope_id = $1",
+        )
+        .bind(person)
+        .fetch_one(pool)
+        .await
+        .expect("应统计记忆行")
+    }
 
     #[test]
     fn person_erasure_covers_every_name_the_model_might_have_used() {
@@ -1648,6 +1740,103 @@ mod erasure_tests {
         assert_eq!(without_nickname, vec!["42".to_string(), "42".to_string()]);
         let blank_nickname = relation_note_targets(42, "42", Some("   "));
         assert_eq!(blank_nickname, vec!["42".to_string(), "42".to_string()]);
+    }
+
+    /// 数据擦除的端到端不变量：擦除之后，**下一次持久化**不能把被删的人写回来。
+    ///
+    /// 走的是生产路径：内存里记录观察 → `persist_if_dirty()` 落盘 → 真正的
+    /// `delete_person_domain_data` → 再一次 `persist_if_dirty()`。持久化是"按内存
+    /// 快照整表重写"，所以只要擦除没有让内存态重新对齐，第二次持久化就会把行写回。
+    /// 这就是 `purge_world_model_domain` 必须在提交后调 `restore_from_store()` 的原因。
+    ///
+    /// 用 `--ignored --exact` 单进程单用例跑：它会临时替换全局配置（world_model 打开）
+    /// 并占用 `WORLD_MODEL_STORE`，结尾会把原配置装回去。
+    #[test]
+    #[ignore = "requires PostgreSQL via DATABASE_URL"]
+    fn erasure_then_persist_does_not_resurrect_the_deleted_person() {
+        use crate::yunxi::world_model_store::PostgresWorldModelStore;
+        use sqlx_postgres::PgPoolOptions;
+        use std::sync::Arc;
+        use yunxi_core::world_model::{ObservationKind, ObservationSource, WorldScope};
+
+        // 世界模型要打开才会走 with_world / persist / restore。
+        let previous_config = crate::config::get();
+        let world_config =
+            crate::config::validate_candidate("[world_model]\nenabled = true\npersist = true\n")
+                .expect("候选配置应合法");
+        crate::config::install(world_config).expect("应安装测试配置");
+        super::world_model::reset_for_tests();
+
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let database_url = std::env::var("DATABASE_URL").expect("需要 DATABASE_URL");
+                let pool = PgPoolOptions::new()
+                    .max_connections(4)
+                    .connect(&database_url)
+                    .await
+                    .expect("应连接 PostgreSQL");
+                let store = initialize_erasure_schemas(&pool).await;
+
+                let world_store = Arc::new(PostgresWorldModelStore::new(pool.clone()));
+                world_store
+                    .initialize_schema()
+                    .await
+                    .expect("应初始化 world schema");
+                let _ = super::WORLD_MODEL_STORE.set(Arc::clone(&world_store));
+
+                let (identity, direct, person_uuid) = seed_person_with_memory(&pool, &store).await;
+
+                // 内存里记一条这个人的观察，并落盘。
+                super::world_model::record_observation(
+                    WorldScope::Person {
+                        person_id: yunxi_core::PersonId::from_uuid(person_uuid),
+                    },
+                    ObservationKind::MessageReceived,
+                    ObservationSource::DirectUserStatement,
+                    "私聊里说过的内容",
+                    None,
+                );
+                super::world_model::persist_if_dirty().await;
+                assert_eq!(world_observation_rows(&pool, person_uuid).await, 1);
+
+                store
+                    .delete_person_domain_data(&identity, &direct)
+                    .await
+                    .expect("擦除应成功");
+
+                // 擦除之后世界里只要再有**任何**活动，脏标记就会被重新置起来，下一次
+                // tick 就是"按内存快照整表重写"。被删的人不能借这次重写回来。
+                // （少了这一步，第二次 persist 会因为脏标记是 false 而直接返回，
+                // 用例就会以错误的理由变绿——这个坑踩过一次。）
+                super::world_model::record_observation(
+                    WorldScope::Global,
+                    ObservationKind::SystemState,
+                    ObservationSource::SystemState,
+                    "擦除之后别的世界活动",
+                    None,
+                );
+                super::world_model::persist_if_dirty().await;
+                assert_eq!(
+                    world_observation_rows(&pool, person_uuid).await,
+                    0,
+                    "擦除之后的下一次持久化不能把被删的人写回来"
+                );
+            });
+
+        super::world_model::reset_for_tests();
+        crate::config::install(previous_config).expect("应还原配置");
+    }
+
+    async fn world_observation_rows(pool: &sqlx_postgres::PgPool, person: uuid::Uuid) -> i64 {
+        sqlx_core::query_scalar::query_scalar(
+            "SELECT COUNT(*) FROM yunxi_world_observations \
+             WHERE scope_kind = 'person' AND scope_id = $1",
+        )
+        .bind(person)
+        .fetch_one(pool)
+        .await
+        .expect("应统计世界模型观察行")
     }
 
     /// `delete_person_domain_data` 把世界模型那段写成"尽力而为"：
@@ -1665,10 +1854,7 @@ mod erasure_tests {
     #[test]
     #[ignore = "requires PostgreSQL via DATABASE_URL"]
     fn world_store_failure_must_not_take_the_person_erasure_down_with_it() {
-        use crate::yunxi::identity_store::PostgresIdentityStore;
         use crate::yunxi::world_model_store::PostgresWorldModelStore;
-        use sqlx_core::query::query;
-        use sqlx_core::query_scalar::query_scalar;
         use sqlx_postgres::PgPoolOptions;
         use std::sync::Arc;
 
@@ -1681,27 +1867,7 @@ mod erasure_tests {
                     .connect(&database_url)
                     .await
                     .expect("应连接 PostgreSQL");
-                let store = Arc::new(PostgresIdentityStore::new(pool.clone()));
-                store
-                    .initialize_schema()
-                    .await
-                    .expect("应初始化身份 schema");
-                // `yunxi_memories` 属于 memory store 的 schema；擦除要靠它来验证。
-                crate::yunxi::memory_store::PostgresMemoryStore::new(
-                    Arc::clone(&crate::memory::MEMORY_MANAGER),
-                    Arc::clone(&store),
-                    pool.clone(),
-                )
-                .initialize_schema()
-                .await
-                .expect("应初始化 memory schema");
-
-                // 擦除的事务里，世界模型之前还有一步 delivery-ledger 删除；
-                // 它缺表会先一步 `?` 返回，那样就测不到我们要测的那段了。
-                crate::yunxi::delivery_ledger::PostgresDeliveryLedger::new(pool.clone())
-                    .initialize_schema()
-                    .await
-                    .expect("应初始化 delivery ledger schema");
+                let store = initialize_erasure_schemas(&pool).await;
 
                 let world_store = Arc::new(PostgresWorldModelStore::new(pool.clone()));
                 world_store
@@ -1711,51 +1877,26 @@ mod erasure_tests {
                 // 让生产代码里那条 `world_model_store().is_some()` 分支成立。
                 let _ = super::WORLD_MODEL_STORE.set(Arc::clone(&world_store));
 
-                let suffix = (uuid::Uuid::new_v4().as_u128() % 1_000_000_000) as i64;
-                let user_id = 1_000_000_000_000_i64 + suffix;
-                let identity = super::qq::person(user_id).expect("valid identity");
-                let direct = super::qq::direct(9_000_000_000_000_i64 + suffix, user_id)
-                    .expect("valid direct conversation");
-                let person_id = store
-                    .resolve_identity(&identity)
-                    .await
-                    .expect("identity should resolve");
-                store
-                    .resolve_direct_for_person(person_id, &direct)
-                    .await
-                    .expect("direct conversation should resolve");
-                query(
-                    "INSERT INTO yunxi_memories
-                        (id, scope_kind, scope_id, kind, content, importance, tags, occurred_at)
-                     VALUES ($1, 'person', $2, 'fact', 'deletion test', 50, '[]', NOW())",
-                )
-                .bind(uuid::Uuid::new_v4())
-                .bind(person_id.into_uuid())
-                .execute(&pool)
-                .await
-                .expect("应创建测试记忆");
+                let (identity, direct, person_uuid) = seed_person_with_memory(&pool, &store).await;
 
                 // 故障注入：世界模型那条 DELETE 必然失败（表不存在）。
-                query("DROP TABLE yunxi_world_observations")
+                sqlx_core::query::query("DROP TABLE yunxi_world_observations")
                     .execute(&pool)
                     .await
                     .expect("应删表以注入失败");
 
                 let result = store.delete_person_domain_data(&identity, &direct).await;
 
-                let remaining: i64 = query_scalar(
-                    "SELECT COUNT(*) FROM yunxi_memories
-                     WHERE scope_kind = 'person' AND scope_id = $1",
-                )
-                .bind(person_id.into_uuid())
-                .fetch_one(&pool)
-                .await
-                .expect("应统计记忆行");
+                let remaining = person_memory_rows(&pool, person_uuid).await;
                 // 把表建回来，免得污染的库影响后续用例。
                 world_store
                     .initialize_schema()
                     .await
                     .expect("应重建 world schema");
+                assert!(
+                    result.is_ok(),
+                    "身份数据已经删掉了，世界模型失败不该让整次擦除报失败：{result:?}"
+                );
                 assert_eq!(
                     remaining, 0,
                     "世界模型删失败不该把整次擦除带走（本次调用返回：{result:?}）"
