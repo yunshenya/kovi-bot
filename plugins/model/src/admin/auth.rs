@@ -3,6 +3,7 @@
 use super::{AdminState, ApiError};
 use axum::Json;
 use axum::extract::{ConnectInfo, Request, State};
+use axum::http::HeaderMap;
 use axum::http::header::{AUTHORIZATION, COOKIE, SET_COOKIE};
 use axum::http::{HeaderValue, StatusCode};
 use axum::middleware::Next;
@@ -238,6 +239,7 @@ pub(crate) async fn challenge(State(state): State<Arc<AdminState>>) -> Response 
 pub(crate) async fn login(
     State(state): State<Arc<AdminState>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(request): Json<LoginRequest>,
 ) -> Result<Response, ApiError> {
     let ip = peer.ip();
@@ -269,7 +271,7 @@ pub(crate) async fn login(
     };
 
     let ttl_secs = state.sessions.ttl().as_secs();
-    let cookie = session_cookie(&session, state.sessions.ttl());
+    let cookie = session_cookie(&session, state.sessions.ttl(), is_secure_request(&headers));
     let mut response = Json(json!({
         "ok": true,
         "session_ttl_secs": ttl_secs,
@@ -284,11 +286,29 @@ pub(crate) async fn login(
 }
 
 /// 拼会话 Cookie。
-pub(crate) fn session_cookie(session: &str, ttl: Duration) -> String {
+///
+/// `secure` 由请求协议决定：经 HTTPS 反代进来时打上 `Secure`，浏览器就再也不会
+/// 在明文 HTTP 请求里带上它（挂公网时这是必须的）；而本机 SSH 隧道是 http://，
+/// 打上 `Secure` 反而会让隧道入口登不进去，所以按请求区分而不是一刀切。
+pub(crate) fn session_cookie(session: &str, ttl: Duration, secure: bool) -> String {
     format!(
-        "{SESSION_COOKIE}={session}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}",
-        ttl.as_secs()
+        "{SESSION_COOKIE}={session}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}{}",
+        ttl.as_secs(),
+        if secure { "; Secure" } else { "" }
     )
+}
+
+/// 请求是否来自 HTTPS。
+///
+/// 只看反向代理设置的 `X-Forwarded-Proto`：本进程自己没有 TLS，所以"直连就是
+/// http"。取值可能形如 `https, http`（多级代理），取第一段。
+pub(crate) fn is_secure_request(headers: &HeaderMap) -> bool {
+    headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(|value| value.trim().eq_ignore_ascii_case("https"))
+        .unwrap_or(false)
 }
 
 /// `GET /?token=<token>`：一次性登录入口。
@@ -299,6 +319,7 @@ pub(crate) async fn login_via_link(
     state: &AdminState,
     token: Option<&str>,
     target: &str,
+    secure: bool,
 ) -> Result<Response, ApiError> {
     let Some(token) = token.map(str::trim).filter(|token| !token.is_empty()) else {
         return Err(ApiError::bad_request("缺少 token 参数"));
@@ -309,7 +330,7 @@ pub(crate) async fn login_via_link(
     let Some(session) = state.sessions.create() else {
         return Err(ApiError::too_many_requests("已登录会话数达到上限"));
     };
-    let cookie = session_cookie(&session, state.sessions.ttl());
+    let cookie = session_cookie(&session, state.sessions.ttl(), secure);
     let mut response = axum::response::Redirect::to(target).into_response();
     response.headers_mut().insert(
         SET_COOKIE,
@@ -442,6 +463,42 @@ mod tests {
         );
         assert_eq!(bearer_token(Some(&header("Token abc"))), None);
         assert_eq!(bearer_token(Some(&header("Bearer   "))), None);
+    }
+
+    #[test]
+    fn secure_flag_follows_the_request_scheme() {
+        // 直连（隧道）是 http：不能带 Secure，否则隧道入口用不了。
+        let plain = session_cookie("sid", Duration::from_secs(60), false);
+        assert!(!plain.contains("Secure"));
+        // 经 HTTPS 反代：必须带 Secure，避免明文请求里漏 Cookie。
+        let secure = session_cookie("sid", Duration::from_secs(60), true);
+        assert!(secure.contains("; Secure"));
+        assert!(secure.contains("HttpOnly"));
+        assert!(secure.contains("SameSite=Strict"));
+    }
+
+    #[test]
+    fn forwarded_proto_decides_https() {
+        assert!(is_secure_request(&{
+            let mut headers = HeaderMap::new();
+            headers.insert("x-forwarded-proto", "https".parse().expect("头部应可构造"));
+            headers
+        }));
+        // 多级代理：只看第一段。
+        assert!(is_secure_request(&{
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "x-forwarded-proto",
+                "https, http".parse().expect("头部应可构造"),
+            );
+            headers
+        }));
+        assert!(!is_secure_request(&{
+            let mut headers = HeaderMap::new();
+            headers.insert("x-forwarded-proto", "http".parse().expect("头部应可构造"));
+            headers
+        }));
+        assert!(!is_secure_request(&HeaderMap::new()));
     }
 
     #[test]
