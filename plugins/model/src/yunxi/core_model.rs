@@ -1168,6 +1168,57 @@ fn reply_text_has_semantic_content(content: &str) -> bool {
     false
 }
 
+/// 本地兜底的输出有没有"薄到不该算一条回复"。
+///
+/// 为什么单独加这一层：`reply_text_has_semantic_content` 判的是"这是不是占位词
+/// 或协议残留"，`"1"` 既不是占位词也不是协议，所以它能通过——线上于是出现过
+/// 主模型输出不可用、本地兜底发出一个 `1`。而本地模型是这条链路上最容易输出碎片
+/// 的一环，必须有下限。
+///
+/// 判据按**有意义的字符**计，不是按长度：汉字、假名、字母、emoji 才算数，
+/// 数字与标点不算。于是 `1`、`1.`、`。1`、`……` 都算碎片，而 `好`、`嗯嗯`、
+/// `嗨～`、`666`、`😊` 都是正常短回复——真人也会那么发，不能误杀。
+fn reply_text_is_too_thin(content: &str) -> bool {
+    let trimmed = content.trim();
+    let meaningful = trimmed
+        .chars()
+        .filter(|character| is_meaningful_reply_character(*character))
+        .count();
+    if meaningful >= MIN_INTRINSIC_FALLBACK_MEANINGFUL_CHARS {
+        return false;
+    }
+    // 没有任何汉字/假名/字母/emoji。数字单独判：`666`（网络用语"溜"）是正常
+    // 回复，`1` 不是——区别在于它是"一个孤零零的记号"还是成串的数字/标点。
+    // 先去掉空白再数：`1 2` 与 `12` 是同一种碎片，空行/空格不该让碎片"变长"。
+    let compact = trimmed
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>();
+    compact.chars().count() < MIN_NUMERIC_SLANG_CHARS
+        || compact.chars().all(|character| !character.is_numeric())
+}
+
+/// 这个字符本身能不能承载一句话的意思。
+///
+/// 汉字与假名要显式列出来：`char::is_alphabetic` 对它们为真，但**数字也是
+/// `is_alphanumeric`**，而"只有数字"正是我们要拦的那种碎片。
+fn is_meaningful_reply_character(character: char) -> bool {
+    if character.is_ascii_digit() || character.is_numeric() {
+        return false;
+    }
+    character.is_alphabetic() || character.is_emoji_char()
+}
+
+/// 日志用的有界预览：只保留开头，避免把整段模型输出刷进日志。
+fn raw_preview(content: &str) -> String {
+    const MAX_CHARS: usize = 60;
+    let mut preview: String = content.trim().chars().take(MAX_CHARS).collect();
+    if content.trim().chars().count() > MAX_CHARS {
+        preview.push('…');
+    }
+    preview.replace('\n', "⏎")
+}
+
 fn intrinsic_content_after_cues(content: &str) -> Option<&str> {
     if content.contains(CORE_INTERACTION_CUES_START) || content.contains(CORE_INTERACTION_CUES_END)
     {
@@ -2612,6 +2663,13 @@ fn ambient_group_interjection_veto(
 /// 会先出现（她开始收着说），继续恶化才轮到不接。
 const SILENCE_TENSION_THRESHOLD: f32 = 0.6;
 
+/// 本地兜底输出至少要有这么多个"有意义字符"（汉字/假名/字母/emoji）才算一条
+/// 回复。"好""😊"这种单字回复是正常的，所以不设长度门槛。
+const MIN_INTRINSIC_FALLBACK_MEANINGFUL_CHARS: usize = 1;
+/// 没有任何有意义字符时，至少要有这么长的数字串才算回复：`666`、`233` 是网络
+/// 用语，`1`、`3` 是要拦的碎片。
+const MIN_NUMERIC_SLANG_CHARS: usize = 3;
+
 /// 静默门控：这个人对她的持续不友好已经攒到了阈值，这一轮不必再回。
 ///
 /// 为什么闸装在这里：它是模型调用之前的否决点，和 `pre_model_plan`、
@@ -3773,6 +3831,10 @@ impl KoviModelBackend {
         if !is_current(ticket).await {
             return None;
         }
+        // 本地兜底此前完全没有日志：线上出现过"主模型输出被判不可用 → 兜底发出
+        // 一条 `1`"，而事后无法回答"本地模型到底写了什么"。这里把原始输出有界地
+        // 记下来（只记长度与前若干字符），并把被丢弃的原因一并说清。
+        let raw_chars = output.text.chars().count();
         let text = if autonomous_turn {
             sanitize_autonomous_intrinsic_output(&output.text)
         } else {
@@ -3780,10 +3842,23 @@ impl KoviModelBackend {
         };
         let Some(text) = text else {
             kovi::log::warn!(
-                "Yunxi Intrinsic output rejected: reason=empty_protocol_or_nonsemantic"
+                "Yunxi Intrinsic output rejected: reason=empty_protocol_or_nonsemantic raw_chars={raw_chars} raw={}",
+                raw_preview(&output.text),
             );
             return None;
         };
+        if !autonomous_turn && reply_text_is_too_thin(&text) {
+            kovi::log::warn!(
+                "Yunxi Intrinsic output rejected: reason=too_thin raw_chars={raw_chars} kept={} raw={}",
+                raw_preview(&text),
+                raw_preview(&output.text),
+            );
+            return None;
+        }
+        kovi::log::info!(
+            "Yunxi Intrinsic fallback produced: raw_chars={raw_chars} kept={}",
+            raw_preview(&text),
+        );
         self.intrinsic_cache.lock().await.insert(scope, ());
         Some(text)
     }
@@ -6856,14 +6931,15 @@ mod tests {
         recent_group_conversation_messages, refine_core_incoming, register_core_tool_intents,
         repair_context_messages, reply_asks_something, reply_expected_for_incoming,
         reply_looks_complete, reply_recovery_required, reply_text_has_semantic_content,
-        requested_message_count, route_from_lookup, route_lookup_with_fallback,
-        safe_single_structured_reply_message, safe_structured_reply_batch,
-        sanitize_autonomous_intrinsic_output, sanitize_intrinsic_output,
-        sanitize_plain_text_batch_message, select_host_model_route_from_capability,
-        serialize_intrinsic_reply_batch, shadow_projection_for_completed_plan, silence_gate_plan,
-        silence_verdict, silent_wait_plan, split_core_speech_markers, strip_core_speech_markers,
-        strong_reply_repair_needed, tool_calls_allowed_for_turn, tool_protocol_authorized_for_turn,
-        visible_reply_intent, visible_reply_intents, visible_reply_state_updates,
+        reply_text_is_too_thin, requested_message_count, route_from_lookup,
+        route_lookup_with_fallback, safe_single_structured_reply_message,
+        safe_structured_reply_batch, sanitize_autonomous_intrinsic_output,
+        sanitize_intrinsic_output, sanitize_plain_text_batch_message,
+        select_host_model_route_from_capability, serialize_intrinsic_reply_batch,
+        shadow_projection_for_completed_plan, silence_gate_plan, silence_verdict, silent_wait_plan,
+        split_core_speech_markers, strip_core_speech_markers, strong_reply_repair_needed,
+        tool_calls_allowed_for_turn, tool_protocol_authorized_for_turn, visible_reply_intent,
+        visible_reply_intents, visible_reply_state_updates,
     };
     use crate::model::{
         BotMemory, ConversationCoordinator, IncomingTurnImpact, OutgoingExecutiveDecision,
@@ -8631,6 +8707,26 @@ mod tests {
             "我插进去说两句会不会太吵？"
         ));
         assert!(first_person_turn_avoidance("我插进去说两句会不会太吵？"));
+    }
+
+    #[test]
+    fn a_one_character_intrinsic_fallback_is_not_a_reply() {
+        // 线上实测（2026-09-14 01:42，群 641996763）：主模型输出被判不可用后，
+        // 本地兜底发出了一个 `1`。`reply_text_has_semantic_content` 拦不住它
+        // （既不是占位词也不是协议残留），所以兜底需要自己的下限。
+        for too_thin in ["1", "1.", "。1", ".", "……", "1 2", "3"] {
+            assert!(
+                reply_text_is_too_thin(too_thin),
+                "碎片不该当成一条回复发出去：{too_thin:?}"
+            );
+        }
+        // 真人也会发的短回复不能被误杀：下限只针对"不像话的碎片"。
+        for kept in ["好", "嗯嗯", "在的", "嗨～", "666", "明天见", "😊"] {
+            assert!(
+                !reply_text_is_too_thin(kept),
+                "正常短回复不能被丢弃：{kept:?}"
+            );
+        }
     }
 
     #[test]
