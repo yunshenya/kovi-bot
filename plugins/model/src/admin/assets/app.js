@@ -1514,6 +1514,80 @@
     const graph = await api(`/api/memory/graph?${params}`);
     memory.graph = graph;
 
+    // 画布、节点坐标、缩放跨重绘保留：切换一个开关不该重建整页（滚动位置、
+    // 筛选状态都会丢），也不该让图重新布局跳一下。
+    const view = memory.graphView || (memory.graphView = {
+      positions: new Map(),
+      zoom: 0.9,
+      panX: 0,
+      panY: 0,
+      hovered: null,
+      dragging: false,
+      moved: false,
+    });
+
+    const heatLabel = h('span', { class: 'graph-heat-label' });
+    const heatMin = h('span');
+    const heatMax = h('span');
+    const canvas = h('canvas', { id: 'memory-graph' });
+    const tooltip = h('div', { class: 'graph-tooltip', id: 'graph-tooltip', hidden: true });
+    const canvasBox = h('div', { class: 'graph-canvas-box' },
+      canvas,
+      h('div', { class: 'graph-hint', text: '滚动缩放 · 拖动平移 · 悬停探索 · 点击查看详情' }),
+      h('div', { class: 'graph-heat' },
+        heatLabel,
+        h('div', { class: 'graph-heat-bar' }),
+        h('div', { class: 'graph-heat-range' }, heatMin, heatMax)),
+      h('button', { class: 'btn ghost small graph-full', text: '全屏', onclick: () => toggleGraphFullscreen(canvasBox) }),
+      tooltip);
+
+    const sideBody = h('div', { class: 'graph-side-body' });
+
+    /** 只重画图：开关类控件都走它，不重建整页。 */
+    const refresh = () => {
+      heatLabel.textContent = memory.colorBy === 'weight'
+        ? '重要度'
+        : memory.colorBy === 'mentioned_at'
+          ? '近期度 · 提及时间'
+          : '近期度 · 发生时间';
+      heatMin.textContent = memory.colorBy === 'weight' ? '低' : shortDate(graph.range && graph.range.min);
+      heatMax.textContent = memory.colorBy === 'weight' ? '高' : shortDate(graph.range && graph.range.max);
+
+      const collapsed = memory.collapseDuplicates ? collapseDuplicateNodes(graph) : null;
+      const shown = collapsed || {
+        nodes: graph.nodes || [],
+        links: graph.links || [],
+        linkCounts: graph.link_counts || {},
+        hidden: 0,
+      };
+      const visibleLinks = (shown.links || []).filter((link) => memory.linkTypes.has(link.type));
+
+      sideBody.replaceChildren(
+        h('div', { class: 'graph-stat' },
+          h('div', {}, h('div', { class: 'label', text: '节点' }),
+            h('div', { class: 'value', text: String(shown.nodes.length) })),
+          h('div', {}, h('div', { class: 'label', text: '链接' }),
+            h('div', { class: 'value', text: String(visibleLinks.length) }))),
+        shown.hidden > 0
+          ? h('p', { class: 'muted small', text: `已把 ${shown.hidden} 条内容重复的记录折进节点` })
+          : null,
+        h('div', { class: 'graph-legend' },
+          ...LINK_TYPES.map(([key, label, color]) => h('div', { class: 'graph-legend-row' },
+            h('i', { style: `background:${color}` }),
+            h('span', { class: memory.linkTypes.has(key) ? '' : 'muted', text: label }),
+            h('span', { class: 'muted', text: String(shown.linkCounts[key] || 0) })))));
+
+      // 视图栏那行也得跟着更新——整页重绘被去掉之后，它不会自己刷新了。
+      const countLabel = document.querySelector('#page-memory .view-count');
+      if (countLabel) {
+        countLabel.textContent = shown.hidden > 0
+          ? `星座图：${graph.total} 条记忆（折叠为 ${shown.nodes.length} 个节点）`
+          : `星座图：${graph.total} 条记忆`;
+      }
+
+      drawConstellation(canvas, tooltip, { nodes: shown.nodes, links: visibleLinks }, view);
+    };
+
     const controls = h('div', { class: 'graph-controls' },
       h('label', { class: 'graph-control' },
         h('span', { text: '着色依据' }),
@@ -1522,7 +1596,10 @@
             h('option', { value: 'mentioned_at', text: '提及时间', selected: memory.colorBy === 'mentioned_at' }),
             h('option', { value: 'occurred_at', text: '发生时间', selected: memory.colorBy === 'occurred_at' }),
             h('option', { value: 'weight', text: '重要度', selected: memory.colorBy === 'weight' }));
-          select.addEventListener('change', () => { memory.colorBy = select.value; renderMemoryPage(); });
+          select.addEventListener('change', () => {
+            memory.colorBy = select.value;
+            refresh();
+          });
           return select;
         })()),
       h('label', { class: 'graph-control', title: '把内容完全相同的记录折成一个节点并标出条数' },
@@ -1531,64 +1608,34 @@
           const input = h('input', { type: 'checkbox', checked: memory.collapseDuplicates });
           input.addEventListener('change', () => {
             memory.collapseDuplicates = input.checked;
-            renderMemoryPage();
+            refresh();
           });
           return h('span', { class: 'switch small' }, input, h('span', { class: 'track' }));
         })()),
       h('div', { class: 'graph-control' },
         h('span', { text: '链接类型' }),
-        ...LINK_TYPES.map(([key, label, color]) => h('button', {
-          class: `link-toggle${memory.linkTypes.has(key) ? '' : ' off'}`,
-          onclick: () => {
+        ...LINK_TYPES.map(([key, label, color]) => {
+          const button = h('button', {
+            class: `link-toggle${memory.linkTypes.has(key) ? '' : ' off'}`,
+          }, h('i', { style: `background:${color}` }), label);
+          button.addEventListener('click', () => {
             if (memory.linkTypes.has(key)) memory.linkTypes.delete(key);
             else memory.linkTypes.add(key);
-            renderMemoryPage();
-          },
-        }, h('i', { style: `background:${color}` }), label))));
+            button.classList.toggle('off', !memory.linkTypes.has(key));
+            refresh();
+          });
+          return button;
+        })));
 
-    const layout = h('div', { class: 'graph-layout' });
-    const canvasBox = h('div', { class: 'graph-canvas-box' },
-      h('canvas', { id: 'memory-graph' }),
-      h('div', { class: 'graph-hint', text: '滚动缩放 · 拖动平移 · 悬停探索 · 点击查看详情' }),
-      h('div', { class: 'graph-heat' },
-        h('span', { class: 'graph-heat-label' },
-          memory.colorBy === 'weight' ? '重要度' : memory.colorBy === 'mentioned_at' ? '近期度 · 提及时间' : '近期度 · 发生时间'),
-        h('div', { class: 'graph-heat-bar' }),
-        h('div', { class: 'graph-heat-range' },
-          h('span', { text: memory.colorBy === 'weight' ? '低' : shortDate(graph.range && graph.range.min) }),
-          h('span', { text: memory.colorBy === 'weight' ? '高' : shortDate(graph.range && graph.range.max) }))),
-      h('button', { class: 'btn ghost small graph-full', text: '全屏', onclick: () => toggleGraphFullscreen(canvasBox) }),
-      h('div', { class: 'graph-tooltip', id: 'graph-tooltip', hidden: true }));
-    layout.append(canvasBox);
+    const layout = h('div', { class: 'graph-layout' }, canvasBox,
+      h('aside', { class: 'graph-side' },
+        h('h4', { text: '星座视图' }),
+        h('p', { class: 'muted small' },
+          '画布渲染的记忆地图：节点是记忆，连线是它们之间真实存在的关系。滚动缩放，拖动平移，悬停探索，点击查看详情。'),
+        sideBody));
 
-    const view = memory.collapseDuplicates ? collapseDuplicateNodes(graph) : null;
-    const shown = view || {
-      nodes: graph.nodes || [],
-      links: graph.links || [],
-      linkCounts: graph.link_counts || {},
-      hidden: 0,
-    };
-    const counts = shown.linkCounts;
-    layout.append(h('aside', { class: 'graph-side' },
-      h('h4', { text: '星座视图' }),
-      h('p', { class: 'muted small' },
-        '画布渲染的记忆地图：节点是记忆，连线是它们之间真实存在的关系。滚动缩放，拖动平移，悬停探索，点击查看详情。'),
-      h('div', { class: 'graph-stat' },
-        h('div', {}, h('div', { class: 'label', text: '节点' }),
-          h('div', { class: 'value', text: String(shown.nodes.length) })),
-        h('div', {}, h('div', { class: 'label', text: '链接' }),
-          h('div', { class: 'value', text: String(Object.values(counts).reduce((a, b) => a + b, 0)) }))),
-      shown.hidden > 0
-        ? h('p', { class: 'muted small', text: `已把 ${shown.hidden} 条内容重复的记录折进节点` })
-        : null,
-      h('div', { class: 'graph-legend' },
-        ...LINK_TYPES.map(([key, label, color]) => h('div', { class: 'graph-legend-row' },
-          h('i', { style: `background:${color}` }), label,
-          h('span', { class: 'muted', text: String(counts[key] || 0) }))))));
-
-    const card = h('div', { class: 'card' }, controls, layout);
-    page.append(card);
-    drawConstellation({ ...graph, nodes: shown.nodes, links: shown.links, total: shown.nodes.length });
+    page.append(h('div', { class: 'card' }, controls, layout));
+    refresh();
   }
 
   function toggleGraphFullscreen(box) {
@@ -1596,17 +1643,21 @@
     else box.requestFullscreen?.().catch(() => toast('浏览器拒绝了全屏请求', 'bad'));
   }
 
-  /** 力导向布局 + canvas 绘制；几百个节点内足够，且只在需要时重绘。 */
-  function drawConstellation(graph) {
-    const canvas = $('#memory-graph');
-    if (!canvas) return;
+  /** 力导向布局 + canvas 绘制。
+   *
+   * 画布与事件监听只挂一次（存在 `canvas.__graphRuntime` 上）：切换开关时复用
+   * 同一块画布、同一份节点坐标，图不会跳，也不会因为反复挂监听越跑越慢。 */
+  function drawConstellation(canvas, tip, graph, view) {
     const context = canvas.getContext('2d');
-    const tip = $('#graph-tooltip');
+    const width = () => canvas.clientWidth || 640;
+    const height = () => canvas.clientHeight || 520;
 
-    const nodes = (graph.nodes || []).filter((node) => memory.kinds.length === 0 || true);
-    const links = (graph.links || []).filter((link) => memory.linkTypes.has(link.type));
+    // 节点对象每次都是新的，悬停状态不能跨重绘沿用。
+    view.hovered = null;
+
+    const nodes = graph.nodes || [];
     const byId = new Map(nodes.map((node) => [node.id, node]));
-    const edges = links
+    const edges = (graph.links || [])
       .map((link) => ({ ...link, a: byId.get(link.source), b: byId.get(link.target) }))
       .filter((edge) => edge.a && edge.b);
 
@@ -1614,8 +1665,7 @@
     const times = nodes.map((node) => new Date(occurredOf(node)).getTime()).filter((t) => !Number.isNaN(t));
     const minTime = times.length ? Math.min(...times) : 0;
     const maxTime = times.length ? Math.max(...times) : 1;
-    const weights = nodes.map((node) => Number(node.weight) || 0);
-    const maxWeight = Math.max(1, ...weights);
+    const maxWeight = Math.max(1, ...nodes.map((node) => Number(node.weight) || 0));
     const heat = (node) => {
       if (memory.colorBy === 'weight') return (Number(node.weight) || 0) / maxWeight;
       const value = new Date(memory.colorBy === 'mentioned_at' ? mentionedOf(node) : occurredOf(node)).getTime();
@@ -1629,16 +1679,21 @@
       degree.set(edge.b.id, (degree.get(edge.b.id) || 0) + 1);
     }
 
-    // 世界坐标：确定性初始摆放（按 id 哈希落在一个圆盘里），再跑力导向。
-    const state = { zoom: 0.9, panX: 0, panY: 0, hovered: null, dragging: false, moved: false };
-    const width = () => canvas.clientWidth || 640;
-    const height = () => canvas.clientHeight || 520;
-
+    // 坐标优先复用上一次的：只有新出现的节点才需要重新摆放。
+    if (view.positions.size > 4000) view.positions.clear();
+    let needsLayout = false;
     nodes.forEach((node, index) => {
-      const angle = index * 2.399963;
-      const radius = Math.sqrt(index + 1) * 26;
-      node.wx = Math.cos(angle) * radius;
-      node.wy = Math.sin(angle) * radius;
+      const cached = view.positions.get(node.id);
+      if (cached) {
+        node.wx = cached.wx;
+        node.wy = cached.wy;
+      } else {
+        const angle = index * 2.399963;
+        const radius = Math.sqrt(index + 1) * 26;
+        node.wx = Math.cos(angle) * radius;
+        node.wy = Math.sin(angle) * radius;
+        needsLayout = true;
+      }
       node.vx = 0;
       node.vy = 0;
     });
@@ -1683,8 +1738,8 @@
     };
 
     const toScreen = (node) => ({
-      x: width() / 2 + (node.wx + state.panX) * state.zoom,
-      y: height() / 2 + (node.wy + state.panY) * state.zoom,
+      x: width() / 2 + (node.wx + view.panX) * view.zoom,
+      y: height() / 2 + (node.wy + view.panY) * view.zoom,
     });
 
     const paint = () => {
@@ -1694,16 +1749,16 @@
       context.setTransform(ratio, 0, 0, ratio, 0, 0);
       context.clearRect(0, 0, width(), height());
 
-      const dim = state.hovered ? new Set([state.hovered.id]) : null;
-      if (state.hovered) {
+      const dim = view.hovered ? new Set([view.hovered.id]) : null;
+      if (view.hovered) {
         for (const edge of edges) {
-          if (edge.a.id === state.hovered.id) dim.add(edge.b.id);
-          if (edge.b.id === state.hovered.id) dim.add(edge.a.id);
+          if (edge.a.id === view.hovered.id) dim.add(edge.b.id);
+          if (edge.b.id === view.hovered.id) dim.add(edge.a.id);
         }
       }
 
       for (const edge of edges) {
-        const active = !state.hovered || edge.a.id === state.hovered.id || edge.b.id === state.hovered.id;
+        const active = !view.hovered || edge.a.id === view.hovered.id || edge.b.id === view.hovered.id;
         const a = toScreen(edge.a);
         const b = toScreen(edge.b);
         context.strokeStyle = LINK_TYPES.find(([key]) => key === edge.type)[2];
@@ -1725,7 +1780,7 @@
         context.beginPath();
         context.fillStyle = heatColor(heat(node));
         context.globalAlpha = faded ? 0.25 : 0.95;
-        context.arc(point.x, point.y, radius * (state.hovered === node ? 1.5 : 1), 0, Math.PI * 2);
+        context.arc(point.x, point.y, radius * (view.hovered === node ? 1.5 : 1), 0, Math.PI * 2);
         context.fill();
         context.globalAlpha = faded ? 0.2 : 0.85;
         context.strokeStyle = 'rgba(255,255,255,0.55)';
@@ -1738,10 +1793,10 @@
       context.font = '11px system-ui, sans-serif';
       context.fillStyle = getComputedStyle(document.body).color;
       for (const node of nodes) {
-        const show = state.hovered === node || (state.zoom > 0.55 && (degree.get(node.id) || 0) >= 3);
+        const show = view.hovered === node || (view.zoom > 0.55 && (degree.get(node.id) || 0) >= 3);
         if (!show) continue;
         const point = toScreen(node);
-        context.globalAlpha = state.hovered === node ? 1 : 0.7;
+        context.globalAlpha = view.hovered === node ? 1 : 0.7;
         context.fillText(String(node.title || '').slice(0, 18), point.x + 7, point.y + 3);
       }
       context.globalAlpha = 1;
@@ -1764,61 +1819,92 @@
       return best;
     };
 
-    canvas.addEventListener('mousemove', (event) => {
-      if (state.dragging) {
-        state.panX += event.movementX / state.zoom;
-        state.panY += event.movementY / state.zoom;
-        state.moved = true;
-        paint();
-        return;
-      }
-      const node = nodeAt(event);
-      if (node !== state.hovered) {
-        state.hovered = node;
-        canvas.style.cursor = node ? 'pointer' : 'grab';
-        paint();
-      }
-      if (node && tip) {
-        const rect = canvas.getBoundingClientRect();
-        tip.hidden = false;
-        tip.style.left = `${event.clientX - rect.left + 14}px`;
-        tip.style.top = `${event.clientY - rect.top + 10}px`;
-        clear(tip);
-        tip.append(
-          h('div', { class: 'tip-kind', text: node.label || node.kind }),
-          h('div', { class: 'tip-title', text: node.title || '' }),
-          h('div', { class: 'tip-meta', text: `${node.scope_label || '全局'} · ${shortDate(mentionedOf(node))}` }));
-      } else if (tip) {
-        tip.hidden = true;
-      }
-    });
-    canvas.addEventListener('mouseleave', () => {
-      state.hovered = null;
-      if (tip) tip.hidden = true;
-      paint();
-    });
-    canvas.addEventListener('mousedown', () => {
-      state.dragging = true;
-      state.moved = false;
-      canvas.style.cursor = 'grabbing';
-    });
-    window.addEventListener('mouseup', () => {
-      state.dragging = false;
-      canvas.style.cursor = state.hovered ? 'pointer' : 'grab';
-    });
-    canvas.addEventListener('click', (event) => {
-      if (state.moved) return;
-      const node = nodeAt(event);
-      if (node) openRecord(node);
-    });
-    canvas.addEventListener('wheel', (event) => {
-      event.preventDefault();
-      const factor = event.deltaY < 0 ? 1.12 : 0.89;
-      state.zoom = Math.min(4, Math.max(0.15, state.zoom * factor));
-      paint();
-    }, { passive: false });
+    // 运行时快照：监听器只挂一次，因此它们必须每次从画布上取最新的这份。
+    canvas.__graphRuntime = { nodes, edges, degree, heat, paint, nodeAt, toScreen, view };
 
-    // 布局分帧跑，避免几百个节点把首屏卡住。
+    if (!canvas.__graphListenersAttached) {
+      canvas.__graphListenersAttached = true;
+      const runtime = () => canvas.__graphRuntime;
+
+      canvas.addEventListener('mousemove', (event) => {
+        const current = runtime();
+        if (!current) return;
+        const { view: currentView, nodeAt: pick, paint: repaint } = current;
+        if (currentView.dragging) {
+          currentView.panX += event.movementX / currentView.zoom;
+          currentView.panY += event.movementY / currentView.zoom;
+          currentView.moved = true;
+          repaint();
+          return;
+        }
+        const node = pick(event);
+        if (node !== currentView.hovered) {
+          currentView.hovered = node;
+          canvas.style.cursor = node ? 'pointer' : 'grab';
+          repaint();
+        }
+        if (node && tip) {
+          const rect = canvas.getBoundingClientRect();
+          tip.hidden = false;
+          tip.style.left = `${event.clientX - rect.left + 14}px`;
+          tip.style.top = `${event.clientY - rect.top + 10}px`;
+          clear(tip);
+          tip.append(
+            h('div', { class: 'tip-kind', text: node.label || node.kind }),
+            h('div', { class: 'tip-title', text: node.title || '' }),
+            h('div', { class: 'tip-meta', text: `${node.scope_label || '全局'} · ${shortDate(mentionedOf(node))}` }));
+        } else if (tip) {
+          tip.hidden = true;
+        }
+      });
+      canvas.addEventListener('mouseleave', () => {
+        const current = runtime();
+        if (!current) return;
+        current.view.hovered = null;
+        if (tip) tip.hidden = true;
+        current.paint();
+      });
+      canvas.addEventListener('mousedown', () => {
+        const current = runtime();
+        if (!current) return;
+        current.view.dragging = true;
+        current.view.moved = false;
+        canvas.style.cursor = 'grabbing';
+      });
+      window.addEventListener('mouseup', () => {
+        const current = runtime();
+        if (!current) return;
+        current.view.dragging = false;
+        canvas.style.cursor = current.view.hovered ? 'pointer' : 'grab';
+      });
+      canvas.addEventListener('click', (event) => {
+        const current = runtime();
+        if (!current || current.view.moved) return;
+        const node = current.nodeAt(event);
+        if (node) openRecord(node);
+      });
+      canvas.addEventListener('wheel', (event) => {
+        const current = runtime();
+        if (!current) return;
+        event.preventDefault();
+        const factor = event.deltaY < 0 ? 1.12 : 0.89;
+        current.view.zoom = Math.min(4, Math.max(0.15, current.view.zoom * factor));
+        current.paint();
+      }, { passive: false });
+    }
+
+    const rememberPositions = () => {
+      for (const node of nodes) view.positions.set(node.id, { wx: node.wx, wy: node.wy });
+    };
+
+    if (!needsLayout) {
+      // 只是开关变了：坐标还在，直接重画，图不会跳。
+      rememberPositions();
+      paint();
+      return;
+    }
+
+    // 有新节点才跑布局，分帧执行避免卡住首屏。
     let remaining = 140;
     const step = () => {
       if (!canvas.isConnected) return;
@@ -1826,6 +1912,7 @@
       remaining -= 6;
       paint();
       if (remaining > 0) requestAnimationFrame(step);
+      else rememberPositions();
     };
     step();
   }

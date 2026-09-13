@@ -143,7 +143,9 @@ def _pitch_tier(manipulation, duration: float, freq: float, previous: float | No
             glide = min(1.0, step / 0.04)
             value = previous + (freq - previous) * glide
         else:
-            value = freq * (1.0 + 0.012 * np.sin(2 * np.pi * 5.5 * at))
+            # 颤音轻一点、起音处渐入：1.2%/5.5Hz 在整首歌里听着像老式恐怖片配乐
+            depth = 0.008 * min(1.0, at / 0.12)
+            value = freq * (1.0 + depth * np.sin(2 * np.pi * 5.0 * at))
         call(tier, "Add point", at, value)
     call([manipulation, tier], "Replace pitch tier")
 
@@ -219,6 +221,17 @@ def synthesize_syllable(tts: "TtsClient", syllable: str, speed: float) -> tuple[
     return audio, rate
 
 
+def _crossfade_join(left: np.ndarray, right: np.ndarray, overlap: int) -> np.ndarray:
+    """用 `overlap` 个样本把两段交叠淡化接起来（比硬拼接少一次波形跳变）。"""
+    overlap = int(min(overlap, len(left), len(right)))
+    if overlap <= 1:
+        return np.concatenate([left, right])
+    ramp = np.linspace(0.0, 1.0, overlap)
+    return np.concatenate(
+        [left[:-overlap], left[-overlap:] * (1 - ramp) + right[:overlap] * ramp, right[overlap:]]
+    )
+
+
 def _voiced_region(samples: np.ndarray, rate: int) -> tuple[int, int] | None:
     """用"低过零率 + 够能量"找有声区间。
 
@@ -283,7 +296,10 @@ def _pitch_shift(samples: np.ndarray, rate: int, freq: float,
     if len(voiced) < int(0.02 * rate):
         return samples
     shifted = _psola_pitch(voiced, rate, freq, previous)
-    return np.concatenate([head, shifted, tail])
+    # 清辅音是原速原调的，元音是变调后的，硬接会在每个字上留一个咔哒（实测 99.99
+    # 分位差分是正常说话的近两倍，听感就是一路"啪啪"声）。3 毫秒交叠就够。
+    edge = max(1, int(0.003 * rate))
+    return _crossfade_join(_crossfade_join(head, shifted, edge), tail, edge)
 
 
 def _fit_duration(
@@ -389,7 +405,7 @@ def _loop_nucleus(
         return None
     head = samples[:start]
     tail = samples[end:]
-    fade = max(1, int(0.0015 * rate))
+    fade = max(1, int(0.004 * rate))
     ramp = np.linspace(0.0, 1.0, fade)
     pieces = [head, unit.copy()]
     filled = len(head) + len(unit)
@@ -496,13 +512,17 @@ def render_song(tts: TtsClient, notes: list[list[float]], lyrics: str, octave: i
     rate = SAMPLE_RATE
     elapsed = 0.0
     previous: float | None = None
-    for (degree, beats), syllable in zip(fitted, syllables, strict=True):
+    overlap = int(0.015 * rate)
+    last_index = len(fitted) - 1
+    for index, ((degree, beats), syllable) in enumerate(zip(fitted, syllables, strict=True)):
         degree = int(round(degree))
         duration = max(0.12, float(beats) * beat_seconds)
         if elapsed + duration > MAX_SECONDS:
             break
         freq = _hz(degree, octave)
-        piece, rate = sing_note(tts, syllable, freq, duration, previous)
+        # 每个音多合成 15 毫秒，专门留给与下一个音的交叠；总时值因此保持不变。
+        held = duration + (overlap / rate if index != last_index else 0.0)
+        piece, rate = sing_note(tts, syllable, freq, held, previous)
         LOG.debug(
             "音符 %d: %s 音级%d 目标 %.3fs 实际 %.3fs 基频 %.0fHz(实测 %.0fHz)",
             len(pieces) + 1,
@@ -520,7 +540,7 @@ def render_song(tts: TtsClient, notes: list[list[float]], lyrics: str, octave: i
         raise SingRequestError("没有渲染出任何音符")
 
     # 逐音做一次有上限的响度对齐：清辅音字天然比元音响得多/轻得多，不压一下会
-    # 出现某个字几乎听不见。只在 ±4dB 内调整，避免把歌压成一条直线。
+    # 出现某个字几乎听不见。只在 ±2.5dB 内调整，避免把整首歌压成一条没有起伏的线。
     levels = [float(np.sqrt(np.mean(piece**2))) if len(piece) else 0.0 for piece in pieces]
     audible = [level for level in levels if level > 1e-4]
     if audible:
@@ -529,17 +549,22 @@ def render_song(tts: TtsClient, notes: list[list[float]], lyrics: str, octave: i
             level = levels[index]
             if level <= 1e-4:
                 continue
-            gain = min(1.6, max(0.63, target_level / level))
+            gain = min(1.33, max(0.75, target_level / level))
             pieces[index] = piece * gain
 
-    audio = np.concatenate(pieces)
+    # 音与音之间用 15 毫秒交叠连起来（legato）：逐音淡到零再淡起来会变成一顿一顿的
+    # 念白感，硬拼又会咔哒——交叠是这两者之间唯一像"唱"的接法。
+    audio = pieces[0]
+    for piece in pieces[1:]:
+        audio = _crossfade_join(audio, piece, overlap)
     fade = min(int(0.01 * rate), len(audio) // 2)
     if fade > 0:
         ramp = np.linspace(0.0, 1.0, fade)
         audio[:fade] *= ramp
         audio[-fade:] *= ramp[::-1]
+    # 收敛一点整体电平：之前峰值 0.92 配高八度音区，等于贴耳喊，很刺。
     peak = float(np.max(np.abs(audio))) or 1.0
-    pcm = (audio / peak * 0.92 * 32767.0).astype("<i2")
+    pcm = (audio / peak * 0.80 * 32767.0).astype("<i2")
     buffer = BytesIO()
     with wave.open(buffer, "wb") as handle:
         handle.setnchannels(1)

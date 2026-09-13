@@ -5,8 +5,8 @@
       "id": "xiaoxingxing",
       "name": "小星星（完整四句）",
       "mood": "童谣 / 轻快",
-      "bpm": 104,
-      "octave": 5,
+      "bpm": 96,
+      "octave": 4,
       "notes": [
         [
           1,
@@ -127,7 +127,7 @@
       "name": "两只老虎",
       "mood": "童谣 / 俏皮",
       "bpm": 120,
-      "octave": 5,
+      "octave": 4,
       "notes": [
         [
           1,
@@ -245,7 +245,7 @@
       "name": "自创 · 轻快",
       "mood": "明亮 / 随口哼",
       "bpm": 112,
-      "octave": 5,
+      "octave": 4,
       "notes": [
         [
           1,
@@ -285,8 +285,8 @@
       "id": "zichang-manban",
       "name": "自创 · 慢板",
       "mood": "抒情 / 晚安",
-      "bpm": 72,
-      "octave": 5,
+      "bpm": 66,
+      "octave": 4,
       "notes": [
         [
           3,
