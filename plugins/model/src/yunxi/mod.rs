@@ -1649,4 +1649,117 @@ mod erasure_tests {
         let blank_nickname = relation_note_targets(42, "42", Some("   "));
         assert_eq!(blank_nickname, vec!["42".to_string(), "42".to_string()]);
     }
+
+    /// `delete_person_domain_data` 把世界模型那段写成"尽力而为"：
+    /// `if world_model_store().is_some() && let Ok(rows) = delete_person_domain_rows(...)`。
+    /// 注释说"世界模型失败不能拖垮擦除"，但 PostgreSQL 里任何语句失败都会中止
+    /// **整个**事务，后续语句一律 25P02；而 sqlx 的 `commit()` 只是发一条 COMMIT，
+    /// 在已中止的事务上等价于回滚，却照样返回 `Ok`。也就是说这个 `let Ok(..)` 恰好
+    /// 做不到它想做的事：它会让这次擦除的其余部分一起静默失效。
+    ///
+    /// 这条测试让世界模型那条 DELETE 真的失败（把它依赖的表删掉），然后断言这个人
+    /// 真正该被删掉的记忆仍然被删掉了。
+    ///
+    /// 它需要 `WORLD_MODEL_STORE` 落在本进程里，因此和 CI 一样按 `--ignored --exact`
+    /// 单进程单用例跑；结尾会把 world 表建回来，失败路径也不留残缺 schema。
+    #[test]
+    #[ignore = "requires PostgreSQL via DATABASE_URL"]
+    fn world_store_failure_must_not_take_the_person_erasure_down_with_it() {
+        use crate::yunxi::identity_store::PostgresIdentityStore;
+        use crate::yunxi::world_model_store::PostgresWorldModelStore;
+        use sqlx_core::query::query;
+        use sqlx_core::query_scalar::query_scalar;
+        use sqlx_postgres::PgPoolOptions;
+        use std::sync::Arc;
+
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let database_url = std::env::var("DATABASE_URL").expect("需要 DATABASE_URL");
+                let pool = PgPoolOptions::new()
+                    .max_connections(4)
+                    .connect(&database_url)
+                    .await
+                    .expect("应连接 PostgreSQL");
+                let store = Arc::new(PostgresIdentityStore::new(pool.clone()));
+                store
+                    .initialize_schema()
+                    .await
+                    .expect("应初始化身份 schema");
+                // `yunxi_memories` 属于 memory store 的 schema；擦除要靠它来验证。
+                crate::yunxi::memory_store::PostgresMemoryStore::new(
+                    Arc::clone(&crate::memory::MEMORY_MANAGER),
+                    Arc::clone(&store),
+                    pool.clone(),
+                )
+                .initialize_schema()
+                .await
+                .expect("应初始化 memory schema");
+
+                // 擦除的事务里，世界模型之前还有一步 delivery-ledger 删除；
+                // 它缺表会先一步 `?` 返回，那样就测不到我们要测的那段了。
+                crate::yunxi::delivery_ledger::PostgresDeliveryLedger::new(pool.clone())
+                    .initialize_schema()
+                    .await
+                    .expect("应初始化 delivery ledger schema");
+
+                let world_store = Arc::new(PostgresWorldModelStore::new(pool.clone()));
+                world_store
+                    .initialize_schema()
+                    .await
+                    .expect("应初始化 world schema");
+                // 让生产代码里那条 `world_model_store().is_some()` 分支成立。
+                let _ = super::WORLD_MODEL_STORE.set(Arc::clone(&world_store));
+
+                let suffix = (uuid::Uuid::new_v4().as_u128() % 1_000_000_000) as i64;
+                let user_id = 1_000_000_000_000_i64 + suffix;
+                let identity = super::qq::person(user_id).expect("valid identity");
+                let direct = super::qq::direct(9_000_000_000_000_i64 + suffix, user_id)
+                    .expect("valid direct conversation");
+                let person_id = store
+                    .resolve_identity(&identity)
+                    .await
+                    .expect("identity should resolve");
+                store
+                    .resolve_direct_for_person(person_id, &direct)
+                    .await
+                    .expect("direct conversation should resolve");
+                query(
+                    "INSERT INTO yunxi_memories
+                        (id, scope_kind, scope_id, kind, content, importance, tags, occurred_at)
+                     VALUES ($1, 'person', $2, 'fact', 'deletion test', 50, '[]', NOW())",
+                )
+                .bind(uuid::Uuid::new_v4())
+                .bind(person_id.into_uuid())
+                .execute(&pool)
+                .await
+                .expect("应创建测试记忆");
+
+                // 故障注入：世界模型那条 DELETE 必然失败（表不存在）。
+                query("DROP TABLE yunxi_world_observations")
+                    .execute(&pool)
+                    .await
+                    .expect("应删表以注入失败");
+
+                let result = store.delete_person_domain_data(&identity, &direct).await;
+
+                let remaining: i64 = query_scalar(
+                    "SELECT COUNT(*) FROM yunxi_memories
+                     WHERE scope_kind = 'person' AND scope_id = $1",
+                )
+                .bind(person_id.into_uuid())
+                .fetch_one(&pool)
+                .await
+                .expect("应统计记忆行");
+                // 把表建回来，免得污染的库影响后续用例。
+                world_store
+                    .initialize_schema()
+                    .await
+                    .expect("应重建 world schema");
+                assert_eq!(
+                    remaining, 0,
+                    "世界模型删失败不该把整次擦除带走（本次调用返回：{result:?}）"
+                );
+            });
+    }
 }

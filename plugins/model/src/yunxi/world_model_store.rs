@@ -1000,6 +1000,106 @@ fn json_error(context: &'static str) -> impl Fn(serde_json::Error) -> anyhow::Er
 mod tests {
     use super::*;
 
+    fn person_observation(
+        person: PersonId,
+        content: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Observation {
+        use yunxi_core::world_model::{ObservationDraft, ObservationPayload};
+        let draft = ObservationDraft::new(
+            WorldScope::Person { person_id: person },
+            ObservationKind::SystemState,
+            ObservationSource::SystemState,
+            ObservationPayload::new(content, None::<&str>).expect("payload"),
+            0.8,
+            Some(3600),
+        )
+        .expect("draft");
+        draft
+            .build(
+                yunxi_core::world_model::ObservationId::new(),
+                yunxi_core::EventId::new(),
+                now,
+            )
+            .expect("observation")
+    }
+
+    async fn person_observation_rows(pool: &PgPool, person: uuid::Uuid) -> i64 {
+        sqlx_core::query_scalar::query_scalar(
+            "SELECT COUNT(*) FROM yunxi_world_observations \
+             WHERE scope_kind = 'person' AND scope_id = $1",
+        )
+        .bind(person)
+        .fetch_one(pool)
+        .await
+        .expect("应统计观察行")
+    }
+
+    /// 数据删除的承诺是"这个人的世界模型数据被删掉"。但持久化循环每个
+    /// `persist_interval_secs`（默认 30s）都用**内存快照整表重写**一遍
+    /// （`save_world`：先 DELETE 全表再按快照 INSERT），而擦除只删库里的行，
+    /// 没有任何东西清 `WORLD_RUNTIME`——`yunxi_core::WorldModel::erase_person`
+    /// 在生产代码里零调用者。于是擦除之后的下一次持久化会把刚删掉的行原样写回来，
+    /// 而用户早已收到"已删除"的回执。
+    ///
+    /// 这条在存储边界上钉住不变量：擦除之后，用**同一份未清理的快照**再做一次
+    /// 持久化，不能把被删的人带回来。
+    #[test]
+    #[ignore = "requires PostgreSQL via DATABASE_URL"]
+    fn postgres_erasure_is_not_undone_by_the_next_world_persist() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let database_url = std::env::var("DATABASE_URL").expect("需要 DATABASE_URL");
+                let pool = sqlx_postgres::PgPoolOptions::new()
+                    .max_connections(4)
+                    .connect(&database_url)
+                    .await
+                    .expect("应连接 PostgreSQL");
+                let store = PostgresWorldModelStore::new(pool.clone());
+                store
+                    .initialize_schema()
+                    .await
+                    .expect("应初始化 world schema");
+
+                let person = PersonId::new();
+                let person_uuid = person.into_uuid();
+                let now = chrono::Utc::now();
+                let mut world = WorldModel::new();
+                world
+                    .observe(person_observation(person, "私聊里说过的内容", now))
+                    .expect("应写入观察");
+
+                // 运行中的世界状态已经落过盘。
+                store.save_world(&world).await.expect("首次持久化");
+                assert_eq!(person_observation_rows(&pool, person_uuid).await, 1);
+
+                // 宿主执行数据删除：identity_store 在擦除事务里调这个方法。
+                let mut transaction = pool.begin().await.expect("应开启事务");
+                PostgresWorldModelStore::delete_person_domain_rows(
+                    &mut transaction,
+                    Some(person_uuid),
+                    &[],
+                )
+                .await
+                .expect("擦除应成功");
+                transaction.commit().await.expect("应提交");
+                assert_eq!(
+                    person_observation_rows(&pool, person_uuid).await,
+                    0,
+                    "擦除当下确实删掉了库里的行"
+                );
+
+                // 持久化循环的下一次 tick：快照来自从未被清理的运行时。
+                store.save_world(&world).await.expect("下一次持久化");
+                assert_eq!(
+                    person_observation_rows(&pool, person_uuid).await,
+                    0,
+                    "擦除之后的下一次持久化不能把被删的人写回来"
+                );
+            });
+    }
+
     #[test]
     fn scope_encoding_roundtrips() {
         let person = PersonId::new();
