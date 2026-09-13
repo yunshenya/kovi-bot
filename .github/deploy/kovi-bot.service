@@ -41,7 +41,10 @@ ProtectHome=read-only
 ReadOnlyPaths=/home/ubuntu/kovi-bot/current /home/ubuntu/kovi-bot/releases
 # runtime 是机器人自己的工作目录；桥的 runtime 目录用来写"接听授权名单"
 # （qq_call.caller_allowlist_file），NapCat 容器通过 bind mount 读同一份文件。
-ReadWritePaths=/home/ubuntu/kovi-bot/runtime /home/ubuntu/napcat-qq-call/bridge/runtime
+# napcat-qq-call/voice 是语音消息的暂存目录（qq_voice.staging_dir）：机器人把
+# 合成好的 WAV 写在这里，NapCat 容器以同一个 bind mount 读走再上传，所以它必须
+# 可写——漏掉它时合成没报错、只在落盘处得到 EROFS，然后静默退回文字。
+ReadWritePaths=/home/ubuntu/kovi-bot/runtime /home/ubuntu/napcat-qq-call/bridge/runtime /home/ubuntu/napcat-qq-call/voice
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectKernelLogs=true
