@@ -167,6 +167,55 @@ pub(crate) fn resolve(text: &str, now: DateTime<Tz>) -> Option<ResolvedTime> {
     })
 }
 
+/// 只有钟点/时段、没有日期信息的时间表达（"下午三点半"、"8:20"、"晚上"）。
+///
+/// 与 [`resolve`] 的分工：`resolve` 要求句子里能确定"哪一天"；这里只回答"一天里
+/// 的哪个时刻"，**不猜日期**。策略留给调用方，例如创建提醒时：落在今天还没到就
+/// 是今天，重复提醒已经过点就顺延到下一次，一次性提醒则反问用户是哪一天。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResolvedTimeOfDay {
+    pub hour: u32,
+    pub minute: u32,
+    pub precision: TimePrecision,
+    /// 被理解的那段原文，便于回显确认。
+    pub matched: String,
+}
+
+/// 解析"只有钟点"的时间表达。算不出来就返回 `None`，绝不猜一个时刻出来。
+pub(crate) fn resolve_time_of_day(text: &str) -> Option<ResolvedTimeOfDay> {
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let period = PERIODS
+        .iter()
+        .find(|period| text.contains(**period))
+        .copied();
+    let clock = resolve_clock(text);
+    let (mut hour, minute, precision) = match (clock, period) {
+        (Some((hour, minute)), _) => (hour, minute, TimePrecision::Minute),
+        (None, Some(period)) => (period_default_hour(period)?, 0, TimePrecision::Period),
+        (None, None) => return None,
+    };
+    // 与 `resolve` 同一条规则："晚上12点"在中文里指次日零点。
+    if period.is_some_and(is_afternoon_period) && hour == 12 {
+        hour = 0;
+    }
+    let mut matched = String::new();
+    if let Some(period) = period {
+        matched.push_str(period);
+    }
+    if let Some((hour, minute)) = clock {
+        matched.push_str(&format!("{hour:02}:{minute:02}"));
+    }
+    Some(ResolvedTimeOfDay {
+        hour,
+        minute,
+        precision,
+        matched,
+    })
+}
+
 /// "三天后""两小时后""半小时后""一周后"——相对当前时刻的偏移。
 fn resolve_offset(text: &str, now: DateTime<Tz>) -> Option<ResolvedTime> {
     let number_before = |unit: &str| -> Option<u32> {
@@ -639,6 +688,32 @@ mod tests {
             assert!(resolve(text, now()).is_none(), "{text} 不该被解析出时刻");
         }
         assert!(resolve("   ", now()).is_none());
+    }
+
+    #[test]
+    fn time_of_day_phrases_resolve_without_inventing_a_date() {
+        let three_thirty = resolve_time_of_day("下午三点半").expect("钟点应能解析");
+        assert_eq!((three_thirty.hour, three_thirty.minute), (15, 30));
+        assert_eq!(three_thirty.precision, TimePrecision::Minute);
+
+        let colon = resolve_time_of_day("8:20").expect("冒号写法应能解析");
+        assert_eq!((colon.hour, colon.minute), (8, 20));
+
+        let period_only = resolve_time_of_day("晚上").expect("时段应能解析");
+        assert_eq!(period_only.hour, 20);
+        assert_eq!(period_only.precision, TimePrecision::Period);
+
+        // "晚上12点"指次日零点，与 `resolve` 同一条规则。
+        let midnight = resolve_time_of_day("晚上12点").expect("跨日写法应能解析");
+        assert_eq!((midnight.hour, midnight.minute), (0, 0));
+
+        // 没有钟点也没有时段时不猜：日期类表达属于 `resolve` 的职责。
+        for text in ["明天", "下周三", "随便吧", ""] {
+            assert!(
+                resolve_time_of_day(text).is_none(),
+                "{text} 不该被当成钟点解析"
+            );
+        }
     }
 
     #[test]

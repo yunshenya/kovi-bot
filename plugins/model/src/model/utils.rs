@@ -655,13 +655,21 @@ pub async fn control_model(
         )
         .await;
     }
+    // 群聊里同样接上这条闸门：模型可以自己决定调工具，但"明确要求建提醒/持续
+    // 监测"时宿主必须能拦住一句并不成立的口头确认。语义层结果不在这一层，用
+    // 主机侧保守判定。
+    let is_main_admin = crate::model::utils::is_main_admin(&bot, user_id);
+    let requires_agent_run_create =
+        is_main_admin && crate::agent_runs::looks_like_agent_run_request(message);
+    let requires_reminder_create =
+        !requires_agent_run_create && crate::reminders::looks_like_reminder_request(message);
     let response = ModelGateway::complete(
         &mut request_messages,
         ToolExecutionContext {
             subject_id: group_id,
             actor_user_id: user_id,
             is_admin: crate::model::utils::is_bot_admin(&bot, user_id),
-            is_main_admin: crate::model::utils::is_main_admin(&bot, user_id),
+            is_main_admin,
             context: "group_chat",
             destination: MessageDestination::Group(group_id),
             source_message_id: current_message_id,
@@ -672,11 +680,8 @@ pub async fn control_model(
                 message,
                 scope: StickerScope::Group(group_id),
             }),
-            // Natural-language tool intent is decided by the model/tool
-            // protocol. Host routing only handles explicit commands and
-            // structured message features.
-            requires_reminder_create: false,
-            requires_agent_run_create: false,
+            requires_reminder_create,
+            requires_agent_run_create,
             requires_group_message_send: false,
             requires_group_followup: false,
             requires_external_tool: false,
@@ -3980,6 +3985,15 @@ async fn private_chat_inner(
         .await;
     }
     let is_main_admin = crate::model::utils::is_main_admin(&bot, user_id);
+    // 语义层判定 + 主机侧保守判定取并集：语义层看得懂"明早出门前叫我一声"这类
+    // 说法，主机侧判定兜住分类器偶发漏判。两者都不解析时间，只决定本轮是否强制
+    // 走 reminder.create / agent.run.create。
+    let requires_agent_run_create = is_main_admin
+        && (understanding.agent_run_request
+            || crate::agent_runs::looks_like_agent_run_request(message));
+    let requires_reminder_create = !requires_agent_run_create
+        && (understanding.reminder_request
+            || crate::reminders::looks_like_reminder_request(message));
     let bot_content = ModelGateway::complete(
         &mut request_messages,
         ToolExecutionContext {
@@ -3997,8 +4011,8 @@ async fn private_chat_inner(
                 message,
                 scope: StickerScope::Private(user_id),
             }),
-            requires_reminder_create: false,
-            requires_agent_run_create: false,
+            requires_reminder_create,
+            requires_agent_run_create,
             requires_group_message_send: is_main_admin && understanding.cross_group_message_request,
             requires_group_followup: is_main_admin && understanding.cross_group_followup_request,
             requires_external_tool: false,

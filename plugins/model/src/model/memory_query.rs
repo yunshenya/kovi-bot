@@ -185,18 +185,9 @@ pub(crate) async fn params_model_with_tool_access(
         role: Roles::System,
         content: registry.instruction_for_native(&tool_context, false),
     });
-    if tool_context.requires_reminder_create {
-        request.push(BotMemory {
-            role: Roles::System,
-            content: "用户明确提出了定时任务请求。本轮不能只回复‘好的’、‘记住了’或其他确认话术；必须先严格调用 reminder.create，并且只有工具返回成功创建结果后才能向用户确认。若无法确定时间或参数，调用工具会返回错误，此时必须如实说明失败，不得声称任务已创建。".to_string(),
-        });
-    }
-    if tool_context.requires_agent_run_create {
-        request.push(BotMemory {
-            role: Roles::System,
-            content: "语义层确认用户明确要求持续监测公开 URL。本轮不能只口头答应，也不能创建普通提醒；必须调用 agent.run.create。把间隔、停止条件、截止时间、最大次数和命中后的私聊正文转换为结构化参数。只有工具成功返回 Run 编号后才能确认已经开始；参数不清楚或工具失败时必须如实说明没有创建。".to_string(),
-        });
-    }
+    // reminder.create / agent.run.create 的强制指令由
+    // `instruction_for_native`（上面那一行）按 `requires_*` 统一追加，
+    // 这里不再重复一份，免得两条链路各说各话。
     if tool_context.requires_group_message_send {
         request.push(BotMemory {
             role: Roles::System,
@@ -718,9 +709,9 @@ fn should_retry_reminder_create(
 
 fn reminder_failure_response(failure: ReminderCreateFailure, detail: Option<&str>) -> BotMemory {
     let content = match failure {
-        ReminderCreateFailure::NotCalled => {
-            "我理解了你的提醒请求，但模型没有成功调用提醒工具，任务未创建。请再试一次，并把时间和提醒内容说得更明确。"
-        }
+        // 与 Core 链路共用同一句话：两条链路对"提醒没建成"的说法必须一致，
+        // 也不能把"模型/工具"这类内部细节讲给用户听。
+        ReminderCreateFailure::NotCalled => crate::reminders::REMINDER_NOT_CREATED,
         ReminderCreateFailure::InvalidArguments => match detail
             .and_then(compact_user_detail)
             .as_deref()
@@ -1201,10 +1192,10 @@ mod tests {
 
     #[test]
     fn reminder_failure_responses_explain_which_stage_failed() {
-        assert!(
-            reminder_failure_response(ReminderCreateFailure::NotCalled, None)
-                .content
-                .contains("没有成功调用提醒工具")
+        // "没调工具"这一格的文案与 Core 链路共用，断言直接对齐那个常量。
+        assert_eq!(
+            reminder_failure_response(ReminderCreateFailure::NotCalled, None).content,
+            crate::reminders::REMINDER_NOT_CREATED
         );
         assert!(
             reminder_failure_response(ReminderCreateFailure::InvalidArguments, None)

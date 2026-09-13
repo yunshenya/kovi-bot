@@ -46,6 +46,15 @@ pub(crate) enum ReminderToolFailureKind {
 
 pub(crate) const SCHEDULED_EXTERNAL_TOOL_FAILURE: &str = "[scheduled_task_external_tool_failure]";
 
+/// 用户明确要求创建提醒、而这一轮并没有真的调用成功 `reminder.create` 时，
+/// 对用户可见的唯一说法。
+///
+/// 这是诚实性兜底，不是错误文案：模型完全可能写一句"已经帮你记下了"而什么都
+/// 没建（线上 2026-09-12 16:04 的"提醒我明天下午三点半开会"就是这么丢的，
+/// `kovi_bot_reminders` 里根本没有对应记录）。宿主必须把那句话换成如实说明——
+/// 宁可说没建成，也不能把没发生的事说成发生了。
+pub(crate) const REMINDER_NOT_CREATED: &str = "这个提醒我没能真的建起来，所以到点不会有通知。你再说一次，把时间点和要提醒的事说清楚一点，我重新记一遍。";
+
 #[derive(Debug)]
 struct ReminderToolError {
     kind: ReminderToolFailureKind,
@@ -701,6 +710,7 @@ fn parse_create_request(
             "mode",
             "after_seconds",
             "local_datetime",
+            "natural_time",
             "timezone",
             "kind",
             "instruction",
@@ -708,7 +718,42 @@ fn parse_create_request(
             "repeat",
         ],
     )?;
-    let mode = required_string(arguments, "mode", 10)?;
+    // 时间来源三选一：natural_time（推荐，模型只转述用户原话）、mode=after、
+    // mode=at。同时给多个说明模型在猜，直接报错让它重新选一种。
+    let natural_time = arguments
+        .get("natural_time")
+        .map(|value| {
+            value
+                .as_str()
+                .ok_or_else(|| anyhow!("参数 natural_time 必须是字符串"))
+        })
+        .transpose()?
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let mode = match arguments.get("mode") {
+        Some(value) => Some(
+            value
+                .as_str()
+                .ok_or_else(|| anyhow!("参数 mode 必须是字符串"))?
+                .trim()
+                .to_string(),
+        ),
+        None => None,
+    };
+    if natural_time.is_some()
+        && (mode.is_some()
+            || arguments.contains_key("after_seconds")
+            || arguments.contains_key("local_datetime"))
+    {
+        return Err(anyhow!(
+            "natural_time 与 mode/after_seconds/local_datetime 只能给一个：直接把用户原话里的时间填进 natural_time 就够了"
+        ));
+    }
+    if natural_time.is_none() && mode.is_none() {
+        return Err(anyhow!(
+            "缺少时间：把用户原话里的时间填进 natural_time（例如“明天下午三点半”），或显式给 mode=after/at"
+        ));
+    }
     let kind = match arguments.get("kind") {
         Some(value) => ReminderKind::parse(
             value
@@ -765,40 +810,48 @@ fn parse_create_request(
         Value::Object(serde_json::Map::new())
     };
     let max_delay = ChronoDuration::days(reminder_config.max_delay_days() as i64);
-    let due_at = match mode.as_str() {
-        "after" => {
-            let seconds = arguments
-                .get("after_seconds")
-                .and_then(Value::as_u64)
-                .ok_or_else(|| anyhow!("mode=after 时必须提供 after_seconds"))?;
-            if !(5..=max_delay.num_seconds() as u64).contains(&seconds) {
-                return Err(anyhow!(
-                    "after_seconds 必须在 5 秒到 {} 天之间",
-                    reminder_config.max_delay_days()
-                ));
+    let due_at = if let Some(phrase) = natural_time {
+        resolve_natural_time(phrase, timezone, timezone_name, repeat, now, max_delay)?
+    } else {
+        match mode.as_deref() {
+            Some("after") => {
+                let seconds = arguments
+                    .get("after_seconds")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| anyhow!("mode=after 时必须提供 after_seconds"))?;
+                if !(5..=max_delay.num_seconds() as u64).contains(&seconds) {
+                    return Err(anyhow!(
+                        "after_seconds 必须在 5 秒到 {} 天之间",
+                        reminder_config.max_delay_days()
+                    ));
+                }
+                now + ChronoDuration::seconds(seconds as i64)
             }
-            now + ChronoDuration::seconds(seconds as i64)
+            Some("at") => {
+                let local_datetime = required_string(arguments, "local_datetime", 32)?;
+                let naive = parse_local_datetime(&local_datetime)?;
+                let local = timezone
+                    .from_local_datetime(&naive)
+                    .single()
+                    .ok_or_else(|| {
+                        anyhow!("这个本地时间在时区 {} 中不存在或有歧义", timezone_name)
+                    })?;
+                let due_at = local.with_timezone(&Utc);
+                if due_at <= now + ChronoDuration::seconds(4) {
+                    return Err(anyhow!("提醒时间已经过去，请提供未来的时间"));
+                }
+                if due_at > now + max_delay {
+                    return Err(anyhow!(
+                        "提醒时间不能超过 {} 天",
+                        reminder_config.max_delay_days()
+                    ));
+                }
+                due_at
+            }
+            Some(other) => return Err(anyhow!("mode 只支持 after 或 at：{other}")),
+            // 上面已经拦过"两个时间来源都没给"，这里只剩并发修改参数的可能。
+            None => return Err(anyhow!("缺少时间：请提供 natural_time 或 mode")),
         }
-        "at" => {
-            let local_datetime = required_string(arguments, "local_datetime", 32)?;
-            let naive = parse_local_datetime(&local_datetime)?;
-            let local = timezone
-                .from_local_datetime(&naive)
-                .single()
-                .ok_or_else(|| anyhow!("这个本地时间在时区 {} 中不存在或有歧义", timezone_name))?;
-            let due_at = local.with_timezone(&Utc);
-            if due_at <= now + ChronoDuration::seconds(4) {
-                return Err(anyhow!("提醒时间已经过去，请提供未来的时间"));
-            }
-            if due_at > now + max_delay {
-                return Err(anyhow!(
-                    "提醒时间不能超过 {} 天",
-                    reminder_config.max_delay_days()
-                ));
-            }
-            due_at
-        }
-        _ => return Err(anyhow!("mode 只支持 after 或 at")),
     };
     Ok(CreateReminderRequest {
         due_at,
@@ -808,6 +861,92 @@ fn parse_create_request(
         repeat,
         payload,
     })
+}
+
+/// 把用户原话里的时间（`natural_time`）解析成绝对时刻。
+///
+/// 日期由宿主算，模型只负责原样转述：模型做日历算术不可靠，而这个时间一旦算错，
+/// 代价是在错的日子把人叫醒。判定顺序（算不出来就报错，绝不猜）：
+///
+/// 1. 能确定"哪一天 + 哪个时刻"（"明天下午三点半"、"三小时后"）→ 直接用；
+/// 2. 只给了钟点/时段（"下午三点半"、"晚上"）→ 落在今天；重复提醒已经过点就按
+///    重复规则顺延到下一次，一次性提醒已经过点则报错，让模型回来问清楚是哪一天；
+/// 3. 只说了日期、没有钟点（"明天"）→ 报错，提醒必须落在某一天的某个时刻上。
+fn resolve_natural_time(
+    phrase: &str,
+    timezone: Tz,
+    timezone_name: &str,
+    repeat: RepeatRule,
+    now: DateTime<Utc>,
+    max_delay: ChronoDuration,
+) -> Result<DateTime<Utc>> {
+    let local_now = now.with_timezone(&timezone);
+    let due_at = if let Some(resolved) = crate::model::chinese_time::resolve(phrase, local_now) {
+        if resolved.precision == crate::model::chinese_time::TimePrecision::Date {
+            return Err(anyhow!(
+                "「{}」只说了日期、没有钟点：先跟用户确认具体时间，再创建提醒",
+                resolved.matched
+            ));
+        }
+        let mut at = resolved.at.with_timezone(&Utc);
+        // "每天下午三点半"这类表达会把首次时间落在今天；今天这个点已经过了就
+        // 顺延到下一次，而不是报错让用户重说一遍。
+        if at <= now && repeat != RepeatRule::None {
+            at = roll_to_next_occurrence(at, timezone_name, repeat, now)?;
+        }
+        at
+    } else if let Some(clock) = crate::model::chinese_time::resolve_time_of_day(phrase) {
+        let naive = local_now
+            .date_naive()
+            .and_hms_opt(clock.hour, clock.minute, 0)
+            .ok_or_else(|| anyhow!("「{}」不是合法时刻", clock.matched))?;
+        let at = timezone
+            .from_local_datetime(&naive)
+            .single()
+            .ok_or_else(|| anyhow!("这个时间在时区 {timezone_name} 中不存在或有歧义"))?
+            .with_timezone(&Utc);
+        if at <= now {
+            if repeat == RepeatRule::None {
+                return Err(anyhow!(
+                    "「{}」今天已经过了：先跟用户确认是哪一天，或让他说个更完整的说法（例如“明天{}”）",
+                    clock.matched,
+                    clock.matched
+                ));
+            }
+            roll_to_next_occurrence(at, timezone_name, repeat, now)?
+        } else {
+            at
+        }
+    } else {
+        return Err(anyhow!(
+            "没法从「{phrase}」确定具体时刻：先跟用户确认日期和时间，或改用 mode=after/at 显式给出"
+        ));
+    };
+    if due_at <= now + ChronoDuration::seconds(4) {
+        return Err(anyhow!("提醒时间已经过去，请提供未来的时间"));
+    }
+    if due_at > now + max_delay {
+        return Err(anyhow!("提醒时间不能超过 {} 天", max_delay.num_days()));
+    }
+    Ok(due_at)
+}
+
+/// 按重复规则把已经过去的一次重复时间顺延到未来。
+fn roll_to_next_occurrence(
+    from: DateTime<Utc>,
+    timezone_name: &str,
+    repeat: RepeatRule,
+    now: DateTime<Utc>,
+) -> Result<DateTime<Utc>> {
+    let mut at = from;
+    // 上限只是防御性护栏：daily/weekly 顺延到未来最多几十步；真撞上说明参数坏了。
+    for _ in 0..512 {
+        at = next_occurrence(at, timezone_name, repeat)?;
+        if at > now {
+            return Ok(at);
+        }
+    }
+    Err(anyhow!("重复提醒的下一次时间算不出来"))
 }
 
 fn parse_local_datetime(value: &str) -> Result<NaiveDateTime> {
@@ -882,6 +1021,90 @@ fn format_created_message(id: i64, request: &CreateReminderRequest) -> String {
             )
         }
     }
+}
+
+/// 用户是否明确要求创建一个定时提醒/定时任务。
+///
+/// 只用于决定是否强制本轮走 `reminder.create`；这里不解析时间，也不创建任务。
+/// 这是一个协议闸门，不是提醒实现：真正的时间解析、权限校验和数据库写入仍然只
+/// 发生在 `reminder.create` 工具内部，避免模型用一段确认话术冒充已经创建成功。
+///
+/// 判定故意保守：既要出现时间线索，也要出现"让芸汐做事"的动作线索；明确取消
+/// 提醒的说法一律为 false（那是 `reminder.cancel` 的事）。漏判不会让能力消失
+/// ——模型仍然可以自己调用工具，只是少了这道强制。
+pub(crate) fn looks_like_reminder_request(text: &str) -> bool {
+    let text = text.trim();
+    if text.is_empty() {
+        return false;
+    }
+    let is_cancellation = [
+        "取消提醒",
+        "取消定时",
+        "不用提醒",
+        "不要提醒",
+        "别提醒",
+        "不用发",
+        "不要发",
+        "别发",
+        "不用了",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker));
+    if is_cancellation {
+        return false;
+    }
+    let has_time = [
+        "秒后",
+        "分后",
+        "分钟后",
+        "小时后",
+        "天后",
+        "周后",
+        "星期后",
+        "礼拜后",
+        "之后",
+        "以后",
+        "今天",
+        "明天",
+        "后天",
+        "每天",
+        "每周",
+        "下周",
+        "今早",
+        "明早",
+        "今晚",
+        "明晚",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker));
+    let has_action = [
+        "提醒",
+        "定时",
+        "发消息",
+        "发一条消息",
+        "发条消息",
+        "发个消息",
+        "发条",
+        "给我发",
+        "发给我",
+        "帮我",
+        "替我",
+        "为我",
+        "记得",
+        "通知",
+        "叫我",
+        "喊我",
+        "告诉我",
+        "搜索",
+        "查询",
+        "查一下",
+        "整理",
+        "总结",
+        "执行",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker));
+    has_time && has_action
 }
 
 fn format_local_time(due_at: DateTime<Utc>, timezone_name: &str) -> Result<String> {
@@ -1490,9 +1713,10 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ReminderKind, ReminderToolFailureKind, RepeatRule, classify_tool_error,
-        failure_notice_for_execution, lease_heartbeat_interval_secs, next_occurrence,
-        next_occurrence_after, parse_create_request, reminder_tool_error,
+        CreateReminderRequest, ReminderKind, ReminderToolFailureKind, RepeatRule,
+        classify_tool_error, failure_notice_for_execution, lease_heartbeat_interval_secs,
+        looks_like_reminder_request, next_occurrence, next_occurrence_after, parse_create_request,
+        reminder_tool_error,
     };
     use crate::config::ReminderConfig;
     use chrono::{Duration, TimeZone, Utc};
@@ -1522,6 +1746,110 @@ mod tests {
         assert_eq!(request.message, "记得 吃饭");
         assert_eq!(request.repeat, RepeatRule::None);
         assert_eq!(request.due_at - now, Duration::seconds(600));
+    }
+
+    /// 固定"现在"：2026-09-13（周日）北京时间 14:30，即 UTC 06:30。
+    fn fixed_now() -> chrono::DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 9, 13, 6, 30, 0)
+            .single()
+            .expect("固定测试时刻")
+    }
+
+    fn request_at(
+        now: chrono::DateTime<Utc>,
+        arguments: Value,
+    ) -> Result<CreateReminderRequest, anyhow::Error> {
+        let arguments = serde_json::from_value(arguments).expect("测试参数应能构造成 JSON 对象");
+        parse_create_request(&arguments, now, &ReminderConfig::default())
+    }
+
+    fn request(arguments: Value) -> Result<CreateReminderRequest, anyhow::Error> {
+        request_at(fixed_now(), arguments)
+    }
+
+    fn at(hour: u32, minute: u32) -> chrono::DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 9, 13, hour, minute, 0)
+            .single()
+            .expect("时刻")
+    }
+
+    #[test]
+    fn natural_time_is_resolved_by_the_host_not_by_the_model() {
+        // "明天下午三点半" → 北京时间 2026-09-14 15:30 = UTC 07:30。
+        let parsed = request(json!({
+            "natural_time": "明天下午三点半",
+            "message": "开会"
+        }))
+        .expect("用户原话时间应能解析");
+        assert_eq!(
+            parsed.due_at,
+            Utc.with_ymd_and_hms(2026, 9, 14, 7, 30, 0)
+                .single()
+                .expect("时刻")
+        );
+        assert_eq!(parsed.timezone, "Asia/Shanghai");
+
+        // 相对量也交给解析器："三小时后"。
+        let parsed = request(json!({"natural_time": "三小时后"})).expect("相对量应能解析");
+        assert_eq!(parsed.due_at, fixed_now() + Duration::hours(3));
+    }
+
+    #[test]
+    fn clock_only_natural_time_lands_on_the_next_future_occurrence() {
+        // 14:30 说"下午三点半" → 今天 15:30。
+        let parsed = request(json!({"natural_time": "下午三点半"})).expect("今天的下一个三点半");
+        assert_eq!(parsed.due_at, at(7, 30));
+
+        // 已经过点时一次性提醒不猜明天，而是报错让模型回去问清楚。
+        let error = request_at(at(8, 0), json!({"natural_time": "下午三点半"}))
+            .expect_err("过点的一次性提醒应报错");
+        assert!(error.to_string().contains("今天已经过了"), "{error}");
+
+        // 每天的话顺延到明天的同一时刻。
+        let parsed = request_at(
+            at(8, 0),
+            json!({"natural_time": "下午三点半", "repeat": "daily"}),
+        )
+        .expect("重复提醒应顺延到下一次");
+        assert_eq!(
+            parsed.due_at,
+            Utc.with_ymd_and_hms(2026, 9, 14, 7, 30, 0)
+                .single()
+                .expect("时刻")
+        );
+        assert_eq!(parsed.repeat, RepeatRule::Daily);
+    }
+
+    #[test]
+    fn natural_time_needs_a_clock_and_only_one_source() {
+        // 只说了日期、没有钟点：先问清楚时间，绝不按 00:00 建一个提醒。
+        assert!(request(json!({"natural_time": "明天"})).is_err());
+        // 完全算不出来时也不猜。
+        assert!(request(json!({"natural_time": "有空的时候"})).is_err());
+        // 时间来源只能给一种。
+        assert!(
+            request(json!({
+                "natural_time": "明天下午三点半",
+                "mode": "after",
+                "after_seconds": 600
+            }))
+            .is_err()
+        );
+        // 一个时间来源都没有。
+        assert!(request(json!({"message": "没有时间"})).is_err());
+    }
+
+    #[test]
+    fn detects_reminder_intent_without_creating_a_task() {
+        assert!(looks_like_reminder_request("三分钟后随便给我发一条消息"));
+        assert!(looks_like_reminder_request("明天早上提醒我吃饭"));
+        assert!(looks_like_reminder_request("提醒我明天下午三点半开会"));
+        assert!(looks_like_reminder_request("十分钟后搜索早上的新闻发给我"));
+        assert!(looks_like_reminder_request("明天早上帮我检查日程"));
+        assert!(!looks_like_reminder_request("我三分钟后下班"));
+        assert!(!looks_like_reminder_request("提醒我吃饭"));
+        assert!(!looks_like_reminder_request("明天早上不用提醒我了"));
+        assert!(!looks_like_reminder_request(""));
     }
 
     #[test]

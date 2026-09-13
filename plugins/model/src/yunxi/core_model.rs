@@ -385,6 +385,48 @@ fn explicit_message_count_for_input(
         .and_then(requested_message_count)
 }
 
+/// 宿主判定"本轮必须真的创建一个东西"的结果。
+///
+/// 这不是意图提示，而是协议闸门：模型没有把对应工具调用发出来时，轮末守卫会把
+/// 它的口头确认换成如实说明（见 `plan` 组装处的 required-tool-creation 守卫）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequiredCreation {
+    Reminder,
+    AgentRun,
+}
+
+impl RequiredCreation {
+    /// native 工具名（带点）；provider 线上名字由
+    /// [`tool_access::wire_tool_name`] 转换。
+    fn tool_name(self) -> &'static str {
+        match self {
+            Self::Reminder => "reminder.create",
+            Self::AgentRun => "agent.run.create",
+        }
+    }
+
+    /// 没建成时对用户可见的唯一说法。
+    fn honest_text(self) -> &'static str {
+        match self {
+            Self::Reminder => crate::reminders::REMINDER_NOT_CREATED,
+            Self::AgentRun => crate::agent_runs::AGENT_RUN_NOT_CREATED,
+        }
+    }
+}
+
+/// 入站原话是否要求本轮必须真的创建一个东西。
+///
+/// 与 [`likely_requires_controlled_tool`] 同一层的保守判定：只回答"这轮必须真的发出
+/// reminder.create / agent.run.create 吗"，不解析时间、不解析 URL、更不创建任何东西。
+/// 持续监测请求本来就要建一个定时任务，因此两者同时成立时只强制 agent.run.create，
+/// 不让模型在同一轮里被要求建两份东西。
+fn required_creation_for_text(text: &str, is_main_admin: bool) -> Option<RequiredCreation> {
+    if is_main_admin && crate::agent_runs::looks_like_agent_run_request(text) {
+        return Some(RequiredCreation::AgentRun);
+    }
+    crate::reminders::looks_like_reminder_request(text).then_some(RequiredCreation::Reminder)
+}
+
 fn tool_calls_allowed_for_turn(
     route_allows_tool_call: bool,
     explicit_message_count: Option<usize>,
@@ -3617,7 +3659,17 @@ impl KoviModelBackend {
         Arc::clone(&self.tool_turns)
     }
 
-    async fn tool_context_for(&self, conversation: QqConversation) -> ToolExecutionContext {
+    /// 组装本轮的受控工具上下文。
+    ///
+    /// `request_text` 是触发本轮的用户原话（非消息事件为 `None`）。宿主在这里判定
+    /// "用户是否明确要求创建提醒/持续监测任务"，并用 `requires_*` 把它同时带给模型
+    /// （见 `instruction_for_native`）和轮末守卫（见 `plan` 里对未兑现创建的拦截）。
+    /// 这里只做保守的协议闸门判定：不解析时间、不解析 URL、更不创建任何东西。
+    async fn tool_context_for(
+        &self,
+        conversation: QqConversation,
+        request_text: Option<&str>,
+    ) -> ToolExecutionContext {
         let (subject_id, actor_user_id, destination, is_admin, is_main_admin, group_paused) =
             match conversation {
                 QqConversation::Private { user_id } => (
@@ -3637,6 +3689,8 @@ impl KoviModelBackend {
                     crate::model::utils::is_group_paused(group_id).await,
                 ),
             };
+        let required_creation =
+            required_creation_for_text(request_text.unwrap_or_default(), is_main_admin);
         ToolExecutionContext {
             subject_id,
             actor_user_id,
@@ -3658,8 +3712,8 @@ impl KoviModelBackend {
             group_paused,
             runtime_bot: Some(Arc::clone(&self.bot)),
             sticker_teaching: None,
-            requires_reminder_create: false,
-            requires_agent_run_create: false,
+            requires_reminder_create: required_creation == Some(RequiredCreation::Reminder),
+            requires_agent_run_create: required_creation == Some(RequiredCreation::AgentRun),
             requires_group_message_send: false,
             requires_group_followup: false,
             requires_external_tool: false,
@@ -5282,6 +5336,15 @@ impl ModelBackend for KoviModelBackend {
                     return Ok(silent_with_interaction_state(input));
                 }
             }
+            // 本轮的工具上下文与"必须真的创建"的需求由宿主在这里定死，和走哪个
+            // 模型档位无关：Intrinsic 档没有工具通道，需求依然成立，轮末守卫会
+            // 据此拒绝把口头确认发出去，而不是让用户以为任务已经建好了。
+            let tool_context = self
+                .tool_context_for(
+                    conversation,
+                    message.map(|message| message.content.as_text()),
+                )
+                .await;
             let route_decision = select_host_model_route(
                 input,
                 &self.intrinsic,
@@ -5323,7 +5386,6 @@ impl ModelBackend for KoviModelBackend {
                     },
                 );
                 if let Some(registry) = tool_registry() {
-                    let tool_context = self.tool_context_for(conversation).await;
                     let read_only_only = tool_follow_up;
                     native_tool_specs =
                         Some(registry.native_tool_specs(&tool_context, read_only_only));
@@ -6061,6 +6123,41 @@ impl ModelBackend for KoviModelBackend {
                     conversation_id_for_log(input),
                 );
             }
+            // 用户明确要求创建提醒/持续监测任务时，只有真的发出了对应工具调用
+            // 才算办成。走到这里说明模型没有把它变成工具意图，而是在正文里写了
+            // 一句"已经帮你记下了"之类的话——这句话必须被换掉：宁可说没建成，
+            // 也不能把没发生的事说成发生了（线上 2026-09-12 16:04 的提醒就是这么
+            // 丢的，`kovi_bot_reminders` 里没有对应记录）。
+            let required_creation = match (
+                tool_context.requires_reminder_create,
+                tool_context.requires_agent_run_create,
+            ) {
+                (true, _) => Some(RequiredCreation::Reminder),
+                (_, true) => Some(RequiredCreation::AgentRun),
+                _ => None,
+            };
+            let unresolved_required_creation = required_creation.filter(|required| {
+                !native_tool_calls
+                    .iter()
+                    .any(|call| call.name == tool_access::wire_tool_name(required.tool_name()))
+            });
+            // 未被点名的群聊里不做这件事：那本来就不该有可见回复，宁可不说话，
+            // 也不要凭空插一句"没建成"。
+            if let Some(required) = unresolved_required_creation
+                && !ambient_group_turn
+            {
+                mind_output_eligible = false;
+                mind_candidates = MindCandidates::default();
+                plan = ReplyPlan::from_model_output(conversation.scope(), required.honest_text())
+                    .await;
+                kovi::log::warn!(
+                    "Yunxi Core required tool creation unmet: event_id={} message_id={} conversation_id={} tool={} action=honest_failure",
+                    input.event.id(),
+                    message_id_for_log(input),
+                    conversation_id_for_log(input),
+                    required.tool_name(),
+                );
+            }
             if !core_plan_has_visible_text(&plan)
                 && reply_recovery_required(input, tool_follow_up)
                 && is_current(ticket).await
@@ -6515,7 +6612,7 @@ mod tests {
         INTRINSIC_AUTONOMOUS_INTENT_TAIL_INSTRUCTION, INTRINSIC_GENERATION_SUFFIX,
         INTRINSIC_SEMANTIC_CONTENT_INSTRUCTION, MAX_CORE_BUBBLES, MAX_DELIVERABLE_BUBBLES_PER_TURN,
         MAX_INTRINSIC_REPLY_PROTOCOL_BYTES, MIND_DECISION_INSTRUCTION, MindCandidates,
-        PersistentRouteLookup, QqConversation, RouteContext, VisibleReplyTarget,
+        PersistentRouteLookup, QqConversation, RequiredCreation, RouteContext, VisibleReplyTarget,
         affect_tone_guidance, ambient_group_interjection_veto, autonomous_conversation_prompt,
         autonomous_conversation_protocol, autonomous_empty_generation_plan,
         autonomous_generation_failure_plan, baseline_disposition, batch_fence_action_key,
@@ -7274,6 +7371,42 @@ mod tests {
         );
         assert!(!prompt.is_empty());
         assert!(prompt.len() <= 4);
+    }
+
+    #[test]
+    fn required_creation_only_fires_for_explicit_requests() {
+        assert_eq!(
+            super::required_creation_for_text("提醒我明天下午三点半开会", false),
+            Some(RequiredCreation::Reminder)
+        );
+        // 含糊或讨论性的说法不强制工具，模型仍可自行调用。
+        assert_eq!(
+            super::required_creation_for_text("提醒功能怎么用", false),
+            None
+        );
+        assert_eq!(
+            super::required_creation_for_text("明天早上不用提醒我了", false),
+            None
+        );
+        assert_eq!(super::required_creation_for_text("", false), None);
+
+        // 持续监测要求主管理员（agent.run.create 是主管理员工具）。非主管理员
+        // 提出同样的请求时，闸门落在普通提醒上：宿主宁可让他听到"没建成"，也不
+        // 让一句"已经在盯着了"冒充一个根本不会存在的后台任务。
+        let watch = "每隔30秒请求一下 https://example.com/health，直到返回 ready 之后告诉我";
+        assert_eq!(
+            super::required_creation_for_text(watch, true),
+            Some(RequiredCreation::AgentRun)
+        );
+        assert_eq!(
+            super::required_creation_for_text(watch, false),
+            Some(RequiredCreation::Reminder)
+        );
+
+        // 失败文案与工具名成对，守卫据此判断"模型到底调没调"。
+        assert_eq!(RequiredCreation::Reminder.tool_name(), "reminder.create");
+        assert_eq!(RequiredCreation::AgentRun.tool_name(), "agent.run.create");
+        assert!(!RequiredCreation::Reminder.honest_text().is_empty());
     }
 
     #[test]

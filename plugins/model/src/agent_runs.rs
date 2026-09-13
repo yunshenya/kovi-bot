@@ -1312,6 +1312,78 @@ pub(crate) async fn delete_user_data(user_id: i64) -> Result<u64> {
     .rows_affected())
 }
 
+/// 用户明确要求持续监测、而这一轮并没有真的创建成功 Run 时，对用户可见的说法。
+///
+/// 与 [`crate::reminders::REMINDER_NOT_CREATED`] 同一个道理：宁可说没建起来，
+/// 也不能让模型用一句"已经在盯着了"冒充一个并不存在的后台任务。
+pub(crate) const AGENT_RUN_NOT_CREATED: &str = "我没有成功创建这个持续任务，所以现在并没有在后台监测。请重新说一次，并明确 URL、检查间隔和停止条件。";
+
+/// 用户是否明确要求"每隔一段时间请求/监控一个公开 URL，满足条件后通知我"。
+///
+/// 只用于决定是否强制本轮走 `agent.run.create`；这里不解析 URL，也不创建 Run。
+/// 判定要求同时出现周期性、URL 目标和完成条件三类线索，并排除查看/取消任务的
+/// 说法——模糊表达漏判不影响模型自己调用工具，只是少了这道强制。
+pub(crate) fn looks_like_agent_run_request(text: &str) -> bool {
+    let text = text.trim();
+    if text.is_empty() {
+        return false;
+    }
+    let lower = text.to_ascii_lowercase();
+    if [
+        "取消监控",
+        "取消监测",
+        "停止监控",
+        "停止监测",
+        "不用盯",
+        "查看状态",
+        "任务状态",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker))
+    {
+        return false;
+    }
+    let recurring = [
+        "每隔",
+        "每过",
+        "每秒",
+        "每分钟",
+        "每小时",
+        "定期",
+        "持续",
+        "反复",
+        "轮询",
+        "监控",
+        "监测",
+        "盯着",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker))
+        || lower.contains("poll ")
+        || lower.contains("every ");
+    let web_target = text.contains("接口")
+        || text.contains("链接")
+        || text.contains("网站")
+        || text.contains("网页")
+        || lower.contains("url")
+        || lower.contains("http://")
+        || lower.contains("https://");
+    let completion = [
+        "直到",
+        "等到",
+        "返回",
+        "出现",
+        "变成",
+        "满足",
+        "之后告诉",
+        "就告诉",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker))
+        || lower.contains("until ");
+    recurring && web_target && completion
+}
+
 fn parse_create_request(
     arguments: &Map<String, Value>,
     now: DateTime<Utc>,
@@ -1832,8 +1904,8 @@ fn new_lease_token(run_id: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        HttpObservation, UrlConditionKind, UrlWatchSpec, condition_matches, parse_create_request,
-        valid_json_pointer,
+        HttpObservation, UrlConditionKind, UrlWatchSpec, condition_matches,
+        looks_like_agent_run_request, parse_create_request, valid_json_pointer,
     };
     use crate::config::AgentRunConfig;
     use chrono::{TimeZone, Utc};
@@ -1852,6 +1924,26 @@ mod tests {
             stop_after_minutes: 60,
             max_executions: 100,
         }
+    }
+
+    #[test]
+    fn detects_agent_run_intent_without_creating_a_run() {
+        assert!(looks_like_agent_run_request(
+            "每隔30秒请求一下 https://example.com/health，直到返回 ready 之后告诉我"
+        ));
+        assert!(looks_like_agent_run_request(
+            "持续监控这个接口，等到状态变成200就告诉我"
+        ));
+        assert!(looks_like_agent_run_request(
+            "30秒后开始每隔一分钟请求这个接口，直到返回ready告诉我"
+        ));
+        assert!(looks_like_agent_run_request(
+            "每分钟检查这个接口，HTTP 状态变成 200 就通知我"
+        ));
+        assert!(!looks_like_agent_run_request("查看接口监控任务状态"));
+        assert!(!looks_like_agent_run_request("停止监控这个链接"));
+        assert!(!looks_like_agent_run_request("帮我请求一下这个链接"));
+        assert!(!looks_like_agent_run_request(""));
     }
 
     #[test]
