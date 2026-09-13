@@ -2261,8 +2261,48 @@
     w: ['response', 'wait'],
     0: ['response', 'null'],
   };
+  /** 说话人编号用的字母表（下标 = collector 落的编号：0=a，1=b…）。 */
+  const SPEAKER_LETTERS = 'ABCDEFGH';
+  /** 其他说话人的配色档数，与 CSS 的 --speaker-0..3 一一对应（多了就轮转）。 */
+  const SPEAKER_TONES = 4;
+  /** 老批次没有说话人编号时的退路：只能按角色显示，看不出是几个其他人。 */
   const ROLE_LABELS = { assistant: '芸汐', user: '同一人', other_member: '他人' };
   const SNIPPET_CHARS = 56;
+
+  /**
+   * 上下文里一个回合的显示名与配色。
+   *
+   * collector 从 2026-09-13 起给 recent_turns 落样本内匿名的 `speaker`
+   * （a = 当前发言者，b/c/… 按首次出现顺序给其他成员）。没有这个字段时，几个
+   * 其他人都显示成"他人"——标注时看不出是"一个人连说三条"还是"三个人在互相
+   * 接话"，而这正是判断 completion/response 的关键线索。
+   *
+   * 返回 `{ label, tone }`，`tone` 直接当 `annotate-role` 的类后缀用。
+   */
+  function annotationSpeaker(turn) {
+    if (turn && turn.role === 'assistant') {
+      return { label: ROLE_LABELS.assistant, tone: 'assistant' };
+    }
+    const id = turn && typeof turn.speaker === 'string' ? turn.speaker.toLowerCase() : '';
+    const index = id.length === 1 ? id.charCodeAt(0) - 'a'.charCodeAt(0) : -1;
+    if (index >= 0 && index < SPEAKER_LETTERS.length) {
+      return {
+        label: `说话人${SPEAKER_LETTERS[index]}`,
+        // 当前发言者（A）沿用原来的绿色，其他人按 --speaker-0..3 轮转。
+        tone: index === 0 ? 'user' : `speaker-${(index - 1) % SPEAKER_TONES}`,
+      };
+    }
+    return { label: ROLE_LABELS[turn && turn.role] || (turn && turn.role) || '?', tone: 'other' };
+  }
+
+  /** 这条样本有没有说话人编号——没有就只能是"他人"，得让标注的人知道。 */
+  function annotationHasSpeakers(sample) {
+    return ((sample && sample.context && sample.context.recent_turns) || [])
+      .some((turn) => turn && turn.speaker);
+  }
+
+  /** 老批次里"他人"的悬停说明：不是没显示，是当时根本没记。 */
+  const SPEAKER_UNRECORDED = '这批采于说话人编号之前，只能标出"其他人"，看不出是几个';
 
   function annotationSnippet(text) {
     const flat = String(text == null ? '' : text).split(/\s+/).filter(Boolean).join(' ');
@@ -2611,13 +2651,24 @@
 
     const body = h('div', { class: 'annotate-body' });
     for (const fragment of context.pending_user_fragments || []) {
+      // 片段与正文同属一次发言（collector 按"同群同发送者间隔 ≤3s"切分），
+      // 所以它们的说话人必然是当前发言者——编号固定是 A，不必各带一个字段。
       body.append(h('div', { class: 'annotate-turn' },
-        h('span', { class: 'annotate-role user', text: '前一句' }),
-        h('span', { class: 'annotate-text', text: String(fragment) })));
+        h('span', { class: 'annotate-role user', text: '说话人A' }),
+        h('span', { class: 'annotate-text' },
+          h('span', { class: 'annotate-tag', text: '前一句' }),
+          String(fragment))));
     }
     for (const turn of context.recent_turns || []) {
+      const speaker = annotationSpeaker(turn);
       body.append(h('div', { class: 'annotate-turn' },
-        h('span', { class: `annotate-role ${turn.role === 'assistant' ? 'assistant' : 'other'}`, text: ROLE_LABELS[turn.role] || turn.role || '?' }),
+        h('span', {
+          class: `annotate-role ${speaker.tone}`,
+          text: speaker.label,
+          title: turn.speaker
+            ? '样本内的匿名编号：同一个人每次都是同一个字母'
+            : SPEAKER_UNRECORDED,
+        }),
         h('span', { class: 'annotate-text', text: String(turn.text == null ? '' : turn.text) })));
     }
     if (context.bot_last_asked_question) {
@@ -2637,12 +2688,21 @@
         ? h('div', { class: 'annotate-warn' },
           '这批采于"@ 判定"修复之前：@ 别人也曾被记成在叫她。这条默认不进队列，标它等于把旧判定确认一遍。')
         : null,
-      h('div', { class: 'annotate-current', text: String(sample.current_text == null ? '' : sample.current_text) }),
+      h('div', { class: 'annotate-current' },
+        h('span', { class: 'annotate-role user', text: '说话人A' }),
+        h('span', {
+          class: 'annotate-current-text',
+          text: String(sample.current_text == null ? '' : sample.current_text),
+        })),
       body.childNodes.length ? h('div', { class: 'annotate-context' }, body) : null,
       h('div', { class: 'annotate-meta' },
         h('span', { text: `弱标签：completion=${labels.completion == null ? '未给' : labels.completion}` }),
         h('span', { text: `response=${labels.response == null ? '未给' : labels.response}` }),
-        h('span', { text: `来源 ${provenance.source || '未知'}` })),
+        h('span', { text: `来源 ${provenance.source || '未知'}` }),
+        // 老批次的"他人"分不出是几个人：明说，免得以为界面漏了编号。
+        annotationHasSpeakers(sample) || !(context.recent_turns || []).length
+          ? null
+          : h('span', { class: 'annotate-note', text: '说话人未记录（这批采于编号之前）' })),
       h('div', { class: 'annotate-labels' },
         h('span', { class: 'annotate-label-head', text: 'completion' }),
         ...COMPLETION_CHOICES.map(([value, label]) => annotationChoice('completion', value, label)),

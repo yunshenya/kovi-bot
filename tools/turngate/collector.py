@@ -9,6 +9,9 @@
   pending_user_fragments,最后一条作为 current_text;
 - 机器人的 `[send]` 行构成 assistant 角色 turn,用于 recent_turns 与
   conversation_active;
+- recent_turns 每条带一个**样本内匿名**的说话人编号(`speaker`: a=当前发言者,
+  b/c/… 按出现顺序给其他成员)。`role` 只能分出"他人",分不清是几个人——编号
+  补上"这几条是不是同一个人"这一维,且只落序号,不落 QQ 号/昵称;
 - **目标判定**:日志里的 `[at]`/`[reply]` 只说明"这条消息有指向",不说明指向谁
   (kovi 的 `Message::to_human_string` 对任何人的 @ 都渲染成 `[at]`,并明确写着
   不要靠它做判断)。运行时判定"指的是别人"时会打印「群聊消息指向其他成员,
@@ -119,6 +122,40 @@ def sanitize(text: str) -> str:
     text = URL_RE.sub("<url>", text)
     text = DIGITS_RE.sub("<id>", text)
     return text
+
+
+def label_speakers(
+    turns: list[dict],
+    senders: list[Optional[str]],
+    current_sender: str,
+) -> None:
+    """就地在 `turns` 上写 `speaker`：样本内的匿名说话人编号。
+
+    `role` 只分得清"芸汐 / 当前发言者 / 其他人"，于是一段上下文里的几个其他人
+    全被标成"他人"——标注时看不出这是"一个人在连说三条"还是"三个人在互相接话"，
+    而这恰恰是 completion/response 的关键线索（doc §7.4 B）。编号补上这一维。
+
+    编号是**样本内**的，只回答"这几条是不是同一个人"，回答不了"这是谁"：
+
+    - `a` 恒为当前发言者（样本正文 `current_text` 与 `pending_user_fragments`
+      都属于他，所以它们不需要各自带编号）；
+    - `b`/`c`/… 按 `turns` 的时间顺序给其他成员；
+    - 芸汐（`assistant`）不编号。
+
+    只落序号，不落 QQ 号、昵称或任何跨样本稳定的标识——脱敏承诺不变。
+    """
+    letters: dict[str, str] = {}
+    for turn, sender in zip(turns, senders):
+        if sender is None or turn.get("role") == "assistant":
+            # 芸汐不编号：她不是"某个人"，标成说话人X只会让人以为群里多了一个成员。
+            continue
+        if sender == current_sender:
+            turn["speaker"] = "a"
+            continue
+        if sender not in letters:
+            # MAX_RECENT_TURNS 条上限决定了这里最多几个字母，chr 够用也够清楚。
+            letters[sender] = chr(ord("b") + len(letters))
+        turn["speaker"] = letters[sender]
 
 
 def mirror_lexical_completion(text: str):
@@ -295,6 +332,9 @@ def main() -> int:
             clean = sanitize(cur)
             # recent turns: 之前的 ≤4 个 user/bot unit
             recent = []
+            # 与 recent 一一对应的发送者（bot 为 None）。只用来编说话人号，
+            # 编完即弃——样本里只留序号，不留身份。
+            recent_senders: list[Optional[str]] = []
             recent_ts = ts
             for prev in reversed(units[:idx]):
                 p_kind, p_sender, p_frags, p_ts = prev
@@ -305,9 +345,12 @@ def main() -> int:
                     "user" if p_sender == sender else "other_member"
                 )
                 recent.append({"role": role, "text": p_text})
+                recent_senders.append(None if p_kind == "bot" else p_sender)
                 if len(recent) >= MAX_RECENT_TURNS:
                     break
             recent.reverse()
+            recent_senders.reverse()
+            label_speakers(recent, recent_senders, sender)
             # conversation_active: 600s 内有 bot 发言或最近 turn
             recent_bot = any(r["role"] == "assistant" for r in recent)
             bot_recent = any(

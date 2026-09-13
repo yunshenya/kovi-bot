@@ -57,7 +57,8 @@ journalctl -u kovi-bot.service -o short-iso --since "2026-09-07 00:00:00" \
 python3 tools/turngate/collector.py --journal /tmp/tg-journal.txt \
     --out datasets/review-batch-$(date +%Y%m%d).jsonl
 # 输出: pending 候选(schema v2), 弱标签 source=pseudo_lexical_v0,
-#       脱敏(URL/长数字), 不透明 source_key(删除屏障用)
+#       脱敏(URL/长数字), 不透明 source_key(删除屏障用),
+#       recent_turns 带样本内匿名的 speaker 编号(a=当前发言者, b/c/… 给其他成员)
 
 # 2) 人工复核(≥500 条/周 达成后产出第一版 v0.1 训练集)
 #    先排"标注价值"的队：只用不依赖策略的客观信号（弱标签有没有判断、上下文
@@ -135,6 +136,24 @@ QQ 号/昵称/URL;删除请求按 source_key 从未训练样本移除;模型更�
 注意 `addressed_to_agent` / `replies_to_agent` / `policy_override` **是**结构化
 特征（`features.py`），所以上面这条反推的准确度直接进权重——它靠的是"标记只否定
 不肯定"这个代码事实，改动任一侧的标记判定都要同步回来看这里。
+
+### 说话人编号（`context.recent_turns[].speaker`）
+
+`role` 只有三档（`assistant` / `user` / `other_member`），于是一段上下文里的几个
+其他成员全被标成"他人"——复核时看不出这是"一个人在连说三条"还是"三个人在互相
+接话"，而这恰恰是判断 completion/response 的关键线索。所以采集器给 `recent_turns`
+的每条再落一个 `speaker`：
+
+- `a` 恒为**当前发言者**（`current_text` 与 `pending_user_fragments` 都属于他，
+  所以这两处不需要各自带字段）；
+- `b`/`c`/… 按出现顺序给其他成员，同一段上下文里同一个人拿同一个字母；
+- 芸汐（`assistant`）不带 `speaker`——她不是"某个人"；
+- 编号是**样本内匿名**的：只落序号，不落 QQ 号、昵称或任何跨样本稳定的标识，
+  它只回答"这几条是不是同一个人"。脱敏承诺不变。
+
+网页端与 `review.py` 都把它显示成"说话人A/B/C…"（每人一色）；采于该字段之前的
+批次没有说话人编号，两个入口都退回按角色显示"他人"，网页端会明说"说话人未记录"。
+`speaker` 与 `targeting` 一样**不进特征向量**，只是复核时的读图辅助。
 
 ### 正文续行（导出格式的坑）
 
