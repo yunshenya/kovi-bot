@@ -42,6 +42,7 @@ mod qq_sing;
 mod qq_voice;
 mod reminders;
 mod server;
+mod silence;
 mod tools;
 mod topic;
 mod traffic;
@@ -64,6 +65,7 @@ pub use qq_call::QqCallConfig;
 pub use qq_sing::QqSingConfig;
 pub use qq_voice::QqVoiceConfig;
 pub use reminders::ReminderConfig;
+pub use silence::SilenceConfig;
 pub use tools::{McpServerConfig, ToolsConfig};
 pub use vision::VisionConfig;
 pub use world_model::WorldModelConfig;
@@ -95,6 +97,8 @@ pub struct ModelConfig {
     proactive: ProactiveConfig,
     /// 群聊未点名接话配置
     group_interjection: GroupInterjectionConfig,
+    /// 相处信号与静默门控配置（默认只影子观察，不改变可见行为）
+    silence: SilenceConfig,
     /// 长期记忆与短期上下文配置
     memory: MemoryConfig,
     /// Persistent Mind v2 state and gradual behavior activation.
@@ -170,6 +174,7 @@ impl ModelConfig {
 
         self.proactive.validate()?;
         self.group_interjection.validate()?;
+        self.silence.validate()?;
         self.memory.validate()?;
         self.mind.validate()?;
         self.message_batch.validate()?;
@@ -234,6 +239,10 @@ impl ModelConfig {
 
     pub fn group_interjection(&self) -> &GroupInterjectionConfig {
         &self.group_interjection
+    }
+
+    pub fn silence(&self) -> &SilenceConfig {
+        &self.silence
     }
 
     pub fn memory(&self) -> &MemoryConfig {

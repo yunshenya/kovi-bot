@@ -56,6 +56,7 @@ mod private_image_memory;
 // QQ 实时语音通话（默认关闭，启用后轮询 NapCat AV 桥）
 pub(crate) mod qq_call;
 mod redis_store;
+mod silence_signal;
 // 本机语音服务客户端（通话与发语音消息共用）
 pub(crate) mod reminders;
 mod speech;
@@ -522,6 +523,9 @@ async fn main() {
                         &ingress_event,
                         *admission,
                         group_decision.planner_attention_requested,
+                        // 静默门控要给管理员留通道，而 Core 侧只有 PersonId、
+                        // 无法自己判管理员；在这里把结论带进去。
+                        crate::model::utils::is_bot_admin(&bot, event.user_id),
                     )
                 },
             )

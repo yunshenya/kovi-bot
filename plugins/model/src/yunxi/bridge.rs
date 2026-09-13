@@ -1302,12 +1302,14 @@ impl CoreBridge {
         event: &GroupMsgEvent,
         incoming_admission: IncomingAdmission,
         planner_attention_requested: bool,
+        sender_is_admin: bool,
     ) -> EnqueueOutcome {
         let Some(mut message) = InboundMessage::from_group(event, planner_attention_requested)
         else {
             return EnqueueOutcome::SkippedInvalid;
         };
         message.incoming_admission = Some(incoming_admission);
+        message.sender_is_admin = sender_is_admin;
         self.send_reliably(message).await
     }
 
@@ -2109,6 +2111,10 @@ struct InboundMessage {
     /// asynchronous Core queues. It is consumed exactly once by the model
     /// backend and never crosses into the platform-neutral Core event schema.
     incoming_admission: Option<IncomingAdmission>,
+    /// 说话人是不是机器人管理员。Core 的事件里只有平台无关的 `PersonId`，
+    /// 没有 QQ 号，因此这个判定只能在 Host 侧做完再带进来；静默门控要用它
+    /// 给管理员留通道。
+    sender_is_admin: bool,
 }
 
 impl InboundMessage {
@@ -2145,6 +2151,7 @@ impl InboundMessage {
             stop_requested: false,
             planner_attention_requested,
             incoming_admission: None,
+            sender_is_admin: false,
             text,
             attachments,
             vision_attachments,
@@ -2181,6 +2188,7 @@ impl InboundMessage {
             stop_requested: false,
             planner_attention_requested: true,
             incoming_admission: None,
+            sender_is_admin: false,
             text,
             attachments,
             vision_attachments,
@@ -3892,6 +3900,7 @@ async fn resolve_and_submit_inner(
                     message_id,
                     incoming_admission,
                     message.vision_attachments.clone(),
+                    message.sender_is_admin,
                 )
                 .await;
             true
@@ -4736,6 +4745,7 @@ mod tests {
             stop_requested: false,
             planner_attention_requested: addressed_to_agent,
             incoming_admission: None,
+            sender_is_admin: false,
         }
     }
 

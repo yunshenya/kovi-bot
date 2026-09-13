@@ -111,8 +111,8 @@ pub use planner::{
     MAX_PLANNER_TOPIC_BYTES, MAX_PLANNER_TOPIC_CHARS, ModelBackend, ModelBackendError,
     ModelBackendFuture, Planner, PlannerError, PlannerInput, PlannerInputValidationError,
     PlannerOutput, PlannerOutputValidationError, PlannerStateSnapshot, RelationState,
-    StateUpdateProposal, apply_interaction_cues, drift_affect_state, drift_relation_state,
-    evolve_interaction_state, evolve_interaction_state_with_cues,
+    StateUpdateProposal, adjust_relation_tension, apply_interaction_cues, drift_affect_state,
+    drift_relation_state, evolve_interaction_state, evolve_interaction_state_with_cues,
 };
 pub use ports::{
     AffectStore, AffectStoreError, AffectStoreFuture, Clock, ConversationMemberStore,

@@ -5,7 +5,7 @@ use sqlx_postgres::PgPool;
 use std::time::Duration;
 use yunxi_core::{
     PersonId, RelationState, RelationStore, RelationStoreError, RelationStoreFuture,
-    drift_relation_state,
+    adjust_relation_tension, drift_relation_state,
 };
 
 const MINIMUM_DRIFT_ELAPSED: Duration = Duration::from_secs(60);
@@ -65,6 +65,28 @@ impl PostgresRelationStore {
         .await
         .map_err(RelationStoreError::storage)?;
         Ok(result.rows_affected() == 1)
+    }
+
+    /// 把一条明确的相处证据记到关系张力上（正=更紧张，负=回暖）。
+    ///
+    /// 为什么要这个方法而不是让调用方 `get` + `set`：张力是**累积**量，而
+    /// `set` 会整行覆盖。调用方只该表达"我看到了多强的一条证据"，加多少、
+    /// 上限在哪、怎么衰减由 Core 的 [`adjust_relation_tension`] 决定，两处
+    /// 判据（字面命中与模型分类）因此落在同一个刻度上。
+    ///
+    /// 读与写不是原子的：并发下可能丢一次加法。这里刻意不做事务——证据是
+    /// 连续事件流，丢一次加法只让张力升得慢一点，而门控本身有阈值与半衰期
+    /// 兜着；为此上锁的代价大于收益。
+    pub(crate) async fn nudge_tension(
+        &self,
+        person_id: PersonId,
+        signed_strength: f32,
+    ) -> Result<Option<RelationState>, RelationStoreError> {
+        let Some(current) = self.get(person_id).await? else {
+            return Ok(None);
+        };
+        let adjusted = adjust_relation_tension(current, signed_strength);
+        self.set(adjusted).await.map(Some)
     }
 }
 

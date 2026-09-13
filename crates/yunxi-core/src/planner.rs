@@ -275,7 +275,51 @@ pub fn apply_interaction_cues(
         );
     }
 
+    // Negative sentiment must leave a trace in the *relationship*, not only in
+    // the mood. Before this, valence fed `affect` alone: someone could be
+    // hostile for a whole evening and `relation.tension` would not move, so
+    // continuity of behaviour ("she keeps taking it") was impossible and the
+    // only durable trace was a transient mood that decays in hours.
+    //
+    // Sustained hostility therefore accumulates here, and `drift_relation_state`
+    // unwinds it with tension's own 3-day half-life — that is the cooldown. A
+    // single bad message moves tension by well under 0.1, which is deliberate:
+    // one insult is an argument, not a verdict.
+    let negative_strength = negative_valence_strength(&cues);
+    if negative_strength > 0.0 {
+        relation.tension = blend_bounded(relation.tension, 1.0, 0.2 * negative_strength, -1.0, 1.0);
+    }
+    // Warmth explicitly cools an existing rift: it is the mirror of the rule
+    // above and the only way a relationship comes back before the half-life
+    // does its work.
+    relation.tension = blend_bounded(
+        relation.tension,
+        0.0,
+        0.08 * cues.gratitude_strength + 0.12 * positive_valence_strength(&cues),
+        -1.0,
+        1.0,
+    );
+
     Ok(InteractionStateEvolution { affect, relation })
+}
+
+/// How strongly these cues read as "this person is being hostile right now",
+/// in `[0, 1]`. Confidence gates it: an unsure classifier must not move a
+/// durable relationship dimension.
+fn negative_valence_strength(cues: &InteractionCues) -> f32 {
+    if cues.sentiment_valence >= 0.0 {
+        return 0.0;
+    }
+    (cues.sentiment_valence.abs() * cues.sentiment_confidence.clamp(0.0, 1.0)).clamp(0.0, 1.0)
+}
+
+/// How strongly these cues read as "this person is being warm right now",
+/// in `[0, 1]`.
+fn positive_valence_strength(cues: &InteractionCues) -> f32 {
+    if cues.sentiment_valence <= 0.0 {
+        return 0.0;
+    }
+    (cues.sentiment_valence * cues.sentiment_confidence.clamp(0.0, 1.0)).clamp(0.0, 1.0)
 }
 
 fn evolve_interaction_state_inner(
@@ -361,6 +405,21 @@ fn evolve_interaction_state_inner(
         relation.tension,
         0.0,
         0.08 * cues.gratitude_strength,
+        -1.0,
+        1.0,
+    );
+    // Same rule as `apply_interaction_cues`: the structural pass also carries
+    // semantic cues, and a hostile message must not raise tension on one path
+    // and leave it untouched on the other. Rates and the 3-day tension
+    // half-life live here and in `drift_relation_state`; keep them in sync.
+    let negative_strength = negative_valence_strength(&cues);
+    if negative_strength > 0.0 {
+        relation.tension = blend_bounded(relation.tension, 1.0, 0.2 * negative_strength, -1.0, 1.0);
+    }
+    relation.tension = blend_bounded(
+        relation.tension,
+        0.0,
+        0.12 * positive_valence_strength(&cues),
         -1.0,
         1.0,
     );
@@ -456,6 +515,28 @@ pub fn drift_relation_state(mut state: RelationState, elapsed: Duration) -> Rela
     state.trust = decay_toward(state.trust, 0.0, elapsed, 730.0 * DAY_SECONDS, -1.0, 1.0);
     state.comfort = decay_toward(state.comfort, 0.0, elapsed, 30.0 * DAY_SECONDS, -1.0, 1.0);
     state.tension = decay_toward(state.tension, 0.0, elapsed, 3.0 * DAY_SECONDS, -1.0, 1.0);
+    state
+}
+
+/// Adjust only the tension dimension of a relation by an explicit signed
+/// strength, reusing the exact rates the semantic cue path uses.
+///
+/// This exists for hosts that hold a direct piece of evidence ("this message
+/// was addressed at her and it is hostile") instead of a sentiment estimate.
+/// Keeping the arithmetic here means a literal hit and a model-classified hit
+/// move the relationship the same way, and the 3-day half-life in
+/// [`drift_relation_state`] unwinds both without a second mechanism.
+#[must_use]
+pub fn adjust_relation_tension(mut state: RelationState, signed_strength: f32) -> RelationState {
+    if state.validate().is_err() {
+        return RelationState::new(state.person_id);
+    }
+    let strength = signed_strength.clamp(-1.0, 1.0);
+    if strength > 0.0 {
+        state.tension = blend_bounded(state.tension, 1.0, 0.2 * strength, -1.0, 1.0);
+    } else if strength < 0.0 {
+        state.tension = blend_bounded(state.tension, 0.0, 0.12 * -strength, -1.0, 1.0);
+    }
     state
 }
 
@@ -1209,7 +1290,7 @@ mod tests {
     }
 
     #[test]
-    fn sentiment_changes_affect_while_gratitude_is_required_for_relation_warmth() {
+    fn sentiment_moves_affect_and_hostility_accumulates_as_relation_tension() {
         let person_id = PersonId::new();
         let message = interaction_message(person_id, ConversationKind::Direct, "hello");
         let relation = RelationState {
@@ -1254,6 +1335,10 @@ mod tests {
 
         assert!(sad.affect.valence < baseline.affect.valence);
         assert_eq!(sad.relation.affinity, baseline.relation.affinity);
+        // Hostility is a relationship event, not only a mood: negative valence
+        // must raise tension, otherwise "she keeps taking it" has no durable
+        // trace and no downstream gate can ever see it. Warmth cools it back.
+        assert!(sad.relation.tension > baseline.relation.tension);
         assert!(grateful.affect.valence > baseline.affect.valence);
         assert!(grateful.relation.affinity > baseline.relation.affinity);
         assert!(grateful.relation.trust > baseline.relation.trust);
@@ -1264,6 +1349,74 @@ mod tests {
             .relation
             .validate()
             .expect("relation stays bounded");
+    }
+
+    #[test]
+    fn sustained_hostility_accumulates_and_a_single_message_barely_moves_tension() {
+        let person_id = PersonId::new();
+        let message = interaction_message(person_id, ConversationKind::Direct, "hello");
+        let affect = AffectState::default();
+        let hostile = InteractionCues {
+            sentiment_valence: -0.9,
+            sentiment_arousal: 0.6,
+            sentiment_confidence: 0.9,
+            gratitude_strength: 0.0,
+        };
+
+        // One hostile message is an argument, not a verdict: it must stay well
+        // below the silence threshold so normal friction never gates a reply.
+        let once = evolve_interaction_state_with_cues(
+            &message,
+            Some(RelationState::new(person_id)),
+            affect,
+            hostile,
+        )
+        .expect("bounded cues");
+        assert!(
+            once.relation.tension < 0.3,
+            "单条负面消息不该把关系推到静默边缘：{}",
+            once.relation.tension
+        );
+
+        // Repeated hostility accumulates instead of hitting a ceiling on the
+        // first message, and stays bounded while doing so.
+        let mut relation = Some(RelationState::new(person_id));
+        for _ in 0..12 {
+            relation = Some(
+                evolve_interaction_state_with_cues(&message, relation, affect, hostile)
+                    .expect("bounded cues")
+                    .relation,
+            );
+        }
+        let accumulated = relation.expect("relation survives");
+        assert!(
+            accumulated.tension > once.relation.tension,
+            "持续不友好必须累积：单次 {} vs 十二次 {}",
+            once.relation.tension,
+            accumulated.tension
+        );
+        accumulated.validate().expect("relation stays bounded");
+
+        // Warmth is the way back before the half-life does its work.
+        let cooled = evolve_interaction_state_with_cues(
+            &message,
+            Some(accumulated),
+            affect,
+            InteractionCues {
+                sentiment_valence: 0.6,
+                sentiment_arousal: 0.2,
+                sentiment_confidence: 0.9,
+                gratitude_strength: 0.8,
+            },
+        )
+        .expect("bounded cues")
+        .relation;
+        assert!(
+            cooled.tension < accumulated.tension,
+            "善意必须能降温：{} -> {}",
+            accumulated.tension,
+            cooled.tension
+        );
     }
 
     #[test]

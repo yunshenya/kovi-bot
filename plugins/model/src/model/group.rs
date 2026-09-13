@@ -485,6 +485,9 @@ pub(crate) async fn group_message_event_after_ingress(
     }
     let structured_at_self = message_at_self(&event.message, event.self_id);
     let locally_addressed = structured_at_self || text_mentions_bot(message);
+    // 相处的确定性证据：只吃"指向她"的消息。模型那条语义通道负责阴阳怪气，
+    // 这一条负责它可能看不见的直白辱骂/驱赶；两者按同一刻度加到关系张力上。
+    record_target_experience(event.user_id, message, locally_addressed).await;
     // Shadow-mode World Model social scene feed: deterministic, no model
     // call, no reply influence (v4 §145–146). No-op when disabled.
     crate::yunxi::world_model::record_group_scene(
@@ -2023,6 +2026,56 @@ fn message_at_self(message: &Message, self_id: i64) -> bool {
             None => false,
         }
     })
+}
+
+/// 把一条指向她的消息记成相处经验：不友好则加张力，友好则降温。
+///
+/// 只处理**指向她**的消息（`addressed` 为真）。群友互相斗嘴不该让她把谁记成
+/// "对我不好"——那既不准确，也不公平。未指向她的消息一律不记，因此这个函数
+/// 对绝大多数群聊消息是零成本的早退。
+///
+/// 与 Core 里那条语义通道的关系：那条负责"阴阳怪气"这类字面看不见的敌意，
+/// 这条负责字面就写着的辱骂与驱赶。两边都只是"一条证据"，加多少、上限在哪、
+/// 如何衰减由 `adjust_relation_tension` 与关系漂移统一决定，不存在两套刻度。
+async fn record_target_experience(user_id: i64, message: &str, addressed: bool) {
+    if !addressed {
+        return;
+    }
+    let Some(strength) = target_experience_strength(message) else {
+        return;
+    };
+    let Some(identity_store) = crate::yunxi::identity_store() else {
+        return;
+    };
+    let Ok(targets) = identity_store.qq_person_domain_targets(user_id).await else {
+        return;
+    };
+    let Some(person_id) = targets.person_id else {
+        return;
+    };
+    let Some(relations) = crate::yunxi::relation_store() else {
+        return;
+    };
+    match relations.nudge_tension(person_id, strength).await {
+        Ok(Some(state)) => println!(
+            "[RELATION] 相处证据已记账 user={} strength={strength:+.2} tension={:.3}",
+            user_id, state.tension
+        ),
+        Ok(None) => {}
+        Err(error) => eprintln!("[WARN] 相处证据写入关系失败 (用户: {}): {}", user_id, error),
+    }
+}
+
+/// 把一条指向她的消息折算成关系张力的调整量。
+///
+/// 字面证据的力度刻意小于"模型明确判定敌意"（后者最高可到 0.2 的混合率）：
+/// 字面命中更容易误判（玩笑式互怼、转述别人的话），所以单次只给 0.08/0.05。
+fn target_experience_strength(message: &str) -> Option<f32> {
+    match crate::silence_signal::target_experience(message) {
+        crate::silence_signal::TargetExperience::Unfriendly => Some(0.08),
+        crate::silence_signal::TargetExperience::Warm => Some(-0.05),
+        crate::silence_signal::TargetExperience::Neutral => None,
+    }
 }
 
 /// 消息是否携带 at/reply 定向段。调用方必须先排除“指向芸汐本人”的情况

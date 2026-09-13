@@ -2603,6 +2603,95 @@ fn ambient_group_interjection_veto(
     Some(silent_with_interaction_state(input))
 }
 
+/// 关系张力达到这个值，静默门控才考虑不接这条。
+///
+/// 为什么是 0.6：张力每次负面语义与 `(1 - tension)` 成比例地上升
+/// （`crates/yunxi-core/src/planner.rs` 的 `apply_interaction_cues`），
+/// 所以 0.6 不可能由一两条消息达到——需要持续的不友好才推得上去，这正是
+/// "持续"的操作化定义。它高过语气阈值 0.35 不少，因此"生分、需要分寸"
+/// 会先出现（她开始收着说），继续恶化才轮到不接。
+const SILENCE_TENSION_THRESHOLD: f32 = 0.6;
+
+/// 静默门控：这个人对她的持续不友好已经攒到了阈值，这一轮不必再回。
+///
+/// 为什么闸装在这里：它是模型调用之前的否决点，和 `pre_model_plan`、
+/// `active_mind_no_output_plan` 同一层。真正的成因不在这一条消息里，而在
+/// `input.relation.tension`——那是长期记忆与相处经验落到行为上的地方；
+/// 门控只是把已经积累的关系状态翻译成"这条不接"。
+///
+/// 三条硬约束，缺一条这套机制都不该上线：
+/// 1. **管理员不拦**。Core 侧判不了（没有 QQ 号），结论由 Host 带进来；
+///    唯一能解除关系张力的人不能被自己触发的静默挡住。
+/// 2. **默认关闭**。`silence.enabled = false` 时只打影子日志：写明"如果打开，
+///    这条会被静默"，可见回复一条不少——上线前先用真实数据确认判据不误伤。
+/// 3. **不是封禁**。张力有 3 天半衰期的自然漂移，善意会主动降温；到期或回暖
+///    就回到照常，没有需要人工解封的状态留在这里。
+fn silence_gate_plan(
+    input: &PlannerInput,
+    host: Option<&HostMessageContext>,
+) -> Option<DecisionPlan> {
+    // `config::get()` 返回的是临时 Arc，直接取字段会在语句末尾被释放；
+    // 先绑成局部变量再借用它的 `silence` 一节。
+    let config = config::get();
+    let silence = config.silence();
+    let WorldEventKind::MessageReceived(message) = input.event.kind() else {
+        return None;
+    };
+    // 只有群聊会被关系张力拦住。私聊是授权好友，门控不替她决定"不理朋友"；
+    // 私聊那头的关系语气已经由人物档案管着。
+    if message.conversation_kind != ConversationKind::Group {
+        return None;
+    }
+    let sender_is_admin = host.is_some_and(|context| context.sender_is_admin);
+    let tension = input.relation.as_ref().map(|relation| relation.tension);
+    let SilenceVerdict::Silence { reason } = silence_verdict(
+        message.conversation_kind,
+        sender_is_admin,
+        tension,
+        silence.enabled(),
+    ) else {
+        return None;
+    };
+    if let Some(tension) = tension {
+        println!(
+            "[SILENCE] shadow={} person={} tension={tension:.3} threshold={SILENCE_TENSION_THRESHOLD:.2} reason={reason}",
+            !silence.enabled(),
+            message.sender,
+        );
+    }
+    Some(silent_with_interaction_state(input))
+}
+
+/// 静默判据本体：纯粹、可测，不碰配置也不打日志。
+///
+/// 返回 `Silence` 只代表"代码这一侧同意不接"；调用方是否真的静默由调用方
+/// 手里的配置决定——影子观察阶段正是靠这个分层做到"判定照跑、行为不变"的。
+fn silence_verdict(
+    conversation_kind: ConversationKind,
+    sender_is_admin: bool,
+    tension: Option<f32>,
+    enabled: bool,
+) -> SilenceVerdict {
+    if conversation_kind != ConversationKind::Group || sender_is_admin || !enabled {
+        return SilenceVerdict::Allow;
+    }
+    match tension {
+        Some(tension) if tension >= SILENCE_TENSION_THRESHOLD => SilenceVerdict::Silence {
+            reason: "relation_tension",
+        },
+        _ => SilenceVerdict::Allow,
+    }
+}
+
+/// 静默判据的结论。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SilenceVerdict {
+    /// 照常走后面的决策。
+    Allow,
+    /// 这一轮不接。
+    Silence { reason: &'static str },
+}
+
 /// Mind 是否为一个未点名回合提出了带由头的开口。`reference_is_present` 要求
 /// 由头确实还在同一份有界快照里，避免拿已经过期的兴趣/议程去开话题。
 fn ambient_mind_intent_present(input: &PlannerInput, projection: &MindDecisionProjection) -> bool {
@@ -3045,6 +3134,12 @@ type BoundedRouteCache<K> = BoundedCache<K, RouteContext>;
 struct HostMessageContext {
     admission: IncomingAdmission,
     vision_attachments: Vec<crate::vision::ImageAttachment>,
+    /// 说话人是不是机器人管理员。
+    ///
+    /// Core 的平台无关事件里只有 `PersonId`，没有 QQ 号，也就无法自己做
+    /// `is_bot_admin`（那需要 QQ 号）。静默门控必须对管理员留出通道——否则
+    /// 唯一能解除静默的人会被自己触发的静默挡住，这个问题没有别的出口。
+    sender_is_admin: bool,
 }
 
 #[derive(Debug)]
@@ -3359,31 +3454,38 @@ where
 }
 
 struct IncomingAdmissionReleaseGuard {
-    admission: Option<IncomingAdmission>,
+    /// 整个 host 上下文而不是只有 admission：静默门控要读 `sender_is_admin`。
+    context: Option<HostMessageContext>,
 }
 
 impl IncomingAdmissionReleaseGuard {
-    fn new(admission: IncomingAdmission) -> Self {
+    fn new(context: HostMessageContext) -> Self {
         Self {
-            admission: Some(admission),
+            context: Some(context),
         }
     }
 
+    fn context(&self) -> &HostMessageContext {
+        self.context
+            .as_ref()
+            .expect("an armed incoming admission guard must carry its context")
+    }
+
     fn admission(&self) -> IncomingAdmission {
-        self.admission
-            .expect("an armed incoming admission guard must carry its admission")
+        self.context().admission
     }
 
     fn disarm(&mut self) {
-        self.admission = None;
+        self.context = None;
     }
 }
 
 impl Drop for IncomingAdmissionReleaseGuard {
     fn drop(&mut self) {
-        let Some(admission) = self.admission.take() else {
+        let Some(context) = self.context.take() else {
             return;
         };
+        let admission = context.admission;
         if let Ok(runtime) = kovi::tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
                 ConversationCoordinator::abandon_incoming(admission).await;
@@ -3872,12 +3974,14 @@ impl KoviModelBackend {
         message_id: MessageId,
         admission: IncomingAdmission,
         vision_attachments: Vec<crate::vision::ImageAttachment>,
+        sender_is_admin: bool,
     ) {
         let displaced = self.host_message_contexts.lock().await.insert(
             message_id,
             HostMessageContext {
                 admission,
                 vision_attachments,
+                sender_is_admin,
             },
         );
         if let Some(displaced) = displaced {
@@ -5039,9 +5143,10 @@ impl ModelBackend for KoviModelBackend {
                         }
                         return Ok(silent_with_interaction_state(input));
                     };
+                    let vision_attachments = context.vision_attachments.clone();
                     (
-                        Some(IncomingAdmissionReleaseGuard::new(context.admission)),
-                        context.vision_attachments,
+                        Some(IncomingAdmissionReleaseGuard::new(context)),
+                        vision_attachments,
                     )
                 }
                 _ => (None, Vec::new()),
@@ -5053,6 +5158,12 @@ impl ModelBackend for KoviModelBackend {
                 return Ok(plan);
             }
             if let Some(plan) = ambient_group_interjection_veto(input, &mind_projection) {
+                return Ok(plan);
+            }
+            // 静默门控与上面几个否决同层：都在模型调用之前，判定也都不依赖
+            // 这一轮的正文。默认只打影子日志，`silence.enabled` 打开才真的不接。
+            let host_context = incoming_guard.as_ref().map(|guard| guard.context());
+            if let Some(plan) = silence_gate_plan(input, host_context) {
                 return Ok(plan);
             }
             let incoming_admission = incoming_guard
@@ -6719,8 +6830,9 @@ mod tests {
         INTRINSIC_AUTONOMOUS_INTENT_TAIL_INSTRUCTION, INTRINSIC_GENERATION_SUFFIX,
         INTRINSIC_SEMANTIC_CONTENT_INSTRUCTION, MAX_CORE_BUBBLES, MAX_DELIVERABLE_BUBBLES_PER_TURN,
         MAX_INTRINSIC_REPLY_PROTOCOL_BYTES, MIND_DECISION_INSTRUCTION, MindCandidates,
-        PersistentRouteLookup, QqConversation, RequiredCreation, RouteContext, VisibleReplyTarget,
-        affect_tone_guidance, ambient_group_interjection_veto, autonomous_conversation_prompt,
+        PersistentRouteLookup, QqConversation, RequiredCreation, RouteContext,
+        SILENCE_TENSION_THRESHOLD, SilenceVerdict, VisibleReplyTarget, affect_tone_guidance,
+        ambient_group_interjection_veto, autonomous_conversation_prompt,
         autonomous_conversation_protocol, autonomous_empty_generation_plan,
         autonomous_generation_failure_plan, baseline_disposition, batch_fence_action_key,
         build_bounded_intrinsic_reply_batch, classify_persistent_person_identity,
@@ -6747,10 +6859,10 @@ mod tests {
         safe_single_structured_reply_message, safe_structured_reply_batch,
         sanitize_autonomous_intrinsic_output, sanitize_intrinsic_output,
         sanitize_plain_text_batch_message, select_host_model_route_from_capability,
-        serialize_intrinsic_reply_batch, shadow_projection_for_completed_plan, silent_wait_plan,
-        split_core_speech_markers, strip_core_speech_markers, strong_reply_repair_needed,
-        tool_calls_allowed_for_turn, tool_protocol_authorized_for_turn, visible_reply_intent,
-        visible_reply_intents, visible_reply_state_updates,
+        serialize_intrinsic_reply_batch, shadow_projection_for_completed_plan, silence_verdict,
+        silent_wait_plan, split_core_speech_markers, strip_core_speech_markers,
+        strong_reply_repair_needed, tool_calls_allowed_for_turn, tool_protocol_authorized_for_turn,
+        visible_reply_intent, visible_reply_intents, visible_reply_state_updates,
     };
     use crate::model::{
         BotMemory, ConversationCoordinator, IncomingTurnImpact, OutgoingExecutiveDecision,
@@ -8521,6 +8633,51 @@ mod tests {
     }
 
     #[test]
+    fn silence_gate_needs_a_group_a_high_tension_and_the_switch_on() {
+        // 默认关闭时永远放行——影子观察阶段判定照跑，但行为一个字都不变。
+        assert_eq!(
+            silence_verdict(ConversationKind::Group, false, Some(0.95), false),
+            SilenceVerdict::Allow,
+        );
+        // 私聊永远放行：授权好友不该被关系张力挡在门外。
+        assert_eq!(
+            silence_verdict(ConversationKind::Direct, false, Some(0.95), true),
+            SilenceVerdict::Allow,
+        );
+        // 管理员永远放行：唯一能解除紧张的人不能被自己触发的静默挡住。
+        assert_eq!(
+            silence_verdict(ConversationKind::Group, true, Some(0.95), true),
+            SilenceVerdict::Allow,
+        );
+        // 没有关系状态（新人）不能静默。
+        assert_eq!(
+            silence_verdict(ConversationKind::Group, false, None, true),
+            SilenceVerdict::Allow,
+        );
+        // 阈值以下放行；到达阈值才不接。
+        assert_eq!(
+            silence_verdict(
+                ConversationKind::Group,
+                false,
+                Some(SILENCE_TENSION_THRESHOLD - 0.01),
+                true
+            ),
+            SilenceVerdict::Allow,
+        );
+        assert_eq!(
+            silence_verdict(
+                ConversationKind::Group,
+                false,
+                Some(SILENCE_TENSION_THRESHOLD),
+                true
+            ),
+            SilenceVerdict::Silence {
+                reason: "relation_tension"
+            },
+        );
+    }
+
+    #[test]
     fn first_person_turn_avoidance_is_a_register_not_a_word_list() {
         // 线上原文（2026-09-13 23:29，群 641996763 白浅）：宿主已经决定要发，
         // 字面清单只收了"先不接话"，于是这句"宣布不接"的元叙述照发，群友看到的
@@ -10107,6 +10264,7 @@ mod tests {
                     file: Some(format!("{key}.png")),
                     url: None,
                 }],
+                sender_is_admin: false,
             };
             let mut cache = HostMessageContextCache::new(2);
 
