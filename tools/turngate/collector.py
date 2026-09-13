@@ -9,16 +9,26 @@
   pending_user_fragments,最后一条作为 current_text;
 - 机器人的 `[send]` 行构成 assistant 角色 turn,用于 recent_turns 与
   conversation_active;
+- **目标判定**:日志里的 `[at]`/`[reply]` 只说明"这条消息有指向",不说明指向谁
+  (kovi 的 `Message::to_human_string` 对任何人的 @ 都渲染成 `[at]`,并明确写着
+  不要靠它做判断)。运行时判定"指的是别人"时会打印「群聊消息指向其他成员,
+  仅观察不回复 (群组: N, 用户: M)」,采集器据此把这一类记成
+  `context.targeting = "other_member"`;带 at/reply 段却没有该标记的消息,
+  目标不可知,直接丢弃并计数——猜错会把 TurnGate 教反;
 - 弱标签(pseudo_lexical_v0)来自高精度本地规则,只作候选,必须人工复核;
   lexical 无法判定的 completion 置 null;
 - 不保存 QQ 号/昵称/URL/Token;source_key 为不透明哈希,供删除屏障使用;
 - 默认不采集:纯本地工具,由开发者在服务器运行时显式执行。
 
 用法:
-    journalctl -u kovi-bot.service --since "2026-09-06 00:00:00" \
-        | grep -E "\\[group|\\[send\\]" > /tmp/tg-journal.txt
+    journalctl -u kovi-bot.service -o short-iso --since "2026-09-06 00:00:00" \
+        > /tmp/tg-journal.txt
     python3 tools/turngate/collector.py --journal /tmp/tg-journal.txt \
         --out tools/turngate/dataset/review-batch-20260907.jsonl
+
+    导出时**不要**只 grep `[group]`/`[send]`:目标判定还要读
+    「群聊消息指向其他成员」标记行。整份日志直接喂给采集器即可,多余的行走
+    匹配不到的分支,不会进样本。
 """
 
 import argparse
@@ -45,6 +55,13 @@ LINE_RE = re.compile(
 )
 # [send] 行没有内层时间戳,用 syslog 时间(见 parse_from_syslog)。
 SEND_RE = re.compile(r"\[send\] \[to group (\d+)\]: ?(.*)$")
+# 运行时判定"这条 at/reply 指的是别人"时打印的标记行（Host 与 Core 两条链路
+# 同一条文案）。日志本身只有 kovi 渲染的 `[at]`/`[reply]`，不带目标是谁——
+# `Message::to_human_string` 对任何人的 @ 都渲染成 `[at]`，函数注释还写着
+# "不要靠此函数做判断"。所以"在叫谁"只能靠这条标记还原。
+AT_OTHER_RE = re.compile(r"群聊消息指向其他成员，仅观察不回复 \(群组: (\d+), 用户: (\d+)\)")
+# 标记行与消息行的时间差容忍度：两条日志由同一次入站处理打印。
+AT_OTHER_WINDOW_SECS = 2.0
 # 第一行之后的续行(无 group 前缀)尽量匹配:任何不以 [ 开头的普通文本行。
 BODY_CONTINUATION_RE = re.compile(r"^[^\[\]].+$")
 
@@ -148,6 +165,7 @@ def main() -> int:
     args = parser.parse_args()
 
     events = []  # (ts, kind, group, user, text)
+    at_other_marks = []  # (ts, group, user) 运行时判定"at/reply 指的是别人"
     last = None
     untimed_sends = 0
     with open(args.journal, encoding="utf-8", errors="replace") as fh:
@@ -169,6 +187,12 @@ def main() -> int:
                     continue
                 events.append(("bot", int(m.group(1)), None, m.group(2), ts))
                 last = ("bot", int(m.group(1)), None, ts)
+                continue
+            m = AT_OTHER_RE.search(line)
+            if m:
+                ts = parse_syslog_ts(line)
+                if ts is not None:
+                    at_other_marks.append((ts, int(m.group(1)), int(m.group(2))))
                 continue
             # 续行:同组同发送者的多段消息
             if last and BODY_CONTINUATION_RE.match(line) and not line.startswith("["):
@@ -197,6 +221,7 @@ def main() -> int:
 
     samples = []
     seen_keys = set()
+    unresolved_targets = 0
     for group_id, evs in by_group.items():
         # 完整时间线: 重建 unit 序列 (每 unit = 同一发言者的连续片段)
         units = []
@@ -222,6 +247,25 @@ def main() -> int:
             has_face = "[face]" in cur
             has_at_flag = has_at or "[at]" in "".join(texts)
             has_reply_flag = has_reply or "[reply]" in "".join(texts)
+            # 目标判定：`[at]`/`[reply]` 只是"有指向"，日志不带目标是谁。运行时
+            # 在判定"指的是别人"时会打印一条标记行，用它把这一类还原成
+            # other_member；标记行缺席而消息带 at/reply 段的，目标不可知
+            # （可能是叫她本人，也可能是旧日志里 Core 链路静默跳过的 at-other），
+            # 这种样本一律丢弃——猜错等于把"@别人"教成"该回她"。
+            at_other = any(
+                mark_group == group_id
+                and mark_user == sender
+                and 0 <= (mark_ts - ts).total_seconds() <= AT_OTHER_WINDOW_SECS
+                for mark_ts, mark_group, mark_user in at_other_marks
+            )
+            if at_other:
+                targeting = "other_member"
+                has_at_flag = False
+                has_reply_flag = False
+            elif has_at_flag or has_reply_flag:
+                targeting = "unresolved"
+            else:
+                targeting = "none"
             clean = sanitize(cur)
             # recent turns: 之前的 ≤4 个 user/bot unit
             recent = []
@@ -248,6 +292,12 @@ def main() -> int:
             )
             conversation_active = recent_bot or bot_recent
 
+            if targeting == "unresolved":
+                # 目标不可知的样本不进批次。它们带着 `[at]`/`[reply]` 段，
+                # 但日志无法说明指的是谁：留下只能二选一，而两种猜法都是错的
+                # （猜"在叫她"把 @别人 教成必答；猜"没叫她"把真点名教成免打扰）。
+                unresolved_targets += 1
+                continue
             context = {
                 "scope": "group",
                 "pending_user_fragments": [sanitize(t) for t in pending],
@@ -261,6 +311,10 @@ def main() -> int:
                 "has_image": has_image,
                 "has_sticker": has_face,
                 "policy_override": "must_reply" if (has_at_flag or has_reply_flag) else "none",
+                # 目标解析结果：none=消息不带 at/reply 段；other_member=运行时
+                # 判定它指向别人（只观察）。addressed_to_agent 只在这里为真时
+                # 才可能为真，绝不从"文本里有 [at]"直接推断。
+                "targeting": targeting,
             }
             key = hashlib.sha256(
                 ("group|%s|%s|%s" % (group_id, clean, json.dumps(recent, ensure_ascii=False)))
@@ -309,6 +363,14 @@ def main() -> int:
         f"({n_pseudo} with lexical completion label, "
         f"{len(samples) - n_pseudo} gray-zone candidates)"
     )
+    if unresolved_targets:
+        # 不是错误，但要让人看见：这批日志里有多少条消息的"在叫谁"无从判断。
+        # 数量偏高通常意味着日志来自还没有 AT_OTHER 标记的旧版本——那时 Core
+        # 链路对 at-other 是静默跳过，采集器无法还原目标。
+        print(
+            f"dropped {unresolved_targets} samples with an unresolved at/reply "
+            f"target (日志需要含「群聊消息指向其他成员」标记行才能还原目标)"
+        )
     # 机器人上下文覆盖率：0 说明 [send] 行没被解析进来（多半是导出格式的问题），
     # 这种批次只有半张样本，不该被当成可用数据。
     print(

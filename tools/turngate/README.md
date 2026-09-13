@@ -50,8 +50,10 @@ Bundle 布局（`models/yunxi-turngate/`，生产由部署方放到稳定目录�
 #    必须带 syslog 时间戳：`[send]` 行本身没有时间戳，用 `-o cat` 导出会让所有
 #    机器人发言被记成"现在"，采出的批次 assistant turns 与 conversation_active
 #    全为 0（collector 现在会直接报错拦下这种批次）。
+#    也不要只 grep `[group`/`[send]`：目标判定还要读运行时打印的
+#    「群聊消息指向其他成员，仅观察不回复」标记行。
 journalctl -u kovi-bot.service -o short-iso --since "2026-09-07 00:00:00" \
-    | grep -E "\[group|\[send\]" > /tmp/tg-journal.txt
+    > /tmp/tg-journal.txt
 python3 tools/turngate/collector.py --journal /tmp/tg-journal.txt \
     --out datasets/review-batch-$(date +%Y%m%d).jsonl
 # 输出: pending 候选(schema v2), 弱标签 source=pseudo_lexical_v0,
@@ -83,6 +85,29 @@ python3 tools/turngate/train.py --data train_turngate-v0.1.jsonl \
 采集纪律 (doc §7.4 D): 默认不采集;原文只存待标注区;训练集不含
 QQ 号/昵称/URL;删除请求按 source_key 从未训练样本移除;模型更新=新版本+
 重新评估。
+
+### 目标判定（`context.targeting`）
+
+日志里的 `[at]`/`[reply]` 只说明"这条消息有指向"，**不说明指向谁**：kovi 的
+`Message::to_human_string` 对任何人的 @ 都渲染成 `[at]`，函数注释还明确写着
+"不要靠此函数做判断"。采集器最初直接把 `[at]` 当成"在叫她"，于是"@了别人"的
+消息被标成 `addressed_to_agent=true` / `must_reply`——拿它训练等于教 TurnGate
+"别人被 @ 时该回她"，正好把线上"过度接话"的毛病固化进模型。
+
+现在：
+
+- 运行时判定"指的是别人"时会打印
+  `[INFO] 群聊消息指向其他成员，仅观察不回复 (群组: N, 用户: M)`（Host 与
+  Core 两条链路同一文案）；采集器据此记 `targeting = "other_member"`，
+  `addressed_to_agent` 保持 false；
+- 带 at/reply 段却找不到该标记的消息，目标不可知 → **丢弃并计数**（批次摘要里
+  打印 `dropped N samples with an unresolved at/reply target`）。数量偏高说明
+  日志来自没有该标记的旧版本，重跑一次带标记的日志即可；
+- 因此 `addressed_to_agent` / `replies_to_agent` 不再会从"文本里有 `[at]`"
+  直接推断为真。
+
+`targeting` 只是复核用元数据，**不进特征向量**：特征协议是锁定的（见下方"修改
+约定"），要把它变成特征必须先走 Rust 与 Python 双侧的版本升级流程。
 
 ## 修改约定
 

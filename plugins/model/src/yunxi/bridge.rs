@@ -2084,6 +2084,14 @@ struct InboundMessage {
     vision_attachments: Vec<crate::vision::ImageAttachment>,
     timestamp: DateTime<Utc>,
     addressed_to_agent: bool,
+    /// 消息带着 at/reply 段、但那些段落指向的是别人（不是芸汐）。
+    ///
+    /// 只用于日志：`[at]` 在 kovi 的人类可读渲染里对**任何人的 @** 都长得
+    /// 一样（`Message::to_human_string` 只看段类型，并明确写着"不要靠此函数
+    /// 做判断"），离线采集聊天记录时无法从日志还原"到底在叫谁"。Core 链路
+    /// 此前对这一类消息静默跳过，于是 `tools/turngate` 只能把"@别人"记成
+    /// "在叫她"，把 TurnGate 训练集教反。
+    directed_at_other_members: bool,
     visible_reply_allowed: bool,
     explicit_request: bool,
     stop_requested: bool,
@@ -2109,6 +2117,12 @@ impl InboundMessage {
         let explicit_request = group_message_requests_explicit_batch(&event.message, &text);
         let attachments = normalize_attachments(&event.message);
         let vision_attachments = crate::vision::extract_image_attachments(&event.message);
+        let addressed_to_agent =
+            message_at_self(&event.message, event.self_id) || text_mentions_agent(&text);
+        // 与 Host 链路的 `directed_at_others` 同一口径：只要带 at/reply 段就
+        // 算"有指向"，因此这里必须已经排除了指向她本人的情况。
+        let directed_at_other_members =
+            directed_at_other_members(&event.message, addressed_to_agent);
         Some(Self {
             address: ConversationAddress::Group {
                 group_id: event.group_id,
@@ -2117,8 +2131,8 @@ impl InboundMessage {
             external_message_id: positive_message_id(event.message_id),
             reply_to_external_message_id: reply_message_id(&event.message),
             replies_to_agent_hint: false,
-            addressed_to_agent: message_at_self(&event.message, event.self_id)
-                || text_mentions_agent(&text),
+            addressed_to_agent,
+            directed_at_other_members,
             visible_reply_allowed: true,
             explicit_request,
             stop_requested: false,
@@ -2150,6 +2164,7 @@ impl InboundMessage {
             reply_to_external_message_id: reply_message_id(&event.message),
             replies_to_agent_hint: false,
             addressed_to_agent: true,
+            directed_at_other_members: false,
             visible_reply_allowed: true,
             explicit_request: true,
             stop_requested: false,
@@ -3722,6 +3737,20 @@ async fn resolve_and_submit_inner(
         });
     let recent_agent_reply =
         resolve_recent_agent_reply(message, conversation_id, reply_reference, message_store).await;
+    // 消息通过 at/reply 段指向其他成员（而非芸汐）时只观察不插话。Host 链路
+    // 早有一条同名日志，Core 链路此前是静默跳过；离线采集（tools/turngate）
+    // 只能看到 kovi 渲染的 `[at]`/`[reply]`、看不到目标是谁，于是把"@别人"
+    // 记成"在叫她"。补上这条，两条链路的判定在日志里才一致可查。
+    if let ConversationAddress::Group { group_id } = message.address
+        && !message.addressed_to_agent
+        && !recent_agent_reply
+        && message.directed_at_other_members
+    {
+        println!(
+            "[INFO] 群聊消息指向其他成员，仅观察不回复 (群组: {}, 用户: {})",
+            group_id, message.sender_user_id
+        );
+    }
     let visible_reply_allowed = effective_visible_reply_allowed(message, recent_agent_reply);
 
     let priority = if message.address.kind() == ConversationKind::Direct
@@ -4244,6 +4273,19 @@ fn pure_group_image(event: &GroupMsgEvent) -> bool {
         && event.borrow_text().unwrap_or_default().trim().is_empty()
 }
 
+/// 消息带着 at/reply 段、但那些段落不指向芸汐本人（`addressed_to_agent`
+/// 已把"@她 / 引用她 / 正文叫她名字"排除掉）。
+///
+/// 与 Host 链路的 `directed_at_others` 同一口径（那边只判段类型，由调用方
+/// 保证已经排除指向她本人的情况）。这个判定只用于日志：日志里的 `[at]`/
+/// `[reply]` 渲染不带目标，离线采集靠它还原"到底在叫谁"。
+fn directed_at_other_members(message: &Message, addressed_to_agent: bool) -> bool {
+    !addressed_to_agent
+        && message
+            .iter()
+            .any(|segment| matches!(segment.type_.as_str(), "at" | "reply"))
+}
+
 fn ambient_group_payload_can_be_sampled(message: &Message) -> bool {
     !message
         .iter()
@@ -4612,6 +4654,7 @@ mod tests {
             vision_attachments: Vec::new(),
             timestamp: Utc::now(),
             addressed_to_agent,
+            directed_at_other_members: false,
             visible_reply_allowed: true,
             explicit_request: false,
             stop_requested: false,
@@ -5028,6 +5071,28 @@ mod tests {
         assert!(!registry.should_request(123, 4, "如果", false, true, false, policy));
         // 窗口外行为不变:冷却/频率限制仍然生效。
         assert!(!registry.should_request(123, 5, "第四条消息", false, false, false, policy));
+    }
+
+    #[test]
+    fn directed_at_other_members_only_counts_messages_not_addressed_to_her() {
+        let plain = Message::from("今天群里有点安静");
+        assert!(!super::directed_at_other_members(&plain, false));
+
+        let at_other = Message::from(vec![Segment::new("at", json!({"qq": "654321"}))]);
+        assert!(super::directed_at_other_members(&at_other, false));
+        // 已经判定为"在叫她"的消息不再算指向别人（"@她 + 引用别人"也不能
+        // 被记成指向别人，否则采集器会把真点名丢进 other_member）。
+        assert!(!super::directed_at_other_members(&at_other, true));
+
+        let reply = Message::from(vec![
+            Segment::new("reply", json!({"id": "10001"})),
+            Segment::new("text", json!({"text": "我说完了"})),
+        ]);
+        assert!(super::directed_at_other_members(&reply, false));
+
+        // 同样的口径决定了未点名消息能不能被采样。
+        assert!(!super::ambient_group_payload_can_be_sampled(&at_other));
+        assert!(super::ambient_group_payload_can_be_sampled(&plain));
     }
 
     #[test]
