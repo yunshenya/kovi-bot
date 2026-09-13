@@ -1715,7 +1715,10 @@
       };
       const visibleLinks = (shown.links || []).filter((link) => memory.linkTypes.has(link.type));
 
-      sideBody.replaceChildren(
+      // `replaceChildren` 会把 null 变成 "null" 文本节点（只有 h() 会跳过空子
+      // 节点），所以先过滤。以前这里直接把三元表达式的结果传进去，折叠重复为 0
+      // 时——也就是平时——侧栏里就挂着一个孤零零的 "null"。
+      sideBody.replaceChildren(...[
         h('div', { class: 'graph-stat' },
           h('div', {}, h('div', { class: 'label', text: '节点' }),
             h('div', { class: 'value', text: String(shown.nodes.length) })),
@@ -1728,7 +1731,8 @@
           ...LINK_TYPES.map(([key, label, color]) => h('div', { class: 'graph-legend-row' },
             h('i', { style: `background:${color}` }),
             h('span', { class: memory.linkTypes.has(key) ? '' : 'muted', text: label }),
-            h('span', { class: 'muted', text: String(shown.linkCounts[key] || 0) })))));
+            h('span', { class: 'muted', text: String(shown.linkCounts[key] || 0) })))),
+      ].filter(Boolean));
 
       // 视图栏那行也得跟着更新——整页重绘被去掉之后，它不会自己刷新了。
       const countLabel = document.querySelector('#page-memory .view-count');
