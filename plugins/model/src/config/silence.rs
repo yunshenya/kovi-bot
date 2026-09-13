@@ -22,7 +22,16 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 #[serde(default)]
 pub struct SilenceConfig {
-    /// 是否让静默真正生效。默认 false＝只计数、只打影子日志，可见回复一条不少。
+    /// 是否让静默真正生效。
+    ///
+    /// 默认 **true**：相处经验改变行为是这个功能的用途本身，"装上但不开"会让它
+    /// 在真正需要的时候恰好没生效。要只看不动就显式写 `false`——那时只记账、只打
+    /// `[SILENCE] shadow=true`，可见回复一条不少（拿真实日志核判据时用得上）。
+    ///
+    /// 之所以能默认开：判据经过实测校准（约 6 条强烈敌意或 22 条指向她的辱骂才越
+    /// 0.6），且有四重边界——3 天半衰期自然回落、善意主动降温、管理员永远放行、
+    /// 私聊不拦。上线前核对过线上关系表：没有任何一条活跃张力接近阈值，
+    /// 不存在"一打开就有人被静默"的存量风险。
     enabled: bool,
     /// 指向她的一条消息要被记为"不友好经验"所需的负面特征数。
     ///
@@ -53,7 +62,7 @@ pub struct SilenceConfig {
 impl Default for SilenceConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             negative_threshold: 3,
             decay_days: 30,
             warm_recovery_count: 2,
@@ -103,11 +112,12 @@ mod tests {
     use super::SilenceConfig;
 
     #[test]
-    fn defaults_are_shadow_first_and_bounded() {
+    fn defaults_are_bounded_and_the_gate_is_on() {
         let config = SilenceConfig::default();
-        // 默认不改变任何可见行为：这是这套机制能被安全地装上线的唯一前提。
-        assert!(!config.enabled());
-        // 群级降温与个人级门控是两个独立开关：默认同样是影子观察。
+        // 个人级门控默认生效：装上但不开，会让这个功能在需要时恰好没作用。
+        assert!(config.enabled());
+        // 群级降温是另一个维度、独立开关，仍默认只影子观察——它影响的是"主动
+        // 插话的频率"，误判的可见代价与个人级不同，先看日志再开。
         assert!(!config.group_cooling_enabled());
         assert!(config.validate().is_ok());
         // 有界：必须有衰减窗口与回暖通道，否则静默会变成永久冷处理。

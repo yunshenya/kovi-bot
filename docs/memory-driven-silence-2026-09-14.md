@@ -41,9 +41,13 @@
 
 ## 三条硬约束（为什么可以安全上线）
 
-1. **默认关闭**。`[silence] enabled = false` 时只打影子日志
-   （`[SILENCE] shadow=true person=… tension=… threshold=… reason=…`），
-   判定照跑、可见回复一条不少。上线顺序：先跑几天日志确认不误伤，再打开开关。
+1. **默认开启（2026-09-14 起）**。`[silence] enabled = true` 是默认值：相处经验
+   改变行为就是这个功能的用途，装上但不开会让它在需要时恰好没作用。写成 `false`
+   即回到"只看不动"——只打 `[SILENCE] shadow=true person=… tension=… threshold=…
+   reason=…`，判定照跑、可见回复一条不少。
+   开启前的存量核对：线上 `yunxi_relations` 里活跃张力最高只有 0.085，那 40 条
+   `tension = 0.8` 是 8 月底的老行，经 `updated_at` 漂移后实际不足 0.1——不存在
+   "一打开就有人被静默"。
 2. **管理员永远放行**。Core 的事件里只有平台无关的 `PersonId`、判不了管理员
    （`is_bot_admin` 要 QQ 号），所以结论由 Host 经 `HostMessageContext.sender_is_admin`
    带进来——唯一能解除紧张的人不能被自己触发的静默挡住。
