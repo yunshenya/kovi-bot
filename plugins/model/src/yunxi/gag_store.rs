@@ -54,7 +54,8 @@ pub(crate) struct GagEntry {
     pub text: String,
     pub state: String,
     pub occurrence: i64,
-    pub importance: i64,
+    /// 与列类型一致（`importance INTEGER`）：按 i64 读会被 sqlx 判为类型不匹配。
+    pub importance: i32,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -157,7 +158,7 @@ impl PostgresGagStore {
         .bind(scope_id)
         .bind(kind.as_str())
         .bind(text)
-        .bind(i64::from(importance.clamp(0, 100)))
+        .bind(i32::from(importance.clamp(0, 100)))
         .bind(now)
         .execute(&self.pool)
         .await?;
@@ -185,23 +186,28 @@ impl PostgresGagStore {
         .bind(limit as i64)
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows
-            .into_iter()
-            .map(|row| GagEntry {
-                id: row.get(0),
-                kind: match row.get::<String, _>(1).as_str() {
-                    "promise" => GagKind::Promise,
-                    "grudge" => GagKind::Grudge,
-                    _ => GagKind::Gag,
-                },
-                text: row.get(2),
-                state: row.get(3),
-                occurrence: row.get(4),
-                importance: row.get(5),
-                created_at: row.get(6),
-                updated_at: row.get(7),
+        // `try_get` 而不是 `get`：列类型一旦和这里的 Rust 类型对不上，`get` 是直接
+        // panic 的，而调用方（`#账本`、私聊上下文注入）根本没法处理。这里就踩过一次
+        // ——`importance` 是 INTEGER，却按 i64 读，任何一条 open 条目都会让读账本
+        // panic。让它变成一个可上报的错误。
+        rows.into_iter()
+            .map(|row| -> anyhow::Result<GagEntry> {
+                Ok(GagEntry {
+                    id: row.try_get(0)?,
+                    kind: match row.try_get::<String, _>(1)?.as_str() {
+                        "promise" => GagKind::Promise,
+                        "grudge" => GagKind::Grudge,
+                        _ => GagKind::Gag,
+                    },
+                    text: row.try_get(2)?,
+                    state: row.try_get(3)?,
+                    occurrence: row.try_get(4)?,
+                    importance: row.try_get(5)?,
+                    created_at: row.try_get(6)?,
+                    updated_at: row.try_get(7)?,
+                })
             })
-            .collect())
+            .collect()
     }
 
     /// Mark an entry fulfilled/voided by id. Returns false when not found.

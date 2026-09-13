@@ -1410,6 +1410,17 @@ pub(crate) async fn delete_qq_person_domain_data(self_id: i64, user_id: i64) -> 
         .context("Yunxi identity store 尚未初始化")?;
     let external_identity = qq::person(user_id)?;
     let direct_conversation = qq::direct(self_id, user_id)?;
+    // 账本条目按 QQ 号原文存（`GagScope::Person(user_id.to_string())`），同样不在这套
+    // 外键级联里，必须显式删；同一个人可能换过号，所以别名一起清。
+    // **必须在身份行被删掉之前读**：`delete_person_domain_data` 会把映射一并删掉。
+    let gag_user_ids = match store.qq_person_domain_targets(user_id).await {
+        Ok(targets) if !targets.qq_user_ids.is_empty() => targets.qq_user_ids,
+        Ok(_) => vec![user_id],
+        Err(error) => {
+            eprintln!("[WARN] 读取 QQ 别名失败，账本只按当前号清理 (用户: {user_id}): {error}");
+            vec![user_id]
+        }
+    };
     // Identity mutations fail closed for the configured owner. The cached
     // mapping may already be stale because another process changed Postgres.
     if crate::config::get().identity().owner_person_id().is_some() {
@@ -1424,7 +1435,42 @@ pub(crate) async fn delete_qq_person_domain_data(self_id: i64, user_id: i64) -> 
     // 相处结论按"显示名/QQ 的文本"存，不在上面那套外键级联里，必须显式删。
     // 别名与当前昵称都传进去：模型可能用 QQ 号、旧昵称或群名片写下结论。
     delete_relation_notes_for_person(user_id, external_identity.external_id()).await;
+    if let Some(gag_store) = gag_store() {
+        delete_gag_entries_for_person(&gag_store, &gag_user_ids, user_id).await;
+    }
     Ok(deleted.total())
+}
+
+/// 清掉某个人的账本条目（`GagScope::Person` 的 key 就是 QQ 号原文，按号逐个清）。
+///
+/// 这些行是用户自己口述的约定/芥蒂原文，会被注入回复上下文，所以和相处结论一样属于
+/// "必须显式删、不能被外键级联覆盖"的一类。不删的后果不是少一行数据：回执告诉用户
+/// "你的可归属数据已删除"，而 `#账本` 里还列着，换个身份映射回来还会继续进上下文。
+///
+/// 失败只记日志、不阻断擦除主流程，与 `delete_relation_notes_for_person` 同一约定：
+/// 擦除本身已经完成，一条附加清理失败不该让用户看到"删除失败"，但必须留下可查的痕迹。
+async fn delete_gag_entries_for_person(
+    store: &PostgresGagStore,
+    user_ids: &[i64],
+    user_id: i64,
+) -> u64 {
+    let mut keys: Vec<String> = user_ids.iter().map(|id| id.to_string()).collect();
+    keys.sort();
+    keys.dedup();
+    let mut deleted = 0_u64;
+    for key in keys {
+        match store
+            .delete_for_scope(gag_store::GagScope::Person(key.clone()))
+            .await
+        {
+            Ok(rows) => deleted = deleted.saturating_add(rows),
+            Err(error) => eprintln!("[WARN] 删除账本条目失败 (scope: {key}): {error}"),
+        }
+    }
+    if deleted > 0 {
+        println!("[INFO] 已删除账本条目 {deleted} 条 (用户: {user_id})");
+    }
+    deleted
 }
 
 /// 清掉某个 QQ 用户相关的相处结论（QQ 号原文 + 所有已知称呼）。
@@ -1634,7 +1680,7 @@ mod tests {
 
 #[cfg(test)]
 mod erasure_tests {
-    use super::relation_note_targets;
+    use super::{delete_gag_entries_for_person, relation_note_targets};
     use crate::yunxi::identity_store::PostgresIdentityStore;
     use sqlx_postgres::PgPool;
     use std::sync::Arc;
@@ -1715,6 +1761,79 @@ mod erasure_tests {
         .await
         .expect("应创建测试记忆");
         (identity, direct, person_uuid)
+    }
+
+    /// 账本条目按 QQ 号原文存、也被注入回复上下文，所以必须显式删干净：不只是
+    /// 当前号，同一个人换过的号（别名）也要清；同时不能碰到别人的条目。
+    #[test]
+    #[ignore = "requires PostgreSQL via DATABASE_URL"]
+    fn person_erasure_purges_the_gag_ledger_for_every_alias() {
+        use crate::yunxi::gag_store::{GagKind, GagScope, PostgresGagStore};
+        use sqlx_postgres::PgPoolOptions;
+
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let database_url = std::env::var("DATABASE_URL").expect("需要 DATABASE_URL");
+                let pool = PgPoolOptions::new()
+                    .max_connections(4)
+                    .connect(&database_url)
+                    .await
+                    .expect("应连接 PostgreSQL");
+                let store =
+                    PostgresGagStore::new(pool.clone(), crate::config::get().gag_ledger().clone());
+                store
+                    .initialize_schema()
+                    .await
+                    .expect("应初始化账本 schema");
+
+                let suffix = (uuid::Uuid::new_v4().as_u128() % 1_000_000_000) as i64;
+                let primary = 1_000_000_000_000_i64 + suffix;
+                let alias = 1_500_000_000_000_i64 + suffix;
+                let stranger = 2_000_000_000_000_i64 + suffix;
+                for (scope_id, text) in [
+                    (primary, "答应过要早睡"),
+                    (alias, "换号之前答应的事"),
+                    (stranger, "别人的约定"),
+                ] {
+                    store
+                        .add(
+                            GagScope::Person(scope_id.to_string()),
+                            GagKind::Promise,
+                            text,
+                            60,
+                        )
+                        .await
+                        .expect("应写入账本条目");
+                }
+
+                let deleted =
+                    delete_gag_entries_for_person(&store, &[primary, alias], primary).await;
+                assert_eq!(deleted, 2, "当前号与别名都该被清掉");
+                assert!(
+                    store
+                        .list_open(GagScope::Person(primary.to_string()), 5)
+                        .await
+                        .expect("应可读回")
+                        .is_empty()
+                );
+                assert!(
+                    store
+                        .list_open(GagScope::Person(alias.to_string()), 5)
+                        .await
+                        .expect("应可读回")
+                        .is_empty()
+                );
+                assert_eq!(
+                    store
+                        .list_open(GagScope::Person(stranger.to_string()), 5)
+                        .await
+                        .expect("应可读回")
+                        .len(),
+                    1,
+                    "不能顺手删掉别人的账本"
+                );
+            });
     }
 
     async fn person_memory_rows(pool: &PgPool, person: uuid::Uuid) -> i64 {
