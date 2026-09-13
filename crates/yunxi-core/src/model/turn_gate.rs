@@ -270,7 +270,7 @@ pub(crate) fn extract_text_features(text: &str, marker: FieldMarker) -> Vec<Text
     let mut counts: Vec<TextFeature> = Vec::with_capacity(64);
     let normalized = normalize_text(text);
     let chars: Vec<char> = normalized.chars().collect();
-    'outer: for width in TURN_GATE_NGRAM_MIN..=TURN_GATE_NGRAM_MAX {
+    for width in TURN_GATE_NGRAM_MIN..=TURN_GATE_NGRAM_MAX {
         if chars.len() < width {
             break;
         }
@@ -286,7 +286,10 @@ pub(crate) fn extract_text_features(text: &str, marker: FieldMarker) -> Vec<Text
                 continue;
             }
             if counts.len() >= TURN_GATE_MAX_TEXT_FEATURES {
-                break 'outer;
+                // 只是"不再新增桶"，不是"停止扫描"：训练器（tools/turngate/features.py）
+                // 在桶满之后仍然把后面的 n-gram 走完，命中已有桶就照旧加一。整体跳出会让
+                // 长文本的计数比训练时少，而计数是乘进 logits 的——线上就与标定不一致了。
+                continue;
             }
             counts.push(TextFeature {
                 index: bucket,
@@ -1212,6 +1215,32 @@ mod tests {
         let mut bad_sha = sample_manifest();
         bad_sha.assets[0].sha256 = "zz".to_owned();
         assert_eq!(bad_sha.validate(), Err(TurnGateManifestError::AssetSha256));
+    }
+
+    /// 特征桶填满 512 之后，训练器仍然继续扫描：已存在的桶照旧计数，只是不再新增桶
+    /// （`tools/turngate/features.py`: `if bucket in counts: … elif len(counts) <
+    /// MAX_TEXT_FEATURES: …`）。Rust 侧若在这里整体跳出，长文本就会算出与训练时不同的
+    /// 计数——而计数是直接乘进 logits 的，等于线上跑的模型和标定用的不是一个。
+    ///
+    /// 期望值取自训练器本身：227 个连续汉字配 `FIELD_MARKERS["current"]`，训练器得到
+    /// 512 个桶、计数总和 **519**。这个长度是特意挑的——200 字时两边凑巧都是 518，
+    /// 只有从这里开始，"封顶之后又给已有桶加了一次"才会真的发生（518 vs 519）。
+    #[test]
+    fn text_feature_cap_keeps_counting_like_the_trainer() {
+        let text: String = (0..227_u32)
+            .filter_map(|offset| char::from_u32(0x4E00 + offset))
+            .collect();
+        let features = extract_text_features(&text, FieldMarker::Current);
+        assert_eq!(
+            features.len(),
+            TURN_GATE_MAX_TEXT_FEATURES,
+            "封顶后不应再新增桶"
+        );
+        let total: u32 = features.iter().map(|feature| feature.count).sum();
+        assert_eq!(
+            total, 519,
+            "封顶之后仍要给已存在的桶计数（训练器行为），不能停止扫描"
+        );
     }
 
     #[test]
