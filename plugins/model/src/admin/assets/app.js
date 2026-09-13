@@ -2219,14 +2219,14 @@
 
     const right = h('div', { class: 'sys-column wide' },
       h('div', { class: 'sys-meters' },
-        meterCard('CPU', cpu.usage_percent || 0, 'accent', [
+        meterCard('CPU', cpu.usage_percent || 0, loadPercentTone(cpu.usage_percent || 0, 85, 95), [
           ['型号', cpu.brand || '—'],
           ['内核数', cpu.physical_cores ? `${cpu.physical_cores} 物理 / ${cpu.cores} 逻辑` : String(cpu.cores || '—')],
           ['主频', cpu.frequency_mhz ? `${cpu.frequency_mhz} MHz` : '—'],
           ['本进程', cpu.process_percent === null || cpu.process_percent === undefined
             ? '—' : `${Number(cpu.process_percent).toFixed(1)}%`],
         ]),
-        meterCard('内存', memory.percent || 0, memoryPercentTone(memory.percent || 0), [
+        meterCard('内存', memory.percent || 0, loadPercentTone(memory.percent || 0), [
           ['总量', fmtBytes(memory.total)],
           ['已用', `${fmtBytes(memory.used)}（可用 ${fmtBytes(memory.available)}）`],
           ['本进程', memory.process_rss === null || memory.process_rss === undefined
@@ -2243,7 +2243,7 @@
             h('span', { class: 'muted small', text: `${fmtBytes(disk.used)} / ${fmtBytes(disk.total)}` })),
           h('div', { class: 'meter-bar' },
             h('div', {
-              class: `meter-fill ${memoryPercentTone(disk.percent)}`,
+              class: `meter-fill ${loadPercentTone(disk.percent)}`,
               style: `width: ${Math.min(100, disk.percent)}%`,
             }))))),
 
@@ -2271,18 +2271,21 @@
         // 只更新仪表盘与磁盘数字，避免整页重绘打断阅读。
         const values = meters.querySelectorAll('.gauge-value');
         if (values[0]) values[0].textContent = `${Number(fresh.cpu.usage_percent || 0).toFixed(0)}%`;
-        setGauge(meters.querySelectorAll('.gauge')[0], fresh.cpu.usage_percent || 0);
+        setGauge(meters.querySelectorAll('.gauge')[0], fresh.cpu.usage_percent || 0,
+          loadPercentTone(fresh.cpu.usage_percent || 0, 85, 95));
         if (values[1]) values[1].textContent = `${Number(fresh.memory.percent || 0).toFixed(0)}%`;
-        setGauge(meters.querySelectorAll('.gauge')[1], fresh.memory.percent || 0);
+        setGauge(meters.querySelectorAll('.gauge')[1], fresh.memory.percent || 0,
+          loadPercentTone(fresh.memory.percent || 0));
       } catch (_) {
         /* 自动刷新失败不打扰用户，下一次再试 */
       }
     }, 5000);
   }
 
-  function memoryPercentTone(percent) {
-    if (percent >= 90) return 'danger';
-    if (percent >= 75) return 'warn';
+  /** 按占用率挑颜色档；CPU 是突发型的，所以阈值另给。 */
+  function loadPercentTone(percent, warnAt = 75, dangerAt = 90) {
+    if (percent >= dangerAt) return 'danger';
+    if (percent >= warnAt) return 'warn';
     return 'ok';
   }
 
@@ -2327,11 +2330,13 @@
     return svg;
   }
 
-  function setGauge(svg, percent) {
+  function setGauge(svg, percent, tone) {
     if (!svg) return;
     const value = Math.max(0, Math.min(100, Number(percent) || 0));
     const fill = svg.querySelector('.gauge-fill');
     if (fill) fill.setAttribute('stroke-dashoffset', String(GAUGE_CIRCUMFERENCE * (1 - value / 100)));
+    // 颜色也要跟着值走，不然刷新后环的长度变了、颜色还停在首屏那一档。
+    if (tone) svg.setAttribute('class', `gauge ${tone}`);
   }
 
   function meterCard(title, percent, tone, rows) {
