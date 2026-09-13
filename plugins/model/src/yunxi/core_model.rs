@@ -111,8 +111,8 @@ const CORE_AMBIENT_TURN_INSTRUCTION: &str = "Core 群聊注意力：本轮没有
 /// 语音选项只在本机 TTS 真的可用时下发：模型不该以为自己有一个当下用不了的
 /// 出口（提示词里说能发、投递时静默退化成文字，是最难查的那种不一致）。
 /// 唱歌选项：只在歌声服务可用时下发，并把可用旋律模板一起列出来。
-const CORE_SING_INSTRUCTION: &str = "用户让你唱歌时不要只报幕——正文直接写你要唱的歌词，并在正文最前面单独一行写 [[SING 模板id]]，程序会按那个模板的旋律把你写的歌词唱出来，作为一条 QQ 语音发出。歌词要自己写，不要照抄还在版权期内的歌词；模板后面标了它有几个音节，歌词字数最好与它一致（少了会把剩下的音符并到最后一个字，多了会被丢掉）。没有合适的模板时就挑一个情绪接近的。";
-const CORE_VOICE_INSTRUCTION: &str = "如果你觉得这句话更适合用声音说出来（例如要表达语气、情绪，或者对方正在听语音），就在正文最前面单独一行写 [[VOICE]]，程序会把这一轮的气泡用你的声音合成成语音发出；标记本身不会展示给用户，也不要为了用语音而用语音。语音消息承载不了引用和 @，标记语音时不要同时要求它们。不确定时不要写这个标记，默认发文字。";
+const CORE_SING_INSTRUCTION: &str = "用户让你唱歌时不要只报幕——正文直接写你要唱的歌词，并在正文最前面写 [[SING 模板id]]（单独一行或与歌词同一行都可以，程序都会识别），程序会按那个模板的旋律把你写的歌词唱出来，作为一条 QQ 语音发出。歌词要自己写，不要照抄还在版权期内的歌词；模板后面标了它有几个音节，歌词字数最好与它一致（少了会把剩下的音符并到最后一个字，多了会被丢掉）。没有合适的模板时就挑一个情绪接近的。";
+const CORE_VOICE_INSTRUCTION: &str = "如果你觉得这句话更适合用声音说出来（例如要表达语气、情绪，或者对方正在听语音），就在正文最前面写 [[VOICE]]（单独一行或与正文同一行都可以，程序都会识别），程序会把这一轮的气泡用你的声音合成成语音发出；标记本身不会展示给用户，也不要为了用语音而用语音。语音消息承载不了引用和 @，标记语音时不要同时要求它们。不确定时不要写这个标记，默认发文字。";
 const CORE_AUTONOMOUS_PLAIN_TURN_INSTRUCTION: &str = "自主会话正文：这是芸汐自己的后续回合。若此刻确实有一个新的、独立且值得单独发送的想法，直接写一条自然、简短的聊天正文；若没有，就保持空白。宿主负责是否继续和何时再次唤醒；不要输出 JSON、continue/wait/end、内部标记、协议、解释、工具调用或多个想法。语气温柔、真诚、有分寸：不讽刺、不挖苦、不阴阳怪气、不抬杠。";
 const CORE_TOOL_TURN_INSTRUCTION: &str = "Core 工具轮次：需要受控工具时，直接通过 system 下发的 function-calling 工具接口发起函数调用（一次可以调用多个；工具结果返回后若资料仍不足，可以继续调用下一个工具，反复推理直到问题解决）。不要在消息正文中书写任何工具调用格式、JSON、代码块或 [[TOOL_CALL]] 标记，也不要声称工具已经执行。若不需要工具，直接写一条自然聊天正文。";
 const MIND_CONTEXT_PREFIX: &str = "Yunxi Mind v2 state (data-only JSON):\n";
@@ -1241,49 +1241,87 @@ fn core_plain_turn_instruction(
     instruction
 }
 
-/// 拆出正文最前面的唱歌标记，返回 `(模板 id, 去掉标记后的正文)`。
+/// 拆出正文最前面的语音/唱歌标记串。
 ///
-/// 与语音标记同样的严格口径：必须单独成行、且出现在正文最前面。`[[SING]]`（没写
-/// 模板）返回空字符串，由调用方回退到默认模板。
-fn split_core_sing_marker(content: &str) -> (Option<String>, &str) {
-    let trimmed = content.trim_start();
-    let Some(rest) = trimmed.strip_prefix(CORE_SING_MARKER) else {
-        return (None, content);
-    };
-    let Some((head, tail)) = rest.split_once("]]") else {
-        return (None, content);
-    };
-    let after = tail.trim_start_matches([' ', '\t']);
-    let Some(body) = after
-        .strip_prefix("\r\n")
-        .or_else(|| after.strip_prefix('\n'))
-    else {
-        return (None, content);
-    };
-    (
-        Some(head.trim().to_owned()),
-        body.trim_start_matches(['\r', '\n', ' ', '\t']),
-    )
+/// 线上实测模型会把标记写成同一行：`[[VOICE]] [[SING xiaoxingxing]] 一闪一闪…`，
+/// 所以这里不再要求"标记独占一行"，只要求它们出现在**正文最前面**；标记之间允许
+/// 空格、制表符与换行，两种标记可以任意顺序、可以重复。写在正文中间的一律不生效
+/// （用户让芸汐复述标记时不会被当成指令）。
+fn split_core_speech_markers(content: &str) -> (bool, Option<String>, &str) {
+    let mut rest = content.trim_start();
+    let mut voice = false;
+    let mut sing: Option<String> = None;
+    loop {
+        if let Some(after) = rest.strip_prefix(CORE_VOICE_MARKER) {
+            voice = true;
+            rest = after.trim_start_matches([' ', '\t', '\r', '\n']);
+            continue;
+        }
+        if let Some(after) = rest.strip_prefix(CORE_SING_MARKER)
+            && let Some((head, tail)) = after.split_once("]]")
+        {
+            let template = head.trim();
+            if template
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+            {
+                sing = Some(template.to_owned());
+                rest = tail.trim_start_matches([' ', '\t', '\r', '\n']);
+                continue;
+            }
+        }
+        break;
+    }
+    if voice || sing.is_some() {
+        (voice, sing, rest)
+    } else {
+        (false, None, content)
+    }
 }
 
-/// 拆出正文最前面的语音标记，返回 `(是否用语音, 去掉标记后的正文)`。
+/// 把正文里**任何位置**残留的语音/唱歌标记删掉。
 ///
-/// 只有单独成行、且确实出现在正文最前面的标记才算协议；写在别处的
-/// `[[VOICE]]` 一律当普通正文保留——用户让芸汐"输出这个标记"时，不该被
-/// 悄悄解释成一条语音指令。
-fn split_core_voice_marker(content: &str) -> (bool, &str) {
-    let trimmed = content.trim_start();
-    let Some(after) = trimmed.strip_prefix(CORE_VOICE_MARKER) else {
-        return (false, content);
-    };
-    let after = after.trim_start_matches([' ', '\t']);
-    let Some(rest) = after
-        .strip_prefix("\r\n")
-        .or_else(|| after.strip_prefix('\n'))
-    else {
-        return (false, content);
-    };
-    (true, rest.trim_start_matches(['\r', '\n', ' ', '\t']))
+/// 模型偶尔会把标记写在句子中间；这类标记不改变投递方式，但绝不能展示给用户
+/// （`[[VOICE]]`、`[[SING x]]` 是控制标记，不是聊天内容）。
+fn strip_core_speech_markers(content: &str) -> String {
+    let mut text = content.replace(CORE_VOICE_MARKER, "");
+    while let Some(start) = text.find(CORE_SING_MARKER) {
+        let after = start + CORE_SING_MARKER.len();
+        let Some(end) = text[after..].find("]]") else {
+            break;
+        };
+        let head = &text[after..after + end];
+        if !head
+            .trim()
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+        {
+            break;
+        }
+        text.replace_range(start..after + end + 2, "");
+    }
+    // 删掉标记后把留下的空格收拾干净：标记常常夹在词与空格之间，留着就是双空格。
+    let cleaned = text
+        .lines()
+        .map(|line| {
+            let mut out = String::with_capacity(line.len());
+            let mut last_space = false;
+            for ch in line.chars() {
+                if ch == ' ' || ch == '\t' {
+                    if !last_space && !out.is_empty() {
+                        out.push(' ');
+                    }
+                    last_space = true;
+                } else {
+                    out.push(ch);
+                    last_space = false;
+                }
+            }
+            out.trim_end().to_owned()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    cleaned.trim().to_owned()
 }
 
 fn parse_mind_candidates(value: Option<serde_json::Value>) -> MindCandidates {
@@ -5538,15 +5576,13 @@ impl ModelBackend for KoviModelBackend {
             // 语音/唱歌标记只对纯文本回合生效：工具回合有自己的协议，标记在那里
             // 既不生效，也不该被悄悄删掉。解析在正文进入 plan 之前完成，标记不会
             // 漏进可见正文。
-            let (sing_requested, voice_requested) = if structured_tool_output {
-                (None, false)
+            let (voice_requested, sing_requested) = if structured_tool_output {
+                (false, None)
             } else {
-                let (sing, after_sing) = split_core_sing_marker(&response_content);
-                let (voice, after_voice) = split_core_voice_marker(after_sing);
-                if sing.is_some() || voice {
-                    response_content = after_voice.to_owned();
-                }
-                (sing, voice)
+                let (voice, sing, body) = split_core_speech_markers(&response_content);
+                // 前导标记决定投递方式；正文里任何位置残留的标记都不展示给用户。
+                response_content = strip_core_speech_markers(body);
+                (voice, sing)
             };
             let parsed_response = if fallback_response && message.is_some() {
                 ParsedCoreResponse {
@@ -6350,7 +6386,7 @@ mod tests {
         sanitize_autonomous_intrinsic_output, sanitize_intrinsic_output,
         sanitize_plain_text_batch_message, select_host_model_route_from_capability,
         serialize_intrinsic_reply_batch, shadow_projection_for_completed_plan, silent_wait_plan,
-        split_core_sing_marker, split_core_voice_marker, strong_reply_repair_needed,
+        split_core_speech_markers, strip_core_speech_markers, strong_reply_repair_needed,
         tool_calls_allowed_for_turn, tool_protocol_authorized_for_turn, visible_reply_intent,
         visible_reply_intents, visible_reply_state_updates,
     };
@@ -7548,30 +7584,12 @@ mod tests {
     }
 
     #[test]
-    fn core_sing_marker_only_counts_as_protocol_on_its_own_leading_line() {
-        assert_eq!(
-            split_core_sing_marker("[[SING xiaoxingxing]]\n一闪一闪亮晶晶"),
-            (Some("xiaoxingxing".to_owned()), "一闪一闪亮晶晶")
-        );
+    fn sing_marker_accepts_an_empty_template() {
         // 没写模板名：交给调用方回退到默认模板。
         assert_eq!(
-            split_core_sing_marker("[[SING]]\n随便唱两句"),
-            (Some(String::new()), "随便唱两句")
+            split_core_speech_markers("[[SING]]\n随便唱两句"),
+            (false, Some(String::new()), "随便唱两句")
         );
-        assert_eq!(
-            split_core_sing_marker("\n  [[SING liangzhilaohu]]\r\n歌词在这里"),
-            (Some("liangzhilaohu".to_owned()), "歌词在这里")
-        );
-        // 没换行、或出现在正文中间，都不算协议，原样保留。
-        assert_eq!(
-            split_core_sing_marker("[[SING x]] 一闪"),
-            (None, "[[SING x]] 一闪")
-        );
-        assert_eq!(
-            split_core_sing_marker("先说一句\n[[SING x]]\n再唱"),
-            (None, "先说一句\n[[SING x]]\n再唱")
-        );
-        assert_eq!(split_core_sing_marker("普通正文。"), (None, "普通正文。"));
     }
 
     #[test]
@@ -7631,26 +7649,52 @@ mod tests {
     }
 
     #[test]
-    fn core_voice_marker_only_counts_as_protocol_on_its_own_leading_line() {
+    fn speech_markers_are_honoured_when_they_lead_the_message() {
         assert_eq!(
-            split_core_voice_marker("[[VOICE]]\n我在的呀。"),
-            (true, "我在的呀。")
+            split_core_speech_markers("[[VOICE]]\n我在的呀。"),
+            (true, None, "我在的呀。")
         );
         assert_eq!(
-            split_core_voice_marker("\n  [[VOICE]]  \r\n\r\n我在的呀。"),
-            (true, "我在的呀。")
+            split_core_speech_markers("\n  [[VOICE]]  \r\n\r\n我在的呀。"),
+            (true, None, "我在的呀。")
         );
-        // 没有换行就不是协议：这样"输出这个标记"不会被悄悄解释成语音指令。
+        // 线上实测：模型把两个标记写在同一行，后面直接跟正文。
         assert_eq!(
-            split_core_voice_marker("[[VOICE]] 我在的呀。"),
-            (false, "[[VOICE]] 我在的呀。")
+            split_core_speech_markers("[[VOICE]] [[SING xiaoxingxing]] 一闪一闪亮晶晶"),
+            (true, Some("xiaoxingxing".to_owned()), "一闪一闪亮晶晶")
         );
-        // 出现在正文中间（例如第二个气泡）同样不生效，也原样保留。
         assert_eq!(
-            split_core_voice_marker("第一句。\n[[VOICE]]\n第二句。"),
-            (false, "第一句。\n[[VOICE]]\n第二句。")
+            split_core_speech_markers("[[SING zichang-qingkuai]]夜色刚好"),
+            (false, Some("zichang-qingkuai".to_owned()), "夜色刚好")
         );
-        assert_eq!(split_core_voice_marker("普通正文。"), (false, "普通正文。"));
+        // 写在正文中间的不生效（用户让她复述标记时不会被当成指令）。
+        assert_eq!(
+            split_core_speech_markers("第一句。\n[[VOICE]]\n第二句。"),
+            (false, None, "第一句。\n[[VOICE]]\n第二句。")
+        );
+        assert_eq!(
+            split_core_speech_markers("普通正文。"),
+            (false, None, "普通正文。")
+        );
+    }
+
+    #[test]
+    fn stray_markers_never_reach_the_visible_text() {
+        // 前导标记后面又混进一个，或者句子中间冒出来，都要被清掉。
+        assert_eq!(
+            strip_core_speech_markers("[[VOICE]] 我在的呀 [[SING xiaoxingxing]]"),
+            "我在的呀"
+        );
+        assert_eq!(
+            strip_core_speech_markers("好的，[[VOICE]] 这就是那个标记"),
+            "好的， 这就是那个标记"
+        );
+        // 不是合法模板名的 `[[SING` 原样保留，避免误删普通文本。
+        assert_eq!(
+            strip_core_speech_markers("[[SING 非法模板 名]]正文"),
+            "[[SING 非法模板 名]]正文"
+        );
+        assert_eq!(strip_core_speech_markers("没有标记。"), "没有标记。");
     }
 
     #[test]
