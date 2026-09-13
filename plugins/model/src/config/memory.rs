@@ -80,6 +80,27 @@ pub struct MemoryConfig {
     /// 这个开关记的是"她判断值得留下的东西"——用户说出的偏好、身份细节、约定。
     /// 关掉只是不再提供这个工具，机械留档不受影响。
     model_memory_enabled: bool,
+    /// 是否把"读过但没回"的回合也写进长期记忆（默认开）。
+    ///
+    /// Core 路的长期记忆是"投递成功才写"：被抽样进语义评估、最后判沉默的回合
+    /// 什么都不留——她**读过了**（模型判定、短期上下文里也有），一小时后却像从没
+    /// 发生过；反倒是没被抽样的噪声会被 Host 那条观察流留档。打开这个开关，沉默
+    /// 回合也留一条入站行（不含回复行），语义上就是"她看到过"。
+    ///
+    /// 与 [`Self::core_writeback_enabled`] 的关系：那个开关决定"写不写"，这个决定
+    /// "沉默回合算不算数"，关掉即回到旧行为（只写投递成功的回合）。
+    silent_turn_writeback_enabled: bool,
+    /// 沉默回合落档的重要度（0..=100，默认 15）。
+    ///
+    /// 故意压得比对话行低：召回是查询驱动的，低重要度让它们只在语义/字面命中
+    /// 时才浮上来，不与真实对话抢 `contextual_memory_limit` 的位置。
+    silent_turn_importance: u8,
+    /// 同一会话每小时最多落档多少条沉默回合（默认 20）。
+    ///
+    /// 护栏针对的是"接续窗口内确定性放行"——热闹的群可以在一小时内让大量未点名
+    /// 消息进入语义评估。超限只留日志，不落档：宁可丢冷场噪声，也不让观察流把
+    /// 召回池冲淡。
+    silent_turn_hourly_limit: usize,
 }
 
 impl MemoryConfig {
@@ -157,6 +178,18 @@ impl MemoryConfig {
 
     pub fn model_memory_enabled(&self) -> bool {
         self.model_memory_enabled
+    }
+
+    pub fn silent_turn_writeback_enabled(&self) -> bool {
+        self.silent_turn_writeback_enabled
+    }
+
+    pub fn silent_turn_importance(&self) -> u8 {
+        self.silent_turn_importance
+    }
+
+    pub fn silent_turn_hourly_limit(&self) -> usize {
+        self.silent_turn_hourly_limit
     }
 
     pub fn runtime_history_ttl_secs(&self) -> u64 {
@@ -284,6 +317,16 @@ impl MemoryConfig {
                 "memory.autonomous_query_max_days 必须大于 0"
             ));
         }
+        if self.silent_turn_importance > 100 {
+            return Err(anyhow::anyhow!(
+                "memory.silent_turn_importance 必须在 0 到 100 之间"
+            ));
+        }
+        if self.silent_turn_hourly_limit == 0 || self.silent_turn_hourly_limit > 1_000 {
+            return Err(anyhow::anyhow!(
+                "memory.silent_turn_hourly_limit 必须在 1 到 1000 之间"
+            ));
+        }
         Ok(())
     }
 }
@@ -321,6 +364,9 @@ impl Default for MemoryConfig {
             autonomous_query_max_days: 3_650,
             core_writeback_enabled: true,
             model_memory_enabled: true,
+            silent_turn_writeback_enabled: true,
+            silent_turn_importance: 15,
+            silent_turn_hourly_limit: 20,
         }
     }
 }

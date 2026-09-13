@@ -14,10 +14,17 @@
 //! - **只有入站过的回合才写**：入站行在 ingress 暂存，投递时取用。主动消息
 //!   （autonomous tick）没有入站行，本轮不写——那是缺口，不是遗漏；
 //! - **写失败绝不影响回复**：只 WARN，丢这一条。
+//!
+//! 2026-09-14 补的那条（`silent_turn_writeback_enabled`）：上面第一条只管"她回了"
+//! 的回合，于是**读过但判沉默**的回合连痕迹都没有——短期上下文里她明明读过
+//! （`conversation.recent_events`），一小时后却像从没发生过；而没被抽样进 Core 的
+//! 噪声反倒被 Host 的观察流留了档。现在沉默回合也落一条**入站行**（没有回复行），
+//! 重要度低一档，并吃每会话每小时的护栏。
 
 use chrono::{DateTime, Local, Utc};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use yunxi_core::{
     EventId, IdentityStore, MAX_MEMORY_CONTENT_BYTES, MAX_MEMORY_CONTENT_CHARS, MemoryDraft,
     MemoryKind, MemoryScope, MemoryStore,
@@ -34,6 +41,16 @@ const MAX_PENDING_TURNS: usize = 256;
 /// legacy 投影会换算成 `ceil(v2/10)` = 4，与历史 `group_chat` 语料的平均 5.5 同量级；
 /// 低于保护阈值 70，所以它会随 `memory.retention_days`（默认 30 天）自然老去。
 const WRITEBACK_IMPORTANCE: u8 = 40;
+
+/// 沉默回合落档时打的标签，方便日后按标签统计或清理这一批。
+pub(crate) const SILENT_TURN_TAG: &str = "silent_turn";
+
+/// 沉默回合护栏的统计窗口：一小时。
+const SILENT_TURN_WINDOW_SECS: u64 = 3_600;
+
+/// 护栏状态最多记多少个会话；超过就整体清空（宁可多放行一个窗口，也不让
+/// 进程内状态无界增长）。
+const MAX_SILENT_TURN_SCOPES: usize = 1_024;
 
 /// 单条正文（入站与回复各自）的字符上限。
 ///
@@ -60,12 +77,15 @@ struct PendingTurns {
 /// Core 回合的入站暂存 + 落库。
 pub(crate) struct MemoryWriteback {
     pending: Mutex<PendingTurns>,
+    /// 沉默回合落档的每小时名额（按会话/人计），窗口是滑动的。
+    silent_turns: Mutex<HashMap<MemoryScope, VecDeque<Instant>>>,
 }
 
 impl MemoryWriteback {
     fn new() -> Self {
         Self {
             pending: Mutex::new(PendingTurns::default()),
+            silent_turns: Mutex::new(HashMap::new()),
         }
     }
 
@@ -115,14 +135,7 @@ impl MemoryWriteback {
         if !crate::config::get().memory().core_writeback_enabled() {
             return;
         }
-        let turn = {
-            let Ok(mut pending) = self.pending.lock() else {
-                kovi::log::warn!("Yunxi memory writeback stash is poisoned; skipping turn");
-                return;
-            };
-            pending.entries.remove(&event_id)
-        };
-        let Some(turn) = turn else {
+        let Some(turn) = self.take_pending(event_id) else {
             return;
         };
         let Some(store) = super::memory_store() else {
@@ -142,6 +155,7 @@ impl MemoryWriteback {
                 MemoryKind::Conversation,
                 WRITEBACK_IMPORTANCE,
                 occurred_at,
+                &[],
             )
             .await
             {
@@ -152,6 +166,96 @@ impl MemoryWriteback {
                 ),
             }
         }
+    }
+
+    /// 回合结束了，但什么都没发出去：把入站行按"她读到过"落档。
+    ///
+    /// 与 [`Self::record_delivered_turn`] 的差别只有三条：没有回复行（她确实没说
+    /// 过话，不能写进"她参与过的对话"）、重要度低一档（不与真实对话抢召回）、
+    /// 吃每会话每小时的护栏（热闹的群不该把召回池冲淡）。没有暂存就是空操作，
+    /// 所以主动消息天然不受影响。
+    pub(crate) async fn record_silent_turn(&self, event_id: EventId) {
+        // 先取再判开关：入口已经关闭时暂存里不会有新条目，而已有的条目不该
+        // 因为开关被关掉就永远留在暂存里等淘汰。
+        let Some(turn) = self.take_pending(event_id) else {
+            return;
+        };
+        // `config::get()` 返回临时 Arc，先绑成局部变量再借用它的一节。
+        let config = crate::config::get();
+        let memory = config.memory();
+        if !memory.core_writeback_enabled() || !memory.silent_turn_writeback_enabled() {
+            return;
+        }
+        let limit = memory.silent_turn_hourly_limit();
+        let Some(store) = super::memory_store() else {
+            kovi::log::warn!("Yunxi silent turn memory skipped: memory store is unavailable");
+            return;
+        };
+        // 名额在真的准备写之前才申领：存储不可用不该白白吃掉这一小时的额度。
+        if !self.claim_silent_turn_slot(turn.scope, limit) {
+            kovi::log::info!(
+                "Yunxi silent turn memory skipped: event_id={event_id} scope={:?} reason=hourly_limit limit={limit}",
+                turn.scope
+            );
+            return;
+        }
+        let importance = memory.silent_turn_importance();
+        match write_memory(
+            store.as_ref(),
+            turn.scope,
+            &turn.line,
+            MemoryKind::Conversation,
+            importance,
+            turn.occurred_at,
+            &[SILENT_TURN_TAG],
+        )
+        .await
+        {
+            Ok(()) => kovi::log::info!(
+                "Yunxi silent turn memory recorded: event_id={event_id} scope={:?} importance={importance}",
+                turn.scope
+            ),
+            Err(error) => kovi::log::warn!(
+                "Yunxi silent turn memory failed: event_id={event_id} scope={:?} error={error}",
+                turn.scope
+            ),
+        }
+    }
+
+    /// 取走这一轮的入站暂存（投递与沉默两条收尾路径共用）。
+    fn take_pending(&self, event_id: EventId) -> Option<PendingTurn> {
+        let Ok(mut pending) = self.pending.lock() else {
+            kovi::log::warn!("Yunxi memory writeback stash is poisoned; skipping turn");
+            return None;
+        };
+        pending.entries.remove(&event_id)
+    }
+
+    /// 申领一条"沉默回合落档"名额：同一会话每小时最多 `limit` 条。
+    ///
+    /// 检查与记账在同一把锁里完成，避免并发下超发。锁中毒时返回 `false`：记忆是
+    /// 尽力而为，这条路径不该把回合拖垮。
+    fn claim_silent_turn_slot(&self, scope: MemoryScope, limit: usize) -> bool {
+        let Ok(mut grants) = self.silent_turns.lock() else {
+            return false;
+        };
+        if grants.len() > MAX_SILENT_TURN_SCOPES {
+            grants.clear();
+        }
+        let now = Instant::now();
+        let window = Duration::from_secs(SILENT_TURN_WINDOW_SECS);
+        let seen = grants.entry(scope).or_default();
+        while seen
+            .front()
+            .is_some_and(|at| now.saturating_duration_since(*at) >= window)
+        {
+            seen.pop_front();
+        }
+        if seen.len() >= limit {
+            return false;
+        }
+        seen.push_back(now);
+        true
     }
 
     /// 暂存条数（诊断与测试用）。
@@ -250,6 +354,7 @@ async fn write_memory(
     kind: MemoryKind,
     importance: u8,
     occurred_at: DateTime<Utc>,
+    tags: &[&str],
 ) -> Result<(), yunxi_core::MemoryStoreError> {
     // 渲染后的正文（含 JSON 结构）也必须落在记忆的限额内，否则 `MemoryDraft::new`
     // 会整条拒绝——那样丢的是一条记忆，而不是被截断的正文。这里宁可显式跳过并留痕。
@@ -266,6 +371,7 @@ async fn write_memory(
     }
     let draft = MemoryDraft::new(scope, kind, content, occurred_at)
         .and_then(|draft| draft.with_importance(importance))
+        .and_then(|draft| draft.with_tags(tags.iter().copied()))
         .map_err(|error| yunxi_core::MemoryStoreError::InvalidRequest {
             reason: error.to_string(),
         })?;
@@ -354,6 +460,7 @@ pub(crate) async fn remember_model_memory(
         request.kind,
         request.importance,
         Utc::now(),
+        &[],
     )
     .await
     .map_err(|error| format!("写入失败: {error}"))?;
@@ -507,6 +614,56 @@ mod tests {
         assert!(
             !pending.entries.contains_key(&oldest),
             "最早的一条应该先被淘汰"
+        );
+    }
+
+    #[test]
+    fn taking_a_pending_turn_consumes_it_exactly_once() {
+        // 投递与沉默是两条互斥的收尾路径，谁先取到谁写；取过之后不能再被另一条
+        // 路径取一次，否则同一轮会被写两遍。
+        let writeback = MemoryWriteback::new();
+        let event_id = EventId::new();
+        writeback.stash_inbound(event_id, MemoryScope::Global, "行".to_string(), Utc::now());
+        assert!(writeback.take_pending(event_id).is_some());
+        assert!(writeback.take_pending(event_id).is_none());
+    }
+
+    #[test]
+    fn silent_turn_slots_are_capped_per_scope() {
+        // 护栏按作用域计：同一群第 limit+1 条不再落档，另一个群不受影响。
+        let writeback = MemoryWriteback::new();
+        let group = MemoryScope::Conversation(yunxi_core::ConversationId::new());
+        let other = MemoryScope::Conversation(yunxi_core::ConversationId::new());
+        assert!(writeback.claim_silent_turn_slot(group, 2));
+        assert!(writeback.claim_silent_turn_slot(group, 2));
+        assert!(
+            !writeback.claim_silent_turn_slot(group, 2),
+            "同一会话超过上限后不该再放行"
+        );
+        assert!(
+            writeback.claim_silent_turn_slot(other, 2),
+            "护栏是每会话的，别的会话不该被连坐"
+        );
+    }
+
+    #[test]
+    fn expired_silent_turn_slots_are_recycled() {
+        // 窗口是滑动的：一小时前的名额不该继续占着。
+        let writeback = MemoryWriteback::new();
+        let group = MemoryScope::Conversation(yunxi_core::ConversationId::new());
+        let expired = Instant::now()
+            .checked_sub(Duration::from_secs(SILENT_TURN_WINDOW_SECS + 60))
+            .expect("测试时钟应能回退");
+        writeback
+            .silent_turns
+            .lock()
+            .expect("锁可用")
+            .entry(group)
+            .or_default()
+            .push_back(expired);
+        assert!(
+            writeback.claim_silent_turn_slot(group, 1),
+            "过期的名额应该被回收后重新可用"
         );
     }
 

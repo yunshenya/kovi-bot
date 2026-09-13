@@ -45,7 +45,8 @@ V1**（`model/utils.rs` 的 `MEMORY_REPOSITORY`，写 `kovi_bot_memories`）。C
   保持"她参与过的对话"这个语义，与旧 `group_chat` 完全一致。
 - **不写未回复的观察流**：`group_observation` 继续由 Host 那条分支写（今天的量：主群 579 条）。
   它们读不到不是本轮要解决的问题，硬塞进召回只会让上下文变吵（文档自己写着"她的记忆语料
-  大多是短群聊噪音"）。
+  大多是短群聊噪音"）。**2026-09-14 晚修订**：Core 路自己判沉默的回合补写一条低重要度的
+  入站行——它不是这条观察流，理由与取值见文末「第 4 步」。
 - **主动消息（autonomous tick）本轮不写**：它没有"入站行"，语义上不是"她回的"。
   V1 时代它写的是 `proactive_group_chat` / `proactive_private_*` 语料（全库目前只有 5 条），
   量极小；补它要额外解析私聊会话 → person，留作下一步。
@@ -151,3 +152,36 @@ V1**（`model/utils.rs` 的 `MEMORY_REPOSITORY`，写 `kovi_bot_memories`）。C
 2. **重要度固定 40**（而非跟随 V1 的长度规则 2~5）：召回排序上与新语料同量级，且规则简单可解释。
 3. **开关默认 `true`**，随下次发布生效：写入是纯增量、可随时关、可按时间删；先观察再开会让
    "数据继续丢"多持续一轮发布。
+
+## 第 4 步：沉默回合也算"她读过"（2026-09-14 晚）
+
+**触发**。按"她没回就不写"上线后回查：一条未点名消息被抽样进 Core、模型判完
+`baseline=Silent reasons=[LowSocialValue]`，读也读了、判也判了，长期记忆里却什么都没有；
+而同一时间**没被抽样**的噪声，Host 那条观察流反倒留了档。方向是反的：花了模型成本的那批
+消失，没花成本的留着。
+
+**边界（先纠正一个更早的说法）**。短期她并不瞎：Core 的群聊上下文来自运行时
+`conversation.recent_events`（含所有 `MessageReceived`，TTL 1 小时）。断的是**长期**——
+一小时后那些消息对她等于没发生过。
+
+**取值**（三个都是 `[memory]` 下的开关）：
+
+| 键 | 默认 | 理由 |
+|---|---|---|
+| `silent_turn_writeback_enabled` | `true` | 这是记忆完整性问题，不改任何行为判定；关掉即回到"只写投递成功的回合" |
+| `silent_turn_importance` | `15` | legacy 投影 = 2，明显低于对话行的 4；召回是查询驱动的，低重要度让它们只在命中时浮上来，不与真实对话抢 `contextual_memory_limit` 的位置 |
+| `silent_turn_hourly_limit` | `20` | 护栏针对"接续窗口内确定性放行"：热闹的群能在一小时里让大量未点名消息进入语义评估。超限只打日志、不落档 |
+
+**实现**。落点仍是 `memory_writeback`：入站行在 ingress 暂存，回合收尾时取用——
+投递成功走 `record_delivered_turn`（写「对方说的 + 她回的」），什么都没发出去则走
+`record_silent_turn`（只写入站行，带 `silent_turn` 标签）。两条路径互斥地 `take_pending`，
+同一轮不会被写两遍；主动消息没有暂存行，天然不受影响。
+
+**实测增量**（发布前 24 小时，5 个群）：群消息 899 → 走 Host 744 / 走 Core 155，其中没有投递的
+75 条（按回合合并约 **70 条/天**）。作为对照，同期落库 `group_observation` 392 条/天、
+`group_chat` 57 条/天。
+
+**验证口径**：发布后 `journalctl -u kovi-bot | grep "silent turn memory"` 应能看到
+`recorded`（含 `importance=15`）与超限时的 `skipped ... reason=hourly_limit`；
+`kovi_bot_memories` 里应出现 `context='group_chat'`、`importance=2` 的新行。
+

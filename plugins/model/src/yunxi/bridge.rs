@@ -3413,15 +3413,20 @@ async fn run_runtime(
                     // 长期记忆：这一轮真的发出去了，就把「对方说的 + 她回的」写进
                     // Memory v2（适配器会同步回旧表）。主动消息没有入站行，因此这里
                     // 是空操作——那是已知缺口，见 docs/yunxi-memory-v2-writeback.md。
-                    if !delivered_replies.is_empty()
-                        && let Some(writeback) = super::memory_writeback::writeback()
-                    {
-                        writeback
-                            .record_delivered_turn(
-                                observation.event_id,
-                                &delivered_replies.join("\n"),
-                            )
-                            .await;
+                    if let Some(writeback) = super::memory_writeback::writeback() {
+                        if !delivered_replies.is_empty() {
+                            writeback
+                                .record_delivered_turn(
+                                    observation.event_id,
+                                    &delivered_replies.join("\n"),
+                                )
+                                .await;
+                        } else {
+                            // 什么都没发出去：她读过、判了沉默的回合也留一条入站行，
+                            // 否则"读过的"一小时后消失，"没被抽样的噪声"反倒留着。
+                            // 开关与每会话护栏都在 writeback 里，这里是空操作兜底。
+                            writeback.record_silent_turn(observation.event_id).await;
+                        }
                     }
                     if autonomous_tick
                         && let Some(conversation_id) = observation.scope.conversation_id()
