@@ -450,6 +450,15 @@ pub fn get() -> ModelConfig {
     ModelConfig::get_current().expect("Failed to get current config")
 }
 
+/// 只读一个布尔开关：调用方（提示词组装、投递）只需要问「能不能发语音」，
+/// 不该为这一个 bit 克隆整份配置。配置未就绪时返回 false。
+pub fn qq_voice_enabled() -> bool {
+    MODEL_CONFIG
+        .read()
+        .map(|config| config.qq_voice().enabled())
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::ModelConfig;

@@ -548,14 +548,15 @@ impl QqActionAdapter {
             QqDestination::Private(_) => None,
         };
         let text = content.as_text();
-        let message = if let Some(reply_to) = external_reply_to {
-            Message::from(vec![
-                Segment::new("reply", json!({"id": reply_to})),
-                Segment::new("text", json!({"text": text})),
-            ])
-        } else {
-            text.to_owned().into()
-        };
+        // Core 标记了语音就交给本机 TTS 合成一条 QQ 语音；配置、合成或落盘任何
+        // 一步不成立都退回文字——语音只是表达方式，不该把这条回复弄丢。
+        let voice_message = voice_message_for(content, crate::config::get().qq_voice()).await;
+        if content.is_voice() && voice_message.is_none() {
+            kovi::log::warn!(
+                "语音消息不可用，本轮已回退成文字: conversation_id={expected_conversation_id}"
+            );
+        }
+        let message = outbound_message(text, external_reply_to, voice_message);
         let fingerprint_content =
             serde_json::to_string(content).unwrap_or_else(|_| content.as_text().to_owned());
         let fingerprint = contextual_outgoing_fingerprint(
@@ -1331,6 +1332,36 @@ async fn release_prepared_action(content: &MessageContent, key: &str) {
     crate::yunxi::discard_mind_outgoing_fence(key);
 }
 
+/// Core 把这一轮标记成语音时，尝试合成一条可直接发送的 QQ 语音消息。
+///
+/// 返回 `None` 表示这一轮没有可发的语音（没标记、配置关闭、合成或落盘失败），
+/// 调用方应当按文字发送——语音只是表达方式，不该把回复弄丢。
+async fn voice_message_for(
+    content: &MessageContent,
+    voice_config: &crate::config::QqVoiceConfig,
+) -> Option<Message> {
+    if !content.is_voice() {
+        return None;
+    }
+    crate::voice_reply::build_voice_message(voice_config, content.as_text()).await
+}
+
+/// 组装要发给 QQ 的那条消息：语音优先，合成成功时整条消息只有 `record` 段
+/// （语音消息承载不了引用）；否则退回文字，引用照旧挂在第一条上。
+fn outbound_message(text: &str, reply_to: Option<i64>, voice: Option<Message>) -> Message {
+    if let Some(voice) = voice {
+        return voice;
+    }
+    if let Some(reply_to) = reply_to {
+        Message::from(vec![
+            Segment::new("reply", json!({"id": reply_to})),
+            Segment::new("text", json!({"text": text})),
+        ])
+    } else {
+        text.to_owned().into()
+    }
+}
+
 fn store_action_error(error: impl std::fmt::Display) -> ActionPortError {
     ActionPortError::new(format!("core_store_failed:{error}"), true)
 }
@@ -1548,14 +1579,181 @@ mod tests {
     use super::{
         QqDestination, ReachOutDeliveryOutcome, compatibility_reach_out_outcome,
         delivery_authorization_allows, delivery_route_is_unchanged, durable_commit_error,
-        parse_qq_destination, recorded_delivery_outcome, single_positive_qq_id,
+        outbound_message, parse_qq_destination, recorded_delivery_outcome, single_positive_qq_id,
+        voice_message_for,
     };
     use crate::model::TrackedSendError;
     use crate::yunxi::delivery_ledger::{DeliveryCommitError, DeliveryStatus};
-    use yunxi_core::{ActionPortOutcome, ConversationId, ConversationKind};
+    use kovi::Message;
+    use kovi::bot::message::Segment;
+    use kovi::serde_json::json;
+    use yunxi_core::{ActionPortOutcome, ConversationId, ConversationKind, MessageContent};
 
     fn ids(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    /// 一份可用的 `[qq_voice]`：暂存目录指向本测试独占的临时目录。
+    fn voice_config(
+        staging_dir: &str,
+        tts_url: &str,
+        enabled: bool,
+    ) -> crate::config::QqVoiceConfig {
+        serde_json::from_value(serde_json::json!({
+            "enabled": enabled,
+            "tts_url": tts_url,
+            "tts_timeout_secs": 5,
+            "sample_rate": 16_000,
+            "max_chars": 80,
+            "staging_dir": staging_dir,
+            "napcat_staging_dir": "/app/qq-call/voice",
+            "keep_files": 8,
+        }))
+        .expect("qq_voice test config")
+    }
+
+    fn staging_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("kovi-voice-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// 只回一句固定 PCM 的假 TTS：验证的是"合成结果怎么变成 QQ 消息"，
+    /// 不是模型推理本身。
+    async fn spawn_stub_tts(pcm: Vec<u8>) -> String {
+        let listener = kovi::tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stub tts");
+        let addr = listener.local_addr().expect("stub tts address");
+        kovi::tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                use kovi::tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buffer = [0_u8; 4096];
+                let _ = socket.read(&mut buffer).await;
+                let mut response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: audio/L16\r\nX-Sample-Rate: 16000\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    pcm.len()
+                )
+                .into_bytes();
+                response.extend_from_slice(&pcm);
+                let _ = socket.write_all(&response).await;
+                let _ = socket.flush().await;
+            }
+        });
+        format!("http://127.0.0.1:{}/v1/tts", addr.port())
+    }
+
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("tokio runtime")
+            .block_on(future)
+    }
+
+    /// 假 TTS 与调用方必须在同一个 runtime 里：runtime 一丢，后台 accept 任务
+    /// 也会跟着消失。
+    fn block_on_with_stub_tts<F, Fut>(pcm: Vec<u8>, body: F) -> Fut::Output
+    where
+        F: FnOnce(String) -> Fut,
+        Fut: std::future::Future,
+    {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("tokio runtime")
+            .block_on(async move { body(spawn_stub_tts(pcm).await).await })
+    }
+
+    #[test]
+    fn voice_delivery_replaces_text_and_the_reply_segment() {
+        let voice = Message::from(vec![Segment::new(
+            "record",
+            json!({"file": "file:///app/qq-call/voice/voice-1.wav"}),
+        )]);
+        // 合成成功：整条消息只有 record 段，引用被丢掉（语音承载不了引用）。
+        let spoken = outbound_message("我在的呀。", Some(42), Some(voice.clone()));
+        assert_eq!(spoken, voice);
+        assert_eq!(spoken.to_human_string().matches("[record]").count(), 1);
+
+        // 没有语音可用：文字与引用都保持原样。
+        let quoted = outbound_message("我在的呀。", Some(42), None);
+        assert!(quoted.to_human_string().contains("[reply]"));
+        assert!(quoted.to_human_string().contains("我在的呀。"));
+        let plain = outbound_message("我在的呀。", None, None);
+        assert_eq!(plain.to_human_string(), "我在的呀。");
+    }
+
+    #[test]
+    fn voice_is_only_attempted_for_content_that_asked_for_it() {
+        let dir = staging_dir("hint");
+        let config = voice_config(
+            &dir.display().to_string(),
+            "http://127.0.0.1:1/v1/tts",
+            true,
+        );
+        // 没标记语音的回复连合成请求都不会发（地址是死端口，发了就会超时）。
+        let typed = MessageContent::text("普通文字。");
+        assert!(block_on(voice_message_for(&typed, &config)).is_none());
+    }
+
+    #[test]
+    fn disabled_or_failing_tts_falls_back_to_text() {
+        let dir = staging_dir("fallback");
+        let staged = dir.display().to_string();
+        let spoken = MessageContent::voice("我在的呀。");
+
+        // 配置关闭：不发请求，调用方按文字发送。
+        let disabled = voice_config(&staged, "http://127.0.0.1:1/v1/tts", false);
+        assert!(block_on(voice_message_for(&spoken, &disabled)).is_none());
+
+        // 语音服务不可达：同样回退，而且不留下半成品消息。
+        let unreachable = voice_config(&staged, "http://127.0.0.1:1/v1/tts", true);
+        assert!(block_on(voice_message_for(&spoken, &unreachable)).is_none());
+    }
+
+    #[test]
+    fn synthesized_voice_becomes_a_record_segment_on_the_napcat_path() {
+        let dir = staging_dir("synth");
+        let staged = dir.display().to_string();
+        let pcm = vec![7_u8; 3_200];
+
+        let message = block_on_with_stub_tts(pcm.clone(), |url| {
+            let staged = staged.clone();
+            async move {
+                let config = voice_config(&staged, &url, true);
+                voice_message_for(&MessageContent::voice("我在的呀。"), &config)
+                    .await
+                    .expect("stub TTS should produce a voice message")
+            }
+        });
+        let human = message.to_human_string();
+        assert!(human.contains("[record]"), "unexpected message: {human}");
+        let segments = message.iter().collect::<Vec<_>>();
+        assert_eq!(segments.len(), 1, "语音消息不该带引用或文字段");
+        assert_eq!(segments[0].type_, "record");
+        let file = segments[0].data["file"]
+            .as_str()
+            .expect("record segment carries a file");
+        // NapCat 侧路径来自 napcat_staging_dir，而不是机器人本机路径。
+        assert!(
+            file.starts_with("file:///app/qq-call/voice/voice-") && file.ends_with(".wav"),
+            "unexpected record file: {file}"
+        );
+        assert!(
+            !file.contains(&staged),
+            "napcat path must not leak the host path"
+        );
+
+        // 音频真的落盘了，而且是可读的 WAV（RIFF 头 + 我们给的 PCM）。
+        let written = std::fs::read_dir(&dir)
+            .expect("staging dir")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .collect::<Vec<_>>();
+        assert_eq!(written.len(), 1, "one turn writes one voice file");
+        let bytes = std::fs::read(&written[0]).expect("staged wav");
+        assert_eq!(&bytes[..4], b"RIFF");
+        assert_eq!(&bytes[8..12], b"WAVE");
+        assert!(bytes.ends_with(&pcm), "pcm payload should be preserved");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

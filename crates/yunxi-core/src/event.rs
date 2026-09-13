@@ -246,12 +246,25 @@ impl<'de> Deserialize<'de> for Attachment {
     }
 }
 
+/// Keeps the optional delivery hint out of serialized content when unset, so
+/// payloads written before the hint existed round-trip unchanged.
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct MessageContent {
     text: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     attachments: Vec<Attachment>,
+    /// Delivery hint: this content should be spoken rather than typed.
+    ///
+    /// The core owns *what* is said, the host owns *how* it reaches the
+    /// platform. A host without a voice channel simply ignores the hint and
+    /// sends `text`, so the flag stays optional and backwards compatible.
+    #[serde(default, skip_serializing_if = "is_false")]
+    voice: bool,
 }
 
 impl Default for MessageContent {
@@ -266,12 +279,30 @@ impl MessageContent {
         Self {
             text: value.into(),
             attachments: Vec::new(),
+            voice: false,
+        }
+    }
+
+    /// Same as [`Self::text`], but asks the host to speak it instead of typing
+    /// it. Hosts without a voice channel fall back to sending the text.
+    #[must_use]
+    pub fn voice(value: impl Into<String>) -> Self {
+        Self {
+            text: value.into(),
+            attachments: Vec::new(),
+            voice: true,
         }
     }
 
     #[must_use]
     pub fn as_text(&self) -> &str {
         &self.text
+    }
+
+    /// Whether this content should be delivered as speech when the host can.
+    #[must_use]
+    pub fn is_voice(&self) -> bool {
+        self.voice
     }
 
     pub fn with_attachments(
@@ -334,12 +365,16 @@ impl<'de> Deserialize<'de> for MessageContent {
             text: String,
             #[serde(default)]
             attachments: Vec<Attachment>,
+            #[serde(default)]
+            voice: bool,
         }
 
         let wire = Wire::deserialize(deserializer)?;
-        MessageContent::text(wire.text)
+        let mut content = MessageContent::text(wire.text)
             .with_attachments(wire.attachments)
-            .map_err(serde::de::Error::custom)
+            .map_err(serde::de::Error::custom)?;
+        content.voice = wire.voice;
+        Ok(content)
     }
 }
 
@@ -1805,6 +1840,40 @@ mod tests {
         assert_eq!(
             serde_json::to_value(MessageContent::text("legacy")).expect("serialize content"),
             serde_json::json!({"text": "legacy"})
+        );
+    }
+
+    #[test]
+    fn voice_content_is_an_optional_delivery_hint() {
+        // Typed content stays byte-identical to the pre-hint payload.
+        assert_eq!(
+            serde_json::to_value(MessageContent::text("你好")).expect("serialize content"),
+            serde_json::json!({"text": "你好"})
+        );
+
+        let spoken = MessageContent::voice("你好");
+        assert!(spoken.is_voice());
+        assert_eq!(spoken.as_text(), "你好");
+        assert_eq!(
+            serde_json::to_value(&spoken).expect("serialize content"),
+            serde_json::json!({"text": "你好", "voice": true})
+        );
+        assert_eq!(
+            serde_json::from_value::<MessageContent>(
+                serde_json::json!({"text": "你好", "voice": true})
+            )
+            .expect("deserialize spoken content"),
+            spoken
+        );
+
+        // A host that predates the hint neither sends nor requires it.
+        let legacy: MessageContent =
+            serde_json::from_str(r#"{"text":"legacy"}"#).expect("legacy content without the hint");
+        assert!(!legacy.is_voice());
+        assert_eq!(
+            MessageContent::default(),
+            MessageContent::text(""),
+            "the default stays typed content"
         );
     }
 
