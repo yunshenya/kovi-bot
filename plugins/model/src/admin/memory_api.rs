@@ -30,6 +30,12 @@ const MAX_LIMIT: i64 = 200;
 const DEFAULT_LIMIT: i64 = 40;
 /// 合并多种类型时，每种类型最多先取多少条参与归并排序。
 const PER_KIND_FETCH: i64 = 200;
+/// 旧版长期记忆在 `KINDS` 里的键。它和其它类型的作用域语义不同（QQ 作用域而非
+/// person 作用域），凡是按人物筛记录的地方都要单独认它。
+const LEGACY_MEMORY_KEY: &str = "legacy_memory";
+/// 离线 Memory v2 backfill 的账本表（`legacy_id` → `target_id`）。它不是可浏览的
+/// 记录类型，只在判定"这条旧记忆有没有 v2 副本"时用到。
+const MIGRATION_LEDGER_TABLE: &str = "yunxi_memory_migration_items";
 
 /// 一种可浏览的记录类型。
 struct RecordKind {
@@ -126,7 +132,7 @@ const KINDS: &[RecordKind] = &[
         counted: true,
     },
     RecordKind {
-        key: "legacy_memory",
+        key: LEGACY_MEMORY_KEY,
         label: "旧版记忆",
         table: "kovi_bot_memories",
         id_expr: "t.id",
@@ -379,6 +385,7 @@ async fn existing_tables(pool: &PgPool) -> Result<BTreeSet<String>, ApiError> {
                 "yunxi_conversations",
                 "yunxi_relations",
                 "yunxi_affect_states",
+                MIGRATION_LEDGER_TABLE,
             ]
             .into_iter()
             .map(str::to_string),
@@ -600,48 +607,7 @@ pub(crate) async fn people(Query(params): Query<PeopleQuery>) -> Result<Json<Val
     let offset = params.offset.unwrap_or(0).max(0);
     let query_text = params.q.unwrap_or_default().trim().to_string();
 
-    let sql = format!(
-        r#"
-        SELECT
-            p.id::text AS id,
-            p.created_at,
-            COALESCE(i.identities, '') AS identities,
-            i.qq AS qq,
-            r.familiarity, r.affinity, r.trust, r.comfort, r.tension,
-            a.valence, a.arousal, a.social_energy, a.curiosity,
-            COALESCE(m.count, 0) AS memory_count
-        FROM yunxi_persons p
-        LEFT JOIN (
-            SELECT person_id,
-                   string_agg(platform || ':' || external_id, ', ' ORDER BY platform, external_id) AS identities,
-                   min(external_id) FILTER (WHERE platform = 'qq') AS qq
-            FROM yunxi_external_identities GROUP BY person_id
-        ) i ON i.person_id = p.id
-        LEFT JOIN {relations} r ON r.person_id = p.id
-        LEFT JOIN {affect} a ON a.person_id = p.id
-        LEFT JOIN (
-            SELECT scope_id, count(*) AS count FROM yunxi_memories
-            WHERE scope_kind = 'person' GROUP BY scope_id
-        ) m ON m.scope_id = p.id
-        WHERE ($1 = '' OR COALESCE(i.identities, '') ILIKE '%' || $1 || '%'
-               OR p.id::text ILIKE '%' || $1 || '%')
-        ORDER BY COALESCE(m.count, 0) DESC, p.created_at DESC
-        LIMIT $2 OFFSET $3
-        "#,
-        relations = if existing.contains("yunxi_relations") {
-            "yunxi_relations"
-        } else {
-            // 用一张同形状的空表替代，避免为了可选表写两套 SQL。
-            "(SELECT NULL::uuid AS person_id, NULL::float8 AS familiarity, NULL::float8 AS affinity, NULL::float8 AS trust, NULL::float8 AS comfort, NULL::float8 AS tension WHERE FALSE) "
-        },
-        affect = if existing.contains("yunxi_affect_states") {
-            "yunxi_affect_states"
-        } else {
-            "(SELECT NULL::uuid AS person_id, NULL::float8 AS valence, NULL::float8 AS arousal, NULL::float8 AS social_energy, NULL::float8 AS curiosity WHERE FALSE) "
-        },
-    );
-
-    let rows = query(&sql)
+    let rows = query(&people_sql(&existing))
         .bind(&query_text)
         .bind(limit)
         .bind(offset)
@@ -674,6 +640,94 @@ pub(crate) async fn people(Query(params): Query<PeopleQuery>) -> Result<Json<Val
         "limit": limit,
         "offset": offset,
     })))
+}
+
+/// 人物列表的 SQL。计数列不是"好看的数字"，而是**她真正记得这个人多少条**，
+/// 因此必须跨两张表数：
+///
+/// - `yunxi_memories` 的 person 作用域（Memory v2）；
+/// - `kovi_bot_memories` 里 `scope_type = 'private'` 的行，按这个人的 QQ 身份归属
+///   （旧版记忆的 subject_id 对私聊就是对方 QQ 号）。
+///
+/// 只数前者会让卡片**结构性恒为 0**：聊天的记忆写入口至今仍在旧表，而 Core 的
+/// person 作用域没有聊天写入口（`yunxi-memory-migrate` 是离线迁移，生产没跑之前
+/// v2 里不会有 person 行）。群记忆不属于任何个人——它的 subject 是群号，会被
+/// `scope_type = 'private'` 挡掉，这也是刻意的口径：卡片说的是"关于他"的记忆。
+///
+/// 两个来源是同一份内容的两个投影，所以还要排掉"旧表这一行在 v2 里已有副本"的
+/// 情况（运行时双写按 Core UUID 对齐主键，离线 backfill 走 ledger），否则等
+/// backfill 真跑起来，同一个人的数字会凭空翻倍。
+fn people_sql(existing: &BTreeSet<String>) -> String {
+    format!(
+        r#"
+        SELECT
+            p.id::text AS id,
+            p.created_at,
+            COALESCE(i.identities, '') AS identities,
+            i.qq AS qq,
+            r.familiarity, r.affinity, r.trust, r.comfort, r.tension,
+            a.valence, a.arousal, a.social_energy, a.curiosity,
+            COALESCE(m.count, 0) + COALESCE(legacy.count, 0) AS memory_count
+        FROM yunxi_persons p
+        LEFT JOIN (
+            SELECT person_id,
+                   string_agg(platform || ':' || external_id, ', ' ORDER BY platform, external_id) AS identities,
+                   min(external_id) FILTER (WHERE platform = 'qq') AS qq
+            FROM yunxi_external_identities GROUP BY person_id
+        ) i ON i.person_id = p.id
+        LEFT JOIN {relations} r ON r.person_id = p.id
+        LEFT JOIN {affect} a ON a.person_id = p.id
+        LEFT JOIN (
+            SELECT scope_id, count(*) AS count FROM yunxi_memories
+            WHERE scope_kind = 'person' GROUP BY scope_id
+        ) m ON m.scope_id = p.id
+        LEFT JOIN {legacy} legacy ON legacy.person_id = p.id
+        WHERE ($1 = '' OR COALESCE(i.identities, '') ILIKE '%' || $1 || '%'
+               OR p.id::text ILIKE '%' || $1 || '%')
+        ORDER BY memory_count DESC, p.created_at DESC
+        LIMIT $2 OFFSET $3
+        "#,
+        relations = if existing.contains("yunxi_relations") {
+            "yunxi_relations"
+        } else {
+            // 用一张同形状的空表替代，避免为了可选表写两套 SQL。
+            "(SELECT NULL::uuid AS person_id, NULL::float8 AS familiarity, NULL::float8 AS affinity, NULL::float8 AS trust, NULL::float8 AS comfort, NULL::float8 AS tension WHERE FALSE) "
+        },
+        affect = if existing.contains("yunxi_affect_states") {
+            "yunxi_affect_states"
+        } else {
+            "(SELECT NULL::uuid AS person_id, NULL::float8 AS valence, NULL::float8 AS arousal, NULL::float8 AS social_energy, NULL::float8 AS curiosity WHERE FALSE) "
+        },
+        legacy = if existing.contains("kovi_bot_memories") {
+            // 按 person 聚合而不是按身份行 join：一个人挂多个 QQ 身份时，直接 join
+            // 会让列表出现重复卡片、计数也会被乘开。
+            //
+            // 两处 NOT EXISTS 防的是"同一条记忆被数两次"。Core 与旧表是同一份内容的
+            // 两个投影，来源有两条：运行时双写会沿用 Core 的 UUID 当旧表主键；
+            // 离线 backfill 用 ledger 记录 legacy_id → target_id。任一条成立就说明
+            // 这条旧记忆在 v2 里已经有对应行，不能再计一次。
+            format!(
+                "(SELECT identity.person_id, count(*) AS count \
+                 FROM yunxi_external_identities identity \
+                 JOIN kovi_bot_memories memory \
+                   ON memory.subject_id::text = identity.external_id \
+                  AND memory.scope_type = 'private' \
+                 WHERE identity.platform = 'qq' \
+                   AND NOT EXISTS (SELECT 1 FROM yunxi_memories core WHERE core.id::text = memory.id) \
+                   {ledger} \
+                 GROUP BY identity.person_id) ",
+                ledger = if existing.contains(MIGRATION_LEDGER_TABLE) {
+                    "AND NOT EXISTS (SELECT 1 FROM yunxi_memory_migration_items item \
+                      JOIN yunxi_memories target ON target.id = item.target_id \
+                      WHERE item.legacy_id = memory.id)"
+                } else {
+                    ""
+                },
+            )
+        } else {
+            "(SELECT NULL::uuid AS person_id, NULL::bigint AS count WHERE FALSE) ".to_string()
+        },
+    )
 }
 
 fn person_card(row: &PgRow) -> Value {
@@ -720,15 +774,18 @@ pub(crate) async fn person(UrlPath(id): UrlPath<String>) -> Result<Json<Value>, 
     .fetch_all(pool)
     .await
     .map_err(|error| ApiError::internal(format!("读取身份失败: {error}")))?;
-    let identities: Vec<Value> = identity_rows
-        .iter()
-        .map(|row| {
-            json!({
-                "platform": row.try_get::<String, _>("platform").unwrap_or_default(),
-                "external_id": row.try_get::<String, _>("external_id").unwrap_or_default(),
-            })
-        })
-        .collect();
+    let mut identities: Vec<Value> = Vec::with_capacity(identity_rows.len());
+    // 旧版记忆按 QQ 号归属（subject_id = 对方 QQ），所以筛旧记忆时要用这串身份，
+    // 而不是 person 的 UUID。
+    let mut qq_identities: Vec<String> = Vec::new();
+    for row in &identity_rows {
+        let platform: String = row.try_get("platform").unwrap_or_default();
+        let external_id: String = row.try_get("external_id").unwrap_or_default();
+        if platform == "qq" && !external_id.is_empty() {
+            qq_identities.push(external_id.clone());
+        }
+        identities.push(json!({ "platform": platform, "external_id": external_id }));
+    }
 
     // 注意：人物存在但没有外部身份也照样打开（此时 identities 为空数组），
     // 因为"解析不出 QQ 号"不该等于"这个人不存在"。
@@ -753,15 +810,23 @@ pub(crate) async fn person(UrlPath(id): UrlPath<String>) -> Result<Json<Value>, 
 
     let mut records = Vec::new();
     for kind in KINDS {
-        let rows = query(&format!(
-            "SELECT * FROM ({}) t WHERE t.scope_kind = 'person' AND t.scope_id = $1 LIMIT 200",
-            kind_select(kind)
-        ))
-        // scope_id 在各子查询里已是 text：按文本绑定，否则 Postgres 会因为
-        // `text = uuid` 直接报operator不存在。
-        .bind(person_id.to_string())
-        .fetch_all(pool)
-        .await;
+        let sql = format!(
+            "SELECT * FROM ({}) t WHERE {} LIMIT 200",
+            kind_select(kind),
+            person_record_filter(kind)
+        );
+        let rows = if kind.key == LEGACY_MEMORY_KEY {
+            // 旧版私有记忆在库里是 QQ 作用域（`scope_type='private'` 投影成 'qq'），
+            // 只按 person 的 UUID 匹配会一条都取不到——人物弹窗因此长期是空的。
+            query(&sql).bind(&qq_identities).fetch_all(pool).await
+        } else {
+            // scope_id 在各子查询里已是 text：按文本绑定，否则 Postgres 会因为
+            // `text = uuid` 直接报operator不存在。
+            query(&sql)
+                .bind(person_id.to_string())
+                .fetch_all(pool)
+                .await
+        };
 
         match rows {
             Ok(rows) => {
@@ -811,6 +876,18 @@ pub(crate) async fn person(UrlPath(id): UrlPath<String>) -> Result<Json<Value>, 
         "records": records,
         "conversations": conversations,
     })))
+}
+
+/// 人物详情里"这条记录属于这个人"的判据。
+///
+/// 绝大多数类型是 Core 的 person 作用域；唯独旧版记忆是 QQ 作用域——它的
+/// `scope_id` 是对方 QQ 号（可能多个身份），所以要绑一个文本数组进去。
+fn person_record_filter(kind: &RecordKind) -> &'static str {
+    if kind.key == LEGACY_MEMORY_KEY {
+        "t.scope_kind = 'qq' AND t.scope_id = ANY($1::text[])"
+    } else {
+        "t.scope_kind = 'person' AND t.scope_id = $1"
+    }
 }
 
 // ---------------------------------------------------------------- 图谱
@@ -1633,6 +1710,109 @@ mod tests {
                     .all(|ch| ch.is_ascii_lowercase() || ch == '_')
             );
         }
+    }
+
+    fn all_tables() -> BTreeSet<String> {
+        KINDS
+            .iter()
+            .map(|kind| kind.table.to_string())
+            .chain(
+                [
+                    "yunxi_persons",
+                    "yunxi_relations",
+                    "yunxi_affect_states",
+                    MIGRATION_LEDGER_TABLE,
+                ]
+                .into_iter()
+                .map(str::to_string),
+            )
+            .collect()
+    }
+
+    /// 人物卡片的数字必须把旧版私有记忆算进去。只数 `yunxi_memories` 的 person
+    /// 作用域会让它结构性恒为 0——生产上线后就是这么表现的（156 人全是 0）。
+    #[test]
+    fn people_count_covers_both_memory_stores() {
+        let sql = people_sql(&all_tables());
+        assert!(sql.contains("FROM yunxi_persons"), "要以人物为基准: {sql}");
+        assert!(
+            sql.contains("FROM yunxi_memories") && sql.contains("scope_kind = 'person'"),
+            "Memory v2 的 person 作用域仍要计入: {sql}"
+        );
+        assert!(
+            sql.contains("kovi_bot_memories") && sql.contains("scope_type = 'private'"),
+            "旧版私有记忆必须计入，否则这个数字恒为 0: {sql}"
+        );
+        assert!(
+            sql.contains("COALESCE(m.count, 0) + COALESCE(legacy.count, 0) AS memory_count"),
+            "两个来源必须是相加关系: {sql}"
+        );
+        assert!(
+            sql.contains("ORDER BY memory_count DESC"),
+            "排序要跟着计数走: {sql}"
+        );
+    }
+
+    #[test]
+    fn people_sql_falls_back_when_the_legacy_table_is_absent() {
+        let mut tables = all_tables();
+        tables.remove("kovi_bot_memories");
+        let sql = people_sql(&tables);
+        assert!(
+            !sql.contains("kovi_bot_memories"),
+            "表不存在时不能引用它: {sql}"
+        );
+        assert!(sql.contains("legacy ON legacy.person_id = p.id"), "{sql}");
+    }
+
+    /// 同一条记忆只该数一次：旧表这一行若在 v2 已有副本（双写同 id，或 backfill
+    /// 走 ledger），就不能再计一遍，否则 backfill 一跑数字直接翻倍。
+    #[test]
+    fn people_count_drops_legacy_rows_that_already_have_a_core_twin() {
+        let sql = people_sql(&all_tables());
+        assert!(
+            sql.contains(
+                "NOT EXISTS (SELECT 1 FROM yunxi_memories core WHERE core.id::text = memory.id)"
+            ),
+            "双写副本要按 Core 主键排掉: {sql}"
+        );
+        assert!(
+            sql.contains(MIGRATION_LEDGER_TABLE)
+                && sql.contains("item.legacy_id = memory.id")
+                && sql.contains("JOIN yunxi_memories target ON target.id = item.target_id"),
+            "backfill 副本要按 ledger + 目标行存在性排掉: {sql}"
+        );
+
+        let mut tables = all_tables();
+        tables.remove(MIGRATION_LEDGER_TABLE);
+        let sql = people_sql(&tables);
+        assert!(
+            !sql.contains(MIGRATION_LEDGER_TABLE),
+            "账本表不存在时不能引用它: {sql}"
+        );
+        assert!(
+            sql.contains("core.id::text = memory.id"),
+            "没有账本也仍要排双写副本: {sql}"
+        );
+    }
+
+    /// 旧版记忆是 QQ 作用域：按 person UUID 匹配一条都取不到，人物弹窗会长期是空的。
+    #[test]
+    fn person_detail_scopes_legacy_memories_by_qq_identity() {
+        let legacy = kind_meta(LEGACY_MEMORY_KEY).expect("旧版记忆类型应存在");
+        assert_eq!(legacy.table, "kovi_bot_memories");
+        let filter = person_record_filter(legacy);
+        assert!(
+            filter.contains("'qq'") && filter.contains("ANY($1::text[])"),
+            "{filter}"
+        );
+
+        let memory = kind_meta("memory").expect("长期记忆类型应存在");
+        let filter = person_record_filter(memory);
+        assert!(
+            filter.contains("'person'") && filter.contains("= $1"),
+            "{filter}"
+        );
     }
 
     #[test]

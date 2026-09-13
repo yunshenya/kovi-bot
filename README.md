@@ -197,8 +197,12 @@ ssh -L 6098:127.0.0.1:6098 -p 22 ubuntu@<服务器>   # 服务器上跑时先做
     Hindsight 一致：31 进制哈希取模五色调色板），每页 100 条带页码导航。
   - **时间线**：按年/月/周/日分组缩放 + 分组跳转，左侧日期轴 + 右侧卡片。
 
-  另有**人物页**（QQ 身份 + 关系五维 + 情绪 + 相关记录）。视图可深链接：`#/memory/table`、
-  `#/memory/timeline`、`#/memory/constellation`、`#/memory/people`。
+  另有**人物页**（QQ 身份 + 关系五维 + 情绪 + 相关记录）。卡片上的记忆条数是"她真正记得这个
+  人多少条"，因此同时数 Memory v2 的 person 作用域与旧版 `kovi_bot_memories` 里
+  `scope_type = 'private'` 的行（按这个人的 QQ 身份归属）：聊天的记忆写入目前仍在旧表，
+  只数 v2 会让这个数字恒为 0。群记忆不属于任何个人（它的 subject 是群号），不计入。
+  视图可深链接：`#/memory/table`、`#/memory/timeline`、`#/memory/constellation`、
+  `#/memory/people`。
 
 - **标注**：TurnGate 待复核样本的网页端（设计文档 §7.4 B）。左边是按"标注价值"排的队列
   （tier / 上下文条数 / 排序理由），右边是单条详情——当前句、前一句、最近几轮（按
