@@ -14,7 +14,7 @@ use crate::model::{
     record_group_target_experience, should_suppress_core_group_message,
 };
 use kovi::PluginBuilder;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -894,7 +894,7 @@ fn clear_ready_marker() {
     let Some(path) = ready_file_path() else {
         return;
     };
-    if let Err(error) = std::fs::remove_file(&path)
+    if let Err(error) = remove_ready_marker_at(&path)
         && error.kind() != std::io::ErrorKind::NotFound
     {
         eprintln!(
@@ -905,27 +905,39 @@ fn clear_ready_marker() {
     }
 }
 
+/// 标记文件是**按显式路径**操作的：路径与 revision 都由调用方给出，不读全局环境变量。
+/// 这样测试可以直接驱动真实文件，不必 `set_var` 改进程级环境——那在 edition 2024 里是
+/// `unsafe`，而且并行测试会互相看见对方塞进去的假 `KOVI_READY_FILE`
+/// （`config::runtime_dir()` 就是读它的）。
+fn remove_ready_marker_at(path: &Path) -> std::io::Result<()> {
+    std::fs::remove_file(path)
+}
+
 fn write_ready_marker() -> std::io::Result<()> {
     let Some(path) = ready_file_path() else {
         return Ok(());
     };
+    let revision = std::env::var("KOVI_DEPLOY_REVISION").unwrap_or_else(|_| "ready".to_string());
+    write_ready_marker_at(&path, revision.trim())
+}
+
+fn write_ready_marker_at(path: &Path, revision: &str) -> std::io::Result<()> {
     if let Some(parent) = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
     {
         std::fs::create_dir_all(parent)?;
     }
-    let revision = std::env::var("KOVI_DEPLOY_REVISION").unwrap_or_else(|_| "ready".to_string());
     let temp_path = path.with_extension(format!("tmp.{}", std::process::id()));
-    std::fs::write(&temp_path, format!("{}\n", revision.trim()))?;
+    std::fs::write(&temp_path, format!("{revision}\n"))?;
     std::fs::rename(temp_path, path)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        MessageOwner, clear_ready_marker, select_message_owner,
-        select_message_owner_with_admission_policy, write_ready_marker,
+        MessageOwner, remove_ready_marker_at, select_message_owner,
+        select_message_owner_with_admission_policy, write_ready_marker_at,
     };
     use crate::yunxi::bridge::EnqueueOutcome;
     use std::cell::Cell;
@@ -1236,25 +1248,32 @@ mod tests {
 
     #[test]
     fn readiness_marker_contains_the_deployed_revision() {
+        // 直接驱动真实文件，不碰进程级环境：并行测试共用同一个进程，
+        // `set_var("KOVI_READY_FILE")` 会被 `config::runtime_dir()` 之类的读方看见。
         let path = std::env::temp_dir().join(format!(
             "kovi-ready-{}-{}.txt",
             std::process::id(),
             std::thread::current().name().unwrap_or("test")
         ));
-        unsafe {
-            std::env::set_var("KOVI_READY_FILE", &path);
-            std::env::set_var("KOVI_DEPLOY_REVISION", "test-revision");
-        }
-        clear_ready_marker();
-        write_ready_marker().expect("应写入 readiness 标记");
+        write_ready_marker_at(&path, "test-revision").expect("应写入 readiness 标记");
         assert_eq!(
             fs::read_to_string(&path).expect("应读取 readiness 标记"),
             "test-revision\n"
         );
-        clear_ready_marker();
-        unsafe {
-            std::env::remove_var("KOVI_READY_FILE");
-            std::env::remove_var("KOVI_DEPLOY_REVISION");
-        }
+        // 覆盖写走的是"临时文件 + rename"：旧 revision 不能残留。
+        write_ready_marker_at(&path, "next-revision").expect("应覆写 readiness 标记");
+        assert_eq!(
+            fs::read_to_string(&path).expect("应读取 readiness 标记"),
+            "next-revision\n"
+        );
+        remove_ready_marker_at(&path).expect("应清理临时标记");
+        assert!(!path.exists());
+        // 清理必须容忍"本来就不存在"——启动路径无条件先清一次。
+        assert!(
+            remove_ready_marker_at(&path)
+                .expect_err("重复清理应报 NotFound")
+                .kind()
+                == std::io::ErrorKind::NotFound
+        );
     }
 }
