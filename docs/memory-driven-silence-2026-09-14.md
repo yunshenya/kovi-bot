@@ -103,8 +103,9 @@ sudo journalctl -u kovi-bot --since "-1 day" | grep -E "\[SILENCE\]|\[RELATION\]
 （`plugins/model/src/group_cooling.rs` + `yunxi_group_cooling`），压力来自
 "这个群里针对她的驱赶"与"她插话后持续无人应答"。命中时**只是放弃这一次未点名
 抽样机会**（`interjection_sampling_vetoed`），被 @ / 被引用**永远不受影响**。
-开关是 `[silence] group_cooling_enabled`，默认 false，只打
-`[GROUP_COOLING] shadow=true …`。删除本群数据时压力一起清掉。
+开关是 `[silence] group_cooling_enabled`，**2026-09-14 起默认 true**（写 false 即
+回到只打 `[GROUP_COOLING] shadow=true …` 的观察态）。开启前核对过线上压力表：
+`yunxi_group_cooling` 是空的，不存在"一开就命中"。删除本群数据时压力一起清掉。
 
 ### 模型抽相处结论：可读的那一半
 

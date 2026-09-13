@@ -56,6 +56,10 @@ pub struct SilenceConfig {
     /// 为什么与 `enabled` 分开：个人级门控改的是"不接这个人"，群级改的是
     /// "在这个群少主动开口"。两者证据不同（关系张力 vs 群气氛）、误伤面也不同，
     /// 必须能分别打开观察，否则一个开关会把两套判据的线上表现混在一起。
+    ///
+    /// 默认 **true**：与个人级门控同一个判断标准——装上但不开，会让它在需要
+    /// 的时候恰好没作用。要只看不动就显式写 `false`，那时只打 `[GROUP_COOLING]`
+    /// 影子日志。
     group_cooling_enabled: bool,
 }
 
@@ -66,7 +70,7 @@ impl Default for SilenceConfig {
             negative_threshold: 3,
             decay_days: 30,
             warm_recovery_count: 2,
-            group_cooling_enabled: false,
+            group_cooling_enabled: true,
         }
     }
 }
@@ -116,9 +120,8 @@ mod tests {
         let config = SilenceConfig::default();
         // 个人级门控默认生效：装上但不开，会让这个功能在需要时恰好没作用。
         assert!(config.enabled());
-        // 群级降温是另一个维度、独立开关，仍默认只影子观察——它影响的是"主动
-        // 插话的频率"，误判的可见代价与个人级不同，先看日志再开。
-        assert!(!config.group_cooling_enabled());
+        // 群级降温是另一个维度、独立开关，同样默认开启。
+        assert!(config.group_cooling_enabled());
         assert!(config.validate().is_ok());
         // 有界：必须有衰减窗口与回暖通道，否则静默会变成永久冷处理。
         assert!(config.decay_days() > 0);

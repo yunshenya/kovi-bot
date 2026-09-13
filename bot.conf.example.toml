@@ -663,6 +663,7 @@ warm_recovery_count = 2
 # 机会**，绝不硬静默：被 @、被引用、被明确对话的回合永远不受影响；压力按 24 小时
 # 半衰期回落，群里的正常对话与善意还会主动把它拉回来。
 #
-# 默认 false＝只记账、只打影子日志（`[GROUP_COOLING] shadow=true group=… pressure=…
-# reason=…`），可见回复一条不少。确认日志里的群号与压力都符合直觉之后再改成 true。
-group_cooling_enabled = false
+# 默认 true：与个人级门控同一个判断标准——装上但不开会让它在需要时恰好没作用。
+# 写成 false 即"只看不动"：只记账、只打影子日志（`[GROUP_COOLING] shadow=true
+# group=… pressure=… reason=…`），可见回复一条不少，适合拿真实日志核对判据。
+group_cooling_enabled = true
