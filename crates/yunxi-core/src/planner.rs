@@ -275,68 +275,17 @@ pub fn apply_interaction_cues(
         );
     }
 
-    // Negative sentiment must leave a trace in the *relationship*, not only in
-    // the mood. Before this, valence fed `affect` alone: someone could be
-    // hostile for a whole evening and `relation.tension` would not move, so
-    // continuity of behaviour ("she keeps taking it") was impossible and the
-    // only durable trace was a transient mood that decays in hours.
+    // **tension 不在这里动。** 它是"证据累积量"，只有 delta 通道能改
+    // （宿主侧 `relation_store::nudge_tension`）。语义 cues 这条通道看到的是
+    // "说话人此刻的情绪"，判不出"这句话是不是冲着她"，历史上几乎从不触发
+    // （线上 24 小时 cues=true 0 次），却带来一个更糟的副作用：回合收尾要把整个
+    // 关系行写回，如果它同时携带 tension，就会用回合开始时的快照覆盖掉期间刚到账
+    // 的相处证据（2026-09-14 实测：证据写 0.0256，回合收尾写回 0）。
     //
-    // Sustained hostility therefore accumulates here, and `drift_relation_state`
-    // unwinds it with tension's own 3-day half-life — that is the cooldown. A
-    // single bad message moves tension by well under 0.1, which is deliberate:
-    // one insult is an argument, not a verdict.
-    let negative_strength = negative_valence_strength(&cues);
-    if negative_strength > 0.0 {
-        relation.tension = blend_bounded(relation.tension, 1.0, 0.2 * negative_strength, -1.0, 1.0);
-    }
-    // Warmth explicitly cools an existing rift: it is the mirror of the rule
-    // above and the only way a relationship comes back before the half-life
-    // does its work.
-    relation.tension = blend_bounded(
-        relation.tension,
-        0.0,
-        0.08 * cues.gratitude_strength + 0.12 * positive_valence_strength(&cues),
-        -1.0,
-        1.0,
-    );
+    // 关系仍然会因为善意而变好：comfort / affinity / trust 都在上面按 gratitude
+    // 更新；张力那一路由相处证据（模型判定）与 3 天半衰期的漂移负责。
 
     Ok(InteractionStateEvolution { affect, relation })
-}
-
-/// A person must be at least this negative, this confidently, before their
-/// sentiment is allowed to move a durable relationship dimension.
-///
-/// The bar is deliberate, not a tuning convenience: without it, ordinary
-/// grumbling ("今天好烦" / "累死了") accumulates. Measured against the silence
-/// threshold, medium-strength complaints reach it in 13 messages — a bad day
-/// would start gating her replies, and complaining about life is not hostility
-/// toward her.
-const NEGATIVE_VALENCE_CEILING: f32 = -0.5;
-const NEGATIVE_CONFIDENCE_FLOOR: f32 = 0.8;
-
-/// How strongly these cues read as "this person is being hostile right now",
-/// in `[0, 1]`.
-///
-/// Two gates, both required: the sentiment must be clearly negative and the
-/// classifier must be sure. Anything milder still moves the transient mood
-/// (which decays in hours) but never the relationship.
-fn negative_valence_strength(cues: &InteractionCues) -> f32 {
-    if cues.sentiment_valence >= NEGATIVE_VALENCE_CEILING {
-        return 0.0;
-    }
-    if cues.sentiment_confidence < NEGATIVE_CONFIDENCE_FLOOR {
-        return 0.0;
-    }
-    (cues.sentiment_valence.abs() * cues.sentiment_confidence.clamp(0.0, 1.0)).clamp(0.0, 1.0)
-}
-
-/// How strongly these cues read as "this person is being warm right now",
-/// in `[0, 1]`.
-fn positive_valence_strength(cues: &InteractionCues) -> f32 {
-    if cues.sentiment_valence <= 0.0 {
-        return 0.0;
-    }
-    (cues.sentiment_valence * cues.sentiment_confidence.clamp(0.0, 1.0)).clamp(0.0, 1.0)
 }
 
 fn evolve_interaction_state_inner(
@@ -411,35 +360,8 @@ fn evolve_interaction_state_inner(
         .clamp(-1.0, 1.0);
     relation.trust = (relation.trust + 0.008 * cues.gratitude_strength * (1.0 - relation.trust))
         .clamp(-1.0, 1.0);
-    relation.tension = blend_bounded(
-        relation.tension,
-        if message.stop_requested { 0.45 } else { 0.0 },
-        if message.stop_requested { 0.12 } else { 0.035 },
-        -1.0,
-        1.0,
-    );
-    relation.tension = blend_bounded(
-        relation.tension,
-        0.0,
-        0.08 * cues.gratitude_strength,
-        -1.0,
-        1.0,
-    );
-    // Same rule as `apply_interaction_cues`: the structural pass also carries
-    // semantic cues, and a hostile message must not raise tension on one path
-    // and leave it untouched on the other. Rates and the 3-day tension
-    // half-life live here and in `drift_relation_state`; keep them in sync.
-    let negative_strength = negative_valence_strength(&cues);
-    if negative_strength > 0.0 {
-        relation.tension = blend_bounded(relation.tension, 1.0, 0.2 * negative_strength, -1.0, 1.0);
-    }
-    relation.tension = blend_bounded(
-        relation.tension,
-        0.0,
-        0.12 * positive_valence_strength(&cues),
-        -1.0,
-        1.0,
-    );
+    // 同上：tension 只有 delta 通道能写。结构演化负责 familiarity（这次互动本身
+    // 让她更熟悉对方），情绪与关系冷暖分别落在 affect 与 comfort/affinity/trust。
 
     let semantic_weight = cues.sentiment_confidence;
     let valence_target = (cues.sentiment_valence * semantic_weight
@@ -1352,15 +1274,22 @@ mod tests {
 
         assert!(sad.affect.valence < baseline.affect.valence);
         assert_eq!(sad.relation.affinity, baseline.relation.affinity);
-        // Hostility is a relationship event, not only a mood: negative valence
-        // must raise tension, otherwise "she keeps taking it" has no durable
-        // trace and no downstream gate can ever see it. Warmth cools it back.
-        assert!(sad.relation.tension > baseline.relation.tension);
         assert!(grateful.affect.valence > baseline.affect.valence);
         assert!(grateful.relation.affinity > baseline.relation.affinity);
         assert!(grateful.relation.trust > baseline.relation.trust);
         assert!(grateful.relation.comfort > baseline.relation.comfort);
-        assert!(grateful.relation.tension < baseline.relation.tension);
+        // **tension 不归这条通道。** 它是证据累积量，只由宿主侧的 delta 通道
+        // （相处证据 → `nudge_tension`）改。语义 cues 既不抬升也不降温：它判的是
+        // 说话人的情绪，判不出"这句话是不是冲着她"，而每一个动 tension 的路径都会
+        // 让回合收尾的整行回写有机会覆盖掉同期到账的证据（2026-09-14 实测）。
+        assert_eq!(
+            sad.relation.tension, baseline.relation.tension,
+            "语义 cues 不得改 tension"
+        );
+        assert_eq!(
+            grateful.relation.tension, baseline.relation.tension,
+            "语义 cues 不得改 tension"
+        );
         grateful.affect.validate().expect("affect stays bounded");
         grateful
             .relation
@@ -1369,93 +1298,52 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_grumbling_never_reaches_the_relationship() {
+    fn only_the_delta_channel_moves_tension() {
         let person_id = PersonId::new();
         let message = interaction_message(person_id, ConversationKind::Direct, "hello");
         let affect = AffectState::default();
-        // 真实的日常抱怨：负面但不够明确，分类器也没那么有把握。
-        let grumbling = InteractionCues {
-            sentiment_valence: -0.45,
-            sentiment_arousal: 0.3,
-            sentiment_confidence: 0.7,
-            gratitude_strength: 0.0,
-        };
-        let mut relation = RelationState::new(person_id);
-        for _ in 0..30 {
-            relation =
-                evolve_interaction_state_with_cues(&message, Some(relation), affect, grumbling)
-                    .expect("bounded cues")
-                    .relation;
-        }
-        // 抱怨生活不该动摇关系；否则"今天好烦"说十几遍就能让她闭嘴。
-        assert_eq!(
-            relation.tension, 0.0,
-            "日常抱怨不得累积成静默证据：{}",
-            relation.tension
-        );
-        relation.validate().expect("relation stays bounded");
-    }
-
-    #[test]
-    fn sustained_hostility_accumulates_and_a_single_message_barely_moves_tension() {
-        let person_id = PersonId::new();
-        let message = interaction_message(person_id, ConversationKind::Direct, "hello");
-        let affect = AffectState::default();
+        // 强烈敌意的语义 cues：以前这条会抬 tension，现在一律不动——累积只发生在
+        // delta 通道里（宿主侧 `nudge_tension`），这样回合收尾的整行回写不可能把它
+        // 抹掉。
         let hostile = InteractionCues {
             sentiment_valence: -0.9,
             sentiment_arousal: 0.6,
             sentiment_confidence: 0.9,
             gratitude_strength: 0.0,
         };
-
-        // One hostile message is an argument, not a verdict: it must stay well
-        // below the silence threshold so normal friction never gates a reply.
-        let once = evolve_interaction_state_with_cues(
-            &message,
-            Some(RelationState::new(person_id)),
-            affect,
-            hostile,
-        )
-        .expect("bounded cues");
-        assert!(
-            once.relation.tension < 0.3,
-            "单条负面消息不该把关系推到静默边缘：{}",
-            once.relation.tension
-        );
-
-        // Repeated hostility accumulates instead of hitting a ceiling on the
-        // first message, and stays bounded while doing so.
-        let mut relation = Some(RelationState::new(person_id));
-        for _ in 0..12 {
-            relation = Some(
-                evolve_interaction_state_with_cues(&message, relation, affect, hostile)
+        let mut relation = RelationState::new(person_id);
+        for _ in 0..30 {
+            relation =
+                evolve_interaction_state_with_cues(&message, Some(relation), affect, hostile)
                     .expect("bounded cues")
-                    .relation,
-            );
+                    .relation;
         }
-        let accumulated = relation.expect("relation survives");
+        assert_eq!(
+            relation.tension, 0.0,
+            "语义 cues 连强烈敌意也不得累积成张力：{}",
+            relation.tension
+        );
+        relation.validate().expect("relation stays bounded");
+
+        // delta 通道：单条远不到静默阈值，持续才累积，善意能拉回来，且始终有界。
+        let once = adjust_relation_tension(RelationState::new(person_id), 0.15);
         assert!(
-            accumulated.tension > once.relation.tension,
-            "持续不友好必须累积：单次 {} vs 十二次 {}",
-            once.relation.tension,
+            once.tension < 0.3,
+            "单条证据不该把关系推到静默边缘：{}",
+            once.tension
+        );
+        let mut accumulated = RelationState::new(person_id);
+        for _ in 0..30 {
+            accumulated = adjust_relation_tension(accumulated, 0.15);
+        }
+        assert!(
+            accumulated.tension > once.tension,
+            "持续证据必须累积：单次 {} vs 三十次 {}",
+            once.tension,
             accumulated.tension
         );
         accumulated.validate().expect("relation stays bounded");
-
-        // Warmth is the way back before the half-life does its work.
-        let cooled = evolve_interaction_state_with_cues(
-            &message,
-            Some(accumulated),
-            affect,
-            InteractionCues {
-                sentiment_valence: 0.6,
-                sentiment_arousal: 0.2,
-                sentiment_confidence: 0.9,
-                gratitude_strength: 0.8,
-            },
-        )
-        .expect("bounded cues")
-        .relation;
+        let cooled = adjust_relation_tension(accumulated, -0.05);
         assert!(
             cooled.tension < accumulated.tension,
             "善意必须能降温：{} -> {}",

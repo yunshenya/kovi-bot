@@ -36,12 +36,15 @@
 | --- | --- | --- |
 | 证据（定向） | `plugins/model/src/model/group.rs` 的入站点 | 代码判"这条是不是冲着她"（结构化 `@` 她 / 正文叫她的名字）；只有命中的消息才值得问一次模型 |
 | 证据（判据） | `plugins/model/src/relation_evidence.rs` | 问模型一次：不友好/友好/中性 + 强度 + 置信；折算刻度在代码里（0.15 / -0.05 锚点，按 strength×confidence 缩放，置信 ≥ 0.6 才记账） |
-| 证据（语义）→ 关系 | `crates/yunxi-core/src/planner.rs` | 负向 valence 抬高 `tension`（0.2 混合率），正向与道谢降温；所有证据共用 `adjust_relation_tension` 一套刻度 |
+| 证据（累积） | `crates/yunxi-core/src/planner.rs` 的 `adjust_relation_tension` | **tension 的唯一写者**：宿主侧 `relation_store::nudge_tension` 以 delta 调它（`(1-tension) × 0.2 × 强度`），3 天半衰期漂移负责消退 |
 | 闸 | `plugins/model/src/yunxi/core_model.rs` 的 `silence_gate_plan` | 与 `pre_model_plan` 同层的**模型调用前**否决点：群聊 + 张力 ≥ 0.6 + 管理员除外 → 静默 |
 
 判定的写入点在两条路共同的**入站点**（`lib.rs` 的群聊入站闭包），是后台任务：
 它不改变这条消息该走 Core 还是 Host、该不该回。同一份判定同时记个人级张力与
 群级气氛（`group_cooling`）。
+
+**tension 单写者**：语义 cues（valence/gratitude）与 Core 的结构演化都**不再**碰
+`relation.tension`（2026-09-14 晚起）——理由见文末「第四处修正」。
 
 ## 三条硬约束（为什么可以安全上线）
 
@@ -236,3 +239,42 @@ sudo journalctl -u kovi-bot --since "-1 day" | grep -E "\[SILENCE\]|\[RELATION\]
 tone=… strength=… confidence=…`），可以事后统计漏判率。这是明确的选择，不是遗漏。
 
 **决策权仍在代码**：模型给的是"这条话有多不友好"，不是"要不要静默她"。
+
+## 第四处修正：tension 单写者（2026-09-14 深夜）
+
+**触发**。模型判据上线后第一次复测：日志里证据明明记了账——
+
+```
+[RELATION] 相处证据已记账 user=3052405886 tone=Unfriendly strength=+0.13 … tension=0.026
+[GROUP_COOLING] 群级证据已记账 group=784469488 signal=directed_push_out pressure=0.220
+```
+
+——但库里 `yunxi_relations.tension` 是 **0**，`updated_at` 停在同一个回合的收尾时刻。
+
+**根因：整行回写覆盖。** Core 每回合收尾都会把**整个关系行**写回
+（插件侧 `interaction_state_updates_with_cues` 用回合开始时的快照算出
+`StateUpdateProposal::Relation`，`crates/yunxi-core/src/runtime.rs` 再
+`services.relations.set(...)`）。相处证据是在回合进行中（判定约 0.75 秒）到账的，回合
+收尾（约 1.4 秒）拿着**旧快照**把它写回去。时间线：证据写 0.0256 → 回合写回 0。
+
+这也解释了历史上的第二个谜：字面通道即使接线正确（第二处修正）也从没积累起来过——
+它同样在回合外写，同样被抹。**受影响的只有个人级张力**；群级压力在另一张表，
+不受影响（实测 0.22 正常落库）。
+
+**修正：tension 只有一个写者。**
+
+1. 适配器 `PostgresRelationStore::set` 的 UPDATE 去掉 `tension` 列（`INSERT` 也不再
+   带它，新行从 0 起步），返回值里的 tension 用 `RETURNING` 取库里当前值。Core 的
+   整行回写从此对张力是 no-op。
+2. `nudge_tension` 改成只写 `tension` 一列——它就是那个唯一写者。
+3. Core 侧所有"顺手改张力"的路径全部删除：语义 cues 的 `valence → tension`、
+   `gratitude → tension`、结构演化的 `stop_requested`（该字段在群聊入站里恒为 false，
+   本来就是死代码）与"每条消息朝 0 微凉"的 0.035 混合率。张力现在只有两个来源：
+   **相处证据的 delta** 与 **3 天半衰期的漂移**；善意通过证据通道（-0.05 锚点）降温。
+4. 回归测试（`#[ignore]`，需 `DATABASE_URL`）钉住三件事：整行回写不得改动 tension
+   （入参写 -0.5 也不行）、delta 通道的写入必须落库、紧跟其后的整行回写不得抹掉它。
+   Core 侧也把两条旧测试改成钉住新不变量（语义 cues 连强烈敌意也不得累积张力）。
+
+**代价**。语义 cues 那条通道的张力影响没有了（它线上 24 小时 `cues=true` 0 次，本来
+就没在工作），"每条消息微凉"的衰减也没有了（由漂移代替，半衰期不变）。换来的是：
+张力不再可能被并发写覆盖，判据、阈值、半衰期都留在代码里。

@@ -86,7 +86,15 @@ impl PostgresRelationStore {
             return Ok(None);
         };
         let adjusted = adjust_relation_tension(current, signed_strength);
-        self.set(adjusted).await.map(Some)
+        // 只写 tension 一列：与 `set` 的分工见那里的注释——这条通道是 tension 的
+        // 唯一写者，改动落在 delta 上，因此不会被别处的整行回写覆盖。
+        query("UPDATE yunxi_relations SET tension = $2, updated_at = NOW() WHERE person_id = $1")
+            .bind(person_id.into_uuid())
+            .bind(f64::from(adjusted.tension))
+            .execute(&self.pool)
+            .await
+            .map_err(RelationStoreError::storage)?;
+        Ok(Some(adjusted))
     }
 }
 
@@ -134,33 +142,47 @@ impl RelationStore for PostgresRelationStore {
         })
     }
 
+    /// 写回"这个人跟她处得怎么样"的**非张力**维度（familiarity/affinity/trust/comfort）。
+    ///
+    /// **`tension` 不在这条路径里写。** 它是证据累积量，只有一个写者：
+    /// [`PostgresRelationStore::nudge_tension`]。原因是一次线上事故：Core 每回合收尾
+    /// 会用**回合开始时的快照**整行回写关系，而相处证据是在回合进行中到账的——
+    /// 证据写 0.0256，回合收尾写回 0，静默门控因此永远越不了线（2026-09-14）。
+    ///
+    /// 返回值里的 tension 是**库里当前的值**（`RETURNING`），不是入参里那个快照值，
+    /// 免得调用方拿着过期值再写一遍。
     fn set<'a>(&'a self, state: RelationState) -> RelationStoreFuture<'a, RelationState> {
         Box::pin(async move {
             state
                 .validate()
                 .map_err(|_| RelationStoreError::InvalidState)?;
-            query(
+            let row = query(
                 "INSERT INTO yunxi_relations
-                    (person_id, familiarity, affinity, trust, comfort, tension)
-                 VALUES ($1, $2, $3, $4, $5, $6)
+                    (person_id, familiarity, affinity, trust, comfort)
+                 VALUES ($1, $2, $3, $4, $5)
                  ON CONFLICT (person_id) DO UPDATE SET
                     familiarity = EXCLUDED.familiarity,
                     affinity = EXCLUDED.affinity,
                     trust = EXCLUDED.trust,
                     comfort = EXCLUDED.comfort,
-                    tension = EXCLUDED.tension,
-                    updated_at = NOW()",
+                    updated_at = NOW()
+                 RETURNING tension",
             )
             .bind(state.person_id.into_uuid())
             .bind(f64::from(state.familiarity))
             .bind(f64::from(state.affinity))
             .bind(f64::from(state.trust))
             .bind(f64::from(state.comfort))
-            .bind(f64::from(state.tension))
-            .execute(&self.pool)
+            .fetch_one(&self.pool)
             .await
             .map_err(RelationStoreError::storage)?;
-            Ok(state)
+            let tension = row
+                .try_get::<f64, _>("tension")
+                .map_err(RelationStoreError::storage)?;
+            Ok(RelationState {
+                tension: tension as f32,
+                ..state
+            })
         })
     }
 }
@@ -269,14 +291,59 @@ mod tests {
                     comfort: 0.75,
                     tension: -0.5,
                 };
+                // `set` 只写非张力维度：入参里的 tension 是回合开始时的快照，
+                // 写进去就会覆盖掉回合期间到账的相处证据（2026-09-14 事故）。
+                let persisted = store.set(expected).await.expect("should persist relation");
+                assert_eq!(persisted.familiarity, expected.familiarity);
+                assert_eq!(persisted.affinity, expected.affinity);
+                assert_eq!(persisted.trust, expected.trust);
+                assert_eq!(persisted.comfort, expected.comfort);
                 assert_eq!(
-                    store.set(expected).await.expect("should persist relation"),
-                    expected
+                    persisted.tension, 0.0,
+                    "整行回写不得改动 tension（快照里写 -0.5 也不行）"
                 );
-
                 assert_eq!(
                     store.get(person_id).await.expect("should reload relation"),
-                    Some(expected)
+                    Some(RelationState {
+                        tension: 0.0,
+                        ..expected
+                    })
+                );
+
+                // 相反方向：相处证据的 delta 通道必须真的写进去，并且是累加。
+                let nudged = store
+                    .nudge_tension(person_id, 0.15)
+                    .await
+                    .expect("should nudge tension")
+                    .expect("relation exists");
+                // `adjust_relation_tension` 的混合率是 0.2：tension=0 时一条
+                // 0.15 强度的证据给出 0.2×0.15 = 0.03。
+                assert!(
+                    (nudged.tension - 0.2 * 0.15).abs() < 1e-6,
+                    "首条证据应当按 (1-tension)×0.2×强度 累积：{}",
+                    nudged.tension
+                );
+                assert_eq!(
+                    store
+                        .get(person_id)
+                        .await
+                        .expect("should reload relation")
+                        .expect("relation exists")
+                        .tension,
+                    nudged.tension,
+                    "delta 通道的写入必须落库"
+                );
+                // 紧跟一次整行回写：证据不得被抹掉。
+                let after_writeback = store
+                    .set(RelationState {
+                        tension: 0.0,
+                        ..expected
+                    })
+                    .await
+                    .expect("should persist relation");
+                assert_eq!(
+                    after_writeback.tension, nudged.tension,
+                    "回合收尾的整行回写不得抹掉刚记账的证据"
                 );
 
                 let legacy_seed = RelationState {
@@ -293,12 +360,17 @@ mod tests {
                         .await
                         .expect("legacy seed should be accepted")
                 );
+                // legacy 建档只能补空行；张力那一路是证据通道的值，不该被它改动。
+                let current = RelationState {
+                    tension: after_writeback.tension,
+                    ..expected
+                };
                 assert_eq!(
                     store
                         .get(person_id)
                         .await
                         .expect("legacy seed must preserve Core relation"),
-                    Some(expected)
+                    Some(current)
                 );
 
                 query(
@@ -320,7 +392,8 @@ mod tests {
                 assert!(drifted.affinity.abs() < expected.affinity.abs());
                 assert!(drifted.trust.abs() < expected.trust.abs());
                 assert!(drifted.comfort.abs() < expected.comfort.abs());
-                assert!(drifted.tension.abs() < expected.tension.abs());
+                // 张力那一行现在是证据通道写的值，漂移只让它朝 0 回落。
+                assert!(drifted.tension.abs() < after_writeback.tension.abs());
                 drifted
                     .validate()
                     .expect("drifted relation should be valid");
