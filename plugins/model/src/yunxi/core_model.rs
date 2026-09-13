@@ -2619,17 +2619,17 @@ const SILENCE_TENSION_THRESHOLD: f32 = 0.6;
 /// `input.relation.tension`——那是长期记忆与相处经验落到行为上的地方；
 /// 门控只是把已经积累的关系状态翻译成"这条不接"。
 ///
+/// 参数只有"说话人是不是管理员"这一个来自 Host 的结论（Core 侧判不了：事件里
+/// 没有 QQ 号），不接收整个 host 上下文——门控不需要别的东西，测试也就不必为了
+/// 一个布尔值去伪造一条完整的入站 admission。
+///
 /// 三条硬约束，缺一条这套机制都不该上线：
-/// 1. **管理员不拦**。Core 侧判不了（没有 QQ 号），结论由 Host 带进来；
-///    唯一能解除关系张力的人不能被自己触发的静默挡住。
+/// 1. **管理员不拦**。唯一能解除关系张力的人不能被自己触发的静默挡住。
 /// 2. **默认关闭**。`silence.enabled = false` 时只打影子日志：写明"如果打开，
 ///    这条会被静默"，可见回复一条不少——上线前先用真实数据确认判据不误伤。
 /// 3. **不是封禁**。张力有 3 天半衰期的自然漂移，善意会主动降温；到期或回暖
 ///    就回到照常，没有需要人工解封的状态留在这里。
-fn silence_gate_plan(
-    input: &PlannerInput,
-    host: Option<&HostMessageContext>,
-) -> Option<DecisionPlan> {
+fn silence_gate_plan(input: &PlannerInput, sender_is_admin: bool) -> Option<DecisionPlan> {
     // `config::get()` 返回的是临时 Arc，直接取字段会在语句末尾被释放；
     // 先绑成局部变量再借用它的 `silence` 一节。
     let config = config::get();
@@ -2642,7 +2642,6 @@ fn silence_gate_plan(
     if message.conversation_kind != ConversationKind::Group {
         return None;
     }
-    let sender_is_admin = host.is_some_and(|context| context.sender_is_admin);
     let tension = input.relation.as_ref().map(|relation| relation.tension);
     let SilenceVerdict::Silence { reason } = silence_verdict(
         message.conversation_kind,
@@ -5162,8 +5161,10 @@ impl ModelBackend for KoviModelBackend {
             }
             // 静默门控与上面几个否决同层：都在模型调用之前，判定也都不依赖
             // 这一轮的正文。默认只打影子日志，`silence.enabled` 打开才真的不接。
-            let host_context = incoming_guard.as_ref().map(|guard| guard.context());
-            if let Some(plan) = silence_gate_plan(input, host_context) {
+            let sender_is_admin = incoming_guard
+                .as_ref()
+                .is_some_and(|guard| guard.context().sender_is_admin);
+            if let Some(plan) = silence_gate_plan(input, sender_is_admin) {
                 return Ok(plan);
             }
             let incoming_admission = incoming_guard
@@ -6859,8 +6860,8 @@ mod tests {
         safe_single_structured_reply_message, safe_structured_reply_batch,
         sanitize_autonomous_intrinsic_output, sanitize_intrinsic_output,
         sanitize_plain_text_batch_message, select_host_model_route_from_capability,
-        serialize_intrinsic_reply_batch, shadow_projection_for_completed_plan, silence_verdict,
-        silent_wait_plan, split_core_speech_markers, strip_core_speech_markers,
+        serialize_intrinsic_reply_batch, shadow_projection_for_completed_plan, silence_gate_plan,
+        silence_verdict, silent_wait_plan, split_core_speech_markers, strip_core_speech_markers,
         strong_reply_repair_needed, tool_calls_allowed_for_turn, tool_protocol_authorized_for_turn,
         visible_reply_intent, visible_reply_intents, visible_reply_state_updates,
     };
@@ -8630,6 +8631,46 @@ mod tests {
             "我插进去说两句会不会太吵？"
         ));
         assert!(first_person_turn_avoidance("我插进去说两句会不会太吵？"));
+    }
+
+    #[test]
+    fn silence_gate_reads_the_configured_switch_and_silences_a_sustained_offender() {
+        // 上面那条测的是判据本身；这条测**接线**：门控到底有没有读配置、
+        // 有没有真的产出静默计划。没有它，"默认开启"只是配置里的一个值。
+        let mut input = group_message_input(true);
+        let WorldEventKind::MessageReceived(message) = input.event.kind() else {
+            panic!("测试输入必须是群聊消息");
+        };
+        let mut relation = RelationState::new(message.sender);
+        relation.tension = SILENCE_TENSION_THRESHOLD + 0.05;
+        input = input.with_relation(Some(relation));
+
+        let defaults_on = crate::config::get();
+        assert!(
+            defaults_on.silence().enabled(),
+            "个人级门控默认应当是开启的（`enabled` 默认值被改动过？）"
+        );
+        let plan = silence_gate_plan(&input, false).expect("高张力非管理员应当被判静默");
+        assert_eq!(plan.disposition, DecisionDisposition::Silent);
+        assert!(plan.intents.is_empty(), "静默计划不该带任何可见意图");
+
+        // 阈值以下的人照常走后面的决策。
+        let mut below = input.clone();
+        if let WorldEventKind::MessageReceived(message) = below.event.kind() {
+            let mut relation = RelationState::new(message.sender);
+            relation.tension = SILENCE_TENSION_THRESHOLD - 0.05;
+            below = below.with_relation(Some(relation));
+        }
+        assert!(
+            silence_gate_plan(&below, false).is_none(),
+            "阈值以下不该被门控拦下"
+        );
+
+        // 管理员永远放行：唯一能解除紧张的人不能被自己触发的静默挡住。
+        assert!(
+            silence_gate_plan(&input, true).is_none(),
+            "管理员不该被静默门控拦下"
+        );
     }
 
     #[test]
