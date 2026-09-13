@@ -144,7 +144,13 @@ Core 的 `erase_person` 不碰 `observations`），再置脏让下一次 persist
 （`world_model/mod.rs:880`），只过滤了 entities/situations/hypotheses/uncertainties/
 social_scene——即使接上调用点也要一并补。
 
-### 2.2 人级删除不清理 `yunxi_gag_entries`
+### 2.2 人级删除不清理 `yunxi_gag_entries` ——**已修（`d49de91`）**
+
+修的时候顺带撞出一个真 bug（已一并修，同一个提交）：`gag_store::list_open` 把 INTEGER
+的 `importance` 当 i64 读，而 `row.get` 是 panic 不是 Err，所以**只要该作用域有任意一条
+open 条目，读账本就会 panic**——`#账本`（`gag_commands.rs:51`，外面那句 `.ok()?` 拦不住
+panic）与私聊的 `ledger_context_for`（`:102`）都会中招。已改成与列一致的 i32，并把这一处
+的 `row.get` 全部换成 `try_get(...)?`，让列类型再漂移时变成可上报的错误而不是 panic。
 
 `identity_store.rs:1089` 的 person 分支逐个删 memories / open_loops / goals /
 affect_states / relations / external_identities / persons，但没有 gag。`gag_store.rs:260`
@@ -152,13 +158,33 @@ affect_states / relations / external_identities / persons，但没有 gag。`gag
 约定/芥蒂原文，会注入回复上下文。建议照 relation-note 的写法在
 `delete_qq_person_domain_data` 里对主号与每个 QQ 别名各清一次。
 
-### 2.3 关系备注按显示名跨作用域删除（可能删到别人）
+### 2.3 关系备注按显示名跨作用域删除（可能删到别人）——**待决策，我原先的修法方向是错的**
 
 `relation_note_store.rs:373` 是 `DELETE ... WHERE target_key = ANY($1)`，而
 `target_key` 只是显示名的规范化（小写 + 折叠空白），调用方（`mod.rs:1442-1464`）
 把 QQ 号和**当前昵称**都传了进来。若某人把昵称改成另一个成员的名字再执行
 `#删除我的数据`，会删掉**所有**会话里键为那个名字的备注，包括无关群里关于真实那位
 成员的。建议加 `AND scope_key = ANY($2)`，只在请求者自身的作用域内接受昵称匹配。
+
+**更正（复核后）**：上面那句"加 `AND scope_key = ANY($2)`"是错的，那样会**少删**。
+相处结论的 scope 来自反思输入的 `MindScope`（`mind_runtime.rs:2410` 传 `input.scope`），
+所以"关于 A 的结论"可以写在**任何**会话作用域里（A 在哪个群说过话，那个群的作用域就
+可能有一条）。从 A 的身份出发枚举不出"所有含 A 的结论的作用域"，按 A 自己的作用域去
+限定，会让群作用域里关于 A 的结论留下来——那是删不干净 A 自己的数据。
+
+真正的判别标准不是作用域，而是**键有没有歧义**：QQ 号 / external_id 能唯一指向一个人，
+显示名不能。三个选项：
+
+- **(a) 只按无歧义标识全局删**（QQ 号 + external_id），不再按显示名全局删。彻底消除
+  误删他人；代价是模型用昵称写下的结论会留下——而模块文档本来就把"别名覆盖做不到
+  穷尽"列为既定代价，所以这在已接受范围内。
+- **(b) 保持现状**：昵称撞名时会删掉无关群里的他人结论。
+- **(c) 折中**：标识全局删 + 显示名只在能归属到 A 的作用域内删（A 的 person 作用域与
+  他的私聊会话）。覆盖私聊，仍漏群聊。
+
+倾向 **(a)**：一条有歧义的键不足以支撑一次删除，"永不删除可归属于他人的数据"比
+"尽量删干净"更该优先；而且群级擦除已经是正确形态（`delete_qq_group_domain_data` 按
+会话作用域删，见 `mod.rs:1546`），按人的这条是唯一的例外。这是隐私策略取舍，等你定。
 
 ### 2.4 「尽力而为」的世界模型删除其实无法 fail-soft ——**已复现，测试已落档**
 
