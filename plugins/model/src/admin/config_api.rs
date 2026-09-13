@@ -155,11 +155,7 @@ fn restart_sections_hit(keys: &[String]) -> Vec<String> {
 }
 
 /// 目录是否可写（真的建一个探针文件再删掉，而不是猜权限位）。
-fn directory_writable(path: &Path) -> bool {
-    let dir = match path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
-        Some(dir) => dir,
-        None => Path::new("."),
-    };
+pub(crate) fn directory_writable(dir: &Path) -> bool {
     if !dir.is_dir() {
         return false;
     }
@@ -173,6 +169,15 @@ fn directory_writable(path: &Path) -> bool {
     }
 }
 
+/// 文件所在目录是否可写。
+fn parent_writable(path: &Path) -> bool {
+    let dir = match path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+        Some(dir) => dir,
+        None => Path::new("."),
+    };
+    directory_writable(dir)
+}
+
 /// `GET /api/config/files`
 pub(crate) async fn list_files() -> Result<Json<Value>, ApiError> {
     let files: Vec<Value> = FILES
@@ -184,7 +189,7 @@ pub(crate) async fn list_files() -> Result<Json<Value>, ApiError> {
                 "name": file.name,
                 "title_full": file.title,
                 "view": file.view,
-                "writable": directory_writable(&path),
+                "writable": parent_writable(&path),
                 "path": path.display().to_string(),
                 "title": file.title,
                 "description": file.description,
@@ -875,7 +880,10 @@ fn resolve_backup(name: &str) -> Result<PathBuf, ApiError> {
 }
 
 /// 原子写：同目录临时文件 + rename，避免半截配置被读到。
-fn write_atomically(path: &Path, text: &str) -> std::io::Result<()> {
+///
+/// 标注接口（`annotation_api`）复用它：改一份 JSONL 批次和改配置一样，
+/// 都不能让读者（例如离线训练器）看到写了一半的文件。
+pub(crate) fn write_atomically(path: &Path, text: &str) -> std::io::Result<()> {
     let temp = PathBuf::from(format!("{}.tmp.{}", path.display(), std::process::id()));
     fs::write(&temp, text)?;
     if let Ok(metadata) = fs::metadata(path) {

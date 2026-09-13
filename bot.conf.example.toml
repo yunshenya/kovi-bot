@@ -610,3 +610,8 @@ token = ""
 session_ttl_secs = 43200
 # 监听非回环地址必须显式打开这一项，否则配置校验直接拒绝。
 allow_non_loopback = false
+# 数据标注批次目录（「标注」页读写 TurnGate 待复核 JSONL 的地方）。
+# 相对路径以运行时目录为基准：生产部署里 current/ 是只读发布目录，只有
+# runtime/ 可写，指到别处会直接得到 EROFS；开发机上没有 KOVI_READY_FILE，
+# 于是落在工作目录下。
+annotation_dir = "turngate"

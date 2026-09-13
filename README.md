@@ -175,7 +175,7 @@ ssh -L 6098:127.0.0.1:6098 -p 22 ubuntu@<服务器>   # 服务器上跑时先做
 `http://127.0.0.1:6098/?token=<token>`（可加 `&page=config|memory` 直接落到某页，命中后立刻
 跳转到不含 Token 的地址）。
 
-页面上能做四件事（设计参考与出处见
+页面上能做五件事（设计参考与出处见
 [管理后台 UI 参考报告](docs/admin-dashboard-ui-reference.md)）：
 
 - **概览**：进程与系统运行时长、内存、PostgreSQL / Redis 就绪状态、记忆条数、模型与调度器
@@ -199,6 +199,20 @@ ssh -L 6098:127.0.0.1:6098 -p 22 ubuntu@<服务器>   # 服务器上跑时先做
 
   另有**人物页**（QQ 身份 + 关系五维 + 情绪 + 相关记录）。视图可深链接：`#/memory/table`、
   `#/memory/timeline`、`#/memory/constellation`、`#/memory/people`。
+
+- **标注**：TurnGate 待复核样本的网页端（设计文档 §7.4 B）。左边是按"标注价值"排的队列
+  （tier / 上下文条数 / 排序理由），右边是单条详情——当前句、前一句、最近几轮（按
+  芸汐 / 同一人 / 他人着色）、弱标签与来源；点按钮或按快捷键打标（`1/2/3` 选
+  completion，`a/c/k/i/w/0` 选 response，`Enter` 保存并下一条，`S` 跳过），顶部是这批的
+  进度、队列覆盖率与「导出训练集」。它和终端里的 `tools/turngate/review.py` 读写**同一份
+  JSONL、同一套语义**（同一个"标注价值"队列、同样的 `human_consensus` 标注块、导出同样
+  剥掉 `review_status` 与 `source_key`），所以两个入口可以换着用——但同一时刻只用一个：
+  文件被别处改动时接口返回 409，页面会要求刷新后重来，而不是把对方的改动盖掉。
+
+  批次目录来自 `admin.annotation_dir`（默认运行时目录下的 `turngate/`，即生产上的
+  `/home/ubuntu/kovi-bot/runtime/turngate/`——`current/` 是只读发布目录，写不进去）。
+  采于「@ 判定」修复之前的批次里，`addressed_to_agent` 分不出"@ 她"还是"@ 别人"，这类样本
+  默认不进队列（可用开关放回来），免得把旧判定人工确认一遍再喂进权重。
 
 - **系统**：主机与进程的实时面板——身份卡（登录号、在线状态）、运行环境（版本 / 部署
   revision / 操作系统 / 内核 / 架构 / 主机名 / 系统与进程运行时长 / 工作目录）、CPU 与内存

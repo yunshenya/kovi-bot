@@ -1,6 +1,6 @@
 /* 芸汐管理后台 —— 无构建前端
  *
- * 结构：登录 → 概览 / 配置 / 记忆。
+ * 结构：登录 → 概览 / 配置 / 记忆 / 标注 / 系统。
  * 约定：
  *   - 一律用 DOM API 构造节点（记忆正文来自模型输出，绝不能当 HTML 插入）；
  *   - 所有写操作都先经服务端校验，失败时展示服务端返回的原因；
@@ -224,6 +224,7 @@
     overview: { title: '概览', subtitle: '进程、存储、模型与调度器的现状', render: renderOverview },
     config: { title: '配置', subtitle: '全部参数；保存前会校验，保存时保留注释', render: renderConfigPage },
     memory: { title: '记忆', subtitle: '长期记忆、情节、人物与未完结线索', render: renderMemoryPage },
+    annotation: { title: '标注', subtitle: 'TurnGate 待复核样本：标完直接导出训练集', render: renderAnnotationPage },
     system: { title: '系统', subtitle: '主机、进程、模型与 OneBot 服务端', render: renderSystemPage },
   };
 
@@ -2213,6 +2214,525 @@
         h('span', { text: item.scope_label || '全局' }),
         h('span', { text: relative(item.occurred_at) || fmtTime(item.occurred_at) })));
   }
+
+  // ───────────────────────────── 标注 ─────────────────────────────
+  //
+  // TurnGate 复核闭环的网页端（doc §7.4 B）：左边是"标注价值"队列，右边是单条
+  // 详情与标签按钮，标完直接导出训练集。与终端里的 tools/turngate/review.py
+  // 读写同一份 JSONL、同一套语义（tier / 排序理由 / human_consensus 标注块 /
+  // 导出剥掉 source_key），两个入口可以换着用——但同一时刻只用一个：文件被别处
+  // 改动时服务端返回 409，页面会要求刷新后重来，而不是把对方的改动盖掉。
+
+  /** 标注页状态。goto() 每次进页都整页重建，靠它挂住批次与当前样本。 */
+  const annotation = {
+    dir: '',
+    exists: true,
+    writable: true,
+    batch: '',
+    revision: '',
+    summary: null,
+    coverage: null,
+    items: [],
+    matched: 0,
+    limit: 40,
+    tab: 'pending',
+    skipFlagged: true,
+    current: null,
+    draft: { completion: '', response: '' },
+    exports: [],
+  };
+
+  const COMPLETION_CHOICES = [['flush_now', '说完了'], ['hold_for_more', '还没说完']];
+  const RESPONSE_CHOICES = [
+    ['answer', '回答'], ['continue', '接续'], ['ack', '应一声'],
+    ['ignore', '不发言'], ['wait', '再等等'],
+  ];
+  /** 键盘：左手选标签（'null' = 判不了），右手回车保存、S 跳过。 */
+  const ANNOTATION_KEYS = {
+    1: ['completion', 'flush_now'],
+    2: ['completion', 'hold_for_more'],
+    3: ['completion', 'null'],
+    a: ['response', 'answer'],
+    c: ['response', 'continue'],
+    k: ['response', 'ack'],
+    i: ['response', 'ignore'],
+    w: ['response', 'wait'],
+    0: ['response', 'null'],
+  };
+  const ROLE_LABELS = { assistant: '芸汐', user: '同一人', other_member: '他人' };
+  const SNIPPET_CHARS = 56;
+
+  function annotationSnippet(text) {
+    const flat = String(text == null ? '' : text).split(/\s+/).filter(Boolean).join(' ');
+    return flat.length > SNIPPET_CHARS ? `${flat.slice(0, SNIPPET_CHARS)}…` : flat;
+  }
+
+  function annotationQuery(extra) {
+    const params = new URLSearchParams({
+      batch: annotation.batch,
+      limit: String(annotation.limit),
+      include_reviewed: String(annotation.tab === 'reviewed'),
+      skip_flagged: String(annotation.skipFlagged),
+      ...extra,
+    });
+    return `/api/annotation/queue?${params.toString()}`;
+  }
+
+  function currentAnnotationIndex() {
+    return annotation.current ? annotation.current.index : -1;
+  }
+
+  async function renderAnnotationPage() {
+    const page = $('#page-annotation');
+    clear(page);
+    page.append(h('div', { class: 'loading', text: '读取标注目录…' }));
+    let data;
+    try {
+      data = await api('/api/annotation/batches');
+    } catch (problem) {
+      clear(page);
+      page.append(h('div', { class: 'empty', text: problem.message }));
+      return;
+    }
+    if (currentPage !== 'annotation') return;
+
+    annotation.dir = data.dir || '';
+    annotation.exists = Boolean(data.exists);
+    annotation.writable = Boolean(data.writable);
+    annotation.exports = data.exports || [];
+    const batches = data.batches || [];
+    if (!batches.some((batch) => batch.name === annotation.batch)) {
+      // 批次没了或被换掉：当前样本与草稿都失效，避免把标签写到别的批次的同一序号上。
+      annotation.batch = batches.length ? batches[0].name : '';
+      annotation.current = null;
+      annotation.draft = { completion: '', response: '' };
+    }
+
+    clear(page);
+    page.append(renderAnnotationToolbar(batches));
+    if (!annotation.exists) {
+      page.append(h('div', { class: 'card' },
+        h('div', { class: 'card-head' }, h('h3', { text: '标注目录还不存在' })),
+        h('div', { class: 'hint', text: '批次由 collector.py 从 journalctl 导出（doc §7.4 B），落在机器人所在机器上：' }),
+        h('pre', { class: 'annotate-cmd', text: `mkdir -p ${annotation.dir}\nscp review-batch-*.jsonl <服务器>:${annotation.dir}/` })));
+      renderAnnotationSummary();
+      return;
+    }
+    if (!batches.length) {
+      page.append(h('div', { class: 'card' },
+        h('div', { class: 'card-head' }, h('h3', { text: '这个目录里还没有批次' })),
+        h('div', { class: 'hint', text: `把 review-batch-*.jsonl 放进 ${annotation.dir} 即可，页面只读这一层目录。` })));
+      renderAnnotationSummary();
+      return;
+    }
+    page.append(h('div', { class: 'annotate-grid' },
+      h('div', { class: 'record-list', id: 'annotate-list' }),
+      h('div', { class: 'detail', id: 'annotate-detail' })));
+    await loadAnnotationQueue();
+  }
+
+  function renderAnnotationToolbar(batches) {
+    const select = h('select', { class: 'select', id: 'annotate-batch' },
+      ...batches.map((batch) => h('option', {
+        value: batch.name,
+        selected: batch.name === annotation.batch,
+        text: `${batch.name}（${batch.summary && !batch.summary.error ? `${batch.summary.pending} 待标` : '读不动'}）`,
+      })));
+    select.addEventListener('change', async () => {
+      annotation.batch = select.value;
+      annotation.current = null;
+      annotation.draft = { completion: '', response: '' };
+      await loadAnnotationQueue();
+    });
+
+    const toggle = h('input', {
+      type: 'checkbox',
+      id: 'annotate-skip-flagged',
+      checked: annotation.skipFlagged,
+    });
+    toggle.addEventListener('change', async () => {
+      annotation.skipFlagged = toggle.checked;
+      await loadAnnotationQueue();
+    });
+
+    const exportButton = h('button', {
+      class: 'btn primary',
+      text: '导出训练集',
+      title: '只收人工复核过、agreement 达标的样本，并剥掉 review_status 与 source_key',
+      onclick: (event) => exportAnnotation(event.target),
+    });
+    const refreshButton = h('button', {
+      class: 'btn ghost',
+      text: '刷新',
+      onclick: () => renderAnnotationPage(),
+    });
+
+    return h('div', { class: 'card annotate-toolbar' },
+      h('div', { class: 'annotate-bar' },
+        h('span', { class: 'annotate-bar-label', text: '批次' }),
+        select,
+        h('div', { class: 'tabs annotate-tabs' },
+          annotationTabButton('pending', '待标注'),
+          annotationTabButton('reviewed', '已标注')),
+        h('label', {
+          class: 'annotate-toggle',
+          title: '这批采于"@ 判定"修复之前：@ 别人也曾被记成在叫她，目标其实分不出来',
+        }, toggle, '跳过目标可疑的样本'),
+        h('span', { class: 'annotate-spacer' }),
+        exportButton,
+        refreshButton),
+      h('div', { class: 'stat-grid annotate-stats', id: 'annotate-stats' }),
+      h('div', { class: 'annotate-hint', id: 'annotate-hint' }),
+      h('div', { class: 'annotate-exports', id: 'annotate-exports' }));
+  }
+
+  function annotationTabButton(key, label) {
+    return h('button', {
+      class: annotation.tab === key ? 'active' : '',
+      text: label,
+      onclick: async () => {
+        if (annotation.tab === key) return;
+        annotation.tab = key;
+        annotation.current = null;
+        annotation.draft = { completion: '', response: '' };
+        await renderAnnotationPage();
+      },
+    });
+  }
+
+  /** 进度与队列覆盖率（口径与 review.py --queue 的表头一致）。 */
+  function renderAnnotationSummary() {
+    const summary = annotation.summary || {};
+    const stats = $('#annotate-stats');
+    if (stats) {
+      clear(stats);
+      stats.append(
+        stat('这批样本', compactNumber(summary.total || 0), null, true),
+        stat('已标注', compactNumber(summary.reviewed || 0), null, true),
+        stat('待标注', compactNumber(summary.pending || 0), null, true),
+        stat('目标判定可疑', compactNumber(summary.flagged || 0), '默认不进队列', true));
+    }
+    const hint = $('#annotate-hint');
+    if (hint) {
+      const coverage = annotation.coverage || {};
+      clear(hint);
+      // `append` 会把 null 变成 "null" 文本节点（h() 才会跳过空子节点），所以先过滤。
+      hint.append(...[
+        h('span', { class: 'mono', text: annotation.dir }),
+        h('span', { text: `队列 ${annotation.matched} 条` }),
+        h('span', { text: `灰区 ${coverage.gray_zone || 0}` }),
+        h('span', { text: `有上下文 ${coverage.with_recent_turns || 0}` }),
+        h('span', { text: `有芸汐发言 ${coverage.with_bot_turn || 0}` }),
+        annotation.writable ? null : h('span', { class: 'badge restart', text: '目录不可写' }),
+      ].filter(Boolean));
+    }
+    renderAnnotationExports();
+  }
+
+  function renderAnnotationExports() {
+    const host = $('#annotate-exports');
+    if (!host) return;
+    clear(host);
+    if (!annotation.exports.length) {
+      host.append(h('span', { class: 'muted small', text: '还没有导出过训练集。' }));
+      return;
+    }
+    host.append(h('span', { class: 'muted small', text: '已导出：' }));
+    for (const item of annotation.exports.slice(0, 5)) {
+      host.append(h('a', {
+        class: 'facet-chip tag',
+        href: `/api/annotation/download?name=${encodeURIComponent(item.name)}`,
+        text: item.name,
+        title: `${fmtBytes(item.bytes)} · ${fmtTime(item.modified)}`,
+      }));
+    }
+  }
+
+  async function loadAnnotationQueue() {
+    const list = $('#annotate-list');
+    if (!list) return;
+    clear(list);
+    list.append(h('div', { class: 'loading', text: '读队列…' }));
+    let data;
+    try {
+      data = await api(annotationQuery());
+    } catch (problem) {
+      clear(list);
+      list.append(h('div', { class: 'empty', text: problem.message }));
+      return;
+    }
+    if (currentPage !== 'annotation') return;
+
+    annotation.revision = data.revision;
+    annotation.summary = data.summary;
+    annotation.coverage = data.coverage;
+    annotation.items = data.items || [];
+    annotation.matched = data.matched || 0;
+    renderAnnotationSummary();
+
+    const selected = currentAnnotationIndex();
+    if (!annotation.items.some((item) => item.index === selected)) {
+      // 队列换了（切批次/切页签/刚标完），当前样本已不在列表里就重新挑第一条。
+      annotation.current = null;
+      annotation.draft = { completion: '', response: '' };
+      const first = annotation.items[0];
+      if (first) {
+        await openAnnotationSample(first.index);
+        return;
+      }
+    }
+    renderAnnotationList();
+    renderAnnotationDetail();
+  }
+
+  function renderAnnotationList() {
+    const list = $('#annotate-list');
+    if (!list) return;
+    clear(list);
+    if (!annotation.items.length) {
+      list.append(h('div', {
+        class: 'empty',
+        text: annotation.tab === 'reviewed' ? '这一批还没有已标注的样本' : '这个队列空了，切到「已标注」看看，或换一批',
+      }));
+      return;
+    }
+    const selected = currentAnnotationIndex();
+    for (const item of annotation.items) {
+      list.append(h('div', {
+        class: `record${item.index === selected ? ' active' : ''}`,
+        onclick: () => openAnnotationSample(item.index),
+      },
+        h('div', { class: 'record-head' },
+          h('span', { class: 'record-title', text: `#${item.index}` }),
+          h('span', { class: 'badge kind', text: `tier ${item.tier}` }),
+          item.review_status === 'reviewed' ? h('span', { class: 'badge', text: '已标' }) : null,
+          item.flagged ? h('span', { class: 'badge secret', text: '目标可疑' }) : null),
+        h('div', { class: 'record-body', text: annotationSnippet(item.current_text) }),
+        h('div', { class: 'record-foot' },
+          h('span', { text: item.reason }),
+          h('span', { text: `上下文 ${item.richness}` }),
+          h('span', { text: item.scope === 'group' ? '群聊' : '私聊' }))));
+    }
+    // 跳过不会把样本移出队列，所以标完之前队列长度不变——得能给"再看下一屏"。
+    const remaining = annotation.matched - annotation.items.length;
+    if (remaining > 0) {
+      list.append(h('button', {
+        class: 'btn ghost small annotate-more',
+        text: `再加载 ${annotation.limit} 条（还有 ${remaining} 条）`,
+        onclick: async () => {
+          annotation.limit = Math.min(annotation.limit + 40, 500);
+          await loadAnnotationQueue();
+        },
+      }));
+    }
+  }
+
+  async function openAnnotationSample(index) {
+    const host = $('#annotate-detail');
+    if (!host) return;
+    annotation.draft = { completion: '', response: '' };
+    clear(host);
+    host.append(h('div', { class: 'loading', text: `打开 #${index}…` }));
+    let data;
+    try {
+      data = await api(`/api/annotation/sample?batch=${encodeURIComponent(annotation.batch)}&index=${index}`);
+    } catch (problem) {
+      clear(host);
+      host.append(h('div', { class: 'empty', text: problem.message }));
+      return;
+    }
+    if (currentPage !== 'annotation') return;
+    annotation.current = data;
+    annotation.revision = data.revision;
+    renderAnnotationList();
+    renderAnnotationDetail();
+  }
+
+  function annotationChoice(head, value, label) {
+    const active = annotation.draft[head] === value;
+    const key = Object.keys(ANNOTATION_KEYS).find(
+      (candidate) => ANNOTATION_KEYS[candidate][0] === head && ANNOTATION_KEYS[candidate][1] === value);
+    return h('button', {
+      class: `label-choice${active ? ' active' : ''}`,
+      title: `${head} = ${value}`,
+      onclick: () => {
+        annotation.draft[head] = active ? '' : value;
+        renderAnnotationDetail();
+      },
+    }, label, key ? h('span', { class: 'annotate-key', text: key }) : null);
+  }
+
+  function renderAnnotationDetail() {
+    const host = $('#annotate-detail');
+    if (!host) return;
+    clear(host);
+    const current = annotation.current;
+    if (!current) {
+      host.append(h('div', { class: 'empty', text: '从左边挑一条开始标。' }));
+      return;
+    }
+    const sample = current.sample || {};
+    const context = sample.context || {};
+    const labels = sample.labels || {};
+    const provenance = sample.label_provenance || {};
+
+    const body = h('div', { class: 'annotate-body' });
+    for (const fragment of context.pending_user_fragments || []) {
+      body.append(h('div', { class: 'annotate-turn' },
+        h('span', { class: 'annotate-role user', text: '前一句' }),
+        h('span', { class: 'annotate-text', text: String(fragment) })));
+    }
+    for (const turn of context.recent_turns || []) {
+      body.append(h('div', { class: 'annotate-turn' },
+        h('span', { class: `annotate-role ${turn.role === 'assistant' ? 'assistant' : 'other'}`, text: ROLE_LABELS[turn.role] || turn.role || '?' }),
+        h('span', { class: 'annotate-text', text: String(turn.text == null ? '' : turn.text) })));
+    }
+    if (context.bot_last_asked_question) {
+      body.append(h('div', { class: 'annotate-turn' },
+        h('span', { class: 'annotate-role assistant', text: '她在等回答' }),
+        h('span', { class: 'annotate-text', text: String(context.bot_last_asked_question) })));
+    }
+
+    host.append(h('div', { class: 'card annotate-card' },
+      h('div', { class: 'card-head' },
+        h('h3', { text: `#${current.index}` }),
+        h('span', { class: 'badge kind', text: `tier ${current.tier}` }),
+        h('span', { class: 'badge', text: current.reason }),
+        h('span', { class: 'badge', text: context.scope === 'group' ? '群聊' : '私聊' }),
+        current.reviewed ? h('span', { class: 'badge default', text: '已标注' }) : null),
+      current.flagged
+        ? h('div', { class: 'annotate-warn' },
+          '这批采于"@ 判定"修复之前：@ 别人也曾被记成在叫她。这条默认不进队列，标它等于把旧判定确认一遍。')
+        : null,
+      h('div', { class: 'annotate-current', text: String(sample.current_text == null ? '' : sample.current_text) }),
+      body.childNodes.length ? h('div', { class: 'annotate-context' }, body) : null,
+      h('div', { class: 'annotate-meta' },
+        h('span', { text: `弱标签：completion=${labels.completion == null ? '未给' : labels.completion}` }),
+        h('span', { text: `response=${labels.response == null ? '未给' : labels.response}` }),
+        h('span', { text: `来源 ${provenance.source || '未知'}` })),
+      h('div', { class: 'annotate-labels' },
+        h('span', { class: 'annotate-label-head', text: 'completion' }),
+        ...COMPLETION_CHOICES.map(([value, label]) => annotationChoice('completion', value, label)),
+        annotationChoice('completion', 'null', '判不了')),
+      h('div', { class: 'annotate-labels' },
+        h('span', { class: 'annotate-label-head', text: 'response' }),
+        ...RESPONSE_CHOICES.map(([value, label]) => annotationChoice('response', value, label)),
+        annotationChoice('response', 'null', '判不了')),
+      h('div', { class: 'annotate-actions' },
+        h('button', { class: 'btn primary', text: '保存并下一条（Enter）', onclick: () => saveAnnotation() }),
+        h('button', { class: 'btn ghost', text: '跳过（S）', onclick: () => skipAnnotation() }),
+        h('span', { class: 'muted small', text: '标不了就跳过——硬标的噪声会进权重。' }))));
+  }
+
+  /** 保存当前草稿。只提交点过的 head，与 review.py --mark 的语义一致。 */
+  async function saveAnnotation() {
+    const current = annotation.current;
+    if (!current) return;
+    const draft = annotation.draft;
+    if (!draft.completion && !draft.response) {
+      toast('先选 completion 或 response；两个都判不了就点「判不了」', 'warn');
+      return;
+    }
+    const body = { batch: annotation.batch, index: current.index, revision: annotation.revision };
+    if (draft.completion === 'null') body.clear_completion = true;
+    else if (draft.completion) body.completion = draft.completion;
+    if (draft.response === 'null') body.clear_response = true;
+    else if (draft.response) body.response = draft.response;
+
+    let result;
+    try {
+      result = await api('/api/annotation/mark', { method: 'POST', body });
+    } catch (problem) {
+      toast(problem.message, 'bad', 9000);
+      return;
+    }
+    annotation.revision = result.revision;
+    annotation.summary = result.summary;
+    const chosen = [draft.completion, draft.response].filter(Boolean).length;
+    toast(`#${current.index} 已标注${chosen === 1 ? '（另一个 head 保留原值）' : ''}`, 'ok');
+    await advanceAnnotation();
+  }
+
+  /** 标完一条之后：本地摘掉它并打开下一条，队列空了就重新拉一页。 */
+  async function advanceAnnotation() {
+    renderAnnotationSummary();
+    const marked = currentAnnotationIndex();
+    annotation.items = annotation.items.filter((item) => item.index !== marked);
+    if (annotation.tab === 'pending') annotation.matched = Math.max(0, annotation.matched - 1);
+    annotation.current = null;
+    const next = annotation.items.find((item) => item.index > marked) || annotation.items[0];
+    if (next) {
+      await openAnnotationSample(next.index);
+      return;
+    }
+    renderAnnotationList();
+    renderAnnotationDetail();
+    await loadAnnotationQueue();
+  }
+
+  async function skipAnnotation() {
+    const current = currentAnnotationIndex();
+    if (current < 0) return;
+    const next = annotation.items.find((item) => item.index > current)
+      || annotation.items.find((item) => item.index !== current);
+    if (!next) {
+      toast('队列里没有别的样本了', 'warn');
+      return;
+    }
+    await openAnnotationSample(next.index);
+  }
+
+  async function exportAnnotation(button) {
+    if (button) button.disabled = true;
+    try {
+      const result = await api('/api/annotation/export', {
+        method: 'POST',
+        body: { batch: annotation.batch },
+      });
+      toast(`导出 ${result.exported} 条（人工复核 ${result.human_reviewed} 条）→ ${result.file}`, 'ok', 7000);
+      await refreshAnnotationExports();
+    } catch (problem) {
+      toast(problem.message, 'bad', 9000);
+    } finally {
+      if (button) button.disabled = false;
+    }
+  }
+
+  async function refreshAnnotationExports() {
+    let data;
+    try {
+      data = await api('/api/annotation/batches');
+    } catch (problem) {
+      toast(problem.message, 'bad');
+      return;
+    }
+    annotation.exports = data.exports || [];
+    renderAnnotationExports();
+  }
+
+  // 键盘只在标注页生效，且不抢输入框（批次下拉、导出链接都还要用键盘操作）。
+  document.addEventListener('keydown', (event) => {
+    if (currentPage !== 'annotation') return;
+    if (event.metaKey || event.ctrlKey || event.altKey) return;
+    const tag = event.target && event.target.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      saveAnnotation();
+      return;
+    }
+    if (event.key === 's' || event.key === 'S') {
+      event.preventDefault();
+      skipAnnotation();
+      return;
+    }
+    const choice = ANNOTATION_KEYS[event.key.toLowerCase()];
+    if (!choice || !annotation.current) return;
+    event.preventDefault();
+    const [head, value] = choice;
+    annotation.draft[head] = annotation.draft[head] === value ? '' : value;
+    renderAnnotationDetail();
+  });
 
   // ───────────────────────────── 系统 ─────────────────────────────
   //

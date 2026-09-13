@@ -26,6 +26,10 @@ bot_memory.json.corrupt.*
 /tools/turngate/dataset/train-*.jsonl
 # 待标注工作单是同一批原文的渲染结果，同样只留在本机。
 /tools/turngate/dataset/worklist-*.txt
+# 管理后台「标注」页的默认目录（admin.annotation_dir = "turngate"）：开发机上
+# 没有 KOVI_READY_FILE，它相对工作目录解析，也就是仓库根的这一层。里面的批次
+# 与导出同样只留本机，绝不能被顺手提交。
+/turngate/
 
 # 临时：NapCat 登录二维码（登录完成后删除）
 .qq-login/

@@ -13,6 +13,7 @@
 //!
 //! 前端是无构建的静态资源（`include_str!` 内嵌），因此发布仍然只有一个二进制。
 
+mod annotation_api;
 mod assets;
 mod auth;
 mod config_api;
@@ -167,6 +168,14 @@ impl ApiError {
         }
     }
 
+    /// 乐观并发冲突：调用方拿着过期的文件版本提交改动。
+    pub(crate) fn conflict(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            message: message.into(),
+        }
+    }
+
     pub(crate) fn internal(message: impl std::fmt::Display) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -260,6 +269,7 @@ async fn index(
         let target = match query.page.as_deref() {
             Some("config") => "/#/config",
             Some("memory") => "/#/memory",
+            Some("annotation") => "/#/annotation",
             Some("system") => "/#/system",
             _ => "/",
         };
@@ -348,6 +358,12 @@ pub(crate) fn router(state: Arc<AdminState>) -> Router {
         .route("/api/memory/graph", get(memory_api::graph))
         .route("/api/memory/tags", get(memory_api::tags))
         .route("/api/memory/stats", get(memory_api::stats))
+        .route("/api/annotation/batches", get(annotation_api::batches))
+        .route("/api/annotation/queue", get(annotation_api::queue))
+        .route("/api/annotation/sample", get(annotation_api::sample))
+        .route("/api/annotation/mark", post(annotation_api::mark))
+        .route("/api/annotation/export", post(annotation_api::export))
+        .route("/api/annotation/download", get(annotation_api::download))
         .layer(axum::middleware::from_fn_with_state(
             Arc::clone(&state),
             auth::require_session,

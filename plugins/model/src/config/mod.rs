@@ -402,6 +402,32 @@ pub fn override_file_path() -> PathBuf {
 /// 运行时覆盖配置的文件名。
 pub const OVERRIDE_FILE: &str = "bot.conf.override.toml";
 
+/// 数据标注批次目录的默认名（相对运行时目录）。
+pub const DEFAULT_ANNOTATION_DIR: &str = "turngate";
+
+/// 数据标注批次目录（管理后台的「标注」页读写它）。
+///
+/// 相对路径以运行时目录为基准：生产部署里 `current/` 是只读发布目录
+/// （systemd `ProtectSystem=strict`），只有运行时目录可写；开发机上没有
+/// `KOVI_READY_FILE`，于是落在工作目录下。配置为绝对路径时原样使用。
+pub fn annotation_dir_path() -> PathBuf {
+    let configured = MODEL_CONFIG
+        .read()
+        .map(|config| config.admin().annotation_dir().trim().to_owned())
+        .unwrap_or_default();
+    let configured = if configured.is_empty() {
+        DEFAULT_ANNOTATION_DIR.to_owned()
+    } else {
+        configured
+    };
+    let path = Path::new(&configured);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        runtime_dir().join(path)
+    }
+}
+
 /// 把内存中的配置替换为给定实例。
 ///
 /// 只应由管理后台在「候选配置已经通过 `validate_candidate` 校验并原子落盘」

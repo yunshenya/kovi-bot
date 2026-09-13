@@ -73,6 +73,15 @@ python3 tools/turngate/review.py --batch review-batch-*.jsonl --export train_tur
 # 3 无机器人发言、4 其余；`--queue` 头部会打印上下文覆盖率，覆盖率低说明
 # 导出格式或时间窗有问题，先回去查第 1 步。
 
+#    也可以走网页端：管理后台的「标注」页用同一套队列与标注语义，鼠标点或
+#    快捷键打标，标完直接下载导出的训练集（导出的字段与 --export 逐条一致）。
+#    批次目录是 admin.annotation_dir（默认运行时目录下的 turngate/，生产上
+#    就是 /home/ubuntu/kovi-bot/runtime/turngate/——current/ 只读，写不进去），
+#    把 review-batch-*.jsonl 放进去即可。两个入口读写**同一份文件**，所以同一
+#    时刻只用一个：文件被别处改动时网页返回 409，刷新后重来。
+#    采于「@ 判定」修复前的批次里 addressed_to_agent 分不出"@ 她"还是"@ 别人"，
+#    网页默认把这类样本排除在队列外（开关可放回来），等重采后再标它们。
+
 # 3) 训练(默认仅人工复核/种子集; --include-pseudo 只做候选对比)
 python3 tools/turngate/train.py --data train_turngate-v0.1.jsonl \
     --out models/yunxi-turngate --training-data-version local-dataset-v2

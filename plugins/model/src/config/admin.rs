@@ -6,6 +6,7 @@
 use anyhow::ensure;
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
+use std::path::{Component, Path};
 
 /// 管理后台配置结构体
 ///
@@ -31,6 +32,9 @@ pub struct AdminConfig {
     session_ttl_secs: u64,
     /// 显式允许监听非回环地址。默认关闭，防止把控制面误暴露到公网。
     allow_non_loopback: bool,
+    /// 数据标注批次目录。相对路径以运行时目录为基准（生产部署里只有运行时
+    /// 目录可写），填绝对路径则以绝对路径为准。
+    annotation_dir: String,
 }
 
 impl AdminConfig {
@@ -69,6 +73,11 @@ impl AdminConfig {
         self.allow_non_loopback
     }
 
+    #[must_use]
+    pub fn annotation_dir(&self) -> &str {
+        self.annotation_dir.as_str()
+    }
+
     /// 监听地址是否是本机回环（含 localhost 与 127.0.0.0/8、::1）。
     #[must_use]
     pub fn binds_loopback_only(&self) -> bool {
@@ -85,6 +94,23 @@ impl AdminConfig {
             return Ok(());
         }
         ensure!(!self.host.trim().is_empty(), "admin.host 不能为空");
+        // 标注目录是后台唯一会往里写业务数据的地方：只允许"目录名或绝对路径"，
+        // 不接受 `..`，免得一次配置手滑把批次文件写到目录之外。
+        let annotation_dir = self.annotation_dir.trim();
+        ensure!(
+            !annotation_dir.is_empty(),
+            "admin.annotation_dir 不能为空：标注页需要一个可读写的批次目录"
+        );
+        ensure!(
+            annotation_dir.len() <= 512,
+            "admin.annotation_dir 过长（上限 512 字节）"
+        );
+        ensure!(
+            !Path::new(annotation_dir)
+                .components()
+                .any(|part| matches!(part, Component::ParentDir)),
+            "admin.annotation_dir 不能包含 `..`：标注页只读写它自己那一层目录"
+        );
         ensure!(
             self.session_ttl_secs >= 300,
             "admin.session_ttl_secs 不能小于 300 秒"
@@ -118,6 +144,8 @@ impl Default for AdminConfig {
             token: String::new(),
             session_ttl_secs: 12 * 60 * 60,
             allow_non_loopback: false,
+            // 相对运行时目录：生产里 current/ 是只读发布目录，只有 runtime/ 可写。
+            annotation_dir: super::DEFAULT_ANNOTATION_DIR.to_string(),
         }
     }
 }
@@ -125,6 +153,7 @@ impl Default for AdminConfig {
 #[cfg(test)]
 mod tests {
     use super::AdminConfig;
+    use std::path::Path;
 
     #[test]
     fn default_binds_loopback_with_the_reserved_admin_port() {
@@ -170,5 +199,33 @@ mod tests {
         };
         assert!(local.binds_loopback_only());
         assert!(local.validate().is_ok());
+    }
+
+    #[test]
+    fn annotation_dir_defaults_to_a_runtime_relative_directory() {
+        let config = AdminConfig::default();
+        assert_eq!(config.annotation_dir(), "turngate");
+        assert!(!Path::new(config.annotation_dir()).is_absolute());
+    }
+
+    #[test]
+    fn annotation_dir_rejects_escaping_the_configured_directory() {
+        let escaping = AdminConfig {
+            annotation_dir: "../elsewhere".to_string(),
+            ..AdminConfig::default()
+        };
+        assert!(escaping.validate().is_err());
+
+        let empty = AdminConfig {
+            annotation_dir: "   ".to_string(),
+            ..AdminConfig::default()
+        };
+        assert!(empty.validate().is_err());
+
+        let absolute = AdminConfig {
+            annotation_dir: "/var/lib/kovi/turngate".to_string(),
+            ..AdminConfig::default()
+        };
+        assert!(absolute.validate().is_ok());
     }
 }
