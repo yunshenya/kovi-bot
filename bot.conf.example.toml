@@ -404,10 +404,19 @@ cooldown_secs = 600
 # 持久化（重启恢复、数据删除联动）。持久化表按需创建（additive），
 # 其余组件不受影响。
 [world_model]
-# 这个开关在当前代码里只影响两处**文案**：启动那行
-# "World Model v4 已启用（shadow_mode=...）" 与 #world-status 里的 "shadow=true"。
-# 它没有门控任何行为（全仓只有这两个消费点），所以 false 也不改变世界模型的行为。
+# **总开关**。false = 整个世界模型不运行：不建持久化表、不恢复、不记录任何观察
+# （所有记录都走 `with_world`，它第一件事就是看这个开关），两处 soft-signal 日志
+# 也不会打。默认 false 的理由是"新部署不改行为"（v4 §215）。
+#
+# 反过来，改成 false 也**不是**"只是关掉文案"——它会让世界模型彻底停摆，
+# 连带 `persist`（文档写明 enabled=false 时忽略）与数据删除联动一起失效。
 enabled = true
+# 只影响两处**文案**：启动那行 "World Model v4 ...（shadow_mode=...）" 与
+# #world-status 里的 "shadow=true"。全仓只有这两个消费点，且都只是拼字符串——
+# 它**不门控任何行为**，true/false 都不改变世界模型做什么。
+#
+# 真正会改变聊天行为的是下面的 reply_context 与 influence_mode（两者默认 disabled）；
+# 不要把"影子/安全"寄托在这个字段上。
 shadow_mode = false
 persist = true
 persist_interval_secs = 30

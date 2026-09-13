@@ -2109,3 +2109,58 @@ mod erasure_tests {
             });
     }
 }
+
+/// `[world_model] enabled` 是**总开关**，不是文案开关。这条把它钉住。
+///
+/// 起因：`bot.conf.example.toml` 那句注释把这个开关描述成"只影响两处文案、不门控任何
+/// 行为"——那句话其实描述的是 `shadow_mode`（它确实只往两处状态行拼 `shadow=true`），
+/// 但被写在了 `enabled` 这一行下面。照那句话去删门控，就会把总开关拆掉。这里用行为
+/// 断言代替注释：关掉之后无论怎么记录都不该有运行时状态，打开之后同一条记录必须进去。
+#[cfg(test)]
+mod world_model_gating_tests {
+    use yunxi_core::world_model::{ObservationKind, ObservationSource, WorldScope};
+
+    fn install_world_model_enabled(enabled: bool) {
+        let source = format!("[world_model]\nenabled = {enabled}\n");
+        let candidate = crate::config::validate_candidate(&source).expect("候选配置应合法");
+        crate::config::install(candidate).expect("应安装测试配置");
+    }
+
+    fn record_one_probe_observation() {
+        super::world_model::record_observation(
+            WorldScope::Global,
+            ObservationKind::SystemState,
+            ObservationSource::SystemState,
+            "总开关测试用的观察",
+            None,
+        );
+    }
+
+    /// 需要改全局配置，所以和其它配置类集成用例一样按 `--ignored --exact` 单独跑
+    /// （`ci.yml` 里点名列了它）。它不需要数据库。
+    #[test]
+    #[ignore = "mutates the process-global config; run via --ignored --exact"]
+    fn disabled_world_model_records_nothing() {
+        let previous = crate::config::get();
+
+        install_world_model_enabled(false);
+        super::world_model::reset_for_tests();
+        record_one_probe_observation();
+        assert!(
+            super::world_model::status_summary().is_none(),
+            "enabled=false 时不该存在任何世界模型运行时状态"
+        );
+
+        // 反面对照：证明上面不是"记录入口本身坏了"。
+        install_world_model_enabled(true);
+        super::world_model::reset_for_tests();
+        record_one_probe_observation();
+        assert!(
+            super::world_model::status_summary().is_some(),
+            "enabled=true 时同一条观察必须被记下来"
+        );
+
+        super::world_model::reset_for_tests();
+        crate::config::install(previous).expect("应还原配置");
+    }
+}

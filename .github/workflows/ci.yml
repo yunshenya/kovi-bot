@@ -90,6 +90,14 @@ jobs:
       - name: Run deterministic concurrency tests
         run: cargo test -p model --features integration-tests --test boundary_integration --locked
 
+      # `[world_model] enabled` 是总开关（关掉就整个世界模型不跑）。它需要改进程级配置，
+      # 所以单独跑一次，避免和并行用例互相看见对方的配置。
+      - name: Run world-model gating test
+        run: >-
+          cargo test -p model --lib --locked
+          yunxi::world_model_gating_tests::disabled_world_model_records_nothing
+          -- --ignored --exact
+
       - name: Run black-box Redis integration test
         env:
           REDIS_URL: redis://127.0.0.1:6379/15

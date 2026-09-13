@@ -2,15 +2,23 @@ use serde::{Deserialize, Serialize};
 
 /// World Model v4 runtime config (plugins/model side).
 ///
-/// Follows the blueprint's feature-flag shape (v4 §215/§216): the runtime is
-/// `enabled = false` by default so a fresh deploy never changes behavior;
-/// once enabled it still runs in `shadow_mode = true` (records observations,
-/// scenes, and metrics only; nothing in the runtime may block or alter chat
-/// replies until it is explicitly switched to active by the operator).
+/// Follows the blueprint's feature-flag shape (v4 §215/§216). The flag that carries
+/// the risk is [`Self::enabled`] — it is the master switch:
+///
+/// - `enabled = false`（默认）：整个世界模型不运行。不建持久化表、不恢复、不记录任何
+///   观察（所有记录都走 `with_world`，它第一件事就是看这个开关）。
+/// - `enabled = true`：开始记录观察/情境/场景。**行为仍然不变**，因为会改变聊天行为的
+///   是 [`Self::reply_context`] 与 [`Self::influence_mode`]，两者默认都是 `"disabled"`。
+///
+/// 注意 [`Self::shadow_mode`] **不门控任何行为**：全仓只有两个消费点（启动日志与
+/// `#world-status`），都只是往状态行里拼一个 `shadow=true` 字样。别把"影子模式 = 安全"
+/// 的保证寄托在它身上——真正拦住行为的是上面那两个 `*_mode`。
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 #[serde(default)]
 pub struct WorldModelConfig {
+    /// 总开关，见类型文档：false 时记录、持久化、恢复、数据删除联动全都不运行。
     enabled: bool,
+    /// 仅影响两处状态**文案**（启动日志、`#world-status`），不门控任何行为。
     shadow_mode: bool,
     /// Persist the in-memory World Model to Postgres (restart recovery,
     /// v4 §130). Requires a configured database; ignored when `enabled=false`.
