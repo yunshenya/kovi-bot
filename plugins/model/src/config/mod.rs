@@ -23,6 +23,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, RwLock};
 
+mod admin;
 mod agent_runs;
 mod agent_tasks;
 mod cognitive_model;
@@ -47,6 +48,7 @@ mod vision;
 mod world_model;
 mod world_sensors;
 
+pub use admin::AdminConfig;
 pub use agent_runs::AgentRunConfig;
 pub use agent_tasks::AgentTaskConfig;
 pub use cognitive_model::{CognitiveModelConfig, IntrinsicConfig, ModelFallbackConfig};
@@ -128,6 +130,8 @@ pub struct ModelConfig {
     /// Intrinsic model and bounded fallback configuration.
     #[serde(rename = "model")]
     model: CognitiveModelConfig,
+    /// 自带 Web 管理后台（配置 + 记忆）。
+    admin: AdminConfig,
 }
 
 impl ModelConfig {
@@ -180,6 +184,7 @@ impl ModelConfig {
         self.qq_voice.validate()?;
         self.executive.validate()?;
         self.model.validate()?;
+        self.admin.validate()?;
         if !self.vision.mcp_server().is_empty() && !self.tools.enabled() {
             return Err(anyhow::anyhow!(
                 "配置 vision.mcp_server 时必须启用 tools.enabled"
@@ -293,6 +298,10 @@ impl ModelConfig {
         &self.model
     }
 
+    pub fn admin(&self) -> &AdminConfig {
+        &self.admin
+    }
+
     fn create_default_config_file(config_path: &Path) -> anyhow::Result<()> {
         let default_config = ModelConfig::default();
         let toml_content = toml::to_string_pretty(&default_config)
@@ -305,12 +314,22 @@ impl ModelConfig {
 
     fn try_deserialize_config() -> anyhow::Result<ModelConfig> {
         let config_path = Self::config_path();
-        Config::builder()
-            .add_source(
-                config::File::from(config_path)
+        let override_path = override_file_path();
+        let mut builder = Config::builder().add_source(
+            config::File::from(config_path)
+                .format(FileFormat::Toml)
+                .required(true),
+        );
+        if override_path.exists() {
+            // 运行时覆盖配置：发布目录是只读的，运维的改动落在可写的运行时目录里，
+            // 后加载的 source 覆盖先加载的（表按字段深合并）。
+            builder = builder.add_source(
+                config::File::from(override_path.clone())
                     .format(FileFormat::Toml)
-                    .required(true),
-            )
+                    .required(false),
+            );
+        }
+        builder
             .build()
             .with_context(|| anyhow::anyhow!("Failed to load config from file"))?
             .try_deserialize::<ModelConfig>()
@@ -333,6 +352,97 @@ impl ModelConfig {
         let path = PathBuf::from("bot.conf.toml");
         path
     }
+}
+
+/// 当前配置文件的路径（管理后台读写的对象）。
+pub fn config_file_path() -> PathBuf {
+    ModelConfig::config_path()
+}
+
+/// 运行时状态目录。
+///
+/// 生产部署把二进制与 `bot.conf.toml` 放在只读的 release 目录里
+/// （systemd 的 `ProtectSystem=strict` + `ReadOnlyPaths`），只有
+/// `KOVI_READY_FILE` 所在的 `runtime/` 可写。开发机上没有这个变量，
+/// 就退回工作目录，行为不变。
+pub fn runtime_dir() -> PathBuf {
+    std::env::var_os("KOVI_READY_FILE")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// 运行时覆盖配置的路径。
+///
+/// 它叠在主配置之上（同名字段以它为准），因此运维在管理后台里的改动既能立即
+/// 生效，也不会因为下一次发布覆盖 release 目录而丢失。
+pub fn override_file_path() -> PathBuf {
+    std::env::var_os("YUNXI_CONFIG_OVERRIDE")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| runtime_dir().join(OVERRIDE_FILE))
+}
+
+/// 运行时覆盖配置的文件名。
+pub const OVERRIDE_FILE: &str = "bot.conf.override.toml";
+
+/// 把内存中的配置替换为给定实例。
+///
+/// 只应由管理后台在「候选配置已经通过 `validate_candidate` 校验并原子落盘」
+/// 之后调用，否则运行中的进程会和磁盘上的文件不一致。
+pub fn install(config: ModelConfig) -> anyhow::Result<()> {
+    let mut guard = MODEL_CONFIG
+        .write()
+        .map_err(|_| anyhow::anyhow!("Failed to acquire write lock for config"))?;
+    *guard = config;
+    Ok(())
+}
+
+/// 校验一段候选 TOML 是否能成为合法配置，但不改动任何状态。
+///
+/// 管理后台用它做「先校验、后落盘」：校验失败时磁盘与内存都保持原样。
+pub fn validate_candidate(source: &str) -> anyhow::Result<ModelConfig> {
+    let config = Config::builder()
+        .add_source(config::File::from_str(source, FileFormat::Toml))
+        .build()
+        .with_context(|| anyhow::anyhow!("候选配置不是合法的 TOML"))?
+        .try_deserialize::<ModelConfig>()
+        .with_context(|| anyhow::anyhow!("候选配置的字段类型或取值不合法"))?;
+    config
+        .validate()
+        .with_context(|| anyhow::anyhow!("候选配置未通过业务校验"))?;
+    Ok(config)
+}
+
+/// 校验一段候选的运行时覆盖配置，但不改动任何状态。
+///
+/// 覆盖配置本身是稀疏的（只写要改的字段），所以必须与主配置合并之后再校验，
+/// 否则会误判成"字段缺失"。
+pub fn validate_override_candidate(source: &str) -> anyhow::Result<ModelConfig> {
+    let config = Config::builder()
+        .add_source(
+            config::File::from(ModelConfig::config_path())
+                .format(FileFormat::Toml)
+                .required(true),
+        )
+        .add_source(config::File::from_str(source, FileFormat::Toml))
+        .build()
+        .with_context(|| anyhow::anyhow!("候选覆盖配置不是合法的 TOML"))?
+        .try_deserialize::<ModelConfig>()
+        .with_context(|| anyhow::anyhow!("候选覆盖配置的字段类型或取值不合法"))?;
+    config
+        .validate()
+        .with_context(|| anyhow::anyhow!("主配置 + 候选覆盖未通过业务校验"))?;
+    Ok(config)
+}
+
+/// 按磁盘上的文件重新加载配置并热替换。
+pub fn reload_from_disk() -> anyhow::Result<ModelConfig> {
+    let config = ModelConfig::load()?;
+    install(config.clone())?;
+    Ok(config)
 }
 
 /// 获取当前配置的克隆

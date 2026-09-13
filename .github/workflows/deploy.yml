@@ -162,6 +162,7 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
           BRAVE_SEARCH_API_KEY: ${{ secrets.BRAVE_SEARCH_API_KEY }}
+          YUNXI_ADMIN_TOKEN: ${{ secrets.YUNXI_ADMIN_TOKEN }}
           REDIS_URL: ${{ secrets.REDIS_URL }}
           VISION_API_URL: ${{ secrets.VISION_API_URL || vars.VISION_API_URL }}
           VISION_WIRE_API: ${{ secrets.VISION_WIRE_API || vars.VISION_WIRE_API || 'responses' }}
@@ -269,6 +270,8 @@ jobs:
             test -z "$VISION_API_TOKEN" || printf 'VISION_API_TOKEN=%s\n' "$VISION_API_TOKEN"
             test -z "$VISION_ACTOR_AUTHORIZATION" || printf 'VISION_ACTOR_AUTHORIZATION=%s\n' "$VISION_ACTOR_AUTHORIZATION"
             test -z "$BRAVE_SEARCH_API_KEY" || printf 'BRAVE_SEARCH_API_KEY=%s\n' "$BRAVE_SEARCH_API_KEY"
+            # 管理后台的登录 Token：不提供就由进程首次启动时生成并写入运行时目录。
+            test -z "$YUNXI_ADMIN_TOKEN" || printf 'YUNXI_ADMIN_TOKEN=%s\n' "$YUNXI_ADMIN_TOKEN"
             printf 'DATABASE_URL=%s\n' "$DATABASE_URL"
             printf 'REDIS_URL=%s\n' "${REDIS_URL:-redis://127.0.0.1:6379/0}"
             printf '%s\n' 'REDIS_KEY_PREFIX=kovi'

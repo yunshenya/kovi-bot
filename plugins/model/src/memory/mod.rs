@@ -1371,6 +1371,11 @@ impl MemoryManager {
     /// # 注意
     /// 添加记忆后会自动保存到当前持久化后端
     pub async fn add_memory(&self, memory: MemoryEntry) -> Result<()> {
+        // 用量记账：写进记忆的内容量（估算 token）。
+        crate::metrics::record(
+            crate::metrics::Metric::MemorySavedTokens,
+            crate::metrics::approx_tokens(&memory.content),
+        );
         let _save_guard = self.save_lock.lock().await;
         let duplicate_id = {
             let memories = self.memories.lock().await;

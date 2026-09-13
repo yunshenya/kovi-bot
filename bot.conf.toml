@@ -269,3 +269,12 @@ provider = "disabled"
 mcp_server = ""
 mcp_tool = "analyze_image"
 timeout_secs = 120
+
+[admin]
+enabled = true
+host = "127.0.0.1"
+port = 6098
+token_env = "YUNXI_ADMIN_TOKEN"
+token = ""
+session_ttl_secs = 43200
+allow_non_loopback = false

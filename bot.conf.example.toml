@@ -561,3 +561,24 @@ staging_dir = "/home/ubuntu/napcat-qq-call/voice"
 napcat_staging_dir = "/app/qq-call/voice"
 # 暂存文件保留数量上限。
 keep_files = 32
+
+# 自带 Web 管理后台：一个页面看全部参数、在线改配置，并按 Hindsight 的方式
+# 浏览长期记忆、情节、人物与未完结线索。登录必须带 Token。
+#
+# 生产部署里 current/ 是只读发布目录，网页上的改动会写到运行时目录的
+# bot.conf.override.toml（可写、跨发布保留），由它覆盖这里的同名参数。
+[admin]
+enabled = true
+# 默认只监听本机：后台能改全部配置、能读全部记忆，等同于机器人自身的控制面。
+host = "127.0.0.1"
+# 刻意避开 NapCat WebUI 的 6099。
+port = 6098
+# 登录 Token 所在的环境变量名（推荐放在 .env 里）。
+token_env = "YUNXI_ADMIN_TOKEN"
+# 也可直接写在这里；留空时按 token_env → 已有 .yunxi-admin-token → 现场生成
+# 的顺序解析。生成的 Token 会写入运行时目录并打印一次启动日志。
+token = ""
+# 登录会话有效期（秒），默认 12 小时。
+session_ttl_secs = 43200
+# 监听非回环地址必须显式打开这一项，否则配置校验直接拒绝。
+allow_non_loopback = false

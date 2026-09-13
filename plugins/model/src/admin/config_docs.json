@@ -1,0 +1,744 @@
+{
+  "fields": {
+    "admin.allow_non_loopback": {
+      "doc": "显式允许监听非回环地址。默认关闭，防止把控制面误暴露到公网。"
+    },
+    "admin.enabled": {
+      "doc": "是否启用自带管理后台。关闭后不监听任何端口。"
+    },
+    "admin.host": {
+      "doc": "监听地址。默认仅本机；非回环地址需要同时打开 allow_non_loopback。"
+    },
+    "admin.port": {
+      "doc": "监听端口。刻意避开 NapCat WebUI 的 6099。"
+    },
+    "admin.session_ttl_secs": {
+      "doc": "登录会话有效期（秒）。默认 12 小时。"
+    },
+    "admin.token": {
+      "doc": "可选的登录 Token 明文。留空时用 token_env；两者都为空则自动生成并 落盘到工作目录的 .yunxi-admin-token（权限 600）后打印一次。",
+      "secret": true
+    },
+    "admin.token_env": {
+      "doc": "登录 Token 所在的环境变量名。为空时回退到 token 字段。"
+    },
+    "agent_tasks.default_collect_minutes": {
+      "doc": "用户没有指定时的默认等待分钟数。"
+    },
+    "agent_tasks.enabled": {
+      "doc": "是否启用跨群问答任务调度和回复收集。"
+    },
+    "agent_tasks.lease_secs": {
+      "doc": "报告任务的数据库租约时间（秒）。"
+    },
+    "agent_tasks.max_active_per_actor": {
+      "doc": "单个主管理员最多同时拥有多少条未完成任务。"
+    },
+    "agent_tasks.max_active_total": {
+      "doc": "全局最多保留多少条未完成任务。"
+    },
+    "agent_tasks.max_collect_minutes": {
+      "doc": "单个任务最多等待群回复的分钟数。"
+    },
+    "agent_tasks.max_event_chars": {
+      "doc": "单条群成员回复最多保存多少字符。"
+    },
+    "agent_tasks.max_events_per_task": {
+      "doc": "单个任务最多保存多少条群成员回复。"
+    },
+    "agent_tasks.max_report_chars": {
+      "doc": "私聊汇报最多发送多少字符。"
+    },
+    "agent_tasks.min_valid_replies": {
+      "doc": "达到多少条有效回复后开始等待安静窗口；0 表示只按最长等待时间收尾。"
+    },
+    "agent_tasks.poll_interval_secs": {
+      "doc": "调度器扫描间隔（秒）。"
+    },
+    "agent_tasks.quiet_period_secs": {
+      "doc": "达到最少有效回复后，连续没有新有效回复多久就提前收尾（秒）。"
+    },
+    "executive.shadow_mode": {
+      "hint": "shadow_mode 与 model.intrinsic.shadow_routing **取或**，一起决定 core_model 里 那个 shadow_routing：任一为 true，路由即便算出\"这轮该用本机模型\"，只要 DeepSeek 可用就仍然走 DeepSeek。生产 2026-09-12 起两个都为 false（见下方说明：目前 还不会真的把任何一轮交给本机模型，因为没有任何代码会把 preferred_tier 降到 Standard 以下）。"
+    },
+    "group_interjection.addressed_reply_gap_secs": {
+      "doc": "被明确点名的消息（`@` 她本人或引用她）在两次可见回复之间的最短 间隔（秒）。它只放松\"等一等\"，不放松频率上限：直接提问不该被 静默丢掉，但预算耗尽时仍然按 `reply_rate_limit` 拒绝。 取值必须 ≤ `reply_gap_secs`，否则退回 `reply_gap_secs`。",
+      "hint": "被明确点名/被引用的消息用更短的间隔：有人直接问她问题时，\"刚回过别人\" 不该让这个问题被静默丢掉（现场事故：@她提问，21 秒前刚回过别人，于是 问题永远没有回答）。放松的只是等待时长，频率上限对两条通道一致——被点名 通道同样会撞到 reply_rate_limit。 取值必须 ≤ reply_gap_secs；写成 0 或更大值会被配置校验拒绝/退回 reply_gap_secs。"
+    },
+    "group_interjection.continuation_window_secs": {
+      "doc": "接续对话窗口：芸汐最近一次在本群发出可见消息后，未点名消息在 这个时长内走\"接续对话\"语义评估（由相关性判定是否回复），窗口外 回到低频插话抽样。窗口越长，群内每条消息请求模型的概率越高。",
+      "hint": "接续对话窗口：芸汐最近一次在本群可见回复后，未点名消息在此秒数内按 \"接续对话\"语义评估（由相关性判定是否回复）；窗口外回到低频插话抽样。 窗口越长，群内每条消息请求模型的概率越高；推荐维持 3 分钟。"
+    },
+    "group_interjection.cooldown_secs": {
+      "doc": "同一群两次未点名接话的最短间隔（秒）。"
+    },
+    "group_interjection.decision_cooldown_secs": {
+      "doc": "两次未点名模型判断之间的最短间隔（秒）。"
+    },
+    "group_interjection.decision_rate_limit": {
+      "doc": "统计窗口内最多允许多少次未点名模型判断。"
+    },
+    "group_interjection.decision_rate_window_secs": {
+      "doc": "未点名模型判断额度的统计窗口（秒）。"
+    },
+    "group_interjection.direct_rate_limit": {
+      "doc": "计数窗口内允许同一成员直接触发的最大次数。"
+    },
+    "group_interjection.direct_rate_window_secs": {
+      "doc": "高频点名计数窗口（秒）。"
+    },
+    "group_interjection.direct_spam_cooldown_secs": {
+      "doc": "连续刷屏后暂停处理该成员直接点名的时间（秒）。"
+    },
+    "group_interjection.enabled": {
+      "doc": "是否允许机器人偶尔接上未点名的群聊话题。"
+    },
+    "group_interjection.familiar_admit_enabled": {
+      "doc": "熟人（熟悉度 ≥ familiarity_threshold）的未点名消息直接进入语义 评估，不等待抽样；是否真的回复仍由评估模型与 Core 决定。",
+      "hint": "熟人放行：熟悉度 ≥ familiarity_threshold 的成员，其未点名消息确定性进入 语义评估（是否真的回复仍由评估模型与 Core 决定），不再只靠概率采样； 这是\"群里有熟人在说话，她会有自然反应\"的通道。familiar_rate_limit 是每群每窗口内进入语义评估的条数上限（模型成本护栏）。"
+    },
+    "group_interjection.familiar_rate_limit": {
+      "doc": "限流窗口内同一群最多放行多少条熟人消息进入语义评估。"
+    },
+    "group_interjection.familiar_rate_window_secs": {
+      "doc": "熟人确定性放行的限流统计窗口（秒）。"
+    },
+    "group_interjection.familiarity_threshold": {
+      "doc": "视为\"熟人\"的熟悉度阈值（0..=1）。"
+    },
+    "group_interjection.interjection_max_output_tokens": {
+      "doc": "未点名接话单次允许生成的最大 token 数。"
+    },
+    "group_interjection.min_eligible_messages": {
+      "doc": "两次本地抽样之间至少积累多少条有价值的消息，不会消耗模型 token。"
+    },
+    "group_interjection.min_message_chars": {
+      "doc": "只有达到该长度的消息才会作为候选，减少过短消息触发语义判断。"
+    },
+    "group_interjection.reply_gap_secs": {
+      "doc": "同群两次群聊可见回复（点名或未点名）之间的最短间隔（秒）。 对\"每句话都回\"的刷屏波次做硬性控制；管理员豁免。",
+      "hint": "群聊可见回复节奏的确定性硬限制（显式识图/教学/命令不受限，管理员与普通 成员同等受限）：同群两次可见聊天回复至少间隔 reply_gap_secs，每 reply_rate_window_secs 内最多 reply_rate_limit 条。 这是\"几乎每句话她都回复\"的最终兜底——无论模型想接多少，同群可见回复 频率都被压住，管理员也不例外。"
+    },
+    "group_interjection.reply_rate_limit": {
+      "doc": "统计窗口内同一群最多输出多少条可见回复（Admin/命令/识图等显式 请求不受限）。"
+    },
+    "group_interjection.reply_rate_window_secs": {
+      "doc": "群聊可见回复频率统计窗口（秒）。"
+    },
+    "group_interjection.response_probability_percent": {
+      "doc": "到达抽样时机后，实际调用模型接话的概率（0-100）。"
+    },
+    "group_interjection.sticker_reaction_cooldown_secs": {
+      "doc": "同一成员表情回应的最短间隔（秒）。 仅保留解析兼容：表情回应的频次目前只由 Core 侧的会话节奏约束， 生产代码不读这三个值。示例配置里已删除，避免它们看起来像生效的旋钮。"
+    },
+    "group_interjection.sticker_reaction_rate_limit": {
+      "doc": "限流窗口内同一群最多回应多少次表情包。仅保留解析兼容，见上。"
+    },
+    "group_interjection.sticker_reaction_rate_window_secs": {
+      "doc": "表情回应限流统计窗口（秒）。仅保留解析兼容，见上。"
+    },
+    "group_interjection.sticker_reaction_window_secs": {
+      "doc": "芸汐发言后，单独表情包可以被视为情绪回应的时间窗口（秒）。"
+    },
+    "identity.owner_person_id": {
+      "doc": "Canonical Yunxi owner. External platform identities are only a host routing detail and are used as a fallback while this remains unset."
+    },
+    "memory.autonomous_query_enabled": {
+      "doc": "是否允许模型在上下文不足时自主检索当前会话范围内的长期记忆。"
+    },
+    "memory.autonomous_query_max_days": {
+      "doc": "自主查询允许回看的最长天数。"
+    },
+    "memory.autonomous_query_max_results": {
+      "doc": "每轮自主查询最多返回多少条记忆。"
+    },
+    "memory.autonomous_query_max_rounds": {
+      "doc": "单次回复最多允许执行多少轮自主记忆查询。"
+    },
+    "memory.embedding_backfill_batch": {
+      "doc": "一轮维护最多回填多少条记忆的向量（避免维护任务卡住）。"
+    },
+    "memory.embedding_enabled": {
+      "doc": "本机嵌入服务开关（默认开）。关掉或服务不可用时，记忆检索退回纯词面。"
+    },
+    "memory.embedding_min_similarity_millis": {
+      "doc": "语义那一路的最低相似度（千分比，默认 450 ≈ 0.45）。 **这条阈值是必须的，不是调优**：语义检索总会返回 top-K，而 BGE 的分数是压缩的 ——实测真实记忆里\"完全无关\"约 0.36、\"确实相关\"约 0.52。没有阈值，融合会把无关 记忆插到词面命中前面，**语义那一路反而让检索变差**。低于阈值就当作\"没有相关的\"， 老老实实退回词面结果。"
+    },
+    "memory.embedding_model": {
+      "doc": "嵌入模型名，随向量一起存，换模型时据此让旧向量失效。"
+    },
+    "memory.embedding_rerank_enabled": {
+      "doc": "是否用交叉编码器对融合后的候选重排（默认开）。关掉即只用融合顺序。"
+    },
+    "memory.embedding_rerank_top_n": {
+      "doc": "最多重排几条候选。重排是两段文本一起过模型，只该用在已经筛出来的少量候选上。"
+    },
+    "memory.embedding_timeout_secs": {
+      "doc": "单次嵌入请求超时（秒）。"
+    },
+    "memory.embedding_url": {
+      "doc": "嵌入服务地址（只监听回环）。"
+    },
+    "memory.episode_max_per_scope": {
+      "doc": "Hard maximum for known Episode statuses in one Mind scope. Protected known records are ranked first; unknown statuses are retained fail-closed and do not participate in eviction."
+    },
+    "memory.episode_protected_salience": {
+      "doc": "Salience at or above this value protects an episode from maintenance cleanup. The same threshold also protects strongly emotional episodes."
+    },
+    "memory.episode_retention_days": {
+      "doc": "Episode records have a longer, independent retention window than the short-lived V1 memory cache."
+    },
+    "memory.max_entries": {
+      "doc": "**失控保护，不是管理手段。** 以前它是 1000，于是\"记不记得住\"由\"数到第 1000 条\"决定：两张记忆表都按 `ROW_NUMBER() > 1000` 直接 DELETE，等于按一个数字遗忘。 现在按 Hindsight 的思路：原始记忆是事实来源，让它自然老去——由 [`Self::retention_days`]（保留期，且高重要性记忆受保护）与去重决定去留， 真正该紧的是**检索层**（每次带进上下文的条数），不是存储层。这个值只在 出现病态增长（例如某个 bug 每秒写几千条）时兜底，届时会打日志说明。",
+      "hint": "失控保护，不是管理手段。 以前这里是 1000，于是\"她记不记得住\"由\"数到第 1000 条\"决定：两张记忆表都按 `ROW_NUMBER() > 1000` 直接 DELETE，等于按一个数字遗忘（真机上那句 \"记忆清理完成，移除 1 条，当前保留 1000 条\"就是它）。 现在按 Hindsight 的思路：原始记忆是事实来源，让它**自然老去**——由 retention_days（保留期，且高重要性记忆受保护）和去重决定去留；真正该收紧的是 **检索层**（每次带进上下文的条数），不是存储层。这个值只在病态增长时兜底， 触发时会打 WARN 说明。"
+    },
+    "mind.event_update_timeout_ms": {
+      "hint": "新消息进入 Core 前的 Mind 确定性更新预算；超时会 fail-soft，不阻塞回复。"
+    },
+    "mind.influence_mode": {
+      "hint": "disabled / shadow / active。Mind 已经过 shadow 观测，生产启用 active。"
+    },
+    "model.intrinsic.shadow_routing": {
+      "hint": "见 [executive].shadow_mode：两者取或。"
+    },
+    "model.turn_gate.asset_dir": {
+      "doc": "bundle 目录 (manifest.toml + turn_gate.bin),相对 WorkingDirectory。"
+    },
+    "model.turn_gate.mode": {
+      "doc": "\"disabled\" | \"shadow\" | \"active\"。",
+      "options": [
+        "disabled",
+        "shadow",
+        "active"
+      ]
+    },
+    "model.turn_gate.response_mode": {
+      "doc": "response head (doc §8.2/§9 Phase 3-4):\"shadow\" 只记录不改变发送 (现默认);\"active\" 才允许 answer/continue/ack 参与路由(先私聊灰度)。",
+      "hint": "response head (Phase 3-4)：shadow 只记录不改变发送；active 才允许 answer/continue/ack 参与路由。 注意 active 还有一道前置条件：代码判的是 `response_mode == \"active\" && engine_available()`，而 engine_available 取决于 models/yunxi-turngate 那个**训练出来的** bundle。没有 bundle 时 active 等于 就位待命（bundle 一装上立即生效），不会凭空改变行为。 ⚠️ 装上第一个 bundle 之前先想清楚灰度顺序：这个字段设成 active 时， **没有影子阶段**——bundle 一放进 asset_dir 重启就立刻参与路由，而且群聊和 私聊一起生效。设计文档 §7.4 E 规划的放开顺序是\"先 completion，再 response； response 先私聊，再谨慎开群聊\"。所以正式训练出第一版之后，建议先把这里拨回 \"shadow\" 跑一段，用 #turn-gate-status 看 FP(误接)/FN(漏接) 记账，再按 私聊 → 群聊的顺序放开；下面 completion 的 `mode` 同理。",
+      "options": [
+        "disabled",
+        "shadow",
+        "active"
+      ]
+    },
+    "proactive.autonomous_conversation_check_interval_secs": {
+      "doc": "自主会话循环的检查间隔（秒）。"
+    },
+    "proactive.autonomous_conversation_cooldown_secs": {
+      "doc": "自主会话选择继续时，两次模型回合之间的最短间隔（秒）。"
+    },
+    "proactive.autonomous_conversation_enabled": {
+      "doc": "是否启用 Neuro-sama 风格的自主会话续聊。",
+      "hint": "Neuro-sama 风格自主会话：宿主状态机根据已发送结果和语境决定是否继续，模型只写候选正文。"
+    },
+    "proactive.autonomous_conversation_group_cooldown_secs": {
+      "doc": "群聊自主续聊选择继续时，两次模型回合之间的最短间隔（秒）。"
+    },
+    "proactive.autonomous_conversation_group_idle_secs": {
+      "doc": "群聊进入自主续聊前至少等待的时间（秒）。群聊默认比私聊更克制。",
+      "hint": "群聊自主续聊更克制：等待更久，由宿主状态机根据公共语境决定是否继续； 群里没人说话时直接停在 Wait，不再自己把话接下去。"
+    },
+    "proactive.autonomous_conversation_group_max_turns": {
+      "doc": "旧版群聊自主续聊上限。保留用于配置反序列化兼容，当前自主会话 不再读取这个字段，是否继续完全由模型语义与 `autonomous_conversation_max_turns` 共同决定。",
+      "hint": "Legacy compatibility field; retained for config compatibility, not read by the loop."
+    },
+    "proactive.autonomous_conversation_idle_secs": {
+      "doc": "用户回复后，进入自主续聊前至少等待的时间（秒）。",
+      "hint": "私聊的\"多想一句\"窗口。宿主只有在芸汐刚发出一条以问题或未完句结尾的短回复 时才会登记一个后续回合（crates/yunxi-core 的 ConversationDirective），并在 这里配置的静默时长之后才唤醒；对方在此期间说话会取消该回合。原来的 5s/3s 在真实来回里几乎永远打不开，等于这个能力从没生效过；30s/8s 才是\"人过了 一会儿又想到一句\"的节奏。"
+    },
+    "proactive.autonomous_conversation_max_turns": {
+      "doc": "单条入站消息之后，最多允许连续多少次自主续聊会话。新的入站会把计数 归零，因此它约束的是\"一次想接话的高潮\"，不会在用户再次说话后禁用主动。 默认 6；设为 0 会被校验拒绝。旧版 `autonomous_conversation_group_max_turns` 已不再被读取，本字段取代它并同时作用于私聊与群聊。",
+      "hint": "单条入站消息之后最多连续多少次自主续聊（新入站会归零计数，私聊与群聊通用）。 这是防止\"一直想说话\"的模型把一次聊天刷成无上限的高潮并烧掉大量 token 的硬上限。"
+    },
+    "proactive.check_interval_secs": {
+      "doc": "两次检查之间的间隔（秒）。"
+    },
+    "proactive.cooldown_secs": {
+      "doc": "两次主动消息之间的最短间隔（秒）。"
+    },
+    "proactive.daily_limit": {
+      "doc": "全部主动消息每天最多发送的条数。"
+    },
+    "proactive.enabled": {
+      "doc": "是否启用随机主动消息。"
+    },
+    "proactive.group_activity_min_messages": {
+      "doc": "上述窗口内至少要有多少条真人消息，才算“群里现在有人在聊”。 芸汐自己的主动消息以 `proactive_` 开头，永远不计入这个数字。"
+    },
+    "proactive.group_activity_window_secs": {
+      "doc": "群聊随机主动消息的“在场”窗口（秒）。只有在这个窗口内确实有人 说过话时，芸汐才会挑一个话题插进去；冷清的群不会被冷不丁打扰。",
+      "hint": "群聊的\"在场\"要求：窗口内（秒）确实有人说过话、且真人消息不少于 group_activity_min_messages 条时，芸汐才会在群里开口——随机主动消息与 自主续聊共用这一条判定，冷清的群不会被冷不丁打扰。她自己的主动消息 不计入条数。"
+    },
+    "proactive.inactivity_threshold_secs": {
+      "doc": "最近没有足够互动多久后，才考虑主动发送（秒）。"
+    },
+    "proactive.main_admin": {
+      "doc": "旧版最信任用户 QQ 号。配置 canonical `identity.owner_person_id` 后不再承担 owner 语义，仅作为未迁移部署的兼容回退。"
+    },
+    "proactive.main_admin_cooldown_secs": {
+      "doc": "两次实际主动联系主人之间的最短间隔。"
+    },
+    "proactive.main_admin_daily_limit": {
+      "doc": "主人每天最多收到的主动私聊条数。"
+    },
+    "proactive.main_admin_decision_interval_secs": {
+      "doc": "两次“是否联系主人”的模型决策之间的最短间隔，避免每轮循环额外消耗 token。",
+      "hint": "可选：部署者可在自己的运行时配置中填写 main_admin。"
+    },
+    "proactive.prepared_grace_ms": {
+      "doc": "主动消息进入 Prepared 后的短竞争窗口；0 关闭，否则限 300-1000ms。"
+    },
+    "proactive.push_probability_percent": {
+      "doc": "每次满足条件后实际发送的概率（0-100）。"
+    },
+    "proactive.recent_interaction_cooldown_secs": {
+      "doc": "用户最近主动互动后，暂不追加主动私聊的时间。",
+      "hint": "私聊：对方最近主动互动过就先不追加主动消息。"
+    },
+    "proactive.target_cooldown_secs": {
+      "doc": "同一个群组或用户再次收到主动消息前的最短间隔。"
+    },
+    "prompt.private_prompt": {
+      "doc": "私聊系统提示词"
+    },
+    "prompt.system_prompt": {
+      "doc": "群聊系统提示词"
+    },
+    "qq_call.allowed_callers": {
+      "doc": "允许来电的 QQ 号白名单；为空时只允许主管理员来电。",
+      "hint": "允许来电的 QQ 号白名单；留空表示只允许主管理员来电。 这份静态名单会在首次初始化时迁移进数据库，之后用 #授权通话 维护。"
+    },
+    "qq_call.archive_to_memory": {
+      "doc": "挂断后是否把通话记录写回来电者的私聊记忆。",
+      "hint": "挂断后把通话记录写回来电者的私聊记忆。"
+    },
+    "qq_call.asr_timeout_secs": {
+      "doc": "单次识别超时秒数。"
+    },
+    "qq_call.asr_url": {
+      "doc": "本机语音服务的识别接口。",
+      "hint": "本机语音服务（只接受回环地址）。"
+    },
+    "qq_call.barge_in_speech_frames": {
+      "doc": "判定对方插话所需的语音帧数。"
+    },
+    "qq_call.bridge_token_env": {
+      "doc": "桥接 Bearer Token 的环境变量名；优先级高于 `bridge_token_file`。",
+      "hint": "桥接 Token：优先读环境变量，其次读安装器生成的 0600 文件。"
+    },
+    "qq_call.bridge_token_file": {
+      "doc": "桥接 Bearer Token 文件路径（安装器生成的 0600 文件）。"
+    },
+    "qq_call.bridge_url": {
+      "doc": "NapCat AV 桥控制接口地址。只允许回环地址。",
+      "hint": "桥的控制接口（只接受回环地址）。"
+    },
+    "qq_call.caller_allowlist_enabled": {
+      "doc": "是否让桥在接听前按名单拦截（默认关闭＝保持\"接通后婉拒\"的原有行为）。 打开后：名单外的来电**根本不会被接通**，让铃声自然结束。这是为了绕开 \"客户端无法挂断、接通后通话一直留在 connected\"的问题，但会改变来电者 听到的结果（从一句婉拒变成无人接听），所以默认关闭，由部署者决定。",
+      "hint": "是否在接听前按名单拦截。默认 false＝保持上游行为：谁打进来都接通，名单外播报 refuse_message 后静音（注意：接通后机器人无法挂断，这通电话会一直连着，直到 对方挂断）。改成 true 则名单外直接不接，来电自然结束（对方听到\"无人接听\"）。"
+    },
+    "qq_call.caller_allowlist_file": {
+      "doc": "机器人写给桥的\"有效通话授权\"名单文件（宿主路径）。 内容是 `{\"callers\": [...], \"updatedAt\": \"...\"}`，由机器人把授权名单、 副管理员与主管理员取并集后写入；桥在接听前读它，名单外不接听。留空关闭 这个能力（回到\"接通后婉拒\"）。",
+      "hint": "接听授权名单：机器人把「通话授权名单 ∪ 副管理员 ∪ 主管理员」写进这个文件， 桥在每个来电接听前读它，名单外**直接不接**（让铃声自然结束）。 为什么不是\"接通后婉拒\"：QQ 的 1v1 通话没有对插件开放\"离开房间\"，接通后机器人 只能静音，通话会一直留在 connected（2026-09-11 晚上这样卡了一整夜）。文件读不到 时桥会回退成接听任何来电，避免机器人没起来时谁都打不进来。"
+    },
+    "qq_call.capture_device": {
+      "doc": "对端声音的采集设备（桥的 speaker sink 的 monitor）。"
+    },
+    "qq_call.capture_sample_rate": {
+      "doc": "采集采样率，必须与桥的 ASR 输入约定一致。",
+      "hint": "采集与切段。frame_ms 必须让\"采样率 × 帧长\"是 1000 的整数倍。"
+    },
+    "qq_call.claim_retry_rounds": {
+      "doc": "她嘴上答应了一件要动手的事却没调用任何工具时，最多补跑几轮让她真的去做。 2026-09-13 线上：她说\"那我先看看有哪些群，等我一下\"，然后整通电话再没有下文。 那一轮 `tool_calls=0`——**根本没有东西在跑**，对方等多久都不会有结果。补跑就是把 说出口的承诺变成真的工具调用：把系统纠正塞回上下文，让她重来一轮。0 = 只记 WARN。",
+      "hint": "她嘴上答应了一件要动手的事（\"我去找找\"\"等我一下\"\"我再发一次\"）却一个工具都没调时， 最多补跑几轮让她真的去做（0 = 只写告警日志、不补跑）。 2026-09-13 线上：她说\"那我先看看有哪些群，等我一下\"，然后整通电话再没有下文—— 那一轮 `tool_calls=0`，也就是**根本没有东西在跑**，对方等多久都不会有结果。补跑就是 把系统纠正塞回上下文让她重来一轮：要么真的调用工具并报结果，要么如实说做不到。"
+    },
+    "qq_call.enabled": {
+      "doc": "是否启用 QQ 语音通话。"
+    },
+    "qq_call.end_of_speech_frames": {
+      "doc": "判定说完所需的静音帧数。"
+    },
+    "qq_call.farewell": {
+      "doc": "对方要求挂断（或到达通话时长上限）时说的最后一句道别。"
+    },
+    "qq_call.frame_ms": {
+      "doc": "语音活动检测帧长毫秒数。"
+    },
+    "qq_call.greeting": {
+      "doc": "没有上下文时的固定接通问候语。"
+    },
+    "qq_call.hangup_enabled": {
+      "doc": "会话结束时是否让桥真的挂断电话（AVSDK cmd 8 = `Quit`）。 上游桥的控制接口白名单原本只有 `login(1)/accept(5)/kernel-forward(55)`， 所以机器人只能\"停止参与\"、等对方挂断。AVSDK 插件的方法表里一直有挂断 （cmd 10 = `Close`）；桥现在把它透出成 `POST /v1/calls/hangup`。打开后， 机器人结束会话时会主动挂断。具体参数是实测出来的固定值，见 `docs/qq-call.md` 的「挂断参数实验」，不开放成配置。",
+      "hint": "会话收尾时是否让桥真的挂断这通电话（默认 true）。 QQ 的 1v1 通话没有对插件开放\"离开房间\"，但 AVSDK 插件的方法表里一直有挂断 （页面 postMessage 的 cmd 就是 `QRTCServiceInterfaceWrapper` 的方法表下标： 1=Login、5=Accept、10=Close、55=OnPenetrateEvent）。桥把它透出成 `POST /v1/calls/hangup`，机器人结束会话（对方要求挂断、名单外婉拒、通话到点、 采集中断）时会调用它。关掉即回到旧行为：只能停止参与，等对方挂断。 具体参数（Close + roomId=0 + 来电者 uid + reason=1）是逐通真机试出来的固定值， 不开放成配置：Quit(8) 和 ClearRoom(11) 挂不断，uid 留空或换成机器人自己则完全 无效。详见 docs/qq-call.md 的「挂断参数实验」。对方界面偶尔出现\"要请多人通话\" 的提示是 QQ 把 1v1 通话当两人群视频房间的固有文案，不影响挂断。"
+    },
+    "qq_call.hangup_keywords": {
+      "doc": "通话中对方说了这些词就当作\"要求挂断\"：说一句道别后真的挂断电话。",
+      "hint": "通话中对方说了这些词就当作\"要求挂断\"：她说一句 farewell 后真的挂断电话。"
+    },
+    "qq_call.history_turns": {
+      "doc": "通话内保留的历史轮数。"
+    },
+    "qq_call.idle_prompt_max": {
+      "doc": "一次通话里连续主动出声的次数上限（对方一直不回应时）。 到顶就回到安静等待，避免变成不停催问；对方一开口计数归零。默认 3：足够把 \"喂？在吗\"\"怎么了呀\"\"那我先不吵你\"这类探话说完，又不会显得急。",
+      "hint": "一次通话里连续主动出声的次数上限；对方一开口计数归零。 到顶就回到安静等待，避免变成不停催问。"
+    },
+    "qq_call.idle_prompt_secs": {
+      "doc": "对方安静多少秒后她主动出声（0 = 关闭主动出声）。 电话不能是\"我说一句她答一句\"：对方不说话时她一直静音，听起来像掉线。到点她会 主动说一句（\"喂？你还在吗\"\"怎么了呀\"），也会借这一轮把没做完的事做完再报结果。 连续主动出声按倍数退避（20/40/80/160 秒），次数上限见 `idle_prompt_max`。 默认 20 秒是调出来的：第一版给 6 秒，真机上她刚讲完一句、对方还在听（或者 正等着她接着讲）就开始问\"你还在听吗\"——人的正常停顿被当成了掉线。计时从 **她说完那一刻**起算，所以这个值要按\"她说完之后对方多久没接话\"来读。",
+      "hint": "对方安静多少秒后她主动出声（0 = 关闭）。 电话不能是\"我说一句她答一句\"：对方不说话时她一直静音，听起来像掉线。到点她会主动 说一句（\"喂？你还在吗\"\"怎么了呀，怎么不说话\"），也会借这一轮把没做完的事做完再报结果。 连续主动出声按 20/40/80/160 秒退避，次数上限见 idle_prompt_max。 默认 20 秒是调出来的：第一版给 6 秒，真机上她刚讲完一句、你还在听（或正等她接着讲） 她就开始问\"你还在听吗\"——人的正常停顿被当成了掉线。计时从**她说完那一刻**起算。"
+    },
+    "qq_call.max_call_seconds": {
+      "doc": "单次通话最长秒数；超过后主动收尾并拒绝继续播放。",
+      "hint": "单次通话时长上限（秒）；到时自动收尾，避免忘记挂断。"
+    },
+    "qq_call.max_reply_chars": {
+      "doc": "电话回复的**单段**最大字数，超过会截断后再送给 TTS。 默认 120（曾经是 40）：40 字只够一句，对方让她\"一直说\"时她讲两句就被截断， 怎么都连不起来。日常回话仍然由提示词压在一两句，这个值只是安全上限。",
+      "hint": "电话里的表达。电话是低带宽通道：默认只让她说一到两句短话。 但这个值是**单段**上限，不是\"每次都只能说这么短\"：对方明确让她\"一直说、不要停\" 时她会连着讲一整段（最长这个字数），讲完还带 [[继续]] 宿主就立刻让她接着讲下一段。 默认 120；曾经是 40——40 字只够一句，真机上她怎么都连不起来，讲两句就停。"
+    },
+    "qq_call.max_utterance_ms": {
+      "doc": "单段语音最长毫秒数，超过后强制切段。"
+    },
+    "qq_call.min_speech_ms": {
+      "doc": "片段内最短有效语音毫秒数。"
+    },
+    "qq_call.min_utterance_ms": {
+      "doc": "最短语音片段毫秒数，短于该长度的片段直接丢弃。"
+    },
+    "qq_call.monologue_max_chunks": {
+      "doc": "对方要她\"一直说、不要停\"时，最多连着讲几段（0 = 不连讲）。 模型一次只生成一段，段与段之间如果等对方开口，就变成一问一答的停顿；这个 上限管的是宿主替她\"接下去\"的次数。对方随时可以插话打断，打断即停。 默认 30 段：按每段最长 `max_reply_chars` 算够讲十几分钟，又不至于让她在 没人听的时候一直念下去（通话本身还有 `max_call_seconds` 兜底）。",
+      "hint": "一次\"一直说\"最多连讲几段（0 = 不连讲）。对方随时可以插话打断，打断即停。"
+    },
+    "qq_call.notify_missed_calls": {
+      "doc": "漏接来电时是否私聊告诉主管理员（默认开启）。 \"漏接\"= 桥看到过邀请、但整通从未进房（对方一直响到放弃）。2026-09-12 实测的 成因是来电被路由到主 QQ 那台设备、AV Host 的 AVSDK 没拿到邀请，接听参数无从 产生。这种失败以前完全静默——只能从\"她没接\"察觉，所以补一条主动通知。",
+      "hint": "漏接来电时是否私聊告诉主管理员（默认 true）。 \"漏接\"= 桥看到过邀请、但整通从未进房（对方一直响到放弃）；实测成因是来电被路由到 主 QQ 那台设备、AV Host 的 AVSDK 没拿到邀请，于是接听参数无从产生。这种失败以前 完全静默——只能从\"她没接\"察觉，所以补一条主动通知。"
+    },
+    "qq_call.outgoing_enabled": {
+      "doc": "是否允许机器人主动拨打（默认开启）。 触发方式只有一种：**管理员**私聊发 `#打给我`——即\"谁让我打，我就打给谁\"， 不接受任意号码，避免变成骚扰工具。之所以只给管理员，是因为**命令只由管理员下达** （`#打给我` 与 `#系统信息` 同一条规则）；通话授权名单管的是\"谁能打进来\"。 AVSDK 侧的外呼通道（cmd 4 + JSON payload） 已真机验证可用，机器人按 AVSDK 的 `20021` 回执确认\"电话到底有没有响\"， 几秒内没回执就如实回复。注意呼出的通话不会让桥进入 ringing/connected。",
+      "hint": "是否允许机器人主动拨打（默认 true）。触发方式只有一种：管理员私聊发 `#打给我`—— \"谁让我打，我就打给谁\"，不接受任意号码。只给管理员是因为命令只由管理员下达； 通话授权名单管的是\"谁能打进来\"。AVSDK 侧的外呼通道（cmd 4 + JSON payload）已真机验证可用；机器人会按 AVSDK 的 20021 回执确认\"电话到底有没有 响\"，几秒内没回执就如实回复，不会空口答应。注意呼出的通话**不会**让桥进入 ringing/connected 阶段，所以排查时别看阶段、要看回执。"
+    },
+    "qq_call.phone_tools_enabled": {
+      "doc": "通话中是否允许她使用工具（默认开启）。 打开后，电话模型会拿到与私聊同一套受控工具（按来电者身份做管理员门控： 主管理员才有跨群发消息、持续任务这些），所以电话里让她\"帮我给群里说一声\" 或者\"提醒我明天开会\"会真的执行。关掉即回到旧行为：她只能说话、动不了手， 并且会如实说自己在打电话做不了。",
+      "hint": "通话中是否允许她使用工具（默认 true）。 打开后电话模型会拿到与私聊同一套受控工具，按来电者身份做管理员门控——所以 \"权限\"不会因为打了电话而变化：主管理员在电话里能让她给别人/群里发消息、建提醒、 启动持续任务；普通授权来电者只能查时间天气、搜网页、翻记忆这类。 电话是实时对话，所以额外做了三件事：工具超过约 0.7 秒还没回来才先说一句填充语 （`tool_filler`），免得电话里出现死寂；一次回复最多跑 `tool_max_rounds` 轮工具， 到顶强制用一句人话收尾；每次工具调用都写审计日志（参数截断）。 注意语音识别会听错（实测\"挂了吧\"能听成\"过了吧\"），所以提示词要求：会改变外部 世界的动作，她先把要做的事复述一遍并等对方明确答应，再真的执行。"
+    },
+    "qq_call.playback_device": {
+      "doc": "芸汐声音的播放设备（桥的虚拟麦克风 sink）。"
+    },
+    "qq_call.poll_interval_ms": {
+      "doc": "通话状态轮询间隔毫秒数。"
+    },
+    "qq_call.pulse_cookie": {
+      "doc": "访问隔离 PulseAudio 所需的 cookie 文件。 桥的 PulseAudio 配置里虽然写了 `auth-anonymous=1`，但实测该选项在 常见版本上并不生效：客户端必须携带与服务端一致的 cookie。容器里的 QQ/AV Host 以 root 运行本就免认证，而机器人以普通用户运行时必须显式 指定 cookie，否则会被服务端以 \"invalid authentication data\" 拒绝。 安装脚本会把服务端 cookie 同步到共享目录，这里填它的路径即可。",
+      "hint": "隔离 PulseAudio 要求客户端携带与服务端一致的 cookie（配置里的 auth-anonymous 在常见版本上不生效）。安装脚本会把服务端 cookie 同步到这个 共享路径；机器人以普通用户运行时必须填它，否则会被拒绝连接。",
+      "secret": true
+    },
+    "qq_call.pulse_server": {
+      "doc": "桥接隔离 PulseAudio 服务地址，例如 `unix:/home/ubuntu/maibot-qq-voice-call/runtime/pulse/native`。",
+      "hint": "桥隔离出来的 PulseAudio 服务与三个虚拟设备。"
+    },
+    "qq_call.refuse_message": {
+      "doc": "来电者不在白名单时播报的一句婉拒；留空表示直接静音不回应。 这句婉拒在来电者不在有效授权名单里时播报（默认行为：接通后婉拒）。"
+    },
+    "qq_call.request_timeout_secs": {
+      "doc": "单次桥接请求超时秒数。"
+    },
+    "qq_call.system_prompt": {
+      "doc": "电话模式系统提示，留空时使用内置默认。",
+      "hint": "留空使用内置电话模式提示（覆盖打字时的气泡/排版要求）。"
+    },
+    "qq_call.tool_filler": {
+      "doc": "她为了等工具结果而要挂起几秒时，先说的那句填充语。 电话里几秒没声音像掉线，所以第一次要跑工具前先说这一句。空字符串＝不说。",
+      "hint": "等工具结果时先说的那句话（空字符串＝不说）。"
+    },
+    "qq_call.tool_max_rounds": {
+      "doc": "一次回复里最多允许几轮工具调用。 模型可能来回调用把电话拖住（电话是实时对话，不是异步任务），所以到上限后 强制它用一句人话收尾。默认 3 轮足够覆盖\"先查时间再算日期再建提醒\"这类串联。",
+      "hint": "一次回复里最多几轮工具调用（至少 1 轮）。"
+    },
+    "qq_call.tts_playback_latency_ms": {
+      "doc": "PulseAudio 播放缓冲毫秒数，过低会卡顿。"
+    },
+    "qq_call.tts_sample_rate": {
+      "doc": "合成输出采样率。"
+    },
+    "qq_call.tts_timeout_secs": {
+      "doc": "合成首包等待超时秒数。"
+    },
+    "qq_call.tts_url": {
+      "doc": "本机语音服务的合成接口。"
+    },
+    "qq_voice.enabled": {
+      "doc": "是否允许芸汐主动发语音消息。"
+    },
+    "qq_voice.keep_files": {
+      "doc": "音频文件保留数量上限；超出后按时间清理最旧的。",
+      "hint": "暂存文件保留数量上限。"
+    },
+    "qq_voice.max_chars": {
+      "doc": "单条语音的最大字数，超过会被截断，避免合成出几十秒的音频。",
+      "hint": "单条语音最大字数，超出会在句末标点处截断。"
+    },
+    "qq_voice.napcat_staging_dir": {
+      "doc": "同一个目录在 NapCat 侧看到的路径。 NapCat 与机器人常常不在同一个文件系统命名空间里（我们的部署里 NapCat 跑在 容器内），而 QQ 语音上传要的是 NapCat 能打开的本地文件。所以音频写到一个 双方都能看到的共享目录，再把 NapCat 侧的路径交给它。非容器部署时两个路径 填成一样即可。",
+      "hint": "同一目录在 NapCat 侧看到的路径（容器内路径）。"
+    },
+    "qq_voice.sample_rate": {
+      "doc": "请求的合成采样率；服务返回的实际采样率以响应头为准。"
+    },
+    "qq_voice.staging_dir": {
+      "doc": "机器人写入音频文件的目录（宿主机路径）。",
+      "hint": "机器人写入音频的目录（宿主机路径）。"
+    },
+    "qq_voice.tts_timeout_secs": {
+      "doc": "单次合成超时秒数。"
+    },
+    "qq_voice.tts_url": {
+      "doc": "本机语音服务的合成接口；必须是回环地址。",
+      "hint": "复用通话功能那套本机语音服务，只监听回环。"
+    },
+    "reminders.default_timezone": {
+      "doc": "未指定时使用的 IANA 时区。"
+    },
+    "reminders.enabled": {
+      "doc": "是否允许模型创建和管理提醒。"
+    },
+    "reminders.lease_secs": {
+      "doc": "单次任务领取租约时间（秒）。"
+    },
+    "reminders.max_attempts": {
+      "doc": "发送失败后的最大尝试次数。"
+    },
+    "reminders.max_delay_days": {
+      "doc": "单条提醒最多提前多少天。"
+    },
+    "reminders.max_message_chars": {
+      "doc": "提醒正文最大字符数。"
+    },
+    "reminders.max_pending_per_group": {
+      "doc": "单个群最多保留多少条未完成群聊提醒。"
+    },
+    "reminders.max_pending_per_user": {
+      "doc": "单个用户最多保留多少条未完成私聊提醒。"
+    },
+    "reminders.max_pending_total": {
+      "doc": "所有会话最多保留多少条未完成提醒。"
+    },
+    "reminders.max_task_instruction_chars": {
+      "doc": "通用定时任务指令最大字符数。"
+    },
+    "reminders.max_task_output_chars": {
+      "doc": "通用定时任务输出最大字符数。"
+    },
+    "reminders.poll_interval_secs": {
+      "doc": "调度器扫描到期任务的间隔（秒）。"
+    },
+    "server_config.actor_authorization": {
+      "doc": "可选的自定义请求头 x-openai-actor-authorization",
+      "secret": true
+    },
+    "server_config.api_key_env": {
+      "doc": "读取主模型 Token 的环境变量名"
+    },
+    "server_config.enabled": {
+      "doc": "是否启用外部强模型。关闭后 Core/Intrinsic 仍可独立运行。"
+    },
+    "server_config.max_output_tokens": {
+      "doc": "单次回复允许模型生成的最大 token 数"
+    },
+    "server_config.max_retries": {
+      "doc": "可重试错误的额外重试次数"
+    },
+    "server_config.model_name": {
+      "doc": "使用的模型名称"
+    },
+    "server_config.request_timeout_secs": {
+      "doc": "单次 HTTP 请求超时秒数"
+    },
+    "server_config.requires_auth": {
+      "doc": "是否要求主模型携带 Bearer Token"
+    },
+    "server_config.supports_vision": {
+      "doc": "当前主模型是否可以直接接收图片"
+    },
+    "server_config.thinking_mode": {
+      "doc": "Provider reasoning mode. `auto` leaves the provider default untouched; `disabled` reserves the output budget for visible text. This is useful for DeepSeek v4, whose hidden reasoning otherwise counts against `max_tokens` and can leave an otherwise successful stream without text.",
+      "options": [
+        "auto",
+        "disabled"
+      ]
+    },
+    "server_config.url": {
+      "doc": "AI模型服务器API地址"
+    },
+    "server_config.wire_api": {
+      "doc": "API 协议：chat_completions 或 responses",
+      "options": [
+        "chat_completions",
+        "responses"
+      ]
+    },
+    "tools.calculator_enabled": {
+      "doc": "是否允许模型使用本地安全计算器。"
+    },
+    "tools.enabled": {
+      "doc": "是否启用模型自主工具调用。"
+    },
+    "tools.health_check_enabled": {
+      "doc": "是否注册管理员专用健康检查工具。"
+    },
+    "tools.max_result_chars": {
+      "doc": "工具结果最多注入模型上下文的字符数。"
+    },
+    "tools.max_rounds": {
+      "doc": "单次回复最多执行多少轮工具调用。"
+    },
+    "tools.mcp_servers": {
+      "doc": "受信任的 MCP stdio 服务。",
+      "hint": "如需 MCP，请把 mcp_servers=[] 替换为下面的 [[tools.mcp_servers]] 配置；定时任务默认不允许 MCP。"
+    },
+    "tools.mcp_servers[].allow_scheduled": {
+      "doc": "是否允许定时任务调用这个 MCP 服务。默认关闭，避免定时任务隐式执行副作用。"
+    },
+    "tools.mcp_servers[].allowed_tools": {
+      "doc": "只暴露这些工具；空列表表示不暴露任何工具。"
+    },
+    "tools.mcp_servers[].args": {
+      "doc": "传给可执行文件的参数。"
+    },
+    "tools.mcp_servers[].command": {
+      "doc": "要启动的可执行文件。"
+    },
+    "tools.mcp_servers[].cwd": {
+      "doc": "可选的工作目录。"
+    },
+    "tools.mcp_servers[].env": {
+      "doc": "仅为这个 MCP 子进程提供的环境变量。"
+    },
+    "tools.mcp_servers[].inherit_env": {
+      "doc": "从机器人进程环境中按名称传给这个 MCP 子进程的变量。"
+    },
+    "tools.mcp_servers[].name": {
+      "doc": "服务在工具名中的稳定标识。"
+    },
+    "tools.mcp_servers[].read_only": {
+      "doc": "只允许标记为只读或未声明破坏性的工具。"
+    },
+    "tools.news_search_enabled": {
+      "doc": "是否允许模型使用新闻专用搜索。",
+      "hint": "内置工具开关；新闻和天气可用于普通对话及定时任务，健康检查仅管理员可用。"
+    },
+    "tools.timeout_secs": {
+      "doc": "单次工具调用超时秒数。"
+    },
+    "tools.weather_enabled": {
+      "doc": "是否允许模型查询公开天气数据。"
+    },
+    "tools.web_fetch_enabled": {
+      "doc": "是否允许模型读取公开网页正文。"
+    },
+    "tools.web_fetch_max_chars": {
+      "doc": "网页正文最多保留多少字符。"
+    },
+    "tools.web_search_enabled": {
+      "doc": "是否允许模型查询公开网页。"
+    },
+    "tools.web_search_max_results": {
+      "doc": "网页搜索最多返回多少条结果。"
+    },
+    "vision.mcp_server": {
+      "doc": "MCP 服务名；必须对应 tools.mcp_servers 中的服务。"
+    },
+    "vision.mcp_tool": {
+      "doc": "MCP 服务中接收图片分析请求的工具名。"
+    },
+    "vision.provider": {
+      "doc": "视觉 Provider：auto、intrinsic、builtin 或 mcp。",
+      "hint": "视觉 Provider：intrinsic（本机推理）/ auto（先试 VISION_API_URL 再退本机）/ builtin（只走 VISION_API_URL）/ mcp / disabled（完全不解析图片）。 本模板默认 disabled：它是给**新机器**的默认值，而新机器上 `models/yunxi-intrinsic` 是空的——那时开 intrinsic 每次来图都会失败并留下 \"视觉不可用\"的错误，disabled 则是安静地按纯文本处理。 要用视觉必须先装 full 变体（含 SigLIP2 编码器，约 400MB）： ./scripts/download-model.sh --variant full 装完改成 intrinsic 即可（生产 2026-09-12 起就是 intrinsic）。 别用 auto 去配一个不可用的 VISION_API_URL：实测那个中转站现在未带 key 回 401、 带上 key 回 404，auto 会每次白打一遍再退回本地。",
+      "options": [
+        "disabled",
+        "intrinsic",
+        "auto",
+        "builtin",
+        "mcp"
+      ]
+    },
+    "vision.timeout_secs": {
+      "doc": "视觉 Provider 单次调用超时秒数。"
+    },
+    "world_model.activity_window_secs": {
+      "doc": "Group activity window used for the social scene bump (seconds)."
+    },
+    "world_model.enabled": {
+      "hint": "这个开关在当前代码里只影响两处**文案**：启动那行 \"World Model v4 已启用（shadow_mode=...）\" 与 #world-status 里的 \"shadow=true\"。 它没有门控任何行为（全仓只有这两个消费点），所以 false 也不改变世界模型的行为。"
+    },
+    "world_model.influence_mode": {
+      "doc": "Behavioral influence: \"disabled\" (default) or \"active\". When active, the world's interruption cost can suppress unaddressed group speech (v4 §103, §197). Keep shadow-observed before enabling.",
+      "hint": "行为级开关：disabled（行为零影响）/ active（世界 interruption cost >0.7 时抑制未点名群聊插话；请先观察 shadow 指标再开启）"
+    },
+    "world_model.max_social_scenes": {
+      "doc": "Maximum distinct conversations with a live social scene."
+    },
+    "world_model.observation_ttl_secs": {
+      "doc": "TTL (seconds) applied to observations derived from chat world facts."
+    },
+    "world_model.persist": {
+      "doc": "Persist the in-memory World Model to Postgres (restart recovery, v4 §130). Requires a configured database; ignored when `enabled=false`."
+    },
+    "world_model.persist_interval_secs": {
+      "doc": "Persistence write interval (seconds)."
+    },
+    "world_model.reply_context": {
+      "doc": "Reply-context injection: \"disabled\" (default, no effect), \"shadow\" (log what would be injected), or \"active\" (inject bounded world context into the reply). Active only after shadow review (v4 §217).",
+      "hint": "回复上下文注入：disabled（无效果）/ shadow（记录将注入的内容）/ active（注入有界客观摘要，影响节奏与分寸）。生产已在 shadow 下长期 观察，默认 active；本地/测试可切回 shadow 或 disabled。"
+    },
+    "world_sensors.sensors": {
+      "doc": "Explicitly configured sensors; when omitted, the built-in `bot:service` command sensor applies (see `default_sensors`)."
+    },
+    "world_sensors.sensors[].command": {
+      "doc": "For `command`: the shell command to run (under `sh -c`)."
+    },
+    "world_sensors.sensors[].expected_exit": {
+      "doc": "For `command`: the exit code that counts as success (default 0)."
+    },
+    "world_sensors.sensors[].expected_output": {
+      "doc": "For `command`: if non-empty, the command output must contain this text."
+    },
+    "world_sensors.sensors[].expected_status": {
+      "doc": "For url_status: the expected HTTP status code that counts as \"success\"."
+    },
+    "world_sensors.sensors[].importance": {
+      "doc": "Importance fed into the world-fact memory."
+    },
+    "world_sensors.sensors[].kind": {
+      "doc": "Sensor kind: `url_status` (fetch a URL and compare status), `command` (run a bounded shell command), or `file_state` (check a file path)."
+    },
+    "world_sensors.sensors[].name": {
+      "doc": "Stable name, e.g. \"ci:main\" — used in the world fact and as a dedupe key."
+    },
+    "world_sensors.sensors[].target": {
+      "doc": "Target: a URL (url_status) or a file path (file_state)."
+    },
+    "world_sensors.sensors[].timeout_secs": {
+      "doc": "Bounded runtime in seconds for a url fetch or a command execution."
+    },
+    "world_sensors.sensors[].watch": {
+      "doc": "Should the core be able to surface this proactively (watched open loop)?"
+    }
+  },
+  "generated_from": [
+    "plugins/model/src/config/*.rs",
+    "bot.conf.example.toml"
+  ],
+  "sections": {
+    "admin": "管理后台配置结构体 默认只监听回环地址并要求 Token 登录：后台能改全部配置、能读全部记忆， 等同于机器人本身的控制面，因此默认不接受远程连接。确实需要跨主机访问 时应显式打开 `allow_non_loopback`，并且只暴露在受控私网 / VPN / 反向代理 之后。",
+    "agent_runs": "通用持久化 Agent Run 的资源与恢复边界。",
+    "agent_tasks": "跨群问答任务配置。 这类任务会在群里发出一个问题，收集一段时间的成员回复，再把汇总 发回发起任务的主管理员私聊。所有上限都在这里集中约束，避免模型参数 直接扩大任务的资源和数据范围。",
+    "gag_ledger": "Gag-ledger (梗账本) config: structured \"promises / running gags / grudges\" the bot owes or holds. Additive and bounded by default.",
+    "group_interjection": "控制机器人在未被点名的群聊中偶尔自然接话的频率。",
+    "model.turn_gate": "TurnGate 完成度分类器 (Phase 2 接线, doc §8.2/§9): - mode = \"active\":TurnGate 优先决定 flush/hold; abstain 或无 bundle 时 回退现有 lexical + MiniMind 路径; - mode = \"shadow\":仅记录 TurnGate 会怎么说与现有路径的分歧,不改变路由; - mode = \"disabled\":完全不参与。",
+    "prompt": "提示词配置结构体 包含机器人在不同场景下使用的系统提示词",
+    "qq_call": "QQ 实时语音通话配置。 通话媒体链路完全由服务器上的 NapCat AV 桥负责（来电信令、自动接听、 PulseAudio 虚拟声卡）；本插件只做三件事：轮询桥的通话状态、对 PulseAudio 设备收发 PCM、调用本机语音服务做 ASR/TTS。默认关闭， 未配置时不影响任何现有链路。",
+    "qq_voice": "芸汐主动发语音消息的配置。 复用通话功能那套本机 TTS 服务（sherpa-onnx，只监听回环），把模型决定用语音 说出来的回复合成成音频，再交给 NapCat 以 QQ 语音消息发出。默认关闭。",
+    "reminders": "持久化提醒任务配置。",
+    "server_config": "服务器配置结构体 包含连接AI模型服务器所需的配置信息",
+    "world_model": "World Model v4 runtime config (plugins/model side). Follows the blueprint's feature-flag shape (v4 §215/§216): the runtime is `enabled = false` by default so a fresh deploy never changes behavior; once enabled it still runs in `shadow_mode = true` (records observations, scenes, and metrics only; nothing in the runtime may block or alter chat replies until it is explicitly switched to active by the operator).",
+    "world_sensors": "World-sensor framework config. Additive and disabled by default so it never disturbs the normal chat deployment. When enabled, a bounded background scheduler polls each configured sensor and, on a meaningful state change, feeds a durable world fact (and, when watched, a surfaceable open loop) into the core via `observe_world_fact`."
+  }
+}

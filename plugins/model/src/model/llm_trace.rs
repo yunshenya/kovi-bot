@@ -170,6 +170,9 @@ fn record(
     finish_reason: Option<String>,
     tool_calls: Vec<String>,
 ) {
+    // 按日用量：模型调用次数（成功与失败都算——失败也在烧重试预算）。
+    crate::metrics::record(crate::metrics::Metric::LlmCalls, 1);
+
     let purpose = current_purpose();
     let model = request_body
         .get("model")
@@ -178,6 +181,15 @@ fn record(
         .to_string();
     let prompt = render_prompt(request_body);
     let at = Local::now();
+
+    // 按日用量：模型收发的估算 token。只算成功调用——失败时 `response` 是错误
+    // 文本，把它当成模型输出会让"这周烧了多少"虚高。
+    if outcome == "ok" {
+        crate::metrics::record(
+            crate::metrics::Metric::LlmTokens,
+            crate::metrics::approx_tokens(&prompt) + crate::metrics::approx_tokens(&response),
+        );
+    }
 
     {
         let mut purposes = PURPOSES

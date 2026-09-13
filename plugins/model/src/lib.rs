@@ -22,6 +22,10 @@ use std::sync::{
 
 // 配置管理模块
 pub mod config;
+// 自带 Web 管理后台（配置 + 记忆，Token 登录）
+mod admin;
+// 按日累计的用量记账（管理后台的用量卡要"对比上周"，必须有历史）
+mod metrics;
 // 持久化角色目标与统一动作执行器
 mod agent_runtime;
 #[cfg(test)]
@@ -843,6 +847,22 @@ async fn main() {
 
         println!("[INFO] 后台任务已启动");
     }
+
+    // 用量记账：先建表，再起周期落库任务。失败只降级成"读不到历史"，
+    // 不影响聊天；每次读数前也会 flush 一次，所以界面上的数字是新鲜的。
+    match metrics::ensure_schema().await {
+        Ok(()) => {
+            kovi::tokio::spawn(metrics::run_flush_loop());
+        }
+        Err(error) => eprintln!("[WARN] 用量指标表初始化失败，用量卡将只显示本周: {error}"),
+    }
+
+    // 管理后台依赖数据库与 Redis 就绪（配置页要写文件、记忆页要读表）。
+    // 它自己只监听回环地址并要求 Token，起不来也不该拦住机器人本体。
+    admin::spawn(
+        &config::get().admin().clone(),
+        Some(Arc::clone(&proactive_bot)),
+    );
 
     if let Err(error) = write_ready_marker() {
         panic!("插件初始化完成但无法写入 readiness 标记: {error}");

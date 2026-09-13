@@ -537,10 +537,12 @@ impl MindRuntime {
         self.metrics
             .decision_observations
             .fetch_add(1, Ordering::Relaxed);
-        self.metrics.estimated_extra_prompt_tokens.fetch_add(
-            u64::try_from(estimated_extra_tokens).unwrap_or(u64::MAX),
-            Ordering::Relaxed,
-        );
+        let injected_tokens = u64::try_from(estimated_extra_tokens).unwrap_or(u64::MAX);
+        self.metrics
+            .estimated_extra_prompt_tokens
+            .fetch_add(injected_tokens, Ordering::Relaxed);
+        // 落一份到按日用量里：这就是 Hindsight 那张「获取模型」卡对应的量。
+        crate::metrics::record(crate::metrics::Metric::MindInjectedTokens, injected_tokens);
         if projection.changes_baseline() {
             match self.config.influence_mode() {
                 MindInfluenceMode::Shadow => {
@@ -2178,6 +2180,8 @@ impl MindRuntime {
             }
         }
         self.metrics.reflections.fetch_add(1, Ordering::Relaxed);
+        // 按日用量：一次真正跑完的反思。
+        crate::metrics::record(crate::metrics::Metric::ReflectionCalls, 1);
         self.metrics
             .last_reflection_unix_ms
             .store(input.requested_at.timestamp_millis(), Ordering::Relaxed);

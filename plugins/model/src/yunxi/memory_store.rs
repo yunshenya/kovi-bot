@@ -755,11 +755,16 @@ impl MemoryStore for PostgresMemoryStore {
                     .publish_memory_after_transaction(entry, duplicate_id)
                     .await;
             }
-            Memory::from_draft(id, draft, Utc::now()).map_err(|error| {
+            let memory = Memory::from_draft(id, draft, Utc::now()).map_err(|error| {
                 MemoryStoreError::InvalidRequest {
                     reason: error.to_string(),
                 }
-            })
+            })?;
+            crate::metrics::record(
+                crate::metrics::Metric::MemorySavedTokens,
+                crate::metrics::approx_tokens(memory.content()),
+            );
+            Ok(memory)
         })
     }
 
@@ -788,6 +793,7 @@ impl MemoryStore for PostgresMemoryStore {
                     .map_err(MemoryStoreError::storage)?;
                 rank_memories(&mut memories, query.text());
                 memories.truncate(query.limit());
+                record_recall(&memories);
                 return Ok(memories);
             };
             let fetch_limit = memory_candidate_limit(query.limit());
@@ -835,6 +841,7 @@ impl MemoryStore for PostgresMemoryStore {
             memories.retain(|memory| seen.insert(memory.id()));
             rank_memories(&mut memories, query.text());
             memories.truncate(query.limit());
+            record_recall(&memories);
             Ok(memories)
         })
     }
@@ -1170,6 +1177,15 @@ fn core_kind(kind: MemoryType, context: &str) -> MemoryKind {
         MemoryType::Preference => MemoryKind::Preference,
         MemoryType::Emotion => MemoryKind::Emotion,
     }
+}
+
+/// 记一次召回的用量（召回进上下文的内容量）。
+fn record_recall(memories: &[yunxi_core::Memory]) {
+    let tokens: u64 = memories
+        .iter()
+        .map(|memory| crate::metrics::approx_tokens(memory.content()))
+        .sum();
+    crate::metrics::record(crate::metrics::Metric::MemoryRecalledTokens, tokens);
 }
 
 #[cfg(test)]

@@ -1,0 +1,2178 @@
+/* 芸汐管理后台 —— 无构建前端
+ *
+ * 结构：登录 → 概览 / 配置 / 记忆。
+ * 约定：
+ *   - 一律用 DOM API 构造节点（记忆正文来自模型输出，绝不能当 HTML 插入）；
+ *   - 所有写操作都先经服务端校验，失败时展示服务端返回的原因；
+ *   - 配置页只提交"改动过的字段"，注释与未改部分由服务端无损保留。
+ */
+(() => {
+  'use strict';
+
+  // ───────────────────────────── 小工具 ─────────────────────────────
+
+  const $ = (selector) => document.querySelector(selector);
+
+  /** 建节点：h('div', {class: 'x'}, '文本', h('b', {}, '粗')) */
+  function h(tag, attrs, ...children) {
+    const node = document.createElement(tag);
+    for (const [key, value] of Object.entries(attrs || {})) {
+      if (value === null || value === undefined || value === false) continue;
+      if (key === 'class') node.className = value;
+      else if (key === 'text') node.textContent = value;
+      else if (key === 'html') node.innerHTML = value;
+      else if (key.startsWith('on') && typeof value === 'function') {
+        node.addEventListener(key.slice(2), value);
+      } else if (key === 'value') node.value = value;
+      else if (value === true) node.setAttribute(key, '');
+      else node.setAttribute(key, value);
+    }
+    for (const child of children.flat()) {
+      if (child === null || child === undefined || child === false) continue;
+      node.append(child instanceof Node ? child : document.createTextNode(String(child)));
+    }
+    return node;
+  }
+
+  function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
+
+  function toast(message, kind = 'ok', ms = 4200) {
+    const node = h('div', { class: `toast ${kind}`, text: message });
+    $('#toast-stack').append(node);
+    setTimeout(() => node.remove(), ms);
+  }
+
+  async function api(path, options = {}) {
+    const response = await fetch(path, {
+      credentials: 'same-origin',
+      headers: options.body ? { 'Content-Type': 'application/json' } : {},
+      ...options,
+      body: options.body ? JSON.stringify(options.body) : undefined,
+    });
+    if (response.status === 401) {
+      showLogin();
+      throw new Error('登录状态已失效，请重新登录');
+    }
+    let payload = null;
+    try { payload = await response.json(); } catch (_) { /* 有些响应没有正文 */ }
+    if (!response.ok) {
+      throw new Error((payload && payload.error) || `请求失败（HTTP ${response.status}）`);
+    }
+    return payload;
+  }
+
+  function fmtTime(value) {
+    if (!value) return '—';
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return String(value);
+    const pad = (n) => String(n).padStart(2, '0');
+    return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} `
+      + `${pad(date.getHours())}:${pad(date.getMinutes())}`;
+  }
+
+  function fmtBytes(bytes) {
+    if (bytes === null || bytes === undefined) return '—';
+    const units = ['B', 'KB', 'MB', 'GB'];
+    let value = Number(bytes);
+    let unit = 0;
+    while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit += 1; }
+    return `${value.toFixed(unit === 0 ? 0 : 1)} ${units[unit]}`;
+  }
+
+  function relative(iso) {
+    if (!iso) return '';
+    const then = new Date(iso).getTime();
+    if (Number.isNaN(then)) return '';
+    const seconds = Math.floor((Date.now() - then) / 1000);
+    if (seconds < 60) return '刚刚';
+    if (seconds < 3600) return `${Math.floor(seconds / 60)} 分钟前`;
+    if (seconds < 86400) return `${Math.floor(seconds / 3600)} 小时前`;
+    if (seconds < 86400 * 30) return `${Math.floor(seconds / 86400)} 天前`;
+    return fmtTime(iso);
+  }
+
+  const displayValue = (value) => {
+    if (value === null || value === undefined) return '—';
+    if (typeof value === 'object') return JSON.stringify(value);
+    if (typeof value === 'string') return value;
+    return String(value);
+  };
+
+  const MASK = '********';
+
+  // ───────────────────────────── 登录态 ─────────────────────────────
+
+  function showLogin() {
+    $('#app-view').hidden = true;
+    $('#login-view').hidden = false;
+    $('#login-token').focus();
+  }
+
+  function showApp() {
+    $('#login-view').hidden = true;
+    $('#app-view').hidden = false;
+  }
+
+  async function sha256Hex(text) {
+    const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+    return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+  }
+
+  /** 优先用一次性挑战做应答，让原始 Token 不过网；没有 WebCrypto 时退回明文。 */
+  async function submitToken(token) {
+    if (window.crypto && window.crypto.subtle) {
+      const challenge = await api('/api/login/challenge', { method: 'POST' });
+      const proof = await sha256Hex(`${challenge.nonce}:${token}`);
+      return api('/api/login', { method: 'POST', body: { nonce: challenge.nonce, proof } });
+    }
+    return api('/api/login', { method: 'POST', body: { token } });
+  }
+
+  $('#login-form').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const error = $('#login-error');
+    error.hidden = true;
+    const button = event.target.querySelector('button');
+    button.disabled = true;
+    try {
+      await submitToken($('#login-token').value);
+      $('#login-token').value = '';
+      showApp();
+      await refreshAll();
+    } catch (problem) {
+      error.textContent = problem.message;
+      error.hidden = false;
+    } finally {
+      button.disabled = false;
+    }
+  });
+
+  $('#logout').addEventListener('click', async () => {
+    try { await api('/api/logout', { method: 'POST' }); } catch (_) { /* 忽略 */ }
+    config.dirty.clear();
+    showLogin();
+  });
+
+  // ───────────────────────────── 主题 ─────────────────────────────
+
+  function applyTheme(theme) {
+    document.documentElement.dataset.theme = theme;
+    localStorage.setItem('yunxi-admin-theme', theme);
+    $('#theme-label').textContent = theme === 'dark' ? '浅色' : '深色';
+  }
+
+  $('#theme-toggle').addEventListener('click', () => {
+    const next = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
+    applyTheme(next);
+  });
+
+  // ───────────────────────────── 页面切换 ─────────────────────────────
+
+  const PAGES = {
+    overview: { title: '概览', subtitle: '进程、存储、模型与调度器的现状', render: renderOverview },
+    config: { title: '配置', subtitle: '全部参数；保存前会校验，保存时保留注释', render: renderConfigPage },
+    memory: { title: '记忆', subtitle: '长期记忆、情节、人物与未完结线索', render: renderMemoryPage },
+    system: { title: '系统', subtitle: '主机、进程、模型与 OneBot 服务端', render: renderSystemPage },
+  };
+
+  let currentPage = 'overview';
+  // 首次进入用 replaceState（不污染历史），之后的切换用 pushState（返回键可用）。
+  let hashInitialized = false;
+
+  function pageFromHash() {
+    const [name, sub] = (location.hash || '').replace(/^#\/?/, '').split('/');
+    if (PAGES[name] && sub) applyMemorySubPage(sub);
+    return PAGES[name] ? name : 'overview';
+  }
+
+  /** `#/memory/table`、`#/memory/timeline`、`#/memory/people` 可以直接打开。 */
+  function applyMemorySubPage(sub) {
+    if (sub === 'people') {
+      memory.tab = 'people';
+      return;
+    }
+    if (['constellation', 'table', 'timeline'].includes(sub)) {
+      memory.tab = 'records';
+      memory.view = sub;
+    }
+  }
+
+  async function goto(page) {
+    if (page !== 'system') stopSystemRefresh();
+    currentPage = page;
+    if (pageFromHash() !== page) {
+      const url = `#/${page}`;
+      if (hashInitialized) history.pushState(null, '', url);
+      else history.replaceState(null, '', url);
+    }
+    for (const button of document.querySelectorAll('.nav-item[data-page]')) {
+      button.classList.toggle('active', button.dataset.page === page);
+    }
+    for (const key of Object.keys(PAGES)) {
+      $(`#page-${key}`).hidden = key !== page;
+    }
+    $('#page-title').textContent = PAGES[page].title;
+    $('#page-subtitle').textContent = PAGES[page].subtitle;
+    await PAGES[page].render();
+  }
+
+  for (const button of document.querySelectorAll('.nav-item[data-page]')) {
+    button.addEventListener('click', () => goto(button.dataset.page));
+  }
+
+  // 深链接：`#/config`、`#/memory` 可以直接打开，浏览器前进/后退也能用。
+  const followHash = () => {
+    const page = pageFromHash();
+    if (page !== currentPage) goto(page);
+  };
+  window.addEventListener('hashchange', followHash);
+  window.addEventListener('popstate', followHash);
+
+  $('#refresh').addEventListener('click', () => refreshAll());
+
+  async function refreshAll() {
+    await refreshHealth();
+    await goto(currentPage);
+  }
+
+  /** 首次进入：先按地址栏里的 hash 决定落在哪一页，再拉数据。 */
+  async function boot() {
+    await refreshHealth();
+    await goto(pageFromHash());
+    hashInitialized = true;
+  }
+
+  async function refreshHealth() {
+    const pill = $('#health-pill');
+    try {
+      const status = await api('/api/status');
+      const ok = status.database.ok && status.redis.ok;
+      pill.className = `pill ${ok ? 'ok' : 'bad'}`;
+      pill.textContent = ok
+        ? `运行中 · ${status.uptime}`
+        : (status.database.ok ? 'Redis 不可用' : '数据库不可用');
+      $('#brand-revision').textContent = `${status.version} · ${String(status.revision).slice(0, 8)}`;
+      overviewCache = status;
+    } catch (problem) {
+      pill.className = 'pill bad';
+      pill.textContent = problem.message;
+    }
+  }
+
+  // ───────────────────────────── 概览 ─────────────────────────────
+
+  let overviewCache = null;
+
+  function stat(label, value, extra, small) {
+    return h('div', { class: 'stat' },
+      h('div', { class: 'label', text: label }),
+      h('div', { class: `value${small ? ' small' : ''}`, text: value }),
+      extra ? h('div', { class: 'extra', text: extra }) : null);
+  }
+
+  async function renderOverview() {
+    const page = $('#page-overview');
+    clear(page);
+    page.append(h('div', { class: 'loading', text: '读取状态…' }));
+    let status;
+    try {
+      status = await api('/api/status');
+      overviewCache = status;
+    } catch (problem) {
+      clear(page);
+      page.append(h('div', { class: 'empty', text: problem.message }));
+      return;
+    }
+    clear(page);
+
+    const counts = status.counts || {};
+    page.append(h('div', { class: 'stat-grid' },
+      stat('系统运行', status.uptime, `芸汐进程 pid ${status.pid}`),
+      stat('进程内存', (status.process || '').replace('芸汐进程内存: ', '') || '—'),
+      stat('PostgreSQL', status.database.ok ? '正常' : '异常',
+        status.database.ok ? fmtBytes(status.database.size_bytes) : status.database.detail, true),
+      stat('Redis', status.redis.ok ? '正常' : '异常', status.redis.detail, true),
+      stat('长期记忆', String(counts.memories ?? '—'), `共 ${counts.total ?? '—'} 条记录`),
+      stat('情节', String(counts.episodes ?? '—'), 'Mind Episode'),
+      stat('人物', String(counts.people ?? '—'), 'canonical Person'),
+      stat('目标 / 线索', `${counts.goals ?? '—'} / ${counts.open_loops ?? '—'}`),
+    ));
+
+    const pendingRestart = (status.admin && status.admin.pending_restart) || [];
+    if (pendingRestart.length) {
+      page.append(h('div', { class: 'restart-note' },
+        `有 ${pendingRestart.length} 个分区的改动已保存，但要重启进程才生效：`,
+        h('strong', { text: pendingRestart.join('、') }),
+        '（按你的部署方式重启服务，例如 systemctl restart kovi-bot）。'));
+    }
+
+    const model = status.model || {};
+    page.append(h('div', { class: 'card' },
+      h('div', { class: 'card-head' }, h('h3', { text: '模型与调度' }),
+        h('span', { class: 'hint', text: `配置 ${status.config.path}` })),
+      h('dl', { class: 'kv' },
+        h('dt', { text: '外部模型' }), h('dd', { text: model.enabled ? `${model.model_name}（${model.endpoint}）` : '已关闭' }),
+        h('dt', { text: 'Token 环境变量' }), h('dd', { class: 'mono', text: model.api_key_env || '—' }),
+        h('dt', { text: '本地 Intrinsic' }), h('dd', { text: model.intrinsic_enabled ? '启用' : '关闭' }),
+        h('dt', { text: 'TurnGate' }), h('dd', { text: model.turn_gate_mode || '—' }),
+        h('dt', { text: '主动消息' }), h('dd', { text: status.scheduler.proactive_enabled ? '启用' : '关闭' }),
+        h('dt', { text: '群聊接话' }), h('dd', { text: status.scheduler.group_interjection_enabled ? '启用' : '关闭' }),
+        h('dt', { text: '工具' }), h('dd', { text: status.scheduler.tools_enabled ? '启用' : '关闭' }),
+        h('dt', { text: '视觉 Provider' }), h('dd', { text: status.scheduler.vision_provider || '—' }),
+        h('dt', { text: '实时通话' }), h('dd', { text: status.scheduler.qq_call_enabled ? '启用' : '关闭' }),
+        h('dt', { text: '配置文件' }), h('dd', { text: `${status.config.modified || '—'} · ${fmtBytes(status.config.bytes)}` }),
+        h('dt', { text: '管理会话' }), h('dd', { text: `${status.admin.sessions} 个 · 后台已运行 ${Math.floor(status.admin.uptime_secs / 60)} 分钟` }),
+      )));
+
+    const recent = await api('/api/memory/records?limit=12');
+    const list = h('div', { class: 'record-list' });
+    if (!recent.items.length) {
+      list.append(h('div', { class: 'empty', text: '还没有记忆记录' }));
+    }
+    for (const item of recent.items) {
+      list.append(recordNode(item, () => { goto('memory').then(() => openRecord(item)); }, false));
+    }
+    page.append(h('div', { class: 'card' },
+      h('div', { class: 'card-head' }, h('h3', { text: '最近的记忆变化' }),
+        h('button', { class: 'btn ghost small', text: '去记忆页', onclick: () => goto('memory') })),
+      list));
+  }
+
+  // ───────────────────────────── 配置 ─────────────────────────────
+
+  const config = {
+    files: [],
+    main: 'bot.conf.toml',
+    name: null,
+    data: null,
+    dirty: new Map(),
+    filter: '',
+  };
+
+  async function renderConfigPage() {
+    const page = $('#page-config');
+    if (!config.files.length) {
+      const payload = await api('/api/config/files');
+      config.files = payload.files;
+      config.main = payload.main;
+      config.restartSections = payload.restart_sections || [];
+      config.name = config.name || config.main;
+    }
+    if (!config.data || config.data.name !== config.name) {
+      try {
+        await loadConfigFile(config.name);
+      } catch (problem) {
+        clear(page);
+        page.append(h('div', { class: 'empty', text: `读取配置失败：${problem.message}` }));
+        return;
+      }
+    }
+    clear(page);
+    const layout = h('div', { class: 'config-layout' });
+
+    // 左栏：文件 + 分区导航
+    const files = h('div', { class: 'file-list' });
+    for (const file of config.files) {
+      files.append(h('button', {
+        class: `file-card${file.name === config.name ? ' active' : ''}`,
+        onclick: async () => {
+          config.dirty.clear();
+          config.name = file.name;
+          try {
+            await renderConfigPage();
+          } catch (problem) {
+            toast(`切换到 ${file.name} 失败：${problem.message}`, 'bad');
+          }
+        },
+      },
+        h('strong', { text: file.title }),
+        h('div', { class: 'file-meta', text: `${file.name} · ${file.exists ? fmtBytes(file.bytes) : '尚未创建'}` }),
+        h('div', { class: 'file-meta', text: file.restart_required ? '改完需重启' : '保存后热加载' })));
+    }
+    const sidebar = h('div', { class: 'card' }, files);
+    layout.append(sidebar);
+
+    const main = h('div', { class: 'config-main' });
+    main.append(renderConfigToolbar());
+    if (config.dirty.size) main.append(renderSaveBar());
+    if (!config.data.writable) {
+      main.append(h('div', { class: 'restart-note' },
+        `这个文件在当前部署里是只读的（${config.data.path}）。生产环境把二进制与主配置放在只读的发布目录里，`,
+        '网页上的改动请写进「运行时覆盖配置」——它落在可写的运行时目录，发布新版本不会把它冲掉。'));
+    }
+    if (config.data.restart_required) {
+      main.append(h('div', { class: 'restart-note', text: '这个文件在启动时读取一次：保存会落盘，但要重启进程才会生效。' }));
+    }
+    const pending = (overviewCache && overviewCache.admin && overviewCache.admin.pending_restart) || [];
+    if (pending.length) {
+      main.append(h('div', { class: 'restart-note' },
+        `待重启生效的分区：${pending.join('、')}`));
+    }
+    if (config.data.view === 'sparse' && config.data.typed) {
+      main.append(h('div', { class: 'field-hint', style: 'padding: 0 4px', text: '这里只列出本文件真正写了的字段；同名字段会覆盖主配置，未列出的沿用主配置。' }));
+    }
+    const body = h('div', { class: 'config-sections' });
+    main.append(body);
+    layout.append(main);
+    page.append(layout);
+
+    renderConfigSections(body, sidebar);
+  }
+
+  function renderConfigToolbar() {
+    const data = config.data;
+    const search = h('input', {
+      class: 'input', placeholder: '搜索参数名或说明…', value: config.filter,
+      oninput: (event) => {
+        config.filter = event.target.value.trim().toLowerCase();
+        renderConfigPage();
+      },
+    });
+    return h('div', { class: 'card tight' },
+      h('div', { class: 'search-row' }, search,
+        h('button', { class: 'btn ghost', text: '原始 TOML', onclick: openRawEditor }),
+        h('button', { class: 'btn ghost', text: `备份 (${backupCount()})`, onclick: openBackups }),
+        config.data.writable ? null : h('span', { class: 'badge secret', text: '只读' }),
+        h('button', {
+          class: 'btn ghost', text: '重新加载',
+          onclick: async () => {
+            try {
+              await api('/api/config/reload', { method: 'POST' });
+              config.dirty.clear();
+              await loadConfigFile(config.name);
+              toast('已按磁盘内容重新加载配置');
+            } catch (problem) { toast(problem.message, 'bad'); }
+          },
+        })),
+      h('div', { class: 'field-hint', text: data.description || '' }));
+  }
+
+  function backupCount() {
+    return (config.files.find((file) => file.name === config.name) || {}).backups || 0;
+  }
+
+  async function loadConfigFile(name) {
+    const payload = await api(`/api/config/file/${encodeURIComponent(name)}`);
+    config.data = payload;
+    config.name = name;
+    config.dirty.clear();
+  }
+
+  /** 分区与字段渲染。filter 命中时只保留匹配的字段。 */
+  function renderConfigSections(container, sidebar) {
+    const data = config.data;
+    const values = data.values || {};
+    const nav = h('div', { class: 'section-nav' });
+    const isTyped = data.typed;
+    let shown = 0;
+
+    const sections = Object.keys(values);
+
+    for (const key of sections) {
+      const value = values[key];
+      const sectionNode = renderSection([key], key, value, isTyped);
+      if (!sectionNode) continue;
+      shown += 1;
+      container.append(sectionNode);
+      nav.append(h('button', {
+        onclick: () => sectionNode.scrollIntoView({ behavior: 'smooth', block: 'start' }),
+      }, h('span', { text: sectionTitle(key, isTyped) }),
+        h('span', { class: 'count', text: countFields(value) })));
+    }
+
+    if (!shown) {
+      container.append(h('div', { class: 'empty', text: '没有匹配的参数' }));
+    }
+
+    const previousNav = sidebar.querySelector('.section-nav');
+    if (previousNav) previousNav.remove();
+    if (isTyped) {
+      sidebar.append(h('div', { class: 'card-head', style: 'padding: 12px 2px 0' }, h('h3', { text: '分区' })), nav);
+    } else {
+      sidebar.append(h('div', { class: 'card-head', style: 'padding: 12px 2px 0' }, h('h3', { text: '顶层键' })), nav);
+    }
+  }
+
+  function sectionTitle(key) {
+    const names = {
+      identity: '身份', prompt: '人设提示词', server_config: '模型服务', proactive: '主动消息',
+      group_interjection: '群聊接话', memory: '记忆', mind: 'Mind v2', message_batch: '消息合并',
+      mood: '情绪', topic: '话题', traffic: '流量与资源上限', tools: '工具', reminders: '提醒',
+      agent_tasks: '跨群问答任务', agent_runs: 'Agent Run', world_sensors: '世界传感器',
+      world_model: 'World Model', gag_ledger: '梗账本', vision: '图片理解', qq_call: '语音通话',
+      qq_voice: '语音消息', executive: 'Executive', model: '模型路由', admin: '管理后台',
+      config: '框架', server: 'OneBot 连接', access_list: '访问白名单', plugin: '插件',
+    };
+    return names[key] || key;
+  }
+
+  function countFields(value) {
+    if (value && typeof value === 'object' && !Array.isArray(value)) {
+      return String(Object.keys(value).length);
+    }
+    return '';
+  }
+
+  /** 一个分区卡片；返回 null 表示被搜索条件过滤掉了。 */
+  function renderSection(path, key, value, isTyped) {
+    const isObject = value && typeof value === 'object' && !Array.isArray(value);
+    const doc = isTyped ? docsFor(path.join('.')) : null;
+    const body = h('div', { class: 'section-body' });
+    let visible = 0;
+
+    if (isObject) {
+      for (const [childKey, childValue] of Object.entries(value)) {
+        const childPath = [...path, childKey];
+        const childIsObject = childValue && typeof childValue === 'object' && !Array.isArray(childValue);
+        if (childIsObject && !Array.isArray(childValue)) {
+          const nested = renderSection(childPath, childKey, childValue, isTyped);
+          if (nested) { body.append(nested); visible += 1; }
+          continue;
+        }
+        const fieldNode = renderField(childPath, childValue, isTyped);
+        if (fieldNode) { body.append(fieldNode); visible += 1; }
+      }
+    } else {
+      const fieldNode = renderField(path, value, isTyped);
+      if (fieldNode) { body.append(fieldNode); visible += 1; }
+    }
+
+    if (!visible) return null;
+    const sectionPath = path.join('.');
+    const header = h('header', {
+      onclick: () => { body.hidden = !body.hidden; },
+    },
+      h('h3', { text: sectionTitle(key) }),
+      h('span', { class: 'path', text: sectionPath }));
+    const card = h('section', { class: 'card section-card', id: `section-${sectionPath}` });
+    card.append(header);
+    if (doc && doc.section) card.append(h('p', { class: 'section-doc', text: doc.section }));
+    card.append(body);
+    return card;
+  }
+
+  function docsFor(path) {
+    const docs = (config.data && config.data.docs) || {};
+    const fields = docs.fields || {};
+    const parts = path.split('.');
+    const entry = fields[path] || null;
+    const sectionDoc = (docs.sections || {})[parts[0]] || null;
+    return { entry, section: sectionDoc };
+  }
+
+  /** 单个字段：标签 + 说明 + 按类型渲染的控件。null 表示被过滤掉。 */
+  function renderField(path, value, isTyped, options) {
+    const overrides = options || {};
+    const dotted = path.join('.');
+    const numericSegments = path.filter((segment) => /^\d+$/.test(segment));
+    const docPath = dotted.replace(/\.\d+(?=\.|$)/g, '[]');
+    const meta = isTyped ? ((config.data.docs || {}).fields || {})[docPath] || null : null;
+    const doc = meta && meta.doc;
+    const hint = meta && meta.hint;
+    const secret = Boolean(meta && meta.secret);
+    const present = !isTyped || !config.data.file_paths || config.data.file_paths.includes(filePrefix(docPath));
+
+    if (config.filter) {
+      const haystack = `${dotted} ${doc || ''} ${hint || ''}`.toLowerCase();
+      if (!haystack.includes(config.filter)) return null;
+    }
+
+    const dirtyKey = overrides.dirtyKey || valueKey(path);
+    const current = overrides.current !== undefined
+      ? overrides.current
+      : (config.dirty.has(dirtyKey) ? config.dirty.get(dirtyKey) : value);
+    const changed = config.dirty.has(dirtyKey);
+
+    const control = buildControl(path, value, current, {
+      secret,
+      options: meta && meta.options,
+      commit: overrides.commit,
+    });
+
+    const restart = isTyped && restartRequiredFor(docPath);
+
+    return h('div', { class: `field${changed ? ' changed' : ''}` },
+      h('div', { class: 'field-label' },
+        h('div', { class: 'field-head' },
+          h('span', { class: 'field-name', text: path.slice(-1)[0] }),
+          secret ? h('span', { class: 'badge secret', text: '密钥' }) : null,
+          restart ? h('span', { class: 'badge restart', text: '需重启' }) : null,
+          !present ? h('span', { class: 'badge default', text: '本文件未写' }) : null,
+          numericSegments.length ? h('span', { class: 'badge', text: `第 ${Number(numericSegments[0]) + 1} 项` }) : null),
+        doc ? h('div', { class: 'field-doc', text: doc }) : null,
+        hint ? h('div', { class: 'field-hint', text: hint }) : null),
+      h('div', { class: 'field-control' }, control));
+  }
+
+  /** 数组元素的路径形如 `tools.mcp_servers[].name`，是否"写进文件"取决于数组本身。 */
+  function filePrefix(docPath) {
+    const index = docPath.indexOf('[]');
+    return index === -1 ? docPath : docPath.slice(0, index).replace(/\.$/, '');
+  }
+
+  function restartRequiredFor(docPath) {
+    const sections = (config.data && config.data.restart_sections) || [];
+    return sections.some((section) => docPath === section || docPath.startsWith(`${section}.`));
+  }
+
+  function valueKey(path) { return path.join('.'); }
+
+  function markDirty(path, value, original) {
+    const key = valueKey(path);
+    if (JSON.stringify(value) === JSON.stringify(original)) config.dirty.delete(key);
+    else config.dirty.set(key, value);
+    // 局部更新高亮与保存栏，避免整页重绘打断输入。
+    const field = document.querySelector(`[data-field="${CSS.escape(key)}"]`);
+    if (field) field.classList.toggle('changed', config.dirty.has(key));
+    refreshSaveBar();
+  }
+
+  function refreshSaveBar() {
+    const main = document.querySelector('.config-main');
+    if (!main) return;
+    const existing = main.querySelector('.save-bar');
+    if (existing) existing.remove();
+    const toolbar = main.querySelector('.card.tight');
+    if (config.dirty.size && toolbar) toolbar.after(renderSaveBar());
+  }
+
+  function renderSaveBar() {
+    const keys = [...config.dirty.keys()];
+    const bar = h('div', { class: 'save-bar' },
+      h('div', { class: 'changed-list' },
+        h('strong', { text: `${keys.length} 项改动` }),
+        h('span', { text: `：${keys.slice(0, 4).join('、')}${keys.length > 4 ? ` 等 ${keys.length} 项` : ''}` })),
+      h('div', { class: 'actions' },
+        h('button', { class: 'btn ghost', text: '查看差异', onclick: () => openDiff(keys) }),
+        h('button', {
+          class: 'btn ghost', text: '放弃',
+          onclick: async () => { config.dirty.clear(); await renderConfigPage(); },
+        }),
+        h('button', { class: 'btn primary', text: '保存并应用', onclick: saveConfig })));
+    return bar;
+  }
+
+  async function saveConfig() {
+    const changes = {};
+    for (const [key, value] of config.dirty) changes[key.replace(/\.\d+(?=\.|$)/g, '[]')] = value;
+    try {
+      const result = await api('/api/config/patch', {
+        method: 'POST',
+        body: { file: config.name, changes },
+      });
+      config.dirty.clear();
+      await loadConfigFile(config.name);
+      await renderConfigPage();
+      const restart = (result.changed || []).some((key) => restartRequiredFor(key));
+      toast(
+        `已保存 ${(result.changed || []).length} 项${result.skipped.length ? `，跳过 ${result.skipped.length} 项密钥` : ''}`
+        + (restart ? '；其中部分分区需要重启才生效' : '，已热加载'),
+        restart ? 'warn' : 'ok');
+      await refreshHealth();
+    } catch (problem) {
+      toast(`保存失败：${problem.message}`, 'bad', 9000);
+    }
+  }
+
+  function openDiff(keys) {
+    const rows = [h('tr', {}, h('th', { text: '参数' }), h('th', { text: '当前' }), h('th', { text: '将改为' }))];
+    for (const key of keys) {
+      const path = key.split('.');
+      const before = valueAtPath(config.data.values, path);
+      const after = config.dirty.get(key);
+      rows.push(h('tr', {},
+        h('td', { class: 'path', text: key }),
+        h('td', { class: 'old', text: displayValue(before) }),
+        h('td', { class: 'new', text: displayValue(after) })));
+    }
+    openModal('本次改动', h('table', { class: 'diff-table' }, ...rows));
+  }
+
+  function valueAtPath(root, path) {
+    let current = root;
+    for (const segment of path) {
+      if (current === null || current === undefined) return undefined;
+      current = current[Array.isArray(current) ? Number(segment) : segment];
+    }
+    return current;
+  }
+
+  /** 按 JSON 类型选择控件；返回一个 DOM 节点。 */
+  function buildControl(path, original, value, options) {
+    const key = valueKey(path);
+    const commit = options.commit || ((next) => markDirty(path, next, original));
+    let control;
+
+    if (typeof value === 'boolean') {
+      const input = h('input', { type: 'checkbox', checked: value });
+      input.addEventListener('change', () => commit(input.checked));
+      control = h('label', { class: 'switch' }, input,
+        h('span', { class: 'track' }), h('span', { class: 'switch-text', text: value ? '开' : '关' }));
+      input.addEventListener('change', () => { control.querySelector('.switch-text').textContent = input.checked ? '开' : '关'; });
+    } else if (typeof value === 'number') {
+      const isFloat = !Number.isInteger(value);
+      const input = h('input', {
+        class: 'input', type: 'number', value: String(value),
+        step: isFloat ? 'any' : '1',
+      });
+      input.addEventListener('input', () => {
+        const parsed = isFloat ? Number.parseFloat(input.value) : Number.parseInt(input.value, 10);
+        if (!Number.isNaN(parsed)) commit(parsed);
+      });
+      control = input;
+    } else if (value === null) {
+      const input = h('input', { class: 'input mono', placeholder: '（未设置，留空保持）', value: '' });
+      input.addEventListener('input', () => commit(input.value === '' ? null : input.value));
+      control = input;
+    } else if (Array.isArray(value)) {
+      control = buildArrayControl(path, original, value, commit);
+    } else if (typeof value === 'object') {
+      control = h('div', { class: 'field-hint', text: '嵌套结构请在原始 TOML 里编辑' });
+    } else {
+      const text = String(value);
+      if (options && options.length) {
+        const select = h('select', { class: 'select' });
+        const known = options.includes(text);
+        if (!known) select.append(h('option', { value: text, text: `${text}（当前）` }));
+        for (const option of options) {
+          select.append(h('option', { value: option, text: option, selected: option === text }));
+        }
+        select.addEventListener('change', () => commit(select.value));
+        control = select;
+      } else if (text.length > 90 || text.includes('\n')) {
+        const area = h('textarea', { class: 'textarea', rows: text.length > 400 ? 12 : 5, value: text });
+        area.addEventListener('input', () => commit(area.value));
+        control = area;
+      } else {
+        const input = h('input', { class: 'input', value: text });
+        input.addEventListener('input', () => commit(input.value));
+        control = input;
+      }
+    }
+
+    const wrapper = h('div', { 'data-field': key }, control);
+    return wrapper;
+  }
+
+  /** 数组：标量数组用逗号分隔；对象数组渲染成可增删的子表单。 */
+  function buildArrayControl(path, original, value, commit) {
+    const container = h('div');
+
+    if (value.every((item) => typeof item !== 'object' || item === null)) {
+      const isNumeric = value.every((item) => typeof item === 'number');
+      const input = h('input', {
+        class: 'input mono',
+        value: value.map((item) => (typeof item === 'string' ? item : String(item))).join(', '),
+        placeholder: '逗号分隔；留空表示空数组',
+      });
+      input.addEventListener('input', () => {
+        const parts = input.value.split(',').map((part) => part.trim()).filter((part) => part !== '');
+        commit(isNumeric ? parts.map(Number).filter((n) => !Number.isNaN(n)) : parts);
+      });
+      container.append(input, h('div', { class: 'field-hint', text: isNumeric ? '数字数组，逗号分隔' : '字符串数组，逗号分隔' }));
+      return container;
+    }
+
+    // 服务端的 patch 以"整个数组"为单位，所以数组内的每次改动都要回写整份数组；
+    // working 是当前编辑中的真值，避免连续改两个字段时后一次覆盖前一次。
+    let working = [];
+    const render = (items) => {
+      working = structuredClone(items);
+      clear(container);
+      working.forEach((item, index) => {
+        const itemPath = [...path, String(index)];
+        const fields = h('div');
+        for (const [childKey, childValue] of Object.entries(item)) {
+          fields.append(renderField([...itemPath, childKey], childValue, false, {
+            current: childValue,
+            dirtyKey: valueKey(path),
+            commit: (nextValue) => {
+              working[index][childKey] = nextValue;
+              commit(structuredClone(working));
+            },
+          }));
+        }
+        container.append(h('div', { class: 'array-item' },
+          h('div', { class: 'array-head' },
+            h('span', { class: 'array-title', text: `#${index + 1}` }),
+            h('button', {
+              class: 'btn ghost small', text: '删除',
+              onclick: () => {
+                const next = working.filter((_, position) => position !== index);
+                commit(structuredClone(next));
+                render(next);
+              },
+            })),
+          fields));
+      });
+      container.append(h('button', {
+        class: 'btn ghost small', text: '+ 添加一项',
+        onclick: () => {
+          const template = working.length ? structuredClone(working[working.length - 1]) : {};
+          for (const childKey of Object.keys(template)) template[childKey] = defaultValueFor(template[childKey]);
+          const next = [...working, template];
+          commit(structuredClone(next));
+          render(next);
+        },
+      }));
+    };
+
+    render(value);
+    return container;
+  }
+
+  function defaultValueFor(value) {
+    if (typeof value === 'string') return '';
+    if (typeof value === 'number') return 0;
+    if (typeof value === 'boolean') return false;
+    if (Array.isArray(value)) return [];
+    if (value && typeof value === 'object') return {};
+    return null;
+  }
+
+  // 原始 TOML 编辑器
+
+  function openRawEditor() {
+    const area = h('textarea', { class: 'textarea', spellcheck: 'false', value: config.data.raw });
+    openModal(`原始 TOML · ${config.name}`, area,
+      [h('button', {
+        class: 'btn primary', text: '校验并保存',
+        onclick: async (event) => {
+          event.target.disabled = true;
+          try {
+            const result = await api(`/api/config/file/${encodeURIComponent(config.name)}`, {
+              method: 'PUT', body: { raw: area.value },
+            });
+            closeModal();
+            await loadConfigFile(config.name);
+            await renderConfigPage();
+            toast(`已保存${result.reloaded ? '并热加载' : ''}${result.backup ? `，备份 ${result.backup}` : ''}`, 'ok');
+          } catch (problem) {
+            toast(`保存失败：${problem.message}`, 'bad', 10000);
+          } finally {
+            event.target.disabled = false;
+          }
+        },
+      })],
+      '留空表示不修改密钥字段；服务端会先校验再落盘');
+  }
+
+  async function openBackups() {
+    let payload;
+    try { payload = await api('/api/config/backups'); } catch (problem) { toast(problem.message, 'bad'); return; }
+    const rows = [h('tr', {}, h('th', { text: '文件' }), h('th', { text: '备份' }), h('th', { text: '大小' }), h('th', { text: '时间' }), h('th', {}))];
+    for (const backup of payload.backups.filter((item) => item.file === config.name)) {
+      rows.push(h('tr', {},
+        h('td', { text: backup.file }),
+        h('td', { class: 'path', text: backup.name }),
+        h('td', { text: fmtBytes(backup.bytes) }),
+        h('td', { text: backup.modified || '—' }),
+        h('td', {}, h('button', {
+          class: 'btn ghost small', text: '回滚',
+          onclick: async () => {
+            if (!confirm(`确定回滚到 ${backup.name}？当前内容会先备份。`)) return;
+            try {
+              await api('/api/config/restore', { method: 'POST', body: { name: backup.name } });
+              closeModal();
+              await loadConfigFile(config.name);
+              await renderConfigPage();
+              toast('已回滚到所选备份');
+            } catch (problem) { toast(problem.message, 'bad'); }
+          },
+        }))));
+    }
+    openModal('配置备份', h('table', { class: 'diff-table' }, ...rows), null, `每个文件保留最近 ${payload.keep} 份`);
+  }
+
+  // ───────────────────────────── 记忆 ─────────────────────────────
+  //
+  // 对照 Hindsight 的「记忆」页：顶部统计卡 → 常驻筛选行 → 三个视图
+  // （星座图 / 表格 / 时间线）→ 详情。每条记录都带标签与实体，
+  // 实体 chip 的取色算法跟直播版一致（31 进制哈希取模五色调色板）。
+
+  const memory = {
+    tab: 'records',
+    view: 'constellation',
+    kinds: [],
+    query: '',
+    tags: [],
+    scope: '',
+    limit: 100,
+    page: 1,
+    data: null,
+    stats: null,
+    graph: null,
+    tagList: null,
+    selected: null,
+    granularity: 'month',
+    groupIndex: 0,
+    colorBy: 'mentioned_at',
+    linkTypes: new Set(['semantic', 'temporal', 'entity', 'causal']),
+  };
+
+  // 数据库里存的是枚举标识，界面上给人话名字。
+  const TAG_LABELS = {
+    fact: '事实', event: '事件', preference: '偏好', emotion: '情绪',
+    profile: '档案', conversation: '对话', memory: '记忆',
+    personal: '个人', follow_up: '跟进', project: '项目', system: '系统',
+    promise: '许诺', awaiting_outcome: '等结果', future_event: '将来', pending_question: '待回答',
+    open: '进行中', active: '进行中', resolved: '已了结', expired: '已过期',
+    global: '全局', person: '个人', agenda: '议程',
+  };
+  const tagLabel = (tag) => TAG_LABELS[tag] || tag;
+
+  // 与 Hindsight 直播版相同的五色调色板（浅色 / 深色两套）。
+  const ENTITY_PALETTE = [
+    ['#00BC7D', '#00D492'],
+    ['#2B7FFF', '#7DB6FF'],
+    ['#8E51FF', '#B695FF'],
+    ['#F59E0B', '#FBB040'],
+    ['#EC4899', '#F472B6'],
+  ];
+
+  /** 直播版的取色算法：hash = 31*hash + charCode，再对调色板长度取模。 */
+  function entityColor(name) {
+    let hash = 0;
+    for (let index = 0; index < name.length; index += 1) {
+      hash = (31 * hash + name.charCodeAt(index)) | 0;
+    }
+    const pair = ENTITY_PALETTE[Math.abs(hash) % ENTITY_PALETTE.length];
+    return document.documentElement.dataset.theme === 'dark' ? pair[1] : pair[0];
+  }
+
+  function entityChip(name) {
+    const color = entityColor(name);
+    const dark = document.documentElement.dataset.theme === 'dark';
+    const alpha = dark ? { bg: '26', border: '4d' } : { bg: '1a', border: '33' };
+    return h('span', {
+      class: 'facet-chip',
+      title: name,
+      style: `background:${color}${alpha.bg};color:${color};border-color:${color}${alpha.border}`,
+    }, name);
+  }
+
+  function tagChip(tag, onClick, active) {
+    return h('span', {
+      class: `facet-chip tag${active ? ' active' : ''}`,
+      onclick: onClick || null,
+      style: onClick ? 'cursor:pointer' : null,
+    }, `#${tagLabel(tag)}`);
+  }
+
+  /** 把命中搜索词的片段包进 <mark>；用 DOM 节点拼，不拼 HTML 字符串。 */
+  function highlighted(text, needle) {
+    const source = String(text ?? '');
+    const term = (needle || '').trim();
+    if (!term) return [source];
+    const lowerSource = source.toLowerCase();
+    const lowerTerm = term.toLowerCase();
+    const parts = [];
+    let cursor = 0;
+    for (;;) {
+      const hit = lowerSource.indexOf(lowerTerm, cursor);
+      if (hit === -1) break;
+      if (hit > cursor) parts.push(source.slice(cursor, hit));
+      parts.push(h('mark', { text: source.slice(hit, hit + term.length) }));
+      cursor = hit + term.length;
+    }
+    if (!parts.length) return [source];
+    if (cursor < source.length) parts.push(source.slice(cursor));
+    return parts;
+  }
+
+  const LINK_TYPES = [
+    ['semantic', '语义', '#0074d9'],
+    ['temporal', '时序', '#009296'],
+    ['entity', '实体', '#f59e0b'],
+    ['causal', '因果', '#8b5cf6'],
+  ];
+
+  /** 记录进入记忆的时间 / 事情发生的时间，与 Hindsight 的两列一一对应。 */
+  /** 大数字缩写：2600 → 2.6K，108100 → 108.1K，跟 Hindsight 的写法一致。 */
+  function compactNumber(value) {
+    const number = Number(value) || 0;
+    if (Math.abs(number) < 1000) return String(number);
+    if (Math.abs(number) < 1_000_000) {
+      const scaled = number / 1000;
+      return `${scaled >= 100 ? Math.round(scaled) : scaled.toFixed(1)}K`;
+    }
+    const scaled = number / 1_000_000;
+    return `${scaled >= 100 ? Math.round(scaled) : scaled.toFixed(1)}M`;
+  }
+
+  /** 用量卡的环比行；上周为 0 时不说百分比（除零没有意义）。 */
+  function usageDelta(card) {
+    const current = Number(card.current) || 0;
+    const previous = Number(card.previous) || 0;
+    if (!previous && !current) return h('div', { class: 'delta flat' }, '与上周持平');
+    if (!previous) return h('div', { class: 'delta up' }, `本周新记 ${compactNumber(current)}`);
+    const change = Number(card.delta_percent) || 0;
+    const arrow = change > 0 ? '↗' : change < 0 ? '↘' : '→';
+    return h('div', { class: `delta ${change > 0 ? 'up' : change < 0 ? 'down' : 'flat'}` },
+      `${arrow} ${change > 0 ? '+' : ''}${change}% 对比上周`);
+  }
+
+  /** 顶部的用量卡：保存 / 召回 / 反思 / 心智模型 / 模型调用（本周）。 */
+  function renderUsageCards(usage) {
+    const wrap = h('div', { class: 'usage-block' });
+    const cards = h('div', { class: 'usage-grid six' });
+    for (const card of usage.cards || []) {
+      cards.append(h('div', { class: 'stat usage-card', title: card.hint || '' },
+        h('div', { class: 'label', text: card.label }),
+        h('div', { class: 'value' },
+          compactNumber(card.current),
+          h('span', { class: 'unit', text: card.unit })),
+        usageDelta(card)));
+    }
+    wrap.append(h('div', { class: 'card-head' },
+      h('h3', { text: '本周' }),
+      h('span', { class: 'hint', text: `${usage.period_start} → ${usage.period_end} · 单位 tokens/calls 为估算` })),
+      cards);
+    return wrap;
+  }
+
+  const occurredOf = (row) => row.occurred_at || row.mentioned_at;
+  const mentionedOf = (row) => row.mentioned_at || row.occurred_at;
+
+  function shortDate(value) {
+    if (!value) return '—';
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return '—';
+    return date.toLocaleDateString('zh-CN', { year: 'numeric', month: 'short', day: 'numeric' });
+  }
+
+  /** 时间线左侧那一列只放"几月几日"，年份交给分组标题。 */
+  function monthDay(value) {
+    if (!value) return '—';
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return '—';
+    return date.toLocaleDateString('zh-CN', { month: 'numeric', day: 'numeric' });
+  }
+
+  function shortTime(value) {
+    if (!value) return '';
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return '';
+    return `${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')} `
+      + `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`;
+  }
+
+  async function renderMemoryPage() {
+    const page = $('#page-memory');
+    clear(page);
+
+    page.append(h('div', { class: 'tabs' },
+      tabButton('records', '记忆'), tabButton('people', '人物')));
+
+    if (memory.tab === 'records') await renderRecordsTab(page);
+    else await renderPeopleTab(page);
+  }
+
+  function tabButton(key, label) {
+    return h('button', {
+      class: memory.tab === key ? 'active' : '',
+      text: label,
+      onclick: () => {
+        memory.tab = key;
+        syncMemoryHash();
+        renderMemoryPage();
+      },
+    });
+  }
+
+  /** 把当前 tab/视图写回地址栏，刷新与分享都能回到同一屏。 */
+  function syncMemoryHash() {
+    if (currentPage !== 'memory') return;
+    const sub = memory.tab === 'people' ? 'people' : memory.view;
+    history.replaceState(null, '', `#/memory/${sub}`);
+  }
+
+  // ── 记录页：统计 + 筛选 + 三视图
+
+  async function renderRecordsTab(page) {
+    const [stats, tagList] = await Promise.all([
+      api('/api/memory/stats'),
+      memory.tagList ? Promise.resolve(memory.tagList) : api('/api/memory/tags'),
+    ]);
+    memory.stats = stats;
+    memory.tagList = tagList;
+
+    if (stats.usage) page.append(renderUsageCards(stats.usage));
+    page.append(renderStatCards(stats));
+    page.append(renderFilterRow(tagList.tags || []));
+    page.append(renderViewBar());
+    if (memory.view === 'constellation') await renderConstellation(page);
+    else if (memory.view === 'table') await renderTable(page);
+    else await renderTimeline(page);
+  }
+
+  function deltaLine(current, previous) {
+    if (!previous && !current) return h('div', { class: 'delta flat' }, '与上周持平');
+    if (!previous) return h('div', { class: 'delta up' }, `本周 +${current}`);
+    const change = Math.round(((current - previous) / previous) * 100);
+    const arrow = change > 0 ? '↗' : change < 0 ? '↘' : '→';
+    return h('div', { class: `delta ${change > 0 ? 'up' : change < 0 ? 'down' : 'flat'}` },
+      `${arrow} ${change > 0 ? '+' : ''}${change}% 对比上周`);
+  }
+
+  /** 第二排：语料规模，正好 6 张（存储大小在概览页，这里不重复占位）。 */
+  function renderStatCards(stats) {
+    const byKind = stats.by_kind || {};
+    const week = stats.week || {};
+    const cards = [
+      ['记忆总数', String(stats.total ?? 0), deltaLine(week.new || 0, week.previous || 0)],
+      ['本周新增', String(week.new ?? 0), h('div', { class: 'delta flat' }, `涉及 ${(week.by_kind || []).length} 类记录`)],
+      ['人物', String(stats.people ?? 0), h('div', { class: 'delta flat' }, `${stats.conversations ?? 0} 个会话`)],
+      ['情节', String(byKind.episode ?? 0), h('div', { class: 'delta flat' }, '第一人称经历')],
+      ['目标', String(byKind.goal ?? 0), h('div', { class: 'delta flat' }, '长期目标')],
+      ['未完结线索', String(byKind.open_loop ?? 0), h('div', { class: 'delta flat' }, '等着被接上')],
+    ];
+    const grid = h('div', { class: 'stat-grid six' });
+    for (const [label, value, extra] of cards) {
+      grid.append(h('div', { class: 'stat' },
+        h('div', { class: 'label', text: label }),
+        h('div', { class: 'value', text: value }),
+        extra));
+    }
+    return grid;
+  }
+
+  function renderFilterRow(tags) {
+    const search = h('input', {
+      class: 'input',
+      placeholder: '按文本或上下文筛选（按 Enter 确认）…',
+      value: memory.query,
+      onkeydown: (event) => {
+        if (event.key === 'Enter') {
+          memory.query = search.value.trim();
+          memory.page = 1;
+          renderMemoryPage();
+        }
+      },
+      oninput: () => {
+        // 清空输入立即恢复完整列表：否则退格会停在一个零结果页上。
+        if (search.value === '' && memory.query !== '') {
+          memory.query = '';
+          memory.page = 1;
+          renderMemoryPage();
+        }
+      },
+    });
+
+    const picker = h('select', { class: 'select' },
+      h('option', { value: '', text: '按标签筛选…' }),
+      ...tags.map((entry) => h('option', {
+        value: entry.tag,
+        text: `${tagLabel(entry.tag)}（${entry.count}）`,
+        selected: memory.tags.includes(entry.tag),
+      })));
+    picker.addEventListener('change', () => {
+      if (!picker.value) return;
+      if (!memory.tags.includes(picker.value)) memory.tags.push(picker.value);
+      memory.page = 1;
+      renderMemoryPage();
+    });
+
+    const active = h('div', { class: 'filter-chips' });
+    for (const tag of memory.tags) {
+      active.append(tagChip(tag, () => {
+        memory.tags = memory.tags.filter((item) => item !== tag);
+        memory.page = 1;
+        renderMemoryPage();
+      }, true));
+    }
+    if (memory.scope) {
+      active.append(h('span', {
+        class: 'facet-chip tag active',
+        style: 'cursor:pointer',
+        onclick: () => { memory.scope = ''; memory.page = 1; renderMemoryPage(); },
+      }, `作用域：${memory.scope} ✕`));
+    }
+
+    const row = h('div', { class: 'search-row' }, search, picker,
+      h('button', {
+        class: 'btn ghost',
+        title: '刷新记忆',
+        text: '刷新',
+        onclick: () => renderMemoryPage(),
+      }),
+      (memory.query || memory.tags.length || memory.scope || memory.kinds.length)
+        ? h('button', {
+          class: 'btn ghost',
+          text: '清除筛选',
+          onclick: () => {
+            memory.query = '';
+            memory.tags = [];
+            memory.scope = '';
+            memory.kinds = [];
+            memory.page = 1;
+            renderMemoryPage();
+          },
+        })
+        : null);
+
+    const box = h('div', { class: 'card tight' }, row);
+    if (active.childNodes.length) box.append(active);
+    return box;
+  }
+
+  function renderViewBar() {
+    const views = [['constellation', '星座图'], ['table', '表格'], ['timeline', '时间线']];
+    return h('div', { class: 'view-bar' },
+      h('span', { class: 'view-count' }, memoryViewSummary()),
+      h('div', { class: 'segmented' },
+        ...views.map(([key, label]) => h('button', {
+          class: memory.view === key ? 'active' : '',
+          onclick: () => {
+            memory.view = key;
+            memory.tab = 'records';
+            syncMemoryHash();
+            renderMemoryPage();
+          },
+        }, label))));
+  }
+
+  function memoryViewSummary() {
+    if (memory.view === 'constellation') {
+      const total = memory.graph ? memory.graph.total : null;
+      return total === null ? '正在加载…' : `星座图：${total} 条记忆`;
+    }
+    if (!memory.data) return '正在加载…';
+    const filtered = memory.query || memory.tags.length || memory.scope;
+    return filtered ? `${memory.data.total} 条匹配记忆` : `共 ${memory.data.total} 条记忆`;
+  }
+
+  // ── 表格视图
+
+  async function renderTable(page) {
+    const params = new URLSearchParams({ limit: String(memory.limit) });
+    params.set('offset', String((memory.page - 1) * memory.limit));
+    if (memory.query) params.set('q', memory.query);
+    if (memory.kinds.length) params.set('kinds', memory.kinds.join(','));
+    if (memory.tags.length) params.set('tags', memory.tags.join(','));
+    if (memory.scope) params.set('scope', memory.scope);
+
+    const data = await api(`/api/memory/records?${params}`);
+    memory.data = data;
+
+    const card = h('div', { class: 'card' });
+    if (!data.items.length) {
+      card.append(h('div', { class: 'empty' },
+        memory.query || memory.tags.length ? '没有记忆匹配你的筛选条件' : '还没有记忆'));
+      page.append(card);
+      return;
+    }
+
+    const table = h('table', { class: 'memory-table' },
+      h('thead', {}, h('tr', {},
+        h('th', { class: 'w-memory', text: '记忆' }),
+        h('th', { class: 'w-entities', text: '实体' }),
+        h('th', { class: 'w-tags', text: '标签' }),
+        h('th', { class: 'w-time', text: '发生时间' }),
+        h('th', { class: 'w-time', text: '提及时间' }))));
+
+    const body = h('tbody');
+    for (const row of data.items) {
+      body.append(h('tr', {
+        onclick: () => openRecord(row),
+      },
+        h('td', {},
+          h('div', { class: 'cell-title' }, ...highlighted(row.title, memory.query)),
+          h('div', { class: 'cell-context' },
+            `${row.label} · ${row.scope_label || '全局'}${row.status ? ` · ${row.status}` : ''}`)),
+        h('td', {}, chipList(row.entities, entityChip)),
+        h('td', {}, chipList(row.tags, (tag) => tagChip(tag, null, false))),
+        h('td', { class: 'cell-time', text: shortDate(occurredOf(row)) }),
+        h('td', { class: 'cell-time', text: shortDate(mentionedOf(row)) })));
+    }
+    table.append(body);
+    card.append(table);
+    card.append(renderPager(data));
+    page.append(card);
+  }
+
+  /** 一行里最多放两个 chip，其余折成 +N（跟直播版一致）。 */
+  function chipList(values, render) {
+    const items = values || [];
+    if (!items.length) return h('span', { class: 'cell-empty', text: '-' });
+    const box = h('div', { class: 'chip-cell' });
+    for (const item of items.slice(0, 2)) box.append(render(item));
+    if (items.length > 2) {
+      box.append(h('span', { class: 'chip-more', text: `+${items.length - 2}` }));
+    }
+    return box;
+  }
+
+  function renderPager(data) {
+    const pages = Math.max(1, Math.ceil(data.total / memory.limit));
+    const jump = (target) => {
+      memory.page = Math.min(Math.max(1, target), pages);
+      renderMemoryPage();
+    };
+    const start = data.total === 0 ? 0 : (memory.page - 1) * memory.limit + 1;
+    const end = Math.min(memory.page * memory.limit, data.total);
+    return h('div', { class: 'table-foot' },
+      h('span', { class: 'muted', text: `${start}-${end} / 共 ${data.total} 条` }),
+      h('div', { class: 'pager-btns' },
+        h('button', { class: 'btn ghost small', text: '«', disabled: memory.page === 1, onclick: () => jump(1) }),
+        h('button', { class: 'btn ghost small', text: '‹', disabled: memory.page === 1, onclick: () => jump(memory.page - 1) }),
+        h('span', { class: 'muted', text: `${memory.page} / ${pages}` }),
+        h('button', { class: 'btn ghost small', text: '›', disabled: memory.page >= pages, onclick: () => jump(memory.page + 1) }),
+        h('button', { class: 'btn ghost small', text: '»', disabled: memory.page >= pages, onclick: () => jump(pages) })));
+  }
+
+  // ── 时间线视图
+
+  const GRANULARITY = [
+    ['year', '年'],
+    ['month', '月'],
+    ['week', '周'],
+    ['day', '日'],
+  ];
+
+  function groupKey(date, granularity) {
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, '0');
+    const day = String(date.getDate()).padStart(2, '0');
+    if (granularity === 'year') return `${year}`;
+    if (granularity === 'month') return `${year}-${month}`;
+    if (granularity === 'day') return `${year}-${month}-${day}`;
+    const start = new Date(date);
+    start.setDate(date.getDate() - date.getDay());
+    return `${start.getFullYear()}-${String(start.getMonth() + 1).padStart(2, '0')}-${String(start.getDate()).padStart(2, '0')}`;
+  }
+
+  function groupLabel(date, granularity) {
+    if (granularity === 'year') return `${date.getFullYear()} 年`;
+    if (granularity === 'month') return date.toLocaleDateString('zh-CN', { year: 'numeric', month: 'long' });
+    if (granularity === 'day') return date.toLocaleDateString('zh-CN', { month: 'long', day: 'numeric', weekday: 'short' });
+    const end = new Date(date);
+    end.setDate(date.getDate() + 6);
+    return `${date.getMonth() + 1}/${date.getDate()} – ${end.getMonth() + 1}/${end.getDate()}`;
+  }
+
+  function timelineGroups(rows, granularity) {
+    const groups = new Map();
+    for (const row of rows) {
+      const value = occurredOf(row);
+      if (!value) continue;
+      const date = new Date(value);
+      if (Number.isNaN(date.getTime())) continue;
+      const key = groupKey(date, granularity);
+      if (!groups.has(key)) groups.set(key, { key, date, items: [] });
+      groups.get(key).items.push(row);
+    }
+    return [...groups.values()].sort((left, right) => left.date - right.date);
+  }
+
+  async function renderTimeline(page) {
+    const params = new URLSearchParams({ limit: String(memory.limit) });
+    params.set('offset', String((memory.page - 1) * memory.limit));
+    if (memory.query) params.set('q', memory.query);
+    if (memory.kinds.length) params.set('kinds', memory.kinds.join(','));
+    if (memory.tags.length) params.set('tags', memory.tags.join(','));
+    if (memory.scope) params.set('scope', memory.scope);
+
+    const data = await api(`/api/memory/records?${params}`);
+    memory.data = data;
+    const groups = timelineGroups(data.items, memory.granularity);
+    const dated = groups.reduce((total, group) => total + group.items.length, 0);
+
+    const card = h('div', { class: 'card' });
+    if (!groups.length) {
+      card.append(h('div', { class: 'empty' }, '没有时间线数据'));
+      page.append(card);
+      return;
+    }
+
+    const first = groups[0].date;
+    const last = groups[groups.length - 1].date;
+    const zoomIndex = GRANULARITY.findIndex(([key]) => key === memory.granularity);
+
+    card.append(h('div', { class: 'timeline-head' },
+      h('span', { class: 'muted' },
+        `${dated} 条记忆（${first.toLocaleDateString('zh-CN', { month: 'short', year: 'numeric' })} → ${last.toLocaleDateString('zh-CN', { month: 'short', year: 'numeric' })}）`),
+      h('div', { class: 'pager-btns' },
+        h('div', { class: 'segmented small' },
+          h('button', {
+            text: '－', title: '缩小（年）',
+            disabled: zoomIndex === 0,
+            onclick: () => { memory.granularity = GRANULARITY[zoomIndex - 1][0]; renderMemoryPage(); },
+          }),
+          h('span', { class: 'segmented-label', text: GRANULARITY[zoomIndex][1] }),
+          h('button', {
+            text: '＋', title: '放大（日）',
+            disabled: zoomIndex === GRANULARITY.length - 1,
+            onclick: () => { memory.granularity = GRANULARITY[zoomIndex + 1][0]; renderMemoryPage(); },
+          })),
+        h('div', { class: 'segmented small' },
+          ...['«', '‹', '›', '»'].map((symbol, index) => h('button', {
+            text: symbol,
+            onclick: () => {
+              const target = [0, memory.groupIndex - 1, memory.groupIndex + 1, groups.length - 1][index];
+              memory.groupIndex = Math.min(Math.max(0, target), groups.length - 1);
+              const node = document.getElementById(`timeline-group-${memory.groupIndex}`);
+              if (node) node.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            },
+          })),
+          h('span', { class: 'segmented-label', text: `${Math.min(memory.groupIndex + 1, groups.length)} / ${groups.length}` })))));
+
+    const rail = h('div', { class: 'timeline-body' });
+    groups.forEach((group, index) => {
+      const block = h('div', { class: 'timeline-group', id: `timeline-group-${index}` },
+        h('div', { class: 'timeline-group-head' },
+          h('span', { class: 'timeline-group-label', text: groupLabel(group.date, memory.granularity) }),
+          h('span', { class: 'timeline-dot' }),
+          h('span', { class: 'muted small', text: `${group.items.length} 条目` })));
+      for (const item of group.items) {
+        block.append(h('div', { class: 'timeline-item', onclick: () => openRecord(item) },
+          h('div', { class: 'timeline-when' },
+            h('div', { text: monthDay(occurredOf(item)) }),
+            h('div', { class: 'timeline-clock', text: fmtTime(occurredOf(item)).slice(-5) })),
+          h('span', { class: 'timeline-node' }),
+          h('div', { class: 'timeline-card' },
+            h('p', { class: 'timeline-text' }, ...highlighted(item.title, memory.query)),
+            item.body && item.body !== item.title
+              ? h('p', { class: 'timeline-context' }, item.body.slice(0, 120))
+              : null,
+            chipList(item.entities, entityChip))));
+      }
+      rail.append(block);
+    });
+    card.append(rail);
+    page.append(card);
+  }
+
+  // ── 星座图视图
+
+  // 冷 → 暖的感知渐变：越新越暖（与 Hindsight 的 heatColor 同一套端点）。
+  function heatColor(t) {
+    const value = Math.max(0, Math.min(1, t));
+    const stops = [[56, 130, 220], [170, 130, 200], [240, 100, 60]];
+    const segment = value * (stops.length - 1);
+    const index = Math.min(Math.floor(segment), stops.length - 2);
+    const fraction = segment - index;
+    const from = stops[index];
+    const to = stops[index + 1];
+    const mix = (a, b) => Math.round(a + (b - a) * fraction);
+    return `rgb(${mix(from[0], to[0])},${mix(from[1], to[1])},${mix(from[2], to[2])})`;
+  }
+
+  async function renderConstellation(page) {
+    const params = new URLSearchParams({ limit: '200' });
+    if (memory.query) params.set('q', memory.query);
+    if (memory.kinds.length) params.set('kinds', memory.kinds.join(','));
+    if (memory.tags.length) params.set('tags', memory.tags.join(','));
+    const graph = await api(`/api/memory/graph?${params}`);
+    memory.graph = graph;
+
+    const controls = h('div', { class: 'graph-controls' },
+      h('label', { class: 'graph-control' },
+        h('span', { text: '着色依据' }),
+        (() => {
+          const select = h('select', { class: 'select small' },
+            h('option', { value: 'mentioned_at', text: '提及时间', selected: memory.colorBy === 'mentioned_at' }),
+            h('option', { value: 'occurred_at', text: '发生时间', selected: memory.colorBy === 'occurred_at' }),
+            h('option', { value: 'weight', text: '重要度', selected: memory.colorBy === 'weight' }));
+          select.addEventListener('change', () => { memory.colorBy = select.value; renderMemoryPage(); });
+          return select;
+        })()),
+      h('div', { class: 'graph-control' },
+        h('span', { text: '链接类型' }),
+        ...LINK_TYPES.map(([key, label, color]) => h('button', {
+          class: `link-toggle${memory.linkTypes.has(key) ? '' : ' off'}`,
+          onclick: () => {
+            if (memory.linkTypes.has(key)) memory.linkTypes.delete(key);
+            else memory.linkTypes.add(key);
+            renderMemoryPage();
+          },
+        }, h('i', { style: `background:${color}` }), label))));
+
+    const layout = h('div', { class: 'graph-layout' });
+    const canvasBox = h('div', { class: 'graph-canvas-box' },
+      h('canvas', { id: 'memory-graph' }),
+      h('div', { class: 'graph-hint', text: '滚动缩放 · 拖动平移 · 悬停探索 · 点击查看详情' }),
+      h('div', { class: 'graph-heat' },
+        h('span', { class: 'graph-heat-label' },
+          memory.colorBy === 'weight' ? '重要度' : memory.colorBy === 'mentioned_at' ? '近期度 · 提及时间' : '近期度 · 发生时间'),
+        h('div', { class: 'graph-heat-bar' }),
+        h('div', { class: 'graph-heat-range' },
+          h('span', { text: memory.colorBy === 'weight' ? '低' : shortDate(graph.range && graph.range.min) }),
+          h('span', { text: memory.colorBy === 'weight' ? '高' : shortDate(graph.range && graph.range.max) }))),
+      h('button', { class: 'btn ghost small graph-full', text: '全屏', onclick: () => toggleGraphFullscreen(canvasBox) }),
+      h('div', { class: 'graph-tooltip', id: 'graph-tooltip', hidden: true }));
+    layout.append(canvasBox);
+
+    const counts = graph.link_counts || {};
+    layout.append(h('aside', { class: 'graph-side' },
+      h('h4', { text: '星座视图' }),
+      h('p', { class: 'muted small' },
+        '画布渲染的记忆地图：节点是记忆，连线是它们之间真实存在的关系。滚动缩放，拖动平移，悬停探索，点击查看详情。'),
+      h('div', { class: 'graph-stat' },
+        h('div', {}, h('div', { class: 'label', text: '节点' }), h('div', { class: 'value', text: String(graph.total) })),
+        h('div', {}, h('div', { class: 'label', text: '链接' }),
+          h('div', { class: 'value', text: String(Object.values(counts).reduce((a, b) => a + b, 0)) }))),
+      h('div', { class: 'graph-legend' },
+        ...LINK_TYPES.map(([key, label, color]) => h('div', { class: 'graph-legend-row' },
+          h('i', { style: `background:${color}` }), label,
+          h('span', { class: 'muted', text: String(counts[key] || 0) }))))));
+
+    const card = h('div', { class: 'card' }, controls, layout);
+    page.append(card);
+    drawConstellation(graph);
+  }
+
+  function toggleGraphFullscreen(box) {
+    if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+    else box.requestFullscreen?.().catch(() => toast('浏览器拒绝了全屏请求', 'bad'));
+  }
+
+  /** 力导向布局 + canvas 绘制；几百个节点内足够，且只在需要时重绘。 */
+  function drawConstellation(graph) {
+    const canvas = $('#memory-graph');
+    if (!canvas) return;
+    const context = canvas.getContext('2d');
+    const tip = $('#graph-tooltip');
+
+    const nodes = (graph.nodes || []).filter((node) => memory.kinds.length === 0 || true);
+    const links = (graph.links || []).filter((link) => memory.linkTypes.has(link.type));
+    const byId = new Map(nodes.map((node) => [node.id, node]));
+    const edges = links
+      .map((link) => ({ ...link, a: byId.get(link.source), b: byId.get(link.target) }))
+      .filter((edge) => edge.a && edge.b);
+
+    // 时间/权重 → 0..1 的热度
+    const times = nodes.map((node) => new Date(occurredOf(node)).getTime()).filter((t) => !Number.isNaN(t));
+    const minTime = times.length ? Math.min(...times) : 0;
+    const maxTime = times.length ? Math.max(...times) : 1;
+    const weights = nodes.map((node) => Number(node.weight) || 0);
+    const maxWeight = Math.max(1, ...weights);
+    const heat = (node) => {
+      if (memory.colorBy === 'weight') return (Number(node.weight) || 0) / maxWeight;
+      const value = new Date(memory.colorBy === 'mentioned_at' ? mentionedOf(node) : occurredOf(node)).getTime();
+      if (Number.isNaN(value) || maxTime === minTime) return 0.5;
+      return (value - minTime) / (maxTime - minTime);
+    };
+
+    const degree = new Map();
+    for (const edge of edges) {
+      degree.set(edge.a.id, (degree.get(edge.a.id) || 0) + 1);
+      degree.set(edge.b.id, (degree.get(edge.b.id) || 0) + 1);
+    }
+
+    // 世界坐标：确定性初始摆放（按 id 哈希落在一个圆盘里），再跑力导向。
+    const state = { zoom: 0.9, panX: 0, panY: 0, hovered: null, dragging: false, moved: false };
+    const width = () => canvas.clientWidth || 640;
+    const height = () => canvas.clientHeight || 520;
+
+    nodes.forEach((node, index) => {
+      const angle = index * 2.399963;
+      const radius = Math.sqrt(index + 1) * 26;
+      node.wx = Math.cos(angle) * radius;
+      node.wy = Math.sin(angle) * radius;
+      node.vx = 0;
+      node.vy = 0;
+    });
+
+    const relax = (iterations) => {
+      for (let step = 0; step < iterations; step += 1) {
+        const alpha = 0.35 * (1 - step / iterations) + 0.02;
+        for (let i = 0; i < nodes.length; i += 1) {
+          const a = nodes[i];
+          for (let j = i + 1; j < nodes.length; j += 1) {
+            const b = nodes[j];
+            let dx = a.wx - b.wx;
+            let dy = a.wy - b.wy;
+            let distance = Math.hypot(dx, dy) || 0.01;
+            if (distance > 420) continue;
+            const push = (2600 / (distance * distance)) * alpha;
+            dx /= distance;
+            dy /= distance;
+            a.vx += dx * push;
+            a.vy += dy * push;
+            b.vx -= dx * push;
+            b.vy -= dy * push;
+          }
+        }
+        for (const edge of edges) {
+          const dx = edge.b.wx - edge.a.wx;
+          const dy = edge.b.wy - edge.a.wy;
+          const distance = Math.hypot(dx, dy) || 0.01;
+          const pull = (distance - 70) * 0.006 * alpha;
+          const fx = (dx / distance) * pull;
+          const fy = (dy / distance) * pull;
+          edge.a.vx += fx;
+          edge.a.vy += fy;
+          edge.b.vx -= fx;
+          edge.b.vy -= fy;
+        }
+        for (const node of nodes) {
+          node.wx += node.vx = node.vx * 0.6;
+          node.wy += node.vy = node.vy * 0.6;
+        }
+      }
+    };
+
+    const toScreen = (node) => ({
+      x: width() / 2 + (node.wx + state.panX) * state.zoom,
+      y: height() / 2 + (node.wy + state.panY) * state.zoom,
+    });
+
+    const paint = () => {
+      const ratio = window.devicePixelRatio || 1;
+      canvas.width = width() * ratio;
+      canvas.height = height() * ratio;
+      context.setTransform(ratio, 0, 0, ratio, 0, 0);
+      context.clearRect(0, 0, width(), height());
+
+      const dim = state.hovered ? new Set([state.hovered.id]) : null;
+      if (state.hovered) {
+        for (const edge of edges) {
+          if (edge.a.id === state.hovered.id) dim.add(edge.b.id);
+          if (edge.b.id === state.hovered.id) dim.add(edge.a.id);
+        }
+      }
+
+      for (const edge of edges) {
+        const active = !state.hovered || edge.a.id === state.hovered.id || edge.b.id === state.hovered.id;
+        const a = toScreen(edge.a);
+        const b = toScreen(edge.b);
+        context.strokeStyle = LINK_TYPES.find(([key]) => key === edge.type)[2];
+        context.globalAlpha = active ? 0.5 : 0.08;
+        context.lineWidth = active ? 1.2 : 0.8;
+        context.beginPath();
+        context.moveTo(a.x, a.y);
+        const midX = (a.x + b.x) / 2 + (b.y - a.y) * 0.08;
+        const midY = (a.y + b.y) / 2 - (b.x - a.x) * 0.08;
+        context.quadraticCurveTo(midX, midY, b.x, b.y);
+        context.stroke();
+      }
+      context.globalAlpha = 1;
+
+      for (const node of nodes) {
+        const point = toScreen(node);
+        const radius = 3.2 + Math.sqrt(degree.get(node.id) || 0) * 1.7;
+        const faded = dim && !dim.has(node.id);
+        context.beginPath();
+        context.fillStyle = heatColor(heat(node));
+        context.globalAlpha = faded ? 0.25 : 0.95;
+        context.arc(point.x, point.y, radius * (state.hovered === node ? 1.5 : 1), 0, Math.PI * 2);
+        context.fill();
+        context.globalAlpha = faded ? 0.2 : 0.85;
+        context.strokeStyle = 'rgba(255,255,255,0.55)';
+        context.lineWidth = 0.8;
+        context.stroke();
+      }
+      context.globalAlpha = 1;
+
+      // 标签：悬停优先，其次在高缩放级别显示度数高的节点。
+      context.font = '11px system-ui, sans-serif';
+      context.fillStyle = getComputedStyle(document.body).color;
+      for (const node of nodes) {
+        const show = state.hovered === node || (state.zoom > 0.55 && (degree.get(node.id) || 0) >= 3);
+        if (!show) continue;
+        const point = toScreen(node);
+        context.globalAlpha = state.hovered === node ? 1 : 0.7;
+        context.fillText(String(node.title || '').slice(0, 18), point.x + 7, point.y + 3);
+      }
+      context.globalAlpha = 1;
+    };
+
+    const nodeAt = (event) => {
+      const rect = canvas.getBoundingClientRect();
+      const x = event.clientX - rect.left;
+      const y = event.clientY - rect.top;
+      let best = null;
+      let bestDistance = 16;
+      for (const node of nodes) {
+        const point = toScreen(node);
+        const distance = Math.hypot(point.x - x, point.y - y);
+        if (distance < bestDistance) {
+          bestDistance = distance;
+          best = node;
+        }
+      }
+      return best;
+    };
+
+    canvas.addEventListener('mousemove', (event) => {
+      if (state.dragging) {
+        state.panX += event.movementX / state.zoom;
+        state.panY += event.movementY / state.zoom;
+        state.moved = true;
+        paint();
+        return;
+      }
+      const node = nodeAt(event);
+      if (node !== state.hovered) {
+        state.hovered = node;
+        canvas.style.cursor = node ? 'pointer' : 'grab';
+        paint();
+      }
+      if (node && tip) {
+        const rect = canvas.getBoundingClientRect();
+        tip.hidden = false;
+        tip.style.left = `${event.clientX - rect.left + 14}px`;
+        tip.style.top = `${event.clientY - rect.top + 10}px`;
+        clear(tip);
+        tip.append(
+          h('div', { class: 'tip-kind', text: node.label || node.kind }),
+          h('div', { class: 'tip-title', text: node.title || '' }),
+          h('div', { class: 'tip-meta', text: `${node.scope_label || '全局'} · ${shortDate(mentionedOf(node))}` }));
+      } else if (tip) {
+        tip.hidden = true;
+      }
+    });
+    canvas.addEventListener('mouseleave', () => {
+      state.hovered = null;
+      if (tip) tip.hidden = true;
+      paint();
+    });
+    canvas.addEventListener('mousedown', () => {
+      state.dragging = true;
+      state.moved = false;
+      canvas.style.cursor = 'grabbing';
+    });
+    window.addEventListener('mouseup', () => {
+      state.dragging = false;
+      canvas.style.cursor = state.hovered ? 'pointer' : 'grab';
+    });
+    canvas.addEventListener('click', (event) => {
+      if (state.moved) return;
+      const node = nodeAt(event);
+      if (node) openRecord(node);
+    });
+    canvas.addEventListener('wheel', (event) => {
+      event.preventDefault();
+      const factor = event.deltaY < 0 ? 1.12 : 0.89;
+      state.zoom = Math.min(4, Math.max(0.15, state.zoom * factor));
+      paint();
+    }, { passive: false });
+
+    // 布局分帧跑，避免几百个节点把首屏卡住。
+    let remaining = 140;
+    const step = () => {
+      if (!canvas.isConnected) return;
+      relax(6);
+      remaining -= 6;
+      paint();
+      if (remaining > 0) requestAnimationFrame(step);
+    };
+    step();
+  }
+
+  // ── 详情
+
+  async function openRecord(item) {
+    memory.selected = item;
+    openModal(item.title || '记忆详情', h('div', { class: 'loading', text: '读取详情…' }));
+    let payload;
+    try {
+      payload = await api(`/api/memory/record/${encodeURIComponent(item.kind)}/${encodeURIComponent(item.id)}`);
+    } catch (problem) {
+      $('#modal-body').replaceChildren(h('div', { class: 'empty', text: problem.message }));
+      return;
+    }
+    const record = payload.record || {};
+    const body = h('div', { class: 'record-detail' });
+    body.append(h('dl', { class: 'kv' },
+      h('dt', { text: '类型' }), h('dd', {}, h('span', { class: 'badge kind', text: payload.label })),
+      h('dt', { text: '作用域' }), h('dd', { text: payload.scope_label || '全局' }),
+      h('dt', { text: '发生时间' }), h('dd', { text: fmtTime(occurredOf(item)) }),
+      h('dt', { text: '提及时间' }), h('dd', { text: fmtTime(mentionedOf(item)) }),
+      item.status ? h('dt', { text: '状态' }) : null,
+      item.status ? h('dd', { text: item.status }) : null,
+      h('dt', { text: '标识' }), h('dd', { class: 'mono', text: `${payload.table} · ${record.id}` })));
+
+    if ((item.entities || []).length) {
+      body.append(h('div', { class: 'field-label', style: 'margin-top:14px', text: '实体' }),
+        h('div', { class: 'chip-cell' }, ...item.entities.map(entityChip)));
+    }
+    if ((item.tags || []).length) {
+      body.append(h('div', { class: 'field-label', style: 'margin-top:12px', text: '标签' }),
+        h('div', { class: 'chip-cell' }, ...item.tags.map((tag) => tagChip(tag, null, false))));
+    }
+
+    const bodyFields = ['content', 'text', 'summary', 'proposition', 'question', 'details'];
+    for (const field of bodyFields) {
+      if (typeof record[field] === 'string' && record[field].trim()) {
+        body.append(h('div', { class: 'body-text', style: 'margin-top:14px' },
+          ...highlighted(record[field], memory.query)));
+        break;
+      }
+    }
+
+    const nested = Object.entries(record).filter(([, value]) => value !== null && typeof value === 'object');
+    if (nested.length) {
+      const details = h('details', { style: 'margin-top:16px' },
+        h('summary', { style: 'cursor:pointer;color:var(--text-dim);font-size:12.5px', text: '原始字段' }));
+      for (const [key, value] of nested) {
+        details.append(
+          h('div', { class: 'field-name', style: 'margin-top:12px', text: key }),
+          h('pre', { class: 'json', text: JSON.stringify(value, null, 2) }));
+      }
+      body.append(details);
+    }
+    $('#modal-body').replaceChildren(body);
+  }
+
+  // ── 人物
+
+  async function renderPeopleTab(page) {
+    const search = h('input', { class: 'input', placeholder: '按 QQ 号或身份搜索…', value: memory.query });
+    page.append(h('div', { class: 'card tight' },
+      h('div', { class: 'search-row' }, search,
+        h('button', {
+          class: 'btn', text: '搜索',
+          onclick: () => { memory.query = search.value; renderMemoryPage(); },
+        }))));
+
+    const data = await api(`/api/memory/people?limit=60${memory.query ? `&q=${encodeURIComponent(memory.query)}` : ''}`);
+    page.append(h('div', { class: 'card-head' },
+      h('h3', { text: `人物（${data.total}）` }),
+      h('span', { class: 'hint', text: 'canonical Person 及其 QQ 身份' })));
+
+    const grid = h('div', { class: 'person-list' });
+    for (const person of data.items) {
+      grid.append(h('div', { class: 'person-card', onclick: () => openPerson(person) },
+        h('div', { class: 'name', text: person.display }),
+        h('div', { class: 'ids', text: person.identities || person.id }),
+        bars(person.relation),
+        h('div', { class: 'ids', style: 'margin-top: 8px', text: `记忆 ${person.memory_count} 条` })));
+    }
+    if (!data.items.length) grid.append(h('div', { class: 'empty', text: '还没有人物记录' }));
+    page.append(grid);
+  }
+
+  function bars(relation) {
+    if (!relation) return null;
+    const node = h('div', { class: 'bars' });
+    for (const [key, label] of [['familiarity', '熟悉'], ['affinity', '好感'], ['trust', '信任'], ['comfort', '自在']]) {
+      const value = relation[key];
+      if (value === null || value === undefined) continue;
+      node.append(h('div', { class: 'bar' },
+        h('span', { text: label }),
+        h('div', { class: 'track' },
+          h('div', { class: 'fill', style: `width: ${Math.round(((Number(value) + 1) / 2) * 100)}%` }))));
+    }
+    return node;
+  }
+
+  async function openPerson(person) {
+    openModal(person.display, h('div', { class: 'loading', text: '读取人物详情…' }));
+    let payload;
+    try {
+      payload = await api(`/api/memory/person/${encodeURIComponent(person.id)}`);
+    } catch (problem) {
+      $('#modal-body').replaceChildren(h('div', { class: 'empty', text: problem.message }));
+      return;
+    }
+    const body = h('div');
+    body.append(h('dl', { class: 'kv' },
+      h('dt', { text: 'PersonId' }), h('dd', { class: 'mono', text: payload.id }),
+      h('dt', { text: '外部身份' }), h('dd', {
+        text: (payload.identities || []).map((identity) => `${identity.platform}:${identity.external_id}`).join('、') || '—',
+      }),
+      h('dt', { text: '会话' }), h('dd', {
+        text: (payload.conversations || []).map((conversation) => `${conversation.kind} ${conversation.external_id || conversation.id.slice(0, 8)}`).join('、') || '—',
+      })));
+
+    if (payload.relation) {
+      body.append(h('h4', { text: '关系' }), bars(payload.relation));
+    }
+    if (payload.affect) {
+      const affect = payload.affect;
+      body.append(h('h4', { text: '情绪' }),
+        h('dl', { class: 'kv' },
+          h('dt', { text: '愉悦度' }), h('dd', { text: Number(affect.valence ?? 0).toFixed(2) }),
+          h('dt', { text: '唤醒度' }), h('dd', { text: Number(affect.arousal ?? 0).toFixed(2) }),
+          h('dt', { text: '社交能量' }), h('dd', { text: Number(affect.social_energy ?? 0).toFixed(2) }),
+          h('dt', { text: '好奇' }), h('dd', { text: Number(affect.curiosity ?? 0).toFixed(2) })));
+    }
+    if (payload.records && payload.records.length) {
+      body.append(h('h4', { text: `相关记录（${payload.records.length}）` }));
+      const list = h('div', { class: 'record-list' });
+      for (const item of payload.records) {
+        list.append(recordNode(item, () => openRecord(item), false));
+      }
+      body.append(list);
+    }
+    $('#modal-body').replaceChildren(body);
+  }
+
+  /** 人物弹窗里用的紧凑记录行。 */
+  function recordNode(item, onClick, active) {
+    const needle = memory.query;
+    return h('div', {
+      class: `record${active ? ' active' : ''}`,
+      onclick: onClick,
+    },
+      h('div', { class: 'record-head' },
+        h('span', { class: 'badge kind', text: item.label || item.kind }),
+        item.status ? h('span', { class: 'badge', text: item.status }) : null),
+      h('div', { class: 'record-title' }, ...highlighted(item.title, needle)),
+      item.body && item.body !== item.title
+        ? h('div', { class: 'record-body' }, ...highlighted(item.body.slice(0, 160), needle))
+        : null,
+      h('div', { class: 'record-foot' },
+        h('span', { text: item.scope_label || '全局' }),
+        h('span', { text: relative(item.occurred_at) || fmtTime(item.occurred_at) })));
+  }
+
+  // ───────────────────────────── 系统 ─────────────────────────────
+  //
+  // 主机与进程的实时面板：身份、运行环境、CPU / 内存（环形仪表盘）、磁盘、
+  // 网络，以及从 OneBot 服务端问来的 NapCat 版本与登录号。页面停留时每 5 秒
+  // 自动刷新一次，离开就停——采样器是复用的，只有真在看才值得刷。
+
+  let systemTimer = null;
+
+  function stopSystemRefresh() {
+    if (systemTimer !== null) {
+      clearInterval(systemTimer);
+      systemTimer = null;
+    }
+  }
+
+  async function renderSystemPage() {
+    const page = $('#page-system');
+    clear(page);
+    page.append(h('div', { class: 'loading', text: '采集系统信息…' }));
+    let data;
+    try {
+      data = await api('/api/system');
+    } catch (problem) {
+      clear(page);
+      page.append(h('div', { class: 'empty', text: problem.textContent || problem.message }));
+      return;
+    }
+    if (currentPage !== 'system') return;
+    clear(page);
+
+    const identity = data.identity || {};
+    const host = data.host || {};
+    const cpu = data.cpu || {};
+    const memory = data.memory || {};
+    const onebot = data.onebot || {};
+
+    const left = h('div', { class: 'sys-column' },
+      h('div', { class: 'card identity-card' },
+        h('div', { class: 'identity-mark' }, '汐'),
+        h('div', { class: 'identity-body' },
+          h('div', { class: 'identity-name' },
+            identity.name || '芸汐',
+            h('span', {
+              class: `dot ${onebot.available ? 'ok' : 'off'}`,
+              title: onebot.available ? 'OneBot 已连接' : 'OneBot 未连接',
+            })),
+          h('div', { class: 'identity-sub' },
+            onebot.login && onebot.login.user_id
+              ? `QQ ${onebot.login.user_id}${onebot.login.nickname ? ` · ${onebot.login.nickname}` : ''}`
+              : '未取到登录号'))),
+
+      h('div', { class: 'card' },
+        h('div', { class: 'card-head' }, h('h3', { text: '运行环境' })),
+        h('dl', { class: 'kv sys-kv' },
+          h('dt', { text: '机器人版本' }), h('dd', { text: identity.version || '—' }),
+          h('dt', { text: '部署版本' }), h('dd', { class: 'mono', text: String(identity.revision || '未知').slice(0, 12) }),
+          h('dt', { text: '操作系统' }), h('dd', { text: host.os || '—' }),
+          h('dt', { text: '内核' }), h('dd', { text: host.kernel || '—' }),
+          h('dt', { text: '架构' }), h('dd', { text: host.arch || '—' }),
+          h('dt', { text: '主机名' }), h('dd', { text: host.hostname || '—' }),
+          h('dt', { text: '系统运行' }), h('dd', { text: formatDuration(host.uptime_secs) }),
+          h('dt', { text: '进程运行' }), h('dd', { text: `${formatDuration(data.process && data.process.uptime_secs)} · pid ${(data.process && data.process.pid) || '—'}` }),
+          h('dt', { text: '工作目录' }), h('dd', { class: 'mono', text: identity.runtime_dir || '—' }))),
+
+      h('div', { class: 'card' },
+        h('div', { class: 'card-head' }, h('h3', { text: 'OneBot 服务端' })),
+        h('dl', { class: 'kv sys-kv' },
+          h('dt', { text: '实现' }), h('dd', {
+            text: onebot.available
+              ? [onebot.version && onebot.version.app_name, onebot.version && onebot.version.app_version].filter(Boolean).join(' ') || '已连接'
+              : (onebot.detail || '未连接'),
+          }),
+          h('dt', { text: '协议' }), h('dd', { text: (onebot.version && onebot.version.protocol_version) || '—' }),
+          h('dt', { text: '在线' }), h('dd', {
+            text: onebot.status && onebot.status.online !== undefined
+              ? (onebot.status.online ? '在线' : '离线')
+              : '—',
+          }),
+          h('dt', { text: '连接状态' }), h('dd', {
+            text: onebot.status && onebot.status.good !== undefined
+              ? (onebot.status.good ? '正常' : '异常')
+              : '—',
+          }))));
+
+    const right = h('div', { class: 'sys-column wide' },
+      h('div', { class: 'sys-meters' },
+        meterCard('CPU', cpu.usage_percent || 0, 'accent', [
+          ['型号', cpu.brand || '—'],
+          ['内核数', cpu.physical_cores ? `${cpu.physical_cores} 物理 / ${cpu.cores} 逻辑` : String(cpu.cores || '—')],
+          ['主频', cpu.frequency_mhz ? `${cpu.frequency_mhz} MHz` : '—'],
+          ['本进程', cpu.process_percent === null || cpu.process_percent === undefined
+            ? '—' : `${Number(cpu.process_percent).toFixed(1)}%`],
+        ]),
+        meterCard('内存', memory.percent || 0, memoryPercentTone(memory.percent || 0), [
+          ['总量', fmtBytes(memory.total)],
+          ['已用', `${fmtBytes(memory.used)}（可用 ${fmtBytes(memory.available)}）`],
+          ['本进程', memory.process_rss === null || memory.process_rss === undefined
+            ? '—' : `${fmtBytes(memory.process_rss)} 常驻`],
+          ['交换区', memory.swap_total ? `${fmtBytes(memory.swap_used)} / ${fmtBytes(memory.swap_total)}` : '未启用'],
+        ])),
+
+      h('div', { class: 'card' },
+        h('div', { class: 'card-head' }, h('h3', { text: '磁盘' }),
+          h('span', { class: 'hint', text: (data.disks || []).length ? '' : '没有可读的挂载点' })),
+        ...(data.disks || []).map((disk) => h('div', { class: 'disk-row' },
+          h('div', { class: 'disk-head' },
+            h('span', { class: 'mono', text: disk.mount }),
+            h('span', { class: 'muted small', text: `${fmtBytes(disk.used)} / ${fmtBytes(disk.total)}` })),
+          h('div', { class: 'meter-bar' },
+            h('div', {
+              class: `meter-fill ${memoryPercentTone(disk.percent)}`,
+              style: `width: ${Math.min(100, disk.percent)}%`,
+            }))))),
+
+      h('div', { class: 'card' },
+        h('div', { class: 'card-head' }, h('h3', { text: '网络与模型' })),
+        h('dl', { class: 'kv sys-kv' },
+          h('dt', { text: '累计接收' }), h('dd', { text: fmtBytes(data.network && data.network.received) }),
+          h('dt', { text: '累计发送' }), h('dd', { text: fmtBytes(data.network && data.network.transmitted) }),
+          h('dt', { text: '外部模型' }), h('dd', { text: `${(data.model && data.model.model_name) || '—'}（${(data.model && data.model.wire_api) || '—'}）` }),
+          h('dt', { text: '接口地址' }), h('dd', { class: 'mono', text: (data.model && data.model.endpoint) || '—' }))));
+
+    page.append(h('div', { class: 'sys-layout' }, left, right));
+
+    stopSystemRefresh();
+    systemTimer = setInterval(async () => {
+      if (currentPage !== 'system') {
+        stopSystemRefresh();
+        return;
+      }
+      try {
+        const fresh = await api('/api/system');
+        if (currentPage !== 'system') return;
+        const meters = $('#page-system .sys-meters');
+        if (!meters) return;
+        // 只更新仪表盘与磁盘数字，避免整页重绘打断阅读。
+        const values = meters.querySelectorAll('.gauge-value');
+        if (values[0]) values[0].textContent = `${Number(fresh.cpu.usage_percent || 0).toFixed(0)}%`;
+        setGauge(meters.querySelectorAll('.gauge')[0], fresh.cpu.usage_percent || 0);
+        if (values[1]) values[1].textContent = `${Number(fresh.memory.percent || 0).toFixed(0)}%`;
+        setGauge(meters.querySelectorAll('.gauge')[1], fresh.memory.percent || 0);
+      } catch (_) {
+        /* 自动刷新失败不打扰用户，下一次再试 */
+      }
+    }, 5000);
+  }
+
+  function memoryPercentTone(percent) {
+    if (percent >= 90) return 'danger';
+    if (percent >= 75) return 'warn';
+    return 'ok';
+  }
+
+  function formatDuration(seconds) {
+    if (seconds === null || seconds === undefined) return '—';
+    const total = Math.max(0, Math.floor(Number(seconds)));
+    const days = Math.floor(total / 86400);
+    const hours = Math.floor((total % 86400) / 3600);
+    const minutes = Math.floor((total % 3600) / 60);
+    if (days > 0) return `${days} 天 ${hours} 小时`;
+    if (hours > 0) return `${hours} 小时 ${minutes} 分`;
+    return `${minutes} 分 ${total % 60} 秒`;
+  }
+
+  const GAUGE_RADIUS = 52;
+  const GAUGE_CIRCUMFERENCE = 2 * Math.PI * GAUGE_RADIUS;
+
+  /** 环形仪表盘：CPU / 内存各一个，跟参考面板一样一眼看出水位。 */
+  function gauge(percent, tone) {
+    const value = Math.max(0, Math.min(100, Number(percent) || 0));
+    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    svg.setAttribute('viewBox', '0 0 120 120');
+    svg.setAttribute('class', `gauge ${tone}`);
+    const track = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+    track.setAttribute('class', 'gauge-track');
+    track.setAttribute('cx', '60');
+    track.setAttribute('cy', '60');
+    track.setAttribute('r', String(GAUGE_RADIUS));
+    const fill = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+    fill.setAttribute('class', 'gauge-fill');
+    fill.setAttribute('cx', '60');
+    fill.setAttribute('cy', '60');
+    fill.setAttribute('r', String(GAUGE_RADIUS));
+    fill.setAttribute('stroke-dasharray', String(GAUGE_CIRCUMFERENCE));
+    fill.setAttribute('stroke-dashoffset', String(GAUGE_CIRCUMFERENCE * (1 - value / 100)));
+    const label = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+    label.setAttribute('class', 'gauge-value');
+    label.setAttribute('x', '60');
+    label.setAttribute('y', '66');
+    label.textContent = `${value.toFixed(0)}%`;
+    svg.append(track, fill, label);
+    return svg;
+  }
+
+  function setGauge(svg, percent) {
+    if (!svg) return;
+    const value = Math.max(0, Math.min(100, Number(percent) || 0));
+    const fill = svg.querySelector('.gauge-fill');
+    if (fill) fill.setAttribute('stroke-dashoffset', String(GAUGE_CIRCUMFERENCE * (1 - value / 100)));
+  }
+
+  function meterCard(title, percent, tone, rows) {
+    return h('div', { class: 'card meter-card' },
+      h('div', { class: 'meter-main' },
+        h('h3', { text: title }),
+        h('dl', { class: 'kv sys-kv' },
+          ...rows.flatMap(([label, value]) => [h('dt', { text: label }), h('dd', { text: value })]))),
+      gauge(percent, tone));
+  }
+
+  // ───────────────────────────── 弹窗 ─────────────────────────────
+
+  let modalFooter = null;
+
+  function openModal(title, bodyNode, buttons, note) {
+    $('#modal-title').textContent = title;
+    $('#modal-note').textContent = note || '';
+    $('#modal-body').replaceChildren(bodyNode);
+    const footer = $('#modal-foot');
+    clear(footer);
+    if (buttons && buttons.length) {
+      footer.hidden = false;
+      for (const button of buttons) footer.append(button);
+    } else {
+      footer.hidden = true;
+    }
+    $('#modal').hidden = false;
+  }
+
+  function closeModal() { $('#modal').hidden = true; }
+
+  $('#modal-close').addEventListener('click', closeModal);
+  $('#modal').addEventListener('click', (event) => { if (event.target.id === 'modal') closeModal(); });
+  document.addEventListener('keydown', (event) => { if (event.key === 'Escape') closeModal(); });
+
+  // ───────────────────────────── 启动 ─────────────────────────────
+
+  applyTheme(localStorage.getItem('yunxi-admin-theme') || 'dark');
+
+  (async () => {
+    // `?token=` 入口失败后会带着 error 回到这里；地址栏当场清干净。
+    const params = new URLSearchParams(location.search);
+    if (params.get('error') === 'token') {
+      history.replaceState(null, '', location.pathname);
+      const error = $('#login-error');
+      error.textContent = '链接里的 Token 不正确或已失效，请重新输入。';
+      error.hidden = false;
+    }
+    try {
+      await api('/api/session');
+      showApp();
+      await boot();
+    } catch (_) {
+      showLogin();
+    }
+  })();
+})();

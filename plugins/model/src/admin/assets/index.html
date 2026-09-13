@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>芸汐 · 管理后台</title>
+<link rel="stylesheet" href="/assets/app.css">
+</head>
+<body>
+
+<!-- ───────────────────────────── 登录 ───────────────────────────── -->
+<div id="login-view" class="login-wrap" hidden>
+  <form id="login-form" class="login-card" autocomplete="off">
+    <div class="login-mark">汐</div>
+    <h1>芸汐管理后台</h1>
+    <p class="login-sub">请输入访问 Token。Token 由服务端生成或通过环境变量配置。</p>
+    <input id="login-token" class="input" type="password" placeholder="访问 Token" autocomplete="current-password" required>
+    <button type="submit" class="btn primary block">登 录</button>
+    <p id="login-error" class="login-error" hidden></p>
+    <p class="login-hint">
+      找不到 Token？见服务端启动日志，或运行时目录的 <code>.yunxi-admin-token</code>
+      （在本机跑就是工作目录）；也可以在 <code>bot.conf.toml</code> 的 <code>[admin]</code> 里
+      配置 <code>token_env</code> 指向的环境变量。
+    </p>
+  </form>
+</div>
+
+<!-- ───────────────────────────── 主界面 ───────────────────────────── -->
+<div id="app-view" class="app" hidden>
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-mark">汐</div>
+      <div class="brand-text">
+        <strong>芸汐</strong>
+        <span id="brand-revision">管理后台</span>
+      </div>
+    </div>
+    <nav class="nav">
+      <button class="nav-item active" data-page="overview"><span class="nav-icon">◈</span>概览</button>
+      <button class="nav-item" data-page="config"><span class="nav-icon">⚙</span>配置</button>
+      <button class="nav-item" data-page="memory"><span class="nav-icon">❖</span>记忆</button>
+      <button class="nav-item" data-page="system"><span class="nav-icon">▤</span>系统</button>
+    </nav>
+    <div class="sidebar-foot">
+      <button id="theme-toggle" class="nav-item subtle"><span class="nav-icon">◐</span><span id="theme-label">浅色</span></button>
+      <button id="logout" class="nav-item subtle"><span class="nav-icon">⏻</span>退出登录</button>
+      <div class="sidebar-note">仅监听回环地址，登录态保存在会话 Cookie 中。</div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="topbar">
+      <div class="topbar-title">
+        <h2 id="page-title">概览</h2>
+        <p id="page-subtitle"></p>
+      </div>
+      <div class="topbar-actions">
+        <span id="health-pill" class="pill">连接中…</span>
+        <button id="refresh" class="btn ghost">刷新</button>
+      </div>
+    </header>
+
+    <section id="page-overview" class="page"></section>
+    <section id="page-config" class="page" hidden></section>
+    <section id="page-memory" class="page" hidden></section>
+    <section id="page-system" class="page" hidden></section>
+  </main>
+</div>
+
+<div id="toast-stack" class="toast-stack"></div>
+
+<!-- 通用弹窗：原始 TOML、备份、记录详情里需要放大展示的内容 -->
+<div id="modal" class="modal" hidden>
+  <div class="modal-card">
+    <header class="modal-head">
+      <h3 id="modal-title">标题</h3>
+      <div class="modal-head-actions">
+        <span id="modal-note" class="modal-note"></span>
+        <button id="modal-close" class="btn ghost small">关闭</button>
+      </div>
+    </header>
+    <div id="modal-body" class="modal-body"></div>
+    <footer id="modal-foot" class="modal-foot" hidden></footer>
+  </div>
+</div>
+
+<script src="/assets/app.js"></script>
+</body>
+</html>

@@ -4,6 +4,9 @@ server-login
 .env
 # 运行时配置可能含 QQ 号、白名单、主机和 Token；仓库只跟踪 *.example.toml。
 bot.conf.toml
+# 管理后台写到运行时目录的覆盖配置与自动生成的登录 Token。
+bot.conf.override.toml
+.yunxi-admin-token
 kovi.conf.toml
 kovi.plugin.toml
 bot_memory.json

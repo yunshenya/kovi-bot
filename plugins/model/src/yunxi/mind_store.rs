@@ -658,12 +658,20 @@ async fn put_record<T: Serialize>(
 ) -> Result<Value, MindStoreError> {
     let mut transaction = pool.begin().await.map_err(MindStoreError::storage)?;
     lock_meta(&mut transaction).await?;
+    // 用量记账：Mind 记录也是"写进记忆"，按 payload 大小估算。
+    let payload_tokens = record
+        .value
+        .serialize(serde_json::value::Serializer)
+        .ok()
+        .map(|value| crate::metrics::approx_tokens(&value.to_string()))
+        .unwrap_or_default();
     let payload = put_record_tx(&mut transaction, table, record, expected_version).await?;
     bump_meta(&mut transaction).await?;
     transaction
         .commit()
         .await
         .map_err(MindStoreError::storage)?;
+    crate::metrics::record(crate::metrics::Metric::MemorySavedTokens, payload_tokens);
     Ok(payload)
 }
 

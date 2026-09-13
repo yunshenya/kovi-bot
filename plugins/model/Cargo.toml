@@ -31,3 +31,6 @@ url.workspace = true
 uuid.workspace = true
 unicode-properties = "0.1.4"
 yunxi-core.workspace = true
+axum = "0.8"
+toml_edit = "0.22"
+tokio = { workspace = true, features = ["net", "rt-multi-thread"] }
