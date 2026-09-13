@@ -2232,6 +2232,8 @@
     revision: '',
     summary: null,
     coverage: null,
+    /** 队列的 tier 分布（下标= tier，含每档含义），由接口下发。 */
+    tiers: [],
     items: [],
     matched: 0,
     limit: 40,
@@ -2388,6 +2390,7 @@
         refreshButton),
       h('div', { class: 'stat-grid annotate-stats', id: 'annotate-stats' }),
       h('div', { class: 'annotate-hint', id: 'annotate-hint' }),
+      h('div', { class: 'annotate-hint', id: 'annotate-tiers' }),
       h('div', { class: 'annotate-exports', id: 'annotate-exports' }));
   }
 
@@ -2431,7 +2434,29 @@
         annotation.writable ? null : h('span', { class: 'badge restart', text: '目录不可写' }),
       ].filter(Boolean));
     }
+    renderAnnotationTiers();
     renderAnnotationExports();
+  }
+
+  /** 队列的 tier 分布 + 每档含义。
+   *
+   * 队列按标注价值升序排，所以首屏必然全是 tier 0——不写清楚含义，这个 badge
+   * 看起来就像"全是低等级"。含义文案由接口下发（annotation_api.rs 的
+   * TIER_LABELS），这里只负责渲染，免得两边口径漂移。 */
+  function renderAnnotationTiers() {
+    const host = $('#annotate-tiers');
+    if (!host) return;
+    clear(host);
+    const tiers = annotation.tiers || [];
+    if (!tiers.length) return;
+    const spans = tiers.map((row) => h('span', {
+      class: row.tier === 0 ? 'facet-chip tag' : 'facet-chip',
+      title: `tier ${row.tier}：${row.label}（越小越先标）`,
+      text: `${row.tier} ${row.label} ${compactNumber(row.count)}`,
+    }));
+    host.append(
+      h('span', { text: '按标注价值排队，tier 越小越先标：' }),
+      ...spans);
   }
 
   function renderAnnotationExports() {
@@ -2471,6 +2496,7 @@
     annotation.revision = data.revision;
     annotation.summary = data.summary;
     annotation.coverage = data.coverage;
+    annotation.tiers = data.tiers || [];
     annotation.items = data.items || [];
     annotation.matched = data.matched || 0;
     renderAnnotationSummary();

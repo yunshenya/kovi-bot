@@ -391,6 +391,26 @@ fn queue_tier(sample: &Value) -> u8 {
     4
 }
 
+/// tier 的含义，下标就是 tier 编号，与 [`queue_tier`] 的取值域一一对应。
+///
+/// 口径与 `tools/turngate/review.py::queue_tier`（以及它的 `--queue` 表头)相同；
+/// 前端不再抄一份文案，说明书跟着分布一起从接口下发，改口径时只改这里。
+const TIER_LABELS: [&str; 5] = ["灰区 + 被叫到", "灰区", "无上下文", "无机器人发言", "其余"];
+
+/// 待标队列的 tier 分布，下标 = tier。
+///
+/// 统计范围必须与 `matched` 完全一致——传进来的就是筛过 reviewed/flagged、
+/// 排过序的队列本身，否则页头的数字会和列表对不上。
+fn tier_distribution<'a>(samples: impl IntoIterator<Item = &'a Value>) -> Vec<usize> {
+    let mut counts = vec![0_usize; TIER_LABELS.len()];
+    for sample in samples {
+        // 不变量：queue_tier 的取值域就是 TIER_LABELS 的下标（单测锁着）。真越界
+        // 说明有人加了 tier 却没补说明，这里宁可炸掉也不要悄悄漏统计。
+        counts[usize::from(queue_tier(sample))] += 1;
+    }
+    counts
+}
+
 /// 采于"@ 判定"修复之前的批次里，目标不可知的样本。
 ///
 /// 当时 kovi 把**任何人**的 @ 都渲染成 `[at]`，于是"@ 别人"被记成
@@ -745,6 +765,7 @@ pub(crate) async fn queue(Query(params): Query<QueueQuery>) -> Result<Json<Value
             )
         });
         let matched = rows.len();
+        let tiers = tier_distribution(rows.iter().map(|(_, sample)| *sample));
         let items: Vec<Value> = rows
             .into_iter()
             .skip(offset)
@@ -788,6 +809,18 @@ pub(crate) async fn queue(Query(params): Query<QueueQuery>) -> Result<Json<Value
             "items": items,
             "summary": summarize(samples),
             "skipped_flagged": skip_flagged,
+            // 队列是按标注价值排的，首屏必然全是最高价值那一档；把分布和每档的
+            // 含义一并给出去，"怎么全是 tier 0" 在页面上就能自答。
+            "tiers": TIER_LABELS
+                .iter()
+                .zip(&tiers)
+                .enumerate()
+                .map(|(tier, (label, count))| json!({
+                    "tier": tier,
+                    "label": label,
+                    "count": count,
+                }))
+                .collect::<Vec<Value>>(),
             "coverage": {
                 "gray_zone": gray_zone,
                 "with_recent_turns": with_recent_turns,
@@ -1073,6 +1106,26 @@ mod tests {
         assert_eq!(queue_tier(&labeled), 4);
         assert!(queue_reason(&gray_addressed).contains("gray-zone"));
         assert!(queue_reason(&labeled).contains("context-rich"));
+    }
+
+    /// 页头的分布必须覆盖 queue_tier 的全部取值：任何一档没落到桶里，页面上就会
+    /// 出现"队列 1998 条、各档加起来 1200"这种自相矛盾的数字。
+    #[test]
+    fn tier_distribution_buckets_every_tier() {
+        let samples = [
+            sample("在吗", None, None, true, 1),
+            sample("随便说说", None, None, false, 2),
+            sample("没上下文", Some("flush_now"), None, false, 0),
+            sample("只有用户说话", Some("flush_now"), None, false, 1),
+            sample("讲完了", Some("flush_now"), Some("ignore"), false, 2),
+        ];
+        let counts = tier_distribution(samples.iter());
+        assert_eq!(counts.len(), TIER_LABELS.len());
+        assert_eq!(counts, vec![1, 1, 1, 1, 1]);
+        assert_eq!(counts.iter().sum::<usize>(), samples.len());
+
+        // 空批次不能炸，也不能编数。
+        assert_eq!(tier_distribution(std::iter::empty()), vec![0; 5]);
     }
 
     #[test]
