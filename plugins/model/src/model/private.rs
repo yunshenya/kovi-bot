@@ -814,7 +814,9 @@ pub(crate) async fn private_message_event_after_ingress(
     {
         eprintln!("[ERROR] 私聊保存表情包使用记录失败: {}", error);
     }
-    let Some(admission) = admit_understood_private_turn(initial_admission, &understanding).await
+    let Some(admission) =
+        admit_understood_private_turn(initial_admission, &understanding, message.trim().is_empty())
+            .await
     else {
         println!(
             "[INFO] 私聊语义决定已过期，丢弃旧批次 (用户: {}, 消息: {:?})",
@@ -1367,10 +1369,11 @@ async fn drain_pending_private_messages_from_current(user_id: i64, bot: &Arc<Run
 async fn admit_understood_private_turn(
     initial: IncomingAdmission,
     understanding: &MessageUnderstanding,
+    carries_no_text: bool,
 ) -> Option<IncomingAdmission> {
     ConversationCoordinator::refine_current_incoming(
         initial,
-        ConversationCoordinator::context_for_understood_turn(understanding, true),
+        ConversationCoordinator::context_for_understood_turn(understanding, true, carries_no_text),
     )
     .await
 }
@@ -1522,7 +1525,7 @@ mod tests {
                 .expect("proactive output should prepare during semantic work");
 
                 let refined =
-                    admit_understood_private_turn(initial, &MessageUnderstanding::default())
+                    admit_understood_private_turn(initial, &MessageUnderstanding::default(), false)
                         .await
                         .expect("ingress should remain current");
 
@@ -1686,6 +1689,7 @@ mod tests {
                     ConversationCoordinator::context_for_understood_turn(
                         &MessageUnderstanding::default(),
                         true,
+                        false,
                     ),
                 )
                 .await

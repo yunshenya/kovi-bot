@@ -930,8 +930,13 @@ pub(crate) async fn group_message_event_after_ingress(
         && (primary_reply_expected
             || continue_conversation
             || (sampled_for_interjection && understanding.interjection_worthy));
-    let Some(admission) =
-        admit_understood_group_turn(initial_admission, &understanding, direct_reply_expected).await
+    let Some(admission) = admit_understood_group_turn(
+        initial_admission,
+        &understanding,
+        direct_reply_expected,
+        message.trim().is_empty(),
+    )
+    .await
     else {
         println!(
             "[INFO] 群聊语义决定已过期，丢弃旧批次 (群组: {}, 消息: {:?})",
@@ -1671,10 +1676,15 @@ async fn admit_understood_group_turn(
     initial: IncomingAdmission,
     understanding: &MessageUnderstanding,
     direct_reply_expected: bool,
+    carries_no_text: bool,
 ) -> Option<IncomingAdmission> {
     ConversationCoordinator::refine_current_incoming(
         initial,
-        ConversationCoordinator::context_for_understood_turn(understanding, direct_reply_expected),
+        ConversationCoordinator::context_for_understood_turn(
+            understanding,
+            direct_reply_expected,
+            carries_no_text,
+        ),
     )
     .await
 }
@@ -2453,6 +2463,7 @@ mod tests {
                     ConversationCoordinator::context_for_understood_turn(
                         &MessageUnderstanding::default(),
                         false,
+                        false,
                     ),
                 )
                 .await
@@ -2719,10 +2730,14 @@ mod tests {
                 .await
                 .expect("reply should prepare during semantic work");
 
-                let refined =
-                    admit_understood_group_turn(initial, &MessageUnderstanding::default(), false)
-                        .await
-                        .expect("ingress should remain current");
+                let refined = admit_understood_group_turn(
+                    initial,
+                    &MessageUnderstanding::default(),
+                    false,
+                    false,
+                )
+                .await
+                .expect("ingress should remain current");
 
                 assert_eq!(refined.decision, OutgoingExecutiveDecision::Keep);
                 assert!(commit_outgoing(outgoing).await);
@@ -2750,7 +2765,7 @@ mod tests {
                     ..MessageUnderstanding::default()
                 };
 
-                let refined = admit_understood_group_turn(initial, &understanding, true)
+                let refined = admit_understood_group_turn(initial, &understanding, true, false)
                     .await
                     .expect("ingress should remain current");
 

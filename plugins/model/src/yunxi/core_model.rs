@@ -4703,6 +4703,7 @@ async fn refine_core_incoming(
         OutgoingExecutiveContext {
             incoming_impact: incoming_impact.unwrap_or(IncomingTurnImpact::Unknown),
             direct_reply_expected: reply_expected,
+            carries_no_text: false,
         },
     )
     .await

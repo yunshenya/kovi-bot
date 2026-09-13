@@ -526,6 +526,22 @@ def sing_note(tts: TtsClient, syllable: str, freq: float, duration: float,
     return _fit_duration(sung, rate, duration, freq), rate
 
 
+_WORKER_TTS: TtsClient | None = None
+
+
+def _sing_note_job(job: tuple[str, str, float, float, float | None]) -> tuple[np.ndarray, int]:
+    """进程池里的单音渲染。
+
+    用进程而不是线程：parselmouth 底下是 Praat，带全局状态，多线程并发调用不保证
+    安全。fork 出来的子进程各自持有自己的 TTS 客户端与缓存。
+    """
+    global _WORKER_TTS
+    tts_url, syllable, freq, duration, previous = job
+    if _WORKER_TTS is None:
+        _WORKER_TTS = TtsClient(tts_url)
+    return sing_note(_WORKER_TTS, syllable, freq, duration, previous)
+
+
 def split_syllables(lyrics: str) -> list[str]:
     """一个汉字一个音节；空白与标点丢掉；连续拉丁字母当成一个音节。"""
     syllables: list[str] = []
@@ -571,7 +587,8 @@ def fit_notes(notes: list[list[float]], syllable_count: int) -> list[tuple[float
 
 def render_song(tts: TtsClient, notes: list[list[float]], lyrics: str, octave: int,
                 tempo: float, breath_after: tuple[int, ...] = (),
-                reverb: bool = True, transpose: float = 0.0) -> tuple[bytes, int, int]:
+                reverb: bool = True, transpose: float = 0.0,
+                pool: object | None = None) -> tuple[bytes, int, int]:
     syllables = split_syllables(lyrics)
     if not syllables:
         raise SingRequestError("歌词里没有可唱的字")
@@ -582,12 +599,17 @@ def render_song(tts: TtsClient, notes: list[list[float]], lyrics: str, octave: i
         raise SingRequestError("模板没有音符")
 
     beat_seconds = 60.0 / max(30.0, min(200.0, tempo))
-    pieces: list[np.ndarray] = []
     rate = SAMPLE_RATE
-    elapsed = 0.0
-    previous: float | None = None
     overlap = int(0.015 * rate)
     last_index = len(fitted) - 1
+
+    # 先把每个音的活排出来。滑音起点取"计划里的上一个音"，不依赖渲染结果，
+    # 所以这些音彼此独立、可以并行——线上那次 28 个音串行渲染要 10 秒，正好
+    # 撞上群里两条附件消息把回复顶掉。
+    jobs: list[tuple[str, str, float, float, float | None]] = []
+    plan: list[tuple[int, int, float, float]] = []  # (index, degree, duration, freq)
+    elapsed = 0.0
+    previous: float | None = None
     for index, ((degree, beats), syllable) in enumerate(zip(fitted, syllables, strict=True)):
         degree = int(round(degree))
         duration = max(0.12, float(beats) * beat_seconds)
@@ -596,25 +618,42 @@ def render_song(tts: TtsClient, notes: list[list[float]], lyrics: str, octave: i
         freq = _transposed(_hz(degree, octave), transpose)
         # 每个音多合成 15 毫秒，专门留给与下一个音的交叠；总时值因此保持不变。
         held = duration + (overlap / rate if index != last_index else 0.0)
-        piece, rate = sing_note(tts, syllable, freq, held, previous)
-        LOG.debug(
-            "音符 %d: %s 音级%d 目标 %.3fs 实际 %.3fs 基频 %.0fHz(实测 %.0fHz)",
-            len(pieces) + 1,
-            syllable,
-            degree,
-            duration,
-            len(piece) / rate,
-            freq,
-            _dominant_hz(piece, rate, 120, 1200),
-        )
+        jobs.append((getattr(tts, "url", ""), syllable, freq, held, previous))
+        plan.append((index, degree, duration, freq))
+        previous = freq
+        elapsed += duration
+    if not jobs:
+        raise SingRequestError("没有渲染出任何音符")
+
+    rendered: list[tuple[np.ndarray, int]]
+    if pool is not None and len(jobs) > 1:
+        try:
+            rendered = list(pool.map(_sing_note_job, jobs))
+        except Exception as error:  # noqa: BLE001 - 并行失败就退回串行，不能整首失败
+            LOG.warning("并行渲染失败，退回串行: %s", error)
+            rendered = [sing_note(tts, syllable, freq, held, previous)
+                        for (_url, syllable, freq, held, previous) in jobs]
+    else:
+        rendered = [sing_note(tts, syllable, freq, held, previous)
+                    for (_url, syllable, freq, held, previous) in jobs]
+
+    pieces: list[np.ndarray] = []
+    for (index, degree, duration, freq), (piece, rate) in zip(plan, rendered, strict=True):
+        if LOG.isEnabledFor(logging.DEBUG):
+            # 只给调试用；这条分析本身要几十毫秒一个音，别放热路径上。
+            LOG.debug(
+                "音符 %d: 音级%d 目标 %.3fs 实际 %.3fs 基频 %.0fHz(实测 %.0fHz)",
+                index + 1,
+                degree,
+                duration,
+                len(piece) / rate,
+                freq,
+                _dominant_hz(piece, rate, 120, 1200),
+            )
         pieces.append(piece)
         if (index + 1) in breath_after:
             # 句尾换气：没有呼吸的连续音墙是"念经/机械"感的来源之一。
             pieces.append(np.zeros(int(BREATH_SECONDS * rate)))
-        previous = freq
-        elapsed += duration
-    if not pieces:
-        raise SingRequestError("没有渲染出任何音符")
 
     # 逐音做一次有上限的响度对齐：清辅音字天然比元音响得多/轻得多，不压一下会
     # 出现某个字几乎听不见。只在 ±2.5dB 内调整，避免把整首歌压成一条没有起伏的线。
@@ -705,6 +744,8 @@ class Handler(BaseHTTPRequestHandler):
     templates: Templates
     # 默认不加混响：试听后选定的音色是"干声"（见 docs/qq-singing.md）。
     default_reverb: bool = False
+    # 逐音渲染的进程池；None 表示串行（起不来也不影响功能）。
+    pool: object | None = None
 
     def _json(self, payload: dict, status: int = 200) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -758,7 +799,8 @@ class Handler(BaseHTTPRequestHandler):
                 breath_after = tuple(int(value) for value in template.get("breath_after", ()))
                 transpose = float(request.get("transpose", template.get("transpose", -5.0)))
             wav, rate, sung = render_song(
-                self.tts, notes, lyrics, octave, tempo, breath_after, reverb, transpose
+                self.tts, notes, lyrics, octave, tempo, breath_after, reverb, transpose,
+                self.pool,
             )
         except SingRequestError as error:
             LOG.warning("拒绝合成: %s", error)
@@ -814,6 +856,14 @@ def main() -> None:
     Handler.tts = TtsClient(tts_url)
     Handler.templates = Templates(templates_path)
     Handler.default_reverb = reverb_enabled
+    # 逐音渲染用进程池（Praat 带全局状态，线程不安全）。留一个核给 TTS 与其他服务。
+    try:
+        from concurrent.futures import ProcessPoolExecutor
+
+        Handler.pool = ProcessPoolExecutor(max_workers=max(2, min(3, (os.cpu_count() or 3) - 1)))
+    except Exception as error:  # noqa: BLE001 - 起不来就串行，不影响正确性
+        LOG.warning("并行渲染进程池创建失败，改串行: %s", error)
+        Handler.pool = None
     server = ThreadingHTTPServer((host, port), Handler)
     LOG.info("芸汐歌声合成服务已启动: http://%s:%d/ （模板 %s，TTS %s）",
              host, port, templates_path.name, tts_url)

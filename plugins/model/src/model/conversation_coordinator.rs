@@ -71,6 +71,12 @@ pub(crate) struct OutgoingExecutiveContext {
     pub(crate) incoming_impact: IncomingTurnImpact,
     /// Whether the newest turn itself requires a direct response.
     pub(crate) direct_reply_expected: bool,
+    /// The newest turn carries no text at all (纯附件：图片/文件/语音条）。
+    ///
+    /// 这种消息没有语义增量，却会被语义判定为"与当前话题相关"，于是把一条已经
+    /// 准备好的回复 Merge/Rewrite 掉。线上事故：她点名被要求唱歌，歌都渲染好了，
+    /// 两条 [file] 在渲染的那几秒里进来，把回复顶成 Superseded 静默丢弃。
+    pub(crate) carries_no_text: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,6 +103,7 @@ impl Default for OutgoingExecutiveContext {
         Self {
             incoming_impact: IncomingTurnImpact::Unknown,
             direct_reply_expected: true,
+            carries_no_text: false,
         }
     }
 }
@@ -433,6 +440,7 @@ impl ConversationCoordinator {
             OutgoingExecutiveContext {
                 incoming_impact: IncomingTurnImpact::InvalidatesPendingContent,
                 direct_reply_expected: true,
+                carries_no_text: false,
             },
         )
         .await
@@ -505,8 +513,13 @@ impl ConversationCoordinator {
     pub(crate) fn context_for_understood_turn(
         understanding: &MessageUnderstanding,
         direct_reply_expected: bool,
+        carries_no_text: bool,
     ) -> OutgoingExecutiveContext {
-        let incoming_impact = if understanding.conversation_relevant {
+        let incoming_impact = if carries_no_text && !direct_reply_expected {
+            // 纯附件又没有点名她：对"已经准备好的回复"没有可合并的内容。
+            // 当作无增量处理（Keep），而不是让它把回复顶掉。
+            IncomingTurnImpact::None
+        } else if understanding.conversation_relevant {
             IncomingTurnImpact::ExtendsPendingTopic
         } else if direct_reply_expected {
             IncomingTurnImpact::Unrelated
@@ -516,6 +529,7 @@ impl ConversationCoordinator {
         OutgoingExecutiveContext {
             incoming_impact,
             direct_reply_expected,
+            carries_no_text,
         }
     }
 
@@ -712,6 +726,7 @@ mod tests {
             OutgoingExecutiveContext {
                 incoming_impact,
                 direct_reply_expected,
+                carries_no_text: false,
             },
         )
     }
@@ -910,6 +925,7 @@ mod tests {
                     OutgoingExecutiveContext {
                         incoming_impact: IncomingTurnImpact::None,
                         direct_reply_expected: false,
+                        carries_no_text: false,
                     },
                 )
                 .await;
@@ -941,6 +957,7 @@ mod tests {
                     OutgoingExecutiveContext {
                         incoming_impact: IncomingTurnImpact::Unrelated,
                         direct_reply_expected: true,
+                        carries_no_text: false,
                     },
                 )
                 .await
@@ -995,6 +1012,7 @@ mod tests {
                     OutgoingExecutiveContext {
                         incoming_impact: IncomingTurnImpact::None,
                         direct_reply_expected: false,
+                        carries_no_text: false,
                     },
                 )
                 .await
@@ -1006,6 +1024,7 @@ mod tests {
                     OutgoingExecutiveContext {
                         incoming_impact: IncomingTurnImpact::None,
                         direct_reply_expected: false,
+                        carries_no_text: false,
                     },
                 )
                 .await
@@ -1034,6 +1053,7 @@ mod tests {
                     OutgoingExecutiveContext {
                         incoming_impact: IncomingTurnImpact::None,
                         direct_reply_expected: false,
+                        carries_no_text: false,
                     },
                 )
                 .await
@@ -1054,6 +1074,7 @@ mod tests {
                     OutgoingExecutiveContext {
                         incoming_impact: IncomingTurnImpact::None,
                         direct_reply_expected: false,
+                        carries_no_text: false,
                     },
                 )
                 .await
@@ -1099,6 +1120,7 @@ mod tests {
                     OutgoingExecutiveContext {
                         incoming_impact: IncomingTurnImpact::None,
                         direct_reply_expected: false,
+                        carries_no_text: false,
                     },
                 )
                 .await
@@ -1143,6 +1165,7 @@ mod tests {
                     OutgoingExecutiveContext {
                         incoming_impact: IncomingTurnImpact::None,
                         direct_reply_expected: false,
+                        carries_no_text: false,
                     },
                 )
                 .await
@@ -1200,6 +1223,7 @@ mod tests {
                     OutgoingExecutiveContext {
                         incoming_impact: IncomingTurnImpact::InvalidatesPendingContent,
                         direct_reply_expected: true,
+                        carries_no_text: false,
                     },
                 )
                 .await
@@ -1235,6 +1259,7 @@ mod tests {
                     OutgoingExecutiveContext {
                         incoming_impact: IncomingTurnImpact::None,
                         direct_reply_expected: false,
+                        carries_no_text: false,
                     },
                 )
                 .await
@@ -1273,6 +1298,7 @@ mod tests {
                     OutgoingExecutiveContext {
                         incoming_impact: IncomingTurnImpact::None,
                         direct_reply_expected: false,
+                        carries_no_text: false,
                     },
                 )
                 .await
@@ -1283,11 +1309,61 @@ mod tests {
                     OutgoingExecutiveContext {
                         incoming_impact: IncomingTurnImpact::None,
                         direct_reply_expected: false,
+                        carries_no_text: false,
                     },
                 )
                 .await
                 .expect("second active admission should remain current");
                 assert_eq!(second.decision, OutgoingExecutiveDecision::Keep);
+            });
+    }
+
+    #[test]
+    fn attachment_only_ambient_traffic_keeps_a_prepared_reply() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("should create test runtime")
+            .block_on(async {
+                let scope = ReplyScope::Group(9_300_900);
+                let ticket = ConversationCoordinator::interrupt(scope).await;
+                assert!(mark_active(ticket).await);
+                let _outgoing = prepare_outgoing(
+                    ticket,
+                    outgoing_fingerprint("已经准备好的一首歌"),
+                    OutgoingSource::Reply,
+                )
+                .await;
+
+                // 一条与当前话题相关、但没有任何文字的纯附件（图片/文件）。
+                let understanding = MessageUnderstanding {
+                    conversation_relevant: true,
+                    ..MessageUnderstanding::default()
+                };
+                let context = ConversationCoordinator::context_for_understood_turn(
+                    &understanding,
+                    false,
+                    true,
+                );
+
+                // 关键：不能因为它"相关"就把还没发出去的回复 Merge 掉。
+                assert_eq!(context.incoming_impact, IncomingTurnImpact::None);
+                assert_eq!(
+                    ConversationCoordinator::decide_prepared_outgoing(
+                        Some(OutgoingSource::Reply),
+                        context,
+                    ),
+                    OutgoingExecutiveDecision::Keep
+                );
+
+                // 对照：同样的相关性，如果这条消息带文字，仍然按合并处理。
+                let with_text = ConversationCoordinator::context_for_understood_turn(
+                    &understanding,
+                    false,
+                    false,
+                );
+                assert_eq!(
+                    with_text.incoming_impact,
+                    IncomingTurnImpact::ExtendsPendingTopic
+                );
             });
     }
 
@@ -1324,6 +1400,7 @@ mod tests {
                         OutgoingExecutiveContext {
                             incoming_impact: impact,
                             direct_reply_expected: true,
+                            carries_no_text: false,
                         },
                     )
                     .await;
@@ -1356,6 +1433,7 @@ mod tests {
                     OutgoingExecutiveContext {
                         incoming_impact: IncomingTurnImpact::Unrelated,
                         direct_reply_expected: true,
+                        carries_no_text: false,
                     },
                 )
                 .await;
@@ -1407,6 +1485,7 @@ mod tests {
                     ConversationCoordinator::context_for_understood_turn(
                         &MessageUnderstanding::default(),
                         true,
+                        false,
                     ),
                 )
                 .await
@@ -1494,6 +1573,7 @@ mod tests {
                     OutgoingExecutiveContext {
                         incoming_impact: IncomingTurnImpact::None,
                         direct_reply_expected: false,
+                        carries_no_text: false,
                     },
                 )
                 .await
@@ -1566,6 +1646,7 @@ mod tests {
                     OutgoingExecutiveContext {
                         incoming_impact: IncomingTurnImpact::None,
                         direct_reply_expected: false,
+                        carries_no_text: false,
                     },
                 )
                 .await
@@ -1581,6 +1662,7 @@ mod tests {
                     OutgoingExecutiveContext {
                         incoming_impact: IncomingTurnImpact::None,
                         direct_reply_expected: false,
+                        carries_no_text: false,
                     },
                 )
                 .await
@@ -1627,6 +1709,7 @@ mod tests {
                     OutgoingExecutiveContext {
                         incoming_impact: IncomingTurnImpact::InvalidatesPendingContent,
                         direct_reply_expected: true,
+                        carries_no_text: false,
                     },
                 )
                 .await;

@@ -338,6 +338,7 @@
     clear(page);
 
     const counts = status.counts || {};
+    page.append(h('div', { class: 'section-title' }, h('span', { text: '运行状态' })));
     page.append(h('div', { class: 'stat-grid' },
       stat('系统运行', status.uptime, `芸汐进程 pid ${status.pid}`),
       stat('进程内存', (status.process || '').replace('芸汐进程内存: ', '') || '—'),
@@ -359,10 +360,10 @@
     }
 
     const model = status.model || {};
-    page.append(h('div', { class: 'card' },
+    const modelCard = h('div', { class: 'card' },
       h('div', { class: 'card-head' }, h('h3', { text: '模型与调度' }),
         h('span', { class: 'hint', text: `配置 ${status.config.path}` })),
-      h('dl', { class: 'kv' },
+      h('dl', { class: 'kv schedule-kv' },
         h('dt', { text: '外部模型' }), h('dd', { text: model.enabled ? `${model.model_name}（${model.endpoint}）` : '已关闭' }),
         h('dt', { text: 'Token 环境变量' }), h('dd', { class: 'mono', text: model.api_key_env || '—' }),
         h('dt', { text: '本地 Intrinsic' }), h('dd', { text: model.intrinsic_enabled ? '启用' : '关闭' }),
@@ -374,8 +375,9 @@
         h('dt', { text: '实时通话' }), h('dd', { text: status.scheduler.qq_call_enabled ? '启用' : '关闭' }),
         h('dt', { text: '配置文件' }), h('dd', { text: `${status.config.modified || '—'} · ${fmtBytes(status.config.bytes)}` }),
         h('dt', { text: '管理会话' }), h('dd', { text: `${status.admin.sessions} 个 · 后台已运行 ${Math.floor(status.admin.uptime_secs / 60)} 分钟` }),
-      )));
+      ));
 
+    // 先取数据再拼版：两栏要一起进场，避免右栏比左栏晚一拍。
     const recent = await api('/api/memory/records?limit=12');
     const list = h('div', { class: 'record-list' });
     if (!recent.items.length) {
@@ -384,10 +386,12 @@
     for (const item of recent.items) {
       list.append(recordNode(item, () => { goto('memory').then(() => openRecord(item)); }, false));
     }
-    page.append(h('div', { class: 'card' },
+    const recentCard = h('div', { class: 'card' },
       h('div', { class: 'card-head' }, h('h3', { text: '最近的记忆变化' }),
         h('button', { class: 'btn ghost small', text: '去记忆页', onclick: () => goto('memory') })),
-      list));
+      list);
+
+    page.append(h('div', { class: 'overview-split' }, modelCard, recentCard));
   }
 
   // ───────────────────────────── 配置 ─────────────────────────────
@@ -464,6 +468,7 @@
       main.append(h('div', { class: 'field-hint', style: 'padding: 0 4px', text: '这里只列出本文件真正写了的字段；同名字段会覆盖主配置，未列出的沿用主配置。' }));
     }
     const body = h('div', { class: 'config-sections' });
+
     main.append(body);
     layout.append(main);
     page.append(layout);
@@ -1341,7 +1346,8 @@
         h('td', { class: 'cell-time', text: shortDate(mentionedOf(row)) })));
     }
     table.append(body);
-    card.append(table);
+    // 包一层可滚动容器，表头才能 sticky 住（表格自己滚动，页码留在下面）。
+    card.append(h('div', { class: 'table-scroll' }, table));
     card.append(renderPager(data));
     page.append(card);
   }
