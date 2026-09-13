@@ -77,8 +77,9 @@ python3 tools/turngate/review.py --batch review-batch-*.jsonl --export train_tur
 #    快捷键打标，标完直接下载导出的训练集（导出的字段与 --export 逐条一致）。
 #    批次目录是 admin.annotation_dir（默认运行时目录下的 turngate/，生产上
 #    就是 /home/ubuntu/kovi-bot/runtime/turngate/——current/ 只读，写不进去），
-#    把 review-batch-*.jsonl 放进去即可。两个入口读写**同一份文件**，所以同一
-#    时刻只用一个：文件被别处改动时网页返回 409，刷新后重来。
+#    后台启动时会自动建好，直接把 review-batch-*.jsonl 放进去即可。两个入口
+#    读写**同一份文件**，所以同一时刻只用一个：文件被别处改动时网页返回 409，
+#    刷新后重来。
 #    采于「@ 判定」修复前的批次里 addressed_to_agent 分不出"@ 她"还是"@ 别人"，
 #    网页默认把这类样本排除在队列外（开关可放回来），等重采后再标它们。
 

@@ -210,7 +210,8 @@ ssh -L 6098:127.0.0.1:6098 -p 22 ubuntu@<服务器>   # 服务器上跑时先做
   文件被别处改动时接口返回 409，页面会要求刷新后重来，而不是把对方的改动盖掉。
 
   批次目录来自 `admin.annotation_dir`（默认运行时目录下的 `turngate/`，即生产上的
-  `/home/ubuntu/kovi-bot/runtime/turngate/`——`current/` 是只读发布目录，写不进去）。
+  `/home/ubuntu/kovi-bot/runtime/turngate/`，后台启动时自动创建——`current/` 是只读发布
+  目录，写不进去；建不出来时页面会把原因显示出来）。
   采于「@ 判定」修复之前的批次里，`addressed_to_agent` 分不出"@ 她"还是"@ 别人"，这类样本
   默认不进队列（可用开关放回来），免得把旧判定人工确认一遍再喂进权重。
 

@@ -113,19 +113,38 @@ fn load_error(path: &Path, error: std::io::Error) -> ApiError {
     }
 }
 
-fn write_error(path: &Path, error: std::io::Error) -> ApiError {
+/// 标注目录读写失败的统一解释。
+///
+/// 生产部署里 `current/` 是只读发布目录（systemd `ProtectSystem=strict`），
+/// 只有运行时目录可写；这两条错误就是踩到它时的解释。
+fn dir_error(dir: &Path, action: &str, error: std::io::Error) -> ApiError {
     match error.kind() {
-        // 生产部署里 `current/` 是只读发布目录（systemd ProtectSystem=strict），
-        // 只有运行时目录可写；这条错误就是踩到它时的解释。
         std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem => {
             ApiError::bad_request(format!(
-                "标注目录不可写 ({}): {error}；生产部署只能写运行时目录，\
+                "{action}失败 ({}): {error}；生产部署只能写运行时目录，\
                  请把 admin.annotation_dir 指到 runtime/ 下",
-                path.display()
+                dir.display()
             ))
         }
-        _ => ApiError::internal(format!("写入批次失败 ({}): {error}", path.display())),
+        _ => ApiError::internal(format!("{action}失败 ({}): {error}", dir.display())),
     }
+}
+
+fn write_error(path: &Path, error: std::io::Error) -> ApiError {
+    dir_error(path, "写入批次", error)
+}
+
+/// 确保标注目录存在（幂等），返回解析后的路径。
+///
+/// 目录完全由 `admin.annotation_dir` 推导、不含任何请求输入，所以建它不需要
+/// 额外授权：部署完就该能直接把批次 scp 进来（scp 到不存在的目录会直接失败），
+/// 打开页面时也不该先让人手工 `mkdir`。
+pub(crate) fn ensure_dir() -> Result<PathBuf, ApiError> {
+    let dir = config::annotation_dir_path();
+    if !dir.is_dir() {
+        fs::create_dir_all(&dir).map_err(|error| dir_error(&dir, "创建标注目录", error))?;
+    }
+    Ok(dir)
 }
 
 /// 串行化本进程内的读-改-写。跨进程干扰由 `revision` 校验兜底。
@@ -595,7 +614,12 @@ fn export_file_name(batch: &str) -> String {
 /// `GET /api/annotation/batches`
 pub(crate) async fn batches() -> Result<Json<Value>, ApiError> {
     blocking(|| {
-        let dir = config::annotation_dir_path();
+        // 目录是配置推导出来的，缺了就建（幂等）：页面第一次打开时就该是能用的
+        // 状态。建不出来也不报错，把原因放进 `error` 让页面说清楚。
+        let (dir, problem) = match ensure_dir() {
+            Ok(dir) => (dir, Value::Null),
+            Err(error) => (config::annotation_dir_path(), Value::String(error.message)),
+        };
         let exists = dir.is_dir();
         let mut batches = Vec::new();
         let mut exports = Vec::new();
@@ -657,6 +681,7 @@ pub(crate) async fn batches() -> Result<Json<Value>, ApiError> {
             "dir": dir.display().to_string(),
             "exists": exists,
             "writable": directory_writable(&dir),
+            "error": problem,
             "batches": batches,
             "exports": exports,
         }))
@@ -852,6 +877,7 @@ pub(crate) async fn mark(Json(body): Json<MarkRequest>) -> Result<Json<Value>, A
         let _guard = write_lock()
             .lock()
             .map_err(|_| ApiError::internal("标注写入锁已损坏"))?;
+        ensure_dir()?;
         let path = batch_path(&batch_name)?;
         let mut batch = load_batch_at(&path)?;
         mark_in_batch(&mut batch, index, &revision, completion, response)
@@ -889,7 +915,7 @@ pub(crate) async fn export(Json(body): Json<ExportRequest>) -> Result<Json<Value
             )));
         }
         let name = export_file_name(&batch_name);
-        let export_path = config::annotation_dir_path().join(&name);
+        let export_path = ensure_dir()?.join(&name);
         let text = render_jsonl(&exported)?;
         write_atomically(&export_path, &text).map_err(|error| write_error(&export_path, error))?;
         Ok(json!({
@@ -1189,5 +1215,27 @@ mod tests {
         assert!(public.get("source_key").is_none());
         assert_eq!(public["current_text"], json!("你好"));
         assert_eq!(sample["source_key"], json!("opaque-key"));
+    }
+
+    #[test]
+    fn read_only_paths_say_where_to_put_the_directory() {
+        let readonly = dir_error(
+            Path::new("/home/ubuntu/kovi-bot/current/turngate"),
+            "创建标注目录",
+            std::io::Error::from(std::io::ErrorKind::ReadOnlyFilesystem),
+        );
+        assert_eq!(readonly.status, axum::http::StatusCode::BAD_REQUEST);
+        assert!(readonly.message.contains("创建标注目录失败"));
+        assert!(readonly.message.contains("runtime/"));
+
+        let unexpected = dir_error(
+            Path::new("/tmp/whatever"),
+            "写入批次",
+            std::io::Error::from(std::io::ErrorKind::UnexpectedEof),
+        );
+        assert_eq!(
+            unexpected.status,
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 }

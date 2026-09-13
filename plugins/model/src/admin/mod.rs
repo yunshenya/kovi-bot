@@ -227,6 +227,14 @@ pub(crate) fn spawn(config: &AdminConfig, bot: Option<Arc<RuntimeBot>>) {
     ));
     let session_hours = config.session_ttl_secs() / 3_600;
 
+    // 标注目录由 admin.annotation_dir 推导，启动时就建好：运维部署完要能把批次
+    // scp 进来（scp 到不存在的目录会直接失败），不该先让人手工 mkdir。建不出来
+    // 只告警，标注页会把原因显示出来。
+    match annotation_api::ensure_dir() {
+        Ok(path) => println!("[INFO] 数据标注目录: {}", path.display()),
+        Err(error) => eprintln!("[WARN] 数据标注目录不可用: {}", error.message),
+    }
+
     kovi::tokio::spawn(async move {
         let listener = match kovi::tokio::net::TcpListener::bind(address).await {
             Ok(listener) => listener,

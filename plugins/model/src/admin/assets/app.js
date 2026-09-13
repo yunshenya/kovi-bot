@@ -2311,9 +2311,13 @@
     clear(page);
     page.append(renderAnnotationToolbar(batches));
     if (!annotation.exists) {
+      // 后台启动时会自动建这个目录；走到这里说明建不出来（只读路径、权限）。
       page.append(h('div', { class: 'card' },
-        h('div', { class: 'card-head' }, h('h3', { text: '标注目录还不存在' })),
-        h('div', { class: 'hint', text: '批次由 collector.py 从 journalctl 导出（doc §7.4 B），落在机器人所在机器上：' }),
+        h('div', { class: 'card-head' }, h('h3', { text: '标注目录建不出来' })),
+        h('div', { class: 'hint', text: data.error
+          ? `后台会按 admin.annotation_dir 自动创建它，这次失败了：${data.error}`
+          : '后台会按 admin.annotation_dir 自动创建它，但它现在不在。' }),
+        h('div', { class: 'hint', text: '批次由 collector.py 从 journalctl 导出（doc §7.4 B），要落在机器人所在机器上：' }),
         h('pre', { class: 'annotate-cmd', text: `mkdir -p ${annotation.dir}\nscp review-batch-*.jsonl <服务器>:${annotation.dir}/` })));
       renderAnnotationSummary();
       return;
@@ -2321,7 +2325,8 @@
     if (!batches.length) {
       page.append(h('div', { class: 'card' },
         h('div', { class: 'card-head' }, h('h3', { text: '这个目录里还没有批次' })),
-        h('div', { class: 'hint', text: `把 review-batch-*.jsonl 放进 ${annotation.dir} 即可，页面只读这一层目录。` })));
+        h('div', { class: 'hint', text: '把 collector.py 采出来的批次放进来（页面只读这一层目录）：' }),
+        h('pre', { class: 'annotate-cmd', text: `scp review-batch-*.jsonl <服务器>:${annotation.dir}/` })));
       renderAnnotationSummary();
       return;
     }
