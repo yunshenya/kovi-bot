@@ -789,8 +789,21 @@ a.stat:hover, .stat.link:hover { border-color: var(--accent); transform: transla
   /* 顶栏：标题占一行、操作占一行。挤在一行时那颗状态胶囊会被压成三行，
      顺带把标题也挤窄。 */
   .topbar { flex-wrap: wrap; gap: 8px 12px; padding-top: 12px; padding-bottom: 12px; }
-  .topbar-actions { width: 100%; justify-content: space-between; }
-  .pill { white-space: nowrap; }
+  /* 胶囊不回行，但必须能被截断：出错时它装的是后台返回的**任意错误串**
+     （app.js 的 refreshHealth 直接把 problem.message 写进 textContent），
+     nowrap 又没有宽度上限时，这一行会被它撑破——文档比手机屏还宽，iOS Safari
+     在加载期会把整页缩小到能放下（看起来就是"右面没占满"），而这个比例一旦
+     定下，不会因为之后文案恢复正常而还原。所以给行动作与胶囊都留出可收缩的
+     余地，超长时截断成省略号：既保住"胶囊始终一行"，又不会撑破页面。
+     胶囊是 inline-flex，省略号管不到里面的 flex 子项，窄屏改成 inline-block
+     让文字回到行内内容，点转到 ::before 自己画、自己留右边距。 */
+  .topbar-actions { width: 100%; justify-content: space-between; min-width: 0; }
+  .pill {
+    display: inline-block; vertical-align: middle;
+    max-width: 100%; min-width: 0;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .pill::before { display: inline-block; vertical-align: middle; margin-right: 6px; }
 
   /* 触屏上手指比鼠标粗：交互元素给到接近 40px 的可点高度。 */
   .btn { min-height: 40px; }
