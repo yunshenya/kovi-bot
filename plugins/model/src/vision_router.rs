@@ -126,7 +126,15 @@ async fn analyze_images_with_intrinsic(
             failures.join("；")
         );
     }
-    Ok(analyses.join("\n"))
+    let mut merged = analyses.join("\n");
+    if images.len() > selected.len() {
+        merged.push_str(&format!(
+            "\n（本次共 {} 张图，只分析了前 {} 张）",
+            images.len(),
+            selected.len()
+        ));
+    }
+    Ok(merged)
 }
 
 const MAX_VISION_QUESTION_CHARS: usize = 4_000;
@@ -154,8 +162,14 @@ impl VisionRouter {
         if images.is_empty() {
             return Err(anyhow!("没有可供视觉 Provider 分析的图片"));
         }
+        // 图片比上限多不再整轮失败：下面按上限截断，并在结论里注明还有几张没看
+        // （"多图未做拆分或降级"是 9-12 巡检里视觉失败的四类病因之一）。
         if images.len() > MAX_ROUTED_VISION_IMAGES {
-            return Err(anyhow!("一次最多分析 {MAX_ROUTED_VISION_IMAGES} 张图片"));
+            eprintln!(
+                "[WARN] 本次收到 {} 张图，按上限只分析前 {} 张",
+                images.len(),
+                MAX_ROUTED_VISION_IMAGES
+            );
         }
         let question = if question.trim().is_empty() {
             default_vision_prompt().to_string()
@@ -454,7 +468,9 @@ mod tests {
     }
 
     #[test]
-    fn router_rejects_more_than_four_images_before_calling_a_provider() {
+    fn router_degrades_gracefully_beyond_the_image_budget() {
+        // 超过上限不再整轮失败：向下截断，交给 provider 分析前 4 张并注明剩余张数。
+        // 这里用一个必定失败的假图 URL 证明它**进到了 provider**，而不是在门口被拒。
         kovi::tokio::runtime::Runtime::new()
             .expect("应创建测试运行时")
             .block_on(async {
@@ -464,7 +480,15 @@ mod tests {
                         url: "data:image/png;base64,iVBORw0KGgo=".to_string(),
                     })
                     .collect::<Vec<_>>();
-                assert!(router.analyze(&images, "看看", None).await.is_err());
+                let error = router
+                    .analyze(&images, "看看", None)
+                    .await
+                    .expect_err("假图应当分析失败");
+                let message = format!("{error}");
+                assert!(
+                    !message.contains("一次最多分析"),
+                    "不该在路由层因为张数直接拒绝: {message}"
+                );
             });
     }
 }
