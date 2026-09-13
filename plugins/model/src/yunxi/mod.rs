@@ -1433,7 +1433,7 @@ pub(crate) async fn delete_qq_person_domain_data(self_id: i64, user_id: i64) -> 
     let _ = refresh_owner_route_while_locked().await;
     let deleted = deleted?;
     // 相处结论按"显示名/QQ 的文本"存，不在上面那套外键级联里，必须显式删。
-    // 别名与当前昵称都传进去：模型可能用 QQ 号、旧昵称或群名片写下结论。
+    // 只用无歧义标识（QQ 号 + 外部身份）：显示名会撞名，传进去等于全局删别人的。
     delete_relation_notes_for_person(user_id, external_identity.external_id()).await;
     if let Some(gag_store) = gag_store() {
         delete_gag_entries_for_person(&gag_store, &gag_user_ids, user_id).await;
@@ -1473,7 +1473,7 @@ async fn delete_gag_entries_for_person(
     deleted
 }
 
-/// 清掉某个 QQ 用户相关的相处结论（QQ 号原文 + 所有已知称呼）。
+/// 清掉某个 QQ 用户相关的相处结论（只按 QQ 号原文与外部身份这两个**无歧义**标识）。
 ///
 /// 失败只记日志、不阻断擦除主流程：擦除本身已经完成，一条附加清理失败不该
 /// 让用户看到"删除失败"——但必须留下可查的痕迹。
@@ -1481,12 +1481,8 @@ async fn delete_relation_notes_for_person(user_id: i64, external_identity: &str)
     let Some(store) = relation_note_store() else {
         return;
     };
-    let nickname = crate::memory::MEMORY_MANAGER
-        .get_user_profile(user_id)
-        .await
-        .map(|profile| profile.nickname);
-    let labels = relation_note_targets(user_id, external_identity, nickname.as_deref());
-    match store.delete_targets(&labels).await {
+    let keys = relation_note_erasure_keys(user_id, external_identity);
+    match store.delete_targets(&keys).await {
         Ok(deleted) if deleted > 0 => {
             println!("[INFO] 已删除相处结论 {deleted} 条 (用户: {user_id})");
         }
@@ -1495,20 +1491,23 @@ async fn delete_relation_notes_for_person(user_id: i64, external_identity: &str)
     }
 }
 
-/// 按人擦除时要匹配的相处结论对象键来源：QQ 号原文 + 外部身份 + 当前昵称。
+/// 按人擦除相处结论时用哪些键：**只有无歧义标识**（QQ 号原文与外部身份）。
 ///
-/// 模型可能用其中任意一种写下结论（"2515950976" / "白浅" / 群名片），所以
-/// 三种都要传。空标签会在 store 里被归一化后丢掉，这里不重复判空。
-fn relation_note_targets(
-    user_id: i64,
-    external_identity: &str,
-    nickname: Option<&str>,
-) -> Vec<String> {
-    let mut labels = vec![user_id.to_string(), external_identity.to_string()];
-    if let Some(nickname) = nickname.map(str::trim).filter(|name| !name.is_empty()) {
-        labels.push(nickname.to_string());
-    }
-    labels
+/// 刻意**不**包含昵称/群名片。这张表按文本存、`delete_targets` 又没有作用域谓词，
+/// 所以传进去的每一个键都是"全局删"。昵称是有歧义的：把昵称改成另一个成员的名字
+/// 再执行 `#删除我的数据`，就会删掉无关群里关于那位真实成员的结论——那是删别人的
+/// 数据。一条有歧义的键不足以支撑一次删除，所以宁可少删（模型用昵称写下的结论会
+/// 留下，模块文档本来就把"别名覆盖做不到穷尽"列为既定代价），也不误删他人。
+///
+/// 顺带说明为什么不能用"限定作用域"来折中：结论的 scope 来自反思输入的 `MindScope`
+/// （`mind_runtime.rs:2410`），关于某人的结论可以写在**任何**会话作用域里（他在哪个
+/// 群说过话，那个群的作用域就可能有），从这个人自己的身份出发枚举不出来；按作用域
+/// 限定会把群里的结论漏掉，那是删不干净他自己的数据。
+///
+/// 群级擦除不受影响：`delete_qq_group_domain_data` 走 `delete_conversations`，本来就
+/// 是按会话作用域删的。
+fn relation_note_erasure_keys(user_id: i64, external_identity: &str) -> Vec<String> {
+    vec![user_id.to_string(), external_identity.to_string()]
 }
 
 /// 解析某个 QQ 群在 Core 里的会话 id（相处结论与群级压力都按会话作用域存）。
@@ -1680,7 +1679,7 @@ mod tests {
 
 #[cfg(test)]
 mod erasure_tests {
-    use super::{delete_gag_entries_for_person, relation_note_targets};
+    use super::{delete_gag_entries_for_person, relation_note_erasure_keys};
     use crate::yunxi::identity_store::PostgresIdentityStore;
     use sqlx_postgres::PgPool;
     use std::sync::Arc;
@@ -1847,18 +1846,105 @@ mod erasure_tests {
         .expect("应统计记忆行")
     }
 
+    /// 昵称撞名不得误删他人：某人把昵称改成另一个成员的名字，再执行 `#删除我的数据`，
+    /// 无关群里关于那位真实成员的相处结论必须原样留着。
+    ///
+    /// 这张表按文本存、`delete_targets` 又没有作用域谓词，所以"把昵称也传进去"就等于
+    /// 全局删——这条测试同时钉住"按人的擦除只用无歧义标识"这个决定。
     #[test]
-    fn person_erasure_covers_every_name_the_model_might_have_used() {
-        let labels = relation_note_targets(2515950976, "2515950976", Some("白浅"));
-        assert!(labels.contains(&"2515950976".to_string()));
-        assert!(labels.contains(&"白浅".to_string()));
-        assert_eq!(labels.len(), 3);
+    #[ignore = "requires PostgreSQL via DATABASE_URL"]
+    fn erasure_never_deletes_another_persons_relation_notes_by_nickname() {
+        use crate::yunxi::relation_note_store::{PostgresRelationNoteStore, RelationNoteDraft};
+        use sqlx_postgres::PgPoolOptions;
+        use yunxi_core::EventId;
+        use yunxi_core::mind::MindScope;
 
-        // 没有昵称时不塞空标签：空串在 store 里会被归一化丢掉，这里也不该出现。
-        let without_nickname = relation_note_targets(42, "42", None);
-        assert_eq!(without_nickname, vec!["42".to_string(), "42".to_string()]);
-        let blank_nickname = relation_note_targets(42, "42", Some("   "));
-        assert_eq!(blank_nickname, vec!["42".to_string(), "42".to_string()]);
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let database_url = std::env::var("DATABASE_URL").expect("需要 DATABASE_URL");
+                let pool = PgPoolOptions::new()
+                    .max_connections(4)
+                    .connect(&database_url)
+                    .await
+                    .expect("应连接 PostgreSQL");
+                let store = PostgresRelationNoteStore::new(pool.clone());
+                store
+                    .initialize_schema()
+                    .await
+                    .expect("应初始化相处结论 schema");
+
+                let now = chrono::Utc::now();
+                let scope = MindScope::Conversation {
+                    conversation_id: yunxi_core::ConversationId::new(),
+                };
+                // 每次用不同的标签：这张表是持久库，写死"小明"会让第二次跑断言
+                // 到上一次留下的行（本地连跑两次就会红）。仓库里其他 PG 用例同样
+                // 用随机后缀。
+                let suffix = (uuid::Uuid::new_v4().as_u128() % 1_000_000_000) as i64;
+                // 请求者把昵称改成了别人的名字；真正属于他的行是按 QQ 号存的。
+                let victim_label = format!("撞名对象{suffix}");
+                let requester_label = format!("1000000000{suffix:03}");
+                for (target, note) in [
+                    (victim_label.as_str(), "他其实只是着急"),
+                    (requester_label.as_str(), "他答应过要早睡"),
+                ] {
+                    let draft =
+                        RelationNoteDraft::new(scope, target, note, 100, Some(EventId::new()), now)
+                            .expect("测试用的相处结论应当有效");
+                    store.upsert_notes(&[draft]).await.expect("应写入相处结论");
+                }
+
+                let keys = relation_note_erasure_keys(1_000_000_000_123, &requester_label);
+                let deleted = store.delete_targets(&keys).await.expect("应删除");
+                assert_eq!(deleted, 1, "只该删掉按 QQ 号存的那一条");
+
+                let remaining = |target: String| {
+                    let pool = pool.clone();
+                    async move {
+                        sqlx_core::query_scalar::query_scalar::<_, i64>(
+                            "SELECT COUNT(*) FROM yunxi_relation_notes WHERE target_key = $1",
+                        )
+                        .bind(target)
+                        .fetch_one(&pool)
+                        .await
+                        .expect("应统计相处结论")
+                    }
+                };
+                assert_eq!(
+                    remaining(requester_label.clone()).await,
+                    0,
+                    "按 QQ 号存的自己的结论应当删掉"
+                );
+                assert_eq!(
+                    remaining(victim_label.clone()).await,
+                    1,
+                    "撞名不得删掉他人（真实那位同名成员）的结论"
+                );
+            });
+    }
+
+    /// 按人擦除相处结论只用**无歧义**标识。
+    ///
+    /// 这张表按文本存、`delete_targets` 没有作用域谓词，所以传进去的每个键都是全局删。
+    /// 昵称有歧义（谁都能把昵称改成别人的名字），一旦传进去就会删掉无关群里关于那位
+    /// 真实成员的结论——删别人的数据。宁可少删，也不误删他人。
+    #[test]
+    fn person_erasure_only_uses_unambiguous_relation_note_keys() {
+        let keys = relation_note_erasure_keys(2515950976, "2515950976");
+        assert!(keys.contains(&"2515950976".to_string()));
+        assert_eq!(keys.len(), 2);
+
+        // 关键断言：昵称**不在**键里。回归到"把显示名也传进去"会让这条失败。
+        let nickname: &str = "白浅";
+        assert!(
+            !keys.contains(&nickname.to_string()),
+            "昵称是歧义键，不能参与全局删除"
+        );
+
+        // 外站身份照旧参与（它同样唯一指向一个人）。
+        let cross_platform = relation_note_erasure_keys(42, "matrix:@someone:example.org");
+        assert!(cross_platform.contains(&"matrix:@someone:example.org".to_string()));
     }
 
     /// 数据擦除的端到端不变量：擦除之后，**下一次持久化**不能把被删的人写回来。
