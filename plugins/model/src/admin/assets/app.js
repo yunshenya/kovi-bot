@@ -2782,6 +2782,7 @@
     if (currentPage !== 'annotation') return;
     annotation.current = data;
     annotation.revision = data.revision;
+    annotation.draft = annotationDraftFor(data);
     renderAnnotationList();
     renderAnnotationDetail();
     if (scrollToDetail && narrowLayout()) {
@@ -2794,6 +2795,34 @@
         behavior: 'smooth',
       });
     }
+  }
+
+  /**
+   * 打开一条样本时，标签按钮该预选什么。
+   *
+   * **已标注的回显人工值**：打开一条标过的样本却四个按钮全空，既看不出自己标过
+   * 什么，也没法在原值上改。已标注样本的 `labels` 里存的就是人工标签（标记时
+   * 覆盖了采集器的弱标签），直接拿来预选。
+   *
+   * **未标注的不预选**：那里 `labels` 是弱标签（机器猜的），先替人选上就是把猜测
+   * 当成人的判断——而"保存"会把它当人工标签写下去，复核就白做了。弱标签仍然以
+   * 文字显示在按钮上方，供人参考而不是替人决定。
+   *
+   * 注意一个数据模型上的老问题：只标了一个 head 的样本，另一个 head 里留着的还是
+   * 采集器的弱标签，而 `label_provenance` 整条已变成 human_consensus——从数据上
+   * 分不出哪一侧是人选的，所以那一侧也会显示成"已选中"。要区分得改数据模型，
+   * 不在这一层解决。
+   */
+  function annotationDraftFor(current) {
+    const empty = { completion: '', response: '' };
+    if (!current || !current.reviewed) return empty;
+    const labels = (current.sample && current.sample.labels) || {};
+    // 存进去的 JSON `null` 表示"判不了"，界面上对应按钮的值是字符串 'null'。
+    const pick = (value) => {
+      if (value === null) return 'null';
+      return typeof value === 'string' ? value : '';
+    };
+    return { completion: pick(labels.completion), response: pick(labels.response) };
   }
 
   function annotationChoice(head, value, label) {
@@ -2874,7 +2903,9 @@
         })),
       body.childNodes.length ? h('div', { class: 'annotate-context' }, body) : null,
       h('div', { class: 'annotate-meta' },
-        h('span', { text: `弱标签：completion=${labels.completion == null ? '未给' : labels.completion}` }),
+        // 已标注样本里 `labels` 存的是**人工**标签（弱标签在标记时被覆盖了），
+        // 再叫"弱标签"会让人以为那是机器的猜测。
+        h('span', { text: `${current.reviewed ? '已标注' : '弱标签'}：completion=${labels.completion == null ? '未给' : labels.completion}` }),
         h('span', { text: `response=${labels.response == null ? '未给' : labels.response}` }),
         h('span', { text: `来源 ${provenance.source || '未知'}` }),
         // 老批次的"他人"分不出是几个人：明说，免得以为界面漏了编号。
