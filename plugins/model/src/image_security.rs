@@ -12,6 +12,9 @@ use std::time::Duration;
 use url::{Host, Url};
 
 const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
+/// 允许解码后缩放的像素上限（约 480MB RGBA 峰值）。再大就直接拒绝，
+/// 不为了缩放把只有 1.1GB 可用内存的机器打爆。
+const MAX_DECODABLE_PIXELS: u64 = 120_000_000;
 pub(crate) const MAX_TOTAL_IMAGE_BYTES: usize = 20 * 1024 * 1024;
 pub(crate) const MAX_REMOTE_IMAGE_URL_BYTES: usize = 4_096;
 pub(crate) const MAX_DATA_IMAGE_URL_BYTES: usize = 14 * 1024 * 1024;
@@ -388,6 +391,119 @@ fn transcode_gif_to_png(bytes: &[u8], max_bytes: usize) -> Result<(String, Vec<u
     Ok(("image/png".to_string(), png))
 }
 
+/// 把超过像素上限的图片按比例缩到限内，再编码回 data URL。
+///
+/// 为什么需要它：本机 SigLIP 编码器内部本来就会把图缩到固定尺寸，`max_pixels`
+/// 只是护栏——但护栏之前没人缩放，于是 8400 万像素的图会先被完整解码（几百 MB）
+/// 再在护栏处失败；9-12 的线上巡检里这类失败出现过两次，而那台机器只有 1.1GB
+/// 可用内存。这里先只读文件头拿尺寸，需要缩小时让解码器**直接按目标尺寸解码**
+/// （`ImageReader::resize`），峰值内存只跟目标尺寸有关。
+pub(crate) fn downscale_image_data_url_to_pixel_limit(
+    raw_url: &str,
+    max_bytes: usize,
+    max_pixels: u64,
+) -> Result<String> {
+    let (_, bytes) = decode_validated_image_data_url(raw_url, max_bytes)?;
+    if max_pixels == 0 {
+        return Ok(raw_url.to_string());
+    }
+    let reader = || {
+        image::ImageReader::new(std::io::Cursor::new(bytes.as_slice()))
+            .with_guessed_format()
+            .map_err(|error| anyhow!("图片格式识别失败: {error}"))
+    };
+    let (width, height) = reader()?
+        .into_dimensions()
+        .map_err(|error| anyhow!("图片尺寸读取失败: {error}"))?;
+    if width == 0 || height == 0 {
+        return Err(anyhow!("图片尺寸无效: {width}x{height}"));
+    }
+    let pixels = u64::from(width) * u64::from(height);
+    if pixels <= max_pixels {
+        return Ok(raw_url.to_string());
+    }
+
+    // 解码上限：再大就先拒绝，避免为了缩放把整机内存打爆（这台机器只有 1.1GB 可用）。
+    if pixels > MAX_DECODABLE_PIXELS {
+        return Err(anyhow!(
+            "图片过大（{pixels} 像素，超过可缩放上限 {MAX_DECODABLE_PIXELS}）"
+        ));
+    }
+    let ratio = (max_pixels as f64 / pixels as f64).sqrt();
+    let mut target_width = ((f64::from(width) * ratio).floor() as u32).max(1);
+    let mut target_height = ((f64::from(height) * ratio).floor() as u32).max(1);
+    // 先朴素解码一次，再缩：image 0.25 没有"按目标尺寸解码"的公开 API，
+    // 所以这里的峰值内存由源图决定，调用方要放到 spawn_blocking 里执行。
+    let source = reader()?
+        .decode()
+        .map_err(|error| anyhow!("图片解码失败: {error}"))?;
+    for _ in 0..4 {
+        let decoded = if target_width * 2 < width || target_height * 2 < height {
+            // 大幅缩小时 box 滤波（thumbnail）比卷积更快、质量也够
+            image::DynamicImage::ImageRgba8(image::imageops::thumbnail(
+                &source,
+                target_width,
+                target_height,
+            ))
+        } else {
+            source.resize(
+                target_width,
+                target_height,
+                image::imageops::FilterType::Triangle,
+            )
+        };
+        // 先试 PNG（截图与文字更清晰）；字节超限就退 JPEG，再不行继续缩。
+        if let Some(data_url) = encode_within_limit(&decoded, ImageFormat::Png, max_bytes)? {
+            return Ok(data_url);
+        }
+        if let Some(data_url) = encode_jpeg_within_limit(&decoded, 85, max_bytes)? {
+            return Ok(data_url);
+        }
+        target_width = (target_width / 2).max(1);
+        target_height = (target_height / 2).max(1);
+    }
+    Err(anyhow!("图片缩放后仍超过 {max_bytes} 字节上限"))
+}
+
+fn encode_within_limit(
+    image: &image::DynamicImage,
+    format: ImageFormat,
+    max_bytes: usize,
+) -> Result<Option<String>> {
+    let mut encoded = Vec::new();
+    image
+        .write_to(&mut std::io::Cursor::new(&mut encoded), format)
+        .map_err(|error| anyhow!("图片重新编码失败: {error}"))?;
+    if encoded.len() > max_bytes {
+        return Ok(None);
+    }
+    let mime_type = match format {
+        ImageFormat::Png => "image/png",
+        ImageFormat::Jpeg => "image/jpeg",
+        _ => "image/png",
+    };
+    Ok(Some(encode_image_data_url(mime_type, &encoded)))
+}
+
+fn encode_jpeg_within_limit(
+    image: &image::DynamicImage,
+    quality: u8,
+    max_bytes: usize,
+) -> Result<Option<String>> {
+    let mut encoded = Vec::new();
+    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(
+        std::io::Cursor::new(&mut encoded),
+        quality,
+    );
+    encoder
+        .encode_image(image)
+        .map_err(|error| anyhow!("图片 JPEG 编码失败: {error}"))?;
+    if encoded.len() > max_bytes {
+        return Ok(None);
+    }
+    Ok(Some(encode_image_data_url("image/jpeg", &encoded)))
+}
+
 fn validate_image_signature(mime_type: &str, bytes: &[u8]) -> Result<()> {
     let valid = image_content_type_from_signature(bytes) == Some(mime_type);
     if valid {
@@ -421,9 +537,10 @@ fn encode_image_data_url(mime_type: &str, bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_validated_image_data_url, image_content_type_from_signature, is_public_image_ip,
-        is_safe_onebot_image_file, parse_image_content_type, resolve_image_content_type,
-        transcode_gif_to_png, validate_image_signature, validate_remote_image_url,
+        decode_validated_image_data_url, downscale_image_data_url_to_pixel_limit,
+        image_content_type_from_signature, is_public_image_ip, is_safe_onebot_image_file,
+        parse_image_content_type, resolve_image_content_type, transcode_gif_to_png,
+        validate_image_signature, validate_remote_image_url,
     };
     use base64::Engine;
     use std::net::IpAddr;
@@ -505,6 +622,96 @@ mod tests {
         }
         assert!(is_public_image_ip("1.1.1.1".parse().unwrap()));
         assert!(is_public_image_ip("2606:4700:4700::1111".parse().unwrap()));
+    }
+
+    /// 造一张 `width x height` 的 PNG data URL（棋盘格，缩放后仍可区分）。
+    fn png_data_url(width: u32, height: u32) -> String {
+        let bitmap = image::ImageBuffer::from_fn(width, height, |x, y| {
+            if (x / 8 + y / 8) % 2 == 0 {
+                image::Rgb([240_u8, 240, 240])
+            } else {
+                image::Rgb([30_u8, 120, 200])
+            }
+        });
+        let mut encoded = Vec::new();
+        image::DynamicImage::ImageRgb8(bitmap)
+            .write_to(
+                &mut std::io::Cursor::new(&mut encoded),
+                image::ImageFormat::Png,
+            )
+            .expect("编码测试图片");
+        format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(&encoded)
+        )
+    }
+
+    #[test]
+    fn oversized_images_are_downscaled_to_the_pixel_limit() {
+        // 2000x2000 = 400 万像素，上限压到 100 万：必须缩，且长宽比保持不变。
+        let url = png_data_url(2000, 2000);
+        let scaled = downscale_image_data_url_to_pixel_limit(&url, 4 * 1024 * 1024, 1_000_000)
+            .expect("超限图片应能被缩放");
+        let (_, bytes) = decode_validated_image_data_url(&scaled, 4 * 1024 * 1024)
+            .expect("缩放结果应是合法图片");
+        let decoded = image::load_from_memory(&bytes).expect("缩放结果应能解码");
+        let pixels = u64::from(decoded.width()) * u64::from(decoded.height());
+        assert!(pixels <= 1_000_000, "缩放后仍有 {pixels} 像素");
+        assert_eq!(decoded.width(), decoded.height(), "等比缩放不该改变长宽比");
+        assert!(
+            decoded.width() >= 900,
+            "不该缩得比需要的更小: {}",
+            decoded.width()
+        );
+    }
+
+    #[test]
+    fn images_within_the_limit_are_returned_untouched() {
+        let url = png_data_url(200, 200);
+        let same = downscale_image_data_url_to_pixel_limit(&url, 4 * 1024 * 1024, 1_000_000)
+            .expect("未超限的图片不该报错");
+        assert_eq!(same, url, "没超限就不该重新编码（保持原图质量）");
+    }
+
+    #[test]
+    fn downscaled_images_respect_the_byte_budget() {
+        // 真实场景：QQ 发来的 JPEG 照片本身不大，但按上限重编成 PNG 会超字节上限，
+        // 此时必须退 JPEG（而不是把超限的图交给下游、再在护栏处失败）。
+        let mut bitmap = image::ImageBuffer::from_fn(1200, 1200, |x, y| {
+            image::Rgb([
+                ((x * 7 + y * 13) % 256) as u8,
+                ((x * 31 + y * 17) % 256) as u8,
+                ((x * 101 + y * 3) % 256) as u8,
+            ])
+        });
+        for (index, pixel) in bitmap.pixels_mut().enumerate() {
+            *pixel = image::Rgb([
+                ((index * 37) % 256) as u8,
+                ((index * 91) % 256) as u8,
+                ((index * 53) % 256) as u8,
+            ]);
+        }
+        let mut jpeg = Vec::new();
+        image::DynamicImage::ImageRgb8(bitmap.clone())
+            .write_to(
+                &mut std::io::Cursor::new(&mut jpeg),
+                image::ImageFormat::Jpeg,
+            )
+            .expect("编码测试 JPEG");
+        let url = format!(
+            "data:image/jpeg;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(&jpeg)
+        );
+
+        // 上限设成"输入 JPEG 放得下、按像素上限重编 PNG 放不下"的量级。
+        let limit = jpeg.len() * 3;
+        let scaled = downscale_image_data_url_to_pixel_limit(&url, limit, 200_000)
+            .expect("应能缩到字节上限内");
+        let (_, bytes) =
+            decode_validated_image_data_url(&scaled, limit).expect("缩放结果应满足同一套校验");
+        assert!(bytes.len() <= limit, "缩放后仍有 {} 字节", bytes.len());
+        let decoded = image::load_from_memory(&bytes).expect("缩放结果应能解码");
+        assert!(u64::from(decoded.width()) * u64::from(decoded.height()) <= 200_000);
     }
 
     #[test]

@@ -14,60 +14,119 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-/// Fall back to the local Intrinsic vision model when the hosted built-in
-/// provider is unavailable or fails. This keeps image understanding working
-/// even when the configured vision endpoint (e.g. an external proxy) is down
-/// or out of balance. Returns `None` when the Intrinsic model is unavailable
-/// or does not support vision, so the caller can continue to the next
-/// provider instead of forcing a local inference.
-async fn analyze_images_with_intrinsic(images: &[VisionImage], question: &str) -> Option<String> {
-    let runtime = crate::yunxi::intrinsic_runtime::get()?;
-    if !runtime.supports_vision() {
-        eprintln!(
-            "[WARN] Intrinsic 视觉模型不可用（supports_vision=false，health={:?}）",
-            runtime.health()
-        );
-        return None;
+/// 给单张图的结论加标题：多图时必须能分辨哪段是哪张，单图保持原文。
+fn label_vision_analysis(index: usize, multi: bool, text: &str) -> String {
+    if multi {
+        format!("【图 {}】{}", index + 1, text)
+    } else {
+        text.to_owned()
     }
-    // The Intrinsic vision engine resolves a single image per turn.
-    if images.len() != 1 {
-        eprintln!(
-            "[WARN] Intrinsic 视觉模型仅支持单图分析，收到 {} 张",
-            images.len()
-        );
-        return None;
+}
+
+/// 用本机 Intrinsic 视觉模型分析图片。
+///
+/// 两件事在这里补齐（9-12 的线上巡检里它们占了全部 WARN/ERROR 的 20%）：
+///
+/// - **多图逐张分析再合并**：本机模型一次只吃一张图，旧实现直接放弃并报"仅支持单图"，
+///   于是带图的 4 张消息永远失败。现在逐张分析、按 `【图 N】` 合并；
+/// - **超像素图先缩放**：`max_pixels` 只是护栏（SigLIP 内部还会缩到固定尺寸），
+///   旧实现在护栏前不缩放，8400 万像素的图必然失败。现在先缩放再推理。
+///
+/// 单张失败不再拖垮整轮：全部失败才返回 `Err(reason)`，并且 reason 是**具体原因**
+/// （像素超限 / 解码失败 / 模型不支持），不再是笼统的"视觉模型不可用"。
+async fn analyze_images_with_intrinsic(
+    images: &[VisionImage],
+    question: &str,
+) -> Result<String, String> {
+    let runtime = crate::yunxi::intrinsic_runtime::get()
+        .ok_or_else(|| "本地 Intrinsic 模型未启用".to_owned())?;
+    if !runtime.supports_vision() {
+        return Err(format!(
+            "模型不支持视觉（supports_vision=false，health={:?}）",
+            runtime.health()
+        ));
     }
     let config = runtime.runtime().config();
-    let image = match crate::yunxi::intrinsic_runtime::resolved_image_from_data_url(
-        &images[0].url,
-        config.media.max_bytes,
-    ) {
-        Ok(image) => image,
-        Err(error) => {
-            eprintln!("[WARN] Intrinsic 视觉图片解析失败: {error}");
-            return None;
-        }
-    };
     let prompt = if question.trim().is_empty() {
         default_vision_prompt().to_string()
     } else {
         question.trim().to_string()
     };
-    match runtime
-        .infer_vision(yunxi_core::VisionInferenceRequest {
-            prompt,
-            image,
-            max_context_tokens: config.max_context_tokens,
-            max_new_tokens: config.max_new_tokens,
+
+    let selected: Vec<&VisionImage> = images.iter().take(MAX_ROUTED_VISION_IMAGES).collect();
+    let multi = selected.len() > 1;
+    let mut analyses: Vec<String> = Vec::new();
+    let mut failures: Vec<String> = Vec::new();
+    for (index, image) in selected.iter().enumerate() {
+        let label = index + 1;
+        let max_bytes = config.media.max_bytes;
+        let max_pixels = config.media.max_pixels;
+        let url = image.url.clone();
+        let scaled = kovi::tokio::task::spawn_blocking(move || {
+            crate::image_security::downscale_image_data_url_to_pixel_limit(
+                &url, max_bytes, max_pixels,
+            )
         })
         .await
-    {
-        Ok(output) => Some(output.text),
-        Err(error) => {
-            eprintln!("[WARN] Intrinsic 视觉推理失败: {error}");
-            None
+        .map_err(|error| format!("图 {label} 缩放任务失败: {error}"))?;
+        let url = match scaled {
+            Ok(url) => url,
+            Err(error) => {
+                failures.push(format!("图 {label}: {error}"));
+                continue;
+            }
+        };
+        let resolved = match crate::yunxi::intrinsic_runtime::resolved_image_from_data_url(
+            &url,
+            config.media.max_bytes,
+        ) {
+            Ok(image) => image,
+            Err(error) => {
+                failures.push(format!("图 {label}: {error}"));
+                continue;
+            }
+        };
+        match runtime
+            .infer_vision(yunxi_core::VisionInferenceRequest {
+                prompt: prompt.clone(),
+                image: resolved,
+                max_context_tokens: config.max_context_tokens,
+                max_new_tokens: config.max_new_tokens,
+            })
+            .await
+        {
+            Ok(output) => {
+                let text = output.text.trim().to_owned();
+                if text.is_empty() {
+                    failures.push(format!("图 {label}: 模型没有给出内容"));
+                } else {
+                    analyses.push(label_vision_analysis(index, multi, &text));
+                }
+            }
+            Err(error) => failures.push(format!("图 {label}: {error}")),
         }
     }
+
+    if analyses.is_empty() {
+        return Err(if failures.is_empty() {
+            "没有可分析的图片".to_owned()
+        } else {
+            format!(
+                "{} 张图全部分析失败（{}）",
+                failures.len(),
+                failures.join("；")
+            )
+        });
+    }
+    if !failures.is_empty() {
+        eprintln!(
+            "[WARN] Intrinsic 视觉部分失败（{} 张成功 / {} 张失败）: {}",
+            analyses.len(),
+            failures.len(),
+            failures.join("；")
+        );
+    }
+    Ok(analyses.join("\n"))
 }
 
 const MAX_VISION_QUESTION_CHARS: usize = 4_000;
@@ -120,22 +179,21 @@ impl VisionRouter {
     ) -> Result<String> {
         match self.config.provider() {
             // 本地 Intrinsic 视觉模型：不依赖外部端点，图片完全在本机推理。
-            "intrinsic" => match analyze_images_with_intrinsic(images, question).await {
-                Some(result) => Ok(result),
-                None => Err(anyhow!(
-                    "本地 Intrinsic 视觉模型不可用（需要单一图片且模型支持 vision）"
-                )),
-            },
+            "intrinsic" => analyze_images_with_intrinsic(images, question)
+                .await
+                .map_err(|reason| anyhow!("本地 Intrinsic 视觉分析失败: {reason}")),
             "builtin" => match analyze_images_with_builtin(images, question).await {
                 Ok(result) => Ok(result),
                 Err(error) => {
                     eprintln!("[WARN] 内置视觉 Provider 失败: {}", error);
                     // Fall back to the local Intrinsic model so image understanding
                     // keeps working when the hosted provider is unavailable.
-                    if let Some(out) = analyze_images_with_intrinsic(images, question).await {
-                        Ok(out)
-                    } else {
-                        Err(error)
+                    match analyze_images_with_intrinsic(images, question).await {
+                        Ok(out) => Ok(out),
+                        Err(reason) => {
+                            eprintln!("[WARN] Intrinsic 视觉回退也失败: {reason}");
+                            Err(error)
+                        }
                     }
                 }
             },
@@ -170,8 +228,9 @@ impl VisionRouter {
         }
         // Local Intrinsic fallback keeps image understanding working even when
         // the hosted vision endpoint is unavailable or out of balance.
-        if let Some(out) = analyze_images_with_intrinsic(images, question).await {
-            return Ok(out);
+        match analyze_images_with_intrinsic(images, question).await {
+            Ok(out) => return Ok(out),
+            Err(reason) => eprintln!("[WARN] Intrinsic 视觉回退失败: {reason}"),
         }
         if mcp_configured {
             return self.analyze_with_mcp(images, question, reply_ticket).await;
@@ -341,7 +400,7 @@ fn set_private_permissions(path: &Path, mode: u32) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{VisionRouter, decode_image_data_url, image_extension};
+    use super::{VisionRouter, decode_image_data_url, image_extension, label_vision_analysis};
     use crate::config::VisionConfig;
     use crate::vision::VisionImage;
     use base64::Engine;
@@ -376,6 +435,22 @@ mod tests {
                 url: "data:image/png;base64,iVBORw0KGgo=".to_string(),
             },
         );
+    }
+
+    #[test]
+    fn single_image_analysis_keeps_plain_text() {
+        // 单图不加标题：下游按纯文本消费，标题会污染提示词。
+        assert_eq!(label_vision_analysis(0, false, "一只猫"), "一只猫");
+    }
+
+    #[test]
+    fn multiple_image_analyses_are_labelled_in_order() {
+        let merged = [
+            label_vision_analysis(0, true, "一只猫"),
+            label_vision_analysis(1, true, "一条狗"),
+        ]
+        .join("\n");
+        assert_eq!(merged, "【图 1】一只猫\n【图 2】一条狗");
     }
 
     #[test]
