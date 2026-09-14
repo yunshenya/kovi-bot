@@ -74,6 +74,7 @@ pub(crate) use crate::model::private::{
     private_message_event_after_ingress, sweep_private_window_queues,
 };
 pub(crate) use crate::model::recall::{
-    is_recent_bot_message, recall_notice_event, send_tracked_private_message,
-    source_messages_already_answered,
+    core_turn_blocked_by_recall, is_recent_bot_message, recall_notice_event,
+    record_core_reply_linkage, remember_core_turn_sources, send_tracked_private_message,
+    source_messages_already_answered, take_core_turn_sources,
 };

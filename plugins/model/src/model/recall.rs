@@ -29,6 +29,7 @@ struct ActiveReply {
     sent_message_ids: Vec<i32>,
 }
 
+#[derive(Debug, Clone)]
 struct RecentReply {
     source_message_ids: Vec<i32>,
     sent_message_ids: Vec<i32>,
@@ -106,6 +107,114 @@ pub(crate) async fn begin_reply_locked(
         sent_message_ids: Vec::new(),
     });
     true
+}
+
+/// Core 回合的"这一轮在答哪几条消息"。
+///
+/// Host 链路靠 `ReplyTicket` 把源消息与她的回复串起来（`begin_reply` →
+/// `record_committed_bot_message` → `finish_reply`）；Core 的回合由 yunxi-core
+/// 自己驱动，投递端口只拿得到目的地、拿不到事件身份，所以这里按 `EventId` 暂存
+/// 一份，供两件事：
+///
+/// 1. **投递前拦截**：源消息被撤回时不要发出去（Host 在生成前后各拦一次，
+///    Core 只有投递端口这一个能拦住的地方）；
+/// 2. **撤回联动**：投递成功后登记「源消息 ↔ 她发出的消息」，群友撤回源消息时
+///    她的回复也要跟着撤回（QQ 只允许撤 2 分钟内的消息）。
+///
+/// 这只是"登记"，不参与任何权限判断；条目在回合结束时取走，另有 TTL 兜底
+/// （回合被节奏/撤回/错误提前终止时不会永久留下）。
+#[derive(Debug, Clone)]
+struct CoreTurnSources {
+    scope: ReplyScope,
+    message_ids: Vec<i32>,
+    recorded_at: Instant,
+}
+
+/// Core 源消息登记表的保质期：超过这个时间没被取走就当它属于一个已经结束的
+/// 回合（投递端口再也等不到它），直接清掉。
+const CORE_TURN_SOURCES_TTL: Duration = Duration::from_secs(600);
+
+static CORE_TURN_SOURCES: LazyLock<Mutex<HashMap<yunxi_core::EventId, CoreTurnSources>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// 记下这一轮 Core 回合在答哪些 QQ 消息（入站时调用，事件提交之前）。
+pub(crate) async fn remember_core_turn_sources(
+    event_id: yunxi_core::EventId,
+    scope: ReplyScope,
+    message_ids: Vec<i32>,
+) {
+    if message_ids.is_empty() {
+        return;
+    }
+    let mut sources = CORE_TURN_SOURCES.lock().await;
+    prune_core_turn_sources(&mut sources, Instant::now());
+    sources.insert(
+        event_id,
+        CoreTurnSources {
+            scope,
+            message_ids,
+            recorded_at: Instant::now(),
+        },
+    );
+}
+
+/// 投递前判断：这个会话当前这一轮的源消息是不是已经被撤回了。
+///
+/// 没有登记（主动消息、进程刚重启）时一律返回 false——宁可发出去，也不要因为
+/// 读不到登记就把一条正常回复吞掉。
+pub(crate) async fn core_turn_blocked_by_recall(scope: ReplyScope) -> bool {
+    let message_ids = {
+        let mut sources = CORE_TURN_SOURCES.lock().await;
+        prune_core_turn_sources(&mut sources, Instant::now());
+        sources
+            .values()
+            .filter(|entry| entry.scope == scope)
+            .max_by_key(|entry| entry.recorded_at)
+            .map(|entry| entry.message_ids.clone())
+    };
+    let Some(message_ids) = message_ids else {
+        return false;
+    };
+    has_recalled_messages(scope, &message_ids).await
+}
+
+/// 回合结束：取走这一轮的源消息（同时清掉登记）。
+pub(crate) async fn take_core_turn_sources(
+    event_id: yunxi_core::EventId,
+) -> Option<(ReplyScope, Vec<i32>)> {
+    let mut sources = CORE_TURN_SOURCES.lock().await;
+    prune_core_turn_sources(&mut sources, Instant::now());
+    sources
+        .remove(&event_id)
+        .map(|entry| (entry.scope, entry.message_ids))
+}
+
+/// 投递成功：把「源消息 ↔ 她发出的消息」记进同一份 `recent_replies`，
+/// 于是群友撤回源消息时，`handle_recalled_message` 会连带撤回她的回复。
+pub(crate) async fn record_core_reply_linkage(
+    scope: ReplyScope,
+    source_message_ids: Vec<i32>,
+    sent_message_ids: Vec<i32>,
+) {
+    if source_message_ids.is_empty() || sent_message_ids.is_empty() {
+        return;
+    }
+    let mut lifecycles = REPLY_LIFECYCLES.lock().await;
+    prune_lifecycles(&mut lifecycles);
+    let lifecycle = lifecycles.entry(scope).or_default();
+    lifecycle.last_seen = Instant::now();
+    lifecycle.recent_replies.push(RecentReply {
+        source_message_ids,
+        sent_message_ids,
+        finished_at: Instant::now(),
+    });
+}
+
+fn prune_core_turn_sources(
+    sources: &mut HashMap<yunxi_core::EventId, CoreTurnSources>,
+    now: Instant,
+) {
+    sources.retain(|_, entry| now.duration_since(entry.recorded_at) < CORE_TURN_SOURCES_TTL);
 }
 
 /// 这些源消息是否已经由某一轮回复回答过（含正在进行的那一轮）。
@@ -694,9 +803,11 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        REPLY_LIFECYCLES, ReplyLifecycle, begin_reply, finish_reply, normalize_recall_message_ids,
-        parse_recall_notice, record_committed_bot_message, record_recent_bot_message,
-        record_standalone_bot_message, remove_bot_messages, source_messages_already_answered,
+        REPLY_LIFECYCLES, ReplyLifecycle, begin_reply, core_turn_blocked_by_recall, finish_reply,
+        normalize_recall_message_ids, parse_recall_notice, record_committed_bot_message,
+        record_core_reply_linkage, record_recent_bot_message, record_standalone_bot_message,
+        remember_core_turn_sources, remove_bot_messages, source_messages_already_answered,
+        take_core_turn_sources,
     };
     use crate::model::interrupt::{
         ReplyScope, clear_reply_state_locked, interrupt, is_active, scope_mutex,
@@ -757,6 +868,79 @@ mod tests {
         remove_bot_messages(&mut lifecycle, &[10, 999]);
         assert_eq!(lifecycle.recent_bot_messages.len(), 1);
         assert_eq!(lifecycle.recent_bot_messages[0].message_id, 11);
+    }
+
+    /// Core 链路的撤回联动：入站登记源消息 → 投递前判断"是不是被撤回了" →
+    /// 投递成功后登记「源消息 ↔ 她发出的消息」。
+    ///
+    /// 线上缺口（2026-09-14 用户指出）：这套联动原先只有 Host 链路在用，Core
+    /// 接管群聊回复之后，撤回既不会拦住她的回复，也不会连带撤回她已发出的那条。
+    #[test]
+    fn core_turns_join_the_recall_lifecycle() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let scope = ReplyScope::Group(9_000_301);
+                let event_id = yunxi_core::EventId::new();
+
+                // 没有登记时一律放行：宁可发出去，也不要因为读不到登记吞掉回复。
+                assert!(!core_turn_blocked_by_recall(scope).await);
+
+                remember_core_turn_sources(event_id, scope, vec![901]).await;
+                assert!(!core_turn_blocked_by_recall(scope).await);
+
+                // 源消息被撤回（直接写进生命周期，等同于收到 group_recall 通知）。
+                {
+                    let mut lifecycles = REPLY_LIFECYCLES.lock().await;
+                    let lifecycle = lifecycles.entry(scope).or_default();
+                    lifecycle
+                        .recalled_message_ids
+                        .insert(901, std::time::Instant::now());
+                }
+                assert!(
+                    core_turn_blocked_by_recall(scope).await,
+                    "源消息被撤回后，这一轮的投递必须被拦住"
+                );
+
+                // 另一个会话不受影响（按会话隔离）。
+                assert!(!core_turn_blocked_by_recall(ReplyScope::Group(9_000_302)).await);
+
+                // 回合结束取走登记，并且只取一次。
+                let (taken_scope, ids) = take_core_turn_sources(event_id)
+                    .await
+                    .expect("应取到这一轮的源消息");
+                assert_eq!(taken_scope, scope);
+                assert_eq!(ids, vec![901]);
+                assert!(take_core_turn_sources(event_id).await.is_none());
+
+                // 投递成功后的联动登记：`handle_recalled_message` 正是靠
+                // `recent_replies` 找出"她当时回了哪几条"。
+                record_core_reply_linkage(scope, vec![901], vec![77_001, 77_002]).await;
+                let linked = {
+                    let lifecycles = REPLY_LIFECYCLES.lock().await;
+                    lifecycles
+                        .get(&scope)
+                        .map(|lifecycle| lifecycle.recent_replies.clone())
+                        .unwrap_or_default()
+                };
+                assert_eq!(linked.len(), 1);
+                assert_eq!(linked[0].source_message_ids, vec![901]);
+                assert_eq!(linked[0].sent_message_ids, vec![77_001, 77_002]);
+
+                // 空登记不产生联动条目（没发出任何东西时不该留下"撤回对象"）。
+                record_core_reply_linkage(scope, vec![902], Vec::new()).await;
+                record_core_reply_linkage(scope, Vec::new(), vec![77_003]).await;
+                let linked = {
+                    let lifecycles = REPLY_LIFECYCLES.lock().await;
+                    lifecycles
+                        .get(&scope)
+                        .map(|lifecycle| lifecycle.recent_replies.len())
+                        .unwrap_or_default()
+                };
+                assert_eq!(linked, 1);
+
+                REPLY_LIFECYCLES.lock().await.remove(&scope);
+            });
     }
 
     /// 排空群聊 waiting room 时的判据：只有**真的发出过消息**的轮次才算

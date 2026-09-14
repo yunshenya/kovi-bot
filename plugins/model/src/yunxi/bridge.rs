@@ -3379,6 +3379,27 @@ fn autonomous_action_needs_retry(actions: &[ActionResult]) -> bool {
     })
 }
 
+/// 这一轮真正落地到 QQ 的消息号（投递结果里的 `qq-message:<id>`）。
+///
+/// 只认 `Delivered`：撤回联动必须建立在"平台确实收了这条"之上，`Deferred` 与
+/// `DeliveryIndeterminate` 都不能算（后者连发没发出去都不确定）。
+fn delivered_qq_message_ids(actions: &[ActionResult]) -> Vec<i32> {
+    actions
+        .iter()
+        .filter_map(|action| match action {
+            ActionResult::Executed {
+                outcome:
+                    yunxi_core::ActionPortOutcome::Delivered {
+                        external_reference: Some(reference),
+                        ..
+                    },
+                ..
+            } => reference.strip_prefix("qq-message:")?.parse::<i32>().ok(),
+            _ => None,
+        })
+        .collect()
+}
+
 fn autonomous_tick_should_retry(
     actions: &[ActionResult],
     delivered: bool,
@@ -3511,6 +3532,21 @@ async fn run_runtime(
                     // 长期记忆：这一轮真的发出去了，就把「对方说的 + 她回的」写进
                     // Memory v2（适配器会同步回旧表）。主动消息没有入站行，因此这里
                     // 是空操作——那是已知缺口，见 docs/yunxi-memory-v2-writeback.md。
+                    // 撤回联动：这一轮在答哪条、真的发出了哪几条。群友撤回源消息时，
+                    // 她的回复要跟着撤（`handle_recalled_message` 消费这份登记）。
+                    if let Some((link_scope, source_message_ids)) =
+                        crate::model::take_core_turn_sources(observation.event_id).await
+                    {
+                        let sent_message_ids = delivered_qq_message_ids(&actions);
+                        if !sent_message_ids.is_empty() {
+                            crate::model::record_core_reply_linkage(
+                                link_scope,
+                                source_message_ids,
+                                sent_message_ids,
+                            )
+                            .await;
+                        }
+                    }
                     if let Some(writeback) = super::memory_writeback::writeback() {
                         if !delivered_replies.is_empty() {
                             writeback
@@ -4047,6 +4083,16 @@ async fn resolve_and_submit_inner(
     let event_id = event.id();
     let event_scope = event.scope();
     let event_priority = event.priority();
+    // 记下"这一轮在答哪条 QQ 消息"：投递前要用它拦住"源消息已被撤回"的回复，
+    // 投递成功后要用它把她的回复与源消息绑在一起（撤回联动）。Core 的回合由
+    // yunxi-core 驱动，投递端口拿不到事件身份，所以只能在这里按 EventId 登记。
+    if let Some(external_message_id) = message
+        .external_message_id
+        .and_then(|value| i32::try_from(value).ok())
+    {
+        crate::model::remember_core_turn_sources(event_id, reply_scope, vec![external_message_id])
+            .await;
+    }
     let admission = match submit_runtime_with_timeout(runtime, event, CORE_RUNTIME_SUBMIT_TIMEOUT)
         .await
     {
@@ -4510,6 +4556,55 @@ fn ambient_group_payload_can_be_sampled(message: &Message) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::delivered_qq_message_ids;
+
+    /// 撤回联动只认"平台确实收了"的投递结果：`Deferred`（含"源消息已撤回"那条
+    /// 拦截）与 `DeliveryIndeterminate` 都不能算，否则撤回的对象会指错。
+    #[test]
+    fn only_delivered_qq_messages_count_for_recall_linkage() {
+        use yunxi_core::{ActionPortOutcome, ActionReceipt};
+        let receipt = ActionReceipt {
+            action_id: None,
+            idempotency_key: None,
+            admitted_at: chrono::Utc::now(),
+        };
+        let delivered = |reference: &str| ActionResult::Executed {
+            receipt: receipt.clone(),
+            outcome: ActionPortOutcome::Delivered {
+                external_reference: Some(reference.to_string()),
+                message_id: None,
+                conversation_id: None,
+            },
+        };
+        let deferred = ActionResult::Executed {
+            receipt: receipt.clone(),
+            outcome: ActionPortOutcome::Deferred {
+                reason: "input_recalled_before_delivery".to_string(),
+            },
+        };
+        let indeterminate = ActionResult::Executed {
+            receipt: receipt.clone(),
+            outcome: ActionPortOutcome::DeliveryIndeterminate {
+                reason: "unknown".to_string(),
+                conversation_id: None,
+            },
+        };
+
+        assert_eq!(
+            delivered_qq_message_ids(&[
+                delivered("qq-message:123"),
+                deferred,
+                indeterminate,
+                ActionResult::Noop,
+                delivered("qq-message:456"),
+                // 非 QQ 引用（别的适配器）不参与这次联动。
+                delivered("telegram-message:789"),
+            ]),
+            vec![123, 456]
+        );
+        assert!(delivered_qq_message_ids(&[]).is_empty());
+    }
+
     use super::{
         ActionCommandControl, ActionCommandState, ConversationAddress, CoreBridge, EnqueueOutcome,
         GroupCoreHandling, InboundMessage, IncomingAdmissionReleaseFuture,

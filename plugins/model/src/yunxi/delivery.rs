@@ -442,6 +442,21 @@ impl QqActionAdapter {
             idempotency_key,
             outgoing,
         } = context;
+        // 源消息刚被撤回就别发：Host 链路在生成前后各拦一次
+        // （`has_recalled_messages` + `begin_reply` 里的撤回判据），而 Core 这一轮
+        // 由 yunxi-core 驱动，投递端口是唯一能拦住的地方——发出去就收不回来了
+        // （QQ 只允许撤自己 2 分钟内的消息）。这里放在最前面：连语音合成都不必做。
+        //
+        // 判据是入站时登记的"这一轮在答哪几条"（`remember_core_turn_sources`）；
+        // 没有登记（主动消息、刚重启）时一律放行，宁可发出去也不要吞掉正常回复。
+        if crate::model::core_turn_blocked_by_recall(expected_destination.reply_scope()).await {
+            kovi::log::info!(
+                "Yunxi Core input recalled: conversation_id={expected_conversation_id} action=discard"
+            );
+            return Ok(ActionPortOutcome::Deferred {
+                reason: "input_recalled_before_delivery".to_string(),
+            });
+        }
         // Core 标记了语音/唱歌就交给本机合成一条 QQ 语音；配置、合成或落盘任何
         // 一步不成立都退回文字——表达方式不该把这条回复弄丢。
         //
