@@ -538,3 +538,14 @@ fn short_id(id: &str) -> String {
    删 = 兑现"tension 单写者"的文档与注释（同时要改 `planner.rs:1389` 那条反向断言）。
 3. **legacy 画像与 Core 关系二选一**：`relationship_level` 现在只在 Host 群聊路更新，
    私聊与被 @ 的消息都不再学（F10）。是把学习搬进 Core 路，还是明确它只服务 Host 路并写进文档？
+
+## 八、本次评审的覆盖边界
+
+四路并行评审里，**Core runtime** 与 **Admin 后台** 两路跑完并已收录（5.1–5.4）；
+**存储/mind** 一路只来得及交出头条结论（即上面 O1，已由我回源码复核），
+**model 生成层**（`model/{private,group,reply,interrupt,conversation_coordinator,tool_access,
+memory_query,utils}.rs`、`memory/mod.rs`）一路被中途叫停——原因是写本文期间有**另一个会话
+正在同一个工作区**改 `sticker_library.rs` / `yunxi/core_model.rs` / `delivery.rs`
+（在修"QQ 上发不出表情包"），工作区当时编译不过；继续让评审代理跑 `cargo`
+既拿不到可信基线，也会和那边的构建抢 `target/` 锁。这两路都是可续跑的，
+需要时再补。
