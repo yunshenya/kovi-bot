@@ -23,6 +23,14 @@ const MAX_AUTHORIZED_FRIENDS: usize = 256;
 
 static STATE: LazyLock<Mutex<Option<GroupAccessState>>> = LazyLock::new(|| Mutex::new(None));
 
+/// 发布通话授权名单时用它串行化。
+///
+/// 为什么需要：快照原来在 `STATE` 锁里取、锁却在写文件之前就放了，而所有调用方共用
+/// 同一个 `.json.tmp`。两个并发授权命令（`#授权通话 Y` 与 `#取消授权通话 X`）交错的
+/// 结果是"后落盘的那次用的是更旧的快照"，被撤销的 X 又回到名单里——而这份文件是
+/// 接通前唯一的拦截点，桥会继续接他的电话。
+static PUBLISH_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
 struct GroupAccessState {
     plugin_name: String,
     /// Kovi 插件访问控制表里的静态好友名单；每次改动数据库授权后都要并回来，
@@ -168,6 +176,9 @@ pub(crate) async fn publish_caller_allowlist() {
     if path.is_empty() {
         return;
     }
+    // 整段发布串行化：快照也要在锁内取，这样"最后一个落盘的人"读到的就是最新状态，
+    // 不会出现后者用旧快照覆盖前者。
+    let _publish_guard = PUBLISH_LOCK.lock().await;
     let callers = {
         let state = STATE.lock().await;
         let Some(state) = state.as_ref() else {
@@ -193,7 +204,9 @@ pub(crate) async fn publish_caller_allowlist() {
         }
     };
     let target = std::path::PathBuf::from(&path);
-    let temporary = target.with_extension("json.tmp");
+    // 临时文件名带上进程号：同机多进程时共用 `.json.tmp` 会互相踩（进程内已由
+    // PUBLISH_LOCK 串行化）。
+    let temporary = target.with_extension(format!("json.tmp.{}", std::process::id()));
     let result =
         std::fs::write(&temporary, &body).and_then(|()| std::fs::rename(&temporary, &target));
     match result {

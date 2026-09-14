@@ -87,6 +87,17 @@ impl TurnGateHostRuntime {
         }
     }
 
+    /// `install()` 时冻结、本次进程真正在用的参与模式。
+    pub(crate) const fn effective_mode(&self) -> &'static str {
+        if self.mode_active {
+            "active"
+        } else if self.mode_shadow {
+            "shadow"
+        } else {
+            "disabled"
+        }
+    }
+
     pub(crate) fn engine_available(&self) -> bool {
         self.engine
             .lock()
@@ -201,7 +212,12 @@ pub(crate) fn turn_gate_status_report() -> String {
         return "[TURNGATE] 运行时未安装".to_owned();
     };
     let turn_gate_cfg = config::get().model().turn_gate().clone();
-    let (completion, response) = (turn_gate_cfg.mode(), turn_gate_cfg.response_mode());
+    // completion 报**本次进程实际生效**的模式，不是配置里的。`mode_active/mode_shadow`
+    // 是 `install()` 时冻结的，而 `model.turn_gate` 又在 RESTART_SECTIONS 里（改配置
+    // 要重启）——只读配置的话，"存盘 + reload 不重启"之后这里会说 completion=active
+    // 而实际仍走 legacy，等于状态命令在骗人。response_mode 本来就是实时读的。
+    let completion = runtime.effective_mode();
+    let response = turn_gate_cfg.response_mode();
     let engine = runtime
         .engine
         .lock()
@@ -215,6 +231,12 @@ pub(crate) fn turn_gate_status_report() -> String {
             runtime.asset_dir,
         ),
     ];
+    if turn_gate_cfg.mode() != completion {
+        lines.push(format!(
+            "配置里 completion={}，本次进程生效的是 {completion}（model.turn_gate 改动需重启）",
+            turn_gate_cfg.mode()
+        ));
+    }
     if let Some(engine) = engine {
         lines.push(format!(
             "model_version={} feature_version={}",
