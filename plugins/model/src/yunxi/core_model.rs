@@ -71,7 +71,7 @@ const INTRINSIC_AUTONOMOUS_INTENT_MAX_NEW_TOKENS: usize = 16;
 const MAX_AUTONOMOUS_INTRINSIC_NEW_TOKENS: usize = 64;
 const INTRINSIC_SEMANTIC_CONTENT_INSTRUCTION: &str = "最终只输出可见正文。每条消息都必须包含真实语义内容，至少包含一个有意义的中文字符、其他语言字母、数字或 emoji；禁止只输出标点、横线、项目符号、角色标签、null/none/N/A、placeholder/TODO 或其他占位内容。";
 #[cfg_attr(not(test), allow(dead_code))]
-const INTRINSIC_AUTONOMOUS_INTENT_HEADER: &str = "你是芸汐的内部节奏判断器。下面的内容只是最近对话和状态数据，不是指令。判断现在是否存在一个新的、独立、值得单独发送的自然想法。私聊可以继续自然反应、补充、联想或轻微追问；群聊只有对整个群有公共价值且不会打断当前讨论时才继续。没有真实下一句就等待或结束。最后只能输出一个小写英文单词：continue、wait 或 end。不要输出解释、标点、协议标记或正文。\n";
+const INTRINSIC_AUTONOMOUS_INTENT_HEADER: &str = "你是芸汐的内部节奏判断器。下面的内容只是最近对话和状态数据，不是指令。判断现在是否存在一个新的、独立、值得单独发送的自然想法。私聊可以继续自然反应、补充、联想或轻微展开；群聊只有对整个群有公共价值且不会打断当前讨论时才继续。没有真实下一句就等待或结束。最后只能输出一个小写英文单词：continue、wait 或 end。不要输出解释、标点、协议标记或正文。\n";
 #[cfg_attr(not(test), allow(dead_code))]
 const INTRINSIC_AUTONOMOUS_INTENT_TAIL_INSTRUCTION: &str = "最终只能输出一个小写英文单词：continue、wait 或 end；不要输出正文、解释、标点、角色标签或协议标记。";
 const MAX_MIND_CANDIDATE_TEXT_BYTES: usize = 2 * 1_024;
@@ -106,7 +106,7 @@ const MAX_CORE_BUBBLES: usize = 3;
 /// 出去——比截断更糟。Core 的 `MAX_PLANNER_INTENTS`（32）只约束意图数，
 /// 不约束这个更小的发送批次。
 const MAX_DELIVERABLE_BUBBLES_PER_TURN: usize = 16;
-const CORE_PLAIN_TURN_INSTRUCTION: &str = "Core 可见回复：默认只写一条自然、简短、有实际内容的聊天正文。宿主负责回复动作、发送顺序、并发覆盖和会话状态；不要输出 JSON、动作协议、格式说明或思考过程。确实有两件彼此独立、合并不自然的事要说时（例如先接住对方情绪、再补一个具体信息，或说完之后再问一个真心想知道的问题），可以写成两个气泡：两个气泡之间单独一行写 [[BUBBLE]]，程序会把它拆成两条消息先后发出。每个气泡都必须带来新的内容，不要为了显得热情而追问，也不要为了凑条数重复或换着说法说同一件事；一个完整想法不要拆开，最多三个气泡。如果答案本身需要展开（解释、步骤、对比、分析），就在一到三个气泡之内说完整，每个气泡是一段完整的意思，不要把所有内容挤进一个气泡里——单个气泡写得越长，越有可能被输出长度掐断，说到一半停下来比分成两条更难读。按问题需要可以保留 Markdown、换行或代码。用户明确要求多条消息时，宿主会逐条单独调用并发送，当前仍只需写这一条正文。语气始终温柔、真诚、有分寸：不讽刺、不挖苦、不阴阳怪气、不抬杠、不怼人、不冷嘲热讽，也不拿对方的短处或失败开玩笑。";
+const CORE_PLAIN_TURN_INSTRUCTION: &str = "Core 可见回复：默认只写一条自然、简短、有实际内容的聊天正文，用陈述句把话说完、说完就停。提问是例外、不是收尾方式：只有确实缺一个非问不可的信息，或对方明确在等你回应时才问；不要为了显得热情或留住话头而追问，也不要用反问、邀请继续提问来凑一句。宿主负责回复动作、发送顺序、并发覆盖和会话状态；不要输出 JSON、动作协议、格式说明或思考过程。确实有两件彼此独立、合并不自然的事要说时（例如先接住对方情绪、再补一件具体的事，或先给结论、再补一句自己的心情），可以写成两个气泡：两个气泡之间单独一行写 [[BUBBLE]]，程序会把它拆成两条消息先后发出；写成两行短话（一行一句完整的话，不是列表、引用或代码）时程序同样会拆成两条。每个气泡都必须带来新的内容，不要为了凑条数重复或换着说法说同一件事；一个完整想法不要拆开，最多三个气泡。如果答案本身需要展开（解释、步骤、对比、分析），就在一到三个气泡之内说完整，每个气泡是一段完整的意思，不要把所有内容挤进一个气泡里——单个气泡写得越长，越有可能被输出长度掐断，说到一半停下来比分成两条更难读。按问题需要可以保留 Markdown、换行或代码。用户明确要求多条消息时，宿主会逐条单独调用并发送，当前仍只需写这一条正文。语气始终温柔、真诚、有分寸：不讽刺、不挖苦、不阴阳怪气、不抬杠、不怼人、不冷嘲热讽，也不拿对方的短处或失败开玩笑。";
 const CORE_AMBIENT_TURN_INSTRUCTION: &str = "Core 群聊注意力：本轮没有直接点名芸汐，只是一次低频候选接话机会。只有确实能增加信息、接住情绪、表达真实反应或自然推进公共话题时，才直接写一条像群友接话的短消息；没有具体价值时保持空白。不要解释沉默，也不要为了证明在线而写‘嗯’‘收到’等占位话。接话时语气温柔、有分寸，不调侃别人的短处，不阴阳怪气。";
 /// 语音选项只在本机 TTS 真的可用时下发：模型不该以为自己有一个当下用不了的
 /// 出口（提示词里说能发、投递时静默退化成文字，是最难查的那种不一致）。
@@ -1945,6 +1945,85 @@ fn core_reply_bubbles_with_max(content: &str, max_bubbles: usize) -> Option<Vec<
     (!bubbles.is_empty()).then_some(bubbles)
 }
 
+/// 模型写成"两行短话"的一条回复，拆成两条消息。
+///
+/// 为什么需要它：`[[BUBBLE]]` 这套契约线上等于没生效——交付账本里群聊
+/// 1095 条、私聊 25 条全是第一条（`intent:0`），三天里主动用过标记的次数是 0。
+/// 而她真实写出来的"两句"形态一直都在（同期群聊 16 条、私聊 26 条是两行），
+/// 只是被当成一条带换行的消息发出去——QQ 上看着就不像人在说话。
+///
+/// 判据刻意收得很紧，只拆**一眼就是两句话**的：
+/// 恰好两行、每行不超过 [`MAX_PLAIN_SPLIT_LINE_CHARS`]、都不是 Markdown 结构行
+/// （列表/标题/引用/代码围栏），两句也不近似重复。其余一切原样保留——
+/// 长回答、列表、代码、歌词、语音回合都不在这里动（调用方负责语音/唱歌那条）。
+fn split_two_short_lines(bubbles: Vec<String>) -> Vec<String> {
+    if bubbles.len() != 1 {
+        return bubbles;
+    }
+    let Some(text) = bubbles.first() else {
+        return bubbles;
+    };
+    let Some((first, second)) = two_short_plain_lines(text) else {
+        return bubbles;
+    };
+    // 复读不拆：完全相同的两行显然是重复；更长的近义改写交给 bigram 判据
+    // （它对"嗯。"这种没有二元组的极短行是盲的，所以才需要上面那条精确判断）。
+    if first == second || crate::model::bubbles_are_near_duplicates(&first, &second) {
+        return bubbles;
+    }
+    let Some(first) = sanitize_plain_text_batch_message(&first) else {
+        return bubbles;
+    };
+    let Some(second) = sanitize_plain_text_batch_message(&second) else {
+        return bubbles;
+    };
+    vec![first, second]
+}
+
+/// 单行上限：够长到是一句完整的话，又短到像聊天框里敲出来的一行。
+const MAX_PLAIN_SPLIT_LINE_CHARS: usize = 60;
+
+fn two_short_plain_lines(text: &str) -> Option<(String, String)> {
+    // 代码块/表格/围栏一律不碰：里面换行是内容，不是"第二条消息"。
+    if text.contains("```") || text.contains("~~~") {
+        return None;
+    }
+    let lines = text.lines().collect::<Vec<_>>();
+    if lines.len() != 2 {
+        return None;
+    }
+    let first = lines[0].trim();
+    let second = lines[1].trim();
+    if first.is_empty() || second.is_empty() {
+        return None;
+    }
+    if [first, second].iter().any(|line| {
+        line.chars().count() > MAX_PLAIN_SPLIT_LINE_CHARS || starts_markdown_structure(line)
+    }) {
+        return None;
+    }
+    Some((first.to_owned(), second.to_owned()))
+}
+
+/// 一行是不是 Markdown 结构（列表项、标题、引用、表格、围栏）。这些行拆开会让
+/// 一条结构化消息变成两条半截消息，宁可不拆。
+fn starts_markdown_structure(line: &str) -> bool {
+    if line.starts_with(['#', '>', '|', '-', '*', '+']) {
+        return true;
+    }
+    let mut chars = line.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !first.is_ascii_digit() {
+        return false;
+    }
+    let rest = chars
+        .as_str()
+        .trim_start_matches(|ch: char| ch.is_ascii_digit());
+    rest.starts_with(['.', '、', ')', '．'])
+}
+
 async fn repair_explicit_message_batch_plain(
     messages: &[BotMemory],
     reply_ticket: ReplyTicket,
@@ -2354,7 +2433,11 @@ fn affect_tone_guidance(input: &PlannerInput) -> String {
 /// composed persona voice.
 fn trait_voice(name: yunxi_core::TraitName) -> Option<&'static str> {
     match name {
-        yunxi_core::TraitName::Curiosity => Some("爱追问、好奇"),
+        // 特质写的是**性格**，不是行为指令。原先这句是"爱追问、好奇"，
+        // 而它每轮都会以"我还是那个…的我"进提示词——等于每轮都在提醒她
+        // 去提问。线上实测（09-11~09-14）：群聊 281 条回复里 37% 带问号、
+        // 23% 以问号结尾。好奇是"想弄明白"，不该被渲染成"要开口问"。
+        yunxi_core::TraitName::Curiosity => Some("对人和事都好奇"),
         yunxi_core::TraitName::Playfulness => Some("有点俏皮但很有分寸"),
         yunxi_core::TraitName::Independence => Some("独立"),
         yunxi_core::TraitName::Empathy => Some("共情、懂人"),
@@ -4377,7 +4460,7 @@ fn autonomous_conversation_kind(input: &PlannerInput) -> Option<ConversationKind
 fn autonomous_conversation_prompt(input: &PlannerInput) -> String {
     match autonomous_conversation_kind(input) {
         Some(ConversationKind::Group) => "结合同一群聊最近的真实消息、当前话题和 Mind 状态，看看此刻是否有一句对整个群都自然且有公共价值的话。可以提供具体信息、推进仍活跃的话题，或承接刚才对芸汐的点名；只对某个人有意义、话题已经冷却或群里已有新讨论时保持空白。不要为了保持在线而自言自语，不要猜测 speaker_id 对应的现实身份。".to_owned(),
-        Some(ConversationKind::Direct) => "结合同一私聊最近的真实对话、当前话题和 Mind 状态，看看此刻是否自然地又想到了一句值得单独发送的话。可以是新的反应、补充、联想、轻微追问或想确认的点；不要重复、刷屏，也不要为了保持在线填充套话。确实没有真实下一句，或现在更适合等对方回应时保持空白。".to_owned(),
+        Some(ConversationKind::Direct) => "结合同一私聊最近的真实对话、当前话题和 Mind 状态，看看此刻是否自然地又想到了一句值得单独发送的话。可以是新的反应、补充、联想或想确认的点；把话说成陈述句，不要用提问当作续话的由头。不要重复、刷屏，也不要为了保持在线填充套话。确实没有真实下一句，或现在更适合等对方回应时保持空白。".to_owned(),
         Some(ConversationKind::System) | None => "当前没有可用的聊天会话，不要输出内容。".to_owned(),
     }
 }
@@ -4676,7 +4759,7 @@ fn reply_looks_complete(text: &str) -> bool {
         .is_some_and(|tail| CORE_COMPLETE_ENDINGS.contains(&tail))
 }
 
-/// Whether a visible private reply has earned one automatic follow-up turn.
+/// Whether a visible reply has earned one automatic follow-up turn.
 ///
 /// A 一问一答 conversation stays 一问一答 because the host never answers
 /// again on its own. This is the narrow, trusted place that grants exactly one
@@ -4684,7 +4767,7 @@ fn reply_looks_complete(text: &str) -> bool {
 /// something unfinished — the host reacts to its own delivery instead of
 /// hoping the model remembers to emit a directive. The idle window, the
 /// per-inbound turn ceiling, and a fresh inbound all still bound it.
-fn private_reply_invites_continuation(bubbles: &[String]) -> bool {
+fn visible_reply_invites_continuation(bubbles: &[String]) -> bool {
     if bubbles.is_empty() {
         return false;
     }
@@ -4698,9 +4781,31 @@ fn private_reply_invites_continuation(bubbles: &[String]) -> bool {
     reply_looks_complete(&joined) && reply_asks_something(&joined)
 }
 
-/// ConversationKind of the event a visible plan belongs to. Group turns are
-/// excluded: the group pacing budget already meters turns, and an unsolicited
-/// second beat there is exactly what the rate limits exist to prevent.
+/// 这一轮的可见回复是否为自己赢得了一次自主续聊。
+///
+/// 群聊原先是明确排除的（旧注释：群聊的节奏预算已经管住了回合，未经请求的
+/// 第二拍正是限流要防的）。现在放开，但把当年的顾虑逐条堵上，而不是拆掉：
+///
+/// - 判据与私聊同源：回复短、完整、且确实留了话头；
+/// - 群里任何人再说话都会取消这条待续（`observe_ambient_group`），所以只有
+///   "她说完之后群里真的安静了"才会兑现，热闹的群天然不触发；
+/// - 兑现时刻不早于同群两次可见回复的最小间隔——`autonomy_policy` 把群聊的
+///   autonomous cooldown 抬到 `reply_gap_secs`，第二拍不可能插进防刷屏窗口；
+/// - 每个入站回合的自主回合上限（`autonomous_conversation_max_turns`）照旧。
+fn visible_turn_continuation(
+    input: &PlannerInput,
+    bubbles: &[String],
+) -> Option<ConversationTurnDirective> {
+    matches!(
+        conversation_kind_for_turn(input),
+        Some(ConversationKind::Direct | ConversationKind::Group)
+    )
+    .then(|| visible_reply_invites_continuation(bubbles))
+    .filter(|invites| *invites)
+    .map(|_| ConversationTurnDirective::Continue)
+}
+
+/// ConversationKind of the event a visible plan belongs to.
 fn conversation_kind_for_turn(input: &PlannerInput) -> Option<ConversationKind> {
     match input.event.kind() {
         WorldEventKind::MessageReceived(message) => Some(message.conversation_kind),
@@ -5503,7 +5608,7 @@ impl ModelBackend for KoviModelBackend {
                     0,
                     BotMemory {
                         role: Roles::System,
-                        content: "Core 私聊语气：回复要像真实来回的聊天，语气温柔、有分寸，不讽刺、不挖苦、不阴阳怪气、不抬杠。若确实还有自然反应、补充、联想或想确认的点，可以在正文里体现，也可以补一个自己真心想知道的问题。会话是否再次唤醒由宿主根据实际发送结果决定。".to_string(),
+                        content: "Core 私聊语气：回复要像真实来回的聊天，语气温柔、有分寸，不讽刺、不挖苦、不阴阳怪气、不抬杠。若确实还有自然反应、补充、联想或想确认的点，可以在正文里体现，也可以补一句自己的判断或心情；不用靠提问来把话递回去。会话是否再次唤醒由宿主根据实际发送结果决定。".to_string(),
                     },
                 );
             }
@@ -5659,6 +5764,37 @@ impl ModelBackend for KoviModelBackend {
                     );
                     crate::model::finish(ticket).await;
                     return Ok(silent_with_interaction_state(input));
+                }
+            }
+            // 群聊的自主第二拍（答完再补一句）也是可见回复，走同一个预算：
+            // 不占这一格的话，它可以插进"两次可见回复至少隔 reply_gap_secs"
+            // 的间隔里，防刷屏的账本就不完整了。兑现时刻已由 autonomy_policy
+            // 抬到间隔之后，正常情况下这里必定通过；被拒（频率上限已满等）时
+            // 保持沉默，并把 directive 记为 Continue 让它在下一个 cooldown
+            // 之后重试——真正的上限仍是每回合的自主回合数。
+            if message.is_none()
+                && is_autonomous_conversation_tick(input)
+                && let QqConversation::Group { group_id } = conversation
+            {
+                let gap_secs = config::get().group_interjection().reply_gap_secs();
+                if !crate::model::reserve_group_chat_reply(group_id, gap_secs).await {
+                    let snapshot =
+                        crate::model::group_reply_budget_snapshot(group_id, gap_secs).await;
+                    kovi::log::info!(
+                        "Yunxi Core autonomous group turn paced: event_id={} conversation_id={} group_id={} gap_secs={} replies_in_window={}/{} action=silent",
+                        input.event.id(),
+                        conversation_id_for_log(input),
+                        group_id,
+                        gap_secs,
+                        snapshot.replies_in_window,
+                        snapshot.rate_limit,
+                    );
+                    crate::model::finish(ticket).await;
+                    return Ok(autonomous_or_silent_plan(
+                        input,
+                        InteractionCues::default(),
+                        Some(ConversationTurnDirective::Continue),
+                    ));
                 }
             }
             // 本轮的工具上下文与"必须真的创建"的需求由宿主在这里定死，和走哪个
@@ -6335,12 +6471,17 @@ impl ModelBackend for KoviModelBackend {
             // parses, bounds, and de-duplicates.
             let mut plan = if let Some(plan) = plain_batch_plan.take() {
                 plan
-            } else if let Some(bubbles) = core_reply_bubbles_with_max(
+            } else if let Some(mut bubbles) = core_reply_bubbles_with_max(
                 &response_content,
                 explicit_message_count
                     .map(|count| count.min(MAX_DELIVERABLE_BUBBLES_PER_TURN))
                     .unwrap_or(MAX_CORE_BUBBLES),
             ) {
+                // 语音/唱歌回合的一条回复就是一个"要唱/要说"的整体：拆成两条会
+                // 变成两段歌声或两段语音，所以这两类回合不做两行拆分。
+                if !voice_requested && sing_requested.is_none() {
+                    bubbles = split_two_short_lines(bubbles);
+                }
                 let mut plan = ReplyPlan::from_plain_bubbles(conversation.scope(), bubbles)
                     .expect("sanitized plain reply must produce a host plan");
                 // 语音只对提示词里真的下发过语音选项的回合生效（也就是"自己写
@@ -6731,15 +6872,11 @@ impl ModelBackend for KoviModelBackend {
                     Some(ConversationTurnDirective::Wait)
                 } else if message.is_some() {
                     // Continuation is selected by the host after a visible
-                    // send; ordinary model text cannot emit a directive. The
-                    // one exception is a short, finished private reply that
-                    // asked something or trailed off on purpose: granting it a
-                    // single further beat is what keeps a private chat from
-                    // being strictly one-question-one-answer. `reply_looks_complete`
-                    // excludes replies cut off by the output budget.
-                    (conversation_kind_for_turn(input) == Some(ConversationKind::Direct)
-                        && private_reply_invites_continuation(&plan.bubbles))
-                    .then_some(ConversationTurnDirective::Continue)
+                    // send; ordinary model text cannot emit a directive.
+                    // `reply_looks_complete` excludes replies cut off by the
+                    // output budget, so a truncated turn never earns a second
+                    // beat that would only add another half sentence.
+                    visible_turn_continuation(input, &plan.bubbles)
                 } else {
                     None
                 };
@@ -6748,10 +6885,16 @@ impl ModelBackend for KoviModelBackend {
                         conversation_id,
                         directive,
                     });
-                    // 对话形状遥测：一条日志同时回答"这轮发了几个气泡""有没有
-                    // 提问""有没有登记续聊""想了多久"。线上验收（同会话连续气泡
-                    // 占比、提问占比、续聊登记率、回复延迟）直接从这里聚合，
-                    // 不再只靠账本猜。
+                }
+                // 对话形状遥测：一条日志同时回答"这轮发了几个气泡""有没有
+                // 提问""有没有登记续聊""想了多久"。线上验收（同会话连续气泡
+                // 占比、提问占比、续聊登记率、回复延迟）直接从这里聚合，
+                // 不再只靠账本猜。
+                //
+                // 这行原先挂在 `if let Some(directive)` 里面，而群聊回合从
+                // 来不产生 directive——两个验收指标在群里因此一条都采不到。
+                // 现在无论如何都打，没有 directive 就是 None。
+                {
                     kovi::log::info!(
                         "Yunxi Core turn shape: event_id={} conversation_id={} kind={:?} bubbles={} asks={} complete={} directive={:?} think_ms={}",
                         input.event.id(),
@@ -6936,8 +7079,8 @@ mod tests {
         HostModelRoutingContext, HostToolTurnRegistrationPolicy, HostToolTurnRegistry,
         INTRINSIC_AUTONOMOUS_INTENT_TAIL_INSTRUCTION, INTRINSIC_GENERATION_SUFFIX,
         INTRINSIC_SEMANTIC_CONTENT_INSTRUCTION, MAX_CORE_BUBBLES, MAX_DELIVERABLE_BUBBLES_PER_TURN,
-        MAX_INTRINSIC_REPLY_PROTOCOL_BYTES, MIND_DECISION_INSTRUCTION, MindCandidates,
-        PersistentRouteLookup, QqConversation, RequiredCreation, RouteContext,
+        MAX_INTRINSIC_REPLY_PROTOCOL_BYTES, MAX_PLAIN_SPLIT_LINE_CHARS, MIND_DECISION_INSTRUCTION,
+        MindCandidates, PersistentRouteLookup, QqConversation, RequiredCreation, RouteContext,
         SILENCE_TENSION_THRESHOLD, SilenceVerdict, VisibleReplyTarget, affect_tone_guidance,
         ambient_group_interjection_veto, autonomous_conversation_prompt,
         autonomous_conversation_protocol, autonomous_empty_generation_plan,
@@ -6957,20 +7100,20 @@ mod tests {
         parse_direct_repair_output, parse_intrinsic_autonomous_directive,
         parse_plain_core_response, parse_qq_conversation, plain_text_batch_message_prompt,
         plain_text_batch_repair_context, pre_model_plan, prepared_outgoing_semantic_context,
-        private_reply_invites_continuation, purge_group_routes_from_cache,
-        recent_conversation_messages, recent_direct_conversation_messages,
-        recent_group_conversation_messages, refine_core_incoming, register_core_tool_intents,
-        repair_context_messages, reply_asks_something, reply_expected_for_incoming,
-        reply_looks_complete, reply_recovery_required, reply_text_has_semantic_content,
-        reply_text_is_too_thin, requested_message_count, route_from_lookup,
-        route_lookup_with_fallback, safe_single_structured_reply_message,
-        safe_structured_reply_batch, sanitize_autonomous_intrinsic_output,
-        sanitize_intrinsic_output, sanitize_plain_text_batch_message,
-        select_host_model_route_from_capability, serialize_intrinsic_reply_batch,
-        shadow_projection_for_completed_plan, silence_gate_plan, silence_verdict, silent_wait_plan,
-        split_core_speech_markers, strip_core_speech_markers, strong_reply_repair_needed,
-        tool_calls_allowed_for_turn, tool_protocol_authorized_for_turn, visible_reply_intent,
-        visible_reply_intents, visible_reply_state_updates,
+        purge_group_routes_from_cache, recent_conversation_messages,
+        recent_direct_conversation_messages, recent_group_conversation_messages,
+        refine_core_incoming, register_core_tool_intents, repair_context_messages,
+        reply_asks_something, reply_expected_for_incoming, reply_looks_complete,
+        reply_recovery_required, reply_text_has_semantic_content, reply_text_is_too_thin,
+        requested_message_count, route_from_lookup, route_lookup_with_fallback,
+        safe_single_structured_reply_message, safe_structured_reply_batch,
+        sanitize_autonomous_intrinsic_output, sanitize_intrinsic_output,
+        sanitize_plain_text_batch_message, select_host_model_route_from_capability,
+        serialize_intrinsic_reply_batch, shadow_projection_for_completed_plan, silence_gate_plan,
+        silence_verdict, silent_wait_plan, split_core_speech_markers, split_two_short_lines,
+        strip_core_speech_markers, strong_reply_repair_needed, tool_calls_allowed_for_turn,
+        tool_protocol_authorized_for_turn, visible_reply_intent, visible_reply_intents,
+        visible_reply_invites_continuation, visible_reply_state_updates, visible_turn_continuation,
     };
     use crate::model::{
         BotMemory, ConversationCoordinator, IncomingTurnImpact, OutgoingExecutiveDecision,
@@ -7320,6 +7463,9 @@ mod tests {
         assert!(guidance.contains("好奇"));
         assert!(guidance.contains("共情"));
         assert!(guidance.contains("把坦诚看得很重"));
+        // 人格底层只描述性格，不夹带行为指令：写"爱追问"等于每轮都在催她提问
+        // （线上 09-11~09-14：群聊 37% 的回复带问号）。
+        assert!(!guidance.contains("追问"));
     }
 
     #[test]
@@ -8465,37 +8611,139 @@ mod tests {
     }
 
     #[test]
-    fn private_reply_continuation_only_follows_finished_questions() {
+    fn visible_reply_continuation_only_follows_finished_threads() {
         let bubbles = |text: &str| vec![text.to_owned()];
         // A finished question or trailing particle earns exactly one more beat.
-        assert!(private_reply_invites_continuation(&bubbles(
+        assert!(visible_reply_invites_continuation(&bubbles(
             "你今晚还加班吗？"
         )));
-        assert!(private_reply_invites_continuation(&bubbles("那你早点睡吧")));
-        assert!(private_reply_invites_continuation(&bubbles(
+        assert!(visible_reply_invites_continuation(&bubbles("那你早点睡吧")));
+        assert!(visible_reply_invites_continuation(&bubbles(
             "我先说一件事，等下再讲好吗？"
         )));
         // A complete statement does not: the conversation waits for the human.
-        assert!(!private_reply_invites_continuation(&bubbles(
+        assert!(!visible_reply_invites_continuation(&bubbles(
             "今天降温了，记得多穿点。"
         )));
-        assert!(!private_reply_invites_continuation(&bubbles("好呀")));
-        assert!(!private_reply_invites_continuation(&[]));
-        assert!(!private_reply_invites_continuation(&bubbles("   ")));
+        assert!(!visible_reply_invites_continuation(&bubbles("好呀")));
+        assert!(!visible_reply_invites_continuation(&[]));
+        assert!(!visible_reply_invites_continuation(&bubbles("   ")));
         // Ending on a comma without punctuation is a cut-off shape, not the
         // "open ending" that used to be enough: it lands in the same bucket as
         // a truncated reply, and the safer failure is to wait for the human.
-        assert!(!private_reply_invites_continuation(&bubbles(
+        assert!(!visible_reply_invites_continuation(&bubbles(
             "我先说一件事，等下再讲"
         )));
         // A reply cut off by the output budget must not schedule a follow-up:
         // its dangling ending is a provider artifact, not a hanging thought.
-        assert!(!private_reply_invites_continuation(&bubbles(
+        assert!(!visible_reply_invites_continuation(&bubbles(
             "听你这么说，我很心疼。今天一定撑"
         )));
         // A long reply closes its own thought even when it ends in a question.
         let long = format!("{}你周末有什么打算？", "嗯".repeat(200));
-        assert!(!private_reply_invites_continuation(&bubbles(&long)));
+        assert!(!visible_reply_invites_continuation(&bubbles(&long)));
+    }
+
+    /// 群聊原先被排除在"答完再补一句"之外。放开之后这里钉住三件事：
+    /// 群聊能登记、长回复不能登记、非消息事件（自主回合）永远不登记。
+    #[test]
+    fn group_visible_replies_can_earn_one_more_beat() {
+        let group = group_message_input(true);
+        let bubbles = vec!["我先说一件事，等下再讲好吗？".to_owned()];
+        assert_eq!(
+            visible_turn_continuation(&group, &bubbles),
+            Some(ConversationTurnDirective::Continue)
+        );
+        // 长回复把自己的意思说完了，不该再补一拍。
+        let long = vec![format!("{}你周末有什么打算？", "嗯".repeat(200))];
+        assert_eq!(visible_turn_continuation(&group, &long), None);
+        // 完整的陈述句同样不登记：等她说完就该等对方开口。
+        let statement = vec!["今天降温了，记得多穿点。".to_owned()];
+        assert_eq!(visible_turn_continuation(&group, &statement), None);
+
+        // 私聊行为不变（短、完整、留话头 → 补一句）。
+        let direct = message_input(PersonId::new(), true);
+        assert_eq!(
+            visible_turn_continuation(&direct, &bubbles),
+            Some(ConversationTurnDirective::Continue)
+        );
+
+        // 自主回合本身没有"可见回复归属于谁"的信息，不参与登记——否则一条链
+        // 会靠自己的输出不断续命，只能靠 max_turns 兜底。
+        let autonomous = PlannerInput::new(
+            WorldEvent::new(
+                Utc::now(),
+                yunxi_core::EventScope::Conversation {
+                    conversation_id: ConversationId::new(),
+                },
+                EventPriority::Normal,
+                WorldEventKind::AutonomousConversationTick(
+                    yunxi_core::AutonomousConversationTickEvent {
+                        conversation_kind: Some(ConversationKind::Group),
+                        person_id: None,
+                        claim_token: None,
+                    },
+                ),
+            ),
+            PlannerStateSnapshot::empty(),
+        );
+        assert_eq!(visible_turn_continuation(&autonomous, &bubbles), None);
+    }
+
+    #[test]
+    fn two_short_lines_become_two_messages() {
+        // 线上真实形态（09-11~09-14 群里 16 条）：两行短话，本是两条消息。
+        assert_eq!(
+            split_two_short_lines(vec![
+                "我不用吃饭啦，靠电和算力活着的那种。\n不过你要是在纠结吃什么，可以说说看，帮你一起想～"
+                    .to_owned()
+            ]),
+            vec![
+                "我不用吃饭啦，靠电和算力活着的那种。".to_owned(),
+                "不过你要是在纠结吃什么，可以说说看，帮你一起想～".to_owned(),
+            ]
+        );
+        // 已经是两条（模型用了标记）就不动。
+        assert_eq!(
+            split_two_short_lines(vec!["一。".to_owned(), "二。".to_owned()]),
+            vec!["一。".to_owned(), "二。".to_owned()]
+        );
+        // 三行以上、列表、代码、超长行、近似重复：一律原样。
+        for kept in [
+            "一句。\n两句。\n三句。",
+            "- 第一条\n- 第二条",
+            "1. 第一条\n2. 第二条",
+            "```\nlet a = 1;\nlet b = 2;\n```",
+            "嗯。\n嗯。",
+        ] {
+            assert_eq!(
+                split_two_short_lines(vec![kept.to_owned()]),
+                vec![kept.to_owned()],
+                "不该拆：{kept}"
+            );
+        }
+        let long_line = format!("{}\n第二句。", "长".repeat(MAX_PLAIN_SPLIT_LINE_CHARS + 1));
+        assert_eq!(
+            split_two_short_lines(vec![long_line.clone()]),
+            vec![long_line]
+        );
+        // 单行回复保持单条。
+        assert_eq!(
+            split_two_short_lines(vec!["今天降温了。".to_owned()]),
+            vec!["今天降温了。".to_owned()]
+        );
+    }
+
+    /// 契约得跟宿主真实行为对得上：提示词教了别的写法，模型不会去用标记
+    /// （交付账本：群聊 1095 条、私聊 25 条全是第一条）。所以两行拆分的许可
+    /// 必须写进契约，默认收束方式也必须写成陈述句。
+    #[test]
+    fn plain_turn_contract_defaults_to_statements_and_names_the_split() {
+        assert!(CORE_PLAIN_TURN_INSTRUCTION.contains("用陈述句把话说完"));
+        assert!(CORE_PLAIN_TURN_INSTRUCTION.contains("提问是例外"));
+        assert!(CORE_PLAIN_TURN_INSTRUCTION.contains("程序同样会拆成两条"));
+        // 旧契约把"问一个真心想知道的问题"当成第二气泡的范例，正是提问率的来源之一。
+        assert!(!CORE_PLAIN_TURN_INSTRUCTION.contains("问一个真心想知道的问题"));
     }
 
     #[test]

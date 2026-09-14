@@ -479,6 +479,14 @@ pub(crate) fn finish_claim_token(
 }
 
 fn autonomy_policy(config: &ProactiveConfig) -> AutonomyPolicy {
+    // 群聊的第二拍（答完再补一句）是可见回复，必须受同群"两次可见回复至少隔
+    // reply_gap_secs"这条防刷屏规则约束。把兑现时刻直接抬到那个间隔之后，
+    // 规则就由构造保证成立：不需要在自主回合里再抢一次节奏配额，也就不会出现
+    // "抢不到配额 → 白烧一次模型调用 → 续聊链被吃掉"的失败路径。
+    let group_gap = crate::config::get()
+        .group_interjection()
+        .reply_gap_secs()
+        .max(1);
     AutonomyPolicy {
         direct_idle: chrono::Duration::seconds(
             config.autonomous_conversation_idle_secs().max(1) as i64
@@ -490,7 +498,9 @@ fn autonomy_policy(config: &ProactiveConfig) -> AutonomyPolicy {
             config.autonomous_conversation_cooldown_secs().max(1) as i64,
         ),
         group_cooldown: chrono::Duration::seconds(
-            config.autonomous_conversation_group_cooldown_secs().max(1) as i64,
+            config
+                .autonomous_conversation_group_cooldown_secs()
+                .max(group_gap) as i64,
         ),
         max_autonomous_turns: config.autonomous_conversation_max_turns().max(1),
     }
@@ -534,8 +544,8 @@ fn touch(order: &mut VecDeque<ConversationId>, conversation_id: ConversationId) 
 mod tests {
     use super::{
         MAX_TRANSIENT_FAILURE_RETRIES, REGISTRY, autonomous_in_flight_timeout,
-        autonomous_in_flight_timeout_for, autonomous_model_phase_budget, claim_due,
-        claim_due_with_context, claim_is_current, finish_claim, finish_claim_token,
+        autonomous_in_flight_timeout_for, autonomous_model_phase_budget, autonomy_policy,
+        claim_due, claim_due_with_context, claim_is_current, finish_claim, finish_claim_token,
         model_retry_backoff, observe_group_activity, observe_inbound, observe_inbound_from_person,
         record_outbound_with_directive, release_claim, release_claim_token, retry_claim,
         retry_claim_token,
@@ -564,6 +574,24 @@ mod tests {
         assert_eq!(model_retry_backoff(1), StdDuration::from_millis(350));
         assert_eq!(model_retry_backoff(2), StdDuration::from_millis(1_050));
         assert_eq!(model_retry_backoff(5), StdDuration::from_millis(10_850));
+    }
+
+    /// 群聊的第二拍是可见回复，兑现时刻必须落在同群"两次可见回复至少隔
+    /// reply_gap_secs"之后——否则它就绕过了防刷屏的那道闸（旧设计正是因此
+    /// 把群聊整条排除掉）。配置把二者解耦时这条断言会变红。
+    #[test]
+    fn group_continuation_waits_out_the_group_reply_gap() {
+        let config = ProactiveConfig::default();
+        let policy = autonomy_policy(&config);
+        let gap = crate::config::get()
+            .group_interjection()
+            .reply_gap_secs()
+            .max(1);
+        let group_cooldown = policy.group_cooldown.num_seconds();
+        assert!(
+            group_cooldown >= gap as i64,
+            "group cooldown {group_cooldown}s 必须 ≥ reply_gap {gap}s"
+        );
     }
 
     fn clear() {
