@@ -372,10 +372,23 @@
     box.select();
   });
 
+  /** 顶栏状态胶囊和概览页要的是同一份 /api/status：短时间内的第二次直接复用，
+   *  否则点一下"刷新"会对着同一个接口打两遍。传 0 可以强制拿新的。 */
+  let statusCache = { at: 0, value: null };
+
+  async function fetchStatus(maxAgeMs = 1500) {
+    const now = Date.now();
+    if (statusCache.value && now - statusCache.at < maxAgeMs) return statusCache.value;
+    const value = await api('/api/status');
+    statusCache = { at: Date.now(), value };
+    return value;
+  }
+
   async function refreshHealth() {
     const pill = $('#health-pill');
     try {
-      const status = await api('/api/status');
+      // 顶栏永远拿新的，顺便把缓存刷新掉，紧接着的概览页就能直接复用。
+      const status = await fetchStatus(0);
       const database = status.database || {};
       const redis = status.redis || {};
       const ok = database.ok && redis.ok;
@@ -393,6 +406,14 @@
   }
 
   // ───────────────────────────── 概览 ─────────────────────────────
+  //
+  // 三块，回答三个问题：她还在正常跑吗（运行状态）→ 她记得多少东西（记忆规模）
+  // → 她现在能用哪几种方式说话（模型与能力）。
+  //
+  // 排版上有一条硬规矩：**能一眼比较的数才配当大数字卡**。状态（"正常"）、路径
+  // （配置文件在哪）、来源说明这些当大数字只会占地方还读不出来，一律走行式排版；
+  // 记忆那几张卡的角标也换成一句人话（"共 4196 条：记忆 639 · 旧版 2901…"），
+  // 塞在卡片小字里折成三行没人看。
 
   let overviewCache = null;
 
@@ -422,13 +443,69 @@
     return node;
   }
 
+  /** `/api/status` 的 process 是一句给人看的话（"芸汐进程内存: 728 MB"）：剥掉标签。 */
+  function processMemoryText(text) {
+    const raw = String(text || '').trim();
+    if (!raw) return '—';
+    return raw.replace(/^芸汐进程内存[:：]\s*/, '') || '—';
+  }
+
+  /** 服务那一行：状态点 + 结论 + 细节。比一张写着"正常"的大数字卡好读。
+   *
+   *  `tone` 只在出错时有意义，而且必须由调用方指定：PostgreSQL 挂了是"坏了"
+   *  （记忆读写全废，红），Redis 挂了只是"退化了"（回退进程内状态，琥珀）——
+   *  两个都用红会让人以为整机出事。 */
+  function serviceLine(ok, statusText, detail, tone = 'danger') {
+    const level = ok ? 'ok' : tone;
+    return h('span', { class: 'service-line' },
+      h('span', { class: `dot ${level === 'ok' ? 'ok' : (level === 'warn' ? 'warn' : 'off')}` }),
+      h('strong', { class: `${level}-text`, text: statusText }),
+      detail ? h('span', { class: 'muted', text: detail }) : null);
+  }
+
+  /** 一个能力开关。开着是绿的、关掉的压暗，一眼扫出她现在能用哪几种方式说话。 */
+  function capChip(label, on, detail) {
+    return h('span', { class: `cap-chip ${on ? 'on' : 'off'}`, title: detail ? `${label}：${detail}` : label },
+      h('span', { class: 'cap-dot' }),
+      h('span', { class: 'cap-label', text: label }),
+      detail ? h('span', { class: 'cap-detail', text: detail }) : null);
+  }
+
+  function capabilityChips(scheduler) {
+    const vision = String(scheduler.vision_provider || '');
+    const stickerCount = Number(scheduler.sticker_files) || 0;
+    const stickerOn = Boolean(scheduler.sticker_enabled);
+    // 表情包是唯一一个"开关开着但还缺素材"的能力：库里是空的时候给个直接的入口。
+    const sticker = [capChip('表情包', stickerOn, stickerOn ? (stickerCount ? `${stickerCount} 张` : '素材库为空') : '')];
+    if (stickerOn && !stickerCount) {
+      sticker.push(h('button', {
+        class: 'link-toggle', type: 'button', text: '去上传', onclick: () => goto('stickers'),
+      }));
+    }
+    return [
+      capChip('主动消息', Boolean(scheduler.proactive_enabled)),
+      capChip('群聊接话', Boolean(scheduler.group_interjection_enabled)),
+      capChip('工具', Boolean(scheduler.tools_enabled)),
+      capChip('实时通话', Boolean(scheduler.qq_call_enabled)),
+      capChip('语音消息', Boolean(scheduler.voice_enabled)),
+      capChip('唱歌', Boolean(scheduler.sing_enabled)),
+      capChip('图片理解', Boolean(vision) && vision !== 'disabled', vision === 'disabled' ? '' : vision),
+      ...sticker,
+    ];
+  }
+
   async function renderOverview() {
     const page = $('#page-overview');
     clear(page);
     page.append(h('div', { class: 'loading', text: '读取状态…' }));
+
+    // 记忆条目与状态并行取：这两件事互不依赖，串起来只是让首屏白等第二次往返。
+    // 失败不抛给外层——下面显示一行"暂时读不到"就够了，不该把整页带走。
+    const recentPromise = api('/api/memory/records?limit=10').catch(() => ({ items: [] }));
+
     let status;
     try {
-      status = await api('/api/status');
+      status = await fetchStatus();
       overviewCache = status;
     } catch (problem) {
       clear(page);
@@ -437,72 +514,14 @@
     }
     clear(page);
 
-    // 老版本接口可能没有其中某一段：缺了就写"—"，绝不整页炸掉
-    // （渲染抛错会被 boot 的 catch 接住，人就突然看到登录页了）。
-    const counts = status.counts || {};
-    const database = status.database || {};
-    const redis = status.redis || {};
-    const model = status.model || {};
-    const scheduler = status.scheduler || {};
-    const admin = status.admin || {};
-    const configInfo = status.config || {};
+    // 要人动手的事排在最前面：库连不上、模型没密钥、有改动等重启——这些都不该
+    // 埋在卡片里让人自己找。
+    for (const note of overviewNotices(status)) page.append(note);
 
-    page.append(h('div', { class: 'section-title' }, h('span', { text: '运行状态' })));
-    page.append(h('div', { class: 'stat-grid' },
-      // 进程时长与主机开机时长必须分开写：线上这台机器已经开了 6 天，而芸汐可能
-      // 5 分钟前刚发完版。混在一起显示会让人以为新版本没生效。
-      stat('芸汐进程', status.process_uptime || '—',
-        `pid ${status.pid ?? '—'} · ${(status.process || '').replace('芸汐进程内存: ', '') || '内存未知'}`),
-      stat('主机', status.host_uptime || status.uptime || '—', '开机时长'),
-      statLink('PostgreSQL', database.ok ? '正常' : '异常',
-        database.ok ? fmtBytes(database.size_bytes) : (database.detail || '—'), 'memory'),
-      statLink('Redis', redis.ok ? '正常' : '异常', redis.detail || '—', 'memory'),
-      statLink('长期记忆', String(counts.memories ?? '—'), memoryBreakdown(counts), 'memory'),
-      statLink('情节', String(counts.episodes ?? '—'), 'Mind Episode', 'memory'),
-      statLink('人物', String(counts.people ?? '—'), 'canonical Person', 'memory'),
-      statLink('目标 / 线索', `${counts.goals ?? '—'} / ${counts.open_loops ?? '—'}`,
-        'Mind Agenda / OpenLoop', 'memory'),
-    ));
+    page.append(runtimeCard(status));
+    page.append(memoryCard(status.counts || {}));
 
-    const pendingRestart = admin.pending_restart || [];
-    if (pendingRestart.length) {
-      page.append(h('div', { class: 'restart-note' },
-        `有 ${pendingRestart.length} 个分区的改动已保存，但要重启进程才生效：`,
-        h('strong', { text: pendingRestart.join('、') }),
-        '（按你的部署方式重启服务，例如 systemctl restart kovi-bot）。'));
-    }
-
-    const modelCard = h('div', { class: 'card' },
-      h('div', { class: 'card-head' }, h('h3', { text: '模型与能力' }),
-        h('button', { class: 'btn ghost small', text: '去模型页', onclick: () => goto('model') })),
-      h('dl', { class: 'kv schedule-kv' },
-        h('dt', { text: '外部模型' }),
-        h('dd', { text: model.enabled === false
-          ? '已关闭（只用本地能力）'
-          : `${model.model_name || '—'}（${model.endpoint || '—'}）` }),
-        h('dt', { text: '模型密钥' }),
-        h('dd', { class: model.has_key ? 'ok-text' : 'bad-text', text: model.key_source_text || '未知' }),
-        h('dt', { text: '本地 Intrinsic' }), h('dd', { text: model.intrinsic_enabled ? '启用' : '关闭' }),
-        h('dt', { text: 'TurnGate' }), h('dd', { text: model.turn_gate_mode || '—' }),
-        h('dt', { text: '主动消息' }), h('dd', { text: scheduler.proactive_enabled ? '启用' : '关闭' }),
-        h('dt', { text: '群聊接话' }), h('dd', { text: scheduler.group_interjection_enabled ? '启用' : '关闭' }),
-        h('dt', { text: '工具' }), h('dd', { text: scheduler.tools_enabled ? '启用' : '关闭' }),
-        h('dt', { text: '视觉' }), h('dd', { text: scheduler.vision_provider || '—' }),
-        // 她"能不能用某种方式说话"是运维最常确认的一件事，四个出口都给出来。
-        h('dt', { text: '语音 / 唱歌' }),
-        h('dd', { text: `${scheduler.voice_enabled ? '语音启用' : '语音关闭'} · ${scheduler.sing_enabled ? '唱歌启用' : '唱歌关闭'}` }),
-        h('dt', { text: '表情包' }),
-        h('dd', {}, stickerSummary(scheduler)),
-        h('dt', { text: '实时通话' }), h('dd', { text: scheduler.qq_call_enabled ? '启用' : '关闭' })),
-      h('div', { class: 'hint', text: `配置文件 ${configInfo.path || '—'} · 修改于 ${configInfo.modified || '—'} · ${fmtBytes(configInfo.bytes)}；后台会话 ${admin.sessions ?? 0} 个，已运行 ${Math.floor((admin.uptime_secs || 0) / 60)} 分钟。` }));
-
-    // 先取数据再拼版：两栏要一起进场，避免右栏比左栏晚一拍。
-    let recent = { items: [] };
-    try {
-      recent = await api('/api/memory/records?limit=8');
-    } catch (_) {
-      // 记忆库拿不到不该把整页带走：下面会显示一行说明。
-    }
+    const recent = await recentPromise;
     const list = h('div', { class: 'record-list' });
     if (!(recent.items || []).length) {
       list.append(h('div', { class: 'empty', text: '暂时读不到记忆记录' }));
@@ -510,18 +529,127 @@
     for (const item of recent.items || []) {
       list.append(recordNode(item, () => { goto('memory').then(() => openRecord(item)); }, false));
     }
-    const recentCard = h('div', { class: 'card' },
-      h('div', { class: 'card-head' }, h('h3', { text: '最近的记忆变化' }),
-        h('button', { class: 'btn ghost small', text: '去记忆页', onclick: () => goto('memory') })),
-      list);
 
-    page.append(h('div', { class: 'overview-split' }, modelCard, recentCard));
+    page.append(h('div', { class: 'overview-split' },
+      modelCard(status.model || {}, status.scheduler || {}),
+      h('div', { class: 'card' },
+        h('div', { class: 'card-head' }, h('h3', { text: '最近的记忆变化' }),
+          h('button', { class: 'btn ghost small', text: '去记忆页', onclick: () => goto('memory') })),
+        list)));
   }
 
-  /** 记忆总量的构成：`total` 里含 2901 条旧版记忆，只写"639 / 共 4196"容易被读成矛盾。 */
+  /** 需要动手的几件事，按"严重到不严重"排。没有就什么都不返回。 */
+  function overviewNotices(status) {
+    const database = status.database || {};
+    const redis = status.redis || {};
+    const model = status.model || {};
+    const pending = (status.admin && status.admin.pending_restart) || [];
+    const notes = [];
+
+    if (!database.ok) {
+      notes.push(h('div', { class: 'restart-note bad' },
+        icon('alert'),
+        h('strong', { text: 'PostgreSQL 不可用：' }),
+        database.detail || '记忆的读写会全部失败，先确认数据库与 DATABASE_URL。'));
+    }
+    if (!redis.ok) {
+      // Redis 掉了不影响她说话，只影响可重建的运行态，所以是提醒不是告警。
+      notes.push(h('div', { class: 'restart-note' },
+        icon('info'),
+        h('strong', { text: 'Redis 不可用：' }),
+        redis.detail || '撤回候选、等待图片与点名限流会退回进程内状态，重启后丢失。'));
+    }
+    if (model.enabled !== false && model.has_key === false) {
+      notes.push(h('div', { class: 'restart-note' },
+        icon('info'),
+        h('strong', { text: '模型没有可用密钥：' }),
+        '外部模型调不通，她只能退回本地能力；去「模型」页填一把，或检查环境变量 ',
+        h('code', { text: model.api_key_env || '（未配置 api_key_env）' }), '。'));
+    }
+    if (pending.length) {
+      notes.push(h('div', { class: 'restart-note' },
+        icon('info'),
+        `有 ${pending.length} 个分区的改动已保存，但要重启进程才生效：`,
+        h('strong', { text: pending.join('、') }),
+        '（按你的部署方式重启服务，例如 systemctl restart kovi-bot）。'));
+    }
+    return notes;
+  }
+
+  /** 运行状态：三张数字卡（进程 / 内存 / 主机）+ 四行事实（服务、配置、后台）。 */
+  function runtimeCard(status) {
+    const database = status.database || {};
+    const redis = status.redis || {};
+    const admin = status.admin || {};
+    const configInfo = status.config || {};
+    return h('div', { class: 'card' },
+      h('div', { class: 'card-head' },
+        h('h3', { text: '运行状态' }),
+        h('span', { class: 'hint mono', text: `v${status.version || '—'} · ${String(status.revision || '未知').slice(0, 8)}` })),
+      h('div', { class: 'stat-grid cols-3' },
+        // 进程时长与主机开机时长必须分开写：线上这台机器已经开了 6 天，而芸汐可能
+        // 5 分钟前刚发完版。混在一起显示会让人以为新版本没生效。
+        stat('芸汐进程', status.process_uptime || '—', `pid ${status.pid ?? '—'}`),
+        stat('进程内存', processMemoryText(status.process), '常驻内存'),
+        stat('主机运行', status.host_uptime || status.uptime || '—', '机器开机时长')),
+      h('dl', { class: 'kv overview-facts' },
+        h('dt', { text: 'PostgreSQL' }),
+        h('dd', {}, serviceLine(database.ok, database.ok ? '正常' : '异常',
+          database.ok ? fmtBytes(database.size_bytes) : (database.detail || '—'), 'danger')),
+        h('dt', { text: 'Redis' }),
+        h('dd', {}, serviceLine(redis.ok, redis.ok ? '正常' : '异常', redis.detail || '—', 'warn')),
+        h('dt', { text: '配置文件' }),
+        h('dd', {}, h('span', {
+          class: 'mono ellipsis',
+          title: configInfo.path || '',
+          text: `${configInfo.path || '—'} · ${fmtBytes(configInfo.bytes)} · 修改于 ${configInfo.modified || '—'}`,
+        })),
+        h('dt', { text: '管理后台' }),
+        h('dd', { text: `${admin.sessions ?? 0} 个会话 · 已运行 ${formatDuration(admin.uptime_secs)}` })));
+  }
+
+  /** 记忆规模：五张能互相比较的数字卡，底下补一行"总数由哪几档构成"。 */
+  function memoryCard(counts) {
+    return h('div', { class: 'card' },
+      h('div', { class: 'card-head' },
+        h('h3', { text: '记忆规模' }),
+        h('span', { class: 'hint', text: '全部由 PostgreSQL 持久化' })),
+      h('div', { class: 'stat-grid cols-5' },
+        statLink('长期记忆', String(counts.memories ?? '—'), 'Memory v2 长期条目', 'memory'),
+        statLink('情节', String(counts.episodes ?? '—'), 'Mind Episode', 'memory'),
+        statLink('人物', String(counts.people ?? '—'), 'canonical Person', 'memory'),
+        statLink('目标', String(counts.goals ?? '—'), 'Mind Agenda', 'memory'),
+        statLink('未完结线索', String(counts.open_loops ?? '—'), 'Open Loop', 'memory')),
+      h('div', { class: 'card-foot' },
+        h('span', { class: 'hint', text: memoryBreakdown(counts) })));
+  }
+
+  /** 模型与能力：四行现状 + 一排能力开关。 */
+  function modelCard(model, scheduler) {
+    return h('div', { class: 'card' },
+      h('div', { class: 'card-head' },
+        h('h3', {}, '模型与能力',
+          model.enabled === false ? h('span', { class: 'pill', text: '外部模型已关闭' }) : null),
+        h('button', { class: 'btn ghost small', text: '去模型页', onclick: () => goto('model') })),
+      h('dl', { class: 'kv overview-facts flush' },
+        h('dt', { text: '当前模型' }), h('dd', {}, h('strong', { text: model.model_name || '—' })),
+        h('dt', { text: '接口地址' }),
+        h('dd', {}, h('span', { class: 'mono ellipsis', title: model.endpoint || '', text: model.endpoint || '—' })),
+        h('dt', { text: '模型密钥' }),
+        h('dd', { class: model.has_key ? 'ok-text' : 'warn-text', text: model.key_source_text || '未知' }),
+        h('dt', { text: '本地能力' }),
+        h('dd', {
+          text: `Intrinsic ${model.intrinsic_enabled ? '启用' : '关闭'} · TurnGate ${model.turn_gate_mode || '—'}`,
+        })),
+      h('div', { class: 'cap-block' },
+        h('div', { class: 'cap-title', text: '表达能力' }),
+        h('div', { class: 'cap-grid' }, ...capabilityChips(scheduler))));
+  }
+
+  /** 记忆总量的构成：`total` 里含旧版记忆，只写"639 / 共 4196"容易被读成矛盾。 */
   function memoryBreakdown(counts) {
     const byKind = counts.by_kind || {};
-    // `memory` 必须排第一：它就是这张卡片的数字本身，落到"其它"里会让人找不到。
+    // `memory` 必须排第一：它就是那张卡片的数字本身，落到"其它"里会让人找不到。
     const names = [
       ['memory', '记忆'], ['legacy_memory', '旧版'], ['episode', '情节'],
       ['user_profile', '用户档案'], ['agenda', '议程'], ['group_profile', '群档案'],
@@ -539,22 +667,6 @@
     if (rest > 0) parts.push(`其它 ${rest}`);
     const total = counts.total ?? '—';
     return parts.length ? `共 ${total} 条：${parts.join(' · ')}` : `共 ${total} 条记录`;
-  }
-
-  /** 表情包那行：开关与素材数量是两件事，分开说才看得出卡在哪一步。 */
-  function stickerSummary(scheduler) {
-    if (!scheduler.sticker_enabled) {
-      return h('span', { text: '关闭' });
-    }
-    if (!scheduler.sticker_files) {
-      return h('span', {}, '已启用，但素材库是空的 ',
-        h('button', {
-          class: 'link-toggle', type: 'button', text: '去上传',
-          onclick: () => goto('stickers'),
-        }));
-    }
-    return h('span', { class: 'ok-text' },
-      `可用 ${scheduler.sticker_files} 张（${scheduler.sticker_labels} 个标签）`);
   }
 
   // ───────────────────────────── 配置 ─────────────────────────────

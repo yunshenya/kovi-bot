@@ -483,6 +483,7 @@ input[type="file"].input::file-selector-button:hover { background: var(--bg-elev
   flex: none;
 }
 .dot.ok { background: var(--ok); box-shadow: 0 0 0 3px var(--ok-soft); }
+.dot.warn { background: var(--warn); box-shadow: 0 0 0 3px var(--warn-soft); }
 .dot.off { background: var(--danger); box-shadow: 0 0 0 3px var(--danger-soft); }
 
 .chip-cell {
@@ -571,13 +572,16 @@ mark {
 
 .card > .hint + .hint { margin-top: 6px; }
 
-/* 重启/只读之类的横幅：不抢眼，但不能被漏看。 */
+/* 重启/只读之类的横幅：不抢眼，但不能被漏看。
+   琥珀=要动手但系统还活着（等重启、Redis 掉了走回退）；
+   红=真的坏了（数据库连不上），所以单独一档。 */
 .restart-note {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
   gap: 6px;
   padding: 11px 14px;
+  font-weight: 400;
   border-radius: var(--radius);
   border: 1px solid color-mix(in srgb, var(--warn) 30%, transparent);
   background: var(--warn-soft);
@@ -586,6 +590,19 @@ mark {
   line-height: 1.6;
 }
 .restart-note strong { color: var(--warn); }
+.restart-note.bad {
+  border-color: color-mix(in srgb, var(--danger) 32%, transparent);
+  background: var(--danger-soft);
+  color: color-mix(in srgb, var(--danger) 88%, var(--text));
+}
+.restart-note.bad strong { color: var(--danger); }
+.restart-note > .icon { width: 15px; height: 15px; flex: none; }
+.restart-note code {
+  padding: 1px 5px;
+  border-radius: 5px;
+  background: color-mix(in srgb, var(--text) 10%, transparent);
+  font-size: 11.5px;
+}
 
 /* 键值表 */
 .kv {
@@ -1020,6 +1037,7 @@ mark {
 }
 
 .stat {
+  position: relative;
   display: flex;
   flex-direction: column;
   gap: 3px;
@@ -1029,9 +1047,36 @@ mark {
   background: var(--bg-elev);
   box-shadow: var(--shadow-xs);
   transition: border-color var(--dur-fast) var(--ease), transform var(--dur) var(--ease-out),
-              box-shadow var(--dur) var(--ease-out);
+              box-shadow var(--dur) var(--ease-out), background var(--dur-fast) var(--ease);
 }
 .stat:hover { border-color: var(--border-strong); transform: translateY(-1px); box-shadow: var(--shadow-sm); }
+
+/* 可点的统计卡：数字本身是入口，悬停给一点"这里能点"的暗示。 */
+.stat.clickable { cursor: pointer; }
+.stat.clickable:hover {
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+  background: linear-gradient(180deg, var(--accent-softer), transparent 70%), var(--bg-elev);
+}
+.stat.clickable:active { transform: translateY(0); }
+.stat.clickable::after {
+  content: "›";
+  position: absolute;
+  top: 12px; right: 13px;
+  color: var(--accent);
+  font-size: 15px;
+  line-height: 1;
+  opacity: 0;
+  transform: translateX(-3px);
+  transition: opacity var(--dur) var(--ease), transform var(--dur) var(--ease-out);
+}
+.stat.clickable:hover::after, .stat.clickable:focus-visible::after { opacity: 1; transform: none; }
+
+/* 语义色文本三档：绿=正常/已配置，琥珀=退化或还没配（能用但不完整），红=坏了。 */
+.ok-text { color: var(--ok); }
+.warn-text { color: var(--warn); }
+.danger-text { color: var(--danger); }
+/* 旧名字保留：语义与 warn-text 相同，避免别处再改一遍。 */
+.bad-text { color: var(--warn); }
 .stat .label { color: var(--text-dim); font-size: 12.5px; font-weight: 500; }
 .stat .value {
   font-size: 26px;
@@ -1117,7 +1162,12 @@ mark {
   transition: width var(--dur-slow) var(--ease-out);
 }
 
-/* ═══════════════ 概览：两栏 ═══════════════ */
+/* ═══════════════ 概览 ═══════════════
+ *
+ * 三块：运行状态（她还活着吗）→ 记忆规模（她记得多少）→ 模型与能力（她怎么说话）。
+ * 数字卡的列数是写死的而不是 auto-fill：一行几张是设计决定，交给 auto-fill 会
+ * 出现"5 张卡占不满 6 列、右边空一格"这种一眼看上去像坏了的结果。
+ */
 
 .overview-split {
   display: grid;
@@ -1125,7 +1175,60 @@ mark {
   gap: 16px;
   align-items: start;
 }
-.schedule-kv { font-size: 13px; }
+
+.stat-grid.cols-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.stat-grid.cols-5 { grid-template-columns: repeat(5, minmax(0, 1fr)); }
+
+/* 行式事实：服务、路径、会话这类不适合当大数字的东西都排在这里。 */
+.overview-facts {
+  margin-top: 16px;
+  padding-top: 15px;
+  border-top: 1px solid var(--border);
+  font-size: 13px;
+}
+/* 紧跟在卡片标题后面的那几行不需要再画一条分隔线。 */
+.overview-facts.flush { margin-top: 0; padding-top: 0; border-top: 0; }
+.overview-facts dt { color: var(--text-faint); }
+.overview-facts dd { min-width: 0; }
+.service-line { display: inline-flex; align-items: center; gap: 9px; flex-wrap: wrap; }
+.ellipsis {
+  display: block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 卡片的脚注行：一句话把上面几张卡串起来（例如记忆总量的构成）。 */
+.card-foot { margin-top: 15px; padding-top: 13px; border-top: 1px solid var(--border); }
+
+/* 能力开关：开着是绿的，关掉的压暗；同一个人扫一眼就知道她能用哪几种方式说话。 */
+.cap-block { margin-top: 16px; padding-top: 15px; border-top: 1px solid var(--border); }
+.cap-title { margin-bottom: 10px; color: var(--text-faint); font-size: 12px; font-weight: 500; }
+.cap-grid { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; }
+.cap-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  height: 27px;
+  padding: 0 11px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--bg-elev-2);
+  color: var(--text-dim);
+  font-size: 12px;
+  white-space: nowrap;
+}
+.cap-chip.on {
+  border-color: color-mix(in srgb, var(--ok) 30%, transparent);
+  background: var(--ok-soft);
+  color: var(--ok);
+}
+.cap-chip.off { background: transparent; color: var(--text-faint); }
+.cap-dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; flex: none; }
+.cap-chip.off .cap-dot { background: transparent; border: 1.5px solid currentColor; }
+.cap-detail { color: var(--text-faint); font-variant-numeric: var(--tnum); }
+.cap-chip.on .cap-detail { color: color-mix(in srgb, var(--ok) 62%, var(--text-faint)); }
 
 /* ═══════════════ 记录行（记忆 / 队列共用） ═══════════════ */
 
@@ -2433,6 +2536,7 @@ mark {
   .overview-split,
   .sys-layout,
   .graph-layout { grid-template-columns: minmax(0, 1fr); }
+  .stat-grid.cols-5 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .graph-side { flex-direction: row; flex-wrap: wrap; gap: 18px; }
   .graph-side > h4, .graph-side > p { flex: 1 1 100%; }
   .graph-side-body { flex: 1 1 auto; }
@@ -2442,6 +2546,7 @@ mark {
 /* 窄屏：侧栏只剩图标，表格摊成卡片。 */
 @media (max-width: 900px) {
   .config-layout { grid-template-columns: minmax(0, 1fr); }
+  .stat-grid.cols-3 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   /* 单列时左栏排在正文前面：把四个文件压成一条横向滑动的条，
      再去掉分区导航（窄屏靠搜索与「全部展开」找分区），免得把搜索框顶到屏幕外。 */
   .config-side { position: static; max-height: none; padding: 10px; }
@@ -2473,6 +2578,7 @@ mark {
   .card-head > .hint { text-align: left; }
 
   .stat-grid, .stat-grid.six, .usage-grid.six { grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); }
+  .stat-grid.cols-3, .stat-grid.cols-5 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .stat .value { font-size: 21px; }
 
   .field { grid-template-columns: minmax(0, 1fr); gap: 8px; }
@@ -2532,6 +2638,7 @@ mark {
   .topbar { flex-wrap: wrap; }
   .topbar-actions { width: 100%; justify-content: space-between; }
   .pill { height: 28px; font-size: 12px; }
+  .stat-grid.cols-3, .stat-grid.cols-5 { grid-template-columns: minmax(0, 1fr); }
 }
 
 /* 尊重系统的"减少动态效果"。 */
@@ -2551,10 +2658,3 @@ mark {
   .page-scroll { overflow: visible; padding: 0; }
   .card { break-inside: avoid; box-shadow: none; }
 }
-
-/* 概览页：可点的统计卡（点进去看细节）与语义色文本 */
-.stat.clickable { cursor: pointer; transition: border-color .15s, transform .15s; }
-.stat.clickable:hover { border-color: var(--accent); }
-.stat.clickable:active { transform: translateY(1px); }
-.ok-text { color: var(--ok); }
-.bad-text { color: var(--warn); }
