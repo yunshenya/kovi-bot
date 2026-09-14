@@ -132,12 +132,27 @@ pub(crate) async fn persistence_loop() {
     }
 }
 
+/// 是否该把内存态写回库：**开着且脏**才算。（"有 store"是调用方的前置条件：
+/// 没有 store 就根本没有可写的地方。）
+///
+/// `enabled` 必须算进来。原先只看脏标记：store 是启动时建的 OnceLock，热关
+/// （管理后台改配置后 reload；`world_model` 不在 `RESTART_SECTIONS` 里）并不会拆掉它，
+/// 内存里那份世界与脏标记也都还在——于是"关掉"之后持久化循环仍可能把最后一份世界
+/// 状态写一次盘。其余入口（`with_world`、`restore_from_store`、reply 注入、influence）
+/// 本来就都看这个开关，这是漏掉的一处。
+pub(crate) const fn should_persist(enabled: bool, dirty: bool) -> bool {
+    enabled && dirty
+}
+
 /// Save the world state when dirty (best-effort; keeps dirty on failure).
 pub(crate) async fn persist_if_dirty() {
     let Some(store) = super::world_model_store() else {
         return;
     };
-    if !WORLD_DIRTY.load(Ordering::Relaxed) {
+    if !should_persist(
+        world_config().enabled(),
+        WORLD_DIRTY.load(Ordering::Relaxed),
+    ) {
         return;
     }
     let snapshot = {
@@ -1380,6 +1395,11 @@ pub(crate) fn conversation_world_summary(
 /// full live state (all scenes / hosts / situations), not merely an
 /// empty-context snapshot.
 pub(crate) fn world_status_text() -> String {
+    // 关掉之后运行时对象还留在内存里（它是 OnceLock / 静态），但状态命令不该拿这份
+    // 陈旧数据糊弄人：`enabled=false` 就是"没在跑"。
+    if !world_config().enabled() {
+        return "World Model v4 状态\nWorld Model 未启用".to_owned();
+    }
     let guard = WORLD_RUNTIME
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());

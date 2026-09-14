@@ -2151,6 +2151,12 @@ mod world_model_gating_tests {
             "enabled=false 时不该存在任何世界模型运行时状态"
         );
 
+        // 状态命令不该拿内存里那份陈旧数据糊弄人。
+        assert!(
+            super::world_model::world_status_text().contains("未启用"),
+            "enabled=false 时 #world-status 应报未启用，而不是渲染旧快照"
+        );
+
         // 反面对照：证明上面不是"记录入口本身坏了"。
         install_world_model_enabled(true);
         super::world_model::reset_for_tests();
@@ -2159,6 +2165,20 @@ mod world_model_gating_tests {
             super::world_model::status_summary().is_some(),
             "enabled=true 时同一条观察必须被记下来"
         );
+        assert!(
+            !super::world_model::world_status_text().contains("未启用"),
+            "enabled=true 时状态命令应渲染真实状态"
+        );
+
+        // 热关之后持久化不能再写盘：这正是原先漏掉的那一处（store 是启动时建的
+        // OnceLock，热关拆不掉它，脏标记也还在）。真正的写盘分支在持久化函数里，
+        // 所以把它的前置条件抽成纯函数来钉。
+        assert!(
+            !super::world_model::should_persist(false, true),
+            "关掉之后即使脏也不该写盘"
+        );
+        assert!(super::world_model::should_persist(true, true));
+        assert!(!super::world_model::should_persist(true, false));
 
         super::world_model::reset_for_tests();
         crate::config::install(previous).expect("应还原配置");
