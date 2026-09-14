@@ -57,6 +57,8 @@ STRUCT_TO_SECTION = {
     "VisionConfig": "vision",
     "QqCallConfig": "qq_call",
     "QqVoiceConfig": "qq_voice",
+    "QqSingConfig": "qq_sing",
+    "QqStickerConfig": "qq_sticker",
     "ExecutiveConfig": "executive",
     "ExecutiveConflictConfig": "executive.conflict",
     "ExecutiveConfidenceConfig": "executive.confidence",
