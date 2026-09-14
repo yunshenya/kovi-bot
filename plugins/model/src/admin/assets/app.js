@@ -2712,11 +2712,22 @@
       h('div', { class: 'record-meta' },
         h('span', { class: 'badge kind', text: item.label || item.kind }),
         statusBadge(item.status),
-        // 作用域为空说明它是全局记录，"全局"两个字每行都写一遍等于没写。
-        item.scope_label ? h('span', { class: 'record-scope', text: item.scope_label }) : null,
+        recordScope(item.scope_label),
         h('span', { class: 'record-when', text: relative(item.occurred_at) || fmtTime(item.occurred_at) })),
       h('div', { class: 'record-title clamp-2' }, ...highlighted(item.title, needle)),
       body ? h('div', { class: 'record-body clamp-2' }, ...highlighted(body, needle)) : null);
+  }
+
+  /**
+   * 作用域那一段。
+   *
+   * 服务端把"没有作用域"也写成了字面量 `全局`（memory_api 的 scope_label_fallback），
+   * 所以不能只判空——线上实测每行都印一个"全局"，和状态徽标一样是纯噪声。
+   */
+  function recordScope(label) {
+    const text = String(label || '').trim();
+    if (!text || text === '全局' || text.toLowerCase() === 'global') return null;
+    return h('span', { class: 'record-scope', text });
   }
 
   /** 这些状态是"一切正常"的默认值：每行挂一个只是噪声，真正有信息量的才给 badge。 */
