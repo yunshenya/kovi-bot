@@ -118,8 +118,17 @@ pub struct GroupInterjectionConfig {
     /// 群聊可见回复频率统计窗口（秒）。
     reply_rate_window_secs: u64,
     /// 统计窗口内同一群最多输出多少条可见回复（Admin/命令/识图等显式
-    /// 请求不受限）。
+    /// 请求不受限）。**只计未点名**的那些：点名是对她说的请求，另有更宽的一份
+    /// 名额（见 `addressed_reply_rate_limit`）。
     reply_rate_limit: usize,
+    /// 统计窗口内同一群最多输出多少条**点名**回复。
+    ///
+    /// 为什么分开记：2026-09-14 晚上一场热闹的来回里，她五分钟就把 10 条用光，
+    /// 之后整段窗口（10 分钟）对谁都不说话——群里看到的是"她不理人"，而那些
+    /// 被丢掉的恰恰是直接点名她的消息。点名本身已有 `should_suppress_direct_trigger`
+    /// 防重复刷，这里给她更宽的一份额度，未点名接话仍按 `reply_rate_limit` 收着。
+    /// 取值必须 ≥ `reply_rate_limit`。
+    addressed_reply_rate_limit: usize,
 }
 
 impl GroupInterjectionConfig {
@@ -265,6 +274,17 @@ impl GroupInterjectionConfig {
         self.reply_rate_limit
     }
 
+    /// 配置里写的点名额度（未做收口）；对外判断请用
+    /// [`Self::effective_addressed_reply_rate_limit`]。
+    pub fn addressed_reply_rate_limit(&self) -> usize {
+        self.addressed_reply_rate_limit
+    }
+
+    /// 点名通道的窗口额度；配置写小了就退回普通额度（宁可严，不可松）。
+    pub fn effective_addressed_reply_rate_limit(&self) -> usize {
+        self.addressed_reply_rate_limit.max(self.reply_rate_limit)
+    }
+
     pub fn validate(&self) -> anyhow::Result<()> {
         if self.min_eligible_messages == 0 {
             return Err(anyhow::anyhow!("群聊接话消息间隔必须大于0"));
@@ -309,6 +329,13 @@ impl GroupInterjectionConfig {
         }
         if self.continuation_window_secs == 0 {
             return Err(anyhow::anyhow!("接续对话窗口必须大于0秒"));
+        }
+        if !(self.reply_rate_limit..=256).contains(&self.addressed_reply_rate_limit) {
+            return Err(anyhow::anyhow!(
+                "group_interjection.addressed_reply_rate_limit 必须 ≥ reply_rate_limit 且 ≤ 256（当前 {} vs {}）",
+                self.addressed_reply_rate_limit,
+                self.reply_rate_limit
+            ));
         }
         if self.reply_gap_secs == 0
             || self.reply_rate_window_secs == 0
@@ -372,6 +399,7 @@ impl Default for GroupInterjectionConfig {
             addressed_reply_gap_secs: 20,
             reply_rate_window_secs: 600,
             reply_rate_limit: 4,
+            addressed_reply_rate_limit: 12,
         }
     }
 }
@@ -379,6 +407,30 @@ impl Default for GroupInterjectionConfig {
 #[cfg(test)]
 mod tests {
     use super::GroupInterjectionConfig;
+
+    /// 点名额度写小了要退回普通额度（宁可严不可松），写超上限直接拒绝启动。
+    #[test]
+    fn addressed_rate_limit_is_bounded_below_and_above() {
+        let mut config = super::GroupInterjectionConfig::default();
+        assert_eq!(
+            config.effective_addressed_reply_rate_limit(),
+            config
+                .reply_rate_limit()
+                .max(config.addressed_reply_rate_limit())
+        );
+        assert!(config.validate().is_ok());
+
+        // 写成比普通额度还小：退回普通额度，不拒绝启动。
+        config.addressed_reply_rate_limit = config.reply_rate_limit().saturating_sub(1);
+        assert_eq!(
+            config.effective_addressed_reply_rate_limit(),
+            config.reply_rate_limit()
+        );
+
+        // 超出上限：拒绝启动（256 是防呆上限，不是推荐值）。
+        config.addressed_reply_rate_limit = 257;
+        assert!(config.validate().is_err());
+    }
 
     #[test]
     fn defaults_are_valid() {

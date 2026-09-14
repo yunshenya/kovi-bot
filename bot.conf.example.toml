@@ -172,6 +172,10 @@ reply_gap_secs = 90
 addressed_reply_gap_secs = 20
 reply_rate_window_secs = 600
 reply_rate_limit = 10
+# 点名通道的窗口额度（必须 ≥ reply_rate_limit）。未点名接话仍按 reply_rate_limit
+# 收着，点名走这份更宽的额度：直接对她说的请求不该被"她刚刚聊得很热闹"挤掉。
+# 两者都受这份额度封顶，避免"手里全是点名"时无上限。
+addressed_reply_rate_limit = 20
 
 [memory]
 # 数据库连接池：全进程共用。默认 5 条 / 等 30 秒，与一直以来的行为一致。

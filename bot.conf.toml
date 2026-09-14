@@ -113,6 +113,12 @@ reply_gap_secs = 90
 addressed_reply_gap_secs = 20
 reply_rate_window_secs = 600
 reply_rate_limit = 10
+# 点名与未点名**分开记账**：未点名接话每 reply_rate_window_secs 内最多
+# reply_rate_limit 条，点名她（结构化 @ / 正文点名 / 引用）另有一份更宽的额度
+# addressed_reply_rate_limit 条，两者都受后者封顶。为什么分开：2026-09-14 晚上
+# 一场热闹的来回里她五分钟就把 10 条用光，之后整段窗口对谁都不说话——而丢掉的
+# 恰恰是直接点名她的消息。点名刷屏另有 should_suppress_direct_trigger 防着。
+addressed_reply_rate_limit = 20
 
 [memory]
 # 数据库连接池：全进程共用。
