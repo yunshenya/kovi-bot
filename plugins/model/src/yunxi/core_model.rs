@@ -100,6 +100,9 @@ const CORE_VOICE_MARKER: &str = "[[VOICE]]";
 /// Core 的唱歌标记：`[[SING 模板id]]`，单独一行写在正文最前面，正文即歌词。
 const CORE_SING_MARKER: &str = "[[SING";
 const MAX_CORE_BUBBLES: usize = 3;
+/// "入站消息 → 说话人"表的容量。它只服务"工具回合之后仍要知道是谁说的"，
+/// 覆盖最近若干条消息即可，不需要持久。
+const CORE_INBOUND_SPEAKER_CAPACITY: usize = 256;
 /// 一轮里宿主的门控最多能放行多少条 pending outgoing（`interrupt.rs`
 /// 的 `MAX_PENDING_OUTGOING_PER_SCOPE`）。它同时是"用户明确要求 N 条"时
 /// 芸汐真的发得出去的上限：超过这个数的 batch 会被整批拒绝，一条也发不
@@ -3650,6 +3653,14 @@ pub(crate) struct KoviModelBackend {
     conversations: Arc<Mutex<BoundedRouteCache<ConversationId>>>,
     people: Arc<Mutex<BoundedRouteCache<PersonId>>>,
     host_message_contexts: Arc<Mutex<HostMessageContextCache>>,
+    /// `MessageId → 说话人 QQ 号`，只读不消费。
+    ///
+    /// `host_message_contexts` 是一次性的（planner 取走即销毁），而"这条消息是
+    /// 谁说的"在她**后续**回合里还需要：典型是工具回合——她先调 `time.now`，
+    /// 可见回复在工具结果那一轮才发出，那一轮没有 `MessageReceivedEvent`，只有
+    /// 溯源用的源消息 id。少了这张表，工具回合之后的回复就不会建立对话焦点，
+    /// 用户紧接着的话也就不算接续（线上 2026-09-14 16:04 实测）。
+    inbound_speakers: Arc<Mutex<BoundedCache<MessageId, i64>>>,
     tool_turns: Arc<HostToolTurnRegistry>,
     // This is an invalidation marker only. Generated text is never cached.
     intrinsic_cache: Arc<Mutex<BoundedCache<ReplyScope, ()>>>,
@@ -3681,6 +3692,9 @@ impl KoviModelBackend {
             intrinsic,
             conversations: Arc::new(Mutex::new(BoundedRouteCache::new(FALLBACK_ROUTE_CAPACITY))),
             people: Arc::new(Mutex::new(BoundedRouteCache::new(FALLBACK_ROUTE_CAPACITY))),
+            inbound_speakers: Arc::new(Mutex::new(BoundedCache::new(
+                CORE_INBOUND_SPEAKER_CAPACITY,
+            ))),
             host_message_contexts: Arc::new(Mutex::new(HostMessageContextCache::new(
                 HOST_MESSAGE_CONTEXT_CAPACITY,
             ))),
@@ -4148,6 +4162,10 @@ impl KoviModelBackend {
         sender_is_admin: bool,
         sender_user_id: i64,
     ) {
+        self.inbound_speakers
+            .lock()
+            .await
+            .insert(message_id, sender_user_id);
         let displaced = self.host_message_contexts.lock().await.insert(
             message_id,
             HostMessageContext {
@@ -4160,6 +4178,11 @@ impl KoviModelBackend {
         if let Some(displaced) = displaced {
             ConversationCoordinator::abandon_incoming(displaced.admission).await;
         }
+    }
+
+    /// 某条入站消息的说话人（QQ 号）。工具回合的可见回复靠它回溯"在回谁"。
+    pub(crate) async fn inbound_speaker_user_id(&self, message_id: MessageId) -> Option<i64> {
+        self.inbound_speakers.lock().await.get(&message_id)
     }
 
     pub(crate) async fn discard_incoming(&self, message_id: MessageId) {
@@ -4849,22 +4872,17 @@ fn reply_expected_for_incoming(input: &PlannerInput) -> bool {
 /// 会 panic——线上 2026-09-14 15:11 的事故正是这个晚读：群聊回复已经生成，
 /// 投递前整轮 panic 丢掉，用户只看到"她不回我"。取不到就宁可不建焦点。
 fn conversation_focus_target(
-    message: Option<&yunxi_core::MessageReceivedEvent>,
     conversation: QqConversation,
-    sender_user_id: Option<i64>,
+    partner_user_id: Option<i64>,
     has_visible_text: bool,
 ) -> Option<(i64, i64)> {
     if !has_visible_text {
         return None;
     }
-    let message = message?;
-    if message.conversation_kind != ConversationKind::Group {
-        return None;
-    }
     let QqConversation::Group { group_id } = conversation else {
         return None;
     };
-    Some((group_id, sender_user_id?))
+    Some((group_id, partner_user_id?))
 }
 
 fn reply_recovery_required(input: &PlannerInput, tool_follow_up: bool) -> bool {
@@ -6936,10 +6954,17 @@ impl ModelBackend for KoviModelBackend {
             // 她可见回复了群里的某人 → 记下"对话焦点"：接下来的未点名消息里，
             // 由这个人接着说的那些算接续（可以回、用接续档间隔、并且会合批）。
             // 只有真的产出可见正文的回合才建立对话，沉默回合不算。
+            // 这一轮在回谁：普通消息回合看当前发言者；工具回合没有当前消息，
+            // 按源消息回溯（`inbound_speakers` 记着每条入站是谁说的）。
+            let mut partner_user_id = sender_user_id;
+            if partner_user_id.is_none()
+                && let Some(source_message_id) = input.event.source_message_id()
+            {
+                partner_user_id = self.inbound_speaker_user_id(source_message_id).await;
+            }
             if let Some((group_id, partner_user_id)) = conversation_focus_target(
-                message,
                 conversation,
-                sender_user_id,
+                partner_user_id,
                 core_plan_has_visible_text(&plan),
             ) {
                 let continuation = message.is_some_and(|message| message.continuation_to_agent);
@@ -7873,31 +7898,23 @@ mod tests {
     /// 也不能去读已经被 `disarm()` 的 guard——那会 panic 掉整轮回复）。
     #[test]
     fn conversation_focus_target_requires_a_visible_group_reply_and_a_known_speaker() {
-        let group = group_message_input(true);
-        let WorldEventKind::MessageReceived(message) = group.event.kind() else {
-            panic!("group fixture must be a received message");
-        };
         let conversation = QqConversation::Group {
             group_id: 641_996_763,
         };
         assert_eq!(
-            conversation_focus_target(Some(message), conversation, Some(3_052_405_886), true),
+            conversation_focus_target(conversation, Some(3_052_405_886), true),
             Some((641_996_763, 3_052_405_886))
         );
         // 沉默回合不建立对话。
         assert_eq!(
-            conversation_focus_target(Some(message), conversation, Some(3_052_405_886), false),
+            conversation_focus_target(conversation, Some(3_052_405_886), false),
             None
         );
-        // 说话人未知（例如晚读了已 disarm 的 guard）：不建，也不 panic。
-        assert_eq!(
-            conversation_focus_target(Some(message), conversation, None, true),
-            None
-        );
+        // 说话人未知：不建焦点，也不 panic（线上曾经在这里 panic 掉整轮回复）。
+        assert_eq!(conversation_focus_target(conversation, None, true), None);
         // 私聊没有"群聊焦点"这回事。
         assert_eq!(
             conversation_focus_target(
-                Some(message),
                 QqConversation::Private { user_id: 1 },
                 Some(3_052_405_886),
                 true

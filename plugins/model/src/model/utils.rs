@@ -774,6 +774,16 @@ pub async fn control_model(
         reply_ticket,
     )
     .await;
+    // Host 链路的可见回复同样建立"对话焦点"。
+    //
+    // 为什么它也需要：Core 那边有一轮回复在跑时，被点名的消息会被交给 Host
+    // 链路处理（不打断在制回合），回复由这里发出——只认 Core 的计划就等于漏掉
+    // 这一支，用户紧接着的未点名消息不会被当成接续。线上 2026-09-14 16:05
+    // 实测：她回了"@你好"，但焦点没建立，随后那句"现在几点了"就掉回低频抽样。
+    // 只有"直接回复某人的回合"（`reply_expected`）才算对话，插话与命令回执不算。
+    if reply_expected && !execution.sent_messages.is_empty() {
+        crate::model::group::note_group_conversation_focus(group_id, user_id, false).await;
+    }
     let _ = set_pending_image_request_for_reply(
         ImageRequestScope::Group { group_id, user_id },
         plan.requests_image && !execution.sent_messages.is_empty(),
