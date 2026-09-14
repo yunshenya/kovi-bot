@@ -877,12 +877,12 @@ pub(crate) async fn group_message_event_after_ingress(
         conversation_active,
     );
     let semantic_required = !ambient_sampling_eligible;
-    let sampled_for_interjection = if semantic_required {
-        false
+    let mut sampled_for_interjection = if semantic_required {
+        None
     } else {
         reserve_interjection_decision(group_id, &intent_text).await
     };
-    let understanding = if semantic_required || sampled_for_interjection {
+    let understanding = if semantic_required || sampled_for_interjection.is_some() {
         understand(batch_request.clone()).await
     } else {
         MessageUnderstanding::default()
@@ -890,8 +890,8 @@ pub(crate) async fn group_message_event_after_ingress(
     crate::yunxi::events::project_interaction_cues(event.user_id, understanding.interaction_cues());
     let asks_for_silence = plain_text && (understanding.wants_no_reply || understanding.wants_stop);
     if asks_for_silence {
-        if sampled_for_interjection {
-            finish_interjection_attempt(group_id, false).await;
+        if let Some(attempt) = sampled_for_interjection.take() {
+            attempt.complete(false).await;
         }
         stop_group_reply(group_id, event.user_id, ingress).await;
         println!(
@@ -900,8 +900,10 @@ pub(crate) async fn group_message_event_after_ingress(
         );
         return;
     }
-    if sampled_for_interjection && !understanding.interjection_worthy {
-        finish_interjection_attempt(group_id, false).await;
+    if !understanding.interjection_worthy
+        && let Some(attempt) = sampled_for_interjection.take()
+    {
+        attempt.complete(false).await;
     }
     vision_requested = !config::get().vision().disabled()
         && (batch_vision_requested || understanding.should_understand_image(&batch_request));
@@ -966,7 +968,8 @@ pub(crate) async fn group_message_event_after_ingress(
         group_id,
         event.user_id,
         &understanding,
-        primary_reply_expected || (sampled_for_interjection && understanding.interjection_worthy),
+        primary_reply_expected
+            || (sampled_for_interjection.is_some() && understanding.interjection_worthy),
     )
     .await;
     let continue_conversation = !primary_reply_expected && conversation_decision.continue_reply;
@@ -985,18 +988,18 @@ pub(crate) async fn group_message_event_after_ingress(
     };
     let reply_budget_ok = !(primary_reply_expected
         || continue_conversation
-        || (sampled_for_interjection && understanding.interjection_worthy))
+        || (sampled_for_interjection.is_some() && understanding.interjection_worthy))
         || vision_requested
         || explicit_sticker_teaching
         || matches!(message.trim(), "#禁言" | "#结束禁言")
         || reserve_group_chat_reply(group_id, addressed_gap_secs).await;
-    if !reply_budget_ok && sampled_for_interjection {
-        finish_interjection_attempt(group_id, false).await;
+    if !reply_budget_ok && let Some(attempt) = sampled_for_interjection.take() {
+        attempt.complete(false).await;
     }
     let direct_reply_expected = reply_budget_ok
         && (primary_reply_expected
             || continue_conversation
-            || (sampled_for_interjection && understanding.interjection_worthy));
+            || (sampled_for_interjection.is_some() && understanding.interjection_worthy));
     let Some(admission) = admit_understood_group_turn(
         initial_admission,
         &understanding,
@@ -1128,7 +1131,10 @@ pub(crate) async fn group_message_event_after_ingress(
         shadow_guard.mark_replied(replied);
         finish_conversation_turn(group_id, event.user_id, turn_marker, replied).await;
         drain_pending_window_messages(group_id, Arc::clone(&bot), ticket).await;
-    } else if sampled_for_interjection && understanding.interjection_worthy && reply_budget_ok {
+    } else if sampled_for_interjection.is_some()
+        && understanding.interjection_worthy
+        && reply_budget_ok
+    {
         println!("[INFO] 群聊未点名接话 (群组: {})", group_id);
         if !stickers.is_empty()
             && let Err(error) = sticker_memory::record_usage(
@@ -1179,7 +1185,9 @@ pub(crate) async fn group_message_event_after_ingress(
             false,
         )
         .await;
-        finish_interjection_attempt(group_id, replied).await;
+        if let Some(attempt) = sampled_for_interjection.take() {
+            attempt.complete(replied).await;
+        }
         shadow_guard.mark_replied(replied);
         finish_conversation_turn(group_id, event.user_id, turn_marker, replied).await;
         drain_pending_window_messages(group_id, Arc::clone(&bot), ticket).await;
@@ -1955,10 +1963,13 @@ async fn take_pending_window_turn(
 /// 放在锁外——`GROUP_INTERJECTION_STATE` 是所有群路径共用的锁，不能压在
 /// 一次 PG 往返上。两段之间靠先占住 `interjection_in_flight` 保证并发消息
 /// 不会各抽一次。
-async fn reserve_interjection_decision(group_id: i64, message: &str) -> bool {
+async fn reserve_interjection_decision(
+    group_id: i64,
+    message: &str,
+) -> Option<InterjectionAttempt> {
     let config = config::get().group_interjection().clone();
     if !config.enabled() || !has_interjection_candidate(message, config.min_message_chars()) {
-        return false;
+        return None;
     }
 
     {
@@ -1972,18 +1983,18 @@ async fn reserve_interjection_decision(group_id: i64, message: &str) -> bool {
             Duration::from_secs(config.decision_rate_window_secs()),
         );
         if state.interjection_in_flight {
-            return false;
+            return None;
         }
         if state.last_interjection.is_some_and(|last| {
             now.duration_since(last) < Duration::from_secs(config.cooldown_secs())
         }) {
-            return false;
+            return None;
         }
 
         state.eligible_messages_since_sample =
             state.eligible_messages_since_sample.saturating_add(1);
         if state.eligible_messages_since_sample < config.min_eligible_messages() {
-            return false;
+            return None;
         }
         if !decision_budget_available(
             state,
@@ -1993,27 +2004,34 @@ async fn reserve_interjection_decision(group_id: i64, message: &str) -> bool {
         ) {
             // 保留已累计的候选；额度恢复后下一条有效消息即可再次抽样。
             state.eligible_messages_since_sample = config.min_eligible_messages();
-            return false;
+            return None;
         }
         // 每积累一批候选消息才抽样一次；未抽中也重新累计，避免逐条消耗 token。
         state.eligible_messages_since_sample = 0;
         // 先占住这一轮尝试：下面要放开锁去读群级压力。
         state.interjection_in_flight = true;
     }
+    // 从这一刻起"有插话在途"就挂在这个凭据上：调用方要么显式 complete，要么在
+    // 任何一条早退路径上由 Drop 兜底解掉。原先靠调用方记得手写 finish，漏一条
+    // 这个群就永久停在"有插话在途"，再也采样不到（prune 又刻意保留在途项）。
+    let attempt = InterjectionAttempt {
+        group_id,
+        completed: false,
+    };
 
     if interjection_sampling_vetoed(group_cooling_gate(group_id).await) {
-        finish_interjection_attempt(group_id, false).await;
-        return false;
+        attempt.complete(false).await;
+        return None;
     }
     if !rand::rng().random_ratio(config.response_probability_percent().into(), 100) {
-        finish_interjection_attempt(group_id, false).await;
-        return false;
+        attempt.complete(false).await;
+        return None;
     }
 
     let mut states = GROUP_INTERJECTION_STATE.lock().await;
     let state = states.entry(group_id).or_default();
     state.decision_attempts.push_back(Instant::now());
-    true
+    Some(attempt)
 }
 
 /// 群降温命中时放弃这一次抽样机会——概率上本来会抽中也一样放弃。
@@ -2187,6 +2205,41 @@ fn decision_budget_available(
 }
 
 /// 模型选择静默时只结束本轮尝试；真正发出消息后才开始冷却。
+/// "这一轮插话尝试"的凭据。
+///
+/// `reserve_interjection_decision` 占住 `interjection_in_flight` 之后把它交给调用方：
+/// 调用方**必须**显式 [`Self::complete`]，否则 Drop 会兜底解掉。原来只有"记得手写
+/// finish"这一条路，而中间任何一条早退（语义过期、纯图片、额度不够、排队等）都会让
+/// 这个群永久停在"有插话在途"——`reserve` 从此直接返回 false，且 prune 刻意保留在途项，
+/// 于是那个群再也不会主动插话，直到进程重启。
+struct InterjectionAttempt {
+    group_id: i64,
+    completed: bool,
+}
+
+impl InterjectionAttempt {
+    async fn complete(mut self, replied: bool) {
+        self.completed = true;
+        finish_interjection_attempt(self.group_id, replied).await;
+    }
+}
+
+impl Drop for InterjectionAttempt {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        // 状态表是 tokio 的 Mutex，Drop 里不能 await，所以把兜底清理交给运行时
+        // （与 lib.rs 的 IncomingAdmissionGuard 同一手法）。
+        let group_id = self.group_id;
+        if let Ok(handle) = kovi::tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                finish_interjection_attempt(group_id, false).await;
+            });
+        }
+    }
+}
+
 async fn finish_interjection_attempt(group_id: i64, replied: bool) {
     let mut states = GROUP_INTERJECTION_STATE.lock().await;
     if let Some(state) = states.get_mut(&group_id) {
@@ -2337,8 +2390,9 @@ async fn update_group_profile(group_id: i64, user_id: i64, understanding: &Messa
 #[cfg(test)]
 mod tests {
     use super::{
-        Addressing, DirectTriggerState, GroupInterjectionState, GroupSenderIdentity,
-        PENDING_WINDOW_MESSAGES, admit_understood_group_turn, ambient_sampling_eligible,
+        Addressing, DirectTriggerState, GROUP_INTERJECTION_STATE, GroupInterjectionState,
+        GroupSenderIdentity, InterjectionAttempt, PENDING_WINDOW_MESSAGES,
+        admit_understood_group_turn, ambient_sampling_eligible,
         clear_group_erasure_reply_state_locked, complete_interjection_attempt,
         continuation_window_secs, conversation_active_for_observation, cooling_gate_verdict,
         decision_budget_available, directed_at_others, group_cooling_gate,
@@ -2763,6 +2817,50 @@ mod tests {
         assert_eq!(state.last_interjection, Some(now));
         // 真正发出可见插话之后才开始"有没有人接她的话"的观察。
         assert!(state.ambient_watch.is_some());
+    }
+
+    /// 凭据被 Drop 时必须兜底解掉"有插话在途"。
+    ///
+    /// 这正是原来漏掉的那条路：`reserve_interjection_decision` 占住标记之后，中间
+    /// 任何一条早退（语义过期、纯图片、额度不够、排队等）都会让这个群永久停在在途
+    /// 状态——`reserve` 从此直接返回 false，而 prune 又刻意保留在途项，于是那个群再也
+    /// 不会主动插话，直到进程重启。
+    #[test]
+    fn dropping_an_interjection_attempt_releases_the_in_flight_flag() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let group_id = 987_654_321_i64;
+                {
+                    let mut states = GROUP_INTERJECTION_STATE.lock().await;
+                    states.insert(
+                        group_id,
+                        GroupInterjectionState {
+                            interjection_in_flight: true,
+                            ..GroupInterjectionState::default()
+                        },
+                    );
+                }
+                {
+                    // 拿到凭据却什么都没做就退出作用域：等价于漏写 finish 的早退路径。
+                    let _attempt = InterjectionAttempt {
+                        group_id,
+                        completed: false,
+                    };
+                }
+                // Drop 里是 spawn，让运行时有机会跑它。
+                kovi::tokio::time::sleep(Duration::from_millis(100)).await;
+                let states = GROUP_INTERJECTION_STATE.lock().await;
+                assert!(
+                    !states
+                        .get(&group_id)
+                        .expect("状态还在")
+                        .interjection_in_flight,
+                    "Drop 应兜底解掉在途标记，否则这个群再也不会主动插话"
+                );
+                drop(states);
+                GROUP_INTERJECTION_STATE.lock().await.remove(&group_id);
+            });
     }
 
     #[test]
