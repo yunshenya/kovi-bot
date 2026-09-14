@@ -2551,3 +2551,10 @@ mark {
   .page-scroll { overflow: visible; padding: 0; }
   .card { break-inside: avoid; box-shadow: none; }
 }
+
+/* 概览页：可点的统计卡（点进去看细节）与语义色文本 */
+.stat.clickable { cursor: pointer; transition: border-color .15s, transform .15s; }
+.stat.clickable:hover { border-color: var(--accent); }
+.stat.clickable:active { transform: translateY(1px); }
+.ok-text { color: var(--ok); }
+.bad-text { color: var(--warn); }

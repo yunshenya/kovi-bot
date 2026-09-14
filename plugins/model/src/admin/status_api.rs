@@ -1,7 +1,7 @@
 //! 概览页数据：进程、存储、模型与配置文件的现状。
 
 use super::{AdminState, ApiError};
-use crate::utils::system_info_get;
+use crate::utils::{format_process_uptime, system_snapshot};
 use axum::Json;
 use axum::extract::State;
 use serde_json::{Value, json};
@@ -17,21 +17,27 @@ pub(crate) async fn status(State(state): State<Arc<AdminState>>) -> Result<Json<
     let (database, redis) = kovi::tokio::join!(database_health(), redis_health());
     let counts = super::memory_api::counts().await;
 
-    let (uptime, process) = kovi::tokio::task::spawn_blocking(system_info_get)
+    let snapshot = kovi::tokio::task::spawn_blocking(system_snapshot)
         .await
-        .unwrap_or_else(|error| {
-            (
-                "获取失败".to_string(),
-                format!("芸汐进程内存: 获取失败 ({error})"),
-            )
+        .unwrap_or_else(|error| crate::utils::SystemSnapshot {
+            // 采样失败不该让整个概览打不开：如实写"获取失败"，页面照旧能看别的。
+            host_uptime: "获取失败".to_string(),
+            process_uptime_secs: None,
+            process_memory: format!("芸汐进程内存: 获取失败 ({error})"),
         });
+    let process_uptime = snapshot.process_uptime_secs.map(format_process_uptime);
 
     Ok(Json(json!({
         "version": env!("CARGO_PKG_VERSION"),
         "revision": std::env::var("KOVI_DEPLOY_REVISION").unwrap_or_else(|_| "未知".to_string()),
         "pid": std::process::id(),
-        "uptime": uptime,
-        "process": process,
+        // `uptime` 是**机器开机时长**（历史字段名，保留给老前端）；
+        // `process_uptime` 才是芸汐自己跑了多久——两者混用会让人以为刚发的版没生效。
+        "uptime": snapshot.host_uptime,
+        "host_uptime": snapshot.host_uptime,
+        "process_uptime_secs": snapshot.process_uptime_secs,
+        "process_uptime": process_uptime,
+        "process": snapshot.process_memory,
         "database": database,
         "redis": redis,
         "counts": counts,
@@ -54,6 +60,18 @@ pub(crate) async fn status(State(state): State<Arc<AdminState>>) -> Result<Json<
             "model_name": config.server_config().model_name(),
             "endpoint": config.server_config().endpoint(),
             "api_key_env": config.server_config().api_key_env(),
+            // 密钥可能来自配置（后台模型页托管）或环境变量：概览页那行"Token 环境变量"
+            // 会误导人以为只能走环境变量，所以把来源一并给出去，措辞由 config 层统一。
+            "has_key": config.server_config().resolved_api_key().is_some(),
+            "api_key_source": match config.server_config().api_key_source() {
+                crate::config::ApiKeySource::Config => "config",
+                crate::config::ApiKeySource::Environment(_) => "environment",
+                crate::config::ApiKeySource::Missing => "missing",
+            },
+            "key_source_text": config.server_config().api_key_source().describe(
+                config.server_config().enabled(),
+                config.server_config().requires_auth(),
+            ),
             "intrinsic_enabled": config.model().intrinsic().enabled(),
             "turn_gate_mode": config.model().turn_gate().mode(),
         },
@@ -63,6 +81,13 @@ pub(crate) async fn status(State(state): State<Arc<AdminState>>) -> Result<Json<
             "tools_enabled": config.tools().enabled(),
             "vision_provider": config.vision().provider(),
             "qq_call_enabled": config.qq_call().enabled(),
+            "voice_enabled": config.qq_voice().enabled(),
+            "sing_enabled": config.qq_sing().enabled(),
+            // 表情包素材库：她"能不能发表情"取决于开关**和**素材数量，两个都给。
+            "sticker_enabled": config.qq_sticker().enabled(),
+            "sticker_files": crate::sticker_library::listing().len(),
+            "sticker_labels": crate::sticker_library::available_labels().len(),
+            "sticker_ready": crate::sticker_library::is_available(),
         },
     })))
 }

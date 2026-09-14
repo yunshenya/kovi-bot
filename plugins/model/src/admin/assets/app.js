@@ -376,10 +376,14 @@
     const pill = $('#health-pill');
     try {
       const status = await api('/api/status');
-      const ok = status.database.ok && status.redis.ok;
+      const database = status.database || {};
+      const redis = status.redis || {};
+      const ok = database.ok && redis.ok;
+      // 这里要用**进程**运行时长（`process_uptime`），不是主机开机时长：
+      // 部署后第一眼就是看这个数字有没有归零。
       setPill(pill, ok ? 'ok' : 'bad', ok
-        ? `运行中 · ${status.uptime}`
-        : (status.database.ok ? 'Redis 不可用' : '数据库不可用'));
+        ? `运行中 · ${status.process_uptime || status.uptime || '—'}`
+        : (database.ok ? 'Redis 不可用' : '数据库不可用'));
       $('#brand-revision').textContent = `${status.version} · ${String(status.revision).slice(0, 8)}`;
       overviewCache = status;
     } catch (problem) {
@@ -399,6 +403,25 @@
       extra ? h('div', { class: 'extra', text: extra }) : null);
   }
 
+  /** 可点进某一页的 stat：运维看到数字后的下一个动作几乎总是"去看细节"。 */
+  function statLink(label, value, extra, page) {
+    const node = stat(label, value, extra);
+    const open = () => goto(page);
+    node.classList.add('clickable');
+    node.title = `打开${PAGES[page] ? PAGES[page].title : page}页`;
+    // 一个可点的 div 对键盘和读屏都是隐形的：补上角色、焦点与 Enter/Space。
+    node.setAttribute('role', 'button');
+    node.setAttribute('tabindex', '0');
+    node.addEventListener('click', open);
+    node.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault();
+        open();
+      }
+    });
+    return node;
+  }
+
   async function renderOverview() {
     const page = $('#page-overview');
     clear(page);
@@ -414,21 +437,34 @@
     }
     clear(page);
 
+    // 老版本接口可能没有其中某一段：缺了就写"—"，绝不整页炸掉
+    // （渲染抛错会被 boot 的 catch 接住，人就突然看到登录页了）。
     const counts = status.counts || {};
+    const database = status.database || {};
+    const redis = status.redis || {};
+    const model = status.model || {};
+    const scheduler = status.scheduler || {};
+    const admin = status.admin || {};
+    const configInfo = status.config || {};
+
     page.append(h('div', { class: 'section-title' }, h('span', { text: '运行状态' })));
     page.append(h('div', { class: 'stat-grid' },
-      stat('系统运行', status.uptime, `芸汐进程 pid ${status.pid}`),
-      stat('进程内存', (status.process || '').replace('芸汐进程内存: ', '') || '—'),
-      stat('PostgreSQL', status.database.ok ? '正常' : '异常',
-        status.database.ok ? fmtBytes(status.database.size_bytes) : status.database.detail, true),
-      stat('Redis', status.redis.ok ? '正常' : '异常', status.redis.detail, true),
-      stat('长期记忆', String(counts.memories ?? '—'), `共 ${counts.total ?? '—'} 条记录`),
-      stat('情节', String(counts.episodes ?? '—'), 'Mind Episode'),
-      stat('人物', String(counts.people ?? '—'), 'canonical Person'),
-      stat('目标 / 线索', `${counts.goals ?? '—'} / ${counts.open_loops ?? '—'}`),
+      // 进程时长与主机开机时长必须分开写：线上这台机器已经开了 6 天，而芸汐可能
+      // 5 分钟前刚发完版。混在一起显示会让人以为新版本没生效。
+      stat('芸汐进程', status.process_uptime || '—',
+        `pid ${status.pid ?? '—'} · ${(status.process || '').replace('芸汐进程内存: ', '') || '内存未知'}`),
+      stat('主机', status.host_uptime || status.uptime || '—', '开机时长'),
+      statLink('PostgreSQL', database.ok ? '正常' : '异常',
+        database.ok ? fmtBytes(database.size_bytes) : (database.detail || '—'), 'memory'),
+      statLink('Redis', redis.ok ? '正常' : '异常', redis.detail || '—', 'memory'),
+      statLink('长期记忆', String(counts.memories ?? '—'), memoryBreakdown(counts), 'memory'),
+      statLink('情节', String(counts.episodes ?? '—'), 'Mind Episode', 'memory'),
+      statLink('人物', String(counts.people ?? '—'), 'canonical Person', 'memory'),
+      statLink('目标 / 线索', `${counts.goals ?? '—'} / ${counts.open_loops ?? '—'}`,
+        'Mind Agenda / OpenLoop', 'memory'),
     ));
 
-    const pendingRestart = (status.admin && status.admin.pending_restart) || [];
+    const pendingRestart = admin.pending_restart || [];
     if (pendingRestart.length) {
       page.append(h('div', { class: 'restart-note' },
         `有 ${pendingRestart.length} 个分区的改动已保存，但要重启进程才生效：`,
@@ -436,31 +472,42 @@
         '（按你的部署方式重启服务，例如 systemctl restart kovi-bot）。'));
     }
 
-    const model = status.model || {};
     const modelCard = h('div', { class: 'card' },
-      h('div', { class: 'card-head' }, h('h3', { text: '模型与调度' }),
-        h('span', { class: 'hint', text: `配置 ${status.config.path}` })),
+      h('div', { class: 'card-head' }, h('h3', { text: '模型与能力' }),
+        h('button', { class: 'btn ghost small', text: '去模型页', onclick: () => goto('model') })),
       h('dl', { class: 'kv schedule-kv' },
-        h('dt', { text: '外部模型' }), h('dd', { text: model.enabled ? `${model.model_name}（${model.endpoint}）` : '已关闭' }),
-        h('dt', { text: 'Token 环境变量' }), h('dd', { class: 'mono', text: model.api_key_env || '—' }),
+        h('dt', { text: '外部模型' }),
+        h('dd', { text: model.enabled === false
+          ? '已关闭（只用本地能力）'
+          : `${model.model_name || '—'}（${model.endpoint || '—'}）` }),
+        h('dt', { text: '模型密钥' }),
+        h('dd', { class: model.has_key ? 'ok-text' : 'bad-text', text: model.key_source_text || '未知' }),
         h('dt', { text: '本地 Intrinsic' }), h('dd', { text: model.intrinsic_enabled ? '启用' : '关闭' }),
         h('dt', { text: 'TurnGate' }), h('dd', { text: model.turn_gate_mode || '—' }),
-        h('dt', { text: '主动消息' }), h('dd', { text: status.scheduler.proactive_enabled ? '启用' : '关闭' }),
-        h('dt', { text: '群聊接话' }), h('dd', { text: status.scheduler.group_interjection_enabled ? '启用' : '关闭' }),
-        h('dt', { text: '工具' }), h('dd', { text: status.scheduler.tools_enabled ? '启用' : '关闭' }),
-        h('dt', { text: '视觉 Provider' }), h('dd', { text: status.scheduler.vision_provider || '—' }),
-        h('dt', { text: '实时通话' }), h('dd', { text: status.scheduler.qq_call_enabled ? '启用' : '关闭' }),
-        h('dt', { text: '配置文件' }), h('dd', { text: `${status.config.modified || '—'} · ${fmtBytes(status.config.bytes)}` }),
-        h('dt', { text: '管理会话' }), h('dd', { text: `${status.admin.sessions} 个 · 后台已运行 ${Math.floor(status.admin.uptime_secs / 60)} 分钟` }),
-      ));
+        h('dt', { text: '主动消息' }), h('dd', { text: scheduler.proactive_enabled ? '启用' : '关闭' }),
+        h('dt', { text: '群聊接话' }), h('dd', { text: scheduler.group_interjection_enabled ? '启用' : '关闭' }),
+        h('dt', { text: '工具' }), h('dd', { text: scheduler.tools_enabled ? '启用' : '关闭' }),
+        h('dt', { text: '视觉' }), h('dd', { text: scheduler.vision_provider || '—' }),
+        // 她"能不能用某种方式说话"是运维最常确认的一件事，四个出口都给出来。
+        h('dt', { text: '语音 / 唱歌' }),
+        h('dd', { text: `${scheduler.voice_enabled ? '语音启用' : '语音关闭'} · ${scheduler.sing_enabled ? '唱歌启用' : '唱歌关闭'}` }),
+        h('dt', { text: '表情包' }),
+        h('dd', {}, stickerSummary(scheduler)),
+        h('dt', { text: '实时通话' }), h('dd', { text: scheduler.qq_call_enabled ? '启用' : '关闭' })),
+      h('div', { class: 'hint', text: `配置文件 ${configInfo.path || '—'} · 修改于 ${configInfo.modified || '—'} · ${fmtBytes(configInfo.bytes)}；后台会话 ${admin.sessions ?? 0} 个，已运行 ${Math.floor((admin.uptime_secs || 0) / 60)} 分钟。` }));
 
     // 先取数据再拼版：两栏要一起进场，避免右栏比左栏晚一拍。
-    const recent = await api('/api/memory/records?limit=12');
-    const list = h('div', { class: 'record-list' });
-    if (!recent.items.length) {
-      list.append(h('div', { class: 'empty', text: '还没有记忆记录' }));
+    let recent = { items: [] };
+    try {
+      recent = await api('/api/memory/records?limit=8');
+    } catch (_) {
+      // 记忆库拿不到不该把整页带走：下面会显示一行说明。
     }
-    for (const item of recent.items) {
+    const list = h('div', { class: 'record-list' });
+    if (!(recent.items || []).length) {
+      list.append(h('div', { class: 'empty', text: '暂时读不到记忆记录' }));
+    }
+    for (const item of recent.items || []) {
       list.append(recordNode(item, () => { goto('memory').then(() => openRecord(item)); }, false));
     }
     const recentCard = h('div', { class: 'card' },
@@ -469,6 +516,45 @@
       list);
 
     page.append(h('div', { class: 'overview-split' }, modelCard, recentCard));
+  }
+
+  /** 记忆总量的构成：`total` 里含 2901 条旧版记忆，只写"639 / 共 4196"容易被读成矛盾。 */
+  function memoryBreakdown(counts) {
+    const byKind = counts.by_kind || {};
+    // `memory` 必须排第一：它就是这张卡片的数字本身，落到"其它"里会让人找不到。
+    const names = [
+      ['memory', '记忆'], ['legacy_memory', '旧版'], ['episode', '情节'],
+      ['user_profile', '用户档案'], ['agenda', '议程'], ['group_profile', '群档案'],
+      ['summary', '摘要'],
+    ];
+    const shown = names
+      .filter(([key]) => (byKind[key] || 0) > 0)
+      .slice(0, 4);
+    const parts = shown.map(([key, label]) => `${label} ${byKind[key]}`);
+    // 只排除**真正列出来**的那几档：把"有名字但没列出来"的也算进"其它"，
+    // 各档加起来才等于 total（否则总和对不上，一眼就看出这行在糊弄人）。
+    const rest = Object.entries(byKind)
+      .filter(([key, value]) => value > 0 && !shown.some(([known]) => known === key))
+      .reduce((sum, [, value]) => sum + value, 0);
+    if (rest > 0) parts.push(`其它 ${rest}`);
+    const total = counts.total ?? '—';
+    return parts.length ? `共 ${total} 条：${parts.join(' · ')}` : `共 ${total} 条记录`;
+  }
+
+  /** 表情包那行：开关与素材数量是两件事，分开说才看得出卡在哪一步。 */
+  function stickerSummary(scheduler) {
+    if (!scheduler.sticker_enabled) {
+      return h('span', { text: '关闭' });
+    }
+    if (!scheduler.sticker_files) {
+      return h('span', {}, '已启用，但素材库是空的 ',
+        h('button', {
+          class: 'link-toggle', type: 'button', text: '去上传',
+          onclick: () => goto('stickers'),
+        }));
+    }
+    return h('span', { class: 'ok-text' },
+      `可用 ${scheduler.sticker_files} 张（${scheduler.sticker_labels} 个标签）`);
   }
 
   // ───────────────────────────── 配置 ─────────────────────────────
