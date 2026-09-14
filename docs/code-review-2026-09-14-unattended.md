@@ -435,7 +435,16 @@ revision 只是本地 SHA——万一这台 Mac 出问题，这个已上线的�
 
 ---
 
-## 八、两点说明
+## 八、第四批修复（本轮两件大事）
+
+| 提交 | 问题 | 验证 |
+| --- | --- | --- |
+| `c4f7ef5` | **语义召回独有的记忆被静默丢弃**（`memory/mod.rs`）：`fuse_with_semantic` 只用词面结果建 `by_id`，再按融合顺序 `remove(&id)`——语义带出的、词面没有的 id 取不到就被丢掉（注释里"缺的补在最后"补的只是词面剩下的）。净效果是 embed 服务照常花钱、检索却等价于关键词匹配，而且**全程没有一个日志**。新增 `load_entries_by_id`，**作用域谓词与词面那一路逐字相同**（越界是隐私问题不是排序问题）。 | `semantic_by_id_load_stays_inside_the_requested_scope`（本地 PG 18 实测）：同 subject 异会话、异 subject 同会话各一条，断言按 id 补取只返回作用域内那条。 |
+| `e0f8337` | **外部内容之后的工具轮仍持全量可写工具**（`memory_query.rs`）：`native_tool_specs(&ctx, false)` 只在循环前算一次、执行一直走可写 `execute`，于是"看网页 → 注入文本 → 下一轮仍挂着 `group.message.send` / `reminder.create`"是通的，唯一防线是提示词里的一句话。改成：本轮有 `is_external_tool_name` 的工具成功，则下一轮清单收窄 + 执行走 `execute_read_only`（循环后那次调用同样收窄）。无外部内容时行为不变，`group.message.targets → send` 那条宿主数据的两轮流程不受影响。 | **只做到编译 + 既有用例 + 全量门禁通过，没有端到端测试**，已在提交信息里写明。要真测需要注入"先调 web.fetch 再调 send"的假模型与假 registry，属于要新搭测试脚手架，留作待办。 |
+
+---
+
+## 九、两点说明
 
 1. 上面第三、四节的条目里，标了具体行号的都经过至少一次源码复核；但除了
    「一、已修」、1.5 以及 2.1/2.4（均已在本地 PostgreSQL 上复现并落成回归测试，
