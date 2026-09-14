@@ -212,14 +212,24 @@ pub(crate) async fn params_model_with_tool_access(
     let mut group_message_send_attempted = false;
     let mut group_message_send_succeeded = false;
     let mut group_followup_succeeded = false;
-    // 原生 function-calling 清单：只包含本轮上下文可用的工具。
-    let tool_specs = registry.native_tool_specs(&tool_context, false);
+    // 一旦某一轮的结果里混进了外部（可被注入）内容，从**下一轮**开始就只给它挂只读
+    // 工具：网页/搜索结果是被注入的载体，模型据此发起的发送、提醒、改群状态都不该带
+    // 真实副作用。没有外部内容时保持全量——`group.message.targets` → `group.message.send`
+    // 那条两轮流程靠的是宿主自己给的数据，不受影响。
+    //
+    // 与兄弟路径一致：core_model 的跟进轮用 `native_tool_specs(ctx, tool_follow_up)`，
+    // delivery 在执行前再查一次 `available_read_only_for_context`，qq_call 直接走
+    // `execute_read_only`。这里原来两样都没做。
+    let mut untrusted_tool_output = false;
     // 工具循环的历史增量（assistant tool_calls / assistant 文本 / tool 结果 /
     // 修复 system 提示）统一以 wire 形式维护，保证与 API 历史严格同序：
     // 模型永远通过 provider 的 tool_calls 通道发起调用，不再依赖文本协议。
     let mut extra_wire: Vec<Value> = Vec::new();
 
     for round in 0..max_tool_rounds {
+        // 原生 function-calling 清单：只包含本轮上下文可用的工具；上一轮吃到外部内容
+        // 就收窄成只读。
+        let tool_specs = registry.native_tool_specs(&tool_context, untrusted_tool_output);
         let Some(payload) = interruptible_model_call_with_native_tools(
             &mut request,
             &extra_wire,
@@ -268,17 +278,31 @@ pub(crate) async fn params_model_with_tool_access(
                     if tool_name == "memory.search" {
                         memory_rounds += 1;
                     }
-                    registry
-                        .execute(
-                            &tool_name,
-                            call.arguments.clone(),
-                            tool_context.clone(),
-                            reply_ticket,
-                        )
-                        .await
+                    // 执行边界也要守：只靠清单收窄不够，模型仍可能报出上一轮见过的
+                    // 写工具名。
+                    if untrusted_tool_output {
+                        registry
+                            .execute_read_only(
+                                &tool_name,
+                                call.arguments.clone(),
+                                tool_context.clone(),
+                                reply_ticket,
+                            )
+                            .await
+                    } else {
+                        registry
+                            .execute(
+                                &tool_name,
+                                call.arguments.clone(),
+                                tool_context.clone(),
+                                reply_ticket,
+                            )
+                            .await
+                    }
                 };
                 if result.succeeded && is_external_tool_name(&tool_name) {
                     external_tool_succeeded = true;
+                    untrusted_tool_output = true;
                 }
                 if result.succeeded && matches!(tool_name.as_str(), "group.pause" | "group.resume")
                 {
@@ -547,10 +571,12 @@ pub(crate) async fn params_model_with_tool_access(
     extra_wire.push(system_wire(
         "本轮工具调用次数已用完。请使用已有结果直接回答，不要再发起工具调用。",
     ));
+    // 这一轮同样按"有没有吃到外部内容"决定清单，否则收窄会被这最后一次调用绕过。
+    let final_tool_specs = registry.native_tool_specs(&tool_context, untrusted_tool_output);
     let Some(response) = interruptible_model_call_with_native_tools(
         &mut request,
         &extra_wire,
-        &tool_specs,
+        &final_tool_specs,
         reply_ticket,
         max_output_tokens,
         vision_images,
