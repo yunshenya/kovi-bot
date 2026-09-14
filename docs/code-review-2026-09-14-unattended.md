@@ -444,7 +444,36 @@ revision 只是本地 SHA——万一这台 Mac 出问题，这个已上线的�
 
 ---
 
-## 九、两点说明
+## 九、第五批修复 + 上线（2026-09-14）
+
+| 提交 | 问题 |
+| --- | --- |
+| `d2a95d7` | `Situation::expire` 的守卫手写 `Planned｜Unknown`，与转换表的 `(OutcomeUnknown, Expired)` 不一致 → 维护路径置成的 `OutcomeUnknown` 永远过期不掉、却占着 Active 名额，8 个槽位满后 `add_situation` 永久失败。改用 `can_transition` 当守卫。（测试实测退回旧守卫会红。） |
+| `b15fef4` | 三处边界：TTS 的 `X-Sample-Rate` 无上界（决定截断长度、可溢出 u32）；传感器状态表满时新传感器拿不到槽位 → 每次轮询写一条假世界事实 + open loop；`metrics::flush` 先 drain 再写、被取消就永久丢一窗计数。 |
+| `428a79e` | 存储侧两处：`yunxi_message_mappings` 补 `created_at` 索引（保留期删除原本全表扫）；旧记忆投影不再用 `.ok()` 静默丢弃（标签按字符截 40/48、Core 按字节限 64，30 汉字就超），改为打出 id 与原因。 |
+| `e872eae` | 两个 Python 服务的输入边界（`/v1/tts` 采样率夹到 8k..=96k 并排掉 bool；`/v1/sing` 补 `Content-Length` 上限与非法值处理）、reranker 补分批推理；`install-qq-call.sh` 的 pin 切不过去改为 `die` 并核对 HEAD；`patch-plugin-login-refresh.py` 的安静期守卫改为两条分支都插 + 写盘前断言。 |
+| `c898159` | 顺手修：发布后的 `[diag]` 用 `journalctl -n 200`，跨进程统计——本次就被它误导过一次（报 2 条，按启动时间过滤实际 0 条）。两处都改成 `--since` 服务启动时间。 |
+
+**上线**：`e872eae`，服务端原子切换 + readiness 通过，**本次启动以来 WARN/ERROR 为 0**，
+启动行 `World Model v4 已启用（shadow_mode=false）`。`c898159` 是脚本/工作流改动，
+不需要重新发布二进制。
+
+### 仍未做（需要行为取舍或更大改动，逐条列明）
+
+| 位置 | 问题 | 为什么没做 |
+| --- | --- | --- |
+| `delivery.rs:554` | 语音/唱歌合成发生在 30s precommit 租约内，合成慢一点整条回复被丢弃且不重试 | 要调整发送顺序（合成挪到 `begin_outgoing_commit` 之前），影响投递时序 |
+| `memory_transport.rs:138` | 退避检查无条件拦截，控制回执也被挡；`#结束禁言` 清不掉 send guard，管理员看不出群仍被压着 | 要决定"控制回执是否豁免"与解禁时是否清退避 |
+| `admin/config_api.rs:250` | 配置接口返回未打码的 `raw`，前端直接渲染 → 密钥进屏幕/截图 | 改对外接口行为，且要与"打码值表示不修改"的写回约定一起设计 |
+| `consolidation.rs:468/544/694/759` | 陈旧批次时间戳会让整批反思被丢弃（只有 Interest 有防回退守卫） | 涉及反思管线语义 |
+| `group_access.rs:196` | 通话授权名单用固定 `.json.tmp` 且快照在释放锁之后写，并发授权可能让旧快照覆盖新的撤销 | 要考虑持有的锁范围 |
+| `memory_store.rs:197` | 保留期清理在全局排他锁内逐行级联删除，一次可放大到数万条语句 | 要改成分批，动的是维护事务边界 |
+| `turn_gate_runtime.rs:203` | `#turn-gate-status` 报的是配置里的 mode，而实际用的是 install 时冻结的那个 | 涉及 `RESTART_SECTIONS` 的运维约定 |
+| `memory/mod.rs:497` | 全进程唯一生产连接池写死 `max_connections(5)`、无 `acquire_timeout` | 容量决策：同一份巡检记录该机内存紧张、swap 已在用，需你按整机余量定 |
+
+---
+
+## 十、两点说明
 
 1. 上面第三、四节的条目里，标了具体行号的都经过至少一次源码复核；但除了
    「一、已修」、1.5 以及 2.1/2.4（均已在本地 PostgreSQL 上复现并落成回归测试，
