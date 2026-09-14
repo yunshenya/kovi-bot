@@ -626,7 +626,7 @@ fi
 ssh "${ssh_opts[@]}" -p "$port" "$host" \
   "systemctl --no-pager --full -n 0 status kovi-bot.service; \
    printf '\n[diag] 本次启动以来的 WARN/ERROR 条数: '; \
-   journalctl -u kovi-bot.service --since "$(systemctl show -p ActiveEnterTimestamp --value kovi-bot.service)" --no-pager -o cat 2>/dev/null \
+   journalctl -u kovi-bot.service --since \"\$(systemctl show -p ActiveEnterTimestamp --value kovi-bot.service)\" --no-pager -o cat 2>/dev/null \
      | grep -cE '^\[(WARN|ERROR)\]' || true" || true
 
 info "revision: $revision"
