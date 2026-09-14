@@ -108,6 +108,42 @@ pub(crate) async fn begin_reply_locked(
     true
 }
 
+/// 这些源消息是否已经由某一轮回复回答过（含正在进行的那一轮）。
+///
+/// 群聊 waiting room（`PENDING_WINDOW_MESSAGES`）只保留"还没人回答"的 turn：
+/// 一条消息可能同时被 Core 链路回答、又被 Host 链路排进队列，排空时若不再
+/// 检查一次，同一条消息会被答第二遍。
+///
+/// 判据必须是**真的发出过消息**：
+/// - 正在进行的这一轮要 `sent_message_ids` 非空才算（它完全可能最终沉默，
+///   那一刻把它当成"答过"就会把排队的那条消息一起丢掉——线上 18:33 的
+///   三条正是"Core 想过但没发"，不能再让它们连排空的机会都没有）；
+/// - 收尾的轮次只把发过消息的记进 `recent_replies`（`finish_reply_locked`
+///   的判断），所以这里直接看即可。
+pub(crate) async fn source_messages_already_answered(
+    scope: ReplyScope,
+    message_ids: &[i32],
+) -> bool {
+    if message_ids.is_empty() {
+        return false;
+    }
+    let lifecycles = REPLY_LIFECYCLES.lock().await;
+    let Some(lifecycle) = lifecycles.get(&scope) else {
+        return false;
+    };
+    let answered = |source_ids: &Vec<i32>| {
+        source_ids
+            .iter()
+            .any(|source_id| message_ids.contains(source_id))
+    };
+    lifecycle.active.as_ref().is_some_and(|active| {
+        !active.sent_message_ids.is_empty() && answered(&active.source_message_ids)
+    }) || lifecycle
+        .recent_replies
+        .iter()
+        .any(|recent| answered(&recent.source_message_ids))
+}
+
 pub(crate) async fn finish_reply(scope: ReplyScope, ticket: ReplyTicket) {
     let lock = scope_mutex(scope);
     let _scope_guard = lock.lock().await;
@@ -659,8 +695,8 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
 mod tests {
     use super::{
         REPLY_LIFECYCLES, ReplyLifecycle, begin_reply, finish_reply, normalize_recall_message_ids,
-        parse_recall_notice, record_recent_bot_message, record_standalone_bot_message,
-        remove_bot_messages,
+        parse_recall_notice, record_committed_bot_message, record_recent_bot_message,
+        record_standalone_bot_message, remove_bot_messages, source_messages_already_answered,
     };
     use crate::model::interrupt::{
         ReplyScope, clear_reply_state_locked, interrupt, is_active, scope_mutex,
@@ -721,6 +757,53 @@ mod tests {
         remove_bot_messages(&mut lifecycle, &[10, 999]);
         assert_eq!(lifecycle.recent_bot_messages.len(), 1);
         assert_eq!(lifecycle.recent_bot_messages[0].message_id, 11);
+    }
+
+    /// 排空群聊 waiting room 时的判据：只有**真的发出过消息**的轮次才算
+    /// 回答过；"登记了但一个字没发"的轮次不能把排队的消息判成已答，否则
+    /// Core 想过但沉默的那些消息会被永久丢掉（线上 18:33 那三条就是这样
+    /// 既没被答、又可能被"看起来答过"而丢弃）。
+    #[test]
+    fn answered_source_messages_require_a_real_send() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let scope = ReplyScope::Group(9_000_101);
+                assert!(
+                    !source_messages_already_answered(scope, &[701]).await,
+                    "没有登记过任何轮次时一律算没答过"
+                );
+
+                let silent = interrupt(scope).await;
+                assert!(begin_reply(scope, silent, vec![701]).await);
+                assert!(
+                    !source_messages_already_answered(scope, &[701]).await,
+                    "只登记、没发出的轮次不算回答——它随时可能沉默收场"
+                );
+                finish_reply(scope, silent).await;
+                assert!(
+                    !source_messages_already_answered(scope, &[701]).await,
+                    "静默收尾之后仍然算没答过"
+                );
+
+                let answered = interrupt(scope).await;
+                assert!(begin_reply(scope, answered, vec![702]).await);
+                assert!(
+                    record_committed_bot_message(scope, answered, 80_001, "答一句").await,
+                    "发出可见消息后应当记账"
+                );
+                assert!(
+                    source_messages_already_answered(scope, &[702]).await,
+                    "正在进行的这一轮算已回答"
+                );
+                finish_reply(scope, answered).await;
+                assert!(
+                    source_messages_already_answered(scope, &[702]).await,
+                    "收尾后仍然记得它答过"
+                );
+                assert!(!source_messages_already_answered(scope, &[703]).await);
+                assert!(!source_messages_already_answered(scope, &[]).await);
+            });
     }
 
     #[test]

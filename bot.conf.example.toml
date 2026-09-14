@@ -69,6 +69,13 @@ per_user_limit = 20
 global_limit = 300
 cooldown_secs = 120
 max_pending_turns = 16
+# 群聊 waiting room 看门狗的扫描间隔（秒，5~600）。队列只在"有在途回合"
+# 时才该非空，排空由回合收尾触发；Core 链路收尾、panic、取消这些路径不会
+# 触发它，一旦漏掉就会自锁（队列非空 → 后面每条本该回的消息继续排队 →
+# 永远没人排空：线上 2026-09-14 18:33 主群就这么静了 4 分钟，且 journal 里
+# "排队"8 次、"排空"0 次）。看门狗每这个间隔扫一遍"队列非空且会话空闲"的
+# 群补踢一次，间隔就是这个上限：太短是白扫，太长等于群里继续沉默。
+window_drain_sweep_secs = 30
 max_input_chars = 6000
 max_model_response_bytes = 2097152
 max_model_queue = 64

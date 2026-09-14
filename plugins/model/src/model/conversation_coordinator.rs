@@ -47,6 +47,62 @@ pub(crate) enum OutgoingExecutiveDecision {
     Defer,
 }
 
+/// waiting room 的归属：这条消息立刻处理、正常排队，还是入队后要立刻排空。
+///
+/// 群聊与私聊共用同一份判据：两条链路曾经各写一份 `should_queue_after_executive`，
+/// 而它们要回答的其实是同一个问题，写两份只会漂移。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WindowQueueDecision {
+    /// 没有在途工作：直接处理这一条。
+    Process,
+    /// 有在途工作：排进 waiting room，等它收尾时排空。
+    Queue,
+    /// waiting room 是**没人管的残局**（非空，却没有任何在途工作）：先入队
+    /// 保住 FIFO 顺序，再让调用方立刻踢一次排空。
+    QueueThenDrain,
+}
+
+/// 一次回复回合的归属结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WindowClaim {
+    /// 拿到了回合处理权：调用方立刻生成回复。
+    Claimed(ReplyTicket),
+    /// 已经进入 waiting room，等有在途工作的那个回合收尾时排空。
+    Queued,
+    /// 已经进入 waiting room，但当前**没有任何在途工作**——waiting room 是
+    /// 残局，调用方必须立刻踢一次排空，否则这条消息会和队列一起烂在里面。
+    QueuedNeedsDrain,
+}
+
+/// 这条消息该不该进 waiting room。
+///
+/// `has_queued` **只在确实有在途工作时**才要求继续排队。队列非空本身说明
+/// "还有人在等"，但如果没有在途回合/待定 admission，它就是没人排空的残局
+/// ——继续入队会让它永远排不完：线上 2026-09-14 18:33 主群就这么静了四分多钟
+/// （journal 里"排队"8 次、"排空"0 次），因为 `has_queued` 曾经是单独成立的
+/// 条件，而排空只在 Host 链路回合收尾时才被触发。残局现在由调用方入队保序后
+/// 立刻排空，看门狗另有一层兜底（`sweep_group_window_queues`）。
+pub(crate) fn window_queue_decision(
+    active: bool,
+    has_queued: bool,
+    has_pending_admission: bool,
+    decision: OutgoingExecutiveDecision,
+    preserved_prepared: bool,
+) -> WindowQueueDecision {
+    let in_flight = active || has_pending_admission || preserved_prepared;
+    if preserved_prepared
+        || has_pending_admission
+        || (active && decision == OutgoingExecutiveDecision::Keep)
+        || (has_queued && in_flight)
+    {
+        return WindowQueueDecision::Queue;
+    }
+    if has_queued {
+        return WindowQueueDecision::QueueThenDrain;
+    }
+    WindowQueueDecision::Process
+}
+
 /// The semantic effect of the newest inbound turn on prepared content.
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

@@ -12,7 +12,8 @@ use crate::model::coalesce::{MessageCoalescer, MessagePart};
 use crate::model::{
     ConversationCoordinator, group_message_event_after_ingress,
     private_message_event_after_ingress, recall_notice_event, record_group_message_observation,
-    record_group_target_experience, should_suppress_core_group_message,
+    record_group_target_experience, should_suppress_core_group_message, sweep_group_window_queues,
+    sweep_private_window_queues,
 };
 use kovi::PluginBuilder;
 use std::path::{Path, PathBuf};
@@ -174,6 +175,9 @@ pub mod test_support {
 /// 后台任务启动标志，确保只启动一次
 static BACKGROUND_TASK_STARTED: AtomicBool = AtomicBool::new(false);
 const DATABASE_INIT_MAX_ATTEMPTS: u32 = 8;
+/// waiting room 看门狗单轮的上限：一次扫几个群、每群最多几条回合，正常是
+/// 毫秒级；超过这个时间说明某一环卡住了，丢掉这一轮比卡死整条看门狗好。
+const WINDOW_DRAIN_SWEEP_TIMEOUT_SECS: u64 = 60;
 
 /// Exactly one runtime owns a message that may produce a visible reply. Core
 /// observation-only group chatter is classified before this selection.
@@ -875,6 +879,40 @@ async fn main() {
                 let check_interval = config::get().mood().natural_drift_check_secs();
                 kovi::tokio::time::sleep(kovi::tokio::time::Duration::from_secs(check_interval))
                     .await;
+            }
+        });
+
+        // 群聊/私聊 waiting room 看门狗。
+        //
+        // 排队只在"有在途回合"时发生，排空由那个回合收尾时触发；但 Core 链路
+        // 收尾、panic、取消都不走那条路径，队列一旦漏掉就会自锁：队列非空 →
+        // 后面每条本该回的消息继续排队 → 永远没人排空（线上 2026-09-14 18:33
+        // 主群静了四分多钟，journal 里"排队"8 次、"排空"0 次）。这里每
+        // `traffic.window_drain_sweep_secs` 扫一遍"队列非空却没人管"的会话补踢
+        // 一次。整轮加超时：看门狗自己卡住就等于没有看门狗（记忆向量回填那条
+        // 循环上踩过同一个坑），超时只丢这一轮，下一轮照常。
+        let window_drain_bot = Arc::clone(&proactive_bot);
+        kovi::tokio::spawn(async move {
+            loop {
+                // 下限兜一层：配置校验已经拒绝 0，但这里再夹一次，避免任何
+                // 热重载路径把它变成 0 之后这条循环变成空转。
+                let sweep_secs = config::get().traffic().window_drain_sweep_secs().max(5);
+                kovi::tokio::time::sleep(kovi::tokio::time::Duration::from_secs(sweep_secs)).await;
+                let sweep = async {
+                    sweep_group_window_queues(&window_drain_bot).await;
+                    sweep_private_window_queues(&window_drain_bot).await;
+                };
+                if kovi::tokio::time::timeout(
+                    kovi::tokio::time::Duration::from_secs(WINDOW_DRAIN_SWEEP_TIMEOUT_SECS),
+                    sweep,
+                )
+                .await
+                .is_err()
+                {
+                    eprintln!(
+                        "[WARN] waiting room 看门狗超时（{WINDOW_DRAIN_SWEEP_TIMEOUT_SECS} 秒未返回），下一轮继续"
+                    );
+                }
             }
         });
 

@@ -11,6 +11,13 @@ pub struct TrafficConfig {
     global_limit: usize,
     cooldown_secs: u64,
     max_pending_turns: usize,
+    /// 群聊 waiting room 看门狗的扫描间隔（秒）。
+    ///
+    /// 队列只在"有在途回合"时才该非空，排空由回合收尾触发；但 Core 链路
+    /// 收尾、panic、取消这些路径不会触发它，队列一旦被落在后面就会自锁
+    /// （`has_queued` 曾让后续消息一直排队，而排空永远不发生）。看门狗每
+    /// 这个间隔扫一遍"队列非空且会话空闲"的群补踢一次，是最后一道保险。
+    window_drain_sweep_secs: u64,
     max_input_chars: usize,
     max_model_response_bytes: usize,
     max_model_queue: usize,
@@ -40,6 +47,10 @@ impl TrafficConfig {
 
     pub fn max_pending_turns(&self) -> usize {
         self.max_pending_turns
+    }
+
+    pub fn window_drain_sweep_secs(&self) -> u64 {
+        self.window_drain_sweep_secs
     }
 
     pub fn max_input_chars(&self) -> usize {
@@ -72,6 +83,11 @@ impl TrafficConfig {
                 "traffic.max_pending_turns 必须在 1 到 128 之间"
             ));
         }
+        if !(5..=600).contains(&self.window_drain_sweep_secs) {
+            return Err(anyhow::anyhow!(
+                "traffic.window_drain_sweep_secs 必须在 5 到 600 之间"
+            ));
+        }
         if !(256..=32_000).contains(&self.max_input_chars) {
             return Err(anyhow::anyhow!(
                 "traffic.max_input_chars 必须在 256 到 32000 之间"
@@ -100,6 +116,7 @@ impl Default for TrafficConfig {
             global_limit: 300,
             cooldown_secs: 120,
             max_pending_turns: 16,
+            window_drain_sweep_secs: 30,
             max_input_chars: 6_000,
             max_model_response_bytes: 2 * 1024 * 1024,
             max_model_queue: 64,
@@ -115,5 +132,24 @@ mod tests {
     #[test]
     fn defaults_are_valid() {
         assert!(TrafficConfig::default().validate().is_ok());
+    }
+
+    /// 看门狗间隔是"队列卡住之后多久被救回来"的上限：太短是白扫，太长等于
+    /// 群里继续沉默，所以既拒绝 0 也拒绝小时级的值。
+    #[test]
+    fn window_drain_sweep_interval_is_bounded() {
+        let mut config = TrafficConfig::default();
+        assert_eq!(config.window_drain_sweep_secs(), 30);
+
+        config.window_drain_sweep_secs = 0;
+        assert!(config.validate().is_err());
+        config.window_drain_sweep_secs = 4;
+        assert!(config.validate().is_err());
+        config.window_drain_sweep_secs = 601;
+        assert!(config.validate().is_err());
+        config.window_drain_sweep_secs = 5;
+        assert!(config.validate().is_ok());
+        config.window_drain_sweep_secs = 600;
+        assert!(config.validate().is_ok());
     }
 }

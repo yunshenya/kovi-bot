@@ -66,10 +66,13 @@ pub(crate) use crate::model::group::{
     group_conversation_focus_user_now, group_message_event_after_ingress,
     group_reply_budget_available_now, group_reply_budget_snapshot, note_group_conversation_focus,
     record_group_message_observation, record_group_target_experience, release_group_reply_slot,
-    reserve_group_chat_reply_slot, should_suppress_core_group_message,
+    reserve_group_chat_reply_slot, should_suppress_core_group_message, sweep_group_window_queues,
 };
 
-pub(crate) use crate::model::private::private_message_event_after_ingress;
+pub(crate) use crate::model::private::{
+    private_message_event_after_ingress, sweep_private_window_queues,
+};
 pub(crate) use crate::model::recall::{
     is_recent_bot_message, recall_notice_event, send_tracked_private_message,
+    source_messages_already_answered,
 };

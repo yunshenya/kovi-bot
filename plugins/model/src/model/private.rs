@@ -4,7 +4,8 @@ use crate::group_access;
 use crate::memory::MEMORY_MANAGER;
 use crate::model::coalesce::{MessageCoalescer, MessagePart};
 use crate::model::conversation_coordinator::{
-    ConversationCoordinator, IncomingAdmission, OutgoingExecutiveDecision, PendingTurn,
+    ConversationCoordinator, IncomingAdmission, PendingTurn, WindowClaim, WindowQueueDecision,
+    window_queue_decision,
 };
 use crate::model::interrupt::{
     ReplyScope, ReplyTicket, clear_reply_state_locked, is_active, scope_mutex,
@@ -824,7 +825,7 @@ pub(crate) async fn private_message_event_after_ingress(
         );
         return;
     };
-    let Some(reply_ticket) = claim_or_queue_private_reply(
+    let reply_ticket = match claim_or_queue_private_reply(
         reply_scope,
         admission,
         user_id,
@@ -836,8 +837,12 @@ pub(crate) async fn private_message_event_after_ingress(
         understanding.clone(),
     )
     .await
-    else {
-        return;
+    {
+        claim @ (WindowClaim::Queued | WindowClaim::QueuedNeedsDrain) => {
+            settle_private_window_claim(claim, user_id, &bot).await;
+            return;
+        }
+        WindowClaim::Claimed(ticket) => ticket,
     };
     private_chat_claimed(
         user_id,
@@ -855,6 +860,15 @@ pub(crate) async fn private_message_event_after_ingress(
     drain_pending_private_messages(user_id, Arc::clone(&bot), reply_ticket).await;
 }
 
+/// 私聊侧同群聊：`QueuedNeedsDrain` 表示队列是没人管的残局（Core 链路收尾、
+/// panic、取消都可能把它落下），必须立刻排空，否则这条消息会一直躺在内存里
+/// 等到进程重启。
+async fn settle_private_window_claim(claim: WindowClaim, user_id: i64, bot: &Arc<RuntimeBot>) {
+    if claim == WindowClaim::QueuedNeedsDrain {
+        drain_pending_private_messages_from_current(user_id, bot).await;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn claim_or_queue_private_reply(
     scope: ReplyScope,
@@ -866,7 +880,7 @@ async fn claim_or_queue_private_reply(
     message_ids: Vec<i32>,
     sticker_teaching_message: Option<Message>,
     understanding: MessageUnderstanding,
-) -> Option<crate::model::ReplyTicket> {
+) -> WindowClaim {
     let scope_lock = scope_mutex(scope);
     let _scope_guard = scope_lock.lock().await;
     let active = ConversationCoordinator::is_active_locked(scope).await;
@@ -877,16 +891,18 @@ async fn claim_or_queue_private_reply(
         .is_some_and(|queue| !queue.is_empty());
     let has_pending_admission =
         ConversationCoordinator::has_other_pending_incoming_locked(admission).await;
-    if should_queue_after_executive(
+    let queue_decision = window_queue_decision(
         active,
         has_queued,
         has_pending_admission,
         admission.decision,
         admission.preserved_prepared,
-    ) {
+    );
+    if queue_decision != WindowQueueDecision::Process {
         println!(
-            "[INFO] 私聊已有回复或排队消息进行中，排队新消息 (用户: {})",
-            user_id
+            "[INFO] 私聊已有回复或排队消息进行中，排队新消息 (用户: {}, 立刻排空: {})",
+            user_id,
+            queue_decision == WindowQueueDecision::QueueThenDrain,
         );
         queue_pending_private_message(
             user_id,
@@ -901,11 +917,14 @@ async fn claim_or_queue_private_reply(
         // The payload now lives in the FIFO; release this admission's own
         // coordinator reservation so it cannot block the next turn.
         ConversationCoordinator::abandon_incoming_locked(admission).await;
-        return None;
+        return match queue_decision {
+            WindowQueueDecision::QueueThenDrain => WindowClaim::QueuedNeedsDrain,
+            _ => WindowClaim::Queued,
+        };
     }
     let ticket = admission.ticket;
     if ConversationCoordinator::begin_reply_locked(scope, ticket, message_ids.clone()).await {
-        Some(ticket)
+        WindowClaim::Claimed(ticket)
     } else {
         // A newer semantic hand-off may have won between refinement and this
         // claim. Keep the complete turn for the FIFO instead of dropping it.
@@ -920,7 +939,7 @@ async fn claim_or_queue_private_reply(
         )
         .await;
         ConversationCoordinator::abandon_incoming_locked(admission).await;
-        None
+        WindowClaim::Queued
     }
 }
 
@@ -1311,19 +1330,6 @@ fn parse_task_id(value: &str) -> Option<i64> {
     (task_id > 0).then_some(task_id)
 }
 
-fn should_queue_after_executive(
-    active: bool,
-    has_queued: bool,
-    has_pending_admission: bool,
-    decision: OutgoingExecutiveDecision,
-    preserved_prepared: bool,
-) -> bool {
-    preserved_prepared
-        || has_queued
-        || has_pending_admission
-        || (active && decision == OutgoingExecutiveDecision::Keep)
-}
-
 async fn send_private_direct_response(
     bot: &Arc<RuntimeBot>,
     user_id: i64,
@@ -1363,6 +1369,38 @@ async fn drain_pending_private_messages_from_current(user_id: i64, bot: &Arc<Run
     let scope = ReplyScope::Private(user_id);
     if let Some(ticket) = ConversationCoordinator::current_ticket(scope).await {
         drain_pending_private_messages(user_id, Arc::clone(bot), ticket).await;
+        return;
+    }
+    // 同群聊：没有回复状态时队列永远排不空，宁可丢掉并告警。
+    let dropped = PENDING_PRIVATE_MESSAGES
+        .lock()
+        .await
+        .remove(&user_id)
+        .map_or(0, |queue| queue.len());
+    if dropped > 0 {
+        println!(
+            "[WARN] 私聊回复状态已不存在，丢弃 {} 条排队消息 (用户: {})",
+            dropped, user_id
+        );
+    }
+}
+
+/// 队列非空的私聊用户（看门狗用）。同群聊：等锁而不是 `try_lock`，漏扫一次
+/// 就是"这个人继续等一个间隔"。
+async fn pending_private_user_ids() -> Vec<i64> {
+    let pending = PENDING_PRIVATE_MESSAGES.lock().await;
+    pending
+        .iter()
+        .filter(|(_, queue)| !queue.is_empty())
+        .map(|(user_id, _)| *user_id)
+        .collect()
+}
+
+/// 看门狗：把"队列非空却没人排空"的私聊补踢一次。与群聊同因同解——排空只在
+/// 回合收尾时触发，Core 链路收尾、panic、取消都不走那里。
+pub(crate) async fn sweep_private_window_queues(bot: &Arc<RuntimeBot>) {
+    for user_id in pending_private_user_ids().await {
+        drain_pending_private_messages_from_current(user_id, bot).await;
     }
 }
 
@@ -1411,10 +1449,18 @@ async fn drain_pending_private_messages(
     bot: Arc<RuntimeBot>,
     mut completed: crate::model::ReplyTicket,
 ) {
+    let mut drained = 0_usize;
     loop {
         let Some((pending, ticket)) = take_pending_private_turn(user_id, completed).await else {
+            if drained > 0 {
+                println!(
+                    "[INFO] 私聊排队窗口已排空 (用户: {}, 本轮处理 {} 条)",
+                    user_id, drained
+                );
+            }
             return;
         };
+        drained += 1;
 
         println!("[INFO] 私聊开始处理排队消息 (用户: {})", user_id);
         private_chat_claimed(
@@ -1444,6 +1490,23 @@ async fn take_pending_private_turn(
             let _scope_guard = scope_lock.lock().await;
             let mut pending_by_user = PENDING_PRIVATE_MESSAGES.lock().await;
             let queue = pending_by_user.entry(user_id).or_default();
+            // 与群聊同一套去重：Core 链路可能已经回过这条消息，Host 链路又把它
+            // 排进了这里，不再检查一次就会答第二遍（判据见 recall 模块）。
+            while let Some(oldest) = queue.front() {
+                let answered =
+                    crate::model::source_messages_already_answered(scope, &oldest.message_ids)
+                        .await;
+                if !answered {
+                    break;
+                }
+                let Some(dropped) = queue.pop_front() else {
+                    break;
+                };
+                println!(
+                    "[INFO] 私聊排队消息已被回复覆盖，丢弃 (用户: {}, 消息: {:?})",
+                    user_id, dropped.message_ids
+                );
+            }
             let result =
                 ConversationCoordinator::claim_next_locked(scope, &mut completed, queue).await;
             let should_wait = result.is_none()
@@ -1468,8 +1531,7 @@ mod tests {
     use super::{
         AgentTaskCommand, PENDING_PRIVATE_MESSAGES, admit_understood_private_turn,
         normalized_private_sender_name, parse_agent_task_command, queue_pending_private_message,
-        select_recent_images, should_queue_after_executive, take_pending_private_turn,
-        with_recent_image_context,
+        select_recent_images, take_pending_private_turn, with_recent_image_context,
     };
     use crate::model::conversation_coordinator::{
         ConversationCoordinator, OutgoingExecutiveDecision,
@@ -1482,14 +1544,24 @@ mod tests {
 
     #[test]
     fn preserved_prepared_reply_queues_the_new_private_turn() {
-        assert!(should_queue_after_executive(
-            false,
-            false,
-            false,
-            OutgoingExecutiveDecision::Keep,
-            true,
-        ));
+        // "保留下来的 prepared" 必须排队：它代表已经有一份待发的内容在等这一轮。
+        assert_eq!(
+            window_queue_decision(false, false, false, OutgoingExecutiveDecision::Keep, true),
+            WindowQueueDecision::Queue
+        );
+        // 队列非空但没有任何在途工作 = 残局，必须要求立刻排空（同群聊判据）。
+        assert_eq!(
+            window_queue_decision(
+                false,
+                true,
+                false,
+                OutgoingExecutiveDecision::Rewrite,
+                false
+            ),
+            WindowQueueDecision::QueueThenDrain
+        );
     }
+    use crate::model::conversation_coordinator::{WindowQueueDecision, window_queue_decision};
     use crate::private_image_memory::{recent_private_images, remember_private_images};
     use crate::vision::{ImageAttachment, VisionImage};
 

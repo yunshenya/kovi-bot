@@ -8,7 +8,8 @@ use crate::health_check::HealthChecker;
 use crate::memory::{GroupProfile, MEMORY_MANAGER};
 use crate::model::coalesce::{MessageCoalescer, MessagePart};
 use crate::model::conversation_coordinator::{
-    ConversationCoordinator, IncomingAdmission, OutgoingExecutiveDecision, PendingTurn,
+    ConversationCoordinator, IncomingAdmission, PendingTurn, WindowClaim, WindowQueueDecision,
+    window_queue_decision,
 };
 use crate::model::conversation_state::{ConversationDecision, GroupConversationState};
 use crate::model::interrupt::{
@@ -1117,7 +1118,7 @@ pub(crate) async fn group_message_event_after_ingress(
         {
             eprintln!("[ERROR] 群聊保存表情包使用记录失败: {}", error);
         }
-        let Some(ticket) = claim_or_queue_group_reply(
+        let claim = claim_or_queue_group_reply(
             reply_scope,
             admission,
             true,
@@ -1130,8 +1131,8 @@ pub(crate) async fn group_message_event_after_ingress(
             sticker_teaching_message.clone(),
             understanding.clone(),
         )
-        .await
-        else {
+        .await;
+        let Some(ticket) = settle_window_claim(claim, group_id, &bot).await else {
             return;
         };
         let turn_marker = begin_conversation_turn(group_id, event.user_id, &understanding).await;
@@ -1169,7 +1170,7 @@ pub(crate) async fn group_message_event_after_ingress(
         {
             eprintln!("[ERROR] 群聊保存表情包使用记录失败: {}", error);
         }
-        let Some(ticket) = claim_or_queue_group_reply(
+        let claim = claim_or_queue_group_reply(
             reply_scope,
             admission,
             true,
@@ -1182,8 +1183,8 @@ pub(crate) async fn group_message_event_after_ingress(
             sticker_teaching_message.clone(),
             understanding.clone(),
         )
-        .await
-        else {
+        .await;
+        let Some(ticket) = settle_window_claim(claim, group_id, &bot).await else {
             return;
         };
         let turn_marker = begin_conversation_turn(group_id, event.user_id, &understanding).await;
@@ -1224,7 +1225,7 @@ pub(crate) async fn group_message_event_after_ingress(
         {
             eprintln!("[ERROR] 群聊保存表情包使用记录失败: {}", error);
         }
-        let Some(ticket) = claim_or_queue_group_reply(
+        let claim = claim_or_queue_group_reply(
             reply_scope,
             admission,
             false,
@@ -1237,8 +1238,8 @@ pub(crate) async fn group_message_event_after_ingress(
             sticker_teaching_message.clone(),
             understanding.clone(),
         )
-        .await
-        else {
+        .await;
+        let Some(ticket) = settle_window_claim(claim, group_id, &bot).await else {
             return;
         };
         let turn_marker = begin_conversation_turn(group_id, event.user_id, &understanding).await;
@@ -1329,6 +1330,47 @@ async fn drain_pending_window_messages_from_current(group_id: i64, bot: &Arc<Run
     let scope = ReplyScope::Group(group_id);
     if let Some(ticket) = ConversationCoordinator::current_ticket(scope).await {
         drain_pending_window_messages(group_id, Arc::clone(bot), ticket).await;
+        return;
+    }
+    // 没有回复状态（例如本群数据刚被清除）时，队列留着只会永远排不空——
+    // 那正是这次要根除的形态。宁可丢掉这几条待处理消息并留一行告警，也不
+    // 要让这个群因为一口排不空的队列一直静音。
+    let dropped = PENDING_WINDOW_MESSAGES
+        .lock()
+        .await
+        .remove(&group_id)
+        .map_or(0, |queue| queue.len());
+    if dropped > 0 {
+        println!(
+            "[WARN] 群聊回复状态已不存在，丢弃 {} 条排队消息 (群组: {})",
+            dropped, group_id
+        );
+    }
+}
+
+/// 队列非空的群（看门狗用）。
+///
+/// 这里老老实实等锁，不用 `try_lock`：等待是**看门狗**在等（聊天路径不受影响，
+/// 这张表的锁只在入队/领取那几行代码里持有），而 `try_lock` 漏掉一次扫描的
+/// 代价是"这个群继续沉默一个间隔"——那正是看门狗要防的事。
+async fn pending_window_group_ids() -> Vec<i64> {
+    let pending = PENDING_WINDOW_MESSAGES.lock().await;
+    pending
+        .iter()
+        .filter(|(_, queue)| !queue.is_empty())
+        .map(|(group_id, _)| *group_id)
+        .collect()
+}
+
+/// 看门狗：把"队列非空却没人排空"的群补踢一次。
+///
+/// 排空只在回合收尾时触发，而 Core 链路收尾、panic、取消这三类路径都不走
+/// 那里；这个扫描是最后一道保险，保证 waiting room 不会烂在内存里（间隔见
+/// `traffic.window_drain_sweep_secs`）。真要不要领取由协调器判定：会话忙时
+/// `claim_follow_up_locked` 直接拒绝、队列原样保留，所以重复踢是安全的。
+pub(crate) async fn sweep_group_window_queues(bot: &Arc<RuntimeBot>) {
+    for group_id in pending_window_group_ids().await {
+        drain_pending_window_messages_from_current(group_id, bot).await;
     }
 }
 
@@ -1959,19 +2001,6 @@ async fn finish_conversation_turn(
         .finish_turn(user_id, turn_generation, replied);
 }
 
-fn should_queue_after_executive(
-    active: bool,
-    has_queued: bool,
-    has_pending_admission: bool,
-    decision: OutgoingExecutiveDecision,
-    preserved_prepared: bool,
-) -> bool {
-    preserved_prepared
-        || has_queued
-        || has_pending_admission
-        || (active && decision == OutgoingExecutiveDecision::Keep)
-}
-
 async fn admit_understood_group_turn(
     initial: IncomingAdmission,
     understanding: &MessageUnderstanding,
@@ -2020,6 +2049,27 @@ async fn queue_pending_window_message(
     );
 }
 
+/// 把 waiting room 的归属结果落到"这一轮到底要不要生成回复"上。
+///
+/// `QueuedNeedsDrain` 是**队列残局**：队列非空却没有任何在途工作（Core 链路
+/// 收尾、panic、取消都可能是把它落下的原因）。这时刚入队的这条消息必须立刻
+/// 排空，否则它会和队列一起烂在内存里，直到进程重启——线上 2026-09-14 18:33
+/// 主群静了四分多钟就是这个状态（排队 8 次、排空 0 次）。
+async fn settle_window_claim(
+    claim: WindowClaim,
+    group_id: i64,
+    bot: &Arc<RuntimeBot>,
+) -> Option<crate::model::ReplyTicket> {
+    match claim {
+        WindowClaim::Claimed(ticket) => Some(ticket),
+        WindowClaim::Queued => None,
+        WindowClaim::QueuedNeedsDrain => {
+            drain_pending_window_messages_from_current(group_id, bot).await;
+            None
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn claim_or_queue_group_reply(
     scope: ReplyScope,
@@ -2033,7 +2083,7 @@ async fn claim_or_queue_group_reply(
     message_ids: Vec<i32>,
     sticker_teaching_message: Option<Message>,
     understanding: MessageUnderstanding,
-) -> Option<crate::model::ReplyTicket> {
+) -> WindowClaim {
     let scope_lock = scope_mutex(scope);
     let _scope_guard = scope_lock.lock().await;
     let active = ConversationCoordinator::is_active_locked(scope).await;
@@ -2044,16 +2094,19 @@ async fn claim_or_queue_group_reply(
         .is_some_and(|queue| !queue.is_empty());
     let has_pending_admission =
         ConversationCoordinator::has_other_pending_incoming_locked(admission).await;
-    if should_queue_after_executive(
+    let queue_decision = window_queue_decision(
         active,
         has_queued,
         has_pending_admission,
         admission.decision,
         admission.preserved_prepared,
-    ) {
+    );
+    if queue_decision != WindowQueueDecision::Process {
         println!(
-            "[INFO] 群聊已有回复或排队消息进行中，排队窗口消息 (群组: {}, 用户: {})",
-            group_id, user_id
+            "[INFO] 群聊已有回复或排队消息进行中，排队窗口消息 (群组: {}, 用户: {}, 立刻排空: {})",
+            group_id,
+            user_id,
+            queue_decision == WindowQueueDecision::QueueThenDrain,
         );
         queue_pending_window_message(
             group_id,
@@ -2070,14 +2123,19 @@ async fn claim_or_queue_group_reply(
         // The payload now lives in the FIFO; release this admission's own
         // coordinator reservation so it cannot block the next turn.
         ConversationCoordinator::abandon_incoming_locked(admission).await;
-        return None;
+        return match queue_decision {
+            WindowQueueDecision::QueueThenDrain => WindowClaim::QueuedNeedsDrain,
+            _ => WindowClaim::Queued,
+        };
     }
     let ticket = admission.ticket;
     if ConversationCoordinator::begin_reply_locked(scope, ticket, message_ids.clone()).await {
-        Some(ticket)
+        WindowClaim::Claimed(ticket)
     } else {
         // A newer semantic hand-off may have won between refinement and this
         // claim. Keep the complete turn for the FIFO instead of dropping it.
+        // 走到这里说明刚有人抢到了回合（`begin_reply_locked` 只有在别人活跃、
+        // 或这批源消息已被撤回时才失败），交给那个回合收尾时排空即可。
         queue_pending_window_message(
             group_id,
             user_id,
@@ -2091,7 +2149,7 @@ async fn claim_or_queue_group_reply(
         )
         .await;
         ConversationCoordinator::abandon_incoming_locked(admission).await;
-        None
+        WindowClaim::Queued
     }
 }
 
@@ -2112,10 +2170,18 @@ async fn drain_pending_window_messages(
     bot: Arc<RuntimeBot>,
     mut completed: crate::model::ReplyTicket,
 ) {
+    let mut drained = 0_usize;
     loop {
         let Some((pending, ticket)) = take_pending_window_turn(group_id, completed).await else {
+            if drained > 0 {
+                println!(
+                    "[INFO] 群聊排队窗口已排空 (群组: {}, 本轮处理 {} 条)",
+                    group_id, drained
+                );
+            }
             return;
         };
+        drained += 1;
 
         println!("[INFO] 群聊开始处理排队窗口消息 (群组: {})", group_id);
         let turn_marker =
@@ -2151,6 +2217,28 @@ async fn take_pending_window_turn(
             let _scope_guard = scope_lock.lock().await;
             let mut pending_by_group = PENDING_WINDOW_MESSAGES.lock().await;
             let queue = pending_by_group.entry(group_id).or_default();
+            // 先丢掉"已经被回答过"的 turn：同一条消息可能先被 Core 链路答了，
+            // 又被 Host 链路排进这里（两条链路都会看到同一条入站消息），不再
+            // 检查一次就会答第二遍。判据见 `source_messages_already_answered`
+            // ——它只认真的发出过消息的轮次，"想过但沉默"的不会误判。
+            //
+            // 锁序：会话锁 → PENDING_WINDOW_MESSAGES → REPLY_LIFECYCLES。反向
+            // 不存在（recall 模块不认识 waiting room），所以不会死锁。
+            while let Some(oldest) = queue.front() {
+                let answered =
+                    crate::model::source_messages_already_answered(scope, &oldest.message_ids)
+                        .await;
+                if !answered {
+                    break;
+                }
+                let Some(dropped) = queue.pop_front() else {
+                    break;
+                };
+                println!(
+                    "[INFO] 群聊排队消息已被回复覆盖，丢弃 (群组: {}, 用户: {}, 消息: {:?})",
+                    group_id, dropped.user_id, dropped.message_ids
+                );
+            }
             let result =
                 ConversationCoordinator::claim_next_locked(scope, &mut completed, queue).await;
             let should_wait = result.is_none()
@@ -2616,9 +2704,9 @@ mod tests {
         group_conversation_focus_state_now, group_conversation_focus_user_now, group_cooling_gate,
         group_erasure_receipt_destination, group_pause_acknowledgement, group_pause_command,
         interjection_sampling_vetoed, message_at_self, normalized_sender_name,
-        note_group_conversation_focus, paced_group_reply_gap_secs, prune_decision_attempts,
-        queue_pending_window_message, release_unconfirmed_slot, reserve_visible_reply_slot,
-        should_queue_after_executive, suppress_direct_trigger, take_pending_window_turn,
+        note_group_conversation_focus, paced_group_reply_gap_secs, pending_window_group_ids,
+        prune_decision_attempts, queue_pending_window_message, release_unconfirmed_slot,
+        reserve_visible_reply_slot, suppress_direct_trigger, take_pending_window_turn,
         text_mentions_bot, with_structured_bot_mention_context,
     };
     use crate::group_cooling::{
@@ -2628,6 +2716,7 @@ mod tests {
     use crate::model::conversation_coordinator::{
         ConversationCoordinator, OutgoingExecutiveDecision,
     };
+    use crate::model::conversation_coordinator::{WindowQueueDecision, window_queue_decision};
     use crate::model::conversation_state::ConversationTurnOptions;
     use crate::model::interrupt::{
         OutgoingSource, OutgoingState, ReplyScope, commit_outgoing, interrupt, interrupt_locked,
@@ -3008,6 +3097,114 @@ mod tests {
                 crate::model::finish(claimed_ticket).await;
                 PENDING_WINDOW_MESSAGES.lock().await.remove(&group_id);
                 assert!(!is_current(new_ticket).await);
+            });
+    }
+
+    /// 排空时丢掉"已经被回答过"的 turn：同一条消息可能先被 Core 链路答了，
+    /// 又被 Host 链路排进 waiting room（两条链路都看得到这条入站消息），不再
+    /// 检查一次就会当着群友的面答第二遍。
+    #[test]
+    fn drainer_drops_queued_turns_the_core_already_answered() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let group_id = 9_200_007;
+                let scope = ReplyScope::Group(group_id);
+                PENDING_WINDOW_MESSAGES.lock().await.remove(&group_id);
+
+                // 先来一条已经被答过的、再来一条没答过的：只有后者该被领取。
+                queue_pending_window_message(
+                    group_id,
+                    55,
+                    true,
+                    "成员".to_string(),
+                    "已经被 Core 答过的消息".to_string(),
+                    Vec::new(),
+                    vec![505],
+                    None,
+                    MessageUnderstanding::default(),
+                )
+                .await;
+                queue_pending_window_message(
+                    group_id,
+                    66,
+                    true,
+                    "成员".to_string(),
+                    "还没人回答的消息".to_string(),
+                    Vec::new(),
+                    vec![606],
+                    None,
+                    MessageUnderstanding::default(),
+                )
+                .await;
+
+                // 模拟 Core 链路把 505 答掉了（真的发出过消息的轮次）。
+                let answered = interrupt(scope).await;
+                assert!(
+                    crate::model::recall::begin_reply(scope, answered, vec![505]).await,
+                    "Core 轮次应登记成功"
+                );
+                assert!(
+                    crate::model::recall::record_committed_bot_message(
+                        scope,
+                        answered,
+                        90_001,
+                        "我答过了"
+                    )
+                    .await,
+                    "Core 发出的消息应记账"
+                );
+                crate::model::recall::finish_reply(scope, answered).await;
+
+                let completed = interrupt(scope).await;
+                let (pending, ticket) = take_pending_window_turn(group_id, completed)
+                    .await
+                    .expect("应领取没被答过的那条");
+                assert_eq!(pending.message, "还没人回答的消息");
+                assert_eq!(pending.message_ids, vec![606]);
+                let remaining = PENDING_WINDOW_MESSAGES.lock().await;
+                assert!(
+                    remaining
+                        .get(&group_id)
+                        .is_none_or(|queue| queue.is_empty()),
+                    "被答过的那条应当已被丢弃"
+                );
+                drop(remaining);
+                crate::model::finish(ticket).await;
+                PENDING_WINDOW_MESSAGES.lock().await.remove(&group_id);
+            });
+    }
+
+    /// 看门狗只该看"真的还有人在等"的群：空队列（以及正在等待中的空壳）
+    /// 不该被反复扫到，否则每一轮都要白白锁一次全局表。
+    #[test]
+    fn window_sweep_only_reports_groups_with_a_non_empty_queue() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let busy_group = 9_200_011;
+                let idle_group = 9_200_013;
+                PENDING_WINDOW_MESSAGES.lock().await.remove(&busy_group);
+                PENDING_WINDOW_MESSAGES.lock().await.remove(&idle_group);
+                queue_pending_window_message(
+                    busy_group,
+                    77,
+                    true,
+                    "成员".to_string(),
+                    "还在等的消息".to_string(),
+                    Vec::new(),
+                    vec![707],
+                    None,
+                    MessageUnderstanding::default(),
+                )
+                .await;
+
+                let groups = pending_window_group_ids().await;
+                assert!(groups.contains(&busy_group));
+                assert!(!groups.contains(&idle_group));
+
+                PENDING_WINDOW_MESSAGES.lock().await.remove(&busy_group);
+                assert!(!pending_window_group_ids().await.contains(&busy_group));
             });
     }
 
@@ -3509,50 +3706,98 @@ mod tests {
 
     #[test]
     fn executive_keep_queues_behind_active_work_but_other_decisions_regenerate() {
-        assert!(should_queue_after_executive(
-            true,
-            false,
-            false,
-            OutgoingExecutiveDecision::Keep,
-            false,
-        ));
+        use WindowQueueDecision::{Process, Queue, QueueThenDrain};
+
+        assert_eq!(
+            window_queue_decision(true, false, false, OutgoingExecutiveDecision::Keep, false),
+            Queue
+        );
         for decision in [
             OutgoingExecutiveDecision::Rewrite,
             OutgoingExecutiveDecision::Merge,
             OutgoingExecutiveDecision::Defer,
         ] {
-            assert!(!should_queue_after_executive(
-                true, false, false, decision, false
-            ));
+            assert_eq!(
+                window_queue_decision(true, false, false, decision, false),
+                Process
+            );
         }
-        assert!(!should_queue_after_executive(
-            false,
-            false,
-            false,
+        assert_eq!(
+            window_queue_decision(false, false, false, OutgoingExecutiveDecision::Keep, false),
+            Process
+        );
+        assert_eq!(
+            window_queue_decision(false, false, false, OutgoingExecutiveDecision::Keep, true),
+            Queue
+        );
+        assert_eq!(
+            window_queue_decision(
+                false,
+                true,
+                false,
+                OutgoingExecutiveDecision::Rewrite,
+                false
+            ),
+            QueueThenDrain
+        );
+        assert_eq!(
+            window_queue_decision(
+                false,
+                false,
+                true,
+                OutgoingExecutiveDecision::Rewrite,
+                false
+            ),
+            Queue
+        );
+    }
+
+    /// 线上回归（2026-09-14 18:33，主群静了四分多钟）：队列曾经因为"自己非空"
+    /// 就把后面每条消息继续排进去，而排空只在 Host 回合收尾时触发——Core
+    /// 收尾、静默收尾都不触发，于是队列永远排不完（journal 里排队 8 次、
+    /// 排空 0 次）。有在途工作时才排队；没有在途工作时入队保序后立刻排空。
+    #[test]
+    fn a_waiting_room_without_in_flight_work_is_not_a_reason_to_keep_queueing() {
+        use WindowQueueDecision::{Process, Queue, QueueThenDrain};
+
+        // 队列非空 + 没有任何在途工作 = 残局：排队（保序）并要求立刻排空。
+        for decision in [
             OutgoingExecutiveDecision::Keep,
-            false,
-        ));
-        assert!(should_queue_after_executive(
-            false,
-            false,
-            false,
-            OutgoingExecutiveDecision::Keep,
-            true,
-        ));
-        assert!(should_queue_after_executive(
-            false,
-            true,
-            false,
             OutgoingExecutiveDecision::Rewrite,
-            false,
-        ));
-        assert!(should_queue_after_executive(
-            false,
-            false,
-            true,
-            OutgoingExecutiveDecision::Rewrite,
-            false,
-        ));
+            OutgoingExecutiveDecision::Merge,
+            OutgoingExecutiveDecision::Defer,
+        ] {
+            assert_eq!(
+                window_queue_decision(false, true, false, decision, false),
+                QueueThenDrain,
+                "残局必须要求立刻排空，否则队列会自锁（decision={decision:?}）"
+            );
+        }
+        // 有在途工作（活跃回合 / 待定 admission / 保留下来的 prepared）时，
+        // 队列非空仍然要求排队：这些情况下确实有人在前面收尾。
+        assert_eq!(
+            window_queue_decision(true, true, false, OutgoingExecutiveDecision::Rewrite, false),
+            Queue
+        );
+        assert_eq!(
+            window_queue_decision(false, true, true, OutgoingExecutiveDecision::Rewrite, false),
+            Queue
+        );
+        assert_eq!(
+            window_queue_decision(false, true, false, OutgoingExecutiveDecision::Rewrite, true),
+            Queue
+        );
+        // 队列本来就空、又没有在途工作：直接处理，不进 waiting room。
+        assert_eq!(
+            window_queue_decision(
+                false,
+                false,
+                false,
+                OutgoingExecutiveDecision::Rewrite,
+                false
+            ),
+            Process
+        );
     }
 
     #[test]
