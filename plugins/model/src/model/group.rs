@@ -803,8 +803,13 @@ pub(crate) async fn group_message_event_after_ingress(
         && directed_at_others(&event.message)
     {
         println!(
-            "[INFO] 群聊消息指向其他成员，仅观察不回复 (群组: {}, 用户: {})",
-            group_id, event.user_id
+            "[INFO] 群聊消息指向其他成员，仅观察不回复 (群组: {}, 用户: {}, {} at_self={} reply_to_self={} named={})",
+            group_id,
+            event.user_id,
+            addressing_evidence(&event.message, event.self_id),
+            addressing.at_self,
+            addressing.reply_to_self,
+            addressing.named_in_text,
         );
         return;
     }
@@ -2803,6 +2808,41 @@ fn message_at_self(message: &Message, self_id: i64) -> bool {
     })
 }
 
+/// 把消息里的定向证据渲染成一行短文本：`at=[123,all] reply=456 self=789`。
+///
+/// 为什么要它：这条判定原先只输出结论（"指向其他成员"），不输出依据。
+/// 2026-09-14 22:27 群里有人 @ 她问"真能用吗"、她被静默，排查时卡住的唯一一件事
+/// 就是**看不出那个 `[at]` 指向谁**（`Message::to_human_string` 对任何人的 @ 都只
+/// 渲染成 `[at]`，`InboundMessage` 那条同名日志的注释也写着"离线采集无法还原到底
+/// 在叫谁"）。而目标恰恰是判定成立的唯一依据：`at=[]`（悬空 @ / 空目标）与
+/// `at=[别人的号]` 是两种完全不同的情况，出了事只能靠这一行区分。
+///
+/// 只保留前几个目标：入站消息的段数有上限，这里再夹一道，避免异常消息把日志撑爆。
+pub(crate) fn addressing_evidence(message: &Message, self_id: i64) -> String {
+    const MAX_TARGETS: usize = 4;
+    let mut targets: Vec<String> = Vec::new();
+    let mut reply = String::from("none");
+    for segment in message.iter() {
+        match segment.type_.as_str() {
+            "at" if targets.len() < MAX_TARGETS => {
+                targets.push(match segment.data.get("qq") {
+                    Some(qq) => qq.as_str().map_or_else(|| qq.to_string(), str::to_owned),
+                    // 段在、目标不在：QQ 客户端发出的悬空 @。
+                    None => "?".to_owned(),
+                });
+            }
+            "reply" => {
+                reply = segment
+                    .data
+                    .get("id")
+                    .map_or_else(|| "?".to_owned(), ToString::to_string);
+            }
+            _ => {}
+        }
+    }
+    format!("at=[{}] reply={reply} self={self_id}", targets.join(","))
+}
+
 /// 消息是否携带 at/reply 定向段。调用方必须先排除“指向芸汐本人”的情况
 /// （结构化 at 自己或引用自己），因此这里只需判断是否存在定向段：
 /// 点名或引用其他成员的消息是定向消息，不应触发插话或接续对话。
@@ -2883,7 +2923,7 @@ mod tests {
         Addressing, DirectTriggerState, GROUP_INTERJECTION_STATE, GroupConversationFocus,
         GroupInterjectionState, GroupSenderIdentity, InterjectionAttempt, PENDING_WINDOW_MESSAGES,
         ReplyBudgetClass, ReplyBudgetLimits, ReplySlotReservation, WindowDrainWait,
-        admit_understood_group_turn, ambient_sampling_eligible,
+        addressing_evidence, admit_understood_group_turn, ambient_sampling_eligible,
         clear_group_erasure_reply_state_locked, complete_interjection_attempt,
         confirm_visible_reply_slot, continuation_window_secs, conversation_active_for_observation,
         cooling_gate_verdict, decision_budget_available, directed_at_others,
@@ -2996,6 +3036,37 @@ mod tests {
         assert!(message_at_self(&everyone, self_id));
         assert!(!message_at_self(&no_at, self_id));
         assert!(message_at_self(&multiple_targets, self_id));
+    }
+
+    /// 判定要留下依据，否则出事时只能看到结论。2026-09-14 22:27 那次静默就卡在
+    /// "看不出 `[at]` 指向谁"，其中最难区分的是**悬空 @**（段在、目标不在）——
+    /// 它既不是"在叫她"，也不是"在叫别人"，只看结论完全看不出来。
+    #[test]
+    fn addressing_evidence_names_targets_reply_and_self() {
+        let at_other = Message::from(vec![
+            Segment::new("at", json!({"qq": "654321"})),
+            Segment::new("text", json!({"text": "快回来直播"})),
+        ]);
+        assert_eq!(
+            addressing_evidence(&at_other, 123_456),
+            "at=[654321] reply=none self=123456"
+        );
+
+        let dangling = Message::from(vec![Segment::new("at", json!({}))]);
+        assert_eq!(
+            addressing_evidence(&dangling, 123_456),
+            "at=[?] reply=none self=123456"
+        );
+
+        let both = Message::from(vec![
+            Segment::new("reply", json!({"id": 42})),
+            Segment::new("at", json!({"qq": "all"})),
+        ]);
+        assert_eq!(addressing_evidence(&both, 7), "at=[all] reply=42 self=7");
+
+        // 没有定向段时也要给出完整形状：`at=[]` 与"没打印这一行"是两回事。
+        let plain = Message::from("今天群里有点安静");
+        assert_eq!(addressing_evidence(&plain, 7), "at=[] reply=none self=7");
     }
 
     #[test]

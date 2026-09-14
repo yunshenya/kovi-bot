@@ -2137,6 +2137,14 @@ struct InboundMessage {
     /// 此前对这一类消息静默跳过，于是 `tools/turngate` 只能把"@别人"记成
     /// "在叫她"，把 TurnGate 训练集教反。
     directed_at_other_members: bool,
+    /// 上一条结论的**依据**：`at=[...] reply=... self=...`，同样是给日志看的。
+    ///
+    /// 只有结论没法排查：2026-09-14 22:27 有人 @ 她问"真能用吗"、她被静默，
+    /// 当时日志里只有"指向其他成员"这句话，看不出那个 `[at]` 指向谁，也没有
+    /// 她自己的号可以对照——目标恰恰是判定成立的唯一依据（`at=[]` 是悬空 @，
+    /// `at=[别人的号]` 才是真的在叫别人）。由 `from_group` 在拿得到原始段的地方
+    /// 算一次；私聊与合批接续没有单条原始消息，记为 `none`。
+    addressing_evidence: String,
     /// 这条是"接续"：发言者是她当前对话焦点里的那个人，没有 @ 也没有引用。
     ///
     /// 由 `enqueue_group_continuation` 在完成度合批成轮时置位；普通入站一律
@@ -2178,6 +2186,7 @@ impl InboundMessage {
         // 算"有指向"，因此这里必须已经排除了指向她本人的情况。
         let directed_at_other_members =
             directed_at_other_members(&event.message, addressed_to_agent);
+        let addressing_evidence = crate::model::addressing_evidence(&event.message, event.self_id);
         Some(Self {
             address: ConversationAddress::Group {
                 group_id: event.group_id,
@@ -2188,6 +2197,7 @@ impl InboundMessage {
             replies_to_agent_hint: false,
             addressed_to_agent,
             directed_at_other_members,
+            addressing_evidence,
             continuation_to_agent: false,
             visible_reply_allowed: true,
             explicit_request,
@@ -2226,6 +2236,7 @@ impl InboundMessage {
             replies_to_agent_hint: false,
             addressed_to_agent: true,
             directed_at_other_members: false,
+            addressing_evidence: String::from("none"),
             continuation_to_agent: false,
             visible_reply_allowed: true,
             explicit_request: true,
@@ -2280,6 +2291,7 @@ impl InboundMessage {
             replies_to_agent_hint: false,
             addressed_to_agent: false,
             directed_at_other_members: false,
+            addressing_evidence: String::from("none"),
             continuation_to_agent: true,
             visible_reply_allowed: true,
             explicit_request: false,
@@ -3976,8 +3988,8 @@ async fn resolve_and_submit_inner(
         && message.directed_at_other_members
     {
         println!(
-            "[INFO] 群聊消息指向其他成员，仅观察不回复 (群组: {}, 用户: {})",
-            group_id, message.sender_user_id
+            "[INFO] 群聊消息指向其他成员，仅观察不回复 (群组: {}, 用户: {}, {})",
+            group_id, message.sender_user_id, message.addressing_evidence
         );
     }
     let visible_reply_allowed = effective_visible_reply_allowed(message, recent_agent_reply);
@@ -5009,6 +5021,7 @@ mod tests {
             timestamp: Utc::now(),
             addressed_to_agent,
             directed_at_other_members: false,
+            addressing_evidence: String::from("none"),
             continuation_to_agent: false,
             visible_reply_allowed: true,
             explicit_request: false,
