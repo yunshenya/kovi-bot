@@ -1370,7 +1370,18 @@ async fn pending_window_group_ids() -> Vec<i64> {
 /// `claim_follow_up_locked` 直接拒绝、队列原样保留，所以重复踢是安全的。
 pub(crate) async fn sweep_group_window_queues(bot: &Arc<RuntimeBot>) {
     for group_id in pending_window_group_ids().await {
-        drain_pending_window_messages_from_current(group_id, bot).await;
+        // 看门狗**不等** pending admission：领不到就留给下一轮（30 秒后），
+        // 整轮扫描必须很快返回。
+        let scope = ReplyScope::Group(group_id);
+        if let Some(ticket) = ConversationCoordinator::current_ticket(scope).await {
+            drain_pending_window_messages_with(
+                group_id,
+                Arc::clone(bot),
+                ticket,
+                WindowDrainWait::Never,
+            )
+            .await;
+        }
     }
 }
 
@@ -1830,6 +1841,19 @@ fn release_unconfirmed_slot(state: &mut GroupInterjectionState, at: Instant) {
         .retain(|slot| slot.at != at || slot.confirmed);
 }
 
+/// 排空 waiting room 时的等待策略。
+///
+/// 这个区别在线上踩出来过（2026-09-14 19:14）：看门狗那一轮扫描去等一个还没
+/// 解决的 pending admission，等满 60 秒触发超时告警，还把这一轮扫描整段取消
+/// ——而 30 秒后它本来就会再来一次。等待只属于"回合收尾"的语义。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowDrainWait {
+    /// 等到在途 admission 解决再领队：回合收尾用，后面的消息要按序接上。
+    ForPendingAdmission,
+    /// 领不到就走：看门狗用，下一轮马上还会来，绝不能让整轮扫描卡住。
+    Never,
+}
+
 /// 回合结束时的收尾：这一轮最终**没有**发出可见消息，就把乐观预留的
 /// 名额还回去。`replied` 来自回复管线的真实结果（不是"打算回"）。
 async fn release_unconfirmed_reply_slot(group_id: i64, slot: Option<Instant>, replied: bool) {
@@ -2168,11 +2192,27 @@ async fn stop_group_reply(group_id: i64, user_id: i64, ingress: ReplyTicket) {
 async fn drain_pending_window_messages(
     group_id: i64,
     bot: Arc<RuntimeBot>,
+    completed: crate::model::ReplyTicket,
+) {
+    drain_pending_window_messages_with(
+        group_id,
+        bot,
+        completed,
+        WindowDrainWait::ForPendingAdmission,
+    )
+    .await;
+}
+
+async fn drain_pending_window_messages_with(
+    group_id: i64,
+    bot: Arc<RuntimeBot>,
     mut completed: crate::model::ReplyTicket,
+    wait: WindowDrainWait,
 ) {
     let mut drained = 0_usize;
     loop {
-        let Some((pending, ticket)) = take_pending_window_turn(group_id, completed).await else {
+        let Some((pending, ticket)) = take_pending_window_turn(group_id, completed, wait).await
+        else {
             if drained > 0 {
                 println!(
                     "[INFO] 群聊排队窗口已排空 (群组: {}, 本轮处理 {} 条)",
@@ -2209,6 +2249,7 @@ async fn drain_pending_window_messages(
 async fn take_pending_window_turn(
     group_id: i64,
     mut completed: crate::model::ReplyTicket,
+    wait: WindowDrainWait,
 ) -> Option<(PendingWindowMessage, crate::model::ReplyTicket)> {
     let scope = ReplyScope::Group(group_id);
     loop {
@@ -2252,7 +2293,10 @@ async fn take_pending_window_turn(
         if let Some(result) = result {
             return Some(result);
         }
-        if !should_wait || !ConversationCoordinator::wait_for_pending_incoming(completed).await {
+        if !should_wait || wait == WindowDrainWait::Never {
+            return None;
+        }
+        if !ConversationCoordinator::wait_for_pending_incoming(completed).await {
             return None;
         }
     }
@@ -2697,7 +2741,7 @@ mod tests {
     use super::{
         Addressing, DirectTriggerState, GROUP_INTERJECTION_STATE, GroupConversationFocus,
         GroupInterjectionState, GroupSenderIdentity, InterjectionAttempt, PENDING_WINDOW_MESSAGES,
-        admit_understood_group_turn, ambient_sampling_eligible,
+        WindowDrainWait, admit_understood_group_turn, ambient_sampling_eligible,
         clear_group_erasure_reply_state_locked, complete_interjection_attempt,
         confirm_visible_reply_slot, continuation_window_secs, conversation_active_for_observation,
         cooling_gate_verdict, decision_budget_available, directed_at_others,
@@ -3084,7 +3128,12 @@ mod tests {
                 new_message_won.notified().await;
 
                 let drainer = kovi::tokio::spawn(async move {
-                    take_pending_window_turn(group_id, completed).await
+                    take_pending_window_turn(
+                        group_id,
+                        completed,
+                        WindowDrainWait::ForPendingAdmission,
+                    )
+                    .await
                 });
                 let new_ticket = new_task.await.expect("新消息任务应正常结束");
                 let (pending, claimed_ticket) = drainer
@@ -3157,9 +3206,13 @@ mod tests {
                 crate::model::recall::finish_reply(scope, answered).await;
 
                 let completed = interrupt(scope).await;
-                let (pending, ticket) = take_pending_window_turn(group_id, completed)
-                    .await
-                    .expect("应领取没被答过的那条");
+                let (pending, ticket) = take_pending_window_turn(
+                    group_id,
+                    completed,
+                    WindowDrainWait::ForPendingAdmission,
+                )
+                .await
+                .expect("应领取没被答过的那条");
                 assert_eq!(pending.message, "还没人回答的消息");
                 assert_eq!(pending.message_ids, vec![606]);
                 let remaining = PENDING_WINDOW_MESSAGES.lock().await;
@@ -3234,7 +3287,12 @@ mod tests {
                 crate::model::finish(completed).await;
 
                 let drainer = kovi::tokio::spawn(async move {
-                    take_pending_window_turn(group_id, completed).await
+                    take_pending_window_turn(
+                        group_id,
+                        completed,
+                        WindowDrainWait::ForPendingAdmission,
+                    )
+                    .await
                 });
                 kovi::tokio::task::yield_now().await;
                 assert!(!drainer.is_finished());
@@ -3259,6 +3317,56 @@ mod tests {
                 assert_eq!(pending.message, "应先处理的排队消息");
                 assert_eq!(pending.message_ids, vec![404]);
                 crate::model::finish(ticket).await;
+                PENDING_WINDOW_MESSAGES.lock().await.remove(&group_id);
+            });
+    }
+
+    /// 看门狗那一轮**不等** pending admission：线上 19:14 实测它等满 60 秒、
+    /// 触发超时告警，还把整轮扫描取消掉，而 30 秒后它本来就会再来。所以这里
+    /// 断言的是"立刻返回"，队列原样留在 waiting room 里等下一轮。
+    #[test]
+    fn watchdog_drain_returns_immediately_instead_of_waiting_for_an_admission() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let group_id = 9_200_017;
+                let scope = ReplyScope::Group(group_id);
+                PENDING_WINDOW_MESSAGES.lock().await.remove(&group_id);
+                let completed = interrupt(scope).await;
+                assert!(mark_active(completed).await);
+                let blocker = ConversationCoordinator::begin_incoming(scope).await;
+                queue_pending_window_message(
+                    group_id,
+                    88,
+                    true,
+                    "成员".to_string(),
+                    "被等在途工作挡住的消息".to_string(),
+                    Vec::new(),
+                    vec![808],
+                    None,
+                    MessageUnderstanding::default(),
+                )
+                .await;
+                crate::model::finish(completed).await;
+
+                let claimed = kovi::tokio::time::timeout(
+                    Duration::from_millis(200),
+                    take_pending_window_turn(group_id, completed, WindowDrainWait::Never),
+                )
+                .await
+                .expect("看门狗不该在这里等 pending admission");
+                assert!(claimed.is_none(), "领不到就返回 None，队列原样保留");
+                assert_eq!(
+                    PENDING_WINDOW_MESSAGES
+                        .lock()
+                        .await
+                        .get(&group_id)
+                        .map(std::collections::VecDeque::len),
+                    Some(1),
+                    "队列必须还在，留给下一轮"
+                );
+
+                ConversationCoordinator::abandon_incoming(blocker).await;
                 PENDING_WINDOW_MESSAGES.lock().await.remove(&group_id);
             });
     }
