@@ -119,6 +119,52 @@ mod tests {
         assert_eq!(truncate_chars("ok", 4), "ok");
     }
 
+    /// `trusted` 的作用域不受"按人限流 + 120 秒整段封锁"影响——点名她与管理员
+    /// 走的就是这条（线上 2026-09-14 20:44：一分钟 48 条刷屏触发了封锁，随后
+    /// 4 次 `[at] 说句话` 全被吞掉，群友以为被拉黑）。
+    #[test]
+    fn trusted_scopes_skip_the_per_user_block() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let limits = crate::config::get().traffic().clone();
+                let scope = InboundScope::Group {
+                    group_id: 9_150_001,
+                    user_id: 9_150_002,
+                };
+                // 全局额度是进程级的，别的测试可能已经把它打满（打满时**所有人**
+                // 都会被抑制，这是设计如此）。这里只验按人限流，所以先清空状态。
+                {
+                    let mut state = TRAFFIC_STATE.lock().await;
+                    state.global_recent.clear();
+                    state.scopes.clear();
+                }
+
+                // 先用普通身份把额度用满：前 per_user_limit 条放行，再多一条触发封锁。
+                for _ in 0..limits.per_user_limit() {
+                    assert!(
+                        !super::should_suppress(scope, false).await,
+                        "额度内不该被抑制"
+                    );
+                }
+                assert!(
+                    super::should_suppress(scope, false).await,
+                    "超出按人上限后应进入封锁期"
+                );
+
+                // 封锁期内：普通身份继续被拒，受信任身份（点名/管理员）放行。
+                assert!(super::should_suppress(scope, false).await);
+                for _ in 0..8 {
+                    assert!(
+                        !super::should_suppress(scope, true).await,
+                        "受信任的消息不该被按人封锁吞掉"
+                    );
+                }
+
+                TRAFFIC_STATE.lock().await.scopes.remove(&scope);
+            });
+    }
+
     #[test]
     fn data_erasure_clear_removes_only_the_private_traffic_scope() {
         kovi::tokio::runtime::Runtime::new()

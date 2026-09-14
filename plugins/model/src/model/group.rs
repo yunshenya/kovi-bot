@@ -336,19 +336,24 @@ pub(crate) async fn should_suppress_core_group_message(
     bot: &RuntimeBot,
 ) -> bool {
     let sender_is_admin = is_bot_admin(bot, event.user_id);
+    let directly_addressed = message_at_self(&event.message, event.self_id)
+        || event.borrow_text().is_some_and(text_mentions_bot);
+    // 点名她的消息不进"按人限流 + 120 秒整段封锁"：那是对她说的请求，被静默吞掉
+    // 正是"她不回我"最伤的形态（线上 2026-09-14 20:44：不忻一分钟发了 48 条，
+    // 之后 4 次 `[at] 说句话` 全部被整段封锁吃掉，他以为被拉黑了）。防重复点名
+    // 由下面的 `should_suppress_direct_trigger` 负责，她的回复节奏（点名档 20 秒 +
+    // 10 条/10 分钟）继续兜住输出；全局 300/60 秒上限对所有人仍然有效。
     if should_suppress(
         InboundScope::Group {
             group_id: event.group_id,
             user_id: event.user_id,
         },
-        sender_is_admin,
+        sender_is_admin || directly_addressed,
     )
     .await
     {
         return true;
     }
-    let directly_addressed = message_at_self(&event.message, event.self_id)
-        || event.borrow_text().is_some_and(text_mentions_bot);
     directly_addressed
         && !sender_is_admin
         && should_suppress_direct_trigger(event.group_id, event.user_id).await
@@ -469,12 +474,17 @@ pub(crate) async fn group_message_event_after_ingress(
             group_id, event.message_id, error
         );
     }
+    // 与 Core 侧同一条规则：点名她的消息不受"按人限流 + 整段封锁"影响
+    // （防重复点名另有 `should_suppress_direct_trigger`）。引用她需要异步解析，
+    // 这里先用与 Core 一致的两个廉价判据：结构化 @ 或正文点名。
+    let directly_addressed =
+        message_at_self(&event.message, event.self_id) || text_mentions_bot(message);
     if should_suppress(
         InboundScope::Group {
             group_id,
             user_id: event.user_id,
         },
-        sender_is_admin,
+        sender_is_admin || directly_addressed,
     )
     .await
     {

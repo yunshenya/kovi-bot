@@ -5195,6 +5195,31 @@ fn group_reply_gap_secs_for(message: &yunxi_core::MessageReceivedEvent) -> u64 {
     group.reply_gap_secs()
 }
 
+/// 点名消息被回复间隔挡下时，最多等多久再答。
+///
+/// 只等"还差一点"的情况：点名档是 20 秒，所以 25 秒足够覆盖它加一点余量；
+/// 撞频率上限（10 条/10 分钟）时等待没有意义，差额比这更大时也不值得让这一轮
+/// 一直挂着——那两种维持原来的静默。
+const CORE_ADDRESSED_GAP_MAX_WAIT_MS: u64 = 25_000;
+/// 等到点后多睡一点再重试，避免刚好卡在边界上又被拒一次。
+const CORE_ADDRESSED_GAP_RETRY_SLACK_MS: u64 = 250;
+
+/// 点名被间隔挡下时该等多久（毫秒）；不值得等就返回 `None`。
+///
+/// 线上 2026-09-14 20:44：不忻 @ 她时只差 9.5 秒没到点名档，那条消息就静默
+/// 消失了——他连着 @ 了四次，最后以为被拉黑。点名是对她说的请求，"等间隔过去
+/// 再答"永远好过"当没看见"。
+fn addressed_gap_wait_ms(
+    snapshot: &crate::model::GroupReplyBudgetSnapshot,
+    max_wait_ms: u64,
+) -> Option<u64> {
+    if snapshot.replies_in_window >= snapshot.rate_limit {
+        return None;
+    }
+    let remaining = snapshot.gap_remaining_ms?;
+    (remaining > 0 && remaining <= max_wait_ms).then_some(remaining)
+}
+
 /// 结合发言者身份给出这一轮的间隔：管理员是明确指令的发出者，间隔不该把他
 /// 的话挡在门外，因此按 0 秒处理（频率上限 `reply_rate_limit` 仍对所有人一致，
 /// 防刷屏的总额度没有被放开）。
@@ -5878,23 +5903,55 @@ impl ModelBackend for KoviModelBackend {
                     None => {
                         let snapshot =
                             crate::model::group_reply_budget_snapshot(group_id, gap_secs).await;
-                        let gap_remaining_ms = snapshot
-                            .gap_remaining_ms
-                            .map_or_else(|| "none".to_owned(), |ms| ms.to_string());
-                        kovi::log::info!(
-                            "Yunxi Core group reply paced: event_id={} message_id={} conversation_id={} group_id={} addressed={} gap_secs={} gap_remaining_ms={} replies_in_window={}/{} action=silent",
-                            input.event.id(),
-                            message_id_for_log(input),
-                            conversation_id_for_log(input),
-                            group_id,
-                            addressed,
-                            gap_secs,
-                            gap_remaining_ms,
-                            snapshot.replies_in_window,
-                            snapshot.rate_limit,
-                        );
-                        crate::model::finish(ticket).await;
-                        return Ok(silent_with_interaction_state(input));
+                        // 点名她、而且只是"还差一点"：等间隔过去再答，不要静默丢掉。
+                        // 线上 2026-09-14 20:44 就是这么丢掉一条 @ 的——只差 9.5 秒，
+                        // 他连 @ 四次都没人理，最后以为被拉黑。
+                        let wait_ms = addressed
+                            .then(|| {
+                                addressed_gap_wait_ms(&snapshot, CORE_ADDRESSED_GAP_MAX_WAIT_MS)
+                            })
+                            .flatten();
+                        if let Some(wait_ms) = wait_ms {
+                            kovi::log::info!(
+                                "Yunxi Core addressed reply deferred: event_id={} message_id={} conversation_id={} group_id={} gap_secs={} wait_ms={} replies_in_window={}/{} action=wait",
+                                input.event.id(),
+                                message_id_for_log(input),
+                                conversation_id_for_log(input),
+                                group_id,
+                                gap_secs,
+                                wait_ms,
+                                snapshot.replies_in_window,
+                                snapshot.rate_limit,
+                            );
+                            kovi::tokio::time::sleep(std::time::Duration::from_millis(
+                                wait_ms + CORE_ADDRESSED_GAP_RETRY_SLACK_MS,
+                            ))
+                            .await;
+                            group_reply_slot =
+                                crate::model::reserve_group_chat_reply_slot(group_id, gap_secs)
+                                    .await;
+                        }
+                        if group_reply_slot.is_none() {
+                            // 等过之后仍被拒（这段里别人又发了消息，或本来就是撞了
+                            // 频率上限）：维持原来的静默，并留下可对账的日志。
+                            let gap_remaining_ms = snapshot
+                                .gap_remaining_ms
+                                .map_or_else(|| "none".to_owned(), |ms| ms.to_string());
+                            kovi::log::info!(
+                                "Yunxi Core group reply paced: event_id={} message_id={} conversation_id={} group_id={} addressed={} gap_secs={} gap_remaining_ms={} replies_in_window={}/{} action=silent",
+                                input.event.id(),
+                                message_id_for_log(input),
+                                conversation_id_for_log(input),
+                                group_id,
+                                addressed,
+                                gap_secs,
+                                gap_remaining_ms,
+                                snapshot.replies_in_window,
+                                snapshot.rate_limit,
+                            );
+                            crate::model::finish(ticket).await;
+                            return Ok(silent_with_interaction_state(input));
+                        }
                     }
                 }
             }
@@ -7253,9 +7310,10 @@ fn visible_reply_state_updates(event: &WorldEventKind) -> Vec<StateUpdateProposa
 #[cfg(test)]
 mod tests {
     use super::{
-        BoundedCache, BoundedRouteCache, CORE_AMBIENT_TURN_INSTRUCTION,
-        CORE_AUTONOMOUS_INTENT_PROTOCOL, CORE_AUTONOMOUS_PLAIN_TURN_INSTRUCTION,
-        CORE_BUBBLE_MARKER, CORE_CONTINUATION_TURN_INSTRUCTION, CORE_EXPLICIT_BATCH_REPAIR_TIMEOUT,
+        BoundedCache, BoundedRouteCache, CORE_ADDRESSED_GAP_MAX_WAIT_MS,
+        CORE_AMBIENT_TURN_INSTRUCTION, CORE_AUTONOMOUS_INTENT_PROTOCOL,
+        CORE_AUTONOMOUS_PLAIN_TURN_INSTRUCTION, CORE_BUBBLE_MARKER,
+        CORE_CONTINUATION_TURN_INSTRUCTION, CORE_EXPLICIT_BATCH_REPAIR_TIMEOUT,
         CORE_GROUP_HISTORY_INSTRUCTION, CORE_GROUP_HISTORY_PREFIX, CORE_MEMORY_CONTEXT_PREFIX,
         CORE_PENDING_OUTGOING_INSTRUCTION, CORE_PENDING_OUTGOING_PLAIN_INSTRUCTION,
         CORE_PLAIN_TURN_INSTRUCTION, CORE_REPLY_REPAIR_PROMPT, CORE_SING_MARKER,
@@ -7266,8 +7324,8 @@ mod tests {
         INTRINSIC_SEMANTIC_CONTENT_INSTRUCTION, MAX_CORE_BUBBLES, MAX_DELIVERABLE_BUBBLES_PER_TURN,
         MAX_INTRINSIC_REPLY_PROTOCOL_BYTES, MAX_PLAIN_SPLIT_LINE_CHARS, MIND_DECISION_INSTRUCTION,
         MindCandidates, PersistentRouteLookup, QqConversation, RequiredCreation, RouteContext,
-        SILENCE_TENSION_THRESHOLD, SilenceVerdict, VisibleReplyTarget, affect_tone_guidance,
-        ambient_group_interjection_veto, autonomous_conversation_prompt,
+        SILENCE_TENSION_THRESHOLD, SilenceVerdict, VisibleReplyTarget, addressed_gap_wait_ms,
+        affect_tone_guidance, ambient_group_interjection_veto, autonomous_conversation_prompt,
         autonomous_conversation_protocol, autonomous_empty_generation_plan,
         autonomous_generation_failure_plan, baseline_disposition, batch_fence_action_key,
         build_bounded_intrinsic_reply_batch, classify_persistent_person_identity,
@@ -7957,6 +8015,39 @@ mod tests {
     /// 管理员豁免的是"等待间隔"，不是频率上限：线上 2026-09-14 16:18 管理员
     /// 那条点名指令被 20 秒间隔静默丢掉（只差 110 毫秒），所以管理员发言一律
     /// 按 0 秒间隔放行；总额度仍由 `reply_rate_limit` 把守。
+    /// 点名被回复间隔挡下时："还差一点"就等，撞频率上限或差太多就不等。
+    /// 线上 2026-09-14 20:44 那条 @ 只差 9.5 秒，被静默丢掉了。
+    #[test]
+    fn addressed_gap_wait_only_covers_small_gaps() {
+        let snapshot = |gap_remaining_ms: Option<u64>, replies_in_window: usize| {
+            crate::model::GroupReplyBudgetSnapshot {
+                gap_remaining_ms,
+                replies_in_window,
+                rate_limit: 10,
+            }
+        };
+        const MAX: u64 = CORE_ADDRESSED_GAP_MAX_WAIT_MS;
+
+        assert_eq!(
+            addressed_gap_wait_ms(&snapshot(Some(9_497), 4), MAX),
+            Some(9_497)
+        );
+        assert_eq!(
+            addressed_gap_wait_ms(&snapshot(Some(MAX), 4), MAX),
+            Some(MAX)
+        );
+        // 差得太多：让这一轮挂那么久没有意义。
+        assert_eq!(
+            addressed_gap_wait_ms(&snapshot(Some(MAX + 1), 4), MAX),
+            None
+        );
+        // 撞频率上限：等几秒也换不来额度（窗口是分钟级）。
+        assert_eq!(addressed_gap_wait_ms(&snapshot(Some(500), 10), MAX), None);
+        // 已经到点、或读不到间隔：不必等。
+        assert_eq!(addressed_gap_wait_ms(&snapshot(Some(0), 4), MAX), None);
+        assert_eq!(addressed_gap_wait_ms(&snapshot(None, 4), MAX), None);
+    }
+
     #[test]
     fn admin_messages_skip_the_group_reply_gap() {
         let group = crate::config::get().group_interjection().clone();
