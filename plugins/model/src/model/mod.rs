@@ -1,3 +1,4 @@
+pub(crate) mod chat_style;
 pub(crate) mod chinese_time;
 pub(crate) mod coalesce;
 mod conversation_coordinator;

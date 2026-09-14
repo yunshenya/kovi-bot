@@ -109,7 +109,13 @@ const CORE_INBOUND_SPEAKER_CAPACITY: usize = 256;
 /// 出去——比截断更糟。Core 的 `MAX_PLANNER_INTENTS`（32）只约束意图数，
 /// 不约束这个更小的发送批次。
 const MAX_DELIVERABLE_BUBBLES_PER_TURN: usize = 16;
-const CORE_PLAIN_TURN_INSTRUCTION: &str = "Core 可见回复：默认只写一条自然、简短、有实际内容的聊天正文，用陈述句把话说完、说完就停。提问是例外、不是收尾方式：只有确实缺一个非问不可的信息，或对方明确在等你回应时才问；不要为了显得热情或留住话头而追问，也不要用反问、邀请继续提问来凑一句。宿主负责回复动作、发送顺序、并发覆盖和会话状态；不要输出 JSON、动作协议、格式说明或思考过程。确实有两件彼此独立、合并不自然的事要说时（例如先接住对方情绪、再补一件具体的事，或先给结论、再补一句自己的心情），可以写成两个气泡：两个气泡之间单独一行写 [[BUBBLE]]，程序会把它拆成两条消息先后发出；写成两行短话（一行一句完整的话，不是列表、引用或代码）时程序同样会拆成两条。每个气泡都必须带来新的内容，不要为了凑条数重复或换着说法说同一件事；一个完整想法不要拆开，最多三个气泡。如果答案本身需要展开（解释、步骤、对比、分析），就在一到三个气泡之内说完整，每个气泡是一段完整的意思，不要把所有内容挤进一个气泡里——单个气泡写得越长，越有可能被输出长度掐断，说到一半停下来比分成两条更难读。按问题需要可以保留 Markdown、换行或代码。用户明确要求多条消息时，宿主会逐条单独调用并发送，当前仍只需写这一条正文。语气始终温柔、真诚、有分寸：不讽刺、不挖苦、不阴阳怪气、不抬杠、不怼人、不冷嘲热讽，也不拿对方的短处或失败开玩笑。";
+/// Core 可见回复的**回合契约**（怎么写、怎么切气泡、哪些格式不许出现）。
+///
+/// 口气与长度不在这里，在 `HUMAN_CHAT_STYLE`——由 `core_plain_turn_instruction`
+/// 拼进来。2026-09-14 之前这里写着"答案需要展开就在一到三个气泡之内说完整""可以
+/// 保留 Markdown、换行或代码"，于是事实类问题（黎曼猜想、角色属性、分类问题）
+/// 一律被写成百科条目：中位 119 字、最长 428 字、一半带破折号。那份许可已经删掉。
+const CORE_PLAIN_TURN_INSTRUCTION: &str = "Core 可见回复：只写这一轮要发出去的聊天正文，用陈述句把话说完、写完就停。提问是例外、不是收尾方式：只有确实缺一个非问不可的信息，或对方明确在等你回应时才问；不要为了显得热情或留住话头而追问，也不要用反问、邀请继续提问来凑一句。宿主负责回复动作、发送顺序、并发覆盖和会话状态；不要输出 JSON、动作协议、格式说明或思考过程。确实有两件彼此独立、合并不自然的事要说时（例如先接住对方情绪、再补一件具体的事，或先给结论、再补一句自己的心情），可以写成两个气泡：两个气泡之间单独一行写 [[BUBBLE]]，程序会把它拆成两条消息先后发出；写成两行短话（一行一句完整的话，不是列表、引用或代码）时程序同样会拆成两条。每个气泡都必须带来新的内容，不要为了凑条数重复或换着说法说同一件事；一个完整想法不要拆开，最多三个气泡。要讲的东西多时，先把最该说的那一句说出来，剩下的要么省掉，要么压成一句话补在后面；不要为了说全而写成一整段，写得太长会被输出长度掐断，说到一半停下比分成两条更难读。只在对方明确要步骤、代码或公式时才可以分行书写。用户明确要求多条消息时，宿主会逐条单独调用并发送，当前仍只需写这一条正文。语气始终温柔、真诚、有分寸：不讽刺、不挖苦、不阴阳怪气、不抬杠、不怼人、不冷嘲热讽，也不拿对方的短处或失败开玩笑。";
 /// 接续回合的可见回复契约：可以回，也可以不回；只有具体的新内容值得占一条消息。
 const CORE_CONTINUATION_TURN_INSTRUCTION: &str = "Core 群聊接续：这一轮没有点名你，是刚才跟你说话的那个人在接着往下说。先判断这句话里有没有具体的、值得回应的东西：有（问题、请求、新信息、情绪需要接住）就正常回一条；只是“好的”“嗯”“收到”“哈哈”这类收尾，或者你已经答过的事，就留空——留空就是保持沉默，宿主不会因此认为你掉线，也不会追问你为什么不说话。不要为了显得在线而回一句“嗯嗯”“好呀”，那比沉默更像机器。要不要继续、继续说几句，由你判断：有新东西就说，没有就停，没有句数限制。";
 const CORE_AMBIENT_TURN_INSTRUCTION: &str = "Core 群聊注意力：本轮没有直接点名芸汐，只是一次低频候选接话机会。只有确实能增加信息、接住情绪、表达真实反应或自然推进公共话题时，才直接写一条像群友接话的短消息；没有具体价值时保持空白。不要解释沉默，也不要为了证明在线而写‘嗯’‘收到’等占位话。接话时语气温柔、有分寸，不调侃别人的短处，不阴阳怪气。";
@@ -1480,11 +1486,22 @@ fn parse_plain_core_response(content: &str) -> ParsedCoreResponse {
 ///
 /// 唱歌还会把服务当前的旋律模板列给模型（`id（名字，N 个音节，情绪）`）：提示词里
 /// 说得出模板名，模型才写得出合法的 `[[SING 模板id]]`。
+/// 给任意一条回合契约接上共用的口语化契约。
+///
+/// 所有会产生**可见发言**的回合（可见回复、接续、未点名接话、自主续说、私聊）
+/// 都走这里：口气只有一份，避免哪天改了其中一条、另一条还留着百科体。
+fn with_chat_style(instruction: &str) -> String {
+    format!(
+        "{instruction}\n\n{}",
+        crate::model::chat_style::HUMAN_CHAT_STYLE
+    )
+}
+
 fn core_plain_turn_instruction(
     voice_enabled: bool,
     sing_templates: &[crate::sing_reply::SingTemplate],
 ) -> String {
-    let mut instruction = CORE_PLAIN_TURN_INSTRUCTION.to_owned();
+    let mut instruction = with_chat_style(CORE_PLAIN_TURN_INSTRUCTION);
     if voice_enabled {
         instruction.push_str(CORE_VOICE_INSTRUCTION);
     }
@@ -5641,7 +5658,7 @@ impl ModelBackend for KoviModelBackend {
                     0,
                     BotMemory {
                         role: Roles::System,
-                        content: CORE_AUTONOMOUS_PLAIN_TURN_INSTRUCTION.to_owned(),
+                        content: with_chat_style(CORE_AUTONOMOUS_PLAIN_TURN_INSTRUCTION),
                     },
                 );
             }
@@ -5694,7 +5711,9 @@ impl ModelBackend for KoviModelBackend {
                     0,
                     BotMemory {
                         role: Roles::System,
-                        content: "Core 私聊语气：回复要像真实来回的聊天，语气温柔、有分寸，不讽刺、不挖苦、不阴阳怪气、不抬杠。若确实还有自然反应、补充、联想或想确认的点，可以在正文里体现，也可以补一句自己的判断或心情；不用靠提问来把话递回去。会话是否再次唤醒由宿主根据实际发送结果决定。".to_string(),
+                        content: with_chat_style(
+                            "Core 私聊语气：回复要像真实来回的聊天，语气温柔、有分寸，不讽刺、不挖苦、不阴阳怪气、不抬杠。若确实还有自然反应、补充、联想或想确认的点，可以在正文里体现，也可以补一句自己的判断或心情；不用靠提问来把话递回去。会话是否再次唤醒由宿主根据实际发送结果决定。",
+                        ),
                     },
                 );
             }
@@ -5712,9 +5731,9 @@ impl ModelBackend for KoviModelBackend {
                     0,
                     BotMemory {
                         role: Roles::System,
-                        content: format!(
+                        content: with_chat_style(&format!(
                             "{CORE_CONTINUATION_TURN_INSTRUCTION}（这段对话里你已经回了 {replies} 句——这只是事实，不是限制：想继续就继续，觉得没什么可说就停。）"
-                        ),
+                        )),
                     },
                 );
             }
@@ -5723,7 +5742,7 @@ impl ModelBackend for KoviModelBackend {
                     0,
                     BotMemory {
                         role: Roles::System,
-                        content: CORE_AMBIENT_TURN_INSTRUCTION.to_string(),
+                        content: with_chat_style(CORE_AMBIENT_TURN_INSTRUCTION),
                     },
                 );
             }
@@ -7045,20 +7064,26 @@ impl ModelBackend for KoviModelBackend {
                     });
                 }
                 // 对话形状遥测：一条日志同时回答"这轮发了几个气泡""有没有
-                // 提问""有没有登记续聊""想了多久"。线上验收（同会话连续气泡
-                // 占比、提问占比、续聊登记率、回复延迟）直接从这里聚合，
-                // 不再只靠账本猜。
+                // 提问""有没有登记续聊""想了多久""像不像人在群里说话"。
+                // 线上验收（同会话连续气泡占比、提问占比、续聊登记率、回复
+                // 延迟、长度与破折号率）直接从这里聚合，不再只靠账本猜。
+                //
+                // `chars` 与 `dash` 是 2026-09-14 加的：那天量出她的回复中位
+                // 119 字、50% 带破折号「——」，而"太像机器人"这种反馈没有数字
+                // 就只能靠感觉吵。改口气之后拿同一条日志的前后分布对比即可。
                 //
                 // 这行原先挂在 `if let Some(directive)` 里面，而群聊回合从
                 // 来不产生 directive——两个验收指标在群里因此一条都采不到。
                 // 现在无论如何都打，没有 directive 就是 None。
                 {
                     kovi::log::info!(
-                        "Yunxi Core turn shape: event_id={} conversation_id={} kind={:?} bubbles={} asks={} complete={} directive={:?} think_ms={}",
+                        "Yunxi Core turn shape: event_id={} conversation_id={} kind={:?} bubbles={} chars={} dash={} asks={} complete={} directive={:?} think_ms={}",
                         input.event.id(),
                         conversation_id,
                         conversation_kind_for_turn(input),
                         plan.bubbles.len(),
+                        visible_content.chars().count(),
+                        visible_content.matches('—').count(),
                         reply_asks_something(&visible_content),
                         reply_looks_complete(&visible_content),
                         directive,
@@ -7228,8 +7253,9 @@ fn visible_reply_state_updates(event: &WorldEventKind) -> Vec<StateUpdateProposa
 #[cfg(test)]
 mod tests {
     use super::{
-        BoundedCache, BoundedRouteCache, CORE_AUTONOMOUS_INTENT_PROTOCOL, CORE_BUBBLE_MARKER,
-        CORE_CONTINUATION_TURN_INSTRUCTION, CORE_EXPLICIT_BATCH_REPAIR_TIMEOUT,
+        BoundedCache, BoundedRouteCache, CORE_AMBIENT_TURN_INSTRUCTION,
+        CORE_AUTONOMOUS_INTENT_PROTOCOL, CORE_AUTONOMOUS_PLAIN_TURN_INSTRUCTION,
+        CORE_BUBBLE_MARKER, CORE_CONTINUATION_TURN_INSTRUCTION, CORE_EXPLICIT_BATCH_REPAIR_TIMEOUT,
         CORE_GROUP_HISTORY_INSTRUCTION, CORE_GROUP_HISTORY_PREFIX, CORE_MEMORY_CONTEXT_PREFIX,
         CORE_PENDING_OUTGOING_INSTRUCTION, CORE_PENDING_OUTGOING_PLAIN_INSTRUCTION,
         CORE_PLAIN_TURN_INSTRUCTION, CORE_REPLY_REPAIR_PROMPT, CORE_SING_MARKER,
@@ -7274,6 +7300,7 @@ mod tests {
         strip_core_speech_markers, strong_reply_repair_needed, tool_calls_allowed_for_turn,
         tool_protocol_authorized_for_turn, visible_reply_intent, visible_reply_intents,
         visible_reply_invites_continuation, visible_reply_state_updates, visible_turn_continuation,
+        with_chat_style,
     };
     use crate::model::{
         BotMemory, ConversationCoordinator, IncomingTurnImpact, OutgoingExecutiveDecision,
@@ -8697,6 +8724,33 @@ mod tests {
         assert_eq!(core_reply_bubbles_with_max("   ", MAX_CORE_BUBBLES), None);
     }
 
+    /// 线上 2026-09-14：中位 119 字、50% 带破折号、事实类问题写成百科条目。
+    /// 根因之一是这条契约本身写着"可以展开""可以保留 Markdown"——那份许可必须
+    /// 一直不在，同时口语化契约必须在（两条都是回归线，不能只靠文案自觉）。
+    #[test]
+    fn core_visible_turns_carry_the_human_chat_style_and_no_essay_license() {
+        let instruction = core_plain_turn_instruction(false, &[]);
+        assert!(instruction.contains(crate::model::chat_style::HUMAN_CHAT_STYLE));
+        for license in [
+            "按问题需要可以保留 Markdown",
+            "就在一到三个气泡之内说完整",
+            "长度和条数由内容决定",
+        ] {
+            assert!(
+                !instruction.contains(license),
+                "可见回复契约里又出现了长文许可：{license}"
+            );
+        }
+        // 接续、未点名接话、自主续说同样是群里看得见的话，口气必须一致。
+        for other in [
+            with_chat_style(CORE_CONTINUATION_TURN_INSTRUCTION),
+            with_chat_style(CORE_AMBIENT_TURN_INSTRUCTION),
+            with_chat_style(CORE_AUTONOMOUS_PLAIN_TURN_INSTRUCTION),
+        ] {
+            assert!(other.contains(crate::model::chat_style::HUMAN_CHAT_STYLE));
+        }
+    }
+
     #[test]
     fn core_plain_turn_instruction_teaches_the_bounded_bubble_contract() {
         assert!(CORE_PLAIN_TURN_INSTRUCTION.contains(CORE_BUBBLE_MARKER));
@@ -8766,13 +8820,13 @@ mod tests {
         let enabled = core_plain_turn_instruction(true, &[]);
 
         // 关掉 qq_voice 时，模型不该知道自己有一个当下用不了的出口。
+        // 契约本身现在总是带上口语化风格块，所以基准是 `with_chat_style(...)`，
+        // 而不是裸常量——比的是"除语音提示外一字不多"。
+        let baseline = with_chat_style(CORE_PLAIN_TURN_INSTRUCTION);
         assert!(!disabled.contains(CORE_VOICE_MARKER));
-        assert_eq!(disabled, CORE_PLAIN_TURN_INSTRUCTION);
+        assert_eq!(disabled, baseline);
         assert!(enabled.contains(CORE_VOICE_MARKER));
-        assert_eq!(
-            enabled,
-            format!("{CORE_PLAIN_TURN_INSTRUCTION}{CORE_VOICE_INSTRUCTION}")
-        );
+        assert_eq!(enabled, format!("{baseline}{CORE_VOICE_INSTRUCTION}"));
     }
 
     #[test]
