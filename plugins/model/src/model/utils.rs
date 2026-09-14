@@ -3429,6 +3429,12 @@ const GROUP_PAUSE_REDIS_KEY: &str = "group_paused";
 
 pub(crate) async fn set_group_paused(group_id: i64, paused: bool) {
     instance_is_ban().lock().await.insert(group_id, paused);
+    if !paused {
+        // 解禁要连"发送被拒退避"一起清：`is_group_paused` 把两者 OR 在一起，而退避
+        // 只有发送成功才会自动清——QQ 拒过一次之后，管理员解禁了群里却继续静默，
+        // 他看不到任何提示。显式解禁是最明确的"可以再发了"信号。
+        crate::model::send_guard::clear(group_id).await;
+    }
     if let Err(error) = persist_group_pause(group_id, paused).await {
         eprintln!(
             "[WARN] 群禁言状态持久化失败 (群组: {}): {}",

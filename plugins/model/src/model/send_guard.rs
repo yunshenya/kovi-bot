@@ -106,6 +106,17 @@ pub(crate) async fn record_success(group_id: i64) {
     }
 }
 
+/// 显式清除某群的发送退避。
+///
+/// 给"管理员解禁"用：`#结束禁言` 清的是显式暂停，而 `is_group_paused` 把发送退避一起
+/// OR 进来，退避又只有发送成功才会清——被 QQ 拒一次之后管理员再怎么解禁，群里都继续
+/// 静默，且没有任何回执告诉他。这个入口让解禁动作把两半一起清掉。
+pub(crate) async fn clear(group_id: i64) {
+    if let Ok(mut guard) = guard().lock() {
+        guard.record_success(group_id);
+    }
+}
+
 /// 该群是否处于发送被拒退避中。
 pub(crate) async fn is_send_rejected(group_id: i64) -> bool {
     guard()
@@ -160,6 +171,27 @@ mod tests {
                 record_success(7).await;
                 assert!(!is_send_rejected(7).await);
             })
+    }
+
+    /// 管理员解禁要能把"发送被拒退避"一起清掉。
+    ///
+    /// `is_group_paused` 把显式暂停与退避 OR 在一起，而退避只有发送成功才自动清——
+    /// 于是 QQ 拒过一次之后，管理员解禁了群里却继续静默，且看不到任何提示。
+    #[test]
+    fn clear_releases_the_backoff_for_admin_unmute() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let group_id = 424_242;
+                assert!(!is_send_rejected(group_id).await);
+                record_rejection(group_id).await;
+                assert!(is_send_rejected(group_id).await);
+                clear(group_id).await;
+                assert!(
+                    !is_send_rejected(group_id).await,
+                    "解禁之后不该还被退避挡着"
+                );
+            });
     }
 
     #[test]
