@@ -12,6 +12,8 @@
 #   - 续聊登记率 : conversation continuation registered / directive=Continue 的回合
 #   - 续聊成功率 : autonomous conversation tick admitted / 登记数
 #   - 泄漏       : 日志里出现字面 [[BUBBLE]]（应当恒为 0）
+#   - 议论率     : 回复命中格言/议论句式的比例，与她同窗口的真人对照
+#                  （2026-09-14 基线：真人 1%，她 12%，最长连续 6 条）
 #
 # 用法: scripts/verify-chat-shape.sh ["3 hours ago"]
 set -euo pipefail
@@ -91,3 +93,20 @@ echo "--- 出站账本（intent:1 = 一轮第二个气泡）---"
 sudo -u postgres psql -d postgres -tAc \
   "select destination_kind, count(*) filter (where delivery_key like '%:intent:1') as multi_bubble, count(*) as total from yunxi_action_delivery_ledger where created_at > now() - interval '24 hours' group by 1"
 REMOTE
+
+# 回复形状：判据只在 scripts/chat_shape_ab.py 里实现一次，这里把同一窗口的日志喂给它，
+# 免得 bash 再抄一份正则（抄一份就会漂移）。看的是她与**同窗口真人**的对照——
+# 议论率这类指标必须跟同时段的真人比，否则话题密度一变就误判。
+reply_log="$(mktemp)"
+trap 'rm -f "$reply_log"' EXIT
+ssh -o BatchMode=yes -o ConnectTimeout=8 -p "$port" \
+  "$host" "journalctl -u kovi-bot.service --since $(printf '%q' "$since") --no-pager" 2>/dev/null \
+  | grep -E '\[group[0-9]+|\[send\] \[to group' > "$reply_log" || true
+echo
+echo "--- 回复形状（她 vs 同窗口的真人）---"
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -s "$reply_log" ]; then
+  python3 "$script_dir/chat_shape_ab.py" --from-log "$reply_log" || true
+else
+  echo "窗口里没有取到群聊消息（检查 unit 名与窗口）"
+fi
