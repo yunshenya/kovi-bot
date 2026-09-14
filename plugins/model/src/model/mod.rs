@@ -74,7 +74,8 @@ pub(crate) use crate::model::group::{
 };
 
 pub(crate) use crate::model::group_context::{
-    attach_group_context, note_group_message, qq_reply_notice,
+    GROUP_CONTEXT_LIMIT, GROUP_CONTEXT_WINDOW_SECS, attach_group_context, note_group_message,
+    qq_reply_notice,
 };
 
 pub(crate) use crate::model::private::{
