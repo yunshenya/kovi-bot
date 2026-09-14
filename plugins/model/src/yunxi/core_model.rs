@@ -4813,10 +4813,16 @@ fn reply_looks_complete(text: &str) -> bool {
 ///
 /// A 一问一答 conversation stays 一问一答 because the host never answers
 /// again on its own. This is the narrow, trusted place that grants exactly one
-/// more beat, and only when the reply itself asked something or visibly left
-/// something unfinished — the host reacts to its own delivery instead of
-/// hoping the model remembers to emit a directive. The idle window, the
-/// per-inbound turn ceiling, and a fresh inbound all still bound it.
+/// more beat, and it takes **both** halves: the reply must read as finished
+/// (`reply_looks_complete`) *and* it must ask something. The host reacts to its
+/// own delivery instead of hoping the model remembers to emit a directive. The
+/// idle window, the per-inbound turn ceiling, and a fresh inbound all still
+/// bound it.
+///
+/// 这里没有"留了话头也算"这一档：`reply_looks_complete` 判的是**结尾有没有
+/// 收尾标记**，"我在这儿" 这种没有尾标点的口语收尾也会被判成没说完，而"没说完"
+/// 与"被输出预算掐断"在文本上分不开。宁可少给一次续聊，也不要让半句话之后
+/// 再追半句（真正的截断信号 `finish_reason` 在这一层已经拿不到了）。
 fn visible_reply_invites_continuation(bubbles: &[String]) -> bool {
     if bubbles.is_empty() {
         return false;
