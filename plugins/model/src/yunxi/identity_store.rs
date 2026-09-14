@@ -1748,6 +1748,13 @@ impl PostgresIdentityStore {
             CREATE INDEX IF NOT EXISTS yunxi_message_mappings_conversation_idx
                 ON yunxi_message_mappings (conversation_id, platform, external_message_id)
             "#,
+            // 保留期清理是 `DELETE ... WHERE created_at < $1`，而这个表每条进出消息都
+            // 一行：没有这个索引就是每次维护全表扫 + 锁住所有待删行，清理代价随表总量
+            // 涨而不是随过期条数涨。
+            r#"
+            CREATE INDEX IF NOT EXISTS yunxi_message_mappings_created_idx
+                ON yunxi_message_mappings (created_at)
+            "#,
             r#"
             CREATE INDEX IF NOT EXISTS yunxi_conversation_members_person_idx
                 ON yunxi_conversation_members (person_id, conversation_id)

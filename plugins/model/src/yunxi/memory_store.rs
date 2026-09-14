@@ -827,12 +827,21 @@ impl MemoryStore for PostgresMemoryStore {
                 })
                 .filter(|entry| query.text().trim().is_empty() || matches_text(entry, query.text()))
                 .collect::<Vec<_>>();
-            memories.extend(
-                matches
-                    .into_iter()
-                    .filter_map(|entry| to_core_memory(query.scope(), entry).ok())
-                    .collect::<Vec<_>>(),
-            );
+            // 不要用 `.ok()` 把它们静默丢掉：旧行的标签是按**字符**截的（语义抽取 40、
+            // 旧写入 48），而 Core 的 `MAX_MEMORY_TAG_BYTES` 是 **64 字节**——一个 30 字
+            // 的中文标签就有 90 字节，整条记忆（含正文）会在这里被无声丢弃，模型再也
+            // 看不到它，而且行也不会被升级，于是永远看不见。同一份数据在规范表那一路
+            // 是硬错误（`:662` 用 `?` 抛出），两条路对同一条不变量不能各说各话。
+            for entry in matches {
+                // 先取 id：`to_core_memory` 按值吃掉了 entry。
+                let entry_id = entry.id.clone();
+                match to_core_memory(query.scope(), entry) {
+                    Ok(memory) => memories.push(memory),
+                    Err(error) => {
+                        eprintln!("[WARN] 旧记忆投影失败，本条跳过（记忆 id={entry_id}）: {error}")
+                    }
+                }
+            }
             transaction
                 .commit()
                 .await
