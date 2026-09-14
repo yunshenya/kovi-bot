@@ -378,6 +378,40 @@ revision 只是本地 SHA——万一这台 Mac 出问题，这个已上线的�
 
 ---
 
+### 生产配置核查（2026-09-14，推送之后）
+
+发布脚本会提示"继承的配置缺少模板里的键"。逐项核过之后结论是**这条警告是良性的**：
+
+- 缺的 31 个键里，12 个由运行时 `bot.conf.override.toml` 提供（`admin.*`、`qq_sing.*`、
+  `host`/`port`、`[silence]` 的阈值、`turn_gate.*` 等）——override 正是"运维改动不随发布
+  丢失"的那个机制；
+- 其余 19 个（`qq_call` 的 13 个、`ambient_requires_mind_intent`、`core_writeback_enabled`、
+  `model_memory_enabled`、`strong_to_intrinsic_text`、`annotation_dir`、`token`）的**代码默认
+  值与模板值逐个相同**，所以实际生效的就是模板文档里那些值。`qq_call` 虽然是开着的，也
+  没有漂移。
+
+**但"用 GitHub Actions 重新生成配置"这条路不能走**（我上一轮的提议是错的，核完收回）：
+那条路径拿模板整份重新生成 `bot.conf.toml`，会把这些只写在主配置里的运维调整一并重置。
+实测有 2 个键会受害，其中一个是真问题：
+
+- `vision.provider`：生产是 `"intrinsic"` 且配置文件里写明了理由（本机 Intrinsic 已装，
+  `.env` 里那个云端 `VISION_API_URL` 两条都断——401/404；`auto` 会先白等 1~2 秒再退回），
+  而模板为了让新机器安静默认 `disabled`。重新生成 = **本机视觉被无声关掉**。
+- `mind.event_update_timeout_ms`：生产 40 / 模板 150，fail-soft 预算，影响较小。
+
+**已处理**：把 `vision.provider = "intrinsic"` 补进运行时 override（走管理后台
+`PUT /api/config/file/bot.conf.override.toml`，即"校验 → 备份 → 原子写 → 热装载"那条路），
+生效值仍为 `intrinsic`（只换存放位置，行为不变），服务 active、0 WARN/ERROR，自动备份
+`bot.conf.override.toml.bak.1789346958435`。这样它就不会随任何一次发布丢失。
+
+**已知但未动**：模板缺 `embedding_*`（6 个）与 `sticker_reaction_*` 等生产在用的键——
+它们的代码默认值与生产值相同，所以就算重新生成也不会改变行为，只是模板作为"生产模板"
+不够完整。管理后台写入路径对主配置文件还有个已记录的缺陷（`config_api.rs:518-523`：
+主文件单独校验后整份 install，会把 override 从内存配置里挤掉），所以本次**只改 override、
+没碰主配置**。
+
+---
+
 ## 六、两点说明
 
 1. 上面第三、四节的条目里，标了具体行号的都经过至少一次源码复核；但除了
