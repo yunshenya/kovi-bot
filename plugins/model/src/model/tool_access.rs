@@ -628,11 +628,17 @@ pub(crate) async fn initialize() -> Result<()> {
     if config::get().memory().autonomous_query_enabled() {
         definitions.push(ToolDefinition {
             name: "memory.search".to_string(),
-            description: "在当前私聊对象或当前群的长期记忆中检索相关资料。只在已有上下文不足以可靠回答时使用。"
+            description: "在当前私聊对象或当前群的长期记忆中检索相关资料。只在已有上下文不足以可靠回答时使用。只想找**某个群成员**相关的记忆时用 person 填他的名字（只支持群聊）：宿主会把它解析成成员，按成员身份（QQ 号）过滤，并把提到这个名字的记忆一并排前。名字匹配到多个成员时不会猜，会让对方澄清。"
                 .to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
+                    "person": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": MAX_GROUP_MEMBER_QUERY_CHARS,
+                        "description": "要检索谁的记忆：本群成员的群名片、昵称或简称。留空则按当前会话整段检索。"
+                    },
                     "keywords": {
                         "type": "array",
                         "items": {"type": "string"},
@@ -1617,9 +1623,7 @@ async fn execute_builtin(
     match tool {
         BuiltinTool::TimeNow => current_time(&arguments),
         BuiltinTool::TimeResolve => resolve_chinese_time(&arguments),
-        BuiltinTool::MemorySearch => {
-            search_memory(&arguments, tool_context.subject_id, tool_context.context).await
-        }
+        BuiltinTool::MemorySearch => search_memory(&arguments, &tool_context).await,
         BuiltinTool::MemoryRemember => {
             // 写操作：模型想完才调用，期间会话可能已经变了（群被禁言、票被作废），
             // 所以和 reminder.create 一样先重新校验一次再落库。
@@ -2416,13 +2420,91 @@ fn current_time(arguments: &Map<String, Value>) -> Result<String> {
     ))
 }
 
+/// 按人检索时，除了成员身份标记，也把名字当关键词。
+///
+/// 两件事一起要：`QQ=<号>` 命中的是**这个人自己说过的话**（记忆行现在带号），
+/// 名字命中的是**别人提到他的那些行**（"渠月月今天没来"）。SQL 按命中词数排序，
+/// 两条都中的排前面。旧记忆没有号标记，只靠名字也还能找到一部分。
+fn person_memory_keywords(user_id: i64, display_name: &str) -> Vec<String> {
+    let name = display_name.trim();
+    let mut keywords = vec![format!("QQ={user_id}")];
+    if !name.is_empty() {
+        keywords.push(name.to_owned());
+    }
+    keywords
+}
+
+/// 匹配到多个同名成员时**不猜**，把候选报回去让对方澄清。
+fn ambiguous_member_message(person: &str, names: &[String]) -> String {
+    format!(
+        "记忆检索：本群有多个成员匹配「{}」（{}），请说明是哪一位，或改用别称再试。",
+        person.trim(),
+        names.join("、")
+    )
+}
+
 async fn search_memory(
     arguments: &Map<String, Value>,
-    subject_id: i64,
-    context: &str,
+    tool_context: &ToolExecutionContext,
 ) -> Result<String> {
-    let lookup: MemoryLookup = serde_json::from_value(Value::Object(arguments.clone()))
+    let subject_id = tool_context.subject_id;
+    let context = tool_context.context;
+    // `person` 只用于解析成成员身份，不进查询参数结构。
+    let person = arguments
+        .get("person")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    let mut lookup_arguments = arguments.clone();
+    lookup_arguments.remove("person");
+    let mut lookup: MemoryLookup = serde_json::from_value(Value::Object(lookup_arguments))
         .map_err(|error| anyhow!("记忆查询参数无效：{error}"))?;
+
+    let mut person_note = String::new();
+    if let Some(person) = person.as_deref() {
+        // 私聊里"按人查"等于跨人检索（当前主体只有私聊对象本人），不做。
+        let MessageDestination::Group(group_id) = tool_context.destination else {
+            return Err(anyhow!(
+                "按成员检索记忆只能在群聊里使用；私聊里请直接用关键词检索当前对话"
+            ));
+        };
+        let bot = tool_context
+            .runtime_bot
+            .as_deref()
+            .ok_or_else(|| anyhow!("记忆检索没有可用的机器人运行时"))?;
+        let member_data = bot
+            .get_group_member_list(group_id)
+            .await
+            .map_err(|error| anyhow!("读取群成员列表失败：{error:?}"))?
+            .data;
+        let candidates = search_group_member_candidates(&member_data, person);
+        match candidates.as_slice() {
+            [] => {
+                return Ok(format!(
+                    "记忆检索：本群没有找到叫「{}」的成员。可以换个称呼，或去掉 person 直接用关键词搜。",
+                    person.trim()
+                ));
+            }
+            [candidate] => {
+                // 身份关键词**插到最前面**：查询侧对关键词有 5 条上限（按顺序截取），
+                // 追加到末尾会被模型自己给的词挤掉，等于没按人过滤。
+                let mut keywords =
+                    person_memory_keywords(candidate.user_id, &candidate.display_name);
+                keywords.append(&mut lookup.keywords);
+                lookup.keywords = keywords;
+                person_note = format!("（检索范围：本群成员 {}）", candidate.display_name);
+            }
+            many => {
+                let names = many
+                    .iter()
+                    .map(|candidate| candidate.display_name.clone())
+                    .collect::<Vec<_>>();
+                return Ok(ambiguous_member_message(person, &names));
+            }
+        }
+    }
+
     let config = config::get();
     let memories = MEMORY_MANAGER
         .query_memories_for_model(
@@ -2433,7 +2515,11 @@ async fn search_memory(
             config.memory().autonomous_query_max_days(),
         )
         .await?;
-    Ok(format_memory_results(&memories))
+    let results = format_memory_results(&memories);
+    if person_note.is_empty() {
+        return Ok(results);
+    }
+    Ok(format!("{person_note}\n{results}"))
 }
 
 /// `memory.remember`：模型自己判断值得长期留存的事，落到**当前会话**的作用域。
@@ -3810,13 +3896,35 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// 按人检索：身份关键词排在**最前面**（查询侧只取前 5 条），并且名字也在里面
+    /// ——号命中的是"他自己说过的话"，名字命中的是"别人提到他的行"。
+    #[test]
+    fn person_memory_keywords_put_identity_first() {
+        assert_eq!(
+            person_memory_keywords(2_503_880_869, "渠月月"),
+            vec!["QQ=2503880869".to_string(), "渠月月".to_string()]
+        );
+        // 名字缺失时只留身份标记，不会塞进一个空关键词。
+        assert_eq!(
+            person_memory_keywords(123, "   "),
+            vec!["QQ=123".to_string()]
+        );
+
+        // 多个同名成员不猜：把候选列出来让对方澄清。
+        let message =
+            ambiguous_member_message("月月", &["渠月月".to_string(), "小月月".to_string()]);
+        assert!(message.contains("多个成员匹配"), "{message}");
+        assert!(message.contains("渠月月"), "{message}");
+        assert!(message.contains("小月月"), "{message}");
+    }
+
     use super::{
         BuiltinTool, GroupMemberMatchKind, MAX_OUTGOING_MESSAGE_CHARS, MessageDestination,
-        ToolDefinition, ToolExecutionContext, ToolRegistry, ToolSource, calculate, current_time,
-        format_bing_results, format_duckduckgo_results, mcp_tool_is_read_only_for_follow_up,
-        normalize_duckduckgo_url, normalize_outgoing_text, private_contacts_result,
-        search_group_member_candidates, tool_is_explicitly_read_only, tool_name_looks_destructive,
-        validate_public_url,
+        ToolDefinition, ToolExecutionContext, ToolRegistry, ToolSource, ambiguous_member_message,
+        calculate, current_time, format_bing_results, format_duckduckgo_results,
+        mcp_tool_is_read_only_for_follow_up, normalize_duckduckgo_url, normalize_outgoing_text,
+        person_memory_keywords, private_contacts_result, search_group_member_candidates,
+        tool_is_explicitly_read_only, tool_name_looks_destructive, validate_public_url,
     };
     use crate::model::ReplyScope;
     use crate::model::interrupt::{finish, interrupt};

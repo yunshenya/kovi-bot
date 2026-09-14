@@ -176,8 +176,25 @@ mod tests {
                 let other = InboundScope::Private(9_100_002);
                 {
                     let mut state = TRAFFIC_STATE.lock().await;
-                    state.scopes.insert(private, ScopeTraffic::default());
-                    state.scopes.insert(other, ScopeTraffic::default());
+                    // `last_seen` 必须是真的时刻：`should_suppress` 每次都会淘汰
+                    // `last_seen` 过旧（以及为 None）的 scope，而测试是并行跑的——
+                    // 插入 `default()`（last_seen=None）时，别处一次并发调用就能把它
+                    // 顺手删掉，这个断言随即凭空失败（踩过一次）。
+                    let now = Some(std::time::Instant::now());
+                    state.scopes.insert(
+                        private,
+                        ScopeTraffic {
+                            last_seen: now,
+                            ..ScopeTraffic::default()
+                        },
+                    );
+                    state.scopes.insert(
+                        other,
+                        ScopeTraffic {
+                            last_seen: now,
+                            ..ScopeTraffic::default()
+                        },
+                    );
                 }
 
                 assert!(clear_private_traffic(9_100_001).await);
