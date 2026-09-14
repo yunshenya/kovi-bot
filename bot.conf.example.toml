@@ -122,6 +122,10 @@ continuation_focus_ttl_secs = 120
 # 没有停留就会一条一轮。这个值给判为"说完"的接续消息留窗口，让紧接着的
 # 下一条并进来；0 = 判完即成轮，取值受 [message_batch] max_wait_ms 封顶。
 continuation_merge_dwell_ms = 2500
+# 接续合批的等待上限（毫秒）：判"还没说完"时最多等她这么久，也是"一口气
+# 连发几条"能并进同一轮的时间跨度（从这一批第一条算起）。与
+# [message_batch] max_wait_ms 分开：那条管低频插话，这条管她正在跟人对话。
+continuation_merge_wait_ms = 6000
 # 接续回答的最短间隔（秒）。0 = 不受"不要每句都回"的间隔限制（仍受
 # reply_rate_limit 与焦点边界约束）；要留下限就填正数，取值必须
 # ≤ reply_gap_secs，超限按 reply_gap_secs 收口。

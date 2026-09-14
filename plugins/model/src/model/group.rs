@@ -95,6 +95,25 @@ struct GroupInterjectionState {
     ambient_watch: Option<AmbientInterjectionWatch>,
 }
 
+impl GroupInterjectionState {
+    /// 当前焦点对象；`now` / `ttl` 由调用方给定，纯逻辑便于测试与热路径复用。
+    fn focus_user_at(&self, now: Instant, ttl: Duration) -> Option<i64> {
+        self.conversation_focus
+            .filter(|focus| now.saturating_duration_since(focus.since) < ttl)
+            .map(|focus| focus.user_id)
+    }
+
+    /// 群里有人说话：不是焦点对象说的，就说明对话被打断了，焦点结束。
+    fn break_focus_on(&mut self, speaker_user_id: i64) {
+        if self
+            .conversation_focus
+            .is_some_and(|focus| focus.user_id != speaker_user_id)
+        {
+            self.conversation_focus = None;
+        }
+    }
+}
+
 /// 未点名接话只维护本地计数和冷却状态；不会为每一条群消息调用模型。
 static GROUP_INTERJECTION_STATE: LazyLock<Mutex<HashMap<i64, GroupInterjectionState>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -1629,12 +1648,7 @@ pub(crate) async fn break_group_conversation_focus(group_id: i64, speaker_user_i
     let Some(state) = states.get_mut(&group_id) else {
         return;
     };
-    if state
-        .conversation_focus
-        .is_some_and(|focus| focus.user_id != speaker_user_id)
-    {
-        state.conversation_focus = None;
-    }
+    state.break_focus_on(speaker_user_id);
 }
 
 /// 同步查询对话焦点，供采样门这类同步判定使用；抢不到锁时按"没有焦点"处理。
@@ -1649,11 +1663,10 @@ pub(crate) fn group_conversation_focus_user_now(group_id: i64, speaker_user_id: 
             .max(1),
     );
     match GROUP_INTERJECTION_STATE.try_lock() {
-        Ok(states) => states.get(&group_id).is_some_and(|state| {
-            state.conversation_focus.is_some_and(|focus| {
-                focus.user_id == speaker_user_id && focus.since.elapsed() < ttl
-            })
-        }),
+        Ok(states) => states
+            .get(&group_id)
+            .and_then(|state| state.focus_user_at(Instant::now(), ttl))
+            .is_some_and(|user_id| user_id == speaker_user_id),
         Err(_) => false,
     }
 }
@@ -2470,7 +2483,7 @@ mod tests {
     use super::{
         Addressing, DirectTriggerState, GROUP_INTERJECTION_STATE, GroupConversationFocus,
         GroupInterjectionState, GroupSenderIdentity, InterjectionAttempt, PENDING_WINDOW_MESSAGES,
-        admit_understood_group_turn, ambient_sampling_eligible, break_group_conversation_focus,
+        admit_understood_group_turn, ambient_sampling_eligible,
         clear_group_erasure_reply_state_locked, complete_interjection_attempt,
         continuation_window_secs, conversation_active_for_observation, cooling_gate_verdict,
         decision_budget_available, directed_at_others, group_conversation_focus_user_now,
@@ -2609,7 +2622,9 @@ mod tests {
 
     /// 对话焦点：她可见回复谁，谁就是焦点；别人一说话焦点就断；TTL 到期失效。
     ///
-    /// 这三条合起来才是"接续"的边界——没有它们，放宽回复间隔就变成刷屏。
+    /// 三条合起来才是"接续"的边界——没有它们，放宽回复间隔就变成刷屏。
+    /// 断言走纯逻辑 + 阻塞读全局态：生产门用的是 `try_lock`（抢不到锁按"没有
+    /// 焦点"处理，宁可少接一次），那种写法在并发测试里本来就不确定。
     #[test]
     fn conversation_focus_follows_the_replied_person_and_breaks_on_others() {
         kovi::tokio::runtime::Runtime::new()
@@ -2618,34 +2633,36 @@ mod tests {
                 let group_id = 9_120_777;
                 let partner = 1_651_505_261_i64;
                 let other = 3_052_405_886_i64;
+                let ttl = Duration::from_secs(
+                    crate::config::get()
+                        .group_interjection()
+                        .continuation_focus_ttl_secs(),
+                );
 
                 assert!(!group_conversation_focus_user_now(group_id, partner));
                 note_group_conversation_focus(group_id, partner).await;
-                assert!(group_conversation_focus_user_now(group_id, partner));
-                assert!(!group_conversation_focus_user_now(group_id, other));
+                let states = GROUP_INTERJECTION_STATE.lock().await;
+                let state = states.get(&group_id).expect("focus state");
+                assert_eq!(state.focus_user_at(Instant::now(), ttl), Some(partner));
 
                 // 焦点对象自己接着说：焦点保留。
-                break_group_conversation_focus(group_id, partner).await;
-                assert!(group_conversation_focus_user_now(group_id, partner));
+                let mut owned = GroupInterjectionState {
+                    conversation_focus: state.conversation_focus,
+                    ..GroupInterjectionState::default()
+                };
+                owned.break_focus_on(partner);
+                assert_eq!(owned.focus_user_at(Instant::now(), ttl), Some(partner));
 
                 // 别人插话：对话被打断，焦点结束。
-                break_group_conversation_focus(group_id, other).await;
-                assert!(!group_conversation_focus_user_now(group_id, partner));
+                owned.break_focus_on(other);
+                assert_eq!(owned.focus_user_at(Instant::now(), ttl), None);
 
                 // TTL 到期：即使没人插话也不再算接续。
-                note_group_conversation_focus(group_id, partner).await;
-                let ttl = crate::config::get()
-                    .group_interjection()
-                    .continuation_focus_ttl_secs();
-                {
-                    let mut states = GROUP_INTERJECTION_STATE.lock().await;
-                    let state = states.get_mut(&group_id).expect("focus state");
-                    state.conversation_focus = Some(GroupConversationFocus {
-                        user_id: partner,
-                        since: Instant::now() - Duration::from_secs(ttl + 1),
-                    });
-                }
-                assert!(!group_conversation_focus_user_now(group_id, partner));
+                owned.conversation_focus = Some(GroupConversationFocus {
+                    user_id: partner,
+                    since: Instant::now() - ttl - Duration::from_secs(1),
+                });
+                assert_eq!(owned.focus_user_at(Instant::now(), ttl), None);
             });
     }
 

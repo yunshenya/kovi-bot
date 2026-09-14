@@ -126,6 +126,13 @@ impl BatchPolicy {
         self
     }
 
+    /// 覆盖"对方还在说"的等待上限。接续链路用它把窗口放宽到能装下一次
+    /// 连发（Host 链路沿用 `[message_batch] max_wait_ms`）。
+    pub(crate) fn with_max_wait(mut self, max_wait: Duration) -> Self {
+        self.max_wait = max_wait;
+        self
+    }
+
     #[cfg(test)]
     fn testing() -> Self {
         Self {
@@ -723,6 +730,12 @@ mod tests {
             &batch(InputCompletion::Complete),
             false,
         ));
+
+        // 接续链路把窗口放宽到能装下一次连发：判"还没说完"时等的是新窗口，
+        // 而不是 [message_batch] 的那个值。
+        let roomier = policy.with_max_wait(Duration::from_millis(600));
+        let wide = batch_delay(&roomier, &batch(InputCompletion::Incomplete), false);
+        assert!(wide > policy.max_wait, "{wide:?} 应放宽到新窗口");
     }
 
     #[test]
