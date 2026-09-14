@@ -379,13 +379,16 @@ impl Situation {
         Ok(())
     }
 
-    /// Expire in place (Planned/Unknown → Expired), e.g. after the event
-    /// window ended; terminal states are untouched.
+    /// Expire in place, e.g. after the event window ended; terminal states are
+    /// untouched.
+    ///
+    /// 守卫直接用转换表，而不是另写一份状态清单：原来这里手写
+    /// `Planned | Unknown`，与表里的 `(OutcomeUnknown, Expired)` 不一致——于是
+    /// "InProgress → OutcomeUnknown"（生产维护路径会把闲置会话置成它）之后的
+    /// 情境永远过期不掉，而 `status()` 又把它算作 Active，8 个槽位填满后
+    /// `add_situation` 就永久返回 TooManyItems，那之后再也不会记录任何情境。
     pub fn expire(&mut self, now: DateTime<Utc>) -> Result<(), WorldValidationError> {
-        if !matches!(
-            self.state,
-            SituationState::Planned | SituationState::Unknown
-        ) {
+        if !can_transition(self.state, SituationState::Expired) {
             return Err(WorldValidationError::InvalidTransition {
                 from: self.state_label(),
                 to: SituationState::Expired.serde_label(),
@@ -689,6 +692,48 @@ mod tests {
         assert_eq!(situation.ended_at(), Some(now));
         // Terminal states cannot expire again.
         assert!(situation.expire(now).is_err());
+    }
+
+    /// `OutcomeUnknown` 也必须能过期——这正是生产上会卡住的那条路。
+    ///
+    /// 维护路径把闲置会话置成 `InProgress → OutcomeUnknown`，而 `status()` 把
+    /// `OutcomeUnknown` 映射成 Active，于是它占着 `MAX_ACTIVE_SITUATIONS_PER_SCOPE`
+    /// 的名额。过期守卫原来手写 `Planned | Unknown`（与转换表里的
+    /// `(OutcomeUnknown, Expired)` 不一致，还反过来允许表里没有的 `Unknown → Expired`），
+    /// 结果是：槽位填满后 `add_situation` 永久返回 TooManyItems，那之后再也不会记录
+    /// 任何情境。守卫改成用转换表之后两边就不会再各说各话。
+    #[test]
+    fn outcome_unknown_can_expire_like_the_transition_table_says() {
+        let now = Utc::now();
+        let mut situation = sample_situation(now);
+        // Planned → InProgress → OutcomeUnknown：都是转换表允许的，也正是维护路径
+        // 走过的两步（把闲置会话置成 OutcomeUnknown）。
+        for (expected, target) in [
+            (SituationState::Planned, SituationState::InProgress),
+            (SituationState::InProgress, SituationState::OutcomeUnknown),
+        ] {
+            let proposal = SituationTransitionProposal::new(
+                situation.id(),
+                situation.version(),
+                expected,
+                target,
+                0.6,
+                ObservationSource::DerivedObservation,
+                false,
+                None,
+                now,
+            )
+            .expect("proposal");
+            situation
+                .apply_transition(&proposal)
+                .unwrap_or_else(|error| panic!("{expected:?} → {target:?} 应当合法: {error}"));
+        }
+        assert_eq!(situation.status(), SituationStatus::Active);
+
+        situation
+            .expire(now)
+            .expect("OutcomeUnknown 应当能过期，否则活跃名额会被永久占住");
+        assert_eq!(situation.state(), SituationState::Expired);
     }
 
     #[test]
