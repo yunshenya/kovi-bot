@@ -48,22 +48,31 @@
   }
 
   async function api(path, options = {}) {
+    // `raw` 走原始请求体：表情包上传就是图片字节，不能 JSON 化。其余仍按 JSON 提交。
+    const { body, raw, headers: extraHeaders, ...rest } = options;
+    const headers = { ...(extraHeaders || {}) };
+    let payload;
+    if (raw !== undefined) payload = raw;
+    else if (body !== undefined) {
+      headers['Content-Type'] = 'application/json';
+      payload = JSON.stringify(body);
+    }
     const response = await fetch(path, {
       credentials: 'same-origin',
-      headers: options.body ? { 'Content-Type': 'application/json' } : {},
-      ...options,
-      body: options.body ? JSON.stringify(options.body) : undefined,
+      headers,
+      ...rest,
+      body: payload,
     });
     if (response.status === 401) {
       showLogin();
       throw new Error('登录状态已失效，请重新登录');
     }
-    let payload = null;
-    try { payload = await response.json(); } catch (_) { /* 有些响应没有正文 */ }
+    let data = null;
+    try { data = await response.json(); } catch (_) { /* 有些响应没有正文 */ }
     if (!response.ok) {
-      throw new Error((payload && payload.error) || `请求失败（HTTP ${response.status}）`);
+      throw new Error((data && data.error) || `请求失败（HTTP ${response.status}）`);
     }
-    return payload;
+    return data;
   }
 
   function fmtTime(value) {
@@ -229,6 +238,7 @@
     overview: { title: '概览', subtitle: '进程、存储、模型与调度器的现状', render: renderOverview },
     config: { title: '配置', subtitle: '全部参数；保存前会校验，保存时保留注释', render: renderConfigPage },
     memory: { title: '记忆', subtitle: '长期记忆、情节、人物与未完结线索', render: renderMemoryPage },
+    stickers: { title: '表情包', subtitle: '她能发出去的素材：上传、查看、删除', render: renderStickerPage },
     annotation: { title: '标注', subtitle: 'TurnGate 待复核样本：标完直接导出训练集', render: renderAnnotationPage },
     system: { title: '系统', subtitle: '主机、进程、模型与 OneBot 服务端', render: renderSystemPage },
   };
@@ -2342,6 +2352,170 @@
       h('div', { class: 'record-foot' },
         h('span', { text: item.scope_label || '全局' }),
         h('span', { text: relative(item.occurred_at) || fmtTime(item.occurred_at) })));
+  }
+
+  // ───────────────────────────── 表情包 ─────────────────────────────
+  //
+  // 她"发得出去"的那些图。素材只有一个来源：`qq_sticker.dir` 那个目录——这里
+  // 上传/删除的就是她发送时读的文件，所以列表里看到的必然就是能发的，不存在
+  // "后台里有、磁盘上没有"。文件名（去掉扩展名）就是标签；同名不覆盖，服务端
+  // 自动加编号（`开心.png` 已存在就写 `开心-2.png`，仍然归到「开心」下）。
+
+  async function renderStickerPage() {
+    const page = $('#page-stickers');
+    clear(page);
+    page.append(h('div', { class: 'loading', text: '读取表情包素材库…' }));
+    let data;
+    try {
+      data = await api('/api/stickers');
+    } catch (problem) {
+      clear(page);
+      page.append(h('div', { class: 'empty', text: problem.message }));
+      return;
+    }
+    if (currentPage !== 'stickers') return;
+
+    clear(page);
+    page.append(renderStickerStatus(data));
+    page.append(renderStickerUpload(data));
+    page.append(renderStickerGrid(data));
+  }
+
+  function renderStickerStatus(data) {
+    const pill = h('span', {
+      class: `pill ${data.enabled ? 'ok' : 'bad'}`,
+      text: data.enabled ? '已启用' : '未启用',
+    });
+    return h('div', { class: 'card' },
+      h('div', { class: 'card-head' },
+        h('h3', {}, '素材库 ', pill),
+        h('div', { class: 'hint', text: `${data.file_count} 张 · ${data.label_count} 个标签 / 上限 ${data.max_files} 张` })),
+      h('div', { class: 'sticker-facts' },
+        stickerFact('目录', data.dir),
+        stickerFact('可写', data.writable ? '是' : '否（后台传不上去，检查权限或只读挂载）'),
+        stickerFact('单张上限', `${data.max_file_kb} KB`),
+        stickerFact('重扫间隔', `${data.rescan_secs} 秒`)),
+      !data.enabled
+        ? h('div', { class: 'hint' }, '配置里 qq_sticker.enabled = false：素材可以先传好，但她现在不会发。改配置页的 [qq_sticker] 打开即可。')
+        : null,
+      data.enabled && data.file_count === 0
+        ? h('div', { class: 'hint' }, '还没有素材——传一张上去，然后可以在 QQ 里发 #表情列表 / #发表情 标签 直接验收。')
+        : null);
+  }
+
+  function stickerFact(label, value) {
+    return h('div', { class: 'sticker-fact' },
+      h('span', { class: 'sticker-fact-label', text: label }),
+      h('span', { class: 'sticker-fact-value mono', text: value }));
+  }
+
+  function renderStickerUpload(data) {
+    const labelInput = h('input', {
+      class: 'input',
+      id: 'sticker-label',
+      placeholder: '标签，例如：无语又想笑（文件名就是它）',
+      maxlength: '64',
+    });
+    const fileInput = h('input', {
+      class: 'input',
+      id: 'sticker-files',
+      type: 'file',
+      accept: 'image/png,image/jpeg,image/gif,image/webp,image/bmp',
+      multiple: true,
+    });
+    const submit = h('button', {
+      class: 'btn primary',
+      text: '上传',
+      onclick: async () => {
+        const label = labelInput.value.trim();
+        const files = Array.from(fileInput.files || []);
+        if (!label) { toast('先填一个标签', 'bad'); labelInput.focus(); return; }
+        if (!files.length) { toast('先选至少一张图片', 'bad'); return; }
+        submit.disabled = true;
+        const original = submit.textContent;
+        let done = 0;
+        for (const file of files) {
+          submit.textContent = `上传中 ${done + 1}/${files.length}…`;
+          try {
+            await api(`/api/stickers?label=${encodeURIComponent(label)}`, {
+              method: 'POST',
+              raw: file,
+              headers: { 'Content-Type': file.type || 'application/octet-stream' },
+            });
+            done += 1;
+          } catch (problem) {
+            toast(`${file.name}：${problem.message}`, 'bad', 7000);
+          }
+        }
+        submit.disabled = false;
+        submit.textContent = original;
+        if (done) toast(`已上传 ${done} 张`, 'ok');
+        fileInput.value = '';
+        await renderStickerPage();
+      },
+    });
+
+    // 拖进来就传：上传是这一页最高频的动作，不值当先点开文件选择器。
+    const drop = h('div', {
+      class: 'sticker-drop',
+      ondragover: (event) => { event.preventDefault(); drop.classList.add('over'); },
+      ondragleave: () => drop.classList.remove('over'),
+      ondrop: (event) => {
+        event.preventDefault();
+        drop.classList.remove('over');
+        if (!event.dataTransfer || !event.dataTransfer.files.length) return;
+        fileInput.files = event.dataTransfer.files;
+        toast(`已选中 ${event.dataTransfer.files.length} 个文件，填好标签后点上传`, 'ok');
+      },
+    }, '把图片拖到这里，或在下面选择文件');
+
+    return h('div', { class: 'card' },
+      h('div', { class: 'card-head' },
+        h('h3', { text: '上传素材' }),
+        h('div', { class: 'hint', text: '同名不覆盖：会自动加编号，并归到同一个标签下' })),
+      h('div', { class: 'sticker-form' },
+        labelInput,
+        fileInput,
+        submit),
+      drop);
+  }
+
+  function renderStickerGrid(data) {
+    const files = data.files || [];
+    if (!files.length) {
+      return h('div', { class: 'card tight' },
+        h('div', { class: 'hint', text: '素材库现在是空的。' }));
+    }
+    return h('div', { class: 'card' },
+      h('div', { class: 'card-head' },
+        h('h3', { text: '现有素材' }),
+        h('div', { class: 'hint', text: '点缩略图看原图；删除会立刻生效（她下一轮就发不出这张）' })),
+      h('div', { class: 'sticker-grid' },
+        ...files.map((file) => renderStickerTile(file))));
+  }
+
+  function renderStickerTile(file) {
+    const url = `/api/stickers/file/${encodeURIComponent(file.name)}`;
+    return h('div', { class: 'sticker-tile' },
+      h('a', { class: 'sticker-thumb', href: url, target: '_blank', rel: 'noopener', title: '在新标签打开原图' },
+        h('img', { src: url, alt: file.label, loading: 'lazy' })),
+      h('div', { class: 'sticker-meta' },
+        h('div', { class: 'sticker-label', text: file.label, title: file.name }),
+        h('div', { class: 'sticker-sub', text: `${file.name} · ${fmtBytes(file.bytes)}` })),
+      h('button', {
+        class: 'btn danger small',
+        text: '删除',
+        onclick: async () => {
+          if (!window.confirm(`删除「${file.label}」（${file.name}）？`)) return;
+          try {
+            await api(`/api/stickers/file/${encodeURIComponent(file.name)}`, { method: 'DELETE' });
+            toast('已删除', 'ok');
+          } catch (problem) {
+            toast(problem.message, 'bad');
+          }
+          await renderStickerPage();
+        },
+      }));
   }
 
   // ───────────────────────────── 标注 ─────────────────────────────

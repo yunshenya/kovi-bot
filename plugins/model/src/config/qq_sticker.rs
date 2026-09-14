@@ -44,6 +44,11 @@ impl QqStickerConfig {
         self.max_file_kb.saturating_mul(1024)
     }
 
+    /// 单文件上限的原始单位（KB）。后台要把它显示给人看，并据此设置上传体上限。
+    pub fn max_file_kb(&self) -> u64 {
+        self.max_file_kb
+    }
+
     pub fn prompt_labels(&self) -> usize {
         self.prompt_labels
     }

@@ -1286,3 +1286,50 @@ a.stat:hover, .stat.link:hover { border-color: var(--accent); transform: transla
 
 /* 队列底部"再加载一屏"：跳过不会移出队列，得能继续往下看 */
 .annotate-more { align-self: center; margin-top: 2px; }
+
+/* ───────────────────────────── 表情包页 ─────────────────────────────
+   素材是图片，缩略图网格是这一页的主要信息；宽窄屏都用同一套 auto-fill，
+   不另做断点：手机上一列、桌面四到六列都由浏览器按图宽算。 */
+.sticker-facts { display: flex; flex-wrap: wrap; gap: 8px 22px; margin-bottom: 4px; }
+.sticker-fact { display: flex; align-items: baseline; gap: 8px; font-size: 12px; }
+.sticker-fact-label { color: var(--text-faint); }
+.sticker-fact-value { color: var(--text-dim); word-break: break-all; }
+
+.sticker-form { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+.sticker-form .input { flex: 1; min-width: 200px; }
+/* 文件选择器不跟着拉伸：它自带按钮宽度，撑满一行反而更难看出点哪里。 */
+.sticker-form input[type="file"] { flex: 0 1 260px; padding: 5px 8px; }
+
+.sticker-drop {
+  margin-top: 10px; padding: 14px; text-align: center;
+  border: 1px dashed var(--border-strong); border-radius: var(--radius-sm);
+  color: var(--text-faint); font-size: 12px;
+  transition: border-color .15s, color .15s, background .15s;
+}
+.sticker-drop.over { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
+
+.sticker-grid {
+  display: grid; gap: 12px;
+  grid-template-columns: repeat(auto-fill, minmax(132px, 1fr));
+}
+.sticker-tile {
+  display: flex; flex-direction: column; gap: 8px;
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  background: var(--bg-elev-2); padding: 10px;
+}
+/* 方形容器 + contain：竖图和横图都完整可见，不裁掉表情的关键部分。 */
+.sticker-thumb {
+  display: flex; align-items: center; justify-content: center;
+  aspect-ratio: 1 / 1; border-radius: var(--radius-sm);
+  background: var(--bg-sunken); overflow: hidden;
+}
+.sticker-thumb img { max-width: 100%; max-height: 100%; object-fit: contain; }
+.sticker-meta { min-width: 0; }
+.sticker-label {
+  font-size: 13px; color: var(--text);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.sticker-sub {
+  font-size: 11px; color: var(--text-faint); font-family: var(--mono);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}

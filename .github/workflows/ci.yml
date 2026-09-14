@@ -106,6 +106,14 @@ jobs:
           sticker_library::tests::configured_library_renders_a_sendable_image_segment
           -- --ignored --exact
 
+      # 后台表情包接口的端到端：真 HTTP 服务 + 真目录（上传 → 列表 → 取原图 →
+      # 越界路径被拒 → 删除），同样要改进程级配置。
+      - name: Run sticker admin API test
+        run: >-
+          cargo test -p model --lib --locked
+          admin::sticker_api::tests::sticker_api_round_trips_over_http
+          -- --ignored --exact
+
       - name: Run black-box Redis integration test
         env:
           REDIS_URL: redis://127.0.0.1:6379/15

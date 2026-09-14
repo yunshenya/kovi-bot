@@ -149,6 +149,221 @@ fn ensure_directory_exists(dir: &Path) -> std::io::Result<bool> {
     Ok(true)
 }
 
+/// 素材目录（无论配置开没开都解析得出来）。
+pub(crate) fn directory_path() -> PathBuf {
+    crate::config::sticker_library_path()
+}
+
+/// 让下一次访问重新扫目录。
+///
+/// 后台传完/删完素材后必须立刻调用：默认 `rescan_secs` 是 30 秒，不这样的话
+/// "刚传完就去 QQ 里试"会撞上还没过期的旧索引，看起来像没传上去。
+pub(crate) fn invalidate_index() {
+    if let Ok(mut index) = INDEX.lock() {
+        index.scanned_at = None;
+    }
+}
+
+/// 素材库入库/删除时的失败原因。
+///
+/// 区分"请求本身不合法"（后台回 400，把原因原样告诉人）与"机器这一侧不行"
+/// （IO/权限，回 500 或按 `admin.annotation_dir` 的约定解释成 400）。
+#[derive(Debug)]
+pub(crate) enum StickerStoreError {
+    Invalid(String),
+    Io(String),
+}
+
+/// 素材库里的一张图（后台列表用它）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StickerFileEntry {
+    pub(crate) name: String,
+    pub(crate) label: String,
+    pub(crate) bytes: u64,
+    pub(crate) modified_unix_secs: Option<u64>,
+}
+
+/// 当前素材清单（按标签、再按文件名排序），带上体积与修改时间。
+///
+/// 目录不存在时返回空列表——后台据此显示"还没有素材"，而不是报错。
+pub(crate) fn listing() -> Vec<StickerFileEntry> {
+    let dir = directory_path();
+    let mut entries = Vec::new();
+    for (label, files) in scan_directory(&dir, crate::config::get().qq_sticker().max_files()) {
+        for path in files {
+            let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            let metadata = std::fs::metadata(&path).ok();
+            entries.push(StickerFileEntry {
+                name: name.to_string(),
+                label: label.clone(),
+                bytes: metadata.as_ref().map_or(0, std::fs::Metadata::len),
+                modified_unix_secs: metadata
+                    .and_then(|metadata| metadata.modified().ok())
+                    .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|duration| duration.as_secs()),
+            });
+        }
+    }
+    entries
+}
+
+/// 后台/脚本传来的一张图，落到素材目录里。
+///
+/// 返回实际写下的文件名（标签一样时自动加编号，不会覆盖已有素材）。落盘是
+/// "临时文件 + rename"的原子替换，扫目录的一方永远看不到写了一半的图。
+pub(crate) fn store_upload(label: &str, bytes: &[u8]) -> Result<String, StickerStoreError> {
+    let config = crate::config::get();
+    let sticker = config.qq_sticker();
+    let stem = file_stem_for_label(label)?;
+    if bytes.is_empty() {
+        return Err(StickerStoreError::Invalid("上传内容是空的".to_string()));
+    }
+    let limit = sticker.max_file_bytes();
+    if bytes.len() as u64 > limit {
+        return Err(StickerStoreError::Invalid(format!(
+            "单张表情不能超过 {} KB（当前 {} KB）",
+            limit / 1024,
+            bytes.len().div_ceil(1024)
+        )));
+    }
+    let extension = extension_for_image(bytes).ok_or_else(|| {
+        StickerStoreError::Invalid(
+            "只支持 PNG / JPEG / GIF / WebP / BMP；文件内容看起来不是图片".to_string(),
+        )
+    })?;
+
+    let dir = directory_path();
+    // 上传是管理员的显式动作：即使 `qq_sticker` 还没打开，也允许先把素材备好。
+    ensure_directory_exists(&dir).map_err(|error| {
+        StickerStoreError::Io(format!("创建素材目录失败 ({}): {error}", dir.display()))
+    })?;
+    let existing = scan_directory(&dir, sticker.max_files().saturating_add(1));
+    let count = existing.values().map(Vec::len).sum::<usize>();
+    if count >= sticker.max_files() {
+        return Err(StickerStoreError::Invalid(format!(
+            "素材数量已达上限（{} 张），先删几张或调大 qq_sticker.max_files",
+            sticker.max_files()
+        )));
+    }
+
+    let name = next_available_name(&dir, &stem, extension);
+    let path = dir.join(&name);
+    let temp = dir.join(format!(".{name}.upload-{}", std::process::id()));
+    std::fs::write(&temp, bytes).map_err(|error| {
+        StickerStoreError::Io(format!("写入素材失败 ({}): {error}", temp.display()))
+    })?;
+    if let Err(error) = std::fs::rename(&temp, &path) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(StickerStoreError::Io(format!(
+            "保存素材失败 ({}): {error}",
+            path.display()
+        )));
+    }
+    invalidate_index();
+    println!(
+        "[INFO] 表情包素材已入库: {} ({} 字节)",
+        path.display(),
+        bytes.len()
+    );
+    Ok(name)
+}
+
+/// 删除一张素材（只接受素材目录里的裸文件名）。
+pub(crate) fn delete_upload(name: &str) -> Result<(), StickerStoreError> {
+    let path = validated_file_path(name)?;
+    std::fs::remove_file(&path).map_err(|error| match error.kind() {
+        std::io::ErrorKind::NotFound => StickerStoreError::Invalid(format!("素材不存在: {name}")),
+        _ => StickerStoreError::Io(format!("删除素材失败 ({}): {error}", path.display())),
+    })?;
+    invalidate_index();
+    println!("[INFO] 表情包素材已删除: {}", path.display());
+    Ok(())
+}
+
+/// 读取一张素材（后台缩略图用）。
+pub(crate) fn read_upload(name: &str) -> Result<Vec<u8>, StickerStoreError> {
+    let path = validated_file_path(name)?;
+    std::fs::read(&path).map_err(|error| match error.kind() {
+        std::io::ErrorKind::NotFound => StickerStoreError::Invalid(format!("素材不存在: {name}")),
+        _ => StickerStoreError::Io(format!("读取素材失败 ({}): {error}", path.display())),
+    })
+}
+
+/// 裸文件名 → 目录内的路径。
+///
+/// 与标注那边的批次名同一条思路：拒绝分隔符、`..`、隐藏文件与超长名字之后，
+/// `join` 的结果必然是该目录的直接子项，请求拼不出目录之外的路径。
+fn validated_file_path(name: &str) -> Result<PathBuf, StickerStoreError> {
+    let name = name.trim();
+    let reject =
+        || StickerStoreError::Invalid("文件名不合法：只接受素材目录内的图片文件名".to_string());
+    if name.is_empty() || name.len() > 255 || name.starts_with('.') {
+        return Err(reject());
+    }
+    if name.contains(['/', '\\']) || name.contains("..") {
+        return Err(reject());
+    }
+    if !is_supported_image_path(Path::new(name)) {
+        return Err(reject());
+    }
+    Ok(directory_path().join(name))
+}
+
+/// 标签 → 文件名主干：只留安全字符，任何输入都拼不出越界的路径。
+///
+/// 首尾的空格与点一律去掉（`.`、`..`、隐藏文件都不是合法主干），标签里的路径
+/// 分隔符、控制字符与 Windows 保留字符一并剔除。
+fn file_stem_for_label(label: &str) -> Result<String, StickerStoreError> {
+    let cleaned: String = label
+        .chars()
+        .filter(|character| {
+            !character.is_control()
+                && !matches!(
+                    character,
+                    '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|'
+                )
+        })
+        .collect();
+    let cleaned = cleaned.trim_matches([' ', '.', '\t']);
+    if cleaned.is_empty() {
+        return Err(StickerStoreError::Invalid(
+            "标签不能为空（去掉空格和非法字符之后就什么都不剩了）".to_string(),
+        ));
+    }
+    Ok(cleaned.chars().take(MAX_LABEL_CHARS).collect())
+}
+
+/// 不覆盖已有素材：`开心.png` 已存在就写 `开心-2.png`（编号会被标签解析重新归到
+/// 「开心」下，所以标签语义不变）。
+fn next_available_name(dir: &Path, stem: &str, extension: &str) -> String {
+    let first = format!("{stem}.{extension}");
+    if !dir.join(&first).exists() {
+        return first;
+    }
+    for index in 2..=9_999_u32 {
+        let candidate = format!("{stem}-{index}.{extension}");
+        if !dir.join(&candidate).exists() {
+            return candidate;
+        }
+    }
+    // 理论上到不了这里（9998 张同名图）；真到了也别覆盖，用进程号兜一个唯一名。
+    format!("{stem}-{}.{extension}", std::process::id())
+}
+
+/// 图片内容类型（缩略图响应头用）：按文件头判断，不听扩展名。
+pub(crate) fn image_content_type(bytes: &[u8]) -> &'static str {
+    match extension_for_image(bytes) {
+        Some("png") => "image/png",
+        Some("jpg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("bmp") => "image/bmp",
+        _ => "application/octet-stream",
+    }
+}
+
 #[derive(Debug, Default)]
 struct StickerIndex {
     scanned_at: Option<Instant>,
@@ -499,22 +714,39 @@ fn next_sticker_file(label: &str) -> Option<PathBuf> {
 }
 
 /// 只认文件头，不认扩展名：运维把 `.txt` 改名成 `.png` 时应当当场发现，
-/// 而不是把一段文本当图片发给 QQ。
-fn looks_like_supported_image(bytes: &[u8]) -> bool {
+/// 而不是把一段文本当图片发给 QQ。返回该内容应使用的扩展名。
+fn extension_for_image(bytes: &[u8]) -> Option<&'static str> {
     const PNG: &[u8] = &[0x89, b'P', b'N', b'G'];
     const JPEG: &[u8] = &[0xFF, 0xD8, 0xFF];
-    bytes.starts_with(PNG)
-        || bytes.starts_with(JPEG)
-        || bytes.starts_with(b"GIF8")
-        || bytes.starts_with(b"BM")
-        || (bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP")
+    if bytes.starts_with(PNG) {
+        return Some("png");
+    }
+    if bytes.starts_with(JPEG) {
+        return Some("jpg");
+    }
+    if bytes.starts_with(b"GIF8") {
+        return Some("gif");
+    }
+    if bytes.starts_with(b"BM") {
+        return Some("bmp");
+    }
+    if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        return Some("webp");
+    }
+    None
+}
+
+/// 内容像不像一张能发的图。收录与上传共用这一处判断。
+fn looks_like_supported_image(bytes: &[u8]) -> bool {
+    extension_for_image(bytes).is_some()
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        StickerLibraryCommand, ensure_directory_exists, label_for_path, looks_like_supported_image,
-        parse_command, resolve_in, scan_directory, strip_trailing_ordinal,
+        StickerLibraryCommand, ensure_directory_exists, extension_for_image, file_stem_for_label,
+        label_for_path, looks_like_supported_image, next_available_name, parse_command, resolve_in,
+        scan_directory, strip_trailing_ordinal, validated_file_path,
     };
     use std::path::{Path, PathBuf};
 
@@ -647,6 +879,82 @@ mod tests {
         assert!(ensure_directory_exists(&blocked).is_err());
 
         let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    /// 标签会变成文件名：任何输入都不能拼出目录之外的路径，也不能变成隐藏文件。
+    #[test]
+    fn labels_become_safe_file_stems() {
+        assert_eq!(
+            file_stem_for_label("无语又想笑").expect("合法"),
+            "无语又想笑"
+        );
+        assert_eq!(file_stem_for_label("  开心  ").expect("合法"), "开心");
+        // 路径分隔符、控制字符与 Windows 保留字符都被剔掉。
+        assert_eq!(
+            file_stem_for_label("../../etc/passwd").expect("合法"),
+            "etcpasswd"
+        );
+        assert_eq!(file_stem_for_label("a/b\\c:d*e?f").expect("合法"), "abcdef");
+        assert_eq!(file_stem_for_label("开心\n难过").expect("合法"), "开心难过");
+        // 去掉首尾的点：`.`、`..`、隐藏文件都不是合法主干。
+        assert!(file_stem_for_label(".").is_err());
+        assert!(file_stem_for_label("..").is_err());
+        assert!(file_stem_for_label("   ").is_err());
+        assert!(
+            file_stem_for_label(".hidden")
+                .expect("合法")
+                .starts_with("hidden")
+        );
+        // 超长标签按上限截断，不会写出超长文件名。
+        let long = file_stem_for_label(&"开".repeat(200)).expect("合法");
+        assert_eq!(long.chars().count(), super::MAX_LABEL_CHARS);
+    }
+
+    /// 只接受素材目录里的裸图片文件名：分隔符、`..`、隐藏文件、非图片一律拒绝。
+    #[test]
+    fn stored_file_names_cannot_escape_the_directory() {
+        assert!(validated_file_path("开心.png").is_ok());
+        assert!(validated_file_path("开心-2.gif").is_ok());
+        for bad in [
+            "../bot.conf.toml",
+            "..",
+            ".",
+            "a/b.png",
+            "a\\b.png",
+            ".hidden.png",
+            "notes.txt",
+            "",
+        ] {
+            assert!(validated_file_path(bad).is_err(), "{bad} 不该被接受");
+        }
+    }
+
+    /// 同名不覆盖：第二张自动加编号，而编号会被标签解析重新归到同一个标签下。
+    #[test]
+    fn uploads_never_overwrite_an_existing_sticker() {
+        let dir = temp_dir("collision");
+        assert_eq!(next_available_name(&dir, "开心", "png"), "开心.png");
+        std::fs::write(dir.join("开心.png"), b"x").expect("应能写文件");
+        assert_eq!(next_available_name(&dir, "开心", "png"), "开心-2.png");
+        std::fs::write(dir.join("开心-2.png"), b"x").expect("应能写文件");
+        assert_eq!(next_available_name(&dir, "开心", "png"), "开心-3.png");
+        // 编号仍然是同一个标签：这是"传第二张同表情"不改变语义的前提。
+        assert_eq!(
+            label_for_path(Path::new("/tmp/stickers/开心-3.png")),
+            Some("开心".to_string())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 扩展名由文件头决定，不听客户端给的文件名。
+    #[test]
+    fn upload_extension_comes_from_the_content() {
+        assert_eq!(extension_for_image(&[0x89, b'P', b'N', b'G']), Some("png"));
+        assert_eq!(extension_for_image(&[0xFF, 0xD8, 0xFF, 0xE0]), Some("jpg"));
+        assert_eq!(extension_for_image(b"GIF89a"), Some("gif"));
+        assert_eq!(extension_for_image(b"BM____"), Some("bmp"));
+        assert_eq!(extension_for_image(b"RIFF____WEBPVP8 "), Some("webp"));
+        assert_eq!(extension_for_image(b"not an image"), None);
     }
 
     #[test]

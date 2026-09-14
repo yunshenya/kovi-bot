@@ -19,6 +19,7 @@ mod auth;
 mod config_api;
 mod memory_api;
 mod status_api;
+mod sticker_api;
 mod token;
 
 use crate::config::AdminConfig;
@@ -372,6 +373,18 @@ pub(crate) fn router(state: Arc<AdminState>) -> Router {
         .route("/api/annotation/mark", post(annotation_api::mark))
         .route("/api/annotation/export", post(annotation_api::export))
         .route("/api/annotation/download", get(annotation_api::download))
+        .route(
+            "/api/stickers",
+            get(sticker_api::list).post(sticker_api::upload).layer(
+                // 上传体是原始图片字节，最大可到几 MB；axum 默认只收 2 MB。
+                // 这一层只挂在这个路由上：别的接口（配置、记忆）不该跟着放宽。
+                sticker_api::body_limit(),
+            ),
+        )
+        .route(
+            "/api/stickers/file/{name}",
+            get(sticker_api::download).delete(sticker_api::remove),
+        )
         .layer(axum::middleware::from_fn_with_state(
             Arc::clone(&state),
             auth::require_session,
