@@ -135,7 +135,8 @@ fn drain_bounded(reader: impl std::io::Read, cap: usize) -> String {
 async fn run_bounded_command(command: &str, timeout: Duration) -> anyhow::Result<(i32, String)> {
     let command = command.to_owned();
     kovi::tokio::task::spawn_blocking(move || {
-        use std::io::Read;
+        // 不再需要 `use std::io::Read`：读取挪进 `drain_bounded`，而它接收的是
+        // `impl Read`，trait 方法随类型参数一起可见。
         use std::process::{Command, Stdio};
         let mut child = Command::new("sh")
             .arg("-c")
