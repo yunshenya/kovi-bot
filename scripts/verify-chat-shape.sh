@@ -43,6 +43,15 @@ log="$(mktemp)"
 trap 'rm -f "$log"' EXIT
 journalctl -u kovi-bot.service --since "$since" --no-pager > "$log" 2>/dev/null
 
+# 取不到日志时必须当场失败：下面所有指标都是 grep -c，空日志会让它们全部为 0——
+# 包括"BUBBLE 泄漏 : 0"这种结论。运维/CI 看到一排 0 会读成"没有问题"，而这个脚本
+# 存在的意义恰恰是防止这种假通过（刚换过 unit 名、账号没有 journal 读权限、
+# 窗口里服务根本没起过，都会走到这里）。
+if [ ! -s "$log" ]; then
+  echo "journalctl 没有取到任何日志（检查 unit 名、窗口与 journal 读权限）" >&2
+  exit 1
+fi
+
 count() { grep -c "$1" "$log" 2>/dev/null || true; }
 
 echo "窗口: $since   日志行数: $(wc -l < "$log")"
