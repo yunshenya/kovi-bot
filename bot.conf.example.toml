@@ -144,7 +144,9 @@ continuation_reply_gap_secs = 0
 continuation_window_secs = 60
 # 群聊可见回复节奏的确定性硬限制（显式识图/教学/命令不受限，管理员与普通
 # 成员同等受限）：同群两次可见聊天回复至少间隔 reply_gap_secs，每
-# reply_rate_window_secs 内最多 reply_rate_limit 条。
+# reply_rate_window_secs 内最多 reply_rate_limit 条。2026-09-14 实测：一场
+# 正常来回 50 秒就把 4 条打满，之后 600 秒内连被点名的消息都会被静默；
+# 抬到 10 后防刷屏仍由 reply_gap 与逐回合限流承担。
 # 这是"几乎每句话她都回复"的最终兜底——无论模型想接多少，同群可见回复
 # 频率都被压住，管理员也不例外。
 reply_gap_secs = 90
@@ -156,7 +158,7 @@ reply_gap_secs = 90
 # reply_gap_secs。
 addressed_reply_gap_secs = 20
 reply_rate_window_secs = 600
-reply_rate_limit = 4
+reply_rate_limit = 10
 
 [memory]
 # 数据库连接池：全进程共用。默认 5 条 / 等 30 秒，与一直以来的行为一致。

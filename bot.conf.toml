@@ -99,12 +99,14 @@ continuation_window_secs = 60
 # 群聊可见回复节奏的确定性硬限制（显式识图/教学/命令不受限，管理员与普通
 # 成员同等受限）：同群两次可见聊天回复至少间隔 reply_gap_secs，每
 # reply_rate_window_secs 内最多 reply_rate_limit 条。防止“每句话都回”。
+# 2026-09-14 实测：一场正常来回 50 秒就把 4 条打满，之后 600 秒内连被点名的
+# 消息都会被静默；抬到 10，防刷屏仍由 reply_gap 与逐回合限流承担。
 reply_gap_secs = 90
 # 被明确点名/被引用的消息用更短的等待：直接提问不该因为“刚回过别人”
 # 被静默丢掉。频率上限与普通通道一致，取值必须 ≤ reply_gap_secs。
 addressed_reply_gap_secs = 20
 reply_rate_window_secs = 600
-reply_rate_limit = 4
+reply_rate_limit = 10
 
 [memory]
 max_entries = 1000
