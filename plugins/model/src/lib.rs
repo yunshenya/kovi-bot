@@ -372,8 +372,17 @@ async fn queue_group_continuation(
         pending_outgoing: false,
     };
     let completion_text = text.clone();
+    // 停留：判"说完了"也不立刻成轮，给连发的下一条留窗口——否则"三条一个请求"
+    // 会被拆成三轮（第一条本身是完整句子时就成轮了）。
+    let policy = crate::model::coalesce::BatchPolicy::from_config().with_min_dwell(
+        std::time::Duration::from_millis(
+            crate::config::get()
+                .group_interjection()
+                .continuation_merge_dwell_ms(),
+        ),
+    );
     let batch = CORE_CONTINUATION_BATCHES
-        .push_with_turn_gate(
+        .push_with_turn_gate_and_policy(
             (group_id, user_id),
             MessagePart {
                 text: text.clone(),
@@ -386,6 +395,7 @@ async fn queue_group_continuation(
                 message_ids: vec![event.message_id],
             },
             context,
+            policy,
             || async move {
                 match crate::yunxi::intrinsic_runtime::get() {
                     Some(runtime) => runtime.classify_input_completion(&completion_text).await,

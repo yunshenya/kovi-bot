@@ -86,7 +86,7 @@ impl Default for PendingBatch {
 }
 
 #[derive(Clone, Copy)]
-struct BatchPolicy {
+pub(crate) struct BatchPolicy {
     enabled: bool,
     complete_delay: Duration,
     normal_delay: Duration,
@@ -95,10 +95,17 @@ struct BatchPolicy {
     max_parts: usize,
     max_chars: usize,
     max_input_chars: usize,
+    /// 批次成轮前的**最短停留**：即使语义判定"说完了"，也至少等这么久，
+    /// 让连发的下一条有机会并进来。0 = 立刻成轮（Host 链路的默认行为）。
+    ///
+    /// 为什么需要它：完成度判的是"这句话说完了没"，不是"这条请求说完了没"。
+    /// 用户分三条发一个请求时，前两条往往每条都是完整句子——没有停留，
+    /// 第一条一到就成轮，三条就变成三轮（2026-09-14 的接续链路实测）。
+    min_dwell: Duration,
 }
 
 impl BatchPolicy {
-    fn from_config() -> Self {
+    pub(crate) fn from_config() -> Self {
         let batching = config::get().message_batch().clone();
         Self {
             enabled: batching.enabled(),
@@ -109,7 +116,14 @@ impl BatchPolicy {
             max_parts: batching.max_parts(),
             max_chars: batching.max_chars(),
             max_input_chars: config::get().traffic().max_input_chars(),
+            min_dwell: Duration::ZERO,
         }
+    }
+
+    /// 给批次加一个最短停留（接续链路用，见 [`BatchPolicy::min_dwell`]）。
+    pub(crate) fn with_min_dwell(mut self, min_dwell: Duration) -> Self {
+        self.min_dwell = min_dwell;
+        self
     }
 
     #[cfg(test)]
@@ -123,6 +137,7 @@ impl BatchPolicy {
             max_parts: 6,
             max_chars: 500,
             max_input_chars: 6_000,
+            min_dwell: Duration::ZERO,
         }
     }
 }
@@ -158,6 +173,25 @@ where
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = InputCompletion>,
     {
+        self.push_with_turn_gate_and_policy(key, part, context, BatchPolicy::from_config(), legacy)
+            .await
+    }
+
+    /// 同 [`Self::push_with_turn_gate`]，但由调用方给定批次策略。
+    ///
+    /// 接续链路要在这里加最短停留（`min_dwell`），Host 链路保持"判完就成轮"。
+    pub(crate) async fn push_with_turn_gate_and_policy<F, Fut>(
+        &self,
+        key: K,
+        part: MessagePart,
+        context: TurnGateBatchContext,
+        policy: BatchPolicy,
+        legacy: F,
+    ) -> Option<TextBatch>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = InputCompletion>,
+    {
         let completion = if let Some(runtime) = crate::yunxi::turn_gate_runtime::get() {
             let pending_fragments = {
                 let pending = self.pending.lock().await;
@@ -184,7 +218,7 @@ where
             legacy().await
         };
         let mut batch = self
-            .push_with_completion_policy(key, part, completion, BatchPolicy::from_config())
+            .push_with_completion_policy(key, part, completion, policy)
             .await?;
         // Phase 3/4:批次成型后用同一份(空白 pending)输入跑 response
         // head——shadow 只记账;active 时连同决策写入 TextBatch 供门控。
@@ -321,29 +355,7 @@ where
             }
             batch.updated_at = now;
 
-            let reached_capacity =
-                batch.parts.len() >= policy.max_parts || batch.char_count >= policy.max_chars;
-            let remaining = policy.max_wait.saturating_sub(batch.started_at.elapsed());
-            // 图片常常先发、文字问题随后补发；给首个纯图片批次完整窗口，避免过早启动模型请求。
-            let semantic_delay = if batch.parts.len() == 1 && image_only_part {
-                policy.max_wait
-            } else if matches!(batch.completion, Some(InputCompletion::Complete)) {
-                Duration::ZERO
-            } else if matches!(batch.completion, Some(InputCompletion::Incomplete)) {
-                // Wait for a follow-up ingress. max_wait is only a watchdog
-                // for a client that never sends the rest of its thought.
-                policy.max_wait
-            } else {
-                adaptive_delay(
-                    batch.parts.last().map(String::as_str).unwrap_or_default(),
-                    policy,
-                )
-            };
-            if reached_capacity {
-                Duration::ZERO
-            } else {
-                semantic_delay.min(remaining)
-            }
+            batch_delay(&policy, batch, image_only_part)
         };
         if !delay.is_zero() {
             kovi::tokio::time::sleep(delay).await;
@@ -372,6 +384,34 @@ where
             turn_gate_response: None,
         })
     }
+}
+
+/// 一个已经吸收了本次 part 的批次该等多久再成轮。
+///
+/// 优先级：容量到顶 → 不等；首条纯图片 → 给满窗口（图片常先发、文字随后补）；
+/// 语义"说完了" → 只等 `min_dwell`；语义"还没说完" → 等到 `max_wait`（它只是
+/// "对方一直没把话说完"的看门狗）；门控弃权（没有语义结论）→ 词法自适应。
+/// 最后统一受 `min_dwell` 抬底、受剩余窗口封顶。
+fn batch_delay(policy: &BatchPolicy, batch: &PendingBatch, image_only_part: bool) -> Duration {
+    let reached_capacity =
+        batch.parts.len() >= policy.max_parts || batch.char_count >= policy.max_chars;
+    if reached_capacity {
+        return Duration::ZERO;
+    }
+    let semantic_delay = if batch.parts.len() == 1 && image_only_part {
+        policy.max_wait
+    } else if matches!(batch.completion, Some(InputCompletion::Complete)) {
+        policy.min_dwell
+    } else if matches!(batch.completion, Some(InputCompletion::Incomplete)) {
+        policy.max_wait
+    } else {
+        adaptive_delay(
+            batch.parts.last().map(String::as_str).unwrap_or_default(),
+            *policy,
+        )
+    };
+    let remaining = policy.max_wait.saturating_sub(batch.started_at.elapsed());
+    semantic_delay.max(policy.min_dwell).min(remaining)
 }
 
 struct BatchPushHook {
@@ -445,13 +485,14 @@ fn ends_complete_sentence(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        BatchPolicy, BatchPushHook, MessageCoalescer, MessagePart, TextBatch, TurnGateBatchContext,
-        adaptive_delay,
+        BatchPolicy, BatchPushHook, MessageCoalescer, MessagePart, PendingBatch, TextBatch,
+        TurnGateBatchContext, adaptive_delay, batch_delay,
     };
     use crate::vision::ImageAttachment;
     use kovi::tokio::sync::Notify;
     use std::sync::Arc;
     use std::time::Duration;
+    use yunxi_core::InputCompletion;
 
     #[test]
     fn turn_gate_path_without_runtime_falls_back_to_legacy_completion() {
@@ -633,6 +674,55 @@ mod tests {
                 assert_eq!(combined.images.len(), 1);
                 assert!(first.await.expect("首个任务应正常结束").is_none());
             });
+    }
+
+    /// 最短停留：判"说完了"也别立刻成轮（接续链路），Host 链路保持立刻成轮。
+    ///
+    /// 这是"分三条发一个请求"能不能合成一轮的关键——没有停留时，第一条本身
+    /// 是完整句子就已经成轮了，后两条只能各自成轮。
+    #[test]
+    fn min_dwell_holds_a_complete_batch_open() {
+        let policy = BatchPolicy::testing();
+        let batch = |completion| PendingBatch {
+            parts: vec!["你去看看德国现在几点了".to_string()],
+            completion: Some(completion),
+            ..PendingBatch::default()
+        };
+
+        // Host 链路：判完即成轮。
+        assert_eq!(
+            batch_delay(&policy, &batch(InputCompletion::Complete), false),
+            Duration::ZERO
+        );
+
+        // 接续链路：判为"说完了"也停留一个窗口，让下一条并进来。
+        let dwell = Duration::from_millis(40);
+        let patient = policy.with_min_dwell(dwell);
+        assert_eq!(
+            batch_delay(&patient, &batch(InputCompletion::Complete), false),
+            dwell
+        );
+        // 剩余窗口按"批次已经存活了多久"扣减，所以贴顶断言留一点余量。
+        let near_max_wait = |delay: Duration| {
+            assert!(
+                delay <= policy.max_wait && delay > policy.max_wait - Duration::from_millis(5),
+                "{delay:?} 应贴住 max_wait={:?}",
+                policy.max_wait
+            );
+        };
+        // "还没说完"本来就等满窗口，停留不会把它拖过 max_wait。
+        near_max_wait(batch_delay(
+            &patient,
+            &batch(InputCompletion::Incomplete),
+            false,
+        ));
+        // 停留本身也受剩余窗口封顶，不会把批次拖到 max_wait 之外。
+        let greedy = policy.with_min_dwell(policy.max_wait * 4);
+        near_max_wait(batch_delay(
+            &greedy,
+            &batch(InputCompletion::Complete),
+            false,
+        ));
     }
 
     #[test]

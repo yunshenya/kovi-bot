@@ -117,6 +117,11 @@ ambient_requires_mind_intent = true
 continuation_enabled = true
 # 焦点存活时间（秒）：她最后一次可见回复之后多久内仍算在对话中。
 continuation_focus_ttl_secs = 120
+# 接续回合成轮前的最短停留（毫秒）。完成度判的是"这句话说完了没"，不是
+# "这条请求说完了没"：分三条发一个请求时，前两条往往各自都是完整句子，
+# 没有停留就会一条一轮。这个值给判为"说完"的接续消息留窗口，让紧接着的
+# 下一条并进来；0 = 判完即成轮，取值受 [message_batch] max_wait_ms 封顶。
+continuation_merge_dwell_ms = 2500
 # 接续回答的最短间隔（秒）。0 = 不受"不要每句都回"的间隔限制（仍受
 # reply_rate_limit 与焦点边界约束）；要留下限就填正数，取值必须
 # ≤ reply_gap_secs，超限按 reply_gap_secs 收口。

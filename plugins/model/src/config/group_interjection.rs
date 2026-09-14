@@ -81,6 +81,13 @@ pub struct GroupInterjectionConfig {
     continuation_enabled: bool,
     /// 焦点存活时长（秒）：她最后一次可见回复之后，多久内仍算在对话中。
     continuation_focus_ttl_secs: u64,
+    /// 接续回合成轮前的最短停留（毫秒）。
+    ///
+    /// 完成度判定回答的是"这句话说完了没"，不是"这条请求说完了没"：用户分三条
+    /// 发一个请求时，前两条往往各自都是完整句子，没有停留就会一条一轮。这个
+    /// 值给"判为说完"的接续消息留一个窗口，让紧接着的下一条并进来。0 = 判完
+    /// 即成轮（Host 链路的默认行为），取值受 `[message_batch] max_wait_ms` 封顶。
+    continuation_merge_dwell_ms: u64,
     /// 接续回答的最短间隔（秒）。默认 0：接续是在同一个对话里接着说，
     /// "不要每句都回"那条防刷屏间隔不适用；总量仍由 `reply_rate_limit`
     /// 和焦点本身（别人插话即结束、TTL 到期）约束。想留一个下限时填正数。
@@ -203,6 +210,10 @@ impl GroupInterjectionConfig {
 
     pub fn continuation_focus_ttl_secs(&self) -> u64 {
         self.continuation_focus_ttl_secs
+    }
+
+    pub fn continuation_merge_dwell_ms(&self) -> u64 {
+        self.continuation_merge_dwell_ms
     }
 
     /// 接续回答使用的回复间隔。配置值超过普通间隔时视为无效，退回普通间隔：
@@ -336,6 +347,7 @@ impl Default for GroupInterjectionConfig {
             ambient_requires_mind_intent: true,
             continuation_enabled: true,
             continuation_focus_ttl_secs: 120,
+            continuation_merge_dwell_ms: 2_500,
             continuation_reply_gap_secs: 0,
             reply_gap_secs: 90,
             addressed_reply_gap_secs: 20,
