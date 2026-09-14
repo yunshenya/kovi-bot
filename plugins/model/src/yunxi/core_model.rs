@@ -5178,6 +5178,19 @@ fn group_reply_gap_secs_for(message: &yunxi_core::MessageReceivedEvent) -> u64 {
     group.reply_gap_secs()
 }
 
+/// 结合发言者身份给出这一轮的间隔：管理员是明确指令的发出者，间隔不该把他
+/// 的话挡在门外，因此按 0 秒处理（频率上限 `reply_rate_limit` 仍对所有人一致，
+/// 防刷屏的总额度没有被放开）。
+fn group_reply_gap_secs_for_sender(
+    message: &yunxi_core::MessageReceivedEvent,
+    sender_is_admin: bool,
+) -> u64 {
+    if sender_is_admin {
+        return 0;
+    }
+    group_reply_gap_secs_for(message)
+}
+
 /// 群聊里"这条是不是在叫她"，由宿主判定后显式交给模型。
 ///
 /// `@芸汐` 的 at 段和引用段在 kovi 的 `text` 字段里会被整段丢掉（`[at]` 只出现在
@@ -5818,9 +5831,13 @@ impl ModelBackend for KoviModelBackend {
                 crate::model::finish(ticket).await;
                 return Ok(silent_with_interaction_state(input));
             }
+            // 这一轮在群聊里占用的"可见回复"名额。预留是乐观的（生成之前
+            // 先占位），所以拿到 token 之后，回合结束时若确实没有可见正文
+            // 就必须归还——见下面的 release。
+            let mut group_reply_slot: Option<std::time::Instant> = None;
             // 群聊可见回复节奏：同群普通聊天回复共享与 Host 相同的确定性
-            // 预算，管理员与普通成员同等受限。预算被拒时保持观察（状态更新
-            // 照常），但不生成可见回复——这是"几乎每句话都回"的兜底。
+            // 预算。预算被拒时保持观察（状态更新照常），但不生成可见回复
+            // ——这是"几乎每句话都回"的兜底。
             // 显式多消息请求（explicit_message_count）、识图与受控工具调用
             // 是用户的明确请求，不受此限。
             //
@@ -5836,27 +5853,30 @@ impl ModelBackend for KoviModelBackend {
                 && !requested_tool_turn
             {
                 let addressed = explicitly_addressed_group_message(group_message);
-                let gap_secs = group_reply_gap_secs_for(group_message);
-                if !crate::model::reserve_group_chat_reply(group_id, gap_secs).await {
-                    let snapshot =
-                        crate::model::group_reply_budget_snapshot(group_id, gap_secs).await;
-                    let gap_remaining_ms = snapshot
-                        .gap_remaining_ms
-                        .map_or_else(|| "none".to_owned(), |ms| ms.to_string());
-                    kovi::log::info!(
-                        "Yunxi Core group reply paced: event_id={} message_id={} conversation_id={} group_id={} addressed={} gap_secs={} gap_remaining_ms={} replies_in_window={}/{} action=silent",
-                        input.event.id(),
-                        message_id_for_log(input),
-                        conversation_id_for_log(input),
-                        group_id,
-                        addressed,
-                        gap_secs,
-                        gap_remaining_ms,
-                        snapshot.replies_in_window,
-                        snapshot.rate_limit,
-                    );
-                    crate::model::finish(ticket).await;
-                    return Ok(silent_with_interaction_state(input));
+                let gap_secs = group_reply_gap_secs_for_sender(group_message, sender_is_admin);
+                match crate::model::reserve_group_chat_reply_slot(group_id, gap_secs).await {
+                    Some(at) => group_reply_slot = Some(at),
+                    None => {
+                        let snapshot =
+                            crate::model::group_reply_budget_snapshot(group_id, gap_secs).await;
+                        let gap_remaining_ms = snapshot
+                            .gap_remaining_ms
+                            .map_or_else(|| "none".to_owned(), |ms| ms.to_string());
+                        kovi::log::info!(
+                            "Yunxi Core group reply paced: event_id={} message_id={} conversation_id={} group_id={} addressed={} gap_secs={} gap_remaining_ms={} replies_in_window={}/{} action=silent",
+                            input.event.id(),
+                            message_id_for_log(input),
+                            conversation_id_for_log(input),
+                            group_id,
+                            addressed,
+                            gap_secs,
+                            gap_remaining_ms,
+                            snapshot.replies_in_window,
+                            snapshot.rate_limit,
+                        );
+                        crate::model::finish(ticket).await;
+                        return Ok(silent_with_interaction_state(input));
+                    }
                 }
             }
             // 群聊的自主第二拍（答完再补一句）也是可见回复，走同一个预算：
@@ -5870,24 +5890,27 @@ impl ModelBackend for KoviModelBackend {
                 && let QqConversation::Group { group_id } = conversation
             {
                 let gap_secs = config::get().group_interjection().reply_gap_secs();
-                if !crate::model::reserve_group_chat_reply(group_id, gap_secs).await {
-                    let snapshot =
-                        crate::model::group_reply_budget_snapshot(group_id, gap_secs).await;
-                    kovi::log::info!(
-                        "Yunxi Core autonomous group turn paced: event_id={} conversation_id={} group_id={} gap_secs={} replies_in_window={}/{} action=silent",
-                        input.event.id(),
-                        conversation_id_for_log(input),
-                        group_id,
-                        gap_secs,
-                        snapshot.replies_in_window,
-                        snapshot.rate_limit,
-                    );
-                    crate::model::finish(ticket).await;
-                    return Ok(autonomous_or_silent_plan(
-                        input,
-                        InteractionCues::default(),
-                        Some(ConversationTurnDirective::Continue),
-                    ));
+                match crate::model::reserve_group_chat_reply_slot(group_id, gap_secs).await {
+                    Some(at) => group_reply_slot = Some(at),
+                    None => {
+                        let snapshot =
+                            crate::model::group_reply_budget_snapshot(group_id, gap_secs).await;
+                        kovi::log::info!(
+                            "Yunxi Core autonomous group turn paced: event_id={} conversation_id={} group_id={} gap_secs={} replies_in_window={}/{} action=silent",
+                            input.event.id(),
+                            conversation_id_for_log(input),
+                            group_id,
+                            gap_secs,
+                            snapshot.replies_in_window,
+                            snapshot.rate_limit,
+                        );
+                        crate::model::finish(ticket).await;
+                        return Ok(autonomous_or_silent_plan(
+                            input,
+                            InteractionCues::default(),
+                            Some(ConversationTurnDirective::Continue),
+                        ));
+                    }
                 }
             }
             // 本轮的工具上下文与"必须真的创建"的需求由宿主在这里定死，和走哪个
@@ -6951,6 +6974,16 @@ impl ModelBackend for KoviModelBackend {
                     mind_candidates,
                 );
             }
+            // 预留是乐观的：这一轮最终没产出可见正文，就得把名额还回去，
+            // 否则它会继续按间隔挡住下一个发言者。线上 2026-09-14 16:18
+            // 实测：一个"只观察没回复"的回合占掉了名额，管理员紧接着的点名
+            // 指令被 20 秒间隔挡在门外（只差 110 毫秒），指令既没回答也没执行。
+            if let Some(at) = group_reply_slot
+                && let QqConversation::Group { group_id } = conversation
+                && !core_plan_has_visible_text(&plan)
+            {
+                crate::model::release_group_reply_slot(group_id, at).await;
+            }
             // 她可见回复了群里的某人 → 记下"对话焦点"：接下来的未点名消息里，
             // 由这个人接着说的那些算接续（可以回、用接续档间隔、并且会合批）。
             // 只有真的产出可见正文的回合才建立对话，沉默回合不算。
@@ -7219,28 +7252,28 @@ mod tests {
         eligible_mind_candidates, explicit_message_batch_needs_repair,
         explicit_message_count_for_event, explicit_message_count_for_input,
         explicit_message_count_instruction, first_person_turn_avoidance, group_reply_gap_secs_for,
-        interaction_state_updates_with_cues, intrinsic_autonomous_intent_prompt,
-        intrinsic_fallback_is_eligible, intrinsic_output_is_unsafe, intrinsic_prompt,
-        is_ambient_group_message, is_plain_text_batch_data_context, keeps_existing_prepared_plan,
-        message_id_for_log, mind_context_messages, mind_outgoing_fence_required,
-        parse_autonomous_intent_response, parse_core_response, parse_direct_repair_output,
-        parse_intrinsic_autonomous_directive, parse_plain_core_response, parse_qq_conversation,
-        plain_text_batch_message_prompt, plain_text_batch_repair_context, pre_model_plan,
-        prepared_outgoing_semantic_context, purge_group_routes_from_cache,
-        recent_conversation_messages, recent_direct_conversation_messages,
-        recent_group_conversation_messages, refine_core_incoming, register_core_tool_intents,
-        repair_context_messages, reply_asks_something, reply_expected_for_incoming,
-        reply_looks_complete, reply_recovery_required, reply_text_has_semantic_content,
-        reply_text_is_too_thin, requested_message_count, route_from_lookup,
-        route_lookup_with_fallback, safe_single_structured_reply_message,
-        safe_structured_reply_batch, sanitize_autonomous_intrinsic_output,
-        sanitize_intrinsic_output, sanitize_plain_text_batch_message,
-        select_host_model_route_from_capability, serialize_intrinsic_reply_batch,
-        shadow_projection_for_completed_plan, silence_gate_plan, silence_verdict, silent_wait_plan,
-        split_core_speech_markers, split_two_short_lines, strip_core_speech_markers,
-        strong_reply_repair_needed, tool_calls_allowed_for_turn, tool_protocol_authorized_for_turn,
-        visible_reply_intent, visible_reply_intents, visible_reply_invites_continuation,
-        visible_reply_state_updates, visible_turn_continuation,
+        group_reply_gap_secs_for_sender, interaction_state_updates_with_cues,
+        intrinsic_autonomous_intent_prompt, intrinsic_fallback_is_eligible,
+        intrinsic_output_is_unsafe, intrinsic_prompt, is_ambient_group_message,
+        is_plain_text_batch_data_context, keeps_existing_prepared_plan, message_id_for_log,
+        mind_context_messages, mind_outgoing_fence_required, parse_autonomous_intent_response,
+        parse_core_response, parse_direct_repair_output, parse_intrinsic_autonomous_directive,
+        parse_plain_core_response, parse_qq_conversation, plain_text_batch_message_prompt,
+        plain_text_batch_repair_context, pre_model_plan, prepared_outgoing_semantic_context,
+        purge_group_routes_from_cache, recent_conversation_messages,
+        recent_direct_conversation_messages, recent_group_conversation_messages,
+        refine_core_incoming, register_core_tool_intents, repair_context_messages,
+        reply_asks_something, reply_expected_for_incoming, reply_looks_complete,
+        reply_recovery_required, reply_text_has_semantic_content, reply_text_is_too_thin,
+        requested_message_count, route_from_lookup, route_lookup_with_fallback,
+        safe_single_structured_reply_message, safe_structured_reply_batch,
+        sanitize_autonomous_intrinsic_output, sanitize_intrinsic_output,
+        sanitize_plain_text_batch_message, select_host_model_route_from_capability,
+        serialize_intrinsic_reply_batch, shadow_projection_for_completed_plan, silence_gate_plan,
+        silence_verdict, silent_wait_plan, split_core_speech_markers, split_two_short_lines,
+        strip_core_speech_markers, strong_reply_repair_needed, tool_calls_allowed_for_turn,
+        tool_protocol_authorized_for_turn, visible_reply_intent, visible_reply_intents,
+        visible_reply_invites_continuation, visible_reply_state_updates, visible_turn_continuation,
     };
     use crate::model::{
         BotMemory, ConversationCoordinator, IncomingTurnImpact, OutgoingExecutiveDecision,
@@ -7892,6 +7925,32 @@ mod tests {
         };
         assert_eq!(group_reply_gap_secs_for(message), group.reply_gap_secs());
         assert!(is_ambient_group_message(message));
+    }
+
+    /// 管理员豁免的是"等待间隔"，不是频率上限：线上 2026-09-14 16:18 管理员
+    /// 那条点名指令被 20 秒间隔静默丢掉（只差 110 毫秒），所以管理员发言一律
+    /// 按 0 秒间隔放行；总额度仍由 `reply_rate_limit` 把守。
+    #[test]
+    fn admin_messages_skip_the_group_reply_gap() {
+        let group = crate::config::get().group_interjection().clone();
+        let admin_addressed = group_message_input(true);
+        let WorldEventKind::MessageReceived(message) = admin_addressed.event.kind() else {
+            panic!("group fixture must be a received message");
+        };
+        assert_eq!(group_reply_gap_secs_for_sender(message, true), 0);
+        assert_eq!(
+            group_reply_gap_secs_for_sender(message, false),
+            group.effective_addressed_reply_gap_secs()
+        );
+        let admin_ambient = group_message_input(false);
+        let WorldEventKind::MessageReceived(message) = admin_ambient.event.kind() else {
+            panic!("group fixture must be a received message");
+        };
+        assert_eq!(group_reply_gap_secs_for_sender(message, true), 0);
+        assert_eq!(
+            group_reply_gap_secs_for_sender(message, false),
+            group.reply_gap_secs()
+        );
     }
 
     /// 焦点只在她"真的在群里回了某人"时建立；说话人取不到就不建（宁可不建，

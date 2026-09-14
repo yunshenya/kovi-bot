@@ -60,6 +60,28 @@ fn continuation_window_secs() -> u64 {
         .effective_continuation_window_secs()
 }
 
+/// 一次"群聊可见回复"的名额预留。
+///
+/// `confirmed` 只表示**真的发出去了**：预留发生在生成之前，模型完全可能最终
+/// 沉默——那种情况下这一格必须归还，否则它会继续按间隔挡住别人（包括点名）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VisibleReplySlot {
+    at: Instant,
+    confirmed: bool,
+}
+
+/// 未被确认的预留最多占位多久。
+///
+/// 它是对**显式归还**的兜底：正常路径在回合结束时就还（Host 看
+/// `process_group_reply_claimed` 的真实结果，Core 看最终计划有没有可见正文），
+/// 这里只兜"调用方在归还之前就离开了"（中途 `return`、取消、panic）。
+///
+/// 取值要同时满足两头：必须覆盖"预留 → 生成 → 真的发出去"的正常时延（早了
+/// 会把真发出去的回复漏记，账本偏松、她变得更爱说话），又不能长到让一次异常
+/// 把整群的回复节奏锁死（晚了就是 16:18 那类静默丢消息）。30 秒是两者的折中，
+/// 而且偏早的代价只是少记一笔，偏晚的代价是用户看见的"她不回我"。
+const UNCONFIRMED_REPLY_SLOT_TTL: Duration = Duration::from_secs(30);
+
 /// 对话焦点：她上一次可见回复是在跟谁说话。
 ///
 /// 只记 QQ 号与时刻：判定"这条未点名消息是不是接着跟她说"需要的就是这两个
@@ -92,7 +114,13 @@ struct GroupInterjectionState {
     /// 焦点只按时间收敛（TTL），以及被她下一次可见回复换成新的对象。
     conversation_focus: Option<GroupConversationFocus>,
     /// 本群可见聊天回复的时间记录（有界），用于群级回复节奏硬限制。
-    visible_replies: VecDeque<Instant>,
+    ///
+    /// 每次预留都先记成**未确认**：真发出可见消息时由
+    /// [`mark_group_reply_sent`] 确认；回合最终判沉默时由调用方归还
+    /// （[`release_group_reply_slot`]），另有 30 秒的 stale 兜底。
+    /// 线上 2026-09-14 16:18 实测：一个"只观察没回复"的回合预占了名额，
+    /// 导致管理员紧接着的点名指令被 20 秒点名间隔挡住（只差 110 毫秒）。
+    visible_replies: VecDeque<VisibleReplySlot>,
     /// 她最近一次**未点名插话**之后的观察：群里有没有人接她的话。
     ///
     /// 只在她主动插话（抽样路径真的发出可见回复）之后开始，被点名回答别人
@@ -1010,24 +1038,32 @@ pub(crate) async fn group_message_event_after_ingress(
     let continue_conversation = !primary_reply_expected && conversation_decision.continue_reply;
     // 群聊可见回复节奏硬限制（同群所有普通聊天回复共享额度）。显式识图
     // 请求、表情教学与禁言命令不受限；额度被拒时本条仅作观察，不生成可见
-    // 回复——这是"每句话都回/扑上来接话"的确定性兜底。管理员与普通成员
-    // 完全一致：不再绕过节奏限制，避免"管理员句句都回"。
+    // 回复——这是"每句话都回/扑上来接话"的确定性兜底。
     // 被点名/被引用的消息用更短的 `addressed_reply_gap_secs`：直接提问
-    // 不该因为"21 秒前刚回过别人"就被静默丢掉；频率上限两条通道一致。
-    let addressed_gap_secs = if primary_reply_expected {
-        config::get()
-            .group_interjection()
-            .effective_addressed_reply_gap_secs()
-    } else {
-        config::get().group_interjection().reply_gap_secs()
-    };
-    let reply_budget_ok = !(primary_reply_expected
+    // 不该因为"21 秒前刚回过别人"就被静默丢掉。
+    // 管理员只豁免**等待间隔**（间隔是为了不刷屏，管理员的话是明确指令），
+    // `reply_rate_limit` 频率上限对所有人一致——避免"管理员句句都回"。
+    let addressed_gap_secs = paced_group_reply_gap_secs(primary_reply_expected, sender_is_admin);
+    // 预留是乐观的（生成之前先占位），所以拿到的 token 要留到回合结束：
+    // 这一轮最终没发出可见消息时必须归还，否则名额会继续按间隔挡住别人。
+    let paced_reply_pending = primary_reply_expected
         || continue_conversation
-        || (sampled_for_interjection.is_some() && understanding.interjection_worthy))
-        || vision_requested
+        || (sampled_for_interjection.is_some() && understanding.interjection_worthy);
+    let pacing_exempt = vision_requested
         || explicit_sticker_teaching
-        || matches!(message.trim(), "#禁言" | "#结束禁言")
-        || reserve_group_chat_reply(group_id, addressed_gap_secs).await;
+        || matches!(message.trim(), "#禁言" | "#结束禁言");
+    let mut group_reply_slot: Option<Instant> = None;
+    let reply_budget_ok = if !paced_reply_pending || pacing_exempt {
+        true
+    } else {
+        match reserve_group_chat_reply_slot(group_id, addressed_gap_secs).await {
+            Some(at) => {
+                group_reply_slot = Some(at);
+                true
+            }
+            None => false,
+        }
+    };
     if !reply_budget_ok && let Some(attempt) = sampled_for_interjection.take() {
         attempt.complete(false).await;
     }
@@ -1047,6 +1083,7 @@ pub(crate) async fn group_message_event_after_ingress(
             "[INFO] 群聊语义决定已过期，丢弃旧批次 (群组: {}, 消息: {:?})",
             group_id, source_message_ids
         );
+        release_unconfirmed_reply_slot(group_id, group_reply_slot, false).await;
         return;
     };
     // Phase 4 门控(仅 response_mode=active 且 bundle 就绪):未点名的
@@ -1063,6 +1100,7 @@ pub(crate) async fn group_message_event_after_ingress(
             "[INFO] TurnGate 门控：群聊批次保持沉默 (群组: {})",
             group_id
         );
+        release_unconfirmed_reply_slot(group_id, group_reply_slot, false).await;
         return;
     }
     if primary_reply_expected && reply_budget_ok {
@@ -1113,6 +1151,7 @@ pub(crate) async fn group_message_event_after_ingress(
         )
         .await;
         shadow_guard.mark_replied(replied);
+        release_unconfirmed_reply_slot(group_id, group_reply_slot, replied).await;
         finish_conversation_turn(group_id, event.user_id, turn_marker, replied).await;
         drain_pending_window_messages(group_id, Arc::clone(&bot), ticket).await;
     } else if continue_conversation && reply_budget_ok {
@@ -1164,6 +1203,7 @@ pub(crate) async fn group_message_event_after_ingress(
         )
         .await;
         shadow_guard.mark_replied(replied);
+        release_unconfirmed_reply_slot(group_id, group_reply_slot, replied).await;
         finish_conversation_turn(group_id, event.user_id, turn_marker, replied).await;
         drain_pending_window_messages(group_id, Arc::clone(&bot), ticket).await;
     } else if sampled_for_interjection.is_some()
@@ -1224,22 +1264,30 @@ pub(crate) async fn group_message_event_after_ingress(
             attempt.complete(replied).await;
         }
         shadow_guard.mark_replied(replied);
+        release_unconfirmed_reply_slot(group_id, group_reply_slot, replied).await;
         finish_conversation_turn(group_id, event.user_id, turn_marker, replied).await;
         drain_pending_window_messages(group_id, Arc::clone(&bot), ticket).await;
-    } else if let Err(error) = MEMORY_MANAGER
-        .add_conversation_memory_with_hints(
-            group_id,
-            &format!("{}: {}", sender, model_message),
-            "group_observation",
-            Some(understanding.memory_importance()),
-            &understanding.memory_tags(),
-        )
-        .await
-    {
-        eprintln!(
-            "[ERROR] 群聊观察记忆记录失败 (群组: {}): {}",
-            group_id, error
-        );
+    } else {
+        // 这条路径不生成可见回复，只记一条观察：正常推演下 `group_reply_slot`
+        // 已经是 None（有预留就一定会走进上面三个分支），这里仍然归还一次，
+        // 守住"每一条结束路径都归还名额"这个不变量——将来在上面新增分支
+        // （比如新的静默拦截）时也不会漏。
+        release_unconfirmed_reply_slot(group_id, group_reply_slot, false).await;
+        if let Err(error) = MEMORY_MANAGER
+            .add_conversation_memory_with_hints(
+                group_id,
+                &format!("{}: {}", sender, model_message),
+                "group_observation",
+                Some(understanding.memory_importance()),
+                &understanding.memory_tags(),
+            )
+            .await
+        {
+            eprintln!(
+                "[ERROR] 群聊观察记忆记录失败 (群组: {}): {}",
+                group_id, error
+            );
+        }
     }
 }
 
@@ -1593,13 +1641,14 @@ pub(crate) fn group_reply_budget_available_now(group_id: i64) -> bool {
             let within_window = state
                 .visible_replies
                 .iter()
-                .filter(|seen_at| now.saturating_duration_since(**seen_at) < rate_window)
+                .filter(|slot| now.saturating_duration_since(slot.at) < rate_window)
                 .count();
             if within_window >= config.reply_rate_limit() {
                 return false;
             }
             state.visible_replies.back().is_none_or(|last| {
-                now.saturating_duration_since(*last) >= Duration::from_secs(config.reply_gap_secs())
+                now.saturating_duration_since(last.at)
+                    >= Duration::from_secs(config.reply_gap_secs())
             })
         }),
         Err(_) => true,
@@ -1612,7 +1661,9 @@ pub(crate) async fn mark_group_reply_sent(group_id: i64) {
     let mut states = GROUP_INTERJECTION_STATE.lock().await;
     prune_interjection_states(&mut states);
     let state = states.entry(group_id).or_default();
-    state.last_bot_reply = Some(Instant::now());
+    let now = Instant::now();
+    state.last_bot_reply = Some(now);
+    confirm_visible_reply_slot(state, now);
 }
 
 /// 她刚刚在群里可见回复了 `user_id`：把对话焦点记成这个人。
@@ -1698,20 +1749,65 @@ pub(crate) fn conversation_continuation_active_now(group_id: i64) -> bool {
 /// 预留是乐观的（模型可能最终沉默），方向只保守不激进。
 ///
 /// `gap` 由调用方给出：普通回复用 `reply_gap_secs`，被明确点名的消息用
-/// 更短的 `addressed_reply_gap_secs`。频率上限（`reply_rate_limit` /
-/// `reply_rate_window_secs`）对两者一致，所以放松的只是"等待"，不是额度。
-pub(crate) async fn reserve_group_chat_reply(group_id: i64, gap_secs: u64) -> bool {
+/// 更短的 `addressed_reply_gap_secs`，管理员发言用 0（管理员的话是明确
+/// 指令，间隔不该把指令挡在门外）。频率上限（`reply_rate_limit` /
+/// `reply_rate_window_secs`）对所有人一致，所以放松的只是"等待"，不是额度。
+///
+/// 返回预留时刻（token）：真发出可见消息时由 [`mark_group_reply_sent`]
+/// 确认，回合判沉默时由调用方归还（[`release_group_reply_slot`]）。
+pub(crate) async fn reserve_group_chat_reply_slot(group_id: i64, gap_secs: u64) -> Option<Instant> {
     let config = config::get().group_interjection().clone();
     let mut states = GROUP_INTERJECTION_STATE.lock().await;
     prune_interjection_states(&mut states);
     let state = states.entry(group_id).or_default();
+    let now = Instant::now();
     reserve_visible_reply_slot(
         state,
-        Instant::now(),
+        now,
         Duration::from_secs(gap_secs),
         Duration::from_secs(config.reply_rate_window_secs()),
         config.reply_rate_limit(),
     )
+    .then_some(now)
+}
+
+/// 归还一格**未确认**的预留：这一轮最终没有发出可见消息。
+pub(crate) async fn release_group_reply_slot(group_id: i64, at: Instant) {
+    let mut states = GROUP_INTERJECTION_STATE.lock().await;
+    let Some(state) = states.get_mut(&group_id) else {
+        return;
+    };
+    release_unconfirmed_slot(state, at);
+}
+
+/// 纯函数：按预留时刻精确归还那一格。已确认（真的发出去过）的名额不还，
+/// 别人的预留也不会被误伤。
+fn release_unconfirmed_slot(state: &mut GroupInterjectionState, at: Instant) {
+    state
+        .visible_replies
+        .retain(|slot| slot.at != at || slot.confirmed);
+}
+
+/// 回合结束时的收尾：这一轮最终**没有**发出可见消息，就把乐观预留的
+/// 名额还回去。`replied` 来自回复管线的真实结果（不是"打算回"）。
+async fn release_unconfirmed_reply_slot(group_id: i64, slot: Option<Instant>, replied: bool) {
+    if let Some(at) = slot
+        && !replied
+    {
+        release_group_reply_slot(group_id, at).await;
+    }
+}
+
+/// 确认"这条群消息真的发出去了"：名额从预留转为已用。
+fn confirm_visible_reply_slot(state: &mut GroupInterjectionState, now: Instant) {
+    if let Some(slot) = state
+        .visible_replies
+        .iter_mut()
+        .rev()
+        .find(|slot| !slot.confirmed && slot.at <= now)
+    {
+        slot.confirmed = true;
+    }
 }
 
 /// 诊断用：本群回复节奏的当前状态快照（间隔毫秒 + 窗口内条数 + 上限）。
@@ -1743,10 +1839,10 @@ pub(crate) async fn group_reply_budget_snapshot(
     let replies_in_window = state
         .visible_replies
         .iter()
-        .filter(|seen_at| now.saturating_duration_since(**seen_at) < rate_window)
+        .filter(|slot| now.saturating_duration_since(slot.at) < rate_window)
         .count();
     let gap_remaining_ms = state.visible_replies.back().and_then(|last| {
-        let seen = now.saturating_duration_since(*last);
+        let seen = now.saturating_duration_since(last.at);
         (seen < gap).then(|| (gap - seen).as_millis() as u64)
     });
     GroupReplyBudgetSnapshot {
@@ -1772,22 +1868,46 @@ fn reserve_visible_reply_slot(
     while state
         .visible_replies
         .front()
-        .is_some_and(|seen_at| now.saturating_duration_since(*seen_at) >= rate_window)
+        .is_some_and(|slot| now.saturating_duration_since(slot.at) >= rate_window)
     {
         state.visible_replies.pop_front();
     }
+    // 兜底：既没被确认、也没被显式归还的预留（调用方早退/取消/panic 残余）
+    // 不该长期占位——否则一次异常就能把这个群的回复节奏锁死。
+    state.visible_replies.retain(|slot| {
+        slot.confirmed || now.saturating_duration_since(slot.at) < UNCONFIRMED_REPLY_SLOT_TTL
+    });
     if state.visible_replies.len() >= rate_limit {
         return false;
     }
     if state
         .visible_replies
         .back()
-        .is_some_and(|last| now.saturating_duration_since(*last) < gap)
+        .is_some_and(|last| now.saturating_duration_since(last.at) < gap)
     {
         return false;
     }
-    state.visible_replies.push_back(now);
+    state.visible_replies.push_back(VisibleReplySlot {
+        at: now,
+        confirmed: false,
+    });
     true
+}
+
+/// 群聊可见回复要等的间隔：管理员按 0 秒处理（他的话是明确指令，"刚回过
+/// 别人"不该把它挡在门外），被点名/被引用的消息用更短的点名档，其余用未点名
+/// 的防刷屏档。频率上限 `reply_rate_limit` 对所有人一致——豁免的只是等待。
+fn paced_group_reply_gap_secs(addressed: bool, sender_is_admin: bool) -> u64 {
+    if sender_is_admin {
+        return 0;
+    }
+    let config = config::get();
+    let group = config.group_interjection();
+    if addressed {
+        group.effective_addressed_reply_gap_secs()
+    } else {
+        group.reply_gap_secs()
+    }
 }
 
 async fn observe_group_conversation(
@@ -2371,7 +2491,7 @@ fn prune_interjection_states(states: &mut HashMap<i64, GroupInterjectionState>) 
         while state
             .visible_replies
             .front()
-            .is_some_and(|seen_at| now.saturating_duration_since(*seen_at) >= reply_rate_window)
+            .is_some_and(|slot| now.saturating_duration_since(slot.at) >= reply_rate_window)
         {
             state.visible_replies.pop_front();
         }
@@ -2491,12 +2611,13 @@ mod tests {
         GroupInterjectionState, GroupSenderIdentity, InterjectionAttempt, PENDING_WINDOW_MESSAGES,
         admit_understood_group_turn, ambient_sampling_eligible,
         clear_group_erasure_reply_state_locked, complete_interjection_attempt,
-        continuation_window_secs, conversation_active_for_observation, cooling_gate_verdict,
-        decision_budget_available, directed_at_others, group_conversation_focus_state_now,
-        group_conversation_focus_user_now, group_cooling_gate, group_erasure_receipt_destination,
-        group_pause_acknowledgement, group_pause_command, interjection_sampling_vetoed,
-        message_at_self, normalized_sender_name, note_group_conversation_focus,
-        prune_decision_attempts, queue_pending_window_message, reserve_visible_reply_slot,
+        confirm_visible_reply_slot, continuation_window_secs, conversation_active_for_observation,
+        cooling_gate_verdict, decision_budget_available, directed_at_others,
+        group_conversation_focus_state_now, group_conversation_focus_user_now, group_cooling_gate,
+        group_erasure_receipt_destination, group_pause_acknowledgement, group_pause_command,
+        interjection_sampling_vetoed, message_at_self, normalized_sender_name,
+        note_group_conversation_focus, paced_group_reply_gap_secs, prune_decision_attempts,
+        queue_pending_window_message, release_unconfirmed_slot, reserve_visible_reply_slot,
         should_queue_after_executive, suppress_direct_trigger, take_pending_window_turn,
         text_mentions_bot, with_structured_bot_mention_context,
     };
@@ -3092,6 +3213,133 @@ mod tests {
             });
     }
 
+    /// 测试专用：一次**真的发出去了**的可见回复。
+    ///
+    /// 预留只是乐观占位（生成之前先占），只有在
+    /// `mark_group_reply_sent` 确认之后才在时间轴里留下记录；所以凡是要
+    /// 表达"她确实回了这条"的地方都必须记账 + 确认，不能只预留。
+    fn reserve_sent_reply(
+        state: &mut GroupInterjectionState,
+        now: Instant,
+        gap: Duration,
+        rate_window: Duration,
+        rate_limit: usize,
+    ) -> bool {
+        let reserved = reserve_visible_reply_slot(state, now, gap, rate_window, rate_limit);
+        if reserved {
+            confirm_visible_reply_slot(state, now);
+        }
+        reserved
+    }
+
+    /// 线上回归（2026-09-14 16:18）：芸汐一个"只观察、没回复"的回合先在
+    /// 群里占了名额，管理员紧接着的点名指令被 20 秒间隔挡掉（只差 110
+    /// 毫秒），指令既没被回答也没被执行。预留是乐观的，回合判沉默就必须
+    /// 立刻归还；没归还的（调用方早退、取消、panic）也有 30 秒兜底。
+    #[test]
+    fn released_reservations_stop_blocking_later_replies() {
+        let mut state = GroupInterjectionState::default();
+        let started = Instant::now();
+        let gap = Duration::from_secs(90);
+        let rate_window = Duration::from_secs(600);
+        let rate_limit = 10;
+
+        // 沉默回合：预留成功，但最终一个字都没发出去。
+        assert!(reserve_visible_reply_slot(
+            &mut state,
+            started,
+            gap,
+            rate_window,
+            rate_limit
+        ));
+        // 一秒后的点名提问仍然被这一格挡住——这正是当时的现场。
+        assert!(!reserve_visible_reply_slot(
+            &mut state,
+            started + Duration::from_secs(1),
+            Duration::from_secs(20),
+            rate_window,
+            rate_limit
+        ));
+        // 回合结束归还后，同一句点名提问立刻可以通过。
+        release_unconfirmed_slot(&mut state, started);
+        assert!(reserve_visible_reply_slot(
+            &mut state,
+            started + Duration::from_secs(1),
+            Duration::from_secs(20),
+            rate_window,
+            rate_limit
+        ));
+        // 归还只针对未确认的那一格：真发出去的名额不能被还掉，
+        // 否则"刚回过一句"就可以被下一句立刻插进来。
+        confirm_visible_reply_slot(&mut state, started + Duration::from_secs(1));
+        release_unconfirmed_slot(&mut state, started + Duration::from_secs(1));
+        assert_eq!(state.visible_replies.len(), 1);
+        assert!(state.visible_replies[0].confirmed);
+        assert!(!reserve_visible_reply_slot(
+            &mut state,
+            started + Duration::from_secs(2),
+            Duration::from_secs(20),
+            rate_window,
+            rate_limit
+        ));
+    }
+
+    /// 管理员豁免的是"等待间隔"，不是频率上限：线上 16:18 管理员那条点名
+    /// 指令被 20 秒间隔静默丢掉（只差 110 毫秒），所以管理员发言一律 0 秒，
+    /// 普通成员仍走点名档/防刷屏档。
+    #[test]
+    fn admins_skip_the_reply_gap_but_keep_everyone_elses_waiting() {
+        let group = crate::config::get().group_interjection().clone();
+        assert_eq!(paced_group_reply_gap_secs(true, true), 0);
+        assert_eq!(paced_group_reply_gap_secs(false, true), 0);
+        assert_eq!(
+            paced_group_reply_gap_secs(true, false),
+            group.effective_addressed_reply_gap_secs()
+        );
+        assert_eq!(
+            paced_group_reply_gap_secs(false, false),
+            group.reply_gap_secs()
+        );
+        // 豁免只影响间隔：频率上限仍是同一份配置，没有被"管理员"这条通道绕过。
+        assert!(group.reply_rate_limit() > 0);
+    }
+
+    /// 兜底：既没确认也没归还的预留（调用方早退/取消/panic 之后的残余）
+    /// 不该长期占位——否则一次异常就能把这个群的回复节奏锁死。
+    #[test]
+    fn unconfirmed_reservations_expire_as_a_backstop() {
+        let mut state = GroupInterjectionState::default();
+        let started = Instant::now();
+        let gap = Duration::from_secs(90);
+        let rate_window = Duration::from_secs(600);
+        let rate_limit = 10;
+
+        assert!(reserve_visible_reply_slot(
+            &mut state,
+            started,
+            gap,
+            rate_window,
+            rate_limit
+        ));
+        // 30 秒内仍算"这一轮正在准备回复"，继续挡住普通间隔。
+        assert!(!reserve_visible_reply_slot(
+            &mut state,
+            started + Duration::from_secs(29),
+            gap,
+            rate_window,
+            rate_limit
+        ));
+        // 超过兜底时限后不再占位，且不计入频率额度。
+        assert!(reserve_visible_reply_slot(
+            &mut state,
+            started + Duration::from_secs(31),
+            gap,
+            rate_window,
+            rate_limit
+        ));
+        assert_eq!(state.visible_replies.len(), 1);
+    }
+
     #[test]
     fn group_visible_reply_budget_enforces_gap_then_rate_window() {
         let mut state = GroupInterjectionState::default();
@@ -3101,7 +3349,7 @@ mod tests {
         let rate_limit = 4;
 
         // 首次预留成功。
-        assert!(reserve_visible_reply_slot(
+        assert!(reserve_sent_reply(
             &mut state,
             started,
             gap,
@@ -3109,7 +3357,7 @@ mod tests {
             rate_limit
         ));
         // 冷却内（90 秒前）拒绝。
-        assert!(!reserve_visible_reply_slot(
+        assert!(!reserve_sent_reply(
             &mut state,
             started + Duration::from_secs(45),
             gap,
@@ -3118,7 +3366,7 @@ mod tests {
         ));
         // 冷却期满后放行，直到窗口内额度用尽。
         for offset in [90, 180, 270] {
-            assert!(reserve_visible_reply_slot(
+            assert!(reserve_sent_reply(
                 &mut state,
                 started + Duration::from_secs(offset),
                 gap,
@@ -3126,7 +3374,7 @@ mod tests {
                 rate_limit
             ));
         }
-        assert!(!reserve_visible_reply_slot(
+        assert!(!reserve_sent_reply(
             &mut state,
             started + Duration::from_secs(300),
             gap,
@@ -3134,7 +3382,7 @@ mod tests {
             rate_limit
         ));
         // 窗口滑过 600 秒后最早的记录失效，重新释放名额。
-        assert!(reserve_visible_reply_slot(
+        assert!(reserve_sent_reply(
             &mut state,
             started + Duration::from_secs(601),
             gap,
@@ -3156,7 +3404,7 @@ mod tests {
         let rate_limit = 4;
 
         // 她刚回过一条普通消息。
-        assert!(reserve_visible_reply_slot(
+        assert!(reserve_sent_reply(
             &mut state,
             started,
             normal_gap,
@@ -3164,7 +3412,7 @@ mod tests {
             rate_limit
         ));
         // 5 秒后的点名提问：被点名间隔同样压住，不会被追着答。
-        assert!(!reserve_visible_reply_slot(
+        assert!(!reserve_sent_reply(
             &mut state,
             started + Duration::from_secs(5),
             addressed_gap,
@@ -3172,14 +3420,14 @@ mod tests {
             rate_limit
         ));
         // 21 秒后的点名提问：普通间隔（90s）拒绝，被点名间隔（20s）放行。
-        assert!(!reserve_visible_reply_slot(
+        assert!(!reserve_sent_reply(
             &mut state,
             started + Duration::from_secs(21),
             normal_gap,
             rate_window,
             rate_limit
         ));
-        assert!(reserve_visible_reply_slot(
+        assert!(reserve_sent_reply(
             &mut state,
             started + Duration::from_secs(21),
             addressed_gap,
@@ -3188,7 +3436,7 @@ mod tests {
         ));
         // 被拒的尝试不写时间戳：别人紧接着问一句，不会因为她这次"差点回复"
         // 而被再压 20 秒。
-        assert!(reserve_visible_reply_slot(
+        assert!(reserve_sent_reply(
             &mut state,
             started + Duration::from_secs(45),
             addressed_gap,
@@ -3196,7 +3444,7 @@ mod tests {
             rate_limit
         ));
         // 放松的只是等待，不是额度：窗口内第 4 条仍然放行 …
-        assert!(reserve_visible_reply_slot(
+        assert!(reserve_sent_reply(
             &mut state,
             started + Duration::from_secs(90),
             addressed_gap,
@@ -3204,14 +3452,14 @@ mod tests {
             rate_limit
         ));
         // … 第 5 条被频率上限拒绝，窗口滑过 600 秒后额度才重新释放。
-        assert!(!reserve_visible_reply_slot(
+        assert!(!reserve_sent_reply(
             &mut state,
             started + Duration::from_secs(200),
             addressed_gap,
             rate_window,
             rate_limit
         ));
-        assert!(reserve_visible_reply_slot(
+        assert!(reserve_sent_reply(
             &mut state,
             started + Duration::from_secs(621),
             addressed_gap,

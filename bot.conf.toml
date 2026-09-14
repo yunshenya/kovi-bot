@@ -100,9 +100,11 @@ continuation_reply_gap_secs = 0
 # 必须 ≤ reply_gap_secs：超限时启动会告警，并按 reply_gap_secs 收口
 #（窗口在她下次可以发言前一直敞开的话，低频抽样与冷却全部作废）。
 continuation_window_secs = 60
-# 群聊可见回复节奏的确定性硬限制（显式识图/教学/命令不受限，管理员与普通
-# 成员同等受限）：同群两次可见聊天回复至少间隔 reply_gap_secs，每
-# reply_rate_window_secs 内最多 reply_rate_limit 条。防止“每句话都回”。
+# 群聊可见回复节奏的确定性硬限制（显式识图/教学/命令不受限）：同群两次
+# 可见聊天回复至少间隔 reply_gap_secs，每 reply_rate_window_secs 内最多
+# reply_rate_limit 条。防止“每句话都回”。管理员豁免的是**等待间隔**（管理员
+# 发言按 0 秒间隔处理：明确指令不该被“刚回过别人”挡掉），频率上限对所有人
+# 一致。名额是乐观预留的，回合最终没发出可见消息会立刻归还。
 # 2026-09-14 实测：一场正常来回 50 秒就把 4 条打满，之后 600 秒内连被点名的
 # 消息都会被静默；抬到 10，防刷屏仍由 reply_gap 与逐回合限流承担。
 reply_gap_secs = 90
