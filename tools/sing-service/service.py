@@ -143,29 +143,48 @@ def trim_silence(samples: np.ndarray, rate: int, threshold: float = 0.006) -> np
     return samples[start:end]
 
 
-def _pitch_tier(manipulation, duration: float, freq: float, previous: float | None):
-    """把整段的基频换成 freq（带颤音、jitter 与来自上一个音的短滑音）。"""
-    tier = call(manipulation, "Create PitchTier", "empty", 0.0, duration)
-    step = 0.02
-    rng = np.random.default_rng(int(freq) % 9973)
-    # 一个预先抽好的随机游走序列：每个点取一段，够整首歌用
-    jitter_values = np.cumsum(rng.normal(0.0, 0.35, 4096))
-    jitter_values = jitter_values - jitter_values.mean()
-    jitter_values = np.clip(jitter_values, -3.0, 3.0)
-    vibrato_hz = float(rng.uniform(4.6, 5.6))
-    for index, time in enumerate(np.arange(0.0, duration + step, step)):
-        at = min(float(time), duration)
-        if index == 0 and previous is not None:
-            glide = min(1.0, step / 0.04)
-            value = previous + (freq - previous) * glide
-        else:
-            # 颤音轻、延迟起振（先直后颤才是人唱的），再叠一点点随机游走当 jitter：
-            # 完全规则的周期会让音色听起来像合成器。
-            depth = 0.007 * min(1.0, max(0.0, (at - 0.25 * duration) / max(0.12, 0.3 * duration)))
-            jitter = 1.0 + 0.0035 * jitter_values[index % len(jitter_values)]
-            value = freq * jitter * (1.0 + depth * np.sin(2 * np.pi * vibrato_hz * at))
-        call(tier, "Add point", at, value)
-    call([manipulation, tier], "Replace pitch tier")
+PITCH_STEP = 0.02
+"""基频轮廓的采样间隔（秒）。"""
+VIBRATO_DEPTH = 0.007
+VIBRATO_HZ = (4.6, 5.6)
+JITTER_DEPTH = 0.0035
+"""微抖幅度 ±0.35%（约 ±6 音分）。"""
+
+
+def _pitch_contour(duration: float, freq: float, previous: float | None,
+                   seed: int) -> tuple[np.ndarray, np.ndarray]:
+    """算出整段的基频轮廓：起音滑音 → 直音 → 渐起的颤音，再叠一层零均值的微抖。
+
+    这里必须守住一条：**轮廓的均值恰好等于 freq**。上一版拿
+    ``np.cumsum(rng.normal(0.0, 0.35, 4096))`` 当 jitter，那是布朗游走——它会被 ±3 的
+    截断钉在偏离 0 的位置整段不动，等价于每个音固定跑调（实测线上 deg2 低 18 音分、
+    deg1/5/7 高 18 音分，相邻音程被压扁最多 36 音分，听感就是一路走音）。真人的
+    jitter 是逐周期、零均值、几个音分的快抖，不是慢漂移；所以这里改用平滑过的零均值
+    噪声，并在最后按均值归一化，保证"听着抖、平均音高就是那个音"。
+    """
+    times = np.clip(
+        np.arange(0.0, duration + PITCH_STEP * 0.5, PITCH_STEP), 0.0, max(duration, PITCH_STEP)
+    )
+    count = int(times.size)
+    rng = np.random.default_rng(seed)
+    vibrato_hz = float(rng.uniform(*VIBRATO_HZ))
+    noise = rng.standard_normal(count + 32)
+    kernel = np.hanning(17)
+    kernel /= kernel.sum()
+    jitter = np.convolve(noise, kernel, mode="same")[16 : 16 + count]
+    jitter = jitter - jitter.mean()
+    span = float(np.max(np.abs(jitter)))
+    if span > 0:
+        jitter = jitter / span
+    # 颤音延迟起振（先直后颤才是人唱的），深 0.7%
+    onset = np.clip((times - 0.25 * duration) / max(0.12, 0.3 * duration), 0.0, 1.0)
+    values = freq * (1.0 + JITTER_DEPTH * jitter) * (
+        1.0 + VIBRATO_DEPTH * onset * np.sin(2 * np.pi * vibrato_hz * times)
+    )
+    if previous is not None and count:
+        # 与上一个音之间 40 毫秒的滑音，第一个采样点只有 20 毫秒，所以取一半
+        values[0] = previous + (freq - previous) * min(1.0, PITCH_STEP / 0.04)
+    return times, values * (freq / float(np.mean(values)))
 
 
 def _dominant_hz(samples: np.ndarray, rate: int, floor: float, ceiling: float) -> float:
@@ -184,59 +203,126 @@ def _dominant_hz(samples: np.ndarray, rate: int, floor: float, ceiling: float) -
 QUIET_PEAK = 0.02
 """低于这个峰值就认为这个字没合成出来（实测单字"是""星"会得到近乎静音）。"""
 
+LEVEL_ALIGN_DB = 12.0
+"""逐音响度对齐的上限。旧版是 ±2.5dB，但逐字合成的响度差本来就到 20dB 以上
+（实测"慢"的字均 RMS 只有"晶"的十分之一），2.5dB 的夹子等于没夹：轻的字照样
+听不见、重的字照样炸。12dB 能把这类字拉回来，又不至于把乐句的起伏压成直线。"""
+
+MIN_VOICED_SECONDS = 0.06
+"""短于这个值的有声段撑不住一个长音。个别字在孤立合成下只给几十毫秒的元音，
+靠循环这么点碎音凑满一个音符，比"这个音没唱准"还难听。"""
+
 
 def _peak(samples: np.ndarray) -> float:
     return float(np.max(np.abs(samples))) if samples.size else 0.0
 
 
-def _longest_silence(samples: np.ndarray, rate: int) -> tuple[int, int] | None:
-    """找最长的低能量段，返回 (起点样本, 长度样本)。"""
+def _sung_level(piece: np.ndarray, rate: int) -> float:
+    """一个音"唱出来"那部分的响度：有声段的 RMS，找不到就用整段。
+
+    用整段 RMS 会被清辅音的字头带偏（字头又短又响），对齐之后元音反而更轻。
+    """
+    if piece.size == 0:
+        return 0.0
+    region = _voiced_region(piece, rate)
+    if region is not None:
+        piece = piece[region[0] : region[1]]
+    return float(np.sqrt(np.mean(piece**2))) if piece.size else 0.0
+
+
+def _energy_levels(samples: np.ndarray, rate: int) -> np.ndarray:
+    """每 10 毫秒一格的 RMS 包络。"""
     hop = max(16, int(0.01 * rate))
-    frames = [samples[i : i + hop] for i in range(0, len(samples) - hop + 1, hop)]
-    if len(frames) < 3:
+    if samples.size < hop:
+        return np.zeros(0)
+    return np.array(
+        [
+            float(np.sqrt(np.mean(samples[i : i + hop] ** 2)))
+            for i in range(0, samples.size - hop + 1, hop)
+        ]
+    )
+
+
+def _carrier_head(carried: np.ndarray, rate: int) -> np.ndarray | None:
+    """从"字，啊"里切出第一个字：在靠后的位置找一段最长的低能量区当切点。
+
+    旧实现只认"最长低能量段 ≤ 8% 峰值"，而且只看全局最长的那一段——它常常落在**开头**
+    （前置静音，实测"星，啊"就是 0.03 秒 @0.00 秒）。调用方又要求切点不早于 20 毫秒，
+    于是这段被判掉、真正的字间低谷反而从没被考虑，最后整段"字，啊"被当成一个字唱进
+    同一个音符——多唱一个"啊"。这里改成：跳过前 25%，在剩下部分里找最长的一段低谷，
+    找不到就返回 None，交给调用方决定要不要整段用。
+    """
+    hop = max(16, int(0.01 * rate))
+    levels = _energy_levels(carried, rate)
+    if levels.size < 4:
         return None
-    levels = np.array([float(np.sqrt(np.mean(frame**2))) for frame in frames])
-    threshold = max(1e-4, float(levels.max()) * 0.08)
+    threshold = max(1e-4, float(levels.max()) * 0.10)
     best: tuple[int, int] | None = None
-    start: int | None = None
-    for index, level in enumerate(levels):
-        if level <= threshold:
-            start = index if start is None else start
+    run: int | None = None
+    for index in range(max(1, int(levels.size * 0.25)), levels.size):
+        if levels[index] <= threshold:
+            run = index if run is None else run
             continue
-        if start is not None:
-            length = index - start
-            if best is None or length > best[1]:
-                best = (start * hop, length * hop)
-            start = None
-    if start is not None:
-        length = len(levels) - start
-        if best is None or length > best[1]:
-            best = (start * hop, length * hop)
-    if best is None or best[1] < int(0.03 * rate):
+        if run is not None:
+            if best is None or index - run > best[1] - best[0]:
+                best = (run, index)
+            run = None
+    if run is not None and (best is None or levels.size - run > best[1] - best[0]):
+        best = (run, levels.size)
+    if best is None or (best[1] - best[0]) * hop < int(0.03 * rate):
         return None
-    return best
+    head = carried[: best[0] * hop]
+    return head if head.size >= int(0.03 * rate) else None
+
+
+def _singable(samples: np.ndarray, rate: int) -> bool:
+    """这段合成撑得住一个长音吗：要有一段够长的周期性（元音），且不是近乎静音。
+
+    唱歌靠元音撑住长音，所以"有没有元音"才是可用性的判据。只看峰值会放过
+    "月""慢"这类塌法——峰值够（0.05），但整段一个周期性帧都没有，最后只能把几十
+    毫秒的碎音硬拉五倍，听起来就是一声没有音高的怪响。
+    """
+    if samples.size == 0 or _peak(samples) < QUIET_PEAK:
+        return False
+    region = _voiced_region(samples, rate)
+    return region is not None and region[1] - region[0] >= int(MIN_VOICED_SECONDS * rate)
 
 
 def synthesize_syllable(tts: "TtsClient", syllable: str, speed: float) -> tuple[np.ndarray, int]:
-    """合成一个字的音频；单字读不出来时用"字，啊"载体切出第一个字。
+    """合成一个字的音频；孤立合成塌掉时按"字。"→"字，啊"两级载体把它带出来。
 
-    实测 vits-zh-ll 对个别孤立汉字（"是""星"）会输出近乎静音（峰值 0.002），
-    而同样的字放进词组就正常。载体后面跟逗号会形成一段真实静音，正好当切点。
+    实测 vits-zh-ll 对孤立汉字有三种塌法：整段近乎无声（"星""事"，峰值 0.001）、
+    只有一小段噪声/鼻音而没有元音（"月""慢"）、以及拖得没意义的尾音。前两种都撑不住
+    一个音符。载体按"最少多余材料"排序：先试句末的"字。"（模型会当成一句正常读，
+    且不留多余音节），再试"字，啊"（最稳，但要切出第一个字）。
     """
     audio, rate = tts.synthesize(syllable, speed)
-    if _peak(audio) >= QUIET_PEAK:
+    if _singable(audio, rate):
         return audio, rate
-    carried, rate = tts.synthesize(f"{syllable}，啊", speed)
-    gap = _longest_silence(carried, rate)
-    if gap is not None and gap[0] >= int(0.02 * rate):
-        head = carried[: gap[0]]
-        if _peak(head) >= QUIET_PEAK:
-            LOG.debug("单字 %s 合成近乎无声，用载体切出前 %.3fs", syllable, gap[0] / rate)
-            return head, rate
-    if _peak(carried) > _peak(audio):
-        LOG.debug("单字 %s 合成近乎无声，退回整段载体", syllable)
-        return carried, rate
-    return audio, rate
+    # 载体也会失败（TTS 超时/报错），此时保留最响的那一份，绝不让整个请求塌掉
+    fallback, fallback_rate = audio, rate
+    for template, cut in ((f"{syllable}。", False), (f"{syllable}，啊", True)):
+        try:
+            carried, carried_rate = tts.synthesize(template, speed)
+        except SingRequestError as error:
+            LOG.warning("载体合成 %s 失败: %s", template, error)
+            continue
+        if cut:
+            head = _carrier_head(carried, carried_rate)
+            if head is not None and _singable(head, carried_rate):
+                LOG.debug("单字 %s 撑不住长音，用载体切出前 %.3fs", syllable, head.size / carried_rate)
+                return head, carried_rate
+            if _singable(carried, carried_rate):
+                # 切不开就整段用：多一个"啊"也比这个音没有音高好
+                LOG.debug("单字 %s 的载体切不开，整段使用（含尾字）", syllable)
+                return carried, carried_rate
+        elif _singable(carried, carried_rate):
+            LOG.debug("单字 %s 撑不住长音，改用句末读法", syllable)
+            return carried, carried_rate
+        if _peak(carried) > _peak(fallback):
+            fallback, fallback_rate = carried, carried_rate
+    # 三种都撑不住：至少别丢音，取更响的那个
+    return fallback, fallback_rate
 
 
 def _voice_eq(samples: np.ndarray, rate: int) -> np.ndarray:
@@ -244,7 +330,7 @@ def _voice_eq(samples: np.ndarray, rate: int) -> np.ndarray:
 
     实测对比她本人说话：唱歌的 0–300Hz（胸腔）只有 20%（说话 35%），1–4kHz（硬度）
     却有 31%（说话 20%）——又薄又尖正是"听着怪"的主要来源。这里三段一起修：
-    200Hz 低架 +3dB 补胸腔、3kHz 附近 -3.5dB 去硬度、6.5kHz 以上 -4dB 收毛刺。
+    250Hz 低架 +4dB 补胸腔、3kHz 峰 −6dB 去硬度、7kHz 以上 −6dB 收毛刺。
     """
     if len(samples) < 64:
         return samples
@@ -305,35 +391,56 @@ def _crossfade_join(left: np.ndarray, right: np.ndarray, overlap: int) -> np.nda
     )
 
 
-def _voiced_region(samples: np.ndarray, rate: int) -> tuple[int, int] | None:
-    """用"低过零率 + 够能量"找有声区间。
+def _periodicity(frame: np.ndarray, rate: int) -> float:
+    """归一化自相关峰：接近 1 是完全周期（元音），接近 0 是噪声/擦音。"""
+    if frame.size < 32:
+        return 0.0
+    centered = frame - frame.mean()
+    energy = float(np.dot(centered, centered))
+    if energy <= 1e-12:
+        return 0.0
+    min_lag = max(2, int(rate / 500))
+    max_lag = min(centered.size - 2, int(rate / 80))
+    if max_lag <= min_lag:
+        return 0.0
+    spectrum = np.fft.rfft(centered, n=2 * centered.size)
+    correlation = np.fft.irfft(spectrum * np.conj(spectrum))[: max_lag + 1]
+    if correlation[0] <= 0:
+        return 0.0
+    return float(np.max(correlation[min_lag : max_lag + 1]) / correlation[0])
 
-    不用 Praat 的基频分析：单字只有几十毫秒，分析窗比字还长，取不到有效帧。
-    擦音（sh/x/s）的过零率明显高于元音，这条判据在短音上也成立。
+
+def _voiced_region(samples: np.ndarray, rate: int) -> tuple[int, int] | None:
+    """用周期性（自相关峰）找有声区间。
+
+    旧判据是"能量够 + 过零率低于 0.12"。过零率在低响度、擦音比例高的字上会漏判，而
+    漏判的后果不是"少切一段"：调用方会退回整段不变调——那个字就用说话的调唱出来了
+    （实测线上"慢""开"两处整字没有变调，等于唱错音）。元音帧的自相关峰在 0.5 以上、
+    擦音在 0.3 以下，这个判据在几十毫秒的短音上也站得住。
     """
     hop = max(16, int(0.008 * rate))
-    if len(samples) < 3 * hop:
+    window = max(hop, int(0.032 * rate))
+    if samples.size < 2 * hop:
         return None
-    frame_rms: list[float] = []
-    frame_zcr: list[float] = []
-    for start in range(0, len(samples) - hop + 1, hop):
-        frame = samples[start : start + hop]
-        frame_rms.append(float(np.sqrt(np.mean(frame**2))))
-        frame_zcr.append(float(np.mean(np.abs(np.diff(np.sign(frame)))) / 2))
-    if not frame_rms:
-        return None
-    peak = max(frame_rms)
+    frames = [
+        (
+            float(np.sqrt(np.mean(samples[start : start + window] ** 2))),
+            _periodicity(samples[start : start + window], rate),
+        )
+        for start in range(0, samples.size - hop, hop)
+    ]
+    peak = max(rms for rms, _ in frames)
     if peak <= 0:
         return None
     voiced = [
         index
-        for index, (rms, zcr) in enumerate(zip(frame_rms, frame_zcr))
-        if rms > 0.25 * peak and zcr < 0.12
+        for index, (rms, periodicity) in enumerate(frames)
+        if periodicity >= 0.45 and rms >= 0.18 * peak
     ]
     if not voiced:
         return None
-    start = max(0, voiced[0] * hop - hop)
-    end = min(len(samples), (voiced[-1] + 2) * hop)
+    start = voiced[0] * hop
+    end = min(samples.size, voiced[-1] * hop + window)
     if end - start < int(0.02 * rate):
         return None
     return start, end
@@ -345,79 +452,110 @@ def _safe_floor(duration: float, minimum: float = 75.0) -> float:
     return max(minimum, min(400.0, 9.0 / max(0.01, duration)))
 
 
-def _psola_pitch(samples: np.ndarray, rate: int, freq: float,
-                 previous: float | None) -> np.ndarray:
+def _resynthesize(samples: np.ndarray, rate: int, freq: float, previous: float | None,
+                  target_seconds: float, seed: int) -> np.ndarray:
+    """一次 PSOLA 同时改音高与时值。
+
+    旧链路是"PSOLA 改音高 → 循环元音核 → 再用 Lengthen (PSOLA) 补零头"，同一个音要过
+    三遍重合成，接缝、颗粒感与颤音被循环复制的问题都从这儿来。Praat 的 Manipulation
+    本来就能同时挂 PitchTier 与 DurationTier：一次重合成把两件事做完，共振峰也保得住。
+    """
     sound = parselmouth.Sound(samples, sampling_frequency=rate)
     manipulation = call(sound, "To Manipulation", 0.01, _safe_floor(sound.duration), 1400)
-    _pitch_tier(manipulation, sound.duration, freq, previous)
+    times, values = _pitch_contour(sound.duration, freq, previous, seed)
+    tier = call(manipulation, "Create PitchTier", "empty", 0.0, sound.duration)
+    for at, value in zip(times.tolist(), values.tolist()):
+        call(tier, "Add point", float(at), float(value))
+    call([manipulation, tier], "Replace pitch tier")
+    ratio = target_seconds / max(1e-6, sound.duration)
+    if not 0.98 <= ratio <= 1.02:
+        duration_tier = call(
+            manipulation, "Create DurationTier", "empty", 0.0, sound.duration
+        )
+        call(duration_tier, "Add point", 0.0, float(ratio))
+        call(duration_tier, "Add point", float(sound.duration), float(ratio))
+        call([manipulation, duration_tier], "Replace duration tier")
     return call(manipulation, "Get resynthesis (overlap-add)").values[0]
 
 
-def _pitch_shift(samples: np.ndarray, rate: int, freq: float,
-                 previous: float | None) -> np.ndarray:
-    """只给有声段换音高，清辅音（字头）原样保留。
+def _tile_with_crossfade(samples: np.ndarray, rate: int, target_seconds: float) -> np.ndarray:
+    """整段平铺到目标长度，只给"整段没有周期性"的清辅音字兜底。
 
-    Praat 的重合成是由基频脉冲驱动的：整段送进去时，"是""星"这种几乎全是清辅音
-    的字会被合成成近乎无声（实测 RMS 0.09 → 0.001），听感上就是那个音消失了。
-    辅音本来也没有音高可改，原样接回去既保住了字头，也避开了这个坑。
+    清辅音没有音高可改，但时值仍然要占满这个音符；重复字头总比空一拍强。
     """
-    region = _voiced_region(samples, rate)
-    if region is None:
-        return samples
-    start, end = region
-    head, voiced, tail = samples[:start], samples[start:end], samples[end:]
-    if len(voiced) < int(0.02 * rate):
-        return samples
-    shifted = _psola_pitch(voiced, rate, freq, previous)
-    # 清辅音是原速原调的，元音是变调后的，硬接会在每个字上留一个咔哒（实测 99.99
-    # 分位差分是正常说话的近两倍，听感就是一路"啪啪"声）。3 毫秒交叠就够。
-    edge = max(1, int(0.003 * rate))
-    return _crossfade_join(_crossfade_join(head, shifted, edge), tail, edge)
+    target = max(1, int(round(target_seconds * rate)))
+    if samples.size == 0:
+        return np.zeros(target)
+    fade = max(1, min(int(0.012 * rate), samples.size // 2))
+    audio = samples.copy()
+    while audio.size < target:
+        audio = _crossfade_join(audio, samples, fade)
+    return audio[:target]
 
 
-def _fit_duration(
-    samples: np.ndarray, rate: int, target: float, expected_hz: float
-) -> np.ndarray:
-    """把已经定好音高的音频调到 target 秒。
+def _exact_seconds(samples: np.ndarray, rate: int, target_seconds: float,
+                   expected_hz: float) -> np.ndarray:
+    """把时长精确对齐到目标秒数。
 
-    短了就循环元音核（"人力VOCALOID"处理长音的标准做法——单字只有 0.1 秒，而一个
-    音符常常要 0.6~1.2 秒，硬拉会变成走调的嗡嗡声）；长了或只差零头就交给 Praat
-    的 Lengthen (PSOLA)。
+    Praat 的时长档在 3 倍以上会欠一点（实测目标 1.09s 只给到 0.90s），所以重合成之后
+    还要收一次尾：长了从尾部削（并做 5 毫秒收尾防咔哒），短了循环稳态段补齐。
     """
-    actual = len(samples) / rate
-    if actual <= 0:
-        return np.zeros(int(target * rate))
-    if target / actual < 1.15:
-        return _psola_scale(samples, rate, target)
-    looped = _loop_nucleus(samples, rate, target, expected_hz)
-    if looped is not None:
-        return _psola_scale(looped, rate, target)
-    # 连元音核都找不到（整段清辅音）：只能硬拉。
-    return _psola_scale(samples, rate, target)
+    target = max(1, int(round(target_seconds * rate)))
+    if samples.size >= target:
+        trimmed = samples[:target].copy()
+        fade = min(int(0.005 * rate), target // 2)
+        if fade > 1:
+            trimmed[-fade:] *= np.linspace(1.0, 0.0, fade)
+        return trimmed
+    looped = _loop_nucleus(samples, rate, target_seconds, expected_hz)
+    if looped is not None and looped.size > samples.size:
+        samples = looped
+    if samples.size < target:
+        samples = _tile_with_crossfade(samples, rate, target_seconds)
+    return samples[:target]
 
 
-def _psola_scale(samples: np.ndarray, rate: int, target: float) -> np.ndarray:
-    """Praat 的 Lengthen (PSOLA)：保留音高改时长。
+MIN_SYNTH_SPEED = 0.40
+"""放慢的下限。实测 VITS 到 0.35 还能再长一点，但 0.4 以下个别字会塌成近静音。"""
 
-    参数顺序是 ``(音高下限, 音高上限, 时长倍数)``——写反了会得到
-    ``minimum pitch must not be less than`` 这种看不懂的报错。
+
+def _stretch_source(tts: "TtsClient", syllable: str,
+                    duration: float) -> tuple[np.ndarray, int]:
+    """挑一个尽量长、又没有塌掉的逐字合成结果。
+
+    时值靠"合成时放慢"，不是事后硬拉：单字只有 0.1~0.2 秒，一个音符却常常
+    0.55~1.1 秒。旧版按 ``natural/duration`` 算语速再夹到 0.45，而单字几乎必然小于
+    0.45，于是**每个字都被夹在 0.45**；慢速下 VITS 有时反而更短（实测"月" speed=1.0
+    是 0.21 秒、0.45 是 0.12 秒），短过 30 毫秒后旧代码直接把整个音换成静音——一个音
+    就这么没了。这里**先按放慢那一档合成**，只在它撑不住长音时才退回自然语速：一次
+    TTS 调用要 120~210 毫秒，占整首歌渲染时间的九成以上，能少一次就少一次（重复字走
+    TTS 缓存）。
     """
-    actual = len(samples) / rate
-    if actual <= 0 or 0.96 <= target / actual <= 1.04:
-        return samples
-    try:
-        sound = parselmouth.Sound(samples, sampling_frequency=rate)
-        stretched = call(
-            sound,
-            "Lengthen (PSOLA)",
-            _safe_floor(sound.duration, 120.0),
-            1400,
-            target / actual,
-        )
-        return stretched.values[0]
-    except Exception as error:  # noqa: BLE001 - 补时长失败就用原样，不值得整轮失败
-        LOG.warning("Lengthen (PSOLA) 失败，保留原时长: %s", error)
-        return samples
+    best: np.ndarray | None = None
+    best_rate = SAMPLE_RATE
+    best_length = 0.0
+    fallback: np.ndarray | None = None
+    fallback_rate = SAMPLE_RATE
+    fallback_length = 0.0
+    for speed in (MIN_SYNTH_SPEED, 1.0):
+        try:
+            audio, rate = synthesize_syllable(tts, syllable, speed)
+        except SingRequestError as error:
+            LOG.warning("合成 %s 失败（speed=%.2f）: %s", syllable, speed, error)
+            continue
+        audio = trim_silence(audio, rate)
+        length = audio.size / rate
+        if length > fallback_length:
+            fallback, fallback_rate, fallback_length = audio, rate, length
+        if length > best_length and _singable(audio, rate):
+            best, best_rate, best_length = audio, rate, length
+        if best is not None:
+            # 放慢那一档已经给出能撑住长音的素材，就不必再合成自然语速那一档
+            break
+    # 两档都撑不住时也不能丢音：宁可留一个塌掉的字，也不要一个空拍。
+    if best is None:
+        return (fallback, fallback_rate) if fallback is not None else (np.zeros(0), SAMPLE_RATE)
+    return best, best_rate
 
 
 def _nucleus_span(samples: np.ndarray, rate: int, expected_hz: float) -> tuple[int, int] | None:
@@ -466,8 +604,7 @@ def _loop_nucleus(
 ) -> np.ndarray | None:
     """把元音核（整数个音高周期）循环到目标长度。
 
-    循环单元按整周期切，接缝的相位就是连续的，所以只需要 1.5 毫秒淡化防咔哒。
-    实测不按周期切时，587Hz 的"星"会掉到 133Hz（接缝把相位错开了）。
+    只在 PSOLA 的时长档欠了一点时用来补尾（见 `_exact_seconds`）。
     """
     span = _nucleus_span(samples, rate, expected_hz)
     if span is None:
@@ -501,47 +638,51 @@ def _loop_nucleus(
     return np.concatenate(pieces)
 
 
+
 def sing_note(tts: TtsClient, syllable: str, freq: float, duration: float,
-              previous: float | None) -> tuple[np.ndarray, int]:
+              previous: float | None, seed: int = 0) -> tuple[np.ndarray, int]:
     """把一个字唱成 freq 这个音、时值 duration 秒。
 
-    时值靠**合成时的语速**（VITS 的 length_scale）拿到：先按正常语速量出这个字
-    自然有多长，再按需要把它合成得慢一些。只在最后补一点 PSOLA 的零头，避免
-    "把 0.19 秒的字硬拉成 0.6 秒"那种发飘的听感。
+    四步：合成（自然语速与放慢取更长的一个）→ 切出有声段（清辅音原样保留）→
+    一次 PSOLA 把音高换成音符、时值拉到音符时值 → 收尾把总时长精确对齐。
     """
-    natural, rate = synthesize_syllable(tts, syllable, 1.0)
-    natural = trim_silence(natural, rate)
-    natural_seconds = len(natural) / rate
-    if natural_seconds <= 0:
-        return np.zeros(int(duration * rate)), rate
-    # 语速只用来"把字拉长一点"，不靠它凑时值：实测 VITS 在 0.45 以下就不再变慢
-    # （speed=0.2 甚至比 speed=1.0 还短），剩下的交给 _fit_duration 循环稳态段。
-    speed = max(0.45, min(1.0, natural_seconds / max(0.08, duration)))
-    if abs(speed - 1.0) < 0.05:
-        audio, rate = natural, rate
-    else:
-        audio, rate = synthesize_syllable(tts, syllable, speed)
-        audio = trim_silence(audio, rate)
-    if len(audio) < int(0.03 * rate):
-        return np.zeros(int(duration * rate)), rate
-    sung = _pitch_shift(audio, rate, freq, previous)
-    return _fit_duration(sung, rate, duration, freq), rate
+    if duration <= 0:
+        return np.zeros(1), SAMPLE_RATE
+    source, rate = _stretch_source(tts, syllable, duration)
+    if source.size == 0:
+        return np.zeros(max(1, int(duration * SAMPLE_RATE))), SAMPLE_RATE
+    region = _voiced_region(source, rate)
+    if region is None:
+        # 整段没有周期性（纯清辅音字）：它本来就没有音高，硬套 PSOLA 只会把擦音
+        # 变成嗡声；保住字头与时值，这个音按无音高唱。
+        LOG.debug("字 %s 整段无周期性，按清辅音铺满时值", syllable)
+        return _tile_with_crossfade(source, rate, duration), rate
+    start, end = region
+    if end - start < int(MIN_VOICED_SECONDS * rate):
+        start, end = 0, source.size
+    head, tail = source[:start], source[end:]
+    # 元音才是被拉长的部分：清辅音按原速留在音符开头，这正是"唱"的形态
+    target_voiced = max(0.04, duration - (head.size + tail.size) / rate)
+    sung = _resynthesize(source[start:end], rate, freq, previous, target_voiced, seed)
+    edge = max(1, int(0.003 * rate))
+    piece = _crossfade_join(_crossfade_join(head, sung, edge), tail, edge)
+    return _exact_seconds(piece, rate, duration, freq), rate
 
 
 _WORKER_TTS: TtsClient | None = None
 
 
-def _sing_note_job(job: tuple[str, str, float, float, float | None]) -> tuple[np.ndarray, int]:
+def _sing_note_job(job: tuple[str, str, float, float, float | None, int]) -> tuple[np.ndarray, int]:
     """进程池里的单音渲染。
 
     用进程而不是线程：parselmouth 底下是 Praat，带全局状态，多线程并发调用不保证
     安全。fork 出来的子进程各自持有自己的 TTS 客户端与缓存。
     """
     global _WORKER_TTS
-    tts_url, syllable, freq, duration, previous = job
+    tts_url, syllable, freq, duration, previous, seed = job
     if _WORKER_TTS is None:
         _WORKER_TTS = TtsClient(tts_url)
-    return sing_note(_WORKER_TTS, syllable, freq, duration, previous)
+    return sing_note(_WORKER_TTS, syllable, freq, duration, previous, seed)
 
 
 def split_syllables(lyrics: str) -> list[str]:
@@ -587,6 +728,32 @@ def fit_notes(notes: list[list[float]], syllable_count: int) -> list[tuple[float
     return head
 
 
+def fit_breaths(notes: list[list[float]], syllable_count: int,
+                breath_after: tuple[int, ...]) -> frozenset[int]:
+    """把"句尾换气"位置跟着旋律一起铺开，返回在哪些音之后换气（1 基）。
+
+    模板里的 ``breath_after`` 只描述它自己那一段的句尾（`zichang-qingkuai` 是 [4]），
+    而歌词更长时旋律要重复。旧实现直接拿模板的下标去比绝对音序，于是一首 20 秒的歌
+    只在第 4 个字之后喘一口气，后面十几个音一口气唱完——这正是"念经感"的来源之一。
+    """
+    if not notes or not breath_after or syllable_count <= 0:
+        return frozenset()
+    length = len(notes)
+    marks = {value for value in (int(item) for item in breath_after) if 0 < value <= length}
+    if not marks:
+        return frozenset()
+    if syllable_count >= length:
+        return frozenset(
+            index + 1 for index in range(syllable_count) if ((index % length) + 1) in marks
+        )
+    # 歌词比旋律短：前面的音原样保留，最后一个音并掉了余下的时值，
+    # 它被并掉的那几个音里的换气点也就跟到句尾。
+    kept = {index + 1 for index in range(syllable_count - 1) if (index + 1) in marks}
+    if any(value in marks for value in range(syllable_count, length + 1)):
+        kept.add(syllable_count)
+    return frozenset(kept)
+
+
 def render_song(tts: TtsClient, notes: list[list[float]], lyrics: str, octave: int,
                 tempo: float, breath_after: tuple[int, ...] = (),
                 reverb: bool = True, transpose: float = 0.0,
@@ -599,6 +766,7 @@ def render_song(tts: TtsClient, notes: list[list[float]], lyrics: str, octave: i
     fitted = fit_notes(notes, len(syllables))
     if not fitted:
         raise SingRequestError("模板没有音符")
+    breath_after = tuple(sorted(fit_breaths(notes, len(syllables), breath_after)))
 
     beat_seconds = 60.0 / max(30.0, min(200.0, tempo))
     rate = SAMPLE_RATE
@@ -608,7 +776,7 @@ def render_song(tts: TtsClient, notes: list[list[float]], lyrics: str, octave: i
     # 先把每个音的活排出来。滑音起点取"计划里的上一个音"，不依赖渲染结果，
     # 所以这些音彼此独立、可以并行——线上那次 28 个音串行渲染要 10 秒，正好
     # 撞上群里两条附件消息把回复顶掉。
-    jobs: list[tuple[str, str, float, float, float | None]] = []
+    jobs: list[tuple[str, str, float, float, float | None, int]] = []
     plan: list[tuple[int, int, float, float]] = []  # (index, degree, duration, freq)
     elapsed = 0.0
     previous: float | None = None
@@ -620,7 +788,9 @@ def render_song(tts: TtsClient, notes: list[list[float]], lyrics: str, octave: i
         freq = _transposed(_hz(degree, octave), transpose)
         # 每个音多合成 15 毫秒，专门留给与下一个音的交叠；总时值因此保持不变。
         held = duration + (overlap / rate if index != last_index else 0.0)
-        jobs.append((getattr(tts, "url", ""), syllable, freq, held, previous))
+        # 种子带上音序号：同一个音级反复出现时，颤音与微抖不会一模一样
+        seed = (index + 1) * 7919 + int(round(freq))
+        jobs.append((getattr(tts, "url", ""), syllable, freq, held, previous, seed))
         plan.append((index, degree, duration, freq))
         previous = freq
         elapsed += duration
@@ -633,11 +803,11 @@ def render_song(tts: TtsClient, notes: list[list[float]], lyrics: str, octave: i
             rendered = list(pool.map(_sing_note_job, jobs))
         except Exception as error:  # noqa: BLE001 - 并行失败就退回串行，不能整首失败
             LOG.warning("并行渲染失败，退回串行: %s", error)
-            rendered = [sing_note(tts, syllable, freq, held, previous)
-                        for (_url, syllable, freq, held, previous) in jobs]
+            rendered = [sing_note(tts, syllable, freq, held, previous, seed)
+                        for (_url, syllable, freq, held, previous, seed) in jobs]
     else:
-        rendered = [sing_note(tts, syllable, freq, held, previous)
-                    for (_url, syllable, freq, held, previous) in jobs]
+        rendered = [sing_note(tts, syllable, freq, held, previous, seed)
+                    for (_url, syllable, freq, held, previous, seed) in jobs]
 
     pieces: list[np.ndarray] = []
     for (index, degree, duration, freq), (piece, rate) in zip(plan, rendered, strict=True):
@@ -657,17 +827,18 @@ def render_song(tts: TtsClient, notes: list[list[float]], lyrics: str, octave: i
             # 句尾换气：没有呼吸的连续音墙是"念经/机械"感的来源之一。
             pieces.append(np.zeros(int(BREATH_SECONDS * rate)))
 
-    # 逐音做一次有上限的响度对齐：清辅音字天然比元音响得多/轻得多，不压一下会
-    # 出现某个字几乎听不见。只在 ±2.5dB 内调整，避免把整首歌压成一条没有起伏的线。
-    levels = [float(np.sqrt(np.mean(piece**2))) if len(piece) else 0.0 for piece in pieces]
-    audible = [level for level in levels if level > 1e-4]
+    # 逐音做一次有上限的响度对齐：逐字合成出来的响度本来就散（实测最轻的字比最响的
+    # 低 18dB 以上），不压就会出现"某个字几乎听不见、某个字炸一下"。
+    levels = [_sung_level(piece, rate) for piece in pieces]
+    audible = [level for level in levels if level > 1e-5]
     if audible:
         target_level = float(np.median(audible))
+        cap = 10 ** (LEVEL_ALIGN_DB / 20)
         for index, piece in enumerate(pieces):
             level = levels[index]
-            if level <= 1e-4:
+            if level <= 1e-5:
                 continue
-            gain = min(1.33, max(0.75, target_level / level))
+            gain = min(cap, max(1.0 / cap, target_level / level))
             pieces[index] = piece * gain
 
     # 音与音之间用 15 毫秒交叠连起来（legato）：逐音淡到零再淡起来会变成一顿一顿的
@@ -696,7 +867,8 @@ def render_song(tts: TtsClient, notes: list[list[float]], lyrics: str, octave: i
         handle.setsampwidth(2)
         handle.setframerate(rate)
         handle.writeframes(pcm.tobytes())
-    return buffer.getvalue(), rate, len(pieces)
+    # 返回唱出的音符数，不是段落数：pieces 里还夹着换气，拿它当"唱了几个字"会虚高。
+    return buffer.getvalue(), rate, len(plan)
 
 
 class Templates:
