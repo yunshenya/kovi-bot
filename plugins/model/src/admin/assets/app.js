@@ -36,15 +36,42 @@
 
   function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
 
+  /** 图标节点：`<svg class="icon"><use href="#i-name"></use></svg>`。
+   *  路径数据只在 index.html 的 sprite 里写一份，这里只引名字。 */
+  function icon(name, className) {
+    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    svg.setAttribute('class', className ? `icon ${className}` : 'icon');
+    svg.setAttribute('aria-hidden', 'true');
+    const use = document.createElementNS('http://www.w3.org/2000/svg', 'use');
+    use.setAttribute('href', `#i-${name}`);
+    svg.append(use);
+    return svg;
+  }
+
   /** 当前是不是窄屏（手机）。与 app.css 里 760px 那一档断点保持同一个数——
    *  有些取舍（标注页把统计收起来、队列放到详情下面）靠 CSS 表达不了。 */
   const NARROW_QUERY = '(max-width: 760px)';
   const narrowLayout = () => window.matchMedia(NARROW_QUERY).matches;
 
+  const TOAST_ICONS = { ok: 'check', warn: 'alert', bad: 'close' };
+
   function toast(message, kind = 'ok', ms = 4200) {
-    const node = h('div', { class: `toast ${kind}`, text: message });
+    const node = h('div', { class: `toast ${kind}`, title: '点击关闭' },
+      h('span', { class: 'toast-icon' }, icon(TOAST_ICONS[kind] || 'info')),
+      h('span', { class: 'toast-text', text: message }));
+    node.addEventListener('click', () => node.remove());
     $('#toast-stack').append(node);
     setTimeout(() => node.remove(), ms);
+  }
+
+  /** 状态胶囊的文案要写进 .pill-text，不能整个 pill.textContent——
+   *  那会把里面那个呼吸的小圆点一起冲掉。 */
+  function setPill(node, kind, text) {
+    if (!node) return;
+    node.className = `pill ${kind}`;
+    const label = node.querySelector('.pill-text');
+    if (label) label.textContent = text;
+    else node.textContent = text;
   }
 
   async function api(path, options = {}) {
@@ -268,6 +295,11 @@
 
   async function goto(page) {
     if (page !== 'system') stopSystemRefresh();
+    // 离开配置页就把滚动监听的引用放掉，别让它抱着已经摘下来的按钮。
+    if (page !== 'config' && config.spyCleanup) {
+      config.spyCleanup();
+      config.spyCleanup = null;
+    }
     currentPage = page;
     if (pageFromHash() !== page) {
       const url = `#/${page}`;
@@ -282,6 +314,7 @@
     }
     $('#page-title').textContent = PAGES[page].title;
     $('#page-subtitle').textContent = PAGES[page].subtitle;
+    document.title = `${PAGES[page].title} · 芸汐 管理后台`;
     await PAGES[page].render();
   }
 
@@ -297,7 +330,15 @@
   window.addEventListener('hashchange', followHash);
   window.addEventListener('popstate', followHash);
 
-  $('#refresh').addEventListener('click', () => refreshAll());
+  $('#refresh').addEventListener('click', async (event) => {
+    const glyph = event.currentTarget.querySelector('.icon');
+    if (glyph) glyph.classList.add('spin');
+    try {
+      await refreshAll();
+    } finally {
+      if (glyph) glyph.classList.remove('spin');
+    }
+  });
 
   async function refreshAll() {
     await refreshHealth();
@@ -315,6 +356,20 @@
   // 队列也换了顺序，这些取舍在渲染时就定死了，光靠 CSS 变不回来。
   window.matchMedia(NARROW_QUERY).addEventListener('change', () => {
     if (currentPage === 'annotation') renderAnnotationPage();
+    if (currentPage === 'config') syncToolbarHeight();
+  });
+
+  // 配置页按 `/` 直接跳进搜索框——215 个字段里找一项时，这是最短的一条路。
+  document.addEventListener('keydown', (event) => {
+    if (currentPage !== 'config') return;
+    if (event.key !== '/' || event.metaKey || event.ctrlKey || event.altKey) return;
+    const tag = event.target && event.target.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+    const box = $('#config-search');
+    if (!box) return;
+    event.preventDefault();
+    box.focus();
+    box.select();
   });
 
   async function refreshHealth() {
@@ -322,15 +377,14 @@
     try {
       const status = await api('/api/status');
       const ok = status.database.ok && status.redis.ok;
-      pill.className = `pill ${ok ? 'ok' : 'bad'}`;
-      pill.textContent = ok
+      setPill(pill, ok ? 'ok' : 'bad', ok
         ? `运行中 · ${status.uptime}`
-        : (status.database.ok ? 'Redis 不可用' : '数据库不可用');
+        : (status.database.ok ? 'Redis 不可用' : '数据库不可用'));
       $('#brand-revision').textContent = `${status.version} · ${String(status.revision).slice(0, 8)}`;
       overviewCache = status;
     } catch (problem) {
-      pill.className = 'pill bad';
-      pill.textContent = problem.message;
+      setPill(pill, 'bad', problem.message);
+      pill.title = problem.message;
     }
   }
 
@@ -430,6 +484,13 @@
     // 先让人看见"有哪些分区"，要点开哪块再点哪块。
     expanded: new Set(),
     sectionPaths: [],
+    /** 左栏分区导航的滚动监听清理函数（切页/重画时先放掉）。 */
+    spyCleanup: null,
+    /** 左栏当前高亮的分区按钮（只在变化时滚动它）。 */
+    spyActive: null,
+    /** 工具行里显示"命中多少分区 / 多少参数"的那个节点。 */
+    matchNode: null,
+    fieldShown: 0,
   };
 
   async function renderConfigPage() {
@@ -472,7 +533,7 @@
         h('div', { class: 'file-meta', text: `${file.name} · ${file.exists ? fmtBytes(file.bytes) : '尚未创建'}` }),
         h('div', { class: 'file-meta', text: file.restart_required ? '改完需重启' : '保存后热加载' })));
     }
-    const sidebar = h('div', { class: 'card' }, files);
+    const sidebar = h('div', { class: 'card config-side' }, files);
     layout.append(sidebar);
 
     const main = h('div', { class: 'config-main' });
@@ -503,6 +564,16 @@
     config.sectionsEl = body;
     config.sidebarEl = sidebar;
     renderConfigSections(body, sidebar);
+    syncToolbarHeight();
+  }
+
+  /** 工具行的高度会随搜索行换行变化（窄屏能折成两行），而吸顶的保存栏、
+   *  分区跳转的滚动留白都按它定位。量一次写进 CSS 变量，免得写死像素。 */
+  function syncToolbarHeight() {
+    const toolbar = document.querySelector('#page-config .config-toolbar');
+    if (!toolbar) return;
+    const height = Math.round(toolbar.getBoundingClientRect().height);
+    document.documentElement.style.setProperty('--config-toolbar-h', `${height}px`);
   }
 
   /** 只重画「分区列表 + 左栏导航」。
@@ -529,10 +600,20 @@
   function renderConfigToolbar() {
     const data = config.data;
     const search = h('input', {
-      class: 'input', placeholder: '搜索参数名或说明…', value: config.filter,
+      class: 'input search', id: 'config-search',
+      placeholder: '搜索参数名或说明…（按 / 聚焦）',
+      value: config.filter,
       oninput: (event) => {
         config.filter = event.target.value.trim().toLowerCase();
         rerenderConfigBody();
+      },
+      onkeydown: (event) => {
+        if (event.key === 'Escape' && config.filter) {
+          event.preventDefault();
+          search.value = '';
+          config.filter = '';
+          rerenderConfigBody();
+        }
       },
     });
     const expandAll = (open) => {
@@ -548,6 +629,9 @@
       onclick: () => expandAll(config.expanded.size === 0),
     });
     config.expandButton = button;
+    // 命中数写在说明行里：搜索框一变，这里立刻跟着变，不必去数扇区。
+    const match = h('span', { class: 'config-match' });
+    config.matchNode = match;
     return h('div', { class: 'card tight config-toolbar' },
       h('div', { class: 'search-row' }, search,
         button,
@@ -556,18 +640,20 @@
         config.data.writable ? null : h('span', { class: 'badge secret', text: '只读' }),
         h('button', {
           class: 'btn ghost', text: '重新加载',
+          title: '丢弃未保存的改动，按磁盘上的内容重读',
           onclick: async () => {
             try {
               await api('/api/config/reload', { method: 'POST' });
               config.dirty.clear();
               await loadConfigFile(config.name);
-              // 只重读文件不重画页面的话，表单还停在旧值上，看起来像"按了没反应"。
-              await renderConfigPage();
               toast('已按磁盘内容重新加载配置');
+              await renderConfigPage();
             } catch (problem) { toast(problem.message, 'bad'); }
           },
         })),
-      h('div', { class: 'field-hint', text: data.description || '' }));
+      h('div', { class: 'config-meta' },
+        h('span', { class: 'field-hint', text: data.description || '' }),
+        match));
   }
 
   function backupCount() {
@@ -586,10 +672,12 @@
     const data = config.data;
     const values = data.values || {};
     const nav = h('div', { class: 'section-nav' });
+    const navButtons = new Map();
     const isTyped = data.typed;
     let shown = 0;
     // 顶层分区是稳定的，但重画时会收集一遍；这里只在第一次算。
     config.sectionPaths = [];
+    config.fieldShown = 0;
 
     const sections = Object.keys(values);
 
@@ -599,30 +687,81 @@
       if (!sectionNode) continue;
       shown += 1;
       container.append(sectionNode);
-      nav.append(h('button', {
+      const button = h('button', {
+        type: 'button',
+        title: `跳到「${sectionTitle(key)}」`,
         onclick: () => {
           sectionNode.openSection?.();
           sectionNode.scrollIntoView({ behavior: 'smooth', block: 'start' });
         },
-      }, h('span', { text: sectionTitle(key, isTyped) }),
-        h('span', { class: 'count', text: countFields(value) })));
+      }, h('span', { text: sectionTitle(key) }),
+        h('span', { class: 'count', text: countFields(value) }));
+      navButtons.set(key, button);
+      nav.append(button);
     }
 
     if (!shown) {
       container.append(h('div', { class: 'empty', text: '没有匹配的参数' }));
     }
+    if (config.matchNode) {
+      config.matchNode.textContent = config.filter
+        ? `匹配 ${shown} 个分区 · ${config.fieldShown} 个参数`
+        : `${shown} 个分区 · ${config.fieldShown} 个参数`;
+    }
 
     // 导航区整块替换：只删 nav 会把标题留下，重画几次就叠出好几行"分区"。
+    // 用 details 而不是死板的标题：窄屏上 26 个分区会把搜索框顶到屏幕外，
+    // 折起来当索引用；宽屏默认展开，跟以前一样。
     let block = sidebar.querySelector('.section-nav-block');
     if (!block) {
-      block = h('div', { class: 'section-nav-block' });
+      block = h('details', { class: 'section-nav-block', open: !narrowLayout() });
       sidebar.append(block);
     }
     clear(block);
     block.append(
-      h('div', { class: 'card-head', style: 'padding: 12px 2px 0' },
-        h('h3', { text: isTyped ? '分区' : '顶层键' })),
+      h('summary', { class: 'section-nav-head' },
+        h('span', { text: isTyped ? '分区' : '顶层键' }),
+        h('span', { class: 'count', text: `${shown} 个` })),
       nav);
+    setupSectionSpy(navButtons);
+  }
+
+  /** 左栏分区导航跟随正文高亮：滚到哪一块，哪一行就是选中态。
+   *
+   *  用滚动位置算而不是 IntersectionObserver：吸顶的工具栏遮住了正文顶部，
+   *  观察器的"可见"判定会把刚滚过去的分区也算成可见。 */
+  function setupSectionSpy(buttons) {
+    if (config.spyCleanup) { config.spyCleanup(); config.spyCleanup = null; }
+    const scroller = document.querySelector('.page-scroll');
+    const entries = [...buttons.entries()];
+    if (!scroller || !entries.length) return;
+    let frame = 0;
+    const update = () => {
+      frame = 0;
+      const first = document.getElementById(`section-${entries[0][0]}`);
+      // 已经离开配置页（整页被重建过）：别再动那些已经摘下来的按钮。
+      if (!first || !first.isConnected) return;
+      // 判定线放在吸顶工具栏下沿再往下一点，避免"刚露头"就被算作当前分区。
+      const line = scroller.getBoundingClientRect().top + 86;
+      let active = entries[0][1];
+      for (const [path, button] of entries) {
+        const card = document.getElementById(`section-${path}`);
+        if (!card) continue;
+        if (card.getBoundingClientRect().top <= line) active = button;
+        else break;
+      }
+      for (const button of buttons.values()) button.classList.toggle('active', button === active);
+      // 选中项可能在左栏的滚动区之外（分区多、栏位矮）：把它带进视野，
+      // 否则高亮跟没高亮一样。block:'nearest' 只在看不见时才动，不会带着页面跳。
+      if (active !== config.spyActive) {
+        config.spyActive = active;
+        active.scrollIntoView({ block: 'nearest' });
+      }
+    };
+    const onScroll = () => { if (!frame) frame = requestAnimationFrame(update); };
+    scroller.addEventListener('scroll', onScroll, { passive: true });
+    config.spyCleanup = () => scroller.removeEventListener('scroll', onScroll);
+    update();
   }
 
   function sectionTitle(key) {
@@ -678,20 +817,30 @@
     const isOpen = searching || config.expanded.has(sectionPath);
     body.hidden = !isOpen;
 
-    const chevron = h('span', { class: 'section-chevron', text: isOpen ? '▾' : '▸' });
+    const chevron = h('span', { class: `section-chevron${isOpen ? ' open' : ''}` }, icon('chevron'));
     // 说明文字只在展开时露出：折起来时它就是白白占一行高度。
     const docNode = doc && doc.section ? h('p', { class: 'section-doc', text: doc.section, hidden: !isOpen }) : null;
+    const setOpen = (open, remember = true) => {
+      body.hidden = !open;
+      chevron.classList.toggle('open', open);
+      if (docNode) docNode.hidden = !open;
+      header.setAttribute('aria-expanded', open ? 'true' : 'false');
+      if (!remember) return;
+      if (open) config.expanded.add(sectionPath);
+      else config.expanded.delete(sectionPath);
+    };
     const header = h('header', {
       class: searching ? 'locked' : '',
+      role: 'button',
+      tabindex: searching ? null : '0',
+      'aria-expanded': isOpen ? 'true' : 'false',
       title: searching ? '搜索中：结果已自动展开' : '点击折叠 / 展开',
-      onclick: () => {
+      onclick: () => { if (!searching) setOpen(body.hidden); },
+      onkeydown: (event) => {
         if (searching) return;
-        const open = body.hidden;
-        body.hidden = !open;
-        chevron.textContent = open ? '▾' : '▸';
-        if (open) config.expanded.add(sectionPath);
-        else config.expanded.delete(sectionPath);
-        if (docNode) docNode.hidden = !open;
+        if (event.key !== 'Enter' && event.key !== ' ') return;
+        event.preventDefault();
+        setOpen(body.hidden);
       },
     },
       chevron,
@@ -702,12 +851,7 @@
 
     const card = h('section', { class: 'card section-card', id: `section-${sectionPath}` });
     // 左栏导航要用它：先展开再滚过去，否则滚到一个折着的标题上什么也看不见。
-    card.openSection = () => {
-      body.hidden = false;
-      chevron.textContent = '▾';
-      if (docNode) docNode.hidden = false;
-      config.expanded.add(sectionPath);
-    };
+    card.openSection = () => setOpen(true);
     card.append(header);
     if (docNode) card.append(docNode);
     card.append(body);
@@ -753,18 +897,21 @@
     });
 
     const restart = isTyped && restartRequiredFor(docPath);
+    config.fieldShown = (config.fieldShown || 0) + 1;
 
-    return h('div', { class: `field${changed ? ' changed' : ''}` },
+    // 字段名与状态在左栏，控件与说明在右栏：说明跟着控件走才能用满整行宽度，
+    // 挤在窄窄的标签栏里会折成好几行，把每一行都撑得老高。
+    return h('div', { class: `field${changed ? ' changed' : ''}`, 'data-field-path': dotted },
       h('div', { class: 'field-label' },
         h('div', { class: 'field-head' },
           h('span', { class: 'field-name', text: path.slice(-1)[0] }),
           secret ? h('span', { class: 'badge secret', text: '密钥' }) : null,
           restart ? h('span', { class: 'badge restart', text: '需重启' }) : null,
           !present ? h('span', { class: 'badge default', text: '本文件未写' }) : null,
-          numericSegments.length ? h('span', { class: 'badge', text: `第 ${Number(numericSegments[0]) + 1} 项` }) : null),
+          numericSegments.length ? h('span', { class: 'badge', text: `第 ${Number(numericSegments[0]) + 1} 项` }) : null)),
+      h('div', { class: 'field-control' }, control,
         doc ? h('div', { class: 'field-doc', text: doc }) : null,
-        hint ? h('div', { class: 'field-hint', text: hint }) : null),
-      h('div', { class: 'field-control' }, control));
+        hint ? h('div', { class: 'field-hint', text: hint }) : null));
   }
 
   /** 数组元素的路径形如 `tools.mcp_servers[].name`，是否"写进文件"取决于数组本身。 */
@@ -1305,7 +1452,7 @@
 
   function renderFilterRow(tags) {
     const search = h('input', {
-      class: 'input',
+      class: 'input search',
       placeholder: '按文本或上下文筛选（按 Enter 确认）…',
       value: memory.query,
       onkeydown: (event) => {
@@ -2251,7 +2398,7 @@
   // ── 人物
 
   async function renderPeopleTab(page) {
-    const search = h('input', { class: 'input', placeholder: '按 QQ 号或身份搜索…', value: memory.query });
+    const search = h('input', { class: 'input search', placeholder: '按 QQ 号或身份搜索…', value: memory.query });
     page.append(h('div', { class: 'card tight' },
       h('div', { class: 'search-row' }, search,
         h('button', {
@@ -2483,7 +2630,8 @@
   }
 
   function modelFact(label, value) {
-    return h('div', { class: 'model-fact' },
+    // 端点地址常常比这一格宽：截断显示，但鼠标停上去要看得到全文。
+    return h('div', { class: 'model-fact', title: `${label}：${value}` },
       h('span', { class: 'model-fact-label', text: label }),
       h('span', { class: 'model-fact-value mono', text: value }));
   }
@@ -2734,7 +2882,8 @@
   }
 
   function stickerFact(label, value) {
-    return h('div', { class: 'sticker-fact' },
+    // 目录路径同理：截断显示，悬停补全。
+    return h('div', { class: 'sticker-fact', title: `${label}：${value}` },
       h('span', { class: 'sticker-fact-label', text: label }),
       h('span', { class: 'sticker-fact-value mono', text: value }));
   }
@@ -3309,14 +3458,14 @@
     renderAnnotationList();
     renderAnnotationDetail();
     if (scrollToDetail && narrowLayout()) {
-      // 让开吸顶的工具栏再滚：直接 scrollIntoView 会把卡片标题压在工具栏下面。
-      // 工具栏高度随标题换行变化，所以量一次，不用写死像素。
-      const topbar = document.querySelector('.topbar');
-      const offset = (topbar ? topbar.getBoundingClientRect().height : 0) + 10;
-      window.scrollTo({
-        top: host.getBoundingClientRect().top + window.scrollY - offset,
-        behavior: 'smooth',
-      });
+      // 内容区自己滚动（.page-scroll），不是文档滚动，所以只能滚那个容器；
+      // 偏移量按"容器顶到详情卡顶"算，工具栏高度随标题换行变化也不用写死像素。
+      const scroller = host.closest('.page-scroll');
+      if (scroller) {
+        const top = host.getBoundingClientRect().top
+          - scroller.getBoundingClientRect().top + scroller.scrollTop;
+        scroller.scrollTo({ top: Math.max(0, top - 10), behavior: 'smooth' });
+      }
     }
   }
 
@@ -3777,8 +3926,11 @@
   // ───────────────────────────── 弹窗 ─────────────────────────────
 
   let modalFooter = null;
+  /** 关掉弹窗后把焦点还回去：键盘用户不该被丢在 body 上。 */
+  let modalReturnFocus = null;
 
   function openModal(title, bodyNode, buttons, note) {
+    if ($('#modal').hidden) modalReturnFocus = document.activeElement;
     $('#modal-title').textContent = title;
     $('#modal-note').textContent = note || '';
     $('#modal-body').replaceChildren(bodyNode);
@@ -3791,12 +3943,29 @@
       footer.hidden = true;
     }
     $('#modal').hidden = false;
+    const card = $('#modal .modal-card');
+    // 要在大段文本里编辑（原始 TOML）时把弹窗放宽，少折几行。
+    if (card) {
+      card.classList.toggle('wide', Boolean(bodyNode && bodyNode.querySelector?.('.textarea')));
+      // 焦点进弹窗：Escape 关得掉，Tab 也不会跑到背后的页面上。
+      card.focus({ preventScroll: true });
+    }
   }
 
-  function closeModal() { $('#modal').hidden = true; }
+  function closeModal() {
+    const modal = $('#modal');
+    if (modal.hidden) return;
+    modal.hidden = true;
+    if (modalReturnFocus && modalReturnFocus.isConnected) {
+      modalReturnFocus.focus({ preventScroll: true });
+    }
+    modalReturnFocus = null;
+  }
 
   $('#modal-close').addEventListener('click', closeModal);
-  $('#modal').addEventListener('click', (event) => { if (event.target.id === 'modal') closeModal(); });
+  $('#modal').addEventListener('click', (event) => {
+    if (event.target.id === 'modal' || event.target.classList.contains('modal-backdrop')) closeModal();
+  });
   document.addEventListener('keydown', (event) => { if (event.key === 'Escape') closeModal(); });
 
   // ───────────────────────────── 启动 ─────────────────────────────

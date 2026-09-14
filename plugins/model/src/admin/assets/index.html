@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow">
+<meta name="color-scheme" content="dark light">
 <title>芸汐 · 管理后台</title>
 <!-- 先落主题再渲染，避免选了浅色主题的人看到一下深色的闪白。 -->
 <script>
@@ -17,13 +18,48 @@
 </head>
 <body>
 
+<!-- ───────────────────────── 图标 ─────────────────────────
+     全部图标是同一套线性图标（24 格、1.7 描边、currentColor），
+     用 <symbol> + <use> 复用：JS 里只写图标名，不重复抄路径数据。 -->
+<svg class="icon-sprite" aria-hidden="true" focusable="false">
+  <symbol id="i-overview" viewBox="0 0 24 24"><rect x="3" y="3" width="7.5" height="7.5" rx="2"/><rect x="13.5" y="3" width="7.5" height="4.5" rx="2"/><rect x="3" y="13.5" width="7.5" height="7.5" rx="2"/><rect x="13.5" y="10.5" width="7.5" height="10.5" rx="2"/></symbol>
+  <symbol id="i-config" viewBox="0 0 24 24"><path d="M5 7h9M18 7h1M5 12h3M12 12h7M5 17h9M18 17h1"/><circle cx="16" cy="7" r="2.1"/><circle cx="10" cy="12" r="2.1"/><circle cx="16" cy="17" r="2.1"/></symbol>
+  <symbol id="i-memory" viewBox="0 0 24 24"><ellipse cx="12" cy="6" rx="7.5" ry="3"/><path d="M4.5 6v6c0 1.66 3.36 3 7.5 3s7.5-1.34 7.5-3V6"/><path d="M4.5 12v6c0 1.66 3.36 3 7.5 3s7.5-1.34 7.5-3v-6"/></symbol>
+  <symbol id="i-model" viewBox="0 0 24 24"><rect x="8" y="8" width="8" height="8" rx="2.2"/><path d="M12 2.5v5M12 16.5v5M2.5 12h5M16.5 12h5M5.2 5.2l3.3 3.3M15.5 15.5l3.3 3.3M18.8 5.2l-3.3 3.3M8.5 15.5l-3.3 3.3"/></symbol>
+  <symbol id="i-stickers" viewBox="0 0 24 24"><path d="M20.5 12a8.5 8.5 0 1 1-8.9-8.5"/><path d="M20.5 12h-4a4.5 4.5 0 0 0-4.5 4.5v4"/><path d="M8.8 14.2a4 4 0 0 0 5 0"/><path d="M9 9.5h.01M15 9.5h.01"/></symbol>
+  <symbol id="i-annotation" viewBox="0 0 24 24"><path d="M3.5 20.5l4.2-1.1a3 3 0 0 0 1.3-.7l9.9-9.9a2.4 2.4 0 0 0-3.4-3.4l-9.9 9.9a3 3 0 0 0-.7 1.3z"/><path d="M14.5 6.5l3 3"/></symbol>
+  <symbol id="i-system" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="7" rx="2.2"/><rect x="3" y="13" width="18" height="7" rx="2.2"/><path d="M7 7.5h.01M7 16.5h.01"/></symbol>
+
+  <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20.5 12a8.5 8.5 0 1 1-2.6-6.1"/><path d="M20.5 4.5V10H15"/></symbol>
+  <symbol id="i-theme" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4.2"/><path d="M12 2.5v2.2M12 19.3v2.2M4.2 4.2l1.6 1.6M18.2 18.2l1.6 1.6M2.5 12h2.2M19.3 12h2.2M4.2 19.8l1.6-1.6M18.2 5.8l1.6-1.6"/></symbol>
+  <symbol id="i-logout" viewBox="0 0 24 24"><path d="M15 4.5h3.5a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2H15"/><path d="M10 8l-4 4 4 4"/><path d="M6 12h9"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5"/><path d="M15.5 15.5L21 21"/></symbol>
+  <symbol id="i-chevron" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><path d="M4.5 12.5l5 5 10-11"/></symbol>
+  <symbol id="i-close" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></symbol>
+  <symbol id="i-alert" viewBox="0 0 24 24"><path d="M12 3.5l9 16H3z"/><path d="M12 10v4.5M12 17.5h.01"/></symbol>
+  <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v5.5M12 7.8h.01"/></symbol>
+  <symbol id="i-eye" viewBox="0 0 24 24"><path d="M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12z"/><circle cx="12" cy="12" r="3.2"/></symbol>
+  <symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="11.5" height="11.5" rx="2.2"/><path d="M15 6.5v-1A2 2 0 0 0 13 3.5H5.5a2 2 0 0 0-2 2V13a2 2 0 0 0 2 2h1"/></symbol>
+  <symbol id="i-upload" viewBox="0 0 24 24"><path d="M12 16V4.5"/><path d="M7.5 9L12 4.5 16.5 9"/><path d="M4.5 15v3a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2v-3"/></symbol>
+  <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4.5 7h15"/><path d="M9.5 7V5.2a1.7 1.7 0 0 1 1.7-1.7h1.6a1.7 1.7 0 0 1 1.7 1.7V7"/><path d="M6.5 7l.9 12.1a2 2 0 0 0 2 1.9h5.2a2 2 0 0 0 2-1.9L17.5 7"/></symbol>
+  <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 4.5V16"/><path d="M7.5 11.5L12 16l4.5-4.5"/><path d="M4.5 19.5h15"/></symbol>
+  <symbol id="i-play" viewBox="0 0 24 24"><path d="M7 4.8l12 7.2-12 7.2z"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+  <symbol id="i-save" viewBox="0 0 24 24"><path d="M5 3.5h11l3.5 3.5v13.5H5z"/><path d="M8.5 3.5v5h6v-5M8.5 20.5v-6h7v6"/></symbol>
+  <symbol id="i-undo" viewBox="0 0 24 24"><path d="M4 9h9.5a5.5 5.5 0 0 1 0 11H7"/><path d="M7.5 4.5L3.5 9l4 4.5"/></symbol>
+  <symbol id="i-command" viewBox="0 0 24 24"><path d="M9 3a3 3 0 0 1 3 3v12a3 3 0 1 1-3-3h6a3 3 0 1 1-3 3V6a3 3 0 1 1 3 3H9a3 3 0 0 1 0-6z"/></symbol>
+</svg>
+
 <!-- ───────────────────────────── 登录 ───────────────────────────── -->
 <div id="login-view" class="login-wrap" hidden>
   <div class="login-aurora" aria-hidden="true">
     <span class="blob b1"></span><span class="blob b2"></span><span class="blob b3"></span>
   </div>
   <div class="login-grid" aria-hidden="true"></div>
-  <button id="login-theme" class="login-theme" type="button" title="切换深浅色">◐</button>
+  <button id="login-theme" class="login-theme" type="button" title="切换深浅色" aria-label="切换深浅色">
+    <svg class="icon" aria-hidden="true"><use href="#i-theme"/></svg>
+  </button>
 
   <form id="login-form" class="login-card" autocomplete="off">
     <div class="login-mark">
@@ -38,7 +74,9 @@
       <span class="login-input-wrap">
         <input id="login-token" class="input" type="password" placeholder="粘贴启动日志里的那串字符"
                autocomplete="off" name="yunxi-admin-token" spellcheck="false" required>
-        <button id="login-reveal" class="login-reveal" type="button" title="显示 / 隐藏">👁</button>
+        <button id="login-reveal" class="login-reveal" type="button" title="显示 / 隐藏" aria-label="显示或隐藏 Token">
+          <svg class="icon" aria-hidden="true"><use href="#i-eye"/></svg>
+        </button>
       </span>
     </label>
 
@@ -67,27 +105,30 @@
 <div id="app-view" class="app" hidden>
   <aside class="sidebar">
     <div class="brand">
-      <div class="brand-mark">汐</div>
+      <div class="brand-mark">汐<span class="brand-halo"></span></div>
       <div class="brand-text">
         <strong>芸汐</strong>
         <span id="brand-revision">管理后台</span>
       </div>
     </div>
-    <nav class="nav">
+
+    <div class="nav-label-head">工作台</div>
+    <nav class="nav" aria-label="主导航">
       <!-- 窄屏只留图标：文字包在 .nav-label 里才藏得掉（裸文本节点没有选择器
            能命中，早先媒体查询写的 span:not(.nav-icon) 从来没生效过）。藏掉
            文字后按钮的可访问名只剩图标，所以每个都补 aria-label。 -->
-      <button class="nav-item active" data-page="overview" aria-label="概览" title="概览"><span class="nav-icon">◈</span><span class="nav-label">概览</span></button>
-      <button class="nav-item" data-page="config" aria-label="配置" title="配置"><span class="nav-icon">⚙</span><span class="nav-label">配置</span></button>
-      <button class="nav-item" data-page="memory" aria-label="记忆" title="记忆"><span class="nav-icon">❖</span><span class="nav-label">记忆</span></button>
-      <button class="nav-item" data-page="model" aria-label="模型" title="模型"><span class="nav-icon">◎</span><span class="nav-label">模型</span></button>
-      <button class="nav-item" data-page="stickers" aria-label="表情包" title="表情包"><span class="nav-icon">☺</span><span class="nav-label">表情包</span></button>
-      <button class="nav-item" data-page="annotation" aria-label="标注" title="标注"><span class="nav-icon">✎</span><span class="nav-label">标注</span></button>
-      <button class="nav-item" data-page="system" aria-label="系统" title="系统"><span class="nav-icon">▤</span><span class="nav-label">系统</span></button>
+      <button class="nav-item active" data-page="overview" aria-label="概览" title="概览"><span class="nav-icon"><svg class="icon" aria-hidden="true"><use href="#i-overview"/></svg></span><span class="nav-label">概览</span></button>
+      <button class="nav-item" data-page="config" aria-label="配置" title="配置"><span class="nav-icon"><svg class="icon" aria-hidden="true"><use href="#i-config"/></svg></span><span class="nav-label">配置</span></button>
+      <button class="nav-item" data-page="memory" aria-label="记忆" title="记忆"><span class="nav-icon"><svg class="icon" aria-hidden="true"><use href="#i-memory"/></svg></span><span class="nav-label">记忆</span></button>
+      <button class="nav-item" data-page="model" aria-label="模型" title="模型"><span class="nav-icon"><svg class="icon" aria-hidden="true"><use href="#i-model"/></svg></span><span class="nav-label">模型</span></button>
+      <button class="nav-item" data-page="stickers" aria-label="表情包" title="表情包"><span class="nav-icon"><svg class="icon" aria-hidden="true"><use href="#i-stickers"/></svg></span><span class="nav-label">表情包</span></button>
+      <button class="nav-item" data-page="annotation" aria-label="标注" title="标注"><span class="nav-icon"><svg class="icon" aria-hidden="true"><use href="#i-annotation"/></svg></span><span class="nav-label">标注</span></button>
+      <button class="nav-item" data-page="system" aria-label="系统" title="系统"><span class="nav-icon"><svg class="icon" aria-hidden="true"><use href="#i-system"/></svg></span><span class="nav-label">系统</span></button>
     </nav>
+
     <div class="sidebar-foot">
-      <button id="theme-toggle" class="nav-item subtle" aria-label="切换深浅色" title="切换深浅色"><span class="nav-icon">◐</span><span id="theme-label" class="nav-label">浅色</span></button>
-      <button id="logout" class="nav-item subtle" aria-label="退出登录" title="退出登录"><span class="nav-icon">⏻</span><span class="nav-label">退出登录</span></button>
+      <button id="theme-toggle" class="nav-item subtle" aria-label="切换深浅色" title="切换深浅色"><span class="nav-icon"><svg class="icon" aria-hidden="true"><use href="#i-theme"/></svg></span><span id="theme-label" class="nav-label">浅色</span></button>
+      <button id="logout" class="nav-item subtle" aria-label="退出登录" title="退出登录"><span class="nav-icon"><svg class="icon" aria-hidden="true"><use href="#i-logout"/></svg></span><span class="nav-label">退出登录</span></button>
       <div class="sidebar-note">仅监听回环地址，登录态保存在会话 Cookie 中。</div>
     </div>
   </aside>
@@ -99,31 +140,38 @@
         <p id="page-subtitle"></p>
       </div>
       <div class="topbar-actions">
-        <span id="health-pill" class="pill">连接中…</span>
-        <button id="refresh" class="btn ghost">刷新</button>
+        <span id="health-pill" class="pill"><span class="pill-dot"></span><span class="pill-text">连接中…</span></span>
+        <button id="refresh" class="btn ghost icon-only" title="刷新当前页" aria-label="刷新当前页">
+          <svg class="icon" aria-hidden="true"><use href="#i-refresh"/></svg>
+        </button>
       </div>
     </header>
 
-    <section id="page-overview" class="page"></section>
-    <section id="page-config" class="page" hidden></section>
-    <section id="page-memory" class="page" hidden></section>
-    <section id="page-model" class="page" hidden></section>
-    <section id="page-stickers" class="page" hidden></section>
-    <section id="page-annotation" class="page" hidden></section>
-    <section id="page-system" class="page" hidden></section>
+    <div class="page-scroll">
+      <section id="page-overview" class="page"></section>
+      <section id="page-config" class="page" hidden></section>
+      <section id="page-memory" class="page" hidden></section>
+      <section id="page-model" class="page" hidden></section>
+      <section id="page-stickers" class="page" hidden></section>
+      <section id="page-annotation" class="page" hidden></section>
+      <section id="page-system" class="page" hidden></section>
+    </div>
   </main>
 </div>
 
-<div id="toast-stack" class="toast-stack"></div>
+<div id="toast-stack" class="toast-stack" role="status" aria-live="polite"></div>
 
 <!-- 通用弹窗：原始 TOML、备份、记录详情里需要放大展示的内容 -->
 <div id="modal" class="modal" hidden>
-  <div class="modal-card">
+  <div class="modal-backdrop"></div>
+  <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="modal-title" tabindex="-1">
     <header class="modal-head">
       <h3 id="modal-title">标题</h3>
       <div class="modal-head-actions">
         <span id="modal-note" class="modal-note"></span>
-        <button id="modal-close" class="btn ghost small">关闭</button>
+        <button id="modal-close" class="btn ghost icon-only small" title="关闭" aria-label="关闭">
+          <svg class="icon" aria-hidden="true"><use href="#i-close"/></svg>
+        </button>
       </div>
     </header>
     <div id="modal-body" class="modal-body"></div>
