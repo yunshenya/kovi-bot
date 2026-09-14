@@ -88,6 +88,12 @@ direct_spam_cooldown_secs = 600
 direct_rate_window_secs = 60
 direct_rate_limit = 4
 sticker_reaction_window_secs = 90
+# 表情包回应的节流（与上面的文字插话分开计）。这三个键线上一直在用，但模板里没有：
+# 它们的值与代码默认值相同，所以就算按模板重新生成配置，行为也不变——补进来是为了让
+# "生产模板"真的覆盖到线上在用的键，别再出现"模板与线上对不上"的这种漂移。
+sticker_reaction_cooldown_secs = 30
+sticker_reaction_rate_window_secs = 300
+sticker_reaction_rate_limit = 3
 # 熟人放行：熟悉度 ≥ familiarity_threshold 的成员，其未点名消息确定性进入
 # 语义评估（是否真的回复仍由评估模型与 Core 决定），不再只靠概率采样；
 # 这是"群里有熟人在说话，她会有自然反应"的通道。familiar_rate_limit
@@ -127,6 +133,14 @@ reply_rate_window_secs = 600
 reply_rate_limit = 4
 
 [memory]
+# 语义召回：本机 embed 服务（tools/embed-service）同时提供嵌入与重排，地址走回环。
+# 这几个键同样是"线上在用、模板缺失"的一类，值等于代码默认值，补进来只为对齐。
+embedding_enabled = true
+embedding_url = "http://127.0.0.1:6112"
+embedding_model = "bge-small-zh-v1.5"
+embedding_min_similarity_millis = 450
+embedding_backfill_batch = 128
+embedding_rerank_enabled = true
 # 失控保护，不是管理手段。
 #
 # 以前这里是 1000，于是"她记不记得住"由"数到第 1000 条"决定：两张记忆表都按
