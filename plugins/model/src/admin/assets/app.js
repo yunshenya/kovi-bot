@@ -3569,8 +3569,11 @@
       renderAnnotationSummary();
       return;
     }
+    // 队列外面套一张卡：宽屏下它的高度要跟右边那条样本齐平，没有可见的容器
+    // 就"对齐"不出任何东西（两张透明列表各撑各的）。
     page.append(h('div', { class: 'annotate-grid' },
-      h('div', { class: 'record-list', id: 'annotate-list' }),
+      h('div', { class: 'card annotate-queue' },
+        h('div', { class: 'record-list', id: 'annotate-list' })),
       h('div', { class: 'detail', id: 'annotate-detail' })));
     await loadAnnotationQueue();
   }

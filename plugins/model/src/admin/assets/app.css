@@ -2283,12 +2283,19 @@ mark {
   display: grid;
   grid-template-columns: 330px minmax(0, 1fr);
   gap: 16px;
-  align-items: start;
+  /* 两栏等高：左边只有四五条队列、右边一整屏样本，一高一矮看着像没排完。 */
+  align-items: stretch;
 }
-.annotate-grid > .record-list {
-  max-height: calc(100vh - 320px);
-  overflow-y: auto;
-  padding-right: 3px;
+.annotate-queue { padding: 12px; min-height: 300px; }
+.annotate-queue > .record-list { overflow-y: auto; padding-right: 4px; }
+
+/* 宽屏下左栏的高度**跟着右边那条样本来**，而不是按自己的内容撑。
+   做法是把列表绝对定位：绝对定位的子元素不参与父级的固有高度计算，于是行高
+   只由右边的详情决定，左栏被拉伸到与它齐平，列表在里面自己滚。
+   （给列表写死 max-height 做不到这件事——那个值只能定个大概，对不上右边。） */
+@media (min-width: 901px) {
+  .annotate-queue { position: relative; }
+  .annotate-queue > .record-list { position: absolute; inset: 12px; }
 }
 .annotate-card { display: flex; flex-direction: column; gap: 13px; }
 .annotate-card > .card-head { margin-bottom: 0; }
@@ -2677,7 +2684,8 @@ mark {
   .file-card { flex: 0 0 auto; min-width: 176px; max-width: 240px; }
   .section-nav-block { display: none; }
   .annotate-grid { grid-template-columns: minmax(0, 1fr); }
-  .annotate-grid > .record-list { max-height: 340px; }
+  /* 单列时不需要跟谁对齐，列表给个上限自己滚就行。 */
+  .annotate-queue > .record-list { max-height: 340px; }
   .sticker-form { grid-template-columns: minmax(0, 1fr); }
 }
 
