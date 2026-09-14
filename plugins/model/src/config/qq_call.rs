@@ -507,9 +507,14 @@ impl QqCallConfig {
                 "qq_call.allowed_callers 必须是正整数 QQ 号"
             ));
         }
-        if self.caller_allowlist_file.trim().is_empty() {
+        // 留空是**合法**的：字段文档与唯一消费方（group_access 的
+        // publish_caller_allowlist 见到空路径直接返回）都把空值当作"关闭接听授权、
+        // 回到接通后婉拒"。原来这里无条件拒绝空值，与那两处直接矛盾——想退回旧行为
+        // 的运维会被"不能为空"挡住，只能塞一个假路径。真正说不通的只有"打开了授权
+        // 却不给路径"这一种组合，所以只拦它。
+        if self.caller_allowlist_enabled && self.caller_allowlist_file.trim().is_empty() {
             return Err(anyhow::anyhow!(
-                "qq_call.caller_allowlist_file 不能为空（留空即关闭接听授权）"
+                "qq_call.caller_allowlist_enabled = true 时必须给出 caller_allowlist_file（留空即关闭接听授权）"
             ));
         }
         if self
@@ -671,11 +676,26 @@ mod tests {
             ..QqCallConfig::default()
         };
         assert!(enabled().validate().is_ok());
-        let no_file = QqCallConfig {
+        // 留空是合法的：文档与唯一消费方都把空路径当作"关闭这个能力、回到接通后婉拒"。
+        // 只有"打开授权却不给路径"才说不通。
+        let blank_file_capability_off = QqCallConfig {
             caller_allowlist_file: "   ".to_string(),
+            caller_allowlist_enabled: false,
             ..enabled()
         };
-        assert!(no_file.validate().is_err());
+        assert!(
+            blank_file_capability_off.validate().is_ok(),
+            "关掉接听授权时留空应当放行（这正是退回旧行为的方式）"
+        );
+        let blank_file_capability_on = QqCallConfig {
+            caller_allowlist_file: "   ".to_string(),
+            caller_allowlist_enabled: true,
+            ..enabled()
+        };
+        assert!(
+            blank_file_capability_on.validate().is_err(),
+            "打开了接听授权却没有名单文件，说不通"
+        );
         let empty_keyword = QqCallConfig {
             hangup_keywords: vec!["挂断".to_string(), "  ".to_string()],
             ..enabled()
