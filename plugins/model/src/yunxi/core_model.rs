@@ -99,6 +99,8 @@ const CORE_BUBBLE_MARKER: &str = "[[BUBBLE]]";
 const CORE_VOICE_MARKER: &str = "[[VOICE]]";
 /// Core 的唱歌标记：`[[SING 模板id]]`，单独一行写在正文最前面，正文即歌词。
 const CORE_SING_MARKER: &str = "[[SING";
+/// Core 的表情包标记：`[[STICKER 标签]]`，写在正文最前面，标签取自宿主素材库。
+const CORE_STICKER_MARKER: &str = "[[STICKER";
 const MAX_CORE_BUBBLES: usize = 3;
 /// "入站消息 → 说话人"表的容量。它只服务"工具回合之后仍要知道是谁说的"，
 /// 覆盖最近若干条消息即可，不需要持久。
@@ -124,6 +126,9 @@ const CORE_AMBIENT_TURN_INSTRUCTION: &str = "Core 群聊注意力：本轮没有
 /// 唱歌选项：只在歌声服务可用时下发，并把可用旋律模板一起列出来。
 const CORE_SING_INSTRUCTION: &str = "用户让你唱歌时不要只报幕——正文直接写你要唱的歌词，并在正文最前面写 [[SING 模板id]]（单独一行或与歌词同一行都可以，程序都会识别），程序会按那个模板的旋律把你写的歌词唱出来，作为一条 QQ 语音发出。歌词要自己写，不要照抄还在版权期内的歌词；模板后面标了它有几个音节，歌词字数最好与它一致（少了会把剩下的音符并到最后一个字，多了会被丢掉）。没有合适的模板时就挑一个情绪接近的。";
 const CORE_VOICE_INSTRUCTION: &str = "如果你觉得这句话更适合用声音说出来（例如要表达语气、情绪，或者对方正在听语音），就在正文最前面写 [[VOICE]]（单独一行或与正文同一行都可以，程序都会识别），程序会把这一轮的气泡用你的声音合成成语音发出；标记本身不会展示给用户，也不要为了用语音而用语音。语音消息承载不了引用和 @，标记语音时不要同时要求它们。不确定时不要写这个标记，默认发文字。";
+/// 表情包选项只在素材库确实有素材时下发（与语音同一条理由：不能让她以为自己有
+/// 一个当下用不了的出口）。标签清单由 `core_sticker_instruction` 动态拼进来。
+const CORE_STICKER_INSTRUCTION: &str = "你也可以随消息发一张表情包：在正文最前面写 [[STICKER 标签]]（单独一行或与正文同一行都可以，程序都会识别），程序会把你素材库里的那张图贴在消息里一起发出；标记本身不会展示给用户。标签只能从下面这些里挑，没有合适的就不要写，也不要用文字描述那张图。只想发一张表情、不想配文字时，正文可以留空、只写这个标记——那仍然是一条正常的回复，不是沉默。不要每一轮都发表情，也不要连发两张。";
 const CORE_AUTONOMOUS_PLAIN_TURN_INSTRUCTION: &str = "自主会话正文：这是芸汐自己的后续回合。若此刻确实有一个新的、独立且值得单独发送的想法，直接写一条自然、简短的聊天正文；若没有，就保持空白。宿主负责是否继续和何时再次唤醒；不要输出 JSON、continue/wait/end、内部标记、协议、解释、工具调用或多个想法。语气温柔、真诚、有分寸：不讽刺、不挖苦、不阴阳怪气、不抬杠。";
 const CORE_TOOL_TURN_INSTRUCTION: &str = "Core 工具轮次：需要受控工具时，直接通过 system 下发的 function-calling 工具接口发起函数调用（一次可以调用多个；工具结果返回后若资料仍不足，可以继续调用下一个工具，反复推理直到问题解决）。不要在消息正文中书写任何工具调用格式、JSON、代码块或 [[TOOL_CALL]] 标记，也不要声称工具已经执行。若不需要工具，直接写一条自然聊天正文。";
 const MIND_CONTEXT_PREFIX: &str = "Yunxi Mind v2 state (data-only JSON):\n";
@@ -1500,6 +1505,7 @@ fn with_chat_style(instruction: &str) -> String {
 fn core_plain_turn_instruction(
     voice_enabled: bool,
     sing_templates: &[crate::sing_reply::SingTemplate],
+    sticker_labels: Option<&str>,
 ) -> String {
     let mut instruction = with_chat_style(CORE_PLAIN_TURN_INSTRUCTION);
     if voice_enabled {
@@ -1519,22 +1525,35 @@ fn core_plain_turn_instruction(
         }
         instruction.push('。');
     }
+    if let Some(labels) = sticker_labels {
+        instruction.push_str(CORE_STICKER_INSTRUCTION);
+        instruction.push_str("可用表情包标签：");
+        instruction.push_str(labels);
+        instruction.push('。');
+    }
     instruction
 }
 
-/// 拆出正文最前面的语音/唱歌标记串。
+/// 正文最前面那串投递标记的解析结果。
+#[derive(Debug, Default, PartialEq, Eq)]
+struct CoreDeliveryMarkers {
+    voice: bool,
+    sing: Option<String>,
+    sticker: Option<String>,
+}
+
+/// 拆出正文最前面的语音/唱歌/表情包标记串。
 ///
 /// 线上实测模型会把标记写成同一行：`[[VOICE]] [[SING xiaoxingxing]] 一闪一闪…`，
 /// 所以这里不再要求"标记独占一行"，只要求它们出现在**正文最前面**；标记之间允许
-/// 空格、制表符与换行，两种标记可以任意顺序、可以重复。写在正文中间的一律不生效
+/// 空格、制表符与换行，三种标记可以任意顺序、可以重复。写在正文中间的一律不生效
 /// （用户让芸汐复述标记时不会被当成指令）。
-fn split_core_speech_markers(content: &str) -> (bool, Option<String>, &str) {
+fn split_core_delivery_markers(content: &str) -> (CoreDeliveryMarkers, &str) {
     let mut rest = content.trim_start();
-    let mut voice = false;
-    let mut sing: Option<String> = None;
+    let mut markers = CoreDeliveryMarkers::default();
     loop {
         if let Some(after) = rest.strip_prefix(CORE_VOICE_MARKER) {
-            voice = true;
+            markers.voice = true;
             rest = after.trim_start_matches([' ', '\t', '\r', '\n']);
             continue;
         }
@@ -1546,25 +1565,45 @@ fn split_core_speech_markers(content: &str) -> (bool, Option<String>, &str) {
                 .chars()
                 .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
             {
-                sing = Some(template.to_owned());
+                markers.sing = Some(template.to_owned());
                 rest = tail.trim_start_matches([' ', '\t', '\r', '\n']);
                 continue;
             }
         }
+        if let Some(after) = rest.strip_prefix(CORE_STICKER_MARKER)
+            && let Some((head, tail)) = after.split_once("]]")
+            && let Some(label) = normalize_core_sticker_label(head)
+        {
+            markers.sticker = Some(label);
+            rest = tail.trim_start_matches([' ', '\t', '\r', '\n']);
+            continue;
+        }
         break;
     }
-    if voice || sing.is_some() {
-        (voice, sing, rest)
+    if markers == CoreDeliveryMarkers::default() {
+        (markers, content)
     } else {
-        (false, None, content)
+        (markers, rest)
     }
 }
 
-/// 把正文里**任何位置**残留的语音/唱歌标记删掉。
+/// 表情包标签同样是不可信输入：只接受单行、有界的短字符串，畸形标记按"没写"处理。
+fn normalize_core_sticker_label(raw: &str) -> Option<String> {
+    let label = raw.trim();
+    if label.is_empty()
+        || label.chars().count() > yunxi_core::MAX_STICKER_LABEL_CHARS
+        || label.chars().any(char::is_control)
+    {
+        return None;
+    }
+    Some(label.to_owned())
+}
+
+/// 把正文里**任何位置**残留的语音/唱歌/表情包标记删掉。
 ///
 /// 模型偶尔会把标记写在句子中间；这类标记不改变投递方式，但绝不能展示给用户
-/// （`[[VOICE]]`、`[[SING x]]` 是控制标记，不是聊天内容）。
-fn strip_core_speech_markers(content: &str) -> String {
+/// （`[[VOICE]]`、`[[SING x]]`、`[[STICKER x]]` 是控制标记，不是聊天内容）。
+fn strip_core_delivery_markers(content: &str) -> String {
     let mut text = content.replace(CORE_VOICE_MARKER, "");
     while let Some(start) = text.find(CORE_SING_MARKER) {
         let after = start + CORE_SING_MARKER.len();
@@ -1577,6 +1616,17 @@ fn strip_core_speech_markers(content: &str) -> String {
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
         {
+            break;
+        }
+        text.replace_range(start..after + end + 2, "");
+    }
+    while let Some(start) = text.find(CORE_STICKER_MARKER) {
+        let after = start + CORE_STICKER_MARKER.len();
+        let Some(end) = text[after..].find("]]") else {
+            break;
+        };
+        let head = &text[after..after + end];
+        if normalize_core_sticker_label(head).is_none() {
             break;
         }
         text.replace_range(start..after + end + 2, "");
@@ -4438,7 +4488,7 @@ fn classify_persistent_person_identity(
 
 #[cfg_attr(not(test), allow(dead_code))]
 fn visible_reply_intent(target: VisibleReplyTarget, content: String) -> Option<CognitiveIntent> {
-    visible_reply_intents(target, &[content], false, None)?
+    visible_reply_intents(target, &[content], false, None, None)?
         .into_iter()
         .next()
 }
@@ -4448,20 +4498,37 @@ fn visible_reply_intents(
     messages: &[String],
     voice: bool,
     sing: Option<&str>,
+    sticker: Option<&str>,
 ) -> Option<Vec<CognitiveIntent>> {
+    // 只发一张表情包的回合：正文本来就是空的，这里补一个空气泡承载投递提示。
+    // 少了这一步，那张表情会因为"没有可读正文"被整轮判成沉默。
+    let sticker_only = sticker.is_some()
+        && !voice
+        && sing.is_none()
+        && messages.iter().all(|message| message.trim().is_empty());
+    let messages: Vec<String> = if messages.is_empty() && sticker_only {
+        vec![String::new()]
+    } else {
+        messages.to_vec()
+    };
     if messages.is_empty()
         || messages
             .iter()
-            .any(|message| !reply_text_has_semantic_content(message))
+            .any(|message| !reply_text_has_semantic_content(message) && !sticker_only)
     {
         return None;
     }
     let mut intents = Vec::with_capacity(messages.len());
     for (index, message) in messages.iter().enumerate() {
+        // 表情包跟着第一条消息走，第二条起只是正文。
+        let sticker_label = if index == 0 { sticker } else { None };
         let content = match sing {
             Some(template) => MessageContent::sing(message.clone(), template),
             None if voice => MessageContent::voice(message.clone()),
-            None => MessageContent::text(message.clone()),
+            None => match sticker_label {
+                Some(label) => MessageContent::sticker(message.clone(), label),
+                None => MessageContent::text(message.clone()),
+            },
         };
         let intent = match target {
             VisibleReplyTarget::Response {
@@ -5440,12 +5507,15 @@ fn should_archive_raw_reply(
 }
 
 fn core_plan_has_visible_text(plan: &ReplyPlan) -> bool {
+    // 只发一张表情的回合正文本来就是空的，但它是实打实的一条可见回复：
+    // 少了这个判据，那张表情会在"这一轮什么都没有"的检查里被整轮丢掉。
     plan.has_visible_reply()
-        && !plan.bubbles.is_empty()
-        && plan
-            .bubbles
-            .iter()
-            .all(|bubble| reply_text_has_semantic_content(bubble))
+        && (plan.sticker.is_some()
+            || (!plan.bubbles.is_empty()
+                && plan
+                    .bubbles
+                    .iter()
+                    .all(|bubble| reply_text_has_semantic_content(bubble))))
 }
 
 fn explicit_message_batch_needs_repair(plan: &ReplyPlan, requested_count: usize) -> bool {
@@ -5842,6 +5912,7 @@ impl ModelBackend for KoviModelBackend {
                         content: core_plain_turn_instruction(
                             crate::config::qq_voice_enabled(),
                             &sing_templates,
+                            crate::sticker_library::prompt_label_listing().as_deref(),
                         ),
                     },
                 );
@@ -6591,17 +6662,20 @@ impl ModelBackend for KoviModelBackend {
             let structured_tool_output = (response_content.contains(CORE_TOOL_CALL_START)
                 || response_content.contains(CORE_TOOL_CALL_END))
                 && tool_protocol_authorized;
-            // 语音/唱歌标记只对纯文本回合生效：工具回合有自己的协议，标记在那里
+            // 语音/唱歌/表情包标记只对纯文本回合生效：工具回合有自己的协议，标记在那里
             // 既不生效，也不该被悄悄删掉。解析在正文进入 plan 之前完成，标记不会
             // 漏进可见正文。
-            let (voice_requested, sing_requested) = if structured_tool_output {
-                (false, None)
+            let delivery_markers = if structured_tool_output {
+                CoreDeliveryMarkers::default()
             } else {
-                let (voice, sing, body) = split_core_speech_markers(&response_content);
+                let (markers, body) = split_core_delivery_markers(&response_content);
                 // 前导标记决定投递方式；正文里任何位置残留的标记都不展示给用户。
-                response_content = strip_core_speech_markers(body);
-                (voice, sing)
+                response_content = strip_core_delivery_markers(body);
+                markers
             };
+            let (voice_requested, sing_requested) =
+                (delivery_markers.voice, delivery_markers.sing.clone());
+            let sticker_requested = delivery_markers.sticker.clone();
             let parsed_response = if fallback_response && message.is_some() {
                 ParsedCoreResponse {
                     content: response_content,
@@ -6859,10 +6933,46 @@ impl ModelBackend for KoviModelBackend {
                     plan.voice = false;
                     plan.sing = Some(chosen);
                 }
+                // 表情包与语音/歌声不同：它是贴在气泡里的，不替换正文。只发一张
+                // 表情的回合没有正文可拆，这里给它留一个空气泡占位——投递时那条
+                // 气泡只带 image 段，仍然算一条可见回复。
+                if let Some(label) = sticker_requested
+                    && message.is_some()
+                    && !requested_tool_turn
+                    && !tool_follow_up
+                    && crate::sticker_library::is_available()
+                {
+                    if plan.bubbles.is_empty() {
+                        plan.bubbles.push(String::new());
+                    }
+                    plan.sticker = Some(label);
+                }
                 plan
             } else {
-                ReplyPlan::from_model_output(conversation.scope(), "").await
+                // 正文为空但写了表情包标记：只发一张表情的回复。
+                let mut plan = ReplyPlan::from_model_output(conversation.scope(), "").await;
+                if let Some(label) = sticker_requested
+                    && message.is_some()
+                    && !requested_tool_turn
+                    && !tool_follow_up
+                    && crate::sticker_library::is_available()
+                {
+                    plan.bubbles.push(String::new());
+                    plan.sticker = Some(label);
+                }
+                plan
             };
+            // 语音/歌声整条替换消息（record 段），承载不了图片；两者同时出现时
+            // 以"说出来"为准，表情丢掉，绝不因为一个冲突标记把整条回复弄没。
+            if plan.voice || plan.sing.is_some() {
+                if plan.sticker.is_some() {
+                    kovi::log::warn!(
+                        "语音/歌声与表情包同时标记，本轮只发声: conversation_id={}",
+                        conversation_id_for_log(input),
+                    );
+                }
+                plan.sticker = None;
+            }
             // 先把"不可发送的成分"剥掉（舞台动作、自述接不接），别让一句话犯规
             // 把整条正常回复带走：线上 2026-09-14 21:05 被长篇贬损那条就是这么
             // 丢的——66 个字生成了，一个字没发出去。
@@ -7137,6 +7247,7 @@ impl ModelBackend for KoviModelBackend {
                 &plan.bubbles,
                 plan.voice,
                 plan.sing.as_deref(),
+                plan.sticker.as_deref(),
             ) else {
                 if reply_expected_for_incoming(input) {
                     kovi::log::warn!(
@@ -7507,13 +7618,14 @@ mod tests {
         CORE_GROUP_HISTORY_INSTRUCTION, CORE_GROUP_HISTORY_PREFIX, CORE_MEMORY_CONTEXT_PREFIX,
         CORE_PENDING_OUTGOING_INSTRUCTION, CORE_PENDING_OUTGOING_PLAIN_INSTRUCTION,
         CORE_PLAIN_TURN_INSTRUCTION, CORE_REPLY_REPAIR_PROMPT, CORE_SING_MARKER,
-        CORE_VOICE_INSTRUCTION, CORE_VOICE_MARKER, CoreDirectRepair, HostMessageContext,
-        HostMessageContextCache, HostModelRoute, HostModelRoutingContext,
-        HostToolTurnRegistrationPolicy, HostToolTurnRegistry,
-        INTRINSIC_AUTONOMOUS_INTENT_TAIL_INSTRUCTION, INTRINSIC_GENERATION_SUFFIX,
-        INTRINSIC_SEMANTIC_CONTENT_INSTRUCTION, MAX_CORE_BUBBLES, MAX_DELIVERABLE_BUBBLES_PER_TURN,
-        MAX_INTRINSIC_REPLY_PROTOCOL_BYTES, MAX_PLAIN_SPLIT_LINE_CHARS, MIND_DECISION_INSTRUCTION,
-        MindCandidates, PersistentRouteLookup, QqConversation, RequiredCreation, RouteContext,
+        CORE_STICKER_INSTRUCTION, CORE_STICKER_MARKER, CORE_VOICE_INSTRUCTION, CORE_VOICE_MARKER,
+        CoreDeliveryMarkers, CoreDirectRepair, HostMessageContext, HostMessageContextCache,
+        HostModelRoute, HostModelRoutingContext, HostToolTurnRegistrationPolicy,
+        HostToolTurnRegistry, INTRINSIC_AUTONOMOUS_INTENT_TAIL_INSTRUCTION,
+        INTRINSIC_GENERATION_SUFFIX, INTRINSIC_SEMANTIC_CONTENT_INSTRUCTION, MAX_CORE_BUBBLES,
+        MAX_DELIVERABLE_BUBBLES_PER_TURN, MAX_INTRINSIC_REPLY_PROTOCOL_BYTES,
+        MAX_PLAIN_SPLIT_LINE_CHARS, MIND_DECISION_INSTRUCTION, MindCandidates,
+        PersistentRouteLookup, QqConversation, RequiredCreation, RouteContext,
         SILENCE_TENSION_THRESHOLD, SilenceVerdict, VisibleReplyTarget, addressed_gap_wait_ms,
         affect_tone_guidance, ambient_group_interjection_veto, autonomous_conversation_prompt,
         autonomous_conversation_protocol, autonomous_empty_generation_plan,
@@ -7545,8 +7657,8 @@ mod tests {
         sanitize_intrinsic_output, sanitize_plain_text_batch_message,
         select_host_model_route_from_capability, serialize_intrinsic_reply_batch,
         shadow_projection_for_completed_plan, should_archive_raw_reply, silence_gate_plan,
-        silence_verdict, silent_wait_plan, split_core_speech_markers, split_two_short_lines,
-        strip_core_speech_markers, strip_stage_directions, strong_reply_repair_needed,
+        silence_verdict, silent_wait_plan, split_core_delivery_markers, split_two_short_lines,
+        strip_core_delivery_markers, strip_stage_directions, strong_reply_repair_needed,
         tool_calls_allowed_for_turn, tool_protocol_authorized_for_turn, visible_reply_intent,
         visible_reply_intents, visible_reply_invites_continuation, visible_reply_state_updates,
         visible_turn_continuation, with_chat_style,
@@ -9110,7 +9222,7 @@ mod tests {
     /// 一直不在，同时口语化契约必须在（两条都是回归线，不能只靠文案自觉）。
     #[test]
     fn core_visible_turns_carry_the_human_chat_style_and_no_essay_license() {
-        let instruction = core_plain_turn_instruction(false, &[]);
+        let instruction = core_plain_turn_instruction(false, &[], None);
         assert!(instruction.contains(crate::model::chat_style::HUMAN_CHAT_STYLE));
         for license in [
             "按问题需要可以保留 Markdown",
@@ -9148,10 +9260,11 @@ mod tests {
     #[test]
     fn sing_marker_accepts_an_empty_template() {
         // 没写模板名：交给调用方回退到默认模板。
-        assert_eq!(
-            split_core_speech_markers("[[SING]]\n随便唱两句"),
-            (false, Some(String::new()), "随便唱两句")
-        );
+        let (markers, body) = split_core_delivery_markers("[[SING]]\n随便唱两句");
+        assert!(!markers.voice);
+        assert_eq!(markers.sing, Some(String::new()));
+        assert_eq!(markers.sticker, None);
+        assert_eq!(body, "随便唱两句");
     }
 
     #[test]
@@ -9162,8 +9275,8 @@ mod tests {
             mood: "童谣 / 轻快".to_owned(),
             syllables: 14,
         }];
-        let without = core_plain_turn_instruction(false, &[]);
-        let with = core_plain_turn_instruction(false, &templates);
+        let without = core_plain_turn_instruction(false, &[], None);
+        let with = core_plain_turn_instruction(false, &templates, None);
 
         // 服务不可用时不该教这个标记，也不该出现模板清单。
         assert!(!without.contains(CORE_SING_MARKER));
@@ -9184,6 +9297,7 @@ mod tests {
             &["一闪一闪亮晶晶".to_string()],
             false,
             Some("xiaoxingxing"),
+            None,
         )
         .expect("sung bubble should become an intent");
         assert!(matches!(
@@ -9197,8 +9311,8 @@ mod tests {
 
     #[test]
     fn voice_option_is_only_offered_to_core_when_the_channel_is_enabled() {
-        let disabled = core_plain_turn_instruction(false, &[]);
-        let enabled = core_plain_turn_instruction(true, &[]);
+        let disabled = core_plain_turn_instruction(false, &[], None);
+        let enabled = core_plain_turn_instruction(true, &[], None);
 
         // 关掉 qq_voice 时，模型不该知道自己有一个当下用不了的出口。
         // 契约本身现在总是带上口语化风格块，所以基准是 `with_chat_style(...)`，
@@ -9212,51 +9326,180 @@ mod tests {
 
     #[test]
     fn speech_markers_are_honoured_when_they_lead_the_message() {
-        assert_eq!(
-            split_core_speech_markers("[[VOICE]]\n我在的呀。"),
-            (true, None, "我在的呀。")
-        );
-        assert_eq!(
-            split_core_speech_markers("\n  [[VOICE]]  \r\n\r\n我在的呀。"),
-            (true, None, "我在的呀。")
-        );
+        let (markers, body) = split_core_delivery_markers("[[VOICE]]\n我在的呀。");
+        assert!(markers.voice);
+        assert_eq!(markers.sing, None);
+        assert_eq!(body, "我在的呀。");
+
+        let (markers, body) = split_core_delivery_markers("\n  [[VOICE]]  \r\n\r\n我在的呀。");
+        assert!(markers.voice);
+        assert_eq!(body, "我在的呀。");
+
         // 线上实测：模型把两个标记写在同一行，后面直接跟正文。
-        assert_eq!(
-            split_core_speech_markers("[[VOICE]] [[SING xiaoxingxing]] 一闪一闪亮晶晶"),
-            (true, Some("xiaoxingxing".to_owned()), "一闪一闪亮晶晶")
-        );
-        assert_eq!(
-            split_core_speech_markers("[[SING zichang-qingkuai]]夜色刚好"),
-            (false, Some("zichang-qingkuai".to_owned()), "夜色刚好")
-        );
+        let (markers, body) =
+            split_core_delivery_markers("[[VOICE]] [[SING xiaoxingxing]] 一闪一闪亮晶晶");
+        assert!(markers.voice);
+        assert_eq!(markers.sing, Some("xiaoxingxing".to_owned()));
+        assert_eq!(body, "一闪一闪亮晶晶");
+
+        let (markers, body) = split_core_delivery_markers("[[SING zichang-qingkuai]]夜色刚好");
+        assert!(!markers.voice);
+        assert_eq!(markers.sing, Some("zichang-qingkuai".to_owned()));
+        assert_eq!(body, "夜色刚好");
+
         // 写在正文中间的不生效（用户让她复述标记时不会被当成指令）。
-        assert_eq!(
-            split_core_speech_markers("第一句。\n[[VOICE]]\n第二句。"),
-            (false, None, "第一句。\n[[VOICE]]\n第二句。")
-        );
-        assert_eq!(
-            split_core_speech_markers("普通正文。"),
-            (false, None, "普通正文。")
-        );
+        let lead = "第一句。\n[[VOICE]]\n第二句。";
+        let (markers, body) = split_core_delivery_markers(lead);
+        assert_eq!(markers, CoreDeliveryMarkers::default());
+        assert_eq!(body, lead);
+
+        let (markers, body) = split_core_delivery_markers("普通正文。");
+        assert_eq!(markers, CoreDeliveryMarkers::default());
+        assert_eq!(body, "普通正文。");
+    }
+
+    /// 表情包标记：可以只写标记（纯表情回复），也可以连正文一起写。
+    #[test]
+    fn sticker_marker_is_read_from_the_leading_markers() {
+        let (markers, body) = split_core_delivery_markers("[[STICKER 无语又想笑]]");
+        assert_eq!(markers.sticker, Some("无语又想笑".to_owned()));
+        assert_eq!(body, "");
+
+        let (markers, body) = split_core_delivery_markers("[[STICKER 开心]] 我也是这么想的。");
+        assert_eq!(markers.sticker, Some("开心".to_owned()));
+        assert_eq!(body, "我也是这么想的。");
+
+        // 与语音标记可以同时出现（投递时以发声为准），解析阶段两者都要认出来。
+        let (markers, body) = split_core_delivery_markers("[[VOICE]] [[STICKER 开心]] 在的呀。");
+        assert!(markers.voice);
+        assert_eq!(markers.sticker, Some("开心".to_owned()));
+        assert_eq!(body, "在的呀。");
+
+        // 标签两侧的空白会被吃掉（模型常把标记换行写），但标签**内部**的换行、
+        // 空标签与超长标签都不是合法标签，整个标记按普通文本留着不动。
+        let (markers, body) = split_core_delivery_markers("[[STICKER \n 开心 ]]正文");
+        assert_eq!(markers.sticker, Some("开心".to_owned()));
+        assert_eq!(body, "正文");
+        for malformed in ["[[STICKER]]正文", "[[STICKER 开\n心]]正文"] {
+            let (markers, body) = split_core_delivery_markers(malformed);
+            assert_eq!(markers.sticker, None, "{malformed}");
+            assert_eq!(body, malformed);
+        }
+        let too_long = format!("[[STICKER {}]]正文", "开".repeat(65));
+        let (markers, body) = split_core_delivery_markers(&too_long);
+        assert_eq!(markers.sticker, None);
+        assert_eq!(body, too_long);
     }
 
     #[test]
     fn stray_markers_never_reach_the_visible_text() {
         // 前导标记后面又混进一个，或者句子中间冒出来，都要被清掉。
         assert_eq!(
-            strip_core_speech_markers("[[VOICE]] 我在的呀 [[SING xiaoxingxing]]"),
+            strip_core_delivery_markers("[[VOICE]] 我在的呀 [[SING xiaoxingxing]]"),
             "我在的呀"
         );
         assert_eq!(
-            strip_core_speech_markers("好的，[[VOICE]] 这就是那个标记"),
+            strip_core_delivery_markers("好的，[[VOICE]] 这就是那个标记"),
             "好的， 这就是那个标记"
         );
         // 不是合法模板名的 `[[SING` 原样保留，避免误删普通文本。
         assert_eq!(
-            strip_core_speech_markers("[[SING 非法模板 名]]正文"),
+            strip_core_delivery_markers("[[SING 非法模板 名]]正文"),
             "[[SING 非法模板 名]]正文"
         );
-        assert_eq!(strip_core_speech_markers("没有标记。"), "没有标记。");
+        // 表情标记同理：合法的删掉，不合法的留给用户看。
+        assert_eq!(
+            strip_core_delivery_markers("正文里的 [[STICKER 开心]] 标记"),
+            "正文里的 标记"
+        );
+        assert_eq!(
+            strip_core_delivery_markers("[[STICKER]]正文"),
+            "[[STICKER]]正文"
+        );
+        assert_eq!(strip_core_delivery_markers("没有标记。"), "没有标记。");
+    }
+
+    /// 表情包选项与语音/唱歌一样，只在真的有素材时才下发。
+    #[test]
+    fn sticker_option_is_only_offered_when_the_library_has_labels() {
+        let without = core_plain_turn_instruction(false, &[], None);
+        let with = core_plain_turn_instruction(false, &[], Some("无语又想笑；开心"));
+
+        assert!(!without.contains(CORE_STICKER_MARKER));
+        assert!(with.contains("[[STICKER 标签]]"));
+        assert!(with.contains("可用表情包标签：无语又想笑；开心。"));
+        assert_eq!(
+            with,
+            format!(
+                "{}{CORE_STICKER_INSTRUCTION}可用表情包标签：无语又想笑；开心。",
+                with_chat_style(CORE_PLAIN_TURN_INSTRUCTION)
+            )
+        );
+    }
+
+    /// 只发一张表情的回合：正文为空，但必须产生一条可见意图（带 image 提示）。
+    #[test]
+    fn sticker_only_turns_still_produce_a_visible_intent() {
+        let conversation_id = ConversationId::new();
+        let intents = visible_reply_intents(
+            VisibleReplyTarget::Response {
+                conversation_id,
+                message_id: MessageId::new(),
+            },
+            &[],
+            false,
+            None,
+            Some("无语又想笑"),
+        )
+        .expect("sticker-only reply should become an intent");
+        assert_eq!(intents.len(), 1);
+        assert!(matches!(
+            &intents[0],
+            CognitiveIntent::SendMessage { content, .. }
+                if content.sticker_label() == Some("无语又想笑")
+                    && content.as_text().is_empty()
+                    && !content.is_empty()
+        ));
+
+        // 没有表情包时，空正文照旧什么都不发。
+        assert!(
+            visible_reply_intents(
+                VisibleReplyTarget::Response {
+                    conversation_id,
+                    message_id: MessageId::new(),
+                },
+                &[],
+                false,
+                None,
+                None,
+            )
+            .is_none()
+        );
+    }
+
+    /// 正文与表情包同一条消息：只有第一条意图带表情，后面的气泡只是文字。
+    #[test]
+    fn sticker_rides_only_on_the_first_bubble() {
+        let conversation_id = ConversationId::new();
+        let intents = visible_reply_intents(
+            VisibleReplyTarget::Send { conversation_id },
+            &["先接住你。".to_string(), "再说一件事。".to_string()],
+            false,
+            None,
+            Some("开心"),
+        )
+        .expect("text with a sticker should become intents");
+        assert_eq!(intents.len(), 2);
+        assert!(matches!(
+            &intents[0],
+            CognitiveIntent::SendMessage { content, .. }
+                if content.sticker_label() == Some("开心")
+                    && content.as_text() == "先接住你。"
+        ));
+        assert!(matches!(
+            &intents[1],
+            CognitiveIntent::SendMessage { content, .. } if content.sticker_label().is_none()
+        ));
     }
 
     #[test]
@@ -9270,6 +9513,7 @@ mod tests {
             },
             &["我在的呀。".to_string(), "你还在忙吗？".to_string()],
             true,
+            None,
             None,
         )
         .expect("spoken bubbles should still become intents");
@@ -9300,6 +9544,7 @@ mod tests {
             },
             &["普通文字。".to_string()],
             false,
+            None,
             None,
         )
         .expect("plain text should still become an intent");
@@ -9674,6 +9919,7 @@ mod tests {
             },
             &["第一条".to_string(), "第二条".to_string()],
             false,
+            None,
             None,
         )
         .expect("two visible bubbles should become two intents");

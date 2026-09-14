@@ -528,6 +528,23 @@ impl QqActionAdapter {
                 content.is_sing()
             );
         }
+        // 表情包同样在 commit 之前解析：它只取决于 content 与素材库，不依赖路由与
+        // 授权，提前不破坏上面那条不变量；读一张本地图也不是慢操作，不会拖垮 30 秒
+        // 的 precommit 租约。放在这里还让"什么都没得发"的轮次在提交前就被挡住。
+        let sticker_message =
+            sticker_segment_for(content, speech_message.is_some(), expected_conversation_id);
+        if speech_message.is_none()
+            && content.as_text().trim().is_empty()
+            && sticker_message.is_none()
+        {
+            kovi::log::warn!(
+                "这一轮没有任何可发送内容，投递已放弃: conversation_id={expected_conversation_id} sticker={:?}",
+                content.sticker_label()
+            );
+            return Ok(ActionPortOutcome::Deferred {
+                reason: "empty_visible_delivery".to_string(),
+            });
+        }
         let precommit = match with_send_stage_budget(
             "begin_outgoing_commit",
             SEND_STAGE_COMMIT_BUDGET,
@@ -642,7 +659,7 @@ impl QqActionAdapter {
             QqDestination::Private(_) => None,
         };
         let text = content.as_text();
-        let message = outbound_message(text, external_reply_to, speech_message);
+        let message = outbound_message(text, external_reply_to, speech_message, sticker_message);
         let fingerprint_content =
             serde_json::to_string(content).unwrap_or_else(|_| content.as_text().to_owned());
         let fingerprint = contextual_outgoing_fingerprint(
@@ -1474,18 +1491,55 @@ async fn speech_message_for(
 }
 
 /// 组装要发给 QQ 的那条消息：语音优先，合成成功时整条消息只有 `record` 段
-/// （语音消息承载不了引用）；否则退回文字，引用照旧挂在第一条上。
-fn outbound_message(text: &str, reply_to: Option<i64>, voice: Option<Message>) -> Message {
+/// （语音消息承载不了引用）；否则退回文字，引用照旧挂在第一条上，表情包贴在
+/// 文字后面（QQ 允许文字与图片同处一条消息）。
+fn outbound_message(
+    text: &str,
+    reply_to: Option<i64>,
+    voice: Option<Message>,
+    sticker: Option<Segment>,
+) -> Message {
     if let Some(voice) = voice {
         return voice;
     }
+    let mut message = Message::new();
     if let Some(reply_to) = reply_to {
-        Message::from(vec![
-            Segment::new("reply", json!({"id": reply_to})),
-            Segment::new("text", json!({"text": text})),
-        ])
-    } else {
-        text.to_owned().into()
+        message.push(Segment::new("reply", json!({ "id": reply_to })));
+    }
+    if !text.is_empty() {
+        message.push_text(text);
+    }
+    if let Some(sticker) = sticker {
+        message.push(sticker);
+    }
+    message
+}
+
+/// 解析这一轮要附带的表情包素材段。
+///
+/// 语音/歌声整条替换消息（`record` 段），承载不了图片，所以发声轮次不再附带表情；
+/// 素材库关掉、标签不在库里、文件读不出来、内容不像图片时都返回 `None`，投递退回
+/// 纯文字——一张图发不出去不该把整条回复带走。
+fn sticker_segment_for(
+    content: &MessageContent,
+    voiced: bool,
+    conversation_id: ConversationId,
+) -> Option<Segment> {
+    let label = content.sticker_label()?;
+    if voiced {
+        kovi::log::warn!(
+            "语音/歌声与表情包同时标记，本轮只发声: conversation_id={conversation_id} label={label}"
+        );
+        return None;
+    }
+    match crate::sticker_library::build_sticker_segment(label) {
+        Some(segment) => Some(segment),
+        None => {
+            kovi::log::warn!(
+                "表情包素材不可用，本轮只发文字: conversation_id={conversation_id} label={label}"
+            );
+            None
+        }
     }
 }
 
@@ -1885,16 +1939,43 @@ mod tests {
             json!({"file": "file:///app/qq-call/voice/voice-1.wav"}),
         )]);
         // 合成成功：整条消息只有 record 段，引用被丢掉（语音承载不了引用）。
-        let spoken = outbound_message("我在的呀。", Some(42), Some(voice.clone()));
+        let spoken = outbound_message("我在的呀。", Some(42), Some(voice.clone()), None);
         assert_eq!(spoken, voice);
         assert_eq!(spoken.to_human_string().matches("[record]").count(), 1);
 
         // 没有语音可用：文字与引用都保持原样。
-        let quoted = outbound_message("我在的呀。", Some(42), None);
+        let quoted = outbound_message("我在的呀。", Some(42), None, None);
         assert!(quoted.to_human_string().contains("[reply]"));
         assert!(quoted.to_human_string().contains("我在的呀。"));
-        let plain = outbound_message("我在的呀。", None, None);
+        let plain = outbound_message("我在的呀。", None, None, None);
         assert_eq!(plain.to_human_string(), "我在的呀。");
+    }
+
+    /// 表情包是**贴**在消息里的：文字照发，图跟在文字后面；只发一张表情时
+    /// 引用仍然挂在前面。它与语音互斥（record 段装不下图）。
+    #[test]
+    fn sticker_rides_along_with_the_text_in_one_message() {
+        let sticker = Segment::new("image", json!({"file": "base64://AAAA"}));
+
+        let with_text = outbound_message("在的呀。", None, None, Some(sticker.clone()));
+        assert_eq!(with_text.to_human_string(), "在的呀。[image]");
+        assert_eq!(
+            with_text
+                .get_from_index(0)
+                .map(|segment| segment.type_.as_str()),
+            Some("text")
+        );
+
+        let sticker_only = outbound_message("", Some(42), None, Some(sticker.clone()));
+        assert_eq!(sticker_only.to_human_string(), "[reply][image]");
+
+        // 语音那一轮不带表情：record 段无法承载图片。
+        let voice = Message::from(vec![Segment::new(
+            "record",
+            json!({"file": "file:///app/qq-call/voice/voice-1.wav"}),
+        )]);
+        let spoken = outbound_message("在的呀。", None, Some(voice.clone()), None);
+        assert_eq!(spoken, voice);
     }
 
     #[test]

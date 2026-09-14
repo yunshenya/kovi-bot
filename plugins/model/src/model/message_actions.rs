@@ -150,6 +150,11 @@ pub(crate) struct ReplyPlan {
     ///
     /// 与 `voice` 互斥：歌声本身就是"说出来"，只是带旋律。
     pub(crate) sing: Option<String>,
+    /// 这一轮随第一条气泡发一张素材库里的表情包（值 = 标签）。
+    ///
+    /// 与 `voice`/`sing` 互斥那两种整条替换的形态不同：表情包是**贴在气泡里**的，
+    /// 正文照发。正文为空时它自己就是那条消息——"只回一张表情"是很正常的回复。
+    pub(crate) sticker: Option<String>,
 }
 
 impl ReplyPlan {
@@ -166,6 +171,7 @@ impl ReplyPlan {
             requests_image: false,
             voice: false,
             sing: None,
+            sticker: None,
         }
     }
 
@@ -180,6 +186,7 @@ impl ReplyPlan {
             requests_image: false,
             voice: false,
             sing: None,
+            sticker: None,
         }
     }
 
@@ -209,6 +216,7 @@ impl ReplyPlan {
             requests_image: false,
             voice: false,
             sing: None,
+            sticker: None,
         })
     }
 
@@ -239,7 +247,9 @@ impl ReplyPlan {
         // bubble so the executor can send the at segment without inventing text.
         let action_only_mention =
             !parsed.disposition.is_silent() && bubbles.is_empty() && !action.at_user_ids.is_empty();
-        if action_only_mention {
+        // 只发一张表情包同样是可见回复：正文可以是空的，但必须有东西发出去。
+        let sticker = parsed.sticker.filter(|_| !parsed.disposition.is_silent());
+        if action_only_mention || (bubbles.is_empty() && sticker.is_some()) {
             bubbles.push(String::new());
         }
         if parsed.disposition.is_silent() || bubbles.is_empty() {
@@ -269,6 +279,7 @@ impl ReplyPlan {
             requests_image,
             voice,
             sing: None,
+            sticker,
         }
     }
 
@@ -297,7 +308,8 @@ impl ReplyPlan {
     pub(crate) fn has_visible_reply(&self) -> bool {
         !self.is_silent()
             && (self.bubbles.iter().any(|bubble| !bubble.is_empty())
-                || self.has_action_only_mention())
+                || self.has_action_only_mention()
+                || self.sticker.is_some())
     }
 
     fn has_action_only_mention(&self) -> bool {
@@ -363,14 +375,43 @@ pub(crate) async fn execute_reply_plan(
         let first_message = index == 0;
         // 模型把这一轮标记成语音时改用 record 段；合成失败会回退成文字，
         // 语音只是表达方式，不该因为 TTS 抖动把回复弄丢。
-        let message = if plan.voice {
-            match crate::voice_reply::build_voice_message(&voice_config, bubble).await {
-                Some(voice) => voice,
-                None => build_outbound_message(bubble, &plan.action, first_message),
-            }
+        let voice_message = if plan.voice {
+            crate::voice_reply::build_voice_message(&voice_config, bubble).await
         } else {
-            build_outbound_message(bubble, &plan.action, first_message)
+            None
         };
+        // record 段整条替换消息，图片挂不上去：语音合成成功时不再附带表情包。
+        let voiced = voice_message.is_some();
+        let mut message = match voice_message {
+            Some(voice) => voice,
+            None => build_outbound_message(bubble, &plan.action, first_message),
+        };
+        // 表情包只在第一条气泡上，和正文同一条消息（QQ 允许文字与图片同气泡）；
+        // 素材解析不到就退回纯文字——一张图发不出去不该把整条回复带走。
+        if first_message
+            && !voiced
+            && let Some(label) = plan.sticker.as_deref()
+        {
+            match crate::sticker_library::build_sticker_segment(label) {
+                Some(segment) => message.push(segment),
+                None => kovi::log::warn!(
+                    "表情包素材不可用，本轮只发文字: label={label} conversation={scope:?}"
+                ),
+            }
+        }
+        // 绝不发一条什么都没有的消息：只发一张表情的轮次在素材取不到时应当整条跳过，
+        // 而不是变成一个空气泡。
+        if !message.iter().any(|segment| {
+            matches!(
+                segment.type_.as_str(),
+                "text" | "at" | "image" | "record" | "face" | "mface"
+            )
+        }) {
+            kovi::log::warn!(
+                "可见回复没有任何可发送内容，本轮跳过这条气泡: conversation={scope:?}"
+            );
+            continue;
+        }
         let reply_to = first_message
             .then_some(plan.action.quote_message_id)
             .flatten()
@@ -380,8 +421,19 @@ pub(crate) async fn execute_reply_plan(
         } else {
             &[]
         };
-        let fingerprint =
-            contextual_outgoing_fingerprint(scope, bubble, reply_to, mention_user_ids, None);
+        // 指纹代表"这一条要发出去的东西"：表情包也是内容的一部分，同文不同图
+        // 不该被当成同一个信封（只发一张表情、正文为空时更是唯一的区分依据）。
+        let fingerprint_content = match (first_message, plan.sticker.as_deref()) {
+            (true, Some(label)) => format!("{bubble}\u{1f}{label}"),
+            _ => bubble.clone(),
+        };
+        let fingerprint = contextual_outgoing_fingerprint(
+            scope,
+            &fingerprint_content,
+            reply_to,
+            mention_user_ids,
+            None,
+        );
         let Some(outgoing) = prepare_outgoing_with_semantic_preview(
             reply_ticket,
             fingerprint,
@@ -680,6 +732,7 @@ mod tests {
             requests_image: false,
             voice: false,
             sing: None,
+            sticker: None,
         };
     }
 
