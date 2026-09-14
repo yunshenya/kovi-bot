@@ -465,11 +465,14 @@ impl Consolidation {
                     return Err(ConsolidationError::ScopeMismatch);
                 }
                 let expected = existing.version();
+                // 批次时间可能早于这条记录上次更新的时间，按"不早于已存状态"取，
+                // 否则整批反思会因为这一条而失败（Interest 那边早就这么做了）。
+                let effective_at = now.max(existing.updated_at());
                 let mut value = existing.apply_delta(
                     directed_delta,
                     stability_delta,
                     &proposal.evidence_refs,
-                    now,
+                    effective_at,
                 )?;
                 // 更新时也要能设有效期：立场被合并掉、或她改了主意之后，旧的那条必须
                 // 真正退休。原实现只在创建时写 valid_until，更新时直接忽略它，
@@ -541,6 +544,9 @@ impl Consolidation {
                     return Err(ConsolidationError::ScopeMismatch);
                 }
                 let expected = existing.version();
+                // 批次时间可能早于这条记录上次更新的时间，按"不早于已存状态"取，
+                // 否则整批反思会因为这一条而失败（Interest 那边早就这么做了）。
+                let effective_at = now.max(existing.updated_at());
                 let value = existing.apply_delta(
                     if proposal.operation == PreferenceOperation::Weaken {
                         -proposal.valence_delta.signum()
@@ -556,7 +562,7 @@ impl Consolidation {
                     },
                     clamp(proposal.intensity_delta),
                     clamp(proposal.confidence_delta),
-                    now,
+                    effective_at,
                 )?;
                 Ok(MindUpsert {
                     value,
@@ -690,11 +696,14 @@ impl Consolidation {
                     return Err(ConsolidationError::ScopeMismatch);
                 }
                 let expected = existing.version();
+                // 批次时间可能早于这条记录上次更新的时间，按"不早于已存状态"取，
+                // 否则整批反思会因为这一条而失败（Interest 那边早就这么做了）。
+                let effective_at = now.max(existing.updated_at());
                 let value = match proposal.operation {
                     OpenQuestionOperation::Upsert => existing.refresh(
                         proposal.related_beliefs.clone(),
                         proposal.salience,
-                        now,
+                        effective_at,
                     )?,
                     OpenQuestionOperation::Resolve => {
                         existing.transition(OpenQuestionStatus::Resolved, now)?
@@ -755,8 +764,12 @@ impl Consolidation {
                     return Err(ConsolidationError::ScopeMismatch);
                 }
                 let expected = existing.version();
+                // 这个类型本来就有 `operation_time`，只是这里没用。
+                let effective_at = existing.operation_time(now);
                 let value = match proposal.operation {
-                    AgendaOperation::Activate => existing.activate(proposal.activation, now)?,
+                    AgendaOperation::Activate => {
+                        existing.activate(proposal.activation, effective_at)?
+                    }
                     AgendaOperation::Defer => existing.defer(
                         proposal
                             .defer_until
