@@ -5320,6 +5320,87 @@ fn core_message_prompt(message: &yunxi_core::MessageReceivedEvent) -> String {
 /// a structured reply plan with only an @ action cannot be represented by the
 /// platform-neutral `CognitiveIntent`. Treat it as invisible here rather than
 /// preparing an empty outgoing envelope that the action adapter cannot send.
+/// 去掉正文开头的舞台动作（`[…]`、`【…】`、`（…）`、`(…)`，可连续多个）。
+///
+/// 模型偶尔会把动作/语气描写写在正文前面（"（愣了一下）你要骂就骂吧"）。这类
+/// 前缀对 QQ 来说是要删掉的东西，不该让它把整条回复判成不可发送。只处理**开头**：
+/// 句子中间的括号往往是正文的一部分（"你要骂就骂吧（笑）"），不该动。
+fn strip_stage_directions(content: &str) -> String {
+    let mut rest = content.trim_start();
+    while let Some(open) = rest.chars().next() {
+        let close = match open {
+            '[' => ']',
+            '【' => '】',
+            '（' => '）',
+            '(' => ')',
+            _ => break,
+        };
+        let Some(end) = rest.find(close) else {
+            break;
+        };
+        rest = rest[end + close.len_utf8()..].trim_start();
+    }
+    rest.trim().to_owned()
+}
+
+/// 删掉"在评论这个回合本身"的整句（自述接不接、内部判断用词）。
+///
+/// 与 [`strip_stage_directions`] 同一个理由：一句话犯规不该让整条回复作废。
+/// 只删整句，不改写、不拼凑其余内容。
+fn drop_internal_decision_sentences(content: &str) -> String {
+    const TERMINATORS: [char; 7] = ['。', '！', '？', '!', '?', '；', '\n'];
+    let mut kept = String::with_capacity(content.len());
+    let mut sentence = String::new();
+    let flush = |sentence: &mut String, kept: &mut String| {
+        if sentence.trim().is_empty() {
+            sentence.clear();
+            return;
+        }
+        let leaked = reply_text_leaks_internal_reasoning(sentence);
+        if !leaked {
+            kept.push_str(sentence);
+        }
+        sentence.clear();
+    };
+    for character in content.chars() {
+        sentence.push(character);
+        if TERMINATORS.contains(&character) {
+            flush(&mut sentence, &mut kept);
+        }
+    }
+    flush(&mut sentence, &mut kept);
+    kept.trim().to_owned()
+}
+
+/// 把不可发送的成分从气泡里**剥掉**，而不是让整条回复作废。
+///
+/// 判据（[`reply_text_has_semantic_content`]）与 `core_plan_has_visible_text` 原本
+/// 对整条回复生效：模型写了一句"我不接这句"式自述、或一个括号舞台动作，同一条里
+/// 正常的正文就被一起带走了。线上 2026-09-14 21:05 被长篇贬损那条就是这么丢的——
+/// 66 个字已经生成，却一个字都没发出去。
+///
+/// 只做"删"不做"编"：清理后没有可发送内容的气泡直接丢掉。返回被清理过的气泡数，
+/// 供日志对账（0 表示原样未动）。
+fn sanitize_core_plan_bubbles(plan: &mut ReplyPlan) -> usize {
+    let mut cleaned_bubbles = 0_usize;
+    let mut kept: Vec<String> = Vec::with_capacity(plan.bubbles.len());
+    for bubble in &plan.bubbles {
+        let trimmed = bubble.trim();
+        let cleaned = drop_internal_decision_sentences(&strip_stage_directions(trimmed));
+        if cleaned != trimmed {
+            cleaned_bubbles += 1;
+        }
+        if reply_text_has_semantic_content(&cleaned) {
+            kept.push(cleaned);
+        }
+    }
+    if cleaned_bubbles > 0 {
+        plan.bubbles = kept;
+        plan.content = plan.bubbles.join("\n");
+    }
+    cleaned_bubbles
+}
+
 fn core_plan_has_visible_text(plan: &ReplyPlan) -> bool {
     plan.has_visible_reply()
         && !plan.bubbles.is_empty()
@@ -6716,7 +6797,23 @@ impl ModelBackend for KoviModelBackend {
             } else {
                 ReplyPlan::from_model_output(conversation.scope(), "").await
             };
-            if invalid_tool_output
+            // 先把"不可发送的成分"剥掉（舞台动作、自述接不接），别让一句话犯规
+            // 把整条正常回复带走：线上 2026-09-14 21:05 被长篇贬损那条就是这么
+            // 丢的——66 个字生成了，一个字没发出去。
+            if sanitize_core_plan_bubbles(&mut plan) > 0 {
+                kovi::log::info!(
+                    "Yunxi Core reply sanitized: event_id={} message_id={} conversation_id={} bubbles={} visible={}",
+                    input.event.id(),
+                    message_id_for_log(input),
+                    conversation_id_for_log(input),
+                    plan.bubbles.len(),
+                    core_plan_has_visible_text(&plan),
+                );
+            }
+            // 该回却什么都没剩下（或工具协议写坏）：先用同一个主模型确认式地再问
+            // 一次，失败才落到本地兜底那个小模型。
+            let invisible_required_reply = !core_plan_has_visible_text(&plan);
+            if (invalid_tool_output || invisible_required_reply)
                 && reply_recovery_required(input, tool_follow_up)
                 && is_current(ticket).await
                 && !fallback_response
@@ -6725,10 +6822,15 @@ impl ModelBackend for KoviModelBackend {
             {
                 mind_candidates = MindCandidates::default();
                 kovi::log::warn!(
-                    "Yunxi Core reply repair: event_id={} message_id={} conversation_id={} reason=invalid_tool_protocol",
+                    "Yunxi Core reply repair: event_id={} message_id={} conversation_id={} reason={}",
                     input.event.id(),
                     message_id_for_log(input),
                     conversation_id_for_log(input),
+                    if invalid_tool_output {
+                        "invalid_tool_protocol"
+                    } else {
+                        "final_plan_invisible"
+                    },
                 );
                 match repair_direct_reply(
                     &messages,
@@ -6742,6 +6844,7 @@ impl ModelBackend for KoviModelBackend {
                     Ok(CoreDirectRepair::Reply(repaired)) => {
                         mind_output_eligible = false;
                         plan = repaired;
+                        sanitize_core_plan_bubbles(&mut plan);
                         kovi::log::info!(
                             "Yunxi Core reply repair succeeded: event_id={} message_id={} conversation_id={} repair_result=reply",
                             input.event.id(),
@@ -6843,8 +6946,9 @@ impl ModelBackend for KoviModelBackend {
                     )
                     .await
                 {
-                    let local_plan =
+                    let mut local_plan =
                         ReplyPlan::from_intrinsic_output(conversation.scope(), &content).await;
+                    sanitize_core_plan_bubbles(&mut local_plan);
                     if core_plan_has_visible_text(&local_plan) {
                         plan = local_plan;
                     }
@@ -7332,8 +7436,8 @@ mod tests {
         constrain_autonomous_tick_plan, conversation_focus_target, conversation_id_for_log,
         core_message_prompt, core_plain_turn_instruction, core_plan_has_visible_text,
         core_reply_bubbles_with_max, core_tool_protocol_diagnostic, default_autonomous_directive,
-        defer_unroutable_due, deterministic_route_fallback, due_reply_target,
-        eligible_mind_candidates, explicit_message_batch_needs_repair,
+        defer_unroutable_due, deterministic_route_fallback, drop_internal_decision_sentences,
+        due_reply_target, eligible_mind_candidates, explicit_message_batch_needs_repair,
         explicit_message_count_for_event, explicit_message_count_for_input,
         explicit_message_count_instruction, first_person_turn_avoidance, group_reply_gap_secs_for,
         group_reply_gap_secs_for_sender, interaction_state_updates_with_cues,
@@ -7351,11 +7455,12 @@ mod tests {
         reply_recovery_required, reply_text_has_semantic_content, reply_text_is_too_thin,
         requested_message_count, route_from_lookup, route_lookup_with_fallback,
         safe_single_structured_reply_message, safe_structured_reply_batch,
-        sanitize_autonomous_intrinsic_output, sanitize_intrinsic_output,
-        sanitize_plain_text_batch_message, select_host_model_route_from_capability,
-        serialize_intrinsic_reply_batch, shadow_projection_for_completed_plan, silence_gate_plan,
-        silence_verdict, silent_wait_plan, split_core_speech_markers, split_two_short_lines,
-        strip_core_speech_markers, strong_reply_repair_needed, tool_calls_allowed_for_turn,
+        sanitize_autonomous_intrinsic_output, sanitize_core_plan_bubbles,
+        sanitize_intrinsic_output, sanitize_plain_text_batch_message,
+        select_host_model_route_from_capability, serialize_intrinsic_reply_batch,
+        shadow_projection_for_completed_plan, silence_gate_plan, silence_verdict, silent_wait_plan,
+        split_core_speech_markers, split_two_short_lines, strip_core_speech_markers,
+        strip_stage_directions, strong_reply_repair_needed, tool_calls_allowed_for_turn,
         tool_protocol_authorized_for_turn, visible_reply_intent, visible_reply_intents,
         visible_reply_invites_continuation, visible_reply_state_updates, visible_turn_continuation,
         with_chat_style,
@@ -8813,6 +8918,75 @@ mod tests {
             None
         );
         assert_eq!(core_reply_bubbles_with_max("   ", MAX_CORE_BUBBLES), None);
+    }
+
+    /// 清理器只做"删"：开头舞台动作去掉、自述整句去掉，其余一个字都不动。
+    /// 线上 2026-09-14 21:05 被长篇贬损那条：模型生成了 66 个字，被一句自述
+    /// 连累成"整条不可发送"，最后一个字都没发出去。
+    #[test]
+    fn reply_sanitizer_strips_narration_without_eating_the_reply() {
+        assert_eq!(
+            strip_stage_directions("（愣了一下）你要骂就骂吧。"),
+            "你要骂就骂吧。"
+        );
+        assert_eq!(
+            strip_stage_directions("[轻轻叹了口气]【无奈】我听着呢。"),
+            "我听着呢。"
+        );
+        // 句子中间的括号是正文的一部分，不动它。
+        assert_eq!(
+            strip_stage_directions("行吧（笑），你说什么就是什么。"),
+            "行吧（笑），你说什么就是什么。"
+        );
+        // 整条都是舞台动作：清完为空，交给上层丢掉。
+        assert_eq!(strip_stage_directions("（无语）"), "");
+
+        // 只删犯规的那一句，别的句子一个字都不动。
+        assert_eq!(
+            drop_internal_decision_sentences("这条我不接。你要骂就骂吧，我听着。"),
+            "你要骂就骂吧，我听着。"
+        );
+        assert_eq!(
+            drop_internal_decision_sentences("好呀，我在的。"),
+            "好呀，我在的。"
+        );
+    }
+
+    /// 清理后按"还剩几条能发的"决定可见性：剥掉自述后仍有一条正常正文就照发，
+    /// 全被剥光才回到原来的静默。
+    #[test]
+    fn sanitized_plan_keeps_the_sendable_bubble() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let scope = crate::model::ReplyScope::Group(9_000_401);
+                let mut plan = ReplyPlan::from_plain_bubbles(
+                    scope,
+                    vec![
+                        "（愣了一下）这条我不接。".to_owned(),
+                        "你要骂就骂吧，我听着。".to_owned(),
+                    ],
+                )
+                .expect("应构建出计划");
+
+                assert_eq!(sanitize_core_plan_bubbles(&mut plan), 1);
+                assert_eq!(plan.bubbles, vec!["你要骂就骂吧，我听着。"]);
+                assert!(core_plan_has_visible_text(&plan));
+
+                // 全是不可发送的内容：清完为空，判定不可见（维持静默）。
+                let mut only_stage =
+                    ReplyPlan::from_plain_bubbles(scope, vec!["（我不知道该说什么）".to_owned()])
+                        .expect("应构建出计划");
+                assert_eq!(sanitize_core_plan_bubbles(&mut only_stage), 1);
+                assert!(only_stage.bubbles.is_empty());
+                assert!(!core_plan_has_visible_text(&only_stage));
+
+                // 干净的正文不该被误改（返回 0 表示原样未动）。
+                let mut clean = ReplyPlan::from_plain_bubbles(scope, vec!["我在的呀。".to_owned()])
+                    .expect("应构建出计划");
+                assert_eq!(sanitize_core_plan_bubbles(&mut clean), 0);
+                assert_eq!(clean.bubbles, vec!["我在的呀。"]);
+            });
     }
 
     /// 线上 2026-09-14：中位 119 字、50% 带破折号、事实类问题写成百科条目。
