@@ -8,7 +8,12 @@ server-login
 # 所以它只能写不含密的部分：密钥一律走 api_key_env / token_env 的 env 间接，
 # 真实 Token 放在已忽略的 .env 里。
 # 管理后台写到运行时目录的覆盖配置与自动生成的登录 Token。
+# 覆盖配置里可能写着 server_config.api_key（后台的模型页会往里写），所以它连同
+# 备份一起忽略；模型档案里更是每套端点各一把密钥，同样绝不入库。
 bot.conf.override.toml
+bot.conf.override.toml.bak.*
+model_profiles.toml
+model_profiles.toml.bak.*
 .yunxi-admin-token
 kovi.conf.toml
 kovi.plugin.toml

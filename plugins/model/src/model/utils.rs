@@ -2281,9 +2281,7 @@ pub(crate) async fn params_model_with_native_tools(
         server_config.thinking_mode(),
     );
     let token = if server_config.requires_auth() {
-        std::env::var(server_config.api_key_env())
-            .ok()
-            .filter(|token| !token.trim().is_empty())
+        server_config.resolved_api_key()
     } else {
         None
     };
@@ -2294,10 +2292,7 @@ pub(crate) async fn params_model_with_native_tools(
     #[cfg(not(test))]
     let tokenless_request_ok = false;
     if server_config.requires_auth() && token.is_none() && !tokenless_request_ok {
-        return ModelPayload::failure(&format!(
-            "未设置 {}，暂时无法调用对话模型",
-            server_config.api_key_env()
-        ));
+        return ModelPayload::failure(&server_config.missing_api_key_message());
     }
     let queue_depth = MODEL_QUEUE_DEPTH.fetch_add(1, Ordering::AcqRel) + 1;
     if queue_depth > config.traffic().max_model_queue() {
@@ -2478,9 +2473,7 @@ async fn params_model_with_token_limit_and_progress_for_reply_mode_inner(
         server_config.thinking_mode(),
     );
     let token = if server_config.requires_auth() {
-        std::env::var(server_config.api_key_env())
-            .ok()
-            .filter(|token| !token.trim().is_empty())
+        server_config.resolved_api_key()
     } else {
         None
     };
@@ -2489,10 +2482,7 @@ async fn params_model_with_token_limit_and_progress_for_reply_mode_inner(
     #[cfg(not(test))]
     let tokenless_request_ok = false;
     if server_config.requires_auth() && token.is_none() && !tokenless_request_ok {
-        return model_error(&format!(
-            "未设置 {}，暂时无法调用对话模型",
-            server_config.api_key_env()
-        ));
+        return model_error(&server_config.missing_api_key_message());
     }
     let queue_depth = MODEL_QUEUE_DEPTH.fetch_add(1, Ordering::AcqRel) + 1;
     if queue_depth > config.traffic().max_model_queue() {
@@ -3755,18 +3745,10 @@ pub async fn send_sys_info_private(bot: Arc<RuntimeBot>, user_id: i64) {
 pub(crate) async fn system_info_content(bot: &RuntimeBot) -> String {
     let result = kovi::tokio::time::timeout(Duration::from_secs(8), async {
     let server_config = config::get().server_config().clone();
-    let model_auth_status = !server_config.enabled()
-        || !server_config.requires_auth()
-        || std::env::var(server_config.api_key_env())
-            .map(|token| !token.trim().is_empty())
-            .unwrap_or(false);
-    let model_auth = if !server_config.enabled() {
-        "外部模型已禁用".to_string()
-    } else if model_auth_status {
-        "已配置".to_string()
-    } else {
-        format!("未配置（{}）", server_config.api_key_env())
-    };
+    let model_auth = server_config.api_key_source().describe(
+        server_config.enabled(),
+        server_config.requires_auth(),
+    );
     let adapter_status =
         match kovi::tokio::time::timeout(Duration::from_secs(3), bot.get_status()).await {
             Ok(Ok(status)) => format_adapter_status(&status.data),

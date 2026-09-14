@@ -268,11 +268,7 @@ fn load_bundle(intrinsic: &IntrinsicConfig) -> yunxi_core::IntrinsicAssetRuntime
 
 fn strong_is_configured() -> bool {
     let server = config::get().server_config().clone();
-    server.enabled()
-        && (!server.requires_auth()
-            || std::env::var(server.api_key_env())
-                .map(|value| !value.trim().is_empty())
-                .unwrap_or(false))
+    server.enabled() && (!server.requires_auth() || server.resolved_api_key().is_some())
 }
 
 fn health_code(health: ModelHealth) -> i64 {

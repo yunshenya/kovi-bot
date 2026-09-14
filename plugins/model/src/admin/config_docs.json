@@ -556,7 +556,7 @@
     },
     "qq_sticker.dir": {
       "doc": "素材目录。相对路径以运行时目录为基准（与 `admin.annotation_dir` 一致）。",
-      "hint": "素材目录。相对路径以运行时目录为基准（与 admin.annotation_dir 一致）； 生产部署建议写绝对路径，例如 \"/home/ubuntu/yunxi-stickers\"。"
+      "hint": "素材目录。相对路径以运行时目录为基准（与 admin.annotation_dir 一致）； 生产部署建议写绝对路径，例如 \"/home/ubuntu/yunxi-stickers\"。 目录不存在会自动补建（与标注目录同一约定）：部署完直接把图丢进去就行，不必先 mkdir。 也可以在管理后台的「表情包」页直接上传/删除——写的就是这个目录，两边是同一批文件。"
     },
     "qq_sticker.enabled": {
       "doc": "是否允许芸汐发表情包。"
@@ -644,8 +644,14 @@
       "doc": "可选的自定义请求头 x-openai-actor-authorization",
       "secret": true
     },
+    "server_config.api_key": {
+      "doc": "主模型 API Key。留空时回退到 `api_key_env` 指向的环境变量。 允许直接写在这里是为了管理后台能配：运维不该为了换一把 key 去 SSH 改 systemd 环境变量再重启。它被标注为密钥（后台只回显掩码、写回时留空表示 不改），并且只该写在运行时覆盖文件（0600）里，不要提交进仓库。",
+      "hint": "主模型 API Key。留空表示不在这里写，走上面的环境变量。 想换密钥但不想 SSH 改 systemd 环境时，就用管理后台的「模型」页填：那里写的是运行时 覆盖配置（bot.conf.override.toml，权限 0600、跨发布保留），保存即生效、不用重启； 也可以在那一页选服务商预设、一键切换模型并测试连通性。 **不要把它提交进仓库**——主配置是发布物。",
+      "secret": true
+    },
     "server_config.api_key_env": {
-      "doc": "读取主模型 Token 的环境变量名"
+      "doc": "读取主模型 Token 的环境变量名",
+      "hint": "主模型密钥从哪来：填了下面的 api_key 就直接用它，否则读这个环境变量。"
     },
     "server_config.enabled": {
       "doc": "是否启用外部强模型。关闭后 Core/Intrinsic 仍可独立运行。"

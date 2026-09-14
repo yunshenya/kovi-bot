@@ -496,6 +496,34 @@ recent_topic_cooldown_secs = 604800
 
 确认候选会将管理员填写的含义写入正式表情记忆；也可以直接在原聊天中引用表情发送 `#教芸汐 这个表情是……`，现有教学流程会自动完成候选确认。驳回或忽略只会暂时抑制重复建议，不会把模型猜测当成事实。
 
+## 换模型与 API Key
+
+管理后台的「模型」页专门做这一件事：选服务商 → 填密钥 → **测试连接** → 应用。写进去的还是 `[server_config]`，所以配置页、概览页与 `#系统信息` 看到的是同一份真相，不需要重启（这几个字段每次用到的当刻都会重新读配置）。
+
+- **服务商预设**：DeepSeek / OpenAI / 智谱 GLM / 月之暗面 / 阿里通义 / 硅基流动 / OpenRouter / 本地 Ollama / 自定义。选一个就自动填好 base_url、协议（Chat Completions 或 Responses）与思考模式，模型名给候选也可以手填。
+- **API Key**：后台**只写不读**——接口从不回显它，页面上留空（或那串掩码）就表示"沿用现在这把"。解析顺序是 `server_config.api_key` → `server_config.api_key_env` 指向的环境变量 → 没有；页面上会直接写出当前用的是哪一种，`#系统信息` 与健康检查用的是同一句话。
+- **测试连接**：拿表单里的值真发一次最小请求（不保存、不影响正在跑的配置），成功报延迟，失败把服务商给的原文带回来；详情里出现的密钥会被抹掉。
+- **模型档案**：填好之后在"存成档案"输入框里起个名字再点应用，就存下一套；以后一键切回或删除。档案存在运行时目录的 `model_profiles.toml`。
+
+落盘与权限：
+
+- 配置改动写进运行时覆盖配置 `bot.conf.override.toml`（`YUNXI_CONFIG_OVERRIDE` 可改路径），**权限 0600**，启动时若发现它是更宽的权限会自动收紧。
+- 模型档案 `model_profiles.toml` 同样是 **0600**：每套档案各存一把密钥。
+- 两个文件都已加进 `.gitignore`。**密钥不要写进 `bot.conf.toml`**：那是随发布走的主配置，`api_key` 留在它里面等于把密钥提交进仓库。
+
+不想用后台也可以手写（`bot.conf.toml` 的 `[server_config]`，或用环境变量）：
+
+```toml
+[server_config]
+enabled = true
+url = "https://api.deepseek.com"     # base_url 或完整的 .../chat/completions 都行
+model_name = "deepseek-v4-flash"
+wire_api = "chat_completions"
+thinking_mode = "disabled"           # 把输出预算留给正文
+api_key_env = "BOT_API_TOKEN"        # 兜底：从环境变量读
+api_key = ""                         # 也可以直接填（只建议写在覆盖配置或自己的运行时配置里）
+```
+
 ## 发表情包
 
 上面那一节是"她看懂别人发的表情"；这一节是"**她自己发得出去**的表情包"。两者数据完全独立：她能发的素材只有你放进 `qq_sticker.dir` 的那些图，她**不会**把聊天里别人的表情存下来再转发出去，所以这条链路不改变任何隐私口径。

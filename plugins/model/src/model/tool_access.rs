@@ -3292,10 +3292,7 @@ fn optional_bounded_u64(
 async fn health_check() -> Result<String> {
     let current_config = config::get();
     let server_config = current_config.server_config().clone();
-    let model_auth = !server_config.requires_auth()
-        || std::env::var(server_config.api_key_env())
-            .map(|value| !value.trim().is_empty())
-            .unwrap_or(false);
+    let model_auth = !server_config.requires_auth() || server_config.resolved_api_key().is_some();
 
     let memory_status = kovi::tokio::time::timeout(Duration::from_secs(4), async {
         let mut checker = HealthChecker::new(Arc::clone(&MEMORY_MANAGER));
@@ -3334,7 +3331,7 @@ async fn health_check() -> Result<String> {
         .unwrap_or("未配置");
     let mut errors = memory_status.errors.clone();
     if !model_auth {
-        errors.push(format!("未设置 {}", server_config.api_key_env()));
+        errors.push(server_config.missing_api_key_message());
     }
     if redis_status.contains("不可用") || redis_status == "查询超时" {
         errors.push(format!("Redis：{}", redis_status));

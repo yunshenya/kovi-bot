@@ -35,6 +35,11 @@ const MANAGED_FILES: &[&str] = &[
 ];
 /// 打码后回显的占位值。写回时等于这个值表示"不修改"。
 const MASK: &str = "********";
+
+/// 掩码占位值（模型页也要认它：前端只能拿到掩码，"填了掩码"= 不改密钥）。
+pub(crate) fn mask_placeholder() -> &'static str {
+    MASK
+}
 /// 通用 TOML 文件里按键名判断是否打码。
 const SECRET_KEY_HINTS: &[&str] = &[
     "token",
@@ -291,7 +296,7 @@ pub(crate) async fn write_raw(
     let validated = validate_candidate(file, &candidate_text)?;
 
     let backup = backup(&path)?;
-    write_atomically(&path, &candidate_text).map_err(|error| write_hint(&path, &error))?;
+    write_config_file(&path, &candidate_text).map_err(|error| write_hint(&path, &error))?;
 
     let mut reloaded = false;
     if let Some(config) = validated {
@@ -323,26 +328,20 @@ pub(crate) struct PatchRequest {
     changes: BTreeMap<String, Value>,
 }
 
-/// `POST /api/config/patch`：按字段改主配置。
-pub(crate) async fn patch(
-    State(state): State<Arc<AdminState>>,
-    Json(body): Json<PatchRequest>,
-) -> Result<Json<Value>, ApiError> {
-    let name = body.file.as_deref().unwrap_or(MAIN_CONFIG);
-    let file = managed_file(name)?;
-    let path = config_path(name)?;
-    if body.changes.is_empty() {
-        return Err(ApiError::bad_request("没有要修改的字段"));
-    }
-
-    let raw = read_config_text(&path, file)?;
+/// 把改动应用到一份 TOML 文本上，返回 `(新文本, 已改字段, 被跳过字段)`。
+///
+/// 纯函数：不碰磁盘、不读全局配置。"改了之后磁盘上会是什么"这件事因此可以直接
+/// 断言——模型页那条链路（表单 → 档案 → `[server_config]`）就靠它落盘。
+pub(crate) fn changed_document(
+    raw: &str,
+    changes: &BTreeMap<String, Value>,
+) -> Result<(String, Vec<String>, Vec<String>), ApiError> {
     let mut document = raw
         .parse::<DocumentMut>()
         .map_err(|error| ApiError::bad_request(format!("现有配置无法解析为 TOML: {error}")))?;
-
     let mut applied = Vec::new();
     let mut skipped = Vec::new();
-    for (key, value) in &body.changes {
+    for (key, value) in changes {
         // 打码值等于"这个密钥我不改"，不能把 ******** 真的写进配置。
         if value.as_str() == Some(MASK) {
             skipped.push(key.clone());
@@ -354,8 +353,36 @@ pub(crate) async fn patch(
     }
     applied.sort();
     skipped.sort();
+    Ok((document.to_string(), applied, skipped))
+}
 
-    let candidate = document.to_string();
+/// `POST /api/config/patch`：按字段改主配置。
+pub(crate) async fn patch(
+    State(state): State<Arc<AdminState>>,
+    Json(body): Json<PatchRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let name = body.file.as_deref().unwrap_or(MAIN_CONFIG);
+    let outcome = apply_changes(&state, name, body.changes).await?;
+    Ok(Json(outcome))
+}
+
+/// 按字段改一份配置文件的实现（HTTP 处理器与模型页共用）。
+///
+/// `name` 是受管文件名；`changes` 是 `{"分组.字段": 新值}`。返回体与
+/// `POST /api/config/patch` 的响应一致，两个入口给出同样的回执。
+pub(crate) async fn apply_changes(
+    state: &Arc<AdminState>,
+    name: &str,
+    changes: BTreeMap<String, Value>,
+) -> Result<Value, ApiError> {
+    let file = managed_file(name)?;
+    let path = config_path(name)?;
+    if changes.is_empty() {
+        return Err(ApiError::bad_request("没有要修改的字段"));
+    }
+
+    let raw = read_config_text(&path, file)?;
+    let (candidate, applied, skipped) = changed_document(&raw, &changes)?;
     if candidate.len() > MAX_CONFIG_BYTES {
         return Err(ApiError::bad_request("配置文本过大"));
     }
@@ -363,17 +390,17 @@ pub(crate) async fn patch(
     let validated = validate_candidate(file, &candidate)?;
 
     if applied.is_empty() {
-        return Ok(Json(json!({
+        return Ok(json!({
             "ok": true,
             "changed": [],
             "skipped": skipped,
             "reloaded": false,
             "message": "没有实际改动",
-        })));
+        }));
     }
 
     let backup = backup(&path)?;
-    write_atomically(&path, &candidate).map_err(|error| write_hint(&path, &error))?;
+    write_config_file(&path, &candidate).map_err(|error| write_hint(&path, &error))?;
 
     let mut reloaded = false;
     if let Some(config) = validated {
@@ -401,7 +428,7 @@ pub(crate) async fn patch(
         (values, masked)
     };
 
-    Ok(Json(json!({
+    Ok(json!({
         "ok": true,
         "changed": applied,
         "skipped": skipped,
@@ -412,7 +439,7 @@ pub(crate) async fn patch(
         "raw": candidate,
         "values": values,
         "masked": masked,
-    })))
+    }))
 }
 
 /// `POST /api/config/reload`：按磁盘内容重新加载内存配置。
@@ -464,7 +491,7 @@ pub(crate) async fn restore_backup(
     let validated = validate_candidate(file, &raw)?;
 
     let backup = backup(&target)?;
-    write_atomically(&target, &raw).map_err(|error| write_hint(&target, &error))?;
+    write_config_file(&target, &raw).map_err(|error| write_hint(&target, &error))?;
     let mut reloaded = false;
     if let Some(config) = validated {
         config::install(config).map_err(ApiError::internal)?;
@@ -1032,6 +1059,73 @@ pub(crate) fn write_atomically(path: &Path, text: &str) -> std::io::Result<()> {
             Err(error)
         }
     }
+}
+
+/// 0600 权限位（只管属主读写）。非 Unix 平台没有这套位，返回 `None` 表示不设。
+fn private_permissions() -> Option<fs::Permissions> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        Some(fs::Permissions::from_mode(0o600))
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+/// 私密写：与 [`write_atomically`] 相同，但**强制** 0600，而不是保留原权限。
+///
+/// 给运行时覆盖配置用：它可能装着 `server.api_key` 这类密钥，而"保留原权限"在
+/// 文件本来就是 0644 时等于把密钥交出去。先设临时文件的权限再 rename，所以文件
+/// 从出现的第一刻就是 0600，中间没有窗口。
+pub(crate) fn write_atomically_private(path: &Path, text: &str) -> std::io::Result<()> {
+    let temp = PathBuf::from(format!("{}.tmp.{}", path.display(), std::process::id()));
+    fs::write(&temp, text)?;
+    if let Some(permissions) = private_permissions() {
+        fs::set_permissions(&temp, permissions)?;
+    }
+    match fs::rename(&temp, path) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = fs::remove_file(&temp);
+            Err(error)
+        }
+    }
+}
+
+/// 按目标文件选写入方式：运行时覆盖配置一律 0600，其余沿用原行为。
+fn write_config_file(path: &Path, text: &str) -> std::io::Result<()> {
+    if path == config::override_file_path() {
+        write_atomically_private(path, text)
+    } else {
+        write_atomically(path, text)
+    }
+}
+
+/// 启动时把已存在的覆盖配置收紧到 0600（以及它的备份）。
+///
+/// 覆盖配置可能是历史版本以 0644 落下的（那时它只存普通字段上），而现在已经允许
+/// 在里面写密钥。返回被收紧的文件数，供启动日志说明。
+pub(crate) fn tighten_private_config_permissions() -> usize {
+    let Some(permissions) = private_permissions() else {
+        return 0;
+    };
+    let mut tightened = 0;
+    let mut paths = vec![config::override_file_path()];
+    paths.extend(backups_of(&config::override_file_path()));
+    for path in paths {
+        let Ok(metadata) = fs::metadata(&path) else {
+            continue;
+        };
+        if metadata.permissions().readonly() || metadata.permissions() == permissions {
+            continue;
+        }
+        if fs::set_permissions(&path, permissions.clone()).is_ok() {
+            tightened += 1;
+        }
+    }
+    tightened
 }
 
 #[cfg(test)]

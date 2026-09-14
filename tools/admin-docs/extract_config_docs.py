@@ -75,6 +75,7 @@ STRUCT_TO_SECTION = {
 
 # 这些字段是密钥或等价物：界面上默认打码，留空写入表示"不改"。
 SECRET_FIELDS = {
+    "server_config.api_key",
     "server_config.actor_authorization",
     "qq_call.pulse_cookie",
     "admin.token",

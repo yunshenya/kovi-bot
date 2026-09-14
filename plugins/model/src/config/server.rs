@@ -6,6 +6,38 @@ use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 use url::Url;
 
+/// 主模型密钥的来源。
+///
+/// 只用于诊断与后台展示；取密钥本身一律走
+/// [`ServerConfig::resolved_api_key`]，免得两处各判一次先后顺序。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApiKeySource {
+    /// 直接写在配置里（管理后台填的那把）。
+    Config,
+    /// 来自这个环境变量。
+    Environment(String),
+    /// 两边都没有。
+    Missing,
+}
+
+impl ApiKeySource {
+    /// 给人看的一句话。`#系统信息`、健康检查与后台概览共用这一处措辞，
+    /// 免得三处各写一套、说法还不一样。
+    pub fn describe(&self, enabled: bool, requires_auth: bool) -> String {
+        if !enabled {
+            return "外部模型已禁用".to_string();
+        }
+        if !requires_auth {
+            return "无需密钥".to_string();
+        }
+        match self {
+            Self::Config => "已配置（写在配置里）".to_string(),
+            Self::Environment(name) => format!("已配置（环境变量 {name}）"),
+            Self::Missing => "未配置".to_string(),
+        }
+    }
+}
+
 /// 服务器配置结构体
 ///
 /// 包含连接AI模型服务器所需的配置信息
@@ -24,6 +56,12 @@ pub struct ServerConfig {
     supports_vision: bool,
     /// 读取主模型 Token 的环境变量名
     api_key_env: String,
+    /// 主模型 API Key。留空时回退到 `api_key_env` 指向的环境变量。
+    ///
+    /// 允许直接写在这里是为了管理后台能配：运维不该为了换一把 key 去 SSH 改
+    /// systemd 环境变量再重启。它被标注为密钥（后台只回显掩码、写回时留空表示
+    /// 不改），并且只该写在运行时覆盖文件（0600）里，不要提交进仓库。
+    api_key: String,
     /// 是否要求主模型携带 Bearer Token
     requires_auth: bool,
     /// 可选的自定义请求头 x-openai-actor-authorization
@@ -71,6 +109,56 @@ impl ServerConfig {
 
     pub fn api_key_env(&self) -> &str {
         self.api_key_env.as_str()
+    }
+
+    /// 直接配置的 API Key（空串表示没配，回退环境变量）。
+    pub fn api_key(&self) -> &str {
+        self.api_key.as_str()
+    }
+
+    /// 这一轮实际要用的 API Key。
+    ///
+    /// 顺序是**配置里的 key → 环境变量 → 没有**：后台填的那把必须能立刻生效，
+    /// 否则"配了却不生效"会比没配更难查；环境变量保留为兜底，老部署不受影响。
+    pub fn resolved_api_key(&self) -> Option<String> {
+        self.resolve_api_key(&|name| std::env::var(name).ok()).0
+    }
+
+    /// 密钥从哪来（诊断与后台展示用）。取密钥一律走 [`Self::resolved_api_key`]。
+    pub fn api_key_source(&self) -> ApiKeySource {
+        self.resolve_api_key(&|name| std::env::var(name).ok()).1
+    }
+
+    /// 密钥解析的唯一实现：先看配置，再看环境变量。
+    ///
+    /// 环境那一路是注入的，测试可以直接喂一张假表——不去改进程级环境变量
+    /// （edition 2024 里那是 `unsafe`，并行用例还会互相看见）。
+    fn resolve_api_key(
+        &self,
+        lookup: &dyn Fn(&str) -> Option<String>,
+    ) -> (Option<String>, ApiKeySource) {
+        let configured = self.api_key.trim();
+        if !configured.is_empty() {
+            return (Some(configured.to_string()), ApiKeySource::Config);
+        }
+        let env_name = self.api_key_env.trim();
+        if env_name.is_empty() {
+            return (None, ApiKeySource::Missing);
+        }
+        match lookup(env_name).filter(|value| !value.trim().is_empty()) {
+            Some(value) => (Some(value), ApiKeySource::Environment(env_name.to_string())),
+            None => (None, ApiKeySource::Missing),
+        }
+    }
+
+    /// 密钥缺失时给人看的一句话：说清楚两个位置都可以配，别让人只盯着环境变量。
+    pub fn missing_api_key_message(&self) -> String {
+        let env_name = self.api_key_env.trim();
+        if env_name.is_empty() {
+            "未配置主模型密钥（server.api_key 为空，server.api_key_env 也没写）".to_string()
+        } else {
+            format!("未配置主模型密钥（server.api_key 为空，环境变量 {env_name} 也没有值）")
+        }
     }
 
     pub fn requires_auth(&self) -> bool {
@@ -144,8 +232,10 @@ impl ServerConfig {
         if self.model_name.is_empty() {
             return Err(anyhow::anyhow!("模型名称不能为空"));
         }
-        if self.api_key_env.trim().is_empty() {
-            return Err(anyhow::anyhow!("server.api_key_env 不能为空"));
+        if self.api_key.trim().is_empty() && self.api_key_env.trim().is_empty() {
+            return Err(anyhow::anyhow!(
+                "server.api_key 与 server.api_key_env 至少要有一个：前者直接写密钥（管理后台用），后者指向存放密钥的环境变量"
+            ));
         }
 
         println!(
@@ -189,6 +279,7 @@ impl Default for ServerConfig {
             wire_api: "chat_completions".to_string(),
             supports_vision: false,
             api_key_env: "BOT_API_TOKEN".to_string(),
+            api_key: String::new(),
             requires_auth: true,
             actor_authorization: String::new(),
             // The built-in model is DeepSeek v4, whose hidden reasoning can
@@ -205,7 +296,7 @@ impl Default for ServerConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::ServerConfig;
+    use super::{ApiKeySource, ServerConfig};
 
     #[test]
     fn deepseek_default_is_text_only() {
@@ -227,6 +318,97 @@ mod tests {
             ..ServerConfig::default()
         };
         assert_eq!(config.endpoint(), "https://example.com/v1/responses");
+    }
+
+    /// 后台填的那把 key 必须能立刻生效；环境变量保留为兜底。这个先后顺序是
+    /// "配了却不生效"这类最难查的问题的唯一防线，所以钉住它。
+    #[test]
+    fn configured_api_key_wins_over_the_environment() {
+        let env_name = "KOVI_TEST_KEY_FALLBACK";
+        let lookup = |name: &str| (name == env_name).then(|| "from-env".to_string());
+
+        let from_env = ServerConfig {
+            api_key: String::new(),
+            api_key_env: env_name.to_string(),
+            ..ServerConfig::default()
+        };
+        assert_eq!(
+            from_env.resolve_api_key(&lookup),
+            (
+                Some("from-env".to_string()),
+                ApiKeySource::Environment(env_name.to_string())
+            )
+        );
+
+        let from_config = ServerConfig {
+            api_key: "from-config".to_string(),
+            api_key_env: env_name.to_string(),
+            ..ServerConfig::default()
+        };
+        assert_eq!(
+            from_config.resolve_api_key(&lookup),
+            (Some("from-config".to_string()), ApiKeySource::Config)
+        );
+
+        // 两边都没有时是"缺失"，而不是空串冒充一把 key。
+        let missing = ServerConfig {
+            api_key: "   ".to_string(),
+            api_key_env: "KOVI_TEST_KEY_UNSET".to_string(),
+            ..ServerConfig::default()
+        };
+        assert_eq!(missing.resolve_api_key(&lookup).0, None);
+        assert_eq!(missing.resolve_api_key(&lookup).1, ApiKeySource::Missing);
+        assert!(
+            missing
+                .missing_api_key_message()
+                .contains("未配置主模型密钥")
+        );
+
+        // 环境变量名没写、配置也没写：一样是缺失，不能 panic。
+        let blank = ServerConfig {
+            api_key: String::new(),
+            api_key_env: String::new(),
+            ..ServerConfig::default()
+        };
+        assert_eq!(blank.resolve_api_key(&lookup).1, ApiKeySource::Missing);
+    }
+
+    /// 展示用的措辞只有一处：禁用、无需密钥、已配置、未配置四种说法。
+    #[test]
+    fn api_key_source_reads_as_one_sentence() {
+        assert_eq!(
+            ApiKeySource::Config.describe(true, true),
+            "已配置（写在配置里）"
+        );
+        assert_eq!(
+            ApiKeySource::Environment("BOT_API_TOKEN".to_string()).describe(true, true),
+            "已配置（环境变量 BOT_API_TOKEN）"
+        );
+        assert_eq!(ApiKeySource::Missing.describe(true, true), "未配置");
+        assert_eq!(
+            ApiKeySource::Missing.describe(false, true),
+            "外部模型已禁用"
+        );
+        assert_eq!(ApiKeySource::Missing.describe(true, false), "无需密钥");
+    }
+
+    /// 直接写密钥时不再强制要求环境变量名，但两个都空要说清楚。
+    #[test]
+    fn a_configured_key_replaces_the_environment_variable_name() {
+        let configured = ServerConfig {
+            api_key: "sk-test".to_string(),
+            api_key_env: String::new(),
+            ..ServerConfig::default()
+        };
+        assert!(configured.validate().is_ok());
+
+        let neither = ServerConfig {
+            api_key: String::new(),
+            api_key_env: String::new(),
+            ..ServerConfig::default()
+        };
+        let error = neither.validate().expect_err("两个都空必须拒绝");
+        assert!(error.to_string().contains("server.api_key"));
     }
 
     #[test]

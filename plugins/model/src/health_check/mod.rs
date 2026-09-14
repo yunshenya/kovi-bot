@@ -68,12 +68,8 @@ impl HealthChecker {
         let server_config = crate::config::get().server_config().clone();
         if !server_config.enabled() {
             warnings.push("外部对话模型已禁用，当前依赖本地 Intrinsic/确定性能力".to_string());
-        } else if server_config.requires_auth()
-            && std::env::var(server_config.api_key_env())
-                .map(|token| token.trim().is_empty())
-                .unwrap_or(true)
-        {
-            errors.push(format!("未设置 {}", server_config.api_key_env()));
+        } else if server_config.requires_auth() && server_config.resolved_api_key().is_none() {
+            errors.push(server_config.missing_api_key_message());
         }
 
         // 检查记忆管理器

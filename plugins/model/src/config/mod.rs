@@ -67,6 +67,7 @@ pub use qq_sing::QqSingConfig;
 pub use qq_sticker::QqStickerConfig;
 pub use qq_voice::QqVoiceConfig;
 pub use reminders::ReminderConfig;
+pub use server::ApiKeySource;
 pub use silence::SilenceConfig;
 pub use tools::{McpServerConfig, ToolsConfig};
 pub use vision::VisionConfig;

@@ -1333,3 +1333,42 @@ a.stat:hover, .stat.link:hover { border-color: var(--accent); transform: transla
   font-size: 11px; color: var(--text-faint); font-family: var(--mono);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
+
+/* ───────────────────────────── 模型页 ─────────────────────────────
+   一页做一件事：换端点。状态卡只读，表单卡是唯一的输入面，档案卡是快捷方式。 */
+.model-facts { display: flex; flex-wrap: wrap; gap: 8px 22px; margin-bottom: 6px; }
+.model-fact { display: flex; align-items: baseline; gap: 8px; font-size: 12px; }
+.model-fact-label { color: var(--text-faint); }
+.model-fact-value { color: var(--text-dim); word-break: break-all; }
+
+.model-form { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end; }
+.model-field { display: flex; flex-direction: column; gap: 5px; min-width: 180px; flex: 1 1 220px; }
+.model-field > span { color: var(--text-faint); font-size: 12px; }
+/* 地址、模型名、密钥要占满一行：它们是最容易填错、也最需要看清的三项。 */
+.model-field.wide { flex: 1 1 100%; }
+.model-check { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--text-dim); }
+.model-advanced { flex: 1 1 100%; }
+.model-advanced summary { cursor: pointer; color: var(--text-faint); font-size: 12px; margin-bottom: 10px; }
+.model-actions { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-top: 14px; }
+.model-actions .input { flex: 1 1 260px; }
+
+.model-test {
+  display: flex; align-items: baseline; gap: 10px; margin-top: 12px;
+  padding: 9px 12px; border-radius: var(--radius-sm); font-size: 12.5px; line-height: 1.6;
+}
+.model-test.ok { background: var(--ok-soft); color: var(--ok); }
+.model-test.bad { background: var(--danger-soft); color: var(--danger); }
+.model-test-badge { font-weight: 600; flex: 0 0 auto; }
+
+.model-profile-list { display: flex; flex-direction: column; gap: 10px; }
+.model-profile {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 10px;
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  background: var(--bg-elev-2); padding: 10px 12px;
+}
+.model-profile-main { flex: 1 1 240px; min-width: 0; }
+.model-profile-label { font-size: 13px; color: var(--text); }
+.model-profile-sub {
+  font-size: 11px; color: var(--text-faint);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}

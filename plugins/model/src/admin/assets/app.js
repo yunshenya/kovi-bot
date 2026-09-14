@@ -238,6 +238,7 @@
     overview: { title: '概览', subtitle: '进程、存储、模型与调度器的现状', render: renderOverview },
     config: { title: '配置', subtitle: '全部参数；保存前会校验，保存时保留注释', render: renderConfigPage },
     memory: { title: '记忆', subtitle: '长期记忆、情节、人物与未完结线索', render: renderMemoryPage },
+    model: { title: '模型', subtitle: '换服务商 / 换模型 / 填密钥 / 测连通性', render: renderModelPage },
     stickers: { title: '表情包', subtitle: '她能发出去的素材：上传、查看、删除', render: renderStickerPage },
     annotation: { title: '标注', subtitle: 'TurnGate 待复核样本：标完直接导出训练集', render: renderAnnotationPage },
     system: { title: '系统', subtitle: '主机、进程、模型与 OneBot 服务端', render: renderSystemPage },
@@ -2352,6 +2353,325 @@
       h('div', { class: 'record-foot' },
         h('span', { text: item.scope_label || '全局' }),
         h('span', { text: relative(item.occurred_at) || fmtTime(item.occurred_at) })));
+  }
+
+  // ───────────────────────────── 模型 ─────────────────────────────
+  //
+  // 换模型这件事的专用页：选服务商预设 → 填密钥 → 测一下 → 应用。写进去的还是
+  // `[server_config]`（落在运行时覆盖配置，0600），所以配置页、概览页与
+  // `#系统信息` 看到的是同一份真相；这里只是把"换一个模型"从"改五个字段、再去
+  // 服务器环境里塞密钥"变成一次下拉加一次点击。
+  //
+  // 密钥只进不出：接口从不回显它，本页也从不预填。
+
+  const MODEL_PROVIDERS = [
+    {
+      id: 'deepseek', label: 'DeepSeek（内置默认）',
+      url: 'https://api.deepseek.com', wire_api: 'chat_completions',
+      thinking_mode: 'disabled', supports_vision: false,
+      models: ['deepseek-v4-flash', 'deepseek-chat', 'deepseek-reasoner'],
+    },
+    {
+      id: 'openai', label: 'OpenAI',
+      url: 'https://api.openai.com/v1', wire_api: 'chat_completions',
+      thinking_mode: 'auto', supports_vision: true,
+      models: ['gpt-4o-mini', 'gpt-4o', 'gpt-4.1', 'o4-mini'],
+    },
+    {
+      id: 'zhipu', label: '智谱 GLM',
+      url: 'https://open.bigmodel.cn/api/paas/v4', wire_api: 'chat_completions',
+      thinking_mode: 'auto', supports_vision: true,
+      models: ['glm-4-plus', 'glm-4-air', 'glm-4v-plus'],
+    },
+    {
+      id: 'moonshot', label: '月之暗面 Kimi',
+      url: 'https://api.moonshot.cn/v1', wire_api: 'chat_completions',
+      thinking_mode: 'auto', supports_vision: false,
+      models: ['kimi-k2-0905-preview', 'moonshot-v1-32k'],
+    },
+    {
+      id: 'dashscope', label: '阿里通义千问',
+      url: 'https://dashscope.aliyuncs.com/compatible-mode/v1', wire_api: 'chat_completions',
+      thinking_mode: 'auto', supports_vision: true,
+      models: ['qwen-plus', 'qwen-max', 'qwen-vl-max'],
+    },
+    {
+      id: 'siliconflow', label: '硅基流动',
+      url: 'https://api.siliconflow.cn/v1', wire_api: 'chat_completions',
+      thinking_mode: 'auto', supports_vision: false,
+      models: ['deepseek-ai/DeepSeek-V3', 'Qwen/Qwen2.5-72B-Instruct'],
+    },
+    {
+      id: 'openrouter', label: 'OpenRouter',
+      url: 'https://openrouter.ai/api/v1', wire_api: 'chat_completions',
+      thinking_mode: 'auto', supports_vision: true,
+      models: ['deepseek/deepseek-chat', 'openai/gpt-4o-mini', 'anthropic/claude-3.5-sonnet'],
+    },
+    {
+      id: 'ollama', label: '本地 Ollama / 兼容端点（免密钥）',
+      url: 'http://127.0.0.1:11434/v1', wire_api: 'chat_completions',
+      thinking_mode: 'auto', supports_vision: false, requires_auth: false,
+      models: ['qwen2.5:7b', 'llama3.1:8b'],
+    },
+    {
+      id: 'custom', label: '自定义（OpenAI 兼容 / Responses）',
+      url: '', wire_api: 'chat_completions', thinking_mode: 'auto', supports_vision: false,
+      models: [],
+    },
+  ];
+
+  /** 模型页状态。切页会整页重建，靠它挂住预设选择、测试结果与结果节点。 */
+  const model = { data: null, provider: 'deepseek', test: null, testNode: null };
+
+  async function renderModelPage() {
+    const page = $('#page-model');
+    clear(page);
+    page.append(h('div', { class: 'loading', text: '读取模型配置…' }));
+    let data;
+    try {
+      data = await api('/api/model');
+    } catch (problem) {
+      clear(page);
+      page.append(h('div', { class: 'empty', text: problem.message }));
+      return;
+    }
+    if (currentPage !== 'model') return;
+    model.data = data;
+    clear(page);
+    page.append(renderModelStatus(data));
+    page.append(renderModelForm(data));
+    page.append(renderModelProfiles(data));
+  }
+
+  function renderModelStatus(data) {
+    const current = data.current || {};
+    const profilesPath = (data.profiles && data.profiles.path) || '';
+    return h('div', { class: 'card' },
+      h('div', { class: 'card-head' },
+        h('h3', {},
+          '当前生效 ',
+          h('span', {
+            class: current.enabled ? 'pill ok' : 'pill bad',
+            text: current.enabled ? '外部模型已启用' : '外部模型已禁用',
+          })),
+        h('div', { class: 'hint', text: current.enabled
+          ? '她在用下面这套端点回话'
+          : '关掉时她只用本地能力（Core / Intrinsic），配置照旧保留' })),
+      h('div', { class: 'model-facts' },
+        modelFact('模型', current.model_name || '—'),
+        modelFact('地址', current.endpoint || '—'),
+        modelFact('协议', current.wire_api === 'responses' ? 'Responses' : 'Chat Completions'),
+        modelFact('思考', current.thinking_mode === 'disabled' ? '关闭（省输出预算）' : '交给服务商默认'),
+        modelFact('视觉', current.supports_vision ? '主模型直接读图' : '交给独立视觉模型'),
+        h('div', { class: 'model-fact' },
+          h('span', { class: 'model-fact-label', text: 'API Key' }),
+          h('span', {
+            class: `pill ${current.has_key ? 'ok' : 'bad'}`,
+            text: current.key_source_text || '未知',
+          }))),
+      h('div', { class: 'hint', text: `配置改动写在 ${data.config_file || '—'}（权限 0600）；档案写在 ${profilesPath}。` }));
+  }
+
+  function modelFact(label, value) {
+    return h('div', { class: 'model-fact' },
+      h('span', { class: 'model-fact-label', text: label }),
+      h('span', { class: 'model-fact-value mono', text: value }));
+  }
+
+  function renderModelForm(data) {
+    const current = data.current || {};
+    const preset = MODEL_PROVIDERS.find((item) => item.id === model.provider) || MODEL_PROVIDERS[0];
+
+    const providerSelect = h('select', { class: 'select', id: 'model-provider' },
+      ...MODEL_PROVIDERS.map((item) => h('option', {
+        value: item.id, selected: item.id === model.provider, text: item.label,
+      })));
+    const urlInput = h('input', {
+      class: 'input mono', id: 'model-url', value: current.url || '',
+      placeholder: 'https://api.example.com/v1',
+    });
+    const modelInput = h('input', {
+      class: 'input mono', id: 'model-name', value: current.model_name || '',
+      placeholder: '模型名，例如 deepseek-v4-flash', list: 'model-name-options',
+    });
+    const modelOptions = h('datalist', { id: 'model-name-options' },
+      ...preset.models.map((name) => h('option', { value: name })));
+    const keyInput = h('input', {
+      class: 'input mono', id: 'model-key', type: 'password', autocomplete: 'new-password',
+      placeholder: current.has_key ? '留空 = 沿用现在这把' : '粘贴 API Key（只写不读，后台不回显）',
+    });
+    const visionToggle = h('input', { type: 'checkbox', checked: Boolean(current.supports_vision) });
+    const authToggle = h('input', { type: 'checkbox', checked: current.requires_auth !== false });
+    const thinkingSelect = h('select', { class: 'select' },
+      ...[['disabled', '关闭（推荐：省下的预算留给正文）'], ['auto', '交给服务商默认']]
+        .map(([value, text]) => h('option', { value, selected: current.thinking_mode === value, text })));
+    const wireSelect = h('select', { class: 'select' },
+      ...[['chat_completions', 'Chat Completions（绝大多数）'], ['responses', 'Responses（OpenAI 新协议）']]
+        .map(([value, text]) => h('option', { value, selected: current.wire_api === value, text })));
+    const tokensInput = h('input', {
+      class: 'input mono', type: 'number', min: '128',
+      value: String(current.max_output_tokens || 1200),
+    });
+    const saveAsInput = h('input', {
+      class: 'input', id: 'model-save-as',
+      placeholder: '可选：起个名字存成档案，方便以后一键切回',
+    });
+    const result = h('div', { class: 'model-test', id: 'model-test' });
+    model.testNode = result;
+
+    // 选预设只填"这一家长什么样"，不碰密钥；模型名给候选，也可以手填。
+    providerSelect.addEventListener('change', () => {
+      model.provider = providerSelect.value;
+      const picked = MODEL_PROVIDERS.find((item) => item.id === model.provider);
+      if (!picked) return;
+      if (picked.url) urlInput.value = picked.url;
+      wireSelect.value = picked.wire_api;
+      thinkingSelect.value = picked.thinking_mode;
+      visionToggle.checked = Boolean(picked.supports_vision);
+      authToggle.checked = picked.requires_auth !== false;
+      clear(modelOptions);
+      for (const name of picked.models) modelOptions.append(h('option', { value: name }));
+      if (picked.models.length && !picked.models.includes(modelInput.value)) {
+        modelInput.value = picked.models[0];
+      }
+    });
+
+    const formBody = () => ({
+      url: urlInput.value.trim(),
+      model_name: modelInput.value.trim(),
+      wire_api: wireSelect.value,
+      thinking_mode: thinkingSelect.value,
+      supports_vision: visionToggle.checked,
+      requires_auth: authToggle.checked,
+      max_output_tokens: Number(tokensInput.value) || 0,
+      api_key: keyInput.value,
+    });
+
+    const testButton = h('button', {
+      class: 'btn',
+      text: '测试连接',
+      title: '用表单里的值真发一次最小请求（不会保存）',
+      onclick: async (event) => {
+        const button = event.target;
+        button.disabled = true;
+        button.textContent = '测试中…';
+        try {
+          model.test = await api('/api/model/test', { method: 'POST', body: formBody() });
+        } catch (problem) {
+          model.test = { ok: false, detail: problem.message };
+        }
+        button.disabled = false;
+        button.textContent = '测试连接';
+        renderModelTestResult();
+      },
+    });
+
+    const applyButton = h('button', {
+      class: 'btn primary',
+      text: '应用',
+      title: '写入运行时覆盖配置并立刻生效（不需要重启）',
+      onclick: async () => {
+        const payload = formBody();
+        if (!payload.model_name) { toast('先填模型名', 'bad'); modelInput.focus(); return; }
+        const saveAs = saveAsInput.value.trim();
+        if (saveAs) payload.save_as = saveAs;
+        try {
+          const outcome = await api('/api/model/apply', { method: 'POST', body: payload });
+          toast(outcome.profile_id ? '已应用，并存成档案' : '已应用，立刻生效', 'ok');
+          keyInput.value = '';
+          saveAsInput.value = '';
+          await renderModelPage();
+        } catch (problem) {
+          toast(problem.message, 'bad', 7000);
+        }
+      },
+    });
+
+    return h('div', { class: 'card' },
+      h('div', { class: 'card-head' },
+        h('h3', { text: '换成另一套模型' }),
+        h('div', { class: 'hint', text: '先选服务商，再填密钥；不确定就点一下"测试连接"' })),
+      h('div', { class: 'model-form' },
+        h('label', { class: 'model-field wide' }, h('span', { text: '服务商' }), providerSelect),
+        h('label', { class: 'model-field wide' },
+          h('span', { text: '地址（base_url 或完整地址）' }), urlInput),
+        h('label', { class: 'model-field wide' },
+          h('span', { text: '模型名' }), modelInput, modelOptions),
+        h('label', { class: 'model-field wide' }, h('span', { text: 'API Key' }), keyInput),
+        h('label', { class: 'model-field' }, h('span', { text: '单次最大输出 token' }), tokensInput),
+        h('label', { class: 'model-check' }, visionToggle, ' 主模型能直接看图'),
+        h('label', { class: 'model-check' }, authToggle, ' 需要 Bearer 鉴权'),
+        h('details', { class: 'model-advanced' },
+          h('summary', { text: '高级（协议 / 思考模式）' }),
+          h('div', { class: 'model-form' },
+            h('label', { class: 'model-field' }, h('span', { text: '协议' }), wireSelect),
+            h('label', { class: 'model-field' }, h('span', { text: '思考模式' }), thinkingSelect)))),
+      h('div', { class: 'model-actions' }, testButton, applyButton, saveAsInput),
+      result);
+  }
+
+  function renderModelTestResult() {
+    const node = model.testNode;
+    if (!node) return;
+    clear(node);
+    const outcome = model.test;
+    if (!outcome) return;
+    node.className = `model-test ${outcome.ok ? 'ok' : 'bad'}`;
+    node.append(h('span', { class: 'model-test-badge', text: outcome.ok ? '通了' : '没通' }));
+    node.append(h('span', {
+      text: `${outcome.detail || ''}${outcome.latency_ms ? `（${outcome.latency_ms} ms）` : ''}`,
+    }));
+  }
+
+  function renderModelProfiles(data) {
+    const profiles = (data.profiles && data.profiles.items) || [];
+    const active = data.current || {};
+    const rows = profiles.map((profile) => h('div', { class: 'model-profile' },
+      h('div', { class: 'model-profile-main' },
+        h('div', { class: 'model-profile-label', text: profile.label }),
+        h('div', { class: 'model-profile-sub mono', text: `${profile.model_name || '—'} · ${profile.url || '—'}` })),
+      h('span', {
+        class: `pill ${profile.has_key ? 'ok' : 'bad'}`,
+        text: profile.has_key ? '带密钥' : '无密钥',
+      }),
+      profile.model_name === active.model_name && profile.url === active.url
+        ? h('span', { class: 'pill ok', text: '正在用' })
+        : null,
+      h('button', {
+        class: 'btn small',
+        text: '应用',
+        onclick: async () => {
+          try {
+            await api('/api/model/apply', { method: 'POST', body: { profile_id: profile.id } });
+            toast(`已切到「${profile.label}」`, 'ok');
+            await renderModelPage();
+          } catch (problem) {
+            toast(problem.message, 'bad', 7000);
+          }
+        },
+      }),
+      h('button', {
+        class: 'btn danger small',
+        text: '删除',
+        onclick: async () => {
+          if (!window.confirm(`删除档案「${profile.label}」？（不影响当前生效的配置）`)) return;
+          try {
+            await api(`/api/model/profiles/${encodeURIComponent(profile.id)}`, { method: 'DELETE' });
+            toast('已删除', 'ok');
+          } catch (problem) {
+            toast(problem.message, 'bad');
+          }
+          await renderModelPage();
+        },
+      })));
+
+    return h('div', { class: 'card' },
+      h('div', { class: 'card-head' },
+        h('h3', { text: '模型档案' }),
+        h('div', { class: 'hint', text: '存过的几套端点，一键切回；档案只在你点"应用"时影响她用的模型' })),
+      rows.length
+        ? h('div', { class: 'model-profile-list' }, ...rows)
+        : h('div', { class: 'hint', text: '还没有档案。填好之后在最下面那个输入框里起个名字再点"应用"，就会存成一套。' }));
   }
 
   // ───────────────────────────── 表情包 ─────────────────────────────

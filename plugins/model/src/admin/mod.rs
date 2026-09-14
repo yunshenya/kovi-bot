@@ -18,6 +18,8 @@ mod assets;
 mod auth;
 mod config_api;
 mod memory_api;
+mod model_api;
+mod model_profiles;
 mod status_api;
 mod sticker_api;
 mod token;
@@ -236,6 +238,13 @@ pub(crate) fn spawn(config: &AdminConfig, bot: Option<Arc<RuntimeBot>>) {
         Err(error) => eprintln!("[WARN] 数据标注目录不可用: {}", error.message),
     }
 
+    // 运行时覆盖配置可能装着 `server.api_key` 这类密钥（后台的模型页会往里写），
+    // 历史版本可能以更宽的权限留下过它，启动时统一收紧到 0600。
+    let tightened = config_api::tighten_private_config_permissions();
+    if tightened > 0 {
+        println!("[INFO] 运行时覆盖配置已收紧到 0600（{tightened} 个文件）");
+    }
+
     kovi::tokio::spawn(async move {
         let listener = match kovi::tokio::net::TcpListener::bind(address).await {
             Ok(listener) => listener,
@@ -384,6 +393,13 @@ pub(crate) fn router(state: Arc<AdminState>) -> Router {
         .route(
             "/api/stickers/file/{name}",
             get(sticker_api::download).delete(sticker_api::remove),
+        )
+        .route("/api/model", get(model_api::state))
+        .route("/api/model/apply", post(model_api::apply))
+        .route("/api/model/test", post(model_api::test))
+        .route(
+            "/api/model/profiles/{id}",
+            axum::routing::delete(model_api::remove_profile),
         )
         .layer(axum::middleware::from_fn_with_state(
             Arc::clone(&state),

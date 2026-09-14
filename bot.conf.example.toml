@@ -13,7 +13,15 @@ url = "https://api.example.com/v1/responses"
 model_name = "your-model-name"
 wire_api = "responses"
 supports_vision = true
+# 主模型密钥从哪来：填了下面的 api_key 就直接用它，否则读这个环境变量。
 api_key_env = "OPENAI_API_KEY"
+# 主模型 API Key。留空表示不在这里写，走上面的环境变量。
+#
+# 想换密钥但不想 SSH 改 systemd 环境时，就用管理后台的「模型」页填：那里写的是运行时
+# 覆盖配置（bot.conf.override.toml，权限 0600、跨发布保留），保存即生效、不用重启；
+# 也可以在那一页选服务商预设、一键切换模型并测试连通性。
+# **不要把它提交进仓库**——主配置是发布物。
+api_key = ""
 requires_auth = true
 actor_authorization = ""
 thinking_mode = "auto"
