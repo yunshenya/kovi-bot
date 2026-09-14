@@ -426,7 +426,16 @@ revision 只是本地 SHA——万一这台 Mac 出问题，这个已上线的�
 
 ---
 
-## 七、两点说明
+## 七、第三批修复（真 bug，我建议优先的两条）
+
+| 提交 | 问题 |
+| --- | --- |
+| `586e7f6` `bf564e8` | **命令型传感器死锁在自己的管道上**（`world_sensors.rs`）：两个管道都 piped，却只在 `try_wait()` 报退出之后才读——子进程写满缓冲区（Linux 64 KiB / macOS 16 KiB）就阻塞在 `write()`、永不退出，于是无论命令多快都走超时分支，**这类传感器根本不可能成功**；而 `should_feed_core` 会把那次 `ok=false` 当成状态变化，每次轮询写一条**假的**持久世界事实 + open loop。改成读线程与等待并发排空，顺带把输出封顶 1 MiB（超限后继续读、只是不保留）。同处的 `read_to_string` + 丢弃错误也会把"命令成功但输出含二进制"判成不匹配，改成 lossy 解码。实测 `seq 1 40000`（约 240 KB）：修前正是 `命令超时（>10s）`，修后 0.06 秒通过。`bf564e8` 是搬走读取后遗留的未使用 import（CI 是 `-D warnings`，会打红；我上一条命令没看退出码就提交了，已补正）。 |
+| `09aa5d1` | **插话在途标记被永久漏掉**（`group.rs`）：`reserve_interjection_decision` 占住 `interjection_in_flight` 后靠调用方记得手写 `finish`，而中间多条早退（语义过期、纯图片、额度不够、排队）会漏——那个群就永久停在"有插话在途"，`reserve` 从此返回 false 且 prune 刻意保留在途项，于是**这个群再也不会主动插话，直到进程重启**，而被点名的回复照常，外面看不出异常。改成 RAII 凭据：显式 `complete(replied)`，否则 Drop 兜底（tokio Mutex 不能在 Drop 里 await，故交给运行时 spawn，与 `IncomingAdmissionGuard` 同一手法）。返回类型 `bool → Option<InterjectionAttempt>` 让编译器把 6 个使用点全找出来，比人眼找早退路径可靠。 |
+
+---
+
+## 八、两点说明
 
 1. 上面第三、四节的条目里，标了具体行号的都经过至少一次源码复核；但除了
    「一、已修」、1.5 以及 2.1/2.4（均已在本地 PostgreSQL 上复现并落成回归测试，
