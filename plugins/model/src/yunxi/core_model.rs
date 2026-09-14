@@ -4835,6 +4835,31 @@ fn reply_expected_for_incoming(input: &PlannerInput) -> bool {
     )
 }
 
+/// 这一轮可见回复要不要建立对话焦点（群聊、真的产出正文、知道说话人是谁）。
+///
+/// 说话人 QQ 号必须由调用方**提前取好**传进来。`IncomingAdmissionReleaseGuard`
+/// 在中途会 `disarm()`（放弃 admission 所有权），之后再调 `guard.context()`
+/// 会 panic——线上 2026-09-14 15:11 的事故正是这个晚读：群聊回复已经生成，
+/// 投递前整轮 panic 丢掉，用户只看到"她不回我"。取不到就宁可不建焦点。
+fn conversation_focus_target(
+    message: Option<&yunxi_core::MessageReceivedEvent>,
+    conversation: QqConversation,
+    sender_user_id: Option<i64>,
+    has_visible_text: bool,
+) -> Option<(i64, i64)> {
+    if !has_visible_text {
+        return None;
+    }
+    let message = message?;
+    if message.conversation_kind != ConversationKind::Group {
+        return None;
+    }
+    let QqConversation::Group { group_id } = conversation else {
+        return None;
+    };
+    Some((group_id, sender_user_id?))
+}
+
 fn reply_recovery_required(input: &PlannerInput, tool_follow_up: bool) -> bool {
     reply_expected_for_incoming(input) || tool_follow_up
 }
@@ -5388,6 +5413,13 @@ impl ModelBackend for KoviModelBackend {
             }
             // 静默门控与上面几个否决同层：都在模型调用之前，判定也都不依赖
             // 这一轮的正文。默认只打影子日志，`silence.enabled` 打开才真的不接。
+            // 说话人的 QQ 号与"是不是管理员"在同一处取：`disarm()` 之后 guard 里
+            // 的上下文会被清空（它只负责放弃 admission 所有权），晚读会 panic。
+            // 线上 2026-09-14 15:11 就是这么炸的——群聊回复已经生成，投递前
+            // panic，整轮丢掉，用户看到的是"她不回我"。
+            let sender_user_id = incoming_guard
+                .as_ref()
+                .map(|guard| guard.context().sender_user_id);
             let sender_is_admin = incoming_guard
                 .as_ref()
                 .is_some_and(|guard| guard.context().sender_is_admin);
@@ -6877,13 +6909,12 @@ impl ModelBackend for KoviModelBackend {
             // 她可见回复了群里的某人 → 记下"对话焦点"：接下来的未点名消息里，
             // 由这个人接着说的那些算接续（可以回、用接续档间隔、并且会合批）。
             // 只有真的产出可见正文的回合才建立对话，沉默回合不算。
-            if core_plan_has_visible_text(&plan)
-                && let Some(group_message) = message
-                && group_message.conversation_kind == ConversationKind::Group
-                && let QqConversation::Group { group_id } = conversation
-                && let Some(guard) = incoming_guard.as_ref()
-            {
-                let partner_user_id = guard.context().sender_user_id;
+            if let Some((group_id, partner_user_id)) = conversation_focus_target(
+                message,
+                conversation,
+                sender_user_id,
+                core_plan_has_visible_text(&plan),
+            ) {
                 crate::model::note_group_conversation_focus(group_id, partner_user_id).await;
                 // 焦点是接续链路的起点：这行让"她跟谁在对话、什么时候开始"
                 // 在日志里可查，否则只能从后面的合批行反推。
@@ -7122,34 +7153,35 @@ mod tests {
         autonomous_conversation_protocol, autonomous_empty_generation_plan,
         autonomous_generation_failure_plan, baseline_disposition, batch_fence_action_key,
         build_bounded_intrinsic_reply_batch, classify_persistent_person_identity,
-        constrain_autonomous_tick_plan, conversation_id_for_log, core_message_prompt,
-        core_plain_turn_instruction, core_plan_has_visible_text, core_reply_bubbles_with_max,
-        core_tool_protocol_diagnostic, default_autonomous_directive, defer_unroutable_due,
-        deterministic_route_fallback, due_reply_target, eligible_mind_candidates,
-        explicit_message_batch_needs_repair, explicit_message_count_for_event,
-        explicit_message_count_for_input, explicit_message_count_instruction,
-        first_person_turn_avoidance, group_reply_gap_secs_for, interaction_state_updates_with_cues,
-        intrinsic_autonomous_intent_prompt, intrinsic_fallback_is_eligible,
-        intrinsic_output_is_unsafe, intrinsic_prompt, is_ambient_group_message,
-        is_plain_text_batch_data_context, keeps_existing_prepared_plan, message_id_for_log,
-        mind_context_messages, mind_outgoing_fence_required, parse_autonomous_intent_response,
-        parse_core_response, parse_direct_repair_output, parse_intrinsic_autonomous_directive,
-        parse_plain_core_response, parse_qq_conversation, plain_text_batch_message_prompt,
-        plain_text_batch_repair_context, pre_model_plan, prepared_outgoing_semantic_context,
-        purge_group_routes_from_cache, recent_conversation_messages,
-        recent_direct_conversation_messages, recent_group_conversation_messages,
-        refine_core_incoming, register_core_tool_intents, repair_context_messages,
-        reply_asks_something, reply_expected_for_incoming, reply_looks_complete,
-        reply_recovery_required, reply_text_has_semantic_content, reply_text_is_too_thin,
-        requested_message_count, route_from_lookup, route_lookup_with_fallback,
-        safe_single_structured_reply_message, safe_structured_reply_batch,
-        sanitize_autonomous_intrinsic_output, sanitize_intrinsic_output,
-        sanitize_plain_text_batch_message, select_host_model_route_from_capability,
-        serialize_intrinsic_reply_batch, shadow_projection_for_completed_plan, silence_gate_plan,
-        silence_verdict, silent_wait_plan, split_core_speech_markers, split_two_short_lines,
-        strip_core_speech_markers, strong_reply_repair_needed, tool_calls_allowed_for_turn,
-        tool_protocol_authorized_for_turn, visible_reply_intent, visible_reply_intents,
-        visible_reply_invites_continuation, visible_reply_state_updates, visible_turn_continuation,
+        constrain_autonomous_tick_plan, conversation_focus_target, conversation_id_for_log,
+        core_message_prompt, core_plain_turn_instruction, core_plan_has_visible_text,
+        core_reply_bubbles_with_max, core_tool_protocol_diagnostic, default_autonomous_directive,
+        defer_unroutable_due, deterministic_route_fallback, due_reply_target,
+        eligible_mind_candidates, explicit_message_batch_needs_repair,
+        explicit_message_count_for_event, explicit_message_count_for_input,
+        explicit_message_count_instruction, first_person_turn_avoidance, group_reply_gap_secs_for,
+        interaction_state_updates_with_cues, intrinsic_autonomous_intent_prompt,
+        intrinsic_fallback_is_eligible, intrinsic_output_is_unsafe, intrinsic_prompt,
+        is_ambient_group_message, is_plain_text_batch_data_context, keeps_existing_prepared_plan,
+        message_id_for_log, mind_context_messages, mind_outgoing_fence_required,
+        parse_autonomous_intent_response, parse_core_response, parse_direct_repair_output,
+        parse_intrinsic_autonomous_directive, parse_plain_core_response, parse_qq_conversation,
+        plain_text_batch_message_prompt, plain_text_batch_repair_context, pre_model_plan,
+        prepared_outgoing_semantic_context, purge_group_routes_from_cache,
+        recent_conversation_messages, recent_direct_conversation_messages,
+        recent_group_conversation_messages, refine_core_incoming, register_core_tool_intents,
+        repair_context_messages, reply_asks_something, reply_expected_for_incoming,
+        reply_looks_complete, reply_recovery_required, reply_text_has_semantic_content,
+        reply_text_is_too_thin, requested_message_count, route_from_lookup,
+        route_lookup_with_fallback, safe_single_structured_reply_message,
+        safe_structured_reply_batch, sanitize_autonomous_intrinsic_output,
+        sanitize_intrinsic_output, sanitize_plain_text_batch_message,
+        select_host_model_route_from_capability, serialize_intrinsic_reply_batch,
+        shadow_projection_for_completed_plan, silence_gate_plan, silence_verdict, silent_wait_plan,
+        split_core_speech_markers, split_two_short_lines, strip_core_speech_markers,
+        strong_reply_repair_needed, tool_calls_allowed_for_turn, tool_protocol_authorized_for_turn,
+        visible_reply_intent, visible_reply_intents, visible_reply_invites_continuation,
+        visible_reply_state_updates, visible_turn_continuation,
     };
     use crate::model::{
         BotMemory, ConversationCoordinator, IncomingTurnImpact, OutgoingExecutiveDecision,
@@ -7799,6 +7831,43 @@ mod tests {
         };
         assert_eq!(group_reply_gap_secs_for(message), group.reply_gap_secs());
         assert!(is_ambient_group_message(message));
+    }
+
+    /// 焦点只在她"真的在群里回了某人"时建立；说话人取不到就不建（宁可不建，
+    /// 也不能去读已经被 `disarm()` 的 guard——那会 panic 掉整轮回复）。
+    #[test]
+    fn conversation_focus_target_requires_a_visible_group_reply_and_a_known_speaker() {
+        let group = group_message_input(true);
+        let WorldEventKind::MessageReceived(message) = group.event.kind() else {
+            panic!("group fixture must be a received message");
+        };
+        let conversation = QqConversation::Group {
+            group_id: 641_996_763,
+        };
+        assert_eq!(
+            conversation_focus_target(Some(message), conversation, Some(3_052_405_886), true),
+            Some((641_996_763, 3_052_405_886))
+        );
+        // 沉默回合不建立对话。
+        assert_eq!(
+            conversation_focus_target(Some(message), conversation, Some(3_052_405_886), false),
+            None
+        );
+        // 说话人未知（例如晚读了已 disarm 的 guard）：不建，也不 panic。
+        assert_eq!(
+            conversation_focus_target(Some(message), conversation, None, true),
+            None
+        );
+        // 私聊没有"群聊焦点"这回事。
+        assert_eq!(
+            conversation_focus_target(
+                Some(message),
+                QqConversation::Private { user_id: 1 },
+                Some(3_052_405_886),
+                true
+            ),
+            None
+        );
     }
 
     #[test]
