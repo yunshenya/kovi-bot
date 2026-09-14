@@ -10,6 +10,8 @@ use thiserror::Error;
 pub const MAX_MESSAGE_CONTENT_BYTES: usize = 32 * 1_024;
 pub const MAX_MESSAGE_CONTENT_CHARS: usize = 8_192;
 pub const MAX_MESSAGE_ATTACHMENTS: usize = 16;
+/// 表情包标签是素材库的键，不是路径也不是 URL；这个上限只用来挡住模型胡写。
+pub const MAX_STICKER_LABEL_CHARS: usize = 64;
 pub const MAX_ATTACHMENT_REFERENCE_BYTES: usize = 4 * 1_024;
 pub const MAX_ATTACHMENT_REFERENCE_CHARS: usize = 2 * 1_024;
 pub const MAX_ATTACHMENT_MEDIA_TYPE_BYTES: usize = 256;
@@ -272,6 +274,17 @@ pub struct MessageContent {
     /// text instead. Singing implies spoken delivery, so `voice` stays false.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sing: Option<String>,
+    /// Delivery hint: attach a sticker from the host's own asset library,
+    /// identified by its label (e.g. `无语又想笑`).
+    ///
+    /// The core owns *what* to express, the host owns *which* file that label
+    /// maps to and how the platform carries it. A host without a sticker
+    /// library ignores the hint and sends `text` alone, so the field stays
+    /// optional and backwards compatible. The label is a reference, never a
+    /// path or a URL: the library is host-owned and never accepts model-chosen
+    /// files. `text` may be empty — a sticker on its own is a complete reply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sticker: Option<String>,
 }
 
 impl Default for MessageContent {
@@ -288,6 +301,7 @@ impl MessageContent {
             attachments: Vec::new(),
             voice: false,
             sing: None,
+            sticker: None,
         }
     }
 
@@ -300,6 +314,7 @@ impl MessageContent {
             attachments: Vec::new(),
             voice: true,
             sing: None,
+            sticker: None,
         }
     }
 
@@ -313,6 +328,21 @@ impl MessageContent {
             attachments: Vec::new(),
             voice: false,
             sing: Some(template.into()),
+            sticker: None,
+        }
+    }
+
+    /// Same as [`Self::text`], but asks the host to attach the sticker it
+    /// keeps under `label`. Hosts without a sticker library fall back to
+    /// sending the text alone; `value` may be empty for a sticker-only reply.
+    #[must_use]
+    pub fn sticker(value: impl Into<String>, label: impl Into<String>) -> Self {
+        Self {
+            text: value.into(),
+            attachments: Vec::new(),
+            voice: false,
+            sing: None,
+            sticker: Some(label.into()),
         }
     }
 
@@ -320,6 +350,12 @@ impl MessageContent {
     #[must_use]
     pub fn sing_template(&self) -> Option<&str> {
         self.sing.as_deref()
+    }
+
+    /// The host-side sticker label this content asks for, when it asks for one.
+    #[must_use]
+    pub fn sticker_label(&self) -> Option<&str> {
+        self.sticker.as_deref()
     }
 
     #[must_use]
@@ -355,6 +391,16 @@ impl MessageContent {
         if self.voice {
             return format!("[语音] {text}");
         }
+        if let Some(label) = &self.sticker {
+            // 只带表情包、没有正文的回合最容易被记成"她什么都没说"：这里必须留下
+            // 痕迹，否则下一轮她会以为上一个回合是空的。
+            let marker = format!("[表情包] {label}");
+            return if text.trim().is_empty() {
+                marker
+            } else {
+                format!("{marker} {text}")
+            };
+        }
         text.to_owned()
     }
 
@@ -374,10 +420,13 @@ impl MessageContent {
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.text.trim().is_empty() && self.attachments.is_empty()
+        self.text.trim().is_empty() && self.attachments.is_empty() && self.sticker.is_none()
     }
 
     pub fn validate(&self) -> Result<(), MessageValidationError> {
+        if let Some(label) = &self.sticker {
+            validate_sticker_label(label)?;
+        }
         if self.text.contains('\0') {
             return Err(MessageValidationError::TextContainsNul);
         }
@@ -422,6 +471,8 @@ impl<'de> Deserialize<'de> for MessageContent {
             voice: bool,
             #[serde(default)]
             sing: Option<String>,
+            #[serde(default)]
+            sticker: Option<String>,
         }
 
         let wire = Wire::deserialize(deserializer)?;
@@ -430,6 +481,8 @@ impl<'de> Deserialize<'de> for MessageContent {
             .map_err(serde::de::Error::custom)?;
         content.voice = wire.voice;
         content.sing = wire.sing;
+        content.sticker = wire.sticker;
+        content.validate().map_err(serde::de::Error::custom)?;
         Ok(content)
     }
 }
@@ -532,6 +585,29 @@ pub enum MessageValidationError {
         length: usize,
         maximum: usize,
     },
+    #[error("sticker label is invalid: {reason}")]
+    InvalidStickerLabel { reason: &'static str },
+}
+
+/// 标签必须是宿主素材库里真实存在的键的形状：非空、单行、有界。
+///
+/// 这里不做"标签是否真的存在"的判断——那是宿主的素材库说了算；core 只保证不会把
+/// 一个畸形字符串（换行、控制字符、超长文本）当成投递提示传下去。
+fn validate_sticker_label(label: &str) -> Result<(), MessageValidationError> {
+    let trimmed = label.trim();
+    if trimmed.is_empty() {
+        return Err(MessageValidationError::InvalidStickerLabel { reason: "empty" });
+    }
+    if trimmed.chars().any(char::is_control) {
+        return Err(MessageValidationError::InvalidStickerLabel {
+            reason: "control_character",
+        });
+    }
+    let chars = trimmed.chars().count();
+    if chars > MAX_STICKER_LABEL_CHARS {
+        return Err(MessageValidationError::InvalidStickerLabel { reason: "too_long" });
+    }
+    Ok(())
 }
 
 fn validate_required_attachment_field(
@@ -1341,6 +1417,62 @@ mod tests {
         assert_eq!(MessageContent::sing("词", "t").as_text(), "词");
         assert!(MessageContent::voice("词").is_voice());
         assert!(MessageContent::sing("词", "t").is_sing());
+    }
+
+    /// 表情包同样是"怎么说的"：只发一张表情、没有正文时，历史里绝不能是一片空白。
+    #[test]
+    fn history_text_keeps_a_sticker_only_reply_visible() {
+        assert_eq!(
+            MessageContent::sticker("", "无语又想笑").history_text(),
+            "[表情包] 无语又想笑"
+        );
+        assert_eq!(
+            MessageContent::sticker("我也是", "无语又想笑").history_text(),
+            "[表情包] 无语又想笑 我也是"
+        );
+        assert_eq!(
+            MessageContent::sticker("", "无语又想笑").sticker_label(),
+            Some("无语又想笑")
+        );
+        assert_eq!(MessageContent::text("没有表情").sticker_label(), None);
+    }
+
+    /// 只带表情包的内容不是空内容，否则宿主会把它当成"没有可见回复"整轮丢掉。
+    #[test]
+    fn sticker_only_content_is_not_empty() {
+        assert!(MessageContent::text("   ").is_empty());
+        assert!(!MessageContent::sticker("   ", "开心").is_empty());
+    }
+
+    #[test]
+    fn sticker_labels_are_bounded_and_single_line() {
+        assert!(MessageContent::sticker("", "开心").validate().is_ok());
+        assert!(MessageContent::sticker("", "   ").validate().is_err());
+        assert!(
+            MessageContent::sticker("", "开心\n第二行")
+                .validate()
+                .is_err()
+        );
+        let too_long = "开".repeat(super::MAX_STICKER_LABEL_CHARS + 1);
+        assert!(MessageContent::sticker("", too_long).validate().is_err());
+    }
+
+    /// 旧版宿主写下的、没有 sticker 字段的载荷必须照旧读得进来。
+    #[test]
+    fn sticker_hint_round_trips_and_stays_optional() {
+        let with_sticker = MessageContent::sticker("在的", "开心");
+        let encoded = serde_json::to_value(&with_sticker).expect("应能序列化");
+        assert_eq!(encoded["sticker"], serde_json::json!("开心"));
+        let decoded: MessageContent = serde_json::from_value(encoded).expect("应能反序列化");
+        assert_eq!(decoded, with_sticker);
+
+        let plain = MessageContent::text("只有正文");
+        let encoded = serde_json::to_value(&plain).expect("应能序列化");
+        assert!(encoded.get("sticker").is_none());
+        let decoded: MessageContent =
+            serde_json::from_value(serde_json::json!({"text": "只有正文"}))
+                .expect("旧载荷应能反序列化");
+        assert_eq!(decoded, plain);
     }
 
     use super::{

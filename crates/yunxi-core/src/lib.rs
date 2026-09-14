@@ -54,7 +54,7 @@ pub use delivery::{
 pub use event::{
     ActionFailedEvent, ActionRejectedEvent, ActionSucceededEvent, Attachment, AttachmentKind,
     AutonomousConversationTickEvent, EventPriority, EventScope, EventType, EventValidationError,
-    GoalCompletedEvent, GoalUpdatedEvent, InteractionCuesObservedEvent,
+    GoalCompletedEvent, GoalUpdatedEvent, InteractionCuesObservedEvent, MAX_STICKER_LABEL_CHARS,
     MAX_TOOL_ERROR_DETAIL_BYTES, MAX_TOOL_ERROR_DETAIL_CHARS, MAX_TOOL_RESULT_BYTES,
     MAX_TOOL_RESULT_CHARS, Message, MessageCollisionDetectedEvent, MessageContent,
     MessageReceivedEvent, MessageSentEvent, MessageValidationError, ProspectiveMemoryEvent,
