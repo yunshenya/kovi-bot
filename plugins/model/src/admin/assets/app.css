@@ -2002,6 +2002,9 @@ mark {
   gap: 14px;
   align-items: end;
 }
+/* 弹窗里的表单：字段比别处长，给最后一行留点余量。 */
+.model-form-body .model-form { margin-bottom: 4px; }
+.model-form-body .model-test { margin-top: 14px; }
 .model-field { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
 .model-field.wide { grid-column: 1 / -1; }
 .model-field > span { color: var(--text-dim); font-size: 12.5px; font-weight: 500; }
@@ -2121,30 +2124,6 @@ mark {
   white-space: nowrap;
 }
 .provider-actions { display: flex; align-items: center; gap: 6px; flex: none; }
-
-/* 「新增 / 编辑」那张表单：有档案时默认折起来，只占一行。 */
-.model-form-card { scroll-margin-top: 16px; }
-.model-form-card > summary {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  margin-bottom: 0;
-  list-style: none;
-  cursor: pointer;
-}
-.model-form-card > summary::-webkit-details-marker { display: none; }
-.model-form-card > summary::after {
-  content: "";
-  width: 7px; height: 7px;
-  border-right: 1.6px solid var(--text-faint);
-  border-bottom: 1.6px solid var(--text-faint);
-  transform: rotate(45deg);
-  transition: transform var(--dur) var(--ease-out);
-  flex: none;
-}
-.model-form-card[open] > summary { margin-bottom: 14px; }
-.model-form-card[open] > summary::after { transform: rotate(-135deg); }
 
 @media (max-width: 760px) {
   .provider-card { align-items: flex-start; }
