@@ -354,7 +354,31 @@ PG `max_connections=100` 与整机余量定夺）、`plugins/model/src/yunxi/mem
 
 ---
 
-## 五、两点说明
+## 五、上线记录（2026-09-14）
+
+**部署前**：生产 revision `f272a49`，`bot.conf.toml` 里 `[world_model] enabled = true`、
+`reply_context = "active"`。也就是说世界模型**在生产是开着的**——2.1（擦除被 30 秒后的
+持久化写回）、2.2（账本条目没删）、2.3（撞名误删他人相处结论）以及 `list_gag` 的类型
+panic（`#账本` / 私聊账本上下文注入）**都是已上线的真实缺陷**，不是潜伏坑。
+
+顺带一个由错注释直接造成的运维后果：生产那份配置里 `enabled` 上面写着
+"2026-09-12 改为 false。这个开关在当前代码里**只影响两处文案**……"——有人是**相信了那句
+错注释**才去动这个开关的。注释本身已于 `b18f6d1` 改正，不会再误导下一次。
+
+**部署**：`scripts/deploy-local.sh --require-clean`，revision
+`6b7778fe74c59f28077bc6ec5efab4d36ce4ec2a`，服务端原子切换 + readiness 通过，
+重启后 0 条 WARN/ERROR；启动行确认 `World Model v4 已启用（shadow_mode=false）`。
+本次发布连同并行那条线（silence / admin UI）一起上线，因为生产原本就跑在
+`f272a49`（同一条线的提交）。
+
+**遗留的操作性风险**（未处理，留给你决定）：这个 revision **不在远端**
+（`origin/main` 仍是 `407e1ff`）。按你的规则我没有 push，但本地发布通道只上传二进制、
+revision 只是本地 SHA——万一这台 Mac 出问题，这个已上线的版本在远端无法复现，也就没法
+按 SHA 回滚。想闭合的话：push 一次，或下次改用 GitHub Actions 手动 dispatch。
+
+---
+
+## 六、两点说明
 
 1. 上面第三、四节的条目里，标了具体行号的都经过至少一次源码复核；但除了
    「一、已修」、1.5 以及 2.1/2.4（均已在本地 PostgreSQL 上复现并落成回归测试，
