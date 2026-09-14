@@ -177,6 +177,8 @@ impl Addressing {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct GroupSenderIdentity {
+    /// 稳定身份：记忆与历史里认人靠它。
+    user_id: i64,
     qq_nickname: String,
     group_card: Option<String>,
 }
@@ -184,6 +186,7 @@ struct GroupSenderIdentity {
 impl GroupSenderIdentity {
     fn from_event(event: &GroupMsgEvent) -> Self {
         Self {
+            user_id: event.user_id,
             qq_nickname: normalized_sender_name(event.sender.nickname.as_deref())
                 .unwrap_or_else(|| "未设置昵称".to_string()),
             group_card: normalized_sender_name(event.sender.card.as_deref()),
@@ -194,8 +197,18 @@ impl GroupSenderIdentity {
         self.group_card.as_deref().unwrap_or(&self.qq_nickname)
     }
 
+    /// 记忆与提示词里怎么标这条消息的说话人。
+    ///
+    /// **QQ 号在前、称呼只是显示**：群名片可以随时改、也可以被别人改成一样，
+    /// 只记称呼的话"某某说过什么"会张冠李戴，事后无从分辨（用户 2026-09-14
+    /// 明确要求：认人要用 QQ 号，不许用昵称查）。
     fn model_sender(&self, time: &str) -> String {
-        format!("[{}] 群成员称呼={}", time, json!(self.display_name()))
+        format!(
+            "[{}] 群成员 QQ={} 称呼={}",
+            time,
+            self.user_id,
+            json!(self.display_name())
+        )
     }
 
     fn reply_target_label(&self) -> String {
@@ -3148,14 +3161,17 @@ mod tests {
     #[test]
     fn group_identity_keeps_card_and_qq_nickname_separate() {
         let identity = GroupSenderIdentity {
+            user_id: 123_456_789,
             qq_nickname: "QQ用户名".to_string(),
             group_card: Some("群内昵称".to_string()),
         };
         assert_eq!(identity.display_name(), "群内昵称");
         let sender = identity.model_sender("12:34:56");
+        // 称呼用于显示，**身份必须带 QQ 号**：两个人可以把群名片改成同一个，
+        // 只靠称呼认人会把记忆张冠李戴（用户 2026-09-14 的要求）。
         assert!(sender.contains("群内昵称"));
+        assert!(sender.contains("QQ=123456789"));
         assert!(!sender.contains("QQ用户名"));
-        assert!(!sender.contains("123"));
         assert_eq!(identity.reply_target_label(), "群内昵称");
     }
 

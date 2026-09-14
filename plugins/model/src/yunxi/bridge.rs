@@ -3737,6 +3737,7 @@ fn stash_pending_memory_line(
         ConversationAddress::Group { .. } => (
             yunxi_core::MemoryScope::Conversation(conversation_id),
             super::memory_writeback::group_inbound_line(
+                message.sender_user_id,
                 &message.sender_label,
                 &message.text,
                 message.timestamp,
@@ -3744,7 +3745,11 @@ fn stash_pending_memory_line(
         ),
         ConversationAddress::Direct { .. } => (
             yunxi_core::MemoryScope::Person(person_id),
-            super::memory_writeback::private_inbound_line(&message.sender_label, &message.text),
+            super::memory_writeback::private_inbound_line(
+                message.sender_user_id,
+                &message.sender_label,
+                &message.text,
+            ),
         ),
     };
     writeback.stash_inbound(

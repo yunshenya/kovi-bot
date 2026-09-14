@@ -297,21 +297,33 @@ pub(crate) fn writeback() -> Option<Arc<MemoryWriteback>> {
 }
 
 /// 群聊入站行，与 V1 的 `group_chat` 语料同形：
-/// `[HH:MM:SS] 群成员称呼="<称呼>": <正文>`（时间按本机时区渲染，与 V1 一致）。
-pub(crate) fn group_inbound_line(sender_label: &str, text: &str, at: DateTime<Utc>) -> String {
+/// `[HH:MM:SS] 群成员 QQ=<号码> 称呼="<称呼>": <正文>`（时间按本机时区渲染）。
+///
+/// **身份以 QQ 号为准，称呼只是显示**：群名片/昵称可以随时改，也可以两个人改成
+/// 一模一样——只记称呼的话，长期记忆里"某某说过什么"会张冠李戴，而且事后无法
+/// 分辨。号是稳定的，所以两样都写，读的人（模型）也能对得上。
+pub(crate) fn group_inbound_line(
+    user_id: i64,
+    sender_label: &str,
+    text: &str,
+    at: DateTime<Utc>,
+) -> String {
     format!(
-        "[{}] 群成员称呼={}: {}",
+        "[{}] 群成员 QQ={} 称呼={}: {}",
         at.with_timezone(&Local).format("%H:%M:%S"),
+        user_id,
         serde_json::Value::String(sender_label.trim().to_string()),
         bounded_text(text)
     )
 }
 
 /// 私聊入站行，与 V1 的 `private_chat` 语料同形（同一份 JSON 形状）。
-pub(crate) fn private_inbound_line(nickname: &str, text: &str) -> String {
+///
+/// 与群聊同一条原则：QQ 号是身份，昵称只是显示（改个昵称不该变成"另一个人"）。
+pub(crate) fn private_inbound_line(user_id: i64, nickname: &str, text: &str) -> String {
     serde_json::json!({
         "消息类型": "私聊",
-        "发送者": { "QQ昵称": nickname.trim() },
+        "发送者": { "QQ号": user_id, "QQ昵称": nickname.trim() },
         "正文": bounded_text(text),
     })
     .to_string()
@@ -544,19 +556,25 @@ mod tests {
 
     #[test]
     fn group_lines_match_the_legacy_corpus_shape() {
-        let line = group_inbound_line("月月（叉腰！）", " 竟然知道村八分嘛 ", at(18, 54));
+        let line = group_inbound_line(
+            2_503_880_869,
+            "月月（叉腰！）",
+            " 竟然知道村八分嘛 ",
+            at(18, 54),
+        );
         assert_eq!(
             line,
-            "[18:54:00] 群成员称呼=\"月月（叉腰！）\": 竟然知道村八分嘛"
+            "[18:54:00] 群成员 QQ=2503880869 称呼=\"月月（叉腰！）\": 竟然知道村八分嘛"
         );
     }
 
     #[test]
     fn private_lines_keep_the_json_shape_and_strip_padding() {
-        let line = private_inbound_line("云深不知处", " speak English ");
+        let line = private_inbound_line(3_052_405_886, "云深不知处", " speak English ");
         let value: serde_json::Value = serde_json::from_str(&line).expect("应是 JSON");
         assert_eq!(value["消息类型"], "私聊");
         assert_eq!(value["发送者"]["QQ昵称"], "云深不知处");
+        assert_eq!(value["发送者"]["QQ号"], 3_052_405_886_i64);
         assert_eq!(value["正文"], "speak English");
     }
 
@@ -582,10 +600,10 @@ mod tests {
     #[test]
     fn over_long_text_is_truncated_before_rendering() {
         let long = "芸".repeat(MAX_TEXT_CHARS + 500);
-        let group = group_inbound_line("某人", &long, at(9, 0));
+        let group = group_inbound_line(1_234_567, "某人", &long, at(9, 0));
         assert_eq!(group.matches('芸').count(), MAX_TEXT_CHARS);
 
-        let private = private_inbound_line("某人", &long);
+        let private = private_inbound_line(1_234_567, "某人", &long);
         let value: serde_json::Value = serde_json::from_str(&private).expect("截断后仍是合法 JSON");
         assert_eq!(
             value["正文"].as_str().expect("正文").chars().count(),
@@ -595,8 +613,8 @@ mod tests {
         // 最坏情况（正文全是需要转义的引号与换行）也要留在记忆的字节限额内。
         let hostile = "\"\\\n".repeat(MAX_TEXT_CHARS);
         for line in [
-            group_inbound_line("某人", &hostile, at(9, 0)),
-            private_inbound_line("某人", &hostile),
+            group_inbound_line(1_234_567, "某人", &hostile, at(9, 0)),
+            private_inbound_line(1_234_567, "某人", &hostile),
             reply_line(&hostile),
         ] {
             assert!(
