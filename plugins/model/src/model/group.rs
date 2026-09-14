@@ -1071,9 +1071,10 @@ pub(crate) async fn group_message_event_after_ingress(
         true
     } else {
         // `primary_reply_expected` 就是「被点名/被引用/显式请求」这一类，走点名额度。
-        match reserve_group_chat_reply_slot(group_id, addressed_gap_secs, primary_reply_expected)
-            .await
-        {
+        // 管理员点名那一档额度也豁免（间隔早就豁免了）：他的话是明确指令，
+        // 不该被"她刚刚聊得很热闹"静默丢掉。未点名的自动接话仍按普通额度收着。
+        let budget_class = reply_budget_class(primary_reply_expected, sender_is_admin);
+        match reserve_group_chat_reply_slot(group_id, addressed_gap_secs, budget_class).await {
             Some(at) => {
                 group_reply_slot = Some(at);
                 true
@@ -1827,15 +1828,24 @@ pub(crate) fn conversation_continuation_active_now(group_id: i64) -> bool {
 pub(crate) async fn reserve_group_chat_reply_slot(
     group_id: i64,
     gap_secs: u64,
-    addressed: bool,
+    class: ReplyBudgetClass,
 ) -> Option<Instant> {
     let limits = ReplyBudgetLimits::from_config();
     let mut states = GROUP_INTERJECTION_STATE.lock().await;
     prune_interjection_states(&mut states);
     let state = states.entry(group_id).or_default();
     let now = Instant::now();
-    reserve_visible_reply_slot(state, now, Duration::from_secs(gap_secs), limits, addressed)
-        .then_some(now)
+    match reserve_visible_reply_slot(state, now, Duration::from_secs(gap_secs), limits, class) {
+        ReplySlotReservation::Reserved => Some(now),
+        ReplySlotReservation::ReservedOverBudget => {
+            println!(
+                "[INFO] 群聊回复额度已满但放行 (群组: {}, 类别={:?})",
+                group_id, class
+            );
+            Some(now)
+        }
+        ReplySlotReservation::Rejected => None,
+    }
 }
 
 /// 归还一格**未确认**的预留：这一轮最终没有发出可见消息。
@@ -1902,14 +1912,14 @@ pub(crate) struct GroupReplyBudgetSnapshot {
 pub(crate) async fn group_reply_budget_snapshot(
     group_id: i64,
     gap_secs: u64,
-    addressed: bool,
+    class: ReplyBudgetClass,
 ) -> GroupReplyBudgetSnapshot {
     let limits = ReplyBudgetLimits::from_config();
     let gap = Duration::from_secs(gap_secs);
     let rate_window = limits.rate_window;
     // 报"这次这一类"的账：点名看全部（点名额度是更宽的那份总闸），未点名只看
     // 未点名的条数。这样日志里的 `replies_in_window/rate_limit` 与拒绝判据一致。
-    let rate_limit = if addressed {
+    let rate_limit = if class.is_addressed() {
         limits.addressed_limit
     } else {
         limits.unaddressed_limit
@@ -1928,7 +1938,7 @@ pub(crate) async fn group_reply_budget_snapshot(
         .visible_replies
         .iter()
         .filter(|slot| now.saturating_duration_since(slot.at) < rate_window)
-        .filter(|slot| !addressed || slot.addressed)
+        .filter(|slot| !class.is_addressed() || slot.addressed)
         .count();
     let gap_remaining_ms = state.visible_replies.back().and_then(|last| {
         let seen = now.saturating_duration_since(last.at);
@@ -1947,6 +1957,54 @@ pub(crate) async fn group_reply_budget_snapshot(
 /// 被拒的尝试会把"上次回复"顶到当前时刻，紧接着的重试（比如稍后一条点名
 /// 提问）会看到 0 秒间隔再次被拒，问题就被永久压在冷却里——现场正是这种
 /// "问了两遍也没人理"的观感。频率上限与间隔都只看真实回复。
+/// 这次可见回复属于哪一类额度。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReplyBudgetClass {
+    /// 未点名接话：普通额度。
+    Ambient,
+    /// 被点名/被引用/显式请求：更宽的那份额度。
+    Addressed,
+    /// 管理员点名的可见回复：额度豁免。
+    ///
+    /// 为什么单独开一档：线上 2026-09-14 21:19 管理员 @ 她问话被静默丢掉
+    /// （`replies_in_window=10/10`、`gap_secs=0`）——等待间隔早就豁免了，额度没有，
+    /// 于是"你直接问她"在热闹时段一样会被吞掉。管理员的话是明确指令；防"她句句
+    /// 都回"靠的是**未点名接话**那份额度与自动接话抽样，与这一档无关。
+    AddressedUncapped,
+}
+
+impl ReplyBudgetClass {
+    /// 记账时算不算"点名"（`AddressedUncapped` 也是点名回复，只是额度豁免）。
+    const fn is_addressed(self) -> bool {
+        matches!(self, Self::Addressed | Self::AddressedUncapped)
+    }
+
+    /// 额度用完时是否仍然放行。
+    const fn bypasses_rate_limit(self) -> bool {
+        matches!(self, Self::AddressedUncapped)
+    }
+}
+
+/// 由"是不是点名"和"是不是管理员"决定走哪一档额度。
+pub(crate) const fn reply_budget_class(addressed: bool, sender_is_admin: bool) -> ReplyBudgetClass {
+    match (addressed, sender_is_admin) {
+        (true, true) => ReplyBudgetClass::AddressedUncapped,
+        (true, false) => ReplyBudgetClass::Addressed,
+        (false, _) => ReplyBudgetClass::Ambient,
+    }
+}
+
+/// 一次预留的结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplySlotReservation {
+    /// 正常拿到名额。
+    Reserved,
+    /// 额度已经用完，但这一档豁免：放行，并照实记账（调用方会留一行日志）。
+    ReservedOverBudget,
+    /// 被拒。
+    Rejected,
+}
+
 /// 一次预留要用到的窗口额度：总窗口 + 未点名额度 + 点名额度。
 ///
 /// 打包成一个结构而不是继续加参数：这些值同源同变（都从配置来、都在同一个判据里
@@ -1975,8 +2033,8 @@ fn reserve_visible_reply_slot(
     now: Instant,
     gap: Duration,
     limits: ReplyBudgetLimits,
-    addressed: bool,
-) -> bool {
+    class: ReplyBudgetClass,
+) -> ReplySlotReservation {
     while state
         .visible_replies
         .front()
@@ -1999,27 +2057,35 @@ fn reserve_visible_reply_slot(
     let unaddressed_in_window = in_window.saturating_sub(addressed_in_window);
     // 点名与未点名分开记账：未点名撞的是普通额度，点名撞的是更宽的那份额度；
     // 两者都受后者封顶，避免"手里全是点名"时无上限。
-    let within_budget = if addressed {
+    let within_budget = if class.is_addressed() {
         in_window < limits.addressed_limit
     } else {
         unaddressed_in_window < limits.unaddressed_limit && in_window < limits.addressed_limit
     };
-    if !within_budget {
-        return false;
-    }
+    // 额度和间隔是两件事：豁免额度的那一档仍然要等间隔（管理员点名那一档的间隔
+    // 由调用方按 0 秒传入，所以实际不等）。
     if state
         .visible_replies
         .back()
         .is_some_and(|last| now.saturating_duration_since(last.at) < gap)
     {
-        return false;
+        return ReplySlotReservation::Rejected;
     }
+    if !within_budget && !class.bypasses_rate_limit() {
+        return ReplySlotReservation::Rejected;
+    }
+    // 豁免档超额度也照实记账：账本必须反映"她真的说了这么多"，否则下一个人的
+    // 额度和日志都会失真。
     state.visible_replies.push_back(VisibleReplySlot {
         at: now,
         confirmed: false,
-        addressed,
+        addressed: class.is_addressed(),
     });
-    true
+    if within_budget {
+        ReplySlotReservation::Reserved
+    } else {
+        ReplySlotReservation::ReservedOverBudget
+    }
 }
 
 /// 群聊可见回复要等的间隔：管理员按 0 秒处理（他的话是明确指令，"刚回过
@@ -2803,7 +2869,8 @@ mod tests {
     use super::{
         Addressing, DirectTriggerState, GROUP_INTERJECTION_STATE, GroupConversationFocus,
         GroupInterjectionState, GroupSenderIdentity, InterjectionAttempt, PENDING_WINDOW_MESSAGES,
-        ReplyBudgetLimits, WindowDrainWait, admit_understood_group_turn, ambient_sampling_eligible,
+        ReplyBudgetClass, ReplyBudgetLimits, ReplySlotReservation, WindowDrainWait,
+        admit_understood_group_turn, ambient_sampling_eligible,
         clear_group_erasure_reply_state_locked, complete_interjection_attempt,
         confirm_visible_reply_slot, continuation_window_secs, conversation_active_for_observation,
         cooling_gate_verdict, decision_budget_available, directed_at_others,
@@ -2812,8 +2879,8 @@ mod tests {
         interjection_sampling_vetoed, message_at_self, normalized_sender_name,
         note_group_conversation_focus, paced_group_reply_gap_secs, pending_window_group_ids,
         prune_decision_attempts, queue_pending_window_message, release_unconfirmed_slot,
-        reserve_visible_reply_slot, suppress_direct_trigger, take_pending_window_turn,
-        text_mentions_bot, with_structured_bot_mention_context,
+        reply_budget_class, reserve_visible_reply_slot, suppress_direct_trigger,
+        take_pending_window_turn, text_mentions_bot, with_structured_bot_mention_context,
     };
     use crate::group_cooling::{
         GROUP_COOLING_SKIP_THRESHOLD, GroupCoolingVerdict, group_cooling_verdict,
@@ -3602,12 +3669,17 @@ mod tests {
         rate_window: Duration,
         rate_limit: usize,
     ) -> bool {
-        let reserved =
-            reserve_visible_reply_slot(state, now, gap, limits(rate_window, rate_limit), false);
-        if reserved {
+        let reserved = reserve_visible_reply_slot(
+            state,
+            now,
+            gap,
+            limits(rate_window, rate_limit),
+            ReplyBudgetClass::Ambient,
+        );
+        if reserved != ReplySlotReservation::Rejected {
             confirm_visible_reply_slot(state, now);
         }
-        reserved
+        reserved != ReplySlotReservation::Rejected
     }
 
     /// 线上回归（2026-09-14 16:18）：芸汐一个"只观察、没回复"的回合先在
@@ -3623,43 +3695,55 @@ mod tests {
         let rate_limit = 10;
 
         // 沉默回合：预留成功，但最终一个字都没发出去。
-        assert!(reserve_visible_reply_slot(
-            &mut state,
-            started,
-            gap,
-            limits(rate_window, rate_limit),
-            false,
-        ));
+        assert_eq!(
+            reserve_visible_reply_slot(
+                &mut state,
+                started,
+                gap,
+                limits(rate_window, rate_limit),
+                ReplyBudgetClass::Ambient,
+            ),
+            ReplySlotReservation::Reserved,
+        );
         // 一秒后的点名提问仍然被这一格挡住——这正是当时的现场。
-        assert!(!reserve_visible_reply_slot(
-            &mut state,
-            started + Duration::from_secs(1),
-            Duration::from_secs(20),
-            limits(rate_window, rate_limit),
-            false,
-        ));
+        assert_eq!(
+            reserve_visible_reply_slot(
+                &mut state,
+                started + Duration::from_secs(1),
+                Duration::from_secs(20),
+                limits(rate_window, rate_limit),
+                ReplyBudgetClass::Ambient,
+            ),
+            ReplySlotReservation::Rejected,
+        );
         // 回合结束归还后，同一句点名提问立刻可以通过。
         release_unconfirmed_slot(&mut state, started);
-        assert!(reserve_visible_reply_slot(
-            &mut state,
-            started + Duration::from_secs(1),
-            Duration::from_secs(20),
-            limits(rate_window, rate_limit),
-            false,
-        ));
+        assert_eq!(
+            reserve_visible_reply_slot(
+                &mut state,
+                started + Duration::from_secs(1),
+                Duration::from_secs(20),
+                limits(rate_window, rate_limit),
+                ReplyBudgetClass::Ambient,
+            ),
+            ReplySlotReservation::Reserved,
+        );
         // 归还只针对未确认的那一格：真发出去的名额不能被还掉，
         // 否则"刚回过一句"就可以被下一句立刻插进来。
         confirm_visible_reply_slot(&mut state, started + Duration::from_secs(1));
         release_unconfirmed_slot(&mut state, started + Duration::from_secs(1));
         assert_eq!(state.visible_replies.len(), 1);
         assert!(state.visible_replies[0].confirmed);
-        assert!(!reserve_visible_reply_slot(
-            &mut state,
-            started + Duration::from_secs(2),
-            Duration::from_secs(20),
-            limits(rate_window, rate_limit),
-            false,
-        ));
+        assert_eq!(
+            reserve_visible_reply_slot(
+                &mut state,
+                started + Duration::from_secs(2),
+                Duration::from_secs(20),
+                limits(rate_window, rate_limit),
+                ReplyBudgetClass::Ambient,
+            ),
+            ReplySlotReservation::Rejected,
+        );
     }
 
     /// 点名与未点名**分开记账**：未点名接话撞 10 条那份额度，点名走更宽的 20 条；
@@ -3680,11 +3764,16 @@ mod tests {
         // 真发出去的回复会在发送时被确认（`mark_group_reply_sent`），未确认的
         // 预留另有 30 秒兜底会被清掉——所以这里必须按真实形态落账。
         let sent = |state: &mut GroupInterjectionState, at: Instant, addressed: bool| {
-            let reserved = reserve_visible_reply_slot(state, at, gap, budget, addressed);
-            if reserved {
+            let class = if addressed {
+                ReplyBudgetClass::Addressed
+            } else {
+                ReplyBudgetClass::Ambient
+            };
+            let reserved = reserve_visible_reply_slot(state, at, gap, budget, class);
+            if reserved != ReplySlotReservation::Rejected {
                 confirm_visible_reply_slot(state, at);
             }
-            reserved
+            reserved != ReplySlotReservation::Rejected
         };
 
         // 先用未点名把普通额度打满（每次隔 1 秒，避开 gap）。
@@ -3710,6 +3799,96 @@ mod tests {
         assert!(!sent(&mut state, started + Duration::from_secs(31), false));
         // 窗口滑过之后重新放行。
         assert!(sent(&mut state, started + Duration::from_secs(601), false));
+    }
+
+    /// 管理员**点名**那一档额度也豁免：额度用完时仍然放行，而且照实记账
+    /// （账本必须反映"她真的说了这么多"，否则下一个人的额度与日志都会失真）。
+    ///
+    /// 线上 2026-09-14 21:19：管理员 @ 她问话被静默丢掉（`replies_in_window=10/10`、
+    /// `gap_secs=0`）——间隔早就豁免了，额度没有，于是"你直接问她"在热闹时段一样被吞。
+    #[test]
+    fn admin_addressed_replies_are_allowed_over_budget() {
+        let mut state = GroupInterjectionState::default();
+        let started = Instant::now();
+        let budget = ReplyBudgetLimits {
+            rate_window: Duration::from_secs(600),
+            unaddressed_limit: 10,
+            addressed_limit: 20,
+        };
+        let gap = Duration::from_secs(0);
+        // 真发出去的回复会被确认；未确认的预留另有 30 秒兜底会被清掉——测试必须
+        // 按真实形态落账，否则额度会被兜底"悄悄还回来"。
+        let reserve_and_confirm =
+            |state: &mut GroupInterjectionState, at: Instant, class: ReplyBudgetClass| {
+                let reserved = reserve_visible_reply_slot(state, at, gap, budget, class);
+                if reserved != ReplySlotReservation::Rejected {
+                    confirm_visible_reply_slot(state, at);
+                }
+                reserved
+            };
+
+        // 先把两份额度都用满（10 条未点名 + 10 条点名）。
+        for index in 0..10 {
+            assert_eq!(
+                reserve_and_confirm(
+                    &mut state,
+                    started + Duration::from_secs(index),
+                    ReplyBudgetClass::Ambient,
+                ),
+                ReplySlotReservation::Reserved
+            );
+        }
+        for index in 0..10 {
+            assert_eq!(
+                reserve_and_confirm(
+                    &mut state,
+                    started + Duration::from_secs(20 + index),
+                    ReplyBudgetClass::Addressed,
+                ),
+                ReplySlotReservation::Reserved
+            );
+        }
+        // 普通点名额度满了：拒绝。
+        assert_eq!(
+            reserve_and_confirm(
+                &mut state,
+                started + Duration::from_secs(40),
+                ReplyBudgetClass::Addressed,
+            ),
+            ReplySlotReservation::Rejected
+        );
+        // 管理员点名：超额度也放行 …
+        assert_eq!(
+            reserve_and_confirm(
+                &mut state,
+                started + Duration::from_secs(41),
+                ReplyBudgetClass::AddressedUncapped,
+            ),
+            ReplySlotReservation::ReservedOverBudget
+        );
+        // … 而且照实记账：窗口内确实多了一条（下一个人的账不会失真）。
+        assert_eq!(state.visible_replies.len(), 21);
+        // 未点名接话仍然被自己那份额度拦着（"她句句都回"的防线不受影响）。
+        assert_eq!(
+            reserve_and_confirm(
+                &mut state,
+                started + Duration::from_secs(42),
+                ReplyBudgetClass::Ambient,
+            ),
+            ReplySlotReservation::Rejected
+        );
+    }
+
+    /// 由"是不是点名"和"是不是管理员"选档：只有管理员点名那一档豁免额度。
+    #[test]
+    fn budget_class_only_uncaps_admin_addressed_turns() {
+        assert_eq!(
+            reply_budget_class(true, true),
+            ReplyBudgetClass::AddressedUncapped
+        );
+        assert_eq!(reply_budget_class(true, false), ReplyBudgetClass::Addressed);
+        assert_eq!(reply_budget_class(false, true), ReplyBudgetClass::Ambient);
+        assert_eq!(reply_budget_class(false, false), ReplyBudgetClass::Ambient);
     }
 
     /// 管理员豁免的是"等待间隔"，不是频率上限：线上 16:18 管理员那条点名
@@ -3742,29 +3921,38 @@ mod tests {
         let rate_window = Duration::from_secs(600);
         let rate_limit = 10;
 
-        assert!(reserve_visible_reply_slot(
-            &mut state,
-            started,
-            gap,
-            limits(rate_window, rate_limit),
-            false,
-        ));
+        assert_eq!(
+            reserve_visible_reply_slot(
+                &mut state,
+                started,
+                gap,
+                limits(rate_window, rate_limit),
+                ReplyBudgetClass::Ambient,
+            ),
+            ReplySlotReservation::Reserved,
+        );
         // 30 秒内仍算"这一轮正在准备回复"，继续挡住普通间隔。
-        assert!(!reserve_visible_reply_slot(
-            &mut state,
-            started + Duration::from_secs(29),
-            gap,
-            limits(rate_window, rate_limit),
-            false,
-        ));
+        assert_eq!(
+            reserve_visible_reply_slot(
+                &mut state,
+                started + Duration::from_secs(29),
+                gap,
+                limits(rate_window, rate_limit),
+                ReplyBudgetClass::Ambient,
+            ),
+            ReplySlotReservation::Rejected,
+        );
         // 超过兜底时限后不再占位，且不计入频率额度。
-        assert!(reserve_visible_reply_slot(
-            &mut state,
-            started + Duration::from_secs(31),
-            gap,
-            limits(rate_window, rate_limit),
-            false,
-        ));
+        assert_eq!(
+            reserve_visible_reply_slot(
+                &mut state,
+                started + Duration::from_secs(31),
+                gap,
+                limits(rate_window, rate_limit),
+                ReplyBudgetClass::Ambient,
+            ),
+            ReplySlotReservation::Reserved,
+        );
         assert_eq!(state.visible_replies.len(), 1);
     }
 

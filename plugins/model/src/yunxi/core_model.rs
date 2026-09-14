@@ -5979,13 +5979,17 @@ impl ModelBackend for KoviModelBackend {
             {
                 let addressed = explicitly_addressed_group_message(group_message);
                 let gap_secs = group_reply_gap_secs_for_sender(group_message, sender_is_admin);
-                match crate::model::reserve_group_chat_reply_slot(group_id, gap_secs, addressed)
+                // 管理员点名走额度豁免档（间隔已被上一步按 0 秒处理）。
+                let budget_class = crate::model::reply_budget_class(addressed, sender_is_admin);
+                match crate::model::reserve_group_chat_reply_slot(group_id, gap_secs, budget_class)
                     .await
                 {
                     Some(at) => group_reply_slot = Some(at),
                     None => {
                         let snapshot = crate::model::group_reply_budget_snapshot(
-                            group_id, gap_secs, addressed,
+                            group_id,
+                            gap_secs,
+                            budget_class,
                         )
                         .await;
                         // 点名她、而且只是"还差一点"：等间隔过去再答，不要静默丢掉。
@@ -6013,7 +6017,9 @@ impl ModelBackend for KoviModelBackend {
                             ))
                             .await;
                             group_reply_slot = crate::model::reserve_group_chat_reply_slot(
-                                group_id, gap_secs, addressed,
+                                group_id,
+                                gap_secs,
+                                budget_class,
                             )
                             .await;
                         }
@@ -6052,12 +6058,21 @@ impl ModelBackend for KoviModelBackend {
                 && let QqConversation::Group { group_id } = conversation
             {
                 let gap_secs = config::get().group_interjection().reply_gap_secs();
-                match crate::model::reserve_group_chat_reply_slot(group_id, gap_secs, false).await {
+                match crate::model::reserve_group_chat_reply_slot(
+                    group_id,
+                    gap_secs,
+                    crate::model::ReplyBudgetClass::Ambient,
+                )
+                .await
+                {
                     Some(at) => group_reply_slot = Some(at),
                     None => {
-                        let snapshot =
-                            crate::model::group_reply_budget_snapshot(group_id, gap_secs, false)
-                                .await;
+                        let snapshot = crate::model::group_reply_budget_snapshot(
+                            group_id,
+                            gap_secs,
+                            crate::model::ReplyBudgetClass::Ambient,
+                        )
+                        .await;
                         kovi::log::info!(
                             "Yunxi Core autonomous group turn paced: event_id={} conversation_id={} group_id={} gap_secs={} replies_in_window={}/{} action=silent",
                             input.event.id(),

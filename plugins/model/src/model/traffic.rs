@@ -133,11 +133,13 @@ mod tests {
                     user_id: 9_150_002,
                 };
                 // 全局额度是进程级的，别的测试可能已经把它打满（打满时**所有人**
-                // 都会被抑制，这是设计如此）。这里只验按人限流，所以先清空状态。
+                // 都会被抑制，这是设计如此）。这里只验按人限流：清掉全局计数，并且
+                // **只**删自己这一格——`scopes.clear()` 会顺手删掉并行测试的状态，
+                // 让它们的断言凭空失败（踩过一次）。
                 {
                     let mut state = TRAFFIC_STATE.lock().await;
                     state.global_recent.clear();
-                    state.scopes.clear();
+                    state.scopes.remove(&scope);
                 }
 
                 // 先用普通身份把额度用满：前 per_user_limit 条放行，再多一条触发封锁。
