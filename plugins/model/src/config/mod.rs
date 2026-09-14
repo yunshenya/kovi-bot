@@ -39,6 +39,7 @@ mod proactive;
 mod prompt;
 mod qq_call;
 mod qq_sing;
+mod qq_sticker;
 mod qq_voice;
 mod reminders;
 mod server;
@@ -63,6 +64,7 @@ pub use identity::IdentityConfig;
 pub use mind::MindConfig;
 pub use qq_call::QqCallConfig;
 pub use qq_sing::QqSingConfig;
+pub use qq_sticker::QqStickerConfig;
 pub use qq_voice::QqVoiceConfig;
 pub use reminders::ReminderConfig;
 pub use silence::SilenceConfig;
@@ -133,6 +135,8 @@ pub struct ModelConfig {
     qq_voice: QqVoiceConfig,
     /// 芸汐唱歌的配置（默认关闭）。
     qq_sing: QqSingConfig,
+    /// 芸汐发表情包的自有素材库配置（默认关闭）。
+    qq_sticker: QqStickerConfig,
     /// Executive v3 deterministic control configuration.
     executive: ExecutiveConfig,
     /// Intrinsic model and bounded fallback configuration.
@@ -192,6 +196,7 @@ impl ModelConfig {
         self.qq_call.validate()?;
         self.qq_voice.validate()?;
         self.qq_sing.validate()?;
+        self.qq_sticker.validate()?;
         if self.qq_sing.enabled() && !self.qq_voice.enabled() {
             return Err(anyhow::anyhow!(
                 "启用 qq_sing 需要同时启用 qq_voice：唱歌复用语音消息的暂存目录与 NapCat 路径映射"
@@ -311,6 +316,10 @@ impl ModelConfig {
 
     pub fn qq_sing(&self) -> &QqSingConfig {
         &self.qq_sing
+    }
+
+    pub fn qq_sticker(&self) -> &QqStickerConfig {
+        &self.qq_sticker
     }
 
     pub fn executive(&self) -> &ExecutiveConfig {
@@ -437,6 +446,32 @@ pub fn annotation_dir_path() -> PathBuf {
     }
 }
 
+/// 表情包素材目录的默认名（相对运行时目录）。
+pub const DEFAULT_STICKER_DIR: &str = "stickers";
+
+/// 表情包素材目录（芸汐能发的那些图就放在这里）。
+///
+/// 相对路径的基准与 [`annotation_dir_path`] 一致：生产部署里只有运行时目录可写，
+/// 开发机上没有 `KOVI_READY_FILE`，于是落在工作目录下。素材是运维手工丢进去的，
+/// 不是运行时写出来的，所以这个目录不要求存在——不存在就是"暂时没有素材"。
+pub fn sticker_library_path() -> PathBuf {
+    let configured = MODEL_CONFIG
+        .read()
+        .map(|config| config.qq_sticker().dir().trim().to_owned())
+        .unwrap_or_default();
+    let configured = if configured.is_empty() {
+        DEFAULT_STICKER_DIR.to_owned()
+    } else {
+        configured
+    };
+    let path = Path::new(&configured);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        runtime_dir().join(path)
+    }
+}
+
 /// 把内存中的配置替换为给定实例。
 ///
 /// 只应由管理后台在「候选配置已经通过 `validate_candidate` 校验并原子落盘」
@@ -551,6 +586,14 @@ pub fn qq_sing_enabled() -> bool {
     MODEL_CONFIG
         .read()
         .map(|config| config.qq_sing().enabled())
+        .unwrap_or(false)
+}
+
+/// 同上，问「能不能发表情包」。
+pub fn qq_sticker_enabled() -> bool {
+    MODEL_CONFIG
+        .read()
+        .map(|config| config.qq_sticker().enabled())
         .unwrap_or(false)
 }
 

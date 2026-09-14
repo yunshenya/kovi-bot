@@ -110,6 +110,8 @@ pub mod proactive_chat;
 pub mod health_check;
 // PostgreSQL 表情包记忆库
 pub(crate) mod sticker_memory;
+// 表情包素材库（她自己能发出去的那些图）
+pub(crate) mod sticker_library;
 
 #[cfg(feature = "integration-tests")]
 #[doc(hidden)]

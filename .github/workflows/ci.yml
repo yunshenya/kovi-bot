@@ -98,6 +98,14 @@ jobs:
           yunxi::world_model_gating_tests::disabled_world_model_records_nothing
           -- --ignored --exact
 
+      # 表情包素材库的端到端：真配置 + 真目录 + 真字节，钉住"她到底会发出去哪几个
+      # 字节"（image 段 + `base64://`）。同样需要改进程级配置，所以也单独跑一次。
+      - name: Run sticker library delivery test
+        run: >-
+          cargo test -p model --lib --locked
+          sticker_library::tests::configured_library_renders_a_sendable_image_segment
+          -- --ignored --exact
+
       - name: Run black-box Redis integration test
         env:
           REDIS_URL: redis://127.0.0.1:6379/15

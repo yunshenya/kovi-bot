@@ -1,0 +1,682 @@
+//! # 表情包素材库（出口）
+//!
+//! [`crate::sticker_memory`] 管的是"她看懂别人发的表情"；这里管的是"**她能发出去**
+//! 的表情包"。素材全部来自 `qq_sticker.dir` 里运维自己放的图片：文件名（去掉扩展名）
+//! 就是标签，例如 `无语又想笑.gif` 的标签是 `无语又想笑`。她不缓存、不转发聊天里
+//! 别人的图，所以这条链路不改变任何隐私口径。
+//!
+//! 发送形态是 OneBot 的 `image` 段，`file` 用 `base64://`：这样不必要求 NapCat 与
+//! 机器人共享同一个文件系统（语音那条链路需要 `staging_dir` / `napcat_staging_dir`
+//! 两份路径映射，图片没有这个必要，也少一处部署会配错的地方）。
+//!
+//! **不发商城表情（`mface`）**：它的 `key` 是服务端下发、绑定具体资源的，重发会被
+//! QQ 拒；而 NapCat 收到商城表情时本来就已经转成 `image` 段交给我们了。以图片段发出
+//! 去的效果在聊天里与表情包一致，只是不算"商城表情"那条 UI。
+
+use crate::config::QqStickerConfig;
+use base64::Engine;
+use kovi::Message;
+use kovi::bot::message::Segment;
+use serde_json::json;
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
+
+/// 认得的图片扩展名。NapCat 会把它们交给 QQ 上传，其余格式一律不收录。
+const SUPPORTED_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "bmp"];
+/// 标签长度上限（字符）。标签会进提示词，不能由文件名无限拉长。
+const MAX_LABEL_CHARS: usize = 64;
+/// 目录递归深度上限。素材目录是给运维丢文件的，不该有人把整块盘塞进来。
+const MAX_SCAN_DEPTH: usize = 3;
+
+/// 管理员的素材库命令。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StickerLibraryCommand {
+    /// `#表情列表`
+    List,
+    /// `#发表情 <标签>`
+    Send { label: String },
+    /// 命令形状对但缺标签，或标签为空。
+    Invalid,
+}
+
+/// 解析素材库命令；不是这两条命令时返回 `None`。
+pub(crate) fn parse_command(message: &str) -> Option<StickerLibraryCommand> {
+    let text = message.trim();
+    if text == "#表情列表" {
+        return Some(StickerLibraryCommand::List);
+    }
+    let rest = text.strip_prefix("#发表情")?;
+    // `#发表情包` 之类的词不该被当成命令。
+    if !rest.is_empty() && !rest.starts_with([' ', '\t', '　']) {
+        return None;
+    }
+    let label = rest.trim();
+    if label.is_empty() {
+        return Some(StickerLibraryCommand::Invalid);
+    }
+    Some(StickerLibraryCommand::Send {
+        label: label.to_string(),
+    })
+}
+
+/// 解析结果：素材库当前状态的一句话说明，给命令回执用。
+pub(crate) fn command_help() -> String {
+    "格式：#表情列表 看有哪些表情包；#发表情 标签 让她发一张。".to_string()
+}
+
+/// 命令回执：当前可用的标签清单（空库时说明该往哪个目录放素材）。
+pub(crate) fn library_listing_reply() -> String {
+    let labels = available_labels();
+    if labels.is_empty() {
+        return format!(
+            "表情包素材库现在是空的，往 {} 里放几张图片再试（文件名就是标签）。",
+            crate::config::sticker_library_path().display()
+        );
+    }
+    let limit = crate::config::get().qq_sticker().prompt_labels().max(20);
+    let mut listing = labels
+        .iter()
+        .take(limit)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("、");
+    if labels.len() > limit {
+        listing.push_str(&format!(
+            "（共 {} 个，这里只列了前 {} 个）",
+            labels.len(),
+            limit
+        ));
+    }
+    format!("现在有 {} 张表情：{listing}", labels.len())
+}
+
+/// 命令回执：这个标签库里没有。
+pub(crate) fn missing_label_reply(label: &str) -> String {
+    let labels = available_labels();
+    if labels.is_empty() {
+        return format!(
+            "素材库里还没有表情。往 {} 里放几张图片再试（文件名就是标签）。",
+            crate::config::sticker_library_path().display()
+        );
+    }
+    let mut listing = labels
+        .iter()
+        .take(20)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("、");
+    if labels.len() > 20 {
+        listing.push_str("……");
+    }
+    format!("素材库里没有“{label}”这张表情。可用的有：{listing}")
+}
+
+/// 一条只带这张表情的消息，交给 tracked send 直发（管理员命令的兜底路径）。
+pub(crate) fn build_sticker_message(raw_label: &str) -> Option<Message> {
+    let segment = build_sticker_segment(raw_label)?;
+    let mut message = Message::new();
+    message.push(segment);
+    Some(message)
+}
+
+#[derive(Debug, Default)]
+struct StickerIndex {
+    scanned_at: Option<Instant>,
+    /// 标签 → 该标签下的素材文件（已排序，便于轮换与测试）。
+    labels: BTreeMap<String, Vec<PathBuf>>,
+}
+
+static INDEX: LazyLock<Mutex<StickerIndex>> = LazyLock::new(|| Mutex::new(StickerIndex::default()));
+/// 每个标签已经用过几次，用来轮换同一标签下的多张图。
+static USE_COUNTS: LazyLock<Mutex<HashMap<String, u64>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// 素材库现在能不能用：配置打开、且目录里确实有素材。
+///
+/// 提示词组装只认这一个判据——关掉配置却仍然告诉模型"你可以发表情包"，只会得到
+/// 一条永远发不出去的标记。
+pub(crate) fn is_available() -> bool {
+    is_available_with(crate::config::get().qq_sticker())
+}
+
+fn is_available_with(config: &QqStickerConfig) -> bool {
+    config.enabled() && !labels_snapshot().is_empty()
+}
+
+/// 全部标签（已排序）。命令回执用它。
+pub(crate) fn available_labels() -> Vec<String> {
+    labels_snapshot().into_keys().collect()
+}
+
+/// 下发给模型的标签清单，按 `qq_sticker.prompt_labels` 截断。
+///
+/// 返回 `(列出的标签, 标签总数)`。总数大于列表长度时调用方要说明"清单没列全"，
+/// 否则模型会以为素材库就只有这几个。
+pub(crate) fn prompt_labels() -> (Vec<String>, usize) {
+    let labels = labels_snapshot();
+    let total = labels.len();
+    let limit = crate::config::get().qq_sticker().prompt_labels();
+    let listed = labels.into_keys().take(limit).collect();
+    (listed, total)
+}
+
+/// 拼好的标签清单句（`A；B；C`），供两条回复协议各自插进自己的说明里。
+///
+/// 素材库关闭或为空时返回 `None`：没有素材就不该在提示词里提"你可以发表情包"。
+pub(crate) fn prompt_label_listing() -> Option<String> {
+    let (labels, total) = prompt_labels();
+    if labels.is_empty() {
+        return None;
+    }
+    let mut listing = labels.join("；");
+    if total > labels.len() {
+        listing.push_str(&format!("（另有 {} 个未列出）", total - labels.len()));
+    }
+    Some(listing)
+}
+
+fn labels_snapshot() -> BTreeMap<String, Vec<PathBuf>> {
+    let config = crate::config::get();
+    let config = config.qq_sticker();
+    if !config.enabled() {
+        return BTreeMap::new();
+    }
+    INDEX
+        .lock()
+        .map(|mut index| {
+            refresh_if_stale(&mut index, config);
+            index.labels.clone()
+        })
+        .unwrap_or_default()
+}
+
+fn refresh_if_stale(index: &mut StickerIndex, config: &QqStickerConfig) {
+    let ttl = Duration::from_secs(config.rescan_secs());
+    if index
+        .scanned_at
+        .is_some_and(|scanned_at| scanned_at.elapsed() < ttl)
+    {
+        return;
+    }
+    let dir = crate::config::sticker_library_path();
+    let labels = scan_directory(&dir, config.max_files());
+    if labels.is_empty() {
+        println!(
+            "[INFO] 表情包素材库为空 (目录: {})，她这一轮不会发表情包",
+            dir.display()
+        );
+    } else {
+        let files = labels.values().map(Vec::len).sum::<usize>();
+        println!(
+            "[INFO] 表情包素材库已加载 {} 张图 / {} 个标签 (目录: {})",
+            files,
+            labels.len(),
+            dir.display()
+        );
+    }
+    *index = StickerIndex {
+        scanned_at: Some(Instant::now()),
+        labels,
+    };
+}
+
+/// 扫目录建索引。纯函数，便于测试；`max_files` 是收录文件数上限。
+fn scan_directory(dir: &Path, max_files: usize) -> BTreeMap<String, Vec<PathBuf>> {
+    let mut files = Vec::new();
+    collect_files(dir, max_files, 0, &mut files);
+    files.sort();
+    let mut labels: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
+    for path in files {
+        let Some(label) = label_for_path(&path) else {
+            continue;
+        };
+        labels.entry(label).or_default().push(path);
+    }
+    labels
+}
+
+fn collect_files(dir: &Path, max_files: usize, depth: usize, files: &mut Vec<PathBuf>) {
+    if files.len() >= max_files || depth > MAX_SCAN_DEPTH {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut children: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .collect();
+    children.sort();
+    for path in children {
+        if files.len() >= max_files {
+            return;
+        }
+        if path.is_dir() {
+            collect_files(&path, max_files, depth + 1, files);
+            continue;
+        }
+        if is_supported_image_path(&path) {
+            files.push(path);
+        }
+    }
+}
+
+fn is_supported_image_path(path: &Path) -> bool {
+    let Some(extension) = path.extension().and_then(|value| value.to_str()) else {
+        return false;
+    };
+    SUPPORTED_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str())
+}
+
+/// 文件路径 → 标签：去扩展名、剥掉尾部编号、限长。
+///
+/// 隐藏文件、取不出名字的文件（`.DS_Store`、`~$x.png` 这类）与不支持的格式直接跳过。
+fn label_for_path(path: &Path) -> Option<String> {
+    if !is_supported_image_path(path) {
+        return None;
+    }
+    let stem = path.file_stem()?.to_str()?.trim();
+    if stem.is_empty() || stem.starts_with('.') || stem.starts_with("~$") {
+        return None;
+    }
+    let label = strip_trailing_ordinal(stem);
+    let label: String = label.chars().take(MAX_LABEL_CHARS).collect();
+    let label = label.trim().to_string();
+    (!label.is_empty()).then_some(label)
+}
+
+/// 剥掉同一标签多张图用的尾部编号：`开心-1`、`开心_2`、`开心 3`、`开心(4)`、
+/// `开心（5）` 都归到 `开心`。
+///
+/// 只在编号前面确实有分隔符时才剥：`39度`、`版本2` 这类名字里的数字是名字的一部分，
+/// 剥了反而会撞到别的标签上。
+fn strip_trailing_ordinal(stem: &str) -> &str {
+    let trimmed = stem.trim_end();
+    // 先脱掉 `(4)` 这类包起来的写法，再剥数字，最后去掉数字前面的分隔符。
+    let unwrapped = trimmed.trim_end_matches([')', '）', ']', '】']);
+    let without_digits = unwrapped.trim_end_matches(|character: char| character.is_ascii_digit());
+    if without_digits.len() == unwrapped.len() {
+        return trimmed;
+    }
+    let head = without_digits.trim_end_matches([' ', '-', '_', '.', '(', '（', '[', '【']);
+    if head.len() == without_digits.len() || head.trim().is_empty() {
+        return trimmed;
+    }
+    head
+}
+
+/// 把模型/命令给的标签落到库里真实存在的标签上。
+///
+/// 先精确匹配（忽略空白与标点、ASCII 不分大小写），再退一步找唯一包含关系。
+/// 仍然不唯一时按"标签更短优先、同长按字典序"取一个——确定性的选择好过随机挑一张
+/// 发错。找不到返回 `None`，调用方应当放弃发表情而不是发一张不相干的。
+pub(crate) fn resolve_label(raw: &str) -> Option<String> {
+    let labels = labels_snapshot();
+    resolve_in(labels.keys().map(String::as_str), raw)
+}
+
+fn resolve_in<'a>(labels: impl Iterator<Item = &'a str>, raw: &str) -> Option<String> {
+    let query = normalize_for_match(raw);
+    if query.is_empty() {
+        return None;
+    }
+    let candidates: Vec<&str> = labels.collect();
+    if let Some(exact) = candidates
+        .iter()
+        .find(|label| normalize_for_match(label) == query)
+    {
+        return Some((*exact).to_string());
+    }
+    let mut contained: Vec<&str> = candidates
+        .iter()
+        .copied()
+        .filter(|label| {
+            let normalized = normalize_for_match(label);
+            normalized.contains(&query) || query.contains(&normalized)
+        })
+        .collect();
+    contained.sort_by(|left, right| {
+        left.chars()
+            .count()
+            .cmp(&right.chars().count())
+            .then_with(|| left.cmp(right))
+    });
+    contained.first().map(|label| (*label).to_string())
+}
+
+/// 匹配用的归一化：去掉空白与常见标点，ASCII 转小写。
+fn normalize_for_match(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| {
+            !character.is_whitespace()
+                && !matches!(
+                    character,
+                    '，' | '。'
+                        | '！'
+                        | '？'
+                        | '、'
+                        | '~'
+                        | '～'
+                        | '!'
+                        | '?'
+                        | '.'
+                        | ','
+                        | ':'
+                        | '：'
+                        | '"'
+                        | '\''
+                        | '“'
+                        | '”'
+                        | '‘'
+                        | '’'
+                        | '('
+                        | ')'
+                        | '（'
+                        | '）'
+                )
+        })
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// 按标签造一个可发送的图片段；标签不存在、文件读不出来或内容不像图片时返回 `None`。
+pub(crate) fn build_sticker_segment(raw_label: &str) -> Option<Segment> {
+    let config = crate::config::get();
+    let config = config.qq_sticker();
+    if !config.enabled() {
+        return None;
+    }
+    let label = resolve_label(raw_label)?;
+    let path = next_sticker_file(&label)?;
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!(
+                "[WARN] 读取表情包素材失败，本轮不发这张 (文件: {}): {}",
+                path.display(),
+                error
+            );
+            return None;
+        }
+    };
+    let limit = config.max_file_bytes();
+    if bytes.len() as u64 > limit {
+        eprintln!(
+            "[WARN] 表情包素材超过大小上限，本轮不发这张 (文件: {}, {} > {} 字节)",
+            path.display(),
+            bytes.len(),
+            limit
+        );
+        return None;
+    }
+    if !looks_like_supported_image(&bytes) {
+        eprintln!(
+            "[WARN] 表情包素材内容不是受支持的图片格式，本轮不发这张 (文件: {})",
+            path.display()
+        );
+        return None;
+    }
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    Some(Segment::new(
+        "image",
+        json!({
+            "file": format!("base64://{encoded}"),
+            "summary": label,
+        }),
+    ))
+}
+
+/// 取这个标签下的下一张图（轮换），并记一次使用。
+fn next_sticker_file(label: &str) -> Option<PathBuf> {
+    let labels = labels_snapshot();
+    let files = labels.get(label)?;
+    if files.is_empty() {
+        return None;
+    }
+    let mut counters = USE_COUNTS.lock().ok()?;
+    let used = counters.entry(label.to_string()).or_insert(0);
+    let index = usize::try_from(*used).unwrap_or(usize::MAX) % files.len();
+    *used = used.saturating_add(1);
+    files.get(index).cloned()
+}
+
+/// 只认文件头，不认扩展名：运维把 `.txt` 改名成 `.png` 时应当当场发现，
+/// 而不是把一段文本当图片发给 QQ。
+fn looks_like_supported_image(bytes: &[u8]) -> bool {
+    const PNG: &[u8] = &[0x89, b'P', b'N', b'G'];
+    const JPEG: &[u8] = &[0xFF, 0xD8, 0xFF];
+    bytes.starts_with(PNG)
+        || bytes.starts_with(JPEG)
+        || bytes.starts_with(b"GIF8")
+        || bytes.starts_with(b"BM")
+        || (bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        StickerLibraryCommand, label_for_path, looks_like_supported_image, parse_command,
+        resolve_in, scan_directory, strip_trailing_ordinal,
+    };
+    use std::path::{Path, PathBuf};
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "kovi-sticker-library-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("应能建临时目录");
+        dir
+    }
+
+    #[test]
+    fn commands_are_recognised_and_bounded() {
+        assert_eq!(
+            parse_command("#表情列表"),
+            Some(StickerLibraryCommand::List)
+        );
+        assert_eq!(
+            parse_command("#发表情 无语又想笑"),
+            Some(StickerLibraryCommand::Send {
+                label: "无语又想笑".to_string()
+            })
+        );
+        assert_eq!(
+            parse_command("   #发表情   开心  "),
+            Some(StickerLibraryCommand::Send {
+                label: "开心".to_string()
+            })
+        );
+        assert_eq!(
+            parse_command("#发表情"),
+            Some(StickerLibraryCommand::Invalid)
+        );
+        assert_eq!(parse_command("#发表情包"), None);
+        assert_eq!(parse_command("发表情 开心"), None);
+        assert_eq!(parse_command("普通聊天"), None);
+    }
+
+    #[test]
+    fn labels_come_from_file_names_without_ordinals() {
+        assert_eq!(strip_trailing_ordinal("开心"), "开心");
+        assert_eq!(strip_trailing_ordinal("开心-1"), "开心");
+        assert_eq!(strip_trailing_ordinal("开心_2"), "开心");
+        assert_eq!(strip_trailing_ordinal("开心 3"), "开心");
+        assert_eq!(strip_trailing_ordinal("开心(4)"), "开心");
+        assert_eq!(strip_trailing_ordinal("开心（5）"), "开心");
+        assert_eq!(strip_trailing_ordinal("开心4"), "开心4");
+        assert_eq!(strip_trailing_ordinal("(4)"), "(4)");
+        // 数字是名字的一部分时不剥，否则会撞到别的标签。
+        assert_eq!(strip_trailing_ordinal("39度"), "39度");
+        assert_eq!(strip_trailing_ordinal("版本2"), "版本2");
+        assert_eq!(strip_trailing_ordinal("1"), "1");
+    }
+
+    #[test]
+    fn only_supported_images_become_labels() {
+        assert_eq!(
+            label_for_path(Path::new("/tmp/stickers/无语又想笑.gif")),
+            Some("无语又想笑".to_string())
+        );
+        assert_eq!(
+            label_for_path(Path::new("/tmp/stickers/开心-1.PNG")),
+            Some("开心".to_string())
+        );
+        assert_eq!(label_for_path(Path::new("/tmp/stickers/.DS_Store")), None);
+        assert_eq!(label_for_path(Path::new("/tmp/stickers/notes.txt")), None);
+        assert_eq!(label_for_path(Path::new("/tmp/stickers/")), None);
+    }
+
+    #[test]
+    fn scanning_groups_ordinals_and_skips_noise() {
+        let dir = temp_dir("scan");
+        std::fs::write(dir.join("开心-1.png"), b"x").expect("应能写文件");
+        std::fs::write(dir.join("开心-2.png"), b"x").expect("应能写文件");
+        std::fs::write(dir.join("无语又想笑.gif"), b"x").expect("应能写文件");
+        std::fs::write(dir.join("说明.txt"), b"x").expect("应能写文件");
+        std::fs::create_dir_all(dir.join("nested")).expect("应能建子目录");
+        std::fs::write(dir.join("nested/收到.webp"), b"x").expect("应能写文件");
+
+        let labels = scan_directory(&dir, 100);
+        // BTreeMap 按码点排序：开(U+5F00) < 收(U+6536) < 无(U+65E0)。
+        assert_eq!(
+            labels.keys().cloned().collect::<Vec<_>>(),
+            vec![
+                "开心".to_string(),
+                "收到".to_string(),
+                "无语又想笑".to_string()
+            ]
+        );
+        assert_eq!(labels.get("开心").map(Vec::len), Some(2));
+
+        let capped = scan_directory(&dir, 2);
+        assert_eq!(capped.values().map(Vec::len).sum::<usize>(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_directory_scans_as_empty() {
+        let labels = scan_directory(Path::new("/tmp/kovi-sticker-library-does-not-exist"), 10);
+        assert!(labels.is_empty());
+    }
+
+    #[test]
+    fn resolution_prefers_exact_then_the_tightest_containment() {
+        let labels = ["开心", "开心到飞起", "无语又想笑"];
+        let resolve = |query: &str| resolve_in(labels.iter().copied(), query);
+
+        assert_eq!(resolve("开心"), Some("开心".to_string()));
+        assert_eq!(resolve(" 开心 "), Some("开心".to_string()));
+        assert_eq!(resolve("无语又想笑！"), Some("无语又想笑".to_string()));
+        assert_eq!(resolve("开心到飞起"), Some("开心到飞起".to_string()));
+        // 只说"开心"是精确命中；说"飞起"才落到更长的那个标签上。
+        assert_eq!(resolve("飞起"), Some("开心到飞起".to_string()));
+        assert_eq!(resolve("找不到的标签"), None);
+        assert_eq!(resolve(""), None);
+    }
+
+    #[test]
+    fn resolution_ignores_punctuation_and_ascii_case() {
+        let labels = ["OK", "好耶"];
+        assert_eq!(
+            resolve_in(labels.iter().copied(), "ok"),
+            Some("OK".to_string())
+        );
+        assert_eq!(
+            resolve_in(labels.iter().copied(), "好耶！！！"),
+            Some("好耶".to_string())
+        );
+    }
+
+    #[test]
+    fn image_sniffing_rejects_renamed_text() {
+        assert!(looks_like_supported_image(&[0x89, b'P', b'N', b'G', 0x0D]));
+        assert!(looks_like_supported_image(&[0xFF, 0xD8, 0xFF, 0xE0]));
+        assert!(looks_like_supported_image(b"GIF89a"));
+        assert!(looks_like_supported_image(b"RIFF____WEBPVP8 "));
+        assert!(!looks_like_supported_image(b"not an image at all"));
+        assert!(!looks_like_supported_image(b""));
+    }
+
+    /// 端到端：真配置 + 真目录 + 真字节，走的就是线上那条一模一样的路
+    /// （扫目录 → 标签解析 → 读文件 → 认格式 → `base64://` 图片段）。
+    ///
+    /// 打开 `qq_sticker` 需要改进程级配置，所以按仓库既有约定标 `#[ignore]`，由
+    /// `ci.yml` 点名单跑（不需要数据库，也不需要网络）。真机上"QQ 里能不能收到"
+    /// 要部署后由人手验，但"她到底会发出去哪几个字节"在这里就能钉死。
+    #[test]
+    #[ignore = "mutates the process-global config; run via --ignored --exact"]
+    fn configured_library_renders_a_sendable_image_segment() {
+        use base64::Engine;
+
+        let dir = temp_dir("configured");
+        // 真图片头即可：这条链路不解码图片，只按文件头认格式。
+        let png: Vec<u8> = vec![
+            0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, b'I', b'H',
+            b'D', b'R',
+        ];
+        // 第二张故意换一个字节：轮换是"换文件"，不是"换同一份字节"。
+        let mut png_alt = png.clone();
+        png_alt.push(0x01);
+        std::fs::write(dir.join("开心-1.png"), &png).expect("应能写素材");
+        std::fs::write(dir.join("开心-2.png"), &png_alt).expect("应能写素材");
+        std::fs::write(dir.join("说明.txt"), b"not a sticker").expect("应能写素材");
+
+        let previous = crate::config::get();
+        let source = format!(
+            "[qq_sticker]\nenabled = true\ndir = \"{}\"\nrescan_secs = 1\n",
+            dir.display()
+        );
+        let candidate = crate::config::validate_candidate(&source).expect("候选配置应合法");
+        crate::config::install(candidate).expect("应安装测试配置");
+        if let Ok(mut index) = super::INDEX.lock() {
+            *index = super::StickerIndex::default();
+        }
+        if let Ok(mut counters) = super::USE_COUNTS.lock() {
+            counters.clear();
+        }
+
+        assert!(super::is_available());
+        // 文件名即标签；带编号的两张图归到同一个标签下。
+        assert_eq!(super::available_labels(), vec!["开心".to_string()]);
+        assert_eq!(super::resolve_label("开心"), Some("开心".to_string()));
+        assert_eq!(super::resolve_label(" 开心 "), Some("开心".to_string()));
+        assert_eq!(super::resolve_label("没有这张"), None);
+        // 不支持的格式不会变成标签。
+        assert_eq!(super::resolve_label("说明"), None);
+
+        let segment = super::build_sticker_segment("开心").expect("应能取到这张图");
+        assert_eq!(segment.type_, "image");
+        let file = segment.data["file"].as_str().expect("image 段应带 file");
+        let encoded = file
+            .strip_prefix("base64://")
+            .expect("素材应当以 base64:// 交付：不依赖 NapCat 与本机共享文件系统，也不要路径映射");
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .expect("交付内容应是合法 base64");
+        assert_eq!(decoded, png, "发出去的必须就是素材文件本身的字节");
+        assert_eq!(segment.data["summary"], "开心");
+
+        // 同一个标签下的多张图轮换着发：第二张就是目录里的另一个文件。
+        let rotated = super::build_sticker_segment("开心").expect("应能取到第二张");
+        let rotated_file = rotated.data["file"].as_str().expect("image 段应带 file");
+        let rotated_decoded = base64::engine::general_purpose::STANDARD
+            .decode(
+                rotated_file
+                    .strip_prefix("base64://")
+                    .expect("同样应是 base64://"),
+            )
+            .expect("交付内容应是合法 base64");
+        assert_eq!(rotated_decoded, png_alt);
+
+        if let Ok(mut index) = super::INDEX.lock() {
+            *index = super::StickerIndex::default();
+        }
+        crate::config::install(previous).expect("应还原配置");
+        assert!(!super::is_available());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
