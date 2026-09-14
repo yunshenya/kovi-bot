@@ -101,6 +101,14 @@ body {
   font: 14px/1.6 var(--sans);
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
+  /* 后台到处是"后台/群聊来的原文"：URL、哈希、[CQ:json,…]、错误原文都可能是一整串
+     不可断行的字符。手机上一旦有这种串把文档顶得比屏宽，iOS Safari 会把整页缩小
+     到能放下——看起来就是"右面没占满"，而且比例一旦定下不会自己还原。
+     overflow-wrap 是继承属性，在这里设一次就覆盖全部文本位（含以后新加的），且只在
+     真的放不下时才断；min-content 也跟着变小，flex 子项因此能收缩而不是把行顶出去。
+     `white-space: nowrap` 的元素（状态胶囊、按钮、chip）不受影响，它们各自有宽度
+     上限/省略号，或者文案本来就不可能长。 */
+  overflow-wrap: anywhere;
 }
 
 code, .mono { font-family: var(--mono); font-size: .92em; }
@@ -732,7 +740,9 @@ a.stat:hover, .stat.link:hover { border-color: var(--accent); transform: transla
   border-left: 3px solid var(--accent);
   border-radius: var(--radius-sm); padding: 10px 15px; font-size: 13px;
   box-shadow: var(--shadow); backdrop-filter: blur(8px);
-  max-width: 420px; animation: toast-in .2s var(--ease);
+  /* 写死 420px 在手机上比屏还宽：长提示会被裁在左边（实测 402px 屏上左边少 34px）。
+     不超过它所在的 fixed 容器即可，桌面上仍是 420px 封顶。 */
+  max-width: min(420px, 100%); animation: toast-in .2s var(--ease);
 }
 .toast.ok { border-left-color: var(--ok); }
 .toast.bad { border-left-color: var(--danger); }
