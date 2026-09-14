@@ -24,6 +24,19 @@ pub struct MemoryConfig {
     /// 记忆插到词面命中前面，**语义那一路反而让检索变差**。低于阈值就当作"没有相关的"，
     /// 老老实实退回词面结果。
     embedding_min_similarity_millis: u32,
+    /// **数据库连接池上限（默认 5，与历史行为一致）。**
+    ///
+    /// 全进程共用这一个池：记忆、提醒、agent run/task、executive 持久化都排它。
+    /// 巡检报告（`docs/known-issues-log-review-2026-09-12.md` 的 P0-3）记录过一次
+    /// "5 条不够"造成的饥饿（acquire 113.93s、后台任务 pool timed out）。
+    /// **调大之前先确认整机余量**：那次的根因是内存压力把 PG 拖慢，盲目加并发只会
+    /// 让更多请求一起挤在慢查询上，并加重 OOM。所以这里只把它变成可调，默认不动。
+    database_pool_max_connections: usize,
+    /// 取连接的最长等待（秒，默认 30 = sqlx 默认值）。
+    ///
+    /// 调小是让它**快速失败**：后台任务宁可早报错，也别排队 30 秒把别的任务一起拖住
+    /// （巡检报告里 executive 持久化被拖垮就是这条链的下游）。
+    database_acquire_timeout_secs: u64,
     /// **失控保护，不是管理手段。**
     ///
     /// 以前它是 1000，于是"记不记得住"由"数到第 1000 条"决定：两张记忆表都按
@@ -118,6 +131,14 @@ impl MemoryConfig {
 
     pub fn embedding_timeout_secs(&self) -> u64 {
         self.embedding_timeout_secs.max(1)
+    }
+
+    pub fn database_pool_max_connections(&self) -> usize {
+        self.database_pool_max_connections
+    }
+
+    pub fn database_acquire_timeout_secs(&self) -> u64 {
+        self.database_acquire_timeout_secs
     }
 
     pub fn embedding_backfill_batch(&self) -> usize {
@@ -237,6 +258,16 @@ impl MemoryConfig {
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
+        if !(1..=64).contains(&self.database_pool_max_connections) {
+            return Err(anyhow::anyhow!(
+                "memory.database_pool_max_connections 必须在 1 到 64 之间"
+            ));
+        }
+        if !(1..=600).contains(&self.database_acquire_timeout_secs) {
+            return Err(anyhow::anyhow!(
+                "memory.database_acquire_timeout_secs 必须在 1 到 600 秒之间"
+            ));
+        }
         if self.max_entries == 0 {
             return Err(anyhow::anyhow!("memory.max_entries 必须大于 0"));
         }
@@ -340,6 +371,8 @@ impl Default for MemoryConfig {
             embedding_timeout_secs: 20,
             embedding_backfill_batch: 128,
             embedding_min_similarity_millis: 450,
+            database_pool_max_connections: 5,
+            database_acquire_timeout_secs: 30,
             embedding_rerank_enabled: true,
             embedding_rerank_top_n: 12,
             max_entries: 50_000,

@@ -494,8 +494,16 @@ impl MemoryManager {
             ));
         }
 
+        // 池大小与取连接超时都走配置（默认 5 / 30 秒，与历史行为一致）：这两个值
+        // 原来写死在代码里，运维想按整机余量调一次就得发一版。
+        let memory_config = crate::config::get().memory().clone();
         let pool = PgPoolOptions::new()
-            .max_connections(5)
+            .max_connections(
+                u32::try_from(memory_config.database_pool_max_connections()).unwrap_or(u32::MAX),
+            )
+            .acquire_timeout(std::time::Duration::from_secs(
+                memory_config.database_acquire_timeout_secs(),
+            ))
             .connect(&database_url)
             .await
             .map_err(|error| anyhow::anyhow!("连接 PostgreSQL 失败: {}", error))?;

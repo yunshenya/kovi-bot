@@ -133,6 +133,14 @@ reply_rate_window_secs = 600
 reply_rate_limit = 4
 
 [memory]
+# 数据库连接池：全进程共用。默认 5 条 / 等 30 秒，与一直以来的行为一致。
+# 巡检报告（docs/known-issues-log-review-2026-09-12.md P0-3）记录过一次"5 条不够"的
+# 饥饿：acquire 113.93 秒、提醒与 agent run 相继 pool timed out。调大之前先确认整机
+# 内存余量——那次的根因是内存压力把 PG 拖慢，加并发只会让更多请求挤在慢查询上。
+database_pool_max_connections = 5
+# 取连接的最长等待。调小是"快速失败"：后台任务宁可早报错，也别排队 30 秒把别的任务
+# 一起拖住。
+database_acquire_timeout_secs = 30
 # 语义召回：本机 embed 服务（tools/embed-service）同时提供嵌入与重排，地址走回环。
 # 这几个键同样是"线上在用、模板缺失"的一类，值等于代码默认值，补进来只为对齐。
 embedding_enabled = true
