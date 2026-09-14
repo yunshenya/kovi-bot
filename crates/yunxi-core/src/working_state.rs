@@ -126,21 +126,23 @@ impl CompactEvent {
         include_text: bool,
         config: WorkingStateConfig,
     ) -> Self {
+        // 收到的与发出的都用 `history_text()`：语音/唱歌的表达方式必须留在历史里，
+        // 否则"她唱了一段"在上下文里退化成"她打了一段歌词"（2026-09-14 19:38 线上）。
         let text = include_text
             .then(|| match event.kind() {
-                WorldEventKind::MessageReceived(message) => message.content.as_text(),
+                WorldEventKind::MessageReceived(message) => message.content.history_text(),
                 WorldEventKind::MessageSent(message) => message
                     .content
                     .as_ref()
-                    .map_or("", crate::MessageContent::as_text),
-                WorldEventKind::ToolFailed(tool) => tool.error_category.as_str(),
-                WorldEventKind::ActionFailed(action) => action.error_category.as_str(),
-                _ => "",
+                    .map_or_else(String::new, crate::MessageContent::history_text),
+                WorldEventKind::ToolFailed(tool) => tool.error_category.clone(),
+                WorldEventKind::ActionFailed(action) => action.error_category.clone(),
+                _ => String::new(),
             })
             .filter(|value| !value.is_empty())
             .map(|value| {
                 bounded_text(
-                    value,
+                    &value,
                     config.max_compact_text_chars,
                     config.max_compact_text_bytes,
                 )

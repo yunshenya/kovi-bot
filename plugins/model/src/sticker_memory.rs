@@ -539,6 +539,16 @@ fn quoted_sender_label(value: &Value) -> Option<String> {
     ))
 }
 
+/// 这条消息里有没有语音（QQ `record` 段）。
+///
+/// 语音没有文字可抽取，所以引用一条语音时，旧代码会退化成 `to_human_string()`
+/// 的原始段落转储（`[record]` + 文件路径）——模型看不出"被引用的是语音"。
+/// 线上 2026-09-14 19:38：她唱了一段，群友引用那条问"这是什么歌"，她答
+/// "歌我没听到呀，你发的是文字"。这里把它变成可理解的一句话。
+fn message_has_voice(message: &Message) -> bool {
+    message.iter().any(|segment| segment.type_ == "record")
+}
+
 fn extract_text(message: &Message) -> String {
     message
         .iter()
@@ -563,10 +573,15 @@ pub(crate) async fn quoted_message_context(
     let stickers = extract_stickers(&quoted.message);
     let images = extract_image_attachments(&quoted.message);
     let labels = known_labels(&stickers, scope).await?;
+    let voice = message_has_voice(&quoted.message);
     let content = if !labels.is_empty() {
         with_sticker_context(&text, &labels)
+    } else if !text.is_empty() && voice {
+        format!("[语音消息] {text}")
     } else if !text.is_empty() {
         text
+    } else if voice {
+        "[语音消息]".to_string()
     } else if !stickers.is_empty() {
         "对方发送了一张尚未学习含义的表情包。".to_string()
     } else {
@@ -1686,6 +1701,23 @@ pub(crate) fn with_sticker_reaction_context(text: &str, previous_bot_message: &s
 
 #[cfg(test)]
 mod tests {
+    /// 引用一条**语音**消息时不能再把原始段落转储丢给模型（线上 19:38 的
+    /// "你发的是文字"就是这么来的）。这里锁住识别能力本身。
+    #[test]
+    fn voice_segments_are_recognised_in_quoted_messages() {
+        use kovi::serde_json::json;
+        let voice = Message::from(vec![Segment::new(
+            "record",
+            json!({"file": "file:///app/qq-call/voice/voice-1.wav"}),
+        )]);
+        assert!(super::message_has_voice(&voice));
+        assert_eq!(super::extract_text(&voice), "");
+
+        let text = Message::from(vec![Segment::new("text", json!({"text": "我在的呀。"}))]);
+        assert!(!super::message_has_voice(&text));
+        assert_eq!(super::extract_text(&text), "我在的呀。");
+    }
+
     use super::{
         QuotedMessageContext, StickerCandidateCommand, StickerCandidateSummary, StickerImage,
         StickerScope, extract_stickers, extract_text, format_candidate_list,

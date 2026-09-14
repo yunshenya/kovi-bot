@@ -338,6 +338,26 @@ impl MessageContent {
         self.voice
     }
 
+    /// 这条内容在**短期上下文与长期记忆**里怎么描述：语音与唱歌带上表达方式前缀，
+    /// 其余只写正文。
+    ///
+    /// 为什么不能只用 [`Self::as_text`]：那会把"怎么说的"抹掉，于是历史里她唱的
+    /// 那首歌看起来像她打了一段歌词。线上 2026-09-14 19:38 就是这么翻车的——她按
+    /// 要求唱了一段（QQ 语音），两分钟后有人回她"这是什么歌"，她答"歌我没听到呀，
+    /// 你发的是文字"。带前缀之后，短期上下文、群/私聊历史与长期记忆都看得出"这条
+    /// 是唱出来的/说出来的"。前缀只进历史与记忆，不参与投递。
+    #[must_use]
+    pub fn history_text(&self) -> String {
+        let text = self.as_text();
+        if self.is_sing() {
+            return format!("[唱歌] {text}");
+        }
+        if self.voice {
+            return format!("[语音] {text}");
+        }
+        text.to_owned()
+    }
+
     pub fn with_attachments(
         mut self,
         attachments: Vec<Attachment>,
@@ -1300,6 +1320,29 @@ pub enum EventValidationError {
 
 #[cfg(test)]
 mod tests {
+    /// 历史与记忆里必须看得出"怎么说的"：语音/唱歌带前缀，纯文字不带。
+    /// 线上 2026-09-14 19:38 她唱了一段，两分钟后却答"歌我没听到呀，你发的是
+    /// 文字"——因为 `as_text()` 把表达方式抹掉了。
+    #[test]
+    fn history_text_keeps_how_it_was_said() {
+        assert_eq!(
+            MessageContent::text("我在的呀。").history_text(),
+            "我在的呀。"
+        );
+        assert_eq!(
+            MessageContent::voice("我在的呀。").history_text(),
+            "[语音] 我在的呀。"
+        );
+        assert_eq!(
+            MessageContent::sing("今天的风轻轻吹过", "xiaoxingxing").history_text(),
+            "[唱歌] 今天的风轻轻吹过"
+        );
+        // 三种表达方式的正文本身不受影响（投递仍然用它）。
+        assert_eq!(MessageContent::sing("词", "t").as_text(), "词");
+        assert!(MessageContent::voice("词").is_voice());
+        assert!(MessageContent::sing("词", "t").is_sing());
+    }
+
     use super::{
         Attachment, AttachmentKind, AutonomousConversationTickEvent, EventPriority, EventScope,
         EventValidationError, GoalCompletedEvent, GoalUpdatedEvent, InteractionCuesObservedEvent,

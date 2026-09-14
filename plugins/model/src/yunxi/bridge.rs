@@ -3461,7 +3461,10 @@ async fn run_runtime(
                                 }
                             )
                         {
-                            let sent = content.as_text().trim();
+                            // 记忆里要保留"她是唱出来的还是打字的"：用
+                            // `history_text()`（语音/唱歌带前缀），而不是纯正文。
+                            let sent = content.history_text();
+                            let sent = sent.trim();
                             if !sent.is_empty() {
                                 delivered_replies.push(sent.to_string());
                             }
