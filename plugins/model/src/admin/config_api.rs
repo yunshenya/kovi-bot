@@ -247,7 +247,10 @@ pub(crate) async fn read_file(UrlPath(name): UrlPath<String>) -> Result<Json<Val
         "restart_required": file.restart_required,
         "writable": directory_writable(&path),
         "path": path.display().to_string(),
-        "raw": raw,
+        // `raw` 也要打码，且必须与 `masked` 列表一致：前端把这个字段直接塞进编辑器，
+        // 一边说"这些字段打了码"、一边原样回显密钥（NapCat 的 access_token、admin.token、
+        // 各种 *_api_key）等于把密钥放到屏幕、截图和浏览器缓存里。
+        "raw": mask_raw_secrets(&raw, &masked),
         "values": values,
         "masked": masked,
         "file_paths": present_paths(&raw),
@@ -274,10 +277,21 @@ pub(crate) async fn write_raw(
         return Err(ApiError::bad_request("配置文本过大"));
     }
 
-    let validated = validate_candidate(file, &body.raw)?;
+    // 显示侧把密钥打了码，所以整文件写回时必须把 `MASK` 还原成磁盘上的真值——否则
+    // 管理员在原始编辑器里点一次保存，所有密钥就变成 `********` 落盘。这与 patch 那条
+    // 路的约定一致（那里遇到 MASK 直接跳过该字段）。
+    let candidate_text = if file.typed {
+        let current = read_config_text(&path, file)?;
+        let (_, masked) = mask_typed(effective_values());
+        restore_masked_secrets(&body.raw, &current, &masked)
+    } else {
+        body.raw.clone()
+    };
+
+    let validated = validate_candidate(file, &candidate_text)?;
 
     let backup = backup(&path)?;
-    write_atomically(&path, &body.raw).map_err(|error| write_hint(&path, &error))?;
+    write_atomically(&path, &candidate_text).map_err(|error| write_hint(&path, &error))?;
 
     let mut reloaded = false;
     if let Some(config) = validated {
@@ -600,6 +614,85 @@ fn mask_typed(mut values: Value) -> (Value, Vec<String>) {
         }
     }
     (values, masked)
+}
+
+/// 按点分路径定位 TOML 里的一个条目（不存在就返回 None）。
+fn item_at_toml_path<'a>(document: &'a mut DocumentMut, path: &[&str]) -> Option<&'a mut Item> {
+    let mut current: &mut Item = document.as_item_mut();
+    for segment in path {
+        current = current.as_table_like_mut()?.get_mut(segment)?;
+    }
+    Some(current)
+}
+
+/// 按点分路径读出一份 TOML 里的值（不存在就返回 None）。
+fn value_at_toml_path(document: &DocumentMut, path: &[&str]) -> Option<TomlValue> {
+    let mut current: &Item = document.as_item();
+    for segment in path {
+        current = current.as_table_like()?.get(segment)?;
+    }
+    current.as_value().cloned()
+}
+
+/// 把 `raw` 文本里被点名的密钥值换成 `MASK`（显示用）。
+///
+/// 用 `toml_edit` 而不是字符串替换：只动点名的键，注释与空行原样保留；路径在本文件里
+/// 不存在（例如密钥只写在覆盖配置里）就跳过。
+fn mask_raw_secrets(raw: &str, masked: &[String]) -> String {
+    if masked.is_empty() || raw.trim().is_empty() {
+        return raw.to_string();
+    }
+    let Ok(mut document) = raw.parse::<DocumentMut>() else {
+        return raw.to_string();
+    };
+    let mut changed = false;
+    for path in masked {
+        let segments: Vec<&str> = path.split('.').collect();
+        if let Some(item) = item_at_toml_path(&mut document, &segments)
+            && let Some(value) = item.as_value_mut()
+        {
+            *value = TomlValue::from(MASK);
+            changed = true;
+        }
+    }
+    if changed {
+        document.to_string()
+    } else {
+        raw.to_string()
+    }
+}
+
+/// 写回时把 `MASK` 还原成磁盘上现存的真实值（`MASK` = "这个密钥我不改"）。
+fn restore_masked_secrets(candidate: &str, current: &str, masked: &[String]) -> String {
+    if masked.is_empty() {
+        return candidate.to_string();
+    }
+    let (Ok(mut target), Ok(source)) = (
+        candidate.parse::<DocumentMut>(),
+        current.parse::<DocumentMut>(),
+    ) else {
+        return candidate.to_string();
+    };
+    let mut restored = false;
+    for path in masked {
+        let segments: Vec<&str> = path.split('.').collect();
+        // 磁盘上没有这个键（或它本来就没值）就没什么可还原的。
+        let Some(existing_value) = value_at_toml_path(&source, &segments) else {
+            continue;
+        };
+        let Some(item) = item_at_toml_path(&mut target, &segments) else {
+            continue;
+        };
+        if item.as_value().and_then(TomlValue::as_str) == Some(MASK) {
+            *item = Item::Value(existing_value);
+            restored = true;
+        }
+    }
+    if restored {
+        target.to_string()
+    } else {
+        candidate.to_string()
+    }
 }
 
 /// 递归找出名字像密钥的字段（用于通用 TOML 文件）。
@@ -985,6 +1078,42 @@ mod tests {
 
         std::fs::remove_file(&override_path).ok();
         std::fs::remove_dir(&dir).ok();
+    }
+
+    /// 原始编辑器的打码/还原必须成对：只打码不还原，管理员点一次保存就把密钥写成
+    /// `********`；只还原不打码，密钥就一直在屏幕上。
+    #[test]
+    fn raw_secrets_are_masked_for_display_and_restored_on_write() {
+        let current = "[server]\n# 桥的访问令牌\naccess_token = \"real-token\"\nport = 3001\n";
+        let masked = vec!["server.access_token".to_string()];
+
+        let display = mask_raw_secrets(current, &masked);
+        assert!(!display.contains("real-token"), "密钥不能回显: {display}");
+        assert!(display.contains(MASK));
+        assert!(display.contains("port = 3001"), "别的键要原样保留");
+        assert!(display.contains("# 桥的访问令牌"), "注释要原样保留");
+
+        // 原样存回：还原成磁盘真值。
+        let saved = restore_masked_secrets(&display, current, &masked);
+        assert!(
+            saved.contains("real-token"),
+            "原样保存不能把密钥换成星号: {saved}"
+        );
+        assert!(!saved.contains(MASK));
+
+        // 改了别的字段：密钥同样要保住。
+        let edited = display.replace("port = 3001", "port = 3002");
+        let saved = restore_masked_secrets(&edited, current, &masked);
+        assert!(saved.contains("real-token") && saved.contains("port = 3002"));
+
+        // 管理员显式轮换了密钥：要写进去，不能被他刚填的值之外的东西覆盖。
+        let rotated = display.replace(MASK, "new-token");
+        let saved = restore_masked_secrets(&rotated, current, &masked);
+        assert!(saved.contains("new-token"), "轮换要生效: {saved}");
+
+        // 路径在本文件里不存在（密钥只在覆盖里）时不该改动任何东西。
+        let untouched = mask_raw_secrets(current, &["other.secret".to_string()]);
+        assert_eq!(untouched, current);
     }
 
     #[test]
