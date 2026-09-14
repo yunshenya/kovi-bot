@@ -515,6 +515,16 @@ async fn main() {
         panic!("表情包记忆库初始化失败，拒绝写入 readiness: {error}");
     }
 
+    // 表情包素材库目录：缺了就补建（幂等），部署完可以直接把素材丢进去，不必先
+    // 手工 mkdir。建不出来**不 panic**——发表情包是可选能力，目录不可用只让她少一个
+    // 出口，不该把整个机器人拦在 readiness 之外；但要在启动时把原因喊清楚。
+    if crate::config::qq_sticker_enabled() {
+        match sticker_library::ensure_directory() {
+            Ok(path) => println!("[INFO] 表情包素材库目录已就绪: {}", path.display()),
+            Err(error) => eprintln!("[ERROR] 表情包素材库目录不可用，她不会发表情包: {error}"),
+        }
+    }
+
     // Redis 只承载可丢失的运行态；连接失败时各模块会继续使用本地兜底。
     redis_store::initialize().await;
 

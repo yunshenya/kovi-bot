@@ -121,9 +121,40 @@ pub(crate) fn build_sticker_message(raw_label: &str) -> Option<Message> {
     Some(message)
 }
 
+/// 素材目录的准备（幂等）：缺了就补建。
+///
+/// 与 `admin.annotation_dir` 同一条约定——部署完就该能直接把素材丢进去，不该先让人
+/// 手工 `mkdir`（`scp` 到不存在的目录会直接失败）。关闭配置时不碰磁盘。
+pub(crate) fn ensure_directory() -> anyhow::Result<PathBuf> {
+    let config = crate::config::get();
+    let dir = crate::config::sticker_library_path();
+    if !config.qq_sticker().enabled() {
+        return Ok(dir);
+    }
+    ensure_directory_exists(&dir).map_err(|error| {
+        anyhow::anyhow!(
+            "创建表情包素材库目录失败 (目录: {}): {error}",
+            dir.display()
+        )
+    })?;
+    Ok(dir)
+}
+
+/// `create_dir_all` 的薄包装，返回"这次是不是真的建了"（便于只在该打日志时打）。
+fn ensure_directory_exists(dir: &Path) -> std::io::Result<bool> {
+    if dir.is_dir() {
+        return Ok(false);
+    }
+    std::fs::create_dir_all(dir)?;
+    Ok(true)
+}
+
 #[derive(Debug, Default)]
 struct StickerIndex {
     scanned_at: Option<Instant>,
+    /// 上一次打日志时的 `(文件数, 标签数)`。默认 30 秒重扫一次，按次打日志会把
+    /// 日志刷满，所以只在素材库的状态**变了**的时候打一行。
+    logged: Option<(usize, usize)>,
     /// 标签 → 该标签下的素材文件（已排序，便于轮换与测试）。
     labels: BTreeMap<String, Vec<PathBuf>>,
 }
@@ -201,23 +232,48 @@ fn refresh_if_stale(index: &mut StickerIndex, config: &QqStickerConfig) {
         return;
     }
     let dir = crate::config::sticker_library_path();
+    // 目录缺失就补建（幂等）：运维不该先手工 mkdir 才能把素材丢进去；管理后台热开
+    // 这个开关、或者目录被外部删掉时，这里也会自己长回来。
+    let created = match ensure_directory_exists(&dir) {
+        Ok(created) => created,
+        Err(error) => {
+            eprintln!(
+                "[ERROR] 表情包素材库目录创建失败，她这一轮不会发表情包 (目录: {}): {}",
+                dir.display(),
+                error
+            );
+            false
+        }
+    };
     let labels = scan_directory(&dir, config.max_files());
-    if labels.is_empty() {
-        println!(
-            "[INFO] 表情包素材库为空 (目录: {})，她这一轮不会发表情包",
-            dir.display()
-        );
-    } else {
-        let files = labels.values().map(Vec::len).sum::<usize>();
-        println!(
-            "[INFO] 表情包素材库已加载 {} 张图 / {} 个标签 (目录: {})",
-            files,
-            labels.len(),
-            dir.display()
-        );
+    let files = labels.values().map(Vec::len).sum::<usize>();
+    // 只在状态变了的时候打一行：默认 30 秒重扫一次，按次打会把日志刷满。目录刚建出来
+    // 也算变化——那一行正是运维最需要看到的"该往哪儿放"。
+    if created || index.logged != Some((files, labels.len())) {
+        if files == 0 {
+            println!(
+                "[INFO] 表情包素材库{}，往里面放几张图片就能用 (目录: {})",
+                if created {
+                    "目录已创建，现在是空的"
+                } else {
+                    "为空"
+                },
+                dir.display()
+            );
+        } else {
+            println!(
+                "[INFO] 表情包素材库已加载 {} 张图 / {} 个标签{} (目录: {})",
+                files,
+                labels.len(),
+                if created { "，目录已创建" } else { "" },
+                dir.display()
+            );
+        }
     }
+    let logged = Some((files, labels.len()));
     *index = StickerIndex {
         scanned_at: Some(Instant::now()),
+        logged,
         labels,
     };
 }
@@ -457,10 +513,22 @@ fn looks_like_supported_image(bytes: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        StickerLibraryCommand, label_for_path, looks_like_supported_image, parse_command,
-        resolve_in, scan_directory, strip_trailing_ordinal,
+        StickerLibraryCommand, ensure_directory_exists, label_for_path, looks_like_supported_image,
+        parse_command, resolve_in, scan_directory, strip_trailing_ordinal,
     };
     use std::path::{Path, PathBuf};
+
+    /// 丢掉进程内的扫描缓存与轮换计数，让下一次访问重新扫一遍目录。
+    ///
+    /// 只给"改配置/改目录"的用例用：正常路径靠 `rescan_secs` 自己过期，不该依赖它。
+    fn reset_library_state() {
+        if let Ok(mut index) = super::INDEX.lock() {
+            *index = super::StickerIndex::default();
+        }
+        if let Ok(mut counters) = super::USE_COUNTS.lock() {
+            counters.clear();
+        }
+    }
 
     fn temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -557,6 +625,30 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 目录缺失要自动补建（幂等）：运维不该先手工 mkdir 才能把素材丢进去。
+    #[test]
+    fn missing_directories_are_created_and_creation_is_idempotent() {
+        let parent = temp_dir("ensure");
+        let nested = parent.join("stickers/nested");
+
+        assert!(
+            ensure_directory_exists(&nested).expect("应能补建目录"),
+            "第一次调用应当真的建了目录"
+        );
+        assert!(nested.is_dir());
+        assert!(
+            !ensure_directory_exists(&nested).expect("已存在的目录应当是空操作"),
+            "目录已存在时不该报'这次建了'"
+        );
+
+        // 路径被一个同名文件占住时如实报错，而不是当成"建好了"。
+        let blocked = parent.join("blocked");
+        std::fs::write(&blocked, b"not a directory").expect("应能写占位文件");
+        assert!(ensure_directory_exists(&blocked).is_err());
+
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
     #[test]
     fn missing_directory_scans_as_empty() {
         let labels = scan_directory(Path::new("/tmp/kovi-sticker-library-does-not-exist"), 10);
@@ -612,7 +704,24 @@ mod tests {
     fn configured_library_renders_a_sendable_image_segment() {
         use base64::Engine;
 
-        let dir = temp_dir("configured");
+        // 故意指向一个**还不存在**的目录：补建是这条链路的一部分。
+        let root = temp_dir("configured");
+        let dir = root.join("stickers");
+        assert!(!dir.is_dir(), "前置条件：目录一开始不该存在");
+
+        let previous = crate::config::get();
+        let source = format!(
+            "[qq_sticker]\nenabled = true\ndir = \"{}\"\nrescan_secs = 1\n",
+            dir.display()
+        );
+        let candidate = crate::config::validate_candidate(&source).expect("候选配置应合法");
+        crate::config::install(candidate).expect("应安装测试配置");
+        reset_library_state();
+
+        // 第一次扫描：目录被补出来，但还没有素材，所以这个出口仍然不下发。
+        assert!(!super::is_available());
+        assert!(dir.is_dir(), "扫描时应当补建素材目录");
+
         // 真图片头即可：这条链路不解码图片，只按文件头认格式。
         let png: Vec<u8> = vec![
             0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, b'I', b'H',
@@ -624,20 +733,7 @@ mod tests {
         std::fs::write(dir.join("开心-1.png"), &png).expect("应能写素材");
         std::fs::write(dir.join("开心-2.png"), &png_alt).expect("应能写素材");
         std::fs::write(dir.join("说明.txt"), b"not a sticker").expect("应能写素材");
-
-        let previous = crate::config::get();
-        let source = format!(
-            "[qq_sticker]\nenabled = true\ndir = \"{}\"\nrescan_secs = 1\n",
-            dir.display()
-        );
-        let candidate = crate::config::validate_candidate(&source).expect("候选配置应合法");
-        crate::config::install(candidate).expect("应安装测试配置");
-        if let Ok(mut index) = super::INDEX.lock() {
-            *index = super::StickerIndex::default();
-        }
-        if let Ok(mut counters) = super::USE_COUNTS.lock() {
-            counters.clear();
-        }
+        reset_library_state();
 
         assert!(super::is_available());
         // 文件名即标签；带编号的两张图归到同一个标签下。
@@ -672,11 +768,9 @@ mod tests {
             .expect("交付内容应是合法 base64");
         assert_eq!(rotated_decoded, png_alt);
 
-        if let Ok(mut index) = super::INDEX.lock() {
-            *index = super::StickerIndex::default();
-        }
+        reset_library_state();
         crate::config::install(previous).expect("应还原配置");
         assert!(!super::is_available());
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

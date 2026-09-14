@@ -712,6 +712,7 @@ default_template = "zichang-qingkuai"
 enabled = false
 # 素材目录。相对路径以运行时目录为基准（与 admin.annotation_dir 一致）；
 # 生产部署建议写绝对路径，例如 "/home/ubuntu/yunxi-stickers"。
+# 目录不存在会自动补建（与标注目录同一约定）：部署完直接把图丢进去就行，不必先 mkdir。
 dir = "stickers"
 # 最多收录多少个素材文件；超出部分按路径排序截断。
 max_files = 200
