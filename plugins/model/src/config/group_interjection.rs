@@ -378,6 +378,18 @@ mod tests {
         assert!(GroupInterjectionConfig::default().validate().is_ok());
     }
 
+    /// 线上配置是从上一版 release 继承的，**没有**接续那三个键——线上行为完全
+    /// 由这里的默认值决定。改默认值等于改线上行为，所以钉住它。
+    #[test]
+    fn continuation_defaults_are_on_and_documented() {
+        let config = GroupInterjectionConfig::default();
+        assert!(config.continuation_enabled());
+        assert_eq!(config.continuation_focus_ttl_secs(), 120);
+        assert_eq!(config.continuation_merge_dwell_ms(), 2_500);
+        assert_eq!(config.continuation_merge_wait_ms(), 6_000);
+        assert_eq!(config.effective_continuation_reply_gap_secs(), 0);
+    }
+
     #[test]
     fn probability_over_one_hundred_is_rejected() {
         let config = GroupInterjectionConfig {
