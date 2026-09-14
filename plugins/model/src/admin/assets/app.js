@@ -2691,23 +2691,52 @@
     $('#modal-body').replaceChildren(body);
   }
 
-  /** 人物弹窗里用的紧凑记录行。 */
+  /**
+   * 一条记忆记录（概览的"最近变化"与人物弹窗共用）。
+   *
+   * 行内的排版是按"扫"来定的，不是按"读"：
+   *   - 第一行只放**分类 + 作用域 + 时间**，时间靠右对齐——一列下来时间能连成一条
+   *     竖线，比每行都从左往右找要快；
+   *   - 标题最多两行（`clamp-2`）：群聊记忆的标题可以很长，不夹住的话一条就占掉
+   *     半屏，十条"最近变化"要滚三屏才看得完；
+   *   - 正文只在**它比标题多说了一点**的时候才出现。旧版记忆的 body 和 title 本来
+   *     就是同一段文字，Mind 的 body 往往以 title 开头，照抄一遍纯粹是浪费行高。
+   */
   function recordNode(item, onClick, active) {
     const needle = memory.query;
+    const body = recordBodyPreview(item);
     return h('div', {
       class: `record${active ? ' active' : ''}`,
       onclick: onClick,
     },
-      h('div', { class: 'record-head' },
+      h('div', { class: 'record-meta' },
         h('span', { class: 'badge kind', text: item.label || item.kind }),
-        item.status ? h('span', { class: 'badge', text: item.status }) : null),
-      h('div', { class: 'record-title' }, ...highlighted(item.title, needle)),
-      item.body && item.body !== item.title
-        ? h('div', { class: 'record-body' }, ...highlighted(item.body.slice(0, 160), needle))
-        : null,
-      h('div', { class: 'record-foot' },
-        h('span', { text: item.scope_label || '全局' }),
-        h('span', { text: relative(item.occurred_at) || fmtTime(item.occurred_at) })));
+        statusBadge(item.status),
+        // 作用域为空说明它是全局记录，"全局"两个字每行都写一遍等于没写。
+        item.scope_label ? h('span', { class: 'record-scope', text: item.scope_label }) : null,
+        h('span', { class: 'record-when', text: relative(item.occurred_at) || fmtTime(item.occurred_at) })),
+      h('div', { class: 'record-title clamp-2' }, ...highlighted(item.title, needle)),
+      body ? h('div', { class: 'record-body clamp-2' }, ...highlighted(body, needle)) : null);
+  }
+
+  /** 这些状态是"一切正常"的默认值：每行挂一个只是噪声，真正有信息量的才给 badge。 */
+  const QUIET_STATUSES = new Set(['', 'active', 'open', 'conversation', 'pending']);
+
+  /** 有信息量的状态翻成中文再显示——界面上不该出现 `resolved` 这种库里的枚举。 */
+  function statusBadge(status) {
+    const raw = String(status || '').trim();
+    if (QUIET_STATUSES.has(raw.toLowerCase())) return null;
+    return h('span', { class: 'badge', text: tagLabel(raw.toLowerCase()) });
+  }
+
+  /** 正文预览：与标题重复（或只是标题的续写）就返回空串，不再占一行。 */
+  function recordBodyPreview(item) {
+    const body = String(item.body || '').trim();
+    const title = String(item.title || '').trim();
+    if (!body || body === title) return '';
+    if (title && body.startsWith(title)) return '';
+    const flat = body.split(/\s+/).filter(Boolean).join(' ');
+    return flat.length > 160 ? `${flat.slice(0, 160)}…` : flat;
   }
 
   // ───────────────────────────── 模型 ─────────────────────────────
