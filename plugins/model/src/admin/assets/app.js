@@ -257,6 +257,9 @@
   $('#theme-toggle').addEventListener('click', () => {
     const next = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
     applyTheme(next);
+    // 有几处颜色是**渲染时按当前主题算出来**的（记忆页的实体 chip、模型页档案卡的首字），
+    // 换主题不重画的话它们会停在上一个主题的那一版。
+    if (currentPage === 'memory' || currentPage === 'model') goto(currentPage);
   });
 
   // ───────────────────────────── 页面切换 ─────────────────────────────
@@ -2816,7 +2819,8 @@
   ];
 
   /** 模型页状态。切页会整页重建，靠它挂住预设选择、测试结果与结果节点。 */
-  const model = { data: null, provider: 'deepseek', test: null, testNode: null };
+  /** 模型页状态。`editingId` 非空表示下面那张表单正在改一套已存在的档案。 */
+  const model = { data: null, provider: 'deepseek', test: null, testNode: null, editingId: null };
 
   async function renderModelPage() {
     const page = $('#page-model');
@@ -2834,8 +2838,9 @@
     model.data = data;
     clear(page);
     page.append(renderModelStatus(data));
-    page.append(renderModelForm(data));
+    // 列表在前、表单在后：这一页最常做的事是"换一套"，不是"改字段"。
     page.append(renderModelProfiles(data));
+    page.append(renderModelForm(data));
   }
 
   function renderModelStatus(data) {
@@ -2850,7 +2855,7 @@
             text: current.enabled ? '外部模型已启用' : '外部模型已禁用',
           })),
         h('div', { class: 'hint', text: current.enabled
-          ? '她在用下面这套端点回话'
+          ? '她在用这一套回话；想换就点下面「模型档案」里的卡片'
           : '关掉时她只用本地能力（Core / Intrinsic），配置照旧保留' })),
       h('div', { class: 'model-facts' },
         modelFact('模型', current.model_name || '—'),
@@ -2874,43 +2879,217 @@
       h('span', { class: 'model-fact-value mono', text: value }));
   }
 
+  /**
+   * 一套档案 = 一张可点的卡片。
+   *
+   * 这一页最常做的事是"换一套模型"，所以卡片本身就是主控件：点一下切过去，
+   * 不为这件事再要求人去右边找一个"应用"小按钮。`切换 / 编辑 / 删除` 三个按钮
+   * 是给键盘与不习惯点卡片的人留的（卡片本身没有 role/tabindex，嵌套可交互元素
+   * 在 ARIA 里是无效结构，所以键盘入口就靠这三个真按钮）。
+   */
+  function profileCard(profile, current) {
+    const isActive = isActiveProfile(profile, current);
+    const switchTo = () => switchModelProfile(profile);
+    const color = entityColor(profile.label);
+    return h('div', {
+      class: `provider-card${isActive ? ' active' : ''}`,
+      title: isActive ? '正在使用这一套' : `点一下切到「${profile.label}」`,
+      onclick: () => { if (!isActive) switchTo(); },
+    },
+      h('span', {
+        class: 'provider-avatar',
+        style: `color:${color};border-color:${color}55;background:${color}1a`,
+      }, avatarLetter(profile.label)),
+      h('div', { class: 'provider-main' },
+        h('div', { class: 'provider-head' },
+          h('span', { class: 'provider-label', text: profile.label }),
+          ...profileBadges(profile, isActive)),
+        h('div', { class: 'provider-meta', text: profileMeta(profile) }),
+        h('div', {
+          class: 'provider-url mono',
+          title: profile.url || '',
+          text: profile.url || '（没有填地址）',
+        })),
+      h('div', { class: 'provider-actions' },
+        isActive ? null : h('button', {
+          class: 'btn small', text: '切换',
+          title: '立刻切到这一套（写进运行时覆盖配置，不需要重启）',
+          onclick: (event) => { event.stopPropagation(); switchTo(); },
+        }),
+        h('button', {
+          class: 'btn ghost small', text: '编辑',
+          title: '把这一套填进下面的表单，改完就地保存',
+          onclick: (event) => { event.stopPropagation(); editModelProfile(profile); },
+        }),
+        h('button', {
+          class: 'btn danger small', text: '删除',
+          onclick: (event) => { event.stopPropagation(); removeModelProfile(profile); },
+        })));
+  }
+
+  /** 首字：中文取第一个字，英文取首字母（大写）。 */
+  function avatarLetter(label) {
+    const text = String(label || '').trim();
+    return text ? text.slice(0, 1).toUpperCase() : '?';
+  }
+
+  /** 档案是不是正在生效的那一套：与原来那行「正在用」同一个口径（地址 + 模型名）。 */
+  function isActiveProfile(profile, current) {
+    return Boolean(profile.model_name)
+      && profile.model_name === current.model_name
+      && profile.url === current.url;
+  }
+
+  /** 「带密钥 / 无密钥」「能读图」「免鉴权」：一眼决定切到哪一套。 */
+  function profileBadges(profile, isActive) {
+    const badges = [];
+    if (isActive) badges.push(h('span', { class: 'badge kind', text: '正在用' }));
+    badges.push(h('span', {
+      class: `badge ${profile.has_key ? 'ok' : 'warn'}`,
+      text: profile.has_key ? '带密钥' : '无密钥',
+    }));
+    if (profile.supports_vision) badges.push(h('span', { class: 'badge', text: '能读图' }));
+    if (profile.requires_auth === false) badges.push(h('span', { class: 'badge', text: '免鉴权' }));
+    return badges;
+  }
+
+  /** 卡片副标题：协议 · 模型名 · 输出上限。 */
+  function profileMeta(profile) {
+    const parts = [
+      profile.wire_api === 'responses' ? 'Responses' : 'Chat Completions',
+      profile.model_name || '（没有填模型名）',
+    ];
+    if (profile.max_output_tokens) parts.push(`最多 ${profile.max_output_tokens} token`);
+    return parts.join(' · ');
+  }
+
+  /** 地址反查服务商预设：编辑一套已有档案时，下拉要能选中它当年是从哪家建的。 */
+  function guessProvider(url) {
+    const text = String(url || '').trim();
+    if (!text) return '';
+    const hit = MODEL_PROVIDERS.find((item) => item.url && text.startsWith(item.url));
+    return hit ? hit.id : 'custom';
+  }
+
+  async function switchModelProfile(profile) {
+    try {
+      await api('/api/model/apply', { method: 'POST', body: { profile_id: profile.id } });
+      toast(`已切到「${profile.label}」`, 'ok');
+      model.editingId = null;
+      await renderModelPage();
+      // 概览页/顶栏看的是同一份 /api/status，顺手让它别再拿缓存里的旧模型名。
+      await refreshHealth();
+    } catch (problem) {
+      toast(problem.message, 'bad', 7000);
+    }
+  }
+
+  async function editModelProfile(profile) {
+    model.editingId = profile.id;
+    model.provider = guessProvider(profile.url) || model.provider;
+    await renderModelPage();
+    revealModelForm('model-url');
+  }
+
+  async function removeModelProfile(profile) {
+    if (!window.confirm(`删除档案「${profile.label}」？（不影响当前生效的配置）`)) return;
+    try {
+      await api(`/api/model/profiles/${encodeURIComponent(profile.id)}`, { method: 'DELETE' });
+      if (model.editingId === profile.id) model.editingId = null;
+      toast('已删除', 'ok');
+    } catch (problem) {
+      toast(problem.message, 'bad');
+    }
+    await renderModelPage();
+  }
+
+  /** 展开「新增 / 编辑」那张表单并滚过去——点了按钮却看不见表单等于没反应。 */
+  function revealModelForm(focusId) {
+    const details = $('#model-form');
+    if (!details) return;
+    details.open = true;
+    details.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    const target = details.querySelector(focusId ? `#${focusId}` : '.model-form .input');
+    if (target) target.focus({ preventScroll: true });
+  }
+
+  function renderModelProfiles(data) {
+    const profiles = (data.profiles && data.profiles.items) || [];
+    const current = data.current || {};
+    const cards = profiles.map((profile) => profileCard(profile, current));
+
+    const addButton = h('button', {
+      class: 'btn primary small', text: '+ 新增档案',
+      title: '选服务商、填密钥，存成一套新的端点',
+      onclick: () => {
+        model.editingId = null;
+        renderModelPage().then(() => revealModelForm('model-url'));
+      },
+    });
+
+    return h('div', { class: 'card' },
+      h('div', { class: 'card-head' },
+        h('h3', { text: '模型档案' }),
+        addButton),
+      cards.length
+        ? [
+          h('div', { class: 'hint', text: '点一张卡片就切过去，立刻生效、不需要重启；正在用的那张高亮并标着「正在用」。' }),
+          h('div', { class: 'provider-list' }, ...cards),
+        ]
+        : h('div', { class: 'empty', text: '还没有档案。点「+ 新增档案」把常用的一套存下来，以后一键切换。' }));
+  }
+
   function renderModelForm(data) {
     const current = data.current || {};
-    const preset = MODEL_PROVIDERS.find((item) => item.id === model.provider) || MODEL_PROVIDERS[0];
+    const editing = model.editingId
+      ? ((data.profiles && data.profiles.items) || []).find((item) => item.id === model.editingId) || null
+      : null;
+    // 编辑态：表单初值来自那套档案；新增态：来自当前生效的配置。
+    const source = editing || current;
+    // 服务商下拉跟着**地址**走：新增时如果当前配置指向的中转站不是任何一家预设，
+    // 下拉却还停在"DeepSeek（内置默认）"就是自相矛盾。
+    const presetId = guessProvider(source.url) || model.provider;
+    const preset = MODEL_PROVIDERS.find((item) => item.id === presetId) || MODEL_PROVIDERS[0];
 
     const providerSelect = h('select', { class: 'select', id: 'model-provider' },
       ...MODEL_PROVIDERS.map((item) => h('option', {
-        value: item.id, selected: item.id === model.provider, text: item.label,
+        value: item.id, selected: item.id === presetId, text: item.label,
       })));
     const urlInput = h('input', {
-      class: 'input mono', id: 'model-url', value: current.url || '',
+      class: 'input mono', id: 'model-url', value: source.url || '',
       placeholder: 'https://api.example.com/v1',
     });
     const modelInput = h('input', {
-      class: 'input mono', id: 'model-name', value: current.model_name || '',
+      class: 'input mono', id: 'model-name', value: source.model_name || '',
       placeholder: '模型名，例如 deepseek-v4-flash', list: 'model-name-options',
     });
     const modelOptions = h('datalist', { id: 'model-name-options' },
       ...preset.models.map((name) => h('option', { value: name })));
     const keyInput = h('input', {
       class: 'input mono', id: 'model-key', type: 'password', autocomplete: 'new-password',
-      placeholder: current.has_key ? '留空 = 沿用现在这把' : '粘贴 API Key（只写不读，后台不回显）',
+      // 密钥只进不出：编辑既有档案时留空就是"还用这把"，不是"清空"。
+      placeholder: editing
+        ? (editing.has_key ? '留空 = 沿用这套档案里的密钥' : '这套档案没有密钥；要用就粘一把进来')
+        : (current.has_key ? '留空 = 沿用现在这把' : '粘贴 API Key（只写不读，后台不回显）'),
     });
-    const visionToggle = h('input', { type: 'checkbox', checked: Boolean(current.supports_vision) });
-    const authToggle = h('input', { type: 'checkbox', checked: current.requires_auth !== false });
+    const visionToggle = h('input', { type: 'checkbox', checked: Boolean(source.supports_vision) });
+    const authToggle = h('input', { type: 'checkbox', checked: source.requires_auth !== false });
     const thinkingSelect = h('select', { class: 'select' },
       ...[['disabled', '关闭（推荐：省下的预算留给正文）'], ['auto', '交给服务商默认']]
-        .map(([value, text]) => h('option', { value, selected: current.thinking_mode === value, text })));
+        .map(([value, text]) => h('option', { value, selected: source.thinking_mode === value, text })));
     const wireSelect = h('select', { class: 'select' },
       ...[['chat_completions', 'Chat Completions（绝大多数）'], ['responses', 'Responses（OpenAI 新协议）']]
-        .map(([value, text]) => h('option', { value, selected: current.wire_api === value, text })));
+        .map(([value, text]) => h('option', { value, selected: source.wire_api === value, text })));
     const tokensInput = h('input', {
       class: 'input mono', type: 'number', min: '128',
-      value: String(current.max_output_tokens || 1200),
+      // 档案里 0 表示"沿用当前配置"，别在编辑时把它变成具体的 1200：
+      // 那样一存就把"不表态"改成了"就按 1200 来"。
+      value: source.max_output_tokens ? String(source.max_output_tokens) : (editing ? '' : '1200'),
+      placeholder: editing ? '留空 = 沿用当前配置' : '',
     });
-    const saveAsInput = h('input', {
-      class: 'input', id: 'model-save-as',
-      placeholder: '可选：起个名字存成档案，方便以后一键切回',
+    const labelInput = h('input', {
+      class: 'input', id: 'model-save-as', value: editing ? editing.label : '',
+      placeholder: editing ? '档案名' : '可选：起个名字存成档案，方便以后一键切回',
     });
     const result = h('div', { class: 'model-test', id: 'model-test' });
     model.testNode = result;
@@ -2964,29 +3143,49 @@
 
     const applyButton = h('button', {
       class: 'btn primary',
-      text: '应用',
+      text: editing ? '保存并应用' : '应用',
       title: '写入运行时覆盖配置并立刻生效（不需要重启）',
       onclick: async () => {
         const payload = formBody();
         if (!payload.model_name) { toast('先填模型名', 'bad'); modelInput.focus(); return; }
-        const saveAs = saveAsInput.value.trim();
-        if (saveAs) payload.save_as = saveAs;
+        // 编辑态必须带上 profile_id 与名字：前者决定"就地更新"而不是"再存一套同名"，
+        // 后者是服务端 required 的档案名（清空了就沿用原来那个）。
+        if (editing) {
+          payload.profile_id = editing.id;
+          payload.save_as = labelInput.value.trim() || editing.label;
+        } else {
+          const label = labelInput.value.trim();
+          if (label) payload.save_as = label;
+        }
         try {
           const outcome = await api('/api/model/apply', { method: 'POST', body: payload });
-          toast(outcome.profile_id ? '已应用，并存成档案' : '已应用，立刻生效', 'ok');
+          toast(
+            editing ? `已更新「${payload.save_as}」并生效`
+              : (outcome.profile_id ? '已应用，并存成档案' : '已应用，立刻生效'),
+            'ok');
+          model.editingId = null;
           keyInput.value = '';
-          saveAsInput.value = '';
           await renderModelPage();
+          await refreshHealth();
         } catch (problem) {
           toast(problem.message, 'bad', 7000);
         }
       },
     });
 
-    return h('div', { class: 'card' },
-      h('div', { class: 'card-head' },
-        h('h3', { text: '换成另一套模型' }),
-        h('div', { class: 'hint', text: '先选服务商，再填密钥；不确定就点一下"测试连接"' })),
+    const cancelButton = editing ? h('button', {
+      class: 'btn ghost', text: '取消编辑',
+      onclick: () => { model.editingId = null; renderModelPage(); },
+    }) : null;
+
+    // 有档案时默认折起来：这一页的主角是上面那排卡片，表单是"要加要改"时才展开的工具。
+    const open = !((data.profiles && data.profiles.items) || []).length || Boolean(editing);
+    return h('details', { class: 'card model-form-card', id: 'model-form', open },
+      h('summary', { class: 'card-head' },
+        h('h3', { text: editing ? `编辑档案：${editing.label}` : '新增一套端点' }),
+        h('span', { class: 'hint', text: editing
+          ? '改完点「保存并应用」就地更新这一套；密钥留空表示不动'
+          : '先选服务商，再填密钥；不确定就点一下「测试连接」' })),
       h('div', { class: 'model-form' },
         h('label', { class: 'model-field wide' }, h('span', { text: '服务商' }), providerSelect),
         h('label', { class: 'model-field wide' },
@@ -3002,7 +3201,7 @@
           h('div', { class: 'model-form' },
             h('label', { class: 'model-field' }, h('span', { text: '协议' }), wireSelect),
             h('label', { class: 'model-field' }, h('span', { text: '思考模式' }), thinkingSelect)))),
-      h('div', { class: 'model-actions' }, testButton, applyButton, saveAsInput),
+      h('div', { class: 'model-actions' }, testButton, applyButton, cancelButton, labelInput),
       result);
   }
 
@@ -3017,57 +3216,6 @@
     node.append(h('span', {
       text: `${outcome.detail || ''}${outcome.latency_ms ? `（${outcome.latency_ms} ms）` : ''}`,
     }));
-  }
-
-  function renderModelProfiles(data) {
-    const profiles = (data.profiles && data.profiles.items) || [];
-    const active = data.current || {};
-    const rows = profiles.map((profile) => h('div', { class: 'model-profile' },
-      h('div', { class: 'model-profile-main' },
-        h('div', { class: 'model-profile-label', text: profile.label }),
-        h('div', { class: 'model-profile-sub mono', text: `${profile.model_name || '—'} · ${profile.url || '—'}` })),
-      h('span', {
-        class: `pill ${profile.has_key ? 'ok' : 'bad'}`,
-        text: profile.has_key ? '带密钥' : '无密钥',
-      }),
-      profile.model_name === active.model_name && profile.url === active.url
-        ? h('span', { class: 'pill ok', text: '正在用' })
-        : null,
-      h('button', {
-        class: 'btn small',
-        text: '应用',
-        onclick: async () => {
-          try {
-            await api('/api/model/apply', { method: 'POST', body: { profile_id: profile.id } });
-            toast(`已切到「${profile.label}」`, 'ok');
-            await renderModelPage();
-          } catch (problem) {
-            toast(problem.message, 'bad', 7000);
-          }
-        },
-      }),
-      h('button', {
-        class: 'btn danger small',
-        text: '删除',
-        onclick: async () => {
-          if (!window.confirm(`删除档案「${profile.label}」？（不影响当前生效的配置）`)) return;
-          try {
-            await api(`/api/model/profiles/${encodeURIComponent(profile.id)}`, { method: 'DELETE' });
-            toast('已删除', 'ok');
-          } catch (problem) {
-            toast(problem.message, 'bad');
-          }
-          await renderModelPage();
-        },
-      })));
-
-    return h('div', { class: 'card' },
-      h('div', { class: 'card-head' },
-        h('h3', { text: '模型档案' }),
-        h('div', { class: 'hint', text: '存过的几套端点，一键切回；档案只在你点"应用"时影响她用的模型' })),
-      rows.length
-        ? h('div', { class: 'model-profile-list' }, ...rows)
-        : h('div', { class: 'hint', text: '还没有档案。填好之后在最下面那个输入框里起个名字再点"应用"，就会存成一套。' }));
   }
 
   // ───────────────────────────── 表情包 ─────────────────────────────
