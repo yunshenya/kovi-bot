@@ -1169,12 +1169,20 @@ mark {
  * 出现"5 张卡占不满 6 列、右边空一格"这种一眼看上去像坏了的结果。
  */
 
+/* 两栏等高：一高一矮会让页面看着像没排完。等高之后左栏通常还有富余高度，
+   所以把「表达能力」那一块用 margin-top:auto 推到卡片底部——空出来的地方就变成
+   两块内容之间的呼吸，而不是卡片下沿挂着一片空白。 */
 .overview-split {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   gap: 16px;
-  align-items: start;
+  align-items: stretch;
 }
+.overview-split > .card { display: flex; flex-direction: column; }
+.overview-split > .card > .kv { margin-bottom: 16px; }
+.overview-split > .card > .cap-block { margin-top: auto; }
+/* 记录列表可以撑满卡片，也可以自己滚——两件事一起才既等高又不会把左栏拉成一片空。 */
+.overview-split .record-list { flex: 1 1 auto; min-height: 0; }
 
 .stat-grid.cols-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .stat-grid.cols-5 { grid-template-columns: repeat(5, minmax(0, 1fr)); }
@@ -2560,6 +2568,12 @@ mark {
 }
 
 /* ═══════════════ 响应式 ═══════════════ */
+
+/* 只有真正的两栏布局才限制记录列表的高度：单列时卡片本来就不需要跟谁对齐，
+   再套一层内层滚动只会让手机上多一个很难滚的小窗口。 */
+@media (min-width: 1181px) {
+  .overview-split .record-list { max-height: 300px; overflow-y: auto; padding-right: 4px; }
+}
 
 /* 中屏：侧栏收窄、图表与两栏布局改成单列。 */
 @media (max-width: 1180px) {
