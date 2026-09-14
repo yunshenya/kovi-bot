@@ -66,9 +66,26 @@ fn set_sensor_state(name: &str, state: SensorState) {
     let mut states = SENSOR_STATES
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    // Bound the live set so an ever-changing sensor list cannot grow unbounded.
-    if !states.contains_key(name) && states.len() >= config::get().world_sensors().max_sensors() {
-        return;
+    // 有界，但**不能**让新传感器拿不到槽位：原来满了就直接 return，而反复改配置会
+    // 让旧名字一直占着名额。新传感器的状态读不回来 → `ok_or_skip` 每次都拿到默认值 →
+    // `should_feed_core(None, false, ..) == true`，冷却门也永不生效，于是**每次轮询**
+    // 写一条持久世界事实 + open loop，无界增长。
+    let world_sensors = config::get().world_sensors().clone();
+    let configured: std::collections::HashSet<&str> = world_sensors
+        .sensors()
+        .iter()
+        .map(|sensor| sensor.name())
+        .collect();
+    states.retain(|existing, _| configured.contains(existing.as_str()));
+    if !states.contains_key(name) && states.len() >= world_sensors.max_sensors() {
+        // 还是满：腾出最旧的一格（没有 last_change 的按最旧算），保证来者一定有位置。
+        if let Some(oldest) = states
+            .iter()
+            .min_by_key(|(_, existing)| existing.last_change)
+            .map(|(existing, _)| existing.clone())
+        {
+            states.remove(&oldest);
+        }
     }
     states.insert(name.to_owned(), state);
 }

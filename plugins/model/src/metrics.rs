@@ -155,23 +155,24 @@ pub(crate) async fn ensure_schema() -> anyhow::Result<()> {
 
 /// 把内存里的累计量写进数据库。由后台任务周期调用，也可在读数前调用。
 pub(crate) async fn flush() {
+    // 取快照，不是 drain：drain 之后、写库之前是一段 await，future 一旦被取消
+    // （管理后台的请求中断、进程关机）这一窗计数就永久丢了，而它可能攒了好几天。
+    // 快照语义下"写入成功才扣减"，失败与取消都原样留着，也就不需要再把数据放回去。
     let pending: Vec<(NaiveDate, &'static str, i64)> = {
-        let Ok(mut buffer) = BUFFER.lock() else {
+        let Ok(buffer) = BUFFER.lock() else {
             return;
         };
         if buffer.is_empty() {
             return;
         }
-        let drained = buffer.drain().collect::<Vec<_>>();
-        drained
-            .into_iter()
-            .map(|((day, metric), amount)| (day, metric, amount))
+        buffer
+            .iter()
+            .map(|((day, metric), amount)| (*day, *metric, *amount))
             .collect()
     };
 
     let Ok(pool) = pool() else {
-        // 池还没就绪：把数据放回去，下一次再试。
-        restore(pending);
+        // 池还没就绪：缓冲原样留着，下一次再试。
         return;
     };
 
@@ -186,9 +187,12 @@ pub(crate) async fn flush() {
         .bind(amount)
         .execute(pool)
         .await;
-        if let Err(error) = result {
-            eprintln!("[WARN] 用量指标写入失败 ({metric}): {error}");
-            restore(vec![(day, metric, amount)]);
+        match result {
+            Ok(_) => subtract(day, metric, amount),
+            Err(error) => {
+                // 写失败就不用扣减：缓冲里那份留着，下一轮继续尝试。
+                eprintln!("[WARN] 用量指标写入失败 ({metric}): {error}");
+            }
         }
     }
 
@@ -200,12 +204,18 @@ pub(crate) async fn flush() {
         .await;
 }
 
-fn restore(rows: Vec<(NaiveDate, &'static str, i64)>) {
+/// 写库成功后，把快照里的这一笔从缓冲里扣掉。
+///
+/// 扣减而不是删除，是因为写库期间可能又记了几笔：那些是快照之后新增的，必须留下。
+fn subtract(day: NaiveDate, metric: &'static str, amount: i64) {
     let Ok(mut buffer) = BUFFER.lock() else {
         return;
     };
-    for (day, metric, amount) in rows {
-        *buffer.entry((day, metric)).or_insert(0) += amount;
+    if let Some(current) = buffer.get_mut(&(day, metric)) {
+        *current -= amount;
+        if *current <= 0 {
+            buffer.remove(&(day, metric));
+        }
     }
 }
 

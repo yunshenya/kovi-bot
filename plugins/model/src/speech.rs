@@ -139,11 +139,16 @@ impl SpeechClient {
         if !status.is_success() {
             return Err(anyhow::anyhow!("语音合成返回 HTTP {}", status.as_u16()));
         }
+        // 只接受配置校验过的同一区间（8k..=48k）。这个头会被下游当作"每秒多少采样"
+        // 直接用：上界失守会让 `sample_rate * 2 * MAX_VOICE_SECONDS` 的截断长度涨到
+        // GB 级，60 秒上限形同虚设；再大一点 `sample_rate * 2` 还会溢出 u32。
+        // 侧车是回环上的另一个进程，它的输出不能当作可信输入。
         let sample_rate = response
             .headers()
             .get("x-sample-rate")
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.trim().parse::<u32>().ok())
+            .filter(|rate| (8_000..=48_000).contains(rate))
             .unwrap_or(self.tts_sample_rate);
         Ok(SpeechStream {
             response,
