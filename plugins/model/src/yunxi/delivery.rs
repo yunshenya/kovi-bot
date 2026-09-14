@@ -110,6 +110,45 @@ impl QqDestination {
     }
 }
 
+/// 发送链路各级的预算（毫秒）。
+///
+/// 为什么要有：线上 2026-09-14 21:16 一次群聊发送卡了整整 30 秒，最后只留下
+/// `action execution timed out after 30000ms`——连 `[send]` 都没打，查不出卡在
+/// 哪一级。发送前有两次查库（会话路由、群白名单）与一次内存仲裁，任何一级撞上
+/// 连接池饥饿都会把整轮回复拖死（当时池是 5 条连接、acquire 超时 30 秒，和卡住
+/// 的时长完全一致）。各级单独设预算：超时能指名道姓，而且**在跨过不可逆边界
+/// 之前**超时可以安全重试。
+const SEND_STAGE_RESOLVE_BUDGET: std::time::Duration = std::time::Duration::from_secs(6);
+const SEND_STAGE_AUTHORIZE_BUDGET: std::time::Duration = std::time::Duration::from_secs(6);
+const SEND_STAGE_COMMIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
+/// 真正调 QQ 接口那一级：超过它说明平台侧没有及时回应，此时**不能**断定没发出去，
+/// 所以这一级超时按"结果未知"处理，而不是可重试。
+const SEND_STAGE_TRANSPORT_BUDGET: std::time::Duration = std::time::Duration::from_secs(12);
+
+/// 给发送链路的一个阶段套预算，超时时留下**带阶段名**的一行。
+async fn with_send_stage_budget<T>(
+    stage: &'static str,
+    budget: std::time::Duration,
+    conversation_id: ConversationId,
+    future: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    match kovi::tokio::time::timeout(budget, future).await {
+        Ok(value) => Some(value),
+        Err(_) => {
+            kovi::log::warn!(
+                "Yunxi send stage timed out: stage={stage} budget_ms={} conversation_id={conversation_id} action=abort_before_send",
+                budget.as_millis(),
+            );
+            None
+        }
+    }
+}
+
+/// 发送前阶段超时的统一文案：没跨过不可逆边界，所以可重试。
+fn send_stage_timeout_error(stage: &str) -> ActionPortError {
+    ActionPortError::new(format!("send_stage_timeout:{stage}"), true)
+}
+
 struct QqSendContext<'a> {
     revalidation_target: DeliveryRevalidationTarget,
     expected_destination: QqDestination,
@@ -379,15 +418,28 @@ impl QqActionAdapter {
         &self,
         conversation_id: ConversationId,
     ) -> Result<QqDestination, ActionPortError> {
-        let destination = self
-            .resolve_conversation_destination_without_authorization(conversation_id)
-            .await?;
+        // 发送链路第一级：查会话路由（数据库）。撞上连接池饥饿时在这里就失败，
+        // 而不是拖到 30 秒后连阶段名都没有。
+        let destination = with_send_stage_budget(
+            "resolve_destination",
+            SEND_STAGE_RESOLVE_BUDGET,
+            conversation_id,
+            self.resolve_conversation_destination_without_authorization(conversation_id),
+        )
+        .await
+        .ok_or_else(|| send_stage_timeout_error("resolve_destination"))??;
         if let QqDestination::Group(group_id) = destination {
-            let authorized = crate::group_access::is_authorized_group(group_id)
-                .await
-                .map_err(|error| {
-                    ActionPortError::new(format!("group_authorization_unavailable:{error}"), true)
-                })?;
+            let authorized = with_send_stage_budget(
+                "authorize_group",
+                SEND_STAGE_AUTHORIZE_BUDGET,
+                conversation_id,
+                crate::group_access::is_authorized_group(group_id),
+            )
+            .await
+            .ok_or_else(|| send_stage_timeout_error("authorize_group"))?
+            .map_err(|error| {
+                ActionPortError::new(format!("group_authorization_unavailable:{error}"), true)
+            })?;
             if !delivery_authorization_allows(destination, Some(authorized)) {
                 return Err(ActionPortError::new("group_not_authorized", false));
             }
@@ -476,7 +528,15 @@ impl QqActionAdapter {
                 content.is_sing()
             );
         }
-        let precommit = match begin_outgoing_commit(outgoing).await {
+        let precommit = match with_send_stage_budget(
+            "begin_outgoing_commit",
+            SEND_STAGE_COMMIT_BUDGET,
+            expected_conversation_id,
+            begin_outgoing_commit(outgoing),
+        )
+        .await
+        .ok_or_else(|| send_stage_timeout_error("begin_outgoing_commit"))?
+        {
             Ok(precommit) => precommit,
             Err(OutgoingCommitRejection::Stale) => {
                 crate::yunxi::discard_mind_outgoing_fence(idempotency_key);
@@ -684,9 +744,26 @@ impl QqActionAdapter {
                 return Err(durable_commit_error(error));
             }
         };
-        let send_result = MessageTransport::new(&self.bot)
-            .send(destination.message_destination(), message)
-            .await;
+        // 跨过不可逆边界的那一级：这里超时**不能**当作"没发出去"（请求可能已经
+        // 到达平台），所以单独归为 DeliveryIndeterminate，交给上层按"结果未知"
+        // 处理——这正是它与前面几级的区别。
+        let Some(send_result) = with_send_stage_budget(
+            "transport_send",
+            SEND_STAGE_TRANSPORT_BUDGET,
+            expected_conversation_id,
+            MessageTransport::new(&self.bot).send(destination.message_destination(), message),
+        )
+        .await
+        else {
+            if let Err(ledger_error) = durable_committed.mark_unknown().await {
+                kovi::log::warn!("transport timeout could not be marked Unknown: {ledger_error}");
+            }
+            drop(committed);
+            return Ok(ActionPortOutcome::DeliveryIndeterminate {
+                reason: "qq_transport_timeout".to_string(),
+                conversation_id: Some(expected_conversation_id),
+            });
+        };
         drop(mind_delivery_permit);
         let message_id = match send_result {
             Ok(message_id) => {
@@ -1626,11 +1703,42 @@ fn compatibility_reach_out_key(intent: &ReachOutIntent) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// 阶段预算的行为：正常完成原样返回；超时返回 None，并且**不**把结果当成
+    /// 成功——调用方据此决定"未跨边界可重试"还是"结果未知"。
+    #[test]
+    fn send_stage_budget_returns_none_only_on_timeout() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let conversation_id = yunxi_core::ConversationId::new();
+                let fast = with_send_stage_budget(
+                    "test_fast",
+                    std::time::Duration::from_secs(1),
+                    conversation_id,
+                    async { 7_u8 },
+                )
+                .await;
+                assert_eq!(fast, Some(7));
+
+                let slow = with_send_stage_budget(
+                    "test_slow",
+                    std::time::Duration::from_millis(20),
+                    conversation_id,
+                    async {
+                        kovi::tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        7_u8
+                    },
+                )
+                .await;
+                assert_eq!(slow, None);
+            });
+    }
+
     use super::{
         QqDestination, ReachOutDeliveryOutcome, compatibility_reach_out_outcome,
         delivery_authorization_allows, delivery_route_is_unchanged, durable_commit_error,
         outbound_message, parse_qq_destination, recorded_delivery_outcome, single_positive_qq_id,
-        speech_message_for, voice_message_for,
+        speech_message_for, voice_message_for, with_send_stage_budget,
     };
     use crate::model::TrackedSendError;
     use crate::yunxi::delivery_ledger::{DeliveryCommitError, DeliveryStatus};

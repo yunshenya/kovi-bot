@@ -115,6 +115,17 @@ reply_rate_window_secs = 600
 reply_rate_limit = 10
 
 [memory]
+# 数据库连接池：全进程共用。
+# 2026-09-14 21:16 线上一次群聊发送卡了整整 30 秒（日志只有 action execution
+# timed out after 30000ms，连 [send] 都没打），时长与旧的 acquire 超时（30 秒）
+# 完全一致——发送前的会话路由/群白名单都要取连接，池一饿，整轮回复就被拖死。
+# 取连接改成 10 秒：快速失败好过排队。发送侧另有更短的阶段预算（6 秒）先一步
+# 兜住，于是失败点能被指名道姓，而且还没跨过"真正发给 QQ"那条边界时可以直接
+# 重试。池大小先不动——巡检报告（docs/known-issues-log-review-2026-09-12.md
+# P0-3）明确写着：那次的根因是内存压力把 PG 拖慢，加并发只会让更多请求挤在慢查询上。
+database_acquire_timeout_secs = 10
+# 池上限保持 5（代码默认）。要调大之前先确认整机内存余量，见上面那条报告。
+database_pool_max_connections = 5
 max_entries = 1000
 retention_days = 30
 episode_retention_days = 365
