@@ -79,6 +79,7 @@ enum BuiltinTool {
     MemorySearch,
     MemoryRemember,
     StickerMemoryTeach,
+    StickerList,
     ReminderCreate,
     ReminderList,
     ReminderCancel,
@@ -127,6 +128,7 @@ impl BuiltinTool {
                 | Self::SystemInfo
                 | Self::GroupMessageTargets
                 | Self::GroupQuestionStatus
+                | Self::StickerList
                 | Self::HealthCheck
         )
     }
@@ -572,6 +574,18 @@ pub(crate) async fn initialize() -> Result<()> {
         source: ToolSource::Builtin(BuiltinTool::SystemInfo),
     });
     definitions.push(ToolDefinition {
+        name: "sticker.list".to_string(),
+        // 描述刻意短：工具 schema 每轮都随请求发送，长描述就是常驻开销；
+        // "拿到标签之后怎么写"由提示词里那句常驻说明负责，不在这里重复。
+        description: "列出她现在能发的表情包标签。打算发表情包时先调用它；没有可用素材时如实说明。"
+            .to_string(),
+        input_schema: json!({
+            "type": "object",
+            "additionalProperties": false
+        }),
+        source: ToolSource::Builtin(BuiltinTool::StickerList),
+    });
+    definitions.push(ToolDefinition {
         name: "sticker_memory.teach".to_string(),
         description: "管理员专用：当管理员明确描述当前表情包的含义，并且当前消息带有表情/图片或引用了包含表情的消息时，保存正式表情记忆。label 只填写管理员给出的含义；普通评价、提问、猜测或讨论表情时不要调用，也不要自行推断含义。"
             .to_string(),
@@ -942,6 +956,8 @@ impl ToolRegistry {
                     && (!tool_context.scheduled || definition.source.available_for_scheduled())
                     && (!definition.source.needs_sticker_teaching_context()
                         || tool_context.sticker_teaching.is_some())
+                    && (!definition.source.needs_sticker_library()
+                        || crate::sticker_library::is_available())
             })
     }
 
@@ -1063,6 +1079,8 @@ impl ToolRegistry {
         tool_context: &ToolExecutionContext,
         read_only_only: bool,
     ) -> Vec<Value> {
+        // 只算一次：下面每个定义都要问"素材库有没有货"，逐条去扫目录是浪费。
+        let sticker_available = crate::sticker_library::is_available();
         self.definitions
             .iter()
             .filter(|definition| {
@@ -1075,6 +1093,9 @@ impl ToolRegistry {
                 if definition.source.needs_sticker_teaching_context()
                     && tool_context.sticker_teaching.is_none()
                 {
+                    return false;
+                }
+                if definition.source.needs_sticker_library() && !sticker_available {
                     return false;
                 }
                 if definition.source.admin_only() && !tool_context.is_admin {
@@ -1397,6 +1418,12 @@ impl ToolSource {
         matches!(self, Self::Builtin(BuiltinTool::StickerMemoryTeach))
     }
 
+    /// 只有素材库里真有素材时才下发的工具：没素材还把 `sticker.list` 挂出去，
+    /// 等于每轮都为她带一份用不上的 schema，还会让她徒劳地调一次。
+    fn needs_sticker_library(&self) -> bool {
+        matches!(self, Self::Builtin(BuiltinTool::StickerList))
+    }
+
     fn available_for_scheduled(&self) -> bool {
         match self {
             Self::Builtin(tool) => !matches!(
@@ -1696,6 +1723,10 @@ async fn execute_builtin(
         BuiltinTool::HelpCommands => {
             reject_unknown_arguments(&arguments, &[])?;
             Ok(crate::model::utils::command_help().to_string())
+        }
+        BuiltinTool::StickerList => {
+            reject_unknown_arguments(&arguments, &[])?;
+            sticker_list().await
         }
         BuiltinTool::SystemInfo => {
             reject_unknown_arguments(&arguments, &[])?;
@@ -3208,6 +3239,26 @@ impl CalculatorParser {
     }
 }
 
+/// `sticker.list`：把素材库里能发的标签交给模型。
+///
+/// 只读、无副作用：清单本身不是秘密（就是文件名），也不改变她的状态。
+async fn sticker_list() -> Result<String> {
+    Ok(sticker_list_reply(crate::sticker_library::tool_listing()))
+}
+
+/// [`sticker_list`] 的措辞部分：拿不到清单（素材库关了或空的）时如实说明。
+///
+/// 工具在那种情况下根本不会下发，这里再挡一道，免得配置热改之后出现
+/// "工具还在、清单空了"的中间态；也让它能脱离全局配置被单测覆盖。
+fn sticker_list_reply(listing: Option<String>) -> String {
+    match listing {
+        Some(listing) => format!(
+            "可用表情包标签：{listing}\n把其中一个标签原样写进正文最前面的 [[STICKER 标签]]，程序会把那张图贴在这条消息里发出；正文可以留空（那就只发一张表情）。"
+        ),
+        None => "表情包素材库现在是空的，这一次没有可以发的表情。".to_string(),
+    }
+}
+
 fn apply_calculator_function(name: &str, arguments: &[f64]) -> Result<f64> {
     let one = || {
         arguments
@@ -3893,6 +3944,69 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::sticker_list_reply;
+
+    /// `sticker.list` 的两条措辞：有清单就给清单 + 怎么用；没有就如实说。
+    ///
+    /// 也钉住"清单不进提示词"这条：清单只在工具返回里出现，所以返回里必须把
+    /// "怎么写标记"一并说清，否则她拿到了标签也不知道贴哪。
+    #[test]
+    fn sticker_list_tool_explains_both_the_labels_and_the_marker() {
+        let with_labels = sticker_list_reply(Some("无语又想笑；开心".to_string()));
+        assert!(with_labels.contains("无语又想笑；开心"));
+        assert!(with_labels.contains("[[STICKER 标签]]"));
+        assert!(with_labels.contains("正文可以留空"));
+
+        let empty = sticker_list_reply(None);
+        assert!(empty.contains("空的"), "{empty}");
+        assert!(!empty.contains("[[STICKER"), "没素材时不该教她写标记");
+    }
+
+    /// `sticker.list` 只在素材库里真有素材时才随请求下发：多一个用不上的 schema
+    /// 是每轮白付的钱，也会让她徒劳地调一次。关掉时它必须消失，开着时必须在。
+    #[test]
+    fn sticker_tool_follows_the_library_availability() {
+        let registry = ToolRegistry {
+            definitions: vec![
+                ToolDefinition {
+                    name: "sticker.list".to_string(),
+                    description: "list stickers".to_string(),
+                    input_schema: json!({"type": "object"}),
+                    source: ToolSource::Builtin(BuiltinTool::StickerList),
+                },
+                // 对照：不受素材库约束的只读工具，用来证明过滤没有把整张表清空。
+                ToolDefinition {
+                    name: "time.now".to_string(),
+                    description: "current time".to_string(),
+                    input_schema: json!({"type": "object"}),
+                    source: ToolSource::Builtin(BuiltinTool::TimeNow),
+                },
+            ],
+            timeout: Duration::from_secs(1),
+            max_result_chars: 1_000,
+        };
+        let context = test_tool_context();
+        let names: Vec<String> = registry
+            .native_tool_specs(&context, false)
+            .iter()
+            .filter_map(|spec| {
+                spec.pointer("/function/name")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect();
+
+        // 下发给 provider 的名字是下划线形式（`time.now` → `time_now`）。
+        assert!(names.iter().any(|name| name == "time_now"), "{names:?}");
+        // 断言"一致"而不是写死某个方向：测试进程里的 qq_sticker 默认是关的，
+        // 但开发机上可能被打开过——这条规则本身与本地配置无关。
+        assert_eq!(
+            names.iter().any(|name| name == "sticker_list"),
+            crate::sticker_library::is_available(),
+            "工具是否下发必须与素材库可用性一致：{names:?}"
+        );
+    }
+
     /// 按人检索：身份关键词排在**最前面**（查询侧只取前 5 条），并且名字也在里面
     /// ——号命中的是"他自己说过的话"，名字命中的是"别人提到他的行"。
     #[test]

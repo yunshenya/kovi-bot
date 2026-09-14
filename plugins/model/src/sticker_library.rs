@@ -75,18 +75,19 @@ pub(crate) fn library_listing_reply() -> String {
             crate::config::sticker_library_path().display()
         );
     }
-    let limit = crate::config::get().qq_sticker().prompt_labels().max(20);
+    // 命令回执在 QQ 里发，太长会刷屏：只列前若干个，其余给个数。
+    const REPLY_LABELS: usize = 24;
     let mut listing = labels
         .iter()
-        .take(limit)
+        .take(REPLY_LABELS)
         .cloned()
         .collect::<Vec<_>>()
         .join("、");
-    if labels.len() > limit {
+    if labels.len() > REPLY_LABELS {
         listing.push_str(&format!(
             "（共 {} 个，这里只列了前 {} 个）",
             labels.len(),
-            limit
+            REPLY_LABELS
         ));
     }
     format!("现在有 {} 张表情：{listing}", labels.len())
@@ -396,29 +397,25 @@ pub(crate) fn available_labels() -> Vec<String> {
     labels_snapshot().into_keys().collect()
 }
 
-/// 下发给模型的标签清单，按 `qq_sticker.prompt_labels` 截断。
+/// `sticker.list` 工具返回给模型的清单：**全部**标签（`A；B；C`）。
 ///
-/// 返回 `(列出的标签, 标签总数)`。总数大于列表长度时调用方要说明"清单没列全"，
-/// 否则模型会以为素材库就只有这几个。
-pub(crate) fn prompt_labels() -> (Vec<String>, usize) {
+/// 这份清单不再常驻提示词：目录一大，每轮都带上它就是白花钱（60 个标签的清单
+/// 加说明约 400 token/轮，而发表情包一天也就几次）。改成她真要发的时候调一次
+/// 工具拿，只有在那一刻才付这几十上百个 token。
+///
+/// 素材库关闭或为空时返回 `None`——那种情况下工具本身也不会下发给模型。
+pub(crate) fn tool_listing() -> Option<String> {
     let labels = labels_snapshot();
-    let total = labels.len();
-    let limit = crate::config::get().qq_sticker().prompt_labels();
-    let listed = labels.into_keys().take(limit).collect();
-    (listed, total)
-}
-
-/// 拼好的标签清单句（`A；B；C`），供两条回复协议各自插进自己的说明里。
-///
-/// 素材库关闭或为空时返回 `None`：没有素材就不该在提示词里提"你可以发表情包"。
-pub(crate) fn prompt_label_listing() -> Option<String> {
-    let (labels, total) = prompt_labels();
     if labels.is_empty() {
         return None;
     }
-    let mut listing = labels.join("；");
-    if total > labels.len() {
-        listing.push_str(&format!("（另有 {} 个未列出）", total - labels.len()));
+    let total = labels.len();
+    let listed = labels.into_keys().collect::<Vec<_>>();
+    let mut listing = listed.join("；");
+    // `max_files` 就是收录上限，正常到不了这里；留一句是为了万一被截断时
+    // 别让她以为"素材库就这么点"。
+    if total > listed.len() {
+        listing.push_str(&format!("（另有 {} 个未列出）", total - listed.len()));
     }
     Some(listing)
 }
@@ -1044,6 +1041,12 @@ mod tests {
         reset_library_state();
 
         assert!(super::is_available());
+        // `sticker.list` 拿到的就是这份清单：全部标签，且素材库关着时没有清单。
+        assert_eq!(
+            super::tool_listing().as_deref(),
+            Some("开心"),
+            "工具清单应当包含素材库里的全部标签"
+        );
         // 文件名即标签；带编号的两张图归到同一个标签下。
         assert_eq!(super::available_labels(), vec!["开心".to_string()]);
         assert_eq!(super::resolve_label("开心"), Some("开心".to_string()));
@@ -1079,6 +1082,7 @@ mod tests {
         reset_library_state();
         crate::config::install(previous).expect("应还原配置");
         assert!(!super::is_available());
+        assert!(super::tool_listing().is_none(), "关掉素材库后不该再有清单");
         let _ = std::fs::remove_dir_all(&root);
     }
 }

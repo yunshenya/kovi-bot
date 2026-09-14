@@ -21,8 +21,6 @@ pub struct QqStickerConfig {
     /// 单个素材文件的大小上限（KB）。整张图会以 base64 走 OneBot 图片段，
     /// 上限压住的是 WebSocket 单帧体积，不是磁盘。
     max_file_kb: u64,
-    /// 提示词里最多列出多少个标签，避免素材一多就把上下文撑爆。
-    prompt_labels: usize,
     /// 目录重扫间隔（秒）。把新表情丢进目录后最多等这么久就能用，不必重启。
     rescan_secs: u64,
 }
@@ -49,10 +47,6 @@ impl QqStickerConfig {
         self.max_file_kb
     }
 
-    pub fn prompt_labels(&self) -> usize {
-        self.prompt_labels
-    }
-
     pub fn rescan_secs(&self) -> u64 {
         self.rescan_secs
     }
@@ -74,11 +68,6 @@ impl QqStickerConfig {
                 "qq_sticker.max_file_kb 必须在 16 到 8192 之间（单位 KB）"
             ));
         }
-        if !(1..=200).contains(&self.prompt_labels) {
-            return Err(anyhow::anyhow!(
-                "qq_sticker.prompt_labels 必须在 1 到 200 之间"
-            ));
-        }
         if !(1..=3_600).contains(&self.rescan_secs) {
             return Err(anyhow::anyhow!(
                 "qq_sticker.rescan_secs 必须在 1 到 3600 秒之间"
@@ -95,7 +84,6 @@ impl Default for QqStickerConfig {
             dir: "stickers".to_string(),
             max_files: 200,
             max_file_kb: 2_048,
-            prompt_labels: 60,
             rescan_secs: 30,
         }
     }
@@ -137,13 +125,6 @@ mod tests {
             ..QqStickerConfig::default()
         };
         assert!(huge_file.validate().is_err());
-
-        let zero_labels = QqStickerConfig {
-            enabled: true,
-            prompt_labels: 0,
-            ..QqStickerConfig::default()
-        };
-        assert!(zero_labels.validate().is_err());
 
         let enabled = QqStickerConfig {
             enabled: true,
