@@ -246,7 +246,9 @@ def main() -> int:
 
     n_val = max(1, int(len(samples) * args.val_frac))
     perm = rng.permutation(len(samples))
-    val_all, train_all = perm[n_val:], perm[:n_val]
+    # n_val 是**验证集**的条数，perm[n_val:] 才是大头（训练集）。上一版把两者写反了：
+    # train_all 只拿到 n_val 条、val_all 拿到其余的，于是"用 20% 训练、在 80% 上标定阈值"。
+    train_all, val_all = perm[n_val:], perm[:n_val]
     train_positions = {i: j for j, i in enumerate(train_all)}
     val_positions = {i: j for j, i in enumerate(val_all)}
     X_train = X[train_all]
