@@ -380,6 +380,34 @@ static INDEX: LazyLock<Mutex<StickerIndex>> = LazyLock::new(|| Mutex::new(Sticke
 static USE_COUNTS: LazyLock<Mutex<HashMap<String, u64>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// 这条消息是不是在问"表情包"这件事。
+///
+/// 用来做**信号驱动的清单注入**：被问到库里有什么的时候，把标签清单直接放进这一轮
+/// 的提示词，而不是指望她自己想到去调 `sticker.list`。线上 2026-09-15 02:15 就是
+/// 栽在这上面：有人 @ 她问"你现在有哪些表情包"，她一次都没调工具（`tool_calls=0`），
+/// 直接凭印象编了个「猫猫歪头」，然后连发两次都发不出去。
+///
+/// 只在命中时花那几十个 token，比把清单常驻提示词便宜得多。
+pub(crate) fn asks_about_stickers(text: &str) -> bool {
+    const NEEDLES: [&str; 6] = ["表情包", "表情", "贴纸", "斗图", "sticker", "meme"];
+    let lowered = text.to_ascii_lowercase();
+    NEEDLES.iter().any(|needle| lowered.contains(needle))
+}
+
+/// "只发一张表情、但那张取不到"时宿主补的一句话。
+///
+/// 绝不整轮沉默：她把一张表情当成了整条回复，取不到就什么都不发的话，群里看到的
+/// 是"她掉线了"（线上 02:16:10 那轮就是这样被丢掉的）。这句话是宿主替她说的，
+/// 所以刻意写得短、不含承诺。
+pub(crate) fn unavailable_sticker_reply(label: &str) -> String {
+    let label = label.trim();
+    if label.is_empty() {
+        "这张表情我这边暂时没有，先这样回你。".to_string()
+    } else {
+        format!("「{label}」这张表情我这边没有，先这样回你。")
+    }
+}
+
 /// 素材库现在能不能用：配置打开、且目录里确实有素材。
 ///
 /// 提示词组装只认这一个判据——关掉配置却仍然告诉模型"你可以发表情包"，只会得到
@@ -952,6 +980,33 @@ mod tests {
         assert_eq!(extension_for_image(b"BM____"), Some("bmp"));
         assert_eq!(extension_for_image(b"RIFF____WEBPVP8 "), Some("webp"));
         assert_eq!(extension_for_image(b"not an image"), None);
+    }
+
+    /// 问"有哪些表情包"要能被识别出来（这是清单注入的触发条件）。
+    #[test]
+    fn sticker_questions_are_detected() {
+        for text in [
+            "你现在有哪些表情包",
+            "发个表情看看",
+            "有没有那种贴纸",
+            "来斗图",
+            "send me a sticker",
+            "show me a MEME",
+        ] {
+            assert!(super::asks_about_stickers(text), "{text} 应当命中");
+        }
+        for text in ["今天天气怎么样", "帮我记一下明天开会", ""] {
+            assert!(!super::asks_about_stickers(text), "{text} 不该命中");
+        }
+    }
+
+    /// 取不到表情时的兜底话术：带标签、简短、不留承诺。
+    #[test]
+    fn unavailable_sticker_reply_is_short_and_names_the_label() {
+        let reply = super::unavailable_sticker_reply("猫猫歪头");
+        assert!(reply.contains("猫猫歪头"));
+        assert!(reply.chars().count() <= 40);
+        assert!(super::unavailable_sticker_reply("   ").contains("暂时没有"));
     }
 
     #[test]

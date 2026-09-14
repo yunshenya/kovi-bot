@@ -533,17 +533,30 @@ impl QqActionAdapter {
         // 的 precommit 租约。放在这里还让"什么都没得发"的轮次在提交前就被挡住。
         let sticker_message =
             sticker_segment_for(content, speech_message.is_some(), expected_conversation_id);
-        if speech_message.is_none()
-            && content.as_text().trim().is_empty()
-            && sticker_message.is_none()
-        {
-            kovi::log::warn!(
-                "这一轮没有任何可发送内容，投递已放弃: conversation_id={expected_conversation_id} sticker={:?}",
-                content.sticker_label()
-            );
-            return Ok(ActionPortOutcome::Deferred {
-                reason: "empty_visible_delivery".to_string(),
-            });
+        // 她只想发一张表情、那张却取不到时，**不能整轮沉默**：群里看到的会是
+        // "她掉线了"（线上 2026-09-15 02:16:10 就是这么被丢掉的）。宿主替她说一句
+        // 最短的实话，投递照常走完；她本来有正文的话，正文一个字都不动。
+        let mut text_override = None;
+        if speech_message.is_none() && content.as_text().trim().is_empty() {
+            match missing_sticker_fallback(content, sticker_message.is_some()) {
+                Some(fallback) => {
+                    kovi::log::warn!(
+                        "只发表情的这一轮表情取不到，改用兜底文字投递: conversation_id={expected_conversation_id} label={:?}",
+                        content.sticker_label()
+                    );
+                    text_override = Some(fallback);
+                }
+                None if sticker_message.is_none() => {
+                    kovi::log::warn!(
+                        "这一轮没有任何可发送内容，投递已放弃: conversation_id={expected_conversation_id} sticker={:?}",
+                        content.sticker_label()
+                    );
+                    return Ok(ActionPortOutcome::Deferred {
+                        reason: "empty_visible_delivery".to_string(),
+                    });
+                }
+                None => {}
+            }
         }
         let precommit = match with_send_stage_budget(
             "begin_outgoing_commit",
@@ -658,7 +671,10 @@ impl QqActionAdapter {
             }
             QqDestination::Private(_) => None,
         };
-        let text = content.as_text();
+        // 兜底文字只在"本来没有正文"时出现，所以这里不会覆盖她写的话。
+        let text = text_override
+            .as_deref()
+            .unwrap_or_else(|| content.as_text());
         let message = outbound_message(text, external_reply_to, speech_message, sticker_message);
         let fingerprint_content =
             serde_json::to_string(content).unwrap_or_else(|_| content.as_text().to_owned());
@@ -1515,6 +1531,18 @@ fn outbound_message(
     message
 }
 
+/// 只发一张表情、那张又取不到时，宿主补的一句文字。
+///
+/// 返回 `None` 表示"照旧按空内容处理"（她本来有正文，或者压根没要求发表情）。
+/// 有正文时不动正文：表情发不出去不该把已经写好的话也换掉。
+fn missing_sticker_fallback(content: &MessageContent, sticker_resolved: bool) -> Option<String> {
+    if sticker_resolved || !content.as_text().trim().is_empty() {
+        return None;
+    }
+    let label = content.sticker_label()?;
+    Some(crate::sticker_library::unavailable_sticker_reply(label))
+}
+
 /// 解析这一轮要附带的表情包素材段。
 ///
 /// 语音/歌声整条替换消息（`record` 段），承载不了图片，所以发声轮次不再附带表情；
@@ -1757,6 +1785,30 @@ fn compatibility_reach_out_key(intent: &ReachOutIntent) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::missing_sticker_fallback;
+
+    /// 只发一张表情、那张取不到时必须有兜底文字；她本来有正文时一个字都不动。
+    ///
+    /// 线上 2026-09-15 02:16:10 就是因为没有这条兜底，整轮被丢弃、群里彻底沉默。
+    #[test]
+    fn a_missing_sticker_only_turn_falls_back_to_text() {
+        let sticker_only = MessageContent::sticker("", "猫猫歪头");
+        let fallback =
+            missing_sticker_fallback(&sticker_only, false).expect("只发表情又取不到时必须有兜底");
+        assert!(fallback.contains("猫猫歪头"));
+
+        // 表情正常发得出去：不代替她说话。
+        assert_eq!(missing_sticker_fallback(&sticker_only, true), None);
+        // 有正文：正文照发，兜底不插嘴。
+        let with_text = MessageContent::sticker("我在的呀。", "猫猫歪头");
+        assert_eq!(missing_sticker_fallback(&with_text, false), None);
+        // 压根没要求发表情：走原来的"空内容"判定。
+        assert_eq!(
+            missing_sticker_fallback(&MessageContent::text(""), false),
+            None
+        );
+    }
+
     /// 阶段预算的行为：正常完成原样返回；超时返回 None，并且**不**把结果当成
     /// 成功——调用方据此决定"未跨边界可重试"还是"结果未知"。
     #[test]

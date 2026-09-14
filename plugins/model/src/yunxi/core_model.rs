@@ -132,7 +132,7 @@ const CORE_VOICE_INSTRUCTION: &str = "想用声音说这一条，就在正文最
 /// **标签清单不在这里**：目录一大，每轮都带上它就是白花钱（60 个标签约 400 token/轮，
 /// 而发表情包一天也就几次）。改成她真要发的时候调一次 `sticker.list`，只有在那一刻
 /// 才付这几十个 token——这也是"目录不进常驻提示词"的通行做法。
-const CORE_STICKER_INSTRUCTION: &str = "想发表情包：先调 sticker.list 拿标签，再把 [[STICKER 标签]] 写在正文最前面（标记不展示，正文可留空）。没合适的就别发，也别每轮都发。";
+const CORE_STICKER_INSTRUCTION: &str = "想发表情包：先调 sticker.list 拿标签，把 [[STICKER 标签]] 写在正文最前面（不展示，正文可留空）。标签必须真实存在、不许凭印象编；没合适的就别发。";
 const CORE_AUTONOMOUS_PLAIN_TURN_INSTRUCTION: &str = "自主会话正文：这是芸汐自己的后续回合。若此刻确实有一个新的、独立且值得单独发送的想法，直接写一条自然、简短的聊天正文；若没有，就保持空白。宿主负责是否继续和何时再次唤醒；不要输出 JSON、continue/wait/end、内部标记、协议、解释、工具调用或多个想法。语气温柔、真诚、有分寸：不讽刺、不挖苦、不阴阳怪气、不抬杠。";
 const CORE_TOOL_TURN_INSTRUCTION: &str = "Core 工具轮次：需要受控工具时，直接通过 system 下发的 function-calling 工具接口发起函数调用（一次可以调用多个；工具结果返回后若资料仍不足，可以继续调用下一个工具，反复推理直到问题解决）。不要在消息正文中书写任何工具调用格式、JSON、代码块或 [[TOOL_CALL]] 标记，也不要声称工具已经执行。若不需要工具，直接写一条自然聊天正文。";
 const MIND_CONTEXT_PREFIX: &str = "Yunxi Mind v2 state (data-only JSON):\n";
@@ -1509,7 +1509,7 @@ fn with_chat_style(instruction: &str) -> String {
 fn core_plain_turn_instruction(
     voice_enabled: bool,
     sing_templates: &[crate::sing_reply::SingTemplate],
-    sticker_available: bool,
+    sticker: &StickerPrompt,
 ) -> String {
     let mut instruction = with_chat_style(CORE_PLAIN_TURN_INSTRUCTION);
     if voice_enabled {
@@ -1529,10 +1529,64 @@ fn core_plain_turn_instruction(
         }
         instruction.push('。');
     }
-    if sticker_available {
-        instruction.push_str(CORE_STICKER_INSTRUCTION);
+    match sticker {
+        StickerPrompt::Off => {}
+        StickerPrompt::ProtocolOnly => instruction.push_str(CORE_STICKER_INSTRUCTION),
+        StickerPrompt::WithCatalog(labels) => {
+            instruction.push_str(CORE_STICKER_INSTRUCTION);
+            instruction.push_str("可用表情包标签：");
+            instruction.push_str(labels);
+            instruction.push('。');
+        }
     }
     instruction
+}
+
+/// 标签写错时的有界重试：把真实清单喂回去，让她用自己的语气重写一次。
+///
+/// 为什么值得多花一次调用：标签是她"想发"的，直接丢掉会让这一轮变成纯文字；
+/// 如果她本来只想发一张表情，整轮还会变成沉默（线上 2026-09-15 02:16 就是这样）。
+/// 只重试一次，失败就退回纯文字，绝不递归。
+async fn repair_sticker_label(
+    messages: &[BotMemory],
+    reply_ticket: ReplyTicket,
+    scope: ReplyScope,
+    bad_label: &str,
+    labels: &str,
+    vision_images: &[crate::vision::VisionImage],
+) -> Option<ReplyPlan> {
+    if !crate::model::is_current(reply_ticket).await {
+        return None;
+    }
+    let mut repair = repair_context_messages(messages, false);
+    repair.push(BotMemory {
+        role: Roles::System,
+        content: sticker_repair_note(bad_label, labels),
+    });
+    let response = kovi::tokio::time::timeout(
+        CORE_REPLY_REPAIR_TIMEOUT,
+        ModelGateway::complete_without_tools_with_plain_style_context(
+            &mut repair,
+            reply_ticket,
+            Some(CORE_REPLY_REPAIR_MAX_OUTPUT_TOKENS),
+            vision_images,
+            None,
+        ),
+    )
+    .await
+    .ok()?
+    .filter(|response| !crate::model::utils::is_model_error_response(&response.content))?;
+
+    // 与普通回合同一套解析：前导标记决定投递形态，残留标记一律剥掉。
+    let (markers, body) = split_core_delivery_markers(&response.content);
+    let body = strip_core_delivery_markers(body);
+    let bubbles = core_reply_bubbles_with_max(&body, MAX_CORE_BUBBLES)?;
+    let mut plan = ReplyPlan::from_plain_bubbles(scope, bubbles)?;
+    // 只接受真的存在的标签；她若又写错一个，就当没发（投递层还会再兜一次）。
+    plan.sticker = markers
+        .sticker
+        .filter(|label| crate::sticker_library::resolve_label(label).is_some());
+    Some(plan)
 }
 
 /// 工具结果那一轮的契约说明。
@@ -1546,6 +1600,42 @@ fn core_tool_follow_up_instruction(sticker_available: bool) -> String {
         instruction.push_str(CORE_STICKER_INSTRUCTION);
     }
     instruction
+}
+
+/// 这一轮该给她哪一档表情包提示。
+///
+/// 被问到"有哪些表情包"时直接把清单给出去：线上那次（02:15）她一次工具都没调，
+/// 凭印象编了个不存在的标签，连发两次都发不出去。清单只在命中这类问题时才注入，
+/// 平时仍走 `sticker.list` 按需查——省 token 与"别让她猜"两件事都要。
+fn sticker_prompt(message: Option<&yunxi_core::MessageReceivedEvent>) -> StickerPrompt {
+    if !crate::sticker_library::is_available() {
+        return StickerPrompt::Off;
+    }
+    let asked = message.is_some_and(|message| {
+        crate::sticker_library::asks_about_stickers(message.content.as_text())
+    });
+    if !asked {
+        return StickerPrompt::ProtocolOnly;
+    }
+    match crate::sticker_library::tool_listing() {
+        Some(listing) => StickerPrompt::WithCatalog(listing),
+        None => StickerPrompt::ProtocolOnly,
+    }
+}
+
+/// 这一轮给模型的表情包提示。
+///
+/// 三档，按"这一轮值不值得付这份 token"分：素材库关了/空着就什么都不给；平时只给
+/// 一句协议；**被问到表情包**时连清单一起给——因为那一刻她要么答清单、要么发一张，
+/// 凭印象编标签正是从这里开始的（线上 2026-09-15 02:15 的现场）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StickerPrompt {
+    /// 素材库关了或空着：连协议都不给。
+    Off,
+    /// 只给协议：她要用就自己调 `sticker.list`。
+    ProtocolOnly,
+    /// 协议 + 完整清单：被明确问到"有哪些表情包"时直接给。
+    WithCatalog(String),
 }
 
 /// 正文最前面那串投递标记的解析结果。
@@ -1858,6 +1948,15 @@ async fn repair_direct_reply(
             Err(failure)
         }
     }
+}
+
+/// 标签写错时喂回去的那段说明：说清"没有这张"、给出真实清单、允许她改发文字。
+///
+/// 不骂她、也不要求道歉——只把事实和可选项摆出来，让她用自己的语气重写。
+fn sticker_repair_note(bad_label: &str, labels: &str) -> String {
+    format!(
+        "你刚才想发 [[STICKER {bad_label}]]，但素材库里没有这张表情。现在真实可用的标签只有：{labels}\n请重写这一条：用上面确实存在的标签（仍写在正文最前面 [[STICKER 标签]]），或者干脆不发表情、只写正文。不要编造标签，也不要用文字描述图片。"
+    )
 }
 
 fn plain_reply_repair_context(messages: &[BotMemory]) -> Vec<BotMemory> {
@@ -5935,7 +6034,7 @@ impl ModelBackend for KoviModelBackend {
                         content: core_plain_turn_instruction(
                             crate::config::qq_voice_enabled(),
                             &sing_templates,
-                            crate::sticker_library::is_available(),
+                            &sticker_prompt(message),
                         ),
                     },
                 );
@@ -6998,6 +7097,46 @@ impl ModelBackend for KoviModelBackend {
                 }
                 plan.sticker = None;
             }
+            // 标签是她凭印象编的（不在素材库里）时，把真实清单喂回去重写一次。
+            // 只重试一次；重写不出来就把表情丢掉、正文照发——绝不让她再猜。
+            if let Some(label) = plan.sticker.clone()
+                && crate::sticker_library::resolve_label(&label).is_none()
+            {
+                let labels = crate::sticker_library::tool_listing().unwrap_or_default();
+                kovi::log::warn!(
+                    "Yunxi Core sticker label missing from library: event_id={} conversation_id={} label={label} retry=once",
+                    input.event.id(),
+                    conversation_id_for_log(input),
+                );
+                match repair_sticker_label(
+                    &messages,
+                    ticket,
+                    conversation.scope(),
+                    &label,
+                    &labels,
+                    &vision_images,
+                )
+                .await
+                {
+                    Some(repaired) if core_plan_has_visible_text(&repaired) => {
+                        kovi::log::info!(
+                            "Yunxi Core sticker label repair succeeded: event_id={} conversation_id={} sticker={:?}",
+                            input.event.id(),
+                            conversation_id_for_log(input),
+                            repaired.sticker,
+                        );
+                        plan = repaired;
+                    }
+                    _ => {
+                        kovi::log::warn!(
+                            "Yunxi Core sticker label repair failed, 本轮不带表情: event_id={} conversation_id={}",
+                            input.event.id(),
+                            conversation_id_for_log(input),
+                        );
+                        plan.sticker = None;
+                    }
+                }
+            }
             // 先把"不可发送的成分"剥掉（舞台动作、自述接不接），别让一句话犯规
             // 把整条正常回复带走：线上 2026-09-14 21:05 被长篇贬损那条就是这么
             // 丢的——66 个字生成了，一个字没发出去。
@@ -7651,43 +7790,43 @@ mod tests {
         INTRINSIC_SEMANTIC_CONTENT_INSTRUCTION, MAX_CORE_BUBBLES, MAX_DELIVERABLE_BUBBLES_PER_TURN,
         MAX_INTRINSIC_REPLY_PROTOCOL_BYTES, MAX_PLAIN_SPLIT_LINE_CHARS, MIND_DECISION_INSTRUCTION,
         MindCandidates, PersistentRouteLookup, QqConversation, RequiredCreation, RouteContext,
-        SILENCE_TENSION_THRESHOLD, SilenceVerdict, VisibleReplyTarget, addressed_gap_wait_ms,
-        affect_tone_guidance, ambient_group_interjection_veto, autonomous_conversation_prompt,
-        autonomous_conversation_protocol, autonomous_empty_generation_plan,
-        autonomous_generation_failure_plan, baseline_disposition, batch_fence_action_key,
-        build_bounded_intrinsic_reply_batch, classify_persistent_person_identity,
-        constrain_autonomous_tick_plan, conversation_focus_target, conversation_id_for_log,
-        core_message_prompt, core_plain_turn_instruction, core_plan_has_visible_text,
-        core_reply_bubbles_with_max, core_tool_follow_up_instruction,
-        core_tool_protocol_diagnostic, default_autonomous_directive, defer_unroutable_due,
-        deterministic_route_fallback, drop_internal_decision_sentences, due_reply_target,
-        eligible_mind_candidates, explicit_message_batch_needs_repair,
-        explicit_message_count_for_event, explicit_message_count_for_input,
-        explicit_message_count_instruction, first_person_turn_avoidance, group_reply_gap_secs_for,
-        group_reply_gap_secs_for_sender, interaction_state_updates_with_cues,
-        intrinsic_autonomous_intent_prompt, intrinsic_fallback_is_eligible,
-        intrinsic_output_is_unsafe, intrinsic_prompt, is_ambient_group_message,
-        is_plain_text_batch_data_context, keeps_existing_prepared_plan, message_id_for_log,
-        mind_context_messages, mind_outgoing_fence_required, parse_autonomous_intent_response,
-        parse_core_response, parse_direct_repair_output, parse_intrinsic_autonomous_directive,
-        parse_plain_core_response, parse_qq_conversation, plain_text_batch_message_prompt,
-        plain_text_batch_repair_context, pre_model_plan, prepared_outgoing_semantic_context,
-        purge_group_routes_from_cache, recent_conversation_messages,
-        recent_direct_conversation_messages, recent_group_conversation_messages,
-        refine_core_incoming, register_core_tool_intents, repair_context_messages,
-        reply_asks_something, reply_expected_for_incoming, reply_looks_complete,
-        reply_recovery_required, reply_text_has_semantic_content, reply_text_is_too_thin,
-        requested_message_count, route_from_lookup, route_lookup_with_fallback,
-        safe_single_structured_reply_message, safe_structured_reply_batch,
-        sanitize_autonomous_intrinsic_output, sanitize_core_plan_bubbles,
-        sanitize_intrinsic_output, sanitize_plain_text_batch_message,
+        SILENCE_TENSION_THRESHOLD, SilenceVerdict, StickerPrompt, VisibleReplyTarget,
+        addressed_gap_wait_ms, affect_tone_guidance, ambient_group_interjection_veto,
+        autonomous_conversation_prompt, autonomous_conversation_protocol,
+        autonomous_empty_generation_plan, autonomous_generation_failure_plan, baseline_disposition,
+        batch_fence_action_key, build_bounded_intrinsic_reply_batch,
+        classify_persistent_person_identity, constrain_autonomous_tick_plan,
+        conversation_focus_target, conversation_id_for_log, core_message_prompt,
+        core_plain_turn_instruction, core_plan_has_visible_text, core_reply_bubbles_with_max,
+        core_tool_follow_up_instruction, core_tool_protocol_diagnostic,
+        default_autonomous_directive, defer_unroutable_due, deterministic_route_fallback,
+        drop_internal_decision_sentences, due_reply_target, eligible_mind_candidates,
+        explicit_message_batch_needs_repair, explicit_message_count_for_event,
+        explicit_message_count_for_input, explicit_message_count_instruction,
+        first_person_turn_avoidance, group_reply_gap_secs_for, group_reply_gap_secs_for_sender,
+        interaction_state_updates_with_cues, intrinsic_autonomous_intent_prompt,
+        intrinsic_fallback_is_eligible, intrinsic_output_is_unsafe, intrinsic_prompt,
+        is_ambient_group_message, is_plain_text_batch_data_context, keeps_existing_prepared_plan,
+        message_id_for_log, mind_context_messages, mind_outgoing_fence_required,
+        parse_autonomous_intent_response, parse_core_response, parse_direct_repair_output,
+        parse_intrinsic_autonomous_directive, parse_plain_core_response, parse_qq_conversation,
+        plain_text_batch_message_prompt, plain_text_batch_repair_context, pre_model_plan,
+        prepared_outgoing_semantic_context, purge_group_routes_from_cache,
+        recent_conversation_messages, recent_direct_conversation_messages,
+        recent_group_conversation_messages, refine_core_incoming, register_core_tool_intents,
+        repair_context_messages, reply_asks_something, reply_expected_for_incoming,
+        reply_looks_complete, reply_recovery_required, reply_text_has_semantic_content,
+        reply_text_is_too_thin, requested_message_count, route_from_lookup,
+        route_lookup_with_fallback, safe_single_structured_reply_message,
+        safe_structured_reply_batch, sanitize_autonomous_intrinsic_output,
+        sanitize_core_plan_bubbles, sanitize_intrinsic_output, sanitize_plain_text_batch_message,
         select_host_model_route_from_capability, serialize_intrinsic_reply_batch,
         shadow_projection_for_completed_plan, should_archive_raw_reply, silence_gate_plan,
         silence_verdict, silent_wait_plan, split_core_delivery_markers, split_two_short_lines,
-        strip_core_delivery_markers, strip_stage_directions, strong_reply_repair_needed,
-        tool_calls_allowed_for_turn, tool_protocol_authorized_for_turn, visible_reply_intent,
-        visible_reply_intents, visible_reply_invites_continuation, visible_reply_state_updates,
-        visible_turn_continuation, with_chat_style,
+        sticker_repair_note, strip_core_delivery_markers, strip_stage_directions,
+        strong_reply_repair_needed, tool_calls_allowed_for_turn, tool_protocol_authorized_for_turn,
+        visible_reply_intent, visible_reply_intents, visible_reply_invites_continuation,
+        visible_reply_state_updates, visible_turn_continuation, with_chat_style,
     };
     use crate::model::{
         BotMemory, ConversationCoordinator, IncomingTurnImpact, OutgoingExecutiveDecision,
@@ -9248,7 +9387,7 @@ mod tests {
     /// 一直不在，同时口语化契约必须在（两条都是回归线，不能只靠文案自觉）。
     #[test]
     fn core_visible_turns_carry_the_human_chat_style_and_no_essay_license() {
-        let instruction = core_plain_turn_instruction(false, &[], false);
+        let instruction = core_plain_turn_instruction(false, &[], &StickerPrompt::Off);
         assert!(instruction.contains(crate::model::chat_style::HUMAN_CHAT_STYLE));
         for license in [
             "按问题需要可以保留 Markdown",
@@ -9301,8 +9440,8 @@ mod tests {
             mood: "童谣 / 轻快".to_owned(),
             syllables: 14,
         }];
-        let without = core_plain_turn_instruction(false, &[], false);
-        let with = core_plain_turn_instruction(false, &templates, false);
+        let without = core_plain_turn_instruction(false, &[], &StickerPrompt::Off);
+        let with = core_plain_turn_instruction(false, &templates, &StickerPrompt::Off);
 
         // 服务不可用时不该教这个标记，也不该出现模板清单。
         assert!(!without.contains(CORE_SING_MARKER));
@@ -9337,8 +9476,8 @@ mod tests {
 
     #[test]
     fn voice_option_is_only_offered_to_core_when_the_channel_is_enabled() {
-        let disabled = core_plain_turn_instruction(false, &[], false);
-        let enabled = core_plain_turn_instruction(true, &[], false);
+        let disabled = core_plain_turn_instruction(false, &[], &StickerPrompt::Off);
+        let enabled = core_plain_turn_instruction(true, &[], &StickerPrompt::Off);
 
         // 关掉 qq_voice 时，模型不该知道自己有一个当下用不了的出口。
         // 契约本身现在总是带上口语化风格块，所以基准是 `with_chat_style(...)`，
@@ -9450,8 +9589,8 @@ mod tests {
     /// `sticker.list` 工具的原因，钉住它免得有人又把清单塞回来）。
     #[test]
     fn sticker_option_is_a_short_pointer_not_a_catalog() {
-        let without = core_plain_turn_instruction(false, &[], false);
-        let with = core_plain_turn_instruction(false, &[], true);
+        let without = core_plain_turn_instruction(false, &[], &StickerPrompt::Off);
+        let with = core_plain_turn_instruction(false, &[], &StickerPrompt::ProtocolOnly);
 
         assert!(!without.contains(CORE_STICKER_MARKER));
         assert!(with.contains("[[STICKER 标签]]"));
@@ -9463,12 +9602,25 @@ mod tests {
                 with_chat_style(CORE_PLAIN_TURN_INSTRUCTION)
             )
         );
-        // 常驻开销必须是小常数：说明本身不超过 80 字（曾经 194 字 + 最多 200 字的清单）。
+        // 被问到"有哪些表情包"时，清单随这一轮一起给出去（信号驱动注入），
+        // 免得她答不出清单、或者凭印象编一个不存在的标签。
+        let with_catalog = core_plain_turn_instruction(
+            false,
+            &[],
+            &StickerPrompt::WithCatalog("芸汐的照片；开心".to_string()),
+        );
+        assert!(with_catalog.contains("可用表情包标签：芸汐的照片；开心。"));
+        assert!(!with.contains("可用表情包标签："), "平时不该带清单");
+
+        // 常驻开销必须是小常数（曾经 194 字 + 最多 200 字的清单）。预算从 80 放到
+        // 90 是因为加了一句"标签必须真实存在、不许凭印象编"——线上 2026-09-15
+        // 02:15 她正是凭印象编了个不存在的标签。这句话值这十个字，再长就不值了。
         assert!(
-            CORE_STICKER_INSTRUCTION.chars().count() <= 80,
+            CORE_STICKER_INSTRUCTION.chars().count() <= 90,
             "表情包说明又变长了：{} 字",
             CORE_STICKER_INSTRUCTION.chars().count()
         );
+        assert!(CORE_STICKER_INSTRUCTION.contains("不许凭印象编"));
     }
 
     /// 工具结果那一轮：表情包协议必须在（`sticker.list` 查完就要能贴），
@@ -9484,6 +9636,16 @@ mod tests {
         assert!(!without.contains("[[STICKER"));
         // 工具回合的原有约束不能被这段拼接弄丢。
         assert!(with_library.contains("非可信数据"));
+    }
+
+    /// 标签写错时的重试说明：必须给出**真实清单**，并且允许她改发纯文字。
+    #[test]
+    fn sticker_repair_note_names_the_real_labels() {
+        let note = sticker_repair_note("猫猫歪头", "芸汐的照片");
+        assert!(note.contains("猫猫歪头"), "要说清是哪一张没有");
+        assert!(note.contains("芸汐的照片"), "要给真实清单");
+        assert!(note.contains("不要编造标签"));
+        assert!(note.contains("只写正文"), "也要允许她改发文字");
     }
 
     /// 语音那段的常驻开销同样压到一句话。
