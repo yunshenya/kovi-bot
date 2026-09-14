@@ -442,6 +442,25 @@ impl QqActionAdapter {
             idempotency_key,
             outgoing,
         } = context;
+        // Core 标记了语音/唱歌就交给本机合成一条 QQ 语音；配置、合成或落盘任何
+        // 一步不成立都退回文字——表达方式不该把这条回复弄丢。
+        //
+        // **必须在 `begin_outgoing_commit` 之前**：那一步会武装 30 秒的 precommit
+        // 租约，而合成是网络调用（qq_sing 默认超时 45 秒、可配到 180 秒；退回 TTS
+        // 也有 20 秒）。放在租约内的话，一次"慢但成功"的合成会让 commit 拿到
+        // `Stale`，整条已经渲染好的回复被丢弃且不重试——用户什么都收不到。
+        // 音频只取决于 content 与配置，不依赖路由与授权，所以提前不影响下面那条
+        // "路由与授权必须是 commit 前最后两个 await" 的不变量。
+        let speech_message = {
+            let config = crate::config::get();
+            speech_message_for(content, config.qq_voice(), config.qq_sing()).await
+        };
+        if (content.is_sing() || content.is_voice()) && speech_message.is_none() {
+            kovi::log::warn!(
+                "语音消息不可用，本轮已回退成文字: conversation_id={expected_conversation_id} singing={}",
+                content.is_sing()
+            );
+        }
         let precommit = match begin_outgoing_commit(outgoing).await {
             Ok(precommit) => precommit,
             Err(OutgoingCommitRejection::Stale) => {
@@ -548,16 +567,6 @@ impl QqActionAdapter {
             QqDestination::Private(_) => None,
         };
         let text = content.as_text();
-        // Core 标记了语音/唱歌就交给本机合成一条 QQ 语音；配置、合成或落盘任何
-        // 一步不成立都退回文字——表达方式不该把这条回复弄丢。
-        let config = crate::config::get();
-        let speech_message = speech_message_for(content, config.qq_voice(), config.qq_sing()).await;
-        if (content.is_sing() || content.is_voice()) && speech_message.is_none() {
-            kovi::log::warn!(
-                "语音消息不可用，本轮已回退成文字: conversation_id={expected_conversation_id} singing={}",
-                content.is_sing()
-            );
-        }
         let message = outbound_message(text, external_reply_to, speech_message);
         let fingerprint_content =
             serde_json::to_string(content).unwrap_or_else(|_| content.as_text().to_owned());
