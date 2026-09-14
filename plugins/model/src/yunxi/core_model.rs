@@ -5416,6 +5416,29 @@ fn sanitize_core_plan_bubbles(plan: &mut ReplyPlan) -> usize {
     cleaned_bubbles
 }
 
+/// 可见回合里"模型原始输出"的留档上限（字节）。够看清一段代码或几句话，又不会把
+/// journal 撑爆（systemd 单条消息的上限在 8 KB 量级）。按字节夹、并保证不切断 UTF-8。
+const CORE_RAW_REPLY_ARCHIVE_BYTES: usize = 4_000;
+/// 最终正文比模型原始输出少这么多字节，就认为"有内容被吃掉了"，值得留档一份原文。
+const CORE_RAW_REPLY_LOSS_BYTES: usize = 120;
+
+/// 这一轮的可见回复要不要把模型原始输出留档。
+///
+/// 为什么要它：2026-09-14 22:26 那条"写个看图软件"的代码回复，发出去时
+/// `argv[0]` 变成了 `argv0]`、正文里残留一行 `BUBBLE]]`、原始 1468 字只剩 1322 字。
+/// 事后查不动——模型调用轨迹是内存环形缓冲（64 条、不落盘），早被后面的聊天冲掉，
+/// 出站也没有原文留档；只能逐个证明"管道里那几个函数是清白的"，定不了案。
+///
+/// 判据只覆盖"内容被动过"的回合：正常回复不留档（线上 24 小时 152 个可见回合里
+/// 只有 14 次命中），所以不会把日志刷满。
+fn should_archive_raw_reply(
+    sanitized_bubbles: usize,
+    raw_bytes: usize,
+    visible_bytes: usize,
+) -> bool {
+    sanitized_bubbles > 0 || raw_bytes.saturating_sub(visible_bytes) > CORE_RAW_REPLY_LOSS_BYTES
+}
+
 fn core_plan_has_visible_text(plan: &ReplyPlan) -> bool {
     plan.has_visible_reply()
         && !plan.bubbles.is_empty()
@@ -6843,7 +6866,8 @@ impl ModelBackend for KoviModelBackend {
             // 先把"不可发送的成分"剥掉（舞台动作、自述接不接），别让一句话犯规
             // 把整条正常回复带走：线上 2026-09-14 21:05 被长篇贬损那条就是这么
             // 丢的——66 个字生成了，一个字没发出去。
-            if sanitize_core_plan_bubbles(&mut plan) > 0 {
+            let sanitized_bubbles = sanitize_core_plan_bubbles(&mut plan);
+            if sanitized_bubbles > 0 {
                 kovi::log::info!(
                     "Yunxi Core reply sanitized: event_id={} message_id={} conversation_id={} bubbles={} visible={}",
                     input.event.id(),
@@ -6851,6 +6875,25 @@ impl ModelBackend for KoviModelBackend {
                     conversation_id_for_log(input),
                     plan.bubbles.len(),
                     core_plan_has_visible_text(&plan),
+                );
+            }
+            // 原始输出留档：只在这一轮真的被动过时打，供事后 diff「模型说了什么」与
+            // 「用户看到了什么」。这条日志是给"发出去的字怎么变样了"这类问题用的。
+            if core_plan_has_visible_text(&plan)
+                && should_archive_raw_reply(
+                    sanitized_bubbles,
+                    response_content.len(),
+                    plan.content.len(),
+                )
+            {
+                kovi::log::info!(
+                    "Yunxi Core raw reply archived: event_id={} message_id={} raw_bytes={} visible_bytes={} sanitized_bubbles={} raw={}",
+                    input.event.id(),
+                    message_id_for_log(input),
+                    response_content.len(),
+                    plan.content.len(),
+                    sanitized_bubbles,
+                    truncate_utf8_prefix_to_bytes(&response_content, CORE_RAW_REPLY_ARCHIVE_BYTES),
                 );
             }
             // 该回却什么都没剩下（或工具协议写坏）：先用同一个主模型确认式地再问
@@ -7501,12 +7544,12 @@ mod tests {
         sanitize_autonomous_intrinsic_output, sanitize_core_plan_bubbles,
         sanitize_intrinsic_output, sanitize_plain_text_batch_message,
         select_host_model_route_from_capability, serialize_intrinsic_reply_batch,
-        shadow_projection_for_completed_plan, silence_gate_plan, silence_verdict, silent_wait_plan,
-        split_core_speech_markers, split_two_short_lines, strip_core_speech_markers,
-        strip_stage_directions, strong_reply_repair_needed, tool_calls_allowed_for_turn,
-        tool_protocol_authorized_for_turn, visible_reply_intent, visible_reply_intents,
-        visible_reply_invites_continuation, visible_reply_state_updates, visible_turn_continuation,
-        with_chat_style,
+        shadow_projection_for_completed_plan, should_archive_raw_reply, silence_gate_plan,
+        silence_verdict, silent_wait_plan, split_core_speech_markers, split_two_short_lines,
+        strip_core_speech_markers, strip_stage_directions, strong_reply_repair_needed,
+        tool_calls_allowed_for_turn, tool_protocol_authorized_for_turn, visible_reply_intent,
+        visible_reply_intents, visible_reply_invites_continuation, visible_reply_state_updates,
+        visible_turn_continuation, with_chat_style,
     };
     use crate::model::{
         BotMemory, ConversationCoordinator, IncomingTurnImpact, OutgoingExecutiveDecision,
@@ -8846,6 +8889,19 @@ mod tests {
         let prompt = intrinsic_prompt(&messages, 512);
         assert!(!prompt.contains("Core 会负责把独立生成的消息按顺序发送"));
         assert!(prompt.ends_with(INTRINSIC_GENERATION_SUFFIX));
+    }
+
+    /// 留档判据：只在"内容真的被动过"时触发，正常回复不触发。
+    #[test]
+    fn raw_reply_archive_only_fires_when_content_changed() {
+        // 原样发出：不留档
+        assert!(!should_archive_raw_reply(0, 500, 500));
+        // 剥掉过内容（sanitize 命中）：留档
+        assert!(should_archive_raw_reply(1, 500, 500));
+        // 没走 sanitize，但正文明显短了一截（2026-09-14 那条 1468 → 1322 字）
+        assert!(should_archive_raw_reply(0, 1468, 1322));
+        // 差值在噪声范围内（去掉标记、首尾空白）：不留档
+        assert!(!should_archive_raw_reply(0, 500, 480));
     }
 
     #[test]
