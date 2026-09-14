@@ -613,9 +613,6 @@ async fn main() {
                 return;
             }
             let group_paused = crate::model::utils::is_group_paused(group_id).await;
-            // 对话焦点：先处理"这段对话还在不在"。别的成员一说话就结束接续
-            // （多人交叉时她不该再按一对一接下去）；焦点对象自己接着说则保留。
-            crate::model::break_group_conversation_focus(group_id, event.user_id).await;
             // 接续分支：她正在跟这个人对话，这条既没 @ 也没引用，是接着往下说。
             // 这里先走完成度合批——"说完了没"决定等不等，而不是固定时间窗；
             // 攒够一轮（或对方停手）后再作为一个可见回合交给 Core。

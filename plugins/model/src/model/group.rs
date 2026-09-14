@@ -83,8 +83,11 @@ struct GroupInterjectionState {
     /// 对话焦点：她上一次可见回复是在跟谁说话（QQ 号）+ 说话时刻。
     ///
     /// 与 `last_bot_reply`（只是"她刚说过话"的时间戳）不同，焦点带**对象**，
-    /// 因此可以用来判断"这条未点名消息是不是接着跟她说"。任何**别人**在群里
-    /// 说话都会把它清掉——群聊一旦变成多人交叉，她就不该再按一对一接下去。
+    /// 因此可以用来判断"这条未点名消息是不是接着跟她说"。
+    ///
+    /// 别人在群里说话**不会**结束焦点：2026-09-14 15:23 实测，群里 5 秒内就有人
+    /// 插一句闲话，按"别人一说话就结束"实现的话，接续活不过一轮、功能等于没有。
+    /// 焦点只按时间收敛（TTL），以及被她下一次可见回复换成新的对象。
     conversation_focus: Option<GroupConversationFocus>,
     /// 本群可见聊天回复的时间记录（有界），用于群级回复节奏硬限制。
     visible_replies: VecDeque<Instant>,
@@ -101,16 +104,6 @@ impl GroupInterjectionState {
         self.conversation_focus
             .filter(|focus| now.saturating_duration_since(focus.since) < ttl)
             .map(|focus| focus.user_id)
-    }
-
-    /// 群里有人说话：不是焦点对象说的，就说明对话被打断了，焦点结束。
-    fn break_focus_on(&mut self, speaker_user_id: i64) {
-        if self
-            .conversation_focus
-            .is_some_and(|focus| focus.user_id != speaker_user_id)
-        {
-            self.conversation_focus = None;
-        }
     }
 }
 
@@ -1635,22 +1628,6 @@ pub(crate) async fn note_group_conversation_focus(group_id: i64, user_id: i64) {
     });
 }
 
-/// 群里有人说话了：不是焦点对象说的，说明对话被打断了，焦点结束。
-///
-/// 每条群消息都会调用（包括她自己的），因此这里是"多人交叉即退出接续"的
-/// 唯一入口；她自己的发送走 [`mark_group_reply_sent`] 与
-/// [`note_group_conversation_focus`]，不会误清。
-pub(crate) async fn break_group_conversation_focus(group_id: i64, speaker_user_id: i64) {
-    let Ok(mut states) = GROUP_INTERJECTION_STATE.try_lock() else {
-        // 抢不到锁时保持严格语义：宁可不打断，也不阻塞入站热路径。
-        return;
-    };
-    let Some(state) = states.get_mut(&group_id) else {
-        return;
-    };
-    state.break_focus_on(speaker_user_id);
-}
-
 /// 同步查询对话焦点，供采样门这类同步判定使用；抢不到锁时按"没有焦点"处理。
 pub(crate) fn group_conversation_focus_user_now(group_id: i64, speaker_user_id: i64) -> bool {
     if !config::get().group_interjection().continuation_enabled() {
@@ -2645,19 +2622,16 @@ mod tests {
                 let state = states.get(&group_id).expect("focus state");
                 assert_eq!(state.focus_user_at(Instant::now(), ttl), Some(partner));
 
-                // 焦点对象自己接着说：焦点保留。
+                // 焦点只认时间：群里别人插话不影响"她还在跟这个人对话"
+                // （线上实测：任何"别人一说话就结束"的实现都会被活跃群秒杀）。
                 let mut owned = GroupInterjectionState {
                     conversation_focus: state.conversation_focus,
                     ..GroupInterjectionState::default()
                 };
-                owned.break_focus_on(partner);
                 assert_eq!(owned.focus_user_at(Instant::now(), ttl), Some(partner));
+                assert_ne!(partner, other);
 
-                // 别人插话：对话被打断，焦点结束。
-                owned.break_focus_on(other);
-                assert_eq!(owned.focus_user_at(Instant::now(), ttl), None);
-
-                // TTL 到期：即使没人插话也不再算接续。
+                // TTL 到期：不再算接续。
                 owned.conversation_focus = Some(GroupConversationFocus {
                     user_id: partner,
                     since: Instant::now() - ttl - Duration::from_secs(1),

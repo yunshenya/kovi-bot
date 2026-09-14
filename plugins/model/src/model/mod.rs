@@ -62,11 +62,10 @@ pub(crate) use crate::model::conversation_coordinator::{
     ConversationCoordinator, IncomingAdmission, IncomingTurnImpact, OutgoingExecutiveContext,
 };
 pub(crate) use crate::model::group::{
-    break_group_conversation_focus, conversation_continuation_active_now,
-    group_conversation_focus_user_now, group_message_event_after_ingress,
-    group_reply_budget_available_now, group_reply_budget_snapshot, note_group_conversation_focus,
-    record_group_message_observation, record_group_target_experience, reserve_group_chat_reply,
-    should_suppress_core_group_message,
+    conversation_continuation_active_now, group_conversation_focus_user_now,
+    group_message_event_after_ingress, group_reply_budget_available_now,
+    group_reply_budget_snapshot, note_group_conversation_focus, record_group_message_observation,
+    record_group_target_experience, reserve_group_chat_reply, should_suppress_core_group_message,
 };
 
 pub(crate) use crate::model::private::private_message_event_after_ingress;
