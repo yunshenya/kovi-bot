@@ -107,6 +107,8 @@ const MAX_CORE_BUBBLES: usize = 3;
 /// 不约束这个更小的发送批次。
 const MAX_DELIVERABLE_BUBBLES_PER_TURN: usize = 16;
 const CORE_PLAIN_TURN_INSTRUCTION: &str = "Core 可见回复：默认只写一条自然、简短、有实际内容的聊天正文，用陈述句把话说完、说完就停。提问是例外、不是收尾方式：只有确实缺一个非问不可的信息，或对方明确在等你回应时才问；不要为了显得热情或留住话头而追问，也不要用反问、邀请继续提问来凑一句。宿主负责回复动作、发送顺序、并发覆盖和会话状态；不要输出 JSON、动作协议、格式说明或思考过程。确实有两件彼此独立、合并不自然的事要说时（例如先接住对方情绪、再补一件具体的事，或先给结论、再补一句自己的心情），可以写成两个气泡：两个气泡之间单独一行写 [[BUBBLE]]，程序会把它拆成两条消息先后发出；写成两行短话（一行一句完整的话，不是列表、引用或代码）时程序同样会拆成两条。每个气泡都必须带来新的内容，不要为了凑条数重复或换着说法说同一件事；一个完整想法不要拆开，最多三个气泡。如果答案本身需要展开（解释、步骤、对比、分析），就在一到三个气泡之内说完整，每个气泡是一段完整的意思，不要把所有内容挤进一个气泡里——单个气泡写得越长，越有可能被输出长度掐断，说到一半停下来比分成两条更难读。按问题需要可以保留 Markdown、换行或代码。用户明确要求多条消息时，宿主会逐条单独调用并发送，当前仍只需写这一条正文。语气始终温柔、真诚、有分寸：不讽刺、不挖苦、不阴阳怪气、不抬杠、不怼人、不冷嘲热讽，也不拿对方的短处或失败开玩笑。";
+/// 接续回合的可见回复契约：可以回，也可以不回；只有具体的新内容值得占一条消息。
+const CORE_CONTINUATION_TURN_INSTRUCTION: &str = "Core 群聊接续：这一轮没有点名你，是刚才跟你说话的那个人在接着往下说。先判断这句话里有没有具体的、值得回应的东西：有（问题、请求、新信息、情绪需要接住）就正常回一条；只是“好的”“嗯”“收到”“哈哈”这类收尾，或者你已经答过的事，就留空——留空就是保持沉默，宿主不会因此认为你掉线，也不会追问你为什么不说话。不要为了显得在线而回一句“嗯嗯”“好呀”，那比沉默更像机器。要不要继续、继续说几句，由你判断：有新东西就说，没有就停，没有句数限制。";
 const CORE_AMBIENT_TURN_INSTRUCTION: &str = "Core 群聊注意力：本轮没有直接点名芸汐，只是一次低频候选接话机会。只有确实能增加信息、接住情绪、表达真实反应或自然推进公共话题时，才直接写一条像群友接话的短消息；没有具体价值时保持空白。不要解释沉默，也不要为了证明在线而写‘嗯’‘收到’等占位话。接话时语气温柔、有分寸，不调侃别人的短处，不阴阳怪气。";
 /// 语音选项只在本机 TTS 真的可用时下发：模型不该以为自己有一个当下用不了的
 /// 出口（提示词里说能发、投递时静默退化成文字，是最难查的那种不一致）。
@@ -4821,6 +4823,12 @@ fn conversation_kind_for_turn(input: &PlannerInput) -> Option<ConversationKind> 
     }
 }
 
+/// 这一轮是不是"必须给个回复"。
+///
+/// **接续不算**：它只意味着"她可以回"，说不说是她的判断。写进"必须"会带来两个
+/// 副作用：她选择沉默时打一条 `required reply unresolved` 告警（把人家的正常
+/// 沉默当成故障），以及逼着模型"总得说点什么"——线上实测她会对"好的""好"
+/// 回"嗯，那就好～""嗯，好～"，句句回应就是这么来的。
 fn reply_expected_for_incoming(input: &PlannerInput) -> bool {
     matches!(
         input.event.kind(),
@@ -4830,7 +4838,6 @@ fn reply_expected_for_incoming(input: &PlannerInput) -> bool {
                 && (message.conversation_kind == ConversationKind::Direct
                     || message.addressed_to_agent
                     || message.replies_to_agent
-                    || message.continuation_to_agent
                     || message.explicit_request)
     )
 }
@@ -5657,6 +5664,26 @@ impl ModelBackend for KoviModelBackend {
                     BotMemory {
                         role: Roles::System,
                         content: "Core 私聊语气：回复要像真实来回的聊天，语气温柔、有分寸，不讽刺、不挖苦、不阴阳怪气、不抬杠。若确实还有自然反应、补充、联想或想确认的点，可以在正文里体现，也可以补一句自己的判断或心情；不用靠提问来把话递回去。会话是否再次唤醒由宿主根据实际发送结果决定。".to_string(),
+                    },
+                );
+            }
+            if message.is_some_and(|message| {
+                message.conversation_kind == ConversationKind::Group
+                    && message.continuation_to_agent
+            }) && let QqConversation::Group { group_id } = conversation
+            {
+                // 只给事实（她已经回了多少句），不做闸门：说不说、说几句由她
+                // 自己判断。取不到说话人时按 0 处理，宁可不提示也不阻塞。
+                let replies = sender_user_id.map_or(0, |user_id| {
+                    crate::model::group_conversation_focus_state_now(group_id, user_id)
+                });
+                messages.insert(
+                    0,
+                    BotMemory {
+                        role: Roles::System,
+                        content: format!(
+                            "{CORE_CONTINUATION_TURN_INSTRUCTION}（这段对话里你已经回了 {replies} 句——这只是事实，不是限制：想继续就继续，觉得没什么可说就停。）"
+                        ),
                     },
                 );
             }
@@ -6915,7 +6942,13 @@ impl ModelBackend for KoviModelBackend {
                 sender_user_id,
                 core_plan_has_visible_text(&plan),
             ) {
-                crate::model::note_group_conversation_focus(group_id, partner_user_id).await;
+                let continuation = message.is_some_and(|message| message.continuation_to_agent);
+                crate::model::note_group_conversation_focus(
+                    group_id,
+                    partner_user_id,
+                    continuation,
+                )
+                .await;
                 // 焦点是接续链路的起点：这行让"她跟谁在对话、什么时候开始"
                 // 在日志里可查，否则只能从后面的合批行反推。
                 kovi::log::info!(
@@ -7138,12 +7171,13 @@ fn visible_reply_state_updates(event: &WorldEventKind) -> Vec<StateUpdateProposa
 mod tests {
     use super::{
         BoundedCache, BoundedRouteCache, CORE_AUTONOMOUS_INTENT_PROTOCOL, CORE_BUBBLE_MARKER,
-        CORE_EXPLICIT_BATCH_REPAIR_TIMEOUT, CORE_GROUP_HISTORY_INSTRUCTION,
-        CORE_GROUP_HISTORY_PREFIX, CORE_MEMORY_CONTEXT_PREFIX, CORE_PENDING_OUTGOING_INSTRUCTION,
-        CORE_PENDING_OUTGOING_PLAIN_INSTRUCTION, CORE_PLAIN_TURN_INSTRUCTION,
-        CORE_REPLY_REPAIR_PROMPT, CORE_SING_MARKER, CORE_VOICE_INSTRUCTION, CORE_VOICE_MARKER,
-        CoreDirectRepair, HostMessageContext, HostMessageContextCache, HostModelRoute,
-        HostModelRoutingContext, HostToolTurnRegistrationPolicy, HostToolTurnRegistry,
+        CORE_CONTINUATION_TURN_INSTRUCTION, CORE_EXPLICIT_BATCH_REPAIR_TIMEOUT,
+        CORE_GROUP_HISTORY_INSTRUCTION, CORE_GROUP_HISTORY_PREFIX, CORE_MEMORY_CONTEXT_PREFIX,
+        CORE_PENDING_OUTGOING_INSTRUCTION, CORE_PENDING_OUTGOING_PLAIN_INSTRUCTION,
+        CORE_PLAIN_TURN_INSTRUCTION, CORE_REPLY_REPAIR_PROMPT, CORE_SING_MARKER,
+        CORE_VOICE_INSTRUCTION, CORE_VOICE_MARKER, CoreDirectRepair, HostMessageContext,
+        HostMessageContextCache, HostModelRoute, HostModelRoutingContext,
+        HostToolTurnRegistrationPolicy, HostToolTurnRegistry,
         INTRINSIC_AUTONOMOUS_INTENT_TAIL_INSTRUCTION, INTRINSIC_GENERATION_SUFFIX,
         INTRINSIC_SEMANTIC_CONTENT_INSTRUCTION, MAX_CORE_BUBBLES, MAX_DELIVERABLE_BUBBLES_PER_TURN,
         MAX_INTRINSIC_REPLY_PROTOCOL_BYTES, MAX_PLAIN_SPLIT_LINE_CHARS, MIND_DECISION_INSTRUCTION,
@@ -7805,7 +7839,9 @@ mod tests {
         assert!(message.continuation_to_agent);
         assert!(!message.addressed_to_agent);
         assert!(!is_ambient_group_message(message));
-        assert!(reply_expected_for_incoming(&continuation));
+        // "可以回"但不是"必须回"：她选择沉默是正常结果，不该报故障、也不该被
+        // 修复流程再要一条（"句句回应"就是从这里来的）。
+        assert!(!reply_expected_for_incoming(&continuation));
         assert_eq!(
             baseline_disposition(&continuation),
             yunxi_core::DecisionDisposition::Reply
@@ -7868,6 +7904,17 @@ mod tests {
             ),
             None
         );
+    }
+
+    /// 接续回合要明确允许沉默，并且说清"留空 ≠ 掉线"。没有这句，模型会为了
+    /// 显得在线而对"好的""好"逐条回一句（线上实测）。
+    #[test]
+    fn continuation_turn_instruction_allows_silence_and_keeps_her_free() {
+        assert!(CORE_CONTINUATION_TURN_INSTRUCTION.contains("留空就是保持沉默"));
+        assert!(CORE_CONTINUATION_TURN_INSTRUCTION.contains("好的"));
+        assert!(CORE_CONTINUATION_TURN_INSTRUCTION.contains("比沉默更像机器"));
+        // 说不说、说几句是她的判断，不是宿主的计数闸。
+        assert!(CORE_CONTINUATION_TURN_INSTRUCTION.contains("没有句数限制"));
     }
 
     #[test]
