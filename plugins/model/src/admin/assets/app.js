@@ -561,6 +561,8 @@
               await api('/api/config/reload', { method: 'POST' });
               config.dirty.clear();
               await loadConfigFile(config.name);
+              // 只重读文件不重画页面的话，表单还停在旧值上，看起来像"按了没反应"。
+              await renderConfigPage();
               toast('已按磁盘内容重新加载配置');
             } catch (problem) { toast(problem.message, 'bad'); }
           },
@@ -1406,6 +1408,12 @@
     return filtered ? `${memory.data.total} 条匹配记忆` : `共 ${memory.data.total} 条记忆`;
   }
 
+  /** 视图栏左边那句统计要等数据回来才准：建栏时数据还没到，取到之后回填一次。 */
+  function syncViewCount() {
+    const label = document.querySelector('#page-memory .view-count');
+    if (label) label.textContent = memoryViewSummary();
+  }
+
   // ── 表格视图
 
   async function renderTable(page) {
@@ -1418,6 +1426,7 @@
 
     const data = await api(`/api/memory/records?${params}`);
     memory.data = data;
+    syncViewCount();
 
     const card = h('div', { class: 'card' });
     if (!data.items.length) {
@@ -1542,6 +1551,7 @@
 
     const data = await api(`/api/memory/records?${params}`);
     memory.data = data;
+    syncViewCount();
     const groups = timelineGroups(data.items, memory.granularity);
     const dated = groups.reduce((total, group) => total + group.items.length, 0);
 
