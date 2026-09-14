@@ -159,6 +159,7 @@ mod tests {
                 conversation_kind: kind,
                 addressed_to_agent: addressed,
                 replies_to_agent: replied,
+                continuation_to_agent: false,
                 stop_requested: false,
                 explicit_request: false,
                 visible_reply_allowed: true,

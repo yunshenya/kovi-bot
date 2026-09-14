@@ -3280,6 +3280,12 @@ struct HostMessageContext {
     /// `is_bot_admin`（那需要 QQ 号）。静默门控必须对管理员留出通道——否则
     /// 唯一能解除静默的人会被自己触发的静默挡住，这个问题没有别的出口。
     sender_is_admin: bool,
+    /// 说话人的 QQ 号。
+    ///
+    /// Core 事件里只有平台无关的 `PersonId`，而"对话焦点"是**群聊侧**的概念
+    /// （入站判定按 QQ 号做），所以这里带上原始号把两边接起来。它只用于焦点
+    /// 记账，不进任何持久化结构，也不进提示词。
+    sender_user_id: i64,
 }
 
 #[derive(Debug)]
@@ -4138,6 +4144,7 @@ impl KoviModelBackend {
         admission: IncomingAdmission,
         vision_attachments: Vec<crate::vision::ImageAttachment>,
         sender_is_admin: bool,
+        sender_user_id: i64,
     ) {
         let displaced = self.host_message_contexts.lock().await.insert(
             message_id,
@@ -4145,6 +4152,7 @@ impl KoviModelBackend {
                 admission,
                 vision_attachments,
                 sender_is_admin,
+                sender_user_id,
             },
         );
         if let Some(displaced) = displaced {
@@ -4822,6 +4830,7 @@ fn reply_expected_for_incoming(input: &PlannerInput) -> bool {
                 && (message.conversation_kind == ConversationKind::Direct
                     || message.addressed_to_agent
                     || message.replies_to_agent
+                    || message.continuation_to_agent
                     || message.explicit_request)
     )
 }
@@ -5070,6 +5079,7 @@ fn is_ambient_group_message(message: &yunxi_core::MessageReceivedEvent) -> bool 
     message.conversation_kind == ConversationKind::Group
         && !message.addressed_to_agent
         && !message.replies_to_agent
+        && !message.continuation_to_agent
         && !message.explicit_request
 }
 
@@ -5102,12 +5112,18 @@ fn explicitly_addressed_group_message(message: &yunxi_core::MessageReceivedEvent
         && (message.addressed_to_agent || message.replies_to_agent)
 }
 
-/// 被点名消息使用的回复间隔；未点名消息沿用普通间隔。
+/// 这一轮群聊回复要等的间隔：点名用点名档，接续用接续档，其余用防刷屏档。
+///
+/// 接续档默认是 0（"在同一个对话里接着说"不受"不要每句都回"约束），总闸仍
+/// 由 `reply_rate_limit` 与焦点本身把守；配置可以给它一个正的下限。
 fn group_reply_gap_secs_for(message: &yunxi_core::MessageReceivedEvent) -> u64 {
     let config = config::get();
     let group = config.group_interjection();
     if explicitly_addressed_group_message(message) {
         return group.effective_addressed_reply_gap_secs();
+    }
+    if message.conversation_kind == ConversationKind::Group && message.continuation_to_agent {
+        return group.effective_continuation_reply_gap_secs();
     }
     group.reply_gap_secs()
 }
@@ -6858,6 +6874,21 @@ impl ModelBackend for KoviModelBackend {
                     mind_candidates,
                 );
             }
+            // 她可见回复了群里的某人 → 记下"对话焦点"：接下来的未点名消息里，
+            // 由这个人接着说的那些算接续（可以回、用接续档间隔、并且会合批）。
+            // 只有真的产出可见正文的回合才建立对话，沉默回合不算。
+            if core_plan_has_visible_text(&plan)
+                && let Some(group_message) = message
+                && group_message.conversation_kind == ConversationKind::Group
+                && let QqConversation::Group { group_id } = conversation
+                && let Some(guard) = incoming_guard.as_ref()
+            {
+                crate::model::note_group_conversation_focus(
+                    group_id,
+                    guard.context().sender_user_id,
+                )
+                .await;
+            }
             let mut state_updates = if message.is_some() {
                 interaction_state_updates_with_cues(input, parsed_response.interaction_cues)
             } else {
@@ -7092,12 +7123,12 @@ mod tests {
         deterministic_route_fallback, due_reply_target, eligible_mind_candidates,
         explicit_message_batch_needs_repair, explicit_message_count_for_event,
         explicit_message_count_for_input, explicit_message_count_instruction,
-        first_person_turn_avoidance, interaction_state_updates_with_cues,
+        first_person_turn_avoidance, group_reply_gap_secs_for, interaction_state_updates_with_cues,
         intrinsic_autonomous_intent_prompt, intrinsic_fallback_is_eligible,
-        intrinsic_output_is_unsafe, intrinsic_prompt, is_plain_text_batch_data_context,
-        keeps_existing_prepared_plan, message_id_for_log, mind_context_messages,
-        mind_outgoing_fence_required, parse_autonomous_intent_response, parse_core_response,
-        parse_direct_repair_output, parse_intrinsic_autonomous_directive,
+        intrinsic_output_is_unsafe, intrinsic_prompt, is_ambient_group_message,
+        is_plain_text_batch_data_context, keeps_existing_prepared_plan, message_id_for_log,
+        mind_context_messages, mind_outgoing_fence_required, parse_autonomous_intent_response,
+        parse_core_response, parse_direct_repair_output, parse_intrinsic_autonomous_directive,
         parse_plain_core_response, parse_qq_conversation, plain_text_batch_message_prompt,
         plain_text_batch_repair_context, pre_model_plan, prepared_outgoing_semantic_context,
         purge_group_routes_from_cache, recent_conversation_messages,
@@ -7151,6 +7182,7 @@ mod tests {
                     conversation_kind: ConversationKind::Direct,
                     addressed_to_agent: true,
                     replies_to_agent: false,
+                    continuation_to_agent: false,
                     stop_requested: false,
                     explicit_request: true,
                     visible_reply_allowed,
@@ -7162,6 +7194,31 @@ mod tests {
 
     fn group_message_input(addressed_to_agent: bool) -> PlannerInput {
         group_message_input_with_flags(addressed_to_agent, false, false, true, false)
+    }
+
+    /// 一条"接续"群消息：没人 @ 她，但宿主判定说话人是她当前对话焦点里的人。
+    fn group_continuation_input() -> PlannerInput {
+        PlannerInput::new(
+            WorldEvent::message_received(
+                EventPriority::High,
+                MessageReceivedEvent {
+                    message_id: MessageId::new(),
+                    conversation_id: ConversationId::new(),
+                    sender: PersonId::new(),
+                    content: MessageContent::text("这个新版本挺有意思"),
+                    reply_to: None,
+                    timestamp: Utc::now(),
+                    conversation_kind: ConversationKind::Group,
+                    addressed_to_agent: false,
+                    replies_to_agent: false,
+                    continuation_to_agent: true,
+                    stop_requested: false,
+                    explicit_request: false,
+                    visible_reply_allowed: true,
+                },
+            ),
+            PlannerStateSnapshot::empty(),
+        )
     }
 
     fn group_message_input_with_flags(
@@ -7184,6 +7241,7 @@ mod tests {
                     conversation_kind: ConversationKind::Group,
                     addressed_to_agent,
                     replies_to_agent,
+                    continuation_to_agent: false,
                     stop_requested,
                     explicit_request,
                     visible_reply_allowed,
@@ -7215,6 +7273,7 @@ mod tests {
                     conversation_kind: ConversationKind::Direct,
                     addressed_to_agent: true,
                     replies_to_agent: false,
+                    continuation_to_agent: false,
                     stop_requested: false,
                     explicit_request: true,
                     visible_reply_allowed: true,
@@ -7509,6 +7568,7 @@ mod tests {
                     conversation_kind: ConversationKind::Direct,
                     addressed_to_agent: true,
                     replies_to_agent: false,
+                    continuation_to_agent: false,
                     stop_requested: false,
                     explicit_request: false,
                     visible_reply_allowed: true,
@@ -7696,6 +7756,46 @@ mod tests {
     /// 她回了"那我就当你答应了——柏林记得给我带张明信片"。@段在 kovi 的 `text`
     /// 里被整段丢掉，正文只剩"好好好"，模型只能猜这句在跟谁说、说的是谁。
     /// 指向性由宿主判定，必须显式进提示词——这个测试钉住它。
+    /// 接续不是旁听：她正在跟这个人对话，所以这条按"对她说的"回合处理——
+    /// 不算 ambient（不走向量否决、不带"没叫你"的说明）、算"该回"，
+    /// 并用接续档间隔而不是未点名的防刷屏档。
+    #[test]
+    fn continuation_turns_are_treated_as_a_turn_for_her() {
+        let continuation = group_continuation_input();
+        let WorldEventKind::MessageReceived(message) = continuation.event.kind() else {
+            panic!("group fixture must be a received message");
+        };
+        assert!(message.continuation_to_agent);
+        assert!(!message.addressed_to_agent);
+        assert!(!is_ambient_group_message(message));
+        assert!(reply_expected_for_incoming(&continuation));
+        assert_eq!(
+            baseline_disposition(&continuation),
+            yunxi_core::DecisionDisposition::Reply
+        );
+        let group = crate::config::get().group_interjection().clone();
+        assert_eq!(
+            group_reply_gap_secs_for(message),
+            group.effective_continuation_reply_gap_secs()
+        );
+
+        // 三档间隔各归各的：点名档 > 接续档（默认 0），未点名仍吃防刷屏档。
+        let addressed = group_message_input(true);
+        let WorldEventKind::MessageReceived(message) = addressed.event.kind() else {
+            panic!("group fixture must be a received message");
+        };
+        assert_eq!(
+            group_reply_gap_secs_for(message),
+            group.effective_addressed_reply_gap_secs()
+        );
+        let ambient = group_message_input(false);
+        let WorldEventKind::MessageReceived(message) = ambient.event.kind() else {
+            panic!("group fixture must be a received message");
+        };
+        assert_eq!(group_reply_gap_secs_for(message), group.reply_gap_secs());
+        assert!(is_ambient_group_message(message));
+    }
+
     #[test]
     fn group_prompt_tells_the_model_who_the_message_targets() {
         let addressed = group_message_input(true);
@@ -8225,6 +8325,7 @@ mod tests {
             conversation_kind: ConversationKind::Group,
             addressed_to_agent: false,
             replies_to_agent: false,
+            continuation_to_agent: false,
             stop_requested: false,
             explicit_request: false,
             visible_reply_allowed: true,
@@ -8249,6 +8350,7 @@ mod tests {
                 conversation_kind: ConversationKind::Direct,
                 addressed_to_agent: true,
                 replies_to_agent: false,
+                continuation_to_agent: false,
                 stop_requested: false,
                 explicit_request: false,
                 visible_reply_allowed: true,
@@ -9616,6 +9718,7 @@ mod tests {
                     conversation_kind: ConversationKind::Group,
                     addressed_to_agent: false,
                     replies_to_agent: false,
+                    continuation_to_agent: false,
                     stop_requested: false,
                     explicit_request: false,
                     visible_reply_allowed: true,
@@ -9853,6 +9956,7 @@ mod tests {
                     conversation_kind: ConversationKind::Direct,
                     addressed_to_agent: true,
                     replies_to_agent: false,
+                    continuation_to_agent: false,
                     stop_requested: false,
                     explicit_request: true,
                     visible_reply_allowed: true,
@@ -9928,6 +10032,7 @@ mod tests {
                 conversation_kind: ConversationKind::Direct,
                 addressed_to_agent: true,
                 replies_to_agent: false,
+                continuation_to_agent: false,
                 stop_requested: false,
                 explicit_request: true,
                 visible_reply_allowed: true,
@@ -9983,6 +10088,7 @@ mod tests {
                 conversation_kind: ConversationKind::Direct,
                 addressed_to_agent: true,
                 replies_to_agent: false,
+                continuation_to_agent: false,
                 stop_requested: false,
                 explicit_request: true,
                 visible_reply_allowed: true,
@@ -10073,6 +10179,7 @@ mod tests {
                 conversation_kind: ConversationKind::Group,
                 addressed_to_agent: false,
                 replies_to_agent: false,
+                continuation_to_agent: false,
                 stop_requested: false,
                 explicit_request: false,
                 visible_reply_allowed: false,
@@ -10112,6 +10219,7 @@ mod tests {
                 conversation_kind: ConversationKind::Group,
                 addressed_to_agent: true,
                 replies_to_agent: false,
+                continuation_to_agent: false,
                 stop_requested: false,
                 explicit_request: false,
                 visible_reply_allowed: true,
@@ -10729,6 +10837,7 @@ mod tests {
                     url: None,
                 }],
                 sender_is_admin: false,
+                sender_user_id: 3_052_405_886,
             };
             let mut cache = HostMessageContextCache::new(2);
 

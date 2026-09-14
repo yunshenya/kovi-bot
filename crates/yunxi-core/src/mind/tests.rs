@@ -26,6 +26,7 @@ fn direct_event(person_id: PersonId, conversation_id: ConversationId, text: &str
             conversation_kind: ConversationKind::Direct,
             addressed_to_agent: true,
             replies_to_agent: false,
+            continuation_to_agent: false,
             stop_requested: false,
             explicit_request: true,
             visible_reply_allowed: true,

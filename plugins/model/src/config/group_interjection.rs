@@ -68,6 +68,24 @@ pub struct GroupInterjectionConfig {
     /// 未点名回合里 Mind 判定 silent 却仍发出可见回复的有 271 条，占全部
     /// 群回复的 75%，是"没问她也要答"的主通道。
     ambient_requires_mind_intent: bool,
+    /// 对话焦点：她在群里可见回复某人之后，记下"正在跟这个人对话"。
+    ///
+    /// 焦点活着时，这个人的未点名后续消息按"接续"处理——可以产生可见回复，
+    /// 用 `continuation_reply_gap_secs` 那一档间隔，而不是未点名的防刷屏档；
+    /// 连发的几条还会走完成度合批，按"说完了没"合成一轮。
+    ///
+    /// 为什么需要它（2026-09-14 实测）："@ 一次再连发几条"的形态下，后几条
+    /// 未点名消息里 89% 连语义评估都进不去，进了评估的也会被 90 秒未点名
+    /// 间隔静默——而接续窗口只有 60 秒，在她能再次开口之前就关了。焦点把
+    /// 判据从"过了几秒"换成"是谁在跟我说话、这段对话还在不在"。
+    continuation_enabled: bool,
+    /// 焦点存活时长（秒）：她最后一次可见回复之后，多久内仍算在对话中。
+    continuation_focus_ttl_secs: u64,
+    /// 接续回答的最短间隔（秒）。默认 0：接续是在同一个对话里接着说，
+    /// "不要每句都回"那条防刷屏间隔不适用；总量仍由 `reply_rate_limit`
+    /// 和焦点本身（别人插话即结束、TTL 到期）约束。想留一个下限时填正数。
+    /// 取值必须 ≤ `reply_gap_secs`，否则退回 `reply_gap_secs`。
+    continuation_reply_gap_secs: u64,
     /// 同群两次群聊可见回复（点名或未点名）之间的最短间隔（秒）。
     /// 对"每句话都回"的刷屏波次做硬性控制；管理员豁免。
     reply_gap_secs: u64,
@@ -179,6 +197,23 @@ impl GroupInterjectionConfig {
         self.ambient_requires_mind_intent
     }
 
+    pub fn continuation_enabled(&self) -> bool {
+        self.continuation_enabled
+    }
+
+    pub fn continuation_focus_ttl_secs(&self) -> u64 {
+        self.continuation_focus_ttl_secs
+    }
+
+    /// 接续回答使用的回复间隔。配置值超过普通间隔时视为无效，退回普通间隔：
+    /// 这条通道只允许比默认节奏更宽松的显式配置生效（与点名档同一约定）。
+    pub fn effective_continuation_reply_gap_secs(&self) -> u64 {
+        if self.continuation_reply_gap_secs > self.reply_gap_secs {
+            return self.reply_gap_secs;
+        }
+        self.continuation_reply_gap_secs
+    }
+
     pub fn reply_gap_secs(&self) -> u64 {
         self.reply_gap_secs
     }
@@ -226,6 +261,9 @@ impl GroupInterjectionConfig {
         }
         if self.direct_rate_limit < 2 {
             return Err(anyhow::anyhow!("群聊点名频率上限不能小于2"));
+        }
+        if self.continuation_focus_ttl_secs == 0 {
+            return Err(anyhow::anyhow!("群聊对话焦点存活时间必须大于0秒"));
         }
         if self.sticker_reaction_window_secs == 0
             || self.sticker_reaction_cooldown_secs == 0
@@ -296,6 +334,9 @@ impl Default for GroupInterjectionConfig {
             familiar_rate_limit: 6,
             continuation_window_secs: 60,
             ambient_requires_mind_intent: true,
+            continuation_enabled: true,
+            continuation_focus_ttl_secs: 120,
+            continuation_reply_gap_secs: 0,
             reply_gap_secs: 90,
             addressed_reply_gap_secs: 20,
             reply_rate_window_secs: 600,

@@ -8,6 +8,7 @@
 //! - 话题生成：智能生成相关话题促进互动
 //! - 健康监控：实时监控系统状态和性能
 
+use crate::model::coalesce::{MessageCoalescer, MessagePart};
 use crate::model::{
     ConversationCoordinator, group_message_event_after_ingress,
     private_message_event_after_ingress, recall_notice_event, record_group_message_observation,
@@ -16,7 +17,7 @@ use crate::model::{
 use kovi::PluginBuilder;
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc,
+    Arc, LazyLock,
     atomic::{AtomicBool, Ordering},
 };
 
@@ -332,6 +333,104 @@ impl Drop for IncomingAdmissionGuard {
     }
 }
 
+/// Core 接续回合的完成度合批器：键是 `(群号, 发送者)`。
+///
+/// 与 Host 链路共用同一套 `[message_batch]` 语义：判"这句话说完了没"决定等
+/// 多久——说完了立刻成轮，还在继续就等到 `max_wait`（有上限）。区别只在
+/// 归属：Host 那份服务低频插话，这份服务"她正在跟某人对话"的接续。
+static CORE_CONTINUATION_BATCHES: LazyLock<MessageCoalescer<(i64, i64)>> =
+    LazyLock::new(Default::default);
+
+/// 把一条"接续"消息推进完成度合批；攒够一轮后作为**一个**可见回合交给 Core。
+///
+/// 时序（2026-09-14 实测的失败形态）：@ 她一句 → 她 1 秒内回一句 → 对方接着
+/// 连发三条。三条各自是独立入站：89% 连语义评估都进不去，进了评估的也会被
+/// 90 秒未点名间隔静默。这里把三条合成一轮，并按接续档放行。
+///
+/// 降级：Core 入队被拒（队列满/超时）时，这批只留最后一条进观察流——合并正文
+/// 会丢，但消息在 Host 观察记忆与跨群问答账本里仍有记录。这条路径只在 Core
+/// 队列打满时走到，日志里带 `action=observe`。
+async fn queue_group_continuation(
+    event: &kovi::event::GroupMsgEvent,
+    bot: &kovi::RuntimeBot,
+    bridge: &Arc<yunxi::bridge::CoreBridge>,
+) {
+    let group_id = event.group_id;
+    let user_id = event.user_id;
+    let text = event.borrow_text().unwrap_or_default().trim().to_owned();
+    let sender_label = yunxi::memory_writeback::sender_label(
+        event.sender.card.as_deref(),
+        event.sender.nickname.as_deref(),
+    );
+    let context = crate::model::coalesce::TurnGateBatchContext {
+        scope: yunxi_core::TurnScope::Group,
+        // 接续本身就意味着对话活跃；这里沿用同一个"她刚说过话"的口径。
+        conversation_active: crate::model::conversation_continuation_active_now(group_id),
+        addressed_to_agent: false,
+        replies_to_agent: false,
+        pending_task: false,
+        pending_outgoing: false,
+    };
+    let completion_text = text.clone();
+    let batch = CORE_CONTINUATION_BATCHES
+        .push_with_turn_gate(
+            (group_id, user_id),
+            MessagePart {
+                text: text.clone(),
+                intent_text: text,
+                addressed: false,
+                plain_text: true,
+                vision_requested: false,
+                sticker_reaction: false,
+                images: crate::vision::extract_image_attachments(&event.message),
+                message_ids: vec![event.message_id],
+            },
+            context,
+            || async move {
+                match crate::yunxi::intrinsic_runtime::get() {
+                    Some(runtime) => runtime.classify_input_completion(&completion_text).await,
+                    // 判不了就按"还没说完"处理：宁可多等一个有界的窗口，
+                    // 也不把对方的半句话当成一轮请求。
+                    None => yunxi_core::InputCompletion::Incomplete,
+                }
+            },
+        )
+        .await;
+    let Some(batch) = batch else {
+        // 还没轮到我：后面还有消息会把它补完。
+        return;
+    };
+    let admission =
+        ConversationCoordinator::begin_incoming(crate::model::ReplyScope::Group(group_id)).await;
+    let mut guard = IncomingAdmissionGuard::new(admission);
+    let outcome = bridge
+        .enqueue_group_continuation(
+            group_id,
+            user_id,
+            batch.text,
+            batch.message_ids.last().copied(),
+            batch.images,
+            sender_label,
+            chrono::Utc::now(),
+            guard.admission(),
+            crate::model::utils::is_bot_admin(bot, user_id),
+        )
+        .await;
+    match outcome {
+        yunxi::bridge::EnqueueOutcome::Accepted => {
+            // 所有权随事件进入 Core（同名上下文由 register_incoming 接管）。
+            guard.take();
+        }
+        other => {
+            // Core 没接住：这几条至少要留在观察流里，不能让消息凭空消失。
+            kovi::log::warn!(
+                "Yunxi Core continuation was not admitted: group_id={group_id} user_id={user_id} outcome={other:?} action=observe"
+            );
+            let _ = bridge.enqueue_group_observation(event);
+        }
+    }
+}
+
 /// 插件主入口函数
 ///
 /// 初始化所有必要的组件并注册消息处理函数：
@@ -493,6 +592,21 @@ async fn main() {
                 return;
             }
             let group_paused = crate::model::utils::is_group_paused(group_id).await;
+            // 对话焦点：先处理"这段对话还在不在"。别的成员一说话就结束接续
+            // （多人交叉时她不该再按一对一接下去）；焦点对象自己接着说则保留。
+            crate::model::break_group_conversation_focus(group_id, event.user_id).await;
+            // 接续分支：她正在跟这个人对话，这条既没 @ 也没引用，是接着往下说。
+            // 这里先走完成度合批——"说完了没"决定等不等，而不是固定时间窗；
+            // 攒够一轮（或对方停手）后再作为一个可见回合交给 Core。
+            if core_supported
+                && !group_paused
+                && !bridge.is_user_blocked(event.user_id)
+                && crate::model::group_conversation_focus_user_now(group_id, event.user_id)
+                && crate::yunxi::bridge::group_message_is_plain_continuation(&event)
+            {
+                queue_group_continuation(&event, &bot, &bridge).await;
+                return;
+            }
             let group_decision = bridge.classify_group(&event, group_paused);
             if group_decision.handling == yunxi::bridge::GroupCoreHandling::Observe {
                 // Un-addressed group text is observed AND may occasionally be

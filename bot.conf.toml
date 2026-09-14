@@ -65,6 +65,19 @@ sticker_reaction_window_secs = 90
 # 未点名回合要有可见输出，必须由 Mind 提出带由头的开口；判 silent 就只
 # 观察。关掉即回到"模型自己决定接不接"的旧行为。
 ambient_requires_mind_intent = true
+# 对话焦点：她在群里可见回复某人之后，这个人的未点名后续算"接续"——
+# 可以回，用 continuation_reply_gap_secs 那一档间隔，并且连发的几条会按
+# "说完了没"合批成一轮。别人一插话、或超过焦点存活时间，接续就结束。
+# 为什么需要它：@ 一次再连发几条时，后几条未点名消息 89% 连语义评估都进
+# 不去，进了的也会被 90 秒未点名间隔静默（接续窗口只有 60 秒，在她能再次
+# 开口之前就关了）。关掉即回到旧行为。
+continuation_enabled = true
+# 焦点存活时间（秒）：她最后一次可见回复之后多久内仍算在对话中。
+continuation_focus_ttl_secs = 120
+# 接续回答的最短间隔（秒）。0 = 不受"不要每句都回"的间隔限制（仍受
+# reply_rate_limit 与焦点边界约束）；要留下限就填正数，取值必须
+# ≤ reply_gap_secs，超限按 reply_gap_secs 收口。
+continuation_reply_gap_secs = 0
 # 接续对话窗口：芸汐最近一次在本群可见回复后，未点名消息在此秒数内按
 # “接续对话”语义评估；窗口外回到低频插话抽样。
 # 必须 ≤ reply_gap_secs：超限时启动会告警，并按 reply_gap_secs 收口

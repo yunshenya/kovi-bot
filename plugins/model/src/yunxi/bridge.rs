@@ -1349,6 +1349,42 @@ impl CoreBridge {
         self.send_reliably(message).await
     }
 
+    /// 把完成度合批后的"接续"消息作为一次可见回合并入 Core。
+    ///
+    /// 与 [`Self::enqueue_group_reliably`] 的区别：这里没有一条单独特定的
+    /// kovi 事件可依，整轮内容来自几条连发消息的合并（`text` 已按顺序拼好），
+    /// 而 `last_external_message_id` 是其中**最后一条**——回复动作引用它，
+    /// 与真人"回最后那句"一致。事件带 `continuation_to_agent`：宿主已经
+    /// 判定发言者是她当前对话焦点里的人，所以这条按"对她说的"处理。
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn enqueue_group_continuation(
+        &self,
+        group_id: i64,
+        sender_user_id: i64,
+        text: String,
+        last_external_message_id: Option<i32>,
+        vision_attachments: Vec<crate::vision::ImageAttachment>,
+        sender_label: String,
+        timestamp: DateTime<Utc>,
+        incoming_admission: IncomingAdmission,
+        sender_is_admin: bool,
+    ) -> EnqueueOutcome {
+        let Some(mut message) = InboundMessage::from_continuation(
+            group_id,
+            sender_user_id,
+            text,
+            last_external_message_id,
+            vision_attachments,
+            sender_label,
+            timestamp,
+        ) else {
+            return EnqueueOutcome::SkippedInvalid;
+        };
+        message.incoming_admission = Some(incoming_admission);
+        message.sender_is_admin = sender_is_admin;
+        self.send_reliably(message).await
+    }
+
     pub(crate) fn enqueue_private_observation(&self, event: &PrivateMsgEvent) -> EnqueueOutcome {
         let Some(mut message) = InboundMessage::from_private(event) else {
             return EnqueueOutcome::SkippedInvalid;
@@ -2101,6 +2137,12 @@ struct InboundMessage {
     /// 此前对这一类消息静默跳过，于是 `tools/turngate` 只能把"@别人"记成
     /// "在叫她"，把 TurnGate 训练集教反。
     directed_at_other_members: bool,
+    /// 这条是"接续"：发言者是她当前对话焦点里的那个人，没有 @ 也没有引用。
+    ///
+    /// 由 `enqueue_group_continuation` 在完成度合批成轮时置位；普通入站一律
+    /// false。它决定这条按"对她说的"处理（可以产生可见回复），同时用接续档
+    /// 的回复间隔，而不是未点名的防刷屏档。
+    continuation_to_agent: bool,
     visible_reply_allowed: bool,
     explicit_request: bool,
     stop_requested: bool,
@@ -2146,6 +2188,7 @@ impl InboundMessage {
             replies_to_agent_hint: false,
             addressed_to_agent,
             directed_at_other_members,
+            continuation_to_agent: false,
             visible_reply_allowed: true,
             explicit_request,
             stop_requested: false,
@@ -2183,6 +2226,7 @@ impl InboundMessage {
             replies_to_agent_hint: false,
             addressed_to_agent: true,
             directed_at_other_members: false,
+            continuation_to_agent: false,
             visible_reply_allowed: true,
             explicit_request: true,
             stop_requested: false,
@@ -2197,6 +2241,57 @@ impl InboundMessage {
                 Some(&event.get_sender_nickname()),
             ),
             timestamp: event_timestamp(event.time),
+        })
+    }
+
+    /// 合成一条"接续"入站回合：内容已经由调用方按顺序合批好（见
+    /// `plugins/model/src/lib.rs` 的接续分支），这里只负责把它变成一个普通
+    /// 的可见回合。`continuation_to_agent = true`、`addressed_to_agent = false`
+    /// 是有意的：没有人 @ 她，但宿主已经判定这句话是在接着跟她说。
+    #[allow(clippy::too_many_arguments)]
+    fn from_continuation(
+        group_id: i64,
+        sender_user_id: i64,
+        text: String,
+        last_external_message_id: Option<i32>,
+        vision_attachments: Vec<crate::vision::ImageAttachment>,
+        sender_label: String,
+        timestamp: DateTime<Utc>,
+    ) -> Option<Self> {
+        valid_qq_id(group_id).then_some(())?;
+        valid_qq_id(sender_user_id).then_some(())?;
+        let text = bounded_text(&text);
+        if text.trim().is_empty() && vision_attachments.is_empty() {
+            return None;
+        }
+        // 正文里的附件由视觉附件反推：图片这条路上真正被解析的是
+        // `vision_attachments`，核心事件里的 `content.attachments()` 只负责让
+        // 提示词知道"这一轮带了图"。两处必须一致，否则会出现"说了有图却看不到"。
+        let attachments = vision_attachments
+            .iter()
+            .map(|image| Attachment::new(AttachmentKind::Image, image.key.clone()))
+            .collect::<Result<Vec<_>, _>>()
+            .ok()?;
+        Some(Self {
+            address: ConversationAddress::Group { group_id },
+            sender_user_id,
+            external_message_id: last_external_message_id.and_then(positive_message_id),
+            reply_to_external_message_id: None,
+            replies_to_agent_hint: false,
+            addressed_to_agent: false,
+            directed_at_other_members: false,
+            continuation_to_agent: true,
+            visible_reply_allowed: true,
+            explicit_request: false,
+            stop_requested: false,
+            planner_attention_requested: false,
+            incoming_admission: None,
+            sender_is_admin: false,
+            text,
+            attachments,
+            vision_attachments,
+            sender_label,
+            timestamp,
         })
     }
 }
@@ -3845,6 +3940,7 @@ async fn resolve_and_submit_inner(
 
     let priority = if message.address.kind() == ConversationKind::Direct
         || message.addressed_to_agent
+        || message.continuation_to_agent
         || recent_agent_reply
         || message.stop_requested
         || message.explicit_request
@@ -3856,6 +3952,7 @@ async fn resolve_and_submit_inner(
     };
     let requested_message_count = (message.address.kind() == ConversationKind::Direct
         || message.addressed_to_agent
+        || message.continuation_to_agent
         || recent_agent_reply
         || message.explicit_request)
         .then(|| super::core_model::requested_message_count(&message.text))
@@ -3874,6 +3971,7 @@ async fn resolve_and_submit_inner(
             conversation_kind: message.address.kind(),
             addressed_to_agent: message.addressed_to_agent,
             replies_to_agent: recent_agent_reply,
+            continuation_to_agent: message.continuation_to_agent,
             stop_requested: message.stop_requested,
             explicit_request: message.explicit_request,
             visible_reply_allowed,
@@ -3912,6 +4010,7 @@ async fn resolve_and_submit_inner(
                     incoming_admission,
                     message.vision_attachments.clone(),
                     message.sender_is_admin,
+                    message.sender_user_id,
                 )
                 .await;
             true
@@ -4222,6 +4321,7 @@ fn effective_visible_reply_allowed(message: &InboundMessage, recent_agent_reply:
     message.visible_reply_allowed
         && (message.address.kind() == ConversationKind::Direct
             || message.addressed_to_agent
+            || message.continuation_to_agent
             || recent_agent_reply
             || message.stop_requested
             || message.explicit_request
@@ -4384,6 +4484,19 @@ fn directed_at_other_members(message: &Message, addressed_to_agent: bool) -> boo
         && message
             .iter()
             .any(|segment| matches!(segment.type_.as_str(), "at" | "reply"))
+}
+
+/// 这条群消息是不是"纯文字接续"：没有 at/reply 段、正文非空、也不是控制命令。
+///
+/// 接续判定（发言者是她当前对话焦点里的人）由调用方完成；这里只管**形状**——
+/// 带 @ 或引用的消息有自己的通道，控制命令（`#…`）有自己的处理，都不该被
+/// 合批成聊天回合。
+pub(crate) fn group_message_is_plain_continuation(event: &GroupMsgEvent) -> bool {
+    if !ambient_group_payload_can_be_sampled(&event.message) {
+        return false;
+    }
+    let text = event.borrow_text().unwrap_or_default().trim();
+    !text.is_empty() && !text.starts_with('#')
 }
 
 fn ambient_group_payload_can_be_sampled(message: &Message) -> bool {
@@ -4742,6 +4855,43 @@ mod tests {
         }
     }
 
+    /// 合批后的接续回合：正文是几条拼起来的、回复目标是最后一条、按"对她说的"
+    /// 处理，但不算被点名（`addressed_to_agent` 保持 false）。
+    #[test]
+    fn continuation_message_merges_text_and_keeps_the_last_reply_target() {
+        let message = InboundMessage::from_continuation(
+            641_996_763,
+            3_052_405_886,
+            "你去看看德国现在几点了\n然后帮我计算一下时差".to_owned(),
+            Some(893_183_052),
+            Vec::new(),
+            "小猫".to_owned(),
+            Utc::now(),
+        )
+        .expect("continuation message");
+
+        assert!(message.continuation_to_agent);
+        assert!(!message.addressed_to_agent);
+        assert_eq!(message.external_message_id, Some(893_183_052));
+        assert!(message.text.contains("时差"));
+        // 没有它，这条消息连可见回复的资格都没有（见 effective_visible_reply_allowed）。
+        assert!(effective_visible_reply_allowed(&message, false));
+
+        // 空正文又没图：不成轮，直接丢弃。
+        assert!(
+            InboundMessage::from_continuation(
+                641_996_763,
+                3_052_405_886,
+                "   ".to_owned(),
+                None,
+                Vec::new(),
+                "小猫".to_owned(),
+                Utc::now(),
+            )
+            .is_none()
+        );
+    }
+
     fn inbound(address: ConversationAddress, addressed_to_agent: bool) -> InboundMessage {
         InboundMessage {
             address,
@@ -4756,6 +4906,7 @@ mod tests {
             timestamp: Utc::now(),
             addressed_to_agent,
             directed_at_other_members: false,
+            continuation_to_agent: false,
             visible_reply_allowed: true,
             explicit_request: false,
             stop_requested: false,
@@ -6068,6 +6219,7 @@ mod tests {
                         conversation_kind,
                         addressed_to_agent: true,
                         replies_to_agent: false,
+                        continuation_to_agent: false,
                         stop_requested: false,
                         explicit_request: true,
                         visible_reply_allowed: true,

@@ -577,6 +577,16 @@ pub struct MessageReceivedEvent {
     pub conversation_kind: ConversationKind,
     pub addressed_to_agent: bool,
     pub replies_to_agent: bool,
+    /// 这条是"接续"：发言者正是她此刻在群里对话的那个人，这句话接着往下说。
+    ///
+    /// 与 `addressed_to_agent` 的区别：没有 @、没有引用、正文也没点名，所以
+    /// 它既不是点名也不该被当成旁听。宿主用对话焦点（她上一次可见回复是对谁
+    /// 说的、之后有没有别人插话）判定它；判定成立时这条按"对她说的"处理——
+    /// 可以产生可见回复，但用接续档的回复间隔，而不是未点名的防刷屏档。
+    ///
+    /// 老载荷没有这个字段，按 false 反序列化。
+    #[serde(default)]
+    pub continuation_to_agent: bool,
     pub stop_requested: bool,
     pub explicit_request: bool,
     /// Whether this observation may produce a visible reply.
@@ -1357,6 +1367,7 @@ mod tests {
                 conversation_kind: ConversationKind::Direct,
                 addressed_to_agent: true,
                 replies_to_agent: false,
+                continuation_to_agent: false,
                 stop_requested: false,
                 explicit_request: true,
                 visible_reply_allowed: true,
@@ -1702,6 +1713,7 @@ mod tests {
                 conversation_kind: ConversationKind::Direct,
                 addressed_to_agent: false,
                 replies_to_agent: false,
+                continuation_to_agent: false,
                 stop_requested: false,
                 explicit_request: false,
                 visible_reply_allowed: true,
@@ -1722,6 +1734,20 @@ mod tests {
         assert!(matches!(
             legacy.kind(),
             WorldEventKind::MessageReceived(message) if message.visible_reply_allowed
+        ));
+
+        // 接续标记同样是可选字段：老载荷里没有它，必须按"不是接续"读，
+        // 否则宿主升级前后的语义会分叉（Core 只认事件，不认宿主代码）。
+        let mut continuations = serde_json::to_value(&event).expect("event should serialize");
+        continuations["kind"]["payload"]
+            .as_object_mut()
+            .expect("message payload")
+            .remove("continuation_to_agent");
+        let continuations: WorldEvent =
+            serde_json::from_value(continuations).expect("older message event should deserialize");
+        assert!(matches!(
+            continuations.kind(),
+            WorldEventKind::MessageReceived(message) if !message.continuation_to_agent
         ));
 
         let oversized = match event.kind().clone() {

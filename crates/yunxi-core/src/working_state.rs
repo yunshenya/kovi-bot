@@ -688,6 +688,7 @@ mod tests {
                 conversation_kind: ConversationKind::Group,
                 addressed_to_agent: false,
                 replies_to_agent: false,
+                continuation_to_agent: false,
                 stop_requested: false,
                 explicit_request: false,
                 visible_reply_allowed: true,
