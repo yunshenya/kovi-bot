@@ -2736,12 +2736,26 @@ impl MemoryManager {
             FusionStrategy::Interleave,
             limit,
         );
-        // 语义那一路可能带出不在词面结果里的记忆；按融合顺序重排，缺的补在最后
-        // ——补不进来的（已过期、已删）就自然不在结果里。
         let mut by_id: std::collections::HashMap<String, MemoryEntry> = lexical
             .into_iter()
             .map(|entry| (entry.id.clone(), entry))
             .collect();
+        // 语义那一路会带出词面**完全没有**的记忆（词面不重叠、语义确实相关）——那正是
+        // 这一路存在的理由，也是上面选 interleave 而不是 RRF 的理由。所以必须把它们
+        // 真的取回来：只在词面结果里按 id 查，等于语义只能给词面结果重排序，embed
+        // 服务白装，而且这种退化完全静默。
+        let missing: Vec<String> = fused
+            .iter()
+            .filter(|id| !by_id.contains_key(*id))
+            .cloned()
+            .collect();
+        if !missing.is_empty()
+            && let Some(fetched) = self.load_entries_by_id(subject_id, context, &missing).await
+        {
+            for entry in fetched {
+                by_id.entry(entry.id.clone()).or_insert(entry);
+            }
+        }
         let mut ordered = Vec::with_capacity(fused.len());
         for id in fused {
             if let Some(entry) = by_id.remove(&id) {
@@ -2750,6 +2764,60 @@ impl MemoryManager {
         }
         ordered.extend(by_id.into_values());
         self.rerank_if_enabled(&client, &query_text, ordered).await
+    }
+
+    /// 按 id 取回只有语义那一路找到的记忆。
+    ///
+    /// **作用域谓词必须与词面那一路逐字一致**（`subject_id` + `context`/`scope_type`）：
+    /// 语义检索越过用户与群的边界是隐私问题，不是排序问题。取不回来的（已删、越界、
+    /// 查询失败或超时）就当作不存在——那条记忆本来也不在词面结果里，于是行为退回
+    /// 改动前的样子，不会因为一次查询失败而让整个召回失效。
+    async fn load_entries_by_id(
+        &self,
+        subject_id: i64,
+        context: &str,
+        ids: &[String],
+    ) -> Option<Vec<MemoryEntry>> {
+        let pool = self.database_pool.get()?;
+        let requested_context = ConversationScope::parse(context)
+            .map(ConversationScope::database_value)
+            .unwrap_or(context)
+            .to_string();
+        let fetch = query(
+            r#"
+            SELECT payload
+            FROM kovi_bot_memories
+            WHERE subject_id = $1
+              AND CASE
+                    WHEN $2 IN ('private', 'group') THEN scope_type = $2
+                    ELSE context = $2
+                  END
+              AND id = ANY($3::TEXT[])
+            "#,
+        )
+        .bind(subject_id)
+        .bind(&requested_context)
+        .bind(ids)
+        .fetch_all(pool);
+        match kovi::tokio::time::timeout(Duration::from_secs(2), fetch).await {
+            Ok(Ok(rows)) => rows
+                .into_iter()
+                .map(|row| serde_json::from_value(row.get("payload")).map_err(Into::into))
+                .collect::<Result<Vec<MemoryEntry>>>()
+                .ok(),
+            Ok(Err(error)) => {
+                warn_sidecar("semantic", || {
+                    format!("按 id 取回语义候选失败，退回词面顺序: {error}")
+                });
+                None
+            }
+            Err(_) => {
+                warn_sidecar("semantic", || {
+                    "按 id 取回语义候选超时，退回词面顺序".to_string()
+                });
+                None
+            }
+        }
     }
 
     /// 用交叉编码器对融合后的候选重排；关掉配置或重排失败就保持融合顺序。
@@ -3536,6 +3604,7 @@ mod tests {
     };
     use chrono::{Duration as ChronoDuration, Local};
     use sqlx_core::query::query;
+    use sqlx_core::row::Row;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
     use uuid::Uuid;
@@ -4444,6 +4513,91 @@ mod tests {
                     .await
                     .expect("应清理 PostgreSQL fixture");
                 let _ = std::fs::remove_file(path);
+            });
+    }
+
+    /// 按 id 取回语义候选时**必须守住作用域**。
+    ///
+    /// 这条路是给"只有语义那一路找到、词面完全没有"的记忆补取内容的（原先它们会被
+    /// 直接丢掉，等于 embed 只能给词面结果重排序）。补取用的是与词面那一路同样的
+    /// 谓词：subject + context/scope。语义检索越过用户与群的边界是隐私问题，不是
+    /// 排序问题，所以这里把两种越界各钉一条。
+    #[test]
+    #[ignore = "requires PostgreSQL via DATABASE_URL"]
+    fn semantic_by_id_load_stays_inside_the_requested_scope() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let subject = Local::now().timestamp_micros();
+                let other_subject = subject + 1;
+                let manager = MemoryManager::new("/tmp/kovi-scope-guard-source.json");
+                manager
+                    .initialize_database()
+                    .await
+                    .expect("应初始化 PostgreSQL 分表");
+
+                let in_scope = format!("作用域内 {subject}");
+                let other_context = format!("其它会话 {subject}");
+                let other_person = format!("别人的记忆 {subject}");
+                manager
+                    .add_conversation_memory(subject, &in_scope, "private_chat")
+                    .await
+                    .expect("应写入作用域内的记忆");
+                manager
+                    .add_conversation_memory(subject, &other_context, "group_chat_scope_guard")
+                    .await
+                    .expect("应写入其它会话的记忆");
+                manager
+                    .add_conversation_memory(other_subject, &other_person, "private_chat")
+                    .await
+                    .expect("应写入别人的记忆");
+
+                let pool = manager.database_pool().cloned().expect("应有连接池");
+                let rows = query(
+                    "SELECT id, payload->>'content' AS content FROM kovi_bot_memories
+                     WHERE subject_id IN ($1, $2)",
+                )
+                .bind(subject)
+                .bind(other_subject)
+                .fetch_all(&pool)
+                .await
+                .expect("应读回 id");
+                let id_of = |needle: &str| {
+                    rows.iter()
+                        .find(|row| row.get::<String, _>("content") == needle)
+                        .map(|row| row.get::<String, _>("id"))
+                        .unwrap_or_else(|| panic!("应能找到记忆: {needle}"))
+                };
+                let ids = vec![
+                    id_of(&in_scope),
+                    id_of(&other_context),
+                    id_of(&other_person),
+                ];
+
+                let fetched = manager
+                    .load_entries_by_id(subject, "private_chat", &ids)
+                    .await
+                    .expect("应能取回");
+                let contents: Vec<String> =
+                    fetched.into_iter().map(|entry| entry.content).collect();
+                assert_eq!(
+                    contents,
+                    vec![in_scope.clone()],
+                    "按 id 补取只能返回同一 subject 且同一作用域的记忆"
+                );
+
+                for (subject_id, content) in [
+                    (subject, in_scope),
+                    (subject, other_context),
+                    (other_subject, other_person),
+                ] {
+                    query("DELETE FROM kovi_bot_memories WHERE subject_id = $1 AND payload->>'content' = $2")
+                        .bind(subject_id)
+                        .bind(content)
+                        .execute(&pool)
+                        .await
+                        .expect("应清理 fixture");
+                }
             });
     }
 }
