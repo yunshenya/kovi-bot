@@ -103,6 +103,33 @@ async fn command_sensor_ok(sensor: &config::WorldSensorConfig) -> bool {
     }
 }
 
+/// 传感器输出的保留上限。它只被用来做一次 `contains` 与 160 字的日志，1 MiB 已经
+/// 远远够用；**超限之后仍然继续读**（只是不再保留），否则子进程会再次写满管道。
+const MAX_SENSOR_OUTPUT_BYTES: usize = 1024 * 1024;
+
+/// 读干一个管道，最多保留 `cap` 字节。
+///
+/// 两点都不能省：一是必须把管道读到 EOF，否则子进程写满缓冲区就卡在 `write()`；
+/// 二是用 lossy 解码——`read_to_string` 碰到非 UTF-8 会整体失败并留下空串，于是
+/// "命令成功、只是输出里带了二进制字节"会被判成"输出不匹配"，一条假的未达预期。
+fn drain_bounded(reader: impl std::io::Read, cap: usize) -> String {
+    let mut kept: Vec<u8> = Vec::new();
+    let mut chunk = [0_u8; 8 * 1024];
+    let mut reader = reader;
+    loop {
+        match reader.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(read) => {
+                if kept.len() < cap {
+                    let room = cap - kept.len();
+                    kept.extend_from_slice(&chunk[..read.min(room)]);
+                }
+            }
+        }
+    }
+    String::from_utf8_lossy(&kept).into_owned()
+}
+
 /// Spawn `sh -c <command>`, capture stdout+stderr, and kill it once `timeout`
 /// elapses so a stuck check cannot wedge the scheduler.
 async fn run_bounded_command(command: &str, timeout: Duration) -> anyhow::Result<(i32, String)> {
@@ -118,28 +145,43 @@ async fn run_bounded_command(command: &str, timeout: Duration) -> anyhow::Result
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|error| anyhow::anyhow!("无法启动命令: {error}"))?;
+        // 两个管道必须在等待的同时**并发**排空。只在 `try_wait()` 报退出之后才去读
+        // 是不行的：子进程写满管道缓冲区（Linux 64 KiB）就会阻塞在 `write()`，永远
+        // 不会退出，于是无论命令多快都会走到超时分支——这类传感器根本不可能成功。
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("stdout 管道缺失"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("stderr 管道缺失"))?;
+        let stdout_reader =
+            std::thread::spawn(move || drain_bounded(stdout, MAX_SENSOR_OUTPUT_BYTES));
+        let stderr_reader =
+            std::thread::spawn(move || drain_bounded(stderr, MAX_SENSOR_OUTPUT_BYTES));
+
         let deadline = std::time::Instant::now() + timeout;
-        loop {
+        let status = loop {
             if let Some(status) = child
                 .try_wait()
                 .map_err(|error| anyhow::anyhow!("等待命令进程失败: {error}"))?
             {
-                let mut output = String::new();
-                if let Some(mut stdout) = child.stdout.take() {
-                    let _ = stdout.read_to_string(&mut output);
-                }
-                if let Some(mut stderr) = child.stderr.take() {
-                    let _ = stderr.read_to_string(&mut output);
-                }
-                return Ok((status.code().unwrap_or(-1), output));
+                break status;
             }
             if std::time::Instant::now() >= deadline {
                 let _ = child.kill();
                 let _ = child.wait();
+                // 进程结束后管道关闭，两个读线程会自然返回。
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
                 return Err(anyhow::anyhow!("命令超时（>{}s）", timeout.as_secs()));
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
-        }
+        };
+        let mut output = stdout_reader.join().unwrap_or_default();
+        output.push_str(&stderr_reader.join().unwrap_or_default());
+        Ok((status.code().unwrap_or(-1), output))
     })
     .await
     .map_err(|error| anyhow::anyhow!("命令执行任务失败: {error}"))?
@@ -467,5 +509,45 @@ mod tests {
             let err = run_bounded_command("sleep 5", Duration::from_millis(300)).await;
             assert!(err.is_err());
         });
+    }
+
+    /// 输出超过管道缓冲区（Linux 64 KiB / macOS 16 KiB）的命令必须能正常跑完。
+    ///
+    /// 修前这里必然失败：两个管道只在 `try_wait()` 报退出之后才被读，子进程写满
+    /// 缓冲区就卡在 `write()`、永远不退出，于是无论命令多快都会走到超时分支——
+    /// 这类传感器根本不可能成功。用 `seq` 产生约 240 KB 输出，稳稳超过两个平台的
+    /// 缓冲区。超时给 10 秒，真出问题也不会把测试拖太久。
+    #[test]
+    fn command_sensor_survives_output_larger_than_the_pipe_buffer() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let (exit, output) = run_bounded_command("seq 1 40000", Duration::from_secs(10))
+                    .await
+                    .expect("大输出不应被判成超时");
+                assert_eq!(exit, 0);
+                assert!(output.len() > 64 * 1024, "确实产出了超过管道缓冲区的输出");
+                assert!(output.contains("40000"), "末尾内容也要读到");
+            });
+    }
+
+    /// 非 UTF-8 输出不能让整段读取失败。
+    ///
+    /// 修前用的是 `read_to_string`：它碰到非法字节会整体报错并留下空串，于是
+    /// "命令成功、只是输出里带了二进制"会被判成"输出不匹配"，一条假的未达预期。
+    #[test]
+    fn command_sensor_keeps_non_utf8_output() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let (exit, output) = run_bounded_command(r"printf 'ÿþOK'", Duration::from_secs(10))
+                    .await
+                    .expect("应能执行");
+                assert_eq!(exit, 0);
+                assert!(
+                    output.contains("OK"),
+                    "非法字节不该把后面的可读内容一起丢掉: {output:?}"
+                );
+            });
     }
 }
