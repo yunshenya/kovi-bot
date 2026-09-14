@@ -138,24 +138,23 @@ def main() -> int:
         text = text.replace(fn_anchor, QUIET_CONST + REFRESH_FUNCTION + fn_anchor, 1)
         print(f"[ok] 加入登录自愈: {path}")
         changed = True
-    else:
-        # 老版本自愈没有安静期常量：先补上，否则判断会引用未定义的常量。
-        if "const LOGIN_REFRESH_QUIET_MS" not in text:
-            fn_anchor = "async function refreshAVHostLogin() {"
-            if text.count(fn_anchor) != 1:
-                print(f"[fail] 找不到 refreshAVHostLogin: {path}")
-                return 1
-            text = text.replace(fn_anchor, QUIET_CONST + fn_anchor, 1)
-            print(f"[ok] 补上安静期常量: {path}")
-            changed = True
-        text, did = ensure(
-            text,
-            "async function refreshAVHostLogin() {\n  if (!pluginContext) return;\n",
-            QUIET_GUARD,
-            "安静期跳过判断",
-            path,
-        )
-        changed |= did
+    # 老版本自愈没有安静期常量：先补上，否则判断会引用未定义的常量。
+    if "const LOGIN_REFRESH_QUIET_MS" not in text:
+        fn_anchor = "async function refreshAVHostLogin() {"
+        if text.count(fn_anchor) != 1:
+            print(f"[fail] 找不到 refreshAVHostLogin: {path}")
+            return 1
+        text = text.replace(fn_anchor, QUIET_CONST + fn_anchor, 1)
+        print(f"[ok] 补上安静期常量: {path}")
+        changed = True
+    text, did = ensure(
+        text,
+        "async function refreshAVHostLogin() {\n  if (!pluginContext) return;\n",
+        QUIET_GUARD,
+        "安静期跳过判断",
+        path,
+    )
+    changed |= did
 
     timer_anchor = "    scheduleAVHostLogin(ctx);\n"
     if "loginRefreshTimer = setInterval" not in text:
@@ -165,6 +164,13 @@ def main() -> int:
         text = text.replace(timer_anchor, timer_anchor + REFRESH_TIMER, 1)
         print(f"[ok] 挂上 60 秒定时器: {path}")
         changed = True
+
+    # 写盘前最后确认安静期守卫真的在位：这个补丁存在的理由就是那次"通话在另一台
+    # 设备上响铃、桥却收不到信令"的回归，而它此前只在某一条分支上插入过守卫——
+    # 落盘一个缺守卫的文件、还打印 [ok]，比直接失败糟得多。
+    if QUIET_GUARD not in text:
+        print(f"[fail] 安静期跳过判断未就位，拒绝写入: {path}")
+        return 1
 
     if changed:
         path.write_text(text, encoding="utf8")

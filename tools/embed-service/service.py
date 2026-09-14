@@ -127,19 +127,28 @@ class Reranker:
         self.needs_token_types = "token_type_ids" in inputs
 
     def score(self, query: str, documents: list[str]) -> list[float]:
-        pairs = [(query, document) for document in documents]
-        encodings = self.tokenizer.encode_batch(pairs)
-        input_ids = np.array([item.ids for item in encodings], dtype=np.int64)
-        attention = np.array([item.attention_mask for item in encodings], dtype=np.int64)
-        feed = {"input_ids": input_ids, "attention_mask": attention}
-        if self.needs_token_types:
-            feed["token_type_ids"] = np.array(
-                [item.type_ids for item in encodings], dtype=np.int64
+        # 与上面的嵌入一样必须切片推理：一次 64 篇、每篇 pad 到 512 的交叉编码器
+        # 前向就是三万 token 级别，激活内存轻松过 GB——同一份注释在上面那条路上
+        # 写着"2026-09-12 真机上就是这样每十分钟被 OOM 杀一次"。
+        scores: list[float] = []
+        for start in range(0, len(documents), INFER_BATCH):
+            batch = documents[start : start + INFER_BATCH]
+            pairs = [(query, document) for document in batch]
+            encodings = self.tokenizer.encode_batch(pairs)
+            input_ids = np.array([item.ids for item in encodings], dtype=np.int64)
+            attention = np.array(
+                [item.attention_mask for item in encodings], dtype=np.int64
             )
-        logits = self.session.run(None, feed)[0]
-        flat = np.asarray(logits).reshape(-1)
-        # bge 重排器用 sigmoid 把 logit 压到 0..1，便于当阈值用。
-        return (1.0 / (1.0 + np.exp(-flat))).astype(np.float32).tolist()
+            feed = {"input_ids": input_ids, "attention_mask": attention}
+            if self.needs_token_types:
+                feed["token_type_ids"] = np.array(
+                    [item.type_ids for item in encodings], dtype=np.int64
+                )
+            logits = self.session.run(None, feed)[0]
+            flat = np.asarray(logits).reshape(-1)
+            # bge 重排器用 sigmoid 把 logit 压到 0..1，便于当阈值用。
+            scores.extend((1.0 / (1.0 + np.exp(-flat))).astype(np.float32).tolist())
+        return scores
 
 
 class Handler(BaseHTTPRequestHandler):

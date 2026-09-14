@@ -41,6 +41,8 @@ LOG = logging.getLogger("yunxi-sing")
 
 MAX_SECONDS = 45.0
 MAX_LYRICS_CHARS = 120
+# 请求体上限：与兄弟服务（embed 1 MB / speech 16 MB）同一思路，先夹住再读。
+MAX_BODY_BYTES = 64 * 1024
 TTS_TIMEOUT_SECS = 20
 # 一个汉字的合成结果可以复用：同一首歌里重复字很多。
 TTS_CACHE_LIMIT = 512
@@ -774,7 +776,16 @@ class Handler(BaseHTTPRequestHandler):
         if self.path != "/v1/sing":
             self._json({"error": "not found"}, status=404)
             return
-        length = int(self.headers.get("Content-Length", "0"))
+        # 先夹长度再读：`int()` 本身可能抛（Content-Length: abc），而
+        # 没有上限时 `Content-Length: 2000000000` 会直接把内存吃光。
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except (TypeError, ValueError):
+            self._json({"error": "Content-Length 非法"}, status=400)
+            return
+        if length <= 0 or length > MAX_BODY_BYTES:
+            self._json({"error": "请求体为空或过大"}, status=400)
+            return
         try:
             request = json.loads(self.rfile.read(length).decode("utf-8"))
         except (ValueError, UnicodeDecodeError):

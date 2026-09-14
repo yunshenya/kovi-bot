@@ -377,8 +377,17 @@ class Handler(BaseHTTPRequestHandler):
         if len(text) > MAX_TTS_CHARS:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": "text 过长"})
             return
+        # 夹在调用方（Rust 侧 qq_voice 配置）认可的同一区间：这个值直接决定
+        # 重采样要生成多少样本，放任 1e8 就是几百 MB 到 GB 的分配。bool 是 int 的
+        # 子类，所以显式排掉，别让 True 变成 1 Hz。
         requested = payload.get("sample_rate")
-        requested = int(requested) if isinstance(requested, int) and requested > 0 else None
+        requested = (
+            int(requested)
+            if isinstance(requested, int)
+            and not isinstance(requested, bool)
+            and 8_000 <= requested <= 96_000
+            else None
+        )
         # 按请求的语速：只给唱歌链路用，取值夹在 0.3~2.0，非法值忽略。
         requested_speed = payload.get("speed")
         requested_speed = (

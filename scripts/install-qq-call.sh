@@ -287,14 +287,22 @@ require_command git
 if [[ -d "$BRIDGE_SRC_DIR/.git" ]]; then
     info "复用已有桥源码: $BRIDGE_SRC_DIR"
     git -C "$BRIDGE_SRC_DIR" fetch --quiet origin "$BRIDGE_REF" 2>/dev/null || true
+    # 这个 ref 是刻意 pin 住的：切不过去就**拒绝安装**。降级成"继续用当前检出"
+    # 会以 root 跑一段来路不明的上游代码，而脚本还会打印 [ok]。
     git -C "$BRIDGE_SRC_DIR" checkout --quiet "$BRIDGE_REF" 2>/dev/null \
-        || warn "无法切换到 $BRIDGE_REF，继续使用当前检出"
+        || die "无法切换到固定提交 $BRIDGE_REF，拒绝安装（请检查网络或该提交是否仍存在）"
 else
     install -d -m 0750 "$(dirname -- "$BRIDGE_SRC_DIR")"
     info "拉取桥源码: $BRIDGE_REPO"
     git clone --quiet "$BRIDGE_REPO" "$BRIDGE_SRC_DIR"
     git -C "$BRIDGE_SRC_DIR" checkout --quiet "$BRIDGE_REF" 2>/dev/null \
-        || warn "无法切换到 $BRIDGE_REF，继续使用默认分支"
+        || die "无法切换到固定提交 $BRIDGE_REF，拒绝安装（请检查网络或该提交是否仍存在）"
+fi
+# 再确认一次 HEAD 就是那个 pin：上面的 checkout 成功也不代表一定落在它上面
+# （例如 ref 被上游改写），装错版本的代价比报错大。
+bridge_head="$(git -C "$BRIDGE_SRC_DIR" rev-parse HEAD 2>/dev/null || printf 'unknown')"
+if [[ "$bridge_head" != "$BRIDGE_REF" ]]; then
+    die "桥源码 HEAD ($bridge_head) 与固定提交 $BRIDGE_REF 不一致，拒绝安装"
 fi
 ok "桥源码就绪: $(git -C "$BRIDGE_SRC_DIR" rev-parse --short HEAD 2>/dev/null || printf 'unknown')"
 
