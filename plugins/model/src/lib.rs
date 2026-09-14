@@ -597,6 +597,24 @@ async fn main() {
                 return;
             }
             let core_supported = bridge.supports_group(&event);
+            // 入站级副作用：群里刚说过什么。**与这一轮最后归 Host 还是归 Core 无关**——
+            // Host 链原先只有"她和这个群的对话"，看不到别人同时在说什么，2026-09-14
+            // 23:01 那条 QQ 通知就是在这个盲区里被当成"对我说的"（见 `group_context`
+            // 模块头）。通知类消息不记：它不是谁说的话。
+            {
+                let raw = event.borrow_text().unwrap_or_default();
+                if !crate::model::qq_reply_notice(&event.message, raw) {
+                    crate::model::note_group_message(
+                        group_id,
+                        Some(event.message_id),
+                        &crate::yunxi::memory_writeback::sender_label(
+                            event.sender.card.as_deref(),
+                            event.sender.nickname.as_deref(),
+                        ),
+                        raw,
+                    );
+                }
+            }
             if !bridge.is_user_blocked(event.user_id) {
                 // 入站级副作用：与这一轮最后归 Host 还是归 Core 无关。相处证据
                 // 尤其不能挂在 Host 那条路上——"指向她"的消息正是判给 Core 的那批，

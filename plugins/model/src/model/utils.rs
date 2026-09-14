@@ -646,6 +646,11 @@ pub async fn control_model(
         &contextual_memories,
         rolling_summary.as_deref(),
     );
+    // 群里刚说过什么。Host 链这条路上原先只有"她和这个群的对话"（上面那份 messages），
+    // 看不到别人同时在说什么——2026-09-14 23:01 那条 QQ 通知落在这个盲区里，被当成
+    // "对我说的"（模块头 `group_context` 有完整来龙去脉）。Core 链早有一份同源上下文，
+    // 这里给它对齐。
+    crate::model::attach_group_context(&mut request_messages, group_id, current_message_id);
     let allow_reply_actions = reply_action_protocol_requested(message);
     if allow_reply_actions {
         attach_reply_protocol_context(

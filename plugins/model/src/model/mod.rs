@@ -5,6 +5,7 @@ mod conversation_coordinator;
 mod conversation_state;
 mod gag_commands;
 mod group;
+mod group_context;
 mod interrupt;
 #[cfg(test)]
 pub(crate) mod llm_mock;
@@ -70,6 +71,10 @@ pub(crate) use crate::model::group::{
     record_group_message_observation, record_group_target_experience, release_group_reply_slot,
     reply_budget_class, reserve_group_chat_reply_slot, should_suppress_core_group_message,
     sweep_group_window_queues,
+};
+
+pub(crate) use crate::model::group_context::{
+    attach_group_context, note_group_message, qq_reply_notice,
 };
 
 pub(crate) use crate::model::private::{

@@ -2177,6 +2177,19 @@ impl InboundMessage {
             return None;
         }
         let text = bounded_text(event.borrow_text().unwrap_or_default());
+        // QQ 的系统通知不是谁说的话：NapCat 会把"某人回复了你的消息："这类 UI 文案
+        // 当成普通群消息送进来，而它附会的"发送者"还对不上（同一条通知四分钟内以两个
+        // 不同成员的身份出现，正文里写的又是第三个昵称）。一旦放进去，焦点判定就会
+        // 把它当成"对方在接着跟我说"——2026-09-14 23:01 就是这么让她回了一句
+        // 「这个表情我还没看懂呢，不过感觉你在笑我」。
+        // 这里直接丢掉，并把形态记一行：下次要确认判据是否够准，看日志就够。
+        if crate::model::qq_reply_notice(&event.message, event.borrow_text().unwrap_or_default()) {
+            println!(
+                "[INFO] 群聊收到 QQ 回复通知，已忽略 (群组: {}, 用户: {}, 正文: {})",
+                event.group_id, event.user_id, text
+            );
+            return None;
+        }
         let explicit_request = group_message_requests_explicit_batch(&event.message, &text);
         let attachments = normalize_attachments(&event.message);
         let vision_attachments = crate::vision::extract_image_attachments(&event.message);
