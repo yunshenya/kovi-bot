@@ -465,6 +465,44 @@ pub fn validate_candidate(source: &str) -> anyhow::Result<ModelConfig> {
     Ok(config)
 }
 
+/// 校验一段候选的**主配置**文本，并叠加磁盘上现存的运行时覆盖，但不改动任何状态。
+///
+/// 主配置不能单独校验。磁盘上的覆盖会叠在主配置之上（加载顺序见
+/// `try_deserialize_config`），所以"这次写入之后，这个进程重新加载会得到什么"必须是
+/// `候选主配置 + 现存覆盖`。单独校验主配置有两个后果：
+///
+/// 1. 跨段规则会被误判——某条规则的另一半只在覆盖里时，一个本来合法的改动会被拒；
+/// 2. 更糟的是通过之后：管理后台 `install` 的是这个"主配置单独"的结果，于是**覆盖
+///    当场从内存配置里失效**（磁盘上还在），要等下次重启才回来。运维在后台改一个主
+///    配置字段，实际连带把覆盖里的设置全丢了，而界面上看不出任何异常。
+pub fn validate_main_candidate(source: &str) -> anyhow::Result<ModelConfig> {
+    validate_main_candidate_with_override(source, &override_file_path())
+}
+
+/// [`validate_main_candidate`] 的实现，覆盖文件路径由调用方给出。
+///
+/// 路径做成参数而不是在里面读环境变量，是为了能直接测：进程级环境是并行测试互相
+/// 污染的来源，这里没必要付那个代价。
+pub(crate) fn validate_main_candidate_with_override(
+    source: &str,
+    override_path: &Path,
+) -> anyhow::Result<ModelConfig> {
+    let mut builder =
+        Config::builder().add_source(config::File::from_str(source, FileFormat::Toml));
+    if override_path.exists() {
+        builder = builder.add_source(config::File::from(override_path).format(FileFormat::Toml));
+    }
+    let config = builder
+        .build()
+        .with_context(|| anyhow::anyhow!("候选主配置不是合法的 TOML"))?
+        .try_deserialize::<ModelConfig>()
+        .with_context(|| anyhow::anyhow!("候选主配置的字段类型或取值不合法"))?;
+    config
+        .validate()
+        .with_context(|| anyhow::anyhow!("候选主配置 + 运行时覆盖未通过业务校验"))?;
+    Ok(config)
+}
+
 /// 校验一段候选的运行时覆盖配置，但不改动任何状态。
 ///
 /// 覆盖配置本身是稀疏的（只写要改的字段），所以必须与主配置合并之后再校验，
@@ -520,6 +558,47 @@ pub fn qq_sing_enabled() -> bool {
 mod tests {
     use super::ModelConfig;
     use config::{Config, FileFormat};
+
+    /// 主配置写入必须叠加磁盘上的运行时覆盖——那才是写完重新加载会得到的配置。
+    ///
+    /// 单独校验主配置的后果不只是"误判跨段规则"：管理后台 `install` 的是校验结果，
+    /// 于是覆盖会**当场从内存里失效**（磁盘上还在），要等下次重启才回来。这条同时
+    /// 钉住"旧行为会丢覆盖"，免得有人把合并那步删掉。
+    #[test]
+    fn main_candidate_keeps_the_runtime_override() {
+        let dir = std::env::temp_dir().join(format!("kovi-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("应建临时目录");
+        let override_path = dir.join("bot.conf.override.toml");
+        std::fs::write(&override_path, "[vision]\nprovider = \"intrinsic\"\n")
+            .expect("应写临时覆盖");
+
+        let main = "[model]\npush_probability_percent = 35\n";
+
+        // 合并后的结果里，覆盖说了算。
+        let merged = super::validate_main_candidate_with_override(main, &override_path)
+            .expect("候选主配置 + 覆盖应通过校验");
+        assert_eq!(
+            merged.vision().provider(),
+            "intrinsic",
+            "主配置里的缺省不该盖掉覆盖"
+        );
+
+        // 对照：单独解析候选主配置（旧行为）拿不到覆盖的值。
+        let alone = super::validate_candidate(main).expect("候选主配置本身合法");
+        assert_ne!(
+            alone.vision().provider(),
+            "intrinsic",
+            "旧行为（只解析主配置）会丢掉覆盖——这正是要被修掉的地方"
+        );
+
+        // 覆盖不存在时就是纯主配置，不该报错。
+        let missing = super::validate_main_candidate_with_override(main, &dir.join("nope.toml"))
+            .expect("没有覆盖文件时应按纯主配置处理");
+        assert_eq!(missing.vision().provider(), alone.vision().provider());
+
+        std::fs::remove_file(&override_path).ok();
+        std::fs::remove_dir(&dir).ok();
+    }
 
     #[test]
     fn complete_default_configuration_is_valid() {

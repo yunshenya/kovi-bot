@@ -511,6 +511,15 @@ fn validate_candidate(
     file: &ManagedFile,
     source: &str,
 ) -> Result<Option<config::ModelConfig>, ApiError> {
+    validate_candidate_with_override(file, source, &config::override_file_path())
+}
+
+/// [`validate_candidate`] 的实现，覆盖文件路径由调用方给出（便于测试）。
+fn validate_candidate_with_override(
+    file: &ManagedFile,
+    source: &str,
+    override_path: &Path,
+) -> Result<Option<config::ModelConfig>, ApiError> {
     if !file.typed {
         parse_toml_value(source).map_err(ApiError::bad_request)?;
         return Ok(None);
@@ -519,7 +528,10 @@ fn validate_candidate(
         // 覆盖配置是稀疏的，必须与主配置合并后再校验。
         config::validate_override_candidate(source)
     } else {
-        config::validate_candidate(source)
+        // 主配置必须与磁盘上现存的运行时覆盖合并后再校验：那才是这次写入之后重新
+        // 加载会得到的配置。单独校验不仅会误判跨段规则，还会让 `install` 把覆盖
+        // 从内存里挤掉（磁盘上还在），要等下次重启才回来。
+        config::validate_main_candidate_with_override(source, override_path)
     }
     .map_err(|error| ApiError::bad_request(format!("{error:#}")))?;
     Ok(Some(validated))
@@ -932,6 +944,48 @@ pub(crate) fn write_atomically(path: &Path, text: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 写主配置时必须把磁盘上的运行时覆盖一并算进去。
+    ///
+    /// 单独校验主配置的后果不只是误判跨段规则：`write_raw`/`patch`/`restore_backup`
+    /// 都会 `install` 校验结果，于是后台改一个主配置字段，会把覆盖里的设置**从内存里
+    /// 挤掉**（磁盘上还在），要等下次重启才回来，而界面上看不出任何异常。
+    #[test]
+    fn writing_the_main_config_keeps_the_runtime_override() {
+        let dir = std::env::temp_dir().join(format!("kovi-admin-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("应建临时目录");
+        let override_path = dir.join("bot.conf.override.toml");
+        std::fs::write(&override_path, "[vision]\nprovider = \"intrinsic\"\n")
+            .expect("应写临时覆盖");
+
+        let file = managed_file("bot.conf.toml").expect("主配置应在白名单里");
+        let validated = validate_candidate_with_override(
+            file,
+            "[model]\npush_probability_percent = 35\n",
+            &override_path,
+        )
+        .expect("候选主配置应通过校验")
+        .expect("类型化文件应返回解析结果");
+        assert_eq!(
+            validated.vision().provider(),
+            "intrinsic",
+            "写主配置不能把运行时覆盖丢掉"
+        );
+
+        // 覆盖文件本身走另一条分支（与主配置合并），确认没被改坏。
+        let override_file = managed_file("bot.conf.override.toml").expect("覆盖配置应在白名单里");
+        assert!(
+            validate_candidate_with_override(
+                override_file,
+                "[vision]\nprovider = \"intrinsic\"\n",
+                &override_path,
+            )
+            .is_ok()
+        );
+
+        std::fs::remove_file(&override_path).ok();
+        std::fs::remove_dir(&dir).ok();
+    }
 
     #[test]
     fn a_bare_config_name_is_backed_up_in_the_working_directory() {
