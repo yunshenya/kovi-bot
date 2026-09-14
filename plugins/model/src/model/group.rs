@@ -609,6 +609,15 @@ pub(crate) async fn group_message_event_after_ingress(
         send_group_direct_response(&bot, group_id, initial_admission, reply).await;
         return;
     }
+    // 素材库命令：她发表情包走的那条出口，管理员可以在 QQ 里直接验收，不经过模型。
+    if let Some(command) = crate::sticker_library::parse_command(message) {
+        println!(
+            "[INFO] 群聊表情包素材库命令进入处理分支 (群组: {}, 用户: {})",
+            group_id, event.user_id
+        );
+        handle_sticker_library_command(&bot, group_id, initial_admission, command).await;
+        return;
+    }
     if is_recent_bot_message(reply_scope, event.message_id).await {
         println!(
             "[INFO] 忽略群聊已记录消息回流 (群组: {}, 消息: {})",
@@ -1359,6 +1368,91 @@ async fn send_group_direct_response(
     // control response.
     drain_pending_window_messages_from_current(group_id, bot).await;
     sent
+}
+
+/// `#表情列表` / `#发表情 标签`：素材库命令的群聊实现。
+///
+/// 文字回执与图片表情走的是同一条直发链路：先把控制面这一轮赢下来（在途回复会被
+/// 代替代），再按与回执相同的间隔有限重试；图片发不出去时如实回一句文字，绝不假装
+/// 发过——管理员正是靠这条回执验收"她在 QQ 里真的能发表情包"。
+async fn handle_sticker_library_command(
+    bot: &Arc<RuntimeBot>,
+    group_id: i64,
+    admission: IncomingAdmission,
+    command: crate::sticker_library::StickerLibraryCommand,
+) {
+    use crate::sticker_library::StickerLibraryCommand;
+    let label = match command {
+        StickerLibraryCommand::List => {
+            send_group_direct_response(
+                bot,
+                group_id,
+                admission,
+                crate::sticker_library::library_listing_reply(),
+            )
+            .await;
+            return;
+        }
+        StickerLibraryCommand::Invalid => {
+            send_group_direct_response(
+                bot,
+                group_id,
+                admission,
+                crate::sticker_library::command_help(),
+            )
+            .await;
+            return;
+        }
+        StickerLibraryCommand::Send { label } => label,
+    };
+    let Some(message) = crate::sticker_library::build_sticker_message(&label) else {
+        send_group_direct_response(
+            bot,
+            group_id,
+            admission,
+            crate::sticker_library::missing_label_reply(&label),
+        )
+        .await;
+        return;
+    };
+    let mut sent = false;
+    if ConversationCoordinator::resolve_active_reply_for_direct_response(admission).await {
+        for (attempt, delay_ms) in std::iter::once(0_u64)
+            .chain(GROUP_DIRECT_RESPONSE_RETRY_DELAYS_MS.iter().copied())
+            .enumerate()
+        {
+            if attempt > 0 {
+                kovi::tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            }
+            sent = crate::model::tracked_send::send_tracked_message_with_revalidation(
+                bot,
+                crate::model::MessageDestination::Group(group_id),
+                message.clone(),
+                crate::model::interrupt::OutgoingSource::Reply,
+                None,
+                || async { true },
+            )
+            .await
+            .is_ok();
+            if sent {
+                break;
+            }
+        }
+    }
+    drain_pending_window_messages_from_current(group_id, bot).await;
+    if !sent {
+        eprintln!(
+            "[ERROR] 群聊表情包命令发送失败 (群组: {}, 标签: {})",
+            group_id, label
+        );
+        send_group_direct_response(
+            bot,
+            group_id,
+            admission,
+            format!("“{label}”这张表情没能发出去，稍后再试。"),
+        )
+        .await;
+    }
 }
 
 async fn drain_pending_window_messages_from_current(group_id: i64, bot: &Arc<RuntimeBot>) {

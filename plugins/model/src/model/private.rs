@@ -348,6 +348,16 @@ pub(crate) async fn private_message_event_after_ingress(
         send_private_direct_response(&bot, user_id, initial_admission, reply).await;
         return;
     }
+    // 素材库命令：她发表情包走的那条出口，管理员可以在 QQ 里直接验收，不经过模型。
+    if let Some(command) = crate::sticker_library::parse_command(message) {
+        println!(
+            "[INFO] 私聊表情包素材库命令进入处理分支 (用户: {}, 命令: {})",
+            user_id,
+            message.trim()
+        );
+        handle_sticker_library_command(&bot, user_id, initial_admission, command).await;
+        return;
+    }
     match message.trim() {
         "#删除我的数据" => {
             send_private_direct_response(
@@ -1363,6 +1373,90 @@ async fn send_private_direct_response(
     // the same-scope FIFO after the send attempt so queued turns cannot stall.
     drain_pending_private_messages_from_current(user_id, bot).await;
     sent
+}
+
+/// `#表情列表` / `#发表情 标签`：素材库命令的私聊实现。
+///
+/// 与群聊那份完全同构：直发链路 + 递增重试；图片发不出去时如实回一句文字，
+/// 绝不假装发过。
+async fn handle_sticker_library_command(
+    bot: &Arc<RuntimeBot>,
+    user_id: i64,
+    admission: IncomingAdmission,
+    command: crate::sticker_library::StickerLibraryCommand,
+) {
+    use crate::sticker_library::StickerLibraryCommand;
+    let label = match command {
+        StickerLibraryCommand::List => {
+            send_private_direct_response(
+                bot,
+                user_id,
+                admission,
+                crate::sticker_library::library_listing_reply(),
+            )
+            .await;
+            return;
+        }
+        StickerLibraryCommand::Invalid => {
+            send_private_direct_response(
+                bot,
+                user_id,
+                admission,
+                crate::sticker_library::command_help(),
+            )
+            .await;
+            return;
+        }
+        StickerLibraryCommand::Send { label } => label,
+    };
+    let Some(message) = crate::sticker_library::build_sticker_message(&label) else {
+        send_private_direct_response(
+            bot,
+            user_id,
+            admission,
+            crate::sticker_library::missing_label_reply(&label),
+        )
+        .await;
+        return;
+    };
+    let mut sent = false;
+    if ConversationCoordinator::resolve_active_reply_for_direct_response(admission).await {
+        for (attempt, delay_ms) in std::iter::once(0_u64)
+            .chain(DIRECT_RESPONSE_RETRY_DELAYS_MS.iter().copied())
+            .enumerate()
+        {
+            if attempt > 0 {
+                kovi::tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            }
+            sent = crate::model::tracked_send::send_tracked_message_with_revalidation(
+                bot,
+                crate::model::MessageDestination::Private(user_id),
+                message.clone(),
+                crate::model::interrupt::OutgoingSource::Reply,
+                None,
+                || async { true },
+            )
+            .await
+            .is_ok();
+            if sent {
+                break;
+            }
+        }
+    }
+    drain_pending_private_messages_from_current(user_id, bot).await;
+    if !sent {
+        eprintln!(
+            "[ERROR] 私聊表情包命令发送失败 (用户: {}, 标签: {})",
+            user_id, label
+        );
+        send_private_direct_response(
+            bot,
+            user_id,
+            admission,
+            format!("“{label}”这张表情没能发出去，稍后再试。"),
+        )
+        .await;
+    }
 }
 
 async fn drain_pending_private_messages_from_current(user_id: i64, bot: &Arc<RuntimeBot>) {
