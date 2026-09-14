@@ -6883,11 +6883,16 @@ impl ModelBackend for KoviModelBackend {
                 && let QqConversation::Group { group_id } = conversation
                 && let Some(guard) = incoming_guard.as_ref()
             {
-                crate::model::note_group_conversation_focus(
+                let partner_user_id = guard.context().sender_user_id;
+                crate::model::note_group_conversation_focus(group_id, partner_user_id).await;
+                // 焦点是接续链路的起点：这行让"她跟谁在对话、什么时候开始"
+                // 在日志里可查，否则只能从后面的合批行反推。
+                kovi::log::info!(
+                    "Yunxi conversation focus set: group_id={} user_id={} event_id={}",
                     group_id,
-                    guard.context().sender_user_id,
-                )
-                .await;
+                    partner_user_id,
+                    input.event.id(),
+                );
             }
             let mut state_updates = if message.is_some() {
                 interaction_state_updates_with_cues(input, parsed_response.interaction_cues)

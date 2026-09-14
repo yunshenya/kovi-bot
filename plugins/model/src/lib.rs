@@ -403,6 +403,16 @@ async fn queue_group_continuation(
     let admission =
         ConversationCoordinator::begin_incoming(crate::model::ReplyScope::Group(group_id)).await;
     let mut guard = IncomingAdmissionGuard::new(admission);
+    // 合并成一轮的可观测点：几个片段、多少字、引用哪条。验收"@一次+连发几条
+    // 能不能当一个请求"就靠这行——没有它，只能从 [send] 反推。
+    kovi::log::info!(
+        "Yunxi Core continuation batched: group_id={} user_id={} parts={} chars={} last_message_id={:?} action=submit",
+        group_id,
+        user_id,
+        batch.message_ids.len(),
+        batch.text.chars().count(),
+        batch.message_ids.last(),
+    );
     let outcome = bridge
         .enqueue_group_continuation(
             group_id,
