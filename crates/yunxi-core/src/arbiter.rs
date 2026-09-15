@@ -559,6 +559,8 @@ pub enum ActionRejection {
     },
     #[error("action idempotency state is full")]
     IdempotencyStateFull { action_id: Option<ActionId> },
+    #[error("too many action scopes are cooling down right now")]
+    CooldownStateFull { action_id: Option<ActionId> },
     #[error("no delivery route is available for person {person_id}")]
     TargetUnavailable {
         action_id: Option<ActionId>,
@@ -585,6 +587,7 @@ impl ActionRejection {
             | Self::DailyLimitExceeded { action_id, .. }
             | Self::Duplicate { action_id, .. }
             | Self::IdempotencyStateFull { action_id }
+            | Self::CooldownStateFull { action_id }
             | Self::TargetUnavailable { action_id, .. }
             | Self::DeliveryResolutionFailed { action_id, .. } => *action_id,
         }
@@ -912,9 +915,9 @@ impl ActionArbiter {
             });
         }
         if self.config.cooldown > Duration::ZERO {
+            let cooldown =
+                chrono::Duration::from_std(self.config.cooldown).unwrap_or(chrono::Duration::MAX);
             if let Some(last) = state.last_by_scope.get(&scope).copied() {
-                let cooldown = chrono::Duration::from_std(self.config.cooldown)
-                    .unwrap_or(chrono::Duration::MAX);
                 let retry_at = last + cooldown;
                 if now < retry_at {
                     return Err(ActionRejection::CooldownActive {
@@ -924,10 +927,16 @@ impl ActionArbiter {
                     });
                 }
             }
+            // 冷却已经过去的条目没有任何用（查一次只会得出"不拦"），却一直占着
+            // 名额。不清理的话这张表只增不减：4096 个会话之后每个**新**会话都会被
+            // 拒绝——而且报的是"幂等状态已满"，条件和原因都不对。
+            if state.last_by_scope.len() >= MAX_TRACKED_ACTION_SCOPES {
+                state.last_by_scope.retain(|_, last| now < *last + cooldown);
+            }
             if state.last_by_scope.len() >= MAX_TRACKED_ACTION_SCOPES
                 && !state.last_by_scope.contains_key(&scope)
             {
-                return Err(ActionRejection::IdempotencyStateFull { action_id });
+                return Err(ActionRejection::CooldownStateFull { action_id });
             }
         }
 
@@ -1442,6 +1451,31 @@ mod tests {
             ),
             Err(ActionRejection::DailyLimitExceeded { limit: 1, .. })
         ));
+    }
+
+    #[test]
+    fn expired_scope_cooldowns_are_reclaimed_before_the_capacity_check() {
+        // `last_by_scope` 只增不删：冷却早已过去的条目永远占着名额，4096 个会话
+        // 之后每个**新**会话都会被拒，报的还是"幂等状态已满"。
+        let now = Utc::now();
+        let arbiter = ActionArbiter::new(
+            ActionArbiterConfig::default()
+                .with_capabilities(EnvironmentCapabilities::all())
+                .with_cooldown(std::time::Duration::from_secs(60)),
+        );
+        {
+            let mut state = lock_arbiter_state(&arbiter.state);
+            let expired = now - ChronoDuration::hours(1);
+            for _ in 0..MAX_TRACKED_ACTION_SCOPES {
+                state
+                    .last_by_scope
+                    .insert(ActionScope::Conversation(ConversationId::new()), expired);
+            }
+        }
+        let fresh = ConversationId::new();
+        arbiter
+            .admit_at(&send_with_key(fresh, "fresh-scope", now), now)
+            .expect("冷却已过期的名额应当被回收，而不是把新会话拒之门外");
     }
 
     #[test]

@@ -3411,6 +3411,7 @@ fn autonomous_action_needs_retry(actions: &[ActionResult]) -> bool {
                 | yunxi_core::ActionRejection::CooldownActive { .. }
                 | yunxi_core::ActionRejection::RateLimitExceeded { .. }
                 | yunxi_core::ActionRejection::IdempotencyStateFull { .. }
+                | yunxi_core::ActionRejection::CooldownStateFull { .. }
                 | yunxi_core::ActionRejection::Stale { .. }
                 | yunxi_core::ActionRejection::TargetUnavailable { .. }
                 | yunxi_core::ActionRejection::DeliveryResolutionFailed { .. }
