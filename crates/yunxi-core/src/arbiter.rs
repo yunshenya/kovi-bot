@@ -39,14 +39,6 @@ fn lock_arbiter_state(state: &Mutex<ArbiterState>) -> std::sync::MutexGuard<'_, 
 pub enum ActionCapability {
     SendMessage,
     ReachOut,
-    /// Open a live voice call with a person.
-    ///
-    /// Deliberately separate from [`Self::ReachOut`]: reaching out is a message
-    /// a person can ignore, a call is one they must answer or reject. Hosts that
-    /// can do the second may not be able to do the first at all (the QQ call
-    /// channel is a separate bridge, not the message transport), so the two are
-    /// declared and withheld independently.
-    StartCall,
     UseTool,
     CreateOpenLoop,
     ResolveOpenLoop,
@@ -60,7 +52,6 @@ impl ActionCapability {
         match self {
             Self::SendMessage => "send_message",
             Self::ReachOut => "reach_out",
-            Self::StartCall => "start_call",
             Self::UseTool => "use_tool",
             Self::CreateOpenLoop => "create_open_loop",
             Self::ResolveOpenLoop => "resolve_open_loop",
@@ -201,15 +192,14 @@ impl EnvironmentCapabilities {
         }
     }
 
-    /// Every **platform-neutral** action capability.
+    /// Every action capability Core defines.
     ///
-    /// [`ActionCapability::StartCall`] is deliberately absent. Placing a call
-    /// needs an out-of-band voice channel that no host gets for free — the QQ
-    /// host drives a separate NapCat AV bridge with its own audio devices — so a
-    /// host that can talk cannot necessarily ring. Hosts that can must declare
-    /// it explicitly (see the QQ adapter's `capabilities()`), and a host that
-    /// gets it from here by accident would be advertising a channel it cannot
-    /// actually open.
+    /// Note what is **not** here: individual tools. A host that can talk cannot
+    /// necessarily ring — placing a call needs an out-of-band voice channel (the
+    /// QQ host drives a separate NapCat AV bridge) — but that is expressed by
+    /// declaring the tool (`call.start`), not by a capability variant. Every
+    /// tool rides on [`ActionCapability::UseTool`]; the tool name is what
+    /// distinguishes them, and [`Self::declares_tool`] is how a host asks.
     #[must_use]
     pub fn all() -> Self {
         Self::empty()
@@ -277,6 +267,21 @@ impl EnvironmentCapabilities {
     pub fn may_carry_foreign_text(&self, tool_name: &str) -> Option<bool> {
         self.declaration_of(tool_name)
             .map(|descriptor| descriptor.may_carry_foreign_text)
+    }
+
+    /// Whether the host declared this tool at all — regardless of whether it is
+    /// usable in the current context.
+    ///
+    /// This is the honest form of "can this host place calls?": the answer is a
+    /// **tool declaration**, because every tool rides on
+    /// [`ActionCapability::UseTool`] and the tool name is what distinguishes
+    /// them. Core deliberately has no one-capability-per-tool variant — a
+    /// `StartCall` capability would be a second way to say what the declaration
+    /// already says, and its only consumer would be a gate that can read the
+    /// declaration directly.
+    #[must_use]
+    pub fn declares_tool(&self, tool_name: &str) -> bool {
+        self.declaration_of(tool_name).is_some()
     }
 
     fn declaration_of(&self, tool_name: &str) -> Option<&ActionDescriptor> {
@@ -1619,12 +1624,26 @@ mod tests {
         ] {
             assert!(capabilities.supports(capability, ActionScope::Global));
         }
-        // `StartCall` 不在里面是**决定**，不是漏了：打电话要走宿主自己的带外语音
-        // 通道（QQ 那边是 NapCat AV 桥），能说话不等于能拨号。要拨号的宿主必须自己
-        // 显式声明，否则就是宣称一条它其实开不了的通道。
-        assert!(
-            !capabilities.supports(ActionCapability::StartCall, ActionScope::Global),
-            "StartCall 需要带外语音通道，不该由 platform-neutral 的 all() 提供"
+    }
+
+    /// 工具是**按名字**声明与查询的，不是一个工具一个能力变体。
+    ///
+    /// 这条测试守的是那个设计决定本身：`call.start` 这类工具必须能被
+    /// `declares_tool` 查到，而查它**不需要**任何专属能力（Core 里也没有）。
+    #[test]
+    fn tool_declarations_are_queried_by_name() {
+        let capabilities = EnvironmentCapabilities::new([
+            ActionDescriptor::tool("call.start", EffectScope::Outbound, false),
+            ActionDescriptor::tool("time.now", EffectScope::ReadOnly, false),
+        ]);
+        assert!(capabilities.declares_tool("call.start"));
+        assert!(capabilities.declares_tool("time.now"));
+        assert!(!capabilities.declares_tool("call.end"));
+        // 声明了工具就等于声明了 `UseTool`，不需要额外能力。
+        assert!(capabilities.supports(ActionCapability::UseTool, ActionScope::Global));
+        assert_eq!(
+            capabilities.effect_of("call.start"),
+            Some(EffectScope::Outbound)
         );
     }
 

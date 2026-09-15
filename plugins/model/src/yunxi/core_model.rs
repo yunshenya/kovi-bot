@@ -514,7 +514,7 @@ fn offers_sticker_tool_alone(
 /// 那比她需要的多得多，而且是在没人要求她的回合里。所以这里把清单收窄到通话一个：
 /// 她要的只是"换个媒介"。
 fn autonomous_call_only(input: &PlannerInput) -> bool {
-    input.supports(ActionCapability::StartCall)
+    input.declares_tool(CALL_TOOL_NAME)
         && matches!(
             input.event.kind(),
             WorldEventKind::AutonomousConversationTick(_)
@@ -5250,12 +5250,15 @@ fn likely_requires_controlled_tool(input: &PlannerInput, allow_tool_call: bool) 
         // 自主回合本来没有任何工具（没有用户正文可供判据依据），于是她想"这次改用电话
         // 而不是消息"都做不到——那个入口根本不在清单里。
         //
-        // 只在天生声明了 `StartCall` 时才放开：通话是带外通道，宿主没配好就什么都不该变。
+        // 只在宿主**声明了通话这个工具**时才放开：通话是带外通道，宿主没配好就什么都不该变。
         // 而且这一轮**只下发通话这一个工具**（见 `autonomous_call_only`），不是把整套
         // 工具清单白送进一个她自己起意的回合——那等于让她在没人要求的时候也能建提醒、
         // 发消息、改群状态，比这个目标大得多。
+        //
+        // 问的是工具声明而不是某个能力变体：工具一律挂在 `UseTool` 下、靠名字区分，
+        // Core 不为单个工具设能力。
         WorldEventKind::AutonomousConversationTick(_) => {
-            return input.supports(ActionCapability::StartCall);
+            return input.declares_tool(CALL_TOOL_NAME);
         }
         _ => return false,
     };
@@ -8043,7 +8046,7 @@ fn visible_reply_state_updates(event: &WorldEventKind) -> Vec<StateUpdateProposa
 #[cfg(test)]
 mod tests {
     use super::{
-        BoundedCache, BoundedRouteCache, CORE_ADDRESSED_GAP_MAX_WAIT_MS,
+        BoundedCache, BoundedRouteCache, CALL_TOOL_NAME, CORE_ADDRESSED_GAP_MAX_WAIT_MS,
         CORE_AMBIENT_TURN_INSTRUCTION, CORE_AUTONOMOUS_INTENT_PROTOCOL,
         CORE_AUTONOMOUS_PLAIN_TURN_INSTRUCTION, CORE_BUBBLE_MARKER,
         CORE_CONTINUATION_TURN_INSTRUCTION, CORE_EXPLICIT_BATCH_REPAIR_TIMEOUT,
@@ -8113,15 +8116,15 @@ mod tests {
         ActionCapability, ActionDescriptor, ActionScope, AffectState, AgendaItemId, AgendaItemKind,
         AgendaItemSnapshot, Attachment, AttachmentKind, AttentionSystem, BeliefId, BeliefSnapshot,
         BeliefSource, CognitiveCapabilitySnapshot, CognitiveIntent, CognitiveTier, ConversationId,
-        ConversationKind, ConversationTurnDirective, DecisionDisposition, EventId, EventPriority,
-        EventScope, IdentityStoreError, InteractionCues, InteractionCuesObservedEvent, InterestId,
-        InterestSnapshot, MessageContent, MessageId, MessageReceivedEvent, MessageSentEvent,
-        MindDecisionProjection, MindInfluenceMode, MindScope, MindSnapshot, ModelHealth, OpenLoop,
-        OpenLoopId, OpenLoopKind, OpenLoopOwner, PersonId, PlannerInput, PlannerStateSnapshot,
-        ProactiveMotive, ProspectiveMemoryEvent, RelationState, SelfModel, SelfModelSnapshot,
-        StateUpdateProposal, ToolNotificationPolicy, WorkingState, WorkingStateConfig, WorldEvent,
-        WorldEventKind, event_action_idempotency_key, evolve_interaction_state,
-        planned_action_idempotency_key,
+        ConversationKind, ConversationTurnDirective, DecisionDisposition, EffectScope, EventId,
+        EventPriority, EventScope, IdentityStoreError, InteractionCues,
+        InteractionCuesObservedEvent, InterestId, InterestSnapshot, MessageContent, MessageId,
+        MessageReceivedEvent, MessageSentEvent, MindDecisionProjection, MindInfluenceMode,
+        MindScope, MindSnapshot, ModelHealth, OpenLoop, OpenLoopId, OpenLoopKind, OpenLoopOwner,
+        PersonId, PlannerInput, PlannerStateSnapshot, ProactiveMotive, ProspectiveMemoryEvent,
+        RelationState, SelfModel, SelfModelSnapshot, StateUpdateProposal, ToolNotificationPolicy,
+        WorkingState, WorkingStateConfig, WorldEvent, WorldEventKind, event_action_idempotency_key,
+        evolve_interaction_state, planned_action_idempotency_key,
     };
 
     fn message_input(person_id: PersonId, visible_reply_allowed: bool) -> PlannerInput {
@@ -10122,16 +10125,16 @@ mod tests {
             .with_capabilities(capabilities)
         };
 
-        // 宿主声明了 StartCall：这一轮该带工具（而且是收窄后的那一个）。
+        // 宿主声明了通话工具：这一轮该带工具（而且是收窄后的那一个）。
         let with_call = tick(vec![
             ActionDescriptor::new(ActionCapability::UseTool),
             ActionDescriptor::new(ActionCapability::SendMessage),
-            ActionDescriptor::new(ActionCapability::StartCall),
+            ActionDescriptor::tool(CALL_TOOL_NAME, EffectScope::Outbound, false),
         ]);
         assert!(likely_requires_controlled_tool(&with_call, true));
         assert!(autonomous_call_only(&with_call));
 
-        // 宿主没声明 StartCall：回到原来的"一个工具都不带"。
+        // 宿主没声明这个工具：回到原来的"一个工具都不带"。
         let without_call = tick(vec![
             ActionDescriptor::new(ActionCapability::UseTool),
             ActionDescriptor::new(ActionCapability::SendMessage),
@@ -10142,7 +10145,7 @@ mod tests {
         // 普通消息回合不受这条影响：那一路由正文判据决定。
         let message = message_input(PersonId::new(), true).with_capabilities(vec![
             ActionDescriptor::new(ActionCapability::UseTool),
-            ActionDescriptor::new(ActionCapability::StartCall),
+            ActionDescriptor::tool(CALL_TOOL_NAME, EffectScope::Outbound, false),
         ]);
         assert!(
             !autonomous_call_only(&message),

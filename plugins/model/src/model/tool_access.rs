@@ -772,8 +772,9 @@ pub(crate) async fn initialize() -> Result<()> {
         source: ToolSource::Builtin(BuiltinTool::StickerList),
     });
     push_recall_tool_definitions(&mut definitions);
-    // 通话没配好时**根本不声明**这个工具：Core 的能力快照也就不会出现 StartCall，
-    // 于是"宿主不能打电话"这件事在认知层就是事实，而不是一个调了才失败的入口。
+    // 通话没配好时**根本不声明**这个工具：Core 的能力快照里也就没有它，于是"宿主不能
+    // 打电话"这件事在认知层就是事实（`PlannerInput::declares_tool` 问得到），
+    // 而不是一个调了才失败的入口。
     if call_channel_configured() {
         push_call_tool_definitions(&mut definitions);
     }

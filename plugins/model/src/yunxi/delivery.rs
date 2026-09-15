@@ -1438,15 +1438,6 @@ impl ChannelAdapter for QqActionAdapter {
             ActionDescriptor::new(ActionCapability::StartGoal),
             ActionDescriptor::new(ActionCapability::CancelGoal),
         ]);
-        // 打电话要走带外语音通道（NapCat AV 桥），不是消息传输的附带能力，所以
-        // **只有通道真的配好、外呼也开着**才宣称会 `StartCall`。不宣称就等于对 Core
-        // 说明"我打不了电话"——那是认知层的事实，而不是一个调了才失败的入口。
-        // 判据与工具注册表共用 `qq_call::outgoing_available`，两处必须一致。
-        if crate::qq_call::outgoing_available() {
-            capabilities
-                .actions
-                .push(ActionDescriptor::new(ActionCapability::StartCall));
-        }
         // Core refuses a tool the host has not declared, so the declarations
         // have to travel with the capability. Without them every tool call
         // would be rejected — including her own.

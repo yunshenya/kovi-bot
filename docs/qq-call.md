@@ -470,8 +470,13 @@ call_motives = ["check_in"]
 **自主回合为什么只带一个工具**：`AutonomousConversationTick` 是"她自己想说话"的回合，
 原本一个工具都没有，所以她想"这次改用电话而不是消息"都做不到。放开工具协议会让它带出
 **整套**清单（建提醒、发消息、改群状态……）——那是在没人要求她的回合里，比她需要的多得多。
-所以那一轮收窄到通话一个（`autonomous_call_only`）。宿主没声明 `StartCall` 时维持原样：
+所以那一轮收窄到通话一个（`autonomous_call_only`）。宿主没声明通话工具时维持原样：
 一个工具都不带。
+
+注意判据问的是**工具声明**（`PlannerInput::declares_tool("call.start")`），不是某个能力
+变体：所有工具一律挂在 `ActionCapability::UseTool` 下、靠名字区分，Core 不为单个工具设
+能力。所以"宿主能不能打电话"这件事在能力快照里就是"有没有 `call.start` 这条声明"，
+只有一种说法。
 
 ### 外呼的三道闸门（默认全放开）
 

@@ -970,6 +970,20 @@ impl PlannerInput {
             .iter()
             .any(|descriptor| descriptor.capability == capability && descriptor.allows(scope))
     }
+
+    /// Whether the host declared this **tool**.
+    ///
+    /// Tools are asked about by name, not by a capability: every tool rides on
+    /// [`ActionCapability::UseTool`] and the name is what distinguishes them
+    /// (see [`crate::EnvironmentCapabilities::declares_tool`]). Callers that
+    /// want "can this host place calls?" ask for `call.start`, not for some
+    /// per-tool capability variant.
+    #[must_use]
+    pub fn declares_tool(&self, tool_name: &str) -> bool {
+        self.capabilities
+            .iter()
+            .any(|descriptor| descriptor.tool.as_deref() == Some(tool_name))
+    }
 }
 
 /// The planner's disposition is intentionally less specific than an action.
