@@ -7,7 +7,10 @@
 //!
 //! Every type here is:
 //! - bounded (text, counts, confidence), see [`limits`];
-//! - validated at construction (no invalid state can be deserialized);
+//! - validated at construction — 但**反序列化本身不校验**：这些类型的 `Deserialize`
+//!   都是普通派生，直接从 JSON 读回来的值可能越界。凡是从存储/快照读回的状态，都必须
+//!   走该类型的 `validate()` 或它专门的恢复入口（例如 `Hypothesis::restore`）之后才能
+//!   当作可信状态使用；
 //! - confidence-aware (0..=1, never silently upgraded to fact);
 //! - freshness-aware (TTL / expiry / stale / unknown are first-class).
 //!
