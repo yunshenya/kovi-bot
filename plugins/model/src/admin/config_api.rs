@@ -320,11 +320,8 @@ pub(crate) async fn write_raw(
     // 需要——它此前走的是 `body.raw.clone()`，于是"打开原始 TOML 点一次保存"就能
     // 把 OneBot 令牌写成八个星号，下一次重启机器人连不上 NapCat。
     let current = read_config_text(&path, file)?;
-    let candidate_text = restore_masked_secrets(
-        &body.raw,
-        &current,
-        &masked_secret_paths(file, &current),
-    );
+    let candidate_text =
+        restore_masked_secrets(&body.raw, &current, &masked_secret_paths(file, &current));
 
     let validated = validate_candidate(file, &candidate_text)?;
 
