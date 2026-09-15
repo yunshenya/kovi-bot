@@ -76,6 +76,17 @@ pub(crate) async fn run_tool_self_test(
 /// 非管理员发的会被静默丢弃（见 `model/private.rs`）。这里另按通话名单判一次，规则是
 /// "谁让我打，我就打给谁"，不接受任意号码，免得变成骚扰工具。**打完必须确认电话真的响了**：AVSDK 的外呼命令可能被丢弃，
 /// 桥返回成功不代表拨出去了，所以这里几秒内轮询 AVSDK 回执，据实回复。
+/// 通话通道是否已配置并允许外呼。
+///
+/// **只留这一处定义**，因为两个地方必须永远一致：工具注册表决定要不要声明 `call.start`，
+/// 宿主的能力快照决定要不要声称自己会 `StartCall`。两边不一致就会出现"Core 以为能打、
+/// 清单里却没有这个工具"，或者更糟的反过来——所以它不能有两份实现。
+pub(crate) fn outgoing_available() -> bool {
+    let config = config::get();
+    let call = config.qq_call();
+    call.enabled() && call.outgoing_enabled()
+}
+
 /// 一次外呼尝试的结局。
 ///
 /// 抽出来是为了让两条触发路径共用**同一份**判定：管理员私聊命令 `#打给我`

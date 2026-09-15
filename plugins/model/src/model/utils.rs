@@ -1013,6 +1013,84 @@ fn reply_action_tool_requested(message: &str) -> bool {
 /// The host uses this only to decide whether exposing that capability is
 /// justified, so false positives are more expensive than asking the model to
 /// answer a terse lookup request in plain text.
+/// 这一句是不是「把电话打给**说话人自己**」的请求。
+///
+/// 为什么单独判、而不是往 `DIRECT_ACTIONS` 里加一个"打电话"：打电话是不可撤销的对外
+/// 动作（响在别人手机上），而这个闸门的粒度只是"要不要给这一轮配工具"。范围一放宽，
+/// "你会打电话吗""怎么打电话""我刚才给他打电话了"都会拿到工具清单，于是她可能
+/// **凭空拨一通**——比该打的时候打不出去严重得多。所以这里只认把电话打给说话人本人的
+/// 说法，并把能力询问、用法讨论、否定、假设、完成态显式排除。
+///
+/// 第三人称那几种（"打电话给我妈"）在这里判不掉：子串上它和"打给我"是同一段。
+/// 兜底不靠这层判断——`call.start` 的目标由宿主绑死在 Core 动作的 actor 上，
+/// 所以就算判错了，响的也是**提问者本人的**手机，不会波及无关的人。这条边界是刻意的。
+fn requests_call_to_speaker(text: &str) -> bool {
+    // 只收"打给正在跟你说话的人"的说法。"打过来"之类没收：它太容易出现在
+    // "他打过来我就接"这种无关句子里。
+    const CALL_ME: &[&str] = &[
+        "打给我",
+        "打电话给我",
+        "打个电话给我",
+        "给我打个电话",
+        "给我打电话",
+        "给我来个电话",
+        "电话打给我",
+        "call me",
+    ];
+    // 讨论/假设：出现在哪儿都算讨论，不必看位置。
+    const DISCUSSION: &[&str] = &[
+        "怎么",
+        "如何",
+        "为什么",
+        "功能",
+        "是什么",
+        "如果",
+        "要是",
+        "假如",
+    ];
+    // 否定**必须看位置**：只有紧贴在请求之前的否定才算否定。
+    // "你不能打给我" 是否定，"你能不能打给我" 是请求——两句都含"不能"。
+    const NEGATIONS: &[&str] = &[
+        "不要",
+        "不用",
+        "别",
+        "无需",
+        "不必",
+        "不能",
+        "没法",
+        "打不了",
+        "不想",
+    ];
+
+    let Some((at, marker)) = CALL_ME
+        .iter()
+        .filter_map(|marker| text.find(marker).map(|at| (at, *marker)))
+        .min_by_key(|(at, _)| *at)
+    else {
+        return false;
+    };
+    if DISCUSSION.iter().any(|word| text.contains(word)) {
+        return false;
+    }
+    // 请求前一小段里找否定。"能不能/可不可以/是否能"是请求口气，先剥掉再判，
+    // 否则"你能不能打给我"会被"不能"这个子串误杀。
+    let window_start = text[..at]
+        .char_indices()
+        .rev()
+        .nth(5)
+        .map_or(0, |(index, _)| index);
+    let before = text[window_start..at]
+        .replace("能不能", "")
+        .replace("可不可以", "")
+        .replace("是否能", "");
+    if NEGATIONS.iter().any(|word| before.contains(word)) {
+        return false;
+    }
+    // 完成态是陈述不是请求："你刚才打给我了""打给我过"。
+    let tail = &text[at + marker.len()..];
+    !(tail.starts_with('了') || tail.starts_with('过'))
+}
+
 pub(crate) fn likely_requires_tool_protocol(content: &str) -> bool {
     let text = content.trim().to_lowercase();
     if text.is_empty() {
@@ -1110,6 +1188,10 @@ pub(crate) fn likely_requires_tool_protocol(content: &str) -> bool {
         || negates_tool_action_with_short_bridge(&text)
     {
         return false;
+    }
+
+    if requests_call_to_speaker(&text) {
+        return true;
     }
 
     // A short, self-contained action is unambiguous without a polite prefix.
@@ -4621,10 +4703,78 @@ mod tests {
         likely_requires_tool_protocol, limit_memory_size, model_attempt_count,
         neutralize_line_speaker_markers, neutralize_protocol_markers, parse_stream_line,
         plain_reply_plan, plain_reply_plan_for_host, private_user_message, read_model_payload,
-        reply_action_tool_requested, sanitize_scheduled_output, should_repair_empty_reply,
-        stream_idle_timeout, tool_result_wire, with_reference_context,
+        reply_action_tool_requested, requests_call_to_speaker, sanitize_scheduled_output,
+        should_repair_empty_reply, stream_idle_timeout, tool_result_wire, with_reference_context,
     };
     use super::{is_group_paused, set_group_paused};
+
+    /// 真机上那两次请求必须配工具——否则她连"打电话"这个入口都拿不到。
+    ///
+    /// 线上 2026-09-16 01:00:51 群里的"去给我打个电话"没通过这道闸门（`DIRECT_ACTIONS`
+    /// 里根本没有电话类动作词），于是那一轮手里只有 `sticker.list`，她只能答
+    /// "我没有打电话的功能呀"。这条测试就是钉住那个场景。
+    #[test]
+    fn a_call_request_reaches_the_tool_protocol() {
+        for request in [
+            "去给我打个电话",
+            "给我打个电话",
+            "打给我",
+            "打电话给我",
+            "给我打电话",
+            "你现在打给我",
+            // 中文里这是请求，不是能力询问：说话人想让你打给他。
+            "你能打电话给我吗",
+            "你能不能打给我",
+            "Call me",
+        ] {
+            assert!(
+                likely_requires_tool_protocol(request),
+                "{request:?} 是要她打电话，必须配工具清单"
+            );
+        }
+    }
+
+    /// 反例比正例更要紧：判错的代价是**凭空拨一通电话**。
+    ///
+    /// 能力询问、用法讨论、否定、假设、完成态陈述都不能拿到工具——它们的共同点是
+    /// "提到了打电话，但不是要她现在打给说话人"。
+    #[test]
+    fn talking_about_calling_does_not_authorize_a_dial() {
+        for chatter in [
+            "你会打电话吗",
+            "你可以打电话吗",
+            "怎么给我打电话",
+            "给我打电话这个功能是什么",
+            "打电话给我是什么意思",
+            "不要打给我",
+            "不用打给我了",
+            "别打给我",
+            "没法打给我",
+            "如果打给我就好了",
+            "要是能打给我就好了",
+            "你刚才打给我了",
+            "他打过来我就接",
+        ] {
+            assert!(
+                !requests_call_to_speaker(chatter),
+                "{chatter:?} 不是「现在打给我」的请求，不该拿到拨号工具"
+            );
+        }
+    }
+
+    /// 第三人称的请求在这里判不掉，是已知且刻意的边界。
+    ///
+    /// "打电话给我妈" 与 "打电话给我" 在子串上是同一段。兜底不靠这层文本判断，而靠
+    /// `call.start` 的目标绑定：它只会拨给 Core 动作的 actor，也就是**提问者本人**。
+    /// 所以判错的最坏后果是响在提问者自己手机上，不会波及无关的人——这条测试把这个
+    /// 已知边界写下来，免得以后有人以为这里是完备的。
+    #[test]
+    fn a_third_party_call_request_falls_back_to_the_actor_binding() {
+        assert!(
+            requests_call_to_speaker("打电话给我妈"),
+            "子串上和「打电话给我」同形，文本层判不掉——这是已知边界"
+        );
+    }
 
     /// 空闲判据：不超过整请求超时，且必须明显短于默认的 60 秒。
     ///

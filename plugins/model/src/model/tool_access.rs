@@ -1125,13 +1125,11 @@ pub(crate) fn tool_registry() -> Option<Arc<ToolRegistry>> {
 
 /// 通话通道是否已配置并允许外呼。
 ///
-/// 和 `qq_call::dial_peer` 里那道判定同源，但这里只问**同步**的配置事实：这个工具
-/// 该不该出现在清单里。授权名单是异步的（查数据库），留到执行时判——"清单收窄只是
-/// 不告诉她，真动手前必须再查一次"是这套工具的既有分工。
+/// 委托给 `qq_call::outgoing_available`：那个判据同时决定宿主的能力快照，两处必须
+/// 一致，所以只留一份实现。这里只问**同步**的配置事实；授权名单是异步的（查数据库），
+/// 留到执行时判——"清单收窄只是不告诉她，真动手前必须再查一次"是这套工具的既有分工。
 fn call_channel_configured() -> bool {
-    let config = crate::config::get();
-    let call = config.qq_call();
-    call.enabled() && call.outgoing_enabled()
+    crate::qq_call::outgoing_available()
 }
 
 impl ToolRegistry {
