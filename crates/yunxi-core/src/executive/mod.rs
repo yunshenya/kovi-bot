@@ -1207,7 +1207,7 @@ mod tests {
         let observed = controller.observe_expectations(&event);
         assert_eq!(observed.satisfied.len(), 4);
         assert!(observed.expired.is_empty());
-        assert!(observed.is_empty() == false, "有终态时就不该算空观察");
+        assert!(!observed.is_empty(), "有终态时就不该算空观察");
         assert!(controller.snapshot().pending_expectations.is_empty());
         assert!(
             controller
