@@ -309,9 +309,16 @@ pub(crate) enum ReplyActionOutcome {
 /// 从 provider 返回的原生工具调用里取出 `reply_action` 那一条。
 ///
 /// 参数由 provider 按 JSON schema 解析，正常路径下这里拿到的已经是结构化对象；宿主仍要
-/// 挡两件 schema 管不了的事：**截断**（`finish_reason=length` 时参数可能只到一半）与
-/// **参数解析失败**（`raw_arguments` 非空而 `arguments` 为空）。这两种一律判无效，不去
-/// 猜、不去补——第 7 条淘汰的正是"替模型擦屁股的容错解析器"。
+/// 挡住"这份对象是不是 provider 原样给的"。做法是拿 `raw_arguments` 复核，而不是信任
+/// `arguments`：
+///
+/// - 流式累积那边（`finalize_native_tool_calls`）对**所有**工具都开着
+///   `complete_truncated_json_object` 的截断补全——那是 registry 类工具沿用的既有行为，
+///   对"查天气"只是参数不全，对回复动作却会变成一次静默、一次撤回或半句话。一段被猜出来的
+///   尾巴绝不能当成动作。
+/// - `finish_reason="length"` 说明整轮被长度上限截断，这一轮的结构化决策同样不可信。
+///
+/// 两种情形一律整条作废，不去猜、不去补——第 7 条淘汰的正是"替模型擦屁股的容错解析器"。
 pub(crate) fn reply_action_from_tool_calls(
     tool_calls: &[crate::model::utils::NativeToolCall],
     finish_reason: Option<&str>,
@@ -328,10 +335,11 @@ pub(crate) fn reply_action_from_tool_calls(
     if finish_reason == Some("length") {
         return ReplyActionOutcome::Invalid("回复动作在长度上限处被截断，参数不完整".to_string());
     }
-    if call.arguments.is_empty() && !call.raw_arguments.trim().is_empty() {
+    let raw = call.raw_arguments.trim();
+    if !raw.is_empty() && !matches!(serde_json::from_str::<Value>(raw), Ok(Value::Object(_))) {
         return ReplyActionOutcome::Invalid(format!(
-            "参数不是合法的 JSON 对象: {}",
-            truncate_chars(call.raw_arguments.trim(), 200)
+            "参数不是 provider 原样给出的完整 JSON 对象，拒绝按猜测补全: {}",
+            truncate_chars(raw, 200)
         ));
     }
     match ReplyActionCall::from_tool_arguments(&call.arguments) {
@@ -1256,6 +1264,33 @@ mod tests {
         assert!(matches!(
             reply_action_from_tool_calls(&[broken], None),
             ReplyActionOutcome::Invalid(_)
+        ));
+        // 「被猜补过的参数」同样整条作废：流式累积那边对所有工具都开着
+        // `complete_truncated_json_object`，所以 `arguments` 可能是补出来的完整对象，
+        // 而 `raw_arguments` 还是那半截。这里必须按 raw 复核，不能采信 arguments。
+        let repaired = tool_call(
+            REPLY_ACTION_TOOL_NAME,
+            json!({"disposition": "silent"}),
+            r#"{"disposition":"sil"#,
+        );
+        assert!(
+            matches!(
+                reply_action_from_tool_calls(&[repaired], None),
+                ReplyActionOutcome::Invalid(_)
+            ),
+            "猜补出来的动作必须作废，否则半截参数就能换来一次静默"
+        );
+        // 合法但不是对象的参数（数组）也不认。
+        let not_an_object = tool_call(REPLY_ACTION_TOOL_NAME, json!({}), "[1,2]");
+        assert!(matches!(
+            reply_action_from_tool_calls(&[not_an_object], None),
+            ReplyActionOutcome::Invalid(_)
+        ));
+        // 空对象是合法的"什么都没填"，按没有动作处理。
+        let empty_object = tool_call(REPLY_ACTION_TOOL_NAME, json!({}), "{}");
+        assert!(matches!(
+            reply_action_from_tool_calls(&[empty_object], None),
+            ReplyActionOutcome::Submitted(_)
         ));
         // 一轮里调两次：不猜哪一条算数。
         assert!(matches!(

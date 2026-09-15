@@ -5061,6 +5061,53 @@ mod tests {
         assert_eq!(calls[0].name, "web_fetch");
     }
 
+    /// 整条链路：SSE 里吐到一半的 `reply_action` → 累积器按既有行为猜补 → 校验器否决。
+    ///
+    /// registry 类工具沿用"补全截断对象"的行为（下一条用例守着它），但回复动作的依据只能是
+    /// provider 原样给出的参数：一段补出来的尾巴会变成一次静默或一次撤回。
+    #[test]
+    fn a_truncated_streamed_reply_action_never_becomes_an_action() {
+        use crate::model::reply::{ReplyActionOutcome, reply_action_from_tool_calls};
+
+        let mut content = String::new();
+        let mut deltas = Vec::new();
+        let mut finish = None;
+        // 只有这一个数据事件，没有 finish_reason、没有 [DONE]：流在半个参数处断了。
+        let chunk = json!({
+            "choices": [{
+                "delta": {"tool_calls": [{"index": 0, "id": "call_1", "type": "function",
+                    "function": {"name": "reply_action", "arguments": "{\"disposition\":\"silent\""}}]},
+                "finish_reason": null
+            }]
+        });
+        assert!(
+            !parse_stream_line(
+                format!("data: {chunk}").as_bytes(),
+                &mut content,
+                &mut deltas,
+                &mut finish,
+            )
+            .expect("半截事件本身是合法 SSE")
+        );
+        assert!(finish.is_none(), "流断了，provider 没给终态原因");
+
+        let calls = finalize_native_tool_calls(&deltas);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "reply_action");
+        assert!(
+            !calls[0].arguments.is_empty(),
+            "前提：累积器确实把半截对象补成过一份 arguments（否则这条用例测不到那个坑）"
+        );
+
+        match reply_action_from_tool_calls(&calls, finish.as_deref()) {
+            ReplyActionOutcome::Invalid(reason) => assert!(
+                reason.contains("拒绝按猜测补全"),
+                "必须因为参数不是原样给出的而作废，实际原因: {reason}"
+            ),
+            other => panic!("补出来的动作必须作废，实际: {other:?}"),
+        }
+    }
+
     #[test]
     fn native_tool_call_arguments_tolerate_truncated_object() {
         let deltas = vec![NativeToolCallDelta {
