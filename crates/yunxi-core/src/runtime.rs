@@ -1959,13 +1959,13 @@ impl CognitiveRuntime {
             {
                 feedback.push(feedback_observation);
             }
-            // Record what this task just tried at the moment it resolves.
+            // Record what this task just tried at the moment it resolves, not
+            // once the round is over.
             //
-            // Order matters: a non-tool intent earlier in this same round can
-            // resolve an expectation inline, and that observation is written at
-            // the end of the round. Recording the attempt here — rather than
-            // batching every attempt to the end as well — is what keeps the
-            // tool call ahead of the expectation it caused.
+            // Order matters: a non-tool intent in this same round has its
+            // derived event observed inline, so batching every attempt to the
+            // end of the round would file an expectation ahead of the call that
+            // caused it.
             if let Some(attempt) = crate::working_memory::attempt_from_intent(intent, &result) {
                 self.working_memory
                     .entry(planner_event.trace().root_event_id())
@@ -4447,6 +4447,143 @@ mod tests {
         fn execute<'a>(&'a self, action: &'a crate::ProposedAction) -> crate::ActionPortFuture<'a> {
             let _ = action;
             Box::pin(async { Err(crate::ActionPortError::new("unsupported", false)) })
+        }
+    }
+
+    /// A plan that both calls a tool and sends a message records the call before
+    /// the expectation its own message settles.
+    ///
+    /// The message's derived event is observed *inside* the dispatch loop, so an
+    /// implementation that records a round's attempts only at the end would file
+    /// the observation ahead of the call that caused it.
+    #[tokio::test]
+    async fn a_mixed_round_records_the_call_before_the_expectation_it_settles() {
+        let conversation_id = ConversationId::new();
+        let probe = Arc::new(OrderProbe::default());
+        let (_handle, mut runtime) = CognitiveRuntime::new_with_services(
+            RuntimeConfig::default(),
+            CoreServices::new(Arc::clone(&probe) as Arc<dyn ModelBackend>),
+        )
+        .expect("valid runtime");
+        let mut capabilities = EnvironmentCapabilities::all();
+        capabilities.actions.push(crate::ActionDescriptor::tool(
+            "web.search",
+            crate::EffectScope::ReadOnly,
+            false,
+        ));
+        let arbiter =
+            ActionArbiter::new(ActionArbiterConfig::default().with_capabilities(capabilities));
+
+        let event = direct_message(conversation_id, PersonId::new());
+        // Bound to this task, so its result lands in this task's history.
+        assert_eq!(
+            runtime.register_expectation(
+                &event,
+                crate::executive::Expectation::new(
+                    crate::ActionId::new(),
+                    crate::executive::ExpectedEventPattern::EventType(
+                        crate::EventType::MessageSent
+                    ),
+                    0.9,
+                    Some(Utc::now() + chrono::Duration::hours(1)),
+                ),
+            ),
+            Ok(true)
+        );
+        let _ = runtime
+            .process_event_with_planner_and_actions(event, &arbiter, &AlwaysCompletingPort)
+            .await
+            .expect("the round runs");
+        // The follow-up round is where the recorded history is visible.
+        let _ = runtime
+            .process_next_with_planner_and_actions(&arbiter, &AlwaysCompletingPort)
+            .await
+            .expect("a follow-up round is due")
+            .expect("the round plans");
+
+        let seen = probe
+            .seen
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(seen.len(), 2, "one record per round: {seen:?}");
+        let history = &seen[1];
+        // The tool call, then the expectation its own sibling message settled,
+        // then the tool-outcome expectation this round's own event settled.
+        assert_eq!(
+            history.len(),
+            3,
+            "the call and both settled expectations: {history:?}"
+        );
+        assert!(
+            history[0].starts_with("attempt:web.search"),
+            "the call came first: {history:?}"
+        );
+        assert!(
+            history[1].contains("MessageSent"),
+            "the expectation the call's own round settled follows it: {history:?}"
+        );
+        assert!(
+            history[2].contains("web.search") && history[2].contains("如期发生"),
+            "the tool-outcome expectation settles when its result is observed: {history:?}"
+        );
+    }
+
+    /// Records the shape of each round's history.
+    #[derive(Default)]
+    struct OrderProbe {
+        seen: std::sync::Mutex<Vec<Vec<String>>>,
+    }
+
+    impl ModelBackend for OrderProbe {
+        fn plan<'a>(&'a self, input: &'a PlannerInput) -> ModelBackendFuture<'a> {
+            Box::pin(async move {
+                let history: Vec<String> = input
+                    .working_memory
+                    .entries()
+                    .iter()
+                    .map(|entry| match &entry.payload {
+                        crate::WorkingEntryPayload::Attempt(attempt) => {
+                            format!("attempt:{}", attempt.tool())
+                        }
+                        crate::WorkingEntryPayload::Observation(observation) => {
+                            format!("observation:{}", observation.describe())
+                        }
+                    })
+                    .collect();
+                self.seen
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(history);
+                let conversation_id = input
+                    .event
+                    .scope()
+                    .conversation_id()
+                    .ok_or(crate::ModelBackendError::Unavailable)?;
+                if !matches!(
+                    input.event.kind(),
+                    crate::WorldEventKind::MessageReceived(_)
+                ) {
+                    return Ok(DecisionPlan::silent());
+                }
+                Ok(DecisionPlan {
+                    disposition: DecisionDisposition::Reply,
+                    intents: vec![
+                        crate::CognitiveIntent::UseTool {
+                            tool_name: "web.search".to_owned(),
+                            input: "{}".to_owned(),
+                            scope: crate::ActionScope::Conversation(conversation_id),
+                            notification_policy: crate::ToolNotificationPolicy::Final,
+                        },
+                        crate::CognitiveIntent::send_message(
+                            conversation_id,
+                            MessageContent::text("先说一句"),
+                        ),
+                    ],
+                    state_updates: Vec::new(),
+                    expectations: Vec::new(),
+                    goal: None,
+                })
+            })
         }
     }
 
