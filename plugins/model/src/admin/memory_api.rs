@@ -450,11 +450,8 @@ pub(crate) async fn records(Query(params): Query<RecordsQuery>) -> Result<Json<V
         totals = filtered;
     }
     sort_items(&mut all);
-    let total = if window_filtered {
-        all.len() as i64
-    } else {
-        db_total.min(window_size)
-    };
+    let (total, total_is_window) =
+        promised_total(window_filtered, all.len() as i64, window_size, db_total);
     let page: Vec<Value> = all
         .into_iter()
         .skip(offset as usize)
@@ -468,11 +465,30 @@ pub(crate) async fn records(Query(params): Query<RecordsQuery>) -> Result<Json<V
         "offset": offset,
         "counts": totals,
         // 真实总数超过可翻页窗口时如实说明，前端据此提示"只看得到前 N 条"。
-        "total_is_window": window_filtered,
+        "total_is_window": total_is_window,
         "window": window_size,
         "db_total": db_total,
         "query": query_text,
     })))
+}
+
+/// 对外承诺的总数，以及"这个总数是否只是窗口口径"。
+///
+/// 过滤后的计数天然只在窗口内；**不过滤时也可能被窗口截断**（每种类型最多抓
+/// `PER_KIND_FETCH` 条，真实总数可能远大于它）。两种都必须如实标注：只标过滤那一种
+/// 的话，长期运行的群记忆会让页码条承诺一堆翻不到的页——`limit=200&offset=200`
+/// 永远是空页，而界面上一个提示都没有。
+fn promised_total(
+    window_filtered: bool,
+    filtered_len: i64,
+    window_size: i64,
+    db_total: i64,
+) -> (i64, bool) {
+    if window_filtered {
+        (filtered_len, true)
+    } else {
+        (db_total.min(window_size), db_total > window_size)
+    }
 }
 
 /// 解析逗号分隔的标签过滤参数。
@@ -2125,6 +2141,19 @@ mod tests {
             );
             assert_ne!(source, target, "裸 id 相同的两个节点不能连成自环");
         }
+    }
+
+    #[test]
+    fn window_totals_say_when_they_are_only_window_totals() {
+        // 过滤后的计数只在窗口内 —— 必须标注。
+        assert_eq!(super::promised_total(true, 7, 600, 5_000), (7, true));
+        // 不过滤但窗口被截断（真实总数更大）—— 同样必须标注，否则页码条会承诺
+        // 翻不到的页。
+        assert_eq!(super::promised_total(false, 0, 600, 5_000), (600, true));
+        // 窗口装得下全部：如实给出真实总数，不必提示。
+        assert_eq!(super::promised_total(false, 0, 600, 120), (120, false));
+        // 边界：正好装满窗口时不算被截断。
+        assert_eq!(super::promised_total(false, 0, 600, 600), (600, false));
     }
 
     #[test]
