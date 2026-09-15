@@ -546,10 +546,13 @@ fn derive_future_event_situation(
             && situation.conversation_id() == Some(conversation_id)
             && situation.status() == SituationStatus::Active
     });
+    // 名额由 Core 按**作用域**把关（`add_situation` 里的
+    // MAX_ACTIVE_SITUATIONS_PER_SCOPE）：这里不再自己数总数。宿主此前数的是
+    // `situations().len()`（含终态、且全世界一起数），而终态情境过去从不清理，
+    // 于是历史上攒够 8 条之后任何会话都再也记不进新情境。
     if let Some((_keyword, label)) = matched
         && has_time_cue
         && !already
-        && world.situations().len() < 8
     {
         let situation = yunxi_core::Situation::new(
             yunxi_core::SituationId::new(),
@@ -645,7 +648,8 @@ fn apply_scene_derivation(
                 && situation.conversation_id() == Some(conversation_id)
                 && situation.status() == SituationStatus::Active
         });
-        if active_scene && !already && world.situations().len() < 8 {
+        // 同上：名额交给 Core 按作用域把关，这里只做"同一会话里已有就跳过"。
+        if active_scene && !already {
             let detail = match scene.scene_kind() {
                 yunxi_core::SocialSceneKind::DirectConversation => "私聊进行中".to_owned(),
                 _ => "群讨论中".to_owned(),
