@@ -611,15 +611,33 @@ impl TurnGateEngine {
         let manifest: TurnGateManifest = toml::from_str(&manifest_text)
             .map_err(|error| TurnGateLoadError::ManifestParse { error })?;
         manifest.validate().map_err(TurnGateLoadError::Manifest)?;
+        // 资产路径必须**落在 bundle 目录内**。`manifest.validate()` 只看 sha256
+        // 的形状，`path.join(&asset.path)` 对 `../..` 一概照拼——而这份 manifest
+        // 来自磁盘，本地能改它就等于能读这个目录外的任何文件（兄弟实现
+        // `model/manifest.rs::verify_assets` 早就做了同样的包含校验，这里漏了）。
         let asset = manifest
             .assets
             .first()
             .ok_or(TurnGateLoadError::AssetNotFound)?;
+        let canonical_root =
+            std::fs::canonicalize(path).map_err(|error| TurnGateLoadError::AssetRead {
+                path: path.to_path_buf(),
+                source: error,
+            })?;
         let asset_path = path.join(&asset.path);
-        let bytes = std::fs::read(&asset_path).map_err(|error| TurnGateLoadError::AssetRead {
-            path: asset_path.clone(),
-            source: error,
-        })?;
+        let canonical_asset =
+            std::fs::canonicalize(&asset_path).map_err(|error| TurnGateLoadError::AssetRead {
+                path: asset_path.clone(),
+                source: error,
+            })?;
+        if !canonical_asset.starts_with(&canonical_root) {
+            return Err(TurnGateLoadError::AssetEscapesRoot { path: asset_path });
+        }
+        let bytes =
+            std::fs::read(&canonical_asset).map_err(|error| TurnGateLoadError::AssetRead {
+                path: canonical_asset.clone(),
+                source: error,
+            })?;
         if let Some(expected_size) = asset.size_bytes
             && expected_size != bytes.len() as u64
         {
@@ -770,6 +788,8 @@ pub enum TurnGateLoadError {
     Manifest(#[from] TurnGateManifestError),
     #[error("turn gate bundle has no assets")]
     AssetNotFound,
+    #[error("turn gate asset escapes the bundle directory: {path}")]
+    AssetEscapesRoot { path: std::path::PathBuf },
     #[error("turn gate asset read failed: {path}: {source}")]
     AssetRead {
         path: std::path::PathBuf,
@@ -1604,6 +1624,29 @@ mod tests {
         assert!(matches!(
             TurnGateEngine::load_from_path(&dir),
             Err(TurnGateLoadError::AssetSizeMismatch { .. })
+        ));
+
+        // 资产路径逃出 bundle 目录 → 拒绝（manifest 来自磁盘，本地能改它就等于
+        // 能读这个目录外的任何文件）。
+        std::fs::write(dir.join("turn_gate.bin"), &bytes).expect("write weights");
+        let mut escaped = manifest.clone();
+        escaped.assets = vec![TurnGateManifestAsset {
+            path: "../outside.bin".to_owned(),
+            sha256: hex_sha256(&bytes),
+            size_bytes: Some(bytes.len() as u64),
+        }];
+        let escaped_dir = dir.join("escaped");
+        std::fs::create_dir_all(&escaped_dir).expect("escaped dir");
+        std::fs::write(
+            escaped_dir.join("manifest.toml"),
+            toml::to_string(&escaped).expect("manifest toml"),
+        )
+        .expect("write manifest");
+        // 目录外真的放一份内容合法的资产，证明拒绝的原因是路径而不是读不到。
+        std::fs::write(dir.join("outside.bin"), &bytes).expect("write outside asset");
+        assert!(matches!(
+            TurnGateEngine::load_from_path(&escaped_dir),
+            Err(TurnGateLoadError::AssetEscapesRoot { .. })
         ));
 
         // 无 manifest → fail-soft 错误,调用方回退。
