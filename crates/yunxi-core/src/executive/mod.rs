@@ -487,6 +487,10 @@ impl ExecutiveController {
     /// Observe one valid world event against all pending expectations. Terminal
     /// statuses are reported to the caller and removed from the pending
     /// projection, so satisfied/expired rows cannot consume future quota.
+    ///
+    /// 四个终态**都要**上报：`retain(Pending)` 在同一趟里把非 Pending 的全部删掉，
+    /// 落进空分支的终态既不会被调用方看到、也不会当场清理。注意运行时目前丢弃了
+    /// 返回值（`runtime.rs` 只调用不消费），所以这里的上报是给将来的消费者留的口子。
     pub fn observe_expectations(&self, event: &crate::WorldEvent) -> ExpectationObservation {
         let mut state = self.state.lock().unwrap_or_else(|lock| lock.into_inner());
         let now = Utc::now();
@@ -495,9 +499,9 @@ impl ExecutiveController {
             match expectation.observe(event, now) {
                 ExpectationStatus::Satisfied => observation.satisfied.push(expectation.id),
                 ExpectationStatus::Expired => observation.expired.push(expectation.id),
-                ExpectationStatus::Pending
-                | ExpectationStatus::Violated
-                | ExpectationStatus::Cancelled => {}
+                ExpectationStatus::Violated => observation.violated.push(expectation.id),
+                ExpectationStatus::Cancelled => observation.cancelled.push(expectation.id),
+                ExpectationStatus::Pending => {}
             }
         }
         if !observation.is_empty() {
@@ -1203,6 +1207,7 @@ mod tests {
         let observed = controller.observe_expectations(&event);
         assert_eq!(observed.satisfied.len(), 4);
         assert!(observed.expired.is_empty());
+        assert!(observed.is_empty() == false, "有终态时就不该算空观察");
         assert!(controller.snapshot().pending_expectations.is_empty());
         assert!(
             controller
@@ -1216,6 +1221,58 @@ mod tests {
                     ),
                 )
                 .expect("released expectation capacity can be reused")
+        );
+    }
+
+    #[test]
+    fn cancelled_expectations_are_reported_and_release_their_quota_at_once() {
+        // 终态里 Satisfied/Expired 一直会被上报，Violated/Cancelled 却落进空分支：
+        // 既不上报，也要等**下一条别的预期**变动才被 retain 顺带删掉——中间一直占着
+        // `MAX_EXPECTATIONS` 的配额。将来谁真接上"预期落空/取消"这条语义，这就是静默
+        // 漏掉的状态。这里把观察结果与当场清账都钉住。
+        let controller = ExecutiveController::default();
+        let expectation = Expectation::new(
+            ActionId::new(),
+            ExpectedEventPattern::EventType(crate::EventType::IdleTick),
+            0.8,
+            None,
+        );
+        assert!(
+            controller
+                .register_expectation_for_scope(ExecutiveScope::Global, expectation.clone())
+                .expect("expectation is valid")
+        );
+        {
+            let mut state = controller
+                .state
+                .lock()
+                .unwrap_or_else(|lock| lock.into_inner());
+            let stored = state
+                .expectations
+                .iter_mut()
+                .find(|item| item.id == expectation.id)
+                .expect("registered expectation is stored");
+            // `ExpectationSet::cancel` 走的就是这一步。
+            assert!(stored.cancel(), "Pending 的预期应当能取消");
+        }
+
+        let event = WorldEvent::new(
+            Utc::now(),
+            EventScope::Global,
+            EventPriority::Normal,
+            WorldEventKind::IdleTick,
+        );
+        let observed = controller.observe_expectations(&event);
+        assert_eq!(
+            observed.cancelled,
+            vec![expectation.id],
+            "取消掉的预期必须上报，而不是静默删掉"
+        );
+        assert!(observed.satisfied.is_empty(), "已经取消的不该同时算满足");
+        assert!(!observed.is_empty(), "有终态时 is_empty 必须为假");
+        assert!(
+            controller.snapshot().pending_expectations.is_empty(),
+            "终态要在同一趟里释放配额"
         );
     }
 

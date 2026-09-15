@@ -93,12 +93,23 @@ impl ExpectationStatus {
 pub struct ExpectationObservation {
     pub satisfied: Vec<ExpectationId>,
     pub expired: Vec<ExpectationId>,
+    /// 被显式判定为"没发生"的预期。
+    ///
+    /// `Expectation::observe` 自己只会产生 Pending/Satisfied/Expired，这两个终态来自
+    /// `violate()`/`cancel()`。把它们一并报出来，是因为 `observe_expectations` 观察完
+    /// 会 `retain(Pending)`：如果它们落进空分支，既不会被上报、也不会当场清理（要等
+    /// 下一条别的预期变动才顺带删掉）——将来谁真的接上这两个状态，就会变成"静默消失"。
+    pub violated: Vec<ExpectationId>,
+    pub cancelled: Vec<ExpectationId>,
 }
 
 impl ExpectationObservation {
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.satisfied.is_empty() && self.expired.is_empty()
+        self.satisfied.is_empty()
+            && self.expired.is_empty()
+            && self.violated.is_empty()
+            && self.cancelled.is_empty()
     }
 }
 
