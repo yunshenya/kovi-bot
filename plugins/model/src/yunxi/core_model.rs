@@ -448,6 +448,18 @@ fn tool_calls_allowed_for_turn(
     route_allows_tool_call && (explicit_message_count.is_none() || tool_intent)
 }
 
+/// `sticker.list` 的注册名（带点；发到 provider 时由 `wire_tool_name` 换成下划线）。
+const STICKER_TOOL_NAME: &str = "sticker.list";
+
+/// 这一轮是不是"刚查完表情包清单"的跟进回合。
+fn just_completed_sticker_list(kind: &WorldEventKind) -> bool {
+    match kind {
+        WorldEventKind::ToolCompleted(tool) => tool.operation == STICKER_TOOL_NAME,
+        WorldEventKind::ToolFailed(tool) => tool.operation == STICKER_TOOL_NAME,
+        _ => false,
+    }
+}
+
 /// 普通可见回合要不要单独带上 `sticker.list`。
 ///
 /// 独立成一个函数是为了能单测：这条判定的两端都容易写反——写宽了每个回合都多背一个工具
@@ -6345,8 +6357,20 @@ impl ModelBackend for KoviModelBackend {
                 );
                 if let Some(registry) = tool_registry() {
                     let read_only_only = tool_follow_up;
-                    native_tool_specs =
-                        Some(registry.native_tool_specs(&tool_context, read_only_only));
+                    let mut specs = registry.native_tool_specs(&tool_context, read_only_only);
+                    // 刚查完清单的跟进回合不再带 `sticker.list`：清单已经在上下文里，再调一次
+                    // 只是白花一轮模型调用。Core 的工具回合是"一次调用一个回合"、没有轮次上限
+                    // （`tools.max_rounds` 管的是宿主那条内部循环），所以这道闸门同时也是
+                    // "查了又查"自环的边界。
+                    if just_completed_sticker_list(input.event.kind()) {
+                        let wire = tool_access::wire_tool_name(STICKER_TOOL_NAME);
+                        specs.retain(|spec| {
+                            spec.pointer("/function/name")
+                                .and_then(serde_json::Value::as_str)
+                                != Some(wire.as_str())
+                        });
+                    }
+                    native_tool_specs = Some(specs);
                     core_tool_registry = Some(registry.clone());
                     messages.insert(
                         0,
@@ -6930,7 +6954,12 @@ impl ModelBackend for KoviModelBackend {
                     parsed_response.interaction_cues,
                 ));
             }
-            if tool_protocol_authorized && let Some(action_scope) = action_scope {
+            // 判据是"这一轮真的把工具下发了"，不是"这一轮是工具轮"：普通可见回合现在也会
+            // 带 `sticker.list`（见 `sticker_only_specs`），它的调用同样必须转成 Core 意图
+            // 去执行——否则模型调了也白调，本轮还会因为正文为空被判成沉默。
+            if core_tool_registry.is_some()
+                && let Some(action_scope) = action_scope
+            {
                 // 原生 function-calling：provider 给出的工具调用直接转为
                 // Core 意图并交给宿主执行；模型不再书写文本协议。
                 if !native_tool_calls.is_empty() {
@@ -7783,26 +7812,27 @@ mod tests {
         MAX_DELIVERABLE_BUBBLES_PER_TURN, MAX_INTRINSIC_REPLY_PROTOCOL_BYTES,
         MAX_PLAIN_SPLIT_LINE_CHARS, MIND_DECISION_INSTRUCTION, MindCandidates,
         PersistentRouteLookup, QqConversation, RequiredCreation, RouteContext,
-        SILENCE_TENSION_THRESHOLD, SilenceVerdict, VisibleReplyTarget, addressed_gap_wait_ms,
-        affect_tone_guidance, ambient_group_interjection_veto, autonomous_conversation_prompt,
-        autonomous_conversation_protocol, autonomous_empty_generation_plan,
-        autonomous_generation_failure_plan, baseline_disposition, batch_fence_action_key,
-        build_bounded_intrinsic_reply_batch, classify_persistent_person_identity,
-        constrain_autonomous_tick_plan, conversation_focus_target, conversation_id_for_log,
-        core_message_prompt, core_plain_turn_instruction, core_plan_has_visible_text,
-        core_reply_bubbles_with_max, core_tool_follow_up_instruction,
-        core_tool_protocol_diagnostic, default_autonomous_directive, defer_unroutable_due,
-        deterministic_route_fallback, drop_internal_decision_sentences, due_reply_target,
-        eligible_mind_candidates, explicit_message_batch_needs_repair,
-        explicit_message_count_for_event, explicit_message_count_for_input,
-        explicit_message_count_instruction, first_person_turn_avoidance, group_reply_gap_secs_for,
-        group_reply_gap_secs_for_sender, insert_persona_context,
-        interaction_state_updates_with_cues, intrinsic_autonomous_intent_prompt,
-        intrinsic_fallback_is_eligible, intrinsic_output_is_unsafe, intrinsic_prompt,
-        is_ambient_group_message, is_plain_text_batch_data_context, keeps_existing_prepared_plan,
-        message_id_for_log, mind_context_messages, mind_outgoing_fence_required,
-        offers_sticker_tool_alone, parse_autonomous_intent_response, parse_core_response,
-        parse_direct_repair_output, parse_intrinsic_autonomous_directive,
+        SILENCE_TENSION_THRESHOLD, STICKER_TOOL_NAME, SilenceVerdict, VisibleReplyTarget,
+        addressed_gap_wait_ms, affect_tone_guidance, ambient_group_interjection_veto,
+        autonomous_conversation_prompt, autonomous_conversation_protocol,
+        autonomous_empty_generation_plan, autonomous_generation_failure_plan, baseline_disposition,
+        batch_fence_action_key, build_bounded_intrinsic_reply_batch,
+        classify_persistent_person_identity, constrain_autonomous_tick_plan,
+        conversation_focus_target, conversation_id_for_log, core_message_prompt,
+        core_plain_turn_instruction, core_plan_has_visible_text, core_reply_bubbles_with_max,
+        core_tool_follow_up_instruction, core_tool_protocol_diagnostic,
+        default_autonomous_directive, defer_unroutable_due, deterministic_route_fallback,
+        drop_internal_decision_sentences, due_reply_target, eligible_mind_candidates,
+        explicit_message_batch_needs_repair, explicit_message_count_for_event,
+        explicit_message_count_for_input, explicit_message_count_instruction,
+        first_person_turn_avoidance, group_reply_gap_secs_for, group_reply_gap_secs_for_sender,
+        insert_persona_context, interaction_state_updates_with_cues,
+        intrinsic_autonomous_intent_prompt, intrinsic_fallback_is_eligible,
+        intrinsic_output_is_unsafe, intrinsic_prompt, is_ambient_group_message,
+        is_plain_text_batch_data_context, just_completed_sticker_list,
+        keeps_existing_prepared_plan, message_id_for_log, mind_context_messages,
+        mind_outgoing_fence_required, offers_sticker_tool_alone, parse_autonomous_intent_response,
+        parse_core_response, parse_direct_repair_output, parse_intrinsic_autonomous_directive,
         parse_plain_core_response, parse_qq_conversation, plain_text_batch_message_prompt,
         plain_text_batch_repair_context, pre_model_plan, prepared_outgoing_semantic_context,
         purge_group_routes_from_cache, recent_conversation_messages,
@@ -9617,6 +9647,34 @@ mod tests {
 
         insert_persona_context(&mut messages, "   ");
         assert_eq!(messages.len(), 3, "空人格不该插入任何东西");
+    }
+
+    /// "刚查完清单"的跟进回合不再带 `sticker.list`：清单已在上下文里，再调一次只是白花
+    /// 一轮模型调用；Core 的工具回合没有轮次上限，这道闸门是"查了又查"自环的边界。
+    #[test]
+    fn sticker_tool_is_not_offered_right_after_it_was_called() {
+        let completed = WorldEventKind::ToolCompleted(yunxi_core::ToolCompletedEvent {
+            operation: STICKER_TOOL_NAME.to_string(),
+            output: String::new(),
+            requires_follow_up: true,
+        });
+        let failed = WorldEventKind::ToolFailed(yunxi_core::ToolFailedEvent {
+            operation: STICKER_TOOL_NAME.to_string(),
+            error_category: "execution_failed".to_string(),
+            detail: String::new(),
+            requires_follow_up: true,
+        });
+        let other = WorldEventKind::ToolCompleted(yunxi_core::ToolCompletedEvent {
+            operation: "web.search".to_string(),
+            output: String::new(),
+            requires_follow_up: true,
+        });
+        assert!(just_completed_sticker_list(&completed));
+        assert!(
+            just_completed_sticker_list(&failed),
+            "失败也要掐，否则她可以一直重试"
+        );
+        assert!(!just_completed_sticker_list(&other), "别的工具不受影响");
     }
 
     /// 普通可见回合要不要单独带 `sticker.list`：写宽写窄都有具体代价，钉住这条判定。
