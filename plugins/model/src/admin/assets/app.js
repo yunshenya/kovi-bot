@@ -139,8 +139,6 @@
     return String(value);
   };
 
-  const MASK = '********';
-
   // ───────────────────────────── 登录态 ─────────────────────────────
 
   function showLogin() {
@@ -1363,6 +1361,9 @@
       if (!remember) return;
       if (open) config.expanded.add(sectionPath);
       else config.expanded.delete(sectionPath);
+      // 单节折叠也在改"展开了几节"：不同步的话按钮字面会跟它的动作相反
+      // （比如全收起之后按钮还写着「全部折叠」，点下去却是全展开）。
+      syncExpandButton();
     };
     const header = h('header', {
       class: searching ? 'locked' : '',
@@ -3870,6 +3871,11 @@
   // 导出剥掉 source_key），两个入口可以换着用——但同一时刻只用一个：文件被别处
   // 改动时服务端返回 409，页面会要求刷新后重来，而不是把对方的改动盖掉。
 
+  // 与后端 `annotation_api::QUEUE_LIMIT_DEFAULT / QUEUE_LIMIT_MAX` 对齐：接口会把
+  // limit 钳到 1..=500，前端越过上限只会拿到固定条数，按钮得自己先停手。
+  const ANNOTATION_PAGE_STEP = 40;
+  const ANNOTATION_LIMIT_MAX = 500;
+
   /** 标注页状态。goto() 每次进页都整页重建，靠它挂住批次与当前样本。 */
   const annotation = {
     dir: '',
@@ -3883,7 +3889,7 @@
     tiers: [],
     items: [],
     matched: 0,
-    limit: 40,
+    limit: ANNOTATION_PAGE_STEP,
     tab: 'pending',
     skipFlagged: true,
     current: null,
@@ -4286,12 +4292,15 @@
     }
     // 跳过不会把样本移出队列，所以标完之前队列长度不变——得能给"再看下一屏"。
     const remaining = annotation.matched - annotation.items.length;
-    if (remaining > 0) {
+    // 按钮上的数字得是"这次会多出多少条"，而不是当前窗口有多大：写总量的话第一屏
+    // 写着 40 还准，点一下之后就变成「再加载 80 条」却只来 40 条。
+    const step = Math.min(ANNOTATION_PAGE_STEP, ANNOTATION_LIMIT_MAX - annotation.limit);
+    if (remaining > 0 && step > 0) {
       list.append(h('button', {
         class: 'btn ghost small annotate-more',
-        text: `再加载 ${annotation.limit} 条（还有 ${remaining} 条）`,
+        text: `再加载 ${step} 条（还有 ${remaining} 条）`,
         onclick: async () => {
-          annotation.limit = Math.min(annotation.limit + 40, 500);
+          annotation.limit = Math.min(annotation.limit + ANNOTATION_PAGE_STEP, ANNOTATION_LIMIT_MAX);
           await loadAnnotationQueue();
         },
       }));
