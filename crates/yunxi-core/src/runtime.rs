@@ -755,10 +755,17 @@ impl CognitiveRuntime {
             // (longest-stale) pending follow-up — observing it so its context is
             // still fed to working state — and keep the newest so its required
             // model turn still runs.
-            if let Some(stale) = self.pending_tool_follow_ups.pop_front()
-                && let ProcessingOutcome::Observed(observation) = self.process_event(stale)
-            {
-                feedback.push(observation);
+            if let Some(stale) = self.pending_tool_follow_ups.pop_front() {
+                let stale_root = stale.trace().root_event_id();
+                if let ProcessingOutcome::Observed(observation) = self.process_event(stale) {
+                    feedback.push(observation);
+                }
+                // 被挤掉的这一条同样是这个根的最后一次出场机会。别的消费路径都会
+                // 归还工具预算（`release_tool_budget_root_if_terminal` 是唯一会
+                // `remove` 的地方），只有这条溢出分支漏了：孤儿项只增不减，攒满
+                // 上限之后 `effective_tool_actions_used` 对每个新根都返回上限，
+                // 工具能力被永久关掉，直到重启（2026-09-15 评审）。
+                self.release_tool_budget_root_if_terminal(stale_root);
             }
             self.pending_tool_follow_ups.push_back(event);
         }
@@ -4558,6 +4565,46 @@ mod tests {
         assert_eq!(model_calls.load(Ordering::SeqCst), 2);
         // Two tool executions and exactly one final visible delivery.
         assert_eq!(port_calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn tool_follow_up_overflow_releases_the_dropped_roots_budget() {
+        // 溢出分支是唯一一条"消费掉 follow-up 却不归还预算"的路：别的消费路径都会
+        // 调 release_tool_budget_root_if_terminal，而它是唯一会 remove 台账条目的
+        // 地方。漏掉它的后果是孤儿条目只增不减——攒满 MAX_TOOL_TRACE_BUDGET_ENTRIES
+        // 之后每个新根都被当成"额度已用尽"，工具能力被永久关闭直到重启。
+        let (_handle, mut runtime) = CognitiveRuntime::new_with_services(
+            RuntimeConfig::default(),
+            CoreServices::with_model(CountingModel {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+        )
+        .expect("valid runtime");
+        // 一个占着台账的根：它是队列里最老的那条 follow-up。
+        let root_event = event(EventPriority::Normal);
+        let root = root_event.trace().root_event_id();
+        runtime
+            .reserve_tool_actions(&root_event, 1)
+            .expect("budget");
+        assert!(runtime.tool_action_budget_by_trace.contains_key(&root));
+        let mut feedback = Vec::new();
+        while runtime.pending_tool_follow_ups.len() < super::MAX_PENDING_TOOL_FOLLOW_UPS {
+            runtime
+                .pending_tool_follow_ups
+                .push_back(event(EventPriority::Normal));
+        }
+        runtime.pending_tool_follow_ups.push_front(root_event);
+
+        runtime.enqueue_tool_follow_up(event(EventPriority::Normal), &mut feedback);
+
+        assert!(
+            !runtime.tool_action_budget_by_trace.contains_key(&root),
+            "被挤掉的根必须归还工具预算，否则孤儿条目会攒满上限"
+        );
+        assert!(
+            !runtime.root_has_pending_tool_follow_up(root),
+            "它的 follow-up 已经被丢掉了，不该还留着待办"
+        );
     }
 
     #[tokio::test]
