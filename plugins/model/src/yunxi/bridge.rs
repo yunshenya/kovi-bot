@@ -317,14 +317,21 @@ fn decision_allowance_available(
     gate.decision_attempts.len() < policy.decision_rate_limit
 }
 
-/// 群成员熟悉度（familiarity, 0..=1）的有界缓存。
+/// 群成员关系温度的有界缓存：熟悉度与好感。
 ///
 /// 同步的 `classify_group` 无法安全查库，因此由 ingress worker 在解析
-/// 身份后按 TTL 异步刷新；读不到时按"不熟悉"处理（fail-soft）。
+/// 身份后按 TTL 异步刷新；读不到时按"不认识"处理（fail-soft）。
 #[derive(Debug, Default)]
 struct FamiliarityCache {
-    entries: HashMap<i64, (f32, Instant)>,
+    entries: HashMap<i64, (RelationWarmth, Instant)>,
     order: VecDeque<i64>,
+}
+
+/// 一次关系读取里路由决策真正需要的两个数。
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct RelationWarmth {
+    familiarity: f32,
+    affinity: f32,
 }
 
 impl FamiliarityCache {
@@ -334,7 +341,7 @@ impl FamiliarityCache {
             .is_none_or(|(_, recorded_at)| recorded_at.elapsed() >= FAMILIARITY_CACHE_TTL)
     }
 
-    fn record(&mut self, user_id: i64, familiarity: f32) {
+    fn record(&mut self, user_id: i64, warmth: RelationWarmth) {
         if !self.entries.contains_key(&user_id) {
             if self.entries.len() >= MAX_FAMILIARITY_ENTRIES
                 && let Some(evicted) = self.order.pop_front()
@@ -343,11 +350,28 @@ impl FamiliarityCache {
             }
             self.order.push_back(user_id);
         }
-        self.entries.insert(user_id, (familiarity, Instant::now()));
+        self.entries.insert(user_id, (warmth, Instant::now()));
     }
 
-    fn familiarity(&self, user_id: i64) -> Option<f32> {
+    fn warmth(&self, user_id: i64) -> Option<RelationWarmth> {
         self.entries.get(&user_id).map(|(value, _)| *value)
+    }
+
+    /// 这个人算不算"自己人"：熟悉度过线，**或**好感到线。
+    ///
+    /// 两维任一过线都放行未点名消息进入语义评估（是否真的回复仍由评估模型与 Core
+    /// 决定）。用"或"而不是加权求和，是因为它们各自都足以说明"这条值得听"：
+    /// 熟人是老邻居，有好感的是她喜欢的人，两种都不该被抽样概率挡在门外。
+    fn admits_sampling(
+        &self,
+        user_id: i64,
+        familiarity_threshold: f64,
+        affinity_threshold: f64,
+    ) -> bool {
+        self.warmth(user_id).is_some_and(|warmth| {
+            f64::from(warmth.familiarity) >= familiarity_threshold
+                || f64::from(warmth.affinity) >= affinity_threshold
+        })
     }
 }
 
@@ -1637,18 +1661,17 @@ impl CoreBridge {
             familiar_rate_window_secs: config.familiar_rate_window_secs(),
             familiar_rate_limit: config.familiar_rate_limit(),
         };
-        // 熟人放行：说话人的熟悉度达到阈值时，未点名消息确定性进入语义
-        // 评估（是否回复仍由评估模型与 Core 决定）。缓存由 ingress worker
-        // 异步刷新，读不到按不熟悉处理。
+        // 自己人放行：熟悉度过线**或**好感到线时，未点名消息确定性进入语义评估
+        // （是否回复仍由评估模型与 Core 决定）。缓存由 ingress worker 异步刷新，
+        // 读不到按不认识处理。
         let familiar_active = policy.familiar_enabled
-            && self
-                .familiarity
-                .lock()
-                .ok()
-                .and_then(|cache| cache.familiarity(event.user_id))
-                .is_some_and(|familiarity| {
-                    f64::from(familiarity) >= config.familiarity_threshold()
-                });
+            && self.familiarity.lock().ok().is_some_and(|cache| {
+                cache.admits_sampling(
+                    event.user_id,
+                    config.familiarity_threshold(),
+                    config.affinity_threshold(),
+                )
+            });
         self.ambient_attention
             .lock()
             .ok()
@@ -3935,7 +3958,13 @@ async fn resolve_and_submit_inner(
         if let Ok(Ok(Some(state))) = refreshed
             && let Ok(mut cache) = refresh.cache.lock()
         {
-            cache.record(message.sender_user_id, state.familiarity);
+            cache.record(
+                message.sender_user_id,
+                RelationWarmth {
+                    familiarity: state.familiarity,
+                    affinity: state.affinity,
+                },
+            );
         }
     }
 
@@ -5507,20 +5536,73 @@ mod tests {
     fn familiarity_cache_records_and_evicts_without_panic() {
         let mut cache = super::FamiliarityCache::default();
         assert!(cache.should_refresh(1));
-        cache.record(1, 0.97);
+        cache.record(
+            1,
+            super::RelationWarmth {
+                familiarity: 0.97,
+                affinity: 0.1,
+            },
+        );
         assert!(!cache.should_refresh(1));
-        assert_eq!(cache.familiarity(1), Some(0.97));
-        assert_eq!(cache.familiarity(2), None);
+        assert_eq!(
+            cache.warmth(1),
+            Some(super::RelationWarmth {
+                familiarity: 0.97,
+                affinity: 0.1,
+            })
+        );
+        assert_eq!(cache.warmth(2), None);
         for user_id in 1..=(super::MAX_FAMILIARITY_ENTRIES as i64 + 8) {
-            cache.record(user_id, 0.5);
+            cache.record(
+                user_id,
+                super::RelationWarmth {
+                    familiarity: 0.5,
+                    affinity: 0.0,
+                },
+            );
         }
         // 有界淘汰:最早的条目被挤出,容量不失控。
-        assert!(cache.familiarity(1).is_none());
+        assert!(cache.warmth(1).is_none());
         assert!(
             cache
-                .familiarity(super::MAX_FAMILIARITY_ENTRIES as i64)
+                .warmth(super::MAX_FAMILIARITY_ENTRIES as i64)
                 .is_some()
         );
+    }
+
+    #[test]
+    fn sampling_admits_either_a_familiar_person_or_a_liked_one() {
+        let mut cache = super::FamiliarityCache::default();
+        // 熟悉度不过线但好感过线：她喜欢这个人，未点名消息照样值得听。
+        cache.record(
+            7,
+            super::RelationWarmth {
+                familiarity: 0.2,
+                affinity: 0.8,
+            },
+        );
+        assert!(cache.admits_sampling(7, 0.5, 0.5));
+        // 两维都在线下：仍然走原来的抽样路径。
+        cache.record(
+            8,
+            super::RelationWarmth {
+                familiarity: 0.2,
+                affinity: 0.1,
+            },
+        );
+        assert!(!cache.admits_sampling(8, 0.5, 0.5));
+        // 熟悉度过线、好感是负的（天天抬杠的老熟人）：熟悉这一维放行，
+        // 是否回复仍由评估模型与静默门控决定。
+        cache.record(
+            9,
+            super::RelationWarmth {
+                familiarity: 0.9,
+                affinity: -0.6,
+            },
+        );
+        assert!(cache.admits_sampling(9, 0.5, 0.5));
+        // 读不到的按不认识处理（fail-soft）。
+        assert!(!cache.admits_sampling(404, 0.5, 0.5));
     }
 
     #[test]

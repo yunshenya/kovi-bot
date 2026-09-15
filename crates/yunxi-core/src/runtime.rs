@@ -1542,11 +1542,17 @@ impl CognitiveRuntime {
             .with_participants(participants);
 
         if let Some(person_id) = person_id {
-            if let Ok(relation) = services.relations.get(person_id).await {
-                input = input.with_relation(relation);
+            // 读失败与"还没有这一行"必须分开：`Ok(None)` 是新人的正常状态，
+            // 由此产生的写就是建档；`Err` 只说明这次没读到，拿默认值回写会把库里
+            // 真实的关系/情绪抹成零。后者标成 `Unavailable`，本轮的写由
+            // `apply_state_updates` 拒绝——详见 `PersonStateRead`。
+            match services.relations.get(person_id).await {
+                Ok(relation) => input = input.with_relation(relation),
+                Err(_) => input = input.with_relation_unavailable(true),
             }
-            if let Ok(affect) = services.affect.get(person_id).await {
-                input = input.with_affect(affect);
+            match services.affect.get(person_id).await {
+                Ok(affect) => input = input.with_affect(affect),
+                Err(_) => input = input.with_affect_unavailable(true),
             }
         }
         input
@@ -1661,6 +1667,11 @@ impl CognitiveRuntime {
         for update in &plan.state_updates {
             match update {
                 StateUpdateProposal::Affect(affect) => {
+                    // 情绪快照没读到：本轮不写。写下去的就是"她此刻是中性的"，
+                    // 而库里那份真实的情绪会被直接覆盖。
+                    if !input.affect_read.is_writable() {
+                        continue;
+                    }
                     let person_id = person_id.ok_or_else(|| {
                         state_update_error(
                             "affect",
@@ -1684,6 +1695,11 @@ impl CognitiveRuntime {
                         })?;
                 }
                 StateUpdateProposal::Relation(relation) => {
+                    // 关系快照没读到：本轮不写。整行回写会把这个人的关系抹成
+                    // "刚认识"，而漂移、证据、历史熟悉度都建立在那一行上。
+                    if !input.relation_read.is_writable() {
+                        continue;
+                    }
                     let person_id = person_id.ok_or_else(|| {
                         state_update_error(
                             "relation",
@@ -2923,11 +2939,12 @@ mod tests {
     };
     use crate::ports::{
         AffectStore, AffectStoreFuture, CoreServices, GoalStore, GoalStoreFuture, MemoryStore,
-        MemoryStoreFuture, OpenLoopStore, OpenLoopStoreFuture, RelationStore, RelationStoreFuture,
+        MemoryStoreFuture, OpenLoopStore, OpenLoopStoreFuture, RelationStore, RelationStoreError,
+        RelationStoreFuture,
     };
     use crate::{DecisionActionKind, ExecutiveScope, ToolNotificationPolicy};
     use chrono::Utc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     struct StaticMindProvider {
@@ -4086,6 +4103,7 @@ mod tests {
     struct TestRelationStore {
         reads: Mutex<Vec<PersonId>>,
         updates: Mutex<Vec<RelationState>>,
+        fail_reads: AtomicBool,
     }
 
     impl RelationStore for TestRelationStore {
@@ -4098,6 +4116,11 @@ mod tests {
                     .lock()
                     .expect("relation recorder lock")
                     .push(person_id);
+                if self.fail_reads.load(Ordering::SeqCst) {
+                    return Err(RelationStoreError::storage(std::io::Error::other(
+                        "relation store is down",
+                    )));
+                }
                 Ok(None)
             })
         }
@@ -6611,6 +6634,70 @@ mod tests {
                 .expect("open-loop recorder lock")
                 .as_slice(),
             &[open_loop_id]
+        );
+    }
+
+    /// 只提交"这个人此刻"的两条状态更新，用来单独观察写回策略。
+    struct PersonStateOnlyModel {
+        affect: AffectState,
+        relation: RelationState,
+    }
+
+    impl ModelBackend for PersonStateOnlyModel {
+        fn plan<'a>(&'a self, _input: &'a PlannerInput) -> ModelBackendFuture<'a> {
+            let affect = self.affect;
+            let relation = self.relation;
+            Box::pin(async move {
+                Ok(DecisionPlan::silent()
+                    .with_state_update(StateUpdateProposal::Affect(affect))
+                    .with_state_update(StateUpdateProposal::Relation(relation)))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_person_state_is_never_written_back_as_a_default() {
+        // 存储读失败与"这个人还没有状态"在值上长得一样（都是 None / 默认值），
+        // 但对写的决定正好相反：前者回写会把她真实的关系抹成"刚认识"。
+        let conversation_id = ConversationId::new();
+        let person_id = PersonId::new();
+        let affects = Arc::new(TestAffectStore::default());
+        let relations = Arc::new(TestRelationStore::default());
+        relations.fail_reads.store(true, Ordering::SeqCst);
+        let services = CoreServices::with_model(PersonStateOnlyModel {
+            affect: AffectState::default(),
+            relation: RelationState {
+                person_id,
+                familiarity: 0.9,
+                affinity: 0.8,
+                trust: 0.7,
+                comfort: 0.6,
+                tension: 0.0,
+            },
+        })
+        .with_affect(affects.clone())
+        .with_relations(relations.clone());
+        let (_handle, mut runtime) =
+            CognitiveRuntime::new_with_services(RuntimeConfig::default(), services)
+                .expect("valid runtime");
+
+        runtime
+            .process_event_with_planner(direct_message(conversation_id, person_id))
+            .await
+            .expect("the turn itself still runs");
+
+        assert!(
+            relations
+                .updates
+                .lock()
+                .expect("relation recorder lock")
+                .is_empty(),
+            "关系读失败时不得把任何关系写回库里"
+        );
+        assert_eq!(
+            affects.updates.lock().expect("affect recorder lock").len(),
+            1,
+            "fail-closed 是按存储分开的：情绪这一份读到了，照常写"
         );
     }
 

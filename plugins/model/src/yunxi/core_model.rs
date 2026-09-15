@@ -2601,10 +2601,18 @@ fn affect_tone_guidance(input: &PlannerInput) -> String {
         parts.push("社交能量低、话少偏内敛".to_owned());
     }
 
-    // Relation warmth.
+    // Relation warmth. 好感是"她多喜欢这个人"的长期刻度，熟悉度是"见过多少次"，
+    // 张力是"眼下有多僵"——三个各管一段，按张力 → 好感 → 熟悉度的顺序判，
+    // 因为最具体的那条最该先说话。
     if let Some(relation) = input.relation.as_ref() {
         if relation.tension >= 0.35 {
             parts.push("和对方还有点生分、需要分寸".to_owned());
+        } else if relation.affinity >= 0.6 {
+            parts.push("挺喜欢这个人，可以自然地热络一点".to_owned());
+        } else if relation.affinity >= 0.25 {
+            parts.push("对这个人是有好感的".to_owned());
+        } else if relation.affinity <= -0.25 {
+            parts.push("对这个人提不起劲，礼貌但不热络".to_owned());
         } else if relation.comfort >= 0.5 && relation.familiarity >= 0.5 {
             parts.push("和对方已经很亲近、放松".to_owned());
         } else if relation.familiarity < 0.25 {
@@ -8169,25 +8177,42 @@ mod tests {
         assert!(affect_tone_guidance(&neutral).is_empty());
         // A low mood plus a still-unfamiliar partner steers the register
         // without ever leaking internal numbers or state names.
+        let relation = |familiarity: f32, affinity: f32, tension: f32| RelationState {
+            person_id: person,
+            familiarity,
+            affinity,
+            trust: 0.3,
+            comfort: 0.2,
+            tension,
+        };
         let clouded = message_input(person, true)
             .with_affect(AffectState {
                 valence: -0.5,
                 arousal: -0.4,
                 ..AffectState::default()
             })
-            .with_relation(Some(RelationState {
-                person_id: person,
-                familiarity: 0.2,
-                affinity: 0.3,
-                trust: 0.3,
-                comfort: 0.2,
-                tension: 0.1,
-            }));
+            .with_relation(Some(relation(0.2, 0.0, 0.1)));
         let guidance = affect_tone_guidance(&clouded);
         assert!(guidance.contains("情绪偏低落"));
         assert!(guidance.contains("和对方还不熟"));
         assert!(!guidance.contains("0.5"));
         assert!(!guidance.contains("话多一些"));
+
+        // 好感是她对**这个人**的长期刻度，接进语气档之后必须真的改变措辞：
+        // 喜欢、有好感、提不起劲三档各说各的话。
+        let liked = message_input(person, true).with_relation(Some(relation(0.8, 0.7, 0.0)));
+        assert!(affect_tone_guidance(&liked).contains("挺喜欢这个人"));
+        let warm = message_input(person, true).with_relation(Some(relation(0.8, 0.3, 0.0)));
+        assert!(affect_tone_guidance(&warm).contains("是有好感的"));
+        let cold = message_input(person, true).with_relation(Some(relation(0.8, -0.4, 0.0)));
+        let cold_guidance = affect_tone_guidance(&cold);
+        assert!(cold_guidance.contains("提不起劲"));
+        assert!(!cold_guidance.contains("挺喜欢"));
+        // 张力优先于好感：关系紧张时先讲分寸，不夸"喜欢这个人"。
+        let strained = message_input(person, true).with_relation(Some(relation(0.8, 0.8, 0.5)));
+        let strained_guidance = affect_tone_guidance(&strained);
+        assert!(strained_guidance.contains("生分"));
+        assert!(!strained_guidance.contains("挺喜欢"));
     }
 
     #[test]

@@ -300,6 +300,7 @@ pub(crate) async fn understand(request: UnderstandingRequest) -> MessageUndersta
 - conversation_end：用户是否明确结束当前聊天线程，例如明确说先聊到这里、不要再接着聊；普通一句话说完、谢谢或换行不自动算结束。
 - topic_shift：当前消息是否明确开启了独立的新主题；新主题可以作为一轮新的聊天继续，但不要因此把普通的补充说明判成换题。
 - interjection_worthy：没有被点名时，是否有自然、具体、能增加交流价值的接话空间。
+- gratitude：这条消息是不是在向芸汐**本人**表达明确的谢意、歉意或关心（"谢谢""抱歉，刚才是我急了""你还好吗"）。它是长期关系的输入之一，所以判据要严：客套收尾的"好的谢谢"、转述别人的谢意（"他让我谢谢你"）、反讽或玩笑式的"谢谢啊"、谢第三方的，都是 false。判断不了就填 false——漏记一次远好过把客气话当成真心。
 - sticker_reaction：如果为 true，这是一条紧跟芸汐发言的表情回应；不要把它当成无内容消息，结合上一条芸汐消息判断是否自然接住。
 - interests、personality_traits、topics：只有从整体语义中有足够把握时才填写，最多各 6 项。
 - group_atmosphere：用很短的描述概括当前群聊氛围，不确定就留空。"#

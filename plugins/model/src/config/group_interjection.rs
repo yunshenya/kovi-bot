@@ -46,6 +46,12 @@ pub struct GroupInterjectionConfig {
     familiar_admit_enabled: bool,
     /// 视为"熟人"的熟悉度阈值（0..=1）。
     familiarity_threshold: f64,
+    /// 视为"自己人"的好感阈值（0..=1）。
+    ///
+    /// 好感与熟悉度是两件事：熟悉是"见过多少次"，好感是"她多喜欢这个人"。
+    /// 天天在群里抬杠的人可以很熟却没有好感，刚认识但一直照顾她的人则相反。
+    /// 任一维过线都算"值得听他说完"，因此未点名消息直接进入语义评估。
+    affinity_threshold: f64,
     /// 熟人确定性放行的限流统计窗口（秒）。
     familiar_rate_window_secs: u64,
     /// 限流窗口内同一群最多放行多少条熟人消息进入语义评估。
@@ -204,6 +210,10 @@ impl GroupInterjectionConfig {
         self.familiarity_threshold
     }
 
+    pub fn affinity_threshold(&self) -> f64 {
+        self.affinity_threshold
+    }
+
     pub fn familiar_rate_window_secs(&self) -> u64 {
         self.familiar_rate_window_secs
     }
@@ -324,6 +334,9 @@ impl GroupInterjectionConfig {
         if self.familiarity_threshold < 0.0 || self.familiarity_threshold > 1.0 {
             return Err(anyhow::anyhow!("熟人熟悉度阈值必须在0到1之间"));
         }
+        if self.affinity_threshold < 0.0 || self.affinity_threshold > 1.0 {
+            return Err(anyhow::anyhow!("自己人好感阈值必须在0到1之间"));
+        }
         if self.familiar_rate_window_secs == 0 || self.familiar_rate_limit == 0 {
             return Err(anyhow::anyhow!("熟人放行限流配置必须大于0"));
         }
@@ -386,6 +399,7 @@ impl Default for GroupInterjectionConfig {
             sticker_reaction_rate_limit: 3,
             familiar_admit_enabled: false,
             familiarity_threshold: 0.5,
+            affinity_threshold: 0.5,
             familiar_rate_window_secs: 600,
             familiar_rate_limit: 6,
             continuation_window_secs: 60,

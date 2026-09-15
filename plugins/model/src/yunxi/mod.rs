@@ -1247,17 +1247,31 @@ pub(crate) async fn project_legacy_user_state(
 
 /// 把 legacy 档案的两个数字投影成 Core 的关系初值。
 ///
-/// 抽成纯函数是为了让"投影不许凭空造出张力"这条不变量**可测**：`tension` 的语义
-/// 是"被持续不友好对待的证据累积"，只有 `adjust_relation_tension`（字面证据与
-/// 模型语义证据）能抬升它，legacy 档案里根本没有这个信息。
+/// 抽成纯函数是为了让两条不变量**可测**：
+///
+/// 1. **投影不许凭空造出张力**：`tension` 的语义是"被持续不友好对待的证据累积"，
+///    只有证据通道能抬升它，legacy 档案里根本没有这个信息。
+/// 2. **投影不许凭空造出负好感**：等级低是"不熟"，不是"有仇"。这里曾经写
+///    `affinity = (level - 5) / 5`，于是 `level = 1`（legacy 里是"礼貌、稍微正式"，
+///    也是新用户的默认值，线上八成档案都是它）被译成好感 **-0.8**。在好感只是
+///    后台一个数字的年代它看起来只是"偏低"；好感接进语气档与放行判据之后，它意味着
+///    "每个新认识的人一建档就是她不喜欢的人"。等级 1..=4 一律给 0（中性起步），
+///    5..=10 才线性给到 0.6——"不熟"与"不喜欢"必须落在刻度两边。
 fn legacy_relation_projection(
     person_id: PersonId,
     relationship_level: u8,
     interaction_count: u32,
 ) -> RelationState {
     let familiarity = (f64::from(interaction_count.min(100)) / 100.0) as f32;
-    let affinity = (f32::from(relationship_level) - 5.0) / 5.0;
-    let trust = (f32::from(relationship_level) - 1.0) / 9.0;
+    let level = f32::from(relationship_level);
+    // 1..=4（礼貌/正式）→ 0；5..=10 → 0.1..=0.6。上界刻意不冲到 1.0：
+    // 建档只是"以前聊得不错"，真正的好感要靠相处证据自己挣。
+    let affinity = if level <= 4.0 {
+        0.0
+    } else {
+        (level - 4.0) / 10.0
+    };
+    let trust = (level - 1.0) / 9.0;
     let comfort = affinity.max(0.0);
     RelationState {
         person_id,
@@ -1266,11 +1280,10 @@ fn legacy_relation_projection(
         trust: trust.clamp(-1.0, 1.0),
         comfort: comfort.clamp(-1.0, 1.0),
         // 恒为 0，不从 `-affinity` 反推。这里曾经写 `(-affinity).max(0.0)`，于是
-        // `relationship_level = 1`（legacy 里是"礼貌、稍微正式"，也是新用户的
-        // 默认值，线上八成档案都是它）被译成张力 0.8。在静默门控用 0.6 当阈值
-        // 之前那个值只是语气提示，无害；门控上线后它意味着"每个新认识的人一建档
-        // 就带着越线的张力，第一条 @ 她的话就被判不接"。等级低是"不熟"，不是
-        // "有仇"，这两件事不能共用一根刻度。
+        // `relationship_level = 1` 被译成张力 0.8。在静默门控用 0.6 当阈值之前
+        // 那个值只是语气提示，无害；门控上线后它意味着"每个新认识的人一建档就带着
+        // 越线的张力，第一条 @ 她的话就被判不接"。等级低是"不熟"，不是"有仇"，
+        // 这两件事不能共用一根刻度。
         tension: 0.0,
     }
 }
@@ -1618,14 +1631,36 @@ mod tests {
 
     #[test]
     fn legacy_projection_still_carries_familiarity_and_warmth_dimensions() {
-        // 这次只动张力：亲密度与信任照旧按等级投影，"熟不熟"仍然进得来。
+        // 亲密度与信任照旧按等级投影，"熟不熟"仍然进得来。
         let stranger = legacy_relation_projection(PersonId::new(), 1, 100);
         let intimate = legacy_relation_projection(PersonId::new(), 10, 100);
-        assert!(stranger.affinity < 0.0, "等级 1 仍然是生分的一端");
         assert_eq!(stranger.familiarity, 1.0, "互动次数应当折算成熟悉度");
         assert_eq!(stranger.comfort, 0.0, "生分没有舒适度可言，但也不是负的");
         assert!(intimate.affinity > 0.0);
         assert!(intimate.trust > stranger.trust);
+    }
+
+    #[test]
+    fn legacy_projection_never_invents_dislike() {
+        // 等级低是"不熟"，不是"有仇"：好感接进语气档与未点名放行之后，
+        // 一个负的初值等于"每个新认识的人一建档就是她不喜欢的人"
+        // （线上八成档案是新用户默认等级 1）。
+        for level in 1..=4u8 {
+            let relation = legacy_relation_projection(PersonId::new(), level, 0);
+            assert_eq!(
+                relation.affinity, 0.0,
+                "等级 {level}（礼貌/正式）应当是中性起步，不是负好感"
+            );
+        }
+        // 高等级仍然带得出"以前就处得不错"，但不冲到满值——好感要靠证据挣。
+        let intimate = legacy_relation_projection(PersonId::new(), 10, 0);
+        assert!(
+            intimate.affinity > 0.0 && intimate.affinity < 1.0,
+            "等级 10 应当是正向但不满值：{}",
+            intimate.affinity
+        );
+        let friendly = legacy_relation_projection(PersonId::new(), 7, 0);
+        assert!(friendly.affinity > 0.0 && friendly.affinity < intimate.affinity);
     }
 
     #[test]

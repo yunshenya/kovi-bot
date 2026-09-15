@@ -699,6 +699,33 @@ impl Default for PlannerStateSnapshot {
     }
 }
 
+/// Outcome of reading one persisted per-person row for this turn.
+///
+/// A planner must be able to tell "this person has no row yet" from "nobody
+/// could read the row". The two look identical on the value itself, but they
+/// call for opposite write decisions: creating a row for a new person is
+/// normal, while writing back a default for a person whose row merely failed
+/// to load would erase it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PersonStateRead {
+    /// Storage answered. The accompanying value may still be absent (a person
+    /// with no row yet), and a write derived from it is safe.
+    #[default]
+    Ok,
+    /// Storage failed. Core must not persist anything derived from this
+    /// snapshot — least of all a fresh default over a real row.
+    Unavailable,
+}
+
+impl PersonStateRead {
+    /// Whether a state update derived from this snapshot may be persisted.
+    #[must_use]
+    pub const fn is_writable(self) -> bool {
+        matches!(self, Self::Ok)
+    }
+}
+
 /// All context needed for one planning turn.  The event is included in full,
 /// while durable context is bounded by the stores and the caller's retrieval
 /// policy before it reaches a model backend.
@@ -716,7 +743,15 @@ pub struct PlannerInput {
     #[serde(default)]
     pub participants: Vec<ConversationMember>,
     pub relation: Option<RelationState>,
+    /// Whether `relation` was actually readable this turn. V1 payloads default
+    /// to `Ok`, which preserves their original write behavior.
+    #[serde(default)]
+    pub relation_read: PersonStateRead,
     pub affect: AffectState,
+    /// Whether `affect` was actually readable this turn, with the same
+    /// fail-closed rule as `relation_read`.
+    #[serde(default)]
+    pub affect_read: PersonStateRead,
     pub capabilities: Vec<ActionDescriptor>,
     /// Bounded, replayable Mind v2 context. Older payloads and V1 hosts
     /// deserialize to an empty snapshot and preserve their original behavior.
@@ -739,11 +774,36 @@ impl PlannerInput {
             goals: Vec::new(),
             participants: Vec::new(),
             relation: None,
+            relation_read: PersonStateRead::Ok,
             affect: AffectState::default(),
+            affect_read: PersonStateRead::Ok,
             capabilities: Vec::new(),
             mind: MindSnapshot::empty(),
             executive: ExecutiveSnapshot::default(),
         }
+    }
+
+    /// Record that this turn's relation read failed. `relation` should then be
+    /// `None`, and Core will decline to persist a relation for the turn.
+    #[must_use]
+    pub const fn with_relation_unavailable(mut self, unavailable: bool) -> Self {
+        self.relation_read = if unavailable {
+            PersonStateRead::Unavailable
+        } else {
+            PersonStateRead::Ok
+        };
+        self
+    }
+
+    /// Record that this turn's affect read failed, with the same consequence.
+    #[must_use]
+    pub const fn with_affect_unavailable(mut self, unavailable: bool) -> Self {
+        self.affect_read = if unavailable {
+            PersonStateRead::Unavailable
+        } else {
+            PersonStateRead::Ok
+        };
+        self
     }
 
     #[must_use]
