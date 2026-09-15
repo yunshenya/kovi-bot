@@ -47,6 +47,7 @@ mod silence;
 mod tools;
 mod topic;
 mod traffic;
+mod understanding;
 mod vision;
 mod world_model;
 mod world_sensors;
@@ -70,6 +71,7 @@ pub use reminders::ReminderConfig;
 pub use server::ApiKeySource;
 pub use silence::SilenceConfig;
 pub use tools::{McpServerConfig, ToolsConfig};
+pub use understanding::UnderstandingConfig;
 pub use vision::VisionConfig;
 pub use world_model::WorldModelConfig;
 pub use world_sensors::{WorldSensorConfig, WorldSensorsConfig};
@@ -110,6 +112,8 @@ pub struct ModelConfig {
     message_batch: MessageBatchConfig,
     /// 情绪缓存与自然漂移配置
     mood: MoodConfig,
+    /// Core 接管回合的会话理解（情绪 / 兴趣 / 画像）配置
+    understanding: UnderstandingConfig,
     /// 话题去重配置
     topic: TopicConfig,
     /// 入站流量、排队和模型响应资源上限。
@@ -184,6 +188,7 @@ impl ModelConfig {
         self.mind.validate()?;
         self.message_batch.validate()?;
         self.mood.validate()?;
+        self.understanding.validate()?;
         self.topic.validate()?;
         self.traffic.validate()?;
         self.tools.validate()?;
@@ -265,6 +270,10 @@ impl ModelConfig {
 
     pub fn mood(&self) -> &MoodConfig {
         &self.mood
+    }
+
+    pub fn understanding(&self) -> &UnderstandingConfig {
+        &self.understanding
     }
 
     pub fn topic(&self) -> &TopicConfig {
@@ -655,6 +664,10 @@ mod tests {
         assert_eq!(config.server_config().thinking_mode(), "disabled");
         assert_eq!(config.memory().max_entries(), 1000);
         assert_eq!(config.mood().cache_ttl_secs(), 300);
+        assert!(
+            config.understanding().core_owned_enabled(),
+            "仓库配置里 Core 回合的会话理解默认开启"
+        );
         assert_eq!(config.topic().recent_topic_cooldown_secs(), 604_800);
         assert!(!config.prompt().system_prompt().contains("NEXT_MESSAGE"));
         assert!(!config.prompt().private_prompt().contains("NEXT_MESSAGE"));

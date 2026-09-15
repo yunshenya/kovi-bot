@@ -3925,6 +3925,31 @@ async fn resolve_and_submit_inner(
     };
     let reply_scope = message.address.reply_scope();
 
+    // Core 接管的这条消息补跑一次会话理解（情绪 / 兴趣 / 画像与关系证据）。
+    //
+    // 放在这个函数里，是因为它是**所有**交给 Core 的消息的唯一汇聚点：入站闭包
+    // 只覆盖"新消息"那条路，接续合批与私聊窗口排空同样会走到这里，而它们也是
+    // 用户真的说过的话。
+    //
+    // `visible_reply_allowed` 是"这一条归 Core 的可见回合"的准确判据：观察型消息
+    // （未点名的群聊背景流量）是 Host 在处理，那两条入站处理器自己会跑一次理解——
+    // 不在这里排掉它们，`interaction_count` 就会涨两次。
+    {
+        let is_private = matches!(message.address, ConversationAddress::Direct { .. });
+        crate::yunxi::events::observe_core_owned_message(
+            message.sender_user_id,
+            message.text.clone(),
+            if is_private {
+                "private_chat"
+            } else {
+                "group_chat"
+            },
+            message.sender_label.clone(),
+            is_private,
+            message.visible_reply_allowed,
+        );
+    }
+
     if let Some(route_tracker) = route_tracker {
         route_tracker.record(
             message.sender_user_id,

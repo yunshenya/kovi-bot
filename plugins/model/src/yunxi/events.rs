@@ -45,6 +45,81 @@ pub(crate) async fn project_destination(
 /// Project semantic evidence already produced by a legacy handler. The
 /// conversion into [`InteractionCues`] happens at the semantic boundary; this
 /// function only resolves the canonical Person and admits a bounded event.
+/// Core 接管的一条消息：补跑一次会话理解，把结果喂给情绪、关系与画像。
+///
+/// 为什么需要它：`understand()` 一直只挂在 Host 的两个入站处理器上，而普通私聊
+/// 文本与"指向她的群消息"都归 Core——那些回合于是既没有情绪、也没有兴趣/性格/
+/// 关系等级的更新。理解层是这条链路唯一的生产者，缺了它，`project_interaction_cues`
+/// 与画像学习对 Core 流量就是死代码。
+///
+/// 三条边界：
+/// - **只补理解，不参与回复**：结果只走 `project_interaction_cues`（关系/情绪）与
+///   `learn_user_profile_from_message`（画像）；这一轮回不回、回什么完全不受影响。
+/// - **后台 + 超时**：宿主不等待它，超时/失败只记日志；它也不改变消息去向。
+/// - **只对 Core 接管的回合跑**：Host 那两条路已经跑过一次，重复调用会让
+///   `interaction_count` 涨两次。
+pub(crate) fn observe_core_owned_message(
+    user_id: i64,
+    text: String,
+    context: &'static str,
+    nickname: String,
+    is_private: bool,
+    visible_reply_allowed: bool,
+) {
+    if !should_observe_core_owned(
+        visible_reply_allowed,
+        &text,
+        crate::config::get().understanding().core_owned_enabled(),
+    ) {
+        return;
+    }
+    kovi::tokio::spawn(async move {
+        let request = crate::model::UnderstandingRequest::text(&text, context);
+        let understanding = match timeout(
+            CORE_UNDERSTANDING_TIMEOUT,
+            crate::model::understand(request),
+        )
+        .await
+        {
+            Ok(understanding) => understanding,
+            Err(_) => {
+                kovi::log::warn!(
+                    "Yunxi core-owned understanding timed out (user: {user_id}, context: {context})"
+                );
+                return;
+            }
+        };
+        project_interaction_cues(user_id, understanding.interaction_cues());
+        crate::model::learn_user_profile_from_message(
+            user_id,
+            &text,
+            &nickname,
+            is_private,
+            &understanding,
+        )
+        .await;
+    });
+}
+
+/// 这条补跑的理解最多花多久。它纯属观测，宁可不记也不让任务堆积。
+const CORE_UNDERSTANDING_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// 要不要为这条消息补跑一次会话理解。
+///
+/// 三个条件缺一不可：开关开着、正文不是空的、这一条是 **Core 的可见回合**
+/// （`visible_reply_allowed`）。
+///
+/// 最后一条是"恰好一次"的关键：观察型消息（未点名的群聊背景流量）由 Host 处理，
+/// 而那两条入站处理器自己会跑一次同样的理解——在这里再跑一次，同一个人的
+/// `interaction_count` 就会涨两次、关系等级跟着多涨一级。
+pub(crate) fn should_observe_core_owned(
+    visible_reply_allowed: bool,
+    text: &str,
+    enabled: bool,
+) -> bool {
+    visible_reply_allowed && enabled && !text.trim().is_empty()
+}
+
 pub(crate) fn project_interaction_cues(user_id: i64, cues: InteractionCues) {
     if !has_interaction_evidence(cues) {
         return;
@@ -242,6 +317,20 @@ const fn projection_timeout(priority: EventPriority) -> Duration {
 mod tests {
     use super::*;
     use yunxi_core::{ReminderDueEvent, ToolCompletedEvent};
+
+    #[test]
+    fn core_owned_understanding_runs_exactly_once_per_visible_turn() {
+        // 三个条件：是 Core 的可见回合、开关开着、正文里有东西。
+        assert!(should_observe_core_owned(true, "在吗", true));
+        // 观察型消息（未点名的群聊背景流量）由 Host 处理，Host 的两条入站处理器
+        // 自己会跑一次理解——这里必须排掉，否则 interaction_count 涨两次。
+        assert!(!should_observe_core_owned(false, "在吗", true));
+        // 开关关掉即回到原状。
+        assert!(!should_observe_core_owned(true, "在吗", false));
+        // 空正文不值得为它花一次分类调用（图片、贴纸这类消息正文就是空的）。
+        assert!(!should_observe_core_owned(true, "", true));
+        assert!(!should_observe_core_owned(true, "   \n\t ", true));
+    }
 
     #[test]
     fn projected_payloads_remain_bounded_and_valid() {

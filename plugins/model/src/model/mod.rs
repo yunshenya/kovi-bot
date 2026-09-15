@@ -51,13 +51,14 @@ pub(crate) use message_actions::{
 pub(crate) use message_transport::{MessageTransport, MessageTransportError};
 pub(crate) use model_gateway::ModelGateway;
 pub(crate) use recall::record_standalone_bot_message;
+pub(crate) use semantic::{UnderstandingRequest, understand};
 pub(crate) use thinking::strip_thinking_notices;
 pub(crate) use tool_access::{ToolExecutionContext, tool_registry};
 pub(crate) use tracked_send::{
     TrackedSendError, send_tracked_message_with_revalidation,
     send_tracked_message_with_revalidation_guard, send_tracked_unrecorded_plain_text,
 };
-pub(crate) use utils::{BotMemory, Roles};
+pub(crate) use utils::{BotMemory, Roles, learn_user_profile_from_message};
 
 #[cfg(test)]
 pub(crate) use crate::model::conversation_coordinator::OutgoingExecutiveDecision;
