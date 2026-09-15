@@ -1236,7 +1236,10 @@ WARN/ERROR 0、QQ 已连上。
   才变化的状态会在执行前被拦掉；这条严格来说是**收紧**，不是放松。
 - 拒绝原因从 `tool_follow_up_requires_read_only_tool` 改名为
   `tool_allowance_rejected_at_effect_boundary`（旧名字已经说不清是什么原因了）。
-- Host 那条 ReAct 循环的口径不变（仍按外部工具名收窄），只把调用点换成新档位参数。
+- Host 那条 ReAct 循环**怎么判**不变（仍按外部工具名 `is_external_tool_name` 收窄），
+  但收窄到哪一档变了：吃到外部内容之后从"只能只读"变成"只读 + 只影响本人的写"。
+  换句话说，Host 侧这次是**放松**了提醒/记忆/撤回这三种写，对外发言依旧挡住；
+  两边（判据来源不同、放行范围相同）现在落在同一个档位定义上。
 
 **踩到的坑（顺手修）**：重构中把 `core_tool_allowance` 的文档块插到了
 `likely_requires_controlled_tool` 的 doc comment 中间，rustdoc 会把连着的一串 `///` 都算给

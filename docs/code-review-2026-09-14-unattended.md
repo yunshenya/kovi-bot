@@ -243,6 +243,13 @@ COMMIT 语句自身的错误（`sqlx-postgres-0.8.6/src/transaction.rs:47-58`）
   并用可写的 `execute`，而兄弟路径（`core_model.rs:5689`、`delivery.rs:1043`）都改成了
   只读。于是「主管理员让机器人看某个网页 → 网页里的注入文本 → 第二轮仍挂着
   `group.message.send` / `reminder.create`」这条链路是通的，唯一防线是提示词里的一句话。
+  **（2026-09-16 现状）**：这条审计指出的"跟进轮全权限"已经不成立，但**不是**靠一句
+  提示词兜的：Host 这条链路先补上了"吃到外部内容就收窄"（`memory_query.rs` 的
+  `untrusted_tool_output`），又与 Core、delivery 一起换成了同一套档位判据
+  （`ToolAllowance` / `WriteScope`）。收窄档现在只放行只读与"只影响本人"的写，
+  `group.message.send` 这类对外动作不再挂出；`reminder.create` / `memory.remember` /
+  `message.recall` 按设计仍然可用（只影响本人、可逆、不对外可见）。
+  见 `code-review-2026-09-15-favorability.md` §11.13。
 - `plugins/model/src/yunxi/delivery.rs:554`：语音/唱歌合成（`qq_sing` 超时默认 45s，
   可配到 180s）发生在 30s 的 precommit 租约**之内**，合成慢一点就 `Stale`，整条已渲染
   好的回复被丢弃且不重试。建议把合成挪到 `begin_outgoing_commit` 之前。

@@ -1145,7 +1145,10 @@ Hindsight 把可观测性做成一等公民（`llm_trace.py` 27KB、`prompt_prev
   并说明 resolved 为空时要反问、precision 为 period/date 时要确认。
 - **创建提醒不再走 time.resolve 的两跳**（2026-09-13 补）：Core 一轮只执行一次工具调用，
   工具结果的 follow-up 轮又把工具清单收成只读，所以"先 resolve 再 reminder.create"实际
-  走不通（线上 2026-09-12 的三点半提醒就是这样丢的）。现在提醒工具多了一个
+  走不通（线上 2026-09-12 的三点半提醒就是这样丢的）。（2026-09-16 更正：跟进轮已改为按
+  **结果来源**分档，`reminder.create` 属于"只影响本人"的写，收窄档里仍然挂得出来，两跳现在
+  走得通；一轮建成仍然更省，所以这条设计不变。见 `code-review-2026-09-15-favorability.md`
+  §11.13。）现在提醒工具多了一个
   `natural_time` 入参：模型把**用户原话**填进去，宿主用同一个 `chinese_time` 解析器算日期，
   一轮就能建成；`time.resolve` 仍服务其他需要具体时刻的场合。
 
