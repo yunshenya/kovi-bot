@@ -611,3 +611,63 @@ memory_query,utils}.rs`、`memory/mod.rs`）一路被中途叫停——原因是
 3. **W7/W8/W9 与其余 LOW**：`Hypothesis` 缺 restore 构造器、Executive 目标跨作用域无上限、
    `ActionArbiter.last_by_scope` 只增不删、`TurnGate` 资产路径未做包含校验等，都是
    当前 latent（没有生产调用点或没有开启对应开关）。逐条清单见 5.3。
+
+---
+
+## 十、第二轮（2026-09-15 下午）：Core 接管之后，私聊这条路断在哪儿
+
+第一轮把好感/信任接进了证据通道，但接着问"证据从哪来"时发现了一个更靠上游的断点。
+
+### 10.1 发现：语义理解层只在 Host 那条路上跑
+
+`understand()`（会话理解：mood / gratitude / interests / 画像学习）全仓只有五个调用
+点：`model/private.rs:705`、`model/group.rs:991`、`proactive_chat`、`mood_system` 两处。
+前两个都在 **Host 专属**的处理器里——`private_message_event_after_ingress` 与
+`group_message_event_after_ingress` 只有 `owner == Host` 时才会被调用
+（`lib.rs:807` / `lib.rs:724`）。
+
+而普通私聊文本与"指向她"的群消息都是 **Core 接管**的
+（`bridge::handles_private` / `supports_group`，cutover 默认开）。结论：
+
+| 消息类型 | 归谁 | 语义理解 | 相处证据（关系/情绪输入） |
+| --- | --- | --- | --- |
+| 私聊普通文本 | Core | ❌ 不跑 | 修复前 ❌ 完全没有 |
+| 群聊 · 指向她 | Core | ❌ 不跑 | ✅ 群聊入站闭包上有（我第一轮修的那条） |
+| 群聊 · 未点名被抽样 | Host | ✅ 跑 | ✅ |
+
+也就是说：**私聊这条路对情绪、兴趣、性格、关系等级、好感全都没有输入**——而私聊是
+信号最强的 1:1 通道。README:484 承诺的"私聊还会持续更新用户的兴趣、性格、关系等级
+和情绪历史"，自 Core 接管起就不再成立。
+
+这也解释了另一件事：`[[INTERACTION_CUES]]` 回复 sidecar 那条通道（文档记为线上 24
+小时 0 次）并不是"模型不配合"——Core 的提示词明确禁止输出协议标记，并有一条测试
+钉着（`core_model.rs:8795`）。它是一条没有生产者的通道。
+
+### 10.2 已修：私聊接进相处证据通道（`f88702a`）
+
+复用群里那套已经上线的判据，不新造机制：同一个 prompt、同一个模型、同一个折算刻度
+（`relation_evidence_nudge`）、同一个后台不阻塞形态、同一个开关
+（`[silence] relation_evidence_model_enabled`，默认 true）。差别只有两点：1:1 天然
+"指向她"，所以不判定向；不写群级气氛。
+
+挂在 `lib.rs` 的私聊入站闭包上，与群聊那条同一个位置、同一条理由：与这一轮归 Host
+还是归 Core 无关。**成本**：每条私聊消息多一次有界分类调用（输出 ≤160 token、
+输入截断 400 字），与群里那条同量级；关掉开关即回到原状。
+
+### 10.3 仍未修：Core 回合的完整语义理解（需要你拍板）
+
+情绪、兴趣、性格、关系等级的更新仍然只在 Host 路上发生。要让它们在 Core 回合也成立，
+只有一条路：**为 Core 接管的回合也跑一次语义理解**，代价是每条消息多一次分类调用
+（输入上限 6000 字，输出上限 420 token）。
+
+三种选择：
+
+1. **不修**：接受"Core 回合不更新画像与情绪"，但把 README 与相关注释改成事实，
+   免得下一个人再按文档去查为什么兴趣一直是空的。
+2. **全开**（推荐）：Core 回合也跑一次 `understand` + `project_interaction_cues` +
+   `learn_user_profile_from_message`，加一个开关（默认开）与一行成本说明。这是把
+   README 承诺的行为接回来。
+3. **只补画像**：不跑完整理解，只把 `relationship_level`/`interests` 的更新接回
+   Core 路——但那条路径本身就是理解层的产物，等于半个方案。
+
+我倾向 **2**，但它每次都要花钱且影响画像涨速，属于"成本与产品取舍"，没有替你拍板。
