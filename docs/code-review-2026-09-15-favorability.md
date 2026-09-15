@@ -1323,3 +1323,66 @@ sha256 `4e2f5eb5…`）→ 产物自检（两条新日志在二进制里、函�
 
 **留给实测**：再发一次"发一张你的照片给我"，这一轮应该直接带图；若仍不带图，日志里的
 `sticker marker dropped` / `not leading` 会直接说明是哪条路径。
+
+### 11.15 "有一段时间卡住了"：上游抖动 + 我们把已生成好的回复丢了（`f9d09b1`）
+
+用户问"刚刚有一段时间卡住了是什么原因"。日志给出两层原因，第二层是我们自己的问题。
+
+**一、上游 DeepSeek 抖动**（19:26:45–19:29:22，群 687898502）：19:26:45 HTTP **503**
+"Service is too busy"；19:27:45 与 19:28:09 两次请求 `status=200 terminal=parse_error`，
+错误是 `模型响应读取失败: error decoding response body`——上游 200 但流读不完整，各自把
+我们的 60 秒超时（`server.request_timeout_secs = 60`）耗满才重试，而重试分别只用 1.0 秒 /
+11.9 秒就成功：是上游偶发流中断，不是我们的解析逻辑。同时段的连带超时：
+`[RELATION] 相处证据判定超时`、两次 `Yunxi core-owned understanding timed out`
+（19:27:00、19:27:03）。今天凌晨 02:58–03:02 也有同形态的一波 14 次。
+
+**二、我们自己把已经生成好的回复丢了**（今天两次）：
+
+| 时间 | 群 | 经过 | 结果 |
+|---|---|---|---|
+| 19:27 | 687898502 | 19:26:45 @她"你能做什么" → 上游 60 秒超时 → 19:27:46 第 2 次尝试 1.03 秒生成 36 字 → 19:27:49 `send stage timed out: stage=begin_outgoing_commit budget_ms=3000 action=abort_before_send` | 群里**没有任何 `[send]`**，紧跟着有人说"装高冷不说话" |
+| 18:13 | 641996763 | 模型只用 1.03 秒生成 39 字，收尾 `begin_outgoing_commit` 仍超 3 秒 | "@我需要一个美食代码"没被回答，该群同样没有任何 `[send]` |
+
+两次的回合都以 `Failed { category: "send_stage_timeout:begin_outgoing_commit",
+retryable: true }` 结束。`retryable: true` 在 arbiter 里只做一件事——`release_reservation`
+（允许**将来**重发同一个动作），而 pipeline 里**没有任何路径真的重发**，所以那条回复就这么
+没了。这是"卡住"里最不该发生的一环：不是没能力回答，是答案被扔了。
+
+**修法两处：**
+
+1. `SEND_STAGE_COMMIT_BUDGET` 3 秒 → **60 秒**。这一级不是"内存里几步操作该多快"，而是
+   "同一条票据上更早的语义准入还要多久 resolve"——`interrupt.rs::begin_outgoing_commit`
+   会一直等到那条准入 resolve 或到它的租期（`INCOMING_RESERVATION_LEASE` = 180 秒），
+   3 秒等于"前一条回合还在跑"必然超时。新值给到一次模型调用同量级
+   （`server.request_timeout_secs` 默认 60），既覆盖常见等待，又不让卡死的准入把回合拖住。
+2. 补上"真的重发一次"：`retry_definitely_not_sent` 套住整条发送链路，判据
+   `send_failure_is_definitely_not_sent` 只认真正调 QQ **之前**的三级
+   （`resolve_destination` / `authorize_group` / `begin_outgoing_commit`）。真正调 QQ 的
+   `transport_send` 超时走 `DeliveryIndeterminate`（结果未知），重发它就是重复发消息，
+   所以它和别的语义失败一律不重试。阶段名与超时类别前缀改成常量单点定义，避免判据与
+   实际错误串漂移。
+
+**顺手核到的背景噪音**（现在已静，不改）：今天 50 次
+`Yunxi Mind event update timed out and failed soft`，集中在 17:00（10 次）与 18:00（15 次）；
+发布配置里 `event_update_timeout_ms = 40`，运行时 override 已按"止血"提到 150（配置上限
+500）。**18:13 之后为 0，20:05 重启后为 0**。另有 9 次 `there is no transaction in
+progress`（`observe_event` 被超时取消后事务状态残留的告警）。
+
+**不是进程卡死**：19:27:45 的 `core_reply` 与 19:28:09 的 `unlabeled` 是并发跑的，其他会话
+没有被串行阻塞；日志里那些 20–30 秒空档是没人说话（只有 5 分钟一次的健康检查）。另外我自己的
+两次部署各让机器人离线约 6 秒（19:57:19–19:57:26、20:05:33–20:05:39），期间的消息在重连后
+一次性补进来了（20:05:39 同时出现 4 条）。
+
+**验证**：新增 `only_pre_transport_stage_timeouts_are_definitely_not_sent`（含"假如
+transport 也变成错误"的反向判据）与
+`the_send_pipeline_retries_exactly_once_and_only_before_the_irreversible_boundary`
+（首次超时第二次成功 → 调 2 次；一直超时 → 只多试 `SEND_PIPELINE_RETRIES` 次；
+transport/授权失败 → 一次都不重试）。fmt、clippy 干净；model 1165、yunxi-core 355、
+yunxi-cli 10、acceptance 13 全绿。
+
+**已上线**（`f9d09b1`）：推 `7b7baac..f9d09b1` → 演练（包 14.2 MiB、sha256 `d219e1a5…`）
+→ 产物自检（重试日志与四个阶段名字面量都在）→ 真部署（`--no-build`）→ 服务 active、
+重启 0 次、WARN/ERROR 0、工具注册表就绪、QQ 已连。
+
+**遗留**：上游那 60 秒静默挂住还没治（把整请求超时改成空闲/首字节超时，能让用户少等 45 秒），
+这次没做。
