@@ -146,6 +146,17 @@ static MODEL_CLIENT: LazyLock<Client> = LazyLock::new(|| {
         .build()
         .expect("模型 HTTP 客户端应可创建")
 });
+/// 流式响应"卡住"的判据：多少秒没有读到任何新数据就断掉重试。
+///
+/// 为什么需要：线上 2026-09-15 19:27 与 19:28 两次 `status=200 terminal=parse_error`
+/// （`error decoding response body`）是上游接了请求、回了响应头，然后**一个字节都不再发**。
+/// 当时只有"整个请求 60 秒"这一道闸（`server.request_timeout_secs`），于是白等满 60 秒才
+/// 重试——而重试只花 1.0 秒就成功了。空闲判据把这段白等从 60 秒压到 20 秒。
+///
+/// 为什么是 20 秒：当天**成功**的调用里最长 11.9 秒（还是重试那一趟），只有两次超过 5 秒；
+/// SSE 生成期间每个 delta 都是一次读取，正常不会出现 20 秒的静默。它同时管住首字节
+/// （第一次 `chunk()` 就是同一个等待），所以不必再单设 TTFB 预算。
+const MODEL_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
 const MODEL_CONCURRENCY_LIMIT: usize = 4;
 static MODEL_REQUEST_LIMIT: LazyLock<Semaphore> =
     LazyLock::new(|| Semaphore::new(MODEL_CONCURRENCY_LIMIT));
@@ -2734,7 +2745,14 @@ async fn round_trip_model_request(
         match result {
             Ok(response) if response.status().is_success() => {
                 let status = response.status();
-                match read_model_payload(response, progress, max_response_bytes).await {
+                match read_model_payload(
+                    response,
+                    progress,
+                    max_response_bytes,
+                    stream_idle_timeout(Duration::from_secs(request_timeout_secs)),
+                )
+                .await
+                {
                     Ok(payload) => {
                         super::llm_trace::record_success(
                             request_body,
@@ -2864,6 +2882,11 @@ fn model_attempt_count(configured_retries: u8) -> usize {
     usize::from(configured_retries.saturating_add(1))
 }
 
+/// SSE 流的空闲判据：不超过整请求超时——配置比它还短时以配置为准，两条闸不会互相矛盾。
+fn stream_idle_timeout(request_timeout: Duration) -> Duration {
+    MODEL_STREAM_IDLE_TIMEOUT.min(request_timeout)
+}
+
 /// Apply the provider-native switch for hidden reasoning without involving
 /// the visible reply contract. DeepSeek's Chat Completions API calls this
 /// `thinking`; its Responses API uses `reasoning.effort`.
@@ -2976,6 +2999,7 @@ async fn read_model_payload(
     mut response: reqwest::Response,
     reporter: Option<&ThinkingReporter>,
     max_response_bytes: usize,
+    stream_idle_timeout: Duration,
 ) -> Result<ModelPayload, String> {
     let is_event_stream = response
         .headers()
@@ -3007,11 +3031,28 @@ async fn read_model_payload(
     let mut finish_reason: Option<String> = None;
     let mut stream_completed = false;
 
-    'stream: while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|error| format!("模型响应读取失败: {error}"))?
-    {
+    'stream: loop {
+        // 上游中途静默：SSE 流按空闲判据尽快失败（上层会立刻重试），非流式响应不套它
+        // ——那种响应的正文是生成结束时一次性到达的，中间本来就一个字节都没有。
+        let chunk = if is_event_stream {
+            match kovi::tokio::time::timeout(stream_idle_timeout, response.chunk()).await {
+                Ok(chunk) => chunk.map_err(|error| format!("模型响应读取失败: {error}"))?,
+                Err(_) => {
+                    return Err(format!(
+                        "模型流式响应空闲超过 {} 秒（上游在响应中途停止发送数据）",
+                        stream_idle_timeout.as_secs()
+                    ));
+                }
+            }
+        } else {
+            response
+                .chunk()
+                .await
+                .map_err(|error| format!("模型响应读取失败: {error}"))?
+        };
+        let Some(chunk) = chunk else {
+            break;
+        };
         if raw_body.len().saturating_add(chunk.len()) > body_limit {
             return Err(format!("模型响应超过 {} 字节上限", body_limit));
         }
@@ -4571,19 +4612,95 @@ mod tests {
     use super::ReplyTurn;
     use super::{
         BotMemory, EMPTY_REPLY_REPAIR_PROMPT, FoldedFragment, MAX_NATIVE_TOOL_ARGUMENTS_BYTES,
-        MessageUnderstanding, NativeToolCall, NativeToolCallDelta, Roles, VisionImage,
-        append_stream_delta, apply_thinking_mode, assistant_tool_calls_wire, build_model_messages,
-        build_responses_input, build_responses_request_body, compression_cutoff,
-        extract_message_tool_calls, extract_stream_delta, finalize_native_tool_calls,
-        format_plain_style_context, group_system_prompt, is_group_admin_command, is_help_command,
-        is_private_only_command, is_restricted_command, likely_requires_tool_protocol,
-        limit_memory_size, model_attempt_count, neutralize_line_speaker_markers,
-        neutralize_protocol_markers, parse_stream_line, plain_reply_plan,
-        plain_reply_plan_for_host, private_user_message, reply_action_tool_requested,
-        sanitize_scheduled_output, should_repair_empty_reply, tool_result_wire,
-        with_reference_context,
+        MODEL_CLIENT, MessageUnderstanding, NativeToolCall, NativeToolCallDelta, Roles,
+        VisionImage, append_stream_delta, apply_thinking_mode, assistant_tool_calls_wire,
+        build_model_messages, build_responses_input, build_responses_request_body,
+        compression_cutoff, extract_message_tool_calls, extract_stream_delta,
+        finalize_native_tool_calls, format_plain_style_context, group_system_prompt,
+        is_group_admin_command, is_help_command, is_private_only_command, is_restricted_command,
+        likely_requires_tool_protocol, limit_memory_size, model_attempt_count,
+        neutralize_line_speaker_markers, neutralize_protocol_markers, parse_stream_line,
+        plain_reply_plan, plain_reply_plan_for_host, private_user_message, read_model_payload,
+        reply_action_tool_requested, sanitize_scheduled_output, should_repair_empty_reply,
+        stream_idle_timeout, tool_result_wire, with_reference_context,
     };
     use super::{is_group_paused, set_group_paused};
+
+    /// 空闲判据：不超过整请求超时，且必须明显短于默认的 60 秒。
+    ///
+    /// 这条数字就是"少等多少秒"本身：整请求超时 60 秒时，上游中途静默最多白等 20 秒
+    /// 就断开重试；配置把整请求超时压到更短时，以配置为准（两条闸不互相矛盾）。
+    #[test]
+    fn the_stream_idle_timeout_stays_below_the_request_timeout() {
+        assert_eq!(
+            stream_idle_timeout(std::time::Duration::from_secs(60)),
+            std::time::Duration::from_secs(20)
+        );
+        assert_eq!(
+            stream_idle_timeout(std::time::Duration::from_secs(5)),
+            std::time::Duration::from_secs(5)
+        );
+    }
+
+    /// 上游在响应中途静默：必须在空闲判据内失败（好让上层立刻重试），
+    /// 而不是一直挂到整请求超时。
+    ///
+    /// 这里起一个只说半句就闭嘴的本地 SSE 服务，跑的是真正的 `read_model_payload`。
+    /// 线上 2026-09-15 19:27 / 19:28 那两次 `error decoding response body` 就是这个形态：
+    /// 响应头回来了、正文一个字节都不再发，白等满 60 秒才重试。
+    #[test]
+    fn a_silent_upstream_is_cut_off_by_the_stream_idle_timeout() {
+        use kovi::tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let listener = kovi::tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("bind stub upstream");
+                let addr = listener.local_addr().expect("stub upstream address");
+                let stub = kovi::tokio::spawn(async move {
+                    let Ok((mut socket, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let mut buffer = [0_u8; 4096];
+                    let _ = socket.read(&mut buffer).await;
+                    // SSE 响应头 + 一个 delta，然后**一个字节都不再发**。
+                    let mut response = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+                    let event = "data: {\"choices\":[{\"delta\":{\"content\":\"好\"}}]}\n\n";
+                    response.extend_from_slice(format!("{:x}\r\n{event}\r\n", event.len()).as_bytes());
+                    let _ = socket.write_all(&response).await;
+                    let _ = socket.flush().await;
+                    // 比任何合理的判据都长：只有我们的空闲判据能结束这次等待。
+                    kovi::tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                });
+
+                let response = MODEL_CLIENT
+                    .get(format!("http://{addr}/v1/chat/completions"))
+                    .send()
+                    .await
+                    .expect("stub upstream should answer");
+                let started = std::time::Instant::now();
+                // `ModelPayload` 没有 `Debug`，所以用 match 取错误，不用 `expect_err`。
+                let error = match read_model_payload(
+                    response,
+                    None,
+                    64 * 1024,
+                    std::time::Duration::from_millis(300),
+                )
+                .await
+                {
+                    Err(error) => error,
+                    Ok(_) => panic!("上游静默时必须报错，而不是拿半个响应当成功"),
+                };
+                assert!(error.contains("空闲"), "错误应当说明是空闲超时：{error}");
+                assert!(
+                    started.elapsed() < std::time::Duration::from_secs(10),
+                    "必须在空闲判据内尽快失败，而不是等整请求超时"
+                );
+                stub.abort();
+            });
+    }
 
     /// 真机探针：**配置里的那个模型到底会不会用 `reply_action` 工具。**
     ///
