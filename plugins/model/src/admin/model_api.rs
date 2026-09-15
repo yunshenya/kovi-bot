@@ -86,11 +86,13 @@ fn current_model_json(server: &ServerConfig) -> Value {
     })
 }
 
-/// 档案列表。`active` 由后端一处判定（[`ModelProfile::is_live`]），页面只负责照着
+/// 档案列表。`active` 由后端一处判定（[`ProfilesFile::is_live`]），页面只负责照着
 /// 显示与禁用删除，不再自己重算一遍"地址 + 模型名"那个口径。
 fn profiles_json(server: &ServerConfig) -> Result<Value, ApiError> {
-    let profiles = model_profiles::list()?;
-    let items: Vec<Value> = profiles
+    // 读一次文件：列表与"哪套正在用"必须来自同一份快照。
+    let file = model_profiles::load()?;
+    let items: Vec<Value> = file
+        .profiles()
         .iter()
         .map(|profile| {
             json!({
@@ -104,7 +106,7 @@ fn profiles_json(server: &ServerConfig) -> Result<Value, ApiError> {
                 "requires_auth": profile.requires_auth,
                 "max_output_tokens": profile.max_output_tokens,
                 "has_key": !profile.api_key.trim().is_empty(),
-                "active": profile.is_live(server),
+                "active": file.is_live(&profile.id, server),
             })
         })
         .collect();
@@ -193,6 +195,15 @@ fn settings_from_request(request: &ModelRequest) -> Result<ModelProfile, ApiErro
     Ok(profile)
 }
 
+/// 这次应用对应的是哪一套档案。
+///
+/// 新存下来的那套优先（"存成档案"与"编辑档案"都会走它）；其次是只报 `profile_id`
+/// 的切换。两个都没有 = 直接填表应用，返回 `None`：那时「正在用」退回保守口径，
+/// 而不是拿上一次的记录去猜。
+fn applied_id_for(request: &ModelRequest, saved: Option<String>) -> Option<String> {
+    saved.or_else(|| request.profile_id.clone())
+}
+
 /// `POST /api/model/apply`：把一套设置写进配置并立刻生效。
 pub(crate) async fn apply(
     State(state): State<Arc<AdminState>>,
@@ -225,6 +236,17 @@ pub(crate) async fn apply(
         }
         None => None,
     };
+
+    // 记下"现在跑的是哪一套档案"：地址与模型名完全相同的副本有好几套时，就靠它指出
+    // 真正在跑的那个（判定见 `ProfilesFile::is_live`）。写失败要说清设置已经生效，
+    // 否则页面会以为整次切换都失败了。
+    let applied = applied_id_for(&request, saved.clone());
+    if let Err(error) = model_profiles::mark_applied(applied.as_deref()) {
+        return Err(ApiError::internal(format!(
+            "模型设置已经切过去了，但没能记下「正在用的是哪一套」：{}",
+            error.message
+        )));
+    }
 
     println!(
         "[INFO] 模型设置已应用: {} (changed={:?})",
@@ -750,9 +772,15 @@ mod tests {
                 "状态接口绝不能回显密钥: {state}"
             );
             // 每套档案都带一个布尔 active：页面照着它标「正在用」、灰掉删除按钮。
-            for item in state["profiles"]["items"].as_array().expect("档案列表") {
+            // 且至多一套算「正在用」——复制出来的副本不该一起被标上、一起删不掉。
+            let items = state["profiles"]["items"].as_array().expect("档案列表");
+            for item in items {
                 assert!(item["active"].is_boolean(), "每套档案都要有 active: {item}");
             }
+            assert!(
+                items.iter().filter(|item| item["active"] == true).count() <= 1,
+                "至多一套算正在用: {state}"
+            );
 
             // 删不存在的档案：404，而不是"假装删成功"。id 里带下划线，`slug()` 生成的
             // id 只可能是小写字母数字与短横线，所以这个名字不可能是本机真有的档案
@@ -820,6 +848,32 @@ mod tests {
 
             server.abort();
         });
+    }
+
+    /// 换完模型要记下"跑的是哪一套档案"：新存的那套优先（存成档案 / 编辑档案都会走它），
+    /// 其次是被应用的那套（只报 `profile_id` 的切换）；两个都没有时返回 `None`——
+    /// 判定退回保守口径，而不是拿上一次的记录去猜。
+    #[test]
+    fn the_applied_record_follows_the_profile_this_request_used() {
+        let request = ModelRequest {
+            profile_id: Some("deepseek".to_string()),
+            ..ModelRequest::default()
+        };
+        assert_eq!(
+            applied_id_for(&request, Some("fresh".to_string())),
+            Some("fresh".to_string()),
+            "新存下来的那套优先"
+        );
+        assert_eq!(
+            applied_id_for(&request, None),
+            Some("deepseek".to_string()),
+            "只是切过去时记的就是被切的那套"
+        );
+        assert_eq!(
+            applied_id_for(&ModelRequest::default(), None),
+            None,
+            "直接填表应用没有对应的档案"
+        );
     }
 
     /// 表单里的密钥三种写法都要落到"不改"，否则页面一保存就把真密钥抹成空。

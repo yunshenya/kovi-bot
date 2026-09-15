@@ -8,8 +8,11 @@
 //! 文件是 `runtime/model_profiles.toml`，**0600**：里面存着各家的 API Key。它不出现在
 //! 配置页的编辑器里（那是受管配置文件的地盘），只能通过模型页读写。
 //!
-//! 「正在用」的判定只写在这里一处（[`ModelProfile::is_live`]）：页面上的标记、卡片
+//! 「正在用」的判定只写在这里一处（[`ProfilesFile::is_live`]）：页面上的标记、卡片
 //! 的删除按钮与删除接口的拦截共用同一份口径，免得三处各判一次、说法还不一样。
+//! 文件里另外记着"最后应用过哪套"（`applied_profile_id`），用来在两套档案的地址与
+//! 模型名一模一样时指出真正在跑的是哪一个；这份记录不参与"这套端点是谁"的判断，
+//! 因此它过期或缺失只会让判定退回保守口径，不会让正在跑的那套变得可删。
 
 use super::ApiError;
 use super::config_api::write_atomically_private;
@@ -62,10 +65,56 @@ fn default_true() -> bool {
     true
 }
 
+/// 档案文件的内容：**档案列表** + **最后应用过哪套**。
+///
+/// 后者只服务一件事：好几套档案的地址与模型名完全一样时（从当前配置"再存一套"
+/// 就会造出这种副本），指出真正在跑的是哪一个。
 #[derive(Debug, Default, Serialize, Deserialize)]
-struct ProfilesFile {
+pub(crate) struct ProfilesFile {
+    /// 最后一次从模型页应用的那套档案 id；`None` = 不知道（还没换过，或这次应用
+    /// 没走档案）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    applied_profile_id: Option<String>,
     #[serde(default)]
     profiles: Vec<ModelProfile>,
+}
+
+impl ProfilesFile {
+    pub(crate) fn profiles(&self) -> &[ModelProfile] {
+        &self.profiles
+    }
+
+    /// 某一套档案是不是"正在用"。
+    ///
+    /// 两步：
+    /// 1. **候选** = 外部模型已启用、且地址与模型名跟当前 `[server_config]` 一致的那些
+    ///    （见 [`ModelProfile::matches_endpoint`]）；
+    /// 2. 候选里如果有一个正是「最后应用过的那套」，那只有它算；否则——没有记录、或记录
+    ///    已经对不上（比如配置被人手工改到了别处）——**所有候选都算**。
+    ///
+    /// 第 2 步的兜底是有意的：宁可同时保护两套一模一样的档案，也不能因为一份过期的
+    /// 记录，把真正在跑的那套判成"没在用"而放行删除。
+    pub(crate) fn is_live(&self, id: &str, server: &ServerConfig) -> bool {
+        let matches = |profile: &ModelProfile| profile.matches_endpoint(server);
+        if !self
+            .profiles
+            .iter()
+            .any(|profile| profile.id == id && matches(profile))
+        {
+            return false;
+        }
+        match self.applied_profile_id.as_deref() {
+            Some(applied)
+                if self
+                    .profiles
+                    .iter()
+                    .any(|profile| profile.id == applied && matches(profile)) =>
+            {
+                id == applied
+            }
+            _ => true,
+        }
+    }
 }
 
 /// 当前生效端点的身份：`(地址, 模型名)`，地址已归一化。
@@ -89,16 +138,18 @@ fn normalize_url(url: &str) -> &str {
 }
 
 impl ModelProfile {
-    /// 这套档案是不是"正在生效的那一套"。
+    /// 这套档案描述的端点，是不是配置里当前生效的那个。
     ///
-    /// 口径是**外部模型已启用 + 地址与模型名跟当前 `[server_config]` 一致**，与页面
-    /// 上那枚「正在用」标记、删除接口的拦截完全同一份。只看这两个字段是有意的：它们是
+    /// 只看**外部模型已启用 + 地址与模型名一致**。只看这两个字段是有意的：它们是
     /// "这套端点是谁"的身份，而密钥、输出上限、协议都是能就地改的可变量——把它们一起
-    /// 比，改过一把密钥之后当前端点就会被判成"另一套"，于是正在用的那套反而变得可删。
+    /// 比，改过一把密钥之后当前端点就会被判成"另一套"，判定整个失真。
     ///
     /// 地址比较前去掉首尾空白与尾部斜杠：`https://x/v1` 与 `https://x/v1/` 拼出来的
     /// 是同一个请求地址，不该因为一个斜杠就当成两套端点。
-    pub(crate) fn is_live(&self, server: &ServerConfig) -> bool {
+    ///
+    /// 命中只说明它是"候选"：复制出来的副本会一起命中，到底哪一套在跑由
+    /// [`ProfilesFile::is_live`] 定。
+    fn matches_endpoint(&self, server: &ServerConfig) -> bool {
         let Some((url, model_name)) = live_identity(server) else {
             return false;
         };
@@ -158,16 +209,23 @@ pub(crate) fn profiles_path() -> PathBuf {
     config::runtime_dir().join(PROFILES_FILE)
 }
 
-/// 读全部档案。文件不存在算"还没有档案"；解析失败如实报错，不静默丢掉。
-pub(crate) fn list() -> Result<Vec<ModelProfile>, ApiError> {
-    list_at(&profiles_path())
+/// 读整个档案文件：档案列表 + "最后应用过哪套"。
+///
+/// 判定「正在用」要同时看这两样，所以一次读盘拿一份完整快照——分开读两次的话，
+/// 中间被改掉就会让页面上的标记与删除闸门各说各话。
+pub(crate) fn load() -> Result<ProfilesFile, ApiError> {
+    load_at(&profiles_path())
 }
 
-/// [`list`] 的显式路径版本：测试直接驱动一个临时文件，不碰进程级运行时目录。
-pub(crate) fn list_at(path: &std::path::Path) -> Result<Vec<ModelProfile>, ApiError> {
+/// [`load`] 的显式路径版本：测试直接驱动一个临时文件，不碰进程级运行时目录。
+///
+/// 文件不存在算"还没有档案"；解析失败如实报错，不静默丢掉。
+pub(crate) fn load_at(path: &std::path::Path) -> Result<ProfilesFile, ApiError> {
     let raw = match std::fs::read_to_string(path) {
         Ok(raw) => raw,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ProfilesFile::default());
+        }
         Err(error) => {
             return Err(ApiError::internal(format!(
                 "读取模型档案失败 ({}): {error}",
@@ -175,21 +233,47 @@ pub(crate) fn list_at(path: &std::path::Path) -> Result<Vec<ModelProfile>, ApiEr
             )));
         }
     };
-    let parsed: ProfilesFile = kovi::toml::from_str(&raw)
-        .map_err(|error| ApiError::bad_request(format!("模型档案不是合法 TOML: {error}")))?;
-    Ok(parsed.profiles)
+    kovi::toml::from_str(&raw)
+        .map_err(|error| ApiError::bad_request(format!("模型档案不是合法 TOML: {error}")))
 }
 
-fn save_at(path: &std::path::Path, profiles: &[ModelProfile]) -> Result<(), ApiError> {
-    let file = ProfilesFile {
-        profiles: profiles.to_vec(),
-    };
-    let text = kovi::toml::to_string_pretty(&file)
+/// 读全部档案。
+pub(crate) fn list() -> Result<Vec<ModelProfile>, ApiError> {
+    list_at(&profiles_path())
+}
+
+/// [`list`] 的显式路径版本。
+pub(crate) fn list_at(path: &std::path::Path) -> Result<Vec<ModelProfile>, ApiError> {
+    Ok(load_at(path)?.profiles)
+}
+
+fn write_at(path: &std::path::Path, file: &ProfilesFile) -> Result<(), ApiError> {
+    let text = kovi::toml::to_string_pretty(file)
         .map_err(|error| ApiError::internal(format!("序列化模型档案失败: {error}")))?;
     // 0600：这里面有 API Key。
     write_atomically_private(path, &text).map_err(|error| {
         ApiError::internal(format!("写入模型档案失败 ({}): {error}", path.display()))
     })
+}
+
+/// 记下"刚刚应用的是哪一套档案"。
+///
+/// 换模型时写：它是两套档案的地址与模型名一模一样时，唯一能指出谁在跑的线索。
+/// 传 `None` 表示"这次应用没走档案"，把记录清掉——判定会退回保守口径（见
+/// [`ProfilesFile::is_live`]），不会因为一条陈旧记录就少保护一套。
+pub(crate) fn mark_applied(id: Option<&str>) -> Result<(), ApiError> {
+    mark_applied_at(&profiles_path(), id)
+}
+
+/// [`mark_applied`] 的显式路径版本。
+pub(crate) fn mark_applied_at(path: &std::path::Path, id: Option<&str>) -> Result<(), ApiError> {
+    let mut file = load_at(path)?;
+    if file.applied_profile_id.as_deref() == id {
+        // 没变就不写盘：省一次文件重写（以及随之而来的 mtime 变化）。
+        return Ok(());
+    }
+    file.applied_profile_id = id.map(str::to_string);
+    write_at(path, &file)
 }
 
 /// 新增或按 id 覆盖一套档案，返回它的 id。
@@ -209,16 +293,16 @@ pub(crate) fn upsert_at(
         return Err(ApiError::bad_request("档案名不能为空"));
     }
     profile.label = profile.label.trim().to_string();
-    let mut profiles = list_at(path)?;
+    let mut file = load_at(path)?;
     if profile.id.trim().is_empty() {
-        profile.id = unique_id(&profiles, &profile.label);
-        profiles.push(profile.clone());
-    } else if let Some(slot) = profiles.iter_mut().find(|item| item.id == profile.id) {
+        profile.id = unique_id(&file.profiles, &profile.label);
+        file.profiles.push(profile.clone());
+    } else if let Some(slot) = file.profiles.iter_mut().find(|item| item.id == profile.id) {
         *slot = profile.clone();
     } else {
-        profiles.push(profile.clone());
+        file.profiles.push(profile.clone());
     }
-    save_at(path, &profiles)?;
+    write_at(path, &file)?;
     Ok(profile.id)
 }
 
@@ -237,18 +321,23 @@ pub(crate) fn remove_at(
     id: &str,
     server: &ServerConfig,
 ) -> Result<(), ApiError> {
-    let mut profiles = list_at(path)?;
-    let Some(profile) = profiles.iter().find(|profile| profile.id == id) else {
+    let mut file = load_at(path)?;
+    let Some(profile) = file.profiles.iter().find(|profile| profile.id == id) else {
         return Err(ApiError::not_found(format!("找不到模型档案: {id}")));
     };
-    if profile.is_live(server) {
+    if file.is_live(id, server) {
         return Err(ApiError::conflict(format!(
             "「{}」正在用（{} / {}），不能删。先切到另一套档案，或在配置页关掉外部模型，再回来删。",
             profile.label, profile.model_name, profile.url
         )));
     }
-    profiles.retain(|profile| profile.id != id);
-    save_at(path, &profiles)
+    // 删掉的正是记录里那套（它已经不在跑了，记录是旧的）时顺手清掉记录，
+    // 免得留一个指向不存在档案的 id。
+    if file.applied_profile_id.as_deref() == Some(id) {
+        file.applied_profile_id = None;
+    }
+    file.profiles.retain(|profile| profile.id != id);
+    write_at(path, &file)
 }
 
 /// 按 id 找一套档案。
@@ -342,12 +431,12 @@ mod tests {
         }
     }
 
-    /// 判定「正在用」：外部模型已启用 + 地址与模型名一致。
+    /// 判定「正在用」的候选口径：外部模型已启用 + 地址与模型名一致。
     ///
     /// 这份规则同时管着页面上的标记与删除闸门，所以把边界一次写清楚：尾部斜杠、
     /// 首尾空白算同一套；换地址、换模型名、空模型名、外部模型关掉，都不算。
     #[test]
-    fn only_the_enabled_endpoint_with_the_same_url_and_model_is_live() {
+    fn only_the_enabled_endpoint_with_the_same_url_and_model_is_a_candidate() {
         let server = test_server(true, "https://api.deepseek.com/v1", "deepseek-v4-flash");
         let mut candidate = profile_at(
             "deepseek",
@@ -355,17 +444,17 @@ mod tests {
             "https://api.deepseek.com/v1",
             "deepseek-v4-flash",
         );
-        assert!(candidate.is_live(&server));
+        assert!(candidate.matches_endpoint(&server));
 
-        // 一个斜杠、一点空白，拼出来的是同一个请求地址：仍算"正在用"。
+        // 一个斜杠、一点空白，拼出来的是同一个请求地址：仍算同一套端点。
         candidate.url = "https://api.deepseek.com/v1/ ".to_string();
         assert!(
-            candidate.is_live(&server),
+            candidate.matches_endpoint(&server),
             "尾部斜杠与空白不该把它判成另一套"
         );
         candidate.url = "https://api.deepseek.com/v1".to_string();
         candidate.model_name = " deepseek-v4-flash ".to_string();
-        assert!(candidate.is_live(&server));
+        assert!(candidate.matches_endpoint(&server));
         candidate.model_name = "deepseek-v4-flash".to_string();
 
         // 密钥、输出上限、协议都是能就地改的可变量：改了它还是同一个端点。
@@ -373,7 +462,7 @@ mod tests {
         candidate.max_output_tokens = 800;
         candidate.wire_api = "responses".to_string();
         assert!(
-            candidate.is_live(&server),
+            candidate.matches_endpoint(&server),
             "可变量不该让正在用的那套变成另一套（否则它反而变得可删）"
         );
 
@@ -384,20 +473,145 @@ mod tests {
             "https://api.deepseek.com/v2",
             "deepseek-v4-flash",
         );
-        assert!(!other.is_live(&server));
+        assert!(!other.matches_endpoint(&server));
         other.url = "https://api.deepseek.com/v1".to_string();
         other.model_name = "deepseek-v3".to_string();
-        assert!(!other.is_live(&server));
+        assert!(!other.matches_endpoint(&server));
         other.model_name = String::new();
-        assert!(!other.is_live(&server), "没有模型名的档案不该冒充当前那套");
+        assert!(
+            !other.matches_endpoint(&server),
+            "没有模型名的档案不该冒充当前那套"
+        );
 
         // 外部模型关掉（或配置里模型名是空的）时她只用本地能力，谁也不在跑。
-        assert!(!candidate.is_live(&test_server(
+        assert!(!candidate.matches_endpoint(&test_server(
             false,
             "https://api.deepseek.com/v1",
             "deepseek-v4-flash"
         )));
-        assert!(!candidate.is_live(&test_server(true, "https://api.deepseek.com/v1", "")));
+        assert!(!candidate.matches_endpoint(&test_server(true, "https://api.deepseek.com/v1", "")));
+    }
+
+    /// 复制出来的副本（地址与模型名一模一样）里，只有**最后应用过的那一套**算「正在用」。
+    #[test]
+    fn a_duplicate_profile_is_not_live_when_another_copy_was_the_one_applied() {
+        let server = test_server(true, "https://api.deepseek.com/v1", "deepseek-v4-flash");
+        let original = profile_at(
+            "deepseek",
+            "DeepSeek 主力",
+            "https://api.deepseek.com/v1",
+            "deepseek-v4-flash",
+        );
+        // 副本：只是另存了一套同名端点，密钥不同。
+        let mut copy = profile_at(
+            "deepseek-2",
+            "DeepSeek 备用",
+            "https://api.deepseek.com/v1",
+            "deepseek-v4-flash",
+        );
+        copy.api_key = "sk-backup".to_string();
+
+        let mut file = super::ProfilesFile {
+            applied_profile_id: Some("deepseek".to_string()),
+            profiles: vec![original.clone(), copy.clone()],
+        };
+        assert!(file.is_live("deepseek", &server), "应用过的那套算");
+        assert!(
+            !file.is_live("deepseek-2", &server),
+            "同一份设置的副本不该一起被当成正在用"
+        );
+
+        // 记录指向的要是另一套（比如后来切到副本上了），判定跟着换人。
+        file.applied_profile_id = Some("deepseek-2".to_string());
+        assert!(!file.is_live("deepseek", &server));
+        assert!(file.is_live("deepseek-2", &server));
+
+        // 记录缺失、或已经对不上（配置被手工改到了别处）：退回保守口径——
+        // 候选全都算，宁可多保护一套，也不能放行删掉真正在跑的那套。
+        for stale in [None, Some("已经删掉的档案".to_string())] {
+            file.applied_profile_id = stale.clone();
+            assert!(
+                file.is_live("deepseek", &server) && file.is_live("deepseek-2", &server),
+                "记录是 {stale:?} 时两套都得保护"
+            );
+        }
+        // 记录指向一套地址已经不同的档案，同样失效。
+        file.applied_profile_id = Some("other".to_string());
+        file.profiles.push(profile_at(
+            "other",
+            "别的",
+            "https://api.deepseek.com/v2",
+            "deepseek-v4-flash",
+        ));
+        assert!(file.is_live("deepseek", &server) && file.is_live("deepseek-2", &server));
+        assert!(
+            !file.is_live("other", &server),
+            "地址对不上的那套本来就不在跑，不该因为记录里写着它就算"
+        );
+    }
+
+    /// 「最后应用过哪套」的记账：换模型时写，值没变就不动文件；删除时顺手清掉。
+    #[test]
+    fn the_applied_record_round_trips_and_is_cleared_on_removal() {
+        let dir = temp_dir("applied-record");
+        let path = dir.join(PROFILES_FILE);
+        let server = test_server(true, "https://api.deepseek.com/v1", "deepseek-v4-flash");
+        let live_id = super::upsert_at(
+            &path,
+            profile_at(
+                "",
+                "DeepSeek 主力",
+                "https://api.deepseek.com/v1",
+                "deepseek-v4-flash",
+            ),
+        )
+        .expect("应能存下档案");
+        let stale_id = super::upsert_at(
+            &path,
+            profile_at("", "别的", "https://api.example.com/v1", "example-model"),
+        )
+        .expect("应能存下另一套");
+
+        // 记在同一个文件里：不新开一个状态文件，少一份要同步的东西。
+        super::mark_applied_at(&path, Some(&live_id)).expect("应能记账");
+        let file = super::load_at(&path).expect("应能读回");
+        assert_eq!(file.applied_profile_id.as_deref(), Some(live_id.as_str()));
+        assert_eq!(file.profiles().len(), 2, "记账不能把档案弄丢");
+        assert!(file.is_live(&live_id, &server));
+        assert!(!file.is_live(&stale_id, &server));
+
+        // 没有变化就不重写文件（否则每点一次切换都要改一次盘的 mtime）。
+        let stamp = std::fs::metadata(&path)
+            .expect("metadata")
+            .modified()
+            .expect("mtime");
+        super::mark_applied_at(&path, Some(&live_id)).expect("应能记账");
+        assert_eq!(
+            std::fs::metadata(&path)
+                .expect("metadata")
+                .modified()
+                .expect("mtime"),
+            stamp,
+            "值没变就不该写盘"
+        );
+
+        // 删掉记录里那套（此时它已经不在跑了）：记录跟着清掉，不留一个指向空档案的 id。
+        super::remove_at(&path, &live_id, &test_server(false, "", "")).expect("禁用后应能删");
+        assert_eq!(
+            super::load_at(&path).expect("应能读回").applied_profile_id,
+            None
+        );
+
+        // 老文件（没有这个字段）照常能读，判定走保守口径。
+        std::fs::write(
+            &path,
+            "[[profiles]]\nid = \"legacy\"\nlabel = \"老档案\"\nurl = \"https://api.deepseek.com/v1\"\nmodel_name = \"deepseek-v4-flash\"\n",
+        )
+        .expect("应能写老格式");
+        let legacy = super::load_at(&path).expect("老格式必须能读");
+        assert_eq!(legacy.applied_profile_id, None);
+        assert!(legacy.is_live("legacy", &server));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 正在用的那套删不掉：接口回 409，磁盘上那套必须原样还在。
@@ -444,6 +658,47 @@ mod tests {
         assert!(super::list_at(&path).expect("应能读取").is_empty());
         let missing = super::remove_at(&path, &backup_id, &server).expect_err("再删应报找不到");
         assert_eq!(missing.status, StatusCode::NOT_FOUND, "{missing:?}");
+        let _ = std::fs::remove_dir_all(path.parent().expect("临时目录"));
+    }
+
+    /// 复制出来的副本删得掉：真正在跑的是被应用过的那套，副本只是同一份设置的另存。
+    #[test]
+    fn only_the_applied_copy_is_protected_from_removal() {
+        let path = temp_dir("remove-duplicate").join(PROFILES_FILE);
+        let server = test_server(true, "https://api.deepseek.com/v1", "deepseek-v4-flash");
+        let applied = super::upsert_at(
+            &path,
+            profile_at(
+                "",
+                "DeepSeek 主力",
+                "https://api.deepseek.com/v1",
+                "deepseek-v4-flash",
+            ),
+        )
+        .expect("应能存下正在用的那套");
+        let duplicate = super::upsert_at(
+            &path,
+            profile_at(
+                "",
+                "DeepSeek 主力 副本",
+                "https://api.deepseek.com/v1",
+                "deepseek-v4-flash",
+            ),
+        )
+        .expect("应能存下副本");
+        super::mark_applied_at(&path, Some(&applied)).expect("应能记账");
+
+        // 两套的设置一模一样，闸门只拦被应用过的那套。
+        let error =
+            super::remove_at(&path, &applied, &server).expect_err("被应用过的那套必须删不掉");
+        assert_eq!(error.status, StatusCode::CONFLICT, "{error:?}");
+        super::remove_at(&path, &duplicate, &server).expect("副本应能删");
+        assert_eq!(super::list_at(&path).expect("应能读取").len(), 1);
+
+        // 记录没了（还没换过模型 / 这次应用没走档案）就退回保守口径：剩下的那套照样删不掉。
+        super::mark_applied_at(&path, None).expect("应能清掉记录");
+        let error = super::remove_at(&path, &applied, &server).expect_err("保守口径下仍要拦住");
+        assert_eq!(error.status, StatusCode::CONFLICT, "{error:?}");
         let _ = std::fs::remove_dir_all(path.parent().expect("临时目录"));
     }
 
