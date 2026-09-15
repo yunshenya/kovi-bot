@@ -146,6 +146,44 @@ impl Hypothesis {
         Ok(hypothesis)
     }
 
+    /// 从持久化状态重建（与 `Situation::restore` / `SocialSceneState::restore`
+    /// 同一形状）。
+    ///
+    /// 少了它，装载方只能用 `new` + `add_evidence` 拼：`status` 一律回到 Active、
+    /// `updated_at` 一律回到 `created_at`、`version` 一律回到 1。已经判定过
+    /// （Supported / Refuted）的假设重启后会被当成"还在观察"，而基于 `updated_at`
+    /// 的 `freshness_at` 随之偏移——它同时喂着 `prune_expired` 与快照的新鲜度分级。
+    #[allow(clippy::too_many_arguments)]
+    pub fn restore(
+        id: super::HypothesisId,
+        proposition: WorldProposition,
+        scope: WorldScope,
+        confidence: f32,
+        evidence_for: Vec<ObservationId>,
+        evidence_against: Vec<ObservationId>,
+        status: HypothesisStatus,
+        created_at: DateTime<Utc>,
+        updated_at: DateTime<Utc>,
+        expires_at: Option<DateTime<Utc>>,
+        version: u64,
+    ) -> Result<Self, WorldValidationError> {
+        let hypothesis = Self {
+            id,
+            proposition,
+            scope,
+            confidence: clamp_unit(confidence),
+            evidence_for,
+            evidence_against,
+            status,
+            created_at,
+            updated_at,
+            expires_at,
+            version,
+        };
+        hypothesis.validate()?;
+        Ok(hypothesis)
+    }
+
     pub fn validate(&self) -> Result<(), WorldValidationError> {
         self.proposition.validate()?;
         validate_unit(self.confidence, "hypothesis confidence")?;

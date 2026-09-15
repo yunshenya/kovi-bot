@@ -478,7 +478,11 @@ impl PostgresWorldModelStore {
             let proposition = yunxi_core::world_model::WorldProposition::new(
                 row.try_get::<String, _>("proposition_text")?,
             )?;
-            let mut hypothesis = Hypothesis::new(
+            // `restore` 而不是 `new` + `add_evidence`：后者会把 status 重置成
+            // Active、updated_at 拉回 created_at、version 归 1——已经判定过的
+            // 假设重启后会被当成"还在观察"，而基于 updated_at 的 freshness 分级
+            // （喂着 prune_expired 与快照）也随之偏移。库里这三列本来就存着。
+            hypotheses.push(Hypothesis::restore(
                 yunxi_core::HypothesisId::from_uuid(row.try_get("id")?),
                 proposition,
                 decode_scope(
@@ -486,22 +490,16 @@ impl PostgresWorldModelStore {
                     row.try_get::<Option<uuid::Uuid>, _>("scope_id")?,
                 )?,
                 row.try_get::<f32, _>("confidence")?,
-                row.try_get("created_at")?,
-                row.try_get("expires_at")?,
-            )?;
-            let evidence_for: Vec<yunxi_core::ObservationId> =
                 serde_json::from_value(row.try_get("evidence_for")?)
-                    .map_err(json_error("evidence_for"))?;
-            let evidence_against: Vec<yunxi_core::ObservationId> =
+                    .map_err(json_error("evidence_for"))?,
                 serde_json::from_value(row.try_get("evidence_against")?)
-                    .map_err(json_error("evidence_against"))?;
-            for id in evidence_for {
-                hypothesis.add_evidence(id, true, hypothesis.updated_at())?;
-            }
-            for id in evidence_against {
-                hypothesis.add_evidence(id, false, hypothesis.updated_at())?;
-            }
-            hypotheses.push(hypothesis);
+                    .map_err(json_error("evidence_against"))?,
+                decode_hypothesis_status(row.try_get::<String, _>("status")?.as_str()),
+                row.try_get("created_at")?,
+                row.try_get("updated_at")?,
+                row.try_get("expires_at")?,
+                row.try_get::<i64, _>("version")? as u64,
+            )?);
         }
         let mut scenes = Vec::new();
         let rows = query("SELECT * FROM yunxi_world_scenes")
@@ -865,6 +863,19 @@ fn hypothesis_status_label(status: HypothesisStatus) -> &'static str {
     }
 }
 
+/// 与 [`hypothesis_status_label`] 成对：装载路径要按库里那个字符串还原状态，
+/// 而不是一律当 Active（那会让已经判定过的假设在重启后"复活"）。
+fn decode_hypothesis_status(label: &str) -> HypothesisStatus {
+    match label {
+        "active" => HypothesisStatus::Active,
+        "supported" => HypothesisStatus::Supported,
+        "rejected" => HypothesisStatus::Rejected,
+        "superseded" => HypothesisStatus::Superseded,
+        "expired" => HypothesisStatus::Expired,
+        _ => HypothesisStatus::Unknown,
+    }
+}
+
 fn scene_kind_label(kind: SocialSceneKind) -> &'static str {
     match kind {
         SocialSceneKind::DirectConversation => "direct_conversation",
@@ -1100,6 +1111,88 @@ mod tests {
             });
     }
 
+    /// 假设的 `status` / `updated_at` / `version` 必须真的读回来。
+    ///
+    /// 装载路径此前用 `new` + `add_evidence` 重建：三列全部归零回到初始状态，
+    /// 于是已经判定过（Supported / Refuted）的假设重启后"复活"成还在观察，
+    /// 基于 `updated_at` 的 freshness 分级（喂着 prune_expired 与快照）也跟着偏移。
+    #[test]
+    #[ignore = "requires PostgreSQL via DATABASE_URL"]
+    fn postgres_hypothesis_status_and_version_survive_a_reload() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let database_url = std::env::var("DATABASE_URL").expect("需要 DATABASE_URL");
+                let pool = sqlx_postgres::PgPoolOptions::new()
+                    .max_connections(4)
+                    .connect(&database_url)
+                    .await
+                    .expect("应连接 PostgreSQL");
+                let store = PostgresWorldModelStore::new(pool.clone());
+                store
+                    .initialize_schema()
+                    .await
+                    .expect("应初始化 world schema");
+
+                let now = chrono::Utc::now();
+                let observed_at = now - chrono::Duration::hours(2);
+                let mut world = WorldModel::new();
+                let mut hypothesis = Hypothesis::new(
+                    yunxi_core::HypothesisId::new(),
+                    yunxi_core::world_model::WorldProposition::new("重启后仍应记得已经判定过")
+                        .expect("命题"),
+                    WorldScope::Person {
+                        person_id: PersonId::new(),
+                    },
+                    0.6,
+                    observed_at,
+                    None,
+                )
+                .expect("假设");
+                // 判定成 Supported 需要至少一条支持证据（validate 会拦）。
+                hypothesis
+                    .add_evidence(yunxi_core::ObservationId::new(), true, now)
+                    .expect("证据");
+                hypothesis
+                    .resolve(HypothesisStatus::Supported, now)
+                    .expect("判定");
+                world
+                    .upsert_hypothesis(hypothesis.clone())
+                    .expect("写入世界");
+                store.save_world(&world).await.expect("持久化");
+
+                let reloaded = store
+                    .load_world()
+                    .await
+                    .expect("应能装载")
+                    .expect("应有持久化状态");
+                let stored = reloaded
+                    .hypotheses()
+                    .iter()
+                    .find(|candidate| candidate.id() == hypothesis.id())
+                    .expect("假设应当被装载回来");
+                assert_eq!(
+                    stored.status(),
+                    HypothesisStatus::Supported,
+                    "判定过的状态不该在重启后回到 Active"
+                );
+                assert_eq!(stored.version(), hypothesis.version(), "版本要读回来");
+                assert_eq!(
+                    stored.updated_at(),
+                    hypothesis.updated_at(),
+                    "updated_at 要读回来（freshness 分级用它）"
+                );
+                assert_eq!(stored.created_at(), hypothesis.created_at());
+                assert_eq!(stored.evidence_for(), hypothesis.evidence_for());
+
+                query("DELETE FROM yunxi_world_hypotheses WHERE id = $1")
+                    .bind(hypothesis.id().into_uuid())
+                    .execute(&pool)
+                    .await
+                    .expect("清理");
+            });
+    }
+
     #[test]
     fn scope_encoding_roundtrips() {
         let person = PersonId::new();
@@ -1202,20 +1295,9 @@ mod tests {
             HypothesisStatus::Unknown,
         ] {
             assert_eq!(
-                decode_hypothesis_status_for_test(hypothesis_status_label(status).to_owned()),
+                decode_hypothesis_status(hypothesis_status_label(status)),
                 status
             );
-        }
-    }
-
-    fn decode_hypothesis_status_for_test(label: String) -> HypothesisStatus {
-        match label.as_str() {
-            "active" => HypothesisStatus::Active,
-            "supported" => HypothesisStatus::Supported,
-            "rejected" => HypothesisStatus::Rejected,
-            "superseded" => HypothesisStatus::Superseded,
-            "expired" => HypothesisStatus::Expired,
-            _ => HypothesisStatus::Unknown,
         }
     }
 }
