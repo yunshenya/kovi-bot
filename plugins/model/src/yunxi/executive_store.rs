@@ -943,8 +943,15 @@ impl PostgresExecutiveStore {
             .await
             .map_err(ExecutivePersistenceError::storage)?;
         for (record, value, expires_at) in decision_values {
-            insert_decision_in_transaction(&mut transaction, record, &parts, value, expires_at)
-                .await?;
+            // 重放确认：`event_id` 上的唯一索引是这条路唯一的重放保护，但插入用的是
+            // `ON CONFLICT DO NOTHING`——返回值丢掉之后，同一事件第二次写入会"报成功
+            // 而库里没有新行"，保护形同虚设。按幂等语义收口：内容一致就当已经写过
+            // （重启后旧事件重投、两个消费者都属预期内），内容不一致才是真冲突。
+            if !insert_decision_in_transaction(&mut transaction, record, &parts, value, expires_at)
+                .await?
+            {
+                confirm_replayed_decision(&mut transaction, record).await?;
+            }
         }
 
         transaction
@@ -1453,8 +1460,15 @@ impl DecisionRecordPersistence for PostgresExecutiveStore {
                 .execute(&mut *transaction)
                 .await
                 .map_err(ExecutivePersistenceError::storage)?;
-            insert_decision_in_transaction(&mut transaction, record, &parts, value, expires_at)
-                .await?;
+            // 重放确认：`event_id` 上的唯一索引是这条路唯一的重放保护，但插入用的是
+            // `ON CONFLICT DO NOTHING`——返回值丢掉之后，同一事件第二次写入会"报成功
+            // 而库里没有新行"，保护形同虚设。按幂等语义收口：内容一致就当已经写过
+            // （重启后旧事件重投、两个消费者都属预期内），内容不一致才是真冲突。
+            if !insert_decision_in_transaction(&mut transaction, record, &parts, value, expires_at)
+                .await?
+            {
+                confirm_replayed_decision(&mut transaction, record).await?;
+            }
             transaction
                 .commit()
                 .await
@@ -1782,6 +1796,39 @@ async fn update_expectation_in_transaction(
     .await
     .map_err(ExecutivePersistenceError::storage)?;
     Ok(result.rows_affected() == 1)
+}
+
+/// 已经存在同一个 `event_id` 的记录时，确认它和这次要写的是同一条决策。
+///
+/// 一致 → 当作"已经写过"；不一致 → `Conflict`，因为这已经不是重放，而是同一个事件
+/// 被赋予了不同的决策。
+async fn confirm_replayed_decision(
+    transaction: &mut sqlx_core::transaction::Transaction<'_, Postgres>,
+    record: &DecisionRecord,
+) -> Result<(), ExecutivePersistenceError> {
+    let stored: Option<Value> =
+        query_scalar("SELECT record FROM yunxi_decision_records WHERE event_id = $1 LIMIT 1")
+            .bind(record.event_id.into_uuid())
+            .fetch_optional(&mut **transaction)
+            .await
+            .map_err(ExecutivePersistenceError::storage)?;
+    let Some(stored) = stored else {
+        // 没插进去、也查不到：唯一约束挡在了别处（例如主键冲突），不是重放。
+        return Err(ExecutivePersistenceError::Conflict);
+    };
+    let stored: DecisionRecord = decode_value(stored, MAX_DECISION_BYTES, "decision")?;
+    // 决策记录没有 scope 字段（按 scope_key 分列存放，同一 event_id 只可能有一条），
+    // 所以"同一条决策"的判据是 id、事件、结论与创建时刻都一致。
+    let same_decision = stored.id == record.id
+        && stored.event_id == record.event_id
+        && stored.disposition == record.disposition
+        && stored.selected_action == record.selected_action
+        && stored.selected_action_id == record.selected_action_id
+        && stored.created_at == record.created_at;
+    if same_decision {
+        return Ok(());
+    }
+    Err(ExecutivePersistenceError::Conflict)
 }
 
 async fn insert_decision_in_transaction(
@@ -2305,6 +2352,54 @@ mod tests {
             now,
         )
         .expect("fixture plan should be valid")
+    }
+
+    #[test]
+    #[ignore = "requires PostgreSQL via DATABASE_URL"]
+    fn replaying_a_decision_record_is_idempotent_and_changed_replays_conflict() {
+        // `event_id` 上的唯一索引是这条路唯一的重放保护，但插入用的是
+        // `ON CONFLICT DO NOTHING`：返回值丢掉之后，"同一事件第二次写入"会报成功而
+        // 库里没有新行——重放保护形同虚设。这里钉住收口后的语义。
+        database_test_support::block_on(async {
+            let database = TestDatabase::connect().await;
+            let store = PostgresExecutiveStore::new(database.pool.clone());
+            store
+                .initialize_schema()
+                .await
+                .expect("Executive migration should succeed");
+
+            let now = Utc::now();
+            let event_id = EventId::new();
+            let record = DecisionRecord::new(event_id, DecisionDisposition::Reply, now);
+            DecisionRecordPersistence::append(&store, &record)
+                .await
+                .expect("首次写入应成功");
+            // 同一事件重投、内容一致：幂等成功，库里仍然只有一条。
+            DecisionRecordPersistence::append(&store, &record)
+                .await
+                .expect("同一事件的重放应幂等成功");
+            let count: i64 =
+                query_scalar("SELECT count(*) FROM yunxi_decision_records WHERE event_id = $1")
+                    .bind(event_id.into_uuid())
+                    .fetch_one(&database.pool)
+                    .await
+                    .expect("should count decision rows");
+            assert_eq!(count, 1, "重放不该写出第二条记录");
+
+            // 同一事件、不同决策：这不是重放，必须报冲突而不是静默丢弃。
+            let changed = DecisionRecord::new(
+                event_id,
+                DecisionDisposition::Silent,
+                now + Duration::seconds(1),
+            );
+            assert!(
+                matches!(
+                    DecisionRecordPersistence::append(&store, &changed).await,
+                    Err(ExecutivePersistenceError::Conflict)
+                ),
+                "同一事件被赋予不同决策时必须冲突"
+            );
+        });
     }
 
     #[test]
