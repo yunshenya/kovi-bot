@@ -15,14 +15,18 @@
 use serde::{Deserialize, Serialize};
 
 use crate::arbiter::{ActionPortOutcome, ActionResult};
+use crate::executive::{ExpectationStatus, ExpectedEventPattern};
 use crate::intent::CognitiveIntent;
 
-/// Maximum number of recorded attempts kept per task.
+/// Maximum number of history entries kept per task — attempts and expectation
+/// results together.
 ///
 /// A trace is already capped at [`crate::MAX_TOOL_ACTIONS_PER_TRACE`] tool
 /// actions; this is the smaller, model-visible window, keeping the newest
 /// entries and dropping the oldest.
-pub const MAX_WORKING_ATTEMPTS: usize = 16;
+pub const MAX_WORKING_ENTRIES: usize = 16;
+/// The former name, kept while callers migrate.
+pub const MAX_WORKING_ATTEMPTS: usize = MAX_WORKING_ENTRIES;
 /// Maximum characters kept from a tool name.
 pub const MAX_WORKING_TOOL_NAME_CHARS: usize = 128;
 /// Maximum characters kept from the model's tool arguments.
@@ -31,6 +35,8 @@ pub const MAX_WORKING_ARGUMENT_CHARS: usize = 2_048;
 pub const MAX_WORKING_RESULT_CHARS: usize = 512;
 /// Maximum characters kept from a failure category.
 pub const MAX_WORKING_FAILURE_CHARS: usize = 256;
+/// Maximum characters kept from an expectation's description.
+pub const MAX_WORKING_EXPECTATION_CHARS: usize = 256;
 
 /// One recorded tool round inside a task.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -160,11 +166,98 @@ impl WorkingAttemptOutcome {
     }
 }
 
-/// What one task has tried so far.
+/// One thing that happened to a task, in the order it happened.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkingEntry {
+    /// Monotonic position within the task.
+    ///
+    /// Attempts and expectation results are recorded at different moments — an
+    /// expectation resolves while the event that resolved it is being observed,
+    /// which is *after* the round that produced it was dispatched — so the
+    /// order of insertion is not the order of history. Sorting by this field
+    /// restores it.
+    pub sequence: u64,
+    pub payload: WorkingEntryPayload,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WorkingEntryPayload {
+    /// A tool the task called, with its arguments and result.
+    Attempt(WorkingAttempt),
+    /// What an action's expectation turned out to be. This is the half of the
+    /// loop that raw events cannot express: an event says what happened, an
+    /// expectation result says whether what was supposed to happen did.
+    Observation(WorkingObservation),
+}
+
+/// How one expectation ended.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkingObservation {
+    /// What the task expected to happen, as a short readable phrase.
+    expected: String,
+    outcome: WorkingObservationOutcome,
+}
+
+impl WorkingObservation {
+    #[must_use]
+    pub fn new(expected: impl Into<String>, outcome: WorkingObservationOutcome) -> Self {
+        Self {
+            expected: bounded(&expected.into(), MAX_WORKING_EXPECTATION_CHARS),
+            outcome,
+        }
+    }
+
+    #[must_use]
+    pub fn expected(&self) -> &str {
+        &self.expected
+    }
+
+    #[must_use]
+    pub const fn outcome(&self) -> &WorkingObservationOutcome {
+        &self.outcome
+    }
+
+    /// A short description of how the expectation ended.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        match self.outcome {
+            WorkingObservationOutcome::Satisfied => {
+                format!("{}：如期发生", self.expected)
+            }
+            WorkingObservationOutcome::Expired => {
+                format!("{}：**没有发生**", self.expected)
+            }
+            WorkingObservationOutcome::Violated => {
+                format!("{}：被判定为没发生", self.expected)
+            }
+            WorkingObservationOutcome::Cancelled => {
+                format!("{}：已作废", self.expected)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkingObservationOutcome {
+    Satisfied,
+    Expired,
+    Violated,
+    Cancelled,
+}
+
+/// What one task has tried, and what came of it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlannerWorkingMemory {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    attempts: Vec<WorkingAttempt>,
+    entries: Vec<WorkingEntry>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    next_sequence: u64,
+}
+
+const fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 impl PlannerWorkingMemory {
@@ -173,36 +266,108 @@ impl PlannerWorkingMemory {
         Self::default()
     }
 
+    /// The task's history in order: attempts interleaved with what their
+    /// expectations turned out to be.
     #[must_use]
-    pub fn attempts(&self) -> &[WorkingAttempt] {
-        &self.attempts
+    pub fn entries(&self) -> &[WorkingEntry] {
+        &self.entries
+    }
+
+    /// The tool calls this task made, in order.
+    pub fn attempts(&self) -> impl Iterator<Item = &WorkingAttempt> {
+        self.entries
+            .iter()
+            .filter_map(|entry| match &entry.payload {
+                WorkingEntryPayload::Attempt(attempt) => Some(attempt),
+                WorkingEntryPayload::Observation(_) => None,
+            })
+    }
+
+    /// The expectation results this task learned, in order.
+    pub fn observations(&self) -> impl Iterator<Item = &WorkingObservation> {
+        self.entries
+            .iter()
+            .filter_map(|entry| match &entry.payload {
+                WorkingEntryPayload::Observation(observation) => Some(observation),
+                WorkingEntryPayload::Attempt(_) => None,
+            })
     }
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.attempts.is_empty()
+        self.entries.is_empty()
     }
 
     #[must_use]
     pub fn len(&self) -> usize {
-        self.attempts.len()
+        self.entries.len()
     }
 
-    /// Records one round's attempts, dropping the oldest when full.
-    ///
-    /// The newest attempts matter most: the model is deciding what to do
-    /// *next*, and a window that kept stale rounds while dropping the round it
-    /// just ran would hide the evidence it needs.
+    /// Records one round's tool attempts.
     pub fn record_round(&mut self, attempts: &[WorkingAttempt]) {
-        if attempts.is_empty() {
-            return;
-        }
         for attempt in attempts {
-            if self.attempts.len() >= MAX_WORKING_ATTEMPTS {
-                self.attempts.remove(0);
-            }
-            self.attempts.push(attempt.clone());
+            self.push(WorkingEntryPayload::Attempt(attempt.clone()));
         }
+    }
+
+    /// Records one resolved expectation.
+    pub fn record_observation(&mut self, observation: WorkingObservation) {
+        self.push(WorkingEntryPayload::Observation(observation));
+    }
+
+    /// Appends an entry, dropping the oldest when full.
+    ///
+    /// The newest entries matter most: the model is deciding what to do *next*,
+    /// and a window that kept stale rounds while dropping the round it just ran
+    /// would hide the evidence it needs.
+    fn push(&mut self, payload: WorkingEntryPayload) {
+        let sequence = self.next_sequence;
+        self.next_sequence = self.next_sequence.saturating_add(1);
+        self.entries.push(WorkingEntry { sequence, payload });
+        self.entries.sort_by_key(|entry| entry.sequence);
+        while self.entries.len() > MAX_WORKING_ATTEMPTS {
+            self.entries.remove(0);
+        }
+    }
+}
+
+/// Describes an expectation in the words a follow-up round needs.
+///
+/// The model has to decide what to do next from this line alone, so it says
+/// what was supposed to happen rather than naming an internal pattern.
+#[must_use]
+pub fn describe_expectation(pattern: &ExpectedEventPattern) -> String {
+    match pattern {
+        ExpectedEventPattern::EventType(event_type) => {
+            format!("接下来应当出现 {event_type:?} 事件")
+        }
+        ExpectedEventPattern::MessageContains(needle) => {
+            format!("接下来的消息里应当出现「{}」", bounded(needle, 120))
+        }
+        ExpectedEventPattern::ToolCompleted { operation } => {
+            format!("工具 `{operation}` 应当执行成功")
+        }
+        ExpectedEventPattern::ToolFailed { operation } => {
+            format!("工具 `{operation}` 应当失败")
+        }
+        ExpectedEventPattern::ActionSucceeded { idempotency_key } => {
+            format!("动作 `{}` 应当成功", bounded(idempotency_key, 120))
+        }
+        ExpectedEventPattern::Custom(value) => {
+            format!("应当发生「{}」", bounded(value, 120))
+        }
+    }
+}
+
+/// Maps a terminal expectation status onto a recorded observation.
+#[must_use]
+pub fn observation_outcome(status: ExpectationStatus) -> Option<WorkingObservationOutcome> {
+    match status {
+        ExpectationStatus::Satisfied => Some(WorkingObservationOutcome::Satisfied),
+        ExpectationStatus::Expired => Some(WorkingObservationOutcome::Expired),
+        ExpectationStatus::Violated => Some(WorkingObservationOutcome::Violated),
+        ExpectationStatus::Cancelled => Some(WorkingObservationOutcome::Cancelled),
+        ExpectationStatus::Pending => None,
     }
 }
 
@@ -312,15 +477,45 @@ mod tests {
                 },
             )]);
         }
-        assert_eq!(memory.len(), MAX_WORKING_ATTEMPTS);
+        assert_eq!(memory.len(), MAX_WORKING_ENTRIES);
         assert_eq!(
-            memory.attempts().first().expect("oldest kept").tool(),
+            memory.attempts().next().expect("oldest kept").tool(),
             "tool.3"
         );
         assert_eq!(
             memory.attempts().last().expect("newest").tool(),
-            format!("tool.{}", MAX_WORKING_ATTEMPTS + 2)
+            format!("tool.{}", MAX_WORKING_ENTRIES + 2)
         );
+    }
+
+    #[test]
+    fn observation_results_land_after_the_round_they_belong_to() {
+        // The attempt is recorded while the round dispatches; the expectation
+        // resolves later, when the event that settles it is observed. History
+        // must still read in the order things happened.
+        let mut memory = PlannerWorkingMemory::new();
+        memory.record_round(&[WorkingAttempt::new(
+            "web.search",
+            "{}",
+            WorkingAttemptOutcome::Succeeded {
+                summary: "ok".to_owned(),
+            },
+        )]);
+        memory.record_observation(WorkingObservation::new(
+            "工具 `web.search` 应当执行成功",
+            WorkingObservationOutcome::Expired,
+        ));
+        let described: Vec<String> = memory
+            .entries()
+            .iter()
+            .map(|entry| match &entry.payload {
+                WorkingEntryPayload::Attempt(attempt) => attempt.tool().to_owned(),
+                WorkingEntryPayload::Observation(observation) => observation.describe(),
+            })
+            .collect();
+        assert_eq!(described.len(), 2);
+        assert_eq!(described[0], "web.search");
+        assert!(described[1].contains("没有发生"));
     }
 
     #[test]

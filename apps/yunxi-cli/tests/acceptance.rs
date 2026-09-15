@@ -560,7 +560,6 @@ impl CoreModelBackend for ToolThenReplyModel {
                     let tried: Vec<&str> = input
                         .working_memory
                         .attempts()
-                        .iter()
                         .map(yunxi_core::WorkingAttempt::tool)
                         .collect();
                     assert_eq!(

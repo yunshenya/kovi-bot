@@ -88,6 +88,19 @@ impl ExpectationStatus {
     }
 }
 
+/// One expectation that reached a terminal status, with the expectation itself.
+///
+/// [`ExpectationObservation`] reports identifiers only, which is enough to
+/// count outcomes but not to act on them: a consumer that wants to tell a task
+/// "the thing you expected did not happen" needs the pattern. The tracker drops
+/// terminal expectations in the same pass, so this is the last moment the
+/// expectation can be read.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedExpectation {
+    pub expectation: Expectation,
+    pub status: ExpectationStatus,
+}
+
 /// Result of observing one event against the bounded pending set.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ExpectationObservation {
@@ -121,6 +134,17 @@ pub struct Expectation {
     pub confidence: f32,
     pub expires_at: Option<DateTime<Utc>>,
     pub status: ExpectationStatus,
+    /// The task (trace root) this expectation belongs to, when Core registered
+    /// it on a turn's behalf.
+    ///
+    /// An expectation describes what a turn expected to happen next, so when it
+    /// resolves the result has to reach *that* task's working memory. Without
+    /// this the runtime could only report that some expectation somewhere
+    /// ended, which no follow-up round can act on. It is process-local
+    /// bookkeeping and defaults to absent for hosts that register expectations
+    /// themselves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_root: Option<crate::EventId>,
 }
 
 pub type ExpectationSnapshot = Expectation;
@@ -144,7 +168,21 @@ impl Expectation {
             },
             expires_at,
             status: ExpectationStatus::Pending,
+            trace_root: None,
         }
+    }
+
+    /// Binds this expectation to the task that formed it.
+    #[must_use]
+    pub const fn for_trace(mut self, trace_root: crate::EventId) -> Self {
+        self.trace_root = Some(trace_root);
+        self
+    }
+
+    /// The task that formed this expectation, when Core registered it.
+    #[must_use]
+    pub const fn trace_root(&self) -> Option<crate::EventId> {
+        self.trace_root
     }
 
     pub fn validate(&self) -> Result<(), &'static str> {

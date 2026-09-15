@@ -109,7 +109,7 @@ pub use decision_record::{
 };
 pub use expectation::{
     Expectation, ExpectationObservation, ExpectationSnapshot, ExpectationStatus,
-    ExpectationTracker, ExpectationTrackerConfig, ExpectedEventPattern,
+    ExpectationTracker, ExpectationTrackerConfig, ExpectedEventPattern, ResolvedExpectation,
 };
 pub use outgoing::{OutgoingSource, PendingOutgoing};
 pub use persistence::{
@@ -489,29 +489,87 @@ impl ExecutiveController {
     /// projection, so satisfied/expired rows cannot consume future quota.
     ///
     /// 四个终态**都要**上报：`retain(Pending)` 在同一趟里把非 Pending 的全部删掉，
-    /// 落进空分支的终态既不会被调用方看到、也不会当场清理。注意运行时目前丢弃了
-    /// 返回值（`runtime.rs` 只调用不消费），所以这里的上报是给将来的消费者留的口子。
+    /// 落进空分支的终态既不会被调用方看到、也不会当场清理。
+    ///
+    /// Identifier-only 形态，供只需要计数或断言的调用方使用；Core 的运行时用
+    /// [`Self::observe_expectations_resolved`]，因为要把结果送回它所属的任务。
     pub fn observe_expectations(&self, event: &crate::WorldEvent) -> ExpectationObservation {
-        let mut state = self.state.lock().unwrap_or_else(|lock| lock.into_inner());
-        let now = Utc::now();
         let mut observation = ExpectationObservation::default();
-        for expectation in &mut state.expectations {
-            match expectation.observe(event, now) {
-                ExpectationStatus::Satisfied => observation.satisfied.push(expectation.id),
-                ExpectationStatus::Expired => observation.expired.push(expectation.id),
-                ExpectationStatus::Violated => observation.violated.push(expectation.id),
-                ExpectationStatus::Cancelled => observation.cancelled.push(expectation.id),
+        for resolved in self.observe_expectations_resolved(event) {
+            match resolved.status {
+                ExpectationStatus::Satisfied => observation.satisfied.push(resolved.expectation.id),
+                ExpectationStatus::Expired => observation.expired.push(resolved.expectation.id),
+                ExpectationStatus::Violated => observation.violated.push(resolved.expectation.id),
+                ExpectationStatus::Cancelled => observation.cancelled.push(resolved.expectation.id),
                 ExpectationStatus::Pending => {}
             }
         }
-        if !observation.is_empty() {
+        observation
+    }
+
+    /// Observes one event and returns the expectations that reached a terminal
+    /// status, each with the expectation it was.
+    ///
+    /// The tracker removes terminal expectations in the same pass, so a caller
+    /// that needs to tell a task what it expected can only do so from here.
+    pub fn observe_expectations_resolved(
+        &self,
+        event: &crate::WorldEvent,
+    ) -> Vec<ResolvedExpectation> {
+        let mut state = self.state.lock().unwrap_or_else(|lock| lock.into_inner());
+        let now = Utc::now();
+        let mut resolved = Vec::new();
+        for expectation in &mut state.expectations {
+            let status = expectation.observe(event, now);
+            if status.is_terminal() {
+                resolved.push(ResolvedExpectation {
+                    expectation: expectation.clone(),
+                    status,
+                });
+            }
+        }
+        if !resolved.is_empty() {
             state
                 .expectations
                 .retain(|expectation| expectation.status == ExpectationStatus::Pending);
             prune_scope_indexes(&mut state);
             bump(&mut state.version);
         }
-        observation
+        resolved
+    }
+
+    /// Resolves every pending expectation that belongs to `trace_root`.
+    ///
+    /// A task that has stopped producing events can no longer satisfy anything
+    /// it expected: whatever it was waiting for did not arrive. Wall-clock
+    /// deadlines cannot express this, because a task that goes quiet may not
+    /// outlive its own deadline — so the lifecycle, not the clock, is what
+    /// settles these.
+    pub fn settle_trace_expectations(
+        &self,
+        trace_root: crate::EventId,
+    ) -> Vec<ResolvedExpectation> {
+        let mut state = self.state.lock().unwrap_or_else(|lock| lock.into_inner());
+        let mut resolved = Vec::new();
+        for expectation in &mut state.expectations {
+            if expectation.trace_root() != Some(trace_root) {
+                continue;
+            }
+            if expectation.expire_if_due(Utc::now()) || expectation.violate() {
+                resolved.push(ResolvedExpectation {
+                    expectation: expectation.clone(),
+                    status: expectation.status,
+                });
+            }
+        }
+        if !resolved.is_empty() {
+            state
+                .expectations
+                .retain(|expectation| expectation.status == ExpectationStatus::Pending);
+            prune_scope_indexes(&mut state);
+            bump(&mut state.version);
+        }
+        resolved
     }
 
     /// Expire pending expectations against the current wall clock and return

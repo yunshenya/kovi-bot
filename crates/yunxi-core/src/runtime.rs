@@ -716,6 +716,56 @@ impl CognitiveRuntime {
         self.services.as_deref()
     }
 
+    /// Records how expectations turned out into the task that formed them.
+    ///
+    /// An expectation is a statement about what a turn expected to happen
+    /// next, so recording its result is the only way the next round can tell
+    /// "the tool reported an error" from "the thing I was waiting for never
+    /// arrived" — the second is invisible in raw events.
+    fn record_expectation_results(&mut self, resolved: Vec<crate::ResolvedExpectation>) {
+        for resolved in resolved {
+            let Some(root) = resolved.expectation.trace_root() else {
+                continue;
+            };
+            let Some(outcome) = crate::working_memory::observation_outcome(resolved.status) else {
+                continue;
+            };
+            self.working_memory
+                .entry(root)
+                .or_default()
+                .record_observation(crate::working_memory::WorkingObservation::new(
+                    crate::working_memory::describe_expectation(
+                        &resolved.expectation.expected_event,
+                    ),
+                    outcome,
+                ));
+        }
+    }
+
+    /// Registers what the current turn expects to happen next.
+    ///
+    /// The expectation is bound to the event's trace root, so when it resolves
+    /// the result reaches the task that formed it. This is the producer side of
+    /// Core's expectation tracking: a host (or Core itself, once a turn can
+    /// declare its own expectations) says what should follow an action, and the
+    /// loop reports back whether it did.
+    ///
+    /// Fails closed for a trace that already reached a terminal state: an
+    /// expectation registered after the task ended could never be observed by
+    /// it, and would only leak quota.
+    pub fn register_expectation(
+        &mut self,
+        event: &WorldEvent,
+        expectation: crate::Expectation,
+    ) -> Result<bool, &'static str> {
+        let root = event.trace().root_event_id();
+        if self.closed_tool_budget_roots.contains(&root) {
+            return Ok(false);
+        }
+        self.executive
+            .register_expectation(expectation.for_trace(root))
+    }
+
     /// Whether any task still holds working memory.
     ///
     /// Exposed for tests and diagnostics: a terminal task must release it, and
@@ -798,6 +848,13 @@ impl CognitiveRuntime {
         if self.root_has_pending_tool_follow_up(root) {
             return;
         }
+        // A task that has stopped producing events can no longer satisfy what
+        // it expected, so settle those expectations before the record is
+        // dropped. This is the only place a deadline is evaluated without an
+        // event to trigger it — a task that goes quiet emits nothing to hang
+        // the check on.
+        let settled = self.executive.settle_trace_expectations(root);
+        self.record_expectation_results(settled);
         // A terminal task can no longer produce a round that would read this.
         self.working_memory.remove(&root);
         if self.tool_action_budget_by_trace.remove(&root).is_some() {
@@ -1029,7 +1086,7 @@ impl CognitiveRuntime {
                 return ProcessingOutcome::RejectedState { event, error };
             }
         };
-        self.executive.observe_expectations(&event);
+        self.record_expectation_results(self.executive.observe_expectations_resolved(&event));
         ProcessingOutcome::Observed(RuntimeObservation {
             event_id: event.id(),
             event_type: event.kind().event_type(),

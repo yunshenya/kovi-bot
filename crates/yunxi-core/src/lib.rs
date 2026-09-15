@@ -84,8 +84,8 @@ pub use executive::{
     MAX_PLAN_STEPS, MAX_REASON_TAGS, MAX_SNAPSHOT_ITEMS, OutgoingSource, PendingOutgoing,
     PlanError, PlanId, PlanRevision, PlanSnapshot, PlanStaleReason, PlanState, PlanStatus,
     PlanStep, PlanStepId, PlanStepKind, PlanStepStatus, PlanStore, PlanValidationError,
-    RetryPolicy, SelfConsistencyConflict, SnapshotExpectation, SnapshotPlan, confidence_level,
-    hypothesis_state, update_confidence,
+    ResolvedExpectation, RetryPolicy, SelfConsistencyConflict, SnapshotExpectation, SnapshotPlan,
+    confidence_level, hypothesis_state, update_confidence,
 };
 pub use goal::{
     Goal, GoalDraft, GoalKind, GoalOwner, GoalState, GoalValidationError, MAX_GOAL_DETAILS_BYTES,
@@ -141,9 +141,11 @@ pub use runtime::{
     RuntimeObservation, SubmitError, planned_action_idempotency_key,
 };
 pub use working_memory::{
-    MAX_WORKING_ARGUMENT_CHARS, MAX_WORKING_ATTEMPTS, MAX_WORKING_FAILURE_CHARS,
-    MAX_WORKING_RESULT_CHARS, MAX_WORKING_TOOL_NAME_CHARS, PlannerWorkingMemory, WorkingAttempt,
-    WorkingAttemptOutcome, attempt_from_intent,
+    MAX_WORKING_ARGUMENT_CHARS, MAX_WORKING_ATTEMPTS, MAX_WORKING_ENTRIES,
+    MAX_WORKING_EXPECTATION_CHARS, MAX_WORKING_FAILURE_CHARS, MAX_WORKING_RESULT_CHARS,
+    MAX_WORKING_TOOL_NAME_CHARS, PlannerWorkingMemory, WorkingAttempt, WorkingAttemptOutcome,
+    WorkingEntry, WorkingEntryPayload, WorkingObservation, WorkingObservationOutcome,
+    attempt_from_intent, describe_expectation, observation_outcome,
 };
 pub use working_state::{
     CompactEvent, ConversationSnapshot, StateUpdate, WorkingState, WorkingStateConfig,

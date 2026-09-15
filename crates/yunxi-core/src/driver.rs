@@ -968,7 +968,6 @@ mod tests {
                 let seen: Vec<(String, String)> = input
                     .working_memory
                     .attempts()
-                    .iter()
                     .map(|attempt| {
                         (
                             attempt.tool().to_owned(),
@@ -1082,6 +1081,230 @@ mod tests {
             !runtime.has_working_memory(),
             "a terminal task must release its working memory"
         );
+    }
+
+    /// Reports, per round, every working-memory entry it can see.
+    #[derive(Debug, Default)]
+    struct ExpectationProbe {
+        rounds: Mutex<Vec<Vec<String>>>,
+    }
+
+    impl ModelBackend for ExpectationProbe {
+        fn plan<'a>(&'a self, input: &'a PlannerInput) -> ModelBackendFuture<'a> {
+            Box::pin(async move {
+                let seen: Vec<String> = input
+                    .working_memory
+                    .entries()
+                    .iter()
+                    .map(|entry| match &entry.payload {
+                        crate::working_memory::WorkingEntryPayload::Attempt(attempt) => {
+                            attempt.tool().to_owned()
+                        }
+                        crate::working_memory::WorkingEntryPayload::Observation(observation) => {
+                            observation.describe()
+                        }
+                    })
+                    .collect();
+                self.rounds
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(seen);
+                let conversation_id = input
+                    .event
+                    .scope()
+                    .conversation_id()
+                    .ok_or(ModelBackendError::Unavailable)?;
+                match input.event.kind() {
+                    WorldEventKind::MessageReceived(_) => Ok(DecisionPlan {
+                        disposition: DecisionDisposition::Reply,
+                        intents: vec![CognitiveIntent::UseTool {
+                            tool_name: "web.search".to_owned(),
+                            input: "{}".to_owned(),
+                            scope: ActionScope::Conversation(conversation_id),
+                            notification_policy: ToolNotificationPolicy::Final,
+                        }],
+                        state_updates: Vec::new(),
+                    }),
+                    WorldEventKind::ToolCompleted(tool) if tool.requires_follow_up => {
+                        Ok(DecisionPlan {
+                            disposition: DecisionDisposition::Reply,
+                            intents: vec![CognitiveIntent::send_message(
+                                conversation_id,
+                                MessageContent::text("好"),
+                            )],
+                            state_updates: Vec::new(),
+                        })
+                    }
+                    _ => Ok(DecisionPlan::silent()),
+                }
+            })
+        }
+    }
+
+    /// An action port whose tool always fails, so an expectation of success
+    /// cannot be met.
+    #[derive(Debug, Default)]
+    struct FailingToolPort;
+
+    impl ActionPort for FailingToolPort {
+        fn execute<'a>(&'a self, action: &'a ProposedAction) -> ActionPortFuture<'a> {
+            Box::pin(async move {
+                match action {
+                    ProposedAction::UseTool(tool) => Ok(ActionPortOutcome::ToolFailed {
+                        operation: tool.tool_name.clone(),
+                        error_category: "network".to_owned(),
+                        detail: "timeout".to_owned(),
+                    }),
+                    ProposedAction::SendMessage(_) => Ok(ActionPortOutcome::Delivered {
+                        external_reference: Some("cli-message:1".to_owned()),
+                        message_id: None,
+                        conversation_id: None,
+                    }),
+                    other => Err(ActionPortError::new(
+                        format!("unsupported: {other:?}"),
+                        false,
+                    )),
+                }
+            })
+        }
+    }
+
+    #[test]
+    fn a_met_expectation_reaches_the_next_round() {
+        // A tool failure is visible in the event. What is *not* visible is
+        // "the thing I was waiting for never arrived" — that only exists if the
+        // expectation's resolution travels back into the task.
+        let outcome = run_expectation_probe(crate::executive::ExpectedEventPattern::ToolFailed {
+            operation: "web.search".to_owned(),
+        });
+        assert_eq!(outcome.len(), 2, "two rounds: the tool, then its follow-up");
+        assert!(outcome[0].is_empty(), "the first round has no history");
+        assert_eq!(
+            outcome[1].len(),
+            2,
+            "attempt plus observation: {:?}",
+            outcome[1]
+        );
+        assert_eq!(outcome[1][0], "web.search");
+        assert!(
+            outcome[1][1].contains("如期发生"),
+            "a met expectation must say so: {}",
+            outcome[1][1]
+        );
+    }
+
+    /// A task that stops producing events settles what it was still waiting
+    /// for, and frees the quota it held.
+    ///
+    /// This is the case wall-clock deadlines cannot cover: the expectation is
+    /// still valid when the task ends, and nothing else will ever be observed
+    /// against it.
+    #[test]
+    fn a_finished_task_settles_the_expectations_it_left_open() {
+        let conversation_id = ConversationId::new();
+        let (handle, mut runtime) =
+            CognitiveRuntime::new(RuntimeConfig::default()).expect("runtime");
+        runtime.install_services(CoreServices::with_model(ThreeStepModel));
+        let event = message_event(conversation_id);
+        let expectation = crate::executive::Expectation::new(
+            crate::ActionId::new(),
+            crate::executive::ExpectedEventPattern::ToolCompleted {
+                operation: "never.happens".to_owned(),
+            },
+            0.9,
+            // No deadline: only the end of the task can settle it.
+            None,
+        );
+        assert_eq!(runtime.register_expectation(&event, expectation), Ok(true));
+        block_on(handle.submit(event)).expect("submit");
+        let arbiter = ActionArbiter::new(ActionArbiterConfig {
+            capabilities: EnvironmentCapabilities::all(),
+            ..ActionArbiterConfig::default()
+        });
+        let mut observer = Recorder {
+            replying_allowed: true,
+            ..Recorder::default()
+        };
+        block_on(drain(&mut runtime, &arbiter, &ImmediatePort, &mut observer));
+        assert!(
+            runtime
+                .executive()
+                .snapshot()
+                .pending_expectations
+                .is_empty(),
+            "a task that ended must not leave expectations holding quota"
+        );
+        assert!(!runtime.has_working_memory());
+    }
+
+    /// Runs a two-round tool task with one expectation registered on the first
+    /// root, and returns what each round could see.
+    fn run_expectation_probe(pattern: crate::executive::ExpectedEventPattern) -> Vec<Vec<String>> {
+        let conversation_id = ConversationId::new();
+        let (handle, mut runtime) =
+            CognitiveRuntime::new(RuntimeConfig::default()).expect("runtime");
+        let probe = Arc::new(ExpectationProbe::default());
+        runtime.install_services(CoreServices::new(
+            Arc::clone(&probe) as Arc<dyn ModelBackend>
+        ));
+        let event = message_event(conversation_id);
+        let expectation = crate::executive::Expectation::new(
+            crate::ActionId::new(),
+            pattern,
+            0.9,
+            // Far enough out that it is still pending when the tool round runs.
+            Some(Utc::now() + chrono::Duration::hours(1)),
+        );
+        assert_eq!(runtime.register_expectation(&event, expectation), Ok(true));
+        block_on(handle.submit(event)).expect("submit");
+        let arbiter = ActionArbiter::new(ActionArbiterConfig {
+            capabilities: EnvironmentCapabilities::all(),
+            ..ActionArbiterConfig::default()
+        });
+        let mut observer = Recorder {
+            replying_allowed: true,
+            ..Recorder::default()
+        };
+        let driven = block_on(drain(
+            &mut runtime,
+            &arbiter,
+            &FailingToolPort,
+            &mut observer,
+        ));
+        assert_eq!(driven, 2, "the tool round and its follow-up");
+        let rounds = probe
+            .rounds
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        rounds.clone()
+    }
+
+    #[test]
+    fn expectations_cannot_be_registered_for_a_finished_task() {
+        let conversation_id = ConversationId::new();
+        let (handle, mut runtime) =
+            CognitiveRuntime::new(RuntimeConfig::default()).expect("runtime");
+        runtime.install_services(CoreServices::with_model(ThreeStepModel));
+        let event = message_event(conversation_id);
+        block_on(handle.submit(event.clone())).expect("submit");
+        let arbiter = ActionArbiter::new(ActionArbiterConfig {
+            capabilities: EnvironmentCapabilities::all(),
+            ..ActionArbiterConfig::default()
+        });
+        let mut observer = Recorder {
+            replying_allowed: true,
+            ..Recorder::default()
+        };
+        block_on(drain(&mut runtime, &arbiter, &ImmediatePort, &mut observer));
+        // The task is over, so a late expectation could never be observed by
+        // it and would only hold quota.
+        let late = crate::executive::Expectation::new(
+            crate::ActionId::new(),
+            crate::executive::ExpectedEventPattern::EventType(EventType::IdleTick),
+            0.5,
+            None,
+        );
+        assert_eq!(runtime.register_expectation(&event, late), Ok(false));
     }
 
     #[test]
