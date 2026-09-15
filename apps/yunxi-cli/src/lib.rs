@@ -92,6 +92,8 @@ impl CoreModelBackend for FakeModel {
                         conversation_id,
                         directive,
                     }],
+
+                    expectations: Vec::new(),
                 });
             }
             let Some(WorldEventKind::MessageReceived(message)) = Some(input.event.kind()) else {
@@ -156,6 +158,8 @@ impl CoreModelBackend for FakeModel {
                         yunxi_core::CognitiveIntent::create_open_loop(draft),
                     ],
                     state_updates,
+
+                    expectations: Vec::new(),
                 });
             }
 
@@ -178,6 +182,8 @@ impl CoreModelBackend for FakeModel {
                     disposition: DecisionDisposition::SpecialAction,
                     intents,
                     state_updates,
+
+                    expectations: Vec::new(),
                 });
             }
 
@@ -188,6 +194,8 @@ impl CoreModelBackend for FakeModel {
                     MessageContent::text(format!("Yunxi heard: {text}{context}")),
                 )],
                 state_updates,
+
+                expectations: Vec::new(),
             })
         })
     }
@@ -1021,6 +1029,7 @@ mod tests {
                 CognitiveIntent::create_open_loop(draft),
             ],
             state_updates: Vec::new(),
+            expectations: Vec::new(),
         };
         let receipt = ActionReceipt {
             action_id: None,
@@ -1067,6 +1076,7 @@ mod tests {
                 yunxi_core::ActionScope::Conversation(conversation_id),
             )],
             state_updates: Vec::new(),
+            expectations: Vec::new(),
         };
         let receipt = ActionReceipt {
             action_id: None,

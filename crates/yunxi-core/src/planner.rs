@@ -25,6 +25,9 @@ use std::time::Duration;
 use thiserror::Error;
 
 pub const MAX_PLANNER_INTENTS: usize = 32;
+/// Most expectations one plan may declare. Kept well under the tracker's own
+/// pending cap so a single turn cannot fill it.
+pub const MAX_PLAN_EXPECTATIONS: usize = 4;
 pub const MAX_PLANNER_STATE_UPDATES: usize = 32;
 pub const MAX_PLANNER_MEMORIES: usize = 128;
 pub const MAX_PLANNER_OPEN_LOOPS: usize = 128;
@@ -1018,6 +1021,77 @@ pub struct DecisionPlan {
     pub disposition: DecisionDisposition,
     pub intents: Vec<CognitiveIntent>,
     pub state_updates: Vec<StateUpdateProposal>,
+    /// What this turn expects to happen next.
+    ///
+    /// A plan already implies its tool expectations structurally, and Core
+    /// derives those itself. This field exists for the expectations a plan
+    /// cannot imply: what should follow *after* the turn is over — a reply to
+    /// the message it just sent, a reminder being honoured, a reaction from
+    /// someone. Nothing else in Core can report those, because "the thing I
+    /// waited for never arrived" produces no event to observe.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expectations: Vec<PlanExpectation>,
+}
+
+/// One thing a plan expects to happen after this turn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "payload", rename_all = "snake_case")]
+pub enum PlanExpectation {
+    /// An event of this kind should occur within `within_secs`.
+    ///
+    /// The window is required: an expectation with no deadline would hold quota
+    /// until its task ended, and a task that ends without the event teaches
+    /// nothing about whether waiting was reasonable.
+    ExpectEvent {
+        event_type: crate::EventType,
+        within_secs: u32,
+    },
+}
+
+/// Longest window a plan may ask for.
+///
+/// Bounded for the same reason the expectation tracker is: a plan cannot park
+/// quota on the scale of a product lifetime.
+pub const MAX_PLAN_EXPECTATION_WINDOW_SECS: u32 = 30 * 24 * 60 * 60;
+/// Shortest window a plan may ask for. A window of zero would expire before the
+/// event it waits for could possibly be observed.
+pub const MIN_PLAN_EXPECTATION_WINDOW_SECS: u32 = 1;
+
+impl PlanExpectation {
+    pub fn validate(&self) -> Result<(), PlannerOutputValidationError> {
+        match self {
+            Self::ExpectEvent { within_secs, .. } => {
+                if !(MIN_PLAN_EXPECTATION_WINDOW_SECS..=MAX_PLAN_EXPECTATION_WINDOW_SECS)
+                    .contains(within_secs)
+                {
+                    return Err(PlannerOutputValidationError::InvalidExpectationWindow {
+                        seconds: *within_secs,
+                        minimum: MIN_PLAN_EXPECTATION_WINDOW_SECS,
+                        maximum: MAX_PLAN_EXPECTATION_WINDOW_SECS,
+                    });
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// The `ExpectedEventPattern` this expectation becomes.
+    #[must_use]
+    pub fn pattern(&self) -> crate::executive::ExpectedEventPattern {
+        match self {
+            Self::ExpectEvent { event_type, .. } => {
+                crate::executive::ExpectedEventPattern::EventType(*event_type)
+            }
+        }
+    }
+
+    /// How long after registration the expectation stops waiting.
+    #[must_use]
+    pub fn window_secs(&self) -> u32 {
+        match self {
+            Self::ExpectEvent { within_secs, .. } => *within_secs,
+        }
+    }
 }
 
 /// Alternate name used by integrations that speak in terms of input/output.
@@ -1030,6 +1104,7 @@ impl DecisionPlan {
             disposition,
             intents: Vec::new(),
             state_updates: Vec::new(),
+            expectations: Vec::new(),
         }
     }
 
@@ -1039,7 +1114,19 @@ impl DecisionPlan {
             disposition: DecisionDisposition::Silent,
             intents: Vec::new(),
             state_updates: Vec::new(),
+            expectations: Vec::new(),
         }
+    }
+
+    /// Declares that this turn expects an event of `event_type` within the
+    /// given window.
+    #[must_use]
+    pub fn expecting_event(mut self, event_type: crate::EventType, within_secs: u32) -> Self {
+        self.expectations.push(PlanExpectation::ExpectEvent {
+            event_type,
+            within_secs,
+        });
+        self
     }
 
     pub fn validate(&self) -> Result<(), PlannerOutputValidationError> {
@@ -1062,6 +1149,15 @@ impl DecisionPlan {
         }
         for update in &self.state_updates {
             update.validate()?;
+        }
+        if self.expectations.len() > MAX_PLAN_EXPECTATIONS {
+            return Err(PlannerOutputValidationError::TooManyExpectations {
+                length: self.expectations.len(),
+                maximum: MAX_PLAN_EXPECTATIONS,
+            });
+        }
+        for expectation in &self.expectations {
+            expectation.validate()?;
         }
         Ok(())
     }
@@ -1239,6 +1335,14 @@ pub enum PlannerOutputValidationError {
     },
     #[error("planner returned too many state updates: {length}, maximum {maximum}")]
     TooManyStateUpdates { length: usize, maximum: usize },
+    #[error("planner returned too many expectations: {length}, maximum {maximum}")]
+    TooManyExpectations { length: usize, maximum: usize },
+    #[error("planner expectation window {seconds}s is outside {minimum}..={maximum} seconds")]
+    InvalidExpectationWindow {
+        seconds: u32,
+        minimum: u32,
+        maximum: u32,
+    },
     #[error("planner returned an invalid intent: {0}")]
     InvalidIntent(#[from] IntentValidationError),
     #[error("planner returned an intent outside the current event scope: {reason}")]
@@ -1340,6 +1444,8 @@ mod tests {
                 disposition: DecisionDisposition::Silent,
                 intents: vec![CognitiveIntent::noop()],
                 state_updates: Vec::new(),
+
+                expectations: Vec::new(),
             },
         });
         let planner = Planner::new(model.clone());
@@ -1359,6 +1465,8 @@ mod tests {
                     crate::MessageContent::text(""),
                 )],
                 state_updates: Vec::new(),
+
+                expectations: Vec::new(),
             },
         });
         let error = Planner::new(model)

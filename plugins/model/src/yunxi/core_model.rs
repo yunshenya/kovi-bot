@@ -2705,6 +2705,7 @@ fn active_mind_no_output_plan(
                     input,
                     InteractionCues::default(),
                 ),
+                expectations: Vec::new(),
             };
             if let WorldEventKind::ProspectiveMemoryDue(due) = input.event.kind() {
                 plan.state_updates.push(StateUpdateProposal::DeferOpenLoop {
@@ -3131,6 +3132,7 @@ async fn register_core_tool_intents(
         disposition: DecisionDisposition::SpecialAction,
         intents,
         state_updates: interaction_state_updates_with_cues(input, interaction_cues),
+        expectations: Vec::new(),
     })
 }
 
@@ -5587,6 +5589,7 @@ fn pre_model_plan(input: &PlannerInput) -> Result<Option<DecisionPlan>, ModelBac
                     StateUpdateProposal::Affect(evolved.affect),
                     StateUpdateProposal::Relation(evolved.relation),
                 ],
+                expectations: Vec::new(),
             }))
         }
         WorldEventKind::MessageReceived(message) if !message.visible_reply_allowed => {
@@ -7621,6 +7624,7 @@ impl ModelBackend for KoviModelBackend {
                 disposition,
                 intents,
                 state_updates,
+                expectations: Vec::new(),
             })
         };
         Box::pin(async move {
@@ -7685,6 +7689,7 @@ fn silent_with_interaction_cues(input: &PlannerInput, cues: InteractionCues) -> 
         disposition: DecisionDisposition::Silent,
         intents: Vec::new(),
         state_updates: interaction_state_updates_with_cues(input, cues),
+        expectations: Vec::new(),
     }
 }
 
@@ -8637,6 +8642,7 @@ mod tests {
             disposition: yunxi_core::DecisionDisposition::SpecialAction,
             intents: Vec::new(),
             state_updates: Vec::new(),
+            expectations: Vec::new(),
         };
 
         let projection = shadow_projection_for_completed_plan(&input, &completed)

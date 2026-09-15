@@ -710,6 +710,7 @@ mod tests {
                             notification_policy: ToolNotificationPolicy::Final,
                         }],
                         state_updates: Vec::new(),
+                        expectations: Vec::new(),
                     }),
                     WorldEventKind::ToolCompleted(tool) if tool.requires_follow_up => {
                         let next = if tool.operation == "step.one" {
@@ -729,6 +730,7 @@ mod tests {
                             disposition: DecisionDisposition::Reply,
                             intents: vec![next],
                             state_updates: Vec::new(),
+                            expectations: Vec::new(),
                         })
                     }
                     _ => Ok(DecisionPlan::silent()),
@@ -998,6 +1000,7 @@ mod tests {
                             notification_policy: ToolNotificationPolicy::Final,
                         }],
                         state_updates: Vec::new(),
+                        expectations: Vec::new(),
                     }),
                     WorldEventKind::ToolCompleted(tool) if tool.requires_follow_up => {
                         let next = if tool.operation == "step.one" {
@@ -1017,6 +1020,7 @@ mod tests {
                             disposition: DecisionDisposition::Reply,
                             intents: vec![next],
                             state_updates: Vec::new(),
+                            expectations: Vec::new(),
                         })
                     }
                     _ => Ok(DecisionPlan::silent()),
@@ -1133,6 +1137,7 @@ mod tests {
                             notification_policy: ToolNotificationPolicy::Final,
                         }],
                         state_updates: Vec::new(),
+                        expectations: Vec::new(),
                     }),
                     WorldEventKind::ToolCompleted(tool) if tool.requires_follow_up => {
                         Ok(DecisionPlan {
@@ -1142,6 +1147,7 @@ mod tests {
                                 MessageContent::text("好"),
                             )],
                             state_updates: Vec::new(),
+                            expectations: Vec::new(),
                         })
                     }
                     _ => Ok(DecisionPlan::silent()),
@@ -1368,6 +1374,7 @@ mod tests {
                         MessageContent::text("好"),
                     )],
                     state_updates: Vec::new(),
+                    expectations: Vec::new(),
                 })
             })
         }

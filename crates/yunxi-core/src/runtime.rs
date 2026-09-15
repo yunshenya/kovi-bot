@@ -47,6 +47,13 @@ const MAX_TOOL_TRACE_BUDGET_ENTRIES: usize = 1_024;
 const MAX_CLOSED_TOOL_TRACE_TOMBSTONES: usize = 4_096;
 /// Cap on the ended-trace record used to refuse late expectation registration.
 const MAX_ENDED_TRACE_TOMBSTONES: usize = 4_096;
+/// How long a derived tool-outcome expectation waits for its result.
+///
+/// An action port answers in the same turn, so this only has to outlast a slow
+/// tool call on the host's side. It is deliberately not "until the task ends":
+/// a tool that never answers should be reported as an unmet prediction rather
+/// than silently accepted.
+const TOOL_OUTCOME_EXPECTATION_WINDOW: chrono::Duration = chrono::Duration::seconds(60);
 const MAX_TOOL_BATCH_OPERATION_CHARS: usize = 128;
 const MAX_TOOL_OPERATION_BYTES: usize = 1_024;
 const MAX_TOOL_ERROR_CATEGORY_BYTES: usize = 256;
@@ -754,15 +761,14 @@ impl CognitiveRuntime {
     /// Registers what the current turn expects to happen next.
     ///
     /// The expectation is bound to the event's trace root, so when it resolves
-    /// the result reaches the task that formed it. This is the producer side of
-    /// Core's expectation tracking: a host (or Core itself, once a turn can
-    /// declare its own expectations) says what should follow an action, and the
-    /// loop reports back whether it did.
+    /// the result reaches the task that formed it.
     ///
     /// A trace that already ended is refused: nothing will ever be observed
     /// against an expectation registered after its task is over, so accepting
     /// it would only hold quota until an unrelated event happened to notice the
-    /// deadline.
+    /// deadline. An equivalent expectation that is already pending is refused
+    /// too, so a repeated turn cannot spend the bounded quota twice on one
+    /// answer.
     pub fn register_expectation(
         &mut self,
         event: &WorldEvent,
@@ -772,8 +778,69 @@ impl CognitiveRuntime {
         if self.lifecycle.has_ended(root) {
             return Ok(false);
         }
+        if self
+            .executive
+            .has_pending_expectation(expectation.source_action_id, &expectation.expected_event)
+        {
+            return Ok(false);
+        }
         self.executive
             .register_expectation(expectation.for_trace(root))
+    }
+
+    /// Registers what a plan says should happen after this turn.
+    ///
+    /// Two kinds are registered, and the difference matters:
+    ///
+    /// - **Derived tool outcomes.** A plan that calls a tool has, by its own
+    ///   structure, predicted that the tool runs. Core does not need anyone to
+    ///   declare that, and the result is what a follow-up round reads when the
+    ///   call does not go as the turn assumed.
+    /// - **Declared expectations.** What should follow *after* the turn, which
+    ///   no intent implies: a reply to the message just sent, a reminder being
+    ///   honoured. Only the plan can know these, and nothing else in Core could
+    ///   report them, because an event that never happens produces nothing to
+    ///   observe.
+    fn register_plan_expectations(&mut self, event: &WorldEvent, plan: &DecisionPlan) {
+        let root = event.trace().root_event_id();
+        let source_action_id = crate::ActionId::new();
+        for intent in &plan.intents {
+            let crate::CognitiveIntent::UseTool { tool_name, .. } = intent else {
+                continue;
+            };
+            let pattern = crate::executive::ExpectedEventPattern::ToolCompleted {
+                operation: tool_name.clone(),
+            };
+            if self
+                .executive
+                .has_pending_expectation(source_action_id, &pattern)
+            {
+                continue;
+            }
+            let _ = self.executive.register_expectation(
+                crate::Expectation::new(
+                    source_action_id,
+                    pattern,
+                    1.0,
+                    Some(Utc::now() + TOOL_OUTCOME_EXPECTATION_WINDOW),
+                )
+                .for_trace(root),
+            );
+        }
+        for declared in &plan.expectations {
+            let pattern = declared.pattern();
+            if self
+                .executive
+                .has_pending_expectation(source_action_id, &pattern)
+            {
+                continue;
+            }
+            let window = chrono::Duration::seconds(i64::from(declared.window_secs()));
+            let _ = self.executive.register_expectation(
+                crate::Expectation::new(source_action_id, pattern, 1.0, Some(Utc::now() + window))
+                    .for_trace(root),
+            );
+        }
     }
 
     /// Whether any task still holds working memory.
@@ -1294,6 +1361,10 @@ impl CognitiveRuntime {
             release_unexecuted_tool_intents(&planner_event, &plan, port).await;
             return Err(error);
         }
+        // Registered before anything dispatches: a result that arrives before
+        // its expectation would be missed, and a prediction registered after
+        // the fact predicts nothing.
+        self.register_plan_expectations(&planner_event, &plan);
         if guard.is_some_and(|guard| !guard()) {
             release_unexecuted_tool_intents(&planner_event, &plan, port).await;
             return Ok(PlannedProcessingOutcome::Planned {
@@ -1342,6 +1413,7 @@ impl CognitiveRuntime {
                         disposition: crate::DecisionDisposition::Silent,
                         intents: plan.intents[..intent_index].to_vec(),
                         state_updates: Vec::new(),
+                        expectations: Vec::new(),
                     },
                     actions,
                     feedback,
@@ -3279,6 +3351,7 @@ mod tests {
                     disposition: crate::DecisionDisposition::Reply,
                     intents,
                     state_updates: Vec::new(),
+                    expectations: Vec::new(),
                 })
             })
         }
@@ -3289,6 +3362,253 @@ mod tests {
     struct ImmediateActionPort;
 
     impl ActionPort for ImmediateActionPort {
+        fn execute<'a>(&'a self, action: &'a crate::ProposedAction) -> crate::ActionPortFuture<'a> {
+            Box::pin(async move {
+                match action {
+                    crate::ProposedAction::UseTool(tool) => {
+                        Ok(crate::ActionPortOutcome::ToolCompleted {
+                            operation: tool.tool_name.clone(),
+                            output: "ok".to_owned(),
+                        })
+                    }
+                    crate::ProposedAction::SendMessage(send) => {
+                        Ok(crate::ActionPortOutcome::Delivered {
+                            external_reference: None,
+                            message_id: Some(crate::MessageId::new()),
+                            conversation_id: Some(send.conversation_id),
+                        })
+                    }
+                    _ => Err(crate::ActionPortError::new("unsupported", false)),
+                }
+            })
+        }
+    }
+
+    /// A plan that declares an expectation gets it registered, and the round
+    /// that settles it hands the result to the next round.
+    ///
+    /// This is the producer end to end: the plan says "I expect this to
+    /// happen", Core registers it, the event settles it, and the follow-up
+    /// round can see that it did. Nothing else in Core can report this, because
+    /// an event that never happens produces nothing to observe.
+    #[tokio::test]
+    async fn a_declared_expectation_is_registered_and_its_result_reaches_the_next_round() {
+        let conversation_id = ConversationId::new();
+        let probe = Arc::new(RoundProbe::default());
+        let (handle, mut runtime) = CognitiveRuntime::new_with_services(
+            RuntimeConfig::default(),
+            CoreServices::new(Arc::clone(&probe) as Arc<dyn crate::ModelBackend>),
+        )
+        .expect("valid runtime");
+        assert_eq!(
+            handle
+                .submit(direct_message(conversation_id, PersonId::new()))
+                .await,
+            Ok(Admission::Accepted)
+        );
+        let arbiter = ActionArbiter::new(
+            ActionArbiterConfig::default().with_capabilities(EnvironmentCapabilities::all()),
+        );
+        // The first round calls a tool, which makes the task continue and gives
+        // Core a tool outcome to derive an expectation from.
+        let first = runtime
+            .process_next_with_planner_and_actions(&arbiter, &DeclaredExpectationPort)
+            .await
+            .expect("first round")
+            .expect("first round plans");
+        assert!(matches!(first, PlannedProcessingOutcome::Planned { .. }));
+        // The follow-up round is where the settled expectation must be visible.
+        let second = runtime
+            .process_next_with_planner_and_actions(&arbiter, &DeclaredExpectationPort)
+            .await
+            .expect("follow-up round")
+            .expect("follow-up plans");
+        let PlannedProcessingOutcome::Planned { .. } = second else {
+            panic!("the follow-up round must plan");
+        };
+
+        let seen = probe
+            .seen
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(seen.len(), 2, "one record per round");
+        assert!(seen[0].is_empty(), "the first round has no history yet");
+        let describe = |memory: &crate::PlannerWorkingMemory| -> Vec<String> {
+            memory
+                .entries()
+                .iter()
+                .map(|entry| match &entry.payload {
+                    crate::WorkingEntryPayload::Attempt(attempt) => {
+                        format!("attempt:{}", attempt.tool())
+                    }
+                    crate::WorkingEntryPayload::Observation(observation) => {
+                        format!("observation:{}", observation.describe())
+                    }
+                })
+                .collect()
+        };
+        let _ = describe;
+        // The plan never declared this one: Core derived it from the tool the
+        // plan called, and the follow-up round is told whether it held.
+        assert!(
+            seen[1]
+                .iter()
+                .any(|line| line.starts_with("attempt:web.search")),
+            "the follow-up round sees the call it made: {:?}",
+            seen[1]
+        );
+        assert!(
+            seen[1]
+                .iter()
+                .any(|line| { line.contains("observation:") && line.contains("如期发生") }),
+            "the follow-up round is told the prediction held: {:?}",
+            seen[1]
+        );
+    }
+
+    /// A plan-declared expectation is registered and settled by the event it
+    /// names, so the round that observes that event can report it.
+    #[tokio::test]
+    async fn a_plan_declared_expectation_is_registered_and_settled() {
+        let conversation_id = ConversationId::new();
+        let (_handle, mut runtime) = CognitiveRuntime::new_with_services(
+            RuntimeConfig::default(),
+            CoreServices::with_model(DeclaredOnlyModel { conversation_id }),
+        )
+        .expect("valid runtime");
+        let event = direct_message(conversation_id, PersonId::new());
+        let arbiter = ActionArbiter::new(
+            ActionArbiterConfig::default().with_capabilities(EnvironmentCapabilities::all()),
+        );
+        runtime
+            .process_event_with_planner_and_actions(event, &arbiter, &DeliveringPort)
+            .await
+            .expect("turn runs");
+        // The turn sent a message and declared that it expects the send to
+        // happen; the delivery settled it, so nothing is left pending.
+        assert!(
+            runtime
+                .executive()
+                .snapshot()
+                .pending_expectations
+                .is_empty(),
+            "the declared expectation must be settled by the event it named"
+        );
+    }
+
+    /// Declares an expectation about the message it is about to send.
+    struct DeclaredOnlyModel {
+        conversation_id: ConversationId,
+    }
+
+    impl crate::ModelBackend for DeclaredOnlyModel {
+        fn plan<'a>(&'a self, _input: &'a PlannerInput) -> crate::ModelBackendFuture<'a> {
+            Box::pin(async move {
+                Ok(DecisionPlan {
+                    disposition: crate::DecisionDisposition::Reply,
+                    intents: vec![crate::CognitiveIntent::send_message(
+                        self.conversation_id,
+                        crate::event::MessageContent::text("先说一句"),
+                    )],
+                    state_updates: Vec::new(),
+                    expectations: vec![crate::planner::PlanExpectation::ExpectEvent {
+                        event_type: crate::EventType::MessageSent,
+                        within_secs: 60,
+                    }],
+                })
+            })
+        }
+    }
+
+    /// Delivers messages with an id, which is what produces a `MessageSent`.
+    struct DeliveringPort;
+
+    impl ActionPort for DeliveringPort {
+        fn execute<'a>(&'a self, action: &'a crate::ProposedAction) -> crate::ActionPortFuture<'a> {
+            Box::pin(async move {
+                match action {
+                    crate::ProposedAction::SendMessage(send) => {
+                        Ok(crate::ActionPortOutcome::Delivered {
+                            external_reference: None,
+                            message_id: Some(crate::MessageId::new()),
+                            conversation_id: Some(send.conversation_id),
+                        })
+                    }
+                    _ => Err(crate::ActionPortError::new("unsupported", false)),
+                }
+            })
+        }
+    }
+
+    /// Records what each round could see of the task history.
+    #[derive(Default)]
+    struct RoundProbe {
+        seen: std::sync::Mutex<Vec<Vec<String>>>,
+    }
+
+    impl crate::ModelBackend for RoundProbe {
+        fn plan<'a>(&'a self, input: &'a PlannerInput) -> crate::ModelBackendFuture<'a> {
+            Box::pin(async move {
+                let seen: Vec<String> = input
+                    .working_memory
+                    .entries()
+                    .iter()
+                    .map(|entry| match &entry.payload {
+                        crate::WorkingEntryPayload::Attempt(attempt) => {
+                            format!("attempt:{}", attempt.tool())
+                        }
+                        crate::WorkingEntryPayload::Observation(observation) => {
+                            format!("observation:{}", observation.describe())
+                        }
+                    })
+                    .collect();
+                self.seen
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(seen);
+                let conversation_id = input
+                    .event
+                    .scope()
+                    .conversation_id()
+                    .ok_or(crate::ModelBackendError::Unavailable)?;
+                if !matches!(
+                    input.event.kind(),
+                    crate::WorldEventKind::MessageReceived(_)
+                ) {
+                    // The follow-up round just answers.
+                    return Ok(DecisionPlan::silent());
+                }
+                Ok(DecisionPlan {
+                    disposition: crate::DecisionDisposition::Reply,
+                    intents: vec![
+                        crate::CognitiveIntent::UseTool {
+                            tool_name: "web.search".to_owned(),
+                            input: "{}".to_owned(),
+                            scope: crate::ActionScope::Conversation(conversation_id),
+                            notification_policy: crate::ToolNotificationPolicy::Final,
+                        },
+                        crate::CognitiveIntent::send_message(
+                            conversation_id,
+                            crate::event::MessageContent::text("先说一句"),
+                        ),
+                    ],
+                    state_updates: Vec::new(),
+                    // The plan declares what should follow: the message it is
+                    // about to send should go out.
+                    expectations: vec![crate::planner::PlanExpectation::ExpectEvent {
+                        event_type: crate::EventType::MessageSent,
+                        within_secs: 60,
+                    }],
+                })
+            })
+        }
+    }
+
+    /// Completes tools and delivers messages, so a declared expectation about
+    /// the message can be settled inside the same round.
+    struct DeclaredExpectationPort;
+
+    impl ActionPort for DeclaredExpectationPort {
         fn execute<'a>(&'a self, action: &'a crate::ProposedAction) -> crate::ActionPortFuture<'a> {
             Box::pin(async move {
                 match action {
@@ -3478,6 +3798,7 @@ mod tests {
                     disposition: DecisionDisposition::Silent,
                     intents: vec![crate::CognitiveIntent::noop()],
                     state_updates: Vec::new(),
+                    expectations: Vec::new(),
                 })
             })
         }
@@ -3511,6 +3832,7 @@ mod tests {
                         MessageContent::text("planned reply"),
                     )],
                     state_updates: Vec::new(),
+                    expectations: Vec::new(),
                 })
             })
         }

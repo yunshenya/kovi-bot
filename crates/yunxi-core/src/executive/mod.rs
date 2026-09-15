@@ -440,6 +440,26 @@ impl ExecutiveController {
         Ok(())
     }
 
+    /// Whether an equivalent expectation is already pending.
+    ///
+    /// Two turns that expect the same thing are the same expectation, and
+    /// re-registering it would spend a second slot of a bounded quota on a
+    /// duplicate answer. Equality ignores the id and the observation deadline:
+    /// what matters is the pattern and the action it came from.
+    #[must_use]
+    pub fn has_pending_expectation(
+        &self,
+        source_action_id: crate::ActionId,
+        expected_event: &ExpectedEventPattern,
+    ) -> bool {
+        let state = self.state.lock().unwrap_or_else(|lock| lock.into_inner());
+        state.expectations.iter().any(|expectation| {
+            expectation.status == ExpectationStatus::Pending
+                && expectation.source_action_id == source_action_id
+                && &expectation.expected_event == expected_event
+        })
+    }
+
     pub fn register_expectation(&self, expectation: Expectation) -> Result<bool, &'static str> {
         self.register_expectation_for_scope(ExecutiveScope::Global, expectation)
     }

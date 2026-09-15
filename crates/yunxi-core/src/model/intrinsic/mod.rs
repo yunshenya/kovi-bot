@@ -203,6 +203,7 @@ impl ModelBackend for IntrinsicModelBackend {
                     reply_to,
                 )],
                 state_updates: Vec::new(),
+                expectations: Vec::new(),
             })
         })
     }

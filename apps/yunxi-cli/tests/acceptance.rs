@@ -43,6 +43,7 @@ impl CoreModelBackend for TwoMessageModel {
                     ),
                 ],
                 state_updates: Vec::new(),
+                expectations: Vec::new(),
             })
         })
     }
@@ -70,6 +71,7 @@ impl CoreModelBackend for SilentAutonomousModel {
                     MessageContent::text("初始回复"),
                 )],
                 state_updates: Vec::new(),
+                expectations: Vec::new(),
             })
         })
     }
@@ -582,6 +584,7 @@ impl CoreModelBackend for ToolThenReplyModel {
                 disposition: DecisionDisposition::Reply,
                 intents: vec![intent],
                 state_updates: Vec::new(),
+                expectations: Vec::new(),
             })
         })
     }
