@@ -1169,6 +1169,40 @@ pub(crate) fn tighten_private_config_permissions() -> usize {
 mod tests {
     use super::*;
 
+    /// 后台「配置」页能不能真的把自动回收切起来——这条链路是"不登录服务器就能
+    /// 从影子档切到 active"的全部依据，值得直接钉住。
+    ///
+    /// `changed_document` 是那条链路的纯函数部分（表单 → TOML 文本），
+    /// 它必须能把 `traffic.turn_reclaim_enabled` 写进 `[traffic]` 段、
+    /// 并且**保留文件里原有的注释**（覆盖配置是手写文档，不能被后台抹掉）。
+    #[test]
+    fn the_config_page_can_flip_automatic_reclaim() {
+        let raw = "# 运行时覆盖配置\n[traffic]\n# 只记账、只打日志\nturn_stall_secs = 300\n";
+        let mut changes = BTreeMap::new();
+        changes.insert(
+            "traffic.turn_reclaim_enabled".to_string(),
+            Value::Bool(true),
+        );
+        changes.insert("traffic.turn_reclaim_secs".to_string(), Value::from(900));
+
+        let (updated, applied, skipped) =
+            changed_document(raw, &changes).expect("这两个键应当能写进去");
+        assert!(skipped.is_empty(), "不是密钥，不该被跳过：{skipped:?}");
+        assert!(applied.contains(&"traffic.turn_reclaim_enabled".to_string()));
+        assert!(updated.contains("turn_reclaim_enabled = true"), "{updated}");
+        assert!(updated.contains("turn_reclaim_secs = 900"), "{updated}");
+        assert!(
+            updated.contains("# 只记账、只打日志"),
+            "写回时必须保留原注释：{updated}"
+        );
+        // 写回之后必须仍是合法 TOML，且解析出来的就是新值。
+        let parsed: toml_edit::DocumentMut = updated.parse().expect("写回后应当仍是合法 TOML");
+        assert_eq!(
+            parsed["traffic"]["turn_reclaim_enabled"].as_bool(),
+            Some(true)
+        );
+    }
+
     /// 写主配置时必须把磁盘上的运行时覆盖一并算进去。
     ///
     /// 单独校验主配置的后果不只是误判跨段规则：`write_raw`/`patch`/`restore_backup`

@@ -532,8 +532,15 @@
     if (seconds === null || seconds === undefined) return '—';
     const total = Math.max(0, Math.round(Number(seconds) || 0));
     if (total < 60) return `${total} 秒`;
-    if (total < 3600) return `${Math.floor(total / 60)} 分 ${total % 60} 秒`;
-    return `${Math.floor(total / 3600)} 时 ${Math.floor((total % 3600) / 60)} 分`;
+    if (total < 3600) {
+      // 整分钟不补"0 秒"：阈值默认就是 180/600 秒这种整数，写成"10 分 0 秒"太啰嗦。
+      const seconds = total % 60;
+      return seconds === 0 ? `${total / 60} 分` : `${Math.floor(total / 60)} 分 ${seconds} 秒`;
+    }
+    const minutes = Math.floor((total % 3600) / 60);
+    return minutes === 0
+      ? `${Math.floor(total / 3600)} 时`
+      : `${Math.floor(total / 3600)} 时 ${minutes} 分`;
   }
 
   /** "排队 3 · 最老 12 秒"这一行，也用于顶部提醒。 */
@@ -558,6 +565,17 @@
     return h('div', { class: `card wait-card${stuck > 0 ? ' stalled' : ''}` },
       h('div', { class: 'card-head' },
         h('h3', { text: '等待房间' }),
+        // 一键切换"影子档 ↔ 自动回收"。放在这里而不是只留在「配置」页：看到
+        // "疑似卡住"的地方就是这张卡片，切档也该在这里，不该让人去 249 个字段里找。
+        h('button', {
+          class: `btn ghost small${auto ? ' wait-toggle-on' : ''}`,
+          text: auto ? '关闭自动回收' : '开启自动回收',
+          title: auto
+            ? '关掉之后只记账、只打 [STALL] 日志，卡住了需要人来点「回收这一轮」'
+            : '开启后：静默超过阈值且没有推进的回合会被自动判死（队列里的原文会补答）。'
+              + '先确认 [STALL] 日志里 would_reclaim=true 没有误报再开。',
+          onclick: (event) => toggleAutoReclaim(!auto, event.currentTarget),
+        }),
         h('span', {
           class: `pill ${stuck > 0 ? 'bad' : (idle ? '' : 'ok')}`,
           title: `静默超过 ${formatWait(info.stalled_after_secs)} 判为疑似卡住`,
@@ -571,6 +589,56 @@
         + (auto
           ? `自动回收已开启（超过 ${formatWait(info.reclaim_after_secs)} 的卡死回合会被自动判死）。`
           : `自动回收未开启：目前只记账、只打 [STALL] 日志，卡住了需要人来点「回收这一轮」。`)));
+  }
+
+  /** 影子档 ↔ 自动回收：改一个配置键，立刻生效。
+   *
+   *  走的是「配置」页同一个接口（`/api/config/patch`），只是把入口挪到看得到症状的
+   *  地方；`traffic` 不在 `restart_sections` 里，看门狗每一轮都用 `config::get()`
+   *  现取，所以**不用重启进程**，下一个扫描周期就按新档位跑。
+   *
+   *  开启要二次确认：它是唯一会主动丢掉"已生成未发出"回复的开关。  */
+  async function toggleAutoReclaim(enabled, button) {
+    if (enabled) {
+      const ok = window.confirm(
+        '开启自动回收？\n\n'
+        + '· 静默超过阈值、确认没有推进的回合会被自动判死\n'
+        + '· 那一轮已生成但没发出去的回复会被丢弃（不补发）\n'
+        + '· 队列里排着的消息不受影响，会按顺序补答\n'
+        + '· 立刻生效，不需要重启进程\n\n'
+        + '建议先确认 [STALL] 日志里 would_reclaim=true 没有误报。');
+      if (!ok) return;
+    }
+    button.disabled = true;
+    try {
+      // 首选运行时覆盖配置（生产上它落在可写目录，且发布新版本不会把它冲掉）；
+      // 开发机上那个文件可能还不存在，写不进去就退回主配置——两种部署都能切成。
+      const changes = { 'traffic.turn_reclaim_enabled': enabled };
+      try {
+        await api('/api/config/patch', {
+          method: 'POST',
+          body: { file: 'bot.conf.override.toml', changes },
+        });
+      } catch (overrideProblem) {
+        try {
+          await api('/api/config/patch', {
+            method: 'POST',
+            body: { file: 'bot.conf.toml', changes },
+          });
+        } catch (mainProblem) {
+          throw new Error(`覆盖配置与主配置都写不进去（${overrideProblem.message} / ${mainProblem.message}）`);
+        }
+      }
+      toast(enabled
+        ? '自动回收已开启：卡死的回合会被自动判死，队列里的消息会补答'
+        : '自动回收已关闭：只记账、只打 [STALL] 日志', enabled ? 'warn' : 'ok', 8000);
+      await fetchStatus(0);
+      updateWaitingRoomCard((statusCache.value && statusCache.value.waiting_room) || {});
+    } catch (problem) {
+      toast(`切换失败：${problem.message}`, 'bad', 9000);
+    } finally {
+      button.disabled = false;
+    }
   }
 
   /** 回收一个卡死的回合：人判断、机器执行。
