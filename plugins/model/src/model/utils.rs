@@ -4649,6 +4649,136 @@ mod tests {
     };
     use super::{is_group_paused, set_group_paused};
 
+    /// 真机探针：**配置里的那个模型到底会不会用 `reply_action` 工具。**
+    ///
+    /// 这是整个迁移唯一无法用替身回答的问题——替身返回的是"provider 会返回的东西"，
+    /// 而这里要问的是真 provider 在拿到这份工具声明后会不会去调它。跑的是仓库自己的请求
+    /// 组装（`params_model_with_native_tools` + `reply_action_tool_spec`），不是手搓的请求。
+    ///
+    /// 需要真密钥，所以默认 `#[ignore]`；本机没有 chat 端点密钥时不要打开：
+    ///
+    /// ```text
+    /// BOT_API_TOKEN=... cargo test -p model --lib live_model_calls_reply_action_tool -- --ignored
+    /// ```
+    ///
+    /// 断言故意留得宽：只要它**调了** `reply_action` 并且参数能过宿主的校验（`from_tool_arguments`）
+    /// 就算通过。具体填了哪些字段由她自己判断，不该由测试替她定；但"一次都没调"必须失败——
+    /// 那意味着线上每一次结构化回复都会退化成普通文字。
+    #[test]
+    #[ignore = "需要 BOT_API_TOKEN 与真实模型端点；跑一次会真的花钱"]
+    fn live_model_calls_reply_action_tool() {
+        use crate::model::reply::{
+            ReplyActionOutcome, attach_reply_action_candidates, clear_reply_targets,
+            record_reply_target, reply_action_from_tool_calls, reply_action_tool_spec,
+        };
+
+        let executor = kovi::tokio::runtime::Runtime::new().expect("test runtime");
+        executor.block_on(async {
+            let scope = crate::model::interrupt::ReplyScope::Group(9_777_001);
+            record_reply_target(scope, 4_242, Some(8_888), "群友", "今晚有空吗").await;
+
+            let mut messages = vec![BotMemory {
+                role: Roles::System,
+                content: super::group_system_prompt(),
+            }];
+            attach_reply_action_candidates(&mut messages, scope, Some(4_242)).await;
+            messages.push(BotMemory {
+                role: Roles::User,
+                content: "帮我@一下刚才那位，问问他几点方便".to_string(),
+            });
+
+            let tool_specs = vec![reply_action_tool_spec(
+                crate::config::qq_voice_enabled(),
+                crate::sticker_library::is_available(),
+            )];
+            let payload = super::params_model_with_native_tools(
+                &mut messages,
+                &[],
+                &tool_specs,
+                Some(256),
+                &[],
+                None,
+                None,
+            )
+            .await;
+
+            println!(
+                "[live-probe] content={:?} tool_calls={:?} finish_reason={:?}",
+                payload.content.chars().take(120).collect::<String>(),
+                payload
+                    .tool_calls
+                    .iter()
+                    .map(|call| call.name.as_str())
+                    .collect::<Vec<_>>(),
+                payload.finish_reason,
+            );
+
+            match reply_action_from_tool_calls(
+                &payload.tool_calls,
+                payload.finish_reason.as_deref(),
+            ) {
+                ReplyActionOutcome::Submitted(action) => {
+                    println!("[live-probe] reply_action 参数通过校验: {action:?}");
+                }
+                ReplyActionOutcome::Invalid(reason) => {
+                    panic!("模型调了 reply_action，但参数没通过宿主校验: {reason}");
+                }
+                ReplyActionOutcome::Absent => panic!(
+                    "模型没有调用 reply_action（正文抽查: {:?}）——线上结构化回复会全部退化",
+                    payload.content.chars().take(200).collect::<String>()
+                ),
+            }
+
+            clear_reply_targets(scope).await;
+
+            // 反向：普通闲聊不该调工具。工具每轮都在手里，如果她见谁都调，
+            // 每条回复都会多背一轮工具往返——那是这次迁移最容易引入的退化。
+            let mut chat = vec![
+                BotMemory {
+                    role: Roles::System,
+                    content: super::group_system_prompt(),
+                },
+                BotMemory {
+                    role: Roles::User,
+                    content: "今天风挺大的，你那边冷不冷呀".to_string(),
+                },
+            ];
+            let payload = super::params_model_with_native_tools(
+                &mut chat,
+                &[],
+                &tool_specs,
+                Some(256),
+                &[],
+                None,
+                None,
+            )
+            .await;
+            println!(
+                "[live-probe] 闲聊: content={:?} tool_calls={:?}",
+                payload.content.chars().take(120).collect::<String>(),
+                payload
+                    .tool_calls
+                    .iter()
+                    .map(|call| call.name.as_str())
+                    .collect::<Vec<_>>(),
+            );
+            assert!(
+                matches!(
+                    reply_action_from_tool_calls(
+                        &payload.tool_calls,
+                        payload.finish_reason.as_deref()
+                    ),
+                    ReplyActionOutcome::Absent
+                ),
+                "普通闲聊不该调用 reply_action，否则每轮都多一次工具往返"
+            );
+            assert!(
+                !payload.content.trim().is_empty(),
+                "闲聊那一轮必须留下可见正文，否则她会突然不说话"
+            );
+        });
+    }
+
     #[test]
     fn mock_model_replaces_the_network_call() {
         // 替身自己也要有测试：它要是没生效，所有 seam 测试都会偷偷去打真网络——
