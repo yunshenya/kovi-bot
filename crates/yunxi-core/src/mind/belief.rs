@@ -246,30 +246,17 @@ impl Belief {
         Ok(updated)
     }
 
-    /// 让这条看法在 `at` 之后不再有效（退休）。
-    ///
-    /// 两个用途：被合并掉的重复项要让位，以及她改了主意之后旧的那条要真正退场。
-    /// belief 必须能退休——否则数量只增不减，"容量上限"会变成一堵永久堵死、
-    /// 而且（原来）完全静默的墙。退休不是删除：记录还在，`valid_until` 之后
-    /// 不再出现在 active 查询里，追溯得到"她以前是这么想的"。
-    ///
-    /// **私有是故意的。** 存储层的契约是"每次 upsert 恰好 `expected + 1`"，
-    /// 所以一次业务更新只能自增一次版本；这个方法单独用会自增一次，再叠上
-    /// [`Belief::apply_delta`] 就成两次，于是每一次"改主意"都被 `VersionConflict`
-    /// 打回、整批反思一起回滚（2026-09-15 定位到的线上故障）。要一次更新里既走
-    /// 证据又退休，用 [`Belief::apply_update`]。
-    fn retired_at(mut self, at: DateTime<Utc>) -> Result<Self, MindValidationError> {
-        self.valid_until = Some(at);
-        self.updated_at = self.updated_at.max(at);
-        self.version = self.version.saturating_add(1);
-        self.validate()?;
-        Ok(self)
-    }
-
     /// 一次业务更新：证据增量 +（可选的）退休，**版本只自增一次**。
     ///
     /// 这是 update 路径唯一应当调用的入口。`valid_until` 是"这次更新之后这条
-    /// 看法还算不算数"，它和证据属于同一次更新，不是第二次更新。
+    /// 看法还算不算数"，它和证据属于同一次更新，不是第二次更新——存储层的契约是
+    /// "每次 upsert 恰好 `expected + 1`"，所以一次业务更新只能自增一次版本。
+    ///
+    /// 这里曾经把它拆成 `apply_delta` + `retired_at` 两步，各加一次版本，于是
+    /// 每一次"改主意"都被 `VersionConflict` 打回、整批反思一起回滚（2026-09-15
+    /// 定位到的线上故障）。退休本身是有意义的：不退休的话 belief 只增不减，
+    /// "容量上限"会变成一堵永久堵死的墙；退休也不是删除——记录还在，`valid_until`
+    /// 之后不再出现在 active 查询里，追溯得到"她以前是这么想的"。
     pub fn apply_update(
         &self,
         confidence_delta: f32,
