@@ -1307,6 +1307,63 @@ mod tests {
         assert_eq!(runtime.register_expectation(&event, late), Ok(false));
     }
 
+    /// A turn that requested no tool still ends. Tracking that end cannot lean
+    /// on the tool-budget ledger, because such a turn never allocates an entry
+    /// there — which is exactly how a late registration used to slip through.
+    #[test]
+    fn a_task_without_tool_rounds_also_stops_accepting_expectations() {
+        let conversation_id = ConversationId::new();
+        let (handle, mut runtime) =
+            CognitiveRuntime::new(RuntimeConfig::default()).expect("runtime");
+        runtime.install_services(CoreServices::with_model(PlainReplyModel));
+        let event = message_event(conversation_id);
+        block_on(handle.submit(event.clone())).expect("submit");
+        let arbiter = ActionArbiter::new(ActionArbiterConfig {
+            capabilities: EnvironmentCapabilities::all(),
+            ..ActionArbiterConfig::default()
+        });
+        let mut observer = Recorder {
+            replying_allowed: true,
+            ..Recorder::default()
+        };
+        let driven = block_on(drain(&mut runtime, &arbiter, &ImmediatePort, &mut observer));
+        assert_eq!(driven, 1, "one plain reply, no tool round");
+
+        let late = crate::executive::Expectation::new(
+            crate::ActionId::new(),
+            crate::executive::ExpectedEventPattern::EventType(EventType::IdleTick),
+            0.5,
+            None,
+        );
+        assert_eq!(
+            runtime.register_expectation(&event, late),
+            Ok(false),
+            "a finished task must refuse late expectations even without a tool round"
+        );
+    }
+
+    /// Answers every message directly; never asks for a tool.
+    #[derive(Debug, Clone, Copy)]
+    struct PlainReplyModel;
+
+    impl ModelBackend for PlainReplyModel {
+        fn plan<'a>(&'a self, input: &'a PlannerInput) -> ModelBackendFuture<'a> {
+            Box::pin(async move {
+                let WorldEventKind::MessageReceived(message) = input.event.kind() else {
+                    return Ok(DecisionPlan::silent());
+                };
+                Ok(DecisionPlan {
+                    disposition: DecisionDisposition::Reply,
+                    intents: vec![CognitiveIntent::send_message(
+                        message.conversation_id,
+                        MessageContent::text("好"),
+                    )],
+                    state_updates: Vec::new(),
+                })
+            })
+        }
+    }
+
     #[test]
     fn observed_mode_consumes_events_without_a_planner() {
         let conversation_id = ConversationId::new();

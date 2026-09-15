@@ -45,6 +45,8 @@ const MAX_TOOL_TRACE_BUDGET_ENTRIES: usize = 1_024;
 /// depth-zero event cannot create a fresh cumulative budget entry. The set is
 /// bounded because event IDs are opaque and contain no user content.
 const MAX_CLOSED_TOOL_TRACE_TOMBSTONES: usize = 4_096;
+/// Cap on the ended-trace record used to refuse late expectation registration.
+const MAX_ENDED_TRACE_TOMBSTONES: usize = 4_096;
 const MAX_TOOL_BATCH_OPERATION_CHARS: usize = 128;
 const MAX_TOOL_OPERATION_BYTES: usize = 1_024;
 const MAX_TOOL_ERROR_CATEGORY_BYTES: usize = 256;
@@ -408,6 +410,12 @@ pub struct CognitiveRuntime {
     /// and parked until the next turn consumes them.
     probed_commands: VecDeque<RuntimeCommand>,
     pending_tool_follow_ups: VecDeque<WorldEvent>,
+    /// Which traces have already ended, so a late registration can be refused.
+    ///
+    /// Tracked separately from the tool-budget ledger: a turn that requested no
+    /// tool never allocates a budget entry, so "no entry" cannot stand in for
+    /// "finished".
+    lifecycle: TraceLifecycle,
     /// What each in-flight task has tried so far, keyed by trace root.
     ///
     /// Bounded by the same lifecycle as the tool budget ledger: an entry
@@ -590,6 +598,7 @@ impl CognitiveRuntime {
                 receiver,
                 probed_commands: VecDeque::new(),
                 pending_tool_follow_ups: VecDeque::new(),
+                lifecycle: TraceLifecycle::default(),
                 working_memory: HashMap::new(),
                 tool_action_budget_by_trace: HashMap::new(),
                 tool_action_budget_order: VecDeque::new(),
@@ -750,16 +759,17 @@ impl CognitiveRuntime {
     /// declare its own expectations) says what should follow an action, and the
     /// loop reports back whether it did.
     ///
-    /// Fails closed for a trace that already reached a terminal state: an
-    /// expectation registered after the task ended could never be observed by
-    /// it, and would only leak quota.
+    /// A trace that already ended is refused: nothing will ever be observed
+    /// against an expectation registered after its task is over, so accepting
+    /// it would only hold quota until an unrelated event happened to notice the
+    /// deadline.
     pub fn register_expectation(
         &mut self,
         event: &WorldEvent,
         expectation: crate::Expectation,
     ) -> Result<bool, &'static str> {
         let root = event.trace().root_event_id();
-        if self.closed_tool_budget_roots.contains(&root) {
+        if self.lifecycle.has_ended(root) {
             return Ok(false);
         }
         self.executive
@@ -848,6 +858,7 @@ impl CognitiveRuntime {
         if self.root_has_pending_tool_follow_up(root) {
             return;
         }
+        self.lifecycle.record_ended(root);
         // A task that has stopped producing events can no longer satisfy what
         // it expected, so settle those expectations before the record is
         // dropped. This is the only place a deadline is evaluated without an
@@ -2741,6 +2752,37 @@ fn action_result_event(
         Some(actor) => event.with_actor(actor),
         None => event,
     })
+}
+
+/// A bounded record of which traces have ended.
+///
+/// Terminal roots are held as tombstones with a cap, so the record cannot grow
+/// with traffic. A tombstone that ages out only means a very stale root is no
+/// longer recognised as finished — a registration for it would then be accepted
+/// and settled by the tracker's own quota, which is bounded either way.
+#[derive(Debug, Default)]
+struct TraceLifecycle {
+    ended: HashSet<EventId>,
+    ended_order: VecDeque<EventId>,
+}
+
+impl TraceLifecycle {
+    fn record_ended(&mut self, root: EventId) {
+        if !self.ended.insert(root) {
+            return;
+        }
+        self.ended_order.push_back(root);
+        while self.ended_order.len() > MAX_ENDED_TRACE_TOMBSTONES {
+            let Some(expired) = self.ended_order.pop_front() else {
+                break;
+            };
+            self.ended.remove(&expired);
+        }
+    }
+
+    fn has_ended(&self, root: EventId) -> bool {
+        self.ended.contains(&root)
+    }
 }
 
 /// Converts every tool action result into one follow-up event. Normal adapter
