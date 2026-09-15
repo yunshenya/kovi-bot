@@ -112,7 +112,7 @@ pub use consolidation::{
     AgendaOperation, AgendaUpdateProposal, Consolidation, ConsolidationConfig, ConsolidationError,
     ConsolidationPlan, ConsolidationResult, InterestOperation, InterestUpdateProposal, MindUpsert,
     OpenQuestionOperation, OpenQuestionUpdateProposal, PreferenceOperation,
-    PreferenceUpdateProposal,
+    PreferenceUpdateProposal, storage_validation_config,
 };
 pub use curiosity::{CuriosityId, CuriosityItem, CuriosityStatus};
 pub use decision::{MindDecisionProjection, MindDecisionReference};

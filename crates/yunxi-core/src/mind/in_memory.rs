@@ -677,12 +677,7 @@ impl MindConsolidationStore for InMemoryMindStore {
         plan: &'a ConsolidationPlan,
     ) -> MindStoreFuture<'a, ConsolidationResult> {
         Box::pin(async move {
-            plan.validate(super::ConsolidationConfig {
-                max_belief_delta: 1.0,
-                max_preference_delta: 1.0,
-                max_interest_affinity_delta: 1.0,
-                max_updates_per_reflection: 128,
-            })?;
+            plan.validate(super::consolidation::storage_validation_config())?;
             let mut state = self.write();
             if state.version != plan.base_mind_version {
                 return Err(MindStoreError::VersionConflict {

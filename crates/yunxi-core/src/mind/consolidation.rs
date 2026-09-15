@@ -205,6 +205,22 @@ pub struct ConsolidationConfig {
     pub max_updates_per_reflection: usize,
 }
 
+/// 存储层校验计划时用的宽松界。
+///
+/// 分工：**策略**上限由 [`Consolidation::prepare`] 按 `ConsolidationConfig` 钳制，
+/// 存储层只保证"形状与绝对量级不出格"。所以这里必须**不小于**任何合法策略配置——否则
+/// 存储层会拒掉策略层刚刚允许的计划（那种失败会表现为"整批反思无故回滚"）。
+/// 内存后端与 Postgres 后端共用这一个来源，免得两边各写一份、慢慢漂移。
+#[must_use]
+pub fn storage_validation_config() -> ConsolidationConfig {
+    ConsolidationConfig {
+        max_belief_delta: 1.0,
+        max_preference_delta: 1.0,
+        max_interest_affinity_delta: 1.0,
+        max_updates_per_reflection: 128,
+    }
+}
+
 impl Default for ConsolidationConfig {
     fn default() -> Self {
         Self {

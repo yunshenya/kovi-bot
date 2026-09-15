@@ -1056,6 +1056,19 @@ async fn nonempty_snapshot_query_returns_only_relevant_state_or_no_opinion() {
     );
 }
 
+#[test]
+fn storage_validation_bounds_never_undercut_the_policy_defaults() {
+    // 存储层只保证"形状与量级不出格"，策略上限由 `Consolidation::prepare` 按
+    // `ConsolidationConfig` 钳制。所以存储层的界**必须不小于**任何合法策略配置：
+    // 一旦被改小，策略层刚允许的计划会被存储层拒掉，表现成"整批反思无故回滚"。
+    let storage = storage_validation_config();
+    let policy = ConsolidationConfig::default();
+    assert!(storage.max_belief_delta >= policy.max_belief_delta);
+    assert!(storage.max_preference_delta >= policy.max_preference_delta);
+    assert!(storage.max_interest_affinity_delta >= policy.max_interest_affinity_delta);
+    assert!(storage.max_updates_per_reflection >= policy.max_updates_per_reflection);
+}
+
 #[tokio::test]
 async fn consolidation_clamps_updates_and_rejects_stale_snapshot() {
     let store = Arc::new(InMemoryMindStore::new());

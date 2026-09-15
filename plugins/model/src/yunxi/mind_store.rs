@@ -527,15 +527,6 @@ fn validate_limit(limit: usize) -> Result<i64, MindStoreError> {
     Ok(limit as i64)
 }
 
-fn storage_validation_config() -> ConsolidationConfig {
-    ConsolidationConfig {
-        max_belief_delta: 1.0,
-        max_preference_delta: 1.0,
-        max_interest_affinity_delta: 1.0,
-        max_updates_per_reflection: 128,
-    }
-}
-
 async fn lock_meta(transaction: &mut Transaction<'_, Postgres>) -> Result<u64, MindStoreError> {
     let row = query("SELECT version FROM yunxi_mind_meta WHERE singleton = TRUE FOR UPDATE")
         .fetch_one(&mut **transaction)
@@ -1718,7 +1709,7 @@ impl MindConsolidationStore for PostgresMindStore {
         plan: &'a ConsolidationPlan,
     ) -> MindStoreFuture<'a, ConsolidationResult> {
         Box::pin(async move {
-            plan.validate(storage_validation_config())?;
+            plan.validate(yunxi_core::mind::storage_validation_config())?;
             let mut transaction = self.pool.begin().await.map_err(MindStoreError::storage)?;
             let actual_version = lock_meta(&mut transaction).await?;
             if actual_version != plan.base_mind_version {
