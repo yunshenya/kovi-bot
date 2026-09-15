@@ -18,6 +18,13 @@ pub struct TrafficConfig {
     /// （`has_queued` 曾让后续消息一直排队，而排空永远不发生）。看门狗每
     /// 这个间隔扫一遍"队列非空且会话空闲"的群补踢一次，是最后一道保险。
     window_drain_sweep_secs: u64,
+    /// "排空还在、但已经多久没推进就算卡住"的阈值（秒）。
+    ///
+    /// 只影响管理后台的判定与措辞，不改变任何回复行为。默认 180 秒的理由：
+    /// 一次群聊回合最坏要串几次模型调用（每次 30 秒超时 ×3 次重试），把阈值压到
+    /// 几十秒会把"正在慢慢回"误报成卡住；放到十分钟又会让人盯着一个已经死了的
+    /// 队列白等。180 秒恰好卡在两者之间。
+    window_stall_secs: u64,
     max_input_chars: usize,
     max_model_response_bytes: usize,
     max_model_queue: usize,
@@ -51,6 +58,10 @@ impl TrafficConfig {
 
     pub fn window_drain_sweep_secs(&self) -> u64 {
         self.window_drain_sweep_secs
+    }
+
+    pub fn window_stall_secs(&self) -> u64 {
+        self.window_stall_secs
     }
 
     pub fn max_input_chars(&self) -> usize {
@@ -88,6 +99,11 @@ impl TrafficConfig {
                 "traffic.window_drain_sweep_secs 必须在 5 到 600 之间"
             ));
         }
+        if !(30..=3_600).contains(&self.window_stall_secs) {
+            return Err(anyhow::anyhow!(
+                "traffic.window_stall_secs 必须在 30 到 3600 之间"
+            ));
+        }
         if !(256..=32_000).contains(&self.max_input_chars) {
             return Err(anyhow::anyhow!(
                 "traffic.max_input_chars 必须在 256 到 32000 之间"
@@ -117,6 +133,7 @@ impl Default for TrafficConfig {
             cooldown_secs: 120,
             max_pending_turns: 16,
             window_drain_sweep_secs: 30,
+            window_stall_secs: 180,
             max_input_chars: 6_000,
             max_model_response_bytes: 2 * 1024 * 1024,
             max_model_queue: 64,
@@ -150,6 +167,25 @@ mod tests {
         config.window_drain_sweep_secs = 5;
         assert!(config.validate().is_ok());
         config.window_drain_sweep_secs = 600;
+        assert!(config.validate().is_ok());
+    }
+
+    /// 卡住阈值只影响后台的判定与措辞：太短会把"正在慢慢回"误报成卡住，
+    /// 太长等于让一个已经死了的队列在页面上装作还在跑。
+    #[test]
+    fn window_stall_threshold_is_bounded() {
+        let mut config = TrafficConfig::default();
+        assert_eq!(config.window_stall_secs(), 180);
+
+        config.window_stall_secs = 0;
+        assert!(config.validate().is_err());
+        config.window_stall_secs = 29;
+        assert!(config.validate().is_err());
+        config.window_stall_secs = 3_601;
+        assert!(config.validate().is_err());
+        config.window_stall_secs = 30;
+        assert!(config.validate().is_ok());
+        config.window_stall_secs = 3_600;
         assert!(config.validate().is_ok());
     }
 }

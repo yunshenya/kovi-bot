@@ -16,6 +16,7 @@ pub(crate) async fn status(State(state): State<Arc<AdminState>>) -> Result<Json<
 
     let (database, redis) = kovi::tokio::join!(database_health(), redis_health());
     let counts = super::memory_api::counts().await;
+    let waiting_room = waiting_room_report().await;
 
     let snapshot = kovi::tokio::task::spawn_blocking(system_snapshot)
         .await
@@ -47,6 +48,10 @@ pub(crate) async fn status(State(state): State<Arc<AdminState>>) -> Result<Json<
             // 已保存、但要重启才生效的分区。
             "pending_restart": state.pending_restart(),
         },
+        // 等待房间 / 会话票据的实时状态（2026-09-15 那次"群静默十小时"之后加的）。
+        // 卡住时页面要能自己说出来：哪个会话、排队几条、最老一条等了多久、
+        // 排空任务还在不在、这个回合活了多久。
+        "waiting_room": waiting_room,
         "config": {
             "path": config_path.display().to_string(),
             "bytes": metadata.as_ref().map(std::fs::Metadata::len),
@@ -90,6 +95,60 @@ pub(crate) async fn status(State(state): State<Arc<AdminState>>) -> Result<Json<
             "sticker_ready": crate::sticker_library::is_available(),
         },
     })))
+}
+
+/// 等待房间与会话票据的实时快照。
+///
+/// 口径在 `model::waiting_room` 里统一（判定"卡住"的阈值来自配置），这里只负责
+/// 把它摊成 JSON。只报有内容的会话：空闲会话不占版面，页面上一眼就能看出
+/// "现在到底有没有人在等、等了多久"。
+async fn waiting_room_report() -> Value {
+    let stalled_after =
+        std::time::Duration::from_secs(crate::config::get().traffic().window_stall_secs());
+    let reports = crate::model::waiting_room::report(stalled_after).await;
+    let scopes: Vec<Value> = reports
+        .iter()
+        .map(|report| {
+            json!({
+                "kind": report.kind,
+                "subject_id": report.subject_id,
+                "queued": report.queued,
+                "oldest_queued_secs": report.oldest_queued_secs,
+                "oldest_sender": report.oldest_sender,
+                "oldest_preview": report.oldest_preview,
+                "processing": report.processing,
+                "drain_active": report.drain_active,
+                "drain_drained": report.drain_drained,
+                "drain_last_progress_secs": report.drain_last_progress_secs,
+                "ticket": report.ticket.as_ref().map(|ticket| json!({
+                    "generation": ticket.generation,
+                    "age_secs": ticket.age_secs,
+                })),
+                "reply": {
+                    "generation": report.reply.generation,
+                    "conversation_version": report.reply.conversation_version,
+                    "active_secs": report.reply.active_secs,
+                    "pending_incoming": report.reply.pending_incoming,
+                    "active_incoming": report.reply.active_incoming,
+                    "pending_incoming_expires_in_secs":
+                        report.reply.pending_incoming_expires_in_secs,
+                    "prepared_outgoing": report.reply.prepared_outgoing,
+                    "oldest_prepared_secs": report.reply.oldest_prepared_secs,
+                    "precommit_armed": report.reply.precommit_armed,
+                    "collision_count": report.reply.collision_count,
+                    "last_seen_secs": report.reply.last_seen_secs,
+                },
+                "stuck": report.stuck,
+                "stuck_reason": report.stuck_reason,
+                "summary": report.summary,
+            })
+        })
+        .collect();
+    json!({
+        "stalled_after_secs": stalled_after.as_secs(),
+        "stuck": reports.iter().filter(|report| report.stuck).count(),
+        "scopes": scopes,
+    })
 }
 
 async fn database_health() -> Value {

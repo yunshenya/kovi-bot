@@ -28,6 +28,7 @@ use crate::model::utils::{
     learn_user_profile_from_message, process_group_reply_claimed, report_vision_failure,
     send_sys_info, set_group_paused,
 };
+use crate::model::waiting_room::{self, DrainGuard, QueueView};
 use crate::redis_store;
 use crate::reminders;
 use crate::sticker_memory;
@@ -1469,6 +1470,8 @@ async fn drain_pending_window_messages_from_current(group_id: i64, bot: &Arc<Run
         .await
         .remove(&group_id)
         .map_or(0, |queue| queue.len());
+    // 队列被丢掉，观测里的深度也必须跟着归零，否则后台会一直显示"还有人在等"。
+    publish_group_queue_state(group_id).await;
     if dropped > 0 {
         println!(
             "[WARN] 群聊回复状态已不存在，丢弃 {} 条排队消息 (群组: {})",
@@ -1554,6 +1557,7 @@ async fn delete_group_data(group_id: i64, bot: &RuntimeBot) {
             .cancel_where(|(candidate_group_id, _)| *candidate_group_id == group_id)
             .await;
         PENDING_WINDOW_MESSAGES.lock().await.remove(&group_id);
+        publish_group_queue_state(group_id).await;
         clear_group_erasure_reply_state_locked(scope).await;
     }
     GROUP_INTERJECTION_STATE.lock().await.remove(&group_id);
@@ -2307,9 +2311,20 @@ async fn queue_pending_window_message(
             message_ids,
             sticker_teaching_message,
             understanding,
+            enqueued_at: Instant::now(),
         },
         "群聊",
         group_id,
+    );
+    waiting_room::record_queue(
+        ReplyScope::Group(group_id),
+        &QueueView {
+            queued: queue.len(),
+            oldest_enqueued_at: queue.front().map(|turn| turn.enqueued_at),
+        },
+        queue
+            .front()
+            .map(|turn| (turn.sender.as_str(), turn.message.as_str())),
     );
 }
 
@@ -2424,6 +2439,7 @@ async fn stop_group_reply(group_id: i64, user_id: i64, ingress: ReplyTicket) {
     let _ = ConversationCoordinator::cancel_current_incoming_locked(ingress).await;
     GROUP_MESSAGE_BATCHES.cancel((group_id, user_id)).await;
     PENDING_WINDOW_MESSAGES.lock().await.remove(&group_id);
+    publish_group_queue_state(group_id).await;
     if let Some(state) = GROUP_INTERJECTION_STATE.lock().await.get_mut(&group_id) {
         state.conversation.close();
     }
@@ -2449,6 +2465,10 @@ async fn drain_pending_window_messages_with(
     mut completed: crate::model::ReplyTicket,
     wait: WindowDrainWait,
 ) {
+    let scope = ReplyScope::Group(group_id);
+    // 活性记账：卡死时后台要能看出"排空在不在跑、多久没推进"（见 waiting_room）。
+    // guard 的 Drop 保证取消/panic 路径也会把 active 落回去，不会留下假活性。
+    let guard = DrainGuard::begin(scope);
     let mut drained = 0_usize;
     loop {
         let Some((pending, ticket)) = take_pending_window_turn(group_id, completed, wait).await
@@ -2459,11 +2479,15 @@ async fn drain_pending_window_messages_with(
                     group_id, drained
                 );
             }
+            publish_group_queue_state(group_id).await;
+            drop(guard);
             return;
         };
         drained += 1;
+        guard.note_progress();
 
         println!("[INFO] 群聊开始处理排队窗口消息 (群组: {})", group_id);
+        waiting_room::note_processing(scope, pending.sender.as_str(), pending.message.as_str());
         let turn_marker =
             begin_conversation_turn(group_id, pending.user_id, &pending.understanding).await;
         let replied = crate::model::utils::process_group_reply_claimed(
@@ -2482,8 +2506,30 @@ async fn drain_pending_window_messages_with(
         )
         .await;
         finish_conversation_turn(group_id, pending.user_id, turn_marker, replied).await;
+        publish_group_queue_state(group_id).await;
         completed = ticket;
     }
+}
+
+/// 把群聊等待房间的当前深度与最老一条摘进运行时观测。
+///
+/// 目的一是后台能直接看到"谁在等、等了多久"，二是它同时是**活性打点**：卡住时
+/// 这个数字会一直停在上一次推进，正常时它每处理一条就往前走一次。
+async fn publish_group_queue_state(group_id: i64) {
+    let pending = PENDING_WINDOW_MESSAGES.lock().await;
+    let queue = pending.get(&group_id);
+    waiting_room::record_queue(
+        ReplyScope::Group(group_id),
+        &QueueView {
+            queued: queue.map_or(0, VecDeque::len),
+            oldest_enqueued_at: queue
+                .and_then(|queue| queue.front())
+                .map(|turn| turn.enqueued_at),
+        },
+        queue
+            .and_then(|queue| queue.front())
+            .map(|turn| (turn.sender.as_str(), turn.message.as_str())),
+    );
 }
 
 async fn take_pending_window_turn(
@@ -2527,6 +2573,19 @@ async fn take_pending_window_turn(
                 && ConversationCoordinator::pending_incoming_for_ticket_locked(completed).await;
             if queue.is_empty() {
                 pending_by_group.remove(&group_id);
+            } else if result.is_some() {
+                // 领走一条之后立刻刷一次深度：活性的心跳点就落在这里（`note_progress`），
+                // 观测里的"排队还剩几条"与"最老一条等了多久"因此每处理一条都往前走一次。
+                waiting_room::record_queue(
+                    scope,
+                    &QueueView {
+                        queued: queue.len(),
+                        oldest_enqueued_at: queue.front().map(|turn| turn.enqueued_at),
+                    },
+                    queue
+                        .front()
+                        .map(|turn| (turn.sender.as_str(), turn.message.as_str())),
+                );
             }
             (result, should_wait)
         };

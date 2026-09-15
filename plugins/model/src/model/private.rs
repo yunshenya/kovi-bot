@@ -25,6 +25,7 @@ use crate::model::utils::{
     is_help_command, is_main_admin, is_restricted_command, private_chat_claimed,
     report_vision_failure, send_sys_info_private,
 };
+use crate::model::waiting_room::{self, QueueView};
 use crate::private_image_memory::{
     RecentPrivateImage, forget_private_user_images, recent_private_images, remember_private_images,
 };
@@ -48,7 +49,7 @@ use kovi::tokio::sync::Mutex;
 use kovi::{Message, RuntimeBot};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, LazyLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 static PRIVATE_MESSAGE_BATCHES: LazyLock<MessageCoalescer<i64>> = LazyLock::new(Default::default);
 
@@ -965,6 +966,7 @@ async fn stop_private_reply(user_id: i64, ingress: ReplyTicket) -> bool {
     }
     PRIVATE_MESSAGE_BATCHES.cancel(user_id).await;
     PENDING_PRIVATE_MESSAGES.lock().await.remove(&user_id);
+    publish_private_queue_state(user_id).await;
     true
 }
 
@@ -976,6 +978,7 @@ async fn delete_private_user_data(user_id: i64, self_id: i64, bot: &RuntimeBot) 
         ConversationCoordinator::interrupt_locked(scope).await;
         PRIVATE_MESSAGE_BATCHES.cancel(user_id).await;
         PENDING_PRIVATE_MESSAGES.lock().await.remove(&user_id);
+        publish_private_queue_state(user_id).await;
         clear_reply_scope_locked(scope).await;
     }
 
@@ -1142,6 +1145,7 @@ async fn clear_private_erasure_runtime_state(user_id: i64) {
         ConversationCoordinator::interrupt_locked(scope).await;
         PRIVATE_MESSAGE_BATCHES.cancel(user_id).await;
         PENDING_PRIVATE_MESSAGES.lock().await.remove(&user_id);
+        publish_private_queue_state(user_id).await;
         clear_reply_scope_locked(scope).await;
         clear_reply_state_locked(scope).await;
     }
@@ -1471,6 +1475,7 @@ async fn drain_pending_private_messages_from_current(user_id: i64, bot: &Arc<Run
         .await
         .remove(&user_id)
         .map_or(0, |queue| queue.len());
+    publish_private_queue_state(user_id).await;
     if dropped > 0 {
         println!(
             "[WARN] 私聊回复状态已不存在，丢弃 {} 条排队消息 (用户: {})",
@@ -1532,9 +1537,20 @@ async fn queue_pending_private_message(
             message_ids,
             sticker_teaching_message,
             understanding,
+            enqueued_at: Instant::now(),
         },
         "私聊",
         user_id,
+    );
+    waiting_room::record_queue(
+        ReplyScope::Private(user_id),
+        &QueueView {
+            queued: queue.len(),
+            oldest_enqueued_at: queue.front().map(|turn| turn.enqueued_at),
+        },
+        queue
+            .front()
+            .map(|turn| (turn.sender.as_str(), turn.message.as_str())),
     );
 }
 
@@ -1543,6 +1559,9 @@ async fn drain_pending_private_messages(
     bot: Arc<RuntimeBot>,
     mut completed: crate::model::ReplyTicket,
 ) {
+    let scope = ReplyScope::Private(user_id);
+    // 与群聊同一套活性记账，理由见 `waiting_room` 模块头。
+    let guard = waiting_room::DrainGuard::begin(scope);
     let mut drained = 0_usize;
     loop {
         let Some((pending, ticket)) = take_pending_private_turn(user_id, completed).await else {
@@ -1552,11 +1571,15 @@ async fn drain_pending_private_messages(
                     user_id, drained
                 );
             }
+            publish_private_queue_state(user_id).await;
+            drop(guard);
             return;
         };
         drained += 1;
+        guard.note_progress();
 
         println!("[INFO] 私聊开始处理排队消息 (用户: {})", user_id);
+        waiting_room::note_processing(scope, pending.sender.as_str(), pending.message.as_str());
         private_chat_claimed(
             user_id,
             &pending.message,
@@ -1569,8 +1592,27 @@ async fn drain_pending_private_messages(
             pending.understanding,
         )
         .await;
+        publish_private_queue_state(user_id).await;
         completed = ticket;
     }
+}
+
+/// 与群聊同源：把私聊等待房间的深度与最老一条摘进运行时观测。
+async fn publish_private_queue_state(user_id: i64) {
+    let pending = PENDING_PRIVATE_MESSAGES.lock().await;
+    let queue = pending.get(&user_id);
+    waiting_room::record_queue(
+        ReplyScope::Private(user_id),
+        &QueueView {
+            queued: queue.map_or(0, VecDeque::len),
+            oldest_enqueued_at: queue
+                .and_then(|queue| queue.front())
+                .map(|turn| turn.enqueued_at),
+        },
+        queue
+            .and_then(|queue| queue.front())
+            .map(|turn| (turn.sender.as_str(), turn.message.as_str())),
+    );
 }
 
 async fn take_pending_private_turn(

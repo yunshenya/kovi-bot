@@ -276,6 +276,11 @@ max_pending_turns = 16
 # "排队"8 次、"排空"0 次）。看门狗每这个间隔扫一遍"队列非空且会话空闲"的
 # 群补踢一次，间隔就是这个上限：太短是白扫，太长等于群里继续沉默。
 window_drain_sweep_secs = 30
+# 「排空还在、但已经多久没推进就算卡住」的阈值（秒，30~3600），只影响管理后台
+# 概览页 waiting_room 那一栏的判定与措辞，不改变任何回复行为。默认 180 秒的理由
+# 见 bot.conf.example.toml 同名一项：压太短会把"正在慢慢回"误报成卡住，放太长
+# 等于让人盯着一个已经死了的队列白等。
+window_stall_secs = 180
 max_input_chars = 6000
 max_model_response_bytes = 2097152
 max_model_queue = 64

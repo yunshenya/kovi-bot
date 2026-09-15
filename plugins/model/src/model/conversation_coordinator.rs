@@ -18,6 +18,7 @@ use crate::config;
 use crate::vision::VisionImage;
 use kovi::Message;
 use std::collections::VecDeque;
+use std::time::Instant;
 
 /// 一个不可拆分的待处理 turn；正文、发送者、附件和消息 ID 总是一起入队。
 #[derive(Debug, Clone)]
@@ -30,6 +31,11 @@ pub(crate) struct PendingTurn {
     pub(crate) message_ids: Vec<i32>,
     pub(crate) understanding: MessageUnderstanding,
     pub(crate) sticker_teaching_message: Option<Message>,
+    /// 入队时刻，只服务运行时观测（"最老一条等了多久"）。
+    ///
+    /// 折进队列（`fold_into_bounded_queue`）的那条会继承最老那一条的时间：
+    /// 正文被保留下来了，"它等了多久"就该按最早的那条算。
+    pub(crate) enqueued_at: Instant,
 }
 
 /// Executive's semantic decision for an otherwise valid prepared outgoing.
@@ -753,6 +759,9 @@ fn fold_into_bounded_queue(
         if turn.sticker_teaching_message.is_none() {
             turn.sticker_teaching_message = oldest.sticker_teaching_message;
         }
+        // 正文按 FIFO 折进来了，等待时间就该按最早那条算——否则"最老一条等了多久"
+        // 会随着每次折队一起变年轻，正好把"这个群已经等了很久"这件事抹掉。
+        turn.enqueued_at = turn.enqueued_at.min(oldest.enqueued_at);
     }
     queue.push_back(turn);
     folded
@@ -771,6 +780,7 @@ mod tests {
         test_outgoing_state,
     };
     use crate::model::semantic::MessageUnderstanding;
+    use std::time::Instant;
 
     fn decide(
         source: OutgoingSource,
@@ -797,6 +807,7 @@ mod tests {
             message_ids: vec![message_id],
             understanding: MessageUnderstanding::default(),
             sticker_teaching_message: None,
+            enqueued_at: Instant::now(),
         }
     }
 

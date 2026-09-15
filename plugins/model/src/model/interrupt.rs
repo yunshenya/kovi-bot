@@ -190,6 +190,12 @@ struct PendingOutgoing {
     idempotency_key: Option<String>,
     source: OutgoingSource,
     state: OutgoingState,
+    /// 这条回复是哪一刻进入 `Prepared` 的。
+    ///
+    /// 只服务运行时观测：`Prepared` 迟迟不 commit 是"回复生成完却发不出去"的
+    /// 直接证据（线上 2026-09-15 那次卡死里，排空任务正是停在 commit 之前的
+    /// 某个 await 上）。不带这个时间戳就只能看到"有一条 Prepared"，说不出等了多久。
+    prepared_at: Instant,
     committed_at: Option<Instant>,
     terminal_at: Option<Instant>,
     collision_reported: bool,
@@ -240,6 +246,14 @@ struct ReplyState {
     conversation_version: u64,
     incoming_sequence: u64,
     active_generation: Option<u64>,
+    /// `active_generation` 是哪一刻挂上去的。
+    ///
+    /// 只服务运行时观测（[`scope_reply_snapshot`]）：线上 2026-09-15 那次"排空任务
+    /// 拿到回合后永久停住"里，`active_generation.is_some()` 一直为真，但没有任何
+    /// 字段能回答"这个回合活了多久"，看门狗因此只能每 30 秒白扫一次、日志里一个字
+    /// 都没有。同一个 `active_generation` 值被保留（`advance_generation_preserving_active`）
+    /// 时不重置——那样年龄才等于"这一轮真的活了多久"。
+    active_since: Option<Instant>,
     pending_incoming: Option<PendingIncoming>,
     active_incoming: VecDeque<ActiveIncomingReservation>,
     pending_precommit: Option<PendingPrecommit>,
@@ -257,6 +271,7 @@ impl Default for ReplyState {
             conversation_version: 0,
             incoming_sequence: 0,
             active_generation: None,
+            active_since: None,
             pending_incoming: None,
             active_incoming: VecDeque::new(),
             pending_precommit: None,
@@ -711,6 +726,7 @@ pub(crate) async fn claim_follow_up_locked(completed: ReplyTicket) -> Option<Rep
     }
     state.generation = state.generation.wrapping_add(1);
     state.active_generation = Some(state.generation);
+    state.active_since = Some(Instant::now());
     state.last_seen = Instant::now();
     Some(ReplyTicket {
         scope: completed.scope,
@@ -783,6 +799,9 @@ pub(crate) async fn claim_active_locked(ticket: ReplyTicket) -> bool {
         pending.resolved.send_replace(true);
         scope_notifier(ticket.scope).notify_waiters();
     }
+    if state.active_generation != Some(ticket.generation) {
+        state.active_since = Some(Instant::now());
+    }
     state.active_generation = Some(ticket.generation);
     state.last_seen = Instant::now();
     true
@@ -800,6 +819,7 @@ pub(crate) async fn finish_locked(ticket: ReplyTicket) {
     if let Some(state) = states.get_mut(&ticket.scope) {
         if ticket_matches(state, ticket) && state.active_generation == Some(ticket.generation) {
             state.active_generation = None;
+            state.active_since = None;
         }
         state.last_seen = Instant::now();
     }
@@ -841,6 +861,97 @@ fn ticket_for_state(scope: ReplyScope, state: &ReplyState) -> ReplyTicket {
         scope_epoch: state.scope_epoch,
         generation: state.generation,
         conversation_version: state.conversation_version,
+    }
+}
+
+/// 某个会话的回复状态一瞥，供运行时观测（管理后台的等待房间那一栏）使用。
+///
+/// **只读、无副作用**：不推进代数、不取消任何东西，也不等会话锁——它要在
+/// "这个会话已经卡住"的时候还能被读到，任何会等锁的实现都可能跟着卡住。
+/// 读到的几个数字之间允许有毫秒级漂移，观测够用。
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ReplyStateSnapshot {
+    pub(crate) generation: u64,
+    pub(crate) conversation_version: u64,
+    /// 当前这一轮从挂上到现在活了多久（秒）。`None` = 没有在途回合。
+    pub(crate) active_secs: Option<u64>,
+    pub(crate) pending_incoming: usize,
+    pub(crate) active_incoming: usize,
+    pub(crate) pending_incoming_expires_in_secs: Option<u64>,
+    /// 已经准备好、但还没提交出去的回复条数（以及最老那条等了多久）。
+    pub(crate) prepared_outgoing: usize,
+    pub(crate) oldest_prepared_secs: Option<u64>,
+    pub(crate) precommit_armed: bool,
+    pub(crate) collision_count: usize,
+    pub(crate) last_seen_secs: u64,
+}
+
+impl ReplyStateSnapshot {
+    /// 这一轮是不是真的还在跑（有活跃回合）。
+    pub(crate) fn is_active(&self) -> bool {
+        self.active_secs.is_some()
+    }
+
+    /// 已经生成好、却迟迟发不出去的回复：commit 被某次等待卡住的直接证据。
+    pub(crate) fn has_stuck_prepared(&self, stuck_after: Duration) -> bool {
+        self.oldest_prepared_secs
+            .is_some_and(|secs| secs >= stuck_after.as_secs())
+    }
+}
+
+/// 有回复状态的会话清单，供运行时观测遍历。
+///
+/// 与 [`scope_reply_snapshot`] 同一套只读约定：不等会话锁，读得到就报。
+/// 数量等于"进程启动以来被回复路径碰过的会话"，几百个量级，够观测用。
+pub(crate) async fn known_scopes() -> Vec<ReplyScope> {
+    REPLY_STATES.lock().await.keys().copied().collect()
+}
+
+/// 读某个会话的回复状态快照。见 [`ReplyStateSnapshot`] 的只读约定。
+pub(crate) async fn scope_reply_snapshot(scope: ReplyScope) -> ReplyStateSnapshot {
+    let now = Instant::now();
+    let states = REPLY_STATES.lock().await;
+    let Some(state) = states.get(&scope) else {
+        return ReplyStateSnapshot::default();
+    };
+    let active_secs = state
+        .active_since
+        .filter(|_| state.active_generation.is_some())
+        .map(|since| now.saturating_duration_since(since).as_secs());
+    let pending_incoming_expires_in_secs = state
+        .pending_incoming
+        .as_ref()
+        .map(|pending| pending.expires_at.saturating_duration_since(now).as_secs())
+        .into_iter()
+        .chain(
+            state
+                .active_incoming
+                .iter()
+                .map(|pending| pending.expires_at.saturating_duration_since(now).as_secs()),
+        )
+        .min();
+    let oldest_prepared_secs = state
+        .pending_outgoing
+        .iter()
+        .filter(|pending| pending.state == OutgoingState::Prepared)
+        .map(|pending| now.saturating_duration_since(pending.prepared_at).as_secs())
+        .max();
+    ReplyStateSnapshot {
+        generation: state.generation,
+        conversation_version: state.conversation_version,
+        active_secs,
+        pending_incoming: usize::from(state.pending_incoming.is_some()),
+        active_incoming: state.active_incoming.len(),
+        pending_incoming_expires_in_secs,
+        prepared_outgoing: state
+            .pending_outgoing
+            .iter()
+            .filter(|pending| pending.state == OutgoingState::Prepared)
+            .count(),
+        oldest_prepared_secs,
+        precommit_armed: state.pending_precommit.is_some(),
+        collision_count: state.collisions.len(),
+        last_seen_secs: now.saturating_duration_since(state.last_seen).as_secs(),
     }
 }
 
@@ -1160,6 +1271,7 @@ async fn prepare_outgoing_batch_locked(
             idempotency_key: None,
             source,
             state: OutgoingState::Prepared,
+            prepared_at: Instant::now(),
             committed_at: None,
             terminal_at: None,
             collision_reported: false,
@@ -1648,6 +1760,7 @@ fn advance_generation_with_active(
     state.generation = state.generation.wrapping_add(1);
     state.conversation_version = state.conversation_version.wrapping_add(1);
     state.active_generation = None;
+    state.active_since = None;
     state.last_seen = now;
     scope_notifier(scope).notify_waiters();
     prune_outgoing(state);
@@ -1859,9 +1972,11 @@ mod tests {
         mark_outgoing_sent, outgoing_fingerprint, prepare_outgoing,
         prepare_outgoing_batch_with_semantic_preview, prepare_proactive_outgoing_if_idle,
         prepared_outgoing_source_locked, release_active_incoming, release_incoming_locked,
-        reserve_active_incoming_locked, scope_mutex, take_message_collisions,
-        try_freeze_prepared_for_incoming_locked, wait_for_pending_incoming,
+        reserve_active_incoming_locked, reserve_incoming_locked, scope_mutex, scope_reply_snapshot,
+        take_message_collisions, try_freeze_prepared_for_incoming_locked,
+        wait_for_pending_incoming,
     };
+    use std::time::Duration;
 
     async fn outgoing_state(token: OutgoingToken) -> Option<OutgoingState> {
         REPLY_STATES
@@ -2312,6 +2427,101 @@ mod tests {
                 drop(_guard);
                 assert!(!is_current(ticket).await);
                 assert!(!is_active(scope).await);
+            });
+    }
+
+    /// 观测口径：后台要能区分"空闲"、"正在回"、"回卡住了"三种状态。
+    /// 线上 2026-09-15 那次群静默十小时里，`active_generation` 一直为真却没有任何
+    /// 字段能说明它活了多久，只能靠人肉对日志——这个快照就是补上这一点。
+    #[test]
+    fn reply_state_snapshot_reports_idle_active_and_prepared_work() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let scope = ReplyScope::Group(9_000_020);
+                // 没碰过的会话：一片空白，绝不是"有在途回合"。
+                let idle = scope_reply_snapshot(scope).await;
+                assert!(!idle.is_active());
+                assert_eq!(idle.prepared_outgoing, 0);
+                assert!(!idle.has_stuck_prepared(Duration::from_secs(180)));
+
+                let ticket = interrupt(scope).await;
+                assert!(mark_active(ticket).await);
+                let active = scope_reply_snapshot(scope).await;
+                assert!(active.is_active(), "挂了活跃回合就要报出来");
+                assert_eq!(active.generation, ticket.generation);
+                assert!(
+                    active.active_secs.is_some_and(|secs| secs < 60),
+                    "刚挂上的回合年龄应当是秒级"
+                );
+
+                // 生成好了但还没发出去：这是"回卡在 commit 之前"的唯一直接证据。
+                assert!(
+                    prepare_outgoing(
+                        ticket,
+                        outgoing_fingerprint("卡住的回复"),
+                        OutgoingSource::Reply,
+                    )
+                    .await
+                    .is_some()
+                );
+                let prepared = scope_reply_snapshot(scope).await;
+                assert_eq!(prepared.prepared_outgoing, 1);
+                assert!(
+                    prepared.oldest_prepared_secs.is_some_and(|secs| secs < 60),
+                    "刚准备好的回复不该被判成卡住"
+                );
+                assert!(
+                    !prepared.has_stuck_prepared(Duration::from_secs(180)),
+                    "阈值没到就不算卡住"
+                );
+                assert!(
+                    prepared.has_stuck_prepared(Duration::from_secs(0)),
+                    "零阈值下必须报出来，判定口径才作数"
+                );
+
+                finish(ticket).await;
+                let done = scope_reply_snapshot(scope).await;
+                assert!(!done.is_active(), "收尾之后不再是在途回合");
+            });
+    }
+
+    /// 快照只读：读一次不能改变任何协调状态，否则观测本身就会干扰回复。
+    #[test]
+    fn reply_state_snapshot_does_not_mutate_coordination() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let scope = ReplyScope::Group(9_000_021);
+                let ticket = interrupt(scope).await;
+                let reservation_id = {
+                    let lock = scope_mutex(scope);
+                    let _guard = lock.lock().await;
+                    reserve_incoming_locked(ticket)
+                        .await
+                        .expect("空闲会话应当能预留一次入站")
+                };
+
+                let snapshot = scope_reply_snapshot(scope).await;
+                assert_eq!(snapshot.pending_incoming, 1);
+                assert!(
+                    snapshot
+                        .pending_incoming_expires_in_secs
+                        .is_some_and(|secs| secs > 0),
+                    "预留是有租期的，快照要给出还剩多久"
+                );
+                assert!(is_current(ticket).await, "读快照不得推进代数");
+                assert_eq!(scope_reply_snapshot(scope).await.pending_incoming, 1);
+
+                {
+                    let lock = scope_mutex(scope);
+                    let _guard = lock.lock().await;
+                    assert!(
+                        release_incoming_locked(ticket, reservation_id, None, false).await,
+                        "应当能交还这次预留"
+                    );
+                }
+                assert_eq!(scope_reply_snapshot(scope).await.pending_incoming, 0);
             });
     }
 
