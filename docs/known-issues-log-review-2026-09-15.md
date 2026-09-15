@@ -196,6 +196,19 @@ scripts/verify-sticker-album.sh                   # 要照片时她直接发相�
 - `verify-sticker-album.sh` 的"对照组"**应当**复现那句否认——那是故障复现，不是脚本坏了；
   只有"验收组 / 最坏情况组"的断言决定 PASS/FAIL。
 
+### 产物自检（发布包里到底有没有这次改动）
+
+发布演练的 release 二进制按字节查过：六条新文案全在，两条旧文案（`想发表情包：先调
+sticker.list`、`列出她现在能发的表情包标签`）都已消失。
+
+```python
+data = open("target/x86_64-unknown-linux-gnu/release/kovi-bot", "rb").read()
+data.find("素材库就是你自己的相册（图都是你的）".encode())   # >= 0 即在产物里
+```
+
+**坑**：macOS 上 `grep -a "中文" 二进制` 会漏报——同样的模式它一条都找不到，用 Python
+按 UTF-8 字节查则全部命中。别用 `grep` 的结论判断"改动没进产物"。
+
 ---
 
 ## 附：本轮 commit
