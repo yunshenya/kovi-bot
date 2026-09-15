@@ -273,24 +273,35 @@ impl Hypothesis {
                 field: "hypothesis merge mismatch",
             });
         }
-        let mut evidence_for = self.evidence_for.clone();
+        // 先在**副本**上改完再验，最后一步才落到 `self`：`dedupe` 只做去重、
+        // 不设上限，两条各 32 条证据的假设合并出 64 条时 `validate()` 会失败——
+        // 若此时已经写回 `self`，这条假设就永远停在非法状态，而
+        // `WorldModel::validate()` 从此恒假、宿主"拒绝持久化"（整个世界的落库
+        // 被一条坏记录冻结）。
+        let mut merged = self.clone();
+        let mut evidence_for = merged.evidence_for.clone();
         evidence_for.extend(other.evidence_for);
-        evidence_for = dedupe(evidence_for, "evidence for", true)?;
-        let mut evidence_against = self.evidence_against.clone();
+        merged.evidence_for = dedupe(evidence_for, "evidence for", true)?;
+        let mut evidence_against = merged.evidence_against.clone();
         evidence_against.extend(other.evidence_against);
-        evidence_against = dedupe(evidence_against, "evidence against", true)?;
-        proof_disjoint(&evidence_for, &evidence_against)?;
-        self.evidence_for = evidence_for;
-        self.evidence_against = evidence_against;
-        if other.confidence > self.confidence {
-            self.confidence = other.confidence;
+        merged.evidence_against = dedupe(evidence_against, "evidence against", true)?;
+        proof_disjoint(&merged.evidence_for, &merged.evidence_against)?;
+        if other.confidence > merged.confidence {
+            merged.confidence = other.confidence;
         }
-        if other.updated_at > self.updated_at {
-            self.updated_at = other.updated_at;
+        if other.updated_at > merged.updated_at {
+            merged.updated_at = other.updated_at;
         }
-        self.expires_at = self.expires_at.max(other.expires_at);
-        self.version = self.version.saturating_add(1);
-        self.validate()
+        // `None` 是"永不过期"，它在 `max()` 下输给任何 `Some`——合并一条带 TTL 的
+        // 假设会把"永远成立"降级成"到点失效"。只有两边都有期限时才取较晚的那个。
+        merged.expires_at = match (merged.expires_at, other.expires_at) {
+            (None, _) | (_, None) => None,
+            (Some(left), Some(right)) => Some(left.max(right)),
+        };
+        merged.version = merged.version.saturating_add(1);
+        merged.validate()?;
+        *self = merged;
+        Ok(())
     }
 
     /// Attach one observation as evidence (for/against) and bump version.
@@ -448,6 +459,48 @@ mod tests {
         assert_eq!(a.confidence(), 0.7);
         assert_eq!(a.evidence_for(), &[obs]);
         assert_eq!(a.version(), 3); // new + evidence + merge
+    }
+
+    #[test]
+    fn a_failed_merge_leaves_the_target_untouched() {
+        // `dedupe` 只去重、不设上限，所以两条证据都攒满的假设合并之后会超限、
+        // `validate()` 失败。旧实现是"先写回 self 再验"，失败之后这条假设就永远
+        // 停在非法状态，而 WorldModel::validate() 从此恒假、宿主拒绝持久化——
+        // 一条坏记录冻结整个世界的落库。
+        let now = Utc::now();
+        let mut a = hypothesis("合并失败的假设", 0.4, now);
+        let mut b = hypothesis("合并失败的假设", 0.5, now);
+        for _ in 0..MAX_EVIDENCE_REFS {
+            a.add_evidence(ObservationId::new(), true, now)
+                .expect("a 的证据");
+            b.add_evidence(ObservationId::new(), true, now)
+                .expect("b 的证据");
+        }
+        let before = a.clone();
+        assert!(a.merge(b).is_err(), "超出证据上限应当失败");
+        assert_eq!(a, before, "失败的合并不得改动目标，哪怕只改了一半");
+        a.validate().expect("目标仍然合法");
+    }
+
+    #[test]
+    fn merging_never_downgrades_an_eternal_hypothesis_to_a_ttl_one() {
+        // `None`（永不过期）在 `Ord` 下小于任何 `Some`，用 max() 合并会把
+        // "一直成立"变成"到点失效"。
+        let now = Utc::now();
+        let mut eternal = hypothesis("她一直喜欢猫", 0.4, now);
+        let ttl = Hypothesis::new(
+            super::super::HypothesisId::new(),
+            WorldProposition::new("她一直喜欢猫").expect("proposition"),
+            WorldScope::Person {
+                person_id: PersonId::new(),
+            },
+            0.5,
+            now,
+            Some(now + Duration::hours(1)),
+        )
+        .expect("ttl hypothesis");
+        eternal.merge(ttl).expect("merge");
+        assert_eq!(eternal.expires_at(), None, "永不过期不该被 TTL 覆盖");
     }
 
     #[test]

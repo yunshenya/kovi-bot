@@ -368,14 +368,19 @@ impl Situation {
             });
         }
         let now = proposal.observed_at();
-        self.state = proposal.target_state();
-        self.updated_at = now;
-        self.confidence = proposal.confidence();
-        if self.state.is_terminal() && self.ended_at.is_none() {
-            self.ended_at = Some(now);
+        // 副本上改、验过再落：直接改 `self` 再 `validate()` 的话，一次时间戳
+        // 倒退（时钟回拨，`updated_at < started_at`）就会把这条情境永久留在非法
+        // 状态，而 `WorldModel::validate()` 从此恒假、整个世界拒绝持久化。
+        let mut next = self.clone();
+        next.state = proposal.target_state();
+        next.updated_at = now;
+        next.confidence = proposal.confidence();
+        if next.state.is_terminal() && next.ended_at.is_none() {
+            next.ended_at = Some(now);
         }
-        self.version = self.version.saturating_add(1);
-        self.validate()?;
+        next.version = next.version.saturating_add(1);
+        next.validate()?;
+        *self = next;
         Ok(())
     }
 

@@ -472,10 +472,15 @@ impl EntityStateIndex {
                 .find(|entity| entity.id() == entity_id)
             {
                 Some(entity) => {
-                    entity.set_confidence(proposal.confidence(), proposal.observed_at())?;
+                    // 一次更新里的多条动作要么全成、要么一条都不落：直接改
+                    // `entity` 时，第 2 条动作失败会把第 1 条已经写进去的改动
+                    // 留在实体上（`WorldModel::validate()` 随后可能恒假）。
+                    let mut next = entity.clone();
+                    next.set_confidence(proposal.confidence(), proposal.observed_at())?;
                     for action in proposal.actions() {
-                        entity.apply(action, proposal.observed_at())?;
+                        next.apply(action, proposal.observed_at())?;
                     }
+                    *entity = next;
                     entity.id()
                 }
                 None => self.create_or_merge(proposal)?,
