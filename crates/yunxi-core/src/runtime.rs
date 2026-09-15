@@ -1159,7 +1159,10 @@ impl CognitiveRuntime {
                 return Err(error);
             }
         };
+        // "这条到期线索办完了吗"只看**真的送到人面前**的动作：工具成功不算送达，
+        // 因此 `due_delivery_attempted` 为 false 时一律不结案。
         let mut all_due_deliveries_succeeded = true;
+        let mut due_delivery_attempted = false;
         let mut due_terminal_non_success = false;
         let mut actions = Vec::with_capacity(plan.intents.len());
         let mut feedback = Vec::new();
@@ -1284,11 +1287,15 @@ impl CognitiveRuntime {
                     }
                 )
                 || replay_terminal == Some(crate::arbiter::AdmittedTerminal::Failed);
-            if due_open_loop.is_some() && !matches!(&proposed, crate::ProposedAction::Noop) {
-                if terminal_non_success {
-                    due_terminal_non_success = true;
-                    all_due_deliveries_succeeded = false;
-                } else if !delivery_succeeded {
+            // 只有"真的往人面前送"的那个动作才决定这条到期线索结不结。工具成功
+            // 不是投递成功：它之后还有一轮可见回复，线索要等那一轮。
+            if due_open_loop.is_some() && terminal_non_success {
+                due_terminal_non_success = true;
+            }
+            if due_open_loop.is_some() && action_delivers_to_target(&proposed) {
+                // 真的有一个"送到人面前"的动作：它的结果决定这条线索结不结。
+                due_delivery_attempted = true;
+                if terminal_non_success || !delivery_succeeded {
                     all_due_deliveries_succeeded = false;
                 }
             }
@@ -1365,9 +1372,17 @@ impl CognitiveRuntime {
         if due_open_loop.is_some() && due_terminal_non_success {
             self.defer_due_open_loop_without_schedule(&input, applied_state_updates)
                 .await?;
-        } else if deferred_due_resolution.is_some() && all_due_deliveries_succeeded {
-            self.resolve_due_open_loop(&input, applied_state_updates)
-                .await?;
+        } else if deferred_due_resolution.is_some() {
+            // 计划提出结案，但"结案"要有依据：这一轮真的把东西送到人面前了。
+            // 纯工具轮次（以及任何没有投递动作的轮次）还没有对这个人说任何话，
+            // 按"这轮没办成"处理——线索保持打开，别在提醒还没发出去的时候结掉它。
+            if due_delivery_attempted && all_due_deliveries_succeeded {
+                self.resolve_due_open_loop(&input, applied_state_updates)
+                    .await?;
+            } else {
+                self.defer_due_open_loop_without_schedule(&input, applied_state_updates)
+                    .await?;
+            }
         }
         record_planner_decision(&self.executive, &input, &plan, selected_action.as_ref());
         Ok(PlannedProcessingOutcome::Planned {
@@ -2322,6 +2337,19 @@ fn scope_matches_action_scope(event_scope: EventScope, action_scope: crate::Acti
     }
 }
 
+/// 这个动作有没有**真的把东西送到人面前**。
+///
+/// 只有 `SendMessage` 与 `ReachOut` 算。工具调用不是投递：它产出的是资料，真正
+/// 送达的是它之后那一轮可见回复。把工具成功当成投递成功，会让一条到期的未完结
+/// 线索（提醒、约定）在**什么都没发出去**的时候就被结掉，而随后的 follow-up 回合
+/// 一旦失败就再也没有重试的由头（2026-09-15 评审）。
+fn action_delivers_to_target(action: &crate::ProposedAction) -> bool {
+    matches!(
+        action,
+        crate::ProposedAction::SendMessage(_) | crate::ProposedAction::ReachOut(_)
+    )
+}
+
 fn deferred_due_open_loop_resolution(
     event: &WorldEvent,
     plan: &DecisionPlan,
@@ -2334,6 +2362,9 @@ fn deferred_due_open_loop_resolution(
                 if *candidate == open_loop_id
         )
     });
+    // 计划里只要还有动作，本轮就"可能"把线索办掉，因此结案必须推迟到投递结果
+    // 出来之后（真正的准入判据在 `all_due_deliveries_succeeded`：只有真的送达
+    // 才算办完）。
     let requires_delivery = plan
         .intents
         .iter()
@@ -5963,6 +5994,73 @@ mod tests {
                 .expect("open-loop defer recorder lock")
                 .as_slice(),
             &[(open_loop_id, None), (open_loop_id, None)]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_successful_tool_never_closes_a_due_open_loop_before_anything_is_sent() {
+        // 失败那一侧早有测试（工具失败 → 不排期），成功这一侧一直没有。工具成功
+        // **不是**投递成功：它之后还有一轮可见回复，提醒要等那一轮真的发出去才算
+        // 办完；把工具成功当成办完，会在什么都没发出去的时候就结掉线索。
+        let conversation_id = ConversationId::new();
+        let open_loop_id = OpenLoopId::new();
+        let open_loops = Arc::new(TestOpenLoopStore::with_visible(
+            open_loop_id,
+            OpenLoopOwner::Conversation(conversation_id),
+        ));
+        let (_handle, mut runtime) = CognitiveRuntime::new_with_services(
+            RuntimeConfig::default(),
+            CoreServices::with_model(DueToolActionModel {
+                conversation_id,
+                open_loop_id,
+            })
+            .with_open_loops(open_loops.clone()),
+        )
+        .expect("valid runtime");
+        let arbiter = ActionArbiter::new(
+            ActionArbiterConfig::default().with_capabilities(EnvironmentCapabilities::all()),
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let port = CountingPort {
+            calls: calls.clone(),
+        };
+
+        let outcome = runtime
+            .process_event_with_planner_and_actions(
+                due_event(conversation_id, open_loop_id),
+                &arbiter,
+                &port,
+            )
+            .await
+            .expect("a successful tool turn is a structured outcome");
+        assert!(matches!(
+            outcome,
+            PlannedProcessingOutcome::Planned { actions, .. }
+                if matches!(
+                    actions.as_slice(),
+                    [ActionResult::Executed {
+                        outcome: ActionPortOutcome::ToolCompleted { .. },
+                        ..
+                    }]
+                )
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(
+            open_loops
+                .resolved
+                .lock()
+                .expect("open-loop resolve recorder lock")
+                .is_empty(),
+            "工具成功不得结掉这条到期线索：这一轮还什么都没发出去"
+        );
+        // 与"投递失败"同一条恢复路径：线索保持打开、但不再自动排期。
+        assert_eq!(
+            open_loops
+                .deferred
+                .lock()
+                .expect("open-loop defer recorder lock")
+                .as_slice(),
+            &[(open_loop_id, None)]
         );
     }
 
