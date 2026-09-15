@@ -376,7 +376,6 @@ pub(crate) fn router(state: Arc<AdminState>) -> Router {
         .route("/api/config/reload", post(config_api::reload))
         .route("/api/config/backups", get(config_api::list_backups))
         .route("/api/config/restore", post(config_api::restore_backup))
-        .route("/api/memory/overview", get(memory_api::overview))
         .route("/api/memory/records", get(memory_api::records))
         .route("/api/memory/record/{kind}/{id}", get(memory_api::record))
         .route("/api/memory/people", get(memory_api::people))

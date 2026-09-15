@@ -70,8 +70,6 @@ struct RecordKind {
     mentioned_expr: &'static str,
     /// 记录内部引用到的其它记录 id（payload 里的 UUID），用于连「因果」边。
     refs_expr: &'static str,
-    /// 概览页是否统计这张表。
-    counted: bool,
 }
 
 /// 从 payload 里抠出被引用的记录 id（UUID）。Mind 的议程、未解问题等会直接指向
@@ -106,7 +104,6 @@ macro_rules! mind_kind {
             entity_expr: $entity,
             mentioned_expr: "t.updated_at",
             refs_expr: MIND_REFS,
-            counted: true,
         }
     };
 }
@@ -130,7 +127,6 @@ const KINDS: &[RecordKind] = &[
         entity_expr: "NULL",
         mentioned_expr: "t.created_at",
         refs_expr: "ARRAY[]::text[]",
-        counted: true,
     },
     RecordKind {
         key: LEGACY_MEMORY_KEY,
@@ -150,7 +146,6 @@ const KINDS: &[RecordKind] = &[
         entity_expr: "NULL",
         mentioned_expr: "t.occurred_at",
         refs_expr: "ARRAY[]::text[]",
-        counted: true,
     },
     mind_kind!("episode", "情节", "yunxi_episodes", "情节", "NULL"),
     mind_kind!("belief", "信念", "yunxi_beliefs", "信念", "NULL"),
@@ -194,7 +189,6 @@ const KINDS: &[RecordKind] = &[
         entity_expr: "NULL",
         mentioned_expr: "t.updated_at",
         refs_expr: "ARRAY[]::text[]",
-        counted: true,
     },
     RecordKind {
         key: "open_loop",
@@ -213,7 +207,6 @@ const KINDS: &[RecordKind] = &[
         entity_expr: "NULL",
         mentioned_expr: "t.updated_at",
         refs_expr: "ARRAY[]::text[]",
-        counted: true,
     },
     RecordKind {
         key: "gag",
@@ -232,7 +225,6 @@ const KINDS: &[RecordKind] = &[
         entity_expr: "NULL",
         mentioned_expr: "t.updated_at",
         refs_expr: "ARRAY[]::text[]",
-        counted: true,
     },
     RecordKind {
         key: "user_profile",
@@ -251,7 +243,6 @@ const KINDS: &[RecordKind] = &[
         entity_expr: "COALESCE(t.payload->>'nickname', 'QQ ' || t.user_id)",
         mentioned_expr: "t.updated_at",
         refs_expr: "ARRAY[]::text[]",
-        counted: true,
     },
     RecordKind {
         key: "group_profile",
@@ -270,7 +261,6 @@ const KINDS: &[RecordKind] = &[
         entity_expr: "COALESCE(t.payload->>'name', '群 ' || t.group_id)",
         mentioned_expr: "t.updated_at",
         refs_expr: "ARRAY[]::text[]",
-        counted: true,
     },
     RecordKind {
         key: "summary",
@@ -289,7 +279,6 @@ const KINDS: &[RecordKind] = &[
         entity_expr: "NULL",
         mentioned_expr: "t.updated_at",
         refs_expr: "ARRAY[]::text[]",
-        counted: true,
     },
 ];
 
@@ -311,57 +300,6 @@ fn clamp_limit(limit: Option<i64>) -> i64 {
 }
 
 // ---------------------------------------------------------------- 概览
-
-/// `GET /api/memory/overview`
-pub(crate) async fn overview() -> Result<Json<Value>, ApiError> {
-    let pool = database_pool()?;
-    let existing = existing_tables(pool).await?;
-
-    let mut counts = Map::new();
-    let mut total: i64 = 0;
-    for kind in KINDS {
-        if !kind.counted || !existing.contains(kind.table) {
-            continue;
-        }
-        let sql = format!("SELECT count(*) AS n FROM {}", kind.table);
-        let count: i64 = query(&sql)
-            .fetch_one(pool)
-            .await
-            .map_err(|error| ApiError::internal(format!("统计 {} 失败: {error}", kind.table)))?
-            .try_get("n")
-            .unwrap_or_default();
-        total += count;
-        counts.insert(kind.key.to_string(), json!(count));
-    }
-
-    let people: i64 = if existing.contains("yunxi_persons") {
-        count_rows(pool, "yunxi_persons").await?
-    } else {
-        0
-    };
-    let conversations: i64 = if existing.contains("yunxi_conversations") {
-        count_rows(pool, "yunxi_conversations").await?
-    } else {
-        0
-    };
-
-    Ok(Json(json!({
-        "counts": counts,
-        "total_records": total,
-        "people": people,
-        "conversations": conversations,
-        "kinds": KINDS.iter().map(|kind| json!({
-            "key": kind.key,
-            "label": kind.label,
-            "count": counts.get(kind.key).cloned().unwrap_or(json!(0)),
-            "available": existing.contains(kind.table),
-        })).collect::<Vec<_>>(),
-        "storage": {
-            "size_bytes": crate::memory::MEMORY_MANAGER.storage_size_bytes().await,
-        },
-        "recent": recent_records(pool, &existing).await?,
-    })))
-}
 
 async fn count_rows(pool: &PgPool, table: &str) -> Result<i64, ApiError> {
     let sql = format!("SELECT count(*) AS n FROM {table}");
@@ -404,21 +342,6 @@ async fn existing_tables(pool: &PgPool) -> Result<BTreeSet<String>, ApiError> {
 }
 
 /// 概览页的"最近变化"：各主要类型最新的几条。
-async fn recent_records(
-    pool: &PgPool,
-    existing: &BTreeSet<String>,
-) -> Result<Vec<Value>, ApiError> {
-    let mut items = Vec::new();
-    for kind in KINDS {
-        if !existing.contains(kind.table) {
-            continue;
-        }
-        let rows = fetch_kind(pool, kind, "", 3, 0).await?;
-        items.extend(rows);
-    }
-    sort_and_slice(&mut items, 12);
-    Ok(items)
-}
 
 // ---------------------------------------------------------------- 列表与详情
 
@@ -1689,11 +1612,6 @@ fn sort_items(items: &mut [Value]) {
     });
 }
 
-fn sort_and_slice(items: &mut Vec<Value>, take: usize) {
-    sort_items(items);
-    items.truncate(take);
-}
-
 /// 批量把人／会话 id 兑换成可读标签，直接写回卡片的 `scope_label`。
 ///
 /// 列表可能有几百条，逐条查会变成几百次往返；这里按类型各查一次。
@@ -2052,7 +1970,6 @@ mod tests {
         let episode = kind_meta("episode").expect("episode 应存在");
         assert!(episode.title_expr.contains("payload->>'summary'"));
         assert_eq!(episode.table, "yunxi_episodes");
-        assert!(episode.counted);
     }
 
     #[test]
