@@ -404,6 +404,9 @@ pub enum PlannedProcessingOutcome {
 #[derive(Debug)]
 pub struct CognitiveRuntime {
     receiver: mpsc::Receiver<RuntimeCommand>,
+    /// Commands taken off the channel by [`CognitiveRuntime::has_pending_event`]
+    /// and parked until the next turn consumes them.
+    probed_commands: VecDeque<RuntimeCommand>,
     pending_tool_follow_ups: VecDeque<WorldEvent>,
     tool_action_budget_by_trace: HashMap<EventId, usize>,
     tool_action_budget_order: VecDeque<EventId>,
@@ -580,6 +583,7 @@ impl CognitiveRuntime {
             },
             Self {
                 receiver,
+                probed_commands: VecDeque::new(),
                 pending_tool_follow_ups: VecDeque::new(),
                 tool_action_budget_by_trace: HashMap::new(),
                 tool_action_budget_order: VecDeque::new(),
@@ -899,6 +903,46 @@ impl CognitiveRuntime {
         Some((event, outcome))
     }
 
+    /// Returns whether an event is ready to process without consuming it.
+    ///
+    /// A long-lived driver blocks on [`Self::process_next_with_event`] so it can
+    /// stay resident while the queue is idle. Tests and bounded scaffolding
+    /// that must return once the runtime is quiescent need the opposite
+    /// question answered, which is what this method is for: it answers "is
+    /// there work right now" and never waits.
+    pub fn has_pending_event(&mut self) -> bool {
+        if self
+            .pending_tool_follow_ups
+            .iter()
+            .any(|event| !self.data_erasure.blocks(event))
+        {
+            return true;
+        }
+        if self.has_ready_probed_command() {
+            return true;
+        }
+        match self.receiver.try_recv() {
+            Ok(command) => {
+                self.probed_commands.push_back(command);
+                self.has_ready_probed_command()
+            }
+            Err(mpsc::error::TryRecvError::Empty) => false,
+            Err(mpsc::error::TryRecvError::Disconnected) => false,
+        }
+    }
+
+    /// Whether a command held from a previous probe can produce a turn now.
+    ///
+    /// A command blocked by an active data-erasure barrier is left in place;
+    /// it becomes ready on a later probe.
+    fn has_ready_probed_command(&self) -> bool {
+        let blocked = &self.data_erasure;
+        self.probed_commands.iter().any(|command| match command {
+            RuntimeCommand::Event(event) => !blocked.blocks(event),
+            _ => true,
+        })
+    }
+
     async fn next_event(&mut self) -> Option<WorldEvent> {
         loop {
             if let Some(event) = self.pending_tool_follow_ups.pop_front() {
@@ -908,7 +952,13 @@ impl CognitiveRuntime {
                 self.release_tool_budget_root_if_terminal(event.trace().root_event_id());
                 continue;
             }
-            match self.receiver.recv().await? {
+            // Commands parked by a quiescence probe are drained before waiting
+            // on the channel so a probe never reorders or loses work.
+            let command = match self.probed_commands.pop_front() {
+                Some(command) => command,
+                None => self.receiver.recv().await?,
+            };
+            match command {
                 RuntimeCommand::Event(event) => {
                     if !self.data_erasure.blocks(&event) {
                         return Some(event);

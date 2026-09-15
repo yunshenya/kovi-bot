@@ -10,6 +10,7 @@ pub mod attention;
 pub mod channel;
 pub mod conversation;
 pub mod delivery;
+pub mod driver;
 pub mod event;
 pub mod executive;
 pub mod goal;
@@ -50,6 +51,10 @@ pub use conversation::{
 };
 pub use delivery::{
     DeliveryResolutionError, DeliveryResolver, DeliveryResolverFuture, DeliveryRoute,
+};
+pub use driver::{
+    AutonomousTurnDisposition, CognitiveTurnObserver, TurnOutcome, TurnReport, drain,
+    drain_observed, run, run_bounded, run_observed, run_observed_bounded,
 };
 pub use event::{
     ActionFailedEvent, ActionRejectedEvent, ActionSucceededEvent, Attachment, AttachmentKind,
