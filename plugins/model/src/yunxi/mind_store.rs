@@ -2015,6 +2015,7 @@ mod tests {
         });
     }
 
+    #[test]
     #[ignore = "requires PostgreSQL via DATABASE_URL"]
     fn postgres_mind_store_contracts_are_durable_bounded_and_atomic() {
         crate::database_test_support::block_on(async {
