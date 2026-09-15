@@ -609,10 +609,27 @@ impl MindSnapshotRequest {
                 matches!(event.scope(), EventScope::Person { .. }),
             ),
         };
+        // 来信正文直接当检索 query 用，而它的入口上限（8192 字）比 mind 文本的上限
+        // （1024 字）大得多。以前这里走的是**校验**：超过 1024 字的来信会让
+        // `for_event` 返回 Err，两个调用点都 fail-soft 成"空 mind"——用户发一段长消息，
+        // 她这一轮就完全看不到自己的信念/偏好/兴趣，而且没有任何日志。检索只需要
+        // 开头那段主题词，截断才是这里该做的（截断后仍走同一套校验）。
         let query = if query.trim().is_empty() {
             String::new()
         } else {
-            super::common::validate_mind_text(query, "mind snapshot query")?
+            // 两个上限都要守：mind 文本同时限**字符数**与**字节数**，而中文一字三
+            // 字节——1024 字的中文是 3072 字节，只按字符截断仍然过不了校验。这里按
+            // "先到者为准"逐字收。
+            let mut bounded = String::new();
+            for character in query.chars() {
+                if bounded.chars().count() >= super::common::MAX_MIND_TEXT_CHARS
+                    || bounded.len() + character.len_utf8() > super::common::MAX_MIND_TEXT_BYTES
+                {
+                    break;
+                }
+                bounded.push(character);
+            }
+            super::common::validate_mind_text(bounded, "mind snapshot query")?
         };
         let topic = topic
             .map(|value| super::common::validate_mind_text(value, "mind snapshot topic"))
@@ -847,6 +864,52 @@ mod tests {
         WorldEventKind,
     };
     use chrono::Utc;
+
+    #[test]
+    fn a_long_message_still_yields_a_mind_query_instead_of_an_empty_snapshot() {
+        // 入口允许 8192 字的来信，而 mind 文本上限是 1024 字。以前超限会让
+        // `for_event` 直接返回 Err，调用方 fail-soft 成"空 mind"——长消息一来，
+        // 她这一轮就看不到自己的信念/偏好/兴趣。检索只要开头那段主题词，截断即可。
+        let long = "很长的来信".repeat(600);
+        assert!(long.chars().count() > super::super::common::MAX_MIND_TEXT_CHARS);
+        let event = WorldEvent::message_received(
+            EventPriority::Normal,
+            crate::MessageReceivedEvent {
+                message_id: crate::MessageId::new(),
+                conversation_id: ConversationId::new(),
+                sender: crate::PersonId::new(),
+                content: crate::MessageContent::text(&long),
+                reply_to: None,
+                timestamp: Utc::now(),
+                conversation_kind: crate::ConversationKind::Direct,
+                addressed_to_agent: true,
+                replies_to_agent: false,
+                continuation_to_agent: false,
+                stop_requested: false,
+                explicit_request: true,
+                visible_reply_allowed: true,
+            },
+        );
+
+        let request = MindSnapshotRequest::for_event(
+            &event,
+            None,
+            MindSnapshotLimits::default(),
+            MindInfluenceMode::Active,
+        )
+        .expect("长来信不该让 mind 快照整体失效");
+        let query = request.query();
+        assert!(!query.is_empty(), "截断后不该是空串");
+        assert!(
+            query.chars().count() <= super::super::common::MAX_MIND_TEXT_CHARS,
+            "query 不能超过字符上限"
+        );
+        assert!(
+            query.len() <= super::super::common::MAX_MIND_TEXT_BYTES,
+            "query 也不能超过字节上限（中文一字三字节，这才是实际卡住的那条）"
+        );
+        assert!(long.starts_with(query), "截断要保留开头那段主题词");
+    }
 
     #[test]
     fn autonomous_request_can_restore_private_direct_person_scope() {
