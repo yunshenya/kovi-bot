@@ -127,6 +127,21 @@ pub(crate) struct PreparedOutgoingCommit {
 }
 
 impl PreparedOutgoingCommit {
+    /// 把手上的预提交租约**从现在起**重新计时。
+    ///
+    /// 租约存在的意义是"进程死在校验中间也要能自愈"，所以它不能无限延长；但"活着只是慢"
+    /// 不该被它误杀——一次卡住的（或只是慢的）重校验会让 `commit` 拿到 `Stale`，那条已经
+    /// 渲染好的回复被整条丢弃且不重试。调用方在每个可能变慢的 await **之前**续一次租，
+    /// 就把"整体不受限"换成了"每一步各自受 30 秒约束"：进程没了就再没人续，照旧到期回收。
+    ///
+    /// 返回 `false` 表示这条预提交已经不在了（被换代或已过期回收），调用方应当放弃。
+    pub(crate) async fn renew(&self) -> bool {
+        let Some(token) = self.token else {
+            return false;
+        };
+        renew_precommit(token).await
+    }
+
     async fn commit_state(
         &mut self,
         effective_fingerprint: u64,
@@ -1448,6 +1463,33 @@ pub(crate) async fn begin_outgoing_commit(
     }
 }
 
+/// 把手上的预提交租约从现在起重新计时（见 [`PreparedOutgoingCommit::renew`]）。
+///
+/// 只续**自己那一条**：token 不匹配（被新消息顶掉、已被换代回收）时返回 `false`，
+/// 调用方据此放弃，不去动别人的状态。
+async fn renew_precommit(token: OutgoingToken) -> bool {
+    let lock = scope_mutex(token.ticket.scope);
+    let _scope_guard = lock.lock().await;
+    let mut states = REPLY_STATES.lock().await;
+    let Some(state) = states.get_mut(&token.ticket.scope) else {
+        return false;
+    };
+    let now = Instant::now();
+    expire_coordination(token.ticket.scope, state, now);
+    if !ticket_matches(state, token.ticket) {
+        return false;
+    }
+    let Some(precommit) = state.pending_precommit.as_mut() else {
+        return false;
+    };
+    if precommit.token != token {
+        return false;
+    }
+    precommit.expires_at = now + PRECOMMIT_VALIDATION_LEASE;
+    state.last_seen = now;
+    true
+}
+
 async fn commit_prevalidated_outgoing(
     token: OutgoingToken,
     effective_fingerprint: u64,
@@ -2215,6 +2257,84 @@ mod tests {
     }
 
     #[test]
+    fn precommit_lease_can_be_renewed_by_its_owner_only() {
+        // 续租是"活着只是慢"与"进程死了"之间的分界：活着的一方在慢步骤前续一次，
+        // 就还有 30 秒；没人续的照旧到期回收。
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let scope = ReplyScope::Private(9_300_001);
+                crate::model::interrupt::clear_reply_state_locked(scope).await;
+                let ticket = super::interrupt(scope).await;
+                assert!(super::mark_active(ticket).await, "回合应当是活动的");
+                let fingerprint = outgoing_fingerprint("续租测试");
+                let outgoing = super::prepare_outgoing_with_semantic_preview(
+                    ticket,
+                    fingerprint,
+                    OutgoingSource::Reply,
+                    Some("续租测试"),
+                )
+                .await
+                .expect("准备一条出站");
+                let precommit = super::begin_outgoing_commit(outgoing)
+                    .await
+                    .expect("应取得预提交许可");
+
+                // 把租约人为压短到 500 毫秒（还没到期），续一次应当把它推回完整时长。
+                let short = std::time::Instant::now() + Duration::from_millis(500);
+                {
+                    let mut states = REPLY_STATES.lock().await;
+                    let state = states.get_mut(&scope).expect("应有回复状态");
+                    let pending = state.pending_precommit.as_mut().expect("应有预提交");
+                    pending.expires_at = short;
+                }
+                assert!(precommit.renew().await, "持有者应当能续租");
+                {
+                    let states = REPLY_STATES.lock().await;
+                    let state = states.get(&scope).expect("应有回复状态");
+                    let pending = state.pending_precommit.expect("续租后仍应是预提交");
+                    assert!(pending.expires_at > short, "续租必须把到期时间往后推");
+                }
+                // 续租之后即使睡过原来那个截止点，这条预提交仍然活着。
+                kovi::tokio::time::sleep(Duration::from_millis(600)).await;
+                assert!(
+                    precommit.renew().await,
+                    "续租过的预提交不该在原截止点之后失效"
+                );
+
+                // 已经过期的预提交**续不回来**：到期是破坏性的（那条 Prepared 已被取消），
+                // 这正是"进程死了没人续租"能被回收的原因。
+                let expired_ticket = super::interrupt(scope).await;
+                assert!(super::mark_active(expired_ticket).await);
+                let expired_token = super::prepare_outgoing_with_semantic_preview(
+                    expired_ticket,
+                    outgoing_fingerprint("过期测试"),
+                    OutgoingSource::Reply,
+                    Some("过期测试"),
+                )
+                .await
+                .expect("准备第二条出站");
+                let expired_guard = super::begin_outgoing_commit(expired_token)
+                    .await
+                    .expect("应取得第二条预提交许可");
+                {
+                    let mut states = REPLY_STATES.lock().await;
+                    let state = states.get_mut(&scope).expect("应有回复状态");
+                    let pending = state.pending_precommit.as_mut().expect("应有预提交");
+                    pending.expires_at = std::time::Instant::now() - Duration::from_secs(1);
+                }
+                assert!(
+                    !expired_guard.renew().await,
+                    "过期回收之后 token 已不再匹配，续租必须失败"
+                );
+
+                // 换代之后（token 不再匹配）续租必须失败，且不该复活任何东西。
+                crate::model::interrupt::clear_reply_state_locked(scope).await;
+                assert!(!precommit.renew().await, "状态已被清掉时续租应当失败");
+            });
+    }
+
+    #[test]
     fn orphaned_prepared_records_expire_instead_of_holding_the_state_forever() {
         // 调用方提前返回 / 任务被取消 / Drop 里那次 spawn 没跑起来，都会留下一条
         // 永远不会 commit 也不会被取消的 Prepared。它会占着不可淘汰的容量、卡住
@@ -2273,7 +2393,7 @@ mod tests {
             .expect("应创建测试运行时")
             .block_on(async {
                 let scope = ReplyScope::Private(9_200_001);
-                let ticket = interrupt(scope).await;
+                let ticket = super::interrupt(scope).await;
                 assert!(mark_active(ticket).await);
                 let first_fingerprint = action_outgoing_fingerprint("重复内容", "batch:0");
                 let second_fingerprint = action_outgoing_fingerprint("重复内容", "batch:1");
@@ -2432,7 +2552,7 @@ mod tests {
             .expect("应创建测试运行时")
             .block_on(async {
                 let scope = ReplyScope::Group(9_200_004);
-                let ticket = interrupt(scope).await;
+                let ticket = super::interrupt(scope).await;
                 assert!(mark_active(ticket).await);
                 let fingerprint = action_outgoing_fingerprint("same", "duplicate");
                 assert!(
@@ -2456,7 +2576,7 @@ mod tests {
             .expect("应创建测试运行时")
             .block_on(async {
                 let scope = ReplyScope::Private(9_200_005);
-                let ticket = interrupt(scope).await;
+                let ticket = super::interrupt(scope).await;
                 assert!(mark_active(ticket).await);
                 let fingerprints = [
                     action_outgoing_fingerprint("proactive one", "proactive:0"),
@@ -2488,7 +2608,7 @@ mod tests {
             .expect("应创建测试运行时")
             .block_on(async {
                 let scope = ReplyScope::Group(9_200_006);
-                let ticket = interrupt(scope).await;
+                let ticket = super::interrupt(scope).await;
                 assert!(mark_active(ticket).await);
                 let fingerprints = [
                     action_outgoing_fingerprint("first", "freeze:0"),
@@ -2662,7 +2782,7 @@ mod tests {
             .expect("应创建测试运行时")
             .block_on(async {
                 let scope = ReplyScope::Private(9_000_008);
-                let ticket = interrupt(scope).await;
+                let ticket = super::interrupt(scope).await;
                 assert!(mark_active(ticket).await);
                 let lock = scope_mutex(scope);
                 let _guard = lock.lock().await;
@@ -2688,7 +2808,7 @@ mod tests {
                 assert_eq!(idle.prepared_outgoing, 0);
                 assert!(!idle.has_stuck_prepared(Duration::from_secs(180)));
 
-                let ticket = interrupt(scope).await;
+                let ticket = super::interrupt(scope).await;
                 assert!(mark_active(ticket).await);
                 let active = scope_reply_snapshot(scope).await;
                 assert!(active.is_active(), "挂了活跃回合就要报出来");
@@ -2736,7 +2856,7 @@ mod tests {
             .expect("应创建测试运行时")
             .block_on(async {
                 let scope = ReplyScope::Group(9_000_030);
-                let ticket = interrupt(scope).await;
+                let ticket = super::interrupt(scope).await;
                 assert!(mark_active(ticket).await);
                 // 一条已经生成好、还没发出去的回复：回收时必须被丢掉（不补发）。
                 assert!(
@@ -2829,7 +2949,7 @@ mod tests {
             .expect("应创建测试运行时")
             .block_on(async {
                 let scope = ReplyScope::Private(9_000_032);
-                let ticket = interrupt(scope).await;
+                let ticket = super::interrupt(scope).await;
                 let generation = ticket.generation();
                 assert!(!is_active(scope).await, "还没开始回复");
                 assert!(reclaim_generation(scope, generation).await.is_none());
@@ -2850,7 +2970,7 @@ mod tests {
             .expect("应创建测试运行时")
             .block_on(async {
                 let scope = ReplyScope::Group(9_000_021);
-                let ticket = interrupt(scope).await;
+                let ticket = super::interrupt(scope).await;
                 let reservation_id = {
                     let lock = scope_mutex(scope);
                     let _guard = lock.lock().await;
@@ -3057,7 +3177,7 @@ mod tests {
             .expect("应创建测试运行时")
             .block_on(async {
                 let scope = ReplyScope::Private(9_100_001);
-                let ticket = interrupt(scope).await;
+                let ticket = super::interrupt(scope).await;
                 assert!(mark_active(ticket).await);
                 let fingerprint = outgoing_fingerprint("old answer");
                 let outgoing = prepare_outgoing(ticket, fingerprint, OutgoingSource::Reply)
@@ -3079,7 +3199,7 @@ mod tests {
             .expect("应创建测试运行时")
             .block_on(async {
                 let scope = ReplyScope::Private(9_100_002);
-                let ticket = interrupt(scope).await;
+                let ticket = super::interrupt(scope).await;
                 assert!(mark_active(ticket).await);
                 let fingerprint = outgoing_fingerprint("already leaving");
                 let outgoing = prepare_outgoing(ticket, fingerprint, OutgoingSource::Proactive)
@@ -3107,7 +3227,7 @@ mod tests {
             .expect("应创建测试运行时")
             .block_on(async {
                 let scope = ReplyScope::Group(9_100_003);
-                let ticket = interrupt(scope).await;
+                let ticket = super::interrupt(scope).await;
                 assert!(mark_active(ticket).await);
                 let fingerprint = outgoing_fingerprint("same bubble");
 
@@ -3239,7 +3359,7 @@ mod tests {
             .expect("应创建测试运行时")
             .block_on(async {
                 let scope = ReplyScope::Group(9_100_032);
-                let ticket = interrupt(scope).await;
+                let ticket = super::interrupt(scope).await;
                 assert!(mark_active(ticket).await);
                 let prepared_fingerprint = outgoing_fingerprint("body");
                 let committed_fingerprint = contextual_outgoing_fingerprint(
@@ -3277,7 +3397,7 @@ mod tests {
             .expect("应创建测试运行时")
             .block_on(async {
                 let scope = ReplyScope::Group(9_100_004);
-                let ticket = interrupt(scope).await;
+                let ticket = super::interrupt(scope).await;
                 assert!(mark_active(ticket).await);
                 let outgoing = prepare_outgoing(
                     ticket,
@@ -3302,7 +3422,7 @@ mod tests {
             .expect("应创建测试运行时")
             .block_on(async {
                 let scope = ReplyScope::Private(9_100_005);
-                let ticket = interrupt(scope).await;
+                let ticket = super::interrupt(scope).await;
                 assert!(mark_active(ticket).await);
                 let outgoing = prepare_outgoing(
                     ticket,
@@ -3340,7 +3460,7 @@ mod tests {
             .expect("应创建测试运行时")
             .block_on(async {
                 let scope = ReplyScope::Group(9_100_006);
-                let ticket = interrupt(scope).await;
+                let ticket = super::interrupt(scope).await;
                 assert!(mark_active(ticket).await);
                 let outgoing = prepare_outgoing(
                     ticket,
@@ -3370,7 +3490,7 @@ mod tests {
             .block_on(async {
                 let scope = ReplyScope::Private(9_100_007);
                 for index in 0..MAX_PENDING_OUTGOING_PER_SCOPE * 3 {
-                    let ticket = interrupt(scope).await;
+                    let ticket = super::interrupt(scope).await;
                     assert!(mark_active(ticket).await);
                     let outgoing = prepare_outgoing(
                         ticket,
@@ -3385,7 +3505,7 @@ mod tests {
                     guard.mark_failed().await;
                 }
 
-                let ticket = interrupt(scope).await;
+                let ticket = super::interrupt(scope).await;
                 assert!(mark_active(ticket).await);
                 assert!(
                     prepare_outgoing(

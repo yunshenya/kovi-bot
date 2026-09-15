@@ -451,6 +451,12 @@ pub(crate) async fn execute_reply_plan(
             mark_outgoing_failed(outgoing).await;
             break;
         };
+        // 下面那次授权查询是租约里唯一可能变慢的 await：先续一次，把 30 秒从现在起算，
+        // 免得"活着只是慢"被当成"进程死了"，让整条已经渲染好的回复被静默丢掉。
+        if !precommit.renew().await {
+            mark_outgoing_failed(outgoing).await;
+            break;
+        }
         let authorization = match destination {
             MessageDestination::Group(group_id) => {
                 match group_access::authorize_group_send(group_id).await {
@@ -528,6 +534,11 @@ pub(crate) async fn send_tracked_reply_text(
         mark_outgoing_failed(outgoing).await;
         return false;
     };
+    // 同上：授权查询之前续租，把租约锚在这一步的起点。
+    if !precommit.renew().await {
+        mark_outgoing_failed(outgoing).await;
+        return false;
+    }
     let authorization = match destination {
         MessageDestination::Group(group_id) => {
             match group_access::authorize_group_send(group_id).await {

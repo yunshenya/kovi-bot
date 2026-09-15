@@ -617,6 +617,12 @@ impl QqActionAdapter {
         } else {
             None
         };
+        // 路由与授权是最后两个 await，各自前面再续一次租。
+        if !precommit.renew().await {
+            return Ok(ActionPortOutcome::Deferred {
+                reason: "outgoing_superseded_before_route_revalidation".to_string(),
+            });
+        }
         let route_guard = crate::yunxi::pin_delivery_routes().await;
         let revalidated = match revalidation_target {
             DeliveryRevalidationTarget::Conversation(conversation_id) => self
