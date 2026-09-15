@@ -321,39 +321,6 @@ impl PostgresMindStore {
                     reason: "episode scope capacity exceeds PostgreSQL BIGINT",
                 }
             })?;
-        let orphaned_agenda = query(
-            r#"
-            DELETE FROM yunxi_agenda_items AS agenda
-            WHERE agenda.status IN ('active', 'deferred')
-              AND (
-                    (
-                        agenda.dedupe_key LIKE 'curiosity:%'
-                        AND NOT EXISTS (
-                            SELECT 1
-                            FROM yunxi_curiosities AS curiosity
-                            WHERE agenda.dedupe_key = 'curiosity:' || curiosity.id::text
-                              AND curiosity.status IN ('open', 'asked')
-                              AND (curiosity.expires_at IS NULL OR curiosity.expires_at > $1)
-                        )
-                    )
-                    OR
-                    (
-                        agenda.dedupe_key LIKE 'open_question:%'
-                        AND NOT EXISTS (
-                            SELECT 1
-                            FROM yunxi_open_questions AS question
-                            WHERE agenda.dedupe_key = 'open_question:' || question.id::text
-                              AND question.status = 'open'
-                        )
-                    )
-              )
-            "#,
-        )
-        .bind(now)
-        .execute(&mut *transaction)
-        .await
-        .map_err(MindStoreError::storage)?
-        .rows_affected();
         let curiosities = query(
             "DELETE FROM yunxi_curiosities WHERE expires_at IS NOT NULL AND expires_at <= $1",
         )
@@ -436,10 +403,82 @@ impl PostgresMindStore {
         // long-running deployment cannot accumulate unbounded knowledge state.
         // We keep the most recently updated records and only evict the oldest
         // once a scope exceeds the cap, mirroring the episode bound.
+        // Beliefs 单独处理（下面），其余三类仍是"整表按 scope 取最近 N 条"。
         let repository_scope_cap: i64 = 256;
-        let mut capped_repository = 0_u64;
+        // 退休信念按寿命清理：`expires_at` 就是 `valid_until`，过了保留窗口才删。
+        let retired_belief_cutoff = now - chrono::Duration::days(RETIRED_BELIEF_RETENTION_DAYS);
+        let retired_beliefs = query(
+            "DELETE FROM yunxi_beliefs
+             WHERE expires_at IS NOT NULL AND expires_at <= $1",
+        )
+        .bind(retired_belief_cutoff)
+        .execute(&mut *transaction)
+        .await
+        .map_err(MindStoreError::storage)?
+        .rows_affected();
+        // 活着（没过期）的信念才吃 scope 上限：退休的那些不该把当前知识挤出去，
+        // 它们有自己的寿命（上面那条）。
+        let capped_beliefs = query(
+            r#"
+            WITH ranked AS (
+                SELECT id,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY scope_key
+                           ORDER BY updated_at DESC, id
+                       ) AS retention_rank
+                FROM yunxi_beliefs
+                WHERE expires_at IS NULL OR expires_at > $1
+            ), evictable AS (
+                SELECT id FROM ranked WHERE retention_rank > $2
+            )
+            DELETE FROM yunxi_beliefs AS record
+            USING evictable
+            WHERE record.id = evictable.id
+            "#,
+        )
+        .bind(now)
+        .bind(repository_scope_cap)
+        .execute(&mut *transaction)
+        .await
+        .map_err(MindStoreError::storage)?
+        .rows_affected();
+        // 删完之后把悬空引用一起收掉：`related_beliefs` 里指着已经不存在的信念的条目
+        // 没有意义，留着只会让"这条问题由哪些看法支撑"越读越错。这里按"存在性"过滤而不是
+        // 只按本轮删掉的 id 过滤，所以历史遗留的悬空引用也会自愈。
+        let pruned_belief_refs = query(
+            r#"
+            UPDATE yunxi_open_questions AS question
+            SET payload = jsonb_set(
+                    question.payload,
+                    '{related_beliefs}',
+                    COALESCE((
+                        SELECT jsonb_agg(entry)
+                        FROM jsonb_array_elements(question.payload -> 'related_beliefs') AS entry
+                        WHERE EXISTS (
+                            SELECT 1 FROM yunxi_beliefs AS belief
+                            WHERE belief.id::text = (entry #>> '{}')
+                        )
+                    ), '[]'::jsonb)
+                )
+            WHERE jsonb_typeof(question.payload -> 'related_beliefs') = 'array'
+              AND EXISTS (
+                    SELECT 1
+                    FROM jsonb_array_elements(question.payload -> 'related_beliefs') AS entry
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM yunxi_beliefs AS belief
+                        WHERE belief.id::text = (entry #>> '{}')
+                    )
+              )
+            "#,
+        )
+        .execute(&mut *transaction)
+        .await
+        .map_err(MindStoreError::storage)?
+        .rows_affected();
+        let mut capped_repository = retired_beliefs
+            .saturating_add(capped_beliefs)
+            .saturating_add(pruned_belief_refs);
         for table in [
-            RecordTable::Beliefs,
             RecordTable::Preferences,
             RecordTable::Interests,
             RecordTable::OpenQuestions,
@@ -472,6 +511,42 @@ impl PostgresMindStore {
                 .rows_affected();
             capped_repository = capped_repository.saturating_add(deleted);
         }
+        // 放在**所有上限清理之后**：它删的是"指向已经不存在的 curiosity / open
+        // question"的议程行，而本轮刚被上限清掉的那些正是它要找的目标。放在前面的话，
+        // 这些残留要等下一轮（可能是明天）才被收掉。
+        let orphaned_agenda = query(
+            r#"
+            DELETE FROM yunxi_agenda_items AS agenda
+            WHERE agenda.status IN ('active', 'deferred')
+              AND (
+                    (
+                        agenda.dedupe_key LIKE 'curiosity:%'
+                        AND NOT EXISTS (
+                            SELECT 1
+                            FROM yunxi_curiosities AS curiosity
+                            WHERE agenda.dedupe_key = 'curiosity:' || curiosity.id::text
+                              AND curiosity.status IN ('open', 'asked')
+                              AND (curiosity.expires_at IS NULL OR curiosity.expires_at > $1)
+                        )
+                    )
+                    OR
+                    (
+                        agenda.dedupe_key LIKE 'open_question:%'
+                        AND NOT EXISTS (
+                            SELECT 1
+                            FROM yunxi_open_questions AS question
+                            WHERE agenda.dedupe_key = 'open_question:' || question.id::text
+                              AND question.status = 'open'
+                        )
+                    )
+              )
+            "#,
+        )
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(MindStoreError::storage)?
+        .rows_affected();
         let removed = orphaned_agenda
             .saturating_add(curiosities)
             .saturating_add(agenda)
@@ -488,6 +563,14 @@ impl PostgresMindStore {
         Ok(removed)
     }
 }
+
+/// 已经退休（`valid_until` 已过）的信念保留多久。
+///
+/// 退休是"她改主意了"，那条命题的 `(scope_key, dedupe_key)` 唯一索引还在：只要行还在，
+/// 同一个命题再次出现就会**原地更新**；行被删掉之后再出现，就会以一个新的 UUID 重新插入，
+/// 而 `open_question.related_beliefs` 之类还指着旧 id（悬空引用）。留一个窗口让这件事自然
+/// 过期，同时给退休信念自己一个有界的寿命。
+const RETIRED_BELIEF_RETENTION_DAYS: i64 = 30;
 
 fn database_count(row: &sqlx_postgres::PgRow, column: &str) -> Result<u64, MindStoreError> {
     let value = row
@@ -1907,7 +1990,8 @@ mod tests {
         BeliefSource, BeliefStore, ConsolidationConfig, ConsolidationPlan, ConversationId,
         CuriosityId, CuriosityItem, CuriosityStore, Episode, EpisodeId, EpisodeStore, EventId,
         Interest, InterestId, InterestStore, MindConsolidationStore, MindDataErasure, MindScope,
-        MindSource, MindStoreError, MindUpsert, PersonId, SelfModelStore, TraceContext,
+        MindSource, MindStoreError, MindUpsert, OpenQuestion, OpenQuestionId, OpenQuestionStore,
+        PersonId, SelfModelStore, TraceContext,
     };
 
     fn belief(
@@ -1971,6 +2055,112 @@ mod tests {
                 .await
                 .expect("test rows should be removable");
         }
+    }
+
+    #[test]
+    #[ignore = "requires PostgreSQL via DATABASE_URL"]
+    fn postgres_cleanup_keeps_retired_beliefs_briefly_and_prunes_dangling_refs() {
+        // 两条新语义：① 退休（`valid_until` 已过）的信念不吃"活着"的 scope 上限，
+        // 按自己的寿命（30 天）清理——保留窗口内行还在，同一个命题再次出现就会原地更新，
+        // 而不是以新 UUID 复活；② 信念被删之后，open question 里指着它的条目要一起收掉。
+        crate::database_test_support::block_on(async {
+            let database_url = std::env::var("DATABASE_URL").expect("requires DATABASE_URL");
+            let pool = PgPoolOptions::new()
+                .max_connections(4)
+                .connect(&database_url)
+                .await
+                .expect("should connect to PostgreSQL");
+            let store = PostgresMindStore::new(pool.clone());
+            store
+                .initialize_schema()
+                .await
+                .expect("first migration should succeed");
+
+            let now = Utc::now();
+            let scope = MindScope::Global;
+            let marker = Uuid::new_v4();
+            // 刚退休：保留。
+            // 退休 = 写入一条带 `valid_until` 的更新版本（新建记录必须是第 1 版）。
+            let recent_seed = belief(
+                BeliefId::new(),
+                scope,
+                format!("recently retired {marker}"),
+                now - Duration::days(10),
+            );
+            BeliefStore::put(&store, &recent_seed, None)
+                .await
+                .expect("信念应先以第 1 版写入");
+            let recently_retired = recent_seed
+                .apply_update(
+                    0.0,
+                    0.0,
+                    &[],
+                    now - Duration::days(1),
+                    Some(now - Duration::days(1)),
+                )
+                .expect("应当可以退休");
+            BeliefStore::put(&store, &recently_retired, Some(1))
+                .await
+                .expect("退休版本应写入");
+            // 退休很久：清理时删掉。
+            let long_seed = belief(
+                BeliefId::new(),
+                scope,
+                format!("long retired {marker}"),
+                now - Duration::days(60),
+            );
+            BeliefStore::put(&store, &long_seed, None)
+                .await
+                .expect("信念应先以第 1 版写入");
+            let long_retired = long_seed
+                .apply_update(
+                    0.0,
+                    0.0,
+                    &[],
+                    now - Duration::days(41),
+                    Some(now - Duration::days(40)),
+                )
+                .expect("应当可以退休");
+            BeliefStore::put(&store, &long_retired, Some(1))
+                .await
+                .expect("久退休的版本应写入");
+            // 一条悬空引用：指向一个不存在的信念 id。
+            let dangling = BeliefId::new();
+            let question = OpenQuestion::new(
+                OpenQuestionId::new(),
+                scope,
+                format!("这条问题引用了一个不存在的看法 {marker}"),
+                vec![recently_retired.id(), dangling],
+                0.5,
+                now,
+            )
+            .expect("问题应当有效");
+            OpenQuestionStore::put(&store, &question, None)
+                .await
+                .expect("问题应写入");
+
+            let removed = store.cleanup(now).await.expect("清理应当成功");
+            assert!(removed > 0, "这一轮应当有东西被清掉");
+
+            let surviving = BeliefStore::get(&store, recently_retired.id())
+                .await
+                .expect("查询应当成功");
+            assert!(surviving.is_some(), "保留窗口内的退休信念不该被删");
+            let gone = BeliefStore::get(&store, long_retired.id())
+                .await
+                .expect("查询应当成功");
+            assert!(gone.is_none(), "超过保留窗口的退休信念应当被删");
+
+            let stored = OpenQuestionStore::get(&store, question.id())
+                .await
+                .expect("查询应当成功")
+                .expect("问题应当还在");
+            assert_eq!(
+                stored.related_beliefs(),
+                &[recently_retired.id()],
+                "悬空引用必须被收掉，存在的那条要留着"
+            );
+        });
     }
 
     #[test]
