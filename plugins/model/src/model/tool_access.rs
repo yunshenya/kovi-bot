@@ -105,6 +105,11 @@ enum BuiltinTool {
     GroupQuestionCancel,
     PrivateContactsSearch,
     PrivateMessageSend,
+    /// 主动拨一通 QQ 语音电话给**本轮说话的人**。
+    ///
+    /// 目标不是模型填的参数，而是 Core 动作的 actor 在效果边界上复核出来的 QQ 号
+    /// （见 `start_call`）。所以它天然不能用来打给任意号码。
+    CallStart,
     HealthCheck,
 }
 
@@ -194,7 +199,11 @@ impl BuiltinTool {
             | Self::GroupQuestionCancel
             | Self::AgentRunCreate
             | Self::AgentRunCancel
-            | Self::StickerMemoryTeach => WriteScope::Outbound,
+            | Self::StickerMemoryTeach
+            // 打出去的电话会响在**别人的手机**上：比发一条消息更难忽视，必须归对外写。
+            // 这一档还顺带保证了注入防线——任务一旦读过外人文字，档位收窄到 UserScoped，
+            // 这个工具就从清单里消失（"别拨号"由档位保证，不靠模型自觉）。
+            | Self::CallStart => WriteScope::Outbound,
         }
     }
 
@@ -221,6 +230,10 @@ impl BuiltinTool {
                 // 的 `revalidate_tool_effect` 卡在已授权群里——所以这里按宿主数据放行，
                 // 否则"主管理员让机器人去某个群发通知"这个必须两步的功能结构上做不了。
                 | Self::GroupMessageTargets
+                // 外呼结果是宿主自己的状态码（拨出去了/没等到回执/名单外），不含任何
+                // 外人写的字。放行它是有意的：电话已经拨出去，接下来她只需要如实说一句，
+                // 不该再因为这条宿主自产的结果把整轮收窄到不能发言。
+                | Self::CallStart
         )
     }
 }
@@ -361,6 +374,28 @@ fn push_recall_tool_definitions(definitions: &mut Vec<ToolDefinition>) {
             "additionalProperties": false
         }),
         source: ToolSource::Builtin(BuiltinTool::MessageRecall),
+    });
+}
+
+/// 主动外呼这个工具的声明。
+///
+/// 抽成函数同样是为了让测试复用同一份 schema 与 description。
+///
+/// 这份 description 只写**触发条件与边界**，不写"你能打电话"这种能力自述（AGENTS.md
+/// 第 6 条：常驻内容只留人格、硬约束与入口）。所以它必须同时说清"什么时候用"和
+/// "什么时候别用"——线上 2026-09-16 01:00 那句"我没有打电话的功能呀"就是因为提示词里
+/// 根本没有这个入口，她只能照自己的印象回答。
+fn push_call_tool_definitions(definitions: &mut Vec<ToolDefinition>) {
+    definitions.push(ToolDefinition {
+        name: "call.start".to_string(),
+        description: "给当前正在跟你说话的人打一通 QQ 语音电话。只在对方明确要你打的时候用，例如“给我打个电话”“打给我”“打电话跟我说”；对方只是提到电话、问你会不会打电话、或讨论通话功能时不要调用。目标由程序绑定到本轮说话的人，你没有参数可以填，也不能指定号码。对方不在可通话名单里会被拒绝，照实告诉对方就行。拨出去之后电话会响在对方手机上，你只能确认邀请有没有真的发出去，所以结果怎么说要跟工具返回一致。"
+            .to_string(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+        }),
+        source: ToolSource::Builtin(BuiltinTool::CallStart),
     });
 }
 
@@ -730,6 +765,11 @@ pub(crate) async fn initialize() -> Result<()> {
         source: ToolSource::Builtin(BuiltinTool::StickerList),
     });
     push_recall_tool_definitions(&mut definitions);
+    // 通话没配好时**根本不声明**这个工具：Core 的能力快照也就不会出现 StartCall，
+    // 于是"宿主不能打电话"这件事在认知层就是事实，而不是一个调了才失败的入口。
+    if call_channel_configured() {
+        push_call_tool_definitions(&mut definitions);
+    }
     definitions.push(ToolDefinition {
         name: "sticker_memory.teach".to_string(),
         description: "管理员专用：当管理员明确描述当前表情包的含义，并且当前消息带有表情/图片或引用了包含表情的消息时，保存正式表情记忆。label 只填写管理员给出的含义；普通评价、提问、猜测或讨论表情时不要调用，也不要自行推断含义。"
@@ -1083,6 +1123,17 @@ pub(crate) fn tool_registry() -> Option<Arc<ToolRegistry>> {
     TOOL_REGISTRY.get().cloned()
 }
 
+/// 通话通道是否已配置并允许外呼。
+///
+/// 和 `qq_call::dial_peer` 里那道判定同源，但这里只问**同步**的配置事实：这个工具
+/// 该不该出现在清单里。授权名单是异步的（查数据库），留到执行时判——"清单收窄只是
+/// 不告诉她，真动手前必须再查一次"是这套工具的既有分工。
+fn call_channel_configured() -> bool {
+    let config = crate::config::get();
+    let call = config.qq_call();
+    call.enabled() && call.outgoing_enabled()
+}
+
 impl ToolRegistry {
     /// 测试用：一个**没有任何定义**的注册表。
     ///
@@ -1121,6 +1172,7 @@ impl ToolRegistry {
                         || tool_context.sticker_teaching.is_some())
                     && (!definition.source.needs_sticker_library()
                         || crate::sticker_library::is_available())
+                    && (!definition.source.needs_call_channel() || call_channel_configured())
             })
     }
 
@@ -1340,6 +1392,9 @@ impl ToolRegistry {
             return false;
         }
         if definition.source.needs_sticker_library() && !sticker_available {
+            return false;
+        }
+        if definition.source.needs_call_channel() && !call_channel_configured() {
             return false;
         }
         if definition.source.admin_only() && !tool_context.is_admin {
@@ -1710,6 +1765,16 @@ impl ToolSource {
         matches!(self, Self::Builtin(BuiltinTool::StickerList))
     }
 
+    /// 只有通话通道真的可用时才下发的工具。
+    ///
+    /// 判据只用**同步**的配置事实（开关开着），不用授权名单：名单要查数据库，是异步的，
+    /// 而"清单收窄"本来只是不告诉她、真动手前还要再查一次（见 `available_for_allowance`）。
+    /// 名单判定放在 `dial_peer` 里，结果如实回报——她因此会说"你不在通话名单里"，
+    /// 而不是像线上 2026-09-16 01:00 那样答"我没有打电话的功能"。
+    fn needs_call_channel(&self) -> bool {
+        matches!(self, Self::Builtin(BuiltinTool::CallStart))
+    }
+
     fn available_for_scheduled(&self) -> bool {
         match self {
             Self::Builtin(tool) => !matches!(
@@ -1736,6 +1801,9 @@ impl ToolSource {
                     | BuiltinTool::StickerMemoryTeach
                     | BuiltinTool::MessageRecallCandidates
                     | BuiltinTool::MessageRecall
+                    // 定时任务不能打电话：它是"到点自己跑"的通道，没人当场看着，
+                    // 而电话是响在别人手机上的。要打也得有人在场的那一轮。
+                    | BuiltinTool::CallStart
             ),
             Self::Mcp {
                 scheduled_allowed, ..
@@ -2026,6 +2094,10 @@ async fn execute_builtin(
             let tool_context =
                 revalidate_tool_effect(&tool_context, reply_ticket, revalidator).await?;
             recall_own_messages(&arguments, &tool_context, reply_ticket).await
+        }
+        BuiltinTool::CallStart => {
+            reject_unknown_arguments(&arguments, &[])?;
+            start_call(&tool_context, reply_ticket, revalidator).await
         }
         BuiltinTool::SystemInfo => {
             reject_unknown_arguments(&arguments, &[])?;
@@ -4217,6 +4289,72 @@ async fn revalidate_tool_effect(
         .map_err(|reason| anyhow!(ToolEffectAuthorizationRejected(reason)))
 }
 
+/// 打一通电话给**本轮说话的人**。
+///
+/// 目标只能来自 `revalidate_tool_effect` 复核过的 `actor_user_id`：那是 Core 动作的
+/// actor 经身份库解析出的 QQ 号，群聊里就是发言者本人。schema 里没有任何"打给谁"的
+/// 参数，所以模型无法影响拨号对象——这比在参数里放一个 uin 字段安全一个量级。
+///
+/// 结局的成败划分是刻意的：**策略性拒绝算成功、真拨不出去算失败**。名单外、功能关掉、
+/// 正在通话中都是"我问过了，答案是不行"，她该照实转述，不该被记成工具故障（那会喂给
+/// 世界模型当退化信号，也会在她连续几次问同一个人之后被当成"卡住了"）。
+async fn start_call(
+    tool_context: &ToolExecutionContext,
+    reply_ticket: crate::model::interrupt::ReplyTicket,
+    revalidator: Option<&dyn ToolEffectRevalidator>,
+) -> Result<String> {
+    // 对外可见的写：和 reminder.create / message.recall 一样，先复核这一轮还是不是
+    // 当前轮、路由有没有变，再真的拨出去。
+    let tool_context = revalidate_tool_effect(tool_context, reply_ticket, revalidator).await?;
+    let peer = tool_context.actor_user_id;
+    if peer <= 0 {
+        return Err(anyhow!(
+            "外呼工具这一轮拿不到说话的人（actor 缺失），不能拨号"
+        ));
+    }
+    let config = config::get().qq_call().clone();
+    let main_admin = tool_context
+        .runtime_bot
+        .as_deref()
+        .and_then(|bot| bot.get_main_admin().ok());
+    let outcome = crate::qq_call::dial_peer(&config, main_admin, peer).await;
+    render_dial_outcome(outcome)
+}
+
+/// 把外呼结局落成工具结果。
+///
+/// 抽成纯函数是为了能在没有桥的情况下把**每一种结局的措辞与成败**钉住：
+/// 这套措辞决定她事后怎么向对方复述一通电话，值得单独测。
+fn render_dial_outcome(outcome: crate::qq_call::DialOutcome) -> Result<String> {
+    use crate::qq_call::DialOutcome;
+    match outcome {
+        DialOutcome::Dialed => Ok(
+            "已经拨出去了，对方的手机应该正在响铃。接下来电话里说什么由通话链路自己接上，             你只需要在这里如实说一句已经打了。"
+                .to_string(),
+        ),
+        // 措辞**只给正确说法**，不写"不要说成 X"。把错话写进她的上下文本身就是反向提示：
+        // 越交代"别提我没这个功能"，那句话越容易被复述出来。
+        DialOutcome::NotAuthorized => Ok(
+            "电话没拨出去：对方不在可通话名单里。照实说明是名单的问题就行。".to_string(),
+        ),
+        DialOutcome::AlreadyInCall => Ok(
+            "现在正通着话，这通先不拨。等这一通结束再说。".to_string(),
+        ),
+        DialOutcome::Disabled => Ok(
+            "通话功能当前没启用（qq_call.enabled = false），打不出去。".to_string(),
+        ),
+        DialOutcome::OutgoingDisabled => Ok(
+            "主动外呼当前被关掉了（qq_call.outgoing_enabled = false），打不出去。".to_string(),
+        ),
+        // 这两种是**真失败**：桥没通，或者拨号请求发出去了却没等到 AVSDK 回执。
+        DialOutcome::NoReceipt => Err(anyhow!(
+            "桥受理了拨号请求，但 {} 秒内没等到 AVSDK 的回执，多半没拨出去。不要告诉对方“已经打了”。",
+            crate::qq_call::DIAL_CONFIRM_WINDOW_SECS
+        )),
+        DialOutcome::BridgeUnavailable(error) => Err(anyhow!("通话桥不可用：{error}")),
+    }
+}
+
 fn reject_unknown_arguments(arguments: &Map<String, Value>, allowed: &[&str]) -> Result<()> {
     if let Some(unknown) = arguments
         .keys()
@@ -4606,9 +4744,10 @@ mod tests {
     use super::{
         BuiltinTool, GroupMemberMatchKind, MAX_OUTGOING_MESSAGE_CHARS, MessageDestination,
         ToolAllowance, ToolDefinition, ToolExecutionContext, ToolRegistry, ToolSource, WriteScope,
-        ambiguous_member_message, calculate, current_time, format_bing_results,
-        format_duckduckgo_results, mcp_tool_is_read_only_for_follow_up, normalize_duckduckgo_url,
-        normalize_outgoing_text, person_memory_keywords, private_contacts_result,
+        ambiguous_member_message, calculate, call_channel_configured, current_time,
+        format_bing_results, format_duckduckgo_results, mcp_tool_is_read_only_for_follow_up,
+        normalize_duckduckgo_url, normalize_outgoing_text, person_memory_keywords,
+        private_contacts_result, push_call_tool_definitions, render_dial_outcome,
         search_group_member_candidates, tool_is_explicitly_read_only, tool_name_looks_destructive,
         validate_public_url,
     };
@@ -4767,6 +4906,116 @@ mod tests {
     /// （`time.now`、`group.message.send`…）原样发出去就是整轮 400。
     /// 手写 spec 那一支（`task.declare`）出过同一个事故，由 `yunxi::core_model`
     /// 自己的守卫管；两边合起来覆盖"给模型的工具清单"这个整体。
+    /// 外呼的每一种结局，措辞与成败都要钉住。
+    ///
+    /// 这套文本会直接决定她事后怎么向对方复述一通电话，所以它比多数工具结果更值得测：
+    /// 说错"已经打了"就是一次假承诺。划分是刻意的——**策略性拒绝算成功**（名单外、
+    /// 功能关掉、正在通话中都是"问过了，答案是不行"），**真拨不出去才算失败**
+    /// （没等到 AVSDK 回执、桥不可用）。混在一起会让世界模型把正常的拒绝当成退化信号。
+    #[test]
+    fn dial_outcomes_are_reported_honestly() {
+        use crate::qq_call::DialOutcome;
+
+        let dialed = render_dial_outcome(DialOutcome::Dialed).expect("拨出去算成功");
+        assert!(dialed.contains("已经拨出去"), "{dialed}");
+
+        // 拒绝的四种情况：都不能出现"拨出去了"这个成功声明。
+        for refused in [
+            DialOutcome::NotAuthorized,
+            DialOutcome::Disabled,
+            DialOutcome::OutgoingDisabled,
+            DialOutcome::AlreadyInCall,
+        ] {
+            let text = render_dial_outcome(refused.clone()).unwrap_or_else(|error| {
+                panic!("{refused:?} 是策略性拒绝，不该算工具失败: {error}")
+            });
+            assert!(
+                !text.contains("已经拨出去"),
+                "{refused:?} 不能带上成功声明: {text}"
+            );
+        }
+
+        // 名单外那句必须指向**名单**这个真实原因，且不能把她没能力这句话写进上下文
+        // ——把错话写出来等于反向提示，越说别提越容易被复述。
+        let refused = render_dial_outcome(DialOutcome::NotAuthorized).expect("拒绝算成功");
+        assert!(refused.contains("名单"), "{refused}");
+        assert!(
+            !refused.contains("没有打电话的功能") && !refused.contains("不要说"),
+            "拒绝文案只该给正确说法，不该把错话或禁令写进去: {refused}"
+        );
+
+        // 真失败：没等到回执 / 桥不可用。
+        for failed in [
+            DialOutcome::NoReceipt,
+            DialOutcome::BridgeUnavailable("连接被拒绝".to_string()),
+        ] {
+            let error = render_dial_outcome(failed.clone())
+                .expect_err(&format!("{failed:?} 是真失败，必须算工具失败"));
+            let text = error.to_string();
+            assert!(
+                !text.contains("已经拨出去"),
+                "{failed:?} 不能带上成功声明: {text}"
+            );
+        }
+        let no_receipt = render_dial_outcome(DialOutcome::NoReceipt)
+            .expect_err("没回执算失败")
+            .to_string();
+        // 失败原因要带上窗口秒数，且这个数字只有一处定义。
+        assert!(
+            no_receipt.contains(&crate::qq_call::DIAL_CONFIRM_WINDOW_SECS.to_string()),
+            "失败原因该说清等了几秒: {no_receipt}"
+        );
+    }
+
+    /// 外呼工具的形态：**没有"打给谁"的参数**，且归对外写、不进定时任务。
+    ///
+    /// 这三条合起来才是"它不能被用来骚扰人"的完整保证：目标由宿主从 Core 动作的 actor
+    /// 绑定，模型无从填写；归 `Outbound` 保证读过外人文字的任务里它会从清单消失；
+    /// 不进定时任务保证没有"到点自己拨号、现场没人看着"的路径。
+    #[test]
+    fn the_call_tool_exposes_no_dial_target_and_stays_outbound() {
+        let mut definitions = Vec::new();
+        push_call_tool_definitions(&mut definitions);
+        assert_eq!(definitions.len(), 1, "这一组只该有外呼一个工具");
+
+        let definition = definitions.first().expect("call.start 声明");
+        assert_eq!(definition.name, "call.start");
+        // schema 里不能有任何"打给谁"的字段。
+        assert_eq!(definition.input_schema["properties"], json!({}));
+        assert_eq!(
+            definition.input_schema["additionalProperties"],
+            json!(false)
+        );
+
+        let ToolSource::Builtin(tool) = definition.source else {
+            panic!("外呼必须是内置工具");
+        };
+        assert_eq!(tool.write_scope(), WriteScope::Outbound);
+        assert!(
+            !tool.result_may_carry_foreign_text(),
+            "外呼结果是宿主自己的状态码，不含外人写的字"
+        );
+        assert!(
+            !definition.source.available_for_scheduled(),
+            "定时任务不得打电话：到点自己拨号，现场没人看着"
+        );
+    }
+
+    /// 外呼工具是否声明，只看通话通道这个开关——不看别的东西，也不硬编码。
+    ///
+    /// 声明出去就等于告诉 Core"宿主能打电话"（能力快照与效果声明都从注册表来），
+    /// 所以开关必须真的被读，而不是恒真。
+    #[test]
+    fn the_call_tool_availability_follows_the_call_channel_switch() {
+        let config = crate::config::get();
+        let call = config.qq_call();
+        assert_eq!(
+            call_channel_configured(),
+            call.enabled() && call.outgoing_enabled(),
+            "可用性必须由 enabled && outgoing_enabled 推出来"
+        );
+    }
+
     #[test]
     fn native_specs_use_wire_safe_function_names() {
         let registry = ToolRegistry {

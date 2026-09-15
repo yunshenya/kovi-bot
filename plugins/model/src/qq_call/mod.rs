@@ -39,6 +39,12 @@ const MISSED_NOTICE_TIMEOUT: Duration = Duration::from_secs(5);
 /// 主动外呼后等"电话真的响起来"的窗口。桥受理 ≠ AVSDK 真的拨号。
 const DIAL_CONFIRM_WINDOW: Duration = Duration::from_secs(6);
 
+/// 同一个窗口的秒数形式。
+///
+/// 给需要把它写进话术的地方用（工具结果要说"几秒内没等到回执"）。暴露这一个常量
+/// 而不是各处再写一遍 `6`：抄出来的那份永远不会跟着上面改。
+pub(crate) const DIAL_CONFIRM_WINDOW_SECS: u64 = DIAL_CONFIRM_WINDOW.as_secs();
+
 /// 私聊指令 `#通话自检 [问题]` 的实现：不通话也能验证电话里的工具链路。
 ///
 /// 试跑：清单与真通话一致（否则验不出"她本来会不会调"），但只有只读工具真跑，
@@ -70,28 +76,96 @@ pub(crate) async fn run_tool_self_test(
 /// 非管理员发的会被静默丢弃（见 `model/private.rs`）。这里另按通话名单判一次，规则是
 /// "谁让我打，我就打给谁"，不接受任意号码，免得变成骚扰工具。**打完必须确认电话真的响了**：AVSDK 的外呼命令可能被丢弃，
 /// 桥返回成功不代表拨出去了，所以这里几秒内轮询 AVSDK 回执，据实回复。
-pub(crate) async fn request_outgoing_call(bot: &kovi::RuntimeBot, requester: i64) -> String {
-    let config = config::get().qq_call().clone();
+/// 一次外呼尝试的结局。
+///
+/// 抽出来是为了让两条触发路径共用**同一份**判定：管理员私聊命令 `#打给我`
+/// 和她的 `call.start` 工具。措辞不同（命令像回话，工具像工具结果），但"能不能打、
+/// 打没打出去"必须只有一个答案——否则迟早出现"命令说成功了、工具说没拨出去"。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DialOutcome {
+    /// AVSDK 回了执，邀请真的发出去了（真机上是手机随即响铃）。
+    Dialed,
+    /// 桥受理了拨号请求，但在确认窗口内没等到 AVSDK 回执——多半没拨出去。
+    /// 不假装成功：文档里那条"不会假装成功"就是针对这种情况。
+    NoReceipt,
+    /// `qq_call.enabled = false`。
+    Disabled,
+    /// `qq_call.outgoing_enabled = false`。
+    OutgoingDisabled,
+    /// 目标不在通话授权名单里（主/副管理员 ∪ 数据库名单 ∪ 静态配置）。
+    NotAuthorized,
+    /// 现在正通着话（可能还没进房）。
+    AlreadyInCall,
+    /// 桥不可用，或拨号请求本身失败。
+    BridgeUnavailable(String),
+}
+
+impl DialOutcome {
+    /// 拨号邀请是否真的发出去了。
+    pub(crate) fn reached_peer(&self) -> bool {
+        matches!(self, Self::Dialed)
+    }
+
+    /// 稳定的事件/日志取值。不要用 `Debug`：那个以后改字段名会悄悄改掉指标口径。
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            Self::Dialed => "dialed",
+            Self::NoReceipt => "no_receipt",
+            Self::Disabled => "disabled",
+            Self::OutgoingDisabled => "outgoing_disabled",
+            Self::NotAuthorized => "not_authorized",
+            Self::AlreadyInCall => "already_in_call",
+            Self::BridgeUnavailable(_) => "bridge_unavailable",
+        }
+    }
+}
+
+/// 拨给某个人。**这是唯一的外呼入口**，`#打给我` 与 `call.start` 都走它，
+/// 免得"禁用开关"或"授权名单"只在其中一条路径上生效。
+///
+/// `peer` 必须是调用方自己解析出来的 QQ 号，**绝不能来自模型填的参数**：
+/// "打给谁"的决定必须在进来之前就绑定好。
+pub(crate) async fn dial_peer(
+    config: &config::QqCallConfig,
+    main_admin: Option<i64>,
+    peer: i64,
+) -> DialOutcome {
+    let outcome = dial_peer_inner(config, main_admin, peer).await;
+    // 每一次外呼尝试都留一条可事后复盘的记录：拨给谁、成没成、为什么。
+    // 打电话是不可撤销的动作，事后要能回答"这通是谁让它打的、结果怎样"。
+    println!(
+        "[INFO] QQ 语音外呼尝试：peer={peer} outcome={} reached={}",
+        outcome.as_str(),
+        outcome.reached_peer()
+    );
+    outcome
+}
+
+async fn dial_peer_inner(
+    config: &config::QqCallConfig,
+    main_admin: Option<i64>,
+    peer: i64,
+) -> DialOutcome {
     if !config.enabled() {
-        return "QQ 语音通话没启用，打不了电话。".to_string();
+        return DialOutcome::Disabled;
     }
     if !config.outgoing_enabled() {
-        return "主动外呼被关掉了（qq_call.outgoing_enabled = false）。".to_string();
+        return DialOutcome::OutgoingDisabled;
     }
-    if !caller_is_allowed(&config, bot.get_main_admin().ok(), requester).await {
-        return "你不在通话授权名单里，我不能打给你。".to_string();
+    if !caller_is_allowed(config, main_admin, peer).await {
+        return DialOutcome::NotAuthorized;
     }
-    let client = match BridgeClient::new(&config) {
+    let client = match BridgeClient::new(config) {
         Ok(client) => client,
-        Err(error) => return format!("打不了电话：{error}"),
+        Err(error) => return DialOutcome::BridgeUnavailable(error.to_string()),
     };
     if let Ok(state) = client.current_call().await
         && state.phase().is_live()
     {
-        return "现在正通着话呢，等这通结束我再打给你。".to_string();
+        return DialOutcome::AlreadyInCall;
     }
-    if let Err(error) = client.dial(requester).await {
-        return format!("打不出去：{error}");
+    if let Err(error) = client.dial(peer).await {
+        return DialOutcome::BridgeUnavailable(error.to_string());
     }
     // 确认电话真的拨出去了：桥受理 ≠ AVSDK 真的拨号。判据是插件记下的外呼回执
     // （AVSDK 回报"对方是否在线"），因为呼出的通话不会让桥进入 ringing/connected。
@@ -101,10 +175,27 @@ pub(crate) async fn request_outgoing_call(bot: &kovi::RuntimeBot, requester: i64
         if let Ok(state) = client.current_call().await
             && (state.phase().is_live() || state.dial_reached_at.is_some())
         {
-            return "好，我打给你啦，接一下～".to_string();
+            return DialOutcome::Dialed;
         }
     }
-    "我让桥拨了，但没等到 AVSDK 的回执，多半是没拨出去——这个我还在查。".to_string()
+    DialOutcome::NoReceipt
+}
+
+pub(crate) async fn request_outgoing_call(bot: &kovi::RuntimeBot, requester: i64) -> String {
+    let config = config::get().qq_call().clone();
+    match dial_peer(&config, bot.get_main_admin().ok(), requester).await {
+        DialOutcome::Dialed => "好，我打给你啦，接一下～".to_string(),
+        DialOutcome::NoReceipt => {
+            "我让桥拨了，但没等到 AVSDK 的回执，多半是没拨出去——这个我还在查。".to_string()
+        }
+        DialOutcome::Disabled => "QQ 语音通话没启用，打不了电话。".to_string(),
+        DialOutcome::OutgoingDisabled => {
+            "主动外呼被关掉了（qq_call.outgoing_enabled = false）。".to_string()
+        }
+        DialOutcome::NotAuthorized => "你不在通话授权名单里，我不能打给你。".to_string(),
+        DialOutcome::AlreadyInCall => "现在正通着话呢，等这通结束我再打给你。".to_string(),
+        DialOutcome::BridgeUnavailable(error) => format!("打不出去：{error}"),
+    }
 }
 
 /// 启动 QQ 语音通话调度器。默认关闭，未启用时立即返回。

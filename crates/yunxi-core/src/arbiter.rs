@@ -39,6 +39,14 @@ fn lock_arbiter_state(state: &Mutex<ArbiterState>) -> std::sync::MutexGuard<'_, 
 pub enum ActionCapability {
     SendMessage,
     ReachOut,
+    /// Open a live voice call with a person.
+    ///
+    /// Deliberately separate from [`Self::ReachOut`]: reaching out is a message
+    /// a person can ignore, a call is one they must answer or reject. Hosts that
+    /// can do the second may not be able to do the first at all (the QQ call
+    /// channel is a separate bridge, not the message transport), so the two are
+    /// declared and withheld independently.
+    StartCall,
     UseTool,
     CreateOpenLoop,
     ResolveOpenLoop,
@@ -52,6 +60,7 @@ impl ActionCapability {
         match self {
             Self::SendMessage => "send_message",
             Self::ReachOut => "reach_out",
+            Self::StartCall => "start_call",
             Self::UseTool => "use_tool",
             Self::CreateOpenLoop => "create_open_loop",
             Self::ResolveOpenLoop => "resolve_open_loop",
@@ -192,6 +201,15 @@ impl EnvironmentCapabilities {
         }
     }
 
+    /// Every **platform-neutral** action capability.
+    ///
+    /// [`ActionCapability::StartCall`] is deliberately absent. Placing a call
+    /// needs an out-of-band voice channel that no host gets for free — the QQ
+    /// host drives a separate NapCat AV bridge with its own audio devices — so a
+    /// host that can talk cannot necessarily ring. Hosts that can must declare
+    /// it explicitly (see the QQ adapter's `capabilities()`), and a host that
+    /// gets it from here by accident would be advertising a channel it cannot
+    /// actually open.
     #[must_use]
     pub fn all() -> Self {
         Self::empty()
@@ -1601,6 +1619,13 @@ mod tests {
         ] {
             assert!(capabilities.supports(capability, ActionScope::Global));
         }
+        // `StartCall` 不在里面是**决定**，不是漏了：打电话要走宿主自己的带外语音
+        // 通道（QQ 那边是 NapCat AV 桥），能说话不等于能拨号。要拨号的宿主必须自己
+        // 显式声明，否则就是宣称一条它其实开不了的通道。
+        assert!(
+            !capabilities.supports(ActionCapability::StartCall, ActionScope::Global),
+            "StartCall 需要带外语音通道，不该由 platform-neutral 的 all() 提供"
+        );
     }
 
     #[test]
