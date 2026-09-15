@@ -1061,7 +1061,11 @@ QQ 那一层需要先部署（不可逆红线，未动），但整条链路上�
 2. **`ModelGateway::complete_without_tools` 已无调用者**（本身带 `#[allow(dead_code)]`，本次迁移之前就
    是死代码）。与第 1 条相关，**已一并处理**（`6229ea2`）：删掉该网关方法、`interruptible_model_call`
    与 memory_query 那份 `ModelPromptMode::LegacyReplyGuidance` 分支。
-   **仍未动**：`utils.rs` 里 `params_model` → `params_model_with_token_limit` → `..._and_progress` →
-   `..._for_reply` 这条通用便利入口链（`params_model` 自带 `#[allow(dead_code)]`，迁移前就没人调，
-   但它像是被显式保留的通用 API）。删它会连带删掉 utils 那份 `ModelPromptMode::LegacyReplyGuidance`，
-   属于本任务范围外的清理，要不要删请说一声。
+   **更正后已一并删除**（`967006b`）：这里原先写的是"`params_model` → `params_model_with_token_limit`
+   → `..._and_progress` → `..._for_reply` 这条链迁移前就没人调"——**那句是错的**。死的只有根上的
+   `params_model`；`params_model_with_token_limit` 还有一个活用户：**表情含义候选整理器**
+   （`sticker_memory.rs`）。它和摘要是同一个坑的第二个实例（严格 JSON 抽取任务被附
+   "本轮回复要求：先直接回应用户……"，而失败是静默的——解析不出 JSON 就 `Ok(None)`），已改走
+   `params_model_without_reply_guidance`（`3415f95`，并补了一条抓请求体的守卫用例）。用户搬走之后
+   整条链才真的没有调用者，随后连同 utils 那份 `ModelPromptMode::LegacyReplyGuidance` 一起删掉
+   （`967006b`）。教训记在这里：核"死代码"要核到**链条的每一个出口**，不能只看根上那个函数。
