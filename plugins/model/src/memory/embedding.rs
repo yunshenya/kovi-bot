@@ -111,16 +111,7 @@ impl EmbeddingClient {
                 ));
             }
             for vector in batch_vectors {
-                let values = vector
-                    .as_array()
-                    .ok_or_else(|| anyhow!("向量不是数组"))?
-                    .iter()
-                    .map(|value| value.as_f64().unwrap_or(0.0) as f32)
-                    .collect::<Vec<f32>>();
-                if values.is_empty() {
-                    return Err(anyhow!("嵌入服务返回了空向量"));
-                }
-                vectors.push(values);
+                vectors.push(parse_vector(vector)?);
             }
         }
         Ok(vectors)
@@ -183,6 +174,36 @@ impl EmbeddingClient {
     }
 }
 
+/// 解析嵌入服务返回的一条向量。
+///
+/// 每个元素都必须是**有限数字**：以前这里用 `value.as_f64().unwrap_or(0.0)`，于是一个
+/// 字符串、null 或缺字段会被静默当成 0——那条记忆的向量从此永远歪着，语义检索再也不会
+/// 正确命中它，而调用方看不到任何异常。维度也不做假设（换模型时维度会变），只要求
+/// 非空；维度一致性由读取侧按"与查询向量同维"检查。
+pub(crate) fn parse_vector(value: &Value) -> Result<Vec<f32>> {
+    let elements = value
+        .as_array()
+        .ok_or_else(|| anyhow!("嵌入向量不是数组"))?;
+    if elements.is_empty() {
+        return Err(anyhow!("嵌入服务返回了空向量"));
+    }
+    let mut values = Vec::with_capacity(elements.len());
+    for (index, element) in elements.iter().enumerate() {
+        let number = element
+            .as_f64()
+            .ok_or_else(|| anyhow!("嵌入向量第 {} 个元素不是数字: {element}", index + 1))?;
+        let value = number as f32;
+        if !value.is_finite() {
+            return Err(anyhow!(
+                "嵌入向量第 {} 个元素不是有限数: {number}",
+                index + 1
+            ));
+        }
+        values.push(value);
+    }
+    Ok(values)
+}
+
 /// 余弦相似度。服务端已做 L2 归一化，所以这里其实就是点积——但仍然做完整计算，
 /// 免得哪天换了不做归一化的模型就悄悄算错。
 pub(crate) fn cosine(left: &[f32], right: &[f32]) -> f32 {
@@ -229,6 +250,30 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+
+    #[test]
+    fn malformed_vector_elements_are_rejected_instead_of_zeroed() {
+        // 以前非数字元素会被 `unwrap_or(0.0)` 静默当成 0：那条记忆的向量从此永远歪着，
+        // 语义检索再也不会正确命中它，而调用方看不到任何异常。
+        let parsed = parse_vector(&serde_json::json!([0.5, -0.25, 1.0])).expect("合法向量");
+        assert_eq!(parsed, vec![0.5, -0.25, 1.0]);
+
+        for bad in [
+            serde_json::json!([0.5, "0.25"]),
+            serde_json::json!([0.5, null]),
+            serde_json::json!([0.5, {}]),
+            serde_json::json!([]),
+            serde_json::json!("not an array"),
+        ] {
+            assert!(
+                parse_vector(&bad).is_err(),
+                "非法向量必须报错而不是补 0: {bad}"
+            );
+        }
+        // 非有限数同样拒绝：NaN/Inf 会让余弦与排序全部失去意义。
+        assert!(parse_vector(&serde_json::json!([f64::NAN])).is_err());
+        assert!(parse_vector(&serde_json::json!([f64::INFINITY])).is_err());
+    }
 
     /// 进程内假服务：**接缝要测在边界上**。
     ///

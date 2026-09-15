@@ -3075,18 +3075,35 @@ impl MemoryManager {
             .next()
             .ok_or_else(|| anyhow::anyhow!("嵌入服务没有返回查询向量"))?;
         let threshold = crate::config::get().memory().embedding_min_similarity();
+        // 维度不一致（换过模型、换过嵌入实现、落库时被截断）的向量**必须挑出来说一声**：
+        // `cosine` 对长度不同的输入返回 0.0，于是这些记忆只是"永远排不上"，从检索结果里
+        // 静默消失——不告警的话，没人会知道有一批记忆已经不可能被语义召回了。
+        let mut dimension_mismatches = 0_usize;
         let mut scored: Vec<(String, f32)> = rows
             .iter()
             .filter_map(|row| {
                 let memory_id: String = row.get("memory_id");
                 let bytes: Vec<u8> = row.get("vector");
                 let vector = vector_from_bytes(&bytes)?;
+                if vector.len() != query_vector.len() {
+                    dimension_mismatches += 1;
+                    return None;
+                }
                 let similarity = cosine(&query_vector, &vector);
                 // 低于阈值就当"没有相关的"：语义检索总会返回 top-K，而无关记忆
                 // 插进融合结果会让检索**变差**，不如老老实实退回词面。
                 (similarity >= threshold).then_some((memory_id, similarity))
             })
             .collect();
+        if dimension_mismatches > 0 {
+            warn_sidecar("semantic_dimension", || {
+                format!(
+                    "有 {dimension_mismatches} 条记忆的向量维度与当前模型（{}，{} 维）不一致，                     这些记忆暂时无法被语义召回；换过模型的话需要重算向量",
+                    client.model(),
+                    query_vector.len()
+                )
+            });
+        }
         // 分数相同按 id 排，保证结果确定。
         scored.sort_by(|left, right| {
             right

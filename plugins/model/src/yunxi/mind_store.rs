@@ -9,8 +9,8 @@ use sqlx_postgres::{PgPool, Postgres};
 use uuid::Uuid;
 use yunxi_core::{
     AgendaItem, AgendaItemId, AgendaStatus, AgendaStore, Belief, BeliefId, BeliefStore,
-    ConsolidationConfig, ConsolidationPlan, ConsolidationResult, CuriosityId, CuriosityItem,
-    CuriosityStatus, CuriosityStore, Episode, EpisodeStore, Interest, InterestId, InterestStore,
+    ConsolidationPlan, ConsolidationResult, CuriosityId, CuriosityItem, CuriosityStatus,
+    CuriosityStore, Episode, EpisodeStore, Interest, InterestId, InterestStore,
     MindConsolidationStore, MindDataErasure, MindDataErasureError, MindDataErasureFuture,
     MindScope, MindServices, MindStoreError, MindStoreFuture, OpenQuestion, OpenQuestionId,
     OpenQuestionStatus, OpenQuestionStore, Preference, PreferenceId, PreferenceStore, SelfIdentity,
