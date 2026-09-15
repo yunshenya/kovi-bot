@@ -1757,6 +1757,8 @@
     tagList: null,
     /** 标签表按需重拉：页面内的筛选/翻页复用缓存，进页面或点「刷新」时置位。 */
     staleTags: true,
+    /** 人物页自己的页码：与记录页的 `page` 分开，否则两边会互相跳页。 */
+    peoplePage: 1,
     selected: null,
     granularity: 'month',
     groupIndex: 0,
@@ -2162,7 +2164,11 @@
     table.append(body);
     // 包一层可滚动容器，表头才能 sticky 住（表格自己滚动，页码留在下面）。
     card.append(h('div', { class: 'table-scroll' }, table));
-    card.append(renderPager(data));
+    card.append(renderPager(data, {
+      page: memory.page,
+      limit: memory.limit,
+      onJump: (target) => { memory.page = target; renderMemoryPage(); },
+    }));
     page.append(card);
   }
 
@@ -2178,14 +2184,13 @@
     return box;
   }
 
-  function renderPager(data) {
-    const pages = Math.max(1, Math.ceil(data.total / memory.limit));
-    const jump = (target) => {
-      memory.page = Math.min(Math.max(1, target), pages);
-      renderMemoryPage();
-    };
-    const start = data.total === 0 ? 0 : (memory.page - 1) * memory.limit + 1;
-    const end = Math.min(memory.page * memory.limit, data.total);
+  /** 翻页条。页码、页大小与"翻到第几页"都由调用方给：记录页与人物页各有自己的
+   *  页码状态，共用一个渲染器比自己再抄一份翻页按钮可靠。 */
+  function renderPager(data, { page, limit, onJump }) {
+    const pages = Math.max(1, Math.ceil(data.total / limit));
+    const jump = (target) => onJump(Math.min(Math.max(1, target), pages));
+    const start = data.total === 0 ? 0 : (page - 1) * limit + 1;
+    const end = Math.min(page * limit, data.total);
     // 过滤与分页都只在后端抓到的那个窗口里做（每类最多 200 条）。真实总数远超
     // 窗口时如实说明：页码条只承诺它翻得到的页，不再出现"共 5000 条、翻到第 5 页
     // 全是空的"。
@@ -2195,11 +2200,11 @@
     return h('div', { class: 'table-foot' },
       h('span', { class: 'muted', text: `${start}-${end} / 共 ${data.total} 条${windowNote}` }),
       h('div', { class: 'pager-btns' },
-        h('button', { class: 'btn ghost small', text: '«', disabled: memory.page === 1, onclick: () => jump(1) }),
-        h('button', { class: 'btn ghost small', text: '‹', disabled: memory.page === 1, onclick: () => jump(memory.page - 1) }),
-        h('span', { class: 'muted', text: `${memory.page} / ${pages}` }),
-        h('button', { class: 'btn ghost small', text: '›', disabled: memory.page >= pages, onclick: () => jump(memory.page + 1) }),
-        h('button', { class: 'btn ghost small', text: '»', disabled: memory.page >= pages, onclick: () => jump(pages) })));
+        h('button', { class: 'btn ghost small', text: '«', disabled: page === 1, onclick: () => jump(1) }),
+        h('button', { class: 'btn ghost small', text: '‹', disabled: page === 1, onclick: () => jump(page - 1) }),
+        h('span', { class: 'muted', text: `${page} / ${pages}` }),
+        h('button', { class: 'btn ghost small', text: '›', disabled: page >= pages, onclick: () => jump(page + 1) }),
+        h('button', { class: 'btn ghost small', text: '»', disabled: page >= pages, onclick: () => jump(pages) })));
   }
 
   // ── 时间线视图
@@ -2328,7 +2333,11 @@
     card.append(rail);
     // 时间线此前只画了当前这一页，却没有任何翻页入口（表格视图有 `renderPager`），
     // 于是第 100 条之后的数据在这个视图里根本到不了。用同一个分页器。
-    card.append(renderPager(data));
+    card.append(renderPager(data, {
+      page: memory.page,
+      limit: memory.limit,
+      onJump: (target) => { memory.page = target; renderMemoryPage(); },
+    }));
     page.append(card);
   }
 
@@ -2993,16 +3002,39 @@
 
   // ── 人物
 
+  /** 人物页每页多少张卡片。人物数量远少于记忆，但也会上百，不能一次全铺出来。 */
+  const PEOPLE_PAGE_SIZE = 60;
+
   async function renderPeopleTab(page) {
     const search = h('input', { class: 'input search', placeholder: '按 QQ 号或身份搜索…', value: memory.query });
     page.append(h('div', { class: 'card tight' },
       h('div', { class: 'search-row' }, search,
         h('button', {
           class: 'btn', text: '搜索',
-          onclick: () => { memory.query = search.value; renderMemoryPage(); },
+          onclick: () => {
+            memory.query = search.value;
+            // 换了搜索词就得回到第一页：停在第 3 页上很可能一条都搜不到。
+            memory.peoplePage = 1;
+            renderMemoryPage();
+          },
         }))));
 
-    const data = await api(`/api/memory/people?limit=60${memory.query ? `&q=${encodeURIComponent(memory.query)}` : ''}`);
+    const params = new URLSearchParams({
+      limit: String(PEOPLE_PAGE_SIZE),
+      offset: String((memory.peoplePage - 1) * PEOPLE_PAGE_SIZE),
+    });
+    if (memory.query) params.set('q', memory.query);
+    const data = await api(`/api/memory/people?${params}`);
+
+    // 页码越界（搜索后结果变少、或别人删了人）：退回最后一页重画，而不是给一屏
+    // "还没有人物记录"——那会让人以为库里空了。
+    const lastPage = Math.max(1, Math.ceil(data.total / PEOPLE_PAGE_SIZE));
+    if (memory.peoplePage > lastPage) {
+      memory.peoplePage = lastPage;
+      await renderMemoryPage();
+      return;
+    }
+
     page.append(h('div', { class: 'card-head' },
       h('h3', { text: `人物（${data.total}）` }),
       h('span', { class: 'hint', text: 'canonical Person 及其 QQ 身份' })));
@@ -3017,6 +3049,14 @@
     }
     if (!data.items.length) grid.append(h('div', { class: 'empty', text: '还没有人物记录' }));
     page.append(grid);
+    // 只有一页就别摆翻页条：那一行除了占地方没有任何用处。
+    if (data.total > PEOPLE_PAGE_SIZE) {
+      page.append(h('div', { class: 'card' }, renderPager(data, {
+        page: memory.peoplePage,
+        limit: PEOPLE_PAGE_SIZE,
+        onJump: (target) => { memory.peoplePage = target; renderMemoryPage(); },
+      })));
+    }
   }
 
   // 关系五维。三个刻意的选择：
