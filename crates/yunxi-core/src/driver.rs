@@ -815,6 +815,23 @@ mod tests {
         }
     }
 
+    /// An arbiter for a test environment that declares the fixture tools.
+    ///
+    /// Core refuses a tool the host never declared, so the fixtures below say
+    /// what they expose just as a real host does.
+    fn arbiter() -> ActionArbiter {
+        let mut capabilities = EnvironmentCapabilities::all();
+        capabilities.actions.extend([
+            crate::ActionDescriptor::tool("step.one", crate::EffectScope::Outbound),
+            crate::ActionDescriptor::tool("step.two", crate::EffectScope::Outbound),
+            crate::ActionDescriptor::tool("web.search", crate::EffectScope::Outbound),
+        ]);
+        ActionArbiter::new(ActionArbiterConfig {
+            capabilities,
+            ..ActionArbiterConfig::default()
+        })
+    }
+
     fn block_on<F: Future>(future: F) -> F::Output {
         let waker = Waker::noop();
         let mut context = Context::from_waker(waker);
@@ -866,12 +883,9 @@ mod tests {
         block_on(handle.submit(message_event(conversation_id))).expect("submit");
         Fixture {
             runtime,
-            // The driver can only reach tools when the host declares the
-            // capability; a default arbiter rejects every action.
-            arbiter: ActionArbiter::new(ActionArbiterConfig {
-                capabilities: EnvironmentCapabilities::all(),
-                ..ActionArbiterConfig::default()
-            }),
+            // The driver can only reach tools when the host declares them; a
+            // default arbiter rejects every action.
+            arbiter: arbiter(),
             port: ImmediatePort,
             observer: Recorder {
                 replying_allowed,
@@ -1041,10 +1055,7 @@ mod tests {
             Arc::clone(&probe) as Arc<dyn ModelBackend>
         ));
         block_on(handle.submit(message_event(conversation_id))).expect("submit");
-        let arbiter = ActionArbiter::new(ActionArbiterConfig {
-            capabilities: EnvironmentCapabilities::all(),
-            ..ActionArbiterConfig::default()
-        });
+        let arbiter = arbiter();
         let mut observer = Recorder {
             replying_allowed: true,
             ..Recorder::default()
@@ -1081,10 +1092,7 @@ mod tests {
             CognitiveRuntime::new(RuntimeConfig::default()).expect("runtime");
         runtime.install_services(CoreServices::with_model(ThreeStepModel));
         block_on(handle.submit(message_event(conversation_id))).expect("submit");
-        let arbiter = ActionArbiter::new(ActionArbiterConfig {
-            capabilities: EnvironmentCapabilities::all(),
-            ..ActionArbiterConfig::default()
-        });
+        let arbiter = arbiter();
         let mut observer = Recorder {
             replying_allowed: true,
             ..Recorder::default()
@@ -1232,10 +1240,7 @@ mod tests {
         );
         assert_eq!(runtime.register_expectation(&event, expectation), Ok(true));
         block_on(handle.submit(event)).expect("submit");
-        let arbiter = ActionArbiter::new(ActionArbiterConfig {
-            capabilities: EnvironmentCapabilities::all(),
-            ..ActionArbiterConfig::default()
-        });
+        let arbiter = arbiter();
         let mut observer = Recorder {
             replying_allowed: true,
             ..Recorder::default()
@@ -1272,10 +1277,7 @@ mod tests {
         );
         assert_eq!(runtime.register_expectation(&event, expectation), Ok(true));
         block_on(handle.submit(event)).expect("submit");
-        let arbiter = ActionArbiter::new(ActionArbiterConfig {
-            capabilities: EnvironmentCapabilities::all(),
-            ..ActionArbiterConfig::default()
-        });
+        let arbiter = arbiter();
         let mut observer = Recorder {
             replying_allowed: true,
             ..Recorder::default()
@@ -1302,10 +1304,7 @@ mod tests {
         runtime.install_services(CoreServices::with_model(ThreeStepModel));
         let event = message_event(conversation_id);
         block_on(handle.submit(event.clone())).expect("submit");
-        let arbiter = ActionArbiter::new(ActionArbiterConfig {
-            capabilities: EnvironmentCapabilities::all(),
-            ..ActionArbiterConfig::default()
-        });
+        let arbiter = arbiter();
         let mut observer = Recorder {
             replying_allowed: true,
             ..Recorder::default()
@@ -1333,10 +1332,7 @@ mod tests {
         runtime.install_services(CoreServices::with_model(PlainReplyModel));
         let event = message_event(conversation_id);
         block_on(handle.submit(event.clone())).expect("submit");
-        let arbiter = ActionArbiter::new(ActionArbiterConfig {
-            capabilities: EnvironmentCapabilities::all(),
-            ..ActionArbiterConfig::default()
-        });
+        let arbiter = arbiter();
         let mut observer = Recorder {
             replying_allowed: true,
             ..Recorder::default()

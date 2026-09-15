@@ -1354,7 +1354,7 @@ impl ChannelAdapter for QqActionAdapter {
     }
 
     fn capabilities(&self) -> EnvironmentCapabilities {
-        EnvironmentCapabilities::new([
+        let mut capabilities = EnvironmentCapabilities::new([
             ActionDescriptor::new(ActionCapability::SendMessage),
             ActionDescriptor::new(ActionCapability::ReachOut),
             ActionDescriptor::new(ActionCapability::UseTool),
@@ -1362,7 +1362,20 @@ impl ChannelAdapter for QqActionAdapter {
             ActionDescriptor::new(ActionCapability::ResolveOpenLoop),
             ActionDescriptor::new(ActionCapability::StartGoal),
             ActionDescriptor::new(ActionCapability::CancelGoal),
-        ])
+        ]);
+        // Core refuses a tool the host has not declared, so the declarations
+        // have to travel with the capability. Without them every tool call
+        // would be rejected — including her own.
+        let Some(registry) = crate::model::tool_registry() else {
+            return capabilities;
+        };
+        capabilities.actions.extend(
+            registry
+                .declared_effects()
+                .into_iter()
+                .map(|(name, effect)| ActionDescriptor::tool(name, effect)),
+        );
+        capabilities
     }
 }
 

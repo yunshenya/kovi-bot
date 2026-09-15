@@ -73,6 +73,42 @@ impl fmt::Display for ActionCapability {
 pub struct ActionDescriptor {
     pub capability: ActionCapability,
     pub allowed_scopes: Option<Vec<ActionScope>>,
+    /// Which tool this declares, for hosts that expose tools.
+    ///
+    /// A `UseTool` intent names a tool, not a capability, so Core cannot tell
+    /// what a call does without this: the capability says "this host can use
+    /// tools", never "this particular call only reads".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+    /// Whose state this action can change.
+    ///
+    /// Declared by the host, because only the host knows what a call does.
+    /// Defaults to [`EffectScope::Outbound`] so an undeclared or unknown action
+    /// fails closed rather than being treated as harmless.
+    #[serde(default)]
+    pub effect: EffectScope,
+}
+
+/// How far an action's effects reach.
+///
+/// This is the declaration Core needs to decide whether a call is allowed given
+/// what the current turn has been exposed to. It is deliberately about *reach*,
+/// not about how dangerous the call looks: a web search and a memory write are
+/// both "safe" and belong in different tiers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EffectScope {
+    /// No side effect at all: a query.
+    ReadOnly,
+    /// Changes only the acting person's own state, reversibly and without
+    /// becoming visible to anyone else: a reminder, a private memory.
+    UserScoped,
+    /// Speaks as the agent, or changes state shared with others.
+    ///
+    /// The default, so a declaration that was forgotten cannot silently pass
+    /// for harmless.
+    #[default]
+    Outbound,
 }
 
 impl ActionDescriptor {
@@ -81,6 +117,8 @@ impl ActionDescriptor {
         Self {
             capability,
             allowed_scopes: None,
+            tool: None,
+            effect: EffectScope::Outbound,
         }
     }
 
@@ -92,6 +130,19 @@ impl ActionDescriptor {
         Self {
             capability,
             allowed_scopes: Some(scopes.into_iter().collect()),
+            tool: None,
+            effect: EffectScope::Outbound,
+        }
+    }
+
+    /// Declares one tool this host exposes, and how far its effects reach.
+    #[must_use]
+    pub fn tool(name: impl Into<String>, effect: EffectScope) -> Self {
+        Self {
+            capability: ActionCapability::UseTool,
+            allowed_scopes: None,
+            tool: Some(name.into()),
+            effect,
         }
     }
 
@@ -151,6 +202,29 @@ impl EnvironmentCapabilities {
     #[must_use]
     pub fn actions(&self) -> &[ActionDescriptor] {
         &self.actions
+    }
+
+    /// Declares one tool this environment can call, and how far it reaches.
+    ///
+    /// A capability entry for `UseTool` says only that tools exist. A `UseTool`
+    /// intent names a *tool*, so without per-tool declarations Core has nothing
+    /// to check a call against — and an undeclared tool is indistinguishable
+    /// from a hallucinated one.
+    #[must_use]
+    pub fn with_tool(self, name: impl Into<String>, effect: EffectScope) -> Self {
+        self.with_action(ActionDescriptor::tool(name, effect))
+    }
+
+    /// How far the named tool's effects reach, when the host declared it.
+    ///
+    /// Returns `None` for a tool nobody declared, which callers must treat as
+    /// "not permitted" rather than "harmless".
+    #[must_use]
+    pub fn effect_of(&self, tool_name: &str) -> Option<EffectScope> {
+        self.actions
+            .iter()
+            .find(|descriptor| descriptor.tool.as_deref() == Some(tool_name))
+            .map(|descriptor| descriptor.effect)
     }
 
     #[must_use]
@@ -398,6 +472,14 @@ impl RateLimit {
 #[derive(Debug, Clone)]
 pub struct ActionArbiterConfig {
     pub capabilities: EnvironmentCapabilities,
+    /// The largest effect any action may have on this turn.
+    ///
+    /// A turn that has taken in text written by someone else may still read and
+    /// may still change the acting person's own state, but it must not speak in
+    /// her name or change shared state. Hosts that track that trust level set
+    /// this per turn; the default permits everything, which is the behaviour
+    /// every existing host already has.
+    pub effect_ceiling: EffectScope,
     pub authorization: AuthorizationPolicy,
     pub cooldown: Duration,
     pub daily_limit: Option<u32>,
@@ -413,6 +495,7 @@ impl Default for ActionArbiterConfig {
             // Hosts must explicitly publish the operations they support. A
             // missing capability declaration must fail closed.
             capabilities: EnvironmentCapabilities::empty(),
+            effect_ceiling: EffectScope::Outbound,
             authorization: AuthorizationPolicy::allow_all(),
             cooldown: Duration::ZERO,
             daily_limit: None,
@@ -873,6 +956,28 @@ impl ActionArbiter {
                 capability,
             });
         }
+        // A `UseTool` capability only says that this host exposes tools; the
+        // intent names a specific tool, and Core cannot judge a call it has no
+        // declaration for. An undeclared tool therefore fails closed, which
+        // also means a hallucinated or injected tool name cannot reach the
+        // environment on the strength of the capability alone.
+        if let crate::ProposedAction::UseTool(tool) = action {
+            let Some(effect) = self.config.capabilities.effect_of(&tool.tool_name) else {
+                return Err(ActionRejection::Unauthorized {
+                    action_id: action.action_id(),
+                    reason: format!("tool `{}` is not declared by this host", tool.tool_name),
+                });
+            };
+            if effect > self.config.effect_ceiling {
+                return Err(ActionRejection::Unauthorized {
+                    action_id: action.action_id(),
+                    reason: format!(
+                        "tool `{}` reaches {:?}, beyond this turn's {:?} ceiling",
+                        tool.tool_name, effect, self.config.effect_ceiling
+                    ),
+                });
+            }
+        }
         if let Err(failure) = self.config.authorization.permits(action) {
             let action_id = action.action_id();
             return match failure {
@@ -1301,6 +1406,111 @@ mod tests {
             )
             .expect("valid action"),
         )
+    }
+
+    #[test]
+    fn an_undeclared_tool_is_refused_and_a_declared_one_respects_the_ceiling() {
+        // The `UseTool` capability only says this host exposes tools. A call
+        // names a specific tool, so the host has to declare that tool — and a
+        // name nobody declared must not reach the environment on the strength
+        // of the capability alone.
+        let conversation_id = ConversationId::new();
+        let scope = ActionScope::Conversation(conversation_id);
+        let tool_action = |name: &str| {
+            ProposedAction::UseTool(
+                crate::ToolAction::new(name, "{}", scope).expect("valid tool action"),
+            )
+        };
+        let mut capabilities = EnvironmentCapabilities::all();
+        capabilities
+            .actions
+            .push(ActionDescriptor::tool("web.search", EffectScope::ReadOnly));
+        capabilities.actions.push(ActionDescriptor::tool(
+            "memory.remember",
+            EffectScope::UserScoped,
+        ));
+        capabilities.actions.push(ActionDescriptor::tool(
+            "group.message.send",
+            EffectScope::Outbound,
+        ));
+
+        let arbiter =
+            ActionArbiter::new(ActionArbiterConfig::default().with_capabilities(capabilities));
+
+        // Declared and within the default ceiling: admitted.
+        arc_ok(
+            &arbiter,
+            &tool_action("web.search"),
+            "declared read-only tool",
+        );
+        arc_ok(
+            &arbiter,
+            &tool_action("group.message.send"),
+            "declared outbound tool",
+        );
+
+        // Never declared: refused, whatever the capability says.
+        let refusal = arbiter
+            .validate_at(&tool_action("made.up.tool"), Utc::now())
+            .expect_err("an undeclared tool must be refused");
+        assert!(
+            matches!(&refusal, ActionRejection::Unauthorized { reason, .. }
+                if reason.contains("not declared")),
+            "unexpected refusal: {refusal:?}"
+        );
+    }
+
+    #[test]
+    fn a_turn_ceiling_refuses_a_tool_whose_effects_reach_further() {
+        let conversation_id = ConversationId::new();
+        let scope = ActionScope::Conversation(conversation_id);
+        let mut capabilities = EnvironmentCapabilities::all();
+        capabilities
+            .actions
+            .push(ActionDescriptor::tool("web.search", EffectScope::ReadOnly));
+        capabilities.actions.push(ActionDescriptor::tool(
+            "memory.remember",
+            EffectScope::UserScoped,
+        ));
+        capabilities.actions.push(ActionDescriptor::tool(
+            "group.message.send",
+            EffectScope::Outbound,
+        ));
+
+        // A turn that took in text written by someone else may still read and
+        // may still change the acting person's own state — but it must not
+        // speak in her name.
+        let arbiter = ActionArbiter::new(ActionArbiterConfig {
+            capabilities,
+            effect_ceiling: EffectScope::UserScoped,
+            ..ActionArbiterConfig::default()
+        });
+        let action = |name: &str| {
+            ProposedAction::UseTool(
+                crate::ToolAction::new(name, "{}", scope).expect("valid tool action"),
+            )
+        };
+        arc_ok(&arbiter, &action("web.search"), "read-only stays allowed");
+        arc_ok(
+            &arbiter,
+            &action("memory.remember"),
+            "user-scoped stays allowed",
+        );
+        let refusal = arbiter
+            .validate_at(&action("group.message.send"), Utc::now())
+            .expect_err("an outbound tool must exceed a user-scoped ceiling");
+        assert!(
+            matches!(&refusal, ActionRejection::Unauthorized { reason, .. }
+                if reason.contains("beyond this turn's")),
+            "unexpected refusal: {refusal:?}"
+        );
+    }
+
+    /// Asserts a proposed action is admitted, with a readable failure.
+    fn arc_ok(arbiter: &ActionArbiter, action: &ProposedAction, what: &str) {
+        if let Err(rejection) = arbiter.validate_at(action, Utc::now()) {
+            panic!("{what} should be admitted, got {rejection:?}");
+        }
     }
 
     #[test]

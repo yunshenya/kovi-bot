@@ -1243,6 +1243,32 @@ impl ToolRegistry {
     /// DeepSeek and several OpenAI-compatible gateways reject function names
     /// containing dots; `resolve_wire_tool_name` maps them back before
     /// execution.
+    /// Declares every tool this host exposes, and how far each one reaches.
+    ///
+    /// Core refuses a `UseTool` intent whose tool the host never declared, so
+    /// this is what makes a call admissible at all. It reports the whole
+    /// registry rather than the currently-offered subset: whether a tool may be
+    /// *called right now* is a turn-level decision Core makes, while what the
+    /// host *can* do is a host fact that does not change per turn.
+    ///
+    /// MCP tools are declared as [`EffectScope::Outbound`] unless the server was
+    /// configured read-only, matching the existing rule that a remote tool's
+    /// effects cannot be audited.
+    pub(crate) fn declared_effects(&self) -> Vec<(String, yunxi_core::EffectScope)> {
+        use yunxi_core::EffectScope;
+        self.definitions
+            .iter()
+            .map(|definition| {
+                let effect = match definition.source.write_scope() {
+                    WriteScope::ReadOnly => EffectScope::ReadOnly,
+                    WriteScope::UserScoped => EffectScope::UserScoped,
+                    WriteScope::Outbound => EffectScope::Outbound,
+                };
+                (definition.name.clone(), effect)
+            })
+            .collect()
+    }
+
     pub(crate) fn native_tool_specs(
         &self,
         tool_context: &ToolExecutionContext,

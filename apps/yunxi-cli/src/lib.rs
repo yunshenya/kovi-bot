@@ -28,10 +28,10 @@ use yunxi_core::{
     AutonomousConversationTickEvent, AutonomousTurnDisposition, AutonomyPolicy, CognitiveRuntime,
     CognitiveTurnObserver, ConversationId, ConversationKind, ConversationLifecycle,
     ConversationLifecycleError, ConversationTurnDirective, CoreServices, DecisionDisposition,
-    DecisionPlan, EnvironmentCapabilities, EventPriority, EventScope, MemoryStore, MessageContent,
-    ModelBackend as CoreModelBackend, OpenLoopDraft, OpenLoopKind, OpenLoopOwner, OpenLoopStore,
-    PersonId, PlannerError, PlannerInput, ProposedAction, RuntimeConfig, RuntimeHandle,
-    StateUpdateProposal, TurnReport, WorldEvent, WorldEventKind,
+    DecisionPlan, EffectScope, EnvironmentCapabilities, EventPriority, EventScope, MemoryStore,
+    MessageContent, ModelBackend as CoreModelBackend, OpenLoopDraft, OpenLoopKind, OpenLoopOwner,
+    OpenLoopStore, PersonId, PlannerError, PlannerInput, ProposedAction, RuntimeConfig,
+    RuntimeHandle, StateUpdateProposal, TurnReport, WorldEvent, WorldEventKind,
 };
 
 /// Input marker used for autonomous turns in the optional CLI journal.
@@ -412,6 +412,32 @@ where
                 .actions
                 .push(ActionDescriptor::new(capability));
         }
+        self.arbiter = ActionArbiter::new(config);
+        self
+    }
+
+    /// Declares one tool this host exposes, and how far its effects reach.
+    ///
+    /// Core refuses a tool the host has not declared, so a model that asks for
+    /// one gets a rejection rather than reaching the environment.
+    #[must_use]
+    pub fn with_tool(mut self, name: impl Into<String>, effect: EffectScope) -> Self {
+        let mut config = self.arbiter.config().clone();
+        if !config
+            .capabilities
+            .actions()
+            .iter()
+            .any(|descriptor| descriptor.capability == ActionCapability::UseTool)
+        {
+            config
+                .capabilities
+                .actions
+                .push(ActionDescriptor::new(ActionCapability::UseTool));
+        }
+        config
+            .capabilities
+            .actions
+            .push(ActionDescriptor::tool(name, effect));
         self.arbiter = ActionArbiter::new(config);
         self
     }

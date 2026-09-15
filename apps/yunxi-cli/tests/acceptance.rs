@@ -12,7 +12,7 @@ use yunxi_cli::{
     JournalRecord, MAX_CLI_OPEN_LOOPS_PER_OWNER, MAX_JOURNAL_INPUT_BYTES,
 };
 use yunxi_core::{
-    ActionCapability, ActionPort, ActionPortError, ActionPortFuture, ActionPortOutcome,
+    ActionPort, ActionPortError, ActionPortFuture, ActionPortOutcome,
     AutonomyPolicy, ConversationId, ConversationTurnDirective, DecisionDisposition, DecisionPlan,
     MessageContent, ModelBackend as CoreModelBackend, OpenLoopDraft, OpenLoopKind, OpenLoopOwner,
     OpenLoopStore, PlannerInput, ProposedAction, WorldEventKind,
@@ -627,7 +627,9 @@ impl ActionPort for ToolEnvironment {
 fn cli_drives_a_tool_follow_up_through_the_core_cycle() {
     let environment = ToolEnvironment::default();
     let host = CliHost::new(ToolThenReplyModel, environment, ConversationId::new())
-        .with_action_capability(ActionCapability::UseTool);
+        // Core refuses an undeclared tool, so the host has to say what it
+        // exposes and how far that reaches.
+        .with_tool("cli.lookup", yunxi_core::EffectScope::ReadOnly);
 
     let response = host.process_line("今天天气怎么样").expect("response");
     assert_eq!(

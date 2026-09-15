@@ -40,7 +40,7 @@ pub use action::{
 pub use arbiter::{
     ActionArbiter, ActionArbiterConfig, ActionCapability, ActionDescriptor, ActionPort,
     ActionPortError, ActionPortFuture, ActionPortOutcome, ActionPortReleaseFuture, ActionReceipt,
-    ActionRejection, ActionResult, AuthorizationPolicy, EnvironmentCapabilities,
+    ActionRejection, ActionResult, AuthorizationPolicy, EffectScope, EnvironmentCapabilities,
     MAX_RATE_LIMIT_WINDOW_ENTRIES, MAX_TRACKED_ACTION_KEYS, MAX_TRACKED_ACTION_SCOPES, RateLimit,
     StaleReason,
 };

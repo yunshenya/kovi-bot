@@ -3289,7 +3289,7 @@ mod tests {
             Ok(true)
         );
         let arbiter = ActionArbiter::new(
-            ActionArbiterConfig::default().with_capabilities(EnvironmentCapabilities::all()),
+            ActionArbiterConfig::default().with_capabilities(all_capabilities()),
         );
         runtime
             .process_event_with_planner_and_actions(event, &arbiter, &ImmediateActionPort)
@@ -3407,7 +3407,7 @@ mod tests {
             Ok(Admission::Accepted)
         );
         let arbiter = ActionArbiter::new(
-            ActionArbiterConfig::default().with_capabilities(EnvironmentCapabilities::all()),
+            ActionArbiterConfig::default().with_capabilities(all_capabilities()),
         );
         // The first round calls a tool, which makes the task continue and gives
         // Core a tool outcome to derive an expectation from.
@@ -3478,7 +3478,7 @@ mod tests {
         .expect("valid runtime");
         let event = direct_message(conversation_id, PersonId::new());
         let arbiter = ActionArbiter::new(
-            ActionArbiterConfig::default().with_capabilities(EnvironmentCapabilities::all()),
+            ActionArbiterConfig::default().with_capabilities(all_capabilities()),
         );
         runtime
             .process_event_with_planner_and_actions(event, &arbiter, &DeliveringPort)
@@ -3670,6 +3670,25 @@ mod tests {
             !runtime.has_pending_event(),
             "bookkeeping alone must not be reported as work"
         );
+    }
+
+    /// Capabilities for a test environment that exposes the fixture tools.
+    ///
+    /// Core refuses a tool the host never declared, so a test exercising the
+    /// tool path has to say what the environment exposes — exactly as a real
+    /// host does.
+    fn all_capabilities() -> EnvironmentCapabilities {
+        let mut capabilities = EnvironmentCapabilities::all();
+        capabilities.actions.extend([
+            crate::ActionDescriptor::tool("web.search", crate::EffectScope::Outbound),
+            crate::ActionDescriptor::tool("calculator", crate::EffectScope::Outbound),
+            crate::ActionDescriptor::tool("weather.current", crate::EffectScope::Outbound),
+            crate::ActionDescriptor::tool("background.task", crate::EffectScope::Outbound),
+            crate::ActionDescriptor::tool("step.one", crate::EffectScope::Outbound),
+            crate::ActionDescriptor::tool("step.two", crate::EffectScope::Outbound),
+            crate::ActionDescriptor::tool("time.now", crate::EffectScope::Outbound),
+        ]);
+        capabilities
     }
 
     use super::{
@@ -5042,7 +5061,7 @@ mod tests {
         )
         .expect("valid runtime");
         let arbiter = ActionArbiter::new(
-            ActionArbiterConfig::default().with_capabilities(EnvironmentCapabilities::all()),
+            ActionArbiterConfig::default().with_capabilities(all_capabilities()),
         );
         let event = direct_message(conversation_id, PersonId::new());
         let output = runtime
@@ -5088,7 +5107,7 @@ mod tests {
         )
         .expect("valid runtime");
         let arbiter = ActionArbiter::new(
-            ActionArbiterConfig::default().with_capabilities(EnvironmentCapabilities::all()),
+            ActionArbiterConfig::default().with_capabilities(all_capabilities()),
         );
         let actor = Arc::new(Mutex::new(None));
         let port = ActorRecordingPort {
@@ -5122,7 +5141,7 @@ mod tests {
         )
         .expect("valid runtime");
         let arbiter = ActionArbiter::new(
-            ActionArbiterConfig::default().with_capabilities(EnvironmentCapabilities::all()),
+            ActionArbiterConfig::default().with_capabilities(all_capabilities()),
         );
         let port_calls = Arc::new(AtomicUsize::new(0));
         let port = ToolThenDeliveryPort {
@@ -5189,7 +5208,7 @@ mod tests {
         )
         .expect("valid runtime");
         let arbiter = ActionArbiter::new(
-            ActionArbiterConfig::default().with_capabilities(EnvironmentCapabilities::all()),
+            ActionArbiterConfig::default().with_capabilities(all_capabilities()),
         );
         let port_calls = Arc::new(AtomicUsize::new(0));
         let port = ToolThenDeliveryPort {
@@ -5361,7 +5380,7 @@ mod tests {
             )
             .expect("valid runtime");
             let arbiter = ActionArbiter::new(
-                ActionArbiterConfig::default().with_capabilities(EnvironmentCapabilities::all()),
+                ActionArbiterConfig::default().with_capabilities(all_capabilities()),
             );
             let port_calls = Arc::new(AtomicUsize::new(0));
             let port = ToolThenDeliveryPort {
@@ -5434,7 +5453,7 @@ mod tests {
         )
         .expect("valid runtime");
         let arbiter = ActionArbiter::new(
-            ActionArbiterConfig::default().with_capabilities(EnvironmentCapabilities::all()),
+            ActionArbiterConfig::default().with_capabilities(all_capabilities()),
         );
         let port_calls = Arc::new(AtomicUsize::new(0));
         let port = MixedToolPort {
@@ -5510,7 +5529,7 @@ mod tests {
         )
         .expect("valid runtime");
         let arbiter = ActionArbiter::new(
-            ActionArbiterConfig::default().with_capabilities(EnvironmentCapabilities::all()),
+            ActionArbiterConfig::default().with_capabilities(all_capabilities()),
         );
         let port_calls = Arc::new(AtomicUsize::new(0));
         let port = AllFailedToolPort {
@@ -5752,7 +5771,7 @@ mod tests {
             .reserve_tool_actions(&event, super::MAX_TOOL_ACTIONS_PER_TRACE)
             .expect("preload the root trace budget");
         let arbiter = ActionArbiter::new(
-            ActionArbiterConfig::default().with_capabilities(EnvironmentCapabilities::all()),
+            ActionArbiterConfig::default().with_capabilities(all_capabilities()),
         );
         let port_calls = Arc::new(AtomicUsize::new(0));
         let port = CountingPort {
@@ -5800,7 +5819,7 @@ mod tests {
         )
         .expect("valid runtime");
         let arbiter = ActionArbiter::new(
-            ActionArbiterConfig::default().with_capabilities(EnvironmentCapabilities::all()),
+            ActionArbiterConfig::default().with_capabilities(all_capabilities()),
         );
         let calls = Arc::new(AtomicUsize::new(0));
         let released_keys = Arc::new(Mutex::new(Vec::new()));
@@ -5843,7 +5862,7 @@ mod tests {
         )
         .expect("valid runtime");
         let arbiter = ActionArbiter::new(
-            ActionArbiterConfig::default().with_capabilities(EnvironmentCapabilities::all()),
+            ActionArbiterConfig::default().with_capabilities(all_capabilities()),
         );
         let released_keys = Arc::new(Mutex::new(Vec::new()));
         let port = FailingReleaseRecordingPort {
@@ -5881,7 +5900,7 @@ mod tests {
         )
         .expect("valid runtime");
         let arbiter = ActionArbiter::new(
-            ActionArbiterConfig::default().with_capabilities(EnvironmentCapabilities::all()),
+            ActionArbiterConfig::default().with_capabilities(all_capabilities()),
         );
         let released_keys = Arc::new(Mutex::new(Vec::new()));
         let port = DeferredReleaseRecordingPort {
@@ -6152,7 +6171,7 @@ mod tests {
         )
         .expect("valid runtime");
         let arbiter = ActionArbiter::new(
-            ActionArbiterConfig::default().with_capabilities(EnvironmentCapabilities::all()),
+            ActionArbiterConfig::default().with_capabilities(all_capabilities()),
         );
         let port_calls = Arc::new(AtomicUsize::new(0));
         let port = ToolThenDeliveryPort {
@@ -6322,7 +6341,7 @@ mod tests {
         )
         .expect("valid runtime");
         let arbiter = ActionArbiter::new(
-            ActionArbiterConfig::default().with_capabilities(EnvironmentCapabilities::all()),
+            ActionArbiterConfig::default().with_capabilities(all_capabilities()),
         );
 
         let failed = runtime
@@ -6383,7 +6402,7 @@ mod tests {
         )
         .expect("valid runtime");
         let arbiter = ActionArbiter::new(
-            ActionArbiterConfig::default().with_capabilities(EnvironmentCapabilities::all()),
+            ActionArbiterConfig::default().with_capabilities(all_capabilities()),
         );
         let calls = Arc::new(AtomicUsize::new(0));
         let port = IndeterminateActionPort {
@@ -6475,7 +6494,7 @@ mod tests {
         )
         .expect("valid runtime");
         let arbiter = ActionArbiter::new(
-            ActionArbiterConfig::default().with_capabilities(EnvironmentCapabilities::all()),
+            ActionArbiterConfig::default().with_capabilities(all_capabilities()),
         );
         let calls = Arc::new(AtomicUsize::new(0));
 
@@ -6536,7 +6555,7 @@ mod tests {
         )
         .expect("valid runtime");
         let arbiter = ActionArbiter::new(
-            ActionArbiterConfig::default().with_capabilities(EnvironmentCapabilities::all()),
+            ActionArbiterConfig::default().with_capabilities(all_capabilities()),
         );
         let calls = Arc::new(AtomicUsize::new(0));
         let port = TerminalFailingActionPort {
@@ -6612,7 +6631,7 @@ mod tests {
             )
             .expect("valid runtime");
             let arbiter = ActionArbiter::new(
-                ActionArbiterConfig::default().with_capabilities(EnvironmentCapabilities::all()),
+                ActionArbiterConfig::default().with_capabilities(all_capabilities()),
             )
             .with_delivery_resolver(Arc::new(RejectingDeliveryResolver { resolution_failed }));
             let calls = Arc::new(AtomicUsize::new(0));
@@ -6690,7 +6709,7 @@ mod tests {
         )
         .expect("valid runtime");
         let arbiter = ActionArbiter::new(
-            ActionArbiterConfig::default().with_capabilities(EnvironmentCapabilities::all()),
+            ActionArbiterConfig::default().with_capabilities(all_capabilities()),
         );
         let calls = Arc::new(AtomicUsize::new(0));
         let port = ToolFailedActionPort {
@@ -6765,7 +6784,7 @@ mod tests {
         )
         .expect("valid runtime");
         let arbiter = ActionArbiter::new(
-            ActionArbiterConfig::default().with_capabilities(EnvironmentCapabilities::all()),
+            ActionArbiterConfig::default().with_capabilities(all_capabilities()),
         );
         let calls = Arc::new(AtomicUsize::new(0));
         let port = CountingPort {
@@ -6832,7 +6851,7 @@ mod tests {
         )
         .expect("valid runtime");
         let arbiter = ActionArbiter::new(
-            ActionArbiterConfig::default().with_capabilities(EnvironmentCapabilities::all()),
+            ActionArbiterConfig::default().with_capabilities(all_capabilities()),
         );
         let port = FakeActionPort;
         // 守卫一共问三次就轮到第一条气泡：观察后一次、计划后一次、每条动作前一次。
@@ -6889,7 +6908,7 @@ mod tests {
         )
         .expect("valid runtime");
         let arbiter = ActionArbiter::new(
-            ActionArbiterConfig::default().with_capabilities(EnvironmentCapabilities::all()),
+            ActionArbiterConfig::default().with_capabilities(all_capabilities()),
         );
         let calls = Arc::new(AtomicUsize::new(0));
 
@@ -6957,7 +6976,7 @@ mod tests {
         )
         .expect("valid runtime");
         let arbiter = ActionArbiter::new(
-            ActionArbiterConfig::default().with_capabilities(EnvironmentCapabilities::all()),
+            ActionArbiterConfig::default().with_capabilities(all_capabilities()),
         );
         let calls = Arc::new(AtomicUsize::new(0));
         let port = CountingDeliveredActionPort {
@@ -7024,7 +7043,7 @@ mod tests {
         )
         .expect("valid runtime");
         let arbiter = ActionArbiter::new(
-            ActionArbiterConfig::default().with_capabilities(EnvironmentCapabilities::all()),
+            ActionArbiterConfig::default().with_capabilities(all_capabilities()),
         );
         let calls = Arc::new(AtomicUsize::new(0));
         let port = FailOnceActionPort {
@@ -7094,7 +7113,7 @@ mod tests {
         )
         .expect("valid runtime");
         let arbiter = ActionArbiter::new(
-            ActionArbiterConfig::default().with_capabilities(EnvironmentCapabilities::all()),
+            ActionArbiterConfig::default().with_capabilities(all_capabilities()),
         );
         let calls = Arc::new(AtomicUsize::new(0));
         let port = FailSecondActionOncePort {
@@ -7181,7 +7200,7 @@ mod tests {
         )
         .expect("valid runtime");
         let arbiter = ActionArbiter::new(
-            ActionArbiterConfig::default().with_capabilities(EnvironmentCapabilities::all()),
+            ActionArbiterConfig::default().with_capabilities(all_capabilities()),
         );
 
         runtime
@@ -7988,7 +8007,7 @@ mod tests {
         )
         .expect("valid runtime");
         let arbiter = ActionArbiter::new(
-            ActionArbiterConfig::default().with_capabilities(EnvironmentCapabilities::all()),
+            ActionArbiterConfig::default().with_capabilities(all_capabilities()),
         );
         let output = runtime
             .process_event_with_planner_and_actions(
