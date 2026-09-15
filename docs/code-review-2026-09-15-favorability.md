@@ -813,3 +813,40 @@ TurnGate 导出转义、`AffectStore::set` 的乐观判据、`ExpectationStatus:
 的可观测化、群聊说话人标记伪造与折队归属（提示词格式变更，改完要看效果），以及审计报告里
 其余低优先项（私聊看门狗等待上限、precommit 30 秒租约的取消语义、孤儿 `Prepared` 的租约、
 嵌入维度校验、后台列表窗口与 `total_is_window` 口径、标注下载绕过 `source_key` 剥离等）。
+
+### 11.5 队列第三批（2026-09-16 凌晨，"继续吧"之后）
+
+在 §11.4 的剩余队列里挑"对错客观、不需要新口径"的做，共 12 个 commit：
+
+| 提交 | 修了什么 | 怎么验证的 |
+| --- | --- | --- |
+| `7022e3d` | `AffectStore::set` 返回**库里的值**（`RETURNING`），不再把入参快照回给 Core | 真库往返测试；乐观判据**没做**，理由写在代码里（单写者，改签名属跨 crate 接口变更） |
+| `68f1951` `ecf220e` | 预期落空/取消（`Violated`/`Cancelled`）不再落进空分支：四个终态全部上报，配额当场释放 | 新增用例：标成 Cancelled 后必须出现在 `cancelled` 里、不算 satisfied、配额已释放；改回空分支立刻失败 |
+| `871fa21` | 私聊看门狗不再等未解决的 admission（与群聊 `WindowDrainWait::Never` 对齐），不会再卡 180 秒并拖掉整轮扫描 | 新增用例：`Never` 下必须立刻返回；去掉该分支测试会挂住超时 |
+| `e28b545` | 长来信不再让 Mind 快照整体失效：query 按**字符 + 字节**双上限截断（中文一字三字节，只按字符截仍过不了校验） | 新增用例：3072 字来信仍能构造请求且 query 是原文前缀；改回只截字符立刻失败 |
+| `f992539` | `WorldModelSnapshot::is_empty` 计入 `causal`（只有因果关系的状态曾被判成"没东西可存"） | 新增用例：空白为空、加一条因果关系后非空；去掉该判断立刻失败 |
+| `c92c539` | 标注下载不再把删除屏障字段 `source_key` 交给浏览器（批次文件每行都有，换个 `?name=` 就能拿到） | 新增用例：剥离后不含该字段、内容与其它字段逐字保留、非法行报错；去掉剥离立刻失败 |
+| `daf9a47` | 后台记忆列表：**不过滤**时被窗口截断的总数也标注为窗口口径（以前只有过滤时标注，页码条会承诺翻不到的页） | 新增用例覆盖过滤/截断/装得下/正好装满四种情形 |
+| `0828301` | 账本写入改成单事务 + 作用域建议锁：并发 `#记下` 不再突破每个作用域条数上限 | 真库并发用例（上限压到 1，`tokio::join!` 两条并发写入，断言只剩一条），连跑 5 次稳定 |
+| `2b9b84a` | 账本命令出错时给回执，不再 `.ok()?` 静默不回（命令认得、只是没做成） | 新增用例断言回执含"没处理成功"与下一步 |
+| `1592a19` | `stop_requested` 补现状说明（见下） | 纯文档，`cargo build -p yunxi-core` |
+
+**一处重要纠正**：§11.4 里我写的"`stop_requested` 建议删而不是接"**是错的**——当时只看了
+`grep` 的前半截。它的消费方在 Core 里是完整的：`AttentionSystem` 把它当作必须处理的理由
+（`AttentionReason::StopRequested`）、`planner` 据此调低舒适度目标与好感增量、
+`mind/decision` 用它挡掉自主发言、`model/intrinsic` 用它取消兜底回复。缺的只是生产者
+（宿主入口四处硬编码 `false`，而语义层的 `wants_stop` 晚于事件提交给 Core）。所以字段
+**不能删**，已把现状、消费方清单与"为什么不能靠这个布尔接线"写进字段文档。真正的"停"
+目前走 `wants_stop` → `interrupt::cancel`，只覆盖宿主自己那轮；让 Core 回合也停下需要
+一条后续信号，属独立特性。
+
+**验证总量**：`cargo fmt --check` 干净；`cargo clippy --workspace --all-targets
+--all-features -- -D warnings` 干净；`cargo test --workspace` = model 1142 + core 354 +
+CLI 10 + acceptance 13，全过（63 ignored）；带 `DATABASE_URL` 的 ignored 真库测试
+**62 passed / 1 failed**（`redis_store` 需要 `REDIS_URL`，本机无 Redis）；
+`node tools/admin-ui-checks.mjs` 7 项全过。
+
+**仍在队列**：嵌入维度/数值校验、precommit 30 秒租约的取消语义、孤儿 `Prepared` 的租约、
+Executive 快照 upsert 的 `>` 与 `DO UPDATE` 判据、`put_record_tx` 的误导性 VersionConflict、
+Mind cleanup 让退休信念"以新 UUID 复活"、`InnerAgenda::prune_to_limits` 终态项绕过上限、
+`InMemoryMindStore::apply` 的硬编码校验配置、台账里更早的私聊/群聊提示词格式项。
