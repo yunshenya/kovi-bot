@@ -311,7 +311,10 @@ impl ExecutiveController {
             .conflicts
             .detect(kind, severity, confidence, participants, Utc::now());
         if let Some(conflict) = &conflict {
-            state.conflict_scopes.insert(conflict.id, scope);
+            // 合并到已有冲突（同 kind、同参与者）时**不要改写归属**：`conflict_scopes`
+            // 记的是"这条冲突属于谁、擦除时跟谁走"，用最后触碰它的调用方覆盖，会让
+            // 同一条冲突在不同时刻归到不同人名下，按作用域擦除时就会漏掉。
+            state.conflict_scopes.entry(conflict.id).or_insert(scope);
             prune_scope_indexes(&mut state);
             bump(&mut state.version);
         }
@@ -1024,6 +1027,56 @@ mod tests {
         assert_eq!(snapshot.active_conflicts[0].id, conflict_b.id);
         assert_ne!(snapshot.active_conflicts[0].id, conflict_a.id);
         assert!(!controller.clear_for_scope_data_erasure(&scope_a));
+    }
+
+    #[test]
+    fn coalesced_conflicts_keep_their_original_erasure_scope() {
+        // 同 kind、同参与者会被合并成同一条冲突（`ConflictSet::detect` 返回已有那条）。
+        // 归属若被新调用方的 scope 覆盖，这条冲突"属于谁、擦除时跟谁走"就随最后触碰者
+        // 漂移——参与者里既没有 A 也没有 B 时，兜底判据救不了它，擦除会直接漏掉。
+        let controller = ExecutiveController::default();
+        let conversation_a = ConversationId::new();
+        let conversation_b = ConversationId::new();
+        let scope_a = ExecutiveScope::Conversation {
+            conversation_id: conversation_a,
+        };
+        let scope_b = ExecutiveScope::Conversation {
+            conversation_id: conversation_b,
+        };
+        // 参与者里刻意不含 A/B 两个会话：这样兜底的"参与者命中"判据不成立，
+        // 能不能擦掉完全取决于归属记录。
+        let participants = vec![ConflictRef::Belief(crate::BeliefId::new())];
+
+        let first = controller
+            .detect_conflict_for_scope(
+                scope_a.clone(),
+                ConflictKind::GoalCompetition,
+                0.9,
+                0.8,
+                participants.clone(),
+            )
+            .expect("第一次应记录冲突");
+        let second = controller
+            .detect_conflict_for_scope(
+                scope_b.clone(),
+                ConflictKind::GoalCompetition,
+                0.95,
+                0.9,
+                participants,
+            )
+            .expect("同一冲突应被合并");
+        assert_eq!(first.id, second.id, "同 kind 同参与者应合并成同一条冲突");
+
+        // 归属仍在 A 上：擦 B 不该动它，擦 A 必须清掉它。
+        assert!(
+            !controller.clear_for_scope_data_erasure(&scope_b),
+            "属于 A 的冲突不该被 B 的擦除带走"
+        );
+        assert!(controller.clear_for_scope_data_erasure(&scope_a));
+        assert!(
+            controller.snapshot().active_conflicts.is_empty(),
+            "合并之后归属漂移会让这条冲突永远擦不掉"
+        );
     }
 
     #[test]
