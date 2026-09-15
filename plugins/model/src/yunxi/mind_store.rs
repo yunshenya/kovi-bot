@@ -1903,7 +1903,7 @@ mod tests {
         BeliefSource, BeliefStore, ConsolidationConfig, ConsolidationPlan, ConversationId,
         CuriosityId, CuriosityItem, CuriosityStore, Episode, EpisodeId, EpisodeStore, EventId,
         Interest, InterestId, InterestStore, MindConsolidationStore, MindDataErasure, MindScope,
-        MindSource, MindStoreError, MindUpsert, PersonId, TraceContext,
+        MindSource, MindStoreError, MindUpsert, PersonId, SelfModelStore, TraceContext,
     };
 
     fn belief(
@@ -2530,6 +2530,84 @@ mod tests {
 
         // 幂等：已经是新身份的模型不该再被改写。
         assert!(migrate_self_identity(&migrated, now).is_none());
+    }
+
+    /// 生产库那行旧身份的一次性迁移：在**真 PostgreSQL** 上走完整路径
+    /// （建表 → 写入旧行 → `ensure_self_model` → 校验 + 再跑一次幂等）。
+    ///
+    /// 为什么单测不够：`legacy_self_identity_migrates_without_touching_the_rest` 只盖住
+    /// 纯逻辑，而这条迁移上线时会真的改写生产库里那一行 singleton——"读出来能过校验、
+    /// 写回去版本对得上、并发再跑一次不炸"这三步只有真库能验。
+    #[test]
+    #[ignore = "requires PostgreSQL via DATABASE_URL"]
+    fn postgres_self_model_identity_migration_is_one_shot() {
+        crate::database_test_support::block_on(async {
+            let database_url = std::env::var("DATABASE_URL").expect("requires DATABASE_URL");
+            let pool = PgPoolOptions::new()
+                .max_connections(2)
+                .connect(&database_url)
+                .await
+                .expect("should connect to PostgreSQL");
+            let store = PostgresMindStore::new(pool.clone());
+            store
+                .initialize_schema()
+                .await
+                .expect("mind schema should initialize");
+
+            // 从"这一行还不存在"开始，保证 `put(None)` 走的确实是首次插入那条路。
+            query("DELETE FROM yunxi_self_model")
+                .execute(&pool)
+                .await
+                .expect("clear singleton");
+            let now = Utc::now();
+            let seeded = yunxi_core::SelfModel::seed_yunxi(now);
+            let legacy = yunxi_core::SelfModel::new(
+                yunxi_core::SelfIdentity::new("芸汐", LEGACY_SELF_IDENTITY_DESCRIPTION)
+                    .expect("legacy identity"),
+                seeded.traits().to_vec(),
+                seeded.values().clone(),
+                seeded.limitations().to_vec(),
+                seeded.long_term_goals().to_vec(),
+                MindSource::Seed,
+                now,
+                1,
+            )
+            .expect("legacy self model");
+            SelfModelStore::put(&store, &legacy, None)
+                .await
+                .expect("legacy row should insert");
+
+            store
+                .ensure_self_model()
+                .await
+                .expect("migration should succeed");
+
+            let migrated = SelfModelStore::get(&store)
+                .await
+                .expect("read back")
+                .expect("self model should exist");
+            assert_eq!(migrated.identity().description(), "我是芸汐。");
+            assert_eq!(migrated.version(), 2, "迁移必须推进版本");
+            assert_eq!(migrated.traits().len(), legacy.traits().len());
+            assert_eq!(migrated.values(), legacy.values());
+            assert_eq!(migrated.limitations().len(), legacy.limitations().len());
+
+            // 幂等：再跑一次不该再写一版（并发启动时另一份进程也会跑到这里）。
+            store
+                .ensure_self_model()
+                .await
+                .expect("second run should be a no-op");
+            let again = SelfModelStore::get(&store)
+                .await
+                .expect("read back")
+                .expect("self model should exist");
+            assert_eq!(again.version(), 2, "再跑一次不该推进版本");
+
+            query("DELETE FROM yunxi_self_model")
+                .execute(&pool)
+                .await
+                .expect("cleanup singleton");
+        });
     }
 
     #[test]
