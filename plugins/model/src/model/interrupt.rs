@@ -1986,6 +1986,15 @@ fn outgoing_is_evictable(pending: &PendingOutgoing, now: Instant) -> bool {
     }
 }
 
+/// `Prepared` 的租约：过了这么久还没人 commit，就当成孤儿。
+///
+/// 内容准备好之后本该很快 commit（预提交校验只有 30 秒租约、发送各阶段也都有超时）。
+/// 但调用方提前返回、任务被取消、`Drop` 里那次 spawn 因为 runtime 正在关闭而没跑起来，
+/// 都会留下一条**永远不会被 commit 也不会被取消**的 `Prepared`。以前 `retain` 无条件
+/// 保留它：占着一格不可淘汰的容量、卡住同一 ticket 的后续 prepare，而且 `prune_states`
+/// 也因此永远认为这个会话"在途"，整份 `ReplyState`（含它的 outgoing 列表）不回收。
+const PREPARED_OUTGOING_LEASE: Duration = Duration::from_secs(5 * 60);
+
 fn prune_outgoing(state: &mut ReplyState) {
     let now = Instant::now();
     for pending in &mut state.pending_outgoing {
@@ -1993,6 +2002,14 @@ fn prune_outgoing(state: &mut ReplyState) {
             && pending.committed_at.is_some_and(|committed_at| {
                 now.duration_since(committed_at) >= COMMITTED_OUTGOING_LEASE
             })
+        {
+            pending.state = OutgoingState::Unknown;
+            pending.terminal_at = Some(now);
+        }
+        // 孤儿 `Prepared` 转成 `Unknown`：迟到的 commit 会照旧被拒（`Stale`），但容量、
+        // 后续 prepare 与整份状态的回收都不再被它永久占住。
+        if pending.state == OutgoingState::Prepared
+            && now.duration_since(pending.prepared_at) >= PREPARED_OUTGOING_LEASE
         {
             pending.state = OutgoingState::Unknown;
             pending.terminal_at = Some(now);
@@ -2179,6 +2196,42 @@ mod tests {
             None,
             "全在碰撞窗口内时宁可真地拒绝这一批，也不能丢不确定的记录"
         );
+    }
+
+    #[test]
+    fn orphaned_prepared_records_expire_instead_of_holding_the_state_forever() {
+        // 调用方提前返回 / 任务被取消 / Drop 里那次 spawn 没跑起来，都会留下一条
+        // 永远不会 commit 也不会被取消的 Prepared。它会占着不可淘汰的容量、卡住
+        // 同一 ticket 的后续 prepare，并让 prune_states 永远认为这个会话在途。
+        let mut state = ReplyState {
+            pending_outgoing: vec![outgoing_in(OutgoingState::Prepared, None)].into(),
+            ..ReplyState::default()
+        };
+        // 刚准备的不能被回收：正常路径上它马上就会被 commit。
+        super::prune_outgoing(&mut state);
+        assert_eq!(state.pending_outgoing.len(), 1, "新准备的记录不该被清掉");
+        assert_eq!(state.pending_outgoing[0].state, OutgoingState::Prepared);
+
+        // 把时间推过租约：应当转成 Unknown（迟到的 commit 照旧被拒），并最终可回收。
+        let stale =
+            std::time::Instant::now() - (super::PREPARED_OUTGOING_LEASE + Duration::from_secs(1));
+        let mut state = ReplyState {
+            pending_outgoing: vec![outgoing_in(OutgoingState::Prepared, None)].into(),
+            ..ReplyState::default()
+        };
+        state.pending_outgoing[0].prepared_at = stale;
+        super::prune_outgoing(&mut state);
+        assert_eq!(
+            state.pending_outgoing.len(),
+            1,
+            "转成 Unknown 后仍在观察期内"
+        );
+        assert_eq!(
+            state.pending_outgoing[0].state,
+            OutgoingState::Unknown,
+            "过期的孤儿 Prepared 必须被降级，否则永远不会回收"
+        );
+        assert!(state.pending_outgoing[0].terminal_at.is_some());
     }
 
     #[test]
