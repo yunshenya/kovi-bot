@@ -1398,6 +1398,24 @@ fn core_tool_follow_up_instruction(sticker: Option<&str>) -> String {
     instruction
 }
 
+/// 这一轮允不允许把 `[[STICKER 标签]]` 真的贴出去。
+///
+/// 判据只有"这是不是一轮可见回复"，以及"这一轮该不该由工具说话"：
+/// - 没有来源消息（自主续聊、定时任务）→ 没有可回复的对象，不发；
+/// - **工具结果跟进轮 → 发**。清单在 `sticker.list` 里，她要先查一次才知道有哪些
+///   标签，所以能贴图的正是查完之后这一轮；
+/// - 其余"这一轮明确要调工具"的回合 → 不发，先办工具的事。
+///
+/// 单独抽出来是因为这条判据曾经写错一次：`requested_tool_turn` 对跟进轮也是 true，
+/// 于是 `!requested_tool_turn` 把跟进轮一起挡了（见调用点注释）。
+fn sticker_delivery_allowed(
+    has_message: bool,
+    requested_tool_turn: bool,
+    tool_follow_up: bool,
+) -> bool {
+    has_message && (!requested_tool_turn || tool_follow_up)
+}
+
 /// 正文最前面那串投递标记的解析结果。
 #[derive(Debug, Default, PartialEq, Eq)]
 struct CoreDeliveryMarkers {
@@ -6676,12 +6694,58 @@ impl ModelBackend for KoviModelBackend {
             } else {
                 let (markers, body) = split_core_delivery_markers(&response_content);
                 // 前导标记决定投递方式；正文里任何位置残留的标记都不展示给用户。
-                response_content = strip_core_delivery_markers(body);
+                let stripped = strip_core_delivery_markers(body);
+                // 写对、但**不在最前面**的表情包标记：既不生效，又被上一步静默删掉，
+                // 用户看到的是"她说要发图，结果什么都没有"。线上 2026-09-15 19:58
+                // 那次丢图有两种可能路径，这条日志就是用来把第二种（标记位置不对）
+                // 与第一种（档位挡下）区分开的——两种情况原先都不留痕迹。
+                if markers.sticker.is_none()
+                    && body.matches(CORE_STICKER_MARKER).count()
+                        > stripped.matches(CORE_STICKER_MARKER).count()
+                {
+                    kovi::log::warn!(
+                        "Yunxi Core sticker marker not leading（已按残留标记删除，本轮不带图）: event_id={} conversation_id={} raw_chars={} visible_chars={}",
+                        input.event.id(),
+                        conversation_id_for_log(input),
+                        body.chars().count(),
+                        stripped.chars().count(),
+                    );
+                }
+                response_content = stripped;
                 markers
             };
             let (voice_requested, sing_requested) =
                 (delivery_markers.voice, delivery_markers.sing.clone());
             let sticker_requested = delivery_markers.sticker.clone();
+            // 表情包能不能贴出去，是"这一轮是什么轮次"的事，与下面走哪条分支无关，
+            // 所以在这里算一次、报一次；两个分支只用结果。
+            //
+            // `requested_tool_turn` 对**任何**工具结果跟进事件都是 true
+            // （`likely_requires_controlled_tool`），所以判据必须显式放行
+            // `tool_follow_up`：原先只写 `!requested_tool_turn`，等于把她刚查完
+            // `sticker.list` 那一轮永远挡在门外——线上 2026-09-15 19:58 就是这样，
+            // "发一张你的照片"查完清单写了标记却一张图都没贴出去，直到用户催一句
+            // "照片呢"（那是新的消息回合，不满足 requested_tool_turn）才发。
+            let sticker_allowed =
+                sticker_delivery_allowed(message.is_some(), requested_tool_turn, tool_follow_up)
+                    && crate::sticker_library::is_available();
+            if let Some(label) = sticker_requested.as_deref()
+                && !sticker_allowed
+            {
+                // 她写了标记、宿主却不发，之前**不留任何痕迹**（丢一个标记只有十几个
+                // 字节，够不到原始正文留档的阈值）。这条日志专门补这个洞：下次只要
+                // 出现，就能一眼看出是谁挡的。
+                kovi::log::warn!(
+                    "Yunxi Core sticker marker dropped: event_id={} conversation_id={} label={} has_message={} requested_tool_turn={} tool_follow_up={} library_available={}",
+                    input.event.id(),
+                    conversation_id_for_log(input),
+                    label,
+                    message.is_some(),
+                    requested_tool_turn,
+                    tool_follow_up,
+                    crate::sticker_library::is_available(),
+                );
+            }
             let parsed_response = if fallback_response && message.is_some() {
                 ParsedCoreResponse {
                     content: response_content,
@@ -6949,14 +7013,13 @@ impl ModelBackend for KoviModelBackend {
                 // 表情的回合没有正文可拆，这里给它留一个空气泡占位——投递时那条
                 // 气泡只带 image 段，仍然算一条可见回复。
                 //
-                // 与语音/唱歌不同的一条：**工具结果那一轮也允许带表情**——标签清单
-                // 常驻提示词，她不需要先"查一次"才能贴；工具回合拿到的结果里也可能
-                // 带着她自己想发的那张。语音/唱歌不放开，是因为它们改变整条的投递
-                // 形态，而表情只是一张附件。
+                // 与语音/唱歌不同的一条：**工具结果那一轮也允许带表情**（判据见上面
+                // 的 `sticker_allowed`）——清单已经挪进 `sticker.list`，她要先查一次
+                // 才知道有哪些标签，能贴图的只能是查完之后的那一轮；工具回合拿到的
+                // 结果里也可能带着她自己想发的那张。语音/唱歌不放开，是因为它们改变
+                // 整条的投递形态，而表情只是一张附件。
                 if let Some(label) = sticker_requested
-                    && message.is_some()
-                    && !requested_tool_turn
-                    && crate::sticker_library::is_available()
+                    && sticker_allowed
                 {
                     if plan.bubbles.is_empty() {
                         plan.bubbles.push(String::new());
@@ -6968,9 +7031,7 @@ impl ModelBackend for KoviModelBackend {
                 // 正文为空但写了表情包标记：只发一张表情的回复。
                 let mut plan = ReplyPlan::from_model_output(conversation.scope(), "").await;
                 if let Some(label) = sticker_requested
-                    && message.is_some()
-                    && !requested_tool_turn
-                    && crate::sticker_library::is_available()
+                    && sticker_allowed
                 {
                     plan.bubbles.push(String::new());
                     plan.sticker = Some(label);
@@ -7685,11 +7746,11 @@ mod tests {
         sanitize_core_plan_bubbles, sanitize_intrinsic_output, sanitize_plain_text_batch_message,
         select_host_model_route_from_capability, shadow_projection_for_completed_plan,
         should_archive_raw_reply, silence_gate_plan, silence_verdict, silent_wait_plan,
-        split_core_delivery_markers, split_two_short_lines, strip_core_delivery_markers,
-        strip_stage_directions, strong_reply_repair_needed, tool_calls_allowed_for_turn,
-        tool_protocol_authorized_for_turn, visible_reply_intent, visible_reply_intents,
-        visible_reply_invites_continuation, visible_reply_state_updates, visible_turn_continuation,
-        with_chat_style,
+        split_core_delivery_markers, split_two_short_lines, sticker_delivery_allowed,
+        strip_core_delivery_markers, strip_stage_directions, strong_reply_repair_needed,
+        tool_calls_allowed_for_turn, tool_protocol_authorized_for_turn, visible_reply_intent,
+        visible_reply_intents, visible_reply_invites_continuation, visible_reply_state_updates,
+        visible_turn_continuation, with_chat_style,
     };
     use crate::model::{
         BotMemory, ConversationCoordinator, IncomingTurnImpact, OutgoingExecutiveDecision,
@@ -9627,6 +9688,43 @@ mod tests {
                 "不该再有拦截话术「{forbidden}」"
             );
         }
+    }
+
+    /// 表情包能不能真的贴出去，只看"这一轮是什么轮次"。
+    ///
+    /// 这条判据写错过一次，代价是"查完清单那一轮永远贴不出图"：`requested_tool_turn`
+    /// 对**工具结果跟进轮也是 true**，所以 `!requested_tool_turn` 把它一起挡了。
+    #[test]
+    fn sticker_delivery_allows_the_turn_right_after_listing_labels() {
+        // 普通可见回合：发。
+        assert!(sticker_delivery_allowed(true, false, false));
+        // 工具结果跟进轮：**必须发**——她刚查完 `sticker.list`，这一轮才是贴图那一轮。
+        assert!(
+            sticker_delivery_allowed(true, true, true),
+            "跟进轮被挡住的话，查完清单就永远贴不出图（线上 2026-09-15 19:58）"
+        );
+        // 明确要调工具的回合：先办工具的事，不贴图。
+        assert!(!sticker_delivery_allowed(true, true, false));
+        // 没有来源消息（自主续聊、定时任务）：没有可回复的对象。
+        assert!(!sticker_delivery_allowed(false, false, false));
+        assert!(!sticker_delivery_allowed(false, true, true));
+    }
+
+    /// 写对但**不在最前面**的表情包标记：不生效，而且会被当"残留标记"删掉。
+    ///
+    /// 这就是 19:58 丢图的两条候选路径之一，现在有一条 WARN 把它与"档位挡下"区分开。
+    #[test]
+    fn a_sticker_marker_after_the_text_is_stripped_without_ever_taking_effect() {
+        let content = "给你看，这就是我呀。[[STICKER 芸汐的照片]]";
+        let (markers, body) = split_core_delivery_markers(content);
+        assert_eq!(markers.sticker, None, "只有最前面的标记才算投递指令");
+        let stripped = strip_core_delivery_markers(body);
+        assert_eq!(stripped, "给你看，这就是我呀。");
+        assert!(
+            body.matches(CORE_STICKER_MARKER).count()
+                > stripped.matches(CORE_STICKER_MARKER).count(),
+            "这条判据是上面那条 WARN 的触发条件，必须成立"
+        );
     }
 
     /// 工具结果那一轮：表情包说明必须在（`sticker.list` 查完就要能贴图），
