@@ -25,8 +25,6 @@ use crate::intent::CognitiveIntent;
 /// actions; this is the smaller, model-visible window, keeping the newest
 /// entries and dropping the oldest.
 pub const MAX_WORKING_ENTRIES: usize = 16;
-/// The former name, kept while callers migrate.
-pub const MAX_WORKING_ATTEMPTS: usize = MAX_WORKING_ENTRIES;
 /// Maximum characters kept from a tool name.
 pub const MAX_WORKING_TOOL_NAME_CHARS: usize = 128;
 /// Maximum characters kept from the model's tool arguments.
@@ -325,7 +323,7 @@ impl PlannerWorkingMemory {
         self.next_sequence = self.next_sequence.saturating_add(1);
         self.entries.push(WorkingEntry { sequence, payload });
         self.entries.sort_by_key(|entry| entry.sequence);
-        while self.entries.len() > MAX_WORKING_ATTEMPTS {
+        while self.entries.len() > MAX_WORKING_ENTRIES {
             self.entries.remove(0);
         }
     }
@@ -468,7 +466,7 @@ mod tests {
     #[test]
     fn recording_keeps_the_newest_attempts() {
         let mut memory = PlannerWorkingMemory::new();
-        for index in 0..(MAX_WORKING_ATTEMPTS + 3) {
+        for index in 0..(MAX_WORKING_ENTRIES + 3) {
             memory.record_round(&[WorkingAttempt::new(
                 format!("tool.{index}"),
                 "{}",
