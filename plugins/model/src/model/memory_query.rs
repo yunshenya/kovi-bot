@@ -6,6 +6,7 @@ use super::reply::{
     reply_action_tool_spec,
 };
 use super::thinking::ThinkingReporter;
+use super::tool_access::ToolAllowance;
 use super::tool_access::{ToolExecutionContext, ToolExecutionResult, tool_registry};
 use super::utils::{
     BotMemory, ModelPayload, NativeToolStyle, Roles, assistant_tool_calls_wire,
@@ -269,7 +270,7 @@ pub(crate) async fn params_model_with_tool_access(
     if tool_turn {
         request.push(BotMemory {
             role: Roles::System,
-            content: registry.instruction_for_native(&tool_context, false),
+            content: registry.instruction_for_native(&tool_context, ToolAllowance::Full),
         });
     }
     // reminder.create / agent.run.create 的强制指令由
@@ -299,14 +300,15 @@ pub(crate) async fn params_model_with_tool_access(
     let mut group_message_send_attempted = false;
     let mut group_message_send_succeeded = false;
     let mut group_followup_succeeded = false;
-    // 一旦某一轮的结果里混进了外部（可被注入）内容，从**下一轮**开始就只给它挂只读
-    // 工具：网页/搜索结果是被注入的载体，模型据此发起的发送、提醒、改群状态都不该带
-    // 真实副作用。没有外部内容时保持全量——`group.message.targets` → `group.message.send`
-    // 那条两轮流程靠的是宿主自己给的数据，不受影响。
+    // 一旦某一轮的结果里混进了外部（可被注入）内容，从**下一轮**开始就收窄到
+    // `UserScoped`：网页/搜索结果是被注入的载体，模型据此发起的对外发言与群状态改动都不该
+    // 发生；只影响本人的写（提醒、个人记忆、撤回她自己刚发的消息）仍然放行。没有外部内容时
+    // 保持全量——`group.message.targets` → `group.message.send` 那条两轮流程靠的是宿主自己
+    // 给的数据，不受影响。
     //
-    // 与兄弟路径一致：core_model 的跟进轮用 `native_tool_specs(ctx, tool_follow_up)`，
-    // delivery 在执行前再查一次 `available_read_only_for_context`，qq_call 直接走
-    // `execute_read_only`。这里原来两样都没做。
+    // 与兄弟路径一致：core_model 的跟进轮用 `core_tool_allowance` +
+    // `available_for_allowance`，delivery 在执行前再查一次 `available_for_allowance`，
+    // qq_call 的试跑直接走 `execute_read_only`。这里原来两样都没做。
     let mut untrusted_tool_output = false;
     // 这一轮到底有没有真的调过 `sticker.list`。"她可能想发图"才带上工具的那些普通回合，
     // 查过一次就够了——清单已经在上下文里，再带一次只是白花一轮模型调用（Core 那条路
@@ -324,6 +326,15 @@ pub(crate) async fn params_model_with_tool_access(
         // 只因为"她可能想发图"才带上工具的普通回合只给 `sticker.list` 一个：整套工具是
         // 每轮几百个 token，还会让她在闲聊里发起不相干的调用。她已经查过就不再带——清单
         // 就在上一条工具结果里。
+        // 这一轮允许到哪一档：只因为"她可能想发图"才带工具的回合只给只读；吃到外部内容
+        // 之后收窄到"只读 + 只影响本人的写"（提醒/记忆/撤回自己），对外发言仍然挡住。
+        let tool_allowance = if sticker_only_turn {
+            ToolAllowance::ReadOnly
+        } else if untrusted_tool_output {
+            ToolAllowance::UserScoped
+        } else {
+            ToolAllowance::Full
+        };
         let mut tool_specs = if sticker_only_turn && !sticker_list_queried {
             registry
                 .sticker_tool_spec(&tool_context)
@@ -332,7 +343,7 @@ pub(crate) async fn params_model_with_tool_access(
         } else if sticker_only_turn {
             Vec::new()
         } else {
-            registry.native_tool_specs(&tool_context, untrusted_tool_output)
+            registry.native_tool_specs(&tool_context, tool_allowance)
         };
         // `reply_action` 与注册表工具并列下发。它不在注册表里（执行者是宿主自己），
         // 所以这里单独追加；已经查过 `sticker.list` 的回合清单为空，但那一轮恰恰最需要
@@ -419,15 +430,15 @@ pub(crate) async fn params_model_with_tool_access(
                     }
                     // 执行边界也要守：只靠清单收窄不够，模型仍可能报出上一轮见过的
                     // 写工具名。sticker-only 的普通回合同样按只读执行——那一轮只该查清单，
-                    // 不该有任何副作用（与 Core 的 `read_only_only = sticker_only_turn ||
-                    // follow_up` 一个口径）。
-                    if untrusted_tool_output || sticker_only_turn {
+                    // 不该有任何副作用（与 Core 的 `core_tool_allowance` 一个口径）。
+                    if tool_allowance != ToolAllowance::Full {
                         registry
-                            .execute_read_only(
+                            .execute_with_allowance(
                                 &tool_name,
                                 call.arguments.clone(),
                                 tool_context.clone(),
                                 reply_ticket,
+                                tool_allowance,
                             )
                             .await
                     } else {
@@ -722,7 +733,12 @@ pub(crate) async fn params_model_with_tool_access(
         "本轮工具调用次数已用完。请使用已有结果直接回答，不要再发起工具调用。",
     ));
     // 这一轮同样按"有没有吃到外部内容"决定清单，否则收窄会被这最后一次调用绕过。
-    let mut final_tool_specs = registry.native_tool_specs(&tool_context, untrusted_tool_output);
+    let final_allowance = if untrusted_tool_output {
+        ToolAllowance::UserScoped
+    } else {
+        ToolAllowance::Full
+    };
+    let mut final_tool_specs = registry.native_tool_specs(&tool_context, final_allowance);
     if let Some(reply_action_tool) = reply_action_tool.as_ref() {
         final_tool_specs.push(reply_action_tool.clone());
     }

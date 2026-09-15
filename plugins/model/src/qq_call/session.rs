@@ -15,7 +15,7 @@ use super::diagnostics;
 use super::vad::Segmenter;
 use crate::config::QqCallConfig;
 use crate::memory::{MEMORY_MANAGER, MemoryEntry, MemoryType};
-use crate::model::tool_access::ToolRegistry;
+use crate::model::tool_access::{ToolAllowance, ToolRegistry};
 use crate::model::utils::{
     ModelPayload, NativeToolCall, assistant_tool_calls_wire, is_model_error_response,
     params_model_with_native_tools, params_model_with_plain_style_context, tool_result_wire,
@@ -1362,7 +1362,9 @@ impl PhoneTools {
             requires_external_tool: false,
             allow_reply_actions: false,
         };
-        let available = registry.native_tool_specs(&context, false).len();
+        let available = registry
+            .native_tool_specs(&context, ToolAllowance::Full)
+            .len();
         println!(
             "[INFO] QQ 通话工具通道已就绪：{available} 个工具（对端 {caller}，管理员 {}，主管理员 {}，模式 {mode:?}）",
             context.is_admin, context.is_main_admin
@@ -1460,7 +1462,9 @@ async fn generate_reply(
         turn.elapsed = started.elapsed();
         return turn;
     };
-    let specs = tools.registry.native_tool_specs(&tools.context, false);
+    let specs = tools
+        .registry
+        .native_tool_specs(&tools.context, ToolAllowance::Full);
     if specs.is_empty() {
         println!("[WARN] QQ 通话的工具清单为空（身份或场景过滤后无可用工具），本轮退回纯文本");
         let response = params_model_with_plain_style_context(
@@ -1611,7 +1615,7 @@ pub(super) async fn self_test(
     // 那些有副作用的工具，能不能执行由 execution 那一层决定。
     let available = tools
         .registry
-        .native_tool_specs(&tools.context, false)
+        .native_tool_specs(&tools.context, ToolAllowance::Full)
         .len();
     let transcript = Arc::new(Mutex::new(vec![Turn {
         from_peer: true,
@@ -1807,7 +1811,7 @@ async fn execute_tool_call(tools: &PhoneTools, call: &NativeToolCall) -> ToolOut
     if tools.mode == PhoneToolMode::Rehearsal
         && !tools
             .registry
-            .available_read_only_for_context(&name, &tools.context)
+            .available_for_allowance(&name, &tools.context, ToolAllowance::ReadOnly)
     {
         println!("[INFO] QQ 通话自检：{name} 有副作用，只记录不执行");
         return ToolOutcome {

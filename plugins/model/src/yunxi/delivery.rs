@@ -959,7 +959,7 @@ impl QqActionAdapter {
         let ticket = claim.ticket;
         let result = async {
             let source_message_id = claim.source_message_id;
-            let read_only_only = claim.read_only_only;
+            let allowance = claim.allowance;
             let Some(registry) = tool_registry() else {
                 return Ok(ActionPortOutcome::Deferred {
                     reason: "tool_registry_unavailable".to_string(),
@@ -1180,14 +1180,15 @@ impl QqActionAdapter {
                 requires_external_tool: false,
                 allow_reply_actions: false,
             };
-            if read_only_only
-                && !registry.available_read_only_for_context(&action.tool_name, &context)
-            {
+            // 执行边的最后一道硬拦：档位与可用性都按**此刻**的事实重算。清单收窄只是
+            // "不告诉她有这些工具"，被注入或幻觉出来的工具名必须在这里被拦掉；顺带也把
+            // 注册之后才变化的状态（群被暂停、管理员身份被撤、素材库没了）重新算一遍。
+            if !registry.available_for_allowance(&action.tool_name, &context, allowance) {
                 drop(mind_delivery_permit);
                 drop(group_authorization);
                 drop(route_guard);
                 return Ok(ActionPortOutcome::Deferred {
-                    reason: "tool_follow_up_requires_read_only_tool".to_string(),
+                    reason: "tool_allowance_rejected_at_effect_boundary".to_string(),
                 });
             }
             drop(group_authorization);
@@ -1210,7 +1211,7 @@ impl QqActionAdapter {
                     context,
                     ticket,
                     revalidator,
-                    read_only_only,
+                    allowance,
                 )
                 .await;
             drop(mind_delivery_permit);

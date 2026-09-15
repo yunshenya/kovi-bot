@@ -2985,24 +2985,15 @@ async fn register_core_tool_intents(
     ticket: ReplyTicket,
     interaction_cues: InteractionCues,
     source_message_id: Option<i32>,
-    sticker_only_turn: bool,
+    allowance: tool_access::ToolAllowance,
 ) -> Option<DecisionPlan> {
     if intents.is_empty() {
         return None;
     }
 
-    // 只读收窄：工具跟进的回合本来就只给只读工具；普通可见回合里我们只下发了
-    // `sticker.list` 一个只读工具，同样必须按只读收窄——模型没有清单却报出一个写工具的
-    // 名字（幻觉）时，不能因为它"看起来在名单里"就真的执行。
-    let read_only_only = sticker_only_turn
-        || matches!(
-            input.event.kind(),
-            WorldEventKind::ToolCompleted(tool) if tool.requires_follow_up
-        )
-        || matches!(
-            input.event.kind(),
-            WorldEventKind::ToolFailed(tool) if tool.requires_follow_up
-        );
+    // 档位由调用方按"上下文里有没有别人写的字"算好（`core_tool_allowance`）：跟进轮、
+    // sticker-only 回合都比首轮窄。这里把它随 capability 一起登记，执行边界（action port）
+    // 用**同一个**档位再拦一次——模型幻觉或被注入时报出一个超档的工具名也执行不了。
 
     let mut registered_keys: Vec<String> = Vec::with_capacity(intents.len());
     for (intent_index, intent) in intents.iter().enumerate() {
@@ -3017,7 +3008,7 @@ async fn register_core_tool_intents(
 
     let policy = HostToolTurnRegistrationPolicy {
         source_message_id,
-        read_only_only,
+        allowance,
     };
     let registrations = intents
         .iter()
@@ -3316,13 +3307,13 @@ struct HostToolTurnCapability {
     envelope_fingerprint: [u8; 32],
     ticket: ReplyTicket,
     source_message_id: Option<i32>,
-    read_only_only: bool,
+    allowance: tool_access::ToolAllowance,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct HostToolTurnRegistrationPolicy {
     source_message_id: Option<i32>,
-    read_only_only: bool,
+    allowance: tool_access::ToolAllowance,
 }
 
 struct HostToolTurnRegistration<'a> {
@@ -3338,7 +3329,7 @@ struct HostToolTurnRegistration<'a> {
 pub(crate) struct HostToolTurnClaim {
     pub(crate) ticket: ReplyTicket,
     pub(crate) source_message_id: Option<i32>,
-    pub(crate) read_only_only: bool,
+    pub(crate) allowance: tool_access::ToolAllowance,
 }
 
 #[derive(Debug)]
@@ -3399,7 +3390,7 @@ impl HostToolTurnRegistry {
             ticket,
             HostToolTurnRegistrationPolicy {
                 source_message_id,
-                read_only_only: false,
+                allowance: tool_access::ToolAllowance::Full,
             },
         )
         .await
@@ -3434,7 +3425,7 @@ impl HostToolTurnRegistry {
                 envelope_fingerprint,
                 ticket,
                 source_message_id: policy.source_message_id,
-                read_only_only: policy.read_only_only,
+                allowance: policy.allowance,
             },
         );
         state.insertion_order.push_back(idempotency_key.to_owned());
@@ -3479,7 +3470,7 @@ impl HostToolTurnRegistry {
                     envelope_fingerprint,
                     ticket: registration.ticket,
                     source_message_id: registration.policy.source_message_id,
-                    read_only_only: registration.policy.read_only_only,
+                    allowance: registration.policy.allowance,
                 },
             );
             state
@@ -3524,7 +3515,7 @@ impl HostToolTurnRegistry {
         Some(HostToolTurnClaim {
             ticket: capability.ticket,
             source_message_id: capability.source_message_id,
-            read_only_only: capability.read_only_only,
+            allowance: capability.allowance,
         })
     }
 
@@ -4925,6 +4916,43 @@ fn intrinsic_capability_available(
         && (!requires_vision || capability.vision_available)
 }
 
+/// 这一轮（或这次跟进轮）允许到哪一档工具。
+///
+/// 判据是"**上下文里有没有别人写的字**"：
+/// - 跟进轮取决于**上一个工具的结果**可不可信（`ToolRegistry::follow_up_allowance`）；
+///   工具**失败**的详情可能夹着远端返回的文本，一律按不可信处理。
+/// - 只因"她可能想发图"才带 `sticker.list` 的普通回合只有那一个只读工具，按只读档。
+/// - 其余首轮全量。
+///
+/// 这条判据比旧口径细一档：旧口径"任何工具结果之后一律只读"让"查一下再提醒我""看看有没有
+/// 过期的再处理"这类多轮任务在 Core 侧完全做不了；现在只影响本人的写（提醒、个人记忆、
+/// 撤回她自己刚发的消息）放开了，以她的身份对外发言或改动共享状态仍然挡住。
+fn core_tool_allowance(
+    input: &PlannerInput,
+    sticker_only_turn: bool,
+) -> tool_access::ToolAllowance {
+    use tool_access::ToolAllowance;
+    if sticker_only_turn {
+        return ToolAllowance::ReadOnly;
+    }
+    let operation = match input.event.kind() {
+        WorldEventKind::ToolCompleted(tool) if tool.requires_follow_up => {
+            Some((&tool.operation, true))
+        }
+        WorldEventKind::ToolFailed(tool) if tool.requires_follow_up => {
+            Some((&tool.operation, false))
+        }
+        _ => None,
+    };
+    let Some((operation, succeeded)) = operation else {
+        return ToolAllowance::Full;
+    };
+    // 注册表不可用时按保守档：宁可这一轮做不了写，也不要在拿不准来源的情况下放开。
+    tool_registry()
+        .map(|registry| registry.follow_up_allowance(operation, succeeded))
+        .unwrap_or(ToolAllowance::UserScoped)
+}
+
 /// Keep the first Intrinsic release deliberately narrow. Possessing the
 /// `UseTool` permission is not itself a reason to spend a Strong call, but a
 /// conservative intent signal must keep tool/high-consequence turns out of a
@@ -6166,8 +6194,11 @@ impl ModelBackend for KoviModelBackend {
                     },
                 );
                 if let Some(registry) = tool_registry() {
-                    let read_only_only = tool_follow_up;
-                    let mut specs = registry.native_tool_specs(&tool_context, read_only_only);
+                    // 走到这里说明本轮 `tool_protocol_authorized` 为真，而
+                    // `offers_sticker_tool_alone` 要求它**为假**——所以"只因可能想发图才带
+                    // 工具"的那种回合在下面那条分支里处理，这里的档位只可能来自工具结果。
+                    let allowance = core_tool_allowance(input, false);
+                    let mut specs = registry.native_tool_specs(&tool_context, allowance);
                     // 刚查完清单的跟进回合不再带 `sticker.list`：清单已经在上下文里，再调一次
                     // 只是白花一轮模型调用。Core 的工具回合是"一次调用一个回合"、没有轮次上限
                     // （`tools.max_rounds` 管的是宿主那条内部循环），所以这道闸门同时也是
@@ -6186,7 +6217,7 @@ impl ModelBackend for KoviModelBackend {
                         0,
                         BotMemory {
                             role: Roles::System,
-                            content: registry.instruction_for_native(&tool_context, read_only_only),
+                            content: registry.instruction_for_native(&tool_context, allowance),
                         },
                     );
                 } else {
@@ -6790,7 +6821,7 @@ impl ModelBackend for KoviModelBackend {
                             ticket,
                             parsed_response.interaction_cues,
                             source_message_id,
-                            sticker_only_specs.is_some(),
+                            core_tool_allowance(input, sticker_only_specs.is_some()),
                         )
                         .await
                         else {
@@ -7629,7 +7660,7 @@ mod tests {
         batch_fence_action_key, classify_persistent_person_identity,
         constrain_autonomous_tick_plan, conversation_focus_target, conversation_id_for_log,
         core_message_prompt, core_plain_turn_instruction, core_plan_has_visible_text,
-        core_reply_bubbles_with_max, core_tool_follow_up_instruction,
+        core_reply_bubbles_with_max, core_tool_allowance, core_tool_follow_up_instruction,
         core_tool_protocol_diagnostic, default_autonomous_directive, defer_unroutable_due,
         deterministic_route_fallback, drop_internal_decision_sentences, due_reply_target,
         eligible_mind_candidates, explicit_message_batch_needs_repair,
@@ -11763,7 +11794,7 @@ mod tests {
                 ticket,
                 InteractionCues::default(),
                 None,
-                false,
+                crate::model::tool_access::ToolAllowance::Full,
             )
             .await
             .expect("all tool intents should register");
@@ -11804,7 +11835,7 @@ mod tests {
                 ticket,
                 InteractionCues::default(),
                 None,
-                false,
+                crate::model::tool_access::ToolAllowance::Full,
             )
             .await;
             assert!(rollback.is_none());
@@ -11850,7 +11881,7 @@ mod tests {
                 ticket,
                 InteractionCues::default(),
                 None,
-                false,
+                crate::model::tool_access::ToolAllowance::Full,
             )
             .await;
             assert!(plan.is_none(), "the whole batch must be rejected");
@@ -12057,7 +12088,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_turn_claim_preserves_read_only_follow_up_policy() {
+    fn tool_turn_claim_preserves_the_allowance_policy() {
         let runtime = kovi::tokio::runtime::Runtime::new().expect("test runtime");
         runtime.block_on(async {
             let registry = HostToolTurnRegistry::new(1);
@@ -12075,7 +12106,7 @@ mod tests {
                         ticket,
                         HostToolTurnRegistrationPolicy {
                             source_message_id: Some(654),
-                            read_only_only: true,
+                            allowance: crate::model::tool_access::ToolAllowance::ReadOnly,
                         },
                     )
                     .await
@@ -12086,42 +12117,46 @@ mod tests {
                 .expect("the exact capability should be claimable");
             assert_eq!(claim.ticket, ticket);
             assert_eq!(claim.source_message_id, Some(654));
-            assert!(claim.read_only_only);
+            assert_eq!(
+                claim.allowance,
+                crate::model::tool_access::ToolAllowance::ReadOnly
+            );
             crate::model::finish(ticket).await;
         });
     }
 
     #[test]
-    fn tool_result_follow_ups_register_read_only_capabilities() {
+    fn tool_result_follow_ups_register_the_allowance_they_were_given() {
+        use crate::model::tool_access::ToolAllowance;
+
         let runtime = kovi::tokio::runtime::Runtime::new().expect("test runtime");
         runtime.block_on(async {
             let conversation_id = ConversationId::new();
-            let follow_ups = [
-                WorldEventKind::ToolCompleted(yunxi_core::ToolCompletedEvent {
-                    operation: "weather.current".to_string(),
-                    output: "晴".to_string(),
-                    requires_follow_up: true,
-                }),
-                WorldEventKind::ToolFailed(yunxi_core::ToolFailedEvent {
-                    operation: "weather.current".to_string(),
-                    error_category: "timeout".to_string(),
-                    detail: "timed out".to_string(),
-                    requires_follow_up: true,
-                }),
-            ];
+            let follow_up = WorldEventKind::ToolCompleted(yunxi_core::ToolCompletedEvent {
+                operation: "weather.current".to_string(),
+                output: "晴".to_string(),
+                requires_follow_up: true,
+            });
 
-            for (index, kind) in follow_ups.into_iter().enumerate() {
+            // 档位怎么算由 `core_tool_allowance` 负责（判据测试见下面那条与
+            // `tool_access::follow_up_allowance`）；这里验证它一路原样登记进 capability，
+            // 执行边界（action port）拿到的就是同一个档位。
+            for allowance in [
+                ToolAllowance::ReadOnly,
+                ToolAllowance::UserScoped,
+                ToolAllowance::Full,
+            ] {
                 let event = WorldEvent::new(
                     Utc::now(),
                     EventScope::Conversation { conversation_id },
                     EventPriority::High,
-                    kind,
+                    follow_up.clone(),
                 );
                 let input = PlannerInput::new(event, PlannerStateSnapshot::empty());
                 let projection =
                     MindDecisionProjection::for_input(&input, DecisionDisposition::Reply);
                 let action_scope = ActionScope::Conversation(conversation_id);
-                let ticket = interrupt(ReplyScope::Private(9_371_030 + index as i64)).await;
+                let ticket = interrupt(ReplyScope::Private(9_371_030)).await;
                 let registry = HostToolTurnRegistry::new(1);
 
                 register_core_tool_intents(
@@ -12132,7 +12167,7 @@ mod tests {
                     ticket,
                     InteractionCues::default(),
                     None,
-                    false,
+                    allowance,
                 )
                 .await
                 .expect("tool follow-up intent should register");
@@ -12142,9 +12177,70 @@ mod tests {
                     .claim_with_context(&key, action_scope, "time.now", "{}")
                     .await
                     .expect("follow-up capability should be claimable");
-                assert!(claim.read_only_only);
+                assert_eq!(claim.allowance, allowance);
                 crate::model::finish(ticket).await;
             }
+        });
+    }
+
+    #[test]
+    fn core_tool_allowance_narrows_follow_ups_and_sticker_only_turns() {
+        use crate::model::tool_access::ToolAllowance;
+
+        let runtime = kovi::tokio::runtime::Runtime::new().expect("test runtime");
+        runtime.block_on(async {
+            let conversation_id = ConversationId::new();
+            let follow_up = |kind: WorldEventKind| {
+                PlannerInput::new(
+                    WorldEvent::new(
+                        Utc::now(),
+                        EventScope::Conversation { conversation_id },
+                        EventPriority::High,
+                        kind,
+                    ),
+                    PlannerStateSnapshot::empty(),
+                )
+            };
+
+            // 只因"她可能想发图"才带 `sticker.list` 的普通回合：只有那一个只读工具。
+            let message = message_input(PersonId::new(), true);
+            assert_eq!(
+                core_tool_allowance(&message, true),
+                ToolAllowance::ReadOnly,
+                "sticker-only 回合必须按只读档"
+            );
+            assert_eq!(
+                core_tool_allowance(&message, false),
+                ToolAllowance::Full,
+                "普通首轮是全量档"
+            );
+
+            // 工具结果跟进轮**绝不会**回到全量档。可信来源具体放到哪一档由注册表判
+            // （`tool_access::follow_up_allowance`）；测试进程里注册表没初始化，此时按
+            // 保守的 `UserScoped` 兜底——这条断言同时守住"注册表拿不到时也绝不放全量"。
+            let completed = follow_up(WorldEventKind::ToolCompleted(
+                yunxi_core::ToolCompletedEvent {
+                    operation: "time.now".to_string(),
+                    output: "2026-09-15T10:00:00+08:00".to_string(),
+                    requires_follow_up: true,
+                },
+            ));
+            assert_eq!(
+                core_tool_allowance(&completed, false),
+                ToolAllowance::UserScoped,
+                "注册表不可用时的跟进轮必须按保守档"
+            );
+            let failed = follow_up(WorldEventKind::ToolFailed(yunxi_core::ToolFailedEvent {
+                operation: "time.now".to_string(),
+                error_category: "internal".to_string(),
+                detail: "boom".to_string(),
+                requires_follow_up: true,
+            }));
+            assert_eq!(
+                core_tool_allowance(&failed, false),
+                ToolAllowance::UserScoped,
+                "工具失败详情可能夹远端原文，一律按不可信处理"
+            );
         });
     }
 
