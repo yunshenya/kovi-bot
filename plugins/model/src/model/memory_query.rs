@@ -12,8 +12,7 @@ use super::utils::{
     is_model_error_response, likely_requires_tool_protocol, params_model_with_native_tools,
     params_model_with_native_tools_and_plain_style,
     params_model_with_native_tools_and_reply_guidance, params_model_with_plain_style_context,
-    params_model_with_plain_style_context_allow_empty,
-    params_model_with_token_limit_and_progress_for_reply, params_model_without_reply_guidance,
+    params_model_with_plain_style_context_allow_empty, params_model_without_reply_guidance,
     plain_assistant_wire, system_wire, tool_result_wire, vision_failure_detail,
 };
 use crate::config;
@@ -974,25 +973,6 @@ fn compact_log_text(value: &str) -> String {
     compact
 }
 
-/// 模型请求期间轮询会话代数；一旦有新消息，立即丢弃网络 future 并让下一轮接管。
-pub(crate) async fn interruptible_model_call(
-    messages: &mut [BotMemory],
-    reply_ticket: ReplyTicket,
-    max_output_tokens: Option<u32>,
-    vision_images: &[VisionImage],
-    progress: Option<Arc<ThinkingReporter>>,
-) -> Option<BotMemory> {
-    interruptible_model_call_mode(
-        messages,
-        reply_ticket,
-        max_output_tokens,
-        vision_images,
-        progress,
-        ModelPromptMode::LegacyReplyGuidance,
-    )
-    .await
-}
-
 /// Run a plain-text completion with host-owned persona/state context while
 /// keeping legacy reply/action guidance out of the request.
 pub(crate) async fn interruptible_model_call_with_plain_style_context(
@@ -1151,7 +1131,6 @@ pub(crate) async fn interruptible_model_call_with_native_tools_and_plain_style(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ModelPromptMode {
-    LegacyReplyGuidance,
     PlainStyleContext,
     PlainStyleContextAllowEmpty,
     None,
@@ -1171,15 +1150,6 @@ async fn interruptible_model_call_mode(
     kovi::tokio::select! {
         response = async {
             match prompt_mode {
-                ModelPromptMode::LegacyReplyGuidance => {
-                    params_model_with_token_limit_and_progress_for_reply(
-                        messages,
-                        max_output_tokens,
-                        vision_images,
-                        progress,
-                        Some(reply_ticket),
-                    ).await
-                }
                 ModelPromptMode::PlainStyleContext => {
                     params_model_with_plain_style_context(
                         messages,

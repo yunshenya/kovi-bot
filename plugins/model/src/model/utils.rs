@@ -9,7 +9,9 @@
 //! - 系统状态监控
 
 use super::interrupt::{ReplyTicket, is_current};
-use super::memory_query::{interruptible_model_call, interruptible_reply_action_turn};
+use super::memory_query::{
+    interruptible_model_call_without_reply_guidance, interruptible_reply_action_turn,
+};
 use super::memory_repository::MEMORY_REPOSITORY;
 use super::message_actions::{
     MessageDestination, ReplyPlan, execute_reply_plan, normalize_legacy_message_text,
@@ -1988,7 +1990,17 @@ async fn summarize_conversation(
             ),
         },
     ];
-    let response = interruptible_model_call(&mut request, reply_ticket, None, &[], None).await?;
+    // 摘要器走**不带回复引导**的那条路：这一轮的 system 提示词明说"只输出摘要，不要回答
+    // 对话"，而带引导的那条会再附一句"先直接回应用户当前真正想问或表达的内容……情绪=X"，
+    // 两条指令互相矛盾（而且摘要请求根本不是一次聊天回合）。
+    let response = interruptible_model_call_without_reply_guidance(
+        &mut request,
+        reply_ticket,
+        None,
+        &[],
+        None,
+    )
+    .await?;
     let summary = normalize_legacy_message_text(&response.content)
         .trim()
         .to_string();

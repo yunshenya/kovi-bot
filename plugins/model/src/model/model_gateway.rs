@@ -2,7 +2,7 @@
 
 use super::interrupt::ReplyTicket;
 use super::memory_query::{
-    interruptible_model_call, interruptible_model_call_with_native_tools,
+    interruptible_model_call_with_native_tools,
     interruptible_model_call_with_native_tools_and_plain_style,
     interruptible_model_call_with_plain_style_context,
     interruptible_model_call_with_plain_style_context_allow_empty,
@@ -20,31 +20,6 @@ use std::sync::Arc;
 pub(crate) struct ModelGateway;
 
 impl ModelGateway {
-    /// Complete one interruptible model request without exposing or executing
-    /// any legacy tools.
-    ///
-    /// Core planning must remain declarative: side effects are proposed as
-    /// intents and only happen later through the arbiter and action port. A
-    /// cancelled request therefore stays distinguishable from a model-produced
-    /// silent reply by returning `None`.
-    #[allow(dead_code)]
-    pub(crate) async fn complete_without_tools(
-        messages: &mut [BotMemory],
-        reply_ticket: ReplyTicket,
-        max_output_tokens: Option<u32>,
-        vision_images: &[VisionImage],
-        progress: Option<Arc<ThinkingReporter>>,
-    ) -> Option<BotMemory> {
-        interruptible_model_call(
-            messages,
-            reply_ticket,
-            max_output_tokens,
-            vision_images,
-            progress,
-        )
-        .await
-    }
-
     /// Complete a tightly scoped protocol repair without appending the style
     /// guidance used by normal chat replies.
     pub(crate) async fn complete_without_tools_or_reply_guidance(
