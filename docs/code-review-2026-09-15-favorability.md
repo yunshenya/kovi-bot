@@ -965,7 +965,7 @@ Core 投递的引用映射/路由/授权）。语义从"整段共用一个 30 �
 就是在替它擦屁股）。但它横跨两条模型链路（Host 的 `model/reply.rs` 常驻协议 + 解析器；Core 的
 自造包装、禁词分支与一大批测试；生成侧还是纯补全），半途改完比不改更糟，所以那一轮只写了方案。
 
-**这次落地**（`f7099a3` 迁移 + `e26c02a` 顺带修 + `3ed59ed` 补漏）：
+**这次落地**（`f7099a3` 迁移 + `e26c02a` 顺带修 + `3ed59ed` 补漏 + `fea30c0` schema 守卫）：
 
 Host（`plugins/model/src/model/`）
 
@@ -1012,6 +1012,11 @@ acceptance **13** 全过（model 侧删掉 3 个只测旧信封构建器的用�
 就是一次凭空出现的静默。现在回复动作这一侧按 `raw_arguments` 复核：不是 provider 原样给出的完整
 JSON 对象就整条作废（registry 工具的行为不动），并有一条跨模块用例把"SSE 里吐到一半 → 累积器确实
 补全了 → 校验器必须否决"这条链路钉住。
+
+**没有密钥就静态核对的那部分**：真机探不了（见下），但"发出去的工具声明形状对不对"是可查的——
+`reply_action` 与 `tool_access.rs` 的 `definition_spec`、与线上已在用的注册表 schema 是同一套形状
+（`type: object` + `properties` + `additionalProperties: false`），只是全部字段可选、故不写
+`required`；用例（`fea30c0`）守住"每个字段都必须有显式 `type` 与非空 `description`"。
 
 **遗留与代价（如实记下）**：
 
