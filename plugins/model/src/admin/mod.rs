@@ -126,11 +126,15 @@ pub(crate) fn constant_time_eq(expected: &str, actual: &str) -> bool {
     }
     let expected = expected.as_bytes();
     let actual = actual.as_bytes();
-    let mut diff = (expected.len() ^ actual.len()) as u8;
+    // 长度差要按 `usize` 留在累加器里。截成 u8 之后，长度相差 256 的整数倍时
+    // 这一位会归零（64 ^ 320 = 256 → 0），于是"长度不同"这个信号被抹掉。
+    // 走到这里仍然需要猜中完整密钥，所以这是常量时间原语自身的缺陷，不是绕过；
+    // 但原语不该有这种边角。
+    let mut diff = expected.len() ^ actual.len();
     for index in 0..expected.len().max(actual.len()) {
         let left = expected.get(index).copied().unwrap_or(0);
         let right = actual.get(index).copied().unwrap_or(0);
-        diff |= left ^ right;
+        diff |= usize::from(left ^ right);
     }
     diff == 0
 }
@@ -428,6 +432,17 @@ mod tests {
         assert!(!state.token_matches("s3cret-tokenn"));
         assert!(!state.token_matches(""));
         assert!(!state.token_matches("S3cret-token"));
+    }
+
+    #[test]
+    fn token_comparison_keeps_the_length_signal_for_long_differences() {
+        // 长度差截成 u8 之后，相差 256 的整数倍时会归零（64 ^ 320 = 256 → 0），
+        // "长度不同"这个信号就被抹掉了。常量时间原语不该有这种边角。
+        let short = "a".repeat(64);
+        let long = format!("{}{}", "a".repeat(319), "b");
+        assert_eq!(short.len() ^ long.len(), 256);
+        assert!(super::constant_time_eq(&short, &short));
+        assert!(!super::constant_time_eq(&short, &long));
     }
 
     #[test]

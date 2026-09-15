@@ -451,9 +451,13 @@ pub(crate) async fn records(Query(params): Query<RecordsQuery>) -> Result<Json<V
 
     let requested: Vec<&RecordKind> = match params.kinds.as_deref() {
         Some(list) if !list.trim().is_empty() => {
-            let mut kinds = Vec::new();
+            let mut kinds: Vec<&RecordKind> = Vec::new();
             for key in list.split(',').map(str::trim).filter(|key| !key.is_empty()) {
-                kinds.push(kind_meta(key)?);
+                let kind = kind_meta(key)?;
+                // 同一个 key 出现两次会把同一批行抓两遍，页面上就是一张卡印两遍。
+                if !kinds.iter().any(|existing| existing.key == kind.key) {
+                    kinds.push(kind);
+                }
             }
             kinds
         }
@@ -471,7 +475,9 @@ pub(crate) async fn records(Query(params): Query<RecordsQuery>) -> Result<Json<V
         totals.insert(kind.key.to_string(), total);
         // 每种类型都从 0 开始取到 offset+limit，归并排序后再统一分页，
         // 这样跨类型的顺序是正确的（代价是有界的一次性排序）。
-        let fetch = (offset + limit).min(PER_KIND_FETCH);
+        // `offset` 来自查询串，可以直接给到 i64::MAX：先加后 min 会在 dev 构建里
+        // 溢出 panic、在 release 里回绕成负数。用 saturating_add 收口。
+        let fetch = offset.saturating_add(limit).clamp(0, PER_KIND_FETCH);
         let rows = fetch_kind(pool, kind, &query_text, fetch, 0).await?;
         all.extend(rows);
     }
@@ -784,14 +790,22 @@ fn drifted_relation_json(row: &PgRow) -> Value {
         .ok()
         .flatten();
     let value = |name: &str| row.try_get::<Option<f64>, _>(name).ok().flatten();
-    let (Some(updated_at), Some(familiarity), Some(affinity), Some(trust), Some(comfort), Some(tension)) = (
+    let (
+        Some(updated_at),
+        Some(familiarity),
+        Some(affinity),
+        Some(trust),
+        Some(comfort),
+        Some(tension),
+    ) = (
         updated_at,
         value("familiarity"),
         value("affinity"),
         value("trust"),
         value("comfort"),
         value("tension"),
-    ) else {
+    )
+    else {
         return Value::Null;
     };
     let stored = yunxi_core::RelationState {
@@ -1077,9 +1091,13 @@ pub(crate) async fn graph(Query(params): Query<GraphQuery>) -> Result<Json<Value
 
     let requested: Vec<&RecordKind> = match params.kinds.as_deref() {
         Some(list) if !list.trim().is_empty() => {
-            let mut kinds = Vec::new();
+            let mut kinds: Vec<&RecordKind> = Vec::new();
             for key in list.split(',').map(str::trim).filter(|key| !key.is_empty()) {
-                kinds.push(kind_meta(key)?);
+                let kind = kind_meta(key)?;
+                // 同一个 key 出现两次会把同一批行抓两遍（图上就是同一个节点连两遍边）。
+                if !kinds.iter().any(|existing| existing.key == kind.key) {
+                    kinds.push(kind);
+                }
             }
             kinds
         }
