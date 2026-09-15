@@ -1,6 +1,8 @@
 # Yunxi Affordance & Cognitive I/O Protocol v8：动态能力表面、上下文注入与高层行动协议开发文档
 
-**文档状态：** 最终设计稿  
+**文档状态：** 设计稿（**未实现**）。2026-09-15 逐条核对见 **§213**：29 条 DoD 中
+已体现 4、部分 9、缺失 16；V8 自有的类型与模块在代码里零命中。本文中与本仓库现状
+矛盾的断言集中在 **§213.2**。  
 **版本：** V8  
 **定位：** Yunxi V1～V7 之上的“外部环境 ↔ Agent”认知交互协议层  
 **目标：** 参考 Neuro-sama 公开 Neuro SDK / Neuro API 中已经公开验证过的工程模式，把 Yunxi 的 Game、Desktop、Voice、Audience、Tool、Workflow 等外部环境统一成一种“环境发布上下文与可执行 Affordance，Yunxi 选择高层 Action，外部 Runtime 负责验证、执行和反馈”的协议。
@@ -632,6 +634,9 @@ LLM 输出永远不可信。
 ---
 
 # 24. Schema Validation
+
+> ⚠️ **与当前实现不符：** 没有任何 JSON-schema 依赖；`ToolAction.input` 是不透明且有界的字符串，
+> schema 由 provider 的原生 function calling 保证。见 §213.2。
 
 必须由 Rust / Domain Runtime 执行：
 
@@ -3005,6 +3010,10 @@ V8 通过缩小 Action Surface 帮助：
 
 # 170. 与 V6 的关系
 
+> ⚠️ **与当前实现不符：** `CapabilityRegistry` / `TaskSupervisor` / `ActionLifecycle` 这三个名字在仓库里
+> **零命中**；真实的替代是 `ActionArbiter` + `ActionPort` + `crates/yunxi-core/src/driver.rs`
+> 的认知循环。见 §213.2。
+
 V6 提供：
 
 ```text
@@ -3697,7 +3706,99 @@ untrusted observation/context
 
 # 213. Definition of Done
 
-V8 完成必须满足：
+## 213.1 逐条实现状态（2026-09-15 核对）
+
+**结论先说：V8 作为一套「外部环境 ↔ Agent」的协议，没有实现。** 它想解决的问题有几个已经由
+V1/V6/V7 的既有机制解决，但**没有一个**是协议、会话或 affordance 形态的。
+
+核对方法：对每个 V8 协议概念在 `crates/yunxi-core`、`plugins/model`、`apps/yunxi-cli` 里搜符号。
+**`affordance` / `CognitiveIoGateway` / `ContextInjection` / `ContextRetention` /
+`AffordanceWindow` / `DecisionRequest` / `DecisionPriority` / `DecisionSlot` / `ActionSelection` /
+`ExecutionReceipt` / `ProtocolSession` / `ExecutionClass` / `HighLevelSkill` /
+`CognitiveIoSnapshot` / `TaskSupervisor` / `CapabilityRegistry` / `ActionLifecycle` /
+`SpeechState`·`SpeechFinished`·`SpeechInterrupted` / `FakeDomain` 全部零命中。**
+`crates/yunxi-core/src/lib.rs` 里没有 v8 模块。这份文档是仓库第一个 commit（`df54638`）加进来的，
+之后从未修改。
+
+三档判定：
+
+- **已体现**：V8 想要的结果，当前机制已经达到，只是形态不同（证据列给出符号）。
+- **部分**：有相邻机制，但缺 V8 要求的那一层。
+- **缺失**：没有。其中多数是"**还没有对象可做**"——它服务的外部环境（游戏、桌面、观众、工作流）
+  本身不存在（架构文档 §137.1 把协议层列为未来/非目标）。
+
+| # | DoD 条目 | 状态 | 证据 / 说明 |
+| --- | --- | --- | --- |
+| 1 | 外部 Domain 发布 ObserveOnly / MayRespond Context | **缺失**（无对象） | 没有 Domain 协议；`AttentionDisposition` 是 Core 从事件派生的，不是 Domain 发布的。 |
+| 2 | Context retention Ephemeral / Task / Window / Session | **缺失** | 最近的相邻物是 `WorkingState` 的有界窗口与 `DecisionRecordRetention`；没有 retention 分类。 |
+| 3 | Capability 与 Affordance 明确分离 | **缺失** | 只有 `ActionCapability`/`ActionDescriptor`；没有可分离的第二层。 |
+| 4 | Affordance 动态 register / unregister | **缺失** | `ChannelAdapter::capabilities()` 是构造时的静态快照。 |
+| 5 | Affordance 有 version / lease / scope | **部分** | 字段在（`allowed_scopes`、`expires_at`、`generation`），但生产用 `ActionArbiterConfig::default()`，这些旋钮**是惰性默认值**。 |
+| 6 | Action schema 由 Rust 验证 | **缺失** | 没有任何 JSON-schema 依赖；`ToolAction.input` 是不透明且有界的 `String`，schema 由 provider 的原生 function calling 保证。 |
+| 7 | Domain state 再验证一次 | **已体现**（在宿主） | 执行边界重验：`ToolEffectRevalidator`、`available_for_allowance`、`execute_inner`。 |
+| 8 | Disposable Affordance 原子 reserve/consume | **部分** | 原子预留按**幂等键**做，不是按 affordance。 |
+| 9 | AffordanceWindow 可 Building → Registered → Ended | **缺失** | 无 window 概念。 |
+| 10 | Registered Window immutable | **缺失** | — |
+| 11 | Window 支持 deadline / parent lifecycle | **缺失** | — |
+| 12 | DecisionRequest 有 per-scope arbitration | **缺失** | 相邻：`ExecutiveScope` 的 per-scope 计划/冲突/决策记录，与 `ReplyScope`。 |
+| 13 | DecisionPriority 支持 Low/Medium/High/Critical | **缺失** | `EventPriority` 有同样四档，但那是**入站排队**优先级，不是决策优先级。 |
+| 14 | Priority 不绕过权限和安全 | **部分** | 该性质成立，但**平凡成立**：授权在 `ActionArbiter` 里是无条件的，没有 DecisionPriority 可约束。 |
+| 15 | Speech interruption 有明确 Runtime event | **缺失** | 无语音事件；`speech.rs` 是同步 ASR/TTS 客户端，打断是宿主内部生成取代（`interrupt.rs`）。 |
+| 16 | Action Selection 与 Execution 分离 | **已体现** | `DecisionPlan`（选择）→ `ActionArbiter` 验证/受理 → `ActionPort`（执行）。没有 affordance id。 |
+| 17 | Acceptance 与最终执行结果分离 | **部分** | `ActionReceipt`（受理）与 `ActionResult`/`ActionPortOutcome` 是分开的；但没有 `ActionStarted`/`ActionProgressed`，也没有"先收下再后台执行"。 |
+| 18 | 长动作自动进入 TaskSupervisor | **缺失** | Core 里只有按轮计数的 follow-up 循环（`TaskBudget`）；派发在回合内 `await`。宿主的 `agent_runs`/`agent_tasks` 是**宿主的**持久运行时，不是 Core 的，也不由 affordance 驱动。 |
+| 19 | Action race 有 correlation / dedupe | **部分** | 幂等键、`StaleReason::GenerationMismatch`、宿主 `OutgoingState` + 指纹去重都在；没有 action/window/decision 的三元关联。 |
+| 20 | stale affordance selection 不执行 | **部分** | `ActionRejection::Stale` 与宿主 ticket 校验可用；但没有 affordance 版本可供"过期"，且 generation 在生产是惰性默认值。 |
+| 21 | protocol session 有 epoch / version | **缺失** | 代码里的 `epoch` 是数据擦除纪元与 `scope_epoch`，含义不同。 |
+| 22 | reconnect 后旧 window 不继续有效 | **缺失** | 没有 session/window。 |
+| 23 | Transport 与协议语义分离 | **部分** | `ChannelAdapter`/`ActionPort`/`DeliveryResolver` 是进程内边界，与传输无关；但**根本没有 wire transport**。 |
+| 24 | 外部 context / description 视为不可信输入 | **已体现** | `ActionDescriptor.may_carry_foreign_text` + Core `foreign_text_roots`/`effect_ceiling_for`（测试 `a_task_that_read_foreign_text_may_no_longer_act_outward`）+ 工具结果的数据包装。不是 `ContextPayload.source_trust` 字段。 |
+| 25 | 实时环境使用高层 Action，不用 LLM 控制 frame | **缺失**（无对象） | 无实时环境；当前最高频通道是 QQ 通话，走的是高层动作。 |
+| 26 | Action Surface 默认小而相关 | **部分** | 按**信任档位**收窄（`ToolAllowance`、`effect_ceiling`、普通回合只带 `sticker.list`）；不是按目标/window 相关性裁剪。 |
+| 27 | Context delta / ephemeral 能控制 Token | **缺失** | 没有 `context_delta`/`CognitiveIoBudget`。上下文"有界"不等于 delta 协议。 |
+| 28 | 有 Fake Agent / Fake Domain / Replay 测试工具 | **部分** | `apps/yunxi-cli` 的 `FakeModel`/`FakeEnvironment` 与 Core 内的 Fake 端口；没有协议 harness、`FakeDomain`、确定性 Replay。 |
+| 29 | V1～V7 行为保持兼容 | **已体现（平凡）** | V8 不存在，所以没有破坏什么；`cargo test --workspace` 全绿。 |
+
+统计：**已体现 4 项**（#7 #16 #24 #29）、**部分 9 项**、**缺失 16 项**。
+
+## 213.2 本文中与当前实现矛盾的断言
+
+以下段落描述的是**当时的设计意图，与现在的代码不符**。读的时候不要当成已实现：
+
+| 位置 | 断言 | 实际情况 |
+| --- | --- | --- |
+| §170 | "V6 提供 CapabilityRegistry / TaskSupervisor / ActionLifecycle" | 三个名字在仓库里**零命中**。真实替代是 `ActionArbiter` + `ActionPort` + `crates/yunxi-core/src/driver.rs` 的循环。 |
+| §24、§176 | "schema validation 必须由 Rust 执行" | 没有任何 JSON-schema 依赖；`ToolAction.input` 是不透明字符串，schema 由 provider 原生 function calling 保证。 |
+| §62、§63、§68 | "收下 receipt → 后台执行 → 稍后 ActionResult" | 派发在回合内 `await`（`dispatch_with_timeout`）；只有 `Deferred`/工具结果会变成 follow-up 事件。**没有接受后转后台的路径。** |
+| §56、§57 | TTS/语音必须发出 `SpeechFinished`/`SpeechInterrupted` WorldEvent | 不存在语音事件；打断是宿主内部的生成取代。 |
+| §51、§58 | Executive 产出 `ActionSelection{affordance_id, window_id, basis}` | Executive/Planner 产出的是 `DecisionPlan` + `ProposedAction`/`CognitiveIntent`；没有 affordance 标识。 |
+| §46 | 同一 Game Channel 只允许一个阻塞 DecisionRequest | 没有阻塞决策这个概念；实际是宿主的 per-scope 回合代际与 turn gate。 |
+| §111、§112 | WebSocket 全双工作为首个 transport | 与架构文档 §137.1（协议层为未来/非目标）矛盾；不存在 wire transport。 |
+| §36 | WindowState 有 Selected/Executing/Ended/Cancelled/Expired | 没有任何对应物；仅有的状态机是宿主回复的 `OutgoingState` 与 Core 的 `AdmittedTerminal`。 |
+| §164 | 理由标签为 CONTEXT_OBSERVED / AFFORDANCE_RESERVED / WINDOW_OPENED | `ExecutiveReasonTag` 的词汇完全不同（GoalPreempted / ConflictHigh / CognitiveTierDowngraded…）。 |
+| §9、§10、§11 | 目录与 Gateway/ContextInjection 类型 | 没有 `v8` 模块或协议 crate。 |
+
+## 213.3 这份文档里**已经达到**的目标（清单未记）
+
+DoD 清单只按 V8 的名字要求，因此漏掉了几个已经真实可用、且有测试的能力：
+
+- **每轮效果上限与自动降档**：读过外人写的字之后，本任务收窄到 `UserScoped`；下发口径与执行口径
+  同源（`PlannerInput.effect_ceiling`）。
+- **原子幂等预留**：含 pending/terminal 跟踪，以及取消时的显式"投递不确定"语义。
+- **执行边界重验**：权限在选中之后被撤销时，执行前会被挡住（§124 的目标，换了一层实现）。
+- **宿主回复协调器状态机**：`Prepared→Committed→Sent/Unknown/Cancelled/Superseded`，带 scope
+  epoch、指纹去重与碰撞上报——§71–77 的竞态实际是在这里处理的。
+- **Core 的按轮任务循环**：任务预算 + 工作记忆 + 预期。
+- **Executive 的 per-scope 基底**：按 scope 的计划/冲突/决策记录/预期——这正是 `DecisionSlot`
+  想要的那层仲裁，只是没有那个名字。
+- **离线端到端 Fake Host**：`apps/yunxi-cli`。
+- **宿主持久后台运行时**：`agent_runs`/`agent_tasks`（真实长任务，但不是 Core 的 `TaskSupervisor`）。
+
+## 213.4 该怎么对待这份文档
+
+**把它当作未实现的设计稿，而不是当前阶段的完成条件。** 任何 V8 工作项都要从头排期：它服务的
+外部环境一个都还不存在，架构文档也把协议层列为未来/非目标。将来真接外部环境时，正确的做法是
+**把已经跑着的那套机制提炼成显式协议**，而不是另起一套。
 
 ```text
 [ ] 外部 Domain 可以发布 ObserveOnly / MayRespond Context
@@ -3731,7 +3832,7 @@ V8 完成必须满足：
 [ ] V1～V7 行为保持兼容
 ```
 
----
+（上面保留原始清单，作为目标规范；逐条状态见 213.1。）
 
 # 214. V1～V8 最终分工
 
