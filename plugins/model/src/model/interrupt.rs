@@ -1898,11 +1898,27 @@ fn expire_coordination(scope: ReplyScope, state: &mut ReplyState, now: Instant) 
         .pending_precommit
         .is_some_and(|pending| pending.expires_at <= now);
     if expired_precommit && let Some(precommit) = state.pending_precommit.take() {
-        if let Some(pending) = state.pending_outgoing.iter_mut().find(|pending| {
-            pending.token == precommit.token && pending.state == OutgoingState::Prepared
-        }) {
-            pending.state = OutgoingState::Cancelled;
-            pending.terminal_at = Some(now);
+        // 预提交校验超时会**取消**这条已准备好的可见回复：这是刻意的 fail-closed——
+        // 校验没跑完就不能发出去，而"进程死在校验中间"也必须能自愈，否则这条
+        // precommit 会一直卡住该会话后续的 prepare。代价是"活着的但很慢"也会被取消，
+        // 所以必须留下痕迹：以前这里全程无日志，与"被新消息顶掉"完全无法区分。
+        let cancelled = state
+            .pending_outgoing
+            .iter_mut()
+            .find(|pending| {
+                pending.token == precommit.token && pending.state == OutgoingState::Prepared
+            })
+            .map(|pending| {
+                pending.state = OutgoingState::Cancelled;
+                pending.terminal_at = Some(now);
+            })
+            .is_some();
+        if cancelled {
+            eprintln!(
+                "[WARN] 预提交校验超过 {} 秒未完成，已取消这条可见回复 (会话: {:?})；                 若反复出现，说明校验路径（身份/路由查询）比租约还慢",
+                PRECOMMIT_VALIDATION_LEASE.as_secs(),
+                precommit.token.ticket.scope()
+            );
         }
         state.last_seen = now;
     }
