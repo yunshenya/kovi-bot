@@ -1249,3 +1249,16 @@ WARN/ERROR 0、QQ 已连上。
 model 1161（新增 `follow_up_allowance_follows_the_preceding_results_trustworthiness`、
 把跟进档位用例拆成"算档位"与"登记原样传递"两条）、yunxi-core 355、yunxi-cli 10、
 acceptance 13 全绿。没跑真机（这条改的是档位判据，探针测不到；真机验证仍然只能靠 QQ 层实测）。
+
+**已上线**（`87a5734`）：推 `1075025..87a5734` → 演练（交叉编译 62 秒、包 14.2 MiB、
+sha256 `e89ba58b…`）→ 产物自检 7 项（本地与服务器二进制各查一遍）：新判据
+`tool_allowance_rejected_at_effect_boundary`、新的拒绝对话文案、`UserScoped` 与 `ReadOnly`
+两段指令在；旧原因名 `tool_follow_up_requires_read_only_tool`、旧文案"工具结果回合只能调用
+只读工具。"、以及旧 UserScoped 整句都不在。→ 真部署（`--no-build`，复用自检过的那份二进制）
+→ 发布后核对：服务器二进制与本地一致（逐条 `grep -aqF`）、服务 active、重启 0 次、
+WARN/ERROR 0、`[INFO] 模型工具注册表已就绪`、QQ 语音通话桥已连、消息在正常处理。
+
+**真机验证仍然是遗留项**：这次改的是"档位判据"，自动化只能验到"新判据确实在二进制里、
+单测覆盖了每一种来源→档位"。要在 QQ 层确认多步任务真的做得了，得实测一轮
+"先查一下 X，再 Y"（例如"看看有哪些提醒，把过期的取消掉"）——这类两跳任务正是这次
+要放开的东西。
