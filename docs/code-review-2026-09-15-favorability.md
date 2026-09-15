@@ -1262,3 +1262,64 @@ WARN/ERROR 0、`[INFO] 模型工具注册表已就绪`、QQ 语音通话桥已�
 单测覆盖了每一种来源→档位"。要在 QQ 层确认多步任务真的做得了，得实测一轮
 "先查一下 X，再 Y"（例如"看看有哪些提醒，把过期的取消掉"）——这类两跳任务正是这次
 要放开的东西。
+
+### 11.14 群里实测之后：表情包在"查完清单那一轮"被吞掉（`4f95ef2`）
+
+用户让我"看一下日志"。日志里有三件事，第三件是个真 bug。
+
+**一、部署健康**：revision `87a5734`、服务 active、NRestarts 0、WARN/ERROR 0、
+`[INFO] 模型工具注册表已就绪`、QQ 连接正常。
+
+**二、上一轮的撤回修复在真机上是对的**（19:33:52，revision 47660c89）：@她"撤回你刚刚
+发的打招呼" → `purpose=core_reply tool_calls=1 finish_reason=tool_calls`（她一轮就调了
+工具）→ 跟进轮回"嗯，已经撤回啦。"，全程没有 `[WARN] 主动撤回消息失败`（成功路径不打日志，
+失败才打）。19:00／19:15 那两次"撤不了"是修之前的形态。
+
+**三、19:58 的"发一张你的照片给我"没发出图**：
+
+| 时间 | 输入 | 原始回复 | 可见 | 结果 |
+|---|---|---|---|---|
+| 19:58:21 | @发一张你的照片给我 | `tool_calls=1`（调了 `sticker.list`） | — | — |
+| 19:58:22 | （工具结果跟进轮） | `chars=29` | `chars=10` = "给你看，这就是我呀。" | **只发文字，没有图** |
+| 19:58:44 | @照片呢 | `chars=17` | `chars=0` | `[send] [reply][image]`，图发出去了 |
+
+算术对得上：`[[STICKER 芸汐的照片]]` = 17 字符，正文 = 10 字符，17 + 2（空白）+ 10 = **29**；
+催那一轮的 17 字符也正好是同一个标记。也就是说**她两次都写了同一个标记，跟进轮那次被宿主
+吃掉了，新的消息回合那次生效了**。
+
+**根因**：`sticker_requested` 的守卫写着 `!requested_tool_turn`，而
+`requested_tool_turn = likely_requires_controlled_tool(...)` 对**任何**
+`ToolCompleted` / `ToolFailed` 跟进事件都返回 true（那段代码的用途是"把跟进轮留在 Strong
+路由上，别退化成没有工具协议的文本路径"）。所以"刚查完清单、正该贴图"的那一轮永远进不去这个
+分支。历史很清楚：`df32c77`（09-15 00:40，把标签清单挪进 `sticker.list` 的那次）删掉了并列的
+`&& !tool_follow_up`，意图就是放开跟进轮——但因为上面这条，**那一删是空操作**。而那段注释与
+`tool_follow_up_turn_keeps_the_sticker_protocol_only` 测试都明确写着"工具结果那一轮也允许带
+表情"：**指令承诺、plan 拒绝**。
+
+**改动**：判据抽成纯函数
+`sticker_delivery_allowed(has_message, requested_tool_turn, tool_follow_up)`
+= `has_message && (!requested_tool_turn || tool_follow_up)`，两个调用点共用同一个结果
+（原先两处各写一遍守卫）。语音/唱歌维持"不放开的原判据"。
+
+**顺带补的两条 WARN**（这次丢图本来可以有两条路径，而两条原先都不留痕）：
+
+1. `Yunxi Core sticker marker dropped` —— 标记解析到了，但被轮次或素材库挡下；打出 label 与
+   `has_message/requested_tool_turn/tool_follow_up/library_available` 四个事实。
+2. `Yunxi Core sticker marker not leading` —— 标记写对但**不在正文最前面**：它不生效，又会被
+   "清掉任何位置残留标记"那一步删掉，同样零痕迹。
+
+19:58 这次无法从日志分辨是哪一条，因为丢一个标记只有 19 字节，够不到原始正文留档的
+120 字节阈值（`CORE_RAW_REPLY_LOSS_BYTES`）——这正是要补日志的理由。下次再出现，一条 WARN
+就能定死。
+
+**验证**：新增 `sticker_delivery_allows_the_turn_right_after_listing_labels`（跟进轮必须
+允许、工具首轮必须不允许、无来源消息必须不允许）与
+`a_sticker_marker_after_the_text_is_stripped_without_ever_taking_effect`（第二条 WARN 的
+触发条件）。fmt / clippy 干净；model 1163、yunxi-core 355、yunxi-cli 10、acceptance 13 全绿。
+
+**已上线**（`4f95ef2`）：推 `53cc9c1..4f95ef2` → 演练（交叉编译 65 秒、包 14.2 MiB、
+sha256 `4e2f5eb5…`）→ 产物自检（两条新日志在二进制里、函数名没泄漏进产物）→ 真部署
+（`--no-build`）→ 服务 active、重启 0 次、WARN/ERROR 0、工具注册表就绪、QQ 已连。
+
+**留给实测**：再发一次"发一张你的照片给我"，这一轮应该直接带图；若仍不带图，日志里的
+`sticker marker dropped` / `not leading` 会直接说明是哪条路径。
