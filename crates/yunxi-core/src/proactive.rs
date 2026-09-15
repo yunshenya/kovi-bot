@@ -578,12 +578,47 @@ fn score_candidate(
     })
 }
 
+/// 她主动接触一个人时用的媒介。
+///
+/// 为什么媒介要显式写进意图、而不是让宿主自己看着办：发消息和打电话的**打扰级别差
+/// 一个量级**——消息可以不看，电话必须接或拒。宿主需要能独立声明"我能打"，Core 需要
+/// 能独立决定"这次用哪种"，两边得以同一个字段为判据，否则"宿主能打"就会变成
+/// "凡是主动接触都打电话"。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReachOutMedium {
+    /// 发一条消息。默认值，也是所有既有调用点的语义。
+    #[default]
+    Message,
+    /// 拨一通语音电话。此时 `ReachOutIntent.message` 是她**开口要说的话**。
+    Call,
+}
+
+impl ReachOutMedium {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Message => "message",
+            Self::Call => "call",
+        }
+    }
+
+    /// 这种媒介会不会让对方的设备**响起来**。
+    #[must_use]
+    pub const fn rings_peer(self) -> bool {
+        matches!(self, Self::Call)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ReachOutIntent {
     person_id: PersonId,
     message: MessageContent,
     motive: ProactiveMotive,
     source_open_loop_id: Option<OpenLoopId>,
+    /// 用哪种媒介接触他。默认发消息；`Call` 时 `message` 是开场白。
+    #[serde(default)]
+    medium: ReachOutMedium,
 }
 
 impl ReachOutIntent {
@@ -602,13 +637,25 @@ impl ReachOutIntent {
         message: MessageContent,
         motive: ProactiveMotive,
     ) -> Result<Self, ProactiveValidationError> {
-        validate_message(&message)?;
-        Ok(Self {
+        Self::from_parts_with_medium(person_id, message, motive, ReachOutMedium::Message)
+    }
+
+    /// 带媒介的构造。`Call` 时 `message` 必须只含能说出来的东西。
+    pub fn from_parts_with_medium(
+        person_id: PersonId,
+        message: MessageContent,
+        motive: ProactiveMotive,
+        medium: ReachOutMedium,
+    ) -> Result<Self, ProactiveValidationError> {
+        let intent = Self {
             person_id,
             message,
             motive,
             source_open_loop_id: None,
-        })
+            medium,
+        };
+        intent.validate()?;
+        Ok(intent)
     }
 
     pub fn from_opportunity(
@@ -616,6 +663,19 @@ impl ReachOutIntent {
         message: MessageContent,
     ) -> Result<Self, ProactiveValidationError> {
         Self::new(opportunity, message)
+    }
+
+    /// 用指定媒介从机会构造（`Call` 时 `message` 是开场白）。
+    pub fn from_opportunity_with_medium(
+        opportunity: ProactiveOpportunity,
+        message: MessageContent,
+        medium: ReachOutMedium,
+    ) -> Result<Self, ProactiveValidationError> {
+        Self::from_parts_with_medium(opportunity.person_id, message, opportunity.motive, medium)
+            .map(|mut intent| {
+                intent.source_open_loop_id = opportunity.source_open_loop_id;
+                intent
+            })
     }
 
     #[must_use]
@@ -639,6 +699,11 @@ impl ReachOutIntent {
     }
 
     #[must_use]
+    pub const fn medium(&self) -> ReachOutMedium {
+        self.medium
+    }
+
+    #[must_use]
     pub fn into_parts(
         self,
     ) -> (
@@ -646,17 +711,20 @@ impl ReachOutIntent {
         MessageContent,
         ProactiveMotive,
         Option<OpenLoopId>,
+        ReachOutMedium,
     ) {
         (
             self.person_id,
             self.message,
             self.motive,
             self.source_open_loop_id,
+            self.medium,
         )
     }
 
     pub fn validate(&self) -> Result<(), ProactiveValidationError> {
-        validate_message(&self.message)
+        validate_message(&self.message)?;
+        validate_reach_out_medium(self.medium, &self.message)
     }
 }
 
@@ -678,13 +746,20 @@ impl<'de> Deserialize<'de> for ReachOutIntent {
             message: StrictMessage,
             motive: ProactiveMotive,
             source_open_loop_id: Option<OpenLoopId>,
+            /// 老载荷里没有这个字段；缺省即"发消息"，所以是向后兼容的。
+            #[serde(default)]
+            medium: ReachOutMedium,
         }
         let wire = Wire::deserialize(deserializer)?;
         let opportunity =
             ProactiveOpportunity::new(wire.person_id, wire.motive, 0, wire.source_open_loop_id)
                 .map_err(serde::de::Error::custom)?;
-        Self::from_opportunity(opportunity, MessageContent::text(wire.message.text))
-            .map_err(serde::de::Error::custom)
+        Self::from_opportunity_with_medium(
+            opportunity,
+            MessageContent::text(wire.message.text),
+            wire.medium,
+        )
+        .map_err(serde::de::Error::custom)
     }
 }
 
@@ -706,6 +781,27 @@ pub enum ProactiveValidationError {
     MessageTooLong { length: usize, maximum: usize },
     #[error("reach-out message is {length} characters, above maximum {maximum}")]
     MessageTooManyCharacters { length: usize, maximum: usize },
+    #[error("a reach-out call can only carry speech, not attachments, stickers or singing")]
+    CallRequiresSpeech,
+}
+
+/// 电话只能承载"说得出来"的内容。
+///
+/// 抽成共享函数是因为它有两道门要守：`ReachOutIntent::validate`（Core 自己构造时）
+/// 和 `ReachOutAction::validate`（动作反序列化时——宿主收到的就是动作）。各写一份的话，
+/// 从动作那头进来的非语音内容会绕过检查，"打电话顺便发表情"就变成一通沉默的电话。
+pub fn validate_reach_out_medium(
+    medium: ReachOutMedium,
+    message: &MessageContent,
+) -> Result<(), ProactiveValidationError> {
+    if medium == ReachOutMedium::Call
+        && (!message.attachments().is_empty()
+            || message.sticker_label().is_some()
+            || message.is_sing())
+    {
+        return Err(ProactiveValidationError::CallRequiresSpeech);
+    }
+    Ok(())
 }
 
 fn validate_score(field: &'static str, value: u8) -> Result<(), ProactiveValidationError> {
@@ -749,6 +845,91 @@ mod tests {
 
     fn candidate(person_id: PersonId) -> ProactiveCandidate {
         ProactiveCandidate::new(person_id, 70, 60, 60, 30, 24).expect("valid candidate")
+    }
+
+    /// 媒介必须活过一次序列化往返——它会随意图与动作落盘/过进程。
+    #[test]
+    fn the_reach_out_medium_survives_a_round_trip() {
+        let person = PersonId::new();
+        for medium in [ReachOutMedium::Message, ReachOutMedium::Call] {
+            let intent = ReachOutIntent::from_parts_with_medium(
+                person,
+                MessageContent::text("喂，是我"),
+                ProactiveMotive::CheckIn,
+                medium,
+            )
+            .expect("valid intent");
+            assert_eq!(intent.medium(), medium);
+            let encoded = serde_json::to_string(&intent).expect("serialize intent");
+            let decoded: ReachOutIntent =
+                serde_json::from_str(&encoded).expect("deserialize intent");
+            assert_eq!(decoded.medium(), medium, "媒介在往返里丢了：{encoded}");
+            assert_eq!(decoded, intent);
+        }
+        assert_eq!(ReachOutMedium::Message.as_str(), "message");
+        assert_eq!(ReachOutMedium::Call.as_str(), "call");
+        assert!(ReachOutMedium::Call.rings_peer());
+        assert!(!ReachOutMedium::Message.rings_peer());
+        assert_eq!(ReachOutMedium::default(), ReachOutMedium::Message);
+    }
+
+    /// 老载荷里没有 `medium` 字段——必须当成"发消息"，不能反序列化失败。
+    ///
+    /// 这条不是洁癖：意图与动作会持久化，部署新版本时存量载荷就是没有这个字段的。
+    /// 判错成"默认打电话"会让升级瞬间变成一批未预期的外呼。
+    #[test]
+    fn a_payload_without_a_medium_is_a_message() {
+        let person = PersonId::new();
+        let legacy = format!(
+            r#"{{"person_id":"{person}","message":{{"text":"在吗"}},"motive":"check_in","source_open_loop_id":null}}"#
+        );
+        let decoded: ReachOutIntent = serde_json::from_str(&legacy).expect("老载荷该能读");
+        assert_eq!(
+            decoded.medium(),
+            ReachOutMedium::Message,
+            "缺字段必须是发消息，不能默认成打电话"
+        );
+    }
+
+    /// 电话只能承载说得出来的内容。
+    ///
+    /// 不拦的话，"打电话顺便把图发过去"会变成一通什么也没说的电话。
+    #[test]
+    fn a_call_can_only_carry_speech() {
+        let person = PersonId::new();
+        let text_only = ReachOutIntent::from_parts_with_medium(
+            person,
+            MessageContent::text("喂，是我，刚想起件事"),
+            ProactiveMotive::Share,
+            ReachOutMedium::Call,
+        );
+        assert!(text_only.is_ok(), "纯文本应该可以打电话");
+
+        for unspeakable in [
+            MessageContent::sticker("cat", "猫猫歪头"),
+            MessageContent::sing("祝你生日快乐", "happy_birthday"),
+        ] {
+            let result = ReachOutIntent::from_parts_with_medium(
+                person,
+                unspeakable,
+                ProactiveMotive::Share,
+                ReachOutMedium::Call,
+            );
+            assert!(
+                matches!(result, Err(ProactiveValidationError::CallRequiresSpeech)),
+                "电话承载不了非语音内容: {result:?}"
+            );
+        }
+        // 同样的内容当**消息**发是允许的——限制只针对电话。
+        assert!(
+            ReachOutIntent::from_parts_with_medium(
+                person,
+                MessageContent::sticker("cat", "猫猫歪头"),
+                ProactiveMotive::Share,
+                ReachOutMedium::Message,
+            )
+            .is_ok()
+        );
     }
 
     #[test]

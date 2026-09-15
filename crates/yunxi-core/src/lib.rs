@@ -134,7 +134,7 @@ pub use proactive::{
     MAX_PROACTIVE_CANDIDATES, MAX_REACH_OUT_MESSAGE_BYTES, MAX_REACH_OUT_MESSAGE_CHARS,
     ProactiveCandidate, ProactiveContext, ProactiveDecision, ProactiveMotive, ProactiveOpportunity,
     ProactiveSilenceReason, ProactiveSystem, ProactiveValidationError, ProspectiveSignal,
-    ReachOutIntent,
+    ReachOutIntent, ReachOutMedium, validate_reach_out_medium,
 };
 pub use runtime::{
     Admission, CognitiveRuntime, DataErasureError, MAX_BLOCKED_DATA_ERASURE_CONVERSATIONS,

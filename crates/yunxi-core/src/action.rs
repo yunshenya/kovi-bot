@@ -336,6 +336,12 @@ pub struct ReachOutAction {
     pub person_id: PersonId,
     pub message: MessageContent,
     pub motive: ProactiveMotive,
+    /// 用哪种媒介接触他。`Call` 时 `message` 是电话里的开场白。
+    ///
+    /// 它必须随动作一路传到宿主：宿主是唯一知道"我到底能不能拨出去"的一侧，
+    /// 而 Core 是唯一能决定"这次该不该用电话"的一侧。
+    #[serde(default)]
+    pub medium: crate::ReachOutMedium,
     pub metadata: ActionMetadata,
 }
 
@@ -350,12 +356,21 @@ impl<'de> Deserialize<'de> for ReachOutAction {
             person_id: PersonId,
             message: MessageContent,
             motive: ProactiveMotive,
+            /// 老载荷没有这个字段；缺省即"发消息"。
+            #[serde(default)]
+            medium: crate::ReachOutMedium,
             metadata: ActionMetadata,
         }
 
         let wire = Wire::deserialize(deserializer)?;
-        Self::with_metadata(wire.person_id, wire.message, wire.motive, wire.metadata)
-            .map_err(serde::de::Error::custom)
+        Self::with_medium(
+            wire.person_id,
+            wire.message,
+            wire.motive,
+            wire.medium,
+            wire.metadata,
+        )
+        .map_err(serde::de::Error::custom)
     }
 }
 
@@ -369,8 +384,8 @@ impl ReachOutAction {
     }
 
     pub fn from_intent(intent: crate::ReachOutIntent) -> Result<Self, ActionValidationError> {
-        let (person_id, message, motive, _) = intent.into_parts();
-        Self::new(person_id, message, motive)
+        let (person_id, message, motive, _, medium) = intent.into_parts();
+        Self::with_medium(person_id, message, motive, medium, ActionMetadata::new()?)
     }
 
     pub fn with_metadata(
@@ -379,10 +394,27 @@ impl ReachOutAction {
         motive: ProactiveMotive,
         metadata: ActionMetadata,
     ) -> Result<Self, ActionValidationError> {
+        Self::with_medium(
+            person_id,
+            message,
+            motive,
+            crate::ReachOutMedium::Message,
+            metadata,
+        )
+    }
+
+    pub fn with_medium(
+        person_id: PersonId,
+        message: MessageContent,
+        motive: ProactiveMotive,
+        medium: crate::ReachOutMedium,
+        metadata: ActionMetadata,
+    ) -> Result<Self, ActionValidationError> {
         let action = Self {
             person_id,
             message,
             motive,
+            medium,
             metadata,
         };
         action.validate()?;
@@ -405,7 +437,11 @@ impl ReachOutAction {
 
     pub fn validate(&self) -> Result<(), ActionValidationError> {
         self.metadata.validate()?;
-        validate_message(&self.message)
+        validate_message(&self.message)?;
+        // 从动作这头进来的内容也要过同一道判据：宿主收到的是动作，
+        // 反序列化路径不能比意图路径宽松。
+        crate::proactive::validate_reach_out_medium(self.medium, &self.message)
+            .map_err(ActionValidationError::Proactive)
     }
 
     #[must_use]
@@ -940,6 +976,8 @@ pub enum ActionValidationError {
     TooManyAttachments { length: usize, maximum: usize },
     #[error("action message content is invalid: {0}")]
     InvalidMessageContent(MessageValidationError),
+    #[error("action is not valid for proactive reach-out: {0}")]
+    Proactive(crate::ProactiveValidationError),
     #[error("action idempotency key must not be empty")]
     EmptyIdempotencyKey,
     #[error("action idempotency key is {length} bytes, above maximum {maximum}")]
@@ -1076,6 +1114,19 @@ mod tests {
             ActionValidationError::MessageContainsNul
         );
 
+        // 电话只承载说话：非语音内容当电话发要在这里被拦下，当消息发则可以。
+        assert_eq!(
+            ReachOutAction::with_medium(
+                PersonId::new(),
+                MessageContent::sticker("cat", "猫猫歪头"),
+                ProactiveMotive::Share,
+                crate::ReachOutMedium::Call,
+                ActionMetadata::new().expect("metadata"),
+            )
+            .expect_err("电话承载不了表情"),
+            ActionValidationError::Proactive(crate::ProactiveValidationError::CallRequiresSpeech)
+        );
+
         let now = Utc::now();
         let metadata = ActionMetadata::with_idempotency_key("same", now)
             .expect("valid metadata")
@@ -1090,6 +1141,48 @@ mod tests {
             .expect_err("backwards expiry should fail"),
             ActionValidationError::ExpiryNotAfterIssue
         );
+    }
+
+    /// 媒介必须从意图一路活到**动作**——宿主是照动作办事的。
+    ///
+    /// 这条漏了的话，Core 决定"打电话"、宿主收到的是一个普通消息动作，
+    /// 于是"她想打给你"变成"她给你发了句话"，而且没有任何地方报错。
+    #[test]
+    fn the_reach_out_medium_reaches_the_action_and_survives_a_round_trip() {
+        use crate::proactive::{ProactiveMotive, ReachOutIntent, ReachOutMedium};
+        let person = PersonId::new();
+        let intent = ReachOutIntent::from_parts_with_medium(
+            person,
+            MessageContent::text("喂，是我"),
+            ProactiveMotive::CheckIn,
+            ReachOutMedium::Call,
+        )
+        .expect("valid intent");
+        let action = ReachOutAction::from_intent(intent).expect("intent to action");
+        assert_eq!(action.medium, ReachOutMedium::Call);
+        assert_eq!(action.person_id, person);
+
+        let encoded = serde_json::to_string(&ProposedAction::ReachOut(action.clone()))
+            .expect("serialize action");
+        let decoded: ProposedAction = serde_json::from_str(&encoded).expect("deserialize action");
+        match decoded {
+            ProposedAction::ReachOut(decoded) => {
+                assert_eq!(decoded.medium, ReachOutMedium::Call, "媒介在动作往返里丢了");
+                assert_eq!(decoded, action);
+            }
+            other => panic!("解出来不是 ReachOut: {other:?}"),
+        }
+
+        // 老动作载荷（没有 medium）必须当成消息。
+        let legacy = encoded.replace(",\"medium\":\"call\"", "");
+        assert_ne!(legacy, encoded, "老载荷构造失败，判据失效");
+        let decoded: ProposedAction = serde_json::from_str(&legacy).expect("老载荷该能读");
+        match decoded {
+            ProposedAction::ReachOut(decoded) => {
+                assert_eq!(decoded.medium, ReachOutMedium::Message)
+            }
+            other => panic!("解出来不是 ReachOut: {other:?}"),
+        }
     }
 
     #[test]
