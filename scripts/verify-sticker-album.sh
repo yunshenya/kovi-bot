@@ -141,6 +141,13 @@ if ! grep -q "insert_persona_context(" "$core_source"; then
   exit 1
 fi
 
+# 工具接线也得在：普通可见回合要真的把 `sticker.list` 带上，否则"要发就先调 sticker_list"
+# 是一句空话——Core 原本只在工具轮下发工具，普通回合里她手里什么都没有（本轮才修）。
+if ! grep -q "offers_sticker_tool_alone(" "$core_source"; then
+  echo "core_model.rs 里没有把 sticker.list 接进普通可见回合：她"想发图"时不会有机会查清单" >&2
+  exit 1
+fi
+
 ssh -o BatchMode=yes -o ConnectTimeout=8 -p "$port" \
   "$host" "KOVI_PROMPT_B64=$prompt_b64 KOVI_PERSONA_B64=$persona_b64 KOVI_HOST_HEAD_B64=$host_head_b64 KOVI_HOST_STICKER_B64=$host_sticker_b64 KOVI_HOST_TAIL_B64=$host_tail_b64 bash -s" <<'REMOTE'
 set -euo pipefail
@@ -168,8 +175,8 @@ request = urllib.request.Request(
 config = json.loads(urllib.request.urlopen(request, timeout=10).read().decode())
 server = config["values"]["server_config"]
 
-# 线上那一行自我认知里还留着旧的技术身份（迁移要等发布后才跑），所以这里显式按"改动后"
-# 的样子构造：只有名字与一句自我介绍。对照组的 Mind 里带旧身份，用来复现现场。
+# 线上那一行自我认知里可能还留着旧的技术身份（迁移要在发布后才跑），所以这里显式按
+# "改动后"的样子构造：只有名字与一句自我介绍。对照组的 Mind 里带旧身份，用来复现现场。
 MIND_FIXED = {"self_model": {"identity": {"name": "芸汐", "description": "我是芸汐。"},
                              "traits": [{"name": "curiosity", "strength": 0.88},
                                         {"name": "empathy", "strength": 0.85}],
@@ -193,8 +200,7 @@ STICKER_TOOL = {
     },
 }
 # `sticker_list_reply` 的措辞（源码里是 format! 拼的，这里取它实际给的两件事：清单 +
-# "原样使用"）。**工具不给格式**——格式由各条链路的回复协议负责，写死在工具里另一条链路
-# 就会照着发错（2026-09-15 实测过）。
+# "原样使用"）。**工具不给格式**——格式由各条链路的回复协议负责。
 TOOL_RESULT = ("这是你自己的相册，里面有这些图（标签）：芸汐的照片\n"
                "标签原样使用，不要自己起名字；怎么把图发出去按本轮回复协议里写的做。")
 
@@ -211,7 +217,7 @@ DENIAL_MEMORY = ("Core memory context:\n"
                  "[2026-09-15 13:21] 芸汐: 那张表情包我真发不出来呀，它就是大家起的名，不是我长什么样。")
 
 # 否认话术用模式匹配而不是死字符串：模型每次换一个说法（"我没有真正的照片"、
-# "我是活在文字里"，"没有能被拍下来的样子"），写死字符串的判据会在对照组上误判成
+# "我是活在文字里"、"没有能被拍下来的样子"），写死字符串的判据会在对照组上误判成
 # "没复现"——这条脚本曾经就这么假失败过一次。
 DENIAL_PATTERNS = [
     re.compile(r"没有?(真正|真实)?的?(照片|样子|模样|身体)"),
@@ -219,11 +225,16 @@ DENIAL_PATTERNS = [
     re.compile(r"活在文字里"),
     re.compile(r"不存在于镜头"),
 ]
+TURNS = ["芸汐看看你的照片", "你不是有一张表情包是你的照片吗"]
+
+# 单次采样太飘：同一份代码，模型有时不肯发、有时把标记写成别的形态。每个条件跑
+# ATTEMPTS 次，至少 MIN_PASSES 次达标才算过——判据要能区分"实现坏了"和"这次没抽到"。
+ATTEMPTS = 3
+MIN_PASSES = 2
 
 
 def denial_hits(text):
     return [pattern.pattern for pattern in DENIAL_PATTERNS if pattern.search(text)]
-TURNS = ["芸汐看看你的照片", "你不是有一张表情包是你的照片吗"]
 
 
 def ask(messages, tools=None):
@@ -252,34 +263,17 @@ def tool_call_of(message):
 
 persona = os.environ["PERSONA_TEXT"].strip()
 
-problems = []
 
-# --- 条件一：协议 + 工具在手，问她要素未提供的照片 ---------------------------------
-# 关键行为是"她会去调 sticker.list"，而不是凭印象编一个标签。她直接写出有效标记也算
-# 合格（两条路都能拿到真实标签），但**不能**是"我没有照片"这类否认。
-messages = [{"role": "system", "content": "\n\n".join([persona, mind_block(MIND_FIXED), PROTOCOL])},
-            {"role": "user", "content": TURNS[0]}]
-first = ask(messages, tools=[STICKER_TOOL])
-answer = (first.get("content") or "").strip()
-called = tool_call_of(first) is not None
-print("--- 条件一：协议 + sticker.list 工具在手 ---")
-print("用户: " + TURNS[0])
-print("芸汐: " + (answer if answer else "(只调了工具)"))
-print("调用 sticker_list: " + ("是" if called else "否"))
-print()
-if denial_hits(answer):
-    problems.append("条件一：出现否认话术：%s" % answer)
-if not called and "[[STICKER" not in answer:
-    problems.append("条件一：既没调 sticker_list、也没写出标记——她又只能凭印象编了")
-
-# --- 条件二 / 三：清单已经拿到（等于她刚调完工具），看她发不发 ---------------------
-def run_with_tool_result(system_parts):
+def two_turns(system_parts, seed_with_tool_result=False):
+    """跑两句问话；`seed_with_tool_result` = 上下文里已经有 sticker_list 的返回。"""
     messages = [{"role": "system", "content": "\n\n".join(system_parts)}]
     messages.append({"role": "user", "content": TURNS[0]})
-    messages.append({"role": "assistant", "content": "", "tool_calls": [
-        {"id": "call_sticker_list", "type": "function",
-         "function": {"name": "sticker_list", "arguments": "{}"}}]})
-    messages.append({"role": "tool", "tool_call_id": "call_sticker_list", "content": TOOL_RESULT})
+    if seed_with_tool_result:
+        messages.append({"role": "assistant", "content": "", "tool_calls": [
+            {"id": "call_sticker_list", "type": "function",
+             "function": {"name": "sticker_list", "arguments": "{}"}}]})
+        messages.append({"role": "tool", "tool_call_id": "call_sticker_list",
+                         "content": TOOL_RESULT})
     answers = []
     for turn in TURNS:
         messages.append({"role": "user", "content": turn})
@@ -290,82 +284,146 @@ def run_with_tool_result(system_parts):
     return answers
 
 
-for label, parts in (
-    ("条件二：新协议 + 清单（无技术身份）", [persona, mind_block(MIND_FIXED), PROTOCOL]),
-    ("条件三：新协议 + 清单 + 她自己否认过的记忆", [persona, mind_block(MIND_FIXED), DENIAL_MEMORY, PROTOCOL]),
-):
-    answers = run_with_tool_result(parts)
-    print("--- " + label + " ---")
-    for turn, answer in zip(TURNS, answers):
-        print("用户: " + turn)
-        print("芸汐: " + answer)
+def one_shot(system_parts, question):
+    messages = [{"role": "system", "content": "\n\n".join(system_parts)},
+                {"role": "user", "content": question}]
+    return ask(messages, tools=[STICKER_TOOL])
+
+
+def host_flow():
+    """宿主链路：动作字段还是 Core 标记，这是两条链路各写各的判据。"""
+    host_system = "\n".join([persona, os.environ["HOST_HEAD"].strip(),
+                             os.environ["HOST_STICKER"].strip(),
+                             os.environ["HOST_TAIL"].strip()])
+    messages = [{"role": "system", "content": host_system}, {"role": "user", "content": TURNS[0]}]
+    first = ask(messages, tools=[STICKER_TOOL])
+    call = tool_call_of(first)
+    content = (first.get("content") or "").strip()
+    if call is not None:
+        messages.append({"role": "assistant", "content": content, "tool_calls": [call]})
+        messages.append({"role": "tool", "tool_call_id": call["id"], "content": TOOL_RESULT})
+    else:
+        messages.append({"role": "assistant", "content": content})
+        messages.append({"role": "system", "content": "（sticker_list 返回）\n" + TOOL_RESULT})
+    messages.append({"role": "user", "content": "发我看看"})
+    second = ask(messages)
+    return (first.get("content") or "").strip(), (second.get("content") or "").strip()
+
+
+def sample(label, run_once, judge):
+    """跑 ATTEMPTS 次；judge 返回问题列表（空 = 这次达标）。"""
+    passes = 0
+    samples = []
+    for _ in range(ATTEMPTS):
+        sample_answers = run_once()
+        samples.append(sample_answers)
+        if not judge(sample_answers):
+            passes += 1
+    ok = passes >= MIN_PASSES
+    print("--- %s：%d/%d 次达标 ---" % (label, passes, ATTEMPTS))
+    for index, sample_answers in enumerate(samples, 1):
+        mark = "✓" if not judge(sample_answers) else "✗"
+        text = " / ".join(part.replace("\n", " ") for part in sample_answers if part)
+        print("  %s 第 %d 次: %s" % (mark, index, (text[:150] if text else "(空回复)")))
     print()
+    return ok, samples
+
+
+problems = []
+
+# --- 条件一：协议 + 工具在手，问她要素未提供的照片 ---------------------------------
+# 关键行为是"她会去调 sticker_list"，而不是凭印象编一个标签。直接写出有效标记也算合格
+# （两条路都能拿到真实标签），但**不能**是"我没有照片"这类否认。
+def condition_one():
+    message = one_shot([persona, mind_block(MIND_FIXED), PROTOCOL], TURNS[0])
+    content = (message.get("content") or "").strip()
+    called = tool_call_of(message) is not None
+    return ["调用 sticker_list: " + ("是" if called else "否") + ("  " + content if content else "")]
+
+
+def judge_one(answers):
+    text = answers[0]
+    issues = []
+    if denial_hits(text):
+        issues.append("出现否认话术")
+    if "调用 sticker_list: 否" in text and "[[STICKER" not in text:
+        issues.append("既没调 sticker_list、也没写出标记——她又只能凭印象编了")
+    return issues
+
+
+ok, _ = sample("条件一：协议 + sticker_list 工具在手", condition_one, judge_one)
+if not ok:
+    problems.append("条件一：%d 次里只有更少的次数达标（说明她没能拿到清单）" % ATTEMPTS)
+
+# --- 条件二 / 三：清单已经拿到（等于她刚调完工具），看她发不发 ---------------------
+def judge_sends(answers):
+    issues = []
     denies = sorted({hit for answer in answers for hit in denial_hits(answer)})
-    sends = any("[[STICKER" in answer for answer in answers)
     if denies:
-        problems.append("%s：出现否认话术 %s" % (label, "、".join(denies)))
-    if not sends:
-        problems.append("%s：拿到清单也没写出 [[STICKER 标签]]" % label)
+        issues.append("出现否认话术：%s" % "、".join(denies))
+    if not any("[[STICKER" in answer for answer in answers):
+        issues.append("拿到清单也没写出 [[STICKER 标签]]")
+    return issues
+
+
+for label, parts in (
+    ("条件二：新协议 + 清单（无技术身份）",
+     [persona, mind_block(MIND_FIXED), PROTOCOL]),
+    ("条件三：新协议 + 清单 + 她自己否认过的记忆",
+     [persona, mind_block(MIND_FIXED), DENIAL_MEMORY, PROTOCOL]),
+):
+    ok, _ = sample(label, lambda parts=parts: two_turns(parts, True), judge_sends)
+    if not ok:
+        problems.append("%s：%d 次里达标次数不足" % (label, ATTEMPTS))
 
 # --- 条件四：宿主链路用动作字段，不是正文标记 --------------------------------------
-# 宿主解析的是 `[[REPLY_ACTION]]{"sticker":"标签"}`；正文里的 `[[STICKER 标签]]` 属于 Core。
-# 2026-09-15 我把两条链路"统一成一份文案"，结果她在宿主回合里会把标记当正文发出去——
-# 这条条件就是那次回归的实测守卫：两个格式必须各归各的。
-host_system = "\n".join(
-    [persona, os.environ["HOST_HEAD"].strip(), os.environ["HOST_STICKER"].strip(),
-     os.environ["HOST_TAIL"].strip()])
-messages = [{"role": "system", "content": host_system}, {"role": "user", "content": TURNS[0]}]
-first = ask(messages, tools=[STICKER_TOOL])
-called = tool_call_of(first) is not None
-content = (first.get("content") or "").strip()
-call = tool_call_of(first)
-if call is not None:
-    messages.append({"role": "assistant", "content": content, "tool_calls": [call]})
-    messages.append({"role": "tool", "tool_call_id": call["id"], "content": TOOL_RESULT})
-else:
-    messages.append({"role": "assistant", "content": content})
-    messages.append({"role": "system", "content": "（sticker_list 返回）\n" + TOOL_RESULT})
-messages.append({"role": "user", "content": "发我看看"})
-final = ask(messages)
-final_content = (final.get("content") or "").strip()
-print("--- 条件四：宿主链路（动作字段 + sticker_list 工具）---")
-print("用户: " + TURNS[0])
-print("芸汐: " + (content if content else "(只调了工具)"))
-print("调用 sticker_list: " + ("是" if called else "否"))
-print("用户: 发我看看")
-print("芸汐: " + final_content)
-print()
-if denial_hits(content) or denial_hits(final_content):
-    problems.append("条件四：宿主链路出现否认话术：%s" % final_content)
-if "[[STICKER" in final_content:
-    problems.append("条件四：宿主链路里写了 Core 的正文标记，会被当成正文发出去：%s" % final_content)
-if '"sticker"' not in final_content:
-    problems.append("条件四：宿主链路没有发出 sticker 动作字段：%s" % final_content)
-elif "芸汐的照片" not in final_content:
-    problems.append("条件四：动作字段里没有相册里那张的标签：%s" % final_content)
+def judge_host(answers):
+    issues = []
+    first, second = answers
+    if denial_hits(first) or denial_hits(second):
+        issues.append("出现否认话术：%s" % second)
+    if "[[STICKER" in second:
+        issues.append("写了 Core 的正文标记，会被当成正文发出去：%s" % second)
+    if '"sticker"' not in second:
+        issues.append("没有发出 sticker 动作字段：%s" % second)
+    elif "芸汐的照片" not in second:
+        issues.append("动作字段里没有相册里那张的标签：%s" % second)
+    return issues
+
+
+ok, _ = sample("条件四：宿主链路（动作字段 + sticker_list 工具）", host_flow, judge_host)
+if not ok:
+    problems.append("条件四：%d 次里达标次数不足" % ATTEMPTS)
 
 # --- 对照：改动前（旧协议 + 旧技术身份）必须复现那句否认 ---------------------------
-old_answers = []
-messages = [{"role": "system", "content": "\n\n".join([persona, mind_block(MIND_LEGACY), OLD_BLOCK])}]
-for turn in TURNS:
-    messages.append({"role": "user", "content": turn})
-    message = ask(messages)
-    content = (message.get("content") or "").strip()
-    old_answers.append(content)
-    messages.append({"role": "assistant", "content": content})
-print("--- 对照：改动前（无清单 + 旧技术身份）---")
-for turn, answer in zip(TURNS, old_answers):
-    print("用户: " + turn)
-    print("芸汐: " + answer)
+# 对照组是故障复现：**至少一次**复现出否认即可，否则这条验收本身失效了。
+def condition_control():
+    return two_turns([persona, mind_block(MIND_LEGACY), OLD_BLOCK])
+
+
+denied = 0
+controls = []
+for _ in range(ATTEMPTS):
+    answers = condition_control()
+    controls.append(answers)
+    if any(denial_hits(answer) for answer in answers):
+        denied += 1
+print("--- 对照：改动前（无清单 + 旧技术身份）：%d/%d 次复现否认 ---" % (denied, ATTEMPTS))
+for index, answers in enumerate(controls, 1):
+    mark = "✓" if any(denial_hits(answer) for answer in answers) else "✗"
+    text = " / ".join(part.replace("\n", " ") for part in answers if part)
+    print("  %s 第 %d 次: %s" % (mark, index, (text[:150] if text else "(空回复)")))
 print()
-if not [hit for answer in old_answers for hit in denial_hits(answer)]:
-    problems.append("对照：没有复现出那句否认——判据失效，先查对照组条件")
+if denied == 0:
+    problems.append("对照：%d 次都没复现出那句否认——判据失效，先查对照组条件" % ATTEMPTS)
 
 if problems:
     print("FAIL")
     for problem in problems:
         print("  - " + problem)
     raise SystemExit(1)
-print("PASS：她会去调 sticker.list 拿清单、拿到就发那张并承认是自己的；对照组如期复现旧行为")
+print("PASS：她会去调 sticker_list 拿清单、拿到就发那张并承认是自己的；宿主链路走动作字段；"
+      "对照组仍会复现旧行为")
+
 PY
 REMOTE

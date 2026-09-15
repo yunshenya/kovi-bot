@@ -448,6 +448,22 @@ fn tool_calls_allowed_for_turn(
     route_allows_tool_call && (explicit_message_count.is_none() || tool_intent)
 }
 
+/// 普通可见回合要不要单独带上 `sticker.list`。
+///
+/// 独立成一个函数是为了能单测：这条判定的两端都容易写反——写宽了每个回合都多背一个工具
+/// （不只多花钱：模型可能在不必要的回合多调一次，多一轮往返），写窄了就回到"她想发图时
+/// 手里没有工具、只能凭印象编标签"的老毛病（线上 2026-09-15 02:15 的"猫猫歪头"）。
+///
+/// 判据：只给 Strong 档（Intrinsic 没有工具通道）、只在**不是**工具轮时补（工具轮本来就带
+/// 全套工具）、且这一轮确实有一条入站消息（自主/系统回合没有"发图"这个动作）。
+fn offers_sticker_tool_alone(
+    route: HostModelRoute,
+    tool_protocol_authorized: bool,
+    has_message: bool,
+) -> bool {
+    route == HostModelRoute::Strong && !tool_protocol_authorized && has_message
+}
+
 fn tool_protocol_authorized_for_turn(
     route_allows_tool_call: bool,
     supports_tool: bool,
@@ -6361,9 +6377,11 @@ impl ModelBackend for KoviModelBackend {
             // 为什么只带这一个：整套只读工具是每轮几百个 token，而这里要的只是"她想知道
             // 自己有什么时查得到"。工具 schema 是固定大小，随素材库增长的是**清单**——那份
             // 才是被移出提示词的东西（AGENTS.md 第 6 条：获取信息的入口属于允许常驻的三类）。
-            let sticker_only_specs = (route_decision.route == HostModelRoute::Strong
-                && !tool_protocol_authorized
-                && message.is_some())
+            let sticker_only_specs = offers_sticker_tool_alone(
+                route_decision.route,
+                tool_protocol_authorized,
+                message.is_some(),
+            )
             .then(tool_registry)
             .flatten()
             .and_then(|registry| {
@@ -7783,18 +7801,19 @@ mod tests {
         intrinsic_fallback_is_eligible, intrinsic_output_is_unsafe, intrinsic_prompt,
         is_ambient_group_message, is_plain_text_batch_data_context, keeps_existing_prepared_plan,
         message_id_for_log, mind_context_messages, mind_outgoing_fence_required,
-        parse_autonomous_intent_response, parse_core_response, parse_direct_repair_output,
-        parse_intrinsic_autonomous_directive, parse_plain_core_response, parse_qq_conversation,
-        plain_text_batch_message_prompt, plain_text_batch_repair_context, pre_model_plan,
-        prepared_outgoing_semantic_context, purge_group_routes_from_cache,
-        recent_conversation_messages, recent_direct_conversation_messages,
-        recent_group_conversation_messages, refine_core_incoming, register_core_tool_intents,
-        repair_context_messages, reply_asks_something, reply_expected_for_incoming,
-        reply_looks_complete, reply_recovery_required, reply_text_has_semantic_content,
-        reply_text_is_too_thin, requested_message_count, route_from_lookup,
-        route_lookup_with_fallback, safe_single_structured_reply_message,
-        safe_structured_reply_batch, sanitize_autonomous_intrinsic_output,
-        sanitize_core_plan_bubbles, sanitize_intrinsic_output, sanitize_plain_text_batch_message,
+        offers_sticker_tool_alone, parse_autonomous_intent_response, parse_core_response,
+        parse_direct_repair_output, parse_intrinsic_autonomous_directive,
+        parse_plain_core_response, parse_qq_conversation, plain_text_batch_message_prompt,
+        plain_text_batch_repair_context, pre_model_plan, prepared_outgoing_semantic_context,
+        purge_group_routes_from_cache, recent_conversation_messages,
+        recent_direct_conversation_messages, recent_group_conversation_messages,
+        refine_core_incoming, register_core_tool_intents, repair_context_messages,
+        reply_asks_something, reply_expected_for_incoming, reply_looks_complete,
+        reply_recovery_required, reply_text_has_semantic_content, reply_text_is_too_thin,
+        requested_message_count, route_from_lookup, route_lookup_with_fallback,
+        safe_single_structured_reply_message, safe_structured_reply_batch,
+        sanitize_autonomous_intrinsic_output, sanitize_core_plan_bubbles,
+        sanitize_intrinsic_output, sanitize_plain_text_batch_message,
         select_host_model_route_from_capability, serialize_intrinsic_reply_batch,
         shadow_projection_for_completed_plan, should_archive_raw_reply, silence_gate_plan,
         silence_verdict, silent_wait_plan, split_core_delivery_markers, split_two_short_lines,
@@ -9600,11 +9619,40 @@ mod tests {
         assert_eq!(messages.len(), 3, "空人格不该插入任何东西");
     }
 
-    /// 表情包说明**带真实清单常驻**：素材库关了或空着才整段不给。
+    /// 普通可见回合要不要单独带 `sticker.list`：写宽写窄都有具体代价，钉住这条判定。
+    #[test]
+    fn sticker_tool_is_offered_on_plain_strong_turns_only() {
+        // 普通可见回合：带着（不然她"想发图"时没有工具可调）。
+        assert!(offers_sticker_tool_alone(
+            HostModelRoute::Strong,
+            false,
+            true
+        ));
+        // 工具轮：本来就带全套工具，不需要单独补。
+        assert!(!offers_sticker_tool_alone(
+            HostModelRoute::Strong,
+            true,
+            true
+        ));
+        // 没有入站消息的回合（自主 tick、系统事件）：没有"发图"这个动作。
+        assert!(!offers_sticker_tool_alone(
+            HostModelRoute::Strong,
+            false,
+            false
+        ));
+        // Intrinsic 档没有工具通道。
+        assert!(!offers_sticker_tool_alone(
+            HostModelRoute::Intrinsic,
+            false,
+            true
+        ));
+    }
+
+    /// 表情包协议是**一句短话、不含清单**：要发图时她自己调 `sticker_list` 拿标签。
     ///
-    /// 这是"修源头"那一步的判据。旧实现平时只给一句"先调 sticker.list 拿标签"，只有
-    /// 消息命中"表情包/照片"这类词时才把清单塞进来——没命中的回合里她根本不知道自己
-    /// 有什么，只能凭印象编（线上 02:15 的"猫猫歪头"、13:21 答应发一张相册里没有的图）。
+    /// 这是 2026-09-15 的用户口径（中途试过把清单常驻，被否掉）：素材一多，每轮都带上那些
+    /// 标签就是白花钱，而它们只在真要发图的那几轮才有用。协议里必须点明"先调工具"，
+    /// 否则她手里没有清单、又不知道该去查，就只能凭印象编（线上 02:15 的"猫猫歪头"）。
     #[test]
     fn sticker_instruction_is_a_short_pointer_to_the_tool() {
         let without = core_plain_turn_instruction(false, &[], None);
