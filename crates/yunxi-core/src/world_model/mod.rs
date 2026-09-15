@@ -1503,6 +1503,46 @@ mod tests {
     }
 
     #[test]
+    fn a_snapshot_with_only_causal_knowledge_is_not_reported_as_empty() {
+        // `is_empty` 以前漏了 `causal`：只有因果关系的那份世界状态会被判成"没东西
+        // 可存"，而调用方正是靠这个判断决定要不要落盘。
+        let now = Utc::now();
+        let mut world = WorldModel::new();
+        let context = WorldSnapshotContext::new(now);
+        assert!(
+            world.snapshot_for(&context).expect("snapshot").is_empty(),
+            "空白世界模型应当是空的"
+        );
+        world
+            .add_causal_relation(
+                super::causal::CausalRelation::new(
+                    super::CausalRelationId::new(),
+                    super::causal::WorldPattern::new(
+                        super::causal::PatternKind::Environment,
+                        "rate_limited",
+                    )
+                    .expect("cause"),
+                    super::causal::WorldPattern::new(
+                        super::causal::PatternKind::Tool,
+                        "retry_later",
+                    )
+                    .expect("effect"),
+                    0.8,
+                    0.9,
+                    super::causal::CausalSource::DomainRule,
+                    super::causal::CausalScope::Global,
+                    1,
+                )
+                .expect("relation"),
+            )
+            .expect("causal relation");
+        assert!(
+            !world.snapshot_for(&context).expect("snapshot").is_empty(),
+            "只有因果关系的状态也必须算作非空"
+        );
+    }
+
+    #[test]
     fn the_snapshot_includes_causal_knowledge_for_every_person_in_context() {
         // 因果快照此前只取 `person_ids().first()`，第 2..8 个参与者的
         // person-specific 关系全部被丢掉——而它们正是"这个人身上会怎样"那部分。

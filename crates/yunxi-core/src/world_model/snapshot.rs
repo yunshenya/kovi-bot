@@ -1082,10 +1082,16 @@ impl WorldModelSnapshot {
     /// Does the snapshot carry any "usable" state? (may be empty for a
     /// fresh world; callers must decide, not assume a non-empty world.)
     #[must_use]
+    /// 这份快照是不是"什么都没有"。
+    ///
+    /// 必须把每一类长期状态都算进来：调用方（世界模型的持久化判断与测试）靠它回答
+    /// "这次有没有东西要落盘"。漏掉 `causal` 的话，只有因果关系的那份状态会被判成
+    /// 空——看起来没东西可存，实际有。
     pub fn is_empty(&self) -> bool {
         self.entities.is_empty()
             && self.situations.is_empty()
             && self.hypotheses.is_empty()
+            && self.causal.is_empty()
             && self.social_scene.is_none()
             && self.temporal.is_empty()
             && self.uncertainties.is_empty()
