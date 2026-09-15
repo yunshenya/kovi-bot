@@ -40,6 +40,11 @@ enabled = true
 check_interval_secs = 300
 inactivity_threshold_secs = 7200
 cooldown_secs = 7200
+# 哪些主动理由可以用**电话**打出去（可用：follow_up、check_in、share、react、curiosity）。
+# 留空 = 从不主动打电话。主动接触是定时器触发的，所以媒介由这份白名单决定，而不是让
+# 模型在生成话题时挑；默认只有 check_in——"担心他最近怎么样"，打电话贴切，其余发消息就够。
+# 拼错的理由名会在启动时报错，不会静默失效。
+call_motives = ["check_in"]
 push_probability_percent = 35
 # 可选：部署者可在自己的运行时配置中填写 main_admin。
 main_admin_decision_interval_secs = 10800
