@@ -3037,10 +3037,10 @@ impl MemoryManager {
         // 每次多取一些候选（`limit` 的 50 倍），但始终不超过硬上限。
         // 取最近的一批候选：`limit` 的 50 倍起步（至少 500 条，保证老记忆也有机会
         // 被算到），上限 2000 条。
-        let candidates = limit
-            .saturating_mul(50)
-            .max(500)
-            .min(Self::SEMANTIC_CANDIDATE_LIMIT);
+        let candidates = limit.saturating_mul(50).clamp(
+            500.min(Self::SEMANTIC_CANDIDATE_LIMIT),
+            Self::SEMANTIC_CANDIDATE_LIMIT,
+        );
         let fetch = query(
             r#"
             SELECT e.memory_id, e.vector
