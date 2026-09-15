@@ -5917,7 +5917,7 @@ impl ModelBackend for KoviModelBackend {
                     BotMemory {
                         role: Roles::System,
                         content: core_tool_follow_up_instruction(
-                            crate::sticker_library::prompt_instruction().as_deref(),
+                            crate::sticker_library::prompt_instruction(),
                         ),
                     },
                 );
@@ -5967,7 +5967,7 @@ impl ModelBackend for KoviModelBackend {
                         content: core_plain_turn_instruction(
                             crate::config::qq_voice_enabled(),
                             &sing_templates,
-                            crate::sticker_library::prompt_instruction().as_deref(),
+                            crate::sticker_library::prompt_instruction(),
                         ),
                     },
                 );
@@ -9537,39 +9537,42 @@ mod tests {
     ///
     /// 这是"修源头"那一步的判据。旧实现平时只给一句"先调 sticker.list 拿标签"，只有
     /// 消息命中"表情包/照片"这类词时才把清单塞进来——没命中的回合里她根本不知道自己
-    /// 有什么，只能凭印象编（线上 02:15 编了个"猫猫歪头"连发两次发不出去，13:21 又答应
-    /// "等下发给你"而相册里没有那张图）。写错了再拦只是按住症状。
+    /// 有什么，只能凭印象编（线上 02:15 的"猫猫歪头"、13:21 答应发一张相册里没有的图）。
     #[test]
-    fn sticker_instruction_carries_the_real_catalog_every_turn() {
+    fn sticker_instruction_is_a_short_pointer_to_the_tool() {
         let without = core_plain_turn_instruction(false, &[], None);
         assert!(
             !without.contains(CORE_STICKER_MARKER),
             "没有素材时不该提表情包"
         );
 
-        let sticker = format!(
-            "{}{}{}",
-            crate::sticker_library::LABEL_PROMPT_HEAD,
-            "芸汐的照片；开心",
-            crate::sticker_library::LABEL_PROMPT_TAIL
-        );
-        let with = core_plain_turn_instruction(false, &[], Some(&sticker));
-        assert!(with.contains("[[STICKER 标签]]"));
-        assert!(with.contains("芸汐的照片；开心"), "真实清单必须在提示词里");
+        let sticker = crate::sticker_library::STICKER_PROMPT;
+        let with = core_plain_turn_instruction(false, &[], Some(sticker));
+        assert!(with.contains("[[STICKER 标签]]"), "要说清标记怎么写");
         assert!(
-            with.contains("别自己起名字"),
-            "要点明标签是照抄清单，不是自己起"
+            with.contains("sticker_list"),
+            "要说清清单怎么拿（写模型能调的那个名字）"
         );
-        assert!(with.ends_with(&sticker), "说明整段拼在最后：{with}");
+        assert!(with.ends_with(sticker), "协议整段拼在最后：{with}");
 
-        // 相册语义（要照片时她得认那张是自己的）保留；"没有就别发/别答应"这类
-        // 拦截话术按用户口径删掉——源头修好后不需要它们。
-        assert!(crate::sticker_library::LABEL_PROMPT_TAIL.contains("你本人的照片"));
-        assert!(crate::sticker_library::LABEL_PROMPT_HEAD.contains("你自己的相册"));
-        for forbidden in ["不许凭印象编", "别答应", "不能用沉默代替", "不许编"] {
+        // 相册语义保留（要照片时她得认那张是自己的）。
+        assert!(sticker.contains("你本人的照片"));
+        assert!(sticker.contains("你自己的相册"));
+        // 清单**不常驻**：协议里不该出现任何列举式清单。
+        assert!(
+            !sticker.contains("现在能发的图（标签）："),
+            "清单不该常驻提示词：{sticker}"
+        );
+        // 拦截话术也不该回来（用户口径：不拦她的回复）。
+        for forbidden in [
+            "不许凭印象编",
+            "别答应",
+            "不能用沉默代替",
+            "相册里没有就别发",
+        ] {
             assert!(
                 !sticker.contains(forbidden),
-                "不该再有拦截话术「{forbidden}」：{sticker}"
+                "不该再有拦截话术「{forbidden}」"
             );
         }
     }
@@ -9578,16 +9581,10 @@ mod tests {
     /// 语音/唱歌不在（它们改变整条投递形态，工具跟进回合有自己的协议）。
     #[test]
     fn tool_follow_up_turn_keeps_the_sticker_protocol_only() {
-        let sticker = format!(
-            "{}{}{}",
-            crate::sticker_library::LABEL_PROMPT_HEAD,
-            "芸汐的照片",
-            crate::sticker_library::LABEL_PROMPT_TAIL
-        );
-        let with_library = core_tool_follow_up_instruction(Some(&sticker));
+        let sticker = crate::sticker_library::STICKER_PROMPT;
+        let with_library = core_tool_follow_up_instruction(Some(sticker));
         let without = core_tool_follow_up_instruction(None);
         assert!(with_library.contains("[[STICKER 标签]]"));
-        assert!(with_library.contains("芸汐的照片"), "清单要跟着一起来");
         assert!(!with_library.contains(CORE_VOICE_MARKER));
         assert!(!with_library.contains(CORE_SING_MARKER));
         assert!(!without.contains("[[STICKER"));

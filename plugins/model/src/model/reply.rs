@@ -408,7 +408,7 @@ pub(crate) async fn attach_reply_protocol_context(
         role: crate::model::utils::Roles::System,
         content: reply_protocol_instructions(
             crate::config::qq_voice_enabled(),
-            crate::sticker_library::prompt_instruction().as_deref(),
+            crate::sticker_library::prompt_instruction(),
         ),
     });
 }
@@ -1055,20 +1055,18 @@ mod tests {
     }
 
     /// 素材库为空时不能告诉模型"你可以发图"——那只会得到一条永远兑现不了的字段；
-    /// 有素材时**真实清单必须在这一轮里**（源头修复：她不知道有什么才会凭印象编）。
+    /// 有素材时只给一句短协议：**清单不常驻**，她自己调 `sticker.list` 拿。
     #[test]
     fn sticker_option_is_only_offered_when_the_library_has_labels() {
-        let sticker = format!(
-            "{}{}{}",
-            crate::sticker_library::LABEL_PROMPT_HEAD,
-            "芸汐的照片",
-            crate::sticker_library::LABEL_PROMPT_TAIL
-        );
+        let sticker = crate::sticker_library::STICKER_PROMPT;
         let without = reply_protocol_instructions(false, None);
-        let with = reply_protocol_instructions(false, Some(&sticker));
+        let with = reply_protocol_instructions(false, Some(sticker));
 
         assert!(!without.contains("相册"), "没有素材时不该提表情包");
-        assert!(with.contains("芸汐的照片"), "真实清单必须在这一轮里");
+        assert!(
+            with.contains("sticker_list"),
+            "要说清清单怎么拿（清单不常驻）"
+        );
         assert!(with.contains("[[STICKER 标签]]"), "要说清标记怎么写");
         assert!(with.contains("你本人的照片"), "相册语义要跟着一起下发");
         assert_eq!(

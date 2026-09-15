@@ -411,74 +411,43 @@ pub(crate) fn available_labels() -> Vec<String> {
     labels_snapshot().into_keys().collect()
 }
 
-/// 表情包说明的开头与结尾：**真实清单拼在中间**，素材库空了或关了才整段不给。
+/// 表情包协议：**一句短话，不含清单**。
 ///
-/// 为什么清单常驻（2026-09-15 用户口径：不拦截她的回复，修源头）：旧实现平时只给一句
-/// "先调 sticker.list 拿标签"，只有消息命中"表情包/照片"这类词时才把清单塞进来。于是
-/// 在没命中的回合里她**根本不知道自己有什么**，只能凭印象编——线上 02:15 编了个
-/// "猫猫歪头"连发两次发不出去，13:21 又答应"等下发给你"而相册里没有那张图。写错了再
-/// 拦（把她的回复丢掉重写一轮）只是按住症状，源头是"她不知道"。
+/// 清单不进常驻提示词（2026-09-15 用户口径）：素材一多，每轮都带上它就是白花钱，
+/// 而且那些标签只在真要发图的那几轮才有用。所以提示词里只说清"要发就先调
+/// `sticker.list` 拿标签"，清单由工具在那一刻给——这也是原先的设计，2026-09-15
+/// 中途试过改成常驻，被否掉，这里留一句免得后人再改回去。
 ///
-/// 代价是每轮多几十个 token；素材库只有几张图时这就是几十个字。真长到几百个标签时
-/// 只列前 [`LABEL_PROMPT_MAX`] 个，其余报个数、让她需要时自己调 `sticker.list`。
-pub(crate) const LABEL_PROMPT_HEAD: &str =
-    "素材库就是你自己的相册（图都是你的）。现在能发的图（标签）：";
-pub(crate) const LABEL_PROMPT_TAIL: &str = "。想发哪张就把 [[STICKER 标签]] 写在正文最前面（不展示，正文可留空），标签照抄上面的、别自己起名字。带你自己名字的标签就是你本人的照片：有人要看你的照片，就把那张发出去，不要说那不是你。";
-/// 常驻提示词里最多列多少个标签。
-pub(crate) const LABEL_PROMPT_MAX: usize = 40;
+/// 相册语义留在这一句里（她要认得出相册里那张就是自己）：有人要看照片时她该发那张，
+/// 而不是说"那不是我真人的样子"——线上 2026-09-15 13:20 就是这么答的。
+///
+/// "发不出去就别发、别答应"那类禁止句**不在这里**：按用户口径，这里修的是"她不知道
+/// 有什么"（工具随时可查），不是靠禁止句把她的回复按住；标签写错时也不再重写她的回合，
+/// 交付层去掉那张图、正文照发。
+///
+/// **名字写 `sticker_list` 而不是 `sticker.list`**：注册名带点是内部 id，发到 provider
+/// 的函数名由 [`crate::model::tool_access::wire_tool_name`] 把点换成下划线（DeepSeek 等
+/// 网关按 `^[a-zA-Z0-9_-]+$` 校验，带点直接 400）。提示词里必须写模型真正能调的那个名字，
+/// 否则她照着抄也调不到。
+pub(crate) const STICKER_PROMPT: &str = "素材库就是你自己的相册（图都是你的）：想发哪张就先调 sticker_list 拿标签，把 [[STICKER 标签]] 写在正文最前面（不展示，正文可留空），标签照抄工具给的、别自己起名字。带你自己名字的标签就是你本人的照片：有人要看你的照片，就把那张发出去，不要说那不是你。";
 
-/// 提示词里那段表情包说明（带真实清单）：Core 与宿主两条链路共用这一份。
-///
-/// 素材库关闭或为空时返回 `None`——那种情况下不能告诉她"你可以发图"，否则她只会写出
-/// 一张永远发不出去的标记。
-pub(crate) fn prompt_instruction() -> Option<String> {
-    let (listing, total) = prompt_listing(LABEL_PROMPT_MAX)?;
-    let mut instruction = String::from(LABEL_PROMPT_HEAD);
-    instruction.push_str(&listing);
-    if total > LABEL_PROMPT_MAX {
-        instruction.push_str(&format!(
-            "（还有 {} 个没列出，需要时调 sticker.list 看全）",
-            total - LABEL_PROMPT_MAX
-        ));
-    }
-    instruction.push_str(LABEL_PROMPT_TAIL);
-    Some(instruction)
+/// 这一轮要不要给这段协议：素材库关了或空着就不给（不能让她以为自己有一个当下用不了
+/// 的出口），给了就一定是上面那一份。
+pub(crate) fn prompt_instruction() -> Option<&'static str> {
+    is_available().then_some(STICKER_PROMPT)
 }
 
 /// `sticker.list` 工具返回给模型的清单：**全部**标签（`A；B；C`）。
 ///
-/// 清单现在也常驻提示词（见 [`prompt_listing`]），这个工具留给两种情况：清单太长被
-/// 截断时看全，以及她自己想再确认一次。素材库关闭或为空时返回 `None`——那种情况下
-/// 工具本身也不会下发给模型。
+/// 这是清单唯一的来源：常驻提示词里只有一句"要发就先调它"（见 [`STICKER_PROMPT`]），
+/// 所以它必须给全，不能截断——截断了就等于让她去猜没列出来的那些。
+/// 素材库关闭或为空时返回 `None`——那种情况下工具本身也不会下发给模型。
 pub(crate) fn tool_listing() -> Option<String> {
     let labels = labels_snapshot();
     if labels.is_empty() {
         return None;
     }
     Some(labels.into_keys().collect::<Vec<_>>().join("；"))
-}
-
-/// 提示词里那份清单：最多 `max_labels` 个标签，连同标签总数一起返回。
-///
-/// **为什么要常驻**（2026-09-15 用户口径：不拦截她的回复，修源头）：旧实现平时只给一句
-/// "先调 sticker.list 拿标签"，只有消息命中"表情包/照片"这类词时才把清单塞进去，于是
-/// 没命中的回合里她根本不知道自己有什么，只能凭印象编——线上 02:15 编了个"猫猫歪头"
-/// 连发两次发不出去，13:21 又答应"等下发给你"而相册里没有那张图。写错了再拦只是按住
-/// 症状，源头是"她不知道"。
-///
-/// 素材库关闭或为空时返回 `None`（连协议都不给）。
-pub(crate) fn prompt_listing(max_labels: usize) -> Option<(String, usize)> {
-    let labels = labels_snapshot();
-    if labels.is_empty() {
-        return None;
-    }
-    let total = labels.len();
-    let listing = labels
-        .into_keys()
-        .take(max_labels.max(1))
-        .collect::<Vec<_>>()
-        .join("；");
-    Some((listing, total))
 }
 
 fn labels_snapshot() -> BTreeMap<String, Vec<PathBuf>> {
@@ -808,6 +777,25 @@ mod tests {
     };
     use std::path::{Path, PathBuf};
 
+    /// 协议里必须写**模型真正能调到的那个名字**：注册名 `sticker.list` 带点，发到
+    /// provider 时会被 `wire_tool_name` 换成下划线（DeepSeek 按 `^[a-zA-Z0-9_-]+$`
+    /// 校验函数名，带点直接 400）。写错名字的后果是她照着提示词抄也调不到工具，于是
+    /// 又回到"凭印象编标签"——这正是这次要修的东西。
+    #[test]
+    fn sticker_protocol_names_the_callable_tool() {
+        let wire = crate::model::tool_access::wire_tool_name("sticker.list");
+        assert!(
+            super::STICKER_PROMPT.contains(&wire),
+            "协议里要写 {wire}：{}",
+            super::STICKER_PROMPT
+        );
+        assert!(
+            !super::STICKER_PROMPT.contains("sticker.list"),
+            "带点的注册名不是模型能调的名字：{}",
+            super::STICKER_PROMPT
+        );
+    }
+
     /// 丢掉进程内的扫描缓存与轮换计数，让下一次访问重新扫一遍目录。
     ///
     /// 只给"改配置/改目录"的用例用：正常路径靠 `rescan_secs` 自己过期，不该依赖它。
@@ -1111,7 +1099,7 @@ mod tests {
         reset_library_state();
 
         assert!(super::is_available());
-        // `sticker.list` 拿到的就是这份清单：全部标签，且素材库关着时没有清单。
+        // `sticker_list` 拿到的就是这份清单：全部标签，且素材库关着时没有清单。
         assert_eq!(
             super::tool_listing().as_deref(),
             Some("开心"),
