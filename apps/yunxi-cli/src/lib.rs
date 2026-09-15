@@ -25,12 +25,13 @@ pub use state::{
 use yunxi_core::{
     ActionArbiter, ActionArbiterConfig, ActionCapability, ActionDescriptor, ActionPort,
     ActionPortError, ActionPortFuture, ActionPortOutcome, ActionRejection, ActionResult,
-    AutonomousConversationTickEvent, AutonomyPolicy, CognitiveRuntime, ConversationId,
-    ConversationKind, ConversationLifecycle, ConversationLifecycleError, ConversationTurnDirective,
-    CoreServices, DecisionDisposition, DecisionPlan, EnvironmentCapabilities, EventPriority,
-    EventScope, MemoryStore, MessageContent, ModelBackend as CoreModelBackend, OpenLoopDraft,
-    OpenLoopKind, OpenLoopOwner, OpenLoopStore, PersonId, PlannedProcessingOutcome, PlannerError,
-    PlannerInput, ProposedAction, RuntimeConfig, StateUpdateProposal, WorldEvent, WorldEventKind,
+    AutonomousConversationTickEvent, AutonomousTurnDisposition, AutonomyPolicy, CognitiveRuntime,
+    CognitiveTurnObserver, ConversationId, ConversationKind, ConversationLifecycle,
+    ConversationLifecycleError, ConversationTurnDirective, CoreServices, DecisionDisposition,
+    DecisionPlan, EnvironmentCapabilities, EventPriority, EventScope, MemoryStore, MessageContent,
+    ModelBackend as CoreModelBackend, OpenLoopDraft, OpenLoopKind, OpenLoopOwner, OpenLoopStore,
+    PersonId, PlannerError, PlannerInput, ProposedAction, RuntimeConfig, RuntimeHandle,
+    StateUpdateProposal, TurnReport, WorldEvent, WorldEventKind,
 };
 
 /// Input marker used for autonomous turns in the optional CLI journal.
@@ -287,6 +288,7 @@ pub struct CliHost<M, E> {
     arbiter: ActionArbiter,
     person_id: PersonId,
     conversation_id: ConversationId,
+    runtime_handle: RuntimeHandle,
     runtime: Mutex<CognitiveRuntime>,
     journal: Option<Arc<CliJournal>>,
     core_state: Arc<CliCoreState>,
@@ -330,7 +332,7 @@ where
         let model = Arc::new(model);
         let person_id = PersonId::new();
         let core_state = Arc::new(CliCoreState::in_memory_for(person_id, conversation_id));
-        let (_, runtime) = CognitiveRuntime::new_with_services(
+        let (runtime_handle, runtime) = CognitiveRuntime::new_with_services(
             RuntimeConfig::default(),
             core_services(&model, &core_state),
         )
@@ -346,6 +348,7 @@ where
             arbiter,
             person_id,
             conversation_id,
+            runtime_handle,
             runtime: Mutex::new(runtime),
             journal: None,
             core_state,
@@ -378,6 +381,30 @@ where
             .get_mut()
             .expect("owned CLI autonomy retry lock cannot be poisoned") = None;
         self.core_state = core_state;
+        self
+    }
+
+    /// Declares an additional Core action capability for this host.
+    ///
+    /// Core's arbiter refuses any action the host has not declared, so a model
+    /// that asks for a tool gets nowhere until the host advertises the
+    /// capability. This is also how a host exercises the driver's tool
+    /// follow-up path without changing the default demo surface.
+    #[must_use]
+    pub fn with_action_capability(mut self, capability: ActionCapability) -> Self {
+        let mut config = self.arbiter.config().clone();
+        if !config
+            .capabilities
+            .actions()
+            .iter()
+            .any(|descriptor| descriptor.capability == capability)
+        {
+            config
+                .capabilities
+                .actions
+                .push(ActionDescriptor::new(capability));
+        }
+        self.arbiter = ActionArbiter::new(config);
         self
     }
 
@@ -511,9 +538,9 @@ where
             .remember_message(self.conversation_id, input, occurred_at)
             .map_err(CliError::State)
             .and_then(|_| self.run_event(event))
-            .and_then(|(plan, response)| {
+            .and_then(|(report, response)| {
                 if response_is_delivered(&response) {
-                    self.record_reactive_outbound(occurred_at, &plan)?;
+                    self.record_reactive_outbound(occurred_at, &report)?;
                 }
                 Ok(response)
             });
@@ -584,20 +611,33 @@ where
         );
         let result = self.run_event(event);
         let host_result = match result {
-            Ok((plan, response)) => {
-                let delivered = response_is_delivered(&response);
-                // A silent autonomous turn is a valid decision to pause. Do
-                // not turn a missing directive into an implicit Continue,
-                // otherwise a model that returns an empty plan is polled in
-                // a tight loop forever. A visible delivery may continue by
-                // default; an explicit model directive still wins.
-                let directive =
-                    plan_directive(&plan, self.conversation_id).unwrap_or(if delivered {
-                        ConversationTurnDirective::Continue
-                    } else {
-                        ConversationTurnDirective::Wait
-                    });
-                self.finish_autonomous_claim(occurred_at, delivered, directive)?;
+            Ok((report, response)) => {
+                // Core classified the turn: it decided whether the claim may be
+                // retried and, if not, what continuation this turn earned. A
+                // silent turn is a valid decision to pause, so a missing
+                // directive never becomes an implicit Continue.
+                match report.autonomous {
+                    Some(AutonomousTurnDisposition::Retry) => {
+                        self.release_autonomous_claim_for_retry(occurred_at)?;
+                        return Ok(Some(response));
+                    }
+                    Some(AutonomousTurnDisposition::Finish {
+                        delivered,
+                        directive,
+                    }) => {
+                        self.finish_autonomous_claim(occurred_at, delivered, directive)?;
+                    }
+                    None => {
+                        // The final turn was not an autonomous one, which can
+                        // only happen if the driver consumed something else
+                        // first. Treat it as an unproductive turn.
+                        self.finish_autonomous_claim(
+                            occurred_at,
+                            false,
+                            ConversationTurnDirective::Wait,
+                        )?;
+                    }
+                }
                 *self.autonomy_retry_after.lock().map_err(|_| {
                     CliError::Runtime("CLI autonomy retry lock poisoned".to_owned())
                 })? = None;
@@ -612,36 +652,59 @@ where
         finish_journal(journal.as_deref(), journal_sequence, host_result).map(Some)
     }
 
-    fn run_event(&self, event: WorldEvent) -> Result<(DecisionPlan, HostResponse), CliError> {
+    /// Submits one event to Core and drives the resulting cycle.
+    ///
+    /// Returns what Core decided for the final turn along with the host
+    /// response. The driver owns the loop: it plans, dispatches, and feeds
+    /// action results back as follow-up events, so a plan that asks for a tool
+    /// carries its result back to the model instead of ending the cycle.
+    fn run_event(&self, event: WorldEvent) -> Result<(TurnReport, HostResponse), CliError> {
         let mut runtime = self
             .runtime
             .lock()
             .map_err(|_| CliError::Runtime("runtime lock poisoned".to_owned()))?;
+        // The event must be in Core's queue before the driver runs: the driver
+        // pulls work, it is not handed a single event.
+        block_on(self.runtime_handle.submit(event))
+            .map_err(|error| CliError::Runtime(format!("core event submission failed: {error}")))?;
         let action_port = CliActionPort {
             environment: &self.environment,
             core_state: &self.core_state,
         };
-        let outcome = block_on(runtime.process_event_with_planner_and_actions(
-            event,
+        let mut observer = CliTurnObserver::default();
+        block_on(yunxi_core::drain(
+            &mut runtime,
             &self.arbiter,
             &action_port,
-        ))
-        .map_err(CliError::Planner)?;
-        let PlannedProcessingOutcome::Planned { plan, actions, .. } = outcome else {
+            &mut observer,
+        ));
+        if let Some(error) = observer.planner_error {
+            return Err(CliError::Runtime(format!("planner error: {error}")));
+        }
+        let Some(report) = observer.turns.pop() else {
             return Err(CliError::Runtime(
                 "runtime rejected the CLI event".to_owned(),
             ));
         };
-        let response = response_from_actions(&plan, actions)?;
-        Ok((plan, response))
+        let Some(plan) = report.plan() else {
+            return Err(CliError::Runtime(
+                "runtime rejected the CLI event".to_owned(),
+            ));
+        };
+        let actions = report.actions().unwrap_or_default();
+        let response = response_from_actions(plan, actions.to_vec())?;
+        Ok((report, response))
     }
 
     fn record_reactive_outbound(
         &self,
         occurred_at: DateTime<Utc>,
-        plan: &DecisionPlan,
+        report: &TurnReport,
     ) -> Result<(), CliError> {
-        let directive = plan_directive(plan, self.conversation_id)
+        // Core already extracted the planner's continuation directive for this
+        // turn; a visible reply without one continues the exchange.
+        let directive = report
+            .expected_directive
             .unwrap_or(ConversationTurnDirective::Continue);
         let mut lifecycle = self
             .lifecycle
@@ -713,22 +776,6 @@ fn finish_journal(
 
 fn response_is_delivered(response: &HostResponse) -> bool {
     matches!(response, HostResponse::Delivered { .. })
-}
-
-fn plan_directive(
-    plan: &DecisionPlan,
-    conversation_id: ConversationId,
-) -> Option<ConversationTurnDirective> {
-    plan.state_updates.iter().find_map(|update| {
-        let StateUpdateProposal::ConversationDirective {
-            conversation_id: target,
-            directive,
-        } = update
-        else {
-            return None;
-        };
-        (*target == conversation_id).then_some(*directive)
-    })
 }
 
 fn response_from_actions(
@@ -861,6 +908,31 @@ where
                 })
             }),
             _ => self.environment.execute(action),
+        }
+    }
+}
+
+/// Records what Core decided while the CLI drives its loop.
+///
+/// The CLI keeps no external lease, so its cancellation query never refuses an
+/// event; the observer exists to collect the final turn and surface a planner
+/// failure that the old single-step call returned directly.
+#[derive(Debug, Default)]
+struct CliTurnObserver {
+    turns: Vec<TurnReport>,
+    /// The driver reports planner errors by reference and `PlannerError` is not
+    /// `Clone`, so the message is captured rather than the value.
+    planner_error: Option<String>,
+}
+
+impl CognitiveTurnObserver for CliTurnObserver {
+    fn on_turn(&mut self, _event: &WorldEvent, report: &TurnReport) {
+        self.turns.push(report.clone());
+    }
+
+    fn on_planner_error(&mut self, _event: &WorldEvent, error: &PlannerError) {
+        if self.planner_error.is_none() {
+            self.planner_error = Some(error.to_string());
         }
     }
 }

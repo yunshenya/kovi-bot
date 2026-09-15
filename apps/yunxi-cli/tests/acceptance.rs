@@ -2,7 +2,7 @@ use std::fs::OpenOptions;
 use std::future::Future;
 use std::io::Write;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::thread;
 
@@ -12,6 +12,7 @@ use yunxi_cli::{
     JournalRecord, MAX_CLI_OPEN_LOOPS_PER_OWNER, MAX_JOURNAL_INPUT_BYTES,
 };
 use yunxi_core::{
+    ActionCapability, ActionPort, ActionPortError, ActionPortFuture, ActionPortOutcome,
     AutonomyPolicy, ConversationId, ConversationTurnDirective, DecisionDisposition, DecisionPlan,
     MessageContent, ModelBackend as CoreModelBackend, OpenLoopDraft, OpenLoopKind, OpenLoopOwner,
     OpenLoopStore, PlannerInput, ProposedAction, WorldEventKind,
@@ -533,4 +534,94 @@ where
             Poll::Pending => thread::yield_now(),
         }
     }
+}
+
+/// A model whose first turn asks for a tool and whose second turn answers from
+/// the tool result. It can only reach that second turn if the host runs Core's
+/// cycle instead of a single step.
+#[derive(Debug, Clone, Copy)]
+struct ToolThenReplyModel;
+
+impl CoreModelBackend for ToolThenReplyModel {
+    fn plan<'a>(&'a self, input: &'a PlannerInput) -> yunxi_core::ModelBackendFuture<'a> {
+        Box::pin(async move {
+            let intent = match input.event.kind() {
+                WorldEventKind::MessageReceived(message) => yunxi_core::CognitiveIntent::UseTool {
+                    tool_name: "cli.lookup".to_owned(),
+                    input: "{}".to_owned(),
+                    scope: yunxi_core::ActionScope::Conversation(message.conversation_id),
+                    notification_policy: yunxi_core::ToolNotificationPolicy::Final,
+                },
+                WorldEventKind::ToolCompleted(tool) if tool.requires_follow_up => {
+                    yunxi_core::CognitiveIntent::send_message(
+                        input
+                            .event
+                            .scope()
+                            .conversation_id()
+                            .expect("tool follow-up keeps its conversation"),
+                        MessageContent::text(format!("工具结果：{}", tool.output)),
+                    )
+                }
+                _ => return Ok(DecisionPlan::silent()),
+            };
+            Ok(DecisionPlan {
+                disposition: DecisionDisposition::Reply,
+                intents: vec![intent],
+                state_updates: Vec::new(),
+            })
+        })
+    }
+}
+
+/// Completes tools instead of delivering them, which is what makes Core queue a
+/// follow-up event and re-enter the loop with the result.
+#[derive(Debug, Default)]
+struct ToolEnvironment {
+    executions: Mutex<Vec<String>>,
+}
+
+impl ActionPort for ToolEnvironment {
+    fn execute<'a>(&'a self, action: &'a ProposedAction) -> ActionPortFuture<'a> {
+        let action = action.clone();
+        Box::pin(async move {
+            match &action {
+                ProposedAction::UseTool(tool) => {
+                    self.executions
+                        .lock()
+                        .expect("tool environment lock poisoned")
+                        .push(tool.tool_name.clone());
+                    Ok(ActionPortOutcome::ToolCompleted {
+                        operation: tool.tool_name.clone(),
+                        output: "晴，24 度".to_owned(),
+                    })
+                }
+                ProposedAction::SendMessage(message) => Ok(ActionPortOutcome::Delivered {
+                    external_reference: Some("tool-env-delivery".to_owned()),
+                    message_id: Some(yunxi_core::MessageId::new()),
+                    conversation_id: Some(message.conversation_id),
+                }),
+                _ => Err(ActionPortError::new("unsupported action", false)),
+            }
+        })
+    }
+}
+
+#[test]
+fn cli_drives_a_tool_follow_up_through_the_core_cycle() {
+    let environment = ToolEnvironment::default();
+    let host = CliHost::new(ToolThenReplyModel, environment, ConversationId::new())
+        .with_action_capability(ActionCapability::UseTool);
+
+    let response = host.process_line("今天天气怎么样").expect("response");
+    assert_eq!(
+        response,
+        HostResponse::Delivered {
+            message: "工具结果：晴，24 度".to_owned(),
+            external_reference: Some("tool-env-delivery".to_owned()),
+        }
+    );
+    assert_eq!(
+        host.environment().executions.lock().expect("lock").clone(),
+        vec!["cli.lookup".to_owned()]
+    );
 }
