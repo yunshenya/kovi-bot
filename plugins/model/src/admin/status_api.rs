@@ -155,6 +155,8 @@ async fn waiting_room_report() -> Value {
         // 自动回收的状态要一起给：卡片上那句"卡住了需要人来点"是否成立，取决于它。
         "auto_reclaim_enabled": traffic.turn_reclaim_enabled(),
         "reclaim_after_secs": traffic.turn_reclaim_secs(),
+        // 一轮的硬性时长上限（0 = 关闭）；卡片上要说清"这一轮最多能活多久"。
+        "turn_deadline_secs": traffic.turn_deadline_secs(),
         "scopes": scopes,
     })
 }

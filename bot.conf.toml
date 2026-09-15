@@ -286,6 +286,9 @@ window_stall_secs = 180
 # 阈值理由与步骤名见 bot.conf.example.toml 同名两项。
 turn_stall_secs = 300
 turn_reclaim_secs = 600
+# 一轮的硬性时长上限（0 = 关闭；理由与定值方法见 bot.conf.example.toml）。
+# 它管的是"活了多久"，与 turn_reclaim_secs 的"多久没推进"互补，必须 ≥ 后者。
+turn_deadline_secs = 0
 # 自动回收卡死的回合（默认关闭，理由与开启前该确认什么见 bot.conf.example.toml）。
 # 后台「等待房间」卡片上那个「回收这一轮」按钮走同一套判据与同一段代码。
 turn_reclaim_enabled = false

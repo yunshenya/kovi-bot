@@ -562,6 +562,9 @@
     const stuck = Number(info.stuck || 0);
     const idle = scopes.length === 0;
     const auto = Boolean(info.auto_reclaim_enabled);
+    // 单轮硬上限（0 = 关闭）。它和"自动回收"是两件事：那个管"多久没动静算死"，
+    // 这个管"一轮最多活多久"——每一步都还在慢慢动的长回合只有它能兜住。
+    const deadline = Number(info.turn_deadline_secs || 0);
     return h('div', { class: `card wait-card${stuck > 0 ? ' stalled' : ''}` },
       h('div', { class: 'card-head' },
         h('h3', { text: '等待房间' }),
@@ -586,6 +589,9 @@
           : h('div', { class: 'wait-list' }, scopes.map(waitingRoomRow))),
       h('div', { class: 'hint wait-foot' },
         `静默超过 ${formatWait(info.stalled_after_secs)} 判为疑似卡住；空闲会话不列出。`
+        + (deadline > 0
+          ? `单轮上限 ${formatWait(deadline)}：活过这个时长的回合会被直接判死。`
+          : '单轮上限未开启（traffic.turn_deadline_secs = 0）。')
         + (auto
           ? `自动回收已开启（超过 ${formatWait(info.reclaim_after_secs)} 的卡死回合会被自动判死）。`
           : `自动回收未开启：目前只记账、只打 [STALL] 日志，卡住了需要人来点「回收这一轮」。`)));

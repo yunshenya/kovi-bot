@@ -352,6 +352,12 @@ pub(crate) enum ReclaimReason {
     StalledTurn,
     /// 没有活跃回合了（那个任务已经没了），队列却还非空——新消息只会一直排队。
     OrphanedQueue,
+    /// 这一轮从开始到现在超过了硬上限（`traffic.turn_deadline_secs`）。
+    ///
+    /// 与 `StalledTurn` 是**两个不同的问题**：那个问"多久没动静算它死了"，
+    /// 这个问"一轮最多允许活多久"。前者可以很短，后者必须大于真实最坏回合，
+    /// 否则会误杀正常的长回合——所以它们是两个独立配置。
+    DeadlineExceeded,
 }
 
 impl ReclaimReason {
@@ -359,6 +365,7 @@ impl ReclaimReason {
         match self {
             Self::StalledTurn => "stalled_turn",
             Self::OrphanedQueue => "orphaned_queue",
+            Self::DeadlineExceeded => "deadline_exceeded",
         }
     }
 
@@ -366,6 +373,7 @@ impl ReclaimReason {
         match self {
             Self::StalledTurn => "回合超过回收阈值没有推进",
             Self::OrphanedQueue => "队列非空但已经没有排空任务",
+            Self::DeadlineExceeded => "这一轮超过了硬性时长上限",
         }
     }
 }
@@ -485,6 +493,55 @@ pub(crate) async fn reclaim_stalled(stall_after: Duration, reclaim_after: Durati
             continue;
         };
         if reclaim(scope, generation, reason).await.is_some() {
+            reclaimed += 1;
+        }
+    }
+    reclaimed
+}
+
+/// 这一轮是不是已经超过硬性时长上限。
+///
+/// 判据只看"从拿到回合到现在活了多久"（[`ScopeReport::turn_waiting_secs`]），
+/// 不看它在哪一步——因为要防的是"任何一处无界等待把整轮吞掉"，而不是某一个已知步骤。
+/// `deadline_secs == 0` 表示关闭。
+pub(crate) fn deadline_exceeded(report: &ScopeReport, deadline_secs: u64) -> bool {
+    deadline_secs > 0
+        && report.reply.is_active()
+        && report
+            .turn_waiting_secs
+            .is_some_and(|secs| secs >= deadline_secs)
+}
+
+/// 按硬性时长上限回收：这一轮活得太久，立刻判死并把支配权交回去。
+///
+/// 它与 [`reclaim`] 做的是同一件事（同一段代码、同一套幂等检查），区别只在**判据**：
+/// 这里不问"多久没推进"，只问"活了多久"。所以它能在"每一步都还在慢慢动、但整轮已经
+/// 跑了二十分钟"这种形态下兜住底——那种情况影子档会一直不报警，而对话其实早就废了。
+///
+/// **它不强杀那个任务**（Rust 里停在不可取消 await 上的 future 杀不掉），它做的是
+/// 把"这一轮的支配权"收回来，让队列继续往下走；原来那个任务即使后来醒了，手里的票
+/// 也已作废，任何一步都会被判成陈旧。语义与后台那个手动按钮完全一致。
+pub(crate) async fn reclaim_expired(deadline_secs: u64) -> usize {
+    if deadline_secs == 0 {
+        return 0;
+    }
+    let mut reclaimed = 0;
+    // 报告阈值用 0 秒：这里要的是"全部有在途回合的会话"，超时判定由 deadline 自己做，
+    // 不该被"卡住"阈值（window_stall_secs）先筛掉一批。
+    for report in report(Duration::ZERO).await {
+        if !deadline_exceeded(&report, deadline_secs) {
+            continue;
+        }
+        let Some(scope) = scope_of(report.kind, report.subject_id) else {
+            continue;
+        };
+        let Some(generation) = turn_generation(scope).await else {
+            continue;
+        };
+        if reclaim(scope, generation, ReclaimReason::DeadlineExceeded)
+            .await
+            .is_some()
+        {
             reclaimed += 1;
         }
     }
@@ -1044,6 +1101,77 @@ mod tests {
         };
         assert!(!is_stalled(&empty, 1));
         assert!(!should_reclaim(&empty, 1, 1));
+    }
+
+    /// 硬上限判据：只看"这一轮活了多久"，与"多久没推进"是两件事。
+    ///
+    /// 关键用例是最后那条：每一步都还在慢慢动（`step_secs` 很小、影子档不会报警），
+    /// 但整轮已经跑了二十分钟——那种形态只有硬上限能兜住。
+    #[test]
+    fn deadline_judges_total_turn_age_not_step_staleness() {
+        let stale_step = ScopeReport {
+            kind: "group",
+            subject_id: 1,
+            queued: 2,
+            oldest_queued_secs: Some(1_200),
+            oldest_sender: None,
+            oldest_preview: None,
+            processing: None,
+            drain_active: true,
+            drain_drained: 0,
+            drain_last_progress_secs: Some(1_200),
+            turn_step: Some("model"),
+            turn_step_secs: Some(1_200),
+            turn_waiting_secs: Some(1_200),
+            turn_observation: None,
+            ticket: None,
+            reply: ReplyStateSnapshot {
+                active_secs: Some(1_200),
+                ..ReplyStateSnapshot::default()
+            },
+            stuck: true,
+            stuck_reason: Some("排空任务还在，但已 1200 秒没有推进".to_string()),
+            summary: String::new(),
+        };
+        assert!(deadline_exceeded(&stale_step, 900));
+        assert!(
+            !deadline_exceeded(&stale_step, 0),
+            "0 是关闭，任何回合都不该被它判死"
+        );
+
+        // 每一步都在动：影子档看不到问题（step_secs 很小），硬上限照样兜住。
+        let slow_but_moving = ScopeReport {
+            turn_step_secs: Some(5),
+            turn_waiting_secs: Some(1_800),
+            stuck: false,
+            stuck_reason: None,
+            ..stale_step.clone()
+        };
+        assert!(
+            deadline_exceeded(&slow_but_moving, 900),
+            "整轮活了 1800 秒、每步都在动，也必须被判死"
+        );
+
+        // 空闲会话（没有在途回合）不该被硬上限碰。
+        let idle = ScopeReport {
+            turn_waiting_secs: None,
+            reply: ReplyStateSnapshot::default(),
+            stuck: false,
+            ..stale_step
+        };
+        assert!(!deadline_exceeded(&idle, 900));
+    }
+
+    /// 回收理由要能分辨"停住了"和"活太久了"——日志与接口回执都靠它说清凭什么。
+    #[test]
+    fn reclaim_reasons_are_distinguishable() {
+        assert_eq!(ReclaimReason::StalledTurn.label(), "stalled_turn");
+        assert_eq!(ReclaimReason::OrphanedQueue.label(), "orphaned_queue");
+        assert_eq!(ReclaimReason::DeadlineExceeded.label(), "deadline_exceeded");
+        assert_ne!(
+            ReclaimReason::DeadlineExceeded.describe(),
+            ReclaimReason::StalledTurn.describe()
+        );
     }
 
     /// 影子档那行日志：必须带步骤、时长与 `would_reclaim`，且正常回合一个字都不打。

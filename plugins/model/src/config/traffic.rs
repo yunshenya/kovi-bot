@@ -34,6 +34,15 @@ pub struct TrafficConfig {
     /// 影子日志里 `would_reclaim` 的阈值（秒）。真正回收时要等的就是这个数——
     /// 比 `turn_stall_secs` 更严，因为回收的代价是"她可能重复回一条"。
     turn_reclaim_secs: u64,
+    /// 一轮回复的硬性时长上限（秒，0 = 关闭）。
+    ///
+    /// 它回答的是"一轮**最多允许活多久**"，与 `turn_reclaim_secs`（"多久没推进算死"）
+    /// 是两个问题：前者可以很短，后者必须大于真实最坏回合，否则会误杀正常的长回合。
+    /// 超过上限就按 `crate::model::waiting_room::reclaim_expired` 判死这一轮、
+    /// 把支配权交回去，队列继续补答。
+    ///
+    /// 默认 0（关闭）：阈值要拿影子档量出来的"正常回合最长多久"来定，不能拍脑袋。
+    turn_deadline_secs: u64,
     /// 自动回收卡死的回合。**默认关闭**，要先跑够影子档再说。
     ///
     /// 打开之后：等待房间看门狗每轮扫描时，对"静默超过 `turn_reclaim_secs` 且没有
@@ -91,6 +100,10 @@ impl TrafficConfig {
         self.turn_reclaim_enabled
     }
 
+    pub fn turn_deadline_secs(&self) -> u64 {
+        self.turn_deadline_secs
+    }
+
     pub fn max_input_chars(&self) -> usize {
         self.max_input_chars
     }
@@ -144,6 +157,15 @@ impl TrafficConfig {
                 "traffic.turn_reclaim_secs 必须不小于 turn_stall_secs 且不超过 7200"
             ));
         }
+        // 硬上限必须**大于**自动回收阈值：比它还小等于"还没判成卡死就已经超时"，
+        // 两条判据会互相打架（谁先命中取决于扫描顺序，行为不可预测）。
+        if self.turn_deadline_secs != 0
+            && !(self.turn_reclaim_secs.max(60)..=7_200).contains(&self.turn_deadline_secs)
+        {
+            return Err(anyhow::anyhow!(
+                "traffic.turn_deadline_secs 必须是 0（关闭）或不小于 turn_reclaim_secs 且不超过 7200"
+            ));
+        }
         if !(256..=32_000).contains(&self.max_input_chars) {
             return Err(anyhow::anyhow!(
                 "traffic.max_input_chars 必须在 256 到 32000 之间"
@@ -176,6 +198,7 @@ impl Default for TrafficConfig {
             window_stall_secs: 180,
             turn_stall_secs: 300,
             turn_reclaim_secs: 600,
+            turn_deadline_secs: 0,
             turn_reclaim_enabled: false,
             max_input_chars: 6_000,
             max_model_response_bytes: 2 * 1024 * 1024,
@@ -267,6 +290,30 @@ mod tests {
     fn automatic_reclaim_is_off_by_default() {
         let config = TrafficConfig::default();
         assert!(!config.turn_reclaim_enabled());
+        assert_eq!(
+            config.turn_deadline_secs(),
+            0,
+            "硬上限也要先跑够影子档再定值"
+        );
         assert!(config.validate().is_ok());
+    }
+
+    /// 硬上限与自动回收阈值必须可共存、且不互相打架。
+    #[test]
+    fn turn_deadline_must_sit_above_the_reclaim_threshold() {
+        let mut config = TrafficConfig {
+            turn_deadline_secs: 900,
+            ..TrafficConfig::default()
+        };
+        assert!(config.validate().is_ok(), "900 > turn_reclaim_secs(600)");
+
+        config.turn_deadline_secs = 599;
+        assert!(config.validate().is_err(), "比回收阈值还小等于两条判据打架");
+        config.turn_deadline_secs = 7_201;
+        assert!(config.validate().is_err());
+        config.turn_deadline_secs = 600;
+        assert!(config.validate().is_ok(), "等于回收阈值是允许的");
+        config.turn_deadline_secs = 0;
+        assert!(config.validate().is_ok(), "0 = 关闭");
     }
 }
