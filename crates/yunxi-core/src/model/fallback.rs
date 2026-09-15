@@ -186,20 +186,26 @@ impl CognitiveModelStack {
                 }
             }
             ModelSelection::Intrinsic => {
-                if input.executive.version > 0
-                    && Self::select_from_capability(
-                        &input.executive.cognitive_capability,
-                        input_requires_vision(input),
-                    ) != ModelSelection::Intrinsic
-                {
-                    // A capability transition can happen between input
-                    // construction and invocation. Never call an Intrinsic
-                    // backend after the versioned snapshot says it cannot
-                    // serve this request.
-                    self.metrics
-                        .reflex_selections
-                        .fetch_add(1, Ordering::Relaxed);
-                    return Err(ModelBackendError::Unavailable);
+                // 复检必须用**和 `select` 同一份**能力快照：`select` 会把
+                // `strong_available` 按"强档是否真的装了"掩掉，这里若直接用原始
+                // 快照，一个过期的 strong 位就会让复检判成 Strong ≠ Intrinsic，
+                // 于是 Intrinsic 永远不被调用、每次 complete 都 Unavailable
+                // （与上面那句注释说的正好相反）。
+                if input.executive.version > 0 {
+                    let mut capability = input.executive.cognitive_capability.clone();
+                    capability.strong_available &= self.strong.is_some();
+                    if Self::select_from_capability(&capability, input_requires_vision(input))
+                        != ModelSelection::Intrinsic
+                    {
+                        // A capability transition can happen between input
+                        // construction and invocation. Never call an Intrinsic
+                        // backend after the versioned snapshot says it cannot
+                        // serve this request.
+                        self.metrics
+                            .reflex_selections
+                            .fetch_add(1, Ordering::Relaxed);
+                        return Err(ModelBackendError::Unavailable);
+                    }
                 }
                 self.metrics.intrinsic_calls.fetch_add(1, Ordering::Relaxed);
                 self.intrinsic.complete(input).await

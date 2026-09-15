@@ -339,6 +339,33 @@ mod tests {
         assert_eq!(intrinsic_fallback.calls.load(Ordering::Relaxed), 1);
     }
 
+    #[tokio::test]
+    async fn a_stale_strong_bit_degrades_to_intrinsic_instead_of_failing() {
+        // `select` 会把 `strong_available` 按"强档是否真的装了"掩掉，而 Intrinsic
+        // 那条复检此前用的是**原始**能力快照。于是一份还写着 strong_available 的
+        // 旧快照会让复检判出 Strong ≠ Intrinsic，直接返回 Unavailable——Intrinsic
+        // 永远不被调用，每次 complete 都失败（与那句注释承诺的降级正好相反）。
+        let intrinsic = Arc::new(CountingBackend::success());
+        let stack = CognitiveModelStack::new(
+            Arc::clone(&intrinsic) as Arc<dyn ModelBackend>,
+            None,
+            ModelFallbackPolicy::default(),
+        )
+        .expect("fallback policy should validate");
+        let mut stale = input();
+        stale.executive.version = 7;
+        stale.executive.cognitive_capability.preferred_tier = CognitiveTier::Standard;
+        stale.executive.cognitive_capability.strong_available = true;
+        // Intrinsic 自己得先"能服务"，否则选择器按设计退到 Reflex 而不是 Intrinsic。
+        stale.executive.cognitive_capability.intrinsic_health = ModelHealth::Healthy;
+        stale.executive.cognitive_capability.text_available = true;
+        stack
+            .complete_with_selection(&stale)
+            .await
+            .expect("过期的强档位应当降级到 Intrinsic，而不是直接失败");
+        assert_eq!(intrinsic.calls.load(Ordering::Relaxed), 1);
+    }
+
     #[test]
     fn manifest_rejects_audio_and_unsafe_asset_paths() {
         let mut manifest = IntrinsicModelManifest {
