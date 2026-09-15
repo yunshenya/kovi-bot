@@ -1031,3 +1031,20 @@ JSON 对象就整条作废（registry 工具的行为不动），并有一条跨
 3. 顺带修（`e26c02a`）：`CORE_REPLY_REPAIR_PROMPT` 与 `core_tool_follow_up_instruction` 两处生产
    提示词还在教模型手写 `[[TOOL_CALL]]` 标记，而代码那条通道不带工具、校验器又一律拒收标记，
    照做必败；已改成 function-calling 口径。
+
+### 11.10 审到但未处理（本轮范围外，留作决定）
+
+迁移过程中顺手审到两处，都**不在** §11.9 的范围里，改动会影响别的子系统的实际提示词，所以只记不改：
+
+1. **对话摘要器被要求"直接回应用户"。** `utils.rs` 的 `summarize_conversation` 走的是
+   `memory_query::interruptible_model_call`（`ModelPromptMode::LegacyReplyGuidance`），那条路会在请求
+   末尾附一份 `generate_reply_guidance`——"本轮回复要求：先直接回应用户当前真正想问或表达的内容……情绪=X，
+   强度=Y/10"。而摘要器自己的 system 提示词写的是"你是聊天记录压缩器……只输出摘要，不要回答对话"。
+   两条指令互相矛盾，且没有任何测试覆盖这条请求的组装。看起来是"通用模型调用"与"回复专用调用"没分开
+   的历史遗留。**建议**：摘要那条改走 `interruptible_model_call_without_reply_guidance`（或给它一个
+   专用 mode）；但这会改变每次会话压缩发给模型的提示词，属于"要拿摘要质量做取舍"，故先问。
+2. **`ModelGateway::complete_without_tools` 已无调用者**（本身带 `#[allow(dead_code)]`，本次迁移之前就
+   是死代码）。与第 1 条相关：如果摘要那条改走不带引导的路，我这次迁移顺带删掉的最后一个生产调用者
+   之外就再无用户，`interruptible_model_call` + `LegacyReplyGuidance` + `params_model_with_token_limit_
+   and_progress_for_reply` 会整条变成死链——那时可以一次删干净。现在删会连带删掉一个仍在用的入口，
+   所以留到第 1 条定了再动。
