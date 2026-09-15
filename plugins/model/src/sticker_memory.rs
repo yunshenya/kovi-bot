@@ -3,7 +3,7 @@
 //! 保存 OneBot 表情/图片的稳定标识、人工教会的含义和轻量使用记录；不下载或保存图片文件。
 
 use crate::memory::MEMORY_MANAGER;
-use crate::model::utils::{BotMemory, Roles, params_model_with_token_limit};
+use crate::model::utils::{BotMemory, Roles, params_model_without_reply_guidance};
 use crate::vision::{ImageAttachment, extract_image_attachments};
 use anyhow::{Result, anyhow};
 use chrono::{Duration as ChronoDuration, Utc};
@@ -1076,7 +1076,13 @@ async fn generate_candidate_suggestion(
             ),
         },
     ];
-    let response = params_model_with_token_limit(&mut messages, Some(180), &[]).await;
+    // 这是一次**严格 JSON 的抽取任务**，不是聊天回合：走不带回复引导的那条路。
+    // 原先走的 `params_model_with_token_limit` 会在请求末尾附一份
+    // `generate_reply_guidance`（"本轮回复要求：先直接回应用户当前真正想问或表达的内容……
+    // 情绪=X"），与上面那句"只输出严格 JSON、不要聊天回复"直接矛盾，还挤占 180 token 的预算；
+    // 失败又是静默的（解析不出 JSON 就 `Ok(None)`），所以她可能永远不产出含义候选。
+    let response =
+        params_model_without_reply_guidance(&mut messages, Some(180), &[], None, None).await;
     let Some(suggestion) = parse_candidate_suggestion(&response.content) else {
         return Ok(None);
     };

@@ -4808,6 +4808,70 @@ mod tests {
         });
     }
 
+    /// 非聊天任务不该被附"本轮回复要求：先直接回应用户……"。
+    ///
+    /// 这条守卫是有来历的：对话摘要器（`6229ea2`）与表情含义候选整理器（`params_model_
+    /// without_reply_guidance` 这条路）都是**严格 JSON / 摘要**任务，却被附过一段回复风格
+    /// 引导——与它们自己的 system 提示词直接矛盾，而且失败是静默的（解析不出来就当没有
+    /// 结果）。两个实例都出自"随便挑了一个调模型的入口"，所以这里盯着组装结果本身。
+    #[test]
+    fn non_chat_model_calls_do_not_carry_reply_style_prompts() {
+        use std::sync::{Arc, Mutex};
+
+        let executor = kovi::tokio::runtime::Runtime::new().expect("test runtime");
+        executor.block_on(async {
+            let captured: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+            let sink = Arc::clone(&captured);
+            let mut messages = vec![
+                BotMemory {
+                    role: Roles::System,
+                    content: "你是表情含义候选整理器。只输出严格 JSON，不要聊天回复。".to_string(),
+                },
+                BotMemory {
+                    role: Roles::User,
+                    content: "样本 1：用户消息：哈哈哈哈".to_string(),
+                },
+            ];
+            let _ = crate::model::llm_mock::with_mock_model(
+                "no-reply-guidance",
+                move |request| {
+                    *sink.lock().expect("capture lock") = Some(request.clone());
+                    "{}".to_string()
+                },
+                async {
+                    super::params_model_without_reply_guidance(
+                        &mut messages,
+                        Some(180),
+                        &[],
+                        None,
+                        None,
+                    )
+                    .await
+                },
+            )
+            .await;
+
+            let body = captured
+                .lock()
+                .expect("capture lock")
+                .clone()
+                .expect("替身必须收到请求体");
+            let serialized = body.to_string();
+            assert!(
+                serialized.contains("只输出严格 JSON"),
+                "原始 system 提示词必须在请求里"
+            );
+            assert!(
+                !serialized.contains("本轮回复要求"),
+                "抽取任务不该被要求'先直接回应用户': {serialized}"
+            );
+            assert!(
+                !serialized.contains("语气参考"),
+                "抽取任务不该被附语气参考: {serialized}"
+            );
+        });
+    }
+
     #[test]
     fn private_only_commands_are_recognised_so_groups_can_drop_them() {
         // 群聊路径靠这个判据把私聊专用命令挡在聊天链路之外。
