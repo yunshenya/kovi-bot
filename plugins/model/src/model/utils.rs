@@ -1316,7 +1316,20 @@ pub(crate) fn likely_requires_tool_protocol(content: &str) -> bool {
     }
     // 精确表只保留"无疑问词、无动词"的名词句;其余时间/日期表达一律
     // 由 question_shape + TOOL_TARGETS 泛化匹配,避免逐字表越堆越长。
-    matches!(text.as_str(), "天气" | "天气预报" | "现在时间")
+    if matches!(text.as_str(), "天气" | "天气预报" | "现在时间") {
+        return true;
+    }
+
+    // 动作类请求（撤回自己先前的消息、@ 某人、引用）不是查询，但同样需要"工具在手"：
+    // Host 那条路要用 `reply_action`，Core 那条路要用 `message.recall*`。
+    //
+    // 这里复用 `reply_action_tool_requested`（它已经是"命令 vs 讨论"这条判据的既有实现），
+    // 而不是在关键词表里再堆一遍"撤回你/撤回刚才/撤回一下…"这种排列组合。
+    //
+    // 它同时补上一个既有的口径漏洞：动作字段的说明里写着"候选里没有唯一目标时先调
+    // group_members_search"，可那一轮要是只挂了 `reply_action`，她根本没有这个工具可调——
+    // "提示词点名了工具、她手里却没有"正是这个仓库反复踩过的坑。
+    reply_action_tool_requested(content)
 }
 
 /// Catch a negation followed by a short politeness filler (for example
@@ -4748,6 +4761,42 @@ mod tests {
     /// without_reply_guidance` 这条路）都是**严格 JSON / 摘要**任务，却被附过一段回复风格
     /// 引导——与它们自己的 system 提示词直接矛盾，而且失败是静默的（解析不出来就当没有
     /// 结果）。两个实例都出自"随便挑了一个调模型的入口"，所以这里盯着组装结果本身。
+    /// 动作类请求必须进工具轮：不然"撤回/@/引用"那一轮她手里什么都没有。
+    ///
+    /// 线上现场（2026-09-15 18:32，群 641996763）："撤回你刚刚发的消息"这一轮归 Core，
+    /// 而 Core 只在 `tool_intent` 为真时才下发工具——判据里没有"撤回"，于是她手里没有任何
+    /// 撤回工具，只能回一句"我这边没有撤回权限"。这里同时守住反面：讨论这类动作的说法
+    /// 仍然留在普通文本路径上，不能因为加了几个动作词就把整类闲聊拉进工具轮。
+    #[test]
+    fn action_requests_reach_the_tool_turn_while_discussing_them_stays_plain() {
+        for request in [
+            "撤回你刚刚发的消息",
+            "撤回吧",
+            "收回刚才那句",
+            "把刚才那条删掉",
+            "@我一下",
+            "引用这条回我",
+        ] {
+            assert!(
+                likely_requires_tool_protocol(request),
+                "动作请求必须进工具轮：{request}"
+            );
+        }
+        for discussion in [
+            "撤回是什么意思",
+            "这个 @ 符号在群里是什么意思？",
+            "引用这条消息是什么意思？",
+            "请解释一下怎么撤回消息",
+            "删除消息这个功能怎么用？",
+            "艾特和提及有什么区别？",
+        ] {
+            assert!(
+                !likely_requires_tool_protocol(discussion),
+                "讨论动作的说法不该进工具轮：{discussion}"
+            );
+        }
+    }
+
     #[test]
     fn non_chat_model_calls_do_not_carry_reply_style_prompts() {
         use std::sync::{Arc, Mutex};
