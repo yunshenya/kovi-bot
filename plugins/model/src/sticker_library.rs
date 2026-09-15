@@ -380,38 +380,6 @@ static INDEX: LazyLock<Mutex<StickerIndex>> = LazyLock::new(|| Mutex::new(Sticke
 static USE_COUNTS: LazyLock<Mutex<HashMap<String, u64>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// 这条消息是不是在说"图"这件事：表情包、贴纸、斗图，以及**她自己的照片**。
-///
-/// 用来做**信号驱动的清单注入**：被问到库里有什么的时候，把标签清单直接放进这一轮
-/// 的提示词，而不是指望她自己想到去调 `sticker.list`。线上 2026-09-15 02:15 就是
-/// 栽在这上面：有人 @ 她问"你现在有哪些表情包"，她一次都没调工具（`tool_calls=0`），
-/// 直接凭印象编了个「猫猫歪头」，然后连发两次都发不出去。
-///
-/// 只在命中时花那几十个 token，比把清单常驻提示词便宜得多。
-///
-/// 相册语义也要按这个判据注入：素材库就是她自己的图库，带她名字的那张就是她本人的
-/// 照片（见 `yunxi/core_model.rs` 的 `CORE_STICKER_INSTRUCTION`）。所以"要她的照片"
-/// 与"要表情包"是同一类请求——只认表情包那几个词，她就会在"发我看看你的照片"这种
-/// 消息上拿不到相册语义（线上 2026-09-15 13:20 就是这么答成"那不是我真人的样子"的）。
-pub(crate) fn asks_about_stickers(text: &str) -> bool {
-    const NEEDLES: [&str; 12] = [
-        "表情包",
-        "表情",
-        "贴纸",
-        "斗图",
-        "照片",
-        "相册",
-        "自拍",
-        "sticker",
-        "meme",
-        "photo",
-        "album",
-        "selfie",
-    ];
-    let lowered = text.to_ascii_lowercase();
-    NEEDLES.iter().any(|needle| lowered.contains(needle))
-}
-
 /// "只发一张表情、但那张取不到"时宿主补的一句话。
 ///
 /// 绝不整轮沉默：她把一张表情当成了整条回复，取不到就什么都不发的话，群里看到的
@@ -443,27 +411,74 @@ pub(crate) fn available_labels() -> Vec<String> {
     labels_snapshot().into_keys().collect()
 }
 
+/// 表情包说明的开头与结尾：**真实清单拼在中间**，素材库空了或关了才整段不给。
+///
+/// 为什么清单常驻（2026-09-15 用户口径：不拦截她的回复，修源头）：旧实现平时只给一句
+/// "先调 sticker.list 拿标签"，只有消息命中"表情包/照片"这类词时才把清单塞进来。于是
+/// 在没命中的回合里她**根本不知道自己有什么**，只能凭印象编——线上 02:15 编了个
+/// "猫猫歪头"连发两次发不出去，13:21 又答应"等下发给你"而相册里没有那张图。写错了再
+/// 拦（把她的回复丢掉重写一轮）只是按住症状，源头是"她不知道"。
+///
+/// 代价是每轮多几十个 token；素材库只有几张图时这就是几十个字。真长到几百个标签时
+/// 只列前 [`LABEL_PROMPT_MAX`] 个，其余报个数、让她需要时自己调 `sticker.list`。
+pub(crate) const LABEL_PROMPT_HEAD: &str =
+    "素材库就是你自己的相册（图都是你的）。现在能发的图（标签）：";
+pub(crate) const LABEL_PROMPT_TAIL: &str = "。想发哪张就把 [[STICKER 标签]] 写在正文最前面（不展示，正文可留空），标签照抄上面的、别自己起名字。带你自己名字的标签就是你本人的照片：有人要看你的照片，就把那张发出去，不要说那不是你。";
+/// 常驻提示词里最多列多少个标签。
+pub(crate) const LABEL_PROMPT_MAX: usize = 40;
+
+/// 提示词里那段表情包说明（带真实清单）：Core 与宿主两条链路共用这一份。
+///
+/// 素材库关闭或为空时返回 `None`——那种情况下不能告诉她"你可以发图"，否则她只会写出
+/// 一张永远发不出去的标记。
+pub(crate) fn prompt_instruction() -> Option<String> {
+    let (listing, total) = prompt_listing(LABEL_PROMPT_MAX)?;
+    let mut instruction = String::from(LABEL_PROMPT_HEAD);
+    instruction.push_str(&listing);
+    if total > LABEL_PROMPT_MAX {
+        instruction.push_str(&format!(
+            "（还有 {} 个没列出，需要时调 sticker.list 看全）",
+            total - LABEL_PROMPT_MAX
+        ));
+    }
+    instruction.push_str(LABEL_PROMPT_TAIL);
+    Some(instruction)
+}
+
 /// `sticker.list` 工具返回给模型的清单：**全部**标签（`A；B；C`）。
 ///
-/// 这份清单不再常驻提示词：目录一大，每轮都带上它就是白花钱（60 个标签的清单
-/// 加说明约 400 token/轮，而发表情包一天也就几次）。改成她真要发的时候调一次
-/// 工具拿，只有在那一刻才付这几十上百个 token。
-///
-/// 素材库关闭或为空时返回 `None`——那种情况下工具本身也不会下发给模型。
+/// 清单现在也常驻提示词（见 [`prompt_listing`]），这个工具留给两种情况：清单太长被
+/// 截断时看全，以及她自己想再确认一次。素材库关闭或为空时返回 `None`——那种情况下
+/// 工具本身也不会下发给模型。
 pub(crate) fn tool_listing() -> Option<String> {
     let labels = labels_snapshot();
     if labels.is_empty() {
         return None;
     }
-    let total = labels.len();
-    let listed = labels.into_keys().collect::<Vec<_>>();
-    let mut listing = listed.join("；");
-    // `max_files` 就是收录上限，正常到不了这里；留一句是为了万一被截断时
-    // 别让她以为"素材库就这么点"。
-    if total > listed.len() {
-        listing.push_str(&format!("（另有 {} 个未列出）", total - listed.len()));
+    Some(labels.into_keys().collect::<Vec<_>>().join("；"))
+}
+
+/// 提示词里那份清单：最多 `max_labels` 个标签，连同标签总数一起返回。
+///
+/// **为什么要常驻**（2026-09-15 用户口径：不拦截她的回复，修源头）：旧实现平时只给一句
+/// "先调 sticker.list 拿标签"，只有消息命中"表情包/照片"这类词时才把清单塞进去，于是
+/// 没命中的回合里她根本不知道自己有什么，只能凭印象编——线上 02:15 编了个"猫猫歪头"
+/// 连发两次发不出去，13:21 又答应"等下发给你"而相册里没有那张图。写错了再拦只是按住
+/// 症状，源头是"她不知道"。
+///
+/// 素材库关闭或为空时返回 `None`（连协议都不给）。
+pub(crate) fn prompt_listing(max_labels: usize) -> Option<(String, usize)> {
+    let labels = labels_snapshot();
+    if labels.is_empty() {
+        return None;
     }
-    Some(listing)
+    let total = labels.len();
+    let listing = labels
+        .into_keys()
+        .take(max_labels.max(1))
+        .collect::<Vec<_>>()
+        .join("；");
+    Some((listing, total))
 }
 
 fn labels_snapshot() -> BTreeMap<String, Vec<PathBuf>> {
@@ -998,29 +1013,6 @@ mod tests {
         assert_eq!(extension_for_image(b"BM____"), Some("bmp"));
         assert_eq!(extension_for_image(b"RIFF____WEBPVP8 "), Some("webp"));
         assert_eq!(extension_for_image(b"not an image"), None);
-    }
-
-    /// 问"有哪些表情包"要能被识别出来（这是清单注入的触发条件）；问"要她的照片"
-    /// 也是同一类请求——素材库就是她的相册，见 `asks_about_stickers` 的说明。
-    #[test]
-    fn sticker_questions_are_detected() {
-        for text in [
-            "你现在有哪些表情包",
-            "发个表情看看",
-            "有没有那种贴纸",
-            "来斗图",
-            "send me a sticker",
-            "show me a MEME",
-            "你不是有一张表情包是你的照片吗",
-            "发我看看你的照片",
-            "相册里有自拍吗",
-            "send me your photo",
-        ] {
-            assert!(super::asks_about_stickers(text), "{text} 应当命中");
-        }
-        for text in ["今天天气怎么样", "帮我记一下明天开会", ""] {
-            assert!(!super::asks_about_stickers(text), "{text} 不该命中");
-        }
     }
 
     /// 取不到表情时的兜底话术：带标签、简短、不留承诺。
