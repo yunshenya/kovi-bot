@@ -2666,6 +2666,13 @@ fn baseline_disposition(input: &PlannerInput) -> DecisionDisposition {
         | WorldEventKind::AutonomousConversationTick(_)
         | WorldEventKind::ToolCompleted(_)
         | WorldEventKind::ToolFailed(_) => DecisionDisposition::Reply,
+        // 她自己拨出去、对方没接：这是唯一该由她收尾的通话结局。别的一律沉默——
+        // 通话本身已经发生过了，没有需要她补的话。
+        WorldEventKind::CallEnded(call)
+            if call.initiated_by_self && call.outcome == yunxi_core::CallOutcome::Unanswered =>
+        {
+            DecisionDisposition::Reply
+        }
         _ => DecisionDisposition::Silent,
     }
 }
@@ -4517,6 +4524,9 @@ impl KoviModelBackend {
             WorldEventKind::AutonomousConversationTick(_) => {
                 self.context_for_scope(input.event.scope()).await
             }
+            // 通话事件按人挂：外呼没接时那条"改发消息"的收尾 reply 要能落回同一个会话，
+            // 否则计划生成了却没有目的地。
+            WorldEventKind::CallEnded(_) => self.context_for_scope(input.event.scope()).await,
             WorldEventKind::ToolCompleted(tool) if tool.requires_follow_up => {
                 self.context_for_scope(input.event.scope()).await
             }
@@ -5957,6 +5967,29 @@ impl ModelBackend for KoviModelBackend {
                         None,
                         VisibleReplyTarget::Send { conversation_id },
                         autonomous_conversation_prompt(input),
+                        OutgoingSource::Proactive,
+                        false,
+                    )
+                }
+                WorldEventKind::CallEnded(_) => {
+                    let WorldEventKind::CallEnded(call) = input.event.kind() else {
+                        unreachable!("call-ended arm must contain its payload")
+                    };
+                    // 只有"她自己拨出去、对方没接"需要她做点什么：改发一条消息是自然的
+                    // 收尾。通了话、名单外婉拒、别人打来的电话结束了——都只是记下来，
+                    // 不该为它花一轮（她刚说完话，没什么可补的）。
+                    if !(call.initiated_by_self
+                        && call.outcome == yunxi_core::CallOutcome::Unanswered)
+                    {
+                        return Ok(DecisionPlan::silent());
+                    }
+                    let Some(reply_target) = due_reply_target(input.event.scope()) else {
+                        return Ok(DecisionPlan::silent());
+                    };
+                    (
+                        None,
+                        reply_target,
+                        "你刚才主动打了一通语音电话，但没能接通，这通已经结束了。要不要改成发一条消息由你决定：可以自然地说一句刚才想找他，也可以完全不提这通电话。现在不适合打扰就什么都不说。".to_owned(),
                         OutgoingSource::Proactive,
                         false,
                     )

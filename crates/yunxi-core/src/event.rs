@@ -865,6 +865,51 @@ pub struct ActionFailedEvent {
     pub error_category: String,
 }
 
+/// 一通 QQ 语音电话结束了。
+///
+/// 为什么这件事必须成为 Core 的事件、而不是只留在宿主日志里：它是**她自己做过的事**，
+/// 而她之后要能拿它推理——"半小时前刚打给他、没接，先别再打""昨天电话里答应了他"。
+/// 没有事件，这些推理在认知层无从发生，通话就只是一段谁也不记得的插曲。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallEndedEvent {
+    /// 通话对端。
+    pub peer: PersonId,
+    /// 这通是不是**我们**拨出去的。
+    ///
+    /// 区分它是因为两者的收尾不同：外呼没人接，她该考虑改发一条消息；别人打来的
+    /// 电话结束了，记下来就够了。
+    pub initiated_by_self: bool,
+    pub outcome: CallOutcome,
+    /// 通话时长（秒）。没接通就是 0。
+    pub duration_secs: u64,
+}
+
+/// 一通电话是怎么结束的。
+///
+/// 只分三种是有意的：桥对**外呼**一律回 `ended`，它自己也分不出"对方拒接"和
+/// "接通后很快挂断"（见 `docs/qq-call.md`）。编一个更细的枚举会把猜测说成事实。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CallOutcome {
+    /// 真的通了话。
+    Completed,
+    /// 没接通：外呼没等到回执，或来电漏接。
+    Unanswered,
+    /// 通话名单外，根本没进入对话。
+    Refused,
+}
+
+impl CallOutcome {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Unanswered => "unanswered",
+            Self::Refused => "refused",
+        }
+    }
+}
+
 /// A proposed action that was refused before a host attempted a side effect.
 ///
 /// Rejections are events as well as return values so callers can feed the
@@ -893,6 +938,7 @@ pub enum WorldEventKind {
     ActionSucceeded(ActionSucceededEvent),
     ActionFailed(ActionFailedEvent),
     ActionRejected(ActionRejectedEvent),
+    CallEnded(CallEndedEvent),
     IdleTick,
     MaintenanceTick,
     HostStarted,
@@ -917,6 +963,7 @@ impl WorldEventKind {
             Self::ActionSucceeded(_) => EventType::ActionSucceeded,
             Self::ActionFailed(_) => EventType::ActionFailed,
             Self::ActionRejected(_) => EventType::ActionRejected,
+            Self::CallEnded(_) => EventType::CallEnded,
             Self::IdleTick => EventType::IdleTick,
             Self::MaintenanceTick => EventType::MaintenanceTick,
             Self::HostStarted => EventType::HostStarted,
@@ -942,6 +989,8 @@ pub enum EventType {
     ActionSucceeded,
     ActionFailed,
     ActionRejected,
+    /// 一通语音电话结束（来电或外呼）。
+    CallEnded,
     IdleTick,
     MaintenanceTick,
     HostStarted,

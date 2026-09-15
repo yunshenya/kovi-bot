@@ -347,7 +347,16 @@ pub(crate) async fn start_scheduler(bot: Arc<kovi::RuntimeBot>) {
                 last_error_at = None;
                 let phase = state.phase();
                 if phase != observed_phase {
-                    report_phase_change(phase, observed_phase, &state, &config, &bot, traced).await;
+                    report_phase_change(
+                        phase,
+                        observed_phase,
+                        &state,
+                        &config,
+                        &bot,
+                        traced,
+                        handled,
+                    )
+                    .await;
                     traced = phase.is_live();
                     observed_phase = phase;
                 }
@@ -397,6 +406,50 @@ pub(crate) async fn start_scheduler(bot: Arc<kovi::RuntimeBot>) {
         }
         kovi::tokio::time::sleep(poll_interval).await;
     }
+}
+
+/// 这通电话该怎么记进认知层。
+///
+/// 纯函数，方便把三种结局的判据钉住。**只分三种**是因为桥分不出更细的：外呼一律回
+/// `ended`，它自己也分不出"对方拒接"和"接通后很快挂断"（见 `docs/qq-call.md`）。
+/// 编一个更细的枚举会把猜测说成事实。
+///
+/// - `allowed == Some(false)` 且是别人打来的 → 名单外婉拒（外呼不可能出现这种，
+///   拨号前就查过名单）；
+/// - 进过房 → `Completed`；
+/// - 其余 → `Unanswered`（外呼没接 / 来电漏接）。
+fn call_outcome(
+    initiated_by_self: bool,
+    allowed: Option<bool>,
+    connected: bool,
+) -> yunxi_core::CallOutcome {
+    if !initiated_by_self && allowed == Some(false) {
+        return yunxi_core::CallOutcome::Refused;
+    }
+    if connected {
+        yunxi_core::CallOutcome::Completed
+    } else {
+        yunxi_core::CallOutcome::Unanswered
+    }
+}
+
+/// 把通话结束通报给 Core。
+///
+/// 只记日志、绝不影响通话收尾（`record_call_ended` 自己吞掉所有失败）。
+async fn record_core_call_ended(state: &CallState, allowed: Option<bool>, connected: bool) {
+    let initiated_by_self = state.dialed_uin.is_some();
+    let Some(peer) = state.dialed_uin.or_else(|| state.caller()) else {
+        // 连对端都解析不出来：没有可归属的人，Core 那边也没法把事件挂到谁身上。
+        return;
+    };
+    let outcome = call_outcome(initiated_by_self, allowed, connected);
+    crate::yunxi::events::record_call_ended(
+        peer,
+        initiated_by_self,
+        outcome,
+        diagnostics::last_call_duration_secs(),
+    )
+    .await;
 }
 
 /// 这次阶段变化算不算"漏接"。
@@ -469,12 +522,18 @@ async fn report_phase_change(
     config: &crate::config::QqCallConfig,
     bot: &kovi::RuntimeBot,
     traced: bool,
+    // 这一通里我们是否真的起过一次会话。外呼的通知观察窗口不进 ringing/connected，
+    // 所以"进过房"对外呼只能靠这个判据，不能读诊断里那份（那可能是上一通的）。
+    session_ran: bool,
 ) {
     let caller = state.caller();
     let caller_name = state.caller_name.as_deref();
     let label = diagnostics::call_label(state.dialed_uin, caller, caller_name);
-    // 先取"这通有没有进过房"：下面 note_call_ended / begin_call 会把它清掉。
-    let connected = diagnostics::last_call_connected();
+    // 先取"这通有没有进过房"与授权结果：下面 note_call_ended / begin_call 会把它清掉。
+    // 外呼读不到有效的授权记录（外呼没有"来电者"，`begin_call` 不会被调用），所以
+    // 那个字段只用于别人打来的电话，判据见 `call_outcome`。
+    let connected = diagnostics::last_call_connected() || session_ran;
+    let allowed = diagnostics::last_call_allowed();
 
     // 这次通话的第一次可见阶段：记下来电者与授权结果，供 `#通话状态` 事后回看。
     if phase.is_live() && !traced {
@@ -525,6 +584,7 @@ async fn report_phase_change(
             if is_missed_call(previous, connected) {
                 notify_missed_call(bot, config, state, previous).await;
             }
+            record_core_call_ended(state, allowed, connected).await;
         }
         CallPhase::Idle if previous.is_live() => {
             if diagnostics::last_call_connected() {
@@ -538,6 +598,7 @@ async fn report_phase_change(
                 diagnostics::note_call_ended("未进房就结束");
                 notify_missed_call(bot, config, state, previous).await;
             }
+            record_core_call_ended(state, allowed, connected).await;
         }
         CallPhase::Error => eprintln!("[ERROR] QQ 语音通话桥报告错误阶段: {label}"),
         CallPhase::Unknown => eprintln!(
@@ -550,6 +611,40 @@ async fn report_phase_change(
 
 #[cfg(test)]
 mod tests {
+    /// 通话结局的判据：桥分不出更细的，所以只有三种。
+    ///
+    /// 判错的具体代价：把"没接通"记成"通了话"，认知层就会以为她真的跟人说过话；
+    /// 把"名单外婉拒"记成"没人接"，她会以为自己打过而对方不接——两件事完全不同。
+    #[test]
+    fn call_outcomes_are_classified_honestly() {
+        use super::call_outcome;
+        use yunxi_core::CallOutcome;
+
+        // 进了房就是通了话，不管是谁打来的。
+        assert_eq!(
+            call_outcome(false, Some(true), true),
+            CallOutcome::Completed
+        );
+        assert_eq!(call_outcome(true, None, true), CallOutcome::Completed);
+
+        // 没进房：别人打来的算漏接，我们拨出去的算没接。
+        assert_eq!(
+            call_outcome(false, Some(true), false),
+            CallOutcome::Unanswered
+        );
+        assert_eq!(call_outcome(true, None, false), CallOutcome::Unanswered);
+
+        // 名单外婉拒：只可能是别人打来的（外呼在拨号前就查过名单）。
+        assert_eq!(
+            call_outcome(false, Some(false), false),
+            CallOutcome::Refused
+        );
+        // 名单外的来电**也会进房**：桥是自动接听的，名单外只是播报一句婉拒然后静音。
+        // 所以"进过房"不能单独用来判"通了话"——授权判据必须排在它前面，否则每一通
+        // 被婉拒的来电都会被记成"她跟这个人说过话"。
+        assert_eq!(call_outcome(false, Some(false), true), CallOutcome::Refused);
+    }
+
     /// 待用开场白：一句话只给一通电话用一次，而且只给它对应的那个人。
     #[test]
     fn a_pending_opening_is_used_once_and_only_for_its_peer() {

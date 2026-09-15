@@ -107,6 +107,18 @@ pub(super) fn last_call_connected() -> bool {
     })
 }
 
+/// 最近一次通话的时长（秒）。没记录时返回 0。
+///
+/// 只在"这通真的进过房"时有值：会话收尾时会写，没接通的就是 0——认知层那边
+/// "没接"和"说了 0 秒"是两件事，靠 outcome 区分，不靠时长。
+pub(super) fn last_call_duration_secs() -> u64 {
+    with_last_call(|slot| {
+        slot.as_ref()
+            .and_then(|trace| trace.duration_secs)
+            .unwrap_or(0)
+    })
+}
+
 /// 标记这次通话已经进房（桥把音频设备接好了）。
 pub(super) fn mark_connected() {
     with_last_call(|slot| {

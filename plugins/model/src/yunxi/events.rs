@@ -5,8 +5,9 @@ use chrono::Utc;
 use kovi::tokio::time::timeout;
 use std::time::Duration;
 use yunxi_core::{
-    Admission, EventPriority, EventScope, GoalCompletedEvent, GoalState, GoalUpdatedEvent,
-    IdentityStore, InteractionCues, InteractionCuesObservedEvent, WorldEvent, WorldEventKind,
+    Admission, CallOutcome, EventPriority, EventScope, GoalCompletedEvent, GoalState,
+    GoalUpdatedEvent, IdentityStore, InteractionCues, InteractionCuesObservedEvent, WorldEvent,
+    WorldEventKind,
 };
 
 const RELIABLE_EVENT_TIMEOUT: Duration = Duration::from_millis(250);
@@ -39,6 +40,72 @@ pub(crate) async fn project_destination(
         }
         Ok(Err(error)) => kovi::log::warn!("Yunxi event projection failed: {error}"),
         Err(_) => kovi::log::warn!("Yunxi event projection timed out"),
+    }
+}
+
+/// 通报一通电话的结束。
+///
+/// 通话模块在会话收尾、外呼没人接、名单外婉拒之后调用。**发不出去不影响通话收尾**：
+/// 这里只记日志，绝不把错误抛回给通话路径——电话已经结束了，认知层漏记一次不该
+/// 变成一个可见的故障。
+///
+/// 身份解析不到（用户从没和芸汐聊过，库里没这个人）时同样只记日志：事件的作用域
+/// 需要 `PersonId`，编不出来就不发，而不是拿个假 id 塞进去。
+pub(crate) async fn record_call_ended(
+    peer_uin: i64,
+    initiated_by_self: bool,
+    outcome: CallOutcome,
+    duration_secs: u64,
+) {
+    let Some(identities) = super::IDENTITY_STORE.get() else {
+        kovi::log::warn!("Yunxi call-ended event skipped: identity store is not installed");
+        return;
+    };
+    let Some(bridge) = super::CORE_BRIDGE.get() else {
+        kovi::log::warn!("Yunxi call-ended event skipped: Core bridge is not installed");
+        return;
+    };
+    let external = match super::qq::person(peer_uin) {
+        Ok(external) => external,
+        Err(error) => {
+            kovi::log::warn!("Yunxi call-ended event skipped: invalid peer {peer_uin}: {error}");
+            return;
+        }
+    };
+    let person_id = match identities.resolve_external_identity(&external).await {
+        Ok(person_id) => person_id,
+        Err(error) => {
+            kovi::log::warn!("Yunxi call-ended event skipped: peer identity unresolved: {error}");
+            return;
+        }
+    };
+    kovi::log::info!(
+        "Yunxi call ended: peer={peer_uin} person={person_id} self_initiated={initiated_by_self} outcome={} duration_secs={duration_secs}",
+        outcome.as_str(),
+    );
+    let event = WorldEvent::new(
+        Utc::now(),
+        EventScope::Person { person_id },
+        EventPriority::Normal,
+        WorldEventKind::CallEnded(yunxi_core::CallEndedEvent {
+            peer: person_id,
+            initiated_by_self,
+            outcome,
+            duration_secs,
+        }),
+    );
+    match timeout(
+        projection_timeout(EventPriority::Normal),
+        bridge.submit_event(event),
+    )
+    .await
+    {
+        Ok(Ok(Admission::Accepted)) => {}
+        Ok(Ok(Admission::DroppedAtCapacity)) => {
+            kovi::log::warn!("Yunxi call-ended event dropped at runtime capacity");
+        }
+        Ok(Err(error)) => kovi::log::warn!("Yunxi call-ended event rejected: {error}"),
+        Err(_) => kovi::log::warn!("Yunxi call-ended event admission timed out"),
     }
 }
 

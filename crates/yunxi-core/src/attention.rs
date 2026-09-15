@@ -97,6 +97,24 @@ impl AttentionSystem {
                 reason: AttentionReason::ProspectiveMemory,
                 salience: 80,
             },
+            // 通话结束。只有一种情况需要她**做点什么**：她自己拨出去、对方没接——
+            // 那时正确的收尾往往是改发一条消息。别人打来的电话结束了、或者话已经
+            // 通过，记下来就够了，不该为它花一次规划（她刚说完话，没什么可补的）。
+            // 这里必须是 `ObserveOnly` 而不是 `Attend`：`should_invoke_planner` 对
+            // `Attend` 也返回真，用它会让她在**每一通电话之后**都多跑一轮模型。
+            // `ObserveOnly` 仍然把事件记进有界工作状态（"刚打过"她记得住），
+            // 只是不为它花钱规划。
+            WorldEventKind::CallEnded(call) => {
+                if call.initiated_by_self && call.outcome == crate::CallOutcome::Unanswered {
+                    must_handle(AttentionReason::ReliableTask)
+                } else {
+                    AttentionResult {
+                        disposition: AttentionDisposition::ObserveOnly,
+                        reason: AttentionReason::RelevantEvent,
+                        salience: 40,
+                    }
+                }
+            }
             WorldEventKind::AutonomousConversationTick(_) => AttentionResult {
                 disposition: AttentionDisposition::Attend,
                 reason: AttentionReason::RelevantEvent,
@@ -138,13 +156,70 @@ const fn must_handle(reason: AttentionReason) -> AttentionResult {
 mod tests {
     use super::{AttentionDisposition, AttentionReason, AttentionSystem};
     use crate::event::{
-        AutonomousConversationTickEvent, EventPriority, EventScope, InteractionCuesObservedEvent,
-        MessageContent, MessageReceivedEvent, ProspectiveMemoryEvent, ReminderDueEvent,
-        ToolCompletedEvent, ToolFailedEvent, WorldEvent, WorldEventKind,
+        AutonomousConversationTickEvent, CallEndedEvent, CallOutcome, EventPriority, EventScope,
+        InteractionCuesObservedEvent, MessageContent, MessageReceivedEvent, ProspectiveMemoryEvent,
+        ReminderDueEvent, ToolCompletedEvent, ToolFailedEvent, WorldEvent, WorldEventKind,
     };
     use crate::identity::{ConversationId, ConversationKind, MessageId, PersonId};
     use crate::planner::InteractionCues;
     use chrono::Utc;
+
+    fn call_ended(initiated_by_self: bool, outcome: CallOutcome) -> WorldEvent {
+        let peer = PersonId::new();
+        WorldEvent::new(
+            Utc::now(),
+            EventScope::Person { person_id: peer },
+            EventPriority::Normal,
+            WorldEventKind::CallEnded(CallEndedEvent {
+                peer,
+                initiated_by_self,
+                outcome,
+                duration_secs: 30,
+            }),
+        )
+    }
+
+    /// 只有"自己拨出去、没接通"这一种通话结局值得花一轮规划。
+    ///
+    /// 判据错了的代价很具体：如果所有通话结束都 MustHandle，她会在**每通电话之后**
+    /// 都多跑一次模型（刚说完话，没什么可补的），白花钱且容易生成废话；反过来如果
+    /// 一律不处理，外呼没人接就没有任何收尾，那通电话等于白打。
+    #[test]
+    fn only_an_unanswered_self_initiated_call_requires_action() {
+        let system = AttentionSystem;
+
+        let follow_up = system.evaluate(&call_ended(true, CallOutcome::Unanswered));
+        assert!(follow_up.should_invoke_planner());
+        assert_eq!(follow_up.disposition, AttentionDisposition::MustHandle);
+
+        for quiet in [
+            call_ended(true, CallOutcome::Completed),
+            call_ended(false, CallOutcome::Completed),
+            call_ended(false, CallOutcome::Unanswered),
+            call_ended(false, CallOutcome::Refused),
+        ] {
+            let result = system.evaluate(&quiet);
+            assert!(
+                !result.should_invoke_planner(),
+                "这种通话结局不该占用一次规划：{:?}",
+                quiet.kind()
+            );
+        }
+    }
+
+    /// 结局的取值要稳定：它进日志、进事件载荷，改名等于改口径。
+    #[test]
+    fn call_outcomes_have_stable_names() {
+        for (outcome, name) in [
+            (CallOutcome::Completed, "completed"),
+            (CallOutcome::Unanswered, "unanswered"),
+            (CallOutcome::Refused, "refused"),
+        ] {
+            assert_eq!(outcome.as_str(), name);
+            let encoded = serde_json::to_string(&outcome).expect("serialize outcome");
+            assert_eq!(encoded, format!("\"{name}\""));
+        }
+    }
 
     fn message(kind: ConversationKind, addressed: bool, replied: bool) -> WorldEvent {
         WorldEvent::message_received(

@@ -59,13 +59,13 @@ pub use driver::{
 };
 pub use event::{
     ActionFailedEvent, ActionRejectedEvent, ActionSucceededEvent, Attachment, AttachmentKind,
-    AutonomousConversationTickEvent, EventPriority, EventScope, EventType, EventValidationError,
-    GoalCompletedEvent, GoalUpdatedEvent, InteractionCuesObservedEvent, MAX_STICKER_LABEL_CHARS,
-    MAX_TOOL_ERROR_DETAIL_BYTES, MAX_TOOL_ERROR_DETAIL_CHARS, MAX_TOOL_RESULT_BYTES,
-    MAX_TOOL_RESULT_CHARS, Message, MessageCollisionDetectedEvent, MessageContent,
-    MessageReceivedEvent, MessageSentEvent, MessageValidationError, ProspectiveMemoryEvent,
-    ReminderDueEvent, ToolCompletedEvent, ToolFailedEvent, TraceContext, TraceError, WorldEvent,
-    WorldEventKind,
+    AutonomousConversationTickEvent, CallEndedEvent, CallOutcome, EventPriority, EventScope,
+    EventType, EventValidationError, GoalCompletedEvent, GoalUpdatedEvent,
+    InteractionCuesObservedEvent, MAX_STICKER_LABEL_CHARS, MAX_TOOL_ERROR_DETAIL_BYTES,
+    MAX_TOOL_ERROR_DETAIL_CHARS, MAX_TOOL_RESULT_BYTES, MAX_TOOL_RESULT_CHARS, Message,
+    MessageCollisionDetectedEvent, MessageContent, MessageReceivedEvent, MessageSentEvent,
+    MessageValidationError, ProspectiveMemoryEvent, ReminderDueEvent, ToolCompletedEvent,
+    ToolFailedEvent, TraceContext, TraceError, WorldEvent, WorldEventKind,
 };
 pub use executive::EvidencePolarity as ExecutiveEvidencePolarity;
 pub use executive::{
