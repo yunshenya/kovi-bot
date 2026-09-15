@@ -926,11 +926,12 @@ impl MindRuntime {
         Ok(())
     }
 
-    async fn load_v1_context(&self, scope: MindScope, query: &str) -> V1MindContext {
-        let Some(services) = self.context_services.as_ref() else {
-            return V1MindContext::default();
-        };
-        let (memory_scope, open_loop_owner, goal_owner) = match scope {
+    /// 一个 scope 在三个 store 里各自对应的归属键。
+    ///
+    /// 抽出来是因为"只读其中一个 store"的轻量路径（见 [`Self::load_v1_open_loops`]）
+    /// 必须和完整读取用同一套映射，否则两条路会悄悄读成不同的 scope。
+    fn scope_owners(scope: MindScope) -> (MemoryScope, OpenLoopOwner, GoalOwner) {
+        match scope {
             MindScope::Global => (
                 MemoryScope::Global,
                 OpenLoopOwner::Global,
@@ -946,7 +947,40 @@ impl MindRuntime {
                 OpenLoopOwner::Conversation(conversation_id),
                 GoalOwner::Conversation(conversation_id),
             ),
+        }
+    }
+
+    /// 只读 open loop 的轻量上下文：`resolve_answered_state` 只用得到这一份。
+    ///
+    /// 它此前走 [`Self::load_v1_context`]，于是每个 scope 都要白读一次 memory 与
+    /// goal，再整份丢掉。memory 那一路不是免费查询：`recall` 会开一个事务、拿
+    /// `lock_memory_read` 共享锁（`plugins/model/src/yunxi/memory_store.rs:771`），
+    /// 而这些开销全部落在"消息进 Core 之前"那段固定预算里。线上 2026-09-15 的
+    /// `Yunxi Mind event update timed out and failed soft` 里，这条白读是每个
+    /// scope 都付一次的固定成本。
+    ///
+    /// 读失败与 [`Self::load_v1_context`] 同样按 fail-soft 处理：记一条 warn、
+    /// 当作"这一轮没有可了结的 open loop"，不阻断入站消息。
+    async fn load_v1_open_loops(&self, scope: MindScope) -> Vec<OpenLoop> {
+        let Some(services) = self.context_services.as_ref() else {
+            return Vec::new();
         };
+        let (_, open_loop_owner, _) = Self::scope_owners(scope);
+        services
+            .open_loops
+            .list(&open_loop_owner, 16)
+            .await
+            .unwrap_or_else(|error| {
+                kovi::log::warn!("Yunxi Mind V1 open-loop context failed soft: {error}");
+                Vec::new()
+            })
+    }
+
+    async fn load_v1_context(&self, scope: MindScope, query: &str) -> V1MindContext {
+        let Some(services) = self.context_services.as_ref() else {
+            return V1MindContext::default();
+        };
+        let (memory_scope, open_loop_owner, goal_owner) = Self::scope_owners(scope);
         let mut degraded = false;
         // 查询文本直接来自消息正文（粘贴长文、长转发都可能超过查询上限），
         // 超长时按字符边界截断——超出部分对检索没有帮助，不该让这一轮回忆整批失败。
@@ -1838,8 +1872,8 @@ impl MindRuntime {
         let mut resolved_open_loops = Vec::new();
         if let Some(context_services) = self.context_services.as_ref() {
             for scope in scopes.iter().copied() {
-                let context = self.load_v1_context(scope, answer).await;
-                for open_loop in context.open_loops.into_iter().filter(|item| {
+                let open_loops = self.load_v1_open_loops(scope).await;
+                for open_loop in open_loops.into_iter().filter(|item| {
                     !item.status().is_terminal()
                         && matches!(
                             item.kind(),
@@ -4454,6 +4488,72 @@ mod tests {
                 "相处结论落库失败，同一批的立场候选必须照常落地"
             );
             assert_eq!(beliefs[0].proposition(), "我认为慢一点更好");
+        });
+    }
+
+    /// 记录 `recall` 被调了几次：用来钉住"入站路径每个 scope 只读一次 memory"。
+    struct CountingRecallStore {
+        recalls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl MemoryStore for CountingRecallStore {
+        fn remember<'a>(&'a self, draft: &'a MemoryDraft) -> MemoryStoreFuture<'a, Memory> {
+            Box::pin(async move {
+                Memory::from_draft(MemoryId::new(), draft, Utc::now()).map_err(|error| {
+                    MemoryStoreError::InvalidRequest {
+                        reason: error.to_string(),
+                    }
+                })
+            })
+        }
+
+        fn recall<'a>(&'a self, _query: &'a MemoryQuery) -> MemoryStoreFuture<'a, Vec<Memory>> {
+            self.recalls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn forget(&self, _scope: MemoryScope, _id: MemoryId) -> MemoryStoreFuture<'_, bool> {
+            Box::pin(async { Ok(false) })
+        }
+    }
+
+    /// `resolve_answered_state` 只用得到 open loop；memory 与 goal 那份也要读的话，
+    /// 每个 scope 就多付一次"开事务 + 拿共享锁"的 recall。
+    ///
+    /// 线上 2026-09-15 的 `Yunxi Mind event update timed out and failed soft`（当天
+    /// 22/48 条入站事件）里，这条白读是每个 scope 都付一次的固定成本；这条测试把
+    /// "一条消息只读一次 memory"钉住，免得以后有人顺手把 `load_v1_context` 加回来。
+    #[test]
+    fn observing_an_event_reads_memory_once_per_scope() {
+        let executor = kovi::tokio::runtime::Runtime::new().expect("test runtime");
+        executor.block_on(async {
+            let store = Arc::new(InMemoryMindStore::new());
+            let services = MindServices::from_store(Arc::clone(&store));
+            let recalls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let context = MindContextServices::new(
+                Arc::new(CountingRecallStore {
+                    recalls: Arc::clone(&recalls),
+                }),
+                Arc::new(StatefulOpenLoopStore::default()),
+                Arc::new(EmptyGoalStore),
+            );
+            let runtime = MindRuntime::new(services, active_config())
+                .expect("valid active Mind runtime")
+                .with_context_services(context);
+
+            let person_id = yunxi_core::PersonId::new();
+            let conversation_id = ConversationId::new();
+            let event = direct_message(person_id, conversation_id, "我面试过了，结果还不错");
+            runtime.observe_event(&event).await.expect("observe event");
+
+            // 私聊有两个 scope（Person + Conversation），只有 agenda 刷新读 memory：
+            // 2 次，而不是改造前的 4 次。
+            assert_eq!(
+                recalls.load(std::sync::atomic::Ordering::Relaxed),
+                2,
+                "resolve 阶段不该再读 memory（每个 scope 只该读一次）"
+            );
         });
     }
 
