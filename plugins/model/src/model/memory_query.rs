@@ -1598,7 +1598,7 @@ mod tests {
             let ticket = crate::model::interrupt::interrupt(scope).await;
             let mut messages = vec![BotMemory {
                 role: Roles::User,
-                content: "把刚才那句话撤回".to_string(),
+                content: "把刚才那句话引用一下".to_string(),
             }];
             let context = ToolExecutionContext {
                 subject_id: 9_555_001,
@@ -1633,15 +1633,15 @@ mod tests {
                         "结构化回复回合必须拿得到 reply_action: {offered:?}"
                     );
                     MockPayload {
-                        content: "好，撤回了。".to_string(),
+                        content: "好，我引用一下。".to_string(),
                         tool_calls: vec![NativeToolCall {
                             id: "call_1".to_string(),
                             name: REPLY_ACTION_TOOL_NAME.to_string(),
-                            arguments: json!({"recall_message_ids": [77]})
+                            arguments: json!({"quote_message_id": 77})
                                 .as_object()
                                 .expect("对象")
                                 .clone(),
-                            raw_arguments: r#"{"recall_message_ids":[77]}"#.to_string(),
+                            raw_arguments: r#"{"quote_message_id":77}"#.to_string(),
                         }],
                     }
                 },
@@ -1659,9 +1659,9 @@ mod tests {
             )
             .await;
 
-            assert_eq!(turn.content, "好，撤回了。");
+            assert_eq!(turn.content, "好，我引用一下。");
             let action = turn.action.expect("工具调用必须落到这一轮的动作上");
-            assert_eq!(action.action.recall_message_ids, vec![77]);
+            assert_eq!(action.action.quote_message_id, Some(77));
         });
     }
 
@@ -1676,7 +1676,7 @@ mod tests {
             let ticket = crate::model::interrupt::interrupt(scope).await;
             let mut messages = vec![BotMemory {
                 role: Roles::User,
-                content: "把刚才那句话撤回".to_string(),
+                content: "把刚才那句话引用一下".to_string(),
             }];
             let context = ToolExecutionContext {
                 subject_id: 9_555_002,

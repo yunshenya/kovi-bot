@@ -1,6 +1,8 @@
 //! 消息动作 Skill 的计划与执行器。
 //!
-//! 模型只负责提出动作意图，真正的消息发送、撤回、分段和打断检查都在这里完成。
+//! 模型只负责提出动作意图，真正的消息发送、分段和打断检查都在这里完成。
+//!
+//! 撤回不在这里：它是 `message.recall` 工具，在模型循环里就地执行（见 `tool_access.rs`）。
 
 use super::interrupt::{
     OutgoingSource, ReplyScope, ReplyTicket, begin_outgoing_commit,
@@ -8,7 +10,7 @@ use super::interrupt::{
     prepare_outgoing_with_semantic_preview,
 };
 use super::message_transport::MessageTransport;
-use super::recall::{RecentBotMessage, recall_bot_messages, record_committed_bot_message};
+use super::recall::record_committed_bot_message;
 use super::reply::{
     ReplyAction, ReplyTurn, build_outbound_message, parse_reply_output,
     sanitize_reply_action_for_sender,
@@ -329,8 +331,6 @@ impl ReplyPlan {
 #[derive(Debug, Default)]
 pub(crate) struct ReplyExecution {
     pub(crate) sent_messages: Vec<String>,
-    pub(crate) recalled_messages: Vec<RecentBotMessage>,
-    pub(crate) recall_requested: bool,
 }
 
 /// 执行一份已经过候选白名单清洗的回复计划。
@@ -341,22 +341,10 @@ pub(crate) async fn execute_reply_plan(
     personality: &BotPersonality,
     reply_ticket: ReplyTicket,
 ) -> ReplyExecution {
+    // 撤回不再从这里走：它已经是 `message.recall` 工具，在模型循环里就地执行。
+    // 这里只负责把可见回复提交出站并交给 QQ。
     let scope = destination.scope();
-    let recall_requested = !plan.action.recall_message_ids.is_empty();
-    if !is_current(reply_ticket).await {
-        return ReplyExecution {
-            recall_requested,
-            ..ReplyExecution::default()
-        };
-    }
-    let recalled_messages =
-        recall_bot_messages(scope, &plan.action.recall_message_ids, bot, reply_ticket).await;
-    let mut execution = ReplyExecution {
-        recalled_messages,
-        recall_requested,
-        ..ReplyExecution::default()
-    };
-
+    let mut execution = ReplyExecution::default();
     if !is_current(reply_ticket).await {
         return execution;
     }
@@ -921,7 +909,6 @@ mod tests {
                             "disposition": "silent",
                             "quote_message_id": 77,
                             "at_user_ids": [88],
-                            "recall_message_ids": [99],
                         }),
                     ),
                     None,
@@ -933,7 +920,6 @@ mod tests {
                 assert!(plan.bubbles.is_empty());
                 assert_eq!(plan.action.quote_message_id, None);
                 assert!(plan.action.at_user_ids.is_empty());
-                assert_eq!(plan.action.recall_message_ids, vec![99]);
             });
     }
 

@@ -97,7 +97,7 @@ const DEFAULT_RESPONSES_INSTRUCTIONS: &str = "请根据输入消息完成当前�
 /// 结构化动作一律走工具：这里只交代"该说什么"与"什么时候该调工具"，字段级契约在
 /// 工具 schema 里（AGENTS.md 第 6 条）。修复调用必须真的把 `reply_action` 挂上，
 /// 否则就是"提示词点名了工具、她手里却没有"——见 `repair_empty_reply`。
-const EMPTY_REPLY_REPAIR_PROMPT: &str = "上一轮没有形成可发送的回复。现在只做一次回复修复：重新结合当前用户消息判断本轮意图，需要文字回应时直接写自然聊天正文；如果用户只要求结构化 @，可以只调用 reply_action、不写正文，不要为了凑正文添加无关套话。自然语言中的“@我”“艾特我”“提及我”指本轮当前消息发送者，用 reply_action 的 at_current_sender 表达，不要调用成员搜索，也不要填写真实 QQ 号；@其他人时才使用动作候选中的 at_user_ref。需要引用或撤回消息时同样通过 reply_action 提交，并使用动作候选里的临时引用，不要只在正文里写成普通文字。不要输出解释、分析、代码块或任何协议标记；若确实不应回应，就用 reply_action 的 disposition=silent。不要编造工具结果，也不要把本次修复当成新的用户消息。";
+const EMPTY_REPLY_REPAIR_PROMPT: &str = "上一轮没有形成可发送的回复。现在只做一次回复修复：重新结合当前用户消息判断本轮意图，需要文字回应时直接写自然聊天正文；如果用户只要求结构化 @，可以只调用 reply_action、不写正文，不要为了凑正文添加无关套话。自然语言中的“@我”“艾特我”“提及我”指本轮当前消息发送者，用 reply_action 的 at_current_sender 表达，不要调用成员搜索，也不要填写真实 QQ 号；@其他人时才使用动作候选中的 at_user_ref。需要引用或 @ 消息时通过 reply_action 提交、并使用动作候选里的临时引用，不要只在正文里写成普通文字。不要输出解释、分析、代码块或任何协议标记；若确实不应回应，就用 reply_action 的 disposition=silent。不要编造工具结果，也不要把本次修复当成新的用户消息。";
 const PLAIN_REPLY_REPAIR_PROMPT: &str = "上一轮没有形成可发送的回复。请重新结合当前用户消息和同一对话上下文，直接写一条自然、具体、可以原样发给用户的聊天正文。不要输出 JSON、动作标记、工具调用、解释、分析、思考过程或消息包装；按问题需要保留 Markdown、换行或代码。不要把本次修复当成新的用户消息，也不要为了凑回复添加无关套话。";
 
 struct EmptyReplyIncident {
@@ -825,30 +825,24 @@ pub async fn control_model(
         reply_ticket,
     )
     .await;
-    if !execution.recalled_messages.is_empty() {
+    // 撤回由 `message.recall` 工具在那一轮里就地执行并登记；这里只把它写进会话历史，
+    // 让后续轮次知道"这些消息她撤回了、不再对用户可见"。
+    let recalled_notices = crate::model::recall::take_recall_notices(reply_scope).await;
+    if !recalled_notices.is_empty() {
         println!(
             "[INFO] 芸汐主动撤回群聊消息 (群组: {}, 数量: {})",
             group_id,
-            execution.recalled_messages.len()
+            recalled_notices.len()
         );
-        append_recall_history_notice(&mut messages, &execution.recalled_messages);
+        append_recall_history_notice(&mut messages, &recalled_notices);
     }
     if plan.is_silent() {
         println!("[INFO] 群聊模型选择静默 (群组: {})", group_id);
-        if execution.recall_requested && execution.recalled_messages.is_empty() {
-            println!("[WARN] 群聊主动撤回未命中可撤回消息 (群组: {})", group_id);
-        }
         limit_memory_size(&mut messages);
         return false;
     }
     if !plan.has_visible_reply() {
-        if execution.recall_requested {
-            if execution.recalled_messages.is_empty() {
-                println!("[WARN] 群聊主动撤回未命中可撤回消息 (群组: {})", group_id);
-            }
-        } else {
-            println!("[WARN] 群聊模型返回了空回复计划 (群组: {})", group_id);
-        }
+        println!("[WARN] 群聊模型返回了空回复计划 (群组: {})", group_id);
         limit_memory_size(&mut messages);
         return false;
     }
@@ -905,12 +899,13 @@ fn should_repair_empty_reply(
     reply_expected: bool,
     understanding: &MessageUnderstanding,
 ) -> bool {
+    // 只发结构化 @ 的轮次不算空回复（`has_visible_reply` 已经把那种情况算成可见）。
+    // 撤回不再参与这个判据：它是工具，执行完还要有一句可见回复，否则才是空回复。
     reply_expected
         && !understanding.wants_no_reply
         && !understanding.wants_stop
         && !plan.is_silent()
         && !plan.has_visible_reply()
-        && plan.action.recall_message_ids.is_empty()
 }
 
 /// Keep the structured reply-action channel for explicit message actions only.
@@ -4299,30 +4294,24 @@ async fn private_chat_inner(
         reply_ticket,
     )
     .await;
-    if !execution.recalled_messages.is_empty() {
+    // 与群聊同理：撤回已经由 `message.recall` 工具就地执行，这里只补一条会话状态，
+    // 让后续轮次知道那些消息不再对用户可见。
+    let recalled_notices = crate::model::recall::take_recall_notices(reply_scope).await;
+    if !recalled_notices.is_empty() {
         println!(
             "[INFO] 芸汐主动撤回私聊消息 (用户: {}, 数量: {})",
             user_id,
-            execution.recalled_messages.len()
+            recalled_notices.len()
         );
-        append_recall_history_notice(&mut history, &execution.recalled_messages);
+        append_recall_history_notice(&mut history, &recalled_notices);
     }
     if plan.is_silent() {
         println!("[INFO] 私聊模型选择静默 (用户: {})", user_id);
-        if execution.recall_requested && execution.recalled_messages.is_empty() {
-            println!("[WARN] 私聊主动撤回未命中可撤回消息 (用户: {})", user_id);
-        }
         limit_memory_size(&mut history);
         return;
     }
     if !plan.has_visible_reply() {
-        if execution.recall_requested {
-            if execution.recalled_messages.is_empty() {
-                println!("[WARN] 私聊主动撤回未命中可撤回消息 (用户: {})", user_id);
-            }
-        } else {
-            println!("[WARN] 私聊模型返回了空回复计划 (用户: {})", user_id);
-        }
+        println!("[WARN] 私聊模型返回了空回复计划 (用户: {})", user_id);
         limit_memory_size(&mut history);
         return;
     }
@@ -5551,19 +5540,6 @@ mod tests {
             &MessageUnderstanding::default()
         ));
 
-        let recall_only = ReplyPlan {
-            action: crate::model::reply::ReplyAction {
-                recall_message_ids: vec![12],
-                ..Default::default()
-            },
-            ..empty.clone()
-        };
-        assert!(!should_repair_empty_reply(
-            &recall_only,
-            true,
-            &MessageUnderstanding::default()
-        ));
-
         let mention_only = ReplyPlan {
             action: crate::model::reply::ReplyAction {
                 at_user_ids: vec![88],
@@ -6194,7 +6170,7 @@ mod tests {
             content: String::new(),
             disposition: ReplyDisposition::Reply,
             action: crate::model::reply::ReplyAction {
-                recall_message_ids: vec![12],
+                quote_message_id: Some(12),
                 ..Default::default()
             },
             bubbles: Vec::new(),

@@ -505,6 +505,65 @@ pub(crate) async fn recall_bot_messages(
     recalled
 }
 
+/// 本回合经工具撤回过、还没写进会话历史的消息（按会话暂存）。
+///
+/// 为什么要绕这一道：宿主回复链路**整轮**握着那条历史的 `MutexGuard`
+/// （`MEMORY` / `PRIVATE_MESSAGE_MEMORY`），而撤回工具就在同一任务、同一次模型循环里
+/// 执行——工具里直接去 lock 同一把锁就是自锁。所以工具只登记，由回合收尾处（那时锁正好
+/// 还握着）取走写进历史。
+///
+/// Core 那条路的回合不由宿主收尾，登记项没人取走，靠 TTL 与容量上限自然过期。
+static PENDING_RECALL_NOTICES: LazyLock<Mutex<HashMap<ReplyScope, PendingRecallNotice>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+const RECALL_NOTICE_TTL: Duration = Duration::from_secs(60 * 10);
+const MAX_RECALL_NOTICE_SCOPES: usize = 256;
+
+struct PendingRecallNotice {
+    messages: Vec<RecentBotMessage>,
+    recorded_at: Instant,
+}
+
+/// 登记"这一轮撤回了哪些消息"，供宿主回合收尾时写进会话历史。
+pub(crate) async fn record_recall_notice(scope: ReplyScope, recalled: &[RecentBotMessage]) {
+    if recalled.is_empty() {
+        return;
+    }
+    let mut pending = PENDING_RECALL_NOTICES.lock().await;
+    prune_recall_notices(&mut pending);
+    pending.insert(
+        scope,
+        PendingRecallNotice {
+            messages: recalled.to_vec(),
+            recorded_at: Instant::now(),
+        },
+    );
+}
+
+/// 取走这个会话待写的撤回通知（取走即清空，不会重复写进历史）。
+pub(crate) async fn take_recall_notices(scope: ReplyScope) -> Vec<RecentBotMessage> {
+    let mut pending = PENDING_RECALL_NOTICES.lock().await;
+    prune_recall_notices(&mut pending);
+    pending
+        .remove(&scope)
+        .map(|notice| notice.messages)
+        .unwrap_or_default()
+}
+
+fn prune_recall_notices(pending: &mut HashMap<ReplyScope, PendingRecallNotice>) {
+    let now = Instant::now();
+    pending.retain(|_, notice| now.duration_since(notice.recorded_at) < RECALL_NOTICE_TTL);
+    while pending.len() > MAX_RECALL_NOTICE_SCOPES {
+        let Some(oldest) = pending
+            .iter()
+            .min_by_key(|(_, notice)| notice.recorded_at)
+            .map(|(scope, _)| *scope)
+        else {
+            break;
+        };
+        pending.remove(&oldest);
+    }
+}
+
 pub(crate) async fn has_recalled_messages(scope: ReplyScope, message_ids: &[i32]) -> bool {
     let lifecycles = REPLY_LIFECYCLES.lock().await;
     lifecycles.get(&scope).is_some_and(|lifecycle| {
@@ -803,17 +862,18 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        REPLY_LIFECYCLES, ReplyLifecycle, begin_reply, core_turn_blocked_by_recall, finish_reply,
-        normalize_recall_message_ids, parse_recall_notice, record_committed_bot_message,
-        record_core_reply_linkage, record_recent_bot_message, record_standalone_bot_message,
-        remember_core_turn_sources, remove_bot_messages, source_messages_already_answered,
-        take_core_turn_sources,
+        REPLY_LIFECYCLES, RecentBotMessage, ReplyLifecycle, begin_reply,
+        core_turn_blocked_by_recall, finish_reply, normalize_recall_message_ids,
+        parse_recall_notice, record_committed_bot_message, record_core_reply_linkage,
+        record_recent_bot_message, record_standalone_bot_message, remember_core_turn_sources,
+        remove_bot_messages, source_messages_already_answered, take_core_turn_sources,
     };
     use crate::model::interrupt::{
         ReplyScope, clear_reply_state_locked, interrupt, is_active, scope_mutex,
     };
     use kovi::event::NoticeEvent;
     use kovi::serde_json::{Value, json};
+    use std::time::Instant;
 
     fn notice(notice_type: &str, extra: Value) -> NoticeEvent {
         let mut value = json!({
@@ -850,6 +910,33 @@ mod tests {
             .expect("应识别私聊撤回");
         assert_eq!(parsed.0, super::ReplyScope::Private(456));
         assert_eq!(parsed.1, 77);
+    }
+
+    /// 撤回通知是"登记 → 取走即清空"的一次性暂存。
+    ///
+    /// 宿主回复链路整轮握着会话历史的锁，而撤回工具在同一任务里执行，所以工具只能登记、
+    /// 由回合收尾取走写进历史（工具里直接写会自锁）。这条用例盯住"取走即清空"——
+    /// 重复写进历史会让后续轮次以为又撤回了一遍。
+    #[test]
+    fn recall_notices_are_staged_then_taken_once() {
+        let runtime = kovi::tokio::runtime::Runtime::new().expect("test runtime");
+        runtime.block_on(async {
+            let scope = crate::model::interrupt::ReplyScope::Group(9_500_001);
+            let recalled = vec![RecentBotMessage {
+                message_id: 77,
+                content: "刚撤回的那句".to_string(),
+                sent_at: Instant::now(),
+            }];
+            super::record_recall_notice(scope, &recalled).await;
+            assert_eq!(super::take_recall_notices(scope).await, recalled);
+            assert!(
+                super::take_recall_notices(scope).await.is_empty(),
+                "取走即清空，不能重复写进历史"
+            );
+            // 空列表不登记，免得留下一堆空条目
+            super::record_recall_notice(scope, &[]).await;
+            assert!(super::take_recall_notices(scope).await.is_empty());
+        });
     }
 
     #[test]

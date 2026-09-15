@@ -3409,6 +3409,9 @@ async fn recall_own_messages(
         .ok_or_else(|| anyhow!("撤回工具没有可用的机器人运行时"))?;
     let recalled =
         crate::model::recall::recall_bot_messages(scope, &requested, bot, reply_ticket).await;
+    // 登记一条"这一轮撤回了什么"，由宿主回合收尾写进会话历史（工具里写不了：宿主整轮
+    // 握着那条历史的锁，同任务再 lock 就是自锁，见 `record_recall_notice`）。
+    crate::model::recall::record_recall_notice(scope, &recalled).await;
     let recalled_ids = recalled
         .iter()
         .map(|message| message.message_id)
