@@ -1075,7 +1075,7 @@ mod tests {
             })
             .collect();
         super::enforce_fold_budget(&mut folded, &mut message, limit);
-        let transcript = super::attributed_transcript("当前", &message, &folded.as_slices().0, ":");
+        let transcript = super::attributed_transcript("当前", &message, folded.as_slices().0, ":");
         assert!(
             transcript.chars().count() <= limit + 64,
             "折出来的文本超预算: {}",
@@ -1102,7 +1102,7 @@ mod tests {
             });
             super::enforce_fold_budget(&mut folded, &mut message, limit);
             let transcript =
-                super::attributed_transcript("当前", &message, &folded.as_slices().0, ":");
+                super::attributed_transcript("当前", &message, folded.as_slices().0, ":");
             assert!(
                 transcript.chars().count() <= limit + 64,
                 "第 {index} 次折叠后超预算: {}",
