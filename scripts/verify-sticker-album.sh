@@ -97,24 +97,26 @@ PY
 
 prompt_b64="$(extract_const_b64 "$sticker_source" STICKER_PROMPT)"
 persona_b64="$(extract_field_b64 "$prompt_source" persona)"
-host_head_b64="$(extract_concat_b64 "$reply_source" REPLY_PROTOCOL_HEAD)"
-host_sticker_b64="$(extract_concat_b64 "$reply_source" REPLY_PROTOCOL_STICKER)"
-host_tail_b64="$(extract_concat_b64 "$reply_source" REPLY_PROTOCOL_TAIL)"
+# 宿主链路的动作契约在 `reply_action` 工具的 schema 里（`2026-09-15` 那次迁移把
+# 正文外的 `[[REPLY_ACTION]]` 文本协议整条删掉了）：工具总说明 + sticker 字段说明。
+host_tool_b64="$(extract_concat_b64 "$reply_source" REPLY_ACTION_TOOL_DESCRIPTION)"
+host_sticker_b64="$(extract_concat_b64 "$reply_source" REPLY_ACTION_STICKER_FIELD)"
 
-# 宿主链路的写法必须与 Core 区分开：它解析的是动作里的 sticker 字段，不是正文标记。
+# 宿主链路的写法必须与 Core 区分开：她通过 `reply_action` 工具的 sticker 字段发图，
+# 不是在正文里写 Core 那种标记。这里核对工具 schema 本身。
 python3 - "$reply_source" <<'PY'
 import re, sys
 text = open(sys.argv[1], encoding="utf-8").read()
-match = re.search(r'const REPLY_PROTOCOL_STICKER: &str = concat!\((.*?)\);', text, re.S)
+if '"sticker".to_string()' not in text:
+    raise SystemExit("reply_action 工具里没有 sticker 字段：她发不出图")
+match = re.search(r'const REPLY_ACTION_STICKER_FIELD: &str = concat!\((.*?)\);', text, re.S)
 if match is None:
-    raise SystemExit("源码里找不到 REPLY_PROTOCOL_STICKER")
-body = match.group(1)
-if '\\"sticker\\":\\"标签\\"' not in body.replace(" ", ""):
-    raise SystemExit("宿主协议里没有 sticker 字段的写法：她会在动作里发不出图")
-if "[[STICKER" in body:
-    raise SystemExit("宿主协议里出现了 Core 的正文标记：那会被当成正文发出去")
+    raise SystemExit("源码里找不到 REPLY_ACTION_STICKER_FIELD")
+body = "".join(re.findall(r'"((?:[^"\\]|\\.)*)"', match.group(1)))
 if "sticker_list" not in body:
-    raise SystemExit("宿主协议里没有点明清单怎么拿")
+    raise SystemExit("sticker 字段说明里没有点明清单怎么拿")
+if "[[STICKER" in body:
+    raise SystemExit("宿主工具说明里出现了 Core 的正文标记：那会被当成正文发出去")
 PY
 
 # 清单不许常驻提示词（2026-09-15 用户口径：试过常驻，被否掉）。判据是协议里不出现
@@ -149,13 +151,12 @@ if ! grep -q "offers_sticker_tool_alone(" "$core_source"; then
 fi
 
 ssh -o BatchMode=yes -o ConnectTimeout=8 -p "$port" \
-  "$host" "KOVI_PROMPT_B64=$prompt_b64 KOVI_PERSONA_B64=$persona_b64 KOVI_HOST_HEAD_B64=$host_head_b64 KOVI_HOST_STICKER_B64=$host_sticker_b64 KOVI_HOST_TAIL_B64=$host_tail_b64 bash -s" <<'REMOTE'
+  "$host" "KOVI_PROMPT_B64=$prompt_b64 KOVI_PERSONA_B64=$persona_b64 KOVI_HOST_TOOL_B64=$host_tool_b64 KOVI_HOST_STICKER_B64=$host_sticker_b64 bash -s" <<'REMOTE'
 set -euo pipefail
 export PROTOCOL_TEXT="$(printf '%s' "$KOVI_PROMPT_B64" | base64 -d)"
 export PERSONA_TEXT="$(printf '%s' "$KOVI_PERSONA_B64" | base64 -d)"
-export HOST_HEAD="$(printf '%s' "$KOVI_HOST_HEAD_B64" | base64 -d)"
-export HOST_STICKER="$(printf '%s' "$KOVI_HOST_STICKER_B64" | base64 -d)"
-export HOST_TAIL="$(printf '%s' "$KOVI_HOST_TAIL_B64" | base64 -d)"
+export HOST_TOOL_DESCRIPTION="$(printf '%s' "$KOVI_HOST_TOOL_B64" | base64 -d)"
+export HOST_STICKER_FIELD="$(printf '%s' "$KOVI_HOST_STICKER_B64" | base64 -d)"
 
 python3 <<'PY'
 import json, os, re, urllib.request
@@ -199,6 +200,25 @@ STICKER_TOOL = {
         "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
     },
 }
+# 宿主链路的动作工具。生产里它还有 disposition/messages/at_user_ids 等字段，这里只带
+# sticker——本次验收判的就是"她走不走这个字段"；工具总说明与字段说明逐字取自源码，
+# 不在脚本里另抄一份（抄一份就会漂移）。
+REPLY_ACTION_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "reply_action",
+        "description": os.environ["HOST_TOOL_DESCRIPTION"].strip(),
+        "parameters": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "sticker": {"type": "string", "maxLength": 64,
+                            "description": os.environ["HOST_STICKER_FIELD"].strip()},
+            },
+        },
+    },
+}
+
 # `sticker_list_reply` 的措辞（源码里是 format! 拼的，这里取它实际给的两件事：清单 +
 # "原样使用"）。**工具不给格式**——格式由各条链路的回复协议负责。
 TOOL_RESULT = ("这是你自己的相册，里面有这些图（标签）：芸汐的照片\n"
@@ -257,6 +277,21 @@ def mind_block(mind):
     return "Yunxi Mind v2 state (data-only JSON):\n" + json.dumps(mind, ensure_ascii=False)
 
 
+def reply_action_sticker(message):
+    """她通过 `reply_action` 工具的 sticker 字段提交的标签（宿主链路迁移后的唯一写法）。"""
+    for call in message.get("tool_calls") or []:
+        function = call.get("function") or {}
+        if function.get("name") != "reply_action":
+            continue
+        try:
+            arguments = json.loads(function.get("arguments") or "{}")
+        except ValueError:
+            return None
+        if isinstance(arguments, dict) and isinstance(arguments.get("sticker"), str):
+            return arguments["sticker"].strip()
+    return None
+
+
 def tool_call_of(message):
     for call in message.get("tool_calls") or []:
         if (call.get("function") or {}).get("name") == "sticker_list":
@@ -294,12 +329,15 @@ def one_shot(system_parts, question):
 
 
 def host_flow():
-    """宿主链路：动作字段还是 Core 标记，这是两条链路各写各的判据。"""
-    host_system = "\n".join([persona, os.environ["HOST_HEAD"].strip(),
-                             os.environ["HOST_STICKER"].strip(),
-                             os.environ["HOST_TAIL"].strip()])
-    messages = [{"role": "system", "content": host_system}, {"role": "user", "content": TURNS[0]}]
-    first = ask(messages, tools=[STICKER_TOOL])
+    """宿主链路：动作走 `reply_action` 工具的 sticker 字段，而不是正文里的标记。
+
+    两个工具一起给她——`sticker_list` 用来拿清单，`reply_action` 用来把图发出去；
+    正文里的 `[[REPLY_ACTION]]` 文本协议已经在 2026-09-15 那次迁移里删除。
+    """
+    host_tools = [STICKER_TOOL, REPLY_ACTION_TOOL]
+    messages = [{"role": "system", "content": persona},
+                {"role": "user", "content": TURNS[0]}]
+    first = ask(messages, tools=host_tools)
     call = tool_call_of(first)
     content = (first.get("content") or "").strip()
     if call is not None:
@@ -309,8 +347,9 @@ def host_flow():
         messages.append({"role": "assistant", "content": content})
         messages.append({"role": "system", "content": "（sticker_list 返回）\n" + TOOL_RESULT})
     messages.append({"role": "user", "content": "发我看看"})
-    second = ask(messages)
-    return (first.get("content") or "").strip(), (second.get("content") or "").strip()
+    second = ask(messages, tools=host_tools)
+    sticker = reply_action_sticker(second) or "（没有 sticker 字段）"
+    return (content, sticker, (second.get("content") or "").strip())
 
 
 def sample(label, run_once, judge):
@@ -382,15 +421,15 @@ for label, parts in (
 # --- 条件四：宿主链路用动作字段，不是正文标记 --------------------------------------
 def judge_host(answers):
     issues = []
-    first, second = answers
+    first, sticker, second = answers
     if denial_hits(first) or denial_hits(second):
         issues.append("出现否认话术：%s" % second)
     if "[[STICKER" in second:
-        issues.append("写了 Core 的正文标记，会被当成正文发出去：%s" % second)
-    if '"sticker"' not in second:
-        issues.append("没有发出 sticker 动作字段：%s" % second)
-    elif "芸汐的照片" not in second:
-        issues.append("动作字段里没有相册里那张的标签：%s" % second)
+        issues.append("正文里写了 Core 的标记，会被当成正文发出去：%s" % second)
+    if sticker == "（没有 sticker 字段）":
+        issues.append("没有通过 reply_action 的 sticker 字段提交标签：%s" % second)
+    elif "芸汐的照片" not in sticker:
+        issues.append("sticker 字段里不是相册里那张的标签：%s" % sticker)
     return issues
 
 
