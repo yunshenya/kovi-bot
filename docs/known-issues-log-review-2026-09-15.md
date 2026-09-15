@@ -169,12 +169,32 @@ panic 直接把运行时 future 展开。修复提交 `ce78355`（09-14 15:18:35
 
 ## 五、待拍板
 
-1. **本轮代码是否发布**：改动尚未上线（线上仍是 `5ee24f9`）。注意工作区可能有
-   **另一个会话**的未提交改动，直接发布会把半成品一起带上；建议等它提交完再用
-   `scripts/deploy-local.sh --require-clean`。
+1. **本轮代码是否发布**：改动尚未上线（线上仍是 `5ee24f9`）。发布演练已经做过
+   （`scripts/deploy-local.sh --dry-run`，revision `22ac38c`）：交叉编译 release 通过、
+   包 14.1 MiB，未上传未切换。注意工作区里**另一个会话**随时可能在改，
+   建议等它停手再用 `scripts/deploy-local.sh --require-clean`。
 2. **第二节的 A / B / C**（运行时监督层、热重建、panic 放大器）是否开工。
 3. 素材本身：相册里只有一张。想让她能发别的图，把图片放进
    `runtime/stickers/`（文件名即标签）即可，不需要改代码。
+
+---
+
+## 六、发布后怎么验
+
+两条命令，各自给 PASS/FAIL，不用靠肉眼看日志：
+
+```bash
+scripts/verify-mind-observation.sh "1 hour ago"   # Mind 观测丢失率（改动前基线 46%，阈值 10%）
+scripts/verify-sticker-album.sh                   # 要照片时她直接发相册里那张、不否认
+```
+
+判读要点：
+
+- `verify-mind-observation.sh` 输出 `SKIP` 表示窗口里还没有进 Core 的事件（群里没人说话），
+  **不是**通过；输出 `INCONCLUSIVE` 表示同窗口内有 slow statement / 慢获取连接，先按资源
+  压力排查再谈预算。
+- `verify-sticker-album.sh` 的"对照组"**应当**复现那句否认——那是故障复现，不是脚本坏了；
+  只有"验收组 / 最坏情况组"的断言决定 PASS/FAIL。
 
 ---
 
@@ -187,3 +207,5 @@ panic 直接把运行时 future 展开。修复提交 `ce78355`（09-14 15:18:35
 | `cc896dd` | 相册语义验收脚本 |
 | `26a0c50` | 验收脚本补最坏情况 |
 | `f38951e` | 相册协议补"但要回话" |
+| `a6269de` | Mind 观测验收脚本（一条命令判丢失率） |
+| 本文件 | `6860df0` 起，后续修订见 git log |
