@@ -3051,6 +3051,12 @@ const TASK_DECLARE_EXPECTABLE_EVENTS: &[(&str, yunxi_core::EventType)] =
 const TASK_DECLARE_TOOL_DESCRIPTION: &str = "声明这次任务要办成什么（goal），以及它之后应当发生什么（expecting，可省略）。这只把意图说清楚，不产生任何动作，也不要为了用它而调用它。形成任务的这一轮说一次即可。";
 
 /// The declaration function's schema.
+///
+/// The wire name must be the sanitized form: providers reject a function name
+/// containing a dot (`^[a-zA-Z0-9_-]+$`), and this spec is the one place the raw
+/// name would otherwise leak out. `take_task_declaration` reads the same wire
+/// form back, so the two must be derived from one place — which is why both go
+/// through `wire_tool_name`.
 fn task_declare_tool_spec() -> Value {
     let names: Vec<&str> = TASK_DECLARE_EXPECTABLE_EVENTS
         .iter()
@@ -3059,7 +3065,7 @@ fn task_declare_tool_spec() -> Value {
     json!({
         "type": "function",
         "function": {
-            "name": TASK_DECLARE_TOOL_NAME,
+            "name": tool_access::wire_tool_name(TASK_DECLARE_TOOL_NAME),
             "description": TASK_DECLARE_TOOL_DESCRIPTION,
             "parameters": {
                 "type": "object",
@@ -3181,15 +3187,20 @@ fn native_calls_to_core_intents(
     registry: &ToolRegistry,
 ) -> Vec<CognitiveIntent> {
     let mut intents = Vec::new();
+    // 声明函数的名字**不在注册表里**，所以 `resolve_wire_tool_name` 认不出它，会把线上
+    // 形态原样返回。因此必须拿线上形态直接比：先前写的是拿解析后的名字比注册名
+    // （`task_declare` vs `task.declare`），两者永远不相等，声明会被当成一个真动作交给
+    // Core——Core 的仲裁器 fail-closed，于是每一轮都多一次"工具未声明"的失败。
+    let declaration_wire = tool_access::wire_tool_name(TASK_DECLARE_TOOL_NAME);
     for call in calls {
         if intents.len() >= MAX_CORE_TOOL_CALLS {
             break;
         }
-        let name = registry.resolve_wire_tool_name(&call.name);
         // A declaration says what the task is for; it is not something to do.
-        if name == TASK_DECLARE_TOOL_NAME {
+        if call.name == declaration_wire {
             continue;
         }
+        let name = registry.resolve_wire_tool_name(&call.name);
         if name.trim() != name || name.is_empty() || name.chars().count() > 128 {
             continue;
         }
@@ -10019,7 +10030,14 @@ mod tests {
     fn the_declaration_function_declares_instead_of_acting() {
         let spec = task_declare_tool_spec();
         assert_eq!(spec["type"], "function");
-        assert_eq!(spec["function"]["name"], TASK_DECLARE_TOOL_NAME);
+        // 断言**线上形态**而不是内部常量。原来这里写的是 `== TASK_DECLARE_TOOL_NAME`，
+        // 拿常量自己跟自己比：`task.declare` 带着点上了线，每次工具轮都 400，
+        // 这条断言却一直是绿的（2026-09-15 00:43 线上）。
+        assert_eq!(
+            spec["function"]["name"],
+            crate::model::tool_access::wire_tool_name(TASK_DECLARE_TOOL_NAME)
+        );
+        assert_eq!(spec["function"]["name"], "task_declare");
         assert_eq!(
             spec["function"]["parameters"]["additionalProperties"],
             json!(false)
@@ -10031,6 +10049,45 @@ mod tests {
                 ["enum"],
             json!(["message_received"])
         );
+    }
+
+    /// 凡是手写 spec，函数名都必须是 provider 能收的形态。
+    ///
+    /// 这里防的是一整类 bug 而不是一次事故。给模型的工具清单有两个来源：注册表
+    /// （`tool_access::definition_spec`，内部统一过 `wire_tool_name`）和手写 spec
+    /// （本文件与 `model::reply`）。手写那一支绕开了注册表，谁把注册名原样填进
+    /// `"name"` 都不会有任何编译期或运行期提示，直到线上第一轮工具调用 400。
+    /// `task.declare` 就是这么上线的：DeepSeek 按 `^[a-zA-Z0-9_-]+$` 校验，
+    /// 带点直接整轮失败，她一个字都发不出来。
+    ///
+    /// 注册表那一支由 `tool_access` 自己的测试守（`definition_spec` 是唯一出口）；
+    /// 这里只管手写的这几份。新增手写 spec 时把它加进这个数组。
+    #[test]
+    fn every_hand_written_tool_spec_uses_a_wire_safe_name() {
+        let specs = [
+            ("task.declare 声明函数", task_declare_tool_spec()),
+            (
+                "reply_action（无语音无表情）",
+                crate::model::reply::reply_action_tool_spec(false, false),
+            ),
+            (
+                "reply_action（有语音有表情）",
+                crate::model::reply::reply_action_tool_spec(true, true),
+            ),
+        ];
+        for (label, spec) in specs {
+            let name = spec
+                .pointer("/function/name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_else(|| panic!("{label} 的 spec 里没有 /function/name"));
+            assert!(
+                !name.is_empty()
+                    && name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+                "{label} 的工具名 {name:?} 不符合 provider 的 ^[a-zA-Z0-9_-]+$，线上会 400"
+            );
+        }
     }
 
     /// 声明被读出来，坏的丢掉而不是毁掉整轮。
@@ -10076,6 +10133,10 @@ mod tests {
     }
 
     /// 声明永远不能变成动作——这是"它只说话不做事"的硬保证。
+    ///
+    /// 注册表用 `ToolRegistry::empty_for_test()`：全局 `tool_registry()` 在单元测试里
+    /// 永远是 `None`，用它会走进提前返回的分支、断言整条空转（这里是发现的第二个
+    /// 空转断言，改坏了也照样绿）。
     #[test]
     fn a_declaration_never_becomes_a_tool_intent() {
         use crate::model::utils::NativeToolCall;
@@ -10091,29 +10152,43 @@ mod tests {
             },
             NativeToolCall {
                 id: "call_search".to_string(),
-                name: "web.search".to_string(),
+                name: "web_search".to_string(),
                 arguments: serde_json::Map::new(),
                 raw_arguments: "{}".to_string(),
             },
         ];
-        let registry = match crate::model::tool_registry() {
-            Some(registry) => registry,
-            // 没有注册表（素材/配置未就位）时这条断言没有意义。
-            None => return,
-        };
+        // 空注册表：声明本来就不在注册表里，这里如实建模那条路径，
+        // 同时避开全局 `tool_registry()`（单元测试里永远是 `None`，
+        // 用它会走提前返回、整条断言空转）。
+        let registry = crate::model::tool_access::ToolRegistry::empty_for_test();
         let intents = native_calls_to_core_intents(
             &calls,
             ActionScope::Conversation(ConversationId::new()),
             ToolNotificationPolicy::Final,
             &registry,
         );
-        assert!(
-            !intents.iter().any(|intent| matches!(
-                intent,
-                yunxi_core::CognitiveIntent::UseTool { tool_name, .. }
-                    if tool_name == TASK_DECLARE_TOOL_NAME
-            )),
-            "声明被当成了动作: {intents:?}"
+        // 声明的**两个形态**都不能出现在意图里：线上形态（模型实际发回来的那个）和注册名。
+        // 原来这里只比注册名，而线上形态是 `task_declare`、注册名是 `task.declare`，
+        // 声明被当成动作时断言照样是绿的——又是一条拿常量自己跟自己比的断言。
+        let forbidden = [
+            TASK_DECLARE_TOOL_NAME.to_string(),
+            crate::model::tool_access::wire_tool_name(TASK_DECLARE_TOOL_NAME),
+        ];
+        let offenders: Vec<&String> = intents
+            .iter()
+            .filter_map(|intent| match intent {
+                yunxi_core::CognitiveIntent::UseTool { tool_name, .. } => Some(tool_name),
+                _ => None,
+            })
+            .filter(|tool_name| forbidden.contains(tool_name))
+            .collect();
+        assert!(offenders.is_empty(), "声明被当成了动作: {offenders:?}");
+        // 同时钉住"批次里的真动作确实转成了意图"，否则上面的断言会因为
+        // "整批都没转"而假绿。
+        assert_eq!(
+            intents.len(),
+            1,
+            "批次里只有 web.search 一个真动作该转成意图: {intents:?}"
         );
     }
 

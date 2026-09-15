@@ -1084,6 +1084,24 @@ pub(crate) fn tool_registry() -> Option<Arc<ToolRegistry>> {
 }
 
 impl ToolRegistry {
+    /// 测试用：一个**没有任何定义**的注册表。
+    ///
+    /// 为什么不直接给测试用全局 `tool_registry()`：它只在 `initialize()` 里填，
+    /// 需要配置、数据库与 MCP，单元测试里永远是 `None`——先前几个测试因此走了
+    /// `None => return` 的分支，断言整条空转，改坏了也照样绿。
+    ///
+    /// 为什么是"空"而不是塞几个真工具：本测试要覆盖的正是"名字不在注册表里"这条
+    /// 路径。声明函数本来就不在注册表里，`resolve_wire_tool_name` 对它退化成恒等，
+    /// 空注册表把这件事**如实**建模，比塞一个无关定义更准确。
+    #[cfg(test)]
+    pub(crate) fn empty_for_test() -> Self {
+        Self {
+            definitions: Vec::new(),
+            timeout: Duration::from_secs(1),
+            max_result_chars: 1_000,
+        }
+    }
+
     pub(crate) fn available_for_context(
         &self,
         name: &str,
@@ -4740,6 +4758,81 @@ mod tests {
             requires_external_tool: false,
             allow_reply_actions: false,
         }
+    }
+
+    /// 注册表发给模型的每个函数名都必须是 provider 能收的形态。
+    ///
+    /// `definition_spec` 是注册表 spec 的唯一出口，本测试钉住它确实过了
+    /// `wire_tool_name`：DeepSeek 按 `^[a-zA-Z0-9_-]+$` 校验函数名，注册名里的点
+    /// （`time.now`、`group.message.send`…）原样发出去就是整轮 400。
+    /// 手写 spec 那一支（`task.declare`）出过同一个事故，由 `yunxi::core_model`
+    /// 自己的守卫管；两边合起来覆盖"给模型的工具清单"这个整体。
+    #[test]
+    fn native_specs_use_wire_safe_function_names() {
+        let registry = ToolRegistry {
+            definitions: vec![
+                ToolDefinition {
+                    name: "time.now".to_string(),
+                    description: "current time".to_string(),
+                    input_schema: json!({"type": "object"}),
+                    source: ToolSource::Builtin(BuiltinTool::TimeNow),
+                },
+                ToolDefinition {
+                    name: "group.members.search".to_string(),
+                    description: "search members".to_string(),
+                    input_schema: json!({"type": "object"}),
+                    source: ToolSource::Builtin(BuiltinTool::GroupMemberSearch),
+                },
+                ToolDefinition {
+                    name: "group.message.send".to_string(),
+                    description: "send to a group".to_string(),
+                    input_schema: json!({"type": "object"}),
+                    source: ToolSource::Builtin(BuiltinTool::GroupMessageSend),
+                },
+            ],
+            timeout: Duration::from_secs(1),
+            max_result_chars: 1_000,
+        };
+        // 跨群发言只能从私聊发起、群成员检索只能在群里发起，所以没有任何**单个**
+        // 上下文能挂出全部三个。判据跑满两个上下文、看并集，才不会空转。
+        let private_context = test_tool_context();
+        let mut group_context = test_tool_context();
+        group_context.destination = MessageDestination::Group(42);
+
+        let mut seen: Vec<String> = Vec::new();
+        for context in [&private_context, &group_context] {
+            for spec in registry.native_tool_specs(context, ToolAllowance::Full) {
+                let name = spec
+                    .pointer("/function/name")
+                    .and_then(Value::as_str)
+                    .expect("每个 spec 都该有 /function/name");
+                assert!(
+                    !name.is_empty()
+                        && name
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+                    "注册表给出的工具名 {name:?} 不符合 provider 的 ^[a-zA-Z0-9_-]+$，线上会 400"
+                );
+                // 反向映射必须能回到注册名，否则模型调回来会被当成未知工具。
+                assert_ne!(
+                    registry.resolve_wire_tool_name(name),
+                    name,
+                    "带点的注册名 {name:?} 没有被换成线上形态"
+                );
+                seen.push(name.to_string());
+            }
+        }
+        seen.sort();
+        seen.dedup();
+        assert_eq!(
+            seen,
+            vec![
+                "group_members_search".to_string(),
+                "group_message_send".to_string(),
+                "time_now".to_string(),
+            ],
+            "三个带点的注册名都要经过 wire 形态，少一个都说明这个测试没覆盖到"
+        );
     }
 
     #[test]
