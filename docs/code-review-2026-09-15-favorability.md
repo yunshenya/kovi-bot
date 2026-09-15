@@ -1018,21 +1018,36 @@ JSON 对象就整条作废（registry 工具的行为不动），并有一条跨
 （`type: object` + `properties` + `additionalProperties: false`），只是全部字段可选、故不写
 `required`；用例（`fea30c0`）守住"每个字段都必须有显式 `type` 与非空 `description`"。
 
+**真机验证（`6081bbb`）**：文档原方案最后一步要求"跑一次真实的私聊/群聊端到端确认"。
+QQ 那一层需要先部署（不可逆红线，未动），但整条链路上唯一无法用替身回答的问题——**配置里的那个
+主模型拿到这份工具声明后到底会不会调它**——已经用真实端点测掉了：一条默认 ignored 的真机用例
+（跑的是仓库自己的请求组装，不是手搓请求）实测 `deepseek-v4-flash`：
+
+- 明确要求 @ 当前发言人 → `tool_calls=["reply_action"]`、`finish_reason="tool_calls"`，参数通过
+  宿主校验（两次实跑分别填了 `at_current_sender`+`quote_message_id` 与候选里的 `at_user_ref`，
+  两种都是合法表达）。
+- 普通闲聊 → **不调工具**且仍留下可见正文。反向这条同样关键：工具每轮都在手里，若她见谁都调，
+  每条回复都会多背一轮工具往返。
+
 **遗留与代价（如实记下）**：
 
-1. **没做真机端到端**。文档原方案最后一步要求"跑一次真实的私聊/群聊端到端确认"；那需要先把新代码
-   部署到运行中的机器人上（部署属于不可逆红线，须由你拍板），所以本轮只到自动化验证为止。
+1. **QQ 层端到端仍未做**：需要在运行中的机器人上部署新代码（部署须由你拍板）。自动化与真机探针
+   都过了，但"QQ 里真的发出这条 @ / 这次撤回 / 这张表情"这一步没有实测记录。
 2. `server.wire_api = "responses"` 的部署**拿不到原生工具**（`params_model_with_native_tools_mode`
    在非 `chat_completions` 时直接返回模型错误）。这是既有约束——Core 的工具轮、sticker-only 轮
-   在 responses 下本来就走不通——但这次把普通的结构化回复回合也纳入了同一约束：那些回合现在会以
-   模型错误结束并触发"回复链路异常"报警，不再有文本协议兜底。当前线上 `bot.conf.toml` 用的是
-   `chat_completions`，不受影响；`bot.conf.example.toml` 里示范的是 `responses`，要按它部署就得
-   先决定是补 responses 的工具支持、还是把示范改成 chat_completions。
+   在 responses 下本来就走不通——但这次把普通的结构化回复回合也纳入了同一约束：那些回合会以模型
+   错误结束并触发"回复链路异常"报警，不再有文本协议兜底。已按决定把示范配置与 README 一并改成
+   `chat_completions`（`e649ca1`，连 URL 一起改——`endpoint()` 只按 wire_api 补后缀）；要不要
+   给 responses 补原生工具支持（请求体 tools/tool_choice + 工具结果走 function_call_output +
+   工具循环历史换方言）**另立一项**，本次只消除模板陷阱。
 3. 顺带修（`e26c02a`）：`CORE_REPLY_REPAIR_PROMPT` 与 `core_tool_follow_up_instruction` 两处生产
    提示词还在教模型手写 `[[TOOL_CALL]]` 标记，而代码那条通道不带工具、校验器又一律拒收标记，
    照做必败；已改成 function-calling 口径。
+4. 顺带修（`6229ea2`）：对话摘要器的请求末尾被附了一份"本轮回复要求：先直接回应用户……"，
+   与它自己的"只输出摘要，不要回答对话"矛盾（§11.10 第 1 条）。改走不带回复引导的路径，并删掉
+   随之无用的 `interruptible_model_call` 与 `ModelGateway::complete_without_tools`。
 
-### 11.10 审到但未处理（本轮范围外，留作决定）
+### 11.10 审到的两处（已定：均按建议处理）
 
 迁移过程中顺手审到两处，都**不在** §11.9 的范围里，改动会影响别的子系统的实际提示词，所以只记不改：
 
@@ -1041,10 +1056,12 @@ JSON 对象就整条作废（registry 工具的行为不动），并有一条跨
    末尾附一份 `generate_reply_guidance`——"本轮回复要求：先直接回应用户当前真正想问或表达的内容……情绪=X，
    强度=Y/10"。而摘要器自己的 system 提示词写的是"你是聊天记录压缩器……只输出摘要，不要回答对话"。
    两条指令互相矛盾，且没有任何测试覆盖这条请求的组装。看起来是"通用模型调用"与"回复专用调用"没分开
-   的历史遗留。**建议**：摘要那条改走 `interruptible_model_call_without_reply_guidance`（或给它一个
-   专用 mode）；但这会改变每次会话压缩发给模型的提示词，属于"要拿摘要质量做取舍"，故先问。
+   的历史遗留。**已按建议修掉**（`6229ea2`）：改走 `interruptible_model_call_without_reply_guidance`
+   （`ModelPromptMode::None`，不附加任何引导），与它原本 `progress = None` 的调用方式一致。
 2. **`ModelGateway::complete_without_tools` 已无调用者**（本身带 `#[allow(dead_code)]`，本次迁移之前就
-   是死代码）。与第 1 条相关：如果摘要那条改走不带引导的路，我这次迁移顺带删掉的最后一个生产调用者
-   之外就再无用户，`interruptible_model_call` + `LegacyReplyGuidance` + `params_model_with_token_limit_
-   and_progress_for_reply` 会整条变成死链——那时可以一次删干净。现在删会连带删掉一个仍在用的入口，
-   所以留到第 1 条定了再动。
+   是死代码）。与第 1 条相关，**已一并处理**（`6229ea2`）：删掉该网关方法、`interruptible_model_call`
+   与 memory_query 那份 `ModelPromptMode::LegacyReplyGuidance` 分支。
+   **仍未动**：`utils.rs` 里 `params_model` → `params_model_with_token_limit` → `..._and_progress` →
+   `..._for_reply` 这条通用便利入口链（`params_model` 自带 `#[allow(dead_code)]`，迁移前就没人调，
+   但它像是被显式保留的通用 API）。删它会连带删掉 utils 那份 `ModelPromptMode::LegacyReplyGuidance`，
+   属于本任务范围外的清理，要不要删请说一声。
