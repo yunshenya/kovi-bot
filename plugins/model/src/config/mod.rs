@@ -609,7 +609,7 @@ pub fn qq_sticker_enabled() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::ModelConfig;
+    use super::{ModelConfig, Prompt};
     use config::{Config, FileFormat};
 
     /// 主配置写入必须叠加磁盘上的运行时覆盖——那才是写完重新加载会得到的配置。
@@ -617,6 +617,76 @@ mod tests {
     /// 单独校验主配置的后果不只是"误判跨段规则"：管理后台 `install` 的是校验结果，
     /// 于是覆盖会**当场从内存里失效**（磁盘上还在），要等下次重启才回来。这条同时
     /// 钉住"旧行为会丢覆盖"，免得有人把合并那步删掉。
+    /// 发布后要做的生产配置变更，先在这里按真实合并路径验一遍。
+    ///
+    /// 现场长这样：主配置 `bot.conf.toml` 里还是**旧的两段全文**（人格 + 场景各写一份，
+    /// 且以"你叫芸汐…"开头），override 里新增 `[prompt]` 的 persona + 场景差异。
+    /// 合并后必须满足两件事：三段都来自 override；`group_prompt()` 拼出来的人格**只出现
+    /// 一次**——否则新代码会把 persona 接在旧全文前面，一轮里说两遍她是谁。
+    #[test]
+    fn persona_override_replaces_the_duplicated_legacy_prompts() {
+        let dir = std::env::temp_dir().join(format!("kovi-persona-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("应建临时目录");
+        let override_path = dir.join("bot.conf.override.toml");
+
+        // 主配置：旧写法（人格抄进两份，且是线上那种开头）。
+        let main = "[prompt]\n\
+                    system_prompt = \"你叫芸汐，是一个温柔的女孩子。群聊规则若干。\"\n\
+                    private_prompt = \"你叫芸汐，是一个温柔的女孩子。私聊规则若干。\"\n";
+
+        std::fs::write(
+            &override_path,
+            "[prompt]\n\
+             persona = \"你叫芸汐，是一个温柔、害羞、慢热而认真的女孩子。\"\n\
+             system_prompt = \"群聊场景：在群里像朋友一样自然参与。\"\n\
+             private_prompt = \"私聊场景：像熟悉已久的朋友一样亲近。\"\n",
+        )
+        .expect("应写临时覆盖");
+
+        let merged = super::validate_main_candidate_with_override(main, &override_path)
+            .expect("主配置 + 覆盖应通过校验");
+        let prompt = merged.prompt();
+        assert_eq!(
+            prompt.persona(),
+            "你叫芸汐，是一个温柔、害羞、慢热而认真的女孩子。"
+        );
+        assert_eq!(
+            prompt.system_prompt(),
+            "群聊场景：在群里像朋友一样自然参与。"
+        );
+        assert_eq!(
+            prompt.private_prompt(),
+            "私聊场景：像熟悉已久的朋友一样亲近。"
+        );
+
+        let group = prompt.group_prompt();
+        let direct = prompt.direct_prompt();
+        assert_eq!(
+            group.matches("你叫芸汐").count(),
+            1,
+            "人格只能说一次：{group}"
+        );
+        assert_eq!(
+            direct.matches("你叫芸汐").count(),
+            1,
+            "人格只能说一次：{direct}"
+        );
+        assert!(!group.contains("群聊规则若干"), "旧全文不该留下：{group}");
+        assert!(group.contains("群聊场景："), "场景差异要跟上：{group}");
+
+        // 对照：没有 override 时读到的还是旧写法——这正是发布后必须推配置的原因。
+        let alone = super::validate_candidate(main).expect("候选主配置本身合法");
+        assert_eq!(
+            alone.prompt().persona(),
+            Prompt::default().persona(),
+            "旧主配置里没有 persona，读到的是代码默认值"
+        );
+        assert!(alone.prompt().system_prompt().contains("你叫芸汐"));
+
+        std::fs::remove_file(&override_path).ok();
+        std::fs::remove_dir(&dir).ok();
+    }
+
     #[test]
     fn main_candidate_keeps_the_runtime_override() {
         let dir = std::env::temp_dir().join(format!("kovi-cfg-{}", std::process::id()));
