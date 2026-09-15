@@ -107,9 +107,20 @@ impl SimulationInput {
                 reason: "simulation world version mismatch",
             });
         }
-        if self.generated_at < DateTime::<Utc>::MIN_UTC {
+        Ok(())
+    }
+
+    /// 带"现在"的校验：生成时刻不能来自未来。
+    ///
+    /// 原来这里写的是 `generated_at < DateTime::<Utc>::MIN_UTC`——永假，等于
+    /// `SimulationInput` 根本没有时间校验。时钟回拨或构造错误会让一份"来自未来"
+    /// 的模拟混进快照，而这一层没有任何办法发现它；`validate_at` 让调用方（手上
+    /// 才有真正的 now）能问出这个问题。
+    pub fn validate_at(&self, now: DateTime<Utc>) -> Result<(), WorldValidationError> {
+        self.validate()?;
+        if self.generated_at > now {
             return Err(WorldValidationError::InvalidTimestamp {
-                reason: "simulation generated_at invalid",
+                reason: "simulation generated_at is in the future",
             });
         }
         Ok(())

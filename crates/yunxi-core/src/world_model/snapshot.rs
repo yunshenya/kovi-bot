@@ -1234,10 +1234,34 @@ pub(super) fn build_snapshot(
 
     // Relevant causal knowledge: high-confidence relations matching scope,
     // confidence-descending (v4 §64, §136).
-    let person_id = context.person_ids().first().copied();
-    let causal = world
-        .causal()
-        .relevant(person_id, context.conversation_id(), limits.causal())
+    //
+    // 上下文里可以有多个参与者（一场群聊最多 8 个），而 `relevant` 一次只认一个
+    // person。此前只取 `person_ids().first()`，第 2..8 个人的 person-specific 因果
+    // 关系全部被丢掉——而它们正是"这个人身上会怎样"那部分。这里逐个人取一遍、
+    // 按 id 去重再统一排序截断；最后再补一次 `None`，让 Global / 会话 / 工具 / 宿主
+    // 作用域的关系也进来（`None` 只排除 person-specific）。
+    let mut matched: Vec<&super::causal::CausalRelation> = Vec::new();
+    let mut seen: std::collections::HashSet<super::CausalRelationId> =
+        std::collections::HashSet::new();
+    for person_id in context
+        .person_ids()
+        .iter()
+        .map(|id| Some(*id))
+        .chain([None])
+    {
+        for relation in
+            world
+                .causal()
+                .relevant(person_id, context.conversation_id(), limits.causal())
+        {
+            if seen.insert(relation.id()) {
+                matched.push(relation);
+            }
+        }
+    }
+    matched.sort_by(|a, b| b.confidence().total_cmp(&a.confidence()));
+    matched.truncate(limits.causal());
+    let causal = matched
         .into_iter()
         .map(CausalRelationSnapshot::from_relation)
         .collect();

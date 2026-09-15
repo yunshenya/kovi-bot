@@ -179,6 +179,12 @@ use serde::{Deserialize, Serialize};
 /// "刚刚发生过什么"；再久就只是占地方的旧账。
 const SITUATION_TERMINAL_GRACE: chrono::Duration = chrono::Duration::hours(24);
 
+/// 世界模型里不确定项的总量上限（超出时淘汰最久没观测到的）。
+///
+/// 快照另有 `MAX_UNCERTAINTIES_PER_SNAPSHOT`（每次给模型看几条）；这个管的是
+/// **状态本身**能存多少——没有它，`add_uncertainty` 是唯一一条无界增长的路。
+const MAX_UNCERTAINTIES_PER_WORLD: usize = 64;
+
 /// 情境列表的硬上限（终态优先淘汰，活动中的不动）。
 ///
 /// 与 `MAX_ACTIVE_SITUATIONS_PER_SCOPE` 是两件事：那个管"同时活着几条"，
@@ -769,6 +775,18 @@ impl WorldModel {
         uncertainty: WorldUncertainty,
     ) -> Result<(), WorldValidationError> {
         uncertainty.validate()?;
+        // 这一处此前是**唯一没有上限**的集合（其它集合在各自的 mutator 或
+        // `validate` 里都有 cap），而它照样会落盘：`WorldModel` 的模块注释写着
+        // "bounded (text, counts, confidence)"。到顶时淘汰最久没观测到的那一条。
+        if self.uncertainties.len() >= MAX_UNCERTAINTIES_PER_WORLD
+            && let Some((oldest, _)) = self
+                .uncertainties
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, existing)| existing.observed_at())
+        {
+            self.uncertainties.remove(oldest);
+        }
         self.uncertainties.push(uncertainty);
         self.version = self.version.saturating_add(1);
         Ok(())
@@ -1482,6 +1500,82 @@ mod tests {
             at,
         )
         .expect("situation")
+    }
+
+    #[test]
+    fn the_snapshot_includes_causal_knowledge_for_every_person_in_context() {
+        // 因果快照此前只取 `person_ids().first()`，第 2..8 个参与者的
+        // person-specific 关系全部被丢掉——而它们正是"这个人身上会怎样"那部分。
+        let now = Utc::now();
+        let first = PersonId::new();
+        let second = PersonId::new();
+        let mut world = WorldModel::new();
+        for person in [first, second] {
+            world
+                .add_causal_relation(
+                    super::causal::CausalRelation::new(
+                        super::CausalRelationId::new(),
+                        super::causal::WorldPattern::new(
+                            super::causal::PatternKind::Environment,
+                            "rate_limited",
+                        )
+                        .expect("cause"),
+                        super::causal::WorldPattern::new(
+                            super::causal::PatternKind::Tool,
+                            format!("outcome_{}", person.into_uuid()),
+                        )
+                        .expect("effect"),
+                        0.8,
+                        0.9,
+                        super::causal::CausalSource::DomainRule,
+                        super::causal::CausalScope::PersonSpecific { person_id: person },
+                        1,
+                    )
+                    .expect("relation"),
+                )
+                .expect("promote");
+        }
+        let context = WorldSnapshotContext::new(now)
+            .with_person(first)
+            .with_person(second);
+        let snapshot = world.snapshot_for(&context).expect("snapshot");
+        assert_eq!(
+            snapshot.causal().len(),
+            2,
+            "上下文里的每个参与者都该带出自己的因果知识"
+        );
+    }
+
+    #[test]
+    fn uncertainties_are_bounded_like_every_other_collection() {
+        // `add_uncertainty` 是唯一没有上限的 mutator，而它照样落盘。
+        let now = Utc::now();
+        let mut world = WorldModel::new();
+        for index in 0..(MAX_UNCERTAINTIES_PER_WORLD + 4) {
+            world
+                .add_uncertainty(
+                    WorldUncertainty::new(
+                        super::UncertaintyId::new(),
+                        super::UncertaintyType::StateUnknown,
+                        WorldScope::Global,
+                        format!("第 {index} 条"),
+                        now - Duration::minutes((MAX_UNCERTAINTIES_PER_WORLD + 4 - index) as i64),
+                        None,
+                    )
+                    .expect("uncertainty"),
+                )
+                .expect("add");
+        }
+        assert_eq!(world.uncertainties().len(), MAX_UNCERTAINTIES_PER_WORLD);
+        // 最久没观测到的那条先走。
+        assert!(
+            !world
+                .uncertainties()
+                .iter()
+                .any(|item| item.note().contains("第 0 条")),
+            "最旧的应当被淘汰"
+        );
+        world.validate().expect("valid");
     }
 
     #[test]

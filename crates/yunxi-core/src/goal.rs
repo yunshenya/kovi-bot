@@ -301,12 +301,9 @@ impl Goal {
         if self.state == state {
             return Ok(());
         }
-        if state == GoalState::Active && self.state == GoalState::Cancelled {
-            return Err(GoalValidationError::InvalidTransition {
-                from: self.state,
-                to: state,
-            });
-        }
+        // `Cancelled → Active` 这一条不需要单独判：Cancelled 是终态，上面的
+        // `is_terminal() && self.state != state` 已经把它挡掉了。留着只会让读者
+        // 以为存在一条没被覆盖的复活路径。
         self.state = state;
         self.updated_at = now;
         self.completed_at = (state == GoalState::Completed).then_some(now);
