@@ -146,18 +146,26 @@ mod tests {
         // `NaN < 0.0` 与 `NaN > capacity` 同时不成立，所以只比较大小的写法会让
         // 一份 NaN 预留整份通过校验，一直到 AttentionBudget::new 才以另一个错误
         // 被拒——那时已经离配置来源很远了。
-        let mut policy = ExecutivePolicy::default();
-        policy.critical_attention_reserve = f32::NAN;
+        let nan = ExecutivePolicy {
+            critical_attention_reserve: f32::NAN,
+            ..ExecutivePolicy::default()
+        };
         assert!(
-            matches!(policy.validate(), Err(ExecutivePolicyError::InvalidBudget)),
+            matches!(nan.validate(), Err(ExecutivePolicyError::InvalidBudget)),
             "NaN 预留必须在策略这一层就被拒"
         );
-        policy.critical_attention_reserve = f32::INFINITY;
+        let infinite = ExecutivePolicy {
+            critical_attention_reserve: f32::INFINITY,
+            ..ExecutivePolicy::default()
+        };
         assert!(matches!(
-            policy.validate(),
+            infinite.validate(),
             Err(ExecutivePolicyError::InvalidBudget)
         ));
-        policy.critical_attention_reserve = 0.0;
-        assert!(policy.validate().is_ok(), "正常值不受影响");
+        let normal = ExecutivePolicy {
+            critical_attention_reserve: 0.0,
+            ..ExecutivePolicy::default()
+        };
+        assert!(normal.validate().is_ok(), "正常值不受影响");
     }
 }

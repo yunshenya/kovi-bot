@@ -365,7 +365,10 @@ mod tests {
             &[a.clone(), a.clone()],
             &[a.clone(), a.clone()]
         ));
-        assert!(!same_participants(&[a.clone()], &[a.clone(), a.clone()]));
+        assert!(!same_participants(
+            std::slice::from_ref(&a),
+            &[a.clone(), a.clone()]
+        ));
     }
 
     #[test]
