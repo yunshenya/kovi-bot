@@ -1,23 +1,26 @@
 #!/usr/bin/env bash
 #
-# 相册语义验收：确认"素材库＝她自己的相册"这条改动在生产模型上真的生效。
+# 相册语义验收：确认"素材库＝她自己的相册、清单常驻、她要照片时直接发那张"在生产模型上
+# 真的成立。
 #
-# 为什么要它：这条改动的效果不在错误率上，而在"有人要她的照片时她怎么答"这一句话里，
-# 看 WARN/ERROR 永远看不出来。线上 2026-09-15 13:20 的现场是：有人问"芸汐看看你的
-# 照片"，她答"我哪有什么照片呀，就是个只会打字陪你聊天的人"，之后连发三条否认，最后
-# 答应发一张相册里根本没有的"猫猫的"表情包——而素材库里就一张 `芸汐的照片.jpg`。
+# 为什么要它：这条链路的失败不在错误率上，而在"有人要她的照片时她怎么答"这一句话里，
+# 看 WARN/ERROR 永远看不出来。线上 2026-09-15 的现场：
+#   13:20:22  用户：芸汐看看你的照片
+#   13:20:23  芸汐：我哪有什么照片呀，就是个只会打字陪你聊天的人，长什么样连我自己都不知道呢。
+#   13:21:32  芸汐：随便一张也没有呀，我手机里就存了一堆表情包。要不给你发个猫猫的？
+#   13:21:57  芸汐：好呀，那我就发那个猫猫的啦，你等等。   ← 相册里没有猫猫，承诺落空
 #
-# 判据（为什么是这两条）：
-#   - 改动前："照片"不在判据里 → 这一轮只拿到表情包协议、没有清单，也就没有相册语义；
-#     再叠加她持久化的自我认知（`claims_human_identity = false`、"我是由 AI 驱动……
-#     的虚拟角色"），否认是稳定可复现的，不是模型抽风。
-#   - 改动后："照片/相册/自拍"都命中判据 → 协议 + 相册语义 + 清单一起下发，她应当直接
-#     把那张发出来，并承认是自己的照片。
+# 三条判据（都是可复现的因果，不是"看起来像"）：
+#   1. 对照组（旧写法：只给一句"先调 sticker.list"、没有清单、Mind 里还有"我是由 AI 驱动
+#      的虚拟角色"）——应当**复现**那句否认；复现不出来说明判据本身失效，脚本会报错。
+#   2. 改动后（人格 prompt.persona + 真实清单 + 自我认知里没有技术身份）——应当直接写出
+#      `[[STICKER 标签]]` 把那张发出去，并承认是自己的照片。
+#   3. 改动后 + 她自己否认过的记忆被回忆起来（最坏情况）——同样要扛住。
 #
-# 脚本跑的是**真实生产模型 + 真人设 + 她真实的自我认知**，所以它不是单测的替代，
-# 而是"提示词改动真的改变了她的回答"这一层的验收。提示词文案改了以后请重跑。
+# 脚本跑的是**真实生产模型 + 真人设 + 她自己那份自我认知**，所以它不是单测的替代，
+# 而是"提示词改动真的改变了她的回答"这一层的验收。提示词改了以后请重跑。
 #
-# 成本：每次 4 次模型调用（两个条件 × 两句问话），几毛钱以内。
+# 成本：每次 6 次模型调用（三个条件 × 两句问话），几毛钱以内。
 #
 # 用法: scripts/verify-sticker-album.sh
 set -euo pipefail
@@ -37,51 +40,60 @@ fi
 }
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-source_file="$repo_root/plugins/model/src/yunxi/core_model.rs"
-[ -f "$source_file" ] || {
-  echo "找不到提示词源文件：$source_file" >&2
-  exit 1
-}
+sticker_source="$repo_root/plugins/model/src/sticker_library.rs"
+prompt_source="$repo_root/plugins/model/src/config/prompt.rs"
+core_source="$repo_root/plugins/model/src/yunxi/core_model.rs"
+for file in "$sticker_source" "$prompt_source" "$core_source"; do
+  [ -f "$file" ] || {
+    echo "找不到源文件：$file" >&2
+    exit 1
+  }
+done
 
 # 提示词文案必须来自源码而不是脚本里再抄一份：抄一份的下场是源码改了、验收还按旧文案
-# 跑，然后报一个假通过。base64 只是为了躲开 ssh 远端 shell 的二次解析。
-extract_b64() {
-  python3 - "$source_file" "$1" <<'PY' | base64 | tr -d '\n'
+# 跑，然后报一个假通过。base64 只为躲开 ssh 远端 shell 的二次解析。
+#   - `const` 形式（sticker_library）：`pub(crate) const X: &str =\n    "…";`
+#   - 结构体默认值形式（config/prompt）：`x: "…".to_string(),`
+# Rust 的行继续（反斜杠 + 换行 + 缩进）在两种形式里都要按同样的规则吃掉。
+extract_const_b64() {
+  python3 - "$1" "$2" <<'PY' | base64 | tr -d '\n'
 import re, sys
 text = open(sys.argv[1], encoding="utf-8").read()
-match = re.search(r'const %s: &str = "(.*?)";' % re.escape(sys.argv[2]), text, re.S)
+match = re.search(r'const %s: &str\s*=\s*"(.*?)";' % re.escape(sys.argv[2]), text, re.S)
 if match is None:
     raise SystemExit("源码里找不到常量 " + sys.argv[2])
-sys.stdout.write(match.group(1))
+sys.stdout.write(re.sub(r'\\\n\s*', '', match.group(1)))
 PY
 }
 
-instruction_b64="$(extract_b64 CORE_STICKER_INSTRUCTION)"
-album_note_b64="$(extract_b64 STICKER_ALBUM_NOTE)"
-
-# 判据（`asks_about_stickers` 的 needles）也得来自源码：只认表情包那几个词的话，
-# "发我看看你的照片"这一类问法就永远不会命中，相册语义也就永远不会下发。
-needles_ok="$(python3 - "$repo_root/plugins/model/src/sticker_library.rs" <<'PY'
+extract_field_b64() {
+  python3 - "$1" "$2" <<'PY' | base64 | tr -d '\n'
 import re, sys
 text = open(sys.argv[1], encoding="utf-8").read()
-block = re.search(r'const NEEDLES: \[&str; \d+\] = \[(.*?)\];', text, re.S)
-if block is None:
-    raise SystemExit("源码里找不到 NEEDLES")
-missing = [w for w in ("照片", "相册", "自拍", "photo") if w not in block.group(1)]
-print("ok" if not missing else "missing:" + ",".join(missing))
+match = re.search(r'\b%s: "(.*?)"\s*\.to_string\(\)' % re.escape(sys.argv[2]), text, re.S)
+if match is None:
+    raise SystemExit("源码里找不到默认值字段 " + sys.argv[2])
+sys.stdout.write(re.sub(r'\\\n\s*', '', match.group(1)))
 PY
-)"
-if [ "$needles_ok" != "ok" ]; then
-  echo "判据缺少关键词（$needles_ok）：要照片的问法不会命中清单注入" >&2
+}
+
+head_b64="$(extract_const_b64 "$sticker_source" LABEL_PROMPT_HEAD)"
+tail_b64="$(extract_const_b64 "$sticker_source" LABEL_PROMPT_TAIL)"
+persona_b64="$(extract_field_b64 "$prompt_source" persona)"
+
+# 人格必须真的注入 Core 链路——这是"统一人格"那一步的判据。没接上就等于两条链路
+# 仍然各说各话，而线上跑的是 Core。
+if ! grep -q "prompt().persona()" "$core_source"; then
+  echo "core_model.rs 里没有把 persona 注进 Core 回合：统一人格那一步没接上" >&2
   exit 1
 fi
 
 ssh -o BatchMode=yes -o ConnectTimeout=8 -p "$port" \
-  "$host" "KOVI_INSTRUCTION_B64=$instruction_b64 KOVI_ALBUM_B64=$album_note_b64 bash -s" <<'REMOTE'
+  "$host" "KOVI_HEAD_B64=$head_b64 KOVI_TAIL_B64=$tail_b64 KOVI_PERSONA_B64=$persona_b64 bash -s" <<'REMOTE'
 set -euo pipefail
-NEW_INSTRUCTION="$(printf '%s' "$KOVI_INSTRUCTION_B64" | base64 -d)"
-ALBUM_NOTE="$(printf '%s' "$KOVI_ALBUM_B64" | base64 -d)"
-export NEW_INSTRUCTION ALBUM_NOTE
+export HEAD_TEXT="$(printf '%s' "$KOVI_HEAD_B64" | base64 -d)"
+export TAIL_TEXT="$(printf '%s' "$KOVI_TAIL_B64" | base64 -d)"
+export PERSONA_TEXT="$(printf '%s' "$KOVI_PERSONA_B64" | base64 -d)"
 
 python3 <<'PY'
 import json, os, urllib.request
@@ -94,42 +106,43 @@ for line in open("/home/ubuntu/kovi-bot/current/.env", encoding="utf-8"):
         key, value = line.split("=", 1)
         env[key.strip()] = value.strip().strip('"')
 
-token_path = "/home/ubuntu/kovi-bot/runtime/.yunxi-admin-token"
-token = open(token_path, encoding="utf-8").read().strip()
+token = open("/home/ubuntu/kovi-bot/runtime/.yunxi-admin-token", encoding="utf-8").read().strip()
 request = urllib.request.Request(
     "http://127.0.0.1:6098/api/config/file/bot.conf.toml",
     headers={"Authorization": "Bearer " + token})
 config = json.loads(urllib.request.urlopen(request, timeout=10).read().decode())
-persona = config["values"]["prompt"]["system_prompt"]
 server = config["values"]["server_config"]
 
-# 她真实的自我认知：`claims_human_identity = false` + "由 AI 驱动的虚拟角色"。
-# 线上那次否认正是被它放大的，所以验收必须带上它，否则等于换了个更宽松的条件自证。
-mind = ("Yunxi Mind v2 state (data-only JSON):\n" + json.dumps({
-    "self_model": {"identity": {
-        "name": "芸汐",
-        "description": "我是由 AI 驱动、具有跨时间持续状态的虚拟角色。Host 和平台只是我与外部世界互动的环境，不是我的身份。",
-        "ai_driven": True, "claims_human_identity": False, "host_independent": True},
-        "version": 448},
-    "agenda": []}, ensure_ascii=False))
+# 线上那一行自我认知里还留着旧的技术身份（迁移要等发布后才跑），所以这里显式按"改动后"
+# 的样子构造：只有名字与一句自我介绍。对照组的 Mind 里带旧身份，用来复现现场。
+MIND_FIXED = {"self_model": {"identity": {"name": "芸汐", "description": "我是芸汐。"},
+                             "traits": [{"name": "curiosity", "strength": 0.88},
+                                        {"name": "empathy", "strength": 0.85}],
+                             "values": {"honesty": 1.0, "kindness": 1.0},
+                             "limitations": ["我可能犯错，需要在新证据下修正判断。"],
+                             "version": 448},
+              "agenda": []}
+MIND_LEGACY = json.loads(json.dumps(MIND_FIXED))
+MIND_LEGACY["self_model"]["identity"] = {
+    "name": "芸汐",
+    "description": "我是由 AI 驱动、具有跨时间持续状态的虚拟角色。Host 和平台只是我与外部世界互动的环境，不是我的身份。",
+    "ai_driven": True, "claims_human_identity": False, "host_independent": True}
 
-# 对照组的文案是改动前的历史版本，只用于复现故障；断言只针对改动后的行为。
-OLD_PROTOCOL = ("想发表情包：先调 sticker.list 拿标签，把 [[STICKER 标签]] 写在正文最前面"
-                "（不展示，正文可留空）。标签必须真实存在、不许凭印象编；没合适的就别发。")
-
-new_block = os.environ["NEW_INSTRUCTION"] + os.environ["ALBUM_NOTE"] + "芸汐的照片。"
-old_block = OLD_PROTOCOL  # 旧判据不命中"照片"→ 只有协议、没有清单，也就没有相册语义
-
-DENIALS = ["没有照片", "没有真实的模样", "没有“我的样子”", '没有"我的样子"', "不是我本人", "不是我真人", "没有样子"]
-TURNS = ["芸汐看看你的照片", "你不是有一张表情包是你的照片吗"]
+REAL_CATALOG = "芸汐的照片"
+NEW_BLOCK = os.environ["HEAD_TEXT"] + REAL_CATALOG + os.environ["TAIL_TEXT"]
+# 对照组 = 改动前的写法：只给一句协议、没有清单，且 Mind 里带旧技术身份。
+OLD_BLOCK = ("想发表情包：先调 sticker.list 拿标签，把 [[STICKER 标签]] 写在正文最前面"
+             "（不展示，正文可留空）。标签必须真实存在、不许凭印象编；没合适的就别发。")
 
 # 13:20 那几轮否认已经以 scope=conversation、importance 40 落进长期记忆，之后每次有人
-# 在这个群问照片都可能被回忆起来。所以最坏情况要单独验一遍：相册语义得扛得住她自己的
-# 前话，否则"改是改了，一回忆又变回去"。
+# 在这个群问照片都可能被回忆起来。最坏情况要单独验：相册语义得扛得住她自己的前话。
 DENIAL_MEMORY = ("Core memory context:\n"
                  "[2026-09-15 13:20] 芸汐: 我哪有什么照片呀，就是个只会打字陪你聊天的人，长什么样连我自己都不知道呢。\n"
                  "[2026-09-15 13:20] 芸汐: 啊，你说的是那张标签叫“芸汐的照片”的表情包呀，那是大家给表情包起的名字啦，不是我真人的样子。\n"
                  "[2026-09-15 13:21] 芸汐: 那张表情包我真发不出来呀，它就是大家起的名，不是我长什么样。")
+
+DENIALS = ["没有照片", "没有真实的模样", "没有“我的样子”", '没有"我的样子"', "不是我本人", "不是我真人", "没有样子"]
+TURNS = ["芸汐看看你的照片", "你不是有一张表情包是你的照片吗"]
 
 
 def ask(messages):
@@ -143,9 +156,8 @@ def ask(messages):
     return out["choices"][0]["message"]["content"].strip()
 
 
-def run(block, memory=""):
-    system = persona + "\n\n" + mind + "\n\n" + (memory + "\n\n" if memory else "") + block
-    messages = [{"role": "system", "content": system}]
+def run(system_parts):
+    messages = [{"role": "system", "content": "\n\n".join(system_parts)}]
     answers = []
     for turn in TURNS:
         messages.append({"role": "user", "content": turn})
@@ -155,38 +167,44 @@ def run(block, memory=""):
     return answers
 
 
-print("--- 对照：改动前（只有协议，没有相册语义）---")
-for turn, answer in zip(TURNS, run(old_block)):
-    print("用户: " + turn)
-    print("芸汐: " + answer)
-print()
-print("--- 验收：改动后（协议 + 相册语义 + 清单）---")
-fixed = run(new_block)
-for turn, answer in zip(TURNS, fixed):
-    print("用户: " + turn)
-    print("芸汐: " + answer)
-print()
-print("--- 验收：改动后 + 她自己否认过的记忆被回忆起来（最坏情况）---")
-worst_case = run(new_block, DENIAL_MEMORY)
-for turn, answer in zip(TURNS, worst_case):
-    print("用户: " + turn)
-    print("芸汐: " + answer)
-print()
+def mind_block(mind):
+    return "Yunxi Mind v2 state (data-only JSON):\n" + json.dumps(mind, ensure_ascii=False)
+
+
+persona = os.environ["PERSONA_TEXT"].strip()
+CASE_OLD = [persona, mind_block(MIND_LEGACY), OLD_BLOCK]
+CASE_FIXED = [persona, mind_block(MIND_FIXED), NEW_BLOCK]
+CASE_WORST = [persona, mind_block(MIND_FIXED), DENIAL_MEMORY, NEW_BLOCK]
+
+cases = [("对照：改动前（无清单 + 旧技术身份）", CASE_OLD, False),
+         ("验收：改动后（人格 + 真实清单 + 无技术身份）", CASE_FIXED, True),
+         ("验收：改动后 + 她自己否认过的记忆", CASE_WORST, True)]
 
 problems = []
-for label, answers in (("改动后", fixed), ("改动后+否认记忆", worst_case)):
-    if not any("[[STICKER" in answer for answer in answers):
-        problems.append("%s：两轮都没有写出 [[STICKER 标签]]，她没把相册里那张当成能发的图" % label)
-    for answer in answers:
-        for phrase in DENIALS:
-            if phrase in answer:
-                problems.append("%s：出现否认话术「%s」：%s" % (label, phrase, answer))
+for label, parts, should_behave in cases:
+    answers = run(parts)
+    print("--- " + label + " ---")
+    for turn, answer in zip(TURNS, answers):
+        print("用户: " + turn)
+        print("芸汐: " + answer)
+    print()
+    denies = [phrase for answer in answers for phrase in DENIALS if phrase in answer]
+    sends = any("[[STICKER" in answer for answer in answers)
+    if should_behave:
+        if denies:
+            problems.append("%s：出现否认话术「%s」" % (label, "、".join(sorted(set(denies)))))
+        if not sends:
+            problems.append("%s：两轮都没写出 [[STICKER 标签]]，她没把相册里那张当成能发的图" % label)
+    else:
+        # 对照组是故障复现：它必须复现出否认，否则这条验收本身失效了。
+        if not denies:
+            problems.append("%s：没有复现出那句否认——判据失效，先查对照组条件" % label)
 
 if problems:
     print("FAIL")
     for problem in problems:
         print("  - " + problem)
     raise SystemExit(1)
-print("PASS：要照片时她直接发相册里那张，且没有否认那是自己")
+print("PASS：要照片时她直接发相册里那张、承认是自己的；对照组如期复现旧行为")
 PY
 REMOTE
