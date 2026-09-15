@@ -1986,8 +1986,16 @@ fn release_unconfirmed_slot(state: &mut GroupInterjectionState, at: Instant) {
 /// 这个区别在线上踩出来过（2026-09-14 19:14）：看门狗那一轮扫描去等一个还没
 /// 解决的 pending admission，等满 60 秒触发超时告警，还把这一轮扫描整段取消
 /// ——而 30 秒后它本来就会再来一次。等待只属于"回合收尾"的语义。
+///
+/// 群聊与私聊共用这一对取值：私聊看门狗原先没有这个开关，走的是请求路径那套
+/// 排空逻辑，单个残留 admission 就能让整轮扫描卡到租约上限（180 秒），本轮其他
+/// 私聊用户一起被跳过。
+///
+/// 群聊与私聊共用这一对取值：私聊看门狗原先没有这个开关，走的是请求路径那套
+/// 排空逻辑，单个残留 admission 就能让整轮扫描卡到租约上限（180 秒），本轮其他
+/// 私聊用户一起被跳过。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WindowDrainWait {
+pub(crate) enum WindowDrainWait {
     /// 等到在途 admission 解决再领队：回合收尾用，后面的消息要按序接上。
     ForPendingAdmission,
     /// 领不到就走：看门狗用，下一轮马上还会来，绝不能让整轮扫描卡住。

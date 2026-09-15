@@ -7,6 +7,7 @@ use crate::model::conversation_coordinator::{
     ConversationCoordinator, IncomingAdmission, PendingTurn, WindowClaim, WindowQueueDecision,
     window_queue_decision,
 };
+use crate::model::group::WindowDrainWait;
 use crate::model::interrupt::{
     ReplyScope, ReplyTicket, clear_reply_state_locked, is_active, scope_mutex,
 };
@@ -868,7 +869,13 @@ pub(crate) async fn private_message_event_after_ingress(
     )
     .await;
     shadow_guard.mark_replied(true);
-    drain_pending_private_messages(user_id, Arc::clone(&bot), reply_ticket).await;
+    drain_pending_private_messages(
+        user_id,
+        Arc::clone(&bot),
+        reply_ticket,
+        WindowDrainWait::ForPendingAdmission,
+    )
+    .await;
 }
 
 /// 私聊版的相处证据：一条 1:1 的消息天然指向她，所以不需要"定向"这一步，
@@ -1489,9 +1496,32 @@ async fn handle_sticker_library_command(
 }
 
 async fn drain_pending_private_messages_from_current(user_id: i64, bot: &Arc<RuntimeBot>) {
+    drain_pending_private_messages_from_current_with(
+        user_id,
+        bot,
+        WindowDrainWait::ForPendingAdmission,
+    )
+    .await;
+}
+
+/// 看门狗专用入口：领不到就走，**不**等在途 admission。
+///
+/// 与群聊 `take_pending_window_turn(..., WindowDrainWait::Never)` 同因同解：等待属于
+/// "回合收尾"的语义，而看门狗下一轮马上还会来。私聊原先没有这个区分，只要有一个残留
+/// 的 admission（handler panic、Core 收尾、取消都会留下），这一轮扫描就会卡到租约上限
+/// （180 秒）并被整段取消——同轮其他私聊用户一起被跳过。
+async fn drain_pending_private_messages_from_current_now(user_id: i64, bot: &Arc<RuntimeBot>) {
+    drain_pending_private_messages_from_current_with(user_id, bot, WindowDrainWait::Never).await;
+}
+
+async fn drain_pending_private_messages_from_current_with(
+    user_id: i64,
+    bot: &Arc<RuntimeBot>,
+    wait: WindowDrainWait,
+) {
     let scope = ReplyScope::Private(user_id);
     if let Some(ticket) = ConversationCoordinator::current_ticket(scope).await {
-        drain_pending_private_messages(user_id, Arc::clone(bot), ticket).await;
+        drain_pending_private_messages(user_id, Arc::clone(bot), ticket, wait).await;
         return;
     }
     // 同群聊：没有回复状态时队列永远排不空，宁可丢掉并告警。
@@ -1524,7 +1554,8 @@ async fn pending_private_user_ids() -> Vec<i64> {
 /// 回合收尾时触发，Core 链路收尾、panic、取消都不走那里。
 pub(crate) async fn sweep_private_window_queues(bot: &Arc<RuntimeBot>) {
     for user_id in pending_private_user_ids().await {
-        drain_pending_private_messages_from_current(user_id, bot).await;
+        // `Never`：看门狗绝不等在途 admission，理由见上面那个入口的文档。
+        drain_pending_private_messages_from_current_now(user_id, bot).await;
     }
 }
 
@@ -1583,13 +1614,15 @@ async fn drain_pending_private_messages(
     user_id: i64,
     bot: Arc<RuntimeBot>,
     mut completed: crate::model::ReplyTicket,
+    wait: WindowDrainWait,
 ) {
     let scope = ReplyScope::Private(user_id);
     // 与群聊同一套活性记账，理由见 `waiting_room` 模块头。
     let guard = waiting_room::DrainGuard::begin(scope);
     let mut drained = 0_usize;
     loop {
-        let Some((pending, ticket)) = take_pending_private_turn(user_id, completed).await else {
+        let Some((pending, ticket)) = take_pending_private_turn(user_id, completed, wait).await
+        else {
             if drained > 0 {
                 println!(
                     "[INFO] 私聊排队窗口已排空 (用户: {}, 本轮处理 {} 条)",
@@ -1653,6 +1686,7 @@ async fn publish_private_queue_state(user_id: i64) {
 async fn take_pending_private_turn(
     user_id: i64,
     mut completed: crate::model::ReplyTicket,
+    wait: WindowDrainWait,
 ) -> Option<(PendingPrivateMessage, crate::model::ReplyTicket)> {
     let scope = ReplyScope::Private(user_id);
     loop {
@@ -1691,7 +1725,10 @@ async fn take_pending_private_turn(
         if let Some(result) = result {
             return Some(result);
         }
-        if !should_wait || !ConversationCoordinator::wait_for_pending_incoming(completed).await {
+        if !should_wait
+            || wait == WindowDrainWait::Never
+            || !ConversationCoordinator::wait_for_pending_incoming(completed).await
+        {
             return None;
         }
     }
@@ -1707,6 +1744,7 @@ mod tests {
     use crate::model::conversation_coordinator::{
         ConversationCoordinator, OutgoingExecutiveDecision,
     };
+    use crate::model::group::WindowDrainWait;
     use crate::model::interrupt::{
         OutgoingSource, OutgoingState, ReplyScope, interrupt, interrupt_locked, is_current,
         mark_active, outgoing_fingerprint, prepare_outgoing, scope_mutex, test_outgoing_state,
@@ -1882,7 +1920,12 @@ mod tests {
                 new_message_won.notified().await;
 
                 let drainer = kovi::tokio::spawn(async move {
-                    take_pending_private_turn(user_id, completed).await
+                    take_pending_private_turn(
+                        user_id,
+                        completed,
+                        WindowDrainWait::ForPendingAdmission,
+                    )
+                    .await
                 });
                 let new_ticket = new_task.await.expect("新消息任务应正常结束");
                 let (pending, claimed_ticket) = drainer
@@ -1895,6 +1938,43 @@ mod tests {
                 crate::model::finish(claimed_ticket).await;
                 PENDING_PRIVATE_MESSAGES.lock().await.remove(&user_id);
                 assert!(!is_current(new_ticket).await);
+            });
+    }
+
+    #[test]
+    fn private_watchdog_drain_never_waits_for_an_unresolved_admission() {
+        // 看门狗与回合收尾的差别就在这个开关上：残留的 admission 会让"愿意等"的那条
+        // 路卡到租约上限（180 秒），而整轮扫描一旦被超时取消，同轮其他私聊用户一起被
+        // 跳过。群聊早就用 `WindowDrainWait::Never` 解决了，私聊这里是同一处理。
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let user_id = 9_200_006;
+                let scope = ReplyScope::Private(user_id);
+                PENDING_PRIVATE_MESSAGES.lock().await.remove(&user_id);
+                let completed = interrupt(scope).await;
+                assert!(mark_active(completed).await);
+                let _blocker = ConversationCoordinator::begin_incoming(scope).await;
+                queue_pending_private_message(
+                    user_id,
+                    "昵称".to_string(),
+                    "看门狗不该等它".to_string(),
+                    Vec::new(),
+                    vec![406],
+                    None,
+                    MessageUnderstanding::default(),
+                )
+                .await;
+                crate::model::finish(completed).await;
+
+                let drained = kovi::tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    take_pending_private_turn(user_id, completed, WindowDrainWait::Never),
+                )
+                .await
+                .expect("看门狗这一趟必须立刻返回，而不是等在途 admission");
+                assert!(drained.is_none(), "领不到就该走，让下一轮再看");
+                PENDING_PRIVATE_MESSAGES.lock().await.remove(&user_id);
             });
     }
 
@@ -1922,7 +2002,12 @@ mod tests {
                 crate::model::finish(completed).await;
 
                 let drainer = kovi::tokio::spawn(async move {
-                    take_pending_private_turn(user_id, completed).await
+                    take_pending_private_turn(
+                        user_id,
+                        completed,
+                        WindowDrainWait::ForPendingAdmission,
+                    )
+                    .await
                 });
                 kovi::tokio::task::yield_now().await;
                 assert!(!drainer.is_finished());
