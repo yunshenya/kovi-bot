@@ -19,7 +19,7 @@ const RECALLED_MESSAGE_RETENTION: Duration = Duration::from_secs(60 * 15);
 pub(crate) const BOT_RECALL_WINDOW_SECS: u64 = 110;
 const BOT_RECALL_WINDOW: Duration = Duration::from_secs(BOT_RECALL_WINDOW_SECS);
 const MAX_RECENT_BOT_MESSAGES: usize = 24;
-const MAX_RECALL_MESSAGES_PER_ACTION: usize = 8;
+pub(crate) const MAX_RECALL_MESSAGES_PER_ACTION: usize = 8;
 const MAX_BOT_MESSAGE_CONTENT_CHARS: usize = 280;
 const _: () = assert!(BOT_RECALL_WINDOW_SECS < 120);
 

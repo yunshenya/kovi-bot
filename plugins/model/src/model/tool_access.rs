@@ -80,6 +80,8 @@ enum BuiltinTool {
     MemoryRemember,
     StickerMemoryTeach,
     StickerList,
+    MessageRecallCandidates,
+    MessageRecall,
     ReminderCreate,
     ReminderList,
     ReminderCancel,
@@ -129,6 +131,7 @@ impl BuiltinTool {
                 | Self::GroupMessageTargets
                 | Self::GroupQuestionStatus
                 | Self::StickerList
+                | Self::MessageRecallCandidates
                 | Self::HealthCheck
         )
     }
@@ -223,6 +226,45 @@ pub(crate) struct ToolRegistry {
     definitions: Vec<ToolDefinition>,
     timeout: Duration,
     max_result_chars: usize,
+}
+
+/// 撤回这两个工具的声明。
+///
+/// 抽成函数是为了让测试复用**同一份** schema 与 description：在测试里再抄一份，
+/// 抄出来的那份永远不会随源码漂移，测的就变成了假协议。
+fn push_recall_tool_definitions(definitions: &mut Vec<ToolDefinition>) {
+    // 撤回是**副作用动作**，所以走注册表而不是回复动作的字段：这样 Host 的 ReAct 循环与
+    // Core 的 `UseTool` 意图都能用它，而平台细节（约 110 秒窗口、`delete_msg`）全留在宿主。
+    // 清单同样不进提示词：要用的时候自己先查（与 `sticker.list` 同一个范式）。
+    definitions.push(ToolDefinition {
+            name: "message.recall_candidates".to_string(),
+            description: "列出你自己最近发出、现在仍可撤回的消息（message_id 与内容）。用户让你撤回时先调它拿准确 id——撤回窗口只有两分钟左右，过了就撤不回来，那时要如实说明（不是“没有权限”），不要猜 id。"
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "additionalProperties": false
+            }),
+            source: ToolSource::Builtin(BuiltinTool::MessageRecallCandidates),
+        });
+    definitions.push(ToolDefinition {
+            name: "message.recall".to_string(),
+            description: "撤回你自己先前发出的消息。message_ids 只能填 message_recall_candidates 给出的 id：不要猜 id，也不要试图撤回别人发的消息。撤回本身是静默动作（用户看不到正文），撤完自然回一句即可。"
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["message_ids"],
+                "properties": {
+                    "message_ids": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "maxItems": crate::model::recall::MAX_RECALL_MESSAGES_PER_ACTION,
+                        "description": "要撤回的消息 id，只能来自 message_recall_candidates；一次最多 8 条。"
+                    }
+                },
+                "additionalProperties": false
+            }),
+            source: ToolSource::Builtin(BuiltinTool::MessageRecall),
+        });
 }
 
 pub(crate) async fn initialize() -> Result<()> {
@@ -590,6 +632,7 @@ pub(crate) async fn initialize() -> Result<()> {
         }),
         source: ToolSource::Builtin(BuiltinTool::StickerList),
     });
+    push_recall_tool_definitions(&mut definitions);
     definitions.push(ToolDefinition {
         name: "sticker_memory.teach".to_string(),
         description: "管理员专用：当管理员明确描述当前表情包的含义，并且当前消息带有表情/图片或引用了包含表情的消息时，保存正式表情记忆。label 只填写管理员给出的含义；普通评价、提问、猜测或讨论表情时不要调用，也不要自行推断含义。"
@@ -1489,6 +1532,8 @@ impl ToolSource {
                     | BuiltinTool::HealthCheck
                     | BuiltinTool::MemoryRemember
                     | BuiltinTool::StickerMemoryTeach
+                    | BuiltinTool::MessageRecallCandidates
+                    | BuiltinTool::MessageRecall
             ),
             Self::Mcp {
                 scheduled_allowed, ..
@@ -1768,6 +1813,17 @@ async fn execute_builtin(
         BuiltinTool::StickerList => {
             reject_unknown_arguments(&arguments, &[])?;
             sticker_list().await
+        }
+        BuiltinTool::MessageRecallCandidates => {
+            reject_unknown_arguments(&arguments, &[])?;
+            recall_candidates(&tool_context).await
+        }
+        BuiltinTool::MessageRecall => {
+            // 写操作：模型想完才调用，期间这一轮可能已经不是当前轮（新消息顶掉、
+            // 群被禁言），所以和 reminder.create 一样先重新校验一次再动手。
+            let tool_context =
+                revalidate_tool_effect(&tool_context, reply_ticket, revalidator).await?;
+            recall_own_messages(&arguments, &tool_context, reply_ticket).await
         }
         BuiltinTool::SystemInfo => {
             reject_unknown_arguments(&arguments, &[])?;
@@ -3279,6 +3335,121 @@ impl CalculatorParser {
 /// `sticker.list`：把素材库里能发的标签交给模型。
 ///
 /// 只读、无副作用：清单本身不是秘密（就是文件名），也不改变她的状态。
+/// 工具上下文里的目的地在撤回/候选存储那边对应的会话作用域。
+fn destination_scope(destination: MessageDestination) -> crate::model::interrupt::ReplyScope {
+    match destination {
+        MessageDestination::Group(group_id) => crate::model::interrupt::ReplyScope::Group(group_id),
+        MessageDestination::Private(user_id) => {
+            crate::model::interrupt::ReplyScope::Private(user_id)
+        }
+    }
+}
+
+/// 她自己最近发出、仍在撤回窗口内的消息。
+///
+/// 清单不进提示词：模型要用的时候自己查一次（与 `sticker.list` 同一个范式），
+/// 于是 Host 与 Core 谁都不需要在常驻上下文里背一份会过期的清单。
+async fn recall_candidates(tool_context: &ToolExecutionContext) -> Result<String> {
+    let scope = destination_scope(tool_context.destination);
+    let messages = crate::model::recall::recent_bot_messages(scope).await;
+    let entries = messages
+        .iter()
+        .map(|message| json!({"message_id": message.message_id, "content": message.content}))
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "recall_window_secs": crate::model::recall::BOT_RECALL_WINDOW_SECS,
+        "messages": entries,
+    })
+    .to_string())
+}
+
+/// 撤回她自己先前发出的消息。
+///
+/// 两道校验都不省：**id 必须在本会话"她发出的消息"白名单里**（否则模型编一个 id 就能删
+/// 别人的消息），**这一轮必须仍是当前轮**（`revalidate_tool_effect`，否则一次过期的撤回会
+/// 打在新会话上）。白名单与执行都复用 `recall_bot_messages`——与宿主回复动作那条撤回是
+/// 同一份实现，不新增第二套语义。
+async fn recall_own_messages(
+    arguments: &Map<String, Value>,
+    tool_context: &ToolExecutionContext,
+    reply_ticket: crate::model::interrupt::ReplyTicket,
+) -> Result<String> {
+    reject_unknown_arguments(arguments, &["message_ids"])?;
+    let requested = recall_message_ids(arguments)?;
+    if requested.is_empty() {
+        return Err(anyhow!(
+            "message_ids 不能为空：先调用 message_recall_candidates 拿到可撤回的 id"
+        ));
+    }
+    if requested.len() > crate::model::recall::MAX_RECALL_MESSAGES_PER_ACTION {
+        return Err(anyhow!(
+            "一次最多撤回 {} 条",
+            crate::model::recall::MAX_RECALL_MESSAGES_PER_ACTION
+        ));
+    }
+    let scope = destination_scope(tool_context.destination);
+    let available = crate::model::recall::recent_bot_messages(scope).await;
+    let unknown = requested
+        .iter()
+        .copied()
+        .filter(|message_id| {
+            !available
+                .iter()
+                .any(|message| message.message_id == *message_id)
+        })
+        .collect::<Vec<_>>();
+    if !unknown.is_empty() {
+        return Err(anyhow!(
+            "这些 id 不在可撤回候选里（可能已过撤回窗口，或本来就不是你发的）：{unknown:?}。不要重试同一个 id，先重新调用 message_recall_candidates 确认。"
+        ));
+    }
+    let bot = tool_context
+        .runtime_bot
+        .as_deref()
+        .ok_or_else(|| anyhow!("撤回工具没有可用的机器人运行时"))?;
+    let recalled =
+        crate::model::recall::recall_bot_messages(scope, &requested, bot, reply_ticket).await;
+    let recalled_ids = recalled
+        .iter()
+        .map(|message| message.message_id)
+        .collect::<Vec<_>>();
+    let failed = requested
+        .iter()
+        .copied()
+        .filter(|message_id| !recalled_ids.contains(message_id))
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "recalled_message_ids": recalled_ids,
+        "failed_message_ids": failed,
+        "note": if failed.is_empty() {
+            "已撤回。"
+        } else {
+            "failed_message_ids 里的没撤成功（平台拒绝或已过期）；不要重试同一个 id。"
+        },
+    })
+    .to_string())
+}
+
+fn recall_message_ids(arguments: &Map<String, Value>) -> Result<Vec<i32>> {
+    let Some(value) = arguments.get("message_ids") else {
+        return Err(anyhow!("缺少 message_ids"));
+    };
+    if value.is_null() {
+        return Ok(Vec::new());
+    }
+    let items = value
+        .as_array()
+        .ok_or_else(|| anyhow!("message_ids 必须是整数数组"))?;
+    items
+        .iter()
+        .map(|item| {
+            item.as_i64()
+                .and_then(|value| i32::try_from(value).ok())
+                .ok_or_else(|| anyhow!("message_ids 的每一项都必须是整数"))
+        })
+        .collect()
+}
+
 async fn sticker_list() -> Result<String> {
     Ok(sticker_list_reply(crate::sticker_library::tool_listing()))
 }
@@ -4680,5 +4851,262 @@ mod tests {
         }))
         .expect("计算参数应能构造");
         assert!(calculate(&unsupported).is_err());
+    }
+
+    // ---------------------------------------------------------------- 撤回工具
+    //
+    // 这一组守两条：**模型编一个 id 删不了别人的消息**；以及线上那个现场
+    // （2026-09-15 18:32，群里"撤回你刚刚发的消息"她说"我这边没有撤回权限"）——
+    // 现在她查得到候选、撤得动、过期也能如实说，而不是编一个理由。
+
+    fn recall_scope(seed: i64) -> crate::model::interrupt::ReplyScope {
+        crate::model::interrupt::ReplyScope::Group(9_400_000 + seed)
+    }
+
+    fn recall_tool_context(scope: crate::model::interrupt::ReplyScope) -> ToolExecutionContext {
+        let destination = match scope {
+            crate::model::interrupt::ReplyScope::Group(group_id) => {
+                MessageDestination::Group(group_id)
+            }
+            crate::model::interrupt::ReplyScope::Private(user_id) => {
+                MessageDestination::Private(user_id)
+            }
+            other => panic!("撤回测试只用群聊/私聊，收到 {other:?}"),
+        };
+        ToolExecutionContext {
+            subject_id: 1,
+            actor_user_id: 1,
+            is_admin: false,
+            is_main_admin: false,
+            context: "group_chat",
+            destination,
+            source_message_id: None,
+            scheduled: false,
+            group_paused: false,
+            runtime_bot: None,
+            sticker_teaching: None,
+            requires_reminder_create: false,
+            requires_agent_run_create: false,
+            requires_group_message_send: false,
+            requires_group_followup: false,
+            requires_external_tool: false,
+            allow_reply_actions: false,
+        }
+    }
+
+    fn recall_registry() -> ToolRegistry {
+        let mut definitions = Vec::new();
+        super::push_recall_tool_definitions(&mut definitions);
+        ToolRegistry {
+            definitions,
+            timeout: Duration::from_secs(1),
+            max_result_chars: 4_000,
+        }
+    }
+
+    fn arguments(value: serde_json::Value) -> Map<String, Value> {
+        value.as_object().cloned().expect("测试参数必须是对象")
+    }
+
+    #[test]
+    fn recall_candidates_list_her_own_recent_messages() {
+        let runtime = kovi::tokio::runtime::Runtime::new().expect("test runtime");
+        runtime.block_on(async {
+            let registry = recall_registry();
+            let scope = recall_scope(1);
+            let ticket = crate::model::interrupt::interrupt(scope).await;
+            assert!(
+                crate::model::recall::record_committed_bot_message(
+                    scope,
+                    ticket,
+                    4_242,
+                    "刚说过的那句"
+                )
+                .await
+            );
+
+            let result = registry
+                .execute(
+                    "message.recall_candidates",
+                    Map::new(),
+                    recall_tool_context(scope),
+                    ticket,
+                )
+                .await;
+            assert!(result.succeeded, "{}", result.content);
+            let value: serde_json::Value =
+                serde_json::from_str(&result.content).expect("候选应当是 JSON");
+            assert_eq!(value["recall_window_secs"], 110);
+            let ids = value["messages"]
+                .as_array()
+                .expect("messages")
+                .iter()
+                .filter_map(|entry| entry["message_id"].as_i64())
+                .collect::<Vec<_>>();
+            assert!(
+                ids.contains(&4_242),
+                "她自己刚发的消息必须在候选里：{ids:?}"
+            );
+            assert!(result.content.contains("刚说过的那句"));
+        });
+    }
+
+    #[test]
+    fn recall_refuses_ids_outside_the_candidate_list() {
+        let runtime = kovi::tokio::runtime::Runtime::new().expect("test runtime");
+        runtime.block_on(async {
+            let registry = recall_registry();
+            let scope = recall_scope(2);
+            let ticket = crate::model::interrupt::interrupt(scope).await;
+            let context = recall_tool_context(scope);
+
+            // 候选为空：编一个 id 必须被拒——否则模型能删掉别人的消息。
+            let refused = registry
+                .execute(
+                    "message.recall",
+                    arguments(serde_json::json!({"message_ids": [99_999]})),
+                    context.clone(),
+                    ticket,
+                )
+                .await;
+            assert!(!refused.succeeded);
+            assert!(
+                refused.content.contains("不在可撤回候选"),
+                "{}",
+                refused.content
+            );
+
+            let empty = registry
+                .execute(
+                    "message.recall",
+                    arguments(serde_json::json!({"message_ids": []})),
+                    context.clone(),
+                    ticket,
+                )
+                .await;
+            assert!(!empty.succeeded);
+            assert!(empty.content.contains("不能为空"), "{}", empty.content);
+
+            let too_many = registry
+                .execute(
+                    "message.recall",
+                    arguments(serde_json::json!({"message_ids": [1, 2, 3, 4, 5, 6, 7, 8, 9]})),
+                    context.clone(),
+                    ticket,
+                )
+                .await;
+            assert!(!too_many.succeeded);
+            assert!(too_many.content.contains("最多"), "{}", too_many.content);
+
+            // 候选里的 id 能过校验：这里只会卡在"没有机器人运行时"（测试里没有真的 bot），
+            // 说明拒绝发生在执行那一步、而不是候选校验那一步。
+            assert!(
+                crate::model::recall::record_committed_bot_message(scope, ticket, 4_243, "待撤回")
+                    .await
+            );
+            let without_bot = registry
+                .execute(
+                    "message.recall",
+                    arguments(serde_json::json!({"message_ids": [4_243]})),
+                    context,
+                    ticket,
+                )
+                .await;
+            assert!(!without_bot.succeeded);
+            assert!(
+                without_bot.content.contains("没有可用的机器人运行时"),
+                "候选里的 id 不该被候选校验拒掉：{}",
+                without_bot.content
+            );
+        });
+    }
+
+    /// 真机探针：配置里的主模型拿到这两个工具后，会不会**主动去查候选**。
+    ///
+    /// 这次修复成立的前提就是这个：工具存在 ≠ 她会用。而"清单不进提示词、要用时自己查"
+    /// 这套设计（与 `sticker.list` 同一个范式）只有在模型真的会调那一下时才成立。
+    /// 默认 ignored：需要真密钥、跑一次会真的花钱。
+    ///
+    /// ```text
+    /// BOT_API_TOKEN=... cargo test -p model --lib live_model_reaches_for_the_recall_tools -- --ignored
+    /// ```
+    #[test]
+    #[ignore = "需要 BOT_API_TOKEN 与真实模型端点；跑一次会真的花钱"]
+    fn live_model_reaches_for_the_recall_tools() {
+        use crate::model::utils::{BotMemory, Roles};
+
+        let runtime = kovi::tokio::runtime::Runtime::new().expect("test runtime");
+        runtime.block_on(async {
+            let registry = recall_registry();
+            let context = recall_tool_context(recall_scope(9));
+            let tool_specs = registry.native_tool_specs(&context, false);
+            let mut messages = vec![
+                BotMemory {
+                    role: Roles::System,
+                    content: "你在一个 QQ 群里，按平时的语气自然回复。".to_string(),
+                },
+                BotMemory {
+                    role: Roles::User,
+                    content: "撤回你刚刚发的那条消息".to_string(),
+                },
+            ];
+            let payload = crate::model::utils::params_model_with_native_tools(
+                &mut messages,
+                &[],
+                &tool_specs,
+                Some(256),
+                &[],
+                None,
+                None,
+            )
+            .await;
+            let called = payload
+                .tool_calls
+                .iter()
+                .map(|call| call.name.as_str())
+                .collect::<Vec<_>>();
+            println!(
+                "[live-probe] tool_calls={called:?} content={:?}",
+                payload.content.chars().take(120).collect::<String>()
+            );
+            assert!(
+                called
+                    .iter()
+                    .any(|name| *name == "message_recall_candidates" || *name == "message_recall"),
+                "模型没有去够撤回工具（只拿到 {called:?}）——那她就还会回一句做不到"
+            );
+        });
+    }
+
+    #[test]
+    fn recall_candidates_are_read_only_and_nothing_is_offered_to_scheduled_turns() {
+        let registry = recall_registry();
+        let context = recall_tool_context(recall_scope(3));
+        let names = |read_only: bool, context: &ToolExecutionContext| {
+            registry
+                .native_tool_specs(context, read_only)
+                .iter()
+                .filter_map(|spec| spec["function"]["name"].as_str().map(str::to_string))
+                .collect::<Vec<_>>()
+        };
+
+        let read_only = names(true, &context);
+        assert!(read_only.contains(&"message_recall_candidates".to_string()));
+        assert!(
+            !read_only.contains(&"message_recall".to_string()),
+            "工具结果回合（不可信数据之后）不能拿到有副作用的撤回工具"
+        );
+
+        let full = names(false, &context);
+        assert!(full.contains(&"message_recall".to_string()));
+        assert!(full.contains(&"message_recall_candidates".to_string()));
+
+        let scheduled = ToolExecutionContext {
+            scheduled: true,
+            ..context
+        };
+        let scheduled_names = names(false, &scheduled);
+        assert!(!scheduled_names.contains(&"message_recall".to_string()));
+        assert!(!scheduled_names.contains(&"message_recall_candidates".to_string()));
     }
 }
