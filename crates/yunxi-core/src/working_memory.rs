@@ -169,13 +169,12 @@ impl WorkingAttemptOutcome {
 /// One thing that happened to a task, in the order it happened.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkingEntry {
-    /// Monotonic position within the task.
+    /// Monotonic position within the task, assigned when the entry is recorded.
     ///
-    /// Attempts and expectation results are recorded at different moments — an
-    /// expectation resolves while the event that resolved it is being observed,
-    /// which is *after* the round that produced it was dispatched — so the
-    /// order of insertion is not the order of history. Sorting by this field
-    /// restores it.
+    /// It orders entries that are appended at different moments (a tool attempt
+    /// as it resolves, an expectation when the event that settles it is
+    /// observed), so the log can be shown in the order things happened rather
+    /// than the order the runtime happened to learn them.
     pub sequence: u64,
     pub payload: WorkingEntryPayload,
 }
@@ -413,6 +412,12 @@ impl PlannerWorkingMemory {
     /// The newest entries matter most: the model is deciding what to do *next*,
     /// and a window that kept stale rounds while dropping the round it just ran
     /// would hide the evidence it needs.
+    ///
+    /// Entries are appended in call order and each gets a fresh sequence, so the
+    /// log is already ordered; the sort is a guard against a caller that hands
+    /// entries over out of order (nothing does today). Callers that record a
+    /// round must therefore call this in true chronological order — ordering
+    /// cannot be repaired afterwards.
     fn push(&mut self, payload: WorkingEntryPayload) {
         let sequence = self.next_sequence;
         self.next_sequence = self.next_sequence.saturating_add(1);
