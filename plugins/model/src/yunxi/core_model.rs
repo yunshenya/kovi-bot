@@ -21,6 +21,7 @@ use crate::model::{
 // `sticker.list` 的注册名（带点；发到 provider 时由 `wire_tool_name` 换成下划线）。
 // 值只有一份、放在素材库那边：宿主链路也要在工具结果上认这个名字，各写一份字面量迟早
 // 会漂开。
+use crate::model::tool_access::CALL_TOOL_NAME;
 use crate::sticker_library::TOOL_NAME as STICKER_TOOL_NAME;
 use crate::yunxi::identity_store::PostgresIdentityStore;
 use crate::yunxi::intrinsic_runtime::IntrinsicHostRuntime;
@@ -503,6 +504,21 @@ fn offers_sticker_tool_alone(
     has_message: bool,
 ) -> bool {
     route == HostModelRoute::Strong && !tool_protocol_authorized && has_message
+}
+
+/// 自主回合要不要**只**带通话这一个工具。
+///
+/// 为什么要单独一条：自主回合（`AutonomousConversationTick`）是"她自己想说话"的回合，
+/// 原本一个工具都没有。为了让她能选"这次用电话而不是消息"，`likely_requires_controlled_tool`
+/// 为它放开了工具协议——但放开协议会带出**整套**工具清单（建提醒、发消息、改群状态……），
+/// 那比她需要的多得多，而且是在没人要求她的回合里。所以这里把清单收窄到通话一个：
+/// 她要的只是"换个媒介"。
+fn autonomous_call_only(input: &PlannerInput) -> bool {
+    input.supports(ActionCapability::StartCall)
+        && matches!(
+            input.event.kind(),
+            WorldEventKind::AutonomousConversationTick(_)
+        )
 }
 
 fn tool_protocol_authorized_for_turn(
@@ -5231,6 +5247,16 @@ fn likely_requires_controlled_tool(input: &PlannerInput, allow_tool_call: bool) 
     }
     let text = match input.event.kind() {
         WorldEventKind::MessageReceived(message) => message.content.as_text(),
+        // 自主回合本来没有任何工具（没有用户正文可供判据依据），于是她想"这次改用电话
+        // 而不是消息"都做不到——那个入口根本不在清单里。
+        //
+        // 只在天生声明了 `StartCall` 时才放开：通话是带外通道，宿主没配好就什么都不该变。
+        // 而且这一轮**只下发通话这一个工具**（见 `autonomous_call_only`），不是把整套
+        // 工具清单白送进一个她自己起意的回合——那等于让她在没人要求的时候也能建提醒、
+        // 发消息、改群状态，比这个目标大得多。
+        WorldEventKind::AutonomousConversationTick(_) => {
+            return input.supports(ActionCapability::StartCall);
+        }
         _ => return false,
     };
     likely_requires_tool_protocol(text)
@@ -6571,6 +6597,16 @@ impl ModelBackend for KoviModelBackend {
             if let Some((registry, spec)) = sticker_only_specs.as_ref() {
                 native_tool_specs = Some(vec![spec.clone()]);
                 core_tool_registry = Some(registry.clone());
+            }
+            // 自主回合只带通话一个工具。放在 sticker_only 之后、并且**覆盖**它：
+            // 两个条件不会同时成立（那个要求 `has_message`，自主回合没有入站消息），
+            // 但顺序写死更省心。
+            if autonomous_call_only(input)
+                && let Some(registry) = core_tool_registry.clone().or_else(tool_registry)
+                && let Some(spec) = registry.tool_spec_by_name(CALL_TOOL_NAME)
+            {
+                native_tool_specs = Some(vec![spec]);
+                core_tool_registry = Some(registry);
             }
             // Place this trusted, host-derived constraint after the optional
             // route/tool instructions so the requested count cannot be
@@ -8024,15 +8060,15 @@ mod tests {
         PersistentRouteLookup, QqConversation, RequiredCreation, RouteContext,
         SILENCE_TENSION_THRESHOLD, STICKER_TOOL_NAME, SilenceVerdict, TASK_DECLARE_TOOL_NAME,
         VisibleReplyTarget, addressed_gap_wait_ms, affect_tone_guidance,
-        ambient_group_interjection_veto, autonomous_conversation_prompt,
+        ambient_group_interjection_veto, autonomous_call_only, autonomous_conversation_prompt,
         autonomous_conversation_protocol, autonomous_empty_generation_plan,
         autonomous_generation_failure_plan, baseline_disposition, batch_fence_action_key,
         classify_persistent_person_identity, constrain_autonomous_tick_plan,
         conversation_focus_target, conversation_id_for_log, core_message_prompt,
         core_plain_turn_instruction, core_plan_has_visible_text, core_reply_bubbles_with_max,
         core_tool_allowance, core_tool_follow_up_instruction, core_tool_protocol_diagnostic,
-        core_working_memory_instruction, native_calls_to_core_intents, take_task_declaration,
-        task_declare_tool_spec,
+        core_working_memory_instruction, likely_requires_controlled_tool,
+        native_calls_to_core_intents, take_task_declaration, task_declare_tool_spec,
     };
     use super::{
         default_autonomous_directive, defer_unroutable_due, deterministic_route_fallback,
@@ -10056,6 +10092,62 @@ mod tests {
         assert!(!without.contains("[[STICKER"));
         // 工具回合的原有约束不能被这段拼接弄丢。
         assert!(with_library.contains("非可信数据"));
+    }
+
+    /// 自主回合只拿打电话这一个工具——不是整套工具清单。
+    ///
+    /// 两个方向都要钉住：写宽了（放整套工具）等于让她在**没人要求**的回合里也能建提醒、
+    /// 发消息、改群状态，比"换个媒介"这个目标大得多；写窄了（一个都不给）她又永远只能
+    /// 发消息，"她自己起意打电话"这条路径等于不存在。
+    #[test]
+    fn autonomous_turns_get_the_call_tool_and_nothing_else() {
+        let tick = |capabilities: Vec<ActionDescriptor>| {
+            PlannerInput::new(
+                WorldEvent::new(
+                    Utc::now(),
+                    EventScope::Conversation {
+                        conversation_id: ConversationId::new(),
+                    },
+                    EventPriority::Low,
+                    WorldEventKind::AutonomousConversationTick(
+                        yunxi_core::AutonomousConversationTickEvent {
+                            conversation_kind: Some(ConversationKind::Direct),
+                            person_id: Some(PersonId::new()),
+                            claim_token: None,
+                        },
+                    ),
+                ),
+                PlannerStateSnapshot::empty(),
+            )
+            .with_capabilities(capabilities)
+        };
+
+        // 宿主声明了 StartCall：这一轮该带工具（而且是收窄后的那一个）。
+        let with_call = tick(vec![
+            ActionDescriptor::new(ActionCapability::UseTool),
+            ActionDescriptor::new(ActionCapability::SendMessage),
+            ActionDescriptor::new(ActionCapability::StartCall),
+        ]);
+        assert!(likely_requires_controlled_tool(&with_call, true));
+        assert!(autonomous_call_only(&with_call));
+
+        // 宿主没声明 StartCall：回到原来的"一个工具都不带"。
+        let without_call = tick(vec![
+            ActionDescriptor::new(ActionCapability::UseTool),
+            ActionDescriptor::new(ActionCapability::SendMessage),
+        ]);
+        assert!(!likely_requires_controlled_tool(&without_call, true));
+        assert!(!autonomous_call_only(&without_call));
+
+        // 普通消息回合不受这条影响：那一路由正文判据决定。
+        let message = message_input(PersonId::new(), true).with_capabilities(vec![
+            ActionDescriptor::new(ActionCapability::UseTool),
+            ActionDescriptor::new(ActionCapability::StartCall),
+        ]);
+        assert!(
+            !autonomous_call_only(&message),
+            "这不是自主回合，不该走这条收窄"
+        );
     }
 
     /// 声明函数只声明，不做事：它的 schema 里没有动作字段，名字也不在注册表里。

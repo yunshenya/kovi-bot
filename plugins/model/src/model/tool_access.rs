@@ -377,6 +377,13 @@ fn push_recall_tool_definitions(definitions: &mut Vec<ToolDefinition>) {
     });
 }
 
+/// 主动外呼这个工具的注册名。
+///
+/// 单独成常量是因为它有两个非注册表用途：路由/提示词里点名，以及"自主回合只带它一个"
+/// 的收窄。抄字面量的话，改名时那两处不会跟着变，而且失败方式是静默的（工具在清单里
+/// 消失，没有任何报错）。
+pub(crate) const CALL_TOOL_NAME: &str = "call.start";
+
 /// 主动外呼这个工具的声明。
 ///
 /// 抽成函数同样是为了让测试复用同一份 schema 与 description。
@@ -387,7 +394,7 @@ fn push_recall_tool_definitions(definitions: &mut Vec<ToolDefinition>) {
 /// 根本没有这个入口，她只能照自己的印象回答。
 fn push_call_tool_definitions(definitions: &mut Vec<ToolDefinition>) {
     definitions.push(ToolDefinition {
-        name: "call.start".to_string(),
+        name: CALL_TOOL_NAME.to_string(),
         description: "给当前正在跟你说话的人打一通 QQ 语音电话。只在对方明确要你打的时候用，例如“给我打个电话”“打给我”“打电话跟我说”；对方只是提到电话、问你会不会打电话、或讨论通话功能时不要调用。目标由程序绑定到本轮说话的人，你没有参数可以填，也不能指定号码。对方不在可通话名单里会被拒绝，照实告诉对方就行。拨出去之后电话会响在对方手机上，你只能确认邀请有没有真的发出去，所以结果怎么说要跟工具返回一致。"
             .to_string(),
         input_schema: json!({
@@ -1340,6 +1347,44 @@ impl ToolRegistry {
             })
             .map(Self::definition_spec)
             .collect()
+    }
+
+    /// 按注册名取一个工具的 spec。没有这个工具时返回 `None`。
+    ///
+    /// 给"这一轮只该带某一个工具"的场合用（自主回合只带通话、普通回合只带 `sticker.list`）。
+    pub(crate) fn tool_spec_by_name(&self, name: &str) -> Option<Value> {
+        let context = ToolExecutionContext {
+            subject_id: 0,
+            actor_user_id: 0,
+            is_admin: false,
+            is_main_admin: false,
+            context: "tool_spec_lookup",
+            destination: MessageDestination::Private(0),
+            source_message_id: None,
+            scheduled: false,
+            group_paused: false,
+            runtime_bot: None,
+            sticker_teaching: None,
+            requires_reminder_create: false,
+            requires_agent_run_create: false,
+            requires_group_message_send: false,
+            requires_group_followup: false,
+            requires_external_tool: false,
+            allow_reply_actions: false,
+        };
+        let sticker_available = crate::sticker_library::is_available();
+        self.definitions
+            .iter()
+            .find(|definition| {
+                definition.name == name
+                    && self.definition_usable(
+                        definition,
+                        &context,
+                        ToolAllowance::Full,
+                        sticker_available,
+                    )
+            })
+            .map(Self::definition_spec)
     }
 
     /// 只取 `sticker.list` 一个工具的 spec。
