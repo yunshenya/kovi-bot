@@ -337,9 +337,8 @@ async fn dispatch_due(bot: &RuntimeBot) -> Result<()> {
                         "[ERROR] 提醒任务执行失败并停止重试 (任务: {}): {error:?}",
                         reminder.id
                     );
-                    if let Some(notice) = failure_notice_for_execution(reminder.kind, &error_text) {
-                        send_failure_notice(bot, &reminder, notice).await;
-                    }
+                    let notice = failure_notice_for_execution(reminder.kind, &error_text);
+                    send_failure_notice(bot, &reminder, notice).await;
                 }
                 continue;
             }
@@ -378,6 +377,11 @@ async fn dispatch_due(bot: &RuntimeBot) -> Result<()> {
                         "[ERROR] 提醒发送失败并停止重试 (任务: {}): {error:?}",
                         reminder.id
                     );
+                    let notice = failure_notice_for_execution(
+                        reminder.kind,
+                        &format!("消息发送失败: {error}"),
+                    );
+                    send_failure_notice(bot, &reminder, notice).await;
                 }
             }
             Err(_) => {
@@ -389,6 +393,11 @@ async fn dispatch_due(bot: &RuntimeBot) -> Result<()> {
                 .await?;
                 if outcome == DeliveryFailure::Failed {
                     eprintln!("[WARN] 提醒发送超时并停止重放 (任务: {})", reminder.id);
+                    let notice = failure_notice_for_execution(
+                        reminder.kind,
+                        "消息发送超时，投递结果不确定且不会自动重放",
+                    );
+                    send_failure_notice(bot, &reminder, notice).await;
                 }
             }
         }
@@ -429,24 +438,40 @@ async fn build_delivery_content_with_lease(
     }
 }
 
-fn failure_notice_for_execution(kind: ReminderKind, error: &str) -> Option<&'static str> {
-    if kind != ReminderKind::Task {
-        return None;
-    }
-    if error.contains("未成功获取所需的外部资料") {
-        Some("我这次没能可靠获取到最新资料，所以先不发送未经核实的内容。你可以稍后再让我查一次。")
-    } else {
-        Some("这次定时任务执行失败了，所以我没有把不确定的结果发给你。")
+/// 提醒彻底失败（不再重试）时给她/他的一句说明。
+///
+/// 一次性提醒（`Message`）以前**没有任何**失败说明：发送失败 → 置 failed → 列表里
+/// 不再显示 → 用户以为提醒还在，到点什么都没发生，也收不到解释。Task 类早就有了，
+/// 这里把 Message 补齐。
+fn failure_notice_for_execution(kind: ReminderKind, error: &str) -> &'static str {
+    match kind {
+        ReminderKind::Task => {
+            if error.contains("未成功获取所需的外部资料") {
+                "我这次没能可靠获取到最新资料，所以先不发送未经核实的内容。你可以稍后再让我查一次。"
+            } else {
+                "这次定时任务执行失败了，所以我没有把不确定的结果发给你。"
+            }
+        }
+        ReminderKind::Message => {
+            "你让我提醒的那件事我没能送到，重试也没成功，这条提醒不会再触发了。             需要的话跟我说一声，我重新设一次。"
+        }
     }
 }
 
 async fn send_failure_notice(bot: &RuntimeBot, reminder: &ClaimedReminder, content: &str) {
     let delivery_key = format!("reminder:{}:failure-notice", reminder.id);
+    // 一次性提醒的失败说明发给**创建者私聊**，不回原会话：原会话可能是群，而
+    // "我本来要提醒某人某件事"不该在无关场合暴露出去。Task 类沿用原目标
+    // （它的失败说明本来就是回答"我刚让你查的东西呢"）。
+    let destination = match reminder.kind {
+        ReminderKind::Task => reminder.destination,
+        ReminderKind::Message => MessageDestination::Private(reminder.creator_user_id),
+    };
     let result = kovi::tokio::time::timeout(
         DELIVERY_SEND_TIMEOUT,
         send_tracked_message_with_revalidation(
             bot,
-            reminder.destination,
+            destination,
             Message::from(content.to_string()),
             OutgoingSource::Proactive,
             Some(&delivery_key),
@@ -1906,13 +1931,18 @@ mod tests {
     }
 
     #[test]
-    fn failed_external_tasks_get_a_safe_user_notice() {
+    fn every_terminal_failure_gets_a_user_notice() {
         assert!(
             failure_notice_for_execution(ReminderKind::Task, "定时任务未成功获取所需的外部资料")
-                .is_some_and(|notice| notice.contains("未经核实"))
+                .contains("未经核实")
         );
-        assert!(failure_notice_for_execution(ReminderKind::Task, "模型服务超时").is_some());
-        assert!(failure_notice_for_execution(ReminderKind::Message, "发送失败").is_none());
+        assert!(
+            failure_notice_for_execution(ReminderKind::Task, "模型服务超时").contains("执行失败")
+        );
+        // 一次性提醒以前完全静默：发送失败后用户以为提醒还在，到点什么都没发生。
+        let notice = failure_notice_for_execution(ReminderKind::Message, "发送失败");
+        assert!(notice.contains("没能送到"), "要如实说明没送到: {notice}");
+        assert!(notice.contains("重新设一次"), "要给出下一步: {notice}");
     }
 
     #[test]
