@@ -24,6 +24,9 @@ const MAX_ACTIVE_INCOMING_PER_SCOPE: usize = 32;
 const OUTGOING_TERMINAL_RETENTION: Duration = Duration::from_secs(60);
 const OUTGOING_UNKNOWN_RETENTION: Duration = Duration::from_secs(60 * 60);
 const MESSAGE_COLLISION_WINDOW: Duration = Duration::from_secs(3);
+/// `Unknown` 的记录在这段时间内不参与"腾地方"的淘汰（远大于碰撞窗口 3 秒、
+/// 远小于保留期 1 小时）：见 [`outgoing_is_evictable`]。
+const UNKNOWN_EVICTION_GRACE: Duration = Duration::from_secs(5 * 60);
 const COMMITTED_OUTGOING_LEASE: Duration = Duration::from_secs(120);
 const INCOMING_RESERVATION_LEASE: Duration = Duration::from_secs(180);
 const PRECOMMIT_VALIDATION_LEASE: Duration = Duration::from_secs(30);
@@ -1930,6 +1933,7 @@ fn make_outgoing_room_for(state: &mut ReplyState, additional: usize) -> Option<(
     if additional == 0 || additional > MAX_PENDING_OUTGOING_PER_SCOPE {
         return None;
     }
+    let now = Instant::now();
     let required_removals = state
         .pending_outgoing
         .len()
@@ -1938,29 +1942,48 @@ fn make_outgoing_room_for(state: &mut ReplyState, additional: usize) -> Option<(
     if required_removals == 0 {
         return Some(());
     }
-    let removable_count = state
+    if state
         .pending_outgoing
         .iter()
-        .filter(|pending| {
-            !matches!(
-                pending.state,
-                OutgoingState::Prepared | OutgoingState::Committed | OutgoingState::Unknown
-            )
-        })
-        .count();
-    if removable_count < required_removals {
+        .filter(|pending| outgoing_is_evictable(pending, now))
+        .count()
+        < required_removals
+    {
         return None;
     }
     for _ in 0..required_removals {
-        let removable = state.pending_outgoing.iter().position(|pending| {
-            !matches!(
-                pending.state,
-                OutgoingState::Prepared | OutgoingState::Committed | OutgoingState::Unknown
-            )
-        })?;
+        // 最旧的先走：`terminal_at` 早说明它离"还可能被当成重复"最远。
+        let removable = state
+            .pending_outgoing
+            .iter()
+            .enumerate()
+            .filter(|(_, pending)| outgoing_is_evictable(pending, now))
+            .min_by_key(|(index, pending)| (pending.terminal_at.unwrap_or(now), *index))
+            .map(|(index, _)| index)?;
         state.pending_outgoing.remove(removable);
     }
     Some(())
+}
+
+/// 这个出站记录能不能为了腾地方而被丢掉。
+///
+/// `Prepared` / `Committed` 不能：它们代表"已经准备好、可能已经发出"的东西，丢一条
+/// 就等于让一条可见回复凭空消失（或让去重失效）。
+///
+/// `Unknown`（结果不确定）**过了碰撞窗口就该可以淘汰**。它需要留下的理由只有一个：
+/// 短时间内别把同一条消息重复发出去——那是 [`MESSAGE_COLLISION_WINDOW`]（3 秒）。
+/// 而 [`OUTGOING_UNKNOWN_RETENTION`] 是"保留观察"的长度（1 小时）。以前两者混为一谈，
+/// 于是 16 格被 Unknown 占满之后 `make_outgoing_room_for` 恒返回 `None`，该会话的
+/// **每一批**可见回复都被整批拒绝（`message_actions` 直接 break）：网络抖动 16 次
+/// 就能让一个群最长哑一小时。这里给一个远大于碰撞窗口、又远小于保留期的安全余量。
+fn outgoing_is_evictable(pending: &PendingOutgoing, now: Instant) -> bool {
+    match pending.state {
+        OutgoingState::Prepared | OutgoingState::Committed => false,
+        OutgoingState::Unknown => pending
+            .terminal_at
+            .is_none_or(|terminal_at| now.duration_since(terminal_at) >= UNKNOWN_EVICTION_GRACE),
+        OutgoingState::Sent | OutgoingState::Cancelled | OutgoingState::Superseded => true,
+    }
 }
 
 fn prune_outgoing(state: &mut ReplyState) {
@@ -2028,13 +2051,14 @@ pub(crate) async fn test_outgoing_state(token: OutgoingToken) -> Option<Outgoing
 mod tests {
     use super::{
         MAX_ACTIVE_INCOMING_PER_SCOPE, MAX_PENDING_OUTGOING_PER_SCOPE, OutgoingCommitRejection,
-        OutgoingSource, OutgoingState, OutgoingToken, REPLY_STATES, ReplyScope,
-        action_outgoing_fingerprint, cancel_locked, cancel_prepared_proactive_locked,
-        claim_follow_up, clear_reply_state_locked, commit_outgoing, commit_outgoing_guard,
-        commit_outgoing_guard_with_context, contextual_outgoing_fingerprint, current_ticket,
-        find_prepared_outgoing, find_prepared_outgoing_by_fingerprint, finish, interrupt,
-        interrupt_if_current, is_active, is_current, mark_active, mark_outgoing_failed,
-        mark_outgoing_sent, outgoing_fingerprint, pending_incoming_for_ticket_locked,
+        OutgoingSource, OutgoingState, OutgoingToken, PendingOutgoing, REPLY_STATES, ReplyScope,
+        ReplyState, ReplyTicket, UNKNOWN_EVICTION_GRACE, action_outgoing_fingerprint,
+        cancel_locked, cancel_prepared_proactive_locked, claim_follow_up, clear_reply_state_locked,
+        commit_outgoing, commit_outgoing_guard, commit_outgoing_guard_with_context,
+        contextual_outgoing_fingerprint, current_ticket, find_prepared_outgoing,
+        find_prepared_outgoing_by_fingerprint, finish, interrupt, interrupt_if_current, is_active,
+        is_current, make_outgoing_room_for, mark_active, mark_outgoing_failed, mark_outgoing_sent,
+        outgoing_fingerprint, outgoing_is_evictable, pending_incoming_for_ticket_locked,
         prepare_outgoing, prepare_outgoing_batch_with_semantic_preview,
         prepare_proactive_outgoing_if_idle, prepared_outgoing_source_locked, reclaim_generation,
         release_active_incoming, release_incoming_locked, reserve_active_incoming_locked,
@@ -2070,6 +2094,91 @@ mod tests {
         if wait.is_err() {
             assert_eq!(outgoing_state(token).await, Some(expected));
         }
+    }
+
+    fn outgoing_in(
+        state: OutgoingState,
+        terminal_at: Option<std::time::Instant>,
+    ) -> PendingOutgoing {
+        PendingOutgoing {
+            token: OutgoingToken {
+                ticket: ReplyTicket {
+                    scope: ReplyScope::Group(1),
+                    scope_epoch: 1,
+                    generation: 1,
+                    conversation_version: 1,
+                },
+                fingerprint: 7,
+                sequence: 1,
+            },
+            effective_fingerprint: 7,
+            semantic_preview: None,
+            idempotency_key: None,
+            source: OutgoingSource::Reply,
+            state,
+            prepared_at: std::time::Instant::now(),
+            committed_at: None,
+            terminal_at,
+            collision_reported: false,
+        }
+    }
+
+    #[test]
+    fn unknown_outgoing_records_must_not_wedge_the_reply_queue() {
+        // 线上形态：网络抖动让一批回复落在 Unknown 上。它们以前和 Prepared/Committed
+        // 一样不可淘汰，16 格占满后 `make_outgoing_room_for` 恒返回 None，该会话的
+        // 每一批可见回复都被整批拒绝——用户看到的是"她突然不说话了"，最长一小时。
+        let now = std::time::Instant::now();
+        assert!(
+            !outgoing_is_evictable(&outgoing_in(OutgoingState::Prepared, None), now),
+            "Prepared 不能丢：那是已经准备好的可见回复"
+        );
+        assert!(
+            !outgoing_is_evictable(&outgoing_in(OutgoingState::Committed, None), now),
+            "Committed 不能丢：丢掉会让去重失效、可能重复发送"
+        );
+        assert!(
+            !outgoing_is_evictable(&outgoing_in(OutgoingState::Unknown, Some(now)), now),
+            "刚变成 Unknown 的还要参与碰撞窗口"
+        );
+        let stale = now - (UNKNOWN_EVICTION_GRACE + Duration::from_secs(1));
+        assert!(
+            outgoing_is_evictable(&outgoing_in(OutgoingState::Unknown, Some(stale)), now),
+            "过了碰撞窗口的 Unknown 必须能被淘汰，否则队列会被锁死"
+        );
+        assert!(outgoing_is_evictable(
+            &outgoing_in(OutgoingState::Sent, Some(now)),
+            now
+        ));
+        assert!(outgoing_is_evictable(
+            &outgoing_in(OutgoingState::Cancelled, Some(now)),
+            now
+        ));
+
+        // 满队列 + 一批新 Unknown 的极端形态：老的可以被淘汰，新的不行。
+        let mut state = ReplyState {
+            pending_outgoing: (0..MAX_PENDING_OUTGOING_PER_SCOPE)
+                .map(|_| outgoing_in(OutgoingState::Unknown, Some(stale)))
+                .collect(),
+            ..ReplyState::default()
+        };
+        assert_eq!(make_outgoing_room_for(&mut state, 1), Some(()));
+        assert_eq!(
+            state.pending_outgoing.len(),
+            MAX_PENDING_OUTGOING_PER_SCOPE - 1
+        );
+
+        let mut fresh = ReplyState {
+            pending_outgoing: (0..MAX_PENDING_OUTGOING_PER_SCOPE)
+                .map(|_| outgoing_in(OutgoingState::Unknown, Some(now)))
+                .collect(),
+            ..ReplyState::default()
+        };
+        assert_eq!(
+            make_outgoing_room_for(&mut fresh, 1),
+            None,
+            "全在碰撞窗口内时宁可真地拒绝这一批，也不能丢不确定的记录"
+        );
     }
 
     #[test]
