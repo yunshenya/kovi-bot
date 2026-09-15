@@ -100,6 +100,20 @@ fn latest_user_message(messages: &[BotMemory]) -> Option<&str> {
         .map(|message| message.content.as_str())
 }
 
+/// 这一轮要不要**只**为了表情包把工具带上。
+///
+/// 独立成一个函数是为了能单测：判定的两端都会出错——写宽了每个普通回合都多背一轮工具
+/// 循环的风险（模型可能在不必要的回合发起调用），写窄了就回到"提示词让她调 `sticker_list`、
+/// 她手里却没有"的老毛病。
+///
+/// 判据：只在**不是**工具轮时补（工具轮本来就带全套工具），且素材库确实有货——后者同时是
+/// 宿主回复协议里那段"先调 sticker_list 拿标签"的下发条件（`reply.rs` 用同一个
+/// `sticker_library::is_available`）。两者绑在同一个判据上，"提示词点名了工具"与"工具在
+/// 请求里"才不会各说各话。
+fn offers_sticker_tool_alone(tool_turn: bool, sticker_available: bool) -> bool {
+    !tool_turn && sticker_available
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ContextPromptMode {
     LegacyReplyActions,
@@ -155,10 +169,18 @@ pub(crate) async fn params_model_with_tool_access(
     vision_images: &[VisionImage],
     progress: Option<Arc<ThinkingReporter>>,
 ) -> BotMemory {
-    let expose_tools = tool_context.group_paused
+    // "工具轮"：这一轮本来就该带工具（群被暂停 / 语义层判定要查 / 关键词命中）。
+    let tool_turn = tool_context.group_paused
         || tool_context.requires_structured_tool_turn()
         || latest_user_message(messages).is_some_and(likely_requires_tool_protocol);
-    if !expose_tools {
+    // 素材库有货时，外面挂的回复协议里已经点名了 `sticker_list`（见 `reply.rs` 的
+    // `REPLY_PROTOCOL_STICKER`，判据与这里同一个 `is_available`）。工具只在工具轮下发的话，
+    // 提示词让她去调、她手里却没有这个工具——只能凭印象编一个标签，或者答应发一张相册里
+    // 没有的图（线上 2026-09-15 02:15 的"猫猫歪头"）。Core 那条路修的是同一个坑
+    // （`7ee0b95`），这里补上，两条链路才一致。
+    let sticker_only_turn =
+        offers_sticker_tool_alone(tool_turn, crate::sticker_library::is_available());
+    if !tool_turn && !sticker_only_turn {
         return interruptible_model_call_for_context(
             messages,
             &tool_context,
@@ -228,10 +250,16 @@ pub(crate) async fn params_model_with_tool_access(
 
     let mut tool_context = tool_context;
     let mut request = messages.to_vec();
-    request.push(BotMemory {
-        role: Roles::System,
-        content: registry.instruction_for_native(&tool_context, false),
-    });
+    // 这段"怎么用工具"的长指令只发给真正的工具轮。只因为"她可能想发图"才带上
+    // `sticker.list` 的普通回合同样不带它：那一段四百多字、每轮都付，而这一轮需要的
+    // 全部信息已经在工具自己的 description 里（AGENTS.md 第 6 条：能写进工具 description
+    // 的就放那里，不要抄进提示词）。Core 那条路对 sticker-only 回合也是这么做的。
+    if tool_turn {
+        request.push(BotMemory {
+            role: Roles::System,
+            content: registry.instruction_for_native(&tool_context, false),
+        });
+    }
     // reminder.create / agent.run.create 的强制指令由
     // `instruction_for_native`（上面那一行）按 `requires_*` 统一追加，
     // 这里不再重复一份，免得两条链路各说各话。
@@ -268,6 +296,10 @@ pub(crate) async fn params_model_with_tool_access(
     // delivery 在执行前再查一次 `available_read_only_for_context`，qq_call 直接走
     // `execute_read_only`。这里原来两样都没做。
     let mut untrusted_tool_output = false;
+    // 这一轮到底有没有真的调过 `sticker.list`。"她可能想发图"才带上工具的那些普通回合，
+    // 查过一次就够了——清单已经在上下文里，再带一次只是白花一轮模型调用（Core 那条路
+    // 用 `just_completed_sticker_list` 守同一件事）。
+    let mut sticker_list_queried = false;
     // 工具循环的历史增量（assistant tool_calls / assistant 文本 / tool 结果 /
     // 修复 system 提示）统一以 wire 形式维护，保证与 API 历史严格同序：
     // 模型永远通过 provider 的 tool_calls 通道发起调用，不再依赖文本协议。
@@ -276,18 +308,49 @@ pub(crate) async fn params_model_with_tool_access(
     for round in 0..max_tool_rounds {
         // 原生 function-calling 清单：只包含本轮上下文可用的工具；上一轮吃到外部内容
         // 就收窄成只读。
-        let tool_specs = registry.native_tool_specs(&tool_context, untrusted_tool_output);
-        let Some(payload) = interruptible_model_call_with_native_tools(
-            &mut request,
-            &extra_wire,
-            &tool_specs,
-            reply_ticket,
-            max_output_tokens,
-            vision_images,
-            progress.clone(),
-        )
-        .await
-        else {
+        //
+        // 只因为"她可能想发图"才带上工具的普通回合只给 `sticker.list` 一个：整套工具是
+        // 每轮几百个 token，还会让她在闲聊里发起不相干的调用。她已经查过就不再带——清单
+        // 就在上一条工具结果里。
+        let tool_specs = if sticker_only_turn && !sticker_list_queried {
+            registry
+                .sticker_tool_spec(&tool_context)
+                .into_iter()
+                .collect()
+        } else if sticker_only_turn {
+            Vec::new()
+        } else {
+            registry.native_tool_specs(&tool_context, untrusted_tool_output)
+        };
+        // 普通可见回合（`PlainText`）本来就带语气参考（`generate_plain_style_context`：
+        // 此刻心情 / 精力 / 主动性），而工具循环的**最后一轮就是那条可见正文**，所以加了
+        // 工具也不该把它丢掉。宿主这条循环原来一律用不带语气上下文的版本，于是"她只是
+        // 可能想发图"才进循环的普通回合会静默少掉一段提示词。生成它只是读一次 personality
+        // 再拼字符串，每轮重算是便宜的。
+        let payload = if context_prompt_mode(&tool_context) == ContextPromptMode::PlainText {
+            interruptible_model_call_with_native_tools_and_plain_style(
+                &mut request,
+                &extra_wire,
+                &tool_specs,
+                reply_ticket,
+                max_output_tokens,
+                vision_images,
+                progress.clone(),
+            )
+            .await
+        } else {
+            interruptible_model_call_with_native_tools(
+                &mut request,
+                &extra_wire,
+                &tool_specs,
+                reply_ticket,
+                max_output_tokens,
+                vision_images,
+                progress.clone(),
+            )
+            .await
+        };
+        let Some(payload) = payload else {
             return interrupted_response();
         };
         if vision_failure_detail(&payload.content).is_some() {
@@ -315,6 +378,9 @@ pub(crate) async fn params_model_with_tool_access(
                 // Provider 返回的 wire 名（点号已转下划线）先反查回注册名；
                 // 未知名字原样交给执行层，让它以“未知工具”失败反馈给模型。
                 let tool_name = registry.resolve_wire_tool_name(&call.name);
+                if tool_name == crate::sticker_library::TOOL_NAME {
+                    sticker_list_queried = true;
+                }
                 // 每个 tool_call 都必须有一条配对的 tool 结果（否则下一次请求会因为
                 // "tool_calls 没有全部跟结果"被上游拒绝），所以超限的那些也要回一条
                 // 结果——回"没执行，请拆到下一轮"，而不是静默丢掉或照单全收。
@@ -331,8 +397,10 @@ pub(crate) async fn params_model_with_tool_access(
                         memory_rounds += 1;
                     }
                     // 执行边界也要守：只靠清单收窄不够，模型仍可能报出上一轮见过的
-                    // 写工具名。
-                    if untrusted_tool_output {
+                    // 写工具名。sticker-only 的普通回合同样按只读执行——那一轮只该查清单，
+                    // 不该有任何副作用（与 Core 的 `read_only_only = sticker_only_turn ||
+                    // follow_up` 一个口径）。
+                    if untrusted_tool_output || sticker_only_turn {
                         registry
                             .execute_read_only(
                                 &tool_name,
@@ -1096,8 +1164,9 @@ mod tests {
         ContextPromptMode, MAX_TOOL_CALLS_PER_ROUND, ReminderCreateFailure, ToolCallRefusal,
         completed_group_followup_response, completed_group_message_response, context_prompt_mode,
         interrupted_response, likely_requires_tool_protocol, merge_group_send_result,
-        refuse_tool_call, reminder_failure_response, required_group_followup_failure,
-        required_group_message_failure, tool_result_has_task_status, tool_round_limit,
+        offers_sticker_tool_alone, refuse_tool_call, reminder_failure_response,
+        required_group_followup_failure, required_group_message_failure,
+        tool_result_has_task_status, tool_round_limit,
     };
     use crate::model::MessageDestination;
     use crate::model::reply::parse_reply_output;
@@ -1127,6 +1196,38 @@ mod tests {
             assert!(
                 likely_requires_tool_protocol(content),
                 "external-tool intent should still expose tools: {content}"
+            );
+        }
+    }
+
+    /// 提示词里点名了 `sticker_list`，那一轮就必须真的把工具下发。
+    ///
+    /// 宿主链路的回复协议在素材库有货时会写"想发一张就填 `"sticker":"标签"`（先调
+    /// sticker_list 拿标签）"（`reply.rs` 的 `REPLY_PROTOCOL_STICKER`，下发判据同样是
+    /// `sticker_library::is_available`）。而工具原本只在"工具轮"下发，工具轮的关键词
+    /// （搜索 / 提醒 / 查一下）里没有任何与图或表情相关的词——于是"芸汐看看你的照片"
+    /// 这类回合里，她被告知去调一个**不在请求里**的工具，只能凭印象编一个标签。
+    /// Core 那条路修的是同一个坑（`7ee0b95` 接线、`a4e3fe4` 补边界），这里是宿主链路。
+    #[test]
+    fn plain_host_turns_get_the_sticker_tool_alone() {
+        // 普通回合 + 素材库有货：必须补，否则提示词让她调、她调不到。
+        assert!(offers_sticker_tool_alone(false, true));
+        // 普通回合 + 素材库空着：不给。这种情况下回复协议本身也不提表情包。
+        assert!(!offers_sticker_tool_alone(false, false));
+        // 工具轮：不重复补（返回 false 不会让她少一个工具——工具轮本来就带全套）。
+        assert!(!offers_sticker_tool_alone(true, true));
+        assert!(!offers_sticker_tool_alone(true, false));
+
+        // 上面那条"她调不到"的判断依据：这几种真实问法都命中不了工具轮判据。
+        for content in [
+            "芸汐看看你的照片",
+            "发张表情包",
+            "你的照片给我看看",
+            "来个猫猫的表情",
+        ] {
+            assert!(
+                !likely_requires_tool_protocol(content),
+                "这句话不该被判成工具轮（否则这条补丁的前提就变了）: {content}"
             );
         }
     }

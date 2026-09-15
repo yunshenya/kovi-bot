@@ -18,6 +18,10 @@ use crate::model::{
     OutgoingSource, action_outgoing_fingerprint, interrupt, is_current, mark_active,
     mark_outgoing_failed, prepare_outgoing_batch_with_semantic_preview,
 };
+// `sticker.list` 的注册名（带点；发到 provider 时由 `wire_tool_name` 换成下划线）。
+// 值只有一份、放在素材库那边：宿主链路也要在工具结果上认这个名字，各写一份字面量迟早
+// 会漂开。
+use crate::sticker_library::TOOL_NAME as STICKER_TOOL_NAME;
 use crate::yunxi::identity_store::PostgresIdentityStore;
 use crate::yunxi::intrinsic_runtime::IntrinsicHostRuntime;
 use crate::yunxi::mind_runtime::{
@@ -460,9 +464,6 @@ fn tool_calls_allowed_for_turn(
 ) -> bool {
     route_allows_tool_call && (explicit_message_count.is_none() || tool_intent)
 }
-
-/// `sticker.list` 的注册名（带点；发到 provider 时由 `wire_tool_name` 换成下划线）。
-const STICKER_TOOL_NAME: &str = "sticker.list";
 
 /// 这一轮是不是"刚查完表情包清单"的跟进回合。
 fn just_completed_sticker_list(kind: &WorldEventKind) -> bool {

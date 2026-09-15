@@ -431,6 +431,14 @@ pub(crate) fn available_labels() -> Vec<String> {
 /// 否则她照着抄也调不到。
 pub(crate) const STICKER_PROMPT: &str = "素材库就是你自己的相册（图都是你的）：想发哪张就先调 sticker_list 拿标签，把 [[STICKER 标签]] 写在正文最前面（不展示，正文可留空），标签照抄工具给的、别自己起名字。带你自己名字的标签就是你本人的照片：有人要看你的照片，就把那张发出去，不要说那不是你。";
 
+/// `sticker.list` 的**注册名**（内部 id，带点）。
+///
+/// 两条链路都要在工具调用结果上认这个名字（"刚查完清单就别再查一遍"），所以只能有一份：
+/// 各写一份字面量的话，改注册名时漏掉一处就会退化成"查了又查"。
+/// 注意它**不是**给模型看的名字——发到 provider 的函数名要经
+/// [`crate::model::tool_access::wire_tool_name`] 把点换成下划线（见 [`STICKER_PROMPT`]）。
+pub(crate) const TOOL_NAME: &str = "sticker.list";
+
 /// 这一轮要不要给这段协议：素材库关了或空着就不给（不能让她以为自己有一个当下用不了
 /// 的出口），给了就一定是上面那一份。
 pub(crate) fn prompt_instruction() -> Option<&'static str> {
