@@ -87,6 +87,165 @@ pub(crate) fn outgoing_available() -> bool {
     call.enabled() && call.outgoing_enabled()
 }
 
+/// 禁止外呼的时段。
+///
+/// 支持跨午夜（`23:00-08:00`）。判据用**当天的分钟数**而不是日期时间，比较简单也够用：
+/// 时区取本机时区的当前时刻，调用方负责给。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct QuietHours {
+    start_minute: u32,
+    end_minute: u32,
+}
+
+impl QuietHours {
+    /// 解析 `"23:00-08:00"`。留空或格式非法返回 `None`（配置加载时会先报错拦住非法值）。
+    pub(crate) fn parse(raw: &str) -> Option<Self> {
+        let (start, end) = raw.trim().split_once('-')?;
+        Some(Self {
+            start_minute: parse_hh_mm(start)?,
+            end_minute: parse_hh_mm(end)?,
+        })
+    }
+
+    /// 这个时刻是否落在静默时段内。
+    pub(crate) fn contains_minute(self, minute: u32) -> bool {
+        if self.start_minute == self.end_minute {
+            // 起止相同：视为"整天静默"。写成等价区间会让它变成"从不静默"，
+            // 那和配置者的意图正好相反。
+            return true;
+        }
+        if self.start_minute < self.end_minute {
+            (self.start_minute..self.end_minute).contains(&minute)
+        } else {
+            // 跨午夜：22:00-08:00 = [22:00, 24:00) ∪ [00:00, 08:00)
+            minute >= self.start_minute || minute < self.end_minute
+        }
+    }
+}
+
+fn parse_hh_mm(raw: &str) -> Option<u32> {
+    let (hour, minute) = raw.trim().split_once(':')?;
+    let hour: u32 = hour.trim().parse().ok()?;
+    let minute: u32 = minute.trim().parse().ok()?;
+    if hour > 23 || minute > 59 {
+        return None;
+    }
+    Some(hour * 60 + minute)
+}
+
+fn minute_of_day(now: chrono::DateTime<chrono::Local>) -> u32 {
+    use chrono::Timelike;
+    now.hour() * 60 + now.minute()
+}
+
+/// 外呼账本：每人每天打了几次、上次是什么时候。
+///
+/// **进程内、重启即清**。这是一个**频次闸门**，不是配额账本：它的作用是在配置真的开启
+/// 之后拦住"短时间内反复拨同一个人"，而不是保证一个跨重启的精确日上限。默认两道限制都
+/// 是关的（见 `QqCallConfig`），所以这份实现只在有人主动打开开关之后才起作用；真要精确
+/// 的跨重启计数，应该落 Redis/Postgres，那是另一个决定。
+#[derive(Debug, Default)]
+struct DialLedger {
+    entries: std::collections::HashMap<i64, DialRecord>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DialRecord {
+    day: chrono::NaiveDate,
+    count: u32,
+    last_at: chrono::DateTime<chrono::Local>,
+}
+
+static DIAL_LEDGER: std::sync::LazyLock<std::sync::Mutex<DialLedger>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(DialLedger::default()));
+
+/// 账本条数上限：它按人记，人不该无界增长。
+const MAX_DIAL_LEDGER_ENTRIES: usize = 512;
+
+fn with_ledger<T>(action: impl FnOnce(&mut DialLedger) -> T) -> T {
+    let mut guard = DIAL_LEDGER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    action(&mut guard)
+}
+
+/// 现在这会儿，频次上允许拨给这个人吗（只查，不记账）。
+fn rate_limit_allows(
+    config: &config::QqCallConfig,
+    peer: i64,
+    now: chrono::DateTime<chrono::Local>,
+) -> bool {
+    let min_interval = config.outgoing_min_interval_secs();
+    let daily_limit = config.outgoing_daily_limit();
+    if min_interval == 0 && daily_limit == 0 {
+        return true;
+    }
+    with_ledger(|ledger| {
+        let Some(record) = ledger.entries.get(&peer) else {
+            return true;
+        };
+        if min_interval > 0 {
+            let elapsed = now
+                .signed_duration_since(record.last_at)
+                .num_seconds()
+                .max(0) as u64;
+            if elapsed < min_interval {
+                return false;
+            }
+        }
+        if daily_limit > 0 && record.day == now.date_naive() && record.count >= daily_limit {
+            return false;
+        }
+        true
+    })
+}
+
+/// 记一次真的拨出去了的外呼。
+fn record_dial(peer: i64, now: chrono::DateTime<chrono::Local>) {
+    with_ledger(|ledger| {
+        if !ledger.entries.contains_key(&peer) && ledger.entries.len() >= MAX_DIAL_LEDGER_ENTRIES {
+            // 丢最早的那个，保持有界而不是拒绝新的。
+            if let Some(oldest) = ledger
+                .entries
+                .iter()
+                .min_by_key(|(_, record)| record.last_at)
+                .map(|(peer, _)| *peer)
+            {
+                ledger.entries.remove(&oldest);
+            }
+        }
+        let entry = ledger.entries.entry(peer).or_insert(DialRecord {
+            day: now.date_naive(),
+            count: 0,
+            last_at: now,
+        });
+        if entry.day != now.date_naive() {
+            entry.day = now.date_naive();
+            entry.count = 0;
+        }
+        entry.count += 1;
+        entry.last_at = now;
+    });
+}
+
+/// 静默时段与频次闸门。两道都默认关着（用户 2026-09-16 的决定），但开关一动就生效。
+fn outgoing_guard(
+    config: &config::QqCallConfig,
+    peer: i64,
+    now: chrono::DateTime<chrono::Local>,
+) -> Option<DialOutcome> {
+    if config
+        .outgoing_quiet_hours()
+        .is_some_and(|quiet| quiet.contains_minute(minute_of_day(now)))
+    {
+        return Some(DialOutcome::QuietHours);
+    }
+    if !rate_limit_allows(config, peer, now) {
+        return Some(DialOutcome::RateLimited);
+    }
+    None
+}
+
 /// 现在能不能拨给这个人——**只查，不拨**。
 ///
 /// 给"这次主动接触该用哪种媒介"那一步用：先问能不能，再决定用不用电话。反过来的话，
@@ -101,6 +260,9 @@ pub(crate) async fn can_dial(
         return false;
     }
     if !caller_is_allowed(config, main_admin, peer).await {
+        return false;
+    }
+    if outgoing_guard(config, peer, chrono::Local::now()).is_some() {
         return false;
     }
     let Ok(client) = BridgeClient::new(config) else {
@@ -184,6 +346,10 @@ pub(crate) enum DialOutcome {
     NotAuthorized,
     /// 现在正通着话（可能还没进房）。
     AlreadyInCall,
+    /// 落在配置的静默时段里（`qq_call.outgoing_quiet_hours`）。
+    QuietHours,
+    /// 撞上频次闸门（每人每天上限 / 最短间隔）。
+    RateLimited,
     /// 桥不可用，或拨号请求本身失败。
     BridgeUnavailable(String),
 }
@@ -203,6 +369,8 @@ impl DialOutcome {
             Self::OutgoingDisabled => "outgoing_disabled",
             Self::NotAuthorized => "not_authorized",
             Self::AlreadyInCall => "already_in_call",
+            Self::QuietHours => "quiet_hours",
+            Self::RateLimited => "rate_limited",
             Self::BridgeUnavailable(_) => "bridge_unavailable",
         }
     }
@@ -263,6 +431,11 @@ async fn dial_peer_inner(
     if !caller_is_allowed(config, main_admin, peer).await {
         return DialOutcome::NotAuthorized;
     }
+    let now = chrono::Local::now();
+    // 静默时段与频次：默认两道都关着，但配置一动就在这里挡住。
+    if let Some(blocked) = outgoing_guard(config, peer, now) {
+        return blocked;
+    }
     let client = match BridgeClient::new(config) {
         Ok(client) => client,
         Err(error) => return DialOutcome::BridgeUnavailable(error.to_string()),
@@ -283,6 +456,8 @@ async fn dial_peer_inner(
         if let Ok(state) = client.current_call().await
             && (state.phase().is_live() || state.dial_reached_at.is_some())
         {
+            // 只有真的拨出去了才记账：没拨出去的不该占用频次额度。
+            record_dial(peer, now);
             return DialOutcome::Dialed;
         }
     }
@@ -302,6 +477,10 @@ pub(crate) async fn request_outgoing_call(bot: &kovi::RuntimeBot, requester: i64
         }
         DialOutcome::NotAuthorized => "你不在通话授权名单里，我不能打给你。".to_string(),
         DialOutcome::AlreadyInCall => "现在正通着话呢，等这通结束我再打给你。".to_string(),
+        DialOutcome::QuietHours => "现在是配置里的静默时段，我不往外打电话。".to_string(),
+        DialOutcome::RateLimited => {
+            "今天打给你的次数已经到上限（或间隔太短），先不打了。".to_string()
+        }
         DialOutcome::BridgeUnavailable(error) => format!("打不出去：{error}"),
     }
 }
@@ -611,6 +790,97 @@ async fn report_phase_change(
 
 #[cfg(test)]
 mod tests {
+    /// 静默时段的区间判据，尤其是**跨午夜**那种。
+    ///
+    /// 跨午夜写错的方向很危险：把 `23:00-08:00` 判成空区间，等于静默时段完全不生效，
+    /// 而失败表现是"半夜打了一通电话"——最不该靠运气的地方。整天静默也是同理：
+    /// 起止相同若按"空区间"处理，恰好和配置者的意图相反。
+    #[test]
+    fn quiet_hours_cover_the_configured_window() {
+        use super::QuietHours;
+
+        let night = QuietHours::parse("23:00-08:00").expect("合法区间");
+        let minute = |hour: u32, minute: u32| hour * 60 + minute;
+        // 跨午夜：晚上那一侧。
+        assert!(night.contains_minute(minute(23, 0)), "起点算在内");
+        assert!(night.contains_minute(minute(23, 59)));
+        assert!(night.contains_minute(minute(0, 0)), "午夜之后仍在窗口内");
+        assert!(night.contains_minute(minute(7, 59)));
+        assert!(!night.contains_minute(minute(8, 0)), "终点不算在内");
+        assert!(!night.contains_minute(minute(12, 0)));
+        assert!(!night.contains_minute(minute(22, 59)));
+
+        // 不跨午夜。
+        let lunch = QuietHours::parse("12:00-13:30").expect("合法区间");
+        assert!(lunch.contains_minute(minute(12, 0)));
+        assert!(lunch.contains_minute(minute(13, 29)));
+        assert!(!lunch.contains_minute(minute(13, 30)));
+        assert!(!lunch.contains_minute(minute(11, 59)));
+        assert!(
+            !lunch.contains_minute(minute(23, 0)),
+            "非跨午夜区间不该吃下夜里"
+        );
+
+        // 起止相同 = 整天静默（而不是"从不静默"）。
+        let always = QuietHours::parse("00:00-00:00").expect("合法区间");
+        assert!(always.contains_minute(minute(0, 0)));
+        assert!(always.contains_minute(minute(15, 30)));
+
+        // 非法写法返回 None，由配置加载那一步报错拦住。
+        for bad in [
+            "",
+            "23:00",
+            "23:00-",
+            "-08:00",
+            "24:00-08:00",
+            "23:60-08:00",
+            "aa-bb",
+        ] {
+            assert!(
+                QuietHours::parse(bad).is_none(),
+                "{bad:?} 不该被解析成合法区间"
+            );
+        }
+    }
+
+    /// 频次账本：默认放开时什么都不拦，开了之后按上限与间隔拦。
+    ///
+    /// 只对**真的拨出去了**的记账（`record_dial` 的调用点在 `Dialed` 那一支），
+    /// 所以没拨出去不会白占额度。
+    #[test]
+    fn the_dial_ledger_counts_only_real_dials() {
+        use super::{MAX_DIAL_LEDGER_ENTRIES, record_dial, with_ledger};
+        use chrono::{Duration as ChronoDuration, Local};
+
+        let peer = 9_000_001;
+        let now = Local::now();
+        // 先清干净，免得上一次运行的残留影响判据。
+        with_ledger(|ledger| ledger.entries.remove(&peer));
+        record_dial(peer, now);
+        record_dial(peer, now + ChronoDuration::seconds(1));
+        let (count, day) = with_ledger(|ledger| {
+            let record = ledger.entries.get(&peer).expect("记过账");
+            (record.count, record.day)
+        });
+        assert_eq!(count, 2);
+        assert_eq!(day, now.date_naive());
+
+        // 跨天要重置计数。
+        record_dial(peer, now + ChronoDuration::days(1));
+        let count = with_ledger(|ledger| ledger.entries[&peer].count);
+        assert_eq!(count, 1, "跨天之后计数该从头开始");
+
+        // 账本有界。
+        for extra in 0..(MAX_DIAL_LEDGER_ENTRIES as i64 + 20) {
+            record_dial(10_000_000 + extra, now);
+        }
+        let length = with_ledger(|ledger| ledger.entries.len());
+        assert!(
+            length <= MAX_DIAL_LEDGER_ENTRIES,
+            "账本必须有界，实际 {length}"
+        );
+    }
+
     /// 通话结局的判据：桥分不出更细的，所以只有三种。
     ///
     /// 判错的具体代价：把"没接通"记成"通了话"，认知层就会以为她真的跟人说过话；

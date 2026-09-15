@@ -116,6 +116,16 @@ pub struct QqCallConfig {
     /// 已真机验证可用，机器人按 AVSDK 的 `20021` 回执确认"电话到底有没有响"，
     /// 几秒内没回执就如实回复。注意呼出的通话不会让桥进入 ringing/connected。
     outgoing_enabled: bool,
+    /// 禁止外呼的时段，例如 `"23:00-08:00"`。留空 = 不限时段。
+    ///
+    /// 默认放开是**有意的决定**（用户 2026-09-16 明确选了"只留配置位、先不启用"），
+    /// 但这个开关必须真的生效：打电话和发消息不是一个量级——消息可以不看，电话必须接。
+    /// 判据放在宿主侧，因为 Core 不知道钟点，也不该知道。
+    outgoing_quiet_hours: String,
+    /// 每个人每天最多被主动拨几次。0 = 不限。
+    outgoing_daily_limit: u32,
+    /// 两次外呼同一个人之间的最短间隔（秒）。0 = 不限。
+    outgoing_min_interval_secs: u64,
     /// 漏接来电时是否私聊告诉主管理员（默认开启）。
     ///
     /// "漏接"= 桥看到过邀请、但整通从未进房（对方一直响到放弃）。2026-09-12 实测的
@@ -344,6 +354,21 @@ impl QqCallConfig {
         self.outgoing_enabled
     }
 
+    /// 禁止外呼的时段；没配置或格式非法时为 `None`（格式非法在加载时就会报错）。
+    ///
+    /// `pub(crate)`：返回类型是 crate 内部的 `QuietHours`，不该出现在对外的 `pub` 签名里。
+    pub(crate) fn outgoing_quiet_hours(&self) -> Option<crate::qq_call::QuietHours> {
+        crate::qq_call::QuietHours::parse(&self.outgoing_quiet_hours)
+    }
+
+    pub fn outgoing_daily_limit(&self) -> u32 {
+        self.outgoing_daily_limit
+    }
+
+    pub fn outgoing_min_interval_secs(&self) -> u64 {
+        self.outgoing_min_interval_secs
+    }
+
     /// 会话结束时是否让桥真的挂断电话。
     pub fn hangup_enabled(&self) -> bool {
         self.hangup_enabled
@@ -407,6 +432,26 @@ impl QqCallConfig {
         if !is_loopback_http_url(&self.asr_url) || !is_loopback_http_url(&self.tts_url) {
             return Err(anyhow::anyhow!(
                 "qq_call.asr_url 与 qq_call.tts_url 必须是回环地址的 http 地址"
+            ));
+        }
+        // 时段写法拼错要在加载时报错：静默忽略会让"我明明设了静默时段"变成一个不生效的
+        // 开关，而它的失败方式恰恰是**半夜打电话**——最不该靠运气的那种。
+        if !self.outgoing_quiet_hours.trim().is_empty()
+            && crate::qq_call::QuietHours::parse(&self.outgoing_quiet_hours).is_none()
+        {
+            return Err(anyhow::anyhow!(
+                "qq_call.outgoing_quiet_hours 格式无效：{}（应写成 23:00-08:00）",
+                self.outgoing_quiet_hours
+            ));
+        }
+        if self.outgoing_daily_limit > 50 {
+            return Err(anyhow::anyhow!(
+                "qq_call.outgoing_daily_limit 过大（上限 50）"
+            ));
+        }
+        if self.outgoing_min_interval_secs > 86_400 {
+            return Err(anyhow::anyhow!(
+                "qq_call.outgoing_min_interval_secs 过大（上限 86400 秒）"
             ));
         }
         if self.bridge_token_env.trim().is_empty() && self.bridge_token_file.trim().is_empty() {
@@ -607,6 +652,10 @@ impl Default for QqCallConfig {
             archive_to_memory: true,
             notify_missed_calls: true,
             outgoing_enabled: true,
+            // 三道闸门默认全放开：功能先能用，要收紧改配置即可，不必改代码。
+            outgoing_quiet_hours: String::new(),
+            outgoing_daily_limit: 0,
+            outgoing_min_interval_secs: 0,
             phone_tools_enabled: true,
             tool_filler: "嗯……我看一下。".to_string(),
             tool_max_rounds: 3,
@@ -751,6 +800,66 @@ mod tests {
         assert_eq!(greedy.claim_retry_rounds(), 5);
         assert_eq!(greedy.idle_prompt_max(), 10);
         assert_eq!(greedy.monologue_max_chunks(), 200);
+    }
+
+    /// 三道外呼闸门：默认全放开，配错要**在加载时报错**。
+    ///
+    /// 静默时段拼错的失败方式是"半夜打了一通电话"——最不该靠运气的地方，所以它不能
+    /// 静默失效。
+    #[test]
+    fn outgoing_guards_default_open_and_reject_bad_values() {
+        let enabled = || QqCallConfig {
+            enabled: true,
+            bridge_token_file: "/tmp/kovi-test-token".to_string(),
+            pulse_server: "unix:/tmp/kovi-test-pulse".to_string(),
+            ..QqCallConfig::default()
+        };
+
+        // 默认全放开。
+        let defaults = enabled();
+        assert_eq!(defaults.outgoing_quiet_hours(), None);
+        assert_eq!(defaults.outgoing_daily_limit(), 0);
+        assert_eq!(defaults.outgoing_min_interval_secs(), 0);
+        assert!(defaults.validate().is_ok());
+
+        // 合法配置要能通过，并且真的能被解析出来。
+        let configured = QqCallConfig {
+            outgoing_quiet_hours: "23:00-08:00".to_string(),
+            outgoing_daily_limit: 3,
+            outgoing_min_interval_secs: 1800,
+            ..enabled()
+        };
+        assert!(configured.validate().is_ok());
+        assert!(configured.outgoing_quiet_hours().is_some());
+
+        // 写错的时段必须报错，而不是当成"不限时段"。
+        for bad in ["23:00", "25:00-08:00", "23:60-08:00", "晚上-早上"] {
+            let config = QqCallConfig {
+                outgoing_quiet_hours: bad.to_string(),
+                ..enabled()
+            };
+            let error = config
+                .validate()
+                .expect_err(&format!("{bad:?} 是非法时段，必须报错"));
+            assert!(
+                error.to_string().contains("outgoing_quiet_hours"),
+                "{error}"
+            );
+        }
+
+        // 明显不合理的上限也拦住。
+        for bad in [
+            QqCallConfig {
+                outgoing_daily_limit: 51,
+                ..enabled()
+            },
+            QqCallConfig {
+                outgoing_min_interval_secs: 90_000,
+                ..enabled()
+            },
+        ] {
+            assert!(bad.validate().is_err(), "超出上限该报错");
+        }
     }
 
     #[test]

@@ -4383,6 +4383,12 @@ fn render_dial_outcome(outcome: crate::qq_call::DialOutcome) -> Result<String> {
         DialOutcome::AlreadyInCall => Ok(
             "现在正通着话，这通先不拨。等这一通结束再说。".to_string(),
         ),
+        DialOutcome::QuietHours => Ok(
+            "电话没拨出去：现在是设置里不让打电话的时段。照实说明是这个原因就行。".to_string(),
+        ),
+        DialOutcome::RateLimited => Ok(
+            "电话没拨出去：给这个人打电话的次数/频率到了设置的上限。照实说明就行。".to_string(),
+        ),
         DialOutcome::Disabled => Ok(
             "通话功能当前没启用（qq_call.enabled = false），打不出去。".to_string(),
         ),

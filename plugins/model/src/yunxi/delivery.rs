@@ -379,6 +379,14 @@ impl QqActionAdapter {
             crate::qq_call::DialOutcome::AlreadyInCall => Ok(ActionPortOutcome::Deferred {
                 reason: "call_already_in_progress".to_string(),
             }),
+            // 静默时段与频次都是"此刻不行、以后可以"：报 Deferred 让主动接触按自己的
+            // 冷却重排，而不是记成永久失败。报成非重试错误会让这次机会直接作废。
+            crate::qq_call::DialOutcome::QuietHours => Ok(ActionPortOutcome::Deferred {
+                reason: "call_quiet_hours".to_string(),
+            }),
+            crate::qq_call::DialOutcome::RateLimited => Ok(ActionPortOutcome::Deferred {
+                reason: "call_rate_limited".to_string(),
+            }),
             crate::qq_call::DialOutcome::BridgeUnavailable(error) => {
                 Err(ActionPortError::new(format!("call_bridge:{error}"), true))
             }
