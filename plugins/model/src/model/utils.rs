@@ -2056,35 +2056,6 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
     truncated
 }
 
-/// 调用AI模型生成回复
-///
-/// 向配置的AI模型发送请求，生成智能回复。包括以下功能：
-/// - 添加轻量回复风格参考
-/// - 发送HTTP请求到AI模型
-/// - 解析响应并清理格式
-///
-/// # 参数
-/// * `messages` - 对话消息列表（可变引用）
-///
-/// # 返回值
-/// 生成的机器人回复消息
-///
-/// # 错误处理
-/// 如果 API 调用失败，返回仅供宿主识别的内部错误状态；可见回复由调用方决定，
-/// 不会自动发送固定保底文案。
-#[allow(dead_code)]
-pub async fn params_model(messages: &mut [BotMemory]) -> BotMemory {
-    params_model_with_token_limit(messages, None, &[]).await
-}
-
-pub(crate) async fn params_model_with_token_limit(
-    messages: &mut [BotMemory],
-    max_tokens: Option<u32>,
-    vision_images: &[VisionImage],
-) -> BotMemory {
-    params_model_with_token_limit_and_progress(messages, max_tokens, vision_images, None).await
-}
-
 pub(crate) fn sanitize_scheduled_output(
     content: &str,
     max_output_chars: usize,
@@ -2201,40 +2172,6 @@ fn humanize_scheduled_prefix(content: &str) -> String {
         }
     }
     trimmed.to_string()
-}
-
-pub(crate) async fn params_model_with_token_limit_and_progress(
-    messages: &mut [BotMemory],
-    max_tokens: Option<u32>,
-    vision_images: &[VisionImage],
-    progress: Option<Arc<ThinkingReporter>>,
-) -> BotMemory {
-    params_model_with_token_limit_and_progress_for_reply(
-        messages,
-        max_tokens,
-        vision_images,
-        progress,
-        None,
-    )
-    .await
-}
-
-pub(crate) async fn params_model_with_token_limit_and_progress_for_reply(
-    messages: &mut [BotMemory],
-    max_tokens: Option<u32>,
-    vision_images: &[VisionImage],
-    progress: Option<Arc<ThinkingReporter>>,
-    reply_ticket: Option<ReplyTicket>,
-) -> BotMemory {
-    params_model_with_token_limit_and_progress_for_reply_mode(
-        messages,
-        max_tokens,
-        vision_images,
-        progress,
-        reply_ticket,
-        ModelPromptMode::LegacyReplyGuidance,
-    )
-    .await
 }
 
 /// Complete a model request with only host-owned plain-text persona/state
@@ -2533,9 +2470,10 @@ async fn params_model_with_native_tools_mode(
     }
 }
 
+/// 一次模型请求要附带的语气上下文（与宿主回复动作那条路的 `NativeToolStyle` 是两回事：
+/// 这里是"纯文本补全"用的，那边是"带工具的结构化回复"用的）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ModelPromptMode {
-    LegacyReplyGuidance,
     PlainStyleContext,
     PlainStyleContextAllowEmpty,
     None,
@@ -2586,7 +2524,7 @@ async fn params_model_with_token_limit_and_progress_for_reply_mode_inner(
     // reporter by habit; action/tool turns remain the only structured path.
     let progress = match prompt_mode {
         ModelPromptMode::PlainStyleContext | ModelPromptMode::PlainStyleContextAllowEmpty => None,
-        ModelPromptMode::LegacyReplyGuidance | ModelPromptMode::None => progress,
+        ModelPromptMode::None => progress,
     };
 
     // Zero-external mode is a supported deployment profile. Return the same
@@ -2596,13 +2534,9 @@ async fn params_model_with_token_limit_and_progress_for_reply_mode_inner(
         return model_error("外部对话模型已禁用");
     }
 
-    // 回复引导只用于本次请求，不写回长期会话，避免 system 消息不断累积。
+    // 语气参考只用于本次请求，不写回长期会话，避免 system 消息不断累积。
     let mut request_messages = messages.to_owned();
     match prompt_mode {
-        ModelPromptMode::LegacyReplyGuidance => request_messages.push(BotMemory {
-            role: Roles::System,
-            content: generate_reply_guidance(messages).await,
-        }),
         ModelPromptMode::PlainStyleContext | ModelPromptMode::PlainStyleContextAllowEmpty => {
             request_messages.push(BotMemory {
                 role: Roles::System,
