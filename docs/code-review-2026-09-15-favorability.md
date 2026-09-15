@@ -600,6 +600,18 @@ memory_query,utils}.rs`、`memory/mod.rs`）一路被中途叫停——原因是
 | W4 先改后验留半成品 | 三处（假设合并、情境转换、实体更新）改成副本上完成、验过再落；顺带修 `expires_at` 的 `None` 被 TTL 覆盖；**反向对照**复现"目标被改坏" | `0c98387` |
 | W6 Intrinsic 永远不可用 | 复检用与选档同一份掩码后的能力快照；**反向对照**复现 `Unavailable` | `eff4452` |
 
+### 第二轮补修（2026-09-15 下午）
+
+| 条目 | 改动 | Commit |
+| --- | --- | --- |
+| W9 冷却名额只增不删 | 容量检查前按过期回收；真满时用新的 `CooldownStateFull`（原来的报错名和原因对不上）；**反向对照**复现"新会话被拒" | `0c33e67` |
+| Executive 四小处 | `max_delta = NaN` 会 panic；`CognitiveBudget::replenish` 丢余数（每 30 秒补一次的路径永远补 0）；`critical_attention_reserve` 的 NaN 能通过校验；`same_participants` 是集合比较（`[A,A,B] == [A,B,B]`）；`revise` 失败路径顺手把计划置成终态。两条做了反向对照 | `3754993` `6802c09` |
+| W7 假设装载丢三列 | 补 `Hypothesis::restore`，`status`/`updated_at`/`version` 真正读回；**PostgreSQL 往返测试** + 反向对照 | `e70a6f3` |
+| turn_gate 资产路径 | 补 `canonicalize` + `starts_with(root)` 包含校验（对齐兄弟实现）；反向对照复现 | `4c6a935` |
+| W8 Executive 目标 | Global 投影不再清掉别人作用域（与文档承诺相反）；补跨作用域上限 `MAX_GOALS_PER_CONTROLLER`；反向对照复现 | `d7419a8` |
+| 世界模型四处查漏 | 不确定项补上限（唯一无界 mutator）；因果快照带上上下文里的每个参与者（此前只取第一个）；删掉永假的时间校验并补 `validate_at`；删掉 `Cancelled → Active` 不可达分支。反向对照复现因果快照丢人 | `0120eae` |
+| 私聊无关系信号 | 见第十节：私聊接进相处证据通道 | `f88702a` |
+
 ### 仍未修（需要单独判断，不在这轮授权范围内自行拍板）
 
 1. **F10 legacy 画像只在 Host 群聊路更新**：私聊与被 @ 的消息都不再学
