@@ -850,3 +850,47 @@ CLI 10 + acceptance 13，全过（63 ignored）；带 `DATABASE_URL` 的 ignored
 Executive 快照 upsert 的 `>` 与 `DO UPDATE` 判据、`put_record_tx` 的误导性 VersionConflict、
 Mind cleanup 让退休信念"以新 UUID 复活"、`InnerAgenda::prune_to_limits` 终态项绕过上限、
 `InMemoryMindStore::apply` 的硬编码校验配置、台账里更早的私聊/群聊提示词格式项。
+
+### 11.6 队列第四批（2026-09-16 凌晨，"接做吧"之后）
+
+又是挑"对错客观、无需新口径"的做，本批 9 个 commit（另有 1 个 clippy/属性修复）：
+
+| 提交 | 修了什么 | 怎么验证的 |
+| --- | --- | --- |
+| `fcd3b2b` | 按 id 更新不存在的记录报 `NotFound`，不再伪装成 `VersionConflict{actual:0}`（上层会误以为版本过期去重试） | 真库用例：把夹具推到第 2 版再更新一条从未写入的记录；改回旧回落立刻失败 |
+| `7053493` | Executive 快照两处 upsert 加上 `WHERE`：同版本不同内容报冲突，不再静默覆盖对方的 plan/expectation 投影 | 真库用例：同版本同内容幂等、同版本不同内容冲突且库里仍是先写者那份；去掉 `WHERE` 立刻失败 |
+| `c13e42b` | 内存/Postgres 两份硬编码的"存储层校验界"收敛成一个公开来源，并钉住"不得小于策略默认值" | 新增用例逐字段断言；把界改小立刻失败 |
+| `41567e1` | 嵌入向量非法元素不再被 `unwrap_or(0.0)` 静默补 0（字符串/null/NaN/空数组一律报错）；维度不一致的存量向量按时间节流告警，而不是"永远排不上" | 新增用例覆盖各类非法输入；`memory::` 54 passed |
+| `7f8c578` | 世界模型模块文档改成事实（反序列化**不**校验边界） | 纯文档 + `cargo build` |
+| `0072bb7` | 孤儿 `Prepared` 出站记录 5 分钟后降级为 `Unknown`：不再永久占容量、卡后续 prepare、让整份 `ReplyState` 不回收 | 新增用例（新准备的不动、过期的降级）；删掉降级分支立刻失败 |
+| `3a9e37e` | 预提交校验超时取消可见回复时打印 WARN（以前与"被新消息顶掉"完全同形、无日志） | `model::interrupt` 37 passed（行为未变，只加日志分支） |
+| `81c273b` | 群聊正文里伪造的"下一条消息"说话人标记被中和，不能再冒充别人说话（同时写进长期记忆的那份也一起处理） | 新增用例覆盖两种标记形态、正常正文不受影响；去掉中和立刻失败 |
+| `432c426` | 修上一条把 `#[test]` 属性弄丢、导致原有用例**静默停跑**的问题（`clippy -D warnings` 的 dead-code 报出来才发现） | `cargo test -- --list` 确认两条都在；真库 4 passed |
+
+**一条核实为误报**：`InnerAgenda::prune_to_limits` 让终态项绕过 per-scope 上限，但紧随其后的
+`items.truncate(max_total)` 仍然对**全表**生效，所以 `validate` 的 `items.len() > max_total`
+不可能被触发——审计里"终态项攒多了会让 upsert 恒失败"的说法不成立。终态项只是不吃
+per-scope 配额（它们的生命周期由 `decay` 里 7 天的保留窗口管）。
+
+**仍未做（需先定口径或属独立特性）**：
+
+1. **折队归属**：折进来的旧发言仍挂在最新发言人名下（`PendingTurn` 只有一个 `sender`）。
+   要做对得把 `PendingTurn.message` 拆成片段列表并贯通 6 处提示词拼装 + 记忆写入，属于
+   提示词格式变更，建议单独一轮做完后人工看一次效果（上一轮已先给折队加了字符预算）。
+2. **预提交租约到期该"取消"还是"续租"**：现在是 fail-closed 取消（进程死在校验中间也能
+   自愈），代价是"活着但很慢"的回复被丢；续租则会让死进程的 precommit 永久卡住该会话。
+   本轮只补了告警，取舍留给你。
+3. **Mind cleanup 物理淘汰退休信念**：按 `updated_at` 每 scope 只留 256 条并物理删除，
+   被删命题再次出现会以新 UUID 重新插入，而 `open_question.related_beliefs` 里仍指着旧 id。
+   这属于"软引用还是引用完整性"的设计取舍。
+4. 审计里其余低优先项：后台记忆接口每类两次串行查询共用 5 条连接池、租约用应用时钟写却用
+   数据库时钟判（reminders/agent_runs）、`waiting_room` 作用域表 append-only 线性扫描、
+   `group.rs` 的 1024 上限被粘性 `conversation.is_active()` 兜住、`private.rs` 控制命令回执
+   在 admission 过期时静默不发送、`conversation.rs` 那条"只在时钟偏移下可达"的分支
+   （本轮想改但没能在代码里定位到具体那一处，未动）。
+
+**验证总量（本批结束时）**：`cargo fmt --check` 干净；`clippy --workspace --all-targets
+--all-features -- -D warnings` 干净；`cargo test --workspace` = model 1147 + core 355 +
+CLI 10 + acceptance 13 全过（65 ignored）；带 `DATABASE_URL` 的 ignored 真库测试
+**64 passed / 1 failed**（`redis_store` 需要 `REDIS_URL`）；`node tools/admin-ui-checks.mjs`
+7 项全过。
