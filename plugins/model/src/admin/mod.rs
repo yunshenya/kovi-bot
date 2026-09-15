@@ -280,6 +280,7 @@ pub(crate) fn spawn(config: &AdminConfig, bot: Option<Arc<RuntimeBot>>) {
 /// 首页：带 `?token=` 时先换会话 Cookie 再跳转，否则返回登录页。
 async fn index(
     axum::extract::State(state): axum::extract::State<Arc<AdminState>>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<SocketAddr>,
     headers: axum::http::HeaderMap,
     axum::extract::Query(query): axum::extract::Query<IndexQuery>,
 ) -> Response {
@@ -297,7 +298,9 @@ async fn index(
             _ => "/",
         };
         let secure = auth::is_secure_request(&headers);
-        return match auth::login_via_link(&state, query.token.as_deref(), target, secure).await {
+        return match auth::login_via_link(&state, query.token.as_deref(), target, secure, peer.ip())
+            .await
+        {
             Ok(response) => response,
             // 链接里的 Token 不对时不要停在带 Token 的地址上，但要让登录页
             // 说清楚为什么没进去。

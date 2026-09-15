@@ -315,18 +315,31 @@ pub(crate) fn is_secure_request(headers: &HeaderMap) -> bool {
 ///
 /// 对齐参考实现（NapCat 的 `?webui_token=`）：适合做书签、给脚本或监控探针用。
 /// 命中后立刻 303 跳到不含 Token 的地址，避免 Token 留在地址栏和前进历史里。
+///
+/// **这条入口同样要过失败限速。** 它和 `POST /api/login` 是两道等价的门：Token 配得
+/// 短的时候，没有限速就等于可以全速爆破，而限速本来就该跟着"验证 Token"这件事走，
+/// 不该跟着某一条路由走。
 pub(crate) async fn login_via_link(
     state: &AdminState,
     token: Option<&str>,
     target: &str,
     secure: bool,
+    ip: IpAddr,
 ) -> Result<Response, ApiError> {
+    let retry_after = state.guard.retry_after(ip);
+    if retry_after > 0 {
+        return Err(ApiError::too_many_requests(format!(
+            "登录失败次数过多，请 {retry_after} 秒后再试"
+        )));
+    }
     let Some(token) = token.map(str::trim).filter(|token| !token.is_empty()) else {
         return Err(ApiError::bad_request("缺少 token 参数"));
     };
     if !state.token_matches(token) {
+        state.guard.record_failure(ip);
         return Err(ApiError::unauthorized("Token 不正确"));
     }
+    state.guard.record_success(ip);
     let Some(session) = state.sessions.create() else {
         return Err(ApiError::too_many_requests("已登录会话数达到上限"));
     };
@@ -436,6 +449,36 @@ mod tests {
         let id = sessions.create().expect("应能创建会话");
         std::thread::sleep(Duration::from_millis(5));
         assert!(!sessions.touch(&id));
+    }
+
+    /// 两道登录门必须共用同一份失败计数。
+    ///
+    /// `/?token=` 那条路以前完全不过限速：Token 配得短的时候，绕开
+    /// `POST /api/login` 就能全速爆破。这里用 AdminState 直接驱动那条路径，断言
+    /// 它既会**记账**（失败攒够就锁），也会**看账**（锁住之后连正确的 Token 也进不去）。
+    #[tokio::test]
+    async fn the_token_link_also_counts_towards_the_login_lockout() {
+        use std::sync::Arc;
+        let state = Arc::new(AdminState::for_test("s3cret-token"));
+        let ip: IpAddr = "127.0.0.1".parse().expect("回环地址应可解析");
+        for _ in 0..FAILURES_BEFORE_LOCKOUT {
+            assert!(
+                login_via_link(&state, Some("wrong"), "/", false, ip)
+                    .await
+                    .is_err(),
+                "错误的 Token 必须被拒"
+            );
+        }
+        assert!(
+            state.guard.retry_after(ip) > 0,
+            "token 链接这条路的失败必须计入限速"
+        );
+        assert!(
+            login_via_link(&state, Some("s3cret-token"), "/", false, ip)
+                .await
+                .is_err(),
+            "锁住之后即使 Token 正确也不放行"
+        );
     }
 
     #[test]
