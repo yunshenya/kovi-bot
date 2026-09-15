@@ -1173,11 +1173,22 @@ impl CognitiveRuntime {
             if guard.is_some_and(|guard| !guard()) {
                 release_unexecuted_tool_intents_from(&planner_event, &plan, intent_index, port)
                     .await;
+                // **已经执行过的那几条不能丢。** 回合中途被顶替（例如自主续聊的
+                // 租约失效）时，前几条动作可能已经真的发出去了；此前这里返回一个
+                // 全空的 plan + actions，宿主于是把一条已经在网上的消息记成"她没
+                // 说话"（`record_silent_turn`），投递与撤回联动一起丢。
+                //
+                // 返回"已执行的前缀"，让宿主看得见真正发生过什么；未执行的部分
+                // 连同状态更新一起丢掉——这一轮已经不属于她了。
                 return Ok(PlannedProcessingOutcome::Planned {
                     observation,
-                    plan: DecisionPlan::silent(),
-                    actions: Vec::new(),
-                    feedback: Vec::new(),
+                    plan: DecisionPlan {
+                        disposition: crate::DecisionDisposition::Silent,
+                        intents: plan.intents[..intent_index].to_vec(),
+                        state_updates: Vec::new(),
+                    },
+                    actions,
+                    feedback,
                 });
             }
             let tool_notification_policy = intent.tool_notification_policy().unwrap_or_default();
@@ -6061,6 +6072,66 @@ mod tests {
                 .expect("open-loop defer recorder lock")
                 .as_slice(),
             &[(open_loop_id, None)]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_mid_turn_cancellation_keeps_the_actions_that_already_went_out() {
+        // 回合中途被顶替（自主续聊的租约失效）时，前面那几条可能已经真的发出去了。
+        // 此前这条路返回全空的 plan + actions，宿主于是把一条已经在网上的消息记成
+        // "她没说话"（record_silent_turn），投递登记与撤回联动一起丢。
+        let conversation_id = ConversationId::new();
+        let open_loop_id = OpenLoopId::new();
+        let open_loops = Arc::new(TestOpenLoopStore::with_visible(
+            open_loop_id,
+            OpenLoopOwner::Conversation(conversation_id),
+        ));
+        let (_handle, mut runtime) = CognitiveRuntime::new_with_services(
+            RuntimeConfig::default(),
+            CoreServices::with_model(DueMultiActionModel {
+                conversation_id,
+                open_loop_id,
+            })
+            .with_open_loops(open_loops),
+        )
+        .expect("valid runtime");
+        let arbiter = ActionArbiter::new(
+            ActionArbiterConfig::default().with_capabilities(EnvironmentCapabilities::all()),
+        );
+        let port = FakeActionPort;
+        // 守卫一共问三次就轮到第一条气泡：观察后一次、计划后一次、每条动作前一次。
+        // 放行前三次（含第一条），在第二条之前失效。
+        let checks = Arc::new(AtomicUsize::new(0));
+        let guard = {
+            let checks = Arc::clone(&checks);
+            move || checks.fetch_add(1, Ordering::SeqCst) < 3
+        };
+
+        let outcome = runtime
+            .process_event_with_planner_and_actions_guarded(
+                due_event(conversation_id, open_loop_id),
+                &arbiter,
+                &port,
+                &guard,
+            )
+            .await
+            .expect("cancellation stays a structured outcome");
+        let PlannedProcessingOutcome::Planned { plan, actions, .. } = outcome else {
+            panic!("expected a planned outcome");
+        };
+        assert_eq!(
+            actions.len(),
+            1,
+            "已经执行过的那一条必须留在结果里，不能被丢掉"
+        );
+        assert_eq!(
+            plan.intents.len(),
+            actions.len(),
+            "返回的意图前缀与已执行的动作必须一一对应（宿主按 zip 消费）"
+        );
+        assert!(
+            plan.state_updates.is_empty(),
+            "被顶替的回合不再写状态：未执行部分连同状态更新一起丢掉"
         );
     }
 
