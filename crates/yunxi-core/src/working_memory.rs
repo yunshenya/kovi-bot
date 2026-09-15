@@ -33,6 +33,8 @@ pub const MAX_WORKING_ARGUMENT_CHARS: usize = 2_048;
 pub const MAX_WORKING_RESULT_CHARS: usize = 512;
 /// Maximum characters kept from a failure category.
 pub const MAX_WORKING_FAILURE_CHARS: usize = 256;
+/// Maximum characters kept from a task's stated goal.
+pub const MAX_WORKING_GOAL_CHARS: usize = 512;
 /// Maximum characters kept from an expectation's description.
 pub const MAX_WORKING_EXPECTATION_CHARS: usize = 256;
 
@@ -248,11 +250,27 @@ pub enum WorkingObservationOutcome {
 /// What one task has tried, and what came of it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlannerWorkingMemory {
+    /// What this task is for, as stated by the round that formed it.
+    ///
+    /// Held here rather than in the step log because it is not a step: it is the
+    /// thing every step is measured against. The first statement wins, so a
+    /// task's purpose cannot quietly change halfway through — a later round that
+    /// wants a different outcome is a different task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    goal: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     entries: Vec<WorkingEntry>,
     #[serde(default, skip_serializing_if = "is_zero")]
     next_sequence: u64,
 }
+
+/// How many consecutive failures on the same call before the task is told it is
+/// going in circles.
+///
+/// Three, not two: a retry after a transient failure is reasonable, and telling
+/// her she is stuck after one retry would be crying wolf. Four or more means the
+/// approach itself is not working.
+pub const STUCK_FAILURE_RUN: usize = 3;
 
 const fn is_zero(value: &u64) -> bool {
     *value == 0
@@ -293,7 +311,62 @@ impl PlannerWorkingMemory {
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.entries.is_empty() && self.goal.is_none()
+    }
+
+    /// Records what this task is for, once.
+    ///
+    /// Returns whether this call set it. A later statement does not overwrite
+    /// the first, because a task whose purpose can be silently replaced cannot
+    /// be measured against anything.
+    pub fn set_goal_once(&mut self, goal: &str) -> bool {
+        if self.goal.is_some() {
+            return false;
+        }
+        let goal = bounded(goal, MAX_WORKING_GOAL_CHARS);
+        let goal = goal.trim();
+        if goal.is_empty() {
+            return false;
+        }
+        self.goal = Some(goal.to_owned());
+        true
+    }
+
+    /// What this task is for, when the forming round said.
+    #[must_use]
+    pub fn goal(&self) -> Option<&str> {
+        self.goal.as_deref()
+    }
+
+    /// The trailing run of failures on one call, when it is long enough to
+    /// mean the approach is not working.
+    ///
+    /// Counts attempts that ended in `Failed` or `Refused`: a refusal is the
+    /// host saying no, which is just as much "this is not the way" as an error.
+    /// A success anywhere in the run ends it — progress resets the count.
+    #[must_use]
+    pub fn stuck_on(&self) -> Option<(&str, usize)> {
+        let mut run = 0_usize;
+        let mut tool: Option<&str> = None;
+        for entry in self.entries.iter().rev() {
+            let WorkingEntryPayload::Attempt(attempt) = &entry.payload else {
+                continue;
+            };
+            let failed = matches!(
+                attempt.outcome(),
+                WorkingAttemptOutcome::Failed { .. } | WorkingAttemptOutcome::Refused { .. }
+            );
+            if !failed {
+                break;
+            }
+            match tool {
+                Some(name) if name != attempt.tool() => break,
+                None => tool = Some(attempt.tool()),
+                Some(_) => {}
+            }
+            run += 1;
+        }
+        (run >= STUCK_FAILURE_RUN).then(|| (tool.unwrap_or_default(), run))
     }
 
     #[must_use]
@@ -461,6 +534,90 @@ mod tests {
             WorkingAttemptOutcome::from_result("web.search", &unrelated),
             WorkingAttemptOutcome::Refused { .. }
         ));
+    }
+
+    #[test]
+    fn a_task_goal_is_set_once_and_never_silently_replaced() {
+        let mut memory = PlannerWorkingMemory::new();
+        assert!(memory.set_goal_once("查一下明天的天气"));
+        assert_eq!(memory.goal(), Some("查一下明天的天气"));
+        // A later round wanting a different outcome is a different task.
+        assert!(!memory.set_goal_once("顺便订张票"));
+        assert_eq!(memory.goal(), Some("查一下明天的天气"));
+        // An empty statement is not a goal.
+        let mut blank = PlannerWorkingMemory::new();
+        assert!(!blank.set_goal_once("   "));
+        assert_eq!(blank.goal(), None);
+        assert!(blank.is_empty());
+    }
+
+    #[test]
+    fn a_goal_alone_is_enough_to_have_something_to_show() {
+        let mut memory = PlannerWorkingMemory::new();
+        memory.set_goal_once("把这件事问清楚");
+        assert!(!memory.is_empty(), "a stated goal is history worth showing");
+        assert_eq!(memory.len(), 0, "but it is not a step");
+    }
+
+    #[test]
+    fn going_in_circles_is_noticed_only_after_a_real_run() {
+        let failed = |tool: &str| {
+            WorkingAttempt::new(
+                tool,
+                "{}",
+                WorkingAttemptOutcome::Failed {
+                    category: "network".to_owned(),
+                    detail: String::new(),
+                },
+            )
+        };
+        let ok = |tool: &str| {
+            WorkingAttempt::new(
+                tool,
+                "{}",
+                WorkingAttemptOutcome::Succeeded {
+                    summary: "ok".to_owned(),
+                },
+            )
+        };
+
+        // One retry after a failure is reasonable, not "stuck".
+        let mut memory = PlannerWorkingMemory::new();
+        memory.record_round(&[failed("web.search"), failed("web.search")]);
+        assert_eq!(memory.stuck_on(), None, "two failures is still a retry");
+
+        memory.record_round(&[failed("web.search")]);
+        assert_eq!(memory.stuck_on(), Some(("web.search", 3)));
+
+        // Progress resets it.
+        memory.record_round(&[ok("web.search")]);
+        assert_eq!(memory.stuck_on(), None);
+
+        // A different tool is a different approach, not a repeat.
+        let mut switching = PlannerWorkingMemory::new();
+        switching.record_round(&[failed("web.search"), failed("weather.current")]);
+        switching.record_round(&[failed("web.search")]);
+        assert_eq!(
+            switching.stuck_on(),
+            None,
+            "alternating tools is not repeating one call"
+        );
+
+        // A refusal is the host saying no, which is just as much "not this way".
+        let refused = |tool: &str| {
+            WorkingAttempt::new(
+                tool,
+                "{}",
+                WorkingAttemptOutcome::Refused {
+                    reason: "capability unavailable".to_owned(),
+                },
+            )
+        };
+        let mut refused_run = PlannerWorkingMemory::new();
+        refused_run.record_round(&[refused("group.send")]);
+        refused_run.record_round(&[refused("group.send")]);
+        refused_run.record_round(&[refused("group.send")]);
+        assert_eq!(refused_run.stuck_on(), Some(("group.send", 3)));
     }
 
     #[test]

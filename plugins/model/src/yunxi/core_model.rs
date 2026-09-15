@@ -1408,6 +1408,11 @@ fn core_working_memory_instruction(memory: &yunxi_core::PlannerWorkingMemory) ->
         return None;
     }
     let mut body = String::new();
+    // 先把"这一趟是为了什么"放在最前：后面每一条都是相对它才有意义，
+    // 而且它是她判断"做完了没有"的唯一依据。
+    if let Some(goal) = memory.goal() {
+        body.push_str(&format!("任务目标：{goal}\n"));
+    }
     for (index, entry) in memory.entries().iter().enumerate() {
         match &entry.payload {
             yunxi_core::WorkingEntryPayload::Attempt(attempt) => {
@@ -2706,6 +2711,7 @@ fn active_mind_no_output_plan(
                     InteractionCues::default(),
                 ),
                 expectations: Vec::new(),
+                goal: None,
             };
             if let WorldEventKind::ProspectiveMemoryDue(due) = input.event.kind() {
                 plan.state_updates.push(StateUpdateProposal::DeferOpenLoop {
@@ -3133,6 +3139,7 @@ async fn register_core_tool_intents(
         intents,
         state_updates: interaction_state_updates_with_cues(input, interaction_cues),
         expectations: Vec::new(),
+        goal: None,
     })
 }
 
@@ -5590,6 +5597,7 @@ fn pre_model_plan(input: &PlannerInput) -> Result<Option<DecisionPlan>, ModelBac
                     StateUpdateProposal::Relation(evolved.relation),
                 ],
                 expectations: Vec::new(),
+                goal: None,
             }))
         }
         WorldEventKind::MessageReceived(message) if !message.visible_reply_allowed => {
@@ -7625,6 +7633,7 @@ impl ModelBackend for KoviModelBackend {
                 intents,
                 state_updates,
                 expectations: Vec::new(),
+                goal: None,
             })
         };
         Box::pin(async move {
@@ -7690,6 +7699,7 @@ fn silent_with_interaction_cues(input: &PlannerInput, cues: InteractionCues) -> 
         intents: Vec::new(),
         state_updates: interaction_state_updates_with_cues(input, cues),
         expectations: Vec::new(),
+        goal: None,
     }
 }
 
@@ -8643,6 +8653,7 @@ mod tests {
             intents: Vec::new(),
             state_updates: Vec::new(),
             expectations: Vec::new(),
+            goal: None,
         };
 
         let projection = shadow_projection_for_completed_plan(&input, &completed)

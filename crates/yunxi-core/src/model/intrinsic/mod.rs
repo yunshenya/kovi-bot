@@ -204,6 +204,7 @@ impl ModelBackend for IntrinsicModelBackend {
                 )],
                 state_updates: Vec::new(),
                 expectations: Vec::new(),
+                goal: None,
             })
         })
     }

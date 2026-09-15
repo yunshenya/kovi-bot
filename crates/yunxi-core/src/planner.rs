@@ -1031,6 +1031,86 @@ pub struct DecisionPlan {
     /// waited for never arrived" produces no event to observe.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub expectations: Vec<PlanExpectation>,
+    /// What this task is *for*.
+    ///
+    /// [`Self::expectations`] says what should happen next; this says why any
+    /// of it is happening. Without it a multi-step task is only a sequence of
+    /// calls with no way to tell "I am done" from "I used up my rounds" — the
+    /// loop can stop but cannot finish. It is set when the task is formed and
+    /// carried into every later round, so the task's purpose cannot silently
+    /// drift from one step to the next.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal: Option<PlanGoal>,
+}
+
+/// A bounded statement of what a task is trying to accomplish.
+///
+/// Natural language, because that is what an intent actually is — Core cannot
+/// check "answer the question about tomorrow's weather" against an event, and
+/// pretending otherwise would push the model into emitting a structured form it
+/// would then reason about less well. What Core *can* do with it is keep it
+/// stable, show it to every round, and notice when the same step keeps failing
+/// against it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanGoal {
+    summary: String,
+}
+
+/// Longest goal statement accepted.
+pub const MAX_PLAN_GOAL_CHARS: usize = 512;
+/// Byte ceiling for a goal statement.
+pub const MAX_PLAN_GOAL_BYTES: usize = 2 * 1_024;
+
+impl PlanGoal {
+    pub fn new(summary: impl Into<String>) -> Result<Self, PlannerOutputValidationError> {
+        let summary = summary.into();
+        validate_goal(&summary)?;
+        Ok(Self {
+            summary: bounded_goal(&summary),
+        })
+    }
+
+    #[must_use]
+    pub fn summary(&self) -> &str {
+        &self.summary
+    }
+}
+
+impl std::fmt::Display for PlanGoal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.summary)
+    }
+}
+
+fn validate_goal(goal: &str) -> Result<(), PlannerOutputValidationError> {
+    if goal.trim().is_empty() {
+        return Err(PlannerOutputValidationError::InvalidGoal(
+            "goal must not be empty".to_owned(),
+        ));
+    }
+    if goal.as_bytes().contains(&0) {
+        return Err(PlannerOutputValidationError::InvalidGoal(
+            "goal must not contain NUL".to_owned(),
+        ));
+    }
+    if goal.len() > MAX_PLAN_GOAL_BYTES {
+        return Err(PlannerOutputValidationError::InvalidGoal(format!(
+            "goal is {} bytes, above the {MAX_PLAN_GOAL_BYTES} byte limit",
+            goal.len()
+        )));
+    }
+    Ok(())
+}
+
+fn bounded_goal(goal: &str) -> String {
+    let mut bounded = String::with_capacity(goal.len().min(MAX_PLAN_GOAL_BYTES));
+    for character in goal.chars().take(MAX_PLAN_GOAL_CHARS) {
+        if bounded.len() + character.len_utf8() > MAX_PLAN_GOAL_BYTES {
+            break;
+        }
+        bounded.push(character);
+    }
+    bounded.trim().to_owned()
 }
 
 /// One thing a plan expects to happen after this turn.
@@ -1105,6 +1185,7 @@ impl DecisionPlan {
             intents: Vec::new(),
             state_updates: Vec::new(),
             expectations: Vec::new(),
+            goal: None,
         }
     }
 
@@ -1115,7 +1196,15 @@ impl DecisionPlan {
             intents: Vec::new(),
             state_updates: Vec::new(),
             expectations: Vec::new(),
+            goal: None,
         }
+    }
+
+    /// States what this task is for.
+    #[must_use]
+    pub fn with_goal(mut self, goal: PlanGoal) -> Self {
+        self.goal = Some(goal);
+        self
     }
 
     /// Declares that this turn expects an event of `event_type` within the
@@ -1158,6 +1247,9 @@ impl DecisionPlan {
         }
         for expectation in &self.expectations {
             expectation.validate()?;
+        }
+        if let Some(goal) = &self.goal {
+            validate_goal(&goal.summary)?;
         }
         Ok(())
     }
@@ -1337,6 +1429,8 @@ pub enum PlannerOutputValidationError {
     TooManyStateUpdates { length: usize, maximum: usize },
     #[error("planner returned too many expectations: {length}, maximum {maximum}")]
     TooManyExpectations { length: usize, maximum: usize },
+    #[error("planner goal is invalid: {0}")]
+    InvalidGoal(String),
     #[error("planner expectation window {seconds}s is outside {minimum}..={maximum} seconds")]
     InvalidExpectationWindow {
         seconds: u32,
@@ -1446,6 +1540,8 @@ mod tests {
                 state_updates: Vec::new(),
 
                 expectations: Vec::new(),
+
+                goal: None,
             },
         });
         let planner = Planner::new(model.clone());
@@ -1467,6 +1563,8 @@ mod tests {
                 state_updates: Vec::new(),
 
                 expectations: Vec::new(),
+
+                goal: None,
             },
         });
         let error = Planner::new(model)

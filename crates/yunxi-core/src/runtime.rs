@@ -955,6 +955,15 @@ impl CognitiveRuntime {
                 .for_trace(root),
             );
         }
+        if let Some(goal) = plan.goal.as_ref() {
+            // The task's purpose is set once, by the round that formed it: a
+            // task whose purpose can be silently replaced cannot be measured
+            // against anything.
+            self.working_memory
+                .entry(root)
+                .or_default()
+                .set_goal_once(goal.summary());
+        }
         for declared in &plan.expectations {
             let pattern = declared.pattern();
             if self
@@ -1580,6 +1589,7 @@ impl CognitiveRuntime {
                         intents: plan.intents[..intent_index].to_vec(),
                         state_updates: Vec::new(),
                         expectations: Vec::new(),
+                        goal: None,
                     },
                     actions,
                     feedback,
@@ -1780,6 +1790,24 @@ impl CognitiveRuntime {
                     .record_round(std::slice::from_ref(&attempt));
             }
             actions.push(result);
+        }
+        // A task that keeps failing the same call is not making progress, and
+        // the next round is the only party that can change approach. Say so,
+        // rather than letting it have to notice the pattern in the log.
+        if !tool_follow_up_events.is_empty()
+            && let Some(memory) = self
+                .working_memory
+                .get(&planner_event.trace().root_event_id())
+            && let Some((tool, run)) = memory.stuck_on()
+        {
+            let note = crate::working_memory::WorkingObservation::new(
+                format!("工具 `{tool}` 已经连续失败 {run} 次"),
+                crate::working_memory::WorkingObservationOutcome::Violated,
+            );
+            self.working_memory
+                .entry(planner_event.trace().root_event_id())
+                .or_default()
+                .record_observation(note);
         }
         let mut final_tool_follow_ups = Vec::new();
         for tool_event in tool_follow_up_events {
@@ -3544,6 +3572,8 @@ mod tests {
                     intents,
                     state_updates: Vec::new(),
                     expectations: Vec::new(),
+
+                    goal: None,
                 })
             })
         }
@@ -3707,6 +3737,8 @@ mod tests {
                         event_type: crate::EventType::MessageSent,
                         within_secs: 60,
                     }],
+
+                    goal: None,
                 })
             })
         }
@@ -3791,6 +3823,8 @@ mod tests {
                         event_type: crate::EventType::MessageSent,
                         within_secs: 60,
                     }],
+
+                    goal: None,
                 })
             })
         }
@@ -3862,6 +3896,145 @@ mod tests {
             !runtime.has_pending_event(),
             "bookkeeping alone must not be reported as work"
         );
+    }
+
+    /// The goal a task states reaches every later round, and a call that keeps
+    /// failing is surfaced as going in circles.
+    #[tokio::test]
+    async fn the_goal_and_a_stuck_notice_reach_the_follow_up_rounds() {
+        let conversation_id = ConversationId::new();
+        let probe = Arc::new(TaskShapeProbe::default());
+        let (handle, mut runtime) = CognitiveRuntime::new_with_services(
+            RuntimeConfig {
+                task_budget: crate::TaskBudget {
+                    max_rounds: 5,
+                    ..crate::TaskBudget::default()
+                },
+                ..RuntimeConfig::default()
+            },
+            CoreServices::new(Arc::clone(&probe) as Arc<dyn ModelBackend>),
+        )
+        .expect("valid runtime");
+        assert_eq!(
+            handle
+                .submit(direct_message(conversation_id, PersonId::new()))
+                .await,
+            Ok(Admission::Accepted)
+        );
+        let mut capabilities = EnvironmentCapabilities::all();
+        capabilities.actions.push(crate::ActionDescriptor::tool(
+            "web.search",
+            crate::EffectScope::ReadOnly,
+            false,
+        ));
+        let arbiter =
+            ActionArbiter::new(ActionArbiterConfig::default().with_capabilities(capabilities));
+
+        while let Some(round) = runtime
+            .process_next_with_planner_and_actions(&arbiter, &AlwaysFailingPort)
+            .await
+        {
+            let outcome = round.expect("each round plans");
+            let PlannedProcessingOutcome::Planned { actions, .. } = outcome else {
+                break;
+            };
+            if actions.is_empty() {
+                break;
+            }
+        }
+
+        let seen = probe
+            .seen
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // The first round is the one that states the goal, so it cannot read it
+        // back; every round after it must.
+        assert_eq!(
+            seen[0].goal, None,
+            "the forming round states the goal, it does not read it"
+        );
+        assert!(
+            seen[1..]
+                .iter()
+                .all(|round| round.goal.as_deref() == Some("查清楚这件事")),
+            "every later round must know what the task is for: {seen:?}"
+        );
+        // A task cannot be stuck before it has tried anything.
+        assert!(
+            !seen[0].stuck,
+            "a task cannot be stuck before it has tried anything"
+        );
+        assert!(
+            seen.iter().any(|round| round.stuck),
+            "three identical failures must be surfaced: {seen:?}"
+        );
+    }
+
+    /// Records the goal and stuck state each round could see.
+    #[derive(Default)]
+    struct TaskShapeProbe {
+        seen: std::sync::Mutex<Vec<RoundShape>>,
+    }
+
+    #[derive(Debug)]
+    struct RoundShape {
+        goal: Option<String>,
+        stuck: bool,
+    }
+
+    impl ModelBackend for TaskShapeProbe {
+        fn plan<'a>(&'a self, input: &'a PlannerInput) -> ModelBackendFuture<'a> {
+            Box::pin(async move {
+                let stuck = input
+                    .working_memory
+                    .observations()
+                    .any(|observation| observation.describe().contains("连续失败"));
+                self.seen
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(RoundShape {
+                        goal: input.working_memory.goal().map(str::to_owned),
+                        stuck,
+                    });
+                let conversation_id = input
+                    .event
+                    .scope()
+                    .conversation_id()
+                    .ok_or(crate::ModelBackendError::Unavailable)?;
+                Ok(DecisionPlan {
+                    disposition: crate::DecisionDisposition::Reply,
+                    intents: vec![crate::CognitiveIntent::UseTool {
+                        tool_name: "web.search".to_owned(),
+                        input: "{}".to_owned(),
+                        scope: crate::ActionScope::Conversation(conversation_id),
+                        notification_policy: crate::ToolNotificationPolicy::Final,
+                    }],
+                    state_updates: Vec::new(),
+                    expectations: Vec::new(),
+                    goal: Some(crate::planner::PlanGoal::new("查清楚这件事").expect("valid goal")),
+                })
+            })
+        }
+    }
+
+    /// Fails every tool call, so the task keeps repeating one failing call.
+    struct AlwaysFailingPort;
+
+    impl ActionPort for AlwaysFailingPort {
+        fn execute<'a>(&'a self, action: &'a crate::ProposedAction) -> crate::ActionPortFuture<'a> {
+            Box::pin(async move {
+                match action {
+                    crate::ProposedAction::UseTool(tool) => {
+                        Ok(crate::ActionPortOutcome::ToolFailed {
+                            operation: tool.tool_name.clone(),
+                            error_category: "network".to_owned(),
+                            detail: "timeout".to_owned(),
+                        })
+                    }
+                    _ => Err(crate::ActionPortError::new("unsupported", false)),
+                }
+            })
+        }
     }
 
     /// A task stops taking steps once it has used its rounds.
@@ -3957,6 +4130,8 @@ mod tests {
                     }],
                     state_updates: Vec::new(),
                     expectations: Vec::new(),
+
+                    goal: None,
                 })
             })
         }
@@ -4065,6 +4240,8 @@ mod tests {
                     }],
                     state_updates: Vec::new(),
                     expectations: Vec::new(),
+
+                    goal: None,
                 })
             })
         }
@@ -4235,6 +4412,8 @@ mod tests {
                     intents: vec![crate::CognitiveIntent::noop()],
                     state_updates: Vec::new(),
                     expectations: Vec::new(),
+
+                    goal: None,
                 })
             })
         }
@@ -4269,6 +4448,8 @@ mod tests {
                     )],
                     state_updates: Vec::new(),
                     expectations: Vec::new(),
+
+                    goal: None,
                 })
             })
         }

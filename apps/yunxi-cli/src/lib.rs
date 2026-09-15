@@ -94,6 +94,8 @@ impl CoreModelBackend for FakeModel {
                     }],
 
                     expectations: Vec::new(),
+
+                    goal: None,
                 });
             }
             let Some(WorldEventKind::MessageReceived(message)) = Some(input.event.kind()) else {
@@ -160,6 +162,8 @@ impl CoreModelBackend for FakeModel {
                     state_updates,
 
                     expectations: Vec::new(),
+
+                    goal: None,
                 });
             }
 
@@ -184,6 +188,8 @@ impl CoreModelBackend for FakeModel {
                     state_updates,
 
                     expectations: Vec::new(),
+
+                    goal: None,
                 });
             }
 
@@ -196,6 +202,8 @@ impl CoreModelBackend for FakeModel {
                 state_updates,
 
                 expectations: Vec::new(),
+
+                goal: None,
             })
         })
     }
@@ -1062,6 +1070,8 @@ mod tests {
             ],
             state_updates: Vec::new(),
             expectations: Vec::new(),
+
+            goal: None,
         };
         let receipt = ActionReceipt {
             action_id: None,
@@ -1109,6 +1119,8 @@ mod tests {
             )],
             state_updates: Vec::new(),
             expectations: Vec::new(),
+
+            goal: None,
         };
         let receipt = ActionReceipt {
             action_id: None,

@@ -44,6 +44,8 @@ impl CoreModelBackend for TwoMessageModel {
                 ],
                 state_updates: Vec::new(),
                 expectations: Vec::new(),
+
+                goal: None,
             })
         })
     }
@@ -72,6 +74,8 @@ impl CoreModelBackend for SilentAutonomousModel {
                 )],
                 state_updates: Vec::new(),
                 expectations: Vec::new(),
+
+                goal: None,
             })
         })
     }
@@ -585,6 +589,8 @@ impl CoreModelBackend for ToolThenReplyModel {
                 intents: vec![intent],
                 state_updates: Vec::new(),
                 expectations: Vec::new(),
+
+                goal: None,
             })
         })
     }
