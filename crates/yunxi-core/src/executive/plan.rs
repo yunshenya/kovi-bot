@@ -274,8 +274,10 @@ impl PlanState {
         }
         let max_revisions = max_revisions.min(MAX_PLAN_REVISIONS);
         if max_revisions == 0 || self.revision_count >= max_revisions {
-            self.status = PlanStatus::Failed;
-            self.updated_at = now;
+            // **失败路径不改状态。** 这里原来顺手把计划置成 Failed，于是把 Err 当作
+            // "什么都没发生、可以重试/继续看"的调用方，手里其实已经是一份终态计划
+            // （而终态是不可逆的：`fail`/`cancel`/`revise` 都会先拒它）。
+            // 要终止就显式调 `fail()`/`cancel()`，这一层只回答"还能不能再改"。
             return Err(PlanError::RevisionLimit {
                 maximum: max_revisions,
             });

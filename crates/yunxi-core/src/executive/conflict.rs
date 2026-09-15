@@ -41,7 +41,9 @@ impl ConflictStatus {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// 参与者引用。`Ord` 是为了让"参与者是否逐个相同"能做多重集比较
+/// （见 `same_participants`），不是为了给冲突排序。
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", content = "id", rename_all = "snake_case")]
 pub enum ConflictRef {
     Belief(crate::BeliefId),
@@ -325,13 +327,46 @@ fn clamp_unit(value: f32) -> f32 {
     }
 }
 
+/// 参与者是否**逐个相同**（含重复次数）。
+///
+/// 原来用"长度相等 + 每个元素都能在对面找到"，那是集合比较：`[A, A, B]` 与
+/// `[A, B, B]` 会被判成同一组参与者，两件不同的冲突于是被当成同一件合并掉。
 fn same_participants(left: &[ConflictRef], right: &[ConflictRef]) -> bool {
-    left.len() == right.len() && left.iter().all(|item| right.contains(item))
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut left_keyed: Vec<&ConflictRef> = left.iter().collect();
+    let mut right_keyed: Vec<&ConflictRef> = right.iter().collect();
+    left_keyed.sort();
+    right_keyed.sort();
+    left_keyed == right_keyed
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn duplicate_participants_are_not_treated_as_a_set() {
+        // `[A, A, B]` 与 `[A, B, B]` 是两组不同的参与者。此前用"长度相等 + 每个
+        // 元素都能在对面找到"比较，两组会被判成同一件冲突而合并掉。
+        let a = ConflictRef::Label("a".to_owned());
+        let b = ConflictRef::Label("b".to_owned());
+        assert!(!same_participants(
+            &[a.clone(), a.clone(), b.clone()],
+            &[a.clone(), b.clone(), b.clone()]
+        ));
+        // 顺序不同但逐个相同，仍然算同一组。
+        assert!(same_participants(
+            &[a.clone(), b.clone()],
+            &[b.clone(), a.clone()]
+        ));
+        assert!(same_participants(
+            &[a.clone(), a.clone()],
+            &[a.clone(), a.clone()]
+        ));
+        assert!(!same_participants(&[a.clone()], &[a.clone(), a.clone()]));
+    }
 
     #[test]
     fn deferred_conflicts_are_not_reported_as_active_or_coalesced() {

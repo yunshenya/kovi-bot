@@ -233,10 +233,50 @@ impl CognitiveBudget {
     }
 
     pub fn replenish(&mut self, elapsed: Duration) {
-        let minutes = elapsed.as_secs() / 60;
-        self.available = self
-            .available
-            .saturating_add(self.replenishment_per_minute.saturating_mul(minutes as u32))
-            .min(self.total);
+        // 按分钟折算，但**不丢余数**：`as_secs() / 60` 会把不足一分钟的部分直接
+        // 截掉，于是每秒调用一次的路径永远补不到量（每次都算出 0 分钟）。
+        // 用 `as_secs_f64` 保留小数，再四舍五入成整数单位。
+        let minutes = elapsed.as_secs_f64() / 60.0;
+        let units = (f64::from(self.replenishment_per_minute) * minutes).round();
+        if !units.is_finite() || units <= 0.0 {
+            return;
+        }
+        let units = units.min(f64::from(u32::MAX)) as u32;
+        self.available = self.available.saturating_add(units).min(self.total);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sub_minute_replenishment_is_not_truncated_away() {
+        // 原来按 `as_secs() / 60` 折算：每次调用不足一分钟的部分直接截掉，于是
+        // "每 30 秒补一次"的路径永远算出 0 分钟、永远补不到量。
+        let mut budget = CognitiveBudget {
+            total: 20,
+            available: 0,
+            reserved_for_critical: 0,
+            replenishment_per_minute: 2,
+        };
+        // 两次 30 秒 = 一分钟 → 应当补到 2 个单位。
+        budget.replenish(Duration::from_secs(30));
+        budget.replenish(Duration::from_secs(30));
+        assert_eq!(budget.available, 2, "半分钟一次的补充不该被抹掉");
+        // 单个 90 秒同样按 1.5 分钟折算（四舍五入到 3）。
+        let mut other = CognitiveBudget {
+            total: 20,
+            available: 0,
+            reserved_for_critical: 0,
+            replenishment_per_minute: 2,
+        };
+        other.replenish(Duration::from_secs(90));
+        assert_eq!(other.available, 3);
+        // 上限与零时长不产生意外。
+        other.replenish(Duration::ZERO);
+        assert_eq!(other.available, 3);
+        other.replenish(Duration::from_secs(600));
+        assert_eq!(other.available, other.total);
     }
 }

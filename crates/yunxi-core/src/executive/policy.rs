@@ -57,8 +57,12 @@ impl ExecutivePolicy {
                 field: "max_active_conflicts",
             });
         }
+        // 预留量也要过 `is_finite`：NaN 与任何数比较都是 false，于是
+        // `NaN < 0.0` 和 `NaN > capacity` 同时不成立，一份 NaN 预留能整份通过校验，
+        // 一直到 `AttentionBudget::new` 才以另一个错误被拒——那时已经离配置来源很远了。
         if self.attention_budget_capacity <= 0.0
             || !self.attention_budget_capacity.is_finite()
+            || !self.critical_attention_reserve.is_finite()
             || self.critical_attention_reserve < 0.0
             || self.critical_attention_reserve > self.attention_budget_capacity
         {
@@ -130,5 +134,30 @@ impl From<CognitiveTier> for ExecutiveTierDecision {
             CognitiveTier::Standard => Self::Standard,
             CognitiveTier::Enhanced => Self::Enhanced,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_non_finite_attention_reserve_is_rejected() {
+        // `NaN < 0.0` 与 `NaN > capacity` 同时不成立，所以只比较大小的写法会让
+        // 一份 NaN 预留整份通过校验，一直到 AttentionBudget::new 才以另一个错误
+        // 被拒——那时已经离配置来源很远了。
+        let mut policy = ExecutivePolicy::default();
+        policy.critical_attention_reserve = f32::NAN;
+        assert!(
+            matches!(policy.validate(), Err(ExecutivePolicyError::InvalidBudget)),
+            "NaN 预留必须在策略这一层就被拒"
+        );
+        policy.critical_attention_reserve = f32::INFINITY;
+        assert!(matches!(
+            policy.validate(),
+            Err(ExecutivePolicyError::InvalidBudget)
+        ));
+        policy.critical_attention_reserve = 0.0;
+        assert!(policy.validate().is_ok(), "正常值不受影响");
     }
 }

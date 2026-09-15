@@ -161,16 +161,25 @@ impl ConfidenceCalibration {
         let stability = clamp(stability).max(self.stability_floor);
         let source_factor = source.reliability();
         let magnitude = (weight.strength() * source_factor * stability).clamp(0.0, 1.0);
-        let max_delta = if matches!(
-            source,
-            EvidenceSource::ToolResult | EvidenceSource::ExplicitUserCorrection
-        ) {
-            self.max_reliable_delta
-        } else {
-            self.max_normal_delta
-        };
+        // 边界先过一遍 `clamp`：`f32::clamp` 在 `min`/`max` 是 NaN 时会 panic，
+        // 而这里的边界来自调用方（`max_delta`）与 `..Default::default()` 之外的反
+        // 序列化数据。一个 NaN 不该把整轮对话打断。
+        let max_delta = clamp(
+            if matches!(
+                source,
+                EvidenceSource::ToolResult | EvidenceSource::ExplicitUserCorrection
+            ) {
+                self.max_reliable_delta
+            } else {
+                self.max_normal_delta
+            },
+        );
         let toward = (target - old) * magnitude;
-        let delta = toward.clamp(-max_delta, max_delta);
+        let delta = if max_delta > 0.0 {
+            toward.clamp(-max_delta, max_delta)
+        } else {
+            0.0
+        };
         let new = clamp(old + delta);
         ConfidenceUpdate {
             old,
@@ -192,8 +201,8 @@ pub fn update_confidence(
     max_delta: f32,
 ) -> f32 {
     let calibration = ConfidenceCalibration {
-        max_normal_delta: max_delta.clamp(0.0, 1.0),
-        max_reliable_delta: max_delta.clamp(0.0, 1.0),
+        max_normal_delta: clamp(max_delta),
+        max_reliable_delta: clamp(max_delta),
         ..ConfidenceCalibration::default()
     };
     calibration
@@ -228,6 +237,37 @@ fn clamp(value: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_non_finite_delta_bound_degrades_instead_of_panicking() {
+        // `f32::clamp` 在边界是 NaN 时会 panic。`max_delta = NaN` 以前会一路走到
+        // `toward.clamp(-NaN, NaN)`，把整轮对话打断——而这一层的既定策略是
+        // "非有限值一律当最不确定"，不是崩掉。
+        for max_delta in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let updated = update_confidence(
+                0.5,
+                0.9,
+                EvidenceSource::SingleDirectStatement,
+                EvidenceWeight::default(),
+                EvidencePolarity::Supports,
+                max_delta,
+            );
+            assert!(
+                updated.is_finite() && (0.0..=1.0).contains(&updated),
+                "max_delta={max_delta} 时应当退化成一个有界的有限值，得到 {updated}"
+            );
+        }
+        // 正常输入的行为不变。
+        let normal = update_confidence(
+            0.5,
+            1.0,
+            EvidenceSource::SingleDirectStatement,
+            EvidenceWeight::default(),
+            EvidencePolarity::Supports,
+            0.2,
+        );
+        assert!(normal > 0.5);
+    }
 
     #[test]
     fn non_finite_confidence_is_fail_safe() {
