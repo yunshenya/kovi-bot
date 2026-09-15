@@ -459,6 +459,27 @@ fn public_sample(sample: &Value) -> Value {
     value
 }
 
+/// 逐行剥掉 `source_key` 后再交给浏览器（下载路径用）。
+///
+/// 刻意**不**容忍解析不了的行：这类文件是标注产物，任何一行读不懂都说明它不是我们
+/// 以为的那种文件，原样透传就等于把屏障字段漏出去——宁可报错。
+fn strip_source_keys(raw: &str) -> Result<String, ApiError> {
+    let mut out = String::with_capacity(raw.len());
+    for (index, line) in raw.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let value: Value = serde_json::from_str(line).map_err(|error| {
+            ApiError::internal(format!("标注文件第 {} 行不是合法 JSON: {error}", index + 1))
+        })?;
+        let rendered = serde_json::to_string(&public_sample(&value))
+            .map_err(|error| ApiError::internal(format!("序列化标注样本失败: {error}")))?;
+        out.push_str(&rendered);
+        out.push('\n');
+    }
+    Ok(out)
+}
+
 fn label_distribution(samples: &[Value], head: usize) -> BTreeMap<String, u64> {
     let mut distribution = BTreeMap::new();
     for sample in samples {
@@ -1004,9 +1025,14 @@ pub(crate) async fn download(Query(params): Query<DownloadQuery>) -> Result<Resp
     let name = validate_batch_name(&params.name)?.to_owned();
     let path = config::annotation_dir_path().join(&name);
     let file_name = name.clone();
-    let text =
-        blocking(move || fs::read_to_string(&path).map_err(|error| load_error(&path, error)))
-            .await?;
+    // 下载同样要过 `public_sample`：`validate_batch_name` 接受标注目录里任何
+    // `*.jsonl`，而**批次文件**每行都带 `source_key`——那是本机的删除屏障字段，
+    // 导出训练集那条路早就剥掉了，下载这条路此前是把文件原样回给浏览器。
+    let text = blocking(move || -> Result<String, ApiError> {
+        let raw = fs::read_to_string(&path).map_err(|error| load_error(&path, error))?;
+        strip_source_keys(&raw)
+    })
+    .await?;
     let disposition = HeaderValue::from_str(&format!("attachment; filename=\"{file_name}\""))
         .map_err(|error| ApiError::internal(format!("文件名无法作为响应头: {error}")))?;
     Ok((
@@ -1029,6 +1055,35 @@ mod tests {
 
     /// 与生产代码里的 `review_status` 取值成对；生产侧只判断"是不是 reviewed"。
     const STATUS_PENDING: &str = "pending";
+
+    #[test]
+    fn downloaded_lines_never_carry_the_deletion_barrier_key() {
+        // `validate_batch_name` 接受目录里任何 *.jsonl，包括每行都带 source_key 的
+        // 批次文件；导出训练集那条路剥掉了它，下载这条路必须一样。
+        let raw = concat!(
+            "{\"source_key\":\"private:1:7\",\"current\":\"你好\",\"tier\":2}\n",
+            "\n",
+            "{\"source_key\":\"private:2:8\",\"current\":\"在吗\",\"tier\":1}\n",
+        );
+        let stripped = super::strip_source_keys(raw).expect("合法 JSONL 应当能剥掉屏障字段");
+        assert!(
+            !stripped.contains("source_key"),
+            "屏障字段不该交给浏览器: {stripped}"
+        );
+        assert!(
+            stripped.contains("你好") && stripped.contains("在吗"),
+            "内容要照旧"
+        );
+        let lines: Vec<&str> = stripped.lines().collect();
+        assert_eq!(lines.len(), 2, "空行不占位，顺序不变");
+        assert!(lines[0].contains("\"tier\":2"), "其它字段逐字保留");
+
+        // 读不懂的行宁可报错：原样透传就等于把屏障字段漏出去。
+        assert!(
+            super::strip_source_keys("not json\n").is_err(),
+            "非法行必须报错而不是透传"
+        );
+    }
 
     fn sample(
         text: &str,
