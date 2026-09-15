@@ -98,7 +98,7 @@
     </details>
   </form>
 
-  <p class="login-foot">只监听回环地址 · 登录状态存在会话 Cookie 里</p>
+  <p class="login-foot">{{bind-note-login}}</p>
 </div>
 
 <!-- ───────────────────────────── 主界面 ───────────────────────────── -->
@@ -129,7 +129,7 @@
     <div class="sidebar-foot">
       <button id="theme-toggle" class="nav-item subtle" aria-label="切换深浅色" title="切换深浅色"><span class="nav-icon"><svg class="icon" aria-hidden="true"><use href="#i-theme"/></svg></span><span id="theme-label" class="nav-label">浅色</span></button>
       <button id="logout" class="nav-item subtle" aria-label="退出登录" title="退出登录"><span class="nav-icon"><svg class="icon" aria-hidden="true"><use href="#i-logout"/></svg></span><span class="nav-label">退出登录</span></button>
-      <div class="sidebar-note">仅监听回环地址，登录态保存在会话 Cookie 中。</div>
+      <div class="sidebar-note">{{bind-note-sidebar}}</div>
     </div>
   </aside>
 

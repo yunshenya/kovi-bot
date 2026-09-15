@@ -59,10 +59,18 @@ pub(crate) struct AdminState {
     bot: Option<Arc<RuntimeBot>>,
     /// 后台启动时刻，用于概览页显示运行时长。
     started_at: Instant,
+    /// 是否只监听回环地址。登录页与侧栏要如实写出绑定范围，配置放开到非回环
+    /// 之后不能再显示"只监听回环地址"。
+    loopback_only: bool,
 }
 
 impl AdminState {
-    fn new(token: String, session_ttl_secs: u64, bot: Option<Arc<RuntimeBot>>) -> Self {
+    fn new(
+        token: String,
+        session_ttl_secs: u64,
+        bot: Option<Arc<RuntimeBot>>,
+        loopback_only: bool,
+    ) -> Self {
         Self {
             token,
             sessions: auth::Sessions::new(session_ttl_secs),
@@ -73,12 +81,18 @@ impl AdminState {
             onebot_cache: Mutex::new(None),
             bot,
             started_at: Instant::now(),
+            loopback_only,
         }
+    }
+
+    pub(crate) fn loopback_only(&self) -> bool {
+        self.loopback_only
     }
 
     #[cfg(test)]
     pub(crate) fn for_test(token: &str) -> Arc<Self> {
-        Arc::new(Self::new(token.to_string(), 3_600, None))
+        // 测试里按"只监听回环"构造；绑定范围本身的渲染由 assets 的测试覆盖。
+        Arc::new(Self::new(token.to_string(), 3_600, None, true))
     }
 
     /// 校验挑战应答：`proof == sha256(nonce + ":" + token)`。
@@ -232,6 +246,7 @@ pub(crate) fn spawn(config: &AdminConfig, bot: Option<Arc<RuntimeBot>>) {
         token.clone(),
         config.session_ttl_secs(),
         bot,
+        address.ip().is_loopback(),
     ));
     let session_hours = config.session_ttl_secs() / 3_600;
 
@@ -307,7 +322,7 @@ async fn index(
             Err(_) => axum::response::Redirect::to("/?error=token").into_response(),
         };
     }
-    assets::index().await
+    assets::index(state.loopback_only()).await
 }
 
 /// OneBot 服务端信息：登录号、在线状态、NapCat 版本。
