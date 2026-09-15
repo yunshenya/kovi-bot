@@ -894,3 +894,38 @@ per-scope 配额（它们的生命周期由 `decay` 里 7 天的保留窗口管�
 CLI 10 + acceptance 13 全过（65 ignored）；带 `DATABASE_URL` 的 ignored 真库测试
 **64 passed / 1 failed**（`redis_store` 需要 `REDIS_URL`）；`node tools/admin-ui-checks.mjs`
 7 项全过。
+
+### 11.7 折队归属重构（2026-09-16，你确认"提示词格式变更没问题、允许特大改动"之后）
+
+`011c7f3`：折队（队列满时把最旧的 turn 折进当前 turn）以前只把正文拼成一段字符串，
+**发言人信息直接丢掉**——A、B 说的话在模型眼里成了 C 说的，而且这份错误归属会随记忆
+写回长期保存（`add_conversation` 用的正是同一份拼接字符串）。
+
+**这次动的东西**（4 个文件、+329/−84）：
+
+| 位置 | 变化 |
+| --- | --- |
+| `PendingTurn` | 新增 `folded: Vec<FoldedFragment>`（`{ sender, message }`，FIFO、最老的在前）；折队时把旧 turn 的 `folded` 与"它自己"依次搬进片段列表，**不再拼接正文**；当前这条始终单独放在 `message` |
+| `attributed_transcript` | 渲染收敛到一个入口：每段各带自己的说话人标记；用户正文里伪造的"下一条消息"标记在**这一个地方**中和（先中和正文、后拼宿主标记，所以宿主标记不会被自己破坏） |
+| `enforce_fold_budget` | 超预算时**先整段丢最老的发言**（保住归属，而不是把文本揉成一团再截），丢了几段在正文开头写明；仍超才截当前这条的尾部 |
+| 私聊那半 | `private_user_message` 增加 `先前消息` 数组（私聊 1:1，折进来的每段都是同一个人说的，不需要重复发言人）。**必须一起改**：私聊与群聊共用 `enqueue`，不改的话折进来的私聊消息会被静默丢掉 |
+| 参数贯通 | `process_group_reply*` / `private_chat*` 各多一个 `folded`；群聊三个直接回合传 `&[]`、排空那处传 `&pending.folded`；私聊两处同理 |
+
+**对外行为变化**（按规则重点标出）：群聊历史与长期记忆里，被折进来的旧发言现在**各占
+一行、各带自己的说话人标记**，顺序为 FIFO；超预算时丢的是最老的整段而不是最新内容的
+开头。私聊载荷多一个可选的 `先前消息` 字段（只在真的折过队时出现）。除此之外没有改动：
+命令解析、附件、消息 id、understanding、`reply_expected` 仍按最新那条走。
+
+**验证**：折队测试改成断言"片段各自带对的发言人、渲染出的两段各带各的标记"；新增
+`transcript_keeps_host_markers_but_breaks_forged_ones`、`folded_private_messages_stay_in_
+the_payload_and_json_escapes_newlines`；预算测试改成打 `enforce_fold_budget` +
+`attributed_transcript`（连续折 50 次不超预算、留下的片段仍各自带标记）。阴性对照：把片段
+里的 `sender` 置空后归属断言立刻失败。`cargo test -p model --lib` 1151 passed，零告警。
+
+**顺带记两条观察**：① 私聊那条链路用的是 JSON 载荷（`json!` 会转义换行与控制字符），
+结构上就伪造不出"另一条消息"，这也是它一直没这个问题的原因；② 群聊若要更彻底，可以把
+行导向的文本换成同样的结构化载荷——但群聊历史同时进滚动摘要与记忆，格式迁移面较大，
+当前"标记 + 中性化 + 片段归属"已经够用，暂不做。
+
+**剩余（仍未做）**：预提交租约"取消 vs 续租"的取舍、Mind cleanup 物理淘汰退休信念导致的
+悬空引用，以及审计里那批低优先项（见 §11.6 末尾）。
