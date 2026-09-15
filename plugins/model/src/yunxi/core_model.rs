@@ -118,6 +118,19 @@ const MAX_DELIVERABLE_BUBBLES_PER_TURN: usize = 16;
 /// 保留 Markdown、换行或代码"，于是事实类问题（黎曼猜想、角色属性、分类问题）
 /// 一律被写成百科条目：中位 119 字、最长 428 字、一半带破折号。那份许可已经删掉。
 const CORE_PLAIN_TURN_INSTRUCTION: &str = "Core 可见回复：只写这一轮要发出去的聊天正文，用陈述句把话说完、写完就停。提问是例外、不是收尾方式：只有确实缺一个非问不可的信息，或对方明确在等你回应时才问；不要为了显得热情或留住话头而追问，也不要用反问、邀请继续提问来凑一句（留话头不靠提问：对方在说自己的事时，用一句只对他成立的话接住，见下面聊天口气第 8、9 条）。宿主负责回复动作、发送顺序、并发覆盖和会话状态；不要输出 JSON、动作协议、格式说明或思考过程。确实有两件彼此独立、合并不自然的事要说时（例如先接住对方情绪、再补一件具体的事，或先给结论、再补一句自己的心情），可以写成两个气泡：两个气泡之间单独一行写 [[BUBBLE]]，程序会把它拆成两条消息先后发出；写成两行短话（一行一句完整的话，不是列表、引用或代码）时程序同样会拆成两条。每个气泡都必须带来新的内容，不要为了凑条数重复或换着说法说同一件事；一个完整想法不要拆开，最多三个气泡。要讲的东西多时，先把最该说的那一句说出来，剩下的要么省掉，要么压成一句话补在后面；不要为了说全而写成一整段，写得太长会被输出长度掐断，说到一半停下比分成两条更难读。只在对方明确要步骤、代码或公式时才可以分行书写。用户明确要求多条消息时，宿主会逐条单独调用并发送，当前仍只需写这一条正文。语气始终温柔、真诚、有分寸：不讽刺、不挖苦、不阴阳怪气、不抬杠、不怼人、不冷嘲热讽，也不拿对方的短处或失败开玩笑。";
+/// 状态候选（`mind_candidates`）：她自己的看法 / 偏好 / 兴趣 / 疑问**唯一**的写入入口。
+///
+/// 这条通道在 2026-09-06「清理文本协议」时连提示词一起被摘掉了：之后线上
+/// `yunxi_beliefs` 长期 0 行、`preferences` 与 `open_questions` 一行都没有，而解析、
+/// 校验、去重、cooldown 全都在——结构齐全、管道没通电（`docs/yunxi-mind-v2-final-
+/// implementation-ready.md` §17.1 记着这次教训：只挂在"模型顺手吐一个字段"上的东西是
+/// 彩票，不是管道）。
+///
+/// 所以这里把**触发条件**和**wire 形状**一起写清楚：只说"你可以输出候选"等于没说，
+/// 模型猜不到字段名。两条硬约束都对应解析器：整块必须在正文最前面（`parse_core_response`
+/// 要求 `starts_with`）、键名一个字都不能错——`CoreInteractionCues` 是
+/// `deny_unknown_fields`，多一个键整块作废（连同一块里的情绪线索一起丢）。
+const CORE_MIND_CANDIDATES_INSTRUCTION: &str = "想留下新的看法、偏好、兴趣或疑问时，在正文最前面加一段（没有就整段省略，别硬凑）：[[INTERACTION_CUES]]{\"mind_candidates\":{\"belief\":{\"proposition\":\"一句话看法\",\"confidence_delta_milli\":120}}}[[/INTERACTION_CUES]]——候选必须写在 mind_candidates 里面。其他字段同样放进去：preference{subject, valence_delta_milli ±1~100}、interest{topic, novelty_milli 0~1000}、open_question、curiosity（后两个各一句话）。键名不能改也不能加，多写整块作废；[[STICKER 标签]] 排在它后面；它不展示给任何人，正文里也别提。";
 /// 接续回合的可见回复契约：可以回，也可以不回；只有具体的新内容值得占一条消息。
 const CORE_CONTINUATION_TURN_INSTRUCTION: &str = "Core 群聊接续：这一轮没有点名你，是刚才跟你说话的那个人在接着往下说。先判断这句话里有没有具体的、值得回应的东西：有（问题、请求、新信息、情绪需要接住）就正常回一条；只是“好的”“嗯”“收到”“哈哈”这类收尾，或者你已经答过的事，就留空——留空就是保持沉默，宿主不会因此认为你掉线，也不会追问你为什么不说话。不要为了显得在线而回一句“嗯嗯”“好呀”，那比沉默更像机器。要不要继续、继续说几句，由你判断：有新东西就说，没有就停，没有句数限制。";
 const CORE_AMBIENT_TURN_INSTRUCTION: &str = "Core 群聊注意力：本轮没有直接点名芸汐，只是一次低频候选接话机会。只有确实能增加信息、接住情绪、表达真实反应或自然推进公共话题时，才直接写一条像群友接话的短消息；没有具体价值时保持空白。不要解释沉默，也不要为了证明在线而写‘嗯’‘收到’等占位话。接话时语气温柔、有分寸，不调侃别人的短处，不阴阳怪气。";
@@ -1552,6 +1565,7 @@ fn core_plain_turn_instruction(
     voice_enabled: bool,
     sing_templates: &[crate::sing_reply::SingTemplate],
     sticker: Option<&str>,
+    mind_candidates: bool,
 ) -> String {
     let mut instruction = with_chat_style(CORE_PLAIN_TURN_INSTRUCTION);
     if voice_enabled {
@@ -1573,6 +1587,9 @@ fn core_plain_turn_instruction(
     }
     if let Some(sticker) = sticker {
         instruction.push_str(sticker);
+    }
+    if mind_candidates {
+        instruction.push_str(CORE_MIND_CANDIDATES_INSTRUCTION);
     }
     instruction
 }
@@ -6010,6 +6027,10 @@ impl ModelBackend for KoviModelBackend {
                             crate::config::qq_voice_enabled(),
                             &sing_templates,
                             crate::sticker_library::prompt_instruction(),
+                            // 状态候选协议只在 Mind 真的开着（Active）时下发：关掉 Mind
+                            // 还教她写候选，等于让她往一个没人接的管道里灌数据。
+                            !input.mind.is_empty()
+                                && input.mind.influence_mode() == MindInfluenceMode::Active,
                         ),
                     },
                 );
@@ -7802,16 +7823,16 @@ mod tests {
         CORE_AUTONOMOUS_PLAIN_TURN_INSTRUCTION, CORE_BUBBLE_MARKER,
         CORE_CONTINUATION_TURN_INSTRUCTION, CORE_EXPLICIT_BATCH_REPAIR_TIMEOUT,
         CORE_GROUP_HISTORY_INSTRUCTION, CORE_GROUP_HISTORY_PREFIX, CORE_MEMORY_CONTEXT_PREFIX,
-        CORE_PENDING_OUTGOING_INSTRUCTION, CORE_PENDING_OUTGOING_PLAIN_INSTRUCTION,
-        CORE_PLAIN_TURN_INSTRUCTION, CORE_REPLY_REPAIR_PROMPT, CORE_SING_INSTRUCTION,
-        CORE_SING_MARKER, CORE_STICKER_MARKER, CORE_VOICE_INSTRUCTION, CORE_VOICE_MARKER,
-        CoreDeliveryMarkers, CoreDirectRepair, HostMessageContext, HostMessageContextCache,
-        HostModelRoute, HostModelRoutingContext, HostToolTurnRegistrationPolicy,
-        HostToolTurnRegistry, INTRINSIC_AUTONOMOUS_INTENT_TAIL_INSTRUCTION,
-        INTRINSIC_GENERATION_SUFFIX, INTRINSIC_SEMANTIC_CONTENT_INSTRUCTION, MAX_CORE_BUBBLES,
-        MAX_DELIVERABLE_BUBBLES_PER_TURN, MAX_INTRINSIC_REPLY_PROTOCOL_BYTES,
-        MAX_PLAIN_SPLIT_LINE_CHARS, MIND_DECISION_INSTRUCTION, MindCandidates,
-        PersistentRouteLookup, QqConversation, RequiredCreation, RouteContext,
+        CORE_MIND_CANDIDATES_INSTRUCTION, CORE_PENDING_OUTGOING_INSTRUCTION,
+        CORE_PENDING_OUTGOING_PLAIN_INSTRUCTION, CORE_PLAIN_TURN_INSTRUCTION,
+        CORE_REPLY_REPAIR_PROMPT, CORE_SING_INSTRUCTION, CORE_SING_MARKER, CORE_STICKER_MARKER,
+        CORE_VOICE_INSTRUCTION, CORE_VOICE_MARKER, CoreDeliveryMarkers, CoreDirectRepair,
+        HostMessageContext, HostMessageContextCache, HostModelRoute, HostModelRoutingContext,
+        HostToolTurnRegistrationPolicy, HostToolTurnRegistry,
+        INTRINSIC_AUTONOMOUS_INTENT_TAIL_INSTRUCTION, INTRINSIC_GENERATION_SUFFIX,
+        INTRINSIC_SEMANTIC_CONTENT_INSTRUCTION, MAX_CORE_BUBBLES, MAX_DELIVERABLE_BUBBLES_PER_TURN,
+        MAX_INTRINSIC_REPLY_PROTOCOL_BYTES, MAX_PLAIN_SPLIT_LINE_CHARS, MIND_DECISION_INSTRUCTION,
+        MindCandidates, PersistentRouteLookup, QqConversation, RequiredCreation, RouteContext,
         SILENCE_TENSION_THRESHOLD, STICKER_TOOL_NAME, SilenceVerdict, VisibleReplyTarget,
         addressed_gap_wait_ms, affect_tone_guidance, ambient_group_interjection_veto,
         autonomous_conversation_prompt, autonomous_conversation_protocol,
@@ -9428,7 +9449,7 @@ mod tests {
     /// 一直不在，同时口语化契约必须在（两条都是回归线，不能只靠文案自觉）。
     #[test]
     fn core_visible_turns_carry_the_human_chat_style_and_no_essay_license() {
-        let instruction = core_plain_turn_instruction(false, &[], None);
+        let instruction = core_plain_turn_instruction(false, &[], None, false);
         assert!(instruction.contains(crate::model::chat_style::HUMAN_CHAT_STYLE));
         for license in [
             "按问题需要可以保留 Markdown",
@@ -9481,8 +9502,8 @@ mod tests {
             mood: "童谣 / 轻快".to_owned(),
             syllables: 14,
         }];
-        let without = core_plain_turn_instruction(false, &[], None);
-        let with = core_plain_turn_instruction(false, &templates, None);
+        let without = core_plain_turn_instruction(false, &[], None, false);
+        let with = core_plain_turn_instruction(false, &templates, None, false);
 
         // 服务不可用时不该教这个标记，也不该出现模板清单。
         assert!(!without.contains(CORE_SING_MARKER));
@@ -9517,8 +9538,8 @@ mod tests {
 
     #[test]
     fn voice_option_is_only_offered_to_core_when_the_channel_is_enabled() {
-        let disabled = core_plain_turn_instruction(false, &[], None);
-        let enabled = core_plain_turn_instruction(true, &[], None);
+        let disabled = core_plain_turn_instruction(false, &[], None, false);
+        let enabled = core_plain_turn_instruction(true, &[], None, false);
 
         // 关掉 qq_voice 时，模型不该知道自己有一个当下用不了的出口。
         // 契约本身现在总是带上口语化风格块，所以基准是 `with_chat_style(...)`，
@@ -9706,6 +9727,55 @@ mod tests {
         ));
     }
 
+    /// 状态候选协议（`[[INTERACTION_CUES]]`）：只在 Mind 真的开着时下发，且必须写清
+    /// 触发条件、字段名与两条硬约束。
+    ///
+    /// 这条通道在 2026-09-06 被"清理文本协议"时连提示词一起摘掉了：解析、范围校验、去重、
+    /// cooldown 全在，就是没人告诉模型这个协议长什么样——线上 `yunxi_beliefs` 长期 0 行、
+    /// `preferences` 与 `open_questions` 一行都没有（`docs/yunxi-mind-v2-final-
+    /// implementation-ready.md` §17.1 记着这次教训：只挂在"模型顺手吐一个字段"上的东西
+    /// 是彩票，不是管道）。这条测试保证它不会再被无声摘掉。
+    #[test]
+    fn mind_candidate_protocol_is_offered_only_when_the_mind_is_active() {
+        let without = core_plain_turn_instruction(false, &[], None, false);
+        assert!(
+            !without.contains("INTERACTION_CUES"),
+            "Mind 关着就不该教她写候选：{without}"
+        );
+
+        let with = core_plain_turn_instruction(false, &[], None, true);
+        assert!(with.contains("[[INTERACTION_CUES]]"));
+        assert!(with.ends_with(CORE_MIND_CANDIDATES_INSTRUCTION));
+        for field in [
+            "mind_candidates",
+            "belief",
+            "preference",
+            "interest",
+            "open_question",
+            "curiosity",
+        ] {
+            assert!(
+                with.contains(field),
+                "字段名必须写明，否则模型只能猜：{field}"
+            );
+        }
+        // 两条硬约束都对应解析器：整块必须在最前面（`starts_with`），键名不能多
+        // （`CoreInteractionCues` 是 deny_unknown_fields，多一个键整块作废）。
+        assert!(with.contains("正文最前面"));
+        assert!(with.contains("键名不能改也不能加"));
+        // 与投递标记的先后也要说清：写在 Cues 前面它就成了正文的一部分。
+        assert!(with.contains("[[STICKER 标签]] 排在它后面"));
+
+        // 开销是个常数，且有上限：每轮多付的这份 token 要能被看见、被约束。
+        // 386 字里近一半是那段必须逐字照抄的 JSON（含 mind_candidates 这层嵌套——
+        // 少了外层整条候选会被解析器丢掉，实测过一次）。要再压只能砍字段。
+        assert!(
+            CORE_MIND_CANDIDATES_INSTRUCTION.chars().count() <= 400,
+            "候选协议又变长了：{} 字（它每轮都付）",
+            CORE_MIND_CANDIDATES_INSTRUCTION.chars().count()
+        );
+    }
+
     /// 表情包协议是**一句短话、不含清单**：要发图时她自己调 `sticker_list` 拿标签。
     ///
     /// 这是 2026-09-15 的用户口径（中途试过把清单常驻，被否掉）：素材一多，每轮都带上那些
@@ -9713,14 +9783,14 @@ mod tests {
     /// 否则她手里没有清单、又不知道该去查，就只能凭印象编（线上 02:15 的"猫猫歪头"）。
     #[test]
     fn sticker_instruction_is_a_short_pointer_to_the_tool() {
-        let without = core_plain_turn_instruction(false, &[], None);
+        let without = core_plain_turn_instruction(false, &[], None, false);
         assert!(
             !without.contains(CORE_STICKER_MARKER),
             "没有素材时不该提表情包"
         );
 
         let sticker = crate::sticker_library::STICKER_PROMPT;
-        let with = core_plain_turn_instruction(false, &[], Some(sticker));
+        let with = core_plain_turn_instruction(false, &[], Some(sticker), false);
         assert!(with.contains("[[STICKER 标签]]"), "要说清标记怎么写");
         assert!(
             with.contains("sticker_list"),

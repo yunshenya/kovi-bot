@@ -229,6 +229,23 @@ pub(crate) async fn initialize_database() -> Result<()> {
         let store = Arc::new(PostgresMindStore::new(pool.clone()));
         store.initialize_schema().await?;
         store.ensure_self_model().await?;
+        // 候选表（beliefs / preferences）只由模型的 `[[INTERACTION_CUES]]` → mind_candidates
+        // 写入。2026-09-06「清理文本协议」把那段提示词一起摘掉之后，这两张表长期 0 行却
+        // 一声不吭，直到有人手动跑 `#立场` 才发现（见
+        // `docs/yunxi-mind-v2-final-implementation-ready.md` §17.1）。所以启动时看一眼：
+        // 空就明说，并指向该查的两处。
+        match store.status().await {
+            Ok(status) if status.beliefs == 0 && status.preferences == 0 => {
+                kovi::log::warn!(
+                    "Yunxi Mind 候选表为空（beliefs=0 preferences=0 interests={} open_questions={} active_agenda={}）：先查 Core 回复协议里 CORE_MIND_CANDIDATES_INSTRUCTION 是否还在下发（`#立场` 与日志里的「候选被安全过滤丢弃」是另外两处）",
+                    status.interests,
+                    status.open_questions,
+                    status.active_agenda,
+                );
+            }
+            Ok(_) => {}
+            Err(error) => kovi::log::warn!("Yunxi Mind 状态自检失败（不影响启动）: {error}"),
+        }
         let _ = MIND_STORE.set(store);
     }
     if MIND_RUNTIME.get().is_none() {
