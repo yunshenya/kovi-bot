@@ -730,6 +730,44 @@ impl ConversationCoordinator {
     }
 }
 
+/// 折队后正文的总预算：与单条入站消息同一个上限（`traffic.max_input_chars`）。
+///
+/// 折队原先只限**条数**（`max_pending_turns`）不限字节，而被折的条目本身可能已经是
+/// 折过好几次的累积体——再折一次会把整条血脉一起搬过来，正文随刷屏次数线性膨胀
+/// （默认 16 格 × 单条 6000 字，刷屏 300 条能到几十万字），随后原样进提示词、
+/// 也原样写进长期记忆；而压缩切点保证"最近两条永不压缩"，超长正文必然留在请求体里，
+/// 换来上游 400 与整轮无回复。
+fn folded_message_limit() -> usize {
+    crate::config::get().traffic().max_input_chars()
+}
+
+/// 省略说明预留的最大字数（`…（较早的 123456 字已省略）` 加上换行）。
+const ELISION_NOTE_CHARS: usize = 32;
+
+/// 把更早的一条正文折到当前正文前面，并保证总长不超过 `limit`。
+///
+/// 超出时保留**尾部**（最新说的话最重要），并在开头写明丢掉了多少字：静默截断会让
+/// 模型以为"前面没人提过这件事"，而一句省略说明能让它知道上下文有缺口。
+fn fold_text(older: &str, newer: &str, limit: usize) -> String {
+    let joined = if newer.trim().is_empty() {
+        older.to_string()
+    } else if older.trim().is_empty() {
+        newer.to_string()
+    } else {
+        format!("{older}\n{newer}")
+    };
+    let total = joined.chars().count();
+    if total <= limit {
+        return joined;
+    }
+    // 先给省略说明留出位置，保证折出来的结果本身也不超预算。
+    let keep = limit.saturating_sub(ELISION_NOTE_CHARS);
+    let dropped = total.saturating_sub(keep);
+    let note = format!("…（较早的 {dropped} 字已省略）\n");
+    let tail = joined.chars().skip(total - keep).collect::<String>();
+    format!("{note}{tail}")
+}
+
 /// Push one pending turn into a bounded FIFO, folding instead of dropping.
 ///
 /// Returns how many older turns were folded into `turn`. The fold preserves
@@ -742,19 +780,14 @@ fn fold_into_bounded_queue(
     max_pending: usize,
 ) -> usize {
     let max_pending = max_pending.max(1);
+    let limit = folded_message_limit();
     let mut folded = 0_usize;
     while queue.len() >= max_pending {
         let Some(oldest) = queue.pop_front() else {
             break;
         };
         folded += 1;
-        if !oldest.message.trim().is_empty() {
-            turn.message = if turn.message.trim().is_empty() {
-                oldest.message
-            } else {
-                format!("{}\n{}", oldest.message, turn.message)
-            };
-        }
+        turn.message = fold_text(&oldest.message, &turn.message, limit);
         turn.message_ids.splice(0..0, oldest.message_ids);
         if turn.sticker_teaching_message.is_none() {
             turn.sticker_teaching_message = oldest.sticker_teaching_message;
@@ -866,6 +899,45 @@ mod tests {
         fold_into_bounded_queue(&mut single, pending_turn("乙", 2), 1);
         assert_eq!(single.len(), 1);
         assert_eq!(single[0].message, "甲\n乙");
+    }
+
+    #[test]
+    fn folded_text_never_exceeds_one_inbound_message() {
+        // 折队只限条数，正文会随刷屏线性膨胀：每一轮都折进来的话，一条 turn 能攒到
+        // 几十万字，而它必然留在请求体里（最近两条永不压缩）。这里钉住上限。
+        let limit = 600;
+        let older = "旧".repeat(limit);
+        let newer = "新".repeat(limit);
+        let folded = super::fold_text(&older, &newer, limit);
+        assert!(
+            folded.chars().count() <= limit,
+            "折出来的正文超预算: {} > {limit}",
+            folded.chars().count()
+        );
+        assert!(folded.contains("字已省略"), "截断要说明丢了多少");
+        assert!(!folded.contains('旧'), "超预算时应当丢掉较早的内容");
+        assert!(
+            folded.ends_with(&"新".repeat(limit - super::ELISION_NOTE_CHARS)),
+            "最新的尾部必须完整留下"
+        );
+
+        // 反复折叠不会累积：每次都以"不超过一条入站消息"收尾。
+        let mut message = String::from("第一句");
+        for index in 0..50 {
+            message =
+                super::fold_text(&message, &format!("第{index}句{}", "内".repeat(200)), limit);
+            assert!(
+                message.chars().count() <= limit,
+                "第 {index} 次折叠后超预算: {}",
+                message.chars().count()
+            );
+        }
+        assert!(message.contains("第49句"), "最新的一句话必须还在");
+
+        // 空正文不制造空行，也不丢内容。
+        assert_eq!(super::fold_text("", "乙", limit), "乙");
+        assert_eq!(super::fold_text("甲", "   ", limit), "甲");
+        assert_eq!(super::fold_text("甲", "乙", limit), "甲\n乙");
     }
 
     #[test]
