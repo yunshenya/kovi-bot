@@ -252,12 +252,42 @@ impl Belief {
     /// belief 必须能退休——否则数量只增不减，"容量上限"会变成一堵永久堵死、
     /// 而且（原来）完全静默的墙。退休不是删除：记录还在，`valid_until` 之后
     /// 不再出现在 active 查询里，追溯得到"她以前是这么想的"。
-    pub fn retired_at(mut self, at: DateTime<Utc>) -> Result<Self, MindValidationError> {
+    ///
+    /// **私有是故意的。** 存储层的契约是"每次 upsert 恰好 `expected + 1`"，
+    /// 所以一次业务更新只能自增一次版本；这个方法单独用会自增一次，再叠上
+    /// [`Belief::apply_delta`] 就成两次，于是每一次"改主意"都被 `VersionConflict`
+    /// 打回、整批反思一起回滚（2026-09-15 定位到的线上故障）。要一次更新里既走
+    /// 证据又退休，用 [`Belief::apply_update`]。
+    fn retired_at(mut self, at: DateTime<Utc>) -> Result<Self, MindValidationError> {
         self.valid_until = Some(at);
         self.updated_at = self.updated_at.max(at);
         self.version = self.version.saturating_add(1);
         self.validate()?;
         Ok(self)
+    }
+
+    /// 一次业务更新：证据增量 +（可选的）退休，**版本只自增一次**。
+    ///
+    /// 这是 update 路径唯一应当调用的入口。`valid_until` 是"这次更新之后这条
+    /// 看法还算不算数"，它和证据属于同一次更新，不是第二次更新。
+    pub fn apply_update(
+        &self,
+        confidence_delta: f32,
+        stability_delta: f32,
+        evidence_refs: &[EvidenceRef],
+        now: DateTime<Utc>,
+        valid_until: Option<DateTime<Utc>>,
+    ) -> Result<Self, MindValidationError> {
+        let updated = self.apply_delta(confidence_delta, stability_delta, evidence_refs, now)?;
+        let Some(valid_until) = valid_until else {
+            return Ok(updated);
+        };
+        // 只补有效期，不再动版本：`apply_delta` 已经代表这次更新。
+        let mut retired = updated;
+        retired.valid_until = Some(valid_until);
+        retired.updated_at = retired.updated_at.max(valid_until);
+        retired.validate()?;
+        Ok(retired)
     }
 
     #[must_use]

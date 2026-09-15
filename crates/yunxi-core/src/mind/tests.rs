@@ -1121,6 +1121,107 @@ async fn consolidation_clamps_updates_and_rejects_stale_snapshot() {
 }
 
 #[tokio::test]
+async fn a_change_of_mind_retires_the_old_belief_in_one_version_bump() {
+    // 2026-09-15 定位到的线上故障：改主意那条路会给提案带上 `valid_until`，而
+    // `apply_delta` 与 `retired_at` 各加一次版本，落库时就成了 "expected + 2"，
+    // 存储层按契约拒绝，**整批反思一起回滚**——她永远无法真正改变看法。
+    let store = Arc::new(InMemoryMindStore::new());
+    let services = MindServices::from_store(Arc::clone(&store));
+    let base = services
+        .consolidation
+        .current_version()
+        .await
+        .expect("version");
+    let event = direct_event(PersonId::new(), ConversationId::new(), "Rust");
+    let make_input = |base| ReflectionInput {
+        trigger: ReflectionTrigger::HighSalienceEvent,
+        depth: ReflectionDepth::Deep,
+        scope: MindScope::Global,
+        recent_events: Vec::new(),
+        salient_memories: Vec::new(),
+        open_loop_summaries: Vec::new(),
+        goal_summaries: Vec::new(),
+        mind: MindSnapshot::new(
+            None,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            MindInfluenceMode::Shadow,
+            base,
+            now(),
+        )
+        .expect("empty versioned snapshot"),
+        requested_at: now(),
+        trace: event.trace(),
+    };
+    let proposition = "Rust 类型系统总体有价值";
+
+    // 第一步：立一条看法。
+    let mut proposal = ReflectionProposal::empty(&make_input(base));
+    proposal.belief_updates.push(BeliefUpdateProposal {
+        operation: BeliefOperation::Upsert,
+        belief_id: None,
+        expected_version: None,
+        scope: MindScope::Global,
+        proposition: proposition.to_owned(),
+        confidence_delta: 0.2,
+        stability_delta: 0.1,
+        source: BeliefSource::Reflection,
+        evidence_refs: Vec::new(),
+        valid_until: None,
+    });
+    let consolidation = Consolidation::new(ConsolidationConfig::default()).expect("config");
+    consolidation
+        .consolidate(&services, &proposal)
+        .await
+        .expect("first upsert creates the belief");
+    let stored = services
+        .beliefs
+        .find_by_key(MindScope::Global, &common::normalized_key(proposition))
+        .await
+        .expect("lookup")
+        .expect("stored belief");
+    assert_eq!(stored.version(), 1);
+
+    // 第二步：改主意——同一条命题带着 `valid_until` 回来，版本必须恰好 +1。
+    let base = services
+        .consolidation
+        .current_version()
+        .await
+        .expect("version");
+    let mut revision = ReflectionProposal::empty(&make_input(base));
+    revision.belief_updates.push(BeliefUpdateProposal {
+        operation: BeliefOperation::Retract,
+        belief_id: Some(stored.id()),
+        expected_version: Some(stored.version()),
+        scope: MindScope::Global,
+        proposition: proposition.to_owned(),
+        confidence_delta: -0.1,
+        stability_delta: -0.05,
+        source: BeliefSource::Reflection,
+        evidence_refs: Vec::new(),
+        // 退休时刻必须晚于这条看法的创建时刻（validate 会拦），所以比固定测试
+        // 时钟晚一分钟。
+        valid_until: Some(now() + chrono::Duration::minutes(1)),
+    });
+    consolidation
+        .consolidate(&services, &revision)
+        .await
+        .expect("改主意必须能落库：版本只该自增一次");
+    let retired = services
+        .beliefs
+        .get(stored.id())
+        .await
+        .expect("lookup")
+        .expect("belief survives retirement");
+    assert_eq!(retired.version(), 2, "一次更新只自增一次版本");
+    assert!(retired.valid_until().is_some(), "旧看法必须真的退休");
+}
+
+#[tokio::test]
 async fn concurrent_updates_accept_only_one_expected_version() {
     let store = Arc::new(InMemoryMindStore::new());
     let belief = Belief::new(

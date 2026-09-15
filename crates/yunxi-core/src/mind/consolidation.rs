@@ -468,18 +468,20 @@ impl Consolidation {
                 // 批次时间可能早于这条记录上次更新的时间，按"不早于已存状态"取，
                 // 否则整批反思会因为这一条而失败（Interest 那边早就这么做了）。
                 let effective_at = now.max(existing.updated_at());
-                let mut value = existing.apply_delta(
+                // 更新时也要能设有效期：立场被合并掉、或她改了主意之后，旧的那条必须
+                // 真正退休。原实现只在创建时写 valid_until，更新时直接忽略它，
+                // 于是 belief 只增不减——"容量上限"就成了永久堵死的墙。
+                //
+                // 走 `apply_update` 而不是 `apply_delta` + `retired_at`：存储层的契约
+                // 是"每次 upsert 恰好 expected + 1"，两步会自增两次版本，于是每一次
+                // "改主意"都被 VersionConflict 打回、整批反思一起回滚（2026-09-15）。
+                let value = existing.apply_update(
                     directed_delta,
                     stability_delta,
                     &proposal.evidence_refs,
                     effective_at,
+                    proposal.valid_until,
                 )?;
-                // 更新时也要能设有效期：立场被合并掉、或她改了主意之后，旧的那条必须
-                // 真正退休。原实现只在创建时写 valid_until，更新时直接忽略它，
-                // 于是 belief 只增不减——"容量上限"就成了永久堵死的墙。
-                if let Some(valid_until) = proposal.valid_until {
-                    value = value.retired_at(valid_until)?;
-                }
                 Ok(MindUpsert {
                     value,
                     expected_version: Some(expected),
