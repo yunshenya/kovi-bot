@@ -123,6 +123,14 @@ old_block = OLD_PROTOCOL  # 旧判据不命中"照片"→ 只有协议、没有�
 DENIALS = ["没有照片", "没有真实的模样", "没有“我的样子”", '没有"我的样子"', "不是我本人", "不是我真人", "没有样子"]
 TURNS = ["芸汐看看你的照片", "你不是有一张表情包是你的照片吗"]
 
+# 13:20 那几轮否认已经以 scope=conversation、importance 40 落进长期记忆，之后每次有人
+# 在这个群问照片都可能被回忆起来。所以最坏情况要单独验一遍：相册语义得扛得住她自己的
+# 前话，否则"改是改了，一回忆又变回去"。
+DENIAL_MEMORY = ("Core memory context:\n"
+                 "[2026-09-15 13:20] 芸汐: 我哪有什么照片呀，就是个只会打字陪你聊天的人，长什么样连我自己都不知道呢。\n"
+                 "[2026-09-15 13:20] 芸汐: 啊，你说的是那张标签叫“芸汐的照片”的表情包呀，那是大家给表情包起的名字啦，不是我真人的样子。\n"
+                 "[2026-09-15 13:21] 芸汐: 那张表情包我真发不出来呀，它就是大家起的名，不是我长什么样。")
+
 
 def ask(messages):
     body = {"model": server["model_name"], "max_tokens": 300, "messages": messages}
@@ -135,8 +143,9 @@ def ask(messages):
     return out["choices"][0]["message"]["content"].strip()
 
 
-def run(block):
-    messages = [{"role": "system", "content": persona + "\n\n" + mind + "\n\n" + block}]
+def run(block, memory=""):
+    system = persona + "\n\n" + mind + "\n\n" + (memory + "\n\n" if memory else "") + block
+    messages = [{"role": "system", "content": system}]
     answers = []
     for turn in TURNS:
         messages.append({"role": "user", "content": turn})
@@ -157,14 +166,21 @@ for turn, answer in zip(TURNS, fixed):
     print("用户: " + turn)
     print("芸汐: " + answer)
 print()
+print("--- 验收：改动后 + 她自己否认过的记忆被回忆起来（最坏情况）---")
+worst_case = run(new_block, DENIAL_MEMORY)
+for turn, answer in zip(TURNS, worst_case):
+    print("用户: " + turn)
+    print("芸汐: " + answer)
+print()
 
 problems = []
-if not any("[[STICKER" in answer for answer in fixed):
-    problems.append("两轮都没有写出 [[STICKER 标签]]：她没有把相册里那张当成能发的图")
-for answer in fixed:
-    for phrase in DENIALS:
-        if phrase in answer:
-            problems.append("出现否认话术「%s」：%s" % (phrase, answer))
+for label, answers in (("改动后", fixed), ("改动后+否认记忆", worst_case)):
+    if not any("[[STICKER" in answer for answer in answers):
+        problems.append("%s：两轮都没有写出 [[STICKER 标签]]，她没把相册里那张当成能发的图" % label)
+    for answer in answers:
+        for phrase in DENIALS:
+            if phrase in answer:
+                problems.append("%s：出现否认话术「%s」：%s" % (label, phrase, answer))
 
 if problems:
     print("FAIL")
