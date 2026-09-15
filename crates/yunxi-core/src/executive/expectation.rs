@@ -140,10 +140,15 @@ pub struct Expectation {
     /// An expectation describes what a turn expected to happen next, so when it
     /// resolves the result has to reach *that* task's working memory. Without
     /// this the runtime could only report that some expectation somewhere
-    /// ended, which no follow-up round can act on. It is process-local
-    /// bookkeeping and defaults to absent for hosts that register expectations
-    /// themselves.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// ended, which no follow-up round can act on.
+    ///
+    /// Never serialized: a trace root identifies an event in *this* process's
+    /// queue, and a host persists expectations. Restoring a stale root after a
+    /// restart would route a resolution into a task that no longer exists,
+    /// creating working memory nothing can ever release. A restored
+    /// expectation therefore has no task, which is the honest answer — its task
+    /// did not survive the process either.
+    #[serde(skip)]
     pub trace_root: Option<crate::EventId>,
 }
 
@@ -323,5 +328,35 @@ impl ExpectationTracker {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.pending.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_trace_root_never_survives_serialization() {
+        // The root names an event in this process's queue, and hosts persist
+        // expectations. A restored stale root would route a resolution into a
+        // task that no longer exists — working memory nothing can release.
+        let expectation = Expectation::new(
+            ActionId::new(),
+            ExpectedEventPattern::EventType(crate::EventType::IdleTick),
+            0.8,
+            None,
+        )
+        .for_trace(crate::EventId::new());
+        assert!(expectation.trace_root().is_some());
+        let encoded = serde_json::to_value(&expectation).expect("serializes");
+        assert!(
+            encoded.get("trace_root").is_none(),
+            "trace root leaked into the persisted form: {encoded}"
+        );
+        let restored: Expectation = serde_json::from_value(encoded).expect("deserializes");
+        assert_eq!(restored.trace_root(), None);
+        // Everything the host durably needs is still there.
+        assert_eq!(restored.id, expectation.id);
+        assert_eq!(restored.expected_event, expectation.expected_event);
     }
 }
