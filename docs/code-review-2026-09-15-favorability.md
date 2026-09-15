@@ -929,3 +929,57 @@ the_payload_and_json_escapes_newlines`；预算测试改成打 `enforce_fold_bud
 
 **剩余（仍未做）**：预提交租约"取消 vs 续租"的取舍、Mind cleanup 物理淘汰退休信念导致的
 悬空引用，以及审计里那批低优先项（见 §11.6 末尾）。
+
+### 11.8 预提交续租 + Mind 清理引用完整性（2026-09-16）
+
+**`b41984c` 预提交租约可续租**：租约到期会把那条 `Prepared` 改成 `Cancelled`（刻意的
+fail-closed：校验没跑完不能发，进程死了也要能自愈）。代价是"活着只是慢"的校验会让
+`commit` 拿到 `Stale`，**整条已经渲染好的回复被丢弃且不重试**——`delivery.rs` 里为此把
+语音合成等慢步骤特意排到 `begin_outgoing_commit` 之前并写明原因，说明这个坑踩过，只是
+当时用"调整顺序"绕开了，租约内剩下的 await 仍暴露在同一风险里。
+
+新增 `PreparedOutgoingCommit::renew()`（只续自己那条，token 不匹配返回 false，绝不碰
+别人的状态），并在三条发送路径的每个可能变慢的 await **之前**续租（多气泡回复、单条提示、
+Core 投递的引用映射/路由/授权）。语义从"整段共用一个 30 秒"变成"每一步各自受 30 秒约束"。
+
+**`ae3c568` Mind 清理的引用完整性**：`cleanup` 原先对所有 mind 记录一视同仁地按
+`updated_at` 每 scope 留 256 条并物理删除，而信念的"退休"不是删行（`expires_at` 写
+`valid_until`、`status` 仍是 'active'），于是退休信念会跟活着的知识抢配额；被挤掉后
+那条命题的 `(scope_key, dedupe_key)` 唯一索引随行消失，同一命题再次出现会以**新 UUID**
+复活，而 `open_question.related_beliefs` 还指着旧 id。三处改动：退休信念按
+`RETIRED_BELIEF_RETENTION_DAYS`（30 天）单独过期；只有活着的信念吃 scope 上限；删完把
+`related_beliefs` 里指向已不存在信念的条目摘掉（按存在性过滤，历史悬空引用一并自愈）。
+顺带把 `orphaned_agenda` 挪到所有上限清理之后——它要找的正是本轮刚被清掉的那些目标。
+
+验证：`precommit_lease_can_be_renewed_by_its_owner_only`（压缩租约后续租成功、睡过原截止
+点仍有效、已过期的续不回来、状态清掉后返回 false）；
+`postgres_cleanup_keeps_retired_beliefs_briefly_and_prunes_dangling_refs`（刚退休的留着、
+退休 40 天的删掉、悬空引用被摘而有效引用保留），两个阴性对照分别跑过并如期失败。
+全量回归：model 1153 + core 355 + CLI 10 + acceptance 13 全过，真库 ignored 65 passed
+（唯一失败仍是需要 `REDIS_URL` 的 `redis_store`）。
+
+### 11.9 待办：把回复动作协议换成受约束通道（规则 7），**尚未开始**
+
+按第 7 条"不要让模型手写结构化文本"，`[[REPLY_ACTION]]{...}[[/REPLY_ACTION]]` 属于应当
+淘汰的那一类：让模型手写 JSON、再用容错解析器去猜（`complete_truncated_json_object`
+就是在替它擦屁股）。这次**没有动**，因为它横跨两条模型链路，半途改完比不改更糟：
+
+- Host：`model/reply.rs` 的 `REPLY_PROTOCOL_HEAD`（30 余行指令）+ `parse_reply_output`
+  解析；`config/mod.rs` 有断言"系统提示词里不许出现 REPLY_ACTION"。
+- Core：`yunxi/core_model.rs` 自己拼 `[[REPLY_ACTION]]`（529/591 行附近）、在纯文本模式里
+  拒绝它（1938/3117/3151）、修复提示词里明确禁止它（152 行），以及一大批围绕它的测试。
+- 生成侧：最终回复走的是 `params_model_*`（纯补全），要换成带 `tools` 的调用。
+
+建议的迁移步骤（下一步照此执行即可）：
+
+1. 定义 `reply_action` 工具（JSON schema：`disposition` / `messages` / `requests_image` /
+   `quote_message_id` / `at_current_sender` / `at_user_ids` / `recall_message_ids` /
+   `voice` / `sticker`），契约写进工具 description（符合第 6 条：按需随工具下发，
+   不再常驻 30 行协议文本）。
+2. 最终回复调用只挂这一个工具（`tools=[reply_action]`），于是模型只能通过它表达结构化
+   动作；正文仍是自然语言（符合第 7 条"先自然语言推理、再转结构"）。
+3. `parse_reply_output` 改成读 `tool_calls[0].arguments`（服务端已保证是合法 JSON），
+   删掉文本标记解析与 `complete_truncated_json_object` 在回复路径上的使用。
+4. Core 侧同步：删除自造的 `[[REPLY_ACTION]]` 包装与所有"禁止出现该标记"的分支。
+5. 清理 `config/mod.rs` 与 `core_model.rs` 里围绕旧协议的断言/修复提示词，替换成新协议的
+   对应断言；跑一次真实的私聊/群聊端到端确认。
