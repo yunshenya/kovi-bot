@@ -23,6 +23,13 @@ impl Default for GagLedgerConfig {
 }
 
 impl GagLedgerConfig {
+    /// 测试用：把每个作用域的条数上限压到很小，好验证淘汰逻辑。
+    #[cfg(test)]
+    pub(crate) const fn with_scope_capacity(mut self, max_entries_per_scope: usize) -> Self {
+        self.max_entries_per_scope = max_entries_per_scope;
+        self
+    }
+
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
             (1..=512).contains(&self.max_entries_per_scope),

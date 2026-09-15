@@ -117,6 +117,20 @@ impl PostgresGagStore {
         let (scope_kind, scope_id) = scope.kind_id();
         let now = Utc::now();
         let id = Uuid::new_v4();
+        // 「数一数 → 删最旧 → 插入」必须是**一个事务**，而且按作用域串行。以前这里是
+        // 三条独立语句：同一用户连发两条 `#记下` 时，两边都读到"还没满"，于是双双跳过
+        // 删除、条数突破上限。被撑大的 open 集合不会自愈——`list_open` 按 created_at
+        // 取前 N，超出的老条目会长期把新条目挤在 LIMIT 之外。
+        let mut transaction = self.pool.begin().await?;
+        query(
+            "SELECT pg_advisory_xact_lock(
+                 hashtextextended('yunxi-gag:' || $1 || ':' || COALESCE($2, ''), 0)
+             )",
+        )
+        .bind(scope_kind)
+        .bind(scope_id)
+        .execute(&mut *transaction)
+        .await?;
         // Bound the scope: drop the oldest open entry of this scope if full.
         let scope_count: i64 = query_scalar(
             "SELECT count(*) FROM yunxi_gag_entries
@@ -124,7 +138,7 @@ impl PostgresGagStore {
         )
         .bind(scope_kind)
         .bind(scope_id)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *transaction)
         .await?;
         if scope_count >= self.config.max_entries_per_scope() as i64 {
             query(
@@ -137,12 +151,12 @@ impl PostgresGagStore {
             )
             .bind(scope_kind)
             .bind(scope_id)
-            .execute(&self.pool)
+            .execute(&mut *transaction)
             .await?;
         }
         let global_count: i64 =
             query_scalar("SELECT count(*) FROM yunxi_gag_entries WHERE state = 'open'")
-                .fetch_one(&self.pool)
+                .fetch_one(&mut *transaction)
                 .await?;
         if global_count >= self.config.max_global_entries() as i64 {
             query(
@@ -152,7 +166,7 @@ impl PostgresGagStore {
                      WHERE state = 'open' ORDER BY created_at LIMIT 1
                  )",
             )
-            .execute(&self.pool)
+            .execute(&mut *transaction)
             .await?;
         }
         query(
@@ -167,8 +181,9 @@ impl PostgresGagStore {
         .bind(text)
         .bind(i32::from(importance.clamp(0, 100)))
         .bind(now)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await?;
+        transaction.commit().await?;
         Ok(id)
     }
 

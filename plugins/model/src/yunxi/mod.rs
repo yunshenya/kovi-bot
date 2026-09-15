@@ -1870,6 +1870,54 @@ mod erasure_tests {
             });
     }
 
+    /// 「数一数 → 删最旧 → 插入」必须在同一事务里、按作用域串行：否则同一用户
+    /// 并发写两条时都读到"还没满"，双双跳过删除，条数突破上限；而被撑大的 open
+    /// 集合不会自愈（`list_open` 按 created_at 取前 N，超出的老条目会长期把新条目
+    /// 挤在 LIMIT 之外）。
+    #[test]
+    #[ignore = "requires PostgreSQL via DATABASE_URL"]
+    fn gag_capacity_holds_under_concurrent_writes() {
+        use crate::yunxi::gag_store::{GagKind, GagScope, PostgresGagStore};
+        use sqlx_postgres::PgPoolOptions;
+
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let database_url = std::env::var("DATABASE_URL").expect("需要 DATABASE_URL");
+                let pool = PgPoolOptions::new()
+                    .max_connections(4)
+                    .connect(&database_url)
+                    .await
+                    .expect("应连接 PostgreSQL");
+                // 上限压到 1：两次**并发**写入只有一条能留下，多出来的必须被删掉。
+                let config = crate::config::get()
+                    .gag_ledger()
+                    .clone()
+                    .with_scope_capacity(1);
+                let store = PostgresGagStore::new(pool.clone(), config);
+                store
+                    .initialize_schema()
+                    .await
+                    .expect("应初始化账本 schema");
+
+                let suffix = (uuid::Uuid::new_v4().as_u128() % 1_000_000_000) as i64;
+                let scope = format!("{}", 4_000_000_000_000_i64 + suffix);
+                let person = || GagScope::Person(scope.clone());
+                let (first, second) = kovi::tokio::join!(
+                    store.add(person(), GagKind::Promise, "第一条", 60),
+                    store.add(person(), GagKind::Promise, "第二条", 60),
+                );
+                first.expect("第一条应写入");
+                second.expect("第二条应写入");
+                let open = store.list_open(person(), 10).await.expect("应能读回");
+                assert_eq!(
+                    open.len(),
+                    1,
+                    "上限是 1 时并发写入也只能留下一条：数数/删除/插入必须在同一事务里串行"
+                );
+            });
+    }
+
     /// 短 id 前缀查找走的是 UUID 范围比较（`id >= lower AND id < upper`），不是
     /// `CAST(id AS TEXT) LIKE`：后者既用不上主键索引，又会让输入里的 `_`/`%` 变成
     /// 通配符——一次"前缀歧义"会被报成"没找到这条账"。
