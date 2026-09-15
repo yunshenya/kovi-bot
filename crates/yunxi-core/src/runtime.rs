@@ -8,7 +8,7 @@ use crate::executive::{
     DecisionActionKind, DecisionRecord, ExecutiveController, ExecutiveReasonTag, ExecutiveScope,
 };
 use crate::goal::GoalOwner;
-use crate::identity::{ConversationId, EventId, PersonId};
+use crate::identity::{ConversationId, ConversationKind, EventId, PersonId};
 use crate::memory::{MemoryQuery, MemoryScope};
 use crate::mind::{
     MindInfluenceMode, MindSnapshotLimits, MindSnapshotProvider, MindSnapshotRequest,
@@ -1500,7 +1500,20 @@ impl CognitiveRuntime {
                 participants = listed;
             }
         }
-        if let Some(person_id) = person_id {
+        // 这个人**私下的**那一份上下文（person 作用域的记忆、他名下的未完结线索与
+        // 目标）只在"只属于他"的场合展开：私聊，或明确以他为作用域的事件。
+        //
+        // 群聊里的一条消息即使来自同一个人，也是**公开场合**——把她私聊里知道的
+        // 事情带进群聊的提示词，等于让那些内容有机会出现在群里。Mind 那条路早就
+        // 有同一道闸门（`mind/snapshot.rs` 用 `ConversationKind::Direct` 决定要不要
+        // 恢复私聊作用域，注释写的是"without guessing in group chat"），记忆这条
+        // 路一直没有。
+        //
+        // 关系与情绪不在闸门之内：那是她自己的状态，不是用户说过的话；群聊的语气档
+        // 与静默门控正是靠它工作的。
+        if let Some(person_id) = person_id
+            && event_is_private_to(&event, person_id)
+        {
             let scope = MemoryScope::Person(person_id);
             if let Ok(query) = MemoryQuery::new(scope, "", 32)
                 && let Ok(recalled) = services.memory.recall(&query).await
@@ -2038,6 +2051,26 @@ fn event_person_id(event: &WorldEvent) -> Option<PersonId> {
         crate::WorldEventKind::InteractionCuesObserved(cues) => Some(cues.person_id),
         crate::WorldEventKind::AutonomousConversationTick(tick) => tick.person_id,
         _ => None,
+    }
+}
+
+/// 这个事件是不是发生在"只属于这个人"的场合。
+///
+/// 私聊，或明确以他为作用域的事件，才算；群聊消息一律不算，哪怕它来自同一个人。
+/// 它决定 `planner_input_with_context` 要不要展开这个人的私聊上下文（记忆、他名下
+/// 的未完结线索与目标）——把私聊里知道的事带进群聊的提示词，就是让那些内容有机会
+/// 被说给群里听。
+fn event_is_private_to(event: &WorldEvent, person_id: PersonId) -> bool {
+    match event.scope() {
+        EventScope::Person {
+            person_id: scoped, ..
+        } => scoped == person_id,
+        EventScope::Conversation { .. } => matches!(
+            event.kind(),
+            crate::WorldEventKind::MessageReceived(message)
+                if message.conversation_kind == ConversationKind::Direct
+        ),
+        EventScope::Global | EventScope::Goal { .. } => false,
     }
 }
 
@@ -6396,6 +6429,88 @@ mod tests {
                 ),
                 (GoalOwner::Person(person_id), MAX_GOALS_PER_CONTEXT_OWNER),
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn group_turns_never_load_the_speakers_private_person_context() {
+        // 群聊里的一条消息即使来自同一个人，也是公开场合：她私聊里知道的事情不能
+        // 因为"是这个人说的"就进入群聊的提示词。Mind 那条路早就有这道闸门
+        // （`ConversationKind::Direct`），记忆这条路一直没有。
+        let conversation_id = ConversationId::new();
+        let person_id = PersonId::new();
+        let memory = Arc::new(TestMemoryStore::default());
+        let open_loops = Arc::new(TestOpenLoopStore::default());
+        let relations = Arc::new(TestRelationStore::default());
+        let goals = Arc::new(TestGoalStore::with_goals(vec![
+            TestGoalStore::goal(
+                GoalId::new(),
+                GoalOwner::Conversation(conversation_id),
+                "conversation goal",
+            ),
+            TestGoalStore::goal(GoalId::new(), GoalOwner::Person(person_id), "person goal"),
+        ]));
+        let (_handle, runtime) = CognitiveRuntime::new_with_services(
+            RuntimeConfig::default(),
+            CoreServices::with_model(FakeModel)
+                .with_memory(memory.clone())
+                .with_open_loops(open_loops.clone())
+                .with_goals(goals.clone())
+                .with_relations(relations.clone()),
+        )
+        .expect("valid runtime");
+
+        let input = runtime
+            .planner_input_with_context(group_message(conversation_id, person_id))
+            .await;
+
+        // 会话作用域照常（群里的共同上下文），person 作用域一个都不取。
+        assert_eq!(
+            memory
+                .recalled_scopes
+                .lock()
+                .expect("memory recorder lock")
+                .as_slice(),
+            &[MemoryScope::Conversation(conversation_id)]
+        );
+        assert_eq!(
+            open_loops
+                .listed_owners
+                .lock()
+                .expect("open-loop recorder lock")
+                .as_slice(),
+            &[OpenLoopOwner::Conversation(conversation_id)]
+        );
+        assert!(
+            !input
+                .memories
+                .iter()
+                .any(|memory| matches!(memory.scope(), MemoryScope::Person(_))),
+            "群聊回合不得带上私聊记忆"
+        );
+        assert!(
+            !input
+                .open_loops
+                .iter()
+                .any(|open_loop| matches!(open_loop.owner(), OpenLoopOwner::Person(_))),
+            "群聊回合不得带上这个人名下的未完结线索"
+        );
+        assert!(
+            !input
+                .goals
+                .iter()
+                .any(|goal| matches!(goal.owner(), GoalOwner::Person(_))),
+            "群聊回合不得带上这个人名下的目标"
+        );
+        // 关系与情绪仍然要读：那是她自己的状态，群聊的语气档与静默门控靠它工作。
+        assert_eq!(
+            relations
+                .reads
+                .lock()
+                .expect("relation recorder lock")
+                .as_slice(),
+            &[person_id],
+            "群聊回合仍然要读关系（语气档与静默门控都用它）"
         );
     }
 
