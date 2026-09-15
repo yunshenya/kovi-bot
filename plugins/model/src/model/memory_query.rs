@@ -17,6 +17,52 @@ use serde_json::Value;
 use std::sync::Arc;
 use std::time::Duration;
 
+/// 一轮里最多执行多少个原生工具调用。
+///
+/// `tools.max_rounds` 只约束"来回几轮"，不约束单轮里上游一次返回多少个调用：
+/// 上游异常或被注入诱导时可能一次返回上百个 `group.message.send`，而它们会**全部**
+/// 真的执行（本轮里每个调用都发一条群消息）。这里给单轮设界，超出的部分回一条
+/// "没执行"，既保住 wire 里 tool_call 与 tool 结果的一一配对，也让模型自己拆分。
+const MAX_TOOL_CALLS_PER_ROUND: usize = 8;
+
+/// 本轮不执行的调用，以及为什么。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolCallRefusal {
+    /// 单轮条数超限：剩下的拆到后续轮次。
+    OverRoundBudget,
+    /// 本轮的长期记忆查询次数已经用完。
+    MemoryRoundsExhausted,
+}
+
+impl ToolCallRefusal {
+    fn message(self) -> String {
+        match self {
+            Self::OverRoundBudget => format!(
+                "本轮最多执行 {MAX_TOOL_CALLS_PER_ROUND} 个工具调用，这一条没有执行；请把剩下的调用拆到后续轮次。"
+            ),
+            Self::MemoryRoundsExhausted => {
+                "本轮长期记忆查询次数已用完，请使用已有资料回答。".to_string()
+            }
+        }
+    }
+}
+
+/// 这一轮里的第 `call_index` 个调用要不要真的执行。
+///
+/// 单轮上限先判：即使记忆配额还剩，也不该在一个响应里把上百个调用全放出去。
+fn refuse_tool_call(
+    call_index: usize,
+    tool_name: &str,
+    memory_rounds: u8,
+    max_memory_rounds: u8,
+) -> Option<ToolCallRefusal> {
+    if call_index >= MAX_TOOL_CALLS_PER_ROUND {
+        return Some(ToolCallRefusal::OverRoundBudget);
+    }
+    (tool_name == "memory.search" && memory_rounds >= max_memory_rounds)
+        .then_some(ToolCallRefusal::MemoryRoundsExhausted)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReminderCreateFailure {
     NotCalled,
@@ -264,14 +310,19 @@ pub(crate) async fn params_model_with_tool_access(
             );
             let mut executed: Vec<(String, ToolExecutionResult)> =
                 Vec::with_capacity(payload.tool_calls.len());
-            for call in &payload.tool_calls {
+            for (call_index, call) in payload.tool_calls.iter().enumerate() {
                 // Provider 返回的 wire 名（点号已转下划线）先反查回注册名；
                 // 未知名字原样交给执行层，让它以“未知工具”失败反馈给模型。
                 let tool_name = registry.resolve_wire_tool_name(&call.name);
-                let result = if tool_name == "memory.search" && memory_rounds >= max_memory_rounds {
+                // 每个 tool_call 都必须有一条配对的 tool 结果（否则下一次请求会因为
+                // "tool_calls 没有全部跟结果"被上游拒绝），所以超限的那些也要回一条
+                // 结果——回"没执行，请拆到下一轮"，而不是静默丢掉或照单全收。
+                let result = if let Some(refusal) =
+                    refuse_tool_call(call_index, &tool_name, memory_rounds, max_memory_rounds)
+                {
                     ToolExecutionResult {
                         succeeded: false,
-                        content: "本轮长期记忆查询次数已用完，请使用已有资料回答。".to_string(),
+                        content: refusal.message(),
                         reminder_failure_kind: None,
                     }
                 } else {
@@ -1008,11 +1059,11 @@ fn interrupted_response() -> BotMemory {
 #[cfg(test)]
 mod tests {
     use super::{
-        ContextPromptMode, ReminderCreateFailure, completed_group_followup_response,
-        completed_group_message_response, context_prompt_mode, interrupted_response,
-        likely_requires_tool_protocol, merge_group_send_result, reminder_failure_response,
-        required_group_followup_failure, required_group_message_failure,
-        tool_result_has_task_status, tool_round_limit,
+        ContextPromptMode, MAX_TOOL_CALLS_PER_ROUND, ReminderCreateFailure, ToolCallRefusal,
+        completed_group_followup_response, completed_group_message_response, context_prompt_mode,
+        interrupted_response, likely_requires_tool_protocol, merge_group_send_result,
+        refuse_tool_call, reminder_failure_response, required_group_followup_failure,
+        required_group_message_failure, tool_result_has_task_status, tool_round_limit,
     };
     use crate::model::MessageDestination;
     use crate::model::reply::parse_reply_output;
@@ -1232,6 +1283,46 @@ mod tests {
             reminder_failure_response(ReminderCreateFailure::Database, None)
                 .content
                 .contains("提醒服务暂时不可用")
+        );
+    }
+
+    #[test]
+    fn a_single_round_cannot_run_unbounded_tool_calls() {
+        // 上游异常或被注入诱导时，一次响应可能带回上百个调用——其中
+        // `group.message.send` 这类副作用工具会**全部**真的执行。单轮必须设界。
+        for index in 0..MAX_TOOL_CALLS_PER_ROUND {
+            assert_eq!(
+                refuse_tool_call(index, "group.message.send", 0, 2),
+                None,
+                "第 {index} 个调用仍在上限内"
+            );
+        }
+        assert_eq!(
+            refuse_tool_call(MAX_TOOL_CALLS_PER_ROUND, "group.message.send", 0, 2),
+            Some(ToolCallRefusal::OverRoundBudget),
+        );
+        assert_eq!(
+            refuse_tool_call(999, "memory.search", 0, 2),
+            Some(ToolCallRefusal::OverRoundBudget),
+            "超限优先于记忆配额"
+        );
+        // 记忆查询配额只在 memory.search 上生效，且用完之后仍给得出提示。
+        assert_eq!(
+            refuse_tool_call(0, "memory.search", 2, 2),
+            Some(ToolCallRefusal::MemoryRoundsExhausted)
+        );
+        assert_eq!(refuse_tool_call(0, "memory.search", 1, 2), None);
+        assert_eq!(
+            refuse_tool_call(0, "time.now", 2, 2),
+            None,
+            "配额只约束记忆查询"
+        );
+        let message = ToolCallRefusal::OverRoundBudget.message();
+        assert!(message.contains(&MAX_TOOL_CALLS_PER_ROUND.to_string()));
+        assert!(
+            ToolCallRefusal::MemoryRoundsExhausted
+                .message()
+                .contains("记忆查询")
         );
     }
 }
