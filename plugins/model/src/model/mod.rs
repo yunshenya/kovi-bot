@@ -80,7 +80,8 @@ pub(crate) use crate::model::group_context::{
 };
 
 pub(crate) use crate::model::private::{
-    private_message_event_after_ingress, sweep_private_window_queues,
+    private_message_event_after_ingress, record_private_target_experience,
+    sweep_private_window_queues,
 };
 pub(crate) use crate::model::recall::{
     core_turn_blocked_by_recall, is_recent_bot_message, recall_notice_event,

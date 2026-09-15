@@ -871,6 +871,31 @@ pub(crate) async fn private_message_event_after_ingress(
     drain_pending_private_messages(user_id, Arc::clone(&bot), reply_ticket).await;
 }
 
+/// 私聊版的相处证据：一条 1:1 的消息天然指向她，所以不需要"定向"这一步，
+/// 直接问一次模型。
+///
+/// 与群聊那条同样挂在**入站**（`lib.rs` 的私聊闭包）上，而不是挂在 Host 那条路：
+/// 普通私聊文本归 Core，挂在 Host 路上等于这条通道永远不生效。判定是后台任务，
+/// 不改变这一轮的去向，也不占回复延迟。
+pub(crate) fn record_private_target_experience(event: &kovi::event::PrivateMsgEvent) {
+    let enabled = crate::config::get()
+        .silence()
+        .relation_evidence_model_enabled();
+    let text = bounded_input(event.borrow_text().unwrap_or_default());
+    if !crate::relation_evidence::should_judge_private(&text, enabled) {
+        return;
+    }
+    let sender_label = event.get_sender_nickname();
+    crate::relation_evidence::spawn_private_judgement(
+        event.user_id,
+        crate::relation_evidence::EvidenceInput {
+            sender_label: &sender_label,
+            text: &text,
+            question: crate::relation_evidence::EvidenceQuestion::TowardHer,
+        },
+    );
+}
+
 /// 私聊侧同群聊：`QueuedNeedsDrain` 表示队列是没人管的残局（Core 链路收尾、
 /// panic、取消都可能把它落下），必须立刻排空，否则这条消息会一直躺在内存里
 /// 等到进程重启。

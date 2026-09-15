@@ -18,8 +18,8 @@ use crate::model::coalesce::{MessageCoalescer, MessagePart};
 use crate::model::{
     ConversationCoordinator, group_message_event_after_ingress,
     private_message_event_after_ingress, recall_notice_event, record_group_message_observation,
-    record_group_target_experience, should_suppress_core_group_message, sweep_group_window_queues,
-    sweep_private_window_queues,
+    record_group_target_experience, record_private_target_experience,
+    should_suppress_core_group_message, sweep_group_window_queues, sweep_private_window_queues,
 };
 use kovi::PluginBuilder;
 use std::path::{Path, PathBuf};
@@ -790,6 +790,11 @@ async fn main() {
                 println!("[INFO] 私聊数据删除屏障期间丢弃入站 (用户: {user_id})");
                 return;
             }
+            // 入站级副作用：与这一轮最后归 Host 还是归 Core 无关。普通私聊文本归
+            // Core，而 Core 那条路既不跑语义理解也没有相处证据通道，所以在入站这里
+            // 补一次判据——否则私聊（信号最强的那条路）对关系与情绪完全没有输入。
+            // 判定是后台任务：不改变消息去向，也不占这一轮延迟。
+            record_private_target_experience(&event);
             let (owner, admission) = select_message_owner_with_async_admission_policy(
                 core_supports_event,
                 || async move {
@@ -941,6 +946,19 @@ async fn main() {
                     // 不做任何回收动作。它是给自动回收攒判据的（阈值见 traffic.
                     // turn_stall_secs / turn_reclaim_secs），写成 0 即关闭。
                     let traffic = config::get().traffic().clone();
+                    // 硬性时长上限（默认关闭）：一轮活得太久就判死这一轮，把支配权交回去。
+                    // 它**不依赖影子档阈值**，判据是"活了多久"而不是"多久没推进"，
+                    // 所以放在最前面——超时的那一轮往往正是"每一步都慢慢动、整轮早就废了"，
+                    // 那种形态影子档不会报警。
+                    let deadline_secs = traffic.turn_deadline_secs();
+                    if deadline_secs > 0 {
+                        let reclaimed = model::waiting_room::reclaim_expired(deadline_secs).await;
+                        if reclaimed > 0 {
+                            println!(
+                                "[INFO] waiting room 超时回收完成：{reclaimed} 个回合超过 {deadline_secs} 秒上限被回收"
+                            );
+                        }
+                    }
                     let stall_secs = traffic.turn_stall_secs();
                     if stall_secs > 0 {
                         let stall_after = std::time::Duration::from_secs(stall_secs);

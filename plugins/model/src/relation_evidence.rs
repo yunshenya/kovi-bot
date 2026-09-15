@@ -120,6 +120,15 @@ pub(crate) fn should_judge(directed_to_her: bool, enabled: bool) -> bool {
     directed_to_her && enabled
 }
 
+/// 私聊那条通道要不要问一次模型：开关开着、且正文里有东西。
+///
+/// 与群聊的 [`should_judge`] 分开写是因为"定向"这一维在私聊里不存在——一条 1:1
+/// 的消息本来就是冲着她说的，不需要（也无法）再判一次。把两个判据分开，是为了让
+/// "私聊多了一个条件"这件事在类型上看得见，而不是靠调用方记得别传 true。
+pub(crate) fn should_judge_private(text: &str, enabled: bool) -> bool {
+    enabled && !text.trim().is_empty()
+}
+
 #[derive(serde::Deserialize)]
 struct RawJudgement {
     #[serde(default)]
@@ -238,6 +247,27 @@ fn truncate(value: &str) -> String {
     value.trim().chars().take(MAX_INPUT_CHARS).collect()
 }
 
+/// 私聊版：一条 1:1 的消息天然"指向她"，只记个人级关系证据。
+///
+/// 为什么需要单独一条：Core 接管普通私聊文本之后，私聊既不跑语义理解、也不经过
+/// 群聊那条相处证据通道（它挂在群聊入站闭包上），于是**私聊对关系与情绪完全
+/// 没有输入**——而私聊恰恰是信号最强的那条路。这里复用群里那套已经上线的判据
+/// （同一个 prompt、同一个模型、同一个折算刻度、同一个后台不阻塞的形态），
+/// 只是不写群级气氛（私聊没有"群"这一维）。
+///
+/// 群聊那两问都需要先判"这条是不是冲着她"；私聊不需要，所以问题固定是
+/// [`EvidenceQuestion::TowardHer`]。
+pub(crate) fn spawn_private_judgement(user_id: i64, input: EvidenceInput<'_>) {
+    let sender_label = input.sender_label.to_string();
+    let text = truncate(input.text);
+    kovi::tokio::spawn(async move {
+        let Some(judgement) = judge(EvidenceQuestion::TowardHer, &sender_label, &text).await else {
+            return;
+        };
+        record_personal_evidence(user_id, judgement).await;
+    });
+}
+
 /// 后台问一次模型并把结论记账，**不阻塞任何回复链路**。
 ///
 /// 超时上限是调用自己带的（`EVIDENCE_TIMEOUT`），所以哪怕模型端卡住，这个任务
@@ -353,6 +383,21 @@ async fn record_group_ambient_push_out(group_id: i64, user_id: i64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn private_judgement_needs_a_switch_and_some_text() {
+        // 私聊没有"定向"这一维（1:1 天然指向她），但另外两个条件仍在：
+        // 开关关着时不问，正文里没有东西时不问——空消息问一次模型是白花钱，
+        // 而且判据本身也无从下手。
+        assert!(should_judge_private("在吗", true));
+        assert!(!should_judge_private("在吗", false));
+        assert!(!should_judge_private("", true));
+        assert!(!should_judge_private("   \n\t ", true));
+        // 群聊那条判据不受影响：定向仍然是它的必要条件。
+        assert!(should_judge(true, true));
+        assert!(!should_judge(false, true));
+        assert!(!should_judge(true, false));
+    }
 
     #[test]
     fn only_unfriendly_and_warm_move_tension_and_only_above_the_confidence_floor() {
