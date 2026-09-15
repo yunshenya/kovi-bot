@@ -308,6 +308,8 @@
   async function goto(page) {
     const epoch = ++renderEpoch;
     if (page !== 'system') stopSystemRefresh();
+    // 概览页的自动刷新同理：离开就停，不在看不见的页面上白刷 /api/status。
+    if (page !== 'overview') stopOverviewRefresh();
     // 离开配置页就把滚动监听的引用放掉，别让它抱着已经摘下来的按钮。
     if (page !== 'config' && config.spyCleanup) {
       config.spyCleanup();
@@ -511,6 +513,101 @@
     ];
   }
 
+  // ───────────────────────────── 等待房间 ─────────────────────────────
+  //
+  // 概览页的「等待房间」：她有没有卡住，一眼就能看出来。
+  //
+  // 为什么单独做这一块：2026-09-15 那次群 641996763 静了十个多小时，journal 里只有
+  // "排队 N 次、排空 0 次"，没有任何一行能指出卡在哪一步——最后是重启才恢复的。
+  // 后端为此记了每个会话的队列深度、排空活性与"当前回合走到哪一步"，这里把它摊开。
+  //
+  // 两条硬约定：
+  //   1. **空闲时就一行字**（"空闲：没有排队，也没有在途回合"）。卡片长期占一大块
+  //      版面却什么都不说，会让人开始无视它，等真出事时也不看。
+  //   2. 消息正文只显示后端截好的 48 字摘要，且跟着"谁在等"一起展示——后台本来
+  //      就能读全部记忆与配置，这里不搬运全文。
+
+  /** 等待时长：秒级给秒，超过一分钟给"分+秒"，再长给"时+分"。戳在标题里给精确秒数。 */
+  function formatWait(seconds) {
+    if (seconds === null || seconds === undefined) return '—';
+    const total = Math.max(0, Math.round(Number(seconds) || 0));
+    if (total < 60) return `${total} 秒`;
+    if (total < 3600) return `${Math.floor(total / 60)} 分 ${total % 60} 秒`;
+    return `${Math.floor(total / 3600)} 时 ${Math.floor((total % 3600) / 60)} 分`;
+  }
+
+  /** "排队 3 · 最老 12 秒"这一行，也用于顶部提醒。 */
+  function waitingRoomSummary(info) {
+    const stuck = Number(info.stuck || 0);
+    const scopes = info.scopes || [];
+    const queued = scopes.reduce((sum, item) => sum + Number(item.queued || 0), 0);
+    if (stuck > 0) {
+      const worst = scopes.find((item) => item.stuck) || {};
+      return `${stuck} 个会话疑似卡住${worst.subject_id ? `（${worst.kind === 'group' ? '群' : ''}${worst.subject_id}）` : ''}`;
+    }
+    if (!scopes.length) return '空闲：没有排队，也没有在途回合';
+    if (queued > 0) return `${scopes.length} 个会话有在途活动 · 排队共 ${queued} 条`;
+    return `${scopes.length} 个会话正在生成回复`;
+  }
+
+  function waitingRoomCard(info) {
+    const scopes = info.scopes || [];
+    const stuck = Number(info.stuck || 0);
+    const idle = scopes.length === 0;
+    return h('div', { class: `card wait-card${stuck > 0 ? ' stalled' : ''}` },
+      h('div', { class: 'card-head' },
+        h('h3', { text: '等待房间' }),
+        h('span', {
+          class: `pill ${stuck > 0 ? 'bad' : (idle ? '' : 'ok')}`,
+          title: `静默超过 ${formatWait(info.stalled_after_secs)} 判为疑似卡住`,
+        }, h('span', { class: 'pill-text', text: stuck > 0 ? `${stuck} 个疑似卡住` : (idle ? '空闲' : '在跑') }))),
+      h('div', { class: 'wait-body' },
+        idle
+          ? h('div', { class: 'empty', text: waitingRoomSummary(info) })
+          : h('div', { class: 'wait-list' }, scopes.map(waitingRoomRow))),
+      h('div', { class: 'hint wait-foot' },
+        `静默超过 ${formatWait(info.stalled_after_secs)} 判为疑似卡住；空闲会话不列出。`));
+  }
+
+  /** 一行一个会话。字段与 `/api/status` 的 waiting_room 一一对应，不在这里二次推断。 */
+  function waitingRoomRow(item) {
+    const replied = item.reply || {};
+    const ticket = item.ticket || {};
+    const label = item.kind === 'group' ? '群' : (item.kind === 'private' ? '私聊' : (item.kind === 'call' ? '通话' : '任务'));
+    const stepText = item.turn_step ? `停在 ${item.turn_step}` : '';
+    // 详情放在 title 里：卡片要能一眼扫过，但出事时又必须查得到数字。
+    const detail = [
+      `静默 ${item.drain_last_progress_secs ?? '—'} 秒`,
+      `回合已 ${item.turn_waiting_secs ?? '—'} 秒`,
+      `当前步骤 ${stepText || '—'}`,
+      ticket.generation !== undefined ? `票据代数 ${ticket.generation}` : null,
+      `已生成未发出的回复 ${replied.prepared_outgoing ?? 0} 条`,
+      `待定入站 ${replied.pending_incoming ?? 0} · 活跃预留 ${replied.active_incoming ?? 0}`,
+    ].filter(Boolean).join(' · ');
+
+    return h('div', { class: `wait-row${item.stuck ? ' bad' : ''}`, title: detail },
+      h('div', { class: 'wait-who' },
+        h('span', { class: 'wait-kind', text: label }),
+        h('span', { class: 'wait-id mono', text: String(item.subject_id) }),
+        item.stuck ? null : h('span', { class: 'wait-state', text: item.drain_active ? '在跑' : '排队' })),
+      h('div', { class: 'wait-metrics' },
+        h('span', { class: 'wait-metric' },
+          h('span', { class: 'wait-metric-label', text: '排队' }),
+          h('span', { class: 'wait-metric-value mono', text: String(item.queued ?? 0) })),
+        h('span', { class: 'wait-metric' },
+          h('span', { class: 'wait-metric-label', text: '最老' }),
+          h('span', { class: 'wait-metric-value mono', text: formatWait(item.oldest_queued_secs) })),
+        h('span', { class: 'wait-metric' },
+          h('span', { class: 'wait-metric-label', text: '静默' }),
+          h('span', { class: 'wait-metric-value mono', text: formatWait(item.drain_last_progress_secs) })),
+        stepText ? h('span', { class: 'wait-step mono', text: stepText, title: `这一步已停 ${item.turn_step_secs ?? '—'} 秒` }) : null),
+      h('div', { class: 'wait-why' },
+        h('span', { text: item.stuck_reason || item.summary || '' }),
+        !item.stuck && item.oldest_sender
+          ? h('span', { class: 'wait-waiting', text: ` · ${item.oldest_sender}：${item.oldest_preview || ''}` })
+          : null));
+  }
+
   async function renderOverview() {
     const page = $('#page-overview');
     clear(page);
@@ -532,10 +629,13 @@
     clear(page);
 
     // 要人动手的事排在最前面：库连不上、模型没密钥、有改动等重启——这些都不该
-    // 埋在卡片里让人自己找。
-    for (const note of overviewNotices(status)) page.append(note);
+    // 埋在卡片里让人自己找。外面套一层，自动刷新时只动这一层。
+    const notices = h('div', { class: 'overview-notices' });
+    for (const note of overviewNotices(status)) notices.append(note);
+    if (notices.childElementCount) page.append(notices);
 
     page.append(runtimeCard(status));
+    page.append(waitingRoomCard(status.waiting_room || {}));
     page.append(memoryCard(status.counts || {}));
 
     const recent = await recentPromise;
@@ -553,6 +653,71 @@
         h('div', { class: 'card-head' }, h('h3', { text: '最近的记忆变化' }),
           h('button', { class: 'btn ghost small', text: '去记忆页', onclick: () => goto('memory') })),
         list)));
+
+    startOverviewRefresh();
+  }
+
+  /** 概览页的自动刷新：等待房间是"正在发生的事"，不刷就等于摆设。
+   *
+   *  为什么是 15 秒：后端每 30 秒扫一次等待房间（`traffic.window_drain_sweep_secs`
+   *  默认 30），比它更快只会白拉；而"卡住"的判定阈值是分钟级，晚十几秒发现不影响
+   *  处置。系统页每 5 秒是整块重绘（会打断阅读），这里**只换卡片**，别的卡片不动。
+   *
+   *  两个必须处理的边角：
+   *  1. 离开概览页时若还有在途请求，必须丢弃它的结果——否则它会把新鲜的
+   *     `overviewCache` 覆盖成旧的（"切走再切回来，数据反而变旧"）。
+   *  2. 同一时刻只允许一个刷新在途，慢请求不会叠成一串。 */
+  let overviewTimer = null;
+  let overviewInFlight = null;
+
+  function stopOverviewRefresh() {
+    if (overviewTimer !== null) {
+      clearInterval(overviewTimer);
+      overviewTimer = null;
+    }
+    // 让在途请求的返回值作废：它回来时会发现自己的票已经不是当前那张。
+    if (overviewInFlight !== null) overviewInFlight = null;
+  }
+
+  function startOverviewRefresh() {
+    stopOverviewRefresh();
+    overviewTimer = setInterval(async () => {
+      if (currentPage !== 'overview') {
+        stopOverviewRefresh();
+        return;
+      }
+      // 标签页在后台时不刷：没人看，白占 CPU 与网络。
+      if (document.hidden || overviewInFlight !== null) return;
+      const ticket = Date.now();
+      overviewInFlight = ticket;
+      try {
+        // 走 fetchStatus：它顺带刷新缓存，用户手点"刷新"或切走再切回时可以直接复用。
+        const fresh = await fetchStatus(0);
+        if (overviewInFlight !== ticket) return;
+        overviewInFlight = null;
+        updateWaitingRoomCard(fresh.waiting_room || {});
+      } catch (_) {
+        /* 自动刷新失败不打扰用户，下一轮再试 */
+        if (overviewInFlight === ticket) overviewInFlight = null;
+      }
+    }, 15000);
+  }
+
+  /** 原地替换那两张与等待房间有关的卡片。
+   *
+   *  找不到位置（用户正在别的页、页面还没画完）就什么都不做——**绝不整页重绘**：
+   *  那会把人正在看的记录列表与滚动位置一起冲掉。 */
+  function updateWaitingRoomCard(info) {
+    if (currentPage !== 'overview') return;
+    const page = $('#page-overview');
+    const live = page.querySelector('.wait-card');
+    if (live) live.replaceWith(waitingRoomCard(info));
+    const notices = page.querySelector('.overview-notices');
+    if (!notices) return;
+    for (const node of notices.querySelectorAll('[data-stall-notice]')) node.remove();
+    const stallNotice = overviewNotices({ waiting_room: info })
+      .find((node) => node.dataset.stallNotice !== undefined);
+    if (stallNotice) notices.prepend(stallNotice);
   }
 
   /** 需要动手的几件事，按"严重到不严重"排。没有就什么都不返回。 */
@@ -589,6 +754,25 @@
         `有 ${pending.length} 个分区的改动已保存，但要重启进程才生效：`,
         h('strong', { text: pending.join('、') }),
         '（按你的部署方式重启服务，例如 systemctl restart kovi-bot）。'));
+    }
+    // 卡住的会话排在最前：它意味着"群里有人说话、她一个字都没回"，是这几条里
+    // 唯一正在伤害用户的那条。判定口径与阈值由后端统一给，前端不自己算。
+    const room = status.waiting_room || {};
+    const stuckScopes = (room.scopes || []).filter((scope) => scope.stuck);
+    if (stuckScopes.length) {
+      const worst = stuckScopes[0];
+      const where = `${worst.kind === 'group' ? '群' : '会话'} ${worst.subject_id}`;
+      const note = h('div', { class: 'restart-note bad' },
+        icon('alert'),
+        h('strong', { text: `疑似卡住 ${stuckScopes.length} 个会话：` }),
+        `${where} 已静默 ${formatWait(worst.drain_last_progress_secs)}`,
+        worst.turn_step ? `，停在 ${worst.turn_step}` : '',
+        '——等待房间那一栏有完整数字；急着重启进程即可清空排队（',
+        h('code', { text: 'systemctl restart kovi-bot' }),
+        '）。');
+      // 打上标记：自动刷新时按它替换，不会误删"模型没密钥"那几条。
+      note.dataset.stallNotice = '1';
+      notes.unshift(note);
     }
     return notes;
   }
