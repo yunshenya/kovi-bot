@@ -3137,6 +3137,9 @@ fn native_calls_to_core_intents(
     intents
 }
 
+// 参数是多了一点（事件 + 注册表 + 投影 + 意图 + 票据 + 线索 + 两个门控），但每一项都在
+// 调用点就地可见，打包成结构体只是把同一批东西换个地方写；与 `SelfModel::new` 同一取舍。
+#[allow(clippy::too_many_arguments)]
 async fn register_core_tool_intents(
     registry: &HostToolTurnRegistry,
     input: &PlannerInput,
@@ -3145,18 +3148,24 @@ async fn register_core_tool_intents(
     ticket: ReplyTicket,
     interaction_cues: InteractionCues,
     source_message_id: Option<i32>,
+    sticker_only_turn: bool,
 ) -> Option<DecisionPlan> {
     if intents.is_empty() {
         return None;
     }
 
-    let read_only_only = matches!(
-        input.event.kind(),
-        WorldEventKind::ToolCompleted(tool) if tool.requires_follow_up
-    ) || matches!(
-        input.event.kind(),
-        WorldEventKind::ToolFailed(tool) if tool.requires_follow_up
-    );
+    // 只读收窄：工具跟进的回合本来就只给只读工具；普通可见回合里我们只下发了
+    // `sticker.list` 一个只读工具，同样必须按只读收窄——模型没有清单却报出一个写工具的
+    // 名字（幻觉）时，不能因为它"看起来在名单里"就真的执行。
+    let read_only_only = sticker_only_turn
+        || matches!(
+            input.event.kind(),
+            WorldEventKind::ToolCompleted(tool) if tool.requires_follow_up
+        )
+        || matches!(
+            input.event.kind(),
+            WorldEventKind::ToolFailed(tool) if tool.requires_follow_up
+        );
 
     let mut registered_keys: Vec<String> = Vec::with_capacity(intents.len());
     for (intent_index, intent) in intents.iter().enumerate() {
@@ -5936,9 +5945,14 @@ impl ModelBackend for KoviModelBackend {
                 .conversation_id()
                 .or_else(|| input.event.scope().conversation_id())
                 .map(ActionScope::Conversation);
+            // 普通可见回合现在也可能调用 `sticker.list`（见下面的 `sticker_only_specs`），
+            // 所以"在答哪条 QQ 消息"这条绑定不能再只认工具轮——工具跑完的那一轮要靠它把
+            // 回复绑回源消息。
+            let sticker_tool_may_be_offered =
+                message.is_some() && crate::sticker_library::is_available();
             let source_message_id = if allow_tool_call
                 && input.supports(ActionCapability::UseTool)
-                && (requested_tool_turn || tool_follow_up)
+                && (requested_tool_turn || tool_follow_up || sticker_tool_may_be_offered)
             {
                 self.source_message_id_for(input).await
             } else {
@@ -6337,6 +6351,30 @@ impl ModelBackend for KoviModelBackend {
                     );
                 }
             }
+            // 表情包：**普通可见回合也把 `sticker.list` 这一个工具带给她**。
+            //
+            // 为什么：发表情包是她随时可能做的动作，而工具原本只在"工具轮"下发
+            // （`tool_intent || tool_follow_up`），普通聊天轮里她手里根本没有这个工具——
+            // 提示词让她"要发就先调 sticker_list"，她调不到，只能凭印象编标签（线上
+            // 2026-09-15 02:15 的"猫猫歪头"、13:21 答应发一张相册里没有的图）。
+            //
+            // 为什么只带这一个：整套只读工具是每轮几百个 token，而这里要的只是"她想知道
+            // 自己有什么时查得到"。工具 schema 是固定大小，随素材库增长的是**清单**——那份
+            // 才是被移出提示词的东西（AGENTS.md 第 6 条：获取信息的入口属于允许常驻的三类）。
+            let sticker_only_specs = (route_decision.route == HostModelRoute::Strong
+                && !tool_protocol_authorized
+                && message.is_some())
+            .then(tool_registry)
+            .flatten()
+            .and_then(|registry| {
+                registry
+                    .sticker_tool_spec(&tool_context)
+                    .map(|spec| (registry, spec))
+            });
+            if let Some((registry, spec)) = sticker_only_specs.as_ref() {
+                native_tool_specs = Some(vec![spec.clone()]);
+                core_tool_registry = Some(registry.clone());
+            }
             // Place this trusted, host-derived constraint after the optional
             // route/tool instructions so the requested count cannot be
             // weakened by a lower-priority conversational guideline.
@@ -6521,6 +6559,34 @@ impl ModelBackend for KoviModelBackend {
                             None,
                         )
                         .await
+                    }
+                } else if let Some(tool_specs) = native_tool_specs.as_ref() {
+                    // 普通可见回合 + 只有 `sticker.list` 在手：保留这一档原有的语气上下文
+                    // （`generate_plain_style_context`），只是多带一个工具——她可以为发表情包
+                    // 查一次清单，不查就照常写正文。
+                    match ModelGateway::complete_with_native_tools_and_plain_style(
+                        &mut messages,
+                        &[],
+                        tool_specs,
+                        ticket,
+                        None,
+                        &vision_images,
+                        None,
+                    )
+                    .await
+                    {
+                        Some(ModelPayload {
+                            content,
+                            tool_calls,
+                            ..
+                        }) => {
+                            native_tool_calls = tool_calls;
+                            Some(BotMemory {
+                                role: Roles::Assistant,
+                                content,
+                            })
+                        }
+                        None => None,
                     }
                 } else if is_autonomous_conversation_tick(input) {
                     ModelGateway::complete_without_tools_with_plain_style_context_allow_empty(
@@ -6867,6 +6933,7 @@ impl ModelBackend for KoviModelBackend {
                             ticket,
                             parsed_response.interaction_cues,
                             source_message_id,
+                            sticker_only_specs.is_some(),
                         )
                         .await
                         else {
@@ -11719,6 +11786,7 @@ mod tests {
                 ticket,
                 InteractionCues::default(),
                 None,
+                false,
             )
             .await
             .expect("all tool intents should register");
@@ -11759,6 +11827,7 @@ mod tests {
                 ticket,
                 InteractionCues::default(),
                 None,
+                false,
             )
             .await;
             assert!(rollback.is_none());
@@ -11804,6 +11873,7 @@ mod tests {
                 ticket,
                 InteractionCues::default(),
                 None,
+                false,
             )
             .await;
             assert!(plan.is_none(), "the whole batch must be rejected");
@@ -12085,6 +12155,7 @@ mod tests {
                     ticket,
                     InteractionCues::default(),
                     None,
+                    false,
                 )
                 .await
                 .expect("tool follow-up intent should register");

@@ -7,7 +7,8 @@ use super::tool_access::{ToolExecutionContext, ToolExecutionResult, tool_registr
 use super::utils::{
     BotMemory, ModelPayload, Roles, assistant_tool_calls_wire, is_model_error_response,
     likely_requires_tool_protocol, params_model_with_native_tools,
-    params_model_with_plain_style_context, params_model_with_plain_style_context_allow_empty,
+    params_model_with_native_tools_and_plain_style, params_model_with_plain_style_context,
+    params_model_with_plain_style_context_allow_empty,
     params_model_with_token_limit_and_progress_for_reply, params_model_without_reply_guidance,
     plain_assistant_wire, system_wire, tool_result_wire, vision_failure_detail,
 };
@@ -963,6 +964,39 @@ pub(crate) async fn interruptible_model_call_with_native_tools(
     }
     kovi::tokio::select! {
         response = params_model_with_native_tools(
+            messages,
+            extra_wire,
+            tool_specs,
+            max_output_tokens,
+            vision_images,
+            progress,
+            Some(reply_ticket),
+        ) => {
+            is_current(reply_ticket).await.then_some(response)
+        }
+        () = wait_until_interrupted(reply_ticket) => None,
+    }
+}
+
+/// 原生工具 + 普通可见回合的语气上下文，可被新消息打断。
+///
+/// 与 [`interruptible_model_call_with_native_tools`] 的唯一区别是保留
+/// `params_model_with_native_tools_and_plain_style` 附上的语气参考——普通可见回合
+/// 本来就有它，加了工具也不该丢。
+pub(crate) async fn interruptible_model_call_with_native_tools_and_plain_style(
+    messages: &mut [BotMemory],
+    extra_wire: &[Value],
+    tool_specs: &[Value],
+    reply_ticket: ReplyTicket,
+    max_output_tokens: Option<u32>,
+    vision_images: &[VisionImage],
+    progress: Option<Arc<ThinkingReporter>>,
+) -> Option<ModelPayload> {
+    if !is_current(reply_ticket).await {
+        return None;
+    }
+    kovi::tokio::select! {
+        response = params_model_with_native_tools_and_plain_style(
             messages,
             extra_wire,
             tool_specs,

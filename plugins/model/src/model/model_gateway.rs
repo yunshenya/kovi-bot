@@ -3,6 +3,7 @@
 use super::interrupt::ReplyTicket;
 use super::memory_query::{
     interruptible_model_call, interruptible_model_call_with_native_tools,
+    interruptible_model_call_with_native_tools_and_plain_style,
     interruptible_model_call_with_plain_style_context,
     interruptible_model_call_with_plain_style_context_allow_empty,
     interruptible_model_call_without_reply_guidance, params_model_with_tool_access,
@@ -109,6 +110,31 @@ impl ModelGateway {
         params_model_with_tool_access(
             messages,
             tool_context,
+            reply_ticket,
+            max_output_tokens,
+            vision_images,
+            progress,
+        )
+        .await
+    }
+
+    /// 原生 function-calling + 普通可见回合的语气上下文。
+    ///
+    /// 用于"普通回复回合也要能调一个小工具"的场景（目前是 `sticker.list`）：调用方不必
+    /// 为了拿工具而放弃 `generate_plain_style_context` 那份语气参考。
+    pub(crate) async fn complete_with_native_tools_and_plain_style(
+        messages: &mut [BotMemory],
+        extra_wire: &[Value],
+        tool_specs: &[Value],
+        reply_ticket: ReplyTicket,
+        max_output_tokens: Option<u32>,
+        vision_images: &[VisionImage],
+        progress: Option<Arc<ThinkingReporter>>,
+    ) -> Option<ModelPayload> {
+        interruptible_model_call_with_native_tools_and_plain_style(
+            messages,
+            extra_wire,
+            tool_specs,
             reply_ticket,
             max_output_tokens,
             vision_images,

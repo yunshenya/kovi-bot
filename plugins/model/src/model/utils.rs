@@ -2232,6 +2232,58 @@ pub(crate) async fn params_model_with_native_tools(
     progress: Option<Arc<ThinkingReporter>>,
     reply_ticket: Option<ReplyTicket>,
 ) -> ModelPayload {
+    params_model_with_native_tools_mode(
+        messages,
+        extra_wire,
+        tool_specs,
+        max_tokens,
+        vision_images,
+        progress,
+        reply_ticket,
+        false,
+    )
+    .await
+}
+
+/// 原生工具 + 普通可见回合的语气上下文。
+///
+/// 普通可见回合一直走 `PlainStyleContext`：它会把 `generate_plain_style_context`
+/// （由心情/精力驱动的语气参考）作为最后一条 system 附上。为了给这样的回合加上
+/// `sticker.list`，不能改用不带语气上下文的那条路——那等于为了让一次工具调用可用而
+/// 把语气调丢了。所以这里保留语气上下文，只是多带工具。
+pub(crate) async fn params_model_with_native_tools_and_plain_style(
+    messages: &mut [BotMemory],
+    extra_wire: &[Value],
+    tool_specs: &[Value],
+    max_tokens: Option<u32>,
+    vision_images: &[VisionImage],
+    progress: Option<Arc<ThinkingReporter>>,
+    reply_ticket: Option<ReplyTicket>,
+) -> ModelPayload {
+    params_model_with_native_tools_mode(
+        messages,
+        extra_wire,
+        tool_specs,
+        max_tokens,
+        vision_images,
+        progress,
+        reply_ticket,
+        true,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn params_model_with_native_tools_mode(
+    messages: &mut [BotMemory],
+    extra_wire: &[Value],
+    tool_specs: &[Value],
+    max_tokens: Option<u32>,
+    vision_images: &[VisionImage],
+    progress: Option<Arc<ThinkingReporter>>,
+    reply_ticket: Option<ReplyTicket>,
+    with_plain_style: bool,
+) -> ModelPayload {
     let config = config::get();
     let server_config = config.server_config();
     if !server_config.enabled() {
@@ -2242,6 +2294,12 @@ pub(crate) async fn params_model_with_native_tools(
     }
 
     let mut request_messages = messages.to_owned();
+    if with_plain_style {
+        request_messages.push(BotMemory {
+            role: Roles::System,
+            content: generate_plain_style_context(&request_messages).await,
+        });
+    }
     if progress.is_some() {
         request_messages.push(BotMemory {
             role: Roles::System,

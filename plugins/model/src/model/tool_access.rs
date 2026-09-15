@@ -1086,41 +1086,77 @@ impl ToolRegistry {
         self.definitions
             .iter()
             .filter(|definition| {
-                if read_only_only && !definition.source.read_only() {
-                    return false;
-                }
-                if tool_context.scheduled && !definition.source.available_for_scheduled() {
-                    return false;
-                }
-                if definition.source.needs_sticker_teaching_context()
-                    && tool_context.sticker_teaching.is_none()
-                {
-                    return false;
-                }
-                if definition.source.needs_sticker_library() && !sticker_available {
-                    return false;
-                }
-                if definition.source.admin_only() && !tool_context.is_admin {
-                    return false;
-                }
-                if definition.source.main_admin_only() && !tool_context.is_main_admin {
-                    return false;
-                }
-                definition
-                    .source
-                    .available_for_context(tool_context.destination, tool_context.group_paused)
+                self.definition_usable(definition, tool_context, read_only_only, sticker_available)
             })
-            .map(|definition| {
-                json!({
-                    "type": "function",
-                    "function": {
-                        "name": wire_tool_name(&definition.name),
-                        "description": definition.description,
-                        "parameters": definition.input_schema,
-                    }
-                })
-            })
+            .map(Self::definition_spec)
             .collect()
+    }
+
+    /// 只取 `sticker.list` 一个工具的 spec。
+    ///
+    /// 为什么要单独取一个：发表情包是她**随时可能做**的动作，而工具原本只在"工具轮"
+    /// （`tool_intent || tool_follow_up`）下发，于是普通聊天轮里她手里根本没有这个工具
+    /// ——提示词让她"要发就先调 sticker_list"，她却调不到，只能凭印象编标签（线上
+    /// 2026-09-15 02:15 的"猫猫歪头"、13:21 答应发一张相册里没有的图，都是这么来的）。
+    ///
+    /// 只带这一个而不是整套只读工具：那是每轮几百个 token，而这里要的只是"她想知道自己
+    /// 有什么时查得到"。工具 schema 是固定大小，随素材库增长的是**清单**——那份才是被
+    /// 移出提示词的东西（AGENTS.md 第 6 条：获取信息的入口属于允许常驻的三类之一）。
+    pub(crate) fn sticker_tool_spec(&self, tool_context: &ToolExecutionContext) -> Option<Value> {
+        let sticker_available = crate::sticker_library::is_available();
+        if !sticker_available {
+            return None;
+        }
+        self.definitions
+            .iter()
+            .find(|definition| {
+                definition.source.needs_sticker_library()
+                    && self.definition_usable(definition, tool_context, false, sticker_available)
+            })
+            .map(Self::definition_spec)
+    }
+
+    fn definition_usable(
+        &self,
+        definition: &ToolDefinition,
+        tool_context: &ToolExecutionContext,
+        read_only_only: bool,
+        sticker_available: bool,
+    ) -> bool {
+        if read_only_only && !definition.source.read_only() {
+            return false;
+        }
+        if tool_context.scheduled && !definition.source.available_for_scheduled() {
+            return false;
+        }
+        if definition.source.needs_sticker_teaching_context()
+            && tool_context.sticker_teaching.is_none()
+        {
+            return false;
+        }
+        if definition.source.needs_sticker_library() && !sticker_available {
+            return false;
+        }
+        if definition.source.admin_only() && !tool_context.is_admin {
+            return false;
+        }
+        if definition.source.main_admin_only() && !tool_context.is_main_admin {
+            return false;
+        }
+        definition
+            .source
+            .available_for_context(tool_context.destination, tool_context.group_paused)
+    }
+
+    fn definition_spec(definition: &ToolDefinition) -> Value {
+        json!({
+            "type": "function",
+            "function": {
+                "name": wire_tool_name(&definition.name),
+                "description": definition.description,
+                "parameters": definition.input_schema,
+            }
+        })
     }
 
     /// Reverse-map a provider wire tool name back to the registered tool name
@@ -4022,6 +4058,76 @@ mod tests {
 
         let empty = sticker_list_reply(None);
         assert!(empty.contains("空的"), "{empty}");
+    }
+
+    /// 普通可见回合只带 `sticker.list` 一个工具。
+    ///
+    /// 为什么要它：工具原本只在"工具轮"（`tool_intent || tool_follow_up`）下发，普通聊天
+    /// 轮里她手里根本没有这个工具——提示词让她"要发就先调 sticker_list"，她调不到，只能
+    /// 凭印象编标签（线上 2026-09-15 02:15 的"猫猫歪头"）。这条测试钉住"单取一个工具"
+    /// 的入口存在，且**只**给这一个（整套只读工具是每轮几百个 token）。
+    #[test]
+    fn plain_turns_can_be_offered_the_sticker_tool_alone() {
+        let registry = ToolRegistry {
+            definitions: vec![
+                ToolDefinition {
+                    name: "sticker.list".to_string(),
+                    description: "list stickers".to_string(),
+                    input_schema: json!({"type": "object"}),
+                    source: ToolSource::Builtin(BuiltinTool::StickerList),
+                },
+                ToolDefinition {
+                    name: "time.now".to_string(),
+                    description: "current time".to_string(),
+                    input_schema: json!({"type": "object"}),
+                    source: ToolSource::Builtin(BuiltinTool::TimeNow),
+                },
+                ToolDefinition {
+                    name: "group.pause".to_string(),
+                    description: "pause".to_string(),
+                    input_schema: json!({"type": "object"}),
+                    source: ToolSource::Builtin(BuiltinTool::GroupPause),
+                },
+            ],
+            timeout: Duration::from_secs(1),
+            max_result_chars: 1_000,
+        };
+        let context = test_tool_context();
+
+        let spec = registry.sticker_tool_spec(&context);
+        assert_eq!(
+            spec.is_some(),
+            crate::sticker_library::is_available(),
+            "单取工具是否可用必须与素材库可用性一致"
+        );
+        if let Some(spec) = spec {
+            assert_eq!(
+                spec.pointer("/function/name").and_then(Value::as_str),
+                Some("sticker_list"),
+                "给出去的必须是模型能调的那个名字"
+            );
+            // 写工具绝不能跟着混进来：她手里只该有这一个只读工具。
+            assert!(
+                !spec
+                    .pointer("/function/name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| name == "group_pause"),
+                "普通回合不该拿到写工具"
+            );
+        }
+
+        // 没有这个工具的 registry（例如配置关掉了素材库）不该凭空造一个出来。
+        let bare = ToolRegistry {
+            definitions: vec![ToolDefinition {
+                name: "time.now".to_string(),
+                description: "current time".to_string(),
+                input_schema: json!({"type": "object"}),
+                source: ToolSource::Builtin(BuiltinTool::TimeNow),
+            }],
+            timeout: Duration::from_secs(1),
+            max_result_chars: 1_000,
+        };
+        assert!(bare.sticker_tool_spec(&context).is_none());
     }
 
     /// `sticker.list` 只在素材库里真有素材时才随请求下发：多一个用不上的 schema
