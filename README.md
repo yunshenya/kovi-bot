@@ -1,7 +1,33 @@
 # kovi-bot
 
-一个使用 Rust 和 Kovi 编写的 QQ 聊天机器人。它支持群聊/私聊、兼容 OpenAI
-Responses 或 Chat Completions 的模型服务、长期记忆、情绪与用户档案，以及可配置的随机主动消息推送。
+芸汐：一个用 Rust 写的**平台无关认知 Agent**，以及它的第一个宿主——Kovi + OneBot 11 的
+QQ 机器人。她支持群聊/私聊、兼容 OpenAI Responses 或 Chat Completions 的模型服务、长期记忆、
+情绪与用户档案、关系、可配置的主动消息推送，以及受限工具的自主调用。
+
+**结构**：`crates/yunxi-core` 是她本身——身份、记忆、关系、情绪、注意力、目标、工作记忆、
+计划与动作边界，不依赖 Kovi、OneBot、QQ 或任何具体存储；`plugins/model` 是 QQ 宿主/适配器；
+`apps/yunxi-cli` 是一个 Fake Host，用来离线验证边界。换掉 QQ 不该要求重写她。
+
+- 她**拥有自己的认知循环**（怎么走一步、这一步为了什么、试过什么、等到哪一步为止、
+  在什么信任档位下可以动手），宿主只声明能力并执行——
+  [**Core 拥有什么：边界与理由**](docs/yunxi-core-boundary.md)。
+- Core 应该是什么、分几个阶段： [`docs/yunxi-core-architecture.md`](docs/yunxi-core-architecture.md)。
+
+## 文档地图
+
+| 想了解 | 读这个 |
+| --- | --- |
+| 边界切在哪、每条规则为什么这么定 | [`docs/yunxi-core-boundary.md`](docs/yunxi-core-boundary.md) |
+| Core 的需求、阶段与完成度 | [`docs/yunxi-core-architecture.md`](docs/yunxi-core-architecture.md) |
+| 环境如何向 Agent 发布上下文与动作空间 | [`docs/yunxi-affordance-cognitive-io-v8.md`](docs/yunxi-affordance-cognitive-io-v8.md) |
+| 全部配置项与逐条说明 | [`bot.conf.example.toml`](bot.conf.example.toml)（唯一权威，此处不再重复） |
+| 管理后台每一页能做什么 | [`docs/admin-dashboard.md`](docs/admin-dashboard.md) |
+| 提醒与定时任务 | [`docs/reminders.md`](docs/reminders.md) |
+| 持续 Agent Run | [`docs/agent-runs.md`](docs/agent-runs.md) |
+| 语音通话 | [`docs/qq-call.md`](docs/qq-call.md) |
+| 唱歌 | [`docs/qq-singing.md`](docs/qq-singing.md) |
+| 数据与隐私 | [`docs/privacy.md`](docs/privacy.md) |
+| 部署手册 | [`.github/deploy/README.md`](.github/deploy/README.md) |
 
 ## 配置与运行
 
@@ -159,109 +185,23 @@ ssh-copy-id -p 22 ubuntu@<服务器>   # 首次：装本机公钥，之后免密
 
 ## 管理后台（配置 + 记忆）
 
-芸汐自带一个 Web 管理后台，和进程一起启动，默认只监听回环地址的 `6098` 端口（NapCat 的
-WebUI 占用 6099，两个不要混）：
+随进程一起启动的 Web 控制面，默认只监听回环地址的 `6098` 端口（NapCat 的 WebUI 占 6099，
+两个不要混）。服务器上跑时先做端口转发，再打开 <http://127.0.0.1:6098/>：
 
 ```bash
-ssh -L 6098:127.0.0.1:6098 -p 22 ubuntu@<服务器>   # 服务器上跑时先做端口转发
-# 打开 http://127.0.0.1:6098/
+ssh -L 6098:127.0.0.1:6098 -p 22 ubuntu@<服务器>
 ```
 
 **登录必须带 Token**。解析顺序是 `admin.token` → `admin.token_env` 指向的环境变量 →
-运行时目录已有的 `.yunxi-admin-token` → 首次启动现场生成。生成的那份会写进运行时目录
-（权限 600）并在启动日志里打印一次，所以默认开箱可用；想固定下来就在 `.env` 里设
-`YUNXI_ADMIN_TOKEN`。浏览器用一次性挑战（`sha256(nonce + ":" + token)`）提交，原始 Token
-不上网；脚本可以直接带 `Authorization: Bearer <token>`，或用一次性链接
-`http://127.0.0.1:6098/?token=<token>`（可加 `&page=config|memory` 直接落到某页，命中后立刻
-跳转到不含 Token 的地址）。
+运行时目录已有的 `.yunxi-admin-token` → 首次启动现场生成（写进运行时目录、权限 600，并在
+启动日志里打印一次，所以默认开箱可用）。浏览器用一次性挑战提交，原始 Token 不上网；脚本可以
+带 `Authorization: Bearer <token>`，或用一次性链接 `http://127.0.0.1:6098/?token=<token>`。
 
-页面上有七块——概览 / 配置 / 记忆 / 模型 / 表情包 / 标注 / 系统（设计参考与出处见
-[管理后台 UI 参考报告](docs/admin-dashboard-ui-reference.md)）：
+七块页面——概览 / 配置 / 记忆 / 模型 / 表情包 / 标注 / 系统——的逐页说明、移动端行为和
+运行时覆盖配置 `bot.conf.override.toml` 的规则见
+[**管理后台：配置与记忆**](docs/admin-dashboard.md)。
 
-手机也能用（<760px 一档断点，不额外维护一套界面）：侧栏收成一列图标，卡片与表单改成
-单列，记忆页的表格摊成一张张卡片（表头收掉，靠每格的 `data-label` 报列名），标注页把
-样本详情排到队列前面、统计与队列分布折进一行可展开的标题，配置页把几个配置文件压成
-一条横向滑动的条、分区导航折起来（窄屏靠搜索与「全部展开」找分区）。宽屏与平板不受影响。
-
-- **概览**：分三块回答"她还好吗 / 她记得什么 / 她怎么说话"——**运行状态**（芸汐进程时长、
-  进程内存、机器开机时长，以及 PostgreSQL / Redis 的状态点、配置文件与后台会话）、**记忆规模**
-  （长期记忆 / 情节 / 人物 / 目标 / 未完结线索，脚注写清总数由哪几档构成）、**模型与能力**
-  （当前模型、密钥来源，加上主动消息 / 群聊接话 / 工具 / 实时通话 / 语音 / 唱歌 / 图片理解 /
-  表情包的一排开关）。要人动手的事排在页面最前面：PostgreSQL 挂了是红，Redis 挂了、模型没
-  密钥、有改动等重启都是琥珀。
-- **配置**：展示 `bot.conf.toml` 的**全部参数**（含没写进文件的默认值，带"默认值"标记）以及
-  `kovi.conf.toml`、`kovi.plugin.toml`。保存前先用同一份 `validate()` 校验，失败就原样退回；
-  保存时按字段写回并**保留注释**，每次改动前自动备份、可一键回滚。搜索框常驻在内容区顶部
-  （按 `/` 聚焦，`Esc` 清空，右侧实时报"命中几个分区 / 几个参数"），左栏分区导航跟随正文
-  高亮，改过的字段会高亮并把「保存并应用」钉在工具行下面，翻到第几个分区都够得到。分区说明
-  和字段说明由
-  [`tools/admin-docs/extract_config_docs.py`](tools/admin-docs/extract_config_docs.py) 从源码
-  文档注释与 `bot.conf.example.toml` 机械提取，代码改了重新跑脚本即可，不需要手工维护两份文案。
-- **记忆**：按 Hindsight 的记忆页做——顶部是**本周用量卡**（保存 / 召回 / 反思 / 心智模型 /
-  模型调用，单位 tokens 或 calls，带"对比上周"）和统计卡（总数 / 本周新增 / 人物 / 情节 /
-  目标 / 未完结线索 / 存储）、常驻筛选行（回车检索 + 标签筛选 + 刷新），下面是三个
-  可切换的视图，覆盖长期记忆、旧版记忆、Mind 的情节/信念/偏好/兴趣/好奇/未解问题/议程、
-  目标、未完结线索、梗账本、档案与会话摘要：
-  - **星座图**：画布渲染的记忆地图——节点是记忆（按提及时间着色，冷→暖），连线是它们之间
-    真实存在的关系：语义（共享标签）、时序（时间相邻）、实体（同一人/群）、因果（payload
-    里直接引用了另一条记录的 id）。四类边可以单独开关，悬停高亮邻居，点击进详情。
-  - **表格**：记忆 / 实体 / 标签 / 发生时间 / 提及时间五列，实体是彩色 chip（取色算法与
-    Hindsight 一致：31 进制哈希取模五色调色板），每页 100 条带页码导航。
-  - **时间线**：按年/月/周/日分组缩放 + 分组跳转，左侧日期轴 + 右侧卡片。
-
-  另有**人物页**（QQ 身份 + 关系五维 + 情绪 + 相关记录）。卡片上的记忆条数是"库里关于这个
-  人有多少条私有记忆"，因此同时数 Memory v2 的 person 作用域与旧版 `kovi_bot_memories` 里
-  `scope_type = 'private'` 的行（按这个人的 QQ 身份归属）：聊天的记忆写入目前仍在旧表，
-  只数 v2 会让这个数字恒为 0。群记忆不属于任何个人（它的 subject 是群号），不计入。
-  这一列说的是"记了多少"，不是"能召回多少"——Core 的召回按 context 前缀取
-  （`private_chat`），旧格式 `private` 的记忆不会被带进上下文，但仍计入这里。
-  视图可深链接：`#/memory/table`、`#/memory/timeline`、`#/memory/constellation`、
-  `#/memory/people`。
-
-- **标注**：TurnGate 待复核样本的网页端（设计文档 §7.4 B）。左边是按"标注价值"排的队列
-  （tier / 上下文条数 / 排序理由），右边是单条详情——当前句、前一句、最近几轮（按**群友**
-  着色：芸汐 / 群友A / 群友B、C…）、弱标签与来源；点按钮或按快捷键打标（`1/2/3` 选
-  completion，`a/c/k/i/w/0` 选 response，`Enter` 保存并下一条，`S` 跳过），顶部是这批的
-  进度、队列覆盖率、**队列的 tier 分布与每档含义**（tier 是标注价值、越小越先标，不是
-  等级——首屏全是 tier 0 正是因为它排在最前，整批还剩多少灰区一眼可见）与「导出训练集」。
-  列表一次最多列 500 条待标样本，但已标注的会离开队列，后面的 tier 会自己浮上来。
-  它和终端里的 `tools/turngate/review.py` 读写**同一份
-  JSONL、同一套语义**（同一个"标注价值"队列、同样的 `human_consensus` 标注块、导出同样
-  剥掉 `review_status` 与 `source_key`），所以两个入口可以换着用——但同一时刻只用一个：
-  文件被别处改动时接口返回 409，页面会要求刷新后重来，而不是把对方的改动盖掉。
-
-  上下文里的**群友编号**来自采集器（`tools/turngate/collector.py`，字段名是 `speaker`）：
-  `a` 恒为当前发言者（正文与"前一句"都属于他），`b`/`c`/… 按出现顺序给同一段上下文里的
-  其他群友，每人一色。编号是**样本内匿名**的，只回答"这几条是不是同一个人"，不含 QQ 号或
-  昵称——没有它，几个其他人都显示成"他人"，标注时看不出是"一个人连说三条"还是"三个人在
-  互相接话"。采于该字段之前的批次（2026-09-13 前）没有群友编号：上下文照旧显示
-  "同一人/他人"，此时**正文框不写"群友A"**（否则同一个人会同时叫"群友A"和"同一人"，
-  看着像两个人），页面另有一行"群友未记录"说明原因。
-
-  批次目录来自 `admin.annotation_dir`（默认运行时目录下的 `turngate/`，即生产上的
-  `/home/ubuntu/kovi-bot/runtime/turngate/`，后台启动时自动创建——`current/` 是只读发布
-  目录，写不进去；建不出来时页面会把原因显示出来）。
-  采于「@ 判定」修复之前的批次里，`addressed_to_agent` 分不出"@ 她"还是"@ 别人"，这类样本
-  默认不进队列（可用开关放回来），免得把旧判定人工确认一遍再喂进权重。
-
-- **系统**：主机与进程的实时面板——身份卡（登录号、在线状态）、运行环境（版本 / 部署
-  revision / 操作系统 / 内核 / 架构 / 主机名 / 系统与进程运行时长 / 工作目录）、CPU 与内存
-  （环形仪表盘 + 本进程占用 + 交换区）、磁盘用量、累计网络流量、模型路由，以及从 OneBot
-  服务端问来的实现与版本（NapCat 版本就在这一块）。停留时每 5 秒自动刷新，离开即停；
-  OneBot 信息带 60 秒缓存与 3 秒超时，对端不可达时只显示这一块未知，不影响主机数据。
-
-  用量数字来自按日累计表 `yunxi_metrics_daily`（见[数据与隐私说明](docs/privacy.md)）：事件发生时
-  只加内存计数器，每 30 秒或读数前落库一次，所以一次聊天里写十条记忆只产生一次入库；
-  读的时候按"最近 7 天 / 前 7 天"聚合，周环比因此是真的。token 数是按中文一字≈一 token、
-  ASCII 四字符≈一 token 估算的（界面上标了"估算"），不是 provider 返回的精确用量。
-
-生产环境的 `current/` 是只读发布目录，网页上的改动写不进去也不该写进去。后台为此多了一层
-**运行时覆盖配置** `bot.conf.override.toml`（放在 `KOVI_READY_FILE` 所在的运行时目录，
-`YUNXI_CONFIG_OVERRIDE` 可改路径）：它叠在主配置之上、同名参数以它为准，发布新版本不会把它
-冲掉，保存后立即热加载。`tools` / `model.intrinsic` / `model.fallback` / `model.turn_gate` /
-`admin` 这几段是启动时一次性读进常驻结构的，改完需要重启进程，页面上会明确标出来。
-
-后台等同于机器人自身的控制面，因此默认拒绝监听非回环地址；确实需要远程访问时设置
+后台等同于机器人自身的控制面，默认拒绝监听非回环地址；确实需要远程访问时设置
 `admin.allow_non_loopback = true`，并只暴露在受控私网、VPN 或反向代理之后。
 
 ## GitHub Actions
@@ -285,168 +225,9 @@ readiness 文件。二进制、配置与环境变量会作为一个整体原子�
 
 模型与随机推送的配置示例：
 
-```toml
-[identity]
-# canonical Yunxi PersonId；配置后优先使用该 Person 的唯一 QQ 路由
-# owner_person_id = "00000000-0000-0000-0000-000000000000"
-
-[server_config]
-url = "https://api.example.com/v1/chat/completions"
-model_name = "your-model-name"
-# 结构化回复动作与注册表工具都走原生 function-calling，只在 chat_completions 上有实现
-wire_api = "chat_completions"
-supports_vision = true
-api_key_env = "OPENAI_API_KEY"
-requires_auth = true
-actor_authorization = ""
-thinking_mode = "auto" # auto 或 disabled；DeepSeek v4 建议 disabled
-max_output_tokens = 1200
-request_timeout_secs = 60
-max_retries = 2
-
-[proactive]
-enabled = true
-check_interval_secs = 300
-inactivity_threshold_secs = 7200
-cooldown_secs = 7200
-push_probability_percent = 35
-# main_admin 可选，只应写在未跟踪的运行时配置中
-main_admin_decision_interval_secs = 10800
-# 群聊的"在场"要求：窗口内有人说话、且真人消息不少于这个条数时才开口
-# （随机主动消息与自主续聊共用；不含她自己发的）
-group_activity_window_secs = 300
-group_activity_min_messages = 2
-# Neuro-sama 风格自主会话（宿主状态机结合语境和已发送结果决定是否继续，模型只生成候选正文）
-autonomous_conversation_enabled = true
-autonomous_conversation_check_interval_secs = 3
-autonomous_conversation_idle_secs = 5
-autonomous_conversation_cooldown_secs = 3
-autonomous_conversation_group_idle_secs = 45
-autonomous_conversation_group_cooldown_secs = 15
-# Legacy compatibility field; retained for config compatibility, not read by the loop.
-autonomous_conversation_group_max_turns = 1
-# 单条入站消息之后最多连续多少次自主续聊（新入站归零计数，私聊与群聊通用）。
-# 这是有界"想接话"的硬上限，防止把一次聊天刷成无上限的高潮并烧掉大量 token。
-autonomous_conversation_max_turns = 6
-# 私聊连续回合由宿主根据对话状态处理；模型只生成当前回合的自然正文。
-
-[traffic]
-enabled = true
-window_secs = 60
-per_user_limit = 20
-global_limit = 300
-cooldown_secs = 120
-max_pending_turns = 16
-max_input_chars = 6000
-max_model_response_bytes = 2097152
-max_model_queue = 64
-model_queue_timeout_secs = 15
-
-[group_interjection]
-enabled = true
-min_eligible_messages = 8
-cooldown_secs = 180
-response_probability_percent = 35
-min_message_chars = 5
-direct_spam_cooldown_secs = 600
-direct_rate_window_secs = 60
-direct_rate_limit = 4
-
-[memory]
-max_entries = 1000
-retention_days = 30
-episode_retention_days = 365
-episode_max_per_scope = 128
-episode_protected_salience = 0.7
-max_conversation_messages = 25
-max_conversation_tokens = 6000
-contextual_memory_limit = 5
-maintenance_interval_secs = 86400
-summary_keep_recent_messages = 15
-summary_max_chars = 1500
-autonomous_query_enabled = true
-autonomous_query_max_rounds = 2
-autonomous_query_max_results = 8
-autonomous_query_max_days = 3650
-
-[tools]
-enabled = true
-max_rounds = 2
-timeout_secs = 15
-max_result_chars = 12000
-web_search_enabled = true
-web_fetch_enabled = true
-web_search_max_results = 5
-web_fetch_max_chars = 12000
-
-[agent_runs]
-enabled = true
-recovery_scan_secs = 30       # 跨进程恢复兜底；进程内创建会立即唤醒
-lease_secs = 60
-request_timeout_secs = 15
-min_interval_secs = 5
-max_interval_secs = 86400
-default_interval_secs = 30
-default_stop_after_minutes = 1440
-max_stop_after_minutes = 10080
-default_max_executions = 20000
-max_executions_per_run = 100000
-max_active_per_user = 10
-max_active_total = 100
-max_consecutive_failures = 5
-max_response_bytes = 524288
-max_body_preview_chars = 2000
-max_notification_chars = 500
-claim_batch_size = 16
-
-[agent_tasks]
-enabled = true
-poll_interval_secs = 5
-max_collect_minutes = 120
-default_collect_minutes = 10
-max_active_per_actor = 20
-max_active_total = 200
-max_events_per_task = 200
-min_valid_replies = 2
-quiet_period_secs = 45
-max_event_chars = 500
-max_report_chars = 3000
-lease_secs = 180
-
-[vision]
-provider = "auto"              # auto、builtin 或 mcp
-mcp_server = ""                # 对应 tools.mcp_servers.name
-mcp_tool = "analyze_image"     # MCP 工具名
-timeout_secs = 60
-
-# MCP 服务默认不配置。只有明确列入 allowed_tools 的工具才会暴露给芸汐。
-# [[tools.mcp_servers]]
-# name = "notes"
-# command = "/usr/local/bin/your-read-only-mcp-server"
-# args = ["--stdio"]
-# cwd = "/home/ubuntu/kovi-bot"
-# inherit_env = ["NOTES_API_TOKEN"]
-# allowed_tools = ["search_notes", "read_note", "analyze_image"]
-# read_only = true
-
-[message_batch]
-enabled = true
-complete_delay_ms = 900
-normal_delay_ms = 1600
-incomplete_delay_ms = 2300
-max_wait_ms = 5000
-max_parts = 6
-max_chars = 500
-
-[mood]
-cache_ttl_secs = 300
-cache_retention_secs = 3600
-natural_drift_after_secs = 7200
-natural_drift_check_secs = 1800
-
-[topic]
-recent_topic_cooldown_secs = 604800
-```
+完整的配置项与逐条说明见 [`bot.conf.example.toml`](bot.conf.example.toml)：它是唯一
+权威的配置参考，README 不再重复一份（重复的那份曾经比它少 20 个 section，包括
+`[agent_runs]` 与 `[agent_tasks]`，读到的人会以为那就是全部）。
 
 机器人会从最近活跃的群组和真正私聊过的用户中随机选择接收方，再结合情绪、能量、时间、群组话题和用户兴趣选择内容。冷却时间、空闲阈值、发送概率、目标冷却和每日上限共同避免刷屏。主动消息的决策时间、最后发送时间和每日计数单独写入 PostgreSQL 的 `kovi_bot_proactive_state`，不受普通记忆容量清理影响；服务重启后也不会重新触发一轮主动消息。长期记忆、用户档案、群组档案、滚动摘要和人格分别写入 PostgreSQL 分表，不再为每次变化重写整份 JSONB；默认最多保留 1000 条长期记忆明细，后台任务会定期去重并清理 30 天前的低重要性记录。Mind Episode 情节记忆使用独立策略：默认保留 365 天、每个作用域最多 128 条已知状态记录，保护项按优先级保留；当已知状态仍超过上限时，会从价值最低的记录开始淘汰（必要时也包括保护项）。未知状态不参与淘汰并始终保留。超过保留期未活跃的用户/群档案及其摘要也会清理；高重要性记忆不按年龄清理，但仍受各自容量策略约束，人格和表情标签则需显式删除。完整的数据范围、外部传输和删除边界见[数据与隐私说明](docs/privacy.md)。首次升级时会自动从旧 `kovi_bot_memory` JSONB 快照（或运行目录的 `bot_memory.json`）迁移，原数据保留作为兼容备份。
 

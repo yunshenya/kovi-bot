@@ -496,6 +496,48 @@ lease_secs = 180
 max_task_instruction_chars = 2000
 max_task_output_chars = 4000
 
+[agent_runs]
+# 持续 Agent Run：有开始、预算、截止条件和取消入口的长期任务（例如"每 30 秒
+# 查一次这个 URL，直到状态变成 ready 再告诉我"）。状态机与限制见
+# docs/agent-runs.md。
+enabled = true
+# 跨进程恢复兜底；进程内创建或重排会立即唤醒调度器，不靠扫描。
+recovery_scan_secs = 30
+lease_secs = 60
+request_timeout_secs = 15
+min_interval_secs = 5
+max_interval_secs = 86400
+default_interval_secs = 30
+default_stop_after_minutes = 1440
+max_stop_after_minutes = 10080
+default_max_executions = 20000
+max_executions_per_run = 100000
+max_active_per_user = 10
+max_active_total = 100
+# 连续失败到这个次数就停并通知，避免一个坏端点被无限重试。
+max_consecutive_failures = 5
+max_response_bytes = 524288
+max_body_preview_chars = 2000
+max_notification_chars = 500
+claim_batch_size = 16
+
+[agent_tasks]
+# 跨群问答闭环：在授权群里提问、收集成员回复、汇总回主管理员私聊。
+enabled = true
+poll_interval_secs = 5
+max_collect_minutes = 120
+default_collect_minutes = 10
+max_active_per_actor = 20
+max_active_total = 200
+max_events_per_task = 200
+# 达到这么多条有效回复、且安静 quiet_period_secs 秒后提前汇总；
+# 否则等到最长等待时间再汇总。
+min_valid_replies = 2
+quiet_period_secs = 45
+max_event_chars = 500
+max_report_chars = 3000
+lease_secs = 180
+
 [vision]
 # 视觉 Provider：intrinsic（本机推理）/ auto（先试 VISION_API_URL 再退本机）/
 # builtin（只走 VISION_API_URL）/ mcp / disabled（完全不解析图片）。
