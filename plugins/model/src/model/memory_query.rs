@@ -125,43 +125,17 @@ enum ContextPromptMode {
     PlainText,
 }
 
+/// 这一轮该带哪份语气参考（原本还兼管"要不要走带回复引导的那条路"）。
+///
+/// 注意：**普通文本快速路径不可能落在 `ReplyAction` 上**。快速路径的守卫是
+/// "没有 `reply_action` 工具"，而工具正是由 `allow_reply_actions` 决定的，所以那条路上
+/// `allow_reply_actions` 必为 false（见 [`params_model_with_tool_access`] 里的守卫）。
+/// `ReplyAction` 这一档只在工具循环里用来选 `NativeToolStyle`。
 fn context_prompt_mode(tool_context: &ToolExecutionContext) -> ContextPromptMode {
     if tool_context.allow_reply_actions {
         ContextPromptMode::ReplyAction
     } else {
         ContextPromptMode::PlainText
-    }
-}
-
-async fn interruptible_model_call_for_context(
-    messages: &mut [BotMemory],
-    tool_context: &ToolExecutionContext,
-    reply_ticket: ReplyTicket,
-    max_output_tokens: Option<u32>,
-    vision_images: &[VisionImage],
-    progress: Option<Arc<ThinkingReporter>>,
-) -> Option<BotMemory> {
-    match context_prompt_mode(tool_context) {
-        ContextPromptMode::ReplyAction => {
-            interruptible_model_call(
-                messages,
-                reply_ticket,
-                max_output_tokens,
-                vision_images,
-                progress,
-            )
-            .await
-        }
-        ContextPromptMode::PlainText => {
-            interruptible_model_call_with_plain_style_context(
-                messages,
-                reply_ticket,
-                max_output_tokens,
-                vision_images,
-                None,
-            )
-            .await
-        }
     }
 }
 
@@ -197,13 +171,14 @@ pub(crate) async fn params_model_with_tool_access(
         )
     });
     if !tool_turn && !sticker_only_turn && reply_action_tool.is_none() {
-        return interruptible_model_call_for_context(
+        // 走到这里的这一轮既没有工具、也没有 `reply_action`（等价于
+        // `!allow_reply_actions`），就是一条普通可见回复：一次模型调用、带 plain 语气参考。
+        return interruptible_model_call_with_plain_style_context(
             messages,
-            &tool_context,
             reply_ticket,
             max_output_tokens,
             vision_images,
-            progress,
+            None,
         )
         .await
         .map(ReplyTurn::from)
@@ -273,13 +248,13 @@ pub(crate) async fn params_model_with_tool_access(
             .await
             .unwrap_or_else(ReplyTurn::silent);
         }
-        return interruptible_model_call_for_context(
+        // 既没有注册表、也没有 `reply_action`（等价于 `!allow_reply_actions`）：普通可见回复。
+        return interruptible_model_call_with_plain_style_context(
             messages,
-            &tool_context,
             reply_ticket,
             max_output_tokens,
             vision_images,
-            progress,
+            None,
         )
         .await
         .map(ReplyTurn::from)
