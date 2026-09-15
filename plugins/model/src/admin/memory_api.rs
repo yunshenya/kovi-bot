@@ -1126,28 +1126,42 @@ pub(crate) async fn graph(Query(params): Query<GraphQuery>) -> Result<Json<Value
         }
     }
 
-    let range = time_range(&nodes);
+    let range = time_range(&nodes, "occurred_at");
+    let ranges = time_ranges(&nodes);
     Ok(Json(json!({
         "nodes": nodes,
         "links": links,
         "link_counts": counts,
         "range": range,
+        "ranges": ranges,
         "total": nodes.len(),
         "query": query_text,
     })))
 }
 
 /// 时间范围（画配色图例用）。
-fn time_range(nodes: &[Value]) -> Value {
+///
+/// 两条序列各算一份：配色可以按"提及时间"或"发生时间"，而 `mentioned_at` 总是不早于
+/// `occurred_at`。只给一份 occurred_at 的范围、却拿它去归一化 mentioned_at，最新提及
+/// 的那批节点会全部顶到最暖色、图例写的还是另一条序列。
+fn time_range(nodes: &[Value], field: &str) -> Value {
     let mut min: Option<&str> = None;
     let mut max: Option<&str> = None;
     for node in nodes {
-        if let Some(time) = node["occurred_at"].as_str() {
+        if let Some(time) = node[field].as_str() {
             min = Some(min.map_or(time, |current| current.min(time)));
             max = Some(max.map_or(time, |current| current.max(time)));
         }
     }
     json!({ "min": min, "max": max })
+}
+
+/// 两种配色各一份范围，前端按当前选择取用。
+fn time_ranges(nodes: &[Value]) -> Value {
+    json!({
+        "occurred": time_range(nodes, "occurred_at"),
+        "mentioned": time_range(nodes, "mentioned_at"),
+    })
 }
 
 /// 按四类关系连边。每类每个节点最多连 K 条，避免图变成毛线球。

@@ -296,7 +296,17 @@
     }
   }
 
+  // 渲染排成一条链，且只画最新那一页。
+  //
+  // 页面的渲染是"先清空、再 await 取数、再 append"。两次渲染重叠时（双击侧栏、
+  // 点统计卡上的链接、刷新按钮点两下），后一次的清空会赶在前一次的 append 之前，
+  // 页面上就出现两套卡片、两张表叠在一起。这里做两件事：渲染串行（不会重叠），
+  // 以及在轮到自己时检查序号（被更新的一次导航顶掉的渲染直接跳过，不白画一遍）。
+  let renderEpoch = 0;
+  let renderChain = Promise.resolve();
+
   async function goto(page) {
+    const epoch = ++renderEpoch;
     if (page !== 'system') stopSystemRefresh();
     // 离开配置页就把滚动监听的引用放掉，别让它抱着已经摘下来的按钮。
     if (page !== 'config' && config.spyCleanup) {
@@ -318,7 +328,11 @@
     $('#page-title').textContent = PAGES[page].title;
     $('#page-subtitle').textContent = PAGES[page].subtitle;
     document.title = `${PAGES[page].title} · 芸汐 管理后台`;
-    await PAGES[page].render();
+    const task = () => (epoch === renderEpoch ? PAGES[page].render() : undefined);
+    const next = renderChain.then(task, task);
+    // 链条本身不能因为某一次渲染失败而断掉，失败照常向上抛给调用方。
+    renderChain = next.then(() => {}, () => {});
+    await next;
   }
 
   for (const button of document.querySelectorAll('.nav-item[data-page]')) {
@@ -1133,7 +1147,9 @@
     if (JSON.stringify(value) === JSON.stringify(original)) config.dirty.delete(key);
     else config.dirty.set(key, value);
     // 局部更新高亮与保存栏，避免整页重绘打断输入。
-    const field = document.querySelector(`[data-field="${CSS.escape(key)}"]`);
+    // 高亮的宿主是带 `data-field-path` 的那一行（CSS 里只有 `.field.changed`）；
+    // 以前查的是 `[data-field=…]`，页面上没有这个属性，于是这段一直是空操作。
+    const field = document.querySelector(`[data-field-path="${CSS.escape(key)}"]`);
     if (field) field.classList.toggle('changed', config.dirty.has(key));
     refreshSaveBar();
   }
@@ -1400,6 +1416,9 @@
   // 对照 Hindsight 的「记忆」页：顶部统计卡 → 常驻筛选行 → 三个视图
   // （星座图 / 表格 / 时间线）→ 详情。每条记录都带标签与实体，
   // 实体 chip 的取色算法跟直播版一致（31 进制哈希取模五色调色板）。
+
+  /** 星座图当前绘制的热度范围（drawConstellation 回填，图例用它）。 */
+  let heatRange = null;
 
   const memory = {
     tab: 'records',
@@ -2079,8 +2098,15 @@
         : memory.colorBy === 'mentioned_at'
           ? '近期度 · 提及时间'
           : '近期度 · 发生时间';
-      heatMin.textContent = memory.colorBy === 'weight' ? '低' : shortDate(graph.range && graph.range.min);
-      heatMax.textContent = memory.colorBy === 'weight' ? '高' : shortDate(graph.range && graph.range.max);
+      // 用**正在画的那条序列**的范围，而不是服务端固定给的 occurred_at 那一份。
+      const drawn = memory.colorBy === 'mentioned_at'
+        ? (graph.ranges && graph.ranges.mentioned) || graph.range
+        : graph.range;
+      const span = heatRange
+        ? { min: new Date(heatRange.min).toISOString(), max: new Date(heatRange.max).toISOString() }
+        : drawn;
+      heatMin.textContent = memory.colorBy === 'weight' ? '低' : shortDate(span && span.min);
+      heatMax.textContent = memory.colorBy === 'weight' ? '高' : shortDate(span && span.max);
 
       const collapsed = memory.collapseDuplicates ? collapseDuplicateNodes(graph) : null;
       const shown = collapsed || {
@@ -2182,6 +2208,8 @@
    * 同一块画布、同一份节点坐标，图不会跳，也不会因为反复挂监听越跑越慢。 */
   function drawConstellation(canvas, tip, graph, view) {
     const context = canvas.getContext('2d');
+    // 图例要写"这张图正在用的那条序列"的范围，由绘制方回填（见 heat()）。
+    heatRange = null;
     const width = () => canvas.clientWidth || 640;
     const height = () => canvas.clientHeight || 520;
 
@@ -2194,14 +2222,20 @@
       .map((link) => ({ ...link, a: byId.get(link.source), b: byId.get(link.target) }))
       .filter((edge) => edge.a && edge.b);
 
-    // 时间/权重 → 0..1 的热度
-    const times = nodes.map((node) => new Date(occurredOf(node)).getTime()).filter((t) => !Number.isNaN(t));
+    // 时间/权重 → 0..1 的热度。**按当前绘制的那条序列算范围**：配色可以选"提及
+    // 时间"或"发生时间"，而 mentioned_at 总是不早于 occurred_at——拿 occurred_at
+    // 的范围去归一化 mentioned_at，最新提及的那批节点会全部顶到最暖色，图例写的
+    // 还是另一条序列。
+    const timeOf = (node) =>
+      new Date(memory.colorBy === 'mentioned_at' ? mentionedOf(node) : occurredOf(node)).getTime();
+    const times = nodes.map(timeOf).filter((t) => !Number.isNaN(t));
     const minTime = times.length ? Math.min(...times) : 0;
     const maxTime = times.length ? Math.max(...times) : 1;
+    heatRange = { min: minTime, max: maxTime };
     const maxWeight = Math.max(1, ...nodes.map((node) => Number(node.weight) || 0));
     const heat = (node) => {
       if (memory.colorBy === 'weight') return (Number(node.weight) || 0) / maxWeight;
-      const value = new Date(memory.colorBy === 'mentioned_at' ? mentionedOf(node) : occurredOf(node)).getTime();
+      const value = timeOf(node);
       if (Number.isNaN(value) || maxTime === minTime) return 0.5;
       return (value - minTime) / (maxTime - minTime);
     };
@@ -2568,7 +2602,12 @@
       h('dt', { text: '提及时间' }), h('dd', { text: fmtTime(mentionedOf(item)) }),
       item.status ? h('dt', { text: '状态' }) : null,
       item.status ? h('dd', { text: item.status }) : null,
-      h('dt', { text: '标识' }), h('dd', { class: 'mono', text: `${payload.table} · ${record.id}` })));
+      // 有的表（用户档案、群档案、会话摘要）没有 `id` 列，接口原样返回行，
+      // 这里直接拼接会印出 "kovi_bot_user_profiles · undefined"。
+      h('dt', { text: '标识' }), h('dd', {
+        class: 'mono',
+        text: record.id ? `${payload.table} · ${record.id}` : payload.table,
+      })));
 
     if ((item.entities || []).length) {
       body.append(h('div', { class: 'field-label', style: 'margin-top:14px', text: '实体' }),
@@ -4128,7 +4167,10 @@
     if (currentPage !== 'annotation') return;
     if (event.metaKey || event.ctrlKey || event.altKey) return;
     const tag = event.target && event.target.tagName;
-    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+    // BUTTON 也要排除：焦点在「跳过」「导出」「刷新」上按回车，用户想要的是那个
+    // 按钮，不是"保存并下一条"。以前这里不排按钮又无条件 preventDefault，
+    // 于是回车被劫持成保存（而且保存是重入的，连按两下会一个成功一个 409）。
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || tag === 'BUTTON') return;
     if (event.key === 'Enter') {
       event.preventDefault();
       saveAnnotation();
