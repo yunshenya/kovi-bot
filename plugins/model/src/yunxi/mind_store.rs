@@ -13,12 +13,41 @@ use yunxi_core::{
     CuriosityStatus, CuriosityStore, Episode, EpisodeStore, Interest, InterestId, InterestStore,
     MindConsolidationStore, MindDataErasure, MindDataErasureError, MindDataErasureFuture,
     MindScope, MindServices, MindStoreError, MindStoreFuture, OpenQuestion, OpenQuestionId,
-    OpenQuestionStatus, OpenQuestionStore, Preference, PreferenceId, PreferenceStore, SelfModel,
-    SelfModelStore, lexical_terms,
+    OpenQuestionStatus, OpenQuestionStore, Preference, PreferenceId, PreferenceStore, SelfIdentity,
+    SelfModel, SelfModelStore, lexical_terms,
 };
 
 const MAX_LIST_LIMIT: usize = 128;
 const GLOBAL_SCOPE_KEY: &str = "global";
+
+/// 旧版自我认知的文案。她第一次启动时写进库里的就是这一句，之后"缺了才补"的逻辑再也
+/// 不会碰它——所以线上那一行必须靠一次性迁移换掉（见 [`migrate_self_identity`]）。
+const LEGACY_SELF_IDENTITY_DESCRIPTION: &str = "我是由 AI 驱动、具有跨时间持续状态的虚拟角色。Host 和平台只是我与外部世界互动的环境，不是我的身份。";
+
+/// 把旧的技术身份换成新的自我认知；已经是新的就返回 `None`（幂等）。
+///
+/// 判据是**文案**而不是 `schema_version`：`SCHEMA_VERSION` 是 mind 全类型（belief /
+/// agenda / episode / …）共用的常量，为一次身份文案改动抬版本会让所有已存的 mind 行
+/// 一起失效。身份内容只落在这**一行 singleton** 上，按文案精确匹配最安全。
+///
+/// 只换 `identity`：traits / values / limitations / long_term_goals 原样保留、version + 1，
+/// 所以她这段时间沉淀出来的性格与价值观不会被覆盖。
+fn migrate_self_identity(current: &SelfModel, now: DateTime<Utc>) -> Option<SelfModel> {
+    if current.identity().description() != LEGACY_SELF_IDENTITY_DESCRIPTION {
+        return None;
+    }
+    SelfModel::new(
+        SelfIdentity::yunxi(),
+        current.traits().to_vec(),
+        current.values().clone(),
+        current.limitations().to_vec(),
+        current.long_term_goals().to_vec(),
+        current.source(),
+        now,
+        current.version().saturating_add(1),
+    )
+    .ok()
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct PostgresMindStore {
@@ -214,17 +243,36 @@ impl PostgresMindStore {
         Ok(())
     }
 
-    pub(crate) async fn seed_self_model_if_absent(&self) -> anyhow::Result<()> {
-        if SelfModelStore::get(self)
+    /// 确保自我认知存在，且不是旧版的"技术身份"。
+    ///
+    /// 迁移的判定与内容在 [`migrate_self_identity`]，这里只管"读—迁—写"。
+    pub(crate) async fn ensure_self_model(&self) -> anyhow::Result<()> {
+        let Some(current) = SelfModelStore::get(self)
             .await
             .map_err(anyhow::Error::from)?
-            .is_none()
-        {
+        else {
             let seed = SelfModel::seed_yunxi(Utc::now());
             match SelfModelStore::put(self, &seed, None).await {
                 Ok(_) | Err(MindStoreError::VersionConflict { .. }) => {}
                 Err(error) => return Err(anyhow::Error::from(error)),
             }
+            return Ok(());
+        };
+        if current.identity().description() != LEGACY_SELF_IDENTITY_DESCRIPTION {
+            return Ok(());
+        }
+        let Some(migrated) = migrate_self_identity(&current, Utc::now()) else {
+            return Ok(());
+        };
+        match SelfModelStore::put(self, &migrated, Some(current.version())).await {
+            Ok(_) => kovi::log::info!(
+                "自我认知已迁移：去掉「AI 驱动 / 虚拟角色」这类技术身份声明（版本 {} -> {}）",
+                current.version(),
+                migrated.version()
+            ),
+            // 并发启动时另一份进程可能已经迁过：版本冲突等于"别人做完了"，不是错误。
+            Err(MindStoreError::VersionConflict { .. }) => {}
+            Err(error) => return Err(anyhow::Error::from(error)),
         }
         Ok(())
     }
@@ -1842,7 +1890,8 @@ fn mind_erasure_store_error(error: MindStoreError) -> MindDataErasureError {
 #[cfg(test)]
 mod tests {
     use super::{
-        PostgresMindStore, RecordTable, bump_meta, episode_record, lock_meta, put_record_tx,
+        LEGACY_SELF_IDENTITY_DESCRIPTION, PostgresMindStore, RecordTable, bump_meta,
+        episode_record, lock_meta, migrate_self_identity, put_record_tx,
     };
     use chrono::{Duration, Utc};
     use sqlx_core::query::query;
@@ -1940,7 +1989,7 @@ mod tests {
                 .await
                 .expect("migration should be idempotent");
             store
-                .seed_self_model_if_absent()
+                .ensure_self_model()
                 .await
                 .expect("self model seed should be restart-safe");
 
@@ -2447,6 +2496,40 @@ mod tests {
                 })
                 .expect("successful plan should remain structurally valid");
         });
+    }
+
+    /// 旧身份必须被换掉，而且只换身份：她沉淀出来的 traits / values / limitations 一个字
+    /// 都不能动，版本 +1。这条迁移跑在生产库那一行 singleton 上，写错了就是把她的性格
+    /// 重置回出厂值。
+    #[test]
+    fn legacy_self_identity_migrates_without_touching_the_rest() {
+        let now = Utc::now();
+        let legacy = yunxi_core::SelfModel::new(
+            yunxi_core::SelfIdentity::new("芸汐", LEGACY_SELF_IDENTITY_DESCRIPTION)
+                .expect("legacy identity"),
+            yunxi_core::SelfModel::seed_yunxi(now).traits().to_vec(),
+            yunxi_core::SelfModel::seed_yunxi(now).values().clone(),
+            yunxi_core::SelfModel::seed_yunxi(now)
+                .limitations()
+                .to_vec(),
+            Vec::new(),
+            MindSource::Seed,
+            now,
+            7,
+        )
+        .expect("legacy self model");
+
+        let migrated = migrate_self_identity(&legacy, now).expect("legacy identity should migrate");
+        assert_eq!(migrated.identity().name(), "芸汐");
+        assert_eq!(migrated.identity().description(), "我是芸汐。");
+        assert_eq!(migrated.version(), 8, "迁移必须推进版本，否则并发写会覆盖");
+        assert_eq!(migrated.traits().len(), legacy.traits().len());
+        assert_eq!(migrated.values(), legacy.values());
+        assert_eq!(migrated.limitations().len(), legacy.limitations().len());
+        assert_eq!(migrated.source(), legacy.source());
+
+        // 幂等：已经是新身份的模型不该再被改写。
+        assert!(migrate_self_identity(&migrated, now).is_none());
     }
 
     #[test]

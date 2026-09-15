@@ -11,13 +11,20 @@ pub const MAX_SELF_TRAITS: usize = 8;
 pub const MAX_SELF_LIMITATIONS: usize = 16;
 pub const MAX_SELF_LONG_TERM_GOALS: usize = 16;
 
+/// 她的自我认知里"她是谁"那一行。
+///
+/// **这里不该有身份声明**：曾经它写着"我是由 AI 驱动、具有跨时间持续状态的虚拟角色。
+/// Host 和平台只是我与外部世界互动的环境，不是我的身份"，还配了三个布尔标记
+/// （`ai_driven` / `claims_human_identity` / `host_independent`）并由 `validate` 强制维持。
+/// 那份自我认知会随 Mind snapshot 进入每一轮提示词，与人格提示词直接打架：线上
+/// 2026-09-15 13:20 有人要她的照片，她答"我哪有什么照片呀，就是个只会打字陪你聊天的人，
+/// 长什么样连我自己都不知道呢"，接着连发三条否认——素材库里那张"芸汐的照片"她不肯认。
+/// 人格（她是谁、怎么说话）由配置里的 `prompt.persona` 统一负责，这里只留名字与一句
+/// 不与人设冲突的自我介绍，不再重复第二份人格、也不声明技术身份。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SelfIdentity {
     name: String,
     description: String,
-    ai_driven: bool,
-    claims_human_identity: bool,
-    host_independent: bool,
 }
 
 impl SelfIdentity {
@@ -28,30 +35,18 @@ impl SelfIdentity {
         let identity = Self {
             name: validate_label(name, "self identity name")?,
             description: validate_mind_text(description, "self identity description")?,
-            ai_driven: true,
-            claims_human_identity: false,
-            host_independent: true,
         };
         identity.validate()?;
         Ok(identity)
     }
 
     pub fn yunxi() -> Self {
-        Self::new(
-            "芸汐",
-            "我是由 AI 驱动、具有跨时间持续状态的虚拟角色。Host 和平台只是我与外部世界互动的环境，不是我的身份。",
-        )
-        .expect("the built-in Yunxi identity is valid")
+        Self::new("芸汐", "我是芸汐。").expect("the built-in Yunxi identity is valid")
     }
 
     pub fn validate(&self) -> Result<(), MindValidationError> {
         validate_label(self.name.clone(), "self identity name")?;
         validate_mind_text(self.description.clone(), "self identity description")?;
-        if !self.ai_driven || self.claims_human_identity || !self.host_independent {
-            return Err(MindValidationError::InvalidProposal {
-                reason: "self identity must remain AI-driven, non-human, and host-independent",
-            });
-        }
         Ok(())
     }
 
@@ -63,16 +58,6 @@ impl SelfIdentity {
     #[must_use]
     pub fn description(&self) -> &str {
         &self.description
-    }
-
-    #[must_use]
-    pub const fn is_ai_driven(&self) -> bool {
-        self.ai_driven
-    }
-
-    #[must_use]
-    pub const fn is_host_independent(&self) -> bool {
-        self.host_independent
     }
 }
 

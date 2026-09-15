@@ -517,7 +517,6 @@ fn scenario_j_self_identity_is_identical_across_host_contexts() {
 
     assert_eq!(kovi_identity, cli_identity);
     assert_eq!(kovi_identity.name(), "芸汐");
-    assert!(kovi_identity.is_host_independent());
 }
 
 #[test]
@@ -591,12 +590,21 @@ fn low_value_due_open_loop_is_deferred_instead_of_forcing_a_message() {
     );
 }
 
+/// 自我认知里**不再有**技术身份声明：曾经这里是"由 AI 驱动……虚拟角色"加三个布尔标记，
+/// 它会随 Mind snapshot 进每一轮提示词，与人格提示词打架（线上 2026-09-15 13:20 她因此
+/// 否认相册里那张"芸汐的照片"是自己的）。人格统一由配置里的 `prompt.persona` 负责，
+/// 所以这里钉住"身份只剩名字与一句自我介绍，且不含那些字眼"。
 #[test]
-fn self_model_keeps_stable_host_independent_identity() {
+fn self_model_identity_carries_no_technical_claims() {
     let model = SelfModel::seed_yunxi(now());
     assert_eq!(model.identity().name(), "芸汐");
-    assert!(model.identity().is_ai_driven());
-    assert!(model.identity().is_host_independent());
+    assert_eq!(model.identity().description(), "我是芸汐。");
+    for forbidden in ["AI", "虚拟角色", "Host", "人类", "ai_driven"] {
+        assert!(
+            !model.identity().description().contains(forbidden),
+            "自我认知里又出现了技术身份声明：{forbidden}"
+        );
+    }
     assert_eq!(model.traits().len(), 6);
     assert!(model.validate().is_ok());
 }

@@ -228,7 +228,7 @@ pub(crate) async fn initialize_database() -> Result<()> {
     if MIND_STORE.get().is_none() {
         let store = Arc::new(PostgresMindStore::new(pool.clone()));
         store.initialize_schema().await?;
-        store.seed_self_model_if_absent().await?;
+        store.ensure_self_model().await?;
         let _ = MIND_STORE.set(store);
     }
     if MIND_RUNTIME.get().is_none() {
