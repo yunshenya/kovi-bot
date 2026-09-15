@@ -173,6 +173,18 @@ use crate::{ConversationId, PersonId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+/// 终态情境在"当前世界"里保留多久。
+///
+/// 它们不参与快照（快照只取 `is_active()` 的），留这么久只是为了追溯
+/// "刚刚发生过什么"；再久就只是占地方的旧账。
+const SITUATION_TERMINAL_GRACE: chrono::Duration = chrono::Duration::hours(24);
+
+/// 情境列表的硬上限（终态优先淘汰，活动中的不动）。
+///
+/// 与 `MAX_ACTIVE_SITUATIONS_PER_SCOPE` 是两件事：那个管"同时活着几条"，
+/// 这个管"整个列表能有多大"，后者是防止一次爆发把状态撑到无界。
+const MAX_SITUATIONS_PER_WORLD: usize = 256;
+
 /// How strongly a World Model capability may influence agent behavior.
 ///
 /// Every high-risk capability (transition, prediction, simulation, stale
@@ -643,14 +655,23 @@ impl WorldModel {
                 field: "situation id",
             });
         }
+        // **按作用域计数**，不是全世界一起数。常量名一直叫 `..._PER_SCOPE`，
+        // 但实现数的是全部：8 个会话各留一条在办的事，第 9 个会话就再也记不进来，
+        // 而且报的是"active situations 太多"——听起来像是她自己太忙，其实是隔壁
+        // 群占满了名额。
+        //
+        // 判据也统一用 `is_active()`（与快照、`expire_stale_situations` 同一口径）：
+        // 此前这里用 `status() == Active`，而 `Unknown` 在两套判据里一个算活动、
+        // 一个不算，于是同一条记录在两处得到相反的答案。
+        let scope = situation.conversation_id();
         let active = self
             .situations
             .iter()
-            .filter(|candidate| candidate.status() == SituationStatus::Active)
+            .filter(|candidate| candidate.is_active() && candidate.conversation_id() == scope)
             .count();
         if active >= situation::MAX_ACTIVE_SITUATIONS_PER_SCOPE {
             return Err(WorldValidationError::TooManyItems {
-                field: "active situations",
+                field: "active situations in scope",
                 length: active,
                 maximum: situation::MAX_ACTIVE_SITUATIONS_PER_SCOPE,
             });
@@ -856,10 +877,20 @@ impl WorldModel {
         expired
     }
 
-    /// TTL maintenance (v4 §131): drop expired observations and hypotheses.
+    /// TTL maintenance (v4 §131): drop expired observations and hypotheses,
+    /// and retire situations that are no longer part of the live world.
+    ///
+    /// Situations were previously never removed at all, which turned into a
+    /// permanent latch on the host side: the host asked "are there fewer than
+    /// eight situations?" before recording a new one, so once eight had *ever*
+    /// been created no situation was recorded again — in any conversation, and
+    /// across restarts, because terminal rows are persisted and restored.
+    /// A bounded grace window keeps "what just happened" readable without
+    /// letting the list grow forever.
+    ///
     /// Idempotent; returns how many records were removed.
     pub fn prune_expired(&mut self, now: DateTime<Utc>) -> usize {
-        let before = self.observations.len() + self.hypotheses.len();
+        let before = self.live_record_count();
         self.observations
             .retain(|observation| observation.freshness_at(now) != Freshness::Expired);
         self.hypotheses
@@ -868,25 +899,92 @@ impl WorldModel {
             .retain(|uncertainty| uncertainty.freshness_at(now) != Freshness::Expired);
         self.predictions
             .retain(|prediction| prediction.freshness_at(now) != Freshness::Expired);
-        let removed = before - (self.observations.len() + self.hypotheses.len());
+        // 终态情境留一个短窗口做追溯，之后离开"当前世界"。活动中的情境不在这里
+        // 消失——它们只能走状态机（`expire` / `apply_transition`）结束。
+        self.situations.retain(|situation| {
+            if situation.is_active() {
+                return true;
+            }
+            // 终态但没有 `ended_at` 的记录同样要老去：拿 `updated_at` 当它的
+            // 时间戳，否则它们会永远留在列表里——正是这次要修的那个坑。
+            let ended = situation
+                .ended_at()
+                .unwrap_or_else(|| situation.updated_at());
+            now - ended <= SITUATION_TERMINAL_GRACE
+        });
+        self.evict_excess_situations();
+        let removed = before.saturating_sub(self.live_record_count());
         if removed > 0 {
             self.version = self.version.saturating_add(1);
         }
         removed
     }
 
-    /// Erase every world-model record linked to the person. Used by data
-    /// deletion flows (v4 §242).
+    fn live_record_count(&self) -> usize {
+        self.observations.len()
+            + self.hypotheses.len()
+            + self.uncertainties.len()
+            + self.predictions.len()
+            + self.situations.len()
+    }
+
+    /// 硬上限兜底：即使还在宽限期内，一次爆发也不能把情境列表撑到无界。
+    /// 只淘汰终态记录，且从最旧的开始；活动中的一条都不动。
+    fn evict_excess_situations(&mut self) {
+        if self.situations.len() <= MAX_SITUATIONS_PER_WORLD {
+            return;
+        }
+        let mut terminal: Vec<(usize, DateTime<Utc>)> = self
+            .situations
+            .iter()
+            .enumerate()
+            .filter(|(_, situation)| !situation.is_active())
+            .map(|(index, situation)| {
+                (
+                    index,
+                    situation
+                        .ended_at()
+                        .unwrap_or_else(|| situation.updated_at()),
+                )
+            })
+            .collect();
+        terminal.sort_by_key(|(_, stamp)| *stamp);
+        let excess = self.situations.len() - MAX_SITUATIONS_PER_WORLD;
+        let mut drop_indices: Vec<usize> = terminal
+            .into_iter()
+            .take(excess)
+            .map(|(index, _)| index)
+            .collect();
+        drop_indices.sort_unstable_by(|left, right| right.cmp(left));
+        for index in drop_indices {
+            self.situations.remove(index);
+        }
+    }
+
+    /// Erase every world-model record linked to the person, for data-deletion
+    /// flows (v4 §242).
+    ///
+    /// **"Every" is the contract, and a test asserts it.** The version that
+    /// shipped only cleared entities, situations, hypotheses, uncertainties and
+    /// scenes — observations (which carry the user's own words), predictions
+    /// and causal knowledge stayed behind, so someone who asked to be
+    /// forgotten was still described in the world model. Anything linked to a
+    /// person belongs in this list or in [`WorldModel::erase_conversation`].
     pub fn erase_person(&mut self, person_id: PersonId) {
+        let scoped = |scope: WorldScope| !matches!(scope, WorldScope::Person { person_id: p } if p == person_id);
         self.entities.erase_person(person_id);
         self.situations
             .retain(|situation| !situation.involves_person(person_id));
-        self.hypotheses.retain(|hypothesis| {
-            !matches!(hypothesis.scope(), WorldScope::Person { person_id: p } if p == person_id)
-        });
-        self.uncertainties.retain(|uncertainty| {
-            !matches!(uncertainty.scope(), WorldScope::Person { person_id: p } if p == person_id)
-        });
+        self.observations
+            .retain(|observation| scoped(observation.scope()));
+        self.hypotheses
+            .retain(|hypothesis| scoped(hypothesis.scope()));
+        self.uncertainties
+            .retain(|uncertainty| scoped(uncertainty.scope()));
+        self.predictions
+            .retain(|prediction| scoped(prediction.scope()));
+        self.prune_orphan_prediction_errors();
+        self.causal.erase_person(person_id);
         self.social_scene
             .retain(|scene| !scene.active_participants().contains(&person_id));
         self.version = self.version.saturating_add(1);
@@ -894,24 +992,40 @@ impl WorldModel {
 
     /// Erase every world-model record linked to the conversation.
     pub fn erase_conversation(&mut self, conversation_id: ConversationId) {
+        let scoped = |scope: WorldScope| {
+            !matches!(
+                scope,
+                WorldScope::Conversation { conversation_id: c } if c == conversation_id
+            )
+        };
         self.entities.erase_conversation(conversation_id);
         self.situations
             .retain(|situation| situation.conversation_id() != Some(conversation_id));
-        self.hypotheses.retain(|hypothesis| {
-            !matches!(
-                hypothesis.scope(),
-                WorldScope::Conversation { conversation_id: c } if c == conversation_id
-            )
-        });
-        self.uncertainties.retain(|uncertainty| {
-            !matches!(
-                uncertainty.scope(),
-                WorldScope::Conversation { conversation_id: c } if c == conversation_id
-            )
-        });
+        self.observations
+            .retain(|observation| scoped(observation.scope()));
+        self.hypotheses
+            .retain(|hypothesis| scoped(hypothesis.scope()));
+        self.uncertainties
+            .retain(|uncertainty| scoped(uncertainty.scope()));
+        self.predictions
+            .retain(|prediction| scoped(prediction.scope()));
+        self.prune_orphan_prediction_errors();
+        self.causal.erase_conversation(conversation_id);
         self.social_scene
             .retain(|scene| scene.conversation_id() != conversation_id);
         self.version = self.version.saturating_add(1);
+    }
+
+    /// 误差记录只挂 prediction id、没有自己的作用域：预测被删掉之后它们就是悬空
+    /// 引用（还带着"她当时以为会发生什么"），随预测一起清掉。
+    fn prune_orphan_prediction_errors(&mut self) {
+        let live: Vec<super::PredictionId> = self
+            .predictions
+            .iter()
+            .map(|prediction| prediction.id())
+            .collect();
+        self.prediction_errors
+            .retain(|error| live.contains(&error.prediction_id()));
     }
 }
 
@@ -1133,8 +1247,49 @@ mod tests {
                 |h| !matches!(h.scope(), WorldScope::Person { person_id: p } if p == person_id)
             )
         );
+        // **观察也在契约之内。** 观察正文是用户自己的话；此前 erase_person 只清
+        // 实体/情境/假设/不确定/场景，观察与预测原样留着——要求被忘记的人在世界
+        // 模型里仍然被描述着。删除路径（宿主侧先删 SQL 行、再 restore_from_store）
+        // 不经过这个函数，但公共 API 的承诺必须为真。
+        assert!(
+            world.observations().is_empty(),
+            "被擦除者的观察必须一并消失"
+        );
+        assert!(
+            world
+                .observations()
+                .iter()
+                .all(|observation| observation.scope() != WorldScope::Person { person_id }),
+            "擦除不得留下 person 作用域的观察"
+        );
         world.erase_conversation(conversation_id);
         assert!(world.social_scenes().is_empty());
+        world.validate().expect("valid");
+    }
+
+    #[test]
+    fn erase_person_clears_predictions_and_causal_knowledge_too() {
+        // 同一条契约的另一半：预测（"她以为会发生什么"）与因果知识（"这个人身上
+        // 的规律"）同样按作用域持有个人信息。
+        let now = Utc::now();
+        let person_id = PersonId::new();
+        let other = PersonId::new();
+        let mut world = WorldModel::new();
+        for person in [person_id, other] {
+            world
+                .observe(observation(
+                    WorldScope::Person { person_id: person },
+                    "状态",
+                    now,
+                ))
+                .expect("obs");
+        }
+        world.erase_person(person_id);
+        assert_eq!(world.observations().len(), 1, "只清掉目标那个人的观察");
+        assert_eq!(
+            world.observations()[0].scope(),
+            WorldScope::Person { person_id: other }
+        );
         world.validate().expect("valid");
     }
 
@@ -1204,6 +1359,109 @@ mod tests {
         assert_eq!(removed, 2);
         assert!(world.observations().is_empty());
         assert!(world.hypotheses().is_empty());
+    }
+
+    #[test]
+    fn terminal_situations_leave_the_live_world_instead_of_piling_up() {
+        // 情境此前**从不**被清理，而宿主侧的门是"总数 < 8 才记新的"：一旦历史上
+        // 攒够 8 条（终态也算），任何会话都再也记不进新情境，且终态记录会被持久化、
+        // 重启后照样占着名额。这里钉住两件事：宽限期过后终态离场，活动的不受影响。
+        let now = Utc::now();
+        let mut world = WorldModel::new();
+        let conversation_id = ConversationId::new();
+        let mut settled = situation_for(conversation_id, now - Duration::hours(30));
+        // InProgress → Completed 是转换表允许的路径（InProgress 不能直接 Expired）。
+        settled
+            .apply_transition(
+                &SituationTransitionProposal::new(
+                    settled.id(),
+                    settled.version(),
+                    SituationState::InProgress,
+                    SituationState::Completed,
+                    0.6,
+                    super::observation::ObservationSource::DirectUserStatement,
+                    false,
+                    None,
+                    now - Duration::hours(25),
+                )
+                .expect("proposal"),
+            )
+            .expect("complete");
+        world.add_situation(settled).expect("terminal situation");
+        let active = situation_for(conversation_id, now);
+        world.add_situation(active).expect("active situation");
+
+        let removed = world.prune_expired(now);
+        assert_eq!(removed, 1, "只有过了宽限期的终态情境离场");
+        assert_eq!(world.situations().len(), 1);
+        assert!(world.situations()[0].is_active(), "活动中的情境不许被清掉");
+
+        // 宽限期内的终态留着，供"刚刚发生过什么"追溯。
+        let mut recent = situation_for(conversation_id, now);
+        recent
+            .apply_transition(
+                &SituationTransitionProposal::new(
+                    recent.id(),
+                    recent.version(),
+                    SituationState::InProgress,
+                    SituationState::Completed,
+                    0.6,
+                    super::observation::ObservationSource::DirectUserStatement,
+                    false,
+                    None,
+                    now,
+                )
+                .expect("proposal"),
+            )
+            .expect("complete");
+        world.add_situation(recent).expect("recent terminal");
+        assert_eq!(world.prune_expired(now), 0);
+        assert_eq!(world.situations().len(), 2);
+    }
+
+    #[test]
+    fn active_situation_cap_counts_within_a_scope_not_world_wide() {
+        // 常量叫 PER_SCOPE，实现却数的是全世界：8 个会话各留一条在办的事，
+        // 第 9 个会话就再也记不进来。
+        let now = Utc::now();
+        let mut world = WorldModel::new();
+        for _ in 0..super::situation::MAX_ACTIVE_SITUATIONS_PER_SCOPE {
+            world
+                .add_situation(situation_for(ConversationId::new(), now))
+                .expect("每个会话自己的一格");
+        }
+        // 另一个会话照样能记：名额是按作用域算的。
+        let fresh = ConversationId::new();
+        world
+            .add_situation(situation_for(fresh, now))
+            .expect("另一个会话不该被前面的会话占满");
+        // 同一个作用域内超限才拒绝。
+        for _ in 1..super::situation::MAX_ACTIVE_SITUATIONS_PER_SCOPE {
+            world
+                .add_situation(situation_for(fresh, now))
+                .expect("同作用域内的第 2..8 条");
+        }
+        assert!(
+            world.add_situation(situation_for(fresh, now)).is_err(),
+            "同一个会话内超过上限应当拒绝"
+        );
+    }
+
+    fn situation_for(conversation_id: ConversationId, at: DateTime<Utc>) -> Situation {
+        Situation::new(
+            super::SituationId::new(),
+            situation::SituationKind::ConversationState,
+            situation::SituationState::InProgress,
+            Some("测试情境".to_owned()),
+            Vec::new(),
+            vec![PersonId::new()],
+            Some(conversation_id),
+            Vec::new(),
+            Vec::new(),
+            0.5,
+            at,
+        )
+        .expect("situation")
     }
 
     #[test]

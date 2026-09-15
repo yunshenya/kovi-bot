@@ -390,6 +390,34 @@ impl CausalKnowledge {
         &self.candidates
     }
 
+    /// 数据擦除：删掉属于这个人的因果知识（关系与候选都要删——候选里同样带着
+    /// "这个人身上会发生什么"的推断）。
+    pub fn erase_person(&mut self, person_id: PersonId) {
+        let owned = |scope: &CausalScope| {
+            matches!(
+                scope,
+                CausalScope::PersonSpecific { person_id: scoped } if *scoped == person_id
+            )
+        };
+        self.relations.retain(|relation| !owned(&relation.scope()));
+        self.candidates
+            .retain(|candidate| !owned(&candidate.proposed_scope()));
+    }
+
+    /// 数据擦除：删掉属于这个会话的因果知识。
+    pub fn erase_conversation(&mut self, conversation_id: ConversationId) {
+        let owned = |scope: &CausalScope| {
+            matches!(
+                scope,
+                CausalScope::ConversationSpecific { conversation_id: scoped }
+                    if *scoped == conversation_id
+            )
+        };
+        self.relations.retain(|relation| !owned(&relation.scope()));
+        self.candidates
+            .retain(|candidate| !owned(&candidate.proposed_scope()));
+    }
+
     /// Record a proposal: dedupe by fingerprint, merges evidence.
     pub fn add_proposal(
         &mut self,
