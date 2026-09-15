@@ -8,6 +8,12 @@
 //! - 话题生成：智能生成相关话题促进互动
 //! - 健康监控：实时监控系统状态和性能
 
+// 群聊回复这条链上的 async 状态机嵌得很深（排空 → 回合观测 → 回合 → 控制模型 →
+// 计划执行 → 发送），加一层 `TurnWatch::enter` 包装就会让 rustc 的布局查询触顶
+// （queries overflow the depth limit）。这是编译器的深度上限，不是运行时行为，
+// 官方给的处置就是抬这个常量——`#![recursion_limit = "256"]`。
+#![recursion_limit = "256"]
+
 use crate::model::coalesce::{MessageCoalescer, MessagePart};
 use crate::model::{
     ConversationCoordinator, group_message_event_after_ingress,
@@ -931,6 +937,18 @@ async fn main() {
                 let sweep = async {
                     sweep_group_window_queues(&window_drain_bot).await;
                     sweep_private_window_queues(&window_drain_bot).await;
+                    // 影子档：把"停在同一步太久"的回合写成一行 `[STALL] shadow=true`，
+                    // 不做任何回收动作。它是给自动回收攒判据的（阈值见 traffic.
+                    // turn_stall_secs / turn_reclaim_secs），写成 0 即关闭。
+                    let traffic = config::get().traffic().clone();
+                    let stall_secs = traffic.turn_stall_secs();
+                    if stall_secs > 0 {
+                        model::waiting_room::scan_shadow(
+                            std::time::Duration::from_secs(stall_secs),
+                            std::time::Duration::from_secs(traffic.turn_reclaim_secs()),
+                        )
+                        .await;
+                    }
                 };
                 if kovi::tokio::time::timeout(
                     kovi::tokio::time::Duration::from_secs(WINDOW_DRAIN_SWEEP_TIMEOUT_SECS),

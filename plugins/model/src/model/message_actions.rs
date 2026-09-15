@@ -360,6 +360,9 @@ pub(crate) async fn execute_reply_plan(
         return execution;
     }
 
+    // 从这里开始是"交给 QQ 发送"：这一步与前面的生成/提交分开打点，卡住时后台
+    // 能直接指出是卡在发送上（发送阶段有自己的预算，见 `message_transport`）。
+    crate::model::waiting_room::TurnWatch::step(crate::model::waiting_room::TurnStep::Send);
     let voice_config = crate::config::get().qq_voice().clone();
     for (index, bubble) in plan.bubbles.iter().enumerate() {
         if !is_current(reply_ticket).await {

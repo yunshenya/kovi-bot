@@ -1579,19 +1579,29 @@ async fn drain_pending_private_messages(
         guard.note_progress();
 
         println!("[INFO] 私聊开始处理排队消息 (用户: {})", user_id);
-        waiting_room::note_processing(scope, pending.sender.as_str(), pending.message.as_str());
-        private_chat_claimed(
-            user_id,
-            &pending.message,
-            pending.sender,
-            bot.clone(),
-            ticket,
-            pending.vision_images,
-            pending.message_ids,
-            pending.sticker_teaching_message,
-            pending.understanding,
-        )
-        .await;
+        // 回合观测：与群聊同一套（步骤台账 + 影子判定），原因见 `waiting_room` 模块头。
+        let watch = waiting_room::TurnWatch::observe(
+            scope,
+            Some(&format!("{}: {}", pending.sender, pending.message)),
+        );
+        watch
+            .enter(async {
+                private_chat_claimed(
+                    user_id,
+                    &pending.message,
+                    pending.sender,
+                    bot.clone(),
+                    ticket,
+                    pending.vision_images,
+                    pending.message_ids,
+                    pending.sticker_teaching_message,
+                    pending.understanding,
+                )
+                .await;
+                waiting_room::TurnWatch::step(waiting_room::TurnStep::Finish);
+            })
+            .await;
+        drop(watch);
         publish_private_queue_state(user_id).await;
         completed = ticket;
     }

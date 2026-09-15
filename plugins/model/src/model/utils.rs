@@ -568,6 +568,7 @@ pub async fn control_model(
     } else {
         message
     };
+    crate::model::waiting_room::TurnWatch::step(crate::model::waiting_room::TurnStep::Memory);
     // 分析情绪并更新
     if let Err(e) = MOOD_SYSTEM
         .analyze_and_update_mood_for_subject_with_understanding(
@@ -629,6 +630,7 @@ pub async fn control_model(
         server_config.supports_vision(),
         messages.len(),
     );
+    crate::model::waiting_room::TurnWatch::step(crate::model::waiting_room::TurnStep::Compress);
     let rolling_summary =
         maybe_compress_conversation(&mut messages, "group_chat", group_id, reply_ticket).await;
     let system_prompt = group_system_prompt();
@@ -670,6 +672,7 @@ pub async fn control_model(
         is_main_admin && crate::agent_runs::looks_like_agent_run_request(message);
     let requires_reminder_create =
         !requires_agent_run_create && crate::reminders::looks_like_reminder_request(message);
+    crate::model::waiting_room::TurnWatch::step(crate::model::waiting_room::TurnStep::Model);
     let response = ModelGateway::complete(
         &mut request_messages,
         ToolExecutionContext {
@@ -738,6 +741,7 @@ pub async fn control_model(
         limit_memory_size(&mut messages);
         return false;
     }
+    crate::model::waiting_room::TurnWatch::step(crate::model::waiting_room::TurnStep::Compose);
     let reply_scope = super::interrupt::ReplyScope::Group(group_id);
     let mut plan = if allow_reply_actions {
         ReplyPlan::from_model_output_for_sender(reply_scope, &response.content, Some(user_id)).await
@@ -773,6 +777,8 @@ pub async fn control_model(
         }
     }
     let personality = MEMORY_REPOSITORY.personality().await;
+    // `execute_reply_plan` 内部依次做"提交出站"与"交给 QQ 发送"；卡死时这两步要分得清。
+    crate::model::waiting_room::TurnWatch::step(crate::model::waiting_room::TurnStep::Commit);
     let execution = execute_reply_plan(
         &bot,
         MessageDestination::Group(group_id),
@@ -3973,6 +3979,7 @@ async fn private_chat_inner(
         server_config.supports_vision(),
         history.len(),
     );
+    crate::model::waiting_room::TurnWatch::step(crate::model::waiting_room::TurnStep::Compress);
     let rolling_summary =
         maybe_compress_conversation(&mut history, "private_chat", user_id, reply_ticket).await;
     if let Some(system_message) = history.first_mut() {
@@ -4006,6 +4013,7 @@ async fn private_chat_inner(
     let requires_reminder_create = !requires_agent_run_create
         && (understanding.reminder_request
             || crate::reminders::looks_like_reminder_request(message));
+    crate::model::waiting_room::TurnWatch::step(crate::model::waiting_room::TurnStep::Model);
     let bot_content = ModelGateway::complete(
         &mut request_messages,
         ToolExecutionContext {
@@ -4076,6 +4084,7 @@ async fn private_chat_inner(
         return;
     }
     let reply_scope = super::interrupt::ReplyScope::Private(user_id);
+    crate::model::waiting_room::TurnWatch::step(crate::model::waiting_room::TurnStep::Compose);
     let mut plan = if allow_reply_actions {
         ReplyPlan::from_model_output(reply_scope, &bot_content.content).await
     } else {
@@ -4110,6 +4119,8 @@ async fn private_chat_inner(
         }
     }
     let personality = MEMORY_REPOSITORY.personality().await;
+    // 与群聊同理：提交出站与交给 QQ 发送在 `execute_reply_plan` 内部。
+    crate::model::waiting_room::TurnWatch::step(crate::model::waiting_room::TurnStep::Commit);
     let execution = execute_reply_plan(
         &bot,
         MessageDestination::Private(user_id),

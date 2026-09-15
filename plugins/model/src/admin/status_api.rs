@@ -120,6 +120,10 @@ async fn waiting_room_report() -> Value {
                 "drain_active": report.drain_active,
                 "drain_drained": report.drain_drained,
                 "drain_last_progress_secs": report.drain_last_progress_secs,
+                // 这一轮做到哪一步、停在这一步多久（影子档与"卡在哪"都看它）。
+                "turn_step": report.turn_step,
+                "turn_step_secs": report.turn_step_secs,
+                "turn_waiting_secs": report.turn_waiting_secs,
                 "ticket": report.ticket.as_ref().map(|ticket| json!({
                     "generation": ticket.generation,
                     "age_secs": ticket.age_secs,

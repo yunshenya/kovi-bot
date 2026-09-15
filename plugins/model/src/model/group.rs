@@ -2487,25 +2487,40 @@ async fn drain_pending_window_messages_with(
         guard.note_progress();
 
         println!("[INFO] 群聊开始处理排队窗口消息 (群组: {})", group_id);
-        waiting_room::note_processing(scope, pending.sender.as_str(), pending.message.as_str());
-        let turn_marker =
-            begin_conversation_turn(group_id, pending.user_id, &pending.understanding).await;
-        let replied = crate::model::utils::process_group_reply_claimed(
-            group_id,
-            pending.user_id,
-            &pending.message,
-            bot.clone(),
-            pending.sender,
-            ticket,
-            None,
-            pending.vision_images,
-            pending.message_ids,
-            pending.sticker_teaching_message,
-            pending.understanding,
-            pending.reply_expected,
-        )
-        .await;
-        finish_conversation_turn(group_id, pending.user_id, turn_marker, replied).await;
+        // 回合观测：从这一刻起，"做到哪一步"记进台账，卡住时日志与后台能指名道姓。
+        // 用 task-local 传播而不是给链上十来个函数加参数（同 `llm_trace` 的用途标签）；
+        // 这条链全程在同一个任务里，不跨 `spawn`。
+        let watch = waiting_room::TurnWatch::observe(
+            scope,
+            Some(&format!("{}: {}", pending.sender, pending.message)),
+        );
+        watch
+            .enter(async {
+                waiting_room::TurnWatch::step(waiting_room::TurnStep::BeginTurn);
+                let turn_marker =
+                    begin_conversation_turn(group_id, pending.user_id, &pending.understanding)
+                        .await;
+                let replied = crate::model::utils::process_group_reply_claimed(
+                    group_id,
+                    pending.user_id,
+                    &pending.message,
+                    bot.clone(),
+                    pending.sender,
+                    ticket,
+                    None,
+                    pending.vision_images,
+                    pending.message_ids,
+                    pending.sticker_teaching_message,
+                    pending.understanding,
+                    pending.reply_expected,
+                )
+                .await;
+                waiting_room::TurnWatch::step(waiting_room::TurnStep::Finish);
+                finish_conversation_turn(group_id, pending.user_id, turn_marker, replied).await;
+                replied
+            })
+            .await;
+        drop(watch);
         publish_group_queue_state(group_id).await;
         completed = ticket;
     }

@@ -25,6 +25,15 @@ pub struct TrafficConfig {
     /// 几十秒会把"正在慢慢回"误报成卡住；放到十分钟又会让人盯着一个已经死了的
     /// 队列白等。180 秒恰好卡在两者之间。
     window_stall_secs: u64,
+    /// 影子档：回合停在同一步超过多久就写一行 `[STALL] shadow=true`（秒，0 = 关闭）。
+    ///
+    /// **只打日志，不动任何东西**。它是给"自动回收"攒判据用的：先量出正常回合最长
+    /// 多久、卡住的都停在哪一步，再决定回收阈值，而不是反过来。默认 300 秒足够宽——
+    /// 影子档要的是"别漏"，不是"别误报"，误报只多一行日志。
+    turn_stall_secs: u64,
+    /// 影子日志里 `would_reclaim` 的阈值（秒）。真正回收时要等的就是这个数——
+    /// 比 `turn_stall_secs` 更严，因为回收的代价是"她可能重复回一条"。
+    turn_reclaim_secs: u64,
     max_input_chars: usize,
     max_model_response_bytes: usize,
     max_model_queue: usize,
@@ -62,6 +71,14 @@ impl TrafficConfig {
 
     pub fn window_stall_secs(&self) -> u64 {
         self.window_stall_secs
+    }
+
+    pub fn turn_stall_secs(&self) -> u64 {
+        self.turn_stall_secs
+    }
+
+    pub fn turn_reclaim_secs(&self) -> u64 {
+        self.turn_reclaim_secs
     }
 
     pub fn max_input_chars(&self) -> usize {
@@ -104,6 +121,19 @@ impl TrafficConfig {
                 "traffic.window_stall_secs 必须在 30 到 3600 之间"
             ));
         }
+        // 0 是"关掉影子档"的显式取值。非 0 时下限取 30 秒：比这更短的话，每一轮
+        // 扫描都会把正常回合报成卡住，日志立刻失去意义（扫描间隔由
+        // `window_drain_sweep_secs` 单独管，它只影响"多久发现一次"，不影响判据）。
+        if self.turn_stall_secs != 0 && !(30..=3_600).contains(&self.turn_stall_secs) {
+            return Err(anyhow::anyhow!(
+                "traffic.turn_stall_secs 必须是 0（关闭）或 30 到 3600 之间"
+            ));
+        }
+        if self.turn_reclaim_secs < self.turn_stall_secs.max(1) || self.turn_reclaim_secs > 7_200 {
+            return Err(anyhow::anyhow!(
+                "traffic.turn_reclaim_secs 必须不小于 turn_stall_secs 且不超过 7200"
+            ));
+        }
         if !(256..=32_000).contains(&self.max_input_chars) {
             return Err(anyhow::anyhow!(
                 "traffic.max_input_chars 必须在 256 到 32000 之间"
@@ -134,6 +164,8 @@ impl Default for TrafficConfig {
             max_pending_turns: 16,
             window_drain_sweep_secs: 30,
             window_stall_secs: 180,
+            turn_stall_secs: 300,
+            turn_reclaim_secs: 600,
             max_input_chars: 6_000,
             max_model_response_bytes: 2 * 1024 * 1024,
             max_model_queue: 64,
@@ -168,6 +200,10 @@ mod tests {
         assert!(config.validate().is_ok());
         config.window_drain_sweep_secs = 600;
         assert!(config.validate().is_ok());
+
+        // 扫描间隔与影子档阈值彼此独立：间隔拉到 600 秒，阈值仍可以更短
+        // （只影响"多久发现一次"，不影响判据本身）。
+        assert!(config.validate().is_ok());
     }
 
     /// 卡住阈值只影响后台的判定与措辞：太短会把"正在慢慢回"误报成卡住，
@@ -186,6 +222,32 @@ mod tests {
         config.window_stall_secs = 30;
         assert!(config.validate().is_ok());
         config.window_stall_secs = 3_600;
+        assert!(config.validate().is_ok());
+    }
+
+    /// 影子档的阈值必须可关、可比扫描间隔长；回收阈值必须 ≥ 卡住阈值（否则
+    /// "还没判成卡住就先判该回收"，判据自相矛盾）。
+    #[test]
+    fn turn_shadow_thresholds_are_coherent() {
+        let mut config = TrafficConfig::default();
+        assert_eq!(config.turn_stall_secs(), 300);
+        assert_eq!(config.turn_reclaim_secs(), 600);
+        assert!(config.validate().is_ok());
+
+        config.turn_stall_secs = 0;
+        assert!(config.validate().is_ok(), "0 是显式关闭");
+
+        config.turn_stall_secs = 29;
+        assert!(config.validate().is_err(), "比扫描间隔还短只会刷屏");
+        config.turn_stall_secs = 3_601;
+        assert!(config.validate().is_err());
+
+        config.turn_stall_secs = 300;
+        config.turn_reclaim_secs = 299;
+        assert!(config.validate().is_err(), "回收阈值不能比卡住阈值还小");
+        config.turn_reclaim_secs = 7_201;
+        assert!(config.validate().is_err());
+        config.turn_reclaim_secs = 300;
         assert!(config.validate().is_ok());
     }
 }

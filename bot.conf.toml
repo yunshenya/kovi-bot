@@ -281,6 +281,11 @@ window_drain_sweep_secs = 30
 # 见 bot.conf.example.toml 同名一项：压太短会把"正在慢慢回"误报成卡住，放太长
 # 等于让人盯着一个已经死了的队列白等。
 window_stall_secs = 180
+# 回合级影子档：回合停在同一步超过 turn_stall_secs 就写一行 `[STALL] shadow=true`
+# 日志（**只打日志，不动任何东西**），给"自动回收卡死回合"攒判据。0 = 关闭。
+# 阈值理由与步骤名见 bot.conf.example.toml 同名两项。
+turn_stall_secs = 300
+turn_reclaim_secs = 600
 max_input_chars = 6000
 max_model_response_bytes = 2097152
 max_model_queue = 64

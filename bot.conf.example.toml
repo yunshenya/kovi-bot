@@ -96,6 +96,23 @@ window_drain_sweep_secs = 30
 # 默认 180 秒：一次群聊回合最坏要串几次模型调用（每次 30 秒超时 ×3 次重试），
 # 压到几十秒会把"正在慢慢回"误报成卡住；放到十分钟又会让人盯着死队列白等。
 window_stall_secs = 180
+# 回合级影子档：一个回复回合停在同一步超过这么久，就写一行
+# `[STALL] shadow=true kind=… step=model step_secs=… would_reclaim=…` 日志。
+#
+# **它只打日志，不动任何东西**——这是给"自动回收卡死的回合"攒判据用的：先量出
+# 正常回合最长多久、卡住的都停在哪一步、`would_reclaim` 会不会误报，再决定要不要
+# 真的动手。0 = 关闭。
+#
+# 为什么需要它：2026-09-15 那次群里静了十小时，日志里只有"排队 N 次、排空 0 次"，
+# 谁也不知道卡在哪一步。有了它，下一次出事第一行日志就能说出 step=commit 还是
+# step=send，不必再登机器抓栈。默认 300 秒足够宽——影子档要的是"别漏"，误报只多
+# 一行日志。steps: claimed / begin_turn / memory / compress / model / compose /
+# commit / send / finish。
+turn_stall_secs = 300
+# 上面那行日志里 `would_reclaim=true` 的阈值（秒）。真正回收时要等的就是这个数：
+# 比 turn_stall_secs 更严，因为回收的代价是"她可能重复回一条"，而漏回收的代价是
+# "这个群接着静默"——两类错误的代价不对称，所以宁可多等。
+turn_reclaim_secs = 600
 max_input_chars = 6000
 max_model_response_bytes = 2097152
 max_model_queue = 64
