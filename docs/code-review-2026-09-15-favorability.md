@@ -958,28 +958,64 @@ Core 投递的引用映射/路由/授权）。语义从"整段共用一个 30 �
 全量回归：model 1153 + core 355 + CLI 10 + acceptance 13 全过，真库 ignored 65 passed
 （唯一失败仍是需要 `REDIS_URL` 的 `redis_store`）。
 
-### 11.9 待办：把回复动作协议换成受约束通道（规则 7），**尚未开始**
+### 11.9 已修：回复动作协议换成受约束通道（规则 7）
 
-按第 7 条"不要让模型手写结构化文本"，`[[REPLY_ACTION]]{...}[[/REPLY_ACTION]]` 属于应当
-淘汰的那一类：让模型手写 JSON、再用容错解析器去猜（`complete_truncated_json_object`
-就是在替它擦屁股）。这次**没有动**，因为它横跨两条模型链路，半途改完比不改更糟：
+**当时为什么没动**：按第 7 条"不要让模型手写结构化文本"，`[[REPLY_ACTION]]{...}[[/REPLY_ACTION]]`
+属于应当淘汰的那一类——让模型手写 JSON、再用容错解析器去猜（`complete_truncated_json_object`
+就是在替它擦屁股）。但它横跨两条模型链路（Host 的 `model/reply.rs` 常驻协议 + 解析器；Core 的
+自造包装、禁词分支与一大批测试；生成侧还是纯补全），半途改完比不改更糟，所以那一轮只写了方案。
 
-- Host：`model/reply.rs` 的 `REPLY_PROTOCOL_HEAD`（30 余行指令）+ `parse_reply_output`
-  解析；`config/mod.rs` 有断言"系统提示词里不许出现 REPLY_ACTION"。
-- Core：`yunxi/core_model.rs` 自己拼 `[[REPLY_ACTION]]`（529/591 行附近）、在纯文本模式里
-  拒绝它（1938/3117/3151）、修复提示词里明确禁止它（152 行），以及一大批围绕它的测试。
-- 生成侧：最终回复走的是 `params_model_*`（纯补全），要换成带 `tools` 的调用。
+**这次落地**（`f7099a3` 迁移 + `e26c02a` 顺带修）：
 
-建议的迁移步骤（下一步照此执行即可）：
+Host（`plugins/model/src/model/`）
 
-1. 定义 `reply_action` 工具（JSON schema：`disposition` / `messages` / `requests_image` /
-   `quote_message_id` / `at_current_sender` / `at_user_ids` / `recall_message_ids` /
-   `voice` / `sticker`），契约写进工具 description（符合第 6 条：按需随工具下发，
-   不再常驻 30 行协议文本）。
-2. 最终回复调用只挂这一个工具（`tools=[reply_action]`），于是模型只能通过它表达结构化
-   动作；正文仍是自然语言（符合第 7 条"先自然语言推理、再转结构"）。
-3. `parse_reply_output` 改成读 `tool_calls[0].arguments`（服务端已保证是合法 JSON），
-   删掉文本标记解析与 `complete_truncated_json_object` 在回复路径上的使用。
-4. Core 侧同步：删除自造的 `[[REPLY_ACTION]]` 包装与所有"禁止出现该标记"的分支。
-5. 清理 `config/mod.rs` 与 `core_model.rs` 里围绕旧协议的断言/修复提示词，替换成新协议的
-   对应断言；跑一次真实的私聊/群聊端到端确认。
+- `reply.rs`：新增 `reply_action_tool_spec`，字段契约随工具 description 下发（第 6 条），常驻的
+  30 余行 `<回复协议>` 整段删除；语音/表情包字段只在下游真的可用时才进 schema。
+  `ReplyActionCall::from_tool_arguments` 只校验 schema 管不了的两件事（越界值、字段名漂移），
+  类型不对**整条动作作废**——畸形参数绝不能让 `silent` 生效。
+  `parse_reply_output(content, call)` 只认工具参数提交的动作；旧解析器、`MAX_REPLY_PROTOCOL_CHARS`
+  与 `complete_truncated_json_object` 在回复路径上的使用全部删除。正文里复述的旧标记改为整段
+  截掉（`scrub_reply_protocol_markers`），保住"标记永远不发出去"这条安全属性，且不再被解释成动作。
+- `memory_query.rs`：`reply_action` 与注册表工具并列下发，且是**终止轮**——提交动作即下结论；
+  与其它工具同轮提交则动作作废、工具照常执行并回灌结果，下一轮要求重新单独提交（不静默丢调用）。
+  返回值由 `BotMemory` 换成 `ReplyTurn`（正文 + 动作），宿主自有静默改为结构化
+  `ReplyTurn::silent()`，`SILENT_REPLY_OUTPUT` 文本常量删除。工具注册表不可用时不再连带砍掉
+  `reply_action`——它不走注册表。
+- `utils.rs`：空回复修复真的把 `reply_action` 挂上（提示词点了名就必须给，否则又是"提示词点名了
+  工具、她手里却没有"）；语气上下文按各条路原口径保留（新增 `NativeToolStyle`：非工具轮带
+  `generate_reply_guidance`，与迁移前逐字一致）。
+- `llm_mock.rs`：替身支持返回"正文 + 原生工具调用"，补两条端到端接缝用例——这一轮确实挂上了
+  工具、工具调用确实变成动作、正文里的标记确实不再变成动作。
+
+Core（`yunxi/core_model.rs`）
+
+- 删除 `[[REPLY_ACTION]]` 兼容信封的读取器（`intrinsic_reply_payload` /
+  `parse_intrinsic_reply_messages` / `safe_single_structured_reply_message`）与只服务它的
+  测试用序列化/裁剪器（共 217 行）。intrinsic 提示词早已只要求一条自然消息，多气泡由 Core 逐条
+  生成后自己排序，信封没有任何生产者。
+- `sanitize_intrinsic_output` / `sanitize_autonomous_intrinsic_output` 只接受自然语言。
+- `CORE_REPLY_REPAIR_PROMPT` 去掉 REPLY_ACTION 这个已死词（写进提示词就是教它写）。
+- **泄漏守卫一条没删**：`intrinsic_output_is_unsafe`、修复通道校验器、
+  `plain_reply_contains_transport_protocol`、诊断字段（`reply_action=` 改名
+  `stale_reply_marker=`）——旧标记出现即判不可用，不会发给用户。这是"拒绝"不是"兜底"。
+
+**验证**：`cargo fmt --check` 干净；`cargo clippy --workspace --all-targets --locked -- -D warnings`
+干净；`cargo test --workspace --all-targets --locked` = model **1151** + core **355** + CLI **10** +
+acceptance **13** 全过（model 侧删掉 3 个只测旧信封构建器的用例，新增 2 条端到端接缝用例与
+1 条"动作必须单独调用"的分流用例）。
+接缝用例覆盖了"工具真的下发 / 工具调用真的变成动作 / 正文标记真的不再是动作"，把这次改动最容易
+无声失效的那一段（跨模型调用的接缝）钉住了。
+
+**遗留与代价（如实记下）**：
+
+1. **没做真机端到端**。文档原方案最后一步要求"跑一次真实的私聊/群聊端到端确认"；那需要先把新代码
+   部署到运行中的机器人上（部署属于不可逆红线，须由你拍板），所以本轮只到自动化验证为止。
+2. `server.wire_api = "responses"` 的部署**拿不到原生工具**（`params_model_with_native_tools_mode`
+   在非 `chat_completions` 时直接返回模型错误）。这是既有约束——Core 的工具轮、sticker-only 轮
+   在 responses 下本来就走不通——但这次把普通的结构化回复回合也纳入了同一约束：那些回合现在会以
+   模型错误结束并触发"回复链路异常"报警，不再有文本协议兜底。当前线上 `bot.conf.toml` 用的是
+   `chat_completions`，不受影响；`bot.conf.example.toml` 里示范的是 `responses`，要按它部署就得
+   先决定是补 responses 的工具支持、还是把示范改成 chat_completions。
+3. 顺带修（`e26c02a`）：`CORE_REPLY_REPAIR_PROMPT` 与 `core_tool_follow_up_instruction` 两处生产
+   提示词还在教模型手写 `[[TOOL_CALL]]` 标记，而代码那条通道不带工具、校验器又一律拒收标记，
+   照做必败；已改成 function-calling 口径。
