@@ -3254,8 +3254,13 @@ async fn sticker_list() -> Result<String> {
 /// 答应"等下发给你"、再发现相册里根本没有那张图，整条承诺落空。
 fn sticker_list_reply(listing: Option<String>) -> String {
     match listing {
+        // **只给数据，不教格式**：Core 用正文标记 `[[STICKER 标签]]`，宿主用动作里的
+        // `"sticker":"标签"` 字段，工具返回的同一段话没法同时说对两种。谁在读它，格式由
+        // 那一轮的回复协议负责（Core 的 `sticker_library::STICKER_PROMPT`、宿主的
+        // `reply::REPLY_PROTOCOL_STICKER`）。这里写死一种，另一条链路就会照着发错——
+        // 2026-09-15 实测：宿主条件下她照着这段把 `[[STICKER …]]` 写进了正文。
         Some(listing) => format!(
-            "这是你自己的相册，里面有这些图（标签）：{listing}\n把其中一个标签原样写进正文最前面的 [[STICKER 标签]]，程序会把那张图贴在这条消息里发出；正文可以留空（那就只发一张图）。清单之外的一律没有，不要答应发清单外的图。"
+            "这是你自己的相册，里面有这些图（标签）：{listing}\n标签原样使用，不要自己起名字；怎么把图发出去按本轮回复协议里写的做。"
         ),
         None => "你自己的相册现在是空的，这一次没有可以发的图。".to_string(),
     }
@@ -4001,15 +4006,22 @@ mod tests {
     /// 也钉住"清单不进提示词"这条：清单只在工具返回里出现，所以返回里必须把
     /// "怎么写标记"一并说清，否则她拿到了标签也不知道贴哪。
     #[test]
-    fn sticker_list_tool_explains_both_the_labels_and_the_marker() {
+    fn sticker_list_tool_returns_labels_without_teaching_a_format() {
         let with_labels = sticker_list_reply(Some("无语又想笑；开心".to_string()));
         assert!(with_labels.contains("无语又想笑；开心"));
-        assert!(with_labels.contains("[[STICKER 标签]]"));
-        assert!(with_labels.contains("正文可以留空"));
+        assert!(with_labels.contains("原样使用"));
+        // 格式归各条链路的回复协议管：这里写死一种，另一条链路就会照着发错。
+        assert!(
+            !with_labels.contains("[[STICKER"),
+            "工具返回不该教 Core 的正文标记（宿主链路会照抄）：{with_labels}"
+        );
+        assert!(
+            !with_labels.contains("\"sticker\""),
+            "工具返回也不该教宿主的动作字段：{with_labels}"
+        );
 
         let empty = sticker_list_reply(None);
         assert!(empty.contains("空的"), "{empty}");
-        assert!(!empty.contains("[[STICKER"), "没素材时不该教她写标记");
     }
 
     /// `sticker.list` 只在素材库里真有素材时才随请求下发：多一个用不上的 schema

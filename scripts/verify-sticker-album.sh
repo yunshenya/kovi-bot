@@ -43,7 +43,8 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 sticker_source="$repo_root/plugins/model/src/sticker_library.rs"
 prompt_source="$repo_root/plugins/model/src/config/prompt.rs"
 core_source="$repo_root/plugins/model/src/yunxi/core_model.rs"
-for file in "$sticker_source" "$prompt_source" "$core_source"; do
+reply_source="$repo_root/plugins/model/src/model/reply.rs"
+for file in "$sticker_source" "$prompt_source" "$core_source" "$reply_source"; do
   [ -f "$file" ] || {
     echo "找不到源文件：$file" >&2
     exit 1
@@ -77,8 +78,44 @@ sys.stdout.write(re.sub(r'\\\n\s*', '', match.group(1)))
 PY
 }
 
+# `const X: &str = concat!("…", "…", …);` —— 宿主链路那几段协议都是这么写的。
+# 把每个字符串字面量取出来拼上，等价于编译期展开。
+extract_concat_b64() {
+  python3 - "$1" "$2" <<'PY' | base64 | tr -d '\n'
+import re, sys
+text = open(sys.argv[1], encoding="utf-8").read()
+match = re.search(r'const %s: &str = concat!\((.*?)\);' % re.escape(sys.argv[2]), text, re.S)
+if match is None:
+    raise SystemExit("源码里找不到 concat! 常量 " + sys.argv[2])
+parts = re.findall(r'"((?:[^"\\]|\\.)*)"', match.group(1))
+if not parts:
+    raise SystemExit("concat! 里没有字符串字面量 " + sys.argv[2])
+joined = "".join(parts)
+sys.stdout.write(joined.replace('\\"', '"').replace("\\n", "\n"))
+PY
+}
+
 prompt_b64="$(extract_const_b64 "$sticker_source" STICKER_PROMPT)"
 persona_b64="$(extract_field_b64 "$prompt_source" persona)"
+host_head_b64="$(extract_concat_b64 "$reply_source" REPLY_PROTOCOL_HEAD)"
+host_sticker_b64="$(extract_concat_b64 "$reply_source" REPLY_PROTOCOL_STICKER)"
+host_tail_b64="$(extract_concat_b64 "$reply_source" REPLY_PROTOCOL_TAIL)"
+
+# 宿主链路的写法必须与 Core 区分开：它解析的是动作里的 sticker 字段，不是正文标记。
+python3 - "$reply_source" <<'PY'
+import re, sys
+text = open(sys.argv[1], encoding="utf-8").read()
+match = re.search(r'const REPLY_PROTOCOL_STICKER: &str = concat!\((.*?)\);', text, re.S)
+if match is None:
+    raise SystemExit("源码里找不到 REPLY_PROTOCOL_STICKER")
+body = match.group(1)
+if '\\"sticker\\":\\"标签\\"' not in body.replace(" ", ""):
+    raise SystemExit("宿主协议里没有 sticker 字段的写法：她会在动作里发不出图")
+if "[[STICKER" in body:
+    raise SystemExit("宿主协议里出现了 Core 的正文标记：那会被当成正文发出去")
+if "sticker_list" not in body:
+    raise SystemExit("宿主协议里没有点明清单怎么拿")
+PY
 
 # 清单不许常驻提示词（2026-09-15 用户口径：试过常驻，被否掉）。判据是协议里不出现
 # 列举式清单、且点明了"要发就先调 sticker.list"——少了后半句她将无从知道该去查。
@@ -105,10 +142,13 @@ if ! grep -q "insert_persona_context(" "$core_source"; then
 fi
 
 ssh -o BatchMode=yes -o ConnectTimeout=8 -p "$port" \
-  "$host" "KOVI_PROMPT_B64=$prompt_b64 KOVI_PERSONA_B64=$persona_b64 bash -s" <<'REMOTE'
+  "$host" "KOVI_PROMPT_B64=$prompt_b64 KOVI_PERSONA_B64=$persona_b64 KOVI_HOST_HEAD_B64=$host_head_b64 KOVI_HOST_STICKER_B64=$host_sticker_b64 KOVI_HOST_TAIL_B64=$host_tail_b64 bash -s" <<'REMOTE'
 set -euo pipefail
 export PROTOCOL_TEXT="$(printf '%s' "$KOVI_PROMPT_B64" | base64 -d)"
 export PERSONA_TEXT="$(printf '%s' "$KOVI_PERSONA_B64" | base64 -d)"
+export HOST_HEAD="$(printf '%s' "$KOVI_HOST_HEAD_B64" | base64 -d)"
+export HOST_STICKER="$(printf '%s' "$KOVI_HOST_STICKER_B64" | base64 -d)"
+export HOST_TAIL="$(printf '%s' "$KOVI_HOST_TAIL_B64" | base64 -d)"
 
 python3 <<'PY'
 import json, os, re, urllib.request
@@ -152,9 +192,11 @@ STICKER_TOOL = {
         "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
     },
 }
-# `sticker_list_reply` 的措辞（源码里是 format! 拼的，这里取最关键的那句与真实标签）。
-TOOL_RESULT = ("可用表情包标签：芸汐的照片\n把其中一个标签原样写进正文最前面的 [[STICKER 标签]]，"
-               "程序会把那张图贴在这条消息里发出；正文可以留空（那就只发一张图）。")
+# `sticker_list_reply` 的措辞（源码里是 format! 拼的，这里取它实际给的两件事：清单 +
+# "原样使用"）。**工具不给格式**——格式由各条链路的回复协议负责，写死在工具里另一条链路
+# 就会照着发错（2026-09-15 实测过）。
+TOOL_RESULT = ("这是你自己的相册，里面有这些图（标签）：芸汐的照片\n"
+               "标签原样使用，不要自己起名字；怎么把图发出去按本轮回复协议里写的做。")
 
 PROTOCOL = os.environ["PROTOCOL_TEXT"].strip()
 # 对照组 = 改动前的写法：一句协议 + 旧技术身份（线上 13:20 就是它）。
@@ -264,6 +306,43 @@ for label, parts in (
         problems.append("%s：出现否认话术 %s" % (label, "、".join(denies)))
     if not sends:
         problems.append("%s：拿到清单也没写出 [[STICKER 标签]]" % label)
+
+# --- 条件四：宿主链路用动作字段，不是正文标记 --------------------------------------
+# 宿主解析的是 `[[REPLY_ACTION]]{"sticker":"标签"}`；正文里的 `[[STICKER 标签]]` 属于 Core。
+# 2026-09-15 我把两条链路"统一成一份文案"，结果她在宿主回合里会把标记当正文发出去——
+# 这条条件就是那次回归的实测守卫：两个格式必须各归各的。
+host_system = "\n".join(
+    [persona, os.environ["HOST_HEAD"].strip(), os.environ["HOST_STICKER"].strip(),
+     os.environ["HOST_TAIL"].strip()])
+messages = [{"role": "system", "content": host_system}, {"role": "user", "content": TURNS[0]}]
+first = ask(messages, tools=[STICKER_TOOL])
+called = tool_call_of(first) is not None
+content = (first.get("content") or "").strip()
+call = tool_call_of(first)
+if call is not None:
+    messages.append({"role": "assistant", "content": content, "tool_calls": [call]})
+    messages.append({"role": "tool", "tool_call_id": call["id"], "content": TOOL_RESULT})
+else:
+    messages.append({"role": "assistant", "content": content})
+    messages.append({"role": "system", "content": "（sticker_list 返回）\n" + TOOL_RESULT})
+messages.append({"role": "user", "content": "发我看看"})
+final = ask(messages)
+final_content = (final.get("content") or "").strip()
+print("--- 条件四：宿主链路（动作字段 + sticker_list 工具）---")
+print("用户: " + TURNS[0])
+print("芸汐: " + (content if content else "(只调了工具)"))
+print("调用 sticker_list: " + ("是" if called else "否"))
+print("用户: 发我看看")
+print("芸汐: " + final_content)
+print()
+if denial_hits(content) or denial_hits(final_content):
+    problems.append("条件四：宿主链路出现否认话术：%s" % final_content)
+if "[[STICKER" in final_content:
+    problems.append("条件四：宿主链路里写了 Core 的正文标记，会被当成正文发出去：%s" % final_content)
+if '"sticker"' not in final_content:
+    problems.append("条件四：宿主链路没有发出 sticker 动作字段：%s" % final_content)
+elif "芸汐的照片" not in final_content:
+    problems.append("条件四：动作字段里没有相册里那张的标签：%s" % final_content)
 
 # --- 对照：改动前（旧协议 + 旧技术身份）必须复现那句否认 ---------------------------
 old_answers = []
