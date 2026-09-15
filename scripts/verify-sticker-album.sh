@@ -83,7 +83,7 @@ persona_b64="$(extract_field_b64 "$prompt_source" persona)"
 
 # 人格必须真的注入 Core 链路——这是"统一人格"那一步的判据。没接上就等于两条链路
 # 仍然各说各话，而线上跑的是 Core。
-if ! grep -q "prompt().persona()" "$core_source"; then
+if ! grep -q "insert_persona_context(" "$core_source"; then
   echo "core_model.rs 里没有把 persona 注进 Core 回合：统一人格那一步没接上" >&2
   exit 1
 fi

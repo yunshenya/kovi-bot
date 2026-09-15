@@ -1499,6 +1499,27 @@ fn with_chat_style(instruction: &str) -> String {
     )
 }
 
+/// 把人格插到这一轮的最前面——**每一条**进 Core 的回合都走这里。
+///
+/// 为什么单独抽一个函数：Core 这条链路此前**没有**任何一份人格提示词，它的"我是谁"
+/// 只有 Mind 自我认知里那句技术身份，于是线上 2026-09-15 13:20 她答"我哪有什么照片呀，
+/// 就是个只会打字陪你聊天的人"，连相册里那张自己的照片都不肯认。人格只此一份（配置的
+/// `prompt.persona`），宿主链路与 Core 共用，改一处两条链路一起变；抽出来是为了能单测
+/// "它排在最前、为空时不注入"，而不是靠读代码确认。
+fn insert_persona_context(messages: &mut Vec<BotMemory>, persona: &str) {
+    let persona = persona.trim();
+    if persona.is_empty() {
+        return;
+    }
+    messages.insert(
+        0,
+        BotMemory {
+            role: Roles::System,
+            content: persona.to_owned(),
+        },
+    );
+}
+
 fn core_plain_turn_instruction(
     voice_enabled: bool,
     sing_templates: &[crate::sing_reply::SingTemplate],
@@ -6051,21 +6072,7 @@ impl ModelBackend for KoviModelBackend {
                 );
             }
 
-            // 人格放在所有上下文之前：Core 这条链路此前**没有**任何一份人格提示词，
-            // 它的"我是谁"只有 Mind 自我认知里那句技术身份，于是线上 2026-09-15 13:20
-            // 她答"我哪有什么照片呀，就是个只会打字陪你聊天的人"，连相册里那张自己的
-            // 照片都不肯认。人格只此一份（配置的 `prompt.persona`），宿主链路与 Core
-            // 共用，改一处两条链路一起变。
-            let persona = crate::config::get().prompt().persona().trim().to_owned();
-            if !persona.is_empty() {
-                messages.insert(
-                    0,
-                    BotMemory {
-                        role: Roles::System,
-                        content: persona,
-                    },
-                );
-            }
+            insert_persona_context(&mut messages, crate::config::get().prompt().persona());
 
             let mut ticket = if let Some(admission) = incoming_admission {
                 if admission.ticket.scope() != conversation.scope() {
@@ -7704,23 +7711,23 @@ mod tests {
         eligible_mind_candidates, explicit_message_batch_needs_repair,
         explicit_message_count_for_event, explicit_message_count_for_input,
         explicit_message_count_instruction, first_person_turn_avoidance, group_reply_gap_secs_for,
-        group_reply_gap_secs_for_sender, interaction_state_updates_with_cues,
-        intrinsic_autonomous_intent_prompt, intrinsic_fallback_is_eligible,
-        intrinsic_output_is_unsafe, intrinsic_prompt, is_ambient_group_message,
-        is_plain_text_batch_data_context, keeps_existing_prepared_plan, message_id_for_log,
-        mind_context_messages, mind_outgoing_fence_required, parse_autonomous_intent_response,
-        parse_core_response, parse_direct_repair_output, parse_intrinsic_autonomous_directive,
-        parse_plain_core_response, parse_qq_conversation, plain_text_batch_message_prompt,
-        plain_text_batch_repair_context, pre_model_plan, prepared_outgoing_semantic_context,
-        purge_group_routes_from_cache, recent_conversation_messages,
-        recent_direct_conversation_messages, recent_group_conversation_messages,
-        refine_core_incoming, register_core_tool_intents, repair_context_messages,
-        reply_asks_something, reply_expected_for_incoming, reply_looks_complete,
-        reply_recovery_required, reply_text_has_semantic_content, reply_text_is_too_thin,
-        requested_message_count, route_from_lookup, route_lookup_with_fallback,
-        safe_single_structured_reply_message, safe_structured_reply_batch,
-        sanitize_autonomous_intrinsic_output, sanitize_core_plan_bubbles,
-        sanitize_intrinsic_output, sanitize_plain_text_batch_message,
+        group_reply_gap_secs_for_sender, insert_persona_context,
+        interaction_state_updates_with_cues, intrinsic_autonomous_intent_prompt,
+        intrinsic_fallback_is_eligible, intrinsic_output_is_unsafe, intrinsic_prompt,
+        is_ambient_group_message, is_plain_text_batch_data_context, keeps_existing_prepared_plan,
+        message_id_for_log, mind_context_messages, mind_outgoing_fence_required,
+        parse_autonomous_intent_response, parse_core_response, parse_direct_repair_output,
+        parse_intrinsic_autonomous_directive, parse_plain_core_response, parse_qq_conversation,
+        plain_text_batch_message_prompt, plain_text_batch_repair_context, pre_model_plan,
+        prepared_outgoing_semantic_context, purge_group_routes_from_cache,
+        recent_conversation_messages, recent_direct_conversation_messages,
+        recent_group_conversation_messages, refine_core_incoming, register_core_tool_intents,
+        repair_context_messages, reply_asks_something, reply_expected_for_incoming,
+        reply_looks_complete, reply_recovery_required, reply_text_has_semantic_content,
+        reply_text_is_too_thin, requested_message_count, route_from_lookup,
+        route_lookup_with_fallback, safe_single_structured_reply_message,
+        safe_structured_reply_batch, sanitize_autonomous_intrinsic_output,
+        sanitize_core_plan_bubbles, sanitize_intrinsic_output, sanitize_plain_text_batch_message,
         select_host_model_route_from_capability, serialize_intrinsic_reply_batch,
         shadow_projection_for_completed_plan, should_archive_raw_reply, silence_gate_plan,
         silence_verdict, silent_wait_plan, split_core_delivery_markers, split_two_short_lines,
@@ -9500,6 +9507,30 @@ mod tests {
             "[[STICKER]]正文"
         );
         assert_eq!(strip_core_delivery_markers("没有标记。"), "没有标记。");
+    }
+
+    /// 人格必须排在 Core 每一轮的最前面；人格为空时一条都不插（配置校验会拦住空人格，
+    /// 但热改配置的中间态也可能出现）。
+    #[test]
+    fn persona_context_leads_every_core_turn() {
+        let mut messages = vec![
+            BotMemory {
+                role: Roles::Data,
+                content: "Core memory context:\n…".to_owned(),
+            },
+            BotMemory {
+                role: Roles::User,
+                content: "在吗".to_owned(),
+            },
+        ];
+        insert_persona_context(&mut messages, "  你叫芸汐，是一个温柔、害羞的女孩子。  ");
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].role, Roles::System, "人格必须是第一条");
+        assert_eq!(messages[0].content, "你叫芸汐，是一个温柔、害羞的女孩子。");
+        assert_eq!(messages[2].content, "在吗", "原有顺序不能被打乱");
+
+        insert_persona_context(&mut messages, "   ");
+        assert_eq!(messages.len(), 3, "空人格不该插入任何东西");
     }
 
     /// 表情包说明**带真实清单常驻**：素材库关了或空着才整段不给。
