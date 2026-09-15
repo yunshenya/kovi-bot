@@ -1464,3 +1464,66 @@ WARN/ERROR 0、readiness 已写、巩固流程正常跑过（`Yunxi Mind reflect
 **诚实说明**：部署后 8 分钟内**没有真实的 Core 回复回合**（当时是凌晨，无流量），所以上述行为
 变化只在测试里验证过，**尚未经真实消息验证**。下一次有对话时值得回看日志确认第 1–4 条的实际
 表现。
+
+### 11.18 上线后第一个真实回合就 400：声明函数的名字没过 wire 形态（`b3f2998`）
+
+§11.17 结尾那句"尚未经真实消息验证"当晚就兑现了代价：**00:43:34 第一个真实的工具回合直接
+400**，她静默丢掉了群 641996763 的一条消息。
+
+**现象**：日志里
+
+```
+[ERROR] 模型请求返回 HTTP 400 Bad Request: invalid_request_error:
+Invalid 'tools[17].function.name': string does not match pattern. Expected a string
+that matches the pattern '^[a-zA-Z0-9_-]+$'.
+```
+
+→ `model_error_response` → `fallback unavailable` → `action=silent_wait`。全库只出现 1 次
+（就是第一轮），说明不是间歇故障，是**每一轮工具回合都会中**。
+
+**根因（两个，第二个被第一个掩盖）**：
+
+1. **直接原因**：`task_declare_tool_spec()` 把注册名 `task.declare` 原样写进
+   `function.name`。DeepSeek 按 `^[a-zA-Z0-9_-]+$` 校验，带点直接整轮 400。注册表那条路
+   （`tool_access::definition_spec`）统一过 `wire_tool_name`，而这份 spec 是手写的，绕开了它。
+   改为一处推导：spec 与 `take_task_declaration` 的读回都用 `wire_tool_name(TASK_DECLARE_TOOL_NAME)`。
+2. **被掩盖的同源错误**：`native_calls_to_core_intents` 判"这是不是声明"用的是
+   `resolve_wire_tool_name` **之后**的名字。而声明**不在注册表里**，反解对它退化成恒等，
+   于是 `task_declare` 永远不等于 `task.declare`——声明会被当成一个**真动作**交给 Core，
+   Core 仲裁器 fail-closed，每一轮都多一次"工具未声明"的失败。原来没暴露，只因为声明当时
+   也叫 `task.declare`（raw==raw 恰好相等），而那个名字一发出去就 400、根本走不到这里。
+
+**必须一起改**：只改 ①，② 会从"不可达"变成"每轮触发"。所以两处合成一个 commit，单独回滚
+任何一个都不是可用状态。
+
+**为什么三条断言全程是绿的**（比 bug 本身更值得记）：
+
+- `the_declaration_function_declares_instead_of_acting` 拿**常量跟常量比**
+  （`== TASK_DECLARE_TOOL_NAME`）——它钉住的是 bug 的形状，不是行为；
+- `a_declaration_never_becomes_a_tool_intent` 用全局 `tool_registry()`，而它在单元测试里
+  **永远是 `None`**，整条断言一直躺在 `None => return` 的提前返回里空转。这点是靠"把实现
+  还原成错误版本之后它居然还是绿的"才发现的；
+- 两者都改成断言线上形态，外加"真动作确实转成了意图"（否则会因为"整批都没转"而假绿）。
+
+**新增两条整类守卫**（防的是这一类，不是这一次）：手写 spec（`core_model` / `model::reply`）
+与注册表 spec（`definition_spec`）给出的每个 `function.name` 都必须符合 `^[a-zA-Z0-9_-]+$`，
+且注册名能反解回注册表。新增 `ToolRegistry::empty_for_test()`——空注册表恰好**如实建模**
+"声明不在注册表里"这条路径，也让测试不再依赖那个永远为 `None` 的全局。
+
+**验证**：`cargo test --workspace` 全绿（model 1177 通过 / 68 忽略，core 395 通过 / 1 忽略，
+CLI 10 + 验收 14），clippy 无告警，fmt 干净。两处实现各自做过变异验证：还原 ① 后
+`the_declaration_function_declares_instead_of_acting` 与
+`every_hand_written_tool_spec_uses_a_wire_safe_name` 变红；还原 ② 后
+`a_declaration_never_becomes_a_tool_intent` 变红并打印 `声明被当成了动作: ["task_declare"]`。
+
+**已上线**（`b3f2998`）：推 `616af55..b3f2998` → 本地交叉编译（包 14.2 MiB、sha256
+`4132a4f4…`）→ 服务端原子切换并写 readiness → 服务 active、重启 0 次、启动以来 WARN/ERROR 0、
+`模型工具注册表已就绪`。**回滚目标是 `5eeff5b`**。
+
+**顺带记一条运维提醒**：本地发布继承上一版配置，脚本会提示"继承的配置缺少模板里的键"
+（本次列出 `addressed_reply_rate_limit`、`ambient_requires_mind_intent`、`base_url`… 等 12 个）。
+这些键**不会**被本地发布带上去，需要时得走 GitHub Actions 手动发布重新生成配置。
+
+**诚实说明**：部署完成时（00:56）仍无流量，所以这次修复**同样只经测试验证**，还没有真实
+工具回合跑过。但这次的判据比上次硬：不是"看起来对"，而是"还原实现即变红"。下一次工具回合
+的日志值得回看——`tools[*].function.name` 不再出现 pattern 400，且不再有 `工具未声明` 类拒绝。
