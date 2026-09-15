@@ -681,11 +681,24 @@ where
         if let Some(error) = observer.planner_error {
             return Err(CliError::Runtime(format!("planner error: {error}")));
         }
-        let Some(report) = observer.turns.pop() else {
+        // A cycle may span several rounds, and an autonomous tick's own round is
+        // not necessarily the last one — a tool follow-up can come after it.
+        // Core's verdict for the tick lives on that round's report, so keep it
+        // instead of reporting whatever round happened to finish last.
+        let autonomous_report = observer
+            .turns
+            .iter()
+            .find(|report| report.autonomous_tick)
+            .cloned();
+        let Some(mut report) = observer.turns.pop() else {
             return Err(CliError::Runtime(
                 "runtime rejected the CLI event".to_owned(),
             ));
         };
+        if let Some(autonomous) = autonomous_report {
+            report.autonomous = autonomous.autonomous;
+            report.autonomous_tick = true;
+        }
         let Some(plan) = report.plan() else {
             return Err(CliError::Runtime(
                 "runtime rejected the CLI event".to_owned(),
@@ -931,6 +944,10 @@ impl CognitiveTurnObserver for CliTurnObserver {
         _event: &'a WorldEvent,
         report: &'a TurnReport,
     ) -> yunxi_core::TurnHook<'a> {
+        // A planner failure from an earlier round must not be reported as the
+        // whole call's failure once a later round has succeeded: the earlier
+        // round's delivery already happened.
+        self.planner_error = None;
         self.turns.push(report.clone());
         Box::pin(async {})
     }

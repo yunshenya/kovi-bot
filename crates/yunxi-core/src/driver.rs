@@ -177,9 +177,18 @@ pub trait CognitiveTurnObserver: Send + Sync {
     /// work was superseded (typically because an external lease was replaced)
     /// and the turn must be released rather than completed.
     ///
-    /// Core asks this once per event, immediately after the event is taken
-    /// from the queue. A `false` answer discards whatever plan the turn
-    /// produced, so the host must release the lease the event carries.
+    /// **Pure query, and asked more than once per turn**: once when the event
+    /// is taken from the queue, again after planning, and again before each
+    /// intent is dispatched. A `false` answer at any point discards whatever
+    /// the turn produced — including a prefix of intents that already
+    /// dispatched — so the host must release the lease the event carries. An
+    /// implementation that consumes a one-shot token or decrements a counter
+    /// will be refused on the second question and have its turn wrongly
+    /// reported as cancelled.
+    ///
+    /// Compatibility drivers ([`run_observed`], [`drain_observed`]) never ask:
+    /// a runtime without a planner cannot produce a continuation, so there is
+    /// no superseded work to skip.
     fn should_process(&self, _event: &WorldEvent) -> bool {
         true
     }

@@ -860,12 +860,15 @@ impl CognitiveRuntime {
         }
         self.lifecycle.record_ended(root);
         // A task that has stopped producing events can no longer satisfy what
-        // it expected, so settle those expectations before the record is
-        // dropped. This is the only place a deadline is evaluated without an
-        // event to trigger it — a task that goes quiet emits nothing to hang
-        // the check on.
-        let settled = self.executive.settle_trace_expectations(root);
-        self.record_expectation_results(settled);
+        // it expected, so release them instead of letting them hold quota until
+        // an unrelated event happens to notice their deadline. This is the only
+        // place a deadline is checked with no event to trigger it: a task that
+        // goes quiet emits nothing to hang the check on.
+        //
+        // The resolution is deliberately not recorded. It would be dropped by
+        // the very next line, and no follow-up round can ever read it — the
+        // task it belonged to is over.
+        let _ = self.executive.settle_trace_expectations(root);
         // A terminal task can no longer produce a round that would read this.
         self.working_memory.remove(&root);
         if self.tool_action_budget_by_trace.remove(&root).is_some() {
@@ -1003,28 +1006,39 @@ impl CognitiveRuntime {
         {
             return true;
         }
-        if self.has_ready_probed_command() {
+        if self.has_pending_command_event() {
             return true;
         }
-        match self.receiver.try_recv() {
-            Ok(command) => {
-                self.probed_commands.push_back(command);
-                self.has_ready_probed_command()
+        // Keep probing past control commands. They are not work, so reporting
+        // "there is work" for one would send a bounded driver into a turn that
+        // then waits on the channel — and an event queued behind a control
+        // command would be missed entirely.
+        loop {
+            match self.receiver.try_recv() {
+                Ok(command) => {
+                    self.probed_commands.push_back(command);
+                    if self.has_pending_command_event() {
+                        return true;
+                    }
+                }
+                Err(mpsc::error::TryRecvError::Empty) => return false,
+                Err(mpsc::error::TryRecvError::Disconnected) => return false,
             }
-            Err(mpsc::error::TryRecvError::Empty) => false,
-            Err(mpsc::error::TryRecvError::Disconnected) => false,
         }
     }
 
-    /// Whether a command held from a previous probe can produce a turn now.
+    /// Whether a queued command can produce a turn right now.
     ///
-    /// A command blocked by an active data-erasure barrier is left in place;
-    /// it becomes ready on a later probe.
-    fn has_ready_probed_command(&self) -> bool {
-        let blocked = &self.data_erasure;
+    /// Only an event can. An event stopped by an active data-erasure barrier is
+    /// left in place and becomes ready on a later probe.
+    fn has_pending_command_event(&self) -> bool {
         self.probed_commands.iter().any(|command| match command {
-            RuntimeCommand::Event(event) => !blocked.blocks(event),
-            _ => true,
+            RuntimeCommand::Event(event) => !self.data_erasure.blocks(event),
+            // Control commands carry no cognition, so they are never work.
+            RuntimeCommand::BeginDataErasure { .. }
+            | RuntimeCommand::EndDataErasure { .. }
+            | RuntimeCommand::BeginConversationDataErasure { .. }
+            | RuntimeCommand::EndConversationDataErasure { .. } => false,
         })
     }
 
@@ -1310,7 +1324,6 @@ impl CognitiveRuntime {
         let mut feedback = Vec::new();
         let mut tool_follow_up_events = Vec::new();
         let mut selected_action = None;
-        let mut round_attempts: Vec<crate::working_memory::WorkingAttempt> = Vec::new();
         let action_dispatch_started = std::time::Instant::now();
         for (intent_index, intent) in plan.intents.iter().enumerate() {
             if guard.is_some_and(|guard| !guard()) {
@@ -1489,12 +1502,18 @@ impl CognitiveRuntime {
             {
                 feedback.push(feedback_observation);
             }
-            // Record what this task just tried before the result becomes the
-            // next round's event. A tool round that asked for one tool would
-            // otherwise leave no trace of its arguments once the result is
-            // folded into the follow-up event's text.
+            // Record what this task just tried at the moment it resolves.
+            //
+            // Order matters: a non-tool intent earlier in this same round can
+            // resolve an expectation inline, and that observation is written at
+            // the end of the round. Recording the attempt here — rather than
+            // batching every attempt to the end as well — is what keeps the
+            // tool call ahead of the expectation it caused.
             if let Some(attempt) = crate::working_memory::attempt_from_intent(intent, &result) {
-                round_attempts.push(attempt);
+                self.working_memory
+                    .entry(planner_event.trace().root_event_id())
+                    .or_default()
+                    .record_round(std::slice::from_ref(&attempt));
             }
             actions.push(result);
         }
@@ -1522,15 +1541,6 @@ impl CognitiveRuntime {
                     final_tool_follow_ups.push(tool_event);
                 }
             }
-        }
-        if !round_attempts.is_empty() {
-            // The record exists so the *next* round can see what this task
-            // already tried. When a round has no follow-up there is no next
-            // round, so nothing is stored.
-            self.working_memory
-                .entry(planner_event.trace().root_event_id())
-                .or_default()
-                .record_round(&round_attempts);
         }
         if let Some(tool_follow_up) = aggregate_tool_follow_up_events(
             &planner_event,
@@ -3174,6 +3184,174 @@ fn message_sent_event(
 
 #[cfg(test)]
 mod tests {
+    /// A round records its tool calls in dispatch order, ahead of any
+    /// expectation its later intents resolve.
+    ///
+    /// The round below fills the whole history window with tool calls and
+    /// settles one expectation from its *last* intent. If the observation were
+    /// written before the calls instead of after them, it would survive inside
+    /// the window and show up here.
+    #[tokio::test]
+    async fn a_round_records_its_calls_ahead_of_the_expectations_they_settle() {
+        let conversation_id = ConversationId::new();
+        let (_handle, mut runtime) = CognitiveRuntime::new_with_services(
+            RuntimeConfig::default(),
+            CoreServices::with_model(ManyToolCallsModel { conversation_id }),
+        )
+        .expect("valid runtime");
+        let event = direct_message(conversation_id, PersonId::new());
+        assert_eq!(
+            runtime.register_expectation(
+                &event,
+                crate::executive::Expectation::new(
+                    crate::ActionId::new(),
+                    crate::executive::ExpectedEventPattern::EventType(
+                        crate::EventType::MessageSent
+                    ),
+                    0.9,
+                    // No deadline: only the observation of the sent message can
+                    // settle it, which happens inside the round.
+                    None,
+                ),
+            ),
+            Ok(true)
+        );
+        let arbiter = ActionArbiter::new(
+            ActionArbiterConfig::default().with_capabilities(EnvironmentCapabilities::all()),
+        );
+        runtime
+            .process_event_with_planner_and_actions(event, &arbiter, &ImmediateActionPort)
+            .await
+            .expect("turn runs");
+
+        let memory = runtime
+            .working_memory
+            .values()
+            .next()
+            .expect("the round left a history");
+        assert_eq!(memory.len(), crate::MAX_WORKING_ENTRIES);
+        let described: Vec<String> = memory
+            .entries()
+            .iter()
+            .map(|entry| match &entry.payload {
+                crate::WorkingEntryPayload::Attempt(attempt) => attempt.tool().to_owned(),
+                crate::WorkingEntryPayload::Observation(observation) => observation.describe(),
+            })
+            .collect();
+        // The window is the newest 16 entries: the last calls dispatched, in
+        // order, and then the expectation their last intent settled. The
+        // observation trails every call because it belongs after them.
+        assert_eq!(
+            described,
+            (5..=19)
+                .map(|index| format!("tool.{index}"))
+                .chain(std::iter::once(
+                    "接下来应当出现 MessageSent 事件：如期发生".to_owned()
+                ))
+                .collect::<Vec<_>>(),
+            "history must read in dispatch order"
+        );
+    }
+
+    /// Asks for many tools and then sends one message, so the round has a tool
+    /// prefix and a non-tool intent whose derived event settles an expectation.
+    struct ManyToolCallsModel {
+        conversation_id: ConversationId,
+    }
+
+    impl crate::ModelBackend for ManyToolCallsModel {
+        fn plan<'a>(&'a self, _input: &'a PlannerInput) -> crate::ModelBackendFuture<'a> {
+            Box::pin(async move {
+                let mut intents: Vec<crate::CognitiveIntent> = (0..(crate::MAX_WORKING_ENTRIES
+                    + 4))
+                    .map(|index| crate::CognitiveIntent::UseTool {
+                        tool_name: format!("tool.{index}"),
+                        input: "{}".to_owned(),
+                        scope: crate::ActionScope::Conversation(self.conversation_id),
+                        notification_policy: crate::ToolNotificationPolicy::Final,
+                    })
+                    .collect();
+                intents.push(crate::CognitiveIntent::send_message(
+                    self.conversation_id,
+                    crate::event::MessageContent::text("先说一句"),
+                ));
+                Ok(crate::DecisionPlan {
+                    disposition: crate::DecisionDisposition::Reply,
+                    intents,
+                    state_updates: Vec::new(),
+                })
+            })
+        }
+    }
+
+    /// Completes tools and delivers messages, so the round can settle an
+    /// expectation about its own message.
+    struct ImmediateActionPort;
+
+    impl ActionPort for ImmediateActionPort {
+        fn execute<'a>(&'a self, action: &'a crate::ProposedAction) -> crate::ActionPortFuture<'a> {
+            Box::pin(async move {
+                match action {
+                    crate::ProposedAction::UseTool(tool) => {
+                        Ok(crate::ActionPortOutcome::ToolCompleted {
+                            operation: tool.tool_name.clone(),
+                            output: "ok".to_owned(),
+                        })
+                    }
+                    crate::ProposedAction::SendMessage(send) => {
+                        Ok(crate::ActionPortOutcome::Delivered {
+                            external_reference: None,
+                            message_id: Some(crate::MessageId::new()),
+                            conversation_id: Some(send.conversation_id),
+                        })
+                    }
+                    _ => Err(crate::ActionPortError::new("unsupported", false)),
+                }
+            })
+        }
+    }
+
+    /// A control command is bookkeeping, not cognition: it must never be
+    /// reported as work, and it must not hide an event queued behind it.
+    #[tokio::test]
+    async fn the_quiescence_probe_ignores_control_commands_but_not_events() {
+        let conversation_id = ConversationId::new();
+        let (handle, mut runtime) =
+            CognitiveRuntime::new(RuntimeConfig::default()).expect("runtime");
+
+        // Queue the erasure command first, then the event, so the probe has to
+        // look past the command to find the work. The erasure call blocks until
+        // the runtime acknowledges it, so it runs on its own task; the turns
+        // below are what let that acknowledgement happen.
+        let erasure_handle = handle.clone();
+        let erasure = tokio::spawn(async move {
+            erasure_handle
+                .begin_data_erasure(PersonId::new(), Vec::new())
+                .await
+        });
+        // Give the erasure command the queue first.
+        tokio::task::yield_now().await;
+        assert_eq!(
+            handle
+                .submit(direct_message(conversation_id, PersonId::new()))
+                .await,
+            Ok(Admission::Accepted)
+        );
+        assert!(
+            runtime.has_pending_event(),
+            "an event behind a control command is still work"
+        );
+        assert!(matches!(
+            runtime.process_next_with_event().await,
+            Some((_, ProcessingOutcome::Observed(_)))
+        ));
+        assert!(erasure.await.expect("erasure task").is_ok());
+        assert!(
+            !runtime.has_pending_event(),
+            "bookkeeping alone must not be reported as work"
+        );
+    }
+
     use super::{
         Admission, CognitiveRuntime, DataErasureError, MAX_DATA_ERASURE_CONVERSATIONS,
         MAX_GOALS_PER_CONTEXT_OWNER, PlannedProcessingOutcome, ProcessingOutcome, RuntimeConfig,
