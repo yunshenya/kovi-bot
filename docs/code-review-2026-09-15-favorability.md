@@ -706,3 +706,72 @@ turn_gate `4c6a935`）里修掉了；5.3 的 LOW 也逐条过了一遍（能修�
    Core 路——但那条路径本身就是理解层的产物，等于半个方案。
 
 我倾向 **2**，但它每次都要花钱且影响画像涨速，属于"成本与产品取舍"，没有替你拍板。
+
+## 十一、第三轮修复台账（2026-09-15 晚，无人值守批次）
+
+本批把"能客观判定对错"的问题全部修完，并把两条此前没审完的线（存储/mind、模型生成层）
+补完。所有条目都跑了测试，关键改动做了**阴性对照**（把修复还原后测试必须失败）。
+
+### 11.1 已修（14 个 commit）
+
+| 提交 | 修了什么 | 怎么验证的 |
+| --- | --- | --- |
+| `0e48bee` | 后台标签表 / 配置文件名与备份数缓存永不失效；进页面、保存、按磁盘重载时置脏；选中文件消失时退回主文件 | node 抽出 `fetchTagList` 与文件列表守卫，4 项检查；改回旧写法后"置脏应重拉"失败 |
+| `bf0da37` | 人物页 `共 N 人` 却只画 60 张卡片且无翻页；翻页条参数化，人物页与记录页页码各自独立 | node 抽出 `renderPager`，5 项检查（区间、禁用态、越界钳制、空结果、窗口口径） |
+| `82dc9ca` | 放开 `allow_non_loopback` 后页面仍写"只监听回环地址"；按实际绑定渲染两种文案 | 新增 `index_states_the_actual_bind_scope`，两种绑定各取一次响应体 |
+| `72b1f64` | 「全部展开/折叠」字面与动作相反；「再加载 N 条」写的是窗口总量而非本次追加量、到顶后按钮点了没反应；删死常量 `MASK` | node 抽出 `syncExpandButton`、`setOpen` 改动路径与追加量算式，4 项检查 |
+| `1a3e607` | 图谱节点用裸 id 当身份，跨类型（v2 与旧表共享 UUID、档案 id 就是 QQ 号）撞车导致连线丢失、度数挂错人 | 新增 `link_endpoints_use_namespaced_keys`，改回裸 id 后立刻失败；node 侧 5 项折叠检查 |
+| `319a769` | 对已了结的问题/议程重复提案会让**整批反思**以 VersionConflict 回滚；无变化的提案改为跳过 | 两个新用例覆盖"首次了结 → 带当前版本重放被跳过 → 带旧版本仍冲突" |
+| `e091a70` | ① Host 工具结果未中和 `[[REPLY_ACTION]]` 等协议标记，被篡改的网页可让她对明确提问静默（Core 链有中和、Host 链漏了）；② `compression_cutoff` 用 `len-2` 夹住保留条数，`[系统, 本轮来信]` 会把本轮来信整条压掉，请求里一个 user 轮次都不剩 | 两条新测试；分别还原后对应测试失败 |
+| `da90d68` | 折队只限条数不限字节，刷屏把单条 turn 撑到几十万字并写进记忆 | 新增 `folded_text_never_exceeds_one_inbound_message`（含连续折叠 50 次不增长） |
+| `53dac39` | 账本存储建表漏了 13 个兄弟 store 都有的建议锁；短 id 前缀用 `LIKE` 当通配符（`_`/`%` 会命中一堆行并被报成"没找到"） | 两个单元测试 + 真库测试 `gag_prefix_lookup_uses_a_uuid_range_and_rejects_wildcards` |
+| `f381485` | 语义召回无 LIMIT、无超时，一次可把整表向量（默认上限 5 万条 ≈ 100MB）拉进进程并独占共享连接池 | 补召回索引 + 2 秒预算 + 候选窗口；`memory::` 53 passed，真库 3 passed |
+| `e65c7e4` | 表情包建表迁移无锁，`DROP CONSTRAINT`+`ADD CONSTRAINT` 并发时会失败并 `panic!` 掉整个插件 | 真库测试连跑两次迁移断言复合主键；另用 `BEGIN … ROLLBACK` 复刻旧表验证迁移语句与 `IF EXISTS` |
+| `4b290fa` | 单轮工具调用无上限：一次响应里的上百个 `group.message.send` 会全部真的执行 | 抽出 `refuse_tool_call` 并加 5 项断言 |
+| `cc1e129` | 群成员列表读不到时按 `Ok(lookup_failed)` 上报，宿主层记成"工具成功" | `model::tool_access` 20 passed |
+| `b896f69` `31f39fe` | 上面两条引入的 clippy 告警（`items_after_test_module`、`manual_clamp`） | `clippy -D warnings` 干净 |
+
+回归：`cargo fmt --check` 干净；`cargo clippy --workspace --all-targets --all-features -- -D warnings` 干净；
+`cargo test --workspace` 1128 + 350 + 10 + 13 全过（58 ignored）；带 `DATABASE_URL` 跑 ignored
+真库测试 57 passed（唯一失败是 `redis_store` 那条需要 `REDIS_URL`，本机没有 Redis）。
+
+### 11.2 已核实为**误报**、不必改的审计结论
+
+两条审计线共报 30 条，其中这几条经逐行复核不成立（记下来免得下次再查一遍）：
+
+- "Postgres 在空查询下 `relevant()` 恒返回空、反思永远看不见已有看法" —— 不成立。
+  `search_enabled` 为 false 时 SQL 里的 `NOT $4::BOOLEAN` 直接放行，空查询走的是
+  "按 score/recency 排序"那条路；内存在线实现的 `query.trim().is_empty()` 分支是同一语义。
+- "`BeliefStore::relevant` 传 `now: None`，退休信念仍进 planner 快照" —— 不成立，
+  `mind_store.rs` 那一处传的是 `Some(now)`。
+- "`InterestOperation::Decay` 在生产是空操作（elapsed 恒为 0）" —— 不成立。
+  `decay(effective_at)` 用的是**记录自己的** `updated_at` 算 elapsed，于是
+  `elapsed = max(now - updated_at, 0)`，正是想要的语义。
+- "`relation_store::set` 绑定了 SQL 从不引用的 `$3`/`$4`" —— 不成立，那两个占位符
+  在 `VALUES ($1,$2,$3,$4,$5,$9)` 里给新行用（首次插入时没有相处证据，取快照值是对的）。
+
+### 11.3 待你拍板（都涉及语义取舍，不擅自改）
+
+1. **`MessageReceivedEvent.stop_requested` 恒为 false**（ingress 四处硬编码）。字段与
+   下游分支都在，但没有生产者：接上等于新增"用户说停就停下这一轮"的能力，删掉则是删字段与
+   一整串死分支。二选一。
+2. **TurnGate 用户文本可注入字段标记**（`\u{0001}`–`\u{0004}`）。需要选：标记改成不可预测的
+   nonce / 渲染前转义用户文本 / 保持现状但写进文档。注意 `tools/turngate/features.py` 要同步。
+3. **`AffectStore::set` 是无版本判据的整行覆盖**（与 2026-09-14 关系侧那次事故同型，关系侧
+   已改成"只写自己两维 + delta 通道"）。要么加 `RETURNING` + 乐观判据，要么同样拆 delta 通道。
+4. **`save_world` 是 7 表全表重写、与擦除路径不互斥**（作者自己的测试名就写着"erasure must
+   resync the runtime"）。要么给快照写单独的建议锁并与擦除互斥，要么降级成按 id upsert + 墓碑清理。
+5. **决策记录的 `ON CONFLICT (event_id) DO NOTHING` 返回值被丢弃**，重放保护形同虚设。
+   要定"同 event_id 不同内容"算幂等还是冲突。
+6. **后台接口把原始 DB/IO 错误文本与绝对路径回给前端**。单管理员 + 默认回环，是"便于运维"
+   还是"收窄成一句通用错误 + 服务端日志"，取决于你的偏好。
+7. **`Unknown` 出站记录 1 小时内不可淘汰**，攒满 16 格后该会话整批回复被拒（网络抖动 16 次
+   即可让一个群最长哑 1 小时）。淘汰策略要定：容量优先（按 `terminal_at` 淘汰旧的）还是
+   保留优先（把幂等记录搬到独立有界 LRU）。
+8. **群聊说话人标记可被换行伪造**、且**折队会把别人的话挂到最新发言人名下**。两者都要动
+   提示词格式（正文净化规则 + 片段级发言人），改完会改变模型看到的历史呈现方式。
+9. **Executive 两处**：合并已有冲突时会重设 `conflict_scopes[id]`，让按作用域擦除漏掉它；
+   `ExpectationStatus::Violated|Cancelled` 落进空分支被删、`Expectation::violate()` 无调用者。
+   需要先定"预期被违反"在产品上意味着什么。
+10. **后台 `/api/memory/stats` 把 DB 错误静默降级成 0**、**提醒发送失败对用户完全静默**、
+    **agent_run 通知闸门瞬时故障被当成终态失败** —— 都是"失败该不该让用户/运维看见"的口径问题。
