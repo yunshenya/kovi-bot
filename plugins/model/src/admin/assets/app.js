@@ -316,6 +316,11 @@
       config.spyCleanup = null;
     }
     currentPage = page;
+    // 轻量列表进页面时重拉一次：配置文件名与备份数、记忆的标签表都会在后台变化，
+    // 缓存一整个会话的话新出现的文件/标签永远不会进到界面上。配置**内容**不重读，
+    // 免得悄悄丢掉没保存的改动——按磁盘重读是「重新加载」那一步的活。
+    if (page === 'config') config.staleFiles = true;
+    if (page === 'memory') memory.staleTags = true;
     if (pageFromHash() !== page) {
       const url = `#/${page}`;
       if (hashInitialized) history.pushState(null, '', url);
@@ -995,6 +1000,8 @@
 
   const config = {
     files: [],
+    /** 文件名与备份数会变（新建文件、保存时写备份），进页面或保存后置位重拉。 */
+    staleFiles: true,
     main: 'bot.conf.toml',
     name: null,
     data: null,
@@ -1015,13 +1022,19 @@
 
   async function renderConfigPage() {
     const page = $('#page-config');
-    if (!config.files.length) {
+    if (config.staleFiles || !config.files.length) {
       const payload = await api('/api/config/files');
       config.files = payload.files;
       config.main = payload.main;
       config.restartSections = payload.restart_sections || [];
-      config.name = config.name || config.main;
+      config.staleFiles = false;
+      // 当前选中的文件可能已经改名或被删掉：留在旧名字上每次重画都只换来一个 404。
+      if (!config.files.some((file) => file.name === config.name)) {
+        config.name = config.main;
+        config.data = null;
+      }
     }
+    config.name = config.name || config.main;
     if (!config.data || config.data.name !== config.name) {
       try {
         await loadConfigFile(config.name);
@@ -1165,6 +1178,8 @@
             try {
               await api('/api/config/reload', { method: 'POST' });
               config.dirty.clear();
+              // 备份目录可能也被动过，列表跟着重拉一次。
+              config.staleFiles = true;
               await loadConfigFile(config.name);
               toast('已按磁盘内容重新加载配置');
               await renderConfigPage();
@@ -1493,6 +1508,8 @@
         body: { file: config.name, changes },
       });
       config.dirty.clear();
+      // 保存会写一份备份，左栏「备份 (N)」得跟着变。
+      config.staleFiles = true;
       await loadConfigFile(config.name);
       await renderConfigPage();
       const restart = (result.changed || []).some((key) => restartRequiredFor(key));
@@ -1738,6 +1755,8 @@
     stats: null,
     graph: null,
     tagList: null,
+    /** 标签表按需重拉：页面内的筛选/翻页复用缓存，进页面或点「刷新」时置位。 */
+    staleTags: true,
     selected: null,
     granularity: 'month',
     groupIndex: 0,
@@ -1927,13 +1946,18 @@
 
   // ── 记录页：统计 + 筛选 + 三视图
 
+  /** 筛选条的标签表：页内交互（筛选、翻页、切视图）复用缓存，进页面与点「刷新」
+   *  时重新拉——否则运行中新产生的标签在整个会话里都不会出现在筛选条上。 */
+  async function fetchTagList() {
+    if (memory.tagList && !memory.staleTags) return memory.tagList;
+    memory.tagList = await api('/api/memory/tags');
+    memory.staleTags = false;
+    return memory.tagList;
+  }
+
   async function renderRecordsTab(page) {
-    const [stats, tagList] = await Promise.all([
-      api('/api/memory/stats'),
-      memory.tagList ? Promise.resolve(memory.tagList) : api('/api/memory/tags'),
-    ]);
+    const [stats, tagList] = await Promise.all([api('/api/memory/stats'), fetchTagList()]);
     memory.stats = stats;
-    memory.tagList = tagList;
 
     if (stats.usage) page.append(renderUsageCards(stats.usage));
     page.append(renderStatCards(stats));
@@ -2032,7 +2056,10 @@
         class: 'btn ghost',
         title: '刷新记忆',
         text: '刷新',
-        onclick: () => renderMemoryPage(),
+        onclick: () => {
+          memory.staleTags = true;
+          renderMemoryPage();
+        },
       }),
       (memory.query || memory.tags.length || memory.scope || memory.kinds.length)
         ? h('button', {
