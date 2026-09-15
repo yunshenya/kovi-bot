@@ -120,10 +120,70 @@ impl QqDestination {
 /// 之前**超时可以安全重试。
 const SEND_STAGE_RESOLVE_BUDGET: std::time::Duration = std::time::Duration::from_secs(6);
 const SEND_STAGE_AUTHORIZE_BUDGET: std::time::Duration = std::time::Duration::from_secs(6);
-const SEND_STAGE_COMMIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
+/// 预提交这一级的特殊之处：它**可能要等同一条票据上更早的语义准入 resolve**
+/// （`interrupt.rs` 的 `begin_outgoing_commit` 会一直等到那条准入 resolve 或到期，
+/// 准入的预留租期是 180 秒）。别级是"内存里几步操作该多快"，这一级是"前一条回合
+/// 还要跑多久"，两者不是一个量纲。
+///
+/// 原先沿用 3 秒，于是"前一条回合还在跑"就等于必然超时，代价是**把已经生成好的整条
+/// 回复丢掉**（线上 2026-09-15 18:13 与 19:27 各一次，都是这个阶段）。这里给到一次
+/// 模型调用同量级（`server.request_timeout_secs` 默认 60 秒），既覆盖常见的"等前一条
+/// 说完"，又不至于让一条卡死的准入把回合无限拖住。
+const SEND_STAGE_COMMIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
 /// 真正调 QQ 接口那一级：超过它说明平台侧没有及时回应，此时**不能**断定没发出去，
 /// 所以这一级超时按"结果未知"处理，而不是可重试。
 const SEND_STAGE_TRANSPORT_BUDGET: std::time::Duration = std::time::Duration::from_secs(12);
+
+/// "确定没发出去"的失败最多再试几次（每次都是一条新的完整尝试）。
+///
+/// 线上 2026-09-15 18:13 与 19:27 两次丢回复：回复已经生成好，收尾阶段超时，
+/// 失败标记明明是 `retryable: true`——但那个标记只释放幂等预留，pipeline 里没有
+/// 任何路径真的重发，于是整条回复就这么没了。这里把"真的重发一次"补上。
+const SEND_PIPELINE_RETRIES: usize = 1;
+
+/// 这个失败能不能断定"一条消息都没发出去"，因而可以安全重试。
+///
+/// 发送链路在真正调 QQ 之前有两级查库（会话路由、群白名单）与一次内存预提交，它们
+/// 超时都意味着**没跨过不可逆边界**（`send_stage_timeout_error` 的注释）；真正调 QQ
+/// 那一级（`transport_send`）超时是"结果未知"，走 `DeliveryIndeterminate`，压根不会
+/// 变成这里能看到的错误类别——重发它会重复发消息。所以判据只认前两级加预提交。
+fn send_failure_is_definitely_not_sent(error: &ActionPortError) -> bool {
+    let Some(stage) = error.category.strip_prefix(SEND_STAGE_TIMEOUT_PREFIX) else {
+        return false;
+    };
+    matches!(
+        stage,
+        SEND_STAGE_RESOLVE | SEND_STAGE_AUTHORIZE | SEND_STAGE_COMMIT
+    )
+}
+
+/// "确定没发出去就再试一次"的循环。
+///
+/// 抽成独立函数是为了能直接测它：真正的发送链路要机器人运行时，测不动；而"重试几次、
+/// 什么情况下不重试"恰恰是最容易写错、代价又最大的地方（少重试一次＝丢一条回复，
+/// 多重试一次＝重复发消息）。
+async fn retry_definitely_not_sent<T, F, Fut>(mut attempt_once: F) -> Result<T, ActionPortError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, ActionPortError>>,
+{
+    let mut attempt = 0_usize;
+    loop {
+        match attempt_once().await {
+            Err(error)
+                if attempt < SEND_PIPELINE_RETRIES
+                    && send_failure_is_definitely_not_sent(&error) =>
+            {
+                attempt += 1;
+                kovi::log::warn!(
+                    "Yunxi send retry after a definitely-not-sent failure: attempt={attempt}/{SEND_PIPELINE_RETRIES} category={}",
+                    error.category,
+                );
+            }
+            other => return other,
+        }
+    }
+}
 
 /// 给发送链路的一个阶段套预算，超时时留下**带阶段名**的一行。
 async fn with_send_stage_budget<T>(
@@ -144,11 +204,21 @@ async fn with_send_stage_budget<T>(
     }
 }
 
+/// 发送链路各阶段的名字与超时错误类别前缀。
+///
+/// 阶段名在三个地方用到（打预算时、造错误时、判断"能不能安全重试"时），所以只在这里
+/// 写一次：靠字面量在三处各写一遍，改一处就会让重试判据悄悄失效。
+const SEND_STAGE_RESOLVE: &str = "resolve_destination";
+const SEND_STAGE_AUTHORIZE: &str = "authorize_group";
+const SEND_STAGE_COMMIT: &str = "begin_outgoing_commit";
+const SEND_STAGE_TIMEOUT_PREFIX: &str = "send_stage_timeout:";
+
 /// 发送前阶段超时的统一文案：没跨过不可逆边界，所以可重试。
 fn send_stage_timeout_error(stage: &str) -> ActionPortError {
-    ActionPortError::new(format!("send_stage_timeout:{stage}"), true)
+    ActionPortError::new(format!("{SEND_STAGE_TIMEOUT_PREFIX}{stage}"), true)
 }
 
+#[derive(Clone, Copy)]
 struct QqSendContext<'a> {
     revalidation_target: DeliveryRevalidationTarget,
     expected_destination: QqDestination,
@@ -421,22 +491,22 @@ impl QqActionAdapter {
         // 发送链路第一级：查会话路由（数据库）。撞上连接池饥饿时在这里就失败，
         // 而不是拖到 30 秒后连阶段名都没有。
         let destination = with_send_stage_budget(
-            "resolve_destination",
+            SEND_STAGE_RESOLVE,
             SEND_STAGE_RESOLVE_BUDGET,
             conversation_id,
             self.resolve_conversation_destination_without_authorization(conversation_id),
         )
         .await
-        .ok_or_else(|| send_stage_timeout_error("resolve_destination"))??;
+        .ok_or_else(|| send_stage_timeout_error(SEND_STAGE_RESOLVE))??;
         if let QqDestination::Group(group_id) = destination {
             let authorized = with_send_stage_budget(
-                "authorize_group",
+                SEND_STAGE_AUTHORIZE,
                 SEND_STAGE_AUTHORIZE_BUDGET,
                 conversation_id,
                 crate::group_access::is_authorized_group(group_id),
             )
             .await
-            .ok_or_else(|| send_stage_timeout_error("authorize_group"))?
+            .ok_or_else(|| send_stage_timeout_error(SEND_STAGE_AUTHORIZE))?
             .map_err(|error| {
                 ActionPortError::new(format!("group_authorization_unavailable:{error}"), true)
             })?;
@@ -479,6 +549,19 @@ impl QqActionAdapter {
         };
         parse_qq_destination(external_id, *kind, self_id)
             .ok_or_else(|| ActionPortError::new("delivery_route_invalid", false))
+    }
+
+    /// 发送链路的入口：`send_to_destination` + 一次"确定没发出去"的重试。
+    ///
+    /// 只重试 [`send_failure_is_definitely_not_sent`] 认下的失败：那些阶段都在真正调
+    /// QQ 之前，重试不会重复发消息；而重试的收益很直接——回复已经生成好了，重试一次
+    /// 就发得出去，不重试用户什么都收不到。预提交动作在失败路径上**不会**被释放
+    /// （释放只发生在解析失败那一支），所以第二次尝试拿到的还是同一个 token。
+    async fn send_to_destination_with_retry(
+        &self,
+        context: QqSendContext<'_>,
+    ) -> Result<ActionPortOutcome, ActionPortError> {
+        retry_definitely_not_sent(|| self.send_to_destination(context)).await
     }
 
     async fn send_to_destination(
@@ -559,13 +642,13 @@ impl QqActionAdapter {
             }
         }
         let precommit = match with_send_stage_budget(
-            "begin_outgoing_commit",
+            SEND_STAGE_COMMIT,
             SEND_STAGE_COMMIT_BUDGET,
             expected_conversation_id,
             begin_outgoing_commit(outgoing),
         )
         .await
-        .ok_or_else(|| send_stage_timeout_error("begin_outgoing_commit"))?
+        .ok_or_else(|| send_stage_timeout_error(SEND_STAGE_COMMIT))?
         {
             Ok(precommit) => precommit,
             Err(OutgoingCommitRejection::Stale) => {
@@ -1312,7 +1395,7 @@ impl ActionPort for QqActionAdapter {
                             reason: "outgoing_not_prepared".to_string(),
                         });
                     };
-                    self.send_to_destination(QqSendContext {
+                    self.send_to_destination_with_retry(QqSendContext {
                         revalidation_target: DeliveryRevalidationTarget::Conversation(
                             send.conversation_id,
                         ),
@@ -1351,7 +1434,7 @@ impl ActionPort for QqActionAdapter {
                             reason: "outgoing_not_prepared".to_string(),
                         });
                     };
-                    self.send_to_destination(QqSendContext {
+                    self.send_to_destination_with_retry(QqSendContext {
                         revalidation_target: DeliveryRevalidationTarget::Person(
                             reach_out.person_id,
                         ),
@@ -1792,7 +1875,11 @@ fn compatibility_reach_out_key(intent: &ReachOutIntent) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::missing_sticker_fallback;
+    use super::{
+        ActionPortError, SEND_PIPELINE_RETRIES, SEND_STAGE_AUTHORIZE, SEND_STAGE_COMMIT,
+        SEND_STAGE_RESOLVE, missing_sticker_fallback, retry_definitely_not_sent,
+        send_failure_is_definitely_not_sent, send_stage_timeout_error,
+    };
 
     /// 只发一张表情、那张取不到时必须有兜底文字；她本来有正文时一个字都不动。
     ///
@@ -1814,6 +1901,92 @@ mod tests {
             missing_sticker_fallback(&MessageContent::text(""), false),
             None
         );
+    }
+
+    /// 只有"确定没发出去"的失败才允许重试。
+    ///
+    /// 这条判据守的是两件相反的事：漏判会让已经生成好的回复被整条丢掉（线上
+    /// 2026-09-15 18:13、19:27 各一次，都是预提交阶段超时）；误判会重复发消息。
+    /// 所以真正调 QQ 那一级（`transport_send`）**必须**落在外面——它超时走的是
+    /// `DeliveryIndeterminate`，这里顺带把"假如它变成一个错误"也钉死。
+    #[test]
+    fn only_pre_transport_stage_timeouts_are_definitely_not_sent() {
+        for stage in [SEND_STAGE_RESOLVE, SEND_STAGE_AUTHORIZE, SEND_STAGE_COMMIT] {
+            assert!(
+                send_failure_is_definitely_not_sent(&send_stage_timeout_error(stage)),
+                "{stage} 在真正调 QQ 之前超时，重试是安全的"
+            );
+        }
+        // 真正调 QQ 那一级：请求可能已经到了平台，重发就是重复发消息。
+        assert!(!send_failure_is_definitely_not_sent(
+            &send_stage_timeout_error("transport_send")
+        ));
+        // 别的失败各有各的语义（授权不通过、QQ 侧拒绝、没有可发送内容……），
+        // 不能因为标着 retryable 就一律重发。
+        for category in [
+            "group_not_authorized",
+            "qq_send_failed:muted",
+            "durable_commit_failed",
+        ] {
+            assert!(
+                !send_failure_is_definitely_not_sent(&ActionPortError::new(category, true)),
+                "{category} 不该被当成“确定没发出去”"
+            );
+        }
+    }
+
+    /// 重试循环：确定没发出去时再试一次，其余失败原样返回（不重发）。
+    #[test]
+    fn the_send_pipeline_retries_exactly_once_and_only_before_the_irreversible_boundary() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                use std::sync::atomic::{AtomicUsize, Ordering};
+
+                // 第一次预提交超时、第二次成功：这正是线上丢回复的形态。
+                let calls = AtomicUsize::new(0);
+                let outcome: Result<&str, ActionPortError> = retry_definitely_not_sent(|| {
+                    let call = calls.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        if call == 0 {
+                            Err(send_stage_timeout_error(SEND_STAGE_COMMIT))
+                        } else {
+                            Ok("sent")
+                        }
+                    }
+                })
+                .await;
+                assert_eq!(outcome.expect("第二次应当成功"), "sent");
+                assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+                // 一直超时：只重试 SEND_PIPELINE_RETRIES 次就放弃，不能无限重发。
+                let calls = AtomicUsize::new(0);
+                let outcome: Result<&str, ActionPortError> = retry_definitely_not_sent(|| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    async { Err(send_stage_timeout_error(SEND_STAGE_COMMIT)) }
+                })
+                .await;
+                assert!(outcome.is_err());
+                assert_eq!(calls.load(Ordering::SeqCst), SEND_PIPELINE_RETRIES + 1);
+
+                // 跨过不可逆边界之后（transport），或别的语义失败：一次都不重试。
+                for category in ["transport_send", "group_not_authorized"] {
+                    let calls = AtomicUsize::new(0);
+                    let outcome: Result<&str, ActionPortError> = retry_definitely_not_sent(|| {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        async move {
+                            if category == "transport_send" {
+                                Err(send_stage_timeout_error("transport_send"))
+                            } else {
+                                Err(ActionPortError::new("group_not_authorized", true))
+                            }
+                        }
+                    })
+                    .await;
+                    assert!(outcome.is_err(), "{category} 应当原样返回失败");
+                    assert_eq!(calls.load(Ordering::SeqCst), 1, "{category} 不该被重试");
+                }
+            });
     }
 
     /// 阶段预算的行为：正常完成原样返回；超时返回 None，并且**不**把结果当成
