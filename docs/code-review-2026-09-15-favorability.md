@@ -965,7 +965,7 @@ Core 投递的引用映射/路由/授权）。语义从"整段共用一个 30 �
 就是在替它擦屁股）。但它横跨两条模型链路（Host 的 `model/reply.rs` 常驻协议 + 解析器；Core 的
 自造包装、禁词分支与一大批测试；生成侧还是纯补全），半途改完比不改更糟，所以那一轮只写了方案。
 
-**这次落地**（`f7099a3` 迁移 + `e26c02a` 顺带修）：
+**这次落地**（`f7099a3` 迁移 + `e26c02a` 顺带修 + `3ed59ed` 补漏）：
 
 Host（`plugins/model/src/model/`）
 
@@ -1000,11 +1000,18 @@ Core（`yunxi/core_model.rs`）
   `stale_reply_marker=`）——旧标记出现即判不可用，不会发给用户。这是"拒绝"不是"兜底"。
 
 **验证**：`cargo fmt --check` 干净；`cargo clippy --workspace --all-targets --locked -- -D warnings`
-干净；`cargo test --workspace --all-targets --locked` = model **1151** + core **355** + CLI **10** +
-acceptance **13** 全过（model 侧删掉 3 个只测旧信封构建器的用例，新增 2 条端到端接缝用例与
-1 条"动作必须单独调用"的分流用例）。
+干净；`cargo test --workspace --all-targets --locked` = model **1152** + core **355** + CLI **10** +
+acceptance **13** 全过（model 侧删掉 3 个只测旧信封构建器的用例，新增 2 条端到端接缝用例、
+1 条"动作必须单独调用"的分流用例与 1 条"截断参数被猜补后必须作废"的跨模块用例）。
 接缝用例覆盖了"工具真的下发 / 工具调用真的变成动作 / 正文标记真的不再是动作"，把这次改动最容易
 无声失效的那一段（跨模型调用的接缝）钉住了。
+
+**自查补掉的一个口子**（`3ed59ed`）：流式累积那边 `finalize_native_tool_calls` 对**所有**工具
+都开着 `complete_truncated_json_object` 的截断补全（registry 类工具沿用的既有行为），于是被切断的
+动作参数会被"补"成一个完整对象照收——`{"disposition":"silent"` 补成 `{"disposition":"silent"}`
+就是一次凭空出现的静默。现在回复动作这一侧按 `raw_arguments` 复核：不是 provider 原样给出的完整
+JSON 对象就整条作废（registry 工具的行为不动），并有一条跨模块用例把"SSE 里吐到一半 → 累积器确实
+补全了 → 校验器必须否决"这条链路钉住。
 
 **遗留与代价（如实记下）**：
 
