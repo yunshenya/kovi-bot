@@ -18,6 +18,7 @@ QQ 机器人。她支持群聊/私聊、兼容 OpenAI Responses 或 Chat Complet
 | 想了解 | 读这个 |
 | --- | --- |
 | 边界切在哪、每条规则为什么这么定 | [`docs/yunxi-core-boundary.md`](docs/yunxi-core-boundary.md) |
+| Core 抽象收口（知觉/表达/作为/承诺/沉默）的迁移台账 | [`docs/core-abstractions-ledger.md`](docs/core-abstractions-ledger.md) |
 | Core 的需求、阶段与完成度 | [`docs/yunxi-core-architecture.md`](docs/yunxi-core-architecture.md) |
 | 环境如何向 Agent 发布上下文与动作空间 | [`docs/yunxi-affordance-cognitive-io-v8.md`](docs/yunxi-affordance-cognitive-io-v8.md) |
 | 全部配置项与逐条说明 | [`bot.conf.example.toml`](bot.conf.example.toml)（唯一权威，此处不再重复） |
