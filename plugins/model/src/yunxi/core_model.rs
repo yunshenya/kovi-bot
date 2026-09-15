@@ -5767,6 +5767,17 @@ impl ModelBackend for KoviModelBackend {
             // 正文），它与模型调用本身的 elapsed_ms 是两件事——中间还有
             // 语义判定、admission 和限流。
             let turn_started = std::time::Instant::now();
+            // 这个人的关系/情绪有一份没读到：Core 本轮会拒绝回写（见
+            // `PersonStateRead`），但那是一处"看起来什么也没发生"的静默降级——
+            // 不在这里留一行，事后只能靠"关系怎么不动了"反推。
+            if !input.relation_read.is_writable() || !input.affect_read.is_writable() {
+                kovi::log::warn!(
+                    "Yunxi person state unavailable: event_id={} relation_read={:?} affect_read={:?} action=skip_writeback",
+                    input.event.id(),
+                    input.relation_read,
+                    input.affect_read,
+                );
+            }
             let mind_projection =
                 MindDecisionProjection::for_input(input, baseline_disposition(input));
             if input.mind.influence_mode() != MindInfluenceMode::Shadow {

@@ -217,6 +217,34 @@ pub(crate) async fn list_files() -> Result<Json<Value>, ApiError> {
     })))
 }
 
+/// 读接口与写接口共用的"哪些键被打过码"清单。
+///
+/// 两个来源的并集：
+///
+/// 1. 类型化配置里 schema 标注的密钥（`mask_typed` 认得的那批）；
+/// 2. **名字像密钥**的键（`is_secret_key`）——通用文件靠它，类型化文件里
+///    serde 不认识、于是 `ModelConfig` 里没有对应字段的键也靠它。
+///
+/// 读和写必须用同一份清单：读的时候按它打码、写的时候按它还原。少了任何一半，
+/// 前端原样回显的 `********` 就会被当成真值落盘（NapCat 的 `access_token` 一旦
+/// 变成这八个星号，下一次重启就连不上 OneBot）。
+fn masked_secret_paths(file: &ManagedFile, raw: &str) -> Vec<String> {
+    let mut masked = Vec::new();
+    if file.typed {
+        let (_, typed) = mask_typed(effective_values());
+        masked.extend(typed);
+    }
+    let mut parsed = if raw.trim().is_empty() {
+        Value::Object(serde_json::Map::new())
+    } else {
+        parse_toml_value(raw).unwrap_or(Value::Object(serde_json::Map::new()))
+    };
+    mask_generic(&mut parsed, &mut Vec::new(), &mut masked);
+    masked.sort();
+    masked.dedup();
+    masked
+}
+
 /// `GET /api/config/file/{name}`
 pub(crate) async fn read_file(UrlPath(name): UrlPath<String>) -> Result<Json<Value>, ApiError> {
     let file = managed_file(&name)?;
@@ -252,10 +280,11 @@ pub(crate) async fn read_file(UrlPath(name): UrlPath<String>) -> Result<Json<Val
         "restart_required": file.restart_required,
         "writable": directory_writable(&path),
         "path": path.display().to_string(),
-        // `raw` 也要打码，且必须与 `masked` 列表一致：前端把这个字段直接塞进编辑器，
-        // 一边说"这些字段打了码"、一边原样回显密钥（NapCat 的 access_token、admin.token、
-        // 各种 *_api_key）等于把密钥放到屏幕、截图和浏览器缓存里。
-        "raw": mask_raw_secrets(&raw, &masked),
+        // `raw` 也要打码，且必须与写回时的还原清单**同源**：前端把这个字段直接塞进
+        // 编辑器，一边说"这些字段打了码"、一边原样回显密钥（NapCat 的 access_token、
+        // admin.token、各种 *_api_key）等于把密钥放到屏幕、截图和浏览器缓存里；
+        // 而清单不一致时，编辑器里那八个星号会被原样写回磁盘。
+        "raw": mask_raw_secrets(&raw, &masked_secret_paths(file, &raw)),
         "values": values,
         "masked": masked,
         "file_paths": present_paths(&raw),
@@ -283,15 +312,19 @@ pub(crate) async fn write_raw(
     }
 
     // 显示侧把密钥打了码，所以整文件写回时必须把 `MASK` 还原成磁盘上的真值——否则
-    // 管理员在原始编辑器里点一次保存，所有密钥就变成 `********` 落盘。这与 patch 那条
-    // 路的约定一致（那里遇到 MASK 直接跳过该字段）。
-    let candidate_text = if file.typed {
-        let current = read_config_text(&path, file)?;
-        let (_, masked) = mask_typed(effective_values());
-        restore_masked_secrets(&body.raw, &current, &masked)
-    } else {
-        body.raw.clone()
-    };
+    // 管理员在原始编辑器里点一次保存，所有密钥就变成 `********` 落盘。这与 patch
+    // 那条路的约定一致（那里遇到 MASK 直接跳过该字段）。
+    //
+    // 还原清单从 `masked_secret_paths` 来，与读接口**同一份**：不只是类型化文件，
+    // `kovi.conf.toml`（`typed: false`，里面有连 NapCat 的 `access_token`）同样
+    // 需要——它此前走的是 `body.raw.clone()`，于是"打开原始 TOML 点一次保存"就能
+    // 把 OneBot 令牌写成八个星号，下一次重启机器人连不上 NapCat。
+    let current = read_config_text(&path, file)?;
+    let candidate_text = restore_masked_secrets(
+        &body.raw,
+        &current,
+        &masked_secret_paths(file, &current),
+    );
 
     let validated = validate_candidate(file, &candidate_text)?;
 
@@ -413,8 +446,7 @@ pub(crate) async fn apply_changes(
 
     // 覆盖配置返回稀疏视图（文件里写了什么），主配置返回生效值。
     let (values, masked) = if file.typed && file.view == "effective" {
-        let (values, masked) = mask_typed(effective_values());
-        (values, masked)
+        mask_typed(effective_values())
     } else {
         let mut values = parse_toml_value(&candidate).unwrap_or(Value::Null);
         let mut masked = Vec::new();
@@ -423,10 +455,18 @@ pub(crate) async fn apply_changes(
             values = masked_values;
             masked = paths;
         } else {
-            mask_generic(&mut values, &mut Vec::new(), &mut masked);
+            let mut parsed = values;
+            mask_generic(&mut parsed, &mut Vec::new(), &mut masked);
+            values = parsed;
         }
         (values, masked)
     };
+
+    // 响应里的 `raw` 是**落盘后的整份文件**，必须和读接口一样打码：`admin.token`、
+    // `server_config.api_key`、NapCat 的 `access_token` 都在这份文本里，明文回显
+    // 等于把密钥送进 devtools、浏览器缓存和任何日志代理。读接口一直在打码，
+    // 只有这里漏了。
+    let raw = mask_raw_secrets(&candidate, &masked_secret_paths(file, &candidate));
 
     Ok(json!({
         "ok": true,
@@ -436,7 +476,7 @@ pub(crate) async fn apply_changes(
         "restart_required": file.restart_required,
         "pending_restart": state.pending_restart(),
         "backup": backup.map(|path| file_name(&path)),
-        "raw": candidate,
+        "raw": raw,
         "values": values,
         "masked": masked,
     }))

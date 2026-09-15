@@ -476,10 +476,18 @@ pub(crate) async fn records(Query(params): Query<RecordsQuery>) -> Result<Json<V
         all.extend(rows);
     }
 
+    // 过滤只在**已抓取的窗口**内做（每种类型最多 PER_KIND_FETCH 条），所以
+    // 过滤之后的计数必须在这个窗口上重算：沿用全表统计会给出"命中 3 条、共 5000
+    // 条"的页码条，越往后翻越是空的。窗口没过滤时全表统计仍然更有信息量
+    // （"她一共记得多少"），但对外承诺的总数必须收口到窗口大小——承诺一页翻不到
+    // 的内容比少报更糟。
+    let window_size = all.len() as i64;
+    let mut window_filtered = false;
     if let Some(filter) = params.tags.as_deref() {
         let wanted = parse_tags(filter);
         if !wanted.is_empty() {
             all.retain(|item| node_has_tag(item, &wanted));
+            window_filtered = true;
         }
     }
 
@@ -490,7 +498,11 @@ pub(crate) async fn records(Query(params): Query<RecordsQuery>) -> Result<Json<V
     {
         let (kind, id) = split_scope(scope);
         all.retain(|item| item["scope_kind"] == json!(kind) && item["scope_id"] == json!(id));
-        // 作用域过滤后的总数不再等于全表统计，直接以过滤结果为准。
+        window_filtered = true;
+    }
+
+    let db_total: i64 = totals.values().sum();
+    if window_filtered {
         let mut filtered = BTreeMap::new();
         for item in &all {
             let key = item["kind"].as_str().unwrap_or_default().to_string();
@@ -498,9 +510,12 @@ pub(crate) async fn records(Query(params): Query<RecordsQuery>) -> Result<Json<V
         }
         totals = filtered;
     }
-
     sort_items(&mut all);
-    let total: i64 = totals.values().sum();
+    let total = if window_filtered {
+        all.len() as i64
+    } else {
+        db_total.min(window_size)
+    };
     let page: Vec<Value> = all
         .into_iter()
         .skip(offset as usize)
@@ -513,6 +528,10 @@ pub(crate) async fn records(Query(params): Query<RecordsQuery>) -> Result<Json<V
         "limit": limit,
         "offset": offset,
         "counts": totals,
+        // 真实总数超过可翻页窗口时如实说明，前端据此提示"只看得到前 N 条"。
+        "total_is_window": window_filtered,
+        "window": window_size,
+        "db_total": db_total,
         "query": query_text,
     })))
 }
@@ -671,6 +690,7 @@ fn people_sql(existing: &BTreeSet<String>) -> String {
             COALESCE(i.identities, '') AS identities,
             i.qq AS qq,
             r.familiarity, r.affinity, r.trust, r.comfort, r.tension,
+            r.updated_at AS relation_updated_at,
             a.valence, a.arousal, a.social_energy, a.curiosity,
             COALESCE(m.count, 0) + COALESCE(legacy.count, 0) AS memory_count
         FROM yunxi_persons p
@@ -749,6 +769,62 @@ fn core_twin_predicate(existing: &BTreeSet<String>, legacy_id_expr: &str) -> Str
     sql
 }
 
+/// 后台画出来的关系必须是**她实际在用的那一份**。
+///
+/// Core 每次读关系都会按 `updated_at` 施加时间漂移（张力半衰期 3 天、comfort 30 天），
+/// 而直接 `SELECT` 出来的是没漂移的旧值。库里 `tension = 0.6`、闲置 6 天时她实际按
+/// 0.15 行动（不会被静默），后台却还写着 0.6——排查的人第一反应会是"门控没生效"。
+/// 所以这里在后台侧也跑一遍同一个 `drift_relation_state`：一份算术，两处显示。
+///
+/// `relation_updated_at` 为 NULL 表示这个人还没有关系行，返回 `null` 而不是零值——
+/// "还没有关系"和"关系是零"在页面上不该长得一样。
+fn drifted_relation_json(row: &PgRow) -> Value {
+    let updated_at = row
+        .try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("relation_updated_at")
+        .ok()
+        .flatten();
+    let value = |name: &str| row.try_get::<Option<f64>, _>(name).ok().flatten();
+    let (Some(updated_at), Some(familiarity), Some(affinity), Some(trust), Some(comfort), Some(tension)) = (
+        updated_at,
+        value("familiarity"),
+        value("affinity"),
+        value("trust"),
+        value("comfort"),
+        value("tension"),
+    ) else {
+        return Value::Null;
+    };
+    let stored = yunxi_core::RelationState {
+        person_id: yunxi_core::PersonId::new(),
+        familiarity: familiarity as f32,
+        affinity: affinity as f32,
+        trust: trust as f32,
+        comfort: comfort as f32,
+        tension: tension as f32,
+    };
+    let elapsed = chrono::Utc::now()
+        .signed_duration_since(updated_at)
+        .to_std()
+        .unwrap_or_default();
+    let drifted = yunxi_core::drift_relation_state(stored, elapsed);
+    json!({
+        "familiarity": drifted.familiarity,
+        "affinity": drifted.affinity,
+        "trust": drifted.trust,
+        "comfort": drifted.comfort,
+        "tension": drifted.tension,
+        // 原样保留库里那份，便于排查"她看到的"和"存的"差多少。
+        "stored": {
+            "familiarity": familiarity,
+            "affinity": affinity,
+            "trust": trust,
+            "comfort": comfort,
+            "tension": tension,
+        },
+        "updated_at": updated_at.to_rfc3339(),
+    })
+}
+
 fn person_card(row: &PgRow) -> Value {
     let qq: Option<String> = row.try_get("qq").ok().flatten();
     json!({
@@ -757,13 +833,7 @@ fn person_card(row: &PgRow) -> Value {
         "identities": row.try_get::<String, _>("identities").unwrap_or_default(),
         "qq": qq,
         "memory_count": row.try_get::<i64, _>("memory_count").unwrap_or_default(),
-        "relation": {
-            "familiarity": row.try_get::<Option<f64>, _>("familiarity").ok().flatten(),
-            "affinity": row.try_get::<Option<f64>, _>("affinity").ok().flatten(),
-            "trust": row.try_get::<Option<f64>, _>("trust").ok().flatten(),
-            "comfort": row.try_get::<Option<f64>, _>("comfort").ok().flatten(),
-            "tension": row.try_get::<Option<f64>, _>("tension").ok().flatten(),
-        },
+        "relation": drifted_relation_json(row),
         "affect": {
             "valence": row.try_get::<Option<f64>, _>("valence").ok().flatten(),
             "arousal": row.try_get::<Option<f64>, _>("arousal").ok().flatten(),
@@ -809,12 +879,19 @@ pub(crate) async fn person(UrlPath(id): UrlPath<String>) -> Result<Json<Value>, 
     // 注意：人物存在但没有外部身份也照样打开（此时 identities 为空数组），
     // 因为"解析不出 QQ 号"不该等于"这个人不存在"。
 
-    let relation = fetch_optional_json(
-        pool,
-        "SELECT row_to_json(t) AS row FROM yunxi_relations t WHERE t.person_id = $1",
-        person_id,
+    // 关系与人物列表走同一份"漂移后"的口径：详情页和卡片上的数字必须一致，
+    // 也必须等于她实际在用的那份。取不到行时返回 null（而不是零值）。
+    let relation = query(
+        "SELECT familiarity, affinity, trust, comfort, tension, \
+                updated_at AS relation_updated_at \
+         FROM yunxi_relations WHERE person_id = $1",
     )
-    .await;
+    .bind(person_id)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten()
+    .map_or(Value::Null, |row| drifted_relation_json(&row));
     let affect = fetch_optional_json(
         pool,
         "SELECT row_to_json(t) AS row FROM yunxi_affect_states t WHERE t.person_id = $1",
@@ -1550,9 +1627,15 @@ fn scope_label_fallback(scope_kind: &str, scope_id: Option<&str>) -> String {
 }
 
 /// 把 UUID／长 id 缩成前 8 位，列表里够用且不喧宾夺主。
+///
+/// 按**字符**截，不按字节：这里的 id 可能是 `{"type":"social_motive","value":"…"}`
+/// 这类被当成标题渲染的 JSON（议程的 subject 就是），按字节切会切在汉字中间 panic，
+/// 而 panic 在连接任务里表现为"记忆页整个打不开"。同一文件下面的 `truncate` 一直
+/// 是按字符截的，只有这里漏了。
 fn short_id(id: &str) -> String {
-    if id.len() > 8 {
-        id[..8].to_string()
+    const SHORT_ID_CHARS: usize = 8;
+    if id.chars().count() > SHORT_ID_CHARS {
+        id.chars().take(SHORT_ID_CHARS).collect()
     } else {
         id.to_string()
     }
