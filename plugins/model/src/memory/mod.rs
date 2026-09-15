@@ -959,6 +959,15 @@ impl MemoryManager {
         .execute(pool)
         .await
         .map_err(|error| anyhow::anyhow!("创建记忆向量表索引失败: {}", error))?;
+        // 语义召回按"最近 N 条候选"取向量：没有这个索引时那句 ORDER BY ...
+        // LIMIT 要在库里排全部命中行；有了它可以沿索引直接取到最近的 N 条。
+        query(
+            "CREATE INDEX IF NOT EXISTS kovi_bot_memories_recall_idx
+             ON kovi_bot_memories (subject_id, context, occurred_at DESC, id DESC)",
+        )
+        .execute(pool)
+        .await
+        .map_err(|error| anyhow::anyhow!("创建记忆召回索引失败: {}", error))?;
 
         // 非破坏式迁移：旧部署没有 scope_type 时补列，并按受控 context 映射回填。
         query(
@@ -2986,10 +2995,26 @@ impl MemoryManager {
         Ok(saved)
     }
 
+    /// 语义检索读向量的时间预算。与词面那一路的 2 秒对齐：超时按"语义不可用"
+    /// 退回词面，不让一次慢查询占着共享连接池拖住整轮对话。
+    const SEMANTIC_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+    /// 语义检索一次最多读多少条候选向量。
+    ///
+    /// 512 维 f32 约 2KB/条，2000 条 ≈ 4MB 与一次可以接受的扫描量；再往上就该先
+    /// 上 pgvector 或先做粗筛，而不是继续把表拉进内存。
+    const SEMANTIC_CANDIDATE_LIMIT: usize = 2_000;
+
     /// 语义那一路：把候选记忆的向量取出来算余弦，返回按相似度排序的记忆 id。
     ///
     /// 作用域过滤与词面那一路一致（subject + context/scope），免得语义检索越过
     /// 用户与群的边界——那是隐私问题，不是排序问题。
+    ///
+    /// 候选集**必须有界**：暴力余弦要先把向量读进进程（512 维 f32 约 2KB/条），
+    /// 而 `max_entries` 默认允许 5 万条——不设上限时单次检索能拉上百 MB、独占共享
+    /// 连接池（默认 5 条）里的一条，慢查询期间记忆的读写一起排队，直接在聊天链路
+    /// 上体现出来。这里取最近 [`SEMANTIC_CANDIDATE_LIMIT`] 条，并套上和词面那一路
+    /// 同样的 2 秒预算：超时按"语义不可用"退回词面，而不是把这一轮拖死。
     pub(crate) async fn semantic_memory_ids(
         &self,
         client: &EmbeddingClient,
@@ -3009,7 +3034,14 @@ impl MemoryManager {
             .map(ConversationScope::database_value)
             .unwrap_or(context)
             .to_string();
-        let rows = query(
+        // 每次多取一些候选（`limit` 的 50 倍），但始终不超过硬上限。
+        // 取最近的一批候选：`limit` 的 50 倍起步（至少 500 条，保证老记忆也有机会
+        // 被算到），上限 2000 条。
+        let candidates = limit
+            .saturating_mul(50)
+            .max(500)
+            .min(Self::SEMANTIC_CANDIDATE_LIMIT);
+        let fetch = query(
             r#"
             SELECT e.memory_id, e.vector
             FROM kovi_bot_memory_embeddings e
@@ -3020,14 +3052,19 @@ impl MemoryManager {
                     ELSE m.context = $2
                   END
               AND e.model = $3
+            ORDER BY m.occurred_at DESC, m.id DESC
+            LIMIT $4
             "#,
         )
         .bind(subject_id)
         .bind(&requested_context)
         .bind(client.model())
-        .fetch_all(pool)
-        .await
-        .map_err(|error| anyhow::anyhow!("读取记忆向量失败: {error}"))?;
+        .bind(candidates as i64)
+        .fetch_all(pool);
+        let rows = kovi::tokio::time::timeout(Self::SEMANTIC_QUERY_TIMEOUT, fetch)
+            .await
+            .map_err(|_| anyhow::anyhow!("读取记忆向量超时"))?
+            .map_err(|error| anyhow::anyhow!("读取记忆向量失败: {error}"))?;
         if rows.is_empty() {
             return Ok(Vec::new());
         }
