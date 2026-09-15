@@ -32,6 +32,19 @@ pub(crate) fn parse_gag_command(text: &str) -> Option<GagCommand> {
     }
 }
 
+/// 账本命令的**错误**回执。
+///
+/// 以前每个分支都是 `.ok()?`：命令已经识别、用户正等着回执，库里一出错就返回
+/// `None`——在她那边表现为"这条消息没被理"，既没有回执也没有日志。命令解析失败返回
+/// `None` 是对的（那不是命令），但"命令认得、只是没做成"必须说出来。
+fn ledger_unavailable(action: &str, error: &anyhow::Error) -> Option<String> {
+    eprintln!("[WARN] 账本{action}失败: {error}");
+    Some(
+        "账本这会儿用不了（数据库那边出了点问题），这条我没处理成功，等会儿再跟我说一次吧～"
+            .to_string(),
+    )
+}
+
 pub(crate) async fn handle_gag_command(person_key: String, text: &str) -> Option<String> {
     let command = parse_gag_command(text)?;
     let store = yunxi::gag_store()?;
@@ -39,7 +52,10 @@ pub(crate) async fn handle_gag_command(person_key: String, text: &str) -> Option
     match command {
         GagCommand::Record(raw) => {
             let kind = infer_kind(&raw);
-            let id = store.add(scope, kind, raw.trim(), 60).await.ok()?;
+            let id = match store.add(scope, kind, raw.trim(), 60).await {
+                Ok(id) => id,
+                Err(error) => return ledger_unavailable("写入", &error),
+            };
             Some(format!(
                 "记下啦（{}）：{}。等兑现了跟我说“还账 {}”就行～",
                 kind_label(kind),
@@ -48,7 +64,10 @@ pub(crate) async fn handle_gag_command(person_key: String, text: &str) -> Option
             ))
         }
         GagCommand::List => {
-            let entries = store.list_open(scope, 20).await.ok()?;
+            let entries = match store.list_open(scope, 20).await {
+                Ok(entries) => entries,
+                Err(error) => return ledger_unavailable("读取", &error),
+            };
             if entries.is_empty() {
                 Some("账本是空的，暂时没有还没兑现的承诺或梗～".to_string())
             } else {
@@ -71,22 +90,27 @@ pub(crate) async fn handle_gag_command(person_key: String, text: &str) -> Option
         }
         GagCommand::Fulfill(id_text) => {
             let id_text = id_text.trim();
-            if let Ok(id) = Uuid::parse_str(id_text)
-                && store.fulfill(id).await.ok()?
-            {
-                return Some("还账成功 ✅ 这条清啦～".to_string());
+            if let Ok(id) = Uuid::parse_str(id_text) {
+                match store.fulfill(id).await {
+                    Ok(true) => return Some("还账成功 ✅ 这条清啦～".to_string()),
+                    Ok(false) => {}
+                    Err(error) => return ledger_unavailable("结清", &error),
+                }
             }
-            if let Some(id) = store.fulfill_by_prefix(id_text).await.ok()? {
-                Some(format!("还账成功 ✅（{}）这条清啦～", short_id(id)))
-            } else {
-                Some(
+            match store.fulfill_by_prefix(id_text).await {
+                Ok(Some(id)) => Some(format!("还账成功 ✅（{}）这条清啦～", short_id(id))),
+                Ok(None) => Some(
                     "没找到这条账：用 #账本 里列出的短 id（如 3f2a1c9b）或完整 id 再来一次。"
                         .to_string(),
-                )
+                ),
+                Err(error) => ledger_unavailable("结清", &error),
             }
         }
         GagCommand::Clear => {
-            let removed = store.delete_for_scope(scope).await.ok()?;
+            let removed = match store.delete_for_scope(scope).await {
+                Ok(removed) => removed,
+                Err(error) => return ledger_unavailable("清空", &error),
+            };
             Some(format!("已清空你的账本（{} 条，含已还的）～", removed))
         }
         GagCommand::Help => Some(
@@ -139,7 +163,17 @@ fn short_id(id: Uuid) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_gag_command;
+    use super::{ledger_unavailable, parse_gag_command};
+
+    #[test]
+    fn ledger_failures_answer_instead_of_staying_silent() {
+        // 命令认得、只是没做成：必须给回执。以前 `.ok()?` 让这一格在用户那边表现成
+        // "她没理我"——没有回执也没有日志。
+        let reply = ledger_unavailable("写入", &anyhow::anyhow!("connection refused"))
+            .expect("失败也必须有回执");
+        assert!(reply.contains("没处理成功"), "要说清没成功: {reply}");
+        assert!(reply.contains("再跟我说一次"), "要给出下一步: {reply}");
+    }
 
     #[test]
     fn parses_owner_ledger_commands() {
