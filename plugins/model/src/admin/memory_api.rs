@@ -1045,19 +1045,29 @@ pub(crate) async fn graph(Query(params): Query<GraphQuery>) -> Result<Json<Value
     sort_items(&mut nodes);
     nodes.truncate(limit as usize);
     resolve_scope_labels(pool, &mut nodes).await;
+    // 每个节点补一个**跨类型唯一**的键：`id` 只在同一类里唯一（v2 与旧表按设计
+    // 共享同一个 UUID，档案类的 id 就是 QQ/群号），拿它当图上的身份会让两个不同
+    // 记录叠成一个节点、连线与度数也挂错人。`id` 本身保持原样——记录详情那条
+    // URL 用的还是它。
+    for node in nodes.iter_mut() {
+        let key = node_key(node);
+        if let Some(object) = node.as_object_mut() {
+            object.insert("key".to_string(), json!(key));
+        }
+    }
 
     let (links, counts) = build_links(&nodes);
     let mut link_degree = vec![0_usize; nodes.len()];
-    let id_index: HashMap<String, usize> = nodes
+    let key_index: HashMap<String, usize> = nodes
         .iter()
         .enumerate()
-        .map(|(index, node)| (node["id"].as_str().unwrap_or_default().to_string(), index))
+        .map(|(index, node)| (node_key(node), index))
         .collect();
     for link in &links {
-        if let Some(&index) = id_index.get(link["source"].as_str().unwrap_or_default()) {
+        if let Some(&index) = key_index.get(link["source"].as_str().unwrap_or_default()) {
             link_degree[index] += 1;
         }
-        if let Some(&index) = id_index.get(link["target"].as_str().unwrap_or_default()) {
+        if let Some(&index) = key_index.get(link["target"].as_str().unwrap_or_default()) {
             link_degree[index] += 1;
         }
     }
@@ -1105,18 +1115,32 @@ fn time_ranges(nodes: &[Value]) -> Value {
     })
 }
 
+/// 图节点的身份键：跨类型唯一。`id` 只在同一类里唯一（v2 与旧表按设计共享同一个
+/// UUID，档案类的 id 就是 QQ/群号），拿它当图上的身份会让两个不同记录叠成一个节点、
+/// 连线与度数也挂错人。节点一定带 `key`；这里保留 `kind:id` 兜底，与前端 `nodeKey`
+/// 的推导规则一致，免得字段缺失时静默退化成空串、把端点全连到同一个坐标上。
+fn node_key(node: &Value) -> String {
+    match node["key"].as_str() {
+        Some(key) if !key.is_empty() => key.to_string(),
+        _ => format!(
+            "{}:{}",
+            node["kind"].as_str().unwrap_or_default(),
+            node["id"].as_str().unwrap_or_default()
+        ),
+    }
+}
+
 /// 按四类关系连边。每类每个节点最多连 K 条，避免图变成毛线球。
 fn build_links(nodes: &[Value]) -> (Vec<Value>, Value) {
     let mut links = Vec::new();
     let mut seen: BTreeSet<(usize, usize, &'static str)> = BTreeSet::new();
-    let ids: Vec<String> = nodes
-        .iter()
-        .map(|node| node["id"].as_str().unwrap_or_default().to_string())
-        .collect();
-    let id_index: HashMap<&str, usize> = ids
+    let keys: Vec<String> = nodes.iter().map(node_key).collect();
+    // `refs` 里存的是**被引用记录的裸 id**（payload 里就是那么写的），所以按裸 id
+    // 找目标；但连线的两端要用跨类型唯一的 key。
+    let id_index: HashMap<&str, usize> = nodes
         .iter()
         .enumerate()
-        .map(|(index, id)| (id.as_str(), index))
+        .map(|(index, node)| (node["id"].as_str().unwrap_or_default(), index))
         .collect();
 
     let mut push = |left: usize, right: usize, kind: &'static str, links: &mut Vec<Value>| {
@@ -1126,8 +1150,8 @@ fn build_links(nodes: &[Value]) -> (Vec<Value>, Value) {
         let key = (left.min(right), left.max(right), kind);
         if seen.insert(key) {
             links.push(json!({
-                "source": ids[left],
-                "target": ids[right],
+                "source": keys[left],
+                "target": keys[right],
                 "type": kind,
             }));
         }
@@ -1997,12 +2021,13 @@ mod tests {
 
     #[test]
     fn link_types_come_from_real_relations() {
+        // 故意不带 `key`：顺带覆盖 `node_key` 的兜底推导。
         let nodes = vec![
-            json!({"id":"a","scope_kind":"person","scope_id":"p1",
+            json!({"id":"a","kind":"memory","scope_kind":"person","scope_id":"p1",
                    "occurred_at":"2026-01-01T00:00:00Z","tags":["x"],"refs":[]}),
-            json!({"id":"b","scope_kind":"person","scope_id":"p1",
+            json!({"id":"b","kind":"memory","scope_kind":"person","scope_id":"p1",
                    "occurred_at":"2026-01-01T01:00:00Z","tags":["x"],"refs":[]}),
-            json!({"id":"c","scope_kind":"global","scope_id":"",
+            json!({"id":"c","kind":"memory","scope_kind":"global","scope_id":"",
                    "occurred_at":"2026-02-01T00:00:00Z","tags":[],"refs":["a"]}),
         ];
         let (links, counts) = build_links(&nodes);
@@ -2017,6 +2042,33 @@ mod tests {
         assert_eq!(counts["causal"], json!(1));
         // 自己不该连自己。
         assert!(links.iter().all(|link| link["source"] != link["target"]));
+    }
+
+    #[test]
+    fn link_endpoints_use_namespaced_keys() {
+        // 不同 kind 的记录可以有相同裸 id；连线的两端必须用跨类型唯一的 key，
+        // 否则前端在按 id 索引节点时会撞车、或者根本找不到端点。
+        let nodes = vec![
+            json!({"key":"memory:42","id":"42","kind":"memory","scope_kind":"person",
+                   "scope_id":"p1","occurred_at":"2026-01-01T00:00:00Z","tags":["x"],"refs":[]}),
+            json!({"key":"episode:42","id":"42","kind":"episode","scope_kind":"person",
+                   "scope_id":"p1","occurred_at":"2026-01-01T01:00:00Z","tags":["x"],"refs":[]}),
+        ];
+        let (links, _) = build_links(&nodes);
+        assert!(!links.is_empty(), "同一作用域的两条记录应至少连一条边");
+        let keys: Vec<&str> = nodes
+            .iter()
+            .map(|node| node["key"].as_str().unwrap_or_default())
+            .collect();
+        for link in &links {
+            let source = link["source"].as_str().unwrap_or_default();
+            let target = link["target"].as_str().unwrap_or_default();
+            assert!(
+                keys.contains(&source) && keys.contains(&target),
+                "连线端点必须是节点的 key: {link:?}"
+            );
+            assert_ne!(source, target, "裸 id 相同的两个节点不能连成自环");
+        }
     }
 
     #[test]

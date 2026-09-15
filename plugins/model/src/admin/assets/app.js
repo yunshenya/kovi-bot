@@ -2320,11 +2320,19 @@
     return `rgb(${mix(from[0], to[0])},${mix(from[1], to[1])},${mix(from[2], to[2])})`;
   }
 
+  /** 图上的身份：服务端给的 `key`（`kind:id`，跨类型唯一）。
+   *
+   * `id` 只在同一类里唯一——v2 与旧表按设计共享同一个 UUID，档案类的 id 就是
+   * QQ/群号——拿它当图上的身份会让两条不同记录叠成一个节点。详情那条 URL 用的
+   * 仍是裸 `id`，所以两者都要留着。
+   */
+  const nodeKey = (node) => node.key || `${node.kind || ''}:${node.id || ''}`;
+
   /** 把标题相同的记录折成一个节点，并重映射连线。 */
   function collapseDuplicateNodes(graph) {
     const groups = new Map();
     for (const node of graph.nodes || []) {
-      const key = (node.title || '').trim() || node.id;
+      const key = (node.title || '').trim() || nodeKey(node);
       if (!groups.has(key)) groups.set(key, []);
       groups.get(key).push(node);
     }
@@ -2343,7 +2351,7 @@
         representative.weight = Math.max(...members.map((member) => Number(member.weight) || 0));
       }
       nodes.push(representative);
-      for (const member of members) idMap.set(member.id, representative.id);
+      for (const member of members) idMap.set(nodeKey(member), nodeKey(representative));
     }
 
     const seen = new Set();
@@ -2529,7 +2537,7 @@
     view.hovered = null;
 
     const nodes = graph.nodes || [];
-    const byId = new Map(nodes.map((node) => [node.id, node]));
+    const byId = new Map(nodes.map((node) => [nodeKey(node), node]));
     const edges = (graph.links || [])
       .map((link) => ({ ...link, a: byId.get(link.source), b: byId.get(link.target) }))
       .filter((edge) => edge.a && edge.b);
@@ -2554,15 +2562,15 @@
 
     const degree = new Map();
     for (const edge of edges) {
-      degree.set(edge.a.id, (degree.get(edge.a.id) || 0) + 1);
-      degree.set(edge.b.id, (degree.get(edge.b.id) || 0) + 1);
+      degree.set(nodeKey(edge.a), (degree.get(nodeKey(edge.a)) || 0) + 1);
+      degree.set(nodeKey(edge.b), (degree.get(nodeKey(edge.b)) || 0) + 1);
     }
 
     // 坐标优先复用上一次的：只有新出现的节点才需要重新摆放。
     if (view.positions.size > 4000) view.positions.clear();
     let needsLayout = false;
     nodes.forEach((node, index) => {
-      const cached = view.positions.get(node.id);
+      const cached = view.positions.get(nodeKey(node));
       if (cached) {
         node.wx = cached.wx;
         node.wy = cached.wy;
@@ -2628,16 +2636,18 @@
       context.setTransform(ratio, 0, 0, ratio, 0, 0);
       context.clearRect(0, 0, width(), height());
 
-      const dim = view.hovered ? new Set([view.hovered.id]) : null;
+      const dim = view.hovered ? new Set([nodeKey(view.hovered)]) : null;
       if (view.hovered) {
         for (const edge of edges) {
-          if (edge.a.id === view.hovered.id) dim.add(edge.b.id);
-          if (edge.b.id === view.hovered.id) dim.add(edge.a.id);
+          if (nodeKey(edge.a) === nodeKey(view.hovered)) dim.add(nodeKey(edge.b));
+          if (nodeKey(edge.b) === nodeKey(view.hovered)) dim.add(nodeKey(edge.a));
         }
       }
 
       for (const edge of edges) {
-        const active = !view.hovered || edge.a.id === view.hovered.id || edge.b.id === view.hovered.id;
+        const active = !view.hovered
+          || nodeKey(edge.a) === nodeKey(view.hovered)
+          || nodeKey(edge.b) === nodeKey(view.hovered);
         const a = toScreen(edge.a);
         const b = toScreen(edge.b);
         context.strokeStyle = LINK_TYPES.find(([key]) => key === edge.type)[2];
@@ -2654,8 +2664,8 @@
 
       for (const node of nodes) {
         const point = toScreen(node);
-        const radius = 3.2 + Math.sqrt(degree.get(node.id) || 0) * 1.7;
-        const faded = dim && !dim.has(node.id);
+        const radius = 3.2 + Math.sqrt(degree.get(nodeKey(node)) || 0) * 1.7;
+        const faded = dim && !dim.has(nodeKey(node));
         context.beginPath();
         context.fillStyle = heatColor(heat(node));
         context.globalAlpha = faded ? 0.25 : 0.95;
@@ -2672,7 +2682,8 @@
       context.font = '11px system-ui, sans-serif';
       context.fillStyle = getComputedStyle(document.body).color;
       for (const node of nodes) {
-        const show = view.hovered === node || (view.zoom > 0.55 && (degree.get(node.id) || 0) >= 3);
+        const show =
+          view.hovered === node || (view.zoom > 0.55 && (degree.get(nodeKey(node)) || 0) >= 3);
         if (!show) continue;
         const point = toScreen(node);
         context.globalAlpha = view.hovered === node ? 1 : 0.7;
@@ -2870,7 +2881,7 @@
     }
 
     const rememberPositions = () => {
-      for (const node of nodes) view.positions.set(node.id, { wx: node.wx, wy: node.wy });
+      for (const node of nodes) view.positions.set(nodeKey(node), { wx: node.wx, wy: node.wy });
     };
 
     if (!needsLayout) {
