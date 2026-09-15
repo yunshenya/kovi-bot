@@ -198,12 +198,50 @@ impl ApiError {
         }
     }
 
-    pub(crate) fn internal(message: impl std::fmt::Display) -> Self {
+    /// 服务暂时不可用，且**原因本身就是给运维看的**（例如数据库连接池还没起来）。
+    ///
+    /// 与 [`ApiError::internal`] 的区别：这类消息里没有实现细节，说清楚比说"内部错误"
+    /// 有用得多——运维看到"连接池尚未初始化"就知道该去查数据库配置，而不是去翻日志。
+    pub(crate) fn unavailable(message: impl Into<String>) -> Self {
         Self {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            message: message.to_string(),
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: message.into(),
         }
     }
+
+    /// 内部错误，但**结论本身必须如实告诉运维**（例如"设置已经切过去了，只是没能记下
+    /// 正在用的是哪一套"——说成"内部错误"会让人以为整次切换都失败了）。
+    ///
+    /// 调用方必须保证 message 里没有绝对路径、SQL、连接串等实现细节：它会被原样回显，
+    /// 这一点与 [`ApiError::internal`] 不同。
+    pub(crate) fn internal_explained(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: message.into(),
+        }
+    }
+
+    /// 内部错误：完整原因**只进服务端日志**，回给客户端的是一句通用说明 + 关联编号。
+    ///
+    /// 后台能改全部配置、读全部记忆，即使默认只监听回环，也不该把绝对路径、SQL 报错、
+    /// 连接串细节交给浏览器——那些内容还会被截图、被粘贴外传。运维按编号去日志里找同一行。
+    /// 用户**自己能纠正**的错误（参数不合法、TOML 语法、字段越界）走 `bad_request`，
+    /// 那些原因照旧原样回显。
+    pub(crate) fn internal(message: impl std::fmt::Display) -> Self {
+        let reason = message.to_string();
+        let id = next_error_id();
+        eprintln!("[ERROR] 管理后台内部错误 #{id}: {reason}");
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: format!("内部错误（编号 {id}），详情见服务端日志"),
+        }
+    }
+}
+
+/// 内部错误的关联编号：日志里同一编号的那一行有完整原因。
+fn next_error_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 impl IntoResponse for ApiError {
@@ -486,6 +524,33 @@ mod tests {
         let mut pending = state.pending_restart();
         pending.sort();
         assert_eq!(pending, vec!["admin".to_string(), "tools".to_string()]);
+    }
+
+    #[test]
+    fn internal_errors_keep_their_detail_out_of_the_response() {
+        // 后台能改全部配置、读全部记忆：绝对路径、SQL 报错、连接串细节不该回给浏览器。
+        let error =
+            super::ApiError::internal("无法写入 /srv/kovi/bot.conf.toml: Read-only file system");
+        let rendered = format!("{error:?}");
+        assert!(
+            !rendered.contains("/srv/kovi"),
+            "内部错误的回显里不该出现绝对路径: {rendered}"
+        );
+        assert!(
+            rendered.contains("内部错误") && rendered.contains("编号"),
+            "应当给出可对照日志的编号: {rendered}"
+        );
+    }
+
+    #[test]
+    fn explained_and_unavailable_errors_stay_readable() {
+        // 这两类刻意保留原文：前者是"已经生效、只是没记下标记"这种必须说清的结论，
+        // 后者是"连接池没起来"这种直接指向运维动作的原因。
+        let explained =
+            super::ApiError::internal_explained("模型设置已经切过去了，但没能记下正在用的是哪一套");
+        assert!(format!("{explained:?}").contains("没能记下"));
+        let unavailable = super::ApiError::unavailable("PostgreSQL 记忆连接池尚未初始化");
+        assert!(format!("{unavailable:?}").contains("连接池尚未初始化"));
     }
 
     #[test]

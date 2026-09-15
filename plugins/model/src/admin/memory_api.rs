@@ -292,7 +292,7 @@ fn kind_meta(key: &str) -> Result<&'static RecordKind, ApiError> {
 fn database_pool() -> Result<&'static PgPool, ApiError> {
     crate::memory::MEMORY_MANAGER
         .database_pool()
-        .ok_or_else(|| ApiError::internal("PostgreSQL 记忆连接池尚未初始化，记忆功能不可用"))
+        .ok_or_else(|| ApiError::unavailable("PostgreSQL 记忆连接池尚未初始化，记忆功能不可用"))
 }
 
 fn clamp_limit(limit: Option<i64>) -> i64 {

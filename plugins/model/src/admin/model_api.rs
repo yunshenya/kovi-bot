@@ -242,7 +242,7 @@ pub(crate) async fn apply(
     // 否则页面会以为整次切换都失败了。
     let applied = applied_id_for(&request, saved.clone());
     if let Err(error) = model_profiles::mark_applied(applied.as_deref()) {
-        return Err(ApiError::internal(format!(
+        return Err(ApiError::internal_explained(format!(
             "模型设置已经切过去了，但没能记下「正在用的是哪一套」：{}",
             error.message
         )));
