@@ -1415,3 +1415,288 @@ fn batch_timestamps_never_rewind_interest_or_agenda_state() {
             .is_ok()
     );
 }
+
+#[tokio::test]
+async fn replaying_a_resolution_is_skipped_instead_of_failing_the_batch() {
+    // 存储层要求每次 upsert 的版本**恰好** expected + 1，而 `transition` 打到已经
+    // 处于目标状态的记录上时会原样返回、版本不涨。模型完全可能对同一个问题再提一次
+    // Resolve（它看到的就是"这条已经了结"，重复提一次很正常），此前那会让整批反思
+    // 以 VersionConflict 回滚——一条无害的重复提案拖垮整批。
+    let store = Arc::new(InMemoryMindStore::new());
+    let services = MindServices::from_store(Arc::clone(&store));
+    let base = services
+        .consolidation
+        .current_version()
+        .await
+        .expect("version");
+    let event = direct_event(PersonId::new(), ConversationId::new(), "Rust");
+    let input = ReflectionInput {
+        trigger: ReflectionTrigger::HighSalienceEvent,
+        depth: ReflectionDepth::Deep,
+        scope: MindScope::Global,
+        recent_events: Vec::new(),
+        salient_memories: Vec::new(),
+        open_loop_summaries: Vec::new(),
+        goal_summaries: Vec::new(),
+        mind: MindSnapshot::new(
+            None,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            MindInfluenceMode::Shadow,
+            base,
+            now(),
+        )
+        .expect("empty versioned snapshot"),
+        requested_at: now(),
+        trace: event.trace(),
+    };
+    let consolidation = Consolidation::new(ConsolidationConfig::default()).expect("config");
+
+    // 第一次：给出这个问题并顺手了结掉。
+    let mut first = ReflectionProposal::empty(&input);
+    first
+        .open_question_updates
+        .push(OpenQuestionUpdateProposal {
+            operation: OpenQuestionOperation::Upsert,
+            question_id: None,
+            expected_version: None,
+            scope: MindScope::Global,
+            question: "她到底喜不喜欢 Rust".to_owned(),
+            related_beliefs: Vec::new(),
+            salience: 0.6,
+        });
+    consolidation
+        .consolidate(&services, &first)
+        .await
+        .expect("首次提案");
+    let question = services
+        .open_questions
+        .find_open_by_key(
+            MindScope::Global,
+            &common::normalized_key("她到底喜不喜欢 Rust"),
+        )
+        .await
+        .expect("lookup")
+        .expect("stored question");
+    let resolved_at = now() + Duration::minutes(1);
+    let mut resolve = ReflectionProposal::empty(&input);
+    resolve.base_snapshot_version = services
+        .consolidation
+        .current_version()
+        .await
+        .expect("version");
+    resolve.proposed_at = resolved_at;
+    resolve
+        .open_question_updates
+        .push(OpenQuestionUpdateProposal {
+            operation: OpenQuestionOperation::Resolve,
+            question_id: Some(question.id()),
+            expected_version: Some(question.version()),
+            scope: MindScope::Global,
+            question: "她到底喜不喜欢 Rust".to_owned(),
+            related_beliefs: Vec::new(),
+            salience: 0.6,
+        });
+    let resolved = consolidation
+        .consolidate(&services, &resolve)
+        .await
+        .expect("第一次了结");
+    assert_eq!(resolved.applied_updates, 1, "了结应当真的写进去");
+
+    let resolved = services
+        .open_questions
+        .get(question.id())
+        .await
+        .expect("lookup")
+        .expect("stored question");
+    assert_eq!(resolved.status(), OpenQuestionStatus::Resolved);
+
+    // 第二次：模型读到的是"已经 Resolved"的这一条，又提了一次 Resolve。
+    // 它给的 expected_version 是刚读到的那一版，所以这不是过期提案，
+    // 而是一条无害的重复提案——必须跳过，不能让整批回滚。
+    let mut replay = ReflectionProposal::empty(&input);
+    replay.base_snapshot_version = services
+        .consolidation
+        .current_version()
+        .await
+        .expect("version");
+    replay.proposed_at = resolved_at + Duration::minutes(1);
+    replay
+        .open_question_updates
+        .push(OpenQuestionUpdateProposal {
+            operation: OpenQuestionOperation::Resolve,
+            question_id: Some(question.id()),
+            expected_version: Some(resolved.version()),
+            scope: MindScope::Global,
+            question: "她到底喜不喜欢 Rust".to_owned(),
+            related_beliefs: Vec::new(),
+            salience: 0.6,
+        });
+    let replayed = consolidation
+        .consolidate(&services, &replay)
+        .await
+        .expect("重复了结不该让整批回滚");
+    assert_eq!(replayed.applied_updates, 0, "已经了结的问题不该再写一次");
+    let stored = services
+        .open_questions
+        .get(question.id())
+        .await
+        .expect("lookup")
+        .expect("stored question");
+    assert_eq!(stored.status(), OpenQuestionStatus::Resolved);
+    assert_eq!(stored.version(), resolved.version(), "跳过之后版本不该动");
+
+    // 过期提案仍然要被拦下：跳过的只是"当前版本 + 已经满足"，不是放弃乐观并发。
+    let mut stale = ReflectionProposal::empty(&input);
+    stale.base_snapshot_version = services
+        .consolidation
+        .current_version()
+        .await
+        .expect("version");
+    stale.proposed_at = resolved_at + Duration::minutes(2);
+    stale
+        .open_question_updates
+        .push(OpenQuestionUpdateProposal {
+            operation: OpenQuestionOperation::Resolve,
+            question_id: Some(question.id()),
+            expected_version: Some(question.version()),
+            scope: MindScope::Global,
+            question: "她到底喜不喜欢 Rust".to_owned(),
+            related_beliefs: Vec::new(),
+            salience: 0.6,
+        });
+    assert!(
+        consolidation.consolidate(&services, &stale).await.is_err(),
+        "拿旧版本号来的提案仍应冲突"
+    );
+}
+
+#[tokio::test]
+async fn replaying_an_agenda_resolution_is_skipped_instead_of_failing_the_batch() {
+    let store = Arc::new(InMemoryMindStore::new());
+    let services = MindServices::from_store(Arc::clone(&store));
+    let base = services
+        .consolidation
+        .current_version()
+        .await
+        .expect("version");
+    let event = direct_event(PersonId::new(), ConversationId::new(), "Rust");
+    let input = ReflectionInput {
+        trigger: ReflectionTrigger::HighSalienceEvent,
+        depth: ReflectionDepth::Deep,
+        scope: MindScope::Global,
+        recent_events: Vec::new(),
+        salient_memories: Vec::new(),
+        open_loop_summaries: Vec::new(),
+        goal_summaries: Vec::new(),
+        mind: MindSnapshot::new(
+            None,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            MindInfluenceMode::Shadow,
+            base,
+            now(),
+        )
+        .expect("empty versioned snapshot"),
+        requested_at: now(),
+        trace: event.trace(),
+    };
+    let consolidation = Consolidation::new(ConsolidationConfig::default()).expect("config");
+    let subject = AgendaSubject::Curiosity(CuriosityId::new());
+
+    let mut first = ReflectionProposal::empty(&input);
+    first.agenda_updates.push(AgendaUpdateProposal {
+        operation: AgendaOperation::Activate,
+        item_id: None,
+        expected_version: None,
+        scope: MindScope::Global,
+        subject: subject.clone(),
+        salience: 0.5,
+        activation: 0.5,
+        stability: 0.5,
+        source: AgendaSource::Curiosity,
+        defer_until: None,
+    });
+    consolidation
+        .consolidate(&services, &first)
+        .await
+        .expect("首次提案");
+    let item = services
+        .agenda
+        .find_active_by_key(MindScope::Global, &subject.dedupe_key())
+        .await
+        .expect("lookup")
+        .expect("stored agenda item");
+
+    let resolved_at = now() + Duration::minutes(1);
+    let mut resolve = ReflectionProposal::empty(&input);
+    resolve.base_snapshot_version = services
+        .consolidation
+        .current_version()
+        .await
+        .expect("version");
+    resolve.proposed_at = resolved_at;
+    resolve.agenda_updates.push(AgendaUpdateProposal {
+        operation: AgendaOperation::Resolve,
+        item_id: Some(item.id()),
+        expected_version: Some(item.version()),
+        scope: MindScope::Global,
+        subject: subject.clone(),
+        salience: 0.5,
+        activation: 0.5,
+        stability: 0.5,
+        source: AgendaSource::Curiosity,
+        defer_until: None,
+    });
+    consolidation
+        .consolidate(&services, &resolve)
+        .await
+        .expect("第一次了结");
+
+    let resolved = services
+        .agenda
+        .get(item.id())
+        .await
+        .expect("lookup")
+        .expect("stored agenda item");
+    let mut replay = ReflectionProposal::empty(&input);
+    replay.base_snapshot_version = services
+        .consolidation
+        .current_version()
+        .await
+        .expect("version");
+    replay.proposed_at = resolved_at + Duration::minutes(1);
+    replay.agenda_updates.push(AgendaUpdateProposal {
+        operation: AgendaOperation::Resolve,
+        item_id: Some(item.id()),
+        expected_version: Some(resolved.version()),
+        scope: MindScope::Global,
+        subject: subject.clone(),
+        salience: 0.5,
+        activation: 0.5,
+        stability: 0.5,
+        source: AgendaSource::Curiosity,
+        defer_until: None,
+    });
+    let replayed = consolidation
+        .consolidate(&services, &replay)
+        .await
+        .expect("终态议程的重复提案不该让整批回滚");
+    assert_eq!(replayed.applied_updates, 0, "终态议程不该再被改写");
+    let stored = services
+        .agenda
+        .get(item.id())
+        .await
+        .expect("lookup")
+        .expect("stored agenda item");
+    assert_eq!(stored.status(), AgendaStatus::Resolved);
+    assert_eq!(stored.version(), resolved.version(), "跳过之后版本不该动");
+}

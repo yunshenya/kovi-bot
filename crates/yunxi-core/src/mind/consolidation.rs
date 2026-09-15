@@ -410,9 +410,12 @@ impl Consolidation {
                     )
                     .await?
             };
-            let upsert = self.prepare_open_question(update, existing, proposal.proposed_at)?;
-            ensure_scope(proposal.scope, upsert.value.scope())?;
-            plan.open_questions.push(upsert);
+            if let Some(upsert) =
+                self.prepare_open_question(update, existing, proposal.proposed_at)?
+            {
+                ensure_scope(proposal.scope, upsert.value.scope())?;
+                plan.open_questions.push(upsert);
+            }
         }
         for update in &proposal.agenda_updates {
             let existing = if let Some(id) = update.item_id {
@@ -423,9 +426,10 @@ impl Consolidation {
                     .find_active_by_key(update.scope, &update.subject.dedupe_key())
                     .await?
             };
-            let upsert = self.prepare_agenda(update, existing, proposal.proposed_at)?;
-            ensure_scope(proposal.scope, upsert.value.scope())?;
-            plan.agenda.push(upsert);
+            if let Some(upsert) = self.prepare_agenda(update, existing, proposal.proposed_at)? {
+                ensure_scope(proposal.scope, upsert.value.scope())?;
+                plan.agenda.push(upsert);
+            }
         }
 
         plan.validate(self.config)?;
@@ -677,12 +681,16 @@ impl Consolidation {
         }
     }
 
+    /// 返回 `None` 表示这条提案什么都没改（例如对已经 Resolved 的问题再发一次
+    /// `Resolve`）：存储层要求每次 upsert 的版本**恰好** `expected + 1`，而
+    /// `transition` 在状态本就相同时原样返回、版本不涨，硬塞进去只会让整批反思
+    /// 以 `VersionConflict` 回滚。跳过它才是"这条已经满足了"的正确表达。
     fn prepare_open_question(
         &self,
         proposal: &OpenQuestionUpdateProposal,
         existing: Option<OpenQuestion>,
         now: DateTime<Utc>,
-    ) -> Result<MindUpsert<OpenQuestion>, ConsolidationError> {
+    ) -> Result<Option<MindUpsert<OpenQuestion>>, ConsolidationError> {
         proposal.validate()?;
         match existing {
             Some(existing) => {
@@ -714,10 +722,13 @@ impl Consolidation {
                         existing.transition(OpenQuestionStatus::Dropped, now)?
                     }
                 };
-                Ok(MindUpsert {
+                if value.version() == expected {
+                    return Ok(None);
+                }
+                Ok(Some(MindUpsert {
                     value,
                     expected_version: Some(expected),
-                })
+                }))
             }
             None => {
                 if proposal.operation != OpenQuestionOperation::Upsert {
@@ -737,20 +748,23 @@ impl Consolidation {
                     proposal.salience,
                     now,
                 )?;
-                Ok(MindUpsert {
+                Ok(Some(MindUpsert {
                     value,
                     expected_version: None,
-                })
+                }))
             }
         }
     }
 
+    /// 与 `prepare_open_question` 同规矩：`transition` 打到已经处于目标状态的议程
+    /// 上时不会涨版本，这种"已经满足了"的提案要跳过，否则整批反思会被存储层的
+    /// `expected + 1` 判据打回。
     fn prepare_agenda(
         &self,
         proposal: &AgendaUpdateProposal,
         existing: Option<AgendaItem>,
         now: DateTime<Utc>,
-    ) -> Result<MindUpsert<AgendaItem>, ConsolidationError> {
+    ) -> Result<Option<MindUpsert<AgendaItem>>, ConsolidationError> {
         proposal.validate()?;
         match existing {
             Some(existing) => {
@@ -783,10 +797,13 @@ impl Consolidation {
                     AgendaOperation::Resolve => existing.transition(AgendaStatus::Resolved, now)?,
                     AgendaOperation::Drop => existing.transition(AgendaStatus::Dropped, now)?,
                 };
-                Ok(MindUpsert {
+                if value.version() == expected {
+                    return Ok(None);
+                }
+                Ok(Some(MindUpsert {
                     value,
                     expected_version: Some(expected),
-                })
+                }))
             }
             None => {
                 if proposal.operation != AgendaOperation::Activate {
@@ -808,10 +825,10 @@ impl Consolidation {
                     proposal.source,
                     now,
                 )?;
-                Ok(MindUpsert {
+                Ok(Some(MindUpsert {
                     value,
                     expected_version: None,
-                })
+                }))
             }
         }
     }
