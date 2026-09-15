@@ -322,6 +322,49 @@ impl SelfModel {
         )
     }
 
+    /// Adds a limitation learned from experience.
+    ///
+    /// Refuses when the list is full rather than evicting: the seeded
+    /// limitations describe who she is and were put there deliberately, and
+    /// silently dropping one to make room for a machine-learned line would be
+    /// the wrong trade. A full list simply stops learning new ones.
+    ///
+    /// A limitation already stated in the same words is not added twice, so a
+    /// pattern noticed on many days does not fill the list with one sentence.
+    pub fn with_learned_limitation(
+        &self,
+        now: DateTime<Utc>,
+        description: impl Into<String>,
+    ) -> Result<SelfModel, MindValidationError> {
+        let limitation = SelfLimitation::new(description)?;
+        if self
+            .limitations
+            .iter()
+            .any(|current| current.description() == limitation.description())
+        {
+            return Ok(self.clone());
+        }
+        if self.limitations.len() >= MAX_SELF_LIMITATIONS {
+            return Ok(self.clone());
+        }
+        let mut limitations = self.limitations.clone();
+        limitations.push(limitation);
+        Self::new(
+            self.identity.clone(),
+            self.traits.clone(),
+            self.values.clone(),
+            limitations,
+            self.long_term_goals.clone(),
+            self.source,
+            now,
+            self.version
+                .checked_add(1)
+                .ok_or(MindValidationError::InvalidProposal {
+                    reason: "self model version exhausted",
+                })?,
+        )
+    }
+
     pub fn validate(&self) -> Result<(), MindValidationError> {
         self.identity.validate()?;
         self.values.validate()?;
@@ -423,5 +466,67 @@ impl SelfModel {
     #[must_use]
     pub const fn schema_version(&self) -> u16 {
         self.schema_version
+    }
+}
+
+#[cfg(test)]
+mod learned_limitation_tests {
+    use super::*;
+    use chrono::Utc;
+
+    #[test]
+    fn a_learned_limitation_is_added_once_and_never_by_eviction() {
+        let now = Utc::now();
+        let seed = SelfModel::seed_yunxi(now);
+        let seeded = seed.limitations().len();
+
+        let learned = seed
+            .with_learned_limitation(now, "我在需要反复查证的事情上容易耗光步数。")
+            .expect("a bounded description is accepted");
+        assert_eq!(learned.limitations().len(), seeded + 1);
+        assert_eq!(learned.version(), seed.version() + 1);
+        assert!(
+            learned
+                .limitations()
+                .iter()
+                .any(|limitation| limitation.description().contains("耗光步数"))
+        );
+
+        // The same sentence is not learned twice, however often it is noticed.
+        let again = learned
+            .with_learned_limitation(now, "我在需要反复查证的事情上容易耗光步数。")
+            .expect("a repeat is accepted but ignored");
+        assert_eq!(again.limitations().len(), seeded + 1);
+        assert_eq!(again.version(), learned.version());
+
+        // A full list stops learning rather than evicting who she is.
+        let mut full = seed.clone();
+        for index in 0..MAX_SELF_LIMITATIONS {
+            full = full
+                .with_learned_limitation(now, format!("第 {index} 条学到的局限"))
+                .expect("bounded");
+        }
+        assert_eq!(full.limitations().len(), MAX_SELF_LIMITATIONS);
+        let refused = full
+            .with_learned_limitation(now, "再来一条")
+            .expect("refusal is not an error");
+        assert_eq!(refused.limitations().len(), MAX_SELF_LIMITATIONS);
+        assert!(
+            refused
+                .limitations()
+                .iter()
+                .any(|limitation| limitation.description().contains("我可能犯错")),
+            "the seeded limitations must survive: {refused:?}",
+        );
+    }
+
+    #[test]
+    fn an_unbounded_limitation_is_refused_as_an_error() {
+        let now = Utc::now();
+        let seed = SelfModel::seed_yunxi(now);
+        assert!(
+            seed.with_learned_limitation(now, "   ").is_err(),
+            "an empty limitation is not a limitation"
+        );
     }
 }

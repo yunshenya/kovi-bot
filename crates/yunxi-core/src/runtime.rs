@@ -93,6 +93,31 @@ fn action_dispatch_timeout_for_elapsed(elapsed: std::time::Duration) -> std::tim
         .max(MIN_ACTION_DISPATCH_TIMEOUT)
 }
 
+/// What finished tasks say about how well she finishes them.
+///
+/// Cross-task by nature: one task going badly is an incident, several is a
+/// pattern worth knowing about herself. Counts saturate — this is a signal for
+/// the self model, not an audit trail.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SelfEfficacyEvidence {
+    /// Tasks that used their whole round budget without saying anything.
+    pub unfinished_tasks: u32,
+    /// Tasks that kept repeating one failing call.
+    pub stuck_tasks: u32,
+}
+
+impl SelfEfficacyEvidence {
+    /// Whether enough has happened to be worth telling her about herself.
+    #[must_use]
+    pub const fn is_notable(self) -> bool {
+        self.unfinished_tasks >= MIN_UNFINISHED_TASKS_FOR_LIMITATION
+    }
+}
+
+/// How many tasks may end unfinished before it counts as a limit rather than a
+/// bad day.
+pub const MIN_UNFINISHED_TASKS_FOR_LIMITATION: u32 = 3;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RuntimeConfig {
     pub event_queue_capacity: usize,
@@ -502,6 +527,8 @@ pub struct CognitiveRuntime {
     lifecycle: TraceLifecycle,
     /// How much work one task may do, as configured.
     task_budget: TaskBudget,
+    /// Running tally of what finished tasks say about her own effectiveness.
+    self_efficacy: SelfEfficacyEvidence,
     /// Rounds each in-flight task has already run, keyed by trace root.
     rounds_by_trace: HashMap<EventId, u8>,
     /// Outcomes of conversation-owned expectations, waiting to be read by the
@@ -515,6 +542,8 @@ pub struct CognitiveRuntime {
     expectation_notes:
         HashMap<crate::executive::ExecutiveScope, VecDeque<crate::WorkingObservation>>,
     expectation_note_order: VecDeque<crate::executive::ExecutiveScope>,
+    /// Tasks that delivered at least one visible message.
+    delivered_roots: HashSet<EventId>,
     /// Tasks that have taken in a tool result which may contain text written
     /// by someone else, keyed by trace root.
     ///
@@ -707,8 +736,10 @@ impl CognitiveRuntime {
                 pending_tool_follow_ups: VecDeque::new(),
                 lifecycle: TraceLifecycle::default(),
                 task_budget: config.task_budget,
+                self_efficacy: SelfEfficacyEvidence::default(),
                 rounds_by_trace: HashMap::new(),
                 foreign_text_roots: HashSet::new(),
+                delivered_roots: HashSet::new(),
                 expectation_notes: HashMap::new(),
                 expectation_note_order: VecDeque::new(),
                 working_memory: HashMap::new(),
@@ -959,6 +990,45 @@ impl CognitiveRuntime {
             .register_expectation_for_scope(scope, expectation)
     }
 
+    /// Records what this finished task says about her ability to finish tasks.
+    ///
+    /// Only outcomes attributable to *her* count. A tool that reported an error
+    /// is usually the network or the host failing, and blaming herself for it
+    /// would poison the self model with other people's faults. What is hers is:
+    /// she ran out of steps without getting the thing done, or she kept trying
+    /// the same failing approach.
+    fn note_task_self_efficacy(&mut self, root: EventId) {
+        let rounds_used = self.rounds_by_trace.get(&root).copied().unwrap_or(0);
+        let stuck = self
+            .working_memory
+            .get(&root)
+            .is_some_and(|memory| memory.stuck_on().is_some());
+        let unfinished =
+            rounds_used >= self.task_budget.max_rounds && !self.delivered_anything(root);
+        if unfinished {
+            self.self_efficacy.unfinished_tasks =
+                self.self_efficacy.unfinished_tasks.saturating_add(1);
+        }
+        if stuck {
+            self.self_efficacy.stuck_tasks = self.self_efficacy.stuck_tasks.saturating_add(1);
+        }
+    }
+
+    /// Whether this task put any visible message in front of anyone.
+    ///
+    /// Recorded directly from the `MessageSent` event the runtime itself
+    /// derives for a delivered message. A task that used its whole budget but
+    /// did say something still finished its job.
+    fn delivered_anything(&self, root: EventId) -> bool {
+        self.delivered_roots.contains(&root)
+    }
+
+    /// What her finished tasks say about how well she finishes them.
+    #[must_use]
+    pub const fn self_efficacy_evidence(&self) -> SelfEfficacyEvidence {
+        self.self_efficacy
+    }
+
     /// Notes whether an observed event puts untrusted text into its task.
     ///
     /// Only a tool result can: a message from a person is her actual subject
@@ -1171,6 +1241,7 @@ impl CognitiveRuntime {
             return;
         }
         self.lifecycle.record_ended(root);
+        self.note_task_self_efficacy(root);
         // A task that has stopped producing events can no longer satisfy what
         // it expected, so release them instead of letting them hold quota until
         // an unrelated event happens to notice their deadline. This is the only
@@ -1185,6 +1256,7 @@ impl CognitiveRuntime {
         self.working_memory.remove(&root);
         self.foreign_text_roots.remove(&root);
         self.rounds_by_trace.remove(&root);
+        self.delivered_roots.remove(&root);
         if self.tool_action_budget_by_trace.remove(&root).is_some() {
             self.tool_action_budget_order
                 .retain(|candidate| *candidate != root);
@@ -1425,6 +1497,11 @@ impl CognitiveRuntime {
                 return ProcessingOutcome::RejectedState { event, error };
             }
         };
+        if matches!(event.kind(), WorldEventKind::MessageSent(_)) {
+            // The runtime derives this itself for a delivered message, so it is
+            // the direct answer to "did this task say anything".
+            self.delivered_roots.insert(event.trace().root_event_id());
+        }
         self.record_expectation_results(self.executive.observe_expectations_resolved(&event));
         ProcessingOutcome::Observed(RuntimeObservation {
             event_id: event.id(),
@@ -3986,6 +4063,164 @@ mod tests {
         );
     }
 
+    /// A task that runs out of steps without saying anything counts against her
+    /// own effectiveness; a tool that merely reported an error does not.
+    #[tokio::test]
+    async fn only_her_own_failures_count_toward_self_efficacy() {
+        let conversation_id = ConversationId::new();
+        let (_handle, mut runtime) = CognitiveRuntime::new_with_services(
+            RuntimeConfig {
+                task_budget: crate::TaskBudget {
+                    max_rounds: 2,
+                    ..crate::TaskBudget::default()
+                },
+                ..RuntimeConfig::default()
+            },
+            CoreServices::with_model(EndlessToolModel),
+        )
+        .expect("valid runtime");
+        let mut capabilities = EnvironmentCapabilities::all();
+        capabilities.actions.push(crate::ActionDescriptor::tool(
+            "web.search",
+            crate::EffectScope::ReadOnly,
+            false,
+        ));
+        let arbiter =
+            ActionArbiter::new(ActionArbiterConfig::default().with_capabilities(capabilities));
+
+        let event = direct_message(conversation_id, PersonId::new());
+        runtime
+            .process_event_with_planner_and_actions(event, &arbiter, &AlwaysCompletingPort)
+            .await
+            .expect("the turn runs");
+
+        let evidence = runtime.self_efficacy_evidence();
+        assert_eq!(
+            evidence.unfinished_tasks, 0,
+            "a task that has not run out of steps is not evidence against her"
+        );
+
+        // Drive it to the end of its budget. It never speaks, so this is a task
+        // she did not manage to finish.
+        while runtime.has_pending_event() {
+            let _ = runtime
+                .process_next_with_planner_and_actions(&arbiter, &AlwaysCompletingPort)
+                .await;
+        }
+        assert_eq!(
+            runtime.self_efficacy_evidence().unfinished_tasks,
+            1,
+            "a task that spent its whole budget without saying anything counts"
+        );
+        assert!(!runtime.self_efficacy_evidence().is_notable());
+    }
+
+    /// A task that says something is finished, even if it also called tools.
+    #[tokio::test]
+    async fn a_task_that_speaks_does_not_count_as_unfinished() {
+        let conversation_id = ConversationId::new();
+        let (_handle, mut runtime) = CognitiveRuntime::new_with_services(
+            RuntimeConfig {
+                task_budget: crate::TaskBudget {
+                    max_rounds: 2,
+                    ..crate::TaskBudget::default()
+                },
+                ..RuntimeConfig::default()
+            },
+            CoreServices::with_model(ToolThenSpeakModel { conversation_id }),
+        )
+        .expect("valid runtime");
+        let mut capabilities = EnvironmentCapabilities::all();
+        capabilities.actions.push(crate::ActionDescriptor::tool(
+            "web.search",
+            crate::EffectScope::ReadOnly,
+            false,
+        ));
+        let arbiter =
+            ActionArbiter::new(ActionArbiterConfig::default().with_capabilities(capabilities));
+        let event = direct_message(conversation_id, PersonId::new());
+        runtime
+            .process_event_with_planner_and_actions(event, &arbiter, &AlwaysCompletingPort)
+            .await
+            .expect("the turn runs");
+        while runtime.has_pending_event() {
+            let _ = runtime
+                .process_next_with_planner_and_actions(&arbiter, &AlwaysCompletingPort)
+                .await;
+        }
+        assert_eq!(
+            runtime.self_efficacy_evidence().unfinished_tasks,
+            0,
+            "saying something means the task did its job"
+        );
+    }
+
+    /// Calls a tool first, then speaks.
+    struct ToolThenSpeakModel {
+        conversation_id: ConversationId,
+    }
+
+    impl ModelBackend for ToolThenSpeakModel {
+        fn plan<'a>(&'a self, input: &'a PlannerInput) -> ModelBackendFuture<'a> {
+            Box::pin(async move {
+                if matches!(
+                    input.event.kind(),
+                    WorldEventKind::ToolCompleted(tool) if tool.requires_follow_up
+                ) {
+                    return Ok(DecisionPlan {
+                        disposition: DecisionDisposition::Reply,
+                        intents: vec![crate::CognitiveIntent::send_message(
+                            self.conversation_id,
+                            MessageContent::text("查到了"),
+                        )],
+                        state_updates: Vec::new(),
+                        expectations: Vec::new(),
+                        goal: None,
+                    });
+                }
+                Ok(DecisionPlan {
+                    disposition: DecisionDisposition::Reply,
+                    intents: vec![crate::CognitiveIntent::UseTool {
+                        tool_name: "web.search".to_owned(),
+                        input: "{}".to_owned(),
+                        scope: crate::ActionScope::Conversation(self.conversation_id),
+                        notification_policy: crate::ToolNotificationPolicy::Final,
+                    }],
+                    state_updates: Vec::new(),
+                    expectations: Vec::new(),
+                    goal: None,
+                })
+            })
+        }
+    }
+
+    /// Keeps asking for a tool and never speaks.
+    struct EndlessToolModel;
+
+    impl ModelBackend for EndlessToolModel {
+        fn plan<'a>(&'a self, input: &'a PlannerInput) -> ModelBackendFuture<'a> {
+            Box::pin(async move {
+                let conversation_id = input
+                    .event
+                    .scope()
+                    .conversation_id()
+                    .ok_or(crate::ModelBackendError::Unavailable)?;
+                Ok(DecisionPlan {
+                    disposition: DecisionDisposition::Reply,
+                    intents: vec![crate::CognitiveIntent::UseTool {
+                        tool_name: "web.search".to_owned(),
+                        input: "{}".to_owned(),
+                        scope: crate::ActionScope::Conversation(conversation_id),
+                        notification_policy: crate::ToolNotificationPolicy::Final,
+                    }],
+                    state_updates: Vec::new(),
+                    expectations: Vec::new(),
+                    goal: None,
+                })
+            })
+        }
+    }
+
     /// An expectation owned by a conversation outlives the task that formed it,
     /// and its answer waits for the next turn in that conversation.
     ///
@@ -4408,7 +4643,8 @@ mod tests {
         }
     }
 
-    /// Completes every tool, so each round produces a follow-up.
+    /// Completes every tool and delivers every message, so a task can both take
+    /// tool steps and end by saying something.
     struct AlwaysCompletingPort;
 
     impl ActionPort for AlwaysCompletingPort {
@@ -4419,6 +4655,13 @@ mod tests {
                         Ok(crate::ActionPortOutcome::ToolCompleted {
                             operation: tool.tool_name.clone(),
                             output: "ok".to_owned(),
+                        })
+                    }
+                    crate::ProposedAction::SendMessage(send) => {
+                        Ok(crate::ActionPortOutcome::Delivered {
+                            external_reference: None,
+                            message_id: Some(crate::MessageId::new()),
+                            conversation_id: Some(send.conversation_id),
                         })
                     }
                     _ => Err(crate::ActionPortError::new("unsupported", false)),

@@ -2414,6 +2414,12 @@ fn affect_tone_guidance(input: &PlannerInput) -> String {
         if let Some(value_text) = strongest_value_voice(model.values()) {
             parts.push(value_text);
         }
+        // 她的局限此前从未被渲染进任何提示词——`limitations` 是 Mind 里一个
+        // 没人读的字段。取**最后一条**（学习到的那条排在最末），只说一句：
+        // 局限是自我认知，不是待办清单，堆在提示词里只会变成噪声。
+        if let Some(limitation) = model.limitations().last() {
+            parts.push(format!("我知道自己{}", limitation.trim_end_matches('。')));
+        }
     }
 
     // Present mood/energy.
