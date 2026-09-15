@@ -683,6 +683,18 @@ pub struct MessageReceivedEvent {
     /// 老载荷没有这个字段，按 false 反序列化。
     #[serde(default)]
     pub continuation_to_agent: bool,
+    /// 这条来信是在要求"停下"（别再回了 / 停住当前这轮）。
+    ///
+    /// **当前状态：Core 这一侧读它，但生产环境里没有写它的人。** 消费方是完整的——
+    /// `AttentionSystem` 把它当作必须处理的理由（`AttentionReason::StopRequested`），
+    /// `planner` 据此调低舒适度目标与好感增量，`mind/decision` 用它挡掉自主发言，
+    /// `model/intrinsic` 用它取消兜底回复；可宿主侧的入口一直是硬编码 `false`
+    /// （`bridge.rs` 四处构造点），所以线上这条链路目前不会触发。
+    ///
+    /// 真正的"停"现在走宿主语义层：`wants_stop` → `interrupt::cancel`，只对宿主自己
+    /// 那轮的可见回复生效。**不要**因为"这里恒为 false"就删字段与那串分支——那是一套
+    /// 接好线只缺生产者的能力；缺的是给 Core 接管的回合也送一个停止信号（宿主语义层
+    /// 的判定晚于事件提交，需要一条后续信号，而不是复活这个布尔），属于独立特性。
     pub stop_requested: bool,
     pub explicit_request: bool,
     /// Whether this observation may produce a visible reply.
