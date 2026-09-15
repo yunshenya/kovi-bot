@@ -38,6 +38,11 @@ const MAX_PENDING_TOOL_FOLLOW_UPS: usize = 128;
 /// This intentionally matches the per-plan intent bound. A model can still
 /// use multiple tools, but a recursive chain cannot grow without limit.
 pub const MAX_TOOL_ACTIONS_PER_TRACE: usize = MAX_PLANNER_INTENTS;
+/// Hard ceiling on a configurable per-task tool budget. A task cannot usefully
+/// call more tools than a plan can even name, times a few rounds.
+pub const MAX_TASK_TOOL_ACTIONS: usize = MAX_PLANNER_INTENTS * 4;
+/// Hard ceiling on a configurable per-task round count.
+pub const MAX_TASK_ROUNDS: u8 = 32;
 /// Number of root traces retained by the cumulative tool-budget ledger.
 /// Entries contain only event IDs and counters, never user content.
 const MAX_TOOL_TRACE_BUDGET_ENTRIES: usize = 1_024;
@@ -87,8 +92,64 @@ fn action_dispatch_timeout_for_elapsed(elapsed: std::time::Duration) -> std::tim
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RuntimeConfig {
     pub event_queue_capacity: usize,
+    /// Structural bound on how deep a trace's derived events may nest.
+    ///
+    /// This is a safety property of the event algebra, not a plan for how long a
+    /// task should run. How much work a task may do is [`Self::task_budget`];
+    /// conflating the two is what made the host's round setting unreachable.
     pub max_trace_depth: u8,
     pub working_state: WorkingStateConfig,
+    pub task_budget: TaskBudget,
+}
+
+/// How much work one task may do before it has to settle.
+///
+/// A task is one trace: the event that started it and everything derived from
+/// it, including every tool result and every follow-up round. Two bounds, in two
+/// units a person can reason about — how many rounds it may take, and how many
+/// tools it may call. Neither is expressed in event depth, because depth is an
+/// artifact of how results are fed back rather than a property of the task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TaskBudget {
+    /// Most planning rounds one task may run, including the first.
+    pub max_rounds: u8,
+    /// Most tool actions one task may dispatch.
+    pub max_tool_actions: usize,
+}
+
+impl Default for TaskBudget {
+    fn default() -> Self {
+        Self {
+            // What the depth bound effectively allowed before this existed, so
+            // an unconfigured runtime behaves as it always has.
+            max_rounds: 8,
+            max_tool_actions: MAX_TOOL_ACTIONS_PER_TRACE,
+        }
+    }
+}
+
+impl TaskBudget {
+    pub fn validate(&self) -> Result<(), RuntimeConfigError> {
+        if self.max_rounds == 0 {
+            return Err(RuntimeConfigError::ZeroTaskRounds);
+        }
+        if self.max_tool_actions == 0 {
+            return Err(RuntimeConfigError::ZeroTaskToolActions);
+        }
+        if self.max_tool_actions > MAX_TASK_TOOL_ACTIONS {
+            return Err(RuntimeConfigError::TaskToolActionsAboveMaximum {
+                value: self.max_tool_actions,
+                maximum: MAX_TASK_TOOL_ACTIONS,
+            });
+        }
+        if self.max_rounds > MAX_TASK_ROUNDS {
+            return Err(RuntimeConfigError::TaskRoundsAboveMaximum {
+                value: self.max_rounds,
+                maximum: MAX_TASK_ROUNDS,
+            });
+        }
+        Ok(())
+    }
 }
 
 impl Default for RuntimeConfig {
@@ -97,6 +158,7 @@ impl Default for RuntimeConfig {
             event_queue_capacity: 256,
             max_trace_depth: 8,
             working_state: WorkingStateConfig::default(),
+            task_budget: TaskBudget::default(),
         }
     }
 }
@@ -105,6 +167,17 @@ impl Default for RuntimeConfig {
 pub enum RuntimeConfigError {
     #[error("event queue capacity must be greater than zero")]
     ZeroQueueCapacity,
+    #[error("a task must be allowed at least one planning round")]
+    ZeroTaskRounds,
+    #[error("a task must be allowed at least one tool action")]
+    ZeroTaskToolActions,
+    #[error(
+        "task tool action budget {value} is above maximum {maximum}",
+        maximum = MAX_TASK_TOOL_ACTIONS
+    )]
+    TaskToolActionsAboveMaximum { value: usize, maximum: usize },
+    #[error("task round budget {value} is above maximum {maximum}")]
+    TaskRoundsAboveMaximum { value: u8, maximum: u8 },
     #[error(
         "event queue capacity {value} is above maximum {maximum}",
         maximum = MAX_EVENT_QUEUE_CAPACITY
@@ -423,6 +496,10 @@ pub struct CognitiveRuntime {
     /// tool never allocates a budget entry, so "no entry" cannot stand in for
     /// "finished".
     lifecycle: TraceLifecycle,
+    /// How much work one task may do, as configured.
+    task_budget: TaskBudget,
+    /// Rounds each in-flight task has already run, keyed by trace root.
+    rounds_by_trace: HashMap<EventId, u8>,
     /// Tasks that have taken in a tool result which may contain text written
     /// by someone else, keyed by trace root.
     ///
@@ -601,6 +678,7 @@ impl CognitiveRuntime {
                 value: config.event_queue_capacity,
             });
         }
+        config.task_budget.validate()?;
         let state = WorkingState::new(config.working_state)?;
         let (sender, receiver) = mpsc::channel(config.event_queue_capacity);
         Ok((
@@ -613,6 +691,8 @@ impl CognitiveRuntime {
                 probed_commands: VecDeque::new(),
                 pending_tool_follow_ups: VecDeque::new(),
                 lifecycle: TraceLifecycle::default(),
+                task_budget: config.task_budget,
+                rounds_by_trace: HashMap::new(),
                 foreign_text_roots: HashSet::new(),
                 working_memory: HashMap::new(),
                 tool_action_budget_by_trace: HashMap::new(),
@@ -905,13 +985,35 @@ impl CognitiveRuntime {
         self.effective_tool_actions_used(event)
     }
 
+    /// Most tool actions one task may dispatch, as configured.
+    const fn tool_action_budget(&self) -> usize {
+        self.task_budget.max_tool_actions
+    }
+
+    /// Claims one planning round for the task this event belongs to.
+    ///
+    /// Returns `false` when the task has already used its rounds, in which case
+    /// the caller must let it settle instead of planning again. Rounds are
+    /// counted here, not inferred from event depth: depth counts derived events,
+    /// which is an implementation detail of how results are fed back, while a
+    /// round is a step the task actually took.
+    fn claim_task_round(&mut self, event: &WorldEvent) -> bool {
+        let root = event.trace().root_event_id();
+        let rounds = self.rounds_by_trace.entry(root).or_insert(0);
+        if *rounds >= self.task_budget.max_rounds {
+            return false;
+        }
+        *rounds = rounds.saturating_add(1);
+        true
+    }
+
     fn effective_tool_actions_used(&self, event: &WorldEvent) -> usize {
         let root = event.trace().root_event_id();
         if let Some(used) = self.tool_action_budget_by_trace.get(&root).copied() {
             return used;
         }
         if self.closed_tool_budget_roots.contains(&root) {
-            return MAX_TOOL_ACTIONS_PER_TRACE;
+            return self.tool_action_budget();
         }
         // A derived event with no ledger entry may be a delayed child of a
         // completed trace. Treating it as a fresh budget would reset the
@@ -919,14 +1021,15 @@ impl CognitiveRuntime {
         if event.trace().depth() > 0
             || self.tool_action_budget_by_trace.len() >= MAX_TOOL_TRACE_BUDGET_ENTRIES
         {
-            MAX_TOOL_ACTIONS_PER_TRACE
+            self.tool_action_budget()
         } else {
             0
         }
     }
 
     fn tool_actions_remaining(&self, event: &WorldEvent) -> usize {
-        MAX_TOOL_ACTIONS_PER_TRACE.saturating_sub(self.effective_tool_actions_used(event))
+        self.tool_action_budget()
+            .saturating_sub(self.effective_tool_actions_used(event))
     }
 
     fn root_has_pending_tool_follow_up(&self, root: EventId) -> bool {
@@ -987,6 +1090,7 @@ impl CognitiveRuntime {
         // A terminal task can no longer produce a round that would read this.
         self.working_memory.remove(&root);
         self.foreign_text_roots.remove(&root);
+        self.rounds_by_trace.remove(&root);
         if self.tool_action_budget_by_trace.remove(&root).is_some() {
             self.tool_action_budget_order
                 .retain(|candidate| *candidate != root);
@@ -1035,12 +1139,12 @@ impl CognitiveRuntime {
     ) -> Result<(), PlannerError> {
         let requested = tool_intent_count(plan);
         let used = self.effective_tool_actions_used(event);
-        if requested > MAX_TOOL_ACTIONS_PER_TRACE.saturating_sub(used) {
+        if requested > self.tool_action_budget().saturating_sub(used) {
             return Err(PlannerError::InvalidOutput(
                 PlannerOutputValidationError::ToolActionBudgetExceeded {
                     used,
                     requested,
-                    maximum: MAX_TOOL_ACTIONS_PER_TRACE,
+                    maximum: self.tool_action_budget(),
                 },
             ));
         }
@@ -1280,6 +1384,9 @@ impl CognitiveRuntime {
         if !observation.attention.should_invoke_planner() {
             return Ok(observed_without_planning(observation));
         }
+        if !self.claim_task_round(&planner_event) {
+            return Ok(observed_without_planning(observation));
+        }
         let planner = self
             .planner
             .as_ref()
@@ -1382,6 +1489,12 @@ impl CognitiveRuntime {
             });
         }
         if !observation.attention.should_invoke_planner() {
+            return Ok(observed_without_planning(observation));
+        }
+        if !self.claim_task_round(&planner_event) {
+            // The task has taken all the steps it is allowed. Let it settle
+            // rather than planning another one; budget is a safety valve, not
+            // something the model is asked to work around.
             return Ok(observed_without_planning(observation));
         }
         let planner = self
@@ -3749,6 +3862,123 @@ mod tests {
             !runtime.has_pending_event(),
             "bookkeeping alone must not be reported as work"
         );
+    }
+
+    /// A task stops taking steps once it has used its rounds.
+    ///
+    /// Before this, the only bound on the reply path was the trace depth Core
+    /// happened to default to, and the operator's `tools.max_rounds` reached
+    /// only the legacy host loop — so the configured number and the effective
+    /// one were different values in different units.
+    #[tokio::test]
+    async fn a_task_stops_at_its_round_budget() {
+        let conversation_id = ConversationId::new();
+        let rounds = 3;
+        let (handle, mut runtime) = CognitiveRuntime::new_with_services(
+            RuntimeConfig {
+                task_budget: crate::TaskBudget {
+                    max_rounds: rounds,
+                    ..crate::TaskBudget::default()
+                },
+                ..RuntimeConfig::default()
+            },
+            CoreServices::with_model(AlwaysAnotherToolModel { conversation_id }),
+        )
+        .expect("valid runtime");
+        assert_eq!(
+            handle
+                .submit(direct_message(conversation_id, PersonId::new()))
+                .await,
+            Ok(Admission::Accepted)
+        );
+        let mut capabilities = EnvironmentCapabilities::all();
+        capabilities.actions.push(crate::ActionDescriptor::tool(
+            "web.search",
+            crate::EffectScope::ReadOnly,
+            false,
+        ));
+        let arbiter =
+            ActionArbiter::new(ActionArbiterConfig::default().with_capabilities(capabilities));
+
+        // Every round asks for another tool, so only the budget can stop it.
+        for round in 1..=rounds {
+            let outcome = runtime
+                .process_next_with_planner_and_actions(&arbiter, &AlwaysCompletingPort)
+                .await
+                .expect("a round is due")
+                .expect("the round plans");
+            assert!(
+                matches!(
+                    &outcome,
+                    PlannedProcessingOutcome::Planned { actions, .. }
+                        if matches!(
+                            actions.as_slice(),
+                            [ActionResult::Executed {
+                                outcome: ActionPortOutcome::ToolCompleted { .. },
+                                ..
+                            }]
+                        )
+                ),
+                "round {round} should still run and call its tool: {outcome:?}"
+            );
+        }
+
+        // The next turn is observed into state instead of planned.
+        let exhausted = runtime
+            .process_next_with_planner_and_actions(&arbiter, &AlwaysCompletingPort)
+            .await
+            .expect("the follow-up event still arrives")
+            .expect("an exhausted task settles instead of failing");
+        assert!(
+            matches!(
+                &exhausted,
+                PlannedProcessingOutcome::Planned { plan, actions, .. }
+                    if actions.is_empty() && plan.intents.is_empty()
+            ),
+            "a task past its budget must settle silently, not plan again: {exhausted:?}"
+        );
+    }
+
+    /// Asks for one more tool every single round.
+    struct AlwaysAnotherToolModel {
+        conversation_id: ConversationId,
+    }
+
+    impl ModelBackend for AlwaysAnotherToolModel {
+        fn plan<'a>(&'a self, _input: &'a PlannerInput) -> ModelBackendFuture<'a> {
+            Box::pin(async move {
+                Ok(DecisionPlan {
+                    disposition: DecisionDisposition::Reply,
+                    intents: vec![crate::CognitiveIntent::UseTool {
+                        tool_name: "web.search".to_owned(),
+                        input: "{}".to_owned(),
+                        scope: crate::ActionScope::Conversation(self.conversation_id),
+                        notification_policy: crate::ToolNotificationPolicy::Final,
+                    }],
+                    state_updates: Vec::new(),
+                    expectations: Vec::new(),
+                })
+            })
+        }
+    }
+
+    /// Completes every tool, so each round produces a follow-up.
+    struct AlwaysCompletingPort;
+
+    impl ActionPort for AlwaysCompletingPort {
+        fn execute<'a>(&'a self, action: &'a crate::ProposedAction) -> crate::ActionPortFuture<'a> {
+            Box::pin(async move {
+                match action {
+                    crate::ProposedAction::UseTool(tool) => {
+                        Ok(crate::ActionPortOutcome::ToolCompleted {
+                            operation: tool.tool_name.clone(),
+                            output: "ok".to_owned(),
+                        })
+                    }
+                    _ => Err(crate::ActionPortError::new("unsupported", false)),
+                }
+            })
+        }
     }
 
     /// Reading material from outside this conversation narrows what a task may

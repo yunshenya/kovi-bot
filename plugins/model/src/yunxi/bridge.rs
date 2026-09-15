@@ -1081,13 +1081,28 @@ impl CoreBridge {
             cache: Arc::clone(&familiarity),
             relations,
         });
+        // Core owns how much work one task may do. The operator's configured
+        // tool rounds are the same number in a different unit, so they are
+        // handed over here rather than re-implemented by a host loop.
+        // Core owns how much work one task may do. `tools.max_rounds` is the
+        // same number in a different unit — until now it only reached the
+        // legacy host loop, so setting it changed nothing on the reply path,
+        // which silently used Core's hard-coded default instead. The tool-action
+        // budget has no operator knob and keeps Core's default.
+        let runtime_config = RuntimeConfig {
+            task_budget: yunxi_core::TaskBudget {
+                max_rounds: crate::config::get().tools().max_rounds(),
+                ..yunxi_core::TaskBudget::default()
+            },
+            ..RuntimeConfig::default()
+        };
         let (runtime_handle, mut runtime) = services.map_or_else(
             || {
-                CognitiveRuntime::new(RuntimeConfig::default())
+                CognitiveRuntime::new(runtime_config)
                     .expect("default Yunxi runtime configuration must be valid")
             },
             |services| {
-                CognitiveRuntime::new_with_services(RuntimeConfig::default(), services)
+                CognitiveRuntime::new_with_services(runtime_config, services)
                     .expect("default Yunxi runtime configuration must be valid")
             },
         );

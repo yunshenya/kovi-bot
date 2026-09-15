@@ -136,9 +136,10 @@ pub use proactive::{
 };
 pub use runtime::{
     Admission, CognitiveRuntime, DataErasureError, MAX_BLOCKED_DATA_ERASURE_CONVERSATIONS,
-    MAX_BLOCKED_DATA_ERASURE_PEOPLE, MAX_DATA_ERASURE_CONVERSATIONS, MAX_TOOL_ACTIONS_PER_TRACE,
-    PlannedProcessingOutcome, ProcessingOutcome, RuntimeConfig, RuntimeConfigError, RuntimeHandle,
-    RuntimeObservation, SubmitError, planned_action_idempotency_key,
+    MAX_BLOCKED_DATA_ERASURE_PEOPLE, MAX_DATA_ERASURE_CONVERSATIONS, MAX_TASK_ROUNDS,
+    MAX_TASK_TOOL_ACTIONS, MAX_TOOL_ACTIONS_PER_TRACE, PlannedProcessingOutcome, ProcessingOutcome,
+    RuntimeConfig, RuntimeConfigError, RuntimeHandle, RuntimeObservation, SubmitError, TaskBudget,
+    planned_action_idempotency_key,
 };
 pub use working_memory::{
     MAX_WORKING_ARGUMENT_CHARS, MAX_WORKING_ENTRIES, MAX_WORKING_EXPECTATION_CHARS,
