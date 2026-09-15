@@ -224,7 +224,18 @@ system 注入；自我认知只剩名字与"我是芸汐。"，三个标记与�
 
 ## 六、发布后怎么验
 
-两条命令，各自给 PASS/FAIL，不用靠肉眼看日志：
+**第一步（发布后立刻做一次）：把 `[prompt]` 推到线上**
+
+```bash
+scripts/apply-persona-config.sh            # 演练：只打印将要写入的 [prompt] 段
+scripts/apply-persona-config.sh --apply    # 真写（走管理后台，热加载、自动留备份）
+```
+
+为什么必须做：线上那份配置还是旧的两段全文，而新代码会把 `persona` 拼在它们前面——
+不换的话人格在一轮里出现两遍。写完新进程启动时会顺带把 `yunxi_self_model` 那行旧身份
+迁移掉，日志里会出现 `自我认知已迁移：去掉「AI 驱动 / 虚拟角色」这类技术身份声明`。
+
+**第二步：两条验收命令，各自给 PASS/FAIL，不用靠肉眼看日志**
 
 ```bash
 scripts/verify-mind-observation.sh "1 hour ago"   # Mind 观测丢失率（改动前基线 46%，阈值 10%）
