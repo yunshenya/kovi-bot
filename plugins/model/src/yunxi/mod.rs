@@ -1870,6 +1870,72 @@ mod erasure_tests {
             });
     }
 
+    /// 短 id 前缀查找走的是 UUID 范围比较（`id >= lower AND id < upper`），不是
+    /// `CAST(id AS TEXT) LIKE`：后者既用不上主键索引，又会让输入里的 `_`/`%` 变成
+    /// 通配符——一次"前缀歧义"会被报成"没找到这条账"。
+    #[test]
+    #[ignore = "requires PostgreSQL via DATABASE_URL"]
+    fn gag_prefix_lookup_uses_a_uuid_range_and_rejects_wildcards() {
+        use crate::yunxi::gag_store::{GagKind, GagScope, PostgresGagStore};
+        use sqlx_postgres::PgPoolOptions;
+
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let database_url = std::env::var("DATABASE_URL").expect("需要 DATABASE_URL");
+                let pool = PgPoolOptions::new()
+                    .max_connections(4)
+                    .connect(&database_url)
+                    .await
+                    .expect("应连接 PostgreSQL");
+                let store =
+                    PostgresGagStore::new(pool.clone(), crate::config::get().gag_ledger().clone());
+                store
+                    .initialize_schema()
+                    .await
+                    .expect("应初始化账本 schema");
+
+                let suffix = (uuid::Uuid::new_v4().as_u128() % 1_000_000_000) as i64;
+                let scope = GagScope::Person(format!("{}", 3_000_000_000_000_i64 + suffix));
+                let first = store
+                    .add(scope.clone(), GagKind::Promise, "答应过要早睡", 60)
+                    .await
+                    .expect("应写入第一条");
+                store
+                    .add(scope.clone(), GagKind::Promise, "答应过要带伞", 60)
+                    .await
+                    .expect("应写入第二条");
+
+                let prefix = &first.to_string()[..8];
+                assert_eq!(
+                    store
+                        .fulfill_by_prefix(prefix)
+                        .await
+                        .expect("前缀查找应成功"),
+                    Some(first),
+                    "八位前缀应当唯一命中，并且真的把它标成已了结"
+                );
+                // 已经了结的条目不再被前缀命中。
+                assert_eq!(
+                    store
+                        .fulfill_by_prefix(prefix)
+                        .await
+                        .expect("前缀查找应成功"),
+                    None,
+                    "已了结的条目不参与前缀匹配"
+                );
+                // 通配符不是十六进制，按"没找到"处理，而不是匹配到一堆行。
+                assert_eq!(
+                    store.fulfill_by_prefix("_").await.expect("前缀查找应成功"),
+                    None
+                );
+                assert_eq!(
+                    store.fulfill_by_prefix("%").await.expect("前缀查找应成功"),
+                    None
+                );
+            });
+    }
+
     async fn person_memory_rows(pool: &PgPool, person: uuid::Uuid) -> i64 {
         sqlx_core::query_scalar::query_scalar(
             "SELECT COUNT(*) FROM yunxi_memories \

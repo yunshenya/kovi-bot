@@ -72,6 +72,12 @@ impl PostgresGagStore {
     }
 
     pub(crate) async fn initialize_schema(&self) -> anyhow::Result<()> {
+        // 与另外十几个 store 一样先取建表锁：`CREATE TABLE IF NOT EXISTS` 在
+        // PostgreSQL 里并非无竞态，两个进程/两个测试线程同时首次初始化会撞
+        // `pg_type_typname_nsp_index` 唯一冲突，而这是启动路径——失败会让整个
+        // 插件初始化返回 Err。
+        let mut transaction = self.pool.begin().await?;
+        super::schema::lock(&mut transaction).await?;
         query(
             "CREATE TABLE IF NOT EXISTS yunxi_gag_entries (
                 id UUID PRIMARY KEY,
@@ -87,14 +93,15 @@ impl PostgresGagStore {
                 last_mentioned_at TIMESTAMPTZ
             )",
         )
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await?;
         query(
             "CREATE INDEX IF NOT EXISTS yunxi_gag_entries_scope_idx
              ON yunxi_gag_entries (scope_kind, scope_id, state)",
         )
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await?;
+        transaction.commit().await?;
         Ok(())
     }
 
@@ -231,11 +238,18 @@ impl PostgresGagStore {
         if prefix.is_empty() {
             return Ok(None);
         }
+        // 用 UUID 前缀的范围比较而不是 `CAST(id AS TEXT) LIKE`：后者既走不了主键
+        // 索引，又会让 `#还账 _` 里的 `_` 变成通配符——一次"前缀歧义"被报成
+        // "没找到这条账"，而且每次调用都要对全表做 CAST。
+        let Some((lower, upper)) = uuid_prefix_range(&prefix) else {
+            return Ok(None);
+        };
         let ids: Vec<Uuid> = query_scalar(
             "SELECT id FROM yunxi_gag_entries
-             WHERE CAST(id AS TEXT) LIKE $1 AND state = 'open' LIMIT 2",
+             WHERE id >= $1 AND ($2::UUID IS NULL OR id < $2) AND state = 'open' LIMIT 2",
         )
-        .bind(format!("{prefix}%"))
+        .bind(lower)
+        .bind(upper)
         .fetch_all(&self.pool)
         .await?;
         if ids.len() != 1 {
@@ -288,6 +302,80 @@ impl PostgresGagStore {
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected())
+    }
+}
+
+/// 把 1..=32 位十六进制前缀翻译成 UUID 的半开区间 `[lower, upper)`。
+///
+/// 比较的是 `uuid` 类型本身而不是它的文本形式：`id >= lower AND id < upper` 能走
+/// 主键索引，也不会像 `LIKE` 那样把用户输入里的 `_`/`%` 当成通配符。前缀全是 `f`
+/// 时上界溢出（区间一直延伸到类型最大值），这时返回 `None` 作上界，SQL 用
+/// `$2 IS NULL` 表达"没有上界"。
+///
+/// 非法输入（空、超过 32 位、含非十六进制字符）返回 `None`，调用方按"没找到"处理。
+fn uuid_prefix_range(prefix: &str) -> Option<(Uuid, Option<Uuid>)> {
+    const HEX_DIGITS: usize = 32;
+    let normalized = prefix
+        .chars()
+        .filter(|character| *character != '-')
+        .collect::<String>()
+        .to_lowercase();
+    if normalized.is_empty()
+        || normalized.len() > HEX_DIGITS
+        || !normalized
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    let value = u128::from_str_radix(&normalized, 16).ok()?;
+    let shift = 4 * (HEX_DIGITS - normalized.len()) as u32;
+    let lower = Uuid::from_u128(value.checked_shl(shift).unwrap_or(u128::MAX));
+    let upper = value
+        .checked_add(1)
+        .and_then(|next| next.checked_shl(shift))
+        .map(Uuid::from_u128);
+    Some((lower, upper))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::uuid_prefix_range;
+    use uuid::Uuid;
+
+    #[test]
+    fn uuid_prefix_range_brackets_exactly_the_matching_ids() {
+        let id = Uuid::parse_str("01234567-89ab-cdef-0123-456789abcdef").expect("uuid");
+        let (lower, upper) = uuid_prefix_range("0123").expect("合法前缀");
+        let upper = upper.expect("前缀不全为 f 时应有上界");
+        assert!(id >= lower && id < upper, "命中前缀的 id 应落在区间内");
+
+        // 换个前缀就不该命中。
+        let other = Uuid::parse_str("11234567-89ab-cdef-0123-456789abcdef").expect("uuid");
+        assert!(
+            !(other >= lower && other < upper),
+            "不同前缀不该落在同一区间"
+        );
+
+        // 前缀越长区间越窄，但始终包含目标。
+        let (lower, upper) = uuid_prefix_range("0123456789ab").expect("合法前缀");
+        let upper = upper.expect("应有上界");
+        assert!(id >= lower && id < upper);
+    }
+
+    #[test]
+    fn uuid_prefix_range_rejects_wildcards_and_junk() {
+        // `_`/`%` 是老实现里最危险的两个字符（LIKE 通配符），现在直接判非法。
+        assert!(uuid_prefix_range("_").is_none());
+        assert!(uuid_prefix_range("%").is_none());
+        assert!(uuid_prefix_range("").is_none());
+        assert!(uuid_prefix_range("zz").is_none());
+        assert!(uuid_prefix_range(&"a".repeat(33)).is_none());
+        // 带连字符的完整 id 也认。
+        assert!(uuid_prefix_range("01234567-89ab-cdef-0123-456789abcdef").is_some());
+        // 全 f 的前缀没有上界，但仍然是一个合法区间。
+        let (_, upper) = uuid_prefix_range(&"f".repeat(32)).expect("合法前缀");
+        assert!(upper.is_none(), "全 f 前缀应返回无上界");
     }
 }
 
