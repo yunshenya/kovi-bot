@@ -10,7 +10,8 @@ use super::interrupt::{
 use super::message_transport::MessageTransport;
 use super::recall::{RecentBotMessage, recall_bot_messages, record_committed_bot_message};
 use super::reply::{
-    ReplyAction, build_outbound_message, parse_reply_output, sanitize_reply_action_for_sender,
+    ReplyAction, ReplyTurn, build_outbound_message, parse_reply_output,
+    sanitize_reply_action_for_sender,
 };
 use super::reply_disposition::ReplyDisposition;
 use crate::group_access;
@@ -221,15 +222,19 @@ impl ReplyPlan {
     }
 
     pub(crate) async fn from_model_output(scope: ReplyScope, content: &str) -> Self {
-        Self::from_model_output_for_sender(scope, content, None).await
+        Self::from_reply_turn(scope, &ReplyTurn::plain(content), None).await
     }
 
-    pub(crate) async fn from_model_output_for_sender(
+    /// 把"模型这一轮的正文 + 它通过 `reply_action` 提交的动作"落成可执行计划。
+    ///
+    /// 结构化决策只来自 `turn.action`（provider 已按 schema 约束过的工具参数），正文
+    /// 只当正文用；这里不再从正文里解析任何动作标记。
+    pub(crate) async fn from_reply_turn(
         scope: ReplyScope,
-        content: &str,
+        turn: &ReplyTurn,
         current_sender_user_id: Option<i64>,
     ) -> Self {
-        let parsed = parse_reply_output(content);
+        let parsed = parse_reply_output(&turn.content, turn.action.as_ref());
         let mut action =
             sanitize_reply_action_for_sender(scope, parsed.action, current_sender_user_id).await;
         let has_structured_messages = parsed.messages.is_some();
@@ -287,7 +292,7 @@ impl ReplyPlan {
     /// explicit structured message bubbles intact so requests such as "send
     /// two messages" are delivered as separate QQ messages.
     pub(crate) async fn from_intrinsic_output(scope: ReplyScope, content: &str) -> Self {
-        let has_structured_messages = parse_reply_output(content).messages.is_some();
+        let has_structured_messages = parse_reply_output(content, None).messages.is_some();
         let mut plan = Self::from_model_output(scope, content).await;
         if plan.is_silent() || plan.bubbles.is_empty() {
             return plan;
@@ -706,7 +711,21 @@ mod tests {
     };
     use crate::memory::BotPersonality;
     use crate::model::interrupt::ReplyScope;
+    use crate::model::reply::{ReplyActionCall, ReplyTurn};
     use crate::model::reply_disposition::ReplyDisposition;
+    use serde_json::{Value, json};
+
+    /// 造一轮"正文 + `reply_action` 工具参数"的模型产物。
+    fn reply_turn(content: &str, arguments: Value) -> ReplyTurn {
+        let call = ReplyActionCall::from_tool_arguments(
+            arguments.as_object().expect("测试参数必须是对象"),
+        )
+        .expect("测试参数应当通过校验");
+        ReplyTurn {
+            content: content.to_string(),
+            action: Some(call),
+        }
+    }
 
     #[test]
     fn bubble_duplicate_guard_keeps_distinct_and_rejects_restatements() {
@@ -756,17 +775,25 @@ mod tests {
             .expect("应创建测试运行时")
             .block_on(async {
                 // Distinct notes remain two separate bubbles.
-                let distinct = ReplyPlan::from_model_output(
+                let distinct = ReplyPlan::from_reply_turn(
                     ReplyScope::Private(9_100_020),
-                    "[[REPLY_ACTION]]{\"messages\":[\"第一条\",\"第二条\"]}[[/REPLY_ACTION]]",
+                    &reply_turn("", json!({"messages": ["第一条", "第二条"]})),
+                    None,
                 )
                 .await;
                 assert_eq!(distinct.bubbles, vec!["第一条", "第二条"]);
 
                 // Near-identical re-statements collapse into one bubble (复读 guard).
-                let repeated = ReplyPlan::from_model_output(
+                let repeated = ReplyPlan::from_reply_turn(
                     ReplyScope::Private(9_100_021),
-                    "[[REPLY_ACTION]]{\"messages\":[\"哈哈，姜冷笑话管够，素材库都快告急了。\",\"哈哈，姜冷笑话管够，素材库快告急啦～\"]}[[/REPLY_ACTION]]",
+                    &reply_turn(
+                        "",
+                        json!({"messages": [
+                            "哈哈，姜冷笑话管够，素材库都快告急了。",
+                            "哈哈，姜冷笑话管够，素材库快告急啦～"
+                        ]}),
+                    ),
+                    None,
                 )
                 .await;
                 assert_eq!(repeated.bubbles.len(), 1);
@@ -800,9 +827,10 @@ mod tests {
         kovi::tokio::runtime::Runtime::new()
             .expect("应创建测试运行时")
             .block_on(async {
-                let plan = ReplyPlan::from_model_output(
+                let plan = ReplyPlan::from_reply_turn(
                     ReplyScope::Private(9_100_003),
-                    "[[REPLY_ACTION]]{\"messages\":[\"第一条\",\"第二条\"]}[[/REPLY_ACTION]]",
+                    &reply_turn("", json!({"messages": ["第一条", "第二条"]})),
+                    None,
                 )
                 .await;
                 assert_eq!(plan.bubbles, vec!["第一条", "第二条"]);
@@ -826,8 +854,11 @@ mod tests {
             });
     }
 
+    /// intrinsic 那条路只吃自然语言正文：旧的动作标记被剥掉，也不再能撑出多气泡。
+    ///
+    /// 多气泡现在只有一条来源——模型通过 `reply_action` 工具提交的 `messages`。
     #[test]
-    fn intrinsic_output_preserves_explicit_structured_message_bubbles() {
+    fn intrinsic_output_no_longer_reads_a_structured_message_batch() {
         kovi::tokio::runtime::Runtime::new()
             .expect("应创建测试运行时")
             .block_on(async {
@@ -836,8 +867,14 @@ mod tests {
                     "[[REPLY_ACTION]]{\"messages\":[\"第一条\",\"第二条\"]}[[/REPLY_ACTION]]",
                 )
                 .await;
-                assert_eq!(plan.bubbles, vec!["第一条", "第二条"]);
-                assert_eq!(plan.content, "第一条\n第二条");
+                assert!(!plan.has_visible_reply(), "标记之后的动作文本不算可见正文");
+
+                let with_body = ReplyPlan::from_intrinsic_output(
+                    ReplyScope::Private(9_100_011),
+                    "先说一句[[REPLY_ACTION]]{\"messages\":[\"第一条\"]}[[/REPLY_ACTION]]",
+                )
+                .await;
+                assert_eq!(with_body.bubbles, vec!["先说一句"]);
             });
     }
 
@@ -852,9 +889,10 @@ mod tests {
         kovi::tokio::runtime::Runtime::new()
             .expect("应创建测试运行时")
             .block_on(async {
-                let plan = ReplyPlan::from_model_output(
+                let plan = ReplyPlan::from_reply_turn(
                     ReplyScope::Private(9_100_004),
-                    "[[REPLY_ACTION]]{\"messages\":[\"结果是 **192**。\",\"已处理\"]}[[/REPLY_ACTION]]",
+                    &reply_turn("", json!({"messages": ["结果是 **192**。", "已处理"]})),
+                    None,
                 )
                 .await;
                 assert_eq!(plan.bubbles, vec!["结果是 192。", "已处理"]);
@@ -875,9 +913,18 @@ mod tests {
                     "测试消息",
                 )
                 .await;
-                let plan = ReplyPlan::from_model_output(
+                let plan = ReplyPlan::from_reply_turn(
                     scope,
-                    "[[REPLY_ACTION]]{\"disposition\":\"silent\",\"quote_message_id\":77,\"at_user_ids\":[88],\"recall_message_ids\":[99]}[[/REPLY_ACTION]]",
+                    &reply_turn(
+                        "",
+                        json!({
+                            "disposition": "silent",
+                            "quote_message_id": 77,
+                            "at_user_ids": [88],
+                            "recall_message_ids": [99],
+                        }),
+                    ),
+                    None,
                 )
                 .await;
                 assert!(plan.is_silent());
@@ -899,11 +946,10 @@ mod tests {
                 let at_user_ref =
                     crate::model::reply::register_mention_target(scope, 8_765_432_113, "当前成员")
                         .await;
-                let plan = ReplyPlan::from_model_output(
+                let plan = ReplyPlan::from_reply_turn(
                     scope,
-                    &format!(
-                        "[[REPLY_ACTION]]{{\"at_user_ids\":[{at_user_ref}]}}[[/REPLY_ACTION]]"
-                    ),
+                    &reply_turn("", json!({"at_user_ids": [at_user_ref]})),
+                    None,
                 )
                 .await;
 
@@ -921,9 +967,9 @@ mod tests {
             .expect("应创建测试运行时")
             .block_on(async {
                 let scope = ReplyScope::Group(9_100_009);
-                let plan = ReplyPlan::from_model_output_for_sender(
+                let plan = ReplyPlan::from_reply_turn(
                     scope,
-                    "{\"at_current_sender\":true}",
+                    &reply_turn("", json!({"at_current_sender": true})),
                     Some(8_765_432_114),
                 )
                 .await;

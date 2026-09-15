@@ -2,9 +2,10 @@
 //!
 //! 这里仅描述本轮是否发送可见正文；引用、@、撤回和分段由各自的消息动作处理。
 
-pub(crate) const SILENT_REPLY_OUTPUT: &str =
-    r#"[[REPLY_ACTION]]{"disposition":"silent"}[[/REPLY_ACTION]]"#;
-
+/// 旧版静默标记：模型历史上用 `[sp]` 表示"本轮不说话"。
+///
+/// 静默现在走结构化通道（`reply_action` 的 disposition，宿主侧是 `ReplyTurn::silent()`），
+/// 这个常量只留给读取侧：模型复述旧输出时仍按静默处理，不要让它变成可见正文。
 const LEGACY_SILENCE_MARKER: &str = "[sp]";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

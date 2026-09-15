@@ -8,6 +8,7 @@ use super::memory_query::{
     interruptible_model_call_with_plain_style_context_allow_empty,
     interruptible_model_call_without_reply_guidance, params_model_with_tool_access,
 };
+use super::reply::ReplyTurn;
 use super::thinking::ThinkingReporter;
 use super::tool_access::ToolExecutionContext;
 use super::utils::{BotMemory, ModelPayload};
@@ -99,6 +100,10 @@ impl ModelGateway {
         .await
     }
 
+    /// 主回复：正文 + 模型通过 `reply_action` 工具提交的结构化动作。
+    ///
+    /// 返回 [`ReplyTurn`] 而不是裸文本，是因为结构化动作只能在工具参数里，不能再从
+    /// 正文里解析（AGENTS.md 第 7 条）。调用方拿到的正文语义与以前一致。
     pub(crate) async fn complete(
         messages: &mut [BotMemory],
         tool_context: ToolExecutionContext,
@@ -106,7 +111,7 @@ impl ModelGateway {
         max_output_tokens: Option<u32>,
         vision_images: &[VisionImage],
         progress: Option<Arc<ThinkingReporter>>,
-    ) -> BotMemory {
+    ) -> ReplyTurn {
         params_model_with_tool_access(
             messages,
             tool_context,

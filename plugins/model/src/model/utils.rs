@@ -9,7 +9,7 @@
 //! - 系统状态监控
 
 use super::interrupt::{ReplyTicket, is_current};
-use super::memory_query::interruptible_model_call;
+use super::memory_query::{interruptible_model_call, interruptible_reply_action_turn};
 use super::memory_repository::MEMORY_REPOSITORY;
 use super::message_actions::{
     MessageDestination, ReplyPlan, execute_reply_plan, normalize_legacy_message_text,
@@ -20,7 +20,9 @@ use super::recall::{
     RecentBotMessage, begin_reply, finish_reply, send_tracked_group_message,
     send_tracked_private_message,
 };
-use super::reply::{attach_reply_protocol_context, clear_mention_context};
+use super::reply::{
+    ReplyTurn, attach_reply_action_candidates, clear_mention_context, reply_action_tool_spec,
+};
 use super::thinking::{ThinkingDestination, ThinkingReporter, strip_thinking_notices};
 use super::tool_access::{StickerTeachingContext, ToolExecutionContext};
 use crate::config;
@@ -88,7 +90,12 @@ const EMPTY_REPLY_ALERT_WINDOW: Duration = Duration::from_secs(10 * 60);
 const VISION_FAILURE_RESPONSE_PREFIX: &str = "[[VISION_FAILURE]]";
 const MODEL_FAILURE_RESPONSE_PREFIX: &str = "[[MODEL_FAILURE]]";
 const DEFAULT_RESPONSES_INSTRUCTIONS: &str = "请根据输入消息完成当前请求。";
-const EMPTY_REPLY_REPAIR_PROMPT: &str = "上一轮没有形成可发送的回复。现在只做一次回复协议修复：重新结合当前用户消息判断本轮意图，需要文字回应时输出自然聊天正文；如果用户只要求发送结构化 @，可以只输出完整动作，不要为了凑正文添加无关套话。自然语言中的“@我”“艾特我”“提及我”必须输出 [[REPLY_ACTION]]{\"disposition\":\"reply\",\"at_current_sender\":true}[[/REPLY_ACTION]]，程序会绑定本轮真实发送者，不要调用成员搜索，也不要填写真实 QQ 号。@其他人时才使用动作候选中的 at_user_ref 并放入 at_user_ids。如果需要引用或撤回消息，也必须使用动作候选中的临时引用，不要只把动作写成正文里的普通文字。不要输出工具调用、解释、分析、代码块或协议之外的 JSON；若确实不应回应，只输出完整的 [[REPLY_ACTION]]{\"disposition\":\"silent\"}[[/REPLY_ACTION]]。不要编造工具结果，也不要把本次修复当成新的用户消息。";
+/// 空回复修复提示词（带 `reply_action` 工具的那条路）。
+///
+/// 结构化动作一律走工具：这里只交代"该说什么"与"什么时候该调工具"，字段级契约在
+/// 工具 schema 里（AGENTS.md 第 6 条）。修复调用必须真的把 `reply_action` 挂上，
+/// 否则就是"提示词点名了工具、她手里却没有"——见 `repair_empty_reply`。
+const EMPTY_REPLY_REPAIR_PROMPT: &str = "上一轮没有形成可发送的回复。现在只做一次回复修复：重新结合当前用户消息判断本轮意图，需要文字回应时直接写自然聊天正文；如果用户只要求结构化 @，可以只调用 reply_action、不写正文，不要为了凑正文添加无关套话。自然语言中的“@我”“艾特我”“提及我”指本轮当前消息发送者，用 reply_action 的 at_current_sender 表达，不要调用成员搜索，也不要填写真实 QQ 号；@其他人时才使用动作候选中的 at_user_ref。需要引用或撤回消息时同样通过 reply_action 提交，并使用动作候选里的临时引用，不要只在正文里写成普通文字。不要输出解释、分析、代码块或任何协议标记；若确实不应回应，就用 reply_action 的 disposition=silent。不要编造工具结果，也不要把本次修复当成新的用户消息。";
 const PLAIN_REPLY_REPAIR_PROMPT: &str = "上一轮没有形成可发送的回复。请重新结合当前用户消息和同一对话上下文，直接写一条自然、具体、可以原样发给用户的聊天正文。不要输出 JSON、动作标记、工具调用、解释、分析、思考过程或消息包装；按问题需要保留 Markdown、换行或代码。不要把本次修复当成新的用户消息，也不要为了凑回复添加无关套话。";
 
 struct EmptyReplyIncident {
@@ -668,9 +675,9 @@ pub async fn control_model(
     // "对我说的"（模块头 `group_context` 有完整来龙去脉）。Core 链早有一份同源上下文，
     // 这里给它对齐。
     crate::model::attach_group_context(&mut request_messages, group_id, current_message_id);
-    let allow_reply_actions = reply_action_protocol_requested(message);
+    let allow_reply_actions = reply_action_tool_requested(message);
     if allow_reply_actions {
-        attach_reply_protocol_context(
+        attach_reply_action_candidates(
             &mut request_messages,
             super::interrupt::ReplyScope::Group(group_id),
             current_message_id,
@@ -757,9 +764,9 @@ pub async fn control_model(
     crate::model::waiting_room::TurnWatch::step(crate::model::waiting_room::TurnStep::Compose);
     let reply_scope = super::interrupt::ReplyScope::Group(group_id);
     let mut plan = if allow_reply_actions {
-        ReplyPlan::from_model_output_for_sender(reply_scope, &response.content, Some(user_id)).await
+        ReplyPlan::from_reply_turn(reply_scope, &response, Some(user_id)).await
     } else {
-        plain_reply_plan_for_host(reply_scope, &response.content)
+        plain_reply_plan_for_host(reply_scope, &response)
     };
     if !is_current(reply_ticket).await {
         limit_memory_size(&mut messages);
@@ -907,7 +914,10 @@ fn should_repair_empty_reply(
 /// Keep the structured reply-action channel for explicit message actions only.
 /// Ordinary questions, including questions containing JSON examples, remain
 /// plain text and are never interpreted as a command by the host.
-fn reply_action_protocol_requested(message: &str) -> bool {
+///
+/// 这一轮判定现在决定的是"要不要把这轮挂上 `reply_action` 工具"（外加动作候选上下文）：
+/// 工具一旦挂上，她就只能通过它表达结构化动作；不挂的普通回合连工具都看不到。
+fn reply_action_tool_requested(message: &str) -> bool {
     let normalized = message.to_lowercase();
     // A user may discuss the syntax of an action without asking us to perform
     // it.  Keep those turns on the plain-text path; only an imperative action
@@ -1433,19 +1443,16 @@ fn plain_reply_plan(scope: super::interrupt::ReplyScope, content: &str) -> Optio
     ReplyPlan::from_plain_bubbles(scope, vec![text.to_owned()])
 }
 
-/// Host 普通文本路径也要尊重模型输出的结构化静默判定。
+/// Host 普通文本路径也要尊重宿主自己的结构化静默判定。
 ///
-/// 群被 `#禁言` 时,工具链路会确定性地返回 `[[REPLY_ACTION]]{"disposition":"silent"}[[/REPLY_ACTION]]`;
-/// 若这里仍按"包含传输协议"拒绝并进入空回复修复,静默意图会被强制改写成
-/// 可见正文,导致禁言在一轮之后失效(模型明明选择沉默,修复却替它发出了话)。
-fn plain_reply_plan_for_host(scope: super::interrupt::ReplyScope, content: &str) -> ReplyPlan {
-    if super::reply::parse_reply_output(content)
-        .disposition
-        .is_silent()
-    {
+/// 群被 `#禁言` 时，工具链路返回的是**结构化的**静默轮次（`ReplyTurn::silent()`）；
+/// 若这里仍按"包含传输协议"拒绝并进入空回复修复，静默意图会被强制改写成可见正文，
+/// 导致禁言在一轮之后失效（模型明明选择沉默，修复却替它发出了话）。
+fn plain_reply_plan_for_host(scope: super::interrupt::ReplyScope, turn: &ReplyTurn) -> ReplyPlan {
+    if turn.is_silent() {
         ReplyPlan::silent()
     } else {
-        plain_reply_plan(scope, content).unwrap_or_else(ReplyPlan::empty_reply)
+        plain_reply_plan(scope, &turn.content).unwrap_or_else(ReplyPlan::empty_reply)
     }
 }
 
@@ -1574,43 +1581,54 @@ async fn repair_empty_reply(
             PLAIN_REPLY_REPAIR_PROMPT.to_string()
         },
     });
-    let response = if allow_reply_actions {
-        params_model_with_token_limit_and_progress_for_reply(
+    let turn = if allow_reply_actions {
+        // 修复提示词点名了 `reply_action`，就必须真的把工具挂上；否则她只能"凭印象"
+        // 把结构化意图写进正文，那正是这次迁移要消灭的东西。语气参考照旧用
+        // `generate_reply_guidance`——这一轮原先走的正是那条带引导的路径。
+        let tool_specs = vec![reply_action_tool_spec(
+            crate::config::qq_voice_enabled(),
+            crate::sticker_library::is_available(),
+        )];
+        interruptible_reply_action_turn(
             &mut repair_messages,
+            &[],
+            &tool_specs,
+            NativeToolStyle::ReplyGuidance,
+            reply_ticket,
             max_output_tokens,
             vision_images,
             progress,
-            Some(reply_ticket),
         )
-        .await
+        .await?
     } else {
-        params_model_with_plain_style_context(
-            &mut repair_messages,
-            max_output_tokens,
-            vision_images,
-            None,
-            Some(reply_ticket),
+        ReplyTurn::plain(
+            params_model_with_plain_style_context(
+                &mut repair_messages,
+                max_output_tokens,
+                vision_images,
+                None,
+                Some(reply_ticket),
+            )
+            .await
+            .content,
         )
-        .await
     };
-    if is_model_error_response(&response.content)
-        || vision_failure_detail(&response.content).is_some()
-        || response.content.contains("[[TOOL_CALL]]")
-        || response.content.contains("[[/TOOL_CALL]]")
+    if is_model_error_response(&turn.content)
+        || vision_failure_detail(&turn.content).is_some()
+        || plain_reply_contains_transport_protocol(&turn.content)
     {
-        log_unusable_reply_protocol(scope, "协议修复", &response.content);
+        log_unusable_reply_protocol(scope, "协议修复", &turn.content);
         return None;
     }
     let plan = if allow_reply_actions {
-        ReplyPlan::from_model_output_for_sender(scope, &response.content, current_sender_user_id)
-            .await
+        ReplyPlan::from_reply_turn(scope, &turn, current_sender_user_id).await
     } else {
-        plain_reply_plan(scope, &response.content).unwrap_or_else(ReplyPlan::empty_reply)
+        plain_reply_plan(scope, &turn.content).unwrap_or_else(ReplyPlan::empty_reply)
     };
     if plan.has_visible_reply() || plan.is_silent() {
         Some(plan)
     } else {
-        log_unusable_reply_protocol(scope, "协议修复", &response.content);
+        log_unusable_reply_protocol(scope, "协议修复", &turn.content);
         None
     }
 }
@@ -1629,13 +1647,11 @@ fn log_unusable_reply_protocol(scope: super::interrupt::ReplyScope, phase: &str,
         truncate_chars(compact.trim(), 320)
     };
     println!(
-        "[WARN] 回复协议未形成可执行计划 (场景: {}, 阶段: {}, 字符数: {}, 动作开始标记: {}, 动作结束标记: {}, 当前发送者字段: {}, 预览: {:?})",
+        "[WARN] 回复未形成可执行计划 (场景: {}, 阶段: {}, 字符数: {}, 残留协议标记: {}, 预览: {:?})",
         scope_label,
         phase,
         content.chars().count(),
-        content.matches("[[REPLY_ACTION]]").count(),
-        content.matches("[[/REPLY_ACTION]]").count(),
-        content.contains("at_current_sender"),
+        plain_reply_contains_transport_protocol(content),
         preview
     );
 }
@@ -2291,7 +2307,49 @@ pub(crate) async fn params_model_with_native_tools(
         vision_images,
         progress,
         reply_ticket,
-        false,
+        NativeToolStyle::None,
+    )
+    .await
+}
+
+/// 原生工具调用要附带的语气参考。
+///
+/// 三条路各自的口径不同，迁移前后必须一一对上，不能因为"多加了一个工具"顺手换掉语气：
+/// 工具轮历来不带；宿主的结构化回复回合（原 legacy 文本协议那条路）带
+/// `generate_reply_guidance`；普通可见回合带 `generate_plain_style_context`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NativeToolStyle {
+    /// 不附带语气参考。
+    None,
+    /// `generate_reply_guidance`：宿主结构化回复回合本来就有这一份。
+    ReplyGuidance,
+    /// `generate_plain_style_context`：普通可见回合。
+    PlainStyle,
+}
+
+/// 原生工具 + 宿主结构化回复回合的语气上下文。
+///
+/// 结构化回复回合（原先靠正文里的动作标记，现在靠 `reply_action` 工具）在非工具轮上
+/// 一直带 `generate_reply_guidance`；加了工具不该把它丢掉——这与
+/// [`params_model_with_native_tools_and_plain_style`] 修的是同一类问题。
+pub(crate) async fn params_model_with_native_tools_and_reply_guidance(
+    messages: &mut [BotMemory],
+    extra_wire: &[Value],
+    tool_specs: &[Value],
+    max_tokens: Option<u32>,
+    vision_images: &[VisionImage],
+    progress: Option<Arc<ThinkingReporter>>,
+    reply_ticket: Option<ReplyTicket>,
+) -> ModelPayload {
+    params_model_with_native_tools_mode(
+        messages,
+        extra_wire,
+        tool_specs,
+        max_tokens,
+        vision_images,
+        progress,
+        reply_ticket,
+        NativeToolStyle::ReplyGuidance,
     )
     .await
 }
@@ -2319,7 +2377,7 @@ pub(crate) async fn params_model_with_native_tools_and_plain_style(
         vision_images,
         progress,
         reply_ticket,
-        true,
+        NativeToolStyle::PlainStyle,
     )
     .await
 }
@@ -2333,7 +2391,7 @@ async fn params_model_with_native_tools_mode(
     vision_images: &[VisionImage],
     progress: Option<Arc<ThinkingReporter>>,
     reply_ticket: Option<ReplyTicket>,
-    with_plain_style: bool,
+    style: NativeToolStyle,
 ) -> ModelPayload {
     let config = config::get();
     let server_config = config.server_config();
@@ -2345,11 +2403,16 @@ async fn params_model_with_native_tools_mode(
     }
 
     let mut request_messages = messages.to_owned();
-    if with_plain_style {
-        request_messages.push(BotMemory {
+    match style {
+        NativeToolStyle::None => {}
+        NativeToolStyle::ReplyGuidance => request_messages.push(BotMemory {
+            role: Roles::System,
+            content: generate_reply_guidance(&request_messages).await,
+        }),
+        NativeToolStyle::PlainStyle => request_messages.push(BotMemory {
             role: Roles::System,
             content: generate_plain_style_context(&request_messages).await,
-        });
+        }),
     }
     if progress.is_some() {
         request_messages.push(BotMemory {
@@ -2679,6 +2742,14 @@ async fn round_trip_model_request(
 ) -> Result<ModelPayload, String> {
     // 测试替身：装了就用它，不走网络。放在最前面，连重试逻辑一起跳过——
     // seam 测试要的是"管道跑通没有"，不是重试策略。
+    #[cfg(test)]
+    if let Some(mock) = super::llm_mock::take_payload_response(request_body) {
+        return Ok(ModelPayload {
+            content: mock.content,
+            tool_calls: mock.tool_calls,
+            finish_reason: Some("stop".to_string()),
+        });
+    }
     #[cfg(test)]
     if let Some(content) = super::llm_mock::take_response(request_body) {
         return Ok(ModelPayload {
@@ -4128,9 +4199,9 @@ async fn private_chat_inner(
         rolling_summary.as_deref(),
     );
     attach_private_profile_context(&mut request_messages, &user_profile);
-    let allow_reply_actions = reply_action_protocol_requested(message);
+    let allow_reply_actions = reply_action_tool_requested(message);
     if allow_reply_actions {
-        attach_reply_protocol_context(
+        attach_reply_action_candidates(
             &mut request_messages,
             super::interrupt::ReplyScope::Private(user_id),
             None,
@@ -4220,9 +4291,9 @@ async fn private_chat_inner(
     let reply_scope = super::interrupt::ReplyScope::Private(user_id);
     crate::model::waiting_room::TurnWatch::step(crate::model::waiting_room::TurnStep::Compose);
     let mut plan = if allow_reply_actions {
-        ReplyPlan::from_model_output(reply_scope, &bot_content.content).await
+        ReplyPlan::from_reply_turn(reply_scope, &bot_content, None).await
     } else {
-        plain_reply_plan_for_host(reply_scope, &bot_content.content)
+        plain_reply_plan_for_host(reply_scope, &bot_content)
     };
     if !is_current(reply_ticket).await {
         limit_memory_size(&mut history);
@@ -4549,6 +4620,7 @@ pub fn get_file_modified_time_formatted() -> anyhow::Result<String> {
 
 #[cfg(test)]
 mod tests {
+    use super::ReplyTurn;
     use super::{
         BotMemory, EMPTY_REPLY_REPAIR_PROMPT, FoldedFragment, MAX_NATIVE_TOOL_ARGUMENTS_BYTES,
         MessageUnderstanding, NativeToolCall, NativeToolCallDelta, Roles, VisionImage,
@@ -4559,7 +4631,7 @@ mod tests {
         is_private_only_command, is_restricted_command, likely_requires_tool_protocol,
         limit_memory_size, model_attempt_count, neutralize_line_speaker_markers,
         neutralize_protocol_markers, parse_stream_line, plain_reply_plan,
-        plain_reply_plan_for_host, private_user_message, reply_action_protocol_requested,
+        plain_reply_plan_for_host, private_user_message, reply_action_tool_requested,
         sanitize_scheduled_output, should_repair_empty_reply, tool_result_wire,
         with_reference_context,
     };
@@ -4805,13 +4877,13 @@ mod tests {
     }
 
     #[test]
-    fn plain_host_plan_honors_explicit_silence_instead_of_repairing_it() {
+    fn plain_host_plan_honors_host_owned_silence_instead_of_repairing_it() {
         let scope = crate::model::interrupt::ReplyScope::Group(9_100_001);
-        let silent = crate::model::reply_disposition::SILENT_REPLY_OUTPUT;
-        let plan = plain_reply_plan_for_host(scope, silent);
+        // 宿主自己判定的静默是结构化的：`ReplyTurn::silent()`，不经过任何正文标记。
+        let plan = plain_reply_plan_for_host(scope, &ReplyTurn::silent());
         assert!(
             plan.is_silent(),
-            "静默协议必须被识别为静默计划,而不是走空回复修复"
+            "宿主静默必须被识别为静默计划,而不是走空回复修复"
         );
         assert!(!plan.has_visible_reply());
         // 修复判定也必须跳过:静默不是空回复。
@@ -4821,12 +4893,13 @@ mod tests {
             "显式静默计划不应触发空回复修复"
         );
         // 普通正文仍走原 plain 路径。
-        let normal = plain_reply_plan_for_host(scope, "今天过得怎么样?");
+        let normal = plain_reply_plan_for_host(scope, &ReplyTurn::plain("今天过得怎么样?"));
         assert!(!normal.is_silent());
         assert!(normal.has_visible_reply());
-        // 非静默但包含协议的对象仍按旧行为拒绝(交由修复)。
-        let protocol_without_silence = "[[REPLY_ACTION]]{\"at_user_ids\":[1]}[[/REPLY_ACTION]]";
-        let rejected = plain_reply_plan_for_host(scope, protocol_without_silence);
+        // 模型复述旧协议标记的正文仍被拒绝(交由修复)，不会当成可见消息发出去。
+        let protocol_without_silence =
+            ReplyTurn::plain("[[REPLY_ACTION]]{\"at_user_ids\":[1]}[[/REPLY_ACTION]]");
+        let rejected = plain_reply_plan_for_host(scope, &protocol_without_silence);
         assert!(!rejected.is_silent());
         assert!(!rejected.has_visible_reply());
     }
@@ -5104,7 +5177,7 @@ mod tests {
             "我想讨论引用消息的用法",
         ] {
             assert!(
-                !reply_action_protocol_requested(discussion),
+                !reply_action_tool_requested(discussion),
                 "action syntax discussion must stay plain: {discussion}"
             );
         }
@@ -5116,7 +5189,7 @@ mod tests {
             "把上一条删掉",
         ] {
             assert!(
-                reply_action_protocol_requested(command),
+                reply_action_tool_requested(command),
                 "explicit action request should use the action path: {command}"
             );
         }
@@ -5271,13 +5344,19 @@ mod tests {
         ));
     }
 
+    /// 修复提示词只交代"该说什么、什么时候调工具"，字段级契约在工具 schema 里。
     #[test]
-    fn empty_reply_repair_prompt_stays_internal_and_plain() {
+    fn empty_reply_repair_prompt_points_at_the_tool_instead_of_the_old_marker() {
         assert!(EMPTY_REPLY_REPAIR_PROMPT.contains("自然聊天正文"));
-        assert!(EMPTY_REPLY_REPAIR_PROMPT.contains("不要输出工具调用"));
-        assert!(EMPTY_REPLY_REPAIR_PROMPT.contains("at_current_sender"));
-        assert!(EMPTY_REPLY_REPAIR_PROMPT.contains("at_user_ids"));
-        assert!(EMPTY_REPLY_REPAIR_PROMPT.contains("只要求发送结构化 @"));
+        assert!(
+            EMPTY_REPLY_REPAIR_PROMPT.contains("reply_action"),
+            "结构化动作只走工具，提示词必须点名它"
+        );
+        assert!(EMPTY_REPLY_REPAIR_PROMPT.contains("只要求结构化 @"));
+        assert!(
+            !EMPTY_REPLY_REPAIR_PROMPT.contains("[[REPLY_ACTION]]"),
+            "不能再教模型写旧标记: {EMPTY_REPLY_REPAIR_PROMPT}"
+        );
         assert!(!EMPTY_REPLY_REPAIR_PROMPT.contains("**"));
     }
 

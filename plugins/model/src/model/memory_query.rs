@@ -1,13 +1,17 @@
 //! 由模型自主发起、由程序严格约束的工具调用循环。
 
 use super::interrupt::{ReplyTicket, is_current};
-use super::reply_disposition::SILENT_REPLY_OUTPUT;
+use super::reply::{
+    REPLY_ACTION_TOOL_NAME, ReplyActionOutcome, ReplyTurn, reply_action_from_tool_calls,
+    reply_action_tool_spec,
+};
 use super::thinking::ThinkingReporter;
 use super::tool_access::{ToolExecutionContext, ToolExecutionResult, tool_registry};
 use super::utils::{
-    BotMemory, ModelPayload, Roles, assistant_tool_calls_wire, is_model_error_response,
-    likely_requires_tool_protocol, params_model_with_native_tools,
-    params_model_with_native_tools_and_plain_style, params_model_with_plain_style_context,
+    BotMemory, ModelPayload, NativeToolStyle, Roles, assistant_tool_calls_wire,
+    is_model_error_response, likely_requires_tool_protocol, params_model_with_native_tools,
+    params_model_with_native_tools_and_plain_style,
+    params_model_with_native_tools_and_reply_guidance, params_model_with_plain_style_context,
     params_model_with_plain_style_context_allow_empty,
     params_model_with_token_limit_and_progress_for_reply, params_model_without_reply_guidance,
     plain_assistant_wire, system_wire, tool_result_wire, vision_failure_detail,
@@ -116,13 +120,14 @@ fn offers_sticker_tool_alone(tool_turn: bool, sticker_available: bool) -> bool {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ContextPromptMode {
-    LegacyReplyActions,
+    /// 本轮挂了 `reply_action`：结构化动作走工具，正文仍是自然语言。
+    ReplyAction,
     PlainText,
 }
 
 fn context_prompt_mode(tool_context: &ToolExecutionContext) -> ContextPromptMode {
     if tool_context.allow_reply_actions {
-        ContextPromptMode::LegacyReplyActions
+        ContextPromptMode::ReplyAction
     } else {
         ContextPromptMode::PlainText
     }
@@ -137,7 +142,7 @@ async fn interruptible_model_call_for_context(
     progress: Option<Arc<ThinkingReporter>>,
 ) -> Option<BotMemory> {
     match context_prompt_mode(tool_context) {
-        ContextPromptMode::LegacyReplyActions => {
+        ContextPromptMode::ReplyAction => {
             interruptible_model_call(
                 messages,
                 reply_ticket,
@@ -161,6 +166,9 @@ async fn interruptible_model_call_for_context(
 }
 
 /// 普通回复只调用一次模型；只有模型明确请求工具时才进入有限工具循环。
+///
+/// 返回值是 [`ReplyTurn`]：正文之外还带着模型通过 `reply_action` 工具提交的结构化动作。
+/// 动作只能从工具参数里来——调用方不再（也不能）从正文里解析任何东西。
 pub(crate) async fn params_model_with_tool_access(
     messages: &mut [BotMemory],
     tool_context: ToolExecutionContext,
@@ -168,19 +176,27 @@ pub(crate) async fn params_model_with_tool_access(
     max_output_tokens: Option<u32>,
     vision_images: &[VisionImage],
     progress: Option<Arc<ThinkingReporter>>,
-) -> BotMemory {
+) -> ReplyTurn {
     // "工具轮"：这一轮本来就该带工具（群被暂停 / 语义层判定要查 / 关键词命中）。
     let tool_turn = tool_context.group_paused
         || tool_context.requires_structured_tool_turn()
         || latest_user_message(messages).is_some_and(likely_requires_tool_protocol);
-    // 素材库有货时，外面挂的回复协议里已经点名了 `sticker_list`（见 `reply.rs` 的
-    // `REPLY_PROTOCOL_STICKER`，判据与这里同一个 `is_available`）。工具只在工具轮下发的话，
+    // 素材库有货时，外面挂的动作候选提示里已经点名了 `sticker_list`（见 `reply.rs` 的
+    // `REPLY_ACTION_STICKER_FIELD`，判据与这里同一个 `is_available`）。工具只在工具轮下发的话，
     // 提示词让她去调、她手里却没有这个工具——只能凭印象编一个标签，或者答应发一张相册里
     // 没有的图（线上 2026-09-15 02:15 的"猫猫歪头"）。Core 那条路修的是同一个坑
     // （`7ee0b95`），这里补上，两条链路才一致。
     let sticker_only_turn =
         offers_sticker_tool_alone(tool_turn, crate::sticker_library::is_available());
-    if !tool_turn && !sticker_only_turn {
+    // 结构化回复动作的工具声明。只在这轮真的该有结构动作用途时下发；
+    // 两个可选能力（语音 / 表情包）按当下真的可用决定字段是否进 schema。
+    let reply_action_tool = tool_context.allow_reply_actions.then(|| {
+        reply_action_tool_spec(
+            crate::config::qq_voice_enabled(),
+            crate::sticker_library::is_available(),
+        )
+    });
+    if !tool_turn && !sticker_only_turn && reply_action_tool.is_none() {
         return interruptible_model_call_for_context(
             messages,
             &tool_context,
@@ -190,14 +206,16 @@ pub(crate) async fn params_model_with_tool_access(
             progress,
         )
         .await
-        .unwrap_or_else(interrupted_response);
+        .map(ReplyTurn::from)
+        .unwrap_or_else(interrupted_turn);
     }
+    // 挂了 `reply_action` 的回合即使不是工具轮也要进循环：那里统一负责"这一轮挂了哪些
+    // 工具、模型怎么用它们"。它的工具清单可以只有 `reply_action`（+ sticker.list），
+    // 与"整套工具每轮几百个 token"是两回事。
+    let native_tool_style = native_tool_style(&tool_context, tool_turn, sticker_only_turn);
     let Some(registry) = tool_registry() else {
         if tool_context.group_paused {
-            return BotMemory {
-                role: Roles::Assistant,
-                content: SILENT_REPLY_OUTPUT.to_string(),
-            };
+            return ReplyTurn::silent();
         }
         if tool_context.requires_external_tool {
             eprintln!(
@@ -207,7 +225,8 @@ pub(crate) async fn params_model_with_tool_access(
             return BotMemory {
                 role: Roles::Assistant,
                 content: crate::reminders::SCHEDULED_EXTERNAL_TOOL_FAILURE.to_string(),
-            };
+            }
+            .into();
         }
         if tool_context.requires_reminder_create {
             eprintln!(
@@ -217,14 +236,15 @@ pub(crate) async fn params_model_with_tool_access(
             return BotMemory {
                 role: Roles::Assistant,
                 content: "我暂时无法创建这个定时任务，请稍后再试一次。".to_string(),
-            };
+            }
+            .into();
         }
         if tool_context.requires_agent_run_create {
             eprintln!(
                 "[WARN] 持续任务请求未执行：模型工具注册表不可用 (范围: {}:{})",
                 tool_context.context, tool_context.subject_id
             );
-            return required_agent_run_failure(false);
+            return required_agent_run_failure(false).into();
         }
         if tool_context.requires_group_message_send {
             eprintln!(
@@ -232,9 +252,26 @@ pub(crate) async fn params_model_with_tool_access(
                 tool_context.context, tool_context.subject_id
             );
             if tool_context.requires_group_followup {
-                return required_group_followup_failure(false, false);
+                return required_group_followup_failure(false, false).into();
             }
-            return required_group_message_failure(false, false);
+            return required_group_message_failure(false, false).into();
+        }
+        // 工具注册表不可用挡的是注册表里的工具，`reply_action` 不经过它：
+        // 结构化动作仍然照常下发，否则"按昵称 @/引用/撤回"这类明确要求会毫无动静地
+        // 退化成一次普通文字回复。
+        if let Some(reply_action_tool) = reply_action_tool {
+            return interruptible_reply_action_turn(
+                messages,
+                &[],
+                std::slice::from_ref(&reply_action_tool),
+                native_tool_style,
+                reply_ticket,
+                max_output_tokens,
+                vision_images,
+                progress,
+            )
+            .await
+            .unwrap_or_else(ReplyTurn::silent);
         }
         return interruptible_model_call_for_context(
             messages,
@@ -245,7 +282,8 @@ pub(crate) async fn params_model_with_tool_access(
             progress,
         )
         .await
-        .unwrap_or_else(interrupted_response);
+        .map(ReplyTurn::from)
+        .unwrap_or_else(interrupted_turn);
     };
 
     let mut tool_context = tool_context;
@@ -312,69 +350,78 @@ pub(crate) async fn params_model_with_tool_access(
         // 只因为"她可能想发图"才带上工具的普通回合只给 `sticker.list` 一个：整套工具是
         // 每轮几百个 token，还会让她在闲聊里发起不相干的调用。她已经查过就不再带——清单
         // 就在上一条工具结果里。
-        let tool_specs = if sticker_only_turn && !sticker_list_queried {
+        let mut tool_specs = if sticker_only_turn && !sticker_list_queried {
             registry
                 .sticker_tool_spec(&tool_context)
                 .into_iter()
-                .collect()
+                .collect::<Vec<_>>()
         } else if sticker_only_turn {
             Vec::new()
         } else {
             registry.native_tool_specs(&tool_context, untrusted_tool_output)
         };
+        // `reply_action` 与注册表工具并列下发。它不在注册表里（执行者是宿主自己），
+        // 所以这里单独追加；已经查过 `sticker.list` 的回合清单为空，但那一轮恰恰最需要
+        // 它——标签拿到手之后，只有通过 `reply_action` 的 sticker 字段才发得出去。
+        if let Some(reply_action_tool) = reply_action_tool.as_ref() {
+            tool_specs.push(reply_action_tool.clone());
+        }
         // 普通可见回合（`PlainText`）本来就带语气参考（`generate_plain_style_context`：
         // 此刻心情 / 精力 / 主动性），而工具循环的**最后一轮就是那条可见正文**，所以加了
         // 工具也不该把它丢掉。宿主这条循环原来一律用不带语气上下文的版本，于是"她只是
         // 可能想发图"才进循环的普通回合会静默少掉一段提示词。生成它只是读一次 personality
         // 再拼字符串，每轮重算是便宜的。
-        let payload = if context_prompt_mode(&tool_context) == ContextPromptMode::PlainText {
-            interruptible_model_call_with_native_tools_and_plain_style(
-                &mut request,
-                &extra_wire,
-                &tool_specs,
-                reply_ticket,
-                max_output_tokens,
-                vision_images,
-                progress.clone(),
-            )
-            .await
-        } else {
-            interruptible_model_call_with_native_tools(
-                &mut request,
-                &extra_wire,
-                &tool_specs,
-                reply_ticket,
-                max_output_tokens,
-                vision_images,
-                progress.clone(),
-            )
-            .await
-        };
+        let payload = interruptible_native_tool_call(
+            &mut request,
+            &extra_wire,
+            &tool_specs,
+            native_tool_style,
+            reply_ticket,
+            max_output_tokens,
+            vision_images,
+            progress.clone(),
+        )
+        .await;
         let Some(payload) = payload else {
-            return interrupted_response();
+            return interrupted_turn();
         };
         if vision_failure_detail(&payload.content).is_some() {
             if group_message_send_succeeded {
-                return completed_group_message_response();
+                return completed_group_message_response().into();
             }
             if agent_run_create_succeeded {
-                return completed_agent_run_response();
+                return completed_agent_run_response().into();
             }
-            return payload.as_bot_memory();
+            return payload.as_bot_memory().into();
         }
         if !payload.tool_calls.is_empty() {
+            // 结构化回复动作是**终止轮**：她提交动作就是在给这一轮下结论，不再有后续
+            // 往返（动作已经交出去了，也没有对应的工具结果要回灌）。与注册表工具同轮
+            // 提交则动作作废——她还没拿到工具结果就先宣布了怎么回。
+            let classified =
+                classify_turn_tool_calls(&payload.tool_calls, payload.finish_reason.as_deref());
+            if classified.registry.is_empty() {
+                // 暂停（`#禁言`）期间不说话这条约束不能被"她提交了动作"绕过：
+                // 与下面没有工具调用的那条路同一个判据。`group.resume` 成功执行会把
+                // `group_paused` 清掉，所以"解禁并回复"不受影响。
+                if tool_context.group_paused {
+                    return ReplyTurn::silent();
+                }
+                return finish_reply_action_turn(payload.content, classified.action);
+            }
+            let registry_calls = classified.registry;
             // ===== 原生 function-calling 轮：执行全部调用，结果回灌后让
             // 模型继续推理（ReAct），直到它认为资料足够并输出最终正文。 =====
             println!(
                 "[INFO] 模型原生工具调用请求: 数量={}, 范围={}:{}, 轮次={}",
-                payload.tool_calls.len(),
+                registry_calls.len(),
                 tool_context.context,
                 tool_context.subject_id,
                 round + 1
             );
             let mut executed: Vec<(String, ToolExecutionResult)> =
-                Vec::with_capacity(payload.tool_calls.len());
-            for (call_index, call) in payload.tool_calls.iter().enumerate() {
+                Vec::with_capacity(registry_calls.len());
+            for (call_index, call) in registry_calls.iter().enumerate() {
                 // Provider 返回的 wire 名（点号已转下划线）先反查回注册名；
                 // 未知名字原样交给执行层，让它以“未知工具”失败反馈给模型。
                 let tool_name = registry.resolve_wire_tool_name(&call.name);
@@ -495,41 +542,43 @@ pub(crate) async fn params_model_with_tool_access(
                 );
                 executed.push((tool_name, result));
             }
-            extra_wire.push(assistant_tool_calls_wire(
-                &payload.content,
-                &payload.tool_calls,
-            ));
+            extra_wire.push(assistant_tool_calls_wire(&payload.content, &registry_calls));
             for (index, result) in executed.iter().enumerate() {
-                let call_id = payload
-                    .tool_calls
+                let call_id = registry_calls
                     .get(index)
                     .map(|call| call.id.clone())
                     .unwrap_or_default();
                 extra_wire.push(tool_result_wire(&call_id, &result.1.content));
             }
+            // 这条提示必须排在工具结果**之后**：wire 里 assistant 的 `tool_calls` 与随后的
+            // `role: "tool"` 结果要保持相邻配对，中间插一条 system 会被上游判成
+            // "tool_calls 没有全部跟结果"。
+            if classified.action_dropped {
+                extra_wire.push(system_wire(
+                    "reply_action 必须单独调用：不要在发起其它工具调用的同一轮里提交它。先看完这一轮的工具结果，再用一次独立的 reply_action 提交本轮动作。",
+                ));
+            }
             continue;
         }
         // Provider 未返回工具调用：把本轮正文当作普通助手响应，沿用既有
-        // required 工具约束与文本协议兜底（旧模型/网关混用期兼容）。
+        // required 工具约束（旧模型/网关混用期兼容）。
         let response = payload.as_bot_memory();
         // Provider 未返回工具调用：本轮正文就是最终回复。仍先校验 required
         // 工具约束（提醒/持续任务/跨群发送等），未完成时要求补齐或拒绝
         // 可能伪造成功的模型文本。
         if tool_context.group_paused {
-            return BotMemory {
-                role: Roles::Assistant,
-                content: SILENT_REPLY_OUTPUT.to_string(),
-            };
+            return ReplyTurn::silent();
         }
         if group_message_send_succeeded && is_model_error_response(&response.content) {
             return if group_followup_succeeded {
                 completed_group_followup_response()
             } else {
                 completed_group_message_response()
-            };
+            }
+            .into();
         }
         if agent_run_create_succeeded && is_model_error_response(&response.content) {
-            return completed_agent_run_response();
+            return completed_agent_run_response().into();
         }
         if tool_context.requires_external_tool && !external_tool_succeeded {
             if is_model_error_response(&response.content) || round + 1 >= max_tool_rounds {
@@ -542,7 +591,8 @@ pub(crate) async fn params_model_with_tool_access(
                 return BotMemory {
                     role: Roles::Assistant,
                     content: crate::reminders::SCHEDULED_EXTERNAL_TOOL_FAILURE.to_string(),
-                };
+                }
+                .into();
             }
             eprintln!(
                 "[WARN] 定时任务模型未发起外部查询，要求协议重试 (范围: {}:{}, 轮次: {})",
@@ -586,7 +636,7 @@ pub(crate) async fn params_model_with_tool_access(
                 );
                 continue;
             }
-            return required_agent_run_failure(agent_run_create_attempted);
+            return required_agent_run_failure(agent_run_create_attempted).into();
         }
         if tool_context.requires_group_message_send && !group_message_send_succeeded {
             if !group_message_send_attempted
@@ -613,7 +663,8 @@ pub(crate) async fn params_model_with_tool_access(
             return required_group_message_failure(
                 group_target_lookup_succeeded,
                 group_message_send_attempted,
-            );
+            )
+            .into();
         }
         if tool_context.requires_group_followup && !group_followup_succeeded {
             eprintln!(
@@ -625,7 +676,8 @@ pub(crate) async fn params_model_with_tool_access(
             return required_group_followup_failure(
                 group_target_lookup_succeeded,
                 group_message_send_attempted,
-            );
+            )
+            .into();
         }
         if tool_context.requires_reminder_create && !reminder_tool_succeeded {
             eprintln!(
@@ -636,7 +688,7 @@ pub(crate) async fn params_model_with_tool_access(
                 round + 1
             );
         }
-        return response;
+        return response.into();
     }
 
     if tool_context.requires_reminder_create && !reminder_tool_succeeded {
@@ -645,11 +697,12 @@ pub(crate) async fn params_model_with_tool_access(
             reminder_failure_detail.as_deref(),
             tool_context,
         );
-        return reminder_failure_response(reminder_failure, reminder_failure_detail.as_deref());
+        return reminder_failure_response(reminder_failure, reminder_failure_detail.as_deref())
+            .into();
     }
 
     if tool_context.requires_agent_run_create && !agent_run_create_succeeded {
-        return required_agent_run_failure(agent_run_create_attempted);
+        return required_agent_run_failure(agent_run_create_attempted).into();
     }
 
     if tool_context.requires_external_tool && !external_tool_succeeded {
@@ -660,7 +713,8 @@ pub(crate) async fn params_model_with_tool_access(
         return BotMemory {
             role: Roles::Assistant,
             content: crate::reminders::SCHEDULED_EXTERNAL_TOOL_FAILURE.to_string(),
-        };
+        }
+        .into();
     }
 
     if tool_context.requires_group_message_send && !group_message_send_succeeded {
@@ -678,54 +732,62 @@ pub(crate) async fn params_model_with_tool_access(
                 group_target_lookup_succeeded,
                 group_message_send_attempted,
             )
-        };
+        }
+        .into();
     }
 
     if tool_context.requires_group_followup && !group_followup_succeeded {
         return required_group_followup_failure(
             group_target_lookup_succeeded,
             group_message_send_attempted,
-        );
+        )
+        .into();
     }
 
     extra_wire.push(system_wire(
         "本轮工具调用次数已用完。请使用已有结果直接回答，不要再发起工具调用。",
     ));
     // 这一轮同样按"有没有吃到外部内容"决定清单，否则收窄会被这最后一次调用绕过。
-    let final_tool_specs = registry.native_tool_specs(&tool_context, untrusted_tool_output);
-    let Some(response) = interruptible_model_call_with_native_tools(
+    let mut final_tool_specs = registry.native_tool_specs(&tool_context, untrusted_tool_output);
+    if let Some(reply_action_tool) = reply_action_tool.as_ref() {
+        final_tool_specs.push(reply_action_tool.clone());
+    }
+    let Some(payload) = interruptible_native_tool_call(
         &mut request,
         &extra_wire,
         &final_tool_specs,
+        native_tool_style,
         reply_ticket,
         max_output_tokens,
         vision_images,
         progress,
     )
     .await
-    .map(|payload| payload.as_bot_memory()) else {
-        return interrupted_response();
+    else {
+        return interrupted_turn();
     };
+    // 收尾轮同样是终止轮：动作在这一轮提交，不再有后续往返。
+    let turn = finish_reply_action_turn(
+        payload.content,
+        reply_action_from_tool_calls(&payload.tool_calls, payload.finish_reason.as_deref()),
+    );
     // 轮次耗尽后的收尾：允许模型使用已有结果给出最终回复，但 required
     // 工具（跨群发送/持续任务）失败时仍不得伪造成功。
-    if group_message_send_succeeded && is_model_error_response(&response.content) {
+    if group_message_send_succeeded && is_model_error_response(&turn.content) {
         if group_followup_succeeded {
-            completed_group_followup_response()
+            completed_group_followup_response().into()
         } else {
-            completed_group_message_response()
+            completed_group_message_response().into()
         }
-    } else if agent_run_create_succeeded && is_model_error_response(&response.content) {
-        completed_agent_run_response()
+    } else if agent_run_create_succeeded && is_model_error_response(&turn.content) {
+        completed_agent_run_response().into()
     } else if tool_context.group_paused {
-        // 与 383 行的确定性静默一致：暂停状态在轮次耗尽后依然生效，模型
+        // 与前面几处的确定性静默一致：暂停状态在轮次耗尽后依然生效，模型
         // 输出的可见正文不能绕过“禁言期间不说话”的约束；只有本轮成功
         // 执行了 group.resume（此处 group_paused 已被清掉）才允许可见回复。
-        BotMemory {
-            role: Roles::Assistant,
-            content: SILENT_REPLY_OUTPUT.to_string(),
-        }
+        ReplyTurn::silent()
     } else {
-        response
+        turn
     }
 }
 
@@ -1046,6 +1108,39 @@ pub(crate) async fn interruptible_model_call_with_native_tools(
     }
 }
 
+/// 原生工具 + 宿主结构化回复回合的语气上下文，可被新消息打断。
+///
+/// 与 [`interruptible_model_call_with_native_tools`] 的唯一区别是附上
+/// `generate_reply_guidance`——结构化回复回合本来就有它，加了 `reply_action` 工具
+/// 也不该丢。
+pub(crate) async fn interruptible_model_call_with_native_tools_and_reply_guidance(
+    messages: &mut [BotMemory],
+    extra_wire: &[Value],
+    tool_specs: &[Value],
+    reply_ticket: ReplyTicket,
+    max_output_tokens: Option<u32>,
+    vision_images: &[VisionImage],
+    progress: Option<Arc<ThinkingReporter>>,
+) -> Option<ModelPayload> {
+    if !is_current(reply_ticket).await {
+        return None;
+    }
+    kovi::tokio::select! {
+        response = params_model_with_native_tools_and_reply_guidance(
+            messages,
+            extra_wire,
+            tool_specs,
+            max_output_tokens,
+            vision_images,
+            progress,
+            Some(reply_ticket),
+        ) => {
+            is_current(reply_ticket).await.then_some(response)
+        }
+        () = wait_until_interrupted(reply_ticket) => None,
+    }
+}
+
 /// 原生工具 + 普通可见回合的语气上下文，可被新消息打断。
 ///
 /// 与 [`interruptible_model_call_with_native_tools`] 的唯一区别是保留
@@ -1151,26 +1246,196 @@ async fn wait_until_interrupted(reply_ticket: ReplyTicket) {
     }
 }
 
-fn interrupted_response() -> BotMemory {
-    BotMemory {
-        role: Roles::Assistant,
-        content: SILENT_REPLY_OUTPUT.to_string(),
+/// 被新消息打断：这一轮什么都不发，交给接管的那一轮。
+fn interrupted_turn() -> ReplyTurn {
+    ReplyTurn::silent()
+}
+
+/// 按各条路原本的口径挑语气上下文。
+///
+/// 迁移只把动作通道从正文标记换成 `reply_action` 工具，不顺手改语气：普通可见回合带
+/// plain style；原先走 legacy 文本协议的结构化回复回合在**非工具轮**上带
+/// `generate_reply_guidance`，进了循环的（工具轮、sticker-only 轮）历来不带，这里照旧。
+fn native_tool_style(
+    tool_context: &ToolExecutionContext,
+    tool_turn: bool,
+    sticker_only_turn: bool,
+) -> NativeToolStyle {
+    match context_prompt_mode(tool_context) {
+        ContextPromptMode::PlainText => NativeToolStyle::PlainStyle,
+        ContextPromptMode::ReplyAction if !tool_turn && !sticker_only_turn => {
+            NativeToolStyle::ReplyGuidance
+        }
+        ContextPromptMode::ReplyAction => NativeToolStyle::None,
     }
+}
+
+/// 按语气口径选一个原生工具调用的可中断包装。
+#[allow(clippy::too_many_arguments)]
+async fn interruptible_native_tool_call(
+    messages: &mut [BotMemory],
+    extra_wire: &[Value],
+    tool_specs: &[Value],
+    style: NativeToolStyle,
+    reply_ticket: ReplyTicket,
+    max_output_tokens: Option<u32>,
+    vision_images: &[VisionImage],
+    progress: Option<Arc<ThinkingReporter>>,
+) -> Option<ModelPayload> {
+    match style {
+        NativeToolStyle::PlainStyle => {
+            interruptible_model_call_with_native_tools_and_plain_style(
+                messages,
+                extra_wire,
+                tool_specs,
+                reply_ticket,
+                max_output_tokens,
+                vision_images,
+                progress,
+            )
+            .await
+        }
+        NativeToolStyle::ReplyGuidance => {
+            interruptible_model_call_with_native_tools_and_reply_guidance(
+                messages,
+                extra_wire,
+                tool_specs,
+                reply_ticket,
+                max_output_tokens,
+                vision_images,
+                progress,
+            )
+            .await
+        }
+        NativeToolStyle::None => {
+            interruptible_model_call_with_native_tools(
+                messages,
+                extra_wire,
+                tool_specs,
+                reply_ticket,
+                max_output_tokens,
+                vision_images,
+                progress,
+            )
+            .await
+        }
+    }
+}
+
+/// 一轮原生工具调用的分流结论。
+#[derive(Debug)]
+struct TurnToolCalls {
+    /// 交给注册表执行的调用；`reply_action` 不在其中（它的执行者是宿主自己）。
+    registry: Vec<crate::model::utils::NativeToolCall>,
+    /// 本轮提交的结构化动作。
+    action: ReplyActionOutcome,
+    /// 动作是否因为"没有单独调用"而被丢弃。
+    action_dropped: bool,
+}
+
+/// 把一轮 provider 工具调用拆成"结构化动作"与"注册表工具"两组。
+///
+/// `reply_action` 必须单独调用：与注册表工具同轮时，她还没拿到工具结果就先宣布了怎么回，
+/// 动作建立在一个还不存在的前提上。工具照常执行（不静默丢调用），动作作废并由调用方在
+/// 工具结果之后要求她重新提交。
+fn classify_turn_tool_calls(
+    calls: &[crate::model::utils::NativeToolCall],
+    finish_reason: Option<&str>,
+) -> TurnToolCalls {
+    let registry = calls
+        .iter()
+        .filter(|call| call.name != REPLY_ACTION_TOOL_NAME)
+        .cloned()
+        .collect::<Vec<_>>();
+    let outcome = reply_action_from_tool_calls(calls, finish_reason);
+    if registry.is_empty() {
+        return TurnToolCalls {
+            registry,
+            action: outcome,
+            action_dropped: false,
+        };
+    }
+    let action_dropped = matches!(outcome, ReplyActionOutcome::Submitted(_));
+    TurnToolCalls {
+        registry,
+        action: ReplyActionOutcome::Absent,
+        action_dropped,
+    }
+}
+
+/// 把"这一轮的正文 + `reply_action` 的提交结果"落成 [`ReplyTurn`]。
+///
+/// `Invalid` 只记日志、降级成"这一轮没有结构化动作"：畸形参数绝不能变成一次静默、
+/// 一次撤回或一次 @。正文该发照发；正文为空时由空回复修复那条路接管。
+fn finish_reply_action_turn(content: String, outcome: ReplyActionOutcome) -> ReplyTurn {
+    let action = match outcome {
+        ReplyActionOutcome::Absent => None,
+        ReplyActionOutcome::Submitted(action) => Some(action),
+        ReplyActionOutcome::Invalid(reason) => {
+            eprintln!("[WARN] reply_action 参数不可用，本轮按没有结构化动作处理 (原因: {reason})");
+            None
+        }
+    };
+    ReplyTurn { content, action }
+}
+
+/// 一次挂了 `reply_action` 的原生调用，直接返回可执行的一轮回复。
+///
+/// 用在没有工具循环的地方（注册表不可用时的兜底、空回复修复）：那里只挂了
+/// `reply_action`，所以它必须是终止轮；万一模型报了别的工具名，这里也**不会**静默吞掉，
+/// 而是明确记一条日志。
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn interruptible_reply_action_turn(
+    messages: &mut [BotMemory],
+    extra_wire: &[Value],
+    tool_specs: &[Value],
+    style: NativeToolStyle,
+    reply_ticket: ReplyTicket,
+    max_output_tokens: Option<u32>,
+    vision_images: &[VisionImage],
+    progress: Option<Arc<ThinkingReporter>>,
+) -> Option<ReplyTurn> {
+    let payload = interruptible_native_tool_call(
+        messages,
+        extra_wire,
+        tool_specs,
+        style,
+        reply_ticket,
+        max_output_tokens,
+        vision_images,
+        progress,
+    )
+    .await?;
+    if let Some(other) = payload
+        .tool_calls
+        .iter()
+        .find(|call| call.name != REPLY_ACTION_TOOL_NAME)
+    {
+        eprintln!(
+            "[WARN] 这一轮只挂载了 reply_action，未声明也没执行的工具调用被忽略 (工具: {})",
+            other.name
+        );
+    }
+    let outcome =
+        reply_action_from_tool_calls(&payload.tool_calls, payload.finish_reason.as_deref());
+    Some(finish_reply_action_turn(payload.content, outcome))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         ContextPromptMode, MAX_TOOL_CALLS_PER_ROUND, ReminderCreateFailure, ToolCallRefusal,
-        completed_group_followup_response, completed_group_message_response, context_prompt_mode,
-        interrupted_response, likely_requires_tool_protocol, merge_group_send_result,
-        offers_sticker_tool_alone, refuse_tool_call, reminder_failure_response,
-        required_group_followup_failure, required_group_message_failure,
-        tool_result_has_task_status, tool_round_limit,
+        classify_turn_tool_calls, completed_group_followup_response,
+        completed_group_message_response, context_prompt_mode, interrupted_turn,
+        likely_requires_tool_protocol, merge_group_send_result, offers_sticker_tool_alone,
+        refuse_tool_call, reminder_failure_response, required_group_followup_failure,
+        required_group_message_failure, tool_result_has_task_status, tool_round_limit,
     };
     use crate::model::MessageDestination;
-    use crate::model::reply::parse_reply_output;
+    use crate::model::reply::REPLY_ACTION_TOOL_NAME;
+    use crate::model::reply::ReplyActionOutcome;
     use crate::model::tool_access::{ToolExecutionContext, ToolExecutionResult};
+    use crate::model::{BotMemory, ReplyScope, Roles};
 
     #[test]
     fn message_action_words_do_not_expose_the_tool_registry() {
@@ -1265,7 +1530,7 @@ mod tests {
                 allow_reply_actions: true,
                 ..context.clone()
             },),
-            ContextPromptMode::LegacyReplyActions
+            ContextPromptMode::ReplyAction
         );
         assert_eq!(context_prompt_mode(&context), ContextPromptMode::PlainText);
     }
@@ -1371,11 +1636,202 @@ mod tests {
         assert!(followup_succeeded);
     }
 
+    /// 端到端接缝：这一轮真的把 `reply_action` 挂上了，provider 出的工具调用真的变成了
+    /// 这一轮的动作。
+    ///
+    /// 单元测试测不到这一段——它跨过模型调用；而这次迁移要保证的正是"动作只从工具参数
+    /// 里来"。替身返回的就是 provider 会返回的那份结构化载荷。
+    #[test]
+    fn reply_action_tool_call_becomes_the_turn_action() {
+        let executor = kovi::tokio::runtime::Runtime::new().expect("test runtime");
+        executor.block_on(async {
+            use crate::model::llm_mock::{MockPayload, with_mock_payload_model};
+            use crate::model::utils::NativeToolCall;
+            use serde_json::json;
+
+            let scope = ReplyScope::Private(9_555_001);
+            let ticket = crate::model::interrupt::interrupt(scope).await;
+            let mut messages = vec![BotMemory {
+                role: Roles::User,
+                content: "把刚才那句话撤回".to_string(),
+            }];
+            let context = ToolExecutionContext {
+                subject_id: 9_555_001,
+                actor_user_id: 9_555_001,
+                is_admin: false,
+                is_main_admin: false,
+                context: "private_chat",
+                destination: MessageDestination::Private(9_555_001),
+                source_message_id: None,
+                scheduled: false,
+                group_paused: false,
+                runtime_bot: None,
+                sticker_teaching: None,
+                requires_reminder_create: false,
+                requires_agent_run_create: false,
+                requires_group_message_send: false,
+                requires_group_followup: false,
+                requires_external_tool: false,
+                allow_reply_actions: true,
+            };
+            let turn = with_mock_payload_model(
+                "reply-action-tool-call",
+                |request| {
+                    let offered = request["tools"]
+                        .as_array()
+                        .expect("这一轮必须下发工具声明")
+                        .iter()
+                        .map(|tool| tool["function"]["name"].as_str().unwrap_or_default())
+                        .collect::<Vec<_>>();
+                    assert!(
+                        offered.contains(&REPLY_ACTION_TOOL_NAME),
+                        "结构化回复回合必须拿得到 reply_action: {offered:?}"
+                    );
+                    MockPayload {
+                        content: "好，撤回了。".to_string(),
+                        tool_calls: vec![NativeToolCall {
+                            id: "call_1".to_string(),
+                            name: REPLY_ACTION_TOOL_NAME.to_string(),
+                            arguments: json!({"recall_message_ids": [77]})
+                                .as_object()
+                                .expect("对象")
+                                .clone(),
+                            raw_arguments: r#"{"recall_message_ids":[77]}"#.to_string(),
+                        }],
+                    }
+                },
+                async {
+                    crate::model::ModelGateway::complete(
+                        &mut messages,
+                        context,
+                        ticket,
+                        Some(64),
+                        &[],
+                        None,
+                    )
+                    .await
+                },
+            )
+            .await;
+
+            assert_eq!(turn.content, "好，撤回了。");
+            let action = turn.action.expect("工具调用必须落到这一轮的动作上");
+            assert_eq!(action.action.recall_message_ids, vec![77]);
+        });
+    }
+
+    /// 反向接缝：正文里复述旧标记不再产生任何动作——协议确实只剩工具一条通道。
+    #[test]
+    fn a_text_marker_in_the_body_no_longer_becomes_an_action() {
+        let executor = kovi::tokio::runtime::Runtime::new().expect("test runtime");
+        executor.block_on(async {
+            use crate::model::llm_mock::{MockPayload, with_mock_payload_model};
+
+            let scope = ReplyScope::Private(9_555_002);
+            let ticket = crate::model::interrupt::interrupt(scope).await;
+            let mut messages = vec![BotMemory {
+                role: Roles::User,
+                content: "把刚才那句话撤回".to_string(),
+            }];
+            let context = ToolExecutionContext {
+                subject_id: 9_555_002,
+                actor_user_id: 9_555_002,
+                is_admin: false,
+                is_main_admin: false,
+                context: "private_chat",
+                destination: MessageDestination::Private(9_555_002),
+                source_message_id: None,
+                scheduled: false,
+                group_paused: false,
+                runtime_bot: None,
+                sticker_teaching: None,
+                requires_reminder_create: false,
+                requires_agent_run_create: false,
+                requires_group_message_send: false,
+                requires_group_followup: false,
+                requires_external_tool: false,
+                allow_reply_actions: true,
+            };
+            let turn = with_mock_payload_model(
+                "reply-action-text-marker",
+                |_| MockPayload {
+                    content: r#"[[REPLY_ACTION]]{"disposition":"silent"}[[/REPLY_ACTION]]"#
+                        .to_string(),
+                    tool_calls: Vec::new(),
+                },
+                async {
+                    crate::model::ModelGateway::complete(
+                        &mut messages,
+                        context,
+                        ticket,
+                        Some(64),
+                        &[],
+                        None,
+                    )
+                    .await
+                },
+            )
+            .await;
+
+            assert!(
+                turn.action.is_none(),
+                "正文里的标记不能被解释成动作: {:?}",
+                turn.action
+            );
+            let parsed = crate::model::reply::parse_reply_output(&turn.content, None);
+            assert!(!parsed.disposition.is_silent());
+            assert!(parsed.content.is_empty(), "标记本身也不能留在可见正文里");
+        });
+    }
+
+    /// `reply_action` 必须单独调用：与注册表工具同轮时动作作废、工具照常执行。
+    #[test]
+    fn a_tool_call_voids_a_reply_action_submitted_in_the_same_round() {
+        use crate::model::utils::NativeToolCall;
+        use serde_json::json;
+
+        let action = NativeToolCall {
+            id: "call_1".to_string(),
+            name: REPLY_ACTION_TOOL_NAME.to_string(),
+            arguments: json!({"at_current_sender": true})
+                .as_object()
+                .expect("对象")
+                .clone(),
+            raw_arguments: "{}".to_string(),
+        };
+        let search = NativeToolCall {
+            id: "call_2".to_string(),
+            name: "memory.search".to_string(),
+            arguments: serde_json::Map::new(),
+            raw_arguments: "{}".to_string(),
+        };
+
+        // 只有动作：终止轮，动作照收。
+        let alone = classify_turn_tool_calls(std::slice::from_ref(&action), None);
+        assert!(alone.registry.is_empty());
+        assert!(matches!(alone.action, ReplyActionOutcome::Submitted(_)));
+        assert!(!alone.action_dropped);
+
+        // 动作 + 注册表工具：动作作废，工具照常进执行队列。
+        let mixed = classify_turn_tool_calls(&[action, search.clone()], None);
+        assert_eq!(mixed.registry.len(), 1);
+        assert_eq!(mixed.registry[0].name, "memory.search");
+        assert!(matches!(mixed.action, ReplyActionOutcome::Absent));
+        assert!(mixed.action_dropped);
+
+        // 只有注册表工具：跟迁移前一样。
+        let tools_only = classify_turn_tool_calls(&[search], None);
+        assert_eq!(tools_only.registry.len(), 1);
+        assert!(matches!(tools_only.action, ReplyActionOutcome::Absent));
+        assert!(!tools_only.action_dropped);
+    }
+
     #[test]
     fn interrupted_tool_loop_returns_structured_silence() {
-        let parsed = parse_reply_output(&interrupted_response().content);
-        assert!(parsed.disposition.is_silent());
-        assert!(parsed.content.is_empty());
+        // 被打断的一轮是宿主自己判定的静默：结构化的，不经过任何正文标记。
+        let turn = interrupted_turn();
+        assert!(turn.is_silent());
+        assert!(turn.content.is_empty());
     }
 
     #[test]

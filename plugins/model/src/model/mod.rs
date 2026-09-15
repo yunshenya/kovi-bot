@@ -18,7 +18,7 @@ mod model_gateway;
 mod private;
 mod recall;
 pub(crate) mod relevance;
-mod reply;
+pub(crate) mod reply;
 mod reply_disposition;
 pub(crate) mod semantic;
 pub(crate) mod send_guard;

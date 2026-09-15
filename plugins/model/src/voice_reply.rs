@@ -1,6 +1,6 @@
 //! 让芸汐把回复以 QQ 语音消息的形式说出来。
 //!
-//! 模型在 `[[REPLY_ACTION]]` 里把这一轮标记为 `voice` 时走这里：用本机 TTS 合成
+//! 模型通过 `reply_action` 工具把这一轮标记为 `voice=true` 时走这里：用本机 TTS 合成
 //! PCM，写成 WAV，再以 OneBot 的 `record` 段交给 NapCat。NapCat 内部会把非 silk
 //! 音频自动转成 silk（`convertToNTSilkTct`），所以这里直接给 WAV 即可。
 //!

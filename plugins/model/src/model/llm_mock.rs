@@ -25,6 +25,21 @@ type Responder = Box<dyn Fn(&Value) -> String + Send + Sync + 'static>;
 
 static RESPONDER: LazyLock<Mutex<Option<Responder>>> = LazyLock::new(|| Mutex::new(None));
 
+/// 替身返回的一次完整载荷：正文 + provider 出的原生工具调用。
+///
+/// 只回正文的 [`with_mock_model`] 测不了"模型通过 `reply_action` 提交动作"这类接缝：
+/// 工具调用是 provider 通道里的结构化数据，不在正文里。这个替身让测试能造出与真实
+/// provider 同形的载荷（`NativeToolCall` 就是要序列化回 API 的那个形状）。
+pub(crate) struct MockPayload {
+    pub(crate) content: String,
+    pub(crate) tool_calls: Vec<super::utils::NativeToolCall>,
+}
+
+type PayloadResponder = Box<dyn Fn(&Value) -> MockPayload + Send + Sync + 'static>;
+
+static PAYLOAD_RESPONDER: LazyLock<Mutex<Option<PayloadResponder>>> =
+    LazyLock::new(|| Mutex::new(None));
+
 /// 测试之间串行化用。持锁期间其它 `with_mock_model` 会等。
 static SERIAL: LazyLock<kovi::tokio::sync::Mutex<()>> =
     LazyLock::new(|| kovi::tokio::sync::Mutex::new(()));
@@ -61,12 +76,55 @@ where
     result
 }
 
+/// 装一个"带原生工具调用"的替身并跑 `body`；与 [`with_mock_model`] 共用同一把串行锁，
+/// 两种替身不会同时在场。
+pub(crate) async fn with_mock_payload_model<F, T>(
+    label: &str,
+    responder: impl Fn(&Value) -> MockPayload + Send + Sync + 'static,
+    body: F,
+) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    let _serial = SERIAL.lock().await;
+    {
+        let mut slot = PAYLOAD_RESPONDER
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(
+            slot.is_none(),
+            "上一个模型替身没拆干净（{label}）——替身必须成对装卸"
+        );
+        *slot = Some(Box::new(responder));
+    }
+    let result = body.await;
+    {
+        let mut slot = PAYLOAD_RESPONDER
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *slot = None;
+    }
+    result
+}
+
 /// 当前是否装了替身。用于"替身在场时不必要求 API 密钥"——请求根本不出网。
 pub(crate) fn is_installed() -> bool {
     RESPONDER
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .is_some()
+        || PAYLOAD_RESPONDER
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some()
+}
+
+/// 取一次"带工具调用"的替身载荷；没装就返回 `None`。
+pub(crate) fn take_payload_response(request_body: &Value) -> Option<MockPayload> {
+    let slot = PAYLOAD_RESPONDER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    slot.as_ref().map(|responder| responder(request_body))
 }
 
 /// 取一次替身回复；没装替身就返回 `None`，调用方走真实 HTTP。

@@ -747,6 +747,22 @@ mod tests {
         assert!(!config.prompt().private_prompt().contains("silent 决策"));
         assert!(!config.prompt().system_prompt().contains("REPLY_ACTION"));
         assert!(!config.prompt().private_prompt().contains("REPLY_ACTION"));
+        // 结构化动作的契约随 `reply_action` 工具下发（AGENTS.md 第 6 条），
+        // 不许再回到常驻提示词里；字段名同样不该在提示词里出现。
+        assert!(!config.prompt().system_prompt().contains("reply_action"));
+        assert!(!config.prompt().private_prompt().contains("reply_action"));
+        assert!(
+            !config
+                .prompt()
+                .system_prompt()
+                .contains("at_current_sender")
+        );
+        assert!(
+            !config
+                .prompt()
+                .private_prompt()
+                .contains("at_current_sender")
+        );
     }
 
     #[test]
