@@ -112,14 +112,16 @@ pub use open_loop::{
 };
 pub use planner::{
     AffectState, ConversationTurnDirective, DecisionDisposition, DecisionPlan,
-    InteractionCueValidationError, InteractionCues, InteractionStateEvolution, MAX_PLANNER_GOALS,
-    MAX_PLANNER_INTENTS, MAX_PLANNER_MEMORIES, MAX_PLANNER_OPEN_LOOPS, MAX_PLANNER_STATE_UPDATES,
-    MAX_PLANNER_TOPIC_BYTES, MAX_PLANNER_TOPIC_CHARS, ModelBackend, ModelBackendError,
-    ModelBackendFuture, PersonStateRead, Planner, PlannerError, PlannerInput,
-    PlannerInputValidationError, PlannerOutput, PlannerOutputValidationError, PlannerStateSnapshot,
-    RelationNudge, RelationPull, RelationState, StateUpdateProposal, adjust_relation_tension,
-    apply_interaction_cues, apply_relation_nudge, drift_affect_state, drift_relation_state,
-    evolve_interaction_state, relation_evidence_nudge, relation_half_lives,
+    InteractionCueValidationError, InteractionCues, InteractionStateEvolution,
+    MAX_PLAN_EXPECTATION_WINDOW_SECS, MAX_PLAN_EXPECTATIONS, MAX_PLAN_GOAL_BYTES,
+    MAX_PLAN_GOAL_CHARS, MAX_PLANNER_GOALS, MAX_PLANNER_INTENTS, MAX_PLANNER_MEMORIES,
+    MAX_PLANNER_OPEN_LOOPS, MAX_PLANNER_STATE_UPDATES, MAX_PLANNER_TOPIC_BYTES,
+    MAX_PLANNER_TOPIC_CHARS, MIN_PLAN_EXPECTATION_WINDOW_SECS, ModelBackend, ModelBackendError,
+    ModelBackendFuture, PersonStateRead, PlanExpectation, PlanGoal, Planner, PlannerError,
+    PlannerInput, PlannerInputValidationError, PlannerOutput, PlannerOutputValidationError,
+    PlannerStateSnapshot, RelationNudge, RelationPull, RelationState, StateUpdateProposal,
+    adjust_relation_tension, apply_interaction_cues, apply_relation_nudge, drift_affect_state,
+    drift_relation_state, evolve_interaction_state, relation_evidence_nudge, relation_half_lives,
 };
 pub use ports::{
     AffectStore, AffectStoreError, AffectStoreFuture, Clock, ConversationMemberStore,

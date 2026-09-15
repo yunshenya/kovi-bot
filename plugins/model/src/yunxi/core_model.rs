@@ -32,6 +32,7 @@ use anyhow::Result;
 use kovi::RuntimeBot;
 use kovi::tokio::sync::Mutex;
 use serde::Deserialize;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 use std::hash::Hash;
@@ -3021,6 +3022,149 @@ pub(crate) fn core_tool_protocol_diagnostic(content: &str) -> String {
     )
 }
 
+/// Wire name of the function the model uses to say what this task is for.
+///
+/// It is a **declaration**, not an action: the host lifts it into the plan's
+/// `goal`/`expectations` and never dispatches it. It therefore travels on the
+/// provider's function-calling channel — the constrained one — rather than as a
+/// marker in the reply text, which is the pattern this codebase is retiring
+/// (AGENTS.md 第 7 条).
+const TASK_DECLARE_TOOL_NAME: &str = "task.declare";
+
+/// Event kinds a declaration may wait for.
+///
+/// Deliberately narrow: most `EventType`s are internal bookkeeping Core emits
+/// for itself, and offering them would invite the model to wait for something
+/// nobody produces.
+const TASK_DECLARE_EXPECTABLE_EVENTS: &[(&str, yunxi_core::EventType)] =
+    &[("message_received", yunxi_core::EventType::MessageReceived)];
+
+const TASK_DECLARE_TOOL_DESCRIPTION: &str = "声明这次任务要办成什么（goal），以及它之后应当发生什么（expecting，可省略）。这只把意图说清楚，不产生任何动作，也不要为了用它而调用它。形成任务的这一轮说一次即可。";
+
+/// The declaration function's schema.
+fn task_declare_tool_spec() -> Value {
+    let names: Vec<&str> = TASK_DECLARE_EXPECTABLE_EVENTS
+        .iter()
+        .map(|(name, _)| *name)
+        .collect();
+    json!({
+        "type": "function",
+        "function": {
+            "name": TASK_DECLARE_TOOL_NAME,
+            "description": TASK_DECLARE_TOOL_DESCRIPTION,
+            "parameters": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "goal": {
+                        "type": "string",
+                        "maxLength": yunxi_core::MAX_PLAN_GOAL_CHARS,
+                        "description": "这次任务要办成什么，一句话，用你自己的话。",
+                    },
+                    "expecting": {
+                        "type": "array",
+                        "maxItems": yunxi_core::MAX_PLAN_EXPECTATIONS,
+                        "description": "这件事做完之后，接下来应当发生什么。只在你真的会等它的时候填，否则省略。",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "properties": {
+                                "event_type": {
+                                    "type": "string",
+                                    "enum": names,
+                                    "description": "你等的那个事件。message_received＝对方发来消息。",
+                                },
+                                "within_secs": {
+                                    "type": "integer",
+                                    "minimum": yunxi_core::MIN_PLAN_EXPECTATION_WINDOW_SECS,
+                                    "maximum": yunxi_core::MAX_PLAN_EXPECTATION_WINDOW_SECS,
+                                    "description": "等多久算没等到（秒）。",
+                                },
+                            },
+                            "required": ["event_type", "within_secs"],
+                        },
+                    },
+                },
+                "required": ["goal"],
+            }
+        }
+    })
+}
+
+/// What the forming round declared about its task.
+#[derive(Debug, Default)]
+struct TaskDeclaration {
+    goal: Option<yunxi_core::PlanGoal>,
+    expectations: Vec<yunxi_core::PlanExpectation>,
+}
+
+impl TaskDeclaration {
+    fn is_empty(&self) -> bool {
+        self.goal.is_none() && self.expectations.is_empty()
+    }
+}
+
+/// Reads a declaration out of a batch of native tool calls.
+///
+/// Invalid declarations are dropped rather than failing the turn: a malformed
+/// goal costs the task its stated purpose, but refusing the whole turn would
+/// cost it the answer it was actually producing.
+fn take_task_declaration(calls: &[NativeToolCall]) -> TaskDeclaration {
+    let wire_name = tool_access::wire_tool_name(TASK_DECLARE_TOOL_NAME);
+    let mut declaration = TaskDeclaration::default();
+    for call in calls {
+        if call.name != wire_name {
+            continue;
+        }
+        let arguments = &call.arguments;
+        if declaration.goal.is_none()
+            && let Some(goal) = arguments.get("goal").and_then(serde_json::Value::as_str)
+            && let Ok(goal) = yunxi_core::PlanGoal::new(goal)
+        {
+            declaration.goal = Some(goal);
+        }
+        let Some(expecting) = arguments
+            .get("expecting")
+            .and_then(serde_json::Value::as_array)
+        else {
+            continue;
+        };
+        for item in expecting {
+            let Some(item) = item.as_object() else {
+                continue;
+            };
+            let Some(event_name) = item.get("event_type").and_then(serde_json::Value::as_str)
+            else {
+                continue;
+            };
+            let Some(event_type) = TASK_DECLARE_EXPECTABLE_EVENTS
+                .iter()
+                .find(|(name, _)| *name == event_name)
+                .map(|(_, event_type)| *event_type)
+            else {
+                continue;
+            };
+            let Some(within_secs) = item
+                .get("within_secs")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|value| u32::try_from(value).ok())
+            else {
+                continue;
+            };
+            let expectation = yunxi_core::PlanExpectation::ExpectEvent {
+                event_type,
+                within_secs,
+            };
+            if expectation.validate().is_ok()
+                && declaration.expectations.len() < yunxi_core::MAX_PLAN_EXPECTATIONS
+            {
+                declaration.expectations.push(expectation);
+            }
+        }
+    }
+    declaration
+}
+
 fn native_calls_to_core_intents(
     calls: &[NativeToolCall],
     scope: ActionScope,
@@ -3033,6 +3177,10 @@ fn native_calls_to_core_intents(
             break;
         }
         let name = registry.resolve_wire_tool_name(&call.name);
+        // A declaration says what the task is for; it is not something to do.
+        if name == TASK_DECLARE_TOOL_NAME {
+            continue;
+        }
         if name.trim() != name || name.is_empty() || name.chars().count() > 128 {
             continue;
         }
@@ -6304,6 +6452,11 @@ impl ModelBackend for KoviModelBackend {
                                 != Some(wire.as_str())
                         });
                     }
+                    // 形成任务的那一轮才带声明函数：目标在任务形成时定下，
+                    // 之后每一轮再带一次只是每轮多付一份 schema。
+                    if !tool_follow_up {
+                        specs.push(task_declare_tool_spec());
+                    }
                     native_tool_specs = Some(specs);
                     core_tool_registry = Some(registry.clone());
                     messages.insert(
@@ -6952,7 +7105,7 @@ impl ModelBackend for KoviModelBackend {
                         )
                     });
                     if let Some(intents) = core_tool_intents {
-                        let Some(tool_plan) = register_core_tool_intents(
+                        let Some(mut tool_plan) = register_core_tool_intents(
                             &self.tool_turns,
                             input,
                             &mind_projection,
@@ -6970,6 +7123,14 @@ impl ModelBackend for KoviModelBackend {
                                 parsed_response.interaction_cues,
                             ));
                         };
+                        // 声明随这一轮的计划一起交给 Core：它是"这一步为了什么"，
+                        // 不是一个要执行的动作（`native_calls_to_core_intents` 已经
+                        // 把声明调用挡在意图之外）。
+                        let declaration = take_task_declaration(&native_tool_calls);
+                        if !declaration.is_empty() {
+                            tool_plan.goal = declaration.goal;
+                            tool_plan.expectations = declaration.expectations;
+                        }
                         crate::model::finish(ticket).await;
                         return Ok(tool_plan);
                     }
@@ -7793,15 +7954,19 @@ mod tests {
         INTRINSIC_SEMANTIC_CONTENT_INSTRUCTION, MAX_CORE_BUBBLES, MAX_DELIVERABLE_BUBBLES_PER_TURN,
         MAX_PLAIN_SPLIT_LINE_CHARS, MIND_DECISION_INSTRUCTION, MindCandidates,
         PersistentRouteLookup, QqConversation, RequiredCreation, RouteContext,
-        SILENCE_TENSION_THRESHOLD, STICKER_TOOL_NAME, SilenceVerdict, VisibleReplyTarget,
-        addressed_gap_wait_ms, affect_tone_guidance, ambient_group_interjection_veto,
-        autonomous_conversation_prompt, autonomous_conversation_protocol,
-        autonomous_empty_generation_plan, autonomous_generation_failure_plan, baseline_disposition,
-        batch_fence_action_key, classify_persistent_person_identity,
-        constrain_autonomous_tick_plan, conversation_focus_target, conversation_id_for_log,
-        core_message_prompt, core_plain_turn_instruction, core_plan_has_visible_text,
-        core_reply_bubbles_with_max, core_tool_allowance, core_tool_follow_up_instruction,
-        core_tool_protocol_diagnostic, core_working_memory_instruction,
+        SILENCE_TENSION_THRESHOLD, STICKER_TOOL_NAME, SilenceVerdict, TASK_DECLARE_TOOL_NAME,
+        VisibleReplyTarget, addressed_gap_wait_ms, affect_tone_guidance,
+        ambient_group_interjection_veto, autonomous_conversation_prompt,
+        autonomous_conversation_protocol, autonomous_empty_generation_plan,
+        autonomous_generation_failure_plan, baseline_disposition, batch_fence_action_key,
+        classify_persistent_person_identity, constrain_autonomous_tick_plan,
+        conversation_focus_target, conversation_id_for_log, core_message_prompt,
+        core_plain_turn_instruction, core_plan_has_visible_text, core_reply_bubbles_with_max,
+        core_tool_allowance, core_tool_follow_up_instruction, core_tool_protocol_diagnostic,
+        core_working_memory_instruction, native_calls_to_core_intents, take_task_declaration,
+        task_declare_tool_spec,
+    };
+    use super::{
         default_autonomous_directive, defer_unroutable_due, deterministic_route_fallback,
         drop_internal_decision_sentences, due_reply_target, eligible_mind_candidates,
         explicit_message_batch_needs_repair, explicit_message_count_for_event,
@@ -7839,6 +8004,7 @@ mod tests {
     };
     use crate::vision::ImageAttachment;
     use chrono::Utc;
+    use serde_json::json;
     use yunxi_core::{
         ActionCapability, ActionDescriptor, ActionScope, AffectState, AgendaItemId, AgendaItemKind,
         AgendaItemSnapshot, Attachment, AttachmentKind, AttentionSystem, BeliefId, BeliefSnapshot,
@@ -9822,6 +9988,109 @@ mod tests {
         assert!(!without.contains("[[STICKER"));
         // 工具回合的原有约束不能被这段拼接弄丢。
         assert!(with_library.contains("非可信数据"));
+    }
+
+    /// 声明函数只声明，不做事：它的 schema 里没有动作字段，名字也不在注册表里。
+    #[test]
+    fn the_declaration_function_declares_instead_of_acting() {
+        let spec = task_declare_tool_spec();
+        assert_eq!(spec["type"], "function");
+        assert_eq!(spec["function"]["name"], TASK_DECLARE_TOOL_NAME);
+        assert_eq!(
+            spec["function"]["parameters"]["additionalProperties"],
+            json!(false)
+        );
+        assert_eq!(spec["function"]["parameters"]["required"], json!(["goal"]));
+        // 只让她等 Core 真的会产出的事件，不给内部记账用的事件。
+        assert_eq!(
+            spec["function"]["parameters"]["properties"]["expecting"]["items"]["properties"]["event_type"]
+                ["enum"],
+            json!(["message_received"])
+        );
+    }
+
+    /// 声明被读出来，坏的丢掉而不是毁掉整轮。
+    #[test]
+    fn a_declaration_is_lifted_out_of_the_tool_batch() {
+        use crate::model::utils::NativeToolCall;
+        let declare = |arguments: serde_json::Value| NativeToolCall {
+            id: "call_declare".to_string(),
+            name: crate::model::tool_access::wire_tool_name(TASK_DECLARE_TOOL_NAME),
+            arguments: arguments.as_object().expect("对象").clone(),
+            raw_arguments: "{}".to_string(),
+        };
+
+        let calls = vec![declare(json!({
+            "goal": "查清楚明天要不要带伞",
+            "expecting": [
+                {"event_type": "message_received", "within_secs": 1800},
+                {"event_type": "not_a_real_event", "within_secs": 60},
+                {"event_type": "message_received", "within_secs": 0}
+            ]
+        }))];
+        let declaration = take_task_declaration(&calls);
+        assert_eq!(
+            declaration.goal.as_ref().map(yunxi_core::PlanGoal::summary),
+            Some("查清楚明天要不要带伞")
+        );
+        // 未知事件名与非法窗口都被丢掉，只剩合法那一条。
+        assert_eq!(declaration.expectations.len(), 1);
+        assert!(matches!(
+            &declaration.expectations[0],
+            yunxi_core::PlanExpectation::ExpectEvent {
+                event_type: yunxi_core::EventType::MessageReceived,
+                within_secs: 1800
+            }
+        ));
+
+        // 空的 goal 不算声明。
+        let blank = take_task_declaration(&[declare(json!({"goal": "   "}))]);
+        assert!(blank.is_empty());
+        // 没有声明调用时什么也不产生。
+        let none = take_task_declaration(&[]);
+        assert!(none.is_empty());
+    }
+
+    /// 声明永远不能变成动作——这是"它只说话不做事"的硬保证。
+    #[test]
+    fn a_declaration_never_becomes_a_tool_intent() {
+        use crate::model::utils::NativeToolCall;
+        let calls = vec![
+            NativeToolCall {
+                id: "call_declare".to_string(),
+                name: crate::model::tool_access::wire_tool_name(TASK_DECLARE_TOOL_NAME),
+                arguments: json!({"goal": "把这件事问清楚"})
+                    .as_object()
+                    .expect("对象")
+                    .clone(),
+                raw_arguments: "{}".to_string(),
+            },
+            NativeToolCall {
+                id: "call_search".to_string(),
+                name: "web.search".to_string(),
+                arguments: serde_json::Map::new(),
+                raw_arguments: "{}".to_string(),
+            },
+        ];
+        let registry = match crate::model::tool_registry() {
+            Some(registry) => registry,
+            // 没有注册表（素材/配置未就位）时这条断言没有意义。
+            None => return,
+        };
+        let intents = native_calls_to_core_intents(
+            &calls,
+            ActionScope::Conversation(ConversationId::new()),
+            ToolNotificationPolicy::Final,
+            &registry,
+        );
+        assert!(
+            !intents.iter().any(|intent| matches!(
+                intent,
+                yunxi_core::CognitiveIntent::UseTool { tool_name, .. }
+                    if tool_name == TASK_DECLARE_TOOL_NAME
+            )),
+            "声明被当成了动作: {intents:?}"
+        );
     }
 
     /// 工作记忆那一段只在真的有历史时出现，且必须是 data-only。
