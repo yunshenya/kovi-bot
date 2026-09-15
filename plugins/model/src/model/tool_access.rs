@@ -235,36 +235,45 @@ pub(crate) struct ToolRegistry {
 fn push_recall_tool_definitions(definitions: &mut Vec<ToolDefinition>) {
     // 撤回是**副作用动作**，所以走注册表而不是回复动作的字段：这样 Host 的 ReAct 循环与
     // Core 的 `UseTool` 意图都能用它，而平台细节（约 110 秒窗口、`delete_msg`）全留在宿主。
-    // 清单同样不进提示词：要用的时候自己先查（与 `sticker.list` 同一个范式）。
+    //
+    // **必须能一轮说完**：Core 的工具结果跟进轮强制只读收窄（`register_core_tool_intents`
+    // 的 `read_only_only`），于是"先查候选、再按 id 撤"在 Core 侧结构上走不通——第一轮查了
+    // 清单，第二轮手里就没有写工具了（线上 2026-09-15 19:00 正是如此：她查完候选只能回一句
+    // "撤不了"）。所以最常见的"撤回刚才那条"用 `target=last` 一次调用完成，`message_ids`
+    // 只留给确实要挑几条的场合（Host 那条路不受这个收窄影响，两种写法都能用）。
     definitions.push(ToolDefinition {
-            name: "message.recall_candidates".to_string(),
-            description: "列出你自己最近发出、现在仍可撤回的消息（message_id 与内容）。用户让你撤回时先调它拿准确 id——撤回窗口只有两分钟左右，过了就撤不回来，那时要如实说明（不是“没有权限”），不要猜 id。"
-                .to_string(),
-            input_schema: json!({
-                "type": "object",
-                "additionalProperties": false
-            }),
-            source: ToolSource::Builtin(BuiltinTool::MessageRecallCandidates),
-        });
+        name: "message.recall_candidates".to_string(),
+        description: "列出你自己最近发出、现在仍可撤回的消息（message_id 与内容）。撤回窗口只有两分钟左右，过了就撤不回来，那时要如实说明（不是“没有权限”）。只想撤最近那条的话不用查它——直接 message_recall 用 target=last。"
+            .to_string(),
+        input_schema: json!({
+            "type": "object",
+            "additionalProperties": false
+        }),
+        source: ToolSource::Builtin(BuiltinTool::MessageRecallCandidates),
+    });
     definitions.push(ToolDefinition {
-            name: "message.recall".to_string(),
-            description: "撤回你自己先前发出的消息。message_ids 只能填 message_recall_candidates 给出的 id：不要猜 id，也不要试图撤回别人发的消息。撤回本身是静默动作（用户看不到正文），撤完自然回一句即可。"
-                .to_string(),
-            input_schema: json!({
-                "type": "object",
-                "required": ["message_ids"],
-                "properties": {
-                    "message_ids": {
-                        "type": "array",
-                        "items": {"type": "integer"},
-                        "maxItems": crate::model::recall::MAX_RECALL_MESSAGES_PER_ACTION,
-                        "description": "要撤回的消息 id，只能来自 message_recall_candidates；一次最多 8 条。"
-                    }
+        name: "message.recall".to_string(),
+        description: "撤回你自己先前发出的消息。用户说“撤回刚才那条”“撤回你刚发的消息”时用 target=last，一次调用就撤掉，不必先查清单；要撤指定的某几条时才用 message_ids（只能填 message_recall_candidates 给出的 id，不要猜）。撤回是静默动作（用户看不到正文），撤完自然回一句即可。"
+            .to_string(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "target": {
+                    "type": "string",
+                    "enum": ["last"],
+                    "description": "撤你最近发出的那一条。"
                 },
-                "additionalProperties": false
-            }),
-            source: ToolSource::Builtin(BuiltinTool::MessageRecall),
-        });
+                "message_ids": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "maxItems": crate::model::recall::MAX_RECALL_MESSAGES_PER_ACTION,
+                    "description": "要撤回的具体消息 id，只能来自 message_recall_candidates；一次最多 8 条。"
+                }
+            },
+            "additionalProperties": false
+        }),
+        source: ToolSource::Builtin(BuiltinTool::MessageRecall),
+    });
 }
 
 pub(crate) async fn initialize() -> Result<()> {
@@ -3374,21 +3383,28 @@ async fn recall_own_messages(
     tool_context: &ToolExecutionContext,
     reply_ticket: crate::model::interrupt::ReplyTicket,
 ) -> Result<String> {
-    reject_unknown_arguments(arguments, &["message_ids"])?;
-    let requested = recall_message_ids(arguments)?;
-    if requested.is_empty() {
-        return Err(anyhow!(
-            "message_ids 不能为空：先调用 message_recall_candidates 拿到可撤回的 id"
-        ));
-    }
+    reject_unknown_arguments(arguments, &["target", "message_ids"])?;
+    let scope = destination_scope(tool_context.destination);
+    let available = crate::model::recall::recent_bot_messages(scope).await;
+    let requested = match recall_target(arguments)? {
+        RecallTarget::Ids(ids) => ids,
+        // 撤最近那条：候选按"最近的在前"排，取第一条即可。这条路径是 Core 侧唯一可行的写法
+        // （工具结果跟进轮只读），所以它必须存在，而且是最常走的那条。
+        RecallTarget::Last => match available.first() {
+            Some(message) => vec![message.message_id],
+            None => {
+                return Err(anyhow!(
+                    "你现在没有可撤回的消息：撤不回来的是超过约 110 秒的那些，如实说明就行。"
+                ));
+            }
+        },
+    };
     if requested.len() > crate::model::recall::MAX_RECALL_MESSAGES_PER_ACTION {
         return Err(anyhow!(
             "一次最多撤回 {} 条",
             crate::model::recall::MAX_RECALL_MESSAGES_PER_ACTION
         ));
     }
-    let scope = destination_scope(tool_context.destination);
-    let available = crate::model::recall::recent_bot_messages(scope).await;
     let unknown = requested
         .iter()
         .copied()
@@ -3421,8 +3437,13 @@ async fn recall_own_messages(
         .copied()
         .filter(|message_id| !recalled_ids.contains(message_id))
         .collect::<Vec<_>>();
+    let recalled_content = recalled
+        .iter()
+        .map(|message| json!({"message_id": message.message_id, "content": message.content}))
+        .collect::<Vec<_>>();
     Ok(json!({
         "recalled_message_ids": recalled_ids,
+        "recalled": recalled_content,
         "failed_message_ids": failed,
         "note": if failed.is_empty() {
             "已撤回。"
@@ -3433,24 +3454,39 @@ async fn recall_own_messages(
     .to_string())
 }
 
-fn recall_message_ids(arguments: &Map<String, Value>) -> Result<Vec<i32>> {
-    let Some(value) = arguments.get("message_ids") else {
-        return Err(anyhow!("缺少 message_ids"));
+/// 这一轮想撤哪些消息：语义写法（最近那条）或显式 id。
+enum RecallTarget {
+    Last,
+    Ids(Vec<i32>),
+}
+
+/// 解析撤回目标。两种写法必须给一个，并**明确报错**而不是猜：
+/// 猜错方向的代价是撤回一条她本不想撤的消息。
+fn recall_target(arguments: &Map<String, Value>) -> Result<RecallTarget> {
+    let ids = match arguments.get("message_ids") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(value) => value
+            .as_array()
+            .ok_or_else(|| anyhow!("message_ids 必须是整数数组"))?
+            .iter()
+            .map(|item| {
+                item.as_i64()
+                    .and_then(|value| i32::try_from(value).ok())
+                    .ok_or_else(|| anyhow!("message_ids 的每一项都必须是整数"))
+            })
+            .collect::<Result<Vec<i32>>>()?,
     };
-    if value.is_null() {
-        return Ok(Vec::new());
+    if !ids.is_empty() {
+        return Ok(RecallTarget::Ids(ids));
     }
-    let items = value
-        .as_array()
-        .ok_or_else(|| anyhow!("message_ids 必须是整数数组"))?;
-    items
-        .iter()
-        .map(|item| {
-            item.as_i64()
-                .and_then(|value| i32::try_from(value).ok())
-                .ok_or_else(|| anyhow!("message_ids 的每一项都必须是整数"))
-        })
-        .collect()
+    match arguments.get("target") {
+        Some(Value::String(target)) if target == "last" => Ok(RecallTarget::Last),
+        Some(Value::String(target)) => Err(anyhow!("target 只允许 last，收到 {target}")),
+        Some(_) => Err(anyhow!("target 必须是字符串 last")),
+        None => Err(anyhow!(
+            "要么给 target=last（撤你最近那条），要么给 message_ids（只能是 message_recall_candidates 给出的 id）"
+        )),
+    }
 }
 
 async fn sticker_list() -> Result<String> {
@@ -4979,16 +5015,52 @@ mod tests {
                 refused.content
             );
 
-            let empty = registry
+            // 两种写法都不给：明确报错，不猜（猜错方向就是撤回一条她本不想撤的）。
+            let unspecified = registry
                 .execute(
                     "message.recall",
-                    arguments(serde_json::json!({"message_ids": []})),
+                    arguments(serde_json::json!({})),
                     context.clone(),
                     ticket,
                 )
                 .await;
-            assert!(!empty.succeeded);
-            assert!(empty.content.contains("不能为空"), "{}", empty.content);
+            assert!(!unspecified.succeeded);
+            assert!(
+                unspecified.content.contains("target=last"),
+                "{}",
+                unspecified.content
+            );
+
+            // 候选为空时 target=last 也要如实拒绝（而不是撤一条不存在的）。
+            let nothing_to_recall = registry
+                .execute(
+                    "message.recall",
+                    arguments(serde_json::json!({"target": "last"})),
+                    context.clone(),
+                    ticket,
+                )
+                .await;
+            assert!(!nothing_to_recall.succeeded);
+            assert!(
+                nothing_to_recall.content.contains("没有可撤回的消息"),
+                "{}",
+                nothing_to_recall.content
+            );
+
+            let bad_target = registry
+                .execute(
+                    "message.recall",
+                    arguments(serde_json::json!({"target": "first"})),
+                    context.clone(),
+                    ticket,
+                )
+                .await;
+            assert!(!bad_target.succeeded);
+            assert!(
+                bad_target.content.contains("只允许 last"),
+                "{}",
+                bad_target.content
+            );
 
             let too_many = registry
                 .execute(
@@ -5011,7 +5083,7 @@ mod tests {
                 .execute(
                     "message.recall",
                     arguments(serde_json::json!({"message_ids": [4_243]})),
-                    context,
+                    context.clone(),
                     ticket,
                 )
                 .await;
@@ -5020,6 +5092,23 @@ mod tests {
                 without_bot.content.contains("没有可用的机器人运行时"),
                 "候选里的 id 不该被候选校验拒掉：{}",
                 without_bot.content
+            );
+
+            // 语义写法同样能过校验：`target=last` 解析到候选里最新那条（这里只有 4_243），
+            // 所以照样只卡在"没有机器人运行时"。
+            let by_target = registry
+                .execute(
+                    "message.recall",
+                    arguments(serde_json::json!({"target": "last"})),
+                    context,
+                    ticket,
+                )
+                .await;
+            assert!(!by_target.succeeded);
+            assert!(
+                by_target.content.contains("没有可用的机器人运行时"),
+                "target=last 必须解析到候选里那条：{}",
+                by_target.content
             );
         });
     }
@@ -5066,17 +5155,18 @@ mod tests {
             let called = payload
                 .tool_calls
                 .iter()
-                .map(|call| call.name.as_str())
+                .map(|call| (call.name.as_str(), call.raw_arguments.as_str()))
                 .collect::<Vec<_>>();
             println!(
                 "[live-probe] tool_calls={called:?} content={:?}",
                 payload.content.chars().take(120).collect::<String>()
             );
+            // 关键性质：她要**在第一轮就调写工具**（`message_recall`）。Core 的工具结果跟进轮
+            // 强制只读收窄，"先查候选再按 id 撤"那条路在 Core 侧走不通（线上 2026-09-15 19:00
+            // 就是这样失败的），所以只调 `message_recall_candidates` 不算通过。
             assert!(
-                called
-                    .iter()
-                    .any(|name| *name == "message_recall_candidates" || *name == "message_recall"),
-                "模型没有去够撤回工具（只拿到 {called:?}）——那她就还会回一句做不到"
+                called.iter().any(|(name, _)| *name == "message_recall"),
+                "模型第一轮没调写工具 message_recall（只拿到 {called:?}）——Core 那条路上她就撤不成"
             );
         });
     }

@@ -354,6 +354,23 @@ fn request_verb_is_inside_quote(prefix: &str) -> bool {
             )
 }
 
+/// 这条消息算不算"对她说的"——只有这种回合才把工具交到她手里。
+///
+/// 判据与 bridge 侧的 `priority` / `requested_message_count` 是同一套：**接续**
+/// （`continuation_to_agent`：她当前对话焦点里的人，没 @ 也没引用地接着说）同样算对她说的。
+/// 这里原先漏了它，于是"撤回你刚刚发的消息"这种紧接着她说的话会被当成未点名消息处理——
+/// 她照样会回复，但手里没有任何工具，只能回一句"我这边没法撤回消息"（线上 2026-09-15 19:15）。
+///
+/// 注意另外两处用的是同一套判据、但**没有**跟着改，因为语义不同、且都需要单独评估：
+/// `explicit_message_count_for_event`（显式条数）与"这一轮是否期待可见回复"。
+fn message_turn_allows_tool_call(message: &yunxi_core::MessageReceivedEvent) -> bool {
+    message.conversation_kind == ConversationKind::Direct
+        || message.addressed_to_agent
+        || message.replies_to_agent
+        || message.continuation_to_agent
+        || message.explicit_request
+}
+
 fn explicit_message_count_for_event(message: &yunxi_core::MessageReceivedEvent) -> Option<usize> {
     if !(message.conversation_kind == ConversationKind::Direct
         || message.addressed_to_agent
@@ -5627,10 +5644,7 @@ impl ModelBackend for KoviModelBackend {
                         },
                         core_message_prompt(message, sender_user_id),
                         OutgoingSource::Reply,
-                        message.conversation_kind == ConversationKind::Direct
-                            || message.addressed_to_agent
-                            || message.replies_to_agent
-                            || message.explicit_request,
+                        message_turn_allows_tool_call(message),
                     )
                 }
                 WorldEventKind::ProspectiveMemoryDue(_) => {
@@ -7625,19 +7639,19 @@ mod tests {
         interaction_state_updates_with_cues, intrinsic_autonomous_intent_prompt,
         intrinsic_fallback_is_eligible, intrinsic_output_is_unsafe, intrinsic_prompt,
         is_ambient_group_message, is_plain_text_batch_data_context, just_completed_sticker_list,
-        keeps_existing_prepared_plan, message_id_for_log, mind_context_messages,
-        mind_outgoing_fence_required, offers_sticker_tool_alone, parse_autonomous_intent_response,
-        parse_core_response, parse_direct_repair_output, parse_intrinsic_autonomous_directive,
-        parse_plain_core_response, parse_qq_conversation, plain_text_batch_message_prompt,
-        plain_text_batch_repair_context, pre_model_plan, prepared_outgoing_semantic_context,
-        purge_group_routes_from_cache, recent_conversation_messages,
-        recent_direct_conversation_messages, recent_group_conversation_messages,
-        refine_core_incoming, register_core_tool_intents, repair_context_messages,
-        reply_asks_something, reply_expected_for_incoming, reply_looks_complete,
-        reply_recovery_required, reply_text_has_semantic_content, reply_text_is_too_thin,
-        requested_message_count, route_from_lookup, route_lookup_with_fallback,
-        sanitize_autonomous_intrinsic_output, sanitize_core_plan_bubbles,
-        sanitize_intrinsic_output, sanitize_plain_text_batch_message,
+        keeps_existing_prepared_plan, message_id_for_log, message_turn_allows_tool_call,
+        mind_context_messages, mind_outgoing_fence_required, offers_sticker_tool_alone,
+        parse_autonomous_intent_response, parse_core_response, parse_direct_repair_output,
+        parse_intrinsic_autonomous_directive, parse_plain_core_response, parse_qq_conversation,
+        plain_text_batch_message_prompt, plain_text_batch_repair_context, pre_model_plan,
+        prepared_outgoing_semantic_context, purge_group_routes_from_cache,
+        recent_conversation_messages, recent_direct_conversation_messages,
+        recent_group_conversation_messages, refine_core_incoming, register_core_tool_intents,
+        repair_context_messages, reply_asks_something, reply_expected_for_incoming,
+        reply_looks_complete, reply_recovery_required, reply_text_has_semantic_content,
+        reply_text_is_too_thin, requested_message_count, route_from_lookup,
+        route_lookup_with_fallback, sanitize_autonomous_intrinsic_output,
+        sanitize_core_plan_bubbles, sanitize_intrinsic_output, sanitize_plain_text_batch_message,
         select_host_model_route_from_capability, shadow_projection_for_completed_plan,
         should_archive_raw_reply, silence_gate_plan, silence_verdict, silent_wait_plan,
         split_core_delivery_markers, split_two_short_lines, strip_core_delivery_markers,
@@ -11298,6 +11312,64 @@ mod tests {
             let empty = ReplyPlan::from_model_output(scope, "").await;
             assert!(!empty.has_visible_reply());
         });
+    }
+
+    /// 接续（她当前对话焦点里的人接着说）必须也算"对她说的"，否则那一轮她手里没有工具。
+    ///
+    /// 线上现场（2026-09-15 19:15，群 784469488）：用户没带 @，紧接着她说了一句
+    /// "撤回你刚刚发的消息"——这条按**接续**处理（`continuation_to_agent`），她照常回复了，
+    /// 但工具闸门只认 私聊/被点名/被引用/显式请求，于是 `tool_intent` 恒为 false、
+    /// 撤回工具根本没下发，她只能回一句"我这边没法撤回消息"。
+    #[test]
+    fn continuation_turns_get_tools_like_any_other_direct_turn() {
+        let event = |kind, addressed: bool, replies: bool, continuation: bool, explicit: bool| {
+            yunxi_core::MessageReceivedEvent {
+                message_id: MessageId::new(),
+                conversation_id: ConversationId::new(),
+                sender: PersonId::new(),
+                content: MessageContent::text("撤回你刚刚发的消息"),
+                reply_to: None,
+                timestamp: Utc::now(),
+                conversation_kind: kind,
+                addressed_to_agent: addressed,
+                replies_to_agent: replies,
+                continuation_to_agent: continuation,
+                stop_requested: false,
+                explicit_request: explicit,
+                visible_reply_allowed: true,
+            }
+        };
+
+        assert!(message_turn_allows_tool_call(&event(
+            ConversationKind::Group,
+            false,
+            false,
+            true,
+            false
+        )));
+        assert!(message_turn_allows_tool_call(&event(
+            ConversationKind::Group,
+            true,
+            false,
+            false,
+            false
+        )));
+        assert!(message_turn_allows_tool_call(&event(
+            ConversationKind::Direct,
+            false,
+            false,
+            false,
+            false
+        )));
+        // 群里真正的未点名消息（既没 @、也没引用、也不是接续）仍然不给工具：
+        // 别人的闲聊不该让她动手。
+        assert!(!message_turn_allows_tool_call(&event(
+            ConversationKind::Group,
+            false,
+            false,
+            false,
+            false
+        )));
     }
 
     #[test]
