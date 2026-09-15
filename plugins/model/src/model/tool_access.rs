@@ -2095,12 +2095,12 @@ async fn search_group_members(
                 group_id, query, response.status
             );
             record_mention_resolution(scope, &query, MentionResolution::LookupFailed).await;
-            return Ok(group_member_search_result(
-                &query,
-                "lookup_failed",
-                &[],
-                0,
-                None,
+            // 读不到成员列表是**失败**，不是"查到了 0 个人"：以前这里返回
+            // Ok(lookup_failed)，宿主层据此记一次工具成功（世界模型的重试结论、
+            // 成功率统计、降级判定全部跟着失真），只有模型能从正文里看出不对。
+            return Err(anyhow!(
+                "读取群成员列表失败（status={}），本次没有查到任何成员，不要据此断定群里有哪些人",
+                response.status
             ));
         }
         Err(error) => {
@@ -2109,12 +2109,8 @@ async fn search_group_members(
                 group_id, query, error
             );
             record_mention_resolution(scope, &query, MentionResolution::LookupFailed).await;
-            return Ok(group_member_search_result(
-                &query,
-                "lookup_failed",
-                &[],
-                0,
-                None,
+            return Err(anyhow!(
+                "读取群成员列表失败（{error}），本次没有查到任何成员，不要据此断定群里有哪些人"
             ));
         }
     };
