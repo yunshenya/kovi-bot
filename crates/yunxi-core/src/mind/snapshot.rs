@@ -576,6 +576,14 @@ pub struct MindSnapshotRequest {
     include_private_person_state: bool,
     limits: MindSnapshotLimits,
     influence_mode: MindInfluenceMode,
+    /// What her finished tasks have recently said about how well she finishes
+    /// them.
+    ///
+    /// Carried on the request because the runtime already builds one every turn
+    /// and the host already consumes it: the provider runs in the host, where
+    /// the self model actually lives, and this is the only thing the runtime
+    /// knows that the provider cannot see for itself.
+    self_efficacy: crate::SelfEfficacyEvidence,
 }
 
 impl MindSnapshotRequest {
@@ -645,6 +653,7 @@ impl MindSnapshotRequest {
             include_private_person_state,
             limits,
             influence_mode,
+            self_efficacy: crate::SelfEfficacyEvidence::default(),
         })
     }
 
@@ -714,6 +723,19 @@ impl MindSnapshotRequest {
     #[must_use]
     pub const fn at(&self) -> DateTime<Utc> {
         self.at
+    }
+
+    /// What her finished tasks say about how well she finishes them.
+    #[must_use]
+    pub const fn self_efficacy(&self) -> crate::SelfEfficacyEvidence {
+        self.self_efficacy
+    }
+
+    /// Attaches the runtime's self-efficacy evidence.
+    #[must_use]
+    pub const fn with_self_efficacy(mut self, self_efficacy: crate::SelfEfficacyEvidence) -> Self {
+        self.self_efficacy = self_efficacy;
+        self
     }
 
     #[must_use]

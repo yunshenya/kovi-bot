@@ -98,11 +98,13 @@ fn action_dispatch_timeout_for_elapsed(elapsed: std::time::Duration) -> std::tim
 /// Cross-task by nature: one task going badly is an incident, several is a
 /// pattern worth knowing about herself. Counts saturate — this is a signal for
 /// the self model, not an audit trail.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SelfEfficacyEvidence {
     /// Tasks that used their whole round budget without saying anything.
+    #[serde(default)]
     pub unfinished_tasks: u32,
     /// Tasks that kept repeating one failing call.
+    #[serde(default)]
     pub stuck_tasks: u32,
 }
 
@@ -2251,6 +2253,9 @@ impl CognitiveRuntime {
         ) else {
             return crate::MindSnapshot::empty();
         };
+        // The host owns the self model, so this is how the evidence of her own
+        // effectiveness reaches the place that can act on it.
+        let request = request.with_self_efficacy(self.self_efficacy);
         match timeout(mind.timeout, mind.provider.snapshot(&request)).await {
             Ok(Ok(snapshot)) => snapshot,
             Ok(Err(_)) | Err(_) => crate::MindSnapshot::empty(),

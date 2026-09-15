@@ -20,7 +20,7 @@ use yunxi_core::{
     OpenQuestionOperation, OpenQuestionStatus, OpenQuestionUpdateProposal, PlannerInput,
     Preference, PreferenceOperation, PreferenceSource, PreferenceUpdateProposal, ReflectionDepth,
     ReflectionEvent, ReflectionInput, ReflectionProposal, ReflectionQueue, ReflectionQueueConfig,
-    ReflectionTrigger, TraceContext, WorldEvent, WorldEventKind,
+    ReflectionTrigger, SelfEfficacyEvidence, TraceContext, WorldEvent, WorldEventKind,
 };
 
 const MAX_TRACKED_SCOPES: usize = 512;
@@ -474,6 +474,35 @@ impl RecentEvents {
     }
 }
 
+/// Cross-task self-efficacy evidence, as last reported by the Core runtime.
+///
+/// Counters only ever move forward: the runtime's tally saturates and never
+/// resets, so storing the maximum reported value keeps this monotone even if a
+/// snapshot request arrives out of order.
+#[derive(Debug, Default)]
+struct SelfEfficacyEvidenceCell {
+    unfinished_tasks: std::sync::atomic::AtomicU32,
+    stuck_tasks: std::sync::atomic::AtomicU32,
+}
+
+impl SelfEfficacyEvidenceCell {
+    fn observe(&self, evidence: SelfEfficacyEvidence) {
+        use std::sync::atomic::Ordering;
+        self.unfinished_tasks
+            .fetch_max(evidence.unfinished_tasks, Ordering::Relaxed);
+        self.stuck_tasks
+            .fetch_max(evidence.stuck_tasks, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> SelfEfficacyEvidence {
+        use std::sync::atomic::Ordering;
+        SelfEfficacyEvidence {
+            unfinished_tasks: self.unfinished_tasks.load(Ordering::Relaxed),
+            stuck_tasks: self.stuck_tasks.load(Ordering::Relaxed),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct MindRuntime {
     services: MindServices,
@@ -482,6 +511,12 @@ pub(crate) struct MindRuntime {
     context_services: Option<MindContextServices>,
     consolidation: Consolidation,
     reflection_queue: ReflectionQueue,
+    /// What her finished tasks have said about how well she finishes them.
+    ///
+    /// Written where the runtime hands a snapshot request over (the runtime owns
+    /// the evidence), read where the self model is actually advanced. Only ever
+    /// grows, so a quiet stretch cannot erase a pattern already noticed.
+    self_efficacy: SelfEfficacyEvidenceCell,
     barrier: RwLock<BarrierState>,
     pending_candidates: Mutex<VecDeque<PendingCandidates>>,
     outgoing_fences: Mutex<VecDeque<PendingMindFence>>,
@@ -509,6 +544,7 @@ impl MindRuntime {
             context_services: None,
             consolidation: Consolidation::new(ConsolidationConfig::default())?,
             reflection_queue: ReflectionQueue::new(ReflectionQueueConfig::default())?,
+            self_efficacy: SelfEfficacyEvidenceCell::default(),
             barrier: RwLock::new(BarrierState::default()),
             pending_candidates: Mutex::new(VecDeque::new()),
             outgoing_fences: Mutex::new(VecDeque::new()),
@@ -2514,7 +2550,12 @@ impl MindRuntime {
             return Ok(());
         };
         let weight = (input.recent_events.len() as f32 / 8.0).clamp(0.0, 1.0);
-        let consolidated = current.with_consolidated(input.requested_at, weight)?;
+        let consolidated = advance_self_model(
+            &current,
+            self.self_efficacy.snapshot(),
+            input.requested_at,
+            weight,
+        )?;
         match self
             .services
             .self_model
@@ -3002,6 +3043,9 @@ impl MindRuntime {
 impl MindSnapshotProvider for MindRuntime {
     fn snapshot<'a>(&'a self, request: &'a MindSnapshotRequest) -> MindSnapshotFuture<'a> {
         Box::pin(async move {
+            // The runtime owns this tally and hands it over on every request;
+            // keep it for the moment consolidation advances the self model.
+            self.self_efficacy.observe(request.self_efficacy());
             let barrier = self.barrier.read().await;
             if barrier.blocks_origin(request.person_id(), request.conversation_id())
                 || request
@@ -3068,6 +3112,44 @@ fn proposal_is_empty(proposal: &ReflectionProposal) -> bool {
         && proposal.interest_updates.is_empty()
         && proposal.open_question_updates.is_empty()
         && proposal.agenda_updates.is_empty()
+}
+
+/// Advances the self model with what reflection just observed and what her own
+/// finished tasks have said about her.
+///
+/// The one place experience turns into self-knowledge: consolidation nudges the
+/// traits and values, and a pattern of unfinished work becomes a limitation she
+/// can act on. Split out from the store plumbing so the rule itself is testable.
+fn advance_self_model(
+    current: &yunxi_core::SelfModel,
+    evidence: SelfEfficacyEvidence,
+    now: chrono::DateTime<chrono::Utc>,
+    weight: f32,
+) -> Result<yunxi_core::SelfModel, yunxi_core::MindValidationError> {
+    let mut model = current.with_consolidated(now, weight)?;
+    for learned in learned_limitations(evidence) {
+        // Idempotent: a limitation already stated in these words is not added
+        // again, so noticing the same pattern every day does not fill the list.
+        model = model.with_learned_limitation(now, learned)?;
+    }
+    Ok(model)
+}
+
+/// How a tally of unfinished work turns into something she knows about herself.
+///
+/// Only patterns become limitations, and only ones she can act on: "I run out of
+/// steps on things that need several of them" changes how she should behave
+/// (say so earlier, ask before promising), while "a tool errored" would not.
+/// The wording lives here rather than in Core because it is her voice.
+fn learned_limitations(evidence: SelfEfficacyEvidence) -> Vec<&'static str> {
+    let mut learned = Vec::new();
+    if evidence.unfinished_tasks >= yunxi_core::MIN_UNFINISHED_TASKS_FOR_LIMITATION {
+        learned.push("我在需要连着好几步才能办成的事情上，有时步数用光了也还没给出答复。");
+    }
+    if evidence.stuck_tasks >= yunxi_core::MIN_UNFINISHED_TASKS_FOR_LIMITATION {
+        learned.push("我在需要外部资料的时候，容易反复试同一条走不通的路。");
+    }
+    learned
 }
 
 fn mind_snapshot_signature(snapshot: &MindSnapshot) -> [u8; 32] {
@@ -3752,6 +3834,117 @@ fn is_informative_chinese_term(term: &str) -> bool {
 mod tests {
     use super::*;
     use crate::yunxi::relation_note_store::{FailingRelationNoteSink, InMemoryRelationNoteSink};
+
+    /// 只有成为模式的事才变成她对自己的认识。
+    #[test]
+    fn only_a_pattern_becomes_a_limitation() {
+        // 一件没做成是意外，不是"我不行"。
+        assert!(
+            learned_limitations(SelfEfficacyEvidence {
+                unfinished_tasks: 1,
+                stuck_tasks: 0,
+            })
+            .is_empty()
+        );
+        assert!(
+            learned_limitations(SelfEfficacyEvidence {
+                unfinished_tasks: 0,
+                stuck_tasks: 2,
+            })
+            .is_empty()
+        );
+
+        let both = learned_limitations(SelfEfficacyEvidence {
+            unfinished_tasks: yunxi_core::MIN_UNFINISHED_TASKS_FOR_LIMITATION,
+            stuck_tasks: yunxi_core::MIN_UNFINISHED_TASKS_FOR_LIMITATION,
+        });
+        assert_eq!(both.len(), 2, "两条模式各给一条：{both:?}");
+        // 措辞是可执行的自知，不是计数器的复述。
+        assert!(both.iter().all(|line| line.contains('我')));
+
+        // 一句话都不含具体工具名——Core 不知道宿主有哪些工具，自我认知也不该知道。
+        assert!(
+            both.iter()
+                .all(|line| !line.contains('_') && !line.contains('.'))
+        );
+    }
+
+    /// 这条线本身：巩固时经历真的变成了一条她对自己的认识。
+    #[test]
+    fn a_noticed_pattern_becomes_a_limitation_when_the_model_advances() {
+        use chrono::Utc;
+        let now = Utc::now();
+        let seed = yunxi_core::SelfModel::seed_yunxi(now);
+        let seeded = seed.limitations().len();
+
+        // 一件没做成：只巩固性格，不自称有局限。
+        let quiet = advance_self_model(
+            &seed,
+            SelfEfficacyEvidence {
+                unfinished_tasks: 1,
+                stuck_tasks: 0,
+            },
+            now,
+            1.0,
+        )
+        .expect("valid model");
+        assert_eq!(quiet.limitations().len(), seeded);
+        assert!(quiet.version() > seed.version(), "巩固本身照常发生");
+
+        // 成了模式：多出一条，而且是能指导行为的措辞。
+        let learned = advance_self_model(
+            &seed,
+            SelfEfficacyEvidence {
+                unfinished_tasks: yunxi_core::MIN_UNFINISHED_TASKS_FOR_LIMITATION,
+                stuck_tasks: 0,
+            },
+            now,
+            1.0,
+        )
+        .expect("valid model");
+        assert_eq!(learned.limitations().len(), seeded + 1);
+        let written = learned
+            .limitations()
+            .last()
+            .expect("a learned limitation")
+            .description()
+            .to_owned();
+        assert!(
+            written.contains("步数"),
+            "写下来的是她读得到的自知：{written}"
+        );
+
+        // 同样的模式再注意到一次，不会长第二条。
+        let again = advance_self_model(
+            &learned,
+            SelfEfficacyEvidence {
+                unfinished_tasks: yunxi_core::MIN_UNFINISHED_TASKS_FOR_LIMITATION + 5,
+                stuck_tasks: 0,
+            },
+            now,
+            1.0,
+        )
+        .expect("valid model");
+        assert_eq!(again.limitations().len(), seeded + 1);
+    }
+
+    /// 运行时的计数只会往前，转存也必须如此。
+    #[test]
+    fn the_evidence_cell_only_moves_forward() {
+        let cell = SelfEfficacyEvidenceCell::default();
+        cell.observe(SelfEfficacyEvidence {
+            unfinished_tasks: 3,
+            stuck_tasks: 1,
+        });
+        assert_eq!(cell.snapshot().unfinished_tasks, 3);
+        // 一条迟到的、更小的报告不能把已经注意到的模式抹掉。
+        cell.observe(SelfEfficacyEvidence {
+            unfinished_tasks: 1,
+            stuck_tasks: 4,
+        });
+        assert_eq!(cell.snapshot().unfinished_tasks, 3);
+        assert_eq!(cell.snapshot().stuck_tasks, 4);
+    }
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
     use yunxi_core::{
