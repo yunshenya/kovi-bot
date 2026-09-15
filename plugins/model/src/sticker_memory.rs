@@ -101,6 +101,19 @@ pub(crate) async fn initialize_database() -> Result<()> {
         .database_pool()
         .ok_or_else(|| anyhow!("PostgreSQL 记忆连接池尚未初始化"))?;
 
+    // 整段迁移放进一个事务并取建议锁：启动路径与测试二进制、重叠的两次部署都可能
+    // 同时初始化，而这里的 `DROP CONSTRAINT` + `ADD CONSTRAINT` 是一对——并发时
+    // 后到者会撞上"约束不存在"，而 `lib.rs` 对它就是 `panic!`，整个插件起不来。
+    // 同仓库 `agent_tasks.rs` 的迁移已经是这个范式。
+    let mut transaction = pool
+        .begin()
+        .await
+        .map_err(|error| anyhow!("开启表情包记忆迁移事务失败: {error}"))?;
+    query("SELECT pg_advisory_xact_lock(hashtextextended('sticker-memory:schema', 0))")
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| anyhow!("锁定表情包记忆迁移失败: {error}"))?;
+
     query(
         r#"
         CREATE TABLE IF NOT EXISTS kovi_bot_sticker_memory (
@@ -116,7 +129,7 @@ pub(crate) async fn initialize_database() -> Result<()> {
         )
         "#,
     )
-    .execute(pool)
+    .execute(&mut *transaction)
     .await
     .map_err(|error| anyhow!("创建表情包记忆表失败: {error}"))?;
 
@@ -124,13 +137,13 @@ pub(crate) async fn initialize_database() -> Result<()> {
     query(
         "ALTER TABLE kovi_bot_sticker_memory ADD COLUMN IF NOT EXISTS scope_type TEXT NOT NULL DEFAULT 'global'",
     )
-    .execute(pool)
+    .execute(&mut *transaction)
     .await
     .map_err(|error| anyhow!("迁移表情包作用域失败: {error}"))?;
     query(
         "ALTER TABLE kovi_bot_sticker_memory ADD COLUMN IF NOT EXISTS scope_id BIGINT NOT NULL DEFAULT 0",
     )
-    .execute(pool)
+    .execute(&mut *transaction)
     .await
     .map_err(|error| anyhow!("迁移表情包作用域失败: {error}"))?;
 
@@ -143,29 +156,31 @@ pub(crate) async fn initialize_database() -> Result<()> {
         ORDER BY array_position(i.indkey, a.attnum)
         "#,
     )
-    .fetch_all(pool)
+    .fetch_all(&mut *transaction)
     .await
     .map_err(|error| anyhow!("读取表情包主键失败: {error}"))?
     .into_iter()
     .map(|row| row.get::<String, _>("column_name"))
     .collect::<Vec<_>>();
     if primary_key_columns == ["sticker_key"] {
-        let mut transaction = pool.begin().await?;
-        query("ALTER TABLE kovi_bot_sticker_memory DROP CONSTRAINT kovi_bot_sticker_memory_pkey")
-            .execute(&mut *transaction)
-            .await?;
+        query(
+            "ALTER TABLE kovi_bot_sticker_memory DROP CONSTRAINT IF EXISTS kovi_bot_sticker_memory_pkey",
+        )
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| anyhow!("迁移表情包主键（删除旧约束）失败: {error}"))?;
         query(
             "ALTER TABLE kovi_bot_sticker_memory ADD CONSTRAINT kovi_bot_sticker_memory_pkey PRIMARY KEY (sticker_key, scope_type, scope_id)",
         )
         .execute(&mut *transaction)
-        .await?;
-        transaction.commit().await?;
+        .await
+        .map_err(|error| anyhow!("迁移表情包主键（建立新约束）失败: {error}"))?;
     }
 
     query(
         "CREATE INDEX IF NOT EXISTS kovi_bot_sticker_memory_updated_at_idx ON kovi_bot_sticker_memory (updated_at DESC)",
     )
-    .execute(pool)
+    .execute(&mut *transaction)
     .await
     .map_err(|error| anyhow!("创建表情包记忆索引失败: {error}"))?;
 
@@ -183,19 +198,19 @@ pub(crate) async fn initialize_database() -> Result<()> {
         )
         "#,
     )
-    .execute(pool)
+    .execute(&mut *transaction)
     .await
     .map_err(|error| anyhow!("创建表情包使用记录表失败: {error}"))?;
     query(
         "CREATE INDEX IF NOT EXISTS kovi_bot_sticker_usage_last_used_at_idx ON kovi_bot_sticker_usage (last_used_at DESC)",
     )
-    .execute(pool)
+    .execute(&mut *transaction)
     .await
     .map_err(|error| anyhow!("创建表情包使用记录索引失败: {error}"))?;
     query(
         "ALTER TABLE kovi_bot_sticker_usage ADD COLUMN IF NOT EXISTS last_candidate_attempt_at TIMESTAMPTZ",
     )
-    .execute(pool)
+    .execute(&mut *transaction)
     .await
     .map_err(|error| anyhow!("迁移表情包候选尝试时间失败: {error}"))?;
 
@@ -214,13 +229,13 @@ pub(crate) async fn initialize_database() -> Result<()> {
         )
         "#,
     )
-    .execute(pool)
+    .execute(&mut *transaction)
     .await
     .map_err(|error| anyhow!("创建表情包观察记录表失败: {error}"))?;
     query(
         "CREATE INDEX IF NOT EXISTS kovi_bot_sticker_observations_scope_idx ON kovi_bot_sticker_observations (sticker_key, scope_type, scope_id, observed_at DESC)",
     )
-    .execute(pool)
+    .execute(&mut *transaction)
     .await
     .map_err(|error| anyhow!("创建表情包观察记录索引失败: {error}"))?;
 
@@ -245,22 +260,25 @@ pub(crate) async fn initialize_database() -> Result<()> {
         )
         "#,
     )
-    .execute(pool)
+    .execute(&mut *transaction)
     .await
     .map_err(|error| anyhow!("创建表情包候选表失败: {error}"))?;
     query(
         "CREATE UNIQUE INDEX IF NOT EXISTS kovi_bot_sticker_candidates_pending_idx ON kovi_bot_sticker_candidates (sticker_key, scope_type, scope_id) WHERE status = 'pending'",
     )
-    .execute(pool)
+    .execute(&mut *transaction)
     .await
     .map_err(|error| anyhow!("创建表情包候选唯一索引失败: {error}"))?;
     query(
         "CREATE INDEX IF NOT EXISTS kovi_bot_sticker_candidates_status_idx ON kovi_bot_sticker_candidates (status, updated_at DESC)",
     )
-    .execute(pool)
+    .execute(&mut *transaction)
     .await
     .map_err(|error| anyhow!("创建表情包候选状态索引失败: {error}"))?;
-
+    transaction
+        .commit()
+        .await
+        .map_err(|error| anyhow!("提交表情包记忆迁移失败: {error}"))?;
     println!("[INFO] PostgreSQL 表情包记忆库已就绪");
     compact_expired().await?;
     Ok(())
@@ -1701,6 +1719,56 @@ pub(crate) fn with_sticker_reaction_context(text: &str, previous_bot_message: &s
 
 #[cfg(test)]
 mod tests {
+    /// 迁移必须幂等且整段在一个事务里：这里有 `DROP CONSTRAINT` + `ADD CONSTRAINT`
+    /// 一对操作，并发/重叠初始化时后到者会撞上"约束不存在"，而 `lib.rs` 对它就是
+    /// `panic!`——整个插件起不来。跑两遍就是在钉"第二遍能看到新主键、直接跳过"。
+    #[test]
+    #[ignore = "requires PostgreSQL via DATABASE_URL"]
+    fn sticker_schema_migration_is_idempotent() {
+        use sqlx_core::row::Row;
+
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                // 走全局单例：`initialize_database()` 会把连接池登记在**这个**实例上，
+                // 而表情包迁移取的是 `MEMORY_MANAGER.database_pool()`。
+                crate::memory::MEMORY_MANAGER
+                    .initialize_database()
+                    .await
+                    .expect("应初始化记忆分表并登记连接池");
+                super::initialize_database()
+                    .await
+                    .expect("第一次表情包迁移应成功");
+                super::initialize_database()
+                    .await
+                    .expect("第二次表情包迁移应幂等成功");
+
+                let pool = crate::memory::MEMORY_MANAGER
+                    .database_pool()
+                    .expect("应已登记连接池");
+                let columns: Vec<String> = sqlx_core::query::query(
+                    r#"
+                    SELECT a.attname AS column_name
+                    FROM pg_index i
+                    JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+                    WHERE i.indrelid = 'kovi_bot_sticker_memory'::regclass AND i.indisprimary
+                    ORDER BY array_position(i.indkey, a.attnum)
+                    "#,
+                )
+                .fetch_all(pool)
+                .await
+                .expect("应读到表情包表主键")
+                .into_iter()
+                .map(|row| row.get::<String, _>("column_name"))
+                .collect();
+                assert_eq!(
+                    columns,
+                    vec!["sticker_key", "scope_type", "scope_id"],
+                    "迁移后主键应当是 (sticker_key, scope_type, scope_id)"
+                );
+            });
+    }
+
     /// 引用一条**语音**消息时不能再把原始段落转储丢给模型（线上 19:38 的
     /// "你发的是文字"就是这么来的）。这里锁住识别能力本身。
     #[test]
