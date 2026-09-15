@@ -2246,7 +2246,11 @@
 
     card.append(h('div', { class: 'timeline-head' },
       h('span', { class: 'muted' },
-        `${dated} 条记忆（${first.toLocaleDateString('zh-CN', { month: 'short', year: 'numeric' })} → ${last.toLocaleDateString('zh-CN', { month: 'short', year: 'numeric' })}）`),
+        // 这一行说的是**本页**这几组覆盖的区间与条数，不是全部——以前它读起来像
+        // 全局统计（旁边的视图条又写着"共 N 条"），两处数字对不上就会让人以为
+        // 数据丢了。写清"本页"并给出全量总数。
+        `本页 ${dated} 条 · ${first.toLocaleDateString('zh-CN', { month: 'short', year: 'numeric' })} → ${last.toLocaleDateString('zh-CN', { month: 'short', year: 'numeric' })}`
+        + `（共 ${data.total} 条${data.total_is_window ? `，在最近 ${data.window} 条里统计` : ''}）`),
       h('div', { class: 'pager-btns' },
         h('div', { class: 'segmented small' },
           h('button', {
@@ -2295,6 +2299,9 @@
       rail.append(block);
     });
     card.append(rail);
+    // 时间线此前只画了当前这一页，却没有任何翻页入口（表格视图有 `renderPager`），
+    // 于是第 100 条之后的数据在这个视图里根本到不了。用同一个分页器。
+    card.append(renderPager(data));
     page.append(card);
   }
 
@@ -4410,15 +4417,31 @@
     await advanceAnnotation();
   }
 
+  /** 队列里的下一条：**按队列顺序**，不是按样本编号。
+   *
+   * 队列由后端按 `(tier, Reverse(richness), index)` 排好（标注 API 的
+   * `load_queue`），也就是说"下一条"应当是列表里的下一个，而不是编号更大的那个。
+   * 以前用 `find(item => item.index > marked)`，遇到编号更大的样本排在前面时会
+   * **往回跳**——标完 #37 跳到 #12，而列表里 #37 的下面明明是 #5。
+   */
+  function nextAnnotationSample(markedIndex) {
+    const items = annotation.items;
+    const position = items.findIndex((item) => item.index === markedIndex);
+    if (position < 0) return items[0];
+    return items[position + 1] || items[0];
+  }
+
   /** 标完一条之后：本地摘掉它并打开下一条，队列空了就重新拉一页。 */
   async function advanceAnnotation() {
     renderAnnotationSummary();
     const marked = currentAnnotationIndex();
+    // 先算出下一条再摘掉当前这条：`nextAnnotationSample` 依赖列表顺序，而摘除
+    // 之后位置会整体前移。
+    const next = nextAnnotationSample(marked);
     annotation.items = annotation.items.filter((item) => item.index !== marked);
     if (annotation.tab === 'pending') annotation.matched = Math.max(0, annotation.matched - 1);
     annotation.current = null;
-    const next = annotation.items.find((item) => item.index > marked) || annotation.items[0];
-    if (next) {
+    if (next && next.index !== marked) {
       await openAnnotationSample(next.index);
       return;
     }
@@ -4430,9 +4453,8 @@
   async function skipAnnotation() {
     const current = currentAnnotationIndex();
     if (current < 0) return;
-    const next = annotation.items.find((item) => item.index > current)
-      || annotation.items.find((item) => item.index !== current);
-    if (!next) {
+    const next = nextAnnotationSample(current);
+    if (!next || next.index === current) {
       toast('队列里没有别的样本了', 'warn');
       return;
     }
