@@ -1069,3 +1069,44 @@ QQ 那一层需要先部署（不可逆红线，未动），但整条链路上�
    `params_model_without_reply_guidance`（`3415f95`，并补了一条抓请求体的守卫用例）。用户搬走之后
    整条链才真的没有调用者，随后连同 utils 那份 `ModelPromptMode::LegacyReplyGuidance` 一起删掉
    （`967006b`）。教训记在这里：核"死代码"要核到**链条的每一个出口**，不能只看根上那个函数。
+
+### 11.11 发布记录（2026-09-15 18:27，本次迁移上线）
+
+**推送**：`986df30..e18983d`（16 个提交）推到 `origin/main`。
+
+**部署**：线上 `5ee24f9` → `e18983df`。注意这次一次性上线的是 **150 个提交**（线上落后
+`origin/main` 134 个，积压了 Mind 候选、折队/队列、表情包相册、画像情绪、提示词人格等好几个
+会话的改动），不只是本次回复协议迁移——发布前已把范围写给用户确认。
+
+- 演练：`scripts/deploy-local.sh --dry-run --require-clean` → 交叉编译 61 秒、包 14.1 MiB、
+  sha256 `8f356d81…`，未上传未切换。
+- 产物自检（照本仓库惯例按字节查，14 项全过）：新协议在（`reply_action`、工具说明、各字段说明、
+  "拒绝按猜测补全"、"reply_action 必须单独调用"），旧协议的**生产者文本**已不在
+  （旧常驻协议头、`SILENT_REPLY_OUTPUT` 那个静默常量、旧语音字段文案、旧空回复修复提示词、
+  两处旧 `[[TOOL_CALL]]` 指令）。裸标记 `[[REPLY_ACTION]]` 仍在二进制里——那是泄漏守卫
+  （`plain_reply_contains_transport_protocol`）刻意保留的，不是残留解析器。
+- 真部署：`--no-build`（复用刚自检过的那份二进制），上传 8 秒、总耗时 18 秒；
+  服务端原子切换 + readiness 通过，服务 active，启动以来 WARN/ERROR = 0，QQ 已连上。
+- 发布后按台账要求推了 `[prompt]`：线上 override 里原本没有该段（用的是主配置那份旧的两段全文，
+  新代码会把 `persona` 拼在前面 → 人格会在每轮出现两遍）。`scripts/apply-persona-config.sh --apply`
+  写入成功（`ok=True reloaded=True`，备份 `bot.conf.override.toml.bak.1789468071214`）。
+
+**发布后验收**（三条都在服务器上跑真实生产模型，只有第三条需要先修）：
+
+| 验收 | 结果 | 备注 |
+| --- | --- | --- |
+| `verify-mind-observation.sh`（窗口自 18:27） | **PASS** | 观测丢失率 0.0%（基线 46%）、超时 0、事务告警 0、WARN/ERROR 0；**但窗口里只有 1 个 Mind 事件**，样本太小，过一阵值得重跑 |
+| `verify-mind-candidates.sh` | **FAIL** | 6 个样本里只有 1 个带**能过解析器**的候选块；失败项是"候选块必须是唯一一段、且在最前面（解析器要求 `starts_with`）"——即她把块写在正文后面，解析器直接丢掉。**不是本次迁移引入的**（属另一条通道的提示词/解析器口径），未改 |
+| `verify-sticker-album.sh` | **PASS**（先修脚本，`9ef5a1a`） | 条件四 3/3：宿主链路**通过 `reply_action` 的 `sticker` 字段**提交 `芸汐的照片`，即本次迁移后的行为；Core 链路条件一~三 3/3；对照组 3/3 仍复现旧否认 |
+
+**这次发布暴露的两个环境事实**（都不是本次改动引入的，记下来免得下次重新查）：
+
+1. `deploy-local.sh` 的本地通道**只带二进制**，配置继承自上一版 release。提示里列出了新版本模板
+   有、而继承配置缺的键（`addressed_reply_rate_limit`、`api_key`、`continuation_*`、`annotation_dir`…），
+   这些会退回默认值；要按模板重新生成配置得走 GitHub Actions 手动 dispatch。
+2. 服务器上 `models/yunxi-turngate/manifest.toml` 不存在，启动日志出现
+   `[TURNGATE] bundle 不可用 (回退 lexical+MiniMind)` —— turn gate 走的是回退路径（可用但降级）。
+
+**回滚**：上一版 release 仍在服务器上，把 `current` 指回去再重启即可——
+`ln -sfn /home/ubuntu/kovi-bot/releases/5ee24f9bf45762f6dabde56b92d522e86db3e35a /home/ubuntu/kovi-bot/current`
+`&& sudo systemctl restart kovi-bot.service`（发布脚本在 readiness 不通过时也会自动做这一步）。
