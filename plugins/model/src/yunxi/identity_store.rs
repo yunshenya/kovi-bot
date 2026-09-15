@@ -1208,6 +1208,12 @@ impl PostgresIdentityStore {
         }
         let rows = match pool.begin().await {
             Ok(mut transaction) => {
+                // 与 `save_world` 取同一把锁：否则"擦除已提交、快照还在路上"会让
+                // 刚删掉的人被整表重写写回来。
+                if let Err(error) = super::schema::lock_world_snapshot(&mut transaction).await {
+                    eprintln!("[WARN] 世界模型擦除无法取得快照锁，身份数据已删除: {error}");
+                    return 0;
+                }
                 match super::world_model_store::PostgresWorldModelStore::delete_person_domain_rows(
                     &mut transaction,
                     person_id,

@@ -14,3 +14,23 @@ pub(super) async fn lock(transaction: &mut Transaction<'_, Postgres>) -> anyhow:
         .await?;
     Ok(())
 }
+
+/// Serialize world-snapshot rewrites against world data erasure.
+///
+/// `save_world` rewrites seven tables from an in-memory snapshot; erasure deletes
+/// one person's or one conversation's rows. They used to run in different
+/// transactions under different locks (the snapshot even shared the DDL gate, so
+/// every save also blocked migrations), which left "erasure committed, snapshot
+/// still on its way in" as a real window. Both sides now take this one lock, so
+/// the DB-level critical sections are mutually exclusive; a snapshot write no
+/// longer holds up schema work either.
+pub(super) async fn lock_world_snapshot(
+    transaction: &mut Transaction<'_, Postgres>,
+) -> anyhow::Result<()> {
+    query(
+        "SELECT pg_advisory_xact_lock(hashtext('kovi-bot'), hashtext('yunxi-world-snapshot-v1'))",
+    )
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}

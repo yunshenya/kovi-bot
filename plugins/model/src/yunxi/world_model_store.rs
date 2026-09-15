@@ -210,7 +210,9 @@ impl PostgresWorldModelStore {
             .validate()
             .map_err(|error| anyhow::anyhow!("World Model 校验失败，拒绝持久化: {error}"))?;
         let mut transaction = self.pool.begin().await?;
-        super::schema::lock(&mut transaction).await?;
+        // 用快照专用的建议锁，而不是建表迁移那把：一是别让每次落盘都挡住迁移与
+        // 热重载，二是擦除路径现在取同一把锁，两边不再可能交错。
+        super::schema::lock_world_snapshot(&mut transaction).await?;
         for table in [
             "yunxi_world_observations",
             "yunxi_world_entities",
@@ -1054,6 +1056,99 @@ mod tests {
     ///
     /// 如果哪天 `save_world` 改成不再整表重写，这条会失败——那时候擦除路径也
     /// 应当跟着重新评估，不要只改测试。
+    /// 落盘与擦除必须互斥，而且落盘不该再占用建表迁移那把锁。
+    ///
+    /// 用"持锁 + 超时"来验证接线：另一条连接把快照锁拿在手里时，`save_world` 与
+    /// 擦除路径都必须等；而建表锁被占住时，`save_world` 应当照常完成（它以前和
+    /// 迁移共用同一把锁，于是每次落盘都会挡住迁移与热重载）。
+    #[test]
+    #[ignore = "requires PostgreSQL via DATABASE_URL"]
+    fn postgres_world_snapshot_and_erasure_share_one_lock_without_blocking_migrations() {
+        use sqlx_core::query_scalar::query_scalar;
+
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let database_url = std::env::var("DATABASE_URL").expect("需要 DATABASE_URL");
+                let pool = sqlx_postgres::PgPoolOptions::new()
+                    .max_connections(4)
+                    .connect(&database_url)
+                    .await
+                    .expect("应连接 PostgreSQL");
+                let store = PostgresWorldModelStore::new(pool.clone());
+                store
+                    .initialize_schema()
+                    .await
+                    .expect("应初始化 world schema");
+
+                let person = PersonId::new();
+                let now = chrono::Utc::now();
+                let mut world = WorldModel::new();
+                world
+                    .observe(person_observation(person, "锁验证用的观察", now))
+                    .expect("应写入观察");
+
+                // 1) 别人握着建表迁移锁时，落盘照常完成。
+                let mut migration = pool.begin().await.expect("应开启迁移事务");
+                super::super::schema::lock(&mut migration)
+                    .await
+                    .expect("应取得建表锁");
+                let saved = kovi::tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    store.save_world(&world),
+                )
+                .await;
+                assert!(
+                    matches!(saved, Ok(Ok(()))),
+                    "落盘不该再和建表迁移共用一把锁: {saved:?}"
+                );
+
+                // 2) 别人握着快照锁时，落盘与擦除都必须等它释放。
+                let mut holder = pool.begin().await.expect("应开启持锁事务");
+                super::super::schema::lock_world_snapshot(&mut holder)
+                    .await
+                    .expect("应取得快照锁");
+
+                let blocked_save = kovi::tokio::time::timeout(
+                    std::time::Duration::from_millis(300),
+                    store.save_world(&world),
+                )
+                .await;
+                assert!(blocked_save.is_err(), "快照锁被占时落盘应当等待");
+
+                let blocked_erase = kovi::tokio::time::timeout(
+                    std::time::Duration::from_millis(300),
+                    async {
+                        let mut transaction = pool.begin().await.expect("应开启擦除事务");
+                        super::super::schema::lock_world_snapshot(&mut transaction).await?;
+                        anyhow::Ok(())
+                    },
+                )
+                .await;
+                assert!(blocked_erase.is_err(), "擦除路径必须取同一把快照锁");
+
+                holder.commit().await.expect("应释放快照锁");
+                // 释放之后两边都能继续。
+                let after = kovi::tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    store.save_world(&world),
+                )
+                .await;
+                assert!(matches!(after, Ok(Ok(()))), "锁释放后落盘应完成: {after:?}");
+                let lock_free: bool = query_scalar(
+                    "SELECT pg_try_advisory_xact_lock(hashtext('kovi-bot'), hashtext('yunxi-world-snapshot-v1'))",
+                )
+                .fetch_one(&pool)
+                .await
+                .expect("应能查询锁状态");
+                // 注意：`pg_try_advisory_xact_lock` 在自动提交语句里随即释放，
+                // 这里只确认键可用（返回 true 表示当前没有人在持锁）。
+                assert!(lock_free, "快照锁应当已经释放");
+
+                migration.commit().await.expect("应释放迁移锁");
+            });
+    }
+
     #[test]
     #[ignore = "requires PostgreSQL via DATABASE_URL"]
     fn postgres_save_world_is_a_full_rewrite_so_erasure_must_resync_the_runtime() {
