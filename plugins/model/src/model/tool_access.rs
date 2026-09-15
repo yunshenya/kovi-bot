@@ -1125,31 +1125,13 @@ impl ToolRegistry {
             })
     }
 
-    /// 工具结果跟进轮的档位。
+    /// 档位现在由 Core 判断（`PlannerInput::effect_ceiling`），宿主只照着它下发。
     ///
-    /// 旧口径是"任何工具结果之后一律只读"，那让"查一下再提醒我""看看群里谁在、再 @ 他"
-    /// 这类多轮任务在 Core 侧结构上做不了——Core 的跟进轮由这一档硬拦（Host 那条 ReAct
-    /// 循环能自己按工具名判断）。新口径按**结果来源**放：宿主自己算出来的结果可以继续全量；
-    /// 结果里可能夹别人写的字、或这次调用**失败**（失败详情常夹远端原文）时，只放开只读与
-    /// 只影响本人的写（提醒、个人记忆、撤回她自己刚发的消息），以她的身份对外发言或改动
-    /// 共享状态仍然挡住。
-    pub(crate) fn follow_up_allowance(&self, operation: &str, succeeded: bool) -> ToolAllowance {
-        if !succeeded {
-            return ToolAllowance::UserScoped;
-        }
-        match self
-            .definitions
-            .iter()
-            .find(|definition| definition.name == operation)
-        {
-            Some(definition) if !definition.source.result_may_carry_foreign_text() => {
-                ToolAllowance::Full
-            }
-            // 不认识的工具名（旧台账、跨版本事件）一律按保守档。
-            _ => ToolAllowance::UserScoped,
-        }
-    }
-
+    /// 这里保留的是**每个档位对应的提示词**：档位收窄时把清单和指令一起收窄，
+    /// 免得她把一个这一轮不会执行的工具当成可用。旧口径是"任何工具结果之后一律
+    /// 只读"，那让"查一下再提醒我"这类多轮任务结构上做不了；新口径按结果来源与
+    /// 失败情况分档，判据在 Core（`effect_ceiling_for`）。
+    ///
     /// Build the native function-calling instruction. The model no longer
     /// writes a text protocol: it must issue provider-native function calls
     /// (and may keep doing so across tool-result rounds until the request is
@@ -4873,72 +4855,6 @@ mod tests {
     /// 这条判据替代了旧口径"任何工具结果之后一律只读"：宿主自己算出来的结果之后，
     /// "查一下再提醒我""看看有没有过期的再处理"这类多轮任务必须还能做完；结果里可能夹
     /// 别人写的字时，只放开只读与只影响本人的写。
-    #[test]
-    fn follow_up_allowance_follows_the_preceding_results_trustworthiness() {
-        let registry = ToolRegistry {
-            definitions: vec![
-                ToolDefinition {
-                    name: "time.now".to_string(),
-                    description: "current time".to_string(),
-                    input_schema: json!({"type": "object"}),
-                    source: ToolSource::Builtin(BuiltinTool::TimeNow),
-                },
-                ToolDefinition {
-                    name: "sticker.list".to_string(),
-                    description: "sticker labels".to_string(),
-                    input_schema: json!({"type": "object"}),
-                    source: ToolSource::Builtin(BuiltinTool::StickerList),
-                },
-                ToolDefinition {
-                    name: "web.search".to_string(),
-                    description: "search".to_string(),
-                    input_schema: json!({"type": "object"}),
-                    source: ToolSource::Builtin(BuiltinTool::WebSearch),
-                },
-                ToolDefinition {
-                    name: "memory.search".to_string(),
-                    description: "search memory".to_string(),
-                    input_schema: json!({"type": "object"}),
-                    source: ToolSource::Builtin(BuiltinTool::MemorySearch),
-                },
-                ToolDefinition {
-                    name: "group.members.search".to_string(),
-                    description: "search members".to_string(),
-                    input_schema: json!({"type": "object"}),
-                    source: ToolSource::Builtin(BuiltinTool::GroupMemberSearch),
-                },
-            ],
-            timeout: Duration::from_secs(1),
-            max_result_chars: 1_000,
-        };
-
-        // 宿主自己算出来的结果：跟进轮仍然是全量档。
-        for trusted in ["time.now", "sticker.list"] {
-            assert_eq!(
-                registry.follow_up_allowance(trusted, true),
-                ToolAllowance::Full,
-                "{trusted} 的结果是宿主自己的数据，不该收窄"
-            );
-        }
-        // 结果里可能夹别人写的字：收窄到只读 + 只影响本人的写。
-        for untrusted in ["web.search", "memory.search", "group.members.search"] {
-            assert_eq!(
-                registry.follow_up_allowance(untrusted, true),
-                ToolAllowance::UserScoped,
-                "{untrusted} 的结果可能被注入，必须收窄"
-            );
-        }
-        // 失败详情里常夹远端返回的原文，所以可信工具失败也要收窄。
-        assert_eq!(
-            registry.follow_up_allowance("time.now", false),
-            ToolAllowance::UserScoped
-        );
-        // 不认识的名字（旧台账、跨版本事件）一律保守。
-        assert_eq!(
-            registry.follow_up_allowance("something.unknown", true),
-            ToolAllowance::UserScoped
-        );
-    }
 
     #[test]
     fn core_follow_up_execution_rejects_side_effect_before_argument_validation() {

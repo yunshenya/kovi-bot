@@ -5169,25 +5169,22 @@ fn core_tool_allowance(
     sticker_only_turn: bool,
 ) -> tool_access::ToolAllowance {
     use tool_access::ToolAllowance;
+    // 档位由 Core 判断（它手里才有"这个任务吃过什么、上一步怎么失败的"），
+    // 宿主只是照着它决定下发什么。以前宿主自己算一份，两份规则长得像但不
+    // 一样（例如"任何工具失败后一律收窄" vs "结果可能含外人文字才收窄"），
+    // 于是**下发给她的工具集**和**真正会执行的工具集**可以不一致。
+    //
+    // 只剩一个宿主自己的判断：只因"她可能想发图"才带 `sticker.list` 的回合。
+    // 那不是信任判断，是**这一轮只打算给她一个只读工具**的下发决定，Core
+    // 看不到也不该看到。
     if sticker_only_turn {
         return ToolAllowance::ReadOnly;
     }
-    let operation = match input.event.kind() {
-        WorldEventKind::ToolCompleted(tool) if tool.requires_follow_up => {
-            Some((&tool.operation, true))
-        }
-        WorldEventKind::ToolFailed(tool) if tool.requires_follow_up => {
-            Some((&tool.operation, false))
-        }
-        _ => None,
-    };
-    let Some((operation, succeeded)) = operation else {
-        return ToolAllowance::Full;
-    };
-    // 注册表不可用时按保守档：宁可这一轮做不了写，也不要在拿不准来源的情况下放开。
-    tool_registry()
-        .map(|registry| registry.follow_up_allowance(operation, succeeded))
-        .unwrap_or(ToolAllowance::UserScoped)
+    match input.effect_ceiling {
+        yunxi_core::EffectScope::ReadOnly => ToolAllowance::ReadOnly,
+        yunxi_core::EffectScope::UserScoped => ToolAllowance::UserScoped,
+        yunxi_core::EffectScope::Outbound => ToolAllowance::Full,
+    }
 }
 
 /// Keep the first Intrinsic release deliberately narrow. Possessing the
@@ -12727,64 +12724,44 @@ mod tests {
     }
 
     #[test]
-    fn core_tool_allowance_narrows_follow_ups_and_sticker_only_turns() {
+    fn the_offered_allowance_follows_cores_ceiling() {
         use crate::model::tool_access::ToolAllowance;
 
-        let runtime = kovi::tokio::runtime::Runtime::new().expect("test runtime");
-        runtime.block_on(async {
-            let conversation_id = ConversationId::new();
-            let follow_up = |kind: WorldEventKind| {
-                PlannerInput::new(
-                    WorldEvent::new(
-                        Utc::now(),
-                        EventScope::Conversation { conversation_id },
-                        EventPriority::High,
-                        kind,
-                    ),
-                    PlannerStateSnapshot::empty(),
-                )
-            };
+        let message = message_input(PersonId::new(), true);
+        // 只因"她可能想发图"才带 `sticker.list` 的回合：下发决定，不是信任判断。
+        assert_eq!(
+            core_tool_allowance(&message, true),
+            ToolAllowance::ReadOnly,
+            "sticker-only 回合只有那一个只读工具"
+        );
 
-            // 只因"她可能想发图"才带 `sticker.list` 的普通回合：只有那一个只读工具。
-            let message = message_input(PersonId::new(), true);
-            assert_eq!(
-                core_tool_allowance(&message, true),
-                ToolAllowance::ReadOnly,
-                "sticker-only 回合必须按只读档"
-            );
-            assert_eq!(
-                core_tool_allowance(&message, false),
-                ToolAllowance::Full,
-                "普通首轮是全量档"
-            );
-
-            // 工具结果跟进轮**绝不会**回到全量档。可信来源具体放到哪一档由注册表判
-            // （`tool_access::follow_up_allowance`）；测试进程里注册表没初始化，此时按
-            // 保守的 `UserScoped` 兜底——这条断言同时守住"注册表拿不到时也绝不放全量"。
-            let completed = follow_up(WorldEventKind::ToolCompleted(
-                yunxi_core::ToolCompletedEvent {
-                    operation: "time.now".to_string(),
-                    output: "2026-09-15T10:00:00+08:00".to_string(),
-                    requires_follow_up: true,
-                },
-            ));
-            assert_eq!(
-                core_tool_allowance(&completed, false),
-                ToolAllowance::UserScoped,
-                "注册表不可用时的跟进轮必须按保守档"
-            );
-            let failed = follow_up(WorldEventKind::ToolFailed(yunxi_core::ToolFailedEvent {
-                operation: "time.now".to_string(),
-                error_category: "internal".to_string(),
-                detail: "boom".to_string(),
-                requires_follow_up: true,
-            }));
-            assert_eq!(
-                core_tool_allowance(&failed, false),
-                ToolAllowance::UserScoped,
-                "工具失败详情可能夹远端原文，一律按不可信处理"
-            );
-        });
+        // 其余全部照 Core 的 ceiling 走：**下发给她的**和**会真正执行的**是同一个判断。
+        let with_ceiling = |ceiling: yunxi_core::EffectScope| {
+            PlannerInput::new(
+                WorldEvent::new(
+                    Utc::now(),
+                    EventScope::Conversation {
+                        conversation_id: ConversationId::new(),
+                    },
+                    EventPriority::High,
+                    WorldEventKind::IdleTick,
+                ),
+                PlannerStateSnapshot::empty(),
+            )
+            .with_effect_ceiling(ceiling)
+        };
+        assert_eq!(
+            core_tool_allowance(&with_ceiling(yunxi_core::EffectScope::Outbound), false),
+            ToolAllowance::Full
+        );
+        assert_eq!(
+            core_tool_allowance(&with_ceiling(yunxi_core::EffectScope::UserScoped), false),
+            ToolAllowance::UserScoped
+        );
+        assert_eq!(
+            core_tool_allowance(&with_ceiling(yunxi_core::EffectScope::ReadOnly), false),
+            ToolAllowance::ReadOnly
+        );
     }
 
     #[test]

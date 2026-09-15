@@ -1064,11 +1064,25 @@ impl CognitiveRuntime {
     /// speak in her name or change shared state on the strength of that
     /// material. Every other task is unrestricted.
     fn effect_ceiling_for(&self, root: EventId) -> crate::EffectScope {
+        // Reading somebody else's words is the strongest reason to be careful:
+        // from then on this task may still read and may still change its own
+        // person's state, but it must not act outward on the strength of text
+        // it did not write.
         if self.foreign_text_roots.contains(&root) {
-            crate::EffectScope::UserScoped
-        } else {
-            crate::EffectScope::Outbound
+            return crate::EffectScope::UserScoped;
         }
+        // A step that just failed is a weaker but real reason: one failure is
+        // not a pattern, but the next step should not be an outward one. A
+        // duplicate of an already-succeeded call is not a failure, and the
+        // working memory records outcomes, not attempts.
+        if self
+            .working_memory
+            .get(&root)
+            .is_some_and(|memory| memory.latest_attempt_failed())
+        {
+            return crate::EffectScope::UserScoped;
+        }
+        crate::EffectScope::Outbound
     }
 
     /// Registers what a plan says should happen after this turn.
@@ -1732,6 +1746,11 @@ impl CognitiveRuntime {
         let mut due_terminal_non_success = false;
         let mut actions = Vec::with_capacity(plan.intents.len());
         let mut feedback = Vec::new();
+        // Fixed for the whole round, and computed before any of this round's
+        // intents run: a plan is one step, so it is judged as one step. Letting
+        // a failure inside the round narrow the round would refuse the sibling
+        // intents a plan deliberately batched together.
+        let round_effect_ceiling = self.effect_ceiling_for(planner_event.trace().root_event_id());
         let mut tool_follow_up_events = Vec::new();
         let mut selected_action = None;
         let action_dispatch_started = std::time::Instant::now();
@@ -1800,7 +1819,7 @@ impl CognitiveRuntime {
             // already refused anything the host never declared.
             if let crate::ProposedAction::UseTool(tool) = &proposed
                 && let Some(effect) = arbiter.config().capabilities.effect_of(&tool.tool_name)
-                && effect > self.effect_ceiling_for(planner_event.trace().root_event_id())
+                && effect > round_effect_ceiling
             {
                 let result = ActionResult::Rejected(crate::ActionRejection::Unauthorized {
                     action_id: proposed.action_id(),
@@ -2101,6 +2120,7 @@ impl CognitiveRuntime {
             .unwrap_or_default();
         // Read before `event` is moved into the input below.
         let event_for_notes = event.clone();
+        let effect_ceiling = self.effect_ceiling_for(event.trace().root_event_id());
         PlannerInput::new(
             event,
             PlannerStateSnapshot::new(self.state.global_version(), conversation),
@@ -2108,6 +2128,7 @@ impl CognitiveRuntime {
         .with_executive(self.executive.snapshot_for_scope(&executive_scope))
         .with_working_memory(working_memory)
         .with_expectation_notes(self.expectation_notes_for(&event_for_notes))
+        .with_effect_ceiling(effect_ceiling)
     }
 
     /// Builds a planner input and opportunistically hydrates bounded durable
@@ -4356,6 +4377,26 @@ mod tests {
         );
     }
 
+    /// Fails every tool, so the round's ceiling is narrowed afterwards.
+    struct FailingToolPort;
+
+    impl ActionPort for FailingToolPort {
+        fn execute<'a>(&'a self, action: &'a crate::ProposedAction) -> crate::ActionPortFuture<'a> {
+            Box::pin(async move {
+                match action {
+                    crate::ProposedAction::UseTool(tool) => {
+                        Ok(crate::ActionPortOutcome::ToolFailed {
+                            operation: tool.tool_name.clone(),
+                            error_category: "network".to_owned(),
+                            detail: "timeout".to_owned(),
+                        })
+                    }
+                    _ => Err(crate::ActionPortError::new("unsupported", false)),
+                }
+            })
+        }
+    }
+
     /// Answers whichever conversation it was addressed in, and declares that it
     /// will wait for a reply.
     struct PlainReporterModel {
@@ -4407,6 +4448,43 @@ mod tests {
             let _ = action;
             Box::pin(async { Err(crate::ActionPortError::new("unsupported", false)) })
         }
+    }
+
+    /// One failing step narrows the *next* round, and the whole round keeps one
+    /// ceiling so a plan's sibling intents are judged together.
+    #[tokio::test]
+    async fn a_failed_step_narrows_the_rounds_that_follow() {
+        let conversation_id = ConversationId::new();
+        let (_handle, mut runtime) = CognitiveRuntime::new_with_services(
+            RuntimeConfig::default(),
+            CoreServices::with_model(AlwaysAnotherToolModel { conversation_id }),
+        )
+        .expect("valid runtime");
+        let mut capabilities = EnvironmentCapabilities::all();
+        capabilities.actions.push(crate::ActionDescriptor::tool(
+            "web.search",
+            crate::EffectScope::ReadOnly,
+            false,
+        ));
+        let arbiter =
+            ActionArbiter::new(ActionArbiterConfig::default().with_capabilities(capabilities));
+
+        let event = direct_message(conversation_id, PersonId::new());
+        assert_eq!(
+            runtime.effect_ceiling_for(event.trace().root_event_id()),
+            crate::EffectScope::Outbound,
+            "nothing has gone wrong yet"
+        );
+        // A step fails, and the rounds after it are judged more carefully.
+        let _ = runtime
+            .process_event_with_planner_and_actions(event.clone(), &arbiter, &FailingToolPort)
+            .await
+            .expect("the round runs");
+        assert_eq!(
+            runtime.effect_ceiling_for(event.trace().root_event_id()),
+            crate::EffectScope::UserScoped,
+            "a failed step narrows the task for the rounds that follow"
+        );
     }
 
     /// The goal a task states reaches every later round, and a call that keeps

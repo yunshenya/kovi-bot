@@ -338,6 +338,28 @@ impl PlannerWorkingMemory {
         self.goal.as_deref()
     }
 
+    /// Whether the most recent tool call failed or was refused.
+    ///
+    /// A different question from [`Self::stuck_on`]: one failure is not a
+    /// pattern, but it is a reason to be careful with the next step. A refused
+    /// call counts — the host saying no is information.
+    #[must_use]
+    pub fn latest_attempt_failed(&self) -> bool {
+        self.entries
+            .iter()
+            .rev()
+            .find_map(|entry| match &entry.payload {
+                WorkingEntryPayload::Attempt(attempt) => Some(attempt),
+                WorkingEntryPayload::Observation(_) => None,
+            })
+            .is_some_and(|attempt| {
+                matches!(
+                    attempt.outcome(),
+                    WorkingAttemptOutcome::Failed { .. } | WorkingAttemptOutcome::Refused { .. }
+                )
+            })
+    }
+
     /// The trailing run of failures on one call, when it is long enough to
     /// mean the approach is not working.
     ///

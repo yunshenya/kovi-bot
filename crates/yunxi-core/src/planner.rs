@@ -770,6 +770,14 @@ pub struct PlannerInput {
     /// runs the driver's follow-up rounds.
     #[serde(default, skip_serializing_if = "PlannerWorkingMemory::is_empty")]
     pub working_memory: PlannerWorkingMemory,
+    /// The largest effect any action may have this round.
+    ///
+    /// Core derives it from what this task has already taken in and how its
+    /// last step went. The host reads it to decide what to offer, so the offered
+    /// tool set and the enforced tool set are the same judgment instead of two
+    /// near-copies that can drift apart.
+    #[serde(default)]
+    pub effect_ceiling: crate::EffectScope,
     /// What this conversation was waiting for, and how it turned out.
     ///
     /// Distinct from [`Self::working_memory`] because it is not this task's
@@ -799,6 +807,7 @@ impl PlannerInput {
             executive: ExecutiveSnapshot::default(),
             working_memory: PlannerWorkingMemory::new(),
             expectation_notes: Vec::new(),
+            effect_ceiling: crate::EffectScope::default(),
         }
     }
 
@@ -806,6 +815,13 @@ impl PlannerInput {
     #[must_use]
     pub fn with_working_memory(mut self, working_memory: PlannerWorkingMemory) -> Self {
         self.working_memory = working_memory;
+        self
+    }
+
+    /// Attaches the round's effect ceiling.
+    #[must_use]
+    pub const fn with_effect_ceiling(mut self, effect_ceiling: crate::EffectScope) -> Self {
+        self.effect_ceiling = effect_ceiling;
         self
     }
 
