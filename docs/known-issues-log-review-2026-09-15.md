@@ -454,6 +454,8 @@ for text in [
     "mind_candidates",                            # 候选协议：嵌套形状
     "正文最前面", "键名不能改也不能加",               # 候选协议：两条硬约束
     "Yunxi Mind 候选表为空",                       # 启动自检
+    "想发一张就填",                                # 宿主链路的动作字段协议
+    "清单不在提示词里：想发图时先调它拿到准确标签",     # 工具 description（新口径）
 ]:
     assert data.find(text.encode()) >= 0, text
 
@@ -462,6 +464,8 @@ for text in [
     "想发表情包：先调 sticker.list",                 # 带点的注册名，发到 provider 会 400
     "列出她现在能发的表情包标签",
     "相册里现在有这些",                             # 被删掉的常驻清单
+    "清单已在提示词里，需要复核或看全时调用",          # 反向误导的工具 description
+    "再看一眼她自己相册里现在能发的图",
     "claims_human_identity", "host_independent", "ai_driven",
 ]:
     assert data.find(text.encode()) < 0, text
@@ -515,4 +519,18 @@ for text in [
 | 批次 | revision | 结论 |
 | --- | --- | --- |
 | 第一轮（三之二之前） | `22ac38c` | 交叉编译通过、包 14.1 MiB |
-| 第二轮（三之三之后） | `400d83d` | 交叉编译 70 秒通过、包 14.2 MiB、sha256 `60eed4f7…`；产物自检（见下）全部符合；**未上传未切换** |
+| 第二轮（三之三之后） | `400d83d` | 交叉编译 70 秒通过、包 14.2 MiB、sha256 `60eed4f7…`；产物自检全部符合 |
+| 第三轮（宿主链路修完之后） | `5d872f0` | 在**干净的 `git worktree`** 里跑（不带另一会话的未提交改动），交叉编译 188 秒、包 14.2 MiB、sha256 `2e9ca0ee…`；产物自检 15 项全过 |
+
+**交叉编译的环境坑（花了十几分钟才看明白，记下来）**：直接用
+`cargo build --release --target x86_64-unknown-linux-gnu` 会失败在
+`ring` 的 build script 上——`failed to find tool "x86_64-linux-gnu-gcc"`，因为这台机器上
+**没有** Linux 交叉 C 编译器（`.cargo/config.toml` 只为 windows-gnu 和 linux-**musl** 配了
+linker）。真正能用的是 `cargo zigbuild`（`zig cc` 当编译器，见 `scripts/deploy-local.sh`
+第 54 行与 277 行），`deploy-local.sh` 自己会调它。**别用裸 `cargo build --target` 的失败
+去判断"发布坏了"**——那不是发布通道。
+
+还有个更隐蔽的副作用：裸编译时 `CC_x86_64_unknown_linux_gnu` 是空的，而它是 build script 的
+`rerun-if-env-changed` 之一，于是这次失败会把 `ring` 的指纹写成"CC=None"，下一次
+`cargo zigbuild` 就会**重编**它一次（能成功，只是多花几分钟）。想省这一下就别在发布前跑裸
+交叉编译。
