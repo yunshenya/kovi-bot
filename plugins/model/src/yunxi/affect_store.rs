@@ -114,7 +114,16 @@ impl AffectStore for PostgresAffectStore {
             state
                 .validate()
                 .map_err(|_| AffectStoreError::InvalidState)?;
-            query(
+            // `RETURNING` 回的是**库里的值**，不是入参那份快照：调用方（Core 的回合
+            // 收尾）之后会拿返回值当"当前情绪"继续用，回快照就等于把它自己写进去的
+            // 东西再确认一遍，库里被别的写者改过也看不出来。`relation_store::set` 早就
+            // 是这么做的。
+            //
+            // 未做的是"乐观判据"：`AffectState` 不带时间戳，要按 `updated_at` 比对就得
+            // 改 `AffectStore::set` 的签名（跨 crate 的接口）。当前写者只有 Core 一个，
+            // 而 Core 是单 worker 顺序处理回合的，read-modify-write 天然串行；等真的出现
+            // 第二个写者（例如 CLI 宿主与插件同时跑）时再改接口，别为不存在的并发付代价。
+            let row = query(
                 "INSERT INTO yunxi_affect_states
                     (person_id, valence, arousal, social_energy, curiosity)
                  VALUES ($1, $2, $3, $4, $5)
@@ -123,17 +132,35 @@ impl AffectStore for PostgresAffectStore {
                     arousal = EXCLUDED.arousal,
                     social_energy = EXCLUDED.social_energy,
                     curiosity = EXCLUDED.curiosity,
-                    updated_at = NOW()",
+                    updated_at = NOW()
+                 RETURNING valence, arousal, social_energy, curiosity",
             )
             .bind(person_id.into_uuid())
             .bind(f64::from(state.valence))
             .bind(f64::from(state.arousal))
             .bind(f64::from(state.social_energy))
             .bind(f64::from(state.curiosity))
-            .execute(&self.pool)
+            .fetch_one(&self.pool)
             .await
             .map_err(AffectStoreError::storage)?;
-            Ok(state)
+            let stored = AffectState {
+                valence: row
+                    .try_get::<f64, _>("valence")
+                    .map_err(AffectStoreError::storage)? as f32,
+                arousal: row
+                    .try_get::<f64, _>("arousal")
+                    .map_err(AffectStoreError::storage)? as f32,
+                social_energy: row
+                    .try_get::<f64, _>("social_energy")
+                    .map_err(AffectStoreError::storage)? as f32,
+                curiosity: row
+                    .try_get::<f64, _>("curiosity")
+                    .map_err(AffectStoreError::storage)? as f32,
+            };
+            stored
+                .validate()
+                .map_err(|_| AffectStoreError::InvalidState)?;
+            Ok(stored)
         })
     }
 }
