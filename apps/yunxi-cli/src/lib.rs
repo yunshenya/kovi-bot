@@ -926,14 +926,24 @@ struct CliTurnObserver {
 }
 
 impl CognitiveTurnObserver for CliTurnObserver {
-    fn on_turn(&mut self, _event: &WorldEvent, report: &TurnReport) {
+    fn on_turn<'a>(
+        &'a mut self,
+        _event: &'a WorldEvent,
+        report: &'a TurnReport,
+    ) -> yunxi_core::TurnHook<'a> {
         self.turns.push(report.clone());
+        Box::pin(async {})
     }
 
-    fn on_planner_error(&mut self, _event: &WorldEvent, error: &PlannerError) {
+    fn on_planner_error<'a>(
+        &'a mut self,
+        _event: &'a WorldEvent,
+        error: &'a PlannerError,
+    ) -> yunxi_core::TurnHook<'a> {
         if self.planner_error.is_none() {
             self.planner_error = Some(error.to_string());
         }
+        Box::pin(async {})
     }
 }
 

@@ -26,12 +26,11 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 use yunxi_core::{
     ActionArbiter, ActionArbiterConfig, ActionPort, ActionResult, Admission, Attachment,
-    AttachmentKind, ChannelAdapter, CognitiveIntent, CognitiveRuntime, ConversationId,
-    ConversationKind, ConversationMemberStore, ConversationTurnDirective, CoreServices,
-    EventPriority, EventScope, EventType, ExternalConversation, IdentityStore,
-    MessageCollisionDetectedEvent, MessageContent, MessageId, MessageReceivedEvent, ModelBackend,
-    OpenLoopStore, PersonId, PlannedProcessingOutcome, ProcessingOutcome, ProposedAction,
-    RelationStore, RuntimeConfig, RuntimeHandle, WorldEvent, WorldEventKind,
+    AttachmentKind, ChannelAdapter, CognitiveIntent, CognitiveRuntime, CognitiveTurnObserver,
+    ConversationId, ConversationKind, ConversationMemberStore, CoreServices, EventPriority,
+    EventScope, ExternalConversation, IdentityStore, MessageCollisionDetectedEvent, MessageContent,
+    MessageId, MessageReceivedEvent, ModelBackend, OpenLoopStore, PersonId, ProposedAction,
+    RelationStore, RuntimeConfig, RuntimeHandle, TurnHook, TurnReport, WorldEvent, WorldEventKind,
 };
 
 /// 控制面命令判断:以 # 开头的文本(禁言/授权/删除数据/状态命令等)永远
@@ -3279,17 +3278,6 @@ impl IncomingAdmissionReleaser for super::core_model::KoviModelBackend {
     }
 }
 
-async fn release_rejected_incoming(
-    event: &WorldEvent,
-    releaser: Option<&dyn IncomingAdmissionReleaser>,
-) {
-    let (Some(releaser), WorldEventKind::MessageReceived(message)) = (releaser, event.kind())
-    else {
-        return;
-    };
-    releaser.discard(message.message_id).await;
-}
-
 /// Cancellation-safe ownership for an admission while the serialized Host
 /// ingress worker resolves identities and constructs the Core event. If the
 /// worker is cancelled by its processing deadline after registering a host
@@ -3394,40 +3382,6 @@ fn autonomous_claim_is_current_for_event(event: &WorldEvent) -> bool {
     super::autonomous::claim_is_current(conversation_id, token)
 }
 
-/// A failed autonomous action should be retried when it never crossed an
-/// irreversible delivery boundary. Indeterminate delivery is intentionally
-/// terminal: replaying it could duplicate a message whose platform outcome
-/// is unknown.
-fn autonomous_action_needs_retry(actions: &[ActionResult]) -> bool {
-    actions.iter().any(|action| match action {
-        ActionResult::Executed {
-            outcome: yunxi_core::ActionPortOutcome::Deferred { .. },
-            ..
-        } => true,
-        ActionResult::Failed { error, .. } => error.retryable,
-        ActionResult::Rejected(rejection) => matches!(
-            rejection,
-            yunxi_core::ActionRejection::CapabilityUnavailable { .. }
-                | yunxi_core::ActionRejection::CooldownActive { .. }
-                | yunxi_core::ActionRejection::RateLimitExceeded { .. }
-                | yunxi_core::ActionRejection::IdempotencyStateFull { .. }
-                | yunxi_core::ActionRejection::CooldownStateFull { .. }
-                | yunxi_core::ActionRejection::Stale { .. }
-                | yunxi_core::ActionRejection::TargetUnavailable { .. }
-                | yunxi_core::ActionRejection::DeliveryResolutionFailed { .. }
-        ),
-        ActionResult::Noop
-        | ActionResult::Executed {
-            outcome:
-                yunxi_core::ActionPortOutcome::Delivered { .. }
-                | yunxi_core::ActionPortOutcome::DeliveryIndeterminate { .. }
-                | yunxi_core::ActionPortOutcome::ToolCompleted { .. }
-                | yunxi_core::ActionPortOutcome::ToolFailed { .. },
-            ..
-        } => false,
-    })
-}
-
 /// 这一轮真正落地到 QQ 的消息号（投递结果里的 `qq-message:<id>`）。
 ///
 /// 只认 `Delivered`：撤回联动必须建立在"平台确实收了这条"之上，`Deferred` 与
@@ -3449,310 +3403,332 @@ fn delivered_qq_message_ids(actions: &[ActionResult]) -> Vec<i32> {
         .collect()
 }
 
-fn autonomous_tick_should_retry(
-    actions: &[ActionResult],
-    delivered: bool,
-    directive: Option<ConversationTurnDirective>,
-) -> bool {
-    if delivered {
-        return false;
-    }
-    // Action results are stronger evidence than the model's directive. A
-    // deferred/retryable result means the proposed message never crossed the
-    // side-effect boundary and should get another bounded attempt.
-    if !actions.is_empty() {
-        return autonomous_action_needs_retry(actions);
-    }
-    // A Continue directive without a visible action means the planner/model
-    // decided there was another thought but failed to materialize it. Keep a
-    // bounded retry for that explicit signal. A missing/Wait/End directive is
-    // a legitimate silent turn and must not become a hot loop.
-    directive == Some(ConversationTurnDirective::Continue)
-}
-
 async fn run_runtime(
     mut runtime: CognitiveRuntime,
     action_arbiter: Option<Arc<ActionArbiter>>,
     action_port: Option<Arc<dyn ActionPort>>,
     incoming_releaser: Option<Arc<dyn IncomingAdmissionReleaser>>,
 ) {
-    let planned = runtime.planner().is_some();
-    if planned
-        && let (Some(arbiter), Some(port)) = (action_arbiter.as_deref(), action_port.as_deref())
-    {
-        while let Some((event, outcome)) = {
-            super::refresh_executive_capability();
-            // Core 是文本聊天的**正式回复路径**，但它由这条独立循环消费事件，
-            // 所以不在私聊/群聊那些入口的标签范围内——线上的 purpose=unlabeled
-            // 就是它。打上标签，`#llm-trace` 才分得清"谁在调模型"。
-            crate::model::llm_trace::with_purpose(
-                "core_reply",
-                runtime.process_next_with_planner_and_actions_with_event_and_guard(
-                    arbiter,
-                    port,
-                    &autonomous_claim_is_current_for_event,
-                ),
-            )
-            .await
-        } {
-            match outcome {
-                Ok(PlannedProcessingOutcome::Planned {
-                    observation,
-                    plan,
-                    actions,
+    // Core 是文本聊天的**正式回复路径**，但它由这条独立循环消费事件，
+    // 所以不在私聊/群聊那些入口的标签范围内。标签设在**最外层**：驱动
+    // 内部的每一次模型调用（首轮与每个工具跟进轮）都归到 `core_reply`。
+    crate::model::llm_trace::with_purpose(
+        "core_reply",
+        drive_core(
+            &mut runtime,
+            action_arbiter.as_deref(),
+            action_port.as_deref(),
+            incoming_releaser.as_deref(),
+        ),
+    )
+    .await;
+}
+
+/// Drives Core's cycle with the host's delivery, memory, and lease bookkeeping.
+///
+/// The loop topology, turn classification, and autonomous retry decision all
+/// live in `yunxi_core::driver`; this type only answers the questions only the
+/// Kovi host can answer.
+async fn drive_core(
+    runtime: &mut CognitiveRuntime,
+    action_arbiter: Option<&ActionArbiter>,
+    action_port: Option<&dyn ActionPort>,
+    incoming_releaser: Option<&dyn IncomingAdmissionReleaser>,
+) {
+    let mut observer = KoviCoreObserver {
+        incoming_releaser,
+        action_port,
+    };
+    match (action_arbiter, action_port) {
+        (Some(arbiter), Some(port)) => {
+            yunxi_core::run(runtime, arbiter, port, &mut observer).await;
+        }
+        // A compatibility host without a planner/action adapter observes
+        // events without ever producing a continuation.
+        _ => {
+            yunxi_core::run_observed(runtime, &mut observer).await;
+        }
+    }
+}
+
+/// The Kovi host's side of Core's driver.
+struct KoviCoreObserver<'a> {
+    incoming_releaser: Option<&'a dyn IncomingAdmissionReleaser>,
+    /// Absent only on a compatibility bridge, which has no action boundary and
+    /// therefore cannot honour a continuation.
+    action_port: Option<&'a dyn ActionPort>,
+}
+
+impl KoviCoreObserver<'_> {
+    /// Releases the exact host admission carried by a visible message.
+    ///
+    /// Core consumes the event even when its turn is refused, so without this
+    /// the conversation stays marked active and later replies are suppressed
+    /// behind a phantom turn.
+    async fn release_incoming(&self, event: &WorldEvent) {
+        let (Some(releaser), WorldEventKind::MessageReceived(message)) =
+            (self.incoming_releaser, event.kind())
+        else {
+            return;
+        };
+        releaser.discard(message.message_id).await;
+    }
+}
+
+impl CognitiveTurnObserver for KoviCoreObserver<'_> {
+    fn should_process(&self, event: &WorldEvent) -> bool {
+        // Core asks this before dispatching, so a superseded autonomous claim
+        // never has its turn completed.
+        autonomous_claim_is_current_for_event(event)
+    }
+
+    fn before_turn(&mut self) -> TurnHook<'_> {
+        super::refresh_executive_capability();
+        Box::pin(async {})
+    }
+
+    fn on_turn<'a>(&'a mut self, event: &'a WorldEvent, report: &'a TurnReport) -> TurnHook<'a> {
+        Box::pin(self.on_turn_inner(event, report))
+    }
+
+    fn on_planner_error<'a>(
+        &'a mut self,
+        event: &'a WorldEvent,
+        error: &'a yunxi_core::PlannerError,
+    ) -> TurnHook<'a> {
+        Box::pin(self.on_planner_error_inner(event, error))
+    }
+
+    fn on_turn_end(&mut self) -> TurnHook<'_> {
+        Box::pin(persist_executive_after_turn())
+    }
+}
+
+impl KoviCoreObserver<'_> {
+    /// Applies Core's verdict to the host's delivery, memory, and lease state.
+    async fn on_turn_inner(&mut self, event: &WorldEvent, report: &TurnReport) {
+        match &report.outcome {
+            yunxi_core::TurnOutcome::Planned { plan, actions } => {
+                if let Some(observation) = report.observed.as_ref() {
+                    kovi::log::debug!(
+                        "Yunxi Core event observed: id={} type={:?} scope={:?} priority={:?} attention={:?} state={:?}",
+                        observation.event_id,
+                        observation.event_type,
+                        observation.scope,
+                        observation.priority,
+                        observation.attention,
+                        observation.state,
+                    );
+                }
+                // A compatibility bridge without a planner/action adapter
+                // cannot deliver a continuation. Do not leave its host claim
+                // leased until the timeout.
+                if self.action_port.is_none() && report.autonomous_tick {
+                    release_autonomous_claim_for_event(event);
+                }
+                self.record_planned(event, report, plan, actions).await;
+            }
+            yunxi_core::TurnOutcome::Cancelled => {
+                // The claim was superseded mid-turn; the host released the
+                // event it carried. Anything this turn already delivered is
+                // still recorded so it is not mistaken for silence.
+                if report.autonomous_tick {
+                    release_autonomous_claim_for_event(event);
+                }
+                self.release_incoming(event).await;
+                kovi::log::info!(
+                    "Yunxi Core turn cancelled before completion: event_id={} delivered={}",
+                    event.id(),
+                    report.delivered_replies.len(),
+                );
+                let _ = report;
+            }
+            yunxi_core::TurnOutcome::InvalidEvent | yunxi_core::TurnOutcome::InvalidState => {
+                // A rejection can be caused by a transient queue or
+                // persistence race. Use the same bounded retry path as a
+                // planner error; an invalid autonomous event still suspends
+                // after the retry budget is exhausted.
+                retry_autonomous_claim_for_event(event);
+                self.release_incoming(event).await;
+                kovi::log::warn!("Yunxi Core rejected an event");
+            }
+        }
+    }
+
+    async fn on_planner_error_inner(
+        &mut self,
+        event: &WorldEvent,
+        error: &yunxi_core::PlannerError,
+    ) {
+        if let Some(conversation_id) = autonomous_tick_conversation_id(event) {
+            retry_autonomous_claim_for_event(event);
+            kovi::log::warn!(
+                "Yunxi autonomous planner failure will be retried: conversation_id={} error={error}",
+                conversation_id,
+            );
+        }
+        // The runtime has consumed the event even when planning fails.
+        self.release_incoming(event).await;
+        kovi::log::error!("Yunxi Core planner failed before action outcome: {error}");
+    }
+}
+
+impl KoviCoreObserver<'_> {
+    async fn record_planned(
+        &self,
+        event: &WorldEvent,
+        report: &TurnReport,
+        plan: &yunxi_core::DecisionPlan,
+        actions: &[yunxi_core::ActionResult],
+    ) {
+        let observation = report.observed.as_ref();
+        let event_id = observation.map_or_else(|| event.id(), |observation| observation.event_id);
+        let autonomous_tick = report.autonomous_tick;
+        for (intent, action) in plan.intents.iter().zip(actions.iter()) {
+            let CognitiveIntent::SendMessage {
+                conversation_id, ..
+            } = intent
+            else {
+                continue;
+            };
+            if !matches!(
+                action,
+                yunxi_core::ActionResult::Executed {
+                    outcome: yunxi_core::ActionPortOutcome::Delivered { .. },
                     ..
-                }) => {
-                    let autonomous_tick =
-                        observation.event_type == EventType::AutonomousConversationTick;
-                    let conversation_id = observation.scope.conversation_id();
-                    let requested_directive = conversation_id.and_then(|conversation_id| {
-                        plan.state_updates.iter().find_map(|update| match update {
-                            yunxi_core::StateUpdateProposal::ConversationDirective {
-                                conversation_id: update_conversation_id,
-                                directive,
-                            } if *update_conversation_id == conversation_id => Some(*directive),
-                            _ => None,
-                        })
-                    });
-                    let mut autonomous_delivered = false;
-                    // 这一轮真正发出去的正文（多段气泡按顺序收集，之后拼成一条记忆）。
-                    let mut delivered_replies: Vec<String> = Vec::new();
-                    for (intent, action) in plan.intents.iter().zip(actions.iter()) {
-                        if let CognitiveIntent::SendMessage {
-                            conversation_id,
-                            content,
-                            ..
-                        } = intent
-                            && matches!(
-                                action,
-                                ActionResult::Executed {
-                                    outcome: yunxi_core::ActionPortOutcome::Delivered { .. },
-                                    ..
-                                }
-                            )
-                        {
-                            // 记忆里要保留"她是唱出来的还是打字的"：用
-                            // `history_text()`（语音/唱歌带前缀），而不是纯正文。
-                            let sent = content.history_text();
-                            let sent = sent.trim();
-                            if !sent.is_empty() {
-                                delivered_replies.push(sent.to_string());
-                            }
-                            if !autonomous_tick {
-                                let proactive_config = crate::config::get().proactive().clone();
-                                let effective_directive =
-                                    super::autonomous::record_outbound_with_directive(
-                                        *conversation_id,
-                                        Utc::now(),
-                                        requested_directive,
-                                        Some(&proactive_config),
-                                    );
-                                if let Some(directive) = effective_directive {
-                                    kovi::log::info!(
-                                        "Yunxi conversation continuation registered: conversation_id={conversation_id} model_directive={requested_directive:?} effective_directive={directive:?} idle_secs={}",
-                                        proactive_config.autonomous_conversation_idle_secs(),
-                                    );
-                                    if requested_directive
-                                        == Some(yunxi_core::ConversationTurnDirective::Continue)
-                                        && directive
-                                            != yunxi_core::ConversationTurnDirective::Continue
-                                    {
-                                        // 宿主请求了续聊却没有登记成功：不是模型的问题，
-                                        // 是生命周期策略把它降级了（例如上一轮还没结清、
-                                        // 或已达到 max_turns）。没有这条日志就只能靠"续聊率
-                                        // 一直是 0"反推。
-                                        kovi::log::warn!(
-                                            "Yunxi continuation request was downgraded: conversation_id={conversation_id} requested={requested_directive:?} effective={directive:?}"
-                                        );
-                                    }
-                                } else if requested_directive
-                                    == Some(yunxi_core::ConversationTurnDirective::Continue)
-                                {
-                                    kovi::log::warn!(
-                                        "Yunxi continuation request was not registered: conversation_id={conversation_id} reason=no_lifecycle_entry"
-                                    );
-                                }
-                            }
-                            if autonomous_tick {
-                                autonomous_delivered = true;
-                            }
-                        }
-                    }
-                    // 长期记忆：这一轮真的发出去了，就把「对方说的 + 她回的」写进
-                    // Memory v2（适配器会同步回旧表）。主动消息没有入站行，因此这里
-                    // 是空操作——那是已知缺口，见 docs/yunxi-memory-v2-writeback.md。
-                    // 撤回联动：这一轮在答哪条、真的发出了哪几条。群友撤回源消息时，
-                    // 她的回复要跟着撤（`handle_recalled_message` 消费这份登记）。
-                    if let Some((link_scope, source_message_ids)) =
-                        crate::model::take_core_turn_sources(observation.event_id).await
+                }
+            ) {
+                continue;
+            }
+            if !autonomous_tick {
+                let proactive_config = crate::config::get().proactive().clone();
+                let effective_directive = super::autonomous::record_outbound_with_directive(
+                    *conversation_id,
+                    Utc::now(),
+                    report.expected_directive,
+                    Some(&proactive_config),
+                );
+                if let Some(directive) = effective_directive {
+                    kovi::log::info!(
+                        "Yunxi conversation continuation registered: conversation_id={conversation_id} model_directive={:?} effective_directive={directive:?} idle_secs={}",
+                        report.expected_directive,
+                        proactive_config.autonomous_conversation_idle_secs(),
+                    );
+                    if report.expected_directive
+                        == Some(yunxi_core::ConversationTurnDirective::Continue)
+                        && directive != yunxi_core::ConversationTurnDirective::Continue
                     {
-                        let sent_message_ids = delivered_qq_message_ids(&actions);
-                        if !sent_message_ids.is_empty() {
-                            crate::model::record_core_reply_linkage(
-                                link_scope,
-                                source_message_ids,
-                                sent_message_ids,
-                            )
-                            .await;
-                        }
-                    }
-                    if let Some(writeback) = super::memory_writeback::writeback() {
-                        if !delivered_replies.is_empty() {
-                            writeback
-                                .record_delivered_turn(
-                                    observation.event_id,
-                                    &delivered_replies.join("\n"),
-                                )
-                                .await;
-                        } else {
-                            // 什么都没发出去：她读过、判了沉默的回合也留一条入站行，
-                            // 否则"读过的"一小时后消失，"没被抽样的噪声"反倒留着。
-                            // 开关与每会话护栏都在 writeback 里，这里是空操作兜底。
-                            writeback.record_silent_turn(observation.event_id).await;
-                        }
-                    }
-                    if autonomous_tick
-                        && let Some(conversation_id) = observation.scope.conversation_id()
-                    {
-                        if !autonomous_claim_is_current_for_event(&event) {
-                            kovi::log::info!(
-                                "Yunxi autonomous tick superseded before completion: event_id={} conversation_id={}",
-                                observation.event_id,
-                                conversation_id,
-                            );
-                        } else if autonomous_tick_should_retry(
-                            &actions,
-                            autonomous_delivered,
-                            requested_directive,
-                        ) {
-                            if let Some(token) = autonomous_tick_claim_token(&event) {
-                                super::autonomous::retry_claim_token(conversation_id, token);
-                            } else {
-                                super::autonomous::retry_claim(conversation_id);
-                            }
-                            kovi::log::warn!(
-                                "Yunxi autonomous turn scheduled for retry: event_id={} conversation_id={} directive={requested_directive:?} actions={:?}",
-                                observation.event_id,
-                                conversation_id,
-                                actions,
-                            );
-                        } else {
-                            let directive = match (autonomous_delivered, requested_directive) {
-                                (true, Some(directive)) => directive,
-                                (false, Some(ConversationTurnDirective::End)) => {
-                                    ConversationTurnDirective::End
-                                }
-                                _ => ConversationTurnDirective::Wait,
-                            };
-                            if let Some(token) = autonomous_tick_claim_token(&event) {
-                                super::autonomous::finish_claim_token(
-                                    conversation_id,
-                                    token,
-                                    Utc::now(),
-                                    autonomous_delivered,
-                                    directive,
-                                    crate::config::get().proactive(),
-                                );
-                            } else {
-                                super::autonomous::finish_claim(
-                                    conversation_id,
-                                    Utc::now(),
-                                    autonomous_delivered,
-                                    directive,
-                                    crate::config::get().proactive(),
-                                );
-                            }
-                        }
-                    }
-                    let has_action_failure = actions.iter().any(|action| !action.is_success());
-                    if has_action_failure {
+                        // 宿主请求了续聊却没有登记成功：不是模型的问题，
+                        // 是生命周期策略把它降级了（例如上一轮还没结清、
+                        // 或已达到 max_turns）。没有这条日志就只能靠"续聊率
+                        // 一直是 0"反推。
                         kovi::log::warn!(
-                            "Yunxi Core turn outcome: event_id={} type={:?} scope={:?} attention={:?} disposition={:?} intents={} actions={:?}",
-                            observation.event_id,
-                            observation.event_type,
-                            observation.scope,
-                            observation.attention,
-                            plan.disposition,
-                            plan.intents.len(),
-                            actions,
+                            "Yunxi continuation request was downgraded: conversation_id={conversation_id} requested={:?} effective={directive:?}",
+                            report.expected_directive,
+                        );
+                    }
+                } else if report.expected_directive
+                    == Some(yunxi_core::ConversationTurnDirective::Continue)
+                {
+                    kovi::log::warn!(
+                        "Yunxi continuation request was not registered: conversation_id={conversation_id} reason=no_lifecycle_entry"
+                    );
+                }
+            }
+        }
+        // 长期记忆：这一轮真的发出去了，就把「对方说的 + 她回的」写进
+        // Memory v2（适配器会同步回旧表）。主动消息没有入站行，因此这里
+        // 是空操作——那是已知缺口，见 docs/yunxi-memory-v2-writeback.md。
+        // 撤回联动：这一轮在答哪条、真的发出了哪几条。群友撤回源消息时，
+        // 她的回复要跟着撤（`handle_recalled_message` 消费这份登记）。
+        if let Some((link_scope, source_message_ids)) =
+            crate::model::take_core_turn_sources(event_id).await
+        {
+            let sent_message_ids = delivered_qq_message_ids(actions);
+            if !sent_message_ids.is_empty() {
+                crate::model::record_core_reply_linkage(
+                    link_scope,
+                    source_message_ids,
+                    sent_message_ids,
+                )
+                .await;
+            }
+        }
+        if let Some(writeback) = super::memory_writeback::writeback() {
+            if !report.delivered_replies.is_empty() {
+                writeback
+                    .record_delivered_turn(event_id, &report.delivered_replies.join("\n"))
+                    .await;
+            } else {
+                // 什么都没发出去：她读过、判了沉默的回合也留一条入站行，
+                // 否则"读过的"一小时后消失，"没被抽样的噪声"反倒留着。
+                // 开关与每会话护栏都在 writeback 里，这里是空操作兜底。
+                writeback.record_silent_turn(event_id).await;
+            }
+        }
+        if autonomous_tick
+            && let Some(conversation_id) = observation.and_then(|o| o.scope.conversation_id())
+        {
+            // Core already decided whether this turn earned a retry and, if
+            // not, what continuation it settled on. The host only applies it.
+            match report.autonomous {
+                Some(yunxi_core::AutonomousTurnDisposition::Retry) => {
+                    if let Some(token) = autonomous_tick_claim_token(event) {
+                        super::autonomous::retry_claim_token(conversation_id, token);
+                    } else {
+                        super::autonomous::retry_claim(conversation_id);
+                    }
+                    kovi::log::warn!(
+                        "Yunxi autonomous turn scheduled for retry: event_id={event_id} conversation_id={conversation_id} directive={:?} actions={actions:?}",
+                        report.expected_directive,
+                    );
+                }
+                Some(yunxi_core::AutonomousTurnDisposition::Finish {
+                    delivered,
+                    directive,
+                }) => {
+                    if let Some(token) = autonomous_tick_claim_token(event) {
+                        super::autonomous::finish_claim_token(
+                            conversation_id,
+                            token,
+                            Utc::now(),
+                            delivered,
+                            directive,
+                            crate::config::get().proactive(),
                         );
                     } else {
-                        // Most turns are routine ObserveOnly/Silent observations with no
-                        // action. Keep them out of the warned journal so real failures
-                        // stay visible; under RUST_LOG=info debug! is suppressed.
-                        kovi::log::debug!(
-                            "Yunxi Core turn outcome: event_id={} type={:?} scope={:?} attention={:?} disposition={:?} intents={} actions={}",
-                            observation.event_id,
-                            observation.event_type,
-                            observation.scope,
-                            observation.attention,
-                            plan.disposition,
-                            plan.intents.len(),
-                            actions.len(),
-                        );
-                    }
-                }
-                Ok(PlannedProcessingOutcome::RejectedEvent { event, .. })
-                | Ok(PlannedProcessingOutcome::RejectedState { event, .. }) => {
-                    // A planner/state rejection can be caused by a transient
-                    // queue or persistence race. Use the same bounded retry
-                    // path as a planner error; an invalid autonomous event
-                    // will still suspend after the retry budget is exhausted.
-                    retry_autonomous_claim_for_event(&event);
-                    release_rejected_incoming(&event, incoming_releaser.as_deref()).await;
-                    kovi::log::warn!("Yunxi Core planner rejected an event");
-                }
-                Err(error) => {
-                    if let Some(conversation_id) = autonomous_tick_conversation_id(&event) {
-                        retry_autonomous_claim_for_event(&event);
-                        kovi::log::warn!(
-                            "Yunxi autonomous planner failure will be retried: conversation_id={} error={error}",
+                        super::autonomous::finish_claim(
                             conversation_id,
+                            Utc::now(),
+                            delivered,
+                            directive,
+                            crate::config::get().proactive(),
                         );
                     }
-                    // The runtime has consumed the event even when planning
-                    // fails. Release the exact host admission carried by a
-                    // visible message; otherwise the conversation remains
-                    // permanently marked as active and later replies can be
-                    // suppressed behind a phantom turn.
-                    release_rejected_incoming(&event, incoming_releaser.as_deref()).await;
-                    kovi::log::error!("Yunxi Core planner failed before action outcome: {error}")
                 }
-            }
-            persist_executive_after_turn().await;
-        }
-        return;
-    }
-    while let Some((event, outcome)) = {
-        super::refresh_executive_capability();
-        runtime.process_next_with_event().await
-    } {
-        match outcome {
-            ProcessingOutcome::Observed(observation) => {
-                if autonomous_tick_conversation_id(&event).is_some() {
-                    // A compatibility bridge without planner/action support
-                    // cannot deliver a continuation. Do not leave its host
-                    // claim leased until the timeout.
-                    release_autonomous_claim_for_event(&event);
-                }
-                kovi::log::debug!(
-                    "Yunxi Core event observed: id={} type={:?} scope={:?} priority={:?} attention={:?} state={:?}",
-                    observation.event_id,
-                    observation.event_type,
-                    observation.scope,
-                    observation.priority,
-                    observation.attention,
-                    observation.state,
-                );
-            }
-            ProcessingOutcome::RejectedEvent { event, .. }
-            | ProcessingOutcome::RejectedState { event, .. } => {
-                release_autonomous_claim_for_event(&event);
-                release_rejected_incoming(&event, incoming_releaser.as_deref()).await;
-                kovi::log::warn!("Yunxi Core runtime rejected an event");
+                None => {}
             }
         }
-        persist_executive_after_turn().await;
+        let has_action_failure = actions.iter().any(|action| !action.is_success());
+        if has_action_failure {
+            kovi::log::warn!(
+                "Yunxi Core turn outcome: event_id={event_id} attention={:?} disposition={:?} intents={} actions={actions:?}",
+                observation.map(|o| o.attention),
+                plan.disposition,
+                plan.intents.len(),
+            );
+        } else {
+            // Most turns are routine ObserveOnly/Silent observations with no
+            // action. Keep them out of the warned journal so real failures
+            // stay visible; under RUST_LOG=info debug! is suppressed.
+            kovi::log::debug!(
+                "Yunxi Core turn outcome: event_id={event_id} attention={:?} disposition={:?} intents={} actions={}",
+                observation.map(|o| o.attention),
+                plan.disposition,
+                plan.intents.len(),
+                actions.len(),
+            );
+        }
     }
 }
 

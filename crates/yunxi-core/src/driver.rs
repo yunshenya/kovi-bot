@@ -21,6 +21,7 @@
 //! messages, writeback, lease release, and persistence. The driver reaches the
 //! host only through [`CognitiveTurnObserver`].
 
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::arbiter::{ActionArbiter, ActionPort, ActionRejection, ActionResult};
@@ -55,6 +56,10 @@ pub enum TurnOutcome {
 pub struct TurnReport {
     /// What happened to this turn.
     pub outcome: TurnOutcome,
+    /// The observation Core recorded for the event, absent when the event was
+    /// rejected before it could be observed. Compatibility hosts that run
+    /// without a planner report this instead of a plan.
+    pub observed: Option<RuntimeObservation>,
     /// Messages that actually crossed the delivery boundary this turn, in plan
     /// order. The host records these; Core does not persist.
     pub delivered_replies: Vec<String>,
@@ -87,7 +92,7 @@ impl TurnReport {
 
     /// A turn the host refused. Any action that already crossed its delivery
     /// boundary is preserved so the host can still record what went out.
-    fn cancelled(
+    fn cancelled_turn(
         observation: Option<RuntimeObservation>,
         plan: Option<&DecisionPlan>,
         actions: &[ActionResult],
@@ -96,6 +101,7 @@ impl TurnReport {
             plan.map_or_else(Vec::new, |plan| Self::collect_delivered(plan, actions));
         Self {
             outcome: TurnOutcome::Cancelled,
+            observed: observation,
             delivered_replies,
             expected_directive: None,
             autonomous_tick: observation.is_some_and(|observation| {
@@ -108,6 +114,7 @@ impl TurnReport {
     fn invalid(outcome: TurnOutcome) -> Self {
         Self {
             outcome,
+            observed: None,
             delivered_replies: Vec::new(),
             expected_directive: None,
             autonomous_tick: false,
@@ -180,18 +187,36 @@ pub trait CognitiveTurnObserver: Send + Sync {
     /// Called immediately before each event is taken from the queue so the
     /// host can refresh anything the next turn reads (dynamic capabilities,
     /// configuration, clocks).
-    fn before_turn(&mut self) {}
+    fn before_turn(&mut self) -> TurnHook<'_> {
+        Box::pin(async {})
+    }
 
     /// Called once per turn whose event reached a decision.
-    fn on_turn(&mut self, event: &WorldEvent, report: &TurnReport);
+    ///
+    /// Asynchronous because the work Core cannot do — writeback, reply
+    /// linkage, lease bookkeeping — is asynchronous in every real host.
+    fn on_turn<'a>(&'a mut self, event: &'a WorldEvent, report: &'a TurnReport) -> TurnHook<'a>;
 
     /// Called once when planning itself failed. The runtime consumed the event,
     /// so the host must release any lease or reservation carried by it.
-    fn on_planner_error(&mut self, event: &WorldEvent, error: &PlannerError);
+    fn on_planner_error<'a>(
+        &'a mut self,
+        event: &'a WorldEvent,
+        error: &'a PlannerError,
+    ) -> TurnHook<'a>;
 
     /// Called after every turn, including rejected ones.
-    fn on_turn_end(&mut self) {}
+    fn on_turn_end(&mut self) -> TurnHook<'_> {
+        Box::pin(async {})
+    }
 }
+
+/// A host hook in progress.
+///
+/// The trait is boxed rather than using `async fn` in traits so that drivers
+/// can accept `&mut dyn CognitiveTurnObserver`; a generic parameter would push
+/// the whole loop into every call site instead.
+pub type TurnHook<'a> = std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 
 /// Drives a runtime as a resident loop until the queue closes.
 ///
@@ -242,12 +267,12 @@ pub async fn drain(
 ) -> usize {
     let mut driven = 0;
     while runtime.has_pending_event() {
-        observer.before_turn();
+        observer.before_turn().await;
         let Some((event, result, dismissed)) = step(runtime, arbiter, port, observer).await else {
             return driven;
         };
-        record(result, dismissed, &event, observer);
-        observer.on_turn_end();
+        record(result, dismissed, &event, observer).await;
+        observer.on_turn_end().await;
         driven += 1;
     }
     driven
@@ -267,12 +292,12 @@ async fn drive(
     };
     let mut driven = 0;
     while driven < limit {
-        observer.before_turn();
+        observer.before_turn().await;
         let Some((event, result, dismissed)) = step(runtime, arbiter, port, observer).await else {
             return driven;
         };
-        record(result, dismissed, &event, observer);
-        observer.on_turn_end();
+        record(result, dismissed, &event, observer).await;
+        observer.on_turn_end().await;
         driven += 1;
     }
     driven
@@ -364,26 +389,21 @@ async fn observe(
         if !resident && !runtime.has_pending_event() {
             return driven;
         }
-        observer.before_turn();
+        observer.before_turn().await;
         let Some((event, outcome)) = runtime.process_next_with_event().await else {
             return driven;
         };
-        // An observed event never reaches a planner, so nothing downstream
-        // would release a lease the event carries. A refused claim is reported
-        // as a cancelled turn for the host to release.
-        if !observer.should_process(&event) {
-            let report = TurnReport::cancelled(None, None, &[]);
-            observer.on_turn(&event, &report);
-            observer.on_turn_end();
-            driven += 1;
-            continue;
-        }
+        // A compatibility runtime has no planner, so it never produces a
+        // continuation and there is no superseded work to skip: the host's
+        // cancellation query is not consulted here. Rejected events are still
+        // reported so the host can release the lease they carry.
         let report = match outcome {
             ProcessingOutcome::Observed(observation) => TurnReport {
                 outcome: TurnOutcome::Planned {
                     plan: DecisionPlan::silent(),
                     actions: Vec::new(),
                 },
+                observed: Some(observation),
                 delivered_replies: Vec::new(),
                 expected_directive: None,
                 autonomous_tick: observation.event_type == EventType::AutonomousConversationTick,
@@ -396,14 +416,14 @@ async fn observe(
                 TurnReport::invalid(TurnOutcome::InvalidState)
             }
         };
-        observer.on_turn(&event, &report);
-        observer.on_turn_end();
+        observer.on_turn(&event, &report).await;
+        observer.on_turn_end().await;
         driven += 1;
     }
     driven
 }
 
-fn record(
+async fn record(
     result: Result<PlannedProcessingOutcome, PlannerError>,
     dismissed: bool,
     event: &WorldEvent,
@@ -420,8 +440,8 @@ fn record(
             actions,
             ..
         }) if dismissed => {
-            let report = TurnReport::cancelled(Some(observation), Some(&plan), &actions);
-            observer.on_turn(event, &report);
+            let report = TurnReport::cancelled_turn(Some(observation), Some(&plan), &actions);
+            observer.on_turn(event, &report).await;
         }
         Ok(PlannedProcessingOutcome::Planned {
             observation,
@@ -430,15 +450,19 @@ fn record(
             ..
         }) => {
             let report = planned_report(observation, &plan, actions);
-            observer.on_turn(event, &report);
+            observer.on_turn(event, &report).await;
         }
         Ok(PlannedProcessingOutcome::RejectedEvent { .. }) => {
-            observer.on_turn(event, &TurnReport::invalid(TurnOutcome::InvalidEvent));
+            observer
+                .on_turn(event, &TurnReport::invalid(TurnOutcome::InvalidEvent))
+                .await;
         }
         Ok(PlannedProcessingOutcome::RejectedState { .. }) => {
-            observer.on_turn(event, &TurnReport::invalid(TurnOutcome::InvalidState));
+            observer
+                .on_turn(event, &TurnReport::invalid(TurnOutcome::InvalidState))
+                .await;
         }
-        Err(error) => observer.on_planner_error(event, &error),
+        Err(error) => observer.on_planner_error(event, &error).await,
     }
 }
 
@@ -475,6 +499,7 @@ fn planned_report(
             plan: plan.clone(),
             actions,
         },
+        observed: Some(observation),
         delivered_replies,
         expected_directive,
         autonomous_tick,
@@ -754,17 +779,28 @@ mod tests {
             authorized
         }
 
-        fn on_turn(&mut self, _event: &WorldEvent, report: &TurnReport) {
+        fn on_turn<'a>(
+            &'a mut self,
+            _event: &'a WorldEvent,
+            report: &'a TurnReport,
+        ) -> TurnHook<'a> {
             self.turns.push(report.outcome.clone());
             self.delivered.push(report.delivered_replies.clone());
+            Box::pin(async {})
         }
 
-        fn on_planner_error(&mut self, _event: &WorldEvent, _error: &PlannerError) {
+        fn on_planner_error<'a>(
+            &'a mut self,
+            _event: &'a WorldEvent,
+            _error: &'a PlannerError,
+        ) -> TurnHook<'a> {
             self.planner_errors += 1;
+            Box::pin(async {})
         }
 
-        fn on_turn_end(&mut self) {
+        fn on_turn_end(&mut self) -> TurnHook<'_> {
             self.turn_ends += 1;
+            Box::pin(async {})
         }
     }
 

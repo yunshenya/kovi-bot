@@ -53,7 +53,7 @@ pub use delivery::{
     DeliveryResolutionError, DeliveryResolver, DeliveryResolverFuture, DeliveryRoute,
 };
 pub use driver::{
-    AutonomousTurnDisposition, CognitiveTurnObserver, TurnOutcome, TurnReport, drain,
+    AutonomousTurnDisposition, CognitiveTurnObserver, TurnHook, TurnOutcome, TurnReport, drain,
     drain_observed, run, run_bounded, run_observed, run_observed_bounded,
 };
 pub use event::{
