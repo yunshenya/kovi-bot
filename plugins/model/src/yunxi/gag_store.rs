@@ -338,6 +338,9 @@ fn uuid_prefix_range(prefix: &str) -> Option<(Uuid, Option<Uuid>)> {
     Some((lower, upper))
 }
 
+#[allow(dead_code)]
+fn _assert_postgres_type(_: &Postgres) {}
+
 #[cfg(test)]
 mod tests {
     use super::uuid_prefix_range;
@@ -378,6 +381,3 @@ mod tests {
         assert!(upper.is_none(), "全 f 前缀应返回无上界");
     }
 }
-
-#[allow(dead_code)]
-fn _assert_postgres_type(_: &Postgres) {}
