@@ -775,3 +775,41 @@ turn_gate `4c6a935`）里修掉了；5.3 的 LOW 也逐条过了一遍（能修�
    需要先定"预期被违反"在产品上意味着什么。
 10. **后台 `/api/memory/stats` 把 DB 错误静默降级成 0**、**提醒发送失败对用户完全静默**、
     **agent_run 通知闸门瞬时故障被当成终态失败** —— 都是"失败该不该让用户/运维看见"的口径问题。
+
+### 11.4 拍板之后的执行结果（2026-09-15 深夜，第二批）
+
+§11.3 那 10 项你选了"低风险六项 + 提醒失败发创建者 + agent_run 闸门退避重试"。执行结果：
+
+| 提交 | 修了什么 | 怎么验证的 |
+| --- | --- | --- |
+| `f16a911` | 合并已有冲突时归属被最后触碰的调用方改写，按作用域擦除会漏掉它 → 首个写者赢 | 新增 `coalesced_conflicts_keep_their_original_erasure_scope`；改回 `insert` 立刻失败 |
+| `005cf86` | 决策记录 `ON CONFLICT (event_id) DO NOTHING` 的返回值被丢弃，重放保护形同虚设 → 同内容幂等成功、改了内容才冲突 | 真库测试：写两次只留一行、换结论必须冲突；丢掉返回值后立刻失败 |
+| `77b2156` | 后台统计三处把 DB 错误吞成 0/"这一类消失" → 能算的照常算，算不出来的回 `null` + `partial_errors` + 服务端日志 | node 抽出 `statNumber`/`renderStatCards`：`null`→「—」、`0`→`0`、降级提示带具体项 |
+| `267f060` | `save_world` 与建表迁移共用一把锁（每次落盘都挡迁移），且与擦除不互斥 → 新增快照专用锁，两侧共用 | 真库测试：占住建表锁照常落盘、占住快照锁必须等待；改回 `schema::lock` 立刻失败 |
+| `624b8c3` | `Unknown` 出站与 Prepared/Committed 一样不可淘汰，16 格占满后整批回复被拒（最长哑 1 小时）→ 过了碰撞窗口即可淘汰，最旧优先 | 新增 `unknown_outgoing_records_must_not_wedge_the_reply_queue`；改回"一律不可淘汰"立刻失败 |
+| `22ac38c` | `ApiError::internal` 把绝对路径与 SQL 报错回显给浏览器 → 只回"内部错误（编号 N）"，完整原因进日志；另留 `unavailable`/`internal_explained` 两个刻意保留原文的构造器 | 两个用例：回显不含绝对路径且带编号、两个保留原文的构造器语义不变 |
+| `c9c978b` | 一次性提醒发送失败后用户完全静默 → 三个终态失败点都发说明，Message 类发**创建者私聊** | `every_terminal_failure_gets_a_user_notice` 覆盖两类文案 |
+| `49fc7bf` | agent_run 通知闸门瞬时故障被当成终态失败（`recover_stale_claims` 也不再碰它）→ 放回 active、清租约、30 秒后重试 | 真库测试断言状态/通知状态/租约/失败计数；改回 `failed` 立刻失败 |
+
+另外把前端检查固化成了 `tools/admin-ui-checks.mjs`（`25294e8`）：无依赖，7 项检查，
+覆盖图谱节点身份、翻页条、两处列表缓存失效、按钮字面、统计降级显示——这些是 Rust
+测试碰不到、又曾经真的错过的前端逻辑。写法上踩过一个坑：`check()` 最初没 await，
+异步断言永远绿；已修正并用阴性对照确认会失败。
+
+**§11.3 里两项结论有修正，不是"待做"**：
+
+- **TurnGate 字段标记不需要改**。标记是**拼在 n-gram 前面再哈希**（`turn_gate.rs:279`
+  `gram.push_str(field_marker(marker))`），Python 侧同构（`features.py:149-166`），样本按
+  JSON 字段存、没有任何地方拿标记做分隔符解析。用户正文里塞 `\u{0001}` 只能得到"本字段
+  多了一个控制字符"的 gram，造不出别的字段的特征。残留的只有可读性问题：导出/标注样本里
+  会出现原始控制字符，值得在**导出边界**转义。
+- **`stop_requested` 建议删而不是接**。真正处理"停"的是 Host 语义层的 `wants_stop` →
+  `interrupt::cancel`；`wants_stop` 产生于 Host 语义层、**晚于**事件提交给 Core，接线等于
+  每条消息先跑一次分类调用。Core 侧那 6 处判断是死分支。真实缺口是"Core 接管的回合不尊重
+  别说了"，那应当作为独立特性走事件/取消信号，而不是复活这个永远为 false 的布尔。
+
+**仍在队列（本轮未选，均需先定口径或属于独立特性）**：`stop_requested` 死代码清理、
+TurnGate 导出转义、`AffectStore::set` 的乐观判据、`ExpectationStatus::Violated|Cancelled`
+的可观测化、群聊说话人标记伪造与折队归属（提示词格式变更，改完要看效果），以及审计报告里
+其余低优先项（私聊看门狗等待上限、precommit 30 秒租约的取消语义、孤儿 `Prepared` 的租约、
+嵌入维度校验、后台列表窗口与 `total_is_window` 口径、标注下载绕过 `source_key` 剥离等）。
