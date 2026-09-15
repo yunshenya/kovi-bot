@@ -865,7 +865,11 @@ impl PostgresExecutiveStore {
         if stored_version.is_some_and(|stored| stored > version) {
             return Err(ExecutivePersistenceError::Conflict);
         }
-        query(
+        // `WHERE` 是必要的：上面那句只挡"我比你旧"，同版本并发写仍然会被无条件覆盖
+        // ——两个写者拿着同一个版本、内容却不同时，后到者会把前者的 plan/expectation
+        // 投影悄悄抹掉。这里只允许"版本更高"或"内容完全相同（幂等重存）"两种更新，
+        // 其余情况 `rows_affected == 0`，由下面报冲突。
+        let written = query(
             r#"
             INSERT INTO yunxi_executive_snapshots
                 (scope_key, scope_kind, scope_id, version, snapshot, updated_at)
@@ -876,6 +880,8 @@ impl PostgresExecutiveStore {
                 version = EXCLUDED.version,
                 snapshot = EXCLUDED.snapshot,
                 updated_at = NOW()
+            WHERE yunxi_executive_snapshots.version < EXCLUDED.version
+               OR yunxi_executive_snapshots.snapshot = EXCLUDED.snapshot
             "#,
         )
         .bind(&parts.key)
@@ -885,7 +891,13 @@ impl PostgresExecutiveStore {
         .bind(snapshot_value)
         .execute(&mut *transaction)
         .await
-        .map_err(ExecutivePersistenceError::storage)?;
+        .map_err(ExecutivePersistenceError::storage)?
+        .rows_affected();
+        if written == 0 {
+            // 同版本、不同内容：这不是"重存了一遍"，而是两个写者对同一个版本给出了
+            // 不同的状态。静默覆盖等于丢掉对方那份，如实报冲突让上层重新取版本。
+            return Err(ExecutivePersistenceError::Conflict);
+        }
 
         if let Some(plan) = normalized.active_plan.as_ref() {
             query(
@@ -1113,7 +1125,9 @@ impl ExecutiveStore for PostgresExecutiveStore {
                     return Err(ExecutivePersistenceError::Conflict);
                 }
             }
-            query(
+            // 与 `save_scope_snapshot` 同一道防线：上面那句只挡"我比你旧"，同版本并发
+            // 写仍会被无条件覆盖。只允许"版本更高"或"内容完全相同（幂等重存）"。
+            let written = query(
                 r#"
                 INSERT INTO yunxi_executive_snapshots
                     (scope_key, scope_kind, scope_id, version, snapshot, updated_at)
@@ -1124,6 +1138,8 @@ impl ExecutiveStore for PostgresExecutiveStore {
                     version = EXCLUDED.version,
                     snapshot = EXCLUDED.snapshot,
                     updated_at = NOW()
+                WHERE yunxi_executive_snapshots.version < EXCLUDED.version
+                   OR yunxi_executive_snapshots.snapshot = EXCLUDED.snapshot
                 "#,
             )
             .bind(&parts.key)
@@ -1133,7 +1149,11 @@ impl ExecutiveStore for PostgresExecutiveStore {
             .bind(value)
             .execute(&mut *transaction)
             .await
-            .map_err(ExecutivePersistenceError::storage)?;
+            .map_err(ExecutivePersistenceError::storage)?
+            .rows_affected();
+            if written == 0 {
+                return Err(ExecutivePersistenceError::Conflict);
+            }
             transaction
                 .commit()
                 .await
@@ -2399,6 +2419,56 @@ mod tests {
                 ),
                 "同一事件被赋予不同决策时必须冲突"
             );
+        });
+    }
+
+    #[test]
+    #[ignore = "requires PostgreSQL via DATABASE_URL"]
+    fn postgres_same_version_snapshots_with_different_content_conflict() {
+        // 两个写者拿着同一个版本、内容却不同时，旧的 upsert 会无条件覆盖：后到者把
+        // 前者的 plan/expectation 投影悄悄抹掉，而且不报错。幂等重存（同版本同内容）
+        // 仍然必须成功。
+        database_test_support::block_on(async {
+            let database = TestDatabase::connect().await;
+            let store = PostgresExecutiveStore::new(database.pool.clone());
+            store
+                .initialize_schema()
+                .await
+                .expect("Executive migration should succeed");
+
+            let scope = ExecutiveScope::Global;
+            let first = snapshot(2);
+            ExecutiveStore::save(&store, &scope, &first)
+                .await
+                .expect("首次保存应成功");
+            // 同版本、同内容：幂等重存，不该报错。
+            ExecutiveStore::save(&store, &scope, &first)
+                .await
+                .expect("同版本同内容的重存应幂等");
+
+            // 同版本、不同内容：必须冲突，而不是静默覆盖。
+            let mut changed = snapshot(2);
+            changed.active_plan = Some(plan(Utc::now()));
+            assert!(
+                matches!(
+                    ExecutiveStore::save(&store, &scope, &changed).await,
+                    Err(ExecutivePersistenceError::Conflict)
+                ),
+                "同版本不同内容必须报冲突"
+            );
+            // 冲突之后库里仍是先写者那份。
+            let loaded = ExecutiveStore::load(&store, &scope)
+                .await
+                .expect("应能读回")
+                .expect("应存在快照");
+            assert!(loaded.active_plan.is_none(), "被拒绝的写入不该落库");
+
+            // 更高版本照旧可以覆盖。
+            let mut newer = snapshot(3);
+            newer.active_plan = Some(plan(Utc::now()));
+            ExecutiveStore::save(&store, &scope, &newer)
+                .await
+                .expect("更高版本应当能写入");
         });
     }
 
