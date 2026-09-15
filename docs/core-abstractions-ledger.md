@@ -27,7 +27,7 @@
 | **知觉** | 输入 | 进 | `WorldEvent` + 注意力（`AttentionSystem`） |
 | **表达** | **对外动作** | 出 | 目标（本会话 / 某人 / 某处）× 媒介（文字 / 语音 / 图片 / 电话）× 内容 |
 | **作为** | **对外动作** | 出 | 宿主声明的能力名（今天的 `UseTool`，已经是泛化的模板） |
-| **承诺** | **Core 自己的状态** | 内 | 状态更新（目标 / 未结之事 / 提醒 / 记忆 / 情绪 / 关系） |
+| **承诺** | **Core 自己的状态** | 内 | 未结之事 / 目标 / 提醒（走状态更新通道）。**注意**：情绪、关系、话题是**状态**不是承诺——见下方注记 |
 | **沉默** | 输出为零 | — | 不是动作，是"没有表达、没有作为" |
 
 所以 `ActionCapability` 的终态是 **`Speak` + `Act` 两个**；承诺走状态通道（不是动作）；
@@ -147,20 +147,22 @@ arbiter.rs  枚举变体 + as_str + capability_for + AuthorizationPolicy 字段
 
 并且它**零独有语义**：核过之后它唯一的活消费者是一个可以改问"工具声明了吗"的闸门。
 
-### 2.2 "表达"今天被拆成六套机制
+### 2.2 "表达"今天被拆成五套机制
 
 | 机制 | 归属 | 档位 | 落点 |
 |---|---|---|---|
 | `SendMessage`（回复） | **能力** | **豁免** | 本会话 |
-| `ReachOut` | **能力** | 受约束 | 某人（`ReachOutMedium::Call` 是电话） |
+| `ReachOut` | **能力** | **不受约束**（见 §6.1） | 某人（`ReachOutMedium::Call` 是电话） |
 | `group.message.send` | 工具 | 受约束 | 别的群 |
 | `private.message.send` | 工具 | 受约束 | 别人 |
 | `call.start` | 工具 | 受约束 | 本会话那个人（电话） |
-| `message.recall` | 工具 | 受约束 | 撤销她发过的（"表达"的逆） |
 
-六套机制里做的事是同一件：**把某个东西说出来，给某个目标，用某种媒介**。它们之所以
-分裂，是因为枚举按"落点"开变体。注意 `reach_out` 与 `call.start` 的档位待遇不同
-（见 §6.1）——这就是分裂的代价。
+五套机制里做的事是同一件：**把某个东西说出来，给某个目标，用某种媒介**。它们之所以
+分裂，是因为枚举按"落点"开变体。**同一个"打电话"在两条路上档位待遇不同**
+（`reach_out` 不受约束、`call.start` 受约束，见 §6.1）——这就是分裂的代价。
+
+（`message.recall` 不在上表：它是"表达的逆"，按 §1.2 的判据归**作为**——Core 只需授权
+与路由，不需要理解内容语义。）
 
 ### 2.3 "承诺"有两套通道
 
@@ -214,14 +216,18 @@ done
 
 | 抽象 | 建议标识符 | 取代 |
 |---|---|---|
-| 知觉 | `Perception`（事件侧沿用 `EventType` / `AttentionSystem`） | 无（本来就是对的） |
+| 知觉 | `Perception`（宿主声明种类+属性，Core 拥有注意力档） | **不取代任何东西——今天它和输出侧是同一种病**，见 §1.3 / 第六步 |
 | 表达 | `Speak` / `SpeakAction` | `SendMessage` + `ReachOut` |
 | 作为 | `Act` / `ActAction` | `UseTool` |
 | 承诺 | `Commitment` + 只留 `StateUpdateProposal` | 四个动作变体 + 两套通道 |
+| **状态**（**待定**，见 §10 第 12 条） | 若走"路 B"则单列：`State` | 今天混在 `StateUpdateProposal` 里 |
 | 沉默 | `Silence` | `Noop` + `DecisionDisposition::Silent` |
 
 `Speak` 的载荷建议：`target`（本会话 / 某人 / 某处）× `medium`（`Text` / `Voice` / `Image` /
 `Call`）× `content` × **`is_turn_output: bool`**（见 §6.2）。
+
+**这张表的行数取决于 §10 第 12 条**：选"路 A"（承诺泛指"改她自己"）就是五行；
+选"路 B"（状态与承诺分开）就是六行。**先定那个，再定名。**
 
 ---
 
@@ -273,7 +279,7 @@ status           TEXT NOT NULL CHECK (status IN ('prepared','committed','sent','
 ### 6.1 回复必须永远发得出去
 
 "她读过外人文字之后，仍然必须能回答正在跟她说话的人"——今天这条**隐式**地靠
-"档位只检查 `UseTool`"实现（`runtime.rs:~1820` 那段注释写明了意图：
+"档位只检查 `UseTool`"实现（`runtime.rs:1822` 那段注释写明了意图：
 *"may still read and may still change its own person's state, but must not speak in her name"*）。
 
 重构后这条必须有**名字**，不能继续靠"恰好只检查了某一种动作"。同时要修一处现存不一致：
@@ -331,20 +337,39 @@ Deferred { reason }                                             // 两者共用
 
 ---
 
-## 7. 迁移计划（四步，每步可单独回滚）
+## 7. 迁移计划（六步：①–④ 必做，⑤ 可选，⑥ 独立）
+
+**接手须知**：①–⑤ 是**输出侧**，⑥ 是**知觉侧**（独立决定）。每步一个语义完整的提交、
+单独可回滚；不要把它们合成一次大改。**第一次提交应该是第一步。**
 
 ### 第一步：属性显式化（无对外行为变化）
 
 把"波及范围"和"是不是本轮产出"变成显式属性，而不是靠"是不是 `UseTool`"隐式表达。
-建议把 `EffectScope` 里混在一起的两个轴拆开：
 
-- `Reach { SelfOnly, ThisConversation, Elsewhere }`（波及多远）
-- `Reversible` / `Visible`（可逆、对外可见）
-- `is_turn_output: bool`（是不是本轮的产出）
+今天的 `EffectScope { ReadOnly, UserScoped, Outbound }` **把两个轴揉在一起**——它自己的文档
+注释写着"deliberately about *reach*"，可 `ReadOnly` 根本不是"波及范围"，是"有没有副作用"：
+
+- **有没有副作用**：`ReadOnly` vs 有副作用
+- **波及多远**：`UserScoped`（只她自己）vs `Outbound`（对外）
+
+拆成两个轴（建议 `Access { Read, Write }` × `Reach { Self, ThisConversation, Elsewhere }`），
+再加"是不是本轮产出"（`is_turn_output: bool`）。
+
+**两个实现上的坎，必须先知道：**
+
+1. **它今天是靠全序工作的。** `EffectScope` derive 了 `PartialOrd, Ord`，档位检查写的是
+   `effect > ceiling`（`arbiter.rs:1034`、`runtime.rs:1822`）。拆成两个轴之后这就不是
+   全序而是**偏序**，`>` 不再成立，两处检查都要改成**逐轴比较**。
+2. **必须保住"只读工具永不被档位拒"**：今天 `ReadOnly < UserScoped ≤ ceiling` 恒真，
+   所以查询类工具从来不会因为档位消失。拆轴时这条要显式测。
 
 **顺带修掉 §6.1 那处 `ReachOut` 绕过档位。**
 
-- 验证：现有测试全绿 + 新增"回复在读过外人文字后仍可发"与"ReachOut 受档位约束"两条。
+`Reversible` / `Visible` 这类属性**这一步不需要**——只有真出现依赖它的判据时再加，
+别在第一步就把属性集铺开。
+
+- 验证：现有测试全绿 + 新增"回复在读过外人文字后仍可发""只读工具永不被档位拒"
+  "ReachOut 受档位约束"三条。
 - 回滚：这一步不动枚举与 wire 格式。
 
 ### 第二步：表达收口成 `Speak`
@@ -366,47 +391,65 @@ Deferred { reason }                                             // 两者共用
 - 验证：目标/未结之事的创建、解析、延后全链路测试；`#立场` / 执行态自检不变。
 - 回滚：这一步要迁数据，回滚脚本必须同批准备。
 
-### 第四步：改名 + 收口能力枚举 + 数据库迁移（**红线，单独审批**）
+### 第四步：收口能力枚举（**保留线上取值，零数据库迁移**）
 
-`ActionCapability` → `{ Speak, Act }`；`permits` → `allow_speak` / `allow_act`；
-`DecisionDisposition::Silent` → 沉默的新名；按 §5 处理三处落盘。
+`ActionCapability` → `{ Speak, Act }`；`permits` → `allow_speak` / `allow_act`。
+**类型名换新、线上升级与落盘取值全部保持旧名**（`#[serde(rename = "send_message")]` 等，
+先例见下方"为什么第四步与第五步要分开"）。这一步因此**不碰 wire、不碰数据、不碰 schema**。
 
-**顺序建议**：第一、二、三步先做（不碰 wire 与数据），第四步单独一批，
-`CHECK` 约束的过渡策略见 §10。
+### 第五步（可选，**红线②，单独审批**）：连线上取值也改名
+
+只有想把 `send_message` / `reach_out` 这些**落盘取值**也换掉时才需要：按 §5 处理
+`CHECK` 约束、四处 JSONB、以及 16 个文档章节。**价值是词汇统一，代价是数据库迁移**，
+所以它是独立决定，不是收口的必要部分。
+
+### 第六步（**与输出侧并行，但是独立决定**）：知觉侧同样收口
+
+§1.3 已经说明知觉侧是同一个问题。它**不在第一到第五步里**，因为：
+
+- 它的接口不同（宿主声明"种类 + 属性"，Core 拥有"注意力档"），
+- 它**已经落盘**（`EventType` 在 `yunxi_expectations` 里，且 `expires_at` 可为 NULL），
+- 它需要先定"事件属性都有哪些"（注意力档是最少的一个；可能还需要"是否要求她回应"）。
+
+要做的话建议**先只加声明通道、不动现有 `EventType` 取值**（与第四步同样的手法：
+类型侧可扩展、线上取值不变），这样它和输出侧的收口可以互相独立地回滚。
+**如果这一轮不做，台账要在 §12 里写明"知觉侧尚未动"，否则下一个人会以为已经做完了。**
 
 ---
 
-### 重要：**结构收口与改名是两件事，可以分开**
 
-第四步里的**风险全部来自"改名"**（数据库 CHECK 约束、落盘 JSONB、16 个文档章节），
-而**价值全部来自"结构收口"**。两者可以解耦：
+**顺序建议**：第一到第四步必做（完全不碰数据），第五步单独一批、可无限期推迟；
+`CHECK` 约束的过渡策略见 §10。
 
-- 结构上把 `ActionCapability` 收成 `{ Speak, Act }`，同时用 `#[serde(rename = "send_message")]`
-  / `rename = "reach_out"`（以及对话日志里的显示名）**保留线上取值不变** →
-  **零数据库迁移、零落盘兼容问题**；
+**为什么第四步与第五步要分开**：**风险全部来自"改名"**（数据库 CHECK 约束、落盘 JSONB、
+16 个文档章节），而**价值全部来自"结构收口"**。两者可以解耦——第四步用
+`#[serde(rename = "send_message")]` / `rename = "reach_out"`（以及日志里的显示名）
+**保留线上取值不变**，于是**零数据库迁移、零落盘兼容问题**。
 
-  **这不是新发明，仓库里已有先例**（`planner.rs:1017`）：
+**这不是新发明，仓库里已有先例**（`planner.rs:1017`）：
 
-  ```rust
-  impl DecisionDisposition {
-      /// Compatibility spelling for callers that use "respond" in their
-      /// product language while the wire representation remains `reply`.
-      pub const Respond: Self = Self::Reply;
-      pub const Ignore: Self = Self::Silent;
-  }
-  ```
+```rust
+impl DecisionDisposition {
+    /// Compatibility spelling for callers that use "respond" in their
+    /// product language while the wire representation remains `reply`.
+    pub const Respond: Self = Self::Reply;
+    pub const Ignore: Self = Self::Silent;
+}
+```
 
-  即"产品语言里叫新名字，线上取值保持旧名"已经是这里的做法。沿用它，改名就不必是红线。
-- 改名（连线上取值也换）纯粹是**词汇统一**的收益，代价是红线②的迁移 + 文档改动。
+"产品语言里叫新名字，线上取值保持旧名"已经是这里的做法。沿用它，第四步就不必是红线。
 
-**建议**：先做结构收口（拿到全部价值），把"连取值也改名"当成一个**可选的、独立的**后续决定。
-如果新对话只做了改名而没做判据与结构收口，结果会比今天更差（多了一层间接性，
+**如果新对话只做了改名而没做判据与结构收口，结果会比今天更差**（多了一层间接性，
 封闭枚举的行为一模一样，只是换了个名字）。
 
 ## 8. "泛化成功"的度量
 
-加一个新的对外能力（例如"视频通话""发朋友圈""发语音条"）时，**Core 的改动处数为 0**：
-只写一条声明 + 数据。今天的基线是 8–10 处。
+两个方向都要量，缺一个就是只做了一半（§1.3）：
+
+- **加一个新的对外能力**（"视频通话""发朋友圈""发语音条"）：**Core 改动处数 = 0**，
+  只写一条声明 + 数据。今天基线 **8–10 处**。
+- **加一个新的知觉种类**（"构建失败""传感器触发"）：同样 **0 处**，只写一条声明
+  （种类 + 属性）。今天基线 **6–8 处**（`CallEnded` 那次就是）。
 
 ---
 
@@ -447,7 +490,7 @@ Core 必须知道**这一轮她说了什么**（§6.2）。如果回复变成普
 9. **表达的目标集封闭还是有限开放**（§6.3）：这是"病会不会搬到目标层"的分水岭。
 10. **两套失败语义要不要拆开出口类型**（§6.4）：`ActionPortOutcome` 今天混着两种形状。
 11. **历史落盘取值怎么办**（§5.2 + §1.3）：`EventType` 与 `DecisionActionKind` 都在 JSONB 里，
-    是 serde alias 读兼容，还是保留线上取值只改类型名（见 §7 那条"两件事可以分开"）。
+    是 serde alias 读兼容，还是保留线上取值只改类型名（见 §7"为什么第四步与第五步要分开"）。
 12. **五个还是六个**（§1 那条说明）：把"承诺"放宽成"改她自己"（路 A，五个），
     还是承认"状态"与"承诺"是两类（路 B，六个）？我倾向路 B，理由是"她现在的状态"与
     "她答应过的未来"混在一起会让"承诺"没法用来推理，而未结之事/提醒/主动跟进恰恰需要它准确。
@@ -473,6 +516,7 @@ Core 必须知道**这一轮她说了什么**（§6.2）。如果回复变成普
 
 | 章节 | 为什么受影响 |
 |---|---|
+| §24 WorldEvent / §25 EventScope / §26 WorldEventKind | **知觉侧**：种类与声明属性（若做第六步） |
 | §28 Environment Capability | 能力/声明的形态 |
 | §29 Action 也必须平台无关 | **就是现在这个枚举** |
 | §30 SendMessage | 并入表达 |
