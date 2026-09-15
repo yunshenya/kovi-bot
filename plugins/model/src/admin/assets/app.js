@@ -2886,9 +2886,13 @@
    * 不为这件事再要求人去右边找一个"应用"小按钮。`切换 / 编辑 / 删除` 三个按钮
    * 是给键盘与不习惯点卡片的人留的（卡片本身没有 role/tabindex，嵌套可交互元素
    * 在 ARIA 里是无效结构，所以键盘入口就靠这三个真按钮）。
+   *
+   * 「正在用」由后端给（`profile.active`）：页面不再自己重算"地址 + 模型名"那个
+   * 口径——那份判定同时管着删除闸门，两处各写一份迟早会不一致。正在用的那张不给
+   * 删：删除按钮就地灰掉并说明原因（后端对直接打接口的请求同样返回 409）。
    */
-  function profileCard(profile, current) {
-    const isActive = isActiveProfile(profile, current);
+  function profileCard(profile) {
+    const isActive = Boolean(profile.active);
     const switchTo = () => switchModelProfile(profile);
     const color = entityColor(profile.label);
     return h('div', {
@@ -2923,6 +2927,10 @@
         }),
         h('button', {
           class: 'btn danger small', text: '删除',
+          disabled: isActive,
+          title: isActive
+            ? '正在用的这一套不能删：先切到另一套档案，或在配置页关掉外部模型'
+            : `删掉「${profile.label}」这套档案（不影响当前生效的配置）`,
           onclick: (event) => { event.stopPropagation(); removeModelProfile(profile); },
         })));
   }
@@ -2931,13 +2939,6 @@
   function avatarLetter(label) {
     const text = String(label || '').trim();
     return text ? text.slice(0, 1).toUpperCase() : '?';
-  }
-
-  /** 档案是不是正在生效的那一套：与原来那行「正在用」同一个口径（地址 + 模型名）。 */
-  function isActiveProfile(profile, current) {
-    return Boolean(profile.model_name)
-      && profile.model_name === current.model_name
-      && profile.url === current.url;
   }
 
   /** 「带密钥 / 无密钥」「能读图」「免鉴权」：一眼决定切到哪一套。 */
@@ -2983,13 +2984,18 @@
     }
   }
 
+  /**
+   * 删除一套档案。正在用的那张的按钮是灰的，正常点不到；这里仍按后端的话如实转达
+   * ——列表是上一次拉取的快照，从渲染到点下去之间完全可能刚好被切过去（那时接口
+   * 返回 409）。
+   */
   async function removeModelProfile(profile) {
     if (!window.confirm(`删除档案「${profile.label}」？（不影响当前生效的配置）`)) return;
     try {
       await api(`/api/model/profiles/${encodeURIComponent(profile.id)}`, { method: 'DELETE' });
       toast('已删除', 'ok');
     } catch (problem) {
-      toast(problem.message, 'bad');
+      toast(problem.message, 'bad', 7000);
     }
     await renderModelPage();
   }
@@ -3005,7 +3011,11 @@
       h('div', { class: 'provider-main' },
         h('div', { class: 'provider-head' },
           h('span', { class: 'provider-label', text: '当前生效的配置' }),
-          h('span', { class: 'badge kind', text: '正在用' }),
+          // 关掉外部模型时她只用本地能力，这张卡就不是"正在用"了：
+          // 标成「正在用」会和上面那行"外部模型已禁用"自相矛盾。
+          current.enabled
+            ? h('span', { class: 'badge kind', text: '正在用' })
+            : h('span', { class: 'badge warn', text: '未启用' }),
           h('span', {
             class: `badge ${current.has_key ? 'ok' : 'warn'}`,
             text: current.has_key ? '带密钥' : '无密钥',
@@ -3030,10 +3040,10 @@
     const profiles = (data.profiles && data.profiles.items) || [];
     const current = data.current || {};
     // 已经有一套档案正好是当前生效的，就不用再补一张"当前配置"（会重复）。
-    const hasActive = profiles.some((profile) => isActiveProfile(profile, current));
+    const hasActive = profiles.some((profile) => Boolean(profile.active));
     const cards = [
       ...(hasActive ? [] : [currentEndpointCard(current)]),
-      ...profiles.map((profile) => profileCard(profile, current)),
+      ...profiles.map((profile) => profileCard(profile)),
     ];
 
     const addButton = h('button', {
@@ -3047,7 +3057,7 @@
         h('h3', { text: '模型档案' }),
         addButton),
       h('div', { class: 'hint', text: profiles.length
-        ? '点一张卡片就切过去，立刻生效、不需要重启；正在用的那张高亮并标着「正在用」。'
+        ? '点一张卡片就切过去，立刻生效、不需要重启；正在用的那张高亮并标着「正在用」，删不掉（先切走再删）。'
         : '还没有存过档案：下面这张就是她现在跑的配置，点「存成档案」把它存下来，以后就能一键切换。' }),
       h('div', { class: 'provider-list' }, ...cards));
   }

@@ -15,7 +15,7 @@
 use super::ApiError;
 use super::model_profiles::{self, ModelProfile};
 use super::{AdminState, config_api};
-use crate::config::{self, ApiKeySource};
+use crate::config::{self, ApiKeySource, ServerConfig};
 use axum::Json;
 use axum::extract::{Path, State};
 use serde::Deserialize;
@@ -61,9 +61,7 @@ pub(crate) struct ModelRequest {
 }
 
 /// 当前生效的模型设置（不含密钥本身）。
-fn current_model_json() -> Value {
-    let config = config::get();
-    let server = config.server_config();
+fn current_model_json(server: &ServerConfig) -> Value {
     let source = server.api_key_source();
     json!({
         "enabled": server.enabled(),
@@ -88,7 +86,9 @@ fn current_model_json() -> Value {
     })
 }
 
-fn profiles_json() -> Result<Value, ApiError> {
+/// 档案列表。`active` 由后端一处判定（[`ModelProfile::is_live`]），页面只负责照着
+/// 显示与禁用删除，不再自己重算一遍"地址 + 模型名"那个口径。
+fn profiles_json(server: &ServerConfig) -> Result<Value, ApiError> {
     let profiles = model_profiles::list()?;
     let items: Vec<Value> = profiles
         .iter()
@@ -104,6 +104,7 @@ fn profiles_json() -> Result<Value, ApiError> {
                 "requires_auth": profile.requires_auth,
                 "max_output_tokens": profile.max_output_tokens,
                 "has_key": !profile.api_key.trim().is_empty(),
+                "active": profile.is_live(server),
             })
         })
         .collect();
@@ -115,9 +116,13 @@ fn profiles_json() -> Result<Value, ApiError> {
 
 /// 一份完整的响应：当前设置 + 档案 + 落盘位置。
 fn model_state() -> Result<Value, ApiError> {
+    // 整份配置读一次：当前设置与"哪套档案正在用"必须来自同一个快照，
+    // 否则两边各读一次，正好卡在切模型中间时会自相矛盾。
+    let live = config::get();
+    let server = live.server_config();
     Ok(json!({
-        "current": current_model_json(),
-        "profiles": profiles_json()?,
+        "current": current_model_json(server),
+        "profiles": profiles_json(server)?,
         "config_file": config::override_file_path().display().to_string(),
     }))
 }
@@ -240,10 +245,14 @@ pub(crate) async fn apply(
 }
 
 /// `DELETE /api/model/profiles/{id}`
+///
+/// **正在用的那套不能删**：拦在这里而不是只靠前端把按钮灰掉，接口自己就是那道闸。
+/// 返回 409，正文里写清怎么才能删（先切走，或先关掉外部模型）。
 pub(crate) async fn remove_profile(Path(id): Path<String>) -> Result<Json<Value>, ApiError> {
-    if !model_profiles::remove(&id)? {
-        return Err(ApiError::not_found(format!("找不到模型档案: {id}")));
-    }
+    // 读一次当前配置：判定"正在用"的依据必须是这一刻生效的那份。
+    let live = config::get();
+    model_profiles::remove(&id, live.server_config())?;
+    println!("[INFO] 模型档案已删除: {id}");
     Ok(Json(json!({ "ok": true, "model": model_state()? })))
 }
 
@@ -641,8 +650,16 @@ mod tests {
             assert_eq!(mode, 0o600, "档案里存着密钥，必须是 0600，实际 {mode:o}");
         }
 
-        assert!(model_profiles::remove_at(&path, &id).expect("应能删除"));
-        assert!(!model_profiles::remove_at(&path, &id).expect("再删应如实返回 false"));
+        // 删除：不在用的那套删得掉；再删如实回 404（而不是假装删成功）。
+        let offline =
+            model_profiles::test_server(true, "https://api.example.com/v1", "example-model");
+        model_profiles::remove_at(&path, &id, &offline).expect("不在用的那套应能删除");
+        let missing = model_profiles::remove_at(&path, &id, &offline).expect_err("再删应报找不到");
+        assert_eq!(
+            missing.status,
+            axum::http::StatusCode::NOT_FOUND,
+            "{missing:?}"
+        );
         assert_eq!(model_profiles::list_at(&path).expect("应能读取").len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -689,9 +706,10 @@ mod tests {
         });
     }
 
-    /// HTTP 层：真 axum 服务 + 真路由。无 Token 401、读回状态、测试连接真发出去
-    /// 并带上密钥。这条不写任何文件（apply 的落盘由上面那条 `changed_document`
-    /// 用例覆盖），所以不必进 ignored 名单。
+    /// HTTP 层：真 axum 服务 + 真路由。无 Token 401、读回状态（含每套档案的
+    /// `active` 标记）、删除不存在的档案回 404、测试连接真发出去并带上密钥。
+    /// 这条不写任何文件（apply 的落盘由上面那条 `changed_document` 用例覆盖，
+    /// 删除闸门由 `model_profiles` 那条用例覆盖），所以不必进 ignored 名单。
     #[test]
     fn model_endpoints_answer_over_http() {
         let seen = StdArc::new(std::sync::Mutex::new(Vec::new()));
@@ -731,6 +749,21 @@ mod tests {
                 !state.to_string().contains("api_key\":\"sk-"),
                 "状态接口绝不能回显密钥: {state}"
             );
+            // 每套档案都带一个布尔 active：页面照着它标「正在用」、灰掉删除按钮。
+            for item in state["profiles"]["items"].as_array().expect("档案列表") {
+                assert!(item["active"].is_boolean(), "每套档案都要有 active: {item}");
+            }
+
+            // 删不存在的档案：404，而不是"假装删成功"。id 里带下划线，`slug()` 生成的
+            // id 只可能是小写字母数字与短横线，所以这个名字不可能是本机真有的档案
+            // （这条用例因此不会动到任何真实文件）。
+            let missing = client
+                .delete(format!("{base}/api/model/profiles/no_such_profile"))
+                .bearer_auth("test-token")
+                .send()
+                .await
+                .expect("应能请求");
+            assert_eq!(missing.status(), reqwest::StatusCode::NOT_FOUND);
 
             // 测试连接：打到假端点，2xx 算通，并且必须真的带上密钥。
             let endpoint = spawn_stub_model(200, StdArc::clone(&seen)).await;

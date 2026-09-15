@@ -7,10 +7,14 @@
 //!
 //! 文件是 `runtime/model_profiles.toml`，**0600**：里面存着各家的 API Key。它不出现在
 //! 配置页的编辑器里（那是受管配置文件的地盘），只能通过模型页读写。
+//!
+//! 「正在用」的判定只写在这里一处（[`ModelProfile::is_live`]）：页面上的标记、卡片
+//! 的删除按钮与删除接口的拦截共用同一份口径，免得三处各判一次、说法还不一样。
 
 use super::ApiError;
 use super::config_api::write_atomically_private;
 use crate::config;
+use crate::config::ServerConfig;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -64,7 +68,43 @@ struct ProfilesFile {
     profiles: Vec<ModelProfile>,
 }
 
+/// 当前生效端点的身份：`(地址, 模型名)`，地址已归一化。
+///
+/// 外部模型没启用、或配置里的模型名是空的，就没有任何端点在跑，返回 `None`——
+/// 那时"她只用本地能力"（Core / Intrinsic），列表里谁也不该被标成「正在用」。
+fn live_identity(server: &ServerConfig) -> Option<(&str, &str)> {
+    if !server.enabled() {
+        return None;
+    }
+    let model_name = server.model_name().trim();
+    if model_name.is_empty() {
+        return None;
+    }
+    Some((normalize_url(server.url()), model_name))
+}
+
+/// 地址的归一化形式，只用于比较：去掉首尾空白与尾部斜杠。
+fn normalize_url(url: &str) -> &str {
+    url.trim().trim_end_matches('/')
+}
+
 impl ModelProfile {
+    /// 这套档案是不是"正在生效的那一套"。
+    ///
+    /// 口径是**外部模型已启用 + 地址与模型名跟当前 `[server_config]` 一致**，与页面
+    /// 上那枚「正在用」标记、删除接口的拦截完全同一份。只看这两个字段是有意的：它们是
+    /// "这套端点是谁"的身份，而密钥、输出上限、协议都是能就地改的可变量——把它们一起
+    /// 比，改过一把密钥之后当前端点就会被判成"另一套"，于是正在用的那套反而变得可删。
+    ///
+    /// 地址比较前去掉首尾空白与尾部斜杠：`https://x/v1` 与 `https://x/v1/` 拼出来的
+    /// 是同一个请求地址，不该因为一个斜杠就当成两套端点。
+    pub(crate) fn is_live(&self, server: &ServerConfig) -> bool {
+        let Some((url, model_name)) = live_identity(server) else {
+            return false;
+        };
+        self.model_name.trim() == model_name && normalize_url(&self.url) == url
+    }
+
     /// 写进 `[server_config]` 的字段。空值表示"这一项不动"，避免把现有配置清空。
     pub(crate) fn changes(&self) -> BTreeMap<String, Value> {
         let mut changes = BTreeMap::new();
@@ -182,21 +222,33 @@ pub(crate) fn upsert_at(
     Ok(profile.id)
 }
 
-/// 删除一套档案；返回是否真的删掉了。
-pub(crate) fn remove(id: &str) -> Result<bool, ApiError> {
-    remove_at(&profiles_path(), id)
+/// 删除一套档案。**正在用的那套删不掉**：删掉它就等于把"她现在跑的是什么"从列表里
+/// 抹掉，之后再想切回去只能重新填一遍地址与密钥。
+pub(crate) fn remove(id: &str, server: &ServerConfig) -> Result<(), ApiError> {
+    remove_at(&profiles_path(), id, server)
 }
 
 /// [`remove`] 的显式路径版本。
-pub(crate) fn remove_at(path: &std::path::Path, id: &str) -> Result<bool, ApiError> {
+///
+/// 判定与删除在同一次读盘里完成（而不是先查一次再删一次）：中间没有窗口能让
+/// "刚被切过去的那套"漏过去。
+pub(crate) fn remove_at(
+    path: &std::path::Path,
+    id: &str,
+    server: &ServerConfig,
+) -> Result<(), ApiError> {
     let mut profiles = list_at(path)?;
-    let before = profiles.len();
-    profiles.retain(|profile| profile.id != id);
-    if profiles.len() == before {
-        return Ok(false);
+    let Some(profile) = profiles.iter().find(|profile| profile.id == id) else {
+        return Err(ApiError::not_found(format!("找不到模型档案: {id}")));
+    };
+    if profile.is_live(server) {
+        return Err(ApiError::conflict(format!(
+            "「{}」正在用（{} / {}），不能删。先切到另一套档案，或在配置页关掉外部模型，再回来删。",
+            profile.label, profile.model_name, profile.url
+        )));
     }
-    save_at(path, &profiles)?;
-    Ok(true)
+    profiles.retain(|profile| profile.id != id);
+    save_at(path, &profiles)
 }
 
 /// 按 id 找一套档案。
@@ -238,9 +290,25 @@ fn short_hash(value: &str) -> String {
     format!("{:08x}", (hasher.finish() & 0xffff_ffff) as u32)
 }
 
+/// 测试用：造一份"当前生效的 `[server_config]`"。
+///
+/// `ServerConfig` 的字段是私有的（只有 `config::server` 能直接构造），所以测试从这里
+/// 反序列化一份，而不是为了测试去放宽字段可见性。
+#[cfg(test)]
+pub(crate) fn test_server(enabled: bool, url: &str, model_name: &str) -> ServerConfig {
+    serde_json::from_value(serde_json::json!({
+        "enabled": enabled,
+        "url": url,
+        "model_name": model_name,
+    }))
+    .expect("测试用的 server_config 必须能构造出来")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ModelProfile, slug, unique_id};
+    use super::{ModelProfile, PROFILES_FILE, slug, test_server, unique_id};
+    use axum::http::StatusCode;
+    use std::path::PathBuf;
 
     fn profile(id: &str, label: &str) -> ModelProfile {
         ModelProfile {
@@ -255,6 +323,128 @@ mod tests {
             max_output_tokens: 0,
             api_key: "sk-test".to_string(),
         }
+    }
+
+    /// 一次性临时目录：名字里带用例名，几个用例并行跑也不会互相踩。
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("kovi-profiles-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("应能建临时目录");
+        dir
+    }
+
+    /// 自己的一套档案：地址与模型名都对齐 `test_server(...)` 的调用点。
+    fn profile_at(id: &str, label: &str, url: &str, model_name: &str) -> ModelProfile {
+        ModelProfile {
+            url: url.to_string(),
+            model_name: model_name.to_string(),
+            ..profile(id, label)
+        }
+    }
+
+    /// 判定「正在用」：外部模型已启用 + 地址与模型名一致。
+    ///
+    /// 这份规则同时管着页面上的标记与删除闸门，所以把边界一次写清楚：尾部斜杠、
+    /// 首尾空白算同一套；换地址、换模型名、空模型名、外部模型关掉，都不算。
+    #[test]
+    fn only_the_enabled_endpoint_with_the_same_url_and_model_is_live() {
+        let server = test_server(true, "https://api.deepseek.com/v1", "deepseek-v4-flash");
+        let mut candidate = profile_at(
+            "deepseek",
+            "DeepSeek",
+            "https://api.deepseek.com/v1",
+            "deepseek-v4-flash",
+        );
+        assert!(candidate.is_live(&server));
+
+        // 一个斜杠、一点空白，拼出来的是同一个请求地址：仍算"正在用"。
+        candidate.url = "https://api.deepseek.com/v1/ ".to_string();
+        assert!(
+            candidate.is_live(&server),
+            "尾部斜杠与空白不该把它判成另一套"
+        );
+        candidate.url = "https://api.deepseek.com/v1".to_string();
+        candidate.model_name = " deepseek-v4-flash ".to_string();
+        assert!(candidate.is_live(&server));
+        candidate.model_name = "deepseek-v4-flash".to_string();
+
+        // 密钥、输出上限、协议都是能就地改的可变量：改了它还是同一个端点。
+        candidate.api_key = "sk-another".to_string();
+        candidate.max_output_tokens = 800;
+        candidate.wire_api = "responses".to_string();
+        assert!(
+            candidate.is_live(&server),
+            "可变量不该让正在用的那套变成另一套（否则它反而变得可删）"
+        );
+
+        // 换地址、换模型名、空模型名：都不是当前那套。
+        let mut other = profile_at(
+            "other",
+            "别的",
+            "https://api.deepseek.com/v2",
+            "deepseek-v4-flash",
+        );
+        assert!(!other.is_live(&server));
+        other.url = "https://api.deepseek.com/v1".to_string();
+        other.model_name = "deepseek-v3".to_string();
+        assert!(!other.is_live(&server));
+        other.model_name = String::new();
+        assert!(!other.is_live(&server), "没有模型名的档案不该冒充当前那套");
+
+        // 外部模型关掉（或配置里模型名是空的）时她只用本地能力，谁也不在跑。
+        assert!(!candidate.is_live(&test_server(
+            false,
+            "https://api.deepseek.com/v1",
+            "deepseek-v4-flash"
+        )));
+        assert!(!candidate.is_live(&test_server(true, "https://api.deepseek.com/v1", "")));
+    }
+
+    /// 正在用的那套删不掉：接口回 409，磁盘上那套必须原样还在。
+    #[test]
+    fn removing_the_live_profile_is_refused_and_leaves_the_file_alone() {
+        let path = temp_dir("remove-live").join(PROFILES_FILE);
+        let server = test_server(true, "https://api.deepseek.com/v1", "deepseek-v4-flash");
+        let live_id = super::upsert_at(
+            &path,
+            profile_at(
+                "",
+                "DeepSeek 主力",
+                "https://api.deepseek.com/v1",
+                "deepseek-v4-flash",
+            ),
+        )
+        .expect("应能存下正在用的那套");
+        let backup_id = super::upsert_at(
+            &path,
+            profile_at("", "备用", "https://api.example.com/v1", "example-model"),
+        )
+        .expect("应能存下备用那套");
+        let before = std::fs::read_to_string(&path).expect("应能读回档案文件");
+
+        let error = super::remove_at(&path, &live_id, &server).expect_err("正在用的那套必须删不掉");
+        assert_eq!(error.status, StatusCode::CONFLICT, "{error:?}");
+        assert!(
+            error.message.contains("正在用") && error.message.contains("先切到另一套档案"),
+            "得说清为什么不能删、怎么才能删: {}",
+            error.message
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("应能读回档案文件"),
+            before,
+            "拦下来之后文件不该有任何改动"
+        );
+        assert_eq!(super::list_at(&path).expect("应能读取").len(), 2);
+
+        // 外部模型关掉之后同一套就可以删了：她确实没在用它。
+        super::remove_at(&path, &live_id, &test_server(false, "", "")).expect("禁用后应能删");
+        assert_eq!(super::list_at(&path).expect("应能读取").len(), 1);
+        // 不在用的那套一直可删；找不到的 id 如实回 404。
+        super::remove_at(&path, &backup_id, &server).expect("备用那套应能删");
+        assert!(super::list_at(&path).expect("应能读取").is_empty());
+        let missing = super::remove_at(&path, &backup_id, &server).expect_err("再删应报找不到");
+        assert_eq!(missing.status, StatusCode::NOT_FOUND, "{missing:?}");
+        let _ = std::fs::remove_dir_all(path.parent().expect("临时目录"));
     }
 
     /// 应用一套档案要写全"换端点"需要的字段，并且顺手把外部模型打开。
