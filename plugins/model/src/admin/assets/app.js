@@ -1980,14 +1980,18 @@
       `${arrow} ${change > 0 ? '+' : ''}${change}% 对比上周`);
   }
 
+  /** 统计数字：`null` 表示"这一项查不出来"，画成「—」而不是 0——0 会被读成
+   *  "库里真的没有"，那是另一个意思。 */
+  const statNumber = (value) => (value === null || value === undefined ? '—' : String(value));
+
   /** 第二排：语料规模，正好 6 张（存储大小在概览页，这里不重复占位）。 */
   function renderStatCards(stats) {
     const byKind = stats.by_kind || {};
     const week = stats.week || {};
     const cards = [
-      ['记忆总数', String(stats.total ?? 0), deltaLine(week.new || 0, week.previous || 0)],
-      ['本周新增', String(week.new ?? 0), h('div', { class: 'delta flat' }, `涉及 ${(week.by_kind || []).length} 类记录`)],
-      ['人物', String(stats.people ?? 0), h('div', { class: 'delta flat' }, `${stats.conversations ?? 0} 个会话`)],
+      ['记忆总数', statNumber(stats.total ?? 0), deltaLine(week.new || 0, week.previous || 0)],
+      ['本周新增', statNumber(week.new ?? 0), h('div', { class: 'delta flat' }, `涉及 ${(week.by_kind || []).length} 类记录`)],
+      ['人物', statNumber(stats.people), h('div', { class: 'delta flat' }, `${statNumber(stats.conversations)} 个会话`)],
       ['情节', String(byKind.episode ?? 0), h('div', { class: 'delta flat' }, '第一人称经历')],
       ['目标', String(byKind.goal ?? 0), h('div', { class: 'delta flat' }, '长期目标')],
       ['未完结线索', String(byKind.open_loop ?? 0), h('div', { class: 'delta flat' }, '等着被接上')],
@@ -1998,6 +2002,13 @@
         h('div', { class: 'label', text: label }),
         h('div', { class: 'value', text: value }),
         extra));
+    }
+    // 有项目查不出来就直说：只画「—」会让人以为是数据缺失，而这里其实是后台
+    // 自己没查成功（原因在服务端日志里）。
+    const degraded = stats.partial_errors || [];
+    if (degraded.length) {
+      grid.append(h('div', { class: 'hint stat-degraded' },
+        `部分统计不可用：${degraded.join('、')}`));
     }
     return grid;
   }

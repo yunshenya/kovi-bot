@@ -302,13 +302,23 @@ fn clamp_limit(limit: Option<i64>) -> i64 {
 // ---------------------------------------------------------------- 概览
 
 async fn count_rows(pool: &PgPool, table: &str) -> Result<i64, ApiError> {
+    count_rows_detail(pool, table)
+        .await
+        .map_err(ApiError::internal)
+}
+
+/// 与 `count_rows` 相同，但把失败原因原样交回调用方。
+///
+/// 统计卡片的场景里"这一项查不出来"和"这一项真的是 0"必须分得开：整条路径报错会让
+/// 运维看不到其它可用的数字，静默当 0 又会被读成"库里真的没有"。
+async fn count_rows_detail(pool: &PgPool, table: &str) -> Result<i64, String> {
     let sql = format!("SELECT count(*) AS n FROM {table}");
     query(&sql)
         .fetch_one(pool)
         .await
-        .map_err(|error| ApiError::internal(format!("统计 {table} 失败: {error}")))?
+        .map_err(|error| format!("统计 {table} 失败: {error}"))?
         .try_get("n")
-        .map_err(|error| ApiError::internal(error.to_string()))
+        .map_err(|error| error.to_string())
 }
 
 /// 数据库里当前存在哪些表。
@@ -1323,14 +1333,23 @@ pub(crate) async fn stats() -> Result<Json<Value>, ApiError> {
     let mut week_new = 0_i64;
     let mut prev_week = 0_i64;
     let mut week_by_kind: Vec<Value> = Vec::new();
+    // 单项查询失败不再静默变成 0：能算的照常算，算不出来的如实标出来，同时把完整
+    // 原因写进服务端日志（接口只回一句"哪一项不可用"）。
+    let mut partial_errors: Vec<String> = Vec::new();
 
     for kind in KINDS {
         if !existing.contains(kind.table) {
             continue;
         }
         let total_sql = format!("SELECT count(*) AS n FROM {}", kind.table);
-        let Ok(row) = query(&total_sql).fetch_one(pool).await else {
-            continue;
+        let row = match query(&total_sql).fetch_one(pool).await {
+            Ok(row) => row,
+            Err(error) => {
+                let reason = format!("统计 {} 失败: {error}", kind.table);
+                eprintln!("[WARN] 后台记忆统计降级: {reason}");
+                partial_errors.push(format!("{} 计数不可用", kind.label));
+                continue;
+            }
         };
         let total: i64 = row.try_get("n").unwrap_or_default();
         if total == 0 {
@@ -1346,39 +1365,54 @@ pub(crate) async fn stats() -> Result<Json<Value>, ApiError> {
             mentioned = kind.mentioned_expr,
             table = kind.table,
         );
-        if let Ok(row) = query(&window_sql).fetch_one(pool).await {
-            let this_week: i64 = row.try_get("this_week").unwrap_or_default();
-            let last_week: i64 = row.try_get("last_week").unwrap_or_default();
-            week_new += this_week;
-            prev_week += last_week;
-            if this_week > 0 {
-                week_by_kind.push(json!({
-                    "key": kind.key,
-                    "label": kind.label,
-                    "count": this_week,
-                }));
+        match query(&window_sql).fetch_one(pool).await {
+            Ok(row) => {
+                let this_week: i64 = row.try_get("this_week").unwrap_or_default();
+                let last_week: i64 = row.try_get("last_week").unwrap_or_default();
+                week_new += this_week;
+                prev_week += last_week;
+                if this_week > 0 {
+                    week_by_kind.push(json!({
+                        "key": kind.key,
+                        "label": kind.label,
+                        "count": this_week,
+                    }));
+                }
+            }
+            Err(error) => {
+                let reason = format!("统计 {} 的周窗口失败: {error}", kind.table);
+                eprintln!("[WARN] 后台记忆统计降级: {reason}");
+                partial_errors.push(format!("{} 本周用量不可用", kind.label));
             }
         }
     }
 
-    let people = if existing.contains("yunxi_persons") {
-        count_rows(pool, "yunxi_persons").await.unwrap_or_default()
-    } else {
-        0
-    };
-    let conversations = if existing.contains("yunxi_conversations") {
-        count_rows(pool, "yunxi_conversations")
-            .await
-            .unwrap_or_default()
-    } else {
-        0
-    };
+    // 这两项查不出来时回 `null`（界面画成「—」），而不是回 0：0 会被读成
+    // "库里真的没有人物/会话"。
+    let people = count_or_unavailable(
+        pool,
+        &existing,
+        "yunxi_persons",
+        "人物",
+        &mut partial_errors,
+    )
+    .await;
+    let conversations = count_or_unavailable(
+        pool,
+        &existing,
+        "yunxi_conversations",
+        "会话",
+        &mut partial_errors,
+    )
+    .await;
 
     Ok(Json(json!({
         "total": by_kind.values().filter_map(Value::as_i64).sum::<i64>(),
         "by_kind": by_kind,
         "people": people,
         "conversations": conversations,
+        // 非空表示"这张卡片是部分结果"：界面据此提示，不让 0/— 冒充完整统计。
+        "partial_errors": partial_errors,
         // 本周 / 上周用量（保存、召回、反思、心智模型、模型调用）。
         "usage": crate::metrics::weekly_cards().await,
         "week": {
@@ -1388,6 +1422,28 @@ pub(crate) async fn stats() -> Result<Json<Value>, ApiError> {
         },
         "storage_bytes": crate::memory::MEMORY_MANAGER.storage_size_bytes().await,
     })))
+}
+
+/// 表不存在时回 0（这是"这个子系统没启用"的正常情形），查询失败时回 `null`
+/// 并把原因记进 `partial_errors`。
+async fn count_or_unavailable(
+    pool: &PgPool,
+    existing: &BTreeSet<String>,
+    table: &str,
+    label: &str,
+    partial_errors: &mut Vec<String>,
+) -> Value {
+    if !existing.contains(table) {
+        return json!(0);
+    }
+    match count_rows_detail(pool, table).await {
+        Ok(count) => json!(count),
+        Err(reason) => {
+            eprintln!("[WARN] 后台记忆统计降级: {reason}");
+            partial_errors.push(format!("{label}计数不可用"));
+            Value::Null
+        }
+    }
 }
 
 // ---------------------------------------------------------------- 内部实现
