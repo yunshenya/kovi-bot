@@ -822,9 +822,9 @@ mod tests {
     fn arbiter() -> ActionArbiter {
         let mut capabilities = EnvironmentCapabilities::all();
         capabilities.actions.extend([
-            crate::ActionDescriptor::tool("step.one", crate::EffectScope::Outbound),
-            crate::ActionDescriptor::tool("step.two", crate::EffectScope::Outbound),
-            crate::ActionDescriptor::tool("web.search", crate::EffectScope::Outbound),
+            crate::ActionDescriptor::tool("step.one", crate::EffectScope::Outbound, false),
+            crate::ActionDescriptor::tool("step.two", crate::EffectScope::Outbound, false),
+            crate::ActionDescriptor::tool("web.search", crate::EffectScope::Outbound, false),
         ]);
         ActionArbiter::new(ActionArbiterConfig {
             capabilities,

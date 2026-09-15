@@ -12,10 +12,10 @@ use yunxi_cli::{
     JournalRecord, MAX_CLI_OPEN_LOOPS_PER_OWNER, MAX_JOURNAL_INPUT_BYTES,
 };
 use yunxi_core::{
-    ActionPort, ActionPortError, ActionPortFuture, ActionPortOutcome,
-    AutonomyPolicy, ConversationId, ConversationTurnDirective, DecisionDisposition, DecisionPlan,
-    MessageContent, ModelBackend as CoreModelBackend, OpenLoopDraft, OpenLoopKind, OpenLoopOwner,
-    OpenLoopStore, PlannerInput, ProposedAction, WorldEventKind,
+    ActionPort, ActionPortError, ActionPortFuture, ActionPortOutcome, AutonomyPolicy,
+    ConversationId, ConversationTurnDirective, DecisionDisposition, DecisionPlan, MessageContent,
+    ModelBackend as CoreModelBackend, OpenLoopDraft, OpenLoopKind, OpenLoopOwner, OpenLoopStore,
+    PlannerInput, ProposedAction, WorldEventKind,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -629,7 +629,7 @@ fn cli_drives_a_tool_follow_up_through_the_core_cycle() {
     let host = CliHost::new(ToolThenReplyModel, environment, ConversationId::new())
         // Core refuses an undeclared tool, so the host has to say what it
         // exposes and how far that reaches.
-        .with_tool("cli.lookup", yunxi_core::EffectScope::ReadOnly);
+        .with_tool("cli.lookup", yunxi_core::EffectScope::ReadOnly, false);
 
     let response = host.process_line("今天天气怎么样").expect("response");
     assert_eq!(

@@ -423,6 +423,13 @@ pub struct CognitiveRuntime {
     /// tool never allocates a budget entry, so "no entry" cannot stand in for
     /// "finished".
     lifecycle: TraceLifecycle,
+    /// Tasks that have taken in a tool result which may contain text written
+    /// by someone else, keyed by trace root.
+    ///
+    /// After that, speaking in her name on the strength of that text is not
+    /// something the task should do — so its effect ceiling narrows. Held in the
+    /// same lifecycle as the rest of a task's record.
+    foreign_text_roots: HashSet<EventId>,
     /// What each in-flight task has tried so far, keyed by trace root.
     ///
     /// Bounded by the same lifecycle as the tool budget ledger: an entry
@@ -606,6 +613,7 @@ impl CognitiveRuntime {
                 probed_commands: VecDeque::new(),
                 pending_tool_follow_ups: VecDeque::new(),
                 lifecycle: TraceLifecycle::default(),
+                foreign_text_roots: HashSet::new(),
                 working_memory: HashMap::new(),
                 tool_action_budget_by_trace: HashMap::new(),
                 tool_action_budget_order: VecDeque::new(),
@@ -788,6 +796,46 @@ impl CognitiveRuntime {
             .register_expectation(expectation.for_trace(root))
     }
 
+    /// Notes whether an observed event puts untrusted text into its task.
+    ///
+    /// Only a tool result can: a message from a person is her actual subject
+    /// matter, while a tool's output is material the task went and fetched, and
+    /// anything in it may have been written by someone who is not in this
+    /// conversation at all.
+    fn note_result_provenance(&mut self, event: &WorldEvent, arbiter: &ActionArbiter) {
+        let operation = match event.kind() {
+            WorldEventKind::ToolCompleted(tool) => &tool.operation,
+            WorldEventKind::ToolFailed(tool) => &tool.operation,
+            _ => return,
+        };
+        // `None` means the host never declared this operation, which is already
+        // refused at dispatch; treat it as untrusted rather than assuming it is
+        // harmless.
+        let carries_foreign_text = arbiter
+            .config()
+            .capabilities
+            .may_carry_foreign_text(operation)
+            .unwrap_or(true);
+        if carries_foreign_text {
+            self.foreign_text_roots
+                .insert(event.trace().root_event_id());
+        }
+    }
+
+    /// The effect ceiling a task has earned.
+    ///
+    /// A task that has read material from outside this conversation may still
+    /// read more and may still change its own person's state, but it must not
+    /// speak in her name or change shared state on the strength of that
+    /// material. Every other task is unrestricted.
+    fn effect_ceiling_for(&self, root: EventId) -> crate::EffectScope {
+        if self.foreign_text_roots.contains(&root) {
+            crate::EffectScope::UserScoped
+        } else {
+            crate::EffectScope::Outbound
+        }
+    }
+
     /// Registers what a plan says should happen after this turn.
     ///
     /// Two kinds are registered, and the difference matters:
@@ -938,6 +986,7 @@ impl CognitiveRuntime {
         let _ = self.executive.settle_trace_expectations(root);
         // A terminal task can no longer produce a round that would read this.
         self.working_memory.remove(&root);
+        self.foreign_text_roots.remove(&root);
         if self.tool_action_budget_by_trace.remove(&root).is_some() {
             self.tool_action_budget_order
                 .retain(|candidate| *candidate != root);
@@ -1320,6 +1369,10 @@ impl CognitiveRuntime {
                 return Ok(PlannedProcessingOutcome::RejectedState { event, error });
             }
         };
+        // Record trust before planning: this turn's own ceiling depends on what
+        // the event just delivered, and a tool call in this turn must already
+        // be subject to it.
+        self.note_result_provenance(&planner_event, arbiter);
         if guard.is_some_and(|guard| !guard()) {
             return Ok(PlannedProcessingOutcome::Planned {
                 observation,
@@ -1452,6 +1505,32 @@ impl CognitiveRuntime {
                 release_unexecuted_tool_intents_from(&planner_event, &plan, intent_index, port)
                     .await;
                 return Err(error);
+            }
+            // The ceiling is Core's own judgement and is per task, not per
+            // host configuration: a task that has read material from outside
+            // this conversation may still read and may still change its own
+            // person's state, but must not speak in her name. The arbiter has
+            // already refused anything the host never declared.
+            if let crate::ProposedAction::UseTool(tool) = &proposed
+                && let Some(effect) = arbiter.config().capabilities.effect_of(&tool.tool_name)
+                && effect > self.effect_ceiling_for(planner_event.trace().root_event_id())
+            {
+                let result = ActionResult::Rejected(crate::ActionRejection::Unauthorized {
+                    action_id: proposed.action_id(),
+                    reason: format!(
+                        "tool `{}` reaches {effect:?}, beyond this task's ceiling",
+                        tool.tool_name
+                    ),
+                });
+                port.release_unexecuted(&proposed).await;
+                if let Some(attempt) = crate::working_memory::attempt_from_intent(intent, &result) {
+                    self.working_memory
+                        .entry(planner_event.trace().root_event_id())
+                        .or_default()
+                        .record_round(std::slice::from_ref(&attempt));
+                }
+                actions.push(result);
+                continue;
             }
             if selected_action.is_none() && !matches!(&proposed, crate::ProposedAction::Noop) {
                 selected_action = Some(proposed.clone());
@@ -3672,6 +3751,114 @@ mod tests {
         );
     }
 
+    /// Reading material from outside this conversation narrows what a task may
+    /// still do on the strength of it.
+    ///
+    /// The result of `web.fetch` may contain text somebody else wrote, so after
+    /// it a task may still read (`web.fetch`) but must not speak as her
+    /// (`group.send`). A tool whose result cannot carry foreign text does not
+    /// narrow anything.
+    #[tokio::test]
+    async fn a_task_that_read_foreign_text_may_no_longer_act_outward() {
+        let conversation_id = ConversationId::new();
+        let (_handle, mut runtime) = CognitiveRuntime::new_with_services(
+            RuntimeConfig::default(),
+            CoreServices::with_model(ReadThenSpeakModel { conversation_id }),
+        )
+        .expect("valid runtime");
+        let mut capabilities = EnvironmentCapabilities::all();
+        capabilities.actions.extend([
+            crate::ActionDescriptor::tool("web.fetch", crate::EffectScope::ReadOnly, true),
+            crate::ActionDescriptor::tool("group.send", crate::EffectScope::Outbound, false),
+        ]);
+        let arbiter =
+            ActionArbiter::new(ActionArbiterConfig::default().with_capabilities(capabilities));
+        let event = direct_message(conversation_id, PersonId::new());
+        let first = runtime
+            .process_event_with_planner_and_actions(event, &arbiter, &ToolAndMessagePort)
+            .await
+            .expect("first turn runs");
+        assert!(
+            matches!(
+                &first,
+                PlannedProcessingOutcome::Planned { actions, .. }
+                    if matches!(
+                        actions.as_slice(),
+                        [ActionResult::Executed {
+                            outcome: ActionPortOutcome::ToolCompleted { .. },
+                            ..
+                        }]
+                    )
+            ),
+            "the read must go through: {first:?}"
+        );
+
+        // The follow-up turn, now that the task has read outside material.
+        let second = runtime
+            .process_next_with_planner_and_actions(&arbiter, &ToolAndMessagePort)
+            .await
+            .expect("follow-up turn exists")
+            .expect("follow-up turn plans");
+        let PlannedProcessingOutcome::Planned { actions, .. } = second else {
+            panic!("the follow-up turn must plan");
+        };
+        assert!(
+            matches!(
+                actions.as_slice(),
+                [ActionResult::Rejected(ActionRejection::Unauthorized { reason, .. })]
+                    if reason.contains("beyond this task's ceiling")
+            ),
+            "speaking outward after reading outside material must be refused: {actions:?}"
+        );
+    }
+
+    /// Reads an outside source, then tries to speak outward on the next turn.
+    struct ReadThenSpeakModel {
+        conversation_id: ConversationId,
+    }
+
+    impl ModelBackend for ReadThenSpeakModel {
+        fn plan<'a>(&'a self, input: &'a PlannerInput) -> ModelBackendFuture<'a> {
+            Box::pin(async move {
+                let follow_up = matches!(
+                    input.event.kind(),
+                    WorldEventKind::ToolCompleted(tool) if tool.requires_follow_up
+                );
+                let tool_name = if follow_up { "group.send" } else { "web.fetch" };
+                Ok(DecisionPlan {
+                    disposition: DecisionDisposition::Reply,
+                    intents: vec![crate::CognitiveIntent::UseTool {
+                        tool_name: tool_name.to_owned(),
+                        input: "{}".to_owned(),
+                        scope: crate::ActionScope::Conversation(self.conversation_id),
+                        notification_policy: crate::ToolNotificationPolicy::Final,
+                    }],
+                    state_updates: Vec::new(),
+                    expectations: Vec::new(),
+                })
+            })
+        }
+    }
+
+    /// Completes tools so the first turn produces a follow-up.
+    struct ToolAndMessagePort;
+
+    impl ActionPort for ToolAndMessagePort {
+        fn execute<'a>(&'a self, action: &'a crate::ProposedAction) -> crate::ActionPortFuture<'a> {
+            Box::pin(async move {
+                match action {
+                    crate::ProposedAction::UseTool(tool) => {
+                        Ok(crate::ActionPortOutcome::ToolCompleted {
+                            operation: tool.tool_name.clone(),
+                            output: "someone else wrote this".to_owned(),
+                        })
+                    }
+                    _ => Err(crate::ActionPortError::new("unsupported", false)),
+                }
+            })
+        }
+    }
+
     /// Capabilities for a test environment that exposes the fixture tools.
     ///
     /// Core refuses a tool the host never declared, so a test exercising the
@@ -3680,13 +3867,13 @@ mod tests {
     fn all_capabilities() -> EnvironmentCapabilities {
         let mut capabilities = EnvironmentCapabilities::all();
         capabilities.actions.extend([
-            crate::ActionDescriptor::tool("web.search", crate::EffectScope::Outbound),
-            crate::ActionDescriptor::tool("calculator", crate::EffectScope::Outbound),
-            crate::ActionDescriptor::tool("weather.current", crate::EffectScope::Outbound),
-            crate::ActionDescriptor::tool("background.task", crate::EffectScope::Outbound),
-            crate::ActionDescriptor::tool("step.one", crate::EffectScope::Outbound),
-            crate::ActionDescriptor::tool("step.two", crate::EffectScope::Outbound),
-            crate::ActionDescriptor::tool("time.now", crate::EffectScope::Outbound),
+            crate::ActionDescriptor::tool("web.search", crate::EffectScope::Outbound, false),
+            crate::ActionDescriptor::tool("calculator", crate::EffectScope::Outbound, false),
+            crate::ActionDescriptor::tool("weather.current", crate::EffectScope::Outbound, false),
+            crate::ActionDescriptor::tool("background.task", crate::EffectScope::Outbound, false),
+            crate::ActionDescriptor::tool("step.one", crate::EffectScope::Outbound, false),
+            crate::ActionDescriptor::tool("step.two", crate::EffectScope::Outbound, false),
+            crate::ActionDescriptor::tool("time.now", crate::EffectScope::Outbound, false),
         ]);
         capabilities
     }

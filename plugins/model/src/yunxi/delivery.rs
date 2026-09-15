@@ -1373,7 +1373,7 @@ impl ChannelAdapter for QqActionAdapter {
             registry
                 .declared_effects()
                 .into_iter()
-                .map(|(name, effect)| ActionDescriptor::tool(name, effect)),
+                .map(|(name, effect, foreign)| ActionDescriptor::tool(name, effect, foreign)),
         );
         capabilities
     }

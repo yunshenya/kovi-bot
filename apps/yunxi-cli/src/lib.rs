@@ -421,7 +421,12 @@ where
     /// Core refuses a tool the host has not declared, so a model that asks for
     /// one gets a rejection rather than reaching the environment.
     #[must_use]
-    pub fn with_tool(mut self, name: impl Into<String>, effect: EffectScope) -> Self {
+    pub fn with_tool(
+        mut self,
+        name: impl Into<String>,
+        effect: EffectScope,
+        may_carry_foreign_text: bool,
+    ) -> Self {
         let mut config = self.arbiter.config().clone();
         if !config
             .capabilities
@@ -434,10 +439,11 @@ where
                 .actions
                 .push(ActionDescriptor::new(ActionCapability::UseTool));
         }
-        config
-            .capabilities
-            .actions
-            .push(ActionDescriptor::tool(name, effect));
+        config.capabilities.actions.push(ActionDescriptor::tool(
+            name,
+            effect,
+            may_carry_foreign_text,
+        ));
         self.arbiter = ActionArbiter::new(config);
         self
     }

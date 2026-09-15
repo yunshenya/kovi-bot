@@ -1254,7 +1254,7 @@ impl ToolRegistry {
     /// MCP tools are declared as [`EffectScope::Outbound`] unless the server was
     /// configured read-only, matching the existing rule that a remote tool's
     /// effects cannot be audited.
-    pub(crate) fn declared_effects(&self) -> Vec<(String, yunxi_core::EffectScope)> {
+    pub(crate) fn declared_effects(&self) -> Vec<(String, yunxi_core::EffectScope, bool)> {
         use yunxi_core::EffectScope;
         self.definitions
             .iter()
@@ -1264,7 +1264,14 @@ impl ToolRegistry {
                     WriteScope::UserScoped => EffectScope::UserScoped,
                     WriteScope::Outbound => EffectScope::Outbound,
                 };
-                (definition.name.clone(), effect)
+                // Whether the result can carry text somebody else wrote is a
+                // fact about the tool, and Core needs it to decide how far a
+                // task may still act after reading that result.
+                (
+                    definition.name.clone(),
+                    effect,
+                    definition.source.result_may_carry_foreign_text(),
+                )
             })
             .collect()
     }

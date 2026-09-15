@@ -75,21 +75,36 @@ pub struct ActionDescriptor {
     pub allowed_scopes: Option<Vec<ActionScope>>,
     /// Which tool this declares, for hosts that expose tools.
     ///
-    /// A `UseTool` intent names a tool, not a capability, so Core cannot tell
-    /// what a call does without this: the capability says "this host can use
-    /// tools", never "this particular call only reads".
+    /// A `UseTool` intent names a tool, not a capability, so Core cannot match a
+    /// call to its declaration without this: the capability says "this host can
+    /// use tools", never "this particular call only reads".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool: Option<String>,
-    /// Whose state this action can change.
+    /// How far this tool's effects reach.
     ///
     /// Declared by the host, because only the host knows what a call does.
     /// Defaults to [`EffectScope::Outbound`] so an undeclared or unknown action
     /// fails closed rather than being treated as harmless.
     #[serde(default)]
     pub effect: EffectScope,
+    /// Whether this tool's result can contain text written by someone else.
+    ///
+    /// A web page, a search result, a remote server, another person's nickname:
+    /// after one of those enters a task, speaking in her name on the strength of
+    /// it is not something she should do. This is a host fact about a tool, so
+    /// it is declared here rather than re-derived by Core — and it defaults to
+    /// true, so a forgotten declaration cannot quietly earn a wider ceiling.
+    #[serde(default = "default_may_carry_foreign_text")]
+    pub may_carry_foreign_text: bool,
+}
+
+const fn default_may_carry_foreign_text() -> bool {
+    true
 }
 
 /// How far an action's effects reach.
+///
+/// See [`EffectScope`] variants for what each tier admits.
 ///
 /// This is the declaration Core needs to decide whether a call is allowed given
 /// what the current turn has been exposed to. It is deliberately about *reach*,
@@ -119,6 +134,7 @@ impl ActionDescriptor {
             allowed_scopes: None,
             tool: None,
             effect: EffectScope::Outbound,
+            may_carry_foreign_text: false,
         }
     }
 
@@ -132,17 +148,24 @@ impl ActionDescriptor {
             allowed_scopes: Some(scopes.into_iter().collect()),
             tool: None,
             effect: EffectScope::Outbound,
+            may_carry_foreign_text: false,
         }
     }
 
-    /// Declares one tool this host exposes, and how far its effects reach.
+    /// Declares one tool this host exposes, how far its effects reach, and
+    /// whether its result can carry text written by someone else.
     #[must_use]
-    pub fn tool(name: impl Into<String>, effect: EffectScope) -> Self {
+    pub fn tool(
+        name: impl Into<String>,
+        effect: EffectScope,
+        may_carry_foreign_text: bool,
+    ) -> Self {
         Self {
             capability: ActionCapability::UseTool,
             allowed_scopes: None,
             tool: Some(name.into()),
             effect,
+            may_carry_foreign_text,
         }
     }
 
@@ -211,8 +234,13 @@ impl EnvironmentCapabilities {
     /// to check a call against — and an undeclared tool is indistinguishable
     /// from a hallucinated one.
     #[must_use]
-    pub fn with_tool(self, name: impl Into<String>, effect: EffectScope) -> Self {
-        self.with_action(ActionDescriptor::tool(name, effect))
+    pub fn with_tool(
+        self,
+        name: impl Into<String>,
+        effect: EffectScope,
+        may_carry_foreign_text: bool,
+    ) -> Self {
+        self.with_action(ActionDescriptor::tool(name, effect, may_carry_foreign_text))
     }
 
     /// How far the named tool's effects reach, when the host declared it.
@@ -221,10 +249,22 @@ impl EnvironmentCapabilities {
     /// "not permitted" rather than "harmless".
     #[must_use]
     pub fn effect_of(&self, tool_name: &str) -> Option<EffectScope> {
+        self.declaration_of(tool_name)
+            .map(|descriptor| descriptor.effect)
+    }
+
+    /// Whether the named tool's result can contain text written by someone
+    /// else. `None` for an undeclared tool, which callers treat as unsafe.
+    #[must_use]
+    pub fn may_carry_foreign_text(&self, tool_name: &str) -> Option<bool> {
+        self.declaration_of(tool_name)
+            .map(|descriptor| descriptor.may_carry_foreign_text)
+    }
+
+    fn declaration_of(&self, tool_name: &str) -> Option<&ActionDescriptor> {
         self.actions
             .iter()
             .find(|descriptor| descriptor.tool.as_deref() == Some(tool_name))
-            .map(|descriptor| descriptor.effect)
     }
 
     #[must_use]
@@ -1422,16 +1462,20 @@ mod tests {
             )
         };
         let mut capabilities = EnvironmentCapabilities::all();
-        capabilities
-            .actions
-            .push(ActionDescriptor::tool("web.search", EffectScope::ReadOnly));
+        capabilities.actions.push(ActionDescriptor::tool(
+            "web.search",
+            EffectScope::ReadOnly,
+            true,
+        ));
         capabilities.actions.push(ActionDescriptor::tool(
             "memory.remember",
             EffectScope::UserScoped,
+            false,
         ));
         capabilities.actions.push(ActionDescriptor::tool(
             "group.message.send",
             EffectScope::Outbound,
+            false,
         ));
 
         let arbiter =
@@ -1465,16 +1509,20 @@ mod tests {
         let conversation_id = ConversationId::new();
         let scope = ActionScope::Conversation(conversation_id);
         let mut capabilities = EnvironmentCapabilities::all();
-        capabilities
-            .actions
-            .push(ActionDescriptor::tool("web.search", EffectScope::ReadOnly));
+        capabilities.actions.push(ActionDescriptor::tool(
+            "web.search",
+            EffectScope::ReadOnly,
+            true,
+        ));
         capabilities.actions.push(ActionDescriptor::tool(
             "memory.remember",
             EffectScope::UserScoped,
+            false,
         ));
         capabilities.actions.push(ActionDescriptor::tool(
             "group.message.send",
             EffectScope::Outbound,
+            false,
         ));
 
         // A turn that took in text written by someone else may still read and
