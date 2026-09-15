@@ -554,6 +554,7 @@
     const scopes = info.scopes || [];
     const stuck = Number(info.stuck || 0);
     const idle = scopes.length === 0;
+    const auto = Boolean(info.auto_reclaim_enabled);
     return h('div', { class: `card wait-card${stuck > 0 ? ' stalled' : ''}` },
       h('div', { class: 'card-head' },
         h('h3', { text: '等待房间' }),
@@ -566,7 +567,43 @@
           ? h('div', { class: 'empty', text: waitingRoomSummary(info) })
           : h('div', { class: 'wait-list' }, scopes.map(waitingRoomRow))),
       h('div', { class: 'hint wait-foot' },
-        `静默超过 ${formatWait(info.stalled_after_secs)} 判为疑似卡住；空闲会话不列出。`));
+        `静默超过 ${formatWait(info.stalled_after_secs)} 判为疑似卡住；空闲会话不列出。`
+        + (auto
+          ? `自动回收已开启（超过 ${formatWait(info.reclaim_after_secs)} 的卡死回合会被自动判死）。`
+          : `自动回收未开启：目前只记账、只打 [STALL] 日志，卡住了需要人来点「回收这一轮」。`)));
+  }
+
+  /** 回收一个卡死的回合：人判断、机器执行。
+   *
+   *  为什么要有按钮：等待房间能看出卡住、日志能证明卡在哪一步，但真出事时最终
+   *  往往是重启进程——那会清掉**所有**会话的排队。这个按钮只动一个会话，而且只动
+   *  "回合"不动"消息"（队列里的原文会按顺序补答）。
+   *
+   *  先 `confirm` 说清代价再发请求：它确实会丢掉那一轮已经生成的回复，这个决定
+   *  不该由一次误点做出。  */
+  async function reclaimTurn(item, button) {
+    const label = item.kind === 'group' ? '群' : '会话';
+    const ok = window.confirm(
+      `回收 ${label} ${item.subject_id} 卡住的回合？\n\n`
+      + `· 这一轮已经生成但没发出去的回复会被丢弃（不会补发）\n`
+      + `· 队列里排着的消息保持不动，会按顺序补答\n`
+      + `· 只影响这一个会话，其他会话不受影响`);
+    if (!ok) return;
+    button.disabled = true;
+    try {
+      const result = await api('/api/waiting-room/reclaim', {
+        method: 'POST',
+        body: { kind: item.kind, subject_id: item.subject_id, generation: item.reply && item.reply.generation },
+      });
+      toast(result.detail || '已回收', 'ok', 8000);
+      // 立刻重拉：这个会话应当马上从"疑似卡住"变成在跑或空闲。
+      await fetchStatus(0);
+      updateWaitingRoomCard((statusCache.value && statusCache.value.waiting_room) || {});
+    } catch (problem) {
+      toast(`回收失败：${problem.message}`, 'bad', 9000);
+    } finally {
+      button.disabled = false;
+    }
   }
 
   /** 一行一个会话。字段与 `/api/status` 的 waiting_room 一一对应，不在这里二次推断。 */
@@ -601,6 +638,16 @@
           h('span', { class: 'wait-metric-label', text: '静默' }),
           h('span', { class: 'wait-metric-value mono', text: formatWait(item.drain_last_progress_secs) })),
         stepText ? h('span', { class: 'wait-step mono', text: stepText, title: `这一步已停 ${item.turn_step_secs ?? '—'} 秒` }) : null),
+      // 卡住的行才给按钮：正常在跑的会话不该出现"强行取消"的入口。
+      item.stuck
+        ? h('div', { class: 'wait-actions' },
+            h('button', {
+              class: 'btn ghost small',
+              text: '回收这一轮',
+              title: '判死卡住的回合，让这个会话立刻能重新接话；队列里的消息保持不动',
+              onclick: (event) => reclaimTurn(item, event.currentTarget),
+            }))
+        : null,
       h('div', { class: 'wait-why' },
         h('span', { text: item.stuck_reason || item.summary || '' }),
         !item.stuck && item.oldest_sender

@@ -23,6 +23,7 @@ mod model_profiles;
 mod status_api;
 mod sticker_api;
 mod token;
+mod waiting_room_api;
 
 use crate::config::AdminConfig;
 use axum::Json;
@@ -401,6 +402,7 @@ pub(crate) fn router(state: Arc<AdminState>) -> Router {
         .route("/api/model", get(model_api::state))
         .route("/api/model/apply", post(model_api::apply))
         .route("/api/model/test", post(model_api::test))
+        .route("/api/waiting-room/reclaim", post(waiting_room_api::reclaim))
         .route(
             "/api/model/profiles/{id}",
             axum::routing::delete(model_api::remove_profile),

@@ -59,6 +59,15 @@ impl ReplyTicket {
     pub(crate) fn scope_epoch(self) -> u64 {
         self.scope_epoch
     }
+
+    /// 这一代回复的代数（运维可见的"回合编号"）。
+    ///
+    /// 给运行时观测用：回收卡死的回合前先记下观测到的代数，回收时再核对一次——
+    /// 中间若已经有人推进过，那次回收就该自己放弃（幂等），否则按钮连点或
+    /// 自动回收并发时会把同一个回合记成回收两次。
+    pub(crate) fn generation(self) -> u64 {
+        self.generation
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -657,6 +666,62 @@ pub(crate) async fn cancel_locked(scope: ReplyScope) -> ReplyTicket {
     let state = states.entry(scope).or_default();
     expire_coordination(scope, state, Instant::now());
     advance_generation(scope, state, OutgoingState::Cancelled)
+}
+
+/// 一次"回收卡死回合"改动了什么。给调用方记账与写日志用。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GenerationReclaim {
+    /// 推进之后的代数。
+    pub(crate) generation: u64,
+    /// 连带给成终态（`Superseded`）的、已生成未发出的回复条数。
+    pub(crate) discarded_prepared: usize,
+    /// 释放掉的待定/活跃入站预留条数。
+    pub(crate) released_admissions: usize,
+}
+
+/// 把一个会话当前这一代判死——**运行时观测的处置出口**，给"回合卡死了"用。
+///
+/// 与 `cancel_locked` 的区别在语义：那个是"用户要求停止"（终态记 `Cancelled`），
+/// 这个是"这一轮已经没人管了，把它收掉让会话重新能接话"（终态记 `Superseded`——
+/// 那条回复本来就没人打算发，不该伪装成被取消）。两者都走同一个
+/// `advance_generation`，不新造状态机。
+///
+/// 三道自我约束：
+/// 1. **代数必须还是观测到的那一代**：按钮连点、自动回收与手动同时触发时，
+///    第二次会拿到 `None`，不会被误记成回收两次；
+/// 2. **没有在途回合就不动**：空闲会话既不该被"回收"，也不该因为一次误点推进代数；
+/// 3. **释放预留**（`clear_pending_incoming` 会唤醒等待者），否则排空会继续等一个
+///    再也不会有人回应的 admission。
+///
+/// 注意它**不动任何锁以外的资源**：队列、记忆、数据库都不碰——回收的是"回合"，
+/// 不是消息。
+pub(crate) async fn reclaim_generation(
+    scope: ReplyScope,
+    observed_generation: u64,
+) -> Option<GenerationReclaim> {
+    let lock = scope_mutex(scope);
+    let _scope_guard = lock.lock().await;
+    let mut states = REPLY_STATES.lock().await;
+    let state = states.get_mut(&scope)?;
+    let now = Instant::now();
+    expire_coordination(scope, state, now);
+    if state.active_generation.is_none() || state.generation != observed_generation {
+        return None;
+    }
+    let released_admissions = usize::from(state.pending_incoming.is_some())
+        + state.active_incoming.len()
+        + usize::from(state.pending_precommit.is_some());
+    let discarded_prepared = state
+        .pending_outgoing
+        .iter()
+        .filter(|pending| pending.state == OutgoingState::Prepared)
+        .count();
+    let next = advance_generation(scope, state, OutgoingState::Superseded);
+    Some(GenerationReclaim {
+        generation: next.generation,
+        discarded_prepared,
+        released_admissions,
+    })
 }
 
 /// Cancel an ingress only if no newer event has crossed the conversation
@@ -1966,15 +2031,15 @@ mod tests {
         OutgoingSource, OutgoingState, OutgoingToken, REPLY_STATES, ReplyScope,
         action_outgoing_fingerprint, cancel_locked, cancel_prepared_proactive_locked,
         claim_follow_up, clear_reply_state_locked, commit_outgoing, commit_outgoing_guard,
-        commit_outgoing_guard_with_context, contextual_outgoing_fingerprint,
+        commit_outgoing_guard_with_context, contextual_outgoing_fingerprint, current_ticket,
         find_prepared_outgoing, find_prepared_outgoing_by_fingerprint, finish, interrupt,
         interrupt_if_current, is_active, is_current, mark_active, mark_outgoing_failed,
-        mark_outgoing_sent, outgoing_fingerprint, prepare_outgoing,
-        prepare_outgoing_batch_with_semantic_preview, prepare_proactive_outgoing_if_idle,
-        prepared_outgoing_source_locked, release_active_incoming, release_incoming_locked,
-        reserve_active_incoming_locked, reserve_incoming_locked, scope_mutex, scope_reply_snapshot,
-        take_message_collisions, try_freeze_prepared_for_incoming_locked,
-        wait_for_pending_incoming,
+        mark_outgoing_sent, outgoing_fingerprint, pending_incoming_for_ticket_locked,
+        prepare_outgoing, prepare_outgoing_batch_with_semantic_preview,
+        prepare_proactive_outgoing_if_idle, prepared_outgoing_source_locked, reclaim_generation,
+        release_active_incoming, release_incoming_locked, reserve_active_incoming_locked,
+        reserve_incoming_locked, scope_mutex, scope_reply_snapshot, take_message_collisions,
+        try_freeze_prepared_for_incoming_locked, wait_for_pending_incoming,
     };
     use std::time::Duration;
 
@@ -2483,6 +2548,120 @@ mod tests {
                 finish(ticket).await;
                 let done = scope_reply_snapshot(scope).await;
                 assert!(!done.is_active(), "收尾之后不再是在途回合");
+            });
+    }
+
+    /// 回收：把卡死的那一轮判死，让会话立刻能接新活；旧票当场作废。
+    #[test]
+    fn reclaiming_a_generation_kills_the_turn_and_frees_admissions() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let scope = ReplyScope::Group(9_000_030);
+                let ticket = interrupt(scope).await;
+                assert!(mark_active(ticket).await);
+                // 一条已经生成好、还没发出去的回复：回收时必须被丢掉（不补发）。
+                assert!(
+                    prepare_outgoing(
+                        ticket,
+                        outgoing_fingerprint("卡住的回复"),
+                        OutgoingSource::Reply
+                    )
+                    .await
+                    .is_some()
+                );
+                let reservation_id = {
+                    let lock = scope_mutex(scope);
+                    let _guard = lock.lock().await;
+                    reserve_incoming_locked(ticket)
+                        .await
+                        .expect("应能预留一次入站")
+                };
+
+                let reclaimed = reclaim_generation(scope, ticket.generation())
+                    .await
+                    .expect("卡死的在途回合应当能回收");
+                assert_eq!(reclaimed.generation, ticket.generation() + 1);
+                assert_eq!(reclaimed.discarded_prepared, 1, "已生成未发出的要记账");
+                assert_eq!(reclaimed.released_admissions, 1, "待定入场要一并释放");
+
+                assert!(!is_current(ticket).await, "旧票必须当场作废");
+                assert!(!is_active(scope).await, "回收之后这个会话不再有在途回合");
+                let snapshot = scope_reply_snapshot(scope).await;
+                assert_eq!(snapshot.prepared_outgoing, 0, "Prepared 不能留着等人补发");
+                assert_eq!(snapshot.pending_incoming, 0);
+                assert_eq!(snapshot.active_secs, None);
+
+                // 回收必须**唤醒**等待者（排空正卡在 `wait_for_pending_incoming` 上等
+                // 一个不会再有人回应的入场）：被唤醒后它要么看到预留已清空（返回 true），
+                // 要么发现自己的票已经陈旧（返回 false）——两条路都意味着"不用再等了"。
+                let woken = kovi::tokio::time::timeout(
+                    Duration::from_secs(2),
+                    wait_for_pending_incoming(ticket),
+                )
+                .await
+                .expect("回收必须唤醒等待者，不能让它一直挂着");
+                assert!(
+                    !pending_incoming_for_ticket_locked(ticket).await,
+                    "唤醒之后不该还认为这个票有未决入场（woken={woken}）"
+                );
+                let _ = reservation_id;
+            });
+    }
+
+    /// 幂等：拿着过期的代数再来一次必须被拒——按钮连点、自动回收与手动同时触发时，
+    /// 不能把同一个回合记成回收两次，更不能误杀随后已经开始的新回合。
+    #[test]
+    fn reclaiming_is_idempotent_and_never_touches_a_newer_turn() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let scope = ReplyScope::Group(9_000_031);
+                let stale = interrupt(scope).await;
+                assert!(mark_active(stale).await);
+                assert!(
+                    reclaim_generation(scope, stale.generation())
+                        .await
+                        .is_some()
+                );
+                assert!(
+                    reclaim_generation(scope, stale.generation())
+                        .await
+                        .is_none(),
+                    "同一个代数不能被回收两次"
+                );
+
+                // 新回合已经开始：拿旧代数来回收必须被拒，且新回合不受影响。
+                let fresh = interrupt(scope).await;
+                assert!(mark_active(fresh).await);
+                assert!(
+                    reclaim_generation(scope, stale.generation())
+                        .await
+                        .is_none()
+                );
+                assert!(is_current(fresh).await, "新回合不该被陈旧的回收请求带走");
+                assert!(is_active(scope).await);
+            });
+    }
+
+    /// 空闲会话不回收：代数不能因为一次误点而推进（否则会白白作废别人的在途工作）。
+    #[test]
+    fn reclaiming_an_idle_scope_is_refused() {
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let scope = ReplyScope::Private(9_000_032);
+                let ticket = interrupt(scope).await;
+                let generation = ticket.generation();
+                assert!(!is_active(scope).await, "还没开始回复");
+                assert!(reclaim_generation(scope, generation).await.is_none());
+                assert_eq!(
+                    current_ticket(scope)
+                        .await
+                        .map(|ticket| ticket.generation()),
+                    Some(generation),
+                    "被拒的回收不得推进代数"
+                );
             });
     }
 

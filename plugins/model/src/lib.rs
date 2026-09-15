@@ -943,11 +943,31 @@ async fn main() {
                     let traffic = config::get().traffic().clone();
                     let stall_secs = traffic.turn_stall_secs();
                     if stall_secs > 0 {
-                        model::waiting_room::scan_shadow(
-                            std::time::Duration::from_secs(stall_secs),
-                            std::time::Duration::from_secs(traffic.turn_reclaim_secs()),
-                        )
-                        .await;
+                        let stall_after = std::time::Duration::from_secs(stall_secs);
+                        let reclaim_after =
+                            std::time::Duration::from_secs(traffic.turn_reclaim_secs());
+                        model::waiting_room::scan_shadow(stall_after, reclaim_after).await;
+                        // 自动回收：默认关闭（`traffic.turn_reclaim_enabled`）。它做的事
+                        // 和后台那个手动按钮完全一样，只是由看门狗按同一套判据执行——
+                        // 打开前先确认影子档的 `would_reclaim=true` 没有误报。
+                        if traffic.turn_reclaim_enabled() {
+                            let reclaimed =
+                                model::waiting_room::reclaim_stalled(stall_after, reclaim_after)
+                                    .await;
+                            if reclaimed > 0 {
+                                println!(
+                                    "[INFO] waiting room 自动回收完成，本轮处理 {reclaimed} 个卡住的会话"
+                                );
+                            }
+                        }
+                    } else if traffic.turn_reclaim_enabled() {
+                        // 影子档关了却打开了自动回收：判据的阈值来自影子档配置，
+                        // 这时没有判据可用，只能不打点也不回收——但要说出来，
+                        // 免得配置写着 true 却什么都不发生。
+                        eprintln!(
+                            "[WARN] traffic.turn_reclaim_enabled 已打开，但 turn_stall_secs=0：\
+                             没有判定阈值，自动回收不会生效"
+                        );
                     }
                 };
                 if kovi::tokio::time::timeout(

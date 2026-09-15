@@ -342,11 +342,169 @@ fn should_reclaim(evidence: &StallEvidence, stall_secs: u64, reclaim_secs: u64) 
             .is_some_and(|secs| secs >= reclaim_secs)
 }
 
+// ------------------------------------------------------------------ 回收卡死的回合
+
+/// 为什么可以回收。这个理由会写进日志与接口回执——回收是**破坏性**动作
+/// （那一轮已经生成的回复会被丢掉），必须能回答"凭什么"。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReclaimReason {
+    /// 有活跃回合，但排空/步骤已经静默超过回收阈值。
+    StalledTurn,
+    /// 没有活跃回合了（那个任务已经没了），队列却还非空——新消息只会一直排队。
+    OrphanedQueue,
+}
+
+impl ReclaimReason {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::StalledTurn => "stalled_turn",
+            Self::OrphanedQueue => "orphaned_queue",
+        }
+    }
+
+    fn describe(self) -> &'static str {
+        match self {
+            Self::StalledTurn => "回合超过回收阈值没有推进",
+            Self::OrphanedQueue => "队列非空但已经没有排空任务",
+        }
+    }
+}
+
+/// 回收结果：给日志、接口回执和测试看的账。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TurnReclaim {
+    pub(crate) reason: ReclaimReason,
+    /// 被判死的那一代。
+    pub(crate) generation: u64,
+    /// 接管的新一代（等于 `generation + 1`）。
+    pub(crate) next_generation: u64,
+    /// 连带给成终态的、已生成未发出的回复条数。
+    pub(crate) discarded_prepared: usize,
+    /// 被释放的待定/活跃入站预留条数。
+    pub(crate) released_admissions: usize,
+}
+
+/// 判定"这个会话现在该不该回收"，返回理由。
+///
+/// 影子日志、手动按钮、自动回收**共用这一处判据**——三处各写一份一定会漂移，
+/// 而漂移的后果是"日志说该回收、按钮却说不够格"这种事。
+///
+/// `queued > 0 && !drain_active` 也算：那种形态下根本没有回合可等，全是残局。
+/// 它不看时间阈值，因为"队列非空却没有任何排空任务"本身就是确定的坏状态
+/// （看门狗每 30 秒会补踢一次，踢不动就是真残局）。
+pub(crate) fn reclaim_reason(
+    report: &ScopeReport,
+    stall_after: Duration,
+    reclaim_after: Duration,
+) -> Option<ReclaimReason> {
+    if report.queued > 0 && !report.drain_active {
+        return Some(ReclaimReason::OrphanedQueue);
+    }
+    // 没有在途回合时没什么可回收的（队列也空）：不是这次要治的形态。
+    if !report.reply.is_active() {
+        return None;
+    }
+    let evidence = StallEvidence {
+        drain_stalled_secs: report
+            .drain_active
+            .then_some(report.drain_last_progress_secs)
+            .flatten(),
+        step_stalled_secs: report.turn_step_secs,
+        turn_waited_secs: report.turn_waiting_secs,
+    };
+    should_reclaim(&evidence, stall_after.as_secs(), reclaim_after.as_secs())
+        .then_some(ReclaimReason::StalledTurn)
+}
+
+/// 把一个卡死的回合判死，让这个会话**立刻**能重新接话。
+///
+/// 做四件事，全部通过协调器已有的原语完成（不新造一套状态机）：
+/// 1. 释放待定/活跃入站预留（`clear_pending_incoming`，会唤醒等待者，排空不再等它）；
+/// 2. 把已生成未发出的回复收成 `Superseded`——**宁可丢，也不要在几分钟后补发一条
+///    错位的回复**；用户看到的是"这条没回"，而不是"十分钟后才回一句答非所问"；
+/// 3. 推进会话代数，让那一轮手里的票立刻作废（它之后任何一步都会被判成陈旧）；
+/// 4. 留下一行可追溯的日志，并把账（丢了几条、放了几条）返回给调用方。
+///
+/// **队列一条不动**：卡住的是回合，不是消息。原文留在 FIFO 里按顺序补答，
+/// 这是底线——用户说了话，宁可答得晚，也不能让它从对话里消失。
+///
+/// 幂等性靠"代数必须还是观测到的那一代"：并发的自动回收或按钮连点，第二次
+/// 会拿到 `None`，不会被误记成"回收了两次"。
+pub(crate) async fn reclaim(
+    scope: ReplyScope,
+    observed_generation: u64,
+    reason: ReclaimReason,
+) -> Option<TurnReclaim> {
+    let outcome = super::interrupt::reclaim_generation(scope, observed_generation).await?;
+    let reclaimed = TurnReclaim {
+        reason,
+        generation: observed_generation,
+        next_generation: outcome.generation,
+        discarded_prepared: outcome.discarded_prepared,
+        released_admissions: outcome.released_admissions,
+    };
+    // 回收是破坏性的，日志要能回答"凭什么"和"丢了什么"。
+    eprintln!(
+        "[WARN] 回合已回收 ({}, {}): reason={} generation={}→{} 丢弃已生成未发出的回复 {} 条 / \
+         释放预留 {} 条（队列保持不动，会接着按顺序补答）",
+        scope_kind(scope),
+        scope_id(scope),
+        reason.describe(),
+        reclaimed.generation,
+        reclaimed.next_generation,
+        reclaimed.discarded_prepared,
+        reclaimed.released_admissions,
+    );
+    Some(reclaimed)
+}
+
+/// 这个会话当前的回合代数（没有状态时返回 `None`）。
+///
+/// 回收前先取它，再把它交给 [`reclaim`]：两者之间若有人已经推进过代数，
+/// 回收会自己放弃（幂等）。
+pub(crate) async fn turn_generation(scope: ReplyScope) -> Option<u64> {
+    super::interrupt::current_ticket(scope)
+        .await
+        .map(|ticket| ticket.generation())
+}
+
+/// 自动回收：对每个"按判据该回收"的会话执行回收。返回回收了几条。
+///
+/// **调用方必须已经确认配置开关打开**——这里不做开关判断，免得两处各判一次。
+pub(crate) async fn reclaim_stalled(stall_after: Duration, reclaim_after: Duration) -> usize {
+    let mut reclaimed = 0;
+    for report in report(stall_after).await {
+        let Some(reason) = reclaim_reason(&report, stall_after, reclaim_after) else {
+            continue;
+        };
+        let Some(scope) = scope_of(report.kind, report.subject_id) else {
+            continue;
+        };
+        // 观测里没有代数的（例如只有队列残局）也要能回收：`turn_generation` 会给当前值。
+        let Some(generation) = turn_generation(scope).await else {
+            continue;
+        };
+        if reclaim(scope, generation, reason).await.is_some() {
+            reclaimed += 1;
+        }
+    }
+    reclaimed
+}
+
+fn scope_of(kind: &str, subject_id: i64) -> Option<ReplyScope> {
+    match kind {
+        "group" => Some(ReplyScope::Group(subject_id)),
+        "private" => Some(ReplyScope::Private(subject_id)),
+        "scheduled" => Some(ReplyScope::Scheduled(subject_id)),
+        "call" => Some(ReplyScope::Call(subject_id)),
+        _ => None,
+    }
+}
+
 /// 影子档：把"卡住的回合"写成一行日志，**不做任何回收动作**。
 ///
 /// 这是阶段 B 的第一档：它的产物不是行为，而是判据——正常回合最长多久、卡住的都
-/// 停在哪一步、`would_reclaim` 会不会误报。有了这些数据才谈得上把 [`should_reclaim`]
-/// 接上真正的动作。开关是 `traffic.turn_stall_secs`，写成 0 即关闭。
+/// 停在哪一步、`would_reclaim` 会不会误报。开关是 `traffic.turn_stall_secs`，写成 0 即关闭。
 pub(crate) async fn scan_shadow(stall_after: Duration, reclaim_after: Duration) {
     for report in report(stall_after).await {
         if let Some(line) = shadow_line(&report, stall_after, reclaim_after) {
@@ -372,10 +530,9 @@ fn shadow_line(
         step_stalled_secs: report.turn_step_secs,
         turn_waited_secs: report.turn_waiting_secs,
     };
-    // 队列非空但没人排空是另一种形态：那个回合已经没了，新消息只会一直排队。
-    let drain_missing = report.queued > 0 && !report.drain_active;
-    let reclaim =
-        drain_missing || should_reclaim(&evidence, stall_after.as_secs(), reclaim_after.as_secs());
+    // 回收判据与影子日志共用 `reclaim_reason`：日志说"该回收"、按钮却说"不够格"
+    // 这种漂移，比两者都不说更糟。
+    let reclaim = reclaim_reason(report, stall_after, reclaim_after).is_some();
     if !report.stuck && !reclaim {
         return None;
     }
@@ -625,6 +782,17 @@ fn preview(message: &str) -> Option<String> {
     }
 }
 
+/// 人话的会话名（后台回执与日志用）："群 641996763" / "私聊 3052405886"。
+pub(crate) fn describe(scope: ReplyScope) -> String {
+    let label = match scope {
+        ReplyScope::Group(_) => "群",
+        ReplyScope::Private(_) => "私聊",
+        ReplyScope::Scheduled(_) => "任务",
+        ReplyScope::Call(_) => "通话",
+    };
+    format!("{label} {}", scope_id(scope))
+}
+
 fn scope_kind(scope: ReplyScope) -> &'static str {
     match scope {
         ReplyScope::Group(_) => "group",
@@ -688,7 +856,7 @@ pub(crate) async fn report(stuck_after: Duration) -> Vec<ScopeReport> {
     reports
 }
 
-async fn scope_report(scope: ReplyScope, stuck_after: Duration) -> ScopeReport {
+pub(crate) async fn scope_report(scope: ReplyScope, stuck_after: Duration) -> ScopeReport {
     let record = scope_record(scope);
     let reply = super::interrupt::scope_reply_snapshot(scope).await;
     let now = Instant::now();
@@ -900,6 +1068,15 @@ mod tests {
                 TurnWatch::step(TurnStep::Send);
             }));
         watch.backdate_for_test(Duration::from_secs(900));
+        // 回收判据要求"确实有在途回合"（`reply.is_active`）：台账里停住但协调器说
+        // 这一轮已经结束的，不该被判死。所以这里要真有那么一轮。
+        let ticket = kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(async {
+                let ticket = super::super::interrupt::interrupt(scope).await;
+                assert!(super::super::interrupt::mark_active(ticket).await);
+                ticket
+            });
         let line = shadow_line(
             &report_now(scope, 300),
             Duration::from_secs(300),
@@ -928,6 +1105,9 @@ mod tests {
             .is_none(),
             "报过一次之后不该每 30 秒刷同一行"
         );
+        kovi::tokio::runtime::Runtime::new()
+            .expect("应创建测试运行时")
+            .block_on(super::super::interrupt::finish(ticket));
     }
 
     /// 步骤台账：`TurnWatch` 记的是"最后一步做完到哪了"，Drop 之后必须查无此回合。

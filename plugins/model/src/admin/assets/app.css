@@ -1241,6 +1241,8 @@ mark {
   font-size: 11.5px;
 }
 .wait-row.bad .wait-step { background: var(--danger-soft); color: var(--danger); }
+.wait-actions { grid-column: 1 / -1; margin-top: 2px; }
+.wait-actions .btn { font-size: 11.5px; }
 .wait-why {
   grid-column: 1 / -1;
   color: var(--text-dim);

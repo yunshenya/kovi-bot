@@ -286,6 +286,9 @@ window_stall_secs = 180
 # 阈值理由与步骤名见 bot.conf.example.toml 同名两项。
 turn_stall_secs = 300
 turn_reclaim_secs = 600
+# 自动回收卡死的回合（默认关闭，理由与开启前该确认什么见 bot.conf.example.toml）。
+# 后台「等待房间」卡片上那个「回收这一轮」按钮走同一套判据与同一段代码。
+turn_reclaim_enabled = false
 max_input_chars = 6000
 max_model_response_bytes = 2097152
 max_model_queue = 64

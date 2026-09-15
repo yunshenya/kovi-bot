@@ -148,9 +148,13 @@ async fn waiting_room_report() -> Value {
             })
         })
         .collect();
+    let traffic = crate::config::get().traffic().clone();
     json!({
         "stalled_after_secs": stalled_after.as_secs(),
         "stuck": reports.iter().filter(|report| report.stuck).count(),
+        // 自动回收的状态要一起给：卡片上那句"卡住了需要人来点"是否成立，取决于它。
+        "auto_reclaim_enabled": traffic.turn_reclaim_enabled(),
+        "reclaim_after_secs": traffic.turn_reclaim_secs(),
         "scopes": scopes,
     })
 }

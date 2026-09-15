@@ -34,6 +34,12 @@ pub struct TrafficConfig {
     /// 影子日志里 `would_reclaim` 的阈值（秒）。真正回收时要等的就是这个数——
     /// 比 `turn_stall_secs` 更严，因为回收的代价是"她可能重复回一条"。
     turn_reclaim_secs: u64,
+    /// 自动回收卡死的回合。**默认关闭**，要先跑够影子档再说。
+    ///
+    /// 打开之后：等待房间看门狗每轮扫描时，对"静默超过 `turn_reclaim_secs` 且没有
+    /// 推进"的会话执行回收——判死的回合让位，队列里的原文按顺序补答。
+    /// 打开前请先确认 `[STALL]` 日志里 `would_reclaim=true` 没有误报。
+    turn_reclaim_enabled: bool,
     max_input_chars: usize,
     max_model_response_bytes: usize,
     max_model_queue: usize,
@@ -79,6 +85,10 @@ impl TrafficConfig {
 
     pub fn turn_reclaim_secs(&self) -> u64 {
         self.turn_reclaim_secs
+    }
+
+    pub fn turn_reclaim_enabled(&self) -> bool {
+        self.turn_reclaim_enabled
     }
 
     pub fn max_input_chars(&self) -> usize {
@@ -166,6 +176,7 @@ impl Default for TrafficConfig {
             window_stall_secs: 180,
             turn_stall_secs: 300,
             turn_reclaim_secs: 600,
+            turn_reclaim_enabled: false,
             max_input_chars: 6_000,
             max_model_response_bytes: 2 * 1024 * 1024,
             max_model_queue: 64,
@@ -248,6 +259,14 @@ mod tests {
         config.turn_reclaim_secs = 7_201;
         assert!(config.validate().is_err());
         config.turn_reclaim_secs = 300;
+        assert!(config.validate().is_ok());
+    }
+
+    /// 自动回收默认关闭：它是唯一会**主动丢掉**已生成回复的开关，出厂不该是开的。
+    #[test]
+    fn automatic_reclaim_is_off_by_default() {
+        let config = TrafficConfig::default();
+        assert!(!config.turn_reclaim_enabled());
         assert!(config.validate().is_ok());
     }
 }
