@@ -133,6 +133,13 @@ pub use snapshot::{
 /// short-lived scopes from growing the process indefinitely.
 pub const MAX_ACTIVE_PLANS: usize = 64;
 
+/// 跨作用域的目标投影总量上限。
+///
+/// `MAX_SNAPSHOT_ITEMS` 管的是"一次调用能传多少"，管不住"N 个会话各传 8 条"：
+/// 没有这个上限时目标列表会随会话数单调增长，而每个回合的 `snapshot_for_scopes`
+/// 都要克隆整份列表。
+pub const MAX_GOALS_PER_CONTROLLER: usize = 256;
+
 #[derive(Debug)]
 struct ExecutiveState {
     conflicts: ConflictMonitor,
@@ -341,36 +348,59 @@ impl ExecutiveController {
             goal.validate()?;
         }
         let mut state = self.state.lock().unwrap_or_else(|lock| lock.into_inner());
-        if matches!(scope, ExecutiveScope::Global) {
-            state.goals = goals;
-            state.goal_scopes.clear();
-            let goal_ids = state
+        // 两个分支做的是同一件事：**只替换这个作用域自己的那一份**。Global 此前
+        // 走的是 `state.goals = goals; state.goal_scopes.clear();`——把其它作用域
+        // 的目标与归属索引一起清掉，与上面那句文档承诺的"retain projections
+        // belonging to other scopes"正好相反。
+        let removed = state
+            .goals
+            .iter()
+            .filter(|goal| {
+                state
+                    .goal_scopes
+                    .get(&goal.goal_id)
+                    .is_some_and(|existing| existing == &scope)
+            })
+            .map(|goal| goal.goal_id)
+            .collect::<Vec<_>>();
+        state.goals.retain(|goal| !removed.contains(&goal.goal_id));
+        for goal_id in removed {
+            state.goal_scopes.remove(&goal_id);
+        }
+        for goal in goals {
+            state.goal_scopes.insert(goal.goal_id, scope.clone());
+            state.goals.push(goal);
+        }
+        // 跨作用域的总量上限：单次调用的 `MAX_SNAPSHOT_ITEMS` 只管住"这一次传了
+        // 多少"，N 个会话各传 8 条就会一直涨下去。超出时淘汰最旧的作用域（按
+        // `goal_scopes` 里最先出现的顺序），与其它有界集合同一套思路。
+        while state.goals.len() > MAX_GOALS_PER_CONTROLLER {
+            let Some(oldest_scope) = state
                 .goals
                 .iter()
-                .map(|goal| goal.goal_id)
-                .collect::<Vec<_>>();
-            for goal_id in goal_ids {
-                state.goal_scopes.insert(goal_id, ExecutiveScope::Global);
-            }
-        } else {
-            let removed = state
+                .find_map(|goal| state.goal_scopes.get(&goal.goal_id).cloned())
+            else {
+                break;
+            };
+            let before = state.goals.len();
+            let dropped: Vec<_> = state
                 .goals
                 .iter()
                 .filter(|goal| {
                     state
                         .goal_scopes
                         .get(&goal.goal_id)
-                        .is_some_and(|existing| existing == &scope)
+                        .is_some_and(|existing| existing == &oldest_scope)
                 })
                 .map(|goal| goal.goal_id)
-                .collect::<Vec<_>>();
-            state.goals.retain(|goal| !removed.contains(&goal.goal_id));
-            for goal_id in removed {
+                .collect();
+            state.goals.retain(|goal| !dropped.contains(&goal.goal_id));
+            for goal_id in dropped {
                 state.goal_scopes.remove(&goal_id);
             }
-            for goal in goals {
-                state.goal_scopes.insert(goal.goal_id, scope.clone());
-                state.goals.push(goal);
+            if state.goals.len() == before {
+                // 索引与列表不一致时不要死循环：请调用方看见并修。
+                break;
             }
         }
         prune_scope_indexes(&mut state);
@@ -872,6 +902,78 @@ mod tests {
             hard_priority: None,
             state: GoalState::Active,
         }
+    }
+
+    #[test]
+    fn a_global_goal_projection_keeps_other_scopes_goals() {
+        // Global 分支此前写的是 `state.goals = goals; state.goal_scopes.clear();`
+        // ——把其它作用域的目标与归属索引一起清掉，与那句"retain projections
+        // belonging to other scopes"的文档承诺正好相反。
+        let controller = ExecutiveController::default();
+        let conversation = ConversationId::new();
+        let scope = ExecutiveScope::Conversation {
+            conversation_id: conversation,
+        };
+        let scoped_goal = crate::GoalId::new();
+        controller
+            .set_prioritized_goals_for_scope(scope.clone(), vec![goal(scoped_goal)])
+            .expect("会话目标");
+
+        let global_goal = crate::GoalId::new();
+        controller
+            .set_prioritized_goals(vec![goal(global_goal)])
+            .expect("全局目标");
+
+        let snapshot = controller.snapshot_for_scopes(std::slice::from_ref(&scope));
+        assert!(
+            snapshot
+                .prioritized_goals
+                .iter()
+                .any(|item| item.goal_id == scoped_goal),
+            "全局投影不得清掉会话作用域的目标"
+        );
+        assert!(
+            snapshot
+                .prioritized_goals
+                .iter()
+                .any(|item| item.goal_id == global_goal),
+            "全局目标本身要写进去"
+        );
+
+        // 反过来：会话作用域的替换不该动全局目标。
+        controller
+            .set_prioritized_goals_for_scope(scope, vec![goal(crate::GoalId::new())])
+            .expect("替换会话目标");
+        let snapshot = controller.snapshot_for_scopes(&[ExecutiveScope::Global]);
+        assert!(
+            snapshot
+                .prioritized_goals
+                .iter()
+                .any(|item| item.goal_id == global_goal),
+            "会话作用域的替换不得动到全局目标"
+        );
+    }
+
+    #[test]
+    fn the_goal_projection_is_bounded_across_scopes() {
+        // 单次调用的 MAX_SNAPSHOT_ITEMS 只管住"这一次传了多少"；
+        // N 个会话各传一条就会一直涨，而每个回合都要克隆整份列表。
+        let controller = ExecutiveController::default();
+        for _ in 0..(MAX_GOALS_PER_CONTROLLER / 8 + 8) {
+            let scope = ExecutiveScope::Conversation {
+                conversation_id: ConversationId::new(),
+            };
+            let goals = (0..8).map(|_| goal(crate::GoalId::new())).collect();
+            controller
+                .set_prioritized_goals_for_scope(scope, goals)
+                .expect("每批都合法");
+        }
+        let snapshot = controller.snapshot_for_scopes(&[ExecutiveScope::Global]);
+        assert!(
+            snapshot.prioritized_goals.len() <= MAX_GOALS_PER_CONTROLLER,
+            "跨作用域总量必须有上限，实测 {}",
+            snapshot.prioritized_goals.len()
+        );
     }
 
     #[test]
