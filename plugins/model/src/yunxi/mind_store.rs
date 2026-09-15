@@ -838,12 +838,25 @@ async fn put_record_tx<T: Serialize>(
         .fetch_optional(&mut **transaction)
         .await
         .map_err(MindStoreError::storage)?;
-    let (id, actual) = conflict.map_or((record.id, 0), |row| {
-        (
-            row.try_get::<Uuid, _>("id").unwrap_or(record.id),
-            row.try_get::<i64, _>("version").unwrap_or(0).max(0) as u64,
-        )
-    });
+    // 回查不到任何冲突行：说明这次失败**不是**版本不符。最典型的是"按 id 更新一条
+    // 已经不存在的记录"——以前这里报 `VersionConflict { expected: N, actual: 0 }`，
+    // 调用方会以为自己拿了个过期版本，实际是那条记录没了（`NotFound`）。
+    let Some(row) = conflict else {
+        return Err(match expected_version {
+            Some(_) => MindStoreError::NotFound {
+                kind: table.kind(),
+                id: record.id.to_string(),
+            },
+            // 新建路径走到这里意味着被一个我们认不出的约束挡住了（这两张表上只有
+            // 主键与 (scope_key, dedupe_key) 两个唯一约束，正常不会发生）。如实说
+            // "约束冲突未知"，别再伪装成版本问题。
+            None => MindStoreError::InvalidRequest {
+                reason: "mind insert conflicted on an unidentified constraint",
+            },
+        });
+    };
+    let id = row.try_get::<Uuid, _>("id").unwrap_or(record.id);
+    let actual = row.try_get::<i64, _>("version").unwrap_or(0).max(0) as u64;
     Err(MindStoreError::VersionConflict {
         kind: table.kind(),
         id: id.to_string(),
@@ -1970,6 +1983,47 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires PostgreSQL via DATABASE_URL"]
+    fn postgres_update_of_a_missing_record_reports_not_found() {
+        // 按 id 更新一条不存在的记录时，以前回查冲突行会落空，于是报
+        // `VersionConflict { expected: N, actual: 0 }`——调用方以为自己版本过期，
+        // 实际是那条记录没了。分类错了会让上层的重试/放弃逻辑跟着走错分支。
+        crate::database_test_support::block_on(async {
+            let database_url = std::env::var("DATABASE_URL").expect("requires DATABASE_URL");
+            let pool = PgPoolOptions::new()
+                .max_connections(4)
+                .connect(&database_url)
+                .await
+                .expect("should connect to PostgreSQL");
+            let store = PostgresMindStore::new(pool.clone());
+            store
+                .initialize_schema()
+                .await
+                .expect("first migration should succeed");
+
+            let now = Utc::now();
+            // `expected_version = Some(1)` 要求待写记录是**第 2 版**（存储层要求
+            // 恰好 expected + 1），所以先把它推到 2 版再去写一条库里没有的 id。
+            let missing = belief(
+                BeliefId::new(),
+                MindScope::Global,
+                format!("never persisted {}", Uuid::new_v4()),
+                now,
+            )
+            .apply_update(0.0, 0.0, &[], now + chrono::Duration::seconds(1), None)
+            .expect("second version should be valid");
+            assert_eq!(missing.version(), 2, "夹具应当是第 2 版");
+            let outcome = BeliefStore::put(&store, &missing, Some(1)).await;
+            assert!(
+                matches!(
+                    outcome,
+                    Err(MindStoreError::NotFound { kind: "belief", .. })
+                ),
+                "缺失记录必须报 NotFound，而不是版本冲突: {outcome:?}"
+            );
+        });
+    }
+
     #[ignore = "requires PostgreSQL via DATABASE_URL"]
     fn postgres_mind_store_contracts_are_durable_bounded_and_atomic() {
         crate::database_test_support::block_on(async {
