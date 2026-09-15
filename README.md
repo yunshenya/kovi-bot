@@ -291,9 +291,10 @@ readiness 文件。二进制、配置与环境变量会作为一个整体原子�
 # owner_person_id = "00000000-0000-0000-0000-000000000000"
 
 [server_config]
-url = "https://api.example.com/v1/responses"
+url = "https://api.example.com/v1/chat/completions"
 model_name = "your-model-name"
-wire_api = "responses"
+# 结构化回复动作与注册表工具都走原生 function-calling，只在 chat_completions 上有实现
+wire_api = "chat_completions"
 supports_vision = true
 api_key_env = "OPENAI_API_KEY"
 requires_auth = true
@@ -603,9 +604,10 @@ actor_authorization = ""
 
 ```toml
 [server_config]
-url = "https://api.example.com/v1/responses"
+url = "https://api.example.com/v1/chat/completions"
 model_name = "your-model-name"
-wire_api = "responses"
+# 结构化回复动作与注册表工具都走原生 function-calling，只在 chat_completions 上有实现
+wire_api = "chat_completions"
 supports_vision = true
 api_key_env = "OPENAI_API_KEY"
 requires_auth = true
@@ -776,6 +778,8 @@ DATABASE_URL="postgresql://…" cargo test -p model --lib \
   yunxi::mind_store::tests::postgres_mind_store_contracts_are_durable_bounded_and_atomic -- --ignored --exact
 REDIS_URL="redis://127.0.0.1:6379/15" cargo test -p model --lib \
   redis_store::tests::redis_runtime_store_round_trips -- --ignored --exact
+BOT_API_TOKEN="…" cargo test -p model --lib \
+  live_model_calls_reply_action_tool -- --ignored --exact
 ```
 
 后三项工具版本固定在 CI 工作流中；本地可使用同版本的 `cargo install --locked --version …`

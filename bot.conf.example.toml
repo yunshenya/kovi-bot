@@ -13,9 +13,11 @@ private_prompt = "私聊场景：在私聊里你像熟悉已久的朋友一样�
 
 [server_config]
 enabled = true
-url = "https://api.example.com/v1/responses"
+url = "https://api.example.com/v1/chat/completions"
 model_name = "your-model-name"
-wire_api = "responses"
+# 必须用 chat_completions：原生 function-calling（结构化回复动作、注册表工具）只在这条
+# 协议上有实现——填 responses 时宿主发不出 tools，工具轮与结构化回复回合会以模型错误结束。
+wire_api = "chat_completions"
 supports_vision = true
 # 主模型密钥从哪来：填了下面的 api_key 就直接用它，否则读这个环境变量。
 api_key_env = "OPENAI_API_KEY"
