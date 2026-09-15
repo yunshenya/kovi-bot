@@ -110,9 +110,10 @@ pub use planner::{
     MAX_PLANNER_INTENTS, MAX_PLANNER_MEMORIES, MAX_PLANNER_OPEN_LOOPS, MAX_PLANNER_STATE_UPDATES,
     MAX_PLANNER_TOPIC_BYTES, MAX_PLANNER_TOPIC_CHARS, ModelBackend, ModelBackendError,
     ModelBackendFuture, Planner, PlannerError, PlannerInput, PlannerInputValidationError,
-    PlannerOutput, PlannerOutputValidationError, PlannerStateSnapshot, RelationState,
-    StateUpdateProposal, adjust_relation_tension, apply_interaction_cues, drift_affect_state,
-    drift_relation_state, evolve_interaction_state, evolve_interaction_state_with_cues,
+    PlannerOutput, PlannerOutputValidationError, PlannerStateSnapshot, RelationNudge, RelationPull,
+    RelationState, StateUpdateProposal, adjust_relation_tension, apply_interaction_cues,
+    apply_relation_nudge, drift_affect_state, drift_relation_state, evolve_interaction_state,
+    relation_evidence_nudge, relation_half_lives,
 };
 pub use ports::{
     AffectStore, AffectStoreError, AffectStoreFuture, Clock, ConversationMemberStore,

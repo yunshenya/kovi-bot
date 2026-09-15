@@ -190,31 +190,19 @@ pub struct InteractionStateEvolution {
     pub relation: RelationState,
 }
 
-/// Evolve the sender-scoped affect and relation state from normalized event
-/// signals. The transition scans at most a bounded prefix of the message and
-/// never accepts a relation belonging to another person.
+/// Evolve the sender-scoped affect and relation state from the message's own
+/// structural signals. The transition scans at most a bounded prefix of the
+/// message and never accepts a relation belonging to another person.
+///
+/// This is the structural half of a turn; the semantic half is
+/// [`apply_interaction_cues`]. Hosts apply both once per understood message.
 #[must_use]
 pub fn evolve_interaction_state(
     message: &MessageReceivedEvent,
     relation: Option<RelationState>,
     affect: AffectState,
 ) -> InteractionStateEvolution {
-    evolve_interaction_state_inner(message, relation, affect, InteractionCues::default())
-}
-
-/// Evolve interaction state with semantic cues produced by an existing host
-/// understanding pass. Invalid or non-finite cues are rejected before any
-/// state is derived.
-pub fn evolve_interaction_state_with_cues(
-    message: &MessageReceivedEvent,
-    relation: Option<RelationState>,
-    affect: AffectState,
-    cues: InteractionCues,
-) -> Result<InteractionStateEvolution, InteractionCueValidationError> {
-    cues.validate()?;
-    Ok(evolve_interaction_state_inner(
-        message, relation, affect, cues,
-    ))
+    evolve_interaction_state_inner(message, relation, affect)
 }
 
 /// Apply semantic evidence after the structural message event has already
@@ -227,7 +215,7 @@ pub fn apply_interaction_cues(
     cues: InteractionCues,
 ) -> Result<InteractionStateEvolution, InteractionCueValidationError> {
     cues.validate()?;
-    let mut relation = relation
+    let relation = relation
         .filter(|state| state.person_id == person_id && state.validate().is_ok())
         .unwrap_or_else(|| RelationState::new(person_id));
     let mut affect = if affect.validate().is_ok() {
@@ -238,18 +226,6 @@ pub fn apply_interaction_cues(
 
     let gratitude = cues.gratitude_strength;
     if gratitude > 0.0 {
-        relation.comfort = blend_bounded(
-            relation.comfort,
-            (relation.comfort + 0.18 * gratitude).clamp(-1.0, 1.0),
-            0.025,
-            -1.0,
-            1.0,
-        );
-        relation.affinity =
-            (relation.affinity + 0.012 * gratitude * (1.0 - relation.affinity)).clamp(-1.0, 1.0);
-        relation.trust =
-            (relation.trust + 0.008 * gratitude * (1.0 - relation.trust)).clamp(-1.0, 1.0);
-        relation.tension = blend_bounded(relation.tension, 0.0, 0.08 * gratitude, -1.0, 1.0);
         affect.social_energy = blend_bounded(
             affect.social_energy,
             (affect.social_energy + 0.04 * gratitude).clamp(0.0, 1.0),
@@ -275,24 +251,34 @@ pub fn apply_interaction_cues(
         );
     }
 
-    // **tension 不在这里动。** 它是"证据累积量"，只有 delta 通道能改
-    // （宿主侧 `relation_store::nudge_tension`）。语义 cues 这条通道看到的是
-    // "说话人此刻的情绪"，判不出"这句话是不是冲着她"，历史上几乎从不触发
-    // （线上 24 小时 cues=true 0 次），却带来一个更糟的副作用：回合收尾要把整个
-    // 关系行写回，如果它同时携带 tension，就会用回合开始时的快照覆盖掉期间刚到账
-    // 的相处证据（2026-09-14 实测：证据写 0.0256，回合收尾写回 0）。
+    // **这条通道只改情绪，不改关系。** `affect` 是小时级的当下状态，由这一轮
+    // 语义理解直接写；而 `relation` 的五个维度各自只有一个写者，由宿主的两条
+    // 通道负责（见 `relation_evidence_nudge`）：
     //
-    // 关系仍然会因为善意而变好：comfort / affinity / trust 都在上面按 gratitude
-    // 更新；张力那一路由相处证据（模型判定）与 3 天半衰期的漂移负责。
+    // - `familiarity` / `comfort`：回合收尾的整行回写（结构演化，本文件的
+    //   `evolve_interaction_state_inner`）。
+    // - `tension` / `affinity` / `trust`：相处证据的 delta 通道。
+    //
+    // 为什么把关系挡在这条通道之外：回合收尾写回的是**回合开始时的快照**。历史上
+    // 它同时携带 tension，于是在回合进行中到账的相处证据会被旧快照覆盖
+    // （2026-09-14 实测：证据写 0.0256、回合收尾写回 0）。同一个坑对 affinity /
+    // trust 一样成立，所以三者一起交给 delta 通道，整行回写不再写它们。
+    //
+    // 善意因此仍然会让关系变好：`gratitude_strength` 由宿主折算成一条正向
+    // evidence 送进 delta 通道（`relation_evidence_nudge`），字段本身留在
+    // `InteractionCues` 里没有变，只是换了落库的那条路。
 
     Ok(InteractionStateEvolution { affect, relation })
 }
 
+/// Structural evolution only: it reads the message's own deterministic shape
+/// (conversation kind, whether it answers her, length, punctuation) and never
+/// the semantic cues. Cue-driven affect lives in [`apply_interaction_cues`],
+/// which the host applies once per understanding pass.
 fn evolve_interaction_state_inner(
     message: &MessageReceivedEvent,
     relation: Option<RelationState>,
     affect: AffectState,
-    cues: InteractionCues,
 ) -> InteractionStateEvolution {
     const MAX_SIGNAL_CHARS: usize = 1_024;
 
@@ -333,7 +319,7 @@ fn evolve_interaction_state_inner(
     relation.familiarity =
         (relation.familiarity + familiarity_rate * (1.0 - relation.familiarity)).clamp(-1.0, 1.0);
 
-    let comfort_target = (if message.stop_requested {
+    let comfort_target = if message.stop_requested {
         -0.3
     } else if message.replies_to_agent {
         0.22
@@ -343,8 +329,7 @@ fn evolve_interaction_state_inner(
         0.05
     } else {
         relation.comfort
-    } + 0.18 * cues.gratitude_strength)
-        .clamp(-1.0, 1.0);
+    };
     relation.comfort = blend_bounded(
         relation.comfort,
         comfort_target,
@@ -352,30 +337,15 @@ fn evolve_interaction_state_inner(
         -1.0,
         1.0,
     );
-    if message.replies_to_agent {
-        relation.trust = (relation.trust + 0.003 * (1.0 - relation.trust)).clamp(-1.0, 1.0);
-    }
-    relation.affinity = (relation.affinity
-        + 0.012 * cues.gratitude_strength * (1.0 - relation.affinity))
-        .clamp(-1.0, 1.0);
-    relation.trust = (relation.trust + 0.008 * cues.gratitude_strength * (1.0 - relation.trust))
-        .clamp(-1.0, 1.0);
-    // 同上：tension 只有 delta 通道能写。结构演化负责 familiarity（这次互动本身
-    // 让她更熟悉对方），情绪与关系冷暖分别落在 affect 与 comfort/affinity/trust。
+    // 结构演化只碰 familiarity（这次互动本身让她更熟悉对方）与 comfort（这次互动
+    // 的相处口径）。tension / affinity / trust 由证据 delta 通道独占：回合收尾写回的
+    // 是回合开始时的快照，它一旦也写这三列，就会覆盖掉回合进行中到账的证据。
 
-    let semantic_weight = cues.sentiment_confidence;
-    let valence_target = (cues.sentiment_valence * semantic_weight
-        + 0.25 * cues.gratitude_strength)
-        .clamp(-1.0, 1.0);
-    affect.valence = blend_bounded(
-        affect.valence,
-        valence_target,
-        0.025 + 0.075 * semantic_weight + 0.03 * cues.gratitude_strength,
-        -1.0,
-        1.0,
-    );
+    // 没有语义 cues 时，情绪只被结构信号往基线拉。语义那部分由
+    // `apply_interaction_cues` 在同一次理解里补上，两边各写一次，不重复计入。
+    affect.valence = blend_bounded(affect.valence, 0.0, 0.025, -1.0, 1.0);
     let structural_arousal = if question { 0.18 } else { 0.0 } + emphasis_count as f32 * 0.12;
-    let arousal_target = (structural_arousal + cues.sentiment_arousal * semantic_weight * 0.65)
+    let arousal_target = structural_arousal
         .clamp(-1.0, 1.0)
         .max(if message.stop_requested { 0.65 } else { -1.0 });
     affect.arousal = blend_bounded(affect.arousal, arousal_target, 0.12, -1.0, 1.0);
@@ -389,7 +359,6 @@ fn evolve_interaction_state_inner(
     let attachment_load = (message.content.attachments().len().min(4) as f32) * 0.05;
     let social_energy_target = (0.88 - length_load - attachment_load
         + if message.replies_to_agent { 0.04 } else { 0.0 }
-        + 0.04 * cues.gratitude_strength
         - if message.stop_requested { 0.12 } else { 0.0 })
     .clamp(0.25, 0.95);
     affect.social_energy =
@@ -433,50 +402,244 @@ pub fn drift_affect_state(state: AffectState, elapsed: Duration) -> AffectState 
     state
 }
 
+/// Half-lives of the five relation dimensions, in seconds.
+///
+/// These are the single source of truth for decay: [`drift_relation_state`]
+/// uses them for reads, and a persistence adapter that materialises drift
+/// inside its own UPDATE must bind these same values rather than restating
+/// them. A second copy of the numbers is how the two paths would silently
+/// disagree.
+pub mod relation_half_lives {
+    const DAY_SECONDS: f64 = 24.0 * 60.0 * 60.0;
+
+    /// 180 days.
+    pub const FAMILIARITY_SECONDS: f64 = 180.0 * DAY_SECONDS;
+    /// 365 days.
+    pub const AFFINITY_SECONDS: f64 = 365.0 * DAY_SECONDS;
+    /// 730 days.
+    pub const TRUST_SECONDS: f64 = 730.0 * DAY_SECONDS;
+    /// 30 days.
+    pub const COMFORT_SECONDS: f64 = 30.0 * DAY_SECONDS;
+    /// 3 days.
+    pub const TENSION_SECONDS: f64 = 3.0 * DAY_SECONDS;
+}
+
 /// Apply slow elapsed-time relation drift while preserving the canonical
 /// person identity. Durable dimensions decay much more slowly than transient
-/// comfort and tension.
+/// comfort and tension. Every dimension decays multiplicatively toward zero.
 #[must_use]
 pub fn drift_relation_state(mut state: RelationState, elapsed: Duration) -> RelationState {
     if state.validate().is_err() {
         return RelationState::new(state.person_id);
     }
-    const DAY_SECONDS: f64 = 24.0 * 60.0 * 60.0;
     state.familiarity = decay_toward(
         state.familiarity,
         0.0,
         elapsed,
-        180.0 * DAY_SECONDS,
+        relation_half_lives::FAMILIARITY_SECONDS,
         -1.0,
         1.0,
     );
-    state.affinity = decay_toward(state.affinity, 0.0, elapsed, 365.0 * DAY_SECONDS, -1.0, 1.0);
-    state.trust = decay_toward(state.trust, 0.0, elapsed, 730.0 * DAY_SECONDS, -1.0, 1.0);
-    state.comfort = decay_toward(state.comfort, 0.0, elapsed, 30.0 * DAY_SECONDS, -1.0, 1.0);
-    state.tension = decay_toward(state.tension, 0.0, elapsed, 3.0 * DAY_SECONDS, -1.0, 1.0);
+    state.affinity = decay_toward(
+        state.affinity,
+        0.0,
+        elapsed,
+        relation_half_lives::AFFINITY_SECONDS,
+        -1.0,
+        1.0,
+    );
+    state.trust = decay_toward(
+        state.trust,
+        0.0,
+        elapsed,
+        relation_half_lives::TRUST_SECONDS,
+        -1.0,
+        1.0,
+    );
+    state.comfort = decay_toward(
+        state.comfort,
+        0.0,
+        elapsed,
+        relation_half_lives::COMFORT_SECONDS,
+        -1.0,
+        1.0,
+    );
+    state.tension = decay_toward(
+        state.tension,
+        0.0,
+        elapsed,
+        relation_half_lives::TENSION_SECONDS,
+        -1.0,
+        1.0,
+    );
+    state
+}
+
+/// One dimension's move toward a target by a bounded mixing rate:
+/// `current + (target - current) * rate`.
+///
+/// This is deliberately the *only* shape a relation update can take. Every
+/// writer (a turn's structural evolution, a piece of relationship evidence)
+/// expresses itself this way, so two writers touching the same row can both be
+/// applied — even when they overlap — instead of the later one overwriting the
+/// earlier one with a stale absolute value.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct RelationPull {
+    pub target: f32,
+    pub rate: f32,
+}
+
+impl RelationPull {
+    #[must_use]
+    pub const fn new(target: f32, rate: f32) -> Self {
+        Self { target, rate }
+    }
+
+    #[must_use]
+    pub fn validate(self) -> bool {
+        self.target.is_finite()
+            && self.rate.is_finite()
+            && (-1.0..=1.0).contains(&self.target)
+            && (0.0..=1.0).contains(&self.rate)
+    }
+
+    #[must_use]
+    pub fn apply(self, current: f32) -> f32 {
+        blend_bounded(current, self.target, self.rate, -1.0, 1.0)
+    }
+}
+
+/// The relation dimensions one piece of evidence moves.
+///
+/// `familiarity` and `comfort` are absent by design: they belong to the turn's
+/// structural evolution. The three that are here have exactly one writer — the
+/// evidence channel — which is what keeps a turn-end writeback from erasing
+/// what arrived while the turn was running.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RelationNudge {
+    pub tension: Option<RelationPull>,
+    pub affinity: Option<RelationPull>,
+    pub trust: Option<RelationPull>,
+}
+
+impl RelationNudge {
+    #[must_use]
+    pub fn is_empty(self) -> bool {
+        self.tension.is_none() && self.affinity.is_none() && self.trust.is_none()
+    }
+
+    #[must_use]
+    pub fn validate(self) -> bool {
+        [self.tension, self.affinity, self.trust]
+            .into_iter()
+            .flatten()
+            .all(RelationPull::validate)
+    }
+}
+
+/// How far a piece of evidence moves tension, per unit of normalized strength.
+///
+/// Anchors (kept where they always were, see
+/// `docs/memory-driven-silence-2026-09-14.md`): one high-confidence hostility
+/// is `0.15`, so it takes about 31 of them to cross the 0.6 silence threshold;
+/// one warm message cools by `0.05`.
+const HOSTILE_TENSION_TARGET: f32 = 1.0;
+const HOSTILE_TENSION_RATE: f32 = 0.2;
+const WARM_TENSION_TARGET: f32 = 0.0;
+const WARM_TENSION_RATE: f32 = 0.12;
+
+/// How fast sustained evidence moves the two durable warmth dimensions.
+///
+/// A warm message at full strength moves affinity by 6% of the remaining
+/// distance and trust by 3%; sustained hostility moves affinity by 4% and trust
+/// by 3% toward the cold end. At one warm message every other day that puts
+/// "clearly likes her" (0.5) about 23 messages away, while a single bad night
+/// costs a well-liked person roughly 0.04 of affinity — real, durable, and
+/// nothing like a verdict. Affinity's 365-day and trust's 730-day half-lives
+/// unwind both directions without a second mechanism.
+const WARM_AFFINITY_RATE: f32 = 0.06;
+const WARM_TRUST_RATE: f32 = 0.03;
+const HOSTILE_AFFINITY_RATE: f32 = 0.04;
+const HOSTILE_TRUST_RATE: f32 = 0.03;
+
+/// Map one signed piece of relationship evidence into the relation dimensions
+/// it moves.
+///
+/// **Sign convention (kept from the host's `tension_delta`): positive is
+/// hostility, negative is warmth.** One number must not mean opposite things
+/// on either side of the boundary.
+///
+/// The judgement of *what a message was* belongs to the host (today: one
+/// bounded model call). The anchors, targets and rates that turn it into a
+/// relationship change belong here, so a literal hit and a model-classified
+/// hit move the relationship along the same scale.
+#[must_use]
+pub fn relation_evidence_nudge(signed_hostility: f32) -> RelationNudge {
+    if !signed_hostility.is_finite() || signed_hostility == 0.0 {
+        return RelationNudge::default();
+    }
+    let strength = signed_hostility.clamp(-1.0, 1.0);
+    if strength > 0.0 {
+        // 不友好：张力上升，好感与信任被压低。
+        RelationNudge {
+            tension: Some(RelationPull::new(
+                HOSTILE_TENSION_TARGET,
+                HOSTILE_TENSION_RATE * strength,
+            )),
+            affinity: Some(RelationPull::new(-1.0, HOSTILE_AFFINITY_RATE * strength)),
+            trust: Some(RelationPull::new(-1.0, HOSTILE_TRUST_RATE * strength)),
+        }
+    } else {
+        // 友好：张力回落，好感与信任被抬高。
+        let magnitude = -strength;
+        RelationNudge {
+            tension: Some(RelationPull::new(
+                WARM_TENSION_TARGET,
+                WARM_TENSION_RATE * magnitude,
+            )),
+            affinity: Some(RelationPull::new(1.0, WARM_AFFINITY_RATE * magnitude)),
+            trust: Some(RelationPull::new(1.0, WARM_TRUST_RATE * magnitude)),
+        }
+    }
+}
+
+/// Apply a [`RelationNudge`] to an in-memory relation state.
+///
+/// Hosts that keep relations in memory (the offline CLI harness, tests) use
+/// this; the PostgreSQL adapter applies the same pulls inside one UPDATE
+/// instead, so that overlapping writers compose.
+#[must_use]
+pub fn apply_relation_nudge(mut state: RelationState, nudge: RelationNudge) -> RelationState {
+    if state.validate().is_err() || !nudge.validate() {
+        return RelationState::new(state.person_id);
+    }
+    if let Some(pull) = nudge.tension {
+        state.tension = pull.apply(state.tension);
+    }
+    if let Some(pull) = nudge.affinity {
+        state.affinity = pull.apply(state.affinity);
+    }
+    if let Some(pull) = nudge.trust {
+        state.trust = pull.apply(state.trust);
+    }
     state
 }
 
 /// Adjust only the tension dimension of a relation by an explicit signed
-/// strength, reusing the exact rates the semantic cue path uses.
-///
-/// This exists for hosts that hold a direct piece of evidence ("this message
-/// was addressed at her and it is hostile") instead of a sentiment estimate.
-/// Keeping the arithmetic here means a literal hit and a model-classified hit
-/// move the relationship the same way, and the 3-day half-life in
-/// [`drift_relation_state`] unwinds both without a second mechanism.
+/// strength. Kept as the narrow entry point for hosts that hold a literal
+/// piece of evidence; it is exactly the tension half of
+/// [`relation_evidence_nudge`], so both callers move tension along one scale.
 #[must_use]
-pub fn adjust_relation_tension(mut state: RelationState, signed_strength: f32) -> RelationState {
-    if state.validate().is_err() {
-        return RelationState::new(state.person_id);
-    }
-    let strength = signed_strength.clamp(-1.0, 1.0);
-    if strength > 0.0 {
-        state.tension = blend_bounded(state.tension, 1.0, 0.2 * strength, -1.0, 1.0);
-    } else if strength < 0.0 {
-        state.tension = blend_bounded(state.tension, 0.0, 0.12 * -strength, -1.0, 1.0);
-    }
-    state
+pub fn adjust_relation_tension(state: RelationState, signed_strength: f32) -> RelationState {
+    let nudge = relation_evidence_nudge(signed_strength);
+    apply_relation_nudge(
+        state,
+        RelationNudge {
+            tension: nudge.tension,
+            ..RelationNudge::default()
+        },
+    )
 }
 
 fn blend_bounded(current: f32, target: f32, rate: f32, minimum: f32, maximum: f32) -> f32 {
@@ -1180,33 +1343,21 @@ mod tests {
         let ambient = evolve_interaction_state(&ambient, Some(initial_relation), initial_affect);
 
         assert!(engaged.relation.familiarity > ambient.relation.familiarity);
-        assert!(engaged.relation.trust > ambient.relation.trust);
         assert!(engaged.relation.comfort > ambient.relation.comfort);
         assert!(engaged.affect.arousal > ambient.affect.arousal);
         assert!(engaged.affect.curiosity > ambient.affect.curiosity);
         assert!(engaged.affect.social_energy > ambient.affect.social_energy);
+        // 结构演化只写 familiarity 与 comfort：tension / affinity / trust 由证据
+        // delta 通道独占，回合收尾的整行回写不许碰它们。
         assert_eq!(engaged.relation.affinity, initial_relation.affinity);
+        assert_eq!(engaged.relation.trust, initial_relation.trust);
+        assert_eq!(engaged.relation.tension, initial_relation.tension);
         engaged.affect.validate().expect("affect stays bounded");
         engaged.relation.validate().expect("relation stays bounded");
     }
 
     #[test]
-    fn semantic_cues_are_validated_and_default_to_legacy_evolution() {
-        let person_id = PersonId::new();
-        let message = interaction_message(person_id, ConversationKind::Direct, "hello");
-        let relation = RelationState::new(person_id);
-        let affect = AffectState::default();
-
-        assert_eq!(
-            evolve_interaction_state_with_cues(
-                &message,
-                Some(relation),
-                affect,
-                InteractionCues::default(),
-            )
-            .expect("default cues are valid"),
-            evolve_interaction_state(&message, Some(relation), affect)
-        );
+    fn interaction_cues_are_validated_at_the_cue_boundary() {
         assert_eq!(
             InteractionCues {
                 sentiment_confidence: f32::NAN,
@@ -1227,17 +1378,29 @@ mod tests {
                 field: "gratitude_strength"
             })
         );
+        // 越界的 cues 整条拒绝，绝不截断成"近似有效"。
+        assert!(
+            apply_interaction_cues(
+                PersonId::new(),
+                None,
+                AffectState::default(),
+                InteractionCues {
+                    sentiment_valence: -1.5,
+                    ..InteractionCues::default()
+                },
+            )
+            .is_err()
+        );
     }
 
     #[test]
-    fn sentiment_moves_affect_and_hostility_accumulates_as_relation_tension() {
+    fn sentiment_moves_affect_only_and_never_the_relation() {
         let person_id = PersonId::new();
-        let message = interaction_message(person_id, ConversationKind::Direct, "hello");
         let relation = RelationState {
             person_id,
             familiarity: 0.2,
-            affinity: 0.0,
-            trust: 0.0,
+            affinity: 0.3,
+            trust: 0.1,
             comfort: 0.0,
             tension: 0.5,
         };
@@ -1247,9 +1410,8 @@ mod tests {
             social_energy: 0.5,
             curiosity: 0.5,
         };
-        let baseline = evolve_interaction_state(&message, Some(relation), affect);
-        let sad = evolve_interaction_state_with_cues(
-            &message,
+        let sad = apply_interaction_cues(
+            person_id,
             Some(relation),
             affect,
             InteractionCues {
@@ -1260,8 +1422,8 @@ mod tests {
             },
         )
         .expect("bounded sentiment cues");
-        let grateful = evolve_interaction_state_with_cues(
-            &message,
+        let grateful = apply_interaction_cues(
+            person_id,
             Some(relation),
             affect,
             InteractionCues {
@@ -1273,25 +1435,15 @@ mod tests {
         )
         .expect("bounded gratitude cues");
 
-        assert!(sad.affect.valence < baseline.affect.valence);
-        assert_eq!(sad.relation.affinity, baseline.relation.affinity);
-        assert!(grateful.affect.valence > baseline.affect.valence);
-        assert!(grateful.relation.affinity > baseline.relation.affinity);
-        assert!(grateful.relation.trust > baseline.relation.trust);
-        assert!(grateful.relation.comfort > baseline.relation.comfort);
-        // **tension 不归这条通道。** 它是证据累积量，只由宿主侧的 delta 通道
-        // （相处证据 → `nudge_tension`）改。语义 cues 既不抬升也不降温：它判的是
-        // 说话人的情绪，判不出"这句话是不是冲着她"，而每一个动 tension 的路径都会
-        // 让回合收尾的整行回写有机会覆盖掉同期到账的证据（2026-09-14 实测）。
-        assert_eq!(
-            sad.relation.tension, baseline.relation.tension,
-            "语义 cues 不得改 tension"
-        );
-        assert_eq!(
-            grateful.relation.tension, baseline.relation.tension,
-            "语义 cues 不得改 tension"
-        );
-        grateful.affect.validate().expect("affect stays bounded");
+        assert!(sad.affect.valence < affect.valence);
+        assert!(grateful.affect.valence > affect.valence);
+        assert!(grateful.affect.social_energy > affect.social_energy);
+        // 关系一列都不动：这条通道看到的是"说话人此刻的情绪"，判不出"这句话是不是
+        // 冲着她"，更不该在回合收尾用旧快照把它写回去。
+        for evolved in [sad.relation, grateful.relation] {
+            assert_eq!(evolved, relation, "语义 cues 不得改关系");
+        }
+        sad.affect.validate().expect("affect stays bounded");
         grateful
             .relation
             .validate()
@@ -1299,13 +1451,12 @@ mod tests {
     }
 
     #[test]
-    fn only_the_delta_channel_moves_tension() {
+    fn only_the_delta_channel_moves_tension_affinity_and_trust() {
         let person_id = PersonId::new();
         let message = interaction_message(person_id, ConversationKind::Direct, "hello");
         let affect = AffectState::default();
-        // 强烈敌意的语义 cues：以前这条会抬 tension，现在一律不动——累积只发生在
-        // delta 通道里（宿主侧 `nudge_tension`），这样回合收尾的整行回写不可能把它
-        // 抹掉。
+        // 强烈敌意的语义 cues 连续三十条：关系一列都不许动——累积只发生在 delta
+        // 通道里，这样回合收尾的整行回写不可能把它抹掉。
         let hostile = InteractionCues {
             sentiment_valence: -0.9,
             sentiment_arousal: 0.6,
@@ -1314,20 +1465,24 @@ mod tests {
         };
         let mut relation = RelationState::new(person_id);
         for _ in 0..30 {
-            relation =
-                evolve_interaction_state_with_cues(&message, Some(relation), affect, hostile)
-                    .expect("bounded cues")
-                    .relation;
+            relation = apply_interaction_cues(person_id, Some(relation), affect, hostile)
+                .expect("bounded cues")
+                .relation;
         }
         assert_eq!(
-            relation.tension, 0.0,
-            "语义 cues 连强烈敌意也不得累积成张力：{}",
-            relation.tension
+            relation,
+            RelationState::new(person_id),
+            "语义 cues 连强烈敌意也不得累积成关系变化"
         );
-        relation.validate().expect("relation stays bounded");
+        // 结构演化同样不碰这三列。
+        let structural = evolve_interaction_state(&message, Some(relation), affect);
+        assert_eq!(structural.relation.tension, relation.tension);
+        assert_eq!(structural.relation.affinity, relation.affinity);
+        assert_eq!(structural.relation.trust, relation.trust);
 
         // delta 通道：单条远不到静默阈值，持续才累积，善意能拉回来，且始终有界。
-        let once = adjust_relation_tension(RelationState::new(person_id), 0.15);
+        let once =
+            apply_relation_nudge(RelationState::new(person_id), relation_evidence_nudge(0.15));
         assert!(
             once.tension < 0.3,
             "单条证据不该把关系推到静默边缘：{}",
@@ -1335,7 +1490,7 @@ mod tests {
         );
         let mut accumulated = RelationState::new(person_id);
         for _ in 0..30 {
-            accumulated = adjust_relation_tension(accumulated, 0.15);
+            accumulated = apply_relation_nudge(accumulated, relation_evidence_nudge(0.15));
         }
         assert!(
             accumulated.tension > once.tension,
@@ -1344,13 +1499,43 @@ mod tests {
             accumulated.tension
         );
         accumulated.validate().expect("relation stays bounded");
-        let cooled = adjust_relation_tension(accumulated, -0.05);
+        let cooled = apply_relation_nudge(accumulated, relation_evidence_nudge(-0.05));
         assert!(
             cooled.tension < accumulated.tension,
             "善意必须能降温：{} -> {}",
             accumulated.tension,
             cooled.tension
         );
+        // 同一条证据同时移动好感与信任：持续善意把它推向 1，一条高置信敌意真的扣分。
+        // 符号沿用 tension_delta 的约定：正 = 不友好，负 = 友好。
+        let mut warmed = RelationState::new(person_id);
+        for _ in 0..23 {
+            warmed = apply_relation_nudge(warmed, relation_evidence_nudge(-0.5));
+        }
+        assert!(
+            warmed.affinity > 0.5,
+            "23 条中等强度的善意应当把好感推过 0.5：{}",
+            warmed.affinity
+        );
+        assert!(warmed.trust > 0.0);
+        let chilled = apply_relation_nudge(
+            RelationState {
+                affinity: 0.9,
+                trust: 0.9,
+                ..RelationState::new(person_id)
+            },
+            relation_evidence_nudge(1.0),
+        );
+        assert!(
+            chilled.affinity > 0.5 && chilled.affinity < 0.9,
+            "一条高置信敌意要真的扣好感，但不能一句话毁掉长期关系：{}",
+            chilled.affinity
+        );
+        assert!(chilled.trust < 0.9);
+        chilled.validate().expect("relation stays bounded");
+        // 无效证据不产生任何更新。
+        assert!(relation_evidence_nudge(f32::NAN).is_empty());
+        assert!(relation_evidence_nudge(0.0).is_empty());
     }
 
     #[test]
@@ -1359,9 +1544,9 @@ mod tests {
         let relation = RelationState {
             person_id,
             familiarity: 0.4,
-            affinity: 0.0,
-            trust: 0.0,
-            comfort: 0.0,
+            affinity: 0.2,
+            trust: 0.1,
+            comfort: 0.3,
             tension: 0.5,
         };
         let affect = AffectState {
@@ -1383,12 +1568,12 @@ mod tests {
         )
         .expect("bounded semantic cues");
 
-        assert_eq!(evolved.relation.familiarity, relation.familiarity);
-        assert!(evolved.relation.affinity > relation.affinity);
-        assert!(evolved.relation.trust > relation.trust);
-        assert!(evolved.relation.tension < relation.tension);
+        // 语义通道只写情绪：关系那一份由结构演化（familiarity/comfort）与证据
+        // delta 通道（tension/affinity/trust）分别负责，同一条互动不会被记两次。
+        assert_eq!(evolved.relation, relation);
         assert!(evolved.affect.valence > affect.valence);
         assert!(evolved.affect.arousal > affect.arousal);
+        assert!(evolved.affect.social_energy > affect.social_energy);
     }
 
     #[test]

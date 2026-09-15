@@ -56,8 +56,12 @@ pub(crate) enum RelationEvidence {
 }
 
 impl RelationEvidence {
-    /// 折算成关系张力的调整量；`None` = 这次不记账。
-    pub(crate) fn tension_delta(self, strength: f32, confidence: f32) -> Option<f32> {
+    /// 折算成**有符号的相处证据强度**；`None` = 这次不记账。
+    ///
+    /// 符号沿用 Core 的约定：正 = 不友好（推高张力、压低好感与信任），
+    /// 负 = 友好（降温、抬高好感与信任）。折算刻度（张力 0.15 锚点、好感的混合率）
+    /// 全在 Core 的 `relation_evidence_nudge` 里，这里只负责"这条判定有多强"。
+    pub(crate) fn signed_strength(self, strength: f32, confidence: f32) -> Option<f32> {
         if !strength.is_finite() || !confidence.is_finite() {
             return None;
         }
@@ -261,11 +265,13 @@ pub(crate) fn spawn_judgement(group_id: i64, user_id: i64, input: EvidenceInput<
 }
 
 /// 个人级：折进 `relation.tension`。刻度与模型 mood 那条通道共用
-/// `adjust_relation_tension`，两边不要各自再乘系数。
+/// 个人级：折进 `relation.tension`（短期冷暖）与 `relation.affinity` / `trust`
+/// （长期好感与信任）。刻度与符号都在 Core 的 `relation_evidence_nudge` 里，
+/// 两边不要各自再乘系数。
 async fn record_personal_evidence(user_id: i64, judgement: RelationJudgement) {
     let Some(strength) = judgement
         .evidence
-        .tension_delta(judgement.strength, judgement.confidence)
+        .signed_strength(judgement.strength, judgement.confidence)
     else {
         return;
     };
@@ -290,10 +296,18 @@ async fn record_personal_evidence(user_id: i64, judgement: RelationJudgement) {
         eprintln!("[WARN] 相处证据跳过：关系存储不可用 (用户: {user_id})");
         return;
     };
-    match relations.nudge_tension(person_id, strength).await {
+    match relations
+        .nudge(person_id, yunxi_core::relation_evidence_nudge(strength))
+        .await
+    {
         Ok(Some(state)) => println!(
-            "[RELATION] 相处证据已记账 user={user_id} tone={:?} strength={strength:+.2} call_strength={:.2} confidence={:.2} tension={:.3}",
-            judgement.evidence, judgement.strength, judgement.confidence, state.tension
+            "[RELATION] 相处证据已记账 user={user_id} tone={:?} strength={strength:+.2} call_strength={:.2} confidence={:.2} tension={:.3} affinity={:.3} trust={:.3}",
+            judgement.evidence,
+            judgement.strength,
+            judgement.confidence,
+            state.tension,
+            state.affinity,
+            state.trust
         ),
         Ok(None) => println!(
             "[RELATION] 相处证据跳过：该 person 还没有关系行 user={user_id} person={person_id} strength={strength:+.2}"
@@ -344,40 +358,85 @@ mod tests {
     fn only_unfriendly_and_warm_move_tension_and_only_above_the_confidence_floor() {
         // 中性永远不记账；置信不足时连明确的敌意也不动长期关系——模型自己都不确定
         // 的判断不该写进"她怎么看你"。
-        assert_eq!(RelationEvidence::Neutral.tension_delta(0.9, 0.9), None);
-        assert_eq!(RelationEvidence::Unfriendly.tension_delta(0.9, 0.5), None);
-        assert_eq!(RelationEvidence::Warm.tension_delta(0.9, 0.59), None);
+        assert_eq!(RelationEvidence::Neutral.signed_strength(0.9, 0.9), None);
+        assert_eq!(RelationEvidence::Unfriendly.signed_strength(0.9, 0.5), None);
+        assert_eq!(RelationEvidence::Warm.signed_strength(0.9, 0.59), None);
 
         let strong = RelationEvidence::Unfriendly
-            .tension_delta(1.0, 1.0)
+            .signed_strength(1.0, 1.0)
             .expect("高置信不友好应当记账");
         assert!((strong - UNFRIENDLY_TENSION_STEP).abs() < 1e-6);
+        assert!(strong > 0.0, "正 = 不友好");
         let mild = RelationEvidence::Unfriendly
-            .tension_delta(0.5, 0.8)
+            .signed_strength(0.5, 0.8)
             .expect("中等强度也记账，只是更小");
         assert!(mild > 0.0 && mild < strong);
-        assert_eq!(
-            RelationEvidence::Warm.tension_delta(1.0, 1.0),
-            Some(WARM_TENSION_STEP)
-        );
+        let warm = RelationEvidence::Warm
+            .signed_strength(1.0, 1.0)
+            .expect("善意也记账");
+        assert_eq!(warm, WARM_TENSION_STEP);
+        assert!(warm < 0.0, "负 = 友好");
     }
 
     #[test]
     fn the_scale_matches_the_calibration_in_the_docs() {
-        // 文档里"约 22 条越线"的标定是字面表时代的锚点。判据换成模型之后这个口径
-        // 不能漂：一条高置信不友好仍约等于 0.15，其余按 strength×confidence 缩放。
+        // 文档里的标定不能被判据换代带偏：一条高置信不友好仍约等于 0.15（0.2 混合率
+        // 下约 31 条越过 0.6），其余按 strength×confidence 缩放。
         let per_message = RelationEvidence::Unfriendly
-            .tension_delta(1.0, 1.0)
+            .signed_strength(1.0, 1.0)
             .expect("应当记账");
-        let mut tension = 0.0_f32;
+        let mut relation = yunxi_core::RelationState::new(yunxi_core::PersonId::new());
         let mut messages = 0;
-        while tension < 0.6 && messages < 100 {
-            tension += (1.0 - tension) * 0.2 * per_message.abs();
+        while relation.tension < 0.6 && messages < 100 {
+            relation = yunxi_core::apply_relation_nudge(
+                relation,
+                yunxi_core::relation_evidence_nudge(per_message),
+            );
             messages += 1;
         }
         assert!(
             (29..=33).contains(&messages),
             "越线所需条数应在 31 上下（0.2 混合率 × 0.15 锚点），实测 {messages}"
+        );
+        // 善意同样真的会降温。
+        let cooled = yunxi_core::apply_relation_nudge(
+            relation,
+            yunxi_core::relation_evidence_nudge(WARM_TENSION_STEP),
+        );
+        assert!(cooled.tension < relation.tension);
+    }
+
+    #[test]
+    fn relationship_evidence_moves_warmth_in_the_documented_direction() {
+        let person = yunxi_core::PersonId::new();
+        let warm = RelationEvidence::Warm
+            .signed_strength(1.0, 1.0)
+            .expect("应当记账");
+        let mut relation = yunxi_core::RelationState::new(person);
+        for _ in 0..23 {
+            relation = yunxi_core::apply_relation_nudge(
+                relation,
+                yunxi_core::relation_evidence_nudge(warm),
+            );
+        }
+        assert!(
+            relation.affinity > 0.05,
+            "持续善意必须真的抬高好感：{}",
+            relation.affinity
+        );
+        assert!(relation.trust > 0.0);
+        let hostile = RelationEvidence::Unfriendly
+            .signed_strength(1.0, 1.0)
+            .expect("应当记账");
+        let chilled = yunxi_core::apply_relation_nudge(
+            relation,
+            yunxi_core::relation_evidence_nudge(hostile),
+        );
+        assert!(
+            chilled.affinity < relation.affinity,
+            "不友好必须真的扣好感：{} -> {}",
+            relation.affinity,
+            chilled.affinity
         );
     }
 

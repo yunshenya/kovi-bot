@@ -99,6 +99,7 @@ async fn project_interaction_cues_inner(
             }
         }
     }
+    record_gratitude_evidence(person_id, cues).await;
     let observed =
         InteractionCuesObservedEvent::new(person_id, cues).map_err(|error| error.to_string())?;
     bridge
@@ -110,6 +111,45 @@ async fn project_interaction_cues_inner(
         ))
         .await
         .map_err(|error| error.to_string())
+}
+
+/// 语义层的 `gratitude`（明确的谢意、歉意、关心）折算成相处证据强度的系数。
+///
+/// 它给的是一条**中等偏强**的善意：`gratitude_strength = 0.75`（语义层的固定
+/// 取值）乘这个系数约等于 0.5 的相处证据，于是约 31 次明确道谢把好感推过 0.5。
+/// 比逐条判定的"顺带的好语气"更强是应该的——它判的是"她在道谢"，不是"这句话
+/// 语气不错"。
+const GRATITUDE_EVIDENCE_SCALE: f32 = 0.65;
+
+/// 道谢走**证据通道**，而不是回合收尾的整行回写。
+///
+/// 关系行只有一根 `updated_at` 时钟，五个维度各有写者：整行回写写回的是**回合开始
+/// 时的快照**，它在回合进行中到账的证据上盖过去（2026-09-14 张力事故）。好感与信任
+/// 因此和张力一样，只能由这条 delta 通道改：它把漂移与本列的变化放进同一条 SQL，
+/// 既不丢别列的衰减，也不会被别处的回写抹掉。
+async fn record_gratitude_evidence(person_id: yunxi_core::PersonId, cues: InteractionCues) {
+    let gratitude = cues.gratitude_strength;
+    if !gratitude.is_finite() || gratitude <= 0.0 {
+        return;
+    }
+    let Some(relations) = super::relation_store() else {
+        return;
+    };
+    // 负号 = 友好：Core 的相处证据约定"正 = 不友好"。
+    let strength = -(gratitude * GRATITUDE_EVIDENCE_SCALE).clamp(0.0, 1.0);
+    match relations
+        .nudge(person_id, yunxi_core::relation_evidence_nudge(strength))
+        .await
+    {
+        Ok(Some(state)) => println!(
+            "[RELATION] 道谢已记账 person={person_id} strength={strength:+.2} tension={:.3} affinity={:.3} trust={:.3}",
+            state.tension, state.affinity, state.trust
+        ),
+        Ok(None) => println!(
+            "[RELATION] 道谢跳过：该 person 还没有关系行 person={person_id} strength={strength:+.2}"
+        ),
+        Err(error) => kovi::log::warn!("Yunxi gratitude evidence failed soft: {error}"),
+    }
 }
 
 pub(crate) fn project_agent_task(

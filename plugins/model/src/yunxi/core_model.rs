@@ -11671,7 +11671,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_response_delta_does_not_repeat_structural_familiarity() {
+    fn semantic_cues_do_not_enter_the_plan_relation_update() {
         let person_id = PersonId::new();
         let input = message_input(person_id, true);
         let WorldEventKind::MessageReceived(message) = input.event.kind() else {
@@ -11695,8 +11695,14 @@ mod tests {
             })
             .expect("relation update");
 
+        // 回合里的关系更新只有结构那一份：familiarity 与 comfort。好感、信任与张力
+        // 由相处证据的 delta 通道独占——计划里带着它们，就会在回合收尾用回合开始时的
+        // 快照覆盖掉同期到账的证据（2026-09-14 张力事故，好感和信任同形）。
         assert_eq!(relation.familiarity, structural.relation.familiarity);
-        assert!(relation.affinity > structural.relation.affinity);
+        assert_eq!(relation.comfort, structural.relation.comfort);
+        assert_eq!(relation.affinity, structural.relation.affinity);
+        assert_eq!(relation.trust, structural.relation.trust);
+        assert_eq!(relation.tension, structural.relation.tension);
     }
 
     #[test]
