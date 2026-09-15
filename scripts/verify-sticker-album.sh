@@ -238,7 +238,10 @@ def denial_hits(text):
 
 
 def ask(messages, tools=None):
-    body = {"model": server["model_name"], "max_tokens": 300, "messages": messages}
+    # 与生产一致：关掉 thinking。不带的话这个模型可能把预算全花在 reasoning 通道上，
+    # 正文为空、判据被误报成失败。
+    body = {"model": server["model_name"], "max_tokens": 300,
+            "thinking": {"type": "disabled"}, "messages": messages}
     if tools:
         body["tools"] = tools
     request = urllib.request.Request(
