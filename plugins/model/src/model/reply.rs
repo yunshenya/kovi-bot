@@ -1368,6 +1368,33 @@ mod tests {
             "这里是宿主链路，写 Core 的标记会被当成正文发出去: {sticker_description}"
         );
         assert_eq!(sticker["sticker"]["maxLength"], json!(64));
+
+        // 形状与线上已在用的注册表工具声明保持一致（`tool_access.rs` 的 `definition_spec`）：
+        // 每个字段都要有显式的 `type` 与非空 `description`——没有说明的字段就是让模型猜。
+        // 这里不加 `required`：`reply_action` 的字段全部可选（省略即默认），
+        // 与注册表工具里那些真有必填项、于是写了 `required` 的 schema 不冲突。
+        for (name, spec) in [
+            ("base", reply_action_tool_spec(false, false)),
+            ("voice", reply_action_tool_spec(true, false)),
+            ("sticker", reply_action_tool_spec(false, true)),
+        ] {
+            let properties = spec["function"]["parameters"]["properties"]
+                .as_object()
+                .expect("properties 必须是对象");
+            assert!(!properties.is_empty(), "{name}: 必须有字段");
+            for (field, schema) in properties {
+                assert!(
+                    schema["type"].is_string(),
+                    "{name}: 字段 {field} 缺显式 type"
+                );
+                assert!(
+                    schema["description"]
+                        .as_str()
+                        .is_some_and(|text| !text.trim().is_empty()),
+                    "{name}: 字段 {field} 缺说明"
+                );
+            }
+        }
     }
 
     /// 动作候选仍然照常挂载，但不再有那条常驻的协议 system 消息。
