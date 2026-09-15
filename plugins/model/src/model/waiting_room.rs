@@ -379,6 +379,13 @@ fn shadow_line(
     if !report.stuck && !reclaim {
         return None;
     }
+    // 判据真正用的那个静默时长：排空没推进、或回合停在同一步，取更大的那个。
+    let stalled_secs = evidence
+        .drain_stalled_secs
+        .into_iter()
+        .chain(evidence.step_stalled_secs)
+        .max()
+        .unwrap_or_default();
     // 同一个回合每超时一轮才报一次：卡住时每 30 秒扫一遍，不能每遍都刷同一行。
     if let Some(id) = report.turn_observation {
         let freshly_stalled = report
@@ -391,13 +398,14 @@ fn shadow_line(
         }
     }
     Some(format!(
-        "[STALL] shadow=true kind={} subject={} step={} step_secs={} waited_secs={} \
-         queue={} oldest_queued_secs={} drain_active={} drain_progress_secs={} \
-         would_reclaim={} reason={}",
-        report.kind,
+        // 字段名跟设计稿对齐：`group=…` / `step=…` / `stalled=…s` 是当初说好的那三个
+        // （`stalled` 取排空与步骤两个静默时长里更大的那个，也就是判据真正用的那个数）。
+        // 其余字段是为了出事时不必再登机器：谁在等、队列多长、排空还活着没有。
+        "[STALL] shadow=true group={} step={} stalled={}s waited={}s queue={} oldest_queued={}s \
+         drain_active={} drain_progress={}s would_reclaim={} reason={}",
         report.subject_id,
         report.turn_step.unwrap_or("none"),
-        report.turn_step_secs.unwrap_or_default(),
+        stalled_secs,
         report.turn_waiting_secs.unwrap_or_default(),
         report.queued,
         report.oldest_queued_secs.unwrap_or_default(),
@@ -899,10 +907,14 @@ mod tests {
         )
         .expect("停在这一步 900 秒必须报出来");
         assert!(line.contains("shadow=true"), "{line}");
+        assert!(
+            line.contains(&format!("group={}", scope_id(scope))),
+            "要指名道姓说是哪个会话: {line}"
+        );
         assert!(line.contains("step=send"), "要指名道姓说卡在哪一步: {line}");
         assert!(line.contains("would_reclaim=true"), "{line}");
         assert!(
-            line.contains("step_secs=900") || line.contains("step_secs=901"),
+            line.contains("stalled=900s") || line.contains("stalled=901s"),
             "要带上停了多久: {line}"
         );
 
