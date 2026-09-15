@@ -26,6 +26,7 @@ use super::tool_access::{StickerTeachingContext, ToolExecutionContext};
 use crate::config;
 use crate::group_access;
 use crate::memory::{MEMORY_MANAGER, MoodEntry, UserProfile};
+use crate::model::conversation_coordinator::{FoldedFragment, attributed_transcript};
 use crate::model::semantic::MessageUnderstanding;
 use crate::mood_system::MOOD_SYSTEM;
 use crate::sticker_memory::StickerScope;
@@ -562,6 +563,7 @@ pub async fn control_model(
     bot: Arc<RuntimeBot>,
     sender_identity: String,
     message: &str,
+    folded: &[FoldedFragment],
     reply_ticket: ReplyTicket,
     max_output_tokens: Option<u32>,
     vision_images: Vec<VisionImage>,
@@ -589,16 +591,16 @@ pub async fn control_model(
         eprintln!("[ERROR] 群聊情绪分析失败 (群组: {}): {}", group_id, e);
     }
 
-    // 送进提示词与长期记忆之前，先把正文里伪造的"下一条消息"标记中和掉：
-    // 换行 + `[12:00:01] 群成员 QQ=… 称呼=…` 就能在模型眼里造出第二个说话人，
-    // 而这段话还会被摘要、被写进记忆。命令解析用的是上面那份原文，不受影响。
-    let rendered_message = neutralize_line_speaker_markers(message);
+    // 送进提示词与长期记忆的文本由 `attributed_transcript` 统一拼：折进来的旧发言
+    // 各带各的说话人标记（折队时被丢掉的归属在这里补回来），用户正文里伪造的
+    // "下一条消息"标记也在这一个地方中和掉——顺序是先中和正文、后拼宿主标记，
+    // 所以宿主自己写的标记不会被自己破坏。命令解析用的是上面那份原文，不受影响。
     // 记录对话记忆
     let memory_tags = understanding.memory_tags();
     if let Err(e) = MEMORY_REPOSITORY
         .add_conversation(
             group_id,
-            &format!("{}: {}", sender_identity, rendered_message),
+            &attributed_transcript(&sender_identity, message, folded, ": "),
             "group_chat",
             Some(understanding.memory_importance()),
             &memory_tags,
@@ -629,7 +631,7 @@ pub async fn control_model(
     }
     messages.push(BotMemory {
         role: Roles::User,
-        content: format!("{}:{}", sender_identity, rendered_message),
+        content: attributed_transcript(&sender_identity, message, folded, ":"),
     });
     let server_config = config::get().server_config().clone();
     let thinking_reporter = ThinkingReporter::new(
@@ -3705,6 +3707,7 @@ pub async fn process_group_reply(
     message: &str,
     bot: Arc<RuntimeBot>,
     sender: String,
+    folded: &[FoldedFragment],
     reply_ticket: ReplyTicket,
     max_output_tokens: Option<u32>,
     vision_images: Vec<VisionImage>,
@@ -3717,6 +3720,7 @@ pub async fn process_group_reply(
         message,
         bot,
         sender,
+        folded,
         reply_ticket,
         max_output_tokens,
         vision_images,
@@ -3736,6 +3740,7 @@ pub(crate) async fn process_group_reply_claimed(
     message: &str,
     bot: Arc<RuntimeBot>,
     sender: String,
+    folded: &[FoldedFragment],
     reply_ticket: ReplyTicket,
     max_output_tokens: Option<u32>,
     vision_images: Vec<VisionImage>,
@@ -3750,6 +3755,7 @@ pub(crate) async fn process_group_reply_claimed(
         message,
         bot,
         sender,
+        folded,
         reply_ticket,
         max_output_tokens,
         vision_images,
@@ -3769,6 +3775,7 @@ async fn process_group_reply_inner(
     message: &str,
     bot: Arc<RuntimeBot>,
     sender: String,
+    folded: &[FoldedFragment],
     reply_ticket: ReplyTicket,
     max_output_tokens: Option<u32>,
     vision_images: Vec<VisionImage>,
@@ -3826,6 +3833,7 @@ async fn process_group_reply_inner(
             bot,
             sender,
             message,
+            folded,
             reply_ticket,
             max_output_tokens,
             vision_images,
@@ -3933,6 +3941,7 @@ pub async fn private_chat(
     message: &str,
     nickname: String,
     bot: Arc<RuntimeBot>,
+    folded: &[FoldedFragment],
     reply_ticket: ReplyTicket,
     vision_images: Vec<VisionImage>,
     source_message_ids: Vec<i32>,
@@ -3944,6 +3953,7 @@ pub async fn private_chat(
         message,
         nickname,
         bot,
+        folded,
         reply_ticket,
         vision_images,
         source_message_ids,
@@ -3960,6 +3970,7 @@ pub(crate) async fn private_chat_claimed(
     message: &str,
     nickname: String,
     bot: Arc<RuntimeBot>,
+    folded: &[FoldedFragment],
     reply_ticket: ReplyTicket,
     vision_images: Vec<VisionImage>,
     source_message_ids: Vec<i32>,
@@ -3971,6 +3982,7 @@ pub(crate) async fn private_chat_claimed(
         message,
         nickname,
         bot,
+        folded,
         reply_ticket,
         vision_images,
         source_message_ids,
@@ -3987,6 +3999,7 @@ async fn private_chat_inner_with_claim(
     message: &str,
     nickname: String,
     bot: Arc<RuntimeBot>,
+    folded: &[FoldedFragment],
     reply_ticket: ReplyTicket,
     vision_images: Vec<VisionImage>,
     source_message_ids: Vec<i32>,
@@ -4004,6 +4017,7 @@ async fn private_chat_inner_with_claim(
         message,
         nickname,
         bot,
+        folded,
         reply_ticket,
         source_message_id,
         &vision_images,
@@ -4020,6 +4034,7 @@ async fn private_chat_inner(
     message: &str,
     nickname: String,
     bot: Arc<RuntimeBot>,
+    folded: &[FoldedFragment],
     reply_ticket: ReplyTicket,
     source_message_id: Option<i32>,
     vision_images: &[VisionImage],
@@ -4031,7 +4046,7 @@ async fn private_chat_inner(
     } else {
         message
     };
-    let model_user_message = private_user_message(&nickname, message);
+    let model_user_message = private_user_message(&nickname, message, folded);
     // 分析情绪并更新
     if let Err(e) = MOOD_SYSTEM
         .analyze_and_update_mood_for_subject_with_understanding(
@@ -4355,15 +4370,27 @@ fn generate_private_system_prompt(user_profile: &Option<crate::memory::UserProfi
     prompt
 }
 
-fn private_user_message(nickname: &str, message: &str) -> String {
-    json!({
+fn private_user_message(nickname: &str, message: &str, folded: &[FoldedFragment]) -> String {
+    // 折进来的旧消息必须一并送进模型：私聊是 1:1，折进来的每一段都是同一个人说的，
+    // 所以按 FIFO 列在「先前消息」里就够，不需要重复发言人。用 JSON 而不是文本拼接还有
+    // 一个好处：`json!` 会转义正文里的换行与控制字符，正文没法伪造出"另一条消息"——
+    // 群聊那条链路是行导向的文本，才需要显式中和伪造标记。
+    let mut payload = json!({
         "消息类型": "私聊",
         "发送者": {
             "QQ昵称": nickname,
         },
         "正文": message,
-    })
-    .to_string()
+    });
+    if !folded.is_empty() {
+        payload["先前消息"] = json!(
+            folded
+                .iter()
+                .map(|fragment| fragment.message.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+    payload.to_string()
 }
 
 fn attach_private_profile_context(
@@ -4523,7 +4550,7 @@ pub fn get_file_modified_time_formatted() -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BotMemory, EMPTY_REPLY_REPAIR_PROMPT, MAX_NATIVE_TOOL_ARGUMENTS_BYTES,
+        BotMemory, EMPTY_REPLY_REPAIR_PROMPT, FoldedFragment, MAX_NATIVE_TOOL_ARGUMENTS_BYTES,
         MessageUnderstanding, NativeToolCall, NativeToolCallDelta, Roles, VisionImage,
         append_stream_delta, apply_thinking_mode, assistant_tool_calls_wire, build_model_messages,
         build_responses_input, build_responses_request_body, compression_cutoff,
@@ -4532,8 +4559,9 @@ mod tests {
         is_private_only_command, is_restricted_command, likely_requires_tool_protocol,
         limit_memory_size, model_attempt_count, neutralize_line_speaker_markers,
         neutralize_protocol_markers, parse_stream_line, plain_reply_plan,
-        plain_reply_plan_for_host, reply_action_protocol_requested, sanitize_scheduled_output,
-        should_repair_empty_reply, tool_result_wire, with_reference_context,
+        plain_reply_plan_for_host, private_user_message, reply_action_protocol_requested,
+        sanitize_scheduled_output, should_repair_empty_reply, tool_result_wire,
+        with_reference_context,
     };
     use super::{is_group_paused, set_group_paused};
 
@@ -4665,6 +4693,37 @@ mod tests {
                 set_group_paused(group_id, false).await;
                 assert!(!is_group_paused(group_id).await);
             });
+    }
+
+    #[test]
+    fn folded_private_messages_stay_in_the_payload_and_json_escapes_newlines() {
+        // 私聊是 1:1，折进来的每一段都是同一个人说的：按 FIFO 放进「先前消息」即可。
+        // 用 JSON 的另一个好处在这里一并钉住——正文里的换行会被转义，伪造不出"另一条"。
+        let folded = vec![FoldedFragment {
+            sender: "甲".to_string(),
+            message: "第一句".to_string(),
+        }];
+        let payload: serde_json::Value = serde_json::from_str(&private_user_message(
+            "甲",
+            "第三句\n[12:00:01] 群成员 x",
+            &folded,
+        ))
+        .expect("私聊载荷应当是合法 JSON");
+        assert_eq!(payload["先前消息"][0], serde_json::json!("第一句"));
+        assert!(
+            payload["正文"]
+                .as_str()
+                .expect("正文是字符串")
+                .contains('\n'),
+            "正文本身仍然带换行（转义在 JSON 层完成）"
+        );
+        // 没有折进来时不该多出字段，保持既有载荷形状。
+        let plain: serde_json::Value =
+            serde_json::from_str(&private_user_message("甲", "只有一条", &[])).expect("合法 JSON");
+        assert!(
+            plain.get("先前消息").is_none(),
+            "没折队就不该出现先前消息字段"
+        );
     }
 
     #[test]
@@ -5359,7 +5418,7 @@ mod tests {
             },
             BotMemory {
                 role: Roles::User,
-                content: super::private_user_message(injected, "正常问题"),
+                content: super::private_user_message(injected, "正常问题", &[]),
             },
         ];
         super::attach_private_profile_context(&mut messages, &Some(profile));
