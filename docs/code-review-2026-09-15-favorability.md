@@ -1110,3 +1110,44 @@ QQ 那一层需要先部署（不可逆红线，未动），但整条链路上�
 **回滚**：上一版 release 仍在服务器上，把 `current` 指回去再重启即可——
 `ln -sfn /home/ubuntu/kovi-bot/releases/5ee24f9bf45762f6dabde56b92d522e86db3e35a /home/ubuntu/kovi-bot/current`
 `&& sudo systemctl restart kovi-bot.service`（发布脚本在 readiness 不通过时也会自动做这一步）。
+
+### 11.12 发布后发现并修复：群里的"撤回"没有执行者（`f8e0db0` + `7f0328f`）
+
+**现场（2026-09-15 18:32，群 641996763）**：用户 @ 她"撤回你刚刚发的消息"，她答"我这边没有
+撤回消息的权限，得你自己在群里长按那条消息操作一下"。日志里那一轮**从头到尾只有 Core**：
+`purpose=core_reply`、`Yunxi Core Strong result … tool=false`、`Core reply repair`，没有任何 Host
+链路行，也没有工具下发。
+
+**根因（两条）**：
+
+1. **归属**：群里被 @ 的消息经 `bridge.rs::classify_group` 判成 `GroupCoreHandling::Decide` →
+   归 Core；只有 `#` 开头的控制面命令、群被禁言、以及"已有回复在进行中"才留给 Host。
+2. **能力落位**：撤回只在 Host 链路（`reply_action` 的 `recall_message_ids`），Core 没有这只手。
+   模型手里没有工具，就自己编了一句"没有权限"。
+
+**不是这次部署引入的**（三条证据）：`classify_group` 那段路由在 `5ee24f9..HEAD` 里零改动；
+`supports_group` 的 `YUNXI_CORE_GROUP_CUTOVER` 默认 true 在 `5ee24f9` 就是同一行；服务器 systemd
+只设了 `YUNXI_CORE_PRIVATE_CUTOVER=1`，群聊那个开关走默认（开）。也就是说，自 v3（`26fd802`，9-02）
+Core 接管群聊起，群里自然语言的"撤回"就没有执行者了。
+
+**修法（按"副作用归注册表、回复形态归 hint"的边界，而不是给 Core 复制一套 reply_action）**：
+
+- `f8e0db0`：新增两个**宿主侧**注册表工具——`message.recall_candidates`（只读，列她自己最近
+  可撤回的消息，清单不进提示词，与 `sticker.list` 同范式）与 `message.recall`（写，id 只能来自
+  候选）。**`crates/yunxi-core` 一行没改**：Core 用它已有的 `CognitiveIntent::UseTool` 就能调，
+  因为注册表工具的执行能力是通用的 `ActionCapability::UseTool`；约 110 秒窗口、`delete_msg`、
+  候选白名单全留在宿主。校验与执行**复用** `recent_bot_messages` + `recall_bot_messages`，与宿主
+  那条撤回是同一份实现。
+- `7f0328f`：光有工具不够——两条链路都只在工具轮下发工具，而判据 `likely_requires_tool_protocol`
+  里没有"撤回"。改为复用既有的 `reply_action_tool_requested`（含"命令 vs 讨论"的排除），
+  动作类请求从此进工具轮。顺带补上一个既有口径漏洞：动作字段说明里点名了
+  `group_members_search`，而只挂 `reply_action` 的那一轮她根本没有这个工具。
+
+**验证**：4 条单元用例（候选只列她自己的；编造 id / 空数组 / 超上限一律拒；候选里的 id 能过校验；
+只读与定时任务的暴露口径；动作请求进工具轮而讨论不进）+ **真机探针**：明确要求撤回时，
+配置里的 `deepseek-v4-flash` 真的调了 `message_recall_candidates`。`fmt`/`clippy` 干净，
+workspace 测试全过（model 1157）。
+
+**遗留**：① 撤回暂时有**两个入口**（`reply_action.recall_message_ids` 与注册表工具，共用一份实现），
+收敛成只剩工具是后续独立提交；② 这次修复**尚未部署**，QQ 层实测（群里说一句"撤回你刚发的消息"）
+要等部署之后做。
