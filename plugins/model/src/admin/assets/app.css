@@ -1149,28 +1149,48 @@ mark {
   font-variant-numeric: var(--tnum);
 }
 
-/* 关系五维 / 进度条组 */
+/* 关系五维 / 进度条组
+ *
+ * 以 0 为中心的双向条：五个维度都是 -1..1 的有符号量，0 是中性。中线画出来，
+ * 正向向右、负向向左，负值走 danger 色——"她不喜欢这个人"必须一眼看得出来，
+ * 而不是像以前那样把 0 画成半满、把负数画成"差一点到一半"。 */
 .bars { display: flex; flex-direction: column; gap: 6px; margin-top: 9px; }
 .bar {
   display: grid;
-  grid-template-columns: 34px minmax(0, 1fr);
+  grid-template-columns: 34px minmax(0, 1fr) 34px;
   align-items: center;
   gap: 9px;
   font-size: 11.5px;
   color: var(--text-faint);
 }
+.bar .value {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
 .bar .track {
+  position: relative;
   height: 5px;
   border-radius: 999px;
   background: var(--gauge-track);
   overflow: hidden;
 }
+.bar .center {
+  position: absolute;
+  left: 50%;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: color-mix(in srgb, var(--text) 35%, transparent);
+}
 .bar .fill {
+  position: absolute;
+  top: 0;
   height: 100%;
   border-radius: 999px;
-  background: linear-gradient(90deg, var(--accent), var(--accent-2));
   transition: width var(--dur-slow) var(--ease-out);
 }
+.bar .fill.positive { background: linear-gradient(90deg, var(--accent), var(--accent-2)); }
+.bar .fill.negative { background: var(--danger); }
 
 /* ═══════════════ 概览 ═══════════════
  *

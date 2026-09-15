@@ -1835,8 +1835,14 @@
     };
     const start = data.total === 0 ? 0 : (memory.page - 1) * memory.limit + 1;
     const end = Math.min(memory.page * memory.limit, data.total);
+    // 过滤与分页都只在后端抓到的那个窗口里做（每类最多 200 条）。真实总数远超
+    // 窗口时如实说明：页码条只承诺它翻得到的页，不再出现"共 5000 条、翻到第 5 页
+    // 全是空的"。
+    const windowNote = data.total_is_window
+      ? `（在最近 ${data.window} 条里统计；库里共 ${data.db_total} 条）`
+      : '';
     return h('div', { class: 'table-foot' },
-      h('span', { class: 'muted', text: `${start}-${end} / 共 ${data.total} 条` }),
+      h('span', { class: 'muted', text: `${start}-${end} / 共 ${data.total} 条${windowNote}` }),
       h('div', { class: 'pager-btns' },
         h('button', { class: 'btn ghost small', text: '«', disabled: memory.page === 1, onclick: () => jump(1) }),
         h('button', { class: 'btn ghost small', text: '‹', disabled: memory.page === 1, onclick: () => jump(memory.page - 1) }),
@@ -2624,16 +2630,41 @@
     page.append(grid);
   }
 
+  // 关系五维。三个刻意的选择：
+  //
+  // 1. **张力也要画**。它是唯一直接改变行为的维度（群聊静默门控的判据），此前
+  //    恰好是唯一没画的那一维——页面上写着"关系"，却少了那一根会让她不回话的线。
+  // 2. **以 0 为中心**。五个维度都是 -1..1 的有符号量，0 是中性。原来把
+  //    (v+1)/2 画成 0..100% 的条，0 看起来就是"50%"：一个中性的人被画成"好感
+  //    一半"，而真正该一眼看出的"负"（不喜欢、紧张）在视觉上完全消失。
+  // 3. **给数字**。没有数字时相差 0.05 的两个人长得一模一样，也没法核对后台
+  //    与库里是否一致。
+  const RELATION_DIMENSIONS = [
+    ['affinity', '好感'],
+    ['trust', '信任'],
+    ['familiarity', '熟悉'],
+    ['comfort', '自在'],
+    ['tension', '张力'],
+  ];
+
   function bars(relation) {
     if (!relation) return null;
     const node = h('div', { class: 'bars' });
-    for (const [key, label] of [['familiarity', '熟悉'], ['affinity', '好感'], ['trust', '信任'], ['comfort', '自在']]) {
+    for (const [key, label] of RELATION_DIMENSIONS) {
       const value = relation[key];
       if (value === null || value === undefined) continue;
+      const clamped = Math.max(-1, Math.min(1, Number(value)));
+      // 从中点向两侧长：宽度是"离中性有多远"，方向由侧别与颜色表达。
+      const half = Math.round(Math.abs(clamped) * 50);
       node.append(h('div', { class: 'bar' },
         h('span', { text: label }),
         h('div', { class: 'track' },
-          h('div', { class: 'fill', style: `width: ${Math.round(((Number(value) + 1) / 2) * 100)}%` }))));
+          h('div', { class: 'center' }),
+          h('div', {
+            class: `fill ${clamped < 0 ? 'negative' : 'positive'}`,
+            style: `width: ${half}%; ${clamped < 0 ? 'right: 50%;' : 'left: 50%;'}`,
+          })),
+        h('span', { class: 'value', text: clamped.toFixed(2) })));
     }
     return node;
   }
@@ -2658,7 +2689,9 @@
       })));
 
     if (payload.relation) {
-      body.append(h('h4', { text: '关系' }), bars(payload.relation));
+      body.append(h('h4', { text: '关系' }),
+        h('div', { class: 'hint', text: '中点是中性（0）；这里是按流逝时间衰减之后的值，也就是她此刻真正在用的那份。张力 ≥ 0.35 会进语气提示，≥ 0.6 会让群聊里的点名回合被静默。' }),
+        bars(payload.relation));
     }
     if (payload.relation_notes && payload.relation_notes.length) {
       // 她在独处反思时写下的相处结论。只读展示：它不参与"回不回"的判定，
@@ -2670,7 +2703,9 @@
         notes.append(h('div', { class: 'record' },
           h('div', { class: 'record-title', text: note.target || '（未具名）' }),
           h('div', { class: 'record-body', text: note.note }),
-          h('div', { class: 'ids', text: `${note.observed_at || ''}　置信 ${(Number(note.confidence_milli || 0) / 100).toFixed(2)}` })));
+          // `confidence_milli` 是**千分比**（写入侧收口在 0..=200，另一个消费方
+          // 也按 /1000 读）。这里此前按 /100 渲染，0.13 会显示成「置信 1.30」。
+          h('div', { class: 'ids', text: `${fmtTime(note.observed_at)}　置信 ${(Number(note.confidence_milli || 0) / 1000).toFixed(2)}` })));
       }
       body.append(notes);
     }
@@ -4384,12 +4419,36 @@
       history.replaceState(null, '', location.pathname);
       showLoginError('链接里的 Token 不正确或已失效，请重新输入。');
     }
+    // **"没登录"与"登录了但页面没渲染出来"必须分开。** 以前整段共用一个
+    // try/catch：任何一次首屏渲染失败（例如数据库暂时连不上，而 `/api/memory/stats`
+    // 是允许 503 的）都会被当成"会话失效"，于是把人踢回登录页——重新登录还是同一个
+    // 结果，控制台恰好在出事的时候进不去。现在只把真正的会话检查失败当作未登录。
+    let authenticated = false;
     try {
       await api('/api/session');
-      showApp();
-      await boot();
+      authenticated = true;
     } catch (_) {
+      authenticated = false;
+    }
+    if (!authenticated) {
       showLogin();
+      return;
+    }
+    showApp();
+    try {
+      await boot();
+    } catch (problem) {
+      // 会话是好的，是页面本身没起来：留在控制台里，把原因写在当前页上。
+      // （`goto` 会先设好 `currentPage` 再渲染，所以这里拿到的是出错的那一页。）
+      const reason = problem && problem.message ? problem.message : String(problem);
+      const page = document.getElementById(`page-${currentPage || 'overview'}`)
+        || document.getElementById('page-overview');
+      if (page) {
+        page.replaceChildren(h('div', { class: 'card' },
+          h('h3', { text: '这一页没能加载' }),
+          h('div', { class: 'hint', text: '会话有效，是页面要的数据没取到。修好后点侧栏或刷新即可。' }),
+          h('pre', { class: 'json', text: reason })));
+      }
     }
   })();
 })();
