@@ -380,7 +380,7 @@ static INDEX: LazyLock<Mutex<StickerIndex>> = LazyLock::new(|| Mutex::new(Sticke
 static USE_COUNTS: LazyLock<Mutex<HashMap<String, u64>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// 这条消息是不是在问"表情包"这件事。
+/// 这条消息是不是在说"图"这件事：表情包、贴纸、斗图，以及**她自己的照片**。
 ///
 /// 用来做**信号驱动的清单注入**：被问到库里有什么的时候，把标签清单直接放进这一轮
 /// 的提示词，而不是指望她自己想到去调 `sticker.list`。线上 2026-09-15 02:15 就是
@@ -388,8 +388,26 @@ static USE_COUNTS: LazyLock<Mutex<HashMap<String, u64>>> =
 /// 直接凭印象编了个「猫猫歪头」，然后连发两次都发不出去。
 ///
 /// 只在命中时花那几十个 token，比把清单常驻提示词便宜得多。
+///
+/// 相册语义也要按这个判据注入：素材库就是她自己的图库，带她名字的那张就是她本人的
+/// 照片（见 `yunxi/core_model.rs` 的 `CORE_STICKER_INSTRUCTION`）。所以"要她的照片"
+/// 与"要表情包"是同一类请求——只认表情包那几个词，她就会在"发我看看你的照片"这种
+/// 消息上拿不到相册语义（线上 2026-09-15 13:20 就是这么答成"那不是我真人的样子"的）。
 pub(crate) fn asks_about_stickers(text: &str) -> bool {
-    const NEEDLES: [&str; 6] = ["表情包", "表情", "贴纸", "斗图", "sticker", "meme"];
+    const NEEDLES: [&str; 12] = [
+        "表情包",
+        "表情",
+        "贴纸",
+        "斗图",
+        "照片",
+        "相册",
+        "自拍",
+        "sticker",
+        "meme",
+        "photo",
+        "album",
+        "selfie",
+    ];
     let lowered = text.to_ascii_lowercase();
     NEEDLES.iter().any(|needle| lowered.contains(needle))
 }
@@ -982,7 +1000,8 @@ mod tests {
         assert_eq!(extension_for_image(b"not an image"), None);
     }
 
-    /// 问"有哪些表情包"要能被识别出来（这是清单注入的触发条件）。
+    /// 问"有哪些表情包"要能被识别出来（这是清单注入的触发条件）；问"要她的照片"
+    /// 也是同一类请求——素材库就是她的相册，见 `asks_about_stickers` 的说明。
     #[test]
     fn sticker_questions_are_detected() {
         for text in [
@@ -992,6 +1011,10 @@ mod tests {
             "来斗图",
             "send me a sticker",
             "show me a MEME",
+            "你不是有一张表情包是你的照片吗",
+            "发我看看你的照片",
+            "相册里有自拍吗",
+            "send me your photo",
         ] {
             assert!(super::asks_about_stickers(text), "{text} 应当命中");
         }
