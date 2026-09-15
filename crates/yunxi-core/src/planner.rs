@@ -770,6 +770,14 @@ pub struct PlannerInput {
     /// runs the driver's follow-up rounds.
     #[serde(default, skip_serializing_if = "PlannerWorkingMemory::is_empty")]
     pub working_memory: PlannerWorkingMemory,
+    /// What this conversation was waiting for, and how it turned out.
+    ///
+    /// Distinct from [`Self::working_memory`] because it is not this task's
+    /// history: an expectation that outlives the task it came from — "I sent it
+    /// and waited for a reply" — reports back here, so the next turn in that
+    /// conversation learns whether the thing she was waiting for ever arrived.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expectation_notes: Vec<crate::WorkingObservation>,
 }
 
 impl PlannerInput {
@@ -790,6 +798,7 @@ impl PlannerInput {
             mind: MindSnapshot::empty(),
             executive: ExecutiveSnapshot::default(),
             working_memory: PlannerWorkingMemory::new(),
+            expectation_notes: Vec::new(),
         }
     }
 
@@ -797,6 +806,16 @@ impl PlannerInput {
     #[must_use]
     pub fn with_working_memory(mut self, working_memory: PlannerWorkingMemory) -> Self {
         self.working_memory = working_memory;
+        self
+    }
+
+    /// Attaches what this conversation was waiting for.
+    #[must_use]
+    pub fn with_expectation_notes(
+        mut self,
+        expectation_notes: Vec<crate::WorkingObservation>,
+    ) -> Self {
+        self.expectation_notes = expectation_notes;
         self
     }
 

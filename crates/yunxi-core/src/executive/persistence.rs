@@ -23,6 +23,49 @@ pub enum ExecutiveScope {
     Goal { goal_id: GoalId },
 }
 
+impl ExecutiveScope {
+    /// The subject an event belongs to.
+    ///
+    /// Conversation scope wins when an event has one: a message in a group is
+    /// about that group even though it also has a sender, and two people's
+    /// expectations must not be satisfied by each other's traffic.
+    #[must_use]
+    pub fn for_event(event: &crate::WorldEvent) -> Self {
+        match event.scope() {
+            crate::EventScope::Conversation { conversation_id } => {
+                Self::Conversation { conversation_id }
+            }
+            crate::EventScope::Person { person_id } => Self::Person { person_id },
+            crate::EventScope::Goal { goal_id } => Self::Goal { goal_id },
+            crate::EventScope::Global => Self::Global,
+        }
+    }
+
+    /// Whether an event in `event_scope` can settle an expectation owned here.
+    ///
+    /// `Global` owns everything, which is what a host that never scopes an
+    /// expectation already gets.
+    #[must_use]
+    pub fn admits(&self, event_scope: &Self) -> bool {
+        match self {
+            Self::Global => true,
+            Self::Conversation { conversation_id } => matches!(
+                event_scope,
+                Self::Conversation {
+                    conversation_id: candidate
+                } if candidate == conversation_id
+            ),
+            Self::Person { person_id } => matches!(
+                event_scope,
+                Self::Person {
+                    person_id: candidate
+                } if candidate == person_id
+            ),
+            Self::Goal { .. } => false,
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum ExecutivePersistenceError {
     #[error("executive persistence is unavailable")]

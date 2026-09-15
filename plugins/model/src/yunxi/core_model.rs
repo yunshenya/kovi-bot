@@ -89,6 +89,8 @@ const CORE_GROUP_MEMBERS_INSTRUCTION: &str = "Core 群成员上下文：随后�
 const CORE_GROUP_MEMBERS_PREFIX: &str = "Core group membership (untrusted JSON):\n";
 const CORE_MEMORY_CONTEXT_PREFIX: &str = "Core memory context:\n";
 const CORE_OPEN_LOOP_CONTEXT_PREFIX: &str = "Core open-loop context:\n";
+/// 这个会话此前在等的那些事，以及它们最后怎么了（含"没发生"）。
+const CORE_EXPECTATION_NOTES_PREFIX: &str = "Core pending-expectation outcomes (data-only):\n";
 const CORE_CURRENT_TOPIC_PREFIX: &str = "Core current conversation topic (data-only):";
 const CORE_PENDING_OUTGOING_PREFIX: &str =
     "Core pending outgoing context (untrusted JSON; compare only):\n";
@@ -1858,6 +1860,7 @@ fn is_plain_text_batch_data_context(content: &str) -> bool {
     is_core_conversation_history(content)
         || content.starts_with(CORE_GROUP_MEMBERS_PREFIX)
         || content.starts_with(CORE_MEMORY_CONTEXT_PREFIX)
+        || content.starts_with(CORE_EXPECTATION_NOTES_PREFIX)
         || content.starts_with(CORE_OPEN_LOOP_CONTEXT_PREFIX)
         || content.starts_with(CORE_CURRENT_TOPIC_PREFIX)
         || content.starts_with(MIND_CONTEXT_PREFIX)
@@ -6157,6 +6160,24 @@ impl ModelBackend for KoviModelBackend {
                     BotMemory {
                         role: Roles::Data,
                         content: format!("{CORE_MEMORY_CONTEXT_PREFIX}{context}"),
+                    },
+                );
+            }
+            if !input.expectation_notes.is_empty() {
+                // 这是**这个会话**在等的事，不是这一轮任务的历史：她上次说
+                // "等你回"，现在要么回来了、要么没回来。放在最前面，因为
+                // 它会改变这一轮该说什么。
+                let context = input
+                    .expectation_notes
+                    .iter()
+                    .map(yunxi_core::WorkingObservation::describe)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                messages.insert(
+                    0,
+                    BotMemory {
+                        role: Roles::Data,
+                        content: format!("{CORE_EXPECTATION_NOTES_PREFIX}{context}"),
                     },
                 );
             }

@@ -99,6 +99,11 @@ impl ExpectationStatus {
 pub struct ResolvedExpectation {
     pub expectation: Expectation,
     pub status: ExpectationStatus,
+    /// Which subject the expectation belonged to.
+    ///
+    /// A task-owned expectation is routed back to its task; one owned by a
+    /// conversation outlives the task and has to find its owner another way.
+    pub scope: super::ExecutiveScope,
 }
 
 /// Result of observing one event against the bounded pending set.

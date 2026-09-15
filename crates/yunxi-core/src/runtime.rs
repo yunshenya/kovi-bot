@@ -52,6 +52,10 @@ const MAX_TOOL_TRACE_BUDGET_ENTRIES: usize = 1_024;
 const MAX_CLOSED_TOOL_TRACE_TOMBSTONES: usize = 4_096;
 /// Cap on the ended-trace record used to refuse late expectation registration.
 const MAX_ENDED_TRACE_TOMBSTONES: usize = 4_096;
+/// How many conversation-owned expectation outcomes one subject keeps.
+const MAX_EXPECTATION_NOTES_PER_SCOPE: usize = 8;
+/// How many subjects may hold waiting expectation outcomes at once.
+const MAX_EXPECTATION_NOTE_SCOPES: usize = 1_024;
 /// How long a derived tool-outcome expectation waits for its result.
 ///
 /// An action port answers in the same turn, so this only has to outlast a slow
@@ -500,6 +504,17 @@ pub struct CognitiveRuntime {
     task_budget: TaskBudget,
     /// Rounds each in-flight task has already run, keyed by trace root.
     rounds_by_trace: HashMap<EventId, u8>,
+    /// Outcomes of conversation-owned expectations, waiting to be read by the
+    /// next turn in that conversation.
+    ///
+    /// Task-owned results go to the task's working memory and die with it. An
+    /// expectation that outlives its task — "I sent it, I am waiting for a
+    /// reply" — has nowhere in that task to land, so its answer waits here
+    /// until the conversation is next active. Bounded per scope and in the
+    /// number of scopes kept.
+    expectation_notes:
+        HashMap<crate::executive::ExecutiveScope, VecDeque<crate::WorkingObservation>>,
+    expectation_note_order: VecDeque<crate::executive::ExecutiveScope>,
     /// Tasks that have taken in a tool result which may contain text written
     /// by someone else, keyed by trace root.
     ///
@@ -694,6 +709,8 @@ impl CognitiveRuntime {
                 task_budget: config.task_budget,
                 rounds_by_trace: HashMap::new(),
                 foreign_text_roots: HashSet::new(),
+                expectation_notes: HashMap::new(),
+                expectation_note_order: VecDeque::new(),
                 working_memory: HashMap::new(),
                 tool_action_budget_by_trace: HashMap::new(),
                 tool_action_budget_order: VecDeque::new(),
@@ -828,22 +845,62 @@ impl CognitiveRuntime {
     /// arrived" — the second is invisible in raw events.
     fn record_expectation_results(&mut self, resolved: Vec<crate::ResolvedExpectation>) {
         for resolved in resolved {
-            let Some(root) = resolved.expectation.trace_root() else {
-                continue;
-            };
             let Some(outcome) = crate::working_memory::observation_outcome(resolved.status) else {
                 continue;
             };
-            self.working_memory
-                .entry(root)
-                .or_default()
-                .record_observation(crate::working_memory::WorkingObservation::new(
-                    crate::working_memory::describe_expectation(
-                        &resolved.expectation.expected_event,
-                    ),
-                    outcome,
-                ));
+            let observation = crate::working_memory::WorkingObservation::new(
+                crate::working_memory::describe_expectation(&resolved.expectation.expected_event),
+                outcome,
+            );
+            match resolved.expectation.trace_root() {
+                // The task that formed it is still around to hear the answer.
+                Some(root) => {
+                    self.working_memory
+                        .entry(root)
+                        .or_default()
+                        .record_observation(observation);
+                }
+                // The task is over; the news waits for whoever speaks next in
+                // this conversation.
+                None => self.push_expectation_note(resolved.scope, observation),
+            }
         }
+    }
+
+    /// Files one conversation-owned outcome, bounded per scope and in scopes.
+    fn push_expectation_note(
+        &mut self,
+        scope: crate::executive::ExecutiveScope,
+        observation: crate::WorkingObservation,
+    ) {
+        let notes = self.expectation_notes.entry(scope.clone()).or_default();
+        if notes.len() >= MAX_EXPECTATION_NOTES_PER_SCOPE {
+            notes.pop_front();
+        }
+        notes.push_back(observation);
+        if self
+            .expectation_note_order
+            .iter()
+            .any(|known| known == &scope)
+        {
+            return;
+        }
+        self.expectation_note_order.push_back(scope);
+        while self.expectation_note_order.len() > MAX_EXPECTATION_NOTE_SCOPES {
+            let Some(expired) = self.expectation_note_order.pop_front() else {
+                break;
+            };
+            self.expectation_notes.remove(&expired);
+        }
+    }
+
+    /// The conversation-owned outcomes waiting for this event's subject.
+    fn expectation_notes_for(&self, event: &WorldEvent) -> Vec<crate::WorkingObservation> {
+        let scope = crate::executive::ExecutiveScope::for_event(event);
+        self.expectation_notes
+            .get(&scope)
+            .map(|notes| notes.iter().cloned().collect())
+            .unwrap_or_default()
     }
 
     /// Registers what the current turn expects to happen next.
@@ -874,6 +931,32 @@ impl CognitiveRuntime {
         }
         self.executive
             .register_expectation(expectation.for_trace(root))
+    }
+
+    /// Registers what a turn expects to happen *after it is over*.
+    ///
+    /// Owned by the conversation rather than by the task: the task ends when the
+    /// turn does, but the thing being waited for — a reply, a reaction — has not
+    /// happened yet. Binding it to the task would expire it the moment the task
+    /// finished, which is precisely when it starts to matter.
+    ///
+    /// An equivalent pending expectation is not registered twice, so a
+    /// conversation that keeps restating one wish cannot spend the tracker's
+    /// bounded quota on it.
+    pub fn register_conversation_expectation(
+        &mut self,
+        event: &WorldEvent,
+        expectation: crate::Expectation,
+    ) -> Result<bool, &'static str> {
+        if self
+            .executive
+            .has_pending_expectation(expectation.source_action_id, &expectation.expected_event)
+        {
+            return Ok(false);
+        }
+        let scope = crate::executive::ExecutiveScope::for_event(event);
+        self.executive
+            .register_expectation_for_scope(scope, expectation)
     }
 
     /// Notes whether an observed event puts untrusted text into its task.
@@ -965,17 +1048,19 @@ impl CognitiveRuntime {
                 .set_goal_once(goal.summary());
         }
         for declared in &plan.expectations {
-            let pattern = declared.pattern();
-            if self
-                .executive
-                .has_pending_expectation(source_action_id, &pattern)
-            {
-                continue;
-            }
+            // Declared expectations are what should happen *after this turn* —
+            // a reply, a reaction — so they are owned by the conversation and
+            // outlive the task. Binding them to the task would expire them the
+            // moment it finished, which is exactly when they start to matter.
             let window = chrono::Duration::seconds(i64::from(declared.window_secs()));
-            let _ = self.executive.register_expectation(
-                crate::Expectation::new(source_action_id, pattern, 1.0, Some(Utc::now() + window))
-                    .for_trace(root),
+            let _ = self.register_conversation_expectation(
+                event,
+                crate::Expectation::new(
+                    source_action_id,
+                    declared.pattern(),
+                    1.0,
+                    Some(Utc::now() + window),
+                ),
             );
         }
     }
@@ -1935,12 +2020,15 @@ impl CognitiveRuntime {
             .get(&event.trace().root_event_id())
             .cloned()
             .unwrap_or_default();
+        // Read before `event` is moved into the input below.
+        let event_for_notes = event.clone();
         PlannerInput::new(
             event,
             PlannerStateSnapshot::new(self.state.global_version(), conversation),
         )
         .with_executive(self.executive.snapshot_for_scope(&executive_scope))
         .with_working_memory(working_memory)
+        .with_expectation_notes(self.expectation_notes_for(&event_for_notes))
     }
 
     /// Builds a planner input and opportunistically hydrates bounded durable
@@ -3896,6 +3984,189 @@ mod tests {
             !runtime.has_pending_event(),
             "bookkeeping alone must not be reported as work"
         );
+    }
+
+    /// An expectation owned by a conversation outlives the task that formed it,
+    /// and its answer waits for the next turn in that conversation.
+    ///
+    /// This is the case the task-owned design could not express: "I sent it and
+    /// I am waiting for a reply" starts mattering exactly when the task ends.
+    #[tokio::test]
+    async fn a_conversation_owned_expectation_survives_its_task_and_reports_back() {
+        let conversation_id = ConversationId::new();
+        let other_conversation = ConversationId::new();
+        let (_handle, mut runtime) = CognitiveRuntime::new_with_services(
+            RuntimeConfig::default(),
+            CoreServices::with_model(PlainReporterModel {
+                conversation_id,
+                declared: std::sync::atomic::AtomicBool::new(false),
+            }),
+        )
+        .expect("valid runtime");
+        let arbiter = ActionArbiter::new(ActionArbiterConfig::default());
+
+        // The turn declares that it will wait for a reply, and then ends. The
+        // declaration is registered after this turn's own event was observed,
+        // so it cannot be satisfied by the message that formed it.
+        let event = direct_message(conversation_id, PersonId::new());
+        let outcome = runtime
+            .process_event_with_planner_and_actions(event.clone(), &arbiter, &QuietPort)
+            .await
+            .expect("the turn runs");
+        assert!(matches!(outcome, PlannedProcessingOutcome::Planned { .. }));
+
+        // The task is over, and the expectation is still waiting — the whole
+        // point of owning it by conversation.
+        assert_eq!(
+            runtime.executive().snapshot().pending_expectations.len(),
+            1,
+            "a conversation-owned expectation must not die with its task"
+        );
+
+        // An event in another conversation is not what it is waiting for.
+        let other = direct_message(other_conversation, PersonId::new());
+        runtime
+            .process_event_with_planner_and_actions(other, &arbiter, &QuietPort)
+            .await
+            .expect("the other turn runs");
+        assert_eq!(
+            runtime.executive().snapshot().pending_expectations.len(),
+            1,
+            "another conversation's event must not settle it"
+        );
+
+        // The event it was actually waiting for does settle it, and the outcome
+        // waits for the next turn in that conversation.
+        let arrived = direct_message(conversation_id, PersonId::new());
+        runtime
+            .process_event_with_planner_and_actions(arrived.clone(), &arbiter, &QuietPort)
+            .await
+            .expect("the awaited turn runs");
+        assert!(
+            runtime
+                .executive()
+                .snapshot()
+                .pending_expectations
+                .is_empty(),
+            "the awaited event settles it"
+        );
+        let notes = runtime.expectation_notes_for(&arrived);
+        assert_eq!(notes.len(), 1, "the outcome must be waiting: {notes:?}");
+        assert!(
+            notes[0].describe().contains("如期发生"),
+            "and it says what happened: {}",
+            notes[0].describe()
+        );
+
+        // The next turn in this conversation can see it.
+        let next = direct_message(conversation_id, PersonId::new());
+        let input = runtime.planner_input(next);
+        assert_eq!(input.expectation_notes.len(), 1);
+    }
+
+    /// A conversation-owned expectation that is never answered expires on the
+    /// clock, and that outcome is reported too.
+    #[tokio::test]
+    async fn an_unanswered_conversation_expectation_is_reported_as_missing() {
+        let conversation_id = ConversationId::new();
+        let (_handle, mut runtime) = CognitiveRuntime::new_with_services(
+            RuntimeConfig::default(),
+            CoreServices::with_model(PlainReporterModel {
+                conversation_id,
+                declared: std::sync::atomic::AtomicBool::new(false),
+            }),
+        )
+        .expect("valid runtime");
+        let event = direct_message(conversation_id, PersonId::new());
+        assert_eq!(
+            runtime.register_conversation_expectation(
+                &event,
+                crate::executive::Expectation::new(
+                    crate::ActionId::new(),
+                    crate::executive::ExpectedEventPattern::EventType(
+                        crate::EventType::MessageReceived
+                    ),
+                    0.9,
+                    // Already due: nothing will ever arrive in time.
+                    Some(Utc::now() - chrono::Duration::seconds(1)),
+                ),
+            ),
+            Ok(true)
+        );
+        // Any event passing through notices the deadline — including one from
+        // an unrelated subject, because a deadline is about time, not about who
+        // the event is about.
+        let unrelated = WorldEvent::new(
+            Utc::now(),
+            EventScope::Global,
+            EventPriority::Normal,
+            crate::WorldEventKind::IdleTick,
+        );
+        runtime.process_event(unrelated);
+        let notes = runtime.expectation_notes_for(&event);
+        assert_eq!(
+            notes.len(),
+            1,
+            "the missed expectation must be filed: {notes:?}"
+        );
+        assert!(
+            notes[0].describe().contains("没有发生"),
+            "and it must say it did not happen: {}",
+            notes[0].describe()
+        );
+    }
+
+    /// Answers whichever conversation it was addressed in, and declares that it
+    /// will wait for a reply.
+    struct PlainReporterModel {
+        conversation_id: ConversationId,
+        /// Declares once, the way a task states its purpose once.
+        declared: std::sync::atomic::AtomicBool,
+    }
+
+    impl ModelBackend for PlainReporterModel {
+        fn plan<'a>(&'a self, input: &'a PlannerInput) -> ModelBackendFuture<'a> {
+            Box::pin(async move {
+                let conversation_id = input
+                    .event
+                    .scope()
+                    .conversation_id()
+                    .ok_or(crate::ModelBackendError::Unavailable)?;
+                Ok(DecisionPlan {
+                    disposition: DecisionDisposition::Reply,
+                    intents: vec![crate::CognitiveIntent::send_message(
+                        conversation_id,
+                        MessageContent::text("好"),
+                    )],
+                    state_updates: Vec::new(),
+                    // Declares once, in the conversation under test, so the
+                    // test can count what is pending.
+                    expectations: if conversation_id == self.conversation_id
+                        && !self
+                            .declared
+                            .swap(true, std::sync::atomic::Ordering::SeqCst)
+                    {
+                        vec![crate::PlanExpectation::ExpectEvent {
+                            event_type: crate::EventType::MessageReceived,
+                            within_secs: 3_600,
+                        }]
+                    } else {
+                        Vec::new()
+                    },
+                    goal: None,
+                })
+            })
+        }
+    }
+
+    /// Refuses every action; the tests above only care about expectations.
+    struct QuietPort;
+
+    impl ActionPort for QuietPort {
+        fn execute<'a>(&'a self, action: &'a crate::ProposedAction) -> crate::ActionPortFuture<'a> {
+            let _ = action;
+            Box::pin(async { Err(crate::ActionPortError::new("unsupported", false)) })
+        }
     }
 
     /// The goal a task states reaches every later round, and a call that keeps

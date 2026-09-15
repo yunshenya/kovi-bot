@@ -538,13 +538,30 @@ impl ExecutiveController {
     ) -> Vec<ResolvedExpectation> {
         let mut state = self.state.lock().unwrap_or_else(|lock| lock.into_inner());
         let now = Utc::now();
+        let event_scope = crate::executive::ExecutiveScope::for_event(event);
+        let scopes = state.expectation_scopes.clone();
         let mut resolved = Vec::new();
         for expectation in &mut state.expectations {
-            let status = expectation.observe(event, now);
+            let scope = scopes
+                .get(&expectation.id)
+                .cloned()
+                .unwrap_or(crate::executive::ExecutiveScope::Global);
+            // A deadline is about time, not about subject matter: anything that
+            // passes through the runtime may notice one has passed. A *match* is
+            // about subject matter, so an expectation owned by one conversation
+            // must never be satisfied by another conversation's event.
+            let status = if scope.admits(&event_scope) {
+                expectation.observe(event, now)
+            } else if expectation.expire_if_due(now) {
+                ExpectationStatus::Expired
+            } else {
+                expectation.status
+            };
             if status.is_terminal() {
                 resolved.push(ResolvedExpectation {
                     expectation: expectation.clone(),
                     status,
+                    scope,
                 });
             }
         }
@@ -570,15 +587,21 @@ impl ExecutiveController {
         trace_root: crate::EventId,
     ) -> Vec<ResolvedExpectation> {
         let mut state = self.state.lock().unwrap_or_else(|lock| lock.into_inner());
+        let scopes = state.expectation_scopes.clone();
         let mut resolved = Vec::new();
         for expectation in &mut state.expectations {
             if expectation.trace_root() != Some(trace_root) {
                 continue;
             }
             if expectation.expire_if_due(Utc::now()) || expectation.violate() {
+                let scope = scopes
+                    .get(&expectation.id)
+                    .cloned()
+                    .unwrap_or(crate::executive::ExecutiveScope::Global);
                 resolved.push(ResolvedExpectation {
                     expectation: expectation.clone(),
                     status: expectation.status,
+                    scope,
                 });
             }
         }
@@ -1276,16 +1299,43 @@ mod tests {
                 .expect("expectation is valid")
         );
 
-        let event = WorldEvent::new(
+        // A global event is not about either conversation, so it must not
+        // settle what they are waiting for. Before scope-aware matching this
+        // satisfied all four, which meant one conversation's event could answer
+        // another's expectation.
+        let global = WorldEvent::new(
             Utc::now(),
             EventScope::Global,
             EventPriority::Normal,
             WorldEventKind::IdleTick,
         );
-        let observed = controller.observe_expectations(&event);
-        assert_eq!(observed.satisfied.len(), 4);
+        assert!(
+            controller.observe_expectations(&global).is_empty(),
+            "全局事件不该结算任何一个会话的预期"
+        );
+
+        let in_scope = |scope: &ExecutiveScope| {
+            let ExecutiveScope::Conversation { conversation_id } = scope else {
+                unreachable!("this test only scopes to conversations")
+            };
+            WorldEvent::new(
+                Utc::now(),
+                EventScope::Conversation {
+                    conversation_id: *conversation_id,
+                },
+                EventPriority::Normal,
+                WorldEventKind::IdleTick,
+            )
+        };
+
+        // Each conversation's own event settles its own expectations, and the
+        // terminal statuses release that scope's quota.
+        let observed = controller.observe_expectations(&in_scope(&scope_a));
+        assert_eq!(observed.satisfied.len(), 2);
         assert!(observed.expired.is_empty());
         assert!(!observed.is_empty(), "有终态时就不该算空观察");
+        let observed = controller.observe_expectations(&in_scope(&scope_b));
+        assert_eq!(observed.satisfied.len(), 2);
         assert!(controller.snapshot().pending_expectations.is_empty());
         assert!(
             controller
