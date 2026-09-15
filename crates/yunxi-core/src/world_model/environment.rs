@@ -512,6 +512,18 @@ impl EnvironmentState {
             {
                 *existing = host.clone();
             } else {
+                // 到顶时淘汰**最久没观测到**的那一个，而不是让这次更新整体失败。
+                // `validate()` 在超限时拒绝的是整份更新——连同时刷新已有宿主的
+                // 那部分也一起丢掉；而拒绝新宿主意味着第 33 个宿主永远进不来。
+                if environment.hosts.len() >= MAX_ENVIRONMENT_HOSTS
+                    && let Some((oldest, _)) = environment
+                        .hosts
+                        .iter()
+                        .enumerate()
+                        .min_by_key(|(_, existing)| existing.observed_at())
+                {
+                    environment.hosts.remove(oldest);
+                }
                 environment.hosts.push(host.clone());
             }
         }
@@ -523,6 +535,16 @@ impl EnvironmentState {
             {
                 *existing = tool.clone();
             } else {
+                // 同上：淘汰最久没观测到的工具。
+                if environment.tools.len() >= MAX_ENVIRONMENT_TOOLS
+                    && let Some((oldest, _)) = environment
+                        .tools
+                        .iter()
+                        .enumerate()
+                        .min_by_key(|(_, existing)| existing.observed_at())
+                {
+                    environment.tools.remove(oldest);
+                }
                 environment.tools.push(tool.clone());
             }
         }
@@ -562,6 +584,65 @@ mod tests {
             state.effective_health_at(now + Duration::minutes(11)),
             ServiceHealth::Unknown
         );
+    }
+
+    #[test]
+    fn a_new_host_or_tool_evicts_the_stalest_one_instead_of_failing() {
+        // 上限此前是"到顶就拒"：第 33 个宿主永远进不来，而且 `validate()` 拒绝的是
+        // **整份更新**——连同时刷新已有宿主的那部分也一起丢。现在淘汰最久没观测到的
+        // 那一个，让新的进得来。
+        let now = Utc::now();
+        let mut environment = EnvironmentState::default();
+        let hosts: Vec<_> = (0..MAX_ENVIRONMENT_HOSTS)
+            .map(|index| {
+                host(
+                    &format!("host-{index}"),
+                    ServiceHealth::Healthy,
+                    now - Duration::minutes(index as i64 + 1),
+                )
+            })
+            .collect();
+        environment = environment
+            .apply(
+                EnvironmentUpdate::new(
+                    hosts,
+                    Vec::new(),
+                    ServiceHealth::Healthy,
+                    RuntimeLoad::new(0, None, 0, 0, now).expect("load"),
+                )
+                .expect("update"),
+            )
+            .expect("fill to cap");
+        assert_eq!(environment.hosts().len(), MAX_ENVIRONMENT_HOSTS);
+
+        // 最久没观测到的是 host-31（now - 32 分钟）。
+        environment = environment
+            .apply(
+                EnvironmentUpdate::new(
+                    vec![host("host-new", ServiceHealth::Healthy, now)],
+                    Vec::new(),
+                    ServiceHealth::Healthy,
+                    RuntimeLoad::new(0, None, 0, 0, now).expect("load"),
+                )
+                .expect("update"),
+            )
+            .expect("新宿主应当能挤掉最旧的那个，而不是让整份更新失败");
+        assert_eq!(environment.hosts().len(), MAX_ENVIRONMENT_HOSTS);
+        assert!(
+            environment
+                .hosts()
+                .iter()
+                .any(|h| h.host().as_str() == "host-new"),
+            "新宿主必须记进来"
+        );
+        assert!(
+            !environment
+                .hosts()
+                .iter()
+                .any(|h| h.host().as_str() == "host-31"),
+            "最久没观测到的那个应当被淘汰"
+        );
+        environment.validate().expect("valid");
     }
 
     #[test]

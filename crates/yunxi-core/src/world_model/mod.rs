@@ -713,12 +713,18 @@ impl WorldModel {
         {
             scene.apply(update)?;
         } else {
-            if self.social_scene.len() >= social_scene::MAX_SCENES_PER_WORLD {
-                return Err(WorldValidationError::TooManyItems {
-                    field: "social scenes",
-                    length: self.social_scene.len(),
-                    maximum: social_scene::MAX_SCENES_PER_WORLD,
-                });
+            // 到顶时淘汰**最久没更新**的那个会话，而不是拒绝新会话：拒绝会让
+            // 第 257 个群永远进不了世界模型（而且失败是静默的，只有一行日志），
+            // 淘汰最旧的只是让最冷清的那个会话重新开始积累——它有 256 个会话在
+            // 前面，本来也已经不是"当前正在发生的事"了。
+            if self.social_scene.len() >= social_scene::MAX_SCENES_PER_WORLD
+                && let Some((oldest, _)) = self
+                    .social_scene
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, scene)| scene.updated_at())
+            {
+                self.social_scene.remove(oldest);
             }
             let mut scene = SocialSceneState::new(update.conversation_id(), update.now())?;
             scene.apply(update)?;
@@ -1447,6 +1453,20 @@ mod tests {
         );
     }
 
+    fn scene_update(conversation_id: ConversationId, at: DateTime<Utc>) -> SocialSceneUpdate {
+        SocialSceneUpdate::new(
+            conversation_id,
+            at,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            false,
+            0.2,
+            SocialSceneKind::GroupDiscussion,
+        )
+        .expect("scene update")
+    }
+
     fn situation_for(conversation_id: ConversationId, at: DateTime<Utc>) -> Situation {
         Situation::new(
             super::SituationId::new(),
@@ -1462,6 +1482,54 @@ mod tests {
             at,
         )
         .expect("situation")
+    }
+
+    #[test]
+    fn a_new_conversation_scene_evicts_the_stalest_one_instead_of_failing() {
+        // 场景上限此前是"到顶就拒"：第 257 个会话永远进不了世界模型，失败还很安静。
+        let now = Utc::now();
+        let mut world = WorldModel::new();
+        let mut oldest = None;
+        for index in 0..social_scene::MAX_SCENES_PER_WORLD {
+            let conversation_id = ConversationId::new();
+            if index == 0 {
+                oldest = Some(conversation_id);
+            }
+            world
+                .update_social_scene(scene_update(
+                    conversation_id,
+                    // index 0 最旧（最久没更新），index 越大越新。
+                    now - Duration::minutes((social_scene::MAX_SCENES_PER_WORLD - index) as i64),
+                ))
+                .expect("fill to cap");
+        }
+        assert_eq!(
+            world.social_scenes().len(),
+            social_scene::MAX_SCENES_PER_WORLD
+        );
+        let fresh = ConversationId::new();
+        world
+            .update_social_scene(scene_update(fresh, now))
+            .expect("新会话应当能挤掉最久没更新的那个，而不是被拒绝");
+        assert_eq!(
+            world.social_scenes().len(),
+            social_scene::MAX_SCENES_PER_WORLD
+        );
+        assert!(
+            world
+                .social_scenes()
+                .iter()
+                .any(|scene| scene.conversation_id() == fresh),
+            "新会话必须记进来"
+        );
+        assert!(
+            !world
+                .social_scenes()
+                .iter()
+                .any(|scene| Some(scene.conversation_id()) == oldest),
+            "最久没更新的那个应当被淘汰"
+        );
+        world.validate().expect("valid");
     }
 
     #[test]
