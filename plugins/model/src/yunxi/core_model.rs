@@ -6172,6 +6172,22 @@ impl ModelBackend for KoviModelBackend {
                 );
             }
 
+            // 人格放在所有上下文之前：Core 这条链路此前**没有**任何一份人格提示词，
+            // 它的"我是谁"只有 Mind 自我认知里那句技术身份，于是线上 2026-09-15 13:20
+            // 她答"我哪有什么照片呀，就是个只会打字陪你聊天的人"，连相册里那张自己的
+            // 照片都不肯认。人格只此一份（配置的 `prompt.persona`），宿主链路与 Core
+            // 共用，改一处两条链路一起变。
+            let persona = crate::config::get().prompt().persona().trim().to_owned();
+            if !persona.is_empty() {
+                messages.insert(
+                    0,
+                    BotMemory {
+                        role: Roles::System,
+                        content: persona,
+                    },
+                );
+            }
+
             let mut ticket = if let Some(admission) = incoming_admission {
                 if admission.ticket.scope() != conversation.scope() {
                     return Ok(silent_with_interaction_state(input));

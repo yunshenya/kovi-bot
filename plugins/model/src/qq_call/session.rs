@@ -2130,7 +2130,7 @@ fn commitment_nudge(claimed: &str) -> String {
 
 /// 私聊人设 + 电话模式约束。电话约束放在后面，明确覆盖打字的格式要求。
 fn phone_system_prompt(config: &QqCallConfig, tools_enabled: bool, peer: &str) -> String {
-    let persona = crate::config::get().prompt().private_prompt().to_owned();
+    let persona = crate::config::get().prompt().direct_prompt();
     let capability = if tools_enabled {
         PHONE_TOOLS_PROMPT
     } else {
