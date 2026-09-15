@@ -28,6 +28,7 @@ use std::time::Duration;
 use yunxi_core::{
     ActionPortOutcome, ActionResult, ConversationId, ConversationKind, ConversationTurnDirective,
     MessageContent, ProactiveOpportunity, ProposedAction, ReachOutAction, ReachOutIntent,
+    ReachOutMedium,
 };
 
 /// 解析群会话对应的 QQ 群号；身份映射缺失/数据库失败时返回 None（调用方
@@ -420,6 +421,41 @@ impl ProactiveChatManager {
         .map_err(Into::into)
     }
 
+    /// 这次主动接触用消息还是电话。
+    ///
+    /// 两道判据都必须过，缺一不可：
+    /// 1. **该不该**——配置里的 `call_motives` 白名单（默认只有 `check_in`）；
+    /// 2. **行不行**——通话通道开着、外呼没关、对方在通话名单里、当前没有正在进行的通话。
+    ///
+    /// 第二道在这里再判一次是有意的：`ReachOutIntent` 一旦带着 `Call` 走到投递，
+    /// 宿主就只有拨号一条路；等拨号失败再退化成发消息，等于把一句"喂，是我"当正文
+    /// 发出去，读起来很怪。所以不满足条件时**在这里**就退回消息，而不是让它在下面失败。
+    async fn reach_out_medium(
+        &self,
+        user_id: i64,
+        motive: yunxi_core::ProactiveMotive,
+    ) -> ReachOutMedium {
+        let config_handle = crate::config::get();
+        if !config_handle.proactive().may_call_for(motive) {
+            return ReachOutMedium::Message;
+        }
+        if !crate::qq_call::outgoing_available() {
+            return ReachOutMedium::Message;
+        }
+        let config = config_handle.qq_call().clone();
+        let main_admin = self.bot.get_main_admin().ok();
+        if !crate::qq_call::can_dial(&config, main_admin, user_id).await {
+            // 名单外或正通话中：如实记一条，然后退回消息。静默退回会让"为什么她从不
+            // 打电话"变成不可排查的问题。
+            kovi::log::info!(
+                "Yunxi proactive call not available, falling back to a message: user={user_id} \
+                 motive={motive}"
+            );
+            return ReachOutMedium::Message;
+        }
+        ReachOutMedium::Call
+    }
+
     async fn generate_private_reach_out(
         &self,
         user_id: i64,
@@ -443,14 +479,19 @@ impl ProactiveChatManager {
         if topic.proactive_motive != Some(motive) {
             return Ok(None);
         }
-        ReachOutIntent::from_opportunity(opportunity, MessageContent::text(topic.content))
-            .map(|intent| {
-                Some(PlannedPrivateReachOut {
-                    intent,
-                    mind_reference: mind_signals.reference,
-                })
+        let medium = self.reach_out_medium(user_id, motive).await;
+        ReachOutIntent::from_opportunity_with_medium(
+            opportunity,
+            MessageContent::text(topic.content),
+            medium,
+        )
+        .map(|intent| {
+            Some(PlannedPrivateReachOut {
+                intent,
+                mind_reference: mind_signals.reference,
             })
-            .map_err(Into::into)
+        })
+        .map_err(Into::into)
     }
 
     async fn deliver_private_reach_out(

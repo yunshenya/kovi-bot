@@ -13,6 +13,17 @@ pub struct ProactiveConfig {
     inactivity_threshold_secs: u64,
     /// 两次主动消息之间的最短间隔（秒）。
     cooldown_secs: u64,
+    /// 哪些主动理由可以用**电话**打出去（取值见 `ProactiveMotive`：`check_in`、
+    /// `follow_up`、`share`、`react`、`curiosity`）。留空 = 从不主动打电话。
+    ///
+    /// 默认只放 `check_in`：那个动机是"担心他最近怎么样"，打电话是贴切的；其余
+    /// （分享、好奇、回应、跟进）一条消息就够。
+    ///
+    /// 为什么按动机白名单、而不是让模型在生成话题时自己挑媒介：这条路是**定时器**
+    /// 触发的，而人已经不在对话里了。让一个纯文本生成步决定"要不要响他手机"，判错
+    /// 收不回来；动机则是 Core 已经算好、可审计的结构化输入。真要放开/收紧，改配置
+    /// 即可，不必碰提示词。
+    call_motives: Vec<String>,
     /// 每次满足条件后实际发送的概率（0-100）。
     push_probability_percent: u8,
     /// 旧版最信任用户 QQ 号。配置 canonical `identity.owner_person_id`
@@ -92,6 +103,21 @@ impl ProactiveConfig {
 
     pub fn main_admin_cooldown_secs(&self) -> u64 {
         self.main_admin_cooldown_secs
+    }
+
+    /// 这个主动理由是否允许用电话接触。
+    ///
+    /// 判据只读配置：能不能拨出去（通道开没开、对方在不在通话名单）由
+    /// `qq_call` 那边在执行前再判一次——这里管"该不该"，那里管"行不行"。
+    pub fn may_call_for(&self, motive: yunxi_core::ProactiveMotive) -> bool {
+        let name = motive.to_string();
+        self.call_motives
+            .iter()
+            .any(|configured| configured == &name)
+    }
+
+    pub fn call_motives(&self) -> &[String] {
+        &self.call_motives
     }
 
     pub fn daily_limit(&self) -> u8 {
@@ -175,6 +201,16 @@ impl ProactiveConfig {
         if self.push_probability_percent > 100 {
             return Err(anyhow::anyhow!("主动消息发送概率必须在0到100之间"));
         }
+        // 动机名拼错就当场报错：静默忽略会让"我明明配了打电话"变成一个不生效的开关，
+        // 而这类问题在运行时看不出来（只会表现为"她从来不打电话"）。
+        for motive in &self.call_motives {
+            motive.parse::<yunxi_core::ProactiveMotive>().map_err(|_| {
+                anyhow::anyhow!(
+                    "proactive.call_motives 里有未知的主动理由：{motive}\
+                         （可用：follow_up、check_in、share、react、curiosity）"
+                )
+            })?;
+        }
         if self.main_admin_decision_interval_secs == 0 {
             return Err(anyhow::anyhow!("主人主动私聊决策间隔必须大于0秒"));
         }
@@ -233,6 +269,7 @@ impl Default for ProactiveConfig {
             check_interval_secs: 300,
             inactivity_threshold_secs: 7200,
             cooldown_secs: 7200,
+            call_motives: vec!["check_in".to_string()],
             push_probability_percent: 35,
             main_admin: None,
             main_admin_decision_interval_secs: 10_800,
@@ -263,6 +300,50 @@ mod tests {
     #[test]
     fn defaults_are_valid() {
         assert!(ProactiveConfig::default().validate().is_ok());
+    }
+
+    /// 默认只让「担心他最近怎么样」用电话打出去。
+    ///
+    /// 这条是产品判断，不是技术细节：主动接触是**定时器**触发的，人已经不在对话里，
+    /// 所以默认只放动机最贴切的那一种，其余一条消息就够。
+    #[test]
+    fn only_check_in_may_call_by_default() {
+        use yunxi_core::ProactiveMotive;
+        let config = ProactiveConfig::default();
+        assert!(config.may_call_for(ProactiveMotive::CheckIn));
+        for motive in [
+            ProactiveMotive::FollowUp,
+            ProactiveMotive::Share,
+            ProactiveMotive::React,
+            ProactiveMotive::Curiosity,
+        ] {
+            assert!(!config.may_call_for(motive), "{motive:?} 默认不该打电话");
+        }
+
+        // 留空 = 从不主动打电话。
+        let never = ProactiveConfig {
+            call_motives: Vec::new(),
+            ..ProactiveConfig::default()
+        };
+        assert!(never.validate().is_ok());
+        assert!(!never.may_call_for(ProactiveMotive::CheckIn));
+    }
+
+    /// 动机名拼错要当场报错。
+    ///
+    /// 静默忽略的话，"我明明配了打电话"会表现为"她从来不打电话"，而运行时不报任何东西。
+    #[test]
+    fn an_unknown_call_motive_is_rejected_at_load() {
+        let config = ProactiveConfig {
+            call_motives: vec!["checkin".to_string()],
+            ..ProactiveConfig::default()
+        };
+        let error = config.validate().expect_err("拼错的动机名必须报错");
+        assert!(error.to_string().contains("checkin"), "{error}");
+        assert!(
+            error.to_string().contains("check_in"),
+            "错误里该给可用取值: {error}"
+        );
     }
 
     #[test]

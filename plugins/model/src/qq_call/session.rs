@@ -263,6 +263,8 @@ pub(super) async fn run(
     config: &QqCallConfig,
     client: &BridgeClient,
     state: &CallState,
+    // 主动外呼时准备好的开场白；来电为 `None`，那就用配置里的问候语。
+    opening: Option<String>,
 ) -> anyhow::Result<()> {
     let caller = state.caller();
     let caller_name = state
@@ -328,7 +330,12 @@ pub(super) async fn run(
     ));
 
     let opening = if allowed {
-        config.greeting().trim().to_owned()
+        // 主动外呼带着"她为什么打这通"来：那才是这通电话该说的第一句。
+        // 没有就退回配置里的通用问候语（来电一直是这条路）。
+        opening
+            .map(|opening| opening.trim().to_owned())
+            .filter(|opening| !opening.is_empty())
+            .unwrap_or_else(|| config.greeting().trim().to_owned())
     } else {
         config.refuse_message().trim().to_owned()
     };

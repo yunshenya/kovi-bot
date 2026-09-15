@@ -327,6 +327,73 @@ impl QqActionAdapter {
             .ok_or_else(|| ActionPortError::new("tool_actor_route_unavailable", false))
     }
 
+    /// 一次"用电话主动接触"的投递。
+    ///
+    /// 映射到 `ActionPortOutcome` 的划分是刻意的：
+    /// - 拿到 AVSDK 回执 = 邀请真的发出去了 → `Delivered`（"她联系上了他"这件事成立）；
+    /// - 桥受理了却没回执 → `DeliveryIndeterminate`（跨过了不可逆边界，但无法证明平台收了）；
+    /// - 正在通话中 → `Deferred`（等这通结束还能再来，不是失败）；
+    /// - 名单外 / 通道关掉 → 非重试错误：这是策略拒绝，重试一万次也一样；
+    /// - 桥不可用 → 可重试错误。
+    ///
+    /// 把"名单外"错报成 `Deferred` 会让主动接触无限重试；错报成 `Delivered` 会在
+    /// 记录里留下一通根本没拨出去的电话。
+    async fn place_reach_out_call(
+        &self,
+        reach_out: &yunxi_core::ReachOutAction,
+    ) -> Result<ActionPortOutcome, ActionPortError> {
+        let person = reach_out.person_id;
+        let (route, _destination) = self
+            .resolve_person_destination(person)
+            .await
+            .map_err(|error| ActionPortError::new(error.to_string(), true))?;
+        let peer = self
+            .resolve_tool_actor_user_id(person)
+            .await
+            .map_err(|error| ActionPortError::new(format!("call_peer_lookup:{error}"), true))?;
+        let config = crate::config::get().qq_call().clone();
+        let main_admin = self.bot.get_main_admin().ok();
+        kovi::log::info!(
+            "Yunxi proactive reach-out by call: person={person} peer={peer} motive={:?}",
+            reach_out.motive,
+        );
+        match crate::qq_call::dial_peer_with_opening(
+            &config,
+            main_admin,
+            peer,
+            Some(reach_out.message.as_text()),
+        )
+        .await
+        {
+            crate::qq_call::DialOutcome::Dialed => Ok(ActionPortOutcome::Delivered {
+                external_reference: Some("qq_call".to_string()),
+                message_id: None,
+                conversation_id: Some(route.conversation_id),
+            }),
+            crate::qq_call::DialOutcome::NoReceipt => {
+                Ok(ActionPortOutcome::DeliveryIndeterminate {
+                    reason: "call_no_avsdk_receipt".to_string(),
+                    conversation_id: Some(route.conversation_id),
+                })
+            }
+            crate::qq_call::DialOutcome::AlreadyInCall => Ok(ActionPortOutcome::Deferred {
+                reason: "call_already_in_progress".to_string(),
+            }),
+            crate::qq_call::DialOutcome::BridgeUnavailable(error) => {
+                Err(ActionPortError::new(format!("call_bridge:{error}"), true))
+            }
+            crate::qq_call::DialOutcome::Disabled => {
+                Err(ActionPortError::new("call_channel_disabled", false))
+            }
+            crate::qq_call::DialOutcome::OutgoingDisabled => {
+                Err(ActionPortError::new("call_outgoing_disabled", false))
+            }
+            crate::qq_call::DialOutcome::NotAuthorized => {
+                Err(ActionPortError::new("call_peer_not_authorized", false))
+            }
+        }
+    }
+
     async fn revalidate_tool_effect(
         &self,
         binding: &CoreToolEffectRevalidator,
@@ -1431,6 +1498,14 @@ impl ActionPort for QqActionAdapter {
                     .await
                 }
                 ProposedAction::ReachOut(reach_out) => {
+                    // 媒介是电话：走外呼通道，**不**落回消息。
+                    //
+                    // 退化成消息是有意的"不"：这句话是照电话开场写的（"喂，是我"），
+                    // 当正文发出去读起来很怪。所以"能不能打"在决定媒介时就判过了
+                    // （见 `proactive_chat::reach_out_medium`），走到这里只剩真的拨。
+                    if reach_out.medium.rings_peer() {
+                        return self.place_reach_out_call(reach_out).await;
+                    }
                     let (route, destination) =
                         match self.resolve_person_destination(reach_out.person_id).await {
                             Ok(resolved) => resolved,

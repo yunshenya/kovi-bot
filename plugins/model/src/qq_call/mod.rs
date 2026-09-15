@@ -87,6 +87,83 @@ pub(crate) fn outgoing_available() -> bool {
     call.enabled() && call.outgoing_enabled()
 }
 
+/// 现在能不能拨给这个人——**只查，不拨**。
+///
+/// 给"这次主动接触该用哪种媒介"那一步用：先问能不能，再决定用不用电话。反过来的话，
+/// 选了电话才发现拨不出去，就只能要么放弃这次接触、要么把一句"喂，是我"当正文发出去，
+/// 两种都不好。判据与 `dial_peer` 同一套（通道开关、外呼开关、通话名单、是否正通话）。
+pub(crate) async fn can_dial(
+    config: &config::QqCallConfig,
+    main_admin: Option<i64>,
+    peer: i64,
+) -> bool {
+    if !config.enabled() || !config.outgoing_enabled() {
+        return false;
+    }
+    if !caller_is_allowed(config, main_admin, peer).await {
+        return false;
+    }
+    let Ok(client) = BridgeClient::new(config) else {
+        return false;
+    };
+    match client.current_call().await {
+        Ok(state) => !state.phase().is_live(),
+        // 桥读不到时保守判"不能打"：宁可发消息，也不要拨一个状态未知的号。
+        Err(_) => false,
+    }
+}
+
+/// 待用开场白：从"拨出去"到桥报告"接通"之间隔着另一条任务链（调度器在轮询桥状态），
+/// 所以投递这一侧只能把要说的话先存下，等会话真的建立时再取。
+///
+/// 带 TTL 而不是永久保存：一通没接的电话不该把开场白留到几小时后那通**来电**上用。
+/// 键是被叫 QQ 号——与调度器认领外呼通话用的 `dialedUin` 是同一个值。
+static PENDING_OPENINGS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<i64, (String, std::time::Instant)>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// 开场白在待用区最多停留多久。
+const PENDING_OPENING_TTL: Duration = Duration::from_secs(300);
+/// 待用开场白的条数上限：这是宿主自产的短字符串，但也不该无界。
+const MAX_PENDING_OPENINGS: usize = 64;
+
+fn with_pending_openings<T>(
+    action: impl FnOnce(&mut std::collections::HashMap<i64, (String, std::time::Instant)>) -> T,
+) -> T {
+    let mut guard = PENDING_OPENINGS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let now = std::time::Instant::now();
+    guard.retain(|_, (_, stored)| now.duration_since(*stored) < PENDING_OPENING_TTL);
+    action(&mut guard)
+}
+
+/// 取走这个人的待用开场白（取走即删除：一句话只该被一通电话用一次）。
+fn take_opening(peer: i64) -> Option<String> {
+    with_pending_openings(|openings| openings.remove(&peer).map(|(opening, _)| opening))
+}
+
+/// 记住这次拨号要说的第一句话。
+fn remember_opening(peer: i64, opening: &str) {
+    let opening = opening.trim();
+    if opening.is_empty() {
+        return;
+    }
+    with_pending_openings(|openings| {
+        if openings.len() >= MAX_PENDING_OPENINGS {
+            // 先丢最早的那个，保持有界而不是拒绝新的。
+            if let Some(oldest) = openings
+                .iter()
+                .min_by_key(|(_, (_, stored))| *stored)
+                .map(|(peer, _)| *peer)
+            {
+                openings.remove(&oldest);
+            }
+        }
+        openings.insert(peer, (opening.to_owned(), std::time::Instant::now()));
+    });
+}
+
 /// 一次外呼尝试的结局。
 ///
 /// 抽出来是为了让两条触发路径共用**同一份**判定：管理员私聊命令 `#打给我`
@@ -141,7 +218,27 @@ pub(crate) async fn dial_peer(
     main_admin: Option<i64>,
     peer: i64,
 ) -> DialOutcome {
+    dial_peer_with_opening(config, main_admin, peer, None).await
+}
+
+/// 拨给某个人，并指定接通后她开口说的第一句话。
+///
+/// 开场白在**拨号之前**就存下、拨不出去就撤销：接通可能发生在确认回执之后不到一秒，
+/// 存晚了会有"会话已经开始、开场白还没到"的窗口。撤销是因为一通没拨出去的电话不该把
+/// 这句话留到之后那通**来电**上用。
+pub(crate) async fn dial_peer_with_opening(
+    config: &config::QqCallConfig,
+    main_admin: Option<i64>,
+    peer: i64,
+    opening: Option<&str>,
+) -> DialOutcome {
+    if let Some(opening) = opening {
+        remember_opening(peer, opening);
+    }
     let outcome = dial_peer_inner(config, main_admin, peer).await;
+    if !outcome.reached_peer() {
+        with_pending_openings(|openings| openings.remove(&peer));
+    }
     // 每一次外呼尝试都留一条可事后复盘的记录：拨给谁、成没成、为什么。
     // 打电话是不可撤销的动作，事后要能回答"这通是谁让它打的、结果怎样"。
     println!(
@@ -272,8 +369,11 @@ pub(crate) async fn start_scheduler(bot: Arc<kovi::RuntimeBot>) {
                             effective.caller_uin = Some(dialed.to_string());
                             effective.caller_name = None;
                         }
+                        // 外呼时存下的开场白在这里被取走；来电没有存过，取到 None。
+                        let opening = state.dialed_uin.and_then(take_opening);
                         if let Err(error) =
-                            session::run(Arc::clone(&bot), &config, &client, &effective).await
+                            session::run(Arc::clone(&bot), &config, &client, &effective, opening)
+                                .await
                         {
                             eprintln!("[ERROR] QQ 语音通话异常结束: {error}");
                         }
@@ -450,6 +550,92 @@ async fn report_phase_change(
 
 #[cfg(test)]
 mod tests {
+    /// 待用开场白：一句话只给一通电话用一次，而且只给它对应的那个人。
+    #[test]
+    fn a_pending_opening_is_used_once_and_only_for_its_peer() {
+        use super::{remember_opening, take_opening};
+        remember_opening(1001, "喂，是我，刚想起件事");
+        assert_eq!(take_opening(1001).as_deref(), Some("喂，是我，刚想起件事"));
+        assert_eq!(take_opening(1001), None, "取过就该没了");
+        assert_eq!(take_opening(1002), None, "不能串到别人身上");
+    }
+
+    /// 空开场白不占位——否则一通没有话可说的外呼会挤掉真正有开场白的那通。
+    #[test]
+    fn a_blank_opening_is_not_stored() {
+        use super::{remember_opening, take_opening};
+        remember_opening(2001, "   ");
+        assert_eq!(take_opening(2001), None);
+        remember_opening(2001, "");
+        assert_eq!(take_opening(2001), None);
+    }
+
+    /// 过期与超量都由写入路径收口，不会无限攒着。
+    ///
+    /// 过期判据用的是单调时钟，测试直接把它写旧，而不是去 sleep。
+    #[test]
+    fn pending_openings_expire_and_stay_bounded() {
+        use super::{
+            MAX_PENDING_OPENINGS, PENDING_OPENING_TTL, PENDING_OPENINGS, remember_opening,
+            take_opening,
+        };
+        use std::time::Duration;
+
+        // 塞一条"早就过期"的，下一次读写就该把它清掉。
+        {
+            let mut guard = PENDING_OPENINGS
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.insert(
+                3001,
+                (
+                    "过期的开场白".to_string(),
+                    std::time::Instant::now() - PENDING_OPENING_TTL - Duration::from_secs(1),
+                ),
+            );
+        }
+        assert_eq!(take_opening(3001), None, "过期条目不该还能用");
+
+        // 超出上限时丢最早的，长度保持有界。
+        for peer in 0..(MAX_PENDING_OPENINGS as i64 + 10) {
+            remember_opening(4000 + peer, "在吗");
+        }
+        let length = PENDING_OPENINGS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len();
+        assert!(
+            length <= MAX_PENDING_OPENINGS,
+            "待用开场白必须有界，实际 {length}"
+        );
+        // 最早的已经被挤掉，最后写进去的还在。
+        assert_eq!(take_opening(4000), None, "最早的应该被挤掉");
+        assert!(
+            take_opening(4000 + MAX_PENDING_OPENINGS as i64 + 9).is_some(),
+            "最后写入的应该还在"
+        );
+    }
+
+    /// `reached_peer` 只对"真的拨出去了"为真——拨号失败时靠它撤销开场白。
+    #[test]
+    fn only_a_dialed_outcome_counts_as_reaching_the_peer() {
+        use super::DialOutcome;
+        assert!(DialOutcome::Dialed.reached_peer());
+        for outcome in [
+            DialOutcome::NoReceipt,
+            DialOutcome::Disabled,
+            DialOutcome::OutgoingDisabled,
+            DialOutcome::NotAuthorized,
+            DialOutcome::AlreadyInCall,
+            DialOutcome::BridgeUnavailable("bridge down".to_string()),
+        ] {
+            assert!(
+                !outcome.reached_peer(),
+                "{outcome:?} 没拨出去，不能被当成联系上了"
+            );
+        }
+    }
+
     #[test]
     fn missed_call_needs_a_live_previous_phase() {
         use super::is_missed_call;
