@@ -574,15 +574,14 @@ async fn begin_notification(
                 Err(_) => "通知在提交前超时".to_string(),
                 Ok(Ok(_)) => unreachable!(),
             };
-            abandon_notification_before_send(
-                run,
-                outcome,
-                completed_action_id,
-                action_completion.as_ref(),
-                &final_result,
-                &error,
-            )
-            .await?;
+            // 闸门没提交 = **确定什么都没发出去**，这只是一次瞬时故障（数据库抖动、
+            // 连接池打满、租约写入失败），不该把这条 Run 判死。以前这里走
+            // `abandon_notification_before_send`：status='failed'、notification_status
+            // ='failed'、next_wake_at=NULL、completed_at=NOW()，而 `recover_stale_claims`
+            // 只看 running/notifying —— 一次抖动就让"盯着接口、满足条件通知我"永久失效，
+            // 用户永远等不到通知，也不会有人重试。改成放回 active 并安排重试；重复发送
+            // 由幂等键 `agent-run:{id}:final-notification` 兜住（何况这次根本没发出去）。
+            reschedule_notification_gate_failure(run, completed_action_id, &error).await?;
         }
     }
     RUN_WAKEUP.notify_one();
@@ -675,48 +674,67 @@ async fn load_notification_action_id(run: &ClaimedRun) -> Result<Option<i64>> {
     .map_err(Into::into)
 }
 
-async fn abandon_notification_before_send(
+/// 通知闸门提交前失败：把 Run 放回 `active` 并安排一次重试。
+///
+/// 状态可能是 `notifying`（闸门的 UPDATE 已经执行、后续步骤失败）或 `running`
+/// （闸门在写入之前就失败），两种都按"自己的租约仍有效"处理。`notification_status`
+/// 回到 `none`——它本来就没发出去，不是 failed。重试走的是完整路径：下一次到期会重新
+/// 判断条件，条件仍成立才再次通知。
+async fn reschedule_notification_gate_failure(
     run: &ClaimedRun,
-    outcome: TerminalOutcome,
     completed_action_id: Option<i64>,
-    action_completion: Option<&ActionCompletion>,
-    final_result: &Value,
     error: &str,
 ) -> Result<()> {
-    let mut transaction = database_pool()?.begin().await?;
+    let pool = database_pool()?;
+    let now = Utc::now();
+    let failures = run.consecutive_failure_count.saturating_add(1);
+    let next_wake_at = std::cmp::min(now + ChronoDuration::seconds(30), run.expires_at);
+    let mut transaction = pool.begin().await?;
     let updated = query_scalar::<Postgres, i64>(
         r#"
         UPDATE kovi_bot_agent_runs
-        SET status = 'failed', notification_status = 'failed', final_outcome = $3,
-            result = $4, last_error = $5, next_wake_at = NULL,
-            lease_token = NULL, lease_until = NULL, completed_at = NOW(), updated_at = NOW()
-        WHERE id = $1 AND status = 'running' AND lease_token = $2
+        SET status = 'active', notification_status = 'none', next_wake_at = $3,
+            consecutive_failure_count = $4, last_error = $5,
+            notification_started_at = NULL,
+            lease_token = NULL, lease_until = NULL, updated_at = NOW()
+        WHERE id = $1 AND status IN ('running', 'notifying') AND lease_token = $2
         RETURNING id
         "#,
     )
     .bind(run.id)
     .bind(&run.lease_token)
-    .bind(outcome.as_str())
-    .bind(final_result)
+    .bind(next_wake_at)
+    .bind(failures)
     .bind(truncate_chars(error, 800))
     .fetch_optional(&mut *transaction)
     .await?;
     if updated.is_none() {
+        // 已经有人接手/结束了这条 Run：什么都不做，别把别人的状态改回去。
         transaction.rollback().await?;
         return Ok(());
     }
-    if let (Some(action_id), Some(completion)) = (completed_action_id, action_completion) {
-        finish_action(&mut transaction, action_id, completion).await?;
+    if let Some(action_id) = completed_action_id {
+        finish_action(
+            &mut transaction,
+            action_id,
+            &ActionCompletion::Failed(truncate_chars(error, 800)),
+        )
+        .await?;
     }
     insert_event(
         &mut transaction,
         run.id,
-        &format!("final:{}:notification_suppressed", outcome.as_str()),
-        "notification_failed",
-        json!({"outcome": outcome.as_str(), "error": error}),
+        "final:notification_gate_retry",
+        "notification_gate_failed",
+        json!({
+            "error": truncate_chars(error, 800),
+            "consecutive_failures": failures,
+            "next_wake_at": next_wake_at,
+        }),
     )
     .await?;
     transaction.commit().await?;
+    RUN_WAKEUP.notify_one();
     Ok(())
 }
 
@@ -2016,6 +2034,117 @@ mod tests {
         assert!(valid_json_pointer("/a~1b/~0value"));
         assert!(!valid_json_pointer("result/state"));
         assert!(!valid_json_pointer("/bad~2escape"));
+    }
+
+    /// 通知闸门在提交前失败 = 确定没发出去，只是瞬时故障：把 Run 放回 active、
+    /// 清掉租约并安排重试，而不是判死。以前它会被写成 status='failed'、
+    /// next_wake_at=NULL，而 `recover_stale_claims` 只看 running/notifying——一次
+    /// 数据库抖动就能让"盯着接口、满足条件通知我"永久失效。
+    #[test]
+    #[ignore = "requires PostgreSQL via DATABASE_URL"]
+    fn postgres_notification_gate_failure_reschedules_instead_of_failing_the_run() {
+        crate::database_test_support::block_on(async {
+            crate::memory::MEMORY_MANAGER
+                .initialize_database()
+                .await
+                .expect("应初始化 PostgreSQL 记忆连接池");
+            super::initialize_database()
+                .await
+                .expect("应初始化 Agent Run 表");
+            let pool = super::database_pool().expect("连接池应存在");
+            let owner = Utc::now().timestamp_micros();
+            let run_id = sqlx_core::query_scalar::query_scalar::<Postgres, i64>(
+                r#"
+                INSERT INTO kovi_bot_agent_runs
+                    (owner_user_id, kind, spec, request_key, source_scope, source_id,
+                     source_message_id, status, notification_status,
+                     execution_count, max_executions, expires_at, next_wake_at,
+                     lease_token, lease_until)
+                VALUES ($1, 'http_watch', '{}'::jsonb, $2, 'private', $1,
+                        0, 'notifying', 'sending',
+                        1, 5, $3, NULL, 'lease-gate-test', $4)
+                RETURNING id
+                "#,
+            )
+            .bind(owner)
+            .bind(format!("gate-test:{owner}"))
+            .bind(Utc::now() + chrono::Duration::hours(1))
+            .bind(Utc::now() + chrono::Duration::seconds(60))
+            .fetch_one(pool)
+            .await
+            .expect("应插入测试 Run");
+
+            let run = super::ClaimedRun {
+                id: run_id,
+                owner_user_id: owner,
+                kind: "http_watch".to_string(),
+                spec: json!({}),
+                expires_at: Utc::now() + chrono::Duration::hours(1),
+                execution_count: 1,
+                max_executions: 5,
+                consecutive_failure_count: 0,
+                lease_token: "lease-gate-test".to_string(),
+                http_action_id: None,
+                reason: super::ClaimReason::Execute,
+            };
+            super::reschedule_notification_gate_failure(&run, None, "闸门写入失败")
+                .await
+                .expect("重排不应失败");
+
+            let row = sqlx_core::query::query(
+                "SELECT status, notification_status, next_wake_at, lease_token, \
+                        consecutive_failure_count, last_error \
+                 FROM kovi_bot_agent_runs WHERE id = $1",
+            )
+            .bind(run_id)
+            .fetch_one(pool)
+            .await
+            .expect("应读回测试 Run");
+            use sqlx_core::row::Row;
+            assert_eq!(
+                row.get::<String, _>("status"),
+                "active",
+                "应当回到可再次领取的状态"
+            );
+            assert_eq!(
+                row.get::<String, _>("notification_status"),
+                "none",
+                "没发出去就不该记成 sending/failed"
+            );
+            assert!(
+                row.get::<Option<chrono::DateTime<Utc>>, _>("next_wake_at")
+                    .is_some(),
+                "必须安排下一次尝试"
+            );
+            assert!(
+                row.get::<Option<String>, _>("lease_token").is_none(),
+                "租约要放掉，否则只能等过期回收"
+            );
+            assert_eq!(row.get::<i32, _>("consecutive_failure_count"), 1);
+            assert!(row.get::<Option<String>, _>("last_error").is_some());
+
+            // 租约已经换人（例如被 recover_stale_claims 回收后又领取）时必须是空操作，
+            // 不能把别人的状态改回去。
+            sqlx_core::query::query(
+                "UPDATE kovi_bot_agent_runs SET status = 'running', lease_token = 'other-lease' \
+                 WHERE id = $1",
+            )
+            .bind(run_id)
+            .execute(pool)
+            .await
+            .expect("应模拟别人接手");
+            super::reschedule_notification_gate_failure(&run, None, "迟到的失败")
+                .await
+                .expect("空操作不应报错");
+            let status = sqlx_core::query_scalar::query_scalar::<Postgres, String>(
+                "SELECT status FROM kovi_bot_agent_runs WHERE id = $1",
+            )
+            .bind(run_id)
+            .fetch_one(pool)
+            .await
+            .expect("应读回状态");
+            assert_eq!(status, "running", "拿着旧租约不该改别人的状态");
+        });
     }
 
     #[test]
