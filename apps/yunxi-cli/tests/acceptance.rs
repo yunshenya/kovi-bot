@@ -553,6 +553,21 @@ impl CoreModelBackend for ToolThenReplyModel {
                     notification_policy: yunxi_core::ToolNotificationPolicy::Final,
                 },
                 WorldEventKind::ToolCompleted(tool) if tool.requires_follow_up => {
+                    // The follow-up round may only answer from the result if
+                    // it also knows what it already tried; Core is the only
+                    // party that can tell it, so its absence is a real defect
+                    // rather than a missing nicety.
+                    let tried: Vec<&str> = input
+                        .working_memory
+                        .attempts()
+                        .iter()
+                        .map(yunxi_core::WorkingAttempt::tool)
+                        .collect();
+                    assert_eq!(
+                        tried,
+                        vec!["cli.lookup"],
+                        "the follow-up round must see the attempt that produced this result"
+                    );
                     yunxi_core::CognitiveIntent::send_message(
                         input
                             .event

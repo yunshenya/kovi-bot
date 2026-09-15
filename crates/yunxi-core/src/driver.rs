@@ -602,7 +602,7 @@ mod tests {
     use chrono::Utc;
     use std::future::Future;
     use std::pin::Pin;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll, Waker};
     use std::thread;
 
@@ -947,6 +947,141 @@ mod tests {
         ));
         assert_eq!(resumed, 2);
         assert_eq!(fixture.observer.turn_ends, 3);
+    }
+
+    /// Records what each round could see of the task's own history, then
+    /// drives a two-tool task. The second round must see the first attempt,
+    /// which is the entire reason working memory exists.
+    #[derive(Debug)]
+    struct WorkingMemoryProbe {
+        seen: Mutex<Vec<Vec<(String, String)>>>,
+    }
+
+    impl ModelBackend for WorkingMemoryProbe {
+        fn plan<'a>(&'a self, input: &'a PlannerInput) -> ModelBackendFuture<'a> {
+            Box::pin(async move {
+                let conversation_id = input
+                    .event
+                    .scope()
+                    .conversation_id()
+                    .ok_or(ModelBackendError::Unavailable)?;
+                let seen: Vec<(String, String)> = input
+                    .working_memory
+                    .attempts()
+                    .iter()
+                    .map(|attempt| {
+                        (
+                            attempt.tool().to_owned(),
+                            attempt.outcome().clone().describe(),
+                        )
+                    })
+                    .collect();
+                self.seen
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(seen);
+                match input.event.kind() {
+                    WorldEventKind::MessageReceived(_) => Ok(DecisionPlan {
+                        disposition: DecisionDisposition::Reply,
+                        intents: vec![CognitiveIntent::UseTool {
+                            tool_name: "step.one".to_owned(),
+                            input: "{\"q\":1}".to_owned(),
+                            scope: ActionScope::Conversation(conversation_id),
+                            notification_policy: ToolNotificationPolicy::Final,
+                        }],
+                        state_updates: Vec::new(),
+                    }),
+                    WorldEventKind::ToolCompleted(tool) if tool.requires_follow_up => {
+                        let next = if tool.operation == "step.one" {
+                            CognitiveIntent::UseTool {
+                                tool_name: "step.two".to_owned(),
+                                input: "{\"q\":2}".to_owned(),
+                                scope: ActionScope::Conversation(conversation_id),
+                                notification_policy: ToolNotificationPolicy::Final,
+                            }
+                        } else {
+                            CognitiveIntent::send_message(
+                                conversation_id,
+                                MessageContent::text("完成"),
+                            )
+                        };
+                        Ok(DecisionPlan {
+                            disposition: DecisionDisposition::Reply,
+                            intents: vec![next],
+                            state_updates: Vec::new(),
+                        })
+                    }
+                    _ => Ok(DecisionPlan::silent()),
+                }
+            })
+        }
+    }
+
+    #[test]
+    fn each_round_sees_what_the_task_already_tried() {
+        let conversation_id = ConversationId::new();
+        let (handle, mut runtime) =
+            CognitiveRuntime::new(RuntimeConfig::default()).expect("runtime");
+        let probe = Arc::new(WorkingMemoryProbe {
+            seen: Mutex::new(Vec::new()),
+        });
+        runtime.install_services(CoreServices::new(
+            Arc::clone(&probe) as Arc<dyn ModelBackend>
+        ));
+        block_on(handle.submit(message_event(conversation_id))).expect("submit");
+        let arbiter = ActionArbiter::new(ActionArbiterConfig {
+            capabilities: EnvironmentCapabilities::all(),
+            ..ActionArbiterConfig::default()
+        });
+        let mut observer = Recorder {
+            replying_allowed: true,
+            ..Recorder::default()
+        };
+        let driven = block_on(drain(&mut runtime, &arbiter, &ImmediatePort, &mut observer));
+        assert_eq!(driven, 3);
+
+        let seen = probe
+            .seen
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(seen.len(), 3, "one record per round");
+        // The first round is a fresh task: nothing tried yet.
+        assert!(seen[0].is_empty());
+        // The second round knows the first tool and how it ended.
+        assert_eq!(
+            seen[1],
+            vec![("step.one".to_owned(), "succeeded: ok".to_owned())]
+        );
+        // The third round carries the whole chain in order.
+        assert_eq!(
+            seen[2],
+            vec![
+                ("step.one".to_owned(), "succeeded: ok".to_owned()),
+                ("step.two".to_owned(), "succeeded: ok".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_finished_task_does_not_leave_its_memory_behind() {
+        let conversation_id = ConversationId::new();
+        let (handle, mut runtime) =
+            CognitiveRuntime::new(RuntimeConfig::default()).expect("runtime");
+        runtime.install_services(CoreServices::with_model(ThreeStepModel));
+        block_on(handle.submit(message_event(conversation_id))).expect("submit");
+        let arbiter = ActionArbiter::new(ActionArbiterConfig {
+            capabilities: EnvironmentCapabilities::all(),
+            ..ActionArbiterConfig::default()
+        });
+        let mut observer = Recorder {
+            replying_allowed: true,
+            ..Recorder::default()
+        };
+        block_on(drain(&mut runtime, &arbiter, &ImmediatePort, &mut observer));
+        assert!(
+            !runtime.has_working_memory(),
+            "a terminal task must release its working memory"
+        );
     }
 
     #[test]

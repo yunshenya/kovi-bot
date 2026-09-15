@@ -24,6 +24,7 @@ pub mod planner;
 pub mod ports;
 pub mod proactive;
 pub mod runtime;
+pub mod working_memory;
 pub mod working_state;
 pub mod world_model;
 
@@ -138,6 +139,11 @@ pub use runtime::{
     MAX_BLOCKED_DATA_ERASURE_PEOPLE, MAX_DATA_ERASURE_CONVERSATIONS, MAX_TOOL_ACTIONS_PER_TRACE,
     PlannedProcessingOutcome, ProcessingOutcome, RuntimeConfig, RuntimeConfigError, RuntimeHandle,
     RuntimeObservation, SubmitError, planned_action_idempotency_key,
+};
+pub use working_memory::{
+    MAX_WORKING_ARGUMENT_CHARS, MAX_WORKING_ATTEMPTS, MAX_WORKING_FAILURE_CHARS,
+    MAX_WORKING_RESULT_CHARS, MAX_WORKING_TOOL_NAME_CHARS, PlannerWorkingMemory, WorkingAttempt,
+    WorkingAttemptOutcome, attempt_from_intent,
 };
 pub use working_state::{
     CompactEvent, ConversationSnapshot, StateUpdate, WorkingState, WorkingStateConfig,

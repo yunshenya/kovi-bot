@@ -408,6 +408,11 @@ pub struct CognitiveRuntime {
     /// and parked until the next turn consumes them.
     probed_commands: VecDeque<RuntimeCommand>,
     pending_tool_follow_ups: VecDeque<WorldEvent>,
+    /// What each in-flight task has tried so far, keyed by trace root.
+    ///
+    /// Bounded by the same lifecycle as the tool budget ledger: an entry
+    /// exists only while its task can still produce a follow-up round.
+    working_memory: HashMap<EventId, crate::working_memory::PlannerWorkingMemory>,
     tool_action_budget_by_trace: HashMap<EventId, usize>,
     tool_action_budget_order: VecDeque<EventId>,
     closed_tool_budget_roots: HashSet<EventId>,
@@ -585,6 +590,7 @@ impl CognitiveRuntime {
                 receiver,
                 probed_commands: VecDeque::new(),
                 pending_tool_follow_ups: VecDeque::new(),
+                working_memory: HashMap::new(),
                 tool_action_budget_by_trace: HashMap::new(),
                 tool_action_budget_order: VecDeque::new(),
                 closed_tool_budget_roots: HashSet::new(),
@@ -710,6 +716,15 @@ impl CognitiveRuntime {
         self.services.as_deref()
     }
 
+    /// Whether any task still holds working memory.
+    ///
+    /// Exposed for tests and diagnostics: a terminal task must release it, and
+    /// that is only observable from outside the runtime.
+    #[must_use]
+    pub fn has_working_memory(&self) -> bool {
+        !self.working_memory.is_empty()
+    }
+
     #[cfg(test)]
     fn tool_actions_used(&self, event: &WorldEvent) -> usize {
         self.effective_tool_actions_used(event)
@@ -783,6 +798,8 @@ impl CognitiveRuntime {
         if self.root_has_pending_tool_follow_up(root) {
             return;
         }
+        // A terminal task can no longer produce a round that would read this.
+        self.working_memory.remove(&root);
         if self.tool_action_budget_by_trace.remove(&root).is_some() {
             self.tool_action_budget_order
                 .retain(|candidate| *candidate != root);
@@ -1225,6 +1242,7 @@ impl CognitiveRuntime {
         let mut feedback = Vec::new();
         let mut tool_follow_up_events = Vec::new();
         let mut selected_action = None;
+        let mut round_attempts: Vec<crate::working_memory::WorkingAttempt> = Vec::new();
         let action_dispatch_started = std::time::Instant::now();
         for (intent_index, intent) in plan.intents.iter().enumerate() {
             if guard.is_some_and(|guard| !guard()) {
@@ -1403,6 +1421,13 @@ impl CognitiveRuntime {
             {
                 feedback.push(feedback_observation);
             }
+            // Record what this task just tried before the result becomes the
+            // next round's event. A tool round that asked for one tool would
+            // otherwise leave no trace of its arguments once the result is
+            // folded into the follow-up event's text.
+            if let Some(attempt) = crate::working_memory::attempt_from_intent(intent, &result) {
+                round_attempts.push(attempt);
+            }
             actions.push(result);
         }
         let mut final_tool_follow_ups = Vec::new();
@@ -1429,6 +1454,15 @@ impl CognitiveRuntime {
                     final_tool_follow_ups.push(tool_event);
                 }
             }
+        }
+        if !round_attempts.is_empty() {
+            // The record exists so the *next* round can see what this task
+            // already tried. When a round has no follow-up there is no next
+            // round, so nothing is stored.
+            self.working_memory
+                .entry(planner_event.trace().root_event_id())
+                .or_default()
+                .record_round(&round_attempts);
         }
         if let Some(tool_follow_up) = aggregate_tool_follow_up_events(
             &planner_event,
@@ -1526,11 +1560,17 @@ impl CognitiveRuntime {
             .conversation_id()
             .and_then(|conversation_id| self.state.conversation(conversation_id));
         let executive_scope = executive_scope_for_event(&event);
+        let working_memory = self
+            .working_memory
+            .get(&event.trace().root_event_id())
+            .cloned()
+            .unwrap_or_default();
         PlannerInput::new(
             event,
             PlannerStateSnapshot::new(self.state.global_version(), conversation),
         )
         .with_executive(self.executive.snapshot_for_scope(&executive_scope))
+        .with_working_memory(working_memory)
     }
 
     /// Builds a planner input and opportunistically hydrates bounded durable

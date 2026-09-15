@@ -14,6 +14,7 @@ use crate::intent::{CognitiveIntent, IntentValidationError};
 use crate::memory::Memory;
 use crate::mind::{MindSnapshot, MindValidationError};
 use crate::open_loop::OpenLoop;
+use crate::working_memory::PlannerWorkingMemory;
 use crate::working_state::ConversationSnapshot;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -761,6 +762,11 @@ pub struct PlannerInput {
     /// deserializing old planner inputs without manufacturing executive data.
     #[serde(default)]
     pub executive: ExecutiveSnapshot,
+    /// What this task has already tried, keyed by the runtime to the trace
+    /// root. Empty for the first round of a task and for every host that never
+    /// runs the driver's follow-up rounds.
+    #[serde(default, skip_serializing_if = "PlannerWorkingMemory::is_empty")]
+    pub working_memory: PlannerWorkingMemory,
 }
 
 impl PlannerInput {
@@ -780,7 +786,15 @@ impl PlannerInput {
             capabilities: Vec::new(),
             mind: MindSnapshot::empty(),
             executive: ExecutiveSnapshot::default(),
+            working_memory: PlannerWorkingMemory::new(),
         }
+    }
+
+    /// Attaches what this task has already tried.
+    #[must_use]
+    pub fn with_working_memory(mut self, working_memory: PlannerWorkingMemory) -> Self {
+        self.working_memory = working_memory;
+        self
     }
 
     /// Record that this turn's relation read failed. `relation` should then be
